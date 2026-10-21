@@ -221,6 +221,8 @@ highest sequence already forwarded on its own flow; it does not count inversion
 pairs or packets merely selected by `reorder`. `pending` counts packets still
 queued at shutdown, separately from deliberate loss. With a completed relay,
 `received = forwarded + dropped + pending` in each direction.
+`downlink_send_errors` is always 0 here; it counts refused replies only in the
+browser harness's relay mode (see "Web client").
 
 `stall_windows` lists windows that actually held packets, separately per flow
 (first-arriving client is flow 0). Each contains planned `start_s`/`end_s`,
@@ -693,7 +695,10 @@ It adds ~19 ms: the model's 10 ms, and 448 samples (9.3 ms) to fit its 480-sampl
 frames to the audio thread's 128-sample quanta (the most a quantum can be past the
 last whole frame; the output starts that far behind, so every quantum has samples
 the moment its frame is cleaned). The desktop app's capture already comes in 10 ms
-frames, so it adds the 10 ms alone.
+frames, so it adds the 10 ms alone. Measured end to end ("Web client" below), turning
+it on costs ~36 ms in Chromium and ~85 ms in WebKit: the microphone also crosses
+into the capture context and back out as a track, a MediaStream hop the 19 ms leaves
+out.
 
 The module and the model's archive (36 MB) are downloaded the first time
 suppression is on in a call and kept in the Cache API; the archive must match its
@@ -832,6 +837,195 @@ and this hysteresis best explain the results; internal decisions were not traced
 All completed measurement phases had zero packet loss and under 0.14% concealment. Shared-host
 scheduling, physical devices, other browsers and internet paths remain unisolated;
 these measurements do not establish a stable CI performance limit.
+
+## Web client
+
+`apps/web/e2e/latency.mjs` measures the built web app with latency.rs's markers:
+the same signal, onset detector, tone identification, matching window, 5 ms floor
+and ≥95% gate (ported in `apps/web/e2e/latency-markers.mjs`, whose tests repeat
+latency.rs's). Each run starts a fresh loopback server, and optionally the `LATENCY_NET`
+relay, from `crates/gwar-client/examples/web_latency.rs`, then a fresh headless
+browser in which two instances of the app connect and join voice as a user would
+(the controller's join, the real engine, SFrame workers and noise suppression), or
+one app and a native peer with latency.rs's virtual 10 ms devices.
+
+```sh
+cargo build --release -p gwar-client --example web_latency
+pnpm --filter web exec playwright install chromium webkit
+pnpm --filter web latency --runs 4 --variant plain --variant sframe:crypto=sframe
+pnpm --filter web latency --set engine=webkit --variant idle --variant jitter:net=jitter
+```
+
+Variants are `name:key=value,...` (`--set` for all of them): `path=browser`
+(default), `browser-native` or `native-browser` (sender-receiver); `engine=chromium`,
+`webkit` or `firefox`; `crypto=plain|sframe` (browser path); `ns=off|on`;
+`net=idle|relay|jitter|loss` or any `LATENCY_NET` spec (`relay` is `seed=1`, `jitter`
+`seed=42;down:jitter=10ms`, `loss` `seed=42;down:loss=2%`, as in the native gate);
+`mic=webaudio|track`; and two experiments that change nothing in the app,
+`ptime=MS` (adds `a=ptime` to the sender's answer) and `jbt=MS` (sets the
+receiver's `jitterBufferTarget`). `--runs` (per variant, default 4), `--markers`
+(60) and `--warmup-ms` (5000) work as in the native runner; variants alternate
+supplied and reversed order. A run takes 15–35 s; each keeps `run.json` (every
+marker and onset, stats, host load, relay counters) and `latency.csv` under
+`target/web-latency/<time>/`, beside `manifest.json` and `summary.json`. Nothing
+is retried or excluded. It is not run in CI: it needs the release fixture, takes
+minutes and is only meaningful on a host whose load is recorded.
+
+**What is measured.** The microphone is `getUserMedia` replaced by an AudioWorklet
+in a 48 kHz context of its own whose MediaStream destination the app receives (a
+clone per capture), so the browser's capture device and its echo cancellation,
+gain control and noise suppression are not in the path; Gwar's own noise
+suppression is. The ear is an AudioWorklet tap the harness connects beside the
+app's master gain → destination connection: what the app hands to the output
+device. A native peer generates or plays out exactly as latency.rs does. Both
+worklets log each render quantum's `currentFrame` and `Date.now()`; a frame is
+timed like a sample of latency.rs's virtual callbacks, from its audio callback
+(the first quantum of a burst: Chromium renders two quanta per 256-frame callback,
+WebKit one per 128) plus its offset, +0.5 ms for `Date.now()`'s whole milliseconds.
+Pages and the native fixture read the same system clock, so no offset between
+processes is estimated. So the result runs from the moment the synthetic
+microphone renders a marker to the moment the receiving app renders it for the
+output device. The output device's buffer is not observable headless (Playwright
+mutes it); browsers report it, as stats, below.
+
+Two further points are timed in Chromium on the same captures, as segments, not
+gates: `sentSegment`, what the sending app's noise suppression sends (a tap on its
+worklet), and `decodedSegment`, decoded audio as the remote track delivers it to
+its sinks (a `MediaStreamTrackProcessor`), before the app's WebAudio graph.
+`mic=track` (Chromium) replaces the worklet microphone with a
+`MediaStreamTrackGenerator` fed 10 ms `AudioData` from the page, each frame timed
+from its write: no WebAudio on the sending side.
+
+With noise suppression on, the model would rightly remove the steady marker tones,
+so the sender runs it at 10% (a 5 dB cap). libDF mixes the captured spectrum back
+into the same frame before synthesis, so the delay is the same at every strength;
+the model runs in full either way.
+
+`getStats()` and the audio contexts are recorded as stats, never as latency: NetEq's
+`jitterBufferDelay / jitterBufferEmittedCount` (its mean buffering over the marker
+window) and target, concealment, packets lost and the sender's packet rate;
+`baseLatency`, `outputLatency` and, in Chromium, `playbackStats` (output
+underruns). `LATENCY_NET` uses latency.rs's relay with `Relay::bind_for_browsers`:
+every local ICE candidate is a flow (up to 32), a host-interface candidate reaches
+the loopback socket with that interface's source address, and downlink sends macOS
+refuses to such a candidate are counted (`downlink_send_errors`) instead of failing
+the run.
+
+### Results (2026-10-21)
+
+Apple M5, macOS 27.0, Playwright's Chromium 153.0.8010.12 and WebKit 26.6,
+release fixture at `e0d535d` plus this harness. The host was shared with other
+agents' builds; the 1-minute load during runs is given. 60 markers per run, 5 s
+warmup unless noted; quantiles pool all matched markers of a variant; the NetEq
+column is the median of runs' mean buffering (stats). Every row is one interleaved
+set; rows of one set compare directly.
+
+| Set | Path, engine | Condition | Runs passed | Matched | Median ms | p95 ms | p99 ms | NetEq ms | Load |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| A | browser→browser, Chromium | plaintext | 6/6 | 360/360 | 73.73 | 78.50 | 80.10 | 30.0 | 12.7 |
+| A | browser→browser, Chromium | SFrame | 6/6 | 360/360 | 73.31 | 78.31 | 86.54 | 30.0 | 12.6 |
+| A | browser→browser, Chromium | noise suppression | 6/6 | 360/360 | 109.52 | 120.60 | 121.08 | 30.6 | 13.0 |
+| A | browser→browser, Chromium | SFrame + suppression | 6/6 | 360/360 | 114.62 | 118.71 | 119.50 | 37.3 | 12.3 |
+| B | browser→browser, Chromium | idle | 6/6 | 360/360 | 68.69 | 74.48 | 74.56 | 24.2 | 13.0 |
+| B | browser→browser, Chromium | jitter 10 ms | 6/6 | 360/360 | 86.60 | 103.96 | 104.12 | 43.9 | 13.0 |
+| B | browser→browser, Chromium | loss 2% | 5/6 | 348/360 | 67.04 | 77.60 | 80.06 | 25.6 | 14.1 |
+| C | browser→browser, Chromium | idle | 6/6 | 360/360 | 72.71 | 79.54 | 79.79 | 29.9 | 9.0 |
+| C | browser→native, Chromium | idle | 6/6 | 360/360 | 66.73 | 76.74 | 78.46 | – | 10.2 |
+| C | native→browser, Chromium | idle | 6/6 | 360/360 | 65.30 | 70.61 | 73.28 | 34.7 | 9.0 |
+| D | browser→browser, WebKit | plaintext | 4/4 | 240/240 | 104.40 | 107.83 | 107.88 | 37.1 | 6.5 |
+| D | browser→browser, WebKit | SFrame | 4/4 | 240/240 | 101.04 | 115.60 | 115.67 | 22.6 | 6.3 |
+| D | browser→browser, WebKit | noise suppression | 4/4 | 240/240 | 189.29 | 216.48 | 217.10 | 36.9 | 7.0 |
+| E | browser→browser, Chromium | 15 s warmup | 4/4 | 240/240 | 76.21 | 80.23 | 82.88 | 32.5 | 7.1 |
+| E | browser→browser, Chromium | 15 s, suppression | 4/4 | 240/240 | 117.38 | 119.50 | 119.60 | 30.4 | 6.0 |
+| E | browser→browser, Chromium | 15 s, suppression, `mic=track` | 4/4 | 240/240 | 106.54 | 116.09 | 117.71 | 29.5 | 4.8 |
+| H | browser→browser, Chromium | as the app is | 6/6 | 360/360 | 61.17 | 72.69 | 72.79 | 19.9 | 6.0 |
+| H | browser→browser, Chromium | `ptime=10` | 6/6 | 360/360 | 57.35 | 69.17 | 69.60 | 30.0 | 6.4 |
+| H | browser→browser, Chromium | `mic=track` | 6/6 | 360/360 | 64.49 | 77.63 | 78.35 | 32.8 | 6.0 |
+| H | browser→browser, Chromium | `jbt=0` | 6/6 | 360/360 | 75.96 | 82.17 | 83.08 | 31.5 | 6.3 |
+| I | browser→browser, Chromium | idle | 4/4 | 240/240 | 71.15 | 79.85 | 80.08 | 29.9 | 5.3 |
+| I | browser→browser, Chromium | `mic=track` | 4/4 | 240/240 | 70.54 | 73.22 | 74.01 | 37.2 | 5.0 |
+| I | native→browser, Chromium | idle | 4/4 | 240/240 | 67.19 | 70.25 | 71.54 | 37.0 | 5.3 |
+| F | native→native (latency.rs) | idle | 4/4 | 240/240 | 62.89 | 68.45 | 69.32 | – | 12.8 |
+| F | native→native (latency.rs) | jitter 10 ms | 4/4 | 240/240 | 59.27 | 76.76 | 79.29 | – | 13.6 |
+| F | native→native (latency.rs) | loss 2% | 4/4 | 240/240 | 58.05 | 76.97 | 78.92 | – | 14.0 |
+| G | native→native (latency.rs) | idle, 15 s warmup | 4/4 | 240/240 | 46.85 | 56.20 | 57.08 | – | 4.5 |
+
+The harness gained its segment taps during the session (`sentSegment` from set E,
+`decodedSegment` in set I); clocks, detection and matching were the same in every
+set. A later single native→browser check (20 markers, 3 s warmup) measured 35.8 ms
+with NetEq at 13.5 ms: NetEq's target, not a fixed cost, separates such runs.
+Set F/G ran `target/release/examples/latency` directly with
+`LATENCY_WAIT_CONNECTED=1` and `LATENCY_WARMUP_MS` 5000/15000, after the browser
+sets. No run had an output underrun (Chromium `playbackStats`) or a native
+playout underrun except one in F's loss runs. Under 2% loss the browser receiver
+concealed 1.7% of samples and lost 1–4 markers a run (93 packets lost over six
+runs; one run failed the gate with 56/60): a lost 20 ms packet carries a whole
+marker, while the native sender's 10 ms packets lose none of F's 240.
+
+Within a run latency is nearly constant (p95 often within 1 ms of the median):
+the 250 ms marker period is a whole number of 20 ms frames, so every marker meets
+the encoder at the same phase. Runs differ by up to a frame for that reason, and
+by NetEq's target, which settles at 20, 30 or 40 ms per run on this host. A
+longer warmup does not lower it (set E); the native receiver's startup trimming
+does need one (F against G).
+
+### Where the time goes (Chromium, browser→browser, idle)
+
+| Segment | ms | How it is known |
+| --- | ---: | --- |
+| Synthetic microphone → its track | ~9–12 | measured: `mic=track` lowers the non-NetEq part 40.4 → 28.4 ms (set H) and 41.8 → 33.2 ms (set I); a real microphone has its own capture buffering instead, not measured |
+| Opus packetization | ~10–14 | measured: 20 ms frames (50 packets/s); `ptime=10` gives 10 ms frames and lowers the non-NetEq part 40.4 → 26.8 ms (set H) |
+| Network, SFU, decoding | a few | loopback; the remainder |
+| NetEq | 20–44 | stats: mean buffering per run, equal to its target; 44 under 10 ms jitter |
+| Decoded track → app output (WebAudio) | ~12 | measured: `decodedSegment` (set I) 45.1–63.5 ms, 11.5–13.2 ms before the output in each of 12 runs |
+| Output device buffer | 24 (Chromium), 12.8 (WebKit) | stats only: `outputLatency`; Chromium `playbackStats.averageLatency` 24.4 ms; `baseLatency` 5.3 / 2.7 ms |
+
+"Non-NetEq part" is a run's median minus its NetEq mean, which removes the target's
+run-to-run steps. A MediaStream hop between WebAudio contexts (a MediaStream
+destination feeding a `MediaStreamAudioSourceNode`, markers timed by the same
+render clocks, 40 markers, local check) took 21.2 ms in Chromium and 48–51 ms in
+WebKit, in one context or two. That hop is what makes the web app's noise
+suppression expensive: in Chromium it adds ~36 ms (set A: 41.4 → 77.3 ms
+non-NetEq), of which `sentSegment` (set E) puts 42.5 ms between the worklet
+microphone and the model's output (31.9 ms with `mic=track`), against 19.3 ms of
+framing and model. WebKit adds ~85 ms (its `sentSegment` is 70.1 ms). Without
+suppression WebKit's non-NetEq part is ~27 ms larger than Chromium's (67.6 against
+~40 ms), consistent with its slower hops; WebKit has no `MediaStreamTrackProcessor`,
+so the sending and receiving sides are not separated there. SFrame costs nothing measurable
+(−0.4 ms pooled in Chromium, −3.4 ms in WebKit; within the run spread).
+
+Against native: native→native measured 46.9 ms here with the gate's 15 s warmup
+(41.8 ms in the quieter paired gate above), browser→browser in Chromium 61–76 ms
+(pooled medians of sets A–C, E, H, I) and in WebKit ~104 ms. Mixed paths fall between, at 65–67 ms. The browser pays for
+20 ms packets (the native sender uses 10 ms), NetEq's 20–40 ms (the native
+receiver's target starts at one 10 ms packet), and the ~12 ms WebAudio receive
+hop; it also has an output device buffer the native virtual device does not (a
+physical device adds its own natively). Downlink jitter of 10 ms cost the browser
++18 ms median and a 104 ms p95 (NetEq 44 ms) in set B; in set F the native client's
+median did not rise (p95 77 ms).
+
+### Not changed, with evidence
+
+- `jitterBufferTarget` is unset, which leaves NetEq adaptive; it is a minimum, so
+  setting 0 cannot lower it. Measured (set H): 75.96 against 61.17 ms pooled,
+  non-NetEq 43.5 against 40.4 ms: no gain. `playoutDelayHint`, Chromium's older
+  form, was not measured separately.
+- 10 ms browser packets (`a=ptime:10` in the server's answer) cut ~13 ms of
+  packetization in set H, but the pooled median moved only −3.8 ms
+  because NetEq's target varied, and it costs ~29 kbps a stream
+  ([opus-10ms.md](opus-10ms.md)) and puts browser 10 ms packets through the
+  TeamSpeak bridge, which no test covers yet. It is left for a decision.
+- Noise suppression without the two MediaStream hops (the model in a worker on
+  `MediaStreamTrackProcessor`/`Generator` frames) and remote audio without the
+  WebAudio receive hop would each save ~12–20 ms in Chromium, but change how audio
+  is captured or played and are not low-risk changes.
+
+Not covered: Firefox (the harness supports it; Playwright's Firefox does not start
+in the sandbox these runs used, "Could not find profile folder", and its audio
+contexts need an audio device), real microphones and speakers, the browser's echo
+cancellation (~9 ms by the estimate above) and gain control, internet paths, and
+an idle host. Browser↔native runs are plaintext: the native fixture does not join
+a web-created channel group.
 
 ## SFU media clock
 

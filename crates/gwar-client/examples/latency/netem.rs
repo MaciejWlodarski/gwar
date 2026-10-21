@@ -14,6 +14,8 @@ use tokio::{
 };
 
 const MAX_QUEUED: usize = 65_536;
+/// Browsers open one flow per local ICE candidate that checks the relay.
+const MAX_BROWSER_FLOWS: usize = 32;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Spec {
@@ -320,16 +322,30 @@ pub struct Report {
     pub flows: usize,
     pub up: Counts,
     pub down: Counts,
+    /// Browser mode only: downlink datagrams the OS refused to send (see `bind_for_browsers`).
+    pub downlink_send_errors: u64,
 }
 pub struct Relay {
     socket: Arc<UdpSocket>,
+    browsers: bool,
     task: Option<JoinHandle<Result<Report>>>,
     stop: Option<oneshot::Sender<()>>,
 }
 impl Relay {
     pub async fn bind() -> Result<Self> {
         let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.context("bind netem relay")?);
-        Ok(Self { socket, task: None, stop: None })
+        Ok(Self { socket, browsers: false, task: None, stop: None })
+    }
+    /// For browser clients (apps/web/e2e/latency.mjs): every local ICE candidate that checks the
+    /// relay is its own flow, and a candidate on a host interface reaches this loopback socket
+    /// with that interface's source address (only local datagrams can arrive here). macOS may
+    /// refuse a reply from loopback to such a candidate; the browser then uses another pair,
+    /// so refused downlink sends are counted instead of failing the run.
+    #[allow(dead_code)] // examples/web_latency.rs only
+    pub async fn bind_for_browsers() -> Result<Self> {
+        let mut relay = Self::bind().await?;
+        relay.browsers = true;
+        Ok(relay)
     }
     pub fn address(&self) -> Result<SocketAddr> {
         Ok(self.socket.local_addr()?)
@@ -337,7 +353,7 @@ impl Relay {
     pub fn start(&mut self, server: SocketAddr, spec: Spec, epoch: Instant) {
         let (stop, receive) = oneshot::channel();
         self.stop = Some(stop);
-        self.task = Some(tokio::spawn(relay(self.socket.clone(), server, spec, epoch, receive)));
+        self.task = Some(tokio::spawn(relay(self.socket.clone(), server, spec, epoch, receive, self.browsers)));
     }
     pub async fn finish(&mut self) -> Result<Report> {
         if let Some(stop) = self.stop.take() {
@@ -370,6 +386,7 @@ async fn relay(
     spec: Spec,
     epoch: Instant,
     mut stop: oneshot::Receiver<()>,
+    browsers: bool,
 ) -> Result<Report> {
     ensure!(server.ip().is_loopback(), "netem is loopback-only");
     ensure!(server != front.local_addr()?, "relay upstream must differ from its advertised address");
@@ -378,6 +395,7 @@ async fn relay(
     let mut flows: Vec<Flow> = Vec::new();
     let mut by_client = HashMap::new();
     let mut buffer = vec![0; 65_536];
+    let mut downlink_send_errors = 0;
     loop {
         // Drain due packets before polling arrivals, including the whole stall burst.
         for flow in &mut flows {
@@ -387,7 +405,12 @@ async fn relay(
                 flow.up.sent(&packet, epoch.elapsed());
             }
             while let Some(packet) = flow.down.pop(epoch.elapsed()) {
-                front.send_to(&packet.data, flow.client).await.context("relay downlink send")?;
+                match front.send_to(&packet.data, flow.client).await {
+                    Err(_) if browsers => downlink_send_errors += 1,
+                    sent => {
+                        sent.context("relay downlink send")?;
+                    }
+                }
                 flow.down.sent(&packet, epoch.elapsed());
             }
         }
@@ -401,12 +424,13 @@ async fn relay(
             }
             received = front.recv_from(&mut buffer) => {
                 let (size, client) = received.context("relay receive")?;
-                ensure!(client.ip().is_loopback(), "non-loopback relay client");
+                ensure!(browsers || client.ip().is_loopback(), "non-loopback relay client");
                 let at = epoch.elapsed();
                 let flow = if let Some(&flow) = by_client.get(&client) {
                     flow
                 } else {
-                    ensure!(flows.len() < 2, "latency relay supports only the two measuring clients");
+                    let limit = if browsers { MAX_BROWSER_FLOWS } else { 2 };
+                    ensure!(flows.len() < limit, "latency relay supports only {limit} flows");
                     let id = flows.len();
                     let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
                     upstream.connect(server).await?;
@@ -455,6 +479,7 @@ async fn relay(
         flows: flows.len(),
         up: Counts::default(),
         down: Counts::default(),
+        downlink_send_errors,
     };
     for flow in flows {
         report.up.merge(flow.up.finish());
@@ -632,6 +657,26 @@ mod tests {
             let report = relay.finish().await.unwrap();
             assert_eq!(report.flows, 2);
             assert_eq!((report.up.forwarded, report.down.forwarded), (2, 2));
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn browser_relay_accepts_a_flow_per_candidate() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut relay = Relay::bind_for_browsers().await.unwrap();
+            relay.start(server.local_addr().unwrap(), Spec::parse("seed=1").unwrap(), Instant::now());
+            let mut buffer = [0; 10];
+            for _ in 0..3 {
+                let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+                client.send_to(b"c", relay.address().unwrap()).await.unwrap();
+                let (size, source) = server.recv_from(&mut buffer).await.unwrap();
+                server.send_to(&buffer[..size], source).await.unwrap();
+                client.recv_from(&mut buffer).await.unwrap();
+            }
+            let report = relay.finish().await.unwrap();
+            assert_eq!((report.flows, report.downlink_send_errors), (3, 0));
         })
         .await
         .unwrap();
