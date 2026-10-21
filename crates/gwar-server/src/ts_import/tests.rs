@@ -791,3 +791,39 @@ fn channels_that_clean_to_one_path_take_no_password_from_the_file() {
     assert!(!super::plan::passwords_template(&planned).contains("Clan/Room"));
     assert!(planned.notes.iter().any(|n| n.contains("\"Clan/Room\"") && n.contains("several channels have this path")));
 }
+
+#[test]
+fn a_password_key_names_one_channel_only() {
+    let with = |pairs: &[(&str, &str)]| Options {
+        passwords: pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+        ..Default::default()
+    };
+    let channel = |cid: &str, pid: &str, name: &str| {
+        r(&[
+            ("cid", cid),
+            ("pid", pid),
+            ("channel_order", "9"),
+            ("channel_name", name),
+            ("channel_topic", ""),
+            ("channel_flag_permanent", "1"),
+            ("channel_maxclients", "-1"),
+            ("channel_flag_password", "1"),
+        ])
+    };
+    // A top-level channel whose cleaned name is the path of Clan/Room: the path wins.
+    let mut s = source();
+    s.channels[2].insert("channel_flag_password".into(), "1".into());
+    s.channels.push(channel("8", "0", "Cl\u{202e}an/Room"));
+    let planned = plan(&s, &with(&[("Clan/Room", "secret")]));
+    let password = |name: &str, parent: Option<u64>| {
+        planned.channels.iter().find(|c| c.name == name && c.parent == parent).unwrap().password.clone()
+    };
+    assert_eq!(password("Room", Some(2)), Password::Kept("secret".into()));
+    assert_eq!(password("Clan/Room", None), Password::Locked);
+    // Clan/"p/q" written as a name is "p\/q", which is also how a top-level "p\/q" is typed.
+    let mut s = source();
+    s.channels.push(channel("8", "2", "p/q"));
+    s.channels.push(channel("9", "0", "p\\/q"));
+    let error = super::plan::plan(&s, &with(&[("p\\/q", "x")])).unwrap_err().to_string();
+    assert!(error.contains("could mean several channels"), "{error}");
+}

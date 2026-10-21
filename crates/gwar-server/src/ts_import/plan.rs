@@ -408,12 +408,30 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
     for path in paths.values() {
         *path_count.entry(path.as_str()).or_default() += 1;
     }
-    for key in options.passwords.keys().filter(|k| k.as_str() != SERVER_PASSWORD) {
-        if path_count.get(key.as_str()).is_some_and(|n| *n > 1) {
-            bail!("the passwords file names \"{key}\", the path of several channels: set their passwords in Gwar");
+    // A key that is a channel's path names that channel; any other key may be a unique name, as
+    // typed or written as a path writes it. A key reaching two channels so would give both its
+    // password: refused.
+    let mut by_name: BTreeMap<String, BTreeSet<u64>> = BTreeMap::new();
+    for cid in kept.keys() {
+        let name = channel_name(&kept, *cid);
+        if name_count[name.as_str()] == 1 {
+            by_name.entry(name.replace('\\', "\\\\").replace('/', "\\/")).or_default().insert(*cid);
+            by_name.entry(name).or_default().insert(*cid);
         }
-        if !paths.values().any(|p| p == key) && name_count.get(key).is_some_and(|n| *n > 1) {
-            bail!("the passwords file names \"{key}\", which several channels are called: write the channel's path");
+    }
+    for key in options.passwords.keys().filter(|k| k.as_str() != SERVER_PASSWORD) {
+        match path_count.get(key.as_str()) {
+            Some(n) if *n > 1 => {
+                bail!("the passwords file names \"{key}\", the path of several channels: set their passwords in Gwar")
+            }
+            Some(_) => {}
+            None if name_count.get(key).is_some_and(|n| *n > 1) => {
+                bail!("the passwords file names \"{key}\", which several channels are called: write the channel's path")
+            }
+            None if by_name.get(key).is_some_and(|ids| ids.len() > 1) => {
+                bail!("the passwords file names \"{key}\", which could mean several channels: write the channel's path")
+            }
+            None => {}
         }
     }
     let mut queue: Vec<Option<u64>> = vec![None];
@@ -489,9 +507,9 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
                         Some(path.as_str())
                     } else if name_count[name.as_str()] == 1 {
                         // The name as typed, or written as a path is (`\\` for a backslash).
-                        [name.as_str(), escaped_name.as_str()]
-                            .into_iter()
-                            .find(|n| *n != SERVER_PASSWORD && options.passwords.contains_key(*n))
+                        [name.as_str(), escaped_name.as_str()].into_iter().find(|n| {
+                            *n != SERVER_PASSWORD && !path_count.contains_key(*n) && options.passwords.contains_key(*n)
+                        })
                     } else {
                         None
                     };
