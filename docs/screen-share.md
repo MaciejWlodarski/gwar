@@ -1504,6 +1504,14 @@ Constraints Gwar passes:
   and the sharer sees "Computer sound could not leave out Gwar's voice, so it
   is not shared".
 
+Edge removed `windowAudio` in Edge 143 (MDN browser-compat-data, see the
+browser table in [native-media.md](native-media.md)). Edge 143+ ignores the
+option like any unknown member, so on Edge the `windowAudio` choices above do
+not apply, and what a window share offers there is Edge's own default. The
+`restrictOwnAudio` check after capture still decides whether any system-audio
+track is kept, so Gwar's voice stays out on Edge as well. Edge therefore
+needs its own browser check, separate from Chrome's.
+
 The opt-in warning says: "Everyone watching will hear everything your
 computer plays, from every app. Gwar's own voice is left out." The setting is
 remembered per device and is off by default.
