@@ -143,7 +143,7 @@ control), and platform adapters as modules or crates behind `cfg`:
 | `windows` | Windows | Windows.Graphics.Capture, WASAPI, Media Foundation |
 | `linux` | Linux | xdg-desktop-portal, PipeWire, VA-API |
 | `android` | Android | the Rust side of MediaCodec and MediaProjection hand-off |
-| `soft` | all | openh264, libvpx (software encode and decode) |
+| `soft` | libvpx: all; OpenH264: macOS, Windows, Linux | libvpx (software VP9/VP8 encode and decode); Cisco's OpenH264 binary (software H.264), never on iOS or Android ([Software fallbacks](#software-fallbacks)) |
 
 Voice moves into `gwar-media` only if that makes sharing code simpler. Moving
 it is not a goal, and the voice engine's latency gates apply to any change
@@ -251,9 +251,10 @@ commands, like voice today. It keeps the command-surface rules of
   cannot tell a native peer from a browser, and must not need to.
 - Same keys: `MLS-Exporter("gwar screen v1", …)` for video and
   `"gwar screen audio v1"` for share audio, with the same frame layouts.
-- The protocol additions this plan needs (H.264 and codec switching,
-  resolution tiers, simulcast) are additions every client gets, the web app
-  included. They are in [Track A](#track-a-sfu-and-protocol).
+- The protocol additions this plan needs (H.264 and codec switching, layer
+  declarations, publisher replacement, resolution tiers, simulcast) are
+  additions every client gets, the web app included. They are in
+  [Track A](#track-a-sfu-and-protocol).
 
 ## 3. Codecs
 
@@ -291,39 +292,115 @@ starts, as it does for VP9 and VP8 (`describe` in
   - Other types (STAP-B, MTAP, FU-B) are refused: they are not allowed in
     `packetization-mode=1`.
 - **Frame start:** the first packet of a new RTP timestamp, as for VP8/VP9.
-- **Keyframe start:** the first packet of an access unit whose first NAL
-  (single, first STAP-A unit, or FU-A with S = 1) is an SPS (7), a PPS (8) or
-  an IDR slice (5).
-- **The access unit must contain an IDR.** The SFU forwards per packet and
-  does not assemble frames, so it decides at the first packet and checks by
-  the end of the access unit. A segment opened at an SPS whose access unit
-  ends (marker bit or new timestamp) without an IDR slice is treated as a
-  failed keyframe: the rest is dropped and one throttled PLI is sent
-  ([Keyframes](screen-share.md#keyframes)).
-- **Publisher contract:** every IDR is preceded by SPS and PPS in the same
-  access unit. str0m's packetizer does this when the encoder emits them
-  (it sends a STAP-A of SPS and PPS before the next NAL). Native encoders are
-  configured to repeat parameter sets on every IDR (VideoToolbox does by
-  default; MediaCodec has `KEY_PREPEND_HEADER_TO_SYNC_FRAMES`, API 29). Chrome's
-  and Safari's behavior is checked by E1 **(to verify)**. The SFU never
-  caches or injects parameter sets.
+- **Publisher contract:** every IDR access unit is in the canonical form of
+  [§3, Encryption](#encryption-nal-aware-sframe): it starts with one SPS
+  followed by one PPS, then optional SEI, then the IDR slices. str0m's
+  packetizer produces this order from canonical input: it holds SPS and PPS
+  and sends them as one STAP-A, SPS first, before the next NAL
+  (`str0m-0.24.1/src/packet/h264.rs`). Each encoder adapter is responsible
+  for the in-band parameter sets; no platform encoder is assumed to provide
+  them:
+  - VideoToolbox emits length-prefixed (AVCC) sample buffers and keeps SPS
+    and PPS in the buffer's format description, not in the samples. The
+    Apple adapter (C1, C9) reads them with
+    [`CMVideoFormatDescriptionGetH264ParameterSetAtIndex`](https://developer.apple.com/documentation/coremedia/cmvideoformatdescriptiongeth264parametersetatindex(_:parametersetindex:parametersetpointerout:parametersetsizeout:parametersetcountout:nalunitheaderlengthout:))
+    and builds the Annex B access unit, SPS and PPS first on every keyframe,
+    as upstream WebRTC's `H264CMSampleBufferToAnnexBBuffer` does
+    ([`nalu_rewriter.cc`](https://webrtc.googlesource.com/src/+/refs/heads/main/sdk/objc/components/video_codec/nalu_rewriter.cc)).
+  - MediaCodec has `KEY_PREPEND_HEADER_TO_SYNC_FRAMES` (API 29); C7 checks
+    the output rather than trusting the key.
+  - Media Foundation MFTs, VA-API, NVENC and OpenH264 are checked by their
+    items (C3, C5, B3) the same way.
+  - Chrome's and Safari's behaviour is checked by E1 **(to verify)**.
+
+  Every encoder adapter passes a late-join test with real encoder output
+  ([Track C acceptance](#track-c-per-platform-capture-and-encode)). The SFU
+  never caches or injects parameter sets.
+- **Keyframe candidate:** a packet whose first NAL (single, or first STAP-A
+  unit) is an SPS (7). It may open a segment only once confirmed.
+- **Confirmation by the IDR slice.** The SFU does not forward a candidate's
+  packets to waiting slots until the packet carrying the start of the first
+  IDR slice (5) of the same RTP timestamp has arrived (a single NAL, a STAP-A
+  unit, or an FU-A with S = 1). Until then, while any slot of the share
+  waits, the packets of the newest RTP timestamp are held in a **bounded
+  prefix buffer** per share, from the first one that arrives:
+  - at most 8 packets and 16 KB, all of one RTP timestamp, ordered by
+    sequence number whatever their arrival order;
+  - **confirmed** when the buffer holds a gap-free run of sequence numbers
+    from the SPS packet to the IDR slice start, containing a PPS before the
+    IDR, with no non-IDR slice (1) in between. The held packets are then
+    released in sequence order, the SPS packet marked as the keyframe start
+    (so `Segment::map`'s base is the SPS packet), followed by the IDR packet
+    and the rest of the access unit as it arrives;
+  - **failed** when the access unit ends first (marker bit or a newer
+    timestamp), when the bound is exceeded, or when a non-IDR slice appears.
+    The held packets are dropped for waiting slots and one throttled PLI is
+    sent ([Keyframes](screen-share.md#keyframes)).
+
+  Only waiting slots and a share whose ingress is blocked (its first
+  keyframe, or after an overrun) use the buffer. Slots already inside a
+  segment get every packet on arrival as today, so the buffer adds no
+  latency outside joins and recoveries, and a join waits only for the
+  packets between the SPS and the IDR start, which the publisher sends
+  back to back. Held packets count against the buckets and frame bounds on
+  arrival, as now.
+- **Edge cases**, each a test in A2:
+  - *missing parameter sets:* an IDR slice start with no confirmed candidate
+    (SPS or PPS lost, or never sent) opens nothing, and one throttled PLI
+    follows;
+  - *reordered parameter sets:* an IDR start that arrives before the SPS
+    packet is held; the candidate is confirmed when the SPS packet arrives,
+    if the bound is not exceeded;
+  - *marker before repair:* when the access unit's marker packet arrives
+    while the prefix still has a gap (a lost PPS packet awaiting RTX), the
+    candidate fails. The later repair is forwarded only to slots already in
+    a segment, as any repair is.
+
+  Provisional forwarding (opening the segment at the SPS and rolling back
+  if no IDR follows) was rejected. PR 3a's ingress (`Ingress::admit`) and
+  `Segment::map` act on each packet as it arrives, so a rollback cannot
+  recall packets a viewer already has. The viewer would then get a frame
+  with parameter sets and no slice, which fails to open in encrypted
+  channels and wastes its keyframe budget.
 - Malformed payloads (a STAP-A unit longer than the packet, an FU-A with both
   S and E set, an empty NAL) are dropped and counted, like a truncated VP9
   descriptor.
 
 #### Negotiation (A2)
 
-
 - `packetization-mode=1` only. Mode 0 (one NAL per packet) cannot carry a
   1080p slice in one MTU and is not offered.
 - **Profiles:** Constrained Baseline (`42e0xx`) is accepted everywhere.
-  Constrained High (`640cxx`) is accepted when the viewer offered it. Main
-  and High with B-frames are not used: B-frames add a frame of latency.
-- **Levels:** the publish answer sets `level-asymmetry-allowed=1`. The level
-  in a viewer's offer is what it can receive. Browsers usually offer level
-  3.1 (`42e01f`) and still decode 1080p in practice **(to verify per
-  browser)**. The SFU therefore does not enforce levels; it matches profiles.
-  Native viewers offer the level their decoder supports (5.1 for 2160p30).
+  Constrained High (`640cxx`), or High (`6400xx`) without B-frames, is sent
+  to a viewer only if it offered that profile (Apple's `low-latency`
+  configuration produces High, see
+  [Hardware encoders](#hardware-encoders-per-platform)). Main, and any
+  profile with B-frames, are not used: B-frames add a frame of latency.
+- **Levels are enforced.** The answers set `level-asymmetry-allowed=1`. Per
+  [RFC 6184 §8.2.2](https://www.rfc-editor.org/rfc/rfc6184#section-8.2.2),
+  that lets the two directions use different levels; it does not let a
+  sender exceed a receiver: "the level to use in the offerer-to-answerer
+  direction MUST be equal to the highest level the answerer supports for
+  receiving". A viewer's receive limits are the level of its
+  `profile-level-id` (or `max-recv-level`), extended by `max-fs`, `max-mbps`,
+  `max-br` and `max-dpb` when present (RFC 6184 §8.1).
+  - The SFU records the limits per viewer and payload type, and treats them
+    as part of what the viewer decodes. A stream is compatible with a viewer
+    only if codec, profile, level and those limits all fit.
+  - The SFU knows each stream's profile and level from the sharer's layer
+    declaration ([A3](#track-a-sfu-and-protocol)) and checks it against the
+    first three bytes after the SPS NAL header (`profile_idc`, constraint
+    flags, `level_idc`), which stay clear in every channel. A keyframe whose
+    SPS does not match the declaration fails like a keyframe without an IDR.
+  - For an incompatible viewer the rule of
+    [Codec negotiation](#codec-negotiation-across-mixed-viewers) picks a
+    compatible layer, a codec switch, a lower publisher output, or an
+    explicit refusal. A viewer is never sent a level above its limits.
+  - Browsers often offer level 3.1 (`42e01f`), which covers 1280×720 at 30
+    fps but not 1080p. Which levels each browser offers, and whether that
+    can be raised, is **(to verify per browser; E1)**. If browsers offer only
+    3.1, 1080p H.264 reaches them through a 720p layer or the VP9 fallback.
+  - Native viewers offer the level their decoder supports (5.1 for 2160p30).
 - **Payload types:** one m-line can carry several codecs. The publish m-line
   offers every codec the sharer can encode (H.264 and VP9/VP8), and the SFU
   maps each viewer's payload type for the codec in flight.
@@ -342,20 +419,57 @@ is encrypted ([screen-share.md, Spikes](screen-share.md#spikes)). The layout,
 already chosen in [screen-share.md §2](screen-share.md#support), is:
 
 - everything up to and including the first slice NAL's header stays clear
-  (start codes, AUD, SPS, PPS, SEI and the slice NAL header byte); it is
+  (start codes, SPS, PPS, SEI and the slice NAL header byte); it is
   RFC 9605 *metadata*, so it is authenticated (AAD = `header || clear`);
 - the rest, `SFrameHeader || AEAD(slice data and later NALs)`, is
   **start-code escaped**: any `00 00 0x` with `x ≤ 3` gets an emulation
-  prevention byte, as in H.264 itself, so no packetizer splits the
-  ciphertext. The receiver unescapes before opening.
+  prevention byte, as in H.264 itself, and a final `00` byte is followed by
+  `03`, so no packetizer splits or trims the ciphertext. The receiver
+  unescapes before opening.
 - Without escaping, about one frame in 2^24 ciphertext bytes contains a
   start code and is lost. Spike S3's unescaped variant worked only by luck.
 
-The exact byte rules (which NALs are clear when several slices exist, the
-escaping, the bounds) are written once, with test vectors shared by Rust and
-TypeScript, in work item [B2](#track-b-shared-rust-media-core)/[E2](#track-e-web-side-changes).
+**The clear part is authenticated in canonical form.** The packetizer and
+depacketizer rewrite the clear bytes. str0m 0.24.1
+(`str0m-0.24.1/src/packet/h264.rs`):
+
+- drops AUD (9) and filler (12) NALs when packetizing;
+- treats every zero byte before `00 00 01` as part of the start code, so a
+  NAL's trailing zero bytes are lost;
+- holds SPS and PPS and sends them as one STAP-A, SPS first, before the next
+  NAL, keeping only the latest of each;
+- writes a four-byte start code (`00 00 00 01`) before every NAL when
+  depacketizing, whatever the sender used.
+
+So an access unit with an AUD, three-byte start codes, or PPS before SPS
+cannot authenticate unchanged. The rule:
+
+- **Canonical form:** four-byte start codes; no AUD or filler NALs; no
+  trailing zero bytes before a start code; parameter sets only at the start
+  of an IDR access unit, as one SPS followed by one PPS; then SEI, then the
+  slices.
+- **The sealer canonicalizes before encryption.** The clear part and the AAD
+  are taken from the canonical bytes, and the canonical bytes are what goes
+  to the packetizer.
+- **The opener canonicalizes after depacketization**, with the same
+  function, before it checks the tag. The decoder gets the opened canonical
+  bytes, never the raw depacketized ones, so bytes outside the canonical
+  form are neither authenticated nor decoded.
+- The function is idempotent, and `canonicalize(depacketize(packetize(c)))`
+  equals `c` for every canonical `c`, for str0m and for each browser
+  receiver. Whether Chromium's and WebKit's receivers change the clear bytes
+  in other ways (WebRTC's SPS/PPS tracker can insert parameter sets before an
+  IDR that lacks them) is **(to verify; E2)**; the publisher
+  contract above means they never need to.
+
+The exact byte rules (the canonical form, which NALs are clear when several
+slices exist, the escaping, the bounds) are written once, with test vectors
+shared by Rust and TypeScript, in work item [B2](#track-b-shared-rust-media-core)/[E2](#track-e-web-side-changes).
 The same vectors gate both implementations, like
-`crates/gwar-client/tests/sframe-interop.json` does for voice. SPS and PPS
+`crates/gwar-client/tests/sframe-interop.json` does for voice. Vectors alone
+do not prove the round trip through real packetizers, so B2 and E2 also
+require **seal → packetize → SFU → depacketize → open** tests, with input
+that has AUDs and with input that has three-byte start codes. SPS and PPS
 stay clear, so the server sees resolution and profile; it already sees
 resolution for VP9 ([What the server still sees](screen-share.md#what-the-server-still-sees)).
 
@@ -377,7 +491,7 @@ decode the share's codec must still be served ([codec negotiation](#codec-negoti
 
 | Platform | API | Notes |
 | --- | --- | --- |
-| macOS, iOS | VideoToolbox (`VTCompressionSession`) | `kVTVideoEncoderSpecification_EnableLowLatencyRateControl` (macOS 11.3+, iOS 14.5+) ([Apple](https://developer.apple.com/documentation/videotoolbox/kvtvideoencoderspecification_enablelowlatencyratecontrol)); takes `IOSurface`-backed pixel buffers from ScreenCaptureKit with no copy |
+| macOS, iOS | VideoToolbox (`VTCompressionSession`) | two configurations, below; output is AVCC with parameter sets in the format description, converted to Annex B by the adapter ([Publisher contract](#sfu-payload-handling-a1-a2)); takes `IOSurface`-backed pixel buffers from ScreenCaptureKit with no copy |
 | Windows | Media Foundation H.264 encoder MFTs | vendor hardware MFTs (NVIDIA NVENC, AMD AMF, Intel Quick Sync) are found with `MFTEnumEx` and `MFT_ENUM_FLAG_HARDWARE`; D3D11 textures in through the DXGI device manager ([Microsoft](https://learn.microsoft.com/en-us/windows/win32/medfound/h-264-video-encoder)); a direct NVENC path only if MFT latency falls short **(to verify)** |
 | Linux | VA-API (Intel, AMD), NVENC (NVIDIA) | dmabuf from PipeWire into VA-API without a copy; some distributions build Mesa without H.264 encode for patent reasons **(to verify which)**; Vulkan Video encode is a later option |
 | Android | MediaCodec | input `Surface` fed by the projection's virtual display; low-latency and priority keys vary by device **(to verify per vendor)** |
@@ -386,6 +500,28 @@ Encoder settings for screen content, all platforms: no B-frames, one slice
 per frame unless the encoder needs more, infinite GOP with keyframes only on
 request (PLI) or on a resolution change, CBR-like rate control with a short
 window, and parameter sets on every IDR.
+
+**Apple encoder configurations.** Apple documents that low-latency rate
+control (`kVTVideoEncoderSpecification_EnableLowLatencyRateControl`, macOS
+11.3+, iOS 14.5+) supports "Only High profiles. The encoder sets the levels
+automatically"
+([Apple](https://developer.apple.com/documentation/videotoolbox/kvtvideoencoderspecification_enablelowlatencyratecontrol)).
+It cannot produce the Constrained Baseline default, so the Apple adapter has
+two configurations, and each advertises only what it produces:
+
+| Configuration | Settings | Advertised in the layer declaration |
+| --- | --- | --- |
+| `compat` (default) | Constrained Baseline through `kVTCompressionPropertyKey_ProfileLevel`; `RealTime`; no frame reordering; standard rate control (average bitrate plus data rate limits); level chosen to fit the share's viewers | `42e0xx` at the level the encoder was configured for |
+| `low-latency` | `EnableLowLatencyRateControl`; High profile; level chosen by the encoder | the profile and level read from the first SPS the session produces, not the requested ones |
+
+- `compat` is used whenever any viewer of the layer accepts only
+  Constrained Baseline, and until the first SPS of a `low-latency` session
+  shows a profile and level every viewer of the layer accepts.
+- Whether `low-latency` emits Constrained High (`640c`) or plain High
+  (`6400`) is **(to verify; C1)**. Plain High is used only for viewers that
+  offered it.
+- Switching configuration is a new encoder session and a keyframe on the
+  same m-line, like a codec switch.
 
 ### Software fallbacks
 
@@ -405,6 +541,29 @@ reference for tests and CI.
   - source builds are for tests and CI only;
   - whether downloading at first use rather than at install meets Cisco's
     terms is **(to verify)** and an [owner decision](#owner-decisions-needed).
+- **Conditions of Cisco's binary.** Its patent licence applies only if
+  ([BINARY_LICENSE.txt](https://www.openh264.org/BINARY_LICENSE.txt)):
+  - the binary is downloaded separately to the user's device, not combined
+    with Gwar before the download;
+  - "the end user must have the ability to control (e.g., to enable,
+    disable, or re-enable) the use of the Cisco-provided binary";
+  - where that control is, Gwar displays "OpenH264 Video Codec provided by
+    Cisco Systems, Inc.";
+  - the licence text and that last condition are reproduced where Gwar
+    presents licensing information.
+
+  B3 builds the setting, the attribution at it, and the notices.
+- **Platforms.** The Cisco binary is used only on macOS, Windows and Linux:
+  - **iOS:** never. The OpenH264 FAQ leaves iOS out because "iOS does not
+    allow for applications to fetch and install modules from the Internet"
+    ([FAQ](https://www.openh264.org/faq.html)). iOS uses VideoToolbox for
+    H.264 encode and decode, which every supported device has.
+  - **Android:** never. Google Play's Device and Network Abuse policy says
+    "an app may not download executable code (such as dex, JAR, .so files)
+    from a source other than Google Play"
+    ([Google](https://support.google.com/googleplay/android-developer/answer/9888379)).
+    Android uses MediaCodec for H.264, and libvpx where MediaCodec lacks
+    VP9 or VP8.
 - **VP9 and VP8: libvpx** (BSD), for software encode and decode. VP9 is the
   fallback codec of the mixed-viewer rule below, and every web sharer sends
   VP9 or VP8, so native viewers must decode both anyway.
@@ -431,22 +590,38 @@ The SFU forwards and never transcodes, so every viewer must decode what the
 sharer sends. The rule ([A3](#track-a-sfu-and-protocol)):
 
 1. **Viewers declare what they decode.** A watch offer's m-lines list the
-   codecs the viewer can receive. The SFU records the set per watch
-   transport. Today's browsers all list VP9 and VP8.
+   codecs the viewer can receive, and for H.264 the profiles, levels and
+   limits of [Negotiation](#negotiation-a2). The SFU records the set per
+   watch transport. Today's browsers all list VP9 and VP8.
 2. **Sharers declare what they encode.** The publish m-line lists every codec
    the sharer can send, preferred first. A native sharer offers
    `[H.264, VP9, VP8]` when it has a hardware H.264 encoder, `[VP9, VP8,
-   H.264]` otherwise. Web sharers keep today's `[VP9, VP8]`.
+   H.264]` otherwise. Web sharers keep today's `[VP9, VP8]`. The sharer also
+   declares each layer it sends: codec, profile and level, resolution and
+   frame rate (the layer declaration, A3).
 3. **The sharer starts with its preferred codec.** No negotiation round
    happens before the first frame.
-4. **A viewer that cannot decode the current codec is not refused.** The SFU
-   assigns it a slot that waits, and asks the sharer to switch
-   (`screen.codec {share, codec}`, a new event to the sharer). The codec asked
-   for is the best one in the intersection of what the sharer encodes and
-   what every current viewer of the share decodes.
-5. **The sharer switches at a keyframe**, on the same m-line (a payload type
-   change; no renegotiation). Each slot's segment starts at the first
-   keyframe in a codec its viewer decodes, using the existing
+4. **A viewer that cannot decode what is sent is not silently refused.** A
+   layer is *compatible* with a viewer when its codec, profile, level and
+   the limits of rule 1 all fit. For a viewer with no compatible layer the
+   SFU assigns a slot that waits, then takes the first of these that
+   applies:
+   1. another layer of the share that is compatible (simulcast, A5);
+   2. a codec switch: `screen.codec {share, codec}`, a new event to the
+      sharer, for the best codec in the intersection of what the sharer
+      encodes and what every current viewer of the share decodes;
+   3. a lower output: `screen.codec` with the limits the sharer must stay
+      within (a lower level, size or frame rate), when the preset allows it
+      (the sharer's rate controller, B6, applies it; Text never trades
+      resolution, so it skips this step);
+   4. an explicit refusal (rule 8).
+5. **The sharer switches at a keyframe**, without a new SDP: a payload type
+   change on the same m-line, or a new encoder configuration on the same
+   payload type. Native publishers always switch in place. Browsers switch
+   in place where they can, otherwise through `screen.publish.replace`
+   ([E3](#track-e-web-side-changes), [A3](#track-a-sfu-and-protocol)), which
+   keeps the share and its viewers. Each slot's segment starts at the first
+   keyframe of a layer compatible with its viewer, using the existing
    wait-for-keyframe rule.
 6. **Switching back** to the preferred codec happens when the last viewer
    that needed the fallback leaves, after a 30 s hold so a viewer flapping in
@@ -454,10 +629,11 @@ sharer sends. The rule ([A3](#track-a-sfu-and-protocol)):
 7. **The fallback may lower quality.** A sharer that switches from hardware
    H.264 to software VP9 also lowers the resolution tier to what its CPU can
    encode ([§4](#cpu-and-gpu-budgets)).
-8. **If the intersection is empty** (a viewer that decodes nothing the sharer
-   encodes), the watch fails with `screen.stopped {reason: "codec"}` and the
-   UI says the viewer's browser cannot play this share. This is not expected
-   with VP8 in every list, but must be handled.
+8. **If nothing fits** (a viewer that decodes nothing the sharer encodes, or
+   whose limits the sharer cannot meet), the watch fails with
+   `screen.stopped {reason: "codec"}` and the UI says the viewer's browser
+   cannot play this share. This is not expected with VP8 in every list, but
+   must be handled.
 
 An alternative is to refuse viewers that cannot decode H.264 and never
 switch. It is simpler, and it locks out Chromium builds without H.264 and
@@ -551,8 +727,11 @@ The native plan is two H.264 layers: the share's tier, and a second layer at
 - Hardware encoders limit concurrent sessions on some consumer GPUs
   **(to verify per vendor)**. A sharer that cannot open a second session
   sends one layer.
-- This extends screen-share PR 13 (simulcast) to H.264 and native senders
-  ([A5](#track-a-sfu-and-protocol)).
+- This extends screen-share PR 13 (simulcast) to H.264 and native senders:
+  SFU forwarding is [A5](#track-a-sfu-and-protocol), the native two-layer
+  publisher is [B11](#track-b-shared-rust-media-core). Tiers that need
+  layers are offered only after a real B11 publisher passes A5's and B11's
+  constrained-viewer tests.
 
 ### Bandwidth and VM egress cost
 
@@ -879,20 +1058,23 @@ extension as well.
 ### Web (stays as is)
 
 Unchanged from [screen-share.md](screen-share.md#browsers). For reference,
-current MDN browser-compat-data (2026-10-15):
+MDN browser-compat-data at commit
+[`d8fae3e`](https://github.com/mdn/browser-compat-data/tree/d8fae3e315612cc015430e40310f827edbf25a0d)
+(2026-10-21; `api/MediaDevices.json` and `api/MediaStreamTrack.json`):
 
-| | Chrome / Edge | Firefox | Safari |
-| --- | --- | --- | --- |
-| `getDisplayMedia` | 72+ / 79+ | 66+ | 13+, iOS 27+ |
-| Audio capture | 74+: "On Windows and ChromeOS, the entire system audio can be captured when sharing an entire screen. On Linux and macOS, only the audio of a tab can be captured." | no | no |
-| `systemAudio` option | 105+ (experimental) | no | no |
-| `windowAudio` option | 141+ (`exclude` and `system` only) | no | no |
-| `suppressLocalAudioPlayback` | 109+ | no | no |
-| `restrictOwnAudio` | 141+ (experimental) | no | no |
+| | Chrome | Edge | Firefox | Safari |
+| --- | --- | --- | --- | --- |
+| `getDisplayMedia` | 72+ | 79+ | 66+ | 13+, iOS 27+ |
+| Audio capture | 74+: "On Windows and ChromeOS, the entire system audio can be captured when sharing an entire screen. On Linux and macOS, only the audio of a tab can be captured." | 79+, as Chrome | no | no |
+| `systemAudio` option | 105+ (experimental) | 105+ (experimental) | no | no |
+| `windowAudio` option | 141+ (`exclude` and `system` only) | 141–142 only: **removed in Edge 143** | no | no |
+| `suppressLocalAudioPlayback` | 109+ | 109+ | no | no |
+| `restrictOwnAudio` | 141+ (experimental) | 141+ (experimental) | no | no |
 
 Sources: [MDN getDisplayMedia](https://developer.mozilla.org/en-US/docs/Web/API/MediaDevices/getDisplayMedia),
 [restrictOwnAudio](https://developer.mozilla.org/en-US/docs/Web/API/MediaTrackConstraints/restrictOwnAudio),
-[browser-compat-data](https://github.com/mdn/browser-compat-data).
+[browser-compat-data](https://github.com/mdn/browser-compat-data) at the
+commit above. Edge entries other than `windowAudio` mirror Chrome's data.
 
 `restrictOwnAudio` removes the capturing tab's own audio. The web app plays
 voice in that tab, so it works for the web client. It cannot help the desktop
@@ -910,10 +1092,11 @@ the same pause and resume events.
 
 | Platform | Hardware | Software fallback |
 | --- | --- | --- |
-| macOS, iOS | VideoToolbox (`VTDecompressionSession`); H.264 everywhere, VP9 on recent Apple silicon **(to verify per OS version)** | libvpx (VP9, VP8), OpenH264 decoder |
-| Windows | Media Foundation decoder MFTs with D3D11 (DXVA) for H.264 and VP9 | libvpx, OpenH264 |
-| Linux | VA-API, NVDEC | libvpx, OpenH264 |
-| Android | MediaCodec, with `KEY_LOW_LATENCY` where supported (API 30+) | libvpx through the NDK |
+| macOS | VideoToolbox (`VTDecompressionSession`); H.264 everywhere, VP9 on recent Apple silicon **(to verify per OS version)** | libvpx (VP9, VP8), OpenH264 (Cisco binary) |
+| iOS | VideoToolbox, as macOS; H.264 always in VideoToolbox | libvpx (VP9, VP8); no OpenH264 ([Software fallbacks](#software-fallbacks)) |
+| Windows | Media Foundation decoder MFTs with D3D11 (DXVA) for H.264 and VP9 | libvpx, OpenH264 (Cisco binary) |
+| Linux | VA-API, NVDEC | libvpx, OpenH264 (Cisco binary) |
+| Android | MediaCodec, with `KEY_LOW_LATENCY` where supported (API 30+) | libvpx through the NDK; no OpenH264 |
 
 Native viewers must decode VP9 and VP8 (every web sharer's codecs) and H.264.
 A decoder error resets the decoder, marks the slot waiting for a keyframe and
@@ -963,28 +1146,29 @@ target; their larger keyframes only affect joins and recoveries.
   into the call.
 - Lip sync: share audio and video come with sender reports on one clock
   (the SFU's arrival wallclock); the viewer delays whichever is early, up to
-  a bound **(to measure; F6)**.
+  a bound (initial value from F6, measured per platform in F8).
 - Ducking (lowering share audio while someone speaks) is optional and off by
   default.
 
 ## 7. Shared audio
 
-Native shared audio follows [Shared audio (phase 2)](screen-share.md#shared-audio-phase-2)
-exactly on the wire. Nothing new is needed on the server once screen-share
-PR 9 lands.
+On the wire, native shared audio is exactly
+[Shared audio (phase 2)](screen-share.md#shared-audio-phase-2): codec,
+m-lines, SFU forwarding, lip sync and the `"gwar screen audio v1"` SFrame
+label are specified there and not repeated here. Nothing new is needed on
+the server once screen-share PR 9 lands. What differs for native clients:
 
-- **Codec:** Opus, stereo, 48 kHz, `maxaveragebitrate=128000`,
-  `useinbandfec=1`, no DTX and no RFC 6464 level gate (music must pass).
-- **Transport:** its own `sendonly` audio m-line on the share's publish
-  transport. On watch transports each slot is a video and audio pair, with
-  one `msid` per slot.
-- **SFU:** its own ingress bucket (192 kbps, 16 KB burst), forwarded before
-  every video slot, no NACK.
-- **Encryption:** SFrame with the label `"gwar screen audio v1"`, its own key
-  and counter. The native engine reuses the voice SFrame code with that
-  label.
-- **Capture:** the platform `AudioSource` adapters of [§5](#5-capture-per-platform),
-  resampled to 48 kHz stereo, encoded in 20 ms frames.
+- **Capture** comes from the platform `AudioSource` adapters of
+  [§5](#5-capture-per-platform), not from `getDisplayMedia`. Rust resamples
+  to 48 kHz stereo and encodes 20 ms Opus frames (B8).
+- **Exclusion of Gwar's voice** is done by the capture adapter, not by
+  `restrictOwnAudio`. An adapter that cannot exclude it gives no audio.
+- **Encryption** reuses the voice SFrame code with the share-audio label.
+  Its counter belongs to the native publish endpoint of
+  [B7](#track-b-shared-rust-media-core), like the video counter.
+- **Echo:** the native engine has the captured signal, so it can feed the
+  sharer's echo canceller (next section). The browser design can only
+  suggest headphones.
 
 ### Echo and the sharer's microphone
 
@@ -1001,8 +1185,8 @@ Two loops must not form:
      from the microphone.
    - The capture tap and the actual speaker output differ by the output
      path's latency. The canceller's delay estimation must cover it
-     **(to measure; F6)**.
-   - If F6 shows the canceller cannot remove it reliably, the fallback is
+     (F6's harness measures it; F8 per platform).
+   - If F8 shows the canceller cannot remove it reliably, the fallback is
      the web design's: suggest headphones, and offer "Mute the shared audio
      for me".
 3. Viewers already feed share audio into their canceller ([§6](#shared-audio-playback)).
@@ -1035,9 +1219,9 @@ Sizes are working days for one person:
 - **M:** 4–8 days;
 - **L:** 8–15 days.
 
-"Now" means the item can start today on `main`, or on top of the open PR 3a
-(#136) where it says so. ★ marks a good first contribution: small, testable
-alone, and not on a security boundary.
+"Now" means the item can start today on `main`, which has PR 3a (#136). ★
+marks a good first contribution: small, testable alone, and not on a
+security boundary.
 
 Open an issue before starting an item, so two people do not build the same
 thing. Items that touch encryption, keys or the SFU's limits get a review
@@ -1047,27 +1231,42 @@ round of their own, as voice 5c/5d had.
 
 **A1. H.264 payload parser ★** (S)
 - Builds: `describe` for H.264 in `media/screen/ingress.rs`: single NAL,
-  STAP-A and FU-A; frame start, keyframe start (SPS, PPS, IDR) and malformed
-  payloads ([H.264 plan](#h264-plan)). No negotiation yet.
+  STAP-A and FU-A; frame start, keyframe candidate (SPS first), IDR slice
+  start, the presence of a PPS, the three SPS profile and level bytes, and
+  malformed payloads ([SFU payload handling](#sfu-payload-handling-a1-a2)).
+  No negotiation and no confirmation yet.
 - Depends on: PR 3a (#136).
 - Acceptance: unit vectors for each packet kind, including a STAP-A with SPS
   and PPS, an FU-A IDR start and continuation, a truncated STAP-A, an FU-A
   with S and E set, and reserved types. Parsing never reads past the payload
   (a fuzz test over random bytes).
-- Now: yes, on top of PR 3a.
+- Now: yes.
 
 **A2. H.264 on the screen transports** (M)
 - Builds: `enable_h264` with `packetization-mode=1` on publish and watch
-  `Rtc`s; profile matching (Constrained Baseline, Constrained High);
-  `level-asymmetry-allowed=1`; per-viewer payload type mapping; the
-  "access unit must contain an IDR" check.
+  `Rtc`s; profile matching (Constrained Baseline, Constrained High, High
+  without B-frames); `level-asymmetry-allowed=1` and per-viewer receive limits (level,
+  `max-recv-level`, `max-fs`, `max-mbps`, `max-br`, `max-dpb`) recorded per
+  payload type ([Negotiation](#negotiation-a2)); per-viewer payload type
+  mapping; the bounded prefix buffer and IDR confirmation of
+  [SFU payload handling](#sfu-payload-handling-a1-a2), in `Ingress` and in
+  the hand-off to `Segment::map`.
 - Depends on: A1, PR 3a.
 - Acceptance, in `crates/gwar-server/tests/screen.rs` (added by PR 3a) with
   str0m frame-mode clients:
   - an H.264 publisher reaches two viewers, frames byte-identical;
-  - a late viewer starts at an IDR with its SPS and PPS;
+  - a late viewer starts at the SPS packet of an IDR access unit and gets its
+    SPS and PPS;
   - an access unit with SPS but no IDR does not open a segment and causes one
     PLI;
+  - the edge cases of [SFU payload handling](#sfu-payload-handling-a1-a2):
+    an IDR whose SPS/PPS packet was lost; SPS/PPS arriving after the IDR
+    start (reordered by the `LATENCY_NET` relay); the marker packet arriving
+    before the RTX repair of a lost PPS packet; a prefix over the bound.
+    Each opens no segment for a waiting viewer and causes one throttled PLI,
+    or, for the reordered case within the bound, opens the segment at the
+    SPS packet;
+  - a slot already in a segment sees no added delay from the prefix buffer;
   - publisher-side loss is repaired into place, as for VP9;
   - offers with `packetization-mode=0` only, or only unsupported profiles,
     are refused before negotiation.
@@ -1075,17 +1274,44 @@ round of their own, as voice 5c/5d had.
 
 **A3. Codec capabilities and switching** (M)
 - Builds: the rule in [Codec negotiation](#codec-negotiation-across-mixed-viewers):
-  per-viewer decodable sets from watch offers, the sharer's encodable list
-  from the publish offer, `screen.codec {share, codec}` to the sharer, slots
-  that start only at a keyframe in a decodable codec, the 30 s hold before
-  switching back, and `screen.stopped {reason: "codec"}`. Protocol types in
-  `gwar-proto`, generated TypeScript, client validators.
+  per-viewer decodable sets with H.264 profiles, levels and limits from
+  watch offers; the sharer's encodable list from the publish offer; the
+  **layer declaration** (codec, profile and level, resolution, frame rate per
+  layer) and its check against each keyframe's SPS bytes; compatibility by
+  codec, profile, level and limits; `screen.codec {share, codec, limits}` to
+  the sharer; slots that start only at a keyframe of a compatible layer; the
+  30 s hold before switching back; and `screen.stopped {reason: "codec"}`.
+  - **`screen.publish.replace {share, ssrc, rtx_ssrc, sdp}`**: the sharer
+    replaces its publish transport without ending the share, for browsers
+    that cannot switch codec in place (E3). The share keeps its id,
+    announcement, watch link, reservations and every viewer's slot; slots
+    wait for the new transport's first keyframe, which opens a new segment
+    as after any drop; no `screen.stopped` or `screen.started` is sent. Only
+    the share's own sharer may send it, at most once per keyframe throttle
+    window, and only after a `screen.codec` request. This changes
+    "one per share, never renegotiated" of
+    [Requests](screen-share.md#requests-gwar4)
+    ([Changes to earlier plans](#changes-to-earlier-plans)).
+  - Protocol types in `gwar-proto`, generated TypeScript, client validators.
 - Depends on: A2. The owner decision on switching versus refusing.
-- Acceptance: tests with an H.264 publisher, an H.264 viewer and a VP9-only
-  viewer: the VP9 viewer joins, the publisher is asked to switch, both
-  viewers decode after the switch keyframe, and the publisher is asked back
-  30 s after the VP9 viewer leaves; a viewer flapping every 5 s causes at
-  most one switch per 30 s; an empty intersection ends that watch only.
+- Acceptance:
+  - an H.264 publisher, an H.264 viewer and a VP9-only viewer: the VP9
+    viewer joins, the publisher is asked to switch, both viewers decode
+    after the switch keyframe, and the publisher is asked back 30 s after
+    the VP9 viewer leaves;
+  - a **level-limited viewer**: a str0m viewer that offers only `42e01f`
+    (level 3.1, no `max-fs`) watching a 1080p30 H.264 share is never sent a
+    keyframe whose SPS level or size exceeds level 3.1 (checked on every
+    keyframe it receives); it gets a compatible layer, a VP9 switch, a
+    lowered output, or `screen.stopped {reason: "codec"}`, in the order of
+    the rule;
+  - a keyframe whose SPS contradicts the layer declaration opens no segment;
+  - both switch paths, with the other viewers' slots kept: a native (str0m)
+    publisher switching in place, and a publisher using
+    `screen.publish.replace`; after a replace the share id, viewer list and
+    watch link are unchanged;
+  - a viewer flapping every 5 s causes at most one switch per 30 s; an
+    empty intersection ends that watch only.
 - Now: after A2.
 
 **A4. Resolution tiers and scaled limits** (M)
@@ -1098,18 +1324,25 @@ round of their own, as voice 5c/5d had.
 - Acceptance: a synthetic 2160p keyframe of 1.8 MiB passes in a 2160p share
   and is cut in a 1080p share; the RTX cache repairs the first packet of a
   2,000-packet keyframe; three overruns still end the share; a server with
-  the default setting refuses a `2160p` start.
+  the default setting refuses a `2160p` start. Tiers that need layers
+  (2160p beyond Text) are refused until A5 and B11 have passed their
+  constrained-viewer tests.
 - Now: the code can start after PR 3b; the numbers need F3.
 
 **A5. H.264 simulcast forwarding** (L)
-- Builds: two RID layers on the publish m-line; per-viewer layer choice from
-  PR 3b's allocation; switching at the target layer's keyframe, with a
-  per-layer PLI; reservations by layer. Extends screen-share PR 13.
-- Depends on: A2, PR 3b.
+- Builds: admission of two layers per share: two main/RTX SSRC pairs with
+  their RIDs in `screen.publish.offer` (PR 3a admits exactly one pair), each
+  with its own ingress, frame bounds and layer declaration; per-viewer layer
+  choice from PR 3b's allocation and the compatibility rule of A3; switching
+  at the target layer's keyframe, with a per-layer PLI; reservations by
+  layer. Extends screen-share PR 13.
+- Depends on: A2, A3, PR 3b.
 - Acceptance: a viewer whose estimate drops below the top layer moves to the
   low layer within one keyframe and is not paused; it moves back after 10 s
-  of headroom; frames stay byte-identical across switches; Safari and Chrome
-  H.264 simulcast senders work too.
+  of headroom; frames stay byte-identical across switches; a level-limited
+  viewer gets the low layer only; Safari and Chrome H.264 simulcast senders
+  work too. A synthetic two-layer str0m publisher is enough here; the native
+  publisher is B11.
 - Now: no.
 
 VP9 temporal layers (screen-share PR 8) and shared audio forwarding
@@ -1131,28 +1364,61 @@ are.
 **B2. Video SFrame layouts in Rust** (M)
 - Builds: VP9 whole-frame, VP8 clear-prefix and H.264 NAL-aware layouts
   ([§3](#encryption-nal-aware-sframe)) on top of the voice SFrame key state,
-  per media kind, with the `"gwar screen v1"` label. Writes the H.264 byte
-  rules into screen-share.md's [Frame layout](screen-share.md#frame-layout)
-  and a shared vector file used by Rust and TypeScript.
+  per media kind, with the `"gwar screen v1"` label. The H.264 canonical form
+  and the canonicalization applied before sealing and after depacketization.
+  Writes the H.264 byte rules into screen-share.md's
+  [Frame layout](screen-share.md#frame-layout) and a shared vector file used
+  by Rust and TypeScript.
 - Depends on: the VP9/VP8 layouts are specified now; the H.264 rules are
-  written in this item, together with E2.
-- Acceptance: vectors at the shortest and widest KID/CTR encodings; an H.264
-  frame whose ciphertext contains every start-code pattern round-trips;
-  escaping is reversible for random inputs (property test); a str0m
-  H.264 packetizer splits an escaped frame only at real NAL boundaries;
-  mutation of any clear byte fails authentication.
+  written in this item, together with E2; A2 for the end-to-end test.
+- Acceptance:
+  - vectors at the shortest and widest KID/CTR encodings, including
+    non-canonical inputs and their canonical form;
+  - an H.264 frame whose ciphertext contains every start-code pattern, or
+    ends in a zero byte, round-trips;
+  - escaping is reversible and canonicalization idempotent for random inputs
+    (property tests);
+  - **seal → str0m packetize → in-process `gwar-server` SFU → str0m
+    depacketize → open**, for access units with an AUD, with three-byte
+    start codes, with trailing zero bytes, with PPS before SPS, and with
+    SEI: each opens, and the decoder input equals the sealer's canonical
+    bytes. The same inputs sealed without canonicalization fail to open,
+    which shows the test exercises the rewrite;
+  - mutation of any canonical clear byte fails authentication.
 - Now: yes for VP9/VP8; H.264 with E2.
 
 **B3. Software codecs** (M)
-- Builds: `soft` adapters: OpenH264 encode and decode (Cisco binary through
-  `libloading` in releases, source build for tests), libvpx VP8/VP9 encode
-  and decode, with the encoder settings of [§3](#hardware-encoders-per-platform).
-  The download and verification of Cisco's binary.
+- Builds: `soft` adapters: libvpx VP8/VP9 encode and decode on every
+  platform; OpenH264 encode and decode on macOS, Windows and Linux only
+  (Cisco binary through `libloading` in releases, source build for tests),
+  never compiled into iOS or Android builds
+  ([Software fallbacks](#software-fallbacks)); the encoder settings of
+  [§3](#hardware-encoders-per-platform); canonical Annex B output with SPS
+  and PPS on every IDR. The download and verification of Cisco's binary, and
+  the conditions of its licence:
+  - a setting that enables, disables and re-enables the Cisco module,
+    showing "OpenH264 Video Codec provided by Cisco Systems, Inc." beside
+    the control. In the Tauri app it is in the settings UI (this item); the
+    native UIs get it through B9's facade;
+  - the licence text and its conditions in the app's licensing information
+    (`THIRD_PARTY_NOTICES.md` and the about screen);
+  - while disabled, the module is neither downloaded nor loaded, and H.264
+    without a hardware encoder falls back to VP9.
 - Depends on: B1. The owner decision on OpenH264.
-- Acceptance: encode and decode the B1 source at 720p30 and 1080p30 on every
-  CI runner; keyframe on request within one frame; bitrate within 15 % of
-  the target over 10 s; the downloaded binary's hash is checked before
-  loading; `THIRD_PARTY_NOTICES.md` and the cargo-about listing updated.
+- Acceptance:
+  - encode and decode the B1 source at 720p30 and 1080p30 on every CI
+    runner; keyframe on request within one frame; bitrate within 15 % of
+    the target over 10 s; OpenH264 output passes the late-join test of
+    [Track C](#track-c-per-platform-capture-and-encode);
+  - the downloaded binary's hash is checked before loading;
+  - the setting: after disabling, no new encoder or decoder session loads
+    the module (a running share switches codec at its next keyframe, as in
+    rule 5 of [Codec negotiation](#codec-negotiation-across-mixed-viewers));
+    re-enabling loads it again without a reinstall; a UI test finds the
+    attribution text at the control;
+  - the iOS and Android build targets contain no OpenH264 code (a `cargo
+    tree` check in CI);
+  - `THIRD_PARTY_NOTICES.md` and the cargo-about listing updated.
 - Now: yes.
 
 **B4. Native publish transport** (L)
@@ -1160,7 +1426,9 @@ are.
   `sendonly` video m-line (H.264, VP9, VP8 and RTX); the encoder driven by
   the send-side estimate (`min(preset cap, 0.7 × estimate)`, as the web
   sharer does); keyframes on PLI; stats; the share lifecycle (start, stop,
-  restart as a new transport).
+  restart as a new transport). One layer; two layers are B11. Codec and
+  encoder-configuration switches happen in place on this m-line once A3
+  lands.
 - Depends on: B1, B3, A2 (for H.264).
 - Acceptance, against a real `gwar-server` in-process:
   - a native publisher and a str0m viewer: frames byte-identical;
@@ -1196,17 +1464,42 @@ are.
   lowers the tier.
 - Now: yes.
 
-**B7. Native screen key endpoint** (M)
-- Builds: a native `screen` endpoint under the call controller's per-kind
-  endpoints (screen-share PR 7): `install`, `activate`, `hold`, `supersede`
-  for screen keys; the counter that outlives transports; a lost encryptor
-  counts as a restart with an own-leaf update. In the Tauri app, a
-  `screen_set_keys` command beside `voice_set_keys`.
-- Depends on: screen-share PR 7. B2.
-- Acceptance: the PR 7 controller tests run against the native endpoint; an
-  encrypted native share is watched by Chromium and WebKit; a removal stops
-  the native sharer under the old key; a native publish transport restarted
-  three times never repeats a counter (checked against the vectors).
+**B7. Native screen key endpoints** (M–L)
+- Builds: during the transition the Tauri app runs two screen engines at
+  once: native publishing (B4) and webview watching (the screen worker).
+  [PR 7's controller](screen-share.md#two-engines-under-one-call-controller)
+  has one endpoint per kind (`audio`, `screen`), so this item splits the
+  screen kind in two:
+  - **`screen-send`** and **`screen-recv`** endpoints, each with its own
+    run, serial, barrier, installed, activated and floor, and its own hold
+    acknowledgement. `attach`, `restartMedia(kind)` and the 1 s hold
+    timeout work per endpoint, exactly as PR 7 specifies for kinds;
+  - on the desktop, `screen-send` is the native engine (through a
+    `screen_set_keys` command beside `voice_set_keys`) and `screen-recv` is
+    the webview's screen worker. The web client attaches its one screen
+    worker as both; losing that worker restarts both;
+  - `screen-send` owns the counter that outlives transports. A lost native
+    encryptor counts as a restart with an own-leaf update and stops native
+    publishing only; `screen-recv` and voice continue. A lost webview worker
+    closes the watch transports only; native publishing and voice continue;
+  - `screen-recv` sends nothing, so it confirms a hold once it has stopped
+    using keys the hold retires.
+- Depends on: screen-share PR 7. B2; B10 for the desktop tests.
+- Acceptance:
+  - the PR 7 controller tests run against both endpoints, separately and
+    attached together;
+  - in one Tauri client, **encrypted native publishing and webview watching
+    at the same time**: its native share is watched by Chromium and WebKit
+    while its webview watches another member's encrypted share;
+  - a removal while both run: each endpoint confirms its hold within 1 s,
+    the native sharer stops under the old key, and an endpoint that does not
+    confirm is closed without closing the other;
+  - the native engine crashing mid-share: native publishing stops and may
+    resume only after the own-leaf update; webview watching and voice keep
+    running. The webview worker crashing: watching recovers through a run
+    restart and `screen.keyframe`; the native share and voice keep running;
+  - a native publish transport restarted three times never repeats a
+    counter (checked against the vectors).
 - Now: no.
 
 **B8. Shared audio in the native engine** (M)
@@ -1214,20 +1507,23 @@ are.
   encode and decode, `"gwar screen audio v1"` SFrame, mixing into native
   playout with per-share gain, and both echo references of
   [§7](#echo-and-the-sharers-microphone).
-- Depends on: screen-share PR 9 (SFU part), B4, B5; an `AudioSource` (C2, C4,
-  C6, C8 or C10) for real use, or a synthetic one for tests.
+- Depends on: screen-share PR 9 (SFU part), B4, B5, F6 (harness and initial
+  thresholds); an `AudioSource` (C2, C4, C6, C8 or C10) for real use, or a
+  synthetic one for tests.
 - Acceptance: a synthetic tone shared natively is detected at a Chromium
-  viewer and a native viewer; mute and volume work; with a looped-back
-  "speaker to microphone" path in the test harness, the shared tone is
-  attenuated in the sharer's voice by at least 20 dB **(threshold to confirm
-  in F6)**.
+  viewer and a native viewer; mute and volume work; with F6's looped-back
+  "speaker to microphone" path, the shared tone is attenuated in the
+  sharer's voice by at least F6's initial threshold (proposed 20 dB), and
+  audio-video skew at a native viewer is within F6's initial bound. F8 may
+  revise both; a revision updates this test.
 - Now: no.
 
 **B9. UniFFI media facade** (M)
 - Builds: the [UniFFI boundary](#the-uniffi-boundary): `MediaSession`,
   `ShareHandle`, `WatchHandle`, callback interfaces, and the
-  `EncodedVideoSink`/`EncoderControl` pair for platform-owned encoders.
-  Kotlin and Swift bindings generated in CI.
+  `EncodedVideoSink`/`EncoderControl` pair for platform-owned encoders;
+  B3's OpenH264 setting where B3 offers the module (macOS). Kotlin and Swift
+  bindings generated in CI.
 - Depends on: B4, B5.
 - Acceptance: a Kotlin and a Swift test (JVM and macOS host, no device) drive
   a share from the synthetic source through a local server and receive
@@ -1246,6 +1542,46 @@ are.
   (F5) on macOS and Windows release builds.
 - Now: no.
 
+**B11. Native two-layer publisher (simulcast)** (L)
+- Builds: the sending side of [Simulcast or SVC](#simulcast-or-svc) on top
+  of B4:
+  - two encoder sessions (the share's tier and a 720p layer at most 30 fps)
+    fed from one capture, or one encoder with two outputs where the platform
+    has it; a sharer that cannot open the second session falls back to one
+    layer and says so in its layer declaration;
+  - RID and SSRC declarations: `a=rid` and `a=simulcast` on the publish
+    m-line and two main/RTX SSRC pairs in `screen.publish.offer`, as A5
+    admits them, with one layer declaration per layer (A3);
+  - per-layer keyframes: a per-layer PLI makes only that layer's encoder
+    produce an IDR;
+  - aggregate uplink allocation: the send-side estimate is split, the low
+    layer first; the top layer gets the rest and is paused when the rest is
+    below its minimum, and B6 runs per layer;
+  - counter allocation across encoders: both layers encrypt under the
+    share's key with counters from one allocator in the `screen-send`
+    endpoint (B7), so no counter repeats across layers or restarts;
+  - the platform-owned path: `EncoderControl` (B9) carries the layer for
+    rate and keyframe requests.
+- Depends on: B4, B6, A5; B7 for encrypted channels; a hardware encoder
+  adapter (C1, C3, C5, C7 or C9) for real use, B3 for tests.
+- Acceptance, against a real `gwar-server` in-process with a native viewer
+  and Chromium:
+  - **constrained viewers:** behind the `LATENCY_NET` relay's `rate=`
+    bottleneck, a viewer whose estimate is below the top layer watches the
+    low layer without a pause while an unconstrained viewer keeps the top
+    layer; a level-limited viewer (`42e01f`) gets the low layer;
+  - a per-layer PLI produces an IDR on that layer only;
+  - the two layers' combined send rate stays within the estimate; when the
+    estimate falls below both, the top layer pauses first;
+  - in an encrypted channel, counters from both layers over three transport
+    restarts never repeat;
+  - a forced failure to open the second session sends one layer, and the
+    SFU serves every viewer from it.
+- Now: no.
+
+Tiers that need layers (§4) are not offered until B11 passes these tests
+with a real native encoder on at least one platform.
+
 ### Track C: per-platform capture and encode
 
 Each platform has a video item and an audio item. Video items include the
@@ -1254,7 +1590,7 @@ F5 and its numbers to F2.
 
 | Item | What it builds | Depends on | Size | Now |
 | --- | --- | --- | --- | --- |
-| **C1. macOS video** | ScreenCaptureKit with `SCContentSharingPicker`, Gwar's windows excluded, `IOSurface` to VideoToolbox H.264 with low-latency rate control | B1, B4 | L | B1 first |
+| **C1. macOS video** | ScreenCaptureKit with `SCContentSharingPicker`, Gwar's windows excluded, `IOSurface` to VideoToolbox H.264 in the two [Apple encoder configurations](#hardware-encoders-per-platform) (`compat` Constrained Baseline by default, `low-latency` High only for viewers that accept it), the AVCC to Annex B conversion with SPS and PPS from the format description inserted before every IDR (shared with C9) | B1, B4 | L | B1 first |
 | **C2. macOS audio** | `capturesAudio` + `excludesCurrentProcessAudio`; Core Audio process tap as fallback; webview sounds handled | B1; B8 to send | M | B1 first |
 | **C3. Windows video** | Windows.Graphics.Capture (Gwar picker through interop, system picker as option), frame-rate limiting, HDR to SDR, `WDA_EXCLUDEFROMCAPTURE`, Media Foundation hardware MFTs | B1, B4 | L | B1 first |
 | **C4. Windows audio** | WASAPI process loopback excluding Gwar's process tree; version detection; no fallback to the system mix without the explicit setting | B1; B8 to send | M | B1 first |
@@ -1262,7 +1598,7 @@ F5 and its numbers to F2.
 | **C6. Linux audio** | PipeWire per-application links excluding Gwar's nodes; PulseAudio-only and Flatpak detection | B1; B8 to send | M | B1 first |
 | **C7. Android video** | MediaProjection consent per session, foreground service, virtual display into a MediaCodec `Surface`, encoded frames to Rust | B9; the Android client | M–L | no |
 | **C8. Android audio** | `AudioPlaybackCapture` (media, game, unknown), Gwar's own players set to `ALLOW_CAPTURE_BY_SYSTEM` | B9; the Android client | S–M | no |
-| **C9. iOS video** | ScreenCaptureKit on iOS 27 (after verification), or the broadcast extension with VideoToolbox in the extension | B9; an iOS client | L | no |
+| **C9. iOS video** | ScreenCaptureKit on iOS 27 (after verification), or the broadcast extension with VideoToolbox in the extension; C1's Apple encoder configurations and Annex B conversion with SPS/PPS insertion; no software H.264 | B9, C1's Apple adapter; an iOS client | L | no |
 | **C10. iOS audio** | ScreenCaptureKit audio (27+) or `.audioApp` buffers, only if Gwar's voice is shown to be absent | C9 | M | no |
 
 Acceptance for every capture item:
@@ -1273,10 +1609,19 @@ Acceptance for every capture item:
   [the budgets](#cpu-and-gpu-budgets); the frame stamp decodes; stopping
   from the OS indicator (macOS menu bar, Android chip, Windows border or
   picker) ends the share in Gwar within 1 s.
+- **Late join with real encoder output:** a viewer that joins mid-share
+  decodes from the next IDR, whose SPS and PPS are in band in canonical form
+  (for Apple, taken from the format description by the adapter). In CI this
+  runs on a recorded fixture of the platform encoder's real output (sample
+  buffers and format descriptions for VideoToolbox, output buffers for
+  MediaCodec and MFTs) through the adapter's conversion code; on hardware it
+  runs live as part of F5. A viewer offering only Constrained Baseline gets
+  a Baseline stream (for Apple, the `compat` configuration).
 - **Audio:** with Gwar playing a known voice signal and another app playing a
-  different tone, the share contains the tone and **not** the voice signal
-  (correlation below a threshold set in F6). This is the gate: an audio item
-  that cannot pass it ships disabled.
+  different tone, the share contains the tone and **not** the voice signal,
+  as measured by F6's harness against its initial threshold (F8 confirms or
+  revises it per platform). This is the gate: an audio item that cannot pass
+  it ships disabled.
 - **Permissions:** first use, denial, revocation while sharing, and
   re-grant are each handled with a clear message (in Polish and English).
 
@@ -1308,27 +1653,45 @@ before a native Linux UI exists.
 - Depends on: A2.
 - Acceptance: Playwright: a str0m H.264 publisher is watched by Chromium and
   WebKit, with the frame stamp checked; Firefox by hand (F5); the existing
-  VP9 tests still pass.
+  VP9 tests still pass. The `profile-level-id` and limits each browser
+  offers are recorded in this document ([Negotiation](#negotiation-a2)), as
+  is whether each browser's IDRs carry SPS and PPS in band.
 - Now: after A2.
 
 **E2. H.264 SFrame in the web worker** (M)
 - Builds: the NAL-aware layout's open (and seal, for screen-share PR 11's web
-  H.264 sending) in the screen worker, against B2's shared vectors. This is
-  the encryption part of screen-share PR 11.
+  H.264 sending) in the screen worker, against B2's shared vectors,
+  including canonicalization after depacketization. This is the encryption
+  part of screen-share PR 11.
 - Depends on: B2 (vectors), screen-share PR 7.
 - Acceptance: the shared vectors pass in WebCrypto; an encrypted native H.264
-  share plays in Chromium and WebKit; worker cost per 2160p keyframe
-  measured.
+  share plays in Chromium and WebKit; **seal → packetize → SFU → depacketize
+  → open** with a native (str0m) sealer and Chromium and WebKit openers, for
+  access units with an AUD and with three-byte start codes, opens every
+  frame; any other rewrite a browser receiver makes to the clear bytes is
+  recorded here and added to the canonical form or the publisher contract;
+  worker cost per 2160p keyframe measured.
 - Now: with B2.
 
 **E3. Codec switch in the web client** (S)
-- Builds: handling `screen.codec` as a sharer (switch codec on the same
-  sender at a keyframe, through `setParameters` codec selection where
-  supported **(to verify per browser)**, otherwise a new publish transport)
-  and `screen.stopped {reason: "codec"}` as a viewer, with UI strings.
+- Builds: handling `screen.codec` as a sharer and
+  `screen.stopped {reason: "codec"}` as a viewer, with UI strings. The
+  sharer switches in place on the same sender at a keyframe, through
+  `RTCRtpSender.setParameters` codec selection (`encodings[].codec`), in
+  browsers where a check at share start shows it works **(to verify per
+  browser)**. Elsewhere it builds a new `RTCPeerConnection` with the new
+  codec and sends `screen.publish.replace` (A3), keeping the share. A new
+  share (`screen.start`) is never used for a switch: it would lose every
+  viewer's watch binding.
 - Depends on: A3.
-- Acceptance: Playwright: a Chromium sharer switches from VP9 to VP8 when a
-  VP8-only test viewer joins, and back after it leaves.
+- Acceptance, Playwright, with a VP8-only test viewer joining and leaving
+  while a VP9-capable viewer keeps watching:
+  - Chromium switches from VP9 to VP8 and back, in place if the check
+    passes there, and through `screen.publish.replace` with the in-place
+    path forced off;
+  - WebKit as a sharer takes whichever path its check selects;
+  - in every case the share id, the other viewer's slot and the watch link
+    survive, and no `screen.stopped` reaches the other viewer.
 - Now: after A3.
 
 **E4. Higher tiers in the sharer UI ★** (S)
@@ -1389,32 +1752,62 @@ before a native Linux UI exists.
 - Depends on: nothing; it grows with each C item.
 - Now: yes.
 
-**F6. Shared-audio echo and lip sync** (S)
-- Builds: measurements for [§7](#echo-and-the-sharers-microphone): exclusion
-  of Gwar's voice per platform, the sharer's echo canceller with the share
-  reference, and audio-video skew at a viewer with a stamped flash and click.
-- Depends on: B8 and an audio C item.
-- Acceptance: thresholds recorded and used by B8's and C's acceptance.
-- Now: no.
+**F6. Shared-audio measurement harness and initial thresholds ★** (S)
+- Builds: the tools that B8 and the audio C items are accepted with, before
+  either exists:
+  - an exclusion detector: given the known voice signal Gwar plays and a
+    captured share, the level of that signal in the share relative to its
+    playout level (cross-correlation over the whole run);
+  - an echo bench: the native engine's echo canceller (`sonora`) with the
+    share signal as an extra far-end reference, and a simulated speaker to
+    microphone path with configurable delay (0–200 ms) and gain;
+  - a skew meter: a stamped flash and click in synthetic share video and
+    audio, and the measured offset at a viewer;
+  - the **initial thresholds** in this document, proposed: the voice signal
+    at least 40 dB below its playout level in the share; the shared tone
+    attenuated by at least 20 dB in the sharer's voice across the delay
+    range; audio at most 40 ms early or 60 ms late against video (the EBU
+    R37 tolerance **(to verify)**).
+- Depends on: B1 (synthetic sources) and the existing voice engine; nothing
+  from B8 or Track C.
+- Acceptance: the harness runs in CI on synthetic signals; a signal mixed in
+  at a known level is reported within 1 dB; the thresholds are recorded here
+  and referenced by B8's and Track C's acceptance.
+- Now: yes, with B1.
 
 **F7. Server cost at higher tiers** (S)
 - Builds: SFU CPU per forwarded Mbps on the VM at 2160p packet rates, and
   egress with simulcast layers, extending PR 3b's measurement.
-- Depends on: A4, A5.
+- Depends on: A4, A5, B11.
+- Now: no.
+
+**F8. Shared-audio platform validation** (S, per platform)
+- Builds: F6's harness run on real platforms for
+  [§7](#echo-and-the-sharers-microphone): exclusion of Gwar's voice per
+  audio C item on real hardware with a live call, the sharer's echo
+  canceller on real speakers and microphones, and lip sync through the real
+  SFU.
+- Depends on: F6, B8, and each audio C item as it lands (C2, C4, C6, C8,
+  C10).
+- Acceptance: results per platform recorded here; each initial threshold
+  confirmed or revised with the measurements that justify it. A revision
+  updates B8's and Track C's tests; an item that fails the revised gate
+  ships its audio disabled. Decides whether the headphone fallback of
+  [§7](#echo-and-the-sharers-microphone) is needed per platform.
 - Now: no.
 
 ### Order
 
 | Stage | Items | What it gives |
 | --- | --- | --- |
-| 0. Now | A1, B1, B3, B6, F2, F3, F5; D5 spike | parsers, traits, codecs and numbers; no user-visible change |
+| 0. Now | A1, B1, B3, B6, F2, F3, F5, F6; D5 spike | parsers, traits, codecs, numbers and the audio harness; no user-visible change |
 | 1. After PR 3a/3b | A2, E1, B2 (VP9/VP8), B4, B5, F1 | a native publisher with the test source, watched by browsers and by a native viewer |
 | 2. First native sharing | A3, E3, C1, C3, B10, F4 | the desktop app on macOS and Windows shares natively with hardware H.264 (plaintext channels) |
-| 3. After screen-share PR 7 | B7, B2 (H.264), E2 | native shares in encrypted channels |
-| 4. After screen-share PR 9 | B8, C2, C4, F6 | desktop shares with sound, without Gwar's voice |
+| 3. After screen-share PR 7 | B7, B2 (H.264), E2 | native shares in encrypted channels, with webview watching beside them |
+| 4. After screen-share PR 9 | B8, C2, C4, F8 | desktop shares with sound, without Gwar's voice |
 | 5. Linux | C5, C6, D3, D5 | the Linux desktop app shares (and watches, if D5 works) |
 | 6. Native watching and mobile | D1, D2, B9, C7, C8, D4, C9, C10 | native viewers; Android and iOS sharing |
-| 7. Higher tiers | A4, A5, E4, F7 | 1440p and 2160p with simulcast |
+| 7. Higher tiers | A4, A5, B11, E4, F7 | 1440p and 2160p with simulcast |
 
 Stages overlap. Stage 7's A4 can move earlier for the Text preset alone,
 which fits today's caps. Rough total: stages 0–2 about 10–14 working weeks
@@ -1439,7 +1832,13 @@ figures, not dates.
   to browsers and watches browsers. Firefox is checked by hand until it runs
   in CI.
 - **Vectors.** SFrame video layouts share one vector file between Rust and
-  TypeScript (B2, E2).
+  TypeScript (B2, E2). H.264 frames also go seal → packetize → SFU →
+  depacketize → open through the real packetizers, with non-canonical input
+  ([§3](#encryption-nal-aware-sframe)).
+- **Recorded encoder output.** Each hardware encoder adapter's conversion
+  code (AVCC to Annex B, parameter-set insertion) runs in CI on fixtures
+  recorded from the real encoder, including the late-join case of
+  [Track C](#track-c-per-platform-capture-and-encode).
 - **Fuzzing.** Payload parsers (A1) and unescaping (B2) get fuzz targets;
   CI runs them briefly, longer runs are manual.
 
@@ -1483,7 +1882,8 @@ the OS version, hardware and build, as screen-share PR 1's table does.
   **(to verify per platform's terms for distributors)**. OpenH264 is covered
   only through Cisco's binary. Linux hardware paths depend on how the
   distribution built Mesa. Mitigation: OS codecs first, Cisco's binary as
-  the only OpenH264 in releases, VP9 everywhere else.
+  the only OpenH264 in releases and only on desktops, under the user
+  control and attribution its licence requires (B3), VP9 everywhere else.
 - **App store policies.** iOS broadcast extensions have tight memory limits
   **(to verify)**, and Apple reviews screen-capture apps. Google Play reviews
   foreground service types; `mediaProjection` must be justified in the Play
@@ -1515,16 +1915,17 @@ the OS version, hardware and build, as screen-share PR 1's table does.
   session limits, driver bugs, and very different latency per vendor. F2's
   matrix and the software fallback contain it.
 - **Bigger keyframes.** 2160p keyframes do not meet the 400 ms deadline for
-  most viewers ([SFU limits to raise](#sfu-limits-to-raise)). Simulcast is
-  the remedy; intra refresh (spreading a keyframe over several frames) is a
-  later option where encoders support it, but the SFU's join logic needs a
-  real IDR.
+  most viewers ([SFU limits to raise](#sfu-limits-to-raise)). Simulcast
+  (A5 forwarding, B11 publishing) is the remedy; intra refresh (spreading a
+  keyframe over several frames) is a later option where encoders support
+  it, but the SFU's join logic needs a real IDR.
 - **Voice impact on the sharer's machine.** Capture and encode compete with
   the voice engine for CPU, and the share competes for uplink. F4 gates it.
 - **Two engines on the desktop during the transition.** The Tauri app will
-  have native voice, native sharing, and webview watching at once. The call
-  controller's per-kind endpoints (screen-share PR 7) must cover a native
-  screen endpoint (B7), not only a web worker.
+  have native voice, native sharing, and webview watching at once: three
+  key endpoints. PR 7's one endpoint per kind does not cover it; B7 splits
+  the screen kind into `screen-send` and `screen-recv`, each failing and
+  recovering on its own.
 - **Unverified iOS 27 behaviour.** The iOS plan depends on how
   ScreenCaptureKit works on iOS. It is new.
 
@@ -1540,13 +1941,22 @@ the OS version, hardware and build, as screen-share PR 1's table does.
   Rust"** ([Two engines under one call controller](screen-share.md#two-engines-under-one-call-controller))
   holds for webview sharing. Native sharing needs screen keys in Rust (B7,
   `screen_set_keys`), with the same control contract as voice.
+- **Endpoints by kind** ([Two engines under one call controller](screen-share.md#two-engines-under-one-call-controller))
+  has `attach(kind: "audio" | "screen")`. B7 splits `screen` into
+  `screen-send` and `screen-recv`, so native publishing and webview watching
+  can run, hold and fail independently. The web client attaches its one
+  worker as both.
+- **`screen.publish.offer`, "one per share, never renegotiated"**
+  ([Requests](screen-share.md#requests-gwar4)) stays true for the offer.
+  A3 adds `screen.publish.replace`, so a browser that cannot switch codec in
+  place replaces its publish transport without ending the share.
 - **Screen-share PR 10** (desktop shared audio) may become C2, C4 and B8 of
   this plan ([Changes to screen-share PR 10](#changes-to-screen-share-pr-10)).
 - **Screen-share PR 11** (H.264) gains SFU work it did not list: A1 and A2
   (H.264 keyframe detection and negotiation in the SFU). Its NAL-aware SFrame
   is E2 here, with B2's shared vectors.
-- **Screen-share PR 13** (simulcast) is extended to H.264 and native senders
-  (A5).
+- **Screen-share PR 13** (simulcast) is extended to H.264 (A5) and to native
+  senders (B11).
 - **README's roadmap** item "Fully native clients later" now points here.
 
 ### Owner decisions needed
@@ -1564,8 +1974,8 @@ the OS version, hardware and build, as screen-share PR 1's table does.
 3. **Codec mismatch:** switch the sharer to a codec every viewer decodes
    (recommended), or refuse viewers that cannot decode H.264.
 4. **OpenH264:** download Cisco's binary at first use for the software
-   H.264 fallback, or ship no software H.264 encoder at all (VP9 when there
-   is no hardware H.264).
+   H.264 fallback on macOS, Windows and Linux (never iOS or Android), or ship
+   no software H.264 encoder at all (VP9 when there is no hardware H.264).
 5. **Minimum OS versions for native sharing:** macOS 14 (kept), Windows 10
    1903 for video and Windows 11 (or build 20348) for sound, Android 10 for
    sound, iOS 27 only or the broadcast extension as well.
@@ -1581,48 +1991,33 @@ the OS version, hardware and build, as screen-share PR 1's table does.
 
 ### Items to verify
 
-Collected from the text above:
+Each open question, where it comes from, and the work item that settles it.
+The details are in the linked sections.
 
-1. macOS: no Screen Recording prompt when capture goes through
-   `SCContentSharingPicker` in a signed build.
-2. macOS 15+: how often the system asks to re-confirm apps that capture
-   without the picker.
-3. macOS: whether a picker-chosen `SCContentFilter` can also exclude Gwar's
-   windows.
-4. macOS: whether `excludesCurrentProcessAudio` covers sounds played by
-   WKWebView's helper processes.
-5. Windows: whether an unpackaged app can declare
-   `graphicsCaptureWithoutBorder`.
-6. Windows: process loopback on Windows 10 builds before 20348 (reported to
-   work from 19041).
-7. Windows: WebView2 processes fall inside the excluded process tree.
-8. Windows: exclusive-fullscreen games under Windows.Graphics.Capture.
-9. Windows: whether Media Foundation hardware MFT latency is low enough, or a
-   direct NVENC path is needed.
-10. Linux: which distributions build Mesa without H.264 VA-API encoding.
-11. Linux: current status of an audio portal; per-application PipeWire
-    capture inside Flatpak.
-12. Android: low-latency MediaCodec keys per vendor.
-13. Android: `excludeUid` combined with `addMatchingUsage` in one
-    configuration.
-14. Android: Play Console declaration for `mediaProjection` foreground
-    services.
-15. iOS 27: ScreenCaptureKit scope (other apps, background mode, audio,
-    `excludesCurrentProcessAudio`).
-16. iOS: broadcast extension memory limit (about 50 MB reported); whether
-    `.audioApp` contains Gwar's own VoIP playback; extension networking
-    versus App Group hand-off.
-17. Browsers: H.264 decode in Chromium builds without proprietary codecs;
-    Firefox High profile; whether Chrome and Safari send SPS/PPS with every
-    IDR; the levels browsers offer versus what they decode.
-18. Browsers: switching codec on one sender with `setParameters`.
-19. Apple decoders: VP9 hardware decode per OS version.
-20. Hardware encoder session limits on consumer GPUs (for simulcast).
-21. OpenH264: whether downloading Cisco's binary at first use (not at
-    install) meets its terms.
-22. OS codec licensing terms for distributors (VideoToolbox, Media
-    Foundation, MediaCodec).
-23. WebKit and WebView2: any way to take a native audio source as a
-    `MediaStreamTrack` (screen-share PR 10's route).
-24. UniFFI: foreign handles (surfaces, layers) and C# generators.
-25. VP9 versus H.264 bitrate at equal quality for screen content (F3).
+| # | Question | Section | Settled by |
+| --- | --- | --- | --- |
+| 1 | macOS: no Screen Recording prompt with `SCContentSharingPicker` in a signed build; re-confirmation cadence without the picker | [macOS](#macos) | C1, F5 |
+| 2 | macOS: can a picker-chosen filter also exclude Gwar's windows? | [macOS](#macos) | C1 |
+| 3 | macOS: does `excludesCurrentProcessAudio` cover WKWebView's helper processes? | [macOS](#macos) | C2 |
+| 4 | Apple: does low-latency rate control emit Constrained High or plain High? | [Hardware encoders](#hardware-encoders-per-platform) | C1 |
+| 5 | Apple decoders: VP9 hardware decode per OS version | [Decoding](#decoding) | D1 |
+| 6 | Windows: `graphicsCaptureWithoutBorder` in an unpackaged app; exclusive-fullscreen games | [Windows](#windows) | C3, F5 |
+| 7 | Windows: process loopback before build 20348; WebView2 inside the excluded tree | [Windows](#windows) | C4 |
+| 8 | Windows: MFT latency, or a direct NVENC path | [Hardware encoders](#hardware-encoders-per-platform) | C3, F2 |
+| 9 | Linux: distributions whose Mesa lacks H.264 VA-API encode | [Hardware encoders](#hardware-encoders-per-platform) | C5 |
+| 10 | Linux: audio portal status; per-application PipeWire capture in Flatpak | [Linux](#linux) | C6 |
+| 11 | Android: low-latency MediaCodec keys per vendor | [Hardware encoders](#hardware-encoders-per-platform) | C7, F2 |
+| 12 | Android: `excludeUid` with `addMatchingUsage`; Play Console form for `mediaProjection` | [Android](#android), [Risks](#risks) | C8, C7 |
+| 13 | iOS 27: ScreenCaptureKit scope, background mode, audio exclusion | [iOS](#ios) | C9, C10 |
+| 14 | iOS extension: memory limit; `.audioApp` and Gwar's VoIP playback; networking or App Group hand-off | [iOS](#ios) | C9, C10 |
+| 15 | Browsers: H.264 in Chromium builds without proprietary codecs; Firefox High profile | [Browser interop](#browser-interop) | E1, F5 |
+| 16 | Browsers: offered H.264 levels and limits; SPS/PPS with every IDR | [Negotiation](#negotiation-a2), [SFU payload handling](#sfu-payload-handling-a1-a2) | E1 |
+| 17 | Browsers: other rewrites of the clear H.264 bytes by their depacketizers | [Encryption](#encryption-nal-aware-sframe) | E2 |
+| 18 | Browsers: in-place codec switching with `setParameters` | [Codec negotiation](#codec-negotiation-across-mixed-viewers) | E3 |
+| 19 | Hardware encoder session limits on consumer GPUs | [Simulcast or SVC](#simulcast-or-svc) | B11, F2 |
+| 20 | OpenH264: download at first use rather than at install | [Software fallbacks](#software-fallbacks) | owner decision 4, B3 |
+| 21 | OS codec licensing terms for distributors | [Risks](#risks) | owner |
+| 22 | WebKit and WebView2: a native audio source as a `MediaStreamTrack` | [Changes to screen-share PR 10](#changes-to-screen-share-pr-10) | C2, C4 |
+| 23 | UniFFI: foreign handles; C# generators | [The UniFFI boundary](#the-uniffi-boundary) | B9, owner decision 1 |
+| 24 | VP9 versus H.264 bitrate at equal quality | [Presets beyond 1080p](#presets-beyond-1080p) | F3 |
+| 25 | Lip-sync tolerance (EBU R37) used as F6's initial bound | [Track F](#track-f-measurements-and-qa) | F6, F8 |
