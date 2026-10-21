@@ -181,12 +181,14 @@ Windows details:
 
 #### Capture check (PR 1)
 
-A debug desktop build started with `GWAR_CAPTURE_CHECK=1` shows a check page
-instead of the app. It probes the webview microphone and camera (both must be
+A debug desktop app whose web bundle was built with `GWAR_CAPTURE_CHECK=1`
+(for example `GWAR_CAPTURE_CHECK=1 pnpm --filter desktop tauri dev`), and that
+is started with it, shows a check page instead of the app. It probes the webview microphone and camera (both must be
 denied), calls `getDisplayMedia` on a click, loops the track through a local
 `RTCPeerConnection` pair and logs the capture and encoder frame rate, split by
 window visibility, every 30 seconds. "Copy report" copies the samples as JSON.
-Release builds never show it.
+Release builds never show it, and bundles built without the variable do not
+contain it (the build fails if they do).
 
 | Platform | Picker | Capture | TCC prompt | fps, window hidden 5 min | Audio offered |
 | --- | --- | --- | --- | --- | --- |

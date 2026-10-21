@@ -20,10 +20,15 @@ interface Sample {
   encoded: number;
 }
 
+/**
+ * One click's capture, claimed before `getDisplayMedia` resolves so a second click cannot start
+ * another. Whatever arrives after it was stopped is released at once.
+ */
 interface Capture {
-  stream: MediaStream;
+  stream: MediaStream | null;
   peers: RTCPeerConnection[];
-  timer: ReturnType<typeof setInterval>;
+  timer: ReturnType<typeof setInterval> | null;
+  stopped: boolean;
 }
 
 /** Chromium's `CaptureController` (not in the DOM typings yet). */
@@ -72,6 +77,17 @@ function preferVp9(transceiver: RTCRtpTransceiver): void {
 async function loopback(track: MediaStreamTrack): Promise<RTCPeerConnection[]> {
   const send = new RTCPeerConnection();
   const receive = new RTCPeerConnection();
+  try {
+    await connect(send, receive, track);
+  } catch (e) {
+    send.close();
+    receive.close();
+    throw e;
+  }
+  return [send, receive];
+}
+
+async function connect(send: RTCPeerConnection, receive: RTCPeerConnection, track: MediaStreamTrack): Promise<void> {
   send.onicecandidate = (e) => void (e.candidate && receive.addIceCandidate(e.candidate).catch(() => {}));
   receive.onicecandidate = (e) => void (e.candidate && send.addIceCandidate(e.candidate).catch(() => {}));
   const transceiver = send.addTransceiver(track, { direction: "sendonly" });
@@ -83,7 +99,6 @@ async function loopback(track: MediaStreamTrack): Promise<RTCPeerConnection[]> {
   await receive.setRemoteDescription(send.localDescription!);
   await receive.setLocalDescription();
   await send.setRemoteDescription(receive.localDescription!);
-  return [send, receive];
 }
 
 function environment(): string[] {
@@ -139,14 +154,30 @@ export function CaptureCheck() {
 
   // No await before getDisplayMedia: it needs the click's user activation.
   const start = () => {
+    if (capture.current) return;
+    const session: Capture = { stream: null, peers: [], timer: null, stopped: false };
+    capture.current = session;
+    setCapturing(true);
     const { request, controller, asked } = requestCapture(Number(fps), audio === "on");
     request.then(
-      (stream) => void begin(stream, controller, asked),
-      (e: unknown) => report(`getDisplayMedia failed after ${Math.round(performance.now() - asked)} ms: ${describeError(e)}`),
+      (stream) => {
+        session.stream = stream;
+        if (session.stopped) return release(session);
+        void begin(session, stream, controller, asked);
+      },
+      (e: unknown) => {
+        report(`getDisplayMedia failed after ${Math.round(performance.now() - asked)} ms: ${describeError(e)}`);
+        if (capture.current === session) end();
+      },
     );
   };
 
-  const begin = async (stream: MediaStream, controller: CaptureControllerLike | undefined, asked: number) => {
+  const end = () => {
+    stop(capture);
+    setCapturing(false);
+  };
+
+  const begin = async (session: Capture, stream: MediaStream, controller: CaptureControllerLike | undefined, asked: number) => {
     try {
       controller?.setFocusBehavior("no-focus-change");
     } catch {
@@ -154,7 +185,11 @@ export function CaptureCheck() {
     }
     report(`getDisplayMedia resolved after ${Math.round(performance.now() - asked)} ms`);
     const [video] = stream.getVideoTracks();
-    if (!video) return report("no video track");
+    if (!video) {
+      report("no video track");
+      if (capture.current === session) end();
+      return;
+    }
     video.contentHint = "detail";
     report(`video settings: ${JSON.stringify(video.getSettings())}`);
     for (const track of stream.getAudioTracks()) report(`audio track: ${track.label} ${JSON.stringify(track.getSettings())}`);
@@ -164,6 +199,9 @@ export function CaptureCheck() {
       report(`loopback failed: ${describeError(e)}`);
       return [];
     });
+    session.peers = peers;
+    // Stopped while the peers connected: nothing more to measure.
+    if (session.stopped) return release(session);
     const started = performance.now();
     let last = { at: started, encoded: 0 };
     const timer = setInterval(() => {
@@ -192,9 +230,8 @@ export function CaptureCheck() {
         }
       });
     }, 1000);
-    capture.current = { stream, peers, timer };
+    session.timer = timer;
     setSamples([]);
-    setCapturing(true);
   };
 
   const latest = samples.at(-1);
@@ -218,7 +255,7 @@ export function CaptureCheck() {
           disabled={capturing}
         />
         <Button variant="primary" onClick={start} disabled={capturing}>Share screen</Button>
-        <Button onClick={() => { stop(capture); setCapturing(false); report("stopped"); }} disabled={!capturing}>Stop</Button>
+        <Button onClick={() => { end(); report("stopped"); }} disabled={!capturing}>Stop</Button>
         <Button onClick={copy}>Copy report</Button>
       </div>
       {latest && (
@@ -236,8 +273,15 @@ export function CaptureCheck() {
 function stop(capture: { current: Capture | null }): void {
   const current = capture.current;
   capture.current = null;
-  if (!current) return;
-  clearInterval(current.timer);
-  for (const track of current.stream.getTracks()) track.stop();
-  for (const peer of current.peers) peer.close();
+  if (current) release(current);
+}
+
+/** Marks a capture stopped and frees what it holds so far; later arrivals free themselves. */
+function release(session: Capture): void {
+  session.stopped = true;
+  if (session.timer !== null) clearInterval(session.timer);
+  session.timer = null;
+  for (const track of session.stream?.getTracks() ?? []) track.stop();
+  for (const peer of session.peers) peer.close();
+  session.peers = [];
 }

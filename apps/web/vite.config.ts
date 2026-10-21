@@ -9,6 +9,9 @@ import { join } from "node:path";
 // The app's version comes from package.json (set by scripts/bump-version.sh) and the commit it is
 // built from (CI's GITHUB_SHA, else git), so reports and the server know exactly which build runs.
 const version = (JSON.parse(readFileSync(new URL("./package.json", import.meta.url), "utf8")) as { version: string }).version;
+// The screen-capture check page (docs/screen-share.md, PR 1) is bundled only when asked for.
+const captureCheck = process.env.GWAR_CAPTURE_CHECK === "1";
+
 const commit = process.env.GITHUB_SHA ?? (() => {
   try { return execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(); } catch { return ""; }
 })();
@@ -23,6 +26,13 @@ export default defineConfig(({ command, mode }) => ({
       const policy = contentSecurityPolicy(mode === "desktop");
       const e2ePolicy = mode === "e2e" ? policy.replace("connect-src 'self' https: wss:", "connect-src 'self' https: wss: http://127.0.0.1:* http://localhost:* ws://127.0.0.1:* ws://localhost:*") : policy;
       return command === "build" ? html.replace("<head>", `<head>\n    <meta http-equiv="Content-Security-Policy" content="${e2ePolicy}" />`) : html;
+    },
+  }, {
+    // A build without the capture check must not ship its page.
+    name: "no-capture-check",
+    generateBundle(_, bundle) {
+      const leaked = Object.keys(bundle).filter((file) => file.includes("capture-check"));
+      if (!captureCheck && leaked.length > 0) this.error(`the capture check leaked into the bundle: ${leaked.join(", ")}`);
     },
   }, {
     // build.license lists the packages of the bundled code, not of assets: the font adds its own.
@@ -41,7 +51,7 @@ export default defineConfig(({ command, mode }) => ({
   },
   // licenses.md: the bundled packages' licenses, served with the app and shipped in the desktop bundle.
   build: { target: "es2022", sourcemap: true, license: { fileName: "licenses.md" } },
-  define: { __APP_VERSION__: JSON.stringify(version), __APP_COMMIT__: JSON.stringify(commit) },
+  define: { __APP_VERSION__: JSON.stringify(version), __APP_COMMIT__: JSON.stringify(commit), __CAPTURE_CHECK__: JSON.stringify(captureCheck) },
   // The browser e2e fixtures are imported at run time: scanning them up front
   // keeps Vite from reloading the pages when it finds their dependencies.
   optimizeDeps: { entries: ["index.html", "e2e/*.html", "e2e/*-fixture.{ts,tsx}"] },

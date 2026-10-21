@@ -522,11 +522,24 @@ permissions are absent. Custom commands below are app-owned IPC and need their
 own validation. A compromised renderer still has audio, TeamSpeak networking
 and identity-write access; CSP and frame validation reduce that exposure.
 
-Webview media permissions are app-owned too: only `main` may capture the
-display (screen sharing, docs/screen-share.md), and the webview microphone and
-camera are always denied, because voice is captured natively. Without this
-handler wry grants every microphone and camera request on macOS. WebKit on
-macOS and WebView2 route display capture through their own system pickers.
+Only the app's own document runs in the webview (`src/webview.rs`):
+
+- `main` navigates only within the app's origin (the dev server under
+  `tauri dev`);
+- it opens no windows: a link opened in a new window goes to the system
+  browser (http and https only);
+- the CSP allows no frames (`frame-src 'none'`).
+
+That is what limits screen capture (docs/screen-share.md) to the app.
+Neither WebKit nor WebView2 asks the permission handler about display
+capture: each has its own picker path, and wry forwards only microphone and
+camera requests. Intercepting WebKit's display-capture decision would need
+its private delegate SPI added to wry's delegate class, so it is not done.
+
+The webview microphone and camera are always denied, because voice is
+captured natively; without a handler wry grants them on macOS. On Windows a
+grant saved in the WebView2 profile skips the handler, so before the app
+loads, the main window sets both to deny for the app's origin.
 
 | Command | Risk and boundary |
 | --- | --- |
