@@ -541,6 +541,12 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
     `Client.channel_group` the channel group. The UI shows them by name next
     to members. They are display only and never Gwar roles: permissions stay
     with the TeamSpeak server.
+    - tsclientlib's book keeps every group a list ever named, so badges come
+      only from the groups in the latest complete `servergrouplist` /
+      `channelgrouplist`: a deleted group's badge goes, a renamed one changes.
+    - Order is TeamSpeak's: by sort id where both groups have one, by id where
+      either has none (0). At most 256 badges of each kind, named as one line
+      of plain text (`display_text`) of at most 64 characters.
 
 ## Clients
 

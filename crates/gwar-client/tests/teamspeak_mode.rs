@@ -417,6 +417,21 @@ async fn teamspeak_mode_shows_group_badges() {
         (default("virtualserver_default_server_group"), default("virtualserver_default_channel_group"));
     assert!(named(BadgeKind::Server, server_default).is_none(), "{badges:?}");
     assert!(named(BadgeKind::Channel, channel_default).is_none(), "{badges:?}");
+
+    // A new group's hostile name arrives as plain text, a rename replaces it, and a deleted
+    // group's badge goes although the book keeps the group.
+    let added = query.call(Cmd::new("servergroupadd").arg("name", "Q\u{202e}A\tZ")).await.unwrap();
+    let sgid: u32 = added[0].get("sgid").and_then(|v| v.parse().ok()).expect("sgid");
+    let badge = |server: &gwar_proto::ServerInfo| {
+        server.badges.iter().find(|b| b.kind == BadgeKind::Server && b.id == sgid).map(|b| b.name.clone())
+    };
+    let named_as =
+        |name: &'static str| move |e: &Event| matches!(e, Event::ServerUpdated(s) if badge(s).as_deref() == Some(name));
+    until(&mut bob.events, named_as("QA Z")).await;
+    query.call(Cmd::new("servergrouprename").arg("sgid", sgid).arg("name", "Renamed")).await.unwrap();
+    until(&mut bob.events, named_as("Renamed")).await;
+    query.call(Cmd::new("servergroupdel").arg("sgid", sgid).arg("force", 1)).await.unwrap();
+    until(&mut bob.events, |e| matches!(e, Event::ServerUpdated(s) if badge(s).is_none())).await;
 }
 
 /// TeamSpeak's own actions through our client: channel order, descriptions and family
