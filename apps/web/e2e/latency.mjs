@@ -29,6 +29,7 @@ import os from "node:os";
 import path from "node:path";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { setTimeout as wait } from "node:timers/promises";
 import { chromium, firefox, webkit } from "playwright";
 import { stopProcesses } from "./processes.mjs";
 import {
@@ -384,10 +385,7 @@ const collectGenerator = page => page.evaluate(() => window.__latency.generator.
  * so a timed-out run cannot overlap the next.
  */
 async function measure({ config, web, binary, dir, markers, warmupMs, record, owned }) {
-  const pause = ms => new Promise((resolve, reject) => {
-    const timer = setTimeout(resolve, ms);
-    owned.abort.signal.addEventListener("abort", () => { clearTimeout(timer); reject(new Error("run cancelled")); }, { once: true });
-  });
+  const pause = ms => wait(ms, undefined, { signal: owned.abort.signal });
   const fixture = await fixtureProcess(binary, web, dir, config.netSpec);
   const ready = await fixture.response("ready");
   record.fixture = { url: ready.url, media: ready.media, mediaBind: ready.mediaBind };
@@ -479,7 +477,7 @@ async function measure({ config, web, binary, dir, markers, warmupMs, record, ow
       const bytes = new Uint8Array(all.buffer);
       let binary = "";
       for (let i = 0; i < bytes.length; i += 0x8000) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
-      return { rate: slot.chunks[0]?.rate, chunks: slot.chunks.map(c => [c.ms, c.samples.length, c.timestamp]), pcm: btoa(binary) };
+      return { rate: slot.chunks[0]?.rate, origin: performance.timeOrigin, chunks: slot.chunks.map(c => [c.ms, c.samples.length, c.timestamp]), pcm: btoa(binary) };
     }) : null;
     const finish = await fixture.command("finish", "finish", 60_000);
     record.native = finish.native && { ...finish.native, blocks: undefined };
@@ -515,20 +513,25 @@ function segment(captures, samples, rate, timeOf) {
 
 /**
  * Decoded audio as the remote track delivers it. Chromium stamps each `AudioData` with its
- * delivery time (microseconds on its monotonic clock); the page reads it later, on its main
- * thread. Frames are timed from their stamps, placed on the measurement clock by the frame read
- * soonest after its stamp (the smallest read-minus-stamp), so main-thread delay does not enter.
- * Read lags and the read-timed result are kept for comparison. Without increasing stamps, frames
- * are timed from their reads and `timing` says so. Samples follow their frame's time, like a
- * capture callback's.
+ * delivery time, in microseconds since the page's time origin; the page reads it later, on its
+ * main thread. Frames are timed from their stamps placed directly on the measurement clock
+ * (`performance.timeOrigin` + stamp), so main-thread delay does not enter. The mapping is only
+ * used once it checks out: no frame may be read before its stamp, and the median read lag must
+ * stay under `STAMP_LAG_MS`. Otherwise frames are timed from their reads and `timing` says so.
+ * Absolute read lags and the read-timed result are kept for comparison. Samples follow their
+ * frame's time, like a capture callback's.
  */
+const STAMP_LAG_MS = 20;
+const STAMP_SLACK_MS = 0.5;
 function decodedSegment(captures, decoded) {
   const bytes = Buffer.from(decoded.pcm, "base64");
   const all = new Float32Array(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.length));
-  const { chunks, rate } = decoded;
-  const stamped = chunks.every(([, , ts], i) => Number.isFinite(ts) && (i === 0 || ts > chunks[i - 1][2]));
-  const lags = chunks.map(([ms, , ts]) => ms - ts / 1000);
-  const offset = Math.min(...lags);
+  const { chunks, rate, origin } = decoded;
+  const increasing = chunks.every(([, , ts], i) => Number.isFinite(ts) && (i === 0 || ts > chunks[i - 1][2]));
+  const stampTimes = chunks.map(([, , ts]) => origin + ts / 1000);
+  const lags = chunks.map(([ms], i) => ms - stampTimes[i]).sort((a, b) => a - b);
+  const lag = { min: lags[0], median: quantile(lags, 0.5), p95: quantile(lags, 0.95), max: lags.at(-1) };
+  const stamped = Number.isFinite(origin) && increasing && lag.min >= -STAMP_SLACK_MS && lag.median <= STAMP_LAG_MS;
   const starts = [];
   let length = 0;
   for (const [, n] of chunks) { starts.push(length); length += n; }
@@ -538,15 +541,14 @@ function decodedSegment(captures, decoded) {
     return times[low] + (i - starts[low]) * 1000 / rate;
   };
   const read = segment(captures, all, rate, timed(chunks.map(([ms]) => ms)));
-  const result = stamped ? segment(captures, all, rate, timed(chunks.map(([, , ts]) => ts / 1000 + offset))) : read;
-  const readLags = lags.map(lag => lag - offset).sort((a, b) => a - b);
+  const result = stamped ? segment(captures, all, rate, timed(stampTimes)) : read;
   const steps = new Map();
   chunks.slice(1).forEach(([, , ts], i) => { const step = Math.round((ts - chunks[i][2]) / 1000); steps.set(step, (steps.get(step) ?? 0) + 1); });
   return {
     ...result, timing: stamped ? "timestamp" : "read", frameSamples: chunks[0][1],
     readTimedMedianMs: read.median_ms,
-    // How much later than the soonest read each frame was read.
-    readLagMs: { median: quantile(readLags, 0.5), p95: quantile(readLags, 0.95), max: readLags.at(-1) },
+    // Read time minus stamp time, per frame, on the measurement clock.
+    readLagMs: lag,
     timestampStepsMs: Object.fromEntries([...steps].sort((a, b) => b[1] - a[1]).slice(0, 8)),
   };
 }

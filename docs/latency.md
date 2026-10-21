@@ -892,10 +892,12 @@ Two further points are timed in Chromium on the same captures, as segments, not
 gates: `sentSegment`, what the sending app's noise suppression sends (a tap on its
 worklet), and `decodedSegment`, decoded audio as the remote track delivers it to
 its sinks (a `MediaStreamTrackProcessor`), before the app's WebAudio graph. Chromium
-stamps each delivered `AudioData` with its delivery time; the page reads it later on
-its main thread, so frames are timed from their stamps, placed on the measurement
-clock by the frame read soonest after its stamp. The run keeps the read lags and the
-read-timed result beside it.
+stamps each delivered `AudioData` with its delivery time, in microseconds since the
+page's time origin; the page reads it later on its main thread. Frames are timed from
+their stamps placed directly on the measurement clock (`performance.timeOrigin` +
+stamp), once each run checks the mapping: no frame read before its stamp, median read
+lag under 20 ms; otherwise the run falls back to read times and says so (`timing`).
+The run keeps the absolute read lags and the read-timed result beside it.
 `mic=track` (Chromium) replaces the worklet microphone with a
 `MediaStreamTrackGenerator` fed 10 ms `AudioData` from the page, each frame timed
 from its write: no WebAudio on the sending side.
@@ -960,9 +962,11 @@ The harness gained its segment taps during the session (`sentSegment` from set E
 `decodedSegment` in set I); clocks, detection and matching were the same in every
 set. A later single native→browser check (20 markers, 3 s warmup) measured 35.8 ms
 with NetEq buffering 13.5 ms: NetEq's buffering, not a fixed cost, separates such
-runs. Set I's segment was timed from frame reads, before the stamps were used; four
-later runs (load 12–24) timed both ways differed by at most 0.11 ms (read lag median
-0.1 ms, p95 0.2 ms, single frames up to 37 ms), the hop then measuring 13.4–14.5 ms.
+runs. Set I's segment was timed from frame reads, before the stamps were used. Two
+later runs with the stamps mapped directly (load 10) passed the check: absolute read
+lag minimum 0 ms, median 0.0 ms, p95 0.1 ms, single frames up to 21 ms, and stamp- and
+read-timed medians within 0.001 ms. Main-thread delay therefore does not bias set I's
+read-timed hop; four runs at load 12–24, timed both ways, put the hop at 13.4–14.5 ms.
 Set F/G ran `target/release/examples/latency` directly with
 `LATENCY_WAIT_CONNECTED=1` and `LATENCY_WARMUP_MS` 5000/15000, after the browser
 sets. No run had an output underrun (Chromium `playbackStats`) or a native
