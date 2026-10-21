@@ -71,9 +71,17 @@ describe("TsConnection", () => {
     expect(seen).toEqual(["welcome", "voice.talking"]);
     expect(conn.isOnline).toBe(true);
     await expect(conn.request("ping", {})).rejects.toBeInstanceOf(RequestError);
-    expect(calls.find((c) => c.command === "ts_connect")?.args).toMatchObject({ address: "h:9987", nickname: "n", password: null, identity: "uid-1" });
+    expect(calls.find((c) => c.command === "ts_connect")?.args).toMatchObject({ address: "h:9987", nickname: "n", password: null, identity: "uid-1", channel: null, channelPassword: null });
     conn.close();
     expect(calls.at(-1)?.command).toBe("ts_disconnect");
+  });
+
+  it("asks for a bookmark's channel and its password", async () => {
+    const { bridge, calls } = fakeBridge();
+    const conn = new TsConnection({ address: "h:9987", nickname: "n", channel: "Lobby/Games", channelPassword: "pw", bridge: async () => bridge });
+    await conn.connect();
+    expect(calls.find((c) => c.command === "ts_connect")?.args).toMatchObject({ channel: "Lobby/Games", channelPassword: "pw" });
+    conn.close();
   });
 });
 

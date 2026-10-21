@@ -131,6 +131,7 @@ struct ClosedPayload {
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn ts_connect(
     app: AppHandle,
     ts: State<'_, Ts>,
@@ -139,6 +140,8 @@ pub async fn ts_connect(
     nickname: String,
     password: Option<String>,
     identity: Option<String>,
+    channel: Option<String>,
+    channel_password: Option<String>,
 ) -> Result<Value, String> {
     ts.close();
     // From the account's identities if signed in to Gwar Connect, else this device's own.
@@ -154,6 +157,8 @@ pub async fn ts_connect(
         nickname,
         server_password: password.filter(|p| !p.is_empty()),
         identity,
+        channel,
+        channel_password,
     })
     .await
     .map_err(|e| format!("{e:#}"))?;

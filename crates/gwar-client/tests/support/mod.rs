@@ -117,6 +117,16 @@ pub async fn ts_client(address: SocketAddr, nickname: &str) -> TsConnected {
 
 /// Like [`ts_client`], with a given identity.
 pub async fn ts_client_as(address: SocketAddr, nickname: &str, identity: tsclientlib::Identity) -> TsConnected {
+    ts_client_into(address, nickname, identity, None).await
+}
+
+/// Like [`ts_client_as`], landing in a channel (a `Parent/Child` path) with its password.
+pub async fn ts_client_into(
+    address: SocketAddr,
+    nickname: &str,
+    identity: tsclientlib::Identity,
+    channel: Option<(&str, &str)>,
+) -> TsConnected {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     loop {
         let options = TsOptions {
@@ -124,6 +134,8 @@ pub async fn ts_client_as(address: SocketAddr, nickname: &str, identity: tsclien
             nickname: nickname.into(),
             server_password: None,
             identity: identity.clone(),
+            channel: channel.map(|(path, _)| path.into()),
+            channel_password: channel.map(|(_, password)| password.into()),
         };
         match teamspeak::connect(options).await {
             Ok(connected) => return connected,

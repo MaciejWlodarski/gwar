@@ -97,8 +97,21 @@ wire! {
             #[serde(default, skip_serializing_if = "Option::is_none")]
             deafened: Option<bool>,
         },
+        /// Kicks from the server, or (TeamSpeak servers only) `from_channel` back to the default channel.
         #[serde(rename = "client.kick")]
-        ClientKick { client: SessionId, #[serde(default)] reason: Option<String> },
+        ClientKick {
+            client: SessionId,
+            #[serde(default)]
+            reason: Option<String>,
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            from_channel: bool,
+        },
+        /// Gets someone's attention with a short message (TeamSpeak servers only).
+        #[serde(rename = "client.poke")]
+        ClientPoke { client: SessionId, message: String },
+        /// A channel's long description, as plain text (TeamSpeak servers only); answers `{description}`.
+        #[serde(rename = "channel.description")]
+        ChannelDescription { channel: ChannelId },
         /// Joins the channel's voice room (leaving any other).
         #[serde(rename = "channel.join")]
         ChannelJoin { channel: ChannelId, #[serde(default)] password: Option<String> },
@@ -628,6 +641,9 @@ wire! {
         ClientUpdated(Client),
         #[serde(rename = "client.left")]
         ClientLeft { client: SessionId, reason: LeaveReason },
+        /// Someone pokes me (TeamSpeak servers only).
+        #[serde(rename = "client.poked")]
+        ClientPoked { client: SessionId, nickname: String, message: String },
         #[serde(rename = "chat.message")]
         ChatMessage(ChatMessage),
         #[serde(rename = "chat.edited")]
@@ -846,6 +862,9 @@ wire! {
         pub position: i32,
         pub has_password: bool,
         pub max_clients: Option<u32>,
+        /// TeamSpeak servers only: the most clients in this channel and its subchannels together.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub max_family_clients: Option<u32>,
         /// End-to-end encrypted, fixed at creation (docs/e2e-build.md, section 4).
         pub encrypted: bool,
         /// New members see earlier messages; for display only, clients trust the group's descriptor.

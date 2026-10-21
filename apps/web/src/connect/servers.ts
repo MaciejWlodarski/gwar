@@ -31,6 +31,9 @@ export interface VaultServer {
   password?: string;
   /** TeamSpeak only: the uid of the identity to connect with. */
   identity?: string;
+  /** TeamSpeak only: the channel to land in (`Parent/Child`) and its password. */
+  channel?: string;
+  channel_password?: string;
   /** Unix ms of the last change, or of the removal. */
   updated_at: number;
   deleted?: true;
@@ -75,12 +78,16 @@ export function vaultServers(contents: VaultContents): VaultServer[] {
     if (!address) continue;
     seen.add(id);
     const kind: ServerKind = e.kind === "teamspeak" ? "teamspeak" : "gwar";
-    const { password: _p, identity: _i, deleted: _d, ...unknown } = e;
+    const { password: _p, identity: _i, channel: _c, channel_password: _cp, deleted: _d, ...unknown } = e;
     const entry: VaultServer = { ...unknown, id, name: text(e.name, LIMITS.name)?.trim() || address, address, kind, updated_at: at };
     const password = text(e.password, LIMITS.password);
     const identity = kind === "teamspeak" ? text(e.identity, LIMITS.identity) : undefined;
+    const channel = kind === "teamspeak" ? text(e.channel, LIMITS.channel) : undefined;
+    const channelPassword = channel ? text(e.channel_password, LIMITS.channelPassword) : undefined;
     if (password) entry.password = password;
     if (identity) entry.identity = identity;
+    if (channel) entry.channel = channel;
+    if (channelPassword) entry.channel_password = channelPassword;
     out.push(entry);
   }
   return out;
@@ -97,6 +104,10 @@ export function fromBookmark(b: Bookmark): VaultServer {
   const entry: VaultServer = { id: b.id, name: b.name.trim().slice(0, LIMITS.name) || address, address, kind: b.kind, updated_at: b.updatedAt };
   if (b.password) entry.password = b.password;
   if (b.kind === "teamspeak" && b.identity) entry.identity = b.identity;
+  if (b.kind === "teamspeak" && b.channel) {
+    entry.channel = b.channel;
+    if (b.channelPassword) entry.channel_password = b.channelPassword;
+  }
   return entry;
 }
 
@@ -119,7 +130,7 @@ export function mergeServers(vault: VaultServer[], local: LocalServers, now: num
     else if (ours.deleted) merged.push(ours);
     else {
       // This device's newer version, keeping fields of the vault entry it does not know.
-      const { password: _p, identity: _i, deleted: _d, ...unknown } = theirs;
+      const { password: _p, identity: _i, channel: _c, channel_password: _cp, deleted: _d, ...unknown } = theirs;
       merged.push({ ...unknown, ...ours });
     }
   }
@@ -158,6 +169,8 @@ export function toBookmarks(entries: VaultServer[], previous: Bookmark[], accoun
       const b: Bookmark = { id: e.id, name: e.name, address: e.address, kind: e.kind, updatedAt: e.updated_at, account };
       if (e.password) b.password = e.password;
       if (e.identity) b.identity = e.identity;
+      if (e.channel) b.channel = e.channel;
+      if (e.channel_password) b.channelPassword = e.channel_password;
       if (old?.insecureLan && e.kind === "gwar" && old.address.trim() === e.address) b.insecureLan = true;
       return b;
     });

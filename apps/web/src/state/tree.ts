@@ -6,6 +6,8 @@ export interface ChannelNode {
   depth: number;
   children: ChannelNode[];
   clients: Client[];
+  /** A TeamSpeak family limit on this channel or one above it is reached: no one more gets in. */
+  familyFull: boolean;
 }
 
 const byName = (a: Client, b: Client) => a.nickname.localeCompare(b.nickname, undefined, { sensitivity: "base" }) || a.id - b.id;
@@ -40,9 +42,19 @@ export function buildTree(channels: Channel[], clients: Client[]): ChannelNode[]
           depth,
           children: build(channel.id, depth + 1, nextSeen),
           clients: (usersIn.get(channel.id) ?? []).sort(byName),
+          familyFull: false,
         };
       });
-  return build(null, 0, new Set());
+  const tree = build(null, 0, new Set());
+  const markFamilies = (nodes: ChannelNode[], above: boolean) => {
+    for (const node of nodes) {
+      const limit = node.channel.max_family_clients ?? null;
+      node.familyFull = above || (limit !== null && descendantsCount(node) >= limit);
+      markFamilies(node.children, node.familyFull);
+    }
+  };
+  markFamilies(tree, false);
+  return tree;
 }
 
 /** Number of users in a channel and all its subchannels. */
@@ -50,7 +62,7 @@ export function descendantsCount(node: ChannelNode): number {
   return node.clients.length + node.children.reduce((n, c) => n + descendantsCount(c), 0);
 }
 
-/** No room left: as many users as the channel's limit (a TeamSpeak limit may also be 0). */
+/** No room left: as many users as the channel's limit (a TeamSpeak limit may also be 0), or a family limit reached. */
 export function isFull(node: ChannelNode): boolean {
-  return node.channel.max_clients !== null && node.clients.length >= node.channel.max_clients;
+  return (node.channel.max_clients !== null && node.clients.length >= node.channel.max_clients) || node.familyFull;
 }

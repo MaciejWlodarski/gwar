@@ -17,6 +17,8 @@ async fn main() -> anyhow::Result<()> {
         nickname,
         server_password: None,
         identity: teamspeak::load_identity(&std::env::temp_dir().join("gwar-ts-probe-identity.json"))?,
+        channel: None,
+        channel_password: None,
     })
     .await?;
     let me = ts.welcome.session;

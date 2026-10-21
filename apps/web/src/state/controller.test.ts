@@ -507,12 +507,43 @@ describe("telling the server what I have read", () => {
   });
 });
 
+describe("TeamSpeak actions", () => {
+  const teamspeak = () => connectFake({ channel: 1, kind: "teamspeak", permissions: ["connect", "kick_members", "manage_channels"] });
+
+  it("shows a poke and keeps it out of the session", async () => {
+    teamspeak();
+    const before = session();
+    link.emit({ ev: "client.poked", d: { client: 99, nickname: "bob", message: "look" } });
+    expect(stores.useUi.getState().toasts.map((t) => t.text)).toEqual(["bob pokes you: look"]);
+    expect(session().threads).toEqual(before.threads);
+  });
+
+  it("pokes, kicks from the channel, reads descriptions and moves channels among their siblings", async () => {
+    teamspeak();
+    await controller.pokeClient(2, "hi");
+    expect(link.sent("client.poke").at(-1)?.d).toEqual({ client: 2, message: "hi" });
+    await controller.kickFromChannel(2);
+    expect(link.sent("client.kick").at(-1)?.d).toEqual({ client: 2, reason: null, from_channel: true });
+    for (const c of [{ id: 1, position: 0 }, { id: 2, position: 1 }, { id: 3, position: 2 }]) {
+      link.emit({ ev: "channel.updated", d: { ...session().channels[c.id] ?? chan(c.id), position: c.position, parent: null } });
+    }
+    await controller.moveChannelBy(2, 1);
+    expect(link.sent("channel.update").at(-1)?.d).toEqual({ channel: 2, position: 2 });
+    await controller.moveChannelBy(2, -1);
+    expect(link.sent("channel.update").at(-1)?.d).toEqual({ channel: 2, position: 0 });
+    const updates = link.sent("channel.update").length;
+    await controller.moveChannelBy(1, -1);
+    await controller.moveChannelBy(3, 1);
+    expect(link.sent("channel.update")).toHaveLength(updates);
+  });
+});
+
 describe("request errors", () => {
   it("say which part of a half-done change went through", async () => {
     const { RequestError } = await import("../net/connection");
     const { describeRequestError } = await import("./controller");
-    const text = describeRequestError(new RequestError("partial", "channel edited, but not moved (TeamSpeak: refused)"));
-    expect(text).toBe("Only part of that went through (channel edited, but not moved (TeamSpeak: refused))");
+    const text = describeRequestError(new RequestError("partial", "the edit went through, the move did not (TeamSpeak: refused)"));
+    expect(text).toBe("Only part of that went through (the edit went through, the move did not (TeamSpeak: refused))");
   });
 });
 

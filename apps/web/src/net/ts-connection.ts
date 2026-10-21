@@ -30,6 +30,9 @@ export interface TsConnectionOptions {
   serverPassword?: string;
   /** The uid of the TeamSpeak identity to use; the desktop falls back to its default one. */
   identity?: string;
+  /** The channel to land in (`Parent/Child`) and its password; the server's default channel if missing. */
+  channel?: string;
+  channelPassword?: string;
   requestTimeoutMs?: number;
   /** Test seams. */
   bridge?: () => Promise<TauriBridge>;
@@ -210,6 +213,8 @@ export class TsConnection implements Link {
         nickname: this.options.nickname,
         password: this.options.serverPassword ?? null,
         identity: this.options.identity ?? null,
+        channel: this.options.channel ?? null,
+        channelPassword: this.options.channelPassword ?? null,
       });
       if (!responseFor("join", welcome)) {
         console.warn("Dropped malformed native welcome");

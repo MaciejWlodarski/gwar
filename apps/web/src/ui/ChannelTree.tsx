@@ -1,8 +1,11 @@
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import {
   Ban,
+  ArrowDown,
+  ArrowUp,
   ChevronRight,
   EyeOff,
+  Info,
   Hash,
   HeadphoneOff,
   Headphones,
@@ -17,6 +20,7 @@ import {
   Plus,
   ShieldCheck,
   Trash2,
+  Users,
   Volume2,
 } from "lucide-react";
 import { memo, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
@@ -117,6 +121,14 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
   const count = node.clients.length;
   const full = isFull(node);
   const spacer = onGwar ? null : parseSpacer(channel.name, node.depth === 0);
+  const familyMax = channel.max_family_clients ?? null;
+  // TeamSpeak sorts siblings by hand: where this one stands among them.
+  const place = useSession((s) => {
+    if (s.kind !== "teamspeak") return null;
+    const siblings = Object.values(s.channels).filter((c) => c.parent === channel.parent);
+    const before = siblings.filter((c) => c.position < channel.position || (c.position === channel.position && c.id < channel.id)).length;
+    return before === siblings.length - 1 ? (before === 0 ? "only" : "last") : before === 0 ? "first" : "middle";
+  });
 
   const join = () => {
     if (canJoin) void controller.joinChannelInteractive(channel.id);
@@ -225,6 +237,15 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
               {channel.max_clients !== null ? `${count}/${channel.max_clients}` : count}
             </span>
           )}
+          {familyMax !== null && !spacer && (
+            <span
+              className={cn("flex shrink-0 items-center gap-0.5 text-xs tabular-nums", node.familyFull ? "font-medium text-danger" : "text-subtle")}
+              title={t("tree.familyLimit", { count: total, max: familyMax })}
+            >
+              <Users aria-hidden className="size-3" />
+              {`${total}/${familyMax}`}
+            </span>
+          )}
           {collapsed && total > 0 && <span className="shrink-0 rounded-full bg-hover px-1.5 text-xs tabular-nums text-muted">{total}</span>}
           <MentionBadge count={mentions} />
           <UnreadBadge count={unread} />
@@ -254,6 +275,11 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           <ContextMenu.Item className={menuItem} disabled={current || !canJoin} onSelect={join}>
             <LogIn className="size-4" /> {t("tree.joinVoice")}
           </ContextMenu.Item>
+          {!onGwar && (
+            <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "channelInfo", channel: channel.id })}>
+              <Info className="size-4" /> {t("tree.info")}
+            </ContextMenu.Item>
+          )}
           {(canCreate || canEdit || canDelete) && <ContextMenu.Separator className={menuSeparator} />}
           {canCreate && (
             <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "channelEdit", mode: "create", parent: channel.id })}>
@@ -264,6 +290,16 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
             <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "channelEdit", mode: "edit", channel: channel.id })}>
               <Pencil className="size-4" /> {t("tree.edit")}
             </ContextMenu.Item>
+          )}
+          {canEdit && place && (
+            <>
+              <ContextMenu.Item className={menuItem} disabled={place === "first" || place === "only"} onSelect={() => void controller.moveChannelBy(channel.id, -1)}>
+                <ArrowUp className="size-4" /> {t("tree.moveUp")}
+              </ContextMenu.Item>
+              <ContextMenu.Item className={menuItem} disabled={place === "last" || place === "only"} onSelect={() => void controller.moveChannelBy(channel.id, 1)}>
+                <ArrowDown className="size-4" /> {t("tree.moveDown")}
+              </ContextMenu.Item>
+            </>
           )}
           {canEdit && onGwar && (
             <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "channelPermissions", channel: channel.id })}>

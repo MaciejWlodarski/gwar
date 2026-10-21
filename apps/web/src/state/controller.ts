@@ -42,6 +42,7 @@ import type { GroupCreate } from "../proto/GroupCreate";
 import type { GroupUpdate } from "../proto/GroupUpdate";
 import type { InviteCreate } from "../proto/InviteCreate";
 import type { ServerUpdate } from "../proto/ServerUpdate";
+import type { EventData } from "../net/protocol";
 import {
   ConnectError,
   Connection,
@@ -58,8 +59,8 @@ import { isDesktop } from "../platform";
 import { createVoiceEngine } from "../voice";
 import { microphoneSsrc } from "../voice/sdp";
 import { VoiceError, type VoiceEngine } from "../voice/engine";
-import { channelThreadKey, latestMessageId, myChannelId, storedKey } from "./reducer";
-import { inAccount, newId, useSettings, type ServerKind } from "./settings";
+import { channelThreadKey, latestMessageId, myChannelId, sortedChannels, storedKey } from "./reducer";
+import { inAccount, newId, useSettings, type Bookmark, type ServerKind } from "./settings";
 import { sameServer } from "../lib/server-key";
 import { useConnectUi, useOutbox, useSession, useUi, useVoice, type FailedSend } from "./stores";
 import type { ThreadKey } from "./types";
@@ -100,6 +101,22 @@ export interface ConnectParams {
   insecureLan?: boolean;
   /** TeamSpeak only: the uid of the identity to connect with (default: the default one). */
   identity?: string;
+  /** TeamSpeak only: the channel to land in (`Parent/Child`) and its password. */
+  channel?: string;
+  channelPassword?: string;
+}
+
+/** How a saved server is connected to. */
+export function bookmarkParams(b: Pick<Bookmark, "kind" | "address" | "password" | "identity" | "channel" | "channelPassword" | "insecureLan">): ConnectParams {
+  return {
+    kind: b.kind,
+    address: b.address,
+    password: b.password,
+    identity: b.identity,
+    channel: b.channel,
+    channelPassword: b.channelPassword,
+    insecureLan: b.insecureLan,
+  };
 }
 
 export type UploadErrorKind = "disabled" | "too_large" | "quota" | "empty" | "forbidden" | "network" | "aborted" | "unsupported";
@@ -376,6 +393,8 @@ class Controller {
         nickname: (await this.getIdentity()).nickname,
         serverPassword: params.password || undefined,
         identity: params.identity,
+        channel: params.channel || undefined,
+        channelPassword: params.channel ? params.channelPassword || undefined : undefined,
       });
     } else {
       const parsed = parseServerAddress(params.address, pageContextFromLocation(), params.insecureLan);
@@ -587,6 +606,10 @@ class Controller {
           // Removed rows may never have been loaded here: count again from the server.
           void this.sealed?.refreshUnread(event.d.conversation, event.d.ids).catch(() => {});
         }).catch(error => console.warn("Conversation message:", error));
+        return;
+      }
+      if (event.ev === "client.poked") {
+        this.poked(event.d);
         return;
       }
       if ((event.ev === "chat.message" || event.ev === "chat.edited") && typeof event.d.target === "object" && "client" in event.d.target) {
@@ -1369,6 +1392,32 @@ class Controller {
     return this.attempt(this.connection.request("client.kick", { client, reason: reason ?? null }));
   }
 
+  /** TeamSpeak only: back to the server's default channel, still on the server. */
+  kickFromChannel(client: number) {
+    return this.attempt(this.connection.request("client.kick", { client, reason: null, from_channel: true }));
+  }
+
+  /** TeamSpeak only. */
+  pokeClient(client: number, message: string) {
+    return this.connection.request("client.poke", { client, message });
+  }
+
+  /** TeamSpeak only: a channel's description, as plain text. */
+  async channelDescription(channel: number): Promise<string> {
+    return (await this.connection.request("channel.description", { channel })).description;
+  }
+
+  /** TeamSpeak only: one place up (-1) or down (+1) among its siblings. */
+  moveChannelBy(channel: number, step: -1 | 1) {
+    const s = useSession.getState(), parent = s.channels[channel]?.parent ?? null;
+    const siblings = sortedChannels(Object.values(s.channels)).filter((c) => c.parent === parent);
+    const at = siblings.findIndex((c) => c.id === channel);
+    const to = at + step;
+    if (at < 0 || to < 0 || to >= siblings.length) return Promise.resolve(undefined);
+    // The place among the other siblings, as `channel.update` counts it.
+    return this.attempt(this.updateChannel({ channel, position: to }));
+  }
+
   // ------------------------------------------------------------- moderation
 
   createGroup(g: GroupCreate) {
@@ -1838,6 +1887,16 @@ class Controller {
         onClick: () => this.openMessage(msg),
       });
     };
+  }
+
+  /** Someone pokes me (TeamSpeak): a toast, and a system notification while the app is in the background. */
+  private poked(poke: EventData<"client.poked">): void {
+    const s = useSession.getState();
+    const name = memberName(s.members, s.clients[poke.client]?.uid ?? "", poke.nickname);
+    useUi.getState().toast("info", poke.message ? tNow("poke.received", { name, message: poke.message }) : tNow("poke.receivedEmpty", { name }));
+    if (!s.focused && useSettings.getState().notifications.privateMessages) {
+      notify({ title: tNow("poke.title", { name }), body: poke.message, tag: `poke-${poke.client}-${Date.now()}` });
+    }
   }
 
   /** Brings up the conversation a message belongs to (clicking a notification). */

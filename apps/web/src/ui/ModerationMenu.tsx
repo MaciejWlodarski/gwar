@@ -1,5 +1,5 @@
 import * as ContextMenu from "@radix-ui/react-context-menu";
-import { Ban, Pencil, ChevronRight, HeadphoneOff, MicOff, ShieldCheck, UserMinus, UserX } from "lucide-react";
+import { Ban, BellRing, DoorOpen, Pencil, ChevronRight, HeadphoneOff, MicOff, ShieldCheck, UserMinus, UserX } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { isTeamSpeak } from "../lib/platform";
@@ -12,7 +12,8 @@ import { menuContent, menuItem, menuItemDanger, menuSeparator } from "./kit";
 /**
  * Kick, ban, remove and role items for the context menu of a person (in the channel
  * tree or the member list). Each shows only if I may use it; role toggles that
- * would break a rule are disabled instead.
+ * would break a rule are disabled instead. On TeamSpeak servers the server decides,
+ * so the TeamSpeak actions (poke, kick from the channel, ban) are offered to everyone.
  */
 export function ModerationItems({ person, groups }: { person: PersonRef; groups: number[] }) {
   const t = useT();
@@ -29,17 +30,21 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
   // Muting for everyone: in the channel the person is in.
   const target = useSession((s) => (person.session !== undefined ? s.clients[person.session] : undefined));
   const canMuteHere = useChannelPermission(target?.channel ?? null, "mute_members");
-  // TeamSpeak servers keep their own bans and roles: only kicking is offered there, as before.
+  // TeamSpeak servers keep their own roles and member list: they get TeamSpeak's own actions instead.
   const onGwar = kind === "gwar";
+  const online = person.session !== undefined;
+  const onTs = kind === "teamspeak" && !isMe && online;
   // Only someone ranked below me (docs/roles.md).
   const stronger = onGwar && !canActOn(me, rank, defs);
   const showRename = onGwar && (isMe || (canRename && !stronger));
-  const showKick = !isMe && canKick && person.session !== undefined;
-  const showBan = !isMe && onGwar && canBan;
+  const showPoke = onTs;
+  const showKickChannel = onTs && canKick;
+  const showKick = !isMe && canKick && online;
+  const showBan = !isMe && canBan && (onGwar || onTs);
   const showRoles = !isMe && onGwar && canGroups;
   const showRemove = !isMe && onGwar && canRemove;
   const showVoice = !isMe && onGwar && !!target && target.channel !== null && canMuteHere;
-  if (!showRename && !showKick && !showBan && !showRoles && !showRemove && !showVoice) return null;
+  if (!showRename && !showPoke && !showKick && !showBan && !showRoles && !showRemove && !showVoice) return null;
 
   const roles = orderedGroups(defs).filter((g) => g.id !== MEMBER_GROUP);
 
@@ -110,6 +115,16 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
             </ContextMenu.Item>
           )}
         </>
+      )}
+      {showPoke && (
+        <ContextMenu.Item className={menuItem} onSelect={() => useUi.getState().openDialog({ kind: "poke", person })}>
+          <BellRing className="size-4" /> {t("poke.action")}
+        </ContextMenu.Item>
+      )}
+      {showKickChannel && (
+        <ContextMenu.Item className={cn(menuItem, menuItemDanger)} onSelect={() => void controller.kickFromChannel(person.session!)}>
+          <DoorOpen className="size-4" /> {t("tree.kickChannel")}
+        </ContextMenu.Item>
       )}
       {showKick && (
         <ContextMenu.Item
