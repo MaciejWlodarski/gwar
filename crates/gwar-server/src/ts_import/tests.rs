@@ -766,3 +766,28 @@ fn imported_names_and_texts_lose_bidi_formatting() {
     let ban = &planned.bans.iter().find(|b| b.ts_id == 1).unwrap().ban;
     assert_eq!((ban.nickname.as_str(), ban.reason.as_deref()), ("Troll", Some("spam")));
 }
+
+#[test]
+fn channels_that_clean_to_one_path_take_no_password_from_the_file() {
+    let mut s = source();
+    // Clan/Room and a sibling that differs only by a bidi character, both with a password.
+    let mut twin = s.channels[2].clone();
+    twin.insert("cid".into(), "8".into());
+    twin.insert("channel_name".into(), "Ro\u{202e}om".into());
+    twin.insert("channel_flag_password".into(), "1".into());
+    s.channels.push(twin);
+    s.channels[2].insert("channel_flag_password".into(), "1".into());
+    let with = |pairs: &[(&str, &str)]| Options {
+        passwords: pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect(),
+        ..Default::default()
+    };
+    let error = super::plan::plan(&s, &with(&[("Clan/Room", "secret")])).unwrap_err().to_string();
+    assert!(error.contains("several channels"), "{error}");
+    let planned = plan(&s, &Options::default());
+    let rooms: Vec<_> = planned.channels.iter().filter(|c| c.name == "Room").collect();
+    assert_eq!(rooms.len(), 2);
+    assert!(rooms.iter().all(|c| c.password == Password::Locked));
+    assert!(!planned.password_keys.iter().any(|k| k == "Clan/Room"));
+    assert!(!super::plan::passwords_template(&planned).contains("Clan/Room"));
+    assert!(planned.notes.iter().any(|n| n.contains("\"Clan/Room\"") && n.contains("several channels have this path")));
+}

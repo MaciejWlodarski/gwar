@@ -402,7 +402,16 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
     for cid in kept.keys() {
         *name_count.entry(channel_name(&kept, *cid)).or_default() += 1;
     }
+    // Siblings whose names differ only by what `fit` drops (or past its length) share a path:
+    // no key can tell them apart, so none of them takes a password from the file.
+    let mut path_count: BTreeMap<&str, usize> = BTreeMap::new();
+    for path in paths.values() {
+        *path_count.entry(path.as_str()).or_default() += 1;
+    }
     for key in options.passwords.keys().filter(|k| k.as_str() != SERVER_PASSWORD) {
+        if path_count.get(key.as_str()).is_some_and(|n| *n > 1) {
+            bail!("the passwords file names \"{key}\", the path of several channels: set their passwords in Gwar");
+        }
         if !paths.values().any(|p| p == key) && name_count.get(key).is_some_and(|n| *n > 1) {
             bail!("the passwords file names \"{key}\", which several channels are called: write the channel's path");
         }
@@ -458,13 +467,20 @@ pub fn plan(source: &Source, options: &Options) -> Result<Plan> {
             }
             let overrides = merge_overrides(overrides);
             let password = if c.get("channel_flag_password").is_some_and(|f| f == "1") {
+                let shared = path_count[path.as_str()] > 1;
                 // A top-level channel called like the server's key cannot be named in the file.
-                if path != SERVER_PASSWORD {
+                if path != SERVER_PASSWORD && !shared {
                     plan.password_keys.push(path.clone());
                 }
                 if options.drop_passwords {
                     plan.notes.push(format!("\"{path}\": password dropped (--drop-passwords)."));
                     Password::Dropped
+                } else if shared {
+                    plan.notes.push(format!(
+                        "\"{path}\": several channels have this path, so the passwords file cannot name it; \
+                         imported locked with a random password (set a new one in Gwar)."
+                    ));
+                    Password::Locked
                 } else {
                     let escaped_name = name.replace('\\', "\\\\").replace('/', "\\/");
                     let key = if path == SERVER_PASSWORD {
