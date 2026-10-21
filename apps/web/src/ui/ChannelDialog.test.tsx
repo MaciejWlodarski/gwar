@@ -149,4 +149,19 @@ describe("creating a channel", () => {
     await act(async () => save().click());
     expect(mock.update).toHaveBeenLastCalledWith({ channel: 4, name: "Yard" });
   });
+  it("keeps a rename made elsewhere while the dialog is open", async () => {
+    const channel = { id: 4, parent: null, name: " Garden", topic: "Lawn", position: 0, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false };
+    useSession.setState({ kind: "teamspeak", channels: { 4: channel } });
+    useUi.getState().openDialog({ kind: "channelEdit", mode: "edit", channel: 4 });
+    await act(async () => root.render(<TooltipProvider><Dialogs /></TooltipProvider>));
+    await act(async () => useSession.setState({ channels: { 4: { ...channel, name: "Orchard", topic: "Trees" } } }));
+    const input = password() as HTMLInputElement;
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "hunter2");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    const save = [...document.querySelectorAll<HTMLButtonElement>('[role="dialog"] button')].find(b => b.textContent === "Save")!;
+    await act(async () => save.click());
+    expect(mock.update).toHaveBeenCalledWith({ channel: 4, password: "hunter2" });
+  });
 });

@@ -258,6 +258,9 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
   const existing = props.mode === "edit" ? channels[props.channel] : undefined;
   const [name, setName] = useState(existing?.name ?? "");
   const [topic, setTopic] = useState(existing?.topic ?? "");
+  // The name and topic as shown when opened: only edits made here are sent, as the shown ones
+  // may be cleaned copies of the server's (and someone else may change them meanwhile).
+  const [opened] = useState(() => ({ name: existing?.name ?? "", topic: existing?.topic ?? "" }));
   const [password, setPassword] = useState("");
   const [removePassword, setRemovePassword] = useState(false);
   const [maxClients, setMaxClients] = useState(existing?.max_clients ? String(existing.max_clients) : "");
@@ -343,9 +346,8 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
         const parentChanged = parentId !== existing.parent;
         await controller.updateChannel({
           channel: existing.id,
-          // Only text edited here: the shown name and topic may be cleaned copies of the server's.
-          ...(name !== (existing.name ?? "") ? { name: name.trim() } : {}),
-          ...(topic !== (existing.topic ?? "") ? { topic: topic.trim() } : {}),
+          ...(name !== opened.name ? { name: name.trim() } : {}),
+          ...(topic !== opened.topic ? { topic: topic.trim() } : {}),
           // "" removes the password; absent keeps it.
           ...(sealedChannel ? {} : removePassword ? { password: "" } : password ? { password } : {}),
           // 0 removes the limit (protocol rule for channel.update).
