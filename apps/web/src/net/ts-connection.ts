@@ -21,6 +21,7 @@ import {
   type Link,
 } from "./connection";
 import { parseFrame } from "./frames";
+import { displayData } from "../lib/text";
 import type { EventData, EventName, Op, RequestInput, ResponseMap } from "./protocol";
 
 export interface TsConnectionOptions {
@@ -133,7 +134,7 @@ export class TsConnection implements Link {
     try {
       const reply = await Promise.race([api.invoke<unknown>("ts_request", { session: this.session, op, d }), timeout]);
       if (!responseFor(op, reply)) { console.warn("Dropped malformed native server response", op); throw new RequestError("bad_request", "Malformed server response"); }
-      return reply as ResponseMap[O];
+      return displayData(reply) as ResponseMap[O];
     } catch (e) {
       if (e instanceof RequestTimeoutError) throw e;
       if (isErrorBody(e)) throw new RequestError(e.code, e.message);
@@ -183,8 +184,10 @@ export class TsConnection implements Link {
         if (p.session !== this.session) return;
         const frame = parseFrame(p.frame);
         if (frame?.kind !== "event") return;
-        if (this.held) this.held.push(frame.event);
-        else this.route(frame.event);
+        // Names and topics reach no screen raw (lib/text.ts).
+        const event = displayData(frame.event);
+        if (this.held) this.held.push(event);
+        else this.route(event);
       }),
       await api.listen<{ session: number }>("ts://closed", (p) => {
         if (p.session === this.session) this.onClosed();
@@ -221,7 +224,7 @@ export class TsConnection implements Link {
         void api.invoke("ts_disconnect", { session });
         throw new Error("Malformed server welcome");
       }
-      return welcome;
+      return displayData(welcome);
     } catch (e) {
       this.held = null;
       if (this.session === session) this.session = 0;

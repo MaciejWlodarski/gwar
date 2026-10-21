@@ -1377,7 +1377,8 @@ class Controller {
     return this.connection.request("channel.delete", { channel });
   }
 
-  async moveClient(client: number, channel: number) {
+  /** `uid`: who the session was when the move was chosen; the server refuses it for someone else. */
+  async moveClient(client: number, uid: string, channel: number) {
     // Moving myself into an encrypted channel enters its voice: same check as a join.
     const s = useSession.getState();
     if (s.me?.session === client && !s.channels[channel]?.encrypted) this.joinAttempt++;
@@ -1387,7 +1388,7 @@ class Controller {
       if (this.conn !== conn || attempt !== this.joinAttempt) return undefined;
       if (refusal) { useUi.getState().toast("info", refusal); return undefined; }
     }
-    return this.attempt(this.connection.request("client.move", { client, channel }));
+    return this.attempt(this.connection.request("client.move", { client, uid, channel }));
   }
 
   /** `uid`: who the session was when the kick was chosen; the server refuses it for someone else. */
@@ -1874,18 +1875,20 @@ class Controller {
     const s = useSession.getState();
     const reason = notifyReason(msg, { meUid: s.me?.uid, focused: s.focused, settings: useSettings.getState().notifications });
     if (!reason) return null;
-    const authorName = memberName(s.members, msg.author_uid, msg.author_name);
-    const channel = typeof msg.target === "object" && "channel" in msg.target ? s.channels[msg.target.channel]?.name : undefined;
+    // A system notification is no place for formatting that reorders the text around it.
+    const authorName = displayText(memberName(s.members, msg.author_uid, msg.author_name));
+    const target = typeof msg.target === "object" && "channel" in msg.target ? s.channels[msg.target.channel]?.name : undefined;
+    const channel = target === undefined ? undefined : displayText(target);
     const title =
       reason === "dm"
         ? tNow("notify.dm", { name: authorName })
         : channel
           ? tNow("notify.channel", { name: authorName, channel })
-          : tNow("notify.server", { name: authorName, server: s.server?.name ?? "" });
+          : tNow("notify.server", { name: authorName, server: displayText(s.server?.name ?? "") });
     return () => {
       notify({
         title: msg.author_uid.startsWith("ts:") ? `${title} · ${tNow("chat.teamSpeakNotification")}` : title,
-        body: notificationBody(msg),
+        body: displayText(notificationBody(msg), true),
         tag: `msg-${msg.id}-${typeof msg.target === "string" ? "server" : Object.keys(msg.target)[0]}`,
         onClick: () => this.openMessage(msg),
       });

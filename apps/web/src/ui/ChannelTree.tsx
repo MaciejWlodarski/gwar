@@ -37,10 +37,9 @@ import { fillText, parseSpacer } from "../lib/spacer";
 import { MentionBadge, UnreadBadge } from "./badges";
 import { useChannelPermission, useGroupsColor, useMyWho, useWhoOf } from "./hooks";
 import { canActOn } from "../lib/permissions";
+import { CLIENT_MIME, clientDragData, readClientDrag } from "../lib/client-drag";
 import { ModerationItems } from "./ModerationMenu";
 import { EmptyState, TalkingAvatar, Slider, menuContent, menuItem, menuItemDanger, menuLabel, menuSeparator } from "./kit";
-
-const CLIENT_MIME = "application/x-gwar-client";
 
 export function ChannelTree() {
   const t = useT();
@@ -175,10 +174,10 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           onDragLeave={() => setDragOver(false)}
           onDrop={(e) => {
             setDragOver(false);
-            const id = Number(e.dataTransfer.getData(CLIENT_MIME));
-            if (canMove && id) {
+            const drag = readClientDrag(e.dataTransfer.getData(CLIENT_MIME));
+            if (canMove && drag) {
               e.preventDefault();
-              void controller.moveClient(id, channel.id);
+              void controller.moveClient(drag.id, drag.uid, channel.id);
             }
           }}
           style={{ paddingLeft: 4 + node.depth * 16 }}
@@ -364,7 +363,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
           tabIndex={-1}
           draggable={canMove}
           onDragStart={(e) => {
-            e.dataTransfer.setData(CLIENT_MIME, String(client.id));
+            e.dataTransfer.setData(CLIENT_MIME, clientDragData({ id: client.id, uid: client.uid }));
             e.dataTransfer.effectAllowed = "move";
           }}
           onDoubleClick={openDm}
@@ -426,7 +425,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
             </>
           )}
           {canMove && myChannel !== null && client.channel !== myChannel && (
-            <ContextMenu.Item className={menuItem} onSelect={() => void controller.moveClient(client.id, myChannel)}>
+            <ContextMenu.Item className={menuItem} onSelect={() => void controller.moveClient(client.id, client.uid, myChannel)}>
               <MoveRight className="size-4" /> {t("tree.moveHere")}
             </ContextMenu.Item>
           )}

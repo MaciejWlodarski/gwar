@@ -200,13 +200,17 @@ async fn moderators_cannot_kick_or_move_someone_stronger() {
 }
 
 #[tokio::test]
-async fn kicks_and_bans_name_who_they_meant_when_session_ids_come_back() {
+async fn moves_kicks_and_bans_name_who_they_meant_when_session_ids_come_back() {
     let server = TestServer::start().await;
     let mut root = admin(&server, "root").await;
     let key = new_key();
     let mut eve = Client::connect_as(&server, key.clone(), "eve", None).await.unwrap();
+    let lobby = seed_channel(&root, "Lobby");
     // Someone else's uid with eve's session: the session is no longer the person chosen.
     let other = uid_of(&new_key());
+    let moved = json!({"client": eve.id(), "uid": other, "channel": lobby});
+    assert_eq!(root.fails("client.move", moved).await, "not_found");
+    root.ok("client.move", json!({"client": eve.id(), "uid": uid_of(&key), "channel": lobby})).await;
     let kick = json!({"client": eve.id(), "uid": other});
     assert_eq!(root.fails("client.kick", kick).await, "not_found");
     assert_eq!(root.fails("ban.create", json!({"client": eve.id(), "uid": other})).await, "not_found");

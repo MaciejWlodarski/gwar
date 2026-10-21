@@ -42,16 +42,33 @@ export function isSafeHref(href: string): boolean {
 }
 
 /** Bidi formatting: marks, embeddings, overrides and isolates, which reorder the text around them. */
-const BIDI = /[؜‎‏‪-‮⁦-⁩]/g;
+const BIDI = /[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g;
 
 /**
- * Text from a TeamSpeak server (pokes, channel descriptions, group names) as it may be shown:
- * bidi formatting goes, and control characters become spaces. `lines` text keeps its newlines and
- * tabs; anything else is one line with its spaces collapsed. Same as `display_text` in
- * crates/gwar-client/src/teamspeak.rs.
+ * Text from a TeamSpeak server (names, topics, pokes, descriptions) as it may be shown: bidi
+ * formatting goes, and control characters become spaces, but for the newlines and tabs of
+ * `lines` text. Spacing is kept: spacer channels are drawn from their names. Same as
+ * `display_text` in crates/gwar-client/src/teamspeak.rs.
  */
 export function displayText(text: string, lines = false): string {
   const kept = (lines ? text.replace(/\r\n?/g, "\n") : text).replace(BIDI, "");
-  const spaced = kept.replace(/\p{Cc}/gu, (c) => (lines && (c === "\n" || c === "\t") ? c : " "));
-  return lines ? spaced : spaced.split(/\s+/u).filter(Boolean).join(" ");
+  return kept.replace(/\p{Cc}/gu, (c) => (lines && (c === "\n" || c === "\t") ? c : " "));
+}
+
+/** Fields of what a TeamSpeak server sends that are shown as text, and whether they keep their lines. */
+const SHOWN: Record<string, boolean> = {
+  nickname: false, name: false, topic: false, author_name: false, away: false, by: false, reason: false, message: false,
+  welcome: true, description: true,
+};
+
+/**
+ * A copy of what a TeamSpeak server sent (the welcome, an event, a reply) with its names, topics and
+ * other shown text through `displayText`, so no screen shows them raw. Payloads are bounded by the
+ * frame schemas before they get here.
+ */
+export function displayData<T>(value: T, key?: string): T {
+  if (typeof value === "string") return (key !== undefined && Object.hasOwn(SHOWN, key) ? displayText(value, SHOWN[key]) : value) as T;
+  if (Array.isArray(value)) return value.map((v: unknown) => displayData(v, key)) as T;
+  if (value && typeof value === "object") return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, displayData(v, k)])) as T;
+  return value;
 }

@@ -534,6 +534,8 @@ describe("TeamSpeak actions", () => {
     teamspeak();
     await controller.pokeClient(2, "u2", "hi");
     expect(link.sent("client.poke").at(-1)?.d).toEqual({ client: 2, uid: "u2", message: "hi" });
+    await controller.moveClient(2, "u2", 3);
+    expect(link.sent("client.move").at(-1)?.d).toEqual({ client: 2, uid: "u2", channel: 3 });
     await controller.kickFromChannel(2, "u2");
     expect(link.sent("client.kick").at(-1)?.d).toEqual({ client: 2, uid: "u2", reason: null, from_channel: true });
     for (const c of [{ id: 1, position: 0 }, { id: 2, position: 1 }, { id: 3, position: 2 }]) {
@@ -818,6 +820,15 @@ describe("notifications", () => {
     call.onClick();
     expect(session().viewChannel).toBe(2);
     expect(session().activeThread).toBe("channel");
+  });
+
+  it("shows names and text without formatting that would reorder the notification", async () => {
+    connectFake();
+    session().dispatch({ type: "focus", focused: false });
+    link.emit({ ev: "chat.message", d: message(56, 1, { author_uid: "ts:mal", author_name: "Mal\u202elory", target: { client: 1 }, text: "he\u202ey\u0007you\nthere" }) });
+    const call = notifyMock.mock.calls[0]![0] as { title: string; body: string };
+    expect(call.title).toContain("Mallory");
+    expect(call.body).toBe("hey you\nthere");
   });
 
   it("is quiet while the window is in front, for plain channel messages, and for my own", async () => {

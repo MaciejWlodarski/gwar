@@ -310,8 +310,8 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
                 Channel {
                     id: c.id.0 as u32,
                     parent: (c.parent.0 != 0).then_some(c.parent.0 as u32),
-                    name: c.name.clone(),
-                    topic: c.topic.clone().unwrap_or_default(),
+                    name: display_text(&c.name, false),
+                    topic: c.topic.as_deref().map(|t| display_text(t, false)).unwrap_or_default(),
                     position,
                     has_password: c.has_password.unwrap_or(false),
                     max_clients: match c.max_clients {
@@ -348,13 +348,13 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
                 Client {
                     id: u32::from(c.id.0),
                     uid: c.uid.as_ref().map(|u| format!("ts:{}", STANDARD.encode(&u.0))).unwrap_or_default(),
-                    nickname: c.name.clone(),
+                    nickname: display_text(&c.name, false),
                     channel: Some(c.channel.0 as u32),
                     groups: c.server_groups.iter().map(|g| g.0 as u32).collect(),
                     platform: Platform::Ts3,
                     muted: c.input_muted,
                     deafened: c.output_muted,
-                    away: c.away_message.clone(),
+                    away: c.away_message.as_deref().map(|a| display_text(a, false)),
                     talking: talking.contains_key(&c.id.0),
                     voice: true,
                     server_muted: false,
@@ -394,8 +394,8 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
         .or_else(|| state.clients.get(&state.own_client).map(|c| c.channel.0 as u32))
         .unwrap_or(0);
     let server = ServerInfo {
-        name: state.server.name.clone(),
-        welcome: state.server.welcome_message.clone(),
+        name: display_text(&state.server.name, false),
+        welcome: display_text(&state.server.welcome_message, true),
         version: state.server.version.clone(),
         default_channel,
         max_clients: u32::from(state.server.max_clients),
@@ -494,7 +494,7 @@ fn reply_for(request: &Request, view: &View, own: u16) -> Reply {
     match request {
         Request::ChannelJoin { .. } => Reply::Join,
         Request::ChatSend { target, text, .. } => Reply::Message(target.clone(), text.clone()),
-        Request::ChannelCreate(c) => Reply::Created { parent: c.parent, name: c.name.clone() },
+        Request::ChannelCreate(c) => Reply::Created { parent: c.parent, name: display_text(&c.name, false) },
         Request::ChannelUpdate(u) => Reply::Channel(u.channel),
         Request::TokenRedeem { .. } => Reply::Groups,
         Request::ChannelDescription { channel } => Reply::Description(*channel),
@@ -516,20 +516,18 @@ fn reply_for(request: &Request, view: &View, own: u16) -> Reply {
     }
 }
 
-/// Text from the TeamSpeak server (pokes, descriptions, group names) as the UI may show it: bidi
-/// formatting goes (it reorders the text around it), and control characters become spaces.
-/// `lines` text keeps its newlines and tabs; anything else is one line with its spaces collapsed.
-/// Same as `displayText` in apps/web/src/lib/text.ts.
+/// Text from the TeamSpeak server (names, topics, pokes, descriptions) as the UI may show it: bidi
+/// formatting goes (it reorders the text around it), and control characters become spaces, but
+/// for the newlines and tabs of `lines` text. Spacing is kept: spacer channels are drawn from
+/// their names. Same as `displayText` in apps/web/src/lib/text.ts.
 fn display_text(text: &str, lines: bool) -> String {
     let bidi =
         |c: char| matches!(c, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
     let text = if lines { text.replace("\r\n", "\n").replace('\r', "\n") } else { text.to_owned() };
-    let spaced: String = text
-        .chars()
+    text.chars()
         .filter(|&c| !bidi(c))
         .map(|c| if c.is_control() && !(lines && matches!(c, '\n' | '\t')) { ' ' } else { c })
-        .collect();
-    if lines { spaced } else { spaced.split_whitespace().collect::<Vec<_>>().join(" ") }
+        .collect()
 }
 
 /// TeamSpeak descriptions are BBCode; the UI shows plain text. Tags go, their text stays
@@ -780,7 +778,8 @@ fn translate(request: &Request, own: u16, view: &View) -> Result<Vec<(Part, OutC
             }
             command("clientmove", &args)
         }
-        Request::ClientMove { client, channel } => {
+        Request::ClientMove { client, uid, channel } => {
+            still(view, *client, uid.as_deref())?;
             command("clientmove", &[("clid", client.to_string()), ("cid", channel.to_string())])
         }
         // TeamSpeak's reasons: 4 kicks from the channel (to the default one), 5 from the server.
@@ -1111,7 +1110,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                                     .as_ref()
                                     .map(|u| format!("ts:{}", STANDARD.encode(&u.0)))
                                     .unwrap_or_else(|| "ts:unknown".into()),
-                                author_name: invoker.name.clone(),
+                                author_name: display_text(&invoker.name, false),
                                 text: message,
                                 sent_at: now_ms(),
                                 mentions: Vec::new(),
@@ -1476,7 +1475,7 @@ mod tests {
     #[test]
     fn shown_text_loses_bidi_formatting_and_control_characters() {
         assert_eq!(display_text("evil\u{202e}gnp.exe\u{2066}x\u{2069}", false), "evilgnp.exex");
-        assert_eq!(display_text("a\0b\nc\td  e ", false), "a b c d e");
+        assert_eq!(display_text("a\0b\nc\td  e ", false), "a b c d  e ");
         assert_eq!(display_text("Zażółć 🎧 مرحبا", false), "Zażółć 🎧 مرحبا");
         assert_eq!(display_text("one\r\ntwo\rthree\n\tfour\u{7}\u{202e}", true), "one\ntwo\nthree\n\tfour ");
     }
@@ -1497,6 +1496,9 @@ mod tests {
         let kick_alice =
             Request::ClientKick { client: 4, uid: Some("ts:YWxpY2U=".into()), reason: None, from_channel: false };
         assert!(matches!(someone_else(kick_alice), Err(e) if e.code == ErrorCode::NotFound));
+        let move_to_9 = |uid: &str| Request::ClientMove { client: 4, uid: Some(uid.into()), channel: 9 };
+        assert!(matches!(someone_else(move_to_9("ts:YWxpY2U=")), Err(e) if e.code == ErrorCode::NotFound));
+        assert_eq!(run(move_to_9("ts:Ym9i")), vec![(Part::Whole, "clientmove clid=4 cid=9".into())]);
         let describe = Request::ChannelDescription { channel: 8 };
         assert_eq!(run(describe), vec![(Part::Whole, "channelgetdescription cid=8".into())]);
 

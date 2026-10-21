@@ -22,7 +22,11 @@ import type { VoiceOffer } from "./VoiceOffer";
 /**
  * Client → server frame.
  */
-export type ClientFrame = { id: number, } & ({ "op": "hello", "d": Hello } | { "op": "join", "d": Join } | { "op": "ping", "d": Record<symbol, never> } | { "op": "client.update", "d": ClientUpdate } | { "op": "client.move", "d": { client: number, channel: number, } } | { "op": "client.voice", "d": { client: number, muted?: boolean | null, deafened?: boolean | null, } } | { "op": "client.kick", "d": { client: number, 
+export type ClientFrame = { id: number, } & ({ "op": "hello", "d": Hello } | { "op": "join", "d": Join } | { "op": "ping", "d": Record<symbol, never> } | { "op": "client.update", "d": ClientUpdate } | { "op": "client.move", "d": { client: number, 
+/**
+ * Who `client` was when the move was chosen: refused if the session is now someone else's.
+ */
+uid?: string | null, channel: number, } } | { "op": "client.voice", "d": { client: number, muted?: boolean | null, deafened?: boolean | null, } } | { "op": "client.kick", "d": { client: number, 
 /**
  * Who `client` was when the kick was chosen: refused if the session is now someone else's.
  */

@@ -1677,7 +1677,7 @@ impl Core {
             Request::Mls(request) => self.mls_request(session, request),
             Request::Ping {} => Ok(Response::Empty {}),
             Request::ClientUpdate(update) => self.client_update(session, update),
-            Request::ClientMove { client, channel } => self.client_move(session, client, channel),
+            Request::ClientMove { client, uid, channel } => self.client_move(session, client, uid, channel),
             Request::ClientKick { from_channel: true, .. } => {
                 Err(err(ErrorCode::BadRequest, "Gwar servers kick from the server only"))
             }
@@ -1800,13 +1800,14 @@ impl Core {
         self.voice_snapshot(session);
     }
 
-    fn client_move(&mut self, session: SessionId, client: SessionId, channel: ChannelId) -> Reply {
+    fn client_move(&mut self, session: SessionId, client: SessionId, uid: Option<Uid>, channel: ChannelId) -> Reply {
         if !self.channels.contains_key(&channel) {
             return Err(err(ErrorCode::NotFound, "no such channel"));
         }
         // Moving someone needs the permission where they are going.
         self.require_in(session, channel, Permission::MoveMembers)?;
-        let Some(target) = self.sessions.get(&client) else {
+        // A reused session id is someone else.
+        let Some(target) = self.sessions.get(&client).filter(|s| uid.as_ref().is_none_or(|u| *u == s.uid)) else {
             return Err(err(ErrorCode::NotFound, "no such client"));
         };
         if client != session && !self.outranks(session, &target.member, &target.groups) {

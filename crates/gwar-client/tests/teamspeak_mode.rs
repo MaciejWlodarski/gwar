@@ -422,7 +422,7 @@ async fn teamspeak_mode_pokes_kicks_bans_and_channel_details() {
     let (bob_id, bob_uid) = (bob.welcome.session, bob.welcome.uid.clone());
     until(&mut admin.events, |e| matches!(e, Event::ClientJoined(c) if c.id == bob_id)).await;
     let poke =
-        Request::ClientPoke { client: bob_id, uid: Some(bob_uid.clone()), message: "over\u{202e} here\u{7}".into() };
+        Request::ClientPoke { client: bob_id, uid: Some(bob_uid.clone()), message: "over\u{202e}\u{7}here".into() };
     request(&admin, poke).await;
     until(
         &mut bob.events,
@@ -444,6 +444,17 @@ async fn teamspeak_mode_pokes_kicks_bans_and_channel_details() {
         support::ts_client_into(bridged.ts_voice, "carol", tsclientlib::Identity::create(), Some(("Gate", "pw"))).await;
     let carol_in = carol.welcome.clients.iter().find(|c| c.id == carol.welcome.session).and_then(|c| c.channel);
     assert_eq!(carol_in, Some(gate.id));
+
+    // Names and topics arrive without formatting that would reorder the text around them.
+    let _mallory = support::ts_client(bridged.ts_voice, "Mal\u{202e}lory").await;
+    until(&mut admin.events, |e| matches!(e, Event::ClientJoined(c) if c.nickname == "Mallory")).await;
+    let garden = Cmd::new("channelcreate")
+        .arg("channel_name", "Gar\u{202e}den")
+        .arg("channel_topic", "Hi\u{7}there")
+        .arg("channel_flag_permanent", 1);
+    query.call(garden).await.unwrap();
+    until(&mut admin.events, |e| matches!(e, Event::ChannelCreated(c) if c.name == "Garden" && c.topic == "Hi there"))
+        .await;
 
     // A ban by identity alone also kicks, and TeamSpeak keeps it.
     let mut dave = support::ts_client(bridged.ts_voice, "dave").await;

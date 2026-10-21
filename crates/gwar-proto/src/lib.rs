@@ -87,7 +87,13 @@ wire! {
         #[serde(rename = "client.update")]
         ClientUpdate(ClientUpdate),
         #[serde(rename = "client.move")]
-        ClientMove { client: SessionId, channel: ChannelId },
+        ClientMove {
+            client: SessionId,
+            /// Who `client` was when the move was chosen: refused if the session is now someone else's.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            uid: Option<Uid>,
+            channel: ChannelId,
+        },
         /// Mutes or deafens someone for everyone (`mute_members` in their channel); absent fields stay.
         #[serde(rename = "client.voice")]
         ClientVoice {
