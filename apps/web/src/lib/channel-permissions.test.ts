@@ -2,7 +2,10 @@ import { describe, expect, it } from "vitest";
 import type { Channel } from "../proto/Channel";
 import type { ChannelOverride } from "../proto/ChannelOverride";
 import type { Group } from "../proto/Group";
+import vectors from "../../../../crates/gwar-proto/tests/role-resolution.json";
+import type { Permission } from "../proto/Permission";
 import { channelPermissions, overrideSource, withOverride } from "./channel-permissions";
+import { ALL_PERMISSIONS } from "./permissions";
 
 const g = (id: number, position: number, permissions: Group["permissions"]): Group => ({ id, name: `g${id}`, permissions, position, hoist: false, mentionable: false });
 const groups = Object.fromEntries(
@@ -36,6 +39,20 @@ describe("channelPermissions", () => {
     expect(of("carol", [], 11)).toEqual(["attach_files"]);
     expect(of("carol", [], 12)).toEqual(["attach_files", "connect", "send_messages", "speak"]);
   });
+});
+
+describe("shared resolution vectors", () => {
+  // The same file drives the server's resolution test (core/overrides.rs).
+  const groups = Object.fromEntries(vectors.groups.map((x, position) => [x.id, g(x.id, position, x.permissions as Permission[])]));
+  const channels = Object.fromEntries(
+    vectors.channels.map((c) => [c.id, ch(c.id, c.parent, c.synced, c.overrides as ChannelOverride[])]),
+  );
+  for (const v of vectors.cases) {
+    it(v.name, () => {
+      const expected = v.expect === "all" ? [...ALL_PERMISSIONS] : (v.expect as Permission[]);
+      expect(channelPermissions({ uid: v.uid, groups: v.groups }, v.channel, channels, groups).sort()).toEqual([...expected].sort());
+    });
+  }
 });
 
 describe("withOverride", () => {

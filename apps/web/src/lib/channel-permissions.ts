@@ -15,7 +15,11 @@ export const CHANNEL_PERMISSIONS: Permission[] = [
   "bypass_password",
   "manage_channels",
   "mute_members",
+  "share_screen",
 ];
+
+/** Off wherever `connect` is off (`Permission::NEEDS_CONNECT`). */
+export const NEEDS_CONNECT: Permission[] = ["speak", "share_screen"];
 
 /** The channel whose overrides apply in `id`: itself, or its nearest unsynced ancestor. */
 export function overrideSource(channels: Record<number, Channel>, id: number): Channel | undefined {
@@ -35,7 +39,7 @@ export function effectiveOverrides(channels: Record<number, Channel>, id: number
 /**
  * What someone may do in a channel, the server's order (docs/roles.md, "Resolving a permission"):
  * their roles (Member's included), the Member override, their other roles' overrides together
- * (deny, then allow), their own override; without connect, no speak.
+ * (deny, then allow), their own override; without connect, no speaking or sharing.
  */
 export function channelPermissions(who: Who & { uid: string }, id: number, channels: Record<number, Channel>, groups: Record<number, Group>): Permission[] {
   const base = permissionsOf([...who.groups, MEMBER_GROUP], groups, who.owner);
@@ -53,7 +57,7 @@ export function channelPermissions(who: Who & { uid: string }, id: number, chann
   for (const o of mine) for (const p of o.allow) held.add(p);
   const own = overrides.find((o) => o.user === who.uid);
   if (own) apply(own);
-  if (!held.has("connect")) held.delete("speak");
+  if (!held.has("connect")) for (const p of NEEDS_CONNECT) held.delete(p);
   return [...held];
 }
 

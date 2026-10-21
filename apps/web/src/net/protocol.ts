@@ -103,6 +103,12 @@ export interface ResponseMap {
   "voice.state": { voice: import("../proto/VoiceState").VoiceState | null };
   "voice.epoch.ack": Empty;
   "voice.epoch.repeat": Empty;
+  "screen.start": { share: string };
+  "screen.stop": Empty;
+  "screen.watch": Empty;
+  "screen.unwatch": Empty;
+  "screen.stop_other": Empty;
+  "screen.link.revoke": Empty;
   "owner.chain": { genesis: string; links: import("../proto/OwnerLinkStatement").OwnerLinkStatement[]; next: number | null };
   "owner.transfer": Empty;
   "managers.update": Empty;

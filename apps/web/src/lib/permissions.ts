@@ -21,13 +21,14 @@ export const ALL_PERMISSIONS: Permission[] = [
   "speak",
   "send_messages",
   "mute_members",
+  "share_screen",
 ];
 
 /** Permissions as the role editor presents them: thematic sections, each with plain-word labels (see i18n `perm.*`). */
 export const PERMISSION_SECTIONS: Array<{ id: "server" | "channels" | "voice" | "people" | "chat"; permissions: Permission[] }> = [
   { id: "server", permissions: ["administrator", "manage_server", "manage_roles"] },
   { id: "channels", permissions: ["manage_channels", "bypass_password"] },
-  { id: "voice", permissions: ["connect", "speak", "mute_members"] },
+  { id: "voice", permissions: ["connect", "speak", "share_screen", "mute_members"] },
   { id: "people", permissions: ["move_members", "kick_members", "ban_members", "manage_members", "create_invites"] },
   { id: "chat", permissions: ["send_messages", "attach_files", "manage_messages"] },
 ];

@@ -642,3 +642,93 @@ async fn failed_uploads_give_their_space_back() {
 fn server_limit(client: &Client) -> u64 {
     client.welcome.server.upload_limit
 }
+
+// -------------------------------------------------------- screen sharing
+
+#[tokio::test]
+async fn moderators_stop_the_shares_of_those_ranked_below() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let mut moderator = Client::connect(&server, "mod").await;
+    let mods = group_id(&root.ok("group.create", json!({"name": "Mods", "permissions": ["mute_members"]})).await);
+    with_groups(&mut root, &moderator, json!([2, mods])).await;
+    let general = seed_channel(&root, "General");
+
+    let share = alice.share_in(general).await;
+    assert_eq!(bob.fails("screen.stop_other", json!({"share": share})).await, "forbidden");
+    assert_eq!(alice.fails("screen.stop_other", json!({"share": share})).await, "bad_request");
+    moderator.ok("screen.stop_other", json!({"share": share})).await;
+    assert_eq!(bob.next_event("screen.stopped").await, json!({"share": share, "reason": "moderator", "by": "mod"}));
+    let me = alice.id();
+    alice.next_event_where("client.updated", |c| c["id"] == me && c.get("sharing").is_none()).await;
+
+    // Not someone ranked at or above oneself.
+    let theirs = root.share_in(general).await;
+    assert_eq!(moderator.fails("screen.stop_other", json!({"share": theirs})).await, "forbidden");
+}
+
+#[tokio::test]
+async fn the_sharer_or_a_moderator_turns_the_watch_link_off_for_good() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let general = seed_channel(&root, "General");
+    alice.ok("channel.join", json!({"channel": general})).await;
+    let voice = alice.ok("voice.state", json!({})).await["voice"].clone();
+    let start = json!({"call": voice["call"], "participation": voice["participation"], "preset": "smooth",
+        "surface": "tab", "guest_link": true});
+    let share = alice.ok("screen.start", start).await["share"].clone();
+
+    assert_eq!(bob.fails("screen.link.revoke", json!({"share": share})).await, "forbidden");
+    root.ok("screen.link.revoke", json!({"share": share})).await;
+    let off = json!({"share": share, "active": false});
+    assert_eq!(alice.next_event("screen.link").await, off);
+    assert_eq!(root.next_event("screen.link").await, off, "moderators are told too");
+    alice.ok("screen.link.revoke", json!({"share": share})).await;
+    assert!(alice.drain_events("screen.link").await.is_empty(), "already off");
+    assert!(bob.drain_events("screen.link").await.is_empty());
+}
+
+#[tokio::test]
+async fn a_password_channels_watch_ends_when_its_viewer_leaves_switches_or_is_moved_out() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let general = seed_channel(&root, "General");
+    let vault = channel_id(&root.create_channel(json!({"name": "Vault", "password": "s3cret"})).await);
+    let enter = json!({"channel": vault, "password": "s3cret"});
+    alice.ok("channel.join", enter.clone()).await;
+    let share = alice.screen_start().await.unwrap()["share"].clone();
+    let ended = json!({"share": share, "reason": "access"});
+    let viewers = |n: u32| json!({"share": share, "members": n, "guests": 0});
+
+    for exit in ["leave", "switch", "moved"] {
+        bob.ok("channel.join", enter.clone()).await;
+        bob.ok("screen.watch", json!({"share": share})).await;
+        assert_eq!(alice.next_event("screen.viewers").await, viewers(1));
+        match exit {
+            "leave" => drop(bob.ok("channel.leave", json!({})).await),
+            "switch" => drop(bob.ok("channel.join", json!({"channel": general})).await),
+            _ => drop(root.ok("client.move", json!({"client": bob.id(), "channel": general})).await),
+        }
+        assert_eq!(bob.next_event("screen.stopped").await, ended, "{exit}");
+        assert_eq!(alice.next_event("screen.viewers").await, viewers(0), "{exit}");
+    }
+}
+
+#[tokio::test]
+async fn a_kicked_viewer_stops_watching() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let share = alice.share_in(seed_channel(&root, "General")).await;
+    bob.ok("screen.watch", json!({"share": share})).await;
+    assert_eq!(alice.next_event("screen.viewers").await["members"], 1);
+    root.ok("client.kick", json!({"client": bob.id()})).await;
+    assert_eq!(alice.next_event("screen.viewers").await["members"], 0);
+}

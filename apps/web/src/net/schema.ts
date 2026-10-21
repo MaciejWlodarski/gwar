@@ -32,6 +32,8 @@ import type { Unread } from "../proto/Unread";
 import type { Welcome } from "../proto/Welcome";
 import type { Managers } from "../proto/Managers";
 import type { OwnerInfo } from "../proto/OwnerInfo";
+import type { ScreenShare } from "../proto/ScreenShare";
+import type { ScreenStopReason } from "../proto/ScreenStopReason";
 import type { EventData, EventName, Op, ResponseMap } from "./protocol";
 import { filePath } from "./address";
 import { MAX_FILE_BYTES } from "../platform/download";
@@ -55,9 +57,9 @@ const id = int();
 const text = str(4096);
 const uid: Rule<string> = (v): v is string => str(128)(v) && v.length > 0 && v !== "prototype" && !Object.hasOwn(Object.prototype, v);
 const ids = array(id, 128);
-const permissions = literal<Permission>(["administrator", "manage_server", "manage_roles", "manage_members", "kick_members", "ban_members", "create_invites", "bypass_password", "attach_files", "manage_messages", "move_members", "manage_channels", "connect", "speak", "send_messages", "mute_members"]);
+const permissions = literal<Permission>(["administrator", "manage_server", "manage_roles", "manage_members", "kick_members", "ban_members", "create_invites", "bypass_password", "attach_files", "manage_messages", "move_members", "manage_channels", "connect", "speak", "send_messages", "mute_members", "share_screen"]);
 const platform = literal<Platform>(["web", "desktop", "mobile", "ts3", "ts6"]);
-const errorCode = literal<ErrorCode>(["bad_request", "not_authenticated", "not_found", "forbidden", "wrong_password", "channel_full", "rate_limited", "conflict", "unavailable", "internal", "banned", "too_large", "quota_exceeded", "certificate_expired", "stale", "pending", "expired", "early", "partial"]);
+const errorCode = literal<ErrorCode>(["bad_request", "not_authenticated", "not_found", "forbidden", "wrong_password", "channel_full", "rate_limited", "conflict", "unavailable", "internal", "banned", "too_large", "quota_exceeded", "busy", "certificate_expired", "stale", "pending", "expired", "early", "partial"]);
 const path = (put = false): Rule<string> => (v): v is string => {
   if (!str(2048)(v)) return false;
   try { filePath(v, put ? "PUT" : "GET"); return true; } catch { return false; }
@@ -79,7 +81,7 @@ const serverProof = shape<ServerProof>({ server_proof: fixed(64) });
 const channelAccess = shape<ChannelAccess>({ roles: array(id, 64), users: array(uid, 1000) });
 const channelOverride = shape<ChannelOverride>({ role: optional(nullable(id)), user: optional(nullable(uid)), allow: array(permissions, 32), deny: array(permissions, 32) });
 const channel = shape<Channel>({ id, parent: nullable(id), name: str(256), topic: text, position: int(2147483647, -2147483648), has_password: bool, max_clients: nullable(int(65535)), encrypted: bool, history: bool, private: bool, access: optional(nullable(channelAccess)), overrides: optional(array(channelOverride, 100)), synced: bool });
-const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool, voice_binding: nullable(voiceBinding), server_muted: optional(bool), server_deafened: optional(bool) });
+const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool, voice_binding: nullable(voiceBinding), server_muted: optional(bool), server_deafened: optional(bool), sharing: optional(bool) });
 const color: Rule<string> = (v): v is string => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v);
 const group = shape<Group>({ id, name: str(256), permissions: array(permissions, 32), color: optional(nullable(color)), position: int(4294967295), hoist: bool, mentionable: bool });
 const attestation = shape<HandleAttestation>({ account_key: str(128), handle: str(64), issued_at: id, expires_at: id, signature: str(128) });
@@ -91,7 +93,9 @@ const ice = shape<IceServer>({ urls: array(str(2048), 16), username: optional(nu
 const ownerInfo = shape<OwnerInfo>({ uid: fixed(20), generation: int(Number.MAX_SAFE_INTEGER, 1), seq: id, head: fixed(32) });
 const envelope = str(32768);
 const managers = shape<Managers>({ anchor: nullable(envelope), list: nullable(envelope), pending: array(uid, 10000), stale: array(uid, 10000) });
-const welcome = shape<Welcome>({ session: id, uid, server, permissions: array(permissions, 32), groups: array(group, 128), channels: array(channel, 1024), clients: array(client, 4096), members: array(member, 10000), unread: array(unread, 1024), conversations: array(conversationUnread, 10000), ice_servers: array(ice, 32), file_access: bearer, owner: optional(nullable(ownerInfo)), managers: optional(nullable(managers)) });
+const shareId = fixed(16);
+const screenShare = shape<ScreenShare>({ share: shareId, client: id, channel: id, preset: literal(["text", "smooth", "game", "saver"]), surface: literal(["screen", "window", "tab", "unknown"]) });
+const welcome = shape<Welcome>({ session: id, uid, server, permissions: array(permissions, 32), groups: array(group, 128), channels: array(channel, 1024), clients: array(client, 4096), members: array(member, 10000), unread: array(unread, 1024), conversations: array(conversationUnread, 10000), ice_servers: array(ice, 32), file_access: bearer, owner: optional(nullable(ownerInfo)), managers: optional(nullable(managers)), shares: optional(array(screenShare, 256)) });
 const target: Rule<ChatTarget> = (v): v is ChatTarget => v === "server" || shape<{ channel: number }>({ channel: id })(v) || shape<{ client: number }>({ client: id })(v);
 const certificate = shape<DeviceCertificate>({ account_key: fixed(32), device_key: fixed(32), issued_at: id, expires_at: id, signature: fixed(64) });
 const commitment: Rule<string> = (v): v is string => v === "-" || fixed(32)(v);
@@ -141,6 +145,9 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "group.deleted": shape({ group: id }), "group.reordered": shape({ groups: ids }), "member.updated": member, "member.removed": shape({ uid }),
   "voice.talking": shape({ ...voiceFields, client: int(4294967295), talking: bool }), "voice.slot": shape({ ...transportFields, slot: int(7), client: nullable(int(4294967295)) }),
   "voice.state": shape({ voice: nullable(voiceState) }),
+  "screen.started": screenShare,
+  "screen.stopped": shape({ share: shareId, reason: literal<ScreenStopReason>(["stopped", "moderator", "left", "limit", "transport", "budget", "access"]), by: optional(str(256)) }),
+  "screen.viewers": shape({ share: shareId, members: int(4294967295), guests: int(4294967295) }), "screen.link": shape({ share: shareId, active: bool }),
   "voice.epoch.ack": shape({call:fixed(16),group:fixed(32),epoch:id,device:fixed(32)}),
   "voice.epoch.request": shape({call:fixed(16),group:fixed(32),epoch:id}),
   "voice.closed": shape({ ...voiceFields, reason: literal(["transport_failed", "channel_restarted", "channel_deleted", "epoch_exhausted", "stream_limit", "state_limit"]) }), "chat.read": (v): v is EventData<"chat.read"> => shape({ channel: id, message: id })(v) || shape({ conversation, message: id })(v), "disconnected": shape({ reason: leave }),
@@ -178,6 +185,7 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "voice.offer": shape({ ...transportFields, sdp: str(65536) }),
   "voice.state": shape({voice:nullable(voiceState)}),
   "voice.epoch.ack": empty, "voice.epoch.repeat": empty,
+  "screen.start": shape({ share: shareId }), "screen.stop": empty, "screen.watch": empty, "screen.unwatch": empty, "screen.stop_other": empty, "screen.link.revoke": empty,
   "owner.chain": shape({ genesis: str(1024), links: array(shape({ statement: str(2048), signature: fixed(64) }), 64), next: nullable(id) }),
   "owner.transfer": empty, "managers.update": empty,
 };

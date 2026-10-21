@@ -25,6 +25,7 @@ fn client(id: u32, uid: &str) -> Client {
         voice_binding: None,
         server_muted: false,
         server_deafened: false,
+        sharing: false,
         id,
         uid: uid.into(),
         nickname: format!("c{id}"),
@@ -104,6 +105,7 @@ async fn start_with_reply(
             file_access: String::new(),
             owner: None,
             managers: None,
+            shares: vec![],
         };
         let mut welcome = serde_json::to_value(welcome).unwrap();
         welcome["clients"] = clients(&me);

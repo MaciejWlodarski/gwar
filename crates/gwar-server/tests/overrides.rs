@@ -274,3 +274,49 @@ async fn deleting_a_channel_keeps_private_ones_hidden_from_the_deleter_and_says_
     assert!(moved["parent"].is_null());
     assert!(alice.drain_events("channel.updated").await.iter().all(|c| c["id"] != hidden));
 }
+
+#[tokio::test]
+async fn losing_bypass_password_ends_watches_from_outside_the_channel() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let keys = role(&mut root, "Keys", json!(["bypass_password"])).await;
+    give(&mut root, &bob, json!([2, keys])).await;
+    let vault = channel_id(&root.create_channel(json!({"name": "Vault", "password": "s3cret"})).await);
+    alice.ok("channel.join", json!({"channel": vault, "password": "s3cret"})).await;
+    let share = alice.screen_start().await.unwrap()["share"].clone();
+    let ended = json!({"share": share, "reason": "access"});
+    let watch = json!({"share": share});
+
+    // Bob is not in the vault, nor in voice at all.
+    bob.ok("screen.watch", watch.clone()).await;
+    root.ok("group.update", json!({"group": keys, "permissions": []})).await;
+    assert_eq!(bob.next_event("screen.stopped").await, ended, "role edit");
+    assert_eq!(bob.fails("screen.watch", watch.clone()).await, "forbidden");
+
+    root.ok("group.update", json!({"group": keys, "permissions": ["bypass_password"]})).await;
+    bob.ok("screen.watch", watch.clone()).await;
+    root.ok("channel.override", for_role(vault, keys, json!([]), json!(["bypass_password"]))).await;
+    assert_eq!(bob.next_event("screen.stopped").await, ended, "override");
+
+    root.ok("channel.override", for_role(vault, keys, json!([]), json!([]))).await;
+    bob.ok("screen.watch", watch.clone()).await;
+    give(&mut root, &bob, json!([2])).await;
+    assert_eq!(bob.next_event("screen.stopped").await, ended, "role removal");
+    assert_eq!(alice.next_event_where("screen.viewers", |v| v["members"] == 0).await["share"], share);
+}
+
+#[tokio::test]
+async fn losing_share_screen_ends_the_share() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let room = channel_id(&root.create_channel(json!({"name": "Room"})).await);
+    let share = alice.share_in(room).await;
+    root.ok("channel.override", for_role(room, 2, json!([]), json!(["share_screen"]))).await;
+    assert_eq!(alice.next_event("screen.stopped").await, json!({"share": share, "reason": "access"}));
+    assert_eq!(alice.screen_start().await.unwrap_err().code, gwar_proto::ErrorCode::Forbidden);
+    // Still in voice: only sharing went.
+    assert_eq!(alice.ok("voice.state", json!({})).await["voice"]["channel"], room);
+}

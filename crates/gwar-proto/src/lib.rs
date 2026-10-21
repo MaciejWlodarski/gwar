@@ -65,6 +65,8 @@ mod mls;
 pub use mls::*;
 mod sealed;
 pub use sealed::*;
+mod screen;
+pub use screen::*;
 
 wire! {
     /// Client → server frame.
@@ -235,6 +237,24 @@ wire! {
         VoiceEpochAck(VoiceEpoch),
         #[serde(rename = "voice.epoch.repeat")]
         VoiceEpochRepeat(VoiceEpoch),
+        /// Shares one's screen into one's voice channel (needs `share_screen` there).
+        #[serde(rename = "screen.start")]
+        ScreenStart(ScreenStart),
+        /// Ends one's own share.
+        #[serde(rename = "screen.stop")]
+        ScreenStop { share: String },
+        /// Watches a share of a channel one can see (in an encrypted one, from inside its call).
+        #[serde(rename = "screen.watch")]
+        ScreenWatch { share: String },
+        #[serde(rename = "screen.unwatch")]
+        ScreenUnwatch { share: String },
+        /// Ends someone else's share (`mute_members` in its channel, rank above the sharer).
+        #[serde(rename = "screen.stop_other")]
+        ScreenStopOther { share: String },
+        /// Turns a share's TeamSpeak watch link off, for good: the sharer, or `mute_members` in
+        /// its channel with a rank above the sharer.
+        #[serde(rename = "screen.link.revoke")]
+        ScreenLinkRevoke { share: String },
         #[serde(untagged)]
         Mls(MlsRequest),
         #[serde(untagged)]
@@ -530,6 +550,8 @@ wire! {
         TeamspeakClaimed { teamspeak: Uid },
         /// `teamspeak.claimable`.
         TeamspeakClaimable { claimable: Vec<Uid> },
+        /// `screen.start`: the new share's id.
+        ScreenShare { share: String },
         Mls(MlsResponse),
         Empty {},
     }
@@ -569,6 +591,8 @@ wire! {
         TooLarge,
         /// An upload would go over the uploader's or the server's storage limit.
         QuotaExceeded,
+        /// A screen-sharing limit is reached; the message says which.
+        Busy,
         /// The Gwar Connect device certificate in `hello` has expired.
         CertificateExpired,
         Stale,
@@ -642,6 +666,24 @@ wire! {
         VoiceEpochAck { call: String, group: String, #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64, device: String },
         #[serde(rename = "voice.epoch.request")]
         VoiceEpochRequest { call: String, group: String, #[serde(deserialize_with = "voice::safe_u64")] #[cfg_attr(feature = "ts", ts(type = "number"))] epoch: u64 },
+        /// To everyone who can see the share's channel.
+        #[serde(rename = "screen.started")]
+        ScreenStarted(ScreenShare),
+        /// To everyone who can see the share's channel; with `access`, to one viewer whose
+        /// watch ended. `by` names the moderator who stopped it.
+        #[serde(rename = "screen.stopped")]
+        ScreenStopped {
+            share: String,
+            reason: ScreenStopReason,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            by: Option<String>,
+        },
+        /// To the sharer: how many watch the share.
+        #[serde(rename = "screen.viewers")]
+        ScreenViewers { share: String, members: u32, guests: u32 },
+        /// To the sharer and the channel's moderators: whether the share's TeamSpeak watch link works.
+        #[serde(rename = "screen.link")]
+        ScreenLink { share: String, active: bool },
         /// This user read a channel or conversation up to `message` on another device.
         #[serde(rename = "chat.read")]
         ChatRead { #[serde(flatten)] target: ChatReadTarget, message: MessageId },
@@ -687,6 +729,9 @@ wire! {
         #[serde(default)]
         #[cfg_attr(feature = "ts", ts(optional = nullable))]
         pub managers: Option<Managers>,
+        /// Running shares in the channels this session can see.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub shares: Vec<ScreenShare>,
     }
 
     /// The head of the server's owner chain.
@@ -839,6 +884,9 @@ wire! {
         /// Deafened for everyone by a moderator: hears nothing.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         pub server_deafened: bool,
+        /// Sharing their screen (the channel tree's LIVE badge).
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        pub sharing: bool,
     }
 
     pub struct Group {
@@ -953,6 +1001,8 @@ wire! {
         SendMessages,
         /// Mute or deafen someone for everyone in a channel.
         MuteMembers,
+        /// Share one's screen into a channel's voice.
+        ShareScreen,
     }
 
     #[derive(Default)]
@@ -1026,7 +1076,7 @@ wire! {
 }
 
 impl Permission {
-    pub const ALL: [Permission; 16] = [
+    pub const ALL: [Permission; 17] = [
         Permission::Administrator,
         Permission::ManageServer,
         Permission::ManageRoles,
@@ -1043,19 +1093,21 @@ impl Permission {
         Permission::Speak,
         Permission::SendMessages,
         Permission::MuteMembers,
+        Permission::ShareScreen,
     ];
 
     /// What every new member may do.
-    pub const MEMBER_DEFAULT: [Permission; 5] = [
+    pub const MEMBER_DEFAULT: [Permission; 6] = [
         Permission::CreateInvites,
         Permission::AttachFiles,
         Permission::Connect,
         Permission::Speak,
         Permission::SendMessages,
+        Permission::ShareScreen,
     ];
 
     /// The permissions a channel can override (docs/roles.md, "Overrides").
-    pub const CHANNEL: [Permission; 9] = [
+    pub const CHANNEL: [Permission; 10] = [
         Permission::Connect,
         Permission::Speak,
         Permission::SendMessages,
@@ -1065,7 +1117,11 @@ impl Permission {
         Permission::BypassPassword,
         Permission::ManageChannels,
         Permission::MuteMembers,
+        Permission::ShareScreen,
     ];
+
+    /// Off wherever `connect` is off (docs/roles.md, "Resolving a permission").
+    pub const NEEDS_CONNECT: [Permission; 2] = [Permission::Speak, Permission::ShareScreen];
 
     pub fn is_channel(self) -> bool {
         Self::CHANNEL.contains(&self)

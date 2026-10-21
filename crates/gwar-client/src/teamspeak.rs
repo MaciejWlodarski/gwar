@@ -344,6 +344,7 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
                     voice: true,
                     server_muted: false,
                     server_deafened: false,
+                    sharing: false,
                     voice_binding: Some(
                         previous
                             .clients
@@ -751,6 +752,12 @@ fn translate(request: &Request, own: u16, own_channel: u64) -> Result<Vec<(Part,
         Request::VoiceOffer(_) | Request::VoiceState {} | Request::VoiceEpochAck(_) | Request::VoiceEpochRepeat(_) => {
             return Err(refused("voice on TeamSpeak servers is native"));
         }
+        Request::ScreenStart(_)
+        | Request::ScreenStop { .. }
+        | Request::ScreenWatch { .. }
+        | Request::ScreenUnwatch { .. }
+        | Request::ScreenStopOther { .. }
+        | Request::ScreenLinkRevoke { .. } => return Err(refused("screen sharing requires a Gwar server")),
         Request::Sealed(_) => return Err(refused("encrypted direct messages require a Gwar server")),
         Request::Mls(_) => return Err(refused("MLS requires a Gwar server")),
         Request::OwnerChain { .. } | Request::OwnerTransfer { .. } | Request::ManagersUpdate { .. } => {
@@ -837,6 +844,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
         file_access: String::new(),
         owner: None,
         managers: None,
+        shares: Vec::new(),
     };
 
     let (request_tx, mut requests) = mpsc::channel(64);
@@ -1210,6 +1218,7 @@ mod tests {
                 voice_binding: None,
                 server_muted: false,
                 server_deafened: false,
+                sharing: false,
             },
         );
         view

@@ -8,6 +8,7 @@ import type { Managers } from "./Managers";
 import type { Member } from "./Member";
 import type { OwnerInfo } from "./OwnerInfo";
 import type { Permission } from "./Permission";
+import type { ScreenShare } from "./ScreenShare";
 import type { ServerInfo } from "./ServerInfo";
 import type { Unread } from "./Unread";
 
@@ -36,4 +37,8 @@ owner?: OwnerInfo | null,
 /**
  * The managers of private channels, once the server has an owner.
  */
-managers?: Managers | null, };
+managers?: Managers | null, 
+/**
+ * Running shares in the channels this session can see.
+ */
+shares?: Array<ScreenShare>, };

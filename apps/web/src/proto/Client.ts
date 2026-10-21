@@ -18,4 +18,8 @@ server_muted?: boolean,
 /**
  * Deafened for everyone by a moderator: hears nothing.
  */
-server_deafened?: boolean, };
+server_deafened?: boolean, 
+/**
+ * Sharing their screen (the channel tree's LIVE badge).
+ */
+sharing?: boolean, };

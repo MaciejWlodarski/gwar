@@ -93,6 +93,26 @@ describe("gwar/4 runtime schemas", () => {
     expect(responseFor("owner.chain", { genesis: "g", links: [{ statement: "s", signature: "A".repeat(86) }], next: null })).toBe(true);
     expect(responseFor("owner.transfer", {})).toBe(true);
   });
+  it("bounds screen shares in the welcome, their events and replies", () => {
+    const share = { share: "A".repeat(22), client: 3, channel: 1, preset: "text", surface: "window" };
+    const event = (ev: string, d: unknown) => parseFrame(JSON.stringify({ ev, d }))?.kind;
+    expect(responseFor("join", { ...welcome(), shares: [share] })).toBe(true);
+    expect(responseFor("join", { ...welcome(), shares: [{ ...share, preset: "4k" }] })).toBe(false);
+    const sharer = { id: 3, uid: "uid3", nickname: "Ann", channel: 1, groups: [], platform: "web", muted: false, deafened: false, away: null, talking: false, voice: true, voice_binding: null };
+    expect(responseFor("join", { ...welcome(), clients: [{ ...sharer, sharing: true }] })).toBe(true);
+    expect(responseFor("join", { ...welcome(), clients: [{ ...sharer, sharing: "yes" }] })).toBe(false);
+    expect(event("screen.started", share)).toBe("event");
+    expect(event("screen.started", { ...share, share: "short" })).toBeUndefined();
+    expect(event("screen.stopped", { share: share.share, reason: "moderator", by: "mod" })).toBe("event");
+    expect(event("screen.stopped", { share: share.share, reason: "access" })).toBe("event");
+    expect(event("screen.stopped", { share: share.share, reason: "bored" })).toBeUndefined();
+    expect(event("screen.viewers", { share: share.share, members: 2, guests: 0 })).toBe("event");
+    expect(event("screen.link", { share: share.share, active: false })).toBe("event");
+    expect(responseFor("screen.start", { share: share.share })).toBe(true);
+    expect(responseFor("screen.start", {})).toBe(false);
+    expect(responseFor("screen.watch", {})).toBe(true);
+    expect(parseFrame('{"re":1,"err":{"code":"busy","message":"full"}}')?.kind).toBe("err");
+  });
   it("validates challenge keys and nonces with exact fields and canonical encodings", () => {
     const valid = challenge();
     expect(parseFrame(JSON.stringify(valid))?.kind).toBe("event");
