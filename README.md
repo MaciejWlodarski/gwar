@@ -558,7 +558,9 @@ settings, and people keep their roles. Step by step, in 15 to 60 minutes:
 
 More in [docs/architecture.md](docs/architecture.md), [docs/connect.md](docs/connect.md),
 [docs/security.md](docs/security.md), [docs/deploy.md](docs/deploy.md),
-[docs/releasing.md](docs/releasing.md), [docs/latency.md](docs/latency.md), and for the
+[docs/releasing.md](docs/releasing.md), [docs/latency.md](docs/latency.md),
+[docs/screen-share.md](docs/screen-share.md) and
+[docs/native-media.md](docs/native-media.md) (native clients and media), and for the
 end-to-end encryption [docs/e2e.md](docs/e2e.md) (design) and
 [docs/e2e-build.md](docs/e2e-build.md) (specification).
 
@@ -592,7 +594,9 @@ GWAR_TS3_DIR=/tmp/ts3 cargo test -p gwar-client --test teamspeak_mode --test tea
 - **Mobile app** (iOS and Android).
 - **Streaming**: screen sharing and video, through the server first, then peer
   to peer (design: [docs/screen-share.md](docs/screen-share.md)).
-- **Fully native clients** later, keeping the same protocol.
+- **Fully native clients** later, keeping the same protocol, with native
+  screen and audio sharing and hardware H.264 on every platform (plan:
+  [docs/native-media.md](docs/native-media.md)).
 - **More TeamSpeak options**: bring your own TeamSpeak license for more slots,
   and a mixed stand-in so Gwar users can still talk when the free slots run out.
 

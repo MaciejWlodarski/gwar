@@ -1889,6 +1889,11 @@ known:
 
 ### Phase 3: native and peer-to-peer
 
+The native part of this phase is now planned in
+[native-media.md](native-media.md): native capture, hardware H.264 and higher
+resolutions on every platform, Linux included, and shared audio that leaves
+out Gwar's own voice. It replaces the first bullet below.
+
 - **Native capture and encode in `gwar-client`:** macOS and Windows for games
   if needed; Linux only if the owner revisits the deferral. str0m frame mode
   with its packetizers; Rust SFrame (5d's library) with the same layouts.

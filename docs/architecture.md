@@ -558,6 +558,11 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
   `gwar-client` (cpal, Opus with FEC, jitter buffer with PLC), global
   push-to-talk, tray.
 
+Eventually every client becomes native, the desktop included, with a shared
+Rust media core behind UniFFI and per-platform capture and codec adapters;
+the web app stays a first-class client. The plan and its contributor work
+items are in [native-media.md](native-media.md).
+
 ### Native command surface
 
 Only the local `main` webview has capabilities; there is no remote URL grant.
