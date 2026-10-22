@@ -49,8 +49,36 @@ pub enum AgentError {
     Waiting,
     #[error(transparent)]
     Rule(#[from] ds::DsError),
+    /// Stored by a newer version of Gwar: left as it is (docs/data-migrations.md).
+    #[error("MLS state saved by a newer version of Gwar (format {0}; this version knows up to {STORE_FORMAT})")]
+    NewerFormat(u8),
 }
 use AgentError::Invalid;
+
+/// The format of a device's stored records (docs/data-migrations.md), the `version` of its
+/// `@device` record. Changing how any record is stored bumps it and adds an upgrade.
+pub const STORE_FORMAT: u8 = 1 + STORE_UPGRADES.len() as u8;
+/// `STORE_UPGRADES[i]` takes a device's stores from format i + 1 to i + 2, `@device` included. They
+/// run as the stores are loaded and reach storage with the next operation's changes, all in one
+/// write; until then every load runs them again.
+pub(crate) const STORE_UPGRADES: &[fn(&mut Stores) -> Result<()>] = &[];
+
+/// Brings `stores` to [`STORE_FORMAT`]; refuses a newer format.
+fn upgrade_stores(stores: &mut Stores) -> Result<()> {
+    #[derive(Deserialize)]
+    struct Format {
+        version: u8,
+    }
+    let Some(device) = stores.groups.get(b"@device".as_slice()) else { return Ok(()) };
+    let format = parse::<Format>(device)?.version;
+    if format > STORE_FORMAT {
+        return Err(AgentError::NewerFormat(format));
+    }
+    for upgrade in STORE_UPGRADES.iter().skip(usize::from(format.max(1)) - 1) {
+        upgrade(stores)?;
+    }
+    Ok(())
+}
 /// How long after its expiry a key package's private keys are kept.
 const KEY_PACKAGE_GRACE_SECS: i64 = 7 * 86_400;
 type Result<T> = std::result::Result<T, AgentError>;
@@ -424,7 +452,7 @@ impl Agent {
         let (hpke_private, hpke_public) = history::hpke_key_pair(&ikm);
         Ok(Self {
             device: DeviceRecord {
-                version: 1,
+                version: STORE_FORMAT,
                 device_key: credential.device_key().into(),
                 hpke_private,
                 hpke_public,
@@ -463,11 +491,14 @@ impl Agent {
     pub fn load_voice(seed: [u8; 32], credential: Credential, stores: Stores) -> Result<Self> {
         Self::load_store(seed, credential, stores, true)
     }
-    fn load_store(seed: [u8; 32], credential: Credential, stores: Stores, voice_only: bool) -> Result<Self> {
+    fn load_store(seed: [u8; 32], credential: Credential, stored: Stores, voice_only: bool) -> Result<Self> {
         let signer = Self::signer(seed, &credential)?;
+        // What storage holds stays `durable`: the upgrade is part of the next changes.
+        let mut stores = stored.clone();
+        upgrade_stores(&mut stores)?;
         let device: DeviceRecord =
             parse(stores.groups.get(b"@device".as_slice()).ok_or(Invalid("missing device record"))?)?;
-        if device.version != 1
+        if device.version != STORE_FORMAT
             || device.device_key != credential.device_key()
             || !(1..=gwar_proto::MAX_SAFE_INTEGER).contains(&device.created_at)
             || device.hpke_public
@@ -523,7 +554,7 @@ impl Agent {
             servers,
             epochs: records(&stores.epochs, false)?,
             outbox: records(&stores.outbox, false)?,
-            durable: stores,
+            durable: stored,
             ready: false,
             poisoned: false,
             voice_only,

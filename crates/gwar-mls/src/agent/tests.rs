@@ -2325,3 +2325,92 @@ fn voice_records_removed_devices_including_a_same_device_rejoin() {
     acknowledge(&mut f.a, &f.id, &update);
     assert!(f.a.group(&server(), &f.id).unwrap().voice_removed.is_empty());
 }
+
+/// A device's stores as one format left them: a channel-less DM group created and settled, its
+/// device (account 1, seed 11) certified at `t`. One fixture per format, never edited once written
+/// (docs/data-migrations.md); write the current one with
+/// `GWAR_WRITE_MLS_FIXTURE=1 cargo test -p gwar-mls --lib stored_formats`.
+fn store_fixture(format: u8) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("tests/fixtures/agent-store-v{format}.json"))
+}
+fn encode_stores(stores: &Stores, t: i64) -> serde_json::Value {
+    let store = |s: &Store| s.iter().map(|(k, v)| [b64(k), b64(v)]).collect::<Vec<_>>();
+    serde_json::json!({
+        "t": t,
+        "stores": {
+            "openmls": store(&stores.openmls), "groups": store(&stores.groups),
+            "epochs": store(&stores.epochs), "outbox": store(&stores.outbox),
+        },
+    })
+}
+fn decode_stores(fixture: &serde_json::Value) -> (Stores, i64) {
+    use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+    let store = |name: &str| -> Store {
+        fixture["stores"][name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|pair| {
+                let part = |i: usize| URL_SAFE_NO_PAD.decode(pair[i].as_str().unwrap()).unwrap();
+                (part(0), part(1))
+            })
+            .collect()
+    };
+    let stores =
+        Stores { openmls: store("openmls"), groups: store("groups"), epochs: store("epochs"), outbox: store("outbox") };
+    (stores, fixture["t"].as_i64().unwrap())
+}
+
+#[test]
+fn stored_formats_every_older_format_loads_into_the_current_one() {
+    if std::env::var_os("GWAR_WRITE_MLS_FIXTURE").is_some() {
+        let f = fixture();
+        let mut a = f.a;
+        let stores = a.durable.clone();
+        a.take_changes();
+        let text = serde_json::to_string_pretty(&encode_stores(&stores, f.t)).unwrap() + "\n";
+        std::fs::create_dir_all(store_fixture(STORE_FORMAT).parent().unwrap()).unwrap();
+        std::fs::write(store_fixture(STORE_FORMAT), text).unwrap();
+    }
+    // A format without its fixture (or a fixture of a format not declared) fails here.
+    assert!(!store_fixture(STORE_FORMAT + 1).exists(), "a fixture for an unknown format: bump STORE_FORMAT");
+    for format in 1..=STORE_FORMAT {
+        let path = store_fixture(format);
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|_| panic!("missing {}", path.display()));
+        let (stores, t) = decode_stores(&serde_json::from_str(&text).unwrap());
+        let device: serde_json::Value = serde_json::from_slice(&stores.groups[b"@device".as_slice()]).unwrap();
+        assert_eq!(device["version"], format, "{} holds format {format}", path.display());
+        let mut a = Agent::load([11; 32], certified(&key(1), &key(11), t - 86_400_000), stores.clone()).unwrap();
+        assert_eq!(a.device.version, STORE_FORMAT);
+        assert_eq!(a.groups.len(), 1, "format {format}: the group is kept");
+        assert_eq!(a.durable, stores, "loading alone writes nothing");
+        // The upgrade reaches storage with the next operation's changes.
+        a.operation(|_| Ok(())).unwrap();
+        let changes = a.take_changes();
+        let mut upgraded = stores;
+        changes.apply(&mut upgraded);
+        let reloaded = Agent::load([11; 32], certified(&key(1), &key(11), t - 86_400_000), upgraded).unwrap();
+        assert_eq!(reloaded.groups, a.groups);
+    }
+}
+
+#[test]
+fn stored_formats_a_newer_format_is_refused_and_left_alone() {
+    let mut a = device(1, 11, now());
+    a.operation(|_| Ok(())).unwrap();
+    let mut stores = Stores::default();
+    let _ = a.take_changes();
+    let mut device: serde_json::Value = serde_json::from_slice(&a.durable.groups[b"@device".as_slice()]).unwrap();
+    device["version"] = (STORE_FORMAT + 1).into();
+    stores.groups.insert(b"@device".to_vec(), serde_json::to_vec(&device).unwrap());
+    let credential = a.credential.clone();
+    assert_eq!(Agent::load([11; 32], credential, stores).err(), Some(AgentError::NewerFormat(STORE_FORMAT + 1)));
+}
+
+#[test]
+fn stored_formats_pin_the_openmls_storage_version() {
+    // OpenMLS writes its own records (the `openmls` store) under keys carrying this version. A
+    // dependency update that changes it would leave every stored group unreadable: it needs a store
+    // upgrade (STORE_UPGRADES) that moves them, and a new fixture.
+    assert_eq!(openmls_traits::storage::CURRENT_VERSION, 1);
+}
