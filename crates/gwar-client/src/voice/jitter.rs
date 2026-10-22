@@ -95,6 +95,9 @@ struct Arrivals {
     unobserved: u64,
     /// The latest time dropped from the front.
     dropped: Option<Instant>,
+    /// A dropped entry was still pending: it counts from the next observation, which then
+    /// becomes `dropped`.
+    dropped_pending: bool,
 }
 
 impl Arrivals {
@@ -109,13 +112,33 @@ impl Arrivals {
         Some(self.entries.range(start..end).rev().copied())
     }
 
+    /// Arrivals keep coming when refills stop (the output device paused), so the limits hold
+    /// here as well as at each observation.
     fn push(&mut self, at: Instant, key: u64, observed: Option<Instant>) {
         let after = observed.is_none_or(|observed| at > observed);
+        let at = self.entries.back().map_or(at, |&(previous, _)| previous.max(at));
+        self.drop_older(at, ARRIVAL_HISTORY - 1);
         if self.pending > 0 || !after {
             self.pending += 1;
         }
-        let at = self.entries.back().map_or(at, |&(previous, _)| previous.max(at));
         self.entries.push_back((at, key));
+    }
+
+    /// Drop entries more than twice the window before `now`, and down to `limit` entries.
+    fn drop_older(&mut self, now: Instant, limit: usize) {
+        while self.entries.front().is_some_and(|&(at, _)| now.saturating_duration_since(at) > 2 * DEPTH_WINDOW)
+            || self.entries.len() > limit
+        {
+            let Some((at, _)) = self.entries.pop_front() else { break };
+            if self.pending == self.entries.len() + 1 {
+                // Its time is not known yet: no earlier than the next observation.
+                self.pending -= 1;
+                self.dropped_pending = true;
+            } else {
+                self.dropped = Some(at);
+            }
+            self.first += 1;
+        }
     }
 
     /// An observation at `now`: every entry since the previous one counts from `now` at the
@@ -127,13 +150,11 @@ impl Arrivals {
             entry.0 = if index >= pending { now } else { entry.0.min(now) };
         }
         self.pending = 0;
-        self.unobserved = self.end();
-        while self.entries.front().is_some_and(|&(at, _)| now.saturating_duration_since(at) > 2 * DEPTH_WINDOW)
-            || self.entries.len() > ARRIVAL_HISTORY
-        {
-            self.dropped = self.entries.pop_front().map(|(at, _)| at);
-            self.first += 1;
+        if std::mem::take(&mut self.dropped_pending) {
+            self.dropped = Some(now);
         }
+        self.unobserved = self.end();
+        self.drop_older(now, ARRIVAL_HISTORY);
     }
 
     fn clear(&mut self) {
@@ -142,6 +163,7 @@ impl Arrivals {
         self.entries.clear();
         self.pending = 0;
         self.dropped = None;
+        self.dropped_pending = false;
     }
 }
 
@@ -1407,5 +1429,75 @@ mod tests {
         assert_eq!(jb.shrink_samples, 0);
         assert_eq!(jb.pop_for(now, 480), Playout::Conceal(480));
         assert_eq!(jb.pop_for(now, 480), packet(3));
+    }
+
+    /// The output device stops after one refill while 200 s of 10 ms packets keep arriving,
+    /// then refills resume for 15 s. Returns the concealments and the cuts within and after
+    /// the first window of resumed observations.
+    fn refills_stop(clock: Clock, reserve_only: bool) -> (usize, usize, usize) {
+        let stride = if clock == Clock::Sequence { FRAME } else { 480 };
+        let start = Instant::now();
+        let at = |k: u64| start + Duration::from_millis(k * 10);
+        let mut jb = JitterBuffer::new();
+        jb.reserve_only = reserve_only;
+        jb.push_at(0, 480, vec![0], at(0), clock);
+        assert_eq!(pop_at(&mut jb, at(0), true), packet(0));
+        for k in 1..=20_000 {
+            jb.push_at(k * stride, 480, vec![1], at(k), clock);
+            let arrivals = &jb.arrivals;
+            assert!(arrivals.entries.len() <= ARRIVAL_HISTORY, "{clock:?} {k}");
+            let (front, back) = (arrivals.entries.front().unwrap().0, arrivals.entries.back().unwrap().0);
+            assert!(back - front <= 2 * DEPTH_WINDOW, "{clock:?} {k}");
+        }
+        let arrivals = &jb.arrivals;
+        assert_eq!(arrivals.end(), 20_001, "{clock:?}");
+        assert!(arrivals.entries.capacity() <= 2 * ARRIVAL_HISTORY, "{clock:?}");
+        assert!(arrivals.unobserved < arrivals.first && arrivals.dropped.is_some(), "{clock:?}");
+        let (mut concealments, mut cut_early, mut cut) = (0, 0, 0);
+        for k in 20_001..=21_500 {
+            jb.push_at(k * stride, 480, vec![1], at(k), clock);
+            match pop_at(&mut jb, at(k), true) {
+                Playout::Packet { skip, .. } if at(k) - at(20_001) < DEPTH_WINDOW => cut_early += skip,
+                Playout::Packet { skip, .. } => cut += skip,
+                Playout::Conceal(_) => concealments += 1,
+                Playout::Idle => panic!("{clock:?} idle at {k}"),
+            }
+            assert!(jb.arrivals.entries.len() <= ARRIVAL_HISTORY, "{clock:?} {k}");
+            assert_eq!(jb.arrivals.unobserved, jb.arrivals.end(), "{clock:?} {k}");
+        }
+        (concealments, cut_early, cut)
+    }
+
+    #[test]
+    fn arrival_history_stays_bounded_while_refills_stop() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let (concealments, cut_early, cut) = refills_stop(clock, false);
+            let (reserve_concealments, ..) = refills_stop(clock, true);
+            // The look-back into dropped history gives no margin: nothing is cut before a
+            // full window of new observations, and the resumed stream (the full queue holds
+            // the oldest packets, so it conceals across the gap after them) conceals no more
+            // than under the reserve rule. The backlog then drains.
+            assert_eq!(cut_early, 0, "{clock:?}");
+            assert!(concealments <= reserve_concealments, "{clock:?}: {concealments} > {reserve_concealments}");
+            assert!(cut > 0, "{clock:?}");
+        }
+    }
+
+    #[test]
+    fn dropped_pending_arrivals_count_from_the_next_observation() {
+        let start = Instant::now();
+        let mut arrivals = Arrivals::default();
+        let observed = start + Duration::from_secs(1);
+        arrivals.observe(observed);
+        // Stamped before the observation: their time is the next one.
+        for k in 0..ARRIVAL_HISTORY as u64 + 10 {
+            arrivals.push(start, k, Some(observed));
+        }
+        assert_eq!((arrivals.entries.len(), arrivals.pending), (ARRIVAL_HISTORY, ARRIVAL_HISTORY));
+        assert_eq!((arrivals.first, arrivals.dropped), (10, None));
+        let next = observed + Duration::from_millis(10);
+        arrivals.observe(next);
+        assert_eq!((arrivals.pending, arrivals.dropped, arrivals.unobserved), (0, Some(next), arrivals.end()));
+        assert!(arrivals.entries.iter().all(|&(at, _)| at == next));
     }
 }

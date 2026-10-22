@@ -467,7 +467,9 @@ concealment, cut and low-water mark (not committed) separated three mechanisms:
   The arrival rule (`jitter.rs` `refresh_surplus`) replaces the reserve with what
   the arrivals show. Nothing is consumed between refills, so a refill at an earlier
   time would have seen a mark's queue without the packets that arrived in between.
-  The buffer keeps every arrival for ten seconds, and each mark is still revised in
+  The buffer keeps every arrival for ten seconds, at most 8,192 of them. While
+  the output device is paused, the oldest are dropped as new ones arrive, and a
+  mark whose look-back reaches dropped arrivals has no margin. Each mark is still revised in
   hindsight by the arrivals after it. Each refill's lead (media consumed ahead of wall time) says
   how early it ran. Only leads since the last refill that consumed nothing count: a
   pause or a stretched timeline leaves consumption behind for good.
