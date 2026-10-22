@@ -112,7 +112,7 @@ function readBarcode(video) {
 }
 
 /** Per device: a synthetic microphone, the barcode reader and, for canvas sharers, the capture hook. */
-function devicePatch({ frequency, canvasId }, stamp, read) {
+function devicePatch({ frequency, canvasId, size }, stamp, read) {
   window.__readBarcode = read;
   // Every peer connection, for the RTP diagnostics a failure prints.
   window.__pcs = [];
@@ -135,8 +135,7 @@ function devicePatch({ frequency, canvasId }, stamp, read) {
     // The test hook: what the picker would return, a canvas with the stamped barcode.
     media.getDisplayMedia = async () => {
       const canvas = document.createElement("canvas");
-      canvas.width = 640;
-      canvas.height = 360;
+      [canvas.width, canvas.height] = size;
       canvas.style.cssText = "position:fixed;left:0;bottom:0;width:64px;height:36px;opacity:0.02;pointer-events:none;z-index:-1";
       document.body.appendChild(canvas);
       stamp(canvas, canvasId);
@@ -173,7 +172,8 @@ const errors = page => page.errors.filter(e => !/Conversation synchronization|fa
 async function device(browser, web, server, name, { canvasId = null, frequency = 440 } = {}) {
   const context = await browser.newContext({ locale: "en-US", viewport: { width: 1440, height: 900 } });
   await context.route("**/*", route => (new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort()));
-  await context.addInitScript({ content: `(${devicePatch})(${JSON.stringify({ frequency, canvasId })}, ${stampBarcode}, ${readBarcode})` });
+  const size = canvasId === null ? null : SOURCE_SIZES[canvasId];
+  await context.addInitScript({ content: `(${devicePatch})(${JSON.stringify({ frequency, canvasId, size })}, ${stampBarcode}, ${readBarcode})` });
   const page = await context.newPage();
   page.errors = [];
   page.on("pageerror", e => page.errors.push(String(e)));
@@ -259,9 +259,20 @@ async function watch(page, sharer) {
  */
 const paintsUnreliably = page => page.engine === "webkit" && process.platform === "linux";
 
+/**
+ * Each source's frame size, all of different shapes: a decoded frame's aspect ratio names the
+ * source even where no pixel can be read (and survives the encoder scaling it down). Source 1 is
+ * the Chromium tab, whose page has the context's 1440×900 viewport, or a canvas of that size.
+ */
+const SOURCE_SIZES = { 1: [1440, 900], 2: [640, 360], 3: [640, 480], 4: [480, 480], 5: [600, 400] };
+function fromSource(id, width, height, what) {
+  const [w, h] = SOURCE_SIZES[id];
+  assert.ok(Math.abs(width / height - w / h) < 0.03, `${what}: a ${width}x${height} frame is not source ${id}'s ${w}x${h}`);
+}
+
 /** Waits until `page` decodes `share` with the source's barcode, twice with different counters. */
 async function sees(page, share, id, what) {
-  if (paintsUnreliably(page)) return decodes(page, share, what);
+  if (paintsUnreliably(page)) return decodes(page, share, id, what);
   const read = () => page.evaluate(share => window.__readBarcode(document.querySelector(`video[data-share="${share}"]`)), share);
   let first = null, last = null;
   const ms = await waitFor(async () => {
@@ -270,13 +281,21 @@ async function sees(page, share, id, what) {
     if (!first) { first = last; return false; }
     return last.counter !== first.counter;
   }, `${what}: ${page.deviceName} decodes source ${id} (last ${JSON.stringify(last)})`, 30_000);
+  fromSource(id, last.width, last.height, what);
   const stats = await session(page, (_, __, controller, share) => controller.screen.stats(share), share);
   assert.ok(stats && stats.framesDecoded > 0, `${what}: frames decoded`);
+  fromSource(id, stats.width, stats.height, `${what} (receiver)`);
   checks.push({ check: what, viewer: page.deviceName, ms, size: `${last.width}x${last.height}`, framesDecoded: stats.framesDecoded });
 }
 
-/** The receiver of `share`'s slot keeps decoding frames: the check where the page paints no video. */
-async function decodes(page, share, what) {
+/**
+ * The receiver of `share`'s slot keeps decoding frames of source `id`'s shape: the check where the
+ * page paints no video. The slot is the one the app holds for `share`, so a wrong slot mapping
+ * shows as another source's shape. Without a painted frame no pixel can be read: WebKit has no
+ * `MediaStreamTrackProcessor`, and `VideoFrame` and `requestVideoFrameCallback` need the painted
+ * video.
+ */
+async function decodes(page, share, id, what) {
   const stats = () => session(page, (_, __, controller, share) => controller.screen.stats(share), share);
   let first = null, last = null;
   const ms = await waitFor(async () => {
@@ -285,6 +304,7 @@ async function decodes(page, share, what) {
     if (!first) { first = last; return false; }
     return last.framesDecoded >= first.framesDecoded + 5;
   }, `${what}: ${page.deviceName} keeps decoding (last ${JSON.stringify(last)})`, 30_000);
+  fromSource(id, last.width, last.height, what);
   checks.push({ check: what, viewer: page.deviceName, ms, size: `${last.width}x${last.height}`, framesDecoded: last.framesDecoded, painted: false });
 }
 

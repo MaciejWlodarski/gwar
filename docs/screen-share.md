@@ -1712,19 +1712,31 @@ badge, stage). Decisions taken while building it, where this design left room:
 - **Changing the preset while sharing** changes the track constraints and the
   sender parameters only. The server keeps announcing the preset the share
   started with: there is no request to change it, and its per-share limit is
-  the server's cap, not the preset's.
+  the server's cap, not the preset's. A change made while `screen.start` or
+  the publish negotiation is still running is applied when the publisher
+  starts.
 - **"Switch source"** is Chromium's own button, enabled by
   `surfaceSwitching: "include"`; Gwar adds none.
 - **`screen.stopped {reason: "access"}`** ends only my watch. The share stays
   listed while its sharer's `Client.sharing` is on, because the same reason
   also ends a share whose sharer lost `share_screen`, and only the sharer's
-  `sharing` going off tells the two apart.
+  `sharing` going off tells the two apart. The server frees the slot
+  (`screen.slot {share: null}`) before it sends `screen.stopped`; the client
+  keeps the freed watch until the reason arrives, so the right notice shows,
+  and none for a share it was not watching.
 - **Watch transport.** One per session, negotiated on the first watch.
   `screen.watch` is asked again for up to 5 s while the server answers
   `unavailable`, because the browser can see the transport connect before the
   screen task reports it. A transport that fails ends every watch, as the
-  server does; the user opens the shares again, and the next watch negotiates
-  a new run.
+  server does, with one notice; the user opens the shares again, and the next
+  watch negotiates a new run.
+- **Watch requests.** Each watch has its own id, and the requests of one share
+  run one at a time: a watch, its release and the next watch of the same share
+  reach the server in order, so an earlier watch's assignment or release is
+  never taken for a later one's. Only the answer to a watch's own
+  `screen.watch` makes it a watch (`screen.slot` events only record the slot).
+  A request whose watch was stopped, or whose transport was replaced, stops
+  before its next step; a slot granted to it anyway is released.
 - **`screen.paused` / `screen.resumed`** arrive with PR 3b; the stage does not
   show "Your connection is too slow" yet.
 - **The stage** shows the share in focus, then every other watched share and
@@ -1742,10 +1754,15 @@ badge, stage). Decisions taken while building it, where this design left room:
   keeps decoding, mostly when it gets the stream after frames already flow. A
   page with two peer connections and no Gwar code shows the same. Safari on
   macOS paints every video. So on Linux the e2e's WebKit viewers check the
-  receiver's decoded frames and frame size instead of the barcode; the macOS
-  runs read every barcode in both engines, and on Linux Chromium viewers read
-  the WebKit sharer's barcode. Linux WebKit is not a supported platform (see
-  the desktop table above).
+  receiver's decoded frames instead of the barcode; the macOS runs read every
+  barcode in both engines, and on Linux Chromium viewers read the WebKit
+  sharer's barcode. Every source has a frame of its own shape (16:10, 16:9,
+  4:3, 1:1, 3:2), and each viewer checks the decoded aspect ratio of the slot
+  the app holds for that share: that ties the slot to its sharer even where no
+  pixel can be read. Pixels cannot be read there: WebKit has no
+  `MediaStreamTrackProcessor`, and `VideoFrame` and `requestVideoFrameCallback`
+  need a painted video. Linux WebKit is not a supported platform (see the
+  desktop table above).
 
 ## 7. Phases and pull requests
 
