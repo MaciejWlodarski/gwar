@@ -2917,6 +2917,7 @@ dependencies = [
  "base64 0.22.1",
  "gwar-client",
  "gwar-proto",
+ "objc2-foundation",
  "open",
  "percent-encoding",
  "reqwest",

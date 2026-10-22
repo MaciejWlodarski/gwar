@@ -681,7 +681,8 @@ loads, the main window sets both to deny for the app's origin.
 | `ts_identity_set_list` | High: replaces a bounded native list; public UID references preserve stored keys without returning them. Deleting identities from the device list, which exist nowhere else, needs a Rust-owned native confirmation. |
 | `ts_identity_detect` | High: discovers official-client private keys only after a Rust-owned native confirmation. |
 | `ts_identity_export` | High: exposes selected/list private keys, including vault seeding, only after a Rust-owned native confirmation. |
-| `tray_set_state` | Low: updates mute/deafen indicators. |
+| `tray_set_state` | Low: updates the mute/deafen indicators and enables "Stop sharing screen". |
+| `screen_capture_support` | Low: says whether this OS may share the screen (macOS version, Windows, Linux); no capture happens natively. |
 | `set_close_to_tray` | Low: changes close behavior. |
 | `debug_autoconnect` | Low: reads one dedicated environment setting in debug builds; returns nothing in release. |
 | `debug_log` | Low: debug log text; no effect in release. |

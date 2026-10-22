@@ -4,5 +4,7 @@
 <dict>
   <key>NSMicrophoneUsageDescription</key>
   <string>Gwar needs the microphone so others can hear you.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>Gwar shares the screen or window you pick with your voice channel.</string>
 </dict>
 </plist>

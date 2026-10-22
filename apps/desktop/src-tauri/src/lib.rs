@@ -4,6 +4,7 @@
 
 pub mod fake_audio;
 mod files;
+mod screen;
 mod shortcuts;
 mod tray;
 mod ts;
@@ -107,6 +108,7 @@ pub fn run() {
             voice::mic_test_start,
             voice::mic_test_stop,
             voice::open_mic_privacy_settings,
+            screen::screen_capture_support,
             files::files_set_server,
             files::files_cancel,
             files::fetch_file,

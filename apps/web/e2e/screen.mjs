@@ -21,6 +21,7 @@
  *   GWAR_SERVER_BIN                 server binary (default: target/debug/gwar-server)
  */
 import { stopProcesses } from "./processes.mjs";
+import { canvasCapture, readBarcode, stampBarcode } from "./screen-source.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -63,56 +64,8 @@ async function waitFor(check, what, timeout = 30_000) {
   }
 }
 
-/**
- * Draws the source's frames: a 20-cell barcode across the top quarter (4 bits of source id, a
- * 12-bit frame counter and a 4-bit check), and a moving block so every frame changes.
- */
-function stampBarcode(canvas, id) {
-  const ctx = canvas.getContext("2d");
-  let counter = 0;
-  const draw = () => {
-    const w = canvas.width, h = canvas.height;
-    counter = (counter + 1) & 4095;
-    ctx.fillStyle = "#777";
-    ctx.fillRect(0, 0, w, h);
-    ctx.fillStyle = `hsl(${(counter * 7) % 360} 70% 50%)`;
-    ctx.fillRect((counter * 9) % w, h / 2, w / 8, h / 4);
-    const check = (id ^ counter ^ (counter >> 4) ^ (counter >> 8) ^ 10) & 15;
-    const bits = [];
-    for (let i = 3; i >= 0; i--) bits.push((id >> i) & 1);
-    for (let i = 11; i >= 0; i--) bits.push((counter >> i) & 1);
-    for (let i = 3; i >= 0; i--) bits.push((check >> i) & 1);
-    bits.forEach((bit, i) => { ctx.fillStyle = bit ? "#000" : "#fff"; ctx.fillRect((i * w) / 20, 0, w / 20 + 1, h / 4); });
-  };
-  draw();
-  setInterval(draw, 50);
-}
-
-/** Reads the barcode back from a decoded video: `{id, counter}`, `{invalid}` or null without a frame. */
-function readBarcode(video) {
-  const w = video?.videoWidth, h = video?.videoHeight;
-  if (!w || !h) return null;
-  const canvas = document.createElement("canvas");
-  canvas.width = w;
-  canvas.height = h;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  ctx.drawImage(video, 0, 0, w, h);
-  const y = Math.floor(h / 8);
-  const bits = [];
-  for (let i = 0; i < 20; i++) {
-    const x = Math.floor(((i + 0.5) * w) / 20);
-    const d = ctx.getImageData(x - 2, y - 2, 5, 5).data;
-    let sum = 0;
-    for (let k = 0; k < d.length; k += 4) sum += d[k] + d[k + 1] + d[k + 2];
-    bits.push(sum / (d.length / 4) / 3 < 128 ? 1 : 0);
-  }
-  const num = (from, n) => bits.slice(from, from + n).reduce((v, b) => v * 2 + b, 0);
-  const id = num(0, 4), counter = num(4, 12), check = num(16, 4);
-  return ((id ^ counter ^ (counter >> 4) ^ (counter >> 8) ^ 10) & 15) === check ? { id, counter, width: w, height: h } : { invalid: true };
-}
-
 /** Per device: a synthetic microphone, the barcode reader and, for canvas sharers, the capture hook. */
-function devicePatch({ frequency, sources }, stamp, read) {
+function devicePatch({ frequency, sources }, stamp, read, capture) {
   window.__readBarcode = read;
   // Every peer connection, for the RTP diagnostics a failure prints.
   window.__pcs = [];
@@ -131,20 +84,7 @@ function devicePatch({ frequency, sources }, stamp, read) {
     return destination.stream;
   };
   media.enumerateDevices = async () => [];
-  if (sources.length) {
-    // The test hook: what the picker would return, a canvas with the stamped barcode. Each share
-    // takes the next source, so a share that follows another is told apart by its frames.
-    let next = 0;
-    media.getDisplayMedia = async () => {
-      const { id, size } = sources[Math.min(next++, sources.length - 1)];
-      const canvas = document.createElement("canvas");
-      [canvas.width, canvas.height] = size;
-      canvas.style.cssText = "position:fixed;left:0;bottom:0;width:64px;height:36px;opacity:0.02;pointer-events:none;z-index:-1";
-      document.body.appendChild(canvas);
-      stamp(canvas, id);
-      return canvas.captureStream(20);
-    };
-  }
+  if (sources.length) capture(sources, stamp);
 }
 
 const sourcePage = `<!doctype html><title>${SOURCE_TITLE}</title><style>html,body{margin:0;height:100%;overflow:hidden;background:#777}canvas{display:block;width:100vw;height:100vh}</style>
@@ -176,7 +116,7 @@ async function device(browser, web, server, name, { canvasId = null, frequency =
   const context = await browser.newContext({ locale: "en-US", viewport: { width: 1440, height: 900 } });
   await context.route("**/*", route => (new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort()));
   const sources = (canvasId === null ? [] : [canvasId].flat()).map(id => ({ id, size: SOURCE_SIZES[id] }));
-  await context.addInitScript({ content: `(${devicePatch})(${JSON.stringify({ frequency, sources })}, ${stampBarcode}, ${readBarcode})` });
+  await context.addInitScript({ content: `(${devicePatch})(${JSON.stringify({ frequency, sources })}, ${stampBarcode}, ${readBarcode}, ${canvasCapture})` });
   const page = await context.newPage();
   page.errors = [];
   page.on("pageerror", e => page.errors.push(String(e)));

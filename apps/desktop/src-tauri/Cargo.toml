@@ -19,6 +19,10 @@ custom-protocol = ["tauri/custom-protocol"]
 webview2-com = "0.39"
 windows = "0.62"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# The macOS version, for the screen-sharing gate (src/screen.rs); the version wry uses.
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSDictionary", "NSProcessInfo", "NSString"] }
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 

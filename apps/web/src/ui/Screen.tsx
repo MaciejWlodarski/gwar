@@ -6,11 +6,12 @@ import { Maximize, MessageSquare, MessageSquareOff, Minimize, MonitorOff, Monito
 import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { cn } from "../lib/cn";
+import { isDesktop } from "../platform";
 import { canActOn } from "../lib/permissions";
 import type { Client } from "../proto/Client";
 import type { ScreenShare } from "../proto/ScreenShare";
 import { controller } from "../state/controller";
-import { canWatch, screenSupport } from "../state/screen-controller";
+import { useCanWatch, useScreenSupport } from "../state/screen-controller";
 import { shareOf } from "../state/reducer";
 import { slotOf, useScreen } from "../state/screen";
 import { useSession } from "../state/stores";
@@ -27,10 +28,11 @@ function useShareRefusal(): string | null {
   const kind = useSession(s => s.kind);
   const encrypted = useSession(s => (me?.channel != null ? !!s.channels[me.channel]?.encrypted : false));
   const allowed = useChannelPermission(me?.channel ?? null, "share_screen");
-  const support = screenSupport();
-  if (kind !== "gwar" || support === "desktop") return null;
+  const support = useScreenSupport();
+  if (kind !== "gwar" || support === "hidden") return null;
   // Encrypted channels refuse until encrypted shares land (PR 7): never a share in the clear.
   if (encrypted) return t("screen.encryptedSoon");
+  if (support === "macos") return t("screen.needsMacos");
   if (support === "unsupported") return t("screen.unsupported");
   if (support === "insecure") return t("screen.insecure");
   if (!allowed) return t("screen.noPermission");
@@ -39,14 +41,15 @@ function useShareRefusal(): string | null {
 
 /**
  * The voice panel's Share button, beside mute and deafen. Hidden on TeamSpeak servers and in
- * the desktop app (desktop sharing is PR 5); shown disabled with the reason elsewhere.
+ * the Linux desktop app (deferred); shown disabled with the reason elsewhere.
  */
 export function ShareButton() {
   const t = useT();
   const own = useScreen(s => s.own);
   const kind = useSession(s => s.kind);
   const refusal = useShareRefusal();
-  if (kind !== "gwar" || screenSupport() === "desktop") return null;
+  const support = useScreenSupport();
+  if (kind !== "gwar" || support === "hidden") return null;
   if (own) {
     return (
       <IconButton label={t("screen.stop")} size="wide" active onClick={() => void controller.screen.stopShare()}
@@ -166,11 +169,12 @@ export function LiveBadge({ client, name }: { client: Client; name: string }) {
   const t = useT();
   const share = useSession(s => shareOf(s, client.id));
   const isMe = useSession(s => s.me?.session === client.id);
+  const watchable = useCanWatch();
   if (!client.sharing) return null;
   const pill = "shrink-0 rounded bg-danger px-1 text-[10px] leading-4 font-bold tracking-wide text-white";
   if (isMe) return <span className={pill} title={t("screen.liveSelf")}>{t("screen.live")}</span>;
-  if (!canWatch() || !share) {
-    return <span className={pill} title={t(screenSupport() === "desktop" ? "screen.liveDesktop" : "screen.liveTitle", { name })}>{t("screen.live")}</span>;
+  if (!watchable || !share) {
+    return <span className={pill} title={t(!watchable && isDesktop() ? "screen.liveDesktop" : "screen.liveTitle", { name })}>{t("screen.live")}</span>;
   }
   return (
     <button type="button" aria-label={t("screen.liveTitle", { name })} title={t("screen.liveTitle", { name })}
