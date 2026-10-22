@@ -678,7 +678,7 @@ async fn commit_clock_errors_do_not_mutate_observers_and_the_clock_survives_rest
 }
 
 #[tokio::test]
-async fn early_and_backwards_commit_times_are_distinct() {
+async fn early_is_retryable_and_backwards_commit_times_are_terminal() {
     for early in [true, false] {
         let server = TestServer::start().await;
         let mut alice = Device::new(1, 11);
@@ -690,9 +690,100 @@ async fn early_and_backwards_commit_times_are_distinct() {
         let update = alice.update();
         assert_eq!(
             a.fails("mls.commit", update_request(&group, 0, &update)).await,
-            if early { "early" } else { "bad_request" }
+            if early { "early" } else { "expired" }
         );
         assert_eq!(a.ok("mls.log", json!({"group":group,"since":0})).await["head"], 0);
+    }
+}
+
+#[tokio::test]
+async fn group_time_floor_is_terminal_for_skewed_commits_and_survives_restart() {
+    for skew in [-180_000, -2_600, 2_600, 180_000] {
+        for external in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let database = dir.path().join("gwar.sqlite");
+            let server = TestServer::start_with(|c| {
+                c.database = Some(database.clone());
+                c.data_dir = Some(dir.path().to_path_buf());
+            })
+            .await;
+            let t = now();
+            let mut alice = Device::new(1, 11);
+            let mut bob = Device::new(2, 21);
+            for (device, account, seed) in [(&mut alice, 1, 11), (&mut bob, 2, 21)] {
+                device.credential = Credential::Account(
+                    serde_json::from_value(certificate(&key(account), &key(seed), t - 600_000, t + 29 * 86_400_000))
+                        .unwrap(),
+                );
+            }
+            let mut a = connect_device(&server, &alice).await;
+            let mut b = connect_device(&server, &bob).await;
+            let mut d = descriptor(&alice, 2, &a.server_key, 1);
+            d.descriptor.created_at = t + skew;
+            let d = SignedDescriptor::sign(d.descriptor, alice.credential.clone(), &alice.signer.0);
+            alice.create(&d, &a.server_key);
+            let info = alice.group_info();
+            let created = a
+                .ok(
+                    "mls.group.create",
+                    json!({
+                        "conversation": d.descriptor.conversation, "group_info": b64(&info)
+                    }),
+                )
+                .await;
+            let group = created["group"].as_str().unwrap().to_owned();
+            let saved = alice.provider.storage().values.read().unwrap().clone();
+            alice.time = Some(t);
+            bob.time = Some(t);
+            let out = if external { bob.join_external(&info, None) } else { alice.update() };
+            let request = update_request(&group, 0, &out);
+            let client = if external { &mut b } else { &mut a };
+            if skew < 0 {
+                client.ok("mls.commit", request).await;
+                assert_eq!(client.ok("mls.group_info", json!({"group":group})).await["epoch"], 1);
+                continue;
+            }
+            let db = rusqlite::Connection::open(&database).unwrap();
+            let snapshot = || {
+                db.query_row(
+                    "SELECT epoch,committed_at,observer,group_info FROM mls_groups WHERE group_id=?1",
+                    [&group],
+                    |r| {
+                        Ok((r.get::<_, u64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Vec<u8>>(2)?, r.get::<_, Vec<u8>>(3)?))
+                    },
+                )
+                .unwrap()
+            };
+            let before = snapshot();
+            assert_eq!(before.1, t + skew);
+            assert_eq!(client.fails("mls.commit", request.clone()).await, "expired");
+            assert_eq!(snapshot(), before);
+            a.close().await;
+            b.close().await;
+            drop(server);
+            let mut config = base_config();
+            config.database = Some(database.clone());
+            config.data_dir = Some(dir.path().to_path_buf());
+            let running = gwar_server::start(config).await.unwrap();
+            let server = TestServer { running, admin_token: String::new() };
+            let mut restored = connect_device(&server, if external { &bob } else { &alice }).await;
+            assert_eq!(restored.fails("mls.commit", request).await, "expired");
+            assert_eq!(snapshot(), before);
+            // A rebuilt timestamp at the floor is immediately acceptable,
+            // without waiting five minutes for the old bytes to age out.
+            let rebuilt = if external {
+                bob.time = Some(t + skew);
+                bob.join_external(&info, None)
+            } else {
+                *alice.provider.storage().values.write().unwrap() = saved;
+                alice.group = MlsGroup::load(alice.provider.storage(), &GroupId::from_slice(&d.group_id())).unwrap();
+                alice.time = Some(t + skew);
+                alice.update()
+            };
+            restored.ok("mls.commit", update_request(&group, 0, &rebuilt)).await;
+            assert_eq!(snapshot().0, 1);
+            assert_eq!(snapshot().1, t + skew);
+        }
     }
 }
 

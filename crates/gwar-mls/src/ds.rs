@@ -28,8 +28,9 @@ pub enum DsError {
     /// Not for the observer's current epoch: someone else's commit came first.
     #[error("stale epoch")]
     Stale,
-    /// The commit's time is too far behind the server's clock: it can never
-    /// be accepted, so its sender builds a new one.
+    /// The commit's time is too far behind the server's clock or below the
+    /// group's persisted previous-commit floor. It can never be accepted,
+    /// so its sender builds a new one.
     #[error("commit expired")]
     Expired,
     /// The commit's time is too far ahead of the server's clock: it may be
@@ -276,7 +277,9 @@ impl Observer {
     /// Consumes the observer: on error, load the saved state again.
     ///
     /// `now` is the server's clock and `previous` the time of the group's last
-    /// commit (both Unix ms); see [`commit_time`].
+    /// commit (both Unix ms); see [`commit_time`]. The caller must persist
+    /// `previous` with the observer so a terminal floor rejection stays terminal
+    /// after a restart or clock rollback.
     pub fn commit(
         mut self,
         commit: &[u8],
@@ -301,24 +304,21 @@ impl Observer {
         if message.epoch() != self.group.group_context().epoch() {
             return Err(DsError::Stale);
         }
-        // A commit too old for the clock can never be accepted, whatever else
-        // OpenMLS would reject it for now (such as an Add whose key package ran
-        // out meanwhile), so its sender learns to build a new one. The time is
-        // read before the signature is checked; it is checked again below.
-        if peek_commit_time(commit).is_some_and(|t| now.saturating_sub(t) > MAX_CLOCK_SKEW_MS) {
+        // Neither age nor the persisted group floor can recover on retry, even
+        // after the clocks catch up. Return the terminal rejection before OpenMLS
+        // can reject an expired Add package. This unverified peek only rejects;
+        // the authenticated time is checked again below before accepting anything.
+        if peek_commit_time(commit).is_some_and(|t| t < previous || now.saturating_sub(t) > MAX_CLOCK_SKEW_MS) {
             return Err(DsError::Expired);
         }
         let crypto = RustCrypto::default();
         let processed = self.group.process_message(&crypto, message).map_err(invalid("commit"))?;
         let committed_at = commit_time(processed.aad()).ok_or(Invalid("commit time"))?;
-        if now.saturating_sub(committed_at) > MAX_CLOCK_SKEW_MS {
+        if committed_at < previous || now.saturating_sub(committed_at) > MAX_CLOCK_SKEW_MS {
             return Err(DsError::Expired);
         }
         if committed_at.saturating_sub(now) > MAX_CLOCK_SKEW_MS {
             return Err(DsError::Early);
-        }
-        if committed_at < previous {
-            return Err(Invalid("commit time"));
         }
         let sender = match processed.sender() {
             Sender::Member(index) => CommitSender::Member(index.u32()),

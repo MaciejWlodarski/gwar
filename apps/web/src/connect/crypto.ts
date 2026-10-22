@@ -48,6 +48,10 @@ export function checkKdf(kdf: Kdf): void {
 export const CERTIFICATE_DAYS = 90;
 /** What servers accept at most. */
 export const MAX_CERTIFICATE_DAYS = 90;
+/** How far apart the service's clock and this device's may be (docs/connect.md). */
+export const CLOCK_SKEW_MS = 300_000;
+/** Two devices can sit at opposite ends of the five-minute clock allowance. */
+export const CERTIFICATE_BACKDATE_MS = 2 * CLOCK_SKEW_MS;
 
 export interface Secrets {
   encKey: Uint8Array;
@@ -221,15 +225,17 @@ export interface SignedDevice {
   signature: string;
 }
 
-/** The account key certifies a device key. */
+/** The account key certifies a device key. Backdate new certificates, including
+ * renewals, so slower peers can use them immediately with strict validity checks.
+ * Expiry is measured from issuedAt, preserving the 90-day maximum. */
 export async function certifyDevice(
   account: KeyPairJwk,
   deviceKey: string,
-  now: number = Date.now(),
-  expiresAt: number = now + CERTIFICATE_DAYS * 86_400_000,
+  issuedAt: number = Math.max(0, Date.now() - CERTIFICATE_BACKDATE_MS),
+  expiresAt: number = issuedAt + CERTIFICATE_DAYS * 86_400_000,
 ): Promise<SignedDevice> {
-  const signature = await signText(account.jwk, deviceStatement(account.publicKey, deviceKey, now, expiresAt));
-  return { device_key: deviceKey, issued_at: now, expires_at: expiresAt, signature };
+  const signature = await signText(account.jwk, deviceStatement(account.publicKey, deviceKey, issuedAt, expiresAt));
+  return { device_key: deviceKey, issued_at: issuedAt, expires_at: expiresAt, signature };
 }
 
 /** Whether the account key signed this certificate and its lifetime is one servers accept (docs/connect.md). */
@@ -257,9 +263,8 @@ export async function hashBytes(bytes: Uint8Array): Promise<string> {
 
 export const hashText = (text: string): Promise<string> => hashBytes(enc.encode(text));
 
-/** How long a Connect challenge lives, and how far apart the service's clock and this device's may be (docs/connect.md). */
+/** How long a Connect challenge lives (docs/connect.md). */
 export const CHALLENGE_MS = 300_000;
-export const CLOCK_SKEW_MS = 300_000;
 
 export function checkChallenge(c: ConnectChallenge, serviceKey: string, now: number = Date.now()): void {
   const canonical = (text: string, length: number) => {

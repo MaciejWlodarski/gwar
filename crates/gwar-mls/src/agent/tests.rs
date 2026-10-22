@@ -100,6 +100,112 @@ fn external_join_waits_for_acceptance_and_exports_matching_keys() {
     );
 }
 #[test]
+fn skewed_join_and_member_commits_rebuild_after_terminal_floor_rejection() {
+    for skew in [-300_000_i64, -180_000, -2_600, 2_600, 180_000, 300_000] {
+        for external in [false, true] {
+            let mut f = if external { fixture() } else { joined() };
+            let out = if external {
+                f.b.join_external(&server(), &f.info, None, f.t + skew, &()).unwrap()
+            } else {
+                f.b.commit(&server(), &f.id, &[], &[], f.t + skew, &()).unwrap()
+            };
+            f.b.take_changes();
+            let saved = f.observer.save();
+            let load = || Observer::load(&saved, &server()).unwrap();
+            let accepted = if skew < 0 {
+                // The bytes can never pass the persisted epoch's floor, even
+                // after both the device and server clocks catch up.
+                for clock in [f.t, f.t - skew] {
+                    assert_eq!(
+                        load().commit(&out.commit, &out.group_info, None, clock, f.t).err(),
+                        Some(ds::DsError::Expired)
+                    );
+                }
+                f.b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
+                assert_eq!(
+                    f.b.reconcile(&server(), &f.id, Reconcile::Rejected { reason: Rejection::Expired }).unwrap(),
+                    if external { Resolution::Rejoin } else { Resolution::Rebuild }
+                );
+                f.b.take_changes();
+                f.b = Agent::load([21; 32], f.b.credential.clone(), f.b.durable.clone()).unwrap();
+                assert!(f.b.outbox(&server(), &f.id).is_none());
+                let rebuilt = if external {
+                    f.b.join_external(&server(), &f.info, None, f.t + 1, &()).unwrap()
+                } else {
+                    f.b.commit(&server(), &f.id, &[], &[], f.t + 1, &()).unwrap()
+                };
+                assert_ne!(out.hash, rebuilt.hash);
+                load().commit(&rebuilt.commit, &rebuilt.group_info, None, f.t - skew, f.t).unwrap();
+                rebuilt
+            } else {
+                load().commit(&out.commit, &out.group_info, None, f.t, f.t).unwrap();
+                out
+            };
+            f.b.take_changes();
+            acknowledge(&mut f.b, &f.id, &accepted);
+            f.a.receive(&server(), &f.id, &accepted.commit, &[]).unwrap();
+            f.a.take_changes();
+            assert_eq!(
+                f.a.sending_key(&server(), &f.id, f.t + skew.abs(), &()).unwrap(),
+                f.b.sending_key(&server(), &f.id, f.t + skew.abs(), &()).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn backdated_fresh_certificates_allow_skewed_adds_and_external_joins() {
+    for skew in [-300_000, -180_000, -2_600, 2_600, 180_000, 300_000] {
+        for external in [false, true] {
+            let mut f = fixture();
+            // The group predates both devices' clocks. Issuance matches
+            // certifyDevice's default: two five-minute allowances back.
+            let server_now = f.t + 300_000;
+            let issuer_now = server_now + skew;
+            let peer_now = server_now - skew;
+            let c = certified(&key(2), &key(21), issuer_now - 600_000);
+            f.b = Agent::new([21; 32], c.clone(), issuer_now).unwrap();
+            f.b.take_changes();
+            let out = if external {
+                f.b.join_external(&server(), &f.info, None, issuer_now, &()).unwrap()
+            } else {
+                let packages = f.b.key_packages(1, issuer_now).unwrap();
+                f.b.take_changes();
+                for package in &packages {
+                    ds::key_package(package).unwrap();
+                }
+                f.a.commit(&server(), &f.id, &packages, &[], peer_now, &()).unwrap()
+            };
+            f.observer =
+                f.observer.commit(&out.commit, &out.group_info, out.welcome.as_deref(), server_now, f.t).unwrap().0;
+            if external {
+                f.b.take_changes();
+                acknowledge(&mut f.b, &f.id, &out);
+                f.a.receive(&server(), &f.id, &out.commit, &[]).unwrap();
+            } else {
+                f.a.take_changes();
+                acknowledge(&mut f.a, &f.id, &out);
+                f.b.welcome(&server(), "fresh-skewed", out.welcome.as_ref().unwrap()).unwrap();
+            }
+            f.a.take_changes();
+            f.b.take_changes();
+            assert_eq!(
+                f.a.sending_key(&server(), &f.id, peer_now, &()).unwrap(),
+                f.b.sending_key(&server(), &f.id, issuer_now, &()).unwrap()
+            );
+            // Backdating issuance does not add a grace period to history,
+            // expiry or revocation. Every exact boundary remains strict.
+            let Credential::Account(cert) = &c else { unreachable!() };
+            assert!(!c.is_current(cert.issued_at - 1, &()));
+            assert!(c.is_current(cert.issued_at, &()));
+            assert!(!c.is_current(cert.expires_at, &()));
+            let revoked = Revoked(c.device_key().into(), peer_now);
+            assert!(!f.a.gate(&server(), &f.id, peer_now, &revoked).unwrap().can_send());
+        }
+    }
+}
+
+#[test]
 fn pending_commit_round_trip_and_reconciliation() {
     let mut f = joined();
     let old = f.a.sending_key(&server(), &f.id, f.t, &()).unwrap();
