@@ -4,6 +4,7 @@ import { useT } from "./i18n";
 import { accountActions } from "./state/account";
 import { useIsMobile } from "./lib/media";
 import { initDesktop } from "./platform/desktop";
+import { initUpdates } from "./platform/updater";
 import { controller } from "./state/controller";
 import { totalDmUnread } from "./state/reducer";
 import { useSession, useUi } from "./state/stores";
@@ -46,6 +47,7 @@ export function App() {
   useEffect(() => controller.init(), []);
   useEffect(() => void accountActions.load(), []);
   useEffect(() => initDesktop(), []);
+  useEffect(() => initUpdates(), []);
 
   useEffect(() => {
     document.title = `${unread > 0 ? `(${unread}) ` : ""}${showApp && serverName ? `${serverName} · ` : ""}Gwar`;

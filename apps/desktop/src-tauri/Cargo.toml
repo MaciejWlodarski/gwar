@@ -43,8 +43,13 @@ tauri-plugin-single-instance = "2"
 tauri-plugin-window-state = "2"
 tauri-plugin-notification = "2.5.1"
 tauri-plugin-dialog = "2"
+# Updates: the plain installers are served as they are, so no zip or tar.gz support for Windows and Linux.
+tauri-plugin-updater = { version = "2.14", default-features = false, features = ["rustls-tls", "system-proxy"] }
+tauri-plugin-process = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 open = "5.4.4"
 
 [dev-dependencies]
 base64 = "0.22"
+# The updater test runs the plugin in a mock app (src/updates.rs).
+tauri = { version = "2", features = ["test"] }

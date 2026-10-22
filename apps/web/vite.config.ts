@@ -12,9 +12,12 @@ const version = (JSON.parse(readFileSync(new URL("./package.json", import.meta.u
 // The screen-capture check page (docs/screen-share.md, PR 1) is bundled only when asked for.
 const captureCheck = process.env.GWAR_CAPTURE_CHECK === "1";
 
-const commit = process.env.GITHUB_SHA ?? (() => {
-  try { return execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(); } catch { return ""; }
-})();
+const git = (...args: string[]) => {
+  try { return execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { return null; }
+};
+const commit = process.env.GITHUB_SHA ?? git("rev-parse", "HEAD") ?? "";
+// The short commit shown with the version (ui/Version.tsx), "-dirty" when tracked files differ from it.
+const revision = commit ? `${commit.slice(0, 7)}${git("status", "--porcelain", "--untracked-files=no") ? "-dirty" : ""}` : "unknown";
 
 // The dev server proxies the WebSocket so `pnpm dev` works against a local
 // `gwar-server` without CORS or mixed-content issues.
@@ -52,7 +55,7 @@ export default defineConfig(({ command, mode }) => ({
   // licenses.md: the bundled packages' licenses, served with the app and shipped in the desktop bundle.
   // watch.html: the TeamSpeak guests' watch page (docs/screen-share.md, PR 6), its own small entry.
   build: { target: "es2022", sourcemap: true, license: { fileName: "licenses.md" }, rolldownOptions: { input: { main: "index.html", watch: "watch.html" } } },
-  define: { __APP_VERSION__: JSON.stringify(version), __APP_COMMIT__: JSON.stringify(commit), __CAPTURE_CHECK__: JSON.stringify(captureCheck) },
+  define: { __APP_VERSION__: JSON.stringify(version), __APP_COMMIT__: JSON.stringify(commit), __APP_REVISION__: JSON.stringify(revision), __CAPTURE_CHECK__: JSON.stringify(captureCheck) },
   // The browser e2e fixtures are imported at run time: scanning them up front
   // keeps Vite from reloading the pages when it finds their dependencies.
   optimizeDeps: { entries: ["index.html", "watch.html", "e2e/*.html", "e2e/*-fixture.{ts,tsx}"] },
