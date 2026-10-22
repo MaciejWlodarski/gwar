@@ -16,6 +16,7 @@ mod links;
 mod messages;
 mod mls;
 pub use mls::TreeRefusal;
+mod egress;
 mod moderation;
 mod overrides;
 mod owner;
@@ -58,7 +59,7 @@ use self::bridge::{BridgeMsg, BridgeNote, RemoteClient};
 use crate::{
     media::{
         AudioOrigin, Member, Routing, SharedRouting,
-        screen::{ScreenCmd, ScreenSignal},
+        screen::{ScreenCmd, ScreenShared, ScreenSignal},
         webrtc::MediaCmd,
     },
     store::{ADMIN_GROUP, ChannelRow, MEMBER_GROUP, Store},
@@ -142,6 +143,8 @@ pub enum CoreMsg {
     Screen(ScreenSignal),
     /// A TeamSpeak guest's watch connection (`/ws/watch`).
     Guest(GuestMsg),
+    /// A minute's read of the host's transmitted bytes (`None` where unavailable).
+    Egress(Option<egress::Reading>),
     Info(oneshot::Sender<ServerInfo>),
     /// A TeamSpeak import for the running server (`gwar-server import-teamspeak` over the control socket).
     #[cfg(feature = "teamspeak")]
@@ -326,6 +329,8 @@ pub struct CoreConfig {
     /// What a TeamSpeak watch link is before its token (`…/watch#`), when the server has a
     /// public URL (docs/screen-share.md, "The link and its token").
     pub watch_base: Option<String>,
+    /// Shared with the screen SFU: its budget and its egress.
+    pub screen: Arc<ScreenShared>,
 }
 
 struct Session {
@@ -452,6 +457,11 @@ pub struct Core {
     guests: BTreeMap<SessionId, screen::Guest>,
     /// SHA-256 of each working watch link's token, to its share.
     watch_links: HashMap<[u8; 32], String>,
+    screen_shared: Arc<ScreenShared>,
+    /// Screen-sharing limits (server settings).
+    screen_limits: gwar_proto::ScreenLimits,
+    /// This month's outbound transfer.
+    egress: egress::Egress,
 }
 
 /// Messages with ids at or above this value are delivered live and not stored.
@@ -546,6 +556,15 @@ pub fn spawn(
             let _ = tx.send(CoreMsg::Tick).await;
         }
     });
+    let ticker = tx.downgrade();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(egress::EGRESS_EVERY);
+        loop {
+            every.tick().await;
+            let Some(tx) = ticker.upgrade() else { break };
+            let _ = tx.send(CoreMsg::Egress(egress::read())).await;
+        }
+    });
     tokio::spawn(async move {
         loop {
             let expiry = core
@@ -629,6 +648,12 @@ impl Core {
         };
         let groups = store.groups()?.into_iter().map(|g| (g.id, g)).collect();
         let mls_commit_clock = store.meta("mls_commit_clock")?.map(|s| s.parse()).transpose()?.unwrap_or(0);
+        let screen_limits = egress::load_limits(&store)?;
+        config
+            .screen
+            .budget_bps
+            .store(screen_limits.budget_mbps as u64 * 1_000_000, std::sync::atomic::Ordering::Relaxed);
+        let egress = egress::Egress::load(&store)?;
         let owner = owner::load(&store, &config.server_key)?;
         let mut core = Self {
             store,
@@ -686,6 +711,9 @@ impl Core {
             watch_base: config.watch_base,
             guests: BTreeMap::new(),
             watch_links: HashMap::new(),
+            screen_shared: config.screen,
+            screen_limits,
+            egress,
         };
         core.refresh_all_private();
         core.mls_reconcile()?;
@@ -736,6 +764,18 @@ impl Core {
                 self.screen_watching(session, run, connected)
             }
             CoreMsg::Guest(msg) => self.guest_msg(msg),
+            CoreMsg::Screen(ScreenSignal::Paused { session, run, share, reason }) => {
+                self.screen_paused(session, run, &share, Some(reason))
+            }
+            CoreMsg::Screen(ScreenSignal::Resumed { session, run, share }) => {
+                self.screen_paused(session, run, &share, None)
+            }
+            CoreMsg::Egress(reading) => {
+                let shared = egress::screen_bytes(&self.screen_shared);
+                if let Err(e) = self.egress_tick(reading, shared, now_ms()) {
+                    warn!("egress counter: {e:#}");
+                }
+            }
             CoreMsg::Voice { session, connected, binding, failed } => {
                 if self
                     .sessions
@@ -1832,6 +1872,7 @@ impl Core {
             Request::InviteDelete { code } => self.invite_delete(session, &code),
             Request::ChatHistory { channel, before, limit } => self.chat_history(session, channel, before, limit),
             Request::ServerUpdate(update) => return self.server_update(session, id, update),
+            Request::ServerEgress {} => self.server_egress(session),
             Request::TokenCreate { group } => self.token_create(session, group),
             Request::TokenRedeem { token } => self.token_redeem(session, &token),
             Request::VoiceOffer(offer) => return self.voice_offer(session, id, offer),
@@ -2912,6 +2953,7 @@ pub(crate) mod expiry_tests {
                 server_signer: Arc::new(crate::server_key::generate()),
                 teamspeak,
                 watch_base: None,
+                screen: ScreenShared::new(0),
             },
             Arc::new(ArcSwap::from_pointee(Routing::default())),
             media,
@@ -3373,6 +3415,7 @@ pub(crate) mod expiry_tests {
                 server_signer: Arc::new(crate::server_key::generate()),
                 teamspeak: false,
                 watch_base: None,
+                screen: ScreenShared::new(0),
             },
             routing.clone(),
             media,

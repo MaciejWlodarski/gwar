@@ -654,6 +654,9 @@ impl Core {
             if u.password.as_ref().is_some_and(|p| p.len() > 128) {
                 return Err(err(ErrorCode::BadRequest, "password too long"));
             }
+            if let Some(limits) = &u.screen {
+                super::egress::check_limits(limits)?;
+            }
             Ok(name)
         })();
         let name = match checked {
@@ -677,6 +680,9 @@ impl Core {
             if let Some(max) = u.max_clients {
                 core.store.set_meta("max_clients", &max.to_string()).map_err(storage_error)?;
                 core.info.max_clients = max;
+            }
+            if let Some(limits) = u.screen {
+                core.set_screen_limits(limits).map_err(storage_error)?;
             }
             if let Some(access) = u.file_access {
                 let value = match access {

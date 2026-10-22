@@ -169,7 +169,7 @@ pub fn format_list(rows: &[MemberRow], groups: &[Group], now: i64) -> String {
 }
 
 /// `YYYY-MM-DD` of a Unix time in milliseconds (UTC).
-fn civil_date(ms: i64) -> String {
+pub(crate) fn civil_date(ms: i64) -> String {
     // Days since 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's algorithm).
     let z = ms.div_euclid(DAY_MS) + 719_468;
     let era = z.div_euclid(146_097);

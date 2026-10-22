@@ -130,6 +130,8 @@ pub struct Running {
     pub media_bind: SocketAddr,
     pub core: CoreHandle,
     pub plane: media::MediaPlane,
+    /// The screen SFU's commands (tests inspect it).
+    pub screen: mpsc::Sender<media::screen::ScreenCmd>,
     /// TeamSpeak voice address, when enabled.
     pub teamspeak: Option<SocketAddr>,
     /// Whether the TeamSpeak bridge is up and in sync (false until then).
@@ -285,6 +287,8 @@ pub async fn start(config: Config) -> Result<Running> {
     let routing = Arc::new(ArcSwap::from_pointee(media::Routing::default()));
     let (media_tx, media_rx) = mpsc::channel(256);
     let (screen_tx, screen_rx) = mpsc::channel(256);
+    // The core sets the budget from the stored limits as it starts.
+    let screen_shared = media::screen::ScreenShared::new(0);
     let core = core::spawn(
         store,
         CoreConfig {
@@ -302,10 +306,11 @@ pub async fn start(config: Config) -> Result<Running> {
             server_key: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(server_key.verifying_key().as_bytes()),
             teamspeak: config.teamspeak.is_some() || link_printer,
             watch_base: watch_base(config.public_url.as_deref(), config.web_root.is_some()),
+            screen: screen_shared.clone(),
         },
         routing.clone(),
         media_tx.clone(),
-        screen_tx,
+        screen_tx.clone(),
     )?;
 
     let udp = Arc::new(UdpSocket::bind(config.media_bind).await.context("bind media UDP socket")?);
@@ -325,7 +330,7 @@ pub async fn start(config: Config) -> Result<Running> {
     let (dispatch, dispatch_rx) = media::screen::dispatch();
     let mut tasks = vec![
         tokio::spawn(media::screen::run(
-            media::screen::ScreenConfig { socket: udp.clone(), advertise },
+            media::screen::ScreenConfig { socket: udp.clone(), advertise, shared: screen_shared },
             core.clone(),
             dispatch_rx,
             screen_rx,
@@ -449,6 +454,7 @@ pub async fn start(config: Config) -> Result<Running> {
         media_bind: media_addr,
         core,
         plane,
+        screen: screen_tx,
         teamspeak,
         teamspeak_ready,
         admin_token,

@@ -10,7 +10,13 @@
 //! share an [`ScreenOrigin`] and every slot a [`WatchGrant`] and ends them synchronously when
 //! access ends, so a packet already on its way is fenced before the command that releases the
 //! slot arrives.
+//!
+//! Each viewer's egress is planned as a whole ([`egress`]): originals wait in a Gwar-owned
+//! priority queue with 400 ms deadlines, repairs and probes pass a cap at the socket, and slots
+//! that do not fit the viewer's estimate are paused. The task also measures what it sends
+//! against the server-wide budget.
 
+mod egress;
 mod ingress;
 mod segment;
 
@@ -27,11 +33,12 @@ use std::{
 
 use arc_swap::ArcSwap;
 use gwar_proto::{
-    ChannelId, SCREEN_SLOTS, ScreenStopReason, SessionId,
+    ChannelId, SCREEN_SLOTS, ScreenPauseReason, ScreenStopReason, SessionId,
     rtp::{SLOT_GENERATION_ID, SlotGeneration, slot_generation_extension},
 };
 use str0m::{
     Candidate, Event as RtcEvent, IceConnectionState, Input, Output, Rtc,
+    bwe::{Bitrate, BweKind},
     change::SdpOffer,
     format::Codec,
     media::{Direction, KeyframeRequestKind, MediaKind, Mid, Pt},
@@ -39,8 +46,10 @@ use str0m::{
     rtp::{ExtensionValues, RtpWrite, Ssrc},
 };
 use tokio::{net::UdpSocket, sync::mpsc, sync::oneshot, time::sleep_until};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
+use egress::{Change, Egress, Queued, ShareMeter, ShareRate};
+pub use egress::{EgressCounters, INITIAL_ESTIMATE};
 use ingress::{Bucket, Ingress, Verdict};
 pub use ingress::{IngressCounters, VideoCodec, describe};
 use segment::Segment;
@@ -70,6 +79,14 @@ const TRANSPORT_PACKET_BURST: f64 = 750.0;
 const TRANSPORT_BYTE_HEADROOM: f64 = 1.5;
 /// Addresses one transport may hold; a further one replaces its oldest.
 const ADDRESSES_PER_TRANSPORT: usize = 4;
+/// Allocation (pauses, resumes, probing targets) and the budget check run this often.
+const ALLOCATION_TICK: Duration = Duration::from_millis(100);
+/// Measured egress over the server-wide budget this many seconds in a row pauses watches.
+const OVER_BUDGET_SECONDS: u32 = 5;
+/// Watches paused for the budget may resume once egress stayed under this share of it …
+const UNDER_BUDGET: f64 = 0.9;
+/// … this long.
+const UNDER_BUDGET_FOR: Duration = Duration::from_secs(10);
 
 /// A share's immutable source authority, captured when the share is admitted and re-checked
 /// on every forwarded packet, like [`super::AudioOrigin`].
@@ -80,22 +97,21 @@ pub struct ScreenOrigin {
     pub channel: ChannelId,
     pub encrypted: bool,
     pub private: bool,
-    /// The bitrate cap its ingress byte bucket follows.
+    /// The bitrate cap its ingress byte bucket follows, and what each of its slots reserves.
     pub cap_bps: u64,
     alive: AtomicBool,
 }
 
 impl ScreenOrigin {
-    pub fn new(session: SessionId, share: String, channel: ChannelId, encrypted: bool, private: bool) -> Arc<Self> {
-        Arc::new(Self {
-            session,
-            share,
-            channel,
-            encrypted,
-            private,
-            cap_bps: SHARE_CAP_BPS,
-            alive: AtomicBool::new(true),
-        })
+    pub fn new(
+        session: SessionId,
+        share: String,
+        channel: ChannelId,
+        encrypted: bool,
+        private: bool,
+        cap_bps: u64,
+    ) -> Arc<Self> {
+        Arc::new(Self { session, share, channel, encrypted, private, cap_bps, alive: AtomicBool::new(true) })
     }
     pub fn alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
@@ -106,8 +122,22 @@ impl ScreenOrigin {
     }
 }
 
-/// Bitrate cap per share (docs/screen-share.md, "Limits").
-pub const SHARE_CAP_BPS: u64 = 8_000_000;
+/// What the core and the screen task share: the budget the task measures its egress against,
+/// and that egress, for the month's breakdown.
+#[derive(Debug, Default)]
+pub struct ScreenShared {
+    /// Server-wide screen budget, bits per second.
+    pub budget_bps: AtomicU64,
+    /// Bytes sent to members' and to guests' transports.
+    pub member_bytes: AtomicU64,
+    pub guest_bytes: AtomicU64,
+}
+
+impl ScreenShared {
+    pub fn new(budget_bps: u64) -> Arc<Self> {
+        Arc::new(Self { budget_bps: AtomicU64::new(budget_bps), ..Self::default() })
+    }
+}
 
 /// Slots of a TeamSpeak guest's watch transport: it watches the one share its link opens.
 pub const GUEST_SLOTS: usize = 1;
@@ -208,8 +238,27 @@ pub enum PublishSignal {
 /// What the screen task tells the core, delivered in the order it happened.
 #[derive(Debug)]
 pub enum ScreenSignal {
-    Publish { share: String, signal: PublishSignal },
-    Watch { session: SessionId, run: u64, connected: bool },
+    Publish {
+        share: String,
+        signal: PublishSignal,
+    },
+    Watch {
+        session: SessionId,
+        run: u64,
+        connected: bool,
+    },
+    /// A viewer's slot of `share` stopped carrying it for now, or carries it again.
+    Paused {
+        session: SessionId,
+        run: u64,
+        share: String,
+        reason: ScreenPauseReason,
+    },
+    Resumed {
+        session: SessionId,
+        run: u64,
+        share: String,
+    },
 }
 
 /// Cancellation for screen transports, watch links and TeamSpeak memberships. Ending is
@@ -277,8 +326,14 @@ pub enum ScreenCmd {
         run: u64,
         slot: u32,
     },
-    /// The share on the viewer's stage; it gets first claim on bandwidth once allocation exists.
+    /// The share on the viewer's stage: it gets first claim on the viewer's bandwidth.
     Focus {
+        session: SessionId,
+        share: String,
+    },
+    /// The viewer watches a share it already watches again: a paused slot tries once more,
+    /// from the share's next keyframe (within the viewer's keyframe budget).
+    Retry {
         session: SessionId,
         share: String,
     },
@@ -303,6 +358,18 @@ pub struct ScreenSnapshot {
     pub shares: HashMap<String, (IngressCounters, u64)>,
     /// Per (viewer, slot): the share and how many packets were written to it.
     pub slots: HashMap<(SessionId, u32), (Option<String>, u64)>,
+    /// Per viewer: its estimate and egress, and why each slot is paused.
+    pub viewers: HashMap<SessionId, ViewerSnapshot>,
+    /// Measured egress over the server-wide budget, seconds in a row.
+    pub over_budget: u32,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct ViewerSnapshot {
+    pub estimate: u64,
+    pub desired: Option<u64>,
+    pub egress: EgressCounters,
+    pub paused: Vec<Option<ScreenPauseReason>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -360,6 +427,8 @@ struct Publisher {
     codecs: HashMap<Pt, VideoCodec>,
     meter: Meter,
     ingress: Ingress,
+    /// What passed ingress: the share's average and keyframe sizes, for its viewers' allocation.
+    rate: ShareMeter,
     /// Why it is ending, once it is.
     ended: Option<ScreenStopReason>,
     connected: bool,
@@ -374,10 +443,28 @@ struct Slot {
     segment: Segment,
     generation: u16,
     pts: HashMap<VideoCodec, Pt>,
-    /// The stream was set up (unpaced, RTX cache) since it was created or wiped.
+    /// The stream was set up (unpaced, RTX cache); its main SSRC, which the egress cap tells
+    /// originals by.
     configured: bool,
+    ssrc: Option<u32>,
     asked: Option<Instant>,
     written: u64,
+}
+
+impl Slot {
+    fn new(mid: Mid, pts: HashMap<VideoCodec, Pt>) -> Self {
+        Self {
+            mid,
+            grant: None,
+            segment: Segment::new(),
+            generation: 0,
+            pts,
+            configured: false,
+            ssrc: None,
+            asked: None,
+            written: 0,
+        }
+    }
 }
 
 struct Watcher {
@@ -391,10 +478,14 @@ struct Watcher {
     slots: Vec<Slot>,
     /// How many slots the offer has.
     size: usize,
-    /// Assignments that arrived before the slot's m-line was seen.
-    pending: Vec<(u32, Arc<WatchGrant>)>,
+    /// Assignments that arrived before the slot's m-line was seen, with their watch order.
+    pending: Vec<(u32, Arc<WatchGrant>, u64)>,
     connected: bool,
     focus: Option<String>,
+    /// The viewer's queues, release bucket, socket cap and allocation, slot by slot.
+    egress: Egress,
+    /// The probing target last given to str0m's BWE.
+    desired: Option<u64>,
     deadline: Instant,
 }
 
@@ -412,6 +503,32 @@ struct Forward {
 pub struct ScreenConfig {
     pub socket: Arc<UdpSocket>,
     pub advertise: SocketAddr,
+    pub shared: Arc<ScreenShared>,
+}
+
+/// The task's own egress, second by second, against the server-wide budget.
+struct Measured {
+    started: Instant,
+    bytes: u64,
+    /// Seconds in a row over budget.
+    over: u32,
+    /// Since when it stayed under `UNDER_BUDGET` of it.
+    under_since: Option<Instant>,
+}
+
+impl Measured {
+    fn new(now: Instant) -> Self {
+        Self { started: now, bytes: 0, over: 0, under_since: Some(now) }
+    }
+}
+
+/// Sends a datagram from the screen task, counting it.
+fn transmit(socket: &UdpSocket, measured: &mut Measured, shared: &ScreenShared, contents: &[u8], to: SocketAddr) {
+    // Under socket pressure a datagram drops, like voice's; video recovers by NACK or keyframe.
+    if socket.try_send_to(contents, to).is_ok() {
+        measured.bytes += contents.len() as u64;
+        shared.member_bytes.fetch_add(contents.len() as u64, Ordering::Relaxed);
+    }
 }
 
 struct Sfu {
@@ -429,6 +546,11 @@ struct Sfu {
     publishers: HashMap<String, Publisher>,
     watchers: HashMap<SessionId, Watcher>,
     next_id: u64,
+    shared: Arc<ScreenShared>,
+    measured: Measured,
+    /// Watch order across all viewers: the newest watch is paused first for the budget.
+    watches: u64,
+    next_allocation: Instant,
 }
 
 pub async fn run(
@@ -439,6 +561,7 @@ pub async fn run(
 ) {
     let DispatchRx { addrs, mut rx, dropped } = dispatch;
     info!("screen SFU running");
+    let now = Instant::now();
     let mut sfu = Sfu {
         socket: config.socket,
         advertise: config.advertise,
@@ -450,6 +573,10 @@ pub async fn run(
         publishers: HashMap::new(),
         watchers: HashMap::new(),
         next_id: 1,
+        shared: config.shared,
+        measured: Measured::new(now),
+        watches: 0,
+        next_allocation: now,
     };
     // While signals wait, one reservation stands in the core's queue, in line with every other
     // sender: a busy core cannot keep passing over them.
@@ -503,8 +630,11 @@ impl Sfu {
         }
         for w in self.watchers.values() {
             at = at.min(w.deadline);
+            if let Some(wake) = w.egress.wake() {
+                at = at.min(wake);
+            }
         }
-        at
+        at.min(self.next_allocation)
     }
 
     fn id(&mut self) -> u64 {
@@ -544,7 +674,9 @@ impl Sfu {
                 let id = self.id();
                 match watcher(id, session, run, lease, slots, &sdp, self.advertise, now) {
                     Ok((mut watcher, answer)) => {
-                        if self.drive_watcher(&mut watcher, &mut Vec::new()) {
+                        let (socket, measured, shared) = (&self.socket, &mut self.measured, &self.shared);
+                        let mut send = |c: &[u8], to| transmit(socket, measured, shared, c, to);
+                        if drive(&mut watcher, now, &mut Vec::new(), &mut send) {
                             self.signal(ScreenSignal::Watch { session, run, connected: true });
                         }
                         self.watchers.insert(session, watcher);
@@ -558,26 +690,41 @@ impl Sfu {
             ScreenCmd::EndWatch { session } => self.end_watch(session),
             ScreenCmd::Assign { session, run, slot, grant } => {
                 let Some(w) = self.watchers.get_mut(&session).filter(|w| w.run == run) else { return };
-                w.pending.retain(|(s, _)| *s != slot);
+                w.pending.retain(|(s, _, _)| *s != slot);
+                self.watches += 1;
                 match w.slots.get_mut(slot as usize) {
                     Some(_) => {
-                        assign(w, slot as usize, grant);
+                        assign(w, slot as usize, grant, self.watches);
                         self.ask_keyframe(session, slot as usize, now);
                     }
-                    None => w.pending.push((slot, grant)),
+                    None => w.pending.push((slot, grant, self.watches)),
                 }
             }
             ScreenCmd::Release { session, run, slot } => {
                 let Some(w) = self.watchers.get_mut(&session).filter(|w| w.run == run) else { return };
-                w.pending.retain(|(s, _)| *s != slot);
-                if let Some(s) = w.slots.get_mut(slot as usize) {
-                    release(&mut w.rtc, s);
+                w.pending.retain(|(s, _, _)| *s != slot);
+                if (slot as usize) < w.slots.len() {
+                    empty(w, slot as usize);
                 }
                 self.flush_watcher(session);
             }
             ScreenCmd::Focus { session, share } => {
                 if let Some(w) = self.watchers.get_mut(&session) {
+                    let lane = w.slots.iter().position(|s| s.grant.as_ref().is_some_and(|g| g.share == share));
+                    w.egress.focus(lane);
                     w.focus = Some(share);
+                }
+            }
+            ScreenCmd::Retry { session, share } => {
+                let Some(w) = self.watchers.get_mut(&session) else { return };
+                let Some(slot) =
+                    w.slots.iter().position(|s| s.grant.as_ref().is_some_and(|g| g.share == share && g.alive()))
+                else {
+                    return;
+                };
+                if w.egress.paused(slot).is_some() {
+                    apply(w, slot, Change::Resume);
+                    self.tell(session, slot, Change::Resume, now);
                 }
             }
             ScreenCmd::Keyframe { session, share } => {
@@ -615,12 +762,29 @@ impl Sfu {
                         .map(|(i, s)| ((w.session, i as u32), (s.grant.as_ref().map(|g| g.share.clone()), s.written)))
                 })
                 .collect(),
+            viewers: self
+                .watchers
+                .values()
+                .map(|w| {
+                    let snapshot = ViewerSnapshot {
+                        estimate: w.egress.estimate(),
+                        desired: w.desired,
+                        egress: w.egress.counters,
+                        paused: (0..w.slots.len()).map(|i| w.egress.paused(i)).collect(),
+                    };
+                    (w.session, snapshot)
+                })
+                .collect(),
+            over_budget: self.measured.over,
         }
     }
 
     /// Asks the share in `session`'s slot for a keyframe, within the viewer's budget.
     fn ask_keyframe(&mut self, session: SessionId, slot: usize, now: Instant) {
         let Some(w) = self.watchers.get_mut(&session) else { return };
+        if w.egress.paused(slot).is_some() {
+            return;
+        }
         let Some(s) = w.slots.get_mut(slot) else { return };
         let Some(grant) = s.grant.as_ref().filter(|g| g.alive()) else { return };
         s.asked = Some(now);
@@ -724,6 +888,14 @@ impl Sfu {
                 !matches!(queued, ScreenSignal::Publish { share: s, signal: PublishSignal::Connected } if s == share)
             }),
             ScreenSignal::Publish { .. } => {}
+            // Only a viewer's latest pause or resume of a share matters.
+            ScreenSignal::Paused { session, share, .. } | ScreenSignal::Resumed { session, share, .. } => {
+                self.outbox.retain(|queued| match queued {
+                    ScreenSignal::Paused { session: s, share: h, .. }
+                    | ScreenSignal::Resumed { session: s, share: h, .. } => !(s == session && h == share),
+                    _ => true,
+                })
+            }
         }
         self.outbox.push_back(signal);
         self.deliver();
@@ -773,6 +945,11 @@ impl Sfu {
             }
             self.flush_publisher(&share);
         }
+        if now >= self.next_allocation {
+            self.next_allocation = now + ALLOCATION_TICK;
+            self.measure(now);
+            self.allocate(now);
+        }
         let sessions: Vec<SessionId> = self.watchers.keys().copied().collect();
         for session in sessions {
             let Some(w) = self.watchers.get_mut(&session) else { continue };
@@ -781,6 +958,80 @@ impl Sfu {
                 w.rtc.disconnect();
             }
             self.flush_watcher(session);
+        }
+    }
+
+    /// Compares the last second's egress with the server-wide budget. Over it for
+    /// `OVER_BUDGET_SECONDS`, the newest watch is paused, one a second while it stays over.
+    /// (Guests, which PR 6 brings, will go first.)
+    fn measure(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.measured.started);
+        if elapsed < Duration::from_secs(1) {
+            return;
+        }
+        let rate = self.measured.bytes as f64 * 8.0 / elapsed.as_secs_f64();
+        self.measured.started = now;
+        self.measured.bytes = 0;
+        let budget = self.shared.budget_bps.load(Ordering::Relaxed) as f64;
+        if rate > budget {
+            self.measured.over += 1;
+            self.measured.under_since = None;
+        } else {
+            self.measured.over = 0;
+            if rate <= UNDER_BUDGET * budget {
+                self.measured.under_since.get_or_insert(now);
+            } else {
+                self.measured.under_since = None;
+            }
+        }
+        if self.measured.over < OVER_BUDGET_SECONDS {
+            return;
+        }
+        let newest = self
+            .watchers
+            .values()
+            .flat_map(|w| w.egress.orders().map(move |(slot, order)| (order, w.session, slot)))
+            .max();
+        if let Some((_, session, slot)) = newest {
+            warn!(rate, budget, "screen egress over budget: pausing the newest watch");
+            if let Some(w) = self.watchers.get_mut(&session) {
+                apply(w, slot, Change::Pause(ScreenPauseReason::Budget));
+            }
+            self.tell(session, slot, Change::Pause(ScreenPauseReason::Budget), now);
+        }
+    }
+
+    /// Runs every viewer's allocation: at most one pause or resume per viewer and tick, and
+    /// the probing target for its BWE.
+    fn allocate(&mut self, now: Instant) {
+        let rates: HashMap<String, ShareRate> =
+            self.publishers.iter_mut().map(|(share, p)| (share.clone(), p.rate.rate(now))).collect();
+        let budget = self.measured.under_since.is_some_and(|at| now.saturating_duration_since(at) >= UNDER_BUDGET_FOR);
+        let sessions: Vec<SessionId> = self.watchers.keys().copied().collect();
+        for session in sessions {
+            let Some(w) = self.watchers.get_mut(&session) else { continue };
+            if let Some((slot, change)) = allocate(w, now, &rates, budget) {
+                self.tell(session, slot, change, now);
+            }
+        }
+    }
+
+    /// A slot was paused or resumed (`apply`): the core tells the viewer, and a resumed slot
+    /// asks for its keyframe.
+    fn tell(&mut self, session: SessionId, slot: usize, change: Change, now: Instant) {
+        let Some(w) = self.watchers.get(&session) else { return };
+        let Some(share) = w.slots.get(slot).and_then(|s| s.grant.as_ref()).map(|g| g.share.clone()) else { return };
+        let run = w.run;
+        match change {
+            Change::Pause(reason) => {
+                debug!(session, share, ?reason, "screen slot paused");
+                self.signal(ScreenSignal::Paused { session, run, share, reason });
+            }
+            Change::Resume => {
+                debug!(session, share, "screen slot resumed");
+                self.ask_keyframe(session, slot, now);
+                self.signal(ScreenSignal::Resumed { session, run, share });
+            }
         }
     }
 
@@ -817,7 +1068,7 @@ impl Sfu {
                     break;
                 }
                 Output::Transmit(t) => {
-                    let _ = self.socket.try_send_to(&t.contents, t.destination);
+                    transmit(&self.socket, &mut self.measured, &self.shared, &t.contents, t.destination);
                 }
                 Output::Event(event) => match event {
                     RtcEvent::Connected => {
@@ -836,14 +1087,17 @@ impl Sfu {
                         let Some(describe) = describe(codec, &packet.payload) else { continue };
                         let source = *packet.seq_no;
                         match p.ingress.admit(source, packet.header.timestamp, packet.payload.len(), describe, now) {
-                            Verdict::Forward { keyframe } => forwards.push(Forward {
-                                source,
-                                timestamp: packet.header.timestamp,
-                                marker: packet.header.marker,
-                                keyframe,
-                                codec,
-                                arrival: packet.timestamp,
-                                payload: packet.payload.clone(),
+                            Verdict::Forward { keyframe } => forwards.push({
+                                p.rate.record(source, packet.header.timestamp, packet.payload.len(), keyframe, now);
+                                Forward {
+                                    source,
+                                    timestamp: packet.header.timestamp,
+                                    marker: packet.header.marker,
+                                    keyframe,
+                                    codec,
+                                    arrival: packet.timestamp,
+                                    payload: packet.payload.clone(),
+                                }
                             }),
                             Verdict::Drop => {
                                 if p.ingress.waiting() {
@@ -871,10 +1125,11 @@ impl Sfu {
             return;
         }
         let mut touched = Vec::new();
+        let slots = self.slots_of(share);
         for forward in &forwards {
-            for (session, index) in self.slots_of(share) {
+            for &(session, index) in &slots {
                 let Some(w) = self.watchers.get_mut(&session) else { continue };
-                if write(w, index, &origin, forward, now) {
+                if enqueue(w, index, &origin, forward, now) {
                     if !touched.contains(&session) {
                         touched.push(session);
                     }
@@ -927,10 +1182,16 @@ impl Sfu {
             .collect()
     }
 
+    /// Releases what the viewer's egress allows, drives the transport until it sleeps and
+    /// sends the viewer's keyframe requests on.
     fn flush_watcher(&mut self, session: SessionId) {
         let Some(mut w) = self.watchers.remove(&session) else { return };
+        let now = Instant::now();
         let mut requests = Vec::new();
-        if self.drive_watcher(&mut w, &mut requests) {
+        release(&mut w, now);
+        let (socket, measured, shared) = (&self.socket, &mut self.measured, &self.shared);
+        let mut send = |c: &[u8], to| transmit(socket, measured, shared, c, to);
+        if drive(&mut w, now, &mut requests, &mut send) {
             self.signal(ScreenSignal::Watch { session: w.session, run: w.run, connected: true });
         }
         if !w.rtc.is_alive() {
@@ -939,78 +1200,8 @@ impl Sfu {
             return;
         }
         self.watchers.insert(session, w);
-        let now = Instant::now();
         for slot in requests {
             self.ask_keyframe(session, slot, now);
-        }
-    }
-
-    /// Polls a watch transport until it sleeps; keyframe requests from the viewer are
-    /// collected by slot. True if it connected just now.
-    fn drive_watcher(&self, w: &mut Watcher, requests: &mut Vec<usize>) -> bool {
-        let mut connected = false;
-        loop {
-            // Membership can end independently while this transport's output is draining.
-            sweep(w);
-            if !w.rtc.is_alive() {
-                return connected;
-            }
-            let output = match w.rtc.poll_output() {
-                Ok(output) => output,
-                Err(e) => {
-                    debug!(session = w.session, "screen watch poll: {e}");
-                    w.rtc.disconnect();
-                    return connected;
-                }
-            };
-            match output {
-                Output::Timeout(at) => {
-                    w.deadline = at;
-                    return connected;
-                }
-                Output::Transmit(t) => {
-                    // Discard an RTP output if authority ended while poll_output ran;
-                    // sweeping also clears the remaining queue and RTX cache.
-                    if is_rtp(&t.contents) && sweep(w) {
-                        continue;
-                    }
-                    let _ = self.socket.try_send_to(&t.contents, t.destination);
-                }
-                Output::Event(event) => match event {
-                    RtcEvent::Connected => {
-                        w.connected = true;
-                        connected = true;
-                    }
-                    RtcEvent::IceConnectionStateChange(IceConnectionState::Disconnected) => w.rtc.disconnect(),
-                    RtcEvent::MediaAdded(added) if added.kind == MediaKind::Video => {
-                        if added.direction.is_sending() && w.slots.len() < w.size {
-                            let pts = video_pts(&w.rtc, added.mid);
-                            w.slots.push(Slot {
-                                mid: added.mid,
-                                grant: None,
-                                segment: Segment::new(),
-                                generation: 0,
-                                pts,
-                                configured: false,
-                                asked: None,
-                                written: 0,
-                            });
-                            let index = w.slots.len() - 1;
-                            if let Some(at) = w.pending.iter().position(|(slot, _)| *slot as usize == index) {
-                                let (_, grant) = w.pending.remove(at);
-                                assign(w, index, grant);
-                                requests.push(index);
-                            }
-                        }
-                    }
-                    RtcEvent::KeyframeRequest(request) => {
-                        if let Some(index) = w.slots.iter().position(|s| s.mid == request.mid) {
-                            requests.push(index);
-                        }
-                    }
-                    _ => {}
-                },
-            }
         }
     }
 
@@ -1105,72 +1296,255 @@ fn video_pts(rtc: &Rtc, mid: Mid) -> HashMap<VideoCodec, Pt> {
     pts
 }
 
-/// Points a slot at a new share: a new segment from its next keyframe, a fresh RTX cache.
-fn assign(w: &mut Watcher, index: usize, grant: Arc<WatchGrant>) {
+/// Polls a watch transport until it sleeps. Every datagram it sends passes the viewer's egress
+/// cap on its way to `send`; keyframe requests from the viewer are collected by slot. True if it
+/// connected just now.
+fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dyn FnMut(&[u8], SocketAddr)) -> bool {
+    let mut connected = false;
+    // With the bandwidth estimator on, str0m's pacer hands out one packet per timeout, so a
+    // timeout already due is handled at once (bounded, should it keep returning `now`).
+    let mut due = 0;
+    loop {
+        // Membership can end independently while this transport's output is draining.
+        sweep(w);
+        if !w.rtc.is_alive() {
+            return connected;
+        }
+        let output = match w.rtc.poll_output() {
+            Ok(output) => output,
+            Err(e) => {
+                debug!(session = w.session, "screen watch poll: {e}");
+                w.rtc.disconnect();
+                return connected;
+            }
+        };
+        match output {
+            Output::Timeout(at) if at <= now && due < DUE_TIMEOUTS => {
+                due += 1;
+                if let Err(e) = w.rtc.handle_input(Input::Timeout(now)) {
+                    debug!(session = w.session, "screen watch timeout: {e}");
+                    w.rtc.disconnect();
+                }
+            }
+            Output::Timeout(at) => {
+                w.deadline = at;
+                return connected;
+            }
+            Output::Transmit(t) => {
+                // Revocation also fences an output produced during poll_output.
+                if is_rtp(&t.contents) && sweep(w) {
+                    continue;
+                }
+                let slots = &w.slots;
+                let class = egress::classify(&t.contents, |ssrc| slots.iter().any(|s| s.ssrc == Some(ssrc)));
+                if w.egress.charge(class, t.contents.len(), now) {
+                    send(&t.contents, t.destination);
+                }
+            }
+            Output::Event(event) => match event {
+                RtcEvent::Connected => {
+                    w.connected = true;
+                    connected = true;
+                }
+                RtcEvent::IceConnectionStateChange(IceConnectionState::Disconnected) => w.rtc.disconnect(),
+                RtcEvent::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => {
+                    w.egress.set_estimate(estimate.as_u64(), now);
+                }
+                RtcEvent::MediaAdded(added) if added.kind == MediaKind::Video => {
+                    if added.direction.is_sending() && w.slots.len() < w.size {
+                        let index = add_slot(w, added.mid);
+                        if let Some(at) = w.pending.iter().position(|(slot, _, _)| *slot as usize == index) {
+                            let (_, grant, order) = w.pending.remove(at);
+                            assign(w, index, grant, order);
+                            requests.push(index);
+                        }
+                    }
+                }
+                RtcEvent::KeyframeRequest(request) => {
+                    if let Some(index) = w.slots.iter().position(|s| s.mid == request.mid) {
+                        requests.push(index);
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+}
+
+/// One viewer's allocation tick: the probing target for its BWE, then at most one pause or
+/// resume, already applied. `rates`: by share. `budget`: slots paused for the server's budget may
+/// resume.
+fn allocate(
+    w: &mut Watcher,
+    now: Instant,
+    rates: &HashMap<String, ShareRate>,
+    budget: bool,
+) -> Option<(usize, Change)> {
+    let lanes: Vec<ShareRate> = w
+        .slots
+        .iter()
+        .map(|s| s.grant.as_ref().and_then(|g| rates.get(&g.share)).copied().unwrap_or_default())
+        .collect();
+    let caps: Vec<u64> = w.slots.iter().map(|s| s.grant.as_ref().map_or(0, |g| g.origin.cap_bps)).collect();
+    let desired = w.egress.desired(&caps, &lanes);
+    if desired != w.desired {
+        if let Some(desired) = desired {
+            w.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired));
+        }
+        w.desired = desired;
+    }
+    let (slot, change) = w.egress.allocate(now, &lanes, budget)?;
+    apply(w, slot, change);
+    Some((slot, change))
+}
+
+/// Carries a pause or resume out on the transport. A pause stops everything of the slot's
+/// media at once, repairs and probes included (its queue went with the egress's own record); a
+/// resume opens a new segment at the share's next keyframe.
+fn apply(w: &mut Watcher, slot: usize, change: Change) {
+    match change {
+        Change::Pause(reason) => {
+            if w.egress.paused(slot).is_none() {
+                w.egress.pause(slot, reason);
+            }
+            let s = &mut w.slots[slot];
+            s.segment.wait();
+            s.asked = None;
+            wipe(&mut w.rtc, s.mid);
+        }
+        Change::Resume => {
+            w.egress.resume(slot);
+            w.slots[slot].segment.wait();
+        }
+    }
+}
+
+/// How many already-due timeouts one `drive` handles before it yields to the task loop.
+const DUE_TIMEOUTS: usize = 256;
+
+/// A slot's m-line appeared; returns its index.
+fn add_slot(w: &mut Watcher, mid: Mid) -> usize {
+    let pts = video_pts(&w.rtc, mid);
+    w.slots.push(Slot::new(mid, pts));
+    w.egress.add_lane();
+    w.slots.len() - 1
+}
+
+/// Points a slot at a new share, `order`-th watched: a new segment from its next keyframe, a
+/// fresh RTX cache and queue.
+fn assign(w: &mut Watcher, index: usize, grant: Arc<WatchGrant>, order: u64) {
+    empty(w, index);
+    let focused = w.focus.as_deref() == Some(grant.share.as_str());
     let slot = &mut w.slots[index];
-    release(&mut w.rtc, slot);
     slot.grant = Some(grant);
     slot.generation = slot.generation.wrapping_add(1);
+    w.egress.assign(index, order);
+    if focused {
+        w.egress.focus(Some(index));
+    }
 }
 
 /// Empties a slot: nothing of its old media is sent after this, repairs and probes included.
-fn release(rtc: &mut Rtc, slot: &mut Slot) {
+fn empty(w: &mut Watcher, index: usize) {
+    let slot = &mut w.slots[index];
     slot.grant = None;
     slot.segment.wait();
     slot.asked = None;
-    // Leaving a sending direction drops all the slot's stream holds: packets written but not
-    // sent yet, the RTX cache and queued repairs. The change is local and never negotiated.
-    if let Some(direction) = rtc.media(slot.mid).map(|m| m.direction()).filter(|d| d.is_sending()) {
+    w.egress.unassign(index);
+    wipe(&mut w.rtc, slot.mid);
+}
+
+/// Drops all of a slot's stream holds: packets written but not sent yet, the RTX cache and
+/// queued repairs. Leaving a sending direction does that; the change is local and never
+/// negotiated.
+fn wipe(rtc: &mut Rtc, mid: Mid) {
+    if let Some(direction) = rtc.media(mid).map(|m| m.direction()).filter(|d| d.is_sending()) {
         let mut sdp = rtc.sdp_api();
-        sdp.set_direction(slot.mid, Direction::Inactive);
-        sdp.set_direction(slot.mid, direction);
+        sdp.set_direction(mid, Direction::Inactive);
+        sdp.set_direction(mid, direction);
     }
 }
 
 /// Releases every slot whose grant ended, ahead of the core's `Release`: once access ends,
 /// nothing of the share leaves this transport, cached repairs included.
 fn sweep(w: &mut Watcher) -> bool {
-    w.pending.retain(|(_, grant)| grant.alive());
+    w.pending.retain(|(_, grant, _)| grant.alive());
     let mut revoked = false;
-    for slot in &mut w.slots {
-        if slot.grant.as_ref().is_some_and(|g| !g.alive()) {
-            release(&mut w.rtc, slot);
+    for index in 0..w.slots.len() {
+        if w.slots[index].grant.as_ref().is_some_and(|g| !g.alive()) {
+            empty(w, index);
             revoked = true;
         }
     }
     revoked
 }
 
-/// Writes one forwarded packet into a viewer's slot. False if the slot dropped it.
-fn write(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forward, now: Instant) -> bool {
+/// Maps one forwarded packet onto a viewer's slot and queues it for the release bucket. False
+/// if the slot does not take it (not its share, paused, waiting for a keyframe, or dropped).
+/// A drop of any slot makes it wait for a keyframe.
+fn enqueue(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forward, now: Instant) -> bool {
     let slot = &mut w.slots[index];
-    if !w.connected || !origin.alive() || !slot.grant.as_ref().is_some_and(|g| g.alive() && g.share == origin.share) {
+    if !w.connected
+        || !origin.alive()
+        || w.egress.paused(index).is_some()
+        || !slot.grant.as_ref().is_some_and(|g| g.alive() && g.share == origin.share)
+    {
         return false;
     }
     let Some(pt) = slot.pts.get(&forward.codec).copied() else { return false };
     let Some((out, timestamp)) = slot.segment.map(forward.source, forward.timestamp, forward.keyframe, now) else {
         return false;
     };
-    let mut direct = w.rtc.direct_api();
-    let Some(stream) = direct.stream_tx_by_mid(slot.mid, None) else { return false };
-    if !slot.configured {
-        stream.set_rtx_cache(RTX_PACKETS, RTX_AGE, Some(RTX_RATIO));
-        stream.set_unpaced(true);
-        slot.configured = true;
-    }
-    let mut extensions = ExtensionValues::default();
-    extensions.user_values.set(SlotGeneration(slot.generation));
-    stream.write_rtp(
-        RtpWrite::new(pt, out.into(), timestamp, forward.arrival, forward.payload.clone())
-            .marker(forward.marker)
-            .nackable(true)
-            .ext_vals(extensions),
+    let packet = Queued::new(
+        out,
+        timestamp,
+        forward.marker,
+        pt,
+        forward.arrival,
+        forward.payload.clone(),
+        forward.timestamp,
+        forward.keyframe,
     );
-    slot.written += 1;
-    true
+    let dropped = w.egress.admit(index, packet, now);
+    for &lane in &dropped {
+        w.slots[lane].segment.wait();
+    }
+    !dropped.contains(&index)
 }
 
-fn rtc(advertise: SocketAddr, now: Instant) -> Result<Rtc, &'static str> {
+/// Writes what the viewer's release bucket allows into str0m, whose unpaced streams send it on
+/// the next poll. Slots whose head reached its deadline were cleared and wait for a keyframe.
+fn release(w: &mut Watcher, now: Instant) {
+    let (released, dropped) = w.egress.due(now);
+    for lane in dropped {
+        w.slots[lane].segment.wait();
+    }
+    for (lane, packet) in released {
+        let slot = &mut w.slots[lane];
+        let mut direct = w.rtc.direct_api();
+        let Some(stream) = direct.stream_tx_by_mid(slot.mid, None) else { continue };
+        if !slot.configured {
+            stream.set_rtx_cache(RTX_PACKETS, RTX_AGE, Some(RTX_RATIO));
+            stream.set_unpaced(true);
+            slot.configured = true;
+            slot.ssrc = Some(*stream.ssrc());
+        }
+        let mut extensions = ExtensionValues::default();
+        extensions.user_values.set(SlotGeneration(slot.generation));
+        // The wallclock is the packet's arrival, not its release: sender reports describe the
+        // sharer's timeline.
+        stream.write_rtp(
+            RtpWrite::new(packet.pt, packet.out.into(), packet.timestamp, packet.arrival, packet.payload)
+                .marker(packet.marker)
+                .nackable(true)
+                .ext_vals(extensions),
+        );
+        slot.written += 1;
+    }
+}
+
+/// A screen transport; a watch transport (`bwe`) estimates its viewer's downlink.
+fn rtc(advertise: SocketAddr, now: Instant, bwe: bool) -> Result<Rtc, &'static str> {
     let mut rtc = Rtc::builder()
         .set_extension(SLOT_GENERATION_ID, slot_generation_extension())
         .set_ice_lite(true)
@@ -1178,6 +1552,7 @@ fn rtc(advertise: SocketAddr, now: Instant) -> Result<Rtc, &'static str> {
         .clear_codecs()
         .enable_vp9(true)
         .enable_vp8(true)
+        .enable_bwe(bwe.then(|| Bitrate::bps(INITIAL_ESTIMATE)))
         .build(now);
     rtc.add_local_candidate(Candidate::host(advertise, "udp").map_err(|_| "bad media address")?);
     Ok(rtc)
@@ -1192,7 +1567,7 @@ fn publisher(
     now: Instant,
 ) -> Result<(Publisher, String), &'static str> {
     let offer = SdpOffer::from_sdp_string(sdp).map_err(|_| "invalid SDP offer")?;
-    let mut rtc = rtc(advertise, now)?;
+    let mut rtc = rtc(advertise, now, false)?;
     let answer = rtc.sdp_api().accept_offer(offer).map_err(|_| "offer not acceptable")?;
     let ssrc = Ssrc::from(ssrc);
     let mid = rtc.direct_api().stream_rx(&ssrc).map(|s| s.mid()).ok_or("video SSRC was not negotiated")?;
@@ -1226,6 +1601,7 @@ fn publisher(
         codecs,
         meter: Meter::new(cap, now),
         ingress: Ingress::new(cap, now),
+        rate: ShareMeter::default(),
         ended: None,
         connected: false,
         created: now,
@@ -1251,7 +1627,7 @@ fn watcher(
         return Err(REFUSED);
     }
     let offer = SdpOffer::from_sdp_string(sdp).map_err(|_| "invalid SDP offer")?;
-    let mut rtc = rtc(advertise, now)?;
+    let mut rtc = rtc(advertise, now, true)?;
     let answer = rtc.sdp_api().accept_offer(offer).map_err(|_| "offer not acceptable")?;
     let ssrcs = sections(sdp)
         .into_iter()
@@ -1274,6 +1650,8 @@ fn watcher(
         pending: Vec::new(),
         connected: false,
         focus: None,
+        egress: Egress::new(now),
+        desired: None,
         deadline: now,
     };
     Ok((watcher, answer.to_sdp_string()))
@@ -1372,6 +1750,8 @@ pub(crate) mod tests {
         held: Vec<Vec<u8>>,
         /// The viewer's STUN checks, as sent.
         checks: Vec<Vec<u8>>,
+        /// Slot 0's retransmissions so far (not counting blank padding).
+        repairs: usize,
     }
 
     impl Pair {
@@ -1392,7 +1772,7 @@ pub(crate) mod tests {
             let (w, answer) =
                 watcher(1, 7, 1, Lease::new(), SCREEN_SLOTS, &offer.to_sdp_string(), addr(6000), now).unwrap();
             client.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
-            let mut pair = Self { w, client, now, hold: false, held: Vec::new(), checks: Vec::new() };
+            let mut pair = Self { w, client, now, hold: false, held: Vec::new(), checks: Vec::new(), repairs: 0 };
             for _ in 0..200 {
                 if pair.w.connected && pair.w.slots.len() == SCREEN_SLOTS {
                     break;
@@ -1415,16 +1795,38 @@ pub(crate) mod tests {
 
         /// 5 ms of both sides. RTP from the SFU that `lose` picks (by sequence number) is lost;
         /// returns how many RTP datagrams the SFU sent.
+        /// Slot 0's main and RTX SSRCs, once its stream exists.
+        fn ssrcs(&mut self) -> Option<(u32, Option<u32>)> {
+            let mid = self.w.slots.first()?.mid;
+            let mut api = self.w.rtc.direct_api();
+            let stream = api.stream_tx_by_mid(mid, None)?;
+            Some((*stream.ssrc(), stream.rtx().map(|r| *r)))
+        }
+
+        /// Runs both ends for 5 ms; returns how many of slot 0's original packets the SFU sent
+        /// (`lose` may drop each by sequence number). Its retransmissions go to `repairs`; the
+        /// bandwidth estimator's blank padding counts as neither.
         fn step(&mut self, lose: &mut dyn FnMut(u16) -> bool) -> usize {
             let mut sent = 0;
+            let mut due = 0;
             loop {
+                let ssrcs = self.ssrcs();
                 match self.w.rtc.poll_output().unwrap() {
+                    Output::Timeout(at) if at <= self.now && due < DUE_TIMEOUTS => {
+                        due += 1;
+                        self.w.rtc.handle_input(Input::Timeout(self.now)).unwrap();
+                    }
                     Output::Timeout(_) => break,
                     Output::Transmit(t) => {
-                        if is_rtp(&t.contents) {
-                            sent += 1;
-                            if lose(u16::from_be_bytes([t.contents[2], t.contents[3]])) {
-                                continue;
+                        if is_rtp(&t.contents) && t.contents[0] & 0x20 == 0 {
+                            let ssrc = u32::from_be_bytes(t.contents[8..12].try_into().unwrap());
+                            if ssrcs.is_some_and(|(main, _)| main == ssrc) {
+                                sent += 1;
+                                if lose(u16::from_be_bytes([t.contents[2], t.contents[3]])) {
+                                    continue;
+                                }
+                            } else if ssrcs.is_some_and(|(_, rtx)| rtx == Some(ssrc)) {
+                                self.repairs += 1;
                             }
                         }
                         let receive = Receive {
@@ -1437,17 +1839,7 @@ pub(crate) mod tests {
                     }
                     Output::Event(RtcEvent::Connected) => self.w.connected = true,
                     Output::Event(RtcEvent::MediaAdded(added)) if added.direction.is_sending() => {
-                        let pts = video_pts(&self.w.rtc, added.mid);
-                        self.w.slots.push(Slot {
-                            mid: added.mid,
-                            grant: None,
-                            segment: Segment::new(),
-                            generation: 0,
-                            pts,
-                            configured: false,
-                            asked: None,
-                            written: 0,
-                        });
+                        add_slot(&mut self.w, added.mid);
                     }
                     Output::Event(_) => {}
                 }
@@ -1524,9 +1916,9 @@ pub(crate) mod tests {
     /// datagrams the SFU sent after the grant ended.
     fn after_revocation(swept: bool) -> usize {
         let mut pair = Pair::new();
-        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false);
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
         let grant = WatchGrant::new(origin.clone());
-        assign(&mut pair.w, 0, grant.clone());
+        assign(&mut pair.w, 0, grant.clone(), 1);
         let now = pair.now;
         for n in 0..10u64 {
             let forward = Forward {
@@ -1538,8 +1930,9 @@ pub(crate) mod tests {
                 arrival: now,
                 payload: Arc::from([if n == 0 { 0x10 } else { 0x00 }, 0x00, n as u8, 0xaa].as_slice()),
             };
-            assert!(write(&mut pair.w, 0, &origin, &forward, now));
+            assert!(enqueue(&mut pair.w, 0, &origin, &forward, now));
         }
+        release(&mut pair.w, now);
         // The viewer loses the third packet; its NACK is held back.
         pair.hold = true;
         let mut seen = 0;
@@ -1558,16 +1951,18 @@ pub(crate) mod tests {
         for datagram in std::mem::take(&mut pair.held) {
             pair.send_to_sfu(&datagram);
         }
-        (0..20).map(|_| pair.step(&mut |_| false)).sum()
+        let repairs = pair.repairs;
+        let sent: usize = (0..20).map(|_| pair.step(&mut |_| false)).sum();
+        sent + pair.repairs - repairs
     }
 
     /// Writes ten packets into a slot and ends its grant before the transport sends them.
-    /// Returns how many RTP datagrams still left (after a sweep when `swept`).
+    /// Returns how many of them still left (after a sweep when `swept`).
     fn queued_at_revocation(swept: bool) -> usize {
         let mut pair = Pair::new();
-        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false);
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
         let grant = WatchGrant::new(origin.clone());
-        assign(&mut pair.w, 0, grant.clone());
+        assign(&mut pair.w, 0, grant.clone(), 1);
         let now = pair.now;
         for n in 0..10u64 {
             let forward = Forward {
@@ -1579,8 +1974,9 @@ pub(crate) mod tests {
                 arrival: now,
                 payload: Arc::from([if n == 0 { 0x10 } else { 0x00 }, 0x00, n as u8, 0xaa].as_slice()),
             };
-            assert!(write(&mut pair.w, 0, &origin, &forward, now));
+            assert!(enqueue(&mut pair.w, 0, &origin, &forward, now));
         }
+        release(&mut pair.w, now);
         grant.end();
         if swept {
             sweep(&mut pair.w);
@@ -1627,7 +2023,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_grant_ends_with_its_share() {
-        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false);
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
         let grant = WatchGrant::new(origin.clone());
         assert!(grant.alive());
         origin.end();

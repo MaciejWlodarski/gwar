@@ -1091,7 +1091,8 @@ fn translate(request: &Request, own: u16, view: &View) -> Result<Vec<(Part, OutC
         | Request::TeamspeakClaimable {}
         | Request::InviteCreate(_)
         | Request::InviteList {}
-        | Request::InviteDelete { .. } => return Err(refused("manage this server in the TeamSpeak client")),
+        | Request::InviteDelete { .. }
+        | Request::ServerEgress {} => return Err(refused("manage this server in the TeamSpeak client")),
         Request::VoiceOffer(_) | Request::VoiceState {} | Request::VoiceEpochAck(_) | Request::VoiceEpochRepeat(_) => {
             return Err(refused("voice on TeamSpeak servers is native"));
         }

@@ -103,6 +103,72 @@ wire! {
     }
 }
 
+wire! {
+    /// Why a viewer's slot stopped carrying its share for now (`screen.paused`). `bandwidth`:
+    /// the viewer's link does not fit it; `budget`: the server's screen egress is over budget.
+    #[derive(Copy, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ScreenPauseReason { Bandwidth, Budget }
+
+    /// Screen-sharing limits (docs/screen-share.md, "Limits"): server settings, replaced as a
+    /// whole by `server.update`.
+    #[derive(Copy, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct ScreenLimits {
+        pub shares_per_channel: u32,
+        pub shares_per_server: u32,
+        pub viewers_per_share: u32,
+        /// Bitrate cap of each new share, kbps.
+        pub share_cap_kbps: u32,
+        /// What all slot reservations and publish caps together may reach, Mbps.
+        pub budget_mbps: u32,
+        /// Admins are warned when the month's outbound transfer reaches 80 % and 100 % of it, TB.
+        pub monthly_egress_tb: u32,
+        /// Past 100 % of `monthly_egress_tb`, new watches are refused.
+        pub monthly_egress_stop: bool,
+    }
+
+    /// What the month's outbound transfer counts: the host's default-route interface, a
+    /// container's own interface, or nothing (not Linux).
+    #[derive(Copy, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum EgressScope { Host, Container, Unavailable }
+
+    /// `server.egress`: this calendar month's outbound transfer (UTC), for the server settings.
+    #[derive(Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct ServerEgress {
+        /// `YYYY-MM`, UTC.
+        pub month: String,
+        pub scope: EgressScope,
+        /// Bytes the interface sent this month, every service on it included; `null` where
+        /// unavailable.
+        #[cfg_attr(feature = "ts", ts(type = "number | null"))]
+        pub total: Option<u64>,
+        /// Of those, the screen SFU's to members and to guests.
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub screen_members: u64,
+        #[cfg_attr(feature = "ts", ts(type = "number"))]
+        pub screen_guests: u64,
+        pub limits: ScreenLimits,
+    }
+}
+
+impl Default for ScreenLimits {
+    /// The owner's defaults of 2026-10-21 (docs/screen-share.md, "Limits").
+    fn default() -> Self {
+        Self {
+            shares_per_channel: 4,
+            shares_per_server: 32,
+            viewers_per_share: 25,
+            share_cap_kbps: 8_000,
+            budget_mbps: 300,
+            monthly_egress_tb: 10,
+            monthly_egress_stop: false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,6 +210,9 @@ mod tests {
             Event::ScreenLink { share: "s".into(), active: false },
             Event::ScreenSlot { run: 1, slot: 3, share: Some("s".into()) },
             Event::ScreenSlot { run: 2, slot: 0, share: None },
+            Event::ScreenPaused { share: "s".into(), reason: ScreenPauseReason::Bandwidth },
+            Event::ScreenResumed { share: "s".into() },
+            Event::ServerEgressWarning { month: "2026-10".into(), percent: 80, total: 8_000_000_000_000, limit: 10 },
         ] {
             let frame = ServerFrame::Event(event);
             let text = serde_json::to_string(&frame).unwrap();
@@ -190,6 +259,29 @@ mod tests {
         }
         // The wire form is the token itself.
         assert_eq!(serde_json::to_value(&frame).unwrap(), raw);
+    }
+
+    #[test]
+    fn egress_reports_and_limits_round_trip() {
+        let egress = ServerEgress {
+            month: "2026-10".into(),
+            scope: EgressScope::Container,
+            total: None,
+            screen_members: 5,
+            screen_guests: 0,
+            limits: ScreenLimits::default(),
+        };
+        let reply = ServerFrame::Ok { re: 3, ok: Response::ServerEgress(egress.clone()) };
+        let text = serde_json::to_string(&reply).unwrap();
+        assert_eq!(serde_json::from_str::<ServerFrame>(&text).unwrap(), reply, "{text}");
+        assert_eq!(serde_json::to_value(&egress).unwrap()["total"], json!(null));
+        let update = json!({"id": 1, "op": "server.update", "d": {"screen": ScreenLimits::default()}});
+        let frame: ClientFrame = serde_json::from_value(update).unwrap();
+        assert!(matches!(frame.request, Request::ServerUpdate(ServerUpdate { screen: Some(_), .. })));
+        let mut partial = serde_json::to_value(ScreenLimits::default()).unwrap();
+        partial.as_object_mut().unwrap().remove("budget_mbps");
+        let update = json!({"id": 1, "op": "server.update", "d": {"screen": partial}});
+        assert!(serde_json::from_value::<ClientFrame>(update).is_err(), "limits are replaced as a whole");
     }
 
     #[test]

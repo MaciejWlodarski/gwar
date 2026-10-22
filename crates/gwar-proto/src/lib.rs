@@ -182,6 +182,9 @@ wire! {
         },
         #[serde(rename = "server.update")]
         ServerUpdate(ServerUpdate),
+        /// This month's outbound transfer (needs `manage_server`).
+        #[serde(rename = "server.egress")]
+        ServerEgress {},
         #[serde(rename = "token.create")]
         TokenCreate { group: GroupId },
         /// Reserves an upload; the reply says where to `PUT` the bytes. A `sealed`
@@ -466,6 +469,8 @@ wire! {
         /// TeamSpeak watch links for shares in bridged channels (docs/screen-share.md).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub screen_guest_links: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub screen: Option<ScreenLimits>,
     }
 
     #[derive(Default)]
@@ -606,6 +611,7 @@ wire! {
         ScreenAnswer { sdp: String },
         /// `screen.watch`: the watch transport's slot the share arrives in.
         ScreenSlot { slot: u32 },
+        ServerEgress(ServerEgress),
         Mls(MlsResponse),
         Empty {},
     }
@@ -750,6 +756,23 @@ wire! {
             slot: u32,
             #[serde(deserialize_with = "voice::required_option")]
             share: Option<String>,
+        },
+        /// To a viewer: its slot of `share` carries nothing for now. It resumes with
+        /// `screen.resumed`, or when the viewer watches the share again (Retry).
+        #[serde(rename = "screen.paused")]
+        ScreenPaused { share: String, reason: ScreenPauseReason },
+        #[serde(rename = "screen.resumed")]
+        ScreenResumed { share: String },
+        /// To admins (`manage_server`): the month's outbound transfer reached `percent` (80 or
+        /// 100) of `limit` bytes.
+        #[serde(rename = "server.egress_warning")]
+        ServerEgressWarning {
+            month: String,
+            percent: u32,
+            #[cfg_attr(feature = "ts", ts(type = "number"))]
+            total: u64,
+            #[cfg_attr(feature = "ts", ts(type = "number"))]
+            limit: u64,
         },
         /// This user read a channel or conversation up to `message` on another device.
         #[serde(rename = "chat.read")]
