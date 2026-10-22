@@ -413,8 +413,9 @@ credential, the OpenMLS provider and Gwar's own per-group records.
   - no entry at that epoch yet (the log's head is still that epoch): nothing
     won, so send the same bytes again. Only when the server answers
     `expired` (the commit's time is more than five minutes behind its commit
-    clock, which never goes back, so no earlier copy can be accepted any
-    more) is the pending commit discarded and a new one built (fresh time,
+    clock, or below the time of the group's previous commit; the clock never
+    goes back, so no earlier copy can be accepted any more) is the pending
+    commit discarded and a new one built (fresh time,
     current rules). On any other error (`early`, `bad_request`, …) it is
     kept and sent again with backoff: some checks depend on time (key
     package lifetimes against the server's system clock), and a commit
