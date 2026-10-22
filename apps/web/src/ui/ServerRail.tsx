@@ -8,7 +8,7 @@ import { useBookmarks, useSettings, type Bookmark } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { TeamSpeakBadge } from "./badges";
 import { Avatar, IconButton, Tooltip, menuContent, menuItem, menuItemDanger } from "./kit";
-import { AlphaReport } from "./BugReport";
+import { AlphaBadge, BugReportButton } from "./BugReport";
 import { UpdateButton, VersionLabel } from "./Version";
 
 export function ServerRail() {
@@ -94,11 +94,12 @@ export function ServerRail() {
         </Tooltip>
       </div>
       <UpdateButton />
-      <AlphaReport />
+      <BugReportButton />
       <IconButton label={t("settings.title")} side="right" onClick={() => openDialog({ kind: "settings", tab: "audio" })}>
         <Settings className="size-5" />
       </IconButton>
       <VersionLabel />
+      <AlphaBadge />
     </nav>
   );
 }

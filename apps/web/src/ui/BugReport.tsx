@@ -15,20 +15,24 @@ const MAX_SHOTS = 5;
 interface Shot { id: number; blob: Blob; url: string }
 
 /** "Alpha" and the way to report a bug, at the bottom of the server rail. */
-export function AlphaReport() {
+export function AlphaBadge() {
+  const t = useT();
+  return (
+    <Tooltip label={t("alpha.hint")} side="right">
+      <span tabIndex={0} className="rounded bg-warn/15 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-warn uppercase">
+        {t("alpha.badge")}
+      </span>
+    </Tooltip>
+  );
+}
+
+export function BugReportButton() {
   const t = useT();
   const openDialog = useUi((s) => s.openDialog);
   return (
-    <div className="flex flex-col items-center gap-1">
-      <Tooltip label={t("alpha.hint")} side="right">
-        <span tabIndex={0} className="rounded bg-warn/15 px-1.5 py-0.5 text-[10px] font-semibold tracking-wide text-warn uppercase">
-          {t("alpha.badge")}
-        </span>
-      </Tooltip>
-      <IconButton label={t("report.open")} side="right" onClick={() => openDialog({ kind: "bugReport" })}>
-        <Bug className="size-5" />
-      </IconButton>
-    </div>
+    <IconButton label={t("report.open")} side="right" onClick={() => openDialog({ kind: "bugReport" })}>
+      <Bug className="size-5" />
+    </IconButton>
   );
 }
 
