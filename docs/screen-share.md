@@ -2,7 +2,9 @@
 
 Status: **design, with the owner's decisions of 2026-10-21 folded in**
 ([Owner decisions](#owner-decisions)). Built so far: the share state and its
-protocol (PR 2), without media. Phase 1
+protocol (PR 2), the SFU's transports and forwarding (PR 3a), and sharing and
+watching from the browser in plaintext channels (PR 4,
+[as built](#web-client-as-built-pr-4)). Phase 1
 goes through the server's SFU. Peer-to-peer sharing comes later and is only
 sketched at the end. The spike code was thrown away; only its results are
 kept here ([Spikes](#spikes)).
@@ -1686,6 +1688,55 @@ from native capture is PR 10.
   tooltip says that watching needs the browser for now.
 
 Polish and English strings are added together, as for every UI change.
+
+### Web client as built (PR 4)
+
+Code: `apps/web/src/voice/screen.ts` (capture, presets, publish and watch
+transports), `state/screen.ts` (the state machine), `state/screen-controller.ts`
+(the protocol) and `ui/Screen.tsx` (button, preset menu, sharing bar, LIVE
+badge, stage). Decisions taken while building it, where this design left room:
+
+- **Desktop waits for PR 5.** The desktop build hides the Share button and does
+  not watch: its LIVE badge says that watching needs the browser for now, the
+  wording planned for Linux. PR 5 enables both on macOS and Windows.
+- **Encrypted channels.** The Share button stays visible but disabled, labelled
+  "Screen sharing in encrypted channels is coming soon". The client also checks
+  before `screen.start` and before watching, so nothing is captured, sent or
+  watched there even if the server's refusal were missing.
+- **Auto preset without a surface.** Browsers that do not report
+  `displaySurface` (and canvas tracks) get Smooth, as screens do.
+- **Uplink headroom floor.** The `0.7 × availableOutgoingBitrate` rule never
+  lowers the cap below 250 kbps: an estimate that low recovers by probing, and a
+  cap under it would starve the probe. It is re-read every 2 s and applied when
+  it moves by more than 10 %.
+- **Changing the preset while sharing** changes the track constraints and the
+  sender parameters only. The server keeps announcing the preset the share
+  started with: there is no request to change it, and its per-share limit is
+  the server's cap, not the preset's.
+- **"Switch source"** is Chromium's own button, enabled by
+  `surfaceSwitching: "include"`; Gwar adds none.
+- **`screen.stopped {reason: "access"}`** ends only my watch. The share stays
+  listed while its sharer's `Client.sharing` is on, because the same reason
+  also ends a share whose sharer lost `share_screen`, and only the sharer's
+  `sharing` going off tells the two apart.
+- **Watch transport.** One per session, negotiated on the first watch.
+  `screen.watch` is asked again for up to 5 s while the server answers
+  `unavailable`, because the browser can see the transport connect before the
+  screen task reports it. A transport that fails ends every watch, as the
+  server does; the user opens the shares again, and the next watch negotiates
+  a new run.
+- **`screen.paused` / `screen.resumed`** arrive with PR 3b; the stage does not
+  show "Your connection is too slow" yet.
+- **The stage** shows the share in focus, then every other watched share and
+  every unwatched share of the same channel as cards. Moderators get "Stop
+  screen share" on the stage and in the channel tree's menu. On narrow screens
+  the stage replaces the chat, with no chat beside it.
+- **`guest_link`** is always false until PR 6 adds the TeamSpeak checkbox.
+- **The e2e's WebKit sharer** gets its canvas track from an init script that
+  stands in for `getDisplayMedia`; the app's own capture path runs unchanged
+  around it. The Chromium sharer captures a real tab (S4's flag). The tab that
+  calls `getDisplayMedia` must be in front: from a background tab Chromium
+  answers `InvalidStateError`, which the app reports as a capture failure.
 
 ## 7. Phases and pull requests
 
