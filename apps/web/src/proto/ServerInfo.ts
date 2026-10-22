@@ -11,7 +11,12 @@ upload_limit: number, file_access: FileAccess,
 /**
  * TeamSpeak compatibility is on (new channels default to plaintext).
  */
-teamspeak: boolean, server_chat: ServerChat, 
+teamspeak: boolean, 
+/**
+ * A share in a bridged channel may post a TeamSpeak watch link (the server setting; links
+ * also need `file_access: link` and a public URL).
+ */
+screen_guest_links: boolean, server_chat: ServerChat, 
 /**
  * TeamSpeak servers only: the server and channel groups shown next to their members.
  */

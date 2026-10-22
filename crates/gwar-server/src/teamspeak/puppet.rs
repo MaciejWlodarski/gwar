@@ -547,6 +547,14 @@ impl PuppetHandle {
     }
 }
 
+#[cfg(test)]
+impl PuppetHandle {
+    /// A handle whose commands land in `cmds`, with no puppet behind it.
+    pub(crate) fn for_test(cmds: mpsc::Sender<PuppetCmd>) -> Self {
+        Self { cmds, audio: RwLock::new(AudioRoute::new(1, 1, None)), task: tokio::spawn(std::future::pending()) }
+    }
+}
+
 impl Drop for PuppetHandle {
     fn drop(&mut self) {
         self.audio.read().expect("puppet route lock").invalidate();

@@ -3,13 +3,15 @@ import type { Ban } from "./Ban";
 import type { Channel } from "./Channel";
 import type { ChatMessage } from "./ChatMessage";
 import type { Group } from "./Group";
+import type { IceServer } from "./IceServer";
 import type { Invite } from "./Invite";
 import type { Member } from "./Member";
 import type { MlsResponse } from "./MlsResponse";
 import type { OwnerLinkStatement } from "./OwnerLinkStatement";
+import type { ScreenPreset } from "./ScreenPreset";
 import type { SealedMessage } from "./SealedMessage";
 import type { ServerProof } from "./ServerProof";
 import type { VoiceState } from "./VoiceState";
 import type { Welcome } from "./Welcome";
 
-export type Response = ServerProof | Welcome | Channel | ChatMessage | { messages: Array<ChatMessage>, } | SealedMessage | { sealed: Array<SealedMessage>, } | { token: string, } | { groups: Array<number>, } | { sdp: string, call: string, participation: string, run: number, } | { voice: VoiceState | null, } | { group: Group, } | { ban: Ban, } | { bans: Array<Ban>, } | { invite: Invite, } | { invites: Array<Invite>, } | { file: string, upload_url: string, } | { uids: Array<string>, count: number, members: Array<Member>, } | { genesis: string, links: Array<OwnerLinkStatement>, next: number | null, } | { nonce: string, } | { teamspeak: string, } | { claimable: Array<string>, } | { share: string, } | { sdp: string, } | { slot: number, } | MlsResponse | Record<symbol, never>;
+export type Response = ServerProof | Welcome | Channel | ChatMessage | { messages: Array<ChatMessage>, } | SealedMessage | { sealed: Array<SealedMessage>, } | { token: string, } | { groups: Array<number>, } | { sdp: string, call: string, participation: string, run: number, } | { voice: VoiceState | null, } | { group: Group, } | { ban: Ban, } | { bans: Array<Ban>, } | { invite: Invite, } | { invites: Array<Invite>, } | { file: string, upload_url: string, } | { uids: Array<string>, count: number, members: Array<Member>, } | { genesis: string, links: Array<OwnerLinkStatement>, next: number | null, } | { nonce: string, } | { teamspeak: string, } | { claimable: Array<string>, } | { share: string, sharer: string, preset: ScreenPreset, ice_servers: Array<IceServer>, } | { share: string, } | { sdp: string, } | { slot: number, } | MlsResponse | Record<symbol, never>;

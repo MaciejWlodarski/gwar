@@ -455,6 +455,7 @@ fn view_of(
         upload_limit: 0,
         file_access: Default::default(),
         teamspeak: true,
+        screen_guest_links: false,
         server_chat: Default::default(),
         badges: badges(state, &previous.listed, images),
         icon: images.token(ImageKey::icon(state.server.icon.0)),

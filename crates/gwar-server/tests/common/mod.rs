@@ -600,13 +600,18 @@ impl Client {
 
     /// `screen.start` from the voice channel one is in.
     pub async fn screen_start(&mut self) -> Result<Value, ErrorBody> {
+        self.screen_start_linked(false).await
+    }
+
+    /// `screen.start` from the voice channel one is in, asking for a TeamSpeak watch link or not.
+    pub async fn screen_start_linked(&mut self, guest_link: bool) -> Result<Value, ErrorBody> {
         let voice = self.ok("voice.state", json!({})).await["voice"].clone();
         let start = json!({
             "call": voice["call"].as_str().unwrap_or("AAAAAAAAAAAAAAAAAAAAAA"),
             "participation": voice["participation"].as_str().unwrap_or("AAAAAAAAAAAAAAAAAAAAAA"),
             "preset": "text",
             "surface": "window",
-            "guest_link": false,
+            "guest_link": guest_link,
         });
         self.request("screen.start", start).await
     }

@@ -463,6 +463,9 @@ wire! {
         pub max_clients: Option<u32>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub file_access: Option<FileAccess>,
+        /// TeamSpeak watch links for shares in bridged channels (docs/screen-share.md).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub screen_guest_links: Option<bool>,
     }
 
     #[derive(Default)]
@@ -594,6 +597,9 @@ wire! {
         TeamspeakClaimed { teamspeak: Uid },
         /// `teamspeak.claimable`.
         TeamspeakClaimable { claimable: Vec<Uid> },
+        /// `guest.watch`: the share a watch link opens, its sharer's display name and how to
+        /// connect. Nothing else about the server reaches a guest.
+        Watching { share: String, sharer: String, preset: ScreenPreset, ice_servers: Vec<IceServer> },
         /// `screen.start`: the new share's id.
         ScreenShare { share: String },
         /// `screen.publish.offer`, `screen.watch.offer`: the SDP answer.
@@ -877,6 +883,9 @@ wire! {
         pub file_access: FileAccess,
         /// TeamSpeak compatibility is on (new channels default to plaintext).
         pub teamspeak: bool,
+        /// A share in a bridged channel may post a TeamSpeak watch link (the server setting; links
+        /// also need `file_access: link` and a public URL).
+        pub screen_guest_links: bool,
         pub server_chat: ServerChat,
         /// TeamSpeak servers only: the server and channel groups shown next to their members.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]

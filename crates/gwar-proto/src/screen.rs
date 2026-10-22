@@ -61,6 +61,31 @@ wire! {
     #[derive(Copy, Eq)]
     #[serde(rename_all = "snake_case")]
     pub enum ScreenStopReason { Stopped, Moderator, Left, Limit, Transport, Budget, Access }
+
+    /// A TeamSpeak guest's frame on `/ws/watch` (docs/screen-share.md, "TeamSpeak watch links"):
+    /// `{"id": 1, "op": "guest.watch", "d": {...}}`. Guests speak nothing else.
+    pub struct GuestFrame {
+        pub id: u32,
+        #[serde(flatten)]
+        pub request: GuestRequest,
+    }
+
+    #[serde(tag = "op", content = "d")]
+    pub enum GuestRequest {
+        /// The first frame: the watch link's token. Answers [`Response::Watching`], or `not_found`
+        /// alike for an unknown, ended or revoked token.
+        #[serde(rename = "guest.watch")]
+        Watch { token: String },
+        /// The guest's watch transport: one `recvonly` video slot. Once per connection; a second
+        /// one closes it.
+        #[serde(rename = "guest.offer")]
+        Offer { sdp: String },
+        #[serde(rename = "screen.keyframe")]
+        Keyframe { share: String },
+        /// The heartbeat, every 20 s: WebSocket pings do not keep a connection open.
+        #[serde(rename = "ping")]
+        Ping {},
+    }
 }
 
 #[cfg(test)]
@@ -114,6 +139,29 @@ mod tests {
             serde_json::to_value(ServerFrame::Event(stopped)).unwrap(),
             json!({"ev": "screen.stopped", "d": {"share": "s", "reason": "access"}})
         );
+    }
+
+    #[test]
+    fn guests_speak_only_the_watch_ops() {
+        let frame: GuestFrame =
+            serde_json::from_value(json!({"id": 1, "op": "guest.watch", "d": {"token": "t"}})).unwrap();
+        assert_eq!(frame.request, GuestRequest::Watch { token: "t".into() });
+        let ping: GuestFrame = serde_json::from_value(json!({"id": 2, "op": "ping", "d": {}})).unwrap();
+        assert_eq!(ping.request, GuestRequest::Ping {});
+        for op in ["hello", "join", "screen.watch", "screen.watch.offer", "chat.send", "channel.join"] {
+            let frame = json!({"id": 3, "op": op, "d": {}});
+            assert!(serde_json::from_value::<GuestFrame>(frame).is_err(), "{op}");
+        }
+        let watching = Response::Watching {
+            share: "s".into(),
+            sharer: "alice".into(),
+            preset: ScreenPreset::Text,
+            ice_servers: vec![],
+        };
+        let reply = ServerFrame::Ok { re: 1, ok: watching };
+        let text = serde_json::to_string(&reply).unwrap();
+        assert_eq!(text, r#"{"re":1,"ok":{"share":"s","sharer":"alice","preset":"text","ice_servers":[]}}"#);
+        assert_eq!(serde_json::from_str::<ServerFrame>(&text).unwrap(), reply);
     }
 
     #[test]

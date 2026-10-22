@@ -224,24 +224,35 @@ impl Drop for Viewer {
 impl Viewer {
     /// Negotiates a watch transport with run `run` and waits until it is connected.
     pub async fn start(client: &mut Client, run: u64) -> Self {
+        Self::negotiate(gwar_proto::SCREEN_SLOTS, run, move |sdp| async move {
+            let answer = client.ok("screen.watch.offer", json!({"run": run, "sdp": sdp})).await;
+            answer["sdp"].as_str().unwrap().to_owned()
+        })
+        .await
+    }
+
+    /// A watch transport of `slots` receive-only video slots, negotiated by `offer` (which
+    /// answers the SDP answer); waits until it is connected.
+    pub async fn negotiate<F: std::future::Future<Output = String>>(
+        slots: usize,
+        run: u64,
+        offer: impl FnOnce(String) -> F,
+    ) -> Self {
         let (socket, local) = socket().await;
         let mut rtc = rtc(local);
         // str0m's random mids can collide within one offer: redraw.
-        let (mids, offer, pending) = loop {
+        let (mids, sdp, pending) = loop {
             let mut api = rtc.sdp_api();
-            let mids: Vec<Mid> = (0..gwar_proto::SCREEN_SLOTS)
-                .map(|_| api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None))
-                .collect();
+            let mids: Vec<Mid> =
+                (0..slots).map(|_| api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None)).collect();
             let unique: HashSet<_> = mids.iter().collect();
             if unique.len() == mids.len() {
                 let (offer, pending) = api.apply().unwrap();
                 break (mids, offer, pending);
             }
         };
-        let answer = client.ok("screen.watch.offer", json!({"run": run, "sdp": offer.to_sdp_string()})).await;
-        rtc.sdp_api()
-            .accept_answer(pending, SdpAnswer::from_sdp_string(answer["sdp"].as_str().unwrap()).unwrap())
-            .unwrap();
+        let answer = offer(sdp.to_sdp_string()).await;
+        rtc.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
         let (received, rx) = mpsc::channel(8192);
         let loss = Loss::default();
         let lose = loss.clone();

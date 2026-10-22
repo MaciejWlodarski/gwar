@@ -31,6 +31,12 @@ pub enum BridgeNote {
     /// mute): the bridge marks them a talker on TeamSpeak, where nobody else talks. Sent when it
     /// or their channel changes; the bridge applies it only while they are in that channel.
     Talker { session: SessionId, channel: ChannelId, talks: bool },
+    /// A share of our user `session` in `channel` was announced with a TeamSpeak watch link: the
+    /// bridge posts it there and keeps it, in memory only, for TeamSpeak users who come later
+    /// (docs/screen-share.md, "TeamSpeak watch links").
+    WatchLink { share: String, session: SessionId, channel: ChannelId, url: super::WatchUrl },
+    /// That link stopped working (the share ended or the link was turned off): forget it.
+    WatchLinkGone { share: String },
 }
 
 /// The server's password as TeamSpeak must have it: Gwar's protects only Gwar logins, so the
@@ -60,6 +66,8 @@ pub enum BridgeMsg {
         hash: String,
         password: String,
     },
+    /// The bridge stopped (it attaches again after a restart): its watch links stop working.
+    Detached,
 }
 
 #[derive(Debug, Clone)]

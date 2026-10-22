@@ -5,6 +5,11 @@
 //! Media runs in the screen SFU task (`media::screen`). A share is announced once its publish
 //! transport connects. Each watch holds a slot of the viewer's watch transport through a
 //! [`WatchGrant`], ended here the moment access ends, before the SFU hears of it.
+mod guests;
+
+pub use guests::{GuestMsg, WatchUrl};
+pub(super) use guests::Guest;
+
 use super::{
     voice::{bad, stale},
     *,
@@ -36,11 +41,15 @@ pub(super) struct Share {
     call: String,
     preset: ScreenPreset,
     surface: ScreenSurface,
-    /// The sharer asked for a TeamSpeak watch link; none exists before PR 6.
+    /// The sharer asked for a TeamSpeak watch link (`screen.start {guest_link}`).
     guest_link: bool,
     /// The watch link was turned off, for good.
     link_revoked: bool,
+    /// SHA-256 of the watch link's token while the link works (`guests::open_watch_link`).
+    link: Option<[u8; 32]>,
     viewers: BTreeSet<SessionId>,
+    /// TeamSpeak guests watching through the link; they count among the share's viewers.
+    guests: BTreeSet<SessionId>,
     origin: Arc<ScreenOrigin>,
     /// The publish transport connected and the share was announced.
     live: bool,
@@ -176,7 +185,9 @@ impl Core {
             surface: start.surface,
             guest_link: start.guest_link,
             link_revoked: false,
+            link: None,
             viewers: BTreeSet::new(),
+            guests: BTreeSet::new(),
             origin: ScreenOrigin::new(session, id.clone(), channel, false, private),
             live: false,
             publish: None,
@@ -326,7 +337,7 @@ impl Core {
             lease: lease.clone(),
         });
         let (reply, rx) = oneshot::channel();
-        permit.send(ScreenCmd::Watch { session, run: offer.run, lease, sdp: offer.sdp, reply });
+        permit.send(ScreenCmd::Watch { session, run: offer.run, lease, slots: SCREEN_SLOTS, sdp: offer.sdp, reply });
         let tx = self.me.upgrade()?;
         let run = offer.run;
         tokio::spawn(async move {
@@ -368,6 +379,8 @@ impl Core {
                 let audience = self.share_audience(channel);
                 self.broadcast(Event::ScreenStarted(self.share_view(id)), |s| audience.contains(&s.id));
                 self.client_updated(sharer);
+                // The link, asked for at the start, exists only from the announcement on.
+                self.open_watch_link(id);
             }
             PublishSignal::Ended(reason) => {
                 let sharer = share.sharer;
@@ -379,6 +392,10 @@ impl Core {
 
     /// The screen SFU reports on a watch transport: once it is gone its watches end.
     pub(super) fn screen_watching(&mut self, session: SessionId, run: u64, connected: bool) {
+        if self.guests.contains_key(&session) {
+            self.guest_watching(session, run, connected);
+            return;
+        }
         let Some(watch) = self.sessions.get_mut(&session).and_then(|s| s.watch.as_mut()) else { return };
         if watch.run != run {
             return;
@@ -440,22 +457,19 @@ impl Core {
         if self.visible_share(session, id)?.sharer != session {
             self.may_moderate(session, id)?;
         }
-        let share = self.shares.get_mut(id).expect("checked above");
-        // Only a link that was asked for has anyone to tell.
-        if std::mem::replace(&mut share.link_revoked, true) || !share.guest_link {
-            return Ok(Response::Empty {});
-        }
-        // PR 6: the link's token stops working here and its guests are disconnected.
+        self.turn_off_link(id);
+        Ok(Response::Empty {})
+    }
+
+    /// Who hears of a share's watch link (`screen.link`): its sharer, and once the share is
+    /// announced the channel's moderators. Before that only its sharer knows of it.
+    fn link_audience(&self, id: &str) -> Vec<SessionId> {
+        let share = &self.shares[id];
         let (sharer, channel, live) = (share.sharer, share.channel, share.live);
-        // Before the share is announced, only its sharer knows of it.
-        let moderators: Vec<_> = self
-            .share_audience(channel)
+        self.share_audience(channel)
             .into_iter()
             .filter(|&s| s == sharer || (live && self.can_in(s, channel, Permission::MuteMembers)))
-            .collect();
-        let event = Event::ScreenLink { share: id.to_owned(), active: false };
-        self.broadcast(event, |s| moderators.contains(&s.id));
-        Ok(Response::Empty {})
+            .collect()
     }
 
     pub(super) fn screen_watch(&mut self, session: SessionId, id: &str) -> Reply {
@@ -465,7 +479,8 @@ impl Core {
         }
         self.may_watch(session, share)?;
         let watching = share.viewers.contains(&session);
-        let full = share.viewers.len() >= VIEWERS_PER_SHARE;
+        // Guests count among the viewers (3b adds reclaiming their reservations for members).
+        let full = share.viewers.len() + share.guests.len() >= VIEWERS_PER_SHARE;
         let Some(watch) = self.sessions[&session].watch.as_ref().filter(|w| w.connected) else {
             return Err(err(ErrorCode::Unavailable, "connect a watch transport first"));
         };
@@ -539,9 +554,9 @@ impl Core {
 
     /// Tells the sharer how many watch their share.
     fn send_viewers(&mut self, id: &str) {
-        let share = &self.shares[id];
-        let (sharer, members) = (share.sharer, share.viewers.len() as u32);
-        self.send_event(sharer, Event::ScreenViewers { share: id.to_owned(), members, guests: 0 });
+        let Some(share) = self.shares.get(id) else { return };
+        let (sharer, members, guests) = (share.sharer, share.viewers.len() as u32, share.guests.len() as u32);
+        self.send_event(sharer, Event::ScreenViewers { share: id.to_owned(), members, guests });
     }
 
     /// Ends a share: for everyone who can see its channel once it was announced, else for its
@@ -553,6 +568,8 @@ impl Core {
         for viewer in viewers {
             self.free_slot(viewer, id, true);
         }
+        // Its guests are told and let go; the link stops working and the bridge forgets it.
+        self.close_watch_link(id, guests::LinkEnd::Ended(reason));
         let share = self.shares.remove(id).expect("found above");
         let _ = self.screen.try_send(ScreenCmd::EndPublish { share: id.to_owned() });
         if let Some(s) = self.sessions.get_mut(&share.sharer) {
@@ -585,6 +602,8 @@ impl Core {
     /// Checks again every watch of a share whose channel is `within`, and every sharer there for
     /// `share_screen` (docs/screen-share.md, "Requests": beside `enforce_connect`, same scope).
     pub(super) fn enforce_watch_where(&mut self, within: impl Fn(&Self, ChannelId) -> bool) {
+        // A channel that stopped being bridged (now private) keeps no watch link.
+        self.recheck_watch_links();
         let ids: Vec<String> =
             self.shares.iter().filter(|(_, s)| within(self, s.channel)).map(|(id, _)| id.clone()).collect();
         for id in ids {

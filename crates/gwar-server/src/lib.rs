@@ -34,6 +34,7 @@ use arc_swap::ArcSwap;
 use axum::http::{HeaderValue, Method, header};
 use axum::{
     Router,
+    response::IntoResponse,
     extract::DefaultBodyLimit,
     routing::{get, put},
 };
@@ -198,6 +199,40 @@ pub fn accepted_endpoints(config: &Config) -> Result<HashSet<String>> {
     Ok(endpoints)
 }
 
+/// What a TeamSpeak watch link is before its token (docs/screen-share.md, "The link and its
+/// token"): this server's own `/watch` page when it serves the web app, else the project's web
+/// app with `server=`, as invite links do. `None` without a public URL: no links then.
+pub fn watch_base(public_url: Option<&str>, serves_web_app: bool) -> Option<String> {
+    let public_url = public_url?;
+    if serves_web_app {
+        return Some(format!("{}/watch#", public_url.trim_end_matches('/')));
+    }
+    let endpoint = endpoint_from_public_url(public_url)?;
+    let encoded: String = endpoint
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => char::from(b).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    Some(format!("{OFFICIAL_WEB_ORIGIN}/watch?server={encoded}#"))
+}
+
+/// The test hook's stand-in bridge: it prints each watch link and attaches nothing to TeamSpeak.
+#[cfg(feature = "test-hooks")]
+async fn print_watch_links(core: CoreHandle) {
+    use crate::core::bridge::{BridgeMsg, BridgeNote};
+    let (tx, mut notes) = mpsc::unbounded_channel();
+    core.bridge(BridgeMsg::Attach(tx)).await;
+    while let Some(note) = notes.recv().await {
+        match note {
+            BridgeNote::WatchLink { share, url, .. } => println!("test hook: watch link {share} {}", url.0),
+            BridgeNote::WatchLinkGone { share } => println!("test hook: watch link gone {share}"),
+            _ => {}
+        }
+    }
+}
+
 pub async fn start(config: Config) -> Result<Running> {
     let public_endpoints = Arc::new(accepted_endpoints(&config)?);
     anyhow::ensure!(
@@ -237,6 +272,12 @@ pub async fn start(config: Config) -> Result<Running> {
         },
     };
     let password: core::ServerPassword = Arc::new(ArcSwap::from_pointee(hash.map(Arc::<str>::from)));
+    // Test hook, for the guest e2e (apps/web/e2e/watch.mjs): a stand-in for the TeamSpeak bridge
+    // that prints the watch links it is given. Never in a release build.
+    #[cfg(feature = "test-hooks")]
+    let link_printer = config.teamspeak.is_none() && std::env::var_os("GWAR_TEST_WATCH_LINKS").is_some();
+    #[cfg(not(feature = "test-hooks"))]
+    let link_printer = false;
     let files_dir = config.files_dir.clone().unwrap_or_else(|| {
         std::env::temp_dir().join(format!("gwar-files-{}-{}", std::process::id(), rand::random::<u32>()))
     });
@@ -259,7 +300,8 @@ pub async fn start(config: Config) -> Result<Running> {
             connect_url: config.connect_url.clone(),
             server_signer: server_key.clone(),
             server_key: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(server_key.verifying_key().as_bytes()),
-            teamspeak: config.teamspeak.is_some(),
+            teamspeak: config.teamspeak.is_some() || link_printer,
+            watch_base: watch_base(config.public_url.as_deref(), config.web_root.is_some()),
         },
         routing.clone(),
         media_tx.clone(),
@@ -297,6 +339,11 @@ pub async fn start(config: Config) -> Result<Running> {
             media_rx,
         )),
     ];
+
+    #[cfg(feature = "test-hooks")]
+    if link_printer {
+        tasks.push(tokio::spawn(print_watch_links(core.clone())));
+    }
 
     // Installing and starting TeamSpeak can take a while; serve our clients meanwhile.
     let (teamspeak, teamspeak_ready) = match config.teamspeak {
@@ -343,11 +390,31 @@ pub async fn start(config: Config) -> Result<Running> {
         .layer(cors);
     let mut app = Router::new()
         .route("/ws", get(gateway::upgrade))
+        .route("/ws/watch", get(gateway::watch_upgrade))
         .route("/health", get(|| async { "ok" }))
         .merge(files_routes)
         .with_state(gateway);
     if let Some(root) = config.web_root {
         let index = root.join("index.html");
+        // The guests' watch page (a second entry of the web app) never sends a Referer.
+        let watch = root.join("watch.html");
+        app = app.route(
+            "/watch",
+            get(move || async move {
+                match tokio::fs::read(&watch).await {
+                    Ok(page) => (
+                        [
+                            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+                            (header::REFERRER_POLICY, "no-referrer"),
+                            (header::CACHE_CONTROL, "no-cache"),
+                        ],
+                        page,
+                    )
+                        .into_response(),
+                    Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
+                }
+            }),
+        );
         app = app.fallback_service(ServeDir::new(root).fallback(ServeFile::new(index)));
     }
     if let Some(url) = config.connect_url {
