@@ -399,10 +399,13 @@ the next packet delivered 10 ms late was concealed
 (`overflow_recovery_keeps_the_jitter_reserve`, 20 and 120 ms refills, both
 clocks). Whole packets can leave up to one packet above the target; the drain
 takes that as quiet cuts. It is the stall-recovery trim with its fade, counted
-as a trim event; the window restarts. It supersedes a stall recovery pending
-for the same burst: trimming the kept audio again to the stall deadline took the
-reserve back out (delivery held from 5 to 6.2 s, refills 10 ms off the packet
-phase, one concealment). A burst of more than a second at once is trimmed the
+as a trim event; the window restarts. A stall recovery pending for the same
+burst keeps its deadline and its hold on the jitter estimate, for the rest of a
+burst still arriving, but its later trims keep the same reserve: trimming the
+kept audio again to `target.max(demand)` took the reserve back out (delivery
+held from 5 to 6.2 s, refills 10 ms off the packet phase, one concealment), and
+dropping the recovery instead left a burst's tail arriving 1 ms later queued
+(490 ms on a 15 ms target). A burst of more than a second at once is trimmed the
 same way, which is acceptable: that much never arrives inside a jitter target.
 In simulation
 (`a_full_queue_keeps_the_newest_audio_and_trims_to_the_target_after_a_pause`,

@@ -39,6 +39,9 @@ struct Recovery {
     /// Fixed media deadline at the end of the arrival stall. Never advance this
     /// with later pops: normal callback batching is not evidence of lateness.
     before: u64,
+    /// An overflow trim ran during this recovery: its later trims keep the jitter reserve
+    /// behind the refill too, as that trim did.
+    reserve: bool,
 }
 
 /// One refill-time depth observation, judged in hindsight. Audio is buffered from `head` (the
@@ -409,8 +412,11 @@ impl JitterBuffer {
                     Clock::Rtp => behind,
                     Clock::Sequence => behind.div_ceil(last_samples) * FRAME,
                 };
-                self.recovering =
-                    Some(Recovery { until: now + Duration::from_millis(200), before: last_ts.saturating_add(advance) });
+                self.recovering = Some(Recovery {
+                    until: now + Duration::from_millis(200),
+                    before: last_ts.saturating_add(advance),
+                    reserve: false,
+                });
             }
         }
         self.clock = clock;
@@ -777,18 +783,21 @@ impl JitterBuffer {
         // More than `MAX_QUEUED` is beyond any target, refill and speaker headroom: the output
         // stopped consuming, or a burst of more than that arrived. Holding it buys nothing. This
         // refill takes its demand, and the target stays behind it as the jitter reserve.
-        // It supersedes a pending stall recovery: what it keeps is the newest audio, and trimming
-        // that again to the stall deadline would take the reserve back out.
         if demand > 0 && std::mem::take(&mut self.overflowed) {
             let keep = self.target_samples() + demand as u64;
             fade |= self.trim(u64::MAX, keep, now);
-            self.recovering = None;
+            // A pending stall recovery keeps its deadline (and its hold on the jitter estimate)
+            // for the rest of a burst still arriving, but must not take the reserve back out.
+            if let Some(recovery) = &mut self.recovering {
+                recovery.reserve = true;
+            }
         }
-        if let Some(before) = self.recovering.as_ref().map(|recovery| recovery.before) {
+        if let Some(recovery) = &self.recovering {
             // Only discard media that starts behind the stalled timeline's deadline. A packet
             // straddling the deadline goes too: kept, it stayed as up to one packet of excess
             // delay that the fractional drain rarely removes before the next stall.
-            let keep = self.target_samples().max(demand as u64);
+            let (before, target) = (recovery.before, self.target_samples());
+            let keep = if recovery.reserve { target + demand as u64 } else { target.max(demand as u64) };
             fade |= self.trim(before, keep, now);
         }
         let Some(mut next) = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)) else {
@@ -1724,6 +1733,32 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_stall_recovery_outlives_an_overflow_trim_for_the_rest_of_the_burst() {
+        // Delivery stalls for 1.5 s; 101 packets arrive at once (an overflow) and a refill trims
+        // them; the other 49 arrive 1 ms later. The stall's deadline still applies to them, so the
+        // next refill does not leave half a second queued.
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let stride = if clock == Clock::Sequence { FRAME } else { 480 };
+            let start = Instant::now();
+            let at = |ms: u64| start + Duration::from_millis(ms);
+            let mut jb = JitterBuffer::new();
+            let mut player = Player::new(480, 240);
+            jb.push_at(0, 480, 0u64.to_le_bytes().to_vec(), at(0), clock);
+            player.refill(&mut jb, at(0), 480);
+            for k in 1..=101u64 {
+                jb.push_at(k * stride, 480, k.to_le_bytes().to_vec(), at(1_500), clock);
+            }
+            player.refill(&mut jb, at(1_500), 480);
+            for k in 102..=150u64 {
+                jb.push_at(k * stride, 480, k.to_le_bytes().to_vec(), at(1_501), clock);
+            }
+            player.refill(&mut jb, at(1_510), 480);
+            let queued = jb.depth().1 + player.staged as u64;
+            assert!(queued <= jb.target_samples() + 480, "{clock:?}: {queued} queued, target {}", jb.target_samples());
         }
     }
 
