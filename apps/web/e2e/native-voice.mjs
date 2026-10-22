@@ -6,12 +6,16 @@
  * engine in `native_bridge` (the desktop shell's command contract, virtual
  * 10 ms devices) instead of Tauri. One browser device uses WebRTC + SFrame
  * workers. Tones are checked at the browser's WebAudio output and at each
- * native speaker.
+ * native speaker. Last, in a plaintext channel, a native device shares its
+ * screen through the webview's own transports (docs/screen-share.md, PR 5)
+ * and the browser watches it, with native voice going on in the same call.
  *
  * Build once: cargo build -p gwar-server && cargo build -p gwar-client --example native_bridge
- *   E2E_BROWSERS=chromium,webkit   engine of every page (default: chromium)
+ *   E2E_BROWSERS=chromium,webkit   engine of every page (default: chromium; CI runs Chromium,
+ *                                  since Linux WebKit paints remote video unreliably, see screen.mjs)
  */
 import { stopProcesses } from "./processes.mjs";
+import { canvasCapture, readBarcode, stampBarcode } from "./screen-source.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -160,10 +164,14 @@ const counters = page => page.evaluate(async () => {
   return controller.voiceCounters();
 });
 
+/** A native device's screen: a 640×480 canvas stamped as source 7, through the picker's test hook. */
+const SCREEN = { id: 7, size: [640, 480] };
+
 async function device(browser, web, server, name, frequency, native) {
-  const context = await browser.newContext({ locale: "en-US" });
+  const context = await browser.newContext({ locale: "en-US", viewport: { width: 1280, height: 800 } });
   await context.route("**/*", route => (new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort()));
   await context.addInitScript(devicePatch, frequency);
+  await context.addInitScript({ content: `window.__readBarcode = ${readBarcode}; (${canvasCapture})(${JSON.stringify([SCREEN])}, ${stampBarcode});` });
   const page = await context.newPage();
   const fixture = native ? nativeFixture(frequency) : null;
   if (fixture) {
@@ -227,6 +235,28 @@ const leave = d => d.page.evaluate(async () => {
 });
 const active = (d, what) => waitFor(async () => (await voice(d.page)).encryption === "active", `${d.name} ${what}`, 30_000);
 
+/** `sharer` shares through the UI; `viewer` opens it from the LIVE badge and reads the barcode. */
+async function shareAndWatch(sharer, viewer) {
+  const started = Date.now();
+  await sharer.page.getByRole("button", { name: "Share screen", exact: true }).click();
+  const dialog = sharer.page.getByRole("dialog", { name: "Share your screen" });
+  await dialog.waitFor({ timeout: 20_000 });
+  await dialog.getByRole("button", { name: "Share", exact: true }).click();
+  const bar = sharer.page.getByRole("status", { name: "You are sharing your screen" });
+  await bar.getByText(/watching$/).waitFor({ timeout: 30_000 });
+  await viewer.page.getByRole("button", { name: `${sharer.name} is sharing their screen. Click to watch.` }).click();
+  let first = null, last = null;
+  await waitFor(async () => {
+    last = await viewer.page.evaluate(() => window.__readBarcode(document.querySelector("video[data-share]")));
+    if (!last || last.invalid || last.id !== SCREEN.id) return false;
+    if (!first) { first = last; return false; }
+    return last.counter !== first.counter;
+  }, `${viewer.name} decodes ${sharer.name}'s screen (last ${JSON.stringify(last)})`, 30_000);
+  assert.ok(Math.abs(last.width / last.height - 4 / 3) < 0.03, `the decoded ${last.width}x${last.height} frame is the 640x480 source`);
+  await bar.getByText("1 watching").waitFor({ timeout: 10_000 });
+  return { ms: Date.now() - started, size: `${last.width}x${last.height}` };
+}
+
 async function run(engine, web, server, token) {
   const type = engine === "webkit" ? webkit : chromium;
   const browser = await type.launch({ headless: true, args: engine === "chromium" ? ["--autoplay-policy=no-user-gesture-required"] : [] });
@@ -286,6 +316,14 @@ async function run(engine, web, server, token) {
     await waitFor(() => hears(erin, 440), "plaintext control: native erin hears alice", 20_000);
     assert.equal((await voice(erin.page)).encryption, null);
     assert.equal(await counters(erin.page), null, "no SFrame counters in plaintext");
+
+    // A native-voice device shares its screen through the webview's transports; the browser
+    // watches it from the LIVE badge, and voice keeps going both ways while it does.
+    timings.screen = await shareAndWatch(erin, alice);
+    timings.voiceWhileSharing = await waitFor(async () => (await hears(erin, 440)) && (await hears(alice, 770)), "native voice both ways while sharing", 20_000);
+    await erin.page.getByRole("status", { name: "You are sharing your screen" }).getByRole("button", { name: "Stop sharing" }).click();
+    await alice.page.locator("video[data-share]").waitFor({ state: "detached", timeout: 15_000 });
+    await waitFor(() => hears(alice, 770), "browser alice hears native erin after the share", 20_000);
 
     const errors = opened.flatMap(d => d.page.errors.filter(e => !/Conversation synchronization|favicon|Failed to load resource/.test(e)).map(e => `${d.name}: ${e}`));
     results.push({ engine, status: "pass", timings, errors });
