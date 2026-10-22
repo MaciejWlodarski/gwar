@@ -1807,11 +1807,10 @@ screen worker; it arrives with PR 7's encrypted shares.
   Gwar; the call works without it.
 - **A refusal is never silent.** WebKit and Chromium answer both a closed
   picker and a refusal before any picker (a WebKit that denies, a missing
-  user gesture, a platform policy) with `NotAllowedError`. A `NotAllowedError`
-  within `PICKER_REFUSED_MS` (500 ms) of the click came before anyone could
-  close a picker: the app says "Screen sharing isn't available here: the
-  system refused before showing the picker (…)". Later ones are the user
-  closing the picker, and stay silent.
+  user gesture, a platform policy) with `NotAllowedError`, and nothing,
+  timing included, tells them apart (a busy renderer delays a refusal; a
+  quick Escape looks like one). Every `NotAllowedError` therefore shows the
+  neutral notice "Screen sharing was cancelled or denied (…)".
 - **Info.plist: `NSScreenCaptureUsageDescription`; entitlements: none.**
   - Two consent paths exist on macOS. `SCContentSharingPicker`, which
     WebKit uses on 14+, is consent by itself: the person picks a window or

@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { initialScreen, useScreen } from "./screen";
-import { canWatch, PICKER_REFUSED_MS, ScreenController, screenSupport, useDesktopCapture } from "./screen-controller";
+import { canWatch, ScreenController, screenSupport, useDesktopCapture } from "./screen-controller";
 import { useUi } from "./stores";
 
 const shell = vi.hoisted(() => ({ invoke: vi.fn<(command: string) => Promise<unknown>>() }));
@@ -71,30 +71,19 @@ describe("the desktop app", () => {
     }
   });
 
-  it("a refusal before the picker shows is reported, never taken for the user closing it", async () => {
+  it("a closed or refused picker is reported neutrally, however long it took", async () => {
     shell.invoke.mockResolvedValue("ok");
     const screen = new ScreenController(() => null, String);
     screen.init();
     await flush();
-    const now = vi.spyOn(Date, "now");
-    const refuse = (after: number) => {
-      now.mockReturnValueOnce(1_000).mockReturnValueOnce(1_000 + after);
+    // A refusal before any picker and the user closing it raise the same error; timing tells nothing.
+    for (let i = 0; i < 2; i++) {
+      toast.mockReset();
       getDisplayMedia.mockImplementationOnce(async () => { throw new DOMException("The request is not allowed", "NotAllowedError"); });
       screen.beginShare();
-    };
-
-    // WebKit before 14.6, or a platform refusal: no picker ever showed.
-    refuse(40);
-    await flush();
-    expect(toast.mock.calls).toEqual([["error", "Screen sharing isn't available here: the system refused before showing the picker (The request is not allowed)"]]);
-    expect(useScreen.getState().own).toBeNull();
-
-    // The user closed the picker: silent, as before.
-    toast.mockReset();
-    refuse(PICKER_REFUSED_MS + 2_000);
-    await flush();
-    expect(toast).not.toHaveBeenCalled();
-    expect(useScreen.getState().own).toBeNull();
-    now.mockRestore();
+      await flush();
+      expect(toast.mock.calls).toEqual([["info", "Screen sharing was cancelled or denied (The request is not allowed)"]]);
+      expect(useScreen.getState().own).toBeNull();
+    }
   });
 });

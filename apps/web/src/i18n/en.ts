@@ -369,7 +369,7 @@ export const en = {
   "screen.channelFull": "This channel already has as many screen shares as allowed.",
   "screen.alreadySharing": "You are already sharing your screen.",
   "screen.captureFailed": "The screen could not be captured: {reason}",
-  "screen.pickerRefused": "Screen sharing isn't available here: the system refused before showing the picker ({reason})",
+  "screen.pickerDeclined": "Screen sharing was cancelled or denied ({reason})",
   "screen.presetTitle": "Share your screen",
   "screen.presetHint": "Pick what matters most. You can change it while sharing.",
   "screen.surface.screen": "Sharing your entire screen",

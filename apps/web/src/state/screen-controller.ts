@@ -20,13 +20,6 @@ import { useSession, useUi } from "./stores";
 /** Why this device cannot share here, or "ok". */
 export type ShareAvailability = Exclude<ScreenSupport, "ok"> | "ok" | "teamspeak" | "encrypted" | "forbidden";
 
-/**
- * A refusal faster than this came before any picker could show: nobody closes a picker that
- * quickly. It is reported, never taken for the user closing the picker (WebKit and Chromium
- * both answer a refused or a closed picker with the same `NotAllowedError`).
- */
-export const PICKER_REFUSED_MS = 500;
-
 /** How long `screen.watch` is retried while the server has not seen the watch transport connect. */
 const WATCH_UNAVAILABLE_MS = 5_000;
 
@@ -124,7 +117,6 @@ export class ScreenController {
     // The button refuses these too; the controller never relies on it.
     if (useScreen.getState().own || screenSupport() !== "ok") return;
     const attempt = ++this.attempts;
-    const asked = Date.now();
     let picked: Promise<MediaStream>;
     try {
       picked = captureScreen();
@@ -146,12 +138,13 @@ export class ScreenController {
         dispatch({ type: "ownEnded", attempt });
         const name = e instanceof DOMException ? e.name : "";
         const reason = e instanceof Error ? e.message : String(e);
-        if (name === "NotAllowedError" && Date.now() - asked < PICKER_REFUSED_MS) {
-          useUi.getState().toast("error", tNow("screen.pickerRefused", { reason }));
+        // WebKit and Chromium answer a closed picker and a refusal before any picker with the same
+        // `NotAllowedError`, and nothing tells them apart: say so neutrally, never stay silent.
+        if (name === "NotAllowedError") {
+          useUi.getState().toast("info", tNow("screen.pickerDeclined", { reason }));
           return;
         }
-        // Closing the picker is not an error.
-        if (name === "NotAllowedError" || name === "AbortError") return;
+        if (name === "AbortError") return;
         useUi.getState().toast("error", tNow("screen.captureFailed", { reason }));
       },
     );

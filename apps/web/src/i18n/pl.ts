@@ -371,7 +371,7 @@ export const pl: Record<Key, string> = {
   "screen.channelFull": "Na tym kanale jest już tyle udostępnień ekranu, ile wolno.",
   "screen.alreadySharing": "Już udostępniasz ekran.",
   "screen.captureFailed": "Nie udało się przechwycić ekranu: {reason}",
-  "screen.pickerRefused": "Udostępnianie ekranu jest tu niedostępne: system odmówił, zanim pokazał okno wyboru ({reason})",
+  "screen.pickerDeclined": "Udostępnianie ekranu anulowano lub odmówiono ({reason})",
   "screen.presetTitle": "Udostępnij ekran",
   "screen.presetHint": "Wybierz, co jest najważniejsze. Możesz to zmienić w trakcie.",
   "screen.surface.screen": "Udostępniasz cały ekran",
