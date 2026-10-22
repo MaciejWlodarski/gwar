@@ -12,7 +12,7 @@ import { Avatar } from "./kit";
 
 const AVATAR = `a${"ab".repeat(20)}`;
 const server: ServerInfo = {
-  name: "TS", welcome: "", version: "3", default_channel: 1, max_clients: 32, upload_limit: 0, file_access: "link", teamspeak: true,
+  name: "TS", welcome: "", version: "3", default_channel: 1, max_clients: 32, upload_limit: 0, file_access: "link", teamspeak: true, screen_guest_links: true,
   server_chat: { encrypted: false, history: false }, icon: "i1001",
   badges: [
     { kind: "server", id: 6, name: "Server Admin", sort: 0 },

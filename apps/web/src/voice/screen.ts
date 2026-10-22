@@ -277,6 +277,8 @@ export class ScreenPublisher {
 
 export interface WatchParams {
   run: number;
+  /** Receive slots: `SCREEN_SLOTS` for members, 1 for a TeamSpeak guest's watch page. */
+  slots?: number;
   iceServers: IceServer[];
   /** `screen.watch.offer` with this run: the server's answer. */
   offer(sdp: string, run: number): Promise<string>;
@@ -288,7 +290,8 @@ export interface WatchParams {
 export interface SlotStats { width: number; height: number; fps: number; framesDecoded: number }
 
 /**
- * The session's watch transport: `SCREEN_SLOTS` receive-only video m-lines and nothing to send.
+ * The session's watch transport: `SCREEN_SLOTS` receive-only video m-lines (one on the guest
+ * watch page) and nothing to send.
  * It stays while the session lasts; a new run replaces it. Receivers keep their jitter buffer
  * minimal (`jitterBufferTarget = 0`) where the engine supports it.
  */
@@ -307,7 +310,7 @@ export class ScreenWatchTransport {
     const pc = new RTCPeerConnection(rtcConfig(this.params.iceServers));
     this.pc = pc;
     this.stopWatching = watchState(pc, s => this.params.state(s), () => this.pc === pc);
-    for (let i = 0; i < SCREEN_SLOTS; i++) {
+    for (let i = 0; i < (this.params.slots ?? SCREEN_SLOTS); i++) {
       const transceiver = pc.addTransceiver("video", { direction: "recvonly" });
       preferCodecs(transceiver, "receive");
       const receiver = transceiver.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null };

@@ -4,8 +4,9 @@ Status: **design, with the owner's decisions of 2026-10-21 folded in**
 ([Owner decisions](#owner-decisions)). Built so far: the share state and its
 protocol (PR 2), the SFU's transports and forwarding (PR 3a), and sharing and
 watching from the browser in plaintext channels (PR 4,
-[as built](#web-client-as-built-pr-4)), and the same in the desktop app (PR 5,
-[as built](#desktop-app-as-built-pr-5)). Phase 1
+[as built](#web-client-as-built-pr-4)), the same in the desktop app (PR 5,
+[as built](#desktop-app-as-built-pr-5)), and TeamSpeak watch links (PR 6,
+[as built](#watch-links-as-built-pr-6)). Phase 1
 goes through the server's SFU. Peer-to-peer sharing comes later and is only
 sketched at the end. The spike code was thrown away; only its results are
 kept here ([Spikes](#spikes)).
@@ -1751,7 +1752,8 @@ badge, stage). Decisions taken while building it, where this design left room:
   every unwatched share of the same channel as cards. Moderators get "Stop
   screen share" on the stage and in the channel tree's menu. On narrow screens
   the stage replaces the chat, with no chat beside it.
-- **`guest_link`** is always false until PR 6 adds the TeamSpeak checkbox.
+- **`guest_link`** was always false until PR 6 added the TeamSpeak checkbox
+  ([Watch links as built](#watch-links-as-built-pr-6)).
 - **The e2e's WebKit sharer** gets its canvas track from an init script that
   stands in for `getDisplayMedia`; the app's own capture path runs unchanged
   around it. The Chromium sharer captures a real tab (S4's flag). The tab that
@@ -1861,6 +1863,90 @@ screen worker; it arrives with PR 7's encrypted shares.
     PR 1's checklist is repeated by hand on release builds.
 - **Follow-up.** `NSProcessInfo.beginActivity` while sharing waits for PR 1's
   hidden-window frame-rate measurement (§1, "Tradeoffs").
+
+### Watch links as built (PR 6)
+
+Code: `crates/gwar-server/src/core/screen/guests.rs` (tokens, guests and
+revocation), `gateway.rs` (`/ws/watch`), `preauth.rs` (guest limits),
+`teamspeak/bridge.rs` (the post, late joiners, the presence marker),
+`apps/web/src/watch/` with `watch.html` (the page) and the sharer's checkbox
+and link line in `ui/Screen.tsx`. Decisions taken while building it, where the
+design left room:
+
+- **The token is made at the announcement.** `screen.start {guest_link}` only
+  records the wish. The token is generated when the share is announced (its
+  publish transport connected), and only if a link is possible then and the
+  sharer has not turned it off meanwhile. With the checkbox off no token ever
+  exists. The core keeps SHA-256(token) → share; the raw URL goes once to the
+  bridge, in a `WatchUrl` whose `Debug` prints no token, so it cannot reach a
+  log line.
+- **"Possible" means:** a public URL, `screen_guest_links` on, `file_access`
+  `link`, a bridge attached right now (not only `--teamspeak`), and a channel
+  that is neither encrypted nor private. Private channels are never bridged,
+  so they get no link either. The web client checks the same (`server.teamspeak`
+  stands in for the bridge) before it shows the notice and the checkbox, and
+  sends `guest_link: false` where the server would make no link anyway.
+- **Turning off is final, whoever does it.** `screen.link.revoke` by the sharer
+  or a moderator; `file_access` set to `members` or `screen_guest_links` set
+  off (checked on every `server.update`, and with the watch rules after any
+  channel change); and the bridge detaching or being replaced. Each turns every
+  affected link off for the rest of its share: turning a setting back on does
+  not bring a link back, the next share gets a new one.
+- **What guests are told.** A share that ends sends its guests
+  `screen.stopped {share, reason}` without `by`; a link turned off sends
+  `screen.link {share, active: false}`. Then their connection closes. The page
+  says "The share has ended" or "This link was turned off".
+- **Errors.** Unknown, ended and turned-off tokens answer the same
+  `not_found` ("this link does not work"). A share already at 10 guests, or at
+  25 viewers with members and guests counted together, answers `busy`: telling
+  a guest that the link works but the share is full reveals nothing a valid
+  token holder could not see anyway. A guest frame that does not parse as one
+  of the watch ops, a second `guest.watch` and a second `guest.offer` close the
+  connection; an error reply echoes the frame's own `id` where it has one.
+- **Guest ids** come from the session id space and are never handed to a
+  member, so a guest's watch lease, slot and `EndWatch` cannot collide with a
+  session's. A guest has no client entry and appears in no event other than
+  the share's guest count.
+- **Who sees the link state.** The sharer and moderators (`mute_members`) in
+  the share's channel get `screen.link` events while the share runs; `Welcome`
+  carries no link state, so a moderator who connects later sees no "Turn off
+  TeamSpeak link" until the next change. The sharer's own line comes from its
+  `screen.link {active: true}`.
+- **The server setting** has a switch in Server settings, shown only on
+  TeamSpeak servers.
+- **Late joiners and the presence marker.** The late-joiner message goes once
+  per TeamSpeak user and share; users already in the channel when the link was
+  posted count as told. The " · sharing screen" marker follows the sharer's
+  name in the channel description's presence line, which lists users without a
+  puppet (the line puppets do not need).
+- **ServerQuery posts only to readers.** Without a puppet the signed
+  ServerQuery post is made only when TeamSpeak users are in the channel; one
+  who arrives later gets the late-joiner message instead.
+- **The page** is plain TypeScript (no React, no app stores), about 8 KB
+  gzipped with its CSS. It keeps the token in the fragment (a reload works
+  after a lost connection), pings every 20 s once admitted, and shows
+  "Connecting…", "Your connection is too slow for this share" (on
+  `screen.paused`, from PR 3b), "The share has ended", "This link was turned
+  off", "This link doesn't work: the share has ended or the link was turned
+  off.", a busy line and a lost-connection line, in Polish or English. With
+  `--web-root` the server serves it at `/watch` with `Referrer-Policy:
+  no-referrer` and `Cache-Control: no-cache`. The official web host must
+  serve `watch.html` at `/watch` too (deployment, not code).
+- **Tests.** `crates/gwar-server/tests/watch_links.rs` runs guests over real
+  SRTP against a channel standing in for the bridge, including the PreAuth
+  limits by /64 and the 60 s idle close of a guest that stops pinging. The
+  bridge tests cover the puppet post, the signed ServerQuery post, late
+  joiners, encrypted channels, members-only servers and the description.
+  `apps/web/e2e/watch.mjs` runs Chromium and WebKit guest pages against a
+  server built with `test-hooks`, whose stand-in bridge
+  (`GWAR_TEST_WATCH_LINKS`) prints each link: the acceptance order, watching,
+  the 150 s heartbeat, the end of the share, the checkbox off and "Turn off".
+- **Waiting for PR 3b** (allocation): a member's admission does not yet
+  reclaim guest reservations (newest guest first; each guest records when it
+  joined for this), `screen.paused` / `screen.resumed` are not yet sent to
+  guests, and a paused guest is not yet re-admitted every 5 s. Until then a
+  guest holds its viewer place like a member, within the 10-guest cap. The
+  page already handles both events.
 
 ## 7. Phases and pull requests
 

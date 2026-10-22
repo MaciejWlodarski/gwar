@@ -35,11 +35,26 @@ impl std::fmt::Debug for WatchUrl {
 pub enum GuestMsg {
     /// The first frame. The core queues the reply on `out` and answers the guest's id, or `None`
     /// when it refused (the error is queued too).
-    Watch { id: u32, token: String, out: OutboundTx, reply: oneshot::Sender<Option<SessionId>> },
-    Offer { guest: SessionId, id: u32, sdp: String },
-    Keyframe { guest: SessionId, id: u32, share: String },
+    Watch {
+        id: u32,
+        token: String,
+        out: OutboundTx,
+        reply: oneshot::Sender<Option<SessionId>>,
+    },
+    Offer {
+        guest: SessionId,
+        id: u32,
+        sdp: String,
+    },
+    Keyframe {
+        guest: SessionId,
+        id: u32,
+        share: String,
+    },
     /// The connection closed.
-    Gone { guest: SessionId },
+    Gone {
+        guest: SessionId,
+    },
 }
 
 pub(in crate::core) struct Guest {
@@ -463,7 +478,10 @@ mod tests {
         })
         .await;
         let refused = watched.unwrap_err();
-        assert_eq!((refused.code, refused.message.as_str()), (ErrorCode::Busy, "this share has as many viewers as allowed"));
+        assert_eq!(
+            (refused.code, refused.message.as_str()),
+            (ErrorCode::Busy, "this share has as many viewers as allowed")
+        );
     }
 
     #[tokio::test]
@@ -475,7 +493,7 @@ mod tests {
         assert_ne!(guest, later);
         let (guests, sessions) = on_core(&core, |core| (core.guests.len(), core.sessions.len())).await;
         assert_eq!((guests, sessions), (1, 2));
-        // A guest is nobody on the server: no client, no event of its arrival or departure.
+        // A guest that leaves is taken off its share.
         core.guest(GuestMsg::Gone { guest }).await;
         let viewers = on_core(&core, |core| core.shares["S"].guests.len()).await;
         assert_eq!(viewers, 0);
@@ -485,7 +503,8 @@ mod tests {
     async fn no_link_where_one_is_not_possible() {
         let (core, mut notes) = core_with_bridge().await;
         linked_share(&core, 0).await;
-        let cases: Vec<(&str, fn(&mut Core))> = vec![
+        type Case = (&'static str, fn(&mut Core));
+        let cases: Vec<Case> = vec![
             ("no public URL", |core| core.watch_base = None),
             ("watch links off", |core| core.info.screen_guest_links = false),
             ("members-only files", |core| core.info.file_access = FileAccess::Members),
@@ -501,12 +520,7 @@ mod tests {
         ];
         for (case, change) in cases {
             let opened = on_core(&core, move |core| {
-                let saved = (
-                    core.watch_base.clone(),
-                    core.info.clone(),
-                    core.bridge.clone(),
-                    core.channels.clone(),
-                );
+                let saved = (core.watch_base.clone(), core.info.clone(), core.bridge.clone(), core.channels.clone());
                 change(core);
                 let share = core.shares.get_mut("S").unwrap();
                 share.link = None;

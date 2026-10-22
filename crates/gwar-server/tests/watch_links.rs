@@ -20,7 +20,9 @@ use tokio_tungstenite::{
 
 /// A server with a public URL whose clients' addresses come from `x-real-ip`, and a stand-in for
 /// the TeamSpeak bridge.
-async fn linked_server(configure: impl FnOnce(&mut gwar_server::Config)) -> (TestServer, UnboundedReceiver<BridgeNote>) {
+async fn linked_server(
+    configure: impl FnOnce(&mut gwar_server::Config),
+) -> (TestServer, UnboundedReceiver<BridgeNote>) {
     let server = TestServer::start_with(|c| {
         c.public_url = Some("https://watch.test".into());
         c.client_ip_header = Some("x-real-ip".into());
@@ -272,9 +274,8 @@ async fn guests_can_send_only_the_watch_ops() {
     let (_, token) = next_link(&mut notes).await;
 
     // Before `guest.watch`: anything else is refused and the connection closes.
-    for (i, (op, d)) in [("hello", json!({})), ("screen.watch", json!({"share": share})), ("ping", json!({}))]
-        .into_iter()
-        .enumerate()
+    for (i, (op, d)) in
+        [("hello", json!({})), ("screen.watch", json!({"share": share})), ("ping", json!({}))].into_iter().enumerate()
     {
         let mut guest = Guest::connect(&server, &format!("198.51.100.{}", 10 + i)).await;
         assert!(guest.request(op, d).await.is_err(), "{op} first");
@@ -422,7 +423,11 @@ async fn private_channels_and_a_detached_bridge_have_no_link() {
     let general = seed_channel(&alice, "General");
     // A private channel is not bridged: none.
     let secret = channel_id(
-        &root.create_channel(json!({"name": "secret", "private": true, "access": {"roles": [], "users": [alice.welcome.uid]}})).await,
+        &root
+            .create_channel(
+                json!({"name": "secret", "private": true, "access": {"roles": [], "users": [alice.welcome.uid]}}),
+            )
+            .await,
     );
     let share = share_linked(&mut alice, secret).await;
     alice.ok("screen.stop", json!({"share": share})).await;
@@ -491,7 +496,10 @@ async fn a_guest_that_stops_pinging_is_closed_after_the_idle_timeout() {
 #[test]
 fn links_open_this_servers_page_or_the_web_app_with_the_server() {
     use gwar_server::watch_base;
-    assert_eq!(watch_base(Some("https://voice.example.com/"), true).as_deref(), Some("https://voice.example.com/watch#"));
+    assert_eq!(
+        watch_base(Some("https://voice.example.com/"), true).as_deref(),
+        Some("https://voice.example.com/watch#")
+    );
     assert_eq!(
         watch_base(Some("https://voice.example.com:8443"), false).as_deref(),
         Some("https://gwar.app/watch?server=wss%3A%2F%2Fvoice.example.com%3A8443%2Fws#")

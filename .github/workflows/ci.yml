@@ -389,7 +389,8 @@ jobs:
           pnpm --filter web e2e:voice
 
   # Plaintext screen sharing through the SFU: a real tab captured in Chromium, a canvas in WebKit,
-  # viewers in both engines reading a stamped barcode back from the decoded video.
+  # viewers in both engines reading a stamped barcode back from the decoded video; then the
+  # TeamSpeak guests' watch page.
   browser-screen:
     needs: [mls-wasm, denoise-wasm]
     runs-on: ubuntu-24.04
@@ -431,6 +432,12 @@ jobs:
           pactl load-module module-null-sink sink_name=e2e
           pactl set-default-sink e2e
           pnpm --filter web e2e:screen
+      # TeamSpeak watch links: guest pages in Chromium and WebKit, through the test hooks' stand-in
+      # bridge (no TeamSpeak server), including the 150 s heartbeat.
+      - name: Watch links for TeamSpeak guests
+        run: |
+          cargo build -p gwar-server --features test-hooks
+          pnpm --filter web e2e:watch
 
   browser-private:
     needs: [mls-wasm, denoise-wasm]

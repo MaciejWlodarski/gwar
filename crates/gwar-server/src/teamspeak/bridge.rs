@@ -2515,6 +2515,7 @@ mod tests {
                     access: None,
                     synced: true,
                     overrides: Vec::new(),
+                    icon: None,
                 },
             );
         }
@@ -2535,6 +2536,7 @@ mod tests {
             server_deafened: false,
             sharing: true,
             channel_group: None,
+            avatar: None,
         };
         let local = Local {
             client,

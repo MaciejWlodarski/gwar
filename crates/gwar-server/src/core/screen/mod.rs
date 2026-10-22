@@ -7,8 +7,8 @@
 //! [`WatchGrant`], ended here the moment access ends, before the SFU hears of it.
 mod guests;
 
-pub use guests::{GuestMsg, WatchUrl};
 pub(super) use guests::Guest;
+pub use guests::{GuestMsg, WatchUrl};
 
 use super::{
     voice::{bad, stale},

@@ -50,11 +50,12 @@ export default defineConfig(({ command, mode }) => ({
     },
   },
   // licenses.md: the bundled packages' licenses, served with the app and shipped in the desktop bundle.
-  build: { target: "es2022", sourcemap: true, license: { fileName: "licenses.md" } },
+  // watch.html: the TeamSpeak guests' watch page (docs/screen-share.md, PR 6), its own small entry.
+  build: { target: "es2022", sourcemap: true, license: { fileName: "licenses.md" }, rolldownOptions: { input: { main: "index.html", watch: "watch.html" } } },
   define: { __APP_VERSION__: JSON.stringify(version), __APP_COMMIT__: JSON.stringify(commit), __CAPTURE_CHECK__: JSON.stringify(captureCheck) },
   // The browser e2e fixtures are imported at run time: scanning them up front
   // keeps Vite from reloading the pages when it finds their dependencies.
-  optimizeDeps: { entries: ["index.html", "e2e/*.html", "e2e/*-fixture.{ts,tsx}"] },
+  optimizeDeps: { entries: ["index.html", "watch.html", "e2e/*.html", "e2e/*-fixture.{ts,tsx}"] },
   test: {
     environment: "node",
     include: ["src/**/*.test.{ts,tsx}"],
