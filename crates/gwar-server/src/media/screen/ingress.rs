@@ -142,6 +142,12 @@ impl Bucket {
         self.tokens = self.tokens.min(burst);
     }
 
+    /// Current credit after accounting for elapsed time.
+    pub fn available(&mut self, now: Instant) -> f64 {
+        self.refill(now);
+        self.tokens
+    }
+
     /// Whether it has refilled completely, so that dropping it loses nothing.
     pub fn full(&mut self, now: Instant) -> bool {
         self.refill(now);

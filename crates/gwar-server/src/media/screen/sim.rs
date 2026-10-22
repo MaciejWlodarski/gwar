@@ -168,6 +168,9 @@ pub struct Sim {
     /// The allocation runs every 100 ms, as in the screen task.
     pub allocation: bool,
     next_allocation: Instant,
+    /// SFU scheduling cadence; the independent receiver continues to timestamp arrivals every ms.
+    pub server_interval: Duration,
+    next_server: Instant,
     arrivals: HashMap<(usize, u16), Instant>,
 }
 
@@ -205,6 +208,8 @@ impl Sim {
             uplink: Vec::new(),
             allocation: true,
             next_allocation: now,
+            server_interval: MS,
+            next_server: now,
             arrivals: HashMap::new(),
         };
         for _ in 0..2000 {
@@ -343,32 +348,36 @@ impl Sim {
     pub fn tick(&mut self) {
         let now = self.now;
         self.frames();
-        for (lane, out, arrival) in self.w.egress.pending() {
-            self.arrivals.insert((lane, out as u16), arrival);
-        }
-        let mut requests = std::mem::take(&mut self.w.dropped_lanes);
-        let mut out = Vec::new();
-        drive(&mut self.w, now, &mut requests, &mut |c: &[u8], _| out.push(c.to_vec()));
-        for datagram in out {
-            let kind = self.classify(&datagram);
-            self.sent.push(Sent { at: now, len: datagram.len(), kind });
-            self.down.send(now, &datagram);
-        }
-        for slot in requests {
-            if let Some(share) = self.shares.iter_mut().find(|s| s.slot == slot) {
-                share.wants_key = true;
+        let server_due = now >= self.next_server;
+        if server_due {
+            self.next_server = now + self.server_interval;
+            for (lane, out, arrival) in self.w.egress.pending() {
+                self.arrivals.insert((lane, out as u16), arrival);
             }
-        }
-        if self.allocation && now >= self.next_allocation {
-            self.next_allocation = now + ALLOCATION_TICK;
-            let rates: HashMap<String, ShareRate> =
-                self.shares.iter_mut().map(|s| (s.origin.share.clone(), s.meter.rate(now))).collect();
-            if let Some((slot, change)) = allocate(&mut self.w, now, &rates, true) {
-                self.changes.push((now, slot, change));
-                if change == Change::Resume
-                    && let Some(share) = self.shares.iter_mut().find(|s| s.slot == slot)
-                {
+            let mut requests = std::mem::take(&mut self.w.dropped_lanes);
+            let mut out = Vec::new();
+            drive(&mut self.w, now, &mut requests, &mut |c: &[u8], _| out.push(c.to_vec()));
+            for datagram in out {
+                let kind = self.classify(&datagram);
+                self.sent.push(Sent { at: now, len: datagram.len(), kind });
+                self.down.send(now, &datagram);
+            }
+            for slot in requests {
+                if let Some(share) = self.shares.iter_mut().find(|s| s.slot == slot) {
                     share.wants_key = true;
+                }
+            }
+            if self.allocation && now >= self.next_allocation {
+                self.next_allocation = now + ALLOCATION_TICK;
+                let rates: HashMap<String, ShareRate> =
+                    self.shares.iter_mut().map(|s| (s.origin.share.clone(), s.meter.rate(now))).collect();
+                if let Some((slot, change)) = allocate(&mut self.w, now, &rates, true) {
+                    self.changes.push((now, slot, change));
+                    if change == Change::Resume
+                        && let Some(share) = self.shares.iter_mut().find(|s| s.slot == slot)
+                    {
+                        share.wants_key = true;
+                    }
                 }
             }
         }
@@ -405,11 +414,15 @@ impl Sim {
                 Output::Event(_) => {}
             }
         }
-        for datagram in self.up.due(now) {
-            self.deliver(&datagram);
+        if server_due {
+            for datagram in self.up.due(now) {
+                self.deliver(&datagram);
+            }
         }
         self.now += MS;
-        self.w.rtc.handle_input(Input::Timeout(self.now)).unwrap();
+        if server_due {
+            self.w.rtc.handle_input(Input::Timeout(self.now)).unwrap();
+        }
         self.client.handle_input(Input::Timeout(self.now)).unwrap();
     }
 
@@ -623,6 +636,34 @@ mod tests {
             assert_eq!(sim.paused(paused), Some(ScreenPauseReason::Bandwidth), "{context}");
             assert!(pauses(&sim, kept).is_empty(), "{context}");
         }
+    }
+
+    #[test]
+    fn game_startup_with_scheduler_jitter_does_not_pause_a_healthy_viewer() {
+        for step in [1, 2, 5, 10] {
+            let mut sim = Sim::new(None);
+            sim.server_interval = step * MS;
+            sim.watch("game", 8_000_000, 60, 200_000, None);
+            while sim.elapsed() < 45 * SECOND {
+                sim.tick();
+                // Stall the SFU; the receiver's clock and socket work stay independent.
+                if sim.elapsed().as_millis().is_multiple_of(100) {
+                    sim.next_server += 10 * MS;
+                }
+            }
+            assert!(sim.changes.is_empty(), "step={step}: {}", summary(&sim));
+            let bytes = sim.bytes(sim.now - 10 * SECOND, sim.now, |k| matches!(k, Kind::Original { .. }));
+            assert!(bytes as f64 * 8.0 / 10.0 >= 0.6 * 8_000_000.0, "steady media, step={step}: {}", summary(&sim));
+        }
+    }
+
+    #[test]
+    fn bandwidth_pause_recovers_when_the_link_clears() {
+        let (sim, _, _) = collapse(true);
+        assert_eq!(sim.paused(0), None, "{}", summary(&sim));
+        assert!(resumes(&sim, 0) > 0, "{}", summary(&sim));
+        let bytes = sim.bytes(sim.now - 10 * SECOND, sim.now, |k| matches!(k, Kind::Original { .. }));
+        assert!(bytes as f64 * 8.0 / 10.0 >= 0.6 * 4_000_000.0, "media flows after resume: {}", summary(&sim));
     }
 
     #[test]

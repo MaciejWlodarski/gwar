@@ -1327,6 +1327,14 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
     requests.append(&mut w.dropped_lanes);
     let mut connected = false;
     let mut released = false;
+    // Forwarding a publisher packet does not advance this viewer's str0m clock.
+    // Catch up before polling: TWCC send times must describe this socket drain,
+    // including after a scheduler stall, rather than the preceding viewer input.
+    if let Err(e) = w.rtc.handle_input(Input::Timeout(now)) {
+        debug!(session = w.session, "screen watch timeout: {e}");
+        w.rtc.disconnect();
+        return connected;
+    }
     // With the bandwidth estimator on, str0m's pacer hands out one packet per timeout, so a
     // timeout already due is handled at once (bounded, should it keep returning `now`).
     let mut due = 0;
@@ -1456,7 +1464,7 @@ fn allocate(
         c.extras_dropped,
         "screen watch egress"
     );
-    if desired != w.desired {
+    if desired != w.desired && (desired < w.desired || w.egress.probe_ready(now)) {
         w.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired.unwrap_or(0)));
         w.desired = desired;
     }

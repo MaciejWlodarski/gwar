@@ -71,14 +71,11 @@ pub const KEYFRAME_FLOOR: usize = 200 * 1024;
 const KEYFRAME_MEMORY: Duration = Duration::from_secs(30);
 /// Probing target over the watched shares' caps.
 const DESIRED_HEADROOM: f64 = 1.1;
-/// The probing target is at most this far above the estimate. str0m probes at up to twice the
-/// target (every 5 s while the viewer is application-limited), so a target far above the
-/// estimate sends clusters that queue on the viewer's link for longer than voice absorbs: two
-/// 4 Mbps caps on a 5 Mbps downlink made 26 Mbps probes and an 83 ms queue in the paired runs
-/// (docs/screen-share.md, "Voice headroom and acceptance"). Stepping the target up with the
-/// estimate kept the queue under 17 ms there, and the estimate still grows by the probes'
-/// results; a tighter reach starved that growth in the simulated links.
-const PROBE_REACH: f64 = 2.0;
+/// str0m probes at up to twice this target. At 1.5 × estimate, a 15 ms cluster
+/// uses 45 ms × estimate before headers, within the 60 ms × estimate extras burst.
+/// Larger targets wait for the reserve to refill, with one MTU of tolerance for background
+/// padding, so discovery cannot manufacture local TWCC loss.
+const PROBE_REACH: f64 = 1.5;
 
 /// One original packet waiting for its viewer, already mapped onto the slot's segment.
 #[derive(Debug, Clone)]
@@ -608,6 +605,7 @@ impl Egress {
         {
             self.dropped_seconds.clear();
             self.counters.escalations += 1;
+            tracing::debug!(lane = lowest, trigger = "extras", estimate = self.estimate(), "screen bandwidth pause");
             self.pause(lowest, ScreenPauseReason::Bandwidth);
             return Some((lowest, Change::Pause(ScreenPauseReason::Bandwidth)));
         }
@@ -615,6 +613,13 @@ impl Egress {
         if let Some(&lane) =
             order.iter().rev().find(|&&l| !self.lanes[l].ramping(now) && self.lanes[l].failures.len() >= FAILURES)
         {
+            tracing::debug!(
+                lane,
+                trigger = "keyframes",
+                estimate = self.estimate(),
+                failures = self.lanes[lane].failures.len(),
+                "screen bandwidth pause"
+            );
             self.pause(lane, ScreenPauseReason::Bandwidth);
             return Some((lane, Change::Pause(ScreenPauseReason::Bandwidth)));
         }
@@ -634,6 +639,14 @@ impl Egress {
             }
         }
         if let Some(lane) = over {
+            tracing::debug!(
+                lane,
+                trigger = "average",
+                estimate = self.estimate(),
+                plan,
+                average = average(lane),
+                "screen bandwidth pause"
+            );
             self.pause(lane, ScreenPauseReason::Bandwidth);
             return Some((lane, Change::Pause(ScreenPauseReason::Bandwidth)));
         }
@@ -681,12 +694,19 @@ impl Egress {
         // Keep feedback flowing while the intended share's fit timer matures. Pause
         // the displaced slot only when the return is ready; resume on the next tick.
         if let Some(lane) = displaced.filter(|_| resume.is_some()) {
+            tracing::debug!(lane, trigger = "priority", "screen bandwidth pause");
             self.pause(lane, ScreenPauseReason::Bandwidth);
             return Some((lane, Change::Pause(ScreenPauseReason::Bandwidth)));
         }
         let lane = resume?;
         self.resume(lane);
         Some((lane, Change::Resume))
+    }
+
+    /// Refill the reserve before raising the probe target. Leave one MTU of tolerance
+    /// so background padding cannot prevent a refill from being observed at a tick.
+    pub fn probe_ready(&mut self, now: Instant) -> bool {
+        self.extras.available(now) >= extras_burst(self.estimate) - 1200.0
     }
 
     /// The bitrate the BWE should probe for: the watched shares' caps with headroom, and
@@ -861,6 +881,20 @@ mod tests {
     }
 
     #[test]
+    fn a_bandwidth_pause_resumes_at_ten_seconds_of_continuous_room() {
+        let now = Instant::now();
+        let mut e = egress(3_000_000, 1, now);
+        let rates = [ShareRate { average: 4_000_000.0, last_keyframe: 200_000, largest_keyframe: 200_000 }];
+        e.pause(0, ScreenPauseReason::Bandwidth);
+        assert_eq!(e.allocate(now, &rates, true), None);
+        let clear = now + Duration::from_secs(3);
+        e.set_estimate(8_000_000, clear);
+        assert_eq!(e.allocate(clear, &rates, true), None);
+        assert_eq!(e.allocate(clear + RESUME_FOR - Duration::from_millis(1), &rates, true), None);
+        assert_eq!(e.allocate(clear + RESUME_FOR, &rates, true), Some((0, Change::Resume)));
+    }
+
+    #[test]
     fn the_probing_target_covers_caps_and_keyframes_within_reach_of_the_estimate() {
         let now = Instant::now();
         let e = egress(20_000_000, 2, now);
@@ -872,7 +906,7 @@ mod tests {
         let floor = (4_400_000.0 + 200.0 * 1024.0 * 8.0 / 0.4) as u64;
         assert_eq!(e.desired(&[4_000_000, 0], &[ShareRate::default(); 2]), Some(floor));
         let low = egress(3_000_000, 2, now);
-        assert_eq!(low.desired(&[4_000_000, 2_500_000], &rates), Some(6_000_000));
+        assert_eq!(low.desired(&[4_000_000, 2_500_000], &rates), Some(4_500_000));
         assert_eq!(Egress::new(now).desired(&[4_000_000], &rates), None);
     }
 

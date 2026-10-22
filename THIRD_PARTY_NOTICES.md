@@ -23,7 +23,7 @@ commit with one patch (`vendor/tsclientlib`, see its `GWAR-PATCH.md`).
 ## str0m
 
 The WebRTC transports use [str0m](https://github.com/algesten/str0m) 0.24.1
-(MIT OR Apache-2.0), vendored in `vendor/str0m` with one probe-padding patch.
+(MIT OR Apache-2.0), vendored in `vendor/str0m` with probe-padding and probe-burst pacing fixes.
 See `vendor/str0m/GWAR-PATCH.md`; its original licenses are included there.
 
 ## Noise suppression model

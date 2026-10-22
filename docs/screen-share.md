@@ -501,6 +501,46 @@ datagrams reach the screen task without slowing voice down.
     isolation is changed (own thread, separate port or a lower video
     allocation).
 
+**VM gate follow-up (`07e2f24`).** The supplied samples show viewer 0
+stopping near 15 s while the other four sustain 8.54 Mbps. That run logged
+only aggregate pause counts, so its exact allocator trigger is unavailable.
+The example uses a fresh server with a 300 Mbps default budget; budget
+allocation would select the newest watch (viewer 4). The observed pause of
+viewer 0 is therefore inconsistent with that path.
+A local replay with 8 ms process stalls during startup produced permanent
+bandwidth pauses with zero original socket-cap drops and zero extras
+escalations. One pause occurred before the 5 s average guard could expire,
+identifying the two-keyframe failure path. Separately, the unconstrained
+transport simulation sent zero originals and paused at 10.546 s, even
+without CPU contention. This is a server pacing/bootstrap defect; increasing
+harness worker counts does not repair it. The stalled replay is diagnostic,
+not a voice acceptance measurement.
+
+The fixes drain bounded unpaced/probe bursts without per-packet timer wakes,
+account for elapsed time on late probe wakes, and update the watch clock
+before polling. The probe target now respects the refilled extras reserve.
+Regressions use an independent viewer clock with 1, 2, 5 and 10 ms SFU
+cadences plus periodic 10 ms stalls, require steady video throughput, restore
+a link after an actual bandwidth pause, and pin resume at exactly 10 s of
+continuous room. Pause thresholds and socket caps are unchanged.
+
+**Local follow-up verification.** All builds used `CARGO_BUILD_JOBS=4`
+and the worktree's `target/`. Server unit tests: 285 passed (including 49
+screen tests and monthly egress); screen integration: 10; latency example:
+24; vendored str0m: 759; Python harness: 4. The no-default-features server
+check, clippy with `-D warnings`, rustfmt and `git diff --check` passed.
+
+The final macOS loopback gate used one pair of 40 markers per scenario:
+unconstrained, all five viewers at 7.87 Mbps with zero pauses,
+voice p95/p99 deltas +0.60/+0.25 ms;
+downlink-loss, 3.08 Mbps still active, p99 delta
++14.92 ms. Both passed with zero underruns in baseline
+and screen runs. The final startup-stall replay kept every viewer at
+7.81 Mbps with zero pauses despite 13.78 ms maximum
+receive wake lateness; the original replay paused two viewers permanently.
+These shortened local runs do not replace the full ten-pair VM gate or its
+CPU scaling measurement. No deployment service or VM was contacted.
+
 **As built in PR 3b** (docs/latency.md, "Screen load"; `scripts/latency/screen_gate.py`):
 
 - The gate compares the **median of the per-pair deltas** (screen − baseline)
@@ -523,6 +563,14 @@ datagrams reach the screen task without slowing voice down.
 - The gate output reports `queue_max_ms`, `scheduling_lateness_max_ms` (actual
   relay send minus scheduled release) and `scheduling_late_over_5ms`, separately
   for each direction and run. Queue residence excludes relay/runtime lateness.
+- Every viewer also reports `receive_scheduling` in the final JSON and each
+  500 ms sample: datagrams, maximum wake lateness, wakes over 5 ms, maximum
+  receive/str0m processing time and control-send errors. A 5 ms heartbeat
+  measures idle/paused viewers too. These are local processing times, not
+  kernel packet-arrival timestamps. `transitions` records the viewer, share,
+  reason and wall-clock time of every pause/resume. The gate enables screen
+  debug logs by default (unless `RUST_LOG` is supplied); bandwidth pauses name
+  their trigger: `average`, `keyframes`, `extras` or `priority`.
 - `rate=` is one bottleneck per direction shared by every flow, so the voice
   sender shares the 10 Mbps uplink with the publisher, and the voice receiver
   the 5 Mbps downlink with the viewer. Loss variants add 1 % loss both ways.
@@ -972,17 +1020,20 @@ serves the voice acceptance instead. Results and deviations:
   they share nothing with it but the screen task.
 - **Probes fit the reserve:** after the bandwidth collapse ends, allocation
   and periodic ALR probes go out whole within the extras burst, and the
-  estimate recovers to the link rate as it does with the cap disabled
-  (paired runs). Built (`probes_after_a_collapse_fit_the_reserve`), with a
-  finding: once every slot is paused nothing flows, and str0m 0.24.1 neither
-  probes a loss-limited estimate nor gets feedback to change it. So a viewer
-  whose every slot has been paused for bandwidth for 15 s restarts its
-  estimator from a third of its estimate (at least 100 kbps); the initial
-  probes, at 3 and 6 times that, test 1 and 2 times the old estimate. In the
-  simulation that probing reaches about 1.8 Mbps after a 1 Mbps collapse on a
-  10 Mbps link, with or without the cap (within 10 % of each other, at most
-  one extras drop), not the link rate: padding-only probes are not enough
-  for str0m's estimator. Retry (`screen.watch` again) stays the way back.
+  capped and uncapped estimates recover within 10 % of each other. The
+  separate recovery regression requires resumed media above 60 % of its
+  intended rate. Built (`probes_after_a_collapse_fit_the_reserve`), with a
+  finding fixed after the `07e2f24` VM gate: the probe pacer waited between
+  individual padding packets instead of draining each generated burst. A
+  240-byte blank packet per 2 ms wake limited discovery to about 1 Mbps even
+  on a healthy link. The local str0m patch now drains each burst immediately
+  and spaces only successive bursts. A viewer whose every slot is paused
+  for bandwidth for 15 s still restarts its loss-limited estimator from a
+  third of its estimate (at least 100 kbps), with bounded initial probes.
+  Recovery then uses measured capacity and the usual 10 s fit guard; Retry
+  is no longer required to recover a healthy link. Regressions cover an
+  8 Mbps/60 fps share with a 200 KB keyframe from startup, scheduler jitter,
+  and an actual bandwidth pause followed by restored capacity.
 - **A test pins str0m behavior:** `set_rtx_cache` empties the cache. Built
   (`set_rtx_cache_empties_the_cache`).
 
@@ -1030,25 +1081,23 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   watched, including probe clusters already scheduled by str0m. A retained
   transport sends zero non-control bytes in the 30 s final-unwatch simulation.
 
-  As built, the target is also **at most twice the current estimate**.
-  str0m's periodic probe runs at 2× desired whatever the estimate, so with
-  the caps alone two Smooth shares (4 Mbps caps) on a 5 Mbps downlink sent
-  26 Mbps clusters every 5 s, which queued 83 ms on the link and held the
-  voice beside them at about 130 ms instead of 45. Capped at 2× the
-  estimate, the longest queue was 16 ms and the estimate still grew by the
-  probes' results. A tighter reach (1.25×) let the estimate drift down in
-  the simulated links, because str0m's estimate of an application-limited
-  sender holds near its probe results.
+  The target is **at most 1.5 × the current estimate**. str0m's largest
+  periodic probe runs at twice that target: a 15 ms cluster uses
+  45 ms × estimate before headers, within the unchanged 60 ms × estimate
+  extras burst. Increases wait until the reserve has refilled to within one
+  MTU; that tolerance prevents regular background padding from starving
+  discovery. Decreases apply immediately. The earlier 2× reach and its
+  measurements predate the per-packet timer fix and do not describe the
+  corrected pacer's burst behavior.
 - **Ramp.** A slot that starts carrying a share is not paused for its first
   10 s; failed keyframes and averages start counting after that. Added in
   PR 3b: a watch transport's estimate starts at 2.5 Mbps, where `B` is
   2 Mbps and admission 100 KB, so every 1080p share's first keyframe fails.
-  On loopback str0m's initial probes measured only 3.1–3.6 Mbps, and the
-  estimate grew past what a 200 KB keyframe needs with the periodic probe
-  5 s later (12.7 Mbps), then about 19 Mbps at 10 s; the ramp covers two of
-  those rounds. Without it, five loopback viewers of an 8 Mbps share were
-  all paused within a second of watching. The cost: a viewer too slow for a
-  share sees broken video for up to 10 s before its pause.
+  Historical loopback runs before the probe-burst fix needed periodic probes
+  to overcome initial undershoot; scheduling jitter could prevent that
+  bootstrap entirely. The corrected pacer discovers capacity without waiting
+  for original media to fit. The ramp still protects normal BWE startup.
+  A viewer too slow for a share sees broken video for up to 10 s before its pause.
 - **Pause** a slot for that viewer (`screen.paused {share, reason:
   "bandwidth"}`), lowest priority first, when either of these holds:
   - the sum of its 2 s average and the higher-priority slots' averages exceeds
@@ -2382,12 +2431,15 @@ person.
    - CPU per Mbps measured on the VM, recorded here.
 
    Built in PR 3b, beyond the list: a 10 s ramp before a new slot's pauses
-   count, the probing target capped at twice the estimate, stalled viewers
+   count, the probing target capped at 1.5 times the estimate, stalled viewers
    reprobing every 15 s, Retry resuming bandwidth pauses, and the screen
    load and gate harness. Round-1 fixes add wire-byte original pacing/capping,
    tiny-delta-safe probes, priority reclamation, immediate keyframe recovery,
    atomic timestamped counters with incomplete coverage, paired voice roles,
    validated screen load, a per-pair tail gate and relay lateness measurements.
+   The VM gate follow-up fixes padding-burst pacing and adds healthy-startup,
+   scheduling-jitter and automatic-recovery regressions, per-viewer receive
+   scheduling and explicit pause-trigger diagnostics.
    The ten-pair voice gate and the CPU figure on the
    VM are still to run ("Voice headroom and acceptance", "Cost on the
    deployment VM").

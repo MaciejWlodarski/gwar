@@ -123,7 +123,7 @@ def validate_load(meta, expected, constrained):
     if (len(rates) != spec["viewers"] or not samples
             or samples[-1]["unix_s"] - samples[0]["unix_s"] < 1.0
             or any(not isinstance(rate, (int, float)) or not minimum <= rate < float("inf") for rate in rates)):
-        raise RuntimeError(f"insufficient steady screen load: need all {spec['viewers']} viewers >= {minimum:.2f} Mbps; got {rates}")
+        raise RuntimeError(f"insufficient steady screen load: need all {spec['viewers']} viewers >= {minimum:.2f} Mbps; got {rates}; receive scheduling: {load.get('receive_scheduling')}; transitions: {load.get('transitions')}")
     return {"active_viewers": len(rates), "minimum_mbps_per_viewer": minimum, "steady_viewer_mbps": rates}
 
 
@@ -167,6 +167,7 @@ def main():
                     print(f"{name} pair {pair + 1}/{args.pairs}: {which}", flush=True)
                     env = environment(options)
                     env.update(LATENCY_WAIT_CONNECTED="1", LATENCY_WARMUP_MS=str(WARMUP_MS))
+                    env.setdefault("RUST_LOG", "gwar_server::media::screen=debug")
                     if net:
                         env["LATENCY_NET"] = f"seed={pair + 1};{net}"
                     if which == "screen":

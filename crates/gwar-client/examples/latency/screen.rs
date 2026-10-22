@@ -136,6 +136,38 @@ struct Counters {
     pauses: AtomicU64,
     resumes: AtomicU64,
     viewer_bytes: Vec<AtomicU64>,
+    receivers: Vec<ReceiveScheduling>,
+    transitions: std::sync::Mutex<Vec<serde_json::Value>>,
+}
+
+/// Per-viewer receive-loop timing, independent of the relay's queue residence.
+#[derive(Default)]
+struct ReceiveScheduling {
+    datagrams: AtomicU64,
+    wake_lateness_max_us: AtomicU64,
+    wakes_over_5ms: AtomicU64,
+    processing_max_us: AtomicU64,
+    send_errors: AtomicU64,
+}
+
+impl ReceiveScheduling {
+    fn wake(&self, due: Instant, now: Instant) {
+        let late = now.saturating_duration_since(due).as_micros() as u64;
+        self.wake_lateness_max_us.fetch_max(late, Ordering::Relaxed);
+        if late > 5_000 {
+            self.wakes_over_5ms.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn report(&self) -> serde_json::Value {
+        serde_json::json!({
+            "datagrams": self.datagrams.load(Ordering::Relaxed),
+            "wake_lateness_max_ms": self.wake_lateness_max_us.load(Ordering::Relaxed) as f64 / 1000.0,
+            "wakes_over_5ms": self.wakes_over_5ms.load(Ordering::Relaxed),
+            "processing_max_ms": self.processing_max_us.load(Ordering::Relaxed) as f64 / 1000.0,
+            "send_errors": self.send_errors.load(Ordering::Relaxed),
+        })
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -143,19 +175,25 @@ struct Sample {
     unix_s: f64,
     received_bytes: u64,
     viewer_bytes: Vec<u64>,
+    receive_scheduling: Vec<serde_json::Value>,
+}
+
+fn unix_s() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64()
 }
 
 fn sample(counters: &Counters) -> Sample {
     Sample {
-        unix_s: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64(),
+        unix_s: unix_s(),
         received_bytes: counters.received_bytes.load(Ordering::Relaxed),
         viewer_bytes: counters.viewer_bytes.iter().map(|n| n.load(Ordering::Relaxed)).collect(),
+        receive_scheduling: counters.receivers.iter().map(ReceiveScheduling::report).collect(),
     }
 }
 
-/// The load runs on its own runtime, so its str0m loops neither delay the voice clients' and
-/// the server's tasks nor are delayed by them: a viewer that reads late would see queueing that
-/// is not on the path, and its TWCC feedback would hold the server's estimate down.
+/// The load has a separate runtime to avoid sharing task queues with voice and the server.
+/// CPU contention can still delay receiving; per-viewer timing distinguishes that delay from
+/// relay queue residence, since late reads also affect TWCC arrival times.
 pub struct Load {
     spec: Spec,
     counters: Arc<Counters>,
@@ -240,6 +278,7 @@ impl Load {
             .build()?;
         let counters = Arc::new(Counters {
             viewer_bytes: (0..spec.viewers).map(|_| AtomicU64::new(0)).collect(),
+            receivers: (0..spec.viewers).map(|_| ReceiveScheduling::default()).collect(),
             ..Counters::default()
         });
         let (url, load) = (url.to_owned(), spec.clone());
@@ -295,7 +334,7 @@ async fn run(
         let share = share["share"].as_str().context("share id")?.to_owned();
         let through = matches!(spec.via, Via::Publishers | Via::All);
         tasks.push(publish(&sharer, &share, &spec, advertised, route(through), counters.clone()).await?);
-        tasks.push(drain(&mut sharer, counters.clone()));
+        tasks.push(drain(&mut sharer, counters.clone(), None));
         connections.push(sharer);
         shares.push(share);
     }
@@ -306,7 +345,7 @@ async fn run(
         for share in &shares {
             viewer.connection.request(Request::ScreenWatch { share: share.clone() }).await.context("screen.watch")?;
         }
-        tasks.push(drain(&mut viewer, counters.clone()));
+        tasks.push(drain(&mut viewer, counters.clone(), Some(n)));
         connections.push(viewer);
     }
     Ok(Running { tasks, _connections: connections })
@@ -354,19 +393,33 @@ impl Load {
             "samples": samples,
             "pauses": c.pauses.load(Ordering::Relaxed),
             "resumes": c.resumes.load(Ordering::Relaxed),
+            "receive_scheduling": c.receivers.iter().map(ReceiveScheduling::report).collect::<Vec<_>>(),
+            "transitions": *c.transitions.lock().unwrap(),
         }))
     }
 }
 
 /// Reads a connection's events, so that they never back up, counting pauses and resumes.
-fn drain(client: &mut Connected, counters: Arc<Counters>) -> JoinHandle<Result<()>> {
+fn drain(client: &mut Connected, counters: Arc<Counters>, viewer: Option<usize>) -> JoinHandle<Result<()>> {
     let mut events = std::mem::replace(&mut client.events, tokio::sync::mpsc::channel(1).1);
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
             match event {
-                gwar_proto::Event::ScreenPaused { .. } => counters.pauses.fetch_add(1, Ordering::Relaxed),
-                gwar_proto::Event::ScreenResumed { .. } => counters.resumes.fetch_add(1, Ordering::Relaxed),
-                _ => 0,
+                gwar_proto::Event::ScreenPaused { share, reason, .. } => {
+                    counters.pauses.fetch_add(1, Ordering::Relaxed);
+                    counters.transitions.lock().unwrap().push(serde_json::json!({
+                        "unix_s": unix_s(), "viewer": viewer,
+                        "share": share, "event": "paused", "reason": reason,
+                    }));
+                }
+                gwar_proto::Event::ScreenResumed { share, .. } => {
+                    counters.resumes.fetch_add(1, Ordering::Relaxed);
+                    counters.transitions.lock().unwrap().push(serde_json::json!({
+                        "unix_s": unix_s(), "viewer": viewer,
+                        "share": share, "event": "resumed",
+                    }));
+                }
+                _ => {}
             };
         }
         bail!("screen control connection closed")
@@ -513,12 +566,18 @@ async fn receiver(
 ) -> Result<()> {
     let mut ready = Some(ready);
     let mut buffer = vec![0; 2048];
+    let timing = &counters.receivers[viewer_index];
+    let mut processing = Instant::now();
+    let heartbeat = Duration::from_millis(5);
+    let mut check = processing + heartbeat;
     loop {
         let deadline = loop {
             match rtc.poll_output()? {
                 Output::Timeout(at) => break at,
                 Output::Transmit(t) => {
-                    let _ = socket.try_send_to(&t.contents, t.destination);
+                    if socket.try_send_to(&t.contents, t.destination).is_err() {
+                        timing.send_errors.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
                 Output::Event(Event::Connected) => {
                     if let Some(ready) = ready.take() {
@@ -533,13 +592,25 @@ async fn receiver(
                 Output::Event(_) => {}
             }
         };
-        tokio::select! {
-            got = socket.recv_from(&mut buffer) => {
-                let (n, source) = got?;
-                let Ok(contents) = buffer[..n].try_into() else { continue };
-                rtc.handle_input(Input::Receive(Instant::now(), Receive { proto: Protocol::Udp, source, destination: local, contents }))?;
+        timing.processing_max_us.fetch_max(processing.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let wake = deadline.min(check).max(Instant::now());
+        let got = tokio::select! {
+            got = socket.recv_from(&mut buffer) => Some(got?),
+            _ = tokio::time::sleep_until(wake.into()) => None,
+        };
+        processing = Instant::now();
+        timing.wake(wake, processing);
+        if processing >= check {
+            check = processing + heartbeat;
+        }
+        if let Some((n, source)) = got {
+            timing.datagrams.fetch_add(1, Ordering::Relaxed);
+            if let Ok(contents) = buffer[..n].try_into() {
+                rtc.handle_input(Input::Receive(
+                    processing,
+                    Receive { proto: Protocol::Udp, source, destination: local, contents },
+                ))?;
             }
-            _ = tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(50)).into()) => {}
         }
         rtc.handle_input(Input::Timeout(Instant::now()))?;
     }

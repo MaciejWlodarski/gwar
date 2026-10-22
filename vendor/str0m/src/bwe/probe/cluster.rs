@@ -263,13 +263,15 @@ impl ProbeClusterState {
             return None;
         }
 
-        // Mark that we've created padding for this instant
+        // Include scheduler lateness in this burst's byte budget. A fixed min_probe_delta
+        // budget would cap the actual rate when the caller wakes less frequently.
+        let burst_duration = if self.last_padding_at < self.started_at.unwrap() {
+            self.config.min_probe_delta()
+        } else {
+            now.saturating_duration_since(self.last_padding_at)
+        };
         self.last_padding_at = now;
-
-        // It's time to send a new probe burst.
-        // Calculate recommended probe size as target_bitrate * min_probe_delta.
-        let min_delta = self.config.min_probe_delta();
-        let recommended_probe_size = self.config.target_bitrate * min_delta;
+        let recommended_probe_size = self.config.target_bitrate * burst_duration;
 
         // Ensure we request at least one padding packet worth of bytes even if min_delta is 0.
         let recommended_probe_size = DataSize::bytes(cmp::max(
@@ -322,6 +324,23 @@ impl ProbeClusterState {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn late_probe_wakes_catch_up_without_exceeding_the_cluster_budget() {
+        let now = Instant::now();
+        let config = ProbeClusterConfig::new(0.into(), Bitrate::mbps(10), ProbeKind::Initial);
+        let mut state = ProbeClusterState::new(config);
+        let first = state.next_packet(now).unwrap();
+        state.record_packet(now, first);
+        let late = now + Duration::from_millis(10);
+        let burst = state.next_packet(late).unwrap();
+        assert_eq!(burst, Bitrate::mbps(10) * Duration::from_millis(10));
+        state.record_packet(late, burst);
+        let later = late + Duration::from_millis(10);
+        let last = state.next_packet(later).unwrap();
+        assert_eq!(first + burst + last, config.target_bytes());
+        assert!(state.next_packet(later).is_none(), "one burst per wake");
+    }
 
     #[test]
     fn low_rate_padding_reaches_minimum_packet_count() {

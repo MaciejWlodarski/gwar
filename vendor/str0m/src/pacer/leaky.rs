@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use super::Pacer;
 use super::PaddingRequest;
-use super::QueueState;
+use super::{QueuePriority, QueueState};
 use crate::Reason;
 use crate::bwe_::ProbeClusterConfig;
 use crate::bwe_::ProbeClusterState;
@@ -288,7 +288,14 @@ impl LeakyBucketPacer {
                 // Check if we're actively probing and should use probe-specific timing
                 let poll_at = if let Some(probe) = self.probe_queue.front() {
                     // During probe: use absolute time directly from probe state
-                    (probe.next_probe_time(), PacerReason::Probe1)
+                    // min_probe_delta separates padding bursts, not their individual
+                    // packets. Drain the already generated burst before waiting again.
+                    let at = if queue.snapshot.priority == QueuePriority::Padding {
+                        now
+                    } else {
+                        probe.next_probe_time()
+                    };
+                    (at, PacerReason::Probe1)
                 } else {
                     // Normal pacing: use relative offset based on debt
                     let drain_debt_time = self.media_debt / self.adjusted_bitrate;
@@ -464,13 +471,10 @@ impl LeakyBucketPacer {
     }
 
     fn request_immediate_timeout(&mut self) {
-        // Request timeout at the next microsecond to ensure time advances between packets.
-        // We can't use already_happened() because that would cause the test harness to
-        // set a very old timestamp, and while lib.rs prevents last_now from going backwards,
-        // it doesn't force it to advance, so all packets would get the same timestamp.
-        const MINIMAL_DELTA: Duration = Duration::from_micros(1);
-
-        let Some(time) = self.last_handle_time.map(|t| t + MINIMAL_DELTA) else {
+        // Re-enter at the current clock value. next_poll and next_packet decide when
+        // a burst has spent its budget; a timer between every packet prevents both
+        // generated padding and application-paced media from draining as a burst.
+        let Some(time) = self.last_handle_time else {
             self.next_poll_time = None;
             return;
         };
@@ -481,7 +485,7 @@ impl LeakyBucketPacer {
 
 #[cfg(test)]
 mod test {
-    use super::super::{QueuePriority, QueueSnapshot};
+    use super::super::QueueSnapshot;
     use super::*;
     use crate::rtp_::{DataSize, Mid, RtpHeader};
     use queue::{PacketKind, Queue, QueuedPacket};
@@ -520,6 +524,88 @@ mod test {
             pacer
                 .handle_timeout(deadline, std::iter::once(queue))
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn unpaced_media_drains_without_a_timer_per_packet() {
+        let now = Instant::now();
+        let mut pacer = LeakyBucketPacer::new(Bitrate::mbps(10));
+        let mut queue = QueueState {
+            midrid: MidRid("video".into(), None),
+            unpaced: true,
+            use_for_padding: false,
+            snapshot: QueueSnapshot {
+                created_at: now,
+                packet_count: 3,
+                byte_size: 3600,
+                first_unsent: Some(now),
+                priority: QueuePriority::Media,
+                ..Default::default()
+            },
+        };
+        pacer.handle_timeout(now, std::iter::once(queue));
+        for remaining in (0..3).rev() {
+            let (midrid, cluster) = pacer.poll_queue().unwrap();
+            assert!(cluster.is_none());
+            pacer.register_send(now, 1200usize.into(), midrid);
+            assert!(pacer.poll_timeout().0.unwrap() <= now);
+            queue.snapshot.packet_count = remaining;
+            queue.snapshot.byte_size = remaining as usize * 1200;
+            queue.snapshot.first_unsent = (remaining > 0).then_some(now);
+            pacer.handle_timeout(now, std::iter::once(queue));
+        }
+        assert!(pacer.poll_queue().is_none());
+    }
+
+    #[test]
+    fn probe_padding_burst_drains_without_a_timer_per_packet() {
+        use crate::bwe_::ProbeKind;
+
+        let now = Instant::now();
+        let mut pacer = LeakyBucketPacer::new(Bitrate::mbps(10));
+        let mut queue = QueueState {
+            midrid: MidRid("probe".into(), None),
+            unpaced: false,
+            use_for_padding: true,
+            snapshot: QueueSnapshot {
+                created_at: now,
+                ..Default::default()
+            },
+        };
+        pacer.handle_timeout(now, std::iter::once(queue));
+        pacer.start_probe(ProbeClusterConfig::new(
+            0.into(),
+            Bitrate::mbps(10),
+            ProbeKind::Initial,
+        ));
+        let request = pacer.handle_timeout(now, std::iter::once(queue)).unwrap();
+        assert!(
+            request.padding > 240,
+            "one burst contains several blank padding packets"
+        );
+        let mut remaining = request.padding;
+        while remaining > 0 {
+            let (midrid, cluster) = pacer
+                .poll_queue()
+                .expect("generated padding is immediately sendable");
+            assert_eq!(cluster, Some(0.into()));
+            let size = remaining.min(240);
+            remaining -= size;
+            pacer.register_send(now, size.into(), midrid);
+            assert!(
+                pacer.poll_timeout().0.unwrap() <= now,
+                "no OS timer between packets of a burst"
+            );
+            queue.snapshot.byte_size = remaining;
+            queue.snapshot.packet_count = remaining.div_ceil(240) as u32;
+            queue.snapshot.update_priority(QueuePriority::Padding);
+            assert!(pacer.handle_timeout(now, std::iter::once(queue)).is_none());
+        }
+        assert!(pacer.poll_queue().is_none());
+        assert!(
+            pacer.poll_timeout().0.unwrap() >= now + Duration::from_millis(2),
+            "space the next burst"
         );
     }
 
