@@ -112,7 +112,7 @@ function readBarcode(video) {
 }
 
 /** Per device: a synthetic microphone, the barcode reader and, for canvas sharers, the capture hook. */
-function devicePatch({ frequency, canvasId, size }, stamp, read) {
+function devicePatch({ frequency, sources }, stamp, read) {
   window.__readBarcode = read;
   // Every peer connection, for the RTP diagnostics a failure prints.
   window.__pcs = [];
@@ -131,14 +131,17 @@ function devicePatch({ frequency, canvasId, size }, stamp, read) {
     return destination.stream;
   };
   media.enumerateDevices = async () => [];
-  if (canvasId !== null) {
-    // The test hook: what the picker would return, a canvas with the stamped barcode.
+  if (sources.length) {
+    // The test hook: what the picker would return, a canvas with the stamped barcode. Each share
+    // takes the next source, so a share that follows another is told apart by its frames.
+    let next = 0;
     media.getDisplayMedia = async () => {
+      const { id, size } = sources[Math.min(next++, sources.length - 1)];
       const canvas = document.createElement("canvas");
       [canvas.width, canvas.height] = size;
       canvas.style.cssText = "position:fixed;left:0;bottom:0;width:64px;height:36px;opacity:0.02;pointer-events:none;z-index:-1";
       document.body.appendChild(canvas);
-      stamp(canvas, canvasId);
+      stamp(canvas, id);
       return canvas.captureStream(20);
     };
   }
@@ -172,8 +175,8 @@ const errors = page => page.errors.filter(e => !/Conversation synchronization|fa
 async function device(browser, web, server, name, { canvasId = null, frequency = 440 } = {}) {
   const context = await browser.newContext({ locale: "en-US", viewport: { width: 1440, height: 900 } });
   await context.route("**/*", route => (new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort()));
-  const size = canvasId === null ? null : SOURCE_SIZES[canvasId];
-  await context.addInitScript({ content: `(${devicePatch})(${JSON.stringify({ frequency, canvasId, size })}, ${stampBarcode}, ${readBarcode})` });
+  const sources = (canvasId === null ? [] : [canvasId].flat()).map(id => ({ id, size: SOURCE_SIZES[id] }));
+  await context.addInitScript({ content: `(${devicePatch})(${JSON.stringify({ frequency, sources })}, ${stampBarcode}, ${readBarcode})` });
   const page = await context.newPage();
   page.errors = [];
   page.on("pageerror", e => page.errors.push(String(e)));
@@ -262,9 +265,10 @@ const paintsUnreliably = page => page.engine === "webkit" && process.platform ==
 /**
  * Each source's frame size, all of different shapes: a decoded frame's aspect ratio names the
  * source even where no pixel can be read (and survives the encoder scaling it down). Source 1 is
- * the Chromium tab, whose page has the context's 1440×900 viewport, or a canvas of that size.
+ * the Chromium tab, whose page has the context's 1440×900 viewport, or a canvas of that size;
+ * source 6 is the restarting sharer's second share.
  */
-const SOURCE_SIZES = { 1: [1440, 900], 2: [640, 360], 3: [640, 480], 4: [480, 480], 5: [600, 400] };
+const SOURCE_SIZES = { 1: [1440, 900], 2: [640, 360], 3: [640, 480], 4: [480, 480], 5: [600, 400], 6: [560, 400] };
 function fromSource(id, width, height, what) {
   const [w, h] = SOURCE_SIZES[id];
   assert.ok(Math.abs(width / height - w / h) < 0.03, `${what}: a ${width}x${height} frame is not source ${id}'s ${w}x${h}`);
@@ -359,7 +363,7 @@ async function run(browsers, web, server, token) {
   await bar(ws).getByText("2 watching").waitFor({ timeout: 10_000 });
 
   // Start → stop → start while watching two other shares: the watch transport is untouched.
-  const c3 = await device(engine("chromium"), web, server, "c3-restart", { frequency: 700, canvasId: 3 });
+  const c3 = await device(engine("chromium"), web, server, "c3-restart", { frequency: 700, canvasId: [3, 6] });
   await join(c3, channels.stage);
   await watch(c3, "cs-tab");
   await sees(c3, csShare, 1, "restarting sharer watches the tab share");
@@ -374,7 +378,8 @@ async function run(browsers, web, server, token) {
   const second = await share(c3, "Sharing your screen");
   assert.notEqual(second, first, "a new share gets a new id");
   await watch(cv, "c3-restart");
-  await sees(cv, second, 3, "second share of the restarting sharer");
+  // The second share has its own source (6, another shape): its frames cannot be the first's.
+  await sees(cv, second, 6, "second share of the restarting sharer");
   await sees(c3, csShare, 1, "still watching the tab share after start → stop → start");
   await sees(c3, wsShare, 2, "still watching the canvas share after start → stop → start");
   assert.deepEqual(await session(c3, (_, screen) => screen.transport), transport, "the watch transport stayed the same");

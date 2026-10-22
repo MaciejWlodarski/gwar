@@ -1736,7 +1736,11 @@ badge, stage). Decisions taken while building it, where this design left room:
   never taken for a later one's. Only the answer to a watch's own
   `screen.watch` makes it a watch (`screen.slot` events only record the slot).
   A request whose watch was stopped, or whose transport was replaced, stops
-  before its next step; a slot granted to it anyway is released.
+  before its next step; a slot granted to it anyway is released. Retiring a
+  watch transport that never connected (a reset or reconnect mid-negotiation)
+  settles whoever waits for it, and a reset starts the queues afresh: an
+  earlier session's requests settle without sending anything and hold up
+  nothing of the next.
 - **`screen.paused` / `screen.resumed`** arrive with PR 3b; the stage does not
   show "Your connection is too slow" yet.
 - **The stage** shows the share in focus, then every other watched share and
@@ -1757,7 +1761,7 @@ badge, stage). Decisions taken while building it, where this design left room:
   receiver's decoded frames instead of the barcode; the macOS runs read every
   barcode in both engines, and on Linux Chromium viewers read the WebKit
   sharer's barcode. Every source has a frame of its own shape (16:10, 16:9,
-  4:3, 1:1, 3:2), and each viewer checks the decoded aspect ratio of the slot
+  4:3, 1:1, 3:2, and 1.4:1 for the restarting sharer's second share), and each viewer checks the decoded aspect ratio of the slot
   the app holds for that share: that ties the slot to its sharer even where no
   pixel can be read. Pixels cannot be read there: WebKit has no
   `MediaStreamTrackProcessor`, and `VideoFrame` and `requestVideoFrameCallback`

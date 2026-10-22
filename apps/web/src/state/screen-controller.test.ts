@@ -237,6 +237,50 @@ describe("watch requests (review round 1)", () => {
   });
 });
 
+describe("watch requests across a reset (review round 2)", () => {
+  it("a reset before the watch transport connects never blocks watching the same share again", async () => {
+    const { link, calls } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => ({ slot: 0 }) });
+    const screen = new ScreenController(() => link, String);
+    const first = screen.watch("A");
+    await flush();
+    expect(calls.map(([op]) => op)).toEqual(["screen.watch.offer"]);
+    // Answered, not connected yet; then the session resets (as on a reconnect).
+    screen.reset();
+    await first;
+    const again = screen.watch("A");
+    await flush();
+    media.transports[1]!.params.state("connected");
+    await vi.advanceTimersByTimeAsync(100);
+    await again;
+    expect(calls.map(([op]) => op)).toEqual(["screen.watch.offer", "screen.watch.offer", "screen.watch", "screen.focus"]);
+    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 0, status: "watching" }]);
+  });
+
+  it("requests of the old session send nothing on the new one, and do not hold it up", async () => {
+    const old = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => { throw new RequestError("unavailable", "connect a watch transport first"); } });
+    const fresh = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => ({ slot: 2 }) });
+    let current = old.link;
+    const screen = new ScreenController(() => current, String);
+    const first = screen.watch("A");
+    await flush();
+    media.transports[0]!.params.state("connected");
+    await vi.advanceTimersByTimeAsync(100);
+    const stopping = screen.unwatch("A");
+    // The session is replaced while the first watch is still retrying and its release is queued.
+    screen.reset();
+    current = fresh.link;
+    const again = screen.watch("A");
+    await flush();
+    media.transports[1]!.params.state("connected");
+    await vi.advanceTimersByTimeAsync(6_000);
+    await Promise.all([first, stopping, again]);
+    expect(old.ops().filter(op => op === "screen.watch").length).toBeLessThanOrEqual(1);
+    expect(old.ops()).not.toContain("screen.unwatch");
+    expect(fresh.ops()).toEqual(["screen.watch.offer", "screen.watch", "screen.focus"]);
+    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 2, status: "watching" }]);
+  });
+});
+
 describe("sharing", () => {
   const track = () => ({ stop: vi.fn(), addEventListener: vi.fn(), getSettings: () => ({ displaySurface: "browser" }) });
   const choosing = (t = track()) => {

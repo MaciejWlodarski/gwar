@@ -50,6 +50,10 @@ export class ScreenController {
   private watchIds = 0;
   /** Each share's watch requests, one at a time. */
   private readonly chains = new Map<string, Promise<void>>();
+  /** Settles the pending wait for the current watch transport, if it never connected. */
+  private retireReady: (() => void) | null = null;
+  /** Bumped by `reset`: a request of an earlier session never goes out in a later one. */
+  private generation = 0;
   /** Watches whose slot the server freed, until `screen.stopped` says why. */
   private readonly released = new Map<string, { onStage: boolean }>();
   private initialised = false;
@@ -227,8 +231,9 @@ export class ScreenController {
     if (s.channels[info.channel]?.encrypted) { useUi.getState().toast("info", tNow("screen.encryptedSoon")); return; }
     if (useScreen.getState().watches.some(w => w.share === share)) { this.focus(share); return; }
     const id = ++this.watchIds;
+    const generation = this.generation;
     dispatch({ type: "watch", share, id });
-    const alive = () => this.link() === conn && useScreen.getState().watches.some(w => w.id === id);
+    const alive = () => this.generation === generation && this.link() === conn && useScreen.getState().watches.some(w => w.id === id);
     await this.serial(share, async () => {
       try {
         if (!alive()) return;
@@ -290,7 +295,12 @@ export class ScreenController {
     const next = useScreen.getState().stage;
     if (next && conn) void conn.request("screen.focus", { share: next }).catch(() => {});
     // After the watch's own request, so the release cannot overtake the grant it releases.
-    if (conn) await this.serial(share, async () => { await conn.request("screen.unwatch", { share }).catch(() => {}); });
+    const generation = this.generation;
+    if (conn) {
+      await this.serial(share, async () => {
+        if (this.generation === generation && this.link() === conn) await conn.request("screen.unwatch", { share }).catch(() => {});
+      });
+    }
   }
 
   /** Puts a watched share on the stage: it gets the first claim on my bandwidth. */
@@ -312,7 +322,7 @@ export class ScreenController {
   private ensureTransport(conn: Link): Promise<number> {
     const phase = useScreen.getState().transport.phase;
     if (this.transport && this.transportReady && (phase === "connecting" || phase === "connected")) return this.transportReady;
-    this.transport?.close();
+    this.dropTransport();
     const run = nextMediaRun();
     let settle!: { resolve: (run: number) => void; reject: (e: unknown) => void };
     const ready = new Promise<number>((resolve, reject) => { settle = { resolve, reject }; });
@@ -340,15 +350,23 @@ export class ScreenController {
     });
     this.transport = transport;
     this.transportReady = ready;
+    this.retireReady = () => settle.reject(new Error("the watch transport was replaced"));
     dispatch({ type: "transport", run, phase: "connecting" });
     transport.start().catch((e: unknown) => { if (this.transport === transport) fail(e); });
     return ready;
   }
 
+  /**
+   * Closes the watch transport. Whoever still waits for it to connect is told now: closing
+   * also cancels its connection timeout, so nothing else would ever settle that wait.
+   */
   private dropTransport(): void {
     this.transport?.close();
     this.transport = null;
     this.transportReady = null;
+    const retire = this.retireReady;
+    this.retireReady = null;
+    retire?.();
   }
 
   // ------------------------------------------------------------------- events
@@ -411,6 +429,10 @@ export class ScreenController {
   reset(): void {
     this.endOwn();
     this.attempts++;
+    // Requests of the old session settle on their own (their transport is retired below, their
+    // link is gone) and send nothing more; the new session's do not wait behind them.
+    this.generation++;
+    this.chains.clear();
     this.released.clear();
     this.dropTransport();
     dispatch({ type: "reset" });
