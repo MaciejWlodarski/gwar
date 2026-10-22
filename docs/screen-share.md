@@ -483,8 +483,8 @@ datagrams reach the screen task without slowing voice down.
 - **On a viewer's downlink** the SFU's per-viewer allocation (below) never
   plans more than 80 % of the viewer's estimate. Voice is about 32–40 kbps per
   speaker and fits in the remainder.
-- **PR 3b acceptance compares voice with and without video,** paired runs, using
-  the `latency` example and `LATENCY_NET` relay from docs/latency.md:
+- **PR 3b acceptance calibrates voice under screen load against A/A on the same
+  host**, using the `latency` example and `LATENCY_NET` relay from docs/latency.md:
   - The relay gets a `rate=` bottleneck option with a bounded queue. The
     example gets a screen load generator: a str0m frame-mode client publishing
     synthetic VP9-sized frames at a preset's rate, through the same relay, and
@@ -493,13 +493,12 @@ datagrams reach the screen task without slowing voice down.
     viewers; a 10 Mbps sharer uplink with an 8 Mbps share; a 5 Mbps viewer
     downlink watching two 4 Mbps shares; each also with 1 % loss.
   - Report voice p50/p95/p99 mouth-to-ear, lost and late frames, playout
-    underruns and concealment, as the latency docs do. Ten pairs, alternating
-    order.
-  - Gate: unconstrained, voice p95 and p99 within 2 ms of the paired baseline
-    and no extra underruns. Constrained, voice p99 within 20 ms of baseline and
-    underruns within baseline + 0.5 %. Missing the gate blocks PR 3b until the
-    isolation is changed (own thread, separate port or a lower video
-    allocation).
+    underruns and concealment, as the latency docs do. Eight pairs **per set**
+    and 100 markers per run by default; A/A and screen sets are interleaved.
+  - Gate: each screen-set metric must be no worse than the same A/A metric
+    plus the tolerance defined below. Missing the calibrated gate blocks PR
+    3b until the isolation is changed (own thread, separate port or a lower
+    video allocation).
 
 **VM gate follow-up (`07e2f24`).** The supplied samples show viewer 0
 stopping near 15 s while the other four sustain 8.54 Mbps. That run logged
@@ -554,22 +553,122 @@ downlink-loss, 3.08 Mbps still active, p99 delta
 and screen runs. The final startup-stall replay kept every viewer at
 7.81 Mbps with zero pauses despite 13.78 ms maximum
 receive wake lateness; the original replay paused two viewers permanently.
-These shortened local runs do not replace the full ten-pair VM gate or its
-CPU scaling measurement. No deployment service or VM was contacted.
+These shortened local runs do not replace the calibrated six-scenario VM
+gate or its CPU scaling measurement. No deployment service or VM was contacted.
 
 **As built in PR 3b** (docs/latency.md, "Screen load"; `scripts/latency/screen_gate.py`):
 
-- The gate compares the **median of the per-pair deltas** (screen − baseline)
-  and fails if more than **one of ten pairs** exceeds any applicable per-pair
-  latency/underrun threshold. Shortened runs allow `floor(pairs / 10)` such
-  pairs, so a median cannot hide intermittent starvation.
-  "No extra underruns" is the screen runs' total against the baselines';
-  the constrained underrun figure is underrun samples over samples played,
-  in percentage points.
+**Owner-approved A/A calibration.** On the Oracle aarch64 deployment host
+(4 vCPU), the supplied `89dacfe` unconstrained A/A set (ten pairs, 100 markers)
+missed every old absolute rule with no video in either arm: median p95/p99
+deltas +5.567/+4.849 ms, six tail pairs, and 3 → 8 underruns. Individual
+latency deltas ranged from about −37 to +41 ms; playout underruns introduced
+steps of about 14.6 ms. The supplied `a4c76a1` screen set was better:
++0.009/+0.151 ms, two tails, and 1 → 2 underruns. These historical sets motivate
+calibration; they are different revisions and separate invocations, so they
+are **not** a calibrated acceptance result. Artifacts remain in
+`/tmp/gwar-gate-aa-89dacfe/` and `/tmp/gwar-gate-a4c76a1/`.
+
+- Each scenario collects two equal-sized sets in **one invocation of the same
+  binary on the same host**. A/A has no video in either arm; the screen set
+  has a baseline without video and a second arm with the scenario's load.
+  Both use the same pair-index seeds, voice impairment roles, 15 s warm-up,
+  marker count and alternating arm order. The second A/A arm retains the
+  artifact label `screen`; its set name is `aa` and its screen metadata is null.
+- One block contains four fresh processes: for even zero-based pair indices,
+  `aa/baseline → aa/screen → screen/baseline → screen/screen`; odd blocks
+  reverse both set order and arm order. The four runs share seed `index + 1`.
+  Thus matched sets are adjacent and slow host drift has balanced order over
+  each two blocks. Even pair counts are recommended for balance. Sets never
+  run concurrently and there is no retry, outlier removal or seed selection.
+- For each set, compute signed per-pair deltas (second arm − baseline), then
+  their medians for p95, p99 and underrun fraction. Underrun fraction is
+  underrun samples / samples played over the harness's full run, including
+  warm-up, identically in both sets. Also compute **total underrun excess**:
+  sum of second-arm underrun counts minus sum of baseline counts. Negative
+  A/A metrics remain signed; no absolute value, clipping to zero, or borrowing
+  a calibration from a different scenario or invocation is permitted.
+- **Unconstrained:** screen median p95 delta ≤ A/A median p95 delta + **2 ms**;
+  likewise p99; screen total underrun excess ≤ A/A total underrun excess
+  (**zero** extra-count tolerance).
+- **Constrained:** screen median p99 delta ≤ A/A median p99 delta + **20 ms**;
+  screen median underrun-fraction delta ≤ A/A median fraction delta +
+  **0.005** (0.5 percentage points, not 0.5 percent relative).
+- **Both:** screen tail-pair count ≤ A/A tail-pair count + `floor(N / 10)`.
+  A tail pair exceeds any original absolute per-pair rule: unconstrained,
+  p95 or p99 delta > 2 ms or any excess underrun count; constrained, p99
+  delta > 20 ms or fraction delta > 0.005. Count the union once per pair.
+  At eight pairs there are **zero additional tails** above A/A; at ten, one.
+  This keeps intermittent starvation visible even when the median is unchanged.
+  All applicable comparisons must pass; equality passes. Median latency is
+  still reported as a diagnostic, without a separate gate.
+
+**Statistical interpretation.** This deliberately uses a deterministic
+comparison of descriptive metrics, rather than a bootstrap/permutation
+p-value. Eight or ten pairs and rare underrun steps provide little information
+about the tail distribution; a bootstrap cannot recover unseen steps, while
+"no significant difference" in a low-power test would not establish that a
+regression is within tolerance. An upper confidence bound for noninferiority
+would be preferable for a powered experiment, but at this sample size it
+would often be inconclusive even for A/A. The chosen rule implements the
+owner's empirical noise allowance without presenting it as 95% confidence.
+
+It reduces false failures from host noise already visible in interleaved A/A.
+Finite-sample differences can still falsely fail two equivalent sets,
+especially signed underrun counts with zero tolerance. Conversely, unusually
+bad A/A can mask a real screen regression, and eight pairs can miss rare
+starvation. Interleaving and balanced seeds/order reduce drift bias; the
+separate tail/count checks catch regressions a median hides. They do not
+remove sampling uncertainty or establish an absolute latency bound. Preserve
+both sets and every failed run, investigate suspicious calibration, and do
+not rerun selectively until a pass. `--null` collects two interleaved A/A
+sets for repeatability diagnosis; it cannot establish acceptance under load.
+
+**Output and VM command.** `summary.json` records `sets.aa` and `sets.screen`
+side by side within every scenario: all pairs, median deltas, arm underrun
+totals, underrun excess and tail count. `comparison` lists A/A, screen,
+tolerance, limit, screen-minus-A/A and pass for each applicable metric;
+`checks` and `pass` give the scenario verdict. `execution_order` pins seeds
+and ordering; each set has its own manifest, CSVs, JSON and logs in
+`<scenario>/aa/` or `<scenario>/screen/`. Run/load errors are recorded and
+leave the overall verdict false.
+
+From the checked-out PR head at the repository root on an otherwise idle VM:
+
+```sh
+export CARGO_BUILD_JOBS=4
+export CARGO_TARGET_DIR="$PWD/target"
+cargo build --release -p gwar-client --example latency
+python3 -B -m unittest discover -s scripts/latency -p 'test_*.py'
+python3 -B scripts/latency/screen_gate.py \
+  --binary target/release/examples/latency --pairs 8 --markers 100 \
+  --out "/tmp/gwar-gate-calibrated-$(git rev-parse --short HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+The example embeds a fresh loopback server; a standalone server build is not
+needed for this command. Do not add `--null`. All six scenarios run by default.
+On a 4-vCPU host, ten pairs **per set** means 240 processes. The measurement
+window is `1 + 15 + 0.25 × markers + 2` seconds = **43 s** at 100 markers:
+**2 h 52 min** before setup/teardown, about **3.2 h** allowing five seconds
+per process for startup, connections and shutdown. The recommended/default
+**eight pairs per set** means 192 processes, **2 h 18 min** of measurement,
+about **2.56 h (2 h 34 min)** with the same allowance. These are planning
+estimates, not measured timings on this head; build time is additional and
+host scheduling can extend them. Reducing pairs by 20% preserves even order
+balance and 100-marker p95/p99 sampling, with 800 markers per arm/set/scenario;
+it weakens rare-event coverage. Using fewer than 100 markers would make p99
+still more dependent on the maximum marker, so the marker count stays 100.
+Set `--pairs 10` for the longer run if the VM time budget permits.
+
+**Load validity and diagnostics:**
+
 - Every screen run must report the expected load spec and every expected viewer
   must receive at least 60 % of the scenario's intended steady media rate
   (8 Mbps for unconstrained/uplink; one 3 Mbps share for downlink), over at
-  least one settled second. A missing, failed or quiet load fails the run.
+  least one settled second. Unconstrained runs must also report **zero pauses**,
+  including startup; even a resumed pause fails. Missing pause metadata fails.
+  A missing, failed or quiet load fails the run; load-task errors propagate
+  through the example's nonzero exit and are never calibrated away.
 - Voice sender/receiver have explicit relay roles: both plaintext and encrypted
   voice rewrite their SDP answer candidates to the role's UDP endpoint. Shared
   seeds select the same voice impairment streams even when screen flows arrive
@@ -600,7 +699,8 @@ CPU scaling measurement. No deployment service or VM was contacted.
 - The load runs on its own runtime and the relay on its own thread: on the
   example's shared two-thread runtime, the relay forwarding 45 Mbps added
   30–90 ms to the voice beside it, which is the harness and not the network.
-- **Local results** (2026-10-22, Apple silicon laptop with 10 cores, shared
+- **Historical results under the old absolute rule** (2026-10-22, Apple
+  silicon laptop with 10 cores, shared
   with other agents' builds, load average 4–7; 60 markers a run after a 15 s
   warm-up). Median per-pair deltas in ms (median / p95 / p99), underruns
   baseline → screen:
@@ -625,9 +725,9 @@ CPU scaling measurement. No deployment service or VM was contacted.
   link. Eight further single runs with tracing, and three with the failing
   pair's seed, did not reproduce it. Without the outliers the downlink
   scenarios cost voice about +10–20 ms median and a few ms at p95/p99.
-- **Left for the VM:** the full ten-pair run, which decides the gate, on a
-  host that runs nothing else. If the outlier mode shows there, the next
-  step is the isolation the gate names: the screen task on its own thread,
+- **Left for the VM:** the calibrated six-scenario run above, which decides
+  the gate, on a host that runs nothing else. If the outlier mode shows there,
+  the next step is the isolation the gate names: the screen task on its own thread,
   off the runtime that carries voice. Round 1 adds relay lateness instrumentation;
   it does not diagnose the outlier. Static inspection found no clear, cheap
   blocking operation to remove from the SFU screen loop, so isolation remains

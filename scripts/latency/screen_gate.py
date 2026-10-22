@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
 """Screen-sharing acceptance for voice (docs/screen-share.md, "Voice headroom and acceptance").
 
-Paired runs of the latency example, without and with a LATENCY_SCREEN load, alternating
-which goes first, per scenario. Each pair shares its LATENCY_NET seed. The gate compares
-the median of the per-pair deltas and allows at most one threshold violation per ten
-pairs (zero for a shortened run of fewer than ten pairs):
+Each scenario interleaves A/A pairs (both arms without screen) and screen pairs (baseline
+without screen, second arm with LATENCY_SCREEN). A four-run block shares its LATENCY_NET
+seed. Both set order and arm order reverse in alternate blocks. Each screen-set metric
+must be <= its A/A counterpart plus the tolerance:
 
-- unconstrained (no rate limit): p95 and p99 within 2 ms of the baseline, and no more
-  playout underruns than the baseline in total;
-- constrained (a rate= bottleneck): p99 within 20 ms of the baseline, and the underrun
-  fraction (underrun samples / samples played) within 0.5 percentage points of it.
+- unconstrained: median per-pair p95/p99 deltas + 2 ms; total underrun excess + 0;
+- constrained: median per-pair p99 delta + 20 ms; median underrun-fraction delta + 0.5 pp;
+- both: tail-pair count + floor(pairs / 10), using the original absolute per-pair rules.
 
---null runs both arms without screen load to measure A/A noise, preserving pair seeds,
-alternation, warmup and every gate rule. The second arm retains the "screen" label.
-Exits 1 when a scenario misses the gate; summary.json has the numbers.
+This is an empirical comparison, not a statistical confidence claim. Eight pairs per set
+and 100 markers plan to about 2.6 hours for all six scenarios on a 4-vCPU host, excluding
+the build. --null also removes screen from the screen set: two interleaved A/A sets for
+diagnosing repeatability. It does not establish acceptance under load.
+Exits 1 when a scenario misses the gate or a run/load fails; summary.json has both sets.
 """
 
 import argparse
@@ -74,21 +75,12 @@ def playout(meta):
     }
 
 
-def gate(pairs, constrained):
+def metrics(pairs, constrained):
+    """Same descriptive metrics for each set; arm deltas remain signed, without clipping."""
     delta = {key: statistics.median(p["screen"][key] - p["baseline"][key] for p in pairs)
              for key in ("median_ms", "p95_ms", "p99_ms", "underrun_fraction")}
     underruns = {name: sum(p[name]["underruns"] for p in pairs) for name in ("baseline", "screen")}
-    if constrained:
-        checks = {
-            f"p99 within {CONSTRAINED_MS} ms": delta["p99_ms"] <= CONSTRAINED_MS,
-            "underruns within baseline + 0.5%": delta["underrun_fraction"] <= UNDERRUN_FRACTION,
-        }
-    else:
-        checks = {
-            f"p95 within {UNCONSTRAINED_MS} ms": delta["p95_ms"] <= UNCONSTRAINED_MS,
-            f"p99 within {UNCONSTRAINED_MS} ms": delta["p99_ms"] <= UNCONSTRAINED_MS,
-            "no extra underruns": underruns["screen"] <= underruns["baseline"],
-        }
+
     def regresses(pair):
         a, b = pair["baseline"], pair["screen"]
         if constrained:
@@ -98,10 +90,46 @@ def gate(pairs, constrained):
                 or b["p99_ms"] - a["p99_ms"] > UNCONSTRAINED_MS
                 or b["underruns"] > a["underruns"])
     tail_pairs = sum(regresses(p) for p in pairs)
-    allowed = len(pairs) // 10
-    checks[f"at most {allowed} regressing pairs"] = tail_pairs <= allowed
     return {"median_delta": delta, "underruns": underruns, "tail_pairs": tail_pairs,
-            "allowed_tail_pairs": allowed, "checks": checks, "pass": all(checks.values())}
+            "underrun_excess": underruns["screen"] - underruns["baseline"]}
+
+
+def gate(aa_pairs, screen_pairs, constrained):
+    """Compare equal-sized interleaved sets; never accept missing calibration."""
+    if not aa_pairs or len(aa_pairs) != len(screen_pairs):
+        raise ValueError("calibration needs equal, nonempty A/A and screen sets")
+    sets = {name: metrics(pairs, constrained) for name, pairs in
+            (("aa", aa_pairs), ("screen", screen_pairs))}
+    aa, screen = sets["aa"], sets["screen"]
+    tolerances = {"p99_ms": CONSTRAINED_MS if constrained else UNCONSTRAINED_MS}
+    if not constrained:
+        tolerances["p95_ms"] = UNCONSTRAINED_MS
+    tolerances["underrun_fraction" if constrained else "underrun_excess"] = UNDERRUN_FRACTION if constrained else 0
+    tolerances["tail_pairs"] = len(aa_pairs) // 10
+    comparison = {}
+    for metric, tolerance in tolerances.items():
+        a = aa[metric] if metric in aa else aa["median_delta"][metric]
+        s = screen[metric] if metric in screen else screen["median_delta"][metric]
+        limit = a + tolerance
+        comparison[metric] = {"aa": a, "screen": s, "tolerance": tolerance,
+                              "limit": limit, "screen_minus_aa": s - a, "pass": s <= limit}
+    checks = {metric: values["pass"] for metric, values in comparison.items()}
+    return {"sets": sets, "comparison": comparison, "checks": checks, "pass": all(checks.values())}
+
+
+def block_order(pair):
+    """Keep matched A/A and screen pairs adjacent and balance both orders over two blocks."""
+    sets = ("aa", "screen") if pair % 2 == 0 else ("screen", "aa")
+    arms = ("baseline", "screen") if pair % 2 == 0 else ("screen", "baseline")
+    return [(set_name, arm) for set_name in sets for arm in arms]
+
+
+def runtime_estimate(scenarios, pairs, markers):
+    """Planning estimate from latency.rs run_for; five seconds per run for setup/teardown."""
+    runs = scenarios * pairs * 4
+    measurement_s = 1 + WARMUP_MS / 1000 + markers * 0.25 + 2
+    return {"runs": runs, "measurement_seconds_per_run": measurement_s,
+            "setup_allowance_seconds_per_run": 5, "estimated_hours": runs * (measurement_s + 5) / 3600}
 
 
 def validate_load(meta, expected, constrained):
@@ -117,6 +145,8 @@ def validate_load(meta, expected, constrained):
         expected_fields[field] = int(expected_fields[field])
     if any(spec.get(key) != value for key, value in expected_fields.items()):
         raise RuntimeError("screen load fields differ from the expected spec")
+    if not constrained and load.get("pauses") != 0:
+        raise RuntimeError("unconstrained screen load must report zero pauses")
     # Downlink scenarios intentionally keep one of the two 3 Mbps shares running.
     active_shares = 1 if constrained else spec["shares"]
     minimum = spec["bitrate"] * active_shares / 1e6 * 0.6
@@ -144,59 +174,76 @@ def main():
     parser.add_argument("--binary", type=lambda v: variant(f"latency={v}")[1], required=True,
                         help="target/release/examples/latency")
     parser.add_argument("--scenario", choices=SCENARIOS, action="append", help="repeatable (default: all)")
-    parser.add_argument("--null", action="store_true", help="A/A noise measurement: no screen load in either arm; same gate rules")
-    parser.add_argument("--pairs", type=positive, default=10, help="pairs per scenario (default: 10)")
+    parser.add_argument("--null", action="store_true", help="diagnostic: both interleaved sets are A/A; no acceptance under load")
+    parser.add_argument("--pairs", type=positive, default=8, help="pairs PER SET per scenario (default: 8; four runs per pair index)")
     parser.add_argument("--markers", type=positive, default=100, help="markers per run (default: 100)")
     parser.add_argument("--minimum-latency-ms", type=minimum_latency, default=5.0)
     parser.add_argument("--out", type=Path, required=True, help="new output directory; never overwritten")
     args = parser.parse_args()
     install_signals()
     args.out.mkdir(parents=True, exist_ok=False)
-    summary = {"null": args.null, "pairs": args.pairs, "markers_per_run": args.markers, "warmup_ms": WARMUP_MS, "scenarios": {}}
+    summary = {"rule": "interleaved-aa-v1", "null": args.null, "pairs_per_set": args.pairs,
+               "markers_per_run": args.markers, "warmup_ms": WARMUP_MS,
+               "runtime_estimate": runtime_estimate(len(args.scenario or SCENARIOS), args.pairs, args.markers),
+               "scenarios": {}, "pass": False}
+    write_json(args.out / "summary.json", summary)
+    print(json.dumps({"runtime_estimate": summary["runtime_estimate"]}), flush=True)
     for name in args.scenario or list(SCENARIOS):
         net, screen, constrained = SCENARIOS[name]
-        if args.null:
-            screen = None
-        options = SimpleNamespace(
-            variant=[("baseline", args.binary), ("screen", args.binary)], runs=args.pairs,
-            markers=args.markers, minimum_latency_ms=args.minimum_latency_ms, extra_delay_ms=0,
-            out=args.out / name,
-        )
-        results = Results(options, "screen-gate", scenario=name, net=net, screen=screen, constrained=constrained, null=args.null)
-        pairs = []
+        sets = {set_name: {"pairs": []} for set_name in ("aa", "screen")}
+        scenario = {"net": net, "screen": None if args.null else screen, "constrained": constrained,
+                    "sets": sets, "execution_order": [], "pass": False}
+        summary["scenarios"][name] = scenario
+        results = {}
         try:
+            for set_name in sets:
+                options = SimpleNamespace(
+                    variant=[("baseline", args.binary), ("screen", args.binary)], runs=args.pairs,
+                    markers=args.markers, minimum_latency_ms=args.minimum_latency_ms, extra_delay_ms=0,
+                    out=args.out / name / set_name,
+                )
+                results[set_name] = Results(options, "screen-gate", scenario=name, set_name=set_name,
+                                            net=net, screen=screen if set_name == "screen" and not args.null else None,
+                                            constrained=constrained, null=args.null)
             for pair in range(args.pairs):
-                order = ("baseline", "screen") if pair % 2 == 0 else ("screen", "baseline")
-                figures = {}
-                for which in order:
-                    run = len(results.manifest["runs"]) + 1
-                    print(f"{name} pair {pair + 1}/{args.pairs}: {which}", flush=True)
-                    env = environment(options)
+                figures = {set_name: {} for set_name in sets}
+                for set_name, which in block_order(pair):
+                    result = results[set_name]
+                    run = len(result.manifest["runs"]) + 1
+                    loaded = set_name == "screen" and which == "screen" and not args.null
+                    print(f"{name} block {pair + 1}/{args.pairs}: {set_name}/{which}", flush=True)
+                    env = environment(result.args)
                     env.update(LATENCY_WAIT_CONNECTED="1", LATENCY_WARMUP_MS=str(WARMUP_MS))
                     env.setdefault("RUST_LOG", "gwar_server::media::screen=debug")
                     if net:
                         env["LATENCY_NET"] = f"seed={pair + 1};{net}"
-                    if which == "screen" and not args.null:
+                    if loaded:
                         env["LATENCY_SCREEN"] = screen
-                    path = results.path(run, which)
+                    path = result.path(run, which)
                     pid = run_client(args.binary, path, args.markers, env)
-                    results.accept(run, which, pid, pair=pair)
+                    result.accept(run, which, pid, pair=pair, seed=pair + 1)
                     meta = json.loads(Path(f"{path}.json").read_text())
-                    if args.null and meta.get("screen") is not None:
-                        raise RuntimeError("unexpected screen load in A/A run")
-                    load_check = validate_load(meta, screen, constrained) if which == "screen" and not args.null else None
-                    figures[which] = {**playout(meta), "screen": meta.get("screen"),
-                                      "load_check": load_check, "relay_timing": relay_timing(meta)}
-                pairs.append(figures)
-            results.finish()
+                    if not loaded and meta.get("screen") is not None:
+                        raise RuntimeError("unexpected screen load in no-load arm")
+                    load_check = validate_load(meta, screen, constrained) if loaded else None
+                    figures[set_name][which] = {**playout(meta), "screen": meta.get("screen"),
+                                               "load_check": load_check, "relay_timing": relay_timing(meta)}
+                    scenario["execution_order"].append({"pair": pair, "set": set_name, "arm": which, "seed": pair + 1})
+                for set_name in sets:
+                    sets[set_name]["pairs"].append(figures[set_name])
+                write_json(args.out / "summary.json", summary)
+            for result in results.values():
+                result.finish()
         except BaseException as error:
-            results.fail(error)
+            for result in results.values():
+                result.fail(error)
+            scenario["error"] = str(error) or type(error).__name__
+            write_json(args.out / "summary.json", summary)
             raise
-        verdict = gate(pairs, constrained)
-        verdict["relay_timing"] = {which: [p[which]["relay_timing"] for p in pairs]
-                                   for which in ("baseline", "screen")}
-        summary["scenarios"][name] = {"net": net, "screen": screen, "constrained": constrained,
-                                      "pairs": pairs, **verdict}
+        verdict = gate(sets["aa"]["pairs"], sets["screen"]["pairs"], constrained)
+        for set_name, values in verdict.pop("sets").items():
+            sets[set_name].update(values)
+        scenario.update(verdict)
         write_json(args.out / "summary.json", summary)
         print(json.dumps({name: verdict}, indent=2), flush=True)
     failed = [name for name, s in summary["scenarios"].items() if not s["pass"]]
