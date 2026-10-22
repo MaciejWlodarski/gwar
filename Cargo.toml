@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/desktop/src-tauri"]
-exclude = ["vendor/openmls", "vendor/tsclientlib"]
+exclude = ["vendor/tsclientlib"]
 
 [workspace.package]
 edition = "2024"
@@ -46,11 +46,6 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
-
-# 0.9.1 can resurrect a removed tail leaf when an external rejoin shrinks
-# and regrows the tree in one commit. See vendor/openmls/GWAR-PATCH.md.
-[patch.crates-io]
-openmls = { path = "vendor/openmls" }
 
 # tsclientlib connects to a download's file transfer itself, where Gwar can
 # neither time it out nor cancel it; the patch hands the offer over instead.

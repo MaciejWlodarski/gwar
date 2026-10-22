@@ -85,7 +85,7 @@ the web app.
 
 ### Building blocks
 
-- `openmls` 0.9.1, `openmls_rust_crypto` 0.6.0, `openmls_traits` 0.6.0,
+- `openmls` 0.9.2, `openmls_rust_crypto` 0.6.0, `openmls_traits` 0.6.0,
   pinned exactly. The wasm wrapper enables `openmls`' `js` feature and
   `getrandom` 0.2's `js` feature (`openmls_rust_crypto` reaches `getrandom`
   0.2 through `rand_core` 0.6); CI builds the wrapper with production
