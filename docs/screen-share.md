@@ -514,9 +514,12 @@ datagrams reach the screen task without slowing voice down.
   must receive at least 60 % of the scenario's intended steady media rate
   (8 Mbps for unconstrained/uplink; one 3 Mbps share for downlink), over at
   least one settled second. A missing, failed or quiet load fails the run.
-- Voice sender/receiver have explicit relay roles, so shared seeds select the
-  same voice impairment streams even when screen flows arrive first. The
-  shared bottleneck still intentionally couples queueing across flows.
+- Voice sender/receiver have explicit relay roles: both plaintext and encrypted
+  voice rewrite their SDP answer candidates to the role's UDP endpoint. Shared
+  seeds select the same voice impairment streams even when screen flows arrive
+  first. The relay reports the seeds actually installed on each flow; a real
+  voice/relay/screen integration regression pins them. The shared bottleneck
+  still intentionally couples queueing across flows.
 - The gate output reports `queue_max_ms`, `scheduling_lateness_max_ms` (actual
   relay send minus scheduled release) and `scheduling_late_over_5ms`, separately
   for each direction and run. Queue residence excludes relay/runtime lateness.
@@ -856,6 +859,11 @@ traffic, with bursts bounded by the sum of the originals and extras bursts. RFC 
 this: originals and retransmissions counted together. Voice runs on a
 separate transport and keeps the remaining 10 %.
 
+Pending BWE events are drained before originals leave the Gwar queue. If an
+original is still rejected by the socket bucket after release, its lane is
+cleared and its stream wiped, its keyframe is counted as failed when applicable,
+and recovery enters the existing viewer budget and publisher throttle.
+
 **When the extras bucket is empty,** the datagram is **dropped at the socket**.
 That is immediate and needs no str0m change:
 
@@ -1017,6 +1025,11 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   short clusters at up to 2× desired, which stay inside the viewer's extras
   bucket ("Per-viewer egress cap").
 
+  Removing the final assignment sets the desired bitrate to zero immediately.
+  The socket suppresses any pending non-control datagrams while nothing is
+  watched, including probe clusters already scheduled by str0m. A retained
+  transport sends zero non-control bytes in the 30 s final-unwatch simulation.
+
   As built, the target is also **at most twice the current estimate**.
   str0m's periodic probe runs at 2× desired whatever the estimate, so with
   the caps alone two Smooth shares (4 Mbps caps) on a 5 Mbps downlink sent
@@ -1133,8 +1146,9 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
     default-route interface from `/proc/net/dev` (Linux). It adds the delta
     since the last read to a per-calendar-month total persisted in the store.
     A counter lower than the last read (a reboot or a wrap) counts from zero.
-    Default-route selection requires destination/mask zero and RTF_UP, lowest
-    metric, falling back to `/proc/net/ipv6_route` for an IPv6 default.
+    Default-route selection requires destination/mask zero, RTF_UP and no
+    RTF_REJECT, lowest metric, falling back to `/proc/net/ipv6_route` for a
+    usable IPv6 default.
     Interface changes rebaseline; they never add that interface's lifetime total.
     The complete checkpoint (counter, UTC timestamp, totals, coverage and warning
     level) is one transactional write; memory changes only after it succeeds.

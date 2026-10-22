@@ -30,7 +30,10 @@ fn default_interface(route: &str) -> Option<String> {
             let fields: Vec<&str> = line.split_whitespace().collect();
             let metric: u64 = fields.get(6)?.parse().ok()?;
             let flags = u32::from_str_radix(fields.get(3)?, 16).ok()?;
-            (fields.get(1) == Some(&"00000000") && fields.get(7) == Some(&"00000000") && flags & 1 != 0)
+            (fields.get(1) == Some(&"00000000")
+                && fields.get(7) == Some(&"00000000")
+                && flags & 1 != 0
+                && flags & 0x200 == 0)
                 .then(|| (metric, fields[0].to_owned()))
         })
         .min()
@@ -355,6 +358,7 @@ mod tests {
     #[test]
     fn route_selection_rejects_half_defaults_down_routes_and_uses_ipv6() {
         let route = "Iface Destination Gateway Flags RefCnt Use Metric Mask\n\
+            reject 00000000 00000000 0201 0 0 0 00000000\n\
             half 00000000 00000000 0001 0 0 0 00000080\n\
             down 00000000 00000000 0000 0 0 0 00000000\n\
             eth0 00000000 00000000 0001 0 0 100 00000000\n";
@@ -368,6 +372,14 @@ mod tests {
             {zero} 00 {zero} 00 {zero} 00000010 0 0 00000001 eth0"
         );
         assert_eq!(default_ipv6_interface(&routes).as_deref(), Some("eth0"));
+        let rejected = "Iface Destination Gateway Flags RefCnt Use Metric Mask\n\
+            reject 00000000 00000000 0201 0 0 0 00000000\n";
+        assert_eq!(default_interface(rejected), None);
+        assert_eq!(
+            default_interface(rejected).or_else(|| default_ipv6_interface(&routes)).as_deref(),
+            Some("eth0"),
+            "an UP|REJECT IPv4 default must not hide the usable IPv6 default"
+        );
     }
 
     #[test]

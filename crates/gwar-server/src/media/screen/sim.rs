@@ -346,7 +346,6 @@ impl Sim {
         for (lane, out, arrival) in self.w.egress.pending() {
             self.arrivals.insert((lane, out as u16), arrival);
         }
-        release(&mut self.w, now);
         let mut requests = std::mem::take(&mut self.w.dropped_lanes);
         let mut out = Vec::new();
         drive(&mut self.w, now, &mut requests, &mut |c: &[u8], _| out.push(c.to_vec()));
@@ -717,6 +716,33 @@ mod tests {
         sim.w.rtc.bwe().reset(Bitrate::bps(estimate / 3));
         sim.run(3 * SECOND);
         (sim, stopped)
+    }
+
+    #[test]
+    fn final_unwatch_stops_periodic_and_pending_probes() {
+        for pending in [false, true] {
+            let mut sim = Sim::new(None);
+            sim.watch("only", 4_000_000, 30, 60_000, None);
+            sim.run(6 * SECOND);
+            assert!(sim.w.desired.is_some());
+            assert!(sim.bytes(sim.start, sim.now, |k| !matches!(k, Kind::Control)) > 100_000);
+            if pending {
+                sim.w.rtc.bwe().reset(Bitrate::bps(100_000));
+                sim.w.rtc.handle_input(Input::Timeout(sim.now)).unwrap();
+            }
+            empty(&mut sim.w, 0);
+            assert_eq!(sim.w.desired, None);
+            let stopped = sim.now;
+            sim.run(30 * SECOND);
+            assert!(sim.w.rtc.is_alive(), "the retained watch transport remains usable");
+            assert_eq!(
+                sim.bytes(stopped, sim.now, |k| !matches!(k, Kind::Control)),
+                0,
+                "no media or probes after final unwatch (pending={pending}): {}",
+                summary(&sim)
+            );
+            assert!(sim.bytes(stopped, sim.now, |k| matches!(k, Kind::Control)) > 0);
+        }
     }
 
     #[test]

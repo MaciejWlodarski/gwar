@@ -378,6 +378,37 @@ impl AudioIo for FakeIo {
         Ok(AudioPorts { mic, speaker, output, _guard: Box::new(Guard { stop, thread: Some(thread) }) })
     }
 }
+/// Routes the voice answer's ICE candidates through the selected relay role (or direct socket).
+fn voice_answer(sdp: &str, server: std::net::SocketAddr) -> String {
+    sdp.lines()
+        .map(|line| {
+            if line.starts_with("a=candidate:") {
+                let mut fields: Vec<String> = line.split_whitespace().map(str::to_owned).collect();
+                if fields.len() >= 6 {
+                    fields[4] = server.ip().to_string();
+                    fields[5] = server.port().to_string();
+                    return fields.join(" ");
+                }
+            }
+            line.to_owned()
+        })
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        + "\r\n"
+}
+
+async fn voice_start(
+    connection: &gwar_client::Connection,
+    io: Box<dyn AudioIo>,
+    server: std::net::SocketAddr,
+) -> anyhow::Result<voice::VoiceHandle> {
+    let connection = connection.clone();
+    voice::start_with(io, server.ip(), move |offer| async move {
+        Ok(voice_answer(&connection.voice_offer(offer).await?, server))
+    })
+    .await
+}
+
 /// Starts an encrypted native run; the offer names the call's voice group.
 async fn encrypted_start(
     client: &gwar_client::Connected,
@@ -405,7 +436,7 @@ async fn encrypted_start(
             "channel": offer["channel"], "call": offer["call"], "participation": offer["participation"],
             "run": RUN, "group": offer["group"], "ssrc": ssrc, "sdp": sdp } }))?;
         let answer = connection.request(request).await?;
-        answer["sdp"].as_str().map(str::to_owned).context("answer without sdp")
+        Ok(voice_answer(answer["sdp"].as_str().context("answer without sdp")?, server))
     };
     Ok((voice::start_encrypted(io, server.ip(), signal, start).await?, binding))
 }
@@ -641,8 +672,8 @@ async fn run(
     let receiver_io = io(&heard, false, settings.extra_delay_ms * RATE / 1000, settings.callback_jitter);
     let (va, vb) = match &calls {
         None => (
-            voice::start(&a.connection, io(&sent, true, 0, false), voice_addresses[0]).await?,
-            voice::start(&b.connection, receiver_io, voice_addresses[1]).await?,
+            voice_start(&a.connection, io(&sent, true, 0, false), voice_addresses[0]).await?,
+            voice_start(&b.connection, receiver_io, voice_addresses[1]).await?,
         ),
         Some((a_state, b_state)) => {
             let (va, a_binding) = encrypted_start(&a, a_state, io(&sent, true, 0, false), voice_addresses[0]).await?;
@@ -875,6 +906,120 @@ mod tests {
             })
             .collect();
         (markers, onsets)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn voice_relay_uses_the_same_role_seeds_with_screen_load() {
+        async fn paired(with_screen: bool) -> Vec<netem::FlowSeed> {
+            let any = "127.0.0.1:0".parse().unwrap();
+            let mut relay = netem::Relay::bind().await.unwrap();
+            let advertise = relay.address().unwrap();
+            let server = gwar_server::start(gwar_server::Config {
+                database: None,
+                http_bind: any,
+                media_bind: any,
+                media_advertise: advertise,
+                max_clients: 32,
+                encrypted_server_chat: false,
+                server_password: None,
+                web_root: None,
+                ice_servers: vec![],
+                teamspeak: None,
+                public_url: None,
+                data_dir: None,
+                public_ip: None,
+                insecure_any_host: true,
+                public_endpoints: Vec::new(),
+                client_ip_header: None,
+                upload_limit: 10 * 1024 * 1024,
+                upload_quota: 0,
+                storage_limit: 0,
+                files_dir: None,
+                web_origins: Vec::new(),
+                tls: None,
+                redirect_http: None,
+                connect_url: None,
+            })
+            .await
+            .expect("start local latency server");
+
+            let mut tasks = ServerTasks { tasks: server.tasks, data_dir: None };
+            let url = format!("ws://{}/ws", server.http);
+            let a = connect(options(&url, "voice sender")).await.unwrap();
+            let b = connect(options(&url, "voice receiver")).await.unwrap();
+            for client in [&a, &b] {
+                client.connection.join(client.welcome.server.default_channel, None).await.unwrap();
+            }
+            let epoch = Instant::now();
+            relay
+                .start(server.media_bind, netem::Spec::parse("seed=17;up:jitter=1ms;down:jitter=1ms").unwrap(), epoch)
+                .unwrap();
+            let mut load = if with_screen {
+                Some(
+                    screen::Load::start(
+                        &url,
+                        screen::Spec::parse("shares=1,viewers=1,bitrate=100kbit,fps=5,keyframe=1000,via=all").unwrap(),
+                        a.welcome.server.default_channel,
+                        advertise,
+                        Some(advertise),
+                        server.media_bind,
+                    )
+                    .await
+                    .unwrap(),
+                )
+            } else {
+                None
+            };
+            if let Some(load) = &mut load {
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while load.report().await.unwrap()["received_bytes"].as_u64().unwrap() == 0 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("screen transport carries media before voice starts");
+            }
+            let io = || {
+                Box::new(FakeIo {
+                    markers_ready: Arc::new(AtomicBool::new(false)),
+                    data: Arc::new(Mutex::new(Measurements::default())),
+                    tone: false,
+                    epoch,
+                    start: Instant::now() + Duration::from_millis(50),
+                    stop: Arc::new(AtomicBool::new(false)),
+                    count: 1,
+                    delay_samples: 0,
+                    callback_jitter: false,
+                    warmup_samples: 0,
+                })
+            };
+            let va = voice_start(&a.connection, io(), relay.voice_address(0).unwrap()).await.unwrap();
+            let vb = voice_start(&b.connection, io(), relay.voice_address(1).unwrap()).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while [va.stats().link, vb.stats().link].iter().any(|s| *s != voice::LinkState::Connected) {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("actual voice transports connect through the relay");
+            drop(va);
+            drop(vb);
+            drop(load);
+            let report = relay.finish().await.unwrap();
+            assert_eq!(report.flows, if with_screen { 4 } else { 2 });
+            if with_screen {
+                assert!(report.flow_seeds[..2].iter().all(|f| f.voice_role.is_none()), "screen flows arrived first");
+            }
+            let mut seeds: Vec<_> = report.flow_seeds.into_iter().filter(|f| f.voice_role.is_some()).collect();
+            seeds.sort_by_key(|f| f.voice_role);
+            assert_eq!(seeds.iter().map(|f| f.voice_role).collect::<Vec<_>>(), vec![Some(0), Some(1)]);
+            tasks.shutdown().await;
+            seeds
+        }
+        let baseline = paired(false).await;
+        let loaded = paired(true).await;
+        assert_eq!(baseline, loaded);
+        assert_ne!(baseline[0].up, baseline[1].up);
     }
 
     #[test]

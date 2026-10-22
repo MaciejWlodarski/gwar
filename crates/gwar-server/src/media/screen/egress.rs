@@ -113,6 +113,10 @@ impl Queued {
         Self { out, timestamp, marker, pt, arrival, payload, frame, keyframe, key: false }
     }
 
+    pub fn key_frame(&self) -> Option<u32> {
+        self.key.then_some(self.frame)
+    }
+
     fn size(&self) -> usize {
         self.payload.len() + ORIGINAL_OVERHEAD
     }
@@ -433,14 +437,31 @@ impl Egress {
         let l = &mut self.lanes[lane];
         let keyframe = key || l.queue.iter().any(|p| p.key);
         self.counters.evicted += l.queue.len() as u64;
-        if keyframe && l.key.is_some() && l.failed != l.key {
-            l.failed = l.key;
+        let frame = keyframe.then_some(l.key).flatten();
+        if let Some(frame) = frame {
+            self.fail_keyframe(lane, frame, now);
+        }
+        self.clear(lane);
+    }
+
+    fn fail_keyframe(&mut self, lane: usize, frame: u32, now: Instant) {
+        let l = &mut self.lanes[lane];
+        if l.failed != Some(frame) {
+            l.failed = Some(frame);
             if !l.ramping(now) {
                 l.failures.push_back(now);
             }
             self.counters.failed_keyframes += 1;
         }
-        self.clear(lane);
+    }
+
+    /// An original already released to str0m was refused by the socket cap. Drop the rest
+    /// of its lane and count its frame even if a newer frame has since been admitted.
+    pub fn reject_original(&mut self, lane: usize, key_frame: Option<u32>, now: Instant) {
+        self.drop_lane(lane, false, now);
+        if let Some(frame) = key_frame {
+            self.fail_keyframe(lane, frame, now);
+        }
     }
 
     /// Admits one original packet into its slot's queue. Returns the slots that dropped

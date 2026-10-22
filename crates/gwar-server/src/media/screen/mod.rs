@@ -456,6 +456,8 @@ struct Slot {
     configured: bool,
     ssrc: Option<u32>,
     asked: Option<Instant>,
+    /// Released originals still owned by str0m: sequence number and source keyframe, if any.
+    originals: VecDeque<(u16, Option<u32>)>,
     written: u64,
 }
 
@@ -470,6 +472,7 @@ impl Slot {
             configured: false,
             ssrc: None,
             asked: None,
+            originals: VecDeque::new(),
             written: 0,
         }
     }
@@ -1207,8 +1210,6 @@ impl Sfu {
         let Some(mut w) = self.watchers.remove(&session) else { return };
         let now = Instant::now();
         let mut requests = Vec::new();
-        release(&mut w, now);
-        requests.append(&mut w.dropped_lanes);
         let (socket, measured, shared) = (&self.socket, &mut self.measured, &self.shared);
         let mut send = |c: &[u8], to| transmit(socket, measured, shared, c, to);
         if drive(&mut w, now, &mut requests, &mut send) {
@@ -1322,7 +1323,10 @@ fn video_pts(rtc: &Rtc, mid: Mid) -> HashMap<VideoCodec, Pt> {
 /// cap on its way to `send`; keyframe requests from the viewer are collected by slot. True if it
 /// connected just now.
 fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dyn FnMut(&[u8], SocketAddr)) -> bool {
+    sweep(w);
+    requests.append(&mut w.dropped_lanes);
     let mut connected = false;
+    let mut released = false;
     // With the bandwidth estimator on, str0m's pacer hands out one packet per timeout, so a
     // timeout already due is handled at once (bounded, should it keep returning `now`).
     let mut due = 0;
@@ -1349,6 +1353,14 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                 }
             }
             Output::Timeout(at) => {
+                if !released {
+                    // str0m emits pending BWE events before media. Drain them before spending
+                    // the release bucket, so both buckets use the same current estimate.
+                    release(w, now);
+                    requests.append(&mut w.dropped_lanes);
+                    released = true;
+                    continue;
+                }
                 w.deadline = at;
                 return connected;
             }
@@ -1359,8 +1371,33 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                 }
                 let slots = &w.slots;
                 let class = egress::classify(&t.contents, |ssrc| slots.iter().any(|s| s.ssrc == Some(ssrc)));
+                // Clearing desired bitrate does not retract an already scheduled probe cluster.
+                if class != egress::Class::Control && !slots.iter().any(|s| s.grant.is_some()) {
+                    continue;
+                }
+                let original = if class == egress::Class::Original {
+                    let ssrc = u32::from_be_bytes(t.contents[8..12].try_into().unwrap());
+                    let lane = w.slots.iter().position(|s| s.ssrc == Some(ssrc)).unwrap();
+                    let sequence = u16::from_be_bytes(t.contents[2..4].try_into().unwrap());
+                    let pending = &mut w.slots[lane].originals;
+                    let key_frame = pending
+                        .iter()
+                        .position(|(seq, _)| *seq == sequence)
+                        .and_then(|at| pending.remove(at))
+                        .and_then(|(_, key)| key);
+                    Some((lane, key_frame))
+                } else {
+                    None
+                };
                 if w.egress.charge(class, t.contents.len(), now) {
                     send(&t.contents, t.destination);
+                } else if let Some((lane, key_frame)) = original {
+                    w.egress.reject_original(lane, key_frame, now);
+                    let slot = &mut w.slots[lane];
+                    slot.segment.wait();
+                    slot.originals.clear();
+                    wipe(&mut w.rtc, slot.mid);
+                    requests.push(lane);
                 }
             }
             Output::Event(event) => match event {
@@ -1420,9 +1457,7 @@ fn allocate(
         "screen watch egress"
     );
     if desired != w.desired {
-        if let Some(desired) = desired {
-            w.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired));
-        }
+        w.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired.unwrap_or(0)));
         w.desired = desired;
     }
     if !w.egress.stalled() {
@@ -1448,6 +1483,7 @@ fn apply(w: &mut Watcher, slot: usize, change: Change) {
             let s = &mut w.slots[slot];
             s.segment.wait();
             s.asked = None;
+            s.originals.clear();
             wipe(&mut w.rtc, s.mid);
         }
         Change::Resume => {
@@ -1488,8 +1524,14 @@ fn empty(w: &mut Watcher, index: usize) {
     slot.grant = None;
     slot.segment.wait();
     slot.asked = None;
+    slot.originals.clear();
     w.egress.unassign(index);
     wipe(&mut w.rtc, slot.mid);
+    if w.pending.is_empty() && w.slots.iter().all(|s| s.grant.is_none()) {
+        w.rtc.bwe().set_desired_bitrate(Bitrate::ZERO);
+        w.desired = None;
+        w.stalled = None;
+    }
 }
 
 /// Drops all of a slot's stream holds: packets written but not sent yet, the RTX cache and
@@ -1571,6 +1613,7 @@ fn release(w: &mut Watcher, now: Instant) {
         }
         let mut extensions = ExtensionValues::default();
         extensions.user_values.set(SlotGeneration(slot.generation));
+        slot.originals.push_back((packet.out as u16, packet.key_frame()));
         // The wallclock is the packet's arrival, not its release: sender reports describe the
         // sharer's timeline.
         stream.write_rtp(
@@ -1951,8 +1994,37 @@ pub(crate) mod tests {
         assert_eq!(sent, 0, "neither queued RTP nor RTX leaves after revocation");
     }
 
+    #[test]
+    fn pending_estimate_is_applied_before_originals_are_released() {
+        let mut pair = Pair::new();
+        pair.w.egress.set_estimate(100_000_000, pair.now);
+        pair.now += Duration::from_secs(4);
+        pair.w.rtc.bwe().reset(Bitrate::bps(100_000));
+        pair.w.rtc.handle_input(Input::Timeout(pair.now)).unwrap();
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
+        assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
+        for source in 1..=50 {
+            let forward = Forward {
+                source,
+                timestamp: 9000,
+                marker: source == 50,
+                keyframe: source == 1,
+                codec: VideoCodec::Vp8,
+                arrival: pair.now,
+                payload: Arc::from(vec![0x10; 1100]),
+            };
+            assert!(enqueue(&mut pair.w, 0, &origin, &forward, pair.now));
+        }
+        let mut requests = Vec::new();
+        drive(&mut pair.w, pair.now, &mut requests, &mut |_, _| {});
+        assert!(pair.w.egress.estimate() < 1_000_000, "the actual pending BWE event was drained");
+        assert!(pair.w.slots[0].written <= 2, "release uses the reduced estimate");
+        assert_eq!(pair.w.egress.counters.originals_dropped, 0);
+        assert!(pair.w.egress.queued() > 0, "the rest stays owned by the deadline queue");
+    }
+
     #[tokio::test]
-    async fn queue_evictions_request_keyframes_without_more_publisher_traffic() {
+    async fn queue_and_socket_drops_request_budgeted_recovery_without_publisher_traffic() {
         let mut pair = Pair::new();
         let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
         assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
@@ -2037,6 +2109,58 @@ pub(crate) mod tests {
         assert!(w.dropped_lanes.contains(&1));
         sfu.flush_watcher(7);
         assert!(sfu.watchers[&7].slots[1].asked.is_some());
+
+        // An estimate can still fall after originals have entered str0m. The socket rejection
+        // must fail their keyframe, wipe the stream and use the same budgeted recovery path.
+        let w = sfu.watchers.get_mut(&7).unwrap();
+        assign(w, 0, WatchGrant::new(origin.clone()), 3, now);
+        w.egress.set_estimate(100_000_000, now);
+        let released_at = now + Duration::from_millis(100);
+        for source in 1..=50 {
+            let f = Forward {
+                source,
+                timestamp: 18000,
+                marker: source == 50,
+                keyframe: source == 1,
+                codec: VideoCodec::Vp8,
+                arrival: released_at,
+                payload: Arc::from(vec![0x10; 1100]),
+            };
+            assert!(enqueue(w, 0, &origin, &f, released_at));
+        }
+        release(w, released_at);
+        assert_eq!(w.slots[0].originals.len(), 50);
+        w.egress.set_estimate(1, released_at);
+        let failures = w.egress.counters.failed_keyframes;
+        sfu.publishers.get_mut("share").unwrap().keyframes.pending = false;
+        // Pair's transport clock is virtual; let the socket-owning SFU's wallclock catch up.
+        tokio::time::sleep_until(released_at.into()).await;
+        for _ in 0..50 {
+            sfu.flush_watcher(7);
+            if sfu.watchers[&7].egress.counters.originals_dropped > 0 {
+                break;
+            }
+            // Even unpaced streams emit one packet per str0m pacer timeout.
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        let w = &sfu.watchers[&7];
+        assert!(
+            w.egress.counters.originals_dropped > 0,
+            "estimate={} counters={:?} pending={} written={} queued={} deadline={:?} now={:?}",
+            w.egress.estimate(),
+            w.egress.counters,
+            w.slots[0].originals.len(),
+            w.slots[0].written,
+            w.egress.queued(),
+            w.deadline,
+            Instant::now()
+        );
+        assert_eq!(w.egress.counters.failed_keyframes, failures + 1);
+        assert!(w.slots[0].segment.waiting());
+        assert!(w.slots[0].originals.is_empty());
+        assert!(w.slots[0].asked.is_some());
+        assert!(sfu.publishers["share"].keyframes.pending);
+        assert!(sfu.budgets.contains_key(&7));
     }
 
     /// Ends `slot`'s grant while the viewer's NACK for a lost packet is in flight, then lets the

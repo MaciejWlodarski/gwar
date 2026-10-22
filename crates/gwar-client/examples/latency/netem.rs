@@ -376,12 +376,20 @@ impl Scheduler {
     }
 }
 
+#[derive(Debug, PartialEq, Eq, Serialize)]
+pub struct FlowSeed {
+    pub voice_role: Option<u64>,
+    pub up: u64,
+    pub down: u64,
+}
+
 #[derive(Serialize)]
 pub struct Report {
     pub spec: Spec,
     pub relay: SocketAddr,
     pub server: SocketAddr,
     pub flows: usize,
+    pub flow_seeds: Vec<FlowSeed>,
     pub up: Counts,
     pub down: Counts,
     /// Browser mode only: downlink datagrams the OS refused to send (see `bind_for_browsers`).
@@ -488,6 +496,7 @@ async fn relay(
     let (incoming, mut replies) = mpsc::channel::<Incoming>(4096);
     let mut readers = JoinSet::<Result<()>>::new();
     let mut flows: Vec<Flow> = Vec::new();
+    let mut flow_seeds = Vec::new();
     let mut by_client = HashMap::new();
     let (arrivals, mut clients) = mpsc::channel(4096);
     for (role, socket) in [(None, front.clone()), (Some(0), voice[0].clone()), (Some(1), voice[1].clone())] {
@@ -560,6 +569,7 @@ async fn relay(
                     let flow_seed = role_seed(role, id);
                     let up_seed = spec.up.seed.unwrap_or(spec.seed) ^ flow_seed;
                     let down_seed = spec.down.seed.unwrap_or(spec.seed) ^ flow_seed ^ 0xd1b54a32d192ed03;
+                    flow_seeds.push(FlowSeed { voice_role: role, up: up_seed, down: down_seed });
                     flows.push(Flow {
                         front: socket,
                         client,
@@ -587,6 +597,7 @@ async fn relay(
         relay: front.local_addr()?,
         server,
         flows: flows.len(),
+        flow_seeds,
         up: Counts::default(),
         down: Counts::default(),
         downlink_send_errors,
