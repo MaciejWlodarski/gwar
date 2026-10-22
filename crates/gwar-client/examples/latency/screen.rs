@@ -343,12 +343,37 @@ async fn run(
         let through = matches!(spec.via, Via::Viewers | Via::All);
         tasks.push(watch(&viewer, n, advertised, route(through), counters.clone()).await?);
         for share in &shares {
-            viewer.connection.request(Request::ScreenWatch { share: share.clone() }).await.context("screen.watch")?;
+            watch_registered_share(|| viewer.connection.request(Request::ScreenWatch { share: share.clone() })).await?;
         }
         tasks.push(drain(&mut viewer, counters.clone(), Some(n)));
         connections.push(viewer);
     }
     Ok(Running { tasks, _connections: connections })
+}
+
+/// Publish negotiation can finish before the SFU registers the share, especially under loss.
+/// Bound the whole operation, including a request that stops receiving replies.
+async fn watch_registered_share<F, Fut>(mut request: F) -> Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<serde_json::Value, ClientError>>,
+{
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut backoff = Duration::from_millis(50);
+        loop {
+            match request().await {
+                Ok(_) => return Ok(()),
+                Err(ClientError::Server(error)) if error.code == ErrorCode::NotFound => {
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_millis(500));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    })
+    .await
+    .context("screen.watch: share not available within 10 seconds")?
+    .context("screen.watch")
 }
 
 impl Load {
@@ -619,6 +644,58 @@ async fn receiver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn not_found() -> ClientError {
+        ClientError::Server(gwar_proto::ErrorBody::new(ErrorCode::NotFound, "no such share"))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_waits_for_share_registration() {
+        let started = tokio::time::Instant::now();
+        let attempts = std::cell::Cell::new(0);
+        watch_registered_share(|| {
+            attempts.set(attempts.get() + 1);
+            std::future::ready(if started.elapsed() < Duration::from_millis(700) {
+                Err(not_found())
+            } else {
+                Ok(serde_json::json!({}))
+            })
+        })
+        .await
+        .unwrap();
+        assert_eq!(attempts.get(), 5);
+        assert_eq!(started.elapsed(), Duration::from_millis(750));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_does_not_retry_other_errors() {
+        for failure in [
+            ClientError::Server(gwar_proto::ErrorBody::new(ErrorCode::Forbidden, "not allowed")),
+            ClientError::Closed,
+            ClientError::Timeout,
+        ] {
+            let started = tokio::time::Instant::now();
+            let mut failure = Some(failure);
+            let error = watch_registered_share(|| std::future::ready(Err(failure.take().expect("no retry"))))
+                .await
+                .unwrap_err();
+            assert!(error.downcast_ref::<ClientError>().is_some());
+            assert_eq!(started.elapsed(), Duration::ZERO);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watch_registration_and_unanswered_requests_share_a_ten_second_deadline() {
+        let started = tokio::time::Instant::now();
+        let error = watch_registered_share(|| std::future::ready(Err(not_found()))).await.unwrap_err();
+        assert!(error.to_string().contains("within 10 seconds"));
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+
+        let started = tokio::time::Instant::now();
+        let error = watch_registered_share(std::future::pending).await.unwrap_err();
+        assert!(error.to_string().contains("within 10 seconds"));
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+    }
 
     #[tokio::test]
     async fn load_task_failures_propagate_to_the_run() {

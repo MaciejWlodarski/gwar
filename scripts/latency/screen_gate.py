@@ -11,6 +11,8 @@ pairs (zero for a shortened run of fewer than ten pairs):
 - constrained (a rate= bottleneck): p99 within 20 ms of the baseline, and the underrun
   fraction (underrun samples / samples played) within 0.5 percentage points of it.
 
+--null runs both arms without screen load to measure A/A noise, preserving pair seeds,
+alternation, warmup and every gate rule. The second arm retains the "screen" label.
 Exits 1 when a scenario misses the gate; summary.json has the numbers.
 """
 
@@ -130,10 +132,11 @@ def validate_load(meta, expected, constrained):
 def relay_timing(meta):
     network = meta.get("network")
     if not network:
-        return None
-    return {direction: {key: network[direction][key] for key in
-            ("queue_max_ms", "scheduling_lateness_max_ms", "scheduling_late_over_5ms")}
-            for direction in ("up", "down")}
+        return {"status": "not_applicable", "reason": "direct media path; LATENCY_NET relay is disabled"}
+    return {"status": "measured", **{
+        direction: {key: network[direction][key] for key in
+                    ("queue_max_ms", "scheduling_lateness_max_ms", "scheduling_late_over_5ms")}
+        for direction in ("up", "down")}}
 
 
 def main():
@@ -141,6 +144,7 @@ def main():
     parser.add_argument("--binary", type=lambda v: variant(f"latency={v}")[1], required=True,
                         help="target/release/examples/latency")
     parser.add_argument("--scenario", choices=SCENARIOS, action="append", help="repeatable (default: all)")
+    parser.add_argument("--null", action="store_true", help="A/A noise measurement: no screen load in either arm; same gate rules")
     parser.add_argument("--pairs", type=positive, default=10, help="pairs per scenario (default: 10)")
     parser.add_argument("--markers", type=positive, default=100, help="markers per run (default: 100)")
     parser.add_argument("--minimum-latency-ms", type=minimum_latency, default=5.0)
@@ -148,15 +152,17 @@ def main():
     args = parser.parse_args()
     install_signals()
     args.out.mkdir(parents=True, exist_ok=False)
-    summary = {"pairs": args.pairs, "markers_per_run": args.markers, "warmup_ms": WARMUP_MS, "scenarios": {}}
+    summary = {"null": args.null, "pairs": args.pairs, "markers_per_run": args.markers, "warmup_ms": WARMUP_MS, "scenarios": {}}
     for name in args.scenario or list(SCENARIOS):
         net, screen, constrained = SCENARIOS[name]
+        if args.null:
+            screen = None
         options = SimpleNamespace(
-            variant=[("baseline", args.binary), ("screen", args.binary)], runs=args.pairs * 2,
+            variant=[("baseline", args.binary), ("screen", args.binary)], runs=args.pairs,
             markers=args.markers, minimum_latency_ms=args.minimum_latency_ms, extra_delay_ms=0,
             out=args.out / name,
         )
-        results = Results(options, "screen-gate", scenario=name, net=net, screen=screen, constrained=constrained)
+        results = Results(options, "screen-gate", scenario=name, net=net, screen=screen, constrained=constrained, null=args.null)
         pairs = []
         try:
             for pair in range(args.pairs):
@@ -170,13 +176,15 @@ def main():
                     env.setdefault("RUST_LOG", "gwar_server::media::screen=debug")
                     if net:
                         env["LATENCY_NET"] = f"seed={pair + 1};{net}"
-                    if which == "screen":
+                    if which == "screen" and not args.null:
                         env["LATENCY_SCREEN"] = screen
                     path = results.path(run, which)
                     pid = run_client(args.binary, path, args.markers, env)
                     results.accept(run, which, pid, pair=pair)
                     meta = json.loads(Path(f"{path}.json").read_text())
-                    load_check = validate_load(meta, screen, constrained) if which == "screen" else None
+                    if args.null and meta.get("screen") is not None:
+                        raise RuntimeError("unexpected screen load in A/A run")
+                    load_check = validate_load(meta, screen, constrained) if which == "screen" and not args.null else None
                     figures[which] = {**playout(meta), "screen": meta.get("screen"),
                                       "load_check": load_check, "relay_timing": relay_timing(meta)}
                 pairs.append(figures)

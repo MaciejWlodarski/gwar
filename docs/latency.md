@@ -270,6 +270,9 @@ within one marker. `up:jitter=10ms` cost far more than `down:jitter=10ms`
 - `viewers` (1–13; with `shares`, at most 14, since the server takes 16
   connections from one address) connections watch every share on a four-slot watch
   transport and count what arrives and every `screen.paused`/`screen.resumed`.
+  Publish negotiation can complete before the SFU registers a share. A watch
+  retries only `NotFound`, with backoff from 50 ms to 500 ms and a 10 s deadline
+  covering requests and waits together. Other errors fail the run immediately.
 - `via`: which screen transports go through the `LATENCY_NET` relay:
   `publishers`, `viewers`, `all`, or `none` (the default; all direct).
 - The load runs on its own two-thread runtime, so its str0m loops neither
@@ -298,14 +301,36 @@ load fails. At most one of ten pairs may exceed a per-pair threshold (zero
 for fewer than ten). Voice relay roles preserve the impairment seed regardless
 of screen arrival order. The output also reports relay scheduling lateness
 (actual send minus due time), separately from bottleneck queue residence.
-It exits 1 when
-a scenario misses the gate:
+`relay_timing.status` is `measured` when `LATENCY_NET` enables a relay. On the
+unconstrained direct path (`via=none`, no `LATENCY_NET`), it is `not_applicable`
+with an explanation: no relay exists to measure. Viewer receive scheduling is
+still recorded in `screen.receive_scheduling`; relay timing does not measure
+voice pipeline or device callback scheduling.
+It exits 1 when a scenario misses the gate:
 
 ```sh
-cargo build --release -p gwar-client --example latency
+CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=target cargo build --release -p gwar-client --example latency
 python3 scripts/latency/screen_gate.py --binary target/release/examples/latency \
   --out target/latency/screen-gate
 ```
+
+Use `--null` to measure the gate's A/A noise, starting with the unconstrained
+scenario where single underruns can move a pair's latency tail:
+
+```sh
+python3 scripts/latency/screen_gate.py --null \
+  --binary target/release/examples/latency --scenario unconstrained \
+  --pairs 10 --markers 100 --out /tmp/gwar-gate-aa-unconstrained
+```
+
+Choose a new output directory for each repetition. Omit `--scenario` to run all
+six scenarios. Both arms run without screen load; the second arm retains the
+`screen` label in file names and comparisons. Warmup, pair seeds, alternating
+order, marker checks, thresholds and underrun/tail rules stay identical. The
+summary and each scenario manifest record `null: true` and `screen: null`.
+Unexpected screen load fails an A/A run. An A/A failure measures gate noise and
+is not screen-load acceptance. The project lead decides any rule changes after
+examining repeated A/A data. See the [a4c76a1 artifact analysis](latency-a4c76a1.md).
 
 `scripts/latency/screen_cpu.py` measures the screen SFU's CPU per forwarded
 Mbps against a separate `gwar-server` process (see its `--help`); run it on the
