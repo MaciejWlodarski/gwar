@@ -16,6 +16,7 @@ import type { DeviceCertificate } from "../proto/DeviceCertificate";
 import { decodeBase64Url, encodeBase64Url } from "./base64url";
 import { kvDelete, kvEnroll, kvGet, kvSet, kvUpdate } from "./kv";
 import { defaultNickname, validNickname } from "./nickname";
+import { upgradeRecord, type RecordUpgrade } from "../lib/stored-data";
 
 export interface Identity {
   readonly nickname: string;
@@ -50,8 +51,19 @@ export interface IdentityStore {
 const KEY = "identity";
 const CONNECT_KEY = "connect";
 
+/**
+ * Upgrades of the stored records (and of identity backup files) as they are read
+ * (docs/data-migrations.md): `IDENTITY_UPGRADES[i]` takes an identity from `version` i + 1 to
+ * i + 2, `CONNECT_UPGRADES` likewise a Connect record. A record of a newer version fails to load
+ * and stays as it is. Version 1 of each is the baseline.
+ */
+export const IDENTITY_UPGRADES: readonly RecordUpgrade[] = [];
+export const CONNECT_UPGRADES: readonly RecordUpgrade[] = [];
+const identityRecord = (value: unknown) => upgradeRecord("The identity", value, IDENTITY_UPGRADES);
+const connectRecord = (value: unknown) => upgradeRecord("The Gwar Connect sign-in", value, CONNECT_UPGRADES);
+
 export const indexedDbIdentityStore: IdentityStore = {
-  load: () => kvGet<IdentityBackup>(KEY),
+  load: async () => identityRecord(await kvGet<unknown>(KEY)) as IdentityBackup | undefined,
   save: (backup) => kvSet(KEY, backup),
 };
 
@@ -96,14 +108,22 @@ export interface ConnectStore {
 }
 
 export const indexedDbConnectStore: ConnectStore = {
-  load: () => kvGet<ConnectRecord>(CONNECT_KEY),
+  load: async () => connectRecord(await kvGet<unknown>(CONNECT_KEY)) as ConnectRecord | undefined,
   save: (record) => kvEnroll(CONNECT_KEY, record, record.accountKey),
   clear: () => kvDelete(CONNECT_KEY),
 };
 
 /** Changes the stored Connect record in one transaction; `change` returns undefined to leave it. */
 export function updateConnectRecord(change: (record: ConnectRecord | undefined) => ConnectRecord | undefined): Promise<void> {
-  return kvUpdate<ConnectRecord>(CONNECT_KEY, change);
+  return kvUpdate<unknown>(CONNECT_KEY, (stored) => change(connectRecord(stored) as ConnectRecord | undefined));
+}
+
+/** A stored identity this version cannot read (damaged, or of a format it does not know): kept as it is, never replaced. */
+export class IdentityUnreadableError extends Error {
+  constructor() {
+    super("The identity saved in this browser cannot be read by this version of Gwar. It was left as it is; update Gwar or restore it from a backup.");
+    this.name = "IdentityUnreadableError";
+  }
 }
 
 export class IdentityUnsupportedError extends Error {
@@ -215,7 +235,11 @@ export async function generateIdentity(): Promise<Identity> {
 
 export async function loadOrCreateIdentity(store: IdentityStore = indexedDbIdentityStore): Promise<Identity> {
   const existing = await store.load();
-  if (existing && isValidBackup(existing)) return fromBackup(existing);
+  if (existing !== undefined) {
+    // Never replaced by a new one: that would lose the uid and every role it holds.
+    if (!isValidBackup(existing)) throw new IdentityUnreadableError();
+    return fromBackup(existing);
+  }
   const identity = await generateIdentity();
   await store.save(identity.exportBackup());
   return identity;
@@ -253,9 +277,9 @@ export async function loadConnectRecord(connect: ConnectStore = indexedDbConnect
 export async function importIdentity(text: string, store: IdentityStore = indexedDbIdentityStore): Promise<Identity> {
   let parsed: unknown;
   try {
-    parsed = JSON.parse(text);
-  } catch {
-    throw new Error("invalid identity file");
+    parsed = identityRecord(JSON.parse(text));
+  } catch (error) {
+    throw error instanceof Error && error.name === "NewerDataError" ? error : new Error("invalid identity file");
   }
   if (!isValidBackup(parsed)) throw new Error("invalid identity file");
   // Normalise to exactly the fields we need; drop key_ops etc.

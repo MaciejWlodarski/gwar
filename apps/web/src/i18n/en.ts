@@ -7,6 +7,9 @@ export const en = {
   "common.delete": "Delete",
   "common.copy": "Copy",
 
+  "storage.newer.title": "Gwar cannot open its saved data",
+  "storage.newer.body": "A newer version of Gwar saved data in this browser or app, and this version cannot read it. Nothing was changed. Reload the page or install the latest Gwar.",
+
   "nav.servers": "Servers",
   "nav.channels": "Channels and servers",
 

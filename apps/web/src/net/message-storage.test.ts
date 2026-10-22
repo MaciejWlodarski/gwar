@@ -109,15 +109,35 @@ describe("per-record storage work", () => {
       expect(await store.cursor()).toBe(0);
     } finally { open.mockRestore(); warn.mockRestore(); }
   });
-  it("reports why a database of an older schema does not open", async () => {
+  it("upgrades a database of version 2 and keeps its checkpoints", async () => {
+    const name = crypto.randomUUID(), old = await older(name, 2);
+    await new Promise<void>((resolve, reject) => {
+      const tx = old.transaction("checkpoints", "readwrite");
+      // As version 2 stored it: no order.
+      tx.objectStore("checkpoints").put({ ...checkpoint(5, "old"), proven: true }, "key");
+      tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error);
+    });
+    old.close();
+    const store = new MessageStorage(name);
+    // Still known: an earlier revision is a rollback, the same one a duplicate stored before every ordered read.
+    expect((await store.checkpoint("key", checkpoint(1, "new"), "-")).continuity).toBe("rollback");
+    expect(await store.checkpoint("key", checkpoint(5, "old"), "-")).toEqual({ continuity: "proven", duplicate: true, order: 0 });
+    expect(store.error).toBeUndefined();
+  });
+  it("refuses a database of a newer version and leaves it as it is", async () => {
     const name = crypto.randomUUID(), warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    (await older(name, 2)).close();
+    await new Promise<void>((resolve) => {
+      const r = indexedDB.open(name, 4);
+      r.onupgradeneeded = () => r.result.createObjectStore("future");
+      r.onsuccess = () => { r.result.close(); resolve(); };
+    });
     const store = new MessageStorage(name);
     try {
-      await expect(store.checkpoint("key", checkpoint(), "-")).rejects.toThrow();
-      await expect(store.cursor()).rejects.toThrow();
-      expect(store.error).toMatch(/^ConstraintError: /);
-      expect(warn).toHaveBeenCalledOnce();
+      await expect(store.cursor()).rejects.toThrow("saved by a newer version of Gwar (format 4");
+      expect(store.error).toMatch(/^NewerDataError: /);
+      const db = await new Promise<IDBDatabase>((resolve) => { const r = indexedDB.open(name); r.onsuccess = () => resolve(r.result); });
+      expect([db.version, [...db.objectStoreNames]]).toEqual([4, ["future"]]);
+      db.close();
     } finally { warn.mockRestore(); }
   });
   it("opens again after the browser closes the connection", async () => {

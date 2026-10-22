@@ -1,14 +1,19 @@
 /** Minimal promise wrapper over one IndexedDB object store (no dependency). */
-const DB_NAME = "gwar";
+import { openDatabase, type IdbMigration } from "../lib/stored-data";
+export const KV_DATABASE = "gwar";
 const STORE = "kv";
 
+/**
+ * The database's versions (docs/data-migrations.md): `KV_MIGRATIONS[i]` takes it from version i
+ * to i + 1. The records in it carry versions of their own (see net/identity.ts).
+ */
+export const KV_MIGRATIONS: readonly IdbMigration[] = [
+  // 1: one store of records by key.
+  (db) => db.createObjectStore(STORE),
+];
+
 function open(): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
-    req.onupgradeneeded = () => req.result.createObjectStore(STORE);
-    req.onsuccess = () => resolve(req.result);
-    req.onerror = () => reject(req.error ?? new Error("indexedDB open failed"));
-  });
+  return openDatabase(KV_DATABASE, KV_MIGRATIONS);
 }
 
 export async function kvGet<T>(key: string): Promise<T | undefined> {
@@ -84,12 +89,18 @@ export async function kvUpdate<T>(key: string, change: (value: T | undefined) =>
       const tx = db.transaction(STORE, "readwrite", { durability: "strict" });
       const store = tx.objectStore(STORE);
       const read = store.get(key);
+      let refused: unknown;
       read.onsuccess = () => {
-        const next = change(read.result as T | undefined);
-        if (next !== undefined) store.put(next, key);
+        try {
+          const next = change(read.result as T | undefined);
+          if (next !== undefined) store.put(next, key);
+        } catch (error) {
+          refused = error;
+          tx.abort();
+        }
       };
       tx.oncomplete = () => resolve();
-      tx.onabort = () => reject(tx.error ?? new Error("indexedDB update aborted"));
+      tx.onabort = () => reject(refused ?? tx.error ?? new Error("indexedDB update aborted"));
       tx.onerror = () => reject(tx.error ?? new Error("indexedDB update failed"));
     });
   } finally {

@@ -9,6 +9,9 @@ export const pl: Record<Key, string> = {
   "common.delete": "Usuń",
   "common.copy": "Kopiuj",
 
+  "storage.newer.title": "Gwar nie może otworzyć zapisanych danych",
+  "storage.newer.body": "Nowsza wersja Gwar zapisała dane w tej przeglądarce lub aplikacji, a ta wersja nie potrafi ich odczytać. Niczego nie zmieniono. Odśwież stronę albo zainstaluj najnowszy Gwar.",
+
   "nav.servers": "Serwery",
   "nav.channels": "Kanały i serwery",
 
