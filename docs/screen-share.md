@@ -1380,8 +1380,11 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
     acknowledgement must have been processed and that UID's original membership
     in the share's channel must still be live; otherwise the reply is the same
     `not_found` as for an unknown token. A reconnect cannot revive an old membership.
-    An admitted private guest keeps this lease: its end closes the watch transport
-    and WebSocket and releases its admission, even without another guest request.
+    An admitted private guest's SFU grant checks this membership lease directly on
+    every forwarded packet and before draining queues or handling RTX. Ending the
+    membership synchronously removes media authority, before any cancellation task
+    runs. Transport/WebSocket closure and admission cleanup follow asynchronously,
+    even without another guest request.
   - The bridge keeps the raw shared URL for the channel post. Private URLs
     exist only in their delivery tasks and queued TeamSpeak commands; their
     registry retains hashes, UID bindings and membership leases.
@@ -1917,8 +1920,11 @@ design left room:
   bound to the recipient's TS UID and uninterrupted channel membership. The
   registry keeps them inactive until the ordered Query acknowledgement, checks
   the share lease and membership at redemption, and keeps at most 64 live private
-  tokens per share. Admitted private guests retain the membership lease; ending it
-  closes their transport and connection and frees their admission.
+  tokens per share. Every guest's SFU grant retains the link lease; private guests'
+  grants also retain the original membership lease. Ending either lease stops fresh
+  forwarding synchronously. Queue and RTX cleanup checks the same grant, so pending
+  media and repairs cannot outlive that authority. Share end uses the grant's existing
+  source authority. Transport/WebSocket teardown and admission cleanup stay async.
 - **"Possible" means:** a public URL, `screen_guest_links` on, `file_access`
   `link`, a bridge attached right now (not only `--teamspeak`), and a channel
   that is neither encrypted nor private. Private channels are never bridged,
@@ -1993,8 +1999,10 @@ design left room:
   The single ordered Query stream places a departure before the acknowledgement
   of a command executed against a reassigned clid, closing the unread-notification
   redemption race. Redemption and subsequent offers and media callbacks recheck
-  the retained membership. A cancellation waiter ends the transport lease before
-  waiting for core queue capacity to release the guest admission. A Query disconnect
+  the retained membership. The SFU grant checks that same membership synchronously
+  on every packet and when clearing queued media and RTX, independently of the
+  cancellation waiter. That waiter ends the transport lease before waiting for core
+  queue capacity to release the guest admission. A Query disconnect
   also invalidates its memberships and terminates their admitted private guests.
   The core ends the link's cancellation lease synchronously on revocation or share end; all private tokens, queued posts,
   admission deferrals, sends and flood retries obey it. Queue admission and
@@ -2025,8 +2033,12 @@ design left room:
   attempts redemption before Query can consume them, and verifies the generic
   miss both then and after the acknowledgement. It also covers the normal ordered
   acknowledgement and activation path. Guest gateway tests negotiate real SRTP,
-  receive 12 packets, end the membership, and verify socket closure, freed admission
-  and no subsequent RTP. Core tests fence queued offers and delayed connection
+  receive 12 packets, end the membership, and immediately publish more media before
+  awaiting socket closure; the revoked guest receives zero RTP. They also verify
+  socket closure and freed admission. A deterministic core/SRTP regression uses the
+  actual guest grant without yielding to cancellation tasks: membership, link and
+  share revocation reject fresh writes and clear queued packets and delayed RTX,
+  while the transport lease and admission still exist. Core tests fence queued offers and delayed connection
   signals after membership ends; verify live, departed, returning and ended token
   bindings and the 64-token cap; exercise both receipt-sweep orderings with one
   delivery per membership; and keep 40-recipient recovery bounded with a stalled reply, share-end

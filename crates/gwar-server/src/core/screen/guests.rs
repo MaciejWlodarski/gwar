@@ -381,7 +381,7 @@ impl Core {
                     _ = lease.ended() => return,
                     _ = membership.ended() => {}
                 }
-                // Close media before waiting for core queue capacity to free the admission.
+                // The grant already fences media; close the transport before awaiting core capacity.
                 lease.end();
                 if let Some(core) = core.upgrade() {
                     let _ = core.send(CoreMsg::Guest(GuestMsg::Gone { guest })).await;
@@ -479,8 +479,12 @@ impl Core {
         if assigned {
             return;
         }
-        let Some(share) = self.shares.get(&self.guests[&guest].share) else { return };
-        let grant = WatchGrant::new(share.origin.clone());
+        let Some(share) = self.shares.get(&g.share) else { return };
+        let Some(link) = share.link_lease.clone() else {
+            self.drop_guest(guest);
+            return;
+        };
+        let grant = WatchGrant::guest(share.origin.clone(), link, g.membership.clone());
         // Room for the assignment first: nothing is recorded that the SFU never hears of.
         let Ok(permit) = self.screen.clone().try_reserve_owned() else {
             self.drop_guest(guest);
@@ -783,6 +787,56 @@ mod tests {
             }
             drop(query);
             peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn guest_grants_stop_rtp_before_async_revocation_teardown() {
+        for private in [false, true] {
+            for authority in ["membership", "link", "share"] {
+                if !private && authority == "membership" {
+                    continue;
+                }
+                let (core, _notes) = core_with_bridge().await;
+                let shared = linked_share(&core, 0).await;
+                let membership = Lease::new();
+                let token = if private {
+                    let links = private_links(&core).await;
+                    let (url, receipt) = links.mint("recipient", membership.clone()).unwrap();
+                    receipt.acknowledge();
+                    url.0.rsplit_once('#').unwrap().1.to_owned()
+                } else {
+                    shared
+                };
+                let guest = guest(&core, &token).await.unwrap();
+                on_core(&core, move |core| {
+                    let (screen, _commands) = mpsc::channel(8);
+                    core.screen = screen;
+                    let lease = core.guests[&guest].lease.clone();
+                    core.guests.get_mut(&guest).unwrap().watch = Some(Watch {
+                        run: GUEST_RUN,
+                        sdp: String::new(),
+                        answer: None,
+                        connected: false,
+                        slots: Default::default(),
+                        lease: lease.clone(),
+                    });
+                    core.guest_watching(guest, GUEST_RUN, true);
+                    let grant = core.guests[&guest].watch.as_ref().unwrap().slots[0].as_ref().unwrap().1.clone();
+                    let share = &core.shares["S"];
+                    crate::media::screen::tests::assert_guest_revocation_stops_rtp(grant, || {
+                        match authority {
+                            "membership" => membership.end(),
+                            "link" => share.link_lease.as_ref().unwrap().end(),
+                            "share" => share.origin.end(),
+                            _ => unreachable!(),
+                        }
+                        assert!(lease.alive(), "the asynchronous teardown has not run");
+                        assert!(core.guests.contains_key(&guest), "admission cleanup has not run");
+                    });
+                })
+                .await;
+            }
         }
     }
 

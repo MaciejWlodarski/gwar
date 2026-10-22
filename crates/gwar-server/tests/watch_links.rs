@@ -242,6 +242,9 @@ async fn private_links_are_presence_bound_at_the_guest_gateway_and_end_with_the_
     stream(alice.publisher(&share), 100, 4).await;
     assert_eq!(viewer.collect(Duration::from_millis(500)).await.len(), 12);
     membership.end();
+    // Write fresh publisher media immediately: do not wait for socket/admission teardown.
+    stream(alice.publisher(&share), 200, 4).await;
+    assert!(viewer.collect(Duration::from_millis(500)).await.is_empty(), "no RTP after membership revocation");
     present.closed().await;
     assert_eq!(alice.next_event("screen.viewers").await, json!({"share": share, "members": 0, "guests": 0}));
     let mut departed = Guest::connect(&server, "198.51.100.2").await;
@@ -263,7 +266,7 @@ async fn private_links_are_presence_bound_at_the_guest_gateway_and_end_with_the_
         }
     })
     .await;
-    stream(alice.publisher(&share), 200, 4).await;
+    stream(alice.publisher(&share), 300, 4).await;
     assert_eq!(returned_viewer.collect(Duration::from_millis(500)).await.len(), 12, "the publisher remains active");
     assert!(viewer.collect(Duration::from_millis(500)).await.is_empty(), "revoked transport receives no RTP");
     alice.ok("screen.stop", json!({"share": share})).await;

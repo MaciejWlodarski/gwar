@@ -113,20 +113,30 @@ pub const SHARE_CAP_BPS: u64 = 8_000_000;
 pub const GUEST_SLOTS: usize = 1;
 
 /// One viewer's right to one share in one slot. The core ends it the moment access ends; it
-/// also ends with its share.
+/// also ends with its share and, for guests, its link and original TeamSpeak membership.
 #[derive(Debug)]
 pub struct WatchGrant {
     pub share: String,
     origin: Arc<ScreenOrigin>,
     alive: AtomicBool,
+    leases: Vec<Arc<Lease>>,
 }
 
 impl WatchGrant {
     pub fn new(origin: Arc<ScreenOrigin>) -> Arc<Self> {
-        Arc::new(Self { share: origin.share.clone(), origin, alive: AtomicBool::new(true) })
+        Arc::new(Self { share: origin.share.clone(), origin, alive: AtomicBool::new(true), leases: Vec::new() })
+    }
+    /// Guest authority is checked directly, without waiting for asynchronous teardown.
+    pub fn guest(origin: Arc<ScreenOrigin>, link: Arc<Lease>, membership: Option<Arc<Lease>>) -> Arc<Self> {
+        Arc::new(Self {
+            share: origin.share.clone(),
+            origin,
+            alive: AtomicBool::new(true),
+            leases: std::iter::once(link).chain(membership).collect(),
+        })
     }
     pub fn alive(&self) -> bool {
-        self.alive.load(Ordering::Acquire) && self.origin.alive()
+        self.alive.load(Ordering::Acquire) && self.origin.alive() && self.leases.iter().all(|lease| lease.alive())
     }
     pub fn end(&self) {
         self.alive.store(false, Ordering::Release);
@@ -938,9 +948,10 @@ impl Sfu {
     /// Polls a watch transport until it sleeps; keyframe requests from the viewer are
     /// collected by slot. True if it connected just now.
     fn drive_watcher(&self, w: &mut Watcher, requests: &mut Vec<usize>) -> bool {
-        sweep(w);
         let mut connected = false;
         loop {
+            // Membership can end independently while this transport's output is draining.
+            sweep(w);
             if !w.rtc.is_alive() {
                 return connected;
             }
@@ -958,6 +969,11 @@ impl Sfu {
                     return connected;
                 }
                 Output::Transmit(t) => {
+                    // Discard an RTP output if authority ended while poll_output ran;
+                    // sweeping also clears the remaining queue and RTX cache.
+                    if is_rtp(&t.contents) && sweep(w) {
+                        continue;
+                    }
                     let _ = self.socket.try_send_to(&t.contents, t.destination);
                 }
                 Output::Event(event) => match event {
@@ -1113,12 +1129,16 @@ fn release(rtc: &mut Rtc, slot: &mut Slot) {
 
 /// Releases every slot whose grant ended, ahead of the core's `Release`: once access ends,
 /// nothing of the share leaves this transport, cached repairs included.
-fn sweep(w: &mut Watcher) {
+fn sweep(w: &mut Watcher) -> bool {
+    w.pending.retain(|(_, grant)| grant.alive());
+    let mut revoked = false;
     for slot in &mut w.slots {
         if slot.grant.as_ref().is_some_and(|g| !g.alive()) {
             release(&mut w.rtc, slot);
+            revoked = true;
         }
     }
+    revoked
 }
 
 /// Writes one forwarded packet into a viewer's slot. False if the slot dropped it.
@@ -1332,7 +1352,7 @@ pub fn publish_ssrcs(sdp: &str) -> Option<(u32, u32)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use str0m::{change::SdpAnswer, media::Direction};
 
     use super::*;
@@ -1450,6 +1470,53 @@ mod tests {
             self.client.handle_input(Input::Timeout(self.now)).unwrap();
             sent
         }
+    }
+
+    /// Runs synchronously with the core's real guest grant: no cancellation task can run
+    /// between revocation, fresh publisher writes, queue cleanup and the delayed NACK.
+    pub(crate) fn assert_guest_revocation_stops_rtp(grant: Arc<WatchGrant>, revoke: impl FnOnce()) {
+        let mut pair = Pair::new();
+        let origin = grant.origin.clone();
+        assign(&mut pair.w, 0, grant.clone());
+        let packet = |n: u64| Forward {
+            source: 100 + n,
+            timestamp: 9000 + (n / 10) as u32 * 3000,
+            marker: n % 10 == 9,
+            keyframe: n.is_multiple_of(10),
+            codec: VideoCodec::Vp8,
+            arrival: pair.now,
+            payload: Arc::from([if n.is_multiple_of(10) { 0x10 } else { 0x00 }, 0x00, n as u8, 0xaa].as_slice()),
+        };
+        let packets: Vec<_> = (0..30).map(packet).collect();
+        for packet in &packets[..10] {
+            assert!(write(&mut pair.w, 0, &origin, packet, pair.now));
+        }
+        pair.hold = true;
+        let mut seen = 0;
+        let sent: usize = (0..10)
+            .map(|_| {
+                pair.step(&mut |_| {
+                    seen += 1;
+                    seen == 3
+                })
+            })
+            .sum();
+        assert_eq!(sent, 10, "the real guest grant forwards before revocation");
+        assert!(!pair.held.is_empty(), "the viewer's loss feedback is held back");
+        for packet in &packets[10..20] {
+            assert!(write(&mut pair.w, 0, &origin, packet, pair.now));
+        }
+        revoke();
+        for packet in &packets[20..] {
+            assert!(!write(&mut pair.w, 0, &origin, packet, pair.now), "fresh RTP after revocation");
+        }
+        sweep(&mut pair.w);
+        pair.hold = false;
+        for datagram in std::mem::take(&mut pair.held) {
+            pair.send_to_sfu(&datagram);
+        }
+        let sent: usize = (0..20).map(|_| pair.step(&mut |_| false)).sum();
+        assert_eq!(sent, 0, "neither queued RTP nor RTX leaves after revocation");
     }
 
     /// Ends `slot`'s grant while the viewer's NACK for a lost packet is in flight, then lets the
