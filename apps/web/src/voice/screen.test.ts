@@ -109,6 +109,32 @@ describe("publish transport", () => {
     expect(pc.close).toHaveBeenCalled();
   });
 
+  it("closed during its first parameter change, it leaves no timer behind", async () => {
+    const offer = vi.fn(async (_body: { ssrc: number; rtx_ssrc: number; sdp: string }) => "answer");
+    const track = { applyConstraints: vi.fn(async () => {}), contentHint: "" } as unknown as MediaStreamTrack;
+    const publisher = new ScreenPublisher({ track, preset: "smooth", iceServers: [], offer, state: () => {} });
+    const starting = publisher.start();
+    await vi.waitFor(() => expect(Peer.all[0]?.transceivers).toHaveLength(1));
+    const sender = Peer.all[0]!.transceivers[0]!.sender as { setParameters: ReturnType<typeof vi.fn> };
+    sender.setParameters.mockImplementation(async () => { publisher.close(); });
+    await starting;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("starts with a preset changed while it negotiated", async () => {
+    let answer!: (sdp: string) => void;
+    const offer = vi.fn(() => new Promise<string>(resolve => { answer = resolve; }));
+    const track = { applyConstraints: vi.fn(async () => {}), contentHint: "" } as unknown as MediaStreamTrack;
+    const publisher = new ScreenPublisher({ track, preset: "game", iceServers: [], offer, state: () => {} });
+    const starting = publisher.start();
+    await vi.waitFor(() => expect(offer).toHaveBeenCalled());
+    await publisher.setPreset("saver");
+    answer("answer");
+    await starting;
+    expect(Peer.all[0]!.sendParams.at(-1)).toMatchObject({ degradationPreference: "balanced", encodings: [{ maxBitrate: 1_500_000, maxFramerate: 30 }] });
+    publisher.close();
+  });
+
   it("refuses an offer without one video stream and its RTX", async () => {
     const offer = vi.fn();
     const publisher = new ScreenPublisher({ track: {} as MediaStreamTrack, preset: "text", iceServers: [], offer, state: () => {} });

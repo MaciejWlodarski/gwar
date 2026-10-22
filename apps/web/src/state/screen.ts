@@ -31,9 +31,13 @@ export interface OwnShare {
   preview: boolean;
 }
 
-/** `requesting` until the server names the watch's slot. */
+/**
+ * `requesting` until the server answers this watch's own `screen.watch`. `id` tells a watch
+ * from an earlier one of the same share whose requests and releases may still be in flight.
+ */
 export interface Watch {
   share: string;
+  id: number;
   slot: number | null;
   status: "requesting" | "watching";
 }
@@ -68,8 +72,8 @@ export type ScreenAction =
   | { type: "ownEnded"; attempt: number }
   | { type: "transport"; run: number; phase: TransportPhase }
   | { type: "stream"; run: number; slot: number; stream: MediaStream }
-  | { type: "watch"; share: string }
-  | { type: "granted"; run: number; share: string; slot: number }
+  | { type: "watch"; share: string; id: number }
+  | { type: "granted"; run: number; id: number; slot: number }
   | { type: "slot"; run: number; slot: number; share: string | null }
   | { type: "unwatch"; share: string }
   | { type: "stage"; share: string }
@@ -146,25 +150,29 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
     }
     case "watch": {
       if (state.watches.some(w => w.share === action.share)) return { ...state, stage: action.share };
-      return { ...state, watches: [...state.watches, { share: action.share, slot: null, status: "requesting" }], stage: action.share };
+      return { ...state, watches: [...state.watches, { share: action.share, id: action.id, slot: null, status: "requesting" }], stage: action.share };
     }
-    case "granted":
+    case "granted": {
+      // Only the answer to this watch's own request: an earlier watch's assignment never counts.
+      const { run, id, slot } = action;
+      if (run !== state.transport.run || slot < 0 || slot >= SCREEN_SLOTS) return state;
+      const watch = state.watches.find(w => w.id === id && w.status === "requesting");
+      if (!watch) return state;
+      const slots = state.slots.slice();
+      slots[slot] = watch.share;
+      return { ...state, slots, watches: state.watches.map(w => (w === watch ? { ...w, slot, status: "watching" } : w)) };
+    }
     case "slot": {
       const { run, slot, share } = action;
       if (run !== state.transport.run || slot < 0 || slot >= SCREEN_SLOTS) return state;
       const slots = state.slots.slice();
-      const before = slots[slot];
       slots[slot] = share;
-      let next: ScreenState = { ...state, slots };
-      if (share !== null) {
-        next = { ...next, watches: next.watches.map(w => (w.share === share ? { ...w, slot, status: "watching" } : w)) };
-      } else if (before) {
-        // The server freed the slot: the watch it carried ended (unwatched, stopped, no access).
-        // A watch asked again since then waits for its own slot.
-        const ended = next.watches.find(w => w.share === before && w.slot === slot && w.status === "watching");
-        if (ended) next = withoutWatch(next, before);
-      }
-      return next;
+      const next: ScreenState = { ...state, slots };
+      if (share !== null) return next;
+      // The server freed the slot: the watch it granted ended (unwatched, stopped, no access).
+      // A watch asked again since then is still requesting, and waits for its own answer.
+      const ended = next.watches.find(w => w.slot === slot && w.status === "watching");
+      return ended ? withoutWatch(next, ended.share) : next;
     }
     case "unwatch":
       return withoutWatch(state, action.share);

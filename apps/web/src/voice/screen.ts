@@ -208,7 +208,9 @@ export class ScreenPublisher {
     if (this.closed) return;
     await pc.setRemoteDescription({ type: "answer", sdp: answer });
     if (this.closed) return;
-    await this.applyParameters(spec.maxBitrate);
+    // The latest preset: `setPreset` may have run while this negotiated.
+    await this.applyParameters(PRESETS[this.preset].maxBitrate);
+    if (this.closed) return;
     this.timer = setInterval(() => void this.headroom(), HEADROOM_INTERVAL_MS);
   }
 

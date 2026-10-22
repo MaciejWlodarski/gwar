@@ -9,7 +9,7 @@ import { useSession, useUi } from "./stores";
 
 const media = vi.hoisted(() => ({
   transports: [] as Array<{ params: { run: number; state(s: string): void; offer(sdp: string, run: number): Promise<string> }; close: () => void }>,
-  publishers: [] as Array<{ params: { offer(body: object): Promise<string>; state(s: string): void }; close: () => void; setPreset: () => Promise<void> }>,
+  publishers: [] as Array<{ params: { preset: string; offer(body: object): Promise<string>; state(s: string): void }; close: () => void; setPreset: () => Promise<void> }>,
 }));
 vi.mock("../voice/screen", async importOriginal => {
   const actual = await importOriginal<typeof import("../voice/screen")>();
@@ -23,7 +23,7 @@ vi.mock("../voice/screen", async importOriginal => {
   class ScreenPublisher {
     close = vi.fn();
     setPreset = vi.fn(async () => {});
-    constructor(readonly params: { offer(body: object): Promise<string>; state(s: string): void }) { media.publishers.push(this); }
+    constructor(readonly params: { preset: string; offer(body: object): Promise<string>; state(s: string): void }) { media.publishers.push(this); }
     async start() { await this.params.offer({ ssrc: 1, rtx_ssrc: 2, sdp: "publish-offer" }); }
   }
   return { ...actual, ScreenWatchTransport, ScreenPublisher, applyCapturePreset: vi.fn(async () => {}), captureSupport: () => "ok" as const };
@@ -51,6 +51,11 @@ function fakeLink(handlers: Record<string, Handler>) {
 }
 
 const toast = vi.fn();
+function deferred<T>() {
+  let resolve!: (v: T) => void, reject!: (e: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
 const flush = () => vi.advanceTimersByTimeAsync(0);
 
 beforeEach(() => {
@@ -86,7 +91,7 @@ describe("watching", () => {
     await watching;
     expect(ops()).toEqual(["screen.watch.offer", "screen.watch", "screen.watch", "screen.watch", "screen.focus"]);
     expect(calls[0]![1]).toMatchObject({ run: transport.params.run, sdp: "watch-offer" });
-    expect(useScreen.getState().watches).toEqual([{ share: "A", slot: 1, status: "watching" }]);
+    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 1, status: "watching" }]);
     // A second watch reuses the transport.
     useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "screen.started", d: share("B", 2, 2) } });
     await screen.watch("B").catch(() => {});
@@ -103,7 +108,7 @@ describe("watching", () => {
 
   it("says when every slot is taken", async () => {
     const { link } = fakeLink({ "screen.watch.offer": () => ({ sdp: "a" }), "screen.watch": () => { throw new RequestError("busy", "you are watching as many shares as allowed"); } });
-    useScreen.setState({ watches: ["W", "X", "Y", "Z"].map((share, slot) => ({ share, slot, status: "watching" as const })) });
+    useScreen.setState({ watches: ["W", "X", "Y", "Z"].map((share, slot) => ({ share, id: 100 + slot, slot, status: "watching" as const })) });
     const screen = new ScreenController(() => link, String);
     const watching = screen.watch("A");
     await flush();
@@ -115,10 +120,120 @@ describe("watching", () => {
 
   it("drops a watch when its share stops, and tells a viewer that lost access", () => {
     const screen = new ScreenController(() => null, String);
-    useScreen.setState({ watches: [{ share: "A", slot: 0, status: "watching" }], stage: "A" });
+    useScreen.setState({ watches: [{ share: "A", id: 100, slot: 0, status: "watching" }], stage: "A" });
     screen.handleEvent({ ev: "screen.stopped", d: { share: "A", reason: "access" } });
     expect(useScreen.getState().stage).toBeNull();
     expect(toast).toHaveBeenCalledWith("info", "You can no longer watch this screen share.");
+  });
+});
+
+describe("watch requests (review round 1)", () => {
+  it("a retry of a watch whose transport failed never reaches the replacement transport", async () => {
+    const { link, calls } = fakeLink({
+      "screen.watch.offer": () => ({ sdp: "answer" }),
+      "screen.watch": d => { if (d.share === "A") throw new RequestError("unavailable", "connect a watch transport first"); return { slot: 0 }; },
+    });
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "screen.started", d: share("B", 2, 2) } });
+    const screen = new ScreenController(() => link, String);
+    const watchingA = screen.watch("A");
+    await flush();
+    media.transports[0]!.params.state("connected");
+    await vi.advanceTimersByTimeAsync(300);
+    media.transports[0]!.params.state("failed");
+    const watchingB = screen.watch("B");
+    await flush();
+    media.transports[1]!.params.state("connected");
+    await vi.advanceTimersByTimeAsync(6_000);
+    await Promise.all([watchingA, watchingB]);
+    const asksForA = calls.filter(([op, d]) => op === "screen.watch" && d.share === "A").length;
+    await vi.advanceTimersByTimeAsync(6_000);
+    expect(calls.filter(([op, d]) => op === "screen.watch" && d.share === "A").length).toBe(asksForA);
+    expect(useScreen.getState().watches).toEqual([{ share: "B", id: expect.any(Number), slot: 0, status: "watching" }]);
+    expect(toast.mock.calls).toEqual([["error", "The connection for watching screen shares was lost."]]);
+  });
+
+  it("a slot granted to a retired watch is released", async () => {
+    const answer = deferred<{ slot: number }>();
+    const { link, ops } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => answer.promise });
+    const screen = new ScreenController(() => link, String);
+    const watching = screen.watch("A");
+    await flush();
+    media.transports[0]!.params.state("connected");
+    await flush();
+    media.transports[0]!.params.state("failed");
+    answer.resolve({ slot: 0 });
+    await watching;
+    expect(ops()).toEqual(["screen.watch.offer", "screen.watch", "screen.unwatch"]);
+    expect(useScreen.getState().watches).toEqual([]);
+  });
+
+  it("watch → stop → watch keeps the second watch, whatever order the first one's answers arrive in", async () => {
+    const answers = [deferred<{ slot: number }>(), deferred<{ slot: number }>()];
+    let asked = 0;
+    const { link, ops } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => answers[asked++]!.promise });
+    const screen = new ScreenController(() => link, String);
+    const first = screen.watch("A");
+    await flush();
+    const transport = media.transports[0]!;
+    transport.params.state("connected");
+    await flush();
+    const run = transport.params.run;
+    const stopping = screen.unwatch("A");
+    const second = screen.watch("A");
+    // The server assigns, answers and then releases the first watch's slot.
+    screen.handleEvent({ ev: "screen.slot", d: { run, slot: 0, share: "A" } });
+    answers[0]!.resolve({ slot: 0 });
+    await flush();
+    screen.handleEvent({ ev: "screen.slot", d: { run, slot: 0, share: null } });
+    await flush();
+    screen.handleEvent({ ev: "screen.slot", d: { run, slot: 1, share: "A" } });
+    answers[1]!.resolve({ slot: 1 });
+    await Promise.all([first, stopping, second]);
+    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 1, status: "watching" }]);
+    // The second request goes out only after the first watch's release.
+    expect(ops().slice(1)).toEqual(["screen.watch", "screen.unwatch", "screen.unwatch", "screen.watch", "screen.focus"]);
+  });
+
+  it("says why a watched share ended when its slot was freed first, as the server sends it", () => {
+    const screen = new ScreenController(() => null, String);
+    useScreen.setState({ transport: { run: 7, phase: "connected" }, watches: [{ share: "A", id: 1, slot: 0, status: "watching" }], stage: "A" });
+    screen.handleEvent({ ev: "screen.slot", d: { run: 7, slot: 0, share: null } });
+    expect(useScreen.getState().watches).toEqual([]);
+    screen.handleEvent({ ev: "screen.stopped", d: { share: "A", reason: "access" } });
+    expect(toast).toHaveBeenCalledWith("info", "You can no longer watch this screen share.");
+    toast.mockReset();
+    useScreen.setState({ watches: [{ share: "B", id: 2, slot: 1, status: "watching" }], stage: "B" });
+    screen.handleEvent({ ev: "screen.slot", d: { run: 7, slot: 1, share: null } });
+    screen.handleEvent({ ev: "screen.stopped", d: { share: "B", reason: "stopped" } });
+    expect(toast).toHaveBeenCalledWith("info", "The screen share has ended.");
+    // A share I never watched ends quietly.
+    toast.mockReset();
+    screen.handleEvent({ ev: "screen.stopped", d: { share: "C", reason: "access" } });
+    expect(toast).not.toHaveBeenCalled();
+  });
+
+  it("a failed watch transport says so once, from either failure path", async () => {
+    for (const how of ["state", "start"] as const) {
+      toast.mockReset();
+      useScreen.setState({ ...initialScreen });
+      const { link } = fakeLink({
+        "screen.watch.offer": () => { if (how === "start") throw new Error("offer refused"); return { sdp: "answer" }; },
+        "screen.watch": () => ({ slot: 0 }),
+      });
+      const screen = new ScreenController(() => link, String);
+      const watching = screen.watch("A");
+      await flush();
+      if (how === "state") {
+        media.transports.at(-1)!.params.state("connected");
+        await watching;
+        expect(useScreen.getState().watches).toHaveLength(1);
+        media.transports.at(-1)!.params.state("failed");
+      }
+      await watching;
+      expect(useScreen.getState()).toMatchObject({ watches: [], stage: null });
+      expect(toast).toHaveBeenCalledTimes(1);
+      expect(toast).toHaveBeenCalledWith("error", "The connection for watching screen shares was lost.");
+    }
   });
 });
 
@@ -142,6 +257,22 @@ describe("sharing", () => {
     expect(useScreen.getState().own?.phase).toBe("live");
     screen.handleEvent({ ev: "screen.viewers", d: { share: "M", members: 2, guests: 0 } });
     expect(useScreen.getState().own?.viewers).toBe(2);
+  });
+
+  it("starts with the preset chosen while screen.start was pending", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const started = deferred<{ share: string }>();
+    const { link } = fakeLink({ "screen.start": () => started.promise, "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String);
+    const t = choosing();
+    const confirming = screen.confirmShare();
+    await flush();
+    screen.setPreset("saver");
+    started.resolve({ share: "M" });
+    await confirming;
+    expect(media.publishers[0]!.params.preset).toBe("saver");
+    const { applyCapturePreset } = await import("../voice/screen");
+    expect(vi.mocked(applyCapturePreset).mock.calls.at(-1)).toEqual([t, "saver"]);
   });
 
   it("refuses in an encrypted channel without sending anything", async () => {
