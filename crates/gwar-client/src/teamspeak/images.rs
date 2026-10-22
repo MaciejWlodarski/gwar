@@ -190,7 +190,12 @@ pub fn transfer_address(server: SocketAddr, ip: Option<&str>, port: u16) -> Opti
         let entry = entry.trim();
         entry.is_empty() || entry.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified() || ip.to_canonical() == own)
     };
-    (port != 0 && ip.is_none_or(|ip| ip.split(',').all(ours))).then(|| SocketAddr::new(server.ip(), port))
+    // The server's own address with the offer's port: an IPv6 peer keeps its scope (interface).
+    (port != 0 && ip.is_none_or(|ip| ip.split(',').all(ours))).then(|| {
+        let mut address = server;
+        address.set_port(port);
+        address
+    })
 }
 
 /// Downloads a file of `size` bytes TeamSpeak offered: connects (`connect`), sends the transfer's
@@ -207,6 +212,11 @@ where
 {
     if size == 0 || size > limit {
         return Err(TransferError::Size);
+    }
+    // `timeout_at` polls its future once before looking at the clock: past the deadline, not even
+    // the connect is started.
+    if Instant::now() >= deadline {
+        return Err(TransferError::TimedOut);
     }
     let transfer = async {
         let mut stream = connect.await.map_err(|_| TransferError::Failed)?;
@@ -482,6 +492,9 @@ impl Images {
     /// one asked for (unknown, timed out, or offered already), or the file is too large (then it
     /// failed).
     pub fn offered(&mut self, id: u16, size: u64) -> Option<(u64, Instant)> {
+        if self.late(id) {
+            return None;
+        }
         let flight = self.flights.get_mut(&id)?;
         if flight.stage != Stage::Asked {
             return None;
@@ -500,6 +513,9 @@ impl Images {
     /// offer pointing anywhere but the server we are connected to ([`transfer_address`]) fails
     /// the file like a wrong one: not asked for again while it is shown.
     pub fn accept(&mut self, id: u16, offer: &tsclientlib::FileDownloadOffer) -> Option<(SocketAddr, u64, Instant)> {
+        if self.late(id) {
+            return None;
+        }
         let Some(address) = transfer_address(offer.server, offer.ip.as_deref(), offer.port) else {
             if let Some(flight) = self.flights.get(&id).filter(|f| f.stage == Stage::Asked) {
                 tracing::debug!(path = %flight.key.path(), ip = ?offer.ip, port = offer.port, "TeamSpeak offered a file elsewhere than its server: ignored");
@@ -509,6 +525,16 @@ impl Images {
         };
         let (limit, deadline) = self.offered(id, offer.size)?;
         Some((address, limit, deadline))
+    }
+
+    /// Whether transfer `id` is asked for and past its deadline, not yet expired by the tick: then
+    /// it ends now, timed out (to be tried again later), and its offer is ignored.
+    fn late(&mut self, id: u16) -> bool {
+        let late = self.flights.get(&id).is_some_and(|f| f.stage == Stage::Asked && Instant::now() >= f.deadline);
+        if late {
+            self.end_asked(id, true);
+        }
+        late
     }
 
     /// TeamSpeak refused transfer `id` (a missing file, say). A running download reports itself.
@@ -783,6 +809,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn an_offer_after_the_deadline_connects_nowhere() {
+        let server: SocketAddr = "192.0.2.7:9987".parse().unwrap();
+        let offer = tsclientlib::FileDownloadOffer { server, ip: None, port: 30033, key: "key".into(), size: 10 };
+        let mut images = Images::new();
+        let start = images.want(BTreeSet::from([ImageKey::Icon(1000), ImageKey::Icon(1001)]));
+        // Past the deadline, before the tick expired them: both offers are ignored at once.
+        tokio::time::advance(TIMEOUT).await;
+        assert_eq!(images.accept(start[0].0, &offer), None);
+        assert_eq!(images.offered(start[1].0, 10), None);
+        assert_eq!(images.busy(), 0, "ended, nothing of them runs");
+        // Timed out: tried again later, not now.
+        assert!(images.queued().is_empty());
+        tokio::time::advance(RETRY_DELAY).await;
+        assert!(images.expire(Instant::now()));
+        assert_eq!(images.queued().len(), 2);
+        // And a download whose deadline has passed does not even start to connect.
+        let never = async { panic!("connected") };
+        let late = Instant::now();
+        assert_eq!(
+            download::<tokio::io::DuplexStream>(never, "key".into(), 10, ICON_LIMIT, late).await,
+            Err(TransferError::TimedOut)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn timed_out_files_are_tried_again_a_few_times_later() {
         let mut images = Images::new();
         let key = ImageKey::Icon(1000);
@@ -863,6 +914,13 @@ mod tests {
             assert_eq!(to(Some(ip)), None, "{ip}");
         }
         assert_eq!(transfer_address(server, None, 0), None);
+        // A link-local peer keeps its interface.
+        let scoped: SocketAddr = "[fe80::1234%7]:9987".parse().unwrap();
+        let to_scoped = transfer_address(scoped, Some("fe80::1234"), 30033).unwrap();
+        assert_eq!(to_scoped, "[fe80::1234%7]:30033".parse::<SocketAddr>().unwrap());
+        let std::net::SocketAddr::V6(to_scoped) = to_scoped else { panic!("IPv6") };
+        assert_eq!((to_scoped.scope_id(), to_scoped.port()), (7, 30033));
+        assert_eq!(transfer_address(scoped, None, 30033).map(|a| a.to_string()), Some("[fe80::1234%7]:30033".into()));
         let v6: SocketAddr = "[2001:db8::7]:9987".parse().unwrap();
         assert_eq!(transfer_address(v6, Some("2001:db8::7"), 30033), Some("[2001:db8::7]:30033".parse().unwrap()));
         assert_eq!(transfer_address(v6, Some("2001:db8::8"), 30033), None);
