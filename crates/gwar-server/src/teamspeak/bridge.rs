@@ -12,10 +12,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -43,7 +40,7 @@ use super::{
 use crate::{
     TeamSpeakConfig,
     core::{
-        CoreHandle, PrivateWatchLinks, WatchUrl,
+        CoreHandle, PrivateWatchLinks, PrivateWatchReceipt, WatchUrl,
         bridge::{BridgeMsg, BridgeNote, RemoteClient, RemoteUpdate, ServerPassword},
         now_ms,
     },
@@ -272,7 +269,7 @@ struct PrivateWatch {
     recipient: Recipient,
     task: tokio::task::JoinHandle<bool>,
     completed: bool,
-    confirmed: Arc<AtomicBool>,
+    receipt: Arc<PrivateWatchReceipt>,
 }
 
 impl WatchPost {
@@ -280,7 +277,7 @@ impl WatchPost {
         for (uid, delivery) in &mut self.private {
             // Query records success at acknowledgement, even if departure wins the
             // delivery task's cancellation race before its next poll.
-            if delivery.confirmed.load(Ordering::Acquire) {
+            if delivery.receipt.confirmed() {
                 self.told.insert(uid.clone(), delivery.recipient.clone());
             }
             if !delivery.completed && delivery.task.is_finished() {
@@ -1454,20 +1451,19 @@ impl<'a> Bridge<'a> {
             }
             // Do not spawn tasks waiting on a semaphore or a full Query queue.
             let Ok(permit) = post.admission.clone().try_acquire_owned() else { continue };
-            let Some(url) = post.private_links.mint(&uid, recipient.generation.clone()) else { continue };
+            let Some((url, receipt)) = post.private_links.mint(&uid, recipient.generation.clone()) else { continue };
             let query = self.query.clone();
             let lease = post.lease.clone();
             let text = watch_text(&post.nickname, &url.0);
-            let confirmed = Arc::new(AtomicBool::new(false));
-            let receipt = confirmed.clone();
+            let acknowledged = receipt.clone();
             let target = recipient.clone();
             let task = tokio::spawn(async move {
                 let _permit = permit;
                 let parts = split_for_teamspeak(&text);
                 for (index, part) in parts.iter().enumerate() {
-                    let confirmed = (index + 1 == parts.len()).then(|| receipt.clone());
+                    let receipt = (index + 1 == parts.len()).then(|| acknowledged.clone());
                     let cmd = Cmd::new("sendtextmessage").arg("targetmode", 1).arg("target", clid).arg("msg", part);
-                    if let Err(e) = query.call_for(cmd, lease.clone(), target.clone(), confirmed).await {
+                    if let Err(e) = query.call_for(cmd, lease.clone(), target.clone(), receipt).await {
                         debug!(clid, "watch link message: {e:#}");
                         return false;
                     }
@@ -1475,7 +1471,7 @@ impl<'a> Bridge<'a> {
                 true
             });
             post.private
-                .insert(uid.clone(), PrivateWatch { recipient: recipient.clone(), task, completed: false, confirmed });
+                .insert(uid.clone(), PrivateWatch { recipient: recipient.clone(), task, completed: false, receipt });
         }
     }
 
@@ -3355,7 +3351,7 @@ mod tests {
             .unwrap();
             assert!(bridge.links["S"].told.is_empty(), "no receipt sweep yet");
             let original = bridge.links["S"].private["uid-70"].recipient.clone();
-            assert!(bridge.links["S"].private["uid-70"].confirmed.load(Ordering::Acquire));
+            assert!(bridge.links["S"].private["uid-70"].receipt.confirmed());
             move_remote(&mut bridge, 7, 20).await;
             if sweep_while_away {
                 bridge.complete_watch_posts().await;
@@ -3469,7 +3465,7 @@ mod tests {
                 // Wait for the original attempt without running recovery for the
                 // replacement membership (the same UID may legitimately rejoin).
                 let delivery = bridge.links.get_mut("S").unwrap().private.get_mut("uid-70").unwrap();
-                assert!(!delivery.confirmed.load(Ordering::Acquire));
+                assert!(!delivery.receipt.confirmed());
                 if !delivery.completed {
                     assert!(!tokio::time::timeout(Duration::from_secs(3), &mut delivery.task).await.unwrap().unwrap());
                     delivery.completed = true;

@@ -1350,10 +1350,13 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
 - A TeamSpeak user who enters the channel while the share runs gets a private
   link from ServerQuery once per uninterrupted channel membership. Each private
   delivery has a fresh token bound to that user's TeamSpeak UID and membership;
-  it never carries the channel post's shared token. Leaving, moving or
-  disconnecting revokes it, including when the same UID later returns. A return
-  gets one fresh private link. Confirmed delivery is recorded at acknowledgement
-  and retained for its membership, including across a delayed receipt sweep.
+  it never carries the channel post's shared token. A newly minted token is
+  inactive until Query processes the final private-message acknowledgement with
+  the original membership still valid. Leaving, moving or disconnecting revokes
+  it and terminates guests already using it, including when the same UID later
+  returns. A return gets one fresh private link. Confirmed delivery is recorded
+  at acknowledgement and retained for its membership, including across a delayed
+  receipt sweep.
 - Nothing is posted when the share ends. The link simply stops working.
 - The channel description's presence line gets " · sharing screen" after the
   sharer's name. The link is not put there: descriptions are visible to
@@ -1373,9 +1376,12 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
 - **Where it is kept:**
   - The guest gateway checks SHA-256(token) → share in memory. Private token
     hashes additionally carry the intended UID and an immutable membership
-    lease. At `guest.watch`, that UID's original membership in the share's
-    channel must still be live; otherwise the reply is the same `not_found`
-    as for an unknown token. A reconnect cannot revive an old membership.
+    lease and acknowledgement state. At `guest.watch`, the final private-message
+    acknowledgement must have been processed and that UID's original membership
+    in the share's channel must still be live; otherwise the reply is the same
+    `not_found` as for an unknown token. A reconnect cannot revive an old membership.
+    An admitted private guest keeps this lease: its end closes the watch transport
+    and WebSocket and releases its admission, even without another guest request.
   - The bridge keeps the raw shared URL for the channel post. Private URLs
     exist only in their delivery tasks and queued TeamSpeak commands; their
     registry retains hashes, UID bindings and membership leases.
@@ -1390,6 +1396,14 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
   share the same share/link lease; share end or link revocation invalidates
   every token synchronously. Guests using any of these tokens share the
   existing 10-guest and 25-viewer limits.
+- **Query ordering assumption.** TeamSpeak notifications and command responses
+  arrive on one ordered Query stream. A departure preceding clid reassignment is
+  therefore read before the acknowledgement of a private message executed against
+  that reused clid. The connection task invalidates memberships as it consumes
+  each notification, then activates private tokens at the final success response.
+  It does this before forwarding the result to a delivery task; neither the bridge
+  event loop nor its receipt sweep may activate a token. Before that response,
+  redemption is a generic miss even if departure bytes are still unread.
 - The shared channel token remains a bearer token for the channel audience;
   TeamSpeak retaining it in channel chat history is accepted.
 - Private recovery admits at most **four delivery tasks per share**, without
@@ -1427,7 +1441,7 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
     A guest that stops pinging is closed after 60 s.
   - The first frame is `guest.watch {token}`. The reply is
     `{share, sharer, preset, ice_servers}`, or one generic `not_found`
-    for unknown, ended and revoked tokens alike.
+    for unknown, inactive, ended and revoked tokens alike.
   - After that, only `guest.offer {sdp}` is accepted, **once per
     connection**, plus `screen.keyframe` and `ping {}`. The offer is a
     watch transport with **one** slot. A second offer closes the
@@ -1901,8 +1915,10 @@ design left room:
   its raw URL goes once to the bridge, in a redacted `WatchUrl`. Private
   delivery mints distinct tokens in a registry shared by the core and bridge,
   bound to the recipient's TS UID and uninterrupted channel membership. The
-  registry checks the share lease and membership again at redemption and
-  keeps at most 64 live private tokens per share.
+  registry keeps them inactive until the ordered Query acknowledgement, checks
+  the share lease and membership at redemption, and keeps at most 64 live private
+  tokens per share. Admitted private guests retain the membership lease; ending it
+  closes their transport and connection and frees their admission.
 - **"Possible" means:** a public URL, `screen_guest_links` on, `file_access`
   `link`, a bridge attached right now (not only `--teamspeak`), and a channel
   that is neither encrypted nor private. Private channels are never bridged,
@@ -1972,11 +1988,15 @@ design left room:
   bridge event loop, with four tasks admitted per share and no tasks waiting for
   admission. Query checks the recipient's connection and membership before
   every socket dispatch and retry, invalidating them before forwarding departures.
-  Private token redemption checks that same UID/membership binding, so clid
-  reassignment after dispatch cannot leave a usable misdelivered token once
-  the original recipient's departure is processed. A Query disconnect also
-  invalidates its memberships. The core ends the link's cancellation lease
-  synchronously on revocation or share end; all private tokens, queued posts,
+  Private tokens remain inactive until the connection task reads the final
+  successful acknowledgement with the original UID/membership still valid.
+  The single ordered Query stream places a departure before the acknowledgement
+  of a command executed against a reassigned clid, closing the unread-notification
+  redemption race. Redemption and subsequent offers and media callbacks recheck
+  the retained membership. A cancellation waiter ends the transport lease before
+  waiting for core queue capacity to release the guest admission. A Query disconnect
+  also invalidates its memberships and terminates their admitted private guests.
+  The core ends the link's cancellation lease synchronously on revocation or share end; all private tokens, queued posts,
   admission deferrals, sends and flood retries obey it. Queue admission and
   reply waiting share a 30 s deadline per send; an in-flight timeout closes
   Query and lets bridge supervision reconnect. A post too long for one
@@ -2000,11 +2020,16 @@ design left room:
   bridge tests cover confirmed puppet delivery, rejection, a dropped queued
   post, uncertain delivery without duplicate fallback, stale receipts and
   cancellation during a query move. Query tests cover cancellation in the
-  socket queue and before a flood retry. New regressions execute a private
-  command only after clid reassignment and refuse its token at redemption;
-  verify live, departed, returning and ended token bindings and the 64-token
-  cap; exercise both receipt-sweep orderings with one delivery per membership;
-  and keep 40-recipient recovery bounded with a stalled reply, share-end
+  socket queue and before a flood retry. A deterministic single-thread regression
+  writes departure/reassignment and acknowledgement bytes before redemption,
+  attempts redemption before Query can consume them, and verifies the generic
+  miss both then and after the acknowledgement. It also covers the normal ordered
+  acknowledgement and activation path. Guest gateway tests negotiate real SRTP,
+  receive 12 packets, end the membership, and verify socket closure, freed admission
+  and no subsequent RTP. Core tests fence queued offers and delayed connection
+  signals after membership ends; verify live, departed, returning and ended token
+  bindings and the 64-token cap; exercise both receipt-sweep orderings with one
+  delivery per membership; and keep 40-recipient recovery bounded with a stalled reply, share-end
   cancellation and Query reconnection signaling. They also cover the signed
   ServerQuery post, late joiners, encrypted channels, members-only servers
   and the description.

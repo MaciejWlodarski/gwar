@@ -8,7 +8,7 @@
 mod guests;
 
 pub(super) use guests::Guest;
-pub use guests::{GuestMsg, PrivateWatchLinks, WatchUrl};
+pub use guests::{GuestMsg, PrivateWatchLinks, PrivateWatchReceipt, WatchUrl};
 
 use super::{
     voice::{bad, stale},

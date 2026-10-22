@@ -6,14 +6,11 @@
 use std::{
     collections::BTreeMap,
     net::SocketAddr,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
-use crate::media::screen::Lease;
+use crate::{core::PrivateWatchReceipt, media::screen::Lease};
 use anyhow::{Context, Result, bail};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -196,7 +193,7 @@ type Reply = oneshot::Sender<Result<Vec<Record>, QueryError>>;
 /// One connection's uninterrupted stay in a channel. Query invalidates it before
 /// forwarding departure/move notifications, even while the bridge is busy.
 #[derive(Clone)]
-pub(super) struct Recipient {
+pub(crate) struct Recipient {
     uid: String,
     cid: u64,
     pub(super) generation: Arc<Lease>,
@@ -265,14 +262,14 @@ struct Request {
     /// A watch link's lifetime, checked at the socket as well as before a flood retry.
     lease: Option<Arc<Lease>>,
     recipient: Option<Recipient>,
-    confirmed: Option<Arc<AtomicBool>>,
+    receipt: Option<Arc<PrivateWatchReceipt>>,
 }
 
 struct InFlight {
     reply: Option<Reply>,
     records: Vec<Record>,
     clients: bool,
-    confirmed: Option<Arc<AtomicBool>>,
+    receipt: Option<Arc<PrivateWatchReceipt>>,
 }
 
 struct Lines {
@@ -444,7 +441,7 @@ impl Query {
         self.call_guarded(cmd, Some(lease), None, None).await
     }
 
-    pub(super) fn recipient(&self, clid: u16, uid: &str, cid: u64) -> Option<Recipient> {
+    pub(crate) fn recipient(&self, clid: u16, uid: &str, cid: u64) -> Option<Recipient> {
         self.connection
             .recipients
             .lock()
@@ -455,14 +452,14 @@ impl Query {
             .cloned()
     }
 
-    pub(super) async fn call_for(
+    pub(crate) async fn call_for(
         &self,
         cmd: Cmd,
         lease: Arc<Lease>,
         recipient: Recipient,
-        confirmed: Option<Arc<AtomicBool>>,
+        receipt: Option<Arc<PrivateWatchReceipt>>,
     ) -> Result<Vec<Record>> {
-        self.call_guarded(cmd, Some(lease), Some(recipient), confirmed).await
+        self.call_guarded(cmd, Some(lease), Some(recipient), receipt).await
     }
 
     async fn call_guarded(
@@ -470,16 +467,16 @@ impl Query {
         cmd: Cmd,
         lease: Option<Arc<Lease>>,
         recipient: Option<Recipient>,
-        confirmed: Option<Arc<AtomicBool>>,
+        receipt: Option<Arc<PrivateWatchReceipt>>,
     ) -> Result<Vec<Record>> {
         let line = cmd.line();
         let work = async {
-            match self.send(&line, lease.clone(), recipient.clone(), confirmed.clone()).await {
+            match self.send(&line, lease.clone(), recipient.clone(), receipt.clone()).await {
                 Err(e) => match e.downcast_ref::<QueryError>().and_then(flood_wait) {
                     Some(wait) => {
                         tracing::warn!(target: "teamspeak::query", "flood protection, retrying in {wait:?}");
                         sleep(wait + Duration::from_millis(250)).await;
-                        self.send(&line, lease.clone(), recipient.clone(), confirmed).await
+                        self.send(&line, lease.clone(), recipient.clone(), receipt).await
                     }
                     None => Err(e),
                 },
@@ -499,7 +496,7 @@ impl Query {
         line: &str,
         lease: Option<Arc<Lease>>,
         recipient: Option<Recipient>,
-        confirmed: Option<Arc<AtomicBool>>,
+        receipt: Option<Arc<PrivateWatchReceipt>>,
     ) -> Result<Vec<Record>> {
         if recipient.as_ref().is_some_and(|r| !r.current()) {
             bail!("watch link recipient left");
@@ -512,7 +509,7 @@ impl Query {
             let (reply, rx) = oneshot::channel();
             self.connection
                 .tx
-                .send(Request { line: line.to_owned(), reply: Some(reply), lease, recipient, confirmed })
+                .send(Request { line: line.to_owned(), reply: Some(reply), lease, recipient, receipt })
                 .await
                 .map_err(|_| anyhow::anyhow!("query connection closed"))?;
             Ok::<_, anyhow::Error>(rx.await.map_err(|_| anyhow::anyhow!("query connection closed"))??)
@@ -585,12 +582,16 @@ async fn run(
                         tracing::warn!(target: "teamspeak::query", "notification backlog full, dropping");
                     }
                 } else if let Some(rest) = line.strip_prefix("error ") {
-                    if let Some(InFlight { reply, records, confirmed, .. }) = current.take()
+                    if let Some(InFlight { reply, records, receipt, .. }) = current.take()
                         && let Some(reply) = reply
                     {
                         let result = parse_error(rest);
-                        if result.is_ok() && let Some(confirmed) = confirmed {
-                            confirmed.store(true, Ordering::Release);
+                        if result.is_ok() && let Some(receipt) = receipt {
+                            // Notifications and command replies share one ordered stream.
+                            // In particular, departure before clid reuse is consumed before
+                            // the reused clid's send acknowledgement. Activate here, never in
+                            // the bridge's independently scheduled delivery/receipt tasks.
+                            receipt.acknowledge();
                         }
                         let _ = reply.send(result.map(|()| records));
                     }
@@ -608,7 +609,7 @@ async fn run(
                 }
             }
             request = requests.recv(), if current.is_none() => {
-                let Some(Request { line, reply, lease, recipient, confirmed }) = request else { return };
+                let Some(Request { line, reply, lease, recipient, receipt }) = request else { return };
                 if lease.as_ref().is_some_and(|lease| !lease.alive())
                     || recipient.as_ref().is_some_and(|r| !r.current())
                     || reply.as_ref().is_some_and(oneshot::Sender::is_closed)
@@ -620,14 +621,14 @@ async fn run(
                     return;
                 }
                 deadline = Instant::now() + CALL_TIMEOUT;
-                current = Some(InFlight { reply, records: Vec::new(), clients: line.starts_with("clientlist ") && line.contains(" -uid"), confirmed });
+                current = Some(InFlight { reply, records: Vec::new(), clients: line.starts_with("clientlist ") && line.contains(" -uid"), receipt });
             }
             _ = keepalive.tick(), if current.is_none() => {
                 if !matches!(timeout(CALL_TIMEOUT, write.write_all(b"whoami\n")).await, Ok(Ok(()))) {
                     return;
                 }
                 deadline = Instant::now() + CALL_TIMEOUT;
-                current = Some(InFlight { reply: None, records: Vec::new(), clients: false, confirmed: None });
+                current = Some(InFlight { reply: None, records: Vec::new(), clients: false, receipt: None });
             }
         }
     }
@@ -1033,7 +1034,7 @@ pub(crate) mod tests {
                 reply: Some(reply),
                 lease: Some(Lease::new()),
                 recipient: Some(recipient),
-                confirmed: None,
+                receipt: None,
             })
             .await
             .unwrap();
@@ -1058,7 +1059,7 @@ pub(crate) mod tests {
                 reply: Some(reply),
                 lease: Some(lease),
                 recipient: None,
-                confirmed: None,
+                receipt: None,
             })
             .await
             .unwrap();

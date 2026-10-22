@@ -221,23 +221,51 @@ async fn private_links_are_presence_bound_at_the_guest_gateway_and_end_with_the_
     })
     .await;
     let membership = Lease::new();
-    let url = links.mint("recipient", membership.clone()).unwrap();
+    let (url, receipt) = links.mint("recipient", membership.clone()).unwrap();
     let token = url.0.rsplit_once('#').unwrap().1;
     assert_ne!(url, shared);
+    let miss = json!({"code": "not_found", "message": "this link does not work"});
+    let mut pending = Guest::connect(&server, "198.51.100.10").await;
+    assert_eq!(pending.watch(token).await.unwrap_err(), miss);
+    pending.closed().await;
+    receipt.acknowledge();
     let mut present = Guest::connect(&server, "198.51.100.1").await;
     assert_eq!(present.watch(token).await.unwrap()["share"], share);
-    drop(present);
+    assert_eq!(alice.next_event("screen.viewers").await, json!({"share": share, "members": 0, "guests": 1}));
+    let mut viewer = present.offer().await;
+    within("a keyframe request for the private guest", async {
+        while alice.publisher(&share).keyframe_requests() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    stream(alice.publisher(&share), 100, 4).await;
+    assert_eq!(viewer.collect(Duration::from_millis(500)).await.len(), 12);
     membership.end();
+    present.closed().await;
+    assert_eq!(alice.next_event("screen.viewers").await, json!({"share": share, "members": 0, "guests": 0}));
     let mut departed = Guest::connect(&server, "198.51.100.2").await;
     assert_eq!(
         departed.watch(token).await.unwrap_err(),
         json!({"code": "not_found", "message": "this link does not work"})
     );
     departed.closed().await;
-    let returned = links.mint("recipient", Lease::new()).unwrap();
+    let (returned, returned_receipt) = links.mint("recipient", Lease::new()).unwrap();
     let fresh = returned.0.rsplit_once('#').unwrap().1;
+    returned_receipt.acknowledge();
     let mut present = Guest::connect(&server, "198.51.100.3").await;
     assert_eq!(present.watch(fresh).await.unwrap()["share"], share);
+    let requests = alice.publisher(&share).keyframe_requests();
+    let mut returned_viewer = present.offer().await;
+    within("a keyframe request for the returning guest", async {
+        while alice.publisher(&share).keyframe_requests() <= requests {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    stream(alice.publisher(&share), 200, 4).await;
+    assert_eq!(returned_viewer.collect(Duration::from_millis(500)).await.len(), 12, "the publisher remains active");
+    assert!(viewer.collect(Duration::from_millis(500)).await.is_empty(), "revoked transport receives no RTP");
     alice.ok("screen.stop", json!({"share": share})).await;
     assert_eq!(present.next_event().await, json!({"ev": "screen.stopped", "d": {"share": share, "reason": "stopped"}}));
     present.closed().await;
