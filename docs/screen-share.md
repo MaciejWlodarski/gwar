@@ -1938,7 +1938,13 @@ design left room:
   through moves and TeamSpeak's command result. Readers count as told only after
   success. A definite rejection or a command dropped before dispatch uses the
   signed fallback; a lost connection after dispatch leaves delivery unknown and
-  does not repeat the channel post. Each receipt belongs to one post attempt.
+  does not repeat the channel post. Untold readers who remain in the channel get
+  one private recovery attempt per uninterrupted channel membership, with at most
+  one flood retry. Each receipt belongs to one post attempt. A departure or move
+  invalidates a reader's membership, so leaving and returning before a receipt
+  cannot count as reading the channel post. Private delivery runs outside the
+  bridge event loop; Query checks the recipient's connection and membership before
+  every socket dispatch and retry, invalidating them before forwarding departures.
   The core ends the link's cancellation lease synchronously on revocation or
   share end; queued posts and fallbacks check it before sending. A post too long
   for one puppet command goes entirely through ServerQuery, avoiding partial

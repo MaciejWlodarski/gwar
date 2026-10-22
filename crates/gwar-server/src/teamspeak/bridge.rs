@@ -35,7 +35,7 @@ use super::{
         self, ChannelText, MessageText, PostDelivery, PostResult, PuppetCmd, PuppetEvent, PuppetHandle, PuppetSpec,
         Shared,
     },
-    query::{Cmd, Query, QueryError, Record},
+    query::{Cmd, Query, QueryError, Recipient, Record},
 };
 use crate::{
     TeamSpeakConfig,
@@ -256,7 +256,21 @@ struct WatchPost {
     nickname: String,
     lease: Arc<Lease>,
     /// This receiver identifies this exact attempt, even if the puppet or share is replaced.
-    pending: Option<(oneshot::Receiver<PostResult>, HashSet<String>)>,
+    pending: Option<(oneshot::Receiver<PostResult>, HashMap<String, Recipient>)>,
+    /// One bounded private attempt per identity and uninterrupted channel membership.
+    private: HashMap<String, PrivateWatch>,
+}
+
+struct PrivateWatch {
+    recipient: Recipient,
+    task: tokio::task::JoinHandle<bool>,
+    completed: bool,
+}
+
+impl Drop for PrivateWatch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl Drop for WatchPost {
@@ -1272,7 +1286,13 @@ impl<'a> Bridge<'a> {
         let Some(local) = self.locals.get(&session) else { return };
         let text = watch_text(&local.client.nickname, &url.0);
         let nickname = local.client.nickname.clone();
-        let readers = self.remotes.values().filter(|r| r.cid == cid).map(|r| r.uid.clone()).collect();
+        let readers = self
+            .remotes
+            .iter()
+            .filter_map(|(&clid, r)| {
+                self.query.recipient(clid, &r.uid, cid).map(|recipient| (r.uid.clone(), recipient))
+            })
+            .collect();
         let puppet = local.puppet.as_ref().filter(|_| local.client.channel == Some(channel));
         // A tracked post is one command: a long post goes entirely through ServerQuery,
         // never partially through the puppet before a refused enqueue triggers fallback.
@@ -1287,7 +1307,10 @@ impl<'a> Bridge<'a> {
             (result, readers)
         });
         let queued = pending.is_some();
-        self.links.insert(share.clone(), WatchPost { channel, text, told: HashSet::new(), nickname, lease, pending });
+        self.links.insert(
+            share.clone(),
+            WatchPost { channel, text, told: HashSet::new(), nickname, lease, pending, private: HashMap::new() },
+        );
         if queued {
             self.complete_watch_posts().await;
         } else {
@@ -1316,7 +1339,7 @@ impl<'a> Bridge<'a> {
                     post.told.extend(
                         self.remotes
                             .values()
-                            .filter(|r| Some(r.cid) == cid && readers.contains(&r.uid))
+                            .filter(|r| Some(r.cid) == cid && readers.get(&r.uid).is_some_and(Recipient::current))
                             .map(|r| r.uid.clone()),
                     );
                 }
@@ -1327,6 +1350,23 @@ impl<'a> Bridge<'a> {
         for share in completed {
             self.fallback_watch_post(&share).await;
         }
+        for post in self.links.values_mut() {
+            for (uid, delivery) in &mut post.private {
+                if !delivery.completed && delivery.task.is_finished() {
+                    delivery.completed = true;
+                    if (&mut delivery.task).await.unwrap_or(false) && post.lease.alive() && delivery.recipient.current()
+                    {
+                        post.told.insert(uid.clone());
+                    }
+                }
+            }
+        }
+        // Unknown channel delivery must recover even for readers who never move.
+        // PrivateWatch keeps failures bounded to one attempt per membership.
+        let readers: Vec<_> = self.remotes.iter().map(|(&clid, r)| (clid, r.cid)).collect();
+        for (clid, cid) in readers {
+            self.tell_watch_links(clid, cid).await;
+        }
     }
 
     async fn fallback_watch_post(&mut self, share: &str) {
@@ -1334,8 +1374,13 @@ impl<'a> Bridge<'a> {
         let Some(cid) = self.map.ts(post.channel) else { return };
         let lease = post.lease.clone();
         let signed = signed_text(&post.nickname, &post.text);
-        let readers: Vec<_> =
-            self.remotes.iter().filter(|(_, r)| r.cid == cid).map(|(&clid, r)| (clid, r.uid.clone())).collect();
+        let readers: Vec<_> = self
+            .remotes
+            .iter()
+            .filter_map(|(&clid, r)| {
+                self.query.recipient(clid, &r.uid, cid).map(|recipient| (clid, r.uid.clone(), recipient))
+            })
+            .collect();
         if readers.is_empty() {
             return;
         }
@@ -1349,10 +1394,10 @@ impl<'a> Bridge<'a> {
         }
         if posted {
             if let Some(post) = self.links.get_mut(share) {
-                post.told.extend(readers.into_iter().map(|(_, uid)| uid));
+                post.told.extend(readers.into_iter().filter(|(_, _, r)| r.current()).map(|(_, uid, _)| uid));
             }
         } else {
-            for (clid, _) in readers {
+            for (clid, _, _) in readers {
                 self.tell_watch_links(clid, cid).await;
             }
         }
@@ -1362,32 +1407,36 @@ impl<'a> Bridge<'a> {
     /// not reached them yet do, as a private message from ServerQuery. They count as told once
     /// the message went out.
     async fn tell_watch_links(&mut self, clid: u16, cid: u64) {
-        let Some(uid) = self.remotes.get(&clid).map(|r| r.uid.clone()) else { return };
-        let due: Vec<_> = self
-            .links
-            .iter()
-            .filter(|(_, post)| {
-                post.lease.alive()
-                    && post.pending.as_ref().is_none_or(|(_, readers)| !readers.contains(&uid))
-                    && self.map.ts(post.channel) == Some(cid)
-                    && !post.told.contains(&uid)
-            })
-            .map(|(share, post)| (share.clone(), post.text.clone(), post.lease.clone()))
-            .collect();
-        'posts: for (share, text, lease) in due {
-            for part in split_for_teamspeak(&text) {
-                if !lease.alive() {
-                    continue 'posts;
-                }
-                let cmd = Cmd::new("sendtextmessage").arg("targetmode", 1).arg("target", clid).arg("msg", part);
-                if let Err(e) = self.query.call_while(cmd, lease.clone()).await {
-                    debug!(clid, "watch link message: {e:#}");
-                    continue 'posts;
-                }
+        let Some(remote) = self.remotes.get(&clid).filter(|r| r.cid == cid) else { return };
+        let uid = remote.uid.clone();
+        let Some(recipient) = self.query.recipient(clid, &uid, cid) else { return };
+        for post in self.links.values_mut() {
+            if !post.lease.alive()
+                || self.map.ts(post.channel) != Some(cid)
+                || post.told.contains(&uid)
+                || post
+                    .pending
+                    .as_ref()
+                    .is_some_and(|(_, readers)| readers.get(&uid).is_some_and(|r| r.same(&recipient)))
+                || post.private.get(&uid).is_some_and(|delivery| delivery.recipient.current())
+            {
+                continue;
             }
-            if let Some(post) = self.links.get_mut(&share) {
-                post.told.insert(uid.clone());
-            }
+            let query = self.query.clone();
+            let lease = post.lease.clone();
+            let text = post.text.clone();
+            let target = recipient.clone();
+            let task = tokio::spawn(async move {
+                for part in split_for_teamspeak(&text) {
+                    let cmd = Cmd::new("sendtextmessage").arg("targetmode", 1).arg("target", clid).arg("msg", part);
+                    if let Err(e) = query.call_for(cmd, lease.clone(), target.clone()).await {
+                        debug!(clid, "watch link message: {e:#}");
+                        return false;
+                    }
+                }
+                true
+            });
+            post.private.insert(uid.clone(), PrivateWatch { recipient: recipient.clone(), task, completed: false });
         }
     }
 
@@ -2090,7 +2139,7 @@ mod tests {
             })
             .await
             .unwrap();
-        bridge.remotes.insert(7, remote(session, 10));
+        insert_remote(&mut bridge, 7, remote(session, 10));
         let original = core.audio_origin(session).await.unwrap();
         bridge.shared.mirror(7, 10, original.clone());
         let old = bridge.shared.mirrors.read().unwrap()[&7].clone();
@@ -2207,10 +2256,10 @@ mod tests {
             })
             .await
             .unwrap();
-        bridge.remotes.insert(7, remote(session, 10));
+        insert_remote(&mut bridge, 7, remote(session, 10));
         commands.lock().unwrap().clear();
         // They walk into 20 on TeamSpeak: our side refuses and asks for them back, twice at most.
-        bridge.client_moved(7, 20).await;
+        move_remote(&mut bridge, 7, 20).await;
         let mut corrections = 0;
         while let Ok(Some(note)) = tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await {
             if let BridgeNote::Event(event) = note
@@ -2301,7 +2350,7 @@ mod tests {
         bridge.apply_talker(7).await;
         assert!(sent(&commands).is_empty());
         // A move: silent until our side decides for the new channel.
-        bridge.client_moved(7, 20).await;
+        move_remote(&mut bridge, 7, 20).await;
         let got = sent(&commands);
         assert!(got.iter().any(|c| c == "clientedit clid=7 client_is_talker=0"), "{got:?}");
         assert!(got.iter().any(|c| c.starts_with("clientdelperm cldbid=5")), "{got:?}");
@@ -2706,6 +2755,32 @@ mod tests {
         (bridge, core)
     }
 
+    fn insert_remote(bridge: &mut Bridge<'_>, clid: u16, remote: Remote) {
+        super::super::query::tests::observe_recipient(&bridge.query, clid, &remote.uid, remote.cid);
+        bridge.remotes.insert(clid, remote);
+    }
+
+    async fn move_remote(bridge: &mut Bridge<'_>, clid: u16, cid: u64) {
+        if let Some(remote) = bridge.remotes.get(&clid) {
+            super::super::query::tests::observe_recipient(&bridge.query, clid, &remote.uid, cid);
+        }
+        bridge.client_moved(clid, cid).await;
+    }
+
+    async fn finish_private(bridge: &mut Bridge<'_>) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                bridge.complete_watch_posts().await;
+                if bridge.links.values().all(|post| post.private.values().all(|delivery| delivery.completed)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("private delivery completes");
+    }
+
     const LINK: &str = "https://gwar.test/watch#c2VjcmV0LXRva2VuLWZvci10aGUtdGVzdHMtb25seQ";
 
     fn watch_link(channel: ChannelId) -> BridgeNote {
@@ -2743,7 +2818,7 @@ mod tests {
         let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
         let (cmds, mut sent) = mpsc::channel(8);
         bridge.locals.get_mut(&500).unwrap().puppet = Some(PuppetHandle::for_test(cmds));
-        bridge.remotes.insert(7, remote(70, 10));
+        insert_remote(&mut bridge, 7, remote(70, 10));
         bridge.on_note(watch_link(1)).await;
         let Ok(PuppetCmd::Post { text, channel, delivery }) = sent.try_recv() else { panic!("a puppet post") };
         assert_eq!(text.0, format!("🖥 [\u{200B}b]alice is sharing their screen. Watch: {LINK}"));
@@ -2754,8 +2829,9 @@ mod tests {
         assert_eq!(bridge.links["S"].told, HashSet::from(["uid-70".to_owned()]));
         assert!(messages(&commands).is_empty(), "the puppet posts, not ServerQuery");
         assert!(bridge.links.contains_key("S"));
-        bridge.client_moved(7, 20).await;
-        bridge.client_moved(7, 10).await;
+        move_remote(&mut bridge, 7, 20).await;
+        move_remote(&mut bridge, 7, 10).await;
+        finish_private(&mut bridge).await;
         bridge.complete_watch_posts().await;
         assert!(messages(&commands).is_empty(), "a successful puppet post is never retried");
     }
@@ -2783,13 +2859,15 @@ mod tests {
             })
             .await
             .unwrap();
-        bridge.remotes.insert(7, remote(session, 20));
-        bridge.client_moved(7, 10).await;
+        insert_remote(&mut bridge, 7, remote(session, 20));
+        move_remote(&mut bridge, 7, 10).await;
+        finish_private(&mut bridge).await;
         let text = format!("🖥 [\u{200B}b]alice is sharing their screen. Watch: {LINK}");
         assert_eq!(messages(&commands), vec![("1".into(), "7".into(), text.clone())]);
         // Out and back in: told already.
-        bridge.client_moved(7, 20).await;
-        bridge.client_moved(7, 10).await;
+        move_remote(&mut bridge, 7, 20).await;
+        move_remote(&mut bridge, 7, 10).await;
+        finish_private(&mut bridge).await;
         assert_eq!(messages(&commands).len(), 1, "a late joiner gets the link once");
 
         // A second share, posted while a TeamSpeak user reads the channel: signed by ServerQuery.
@@ -2805,16 +2883,17 @@ mod tests {
         let signed = format!("[\u{200B}[\u{200B}b]alice] {text}");
         assert_eq!(messages(&commands), vec![("2".into(), "10".into(), signed)]);
         // Those who read it in the channel are not told again.
-        bridge.client_moved(7, 20).await;
-        bridge.client_moved(7, 10).await;
+        move_remote(&mut bridge, 7, 20).await;
+        move_remote(&mut bridge, 7, 10).await;
+        finish_private(&mut bridge).await;
         assert_eq!(messages(&commands).len(), 1);
 
         // Gone: nobody is told any more.
         bridge.on_note(BridgeNote::WatchLinkGone { share: "S".into() }).await;
         bridge.on_note(BridgeNote::WatchLinkGone { share: "T".into() }).await;
         assert!(bridge.links.is_empty(), "the bridge's copy is gone");
-        bridge.remotes.insert(8, remote(session, 20));
-        bridge.client_moved(8, 10).await;
+        insert_remote(&mut bridge, 8, remote(session, 20));
+        move_remote(&mut bridge, 8, 10).await;
         assert_eq!(messages(&commands).len(), 1);
     }
 
@@ -2829,7 +2908,7 @@ mod tests {
             let local = bridge.locals.get_mut(&500).unwrap();
             local.puppet = Some(PuppetHandle::for_test(cmds));
             local.client.channel = Some(channel);
-            bridge.remotes.insert(7, remote(70, if channel == 2 { 20 } else { 10 }));
+            insert_remote(&mut bridge, 7, remote(70, if channel == 2 { 20 } else { 10 }));
             bridge.on_note(watch_link(channel)).await;
             assert!(sent.try_recv().is_err(), "channel {channel}, {access:?}: no puppet post");
             assert!(messages(&commands).is_empty(), "channel {channel}, {access:?}: no ServerQuery post");
@@ -2847,14 +2926,15 @@ mod tests {
         let (cmds, sent) = mpsc::channel(8);
         drop(sent);
         bridge.locals.get_mut(&500).unwrap().puppet = Some(PuppetHandle::for_test(cmds));
-        bridge.remotes.insert(7, remote(70, 10));
+        insert_remote(&mut bridge, 7, remote(70, 10));
         bridge.on_note(watch_link(1)).await;
         let text = format!("🖥 [\u{200B}b]alice is sharing their screen. Watch: {LINK}");
         let signed = format!("[\u{200B}[\u{200B}b]alice] {text}");
         assert_eq!(messages(&commands), vec![("2".into(), "10".into(), signed)]);
         // The reader read it there and is not told again.
-        bridge.client_moved(7, 20).await;
-        bridge.client_moved(7, 10).await;
+        move_remote(&mut bridge, 7, 20).await;
+        move_remote(&mut bridge, 7, 10).await;
+        finish_private(&mut bridge).await;
         assert_eq!(messages(&commands).len(), 1);
         assert_eq!(bridge.links["S"].told, HashSet::from(["uid-70".to_owned()]));
     }
@@ -2867,11 +2947,10 @@ mod tests {
         let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
         let (cmds, sent) = mpsc::channel(8);
         bridge.locals.get_mut(&500).unwrap().puppet = Some(PuppetHandle::for_test(cmds));
-        bridge.remotes.insert(7, remote(70, 10));
+        insert_remote(&mut bridge, 7, remote(70, 10));
         bridge.on_note(watch_link(1)).await;
         assert!(bridge.links["S"].told.is_empty(), "queue acceptance is not delivery");
-        bridge.client_moved(7, 20).await;
-        bridge.client_moved(7, 10).await;
+        bridge.tell_watch_links(7, 10).await;
         assert!(messages(&commands).is_empty(), "no second attempt while the first is pending");
 
         // Reproduction: the puppet dies with the accepted post still in its command queue.
@@ -2882,8 +2961,9 @@ mod tests {
         assert_eq!(messages(&commands), vec![("2".into(), "10".into(), signed_text("[b]alice", &text))]);
         assert_eq!(bridge.links["S"].told, HashSet::from(["uid-70".to_owned()]));
         bridge.complete_watch_posts().await;
-        bridge.client_moved(7, 20).await;
-        bridge.client_moved(7, 10).await;
+        move_remote(&mut bridge, 7, 20).await;
+        move_remote(&mut bridge, 7, 10).await;
+        finish_private(&mut bridge).await;
         assert_eq!(messages(&commands).len(), 1, "exactly one fallback");
     }
 
@@ -2895,7 +2975,7 @@ mod tests {
         let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
         let (cmds, mut sent) = mpsc::channel(8);
         bridge.locals.get_mut(&500).unwrap().puppet = Some(PuppetHandle::for_test(cmds));
-        bridge.remotes.insert(7, remote(70, 10));
+        insert_remote(&mut bridge, 7, remote(70, 10));
         bridge.on_note(watch_link(1)).await;
         let PuppetCmd::Post { mut delivery, .. } = sent.recv().await.unwrap() else { panic!("post") };
         delivery.dispatched();
@@ -2910,24 +2990,81 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn uncertain_puppet_delivery_never_repeats_the_channel_post_and_does_not_mark_readers() {
+    async fn uncertain_puppet_delivery_recovers_privately_for_a_stationary_reader_once() {
         let (query, commands) = channel_query(false).await;
         let dir = tempfile::tempdir().unwrap();
         let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
         let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
         let (cmds, mut sent) = mpsc::channel(8);
         bridge.locals.get_mut(&500).unwrap().puppet = Some(PuppetHandle::for_test(cmds));
-        bridge.remotes.insert(7, remote(70, 10));
+        insert_remote(&mut bridge, 7, remote(70, 10));
         bridge.on_note(watch_link(1)).await;
         let PuppetCmd::Post { mut delivery, .. } = sent.recv().await.unwrap() else { panic!("post") };
         delivery.dispatched();
         drop(delivery);
         bridge.complete_watch_posts().await;
         assert!(bridge.links["S"].told.is_empty());
-        assert!(messages(&commands).is_empty(), "delivery may have succeeded; no fallback");
-        bridge.client_moved(7, 20).await;
-        bridge.client_moved(7, 10).await;
+        finish_private(&mut bridge).await;
+        for _ in 0..20 {
+            bridge.complete_watch_posts().await;
+        }
         assert_eq!(messages(&commands), vec![("1".into(), "7".into(), watch_text("[b]alice", LINK))]);
+        assert!(bridge.links["S"].told.contains("uid-70"));
+    }
+
+    #[tokio::test]
+    async fn uncertain_delivery_private_recovery_is_bounded_even_when_rejected() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (query, commands) = channel_query_texts(false, 10, fail.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
+        let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
+        let (cmds, mut sent) = mpsc::channel(8);
+        bridge.locals.get_mut(&500).unwrap().puppet = Some(PuppetHandle::for_test(cmds));
+        insert_remote(&mut bridge, 7, remote(70, 10));
+        bridge.on_note(watch_link(1)).await;
+        let PuppetCmd::Post { mut delivery, .. } = sent.recv().await.unwrap() else { panic!("post") };
+        delivery.dispatched();
+        drop(delivery);
+        finish_private(&mut bridge).await;
+        assert!(bridge.links["S"].told.is_empty());
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..20 {
+            bridge.complete_watch_posts().await;
+        }
+        finish_private(&mut bridge).await;
+        assert_eq!(
+            messages(&commands),
+            vec![("1".into(), "7".into(), watch_text("[b]alice", LINK))],
+            "one recovery attempt, no channel repeat"
+        );
+        move_remote(&mut bridge, 7, 20).await;
+        move_remote(&mut bridge, 7, 10).await;
+        finish_private(&mut bridge).await;
+        assert_eq!(messages(&commands).len(), 2, "a new membership may retry a failed private message");
+        assert!(bridge.links["S"].told.contains("uid-70"));
+    }
+
+    #[tokio::test]
+    async fn ended_or_revoked_links_cancel_pending_private_delivery() {
+        for gone in [false, true] {
+            let (query, commands) = channel_query(false).await;
+            let dir = tempfile::tempdir().unwrap();
+            let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
+            let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
+            bridge.on_note(watch_link(1)).await;
+            insert_remote(&mut bridge, 7, remote(70, 10));
+            bridge.tell_watch_links(7, 10).await;
+            assert!(bridge.links["S"].private.contains_key("uid-70"));
+            if gone {
+                bridge.on_note(BridgeNote::WatchLinkGone { share: "S".into() }).await;
+            } else {
+                bridge.links["S"].lease.end();
+            }
+            finish_private(&mut bridge).await;
+            bridge.query.call(Cmd::new("whoami")).await.unwrap();
+            assert!(messages(&commands).is_empty(), "pending private tasks cannot send after cancellation");
+        }
     }
 
     #[tokio::test]
@@ -2939,7 +3076,7 @@ mod tests {
             let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
             let (cmds, mut sent) = mpsc::channel(8);
             bridge.locals.get_mut(&500).unwrap().puppet = Some(PuppetHandle::for_test(cmds));
-            bridge.remotes.insert(7, remote(70, 10));
+            insert_remote(&mut bridge, 7, remote(70, 10));
             bridge.on_note(watch_link(1)).await;
             let PuppetCmd::Post { delivery, .. } = sent.recv().await.unwrap() else { panic!("post") };
             assert!(delivery.current());
@@ -2952,8 +3089,9 @@ mod tests {
             assert!(!delivery.current(), "a queued puppet command may no longer send");
             drop(delivery);
             bridge.complete_watch_posts().await;
-            bridge.client_moved(7, 20).await;
-            bridge.client_moved(7, 10).await;
+            move_remote(&mut bridge, 7, 20).await;
+            move_remote(&mut bridge, 7, 10).await;
+            finish_private(&mut bridge).await;
             assert!(messages(&commands).is_empty(), "neither fallback nor private message after cancellation");
         }
     }
@@ -2967,7 +3105,7 @@ mod tests {
         let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
         let (cmds, sent) = mpsc::channel(8);
         bridge.locals.get_mut(&500).unwrap().puppet = Some(PuppetHandle::for_test(cmds));
-        bridge.remotes.insert(7, remote(70, 10));
+        insert_remote(&mut bridge, 7, remote(70, 10));
         bridge.post_watch_link("S".into(), 500, 1, WatchUrl(LINK.into()), lease.clone()).await;
         drop(sent);
         bridge.complete_watch_posts().await;
@@ -2985,7 +3123,7 @@ mod tests {
         let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
         let (cmds, mut sent) = mpsc::channel(8);
         bridge.locals.get_mut(&500).unwrap().puppet = Some(PuppetHandle::for_test(cmds));
-        bridge.remotes.insert(7, remote(70, 10));
+        insert_remote(&mut bridge, 7, remote(70, 10));
         bridge.on_note(watch_link(1)).await;
         let PuppetCmd::Post { delivery: old, .. } = sent.recv().await.unwrap() else { panic!("post") };
         bridge.on_note(watch_link(1)).await;
@@ -3009,7 +3147,7 @@ mod tests {
         let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
         let (cmds, mut sent) = mpsc::channel(1);
         bridge.locals.get_mut(&500).unwrap().puppet = Some(PuppetHandle::for_test(cmds));
-        bridge.remotes.insert(7, remote(70, 10));
+        insert_remote(&mut bridge, 7, remote(70, 10));
         bridge
             .post_watch_link(
                 "S".into(),
@@ -3031,19 +3169,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
         let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
-        bridge.remotes.insert(7, remote(70, 10));
+        insert_remote(&mut bridge, 7, remote(70, 10));
         // Neither the signed post nor the private message to the reader goes out.
         bridge.on_note(watch_link(1)).await;
+        finish_private(&mut bridge).await;
         assert!(bridge.links["S"].told.is_empty(), "nobody was told");
         // Back and forth once ServerQuery may post again: the reader is told now, once.
         fail.store(false, std::sync::atomic::Ordering::SeqCst);
         commands.lock().unwrap().clear();
-        bridge.client_moved(7, 20).await;
-        bridge.client_moved(7, 10).await;
+        move_remote(&mut bridge, 7, 20).await;
+        move_remote(&mut bridge, 7, 10).await;
+        finish_private(&mut bridge).await;
         let text = format!("🖥 [\u{200B}b]alice is sharing their screen. Watch: {LINK}");
         assert_eq!(messages(&commands), vec![("1".into(), "7".into(), text)]);
-        bridge.client_moved(7, 20).await;
-        bridge.client_moved(7, 10).await;
+        move_remote(&mut bridge, 7, 20).await;
+        move_remote(&mut bridge, 7, 10).await;
+        finish_private(&mut bridge).await;
         assert_eq!(messages(&commands).len(), 1);
     }
 
@@ -3054,13 +3195,15 @@ mod tests {
         let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
         let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
         bridge.on_note(watch_link(1)).await;
-        bridge.remotes.insert(7, remote(70, 20));
-        bridge.client_moved(7, 10).await;
+        insert_remote(&mut bridge, 7, remote(70, 20));
+        move_remote(&mut bridge, 7, 10).await;
+        finish_private(&mut bridge).await;
         assert_eq!(messages(&commands).len(), 1);
         // They leave; someone else connects and TeamSpeak hands them the same client id.
         bridge.remotes.remove(&7);
-        bridge.remotes.insert(7, remote(71, 20));
-        bridge.client_moved(7, 10).await;
+        insert_remote(&mut bridge, 7, remote(71, 20));
+        move_remote(&mut bridge, 7, 10).await;
+        finish_private(&mut bridge).await;
         let told: Vec<_> = messages(&commands).into_iter().map(|(mode, target, _)| (mode, target)).collect();
         assert_eq!(told, vec![("1".into(), "7".into()), ("1".into(), "7".into())], "both users get the link");
     }
@@ -3090,5 +3233,100 @@ mod tests {
         let description = bridge.descriptions[&10].clone();
         assert_eq!(description, "[b]In the app (1):[/b] [\u{200B}b]alice · sharing screen");
         assert!(!commands.lock().unwrap().iter().any(|c| c.contains("watch")), "no link in any command");
+    }
+
+    #[tokio::test]
+    async fn a_reader_who_leaves_during_delivery_gets_a_private_link_after_returning() {
+        let (query, commands) = channel_query(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
+        let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
+        let (cmds, mut sent) = mpsc::channel(8);
+        bridge.locals.get_mut(&500).unwrap().puppet = Some(PuppetHandle::for_test(cmds));
+        insert_remote(&mut bridge, 7, remote(70, 10));
+        bridge.on_note(watch_link(1)).await;
+        let PuppetCmd::Post { mut delivery, .. } = sent.recv().await.unwrap() else { panic!("post") };
+        move_remote(&mut bridge, 7, 20).await;
+        // TeamSpeak accepts the channel post while this reader is elsewhere.
+        delivery.dispatched();
+        delivery.complete(true);
+        // Both move notifications can beat the next 100 ms receipt sweep.
+        move_remote(&mut bridge, 7, 10).await;
+        bridge.complete_watch_posts().await;
+        assert!(!bridge.links["S"].told.contains("uid-70"), "the old membership missed the channel post");
+        finish_private(&mut bridge).await;
+        assert_eq!(messages(&commands), vec![("1".into(), "7".into(), watch_text("[b]alice", LINK))]);
+        assert!(bridge.links["S"].told.contains("uid-70"));
+        move_remote(&mut bridge, 7, 20).await;
+        move_remote(&mut bridge, 7, 10).await;
+        finish_private(&mut bridge).await;
+        assert_eq!(messages(&commands).len(), 1, "confirmed private delivery suppresses later rejoins");
+    }
+
+    #[tokio::test]
+    async fn a_private_flood_retry_cannot_follow_a_reused_client_id() {
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::TcpListener,
+        };
+        for handle_notifications in [false, true] {
+            for replacement in ["other-user", "uid-70"] {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let replacement_cid = if handle_notifications { 30 } else { 10 };
+                let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+                let seen = delivered.clone();
+                tokio::spawn(async move {
+                    let (sock, _) = listener.accept().await.unwrap();
+                    let (read, mut write) = sock.into_split();
+                    write.write_all(b"TS3\n\rWelcome\n\r").await.unwrap();
+                    let mut lines = BufReader::new(read).lines();
+                    let mut flooded = false;
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        if line.starts_with("sendtextmessage ") {
+                            if !flooded {
+                                flooded = true;
+                                // The numeric ID is reused during flood backoff. The bridge
+                                // may handle these events immediately or remain busy elsewhere.
+                                write.write_all(format!("notifyclientleftview clid=7 reasonid=8\n\rnotifycliententerview clid=7 cid={replacement_cid} client_type=0 client_unique_identifier={replacement}\n\rerror id=524 msg=client\\sis\\sflooding extra_msg=please\\swait\\s1\\sseconds\n\r").as_bytes()).await.unwrap();
+                                continue;
+                            }
+                            seen.lock().unwrap().push(("other-user", line));
+                        }
+                        write.write_all(b"error id=0 msg=ok\n\r").await.unwrap();
+                    }
+                });
+                let (query, mut notes) = Query::connect(addr, "serveradmin", "p", 1).await.unwrap();
+                let dir = tempfile::tempdir().unwrap();
+                let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
+                let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
+                bridge.on_note(watch_link(1)).await; // No readers: retain the link, no channel post.
+                insert_remote(&mut bridge, 7, remote(70, 10));
+                tokio::time::timeout(Duration::from_millis(100), bridge.tell_watch_links(7, 10))
+                    .await
+                    .expect("private delivery must not block the bridge on flood backoff");
+                let departure = tokio::time::timeout(Duration::from_secs(2), notes.recv()).await.unwrap().unwrap();
+                assert_eq!(departure.name, "notifyclientleftview");
+                if handle_notifications {
+                    bridge.on_notification(departure).await;
+                    assert!(!bridge.remotes.contains_key(&7), "departure is handled while delivery is pending");
+                    let arrival = notes.recv().await.unwrap();
+                    bridge.on_notification(arrival).await;
+                    assert_eq!(bridge.remotes[&7].uid, replacement);
+                }
+                // Wait for the original attempt without running recovery for the
+                // replacement membership (the same UID may legitimately rejoin).
+                let delivery = bridge.links.get_mut("S").unwrap().private.get_mut("uid-70").unwrap();
+                assert!(!tokio::time::timeout(Duration::from_secs(3), &mut delivery.task).await.unwrap().unwrap());
+                delivery.completed = true;
+                // A barrier on the same transport also detects a retry written late.
+                bridge.query.call(Cmd::new("whoami")).await.unwrap();
+                assert!(
+                    delivered.lock().unwrap().is_empty(),
+                    "a replacement connection must not receive the bearer link"
+                );
+                assert!(bridge.links["S"].told.is_empty());
+            }
+        }
     }
 }
