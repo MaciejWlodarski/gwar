@@ -794,6 +794,24 @@ mod tests {
     /// clocks. No schedule may conceal more. About a minute in release:
     /// `cargo test --release -p gwar-client --lib drain_grid -- --ignored --nocapture`.
     #[test]
+    fn a_delayed_refill_over_short_packets_is_not_an_overflow() {
+        use super::super::jitter::Clock;
+        // 64 packets of 2.5 or 5 ms are only 160 or 320 ms of audio, which a refill serviced late
+        // with speaker headroom can queue legitimately. A 64-packet cap trimmed that to the
+        // target and dropped what the catch-up refill needed: 1,920 and 3,840 samples cut, and
+        // 51 and 40 concealments instead of 27 and 20. The cap is 1 s of audio now.
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for (packet, callback, late_ms) in [(120, 5760, 60), (240, 11_520, 100)] {
+                let late = periodic_delay(clock, &[packet], &[callback], u64::MAX / 2, 0, |k| {
+                    if k == 10 { late_ms * 48 } else { 0 }
+                });
+                let (on_time, _) = periodic_delay(clock, &[packet], &[callback], u64::MAX / 2, 0, |_| 0);
+                assert_eq!(late, (on_time, 0), "{clock:?} {packet}");
+            }
+        }
+    }
+
+    #[test]
     #[ignore = "slow; run on demand"]
     fn drain_grid_never_conceals_more_than_the_reserve_rule() {
         use super::super::jitter::Clock;

@@ -282,11 +282,13 @@ pub struct JitterBuffer {
     last_attempt: Option<Instant>,
     pub(crate) concealments: u64,
     pub(crate) late_drops: u64,
-    /// Queued packets dropped, oldest first, to keep the queue within `MAX_PACKETS`.
+    /// Queued packets dropped, oldest first, to keep the queue within `MAX_QUEUED` and
+    /// `MAX_PACKETS`.
     pub(crate) overflow_drops: u64,
     /// Overflow dropped the packets before the playout position: the next one fades in.
     skipped: bool,
-    /// The queue overflowed since the last refill: the next one trims it to the target.
+    /// The queue exceeded `MAX_QUEUED` since the last refill: the next one trims it to the
+    /// target.
     overflowed: bool,
     pub(crate) shrink_samples: u64,
     pub(crate) trim_events: u64,
@@ -299,7 +301,12 @@ pub struct JitterBuffer {
 const FRAME: u64 = 960; // TS packet-counter stride and unknown-stream default.
 const MAX_CONCEAL: u64 = 4800; // 100 ms of audio, independent of packet duration.
 const STALL: Duration = Duration::from_millis(100);
-const MAX_PACKETS: usize = 64;
+// Queued audio beyond any legitimate need: the 160 ms target, plus a refill and speaker headroom
+// (the speaker ring holds 500 ms), with margin.
+const MAX_QUEUED: u64 = 48_000;
+// A memory bound only: 1.28 s of the shortest (2.5 ms) packets, so `MAX_QUEUED` binds first.
+const MAX_PACKETS: usize = 512;
+const _: () = assert!(MAX_PACKETS as u64 * 120 > MAX_QUEUED);
 const MAX_TARGET: u64 = 7680; // 160 ms, independent of packet duration.
 const QUIET_SHRINK: Duration = Duration::from_secs(1);
 // Retain sparse dips (including a 5 ms delay every three seconds). Corrections
@@ -435,13 +442,15 @@ impl JitterBuffer {
             self.arrival = Some((ts, now, samples));
         }
         self.packets.insert(ts, Packet { data, samples, step: if clock == Clock::Sequence { FRAME } else { samples } });
-        // Bound memory by keeping the newest audio. Keeping the oldest instead (while refills
-        // stop, say) played seconds-old audio on resume, then concealed the hole after it,
+        // Bound the queue by keeping the newest audio. Keeping the oldest instead (while
+        // refills stop, say) played stale audio on resume, then concealed the hole after it,
         // which the arrivals during the concealment refilled only to be dropped again.
-        while self.packets.len() > MAX_PACKETS {
-            let Some((oldest, _)) = self.packets.pop_first() else { break };
+        let mut queued = self.depth().1;
+        while queued > MAX_QUEUED || self.packets.len() > MAX_PACKETS {
+            self.overflowed |= queued > MAX_QUEUED;
+            let Some((oldest, packet)) = self.packets.pop_first() else { break };
+            queued -= packet.samples;
             self.overflow_drops += 1;
-            self.overflowed = true;
             if self.next.is_some_and(|next| next <= oldest) {
                 self.next = self.packets.first_key_value().map(|(&ts, _)| ts);
                 self.held = 0;
@@ -765,8 +774,9 @@ impl JitterBuffer {
         if demand > 0 {
             fade = std::mem::take(&mut self.skipped);
         }
-        // An overflow means a backlog far beyond any jitter target: the output stopped
-        // consuming, or a burst of more than the queue arrived. Holding it buys nothing.
+        // More than `MAX_QUEUED` is beyond any target, refill and speaker headroom: the output
+        // stopped consuming, or a burst of more than that arrived. Holding it buys nothing, and
+        // no later refill can need more than this one's demand or the target.
         if demand > 0 && std::mem::take(&mut self.overflowed) {
             fade |= self.trim(u64::MAX, demand, now);
         }
@@ -1625,8 +1635,10 @@ mod tests {
         for k in paused..resume {
             push(&mut jb, k);
         }
-        assert_eq!(jb.depth().0, MAX_PACKETS, "{clock:?} {pattern:?}");
-        assert_eq!(jb.overflow_drops, resume - paused - MAX_PACKETS as u64, "{clock:?} {pattern:?}");
+        let (count, queued) = jb.depth();
+        let longest = *pattern.iter().max().unwrap() as u64;
+        assert!(queued <= MAX_QUEUED && queued + longest > MAX_QUEUED, "{clock:?} {pattern:?}: {queued}");
+        assert_eq!(jb.overflow_drops, resume - paused - count as u64, "{clock:?} {pattern:?}");
         let before = player.played.len();
         let mut levels = Vec::new();
         for k in resume..4000 {
@@ -1707,15 +1719,15 @@ mod tests {
         let mut jb = JitterBuffer::new();
         jb.push_at(0, 480, vec![0], start, Clock::Rtp);
         assert_eq!(jb.pop_at(start), packet(0));
-        // A hole at the head holds playback while 65 later packets arrive at once.
-        for k in 2..=66u64 {
+        // A hole at the head holds playback while 101 later packets (1.01 s) arrive at once.
+        for k in 2..=102u64 {
             jb.push_at(k * 480, 480, vec![k as u8], start + Duration::from_millis(5), Clock::Rtp);
         }
-        assert_eq!((jb.depth().0, jb.overflow_drops), (MAX_PACKETS, 1));
+        assert_eq!((jb.depth().0, jb.overflow_drops), (100, 1));
         // Playback moved past the dropped packet; packet 1 is late now.
         assert_eq!(jb.next, Some(3 * 480));
         jb.push_at(480, 480, vec![1], start + Duration::from_millis(6), Clock::Rtp);
-        assert_eq!((jb.depth().0, jb.overflow_drops, jb.late_drops), (MAX_PACKETS, 1, 1));
+        assert_eq!((jb.depth().0, jb.overflow_drops, jb.late_drops), (100, 1, 1));
         // The next refill trims the rest to the target (the burst raised it) and fades in.
         let Playout::Packet { data, fade: true, .. } = jb.pop_for(start + Duration::from_millis(10), 480) else {
             panic!("no packet")
@@ -1724,7 +1736,7 @@ mod tests {
         assert_eq!(jb.trim_events, 1);
         let depth = jb.depth().1;
         assert!(depth + 480 >= jb.target_samples() && depth < jb.target_samples(), "{depth}");
-        assert_eq!(depth, (66 - u64::from(data[0])) * 480);
+        assert_eq!(depth, (102 - u64::from(data[0])) * 480);
         let Playout::Packet { data: next, fade: false, .. } = jb.pop_for(start + Duration::from_millis(20), 480) else {
             panic!("no packet")
         };

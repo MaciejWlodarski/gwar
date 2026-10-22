@@ -369,7 +369,7 @@ old nonquiet deadline; uncorrelated audio never uses that deadline to force a
 cut. Quiet audio retains the <=240-sample skip and 120-sample boundary fade.
 Burst recovery still discards whole packets and fades as before.
 
-Queue overflow (2026-10-22). The queue holds at most 64 packets. When it was
+Queue overflow (2026-10-22). The queue held at most 64 packets. When it was
 full, a new packet was dropped, so a queue that filled while the output device
 was paused kept its oldest audio: on resume it played the stale 640 ms (10 ms
 packets), then concealed the hole after it, and the packets arriving during that
@@ -380,22 +380,36 @@ instead; when that moves past the playout position, playback continues at the
 oldest kept packet and fades in. The window's marks restart (they counted the
 dropped audio), but the last observation stays.
 
-An overflow is also the evidence that the backlog is worth nothing: 64 packets
-(at least 640 ms of 10 ms packets) are far beyond any jitter target, so either
-the output stopped consuming or more than a queue's worth arrived at once. The
-next refill after an overflow therefore trims the queue once, oldest first, down
-to the target and its own demand, by the queued packets' own durations (mixed
-10/20 ms streams included; holes count as nothing, so at least the target of
-real audio stays). It is the stall-recovery trim with its fade, counted as a
-trim event; the window restarts. A burst of more than 64 packets at once is
-trimmed the same way, which is acceptable: that much never arrives inside a
-jitter target. In simulation
+A packet count says little about duration, though: 64 packets of 2.5 ms are
+only 160 ms (the largest target), and 64 of 5 ms 320 ms, which a refill serviced
+late with speaker headroom can queue legitimately. The queue is therefore capped
+by duration: 1 s of queued audio (`MAX_QUEUED`), above the 160 ms target plus a
+refill and speaker headroom (the speaker ring holds 500 ms), with margin. A
+count of 512 packets remains as a memory bound only; at 2.5 ms per packet it is
+1.28 s, so the duration cap always binds first.
+
+Exceeding 1 s is also the evidence that the backlog is worth nothing: either the
+output stopped consuming or more than a second of audio arrived at once. The
+next refill after that therefore trims the queue once, oldest first, down to the
+target and its own demand, by the queued packets' own durations (mixed 10/20 ms
+streams included; holes count as nothing, so at least the target of real audio
+stays). Short of such a burst, the output had not consumed for over 840 ms,
+longer than the speaker ring lasts, so no later catch-up refill needs more than
+this one's demand. It is
+the stall-recovery trim with its fade, counted as a trim event; the window
+restarts. A burst of more than a second at once is trimmed the same way, which
+is acceptable: that much never arrives inside a jitter target. In simulation
 (`a_full_queue_keeps_the_newest_audio_and_trims_to_the_target_after_a_pause`,
-both clocks, 20 s pause) the first refill after the pause trimmed 630 ms
-(10 ms packets), 1.26 s (20 ms), 940 ms (alternating 10/20 ms) and 840 ms
-(20/10/10 ms), and playback went on from the newest audio at the target with no
-gap and no PLC. Before this trim, the backlog took the fractional drain 65.5 s
-(10 ms packets) to 126.5 s (20 ms packets, quiet 5 ms cuts) to remove.
+both clocks, 20 s pause) the first refill after the pause trimmed 990 ms (10 ms
+packets), 980 ms (20 ms and 20/10/10 ms) and 970 ms (alternating 10/20 ms), and
+playback went on from the newest audio at the target with no gap and no PLC.
+Without the trim, a 64-packet backlog took the fractional drain 65.5 s (10 ms
+packets) to 126.5 s (20 ms packets, quiet 5 ms cuts). With the 64-packet trigger,
+a 2.5 ms stream with 120 ms refills, one 60 ms late, lost 1,920 samples and
+concealed 51 times instead of 27; 5 ms packets with 240 ms refills, one 100 ms
+late, lost 3,840 samples and concealed 40 times instead of 20
+(`a_delayed_refill_over_short_packets_is_not_an_overflow`, now no cut and no
+extra PLC).
 
 A refill-stall rule that dropped the backlog at once was tried and left out.
 Refill timing alone cannot tell a paused device from late pipeline service: a
