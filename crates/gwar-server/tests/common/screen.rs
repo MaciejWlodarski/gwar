@@ -38,16 +38,25 @@ pub fn vp8(start: bool, keyframe: bool, body: &[u8]) -> Vec<u8> {
 }
 
 /// A frame of `packets` packets with timestamp `timestamp`, each tagged with `tag` and its index.
+/// Packets are near full size, like a real share's: str0m sizes its probes in payload bytes,
+/// and on tiny packets the headers alone would overflow a viewer's extras reserve.
 pub fn frame(sequence: u64, timestamp: u32, keyframe: bool, packets: usize, tag: u8) -> Vec<Packet> {
     (0..packets)
-        .map(|i| Packet {
-            sequence: sequence + i as u64,
-            timestamp,
-            marker: i + 1 == packets,
-            payload: vp8(i == 0, keyframe, &[tag, i as u8, 0xaa, 0x55]),
+        .map(|i| {
+            let mut body = vec![0x55; BODY];
+            body[..4].copy_from_slice(&[tag, i as u8, 0xaa, 0x55]);
+            Packet {
+                sequence: sequence + i as u64,
+                timestamp,
+                marker: i + 1 == packets,
+                payload: vp8(i == 0, keyframe, &body),
+            }
         })
         .collect()
 }
+
+/// A test packet's body: its tag, index and filler.
+const BODY: usize = 1000;
 
 /// Which outgoing or incoming RTP datagrams a peer drops on purpose, by sequence number on the
 /// given stream: each listed number is dropped once, so its repair gets through.

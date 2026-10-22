@@ -64,7 +64,7 @@ async fn a_late_viewer_starts_at_a_keyframe_and_gets_every_byte_in_order() {
     // Byte for byte, and numbered without gaps from the keyframe on.
     let packets: Vec<_> = received.iter().map(|(_, p)| p).collect();
     assert!(packets.windows(2).all(|w| w[1].sequence == w[0].sequence + 1));
-    assert_eq!(packets[0].payload, screen::vp8(true, true, &[20, 0, 0xaa, 0x55]));
+    assert_eq!(packets[0].payload, screen::frame(0, 0, true, 1, 20)[0].payload);
     assert!(packets.iter().filter(|p| p.marker).count() == 4, "markers pass through");
 }
 
