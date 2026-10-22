@@ -3,8 +3,14 @@
 //! One task owns the socket and serializes commands; `notify*` lines are routed to a separate channel and never
 //! mistaken for a reply, even when they arrive between a command and its `error` line.
 
-use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
+use crate::{core::PrivateWatchReceipt, media::screen::Lease};
 use anyhow::{Context, Result, bail};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -14,7 +20,7 @@ use tokio::{
     },
     sync::{mpsc, oneshot},
     task::JoinHandle,
-    time::{Instant, interval_at, sleep, timeout},
+    time::{Instant, interval_at, sleep, sleep_until, timeout},
 };
 
 /// One key/value group of a reply; values are unescaped and bare flags map to `""`.
@@ -184,10 +190,86 @@ fn flood_wait(err: &QueryError) -> Option<Duration> {
 
 type Reply = oneshot::Sender<Result<Vec<Record>, QueryError>>;
 
+/// One connection's uninterrupted stay in a channel. Query invalidates it before
+/// forwarding departure/move notifications, even while the bridge is busy.
+#[derive(Clone)]
+pub(crate) struct Recipient {
+    uid: String,
+    cid: u64,
+    pub(super) generation: Arc<Lease>,
+}
+
+impl Recipient {
+    pub(super) fn current(&self) -> bool {
+        self.generation.alive()
+    }
+
+    pub(super) fn same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.generation, &other.generation)
+    }
+}
+
+#[derive(Default)]
+struct Recipients(BTreeMap<u16, Recipient>);
+
+impl Recipients {
+    fn observe(&mut self, record: &Record) {
+        let Some(clid) = record.get("clid").and_then(|v| v.parse().ok()) else { return };
+        let Some(uid) = record.get("client_unique_identifier").filter(|uid| !uid.is_empty()) else { return };
+        let Some(cid) = record.get("cid").or_else(|| record.get("ctid")).and_then(|v| v.parse().ok()) else { return };
+        if self.0.get(&clid).is_some_and(|r| r.uid == *uid && r.cid == cid) {
+            return;
+        }
+        self.remove(clid);
+        self.0.insert(clid, Recipient { uid: uid.clone(), cid, generation: Lease::new() });
+    }
+
+    fn remove(&mut self, clid: u16) {
+        if let Some(old) = self.0.remove(&clid) {
+            old.generation.end();
+        }
+    }
+
+    fn notification(&mut self, notification: &Notification) {
+        for record in &notification.records {
+            let Some(clid) = record.get("clid").and_then(|v| v.parse().ok()) else { continue };
+            match notification.name.as_str() {
+                "notifyclientleftview" => self.remove(clid),
+                "notifycliententerview" => {
+                    self.remove(clid);
+                    self.observe(record);
+                }
+                "notifyclientmoved" => {
+                    if let Some(mut old) = self.0.remove(&clid) {
+                        old.generation.end();
+                        if let Some(cid) = record.get("ctid").and_then(|v| v.parse().ok()) {
+                            old.cid = cid;
+                            old.generation = Lease::new();
+                            self.0.insert(clid, old);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 struct Request {
     line: String,
     /// `None` for internal keepalives.
     reply: Option<Reply>,
+    /// A watch link's lifetime, checked at the socket as well as before a flood retry.
+    lease: Option<Arc<Lease>>,
+    recipient: Option<Recipient>,
+    receipt: Option<Arc<PrivateWatchReceipt>>,
+}
+
+struct InFlight {
+    reply: Option<Reply>,
+    records: Vec<Record>,
+    clients: bool,
+    receipt: Option<Arc<PrivateWatchReceipt>>,
 }
 
 struct Lines {
@@ -202,6 +284,7 @@ impl Drop for Lines {
 }
 
 struct Connection {
+    recipients: Arc<Mutex<Recipients>>,
     tx: mpsc::Sender<Request>,
     task: JoinHandle<()>,
 }
@@ -279,8 +362,9 @@ impl Query {
         }
         let (tx, rx) = mpsc::channel(32);
         let (notify_tx, notify_rx) = mpsc::channel(NOTIFICATION_BACKLOG);
-        let task = tokio::spawn(run(write, lines, rx, notify_tx));
-        let query = Query { connection: Arc::new(Connection { tx, task }) };
+        let recipients = Arc::new(Mutex::new(Recipients::default()));
+        let task = tokio::spawn(run(write, lines, rx, notify_tx, recipients.clone()));
+        let query = Query { connection: Arc::new(Connection { tx, task, recipients }) };
         query
             .call(Cmd::new("login").arg("client_login_name", login).arg("client_login_password", password))
             .await
@@ -350,31 +434,95 @@ impl Query {
 
     /// Run a command. A non-zero error id comes back as a [`QueryError`] inside the `anyhow::Error`.
     pub async fn call(&self, cmd: Cmd) -> Result<Vec<Record>> {
+        self.call_guarded(cmd, None, None, None).await
+    }
+
+    pub(super) async fn call_while(&self, cmd: Cmd, lease: Arc<Lease>) -> Result<Vec<Record>> {
+        self.call_guarded(cmd, Some(lease), None, None).await
+    }
+
+    pub(crate) fn recipient(&self, clid: u16, uid: &str, cid: u64) -> Option<Recipient> {
+        self.connection
+            .recipients
+            .lock()
+            .unwrap()
+            .0
+            .get(&clid)
+            .filter(|r| r.uid == uid && r.cid == cid && r.current())
+            .cloned()
+    }
+
+    pub(crate) async fn call_for(
+        &self,
+        cmd: Cmd,
+        lease: Arc<Lease>,
+        recipient: Recipient,
+        receipt: Option<Arc<PrivateWatchReceipt>>,
+    ) -> Result<Vec<Record>> {
+        self.call_guarded(cmd, Some(lease), Some(recipient), receipt).await
+    }
+
+    async fn call_guarded(
+        &self,
+        cmd: Cmd,
+        lease: Option<Arc<Lease>>,
+        recipient: Option<Recipient>,
+        receipt: Option<Arc<PrivateWatchReceipt>>,
+    ) -> Result<Vec<Record>> {
         let line = cmd.line();
-        match self.send(&line).await {
-            Err(e) => match e.downcast_ref::<QueryError>().and_then(flood_wait) {
-                Some(wait) => {
-                    tracing::warn!(target: "teamspeak::query", "flood protection, retrying in {wait:?}");
-                    sleep(wait + Duration::from_millis(250)).await;
-                    self.send(&line).await
-                }
-                None => Err(e),
-            },
-            ok => ok,
+        let work = async {
+            match self.send(&line, lease.clone(), recipient.clone(), receipt.clone()).await {
+                Err(e) => match e.downcast_ref::<QueryError>().and_then(flood_wait) {
+                    Some(wait) => {
+                        tracing::warn!(target: "teamspeak::query", "flood protection, retrying in {wait:?}");
+                        sleep(wait + Duration::from_millis(250)).await;
+                        self.send(&line, lease.clone(), recipient.clone(), receipt).await
+                    }
+                    None => Err(e),
+                },
+                ok => ok,
+            }
+        };
+        tokio::select! {
+            biased;
+            _ = async { if let Some(lease) = &lease { lease.ended().await } else { std::future::pending().await } } => bail!("watch link ended"),
+            _ = async { if let Some(recipient) = &recipient { recipient.generation.ended().await } else { std::future::pending().await } } => bail!("watch link recipient left"),
+            result = work => result,
         }
     }
 
-    async fn send(&self, line: &str) -> Result<Vec<Record>> {
-        let (reply, rx) = oneshot::channel();
-        self.connection
-            .tx
-            .send(Request { line: line.to_owned(), reply: Some(reply) })
-            .await
-            .map_err(|_| anyhow::anyhow!("query connection closed"))?;
-        match timeout(CALL_TIMEOUT, rx).await {
-            Err(_) => bail!("query command timed out"),
-            Ok(Err(_)) => bail!("query connection closed"),
-            Ok(Ok(result)) => Ok(result?),
+    async fn send(
+        &self,
+        line: &str,
+        lease: Option<Arc<Lease>>,
+        recipient: Option<Recipient>,
+        receipt: Option<Arc<PrivateWatchReceipt>>,
+    ) -> Result<Vec<Record>> {
+        if recipient.as_ref().is_some_and(|r| !r.current()) {
+            bail!("watch link recipient left");
+        }
+        if lease.as_ref().is_some_and(|lease| !lease.alive()) {
+            bail!("watch link ended");
+        }
+        // One deadline includes queue admission, socket dispatch and the reply.
+        let result = timeout(CALL_TIMEOUT, async {
+            let (reply, rx) = oneshot::channel();
+            self.connection
+                .tx
+                .send(Request { line: line.to_owned(), reply: Some(reply), lease, recipient, receipt })
+                .await
+                .map_err(|_| anyhow::anyhow!("query connection closed"))?;
+            Ok::<_, anyhow::Error>(rx.await.map_err(|_| anyhow::anyhow!("query connection closed"))??)
+        })
+        .await;
+        match result {
+            Ok(result) => result,
+            Err(_) => {
+                // A late reply cannot safely be paired with another command. Closing the
+                // transport also closes notifications, so bridge supervision reconnects.
+                self.connection.task.abort();
+                bail!("query command timed out");
+            }
         }
     }
 }
@@ -397,60 +545,180 @@ async fn read_lines(read: OwnedReadHalf, tx: mpsc::Sender<String>) {
     }
 }
 
+struct ConnectedRecipients(Arc<Mutex<Recipients>>);
+
+impl Drop for ConnectedRecipients {
+    fn drop(&mut self) {
+        let mut recipients = self.0.lock().unwrap();
+        for recipient in recipients.0.values() {
+            recipient.generation.end();
+        }
+        recipients.0.clear();
+    }
+}
+
 /// The connection task: sends one request at a time and demultiplexes server lines.
 async fn run(
     mut write: OwnedWriteHalf,
     mut lines: Lines,
     mut requests: mpsc::Receiver<Request>,
     notifications: mpsc::Sender<Notification>,
+    recipients: Arc<Mutex<Recipients>>,
 ) {
+    let _connected = ConnectedRecipients(recipients.clone());
+    let mut deadline = Instant::now() + CALL_TIMEOUT;
     let mut keepalive = interval_at(Instant::now() + KEEPALIVE, KEEPALIVE);
-    let mut current: Option<(Option<Reply>, Vec<Record>)> = None;
+    let mut current: Option<InFlight> = None;
     loop {
         tokio::select! {
+            biased;
+            _ = sleep_until(deadline), if current.is_some() => return,
             line = lines.rx.recv() => {
                 let Some(line) = line else { return };
                 if line.starts_with("notify") {
-                    if notifications.try_send(parse_notification(&line)).is_err_and(|e| matches!(e, mpsc::error::TrySendError::Full(_))) {
+                    let notification = parse_notification(&line);
+                    recipients.lock().unwrap().notification(&notification);
+                    if notifications.try_send(notification).is_err_and(|e| matches!(e, mpsc::error::TrySendError::Full(_))) {
                         tracing::warn!(target: "teamspeak::query", "notification backlog full, dropping");
                     }
                 } else if let Some(rest) = line.strip_prefix("error ") {
-                    if let Some((reply, records)) = current.take()
+                    if let Some(InFlight { reply, records, receipt, .. }) = current.take()
                         && let Some(reply) = reply
                     {
-                        let _ = reply.send(parse_error(rest).map(|()| records));
+                        let result = parse_error(rest);
+                        if result.is_ok() && let Some(receipt) = receipt {
+                            // Notifications and command replies share one ordered stream.
+                            // In particular, departure before clid reuse is consumed before
+                            // the reused clid's send acknowledgement. Activate here, never in
+                            // the bridge's independently scheduled delivery/receipt tasks.
+                            receipt.acknowledge();
+                        }
+                        let _ = reply.send(result.map(|()| records));
                     }
-                } else if let Some((_, records)) = current.as_mut() {
-                    records.extend(parse_records(&line));
+                } else if let Some(InFlight { records, clients, .. }) = current.as_mut() {
+                    let incoming = parse_records(&line);
+                    if *clients {
+                        let mut recipients = recipients.lock().unwrap();
+                        for record in &incoming {
+                            recipients.observe(record);
+                        }
+                    }
+                    records.extend(incoming);
                 } else {
                     tracing::debug!(target: "teamspeak::query", "unexpected line: {line}");
                 }
             }
             request = requests.recv(), if current.is_none() => {
-                let Some(Request { line, reply }) = request else { return };
-                if write.write_all(format!("{line}\n").as_bytes()).await.is_err() {
+                let Some(Request { line, reply, lease, recipient, receipt }) = request else { return };
+                if lease.as_ref().is_some_and(|lease| !lease.alive())
+                    || recipient.as_ref().is_some_and(|r| !r.current())
+                    || reply.as_ref().is_some_and(oneshot::Sender::is_closed)
+                {
+                    // Dropping the reply returns an error to the caller without writing the token.
+                    continue;
+                }
+                if !matches!(timeout(CALL_TIMEOUT, write.write_all(format!("{line}\n").as_bytes())).await, Ok(Ok(()))) {
                     return;
                 }
-                current = Some((reply, Vec::new()));
+                deadline = Instant::now() + CALL_TIMEOUT;
+                current = Some(InFlight { reply, records: Vec::new(), clients: line.starts_with("clientlist ") && line.contains(" -uid"), receipt });
             }
             _ = keepalive.tick(), if current.is_none() => {
-                if write.write_all(b"whoami\n").await.is_err() {
+                if !matches!(timeout(CALL_TIMEOUT, write.write_all(b"whoami\n")).await, Ok(Ok(()))) {
                     return;
                 }
-                current = Some((None, Vec::new()));
+                deadline = Instant::now() + CALL_TIMEOUT;
+                current = Some(InFlight { reply: None, records: Vec::new(), clients: false, receipt: None });
             }
         }
     }
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
     };
 
     use super::*;
+
+    pub(crate) fn observe_recipient(query: &Query, clid: u16, uid: &str, cid: u64) {
+        query.connection.recipients.lock().unwrap().observe(&Record::from([
+            ("clid".into(), clid.to_string()),
+            ("client_unique_identifier".into(), uid.into()),
+            ("cid".into(), cid.to_string()),
+        ]));
+    }
+
+    pub(crate) fn recipient_membership(query: &Query, clid: u16, uid: &str, cid: u64) -> Arc<Lease> {
+        query.recipient(clid, uid, cid).unwrap().generation
+    }
+
+    pub(crate) struct StalledQuery {
+        pub query: Query,
+        pub notes: mpsc::Receiver<Notification>,
+        pub commands: mpsc::UnboundedReceiver<String>,
+        peer: JoinHandle<()>,
+    }
+
+    impl Drop for StalledQuery {
+        fn drop(&mut self) {
+            self.peer.abort();
+        }
+    }
+
+    pub(crate) async fn stalled_query() -> StalledQuery {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (commands, received) = mpsc::unbounded_channel();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            write.write_all(b"TS3\n\rWelcome\n\r").await.unwrap();
+            let mut lines = BufReader::new(read).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.starts_with("sendtextmessage") || line == "stall" {
+                    commands.send(line).unwrap();
+                    continue;
+                }
+                if write.write_all(b"error id=0 msg=ok\n\r").await.is_err() {
+                    return;
+                }
+            }
+        });
+        let (query, notes) = Query::connect(addr, "serveradmin", "p", 1).await.unwrap();
+        StalledQuery { query, notes, commands: received, peer }
+    }
+
+    #[tokio::test]
+    async fn a_stuck_reply_closes_the_transport_and_bounds_full_queue_admission() {
+        let mut server = stalled_query().await;
+        observe_recipient(&server.query, 7, "recipient", 10);
+        let membership = recipient_membership(&server.query, 7, "recipient", 10);
+        let query = server.query.clone();
+        let first = tokio::spawn(async move { query.call(Cmd::new("stall")).await });
+        assert_eq!(server.commands.recv().await.unwrap(), "stall");
+        let mut callers = Vec::new();
+        for _ in 0..40 {
+            let query = server.query.clone();
+            callers.push(tokio::spawn(async move { query.call(Cmd::new("whoami")).await }));
+        }
+        // There are both enqueued calls and calls waiting to enqueue.
+        while server.query.connection.tx.capacity() != 0 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::pause();
+        tokio::time::advance(CALL_TIMEOUT + Duration::from_secs(1)).await;
+        assert!(first.await.unwrap().is_err());
+        for caller in callers {
+            assert!(caller.await.unwrap().is_err());
+        }
+        assert!(server.notes.recv().await.is_none(), "supervision can reconnect");
+        assert!(!membership.alive(), "transport loss revokes its private tokens");
+        assert!(server.query.call(Cmd::new("whoami")).await.is_err());
+        assert!(server.commands.try_recv().is_err(), "no queued command reaches a desynchronized socket");
+    }
 
     #[test]
     fn escaping_roundtrip() {
@@ -516,6 +784,10 @@ pub(super) mod tests {
 
     /// Fake server speaking with `\n\r` terminators like the real one; `eol` lets a test pick another.
     async fn fake_server(eol: &'static str) -> SocketAddr {
+        fake_server_cancelling(eol, None).await
+    }
+
+    async fn fake_server_cancelling(eol: &'static str, cancel_on_flood: Option<Arc<Lease>>) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -538,12 +810,15 @@ pub(super) mod tests {
                     }
                     // Notifications before, between and after the data, plus a notification that looks like data.
                     "clientlist" => format!(
-                        "notifyclientmoved clid=9 ctid=2{eol}clid=1 client_nickname=A\\sB|clid=2 client_nickname=C{eol}\
+                        "notifyclientmoved clid=9 ctid=2{eol}clid=1 cid=1 client_unique_identifier=uid-1 client_nickname=A\\sB|clid=2 cid=1 client_unique_identifier=uid-2 client_nickname=C{eol}\
                          notifytextmessage msg=x{eol}error id=0 msg=ok{eol}notifyclientleftview clid=2{eol}"
                     ),
                     "boom" => format!("error id=2568 msg=insufficient\\sclient\\spermissions failed_permid=4{eol}"),
                     "flood" if !flooded => {
                         flooded = true;
+                        if let Some(lease) = &cancel_on_flood {
+                            lease.end();
+                        }
                         format!("error id=524 msg=client\\sis\\sflooding extra_msg=please\\swait\\s1\\sseconds{eol}")
                     }
                     "flood" => format!("ok=1{eol}error id=0 msg=ok{eol}"),
@@ -725,6 +1000,82 @@ pub(super) mod tests {
         assert_eq!(clone.call(Cmd::new("whoami")).await.unwrap()[0]["client_id"], "100");
         drop(clone);
         assert!(matches!(server.event().await, ChannelEvent::Closed(1)));
+    }
+
+    #[tokio::test]
+    async fn clientlist_seeds_recipient_generations_and_departures_invalidate_them() {
+        let addr = fake_server("\n\r").await;
+        let (query, mut notes) = Query::connect(addr, "serveradmin", "p ss", 1).await.unwrap();
+        query.call(Cmd::new("clientlist").flag("-uid")).await.unwrap();
+        let first = query.recipient(1, "uid-1", 1).expect("clientlist seeds recipients");
+        while notes.recv().await.unwrap().name != "notifyclientleftview" {}
+        assert!(query.recipient(2, "uid-2", 1).is_none());
+        assert!(first.current());
+        assert!(query.recipient(1, "wrong-uid", 1).is_none());
+        assert!(query.recipient(1, "uid-1", 2).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_departed_recipient_is_not_written_from_the_query_queue() {
+        let mut server = channel_server().await;
+        let (query, _notes) = Query::listen_channel(server.addr, "p ss", 1).await.unwrap();
+        assert!(matches!(server.event().await, ChannelEvent::Ready { .. }));
+        observe_recipient(&query, 7, "old-user", 1);
+        let recipient = query.recipient(7, "old-user", 1).unwrap();
+        query.connection.recipients.lock().unwrap().notification(&parse_notification("notifyclientleftview clid=7"));
+        observe_recipient(&query, 7, "new-user", 1);
+        // Bypass the call-site guard: the socket must reject the old generation.
+        let (reply, result) = oneshot::channel();
+        query
+            .connection
+            .tx
+            .send(Request {
+                line: "sendtextmessage targetmode=1 target=7 msg=private-watch-link".into(),
+                reply: Some(reply),
+                lease: Some(Lease::new()),
+                recipient: Some(recipient),
+                receipt: None,
+            })
+            .await
+            .unwrap();
+        assert!(result.await.is_err());
+        assert_eq!(query.call(Cmd::new("whoami")).await.unwrap()[0]["client_id"], "100");
+    }
+
+    #[tokio::test]
+    async fn an_ended_watch_link_is_not_written_from_the_query_queue() {
+        let mut server = channel_server().await;
+        let (query, _notes) = Query::listen_channel(server.addr, "p ss", 1).await.unwrap();
+        assert!(matches!(server.event().await, ChannelEvent::Ready { .. }));
+        let lease = Lease::new();
+        lease.end();
+        // Bypass the call-site guard to test the final check in the socket task.
+        let (reply, result) = oneshot::channel();
+        query
+            .connection
+            .tx
+            .send(Request {
+                line: "sendtextmessage targetmode=2 msg=ended-watch-link".into(),
+                reply: Some(reply),
+                lease: Some(lease),
+                recipient: None,
+                receipt: None,
+            })
+            .await
+            .unwrap();
+        assert!(result.await.is_err());
+        // The fake server rejects unexpected text; a successful probe proves none was written.
+        assert_eq!(query.call(Cmd::new("whoami")).await.unwrap()[0]["client_id"], "100");
+    }
+
+    #[tokio::test]
+    async fn an_ended_watch_link_is_not_retried_after_flood_protection() {
+        let lease = Lease::new();
+        let addr = fake_server_cancelling("\n\r", Some(lease.clone())).await;
+        let (query, _notes) = Query::connect(addr, "serveradmin", "p ss", 1).await.unwrap();
+        let result = query.call_while(Cmd::new("flood"), lease).await;
+        assert!(result.unwrap_err().to_string().contains("watch link ended"));
+        query.call(Cmd::new("servernotifyregister").arg("event", "server")).await.unwrap();
     }
 
     async fn interleaving(eol: &'static str) {

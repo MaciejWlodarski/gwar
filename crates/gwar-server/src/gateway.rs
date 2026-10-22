@@ -30,14 +30,17 @@ use tokio_tungstenite::{
 };
 
 use gwar_proto::{
-    Challenge, ClientFrame, ErrorBody, ErrorCode, Event, LeaveReason, PROTOCOL_VERSION, Request,
-    Response as ProtocolResponse, ServerFrame, ServerProof, server_proof_statement,
+    Challenge, ClientFrame, ErrorBody, ErrorCode, Event, GuestFrame, GuestRequest, LeaveReason, PROTOCOL_VERSION,
+    Request, Response as ProtocolResponse, ServerFrame, ServerProof, server_proof_statement,
 };
-use tokio::{sync::mpsc, time::timeout};
+use tokio::{
+    sync::{mpsc, oneshot},
+    time::timeout,
+};
 use tracing::debug;
 
 use crate::{
-    core::{ConnectRequest, CoreHandle, OUTBOUND_QUEUE, Outbound, ServerPassword, encode},
+    core::{ConnectRequest, CoreHandle, GuestMsg, OUTBOUND_QUEUE, Outbound, ServerPassword, encode},
     identity,
 };
 
@@ -70,12 +73,41 @@ const RATE_PER_SEC: f64 = 20.0;
 pub async fn upgrade(
     State(gateway): State<Gateway>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    mut request: HttpRequest,
+    request: HttpRequest,
 ) -> Response {
     let ip = client_ip(peer, request.headers(), gateway.client_ip_header.as_ref());
     let Some(permit) = gateway.preauth.connection(ip) else {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     };
+    accept(request, permit, AUTHENTICATED_MAX_FRAME, move |socket| connection(socket, gateway, ip))
+}
+
+/// `GET /ws/watch`: a TeamSpeak guest's watch-only connection (docs/screen-share.md, "Guest
+/// sessions"). The same pre-authentication bounds as `/ws`, and a guest's own per-subscriber
+/// limit inside them.
+pub async fn watch_upgrade(
+    State(gateway): State<Gateway>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    request: HttpRequest,
+) -> Response {
+    let ip = client_ip(peer, request.headers(), gateway.client_ip_header.as_ref());
+    let Some(permit) = gateway.preauth.guest(ip) else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
+    accept(request, permit, MAX_FRAME, move |socket| guest_connection(socket, gateway, ip))
+}
+
+/// Upgrades to a WebSocket whose messages are at most `limit` bytes, and runs `serve` on it
+/// while holding the pre-authentication `permit`.
+fn accept<F>(
+    mut request: HttpRequest,
+    permit: crate::preauth::Connection,
+    limit: usize,
+    serve: impl FnOnce(WebSocket) -> F + Send + 'static,
+) -> Response
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     let Ok(response) = create_response_with_body(&request, Body::empty) else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -87,15 +119,15 @@ pub async fn upgrade(
         let Ok(upgraded) = upgrade.await else { return };
         let config = WebSocketConfig::default()
             .read_buffer_size(16 * 1024)
-            .max_message_size(Some(AUTHENTICATED_MAX_FRAME))
-            .max_frame_size(Some(AUTHENTICATED_MAX_FRAME));
+            .max_message_size(Some(limit))
+            .max_frame_size(Some(limit));
         let socket = WebSocketStream::from_raw_socket(
             transport::Transport::new(TokioIo::new(upgraded)),
             Role::Server,
             Some(config),
         )
         .await;
-        connection(socket, gateway, ip).await;
+        serve(socket).await;
     });
     response
 }
@@ -340,9 +372,7 @@ async fn connection(mut socket: WebSocket, gateway: Gateway, ip: IpAddr) {
 
     let mut writer = writer;
     let mut writer_done = false;
-    let mut tokens = RATE_BURST;
-    let mut refilled = Instant::now();
-    let mut refused = 0u32;
+    let mut rate = FrameRate::new();
     let reason = loop {
         let raw = tokio::select! {
             raw = next_text(&mut stream, IDLE_TIMEOUT, AUTHENTICATED_MAX_FRAME) => raw,
@@ -354,30 +384,22 @@ async fn connection(mut socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         let Some(raw) = raw else {
             break LeaveReason::Quit;
         };
-        let now = Instant::now();
-        tokens = (tokens + now.duration_since(refilled).as_secs_f64() * RATE_PER_SEC).min(RATE_BURST);
-        refilled = now;
-        // Every frame costs a token, malformed ones too.
-        let allowed = tokens >= 1.0;
-        if allowed {
-            tokens -= 1.0;
-            refused = 0;
-        } else {
-            refused += 1;
-            if refused > RATE_OVERRUN {
+        let allowed = match rate.take() {
+            Rate::Allowed => true,
+            Rate::Refused => false,
+            Rate::Overrun => {
                 debug!(session, "dropping a connection that keeps sending past the rate limit");
                 break LeaveReason::Timeout;
             }
-        }
+        };
         let frame = match serde_json::from_str::<ClientFrame>(&raw) {
             Ok(frame) => frame,
             Err(e) => {
                 debug!(session, "bad frame: {e}");
-                let re = serde_json::from_str::<serde_json::Value>(&raw)
-                    .ok()
-                    .and_then(|v| v.get("id")?.as_u64())
-                    .unwrap_or(0) as u32;
-                let reply = ServerFrame::Err { re, err: ErrorBody::new(ErrorCode::BadRequest, "malformed request") };
+                let reply = ServerFrame::Err {
+                    re: frame_id(&raw),
+                    err: ErrorBody::new(ErrorCode::BadRequest, "malformed request"),
+                };
                 if out.try_send(Outbound::Frame(encode(&reply))).is_err() {
                     break LeaveReason::Timeout;
                 }
@@ -400,9 +422,280 @@ async fn connection(mut socket: WebSocket, gateway: Gateway, ip: IpAddr) {
     }
 }
 
+/// The `id` of a frame that did not parse, to answer it; 0 when it has none.
+fn frame_id(raw: &str) -> u32 {
+    serde_json::from_str::<serde_json::Value>(raw).ok().and_then(|v| v.get("id")?.as_u64()).unwrap_or(0) as u32
+}
+
+/// Per-connection frame rate: a token bucket, and a client that keeps sending past it is let go.
+struct FrameRate {
+    tokens: f64,
+    refilled: Instant,
+    refused: u32,
+}
+
+enum Rate {
+    Allowed,
+    Refused,
+    Overrun,
+}
+
+impl FrameRate {
+    fn new() -> Self {
+        Self { tokens: RATE_BURST, refilled: Instant::now(), refused: 0 }
+    }
+
+    /// Every frame costs a token, malformed ones too.
+    fn take(&mut self) -> Rate {
+        let now = Instant::now();
+        self.tokens = (self.tokens + now.duration_since(self.refilled).as_secs_f64() * RATE_PER_SEC).min(RATE_BURST);
+        self.refilled = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            self.refused = 0;
+            return Rate::Allowed;
+        }
+        self.refused += 1;
+        if self.refused > RATE_OVERRUN { Rate::Overrun } else { Rate::Refused }
+    }
+}
+
+/// A guest's connection: `guest.watch {token}` first, then one `guest.offer`, `screen.keyframe`
+/// and the `ping` heartbeat, nothing else. Anything else, a second offer or a second watch
+/// closes it. No identity, no password: the token is the capability.
+async fn guest_connection(mut socket: WebSocket, gateway: Gateway, ip: IpAddr) {
+    let Some(raw) = next_text(&mut socket, HELLO_TIMEOUT, MAX_FRAME).await else { return };
+    if !gateway.preauth.hello(ip) {
+        let _ = socket.send(error(0, ErrorCode::RateLimited, "too many attempts")).await;
+        return;
+    }
+    let (id, token) = match serde_json::from_str::<GuestFrame>(&raw) {
+        Ok(GuestFrame { id, request: GuestRequest::Watch { token } }) => (id, token),
+        Ok(frame) => {
+            let _ = socket.send(error(frame.id, ErrorCode::NotAuthenticated, "send guest.watch first")).await;
+            return;
+        }
+        Err(_) => {
+            let _ = socket.send(error(frame_id(&raw), ErrorCode::BadRequest, "malformed request")).await;
+            return;
+        }
+    };
+    let (out, outbound) = mpsc::channel(OUTBOUND_QUEUE);
+    let (held, let_go) = oneshot::channel();
+    // The core queues its reply on `out`, before anything else it sends the guest.
+    let guest = gateway.core.guest_watch(id, token, out, held).await;
+    let (sink, mut stream) = socket.split();
+    // The gateway's own answers (`ping`, refusals), beside the core's frames.
+    let (local, answers) = mpsc::channel::<ServerFrame>(8);
+    let mut writer = tokio::spawn(guest_writer(sink, outbound, answers, let_go));
+    let Some(guest) = guest else {
+        drop(local);
+        finish_writer(writer).await;
+        return;
+    };
+    // The offer must follow the reply within `HELLO_TIMEOUT`, whatever else comes meanwhile.
+    let offer_by = Instant::now() + HELLO_TIMEOUT;
+    let mut offered = false;
+    let mut rate = FrameRate::new();
+    let mut writer_done = false;
+    loop {
+        let wait = if offered { IDLE_TIMEOUT } else { offer_by.saturating_duration_since(Instant::now()) };
+        let raw = tokio::select! {
+            raw = next_text(&mut stream, wait, MAX_FRAME) => raw,
+            // The writer ends when the core lets the guest go, or the socket stops taking frames.
+            _ = &mut writer => {
+                writer_done = true;
+                None
+            }
+        };
+        let Some(raw) = raw else { break };
+        let allowed = match rate.take() {
+            Rate::Allowed => true,
+            Rate::Refused => false,
+            Rate::Overrun => break,
+        };
+        // Guests speak only the watch ops: anything else ends the connection.
+        let Ok(GuestFrame { id, request }) = serde_json::from_str::<GuestFrame>(&raw) else { break };
+        // What ends a connection ends it even past the rate limit.
+        match &request {
+            GuestRequest::Watch { .. } => break,
+            GuestRequest::Offer { .. } if offered => {
+                debug!(guest, "a second guest.offer closes the connection");
+                break;
+            }
+            _ => {}
+        }
+        if !allowed {
+            let refused = ServerFrame::Err { re: id, err: ErrorBody::new(ErrorCode::RateLimited, "slow down") };
+            if local.try_send(refused).is_err() {
+                break;
+            }
+            continue;
+        }
+        match request {
+            GuestRequest::Watch { .. } => unreachable!("closed above"),
+            GuestRequest::Offer { sdp } => {
+                offered = true;
+                gateway.core.guest(GuestMsg::Offer { guest, id, sdp }).await;
+            }
+            GuestRequest::Keyframe { share } => gateway.core.guest(GuestMsg::Keyframe { guest, id, share }).await,
+            GuestRequest::Ping {} => {
+                if local.try_send(ServerFrame::Ok { re: id, ok: ProtocolResponse::Empty {} }).is_err() {
+                    break;
+                }
+            }
+        }
+    }
+    gateway.core.guest(GuestMsg::Gone { guest }).await;
+    drop(local);
+    if !writer_done {
+        finish_writer(writer).await;
+    }
+}
+
+/// How long one frame to a guest may take to leave: a guest that stops reading is let go.
+const GUEST_SEND_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a guest's last frames (the share's end, the link turned off) and the close may take.
+const GUEST_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Writes a guest's frames until the core lets it go (`let_go`), the socket stops taking them
+/// within `GUEST_SEND_TIMEOUT`, or the core's queue closes. Being let go interrupts a write in
+/// progress; what the core queued last is then flushed and the socket closed, within
+/// `GUEST_FLUSH_TIMEOUT`. The socket's write half is dropped when this returns.
+async fn guest_writer<S: futures::Sink<Message> + Unpin>(
+    mut sink: S,
+    mut outbound: mpsc::Receiver<Outbound>,
+    mut answers: mpsc::Receiver<ServerFrame>,
+    mut let_go: oneshot::Receiver<()>,
+) {
+    let mut ping = tokio::time::interval(PING_INTERVAL);
+    ping.tick().await;
+    loop {
+        let message = tokio::select! {
+            // The core's frames first: the last ones it queued go before its letting go is seen.
+            biased;
+            item = outbound.recv() => match item {
+                Some(Outbound::Frame(frame)) => Message::Text(Utf8Bytes::from(&*frame)),
+                Some(Outbound::Close(_)) | None => break,
+            },
+            _ = &mut let_go => break,
+            Some(frame) = answers.recv() => text(&frame),
+            _ = ping.tick() => Message::Ping(Default::default()),
+        };
+        tokio::select! {
+            // A frame that can leave now does, so the core's last frames are not lost to its
+            // letting go; one held up by a guest that does not read is interrupted.
+            biased;
+            sent = timeout(GUEST_SEND_TIMEOUT, sink.send(message)) => {
+                if !matches!(sent, Ok(Ok(()))) {
+                    return;
+                }
+            }
+            _ = &mut let_go => break,
+        }
+    }
+    let _ = timeout(GUEST_FLUSH_TIMEOUT, async move {
+        while let Ok(Outbound::Frame(frame)) = outbound.try_recv() {
+            if sink.send(Message::Text(Utf8Bytes::from(&*frame))).await.is_err() {
+                return;
+            }
+        }
+        let _ = sink.close().await;
+    })
+    .await;
+}
+
+/// Waits for a guest's writer, which bounds itself; aborted should it ever outlive its bounds.
+async fn finish_writer(mut writer: tokio::task::JoinHandle<()>) {
+    if timeout(GUEST_SEND_TIMEOUT + GUEST_FLUSH_TIMEOUT, &mut writer).await.is_err() {
+        writer.abort();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        pin::Pin,
+        sync::{Arc, Mutex},
+        task::{Context, Poll},
+    };
+
+    /// A socket that takes frames (into `sent`) or, `stuck`, never takes another: a guest that
+    /// stopped reading, whose buffers are full.
+    #[derive(Clone, Default)]
+    struct Socket {
+        sent: Arc<Mutex<Vec<Message>>>,
+        stuck: bool,
+    }
+
+    impl futures::Sink<Message> for Socket {
+        type Error = ();
+        fn poll_ready(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            if self.stuck { Poll::Pending } else { Poll::Ready(Ok(())) }
+        }
+        fn start_send(self: Pin<&mut Self>, item: Message) -> Result<(), ()> {
+            self.sent.lock().unwrap().push(item);
+            Ok(())
+        }
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            self.poll_ready(cx)
+        }
+        fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), ()>> {
+            self.poll_ready(cx)
+        }
+    }
+
+    fn frame(text: &str) -> Outbound {
+        Outbound::Frame(Arc::from(text))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_guest_that_stops_reading_is_let_go_at_once_when_the_core_drops_it() {
+        let (out, outbound) = mpsc::channel(8);
+        let (_local, answers) = mpsc::channel(8);
+        let (held, let_go) = oneshot::channel();
+        out.try_send(frame("{}")).unwrap();
+        let socket = Socket { stuck: true, ..Default::default() };
+        let started = tokio::time::Instant::now();
+        let writer = tokio::spawn(guest_writer(socket, outbound, answers, let_go));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!writer.is_finished(), "still trying while the guest is held");
+        // The core lets the guest go: its last frame is queued, then its queue and signal close.
+        out.try_send(frame(r#"{"ev":"screen.link"}"#)).unwrap();
+        drop((out, held));
+        timeout(GUEST_FLUSH_TIMEOUT + Duration::from_millis(100), writer).await.unwrap().unwrap();
+        assert!(started.elapsed() < Duration::from_millis(500) + GUEST_SEND_TIMEOUT, "not left to time out");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_guest_gets_its_last_frames_before_the_close() {
+        let (out, outbound) = mpsc::channel(8);
+        let (_local, answers) = mpsc::channel(8);
+        let (held, let_go) = oneshot::channel();
+        let socket = Socket::default();
+        let sent = socket.sent.clone();
+        for text in ["a", "b", "c"] {
+            out.try_send(frame(text)).unwrap();
+        }
+        drop((out, held));
+        timeout(Duration::from_secs(1), guest_writer(socket, outbound, answers, let_go)).await.unwrap();
+        let texts: Vec<String> =
+            sent.lock().unwrap().iter().filter_map(|m| m.to_text().ok().map(str::to_owned)).collect();
+        assert_eq!(texts, ["a", "b", "c"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_socket_that_takes_nothing_ends_the_writer_by_itself() {
+        let (out, outbound) = mpsc::channel(8);
+        let (_local, answers) = mpsc::channel(8);
+        let (_held, let_go) = oneshot::channel();
+        out.try_send(frame("{}")).unwrap();
+        let socket = Socket { stuck: true, ..Default::default() };
+        timeout(GUEST_SEND_TIMEOUT + Duration::from_millis(100), guest_writer(socket, outbound, answers, let_go))
+            .await
+            .expect("a write that cannot leave ends the writer");
+    }
 
     #[test]
     fn forwarded_addresses_count_only_from_a_named_header_behind_loopback() {

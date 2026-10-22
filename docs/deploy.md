@@ -109,6 +109,17 @@ server {
     # The web app asks /health whether a Gwar server answers on its own origin.
     location = /health { include snippets/gwar-server-proxy.conf; }
     location = /ws { include snippets/gwar-server-proxy.conf; }
+    # TeamSpeak guests' watch connections (docs/screen-share.md, PR 6): the exact `/ws`
+    # location above does not match them.
+    location = /ws/watch { include snippets/gwar-server-proxy.conf; }
+    # The guests' watch page, a second entry of the web app. Its token is in the fragment, so
+    # it never reaches nginx; the page sends no Referer and no other site may frame it.
+    location ~ ^/watch(\.html)?$ {
+        include snippets/gwar-security-headers.conf;
+        add_header X-Frame-Options "DENY" always;
+        add_header Cache-Control "no-cache";
+        try_files /watch.html =404;
+    }
     location /api/files/ {
         client_max_body_size 30m;
         include snippets/gwar-server-proxy.conf;
@@ -156,6 +167,9 @@ server {
     # listen 443 ssl; ... (managed by certbot)
 }
 ```
+
+`voice.gwar.app` proxies every path, `/ws/watch` included; a Gwar server run with
+`--web-root` serves `/watch` and `/watch.html` itself with the same headers.
 
 nginx overwrites `X-Real-IP` with the address it sees, and the units run with
 `--client-ip-header x-real-ip`, so per-address limits and bans see real clients.

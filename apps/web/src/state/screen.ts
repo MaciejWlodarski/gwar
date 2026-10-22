@@ -27,6 +27,10 @@ export interface OwnShare {
   preset: ScreenPreset;
   /** Members watching, from `screen.viewers`. */
   viewers: number;
+  /** TeamSpeak guests watching through the watch link, from `screen.viewers`. */
+  guests: number;
+  /** The preset menu's "Post a watch link to TeamSpeak", on by default. */
+  guestLink: boolean;
   /** The sharer's own thumbnail, off by default. */
   preview: boolean;
 }
@@ -58,6 +62,8 @@ export interface ScreenState {
   stage: string | null;
   /** The chat beside the stage is collapsed. */
   chatHidden: boolean;
+  /** Shares whose TeamSpeak watch link works, as `screen.link` said (to their sharer and moderators). */
+  links: Record<string, true>;
 }
 
 export type ScreenAction =
@@ -67,7 +73,9 @@ export type ScreenAction =
   | { type: "starting"; attempt: number }
   | { type: "started"; attempt: number; share: string }
   | { type: "live"; share: string }
-  | { type: "viewers"; share: string; members: number }
+  | { type: "viewers"; share: string; members: number; guests: number }
+  | { type: "guestLink"; on: boolean }
+  | { type: "link"; share: string; active: boolean }
   | { type: "preview"; on: boolean }
   | { type: "ownEnded"; attempt: number }
   | { type: "transport"; run: number; phase: TransportPhase }
@@ -76,6 +84,7 @@ export type ScreenAction =
   | { type: "granted"; run: number; id: number; slot: number }
   | { type: "slot"; run: number; slot: number; share: string | null }
   | { type: "unwatch"; share: string }
+
   | { type: "stage"; share: string }
   | { type: "chat"; hidden: boolean }
   | { type: "reset" };
@@ -90,6 +99,7 @@ export const initialScreen: ScreenState = {
   streams: emptySlots(),
   stage: null,
   chatHidden: false,
+  links: {},
 };
 
 function withoutWatch(state: ScreenState, share: string): ScreenState {
@@ -109,7 +119,7 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
   switch (action.type) {
     case "pick":
       if (state.own) return state;
-      return { ...state, own: { phase: "picking", attempt: action.attempt, share: null, stream: null, surface: "unknown", choice: "auto", preset: "smooth", viewers: 0, preview: false } };
+      return { ...state, own: { phase: "picking", attempt: action.attempt, share: null, stream: null, surface: "unknown", choice: "auto", preset: "smooth", viewers: 0, guests: 0, guestLink: true, preview: false } };
     case "picked":
       return setOwn(state, action.attempt, ["picking"], { phase: "choosing", stream: action.stream, surface: action.surface, preset: resolvePreset("auto", action.surface) });
     case "choose": {
@@ -124,7 +134,13 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
     case "live":
       return state.own?.share === action.share ? setOwn(state, state.own.attempt, ["starting", "live"], { phase: "live" }) : state;
     case "viewers":
-      return state.own?.share === action.share ? { ...state, own: { ...state.own, viewers: action.members } } : state;
+      return state.own?.share === action.share ? { ...state, own: { ...state.own, viewers: action.members, guests: action.guests } } : state;
+    case "guestLink":
+      return state.own?.phase === "choosing" ? { ...state, own: { ...state.own, guestLink: action.on } } : state;
+    case "link": {
+      const { [action.share]: _, ...rest } = state.links;
+      return { ...state, links: action.active ? { ...rest, [action.share]: true } : rest };
+    }
     case "preview":
       return state.own ? { ...state, own: { ...state.own, preview: action.on } } : state;
     case "ownEnded":
@@ -182,6 +198,7 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       return { ...state, chatHidden: action.hidden };
     case "reset":
       return { ...initialScreen, chatHidden: state.chatHidden };
+
   }
 }
 

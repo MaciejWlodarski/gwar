@@ -4,8 +4,9 @@ Status: **design, with the owner's decisions of 2026-10-21 folded in**
 ([Owner decisions](#owner-decisions)). Built so far: the share state and its
 protocol (PR 2), the SFU's transports and forwarding (PR 3a), and sharing and
 watching from the browser in plaintext channels (PR 4,
-[as built](#web-client-as-built-pr-4)), and the same in the desktop app (PR 5,
-[as built](#desktop-app-as-built-pr-5)). Phase 1
+[as built](#web-client-as-built-pr-4)), the same in the desktop app (PR 5,
+[as built](#desktop-app-as-built-pr-5)), and TeamSpeak watch links (PR 6,
+[as built](#watch-links-as-built-pr-6)). Phase 1
 goes through the server's SFU. Peer-to-peer sharing comes later and is only
 sketched at the end. The spike code was thrown away; only its results are
 kept here ([Spikes](#spikes)).
@@ -1346,9 +1347,16 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
   that channel.
 - The text is `🖥 {name} is sharing their screen. Watch: {url}`, with the
   name passed through `plain`.
-- A TeamSpeak user who enters the channel while the share runs gets the link
-  once, as a private message from ServerQuery, so late joiners are not left
-  out. The bridge sends it from its in-memory copy of the link (below).
+- A TeamSpeak user who enters the channel while the share runs gets a private
+  link from ServerQuery once per uninterrupted channel membership. Each private
+  delivery has a fresh token bound to that user's TeamSpeak UID and membership;
+  it never carries the channel post's shared token. A newly minted token is
+  inactive until Query processes the final private-message acknowledgement with
+  the original membership still valid. Leaving, moving or disconnecting revokes
+  it and terminates guests already using it, including when the same UID later
+  returns. A return gets one fresh private link. Confirmed delivery is recorded
+  at acknowledgement and retained for its membership, including across a delayed
+  receipt sweep.
 - Nothing is posted when the share ends. The link simply stops working.
 - The channel description's presence line gets " · sharing screen" after the
   sharer's name. The link is not put there: descriptions are visible to
@@ -1366,18 +1374,48 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
   web host or in a Referer header. Only the watch page reads it, and sends it
   over the WebSocket to the Gwar server.
 - **Where it is kept:**
-  - The guest gateway checks tokens against SHA-256(token) → share, in
-    memory.
-  - The bridge also keeps the raw link, in memory, for one purpose: sending
-    it to TeamSpeak users who enter the channel later. It is a map from share
-    to link inside the bridge task.
-  - Nothing is written to disk or to logs. The raw link exists only in that
-    bridge map and in the messages sent to TeamSpeak.
+  - The guest gateway checks SHA-256(token) → share in memory. Private token
+    hashes additionally carry the intended UID and an immutable membership
+    lease and acknowledgement state. At `guest.watch`, the final private-message
+    acknowledgement must have been processed and that UID's original membership
+    in the share's channel must still be live; otherwise the reply is the same
+    `not_found` as for an unknown token. A reconnect cannot revive an old membership.
+    An admitted private guest's SFU grant checks this membership lease directly on
+    every forwarded packet and before draining queues or handling RTX. Ending the
+    membership synchronously removes media authority, before any cancellation task
+    runs. Transport/WebSocket closure and admission cleanup follow asynchronously,
+    even without another guest request.
+  - The bridge keeps the raw shared URL for the channel post. Private URLs
+    exist only in their delivery tasks and queued TeamSpeak commands; their
+    registry retains hashes, UID bindings and membership leases.
+  - Nothing is written to disk or to logs. Token-bearing wrappers redact
+    their contents in `Debug`.
 - **When it dies.** The token and the bridge's copy are both removed when
   the share ends (stop, leave, moderator stop, transport failure), when the
   link is turned off, and when the bridge detaches. A server restart ends
   every share, and so every link.
-- One share has one token. A new share gets a new token and a new post.
+- Each share has one shared token for its channel post and at most **64 live
+  private tokens**. Expired memberships release token capacity. All tokens
+  share the same share/link lease; share end or link revocation invalidates
+  every token synchronously. Guests using any of these tokens share the
+  existing 10-guest and 25-viewer limits.
+- **Query ordering assumption.** TeamSpeak notifications and command responses
+  arrive on one ordered Query stream. A departure preceding clid reassignment is
+  therefore read before the acknowledgement of a private message executed against
+  that reused clid. The connection task invalidates memberships as it consumes
+  each notification, then activates private tokens at the final success response.
+  It does this before forwarding the result to a delivery task; neither the bridge
+  event loop nor its receipt sweep may activate a token. Before that response,
+  redemption is a generic miss even if departure bytes are still unread.
+- The shared channel token remains a bearer token for the channel audience;
+  TeamSpeak retaining it in channel chat history is accepted.
+- Private recovery admits at most **four delivery tasks per share**, without
+  waiting in the bridge event loop. Later receipt sweeps reconcile readers
+  waiting for capacity. Share or membership cancellation interrupts queued
+  sends and flood backoff. Each Query send has a 30 s deadline including
+  enqueueing and the reply. An in-flight timeout closes the transport and
+  its notification stream, allowing bridge supervision to reconnect; queued
+  callers fail instead of waiting behind the stalled command.
 - The token grants exactly one thing: watching that share. Guests see no
   other name than the sharer's display name, and no channel, chat or other
   shares.
@@ -1406,7 +1444,7 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
     A guest that stops pinging is closed after 60 s.
   - The first frame is `guest.watch {token}`. The reply is
     `{share, sharer, preset, ice_servers}`, or one generic `not_found`
-    for unknown, ended and revoked tokens alike.
+    for unknown, inactive, ended and revoked tokens alike.
   - After that, only `guest.offer {sdp}` is accepted, **once per
     connection**, plus `screen.keyframe` and `ping {}`. The offer is a
     watch transport with **one** slot. A second offer closes the
@@ -1751,7 +1789,8 @@ badge, stage). Decisions taken while building it, where this design left room:
   every unwatched share of the same channel as cards. Moderators get "Stop
   screen share" on the stage and in the channel tree's menu. On narrow screens
   the stage replaces the chat, with no chat beside it.
-- **`guest_link`** is always false until PR 6 adds the TeamSpeak checkbox.
+- **`guest_link`** was always false until PR 6 added the TeamSpeak checkbox
+  ([Watch links as built](#watch-links-as-built-pr-6)).
 - **The e2e's WebKit sharer** gets its canvas track from an init script that
   stands in for `getDisplayMedia`; the app's own capture path runs unchanged
   around it. The Chromium sharer captures a real tab (S4's flag). The tab that
@@ -1861,6 +1900,161 @@ screen worker; it arrives with PR 7's encrypted shares.
     PR 1's checklist is repeated by hand on release builds.
 - **Follow-up.** `NSProcessInfo.beginActivity` while sharing waits for PR 1's
   hidden-window frame-rate measurement (§1, "Tradeoffs").
+
+### Watch links as built (PR 6)
+
+Code: `crates/gwar-server/src/core/screen/guests.rs` (tokens, guests and
+revocation), `gateway.rs` (`/ws/watch`), `preauth.rs` (guest limits),
+`teamspeak/bridge.rs` (the post, late joiners, the presence marker),
+`apps/web/src/watch/` with `watch.html` (the page) and the sharer's checkbox
+and link line in `ui/Screen.tsx`. Decisions taken while building it, where the
+design left room:
+
+- **The token is made at the announcement.** `screen.start {guest_link}` only
+  records the wish. The token is generated when the share is announced (its
+  publish transport connected), and only if a link is possible then and the
+  sharer has not turned it off meanwhile. With the checkbox off no token ever
+  exists. The core keeps SHA-256(token) → share for the shared channel link;
+  its raw URL goes once to the bridge, in a redacted `WatchUrl`. Private
+  delivery mints distinct tokens in a registry shared by the core and bridge,
+  bound to the recipient's TS UID and uninterrupted channel membership. The
+  registry keeps them inactive until the ordered Query acknowledgement, checks
+  the share lease and membership at redemption, and keeps at most 64 live private
+  tokens per share. Every guest's SFU grant retains the link lease; private guests'
+  grants also retain the original membership lease. Ending either lease stops fresh
+  forwarding synchronously. Queue and RTX cleanup checks the same grant, so pending
+  media and repairs cannot outlive that authority. Share end uses the grant's existing
+  source authority. Transport/WebSocket teardown and admission cleanup stay async.
+- **"Possible" means:** a public URL, `screen_guest_links` on, `file_access`
+  `link`, a bridge attached right now (not only `--teamspeak`), and a channel
+  that is neither encrypted nor private. Private channels are never bridged,
+  so they get no link either. The web client checks the same (`server.teamspeak`
+  stands in for the bridge) before it shows the notice and the checkbox, and
+  sends `guest_link: false` where the server would make no link anyway.
+- **Turning off is final, whoever does it.** `screen.link.revoke` by the sharer
+  or a moderator; `file_access` set to `members` or `screen_guest_links` set
+  off (checked on every `server.update`, and with the watch rules after any
+  channel change); and the bridge detaching or being replaced. Each turns every
+  affected link off for the rest of its share: turning a setting back on does
+  not bring a link back, the next share gets a new one.
+- **What guests are told.** A share that ends sends its guests
+  `screen.stopped {share, reason}` without `by`; a link turned off sends
+  `screen.link {share, active: false}`. Then their connection closes. The page
+  says "The share has ended" or "This link was turned off".
+- **Errors.** Unknown, ended and turned-off tokens answer the same
+  `not_found` ("this link does not work"). A share already at 10 guests, or at
+  25 viewers with members and guests counted together, answers `busy`: telling
+  a guest that the link works but the share is full reveals nothing a valid
+  token holder could not see anyway. A guest frame that does not parse as one
+  of the watch ops, a second `guest.watch` and a second `guest.offer` close the
+  connection, even past the rate limit; an error reply echoes the frame's own
+  `id` where it has one.
+- **A guest let go is gone at once.** The core holds a signal for each guest
+  and drops it with the guest; the gateway's writer then stops even a write
+  stuck on a guest that no longer reads, flushes the last frames and the close
+  within 2 s, and drops the socket. Any frame that cannot leave within 5 s
+  ends the connection too. Its pre-authentication place frees with it.
+- **The token never reaches a log.** It travels as `WatchToken` from the
+  frame to the core and the bridge's copy as `WatchUrl`; both print `(..)` in
+  `Debug`. The puppet's queued text (`MessageText`) prints only its length.
+- **Guest ids** come from the session id space and are never handed to a
+  member, so a guest's watch lease, slot and `EndWatch` cannot collide with a
+  session's. A guest has no client entry and appears in no event other than
+  the share's guest count.
+- **Who sees the link state.** The sharer and moderators (`mute_members`) in
+  the share's channel get `screen.link` events while the share runs; `Welcome`
+  carries no link state, so a moderator who connects later sees no "Turn off
+  TeamSpeak link" until the next change. The sharer's own line comes from its
+  `screen.link {active: true}`.
+- **The server setting** has a switch in Server settings, shown only on
+  TeamSpeak servers.
+- **Late joiners and the presence marker.** Private links go once per UID and
+  uninterrupted channel membership, using a fresh per-recipient token. Query
+  records successful delivery at acknowledgement. Completed receipts are
+  consumed before an old attempt is replaced, and a departure never discards
+  an acknowledged receipt. That membership's token is revoked on departure;
+  returning starts a new membership with one fresh private link. Readers of
+  the channel post count as told only after confirmed delivery and while their
+  original membership remains valid. If the signed channel post fails, those
+  in the channel get private links instead. The " · sharing screen" marker
+  follows the sharer's name in the channel description's presence line, which lists users without a
+  puppet (the line puppets do not need).
+- **ServerQuery posts only to readers.** Without a puppet, or when the
+  puppet's queue does not take the post, the signed ServerQuery post is made
+  only when TeamSpeak users are in the channel; one who arrives later gets the
+  late-joiner message instead. Enqueue is not delivery: the puppet keeps a receipt
+  through moves and TeamSpeak's command result. Readers count as told only after
+  success. A definite rejection or a command dropped before dispatch uses the
+  signed fallback; a lost connection after dispatch leaves delivery unknown and
+  does not repeat the channel post. Untold readers who remain in the channel get
+  one private recovery attempt per uninterrupted channel membership, with at most
+  one flood retry. Each receipt belongs to one post attempt. A departure or move
+  invalidates a reader's membership, so leaving and returning before a receipt
+  cannot count as reading the channel post. Private delivery runs outside the
+  bridge event loop, with four tasks admitted per share and no tasks waiting for
+  admission. Query checks the recipient's connection and membership before
+  every socket dispatch and retry, invalidating them before forwarding departures.
+  Private tokens remain inactive until the connection task reads the final
+  successful acknowledgement with the original UID/membership still valid.
+  The single ordered Query stream places a departure before the acknowledgement
+  of a command executed against a reassigned clid, closing the unread-notification
+  redemption race. Redemption and subsequent offers and media callbacks recheck
+  the retained membership. The SFU grant checks that same membership synchronously
+  on every packet and when clearing queued media and RTX, independently of the
+  cancellation waiter. That waiter ends the transport lease before waiting for core
+  queue capacity to release the guest admission. A Query disconnect
+  also invalidates its memberships and terminates their admitted private guests.
+  The core ends the link's cancellation lease synchronously on revocation or share end; all private tokens, queued posts,
+  admission deferrals, sends and flood retries obey it. Queue admission and
+  reply waiting share a 30 s deadline per send; an in-flight timeout closes
+  Query and lets bridge supervision reconnect. A post too long for one
+  puppet command goes entirely through ServerQuery, avoiding partial
+  enqueue and duplicate fallback posts.
+- **The page** is plain TypeScript (no React, no app stores), about 8 KB
+  gzipped with its CSS. It keeps the token in the fragment (a reload works
+  after a lost connection), pings every 20 s once admitted, and shows
+  "Connecting…", "Your connection is too slow for this share" (on
+  `screen.paused`, from PR 3b), "The share has ended", "This link was turned
+  off", "This link doesn't work: the share has ended or the link was turned
+  off.", a busy line and a lost-connection line, in Polish or English. With
+  `--web-root` the server serves it at `/watch` and `/watch.html` with
+  `Referrer-Policy: no-referrer`, `Cache-Control: no-cache`,
+  `Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options:
+  DENY`. The official web host serves it the same way and proxies
+  `/ws/watch` (docs/deploy.md, nginx).
+- **Tests.** `crates/gwar-server/tests/watch_links.rs` runs guests over real
+  SRTP against a channel standing in for the bridge, including the PreAuth
+  limits by /64 and the 60 s idle close of a guest that stops pinging. The
+  bridge tests cover confirmed puppet delivery, rejection, a dropped queued
+  post, uncertain delivery without duplicate fallback, stale receipts and
+  cancellation during a query move. Query tests cover cancellation in the
+  socket queue and before a flood retry. A deterministic single-thread regression
+  writes departure/reassignment and acknowledgement bytes before redemption,
+  attempts redemption before Query can consume them, and verifies the generic
+  miss both then and after the acknowledgement. It also covers the normal ordered
+  acknowledgement and activation path. Guest gateway tests negotiate real SRTP,
+  receive 12 packets, end the membership, and immediately publish more media before
+  awaiting socket closure; the revoked guest receives zero RTP. They also verify
+  socket closure and freed admission. A deterministic core/SRTP regression uses the
+  actual guest grant without yielding to cancellation tasks: membership, link and
+  share revocation reject fresh writes and clear queued packets and delayed RTX,
+  while the transport lease and admission still exist. Core tests fence queued offers and delayed connection
+  signals after membership ends; verify live, departed, returning and ended token
+  bindings and the 64-token cap; exercise both receipt-sweep orderings with one
+  delivery per membership; and keep 40-recipient recovery bounded with a stalled reply, share-end
+  cancellation and Query reconnection signaling. They also cover the signed
+  ServerQuery post, late joiners, encrypted channels, members-only servers
+  and the description.
+  `apps/web/e2e/watch.mjs` runs Chromium and WebKit guest pages against a
+  server built with `test-hooks`, whose stand-in bridge
+  (`GWAR_TEST_WATCH_LINKS`) prints each link: the acceptance order, watching,
+  the 150 s heartbeat, the end of the share, the checkbox off and "Turn off".
+- **Waiting for PR 3b** (allocation): a member's admission does not yet
+  reclaim guest reservations (newest guest first; each guest records when it
+  joined for this), `screen.paused` / `screen.resumed` are not yet sent to
+  guests, and a paused guest is not yet re-admitted every 5 s. Until then a
+  guest holds its viewer place like a member, within the 10-guest cap. The
+  page already handles both events.
 
 ## 7. Phases and pull requests
 

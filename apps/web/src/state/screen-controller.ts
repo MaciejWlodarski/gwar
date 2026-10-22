@@ -68,6 +68,18 @@ async function loadDesktopCapture(): Promise<void> {
   }
 }
 
+/**
+ * Whether a share in my voice channel can get a TeamSpeak watch link, so the preset menu says so
+ * and offers the checkbox (docs/screen-share.md, "TeamSpeak watch links"): a bridged channel (on
+ * a TeamSpeak server, plaintext and not private) where files open by link and watch links are on.
+ */
+export function guestLinkPossible(s: ReturnType<typeof useSession.getState>): boolean {
+  const channel = myChannelId(s);
+  const info = channel === null ? undefined : s.channels[channel];
+  return s.kind === "gwar" && !!s.server?.teamspeak && s.server.file_access === "link" && !!s.server.screen_guest_links
+    && !!info && !info.encrypted && !info.private;
+}
+
 function dispatch(action: ScreenAction): void {
   useScreen.getState().dispatch(action);
 }
@@ -161,6 +173,23 @@ export class ScreenController {
     dispatch({ type: "preview", on });
   }
 
+  /** The preset menu's "Post a watch link to TeamSpeak". */
+  setGuestLink(on: boolean): void {
+    dispatch({ type: "guestLink", on });
+  }
+
+  guestLinkPossible(): boolean {
+    return guestLinkPossible(useSession.getState());
+  }
+
+  /** Turns my share's watch link off, or (as a moderator) someone else's; final for that share. */
+  async turnOffLink(share: string): Promise<void> {
+    const conn = this.link();
+    if (!conn) return;
+    try { await conn.request("screen.link.revoke", { share }); }
+    catch (e) { useUi.getState().toast("error", this.describe(e)); }
+  }
+
   /** The preset menu's confirmation: `screen.start`, then the share's publish transport. */
   async confirmShare(): Promise<void> {
     const own = useScreen.getState().own;
@@ -168,6 +197,8 @@ export class ScreenController {
     const track = own?.stream?.getVideoTracks()[0];
     if (!own || own.phase !== "choosing" || !track) return;
     const { attempt, preset, surface } = own;
+    // Only what the sharer saw and confirmed: the notice and the checkbox were in the preset menu.
+    const guestLink = own.guestLink && this.guestLinkPossible();
     const current = () => useScreen.getState().own?.attempt === attempt && this.link() === conn;
     const s = useSession.getState();
     const me = s.me ? s.clients[s.me.session] : undefined;
@@ -179,7 +210,7 @@ export class ScreenController {
     await applyCapturePreset(track, preset);
     let share: string;
     try {
-      share = (await conn.request("screen.start", { call: binding.call, participation: binding.participation, preset, surface, guest_link: false })).share;
+      share = (await conn.request("screen.start", { call: binding.call, participation: binding.participation, preset, surface, guest_link: guestLink })).share;
     } catch (e) {
       if (!current()) return;
       this.endOwn();
@@ -419,7 +450,10 @@ export class ScreenController {
         dispatch({ type: "live", share: event.d.share });
         return;
       case "screen.viewers":
-        dispatch({ type: "viewers", share: event.d.share, members: event.d.members });
+        dispatch({ type: "viewers", share: event.d.share, members: event.d.members, guests: event.d.guests });
+        return;
+      case "screen.link":
+        dispatch({ type: "link", share: event.d.share, active: event.d.active });
         return;
       case "screen.slot": {
         const { run, slot, share } = event.d;
@@ -432,6 +466,7 @@ export class ScreenController {
       }
       case "screen.stopped": {
         const { share, reason, by } = event.d;
+        if (reason !== "access") dispatch({ type: "link", share, active: false });
         const own = useScreen.getState().own;
         if (own?.share === share) {
           this.endOwn();

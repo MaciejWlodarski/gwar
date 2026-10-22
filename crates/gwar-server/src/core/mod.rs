@@ -22,6 +22,7 @@ mod owner;
 pub(crate) mod passwords;
 mod private;
 mod screen;
+pub use screen::{GuestMsg, PrivateWatchLinks, PrivateWatchReceipt, WatchUrl};
 mod sealed;
 mod voice;
 
@@ -46,7 +47,7 @@ use gwar_proto::{
     Channel, ChannelAccess, ChannelCreate, ChannelId, ChannelUpdate, ChatMessage, ChatTarget, Client, ClientUpdate,
     DeviceCertificate, ErrorBody, ErrorCode, Event, FileAccess, Group, GroupId, IceServer, LeaveReason, MessageId,
     MessageSignature, NICKNAME_MAX_LEN, Permission, Platform, Request, Response, ServerFrame, ServerInfo, SessionId,
-    Uid, Unread, Welcome,
+    Uid, Unread, WatchToken, Welcome,
 };
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -139,6 +140,8 @@ pub enum CoreMsg {
     },
     /// The screen SFU on a transport, in the order it saw them.
     Screen(ScreenSignal),
+    /// A TeamSpeak guest's watch connection (`/ws/watch`).
+    Guest(GuestMsg),
     Info(oneshot::Sender<ServerInfo>),
     /// A TeamSpeak import for the running server (`gwar-server import-teamspeak` over the control socket).
     #[cfg(feature = "teamspeak")]
@@ -275,6 +278,24 @@ impl CoreHandle {
         let _ = self.tx.send(CoreMsg::Bridge(msg)).await;
     }
 
+    /// A guest's `guest.watch`: the core queues the reply on `out`; the guest's id, or `None`
+    /// when refused.
+    pub async fn guest_watch(
+        &self,
+        id: u32,
+        token: WatchToken,
+        out: OutboundTx,
+        held: oneshot::Sender<()>,
+    ) -> Option<SessionId> {
+        let (reply, rx) = oneshot::channel();
+        self.tx.send(CoreMsg::Guest(GuestMsg::Watch { id, token, out, held, reply })).await.ok()?;
+        rx.await.ok().flatten()
+    }
+
+    pub async fn guest(&self, msg: GuestMsg) {
+        let _ = self.tx.send(CoreMsg::Guest(msg)).await;
+    }
+
     /// Adds a remote session (see [`bridge`]); `None` if the core is gone.
     pub async fn remote_join(&self, client: RemoteClient) -> Option<SessionId> {
         let (tx, rx) = oneshot::channel();
@@ -302,6 +323,9 @@ pub struct CoreConfig {
     pub server_signer: Arc<ed25519_dalek::SigningKey>,
     /// TeamSpeak compatibility is on.
     pub teamspeak: bool,
+    /// What a TeamSpeak watch link is before its token (`…/watch#`), when the server has a
+    /// public URL (docs/screen-share.md, "The link and its token").
+    pub watch_base: Option<String>,
 }
 
 struct Session {
@@ -422,6 +446,12 @@ pub struct Core {
     /// `screen.*.offer` rate per session.
     screen_offers: HashMap<SessionId, voice::Bucket>,
     screen: mpsc::Sender<ScreenCmd>,
+    /// See [`CoreConfig::watch_base`].
+    watch_base: Option<String>,
+    /// TeamSpeak guests watching through watch links, by an id from the session id space.
+    guests: BTreeMap<SessionId, screen::Guest>,
+    /// SHA-256 of each working watch link's token, to its share.
+    watch_links: HashMap<[u8; 32], String>,
 }
 
 /// Messages with ids at or above this value are delivered live and not stored.
@@ -592,6 +622,7 @@ impl Core {
                 _ => FileAccess::Link,
             },
             teamspeak: config.teamspeak,
+            screen_guest_links: store.meta("screen_guest_links")?.as_deref() != Some("off"),
             server_chat: store.server_chat()?,
             badges: Vec::new(),
             icon: None,
@@ -652,6 +683,9 @@ impl Core {
             screen_starts: HashMap::new(),
             screen_offers: HashMap::new(),
             screen,
+            watch_base: config.watch_base,
+            guests: BTreeMap::new(),
+            watch_links: HashMap::new(),
         };
         core.refresh_all_private();
         core.mls_reconcile()?;
@@ -701,6 +735,7 @@ impl Core {
             CoreMsg::Screen(ScreenSignal::Watch { session, run, connected }) => {
                 self.screen_watching(session, run, connected)
             }
+            CoreMsg::Guest(msg) => self.guest_msg(msg),
             CoreMsg::Voice { session, connected, binding, failed } => {
                 if self
                     .sessions
@@ -1416,7 +1451,7 @@ impl Core {
             let id = self.next_session;
             // Session ids double as TeamSpeak client ids, which are u16.
             self.next_session = if self.next_session >= SessionId::from(u16::MAX) { 1 } else { self.next_session + 1 };
-            if !self.sessions.contains_key(&id) {
+            if !self.sessions.contains_key(&id) && !self.guests.contains_key(&id) {
                 return id;
             }
         }
@@ -1470,6 +1505,8 @@ impl Core {
     fn bridge_msg(&mut self, msg: BridgeMsg) {
         match msg {
             BridgeMsg::Attach(bridge) => {
+                // The bridge it replaces took its copies of the watch links with it.
+                self.turn_off_all_links();
                 let stale: Vec<_> = self.sessions.values().filter(|s| s.out.is_none()).map(|s| s.id).collect();
                 for session in stale {
                     self.remove(session, LeaveReason::Timeout);
@@ -1640,6 +1677,13 @@ impl Core {
             BridgeMsg::ServerPasswordSet { hash, password } => {
                 if let Err(e) = self.store.forget_bridge_server_password(Some((&hash, &password))) {
                     warn!("store: {e:#}");
+                }
+            }
+            BridgeMsg::Detached => {
+                // Only the bridge that stopped: a newer one may have attached since.
+                if self.bridge.as_ref().is_none_or(|b| b.is_closed()) {
+                    self.bridge = None;
+                    self.turn_off_all_links();
                 }
             }
             BridgeMsg::Leave(session, reason) => {
@@ -2867,6 +2911,7 @@ pub(crate) mod expiry_tests {
                 server_key: String::new(),
                 server_signer: Arc::new(crate::server_key::generate()),
                 teamspeak,
+                watch_base: None,
             },
             Arc::new(ArcSwap::from_pointee(Routing::default())),
             media,
@@ -3327,6 +3372,7 @@ pub(crate) mod expiry_tests {
                 server_key: String::new(),
                 server_signer: Arc::new(crate::server_key::generate()),
                 teamspeak: false,
+                watch_base: None,
             },
             routing.clone(),
             media,

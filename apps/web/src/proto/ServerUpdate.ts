@@ -4,4 +4,8 @@ import type { FileAccess } from "./FileAccess";
 /**
  * Absent fields stay unchanged; `password: ""` removes the server password.
  */
-export type ServerUpdate = { name?: string | null, welcome?: string | null, default_channel?: number | null, password?: string | null, max_clients?: number | null, file_access?: FileAccess | null, };
+export type ServerUpdate = { name?: string | null, welcome?: string | null, default_channel?: number | null, password?: string | null, max_clients?: number | null, file_access?: FileAccess | null, 
+/**
+ * TeamSpeak watch links for shares in bridged channels (docs/screen-share.md).
+ */
+screen_guest_links?: boolean | null, };

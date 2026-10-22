@@ -8,7 +8,7 @@ import { useSession } from "../state/stores";
 import { TsGroupBadges } from "./badges";
 
 const server: ServerInfo = {
-  name: "TS", welcome: "", version: "3", default_channel: 1, max_clients: 32, upload_limit: 0, file_access: "link", teamspeak: true,
+  name: "TS", welcome: "", version: "3", default_channel: 1, max_clients: 32, upload_limit: 0, file_access: "link", teamspeak: true, screen_guest_links: true,
   server_chat: { encrypted: false, history: false },
   badges: [
     { kind: "server", id: 6, name: "Server Admin", sort: 0 },

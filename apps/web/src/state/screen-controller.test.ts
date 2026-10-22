@@ -284,7 +284,7 @@ describe("watch requests across a reset (review round 2)", () => {
 describe("sharing", () => {
   const track = () => ({ stop: vi.fn(), addEventListener: vi.fn(), getSettings: () => ({ displaySurface: "browser" }) });
   const choosing = (t = track()) => {
-    useScreen.setState({ own: { phase: "choosing", attempt: 1, share: null, stream: { getVideoTracks: () => [t], getTracks: () => [t] } as unknown as MediaStream, surface: "tab", choice: "auto", preset: "text", viewers: 0, preview: false } });
+    useScreen.setState({ own: { phase: "choosing", attempt: 1, share: null, stream: { getVideoTracks: () => [t], getTracks: () => [t] } as unknown as MediaStream, surface: "tab", choice: "auto", preset: "text", viewers: 0, guests: 0, guestLink: true, preview: false } });
     return t;
   };
 
@@ -329,6 +329,57 @@ describe("sharing", () => {
     expect(ops()).toEqual([]);
     expect(t.stop).toHaveBeenCalled();
     expect(useScreen.getState().own).toBeNull();
+  });
+
+  describe("TeamSpeak watch links", () => {
+    const teamspeak = (patch: Record<string, unknown> = {}) => {
+      const server = useSession.getState().server!;
+      useSession.setState({ server: { ...server, teamspeak: true, file_access: "link", screen_guest_links: true, ...patch } });
+    };
+    const start = async (configure: (screen: ScreenController) => void = () => {}) => {
+      useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+      const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+      const screen = new ScreenController(() => link, String);
+      choosing();
+      configure(screen);
+      await screen.confirmShare();
+      return { screen, start: calls[0]![1] };
+    };
+
+    it("asks for a link only where one is possible and the sharer left the checkbox on", async () => {
+      teamspeak();
+      expect((await start()).start.guest_link).toBe(true);
+      useScreen.setState({ ...initialScreen });
+      expect((await start(screen => screen.setGuestLink(false))).start.guest_link).toBe(false);
+    });
+
+    it("never asks without a bridged channel, links for files or the server's watch links", async () => {
+      for (const patch of [{ teamspeak: false }, { file_access: "members" }, { screen_guest_links: false }]) {
+        useScreen.setState({ ...initialScreen });
+        teamspeak(patch);
+        expect((await start()).start.guest_link, JSON.stringify(patch)).toBe(false);
+      }
+      teamspeak();
+      useSession.setState({ channels: { ...useSession.getState().channels, 1: { ...ch(1), private: true } } });
+      useScreen.setState({ ...initialScreen });
+      expect((await start()).start.guest_link, "private channel").toBe(false);
+    });
+
+    it("shows the link and its guests, and forgets it when it is off or the share ends", async () => {
+      teamspeak();
+      const { screen } = await start();
+      screen.handleEvent({ ev: "screen.started", d: share("M", 1, 1) });
+      screen.handleEvent({ ev: "screen.link", d: { share: "M", active: true } });
+      screen.handleEvent({ ev: "screen.viewers", d: { share: "M", members: 1, guests: 2 } });
+      expect(useScreen.getState().links).toEqual({ M: true });
+      expect(useScreen.getState().own).toMatchObject({ viewers: 1, guests: 2 });
+      screen.handleEvent({ ev: "screen.link", d: { share: "M", active: false } });
+      expect(useScreen.getState().links).toEqual({});
+      // A moderator hears of someone else's link; it goes with the share.
+      screen.handleEvent({ ev: "screen.link", d: { share: "A", active: true } });
+      screen.handleEvent({ ev: "screen.stopped", d: { share: "A", reason: "stopped" } });
+      expect(useScreen.getState().links).toEqual({});
+    });
   });
 
   it("ends my share when a moderator stops it", async () => {

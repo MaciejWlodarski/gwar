@@ -38,7 +38,8 @@ export function pageContextFromLocation(loc: Pick<Location, "protocol" | "hostna
 /** The WebSocket URL of the server that served this page (rule: same origin). */
 export function sameOriginUrl(page: PageContext): string {
   const secure = page.protocol === "https:";
-  const host = page.hostname.includes(":") ? `[${page.hostname}]` : page.hostname;
+  // `location.hostname` already brackets an IPv6 address; a bare one gets them once.
+  const host = page.hostname.includes(":") && !page.hostname.startsWith("[") ? `[${page.hostname}]` : page.hostname;
   return `${secure ? "wss" : "ws"}://${host}${page.port ? `:${page.port}` : ""}${DEFAULT_PATH}`;
 }
 

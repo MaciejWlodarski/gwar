@@ -11,7 +11,7 @@ import { canActOn } from "../lib/permissions";
 import type { Client } from "../proto/Client";
 import type { ScreenShare } from "../proto/ScreenShare";
 import { controller } from "../state/controller";
-import { useCanWatch, useScreenSupport } from "../state/screen-controller";
+import { guestLinkPossible, useCanWatch, useScreenSupport } from "../state/screen-controller";
 import { shareOf } from "../state/reducer";
 import { slotOf, useScreen } from "../state/screen";
 import { useSession } from "../state/stores";
@@ -80,6 +80,7 @@ export function SharePresetDialog() {
   const own = useScreen(s => s.own);
   const open = own?.phase === "choosing";
   const [busy, setBusy] = useState(false);
+  const linkable = useSession(guestLinkPossible);
   if (!own || (own.phase !== "choosing" && !busy)) return null;
   return (
     <Dialog
@@ -112,6 +113,16 @@ export function SharePresetDialog() {
         </div>
       </fieldset>
       <p className="mt-3 text-xs text-subtle">{t("screen.presetHint")}</p>
+      {linkable && (
+        // Shown before anything is published: no link exists until the share starts with it.
+        <div className="mt-3 rounded-md border border-line bg-side px-3 py-2">
+          <p className="text-xs text-muted">{t("screen.tsNotice")}</p>
+          <label className="mt-1.5 flex cursor-pointer items-center gap-2 text-sm text-fg">
+            <input type="checkbox" className="size-4 accent-[var(--accent)]" checked={own.guestLink} onChange={e => controller.screen.setGuestLink(e.target.checked)} />
+            {t("screen.tsPost")}
+          </label>
+        </div>
+      )}
     </Dialog>
   );
 }
@@ -134,13 +145,24 @@ export function SharingBar() {
   const t = useT();
   const lang = useLanguage();
   const own = useScreen(s => s.own);
+  const links = useScreen(s => s.links);
   if (!own || (own.phase !== "starting" && own.phase !== "live")) return null;
   const watching = own.phase === "live" ? t(countKey(lang, "screen.watching", own.viewers), { count: own.viewers }) : t("screen.starting");
+  const linked = !!own.share && !!links[own.share];
   return (
     <div role="status" aria-label={t("screen.sharingBar")} className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 bg-danger px-3 py-1.5 text-sm text-white">
       <MonitorUp aria-hidden className="size-4 shrink-0" />
       <span className="font-medium">{t("screen.sharingBar")}</span>
       <span data-testid="screen-viewers" className="text-white/85">{watching}</span>
+      {linked && own.share && (
+        <span data-testid="screen-ts-link" className="flex items-center gap-1.5 text-white/85">
+          <span>{`${t("screen.tsLinkOn")} · ${t(countKey(lang, "screen.guests", own.guests), { count: own.guests })}`}</span>
+          <Button size="sm" variant="secondary" title={t("screen.tsTurnOffTitle")} className="h-6 border-white/40 px-2 text-xs text-white hover:bg-white/15"
+            onClick={() => void controller.screen.turnOffLink(own.share!)}>
+            {t("screen.tsTurnOff")}
+          </Button>
+        </span>
+      )}
       <span className="ml-auto flex items-center gap-2">
         <label className="flex items-center gap-1.5 text-xs">
           {t("screen.preset")}
@@ -267,6 +289,7 @@ export function Stage() {
   const info = stage ? shares[stage] : undefined;
   const { client, name } = useSharer(info);
   const mayStop = useMayStop(info, client);
+  const linked = useScreen(s => (stage ? !!s.links[stage] : false));
   const frame = useRef<HTMLDivElement>(null);
   const video = useRef<HTMLVideoElement | null>(null);
   const [fullscreen, setFullscreen] = useState(false);
@@ -310,6 +333,11 @@ export function Stage() {
         <span className="shrink-0 rounded bg-danger px-1 text-[10px] leading-4 font-bold tracking-wide">{t("screen.live")}</span>
         <QualityBadge share={stage} />
         <span className="ml-auto flex items-center gap-1">
+          {mayStop && linked && (
+            <Button size="sm" variant="secondary" className="border-white/30 text-white hover:bg-white/10" onClick={() => void controller.screen.turnOffLink(stage)}>
+              {t("screen.tsTurnOffOther")}
+            </Button>
+          )}
           {mayStop && (
             <Button size="sm" variant="secondary" className="border-white/30 text-white hover:bg-white/10" onClick={() => void controller.screen.stopOther(stage)}>
               <ScreenShareOff className="size-4" /> {t("screen.stopOther")}

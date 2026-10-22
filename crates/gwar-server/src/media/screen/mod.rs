@@ -109,21 +109,34 @@ impl ScreenOrigin {
 /// Bitrate cap per share (docs/screen-share.md, "Limits").
 pub const SHARE_CAP_BPS: u64 = 8_000_000;
 
+/// Slots of a TeamSpeak guest's watch transport: it watches the one share its link opens.
+pub const GUEST_SLOTS: usize = 1;
+
 /// One viewer's right to one share in one slot. The core ends it the moment access ends; it
-/// also ends with its share.
+/// also ends with its share and, for guests, its link and original TeamSpeak membership.
 #[derive(Debug)]
 pub struct WatchGrant {
     pub share: String,
     origin: Arc<ScreenOrigin>,
     alive: AtomicBool,
+    leases: Vec<Arc<Lease>>,
 }
 
 impl WatchGrant {
     pub fn new(origin: Arc<ScreenOrigin>) -> Arc<Self> {
-        Arc::new(Self { share: origin.share.clone(), origin, alive: AtomicBool::new(true) })
+        Arc::new(Self { share: origin.share.clone(), origin, alive: AtomicBool::new(true), leases: Vec::new() })
+    }
+    /// Guest authority is checked directly, without waiting for asynchronous teardown.
+    pub fn guest(origin: Arc<ScreenOrigin>, link: Arc<Lease>, membership: Option<Arc<Lease>>) -> Arc<Self> {
+        Arc::new(Self {
+            share: origin.share.clone(),
+            origin,
+            alive: AtomicBool::new(true),
+            leases: std::iter::once(link).chain(membership).collect(),
+        })
     }
     pub fn alive(&self) -> bool {
-        self.alive.load(Ordering::Acquire) && self.origin.alive()
+        self.alive.load(Ordering::Acquire) && self.origin.alive() && self.leases.iter().all(|lease| lease.alive())
     }
     pub fn end(&self) {
         self.alive.store(false, Ordering::Release);
@@ -199,20 +212,30 @@ pub enum ScreenSignal {
     Watch { session: SessionId, run: u64, connected: bool },
 }
 
-/// A watch transport's lease: the core ends it when it drops the transport, so the screen task
-/// closes it even if the `EndWatch` that follows is lost to a full queue.
+/// Cancellation for screen transports, watch links and TeamSpeak memberships. Ending is
+/// synchronous; async waiters wake immediately. The screen task also checks the flag, so a
+/// transport closes even if its `EndWatch` is lost to a full queue.
 #[derive(Debug)]
-pub struct Lease(AtomicBool);
+pub struct Lease(AtomicBool, tokio::sync::Notify);
 
 impl Lease {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self(AtomicBool::new(true)))
+        Arc::new(Self(AtomicBool::new(true), tokio::sync::Notify::new()))
     }
     pub fn alive(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
+    pub async fn ended(&self) {
+        let ended = self.1.notified();
+        tokio::pin!(ended);
+        ended.as_mut().enable();
+        if self.alive() {
+            ended.await;
+        }
+    }
     pub fn end(&self) {
         self.0.store(false, Ordering::Release);
+        self.1.notify_waiters();
     }
 }
 
@@ -228,11 +251,13 @@ pub enum ScreenCmd {
     EndPublish {
         share: String,
     },
-    /// A session's watch transport, replacing any earlier run.
+    /// A session's watch transport, replacing any earlier run: [`SCREEN_SLOTS`] slots for a
+    /// member, [`GUEST_SLOTS`] for a TeamSpeak guest (whose id comes from the same space).
     Watch {
         session: SessionId,
         run: u64,
         lease: Arc<Lease>,
+        slots: usize,
         sdp: String,
         reply: oneshot::Sender<Result<String, &'static str>>,
     },
@@ -364,6 +389,8 @@ struct Watcher {
     /// Local ICE username fragment, which routes its STUN.
     ufrag: String,
     slots: Vec<Slot>,
+    /// How many slots the offer has.
+    size: usize,
     /// Assignments that arrived before the slot's m-line was seen.
     pending: Vec<(u32, Arc<WatchGrant>)>,
     connected: bool,
@@ -505,7 +532,7 @@ impl Sfu {
                 }
             }
             ScreenCmd::EndPublish { share } => self.end_publish(&share),
-            ScreenCmd::Watch { session, run, lease, sdp, reply } => {
+            ScreenCmd::Watch { session, run, lease, slots, sdp, reply } => {
                 if reply.is_closed() || !lease.alive() {
                     return;
                 }
@@ -515,7 +542,7 @@ impl Sfu {
                 }
                 self.end_watch(session);
                 let id = self.id();
-                match watcher(id, session, run, lease, &sdp, self.advertise, now) {
+                match watcher(id, session, run, lease, slots, &sdp, self.advertise, now) {
                     Ok((mut watcher, answer)) => {
                         if self.drive_watcher(&mut watcher, &mut Vec::new()) {
                             self.signal(ScreenSignal::Watch { session, run, connected: true });
@@ -921,9 +948,10 @@ impl Sfu {
     /// Polls a watch transport until it sleeps; keyframe requests from the viewer are
     /// collected by slot. True if it connected just now.
     fn drive_watcher(&self, w: &mut Watcher, requests: &mut Vec<usize>) -> bool {
-        sweep(w);
         let mut connected = false;
         loop {
+            // Membership can end independently while this transport's output is draining.
+            sweep(w);
             if !w.rtc.is_alive() {
                 return connected;
             }
@@ -941,6 +969,11 @@ impl Sfu {
                     return connected;
                 }
                 Output::Transmit(t) => {
+                    // Discard an RTP output if authority ended while poll_output ran;
+                    // sweeping also clears the remaining queue and RTX cache.
+                    if is_rtp(&t.contents) && sweep(w) {
+                        continue;
+                    }
                     let _ = self.socket.try_send_to(&t.contents, t.destination);
                 }
                 Output::Event(event) => match event {
@@ -950,7 +983,7 @@ impl Sfu {
                     }
                     RtcEvent::IceConnectionStateChange(IceConnectionState::Disconnected) => w.rtc.disconnect(),
                     RtcEvent::MediaAdded(added) if added.kind == MediaKind::Video => {
-                        if added.direction.is_sending() && w.slots.len() < SCREEN_SLOTS {
+                        if added.direction.is_sending() && w.slots.len() < w.size {
                             let pts = video_pts(&w.rtc, added.mid);
                             w.slots.push(Slot {
                                 mid: added.mid,
@@ -1096,12 +1129,16 @@ fn release(rtc: &mut Rtc, slot: &mut Slot) {
 
 /// Releases every slot whose grant ended, ahead of the core's `Release`: once access ends,
 /// nothing of the share leaves this transport, cached repairs included.
-fn sweep(w: &mut Watcher) {
+fn sweep(w: &mut Watcher) -> bool {
+    w.pending.retain(|(_, grant)| grant.alive());
+    let mut revoked = false;
     for slot in &mut w.slots {
         if slot.grant.as_ref().is_some_and(|g| !g.alive()) {
             release(&mut w.rtc, slot);
+            revoked = true;
         }
     }
+    revoked
 }
 
 /// Writes one forwarded packet into a viewer's slot. False if the slot dropped it.
@@ -1198,17 +1235,20 @@ fn publisher(
     Ok((publisher, answer.to_sdp_string()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn watcher(
     id: u64,
     session: SessionId,
     run: u64,
     lease: Arc<Lease>,
+    size: usize,
     sdp: &str,
     advertise: SocketAddr,
     now: Instant,
 ) -> Result<(Watcher, String), &'static str> {
-    if !watch_offer(sdp) {
-        return Err("a watch offer has exactly 4 receive-only video m-lines");
+    const REFUSED: &str = "a watch offer has exactly its receive-only video m-lines";
+    if !watch_offer(sdp, size) {
+        return Err(REFUSED);
     }
     let offer = SdpOffer::from_sdp_string(sdp).map_err(|_| "invalid SDP offer")?;
     let mut rtc = rtc(advertise, now)?;
@@ -1219,7 +1259,7 @@ fn watcher(
         .filter_map(|l| l.strip_prefix("a=ssrc:")?.split_whitespace().next()?.parse::<u32>().ok())
         .collect::<HashSet<_>>();
     if ssrcs.iter().any(|&ssrc| rtc.direct_api().stream_rx(&ssrc.into()).is_some()) {
-        return Err("a watch offer has exactly 4 receive-only video m-lines");
+        return Err(REFUSED);
     }
     let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
     let watcher = Watcher {
@@ -1229,7 +1269,8 @@ fn watcher(
         lease,
         rtc,
         ufrag,
-        slots: Vec::with_capacity(SCREEN_SLOTS),
+        slots: Vec::with_capacity(size),
+        size,
         pending: Vec::new(),
         connected: false,
         focus: None,
@@ -1266,13 +1307,14 @@ fn sections(sdp: &str) -> Vec<Vec<&str>> {
     sections
 }
 
-/// A watch offer is the 4 slots and nothing else: `SCREEN_SLOTS` video m-lines that only
-/// receive, and no data channel. Anything that could send media to the SFU would bypass the
-/// publisher's admission and meter. (Its SSRCs are the viewer's RTCP senders; `watcher`
-/// checks no stream was set up to receive from them.)
-fn watch_offer(sdp: &str) -> bool {
+/// A watch offer is its slots and nothing else: `size` video m-lines that only receive
+/// (`SCREEN_SLOTS` for a member, `GUEST_SLOTS` for a guest), and no data channel. Anything that
+/// could send media to the SFU would bypass the publisher's admission and meter. (Its SSRCs are
+/// the viewer's RTCP senders; `watcher` checks no stream was set up to receive from them.)
+fn watch_offer(sdp: &str, size: usize) -> bool {
     let sections = sections(sdp);
-    sections.len() == SCREEN_SLOTS
+    (size == SCREEN_SLOTS || size == GUEST_SLOTS)
+        && sections.len() == size
         && sections.iter().all(|lines| {
             lines[0].starts_with("m=video ")
                 && lines.iter().filter(|l| DIRECTIONS.contains(&l.trim_end())).eq(["a=recvonly"].iter())
@@ -1310,7 +1352,7 @@ pub fn publish_ssrcs(sdp: &str) -> Option<(u32, u32)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use str0m::{change::SdpAnswer, media::Direction};
 
     use super::*;
@@ -1347,7 +1389,8 @@ mod tests {
                     break api.apply().unwrap();
                 }
             };
-            let (w, answer) = watcher(1, 7, 1, Lease::new(), &offer.to_sdp_string(), addr(6000), now).unwrap();
+            let (w, answer) =
+                watcher(1, 7, 1, Lease::new(), SCREEN_SLOTS, &offer.to_sdp_string(), addr(6000), now).unwrap();
             client.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
             let mut pair = Self { w, client, now, hold: false, held: Vec::new(), checks: Vec::new() };
             for _ in 0..200 {
@@ -1427,6 +1470,53 @@ mod tests {
             self.client.handle_input(Input::Timeout(self.now)).unwrap();
             sent
         }
+    }
+
+    /// Runs synchronously with the core's real guest grant: no cancellation task can run
+    /// between revocation, fresh publisher writes, queue cleanup and the delayed NACK.
+    pub(crate) fn assert_guest_revocation_stops_rtp(grant: Arc<WatchGrant>, revoke: impl FnOnce()) {
+        let mut pair = Pair::new();
+        let origin = grant.origin.clone();
+        assign(&mut pair.w, 0, grant.clone());
+        let packet = |n: u64| Forward {
+            source: 100 + n,
+            timestamp: 9000 + (n / 10) as u32 * 3000,
+            marker: n % 10 == 9,
+            keyframe: n.is_multiple_of(10),
+            codec: VideoCodec::Vp8,
+            arrival: pair.now,
+            payload: Arc::from([if n.is_multiple_of(10) { 0x10 } else { 0x00 }, 0x00, n as u8, 0xaa].as_slice()),
+        };
+        let packets: Vec<_> = (0..30).map(packet).collect();
+        for packet in &packets[..10] {
+            assert!(write(&mut pair.w, 0, &origin, packet, pair.now));
+        }
+        pair.hold = true;
+        let mut seen = 0;
+        let sent: usize = (0..10)
+            .map(|_| {
+                pair.step(&mut |_| {
+                    seen += 1;
+                    seen == 3
+                })
+            })
+            .sum();
+        assert_eq!(sent, 10, "the real guest grant forwards before revocation");
+        assert!(!pair.held.is_empty(), "the viewer's loss feedback is held back");
+        for packet in &packets[10..20] {
+            assert!(write(&mut pair.w, 0, &origin, packet, pair.now));
+        }
+        revoke();
+        for packet in &packets[20..] {
+            assert!(!write(&mut pair.w, 0, &origin, packet, pair.now), "fresh RTP after revocation");
+        }
+        sweep(&mut pair.w);
+        pair.hold = false;
+        for datagram in std::mem::take(&mut pair.held) {
+            pair.send_to_sfu(&datagram);
+        }
+        let sent: usize = (0..20).map(|_| pair.step(&mut |_| false)).sum();
+        assert_eq!(sent, 0, "neither queued RTP nor RTX leaves after revocation");
     }
 
     /// Ends `slot`'s grant while the viewer's NACK for a lost packet is in flight, then lets the
@@ -1570,18 +1660,23 @@ mod tests {
         let slot = |direction: &str| format!("m=video 9 UDP/TLS/RTP/SAVPF 96\r\na=mid:x\r\n{direction}");
         let offer = |slots: &[String]| format!("v=0\r\n{}", slots.concat());
         let four = vec![slot("a=recvonly\r\n"); SCREEN_SLOTS];
-        assert!(watch_offer(&offer(&four)));
-        assert!(!watch_offer(&offer(&four[..3])), "three slots");
+        assert!(watch_offer(&offer(&four), SCREEN_SLOTS));
+        assert!(!watch_offer(&offer(&four[..3]), SCREEN_SLOTS), "three slots");
+        // A guest's transport has exactly one slot, and a member's never has one.
+        assert!(watch_offer(&offer(&four[..1]), GUEST_SLOTS));
+        assert!(!watch_offer(&offer(&four), GUEST_SLOTS), "a guest offering four slots");
+        assert!(!watch_offer(&offer(&four[..2]), GUEST_SLOTS), "a guest offering two slots");
+        assert!(!watch_offer(&offer(&four[..2]), 2), "only the two sizes exist");
         for other in ["a=sendonly\r\n", "a=sendrecv\r\n", "", "a=recvonly\r\na=sendonly\r\n"] {
             let mut slots = four.clone();
             slots[2] = slot(other);
-            assert!(!watch_offer(&offer(&slots)), "{other:?}");
+            assert!(!watch_offer(&offer(&slots), SCREEN_SLOTS), "{other:?}");
         }
         let mut slots = four.clone();
         slots[3] = "m=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=recvonly\r\n".into();
-        assert!(!watch_offer(&offer(&slots)), "audio");
+        assert!(!watch_offer(&offer(&slots), SCREEN_SLOTS), "audio");
         slots[3] = "m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n".into();
-        assert!(!watch_offer(&offer(&slots)), "a data channel");
+        assert!(!watch_offer(&offer(&slots), SCREEN_SLOTS), "a data channel");
     }
 
     #[test]

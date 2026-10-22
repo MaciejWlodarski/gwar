@@ -965,6 +965,7 @@ mod tests {
                 server_key: URL_SAFE_NO_PAD.encode(signer.verifying_key().as_bytes()),
                 server_signer: Arc::new(signer),
                 teamspeak: false,
+                watch_base: None,
             },
             Arc::new(ArcSwap::from_pointee(Routing::default())),
             media,

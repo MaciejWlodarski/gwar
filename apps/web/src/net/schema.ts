@@ -70,7 +70,7 @@ const path = (put = false): Rule<string> => (v): v is string => {
 export const imageToken: Rule<string> = (v): v is string => typeof v === "string" && /^(?:i[0-9]{1,10}|a[0-9a-f]{40})$/.test(v);
 const image = optional(nullable(imageToken));
 const badge = shape<Badge>({ kind: literal<BadgeKind>(["server", "channel"]), id, name: str(256), sort: int(2147483647, -2147483648), icon: image });
-const server = shape<ServerInfo>({ name: str(256), welcome: text, version: str(64), default_channel: id, max_clients: int(65535), upload_limit: int(Number.MAX_SAFE_INTEGER), file_access: literal<FileAccess>(["link", "members"]), teamspeak: bool, server_chat: shape({ encrypted: bool, history: bool }), badges: optional(array(badge, 512)), icon: image });
+const server = shape<ServerInfo>({ name: str(256), welcome: text, version: str(64), default_channel: id, max_clients: int(65535), upload_limit: int(Number.MAX_SAFE_INTEGER), file_access: literal<FileAccess>(["link", "members"]), teamspeak: bool, screen_guest_links: bool, server_chat: shape({ encrypted: bool, history: bool }), badges: optional(array(badge, 512)), icon: image });
 /** A download bearer token: empty, or URL-safe characters only, so it is always a valid header value. */
 const bearer: Rule<string> = (v): v is string => str(128)(v) && /^[A-Za-z0-9_-]*$/.test(v);
 const fixed = (bytes: number): Rule<string> => (v): v is string => {

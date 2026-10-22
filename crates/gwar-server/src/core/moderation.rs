@@ -686,6 +686,12 @@ impl Core {
                 core.store.set_meta("file_access", value).map_err(storage_error)?;
                 core.info.file_access = access;
             }
+            if let Some(on) = u.screen_guest_links {
+                core.store.set_meta("screen_guest_links", if on { "on" } else { "off" }).map_err(storage_error)?;
+                core.info.screen_guest_links = on;
+            }
+            // Members-only files or no watch links: the links that work now stop.
+            core.recheck_watch_links();
             if let Some(hash) = password_hash {
                 // Stored even when empty: an explicit "no password" outlives the command line.
                 core.store.set_meta("password_hash", hash.as_deref().unwrap_or("")).map_err(storage_error)?;

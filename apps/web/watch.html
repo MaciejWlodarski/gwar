@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <!-- The watch link's token is in the fragment, which no request carries; nor does a Referer. -->
+    <meta name="referrer" content="no-referrer" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>Gwar</title>
+  </head>
+  <body>
+    <main id="watch">
+      <header>
+        <h1 id="title"></h1>
+        <span class="controls">
+          <button type="button" id="pip" hidden></button>
+          <button type="button" id="fullscreen"></button>
+        </span>
+      </header>
+      <div id="frame">
+        <video id="video" muted autoplay playsinline></video>
+        <p id="status" role="status" aria-live="polite"></p>
+      </div>
+    </main>
+    <script type="module" src="/src/watch/main.ts"></script>
+  </body>
+</html>
