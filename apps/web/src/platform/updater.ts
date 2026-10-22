@@ -165,7 +165,8 @@ let updater: Updater | null = null;
 
 /**
  * Starts the update checks in a built desktop app; returns their cleanup. Other builds leave the
- * plugins out: the web app has none, and `tauri dev` must not replace itself with a release.
+ * plugins out: the web app has none, and `tauri dev` must not replace itself with a release (debug
+ * desktop builds have no updater plugin at all, lib.rs, so their checks fail quietly).
  */
 export function initUpdates(): (() => void) | undefined {
   if (import.meta.env.MODE !== "desktop" || !isDesktop()) return undefined;

@@ -70,9 +70,6 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
-        // App updates: the web UI checks, downloads and installs them (platform/updater.ts), then
-        // restarts the app; the feed and the release key are in tauri.conf.json (docs/releasing.md).
-        .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         // TODO: tauri-plugin-autostart (launch at login) once there is a setting for it.
         .manage(voice::Voice::default())
@@ -139,6 +136,13 @@ pub fn run() {
             debug::debug_capture_check,
             debug::debug_log,
         ]);
+
+    // App updates: the web UI checks, downloads and installs them (platform/updater.ts), then
+    // restarts the app; the feed and the release key are in tauri.conf.json (docs/releasing.md).
+    // Release builds only: a debug build (`tauri dev`, `tauri build --debug`) never replaces
+    // itself; its checks fail and show nothing.
+    #[cfg(not(debug_assertions))]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
 
     builder.build(tauri::generate_context!()).expect("error while building the Voice app").run(|app, event| {
         // Clicking the Dock icon of a hidden app brings the window back.

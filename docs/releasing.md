@@ -36,8 +36,11 @@ GitHub release. Nothing is public until you publish the draft by hand.
    is for your tag, on the commit you pushed, and that nobody changed
    `.github/workflows/release.yml` there. Then approve it, and it adds
    `SHA256SUMS.minisig`, the signatures of the update files and `latest.json`
-   (see [Updates](#updates)) to the draft. Approve before publishing; it
-   refuses to change a published release.
+   (see [Updates](#updates)) to the draft. It signs the files on the draft,
+   only if they are exactly the ones in the `SHA256SUMS` the release job made
+   (whose hash it passes on), so nothing uploaded while the job waits gets
+   signed. Approve before publishing; it refuses to change a published
+   release.
 6. Once the sign job has finished and `SHA256SUMS.minisig` and `latest.json`
    are on the draft, open the draft under Releases. Edit the generated notes,
    optionally download and try a few assets, then press **Publish release**.
@@ -174,8 +177,9 @@ The build jobs need no key: Tauri's own updater files
 (`bundle > createUpdaterArtifacts`) would need its private key at build time,
 so the workflow packs the macOS app itself and serves the installers as they
 are. Locally built apps (`pnpm tauri build`) check for updates the same way, so
-a local 0.1.2 build is offered 0.1.3 once it is published. `tauri dev` and the
-web app never check.
+a local 0.1.2 build is offered 0.1.3 once it is published. Debug builds
+(`tauri dev`, `tauri build --debug`) leave the updater out, so they never
+update, and the web app never checks.
 
 ## The release key
 

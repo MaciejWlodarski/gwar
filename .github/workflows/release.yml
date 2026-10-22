@@ -248,6 +248,9 @@ jobs:
   release:
     needs: [check, desktop, server]
     runs-on: ubuntu-24.04
+    outputs:
+      # What the sign job signs: the draft's files must match this SHA256SUMS.
+      sums: ${{ steps.sums.outputs.sha256 }}
     permissions:
       contents: write
       id-token: write
@@ -280,12 +283,14 @@ jobs:
           done
           exit "$missing"
       - name: Checksums
+        id: sums
         working-directory: dist
         run: |
           sums=$(find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort | xargs sha256sum)
           printf '%s\n' "$sums" > SHA256SUMS
           cat SHA256SUMS
           sha256sum --check SHA256SUMS
+          echo "sha256=$(sha256sum SHA256SUMS | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: release-assets
@@ -335,10 +340,33 @@ jobs:
         with:
           sparse-checkout: docs/release-key.pub
           sparse-checkout-cone-mode: false
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
-        with:
-          name: release-assets
-          path: dist
+      # Signs the files on the draft, as the release job uploaded them: its SHA256SUMS, whose hash
+      # comes from that job's output, must list exactly them. An artifact uploaded while this job
+      # waits for approval (the build jobs can) is never what gets signed.
+      - name: Download the draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+          SUMS_SHA256: ${{ needs.release.outputs.sums }}
+        run: |
+          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft)" != "true" ]; then
+            echo "::error::Release $TAG is already published; not changing it."; exit 1
+          fi
+          if ! [[ $SUMS_SHA256 =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::The release job gave no SHA256SUMS hash."; exit 1
+          fi
+          mkdir dist
+          gh release download "$TAG" --repo "$REPO" --dir dist
+          cd dist
+          # A re-run finds this job's earlier output on the draft; it is made again below.
+          rm -f ./*.minisig latest.json
+          echo "$SUMS_SHA256  SHA256SUMS" | sha256sum --check
+          sha256sum --check SHA256SUMS
+          if ! diff <(cut -d ' ' -f 3- SHA256SUMS | LC_ALL=C sort) \
+            <(find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort); then
+            echo "::error::The draft's files differ from the ones SHA256SUMS lists."; exit 1
+          fi
       - name: Install minisign
         run: sudo apt-get update && sudo apt-get install -y minisign
       - name: Sign SHA256SUMS and the updates
