@@ -60,6 +60,7 @@ pub struct Bwe {
     desired_bitrate: Bitrate,
     smoother: EstimateSmoother,
     min_probe_interval: Duration,
+    probe_byte_limit: DataSize,
 }
 
 impl Bwe {
@@ -70,6 +71,7 @@ impl Bwe {
             desired_bitrate: Bitrate::ZERO,
             smoother: EstimateSmoother::new(),
             min_probe_interval: Duration::ZERO,
+            probe_byte_limit: DataSize::bytes(i64::MAX),
         }
     }
 
@@ -78,7 +80,11 @@ impl Bwe {
         if let Some(estimate) = self.bwe.last_estimate() {
             self.smoother.record(now, estimate);
         }
-        result
+        result.map(|config| config.with_max_bytes(self.probe_byte_limit))
+    }
+
+    pub fn set_probe_byte_limit(&mut self, bytes: usize) {
+        self.probe_byte_limit = DataSize::bytes(bytes.min(i64::MAX as usize) as i64);
     }
 
     pub fn start_probe(&mut self, config: ProbeClusterConfig, now: Instant) -> bool {
@@ -105,6 +111,7 @@ impl Bwe {
 
     pub fn reset(&mut self, init_bitrate: Bitrate) {
         self.bwe.reset(init_bitrate);
+        self.smoother = EstimateSmoother::new();
         self.bwe
             .probe_control
             .set_min_probe_interval(self.min_probe_interval);

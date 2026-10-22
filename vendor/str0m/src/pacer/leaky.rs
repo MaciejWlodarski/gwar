@@ -32,6 +32,8 @@ pub struct LeakyBucketPacer {
     last_handle_time: Option<Instant>,
     /// Observed wake interval; short callbacks decay the peak gradually.
     wake_interval: Duration,
+    /// Regular application cadence, excluding stalls; used by byte-limited probes only.
+    bounded_wake_interval: Duration,
     /// The last time we indicated that a packet should be sent.
     last_emitted: Option<Instant>,
     /// The next time we should send a queued packet.
@@ -98,8 +100,11 @@ impl Pacer for LeakyBucketPacer {
         let elapsed = self.update_handle_time_and_get_elapsed(now);
 
         if !elapsed.is_zero() {
-            // A short callback between scheduler wakes must not erase their cadence.
             self.wake_interval = elapsed.max(self.wake_interval.saturating_sub(elapsed / 20));
+            if elapsed <= Duration::from_millis(20) {
+                self.bounded_wake_interval =
+                    elapsed.max(self.bounded_wake_interval.saturating_sub(elapsed / 20));
+            }
         }
         self.clear_debt(elapsed);
         self.maybe_update_adjusted_bitrate(now);
@@ -179,6 +184,7 @@ impl LeakyBucketPacer {
             padding_bitrate: Bitrate::ZERO,
             last_handle_time: None,
             wake_interval: Duration::ZERO,
+            bounded_wake_interval: Duration::ZERO,
             last_emitted: None,
             next_poll_time: None,
             media_debt: DataSize::ZERO,
@@ -440,17 +446,20 @@ impl LeakyBucketPacer {
         // Active probes need padding to hit their target bitrate when there's insufficient media.
         if let Some(probe) = self.probe_queue.front_mut() {
             // Delegate probe timing and padding calculation to ProbeClusterState
-            if !probe.should_send_now(now) {
+            let bounded = probe.config().is_byte_limited();
+            if !(queue.unpaced && bounded) && !probe.should_send_now(now) {
                 // Not time yet - wait until next_probe_time
                 return None;
             }
 
             // Get recommended padding amount from ProbeClusterState
             // This handles the calculation of how much padding is needed based on probe timing
-            let wake_interval = if queue.unpaced {
-                self.wake_interval
-            } else {
+            let wake_interval = if !queue.unpaced {
                 Duration::ZERO
+            } else if bounded {
+                self.bounded_wake_interval
+            } else {
+                self.wake_interval
             };
             let padding_size = probe.next_packet(now, wake_interval);
             let Some(padding_size) = padding_size else {
@@ -608,6 +617,82 @@ mod test {
             pacer.register_send(now, 1200usize.into(), midrid);
             assert_eq!(pacer.poll_timeout().0, Some(now + Duration::from_micros(1)));
             assert!(pacer.poll_queue().is_none());
+        }
+    }
+
+    #[test]
+    fn unpaced_media_tops_up_the_first_probe_burst_at_the_same_clock() {
+        use crate::bwe_::ProbeKind;
+
+        let now = Instant::now();
+        let mut pacer = LeakyBucketPacer::new(Bitrate::mbps(10));
+        let queue = QueueState {
+            midrid: MidRid("probe".into(), None),
+            unpaced: true,
+            use_for_padding: true,
+            snapshot: QueueSnapshot {
+                created_at: now,
+                ..Default::default()
+            },
+        };
+        pacer.handle_timeout(now, std::iter::once(queue));
+        let wake = now + Duration::from_millis(15);
+        pacer.handle_timeout(wake, std::iter::once(queue));
+        pacer.start_probe(
+            ProbeClusterConfig::new(0.into(), Bitrate::mbps(10), ProbeKind::Initial)
+                .with_max_bytes(DataSize::bytes(64_000)),
+        );
+        // Released originals start the probe before its first padding request.
+        pacer.register_send(wake, 5000usize.into(), queue.midrid);
+        let padding = pacer.handle_timeout(wake, std::iter::once(queue)).unwrap();
+        assert_eq!(
+            5000 + padding.padding,
+            (Bitrate::mbps(10) * Duration::from_millis(15)).as_bytes_usize(),
+            "media and padding fill one burst before spacing the next one"
+        );
+    }
+
+    #[test]
+    fn unpaced_probe_budget_does_not_retain_scheduler_stalls() {
+        use crate::bwe_::ProbeKind;
+
+        let now = Instant::now();
+
+        for stall in [1, 15, 20, 100, 1000] {
+            let mut pacer = LeakyBucketPacer::new(Bitrate::mbps(10));
+            let queue = QueueState {
+                midrid: MidRid("probe".into(), None),
+                unpaced: true,
+                use_for_padding: true,
+                snapshot: QueueSnapshot {
+                    created_at: now,
+                    ..Default::default()
+                },
+            };
+            pacer.handle_timeout(now, std::iter::once(queue));
+            let wake = now + Duration::from_millis(stall);
+            pacer.handle_timeout(wake, std::iter::once(queue));
+            let config = ProbeClusterConfig::new(0.into(), Bitrate::mbps(10), ProbeKind::Initial)
+                .with_max_bytes(DataSize::bytes(64_000));
+            pacer.start_probe(config);
+            let first = pacer.handle_timeout(wake, std::iter::once(queue)).unwrap();
+            assert!(
+                first.padding <= (Bitrate::mbps(10) * Duration::from_millis(20)).as_bytes_usize()
+            );
+            for size in (0..first.padding)
+                .step_by(240)
+                .map(|at| (first.padding - at).min(240))
+            {
+                pacer.register_send(wake, size.into(), first.midrid);
+            }
+            let second = pacer
+                .handle_timeout(wake + Duration::from_millis(20), std::iter::once(queue))
+                .unwrap();
+            assert!(
+                first.padding + second.padding
+                    <= (Bitrate::mbps(10) * Duration::from_millis(22)).as_bytes_usize(),
+                "late wakes cannot expand the cluster budget beyond configured cadence"
+            );
         }
     }
 

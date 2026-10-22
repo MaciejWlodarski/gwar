@@ -38,6 +38,9 @@ pub struct ProbeClusterConfig {
 
     /// The kind of probe this is.
     kind: ProbeKind,
+
+    /// Application payload-byte budget, before RTP/SRTP serialization.
+    max_bytes: DataSize,
 }
 
 /// Kind of probe
@@ -72,7 +75,18 @@ impl ProbeClusterConfig {
             // WebRTC default for general probing (not initial/network-state): 2ms.
             min_probe_delta: Duration::from_millis(2),
             kind,
+            max_bytes: DataSize::bytes(i64::MAX),
         }
+    }
+
+    /// Bound the cluster payload target; allow one packet of rounding at the socket.
+    pub(crate) fn with_max_bytes(mut self, max_bytes: DataSize) -> Self {
+        self.max_bytes = max_bytes;
+        self
+    }
+
+    pub(crate) fn is_byte_limited(&self) -> bool {
+        self.max_bytes < DataSize::bytes(i64::MAX)
     }
 
     /// Set a custom target duration for this probe.
@@ -164,7 +178,7 @@ impl ProbeClusterState {
         Self {
             config,
             bytes_sent: DataSize::ZERO,
-            byte_target: config.target_bytes(),
+            byte_target: config.target_bytes().min(config.max_bytes),
             packets_sent: 0,
             started_at: None,
             last_packet_at: None,
@@ -203,7 +217,7 @@ impl ProbeClusterState {
     /// Check if the probe cluster is complete.
     ///
     /// A probe is complete when BOTH conditions are met (matching WebRTC):
-    /// 1. Sent bytes >= runtime target (nominal duration, or the observed unpaced cadence)
+    /// 1. Sent bytes >= runtime target (nominal duration, or the selected unpaced burst interval)
     /// 2. Sent packets >= min_packet_count
     ///
     /// Note: WebRTC does NOT check duration for completion. Duration is only used
@@ -245,7 +259,7 @@ impl ProbeClusterState {
     /// min_probe_delta` (e.g. 240 bytes / 2ms = 960 kbit/s), which would be far below the
     /// intended probe bitrate.
     ///
-    /// `wake_interval` is the application's observed scheduling interval for unpaced
+    /// `wake_interval` is the application's selected burst interval for unpaced
     /// streams, or zero to retain the default first-burst size for paced streams.
     /// Returns `None` if it's not time to send yet, or if we've already created
     /// a padding packet for this instant.
@@ -260,7 +274,9 @@ impl ProbeClusterState {
             return None;
         }
 
-        if now < self.next_probe_time() {
+        let first_burst = self.last_padding_at < self.started_at.unwrap();
+        let top_up = self.config.is_byte_limited() && !wake_interval.is_zero();
+        if now < self.next_probe_time() && !(first_burst && top_up) {
             return None;
         }
 
@@ -272,19 +288,20 @@ impl ProbeClusterState {
         }
 
         let coarse = wake_interval > self.config.min_probe_delta();
-        // A cluster must span the observed wake interval. Keeping only 15 ms worth
+        // A cluster must span the selected burst interval. Keeping only 15 ms worth
         // of bytes at a 20 ms cadence systematically undermeasures its target rate.
         // Reserve a final minimum interval so actual sends have distinct timestamps.
-        let burst_duration = if self.last_padding_at < self.started_at.unwrap() {
+        let burst_duration = if first_burst {
             let duration = self
                 .config
                 .target_duration
                 .max(wake_interval + self.config.min_probe_delta());
-            self.byte_target = self.config.target_bitrate * duration;
+            self.byte_target = (self.config.target_bitrate * duration).min(self.config.max_bytes);
             if coarse {
                 self.byte_target = self
                     .byte_target
-                    .max(MAX_PADDING_PACKET_SIZE * self.config.min_packet_count() as u64);
+                    .max(MAX_PADDING_PACKET_SIZE * self.config.min_packet_count() as u64)
+                    .min(self.config.max_bytes);
             }
             wake_interval
                 .min(duration.saturating_sub(self.config.min_probe_delta()))
@@ -300,7 +317,21 @@ impl ProbeClusterState {
         } else {
             MAX_PADDING_PACKET_SIZE
         };
-        let recommended_probe_size = (self.config.target_bitrate * burst_duration).max(burst_floor);
+        let mut burst_bytes = self.config.target_bitrate * burst_duration;
+        if first_burst && top_up {
+            // Media can start an unpaced probe before padding is requested. Top
+            // up that same burst instead of waiting a wake and undermeasuring it.
+            burst_bytes = burst_bytes.saturating_sub(self.bytes_sent);
+        }
+        let mut recommended_probe_size = burst_bytes.max(burst_floor);
+        if first_burst && coarse && top_up {
+            // Include initial media when leaving a tail for a distinct timestamp.
+            recommended_probe_size = recommended_probe_size.min(
+                self.byte_target
+                    .saturating_sub(self.bytes_sent)
+                    .saturating_sub(MAX_PADDING_PACKET_SIZE),
+            );
+        }
         let bytes_remaining = self.byte_target.saturating_sub(self.bytes_sent);
 
         // Like BitrateProber::ProbeSent, completion requires both the byte and
@@ -353,6 +384,35 @@ impl ProbeClusterState {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn byte_limited_probe_keeps_a_tail_and_stays_bounded_after_a_stall() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(20);
+        for media in [0, 500] {
+            let config = ProbeClusterConfig::new(0.into(), Bitrate::mbps(30), ProbeKind::Initial)
+                .with_max_bytes(DataSize::bytes(2000));
+            let mut state = ProbeClusterState::new(config);
+            if media > 0 {
+                state.record_packet(now, DataSize::bytes(media));
+            }
+            let padding = state.next_packet(now, interval).unwrap();
+            let first = DataSize::bytes(media) + padding;
+            assert!(
+                first < DataSize::bytes(2000),
+                "leave a distinct send timestamp"
+            );
+            for at in (0..padding.as_bytes_usize()).step_by(240) {
+                state.record_packet(now, (padding.as_bytes_usize() - at).min(240).into());
+            }
+            assert!(!state.is_complete(now));
+            let after_stall = now + Duration::from_millis(250);
+            let tail = state.next_packet(after_stall, interval).unwrap();
+            assert_eq!(first + tail, DataSize::bytes(2000));
+            state.record_packet(after_stall, tail);
+            assert!(state.is_complete(after_stall));
+        }
+    }
 
     #[test]
     fn late_probe_wakes_catch_up_without_exceeding_the_cluster_budget() {

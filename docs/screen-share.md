@@ -546,7 +546,7 @@ Only application-paced media and generated padding bursts drain at the same
 clock. Scheduler-aware first-burst sizing applies only to application-paced
 streams. The cellular regression passes without lowering its thresholds.
 
-**Review-fix validation.** All builds used `CARGO_BUILD_JOBS=4` and the
+**Previous review-fix validation (`5628c4c`).** All builds used `CARGO_BUILD_JOBS=4` and the
 worktree's `target/`. The server's 288 unit tests passed, including 52 screen
 and egress tests and every recovery-matrix case; screen integration: 10;
 latency example: 27; Python harness: 19. The full vendored str0m suite with
@@ -556,6 +556,19 @@ latency example: 27; Python harness: 19. The full vendored str0m suite with
 check, server/proto/client and full-vendor all-targets clippy with
 `-D warnings`, workspace/vendor rustfmt, and `git diff --check` passed.
 No deployment host or VM was contacted.
+
+**Recovery follow-up validation.** All builds used `-j 4`. All 290 server unit
+tests passed, including the 70-case matrix, both exact review repros and six
+parameterized variants. Server unit test code used package `opt-level=1`,
+with debug assertions and overflow checks enabled. Screen integration: 10;
+latency example: 27; Python harness: 19. Full vendored str0m with
+`--no-default-features --features aws-lc-rs,_internal_test_exports`: 769 unit
+tests, 330 integration tests (including `bwe_cellular` and capacity restoration),
+and 59 doctests passed; two doctests remain ignored. The required
+`cargo check -p gwar-server --no-default-features --tests`, server test clippy
+with `-D warnings`, workspace/vendor rustfmt and `git diff --check` passed.
+The full vendor run used canonical ignored capture fixtures from the locally
+cached str0m 0.24.1 package; those scratch copies are removed after validation.
 
 The earlier macOS loopback gate at `a4c76a1` used one pair of 40 markers
 per scenario:
@@ -1161,36 +1174,55 @@ serves the voice acceptance instead. Results and deviations:
   individual padding packets instead of draining each generated burst. A
   240-byte blank packet per 2 ms wake limited discovery to about 1 Mbps even
   on a healthy link. The local str0m patch now drains each burst immediately
-  and spaces only successive bursts. Application-paced streams retain an
-  observed scheduler cadence across short intermediate callbacks. Their probe
-  byte target covers at least that interval plus the minimum burst spacing;
-  the initial burst leaves a tail for a later timestamp. The already-required
+  and spaces only successive bursts. Application-paced streams learn regular
+  scheduling cadences up to 20 ms; longer stalls never increase retained cadence.
+  The nominal 15 ms cluster may cover that regular cadence plus 2 ms of burst
+  spacing, but a separate payload-byte limit bounds it against the actual extras
+  reserve after worst-case RTP/SRTP headers and one MTU of rounding. A limited
+  first burst leaves a tail for a later timestamp. Late wakes consume only the
+  remaining budget. The already-required
   minimum packet count is batched at low rates. Burst spacing starts at the
   first actual send, including when padding was prepared on an earlier timeout.
   Fallback probes inherit their media source's pacing mode, and screen slots
   are configured before bootstrap. Paced media keeps its original scheduling
   and first-burst size.
 
-  Recovering and coarsely scheduled screen-watch transports dispatch probe
-  clusters at least one second apart, allowing the extras reserve to refill
-  between initial probes too. Fast active transports retain ordinary probing.
-  The configurable interval persists across estimator resets. Target increases still wait for a full reserve within
-  one MTU, and regular background padding stops at its source while it refills.
+  Recovering and coarsely scheduled screen-watch transports dispatch clusters
+  at least one second apart, including startup pairs, allowing the reserve to
+  refill. Recovery spacing lasts ten seconds after resume; fast active transports
+  otherwise retain normal probing. Target increases wait for a full reserve
+  within one MTU, and background padding stops at its source while it refills.
 
-  A fully bandwidth-paused viewer requests one recovery probe after 15 s
-  without an estimate improvement above 5 %, once the reserve is ready.
-  Progress restarts that timer. Each unsuccessful cycle reduces desired-target
-  reach by 10 %, from 1.5 times the estimate to a floor of 1.15, retaining unmet
-  demand for ALR probes. The SFU synchronizes its cached desired bitrate and
-  str0m's target before requesting the probe. A 100 kbps minimum probe base
-  prevents tiny estimates from starving feedback. Recovery preserves the
-  estimator, cluster IDs and feedback history during capacity discovery instead
-  of repeatedly resetting them. At resume, after the fit timer has passed, the
-  congestion/ACK history is rebased once at the measured estimate with both
-  desired-bitrate copies bounded before reset. This prevents sparse pause-time
-  feedback from collapsing the first active estimate to the 40 kbps floor.
-  Recovery probe spacing remains for ten seconds while fresh media feedback
-  settles. Active media clears the stalled-target backoff state.
+  A fully bandwidth-paused viewer restarts ordinary startup probing from the
+  same 2.5 Mbps estimate as a fresh subscriber, as soon as the reserve is ready.
+  If no paused lane fits, it retries after 15 s once the reserve refills. A
+  continuous-fit guard in progress finishes before another reset, and ready
+  priority handoffs/resumes run first. There is no custom recovery probe,
+  estimate-progress tracking or adaptive target backoff. Resets discard congestion/ACK/loss history, estimate smoothing,
+  in-flight TWCC send records, pending probe padding, pacer debt and scheduler
+  history. RTP, TWCC and SRTP sequence counters and the transport stay intact.
+  Existing socket credit is preserved, never replenished by a reset. Both
+  desired-bitrate copies are clamped to 1.5 times the new estimate before reset.
+  Once the normal ten-second continuous-fit guard permits resume, sparse
+  pause-time feedback is discarded again at the measured capacity, so active
+  video starts with fresh measurements.
+
+  Capacity rediscovery also fills the first probe burst at the right clock.
+  Released media can start an unpaced cluster before padding is requested.
+  The first padding request now tops up that same burst, counting media already
+  sent, instead of waiting another scheduler wake and sending a large late tail.
+  That distorted burst pattern could undermeasure a healthy link and cause a
+  false re-pause after a successive or long outage. Byte-limited bursts still
+  leave a tail for a later timestamp, including when media starts the cluster.
+  Paced media retains its original timing and first-burst size.
+
+  Permanent regressions include the reviewer's exact 15 ms cadence with a
+  100 ms stall every 2 s and a 12-42 s collapse, and the successive 12-42 s
+  and 222-251 s collapses with 1% loss. Parameterized cases cover 1/10/15/20 ms
+  cadences, 60/100/150/250 ms stalls every 1.3/2/3.5/5 s, one to three outages,
+  and 0-2% loss. Every restored interval requires resume within 180 s, no
+  re-pause, and at least 7.2 Mbps received in each of its final three ten-second
+  windows. The existing 70-case matrix keeps the same assertions.
 
   The originals release and socket buckets retain 10 ms of credit at normal
   cadences and allow 30 ms when measured wakes exceed 10 ms. This covers the
@@ -2655,7 +2687,7 @@ person.
 
    Built in PR 3b, beyond the list: a 10 s ramp before a new slot's pauses
    count, the probing target capped at 1.5 times the estimate, stalled viewers
-   reprobing every 15 s, Retry resuming bandwidth pauses, and the screen
+   retrying fresh startup after 15 s with no lane fitting, Retry resuming bandwidth pauses, and the screen
    load and gate harness. Round-1 fixes add wire-byte original pacing/capping,
    tiny-delta-safe probes, priority reclamation, immediate keyframe recovery,
    atomic timestamped counters with incomplete coverage, paired voice roles,

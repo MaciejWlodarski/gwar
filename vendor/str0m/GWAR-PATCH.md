@@ -14,9 +14,13 @@ past keyframe admission or recover after a pause. Application-paced
 Gwar's released originals drain without a per-packet timer. `ProbeClusterState`
 accounts for elapsed time on a late wake, within the remaining cluster bytes;
 spacing between bursts and Gwar's socket cap remain enabled. Application-paced
-probes account for the observed wake cadence in their byte target and first
-burst, batch the minimum packet count at low rates, and space from actual send
-time when padding is prepared before it is polled. Fallback probes inherit the
+probes with an explicit byte limit learn regular scheduling cadences up to 20 ms, batch the minimum packet
+count at low rates, and space from actual send time when padding is prepared
+before it is polled. Longer stalls never enlarge the retained cadence.
+`Bwe::set_probe_byte_limit` bounds cluster payload bytes after the application
+reserves worst-case RTP/SRTP headers and packet rounding. It survives resets.
+A byte-limited first burst leaves a tail for a distinct send timestamp;
+late wakes cannot exceed the remaining cluster budget. Fallback probes inherit the
 source's pacing mode. Paced streams retain the original first-burst sizing and
 one-microsecond timeout re-entry, including during probes. The previous generic
 same-clock timeout caused Gwar's `simple::bwe_cellular` regression; unchanged
@@ -24,13 +28,25 @@ crates.io str0m 0.24.1 was not affected.
 
 `Bwe::set_min_probe_interval` optionally spaces dispatched clusters, including
 the initial pair, and persists across estimator resets. Gwar watch transports
-use one second during recovery or coarse scheduling to refill their extras
-reserve. Fast active transports and the default retain zero.
-`Bwe::request_recovery_probe` lets a paused application explicitly queue one
-probe while loss-limited, respecting the same target and dispatch interval.
-These requests preserve cluster IDs and estimator/feedback history during
-discovery. Gwar rebases sparse congestion/ACK history once at measured capacity
-when media resumes, retaining recovery spacing for ten seconds afterward.
+use one second while fully paused, coarsely scheduled, or in the first ten
+seconds after resume. Fast active transports and the library default retain zero.
+Gwar no longer uses `Bwe::request_recovery_probe` or adaptive target backoff:
+fully paused viewers retry ordinary startup probing from 2.5 Mbps after 15 s
+with no lane fitting, waiting for existing socket credit before restarting.
+Continuous-fit timers and ready priority handoffs finish first. Resume starts fresh
+feedback at the measured capacity after the ordinary continuous-fit guard.
+`Bwe::reset` also resets smoothing, pending probe padding, the pacer and TWCC
+send records, retaining transport sequence numbers and SRTP replay state.
+Old feedback therefore cannot be attributed to new clusters with reused IDs.
+
+When media starts a byte-limited unpaced cluster, its first padding request tops up that
+same burst immediately, counting the media already sent. Previously its first
+media bytes delayed padding until a later wake, making a healthy link look
+slower and eventually causing false bandwidth re-pauses. Byte-limited first
+bursts reserve a later timestamp even when media starts them. Paced streams
+retain their original first-burst timing and sizing. Unbounded transports retain
+their original cadence handling and probe behavior too; the estimator's
+saturation logic and thresholds are unchanged.
 
 `Bwe::set_padding_bitrate_limit` caps regular background padding independently
 of probe clusters. The session reapplies the limit after estimate updates and
@@ -42,7 +58,9 @@ actual-byte extras cap; its rate and bucket capacity are unchanged.
 
 Regressions cover multi-packet burst draining, Game startup with scheduler
 jitter, 70 combinations of collapse duration, cadence and downlink loss with
-resume and sustained received video, preserved paced-media clock advancement,
+resume and sustained received video, intermittent 60-250 ms scheduler stalls,
+successive outages at 0-2% loss without re-pauses, clean estimator resets across
+TWCC sequence wraparound, preserved paced-media clock advancement,
 the padding disable/reset/re-enable lifecycle, and 16-byte Text deltas at 5 fps.
 The e2e screen tests use 6-byte packets. Remove these changes when upstream
 provides equivalent protection. Changed upstream files:

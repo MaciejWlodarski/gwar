@@ -1339,6 +1339,12 @@ impl Session {
             .is_some_and(|bwe| bwe.request_recovery_probe(now))
     }
 
+    pub fn set_bwe_probe_byte_limit(&mut self, bytes: usize) {
+        if let Some(bwe) = self.bwe.as_mut() {
+            bwe.set_probe_byte_limit(bytes);
+        }
+    }
+
     pub fn set_bwe_min_probe_interval(&mut self, interval: Duration) {
         if let Some(bwe) = self.bwe.as_mut() {
             bwe.set_min_probe_interval(interval);
@@ -1348,6 +1354,12 @@ impl Session {
     pub fn reset_bwe(&mut self, init_bitrate: Bitrate) {
         if let Some(bwe) = self.bwe.as_mut() {
             bwe.reset(init_bitrate);
+            // Retain transport/SRTP sequence numbers, but discard old probe bursts,
+            // scheduler cadence, debt and in-flight feedback from the previous BWE.
+            self.pacer = PacerImpl::leaky_bucket(init_bitrate * 2.0);
+            self.streams.set_probe_media(None);
+            self.twcc_tx_register = TwccSendRegister::new(1000);
+            self.configure_pacer();
         }
     }
 
@@ -1552,6 +1564,47 @@ mod tests {
     use crate::RtcConfig;
     use crate::io::DATAGRAM_MTU_TARGET;
     use crate::packet::RedEncoder;
+
+    #[test]
+    fn bwe_reset_discards_old_probes_feedback_and_smoothing_but_keeps_transport_sequence() {
+        let now = Instant::now();
+        let cfg = RtcConfig::default().enable_bwe(Some(Bitrate::mbps(10)));
+        let mut s = Session::new(&cfg);
+        s.twcc = 65_553;
+        s.twcc_tx_register
+            .register_seq(TwccPacketId::new(s.twcc - 1), now, 240);
+        let bwe = s.bwe.as_mut().unwrap();
+        bwe.set_desired_bitrate(Bitrate::mbps(30));
+        let probe = bwe.handle_timeout(now, true).unwrap();
+        assert_eq!(bwe.poll_estimate(), Some(Bitrate::mbps(10)));
+        s.pacer.start_probe(probe);
+        assert!(s.pacer.active_cluster().is_some());
+
+        s.reset_bwe(Bitrate::mbps(1));
+        assert_eq!(
+            s.twcc, 65_553,
+            "TWCC numbering survives resets and wraparound"
+        );
+        assert!(
+            (&s.twcc_tx_register).into_iter().next().is_none(),
+            "old feedback has no send records"
+        );
+        assert!(
+            s.pacer.active_cluster().is_none(),
+            "discard unsent old clusters"
+        );
+        let bwe = s.bwe.as_mut().unwrap();
+        assert!(
+            bwe.poll_estimate().is_none(),
+            "old smoothed estimates are discarded"
+        );
+        bwe.handle_timeout(now, true);
+        assert_eq!(
+            bwe.poll_estimate(),
+            Some(Bitrate::mbps(1)),
+            "fresh feedback starts at the new estimate"
+        );
+    }
 
     #[test]
     fn session_mtu_matches_config() {

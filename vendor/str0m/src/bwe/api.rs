@@ -81,6 +81,16 @@ impl<'a> Bwe<'a> {
         self.0.session.request_bwe_recovery_probe(self.0.last_now)
     }
 
+    /// Bound probe payload bytes to an application's separate socket reserve.
+    ///
+    /// Allow for RTP/SRTP headers and one packet of rounding when choosing the
+    /// limit. Minimum packet counts still apply. Byte-limited unpaced probes
+    /// combine media and padding in their first burst and learn only regular
+    /// cadences up to 20 ms. Persists across BWE resets.
+    pub fn set_probe_byte_limit(&mut self, bytes: usize) {
+        self.0.session.set_bwe_probe_byte_limit(bytes);
+    }
+
     /// Set the minimum interval between dispatched probe clusters.
     ///
     /// Defaults to zero. Applications with a separate extras budget can allow its
@@ -91,8 +101,9 @@ impl<'a> Bwe<'a> {
 
     /// Reset the BWE with a new init_bitrate
     ///
-    /// This discards the current estimator state and starts estimation again
-    /// from `init_bitrate`. Normal transitions from audio-only to video sending
+    /// This discards estimator/smoothing state, queued probes, pacer debt and
+    /// in-flight TWCC send records, then starts estimation from `init_bitrate`.
+    /// Transport sequence numbers and SRTP state are preserved. Normal transitions from audio-only to video sending
     /// do not require a reset: with TWCC negotiated, probing can discover
     /// capacity before video starts. The desired bitrate controls the capacity
     /// the estimator attempts to discover.

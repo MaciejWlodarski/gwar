@@ -684,15 +684,15 @@ mod tests {
     fn game_recovers_after_different_collapse_durations() {
         // Exercise coarse, lossy scheduling first so recovery failures surface early.
         for loss in [0.01, 0.0] {
-            for cadence in [20, 15, 10, 5, 1] {
+            for cadence in [15, 20, 10, 5, 1] {
                 for collapse in [
-                    15 * SECOND,
-                    28 * SECOND,
-                    29 * SECOND,
-                    30 * SECOND,
-                    30 * SECOND + 100 * MS,
-                    60 * SECOND,
                     120 * SECOND,
+                    60 * SECOND,
+                    30 * SECOND + 100 * MS,
+                    30 * SECOND,
+                    29 * SECOND,
+                    28 * SECOND,
+                    15 * SECOND,
                 ] {
                     let end = COLLAPSE + collapse + 360 * SECOND;
                     game_recovery(collapse, cadence, loss, false, end);
@@ -702,7 +702,6 @@ mod tests {
     }
 
     fn game_recovery(collapse: Duration, cadence: u32, loss: f64, restore_cadence: bool, end: Duration) {
-        const MAX_RESUME: Duration = Duration::from_secs(180);
         let restore_link = COLLAPSE + collapse;
         let restore_scheduling = restore_link + 40 * SECOND;
         let mut sim = Sim::new(Some(20_000_000));
@@ -723,29 +722,97 @@ mod tests {
         }
         sim.run(end - restore_scheduling);
 
-        let context = format!(
-            "collapse={collapse:?} cadence={cadence} loss={loss} restore_cadence={restore_cadence}: {}",
-            summary(&sim)
+        let restore = sim.start + restore_link;
+        assert_game_recovery(
+            &mut sim,
+            restore,
+            &format!("collapse={collapse:?} cadence={cadence} loss={loss} restore_cadence={restore_cadence}"),
         );
-        let resumed = sim.changes.iter().find_map(|(at, slot, change)| {
-            (*slot == 0 && *change == Change::Resume && *at >= sim.start + restore_link)
-                .then(|| *at - sim.start - restore_link)
-        });
-        let resumed = resumed.unwrap_or_else(|| panic!("the healthy link must resume: {context}"));
-        assert!(resumed <= MAX_RESUME, "resume after {resumed:?}, bound {MAX_RESUME:?}: {context}");
+    }
+
+    #[test]
+    fn game_recovers_with_intermittent_scheduler_stalls() {
+        // The first case is the reviewer's exact 12-42 s outage, 15 ms cadence,
+        // and 100 ms stall every 2 s, followed through 402 s. Vary both clocks,
+        // loss and outage count so historical delays cannot become probe budgets.
+        for (cadence, period, stall, loss, outages) in
+            [(15, 2000, 100, 0.0, 1), (10, 1300, 60, 0.01, 1), (20, 3500, 150, 0.02, 2), (15, 5000, 250, 0.0, 3)]
+        {
+            let schedule = format!("cadence={cadence} period={period} stall={stall} loss={loss}");
+            let mut sim = Sim::new(Some(20_000_000));
+            sim.down.loss = loss;
+            sim.watch("game", 8_000_000, 60, 200_000, None);
+            let run = |sim: &mut Sim, duration| {
+                let end = sim.now + duration;
+                while sim.now < end {
+                    sim.server_interval = if (sim.now - sim.start).as_millis() % period < stall {
+                        stall as u32 * MS
+                    } else {
+                        cadence * MS
+                    };
+                    sim.tick();
+                }
+            };
+            run(&mut sim, COLLAPSE);
+            assert!(sim.w.egress.counters.original_bytes > 0, "{schedule}: {}", summary(&sim));
+            for outage in 0..outages {
+                sim.down.rate = Some(1_000_000);
+                run(&mut sim, 30 * SECOND);
+                assert_eq!(sim.paused(0), Some(ScreenPauseReason::Bandwidth), "{schedule}: {}", summary(&sim));
+                sim.down.rate = Some(20_000_000);
+                let restore = sim.now;
+                run(&mut sim, 360 * SECOND);
+                assert_game_recovery(&mut sim, restore, &format!("{schedule} outage={outage}"));
+            }
+        }
+    }
+
+    #[test]
+    fn game_recovers_after_successive_outages_without_repausing() {
+        // Exact review repro first: 12-42 s and 222-251 s, 15 ms cadence,
+        // 1% loss, then healthy capacity through 431 s. Each restoration has
+        // its own no-repause and three received-throughput-window assertions.
+        for (cadence, loss, outages) in [
+            (15, 0.01, vec![30 * SECOND, 29 * SECOND]),
+            (1, 0.0, vec![15 * SECOND, 28 * SECOND, 30 * SECOND + 100 * MS]),
+            (10, 0.02, vec![29 * SECOND, 30 * SECOND, 60 * SECOND]),
+            (20, 0.01, vec![60 * SECOND, 15 * SECOND]),
+        ] {
+            let mut sim = Sim::new(Some(20_000_000));
+            sim.server_interval = cadence * MS;
+            sim.down.loss = loss;
+            sim.watch("game", 8_000_000, 60, 200_000, None);
+            sim.run(COLLAPSE);
+            assert!(sim.w.egress.counters.original_bytes > 0, "{}", summary(&sim));
+            for (outage, duration) in outages.into_iter().enumerate() {
+                sim.down.rate = Some(1_000_000);
+                sim.run(duration);
+                assert_eq!(sim.paused(0), Some(ScreenPauseReason::Bandwidth), "{}", summary(&sim));
+                sim.down.rate = Some(20_000_000);
+                let restore = sim.now;
+                sim.run(180 * SECOND);
+                assert_game_recovery(&mut sim, restore, &format!("cadence={cadence} loss={loss} outage={outage}"));
+            }
+        }
+    }
+
+    fn assert_game_recovery(sim: &mut Sim, restore: Instant, scenario: &str) {
+        let context = format!("{scenario}: {}", summary(sim));
+        let resumed = sim
+            .changes
+            .iter()
+            .find_map(|(at, slot, change)| (*slot == 0 && *at >= restore && *change == Change::Resume).then_some(*at))
+            .unwrap_or_else(|| panic!("the healthy link must resume: {context}"));
+        assert!(resumed - restore <= 180 * SECOND, "resume within 180 s: {context}");
         assert_eq!(sim.paused(0), None, "{context}");
         assert!(
-            sim.changes.iter().all(|(at, _, change)| {
-                *at <= sim.start + restore_link + resumed || !matches!(change, Change::Pause(_))
-            }),
+            sim.changes.iter().all(|(at, _, change)| { *at <= resumed || !matches!(change, Change::Pause(_)) }),
             "video stays resumed: {context}"
         );
         let ssrc = sim.ssrcs(0).0;
-        // Each final ten-second window must carry the intended video at the receiver.
-        // Socket sends alone could pass despite downlink drops or an idle receiver.
         let mut rates = Vec::new();
-        for to in [end - 20 * SECOND, end - 10 * SECOND, end] {
-            let to = sim.start + to;
+        for ago in [20, 10, 0] {
+            let to = sim.now - ago * SECOND;
             let from = to - 10 * SECOND;
             let bytes: usize = sim
                 .received
@@ -754,16 +821,14 @@ mod tests {
                 .map(|(_, _, _, payload)| payload.len())
                 .sum();
             let bps = bytes as f64 * 8.0 / 10.0;
-            assert!(bps >= 0.9 * 8_000_000.0, "received video {bps} bps: {context}");
+            assert!(bps >= 7_200_000.0, "received video {bps} bps: {context}");
             rates.push(bps);
         }
-        let sent_bps =
-            sim.bytes(sim.now - 10 * SECOND, sim.now, |k| matches!(k, Kind::Original { .. })) as f64 * 8.0 / 10.0;
         println!(
-            "collapse={collapse:?} cadence={cadence} loss={loss} restore_cadence={restore_cadence} resume_after={resumed:?} \
-             received_bps={rates:?} sent_bps={sent_bps} extras_dropped={} estimate={}",
+            "{scenario} resume_after={:?} received_bps={rates:?} extras_dropped={} estimate={}",
+            resumed - restore,
             sim.w.egress.counters.extras_dropped,
-            sim.w.egress.estimate(),
+            sim.w.egress.estimate()
         );
     }
 

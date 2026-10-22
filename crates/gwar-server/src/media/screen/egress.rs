@@ -72,9 +72,8 @@ pub const KEYFRAME_FLOOR: usize = 200 * 1024;
 const KEYFRAME_MEMORY: Duration = Duration::from_secs(30);
 /// Probing target over the watched shares' caps.
 const DESIRED_HEADROOM: f64 = 1.1;
-/// Normal desired-target reach. Watch transports back it off after stalled cycles,
-/// space clusters, and wait for the extras reserve before increasing the target.
-/// Cadence-adjusted probes still pass the unchanged actual-byte extras cap.
+/// Desired-target reach. Watch transports space byte-bounded clusters and wait for
+/// the extras reserve before increasing the target or restarting estimation.
 pub(super) const PROBE_REACH: f64 = 1.5;
 
 /// One original packet waiting for its viewer, already mapped onto the slot's segment.
@@ -370,6 +369,11 @@ impl Egress {
         assigned().next().is_some()
             && assigned().all(|l| l.paused.is_some())
             && assigned().any(|l| l.paused == Some(ScreenPauseReason::Bandwidth))
+    }
+
+    /// A bandwidth-paused lane is accumulating the continuous-fit guard.
+    pub fn fitting(&self) -> bool {
+        self.lanes.iter().any(|l| l.paused == Some(ScreenPauseReason::Bandwidth) && l.fits_since.is_some())
     }
 
     /// The slot carries a new share, `order`-th watched (lower is earlier): a fresh lane, not
@@ -723,6 +727,11 @@ impl Egress {
         let lane = resume?;
         self.resume(lane);
         Some((lane, Change::Resume))
+    }
+
+    /// Probe payload budget after worst-case RTP/SRTP headers and packet rounding.
+    pub fn probe_byte_limit(&self) -> usize {
+        ((extras_burst(self.estimate) - 1200.0) * 240.0 / (240 + ORIGINAL_OVERHEAD) as f64) as usize
     }
 
     /// Refill the reserve before raising the probe target, with one MTU of tolerance

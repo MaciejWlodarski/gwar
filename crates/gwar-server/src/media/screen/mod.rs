@@ -83,11 +83,9 @@ const TRANSPORT_BYTE_HEADROOM: f64 = 1.5;
 const ADDRESSES_PER_TRANSPORT: usize = 4;
 /// Allocation (pauses, resumes, probing targets) and the budget check run this often.
 const ALLOCATION_TICK: Duration = Duration::from_millis(100);
-/// A viewer whose every slot is paused sends nothing, and str0m 0.24.1 does not probe a
-/// loss-limited estimate without feedback. After this long without progress, request one
-/// bounded recovery probe while preserving estimator history and measured capacity.
-const REPROBE_EVERY: Duration = Duration::from_secs(15);
-const REPROBE_FLOOR: u64 = 100_000;
+/// A fully paused viewer with no lane fitting retries standard startup probing from
+/// a clean estimator. The existing continuous-fit guard takes precedence over retries.
+const RESTART_EVERY: Duration = Duration::from_secs(15);
 /// Measured egress over the server-wide budget this many seconds in a row pauses watches.
 const OVER_BUDGET_SECONDS: u32 = 5;
 /// Watches paused for the budget may resume once egress stayed under this share of it …
@@ -498,19 +496,9 @@ struct Watcher {
     dropped_lanes: Vec<usize>,
     /// The probing target last given to str0m's BWE.
     desired: Option<u64>,
-    /// Probe progress and target backoff while every slot is paused.
-    stalled: Option<Recovery>,
-    /// Keep recovery probe spacing while fresh media feedback settles after a resume.
-    recovery_until: Option<Instant>,
+    /// Last estimator restart; also bounds post-resume probe spacing.
+    restarted: Option<Instant>,
     deadline: Instant,
-}
-
-/// A fully paused viewer's recovery cycle. Failed cycles reduce probe reach instead of
-/// repeating the same oversized probes indefinitely; successful media clears this state.
-struct Recovery {
-    since: Instant,
-    estimate: u64,
-    reach: f64,
 }
 
 /// A packet that passed ingress, to be written to every slot that carries its share.
@@ -1471,10 +1459,7 @@ fn allocate(
         .map(|s| s.grant.as_ref().and_then(|g| rates.get(&g.share)).copied().unwrap_or_default())
         .collect();
     let caps: Vec<u64> = w.slots.iter().map(|s| s.grant.as_ref().map_or(0, |g| g.origin.cap_bps)).collect();
-    let desired = w.egress.desired(&caps, &lanes).map(|target| {
-        let reach = w.stalled.as_ref().map_or(egress::PROBE_REACH, |r| r.reach);
-        target.min((reach * w.egress.estimate() as f64) as u64)
-    });
+    let desired = w.egress.desired(&caps, &lanes);
     let c = w.egress.counters;
     trace!(
         session = w.session,
@@ -1484,15 +1469,12 @@ fn allocate(
         c.extras_dropped,
         "screen watch egress"
     );
-    // Preserve ordinary probing on fast active transports. Recovery and coarse
-    // clocks need reserve refill time between clusters, including the initial pair.
-    let probe_interval =
-        if w.egress.stalled() || w.egress.coarse_cadence() || w.recovery_until.is_some_and(|until| now < until) {
-            Duration::from_secs(1)
-        } else {
-            Duration::ZERO
-        };
-    w.rtc.bwe().set_min_probe_interval(probe_interval);
+    let stalled = w.egress.stalled();
+    let recovering = w.restarted.is_some_and(|at| now.saturating_duration_since(at) < egress::RAMP);
+    let interval =
+        if stalled || recovering || w.egress.coarse_cadence() { Duration::from_secs(1) } else { Duration::ZERO };
+    w.rtc.bwe().set_min_probe_interval(interval);
+    w.rtc.bwe().set_probe_byte_limit(w.egress.probe_byte_limit());
     let probe_ready = w.egress.probe_ready(now);
     // Idle padding must not spend the credit a probe target increase is waiting for.
     // Apply this at the source: socket drops would manufacture TWCC loss instead.
@@ -1501,42 +1483,40 @@ fn allocate(
         w.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired.unwrap_or(0)));
         w.desired = desired;
     }
-    if !w.egress.stalled() {
-        w.stalled = None;
-    } else {
-        let estimate = w.egress.estimate();
-        let recovery = w.stalled.get_or_insert(Recovery { since: now, estimate, reach: egress::PROBE_REACH });
-        if estimate > recovery.estimate.saturating_mul(105) / 100 {
-            recovery.since = now;
-            recovery.estimate = estimate;
+    // Finish a ready priority handoff or resume before considering a fresh start.
+    if let Some((slot, change)) = w.egress.allocate(now, &lanes, budget) {
+        if change == Change::Resume && w.restarted.is_some() {
+            let estimate = w.egress.estimate();
+            restart_estimator(w, estimate, now, &caps, &lanes);
+            w.restarted = Some(now);
         }
-        if now.saturating_duration_since(recovery.since) >= REPROBE_EVERY && probe_ready {
-            // Leave more reserve for consecutive clusters when the last cycle failed
-            // to improve the estimate. Keep unmet demand so ALR probes can still grow it.
-            recovery.reach = (recovery.reach * 0.9).max(1.15);
-            recovery.since = now;
-            recovery.estimate = estimate;
-            // Synchronize the target before queuing a recovery probe. At very low
-            // estimates the floor still fits in the unchanged 64 KB extras reserve.
-            let ceiling = (recovery.reach * estimate.max(REPROBE_FLOOR) as f64) as u64;
-            w.desired = w.desired.map(|target| if estimate < REPROBE_FLOOR { ceiling } else { target.min(ceiling) });
-            w.rtc.bwe().set_desired_bitrate(Bitrate::bps(w.desired.unwrap_or(0)));
-            w.rtc.bwe().request_recovery_probe();
+        apply(w, slot, change);
+        return Some((slot, change));
+    }
+    if !stalled {
+        if !recovering {
+            w.restarted = None;
         }
+    } else if w.restarted.is_none_or(|at| now.saturating_duration_since(at) >= RESTART_EVERY)
+        && !w.egress.fitting()
+        && probe_ready
+    {
+        // Nothing fits: retry normal startup with clean congestion/ACK history.
+        // Existing socket credit is never minted, and a continuous-fit timer
+        // already in progress must finish instead of being reset by the retry.
+        restart_estimator(w, INITIAL_ESTIMATE, now, &caps, &lanes);
+        w.restarted = Some(now);
     }
-    let (slot, change) = w.egress.allocate(now, &lanes, budget)?;
-    if change == Change::Resume && w.stalled.is_some() {
-        // Sparse pause-time feedback must not become the active media's rate floor.
-        // Rebase congestion/ACK history once at the measured capacity, after the fit
-        // timer has passed, with the bounded target already synchronized.
-        let estimate = w.egress.estimate();
-        w.desired = w.desired.map(|target| target.min((egress::PROBE_REACH * estimate as f64) as u64));
-        w.rtc.bwe().set_desired_bitrate(Bitrate::bps(w.desired.unwrap_or(0)));
-        w.rtc.bwe().reset(Bitrate::bps(estimate));
-        w.recovery_until = Some(now + Duration::from_secs(10));
-    }
-    apply(w, slot, change);
-    Some((slot, change))
+    None
+}
+
+/// Synchronize the bounded desired target before starting ordinary startup probes.
+fn restart_estimator(w: &mut Watcher, estimate: u64, now: Instant, caps: &[u64], lanes: &[ShareRate]) {
+    w.egress.set_estimate(estimate, now);
+    w.desired = w.egress.desired(caps, lanes);
+    w.rtc.bwe().set_desired_bitrate(Bitrate::bps(w.desired.unwrap_or(0)));
+    w.rtc.bwe().set_probe_byte_limit(w.egress.probe_byte_limit());
+    w.rtc.bwe().reset(Bitrate::bps(estimate));
 }
 
 /// Carries a pause or resume out on the transport. A pause stops everything of the slot's
@@ -1602,8 +1582,7 @@ fn empty(w: &mut Watcher, index: usize) {
     if w.pending.is_empty() && w.slots.iter().all(|s| s.grant.is_none()) {
         w.rtc.bwe().set_desired_bitrate(Bitrate::ZERO);
         w.desired = None;
-        w.stalled = None;
-        w.recovery_until = None;
+        w.restarted = None;
     }
 }
 
@@ -1809,8 +1788,7 @@ fn watcher(
         egress: Egress::new(now),
         dropped_lanes: Vec::new(),
         desired: None,
-        stalled: None,
-        recovery_until: None,
+        restarted: None,
         deadline: now,
     };
     Ok((watcher, answer.to_sdp_string()))
