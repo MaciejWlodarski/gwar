@@ -34,7 +34,7 @@ official documentation is marked **(to verify)**. The list is collected in
 | Client | UI | Voice | Screen sharing |
 | --- | --- | --- | --- |
 | Web (`apps/web`) | React | WebRTC in the browser, SFrame worker | Being built: `getDisplayMedia`, VP9/VP8 ([screen-share.md](screen-share.md)) |
-| Desktop (`apps/desktop`, Tauri 2) | the same React UI in the system webview | **native**: `gwar-client` (str0m, cpal, Opus, SFrame in Rust) | macOS 14+ and Windows through the webview; none on Linux ([owner decision 1](screen-share.md#owner-decisions)) |
+| Desktop (`apps/desktop`, Tauri 2) | the same React UI in the system webview | **native**: `gwar-client` (str0m, cpal, Opus, SFrame in Rust) | macOS 14.6+ and Windows through the webview; none on Linux ([owner decision 1](screen-share.md#owner-decisions)) |
 | Android | being built separately (docs on its branch) | | |
 | iOS | none | none | none |
 

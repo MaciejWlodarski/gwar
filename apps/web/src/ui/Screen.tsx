@@ -32,7 +32,7 @@ function useShareRefusal(): string | null {
   if (kind !== "gwar" || support === "hidden") return null;
   // Encrypted channels refuse until encrypted shares land (PR 7): never a share in the clear.
   if (encrypted) return t("screen.encryptedSoon");
-  if (support === "macos") return t("screen.needsMacos14");
+  if (support === "macos") return t("screen.needsMacos");
   if (support === "unsupported") return t("screen.unsupported");
   if (support === "insecure") return t("screen.insecure");
   if (!allowed) return t("screen.noPermission");

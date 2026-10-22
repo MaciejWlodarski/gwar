@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { initialScreen, useScreen } from "./screen";
-import { canWatch, ScreenController, screenSupport, useDesktopCapture } from "./screen-controller";
+import { canWatch, PICKER_REFUSED_MS, ScreenController, screenSupport, useDesktopCapture } from "./screen-controller";
+import { useUi } from "./stores";
 
 const shell = vi.hoisted(() => ({ invoke: vi.fn<(command: string) => Promise<unknown>>() }));
 vi.mock("../platform", () => ({
@@ -10,12 +11,15 @@ vi.mock("../platform", () => ({
 
 const getDisplayMedia = vi.fn(() => new Promise<MediaStream>(() => {}));
 const flush = () => new Promise(resolve => setTimeout(resolve, 0));
+const toast = vi.fn();
 
 beforeEach(() => {
   shell.invoke.mockReset();
   getDisplayMedia.mockClear();
   useDesktopCapture.setState({ capture: null });
   useScreen.setState({ ...initialScreen });
+  toast.mockReset();
+  useUi.setState({ toast });
   vi.stubGlobal("RTCPeerConnection", class {});
   vi.stubGlobal("window", { isSecureContext: true });
   vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
@@ -30,7 +34,7 @@ describe("the desktop app", () => {
     expect(getDisplayMedia).not.toHaveBeenCalled();
   });
 
-  it("asks the shell once at start: macOS 14+ and Windows share and watch", async () => {
+  it("asks the shell once at start: macOS 14.6+ and Windows share and watch", async () => {
     shell.invoke.mockResolvedValue("ok");
     const screen = new ScreenController(() => null, String);
     screen.init();
@@ -43,7 +47,7 @@ describe("the desktop app", () => {
     expect(getDisplayMedia).toHaveBeenCalledTimes(1);
   });
 
-  it("macOS before 14 watches but never opens the picker", async () => {
+  it("macOS before 14.6 watches but never opens the picker", async () => {
     shell.invoke.mockResolvedValue("macos_too_old");
     const screen = new ScreenController(() => null, String);
     screen.init();
@@ -65,5 +69,32 @@ describe("the desktop app", () => {
       expect(screenSupport()).toBe("hidden");
       expect(canWatch()).toBe(false);
     }
+  });
+
+  it("a refusal before the picker shows is reported, never taken for the user closing it", async () => {
+    shell.invoke.mockResolvedValue("ok");
+    const screen = new ScreenController(() => null, String);
+    screen.init();
+    await flush();
+    const now = vi.spyOn(Date, "now");
+    const refuse = (after: number) => {
+      now.mockReturnValueOnce(1_000).mockReturnValueOnce(1_000 + after);
+      getDisplayMedia.mockImplementationOnce(async () => { throw new DOMException("The request is not allowed", "NotAllowedError"); });
+      screen.beginShare();
+    };
+
+    // WebKit before 14.6, or a platform refusal: no picker ever showed.
+    refuse(40);
+    await flush();
+    expect(toast.mock.calls).toEqual([["error", "Screen sharing isn't available here: the system refused before showing the picker (The request is not allowed)"]]);
+    expect(useScreen.getState().own).toBeNull();
+
+    // The user closed the picker: silent, as before.
+    toast.mockReset();
+    refuse(PICKER_REFUSED_MS + 2_000);
+    await flush();
+    expect(toast).not.toHaveBeenCalled();
+    expect(useScreen.getState().own).toBeNull();
+    now.mockRestore();
   });
 });

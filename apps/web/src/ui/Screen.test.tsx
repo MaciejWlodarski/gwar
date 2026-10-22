@@ -77,7 +77,7 @@ describe("the Share button and LIVE badge", () => {
   it("on macOS before 14: the button says why and opens no picker; watching works", async () => {
     await desktop("macos_too_old");
     await show();
-    expect(button()?.getAttribute("aria-label")).toBe("Screen sharing needs macOS 14 or later.");
+    expect(button()?.getAttribute("aria-label")).toBe("Screen sharing needs macOS 14.6 or later.");
     expect(button()?.getAttribute("aria-disabled")).toBe("true");
     await act(async () => button()!.click());
     expect(getDisplayMedia).not.toHaveBeenCalled();

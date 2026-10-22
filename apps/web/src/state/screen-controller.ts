@@ -3,7 +3,7 @@
  * and the screen store (`state/screen.ts`). Plaintext channels only: in an encrypted channel
  * nothing is captured or sent, and nothing is watched, until encrypted shares land (PR 7).
  * The desktop app runs the same transports in its webview, beside the native voice engine: it
- * shares on macOS 14+ and Windows, watches on macOS and Windows, and does neither on Linux.
+ * shares on macOS 14.6+ and Windows, watches on macOS and Windows, and does neither on Linux.
  */
 import { create } from "zustand";
 import { tNow } from "../i18n";
@@ -20,22 +20,30 @@ import { useSession, useUi } from "./stores";
 /** Why this device cannot share here, or "ok". */
 export type ShareAvailability = Exclude<ScreenSupport, "ok"> | "ok" | "teamspeak" | "encrypted" | "forbidden";
 
+/**
+ * A refusal faster than this came before any picker could show: nobody closes a picker that
+ * quickly. It is reported, never taken for the user closing the picker (WebKit and Chromium
+ * both answer a refused or a closed picker with the same `NotAllowedError`).
+ */
+export const PICKER_REFUSED_MS = 500;
+
 /** How long `screen.watch` is retried while the server has not seen the watch transport connect. */
 const WATCH_UNAVAILABLE_MS = 5_000;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
 /**
- * The desktop shell's answer (`screen_capture_support`, src-tauri/src/screen.rs): macOS 14+ and
- * Windows share, older macOS does not (owner decision), and Linux, whose WebKitGTK has no
- * WebRTC, neither shares nor watches. Null in the browser, and until the shell answers.
+ * The desktop shell's answer (`screen_capture_support`, src-tauri/src/screen.rs): macOS 14.6+
+ * and Windows share; older macOS does not (the owner gated sharing to 14, and WebKit before
+ * 14.6 refuses before its picker shows); Linux, whose WebKitGTK has no WebRTC, neither shares
+ * nor watches. Null in the browser, and until the shell answers.
  */
 export type DesktopCapture = "ok" | "macos_too_old" | "unsupported";
 export const useDesktopCapture = create<{ capture: DesktopCapture | null }>(() => ({ capture: null }));
 
 /**
  * Whether this build and browser can share at all, before any channel rule. "hidden": the
- * desktop app where sharing does not exist (Linux) or is not known yet; "macos": macOS before 14.
+ * desktop app where sharing does not exist (Linux) or is not known yet; "macos": macOS before 14.6.
  */
 export type ScreenSupport = "ok" | "hidden" | "macos" | "unsupported" | "insecure";
 
@@ -116,6 +124,7 @@ export class ScreenController {
     // The button refuses these too; the controller never relies on it.
     if (useScreen.getState().own || screenSupport() !== "ok") return;
     const attempt = ++this.attempts;
+    const asked = Date.now();
     let picked: Promise<MediaStream>;
     try {
       picked = captureScreen();
@@ -135,10 +144,15 @@ export class ScreenController {
       },
       (e: unknown) => {
         dispatch({ type: "ownEnded", attempt });
-        // Closing the picker is not an error.
         const name = e instanceof DOMException ? e.name : "";
+        const reason = e instanceof Error ? e.message : String(e);
+        if (name === "NotAllowedError" && Date.now() - asked < PICKER_REFUSED_MS) {
+          useUi.getState().toast("error", tNow("screen.pickerRefused", { reason }));
+          return;
+        }
+        // Closing the picker is not an error.
         if (name === "NotAllowedError" || name === "AbortError") return;
-        useUi.getState().toast("error", tNow("screen.captureFailed", { reason: e instanceof Error ? e.message : String(e) }));
+        useUi.getState().toast("error", tNow("screen.captureFailed", { reason }));
       },
     );
   }
