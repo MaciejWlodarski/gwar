@@ -622,7 +622,6 @@ mod tests {
     const COLLAPSE: Duration = Duration::from_secs(12);
 
     /// 4 Mbps on a 10 Mbps downlink that drops to 1 Mbps after `COLLAPSE`, and back after 15 s.
-
     fn collapse(cap: bool) -> (Sim, u64, u64) {
         let mut sim = Sim::new(Some(10_000_000));
         sim.w.egress.cap = cap;

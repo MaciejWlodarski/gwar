@@ -275,7 +275,10 @@ struct FakeIo {
     markers_ready: Arc<AtomicBool>,
     data: Arc<Mutex<Measurements>>,
     tone: bool,
+    /// The measurement clock's zero.
     epoch: Instant,
+    /// When both devices' first callbacks run.
+    start: Instant,
     stop: Arc<AtomicBool>,
     count: usize,
     delay_samples: usize,
@@ -306,7 +309,7 @@ impl AudioIo for FakeIo {
         let thread = thread::Builder::new().name("latency-audio".into()).spawn(move || {
             // Both devices start on the same phase; only the receiver varies its
             // block sizes when callback jitter is enabled.
-            let start = self.epoch + Duration::from_millis(200);
+            let start = self.start;
             if let Some(wait) = start.checked_duration_since(Instant::now()) {
                 thread::sleep(wait);
             }
@@ -522,7 +525,7 @@ async fn measure(
         http_bind: any,
         media_bind: any,
         media_advertise: advertise,
-        // Two voice clients, up to four sharers and 24 viewers (LATENCY_SCREEN).
+        // Two voice clients and up to 14 sharers and viewers (LATENCY_SCREEN).
         max_clients: 32,
         encrypted_server_chat: false,
         server_password: None,
@@ -612,6 +615,9 @@ async fn run(
         None => None,
     };
     let markers_ready = Arc::new(AtomicBool::new(!settings.wait_connected));
+    // After the screen load, whose start can take seconds: a device that starts late runs
+    // ahead to catch up and overflows its ring.
+    let start = Instant::now() + Duration::from_millis(200);
     let sent = Arc::new(Mutex::new(Measurements::default()));
     let heard = Arc::new(Mutex::new(Measurements::default()));
     let io = |data: &Arc<Mutex<Measurements>>, tone: bool, delay_samples: usize, callback_jitter: bool| {
@@ -620,6 +626,7 @@ async fn run(
             data: data.clone(),
             tone,
             epoch,
+            start,
             stop: Arc::new(AtomicBool::new(false)),
             count,
             delay_samples,

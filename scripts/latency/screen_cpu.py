@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Screen SFU CPU per forwarded Mbps (docs/screen-share.md, "Cost on the deployment VM").
 
-Starts a fresh gwar-server process on loopback, then for each viewer count runs the latency
+For each viewer count, starts a fresh gwar-server process on loopback and runs the latency
 example against it with a LATENCY_SCREEN load (one share), and samples the server process's
 CPU time while the viewers' slots are past their ramp. The load and the voice clients run
 in the example's process, so the server's figure is its own. The marginal cost is the
@@ -73,7 +73,7 @@ def step(args, http, media, viewers, out):
     env = {key: value for key, value in os.environ.items() if not key.startswith(("GWAR_", "LATENCY_"))}
     env.update(
         LATENCY_URL=f"ws://127.0.0.1:{http}/ws", LATENCY_SERVER=f"127.0.0.1:{media}",
-        LATENCY_WARMUP_MS="0",
+        LATENCY_WAIT_CONNECTED="1", LATENCY_WARMUP_MS="0",
         LATENCY_SCREEN=f"shares=1,bitrate={args.bitrate},fps={args.fps},keyframe={args.keyframe},viewers={viewers}",
     )
     csv = out / f"viewers-{viewers:02d}.csv"
@@ -106,6 +106,26 @@ def step(args, http, media, viewers, out):
     }
 
 
+def measure(args, viewers):
+    """One step on a fresh server: the server's per-address limits (16 connections, a burst of
+    20 hellos) then hold for each step."""
+    http, media = free_port(socket.SOCK_STREAM), free_port(socket.SOCK_DGRAM)
+    with tempfile.TemporaryDirectory(prefix="gwar-screen-cpu-") as data, \
+            (args.out / f"server-{viewers:02d}.txt").open("x") as log:
+        server = subprocess.Popen(
+            [str(args.server), "--data-dir", data, "--http", f"127.0.0.1:{http}", "--media", f"127.0.0.1:{media}",
+             "--public-ip", "127.0.0.1", "--no-connect", "--insecure-any-host", "--upload-limit-mb", "0"],
+            env={key: value for key, value in os.environ.items() if not key.startswith("GWAR_")},
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+        )
+        args.server_pid = server.pid
+        try:
+            wait_listening(http, server)
+            return step(args, http, media, viewers, args.out)
+        finally:
+            stop_process(server)
+
+
 def slope(points):
     xs, ys = [p["forwarded_mbps"] for p in points], [p["cpu_percent"] for p in points]
     mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
@@ -120,7 +140,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--server", type=Path, required=True, help="target/release/gwar-server")
     parser.add_argument("--load", type=Path, required=True, help="target/release/examples/latency")
-    parser.add_argument("--viewers", default="1,4,8,16,24", help="viewer counts (default: 1,4,8,16,24)")
+    parser.add_argument("--viewers", default="1,4,8,13", help="viewer counts, at most 13 (default: 1,4,8,13)")
     parser.add_argument("--bitrate", default="4mbit", help="per share (default: 4mbit, Smooth)")
     parser.add_argument("--fps", type=positive, default=30)
     parser.add_argument("--keyframe", type=positive, default=150000)
@@ -130,25 +150,11 @@ def main():
     if not re.fullmatch(r"\d+(,\d+)*", args.viewers):
         raise ValueError("--viewers takes comma-separated counts")
     args.out.mkdir(parents=True, exist_ok=False)
-    http, media = free_port(socket.SOCK_STREAM), free_port(socket.SOCK_DGRAM)
-    with tempfile.TemporaryDirectory(prefix="gwar-screen-cpu-") as data, \
-            (args.out / "server.txt").open("x") as log:
-        server = subprocess.Popen(
-            [str(args.server), "--data-dir", data, "--http", f"127.0.0.1:{http}", "--media", f"127.0.0.1:{media}",
-             "--public-ip", "127.0.0.1", "--no-connect", "--insecure-any-host", "--upload-limit-mb", "0"],
-            env={key: value for key, value in os.environ.items() if not key.startswith("GWAR_")},
-            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
-        )
-        args.server_pid = server.pid
-        try:
-            wait_listening(http, server)
-            points = []
-            for viewers in map(int, args.viewers.split(",")):
-                print(f"{viewers} viewers", flush=True)
-                points.append(step(args, http, media, viewers, args.out))
-                print(json.dumps(points[-1]), flush=True)
-        finally:
-            stop_process(server)
+    points = []
+    for viewers in map(int, args.viewers.split(",")):
+        print(f"{viewers} viewers", flush=True)
+        points.append(measure(args, viewers))
+        print(json.dumps(points[-1]), flush=True)
     per_mbps, base = slope(points)
     summary = {
         "platform": platform.platform(), "machine": platform.machine(), "processor": platform.processor(),

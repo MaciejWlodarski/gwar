@@ -10,9 +10,10 @@
 //! - `via`: which screen transports go through the `LATENCY_NET` relay (`publishers`, `viewers`,
 //!   `all`) and which reach the server directly (`none`: all of them).
 use anyhow::{Context, Result, bail, ensure};
-use gwar_client::{ConnectOptions, Connected, Identity, connect};
+use gwar_client::{ClientError, ConnectOptions, Connected, Identity, connect};
 use gwar_proto::{
-    ClientSoftware, Platform, Request, ScreenPreset, ScreenPublishOffer, ScreenStart, ScreenSurface, ScreenWatchOffer,
+    ClientSoftware, ErrorCode, Platform, Request, ScreenPreset, ScreenPublishOffer, ScreenStart, ScreenSurface,
+    ScreenWatchOffer,
 };
 use serde::Serialize;
 use std::{
@@ -35,7 +36,9 @@ use str0m::{
 use tokio::{net::UdpSocket, task::JoinHandle};
 
 const MAX_SHARES: usize = 4;
-const MAX_VIEWERS: usize = 24;
+const MAX_VIEWERS: usize = 13;
+/// The server takes 16 connections from one address; the call has two.
+const MAX_CONNECTIONS: usize = 14;
 /// The steady rate counts from here: past the SFU's 10 s ramp of a new slot, and settled.
 const STEADY_AFTER: Duration = Duration::from_secs(12);
 
@@ -102,6 +105,7 @@ impl Spec {
         }
         ensure!((1..=MAX_SHARES).contains(&spec.shares), "shares must be within 1..{MAX_SHARES}");
         ensure!((1..=MAX_VIEWERS).contains(&spec.viewers), "viewers must be within 1..{MAX_VIEWERS}");
+        ensure!(spec.shares + spec.viewers <= MAX_CONNECTIONS, "shares and viewers may be {MAX_CONNECTIONS} together");
         ensure!((100_000..=8_000_000).contains(&spec.bitrate), "bitrate must be within 100kbit..8mbit (Game's cap)");
         ensure!((1..=120).contains(&spec.fps), "fps must be within 1..120");
         ensure!((1_000..=2_000_000).contains(&spec.keyframe), "keyframe must be within 1000..2000000 bytes");
@@ -114,8 +118,8 @@ impl Spec {
 fn preset(bitrate: u64) -> ScreenPreset {
     match bitrate {
         ..=1_500_000 => ScreenPreset::Saver,
-        ..=2_500_000 => ScreenPreset::Text,
-        ..=4_000_000 => ScreenPreset::Smooth,
+        1_500_001..=2_500_000 => ScreenPreset::Text,
+        2_500_001..=4_000_000 => ScreenPreset::Smooth,
         _ => ScreenPreset::Game,
     }
 }
@@ -174,6 +178,20 @@ fn options(url: &str, name: &str) -> ConnectOptions {
     }
 }
 
+/// Connects, waiting out the server's hello limit for one address (a burst of 20, then one a
+/// second, and a login takes two): the load opens up to 14 connections at once.
+async fn join(url: &str, name: &str) -> Result<Connected> {
+    for _ in 0..20 {
+        match connect(options(url, name)).await {
+            Err(ClientError::Server(e)) if e.code == ErrorCode::RateLimited => {
+                tokio::time::sleep(Duration::from_millis(2500)).await;
+            }
+            connected => return Ok(connected?),
+        }
+    }
+    bail!("{name}: the server kept refusing hellos")
+}
+
 async fn socket() -> Result<(Arc<UdpSocket>, SocketAddr)> {
     let socket = UdpSocket::bind("127.0.0.1:0").await.context("bind screen load socket")?;
     let local = socket.local_addr()?;
@@ -206,7 +224,14 @@ impl Load {
         let counters = Arc::new(Counters::default());
         let (url, load) = (url.to_owned(), spec.clone());
         let running = runtime.spawn(run(url, load, channel, advertised, relay, server, counters.clone()));
-        let running = running.await??;
+        let running = match running.await {
+            Ok(Ok(running)) => running,
+            failed => {
+                // Dropping a runtime inside the caller's would panic.
+                runtime.shutdown_background();
+                return Err(failed.map_err(anyhow::Error::from).and_then(|r| r.map(drop)).unwrap_err());
+            }
+        };
         // The loops and connections live until the runtime shuts down.
         runtime.spawn(async move {
             let _running = running;
@@ -237,7 +262,7 @@ async fn run(
     let route = |through: bool| if through { relay.unwrap_or(server) } else { server };
     let mut shares = Vec::new();
     for n in 0..spec.shares {
-        let mut sharer = connect(options(url, &format!("screen sharer {n}"))).await?;
+        let mut sharer = join(url, &format!("screen sharer {n}")).await?;
         sharer.connection.join(channel, None).await?;
         let state = sharer.connection.request(Request::VoiceState {}).await?;
         let binding = |key: &str| state["voice"][key].as_str().unwrap_or("AAAAAAAAAAAAAAAAAAAAAA").to_owned();
@@ -257,7 +282,7 @@ async fn run(
         shares.push(share);
     }
     for n in 0..spec.viewers {
-        let mut viewer = connect(options(url, &format!("screen viewer {n}"))).await?;
+        let mut viewer = join(url, &format!("screen viewer {n}")).await?;
         let through = matches!(spec.via, Via::Viewers | Via::All);
         tasks.push(watch(&viewer, advertised, route(through), counters.clone()).await?);
         for share in &shares {
@@ -500,7 +525,8 @@ mod tests {
             "via=up",
             "fps=1,fps=2",
             "colour=red",
-            "viewers=25",
+            "viewers=14",
+            "shares=4,viewers=11",
         ] {
             assert!(Spec::parse(invalid).is_err(), "accepted {invalid}");
         }

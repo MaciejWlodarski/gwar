@@ -501,6 +501,55 @@ datagrams reach the screen task without slowing voice down.
     isolation is changed (own thread, separate port or a lower video
     allocation).
 
+**As built in PR 3b** (docs/latency.md, "Screen load"; `scripts/latency/screen_gate.py`):
+
+- The gate compares the **median of the per-pair deltas** (screen − baseline).
+  "No extra underruns" is the screen runs' total against the baselines';
+  the constrained underrun figure is underrun samples over samples played,
+  in percentage points.
+- `rate=` is one bottleneck per direction shared by every flow, so the voice
+  sender shares the 10 Mbps uplink with the publisher, and the voice receiver
+  the 5 Mbps downlink with the viewer. Loss variants add 1 % loss both ways.
+  The unconstrained scenarios have five viewers, directly (no loss) or all
+  through the relay (loss); the uplink ones one viewer, directly.
+- **Deviation:** the downlink scenario uses two **3 Mbps** Smooth shares, not
+  4 Mbps. `B` is 80 % of an estimate that stays below the 5 Mbps link
+  (4.4–4.7 Mbps measured), so a 4 Mbps share never fits: both paused and no
+  video ran beside the voice. With 3 Mbps one share pauses and the other
+  runs at 3.0 Mbps.
+- The load runs on its own runtime and the relay on its own thread: on the
+  example's shared two-thread runtime, the relay forwarding 45 Mbps added
+  30–90 ms to the voice beside it, which is the harness and not the network.
+- **Local results** (2026-10-22, Apple silicon laptop with 10 cores, shared
+  with other agents' builds, load average 4–7; 60 markers a run after a 15 s
+  warm-up). Median per-pair deltas in ms (median / p95 / p99), underruns
+  baseline → screen:
+
+  | Scenario | Pairs | Δ median | Δ p95 | Δ p99 | Underruns | Gate |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | unconstrained, 5 × 7.8 Mbps | 2 | −5.7 | −5.1 | −4.6 | 1 → 0 | pass |
+  | unconstrained + 1 % loss | 2 | +1.0 | −6.9 | −2.3 | 0 → 0 | pass |
+  | uplink 10 Mbps, 7.7 Mbps share | 2 | +4.9 | +0.2 | −4.4 | 2 → 0 | pass |
+  | uplink + 1 % loss | 2 | −9.1 | −10.6 | −13.9 | 3 → 0 | pass |
+  | downlink 5 Mbps, 2 × 3 Mbps | 2 | +7.1 | −12.0 | −12.0 | 0 → 3 | pass |
+  | downlink + 1 % loss | 2 | +50.3 | +55.6 | +66.3 | 0 → 9 | **miss** |
+  | downlink, rerun | 4 | +18.1 | +23.1 | +23.1 | 0 → 8 | **miss** |
+  | downlink + 1 % loss, rerun | 4 | +12.1 | +2.5 | +2.7 | 1 → 1 | pass |
+
+  The baselines alone ranged from 46 to 90 ms median between runs of the
+  same build, so two pairs settle nothing; the misses come from **one
+  outlier pair each**. In those runs (2 of 12 constrained-downlink screen
+  runs) both shares ended paused, the voice receiver got no audio for about
+  140 ms around 12 s, and its playout stayed near 170 ms afterwards; the
+  relay's queue never exceeded 31 ms, so the gap was not on the simulated
+  link. Eight further single runs with tracing, and three with the failing
+  pair's seed, did not reproduce it. Without the outliers the downlink
+  scenarios cost voice about +10–20 ms median and a few ms at p95/p99.
+- **Left for the VM:** the full ten-pair run, which decides the gate, on a
+  host that runs nothing else. If the outlier mode shows there, the next
+  step is the isolation the gate names: the screen task on its own thread,
+  off the runtime that carries voice.
+
 ### Admission and resource limits
 
 Each share's publish `Rtc` binds its negotiated SSRC and RTX SSRC to an
@@ -788,6 +837,20 @@ That is immediate and needs no str0m change:
   lost. str0m's loss controller then lowers the estimate of an overloaded
   viewer, which is the right direction.
 
+**Found in PR 3b: tiny packets defeat the reserve.** str0m sizes probe
+clusters in payload bytes and builds them from cached packets
+(resend-as-padding). With the end-to-end tests' 6-byte payloads every probe
+datagram was about 52 bytes on the wire, roughly three times its payload, so
+the start-up probes overflowed the bucket. The dropped probes carry TWCC
+numbers, so the viewer reported them lost; str0m's loss controller cut the
+estimate from 2.5 Mbps to about 60 kbps, which shrank the bucket and `B`
+with it, and repairs and originals starved. Near-full packets (the tests now
+send 1 KB bodies) never drop. A real share's packets are near the MTU while
+it moves, but a static Text share sends small deltas, so the same spiral is
+possible there: worth watching in PR 4's browser runs. The remedies, if it
+shows, are charging extras by payload rather than wire bytes, or a packet
+allowance beside the byte bucket.
+
 The 64 KB floor matters at low estimates: it is 200 ms of a 2.5 Mbps link.
 The paired voice runs found that the probe *rate* matters more than this
 volume, which the cap on the desired bitrate handles.
@@ -1069,7 +1132,13 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
     0.4 % of an A1 core per Mbps**;
   - **100 Mbps of egress (25 viewers at 4 Mbps) ≈ 0.4 of one A1 core**, on a
     task separate from voice.
-  - PR 3b re-measures this on the VM.
+  - PR 3b re-measures this on the VM with `scripts/latency/screen_cpu.py`:
+    one 4 Mbps share and 1–13 viewers against a separate `gwar-server`
+    process, CPU from the process's own counters, the slope over forwarded
+    Mbps by least squares. Locally (the same laptop, shared with other
+    builds), forwarding 4, 16, 32 and 52 Mbps cost 5.5, 8.8, 13.7 and 18.9 %
+    of one core: **about 0.28 % of a core per Mbps** on top of 4.4 % for the
+    rest of the server, about twice S3's figure. Not yet run on the VM.
 - **Compute allowance.** The account is Always Free (confirmed by the owner,
   2026-10-21). Oracle's Always Free page gives 1,500 A1 OCPU-hours and
   9,000 GB-hours a month, which is 2 OCPUs and 12 GB running continuously.
@@ -2254,6 +2323,13 @@ person.
      and acceptance", including the `LATENCY_NET` `rate=` option and the
      screen load generator.
    - CPU per Mbps measured on the VM, recorded here.
+
+   Built in PR 3b, beyond the list: a 10 s ramp before a new slot's pauses
+   count, the probing target capped at twice the estimate, stalled viewers
+   reprobing every 15 s, Retry resuming bandwidth pauses, and the screen
+   load and gate harness. The ten-pair voice gate and the CPU figure on the
+   VM are still to run ("Voice headroom and acceptance", "Cost on the
+   deployment VM").
 4. **Web sharing and watching, plaintext (L, 7–9 days).**
    - `voice/screen.ts`: publish and watch transports, the capture with presets
      and constraints, codec preference, sender parameters with uplink

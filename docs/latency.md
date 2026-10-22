@@ -267,7 +267,8 @@ within one marker. `up:jitter=10ms` cost far more than `down:jitter=10ms`
   at most 8 Mbps). Each publishes through a str0m frame-mode VP9 sender:
   synthetic frames of `bitrate / fps` bytes, `keyframe` bytes for the first
   frame and for every keyframe request, paced by str0m's TWCC pacer.
-- `viewers` (1–24) connections watch every share on a four-slot watch
+- `viewers` (1–13; with `shares`, at most 14, since the server takes 16
+  connections from one address) connections watch every share on a four-slot watch
   transport and count what arrives and every `screen.paused`/`screen.resumed`.
 - `via`: which screen transports go through the `LATENCY_NET` relay:
   `publishers`, `viewers`, `all`, or `none` (the default; all direct).
