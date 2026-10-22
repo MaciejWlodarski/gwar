@@ -113,6 +113,11 @@ function readBarcode(video) {
 /** Per device: a synthetic microphone, the barcode reader and, for canvas sharers, the capture hook. */
 function devicePatch({ frequency, canvasId }, stamp, read) {
   window.__readBarcode = read;
+  // Every peer connection, for the RTP diagnostics a failure prints.
+  window.__pcs = [];
+  window.RTCPeerConnection = new Proxy(window.RTCPeerConnection, {
+    construct(target, args) { const pc = new target(...args); window.__pcs.push(pc); return pc; },
+  });
   const media = navigator.mediaDevices;
   media.getUserMedia = async () => {
     const context = new AudioContext();
@@ -141,6 +146,26 @@ function devicePatch({ frequency, canvasId }, stamp, read) {
 
 const sourcePage = `<!doctype html><title>${SOURCE_TITLE}</title><style>html,body{margin:0;height:100%;overflow:hidden;background:#777}canvas{display:block;width:100vw;height:100vh}</style>
 <canvas width="1280" height="720"></canvas><script>(${stampBarcode})(document.querySelector("canvas"), 1)</script>`;
+
+/** What a failure prints per device: each open peer connection's RTP streams and the stage's videos. */
+const diagnostics = page => page.evaluate(async () => ({
+  rtp: await Promise.all(window.__pcs.filter(pc => pc.connectionState !== "closed").map(async pc => {
+    const stats = await pc.getStats();
+    const codecs = {};
+    const streams = [];
+    stats.forEach(s => { if (s.type === "codec") codecs[s.id] = `${s.mimeType} ${s.sdpFmtpLine ?? ""}`.trim(); });
+    stats.forEach(s => {
+      if (s.type !== "inbound-rtp" && s.type !== "outbound-rtp") return;
+      streams.push({ dir: s.type === "inbound-rtp" ? "in" : "out", mid: s.mid, codec: codecs[s.codecId], packets: s.packetsReceived ?? s.packetsSent, bytes: s.bytesReceived ?? s.bytesSent,
+        frames: s.framesDecoded ?? s.framesEncoded, keyFrames: s.keyFramesDecoded ?? s.keyFramesEncoded, pli: s.pliCount, fir: s.firCount, nack: s.nackCount, size: `${s.frameWidth}x${s.frameHeight}` });
+    });
+    return { state: pc.connectionState, streams };
+  })),
+  videos: [...document.querySelectorAll("video[data-share]")].map(v => {
+    const track = v.srcObject?.getVideoTracks?.()[0];
+    return { share: v.dataset.share, readyState: v.readyState, size: `${v.videoWidth}x${v.videoHeight}`, paused: v.paused, track: track && `${track.readyState}${track.muted ? " muted" : ""}` };
+  }),
+}));
 
 const errors = page => page.errors.filter(e => !/Conversation synchronization|favicon|Failed to load resource|Screen capture constraints|WebSocket/.test(e));
 
@@ -379,7 +404,8 @@ try {
   failure = error;
   for (const page of opened) {
     const state = await session(page, (s, screen) => ({ own: screen.own && { ...screen.own, stream: !!screen.own.stream }, transport: screen.transport, watches: screen.watches, slots: screen.slots, shares: Object.keys(s.shares) })).catch(e => String(e));
-    console.error(JSON.stringify({ device: page.deviceName, state, errors: page.errors.slice(-20) }));
+    const rtc = await diagnostics(page).catch(e => String(e));
+    console.error(JSON.stringify({ device: page.deviceName, state, rtc, errors: page.errors.slice(-20) }));
   }
 } finally {
   for (const browser of Object.values(browsers)) await browser.close().catch(() => {});
