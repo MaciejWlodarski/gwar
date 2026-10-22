@@ -389,6 +389,18 @@ fn key_packages_from_a_clock_ahead_are_valid() {
         let p = ds::key_package(&p).unwrap();
         assert!(p.not_after * 1000 <= (ahead + 84 * 86_400_000) as u64);
     }
+    // Without a certificate to end it first, the range is OpenMLS's maximum: 84 days plus the hour.
+    let mut local = Agent::new([11; 32], Credential::Local { device_key: public(&key(11)) }, ahead).unwrap();
+    local.take_changes();
+    let package = local.key_packages(1, ahead).unwrap().remove(0);
+    let package = KeyPackageIn::tls_deserialize_exact(&package)
+        .unwrap()
+        .validate(local.provider.crypto(), ProtocolVersion::Mls10)
+        .unwrap();
+    let issued = ahead as u64 / 1000;
+    assert_eq!(package.life_time().not_before(), issued - CLOCK_SKEW_SECS);
+    assert_eq!(package.life_time().not_after(), issued + 84 * 86400);
+    assert!(package.life_time().has_acceptable_range());
 }
 
 #[test]
