@@ -379,16 +379,20 @@ pub struct Report {
     /// Browser mode only: downlink datagrams the OS refused to send (see `bind_for_browsers`).
     pub downlink_send_errors: u64,
 }
+/// The relay runs on its own one-thread runtime: it stands in for the network, so it must
+/// neither take CPU time from the clients and the in-process server nor wait for theirs.
 pub struct Relay {
-    socket: Arc<UdpSocket>,
+    socket: std::net::UdpSocket,
     browsers: bool,
+    runtime: Option<tokio::runtime::Runtime>,
     task: Option<JoinHandle<Result<Report>>>,
     stop: Option<oneshot::Sender<()>>,
 }
 impl Relay {
     pub async fn bind() -> Result<Self> {
-        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.context("bind netem relay")?);
-        Ok(Self { socket, browsers: false, task: None, stop: None })
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").context("bind netem relay")?;
+        socket.set_nonblocking(true)?;
+        Ok(Self { socket, browsers: false, runtime: None, task: None, stop: None })
     }
     /// For browser clients (apps/web/e2e/latency.mjs): every local ICE candidate that checks the
     /// relay is its own flow, and a candidate on a host interface reaches this loopback socket
@@ -404,10 +408,18 @@ impl Relay {
     pub fn address(&self) -> Result<SocketAddr> {
         Ok(self.socket.local_addr()?)
     }
-    pub fn start(&mut self, server: SocketAddr, spec: Spec, epoch: Instant) {
+    pub fn start(&mut self, server: SocketAddr, spec: Spec, epoch: Instant) -> Result<()> {
         let (stop, receive) = oneshot::channel();
         self.stop = Some(stop);
-        self.task = Some(tokio::spawn(relay(self.socket.clone(), server, spec, epoch, receive, self.browsers)));
+        let runtime =
+            tokio::runtime::Builder::new_multi_thread().worker_threads(1).thread_name("netem").enable_all().build()?;
+        let (socket, browsers) = (self.socket.try_clone()?, self.browsers);
+        self.task = Some(runtime.spawn(async move {
+            let front = Arc::new(UdpSocket::from_std(socket)?);
+            relay(front, server, spec, epoch, receive, browsers).await
+        }));
+        self.runtime = Some(runtime);
+        Ok(())
     }
     pub async fn finish(&mut self) -> Result<Report> {
         if let Some(stop) = self.stop.take() {
@@ -420,6 +432,9 @@ impl Drop for Relay {
     fn drop(&mut self) {
         if let Some(task) = &self.task {
             task.abort();
+        }
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
         }
     }
 }
@@ -716,7 +731,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), async {
             let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let mut relay = Relay::bind().await.unwrap();
-            relay.start(server.local_addr().unwrap(), Spec::parse("seed=1").unwrap(), Instant::now());
+            relay.start(server.local_addr().unwrap(), Spec::parse("seed=1").unwrap(), Instant::now()).unwrap();
             let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let mut buffer = [0; 10];
@@ -744,7 +759,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), async {
             let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
             let mut relay = Relay::bind_for_browsers().await.unwrap();
-            relay.start(server.local_addr().unwrap(), Spec::parse("seed=1").unwrap(), Instant::now());
+            relay.start(server.local_addr().unwrap(), Spec::parse("seed=1").unwrap(), Instant::now()).unwrap();
             let mut buffer = [0; 10];
             for _ in 0..3 {
                 let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();

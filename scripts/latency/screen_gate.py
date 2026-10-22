@@ -8,7 +8,7 @@ the median of the per-pair deltas:
 - unconstrained (no rate limit): p95 and p99 within 2 ms of the baseline, and no more
   playout underruns than the baseline in total;
 - constrained (a rate= bottleneck): p99 within 20 ms of the baseline, and the underrun
-  fraction (underrun samples / callback samples) within 0.5 percentage points of it.
+  fraction (underrun samples / samples played) within 0.5 percentage points of it.
 
 Exits 1 when a scenario misses the gate; summary.json has the numbers.
 """
@@ -49,6 +49,13 @@ UNDERRUN_FRACTION = 0.005
 WARMUP_MS = 15000
 
 
+def played(meta):
+    """Samples the receiver played after connecting: the run's length, as latency.rs runs it."""
+    rate = meta["sample_rate"]
+    return (rate + meta["warmup_samples"] + meta["markers"] * meta["marker_interval_samples"]
+            + meta["matching_window_ms"] * rate / 1000)
+
+
 def playout(meta):
     """Voice figures of one run, as the latency docs report them."""
     receiver = meta["receiver_playout"]
@@ -57,7 +64,7 @@ def playout(meta):
         "median_ms": meta["median_ms"], "p95_ms": meta["p95_ms"], "p99_ms": meta["p99_ms"],
         "lost_markers": len(meta["lost_markers"]),
         "underruns": receiver["underruns"],
-        "underrun_fraction": receiver["underrun_samples"] / max(receiver["callback_samples"], 1),
+        "underrun_fraction": receiver["underrun_samples"] / played(meta),
         "concealments": sum(slot["concealments"] for slot in slots),
         "late_drops": sum(slot["late_drops"] for slot in slots),
         "frames_received": meta["receiver_frames_received"],

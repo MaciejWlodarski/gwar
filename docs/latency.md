@@ -242,6 +242,10 @@ write useful output and still exit unsuccessfully if more than 5% of markers
 are unmatched. Inspect per-marker CSV timelines and applied stall windows,
 because a call's median alone can hide persistent latency after a stall.
 
+The relay runs on its own one-thread runtime, so its scheduling neither takes
+CPU time from the clients and the in-process server nor waits for theirs; with
+a screen load it forwards tens of Mbps.
+
 Sharing one link per direction stands in for a shared access link: with
 `LATENCY_SCREEN` a share's publisher and the voice sender queue behind the same
 `up`, and a viewer and the voice receiver behind the same `down`.

@@ -591,7 +591,7 @@ async fn run(
     };
     let epoch = Instant::now();
     let media_addr = if let Some((relay, spec, server)) = &mut net {
-        relay.start(*server, spec.clone(), epoch);
+        relay.start(*server, spec.clone(), epoch)?;
         println!("netem relay={} spec={}", relay.address()?, spec.source);
         relay.address()?
     } else {

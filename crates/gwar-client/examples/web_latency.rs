@@ -298,7 +298,7 @@ async fn main() -> anyhow::Result<()> {
     anyhow::ensure!(server.http.ip().is_loopback() && server.media.ip().is_loopback(), "loopback server required");
     let clock = Clock::new();
     if let (Some(relay), Some(spec)) = (&mut relay, &net) {
-        relay.start(server.media_bind, spec.clone(), clock.instant);
+        relay.start(server.media_bind, spec.clone(), clock.instant)?;
     }
     let result = run(&server, &out, clock, &mut relay).await;
     for task in &server.tasks {
