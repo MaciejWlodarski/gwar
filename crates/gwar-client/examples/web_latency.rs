@@ -207,6 +207,7 @@ impl Peer {
                 "staged_samples": slot.staged_samples,
                 "concealments": slot.concealments,
                 "late_drops": slot.late_drops,
+                "overflow_drops": slot.overflow_drops,
                 "shrink_samples": slot.shrink_samples,
                 "trim_events": slot.trim_events,
             })).collect::<Vec<_>>(),

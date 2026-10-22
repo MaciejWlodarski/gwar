@@ -322,10 +322,11 @@ artificial delay in both ms and samples are recorded too.
 `receiver_playout` is the receiver's final live snapshot: speaker queue level,
 latest and held maximum callback sizes, scheduling headroom, active-stream
 underrun events and samples, and per-slot target/queue/staged samples,
-concealment events, late drops, shrunk samples, `trim_events` and
+concealment events, late drops, `overflow_drops` (queued packets dropped, oldest
+first, because the queue was full), shrunk samples, `trim_events` and
 `concealments_after_trim` (concealments within one second after a trim). A trim
 event is one fractional correction or one stall-recovery batch; these counters
-include both. Proximity is diagnostic correlation, not proof that a trim caused
+include both. Overflow drops are not trims. Proximity is diagnostic correlation, not proof that a trim caused
 the concealment. All sample counts use 48 kHz mono; divide by 48 for ms. These cumulative counters include warmup; raw
 receiver underflows also include idle callbacks, whereas playout underruns count
 only callbacks during playback.
@@ -367,6 +368,66 @@ including onsets in lookahead packets. Correlated speech need not wait for the
 old nonquiet deadline; uncorrelated audio never uses that deadline to force a
 cut. Quiet audio retains the <=240-sample skip and 120-sample boundary fade.
 Burst recovery still discards whole packets and fades as before.
+
+Queue overflow (2026-10-22). The queue held at most 64 packets. When it was
+full, a new packet was dropped, so a queue that filled while the output device
+was paused kept its oldest audio: on resume it played the stale 640 ms (10 ms
+packets), then concealed the hole after it, and the packets arriving during that
+concealment found the queue full again. With refills resuming one packet per
+10 ms that repeated every 0.74 s (64 packets, then 100 ms of PLC), 200
+concealments in 15 s on both clocks. Overflow now drops the oldest packet
+instead; when that moves past the playout position, playback continues at the
+oldest kept packet and fades in. The window's marks restart (they counted the
+dropped audio), but the last observation stays.
+
+A packet count says little about duration, though: 64 packets of 2.5 ms are
+only 160 ms (the largest target), and 64 of 5 ms 320 ms, which a refill serviced
+late with speaker headroom can queue legitimately. The queue is therefore capped
+by duration: 1 s of queued audio (`MAX_QUEUED`), above the 160 ms target plus a
+refill and speaker headroom (the speaker ring holds 500 ms), with margin. A
+count of 512 packets remains as a memory bound only; at 2.5 ms per packet it is
+1.28 s, so the duration cap always binds first.
+
+Exceeding 1 s is also the evidence that the backlog is worth nothing: either the
+output stopped consuming or more than a second of audio arrived at once. The
+next refill after that therefore trims the queue once, oldest first, down to
+that refill's demand plus the target, by the queued packets' own durations
+(mixed 10/20 ms streams included; holes count as nothing). The refill takes its
+demand and the target stays queued behind it as the jitter reserve: keeping only
+the larger of the two let a 20 ms refill on a 13 ms target empty the queue, and
+the next packet delivered 10 ms late was concealed
+(`overflow_recovery_keeps_the_jitter_reserve`, 20 and 120 ms refills, both
+clocks). Whole packets can leave up to one packet above the target; the drain
+takes that as quiet cuts. It is the stall-recovery trim with its fade, counted
+as a trim event; the window restarts. A stall recovery pending for the same
+burst keeps its deadline and its hold on the jitter estimate, for the rest of a
+burst still arriving, but its later trims keep the same reserve: trimming the
+kept audio again to `target.max(demand)` took the reserve back out (delivery
+held from 5 to 6.2 s, refills 10 ms off the packet phase, one concealment), and
+dropping the recovery instead left a burst's tail arriving 1 ms later queued
+(490 ms on a 15 ms target). A burst of more than a second at once is trimmed the
+same way, which is acceptable: that much never arrives inside a jitter target.
+In simulation
+(`a_full_queue_keeps_the_newest_audio_and_trims_to_the_target_after_a_pause`,
+both clocks, 20 s pause) the first refill after the pause trimmed 980 ms (10 ms
+packets), 960 ms (20 ms), 970 ms (20/10/10 ms) and 960 ms (alternating
+10/20 ms), and playback went on from the newest audio with no gap and no PLC.
+Without the trim, a 64-packet backlog took the fractional drain 65.5 s (10 ms
+packets) to 126.5 s (20 ms packets, quiet 5 ms cuts). With the 64-packet trigger,
+a 2.5 ms stream with 120 ms refills, one 60 ms late, lost 1,920 samples and
+concealed 51 times instead of 27; 5 ms packets with 240 ms refills, one 100 ms
+late, lost 3,840 samples and concealed 40 times instead of 20
+(`a_delayed_refill_over_short_packets_is_not_an_overflow`, now no cut and no
+extra PLC).
+
+A refill-stall rule that dropped the backlog at once was tried and left out.
+Refill timing alone cannot tell a paused device from late pipeline service: a
+refill serviced 110 ms late with 120 ms of speaker headroom loses no audio, yet
+the rule dropped 110 ms and the next refill concealed 100 ms
+(`a_delayed_refill_with_headroom_trims_nothing`). Output underruns show only the
+time the device played without the pipeline, not a pause; a sound signal would
+need the device's consumed samples against the wall clock. The web client uses
+the browser's WebRTC receiver (NetEq), not this buffer.
 
 A 10 ms packet cannot contain two periods of low-pitched speech. Only when a
 correction is eligible, the decoder stages already queued contiguous packets
