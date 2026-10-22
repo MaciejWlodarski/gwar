@@ -141,6 +141,14 @@ Whether it is **current** at a time `t` is judged separately, against a
 revocation view supplied by the caller (`Authority` below):
 `issued_at <= t < expires_at`, and not revoked at or before `t`.
 
+The shared web/desktop Connect issuer backdates fresh and renewed certificates
+by ten minutes (clamped at Unix epoch zero), covering two devices at opposite
+ends of the five-minute clock allowance. Expiry is exactly 90 days after that
+backdated issuance, not after the local current time. Connect verifies these
+account-signed certificates; it does not issue them. Historical certificate,
+revocation, live sending and voice-admission checks keep their strict signed
+boundaries; these checks add no clock grace.
+
 ### Descriptor
 
 The GroupContext extension `0xff00` holds three netstrings (as in
@@ -464,7 +472,13 @@ signed with the commit by its sender: `gwar commit v1\n{committed_at}` (Unix
 ms). The server rejects a commit whose time is more than five minutes behind
 its commit clock with `expired`, one more than five minutes ahead of it with
 `early` (it may be accepted later), and one earlier than the previous
-commit's time of that group with `bad_request`.
+commit's time of that group with terminal `expired` as well. The previous time
+is the persisted `mls_groups.committed_at` floor (or the current call's accepted
+time for volatile voice groups); clock catch-up or rollback cannot make those
+bytes acceptable. The client discards the pending commit and rebuilds, or drops
+an unaccepted external join and rejoins, using a fresh local timestamp. A device
+still behind the floor may need to wait for its clock to catch up, but it never
+has to wait out the old commit's five-minute expiry window.
 The commit clock is the larger of the system clock and the highest value it
 returned before, which is persisted (table `meta`) before any `expired`
 reply, so a system clock set back never revives an expired commit. The

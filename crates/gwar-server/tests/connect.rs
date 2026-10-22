@@ -150,6 +150,22 @@ async fn maximum_lifetime_certificate_uses_one_clock_sample() {
 }
 
 #[tokio::test]
+async fn backdated_fresh_certificates_authenticate_across_clock_skew() {
+    let server = TestServer::start().await;
+    let account = new_key();
+    for skew in [-300_000, -180_000, -2_600, 2_600, 180_000, 300_000] {
+        let device = new_key();
+        // Match the shared web/desktop issuer, including its full signed
+        // 90-day interval rather than extending expiry by the backdate.
+        let issued_at = now() + skew - 600_000;
+        let cert = certificate(&account, &device, issued_at, issued_at + CERTIFICATE_LIFETIME);
+        let client = as_device(&server, &device, cert).await.expect("fresh skewed certificate accepted");
+        assert_eq!(client.welcome.uid, uid_of(&account));
+        client.close().await;
+    }
+}
+
+#[tokio::test]
 async fn an_expired_certificate_is_reported_as_such() {
     let server = TestServer::start().await;
     let account = SigningKey::from_bytes(&rand::random());

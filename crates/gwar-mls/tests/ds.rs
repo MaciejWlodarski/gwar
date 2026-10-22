@@ -410,7 +410,9 @@ fn commit_times_follow_the_server_clock_and_never_go_back() {
     let skew = ds::MAX_CLOCK_SKEW_MS;
     assert_eq!(load().commit(&commit, &info, None, NOW + skew + 1, 0).err(), Some(DsError::Expired));
     assert_eq!(load().commit(&commit, &info, None, NOW - skew - 1, 0).err(), Some(DsError::Early));
-    assert_eq!(load().commit(&commit, &info, None, NOW, NOW + 1).err(), Some(DsError::Invalid("commit time")));
+    assert_eq!(load().commit(&commit, &info, None, NOW, NOW + 1).err(), Some(DsError::Expired));
+    // Below the group floor is terminal even when this clock would say early.
+    assert_eq!(load().commit(&commit, &info, None, NOW - skew - 1, NOW + 1).err(), Some(DsError::Expired));
     let (_, accepted) = load().commit(&commit, &info, None, NOW + skew, NOW).unwrap();
     assert_eq!(accepted.committed_at, NOW);
     assert_eq!(ds::commit_time(b"gwar commit v1\n01"), None);
@@ -428,6 +430,8 @@ fn an_old_commit_is_expired_even_when_its_key_packages_ran_out() {
     assert_eq!(load().commit(&commit, &info, Some(&welcome), NOW, 0).err(), Some(DsError::Invalid("commit")));
     let late = NOW + ds::MAX_CLOCK_SKEW_MS + 1;
     assert_eq!(load().commit(&commit, &info, Some(&welcome), late, 0).err(), Some(DsError::Expired));
+    // A persisted group floor is equally terminal, even inside the clock window.
+    assert_eq!(load().commit(&commit, &info, Some(&welcome), NOW, NOW + 1).err(), Some(DsError::Expired));
 }
 
 #[test]

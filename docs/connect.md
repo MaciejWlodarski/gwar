@@ -156,7 +156,10 @@ All signatures are Ed25519 over the UTF-8 text, fields separated by `\n`:
   device inventory is for inspection and revocation; its names, last-seen
   times and completeness are unverified service claims, never instructions
   to sign. The prompt starts exactly 14 days before expiry. Issuance and every verifier
-  enforce the 90-day maximum.
+  enforce the 90-day maximum. The shared web/desktop issuer sets `issued_at`
+  to ten minutes before its local clock (clamped at zero) and `expires_at` to
+  90 days after `issued_at`. This covers two devices at opposite ends of the
+  five-minute clock allowance without loosening historical or revocation checks.
 - **Revocation**, by the account key: `gwar revoke v1\n{account_key}\n{device_key}\n{revoked_at}`.
 
 ### Session and credential challenges

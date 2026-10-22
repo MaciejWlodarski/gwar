@@ -154,7 +154,11 @@ reloads (accepting then says it was not saved).
   anything. Connect cannot weaken the parameters to speed up guessing.
 - A device only ever certifies its own locally held key. The device list from
   Connect is shown for inspection and revocation, never used as an instruction
-  to sign.
+  to sign. The shared web/desktop issuer backdates new and renewed certificates
+  ten minutes to cover two devices at opposite ends of the five-minute clock
+  allowance; expiry is 90 days after the backdated issuance. Connect verifies
+  the account signature. Certificate validity, historical signatures and
+  revocation checks retain their exact boundaries, including voice admission.
 - Sessions are issued against a five-minute, one-use challenge signed by the
   device (`gwar session v1 …`), bound to the service, account, certificate and
   session, and end when the certificate expires.

@@ -1352,6 +1352,32 @@ mod tests {
     }
 
     #[test]
+    fn backdated_fresh_certificates_admit_voice_across_clock_skew() {
+        for skew in [-300_000, -180_000, -2_600, 2_600, 180_000, 300_000] {
+            let mut f = TestCall::new();
+            let server_now = now_ms();
+            // Same issued_at as the shared web/desktop certificate issuer.
+            let issued_at = server_now + skew - 600_000;
+            let expiry = issued_at + 86_400_000;
+            f.core.voice_clock = test_clock;
+            VOICE_TIME.set(server_now - skew);
+            f.add(Some(expiry), Some(expiry), true, true);
+            let session = f.sessions[1];
+            assert!(f.core.voice_state(session).is_some());
+            f.core.voice_reconcile();
+            assert!(f.core.voice_state(session).is_some());
+            // Admission and the cached voice gate still enforce the signed
+            // interval, including rollback just before issuance and exact expiry.
+            VOICE_TIME.set(issued_at - 1);
+            assert_eq!(f.core.voice_admission(session, f.channel).err().unwrap().code, ErrorCode::Forbidden);
+            f.core.voice_reconcile();
+            assert!(f.core.voice_state(session).is_none());
+            VOICE_TIME.set(expiry);
+            assert_eq!(f.core.voice_admission(session, f.channel).err().unwrap().code, ErrorCode::Forbidden);
+        }
+    }
+
+    #[test]
     fn simultaneous_voice_expiry_batches_detachments_and_reuses_parent_view() {
         let mut f = TestCall::new();
         let expiry = now_ms() + 3_600_000;

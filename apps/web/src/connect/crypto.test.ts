@@ -1,7 +1,8 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import integrityVectors from "../../../../crates/gwar-connect/tests/integrity-vectors.json";
 import { decodeBase64Url, encodeBase64Url } from "../net/base64url";
 import {
+  CERTIFICATE_BACKDATE_MS,
   CHALLENGE_MS,
   CLOCK_SKEW_MS,
   checkChallenge,
@@ -130,6 +131,29 @@ describe("verifying certificates", () => {
     expect(await verifyDeviceCertificate(ACCOUNT_KEY, { ...cert, device_key: ACCOUNT_KEY })).toBe(false);
     expect(await verifyDeviceCertificate(DEVICE_KEY, cert)).toBe(false);
   });
+
+  it.each([-300_000, -180_000, -2_600, 2_600, 180_000, 300_000])(
+    "issues immediately usable certificates with issuer clock skew %i ms",
+    async skew => {
+      const serverNow = 1_800_000_000_000;
+      const issuerNow = serverNow + skew, peerNow = serverNow - skew;
+      const clock = vi.spyOn(Date, "now").mockReturnValue(issuerNow);
+      try {
+        const account = await keyFromSeed(fill(32, 1));
+        // No explicit timestamps: exercise the issuer used by registration,
+        // login, recovery and renewal in both web and desktop.
+        const cert = await certifyDevice(account, DEVICE_KEY);
+        expect(cert.issued_at).toBe(issuerNow - CERTIFICATE_BACKDATE_MS);
+        expect(cert.expires_at - cert.issued_at).toBe(90 * DAY);
+        expect(cert.expires_at).toBe(issuerNow + 90 * DAY - CERTIFICATE_BACKDATE_MS);
+        for (const now of [issuerNow, serverNow, peerNow]) {
+          expect(cert.issued_at).toBeLessThanOrEqual(now);
+          expect(cert.expires_at).toBeGreaterThan(now);
+        }
+        expect(await verifyDeviceCertificate(ACCOUNT_KEY, cert)).toBe(true);
+      } finally { clock.mockRestore(); }
+    },
+  );
 
   it("rejects lifetimes servers refuse, even when signed", async () => {
     const account = await keyFromSeed(fill(32, 1));
