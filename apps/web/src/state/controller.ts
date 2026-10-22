@@ -58,6 +58,7 @@ import type { pruneRequest } from "../lib/prune";
 import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, IdentityUnsupportedError, type Identity } from "../net/identity";
 import { isDesktop } from "../platform";
 import { createVoiceEngine } from "../voice";
+import { ScreenController } from "./screen-controller";
 import { microphoneSsrc } from "../voice/sdp";
 import { VoiceError, type VoiceEngine } from "../voice/engine";
 import { channelThreadKey, latestMessageId, myChannelId, sortedChannels, storedKey } from "./reducer";
@@ -225,6 +226,8 @@ class Controller {
   private readTimer: ReturnType<typeof setTimeout> | null = null;
   /** The voice channel I was in when the connection dropped; rejoined after the resync. */
   private rejoin: number | null = null;
+  /** Screen sharing and watching (docs/screen-share.md). */
+  readonly screen = new ScreenController(() => this.conn, describeRequestError);
 
   constructor() {
     this.engine = createVoiceEngine();
@@ -244,6 +247,7 @@ class Controller {
   init(): void {
     if (this.initialised) return;
     this.initialised = true;
+    this.screen.init();
     const e = this.engine;
     e.on("level", (level) => useVoice.getState().set({ level }));
     e.on("state", (state) => {
@@ -561,6 +565,8 @@ class Controller {
     const session = useSession.getState();
     conn.onWelcome((welcome, resync) => {
       if (this.conn !== conn) return;
+      // A new session: shares and watches of the one before ended with it.
+      this.screen.reset();
       this.entered.clear();
       // Joins asked before this Welcome can no longer settle (their session ended): drop their spinner
       // before any rejoin below shows its own.
@@ -651,6 +657,7 @@ class Controller {
           if (notificationAllowed(result)) alert?.();
         }).catch(() => {}).finally(() => { this.messagePending--; });
       } else session.dispatch({ type: "event", event, now: Date.now() });
+      if (event.ev.startsWith("screen.")) this.screen.handleEvent(event);
       if (event.ev === "chat.read" && "conversation" in event.d) void this.sealed?.refreshUnread(event.d.conversation).catch(() => {});
       if (event.ev === "voice.closed" && (() => {
         const state = useSession.getState();
@@ -691,6 +698,7 @@ class Controller {
           // A new session starts outside voice: remember where to go back to.
           this.rejoin ??= myChannelId(useSession.getState());
           session.dispatch({ type: "phase", phase: "reconnecting" });
+          this.screen.reset();
           void this.stopVoice();
           break;
         case "closed":
@@ -738,6 +746,7 @@ class Controller {
     // device lease is released by the runtime's close below.
     this.voiceRun++;
     this.endVoiceCall();
+    this.screen.reset();
     const stopped = this.engine.stop();
     this.runtimeAbort?.abort(); this.runtimeAbort = null;
     this.sealed?.close(); this.sealed = null;

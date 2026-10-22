@@ -11,6 +11,7 @@ import type { Client } from "../proto/Client";
 import type { Event } from "../proto/Event";
 import type { Member } from "../proto/Member";
 import type { Permission } from "../proto/Permission";
+import type { ScreenShare } from "../proto/ScreenShare";
 import type { Welcome } from "../proto/Welcome";
 import { AUDIO_SLOTS } from "../net/protocol";
 import { MEMBER_GROUP, permissionsOf } from "../lib/permissions";
@@ -32,6 +33,7 @@ export const initialState: SessionState = {
   managers: null,
   iceServers: [],
   slots: Array.from({ length: AUDIO_SLOTS }, () => null),
+  shares: {},
   threads: {},
   activeThread: "channel",
   viewChannel: null,
@@ -423,7 +425,8 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
       const { [`ch:${event.d.channel}`]: _thread, ...threads } = state.threads;
       const fallback = myChannelId(state) ?? state.server?.default_channel ?? null;
       const viewChannel = state.viewChannel !== event.d.channel ? state.viewChannel : fallback === event.d.channel ? null : fallback;
-      return { ...state, channels, threads, viewChannel };
+      const channel = event.d.channel;
+      return { ...state, channels, threads, viewChannel, shares: withoutShares(state.shares, s => s.channel === channel) };
     }
     case "client.joined":
     case "client.updated": {
@@ -431,6 +434,8 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
       const prev = state;
       const prevMyChannel = myChannelId(state);
       let next: SessionState = upsertMember({ ...state, clients: { ...state.clients, [client.id]: client } }, client, now);
+      // A client that is no longer sharing has no share: its stop may have been told to its viewers only.
+      if (!client.sharing) next = { ...next, shares: withoutShares(next.shares, s => s.client === client.id) };
       if (client.id === state.me?.session) {
         next.permissions = computePermissions(next, next.permissions);
         const ch = client.channel;
@@ -453,7 +458,8 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
     }
     case "client.left": {
       const gone = state.clients[event.d.client];
-      let next = removeClient(state, event.d.client);
+      const left = event.d.client;
+      let next = removeClient({ ...state, shares: withoutShares(state.shares, s => s.client === left) }, left);
       // Still known, now offline (unless another session of the same user remains).
       if (gone && !Object.values(next.clients).some((c) => c.uid === gone.uid)) next = upsertMember(next, gone, now);
       return channelNotices(state, next, now, event.d.client);
@@ -500,8 +506,15 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
       return { ...state, slots: state.slots.map(() => null) };
     }
     case "voice.state": case "voice.epoch.ack": case "voice.epoch.request": return state;
-    // Shares reach the interface with the screen-sharing UI (docs/screen-share.md, PR 4).
-    case "screen.started": case "screen.stopped": case "screen.viewers": case "screen.link": case "screen.slot": return state;
+    case "screen.started":
+      return state.channels[event.d.channel] ? { ...state, shares: { ...state.shares, [event.d.share]: event.d } } : state;
+    case "screen.stopped":
+      // `access` told to one viewer ends only that viewer's watch: the share runs on, and goes
+      // with its sharer's `sharing` or its channel when it really ended or was hidden.
+      if (event.d.reason === "access" || !state.shares[event.d.share]) return state;
+      return { ...state, shares: withoutShares(state.shares, s => s.share === event.d.share) };
+    // The screen controller keeps these (state/screen.ts).
+    case "screen.viewers": case "screen.link": case "screen.slot": return state;
     case "challenge":
     case "disconnected":
       return state;
@@ -575,6 +588,7 @@ export function reduce(state: SessionState, action: Action): SessionState {
         managers: w.managers ?? null,
         iceServers: w.ice_servers,
         slots: initialState.slots,
+        shares: Object.fromEntries((w.shares ?? []).filter(s => channels[s.channel]).map(s => [s.share, s])),
         // Private and plaintext server history survives a resync; encrypted scrollback is reloaded.
         threads: action.resync ? Object.fromEntries(Object.entries(state.threads).filter(([k]) => !k.startsWith("ch:") && !(k === "server" && w.server.server_chat.encrypted))) : {},
         epoch: state.epoch + 1,
@@ -668,6 +682,16 @@ export function reduce(state: SessionState, action: Action): SessionState {
 }
 
 // ---------------------------------------------------------------- selectors
+
+function withoutShares(shares: SessionState["shares"], drop: (share: ScreenShare) => boolean): SessionState["shares"] {
+  const kept = Object.entries(shares).filter(([, s]) => !drop(s));
+  return kept.length === Object.keys(shares).length ? shares : Object.fromEntries(kept);
+}
+
+/** The running share of a client, if it shares. */
+export function shareOf(state: Pick<SessionState, "shares">, client: number): ScreenShare | undefined {
+  return Object.values(state.shares).find(s => s.client === client);
+}
 
 export function hasPermission(state: Pick<SessionState, "permissions">, p: Permission): boolean {
   return state.permissions.includes(p);
