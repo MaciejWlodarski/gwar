@@ -363,6 +363,7 @@ export const en = {
   "screen.encryptedSoon": "Screen sharing in encrypted channels is coming soon.",
   "screen.unsupported": "This browser can't share the screen.",
   "screen.insecure": "Screen sharing needs a secure connection (https).",
+  "screen.needsMacos14": "Screen sharing needs macOS 14 or later.",
   "screen.desktopSoon": "Screen sharing in the desktop app is coming soon. Use the browser for now.",
   "screen.noPermission": "You can't share your screen in this channel.",
   "screen.channelFull": "This channel already has as many screen shares as allowed.",

@@ -2,11 +2,13 @@
  * Glue between the server's screen protocol (`screen.*`), the media layer (`voice/screen.ts`)
  * and the screen store (`state/screen.ts`). Plaintext channels only: in an encrypted channel
  * nothing is captured or sent, and nothing is watched, until encrypted shares land (PR 7).
- * The desktop app enables sharing in PR 5; until then it neither shares nor watches.
+ * The desktop app runs the same transports in its webview, beside the native voice engine: it
+ * shares on macOS 14+ and Windows, watches on macOS and Windows, and does neither on Linux.
  */
+import { create } from "zustand";
 import { tNow } from "../i18n";
 import { RequestError, type Link } from "../net/connection";
-import { isDesktop } from "../platform";
+import { isDesktop, tauri } from "../platform";
 import type { Event } from "../proto/Event";
 import type { ScreenStopReason } from "../proto/ScreenStopReason";
 import { nextMediaRun } from "../voice/engine";
@@ -16,22 +18,53 @@ import { useScreen, type ScreenAction } from "./screen";
 import { useSession, useUi } from "./stores";
 
 /** Why this device cannot share here, or "ok". */
-export type ShareAvailability = "ok" | "desktop" | "teamspeak" | "unsupported" | "insecure" | "encrypted" | "forbidden";
+export type ShareAvailability = Exclude<ScreenSupport, "ok"> | "ok" | "teamspeak" | "encrypted" | "forbidden";
 
 /** How long `screen.watch` is retried while the server has not seen the watch transport connect. */
 const WATCH_UNAVAILABLE_MS = 5_000;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-/** Whether this build and browser can share or watch at all, before any channel rule. */
-export function screenSupport(): "ok" | "desktop" | "unsupported" | "insecure" {
-  if (isDesktop()) return "desktop";
+/**
+ * The desktop shell's answer (`screen_capture_support`, src-tauri/src/screen.rs): macOS 14+ and
+ * Windows share, older macOS does not (owner decision), and Linux, whose WebKitGTK has no
+ * WebRTC, neither shares nor watches. Null in the browser, and until the shell answers.
+ */
+export type DesktopCapture = "ok" | "macos_too_old" | "unsupported";
+export const useDesktopCapture = create<{ capture: DesktopCapture | null }>(() => ({ capture: null }));
+
+/**
+ * Whether this build and browser can share at all, before any channel rule. "hidden": the
+ * desktop app where sharing does not exist (Linux) or is not known yet; "macos": macOS before 14.
+ */
+export type ScreenSupport = "ok" | "hidden" | "macos" | "unsupported" | "insecure";
+
+export function screenSupport(desktop: DesktopCapture | null = useDesktopCapture.getState().capture): ScreenSupport {
+  if (isDesktop()) {
+    if (desktop === null || desktop === "unsupported") return "hidden";
+    if (desktop === "macos_too_old") return "macos";
+  }
   return captureSupport();
 }
 
-/** Whether this browser can watch (receiving needs WebRTC, not `getDisplayMedia`). */
-export function canWatch(): boolean {
-  return !isDesktop() && typeof RTCPeerConnection === "function";
+/** Whether this browser or app can watch (receiving needs WebRTC, not `getDisplayMedia`). */
+export function canWatch(desktop: DesktopCapture | null = useDesktopCapture.getState().capture): boolean {
+  if (isDesktop() && (desktop === null || desktop === "unsupported")) return false;
+  return typeof RTCPeerConnection === "function";
+}
+
+/** `screenSupport()` for components: renders again once the desktop shell answers. */
+export const useScreenSupport = (): ScreenSupport => screenSupport(useDesktopCapture(s => s.capture));
+export const useCanWatch = (): boolean => canWatch(useDesktopCapture(s => s.capture));
+
+/** Asks the desktop shell once; a failure leaves sharing and watching off. */
+async function loadDesktopCapture(): Promise<void> {
+  try {
+    const capture = await (await tauri()).invoke<DesktopCapture>("screen_capture_support");
+    useDesktopCapture.setState({ capture });
+  } catch (e) {
+    console.warn("[screen] capture support:", e);
+  }
 }
 
 function dispatch(action: ScreenAction): void {
@@ -67,6 +100,7 @@ export class ScreenController {
   init(): void {
     if (this.initialised) return;
     this.initialised = true;
+    if (isDesktop()) void loadDesktopCapture();
     useSession.subscribe((s, prev) => {
       if (myChannelId(s) !== myChannelId(prev) && useScreen.getState().own) this.endOwn();
     });
@@ -79,7 +113,8 @@ export class ScreenController {
    * before it (a user gesture and a focused document are required). The preset menu follows.
    */
   beginShare(): void {
-    if (useScreen.getState().own) return;
+    // The button refuses these too; the controller never relies on it.
+    if (useScreen.getState().own || screenSupport() !== "ok") return;
     const attempt = ++this.attempts;
     let picked: Promise<MediaStream>;
     try {

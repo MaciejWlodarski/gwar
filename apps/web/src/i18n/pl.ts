@@ -365,6 +365,7 @@ export const pl: Record<Key, string> = {
   "screen.encryptedSoon": "Udostępnianie ekranu na kanałach szyfrowanych już wkrótce.",
   "screen.unsupported": "Ta przeglądarka nie potrafi udostępnić ekranu.",
   "screen.insecure": "Udostępnianie ekranu wymaga bezpiecznego połączenia (https).",
+  "screen.needsMacos14": "Udostępnianie ekranu wymaga systemu macOS 14 lub nowszego.",
   "screen.desktopSoon": "Udostępnianie ekranu w aplikacji na komputer już wkrótce. Na razie użyj przeglądarki.",
   "screen.noPermission": "Nie możesz udostępniać ekranu na tym kanale.",
   "screen.channelFull": "Na tym kanale jest już tyle udostępnień ekranu, ile wolno.",

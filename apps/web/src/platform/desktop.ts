@@ -1,11 +1,13 @@
 /**
  * Desktop-only wiring between the shared UI state and the Tauri shell:
- * global shortcuts (push-to-talk, mute, deafen), the system tray and the
- * close-to-tray option. Everything here is a no-op in the browser.
+ * global shortcuts (push-to-talk, mute, deafen), the system tray (with
+ * "Stop sharing screen" while sharing) and the close-to-tray option.
+ * Everything here is a no-op in the browser.
  */
 import { tNow } from "../i18n";
 import { controller } from "../state/controller";
 import { useSettings } from "../state/settings";
+import { useScreen } from "../state/screen";
 import { useSession, useUi, useVoice } from "../state/stores";
 import { isDesktop, tauri, type TauriBridge, type Unlisten } from ".";
 
@@ -63,6 +65,7 @@ export function initDesktop(): (() => void) | undefined {
     const act = (action: string) => {
       if (action === "mute") controller.toggleMute();
       else if (action === "deafen") controller.toggleDeafen();
+      else if (action === "stop_share") void controller.screen.stopShare();
     };
     cleanup(await api.listen<{ action: string }>("shortcut://action", (p) => act(p.action)));
     cleanup(await api.listen<{ action: string }>("tray://action", (p) => act(p.action)));
@@ -91,12 +94,15 @@ export function initDesktop(): (() => void) | undefined {
     cleanup(useSettings.subscribe(sync));
 
     // Keep the tray menu in step with the UI.
+    const sharing = () => useScreen.getState().own !== null;
     const pushTray = () => {
       const { muted, deafened } = useVoice.getState();
-      void api.invoke("tray_set_state", { muted, deafened });
+      void api.invoke("tray_set_state", { muted, deafened, sharing: sharing() });
     };
     pushTray();
     cleanup(useVoice.subscribe((s, prev) => (s.muted !== prev.muted || s.deafened !== prev.deafened ? pushTray() : undefined)));
+    // "Stop sharing screen" in the tray, from the picker until the share ends.
+    cleanup(useScreen.subscribe((s, prev) => ((s.own !== null) !== (prev.own !== null) ? pushTray() : undefined)));
 
     await debugAutoconnect(api);
   })();
