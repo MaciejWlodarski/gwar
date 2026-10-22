@@ -89,12 +89,15 @@ export class MessageStorage {
         blocked = true;
         reject(new Error("Message storage is being upgraded in another tab"));
       };
-      // Pre-release: no upgrades. A database of an older schema fails to open (storage unavailable);
-      // the reason, not the abort it causes, is what diagnostics report.
+      // Pre-release: no upgrades. A database of an older schema is emptied and made anew, as if the
+      // browser had cleared it (which this protection already does not cover): what it held is only
+      // this device's record of messages it saw. Should that fail, the reason, not the abort it
+      // causes, is what diagnostics report.
       let upgrade: unknown;
       request.onupgradeneeded = () => {
         const db = request.result;
         try {
+          for (const store of [...db.objectStoreNames]) db.deleteObjectStore(store);
           db.createObjectStore("checkpoints").createIndex("at", "at");
           db.createObjectStore("revocations");
           db.createObjectStore("feeds");

@@ -371,8 +371,9 @@ this protection; missing predecessors remain **continuity unproven**. Visible
 message/context fingerprints share cached and in-flight verification. Thread
 updates check only new fingerprints; the minute timer refreshes time-dependent
 authorization notes with one bulk read and no checkpoint writes. Before the
-release there are no upgrades: a database of an older schema does not open, and
-storage counts as unavailable (with the reason in diagnostics). A failed storage
+release there are no upgrades: a database of an older schema is emptied and made
+anew, as if the browser had cleared it (if even that fails, storage counts as
+unavailable, with the reason in diagnostics). A failed storage
 transaction is tried once more on a new connection; a tab blocking an upgrade makes
 storage unavailable at once rather than pending. A message checked while storage was
 unavailable shows **checkpoints unavailable** until storage works again: then (at

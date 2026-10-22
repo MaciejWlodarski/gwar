@@ -109,16 +109,19 @@ describe("per-record storage work", () => {
       expect(await store.cursor()).toBe(0);
     } finally { open.mockRestore(); warn.mockRestore(); }
   });
-  it("reports why a database of an older schema does not open", async () => {
-    const name = crypto.randomUUID(), warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    (await older(name, 2)).close();
+  it("empties a database of an older schema and makes it anew", async () => {
+    const name = crypto.randomUUID(), old = await older(name, 2);
+    await new Promise<void>((resolve, reject) => {
+      const tx = old.transaction("checkpoints", "readwrite");
+      tx.objectStore("checkpoints").put({ ...checkpoint(5, "old"), order: 1 }, "key");
+      tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error);
+    });
+    old.close();
     const store = new MessageStorage(name);
-    try {
-      await expect(store.checkpoint("key", checkpoint(), "-")).rejects.toThrow();
-      await expect(store.cursor()).rejects.toThrow();
-      expect(store.error).toMatch(/^ConstraintError: /);
-      expect(warn).toHaveBeenCalledOnce();
-    } finally { warn.mockRestore(); }
+    expect(await store.cursor()).toBe(0);
+    // The old record is gone: an earlier revision is a first sighting, not a rollback.
+    expect((await store.checkpoint("key", checkpoint(1, "new"), "-")).continuity).not.toBe("rollback");
+    expect(store.error).toBeUndefined();
   });
   it("opens again after the browser closes the connection", async () => {
     const store = new MessageStorage(crypto.randomUUID()), connection = () => (store as unknown as { connection: IDBDatabase }).connection;
