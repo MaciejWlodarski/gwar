@@ -46,6 +46,11 @@ pub const RELEASE_BURST_FLOOR: f64 = 2.0 * 1200.0;
 pub const AVERAGE_WINDOW: Duration = Duration::from_secs(2);
 /// A slot whose average with the higher-priority ones exceeds `B` this long is paused.
 const OVER_FOR: Duration = Duration::from_secs(5);
+/// A slot that starts carrying a share is not paused for this long: the estimate needs it to
+/// grow from its last value (2.5 Mbps on a fresh transport) toward the share's rate and the
+/// keyframe room the SFU probes for. str0m probes an application-limited sender every 5 s, so
+/// this covers two rounds.
+pub const RAMP: Duration = Duration::from_secs(10);
 /// Two failed keyframes within ten seconds pause a slot.
 const FAILURES: usize = 2;
 const FAILURE_WINDOW: Duration = Duration::from_secs(10);
@@ -61,6 +66,14 @@ pub const KEYFRAME_FLOOR: usize = 200 * 1024;
 const KEYFRAME_MEMORY: Duration = Duration::from_secs(30);
 /// Probing target over the watched shares' caps.
 const DESIRED_HEADROOM: f64 = 1.1;
+/// The probing target is at most this far above the estimate. str0m probes at up to twice the
+/// target (every 5 s while the viewer is application-limited), so a target far above the
+/// estimate sends clusters that queue on the viewer's link for longer than voice absorbs: two
+/// 4 Mbps caps on a 5 Mbps downlink made 26 Mbps probes and an 83 ms queue in the paired runs
+/// (docs/screen-share.md, "Voice headroom and acceptance"). Stepping the target up with the
+/// estimate kept the queue under 17 ms there, and the estimate still grows by the probes'
+/// results; a tighter reach starved that growth in the simulated links.
+const PROBE_REACH: f64 = 2.0;
 
 /// One original packet waiting for its viewer, already mapped onto the slot's segment.
 #[derive(Debug, Clone)]
@@ -190,6 +203,8 @@ pub struct Lane {
     key: Option<u32>,
     failed: Option<u32>,
     failures: VecDeque<Instant>,
+    /// Until then (`RAMP` after the share was assigned) failures and averages do not count.
+    ramp: Option<Instant>,
     over_since: Option<Instant>,
     fits_since: Option<Instant>,
 }
@@ -197,6 +212,10 @@ pub struct Lane {
 impl Lane {
     fn active(&self) -> bool {
         self.assigned && self.paused.is_none()
+    }
+
+    fn ramping(&self, now: Instant) -> bool {
+        self.ramp.is_some_and(|until| now < until)
     }
 }
 
@@ -328,10 +347,11 @@ impl Egress {
             && assigned().any(|l| l.paused == Some(ScreenPauseReason::Bandwidth))
     }
 
-    /// The slot carries a new share, `order`-th watched (lower is earlier): a fresh lane.
-    pub fn assign(&mut self, lane: usize, order: u64) {
+    /// The slot carries a new share, `order`-th watched (lower is earlier): a fresh lane, not
+    /// paused before `RAMP` has passed.
+    pub fn assign(&mut self, lane: usize, order: u64, now: Instant) {
         self.clear(lane);
-        self.lanes[lane] = Lane { assigned: true, order, ..Lane::default() };
+        self.lanes[lane] = Lane { assigned: true, order, ramp: Some(now + RAMP), ..Lane::default() };
     }
 
     /// The slot carries nothing any more.
@@ -400,7 +420,9 @@ impl Egress {
         self.counters.evicted += l.queue.len() as u64;
         if keyframe && l.key.is_some() && l.failed != l.key {
             l.failed = l.key;
-            l.failures.push_back(now);
+            if !l.ramping(now) {
+                l.failures.push_back(now);
+            }
             self.counters.failed_keyframes += 1;
         }
         self.clear(lane);
@@ -554,7 +576,7 @@ impl Egress {
         for &lane in &order {
             sum += average(lane);
             let l = &mut self.lanes[lane];
-            if sum > plan {
+            if sum > plan && !l.ramping(now) {
                 let since = *l.over_since.get_or_insert(now);
                 if now.saturating_duration_since(since) >= OVER_FOR {
                     over = Some(lane);
@@ -593,7 +615,8 @@ impl Egress {
     }
 
     /// The bitrate the BWE should probe for: the watched shares' caps with headroom, and
-    /// room for the largest recent keyframe within the deadline. `None` with nothing watched.
+    /// room for the largest recent keyframe within the deadline, within `PROBE_REACH` of the
+    /// estimate. `None` with nothing watched.
     pub fn desired(&self, caps: &[u64], rates: &[ShareRate]) -> Option<u64> {
         let watched: Vec<usize> = (0..self.lanes.len()).filter(|&l| self.lanes[l].assigned).collect();
         if watched.is_empty() {
@@ -606,7 +629,8 @@ impl Egress {
             .max()
             .unwrap_or(0)
             .max(KEYFRAME_FLOOR);
-        Some((caps * DESIRED_HEADROOM + keyframe as f64 * 8.0 / DEADLINE.as_secs_f64()) as u64)
+        let target = caps * DESIRED_HEADROOM + keyframe as f64 * 8.0 / DEADLINE.as_secs_f64();
+        Some(target.min(PROBE_REACH * self.estimate) as u64)
     }
 
     /// Active slots and their watch order, for the server-wide budget.
@@ -647,7 +671,7 @@ mod tests {
         let mut e = Egress::new(now);
         for lane in 0..lanes {
             e.add_lane();
-            e.assign(lane, lane as u64);
+            e.assign(lane, lane as u64, now - RAMP);
         }
         e.set_estimate(estimate, now);
         e
@@ -759,6 +783,54 @@ mod tests {
         assert_eq!(e.allocate(now, &rates, true), None, "ten seconds of room");
         now += Duration::from_secs(1);
         assert_eq!(e.allocate(now, &rates, true), Some((0, Change::Resume)));
+    }
+
+    #[test]
+    fn the_probing_target_covers_caps_and_keyframes_within_reach_of_the_estimate() {
+        let now = Instant::now();
+        let e = egress(20_000_000, 2, now);
+        let rates = [ShareRate { largest_keyframe: 300 * 1024, ..Default::default() }, ShareRate::default()];
+        // 1.1 × (4 + 2.5) Mbps, and 300 KB within the deadline.
+        let target = (6_500_000.0 * 1.1 + 300.0 * 1024.0 * 8.0 / 0.4) as u64;
+        assert_eq!(e.desired(&[4_000_000, 2_500_000], &rates), Some(target));
+        // A small keyframe still reserves 200 KB.
+        let floor = (4_400_000.0 + 200.0 * 1024.0 * 8.0 / 0.4) as u64;
+        assert_eq!(e.desired(&[4_000_000, 0], &[ShareRate::default(); 2]), Some(floor));
+        let low = egress(3_000_000, 2, now);
+        assert_eq!(low.desired(&[4_000_000, 2_500_000], &rates), Some(6_000_000));
+        assert_eq!(Egress::new(now).desired(&[4_000_000], &rates), None);
+    }
+
+    #[test]
+    fn a_new_slot_is_not_paused_while_its_estimate_ramps_up() {
+        let mut now = Instant::now();
+        let mut e = Egress::new(now);
+        e.add_lane();
+        e.assign(0, 1, now);
+        // 8 Mbps with 200 KB keyframes on the initial 2.5 Mbps: over B and over admission.
+        let rates = [ShareRate { average: 8_000_000.0, last_keyframe: 200 * 1024, largest_keyframe: 200 * 1024 }];
+        let start = now;
+        for frame in 1..=5 {
+            for n in 0..170 {
+                if !e.admit(0, packet(n, frame, n == 0, 1200, now), now).is_empty() {
+                    break;
+                }
+            }
+            now += Duration::from_millis(1900);
+            assert_eq!(e.allocate(now, &rates, true), None, "{:?} into the ramp", now - start);
+        }
+        assert!(e.counters.failed_keyframes >= 5);
+        // Past the ramp both triggers count again: the averages first need their 5 s.
+        now = start + RAMP;
+        for frame in [6, 7] {
+            for n in 0..170 {
+                if !e.admit(0, packet(n, frame, n == 0, 1200, now), now).is_empty() {
+                    break;
+                }
+            }
+            now += Duration::from_secs(1);
+        }
+        assert_eq!(e.allocate(now, &rates, true), Some((0, Change::Pause(ScreenPauseReason::Bandwidth))));
     }
 
     #[test]

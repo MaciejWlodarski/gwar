@@ -48,7 +48,7 @@ use str0m::{
     rtp::{ExtensionValues, RtpWrite, Ssrc},
 };
 use tokio::{net::UdpSocket, sync::mpsc, sync::oneshot, time::sleep_until};
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use egress::{Change, Egress, Queued, ShareMeter, ShareRate};
 pub use egress::{EgressCounters, INITIAL_ESTIMATE};
@@ -703,7 +703,7 @@ impl Sfu {
                 self.watches += 1;
                 match w.slots.get_mut(slot as usize) {
                     Some(_) => {
-                        assign(w, slot as usize, grant, self.watches);
+                        assign(w, slot as usize, grant, self.watches, now);
                         self.ask_keyframe(session, slot as usize, now);
                     }
                     None => w.pending.push((slot, grant, self.watches)),
@@ -1033,7 +1033,8 @@ impl Sfu {
         let run = w.run;
         match change {
             Change::Pause(reason) => {
-                debug!(session, share, ?reason, "screen slot paused");
+                let (estimate, counters) = (w.egress.estimate(), w.egress.counters);
+                debug!(session, share, ?reason, estimate, ?counters, "screen slot paused");
                 self.signal(ScreenSignal::Paused { session, run, share, reason });
             }
             Change::Resume => {
@@ -1357,6 +1358,7 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                 }
                 RtcEvent::IceConnectionStateChange(IceConnectionState::Disconnected) => w.rtc.disconnect(),
                 RtcEvent::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => {
+                    trace!(session = w.session, estimate = estimate.as_u64(), "screen watch estimate");
                     w.egress.set_estimate(estimate.as_u64(), now);
                 }
                 RtcEvent::MediaAdded(added) if added.kind == MediaKind::Video => {
@@ -1364,7 +1366,7 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                         let index = add_slot(w, added.mid);
                         if let Some(at) = w.pending.iter().position(|(slot, _, _)| *slot as usize == index) {
                             let (_, grant, order) = w.pending.remove(at);
-                            assign(w, index, grant, order);
+                            assign(w, index, grant, order, now);
                             requests.push(index);
                         }
                     }
@@ -1396,6 +1398,15 @@ fn allocate(
         .collect();
     let caps: Vec<u64> = w.slots.iter().map(|s| s.grant.as_ref().map_or(0, |g| g.origin.cap_bps)).collect();
     let desired = w.egress.desired(&caps, &lanes);
+    let c = w.egress.counters;
+    trace!(
+        session = w.session,
+        estimate = w.egress.estimate(),
+        c.original_bytes,
+        c.extra_bytes,
+        c.extras_dropped,
+        "screen watch egress"
+    );
     if desired != w.desired {
         if let Some(desired) = desired {
             w.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired));
@@ -1447,13 +1458,13 @@ fn add_slot(w: &mut Watcher, mid: Mid) -> usize {
 
 /// Points a slot at a new share, `order`-th watched: a new segment from its next keyframe, a
 /// fresh RTX cache and queue.
-fn assign(w: &mut Watcher, index: usize, grant: Arc<WatchGrant>, order: u64) {
+fn assign(w: &mut Watcher, index: usize, grant: Arc<WatchGrant>, order: u64, now: Instant) {
     empty(w, index);
     let focused = w.focus.as_deref() == Some(grant.share.as_str());
     let slot = &mut w.slots[index];
     slot.grant = Some(grant);
     slot.generation = slot.generation.wrapping_add(1);
-    w.egress.assign(index, order);
+    w.egress.assign(index, order, now);
     if focused {
         w.egress.focus(Some(index));
     }
@@ -1932,7 +1943,7 @@ pub(crate) mod tests {
         let mut pair = Pair::new();
         let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
         let grant = WatchGrant::new(origin.clone());
-        assign(&mut pair.w, 0, grant.clone(), 1);
+        assign(&mut pair.w, 0, grant.clone(), 1, pair.now);
         let now = pair.now;
         for n in 0..10u64 {
             let forward = Forward {
@@ -1976,7 +1987,7 @@ pub(crate) mod tests {
         let mut pair = Pair::new();
         let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
         let grant = WatchGrant::new(origin.clone());
-        assign(&mut pair.w, 0, grant.clone(), 1);
+        assign(&mut pair.w, 0, grant.clone(), 1, pair.now);
         let now = pair.now;
         for n in 0..10u64 {
             let forward = Forward {

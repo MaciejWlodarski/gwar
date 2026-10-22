@@ -223,7 +223,7 @@ impl Sim {
         let slot = self.shares.len();
         let origin = ScreenOrigin::new(1 + slot as SessionId, name.into(), 1, false, false, 8_000_000);
         let grant = WatchGrant::new(origin.clone());
-        assign(&mut self.w, slot, grant, slot as u64 + 1);
+        assign(&mut self.w, slot, grant, slot as u64 + 1, self.now);
         self.shares.push(Share {
             origin,
             slot,
@@ -449,7 +449,7 @@ impl Sim {
 
 #[cfg(test)]
 mod tests {
-    use super::super::egress::{DEADLINE, EXTRAS, PLAN, RELEASE_BURST, RELEASE_BURST_FLOOR, extras_burst};
+    use super::super::egress::{DEADLINE, EXTRAS, PLAN, RAMP, RELEASE_BURST, RELEASE_BURST_FLOOR, extras_burst};
     use super::*;
 
     const SECOND: Duration = Duration::from_secs(1);
@@ -523,7 +523,7 @@ mod tests {
             let mut sim = Sim::new(rate);
             let t = text(&mut sim);
             // Warm-up: the estimate grows from its initial 2.5 Mbps by probing.
-            sim.run(6 * SECOND);
+            sim.run(RAMP);
             keyframes(&mut sim, t);
             sim.run(20 * SECOND);
             let context = summary(&sim);
@@ -551,7 +551,8 @@ mod tests {
     fn keyframes_overflowing_admission_pause_a_3_mbps_viewer_for_good() {
         let mut sim = Sim::new(Some(3_000_000));
         let t = text(&mut sim);
-        sim.run(6 * SECOND);
+        // Failures count once the slot's ramp is over.
+        sim.run(RAMP);
         keyframes(&mut sim, t);
         sim.run(20 * SECOND);
         let context = summary(&sim);
@@ -573,7 +574,8 @@ mod tests {
         sim.run(8 * SECOND);
         assert_eq!(sim.changes, [], "the stage share alone fits: {}", summary(&sim));
         let t = text(&mut sim);
-        sim.run(SECOND);
+        // Past the new slot's ramp, when its failures start to count.
+        sim.run(RAMP);
         keyframes(&mut sim, t);
         sim.run(12 * SECOND);
         let context = summary(&sim);
@@ -582,7 +584,8 @@ mod tests {
         let paused = pauses(&sim, 1);
         assert_eq!(paused.len(), 1, "{context}");
         let second = sim.shares[1].keyframes.iter().filter(|k| k.1 == KEYFRAME).nth(1).unwrap().0 - sim.start;
-        assert!(paused[0] <= second + ALLOCATION_TICK, "paused within two keyframes: {context}");
+        // The second keyframe fails at its deadline.
+        assert!(paused[0] <= second + DEADLINE + ALLOCATION_TICK, "paused within two keyframes: {context}");
         assert!(pauses(&sim, 0).is_empty(), "{context}");
         assert_eq!(sim.shares[0].refused, 0, "the stage share lost nothing: {context}");
         let stage_late = sim
@@ -615,12 +618,16 @@ mod tests {
         }
     }
 
-    /// 4 Mbps on a 10 Mbps downlink that drops to 1 Mbps after 8 s, and back after 15 s.
+    /// When `collapse` drops the link: past the slot's ramp.
+    const COLLAPSE: Duration = Duration::from_secs(12);
+
+    /// 4 Mbps on a 10 Mbps downlink that drops to 1 Mbps after `COLLAPSE`, and back after 15 s.
+
     fn collapse(cap: bool) -> (Sim, u64, u64) {
         let mut sim = Sim::new(Some(10_000_000));
         sim.w.egress.cap = cap;
         sim.watch("game", 4_000_000, 30, 60_000, None);
-        sim.run(8 * SECOND);
+        sim.run(COLLAPSE);
         assert_eq!(sim.changes, [], "{}", summary(&sim));
         sim.down.rate = Some(1_000_000);
         sim.run(15 * SECOND);
@@ -636,8 +643,8 @@ mod tests {
         let context = summary(&sim);
         assert!(sim.oldest_original(0) <= DEADLINE, "{context}");
         let paused = pauses(&sim, 0);
-        assert!(!paused.is_empty() && paused[0] > 8 * SECOND, "{context}");
-        assert!(paused[0] < 8 * SECOND + 10 * SECOND, "paused soon after the collapse: {context}");
+        assert!(!paused.is_empty() && paused[0] > COLLAPSE, "{context}");
+        assert!(paused[0] < COLLAPSE + 10 * SECOND, "paused soon after the collapse: {context}");
     }
 
     #[test]
