@@ -22,7 +22,7 @@ use std::{
 use anyhow::{Result, anyhow};
 use futures::StreamExt;
 use gwar_proto::SessionId;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
 use tsclientlib::{
     ChannelId as TsChannelId, Connection, DisconnectOptions, Identity, MessageTarget, OutCommandExt, StreamItem,
@@ -32,6 +32,7 @@ use tsproto_packets::packets::{AudioData, CodecType, Direction, Flags, OutAudio,
 
 use crate::{
     core::CoreHandle,
+    media::screen::Lease,
     media::{AudioKind, AudioOrigin, AudioPacket, AudioRoute, MediaPlane, SourceClock, opus},
 };
 
@@ -493,7 +494,61 @@ pub enum PuppetCmd {
         text: MessageText,
         channel: Option<ChannelText>,
     },
+    /// One channel post with a delivery receipt. A single command prevents partial enqueue.
+    Post {
+        text: MessageText,
+        channel: ChannelText,
+        delivery: PostDelivery,
+    },
     Quit,
+}
+
+/// A post's result. Losing the connection after dispatch cannot prove whether it arrived:
+/// only `Failed` permits a fallback channel post without risking a duplicate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PostResult {
+    Delivered,
+    Failed,
+    Unknown,
+}
+
+/// Follows a post through the command queue, a pending move and TeamSpeak's command result.
+/// Dropping an unsent command reports failure; dropping an in-flight one reports uncertainty.
+#[derive(Debug)]
+pub struct PostDelivery {
+    lease: Arc<Lease>,
+    reply: Option<oneshot::Sender<PostResult>>,
+    dispatched: bool,
+}
+
+impl PostDelivery {
+    pub fn new(lease: Arc<Lease>) -> (Self, oneshot::Receiver<PostResult>) {
+        let (reply, result) = oneshot::channel();
+        (Self { lease, reply: Some(reply), dispatched: false }, result)
+    }
+
+    pub(super) fn current(&self) -> bool {
+        self.lease.alive() && self.reply.as_ref().is_some_and(|reply| !reply.is_closed())
+    }
+
+    pub(super) fn dispatched(&mut self) {
+        self.dispatched = true;
+    }
+
+    pub(super) fn complete(mut self, delivered: bool) {
+        let result = if delivered { PostResult::Delivered } else { PostResult::Failed };
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(result);
+        }
+    }
+}
+
+impl Drop for PostDelivery {
+    fn drop(&mut self) {
+        if let Some(reply) = self.reply.take() {
+            let _ = reply.send(if self.dispatched { PostResult::Unknown } else { PostResult::Failed });
+        }
+    }
 }
 
 /// A chat message on its way to TeamSpeak. Its `Debug` gives only its length: commands are
@@ -689,7 +744,7 @@ async fn run(
     let mut ingress_waiters = IngressWaiters::default();
     let mut voice = spec.voice;
     let mut moving: Option<Moving> = None;
-    let mut waiting: Vec<(u64, String)> = Vec::new();
+    let mut waiting: Vec<ChannelPost> = Vec::new();
     enum Step {
         Uplink(AudioPacket),
         Flush,
@@ -915,6 +970,7 @@ async fn run(
                                 Ok(()) => {}
                             }
                         }
+                        Some(Pending::Post(delivery)) => delivery.complete(result.is_ok()),
                         Some(Pending::Command(command)) => match result {
                             // E.g. a move into the channel the puppet is already in.
                             Err(e) if format!("{e:?}").contains("AlreadyIn") => {}
@@ -978,24 +1034,29 @@ async fn run(
                     }
                     continue;
                 }
-                if matches!(cmd, PuppetCmd::Text { .. }) && !audio.is_current() {
+                if matches!(cmd, PuppetCmd::Text { .. } | PuppetCmd::Post { .. }) && !audio.is_current() {
                     continue;
                 }
-                if let PuppetCmd::Text { channel: Some(target), text, .. } = cmd {
-                    match channel_text(own_channel(&con), moving.as_ref().map(|m| m.cid), route, target) {
-                        TextNow::Send => send_channel_text(&mut con, &mut pending, text.0),
-                        TextNow::Wait if waiting.len() < 64 => waiting.push((target.cid, text.0)),
-                        TextNow::Wait | TextNow::Drop => {
-                            debug!(session = spec.session, "channel text dropped across a move")
+                let (target, text, delivery) = match cmd {
+                    PuppetCmd::Text { channel: Some(target), text, .. } => (target, text, None),
+                    PuppetCmd::Post { channel, text, delivery } => (channel, text, Some(delivery)),
+                    cmd => {
+                        let label = format!("{cmd:?}").split([' ', '(']).next().unwrap_or_default().to_owned();
+                        if let Some(command) = command_for(clid, cmd)
+                            && let Ok(handle) = command.send_with_result(&mut con)
+                        {
+                            pending.insert(handle, Pending::Command(label));
                         }
+                        continue;
                     }
-                    continue;
-                }
-                let label = format!("{cmd:?}").split([' ', '(']).next().unwrap_or_default().to_owned();
-                if let Some(command) = command_for(clid, cmd)
-                    && let Ok(handle) = command.send_with_result(&mut con)
-                {
-                    pending.insert(handle, Pending::Command(label));
+                };
+                let post = ChannelPost { cid: target.cid, text, delivery };
+                match channel_text(own_channel(&con), moving.as_ref().map(|m| m.cid), route, target) {
+                    TextNow::Send => send_channel_text(&mut con, &mut pending, post),
+                    TextNow::Wait if waiting.len() < 64 => waiting.push(post),
+                    TextNow::Wait | TextNow::Drop => {
+                        debug!(session = spec.session, "channel text dropped across a move")
+                    }
                 }
             }
         }
@@ -1036,9 +1097,30 @@ fn own_channel(con: &Connection) -> Option<u64> {
     Some(state.clients.get(&state.own_client)?.channel.0)
 }
 
-fn send_channel_text(con: &mut Connection, pending: &mut HashMap<tsclientlib::MessageHandle, Pending>, text: String) {
-    if let Ok(handle) = command("sendtextmessage", &[("targetmode", "2".into()), ("msg", text)]).send_with_result(con) {
-        pending.insert(handle, Pending::Command("Text".into()));
+struct ChannelPost {
+    cid: u64,
+    text: MessageText,
+    delivery: Option<PostDelivery>,
+}
+
+fn send_channel_text(
+    con: &mut Connection,
+    pending: &mut HashMap<tsclientlib::MessageHandle, Pending>,
+    mut post: ChannelPost,
+) {
+    if post.delivery.as_ref().is_some_and(|delivery| !delivery.current()) {
+        return;
+    }
+    if let Ok(handle) =
+        command("sendtextmessage", &[("targetmode", "2".into()), ("msg", post.text.0)]).send_with_result(con)
+    {
+        let receipt = if let Some(mut delivery) = post.delivery.take() {
+            delivery.dispatched();
+            Pending::Post(delivery)
+        } else {
+            Pending::Command("Text".into())
+        };
+        pending.insert(handle, receipt);
     }
 }
 
@@ -1047,14 +1129,14 @@ fn flush_channel_text(
     con: &mut Connection,
     pending: &mut HashMap<tsclientlib::MessageHandle, Pending>,
     moving: bool,
-    waiting: &mut Vec<(u64, String)>,
+    waiting: &mut Vec<ChannelPost>,
 ) {
-    let Some(&(cid, _)) = waiting.first() else { return };
+    let Some(cid) = waiting.first().map(|post| post.cid) else { return };
     if moving || own_channel(con) != Some(cid) {
         return;
     }
-    for (_, text) in std::mem::take(waiting) {
-        send_channel_text(con, pending, text);
+    for post in std::mem::take(waiting) {
+        send_channel_text(con, pending, post);
     }
 }
 
@@ -1160,6 +1242,7 @@ fn is_opus(codec: CodecType) -> bool {
 
 enum Pending {
     Command(String),
+    Post(PostDelivery),
     Nickname { base: String, variant: u32, generation: u64 },
 }
 
@@ -1214,7 +1297,7 @@ fn command_for(clid: u16, cmd: PuppetCmd) -> Option<OutCommand> {
             }
             command("sendtextmessage", &args)
         }
-        PuppetCmd::Quit => return None,
+        PuppetCmd::Post { .. } | PuppetCmd::Quit => return None,
     })
 }
 
@@ -1309,6 +1392,25 @@ mod tests {
             assert_eq!(whisper, again);
             assert!(new > old, "spurt {new} does not follow {old}");
         }
+    }
+
+    #[test]
+    fn post_receipts_distinguish_dropped_rejected_delivered_and_uncertain_commands() {
+        let (delivery, mut result) = PostDelivery::new(Lease::new());
+        drop(delivery);
+        assert_eq!(result.try_recv().unwrap(), PostResult::Failed);
+
+        for delivered in [false, true] {
+            let (mut delivery, mut result) = PostDelivery::new(Lease::new());
+            delivery.dispatched();
+            delivery.complete(delivered);
+            assert_eq!(result.try_recv().unwrap(), if delivered { PostResult::Delivered } else { PostResult::Failed });
+        }
+
+        let (mut delivery, mut result) = PostDelivery::new(Lease::new());
+        delivery.dispatched();
+        drop(delivery);
+        assert_eq!(result.try_recv().unwrap(), PostResult::Unknown);
     }
 
     #[test]

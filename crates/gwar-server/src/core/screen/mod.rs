@@ -47,6 +47,8 @@ pub(super) struct Share {
     link_revoked: bool,
     /// SHA-256 of the watch link's token while the link works (`guests::open_watch_link`).
     link: Option<[u8; 32]>,
+    /// Cancels queued TeamSpeak posts as soon as the link ends.
+    link_lease: Option<Arc<Lease>>,
     viewers: BTreeSet<SessionId>,
     /// TeamSpeak guests watching through the link; they count among the share's viewers.
     guests: BTreeSet<SessionId>,
@@ -186,6 +188,7 @@ impl Core {
             guest_link: start.guest_link,
             link_revoked: false,
             link: None,
+            link_lease: None,
             viewers: BTreeSet::new(),
             guests: BTreeSet::new(),
             origin: ScreenOrigin::new(session, id.clone(), channel, false, private),

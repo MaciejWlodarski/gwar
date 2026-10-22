@@ -1927,13 +1927,22 @@ design left room:
   per TeamSpeak user and share, by TeamSpeak identity (client ids are reused);
   users in the channel when the link was posted count as told only if the
   post went out, and anyone counts as told only once a message to them did.
-  If the post failed, those in the channel get it privately instead. The " · sharing screen" marker follows the sharer's
+  If the signed channel post fails, those in the channel get it privately instead.
+  The " · sharing screen" marker follows the sharer's
   name in the channel description's presence line, which lists users without a
   puppet (the line puppets do not need).
 - **ServerQuery posts only to readers.** Without a puppet, or when the
   puppet's queue does not take the post, the signed ServerQuery post is made
   only when TeamSpeak users are in the channel; one who arrives later gets the
-  late-joiner message instead.
+  late-joiner message instead. Enqueue is not delivery: the puppet keeps a receipt
+  through moves and TeamSpeak's command result. Readers count as told only after
+  success. A definite rejection or a command dropped before dispatch uses the
+  signed fallback; a lost connection after dispatch leaves delivery unknown and
+  does not repeat the channel post. Each receipt belongs to one post attempt.
+  The core ends the link's cancellation lease synchronously on revocation or
+  share end; queued posts and fallbacks check it before sending. A post too long
+  for one puppet command goes entirely through ServerQuery, avoiding partial
+  enqueue and duplicate fallback posts.
 - **The page** is plain TypeScript (no React, no app stores), about 8 KB
   gzipped with its CSS. It keeps the token in the fragment (a reload works
   after a lost connection), pings every 20 s once admitted, and shows
@@ -1949,8 +1958,12 @@ design left room:
 - **Tests.** `crates/gwar-server/tests/watch_links.rs` runs guests over real
   SRTP against a channel standing in for the bridge, including the PreAuth
   limits by /64 and the 60 s idle close of a guest that stops pinging. The
-  bridge tests cover the puppet post, the signed ServerQuery post, late
-  joiners, encrypted channels, members-only servers and the description.
+  bridge tests cover confirmed puppet delivery, rejection, a dropped queued
+  post, uncertain delivery without duplicate fallback, stale receipts and
+  cancellation during a query move. Query tests cover cancellation in the
+  socket queue and before a flood retry. They also cover the signed
+  ServerQuery post, late joiners, encrypted channels, members-only servers
+  and the description.
   `apps/web/e2e/watch.mjs` runs Chromium and WebKit guest pages against a
   server built with `test-hooks`, whose stand-in bridge
   (`GWAR_TEST_WATCH_LINKS`) prints each link: the acceptance order, watching,

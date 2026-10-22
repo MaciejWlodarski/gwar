@@ -5,6 +5,7 @@
 
 use std::{collections::BTreeMap, net::SocketAddr, sync::Arc, time::Duration};
 
+use crate::media::screen::Lease;
 use anyhow::{Context, Result, bail};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -188,6 +189,8 @@ struct Request {
     line: String,
     /// `None` for internal keepalives.
     reply: Option<Reply>,
+    /// A watch link's lifetime, checked at the socket as well as before a flood retry.
+    lease: Option<Arc<Lease>>,
 }
 
 struct Lines {
@@ -350,13 +353,21 @@ impl Query {
 
     /// Run a command. A non-zero error id comes back as a [`QueryError`] inside the `anyhow::Error`.
     pub async fn call(&self, cmd: Cmd) -> Result<Vec<Record>> {
+        self.call_guarded(cmd, None).await
+    }
+
+    pub(super) async fn call_while(&self, cmd: Cmd, lease: Arc<Lease>) -> Result<Vec<Record>> {
+        self.call_guarded(cmd, Some(lease)).await
+    }
+
+    async fn call_guarded(&self, cmd: Cmd, lease: Option<Arc<Lease>>) -> Result<Vec<Record>> {
         let line = cmd.line();
-        match self.send(&line).await {
+        match self.send(&line, lease.clone()).await {
             Err(e) => match e.downcast_ref::<QueryError>().and_then(flood_wait) {
                 Some(wait) => {
                     tracing::warn!(target: "teamspeak::query", "flood protection, retrying in {wait:?}");
                     sleep(wait + Duration::from_millis(250)).await;
-                    self.send(&line).await
+                    self.send(&line, lease).await
                 }
                 None => Err(e),
             },
@@ -364,11 +375,14 @@ impl Query {
         }
     }
 
-    async fn send(&self, line: &str) -> Result<Vec<Record>> {
+    async fn send(&self, line: &str, lease: Option<Arc<Lease>>) -> Result<Vec<Record>> {
+        if lease.as_ref().is_some_and(|lease| !lease.alive()) {
+            bail!("watch link ended");
+        }
         let (reply, rx) = oneshot::channel();
         self.connection
             .tx
-            .send(Request { line: line.to_owned(), reply: Some(reply) })
+            .send(Request { line: line.to_owned(), reply: Some(reply), lease })
             .await
             .map_err(|_| anyhow::anyhow!("query connection closed"))?;
         match timeout(CALL_TIMEOUT, rx).await {
@@ -427,7 +441,11 @@ async fn run(
                 }
             }
             request = requests.recv(), if current.is_none() => {
-                let Some(Request { line, reply }) = request else { return };
+                let Some(Request { line, reply, lease }) = request else { return };
+                if lease.as_ref().is_some_and(|lease| !lease.alive()) {
+                    // Dropping the reply returns an error to the caller without writing the token.
+                    continue;
+                }
                 if write.write_all(format!("{line}\n").as_bytes()).await.is_err() {
                     return;
                 }
@@ -516,6 +534,10 @@ pub(super) mod tests {
 
     /// Fake server speaking with `\n\r` terminators like the real one; `eol` lets a test pick another.
     async fn fake_server(eol: &'static str) -> SocketAddr {
+        fake_server_cancelling(eol, None).await
+    }
+
+    async fn fake_server_cancelling(eol: &'static str, cancel_on_flood: Option<Arc<Lease>>) -> SocketAddr {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
@@ -544,6 +566,9 @@ pub(super) mod tests {
                     "boom" => format!("error id=2568 msg=insufficient\\sclient\\spermissions failed_permid=4{eol}"),
                     "flood" if !flooded => {
                         flooded = true;
+                        if let Some(lease) = &cancel_on_flood {
+                            lease.end();
+                        }
                         format!("error id=524 msg=client\\sis\\sflooding extra_msg=please\\swait\\s1\\sseconds{eol}")
                     }
                     "flood" => format!("ok=1{eol}error id=0 msg=ok{eol}"),
@@ -725,6 +750,40 @@ pub(super) mod tests {
         assert_eq!(clone.call(Cmd::new("whoami")).await.unwrap()[0]["client_id"], "100");
         drop(clone);
         assert!(matches!(server.event().await, ChannelEvent::Closed(1)));
+    }
+
+    #[tokio::test]
+    async fn an_ended_watch_link_is_not_written_from_the_query_queue() {
+        let mut server = channel_server().await;
+        let (query, _notes) = Query::listen_channel(server.addr, "p ss", 1).await.unwrap();
+        assert!(matches!(server.event().await, ChannelEvent::Ready { .. }));
+        let lease = Lease::new();
+        lease.end();
+        // Bypass the call-site guard to test the final check in the socket task.
+        let (reply, result) = oneshot::channel();
+        query
+            .connection
+            .tx
+            .send(Request {
+                line: "sendtextmessage targetmode=2 msg=ended-watch-link".into(),
+                reply: Some(reply),
+                lease: Some(lease),
+            })
+            .await
+            .unwrap();
+        assert!(result.await.is_err());
+        // The fake server rejects unexpected text; a successful probe proves none was written.
+        assert_eq!(query.call(Cmd::new("whoami")).await.unwrap()[0]["client_id"], "100");
+    }
+
+    #[tokio::test]
+    async fn an_ended_watch_link_is_not_retried_after_flood_protection() {
+        let lease = Lease::new();
+        let addr = fake_server_cancelling("\n\r", Some(lease.clone())).await;
+        let (query, _notes) = Query::connect(addr, "serveradmin", "p ss", 1).await.unwrap();
+        let result = query.call_while(Cmd::new("flood"), lease).await;
+        assert!(result.unwrap_err().to_string().contains("watch link ended"));
+        query.call(Cmd::new("servernotifyregister").arg("event", "server")).await.unwrap();
     }
 
     async fn interleaving(eol: &'static str) {

@@ -34,7 +34,14 @@ pub enum BridgeNote {
     /// A share of our user `session` in `channel` was announced with a TeamSpeak watch link: the
     /// bridge posts it there and keeps it, in memory only, for TeamSpeak users who come later
     /// (docs/screen-share.md, "TeamSpeak watch links").
-    WatchLink { share: String, session: SessionId, channel: ChannelId, url: super::WatchUrl },
+    WatchLink {
+        share: String,
+        session: SessionId,
+        channel: ChannelId,
+        url: super::WatchUrl,
+        /// Ended synchronously by the core, before the bridge processes `WatchLinkGone`.
+        lease: std::sync::Arc<crate::media::screen::Lease>,
+    },
     /// That link stopped working (the share ended or the link was turned off): forget it.
     WatchLinkGone { share: String },
 }

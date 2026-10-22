@@ -114,11 +114,14 @@ impl Core {
         let token = URL_SAFE_NO_PAD.encode(raw);
         let hash = token_hash(&token);
         let (session, channel) = (share.sharer, share.channel);
-        self.shares.get_mut(id).expect("found above").link = Some(hash);
+        let lease = Lease::new();
+        let share = self.shares.get_mut(id).expect("found above");
+        share.link = Some(hash);
+        share.link_lease = Some(lease.clone());
         self.watch_links.insert(hash, id.to_owned());
         let url = WatchUrl(format!("{base}{token}"));
         let share = id.to_owned();
-        self.notify_bridge(|| BridgeNote::WatchLink { share, session, channel, url });
+        self.notify_bridge(|| BridgeNote::WatchLink { share, session, channel, url, lease });
         let audience = self.link_audience(id);
         self.broadcast(Event::ScreenLink { share: id.to_owned(), active: true }, |s| audience.contains(&s.id));
     }
@@ -127,6 +130,9 @@ impl Core {
     /// every guest is told why and let go, all before this returns.
     pub(super) fn close_watch_link(&mut self, id: &str, end: LinkEnd) {
         let Some(share) = self.shares.get_mut(id) else { return };
+        if let Some(lease) = share.link_lease.take() {
+            lease.end();
+        }
         let guests = std::mem::take(&mut share.guests);
         if let Some(hash) = share.link.take() {
             self.watch_links.remove(&hash);
@@ -412,6 +418,7 @@ mod tests {
                     guest_link: true,
                     link_revoked: false,
                     link: Some(hash),
+                    link_lease: Some(Lease::new()),
                     viewers: (10_000..10_000 + viewers).collect(),
                     guests: BTreeSet::new(),
                     origin: ScreenOrigin::new(sharer, "S".into(), channel, false, false),
@@ -536,6 +543,24 @@ mod tests {
         core.guest(GuestMsg::Gone { guest }).await;
         let viewers = on_core(&core, |core| core.shares["S"].guests.len()).await;
         assert_eq!(viewers, 0);
+    }
+
+    #[tokio::test]
+    async fn ending_or_revoking_a_link_cancels_its_queued_posts_before_the_bridge_reads_its_note() {
+        for end in [LinkEnd::Ended(ScreenStopReason::Stopped), LinkEnd::TurnedOff] {
+            let (core, mut notes) = core_with_bridge().await;
+            linked_share(&core, 0).await;
+            let lease = on_core(&core, |core| {
+                core.close_watch_link("S", LinkEnd::TurnedOff);
+                core.open_watch_link("S");
+                core.shares["S"].link_lease.as_ref().unwrap().clone()
+            })
+            .await;
+            assert!(lease.alive());
+            on_core(&core, move |core| core.close_watch_link("S", end)).await;
+            assert!(!lease.alive(), "the bridge need not process the queued note to cancel its post");
+            assert!(notes.try_recv().is_ok());
+        }
     }
 
     #[tokio::test]
