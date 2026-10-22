@@ -150,6 +150,7 @@ struct SlotCounters {
     samples: AtomicU64,
     concealments: AtomicU64,
     late_drops: AtomicU64,
+    overflow_drops: AtomicU64,
     target_samples: AtomicU64,
     staged_samples: AtomicU64,
     shrink_samples: AtomicU64,
@@ -165,6 +166,8 @@ pub struct SlotStats {
     pub queued_samples: u64,
     pub concealments: u64,
     pub late_drops: u64,
+    /// Queued packets dropped, oldest first, because the queue was full.
+    pub overflow_drops: u64,
     pub target_samples: u64,
     pub staged_samples: u64,
     pub shrink_samples: u64,
@@ -286,6 +289,7 @@ impl VoiceHandle {
                     queued_samples: s.samples.load(Ordering::Relaxed),
                     concealments: s.concealments.load(Ordering::Relaxed),
                     late_drops: s.late_drops.load(Ordering::Relaxed),
+                    overflow_drops: s.overflow_drops.load(Ordering::Relaxed),
                     target_samples: s.target_samples.load(Ordering::Relaxed),
                     staged_samples: s.staged_samples.load(Ordering::Relaxed),
                     shrink_samples: s.shrink_samples.load(Ordering::Relaxed),
@@ -736,6 +740,7 @@ fn pipeline<const CAPTURE: usize>(
             stats.samples.store(samples, Ordering::Relaxed);
             stats.concealments.store(buffer.concealments, Ordering::Relaxed);
             stats.late_drops.store(buffer.late_drops, Ordering::Relaxed);
+            stats.overflow_drops.store(buffer.overflow_drops, Ordering::Relaxed);
             stats.target_samples.store(buffer.target_samples(), Ordering::Relaxed);
             stats.staged_samples.store(slot.staged_samples() as u64, Ordering::Relaxed);
             stats.shrink_samples.store(buffer.shrink_samples, Ordering::Relaxed);

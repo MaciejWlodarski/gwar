@@ -729,6 +729,7 @@ async fn run(
                 "staged_samples": stats.staged_samples,
                 "concealments": stats.concealments,
                 "late_drops": stats.late_drops,
+                "overflow_drops": stats.overflow_drops,
                 "shrink_samples": stats.shrink_samples,
                 "trim_events": stats.trim_events,
                 "concealments_after_trim": stats.concealments_after_trim,

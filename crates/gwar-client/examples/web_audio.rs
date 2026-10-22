@@ -289,7 +289,7 @@ impl Native {
             "underrunSamples": stats.underrun_samples,
             "slots": stats.slots.iter().map(|s| json!({
                 "generation": s.generation, "concealments": s.concealments,
-                "lateDrops": s.late_drops, "targetSamples": s.target_samples,
+                "lateDrops": s.late_drops, "overflowDrops": s.overflow_drops, "targetSamples": s.target_samples,
             })).collect::<Vec<_>>(),
         })
     }

@@ -322,10 +322,11 @@ artificial delay in both ms and samples are recorded too.
 `receiver_playout` is the receiver's final live snapshot: speaker queue level,
 latest and held maximum callback sizes, scheduling headroom, active-stream
 underrun events and samples, and per-slot target/queue/staged samples,
-concealment events, late drops, shrunk samples, `trim_events` and
+concealment events, late drops, `overflow_drops` (queued packets dropped, oldest
+first, because the queue was full), shrunk samples, `trim_events` and
 `concealments_after_trim` (concealments within one second after a trim). A trim
-event is one fractional correction or one stall-recovery batch; these counters
-include both. Proximity is diagnostic correlation, not proof that a trim caused
+event is one fractional correction or one stall-recovery batch (after an arrival
+or a refill stall); these counters include both. Overflow drops are not trims. Proximity is diagnostic correlation, not proof that a trim caused
 the concealment. All sample counts use 48 kHz mono; divide by 48 for ms. These cumulative counters include warmup; raw
 receiver underflows also include idle callbacks, whereas playout underruns count
 only callbacks during playback.
@@ -367,6 +368,26 @@ including onsets in lookahead packets. Correlated speech need not wait for the
 old nonquiet deadline; uncorrelated audio never uses that deadline to force a
 cut. Quiet audio retains the <=240-sample skip and 120-sample boundary fade.
 Burst recovery still discards whole packets and fades as before.
+
+Queue overflow and refill stalls (2026-10-22). The queue holds at most 64
+packets. When it was full, a new packet was dropped, so a queue that filled while
+the output device was paused kept its oldest audio: on resume it played the
+stale 640 ms (10 ms packets), then concealed the hole after it, and the packets
+arriving during that concealment found the queue full again. With refills
+resuming one packet per 10 ms that repeated every 0.74 s (64 packets, then
+100 ms of PLC), 200 concealments in 15 s on both clocks. Overflow now drops the
+oldest packet instead; when that moves past the playout position, playback
+continues at the oldest kept packet and fades in. The window's marks restart
+(they counted the dropped audio), but the last observation stays, so a refill
+stall is still measured. A refill that comes after a gap leaves the stream
+behind by the gap less its own demand; if that is a stall (100 ms) or more, it
+recovers like an arrival stall: queued packets that start within that lag are
+discarded, down to the target and the pending refill, never past the newest
+packet. Large periodic refills (120 ms of demand every 120 ms) lag nothing and
+trim nothing. A 150 ms refill stall drops 150 ms; a backlog from before it stays
+for the drain. The decoded tail staged in the slot (at most one packet) still
+plays. The web client uses the browser's WebRTC receiver (NetEq), not this
+buffer.
 
 A 10 ms packet cannot contain two periods of low-pitched speech. Only when a
 correction is eligible, the decoder stages already queued contiguous packets

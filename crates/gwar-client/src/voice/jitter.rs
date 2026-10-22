@@ -282,6 +282,10 @@ pub struct JitterBuffer {
     last_attempt: Option<Instant>,
     pub(crate) concealments: u64,
     pub(crate) late_drops: u64,
+    /// Queued packets dropped, oldest first, to keep the queue within `MAX_PACKETS`.
+    pub(crate) overflow_drops: u64,
+    /// Overflow dropped the packets before the playout position: the next one fades in.
+    skipped: bool,
     pub(crate) shrink_samples: u64,
     pub(crate) trim_events: u64,
     pub(crate) concealments_after_trim: u64,
@@ -293,6 +297,8 @@ pub struct JitterBuffer {
 const FRAME: u64 = 960; // TS packet-counter stride and unknown-stream default.
 const MAX_CONCEAL: u64 = 4800; // 100 ms of audio, independent of packet duration.
 const STALL: Duration = Duration::from_millis(100);
+const STALL_SAMPLES: u64 = 4800;
+const RECOVERY: Duration = Duration::from_millis(200);
 const MAX_PACKETS: usize = 64;
 const MAX_TARGET: u64 = 7680; // 160 ms, independent of packet duration.
 const QUIET_SHRINK: Duration = Duration::from_secs(1);
@@ -346,6 +352,8 @@ impl JitterBuffer {
             last_attempt: None,
             concealments: 0,
             late_drops: 0,
+            overflow_drops: 0,
+            skipped: false,
             shrink_samples: 0,
             trim_events: 0,
             concealments_after_trim: 0,
@@ -393,8 +401,7 @@ impl JitterBuffer {
                     Clock::Rtp => behind,
                     Clock::Sequence => behind.div_ceil(last_samples) * FRAME,
                 };
-                self.recovering =
-                    Some(Recovery { until: now + Duration::from_millis(200), before: last_ts.saturating_add(advance) });
+                self.recovering = Some(Recovery { until: now + RECOVERY, before: last_ts.saturating_add(advance) });
             }
         }
         self.clock = clock;
@@ -425,11 +432,21 @@ impl JitterBuffer {
         } else {
             self.arrival = Some((ts, now, samples));
         }
-        // Bound memory without discarding the imminent playout packet.
-        if self.packets.len() >= MAX_PACKETS {
-            return;
-        }
         self.packets.insert(ts, Packet { data, samples, step: if clock == Clock::Sequence { FRAME } else { samples } });
+        // Bound memory by keeping the newest audio. Keeping the oldest instead (while refills
+        // stop, say) played seconds-old audio on resume, then concealed the hole after it,
+        // which the arrivals during the concealment refilled only to be dropped again.
+        while self.packets.len() > MAX_PACKETS {
+            let Some((oldest, _)) = self.packets.pop_first() else { break };
+            self.overflow_drops += 1;
+            if self.next.is_some_and(|next| next <= oldest) {
+                self.next = self.packets.first_key_value().map(|(&ts, _)| ts);
+                self.held = 0;
+                self.skipped = true;
+            }
+            // The marks counted audio that is gone now.
+            self.forget_marks();
+        }
     }
 
     pub(crate) fn depth(&self) -> (usize, u64) {
@@ -464,6 +481,7 @@ impl JitterBuffer {
         self.arrivals.clear();
         self.last_shrink = None;
         self.last_attempt = None;
+        self.skipped = false;
     }
 
     pub fn pop(&mut self) -> Playout {
@@ -500,13 +518,47 @@ impl JitterBuffer {
         self.surplus = 0;
     }
 
+    /// Restart the window but keep the last observation: refills go on, and a refill stall
+    /// is still measured from it.
+    fn forget_marks(&mut self) {
+        let last_observation = self.last_observation;
+        self.clear_depth();
+        self.last_observation = last_observation;
+        self.above_since = None;
+    }
+
     /// Buffered audio (holes included) + decoded tail immediately before each refill. At the
     /// low-water point only the pending refill and the safety margin are required; what the
     /// refill timing adds is in `refresh_surplus`. Arrival phase is never audio credit. A full
     /// five seconds of observations must support a surplus, and any lower sample vetoes a
     /// correction immediately.
     pub(crate) fn observe_depth(&mut self, now: Instant, staged: usize, demand: usize) {
+        if let Some(at) = self.last_observation {
+            self.resume(samples_between(at, now), demand as u64, now);
+        }
         self.observe(now, staged as i64 - demand as i64, demand as i64 - staged as i64);
+    }
+
+    /// Refills `gap` samples apart, this one for `demand`: live media moved on by the gap, and
+    /// whatever this refill does not consume of it is behind the live stream (the output
+    /// device paused, or the refill thread stalled). A lag of a stall or more recovers like an
+    /// arrival stall: the queued audio behind it is dropped, down to the target depth. Large
+    /// periodic refills consume what arrived in between and lag nothing.
+    fn resume(&mut self, gap: u64, demand: u64, now: Instant) {
+        let lag = gap.saturating_sub(demand);
+        let Some(head) = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)) else { return };
+        let Some((&last, packet)) = self.packets.last_key_value() else { return };
+        if lag < STALL_SAMPLES {
+            return;
+        }
+        let advance = match self.clock {
+            Clock::Rtp => lag,
+            Clock::Sequence => lag / self.last_samples * FRAME,
+        };
+        // Never past the newest packet: once that plays, the stream is live again.
+        let before = head.saturating_add(advance).min(last + packet.step);
+        let before = self.recovering.as_ref().map_or(before, |r| r.before.max(before));
+        self.recovering = Some(Recovery { until: now + RECOVERY, before });
     }
 
     /// `surplus` is the staged audio less the demand; `pending` is the demand not yet met from
@@ -704,12 +756,16 @@ impl JitterBuffer {
             return Playout::Idle;
         }
         let mut fade = false;
+        if demand > 0 {
+            fade = std::mem::take(&mut self.skipped);
+        }
         if let Some(recovery) = &self.recovering {
             // Only discard media that starts behind the stalled timeline's deadline, and
             // retain enough audio for this refill as well as the pre-stall target. A packet
             // straddling the deadline goes too: kept, it stayed as up to one packet of excess
             // delay that the fractional drain rarely removes before the next stall.
             let mut depth = self.depth().1;
+            let mut trimmed = false;
             while self.packets.len() > 1 {
                 let (&ts, packet) = self.packets.first_key_value().unwrap();
                 if ts >= recovery.before || depth - packet.samples < self.target_samples().max(demand as u64) {
@@ -718,15 +774,16 @@ impl JitterBuffer {
                 let (_, packet) = self.packets.pop_first().unwrap();
                 depth -= packet.samples;
                 self.shrink_samples += packet.samples;
-                fade = true;
+                trimmed = true;
             }
-            if fade {
+            if trimmed {
                 self.next = self.packets.first_key_value().map(|(&ts, _)| ts);
                 self.held = 0;
                 self.trim_events += 1;
                 self.last_shrink = Some(now);
                 self.clear_depth();
                 self.above_since = None;
+                fade = true;
             }
         }
         let Some(mut next) = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)) else {
@@ -1471,15 +1528,13 @@ mod tests {
     #[test]
     fn arrival_history_stays_bounded_while_refills_stop() {
         for clock in [Clock::Rtp, Clock::Sequence] {
-            let (concealments, cut_early, cut) = refills_stop(clock, false);
-            let (reserve_concealments, ..) = refills_stop(clock, true);
             // The look-back into dropped history gives no margin: nothing is cut before a
-            // full window of new observations, and the resumed stream (the full queue holds
-            // the oldest packets, so it conceals across the gap after them) conceals no more
-            // than under the reserve rule. The backlog then drains.
-            assert_eq!(cut_early, 0, "{clock:?}");
-            assert!(concealments <= reserve_concealments, "{clock:?}: {concealments} > {reserve_concealments}");
-            assert!(cut > 0, "{clock:?}");
+            // full window of new observations. Resuming drops the backlog (see
+            // `a_full_queue_keeps_the_newest_audio_and_resumes_near_live`), and nothing conceals.
+            for reserve_only in [false, true] {
+                let (concealments, cut_early, _) = refills_stop(clock, reserve_only);
+                assert_eq!((concealments, cut_early), (0, 0), "{clock:?} {reserve_only}");
+            }
         }
     }
 
@@ -1499,5 +1554,146 @@ mod tests {
         arrivals.observe(next);
         assert_eq!((arrivals.pending, arrivals.dropped, arrivals.unobserved), (0, Some(next), arrivals.end()));
         assert!(arrivals.entries.iter().all(|&(at, _)| at == next));
+    }
+
+    /// Plays through `pop_for` as `Slot::mix_refill` does: one observation per refill, then
+    /// packets until the demand is met. Returns the keys played.
+    fn refill(jb: &mut JitterBuffer, now: Instant, demand: usize, played: &mut Vec<u64>) -> usize {
+        jb.observe_depth(now, 0, demand);
+        let (mut written, mut concealed) = (0, 0);
+        while written < demand {
+            match jb.pop_for(now, demand - written) {
+                Playout::Packet { data, .. } => {
+                    played.push(u64::from_le_bytes(data.try_into().unwrap()));
+                    written += 480;
+                }
+                Playout::Conceal(samples) => {
+                    concealed += 1;
+                    written += samples;
+                }
+                Playout::Idle => break,
+            }
+        }
+        concealed
+    }
+
+    #[test]
+    fn a_full_queue_keeps_the_newest_audio_and_resumes_near_live() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let stride = if clock == Clock::Sequence { FRAME } else { 480 };
+            let start = Instant::now();
+            let at = |k: u64| start + Duration::from_millis(k * 10);
+            let push =
+                |jb: &mut JitterBuffer, k: u64| jb.push_at(k * stride, 480, k.to_le_bytes().to_vec(), at(k), clock);
+            let mut jb = JitterBuffer::new();
+            let mut played = Vec::new();
+            for k in 0..50 {
+                push(&mut jb, k);
+                assert_eq!(refill(&mut jb, at(k), 480, &mut played), 0);
+            }
+            // The output device pauses for 20 s while the packets keep coming.
+            for k in 50..2050 {
+                push(&mut jb, k);
+            }
+            assert_eq!(jb.depth().0, MAX_PACKETS, "{clock:?}");
+            assert_eq!(jb.overflow_drops, 2000 - MAX_PACKETS as u64, "{clock:?}");
+            assert_eq!(jb.packets.first_key_value().map(|(&ts, _)| ts / stride), Some(2050 - MAX_PACKETS as u64));
+            // It resumes at the newest packets, at the target depth, and never conceals.
+            played.clear();
+            let mut concealments = 0;
+            for k in 2050..2550 {
+                push(&mut jb, k);
+                concealments += refill(&mut jb, at(k), 480, &mut played);
+                assert!(jb.depth().1 <= jb.target_samples(), "{clock:?} {k}: {:?}", jb.depth());
+                assert!(played.last().is_some_and(|&key| key + 1 >= k), "{clock:?} {k}: {:?}", played.last());
+            }
+            assert_eq!(concealments, 0, "{clock:?}");
+            assert_eq!(played.len(), 500, "{clock:?}");
+            assert!(played.windows(2).all(|pair| pair[1] == pair[0] + 1), "{clock:?}");
+            assert_eq!(jb.trim_events, 1, "{clock:?}");
+            assert_eq!(jb.shrink_samples, (MAX_PACKETS as u64 - 1) * 480, "{clock:?}");
+        }
+    }
+
+    #[test]
+    fn a_refill_stall_drops_only_what_the_stream_moved_on() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let stride = if clock == Clock::Sequence { FRAME } else { 480 };
+            let start = Instant::now();
+            let at = |k: u64| start + Duration::from_millis(k * 10);
+            let push =
+                |jb: &mut JitterBuffer, k: u64| jb.push_at(k * stride, 480, k.to_le_bytes().to_vec(), at(k), clock);
+            let mut jb = JitterBuffer::new();
+            let mut played = Vec::new();
+            for k in 0..50 {
+                push(&mut jb, k);
+                refill(&mut jb, at(k), 480, &mut played);
+            }
+            // A 90 ms lag is left to the drain (and stays as backlog here). A 150 ms lag is
+            // dropped at once, but only that: the backlog from before is the drain's.
+            let mut newest = 49;
+            for (stall, trimmed) in [(10, 0), (16, 1)] {
+                for k in newest + 1..=newest + stall {
+                    push(&mut jb, k);
+                }
+                newest += stall;
+                let before = jb.trim_events;
+                assert_eq!(refill(&mut jb, at(newest), 480, &mut played), 0, "{clock:?} {stall}");
+                assert_eq!(jb.trim_events - before, trimmed, "{clock:?} {stall}");
+                let behind = newest - played.last().unwrap();
+                assert_eq!(behind, 9, "{clock:?} {stall}");
+                for k in newest + 1..newest + 50 {
+                    push(&mut jb, k);
+                    assert_eq!(refill(&mut jb, at(k), 480, &mut played), 0, "{clock:?} {stall}");
+                }
+                newest += 49;
+            }
+            assert!(played.windows(2).all(|pair| pair[1] > pair[0]), "{clock:?}");
+            assert_eq!(jb.overflow_drops, 0, "{clock:?}");
+        }
+    }
+
+    #[test]
+    fn large_periodic_refills_are_not_a_stall() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let stride = if clock == Clock::Sequence { FRAME } else { 480 };
+            let start = Instant::now();
+            let mut jb = JitterBuffer::new();
+            let mut played = Vec::new();
+            let mut concealments = 0;
+            // 120 ms refills, each for what arrived since the previous one.
+            for k in 0..3000u64 {
+                jb.push_at(k * stride, 480, k.to_le_bytes().to_vec(), start + Duration::from_millis(k * 10), clock);
+                if k % 12 == 11 {
+                    concealments += refill(&mut jb, start + Duration::from_millis(k * 10), 12 * 480, &mut played);
+                }
+            }
+            assert_eq!((concealments, jb.trim_events, jb.overflow_drops), (0, 0, 0), "{clock:?}");
+            assert_eq!(played.len(), 3000, "{clock:?}");
+        }
+    }
+
+    #[test]
+    fn overflow_on_a_full_queue_drops_the_oldest_and_fades_in() {
+        let start = Instant::now();
+        let mut jb = JitterBuffer::new();
+        jb.push_at(0, 480, vec![0], start, Clock::Rtp);
+        assert_eq!(jb.pop_at(start), packet(0));
+        // A hole at the head holds playback while 65 later packets arrive at once.
+        for k in 2..=66u64 {
+            jb.push_at(k * 480, 480, vec![k as u8], start + Duration::from_millis(5), Clock::Rtp);
+        }
+        assert_eq!((jb.depth().0, jb.overflow_drops), (MAX_PACKETS, 1));
+        // Playback moved past the dropped packet; packet 1 is late now.
+        assert_eq!(jb.next, Some(3 * 480));
+        jb.push_at(480, 480, vec![1], start + Duration::from_millis(6), Clock::Rtp);
+        assert_eq!((jb.depth().0, jb.overflow_drops, jb.late_drops), (MAX_PACKETS, 1, 1));
+        assert!(
+            matches!(jb.pop_for(start + Duration::from_millis(10), 480), Playout::Packet { data, fade: true, .. } if data == vec![3])
+        );
+        assert!(
+            matches!(jb.pop_for(start + Duration::from_millis(20), 480), Playout::Packet { data, fade: false, .. } if data == vec![4])
+        );
+        assert_eq!(jb.concealments, 0);
     }
 }
