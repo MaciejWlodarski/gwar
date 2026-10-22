@@ -37,29 +37,48 @@ export function migrateLocalStorage(storage: Storage): void {
   }
 }
 
-let state: { error?: unknown } | undefined;
+let problem: unknown;
+const listeners = new Set<() => void>();
+
 /**
- * Whether the app may read and write its localStorage: migrated once per page, before the first
- * read. False when it holds a newer version's data or a migration failed (`localStorageError`): it
- * then stays untouched.
- * Storage that is unavailable altogether counts as usable: each reader already copes with that.
+ * Whether the app may read and write its localStorage now. Every call checks the stored version
+ * again (another tab of a newer version may have upgraded it meanwhile) and runs any migration
+ * first. Once it holds a newer version's data, or a migration failed (`localStorageError`), it stays
+ * unusable for this page and untouched. Storage that is unavailable altogether counts as usable:
+ * each reader already copes with that.
  */
 export function localStorageUsable(): boolean {
-  if (!state) {
-    state = {};
-    let storage: Storage | undefined;
-    try { storage = typeof localStorage === "undefined" ? undefined : localStorage; storage?.getItem(LOCAL_STORAGE_VERSION_KEY); } catch { storage = undefined; }
-    // A migration that failed (storage full) leaves its step to run again next time; until then
-    // nothing reads data of the old shape as the new one.
-    try { if (storage) migrateLocalStorage(storage); } catch (error) { state.error = error; }
+  if (problem !== undefined) return false;
+  let storage: Storage | undefined;
+  try { storage = typeof localStorage === "undefined" ? undefined : localStorage; storage?.getItem(LOCAL_STORAGE_VERSION_KEY); } catch { storage = undefined; }
+  if (!storage) return true;
+  // A failed migration (storage full) runs again on the next page; until then nothing reads data of
+  // the old shape as the new one.
+  try { migrateLocalStorage(storage); } catch (error) {
+    problem = error;
+    for (const listener of [...listeners]) listener();
+    return false;
   }
-  return state.error === undefined;
+  return true;
 }
 
-/** Why localStorage is not used this session, if it is not. */
+/** Why localStorage is not used, if it is not. */
 export function localStorageError(): unknown {
   localStorageUsable();
-  return state?.error;
+  return problem;
+}
+
+/**
+ * Calls `listener` once localStorage becomes unusable: at once if a newer version's tab upgrades it
+ * (the `storage` event), else at the next read or write.
+ */
+export function watchLocalStorage(listener: () => void): () => void {
+  listeners.add(listener);
+  const changed = (event: StorageEvent) => {
+    if (event.key === LOCAL_STORAGE_VERSION_KEY || event.key === null) localStorageUsable();
+  };
+  globalThis.addEventListener?.("storage", changed);
+  return () => { listeners.delete(listener); globalThis.removeEventListener?.("storage", changed); };
 }
 
 /** For zustand's `persist`: nothing is read or written while localStorage holds a newer version. */
@@ -70,3 +89,16 @@ export function guardedLocalStorage(storage: Storage | undefined) {
     removeItem: (name: string) => { if (localStorageUsable()) storage?.removeItem(name); },
   };
 }
+
+function gate(): void {
+  if (!localStorageUsable()) throw localStorageError();
+}
+/**
+ * localStorage for the app's own keys (pins, channel records, caches): it fails, as unavailable
+ * storage does, while localStorage holds a newer version's data. Every reader fails closed.
+ */
+export const appStorage: Pick<Storage, "getItem" | "setItem" | "removeItem"> = {
+  getItem: (key) => { gate(); return localStorage.getItem(key); },
+  setItem: (key, value) => { gate(); localStorage.setItem(key, value); },
+  removeItem: (key) => { gate(); localStorage.removeItem(key); },
+};

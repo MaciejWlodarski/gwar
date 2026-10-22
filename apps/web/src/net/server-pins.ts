@@ -1,4 +1,5 @@
 import { decodeFixed, normalizeEndpoint, serverPublicKey } from "./handshake";
+import { appStorage } from "../lib/local-storage";
 
 export interface ServerPin {
   server_pk: string;
@@ -21,7 +22,7 @@ export class ServerIdentityChanged extends Error {
 const PREFIX = "gwar.server-pin:";
 export const serverPins: PinStore = {
   load(endpoint) {
-    const value = localStorage.getItem(PREFIX + normalizeEndpoint(endpoint));
+    const value = appStorage.getItem(PREFIX + normalizeEndpoint(endpoint));
     if (value === null) return undefined;
     const pin: ServerPin = JSON.parse(value);
     decodeFixed(pin.server_pk, 32);
@@ -31,10 +32,10 @@ export const serverPins: PinStore = {
   commit(endpoint, key) {
     const old = this.load(endpoint);
     if (old && old.server_pk !== key) throw new ServerIdentityChanged(endpoint, old.server_pk, key, "pin");
-    if (!old) localStorage.setItem(PREFIX + normalizeEndpoint(endpoint), JSON.stringify({ server_pk: key, first_seen: Date.now() }));
+    if (!old) appStorage.setItem(PREFIX + normalizeEndpoint(endpoint), JSON.stringify({ server_pk: key, first_seen: Date.now() }));
   },
   forget(endpoint, previous) {
-    if (this.load(endpoint)?.server_pk === previous) localStorage.removeItem(PREFIX + normalizeEndpoint(endpoint));
+    if (this.load(endpoint)?.server_pk === previous) appStorage.removeItem(PREFIX + normalizeEndpoint(endpoint));
   },
 };
 

@@ -14,9 +14,9 @@
  */
 import type { DeviceCertificate } from "../proto/DeviceCertificate";
 import { decodeBase64Url, encodeBase64Url } from "./base64url";
-import { kvDelete, kvEnroll, kvGet, kvSet, kvUpdate } from "./kv";
+import { kvDelete, kvEnroll, kvGet, kvSet, kvUpdate, type KvGuard } from "./kv";
 import { defaultNickname, validNickname } from "./nickname";
-import { upgradeRecord, type RecordUpgrade } from "../lib/stored-data";
+import { NewerDataError, upgradeRecord, type RecordUpgrade } from "../lib/stored-data";
 
 export interface Identity {
   readonly nickname: string;
@@ -48,8 +48,8 @@ export interface IdentityStore {
   save(backup: IdentityBackup): Promise<void>;
 }
 
-const KEY = "identity";
-const CONNECT_KEY = "connect";
+export const KEY = "identity";
+export const CONNECT_KEY = "connect";
 
 /**
  * Upgrades of the stored records (and of identity backup files) as they are read
@@ -59,12 +59,15 @@ const CONNECT_KEY = "connect";
  */
 export const IDENTITY_UPGRADES: readonly RecordUpgrade[] = [];
 export const CONNECT_UPGRADES: readonly RecordUpgrade[] = [];
-const identityRecord = (value: unknown) => upgradeRecord("The identity", value, IDENTITY_UPGRADES);
-const connectRecord = (value: unknown) => upgradeRecord("The Gwar Connect sign-in", value, CONNECT_UPGRADES);
+export const identityRecord = (value: unknown) => upgradeRecord("The identity", value, IDENTITY_UPGRADES);
+export const connectRecord = (value: unknown) => upgradeRecord("The Gwar Connect sign-in", value, CONNECT_UPGRADES);
+// Checked in the transaction that replaces or deletes the record: a newer version's stays.
+const keepNewerIdentity: KvGuard = (stored) => void identityRecord(stored);
+const keepNewerConnect: KvGuard = (stored) => void connectRecord(stored);
 
 export const indexedDbIdentityStore: IdentityStore = {
   load: async () => identityRecord(await kvGet<unknown>(KEY)) as IdentityBackup | undefined,
-  save: (backup) => kvSet(KEY, backup),
+  save: (backup) => kvSet(KEY, backup, keepNewerIdentity),
 };
 
 /**
@@ -109,8 +112,8 @@ export interface ConnectStore {
 
 export const indexedDbConnectStore: ConnectStore = {
   load: async () => connectRecord(await kvGet<unknown>(CONNECT_KEY)) as ConnectRecord | undefined,
-  save: (record) => kvEnroll(CONNECT_KEY, record, record.accountKey),
-  clear: () => kvDelete(CONNECT_KEY),
+  save: (record) => kvEnroll(CONNECT_KEY, record, record.accountKey, { record: keepNewerConnect, identity: keepNewerIdentity }),
+  clear: () => kvDelete(CONNECT_KEY, keepNewerConnect),
 };
 
 /** Changes the stored Connect record in one transaction; `change` returns undefined to leave it. */
@@ -131,6 +134,15 @@ export class IdentityUnsupportedError extends Error {
     super("Ed25519 is not available in this browser or context");
     this.name = "IdentityUnsupportedError";
   }
+}
+
+/** Why this device's identity did not load, as a connect failure (`err.connect.*`). */
+export type IdentityFailure = "identity" | "identity_unreadable" | "identity_storage" | "storage_newer";
+export function identityFailure(error: unknown): IdentityFailure {
+  if (error instanceof IdentityUnsupportedError) return "identity";
+  if (error instanceof IdentityUnreadableError) return "identity_unreadable";
+  if (error instanceof NewerDataError) return "storage_newer";
+  return "identity_storage";
 }
 
 const ALGORITHM = { name: "Ed25519" } as const;
@@ -269,7 +281,12 @@ export async function loadActiveIdentity(
 
 /** The stored Connect sign-in, if any (and valid). */
 export async function loadConnectRecord(connect: ConnectStore = indexedDbConnectStore): Promise<ConnectRecord | undefined> {
-  const record = await connect.load().catch(() => undefined);
+  // Unreadable storage reads as signed out, but a sign-in of a newer version must not: it would be
+  // replaced by the next sign-in on this older version.
+  const record = await connect.load().catch((error: unknown) => {
+    if (error instanceof NewerDataError) throw error;
+    return undefined;
+  });
   return record && isValidConnectRecord(record) ? record : undefined;
 }
 

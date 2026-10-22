@@ -1,4 +1,5 @@
 import { CONNECT_URL } from "../lib/official";
+import { appStorage } from "../lib/local-storage";
 
 /**
  * Handle continuity: the account (uid) this client first saw behind each verified Connect handle. Connect may
@@ -26,7 +27,7 @@ const listeners = new Set<() => void>();
 /** The stored uid (`null`: none, or corrupt, which only code on this origin can write); undefined if unreadable. */
 function readStored(handle: string): string | null | undefined {
   let raw: string | null;
-  try { raw = localStorage.getItem(PREFIX + handle); } catch { return undefined; }
+  try { raw = appStorage.getItem(PREFIX + handle); } catch { return undefined; }
   try {
     const uid = (JSON.parse(raw ?? "null") as { uid?: unknown } | null)?.uid;
     return typeof uid === "string" ? uid : null;
@@ -59,7 +60,7 @@ function notify() {
 
 function write(handle: string, uid: string, accepted: boolean): boolean {
   try {
-    localStorage.setItem(PREFIX + handle, JSON.stringify({ uid }));
+    appStorage.setItem(PREFIX + handle, JSON.stringify({ uid }));
   } catch {
     unsaved.set(handle, { uid, accepted });
     return false;

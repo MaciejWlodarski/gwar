@@ -41,6 +41,7 @@ deployed from main). Concretely:
 | --- | --- |
 | Message checks at IndexedDB version 2 (`gwar-message-auth-v3` before #105) | **Migrated** (2 → 3: adds the `order` store, existing checkpoints get order 0) |
 | Server databases of v0.1.0: role permissions named as in roles version 1 | **Migrated** (with the roles v2 schema migrations: names mapped, Admin holds `administrator`, Member keeps joining, talking and writing) |
+| Server databases of v0.1.0 that a server from v0.1.2 on already migrated, roles unconverted | **Repaired** (migration 31: only roles still holding a name of version 1 are converted, as above; roles edited since keep their version-2 names; Member gains joining, talking and writing and its place last only if no server of roles version 2 step 2 ever did that, told by the `member_defaults`/`member_channel_defaults` markers) |
 | Server and Connect databases at any older `user_version` | **Migrated** (the ordered SQL migrations below) |
 | TeamSpeak identity lists without a `version` (desktop, v0.1.0 on) | **Migrated** (read as version 1, written with it) |
 | Web data under the old `vc` names (`vc` IndexedDB, `vc.*` localStorage: v0.1.0 and v0.1.1 in a browser) | **Unsupported.** The move ran only between #112 and #117; that data is ignored and left in place, and the app starts as on a new device (sign in to Gwar Connect again, or import an identity backup). |
@@ -58,7 +59,7 @@ its WebKit data directory.
 
 | Store | Holds | Version and mechanism |
 | --- | --- | --- |
-| IndexedDB `gwar`, store `kv` (`net/kv.ts`) | `identity`: the local identity, `{format: "gwar-identity", version: 1, jwk, nickname}` (the private key as a JWK; also the identity backup file format). `connect`: the Gwar Connect sign-in, `{version: 1, handle, nickname?, accountKey, deviceName, deviceJwk, certificate, token, vaultKey, archiveRecovery?, archiveRecoverySecret?}`. `moved-from-vc`: a timestamp left by the old rename move, unused. | Database version 1 (`KV_MIGRATIONS`). Each record has its own `version`, upgraded as it is read (`IDENTITY_UPGRADES`, `CONNECT_UPGRADES`, `upgradeRecord`). **Never wiped**: an unreadable identity fails to load and stays. |
+| IndexedDB `gwar`, store `kv` (`net/kv.ts`) | `identity`: the local identity, `{format: "gwar-identity", version: 1, jwk, nickname}` (the private key as a JWK; also the identity backup file format). `connect`: the Gwar Connect sign-in, `{version: 1, handle, nickname?, accountKey, deviceName, deviceJwk, certificate, token, vaultKey, archiveRecovery?, archiveRecoverySecret?}`. `moved-from-vc`: a timestamp left by the old rename move, unused. | Database version 1 (`KV_MIGRATIONS`). Each record has its own `version`, upgraded as it is read (`IDENTITY_UPGRADES`, `CONNECT_UPGRADES`, `upgradeRecord`). Every write and delete (save, sign-out, enrollment's removal of the old identity) reads the stored record in the same transaction and aborts if it is newer. **Never wiped**: an unreadable identity fails to load and stays. |
 | IndexedDB `gwar-message-auth-v3` (`net/message-storage.ts`) | `checkpoints` (by `server/author/message`, index `at`): `{revision, hash, created, conversation, at, proven?, deleted?, files?, order}`; `revocations` (by `account:device`): account-signed revocations; `feeds` (by Connect URL): `{cursor, checked, available?, read?}`; `order`: one counter. | Database version 3 (`MESSAGE_STORAGE_MIGRATIONS`; version 1 never held data, the name started at 2). Not a cache: losing it loses rollback protection, so it is migrated, never emptied. |
 | IndexedDB `gwar-mls-v2-<device public key>` (`mls/storage.ts`) | The device's MLS agent: stores `openmls` (OpenMLS's own records), `groups` (`@device`, group records, `{server}/@server` owner pins, `@archive`), `epochs`, `outbox`; binary keys and values written by `crates/gwar-mls`. The runtime's jobs (`@runtime/…`, JSON) live in `outbox`. | Database version 1 (`MLS_MIGRATIONS`), which also versions the runtime's jobs. The agent's records have their own format, the `version` of `@device` (`STORE_FORMAT` in `crates/gwar-mls/src/agent/mod.rs`, currently 1): `STORE_UPGRADES` run as the agent loads and reach storage with its next write. OpenMLS's own records are keyed by its storage version, pinned by a test. **Never wiped**: an unreadable state fails to load and stays. |
 | localStorage `gwar.settings` (zustand `persist`) | Preferences, bookmarks (with server and channel passwords), removed bookmarks, the last server, per-server flags. | The localStorage version (below). zustand's own `version` stays 1. |
@@ -83,7 +84,7 @@ The webview's data (above) is the rest of what the desktop app keeps.
 
 | File | Holds | Version and mechanism |
 | --- | --- | --- |
-| `gwar.sqlite3` | Everything the server knows: channels, roles, members, messages, files, invites, bans, MLS delivery state, owner chain, TeamSpeak links and imports. | `PRAGMA user_version` = the number of `MIGRATIONS` applied (`crates/gwar-server/src/store.rs`, currently 30). Each runs in one transaction with its data step (`migrate_data`) and the new version. A newer `user_version` refuses to start. |
+| `gwar.sqlite3` | Everything the server knows: channels, roles, members, messages, files, invites, bans, MLS delivery state, owner chain, TeamSpeak links and imports. | `PRAGMA user_version` = the number of `MIGRATIONS` applied (`crates/gwar-server/src/store.rs`, currently 31). Each runs in one transaction with its data step (`migrate_data`) and the new version. A newer `user_version` refuses to start. |
 | `gwar.sqlite3.before-import-*` | Copies taken before a TeamSpeak import. | The version they had then; they open like any older database. |
 | `gwar.lock` | The data directory lock. | — |
 | `server-key.ed25519` | The server's identity key, 32 raw bytes. | Fixed format; anything else fails to start. Never rewritten. |
@@ -121,15 +122,25 @@ desktop app.
 `openDatabase(name, migrations)` (`apps/web/src/lib/stored-data.ts`) opens a
 database at version `migrations.length`. In `onupgradeneeded` it runs
 `migrations[oldVersion]` up to the last, all in the one version-change
-transaction: an exception, or a failed record rewrite (`eachRecord`), aborts it,
-the database keeps its old version and data, and the reason (not the abort) is
-what the open rejects with. A database of a newer version rejects with
+transaction. A step that rewrites records returns the promise of `eachRecord`,
+and the next step starts only once that one's rewrites have all succeeded, so
+steps see each other's results in order. An exception, a rejected step or a
+failed request aborts the transaction, the database keeps its old version and
+data, and the reason (the step's error or the failed request's, not the abort it
+caused) is what the open rejects with. A database of a newer version rejects with
 `NewerDataError` without being changed. No step ever calls `createObjectStore`
 outside its own migration.
 
-At start the app also lists the databases (`indexedDB.databases()`) and shows a
-"saved by a newer version" screen instead of the app if any is newer than it
-knows (`lib/stored-data-check.ts`); each store still checks on its own open.
+At start the app also checks, without changing anything (`lib/stored-data-check.ts`):
+the version of every database it knows (`indexedDB.databases()`), the `version`
+of the identity and Connect records, and the agent format of every device's MLS
+state (`@device`, against `MLS_STORE_FORMAT`, which a test keeps equal to the
+newest fixture of `crates/gwar-mls`). Anything newer shows the "saved by a newer
+version" screen instead of the app; each store still checks on its own open.
+Failures that reach a user later (connecting, signing in, the identity settings)
+are told apart in English and Polish: data of a newer version (update Gwar), an
+identity this version cannot read (kept; update Gwar or import a backup), and
+storage the browser refuses.
 
 ### Records inside IndexedDB
 
@@ -137,7 +148,11 @@ Records the app reads as objects carry `version`. `upgradeRecord(store, value,
 upgrades)` runs the upgrades from the record's version on as it is read and
 throws `NewerDataError` for a newer one; the upgraded record is written by the
 next save. This keeps record changes independent of the database version, so a
-record change does not lock every older tab out of the whole database.
+record change does not lock every older tab out of the whole database. Writes
+and deletes pass a guard to `kvSet`/`kvDelete`/`kvEnroll` that reads the stored
+record in the write's own transaction, so an older tab can neither overwrite nor
+delete a record a newer tab wrote meanwhile, and a newer record is reported as
+such, never read as missing (signed out).
 
 ### MLS agent state
 
@@ -153,16 +168,23 @@ operation after it. Until then each load runs it again.
 
 `gwar.storage-version` holds one version for every key the app keeps there
 (missing: 1). `migrateLocalStorage` runs `LOCAL_STORAGE_MIGRATIONS` from it on
-before anything reads (the first read of the settings, or the start check), and
-writes the version after each step. A newer or unreadable version, or a failed
-step, leaves everything untouched: the settings store neither reads nor writes,
-and the app shows the "saved by a newer version" screen.
+and writes the version after each step. Every key goes through the gate in
+`lib/local-storage.ts` (`guardedLocalStorage` for the settings, `appStorage` for
+the pins, channel records and service keys), which reads the version again
+before each read and write, so a tab opened before a newer version's tab
+upgraded localStorage stops writing at once. Other tabs also hear the change as
+a `storage` event and replace the app with the error screen. A newer or
+unreadable version, or a failed step, leaves everything untouched: nothing is
+read or written, and the app shows the "saved by a newer version" screen.
 
 ### Desktop files
 
 JSON files carry `version` (missing: 1). The loader refuses a newer version
 before parsing the rest, applies the upgrades to the JSON, and the next save
-writes the current version. Writes replace the file in one step (write a
+writes the current version. A TeamSpeak identity list with an entry this
+version cannot read is refused as a whole and left alone, rather than dropping
+the entry and saving the rest (or a new identity) over it; skipping unreadable
+entries is only for identities a user imports on purpose. Writes replace the file in one step (write a
 temporary file, rename).
 
 ### Server and Connect databases
@@ -170,7 +192,9 @@ temporary file, rename).
 Ordered SQL in `MIGRATIONS`; `PRAGMA user_version` is how many ran. Each
 migration, its data step and the new version commit in one transaction. A
 `user_version` above `MIGRATIONS.len()` stops the process with an error naming
-both versions; nothing is changed.
+both versions; nothing is changed. A data step that a released server skipped is
+repaired by a new migration that detects the old data itself (migration 31:
+roles still named as in version 1), never by changing the step that was skipped.
 
 ## Adding a migration
 

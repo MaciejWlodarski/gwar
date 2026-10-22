@@ -55,7 +55,7 @@ import {
 } from "../net/connection";
 import { TsConnection } from "../net/ts-connection";
 import type { pruneRequest } from "../lib/prune";
-import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, IdentityUnsupportedError, type Identity } from "../net/identity";
+import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, identityFailure, type Identity, type IdentityFailure } from "../net/identity";
 import { isDesktop } from "../platform";
 import { createVoiceEngine } from "../voice";
 import { ScreenController } from "./screen-controller";
@@ -80,7 +80,7 @@ type SessionSnapshot = ReturnType<typeof useSession.getState>;
 
 export class ConnectFailure extends Error {
   constructor(
-    readonly kind: ConnectError["kind"] | "address" | "identity",
+    readonly kind: ConnectError["kind"] | "address" | IdentityFailure,
     message: string,
     readonly serverName?: string,
     readonly ban?: BanNotice,
@@ -158,6 +158,8 @@ export function describeJoinError(e: unknown): string {
   if (e instanceof RequestError && e.code === "forbidden") return tNow("err.join.forbidden");
   return describeRequestError(e);
 }
+
+export { identityFailure };
 
 export function describeConnectFailure(f: ConnectFailure): string {
   if (f.kind === "address") return f.message;
@@ -416,7 +418,7 @@ class Controller {
         identity = await this.getIdentity();
       } catch (e) {
         session.dispatch({ type: "phase", phase: "idle" });
-        throw new ConnectFailure("identity", e instanceof IdentityUnsupportedError ? e.message : String(e));
+        throw new ConnectFailure(identityFailure(e), e instanceof Error ? e.message : String(e));
       }
 
       conn = new Connection({

@@ -5,6 +5,12 @@ export interface Persistence {
   write(changes: Changes): Promise<void>;
   close(): void;
 }
+/**
+ * The newest format of the agent's records this app reads: `STORE_FORMAT` in
+ * crates/gwar-mls/src/agent/mod.rs (a test keeps them equal). Only the start-up check uses it; the
+ * agent refuses newer state on its own.
+ */
+export const MLS_STORE_FORMAT = 1;
 /** One device's MLS database. */
 export const mlsDatabase = (device: string) => `gwar-mls-v2-${device}`;
 /**

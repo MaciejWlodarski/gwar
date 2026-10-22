@@ -9,7 +9,7 @@ const STORE = "kv";
  */
 export const KV_MIGRATIONS: readonly IdbMigration[] = [
   // 1: one store of records by key.
-  (db) => db.createObjectStore(STORE),
+  (db) => { db.createObjectStore(STORE); },
 ];
 
 function open(): Promise<IDBDatabase> {
@@ -29,81 +29,73 @@ export async function kvGet<T>(key: string): Promise<T | undefined> {
   }
 }
 
-export async function kvSet(key: string, value: unknown): Promise<void> {
+/**
+ * Checks what is stored under a key before a write replaces or deletes it, in the same transaction
+ * (a record of a newer version must not be overwritten by an older tab): throwing refuses the write.
+ */
+export type KvGuard = (stored: unknown) => void;
+
+/** One read-write transaction; `refuse` aborts it and rejects with the reason. */
+async function readWrite(work: (store: IDBObjectStore, refuse: (reason: unknown) => void) => void, durable = false): Promise<void> {
   const db = await open();
   try {
     await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite");
-      tx.objectStore(STORE).put(value, key);
+      const tx = db.transaction(STORE, "readwrite", durable ? { durability: "strict" } : undefined);
+      let refused: unknown;
       tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error ?? new Error("indexedDB put failed"));
+      tx.onabort = () => reject(refused ?? tx.error ?? new Error("indexedDB write aborted"));
+      tx.onerror = () => reject(refused ?? tx.error ?? new Error("indexedDB write failed"));
+      work(tx.objectStore(STORE), (reason) => {
+        refused ??= reason;
+        try { tx.abort(); } catch { /* already finished */ }
+      });
     });
   } finally {
     db.close();
   }
 }
 
-export async function kvDelete(key: string): Promise<void> {
-  const db = await open();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite");
-      tx.objectStore(STORE).delete(key);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error ?? new Error("indexedDB delete failed"));
-    });
-  } finally {
-    db.close();
-  }
+/** Runs `then` with the stored value once `guard` accepts it. */
+function checked(store: IDBObjectStore, key: string, guard: KvGuard | undefined, refuse: (reason: unknown) => void, then: (stored: unknown) => void): void {
+  const read = store.get(key);
+  read.onsuccess = () => {
+    try { guard?.(read.result); } catch (error) { return refuse(error); }
+    then(read.result);
+  };
 }
 
-/** Commit the device before deleting a matching plaintext account root, in one durable transaction. */
-export async function kvEnroll(key: string, value: unknown, accountKey: string): Promise<void> {
-  const db = await open();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite", { durability: "strict" });
-      const store = tx.objectStore(STORE);
-      store.put(value, key);
-      const identity = store.get("identity");
-      identity.onsuccess = () => {
-        if (identity.result?.jwk?.x === accountKey) store.delete("identity");
-      };
-      tx.oncomplete = () => resolve();
-      tx.onabort = () => reject(tx.error ?? new Error("indexedDB enrollment aborted"));
-      tx.onerror = () => reject(tx.error ?? new Error("indexedDB enrollment failed"));
+export function kvSet(key: string, value: unknown, guard?: KvGuard): Promise<void> {
+  return readWrite((store, refuse) => checked(store, key, guard, refuse, () => store.put(value, key)));
+}
+
+export function kvDelete(key: string, guard?: KvGuard): Promise<void> {
+  return readWrite((store, refuse) => checked(store, key, guard, refuse, () => store.delete(key)));
+}
+
+/**
+ * Commit the device before deleting a matching plaintext account root, in one durable transaction.
+ * `guards` check the record replaced and any stored identity; either refusing refuses it all.
+ */
+export function kvEnroll(key: string, value: unknown, accountKey: string, guards: { record?: KvGuard; identity?: KvGuard } = {}): Promise<void> {
+  return readWrite((store, refuse) => {
+    checked(store, key, guards.record, refuse, () => store.put(value, key));
+    checked(store, "identity", (stored) => { if (stored !== undefined) guards.identity?.(stored); }, refuse, (identity) => {
+      if ((identity as { jwk?: { x?: unknown } } | undefined)?.jwk?.x === accountKey) store.delete("identity");
     });
-  } finally {
-    db.close();
-  }
+  }, true);
 }
 
 /**
  * Reads and changes one value in a single read-write transaction: nothing commits in between.
  * `change` returns the new value, or undefined to leave it as it is.
  */
-export async function kvUpdate<T>(key: string, change: (value: T | undefined) => T | undefined): Promise<void> {
-  const db = await open();
-  try {
-    await new Promise<void>((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite", { durability: "strict" });
-      const store = tx.objectStore(STORE);
-      const read = store.get(key);
-      let refused: unknown;
-      read.onsuccess = () => {
-        try {
-          const next = change(read.result as T | undefined);
-          if (next !== undefined) store.put(next, key);
-        } catch (error) {
-          refused = error;
-          tx.abort();
-        }
-      };
-      tx.oncomplete = () => resolve();
-      tx.onabort = () => reject(refused ?? tx.error ?? new Error("indexedDB update aborted"));
-      tx.onerror = () => reject(tx.error ?? new Error("indexedDB update failed"));
-    });
-  } finally {
-    db.close();
-  }
+export function kvUpdate<T>(key: string, change: (value: T | undefined) => T | undefined): Promise<void> {
+  return readWrite((store, refuse) => {
+    const read = store.get(key);
+    read.onsuccess = () => {
+      let next: T | undefined;
+      try { next = change(read.result as T | undefined); } catch (error) { return refuse(error); }
+      if (next !== undefined) store.put(next, key);
+    };
+  }, true);
 }

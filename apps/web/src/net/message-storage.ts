@@ -45,7 +45,7 @@ export const MESSAGE_STORAGE_MIGRATIONS: readonly IdbMigration[] = [
   // came before every ordered read: order 0.
   (db, tx) => {
     db.createObjectStore(ORDER);
-    eachRecord(tx.objectStore("checkpoints"), (value) => {
+    return eachRecord(tx.objectStore("checkpoints"), (value) => {
       const checkpoint = value as Partial<Checkpoint>;
       return checkpoint.order === undefined ? { ...checkpoint, order: 0 } : undefined;
     });

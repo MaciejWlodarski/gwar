@@ -15,28 +15,36 @@ export class NewerDataError extends Error {
 
 /**
  * One step of an IndexedDB database: `migrations[i]` takes it from version i to i + 1, inside the
- * upgrade transaction (`tx`). A step that reads or rewrites records does so with requests of `tx`;
- * a failed one aborts the whole upgrade (see `eachRecord`).
+ * upgrade transaction (`tx`). A step that reads or rewrites records returns a promise that settles
+ * when its requests have (`eachRecord`): the next step starts only then. A step that throws or
+ * rejects aborts the whole upgrade.
  */
-export type IdbMigration = (db: IDBDatabase, tx: IDBTransaction) => void;
+export type IdbMigration = (db: IDBDatabase, tx: IDBTransaction) => void | Promise<void>;
 
 /**
  * Calls `change` with every record of `store`, in the upgrade transaction; `change` returns the
- * record to store instead, or undefined to keep it. A failure aborts the upgrade.
+ * record to store instead, or undefined to keep it. Settles once every record was visited and
+ * rewritten; rejects (aborting the upgrade) if `change` throws or a request fails.
  */
-export function eachRecord(store: IDBObjectStore, change: (value: unknown, key: IDBValidKey) => unknown): void {
-  const cursor = store.openCursor();
-  cursor.onsuccess = () => {
-    const current = cursor.result;
-    if (!current) return;
-    try {
-      const next = change(current.value, current.primaryKey);
-      if (next !== undefined) current.update(next);
-      current.continue();
-    } catch (error) {
-      failUpgrade(store.transaction, error);
-    }
-  };
+export function eachRecord(store: IDBObjectStore, change: (value: unknown, key: IDBValidKey) => unknown): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cursor = store.openCursor();
+    cursor.onerror = () => reject(cursor.error);
+    cursor.onsuccess = () => {
+      const current = cursor.result;
+      if (!current) return resolve();
+      try {
+        const next = change(current.value, current.primaryKey);
+        if (next !== undefined) {
+          const update = current.update(next);
+          update.onerror = () => reject(update.error);
+        }
+        current.continue();
+      } catch (error) {
+        reject(error);
+      }
+    };
+  });
 }
 
 const failures = new WeakMap<IDBTransaction, unknown>();
@@ -54,9 +62,10 @@ export interface OpenOptions {
 
 /**
  * Opens `name` at version `migrations.length`, first running every migration after the stored
- * version, all in the one upgrade transaction: an interrupted upgrade commits nothing and leaves the
- * database as it was, to be upgraded again on the next open. A database of a newer version is not
- * opened (NewerDataError). The reason a migration failed, not the abort it causes, is what rejects.
+ * version, one after another, all in the one upgrade transaction: an interrupted upgrade commits
+ * nothing and leaves the database as it was, to be upgraded again on the next open. A database of
+ * a newer version is not opened (NewerDataError). The reason a migration failed (its exception, or
+ * the request that failed), not the abort it causes, is what rejects.
  */
 export function openDatabase(name: string, migrations: readonly IdbMigration[], options: OpenOptions = {}): Promise<IDBDatabase> {
   const factory = options.factory ?? indexedDB;
@@ -65,19 +74,31 @@ export function openDatabase(name: string, migrations: readonly IdbMigration[], 
     const request = factory.open(name, version);
     let upgrade: IDBTransaction | undefined;
     request.onupgradeneeded = (event) => {
-      const db = request.result;
-      upgrade = request.transaction!;
-      try {
-        for (let step = event.oldVersion; step < version; step++) migrations[step]!(db, upgrade);
-      } catch (error) {
-        failUpgrade(upgrade, error);
-      }
+      const db = request.result, tx = request.transaction!;
+      upgrade = tx;
+      // Synchronous steps run at once; after one that returns a promise, the next runs when it
+      // settles, from a request callback of this transaction, which is then still active.
+      const run = (from: number): void => {
+        for (let step = from; step < version; step++) {
+          let pending: void | Promise<void>;
+          try {
+            pending = migrations[step]!(db, tx);
+          } catch (error) {
+            return failUpgrade(tx, error);
+          }
+          if (pending) {
+            pending.then(() => run(step + 1), (error: unknown) => failUpgrade(tx, error));
+            return;
+          }
+        }
+      };
+      run(event.oldVersion);
     };
     if (options.onBlocked) request.onblocked = options.onBlocked;
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => {
-      const failure = upgrade && failures.get(upgrade);
-      if (failure !== undefined) return reject(failure);
+      const failure = upgrade && (failures.get(upgrade) ?? upgrade.error);
+      if (failure) return reject(failure);
       if (request.error?.name !== "VersionError") return reject(request.error ?? new Error(`${name}: open failed`));
       // Which version is stored, for the message: an open without a version never upgrades.
       const peek = factory.open(name);

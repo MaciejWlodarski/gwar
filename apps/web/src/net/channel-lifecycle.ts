@@ -1,4 +1,5 @@
 import type { MessageVerification } from "./message-signature";
+import { appStorage } from "../lib/local-storage";
 
 /** Channel ids this client has seen on a server (by server key) and seen deleted. An honest server never reuses
  *  a deleted id, so a reused one means the server may be showing a deleted channel's messages as another
@@ -45,7 +46,7 @@ function parse(raw: string | null): Record {
 }
 
 export function channelLifecycle(given?: Store): ChannelLifecycle {
-  const storage = () => given ?? globalThis.localStorage;
+  const storage = () => given ?? appStorage;
   // The record in memory is authoritative for this session; storage carries it across reloads. Saved records
   // can be dropped from memory and read again; unsaved ones cannot, so they stay. When every slot holds one and
   // another record is loaded, the oldest goes and every record is uncertain for the rest of the session.

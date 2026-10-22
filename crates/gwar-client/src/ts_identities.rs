@@ -141,6 +141,18 @@ pub fn load(path: &Path) -> Result<Option<List>> {
                 object.remove("version");
             }
             let list: List = serde_json::from_value(value).context("invalid TeamSpeak identities file")?;
+            // A stored key this version cannot read is refused with the whole file, never dropped:
+            // normalizing would lose it, and the next save would make that final. (Imports, through
+            // `from_texts`, skip what they cannot read.)
+            for entry in &list.identities {
+                entry.identity().with_context(|| {
+                    format!(
+                        "{}: TeamSpeak identity {:?} cannot be read by this version of Gwar; the file was not changed",
+                        path.display(),
+                        entry.name
+                    )
+                })?;
+            }
             Ok(Some(list.normalized()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -287,6 +299,26 @@ mod tests {
         std::fs::write(&path, &text).unwrap();
         let error = load(&path).unwrap_err().to_string();
         assert!(error.contains("newer version of Gwar"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn a_file_with_an_unreadable_identity_is_refused_and_left_alone() {
+        let dir = TempDir::new("ts-list");
+        let path = dir.join("list.json");
+        let a = generate();
+        let text = serde_json::json!({
+            "version": 1,
+            "default": uid(&a),
+            "identities": [
+                {"uid": uid(&a), "name": "a", "identity": export(&a)},
+                {"uid": "future", "name": "Main", "identity": "a key of a format this version does not know"},
+            ],
+        })
+        .to_string();
+        std::fs::write(&path, &text).unwrap();
+        let error = format!("{:#}", load(&path).unwrap_err());
+        assert!(error.contains("\"Main\" cannot be read"), "{error}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 }

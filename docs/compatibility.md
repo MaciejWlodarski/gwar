@@ -68,13 +68,32 @@ With a client and a server one version apart, these fail first:
 done additively. Clients keep a list of majors they speak (`[4]`, later `[4, 5]`),
 the server one; within a major everything is additive.
 
-**Features.** Within a major, what a server can do is a list of named features,
-advertised in the `challenge` (so a client can decide before signing in) and
-repeated in `welcome`:
+**The bootstrap is frozen.** Every client parses the `challenge` before it sends
+`hello`, so the challenge is the one frame the server cannot shape for the
+client: it does not know the client yet. Its shape (`protocol`, `server_pk`,
+`server_nonce`, `password_required` and `server`, a `ServerInfo` as the oldest
+client in the window reads it) is therefore frozen: servers send no new field in the challenge or the `ServerInfo` it
+carries, and keep sending every field of today's shape (`screen_guest_links`
+included), until every client in the support window parses it leniently (step 1
+of the migration path, then one full window). Clients may read it more leniently
+at any time, which is what lets them reach servers older than the freeze. Until then,
+`ServerInfo` in the challenge is a separate, frozen wire type from the one in
+`welcome` and `server.updated`, which may grow per session. The only things a client learns before signing in are
+`protocol` and `server.version`, both already in today's challenge, and both are
+enough for the decisions it has to take there (wrong major, server too old).
+
+**Features.** Within a major, what a server can do is a list of named features.
+They are negotiated after the challenge: the client sends the features it
+understands in `hello.client.features`, and the server answers in `welcome`
+with the features both sides have:
 
 ```json
 "server": { "name": "…", "version": "0.3.1", "features": ["screen.share", "screen.guest_links", "roles.overrides", "ts.badges", "mls.private"] }
 ```
+
+A client that sends no `features` (every client before step 2) gets the welcome
+in the baseline shape it was built for, without `features` and without fields of
+later features.
 
 - A feature name is a stable, never-reused string for an op, an event or a field
   family (`screen.share` = the `screen.*` ops and events and `Welcome.shares`).
@@ -82,8 +101,8 @@ repeated in `welcome`:
   checks `server.has("screen.share")` before showing the UI or sending the op;
   absent features are hidden, not greyed with an error. Fields of an absent
   feature are treated as their empty value.
-- The client sends its own list in `hello.client.features`, so the server knows
-  what the client can parse (see "The reverse direction").
+- The server shapes the welcome, events and responses of the session from the
+  client's list (see "The reverse direction").
 - Features never go away within a major; removing one is a major change.
 
 `ServerInfo.version` (the release, `MAJOR.MINOR.PATCH`) is for display and for
@@ -129,8 +148,9 @@ oldest supported server.
   0.5 client: 0.4.x and 0.5.x), or six months, whichever is longer. The
   minimum is a constant in the client (`MIN_SERVER_VERSION`), raised on purpose
   in a release note.
-- The client reads `server.version` from the challenge. Below the minimum it
-  stops before signing in and shows: "This server runs Gwar 0.3.2. This app needs
+- The client reads `server.version` from the challenge (a field every server
+  sends today, so this check works against servers older than the check
+  itself). Below the minimum it stops before signing in and shows: "This server runs Gwar 0.3.2. This app needs
   0.4 or later: ask the server's admin to update." with the server's name. The
   connect screen keeps the bookmark.
 - Inside the window but older than the client: the client connects, hides
@@ -147,11 +167,18 @@ oldest supported server.
   (`--min-client-version`, default: the oldest client release still in its
   window) and answers older ones with a new `client_too_old` error whose message
   names the version to install; the client shows it as such.
+- The challenge is sent before the server knows the client, so it stays in its
+  frozen baseline shape (see "Versions and capabilities"); an older client always
+  parses it and gets as far as `hello`.
 - Until every client in the window has the lenient parser (step 1 below), the
   server must not add fields to existing frames for clients that did not
-  advertise the feature: it sends per-session frames shaped for the client's
-  feature list. After that, only new ops and events need gating, and the server
-  never sends events of a feature the client did not advertise.
+  advertise the feature: from `welcome` on it sends per-session frames shaped for
+  the client's feature list. After that, only new ops and events need gating, and
+  the server never sends events of a feature the client did not advertise.
+- `client_too_old` is an answer to `hello`, so it reaches even a strict older
+  client: `ErrorCode` gets the value in the release that adds the parser for it,
+  and until every client in the window knows it the server sends it as
+  `bad_request` with the same message, which today's clients already show.
 - TeamSpeak clients are unaffected: the bridge speaks TeamSpeak's protocol.
 - The web app a server serves itself (`--web-root`) matches that server; the web
   app at gwar.app is always the newest, so it is the client that meets the
@@ -190,11 +217,14 @@ two phases: **read everywhere first, write later**.
    enum fallbacks for server frames; make every field added since v0.1.2 that a
    server in the window may lack `optional` (first: `ServerInfo.screen_guest_links`,
    so today's client works with a v0.1.2 server). Report "server version too old"
-   from the challenge instead of timing out. Add `unsupported` to `ErrorCode`.
-2. **Features.** Add `features` to `ServerInfo` (challenge and welcome) and to
-   `hello.client`; the client's `has(feature)` gates the screen sharing, roles
-   override, TeamSpeak badge, private channel and watch-link UI first, as the
-   newest features. Name every feature from then on in the PR that adds it.
+   from the challenge's `server.version` instead of timing out. Add `unsupported`
+   to `ErrorCode`. Freeze the challenge: split its `ServerInfo` from the
+   welcome's and pin its shape with a test, so no PR can change it by accident.
+2. **Features.** Add `features` to `hello.client` and to the welcome's
+   `ServerInfo` (never the challenge's); the client's `has(feature)` gates the
+   screen sharing, roles override, TeamSpeak badge, private channel and
+   watch-link UI first, as the newest features. Name every feature from then on
+   in the PR that adds it.
 3. **The window.** `MIN_SERVER_VERSION` in clients and `--min-client-version` in
    the server, with the messages above; `client_too_old` error.
 4. **CI.** A job that runs the browser smoke suite against the previous release's
@@ -203,4 +233,5 @@ two phases: **read everywhere first, write later**.
 5. **E2E versions.** Gwar format capabilities in leaf nodes, readers of several
    versions, and the read-first rule in the e2e docs, before the first v2 format.
 6. **Major 5** only if something cannot be additive; clients by then speak 4 and
-   5 for a window.
+   5 for a window. Changing the challenge itself counts as a major change until
+   one window after step 1, when every supported client reads it leniently.
