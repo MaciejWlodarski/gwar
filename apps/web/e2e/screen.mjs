@@ -10,7 +10,7 @@
  *   an init script standing in for `getDisplayMedia`.
  * - Every source stamps a barcode (source id, frame counter, check) into its frames; viewers in
  *   both engines read it back from the decoded video, so frames are checked end to end. (WebKit on
- *   Linux paints one remote video per page; see `paintsOneVideo`.)
+ *   Linux paints remote video unreliably; see `paintsUnreliably`.)
  *
  * Covered: Chromium and WebKit sharing to Chromium and WebKit viewers; a viewer in another
  * channel's voice and one in no voice at all; a late joiner who learns of shares from the
@@ -251,17 +251,17 @@ async function watch(page, sharer) {
 }
 
 /**
- * WebKit on Linux (Playwright's GTK/WPE build, GStreamer media) paints only the first remote video
- * of a page: later `<video>` elements stay at HAVE_NOTHING while the receiver keeps decoding
- * (reproduced without Gwar, two peer connections in one page). Safari on macOS paints every one,
- * and the macOS runs read the barcode from all of them. On Linux a WebKit viewer reads the barcode
- * from its first share and checks the decoder for the rest.
+ * WebKit on Linux (Playwright's GTK/WPE build, GStreamer media) paints remote video unreliably: a
+ * `<video>` often stays at HAVE_NOTHING while its receiver keeps decoding, mostly when the element
+ * gets the stream after frames already flow (reproduced without Gwar, two peer connections in one
+ * page). Safari on macOS paints every one, and the macOS runs read the barcode in both engines. On
+ * Linux a WebKit viewer checks the receiver's decoded frames instead.
  */
-const paintsOneVideo = page => page.engine === "webkit" && process.platform === "linux";
+const paintsUnreliably = page => page.engine === "webkit" && process.platform === "linux";
 
 /** Waits until `page` decodes `share` with the source's barcode, twice with different counters. */
 async function sees(page, share, id, what) {
-  if (paintsOneVideo(page) && page.painted) return decodes(page, share, what);
+  if (paintsUnreliably(page)) return decodes(page, share, what);
   const read = () => page.evaluate(share => window.__readBarcode(document.querySelector(`video[data-share="${share}"]`)), share);
   let first = null, last = null;
   const ms = await waitFor(async () => {
@@ -270,7 +270,6 @@ async function sees(page, share, id, what) {
     if (!first) { first = last; return false; }
     return last.counter !== first.counter;
   }, `${what}: ${page.deviceName} decodes source ${id} (last ${JSON.stringify(last)})`, 30_000);
-  page.painted = true;
   const stats = await session(page, (_, __, controller, share) => controller.screen.stats(share), share);
   assert.ok(stats && stats.framesDecoded > 0, `${what}: frames decoded`);
   checks.push({ check: what, viewer: page.deviceName, ms, size: `${last.width}x${last.height}`, framesDecoded: stats.framesDecoded });

@@ -1737,14 +1737,15 @@ badge, stage). Decisions taken while building it, where this design left room:
   around it. The Chromium sharer captures a real tab (S4's flag). The tab that
   calls `getDisplayMedia` must be in front: from a background tab Chromium
   answers `InvalidStateError`, which the app reports as a capture failure.
-- **WebKit on Linux** (Playwright's GTK/WPE build, which CI runs) paints only
-  the first remote video of a page; later `<video>` elements stay empty while
-  the receiver keeps decoding. A page with two peer connections and no Gwar
-  code shows the same. Safari on macOS paints every video. So on Linux the
-  e2e's WebKit viewers read the barcode from their first share and check the
-  receiver's decoded frames for the rest; the macOS runs read every barcode
-  in both engines. Linux WebKit is not a supported platform (see the desktop
-  table above).
+- **WebKit on Linux** (Playwright's GTK/WPE build, which CI runs) paints
+  remote video unreliably: a `<video>` often stays empty while its receiver
+  keeps decoding, mostly when it gets the stream after frames already flow. A
+  page with two peer connections and no Gwar code shows the same. Safari on
+  macOS paints every video. So on Linux the e2e's WebKit viewers check the
+  receiver's decoded frames and frame size instead of the barcode; the macOS
+  runs read every barcode in both engines, and on Linux Chromium viewers read
+  the WebKit sharer's barcode. Linux WebKit is not a supported platform (see
+  the desktop table above).
 
 ## 7. Phases and pull requests
 
