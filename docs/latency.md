@@ -380,12 +380,22 @@ instead; when that moves past the playout position, playback continues at the
 oldest kept packet and fades in. The window's marks restart (they counted the
 dropped audio), but the last observation stays.
 
-After a pause the queue therefore resumes with the newest 64 packets, without a
-gap or PLC, and the backlog drains through the fractional drain once a fresh
-window has passed. In simulation (`a_full_queue_keeps_the_newest_audio_and_drains_after_a_pause`,
-both clocks, after a 20 s pause) it reached the target within 65.5 s for 10 ms
-packets (640 ms of backlog) and 126.5 s for 20 ms packets (1.28 s) with quiet
-5 ms cuts, and 65.5 s for 20 ms packets with 10 ms cuts.
+An overflow is also the evidence that the backlog is worth nothing: 64 packets
+(at least 640 ms of 10 ms packets) are far beyond any jitter target, so either
+the output stopped consuming or more than a queue's worth arrived at once. The
+next refill after an overflow therefore trims the queue once, oldest first, down
+to the target and its own demand, by the queued packets' own durations (mixed
+10/20 ms streams included; holes count as nothing, so at least the target of
+real audio stays). It is the stall-recovery trim with its fade, counted as a
+trim event; the window restarts. A burst of more than 64 packets at once is
+trimmed the same way, which is acceptable: that much never arrives inside a
+jitter target. In simulation
+(`a_full_queue_keeps_the_newest_audio_and_trims_to_the_target_after_a_pause`,
+both clocks, 20 s pause) the first refill after the pause trimmed 630 ms
+(10 ms packets), 1.26 s (20 ms), 940 ms (alternating 10/20 ms) and 840 ms
+(20/10/10 ms), and playback went on from the newest audio at the target with no
+gap and no PLC. Before this trim, the backlog took the fractional drain 65.5 s
+(10 ms packets) to 126.5 s (20 ms packets, quiet 5 ms cuts) to remove.
 
 A refill-stall rule that dropped the backlog at once was tried and left out.
 Refill timing alone cannot tell a paused device from late pipeline service: a
