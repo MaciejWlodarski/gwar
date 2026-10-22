@@ -61,6 +61,15 @@ impl<'a> Bwe<'a> {
         self.0.session.set_bwe_desired_bitrate(desired_bitrate);
     }
 
+    /// Limit the bitrate of regular background padding, without limiting probe clusters.
+    ///
+    /// `Some(Bitrate::ZERO)` disables regular padding; `None` removes the limit.
+    /// The limit persists across estimate updates and BWE resets. Applications with
+    /// a separate probe reserve can disable background padding to let it refill.
+    pub fn set_padding_bitrate_limit(&mut self, limit: Option<Bitrate>) {
+        self.0.session.set_bwe_padding_bitrate_limit(limit);
+    }
+
     /// Reset the BWE with a new init_bitrate
     ///
     /// This discards the current estimator state and starts estimation again

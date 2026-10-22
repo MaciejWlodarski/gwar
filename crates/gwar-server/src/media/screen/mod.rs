@@ -1464,7 +1464,11 @@ fn allocate(
         c.extras_dropped,
         "screen watch egress"
     );
-    if desired != w.desired && (desired < w.desired || w.egress.probe_ready(now)) {
+    let probe_ready = w.egress.probe_ready(now);
+    // Idle padding must not spend the credit a probe target increase is waiting for.
+    // Apply this at the source: socket drops would manufacture TWCC loss instead.
+    w.rtc.bwe().set_padding_bitrate_limit((!probe_ready).then_some(Bitrate::ZERO));
+    if desired != w.desired && (desired < w.desired || probe_ready) {
         w.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired.unwrap_or(0)));
         w.desired = desired;
     }

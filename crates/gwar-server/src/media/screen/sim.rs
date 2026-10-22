@@ -389,7 +389,24 @@ impl Sim {
                 contents: datagram.as_slice().try_into().unwrap(),
             };
             self.client.handle_input(Input::Receive(now, receive)).unwrap();
+            // RTP mode has one pending packet event: drain before the next input.
+            self.drive_client();
         }
+        self.drive_client();
+        if server_due {
+            for datagram in self.up.due(now) {
+                self.deliver(&datagram);
+            }
+        }
+        self.now += MS;
+        if server_due {
+            self.w.rtc.handle_input(Input::Timeout(self.now)).unwrap();
+        }
+        self.client.handle_input(Input::Timeout(self.now)).unwrap();
+    }
+
+    fn drive_client(&mut self) {
+        let now = self.now;
         let mut due = 0;
         loop {
             match self.client.poll_output().unwrap() {
@@ -414,16 +431,6 @@ impl Sim {
                 Output::Event(_) => {}
             }
         }
-        if server_due {
-            for datagram in self.up.due(now) {
-                self.deliver(&datagram);
-            }
-        }
-        self.now += MS;
-        if server_due {
-            self.w.rtc.handle_input(Input::Timeout(self.now)).unwrap();
-        }
-        self.client.handle_input(Input::Timeout(self.now)).unwrap();
     }
 
     /// Hands the SFU a datagram from the viewer.
@@ -664,6 +671,72 @@ mod tests {
         assert!(resumes(&sim, 0) > 0, "{}", summary(&sim));
         let bytes = sim.bytes(sim.now - 10 * SECOND, sim.now, |k| matches!(k, Kind::Original { .. }));
         assert!(bytes as f64 * 8.0 / 10.0 >= 0.6 * 4_000_000.0, "media flows after resume: {}", summary(&sim));
+    }
+
+    #[test]
+    fn game_recovers_after_scheduler_delay_and_bandwidth_collapse() {
+        const RESTORE_LINK: Duration = Duration::from_secs(27);
+        const RESTORE_CADENCE: Duration = Duration::from_secs(67);
+        const MAX_RESUME: Duration = Duration::from_secs(45);
+        const END: Duration = Duration::from_secs(160);
+
+        // Cover the reviewer's combined failure, and recovery while the SFU remains slow.
+        for restore_cadence in [true, false] {
+            let mut sim = Sim::new(Some(20_000_000));
+            sim.server_interval = 10 * MS;
+            sim.watch("game", 8_000_000, 60, 200_000, None);
+            sim.run(COLLAPSE);
+            assert!(sim.changes.is_empty(), "{}", summary(&sim));
+            sim.down.rate = Some(1_000_000);
+            sim.run(RESTORE_LINK - COLLAPSE);
+            assert_eq!(sim.paused(0), Some(ScreenPauseReason::Bandwidth), "{}", summary(&sim));
+            sim.down.rate = Some(20_000_000);
+            sim.run(RESTORE_CADENCE - RESTORE_LINK);
+            if restore_cadence {
+                sim.server_interval = MS;
+            }
+            sim.run(END - RESTORE_CADENCE);
+
+            let context = format!("restore_cadence={restore_cadence}: {}", summary(&sim));
+            let resumed = sim.changes.iter().find_map(|(at, slot, change)| {
+                (*slot == 0 && *change == Change::Resume && *at >= sim.start + RESTORE_LINK)
+                    .then(|| *at - sim.start - RESTORE_LINK)
+            });
+            let resumed = resumed.unwrap_or_else(|| panic!("the healthy link must resume: {context}"));
+            assert!(resumed <= MAX_RESUME, "resume after {resumed:?}, bound {MAX_RESUME:?}: {context}");
+            assert_eq!(sim.paused(0), None, "{context}");
+            assert!(
+                sim.changes.iter().all(|(at, _, change)| {
+                    *at <= sim.start + RESTORE_LINK + resumed || !matches!(change, Change::Pause(_))
+                }),
+                "video stays resumed: {context}"
+            );
+            let ssrc = sim.ssrcs(0).0;
+            // Every final ten-second window must carry the intended video at the receiver.
+            // Socket sends alone could pass despite downlink drops or an idle receiver.
+            let mut rates = Vec::new();
+            for end in [140, 150, 160] {
+                let to = sim.start + end * SECOND;
+                let from = to - 10 * SECOND;
+                let bytes: usize = sim
+                    .received
+                    .iter()
+                    .filter(|(at, source, _, _)| *at >= from && *at < to && *source == ssrc)
+                    .map(|(_, _, _, payload)| payload.len())
+                    .sum();
+                let bps = bytes as f64 * 8.0 / 10.0;
+                assert!(bps >= 0.9 * 8_000_000.0, "received video {bps} bps: {context}");
+                rates.push(bps);
+            }
+            let sent_bps =
+                sim.bytes(sim.now - 10 * SECOND, sim.now, |k| matches!(k, Kind::Original { .. })) as f64 * 8.0 / 10.0;
+            println!(
+                "restore_cadence={restore_cadence} resume_after={resumed:?} received_bps={rates:?} \
+                 sent_bps={sent_bps} extras_dropped={} estimate={}",
+                sim.w.egress.counters.extras_dropped,
+                sim.w.egress.estimate(),
+            );
+        }
     }
 
     #[test]

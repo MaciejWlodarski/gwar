@@ -15,8 +15,18 @@ Gwar's released originals drain without a per-packet timer. `ProbeClusterState`
 accounts for elapsed time on a late wake, within the remaining cluster bytes;
 spacing between bursts and Gwar's socket cap remain enabled.
 
+`Bwe::set_padding_bitrate_limit` caps regular background padding independently
+of probe clusters. The session reapplies the limit after estimate updates and
+retains it across estimator resets. Gwar screen-watch transports set it to zero
+while their reserve refills, then remove the limit when the reserve is ready.
+This keeps str0m's 50 kbps idle padding from exhausting a probe reserve
+refilling at only 10 kbps after a collapse. Probe traffic still passes Gwar's
+actual-byte extras cap; burst sizes are unchanged.
+
 Regressions cover multi-packet burst draining, Game startup with scheduler
-jitter, recovery after a bandwidth collapse, and 16-byte Text deltas at 5 fps.
+jitter, combined slow scheduling and bandwidth collapse with bounded resume
+and sustained received video, and 16-byte Text deltas at 5 fps.
 The e2e screen tests use 6-byte packets. Remove these changes when upstream
 provides equivalent protection. Changed upstream files:
-`src/streams/send.rs`, `src/pacer/leaky.rs` and `src/bwe/probe/cluster.rs`.
+`src/streams/send.rs`, `src/pacer/leaky.rs`, `src/bwe/probe/cluster.rs`,
+`src/bwe/api.rs` and `src/session.rs`.

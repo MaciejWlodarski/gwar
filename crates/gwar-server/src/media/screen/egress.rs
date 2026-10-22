@@ -73,8 +73,8 @@ const KEYFRAME_MEMORY: Duration = Duration::from_secs(30);
 const DESIRED_HEADROOM: f64 = 1.1;
 /// str0m probes at up to twice this target. At 1.5 × estimate, a 15 ms cluster
 /// uses 45 ms × estimate before headers, within the 60 ms × estimate extras burst.
-/// Larger targets wait for the reserve to refill, with one MTU of tolerance for background
-/// padding, so discovery cannot manufacture local TWCC loss.
+/// Larger targets wait for the reserve to refill, with one MTU of tolerance at the
+/// allocation tick. Watch transports suspend regular padding while the reserve refills.
 const PROBE_REACH: f64 = 1.5;
 
 /// One original packet waiting for its viewer, already mapped onto the slot's segment.
@@ -703,8 +703,8 @@ impl Egress {
         Some((lane, Change::Resume))
     }
 
-    /// Refill the reserve before raising the probe target. Leave one MTU of tolerance
-    /// so background padding cannot prevent a refill from being observed at a tick.
+    /// Refill the reserve before raising the probe target, with one MTU of tolerance
+    /// at the allocation tick. Watch transports suspend regular padding until this is ready.
     pub fn probe_ready(&mut self, now: Instant) -> bool {
         self.extras.available(now) >= extras_burst(self.estimate) - 1200.0
     }

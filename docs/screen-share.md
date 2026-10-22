@@ -519,18 +519,26 @@ not a voice acceptance measurement.
 The fixes drain bounded unpaced/probe bursts without per-packet timer wakes,
 account for elapsed time on late probe wakes, and update the watch clock
 before polling. The probe target now respects the refilled extras reserve.
+Screen-watch transports suspend ordinary background padding at its source
+while the reserve refills; probe clusters remain enabled. Otherwise str0m's
+50 kbps padding can drain the extras bucket faster than its 10 kbps refill
+at a 100 kbps estimate,
+permanently blocking target growth even after the link recovers. The padding
+limit survives estimator updates and resets; background padding returns
+when the reserve is ready. Burst sizes are unchanged.
 Regressions use an independent viewer clock with 1, 2, 5 and 10 ms SFU
 cadences plus periodic 10 ms stalls, require steady video throughput, restore
 a link after an actual bandwidth pause, and pin resume at exactly 10 s of
 continuous room. Pause thresholds and socket caps are unchanged.
 
 **Local follow-up verification.** All builds used `CARGO_BUILD_JOBS=4`
-and the worktree's `target/`. Server unit tests: 285 passed (including 49
+and the worktree's `target/`. Server unit tests: 286 passed (including 50
 screen tests and monthly egress); screen integration: 10; latency example:
 24; vendored str0m: 759; Python harness: 4. The no-default-features server
 check, clippy with `-D warnings`, rustfmt and `git diff --check` passed.
 
-The final macOS loopback gate used one pair of 40 markers per scenario:
+The earlier macOS loopback gate at `a4c76a1` used one pair of 40 markers
+per scenario:
 unconstrained, all five viewers at 7.87 Mbps with zero pauses,
 voice p95/p99 deltas +0.60/+0.25 ms;
 downlink-loss, 3.08 Mbps still active, p99 delta
@@ -899,6 +907,9 @@ classified by its header, with no decryption:
   - rate `0.1 × estimate`;
   - burst `max(64 KB, 30 ms × 2 × estimate)`, enough for a str0m probe
     cluster at up to twice the estimate. This is the reserved probe capacity.
+
+  Ordinary background padding is suspended on watch transports while credit
+  accumulates between probe clusters, including at the lowest estimates.
 - **Control:** RTCP (payload types 192–223), STUN and DTLS are small and
   always sent.
 
@@ -1033,7 +1044,19 @@ serves the voice acceptance instead. Results and deviations:
   Recovery then uses measured capacity and the usual 10 s fit guard; Retry
   is no longer required to recover a healthy link. Regressions cover an
   8 Mbps/60 fps share with a 200 KB keyframe from startup, scheduler jitter,
-  and an actual bandwidth pause followed by restored capacity.
+  and an actual bandwidth pause followed by restored capacity. The combined
+  regression (`game_recovers_after_scheduler_delay_and_bandwidth_collapse`)
+  runs Game at 8 Mbps/60 fps with a 200 KB keyframe and a 10 ms SFU cadence:
+  a 20 Mbps link collapses to 1 Mbps at 12 s, recovers at 27 s, and the cadence
+  returns to 1 ms at 67 s. It runs until 160 s and also covers keeping the
+  10 ms cadence throughout. Each run must resume within 45 s of link recovery,
+  remain resumed, and deliver at least 90 % of the intended payload rate in
+  each of the final three ten-second receiver windows. Both variants resume
+  at 56.45 s (29.45 s after link restoration), with no later pause, 8.00 Mbps
+  of received video payload and 8.34 Mbps of serialized originals. Total
+  extras drops fall from 15,372 in the original combined scenario to 145.
+  The simulated receiver drains str0m after every datagram, preserving its
+  single pending RTP event when several packets arrive within one millisecond.
 - **A test pins str0m behavior:** `set_rtx_cache` empties the cache. Built
   (`set_rtx_cache_empties_the_cache`).
 
@@ -1085,10 +1108,13 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   periodic probe runs at twice that target: a 15 ms cluster uses
   45 ms × estimate before headers, within the unchanged 60 ms × estimate
   extras burst. Increases wait until the reserve has refilled to within one
-  MTU; that tolerance prevents regular background padding from starving
-  discovery. Decreases apply immediately. The earlier 2× reach and its
-  measurements predate the per-packet timer fix and do not describe the
-  corrected pacer's burst behavior.
+  MTU. Screen-watch transports suspend ordinary background padding through
+  `Bwe::set_padding_bitrate_limit(Some(Bitrate::ZERO))`, so it cannot consume
+  the refill while the target waits. Once ready, the background-padding limit
+  is removed. Probe clusters still supply TWCC feedback during a pause;
+  every extra datagram still passes the actual-byte cap. Decreases apply
+  immediately. The earlier 2× reach and its measurements predate the
+  per-packet timer fix and do not describe the corrected pacer's burst behavior.
 - **Ramp.** A slot that starts carrying a share is not paused for its first
   10 s; failed keyframes and averages start counting after that. Added in
   PR 3b: a watch transport's estimate starts at 2.5 Mbps, where `B` is

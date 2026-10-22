@@ -99,6 +99,7 @@ pub(crate) struct Session {
 
     bwe: Option<Bwe>,
     bwe_last_event: Option<(Bitrate, bool)>,
+    bwe_padding_bitrate_limit: Option<Bitrate>,
 
     enable_twcc_feedback: bool,
 
@@ -205,6 +206,7 @@ impl Session {
             max_rx_seq_lookup: HashMap::new(),
             bwe,
             bwe_last_event: None,
+            bwe_padding_bitrate_limit: None,
             enable_twcc_feedback: false,
             pacer,
             pacer_control: PacerControl::new(),
@@ -1326,6 +1328,11 @@ impl Session {
         }
     }
 
+    pub fn set_bwe_padding_bitrate_limit(&mut self, limit: Option<Bitrate>) {
+        self.bwe_padding_bitrate_limit = limit;
+        self.configure_pacer();
+    }
+
     pub fn reset_bwe(&mut self, init_bitrate: Bitrate) {
         if let Some(bwe) = self.bwe.as_mut() {
             bwe.reset(init_bitrate);
@@ -1368,7 +1375,10 @@ impl Session {
             .pacer_control
             .calculate(has_active_media, current_estimate, is_overuse);
 
-        self.pacer.set_padding_rate(result.padding_rate);
+        let padding_rate = self
+            .bwe_padding_bitrate_limit
+            .map_or(result.padding_rate, |limit| result.padding_rate.min(limit));
+        self.pacer.set_padding_rate(padding_rate);
         self.pacer.set_pacing_rate(result.pacing_rate);
     }
 
