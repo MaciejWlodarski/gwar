@@ -4,7 +4,8 @@ Status: **design, with the owner's decisions of 2026-10-21 folded in**
 ([Owner decisions](#owner-decisions)). Built so far: the share state and its
 protocol (PR 2), the SFU's transports and forwarding (PR 3a), and sharing and
 watching from the browser in plaintext channels (PR 4,
-[as built](#web-client-as-built-pr-4)). Phase 1
+[as built](#web-client-as-built-pr-4)), and the same in the desktop app (PR 5,
+[as built](#desktop-app-as-built-pr-5)). Phase 1
 goes through the server's SFU. Peer-to-peer sharing comes later and is only
 sketched at the end. The spike code was thrown away; only its results are
 kept here ([Spikes](#spikes)).
@@ -1696,9 +1697,8 @@ transports), `state/screen.ts` (the state machine), `state/screen-controller.ts`
 (the protocol) and `ui/Screen.tsx` (button, preset menu, sharing bar, LIVE
 badge, stage). Decisions taken while building it, where this design left room:
 
-- **Desktop waits for PR 5.** The desktop build hides the Share button and does
-  not watch: its LIVE badge says that watching needs the browser for now, the
-  wording planned for Linux. PR 5 enables both on macOS and Windows.
+- **The desktop app** shares and watches from PR 5 on
+  ([as built](#desktop-app-as-built-pr-5)).
 - **Encrypted channels.** The Share button stays visible but disabled, labelled
   "Screen sharing in encrypted channels is coming soon". The client also checks
   before `screen.start` and before watching, so nothing is captured, sent or
@@ -1767,6 +1767,73 @@ badge, stage). Decisions taken while building it, where this design left room:
   `MediaStreamTrackProcessor`, and `VideoFrame` and `requestVideoFrameCallback`
   need a painted video. Linux WebKit is not a supported platform (see the
   desktop table above).
+
+
+### Desktop app as built (PR 5)
+
+The desktop app runs PR 4's web code in its webview: the same capture,
+publish and watch transports and the same UI, beside the native voice engine.
+Video never crosses into Rust. The native engine, `voice_set_keys` and the
+voice command contract are unchanged. In plaintext channels there is no
+screen worker; it arrives with PR 7's encrypted shares.
+
+- **Where it shares.** A new app-owned command, `screen_capture_support`
+  (`src-tauri/src/screen.rs`), answers once at start:
+  - `ok` on macOS 14 or later (the major version from
+    `NSProcessInfo.operatingSystemVersion`) and on Windows;
+  - `macos_too_old` before macOS 14: the Share button is shown disabled,
+    "Screen sharing needs macOS 14 or later", and no picker opens;
+    watching works wherever the webview has `RTCPeerConnection`;
+  - `unsupported` on Linux: no Share button, and the LIVE badge's tooltip
+    says watching needs the browser (owner decision 1).
+  - Until it answers, the desktop neither shares nor watches; if the command
+    fails, it stays that way.
+  - The controller checks the same answer before opening the picker, not only
+    the button.
+- **Windows** runs WebView2's Chromium picker, as §1 says. The app's origin
+  there, `http://tauri.localhost`, is a secure context (Chromium treats
+  `*.localhost` as potentially trustworthy), so `getDisplayMedia` is exposed.
+  `CaptureController` and `surfaceSwitching` work as in Chrome.
+- **macOS** runs WebKit's own picker path (§1). WKWebView has no
+  `CaptureController` (PR 1), so sharing a window may bring it in front of
+  Gwar; the call works without it.
+- **Info.plist and entitlements: nothing added.**
+  - macOS has no usage-description key for screen recording.
+  - The app is not sandboxed, and the hardened runtime has no screen-capture
+    entitlement.
+  - With `SCContentSharingPicker` (macOS 14+), the system picker is the
+    consent and no Screen Recording permission is needed. Were WebKit to use
+    its own window list instead (not expected on 14+), macOS would ask once for
+    Screen Recording for "Gwar"; the manual checklist records which happens.
+  - `NSCameraUsageDescription` (wry #1195) stays out until a manual check shows
+    the picker fails without it; that check is in the PR's checklist.
+- **CSP: no change.**
+  - WebRTC is not governed by `connect-src`, and the policy sets no `webrtc`
+    directive.
+  - A `MediaStream` in `video.srcObject` is not a fetch, so `media-src` does not
+    apply.
+  - There are no workers in plaintext; PR 7's worker is a bundled script,
+    allowed by `default-src 'self'`.
+  - `frame-src 'none'` stays.
+- **Tray.** The tray menu gets "Stop sharing screen", enabled from the picker
+  until the share ends, and the tooltip says "Gwar (sharing your screen)".
+  - The red dot on the tray icon (§6) is not drawn. The macOS icon is a
+    template image, which the menu bar recolors, so a red dot would need a
+    second, non-template icon pair for light and dark menu bars. macOS already
+    shows its own screen-recording indicator there.
+- **Tests.**
+  - Unit tests:
+    - the platform gate (Rust);
+    - the button, the badge and the controller for each answer (vitest);
+    - the tray tooltip.
+  - The native-voice Playwright run (`e2e:native-voice`) now ends in a
+    plaintext channel:
+    - a device driving the native engine shares a canvas through the
+      webview's transports, and the browser device watches it from the LIVE
+      badge and reads its barcode;
+    - voice goes on both ways while it shares, and after it stops.
+  - Real capture in WKWebView and WebView2 needs a human at the picker, so
+    PR 1's checklist is repeated by hand on release builds.
 
 ## 7. Phases and pull requests
 
