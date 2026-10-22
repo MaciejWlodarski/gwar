@@ -691,3 +691,29 @@ describe("encrypted server chat", () => {
     expect(reduce(s, { type: "sealedStatus", thread: "server", securing: true })).toBe(s);
   });
 });
+
+describe("screen shares", () => {
+  const share = (id: string, client: number, channel = 1) => ({ share: id, client, channel, preset: "text" as const, surface: "window" as const });
+  const live = () => ev(ev(online(), { ev: "screen.started", d: share("A", 2) }), { ev: "client.updated", d: cl(2, 1, { sharing: true }) });
+
+  it("lists the shares of the welcome and of announcements in visible channels", () => {
+    const s = reduce(initialState, { type: "welcome", resync: false, now: 1, welcome: welcome({ session: 1, uid: "u1", channels: [ch(1)], clients: [cl(1), cl(2, 1, { sharing: true })], shares: [share("A", 2), share("H", 3, 9)] }) });
+    expect(Object.keys(s.shares)).toEqual(["A"]);
+    expect(Object.keys(live().shares)).toEqual(["A"]);
+    expect(ev(online(), { ev: "screen.started", d: share("X", 2, 99) }).shares).toEqual({});
+  });
+
+  it("ends a share when it stops, its sharer stops sharing or leaves, or its channel is hidden", () => {
+    expect(ev(live(), { ev: "screen.stopped", d: { share: "A", reason: "moderator", by: "mod" } }).shares).toEqual({});
+    expect(ev(live(), { ev: "client.updated", d: cl(2, 1, { sharing: false }) }).shares).toEqual({});
+    expect(ev(live(), { ev: "client.left", d: { client: 2, reason: { kind: "quit" } } }).shares).toEqual({});
+    expect(ev(live(), { ev: "channel.hidden", d: { channel: 1 } }).shares).toEqual({});
+  });
+
+  it("keeps a share whose watch alone ended for me (access)", () => {
+    const s = ev(live(), { ev: "screen.stopped", d: { share: "A", reason: "access" } });
+    expect(Object.keys(s.shares)).toEqual(["A"]);
+    // The sharer losing `share_screen` also says `access`; their `sharing` going off ends it.
+    expect(ev(s, { ev: "client.updated", d: cl(2, 1, { sharing: false }) }).shares).toEqual({});
+  });
+});

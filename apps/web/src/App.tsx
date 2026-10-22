@@ -16,6 +16,8 @@ import { TooltipProvider } from "./ui/kit";
 import { MemberList } from "./ui/MemberList";
 import { useMembersPanel } from "./ui/members";
 import { ServerRail } from "./ui/ServerRail";
+import { SharePresetDialog, SharingBar, Stage } from "./ui/Screen";
+import { useScreen } from "./state/screen";
 import { Sidebar } from "./ui/Sidebar";
 import { Toaster } from "./ui/Toaster";
 
@@ -36,6 +38,8 @@ export function App() {
   const setMembersDrawer = useUi((s) => s.setMembersDrawer);
   const members = useMembersPanel();
   const showApp = phase === "online" || phase === "reconnecting";
+  const stageOpen = useScreen((s) => s.stage !== null);
+  const chatHidden = useScreen((s) => s.chatHidden);
 
   useTheme();
   useShortcuts();
@@ -58,13 +62,28 @@ export function App() {
     <TooltipProvider>
       <div className="flex h-dvh w-full flex-col overflow-hidden bg-rail">
         <ConnectionWarning phase={phase} insecure={insecureConnection} />
+        {showApp && <SharingBar />}
         <div className="flex min-h-0 w-full flex-1 overflow-hidden">
           {!isMobile && <ServerRail />}
           {showApp ? (
             <>
               {!isMobile && <Sidebar />}
-              <ChatArea />
-              {!isMobile && members.open && <MemberList />}
+              {stageOpen ? (
+                <>
+                  {/* Watching: the stage is the main content, the chat collapsible beside it. */}
+                  <Stage />
+                  {!isMobile && !chatHidden && (
+                    <div className="flex w-[min(380px,32vw)] min-w-0 shrink-0 border-l border-line">
+                      <ChatArea />
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  <ChatArea />
+                  {!isMobile && members.open && <MemberList />}
+                </>
+              )}
             </>
           ) : (
             <ConnectScreen />
@@ -106,6 +125,7 @@ export function App() {
         </DialogPrimitive.Root>
       )}
       <Dialogs />
+      {showApp && <SharePresetDialog />}
       <Toaster />
     </TooltipProvider>
   );

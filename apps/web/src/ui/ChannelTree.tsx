@@ -40,6 +40,7 @@ import { useChannelPermission, useGroupsColor, useMyWho, useWhoOf } from "./hook
 import { canActOn } from "../lib/permissions";
 import { CLIENT_MIME, clientDragData, readClientDrag } from "../lib/client-drag";
 import { ModerationItems } from "./ModerationMenu";
+import { LiveBadge } from "./Screen";
 import { EmptyState, TalkingAvatar, Slider, menuContent, menuItem, menuItemDanger, menuLabel, menuSeparator } from "./kit";
 
 export function ChannelTree() {
@@ -387,6 +388,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
             {client.nickname}
           </span>
           <TsGroupBadges groups={client.groups} channelGroup={client.channel_group} />
+          <LiveBadge client={client} name={client.nickname} />
           {client.away !== null && (
             <span className="min-w-0 max-w-[40%] truncate text-xs text-subtle" title={client.away}>
               {client.away || t("tree.away")}

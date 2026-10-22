@@ -1,10 +1,11 @@
 import * as ContextMenu from "@radix-ui/react-context-menu";
-import { Ban, BellRing, DoorOpen, Pencil, ChevronRight, HeadphoneOff, MicOff, ShieldCheck, UserMinus, UserX } from "lucide-react";
+import { Ban, BellRing, DoorOpen, Pencil, ChevronRight, HeadphoneOff, MicOff, ScreenShareOff, ShieldCheck, UserMinus, UserX } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { isTeamSpeak } from "../lib/platform";
 import { canActOn, canGiveGroup, ADMIN_GROUP, MEMBER_GROUP, orderedGroups, toggleGroup } from "../lib/permissions";
 import { controller } from "../state/controller";
+import { shareOf } from "../state/reducer";
 import { useSession, useUi, type PersonRef } from "../state/stores";
 import { useChannelPermission, useMyWho, usePermission, useWhoOf } from "./hooks";
 import { menuContent, menuItem, menuItemDanger, menuSeparator } from "./kit";
@@ -44,7 +45,10 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
   const showRoles = !isMe && onGwar && canGroups;
   const showRemove = !isMe && onGwar && canRemove;
   const showVoice = !isMe && onGwar && !!target && target.channel !== null && canMuteHere;
-  if (!showRename && !showPoke && !showKick && !showBan && !showRoles && !showRemove && !showVoice) return null;
+  // A moderator of the channel, ranked above the sharer, may stop their screen share.
+  const share = useSession((s) => (person.session !== undefined ? shareOf(s, person.session) : undefined));
+  const showStopShare = !isMe && onGwar && !!share && canMuteHere && !stronger;
+  if (!showRename && !showPoke && !showKick && !showBan && !showRoles && !showRemove && !showVoice && !showStopShare) return null;
 
   const roles = orderedGroups(defs).filter((g) => g.id !== MEMBER_GROUP);
 
@@ -115,6 +119,11 @@ export function ModerationItems({ person, groups }: { person: PersonRef; groups:
             </ContextMenu.Item>
           )}
         </>
+      )}
+      {showStopShare && (
+        <ContextMenu.Item className={menuItem} onSelect={() => void controller.screen.stopOther(share!.share)}>
+          <ScreenShareOff className="size-4" /> {t("screen.stopOther")}
+        </ContextMenu.Item>
       )}
       {showPoke && (
         <ContextMenu.Item className={menuItem} onSelect={() => useUi.getState().openDialog({ kind: "poke", person })}>

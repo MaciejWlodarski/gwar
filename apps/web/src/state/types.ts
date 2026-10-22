@@ -8,6 +8,7 @@ import type { Group } from "../proto/Group";
 import type { IceServer } from "../proto/IceServer";
 import type { Member } from "../proto/Member";
 import type { Permission } from "../proto/Permission";
+import type { ScreenShare } from "../proto/ScreenShare";
 import type { ServerInfo } from "../proto/ServerInfo";
 
 /** `channel` is the tab for the channel I am looking at (`SessionState.viewChannel`), in voice or not. */
@@ -68,6 +69,8 @@ export interface SessionState {
   iceServers: IceServer[];
   /** Which user's audio currently arrives on each receive slot. */
   slots: Array<number | null>;
+  /** Running screen shares in the channels I can see, by share id (docs/screen-share.md). */
+  shares: Record<string, ScreenShare>;
   threads: Record<string, Thread>;
   activeThread: ThreadKey;
   /** The channel whose chat the `channel` tab shows (not necessarily the one I am in voice in). */

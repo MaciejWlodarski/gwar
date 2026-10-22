@@ -9,6 +9,7 @@ import { useSession, useVoice } from "../state/stores";
 import { useChannelPermission, useMe, keyLabel, modKey } from "./hooks";
 import { Button, IconButton, TalkingAvatar } from "./kit";
 import { ConnectBadge } from "./badges";
+import { ShareButton } from "./Screen";
 
 /** Mic toggle that doubles as a level meter and talking indicator. */
 export function MicButton({ size = "lg" }: { size?: "md" | "lg" | "wide" }) {
@@ -194,9 +195,10 @@ export function VoicePanel() {
         </div>
       )}
       <SelfRow sub={me?.away ? <span className="truncate">{me.away}</span> : null} />
-      <div className="grid grid-cols-2 gap-1.5">
+      <div className="grid auto-cols-fr grid-flow-col gap-1.5">
         <MicButton size="wide" />
         <DeafenButton size="wide" />
+        <ShareButton />
       </div>
     </div>
   );
