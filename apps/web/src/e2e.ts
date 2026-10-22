@@ -10,6 +10,7 @@ const modules: Record<string, () => Promise<unknown>> = {
   "/src/net/message-signature.ts": () => import("./net/message-signature.ts"),
   "/src/state/controller.ts": () => import("./state/controller.ts"),
   "/src/state/reducer.ts": () => import("./state/reducer.ts"),
+  "/src/state/screen.ts": () => import("./state/screen.ts"),
   "/src/state/settings.ts": () => import("./state/settings.ts"),
   "/src/state/stores.ts": () => import("./state/stores.ts"),
   "/src/voice/denoise/index.ts": () => import("./voice/denoise/index.ts"),
