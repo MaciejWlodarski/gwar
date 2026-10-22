@@ -95,12 +95,6 @@ impl Bwe {
         self.bwe.end_probe(now, cluster_id);
     }
 
-    pub fn request_recovery_probe(&mut self, now: Instant) -> bool {
-        self.bwe
-            .probe_control
-            .request_recovery_probe(self.desired_bitrate, now)
-    }
-
     pub fn set_min_probe_interval(&mut self, interval: Duration) {
         if self.min_probe_interval == interval {
             return;

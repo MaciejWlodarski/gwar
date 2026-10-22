@@ -1198,9 +1198,12 @@ serves the voice acceptance instead. Results and deviations:
   If no paused lane fits, it retries after 15 s once the reserve refills. A
   continuous-fit guard in progress finishes before another reset, and ready
   priority handoffs/resumes run first. There is no custom recovery probe,
-  estimate-progress tracking or adaptive target backoff. Resets discard congestion/ACK/loss history, estimate smoothing,
-  in-flight TWCC send records, pending probe padding, pacer debt and scheduler
-  history. RTP, TWCC and SRTP sequence counters and the transport stay intact.
+  estimate-progress tracking or adaptive target backoff. Resets discard
+  congestion/ACK/loss history, estimate smoothing,
+  in-flight TWCC send records, pending padding from both the fallback and every
+  media/RTX source, pacer debt and scheduler history. Queued media and repair
+  caches survive the reset. RTP, TWCC and SRTP sequence counters and the
+  transport stay intact.
   Existing socket credit is preserved, never replenished by a reset. Both
   desired-bitrate copies are clamped to 1.5 times the new estimate before reset.
   Once the normal ten-second continuous-fit guard permits resume, sparse
@@ -1215,6 +1218,25 @@ serves the voice acceptance instead. Results and deviations:
   false re-pause after a successive or long outage. Byte-limited bursts still
   leave a tail for a later timestamp, including when media starts the cluster.
   Paced media retains its original timing and first-burst size.
+
+  Released media can also consume that reserved tail at the first timestamp.
+  Once their byte and packet targets are met, byte-limited probes remain open
+  for a later timestamp within the supported regular cadence (at most 20 ms).
+  If no media arrives then, one blank packet uses the existing MTU rounding
+  reserve. A longer scheduler stall ends that single-timestamp cluster without
+  tagging another packet; its invalid result is discarded, so scheduling delay
+  cannot become a false low-capacity sample. Without this guard, the estimator rejected zero-duration clusters,
+  leaving a healthy 20 Mbps viewer at about 7.75 Mbps estimated capacity and
+  pausing it at 15.06 s with 1% loss and 15 ms scheduling. The separate
+  outage-free regression requires zero pauses for every cadence from 1 through
+  20 ms at 0%, 1% and 2% loss (60 cases), plus at least 7.2 Mbps received in
+  each of the final three ten-second windows. Neither allocator thresholds nor
+  upstream's unbounded-probe timing changes.
+
+  This allocator-driven pause does not exist on current `main` (`a78f775`):
+  source comparison confirms it has no screen bandwidth allocator and its watch
+  transports do not enable BWE. This is a source-based comparison; the PR's
+  simulation cannot run unchanged there because that egress path is absent.
 
   Permanent regressions include the reviewer's exact 15 ms cadence with a
   100 ms stall every 2 s and a 12-42 s collapse, and the successive 12-42 s
@@ -1250,34 +1272,37 @@ serves the voice acceptance instead. Results and deviations:
   pauses, and require at least 90 % of the intended payload rate in each
   of the final three ten-second receiver windows. This is a deterministic
   regression bound for these fixtures, not a production recovery guarantee.
-  Coarse, lossy startup may pause before the imposed collapse; every case
-  must send originals before the outage and meet the same recovery assertions.
+  Every case must have zero startup pauses and send originals before the
+  outage, then meet the same recovery assertions.
   The separate scheduling-restoration case changes 10 ms back to 1 ms
   40 s after restoration and applies the same resume and throughput checks.
+
+  These tables were regenerated from the complete 70-case regression with the
+  timestamp guard and complete padding-reset fixes above.
 
   **Lossless: resume delay in seconds after physical restoration.**
 
   | Collapse | 1 ms | 5 ms | 10 ms | 15 ms | 20 ms |
   | --- | ---: | ---: | ---: | ---: | ---: |
-  | 15 s | 18.244 | 16.645 | 15.750 | 60.510 | 39.060 |
-  | 28 s | 19.444 | 16.645 | 15.250 | 47.510 | 26.060 |
-  | 29 s | 18.444 | 17.645 | 14.250 | 46.510 | 25.060 |
-  | 30 s | 17.444 | 17.845 | 16.250 | 45.510 | 24.060 |
-  | 30.1 s | 17.344 | 17.745 | 16.150 | 45.410 | 23.960 |
-  | 60 s | 20.044 | 18.145 | 16.350 | 16.770 | 18.560 |
-  | 120 s | 17.144 | 18.045 | 16.350 | 17.145 | 18.060 |
+  | 15 s | 28.644 | 15.845 | 14.550 | 54.735 | 33.960 |
+  | 28 s | 15.644 | 18.645 | 16.650 | 41.735 | 20.960 |
+  | 29 s | 14.644 | 17.645 | 15.550 | 40.735 | 19.960 |
+  | 30 s | 13.644 | 16.645 | 14.550 | 39.735 | 18.960 |
+  | 30.1 s | 13.544 | 16.545 | 14.450 | 39.635 | 18.860 |
+  | 60 s | 13.644 | 18.245 | 14.550 | 28.530 | 24.760 |
+  | 120 s | 39.644 | 21.445 | 14.550 | 19.035 | 18.460 |
 
   **1 % downlink loss: resume delay in seconds after physical restoration.**
 
   | Collapse | 1 ms | 5 ms | 10 ms | 15 ms | 20 ms |
   | --- | ---: | ---: | ---: | ---: | ---: |
-  | 15 s | 16.744 | 16.645 | 15.350 | 21.450 | 24.460 |
-  | 28 s | 16.944 | 16.645 | 17.350 | 23.360 | 26.660 |
-  | 29 s | 15.944 | 17.645 | 16.350 | 22.360 | 25.660 |
-  | 30 s | 16.944 | 17.645 | 15.350 | 21.360 | 24.660 |
-  | 30.1 s | 16.844 | 17.545 | 15.250 | 21.260 | 24.560 |
-  | 60 s | 17.544 | 18.245 | 15.850 | 17.505 | 17.960 |
-  | 120 s | 17.844 | 18.445 | 15.850 | 17.670 | 16.960 |
+  | 15 s | 28.844 | 15.645 | 15.550 | 39.090 | 32.460 |
+  | 28 s | 15.844 | 17.545 | 16.650 | 26.090 | 19.460 |
+  | 29 s | 14.844 | 16.545 | 15.550 | 25.090 | 18.460 |
+  | 30 s | 13.844 | 15.545 | 14.550 | 24.090 | 17.460 |
+  | 30.1 s | 13.744 | 15.445 | 14.450 | 23.990 | 17.360 |
+  | 60 s | 13.844 | 18.045 | 15.550 | 30.000 | 24.760 |
+  | 120 s | 40.844 | 21.445 | 15.550 | 22.080 | 19.660 |
 
 
   The simulated receiver drains str0m after every datagram, preserving its

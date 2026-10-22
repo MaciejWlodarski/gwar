@@ -1271,6 +1271,12 @@ impl StreamTx {
         }
     }
 
+    /// Discard padding from an old BWE without touching media, repairs or sequence state.
+    pub(crate) fn clear_padding(&mut self) {
+        self.padding = 0;
+        self.queue_info = None;
+    }
+
     pub(crate) fn reset_buffers(&mut self) {
         self.send_queue.clear();
         self.queue_info = None;

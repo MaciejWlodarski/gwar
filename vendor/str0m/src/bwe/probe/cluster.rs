@@ -224,7 +224,9 @@ impl ProbeClusterState {
     /// to calculate the target bytes threshold. This ensures probes complete even
     /// when all packets are sent at the same instant (e.g., in tests or when the
     /// pacer generates bursts faster than wall-clock time advances).
-    pub fn is_complete(&self, _now: Instant) -> bool {
+    /// Explicitly byte-limited probes allow one regular wake (up to 20 ms) for
+    /// a usable second timestamp before ending an otherwise complete cluster.
+    pub fn is_complete(&self, now: Instant) -> bool {
         if self.started_at.is_none() {
             return false; // Not started yet
         }
@@ -234,7 +236,16 @@ impl ProbeClusterState {
         let bytes_met = self.bytes_sent >= self.byte_target;
         let packets_met = self.packets_sent >= self.config.min_packet_count;
 
-        bytes_met && packets_met
+        // Application-paced media can consume the entire padding tail in the
+        // first burst. A byte-limited cluster still needs a later timestamp,
+        // otherwise the probe estimator rejects it with a zero send interval.
+        // If the next wake misses the supported regular cadence, finish without
+        // adding a timing packet: the zero-duration result is discarded rather
+        // than measuring the scheduler stall as a loss of network capacity.
+        let timing_met = !self.config.is_byte_limited()
+            || self.last_packet_at > self.started_at
+            || now.saturating_duration_since(self.started_at.unwrap()) > Duration::from_millis(20);
+        bytes_met && packets_met && timing_met
     }
 
     /// Check if it's time to send the next probe packet.
@@ -337,8 +348,13 @@ impl ProbeClusterState {
         // Like BitrateProber::ProbeSent, completion requires both the byte and
         // packet thresholds. At low rates the byte target can fit in one packet;
         // keep sending bounded padding until the minimum packet count is met.
+        // If media spent the byte target at one clock, one later blank packet
+        // supplies usable timing within the application's packet-rounding reserve.
+        let needs_timestamp = self.config.is_byte_limited()
+            && self.last_packet_at == self.started_at
+            && self.started_at.is_some_and(|start| now > start);
         let request_bytes = if bytes_remaining == DataSize::ZERO
-            && self.packets_sent < self.config.min_packet_count
+            && (self.packets_sent < self.config.min_packet_count || needs_timestamp)
         {
             MAX_PADDING_PACKET_SIZE
         } else {
@@ -411,6 +427,42 @@ mod test {
             assert_eq!(first + tail, DataSize::bytes(2000));
             state.record_packet(after_stall, tail);
             assert!(state.is_complete(after_stall));
+        }
+    }
+
+    #[test]
+    fn byte_limited_media_cannot_complete_a_probe_at_one_timestamp() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(20);
+        let config = ProbeClusterConfig::new(0.into(), Bitrate::mbps(10), ProbeKind::Initial)
+            .with_max_bytes(DataSize::bytes(2000));
+        for padding_first in [false, true] {
+            let mut state = ProbeClusterState::new(config);
+            if padding_first {
+                let padding = state.next_packet(now, interval).unwrap();
+                state.record_packet(now, padding);
+            }
+            // Released originals can consume the reserved tail before another wake.
+            for _ in 0..5 {
+                state.record_packet(now, DataSize::bytes(400));
+            }
+            assert!(
+                !state.is_complete(now),
+                "zero-duration feedback is unusable"
+            );
+            assert!(state.next_packet(now, interval).is_none());
+            assert!(
+                state.is_complete(now + Duration::from_millis(150)),
+                "end without tagging a late packet after a scheduler stall"
+            );
+            let later = now + interval;
+            let padding = state.next_packet(later, interval).unwrap();
+            assert_eq!(
+                padding, MAX_PADDING_PACKET_SIZE,
+                "one bounded timestamp packet"
+            );
+            state.record_packet(later, padding);
+            assert!(state.is_complete(later));
         }
     }
 

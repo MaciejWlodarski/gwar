@@ -1333,12 +1333,6 @@ impl Session {
         self.configure_pacer();
     }
 
-    pub fn request_bwe_recovery_probe(&mut self, now: Instant) -> bool {
-        self.bwe
-            .as_mut()
-            .is_some_and(|bwe| bwe.request_recovery_probe(now))
-    }
-
     pub fn set_bwe_probe_byte_limit(&mut self, bytes: usize) {
         if let Some(bwe) = self.bwe.as_mut() {
             bwe.set_probe_byte_limit(bytes);
@@ -1358,6 +1352,9 @@ impl Session {
             // scheduler cadence, debt and in-flight feedback from the previous BWE.
             self.pacer = PacerImpl::leaky_bucket(init_bitrate * 2.0);
             self.streams.set_probe_media(None);
+            for stream in self.streams.streams_tx() {
+                stream.clear_padding();
+            }
             self.twcc_tx_register = TwccSendRegister::new(1000);
             self.configure_pacer();
         }
@@ -1603,6 +1600,111 @@ mod tests {
             bwe.poll_estimate(),
             Some(Bitrate::mbps(1)),
             "fresh feedback starts at the new estimate"
+        );
+    }
+
+    #[test]
+    fn bwe_reset_clears_both_padding_sources_but_keeps_media_and_rtp_sequences() {
+        use crate::media::MID_PROBE;
+        use crate::rtp_::MidRid;
+        use crate::streams::RtpWrite;
+
+        let now = Instant::now();
+        let cfg = RtcConfig::default().enable_bwe(Some(Bitrate::mbps(10)));
+        let mut s = Session::new(&cfg);
+        let codecs = CodecConfig::new_with_defaults();
+        let pt = codecs
+            .params()
+            .iter()
+            .find(|p| p.resend().is_some())
+            .unwrap()
+            .pt();
+        let exts = ExtensionMap::standard();
+        let media = Media::default();
+        let mut buf = vec![];
+        let mut twcc = 65_553;
+        let mut previous = vec![];
+        for id in [42, 52] {
+            let stream = s.streams.declare_stream_tx(
+                id.into(),
+                Some((id + 1).into()),
+                MidRid("vid".into(), None),
+            );
+            stream.write_rtp(RtpWrite::new(pt, 100.into(), 0, now, vec![7; 1100]).nackable(true));
+            stream.handle_timeout(now, || (&media, &codecs));
+            stream
+                .poll_packet(now, &exts, Some(&mut twcc), codecs.params(), &mut buf)
+                .unwrap();
+            stream.generate_padding(240);
+            let packet = stream
+                .poll_packet(now, &exts, Some(&mut twcc), codecs.params(), &mut buf)
+                .unwrap();
+            previous.push((id, *packet.seq_no));
+            stream
+                .write_rtp(RtpWrite::new(pt, 101.into(), 1500, now, vec![9; 1100]).nackable(true));
+            stream.handle_timeout(now, || (&media, &codecs));
+            stream.generate_padding(50_000);
+            assert_eq!(stream.queue_state(now).snapshot.byte_size, 51_100);
+        }
+        let probe = MidRid(MID_PROBE, None);
+        s.streams.set_probe_media(Some(("vid".into(), pt)));
+        let stream = s.streams.stream_tx_by_midrid(probe).unwrap();
+        stream.generate_padding(240);
+        let first_probe = *stream
+            .poll_packet(now, &exts, Some(&mut twcc), codecs.params(), &mut buf)
+            .unwrap()
+            .seq_no;
+        stream.generate_padding(50_000);
+        assert_eq!(stream.queue_state(now).snapshot.byte_size, 50_000);
+
+        s.reset_bwe(Bitrate::mbps(1));
+        for (id, previous_rtx) in previous {
+            let stream = s.streams.stream_tx(&id.into()).unwrap();
+            assert!(
+                stream.queue_info().is_none(),
+                "discard stale padding snapshots"
+            );
+            assert_eq!(
+                stream.queue_state(now).snapshot.byte_size,
+                1100,
+                "keep queued media only"
+            );
+            let media = stream
+                .poll_packet(now, &exts, Some(&mut twcc), codecs.params(), &mut buf)
+                .unwrap();
+            assert_eq!(*media.seq_no, 101);
+            assert_eq!(stream.last_packet(), Some([9; 1100].as_slice()));
+            assert!(
+                stream
+                    .poll_packet(now, &exts, Some(&mut twcc), codecs.params(), &mut buf)
+                    .is_none()
+            );
+            stream.generate_padding(240);
+            let padding = stream
+                .poll_packet(now, &exts, Some(&mut twcc), codecs.params(), &mut buf)
+                .unwrap();
+            assert_eq!(
+                *padding.seq_no,
+                previous_rtx + 1,
+                "RTX sequence survives reset"
+            );
+        }
+        s.streams.set_probe_media(Some(("vid".into(), pt)));
+        let stream = s.streams.stream_tx_by_midrid(probe).unwrap();
+        assert_eq!(stream.queue_state(now).snapshot.packet_count, 0);
+        assert!(
+            stream
+                .poll_packet(now, &exts, Some(&mut twcc), codecs.params(), &mut buf)
+                .is_none()
+        );
+        stream.generate_padding(240);
+        let padding = stream
+            .poll_packet(now, &exts, Some(&mut twcc), codecs.params(), &mut buf)
+            .unwrap();
+        assert_eq!(
+            *padding.seq_no,
+            first_probe + 1,
+            "fallback sequence survives reset"
         );
     }
 

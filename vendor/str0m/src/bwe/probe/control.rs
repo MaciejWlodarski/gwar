@@ -131,17 +131,6 @@ impl ProbeControl {
         Self::default()
     }
 
-    pub fn request_recovery_probe(&mut self, desired: Bitrate, now: Instant) -> bool {
-        if !self.enabled || desired.is_zero() || !self.pending.is_empty() {
-            return false;
-        }
-        // An application with no media can explicitly rediscover capacity even
-        // while loss-limited. Keep cluster IDs and feedback history intact.
-        self.queue_probe(desired * 2.0, ProbeKind::Stagnant, desired, now);
-        self.request_immediate();
-        !self.pending.is_empty()
-    }
-
     pub fn set_min_probe_interval(&mut self, interval: Duration) {
         self.min_probe_interval = interval;
         self.request_immediate();
@@ -734,27 +723,6 @@ impl BandwidthLimitedCause {
 #[cfg(test)]
 mod test {
     use super::*;
-
-    #[test]
-    fn explicit_recovery_keeps_ids_and_respects_cluster_spacing() {
-        let mut pc = ProbeControl::new();
-        let now = Instant::now();
-        assert!(!pc.request_recovery_probe(Bitrate::mbps(1), now));
-        pc.enable(true);
-        pc.set_min_probe_interval(Duration::from_secs(1));
-        pc.set_desired_bitrate(Bitrate::mbps(1));
-        pc.set_estimated_bitrate(Bitrate::kbps(300), BandwidthLimitedCause::DelayBasedLimited);
-        let first = pc.handle_timeout(now).unwrap();
-        let second = pc.handle_timeout(now + Duration::from_secs(1)).unwrap();
-        pc.set_estimated_bitrate(Bitrate::kbps(100), BandwidthLimitedCause::LossLimitedBwe);
-        assert!(pc.request_recovery_probe(Bitrate::mbps(1), now + Duration::from_secs(1)));
-        assert!(!pc.request_recovery_probe(Bitrate::mbps(1), now + Duration::from_secs(1)));
-        assert!(pc.handle_timeout(now + Duration::from_secs(1)).is_none());
-        let recovery = pc.handle_timeout(now + Duration::from_secs(2)).unwrap();
-        assert_ne!(first.cluster(), second.cluster());
-        assert_ne!(second.cluster(), recovery.cluster());
-        assert_eq!(recovery.target_bitrate(), Bitrate::mbps(2));
-    }
 
     #[test]
     fn minimum_interval_spaces_initial_and_later_probes() {

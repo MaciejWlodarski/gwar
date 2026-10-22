@@ -33,6 +33,10 @@ pub fn connect_with_bwe(initial_bitrate: Bitrate, desired_bitrate: Bitrate) -> (
 
     let (mut l, mut r) = connect_l_r_with_rtc(rtc1, rtc2);
 
+    // Use the RTC construction clock for both wrappers before normalizing time.
+    l.start = start;
+    r.start = start;
+
     l.bwe().set_desired_bitrate(desired_bitrate);
 
     // The resolution must be smaller than the fastest send rate we want to test.

@@ -72,15 +72,6 @@ impl<'a> Bwe<'a> {
         self.0.session.set_bwe_padding_bitrate_limit(limit);
     }
 
-    /// Request one capacity-rediscovery probe, even when loss-limited.
-    ///
-    /// Intended for an application that has stopped media and has a full probe
-    /// reserve. Uses at most twice the desired bitrate and obeys the configured
-    /// minimum interval. Returns false if disabled or another cluster is pending.
-    pub fn request_recovery_probe(&mut self) -> bool {
-        self.0.session.request_bwe_recovery_probe(self.0.last_now)
-    }
-
     /// Bound probe payload bytes to an application's separate socket reserve.
     ///
     /// Allow for RTP/SRTP headers and one packet of rounding when choosing the

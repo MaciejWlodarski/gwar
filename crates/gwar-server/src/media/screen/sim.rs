@@ -665,6 +665,34 @@ mod tests {
     }
 
     #[test]
+    fn game_startup_without_outages_never_pauses_across_cadence_and_loss() {
+        for loss in [0.01, 0.02, 0.0] {
+            for cadence in [15, 20].into_iter().chain((1..20).filter(|c| *c != 15)) {
+                let mut sim = Sim::new(Some(20_000_000));
+                sim.server_interval = cadence * MS;
+                sim.down.loss = loss;
+                sim.watch("game", 8_000_000, 60, 200_000, None);
+                sim.run(60 * SECOND);
+                let context = format!("cadence={cadence} loss={loss}: {}", summary(&sim));
+                assert!(sim.changes.is_empty(), "zero startup pauses: {context}");
+                let ssrc = sim.ssrcs(0).0;
+                for ago in [20, 10, 0] {
+                    let to = sim.now - ago * SECOND;
+                    let from = to - 10 * SECOND;
+                    let bytes: usize = sim
+                        .received
+                        .iter()
+                        .filter(|(at, source, _, _)| *at >= from && *at < to && *source == ssrc)
+                        .map(|(_, _, _, payload)| payload.len())
+                        .sum();
+                    assert!(bytes as f64 * 8.0 / 10.0 >= 7_200_000.0, "steady received video: {context}");
+                }
+                println!("startup cadence={cadence} loss={loss} pauses=0 estimate={}", sim.w.egress.estimate());
+            }
+        }
+    }
+
+    #[test]
     fn bandwidth_pause_recovers_when_the_link_clears() {
         let (sim, _, _) = collapse(true);
         assert_eq!(sim.paused(0), None, "{}", summary(&sim));
@@ -709,8 +737,7 @@ mod tests {
         sim.down.loss = loss;
         sim.watch("game", 8_000_000, 60, 200_000, None);
         sim.run(COLLAPSE);
-        // Lossy, coarse scheduling may pause during bootstrap too. Require actual
-        // originals before the outage, then the same restored-link recovery for every case.
+        assert!(sim.changes.is_empty(), "healthy bootstrap: {}", summary(&sim));
         assert!(sim.w.egress.counters.original_bytes > 0, "{}", summary(&sim));
         sim.down.rate = Some(1_000_000);
         sim.run(collapse);
