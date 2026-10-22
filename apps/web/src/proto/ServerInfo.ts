@@ -15,4 +15,8 @@ teamspeak: boolean, server_chat: ServerChat,
 /**
  * TeamSpeak servers only: the server and channel groups shown next to their members.
  */
-badges?: Array<Badge>, };
+badges?: Array<Badge>, 
+/**
+ * TeamSpeak servers only: the server's icon, as an [image token](Badge::icon).
+ */
+icon?: string | null, };

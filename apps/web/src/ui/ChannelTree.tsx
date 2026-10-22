@@ -34,7 +34,8 @@ import { useSettings } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { buildTree, descendantsCount, isFull, type ChannelNode } from "../state/tree";
 import { fillText, parseSpacer } from "../lib/spacer";
-import { MentionBadge, TsGroupBadges, UnreadBadge } from "./badges";
+import { MentionBadge, TsGroupBadges, TsIcon, UnreadBadge } from "./badges";
+import { useTsImage } from "./ts-images";
 import { useChannelPermission, useGroupsColor, useMyWho, useWhoOf } from "./hooks";
 import { canActOn } from "../lib/permissions";
 import { CLIENT_MIME, clientDragData, readClientDrag } from "../lib/client-drag";
@@ -224,6 +225,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           ) : (
             <span className="min-w-0 flex-1 truncate" title={channel.topic || undefined}>{channel.name}</span>
           )}
+          {!spacer && !onGwar && <TsIcon token={channel.icon} />}
           {current && <span className="sr-only">({t("tree.inVoice")})</span>}
           {current && channel.has_password && <Lock aria-label={t("tree.locked")} className="size-3.5 shrink-0 text-warn" />}
           {isDefault && !spacer && <House aria-label={t("tree.default")} className="size-3.5 shrink-0 text-subtle" />}
@@ -341,6 +343,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
   const target = useWhoOf(client.uid, client.groups);
   const groups = useSession((s) => s.groups);
   const onGwar = useSession((s) => s.kind === "gwar");
+  const avatar = useTsImage(onGwar ? null : sessionClient.avatar);
   // Myself, or someone ranked below me (docs/roles.md); a TeamSpeak server decides that itself.
   const canMove = mayMove && (isMe || !onGwar || canActOn(me, target, groups));
   const color = useGroupsColor(client.groups);
@@ -379,7 +382,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
             compact ? "h-6" : "h-7",
           )}
         >
-          <TalkingAvatar name={client.nickname} seed={client.uid} size={avatarSize} talking={client.talking} />
+          <TalkingAvatar name={client.nickname} seed={client.uid} image={avatar} size={avatarSize} talking={client.talking} />
           <span className={cn("min-w-0 truncate", silenced && "text-muted", isMe && "font-medium")} style={color ? { color } : undefined}>
             {client.nickname}
           </span>

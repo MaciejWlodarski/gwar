@@ -7,6 +7,10 @@
 //!   is the uid of the TeamSpeak identity to use (see `ts_identity`), default the list's default
 //! - `ts_request {session, op, d}` -> reply value, or rejects with an `ErrorBody`
 //! - `ts_disconnect {session}`
+//! - `ts_image {session, token}` -> the bytes (an `ArrayBuffer`) of an icon or avatar token from
+//!   the shapes (`ServerInfo.icon`, `Badge.icon`, `Channel.icon`, `Client.avatar`): a PNG, JPEG,
+//!   GIF or WebP image the adapter fetched from the TeamSpeak server and checked; rejects if this
+//!   connection has no such image (see `gwar_client::teamspeak::images`)
 //! - event `ts://event {session, frame}` where `frame` is the JSON text of a
 //!   `gwar/1` event (`{"ev":..,"d":..}`, identical to the server's frames)
 //! - event `ts://closed {session}` when the connection ended
@@ -258,4 +262,13 @@ pub fn ts_disconnect(ts: State<'_, Ts>, session: u64) {
         tracing::info!("ts_disconnect session={session}");
         ts.close();
     }
+}
+
+#[tauri::command]
+pub fn ts_image(ts: State<'_, Ts>, session: u64, token: String) -> Result<tauri::ipc::Response, String> {
+    let image = match ts.lock().as_ref() {
+        Some(a) if a.session == session => a.handle.image(&token),
+        _ => None,
+    };
+    image.map(|bytes| tauri::ipc::Response::new(bytes.to_vec())).ok_or_else(|| "no such image".into())
 }

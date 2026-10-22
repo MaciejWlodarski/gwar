@@ -25,7 +25,7 @@ export function MentionMenu({ matches, index, onPick, onHover }: { matches: Pers
           className={cn("flex h-8 cursor-pointer items-center gap-2 rounded-md px-2 text-sm", i === index ? "bg-hover" : "")}
         >
           <span className={cn(!p.online && "opacity-50")}>
-            <Avatar name={p.nickname} seed={p.uid} size={20} />
+            <Avatar name={p.nickname} seed={p.uid} uid={p.uid} size={20} />
           </span>
           <span className={cn("min-w-0 flex-1 truncate", !p.online && "text-muted")}>{p.nickname}</span>
           <IdentityLine member={p} tag={p.tag} />

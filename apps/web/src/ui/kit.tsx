@@ -7,6 +7,7 @@ import { Check, ChevronDown, X } from "lucide-react";
 import {
   forwardRef,
   useId,
+  useState,
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
   type ReactElement,
@@ -16,6 +17,7 @@ import {
 import { avatarColors, initials } from "../lib/color";
 import { cn } from "../lib/cn";
 import { useT } from "../i18n";
+import { useMemberAvatar } from "./ts-images";
 
 /** Small radio-style toggle. Options may be disabled (with a tooltip-style title). */
 export function Segmented<T extends string>({
@@ -186,13 +188,37 @@ export function Avatar({
   size = 24,
   className,
   square,
+  image,
+  uid,
 }: {
   name: string;
   seed?: string;
   size?: number;
   className?: string;
   square?: boolean;
+  /** A picture (a `blob:` URL of this origin) in place of the initials. */
+  image?: string | null;
+  /** A member whose TeamSpeak avatar, if any, takes the place of the initials. */
+  uid?: string | null;
 }) {
+  const avatar = useMemberAvatar(image ? null : uid);
+  const src = image ?? avatar;
+  // A picture that fails to load gives way to the initials.
+  const [broken, setBroken] = useState<string | null>(null);
+  if (src && src !== broken) {
+    return (
+      <img
+        aria-hidden
+        alt=""
+        src={src}
+        draggable={false}
+        onError={() => setBroken(src)}
+        data-testid="avatar-image"
+        className={cn("shrink-0 select-none object-cover", square ? "rounded-xl" : "rounded-full", className)}
+        style={{ width: size, height: size }}
+      />
+    );
+  }
   return (
     <span
       aria-hidden

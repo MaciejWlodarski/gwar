@@ -131,6 +131,23 @@ describe("gwar/4 runtime schemas", () => {
     expect(responseFor("join", { ...w, server: { ...w.server, badges: [{ ...badge, name: "x".repeat(300) }] } })).toBe(false);
     expect(parseFrame(JSON.stringify({ ev: "server.updated", d: { ...w.server, badges: [badge] } }))?.kind).toBe("event");
   });
+  it("accepts TeamSpeak icon and avatar tokens, never URLs or other text", () => {
+    const w = welcome();
+    const avatar = `a${"0123456789abcdef".repeat(2)}01234567`;
+    const badge = { kind: "server", id: 6, name: "Iconic", sort: 0, icon: "i412469435" };
+    const client = { id: 2, uid: "ts:QQ==", nickname: "bob", channel: 1, groups: [6], platform: "ts3", muted: false, deafened: false, away: null, talking: false, voice: true, voice_binding: null, avatar };
+    const channel = { id: 1, parent: null, name: "Lobby", topic: "", position: 0, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false, icon: "i1099912907" };
+    const server = { ...w.server, icon: "i1001", badges: [badge, { ...badge, id: 7, icon: null }] };
+    expect(responseFor("join", { ...w, server, clients: [client], channels: [channel] })).toBe(true);
+    for (const bad of ["https://evil.test/a.png", "blob:https://x/1", "data:image/png;base64,AAAA", "javascript:alert(1)", "i", "i12345678901", "I1001", `a${"0".repeat(39)}`, `A${"0".repeat(40)}`, `a${"g".repeat(40)}`, 7]) {
+      expect(responseFor("join", { ...w, server: { ...w.server, icon: bad } })).toBe(false);
+      expect(responseFor("join", { ...w, server: { ...w.server, badges: [{ ...badge, icon: bad }] } })).toBe(false);
+      expect(parseFrame(JSON.stringify({ ev: "channel.updated", d: { ...channel, icon: bad } }))).toBeNull();
+      expect(parseFrame(JSON.stringify({ ev: "client.updated", d: { ...client, avatar: bad } }))).toBeNull();
+    }
+    expect(parseFrame(JSON.stringify({ ev: "client.joined", d: client }))?.kind).toBe("event");
+    expect(parseFrame(JSON.stringify({ ev: "channel.created", d: channel }))?.kind).toBe("event");
+  });
   it("validates challenge keys and nonces with exact fields and canonical encodings", () => {
     const valid = challenge();
     expect(parseFrame(JSON.stringify(valid))?.kind).toBe("event");

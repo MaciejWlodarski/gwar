@@ -36,7 +36,7 @@ function Reader({ uid, devices }: { uid: string; devices: string }) {
   const name = useMemberName(uid, uid.slice(0, 8));
   return (
     <li className="flex items-center gap-3 rounded-md px-1 py-1.5">
-      <Avatar name={name} seed={uid} size={28} />
+      <Avatar name={name} seed={uid} uid={uid} size={28} />
       <span className="min-w-0 flex-1 truncate text-sm">{name}</span>
       <span className="shrink-0 text-xs text-subtle">{devices}</span>
     </li>
@@ -70,7 +70,7 @@ function Hearer({ uid, devices }: { uid: string; devices: string[] }) {
   const name = useMemberName(uid, uid.slice(0, 8));
   return (
     <li className="flex items-start gap-3 rounded-md px-1 py-1.5">
-      <Avatar name={name} seed={uid} size={28} />
+      <Avatar name={name} seed={uid} uid={uid} size={28} />
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm">{name}</div>
         {devices.map((device) => (

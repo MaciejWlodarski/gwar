@@ -881,6 +881,9 @@ wire! {
         /// TeamSpeak servers only: the server and channel groups shown next to their members.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub badges: Vec<Badge>,
+        /// TeamSpeak servers only: the server's icon, as an [image token](Badge::icon).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub icon: Option<String>,
     }
 
     /// A TeamSpeak server or channel group, for display only: the TeamSpeak server decides what
@@ -891,6 +894,10 @@ wire! {
         pub name: String,
         /// TeamSpeak's sort id: lower comes first.
         pub sort: i32,
+        /// The group's icon as an image token: a short name the TeamSpeak connection serves the
+        /// image by (never a URL), present once the image is there.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub icon: Option<String>,
     }
 
     #[derive(Copy, Eq)]
@@ -946,6 +953,9 @@ wire! {
         pub overrides: Vec<ChannelOverride>,
         /// A subchannel that uses its parent's overrides.
         pub synced: bool,
+        /// TeamSpeak servers only: the channel's icon, as an [image token](Badge::icon).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub icon: Option<String>,
     }
 
     pub struct Client {
@@ -976,6 +986,9 @@ wire! {
         /// TeamSpeak servers only: the channel group in the current channel.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub channel_group: Option<u32>,
+        /// TeamSpeak servers only: the avatar, as an [image token](Badge::icon).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub avatar: Option<String>,
     }
 
     pub struct Group {

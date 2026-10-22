@@ -8,6 +8,14 @@ import { unreadLabel } from "../lib/chat";
 import { badgesOf } from "../lib/ts-badges";
 import { useSession } from "../state/stores";
 import { useMemo } from "react";
+import { useTsImage } from "./ts-images";
+
+/** A TeamSpeak icon (a group's, a channel's or the server's) by its image token, 16 px like TeamSpeak's; nothing until it is loaded. */
+export function TsIcon({ token, className }: { token: string | null | undefined; className?: string }) {
+  const src = useTsImage(token);
+  if (!src) return null;
+  return <img src={src} alt="" aria-hidden draggable={false} data-testid="ts-icon" className={cn("size-4 shrink-0 select-none object-contain", className)} />;
+}
 
 /** Pill with the number of unread messages. */
 export function UnreadBadge({ count, className }: { count: number; className?: string }) {
@@ -62,9 +70,10 @@ export function TsGroupBadges({ groups, channelGroup, wrap, className }: { group
         <span
           key={`${b.kind}:${b.id}`}
           title={b.name}
-          className="min-w-0 max-w-32 shrink truncate rounded bg-hover px-1 text-[10px] leading-4 font-medium text-subtle"
+          className="inline-flex min-w-0 max-w-32 shrink items-center gap-0.5 rounded bg-hover px-1 text-[10px] leading-4 font-medium text-subtle"
         >
-          {b.name}
+          <TsIcon token={b.icon} className="size-3" />
+          <span className="min-w-0 truncate">{b.name}</span>
         </span>
       ))}
     </span>

@@ -66,8 +66,11 @@ const path = (put = false): Rule<string> => (v): v is string => {
   if (!str(2048)(v)) return false;
   try { filePath(v, put ? "PUT" : "GET"); return true; } catch { return false; }
 };
-const badge = shape<Badge>({ kind: literal<BadgeKind>(["server", "channel"]), id, name: str(256), sort: int(2147483647, -2147483648) });
-const server = shape<ServerInfo>({ name: str(256), welcome: text, version: str(64), default_channel: id, max_clients: int(65535), upload_limit: int(Number.MAX_SAFE_INTEGER), file_access: literal<FileAccess>(["link", "members"]), teamspeak: bool, server_chat: shape({ encrypted: bool, history: bool }), badges: optional(array(badge, 512)) });
+/** A TeamSpeak icon or avatar token (`i<icon id>`, `a<40 hex>`): a name the TeamSpeak connection resolves, never a URL. */
+export const imageToken: Rule<string> = (v): v is string => typeof v === "string" && /^(?:i[0-9]{1,10}|a[0-9a-f]{40})$/.test(v);
+const image = optional(nullable(imageToken));
+const badge = shape<Badge>({ kind: literal<BadgeKind>(["server", "channel"]), id, name: str(256), sort: int(2147483647, -2147483648), icon: image });
+const server = shape<ServerInfo>({ name: str(256), welcome: text, version: str(64), default_channel: id, max_clients: int(65535), upload_limit: int(Number.MAX_SAFE_INTEGER), file_access: literal<FileAccess>(["link", "members"]), teamspeak: bool, server_chat: shape({ encrypted: bool, history: bool }), badges: optional(array(badge, 512)), icon: image });
 /** A download bearer token: empty, or URL-safe characters only, so it is always a valid header value. */
 const bearer: Rule<string> = (v): v is string => str(128)(v) && /^[A-Za-z0-9_-]*$/.test(v);
 const fixed = (bytes: number): Rule<string> => (v): v is string => {
@@ -83,8 +86,8 @@ const challenge = shape<Challenge>({ protocol: int(255), server_pk: fixed(32), s
 const serverProof = shape<ServerProof>({ server_proof: fixed(64) });
 const channelAccess = shape<ChannelAccess>({ roles: array(id, 64), users: array(uid, 1000) });
 const channelOverride = shape<ChannelOverride>({ role: optional(nullable(id)), user: optional(nullable(uid)), allow: array(permissions, 32), deny: array(permissions, 32) });
-const channel = shape<Channel>({ id, parent: nullable(id), name: str(256), topic: text, position: int(2147483647, -2147483648), has_password: bool, max_clients: nullable(int(65535)), max_family_clients: optional(nullable(int(65535))), encrypted: bool, history: bool, private: bool, access: optional(nullable(channelAccess)), overrides: optional(array(channelOverride, 100)), synced: bool });
-const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool, voice_binding: nullable(voiceBinding), server_muted: optional(bool), server_deafened: optional(bool), sharing: optional(bool), channel_group: optional(nullable(id)) });
+const channel = shape<Channel>({ id, parent: nullable(id), name: str(256), topic: text, position: int(2147483647, -2147483648), has_password: bool, max_clients: nullable(int(65535)), max_family_clients: optional(nullable(int(65535))), encrypted: bool, history: bool, private: bool, access: optional(nullable(channelAccess)), overrides: optional(array(channelOverride, 100)), synced: bool, icon: image });
+const client = shape<Client>({ id, uid, nickname: str(256), channel: nullable(id), groups: ids, platform, muted: bool, deafened: bool, away: nullable(text), talking: bool, voice: bool, voice_binding: nullable(voiceBinding), server_muted: optional(bool), server_deafened: optional(bool), sharing: optional(bool), channel_group: optional(nullable(id)), avatar: image });
 const color: Rule<string> = (v): v is string => typeof v === "string" && /^#[0-9a-f]{6}$/i.test(v);
 const group = shape<Group>({ id, name: str(256), permissions: array(permissions, 32), color: optional(nullable(color)), position: int(4294967295), hoist: bool, mentionable: bool });
 const attestation = shape<HandleAttestation>({ account_key: str(128), handle: str(64), issued_at: id, expires_at: id, signature: str(128) });

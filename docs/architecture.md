@@ -554,6 +554,56 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
       one order over the whole catalog, before cutting it; every member's
       badges keep the catalog's order. At most 256 badges of each kind, named
       as one line of plain text (`display_text`) of at most 64 characters.
+  - Icons and avatars, like TeamSpeak's own client shows them: the server's
+    icon (next to its name in the sidebar), channel icons (in the tree), group
+    icons (in the badges) and client avatars (wherever Gwar shows a member's
+    initials). `ServerInfo.icon`, `Channel.icon`, `Badge.icon` and
+    `Client.avatar` carry an image token (`i<icon id>`, `a<40 hex>`), never a
+    URL, and only once the image is there; Gwar servers send none.
+    - The adapter (`gwar_client::teamspeak::images`) fetches the files through
+      TeamSpeak's file transfer (`ftinitdownload`, channel 0): `/icon_<id>`,
+      and `/avatar_<uid>` with the uid's bytes in hex written as the letters
+      a–p (Query's `client_base64HashClientUID`). Icon ids below 1000 (100,
+      200, 300, 500, 600) are TeamSpeak's built-in group icons, drawn by its
+      client from its skin: they are no files and Gwar has no equivalents, so
+      they are skipped and the badge's name stands alone.
+    - Bounds: icons at most 64 KiB, avatars at most 300 KiB (TeamSpeak's
+      default `i_client_max_avatar_filesize` is 200,000 bytes); 4 transfers
+      at a time, each with an absolute deadline of 15 s from asking; exactly
+      the announced size is read. tsclientlib is patched to hand TeamSpeak's
+      offer (`notifystartdownload`) over without connecting
+      (`vendor/tsclientlib/GWAR-PATCH.md`): an offer after the deadline is
+      ignored, and the adapter connects, sends the key and reads the file on
+      a task of its own under that one deadline, cancelled with the
+      connection. It connects only to the server it is connected to: the
+      live connection's IP (a host name is not looked up again) at the
+      offer's port. An offer whose `ip` is anything but empty, a placeholder
+      (`0.0.0.0`, `::`) or that same IP is ignored, so nothing connects, and
+      the file counts as wrong. A transfer keeps its slot until that task has ended (one
+      asked for and not yet offered runs nothing, so its slot frees at the
+      deadline). A file must be a PNG, JPEG, GIF or WebP by its first bytes,
+      whatever TeamSpeak calls it: SVG and anything else is refused.
+    - The cache is per connection and in memory only (nothing on disk): at
+      most 32 MiB and 2048 images, keyed by icon id or by the avatar's owner
+      and hash (`client_flag_avatar`), so an image is fetched again only when
+      the id or hash changes. Only the first 2048 images the view shows are
+      considered. A full cache drops images no longer shown; an image that
+      finds it full of images still shown waits, and is fetched again once
+      that much room can be made. A file that was wrong (missing, refused,
+      too large, no image, offered elsewhere) is not asked for again while it
+      is shown; one that
+      timed out or whose connection broke is, after 1 and then 5 minutes, 3
+      tries in all. No longer shown, a failure is forgotten. Group icons are
+      wanted only for the badges sent (the same ordered, cut selection).
+    - The UI gets the bytes by token from the desktop app (`ts_image`), checks
+      their type and size again and shows them through `blob:` URLs of its own
+      origin (`net/ts-images.ts`), which the CSP allows for images. It keeps
+      exactly the images the session names now (server, badges, channels,
+      clients), at most 2048 and 32 MiB, and revokes the URL of one no longer
+      named; when the native session closes (for good or to reconnect) all are
+      revoked and loads still under way are dropped. A changed icon or avatar
+      is a new token: the shape drops the old one and names the new one once
+      it is fetched, as an update like any other.
 
 ## Clients
 
@@ -624,6 +674,7 @@ loads, the main window sets both to deny for the app's origin.
 | `ts_connect` | High: native UDP connection and private identity use; JS passes a public UID, Rust loads the key directly. |
 | `ts_request` | High: typed TeamSpeak operations on the current native session. |
 | `ts_disconnect` | Low: closes the matching native session. |
+| `ts_image` | Low: bytes of an icon or avatar the current native session already fetched and checked, by token; no network. |
 | `ts_identity_list` | Low: source/default, UID and name only; no private identity text. |
 | `ts_identity_parse` | Medium: bounded parsing of caller-supplied private text; reads no stored key. |
 | `ts_identity_generate` | Medium: creates a new unstored key for explicit import/vault flows. |

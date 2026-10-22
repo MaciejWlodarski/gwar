@@ -96,7 +96,7 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
     <Dialog open onOpenChange={(o) => !o && close()} title={t("member.profile")} width="max-w-sm">
       <div className="flex flex-col gap-4">
         <div className="flex items-center gap-3">
-          <Avatar name={nickname} seed={uid} size={40} />
+          <Avatar name={nickname} seed={uid} uid={uid} size={40} />
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <span className="truncate font-semibold">{nickname}</span>

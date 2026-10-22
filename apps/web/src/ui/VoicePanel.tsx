@@ -76,7 +76,7 @@ function SelfRow({ sub, subTitle }: { sub: ReactNode; subTitle?: string }) {
   if (!me) return null;
   return (
     <div className="flex min-w-0 items-center gap-2 px-1">
-      <TalkingAvatar name={me.nickname} seed={me.uid} size={32} talking={me.talking && me.channel !== null} />
+      <TalkingAvatar name={me.nickname} seed={me.uid} uid={me.uid} size={32} talking={me.talking && me.channel !== null} />
       <div className="min-w-0 flex-1 leading-tight">
         <div className="flex min-w-0 items-center gap-1">
           <span className="truncate text-sm font-semibold">{me.nickname}</span>

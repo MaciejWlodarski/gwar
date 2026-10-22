@@ -9,7 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     path::Path,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
     thread,
@@ -37,6 +37,9 @@ use tsclientlib::{
 use tsproto_packets::packets::{AudioData, CodecType, Direction, Flags, OutAudio, OutCommand, PacketType};
 
 use crate::ClientError;
+
+pub mod images;
+use images::{ImageKey, Images, Reads};
 
 pub struct TsOptions {
     /// `host[:port]`, default port 9987.
@@ -220,6 +223,7 @@ pub struct TsHandle {
     pub audio_out: mpsc::Sender<TsMicrophone>,
     pub audio_stale_dropped: Arc<AtomicU64>,
     pub audio_socket_pressure: Arc<AtomicU64>,
+    images: Arc<Mutex<images::Store>>,
 }
 
 pub struct TsConnected {
@@ -238,6 +242,12 @@ impl TsHandle {
             Ok(Err(_)) => Err(ClientError::Closed),
             Ok(Ok(result)) => result.map_err(ClientError::Server),
         }
+    }
+
+    /// The image an icon or avatar token of this connection's shapes names, if it is here: a
+    /// PNG, JPEG, GIF or WebP file from the TeamSpeak server ([`images`]).
+    pub fn image(&self, token: &str) -> Option<Arc<[u8]>> {
+        self.images.lock().unwrap_or_else(|e| e.into_inner()).get(token)
     }
 
     /// Disconnects by dropping the request channel.
@@ -319,8 +329,12 @@ fn local_slot_binding(view: &View, own: u16) -> gwar_proto::VoiceTransportBindin
     gwar_proto::VoiceTransportBinding { call: b.call.clone(), participation: b.participation.clone(), run: 1 }
 }
 
-fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View) -> Option<View> {
-    let state = con.get_state().ok()?;
+fn view_of(
+    state: &tsclientlib::data::Connection,
+    talking: &HashMap<u16, Instant>,
+    previous: &View,
+    images: &Images,
+) -> View {
     let mut channels = BTreeMap::new();
     let descriptions = state
         .channels
@@ -364,6 +378,7 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
                     access: None,
                     overrides: Vec::new(),
                     synced: false,
+                    icon: images.token(c.icon.and_then(|i| ImageKey::icon(i.0))),
                 },
             );
             previous = c.id.0;
@@ -396,6 +411,7 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
                     server_deafened: false,
                     sharing: false,
                     channel_group: Some(c.channel_group.0 as u32),
+                    avatar: images.token(c.uid.as_ref().and_then(|u| ImageKey::avatar(&u.0, &c.avatar_hash))),
                     voice_binding: Some(
                         previous
                             .clients
@@ -440,9 +456,10 @@ fn view_of(con: &TsConnection, talking: &HashMap<u16, Instant>, previous: &View)
         file_access: Default::default(),
         teamspeak: true,
         server_chat: Default::default(),
-        badges: badges(state, &previous.listed),
+        badges: badges(state, &previous.listed, images),
+        icon: images.token(ImageKey::icon(state.server.icon.0)),
     };
-    Some(View { server: Some(server), channels, clients, descriptions, names, listed: previous.listed.clone() })
+    View { server: Some(server), channels, clients, descriptions, names, listed: previous.listed.clone() }
 }
 
 /// Badges of each kind at most, so the server info stays within what the UI accepts (512 badges,
@@ -451,31 +468,109 @@ const BADGES_PER_KIND: usize = 256;
 /// Longest badge name kept, in characters (TeamSpeak allows 30).
 const BADGE_NAME: usize = 64;
 
-/// The groups worth a badge: listed regular ones, but not the defaults everyone has.
-fn badges(state: &tsclientlib::data::Connection, listed: &GroupLists) -> Vec<Badge> {
-    let regular = |t: &tsclientlib::GroupType| matches!(t, tsclientlib::GroupType::Regular);
-    let known = |ids: &Option<BTreeSet<u64>>, id: u64| ids.as_ref().is_none_or(|ids| ids.contains(&id));
-    let server = state
+/// The server groups worth a badge: listed regular ones, but not the default everyone has.
+fn badge_server_groups<'a>(
+    state: &'a tsclientlib::data::Connection,
+    listed: &'a GroupLists,
+) -> impl Iterator<Item = &'a tsclientlib::data::ServerGroup> {
+    state
         .server_groups
         .values()
-        .filter(|g| regular(&g.group_type) && g.id != state.server.default_server_group)
-        .filter(|g| known(&listed.server, g.id.0))
-        .filter_map(|g| badge(BadgeKind::Server, g.id.0, &g.name, g.sort_id))
-        .collect();
-    let channel = state
+        .filter(|g| {
+            matches!(g.group_type, tsclientlib::GroupType::Regular) && g.id != state.server.default_server_group
+        })
+        .filter(|g| listed.server.as_ref().is_none_or(|ids| ids.contains(&g.id.0)))
+}
+
+/// The channel groups worth a badge, like [`badge_server_groups`].
+fn badge_channel_groups<'a>(
+    state: &'a tsclientlib::data::Connection,
+    listed: &'a GroupLists,
+) -> impl Iterator<Item = &'a tsclientlib::data::ChannelGroup> {
+    state
         .channel_groups
         .values()
-        .filter(|g| regular(&g.group_type) && g.id != state.server.default_channel_group)
-        .filter(|g| known(&listed.channel, g.id.0))
-        .filter_map(|g| badge(BadgeKind::Channel, g.id.0, &g.name, g.sort_id))
+        .filter(|g| {
+            matches!(g.group_type, tsclientlib::GroupType::Regular) && g.id != state.server.default_channel_group
+        })
+        .filter(|g| listed.channel.as_ref().is_none_or(|ids| ids.contains(&g.id.0)))
+}
+
+/// The badges the view shows (ordered, named and cut as [`ordered_badges`] does), without their
+/// icons, each with its icon's image if that is a file. The one selection both [`badges`] and
+/// [`wanted_images`] use: an icon is wanted exactly when its badge is shown.
+fn badge_catalog(state: &tsclientlib::data::Connection, listed: &GroupLists) -> Vec<(Badge, Option<ImageKey>)> {
+    let mut icons: HashMap<(bool, u32), tsclientlib::IconId> = HashMap::new();
+    let server = badge_server_groups(state, listed)
+        .filter_map(|g| {
+            let badge = badge(BadgeKind::Server, g.id.0, &g.name, g.sort_id, None)?;
+            icons.insert((true, badge.id), g.icon);
+            Some(badge)
+        })
+        .collect();
+    let channel = badge_channel_groups(state, listed)
+        .filter_map(|g| {
+            let badge = badge(BadgeKind::Channel, g.id.0, &g.name, g.sort_id, None)?;
+            icons.insert((false, badge.id), g.icon);
+            Some(badge)
+        })
         .collect();
     ordered_badges(server, channel)
+        .into_iter()
+        .map(|badge| {
+            let icon = icons.get(&(badge.kind == BadgeKind::Server, badge.id)).and_then(|icon| ImageKey::icon(icon.0));
+            (badge, icon)
+        })
+        .collect()
+}
+
+/// The groups worth a badge, with their icons where they are here.
+fn badges(state: &tsclientlib::data::Connection, listed: &GroupLists, images: &Images) -> Vec<Badge> {
+    badge_catalog(state, listed)
+        .into_iter()
+        .map(|(mut badge, icon)| {
+            badge.icon = images.token(icon);
+            badge
+        })
+        .collect()
+}
+
+/// The images the view shows: the server's icon, the badge groups' and channels' icons, and
+/// everyone's avatar. Icons come first: they are few and small.
+fn wanted_images(state: &tsclientlib::data::Connection, listed: &GroupLists) -> BTreeSet<ImageKey> {
+    let mut wanted = BTreeSet::new();
+    wanted.extend(ImageKey::icon(state.server.icon.0));
+    wanted.extend(badge_catalog(state, listed).into_iter().filter_map(|(_, icon)| icon));
+    wanted.extend(state.channels.values().filter_map(|c| ImageKey::icon(c.icon?.0)));
+    wanted.extend(state.clients.values().filter_map(|c| ImageKey::avatar(&c.uid.as_ref()?.0, &c.avatar_hash)));
+    wanted
+}
+
+/// Asks TeamSpeak for the files of the transfers `start` (from [`Images::want`] or [`Images::queued`]).
+fn fetch(con: &mut TsConnection, images: &mut Images, start: Vec<(u16, ImageKey)>) {
+    use tsclientlib::messages::c2s::{OutInitDownloadMessage, OutInitDownloadPart};
+    for (id, key) in start {
+        let path = key.path();
+        let part = OutInitDownloadPart {
+            client_filetransfer_id: id,
+            name: path.as_str().into(),
+            channel_id: tsclientlib::ChannelId(0),
+            channel_password: "".into(),
+            seek_position: 0,
+            protocol: 1,
+        };
+        tracing::debug!(id, path = %path, "TeamSpeak image wanted");
+        match OutInitDownloadMessage::new(&mut std::iter::once(part)).send_with_result(con) {
+            Ok(command) => images.sent(id, command),
+            Err(_) => images.unsent(id),
+        }
+    }
 }
 
 /// A badge named by `name` as plain text, or none if nothing of the name is left.
-fn badge(kind: BadgeKind, id: u64, name: &str, sort: i32) -> Option<Badge> {
+fn badge(kind: BadgeKind, id: u64, name: &str, sort: i32, icon: Option<String>) -> Option<Badge> {
     let name = badge_name(name);
-    (!name.is_empty()).then_some(Badge { kind, id: id as u32, name, sort })
+    (!name.is_empty()).then_some(Badge { kind, id: id as u32, name, sort, icon })
 }
 
 /// One line of plain text ([`display_text`]), cut to [`BADGE_NAME`] characters.
@@ -1082,7 +1177,8 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
     // Like the official client: see everyone, not just the people in our channel.
     let _ = command("channelsubscribeall", &[]).send(&mut con);
     let mut talking: HashMap<u16, Instant> = HashMap::new();
-    let Some(mut view) = view_of(&con, &talking, &View::default()) else {
+    let mut images = Images::new();
+    let Some(mut view) = con.get_state().ok().map(|state| view_of(state, &talking, &View::default(), &images)) else {
         let _ = ready.send(Err(anyhow!("no server state")));
         return;
     };
@@ -1119,10 +1215,16 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
         audio_out,
         audio_stale_dropped: audio_stale_dropped.clone(),
         audio_socket_pressure: audio_socket_pressure.clone(),
+        images: images.store(),
     };
     if ready.send(Ok(TsConnected { handle, welcome, events, audio_in })).is_err() {
         return;
     }
+    // Icons and avatars follow the Welcome: each shows once it is here, as an update.
+    let start = images.want(wanted_images(state, &view.listed));
+    fetch(&mut con, &mut images, start);
+    // The downloads under way (connect, key, read); dropped, so aborted, when the connection ends.
+    let mut reads = Reads::default();
 
     type ReplyTx = oneshot::Sender<Result<Value, ErrorBody>>;
     /// A request waiting for TeamSpeak to answer `part`; `rest` runs only if it went through.
@@ -1163,6 +1265,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
         Item(Option<Result<StreamItem, tsclientlib::Error>>),
         Request(Option<PendingRequest>),
         Mic(Option<TsMicrophone>),
+        Image(images::Transferred),
         Tick,
     }
     loop {
@@ -1172,6 +1275,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                 item = stream.next() => Step::Item(item),
                 request = requests.recv() => Step::Request(request.map(|(request, reply)| (Box::new(request), reply))),
                 frame = mic.recv() => Step::Mic(frame),
+                image = reads.next() => Step::Image(image),
                 _ = tick.tick() => Step::Tick,
             }
         };
@@ -1256,7 +1360,10 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                     }
                 }
                 StreamItem::MessageResult(handle, result) => {
-                    if let Some(mut flight) = pending.remove(&handle) {
+                    if images.answered(handle, result.is_ok()) {
+                        let start = images.queued();
+                        fetch(&mut con, &mut images, start);
+                    } else if let Some(mut flight) = pending.remove(&handle) {
                         match result {
                             Ok(()) => {
                                 flight.done.push(flight.part);
@@ -1278,6 +1385,23 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                             }
                         }
                     }
+                }
+                StreamItem::FileDownloadOffered(transfer, offer) => {
+                    // Connected to (only ever the server we are connected to), keyed and read on a task
+                    // of its own, within its limit and by its deadline; the result comes back as a
+                    // step. An offer not asked for, or pointing elsewhere, is ignored.
+                    if let Some((address, limit, deadline)) = images.accept(transfer.0, &offer) {
+                        let connect = tokio::net::TcpStream::connect(address);
+                        reads.start(transfer.0, connect, offer.key, offer.size, limit, deadline);
+                    } else {
+                        let start = images.queued();
+                        fetch(&mut con, &mut images, start);
+                    }
+                }
+                StreamItem::FiletransferFailed(transfer, _) => {
+                    images.refused(transfer.0);
+                    let start = images.queued();
+                    fetch(&mut con, &mut images, start);
                 }
                 StreamItem::DisconnectedTemporarily(_) => {}
                 _ => {}
@@ -1319,16 +1443,29 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                     send_audio_now(transport, packet, &audio_socket_pressure);
                 }
             }
+            Step::Image((transfer, data)) => {
+                book_changed |= images.finished(transfer, data);
+                let start = images.queued();
+                fetch(&mut con, &mut images, start);
+            }
             Step::Tick => {
                 let before = talking.len();
                 talking.retain(|_, at| at.elapsed() < TALKING);
                 book_changed |= talking.len() != before;
+                if images.expire(Instant::now()) {
+                    let start = images.queued();
+                    fetch(&mut con, &mut images, start);
+                }
             }
         }
         if book_changed {
-            if let Some(next) = view_of(&con, &talking, &view) {
+            if let Some(next) = con.get_state().ok().map(|state| view_of(state, &talking, &view, &images)) {
                 diff(&view, &next, &mut out);
                 view = next;
+            }
+            if let Some(wanted) = con.get_state().ok().map(|state| wanted_images(state, &view.listed)) {
+                let start = images.want(wanted);
+                fetch(&mut con, &mut images, start);
             }
             let left: Vec<u16> = out
                 .iter()
@@ -1467,6 +1604,7 @@ mod tests {
             access: None,
             overrides: Vec::new(),
             synced: false,
+            icon: None,
         }
     }
 
@@ -1488,6 +1626,7 @@ mod tests {
             server_deafened: false,
             sharing: false,
             channel_group: None,
+            avatar: None,
         }
     }
 
@@ -1607,7 +1746,7 @@ mod tests {
 
     #[test]
     fn badges_follow_teamspeak_order_and_stay_within_limits() {
-        let group = |kind, id, sort| Badge { kind, id, name: format!("g{id}"), sort };
+        let group = |kind, id, sort| Badge { kind, id, name: format!("g{id}"), sort, icon: None };
         let ids = |badges: &[Badge]| badges.iter().map(|b| b.id).collect::<Vec<_>>();
         let order = |groups: &[(u32, i32)]| {
             let mut badges: Vec<_> = groups.iter().map(|&(id, sort)| group(BadgeKind::Server, id, sort)).collect();
@@ -1637,10 +1776,155 @@ mod tests {
         assert_eq!(ids(&badges[BADGES_PER_KIND - 1..]), [BADGES_PER_KIND as u32, 1, 2]);
 
         // Names are one line of plain text, cut short; nothing left is no badge.
-        assert_eq!(badge(BadgeKind::Server, 7, "Q\u{202e}A\nZ", 0).map(|b| b.name), Some("QA Z".into()));
-        assert_eq!(badge(BadgeKind::Server, 7, &"x".repeat(300), 0).map(|b| b.name.len()), Some(BADGE_NAME));
-        assert!(badge(BadgeKind::Server, 7, "\u{2066}\0", 0).is_none());
-        assert!(badge(BadgeKind::Server, 7, " \u{7} ", 0).is_none());
+        assert_eq!(badge(BadgeKind::Server, 7, "Q\u{202e}A\nZ", 0, None).map(|b| b.name), Some("QA Z".into()));
+        assert_eq!(badge(BadgeKind::Server, 7, &"x".repeat(300), 0, None).map(|b| b.name.len()), Some(BADGE_NAME));
+        assert!(badge(BadgeKind::Server, 7, "\u{2066}\0", 0, None).is_none());
+        assert!(badge(BadgeKind::Server, 7, " \u{7} ", 0, None).is_none());
+    }
+
+    /// TeamSpeak's wire text `line`, as tsclientlib parses it.
+    fn parse(line: &str) -> tsclientlib::messages::s2c::InMessage {
+        let mut packet =
+            tsproto_packets::packets::OutPacket::new_with_dir(Direction::S2C, Flags::empty(), PacketType::Command);
+        packet.data_mut().extend_from_slice(line.as_bytes());
+        tsclientlib::messages::s2c::InMessage::new(&packet.header(), packet.content()).unwrap()
+    }
+
+    /// tsclientlib's book after TeamSpeak sent it `lines` (the first one `initserver`).
+    fn book(lines: &[&str]) -> tsclientlib::data::Connection {
+        let tsclientlib::messages::s2c::InMessage::InitServer(init) = parse(lines[0]) else {
+            panic!("initserver first")
+        };
+        let key = tsproto_types::crypto::EccKeyPrivP256::create().to_pub();
+        let mut book = tsclientlib::data::Connection::new(key, &init);
+        for line in &lines[1..] {
+            book.handle_command(&parse(line)).unwrap();
+        }
+        book
+    }
+
+    /// What TeamSpeak 3.13.7 sent on connecting (shortened): a server icon, a channel icon, the
+    /// group Iconic with an icon file, the built-in group icons, and carol's avatar.
+    const SERVER: &[&str] = &[
+        r"initserver virtualserver_name=TS virtualserver_welcomemessage virtualserver_platform=Linux virtualserver_version=3.13.7 virtualserver_maxclients=32 virtualserver_created=1792613445 virtualserver_codec_encryption_mode=0 virtualserver_hostmessage virtualserver_hostmessage_mode=0 virtualserver_default_server_group=8 virtualserver_default_channel_group=8 virtualserver_hostbanner_url virtualserver_hostbanner_gfx_url virtualserver_hostbanner_gfx_interval=0 virtualserver_priority_speaker_dimm_modificator=-18.0000 virtualserver_id=1 virtualserver_hostbutton_tooltip virtualserver_hostbutton_url virtualserver_hostbutton_gfx_url virtualserver_name_phonetic virtualserver_icon_id=1099912907 virtualserver_ip=0.0.0.0,\s:: virtualserver_ask_for_privilegekey=1 virtualserver_hostbanner_mode=0 virtualserver_channel_temp_delete_delay_default=0 acn=probe aclid=38 pv=7 client_talk_power=0 client_needed_serverquery_view_power=75",
+        r"channellist cid=1 cpid=0 channel_name=Default\sChannel channel_topic channel_codec=4 channel_codec_quality=6 channel_maxclients=-1 channel_maxfamilyclients=-1 channel_order=0 channel_flag_permanent=1 channel_flag_semi_permanent=0 channel_flag_default=1 channel_flag_password=0 channel_codec_latency_factor=1 channel_codec_is_unencrypted=1 channel_delete_delay=0 channel_unique_identifier=e06cad5f-214d-472c-9b7f-5ed156fe7f35 channel_flag_maxclients_unlimited=1 channel_flag_maxfamilyclients_unlimited=1 channel_flag_maxfamilyclients_inherited=0 channel_needed_talk_power=0 channel_forced_silence=0 channel_name_phonetic channel_icon_id=412469435 channel_banner_gfx_url channel_banner_mode=0|cid=2 cpid=0 channel_name=Plain channel_topic channel_codec=4 channel_codec_quality=6 channel_maxclients=-1 channel_maxfamilyclients=-1 channel_order=1 channel_flag_permanent=1 channel_flag_semi_permanent=0 channel_flag_default=0 channel_flag_password=0 channel_codec_latency_factor=1 channel_codec_is_unencrypted=1 channel_delete_delay=0 channel_unique_identifier=f06cad5f-214d-472c-9b7f-5ed156fe7f35 channel_flag_maxclients_unlimited=1 channel_flag_maxfamilyclients_unlimited=1 channel_flag_maxfamilyclients_inherited=0 channel_needed_talk_power=0 channel_forced_silence=0 channel_name_phonetic channel_icon_id=0 channel_banner_gfx_url channel_banner_mode=0",
+        r"notifycliententerview cfid=0 ctid=1 reasonid=2 clid=37 client_unique_identifier=mXS8XLS91EsdpLbhfrFoPPc8ZdQ= client_nickname=carol client_input_muted=0 client_output_muted=0 client_outputonly_muted=0 client_input_hardware=1 client_output_hardware=1 client_meta_data client_is_recording=0 client_database_id=11 client_channel_group_id=8 client_servergroups=8 client_away=0 client_away_message client_type=0 client_flag_avatar=0123456789abcdef0123456789abcdef client_talk_power=0 client_talk_request=0 client_talk_request_msg client_description client_is_talker=0 client_is_priority_speaker=0 client_unread_messages=0 client_nickname_phonetic client_needed_serverquery_view_power=75 client_icon_id=0 client_is_channel_commander=0 client_country client_channel_group_inherited_channel_id=1 client_badges client_myteamspeak_id client_integrations client_myteamspeak_avatar client_signed_badges|clid=38 client_unique_identifier=cpbj88QCPdFzQ80H9GlzHuXeDkQ= client_nickname=probe client_input_muted=0 client_output_muted=0 client_outputonly_muted=0 client_input_hardware=1 client_output_hardware=1 client_meta_data client_is_recording=0 client_database_id=7 client_channel_group_id=8 client_servergroups=8 client_away=0 client_away_message client_type=0 client_flag_avatar client_talk_power=0 client_talk_request=0 client_talk_request_msg client_description client_is_talker=0 client_is_priority_speaker=0 client_unread_messages=0 client_nickname_phonetic client_needed_serverquery_view_power=75 client_icon_id=0 client_is_channel_commander=0 client_country client_channel_group_inherited_channel_id=1 client_badges client_myteamspeak_id client_integrations client_myteamspeak_avatar client_signed_badges",
+        r"notifychannelgrouplist cgid=5 name=Channel\sAdmin type=1 iconid=100 savedb=1 sortid=0 namemode=0 n_modifyp=75 n_member_addp=50 n_member_removep=50|cgid=8 name=Guest type=1 iconid=0 savedb=0 sortid=0 namemode=0 n_modifyp=75 n_member_addp=0 n_member_removep=0",
+        r"notifyservergrouplist sgid=6 name=Server\sAdmin type=1 iconid=300 savedb=1 sortid=0 namemode=0 n_modifyp=75 n_member_addp=75 n_member_removep=75|sgid=8 name=Guest type=1 iconid=0 savedb=0 sortid=0 namemode=0 n_modifyp=75 n_member_addp=0 n_member_removep=0|sgid=9 name=Iconic type=1 iconid=412469435 savedb=1 sortid=0 namemode=0 n_modifyp=100 n_member_addp=100 n_member_removep=100",
+    ];
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+    /// Lets every transfer `images` asks for bring a PNG.
+    fn arrive(images: &mut Images, wanted: BTreeSet<ImageKey>) {
+        arrive_as(images, wanted, PNG);
+    }
+
+    /// Lets every transfer `images` asks for bring `file`.
+    fn arrive_as(images: &mut Images, wanted: BTreeSet<ImageKey>, file: &[u8]) {
+        let mut start = images.want(wanted);
+        while !start.is_empty() {
+            for (id, _) in start {
+                images.offered(id, file.len() as u64).unwrap();
+                images.finished(id, Ok(file.to_vec()));
+            }
+            start = images.queued();
+        }
+    }
+
+    #[test]
+    fn only_the_icons_of_badges_shown_are_wanted() {
+        // 600 more groups, each with a full-size icon, their icon ids in the opposite order of
+        // their group ids: only the first BADGES_PER_KIND groups are badges.
+        let groups: Vec<String> = (1..=600u32)
+            .map(|n| {
+                let (id, icon) = (100 + n, 2_000_000 - n);
+                format!(r"sgid={id} name=G{n} type=1 iconid={icon} savedb=1 sortid=0 namemode=0 n_modifyp=0 n_member_addp=0 n_member_removep=0")
+            })
+            .collect();
+        let line = format!("notifyservergrouplist {}", groups.join("|"));
+        let mut lines = SERVER.to_vec();
+        lines.push(&line);
+        let book = book(&lines);
+        let listed = GroupLists::default();
+        let ours = |k: &ImageKey| matches!(k, ImageKey::Icon(id) if (1_999_000..2_000_000).contains(id));
+        let shown: BTreeSet<ImageKey> =
+            badge_catalog(&book, &listed).into_iter().filter_map(|(_, icon)| icon).filter(ours).collect();
+        let wanted = wanted_images(&book, &listed);
+        assert_eq!(wanted.iter().filter(|k| ours(k)).cloned().collect::<BTreeSet<_>>(), shown);
+        assert_eq!(shown.len(), BADGES_PER_KIND - 2, "Server Admin and Iconic come first");
+
+        // So every badge shown gets its icon, and carol her avatar, within the cache.
+        let mut file = PNG.to_vec();
+        file.resize(images::ICON_LIMIT as usize, 0);
+        let mut images = Images::new();
+        arrive_as(&mut images, wanted, &file);
+        let view = view_of(&book, &HashMap::new(), &View::default(), &images);
+        let badges = &view.server.as_ref().unwrap().badges;
+        assert_eq!(badges.iter().filter(|b| b.kind == BadgeKind::Server).count(), BADGES_PER_KIND);
+        assert!(badges.iter().filter(|b| b.name.starts_with('G')).all(|b| b.icon.is_some()));
+        assert!(view.clients[&37].avatar.is_some());
+    }
+
+    #[test]
+    fn icons_and_avatars_map_into_the_shapes_once_here() {
+        let mut book = book(SERVER);
+        let listed = GroupLists::default();
+        let carol = STANDARD.decode("mXS8XLS91EsdpLbhfrFoPPc8ZdQ=").unwrap();
+        let avatar = |hash| ImageKey::avatar(&carol, hash).unwrap();
+        // The built-in icons of Server Admin (300) and Channel Admin (100) are no files.
+        let first = avatar("0123456789abcdef0123456789abcdef");
+        let wanted = wanted_images(&book, &listed);
+        assert_eq!(wanted, BTreeSet::from([ImageKey::Icon(412_469_435), ImageKey::Icon(1_099_912_907), first.clone()]));
+
+        // Nothing is shown before it is here.
+        let mut images = Images::new();
+        let talking = HashMap::new();
+        let before = view_of(&book, &talking, &View::default(), &images);
+        let server = before.server.as_ref().unwrap();
+        assert!(server.icon.is_none() && server.badges.iter().all(|b| b.icon.is_none()));
+        assert!(before.channels.values().all(|c| c.icon.is_none()));
+        assert!(before.clients.values().all(|c| c.avatar.is_none()));
+
+        arrive(&mut images, wanted);
+        let view = view_of(&book, &talking, &before, &images);
+        let server = view.server.as_ref().unwrap();
+        assert_eq!(server.icon.as_deref(), Some("i1099912907"));
+        let icon_of = |name: &str| server.badges.iter().find(|b| b.name == name).map(|b| b.icon.clone());
+        assert_eq!(icon_of("Iconic"), Some(Some("i412469435".into())));
+        assert_eq!((icon_of("Server Admin"), icon_of("Channel Admin")), (Some(None), Some(None)));
+        assert_eq!(view.channels[&1].icon.as_deref(), Some("i412469435"));
+        assert_eq!(view.channels[&2].icon, None);
+        assert_eq!(view.clients[&37].avatar, Some(first.token()));
+        assert_eq!(view.clients[&38].avatar, None, "no avatar");
+        let token = first.token();
+        assert!(images.store().lock().unwrap().get(&token).is_some());
+        let mut events = Vec::new();
+        diff(&before, &view, &mut events);
+        assert!(events.iter().any(|e| matches!(e, Event::ServerUpdated(s) if s.icon.is_some())));
+        assert!(events.iter().any(|e| matches!(e, Event::ChannelUpdated(c) if c.id == 1)));
+        assert!(events.iter().any(|e| matches!(e, Event::ClientUpdated(c) if c.id == 37)));
+
+        // A new avatar: the old one leaves the shapes until the new one is here.
+        book.handle_command(&parse(r"notifyclientupdated clid=37 client_flag_avatar=fedcba9876543210fedcba9876543210"))
+            .unwrap();
+        let second = avatar("fedcba9876543210fedcba9876543210");
+        let wanted = wanted_images(&book, &listed);
+        assert!(wanted.contains(&second) && !wanted.contains(&first));
+        let pending = view_of(&book, &talking, &view, &images);
+        assert_eq!(pending.clients[&37].avatar, None);
+        arrive(&mut images, wanted);
+        let after = view_of(&book, &talking, &pending, &images);
+        assert_eq!(after.clients[&37].avatar, Some(second.token()));
+        assert_ne!(second.token(), token);
+
+        // Without images the shapes carry no image fields at all, as from a Gwar server.
+        let plain = serde_json::to_value(&before.channels[&1]).unwrap();
+        assert!(plain.get("icon").is_none());
+        let plain = serde_json::to_value(&before.clients[&37]).unwrap();
+        assert!(plain.get("avatar").is_none());
+        let plain = serde_json::to_value(before.server.as_ref().unwrap()).unwrap();
+        assert!(plain.get("icon").is_none() && plain["badges"][0].get("icon").is_none());
     }
 
     #[test]

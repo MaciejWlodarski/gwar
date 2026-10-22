@@ -434,6 +434,198 @@ async fn teamspeak_mode_shows_group_badges() {
     until(&mut bob.events, |e| matches!(e, Event::ServerUpdated(s) if badge(s).is_none())).await;
 }
 
+/// A tiny PNG; the colour only changes the bytes.
+fn png(rgb: [u8; 3]) -> Vec<u8> {
+    let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x02\0\0\0".to_vec();
+    png.extend_from_slice(&rgb);
+    png
+}
+
+/// Uploads `data` as `/icon_<id>` through Query and TeamSpeak's file transfer.
+async fn upload_icon(query: &Query, filetransfer: std::net::SocketAddr, id: u32, data: &[u8]) {
+    use tokio::io::AsyncWriteExt;
+    let upload = Cmd::new("ftinitupload")
+        .arg("clientftfid", 1)
+        .arg("name", format!("/icon_{id}"))
+        .arg("cid", 0)
+        .arg("cpw", "")
+        .arg("size", data.len())
+        .arg("overwrite", 1)
+        .arg("resume", 0);
+    let reply = query.call(upload).await.unwrap();
+    let key = reply[0].get("ftkey").unwrap_or_else(|| panic!("no upload: {reply:?}")).clone();
+    let mut stream = tokio::net::TcpStream::connect(filetransfer).await.unwrap();
+    stream.write_all(key.as_bytes()).await.unwrap();
+    stream.write_all(data).await.unwrap();
+    stream.shutdown().await.unwrap();
+    // The server has the file once it closes the transfer.
+    let mut rest = Vec::new();
+    let _ = timeout(Duration::from_secs(5), tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut rest)).await;
+}
+
+/// carol, a plain TeamSpeak client: only a client can upload its own avatar. Each `(image, hash)`
+/// sent to her becomes her avatar; her uid comes back first.
+fn avatar_owner(address: std::net::SocketAddr) -> (Vec<u8>, tokio::sync::mpsc::Sender<(Vec<u8>, String)>) {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    use tsclientlib::{OutCommandExt, StreamItem};
+    let (uid_tx, uid_rx) = std::sync::mpsc::channel();
+    let (avatar_tx, mut avatars) = tokio::sync::mpsc::channel::<(Vec<u8>, String)>(4);
+    thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+            let mut carol = loop {
+                let connecting = tsclientlib::Connection::build(address.to_string()).name("carol").log_commands(false);
+                let mut carol = connecting.connect().unwrap();
+                let mut events = carol.events();
+                let listed = loop {
+                    match events.next().await {
+                        Some(Ok(StreamItem::MessageEvent(tsclientlib::InMessage::ChannelListFinished(_)))) => {
+                            break true;
+                        }
+                        Some(Ok(_)) => {}
+                        _ => break false,
+                    }
+                };
+                drop(events);
+                if listed {
+                    break carol;
+                }
+                assert!(tokio::time::Instant::now() < deadline, "carol could not connect");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            };
+            let state = carol.get_state().unwrap();
+            uid_tx.send(state.clients[&state.own_client].uid.clone().unwrap().0).unwrap();
+            let mut pending = None;
+            loop {
+                let next = {
+                    let mut events = carol.events();
+                    tokio::select! {
+                        event = events.next() => Err(event),
+                        avatar = avatars.recv() => Ok(avatar),
+                    }
+                };
+                match next {
+                    Ok(Some((data, hash))) => {
+                        carol
+                            .upload_file(tsclientlib::ChannelId(0), "/avatar", None, data.len() as u64, true, false)
+                            .unwrap();
+                        pending = Some((data, hash));
+                    }
+                    Ok(None) | Err(None) => break,
+                    Err(Some(Ok(StreamItem::FileUpload(_, upload)))) => {
+                        let (data, hash) = pending.take().expect("an avatar to upload");
+                        let mut stream = upload.stream;
+                        stream.write_all(&data).await.unwrap();
+                        stream.shutdown().await.unwrap();
+                        let mut rest = Vec::new();
+                        let read = tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut rest);
+                        let _ = timeout(Duration::from_secs(5), read).await;
+                        let mut update = tsproto_packets::packets::OutCommand::new(
+                            tsproto_packets::packets::Direction::C2S,
+                            tsproto_packets::packets::Flags::empty(),
+                            tsproto_packets::packets::PacketType::Command,
+                            "clientupdate",
+                        );
+                        update.write_arg("client_flag_avatar", &hash);
+                        update.send(&mut carol).unwrap();
+                    }
+                    Err(Some(Ok(StreamItem::FiletransferFailed(_, error)))) => panic!("carol's upload failed: {error}"),
+                    Err(Some(Ok(_))) => {}
+                    Err(Some(Err(error))) => panic!("carol lost the connection: {error}"),
+                }
+            }
+            let _ = carol.disconnect(tsclientlib::DisconnectOptions::new());
+            let _ = timeout(Duration::from_secs(2), carol.events().for_each(|_| async {})).await;
+        });
+    });
+    (uid_rx.recv_timeout(Duration::from_secs(100)).expect("carol on TeamSpeak"), avatar_tx)
+}
+
+/// TeamSpeak's icons and avatars: uploaded on the server, they reach our client as image tokens
+/// with the very bytes behind them, and a changed icon or avatar replaces its token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn teamspeak_mode_shows_icons_and_avatars() {
+    let Some(bridged) = support::start().await else { return };
+    let (query, _notifications) =
+        Query::connect(bridged.query, "serveradmin", &bridged.query_password(), 1).await.unwrap();
+    let (carol_uid, carol) = avatar_owner(bridged.ts_voice);
+    let first_avatar = png([1, 2, 3]);
+    carol.send((first_avatar.clone(), "0123456789abcdef0123456789abcdef".into())).await.unwrap();
+
+    let mut bob = support::ts_client(bridged.ts_voice, "bob").await;
+    let lobby = bob.welcome.server.default_channel;
+    let (server_icon, group_icon) = (png([4, 5, 6]), png([7, 8, 9]));
+    upload_icon(&query, bridged.filetransfer, 1_234_567, &server_icon).await;
+    upload_icon(&query, bridged.filetransfer, 7_654_321, &group_icon).await;
+    query.call(Cmd::new("serveredit").arg("virtualserver_icon_id", 1_234_567)).await.unwrap();
+    let added = query.call(Cmd::new("servergroupadd").arg("name", "Iconic")).await.unwrap();
+    let sgid: u32 = added[0].get("sgid").and_then(|v| v.parse().ok()).expect("sgid");
+    let icon_perm = |cmd: &str, id: u32| Cmd::new(cmd).arg("permsid", "i_icon_id").arg("permvalue", id);
+    query
+        .call(icon_perm("servergroupaddperm", 7_654_321).arg("sgid", sgid).arg("permnegated", 0).arg("permskip", 0))
+        .await
+        .unwrap();
+    query.call(icon_perm("channeladdperm", 7_654_321).arg("cid", lobby)).await.unwrap();
+
+    let mut server = bob.welcome.server.clone();
+    let mut channel = bob.welcome.channels.iter().find(|c| c.id == lobby).cloned().expect("lobby");
+    let carol_here = bob.welcome.clients.iter().find(|c| c.nickname == "carol");
+    let (mut carol_session, mut avatar) = (carol_here.map(|c| c.id), carol_here.and_then(|c| c.avatar.clone()));
+    let iconic = |server: &gwar_proto::ServerInfo| {
+        server.badges.iter().find(|b| b.kind == BadgeKind::Server && b.id == sgid).and_then(|b| b.icon.clone())
+    };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    while server.icon.is_none() || iconic(&server).is_none() || channel.icon.is_none() || avatar.is_none() {
+        let event = tokio::time::timeout_at(deadline, bob.events.recv()).await.unwrap_or_else(|_| {
+            panic!("no icons and avatar: {:?} {:?} {:?} {avatar:?}", server.icon, iconic(&server), channel.icon)
+        });
+        match event.expect("events ended") {
+            Event::ServerUpdated(s) => server = s,
+            Event::ChannelUpdated(c) if c.id == lobby => channel = c,
+            Event::ClientJoined(c) | Event::ClientUpdated(c) if c.nickname == "carol" => {
+                carol_session = Some(c.id);
+                avatar = c.avatar;
+            }
+            _ => {}
+        }
+    }
+    let image = |token: &Option<String>| bob.handle.image(token.as_deref().unwrap()).map(|b| b.to_vec());
+    assert_eq!(image(&server.icon), Some(server_icon));
+    assert_eq!(image(&iconic(&server)), Some(group_icon.clone()));
+    assert_eq!(image(&channel.icon), Some(group_icon));
+    assert_eq!(image(&avatar), Some(first_avatar));
+    // Server Admin's icon (300) is built into TeamSpeak's client: no file, no token.
+    let admin = server.badges.iter().find(|b| b.kind == BadgeKind::Server && b.name == "Server Admin");
+    assert_eq!(admin.map(|b| b.icon.clone()), Some(None), "{:?}", server.badges);
+    assert_eq!(bob.handle.image("i1"), None);
+
+    // A new channel icon and a new avatar replace their tokens.
+    let new_icon = png([10, 11, 12]);
+    upload_icon(&query, bridged.filetransfer, 2_345_678, &new_icon).await;
+    query.call(icon_perm("channeladdperm", 2_345_678).arg("cid", lobby)).await.unwrap();
+    let changed = until(
+        &mut bob.events,
+        |e| matches!(e, Event::ChannelUpdated(c) if c.id == lobby && c.icon.is_some() && c.icon != channel.icon),
+    )
+    .await;
+    let Event::ChannelUpdated(changed) = changed else { unreachable!() };
+    assert_eq!(image(&changed.icon), Some(new_icon));
+    let new_avatar = png([13, 14, 15]);
+    carol.send((new_avatar.clone(), "fedcba9876543210fedcba9876543210".into())).await.unwrap();
+    let session = carol_session.expect("carol's session");
+    let updated = until(
+        &mut bob.events,
+        |e| matches!(e, Event::ClientUpdated(c) if c.id == session && c.avatar.is_some() && c.avatar != avatar),
+    )
+    .await;
+    let Event::ClientUpdated(updated) = updated else { unreachable!() };
+    assert_eq!(image(&updated.avatar), Some(new_avatar));
+    assert!(!carol_uid.is_empty());
+    drop(carol);
+}
+
 /// TeamSpeak's own actions through our client: channel order, descriptions and family
 /// limits, pokes, kicks from a channel, bans by identity, and landing in a saved channel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
