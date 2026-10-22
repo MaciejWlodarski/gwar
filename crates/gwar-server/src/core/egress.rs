@@ -235,6 +235,77 @@ mod tests {
         assert_eq!(month(1_760_000_000_000), "2025-10");
     }
 
+    fn core() -> Core {
+        let signer = ed25519_dalek::SigningKey::from_bytes(&[99; 32]);
+        let (_tx, _rx) = mpsc::channel(16);
+        Core::new(
+            Store::in_memory().unwrap(),
+            CoreConfig {
+                max_clients: 10,
+                ice_servers: vec![],
+                version: "test".into(),
+                password: Arc::new(ArcSwap::from_pointee(None)),
+                password_plaintext: None,
+                upload_limit: 0,
+                upload_quota: 0,
+                storage_limit: 0,
+                files_dir: PathBuf::new(),
+                connect_url: None,
+                server_key: URL_SAFE_NO_PAD.encode(signer.verifying_key().as_bytes()),
+                server_signer: Arc::new(signer),
+                teamspeak: false,
+                screen: ScreenShared::new(0),
+            },
+            Arc::new(ArcSwap::from_pointee(Routing::default())),
+            mpsc::channel(8).0,
+            mpsc::channel(8).0,
+            _tx.downgrade(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_counter_adds_deltas_by_month_and_warns_once_per_threshold() {
+        let mut core = core();
+        let read = |interface: &str, transmitted: u64| {
+            Some(Reading { interface: interface.into(), transmitted, scope: EgressScope::Host })
+        };
+        let october = 1_760_000_000_000;
+        let november = october + 30 * 86_400_000;
+        core.egress_tick(read("eth0", 1_000), (0, 0), october).unwrap();
+        assert_eq!(core.egress.total, 0, "the first read is the baseline");
+        core.egress_tick(read("eth0", 5_000), (100, 7), october).unwrap();
+        assert_eq!((core.egress.total, core.egress.screen_members, core.egress.screen_guests), (4_000, 100, 7));
+        core.egress_tick(read("eth0", 2_000), (150, 7), october).unwrap();
+        assert_eq!(core.egress.total, 6_000, "a lower counter (a reboot) counts from zero");
+        core.egress_tick(read("eth1", 500), (150, 7), october).unwrap();
+        assert_eq!(core.egress.total, 6_500, "so does another interface");
+        core.egress_tick(None, (150, 7), october).unwrap();
+        assert_eq!((core.egress.total, core.egress.scope), (6_500, Some(EgressScope::Unavailable)));
+
+        // 1 TB: 80 % once, then 100 %.
+        core.set_screen_limits(ScreenLimits { monthly_egress_tb: 1, ..Default::default() }).unwrap();
+        core.egress_tick(read("eth1", 500 + 800_000_000_000), (150, 7), october).unwrap();
+        assert_eq!(core.egress.warned, 80);
+        core.egress_tick(read("eth1", 500 + 800_000_000_001), (150, 7), october).unwrap();
+        assert_eq!(core.egress.warned, 80);
+        assert!(!core.egress_stopped(), "only warned unless told to stop");
+        core.egress_tick(read("eth1", 500 + 1_000_000_000_000), (150, 7), october).unwrap();
+        assert_eq!(core.egress.warned, 100);
+        core.set_screen_limits(ScreenLimits { monthly_egress_tb: 1, monthly_egress_stop: true, ..Default::default() })
+            .unwrap();
+        assert!(core.egress_stopped());
+        assert_eq!(core.screen_shared.budget_bps.load(Ordering::Relaxed), 300_000_000);
+
+        // A restart keeps the month's totals; a new month starts from zero.
+        let stored = Egress::load(&core.store).unwrap();
+        assert_eq!((stored.month.as_str(), stored.total, stored.warned), ("2025-10", core.egress.total, 100));
+        core.egress_tick(read("eth1", 500 + 1_000_000_001_000), (160, 7), november).unwrap();
+        assert_eq!((core.egress.month.as_str(), core.egress.total, core.egress.warned), ("2025-11", 1_000, 0));
+        assert_eq!((core.egress.screen_members, core.egress.screen_guests), (10, 0));
+        assert!(!core.egress_stopped());
+    }
+
     #[test]
     fn limits_are_checked() {
         assert!(check_limits(&ScreenLimits::default()).is_ok());
