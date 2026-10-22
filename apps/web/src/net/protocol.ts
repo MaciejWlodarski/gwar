@@ -21,6 +21,7 @@ import type { Member } from "../proto/Member";
 import type { Event } from "../proto/Event";
 import type { Request } from "../proto/Request";
 import type { Welcome } from "../proto/Welcome";
+import type { ServerEgress } from "../proto/ServerEgress";
 
 export const PROTOCOL_VERSION = 4;
 /** Number of recvonly audio transceivers the server expects (`AUDIO_SLOTS`). */
@@ -80,6 +81,7 @@ export interface ResponseMap {
   "chat.read": Empty;
   "chat.history": { messages: ChatMessage[] };
   "server.update": Empty;
+  "server.egress": ServerEgress;
   "token.create": { token: string };
   "token.redeem": { groups: number[] };
   "file.upload": { file: string; upload_url: string };

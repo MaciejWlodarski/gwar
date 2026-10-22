@@ -121,6 +121,24 @@ describe("gwar/4 runtime schemas", () => {
     expect(event("screen.slot", { run: 1, slot: 4, share: null })).toBeUndefined();
     expect(event("screen.slot", { run: 1, slot: 0 })).toBeUndefined();
     expect(parseFrame('{"re":1,"err":{"code":"busy","message":"full"}}')?.kind).toBe("err");
+    expect(event("screen.paused", { share: share.share, reason: "bandwidth" })).toBe("event");
+    expect(event("screen.paused", { share: share.share, reason: "budget" })).toBe("event");
+    expect(event("screen.paused", { share: share.share, reason: "tired" })).toBeUndefined();
+    expect(event("screen.resumed", { share: share.share })).toBe("event");
+    expect(event("screen.resumed", {})).toBeUndefined();
+  });
+  it("bounds the egress report, its warnings and the screen limits", () => {
+    const event = (ev: string, d: unknown) => parseFrame(JSON.stringify({ ev, d }))?.kind;
+    const limits = { shares_per_channel: 4, shares_per_server: 32, viewers_per_share: 25, share_cap_kbps: 8000, budget_mbps: 300, monthly_egress_tb: 10, monthly_egress_stop: false };
+    const egress = { month: "2026-10", scope: "host", total: 123, screen_members: 4, screen_guests: 0, limits };
+    expect(responseFor("server.egress", egress)).toBe(true);
+    expect(responseFor("server.egress", { ...egress, scope: "unavailable", total: null })).toBe(true);
+    expect(responseFor("server.egress", { ...egress, month: "October" })).toBe(false);
+    expect(responseFor("server.egress", { ...egress, scope: "cloud" })).toBe(false);
+    expect(responseFor("server.egress", { ...egress, limits: { ...limits, budget_mbps: 0 } })).toBe(false);
+    expect(responseFor("server.egress", { ...egress, limits: { ...limits, extra: 1 } })).toBe(false);
+    expect(event("server.egress_warning", { month: "2026-10", percent: 80, total: 8e12, limit: 1e13 })).toBe("event");
+    expect(event("server.egress_warning", { month: "2026-10", percent: 180, total: 8e12, limit: 1e13 })).toBeUndefined();
   });
   it("accepts TeamSpeak group badges in the server info and a client's channel group", () => {
     const w = welcome();
