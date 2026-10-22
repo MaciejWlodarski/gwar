@@ -206,6 +206,50 @@ async fn a_guest_watches_a_share_through_its_link_until_it_ends() {
 }
 
 #[tokio::test]
+async fn private_links_are_presence_bound_at_the_guest_gateway_and_end_with_the_share() {
+    use gwar_server::media::screen::Lease;
+    let (server, mut notes) = linked_server(|_| {}).await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let general = seed_channel(&alice, "General");
+    let share = share_linked(&mut alice, general).await;
+    let (shared, links) = within("private token registry for the announced share", async {
+        loop {
+            if let Some(BridgeNote::WatchLink { url, private_links, .. }) = notes.recv().await {
+                break (url, private_links);
+            }
+        }
+    })
+    .await;
+    let membership = Lease::new();
+    let url = links.mint("recipient", membership.clone()).unwrap();
+    let token = url.0.rsplit_once('#').unwrap().1;
+    assert_ne!(url, shared);
+    let mut present = Guest::connect(&server, "198.51.100.1").await;
+    assert_eq!(present.watch(token).await.unwrap()["share"], share);
+    drop(present);
+    membership.end();
+    let mut departed = Guest::connect(&server, "198.51.100.2").await;
+    assert_eq!(
+        departed.watch(token).await.unwrap_err(),
+        json!({"code": "not_found", "message": "this link does not work"})
+    );
+    departed.closed().await;
+    let returned = links.mint("recipient", Lease::new()).unwrap();
+    let fresh = returned.0.rsplit_once('#').unwrap().1;
+    let mut present = Guest::connect(&server, "198.51.100.3").await;
+    assert_eq!(present.watch(fresh).await.unwrap()["share"], share);
+    alice.ok("screen.stop", json!({"share": share})).await;
+    assert_eq!(present.next_event().await, json!({"ev": "screen.stopped", "d": {"share": share, "reason": "stopped"}}));
+    present.closed().await;
+    assert!(links.mint("recipient", Lease::new()).is_none());
+    for (i, token) in [token, fresh, shared.0.rsplit_once('#').unwrap().1].into_iter().enumerate() {
+        let mut ended = Guest::connect(&server, &format!("198.51.100.{}", i + 10)).await;
+        assert_eq!(ended.watch(token).await.unwrap_err()["code"], "not_found");
+        ended.closed().await;
+    }
+}
+
+#[tokio::test]
 async fn unknown_ended_and_turned_off_tokens_answer_the_same_not_found() {
     let (server, mut notes) = linked_server(|_| {}).await;
     let mut alice = Client::connect(&server, "alice").await;

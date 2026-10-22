@@ -22,7 +22,7 @@ mod owner;
 pub(crate) mod passwords;
 mod private;
 mod screen;
-pub use screen::{GuestMsg, WatchUrl};
+pub use screen::{GuestMsg, PrivateWatchLinks, WatchUrl};
 mod sealed;
 mod voice;
 

@@ -1347,9 +1347,13 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
   that channel.
 - The text is `🖥 {name} is sharing their screen. Watch: {url}`, with the
   name passed through `plain`.
-- A TeamSpeak user who enters the channel while the share runs gets the link
-  once, as a private message from ServerQuery, so late joiners are not left
-  out. The bridge sends it from its in-memory copy of the link (below).
+- A TeamSpeak user who enters the channel while the share runs gets a private
+  link from ServerQuery once per uninterrupted channel membership. Each private
+  delivery has a fresh token bound to that user's TeamSpeak UID and membership;
+  it never carries the channel post's shared token. Leaving, moving or
+  disconnecting revokes it, including when the same UID later returns. A return
+  gets one fresh private link. Confirmed delivery is recorded at acknowledgement
+  and retained for its membership, including across a delayed receipt sweep.
 - Nothing is posted when the share ends. The link simply stops working.
 - The channel description's presence line gets " · sharing screen" after the
   sharer's name. The link is not put there: descriptions are visible to
@@ -1367,18 +1371,34 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
   web host or in a Referer header. Only the watch page reads it, and sends it
   over the WebSocket to the Gwar server.
 - **Where it is kept:**
-  - The guest gateway checks tokens against SHA-256(token) → share, in
-    memory.
-  - The bridge also keeps the raw link, in memory, for one purpose: sending
-    it to TeamSpeak users who enter the channel later. It is a map from share
-    to link inside the bridge task.
-  - Nothing is written to disk or to logs. The raw link exists only in that
-    bridge map and in the messages sent to TeamSpeak.
+  - The guest gateway checks SHA-256(token) → share in memory. Private token
+    hashes additionally carry the intended UID and an immutable membership
+    lease. At `guest.watch`, that UID's original membership in the share's
+    channel must still be live; otherwise the reply is the same `not_found`
+    as for an unknown token. A reconnect cannot revive an old membership.
+  - The bridge keeps the raw shared URL for the channel post. Private URLs
+    exist only in their delivery tasks and queued TeamSpeak commands; their
+    registry retains hashes, UID bindings and membership leases.
+  - Nothing is written to disk or to logs. Token-bearing wrappers redact
+    their contents in `Debug`.
 - **When it dies.** The token and the bridge's copy are both removed when
   the share ends (stop, leave, moderator stop, transport failure), when the
   link is turned off, and when the bridge detaches. A server restart ends
   every share, and so every link.
-- One share has one token. A new share gets a new token and a new post.
+- Each share has one shared token for its channel post and at most **64 live
+  private tokens**. Expired memberships release token capacity. All tokens
+  share the same share/link lease; share end or link revocation invalidates
+  every token synchronously. Guests using any of these tokens share the
+  existing 10-guest and 25-viewer limits.
+- The shared channel token remains a bearer token for the channel audience;
+  TeamSpeak retaining it in channel chat history is accepted.
+- Private recovery admits at most **four delivery tasks per share**, without
+  waiting in the bridge event loop. Later receipt sweeps reconcile readers
+  waiting for capacity. Share or membership cancellation interrupts queued
+  sends and flood backoff. Each Query send has a 30 s deadline including
+  enqueueing and the reply. An in-flight timeout closes the transport and
+  its notification stream, allowing bridge supervision to reconnect; queued
+  callers fail instead of waiting behind the stalled command.
 - The token grants exactly one thing: watching that share. Guests see no
   other name than the sharer's display name, and no channel, chat or other
   shares.
@@ -1877,9 +1897,12 @@ design left room:
   records the wish. The token is generated when the share is announced (its
   publish transport connected), and only if a link is possible then and the
   sharer has not turned it off meanwhile. With the checkbox off no token ever
-  exists. The core keeps SHA-256(token) → share; the raw URL goes once to the
-  bridge, in a `WatchUrl` whose `Debug` prints no token, so it cannot reach a
-  log line.
+  exists. The core keeps SHA-256(token) → share for the shared channel link;
+  its raw URL goes once to the bridge, in a redacted `WatchUrl`. Private
+  delivery mints distinct tokens in a registry shared by the core and bridge,
+  bound to the recipient's TS UID and uninterrupted channel membership. The
+  registry checks the share lease and membership again at redemption and
+  keeps at most 64 live private tokens per share.
 - **"Possible" means:** a public URL, `screen_guest_links` on, `file_access`
   `link`, a bridge attached right now (not only `--teamspeak`), and a channel
   that is neither encrypted nor private. Private channels are never bridged,
@@ -1923,13 +1946,16 @@ design left room:
   `screen.link {active: true}`.
 - **The server setting** has a switch in Server settings, shown only on
   TeamSpeak servers.
-- **Late joiners and the presence marker.** The late-joiner message goes once
-  per TeamSpeak user and share, by TeamSpeak identity (client ids are reused);
-  users in the channel when the link was posted count as told only if the
-  post went out, and anyone counts as told only once a message to them did.
-  If the signed channel post fails, those in the channel get it privately instead.
-  The " · sharing screen" marker follows the sharer's
-  name in the channel description's presence line, which lists users without a
+- **Late joiners and the presence marker.** Private links go once per UID and
+  uninterrupted channel membership, using a fresh per-recipient token. Query
+  records successful delivery at acknowledgement. Completed receipts are
+  consumed before an old attempt is replaced, and a departure never discards
+  an acknowledged receipt. That membership's token is revoked on departure;
+  returning starts a new membership with one fresh private link. Readers of
+  the channel post count as told only after confirmed delivery and while their
+  original membership remains valid. If the signed channel post fails, those
+  in the channel get private links instead. The " · sharing screen" marker
+  follows the sharer's name in the channel description's presence line, which lists users without a
   puppet (the line puppets do not need).
 - **ServerQuery posts only to readers.** Without a puppet, or when the
   puppet's queue does not take the post, the signed ServerQuery post is made
@@ -1943,11 +1969,18 @@ design left room:
   one flood retry. Each receipt belongs to one post attempt. A departure or move
   invalidates a reader's membership, so leaving and returning before a receipt
   cannot count as reading the channel post. Private delivery runs outside the
-  bridge event loop; Query checks the recipient's connection and membership before
+  bridge event loop, with four tasks admitted per share and no tasks waiting for
+  admission. Query checks the recipient's connection and membership before
   every socket dispatch and retry, invalidating them before forwarding departures.
-  The core ends the link's cancellation lease synchronously on revocation or
-  share end; queued posts and fallbacks check it before sending. A post too long
-  for one puppet command goes entirely through ServerQuery, avoiding partial
+  Private token redemption checks that same UID/membership binding, so clid
+  reassignment after dispatch cannot leave a usable misdelivered token once
+  the original recipient's departure is processed. A Query disconnect also
+  invalidates its memberships. The core ends the link's cancellation lease
+  synchronously on revocation or share end; all private tokens, queued posts,
+  admission deferrals, sends and flood retries obey it. Queue admission and
+  reply waiting share a 30 s deadline per send; an in-flight timeout closes
+  Query and lets bridge supervision reconnect. A post too long for one
+  puppet command goes entirely through ServerQuery, avoiding partial
   enqueue and duplicate fallback posts.
 - **The page** is plain TypeScript (no React, no app stores), about 8 KB
   gzipped with its CSS. It keeps the token in the fragment (a reload works
@@ -1967,7 +2000,12 @@ design left room:
   bridge tests cover confirmed puppet delivery, rejection, a dropped queued
   post, uncertain delivery without duplicate fallback, stale receipts and
   cancellation during a query move. Query tests cover cancellation in the
-  socket queue and before a flood retry. They also cover the signed
+  socket queue and before a flood retry. New regressions execute a private
+  command only after clid reassignment and refuse its token at redemption;
+  verify live, departed, returning and ended token bindings and the 64-token
+  cap; exercise both receipt-sweep orderings with one delivery per membership;
+  and keep 40-recipient recovery bounded with a stalled reply, share-end
+  cancellation and Query reconnection signaling. They also cover the signed
   ServerQuery post, late joiners, encrypted channels, members-only servers
   and the description.
   `apps/web/e2e/watch.mjs` runs Chromium and WebKit guest pages against a

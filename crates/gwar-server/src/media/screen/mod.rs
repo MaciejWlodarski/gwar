@@ -202,20 +202,30 @@ pub enum ScreenSignal {
     Watch { session: SessionId, run: u64, connected: bool },
 }
 
-/// A watch transport's lease: the core ends it when it drops the transport, so the screen task
-/// closes it even if the `EndWatch` that follows is lost to a full queue.
+/// Cancellation for screen transports, watch links and TeamSpeak memberships. Ending is
+/// synchronous; async waiters wake immediately. The screen task also checks the flag, so a
+/// transport closes even if its `EndWatch` is lost to a full queue.
 #[derive(Debug)]
-pub struct Lease(AtomicBool);
+pub struct Lease(AtomicBool, tokio::sync::Notify);
 
 impl Lease {
     pub fn new() -> Arc<Self> {
-        Arc::new(Self(AtomicBool::new(true)))
+        Arc::new(Self(AtomicBool::new(true), tokio::sync::Notify::new()))
     }
     pub fn alive(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
+    pub async fn ended(&self) {
+        let ended = self.1.notified();
+        tokio::pin!(ended);
+        ended.as_mut().enable();
+        if self.alive() {
+            ended.await;
+        }
+    }
     pub fn end(&self) {
         self.0.store(false, Ordering::Release);
+        self.1.notify_waiters();
     }
 }
 

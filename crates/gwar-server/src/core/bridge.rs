@@ -39,8 +39,9 @@ pub enum BridgeNote {
         session: SessionId,
         channel: ChannelId,
         url: super::WatchUrl,
-        /// Ended synchronously by the core, before the bridge processes `WatchLinkGone`.
-        lease: std::sync::Arc<crate::media::screen::Lease>,
+        /// Owns all private tokens and the cancellation lease, ended synchronously
+        /// by the core before the bridge processes `WatchLinkGone`.
+        private_links: std::sync::Arc<super::PrivateWatchLinks>,
     },
     /// That link stopped working (the share ended or the link was turned off): forget it.
     WatchLinkGone { share: String },

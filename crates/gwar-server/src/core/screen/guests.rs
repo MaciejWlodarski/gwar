@@ -2,8 +2,9 @@
 //!
 //! A share in a bridged plaintext channel whose sharer asked for it gets one link once it is
 //! announced: 32 random bytes from the OS, in base64url, after `#` in the URL. The core keeps
-//! only SHA-256 of the token, mapped to the share; the bridge keeps the URL to post it and to
-//! tell late joiners, and nothing else ever holds it. The link dies with the share, when it is
+//! only SHA-256 of the token, mapped to the share; the bridge keeps that URL for the channel
+//! post. Private delivery mints separate tokens bound to a TS UID and membership, checked
+//! again at redemption. Every token shares the link lease. The link dies with the share, when it is
 //! turned off, when a server setting rules it out, and when the bridge detaches.
 //!
 //! A guest is one `/ws/watch` connection that presented a working token: no identity, no
@@ -12,6 +13,7 @@
 use super::*;
 use crate::media::screen::GUEST_SLOTS;
 use rand::{TryRngCore, rngs::OsRng};
+use std::sync::Mutex;
 
 /// Guests per share (`guests_per_share`): a leaked link cannot crowd out members.
 pub(in crate::core) const GUESTS_PER_SHARE: usize = 10;
@@ -25,6 +27,64 @@ pub struct WatchUrl(pub String);
 impl std::fmt::Debug for WatchUrl {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("WatchUrl(..)")
+    }
+}
+
+/// At most this many private tokens can remain live for one share.
+const PRIVATE_TOKENS_PER_SHARE: usize = 64;
+
+/// Private links share the channel link's lease and require the same uninterrupted
+/// TeamSpeak UID/channel membership at minting and redemption. Only hashes are retained.
+pub struct PrivateWatchLinks {
+    base: String,
+    lease: Arc<Lease>,
+    tokens: Mutex<HashMap<[u8; 32], PrivateToken>>,
+}
+
+struct PrivateToken {
+    uid: String,
+    membership: Arc<Lease>,
+}
+
+impl std::fmt::Debug for PrivateWatchLinks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PrivateWatchLinks(..)")
+    }
+}
+
+impl PrivateWatchLinks {
+    pub fn new(base: String, lease: Arc<Lease>) -> Arc<Self> {
+        Arc::new(Self { base, lease, tokens: Mutex::default() })
+    }
+
+    pub fn lease(&self) -> Arc<Lease> {
+        self.lease.clone()
+    }
+
+    pub fn mint(&self, uid: &str, membership: Arc<Lease>) -> Option<WatchUrl> {
+        if uid.is_empty() || !self.lease.alive() || !membership.alive() {
+            return None;
+        }
+        let mut tokens = self.tokens.lock().unwrap();
+        tokens.retain(|_, token| token.membership.alive());
+        if tokens.len() >= PRIVATE_TOKENS_PER_SHARE {
+            return None;
+        }
+        let mut raw = [0u8; 32];
+        OsRng.try_fill_bytes(&mut raw).ok()?;
+        let token = URL_SAFE_NO_PAD.encode(raw);
+        tokens.insert(token_hash(&token), PrivateToken { uid: uid.to_owned(), membership });
+        Some(WatchUrl(format!("{}{token}", self.base)))
+    }
+
+    fn contains(&self, hash: &[u8; 32]) -> bool {
+        self.lease.alive()
+            && self
+                .tokens
+                .lock()
+                .unwrap()
+                .get(hash)
+                .is_some_and(|token| !token.uid.is_empty() && token.membership.alive())
     }
 }
 
@@ -118,10 +178,12 @@ impl Core {
         let share = self.shares.get_mut(id).expect("found above");
         share.link = Some(hash);
         share.link_lease = Some(lease.clone());
+        let private_links = PrivateWatchLinks::new(base.clone(), lease.clone());
+        share.private_links = Some(private_links.clone());
         self.watch_links.insert(hash, id.to_owned());
         let url = WatchUrl(format!("{base}{token}"));
         let share = id.to_owned();
-        self.notify_bridge(|| BridgeNote::WatchLink { share, session, channel, url, lease });
+        self.notify_bridge(|| BridgeNote::WatchLink { share, session, channel, url, private_links });
         let audience = self.link_audience(id);
         self.broadcast(Event::ScreenLink { share: id.to_owned(), active: true }, |s| audience.contains(&s.id));
     }
@@ -133,6 +195,7 @@ impl Core {
         if let Some(lease) = share.link_lease.take() {
             lease.end();
         }
+        share.private_links = None;
         let guests = std::mem::take(&mut share.guests);
         if let Some(hash) = share.link.take() {
             self.watch_links.remove(&hash);
@@ -239,9 +302,19 @@ impl Core {
             return Err(not_found());
         }
         let hash = token_hash(token);
-        let id = self.watch_links.get(&hash).ok_or_else(not_found)?.clone();
+        let id = self
+            .watch_links
+            .get(&hash)
+            .cloned()
+            .or_else(|| {
+                self.shares.iter().find_map(|(id, share)| {
+                    share.private_links.as_ref().filter(|links| links.contains(&hash)).map(|_| id.clone())
+                })
+            })
+            .ok_or_else(not_found)?;
         let share = self.shares.get(&id).ok_or_else(not_found)?;
-        if share.link != Some(hash) || share.link_revoked || !share.live || !self.link_possible(share.channel) {
+        let valid = share.link == Some(hash) || share.private_links.as_ref().is_some_and(|links| links.contains(&hash));
+        if !valid || share.link_revoked || !share.live || !self.link_possible(share.channel) {
             return Err(not_found());
         }
         if share.guests.len() >= GUESTS_PER_SHARE {
@@ -419,6 +492,7 @@ mod tests {
                     link_revoked: false,
                     link: Some(hash),
                     link_lease: Some(Lease::new()),
+                    private_links: None,
                     viewers: (10_000..10_000 + viewers).collect(),
                     guests: BTreeSet::new(),
                     origin: ScreenOrigin::new(sharer, "S".into(), channel, false, false),
@@ -461,6 +535,133 @@ mod tests {
         let (notes, receiver) = mpsc::unbounded_channel();
         core.bridge(BridgeMsg::Attach(notes)).await;
         (core, receiver)
+    }
+
+    async fn private_links(core: &CoreHandle) -> Arc<PrivateWatchLinks> {
+        on_core(core, |core| {
+            let share = core.shares.get_mut("S").unwrap();
+            let links = PrivateWatchLinks::new(core.watch_base.clone().unwrap(), share.link_lease.clone().unwrap());
+            share.private_links = Some(links.clone());
+            links
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn private_tokens_require_the_original_membership_and_share_lease() {
+        for end in [LinkEnd::TurnedOff, LinkEnd::Ended(ScreenStopReason::Stopped)] {
+            let (core, _notes) = core_with_bridge().await;
+            let shared = linked_share(&core, 0).await;
+            let links = private_links(&core).await;
+            let membership = Lease::new();
+            let url = links.mint("ts-recipient", membership.clone()).unwrap();
+            let token = url.0.rsplit_once('#').unwrap().1;
+            let admitted = guest(&core, token).await.expect("recipient is still present");
+            core.guest(GuestMsg::Gone { guest: admitted }).await;
+            membership.end();
+            let miss = guest(&core, "unknown-token").await.unwrap_err();
+            let departed = guest(&core, token).await.unwrap_err();
+            assert_eq!((departed.code, departed.message), (miss.code, miss.message));
+            // Rejoining under the same UID cannot revive the revoked token.
+            let returned = links.mint("ts-recipient", Lease::new()).unwrap();
+            assert_ne!(returned, url);
+            assert!(guest(&core, token).await.is_err());
+            let returned_token = returned.0.rsplit_once('#').unwrap().1;
+            assert!(guest(&core, returned_token).await.is_ok());
+            on_core(&core, move |core| core.close_watch_link("S", end)).await;
+            assert!(guest(&core, token).await.is_err());
+            assert!(guest(&core, returned_token).await.is_err());
+            assert!(guest(&core, &shared).await.is_err());
+            assert!(links.mint("ts-recipient", Lease::new()).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn private_token_count_is_bounded_and_uses_the_existing_guest_limit() {
+        let (core, _notes) = core_with_bridge().await;
+        linked_share(&core, 0).await;
+        let links = private_links(&core).await;
+        let membership = Lease::new();
+        for i in 0..PRIVATE_TOKENS_PER_SHARE {
+            let url = links.mint(&format!("uid-{i}"), membership.clone()).unwrap();
+            if i <= GUESTS_PER_SHARE {
+                let admitted = guest(&core, url.0.rsplit_once('#').unwrap().1).await;
+                if i < GUESTS_PER_SHARE {
+                    assert!(admitted.is_ok());
+                } else {
+                    assert_eq!(admitted.unwrap_err().code, ErrorCode::Busy);
+                }
+            }
+        }
+        assert!(links.mint("over-limit", Lease::new()).is_none());
+        membership.end();
+        assert!(links.mint("new-membership", Lease::new()).is_some());
+        assert_eq!(links.tokens.lock().unwrap().len(), 1, "departed tokens release capacity");
+    }
+
+    #[cfg(feature = "teamspeak")]
+    #[tokio::test]
+    async fn a_link_misdelivered_after_dispatch_is_a_lookup_miss_at_redemption() {
+        use crate::teamspeak::query::{Cmd, Query, tests::recipient_membership};
+        use tokio::{
+            io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+            net::TcpListener,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (dispatched, seen) = oneshot::channel();
+        let (execute, execution) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let (read, mut write) = socket.into_split();
+            write.write_all(b"TS3\n\rWelcome\n\r").await.unwrap();
+            let mut lines = BufReader::new(read).lines();
+            while let Some(line) = lines.next_line().await.unwrap() {
+                if line.starts_with("sendtextmessage ") {
+                    dispatched.send(line).unwrap();
+                    execution.await.unwrap();
+                    // Execute only after clid 7 belongs to someone in another channel.
+                    write.write_all(b"notifyclientleftview clid=7 reasonid=8\n\rnotifycliententerview clid=7 cid=20 client_unique_identifier=wrong-user\n\rerror id=0 msg=ok\n\r").await.unwrap();
+                    while lines.next_line().await.unwrap().is_some() {}
+                    return;
+                }
+                if line.starts_with("clientlist") {
+                    write.write_all(b"clid=7 cid=10 client_unique_identifier=recipient\n\r").await.unwrap();
+                }
+                write.write_all(b"error id=0 msg=ok\n\r").await.unwrap();
+            }
+        });
+        let (query, mut notifications) = Query::connect(addr, "serveradmin", "p", 1).await.unwrap();
+        query.call(Cmd::new("clientlist").flag("-uid")).await.unwrap();
+        let membership = recipient_membership(&query, 7, "recipient", 10);
+        let (core, _notes) = core_with_bridge().await;
+        linked_share(&core, 0).await;
+        let links = private_links(&core).await;
+        let url = links.mint("recipient", membership.clone()).unwrap();
+        let token = url.0.rsplit_once('#').unwrap().1.to_owned();
+        let delivery_query = query.clone();
+        let delivery = tokio::spawn(async move {
+            delivery_query
+                .call(Cmd::new("sendtextmessage").arg("targetmode", 1).arg("target", 7).arg("msg", url.0))
+                .await
+        });
+        let wire = seen.await.unwrap();
+        assert!(wire.contains("target=7") && wire.contains(&token));
+        assert!(membership.alive(), "the recipient was valid when dispatched");
+        execute.send(()).unwrap();
+        let departure = notifications.recv().await.unwrap();
+        assert_eq!(departure.name, "notifyclientleftview");
+        assert!(!membership.alive());
+        // A successful TS acknowledgement cannot authorize the misdelivered token.
+        delivery.await.unwrap().unwrap();
+        let refused = guest(&core, &token).await.unwrap_err();
+        let miss = guest(&core, "unknown-token").await.unwrap_err();
+        assert_eq!((refused.code, refused.message), (miss.code, miss.message));
+        let arrival = notifications.recv().await.unwrap();
+        assert_eq!(arrival.records[0]["client_unique_identifier"], "wrong-user");
+        assert!(notifications.try_recv().is_err());
+        drop(query);
+        peer.await.unwrap();
     }
 
     #[tokio::test]

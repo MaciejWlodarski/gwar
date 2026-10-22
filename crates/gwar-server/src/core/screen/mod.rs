@@ -8,7 +8,7 @@
 mod guests;
 
 pub(super) use guests::Guest;
-pub use guests::{GuestMsg, WatchUrl};
+pub use guests::{GuestMsg, PrivateWatchLinks, WatchUrl};
 
 use super::{
     voice::{bad, stale},
@@ -49,6 +49,7 @@ pub(super) struct Share {
     link: Option<[u8; 32]>,
     /// Cancels queued TeamSpeak posts as soon as the link ends.
     link_lease: Option<Arc<Lease>>,
+    private_links: Option<Arc<PrivateWatchLinks>>,
     viewers: BTreeSet<SessionId>,
     /// TeamSpeak guests watching through the link; they count among the share's viewers.
     guests: BTreeSet<SessionId>,
@@ -189,6 +190,7 @@ impl Core {
             link_revoked: false,
             link: None,
             link_lease: None,
+            private_links: None,
             viewers: BTreeSet::new(),
             guests: BTreeSet::new(),
             origin: ScreenOrigin::new(session, id.clone(), channel, false, private),
