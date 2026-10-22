@@ -189,8 +189,16 @@ and accept decimals (0 through 24 hours); percentages require `%` (0 through
   Nonzero `reorder` conflicts with `keep_order`.
 - `seed=42`: unsigned 64-bit seed, either global or inside a direction to
   override the global seed. The default global seed is 1.
+- `rate=5mbit`: a bottleneck of that rate (`kbit`, `mbit`, `gbit` or plain bits
+  per second, 8 kbit/s to 100 Gbit/s), **shared by every flow in the
+  direction**: all clients' uplinks queue behind one `up` link, all downlinks
+  behind one `down` link. A datagram occupies the link for its size plus 28
+  bytes (IPv4 and UDP headers) at the rate, after those queued before it.
+  `queue=100ms` (the default; needs `rate`) bounds the wait: a datagram that
+  would wait longer is dropped (`queue_dropped`, also counted in `dropped`).
+  `queue_max_ms` records the longest wait.
 
-Loss is applied first, then delay/jitter, the optional reorder hold, the stall,
+Loss is applied first, then the bottleneck, delay/jitter, the optional reorder hold, the stall,
 and finally order preservation. The relay treats every UDP datagram alike,
 including ICE/DTLS/RTCP; it never decrypts media. Severe impairments during
 startup can prevent the voice connection. Each direction applies to **both**
@@ -234,11 +242,61 @@ write useful output and still exit unsuccessfully if more than 5% of markers
 are unmatched. Inspect per-marker CSV timelines and applied stall windows,
 because a call's median alone can hide persistent latency after a stall.
 
+Sharing one link per direction stands in for a shared access link: with
+`LATENCY_SCREEN` a share's publisher and the voice sender queue behind the same
+`up`, and a viewer and the voice receiver behind the same `down`.
+
 On `a0f5686`, `up:stall=270ms@12s` left about +240 ms on every later marker
 of the call (the SFU re-stamps slot RTP time from arrival, so the burst looks
 like a new talk spurt), while `down:stall=270ms@12s` recovered to baseline
 within one marker. `up:jitter=10ms` cost far more than `down:jitter=10ms`
 (103 vs 63 ms median) for the same reason.
+
+## Screen load
+
+`LATENCY_SCREEN` adds screen shares beside the call (docs/screen-share.md,
+"Voice headroom and acceptance"), for example
+`LATENCY_SCREEN=shares=1,bitrate=8mbit,fps=60,keyframe=200000,viewers=5,via=none`:
+
+- `shares` (1–4) sharer connections join the call's channel and each start a
+  share with the preset whose cap fits `bitrate` (Saver, Text, Smooth, Game;
+  at most 8 Mbps). Each publishes through a str0m frame-mode VP9 sender:
+  synthetic frames of `bitrate / fps` bytes, `keyframe` bytes for the first
+  frame and for every keyframe request, paced by str0m's TWCC pacer.
+- `viewers` (1–24) connections watch every share on a four-slot watch
+  transport and count what arrives and every `screen.paused`/`screen.resumed`.
+- `via`: which screen transports go through the `LATENCY_NET` relay:
+  `publishers`, `viewers`, `all`, or `none` (the default; all direct).
+- The load runs on its own two-thread runtime, so its str0m loops neither
+  delay the voice clients and the in-process server nor are delayed by them.
+  It starts before voice, so with `LATENCY_WARMUP_MS=15000` the markers start
+  after the slots' 10 s ramp.
+- The run's JSON gains `screen`: frames, keyframes, keyframe requests, bytes
+  published and received, pauses, resumes, the average received rate per
+  viewer and `steady_mbps_per_viewer`, counted from 12 s after the load
+  started. Without `LATENCY_SCREEN` it is `null`.
+
+`RUST_LOG` logs to stderr, for example
+`RUST_LOG=gwar_server::media::screen=trace` for each watch transport's estimate
+and egress counters every 100 ms.
+
+`scripts/latency/screen_gate.py` runs the acceptance: paired runs without and
+with the load, alternating which goes first, sharing the pair's `LATENCY_NET`
+seed, in six scenarios (unconstrained, a 10 Mbps uplink with an 8 Mbps share,
+a 5 Mbps downlink with two shares, each also with 1 % loss). It writes each
+scenario's runs like `run_local.py`, and `summary.json` with the voice figures
+of every run, the median per-pair deltas and the gate verdict; it exits 1 when
+a scenario misses the gate:
+
+```sh
+cargo build --release -p gwar-client --example latency
+python3 scripts/latency/screen_gate.py --binary target/release/examples/latency \
+  --out target/latency/screen-gate
+```
+
+`scripts/latency/screen_cpu.py` measures the screen SFU's CPU per forwarded
+Mbps against a separate `gwar-server` process (see its `--help`); run it on the
+host to be measured.
 
 ## Compare builds
 

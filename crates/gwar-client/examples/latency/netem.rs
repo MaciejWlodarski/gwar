@@ -16,6 +16,12 @@ use tokio::{
 const MAX_QUEUED: usize = 65_536;
 /// Browsers open one flow per local ICE candidate that checks the relay.
 const MAX_BROWSER_FLOWS: usize = 32;
+/// Two voice clients, and a screen load's publishers and viewers.
+const MAX_NATIVE_FLOWS: usize = 16;
+/// IPv4 and UDP headers, which a link's rate also carries.
+const WIRE_OVERHEAD: usize = 28;
+/// A bottleneck's queue, as sending time, unless `queue=` says otherwise.
+const DEFAULT_QUEUE: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Spec {
@@ -36,6 +42,10 @@ pub struct Direction {
     reorder_delay: Duration,
     stall: Option<Stall>,
     seed: Option<u64>,
+    /// A bottleneck of this many bits per second, shared by every flow of the direction.
+    rate: Option<u64>,
+    /// How much sending time the bottleneck queues before it drops (drop-tail).
+    queue: Duration,
 }
 impl Default for Direction {
     fn default() -> Self {
@@ -50,6 +60,8 @@ impl Default for Direction {
             reorder_delay: Duration::from_millis(20),
             stall: None,
             seed: None,
+            rate: None,
+            queue: DEFAULT_QUEUE,
         }
     }
 }
@@ -71,6 +83,17 @@ fn duration(value: &str) -> Result<Duration> {
     let seconds = number.parse::<f64>().context("invalid duration")? * scale;
     ensure!(seconds.is_finite() && (0.0..=86_400.0).contains(&seconds), "duration must be within 0s..24h");
     Ok(Duration::from_secs_f64(seconds))
+}
+/// Bits per second: a plain number, or with kbit, mbit or gbit.
+fn rate(value: &str) -> Result<u64> {
+    let lower = value.to_ascii_lowercase();
+    let (number, scale) = [("gbit", 1e9), ("mbit", 1e6), ("kbit", 1e3)]
+        .into_iter()
+        .find_map(|(unit, scale)| lower.strip_suffix(unit).map(|n| (n.to_owned(), scale)))
+        .unwrap_or((lower.clone(), 1.0));
+    let bits = number.parse::<f64>().context("rate needs a number of bits per second")? * scale;
+    ensure!(bits.is_finite() && (8_000.0..=100e9).contains(&bits), "rate must be within 8kbit..100gbit");
+    Ok(bits as u64)
 }
 fn probability(value: &str) -> Result<f64> {
     let percent = value.strip_suffix('%').context("probability needs %")?.parse::<f64>()?;
@@ -128,6 +151,8 @@ impl Spec {
                     }
                     "every" => every = Some(duration(value)?),
                     "seed" => config.seed = Some(value.parse().context("seed must be an unsigned integer")?),
+                    "rate" => config.rate = Some(rate(value)?),
+                    "queue" => config.queue = duration(value)?,
                     _ => bail!("unknown LATENCY_NET option: {key}"),
                 }
             }
@@ -137,6 +162,8 @@ impl Spec {
                 stall.every = Some(every);
             }
             ensure!(!config.keep_order || config.reorder == 0.0, "keep_order conflicts with reorder");
+            ensure!(config.rate.is_some() || !keys.contains("queue"), "queue requires rate");
+            ensure!(!config.queue.is_zero(), "queue must be positive");
         }
         Ok(spec)
     }
@@ -164,6 +191,10 @@ pub struct Counts {
     forwarded: u64,
     delayed: u64,
     dropped: u64,
+    /// Of `dropped`, by a full bottleneck queue.
+    queue_dropped: u64,
+    /// The longest a packet waited in the bottleneck's queue.
+    queue_max_ms: f64,
     reordered: u64,
     pending: usize,
     stall_windows: Vec<StallWindow>,
@@ -184,10 +215,19 @@ impl Counts {
         self.forwarded += other.forwarded;
         self.delayed += other.delayed;
         self.dropped += other.dropped;
+        self.queue_dropped += other.queue_dropped;
+        self.queue_max_ms = self.queue_max_ms.max(other.queue_max_ms);
         self.reordered += other.reordered;
         self.pending += other.pending;
         self.stall_windows.extend(other.stall_windows);
     }
+}
+/// One direction's bottleneck, shared by every flow of the relay: a FIFO that sends at the
+/// direction's `rate`.
+#[derive(Default)]
+struct Link {
+    /// When it finishes sending what it holds.
+    busy: Duration,
 }
 struct Packet {
     due: Duration,
@@ -218,7 +258,7 @@ impl Scheduler {
             flow,
         }
     }
-    fn enqueue(&mut self, at: Duration, data: Vec<u8>) -> Result<()> {
+    fn enqueue(&mut self, at: Duration, data: Vec<u8>, link: &mut Link) -> Result<()> {
         let sequence = self.counts.received;
         self.counts.received += 1;
         let burst_drop = if self.burst_left > 0 {
@@ -239,6 +279,20 @@ impl Scheduler {
             return Ok(());
         }
         ensure!(self.queue.len() < MAX_QUEUED, "netem queue exceeds {MAX_QUEUED} packets");
+        // The bottleneck first, then the path's delay: a packet leaves the link once those ahead
+        // of it have, and is dropped if that is more than `queue` away.
+        let mut sent = at;
+        if let Some(rate) = self.config.rate {
+            let start = at.max(link.busy);
+            if start - at > self.config.queue {
+                self.counts.dropped += 1;
+                self.counts.queue_dropped += 1;
+                return Ok(());
+            }
+            link.busy = start + Duration::from_secs_f64((data.len() + WIRE_OVERHEAD) as f64 * 8.0 / rate as f64);
+            sent = link.busy;
+            self.counts.queue_max_ms = self.counts.queue_max_ms.max((start - at).as_secs_f64() * 1000.0);
+        }
         let jitter = if self.config.jitter.is_zero() {
             0.0
         } else if self.config.normal {
@@ -249,7 +303,7 @@ impl Scheduler {
             2.0 * self.random.unit() - 1.0
         };
         let delay = (self.config.delay.as_secs_f64() + jitter * self.config.jitter.as_secs_f64()).max(0.0);
-        let mut due = at + Duration::from_secs_f64(delay);
+        let mut due = sent + Duration::from_secs_f64(delay);
         if self.random.chance(self.config.reorder) {
             due += self.config.reorder_delay;
         }
@@ -396,6 +450,7 @@ async fn relay(
     let mut by_client = HashMap::new();
     let mut buffer = vec![0; 65_536];
     let mut downlink_send_errors = 0;
+    let (mut up_link, mut down_link) = (Link::default(), Link::default());
     loop {
         // Drain due packets before polling arrivals, including the whole stall burst.
         for flow in &mut flows {
@@ -429,7 +484,7 @@ async fn relay(
                 let flow = if let Some(&flow) = by_client.get(&client) {
                     flow
                 } else {
-                    let limit = if browsers { MAX_BROWSER_FLOWS } else { 2 };
+                    let limit = if browsers { MAX_BROWSER_FLOWS } else { MAX_NATIVE_FLOWS };
                     ensure!(flows.len() < limit, "latency relay supports only {limit} flows");
                     let id = flows.len();
                     let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
@@ -460,9 +515,9 @@ async fn relay(
                     by_client.insert(client, id);
                     id
                 };
-                flows[flow].up.enqueue(at, buffer[..size].to_vec())?;
+                flows[flow].up.enqueue(at, buffer[..size].to_vec(), &mut up_link)?;
             }
-            Some(packet) = replies.recv() => flows[packet.flow].down.enqueue(packet.at, packet.data)?,
+            Some(packet) = replies.recv() => flows[packet.flow].down.enqueue(packet.at, packet.data, &mut down_link)?,
             _ = tokio::time::sleep_until(deadline.into()) => {},
         }
     }
@@ -470,7 +525,7 @@ async fn relay(
     while readers.join_next().await.is_some() {}
     // Account for already-read replies which were queued at shutdown.
     while let Ok(packet) = replies.try_recv() {
-        flows[packet.flow].down.enqueue(packet.at, packet.data)?;
+        flows[packet.flow].down.enqueue(packet.at, packet.data, &mut down_link)?;
     }
     let mut report = Report {
         spec,
@@ -507,6 +562,7 @@ mod tests {
     #[test]
     fn strict_spec_validation() {
         Spec::parse("seed=42;up:stall=270ms@12s,jitter=5ms,every=10s;down:loss=1%,reorder=0.5%").unwrap();
+        Spec::parse("up:rate=10mbit,queue=50ms;down:rate=5000kbit,loss=1%").unwrap();
         for invalid in [
             "",
             "up:",
@@ -523,6 +579,10 @@ mod tests {
             "up:loss=1%,loss=2%",
             "up:loss=1%;up:delay=1ms",
             "seed=1;seed=2",
+            "up:rate=0",
+            "up:rate=fast",
+            "up:queue=50ms",
+            "up:rate=1mbit,queue=0ms",
         ] {
             assert!(Spec::parse(invalid).is_err(), "accepted {invalid}");
         }
@@ -532,7 +592,7 @@ mod tests {
         for (source, delay) in [("seed=1", 0), ("up:delay=10ms", 10)] {
             let mut scheduler = scheduler(source);
             for i in 0..10 {
-                scheduler.enqueue(Duration::from_millis(i), vec![i as u8]).unwrap();
+                scheduler.enqueue(Duration::from_millis(i), vec![i as u8], &mut Link::default()).unwrap();
             }
             for i in 0..10 {
                 let due = Duration::from_millis(i + delay);
@@ -554,7 +614,7 @@ mod tests {
             let trace = |seeded: &str| {
                 let mut scheduler = scheduler(seeded);
                 for i in 0..1000 {
-                    scheduler.enqueue(Duration::from_millis(i), Vec::new()).unwrap();
+                    scheduler.enqueue(Duration::from_millis(i), Vec::new(), &mut Link::default()).unwrap();
                 }
                 let sent = drain(&mut scheduler);
                 for &(sequence, due) in &sent {
@@ -576,7 +636,7 @@ mod tests {
         for keep_order in [false, true] {
             let mut scheduler = scheduler(&format!("up:jitter=10ms,keep_order={keep_order}"));
             for i in 0..100 {
-                scheduler.enqueue(Duration::from_millis(i), Vec::new()).unwrap();
+                scheduler.enqueue(Duration::from_millis(i), Vec::new(), &mut Link::default()).unwrap();
             }
             let sent = drain(&mut scheduler);
             assert_eq!(sent.windows(2).all(|pair| pair[0].0 < pair[1].0), keep_order);
@@ -587,7 +647,7 @@ mod tests {
     fn explicit_reordering_counts_actual_late_packets() {
         let mut scheduler = scheduler("seed=1;up:reorder=50%,reorder_delay=20ms");
         for i in 0..100 {
-            scheduler.enqueue(Duration::from_millis(i), Vec::new()).unwrap();
+            scheduler.enqueue(Duration::from_millis(i), Vec::new(), &mut Link::default()).unwrap();
         }
         drain(&mut scheduler);
         assert!(scheduler.counts.reordered > 0);
@@ -597,7 +657,7 @@ mod tests {
     fn stall_releases_a_burst_and_periodic_windows() {
         let mut scheduler = scheduler("up:stall=270ms@12s,every=10s");
         for at in [11_999, 12_000, 12_100, 12_269, 12_270, 22_001, 22_100] {
-            scheduler.enqueue(Duration::from_millis(at), Vec::new()).unwrap();
+            scheduler.enqueue(Duration::from_millis(at), Vec::new(), &mut Link::default()).unwrap();
         }
         assert_eq!(scheduler.pop(Duration::from_millis(11_999)).unwrap().sequence, 0);
         assert!(scheduler.pop(Duration::from_millis(12_269)).is_none());
@@ -612,15 +672,15 @@ mod tests {
     #[test]
     fn stall_holds_packets_already_in_flight() {
         let mut scheduler = scheduler("up:delay=20ms,stall=270ms@12s,keep_order");
-        scheduler.enqueue(Duration::from_millis(11_990), Vec::new()).unwrap();
-        scheduler.enqueue(Duration::from_millis(12_260), Vec::new()).unwrap();
+        scheduler.enqueue(Duration::from_millis(11_990), Vec::new(), &mut Link::default()).unwrap();
+        scheduler.enqueue(Duration::from_millis(12_260), Vec::new(), &mut Link::default()).unwrap();
         assert_eq!(drain(&mut scheduler), [(0, Duration::from_millis(12_270)), (1, Duration::from_millis(12_280))]);
     }
     #[test]
     fn burst_loss_is_consecutive_and_full_loss_drops_every_packet() {
         let mut scheduler = scheduler("seed=5;up:burst=3@20%");
         for i in 0..100 {
-            scheduler.enqueue(Duration::from_millis(i), Vec::new()).unwrap();
+            scheduler.enqueue(Duration::from_millis(i), Vec::new(), &mut Link::default()).unwrap();
         }
         let sent = drain(&mut scheduler);
         let sequences: Vec<_> = sent.iter().map(|p| p.0).collect();
@@ -628,11 +688,29 @@ mod tests {
         assert!(sequences.windows(2).all(|p| (p[1] - p[0] - 1) % 3 == 0));
         let mut scheduler = Scheduler::new(Spec::parse("up:loss=100%").unwrap().up, 1, 0);
         for _ in 0..10 {
-            scheduler.enqueue(Duration::ZERO, Vec::new()).unwrap();
+            scheduler.enqueue(Duration::ZERO, Vec::new(), &mut Link::default()).unwrap();
         }
         assert_eq!(scheduler.counts.dropped, 10);
         assert!(scheduler.queue.is_empty());
     }
+    #[test]
+    fn a_rate_paces_flows_through_one_queue_and_drops_its_tail() {
+        // 1 Mbit/s: a 97-byte payload (125 bytes on the wire) takes 1 ms.
+        let spec = Spec::parse("up:rate=1mbit,queue=10ms,delay=5ms").unwrap();
+        let mut link = Link::default();
+        let (mut a, mut b) = (Scheduler::new(spec.up.clone(), 1, 0), Scheduler::new(spec.up, 2, 1));
+        for _ in 0..8 {
+            a.enqueue(Duration::ZERO, vec![0; 97], &mut link).unwrap();
+            b.enqueue(Duration::ZERO, vec![0; 97], &mut link).unwrap();
+        }
+        // Sixteen at once: eleven fit within 10 ms of queue, the rest drop.
+        let (a, b) = (drain(&mut a), drain(&mut b));
+        let mut dues: Vec<_> = a.iter().chain(&b).map(|p| p.1.as_micros()).collect();
+        dues.sort();
+        assert_eq!(dues, (1..=11).map(|ms| ms * 1000 + 5000).collect::<Vec<_>>());
+        assert_eq!(a.len() + b.len(), 11);
+    }
+
     #[tokio::test]
     async fn relay_keeps_two_clients_and_return_addresses_separate() {
         tokio::time::timeout(Duration::from_secs(3), async {

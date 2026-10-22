@@ -338,8 +338,9 @@ pub enum ScreenCmd {
         session: SessionId,
         share: String,
     },
-    /// The viewer watches a share it already watches again: a paused slot tries once more,
-    /// from the share's next keyframe (within the viewer's keyframe budget).
+    /// The viewer watches a share it already watches again: a slot paused for bandwidth tries
+    /// once more, from the share's next keyframe (within the viewer's keyframe budget). A
+    /// budget pause waits for the server's egress to fall.
     Retry {
         session: SessionId,
         share: String,
@@ -731,7 +732,7 @@ impl Sfu {
                 else {
                     return;
                 };
-                if w.egress.paused(slot).is_some() {
+                if w.egress.paused(slot) == Some(ScreenPauseReason::Bandwidth) {
                     apply(w, slot, Change::Resume);
                     self.tell(session, slot, Change::Resume, now);
                 }

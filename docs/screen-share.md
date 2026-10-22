@@ -2,7 +2,8 @@
 
 Status: **design, with the owner's decisions of 2026-10-21 folded in**
 ([Owner decisions](#owner-decisions)). Built so far: the share state and its
-protocol (PR 2), the SFU's transports and forwarding (PR 3a), and sharing and
+protocol (PR 2), the SFU's transports and forwarding (PR 3a), its allocation,
+egress cap, budgets and measurements (PR 3b), and sharing and
 watching from the browser in plaintext channels (PR 4,
 [as built](#web-client-as-built-pr-4)), the same in the desktop app (PR 5,
 [as built](#desktop-app-as-built-pr-5)), and TeamSpeak watch links (PR 6,
@@ -540,9 +541,15 @@ Limits are enforced continuously, not only when a share or watch is admitted:
     reserve 32 + 25 × 10.4 = 292 Mbps and lock members out, while real guest
     egress (around 200 Mbps) never trips the measured overrun below.
   - The screen task also measures real egress every second, including
-    retransmissions and padding, from str0m's `Event::PeerStats`, enabled with `set_stats_interval(1 s)`.
+    retransmissions and padding. As built it counts the bytes of every
+    datagram its transports hand to the socket (the send function that
+    enforces the per-viewer cap) rather than str0m's `Event::PeerStats`,
+    which reports per-stream RTP and would miss STUN, DTLS and RTCP.
   - When it stays over budget for 5 s, guest watches are paused first, then
-    the newest member watches.
+    the newest member watches, one a second while it stays over
+    (`screen.paused {reason: "budget"}`; guests arrive with PR 6). A paused
+    slot keeps its reservation. Budget pauses resume through the usual resume
+    rule once egress has stayed at or under 90 % of the budget for 10 s.
 - **Negotiation.**
   - At most 4 `screen.*.offer` per session per minute.
   - A guest connection gets exactly one accepted `guest.offer`. A second one
@@ -688,7 +695,9 @@ Nothing is promised about downstream network queues; the SFU cannot see them.
 - **Bounded admission.** A packet enters a slot's queue only if the viewer's
   queued bytes stay at or under `max(64 KB, 400 ms × release rate)`.
   Otherwise it is dropped like an eviction. The bound is checked per packet,
-  so it never overshoots.
+  so it never overshoots. As built, a packet that would overshoot first takes
+  the room of lower-priority slots (their queues drop, lowest first, and wait
+  for a keyframe); only what still does not fit drops from its own slot.
 - Both kinds of drop are recorded per frame. A keyframe that loses any packet
   either way is a **failed keyframe**, which the pause rule counts.
 - **Pause, unwatch and drops clear the queue at once.** Only packets released
@@ -704,9 +713,12 @@ limit is a target, not a bound:
 - eviction runs only when a packet is cached
   (`streams/rtx_cache.rs`, `cache_sent_packet` → `maybe_evict`);
 - it scans in sequence order and stops at the first fresh entry
-  (`streams/rtx_cache_buf.rs`, `evict`). A delayed publisher repair with a
-  lower sequence number, cached later, therefore shields older entries behind
-  it while traffic continues;
+  (`streams/rtx_cache_buf.rs`, `evict`). The design expected a delayed
+  publisher repair with a lower sequence number, cached later, to shield
+  older entries behind it. PR 3b's test found that str0m 0.24.1 does not
+  cache it at all ("Do not cache values preceding evict position" in
+  `rtx_cache_buf.rs`, `push`): it shields nothing, and a viewer's NACK for
+  it goes unanswered, so that viewer repairs the frame with a keyframe;
 - lookup checks no age;
 - padding probes reuse cached packets without the NACK limiter
   (`streams/send.rs`, `poll_packet_padding`);
@@ -729,7 +741,9 @@ limit is a target, not a bound:
   - when the estimate has stagnated for 15 s with unmet demand.
 
   str0m 0.24.1 offers no public setting to cap or disable them; only the
-  desired bitrate steers them. Their volume is capped by the egress cap below.
+  desired bitrate steers them. Their volume is capped by the egress cap below,
+  and their rate by keeping the desired bitrate within twice the estimate
+  ("Probing for keyframe room").
 
 **Per-viewer egress cap: originals, repairs and probes together.**
 
@@ -774,6 +788,10 @@ That is immediate and needs no str0m change:
   lost. str0m's loss controller then lowers the estimate of an overloaded
   viewer, which is the right direction.
 
+The 64 KB floor matters at low estimates: it is 200 ms of a 2.5 Mbps link.
+The paired voice runs found that the probe *rate* matters more than this
+volume, which the cap on the desired bitrate handles.
+
 **Escalation.** If the extras bucket drops packets in more than 2 s of any 5 s
 window, the viewer's lowest-priority slot is paused with reason `bandwidth`.
 The pause wipes that slot's cache, as above. Resuming follows the usual
@@ -787,7 +805,10 @@ egress check remains a backstop.
 `StreamTx::set_rtx_cache` **replaces the cache with an empty one**
 (`streams/send.rs`: "Dump old cache"). Pause, unwatch and slot reassignment
 call it on the slot's stream. After that, neither a late NACK nor a probe can
-send anything of the old media on that stream.
+send anything of the old media on that stream. As built, pause, unwatch and
+reassignment all use the local direction switch described under "Requests",
+which drops the stream's held packets and queued resends along with the
+cache; the pin test covers `set_rtx_cache` for the fallback.
 
 **Options considered and rejected:**
 
@@ -813,16 +834,22 @@ send anything of the old media on that stream.
   eviction, repairs get a hard bound at no cost. That is worth proposing
   upstream, but phase 1 does not depend on it.
 
-**Tests in PR 3b**, with str0m viewers behind the relay's `rate=` bottleneck.
-Every check timestamps packets **at the SFU's socket send**, against their
-arrival from the publisher:
+**Tests in PR 3b**, with str0m viewers behind a constrained link. Every check
+timestamps packets **at the SFU's socket send**, against their arrival from
+the publisher. Built as `media/screen/sim.rs`: the screen task's watch
+transport, egress and allocation code driven on a simulated clock against a
+str0m viewer behind a simulated bottleneck (rate, 100 ms queue, loss, 10 ms
+delay), so the timings are exact and the runs repeatable. The relay's `rate=`
+serves the voice acceptance instead. Results and deviations:
 
 - **A bandwidth collapse** from 10 to 1 Mbps mid-share: no original is sent
   past 400 ms, and the viewer is paused by the allocation rule.
+  Built (`a_bandwidth_collapse_sends_no_stale_original_and_pauses_the_viewer`).
 - **Pause and unwatch:** after the pausing iteration, nothing of the slot's
   old media is sent. That covers originals, a NACK for a packet sent just
   before the pause, and a forced BWE probe on the same watch transport, which
-  sends only blank padding or other active slots' media.
+  sends only blank padding or other active slots' media. Built
+  (`pause_and_unwatch_stop_everything_of_the_slot`).
 - **A reordered publisher repair:**
   - 102 arrives at 0 ms and is sent at 390 ms;
   - a delayed 101 is sent at 580 ms;
@@ -832,16 +859,37 @@ arrival from the publisher:
   The test records whether str0m still serves it, so a str0m change is
   noticed. It asserts the viewer's playout is unaffected (no extra freeze,
   frames byte-identical) and a pause still wipes the shielded entry.
+  Built (`a_late_nack_after_a_reordered_publisher_repair_and_a_pause`):
+  str0m 0.24.1 never cached the late 101, so 102 is not served (the test
+  asserts that); every other packet arrives byte-identical, and the pause
+  wipes the cache.
 - **A NACK storm:** a viewer NACKs the whole cache repeatedly, 50 times a
   second. Its bytes at the socket stay within
   `(0.8 + 0.1) × estimate × t + burst` plus control traffic. Its
   lowest-priority slot is paused by the escalation rule. Other viewers and the
   voice gate in "Voice headroom and acceptance" are unaffected.
+  Built (`a_nack_storm_stays_within_the_egress_cap_and_pauses_the_lowest_slot`)
+  with deviations: str0m's RTX ratio cap (0.15) answers only part of a storm,
+  which then fits the 0.1 reserve unless media runs near `B`, so the storm is
+  fresh NACKs for every packet, replayed every 20 ms, on a 6 Mbps link with
+  5 % loss and two shares. Replaying TWCC feedback as well collapsed the
+  estimate instead. The single-viewer simulation cannot show other viewers;
+  they share nothing with it but the screen task.
 - **Probes fit the reserve:** after the bandwidth collapse ends, allocation
   and periodic ALR probes go out whole within the extras burst, and the
   estimate recovers to the link rate as it does with the cap disabled
-  (paired runs).
-- **A test pins str0m behavior:** `set_rtx_cache` empties the cache.
+  (paired runs). Built (`probes_after_a_collapse_fit_the_reserve`), with a
+  finding: once every slot is paused nothing flows, and str0m 0.24.1 neither
+  probes a loss-limited estimate nor gets feedback to change it. So a viewer
+  whose every slot has been paused for bandwidth for 15 s restarts its
+  estimator from a third of its estimate (at least 100 kbps); the initial
+  probes, at 3 and 6 times that, test 1 and 2 times the old estimate. In the
+  simulation that probing reaches about 1.8 Mbps after a 1 Mbps collapse on a
+  10 Mbps link, with or without the cap (within 10 % of each other, at most
+  one extras drop), not the link rate: padding-only probes are not enough
+  for str0m's estimator. Retry (`screen.watch` again) stays the way back.
+- **A test pins str0m behavior:** `set_rtx_cache` empties the cache. Built
+  (`set_rtx_cache_empties_the_cache`).
 
 ### Keyframes
 
@@ -881,6 +929,26 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   queue deadline, even for low-average shares. The cost is str0m's probes,
   short clusters at up to 2× desired, which stay inside the viewer's extras
   bucket ("Per-viewer egress cap").
+
+  As built, the target is also **at most twice the current estimate**.
+  str0m's periodic probe runs at 2× desired whatever the estimate, so with
+  the caps alone two Smooth shares (4 Mbps caps) on a 5 Mbps downlink sent
+  26 Mbps clusters every 5 s, which queued 83 ms on the link and held the
+  voice beside them at about 130 ms instead of 45. Capped at 2× the
+  estimate, the longest queue was 16 ms and the estimate still grew by the
+  probes' results. A tighter reach (1.25×) let the estimate drift down in
+  the simulated links, because str0m's estimate of an application-limited
+  sender holds near its probe results.
+- **Ramp.** A slot that starts carrying a share is not paused for its first
+  10 s; failed keyframes and averages start counting after that. Added in
+  PR 3b: a watch transport's estimate starts at 2.5 Mbps, where `B` is
+  2 Mbps and admission 100 KB, so every 1080p share's first keyframe fails.
+  On loopback str0m's initial probes measured only 3.1–3.6 Mbps, and the
+  estimate grew past what a 200 KB keyframe needs with the periodic probe
+  5 s later (12.7 Mbps), then about 19 Mbps at 10 s; the ramp covers two of
+  those rounds. Without it, five loopback viewers of an 8 Mbps share were
+  all paused within a second of watching. The cost: a viewer too slow for a
+  share sees broken video for up to 10 s before its pause.
 - **Pause** a slot for that viewer (`screen.paused {share, reason:
   "bandwidth"}`), lowest priority first, when either of these holds:
   - the sum of its 2 s average and the higher-priority slots' averages exceeds
@@ -921,6 +989,15 @@ emit 204 KB keyframes every 2 s:
   1.8 Mbps, so it expires at the deadline. The average trigger stays below
   `B`, and the keyframe trigger pauses the low-priority slot within two
   keyframes. The stage share is unaffected.
+
+All three are built in `media/screen/sim.rs`, with the forced keyframes
+starting after the slot's ramp; "within two keyframes" is measured to the
+second keyframe's deadline, when it fails. Also built there: two equal
+shares on a constrained viewer pause the lower-priority one, the earlier
+watched unless `screen.focus` names the other. A viewer's Retry
+(`screen.watch` of a share it already watches) resumes a slot paused for
+bandwidth at once, through the keyframe throttle; a budget pause waits for
+the server's egress to fall.
 
 The sharer is never slowed by viewers. The SFU never relays viewers' estimates
 or REMB to the publisher. The sharer adapts only to its own uplink (TWCC on
@@ -976,6 +1053,12 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
   - Admins get a warning at 80 % and 100 % of `monthly_egress_tb` (default
     10). There is no automatic cut-off by default. An optional
     `monthly_egress_stop` refuses new watches above 100 %.
+  - As built (PR 3b): `server.egress` (`manage_server`) answers with the
+    month (UTC), the scope (`host`, `container` or `unavailable`), the total
+    and the screen SFU's bytes to members and guests, and the limits. The
+    `ScreenLimits` above are server settings, replaced as a whole through
+    `server.update`. Admins online get `server.egress_warning` once per
+    threshold and month.
 - **Network:** A1 shapes get 1 Gbps per OCPU, so bandwidth binds after CPU.
 - **CPU, measured in S3** on an Apple M5, with str0m RTP mode doing SRTP for
   every packet:

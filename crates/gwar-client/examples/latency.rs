@@ -9,11 +9,15 @@
 //! LATENCY_EXTRA_DELAY_MS adds a sample delay line to the fake output device.
 //! LATENCY_SFRAME=1 measures an encrypted call (local server only): a real voice
 //! MLS group, exporter keys installed through the engine's key channel, SFrame.
+//! LATENCY_SCREEN adds screen shares and viewers beside the call; see docs/latency.md.
+//! RUST_LOG logs to stderr, for example `RUST_LOG=gwar_server::media::screen=debug`.
 //! Exits with an error if more than 5% of markers are unmatched.
 #[path = "latency/mls.rs"]
 mod mls;
 #[path = "latency/netem.rs"]
 mod netem;
+#[path = "latency/screen.rs"]
+mod screen;
 
 use anyhow::Context;
 use gwar_client::{
@@ -60,7 +64,7 @@ const IDENTITY_WINDOW: usize = 480; // 10 ms after the detected onset
 const MIN_IDENTITY_CONFIDENCE: f64 = 0.8;
 const MIN_TONE_ENERGY_FRACTION: f64 = 0.6;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Settings {
     minimum_ms: f64,
     extra_delay_ms: usize,
@@ -69,6 +73,8 @@ struct Settings {
     /// Arm markers after both transports connect; keep carrier/impairments running.
     wait_connected: bool,
     warmup_samples: usize,
+    /// Screen shares and viewers beside the call (`LATENCY_SCREEN`).
+    screen: Option<screen::Spec>,
     /// Encrypted call with SFrame (`LATENCY_SFRAME=1`).
     sframe: bool,
 }
@@ -115,7 +121,9 @@ impl Settings {
             Err(std::env::VarError::NotPresent) => false,
             _ => anyhow::bail!("LATENCY_SFRAME must be 0 or 1"),
         };
-        Ok(Self { minimum_ms, extra_delay_ms, callback_jitter, wait_connected, warmup_samples, sframe })
+        let screen = std::env::var("LATENCY_SCREEN").ok().map(|source| screen::Spec::parse(&source)).transpose()?;
+        anyhow::ensure!(!(sframe && screen.is_some()), "LATENCY_SCREEN measures an unencrypted call");
+        Ok(Self { minimum_ms, extra_delay_ms, callback_jitter, wait_connected, warmup_samples, screen, sframe })
     }
 }
 
@@ -415,6 +423,10 @@ fn options(url: &str, name: &str) -> ConnectOptions {
 }
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
+    // Logs only on request (`RUST_LOG`): the run's own output is its report.
+    if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        tracing_subscriber::fmt().with_env_filter(filter).with_writer(std::io::stderr).init();
+    }
     let mut args = std::env::args().skip(1);
     let output = args.next().context("usage: latency output.csv [marker-count]")?;
     let count: usize = args.next().map(|s| s.parse()).transpose().context("invalid marker count")?.unwrap_or(100);
@@ -510,7 +522,8 @@ async fn measure(
         http_bind: any,
         media_bind: any,
         media_advertise: advertise,
-        max_clients: 8,
+        // Two voice clients, up to four sharers and 24 viewers (LATENCY_SCREEN).
+        max_clients: 32,
         encrypted_server_chat: false,
         server_password: None,
         web_root: None,
@@ -583,6 +596,20 @@ async fn run(
         relay.address()?
     } else {
         server_addr
+    };
+    // The screen load runs from before voice starts until the measurement ends.
+    let load = match &settings.screen {
+        Some(spec) => {
+            let (relay, direct) = match &net {
+                Some((relay, _, server)) => (Some(relay.address()?), *server),
+                None => (None, server_addr),
+            };
+            let channel = a.welcome.server.default_channel;
+            let load = screen::Load::start(&url, spec.clone(), channel, media_addr, relay, direct).await?;
+            println!("screen load {}", spec.source);
+            Some(load)
+        }
+        None => None,
     };
     let markers_ready = Arc::new(AtomicBool::new(!settings.wait_connected));
     let sent = Arc::new(Mutex::new(Measurements::default()));
@@ -681,6 +708,7 @@ async fn run(
         }
     }
     drop((va, vb));
+    let screen = load.map(|load| load.report());
     let network = if let Some((relay, _, _)) = &mut net { Some(relay.finish().await?) } else { None };
     let sent = sent.lock().unwrap();
     let heard = heard.lock().unwrap();
@@ -787,6 +815,7 @@ async fn run(
         "warmup_samples": settings.warmup_samples,
     });
     metadata["sframe"] = serde_json::json!(settings.sframe);
+    metadata["screen"] = serde_json::json!(screen);
     metadata["receiver_sframe"] = serde_json::to_value(crypto)?;
     std::fs::write(format!("{output}.json"), serde_json::to_string_pretty(&metadata)?)?;
     anyhow::ensure!(
