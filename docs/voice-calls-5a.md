@@ -55,11 +55,9 @@ Plaintext voice retains the existing Opus format and packetization.
 - `crates/gwar-client` and `apps/desktop/src-tauri`: bound plaintext negotiation,
   direct-TeamSpeak adapter events, checked native starts and serialized
   run claim/retirement. Old stop/answer commands cannot stop the current run.
-- `vendor/openmls`, `Cargo.toml`, `Cargo.lock`: pinned 0.9.1 with one source
-  fix; see `vendor/openmls/GWAR-PATCH.md`. The new rejoin regression exposed
-  removed nodes reappearing when one commit shrank and regrew a tree. Newly
-  exposed original-tree positions are now blank. All other upstream source
-  files are byte-identical to the published package.
+- `Cargo.toml`, `Cargo.lock`: the new rejoin regression exposed removed nodes
+  reappearing when one commit shrank and regrew a tree (GHSA-94v4-rg25-x625).
+  Upstream fixed it in `openmls` 0.9.2, which Gwar pins.
 
 ## Bounds and failure behavior
 
