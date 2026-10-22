@@ -30,6 +30,8 @@ pub struct LeakyBucketPacer {
     padding_bitrate: Bitrate,
     /// The last time we refreshed media debt and potentially adjusted the bitrate.
     last_handle_time: Option<Instant>,
+    /// Observed wake interval; short callbacks decay the peak gradually.
+    wake_interval: Duration,
     /// The last time we indicated that a packet should be sent.
     last_emitted: Option<Instant>,
     /// The next time we should send a queued packet.
@@ -95,6 +97,10 @@ impl Pacer for LeakyBucketPacer {
 
         let elapsed = self.update_handle_time_and_get_elapsed(now);
 
+        if !elapsed.is_zero() {
+            // A short callback between scheduler wakes must not erase their cadence.
+            self.wake_interval = elapsed.max(self.wake_interval.saturating_sub(elapsed / 20));
+        }
         self.clear_debt(elapsed);
         self.maybe_update_adjusted_bitrate(now);
 
@@ -132,7 +138,7 @@ impl Pacer for LeakyBucketPacer {
 
         // Mark that we need timeout before next poll
         self.needs_timeout_before_next_poll = true;
-        self.request_immediate_timeout();
+        self.request_immediate_timeout(next);
 
         // Capture the cluster ID at poll time, before register_send() might clear it
         let cluster_id = self.active_cluster();
@@ -172,6 +178,7 @@ impl LeakyBucketPacer {
             adjusted_bitrate: Bitrate::ZERO,
             padding_bitrate: Bitrate::ZERO,
             last_handle_time: None,
+            wake_interval: Duration::ZERO,
             last_emitted: None,
             next_poll_time: None,
             media_debt: DataSize::ZERO,
@@ -440,7 +447,12 @@ impl LeakyBucketPacer {
 
             // Get recommended padding amount from ProbeClusterState
             // This handles the calculation of how much padding is needed based on probe timing
-            let padding_size = probe.next_packet(now);
+            let wake_interval = if queue.unpaced {
+                self.wake_interval
+            } else {
+                Duration::ZERO
+            };
+            let padding_size = probe.next_packet(now, wake_interval);
             let Some(padding_size) = padding_size else {
                 // Probe says no padding needed (already sent enough for this interval)
                 return None;
@@ -470,14 +482,20 @@ impl LeakyBucketPacer {
         })
     }
 
-    fn request_immediate_timeout(&mut self) {
-        // Re-enter at the current clock value. next_poll and next_packet decide when
-        // a burst has spent its budget; a timer between every packet prevents both
-        // generated padding and application-paced media from draining as a burst.
-        let Some(time) = self.last_handle_time else {
+    fn request_immediate_timeout(&mut self, from: MidRid) {
+        let Some(mut time) = self.last_handle_time else {
             self.next_poll_time = None;
             return;
         };
+        // Only application-paced media and generated padding drain at the same clock.
+        // An empty selected queue means handle_timeout just requested padding for it.
+        // Preserve upstream's clock advance for paced media, including during probes.
+        let same_clock = self.queue_states.iter().any(|q| {
+            q.midrid == from && (q.unpaced || q.snapshot.priority != QueuePriority::Media)
+        });
+        if !same_clock {
+            time += Duration::from_micros(1);
+        }
 
         self.next_poll_time = Some((time, PacerReason::Immediate));
     }
@@ -556,6 +574,41 @@ mod test {
             pacer.handle_timeout(now, std::iter::once(queue));
         }
         assert!(pacer.poll_queue().is_none());
+    }
+
+    #[test]
+    fn paced_media_keeps_its_clock_advance_during_probes_too() {
+        use crate::bwe_::ProbeKind;
+
+        for probing in [false, true] {
+            let now = Instant::now();
+            let mut pacer = LeakyBucketPacer::new(Bitrate::mbps(10));
+            let queue = QueueState {
+                midrid: MidRid("video".into(), None),
+                unpaced: false,
+                use_for_padding: true,
+                snapshot: QueueSnapshot {
+                    created_at: now,
+                    packet_count: 3,
+                    byte_size: 3600,
+                    first_unsent: Some(now),
+                    priority: QueuePriority::Media,
+                    ..Default::default()
+                },
+            };
+            if probing {
+                pacer.start_probe(ProbeClusterConfig::new(
+                    0.into(),
+                    Bitrate::mbps(10),
+                    ProbeKind::Initial,
+                ));
+            }
+            pacer.handle_timeout(now, std::iter::once(queue));
+            let (midrid, _) = pacer.poll_queue().unwrap();
+            pacer.register_send(now, 1200usize.into(), midrid);
+            assert_eq!(pacer.poll_timeout().0, Some(now + Duration::from_micros(1)));
+            assert!(pacer.poll_queue().is_none());
+        }
     }
 
     #[test]

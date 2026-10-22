@@ -55,6 +55,8 @@ pub enum BandwidthLimitedCause {
 pub struct ProbeControl {
     config: Config,
     next_timeout: Instant,
+    min_probe_interval: Duration,
+    last_dispatched: Option<Instant>,
     enabled: bool,
 
     desired_bitrate: Option<Bitrate>,
@@ -102,6 +104,8 @@ impl Default for ProbeControl {
             config: Config::default(),
             enabled: false,
             next_timeout: not_happening(),
+            min_probe_interval: Duration::ZERO,
+            last_dispatched: None,
             desired_bitrate: None,
             prev_desired: None,
             last_estimate: None,
@@ -127,6 +131,31 @@ impl ProbeControl {
         Self::default()
     }
 
+    pub fn request_recovery_probe(&mut self, desired: Bitrate, now: Instant) -> bool {
+        if !self.enabled || desired.is_zero() || !self.pending.is_empty() {
+            return false;
+        }
+        // An application with no media can explicitly rediscover capacity even
+        // while loss-limited. Keep cluster IDs and feedback history intact.
+        self.queue_probe(desired * 2.0, ProbeKind::Stagnant, desired, now);
+        self.request_immediate();
+        !self.pending.is_empty()
+    }
+
+    pub fn set_min_probe_interval(&mut self, interval: Duration) {
+        self.min_probe_interval = interval;
+        self.request_immediate();
+    }
+
+    fn poll_pending(&mut self, now: Instant) -> Option<ProbeClusterConfig> {
+        let config = self.pending.pop_front()?;
+        self.last_dispatched = Some(now);
+        if !self.pending.is_empty() {
+            self.request_immediate();
+        }
+        Some(config)
+    }
+
     pub fn enable(&mut self, v: bool) {
         if !self.enabled && v {
             self.enabled = true;
@@ -139,6 +168,7 @@ impl ProbeControl {
             self.last_estimate_change = None;
             self.last_stagnant = None;
             self.last_probe = None;
+            self.last_dispatched = None;
             self.prev_estimate = None;
             self.scheduled_exponential = None;
             self.scheduled_periodic_alr = None;
@@ -226,8 +256,20 @@ impl ProbeControl {
         let desired = self.desired_bitrate?;
         let estimate = self.last_estimate?;
 
+        // Applications with a separate extras reserve can let it refill between
+        // clusters, including the two initial probes. Default pacing is unchanged.
+        if let Some(last) = self.last_dispatched {
+            let next = last
+                .checked_add(self.min_probe_interval)
+                .unwrap_or_else(not_happening);
+            if now < next {
+                self.next_timeout = next;
+                return None;
+            }
+        }
+
         // Return pending probes first.
-        if let Some(config) = self.pending.pop_front() {
+        if let Some(config) = self.poll_pending(now) {
             // Schedule another.
             self.request_immediate();
             return Some(config);
@@ -258,7 +300,7 @@ impl ProbeControl {
             self.request_immediate();
         }
 
-        self.pending.pop_front()
+        self.poll_pending(now)
     }
 
     fn update_estimate_change(&mut self, now: Instant, estimate: Bitrate) {
@@ -692,6 +734,48 @@ impl BandwidthLimitedCause {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn explicit_recovery_keeps_ids_and_respects_cluster_spacing() {
+        let mut pc = ProbeControl::new();
+        let now = Instant::now();
+        assert!(!pc.request_recovery_probe(Bitrate::mbps(1), now));
+        pc.enable(true);
+        pc.set_min_probe_interval(Duration::from_secs(1));
+        pc.set_desired_bitrate(Bitrate::mbps(1));
+        pc.set_estimated_bitrate(Bitrate::kbps(300), BandwidthLimitedCause::DelayBasedLimited);
+        let first = pc.handle_timeout(now).unwrap();
+        let second = pc.handle_timeout(now + Duration::from_secs(1)).unwrap();
+        pc.set_estimated_bitrate(Bitrate::kbps(100), BandwidthLimitedCause::LossLimitedBwe);
+        assert!(pc.request_recovery_probe(Bitrate::mbps(1), now + Duration::from_secs(1)));
+        assert!(!pc.request_recovery_probe(Bitrate::mbps(1), now + Duration::from_secs(1)));
+        assert!(pc.handle_timeout(now + Duration::from_secs(1)).is_none());
+        let recovery = pc.handle_timeout(now + Duration::from_secs(2)).unwrap();
+        assert_ne!(first.cluster(), second.cluster());
+        assert_ne!(second.cluster(), recovery.cluster());
+        assert_eq!(recovery.target_bitrate(), Bitrate::mbps(2));
+    }
+
+    #[test]
+    fn minimum_interval_spaces_initial_and_later_probes() {
+        let mut pc = ProbeControl::new();
+        pc.enable(true);
+        let now = Instant::now();
+        pc.set_min_probe_interval(Duration::from_secs(1));
+        pc.set_desired_bitrate(Bitrate::mbps(50));
+        pc.set_estimated_bitrate(Bitrate::kbps(300), BandwidthLimitedCause::DelayBasedLimited);
+        assert!(pc.handle_timeout(now).is_some());
+        assert!(pc.handle_timeout(now).is_none());
+        assert_eq!(pc.poll_timeout(), now + Duration::from_secs(1));
+        assert!(
+            pc.handle_timeout(now + Duration::from_millis(999))
+                .is_none()
+        );
+        assert!(pc.handle_timeout(now + Duration::from_secs(1)).is_some());
+        pc.set_desired_bitrate(Bitrate::mbps(60));
+        assert!(pc.handle_timeout(now + Duration::from_secs(1)).is_none());
+        assert_eq!(pc.poll_timeout(), now + Duration::from_secs(2));
+    }
 
     #[test]
     fn initial_exponential_probes_are_queued_and_emitted_one_per_tick() {

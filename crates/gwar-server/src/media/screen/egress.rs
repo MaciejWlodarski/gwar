@@ -39,8 +39,9 @@ const ADMISSION_FLOOR: f64 = 64.0 * 1024.0;
 /// twice the estimate.
 const EXTRAS_FLOOR: f64 = 64.0 * 1024.0;
 const PROBE_CLUSTER: f64 = 0.030;
-/// The release bucket keeps at most this much of `B` when idle (and at least two packets).
+/// Normal originals burst, with a bounded catch-up window at coarse scheduler cadences.
 pub const RELEASE_BURST: f64 = 0.010;
+const COARSE_RELEASE_BURST: f64 = 0.030;
 pub const RELEASE_BURST_FLOOR: f64 = 2.0 * 1200.0;
 /// Upper bound for originals: 12-byte RTP header + 4-byte extension header + 32 bytes
 /// for two-byte-form MID (up to 16 bytes), TWCC, absolute-send-time, slot generation and
@@ -71,10 +72,9 @@ pub const KEYFRAME_FLOOR: usize = 200 * 1024;
 const KEYFRAME_MEMORY: Duration = Duration::from_secs(30);
 /// Probing target over the watched shares' caps.
 const DESIRED_HEADROOM: f64 = 1.1;
-/// str0m probes at up to twice this target. At 1.5 × estimate, a 15 ms cluster
-/// uses 45 ms × estimate before headers, within the 60 ms × estimate extras burst.
-/// Larger targets wait for the reserve to refill, with one MTU of tolerance at the
-/// allocation tick. Watch transports suspend regular padding while the reserve refills.
+/// Normal desired-target reach. Watch transports back it off after stalled cycles,
+/// space clusters, and wait for the extras reserve before increasing the target.
+/// Cadence-adjusted probes still pass the unchanged actual-byte extras cap.
 pub(super) const PROBE_REACH: f64 = 1.5;
 
 /// One original packet waiting for its viewer, already mapped onto the slot's segment.
@@ -269,6 +269,8 @@ pub struct Egress {
     /// The release bucket, in reserved serialized bytes.
     tokens: f64,
     refilled: Instant,
+    released_at: Instant,
+    release_interval: Duration,
     originals: Bucket,
     extras: Bucket,
     queued: usize,
@@ -289,6 +291,8 @@ impl Egress {
             estimate,
             tokens: (RELEASE_BURST * PLAN * estimate / 8.0).max(RELEASE_BURST_FLOOR),
             refilled: now,
+            released_at: now,
+            release_interval: Duration::ZERO,
             originals: Bucket::new(
                 PLAN * estimate / 8.0,
                 (RELEASE_BURST * PLAN * estimate / 8.0).max(RELEASE_BURST_FLOOR),
@@ -321,8 +325,13 @@ impl Egress {
         self.plan() / 8.0
     }
 
+    pub fn coarse_cadence(&self) -> bool {
+        self.release_interval > Duration::from_millis(10)
+    }
+
     fn release_burst(&self) -> f64 {
-        (RELEASE_BURST * self.release_rate()).max(RELEASE_BURST_FLOOR)
+        let interval = if self.coarse_cadence() { COARSE_RELEASE_BURST } else { RELEASE_BURST };
+        (interval * self.release_rate()).max(RELEASE_BURST_FLOOR)
     }
 
     /// The viewer's queued bytes may reach this: `max(64 KB, 400 ms × B)`.
@@ -510,6 +519,19 @@ impl Egress {
     /// Evicts what reached its deadline and releases what the bucket allows, most important
     /// slot first. Returns the released packets in order, and the slots that dropped.
     pub fn due(&mut self, now: Instant) -> (Vec<(usize, Queued)>, Vec<usize>) {
+        // Refill both buckets under the old burst before changing the window.
+        // Otherwise release could earn credit that the socket bucket already clipped.
+        self.refill(now);
+        let burst = self.release_burst();
+        let elapsed = now.saturating_duration_since(self.released_at);
+        self.released_at = now;
+        if !elapsed.is_zero() {
+            self.release_interval = elapsed.max(self.release_interval.saturating_sub(elapsed / 20));
+        }
+        if burst != self.release_burst() {
+            self.tokens = self.tokens.min(self.release_burst());
+            self.originals.reconfigure(self.release_rate(), self.release_burst(), now);
+        }
         let mut dropped = Vec::new();
         for lane in 0..self.lanes.len() {
             // Arrival order is deadline order, so the head expires first.
@@ -794,6 +816,26 @@ mod tests {
         assert!(order[..10].iter().all(|(lane, _, _)| *lane == 1), "{order:?}");
         let took = order.last().unwrap().2 - now;
         assert!(took >= 15 * MS && took <= 21 * MS, "{took:?}");
+    }
+
+    #[test]
+    fn changing_cadence_keeps_released_originals_inside_the_socket_credit() {
+        let start = Instant::now();
+        let mut e = egress(10_000_000, 1, start);
+        for seq in 0..100 {
+            assert!(e.admit(0, packet(seq, 0, seq == 0, 1000, start), start).is_empty());
+        }
+        let mut now = start;
+        for millis in [1, 11].into_iter().chain(std::iter::repeat_n(1, 100)) {
+            now += millis * MS;
+            let (released, dropped) = e.due(now);
+            assert!(dropped.is_empty());
+            for (_, packet) in released {
+                // Charge the full reservation: real serialized RTP can only be smaller.
+                assert!(e.charge(Class::Original, packet.size(), now));
+            }
+        }
+        assert_eq!(e.queued(), 0);
     }
 
     #[test]

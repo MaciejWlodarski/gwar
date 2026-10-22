@@ -59,6 +59,7 @@ pub struct Bwe {
     bwe: SendSideBandwidthEstimator,
     desired_bitrate: Bitrate,
     smoother: EstimateSmoother,
+    min_probe_interval: Duration,
 }
 
 impl Bwe {
@@ -68,6 +69,7 @@ impl Bwe {
             bwe: send_side_bwe,
             desired_bitrate: Bitrate::ZERO,
             smoother: EstimateSmoother::new(),
+            min_probe_interval: Duration::ZERO,
         }
     }
 
@@ -87,8 +89,25 @@ impl Bwe {
         self.bwe.end_probe(now, cluster_id);
     }
 
+    pub fn request_recovery_probe(&mut self, now: Instant) -> bool {
+        self.bwe
+            .probe_control
+            .request_recovery_probe(self.desired_bitrate, now)
+    }
+
+    pub fn set_min_probe_interval(&mut self, interval: Duration) {
+        if self.min_probe_interval == interval {
+            return;
+        }
+        self.min_probe_interval = interval;
+        self.bwe.probe_control.set_min_probe_interval(interval);
+    }
+
     pub fn reset(&mut self, init_bitrate: Bitrate) {
         self.bwe.reset(init_bitrate);
+        self.bwe
+            .probe_control
+            .set_min_probe_interval(self.min_probe_interval);
     }
 
     pub fn update<'t>(

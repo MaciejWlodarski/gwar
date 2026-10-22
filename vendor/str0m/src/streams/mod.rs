@@ -632,6 +632,7 @@ impl Streams {
         // Snapshot each stream once, preferring media/RTX padding over the
         // fallback. No extra stream or retransmission-queue scan is needed.
         let mut media_padding = false;
+        let probe_mid = self.probe_media.map(|(mid, _)| mid);
         let mut probe_queue = self.probe_media.map(|_| {
             let mut queue = self.probe_tx.queue_state(now);
             queue.midrid = MidRid(MID_PROBE, None);
@@ -641,6 +642,12 @@ impl Streams {
         std::iter::from_fn(move || {
             if let Some(stream) = streams.next() {
                 let mut queue = stream.queue_state(now);
+                if Some(stream.mid()) == probe_mid {
+                    // Fallback padding probes for this source before it has cached RTP.
+                    if let Some(probe) = probe_queue.as_mut() {
+                        probe.unpaced = queue.unpaced;
+                    }
+                }
                 if probe_queue.is_some() && queue.use_for_padding {
                     // Only negotiated feedback sources can provide probe padding.
                     // Ordinary padding keeps its existing eligibility.

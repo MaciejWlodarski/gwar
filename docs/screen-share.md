@@ -524,13 +524,13 @@ while the reserve refills; probe clusters remain enabled. Otherwise str0m's
 at a 100 kbps estimate,
 permanently blocking target growth even after the link recovers. The padding
 limit survives estimator updates and resets; background padding returns
-when the reserve is ready. Burst sizes are unchanged.
+when the reserve is ready. The extras bucket capacity is unchanged.
 Regressions use an independent viewer clock with 1, 2, 5 and 10 ms SFU
 cadences plus periodic 10 ms stalls, require steady video throughput, restore
 a link after an actual bandwidth pause, and pin resume at exactly 10 s of
 continuous room. Pause thresholds and socket caps are unchanged.
 
-**Local follow-up verification.** All builds used `CARGO_BUILD_JOBS=4`
+**Historical follow-up verification at `674633d`.** All builds used `CARGO_BUILD_JOBS=4`
 and the worktree's `target/`. Server unit tests: 287 passed (including 51
 screen tests and monthly egress); screen integration: 10; latency example:
 27; vendored str0m: 759 unit tests and 14 probe integration tests, including
@@ -538,11 +538,24 @@ padding disable/reset/re-enable; Python harness: 9. The no-default-features
 server check, clippy with `-D warnings` for the server/proto/client and vendor
 library/probe regression, rustfmt and `git diff --check` passed.
 
-The broader vendored str0m suite hits an existing `simple::bwe_cellular`
-failure: 403.346 kbps measured against a 750 kbps intermediate threshold.
-A scratch export of the unchanged `89dacfe` head, with the same local packet
-fixtures, reproduces that identical failure. This fix changes no str0m
-production code.
+The `simple::bwe_cellular` failure was caused by Gwar's generic immediate-timeout
+patch, not by unchanged crates.io str0m 0.24.1. Reproducing it at `89dacfe`
+compared two revisions that already contained the faulty patch. Paced media
+now keeps upstream's one-microsecond clock advance, including during probes.
+Only application-paced media and generated padding bursts drain at the same
+clock. Scheduler-aware first-burst sizing applies only to application-paced
+streams. The cellular regression passes without lowering its thresholds.
+
+**Review-fix validation.** All builds used `CARGO_BUILD_JOBS=4` and the
+worktree's `target/`. The server's 288 unit tests passed, including 52 screen
+and egress tests and every recovery-matrix case; screen integration: 10;
+latency example: 27; Python harness: 19. The full vendored str0m suite with
+`--no-default-features --features aws-lc-rs,_internal_test_exports` passed:
+765 unit tests, 330 integration tests (including `simple::bwe_cellular`), and
+59 doctests; two doctests remain ignored. The no-default-features server
+check, server/proto/client and full-vendor all-targets clippy with
+`-D warnings`, workspace/vendor rustfmt, and `git diff --check` passed.
+No deployment host or VM was contacted.
 
 The earlier macOS loopback gate at `a4c76a1` used one pair of 40 markers
 per scenario:
@@ -1008,7 +1021,8 @@ classified by its header, with no decryption:
   for serialized RTP extensions/alignment and SRTP overhead. Admission and share
   rate/keyframe meters include that same overhead. An originals bucket at the
   socket checks the actual serialized bytes at `B`, with burst
-  `max(2400 B, 10 ms × B)`. UDP/IP bytes are outside this socket-byte cap.
+  `max(2400 B, 10 ms × B)`, expanding to 30 ms of `B` when measured
+  scheduler wakes exceed 10 ms. UDP/IP bytes are outside this socket-byte cap.
 - **Extras:** RTP on any other SSRC, that is, the RTX SSRCs (repairs and
   padding) and str0m's probe SSRC. They pass through **one token bucket per
   viewer**:
@@ -1139,52 +1153,100 @@ serves the voice acceptance instead. Results and deviations:
   they share nothing with it but the screen task.
 - **Probes fit the reserve:** after the bandwidth collapse ends, allocation
   and periodic ALR probes go out whole within the extras burst, and the
-  capped and uncapped estimates recover within 10 % of each other. The
+  capped estimate does not trail the uncapped estimate by more than 10 %.
+  Capping can improve feedback by preventing probe loss. The
   separate recovery regression requires resumed media above 60 % of its
   intended rate. Built (`probes_after_a_collapse_fit_the_reserve`), with a
   finding fixed after the `07e2f24` VM gate: the probe pacer waited between
   individual padding packets instead of draining each generated burst. A
   240-byte blank packet per 2 ms wake limited discovery to about 1 Mbps even
   on a healthy link. The local str0m patch now drains each burst immediately
-  and spaces only successive bursts. A viewer whose every slot is paused
-  for bandwidth for 15 s still restarts its loss-limited estimator from a
-  third of its estimate (at least 100 kbps), with bounded initial probes.
-  Before every restart, the SFU lowers str0m's desired bitrate to at most
-  1.5 times the restart estimate and updates its cached desired bitrate.
-  Keeping the old target would bypass the reach limit, drop probes at the
-  unchanged extras cap, and repeatedly break the fit timer. This clamp
-  applies on every restart, regardless of how long the link was impaired.
-  Capacity rediscovery adds delay after the physical link recovers: the
-  resume rule requires **10 s of continuous measured room**, starting only
-  once probing has rediscovered enough capacity. Retry is no longer
-  required to recover a healthy link. Regressions cover an
-  8 Mbps/60 fps share with a 200 KB keyframe from startup, scheduler jitter,
-  and an actual bandwidth pause followed by restored capacity. The combined
-  regression (`game_recovers_after_scheduler_delay_and_bandwidth_collapse`)
-  runs Game at 8 Mbps/60 fps with a 200 KB keyframe and a 10 ms SFU cadence:
-  a 20 Mbps link collapses to 1 Mbps at 12 s, recovers at 27 s, and the cadence
-  returns to 1 ms at 67 s. It runs until 160 s and also covers keeping the
-  10 ms cadence throughout. Each run must resume within 45 s of link recovery,
-  remain resumed, and deliver at least 90 % of the intended payload rate in
-  each of the final three ten-second receiver windows. Both variants resume
-  at 56.45 s (29.45 s after link restoration), with no later pause, 8.00 Mbps
-  of received video payload and 8.34 Mbps of serialized originals. Total
-  extras drops are 62 with the restart target clamp (145 before that fix),
-  down from 15,372 in the original combined scenario.
+  and spaces only successive bursts. Application-paced streams retain an
+  observed scheduler cadence across short intermediate callbacks. Their probe
+  byte target covers at least that interval plus the minimum burst spacing;
+  the initial burst leaves a tail for a later timestamp. The already-required
+  minimum packet count is batched at low rates. Burst spacing starts at the
+  first actual send, including when padding was prepared on an earlier timeout.
+  Fallback probes inherit their media source's pacing mode, and screen slots
+  are configured before bootstrap. Paced media keeps its original scheduling
+  and first-burst size.
+
+  Recovering and coarsely scheduled screen-watch transports dispatch probe
+  clusters at least one second apart, allowing the extras reserve to refill
+  between initial probes too. Fast active transports retain ordinary probing.
+  The configurable interval persists across estimator resets. Target increases still wait for a full reserve within
+  one MTU, and regular background padding stops at its source while it refills.
+
+  A fully bandwidth-paused viewer requests one recovery probe after 15 s
+  without an estimate improvement above 5 %, once the reserve is ready.
+  Progress restarts that timer. Each unsuccessful cycle reduces desired-target
+  reach by 10 %, from 1.5 times the estimate to a floor of 1.15, retaining unmet
+  demand for ALR probes. The SFU synchronizes its cached desired bitrate and
+  str0m's target before requesting the probe. A 100 kbps minimum probe base
+  prevents tiny estimates from starving feedback. Recovery preserves the
+  estimator, cluster IDs and feedback history during capacity discovery instead
+  of repeatedly resetting them. At resume, after the fit timer has passed, the
+  congestion/ACK history is rebased once at the measured estimate with both
+  desired-bitrate copies bounded before reset. This prevents sparse pause-time
+  feedback from collapsing the first active estimate to the 40 kbps floor.
+  Recovery probe spacing remains for ten seconds while fresh media feedback
+  settles. Active media clears the stalled-target backoff state.
+
+  The originals release and socket buckets retain 10 ms of credit at normal
+  cadences and allow 30 ms when measured wakes exceed 10 ms. This covers the
+  tested 20 ms cadence plus estimate-change margin; their rate remains
+  `0.8 × estimate`. The fixed 10 ms capacity discarded half the pacing credit
+  between 20 ms wakes and repeatedly starved resumed video. The extras rate,
+  socket cap and bucket capacity, and every pause/resume threshold remain
+  unchanged. Release and socket credit refill under the old burst window before
+  its size changes, so released media cannot spend credit the socket clipped.
+  Pacer snapshots refresh immediately after writing released originals.
+
+  The supported resume rule is **10 s of continuous measured room**.
+  Capacity rediscovery after physical restoration adds a delay that is not
+  bounded in general; neither 10 s nor the previous 45 s claim is a general
+  recovery deadline. The earlier regression missed 28/29 s collapses, slow
+  15/20 ms cadences and downlink loss.
 
   The parameterized regression
-  (`game_recovers_after_different_collapse_durations`) keeps the 10 ms
-  cadence and observes 360 s after link restoration. Collapse duration →
-  measured resume delay from restoration: **15 s → 29.45 s; 30 s → 44.45 s;
-  30.1 s → 44.35 s; 60 s → 29.45 s; 120 s → 29.45 s**. All enforce the same
-  **45 s maximum**, no later pause and at least 90 % of the intended rate
-  in each final ten-second receiver window; all measure 7,999,680 bps of
-  payload and 8,337,600 bps of serialized originals. The 30.1 s case restores
-  the link at 42.1 s and ends at 402.1 s. Before the clamp it never resumed
-  and dropped 919 extras; now it resumes at 86.45 s and drops 114 extras.
-  These are simulated bounds with healthy restored capacity and feedback,
-  including capacity rediscovery followed by 10 s of continuous measured
-  room; they are not a ten-second deadline from physical restoration.
+  (`game_recovers_after_different_collapse_durations`) runs an 8 Mbps/60 fps
+  Game share with a 200 KB keyframe. A 20 Mbps link collapses to 1 Mbps at
+  12 s for 15, 28, 29, 30, 30.1, 60 or 120 s. Each duration runs at 1, 5, 10,
+  15 and 20 ms SFU cadences, on a lossless link and with 1 % downlink loss
+  throughout: 70 cases. All observe another 360 s after restoration,
+  require resume within a generous 180 s test bound, forbid subsequent
+  pauses, and require at least 90 % of the intended payload rate in each
+  of the final three ten-second receiver windows. This is a deterministic
+  regression bound for these fixtures, not a production recovery guarantee.
+  Coarse, lossy startup may pause before the imposed collapse; every case
+  must send originals before the outage and meet the same recovery assertions.
+  The separate scheduling-restoration case changes 10 ms back to 1 ms
+  40 s after restoration and applies the same resume and throughput checks.
+
+  **Lossless: resume delay in seconds after physical restoration.**
+
+  | Collapse | 1 ms | 5 ms | 10 ms | 15 ms | 20 ms |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | 15 s | 18.244 | 16.645 | 15.750 | 60.510 | 39.060 |
+  | 28 s | 19.444 | 16.645 | 15.250 | 47.510 | 26.060 |
+  | 29 s | 18.444 | 17.645 | 14.250 | 46.510 | 25.060 |
+  | 30 s | 17.444 | 17.845 | 16.250 | 45.510 | 24.060 |
+  | 30.1 s | 17.344 | 17.745 | 16.150 | 45.410 | 23.960 |
+  | 60 s | 20.044 | 18.145 | 16.350 | 16.770 | 18.560 |
+  | 120 s | 17.144 | 18.045 | 16.350 | 17.145 | 18.060 |
+
+  **1 % downlink loss: resume delay in seconds after physical restoration.**
+
+  | Collapse | 1 ms | 5 ms | 10 ms | 15 ms | 20 ms |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | 15 s | 16.744 | 16.645 | 15.350 | 21.450 | 24.460 |
+  | 28 s | 16.944 | 16.645 | 17.350 | 23.360 | 26.660 |
+  | 29 s | 15.944 | 17.645 | 16.350 | 22.360 | 25.660 |
+  | 30 s | 16.944 | 17.645 | 15.350 | 21.360 | 24.660 |
+  | 30.1 s | 16.844 | 17.545 | 15.250 | 21.260 | 24.560 |
+  | 60 s | 17.544 | 18.245 | 15.850 | 17.505 | 17.960 |
+  | 120 s | 17.844 | 18.445 | 15.850 | 17.670 | 16.960 |
+
 
   The simulated receiver drains str0m after every datagram, preserving its
   single pending RTP event when several packets arrive within one millisecond.
@@ -1294,7 +1356,7 @@ emit 204 KB keyframes every 2 s:
 
 - **Room for keyframes.** An unconstrained viewer and a 20 Mbps viewer: neither
   is paused, no packet is dropped, and each keyframe leaves the SFU within
-  `K ÷ B` plus 10 ms.
+  `K ÷ B` plus 30 ms.
 - **Admission overflow.** A 3 Mbps viewer: the keyframes fail at admission,
   the viewer is paused within two keyframes, and it is not resumed while its
   estimate stays at 3 Mbps.

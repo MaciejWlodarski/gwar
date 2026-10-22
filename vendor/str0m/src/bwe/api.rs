@@ -1,5 +1,7 @@
 //! Bandwidth estimation.
 
+use std::time::Duration;
+
 use crate::{Rtc, rtp_::Mid};
 
 pub use crate::rtp_::Bitrate;
@@ -68,6 +70,23 @@ impl<'a> Bwe<'a> {
     /// a separate probe reserve can disable background padding to let it refill.
     pub fn set_padding_bitrate_limit(&mut self, limit: Option<Bitrate>) {
         self.0.session.set_bwe_padding_bitrate_limit(limit);
+    }
+
+    /// Request one capacity-rediscovery probe, even when loss-limited.
+    ///
+    /// Intended for an application that has stopped media and has a full probe
+    /// reserve. Uses at most twice the desired bitrate and obeys the configured
+    /// minimum interval. Returns false if disabled or another cluster is pending.
+    pub fn request_recovery_probe(&mut self) -> bool {
+        self.0.session.request_bwe_recovery_probe(self.0.last_now)
+    }
+
+    /// Set the minimum interval between dispatched probe clusters.
+    ///
+    /// Defaults to zero. Applications with a separate extras budget can allow its
+    /// reserve to refill between clusters. This setting survives estimator resets.
+    pub fn set_min_probe_interval(&mut self, interval: Duration) {
+        self.0.session.set_bwe_min_probe_interval(interval);
     }
 
     /// Reset the BWE with a new init_bitrate

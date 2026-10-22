@@ -137,6 +137,8 @@ pub struct ProbeClusterState {
 
     /// Total bytes sent so far in this probe
     bytes_sent: DataSize,
+    /// Runtime byte target, including coarse scheduling and minimum packet count.
+    byte_target: DataSize,
 
     /// Total packets sent so far in this probe
     packets_sent: usize,
@@ -152,6 +154,8 @@ pub struct ProbeClusterState {
     /// When we last created a padding request
     /// Used to prevent creating multiple padding packets for the same instant
     last_padding_at: Instant,
+    /// A requested burst has not reached its first actual socket send yet.
+    padding_pending: bool,
 }
 
 impl ProbeClusterState {
@@ -160,10 +164,12 @@ impl ProbeClusterState {
         Self {
             config,
             bytes_sent: DataSize::ZERO,
+            byte_target: config.target_bytes(),
             packets_sent: 0,
             started_at: None,
             last_packet_at: None,
             last_padding_at: already_happened(),
+            padding_pending: false,
         }
     }
 
@@ -197,7 +203,7 @@ impl ProbeClusterState {
     /// Check if the probe cluster is complete.
     ///
     /// A probe is complete when BOTH conditions are met (matching WebRTC):
-    /// 1. Sent bytes >= target_bytes (target_bitrate * target_duration)
+    /// 1. Sent bytes >= runtime target (nominal duration, or the observed unpaced cadence)
     /// 2. Sent packets >= min_packet_count
     ///
     /// Note: WebRTC does NOT check duration for completion. Duration is only used
@@ -211,7 +217,7 @@ impl ProbeClusterState {
 
         // Match WebRTC's BitrateProber::ProbeSent() logic:
         // if (sent_bytes >= probe_cluster_min_bytes && sent_probes >= probe_cluster_min_probes)
-        let bytes_met = self.bytes_sent >= self.config.target_bytes();
+        let bytes_met = self.bytes_sent >= self.byte_target;
         let packets_met = self.packets_sent >= self.config.min_packet_count;
 
         bytes_met && packets_met
@@ -239,9 +245,11 @@ impl ProbeClusterState {
     /// min_probe_delta` (e.g. 240 bytes / 2ms = 960 kbit/s), which would be far below the
     /// intended probe bitrate.
     ///
+    /// `wake_interval` is the application's observed scheduling interval for unpaced
+    /// streams, or zero to retain the default first-burst size for paced streams.
     /// Returns `None` if it's not time to send yet, or if we've already created
     /// a padding packet for this instant.
-    pub fn next_packet(&mut self, now: Instant) -> Option<DataSize> {
+    pub fn next_packet(&mut self, now: Instant, wake_interval: Duration) -> Option<DataSize> {
         if self.started_at.is_none() {
             self.started_at = Some(now);
         }
@@ -263,24 +271,37 @@ impl ProbeClusterState {
             return None;
         }
 
-        // Include scheduler lateness in this burst's byte budget. A fixed min_probe_delta
-        // budget would cap the actual rate when the caller wakes less frequently.
+        let coarse = wake_interval > self.config.min_probe_delta();
+        // A cluster must span the observed wake interval. Keeping only 15 ms worth
+        // of bytes at a 20 ms cadence systematically undermeasures its target rate.
+        // Reserve a final minimum interval so actual sends have distinct timestamps.
         let burst_duration = if self.last_padding_at < self.started_at.unwrap() {
-            self.config.min_probe_delta()
+            let duration = self
+                .config
+                .target_duration
+                .max(wake_interval + self.config.min_probe_delta());
+            self.byte_target = self.config.target_bitrate * duration;
+            if coarse {
+                self.byte_target = self
+                    .byte_target
+                    .max(MAX_PADDING_PACKET_SIZE * self.config.min_packet_count() as u64);
+            }
+            wake_interval
+                .min(duration.saturating_sub(self.config.min_probe_delta()))
+                .max(self.config.min_probe_delta())
         } else {
             now.saturating_duration_since(self.last_padding_at)
         };
         self.last_padding_at = now;
-        let recommended_probe_size = self.config.target_bitrate * burst_duration;
-
-        // Ensure we request at least one padding packet worth of bytes even if min_delta is 0.
-        let recommended_probe_size = DataSize::bytes(cmp::max(
-            recommended_probe_size.as_bytes_i64(),
-            MAX_PADDING_PACKET_SIZE.as_bytes_i64(),
-        ));
-
-        // Calculate remaining bytes needed to complete the probe cluster.
-        let bytes_remaining = self.config.target_bytes().saturating_sub(self.bytes_sent);
+        // At low estimates, batch the already-required minimum packet count over
+        // two wakes rather than capping feedback at one small packet per wake.
+        let burst_floor = if coarse {
+            MAX_PADDING_PACKET_SIZE * self.config.min_packet_count().div_ceil(2) as u64
+        } else {
+            MAX_PADDING_PACKET_SIZE
+        };
+        let recommended_probe_size = (self.config.target_bitrate * burst_duration).max(burst_floor);
+        let bytes_remaining = self.byte_target.saturating_sub(self.bytes_sent);
 
         // Like BitrateProber::ProbeSent, completion requires both the byte and
         // packet thresholds. At low rates the byte target can fit in one packet;
@@ -296,6 +317,7 @@ impl ProbeClusterState {
         if request_bytes == DataSize::ZERO {
             None
         } else {
+            self.padding_pending = true;
             Some(request_bytes)
         }
     }
@@ -311,8 +333,15 @@ impl ProbeClusterState {
         // If a probe is active and we observe a media packet before any probe-generated padding,
         // treat that as the start of the probe. This keeps timing semantics consistent and ensures
         // `next_probe_time()` enforces `min_probe_delta` from the first packet onwards.
-        if self.started_at.is_none() {
+        if self.packets_sent == 0 {
             self.started_at = Some(now);
+        }
+        if self.padding_pending {
+            // Padding can be prepared on a timeout and polled only on a later wake.
+            // Space from the actual send; otherwise the whole next burst could also
+            // drain at this clock, leaving the estimator a zero-duration cluster.
+            self.last_padding_at = now;
+            self.padding_pending = false;
         }
 
         self.bytes_sent += size;
@@ -330,16 +359,80 @@ mod test {
         let now = Instant::now();
         let config = ProbeClusterConfig::new(0.into(), Bitrate::mbps(10), ProbeKind::Initial);
         let mut state = ProbeClusterState::new(config);
-        let first = state.next_packet(now).unwrap();
+        let first = state.next_packet(now, Duration::ZERO).unwrap();
         state.record_packet(now, first);
         let late = now + Duration::from_millis(10);
-        let burst = state.next_packet(late).unwrap();
+        let burst = state.next_packet(late, Duration::ZERO).unwrap();
         assert_eq!(burst, Bitrate::mbps(10) * Duration::from_millis(10));
         state.record_packet(late, burst);
         let later = late + Duration::from_millis(10);
-        let last = state.next_packet(later).unwrap();
+        let last = state.next_packet(later, Duration::ZERO).unwrap();
         assert_eq!(first + burst + last, config.target_bytes());
-        assert!(state.next_packet(later).is_none(), "one burst per wake");
+        assert!(
+            state.next_packet(later, Duration::ZERO).is_none(),
+            "one burst per wake"
+        );
+    }
+
+    #[test]
+    fn delayed_poll_spaces_bursts_from_actual_send_time() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(20);
+        let config = ProbeClusterConfig::new(0.into(), Bitrate::mbps(10), ProbeKind::Initial);
+        let mut state = ProbeClusterState::new(config);
+        let first = state.next_packet(now, interval).unwrap();
+        let sent = now + interval;
+        state.record_packet(sent, first);
+        assert!(state.next_packet(sent, interval).is_none());
+        let second = state.next_packet(sent + interval, interval).unwrap();
+        assert_eq!(
+            first + second,
+            config.target_bitrate() * (interval + config.min_probe_delta())
+        );
+        assert_eq!(state.started_at, Some(sent));
+    }
+
+    #[test]
+    fn coarse_wakes_balance_the_bursts_within_the_cluster_budget() {
+        let now = Instant::now();
+        for cadence in [15, 20] {
+            let interval = Duration::from_millis(cadence);
+            let config = ProbeClusterConfig::new(0.into(), Bitrate::mbps(10), ProbeKind::Initial);
+            let mut state = ProbeClusterState::new(config);
+            let first = state.next_packet(now, interval).unwrap();
+            assert_eq!(first, config.target_bitrate() * interval);
+            state.record_packet(now, first);
+            let second = state.next_packet(now + interval, interval).unwrap();
+            assert_eq!(
+                first + second,
+                config.target_bitrate() * (interval + config.min_probe_delta())
+            );
+            assert!(state.next_packet(now + interval, interval).is_none());
+        }
+    }
+
+    #[test]
+    fn coarse_low_rate_probe_batches_the_minimum_packets() {
+        let now = Instant::now();
+        let interval = Duration::from_millis(20);
+        let config = ProbeClusterConfig::new(0.into(), Bitrate::kbps(200), ProbeKind::Initial);
+        let mut state = ProbeClusterState::new(config);
+        let first = state.next_packet(now, interval).unwrap();
+        assert_eq!(first, MAX_PADDING_PACKET_SIZE * 3u64);
+        for _ in 0..3 {
+            state.record_packet(now, MAX_PADDING_PACKET_SIZE);
+        }
+        let later = now + interval * 2;
+        let second = state.next_packet(later, interval).unwrap();
+        assert_eq!(second, MAX_PADDING_PACKET_SIZE * 2u64);
+        for _ in 0..2 {
+            state.record_packet(later, MAX_PADDING_PACKET_SIZE);
+        }
+        assert!(state.is_complete(later));
+        assert_eq!(
+            first + second,
+            MAX_PADDING_PACKET_SIZE * config.min_packet_count() as u64
+        );
     }
 
     #[test]
@@ -349,7 +442,9 @@ mod test {
         let mut state = ProbeClusterState::new(config);
         for i in 0..config.min_packet_count() {
             let at = if i == 0 { now } else { state.next_probe_time() };
-            let size = state.next_packet(at).expect("minimum packets still needed");
+            let size = state
+                .next_packet(at, Duration::ZERO)
+                .expect("minimum packets still needed");
             assert!(size <= MAX_PADDING_PACKET_SIZE);
             state.record_packet(at, size);
         }
@@ -459,9 +554,17 @@ mod test {
         assert_eq!(state.config().min_probe_delta(), Duration::from_millis(20));
 
         // Start a burst at `now`, then verify that a second burst is blocked until >= now+20ms.
-        assert!(state.next_packet(now).is_some());
-        assert!(state.next_packet(now + Duration::from_millis(19)).is_none());
-        assert!(state.next_packet(now + Duration::from_millis(20)).is_some());
+        assert!(state.next_packet(now, Duration::ZERO).is_some());
+        assert!(
+            state
+                .next_packet(now + Duration::from_millis(19), Duration::ZERO)
+                .is_none()
+        );
+        assert!(
+            state
+                .next_packet(now + Duration::from_millis(20), Duration::ZERO)
+                .is_some()
+        );
         let next = state.last_padding_at;
         assert!(
             next >= now + Duration::from_millis(20),

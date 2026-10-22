@@ -16,8 +16,7 @@ fn send_frame(
     mid: Mid,
     rid: Rid,
     pt: Pt,
-    seq: u64,
-    timestamp: u32,
+    (seq, timestamp): (u64, u32),
     payload: &'static [u8],
 ) -> Result<(), RtcError> {
     let at = l.last.max(r.last) + Duration::from_millis(10);
@@ -63,8 +62,7 @@ fn ssrc_change_resets_every_payload_type_on_the_stream() -> Result<(), RtcError>
         mid,
         rid,
         vp8_pt,
-        100,
-        90_000,
+        (100, 90_000),
         &[0x10, 0x01, 0xaa],
     )?;
     assert!(received_frame(&r, vp8_pt, 100));
@@ -73,7 +71,15 @@ fn ssrc_change_resets_every_payload_type_on_the_stream() -> Result<(), RtcError>
         .reset_stream_tx(mid, Some(rid), 84.into(), None)
         .expect("SSRC reset");
     // The first packet on the new SSRC uses H.264, so it resets that depacketizer.
-    send_frame(&mut l, &mut r, mid, rid, h264_pt, 1, 180_000, &[0x65, 0xaa])?;
+    send_frame(
+        &mut l,
+        &mut r,
+        mid,
+        rid,
+        h264_pt,
+        (1, 180_000),
+        &[0x65, 0xaa],
+    )?;
     assert!(received_frame(&r, h264_pt, 1));
     // VP8 must also start fresh on the new SSRC, even though it was not the
     // payload type of the packet that signaled the change.
@@ -83,8 +89,7 @@ fn ssrc_change_resets_every_payload_type_on_the_stream() -> Result<(), RtcError>
         mid,
         rid,
         vp8_pt,
-        2,
-        270_000,
+        (2, 270_000),
         &[0x10, 0x01, 0xbb],
     )?;
     assert!(

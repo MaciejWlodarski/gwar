@@ -1333,6 +1333,18 @@ impl Session {
         self.configure_pacer();
     }
 
+    pub fn request_bwe_recovery_probe(&mut self, now: Instant) -> bool {
+        self.bwe
+            .as_mut()
+            .is_some_and(|bwe| bwe.request_recovery_probe(now))
+    }
+
+    pub fn set_bwe_min_probe_interval(&mut self, interval: Duration) {
+        if let Some(bwe) = self.bwe.as_mut() {
+            bwe.set_min_probe_interval(interval);
+        }
+    }
+
     pub fn reset_bwe(&mut self, init_bitrate: Bitrate) {
         if let Some(bwe) = self.bwe.as_mut() {
             bwe.reset(init_bitrate);

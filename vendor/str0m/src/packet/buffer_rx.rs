@@ -1392,8 +1392,9 @@ mod test {
             }
         }
         let anchor = base.checked_add(Duration::from_secs(low)).unwrap();
-        let timeout = Some(Duration::from_secs(600));
-        assert!(anchor.checked_add(timeout.unwrap()).is_none());
+        let timeout = Duration::from_secs(600);
+        assert!(anchor.checked_add(timeout).is_none());
+        let timeout = Some(timeout);
 
         let mut buf = DepacketizingBuffer::new(CodecDepacketizer::Boxed(Box::new(TestDepack)), 3);
         buf.push(test_meta(base, 1, 1, 0), [1, 9]);
