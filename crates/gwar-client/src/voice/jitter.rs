@@ -777,9 +777,12 @@ impl JitterBuffer {
         // More than `MAX_QUEUED` is beyond any target, refill and speaker headroom: the output
         // stopped consuming, or a burst of more than that arrived. Holding it buys nothing. This
         // refill takes its demand, and the target stays behind it as the jitter reserve.
+        // It supersedes a pending stall recovery: what it keeps is the newest audio, and trimming
+        // that again to the stall deadline would take the reserve back out.
         if demand > 0 && std::mem::take(&mut self.overflowed) {
             let keep = self.target_samples() + demand as u64;
             fade |= self.trim(u64::MAX, keep, now);
+            self.recovering = None;
         }
         if let Some(before) = self.recovering.as_ref().map(|recovery| recovery.before) {
             // Only discard media that starts behind the stalled timeline's deadline. A packet
@@ -1673,36 +1676,53 @@ mod tests {
         }
     }
 
+    /// 10 ms packets, every 50th delivered 10 ms late, so the target carries a reserve for it.
+    /// Either the output pauses from 5 s to 25 s, or delivery stalls from 5 s to 6.2 s and the
+    /// held packets arrive at once (overflow and stall recovery together). Refills of `refill`
+    /// packets run at `offset` ms into each period. Returns the concealments after the
+    /// disruption and the trim events.
+    fn overflow_with_jitter(clock: Clock, refill: u64, offset: u64, output_pause: bool) -> (usize, u64) {
+        let stride = if clock == Clock::Sequence { FRAME } else { 480 };
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let arrival = |k: u64| {
+            let time = k * 10 + if k % 50 == 49 { 10 } else { 0 };
+            if !output_pause && (5_000..6_200).contains(&time) { 6_200 } else { time }
+        };
+        let (resume, period) = (if output_pause { 25_000 } else { 6_200 }, refill * 10);
+        let mut jb = JitterBuffer::new();
+        let mut player = Player::new(480, 240);
+        let (mut k, mut resumed_with) = (0, None);
+        for time in 1..=40_000u64 {
+            while arrival(k) <= time {
+                jb.push_at(k * stride, 480, k.to_le_bytes().to_vec(), at(arrival(k)), clock);
+                k += 1;
+            }
+            let paused = output_pause && (5_000..resume).contains(&time);
+            if time % period == offset % period && !paused {
+                if time >= resume && resumed_with.is_none() {
+                    resumed_with = Some(player.concealed);
+                }
+                player.refill(&mut jb, at(time), (refill * 480) as usize);
+            }
+        }
+        (player.concealed - resumed_with.unwrap(), jb.trim_events)
+    }
+
     #[test]
     fn overflow_recovery_keeps_the_jitter_reserve() {
-        // 10 ms packets, every 50th delivered 10 ms late, so the target carries a reserve for it.
-        // The output pauses for 20 s and resumes; refills are longer than a packet. The trim
-        // keeps the target behind the first refill's demand, so the jitter stays covered.
+        // The trim keeps the target behind the first refill's demand, so the jitter stays covered,
+        // also when a stall recovery is pending for the same burst.
         for clock in [Clock::Rtp, Clock::Sequence] {
-            for refill in [2u64, 12] {
-                let stride = if clock == Clock::Sequence { FRAME } else { 480 };
-                let start = Instant::now();
-                let at = |ms: u64| start + Duration::from_millis(ms);
-                let arrival = |k: u64| k * 10 + if k % 50 == 49 { 10 } else { 0 };
-                let mut jb = JitterBuffer::new();
-                let mut player = Player::new(480, 240);
-                let (mut k, mut resumed_with) = (0, None);
-                for time in 1..=40_000u64 {
-                    while arrival(k) <= time {
-                        jb.push_at(k * stride, 480, k.to_le_bytes().to_vec(), at(arrival(k)), clock);
-                        k += 1;
-                    }
-                    let paused = (5_000..25_000).contains(&time);
-                    if time % (refill * 10) == 0 && !paused {
-                        if time >= 25_000 && resumed_with.is_none() {
-                            resumed_with = Some(player.concealed);
-                        }
-                        player.refill(&mut jb, at(time), (refill * 480) as usize);
+            for refill in [2, 12] {
+                for offset in [0, 10] {
+                    for output_pause in [true, false] {
+                        let (concealed, trims) = overflow_with_jitter(clock, refill, offset, output_pause);
+                        let case = format!("{clock:?} refill {refill} offset {offset} output pause {output_pause}");
+                        assert_eq!(concealed, 0, "{case}: concealed after the overflow trim");
+                        assert!(trims >= 1, "{case}");
                     }
                 }
-                let before = resumed_with.unwrap();
-                assert_eq!(jb.trim_events, 1, "{clock:?} {refill}");
-                assert_eq!(player.concealed, before, "{clock:?} {refill}: concealed after the overflow trim");
             }
         }
     }

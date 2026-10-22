@@ -399,12 +399,16 @@ the next packet delivered 10 ms late was concealed
 (`overflow_recovery_keeps_the_jitter_reserve`, 20 and 120 ms refills, both
 clocks). Whole packets can leave up to one packet above the target; the drain
 takes that as quiet cuts. It is the stall-recovery trim with its fade, counted
-as a trim event; the window restarts. A burst of more than a second at once is trimmed the same way, which
-is acceptable: that much never arrives inside a jitter target. In simulation
+as a trim event; the window restarts. It supersedes a stall recovery pending
+for the same burst: trimming the kept audio again to the stall deadline took the
+reserve back out (delivery held from 5 to 6.2 s, refills 10 ms off the packet
+phase, one concealment). A burst of more than a second at once is trimmed the
+same way, which is acceptable: that much never arrives inside a jitter target.
+In simulation
 (`a_full_queue_keeps_the_newest_audio_and_trims_to_the_target_after_a_pause`,
-both clocks, 20 s pause) the first refill after the pause trimmed 990 ms (10 ms
-packets), 980 ms (20 ms and 20/10/10 ms) and 970 ms (alternating 10/20 ms), and
-playback went on from the newest audio at the target with no gap and no PLC.
+both clocks, 20 s pause) the first refill after the pause trimmed 980 ms (10 ms
+packets), 960 ms (20 ms), 970 ms (20/10/10 ms) and 960 ms (alternating
+10/20 ms), and playback went on from the newest audio with no gap and no PLC.
 Without the trim, a 64-packet backlog took the fractional drain 65.5 s (10 ms
 packets) to 126.5 s (20 ms packets, quiet 5 ms cuts). With the 64-packet trigger,
 a 2.5 ms stream with 120 ms refills, one 60 ms late, lost 1,920 samples and
