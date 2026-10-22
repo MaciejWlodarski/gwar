@@ -51,6 +51,11 @@ is the development exception.
 - **Speech gate on the server.** Browsers send their audio level (RFC 6464);
   the server drops silence, drives the "talking" indicator and ends talk spurts
   for TeamSpeak clients.
+- **Data moves forward on its own.** Every store the server, Gwar Connect, the
+  desktop app and the web app keep has a version; an update upgrades older data
+  in place and an older version refuses newer data instead of misreading or
+  wiping it ([data-migrations.md](data-migrations.md)). How clients and servers
+  of different versions talk to each other: [compatibility.md](compatibility.md).
 
 ## The `gwar/4` protocol
 
@@ -370,9 +375,11 @@ rollback/clearing is outside
 this protection; missing predecessors remain **continuity unproven**. Visible
 message/context fingerprints share cached and in-flight verification. Thread
 updates check only new fingerprints; the minute timer refreshes time-dependent
-authorization notes with one bulk read and no checkpoint writes. Before the
-release there are no upgrades: a database of an older schema does not open, and
-storage counts as unavailable (with the reason in diagnostics). A failed storage
+authorization notes with one bulk read and no checkpoint writes. An older
+database is upgraded in place, step by step, keeping its checkpoints
+([data migrations](data-migrations.md)); one of a newer version, or an upgrade
+that fails, leaves it as it is and storage counts as unavailable (with the
+reason in diagnostics). A failed storage
 transaction is tried once more on a new connection; a tab blocking an upgrade makes
 storage unavailable at once rather than pending. A message checked while storage was
 unavailable shows **checkpoints unavailable** until storage works again: then (at
