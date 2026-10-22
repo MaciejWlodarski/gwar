@@ -92,7 +92,10 @@ the web app.
   features.
 - **Lifetimes.** OpenMLS checks key package lifetimes against the wall clock
   (at most 84 days, its limit). Gwar's rule is the device certificate, so:
-  key packages last until the device certificate expires, at most 84 days;
+  key packages last until the device certificate expires, at most 84 days,
+  and are valid from an hour before they were made, as OpenMLS' default
+  lifetimes are (a device whose clock is ahead would otherwise publish
+  packages the server and other members find not valid yet);
   joins (Welcome, external commit) skip OpenMLS' lifetime check and apply
   Gwar's certificate rules instead; the server never re-validates lifetimes
   of leaves already in a tree (below). A device that cannot replay an old

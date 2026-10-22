@@ -377,6 +377,33 @@ fn key_package_lifetimes_and_last_resort() {
 }
 
 #[test]
+fn key_packages_from_a_clock_ahead_are_valid() {
+    let mut f = fixture();
+    // The device's clock is half an hour ahead of the server's (here, the test's real clock).
+    let ahead = f.t + 30 * 60_000;
+    let package = f.b.key_packages(1, ahead).unwrap().remove(0);
+    f.b.take_changes();
+    let last_resort = f.b.last_resort_key_package(ahead).unwrap();
+    f.b.take_changes();
+    for p in [package, last_resort] {
+        let p = ds::key_package(&p).unwrap();
+        assert!(p.not_after * 1000 <= (ahead + 84 * 86_400_000) as u64);
+    }
+    // Without a certificate to end it first, the range is OpenMLS's maximum: 84 days plus the hour.
+    let mut local = Agent::new([11; 32], Credential::Local { device_key: public(&key(11)) }, ahead).unwrap();
+    local.take_changes();
+    let package = local.key_packages(1, ahead).unwrap().remove(0);
+    let package = KeyPackageIn::tls_deserialize_exact(&package)
+        .unwrap()
+        .validate(local.provider.crypto(), ProtocolVersion::Mls10)
+        .unwrap();
+    let issued = ahead as u64 / 1000;
+    assert_eq!(package.life_time().not_before(), issued - CLOCK_SKEW_SECS);
+    assert_eq!(package.life_time().not_after(), issued + 84 * 86400);
+    assert!(package.life_time().has_acceptable_range());
+}
+
+#[test]
 fn dm_adds_devices_with_welcomes_and_deduplicates_after_crash() {
     let mut f = fixture();
     let mut b2 = device(2, 22, f.t);

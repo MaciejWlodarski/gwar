@@ -108,6 +108,8 @@ fn group_key(server: &str, id: &[u8; 32]) -> String {
 fn epoch_key(group: &str, epoch: u64) -> String {
     format!("{group}/{epoch:020}")
 }
+/// How far a device's clock may be ahead of others' for its leaf lifetimes to be valid there.
+const CLOCK_SKEW_SECS: u64 = 3600;
 fn capabilities() -> Capabilities {
     Capabilities::new(
         None,
@@ -677,15 +679,18 @@ impl Agent {
         if !(0..=gwar_proto::MAX_SAFE_INTEGER).contains(&now) || !self.credential.is_current(now, &()) {
             return Err(Invalid("certificate now"));
         }
-        let start = now as u64 / 1000;
+        let issued = now as u64 / 1000;
         let end = match &self.credential {
-            Credential::Account(c) => (c.expires_at as u64 / 1000).min(start + 84 * 86400),
-            _ => start + 84 * 86400,
+            Credential::Account(c) => (c.expires_at as u64 / 1000).min(issued + 84 * 86400),
+            _ => issued + 84 * 86400,
         };
-        if end <= start {
+        if end <= issued {
             return Err(Invalid("key package lifetime"));
         }
-        Ok(Lifetime::init(start, end))
+        // Valid from an hour back, as OpenMLS's own default lifetimes are: a device whose clock is
+        // ahead of the server's or of another member's would otherwise publish packages that are
+        // not valid yet there. 84 days plus that hour is OpenMLS's maximum leaf lifetime range.
+        Ok(Lifetime::init(issued.saturating_sub(CLOCK_SKEW_SECS), end))
     }
     pub fn key_packages(&mut self, n: usize, now: i64) -> Result<Vec<Vec<u8>>> {
         if self.voice_only {
