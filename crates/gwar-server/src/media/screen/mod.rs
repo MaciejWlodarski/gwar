@@ -85,7 +85,7 @@ const ADDRESSES_PER_TRANSPORT: usize = 4;
 const ALLOCATION_TICK: Duration = Duration::from_millis(100);
 /// A viewer whose every slot is paused sends nothing, and str0m 0.24.1 does not probe a
 /// loss-limited estimate without feedback; so this often its estimator restarts from a third of
-/// its estimate, whose initial probes (3x and 6x) then test 1x and 2x of it.
+/// its estimate. First lower the desired bitrate to the restart estimate's probe reach.
 const REPROBE_EVERY: Duration = Duration::from_secs(15);
 const REPROBE_FLOOR: u64 = 100_000;
 /// Measured egress over the server-wide budget this many seconds in a row pauses watches.
@@ -1476,7 +1476,12 @@ fn allocate(
         w.stalled = None;
     } else if now.saturating_duration_since(*w.stalled.get_or_insert(now)) >= REPROBE_EVERY {
         w.stalled = Some(now);
-        w.rtc.bwe().reset(Bitrate::bps((w.egress.estimate() / 3).max(REPROBE_FLOOR)));
+        let restart = (w.egress.estimate() / 3).max(REPROBE_FLOOR);
+        // Reset retains str0m's desired bitrate. Bound it before the initial probes can
+        // run, using the same reach as ordinary target updates, even after a long stall.
+        w.desired = w.desired.map(|target| target.min((egress::PROBE_REACH * restart as f64) as u64));
+        w.rtc.bwe().set_desired_bitrate(Bitrate::bps(w.desired.unwrap_or(0)));
+        w.rtc.bwe().reset(Bitrate::bps(restart));
     }
     let (slot, change) = w.egress.allocate(now, &lanes, budget)?;
     apply(w, slot, change);

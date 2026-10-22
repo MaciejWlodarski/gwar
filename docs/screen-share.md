@@ -532,10 +532,18 @@ a link after an actual bandwidth pause, and pin resume at exactly 10 s of
 continuous room. Pause thresholds and socket caps are unchanged.
 
 **Local follow-up verification.** All builds used `CARGO_BUILD_JOBS=4`
-and the worktree's `target/`. Server unit tests: 286 passed (including 50
+and the worktree's `target/`. Server unit tests: 287 passed (including 51
 screen tests and monthly egress); screen integration: 10; latency example:
-24; vendored str0m: 759; Python harness: 4. The no-default-features server
-check, clippy with `-D warnings`, rustfmt and `git diff --check` passed.
+27; vendored str0m: 759 unit tests and 14 probe integration tests, including
+padding disable/reset/re-enable; Python harness: 9. The no-default-features
+server check, clippy with `-D warnings` for the server/proto/client and vendor
+library/probe regression, rustfmt and `git diff --check` passed.
+
+The broader vendored str0m suite hits an existing `simple::bwe_cellular`
+failure: 403.346 kbps measured against a 750 kbps intermediate threshold.
+A scratch export of the unchanged `89dacfe` head, with the same local packet
+fixtures, reproduces that identical failure. This fix changes no str0m
+production code.
 
 The earlier macOS loopback gate at `a4c76a1` used one pair of 40 markers
 per scenario:
@@ -1041,8 +1049,15 @@ serves the voice acceptance instead. Results and deviations:
   and spaces only successive bursts. A viewer whose every slot is paused
   for bandwidth for 15 s still restarts its loss-limited estimator from a
   third of its estimate (at least 100 kbps), with bounded initial probes.
-  Recovery then uses measured capacity and the usual 10 s fit guard; Retry
-  is no longer required to recover a healthy link. Regressions cover an
+  Before every restart, the SFU lowers str0m's desired bitrate to at most
+  1.5 times the restart estimate and updates its cached desired bitrate.
+  Keeping the old target would bypass the reach limit, drop probes at the
+  unchanged extras cap, and repeatedly break the fit timer. This clamp
+  applies on every restart, regardless of how long the link was impaired.
+  Capacity rediscovery adds delay after the physical link recovers: the
+  resume rule requires **10 s of continuous measured room**, starting only
+  once probing has rediscovered enough capacity. Retry is no longer
+  required to recover a healthy link. Regressions cover an
   8 Mbps/60 fps share with a 200 KB keyframe from startup, scheduler jitter,
   and an actual bandwidth pause followed by restored capacity. The combined
   regression (`game_recovers_after_scheduler_delay_and_bandwidth_collapse`)
@@ -1054,11 +1069,31 @@ serves the voice acceptance instead. Results and deviations:
   each of the final three ten-second receiver windows. Both variants resume
   at 56.45 s (29.45 s after link restoration), with no later pause, 8.00 Mbps
   of received video payload and 8.34 Mbps of serialized originals. Total
-  extras drops fall from 15,372 in the original combined scenario to 145.
+  extras drops are 62 with the restart target clamp (145 before that fix),
+  down from 15,372 in the original combined scenario.
+
+  The parameterized regression
+  (`game_recovers_after_different_collapse_durations`) keeps the 10 ms
+  cadence and observes 360 s after link restoration. Collapse duration →
+  measured resume delay from restoration: **15 s → 29.45 s; 30 s → 44.45 s;
+  30.1 s → 44.35 s; 60 s → 29.45 s; 120 s → 29.45 s**. All enforce the same
+  **45 s maximum**, no later pause and at least 90 % of the intended rate
+  in each final ten-second receiver window; all measure 7,999,680 bps of
+  payload and 8,337,600 bps of serialized originals. The 30.1 s case restores
+  the link at 42.1 s and ends at 402.1 s. Before the clamp it never resumed
+  and dropped 919 extras; now it resumes at 86.45 s and drops 114 extras.
+  These are simulated bounds with healthy restored capacity and feedback,
+  including capacity rediscovery followed by 10 s of continuous measured
+  room; they are not a ten-second deadline from physical restoration.
+
   The simulated receiver drains str0m after every datagram, preserving its
   single pending RTP event when several packets arrive within one millisecond.
-- **A test pins str0m behavior:** `set_rtx_cache` empties the cache. Built
-  (`set_rtx_cache_empties_the_cache`).
+- **Tests pin str0m behavior:** `set_rtx_cache` empties the cache. Built
+  (`set_rtx_cache_empties_the_cache`). The vendored str0m regression
+  `padding_limit_survives_reset_and_can_be_removed` checks actual RTP output:
+  disabling regular padding stops it at the source, the limit survives an
+  estimator reset and subsequent updates, probe clusters still run, and
+  removing the limit restores regular padding.
 
 ### Keyframes
 
@@ -1134,7 +1169,7 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
     3 Mbps estimate, `B` is 2.4 Mbps and the admission bound 120 KB, so a
     204 KB keyframe is rejected at admission before any packet reaches its
     deadline.
-- **Resume** only when, for 10 s:
+- **Resume** only after 10 s of continuous measured room:
   `B − Σ higher-priority intended slots ≥ max(1.2 × its average, K_last / 400 ms)`.
   The intended set includes active and paused slots in priority order. Focusing
   an already-paused share reclaims room from lower active slots, one change per

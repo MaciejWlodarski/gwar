@@ -94,6 +94,82 @@ fn no_twcc_extension_no_probes() -> Result<(), RtcError> {
 }
 
 #[test]
+fn padding_limit_survives_reset_and_can_be_removed() -> Result<(), RtcError> {
+    let (mut l, mut r) = peers(false);
+    let mut change = l.sdp_api();
+    change.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+    let (offer, pending) = change.apply().unwrap();
+    let answer = r.sdp_api().accept_offer(offer)?;
+    l.sdp_api().accept_answer(pending, answer)?;
+    // With no desired probing rate or media, RTP output is regular idle padding.
+    l.bwe().set_desired_bitrate(Bitrate::ZERO);
+    run(&mut l, &mut r, Duration::from_secs(1))?;
+    assert!(rtp_packets(&l) > 5, "regular padding is initially enabled");
+
+    l.bwe().set_padding_bitrate_limit(Some(Bitrate::ZERO));
+    run(&mut l, &mut r, Duration::from_millis(200))?;
+    l.events.clear();
+    run(&mut l, &mut r, Duration::from_secs(1))?;
+    assert_eq!(
+        rtp_packets(&l),
+        0,
+        "disabling padding stops it at its source"
+    );
+
+    l.bwe().reset(Bitrate::kbps(100));
+    l.events.clear();
+    run(&mut l, &mut r, Duration::from_secs(1))?;
+    assert_eq!(rtp_packets(&l), 0, "reset must preserve the padding limit");
+    assert!(
+        l.events.iter().any(|(_, event)| matches!(
+            event,
+            Event::EgressBitrateEstimate(BweKind::Twcc {
+                can_probe: true,
+                ..
+            })
+        )),
+        "the limit survives estimator updates after reset"
+    );
+
+    l.bwe().set_desired_bitrate(Bitrate::kbps(600));
+    l.events.clear();
+    run(&mut l, &mut r, Duration::from_secs(1))?;
+    assert!(
+        rtp_packets(&l) > 5,
+        "the limit must leave probe clusters enabled"
+    );
+    l.bwe().set_desired_bitrate(Bitrate::ZERO);
+    run(&mut l, &mut r, Duration::from_secs(2))?;
+    l.events.clear();
+    run(&mut l, &mut r, Duration::from_secs(1))?;
+    assert_eq!(
+        rtp_packets(&l),
+        0,
+        "regular padding is still disabled after probing"
+    );
+
+    l.bwe().set_padding_bitrate_limit(None);
+    l.events.clear();
+    run(&mut l, &mut r, Duration::from_secs(1))?;
+    assert!(
+        rtp_packets(&l) > 5,
+        "removing the limit restores regular padding"
+    );
+    Ok(())
+}
+
+fn rtp_packets(rtc: &TestRtc) -> usize {
+    rtc.events
+        .iter()
+        .filter(|(_, event)| {
+            matches!(
+                event, Event::RawPacket(p) if matches!(p.as_ref(), RawPacket::RtpTx(_, _))
+            )
+        })
+        .count()
+}
+
+#[test]
 fn idle_capacity_collapse_and_recovery() -> Result<(), RtcError> {
     let (mut l, mut r) = peers(true);
     l.direct_api().declare_media("aud".into(), MediaKind::Audio);
@@ -252,7 +328,7 @@ fn renegotiating_inactive_signals_probe_state_transitions() -> Result<(), RtcErr
         estimates,
         vec![&BweKind::Twcc {
             estimate: last_estimate,
-            can_probe: false,
+            can_probe: false
         }]
     );
     l.events.clear();
