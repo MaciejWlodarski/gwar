@@ -1902,7 +1902,16 @@ design left room:
   a guest that the link works but the share is full reveals nothing a valid
   token holder could not see anyway. A guest frame that does not parse as one
   of the watch ops, a second `guest.watch` and a second `guest.offer` close the
-  connection; an error reply echoes the frame's own `id` where it has one.
+  connection, even past the rate limit; an error reply echoes the frame's own
+  `id` where it has one.
+- **A guest let go is gone at once.** The core holds a signal for each guest
+  and drops it with the guest; the gateway's writer then stops even a write
+  stuck on a guest that no longer reads, flushes the last frames and the close
+  within 2 s, and drops the socket. Any frame that cannot leave within 5 s
+  ends the connection too. Its pre-authentication place frees with it.
+- **The token never reaches a log.** It travels as `WatchToken` from the
+  frame to the core and the bridge's copy as `WatchUrl`; both print `(..)` in
+  `Debug`. The puppet's queued text (`MessageText`) prints only its length.
 - **Guest ids** come from the session id space and are never handed to a
   member, so a guest's watch lease, slot and `EndWatch` cannot collide with a
   session's. A guest has no client entry and appears in no event other than
@@ -1915,13 +1924,16 @@ design left room:
 - **The server setting** has a switch in Server settings, shown only on
   TeamSpeak servers.
 - **Late joiners and the presence marker.** The late-joiner message goes once
-  per TeamSpeak user and share; users already in the channel when the link was
-  posted count as told. The " · sharing screen" marker follows the sharer's
+  per TeamSpeak user and share, by TeamSpeak identity (client ids are reused);
+  users in the channel when the link was posted count as told only if the
+  post went out, and anyone counts as told only once a message to them did.
+  If the post failed, those in the channel get it privately instead. The " · sharing screen" marker follows the sharer's
   name in the channel description's presence line, which lists users without a
   puppet (the line puppets do not need).
-- **ServerQuery posts only to readers.** Without a puppet the signed
-  ServerQuery post is made only when TeamSpeak users are in the channel; one
-  who arrives later gets the late-joiner message instead.
+- **ServerQuery posts only to readers.** Without a puppet, or when the
+  puppet's queue does not take the post, the signed ServerQuery post is made
+  only when TeamSpeak users are in the channel; one who arrives later gets the
+  late-joiner message instead.
 - **The page** is plain TypeScript (no React, no app stores), about 8 KB
   gzipped with its CSS. It keeps the token in the fragment (a reload works
   after a lost connection), pings every 20 s once admitted, and shows
@@ -1929,9 +1941,11 @@ design left room:
   `screen.paused`, from PR 3b), "The share has ended", "This link was turned
   off", "This link doesn't work: the share has ended or the link was turned
   off.", a busy line and a lost-connection line, in Polish or English. With
-  `--web-root` the server serves it at `/watch` with `Referrer-Policy:
-  no-referrer` and `Cache-Control: no-cache`. The official web host must
-  serve `watch.html` at `/watch` too (deployment, not code).
+  `--web-root` the server serves it at `/watch` and `/watch.html` with
+  `Referrer-Policy: no-referrer`, `Cache-Control: no-cache`,
+  `Content-Security-Policy: frame-ancestors 'none'` and `X-Frame-Options:
+  DENY`. The official web host serves it the same way and proxies
+  `/ws/watch` (docs/deploy.md, nginx).
 - **Tests.** `crates/gwar-server/tests/watch_links.rs` runs guests over real
   SRTP against a channel standing in for the bridge, including the PreAuth
   limits by /64 and the 60 s idle close of a guest that stops pinging. The

@@ -102,6 +102,11 @@ describe("sameOriginUrl", () => {
     expect(sameOriginUrl(https)).toBe("wss://voice.example.com/ws");
     expect(sameOriginUrl(http)).toBe("ws://localhost:5173/ws");
   });
+
+  it("brackets an IPv6 host once, whether or not the page already did", () => {
+    expect(sameOriginUrl({ protocol: "http:", hostname: new URL("http://[::1]:8790/").hostname, port: "8790" })).toBe("ws://[::1]:8790/ws");
+    expect(sameOriginUrl({ protocol: "https:", hostname: "2001:db8::7", port: "" })).toBe("wss://[2001:db8::7]/ws");
+  });
 });
 
 // File URLs are capabilities on the selected server, never arbitrary URLs.

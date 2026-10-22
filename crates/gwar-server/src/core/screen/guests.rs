@@ -34,11 +34,14 @@ impl std::fmt::Debug for WatchUrl {
 #[derive(Debug)]
 pub enum GuestMsg {
     /// The first frame. The core queues the reply on `out` and answers the guest's id, or `None`
-    /// when it refused (the error is queued too).
+    /// when it refused (the error is queued too). The core holds `held` exactly as long as the
+    /// guest: dropping it tells the gateway to stop writing at once, even into a socket the
+    /// guest no longer reads.
     Watch {
         id: u32,
-        token: String,
+        token: WatchToken,
         out: OutboundTx,
+        held: oneshot::Sender<()>,
         reply: oneshot::Sender<Option<SessionId>>,
     },
     Offer {
@@ -60,6 +63,8 @@ pub enum GuestMsg {
 pub(in crate::core) struct Guest {
     share: String,
     out: OutboundTx,
+    /// Dropped with the guest: the gateway's writer stops (see [`GuestMsg::Watch`]).
+    _held: oneshot::Sender<()>,
     watch: Option<Watch>,
     /// Admission order: when 3b's budget reclaims guest reservations for a member, the newest
     /// guest goes first.
@@ -183,8 +188,8 @@ impl Core {
 
     pub(in crate::core) fn guest_msg(&mut self, msg: GuestMsg) {
         match msg {
-            GuestMsg::Watch { id, token, out, reply } => {
-                let admitted = match self.admit_guest(&token, out.clone()) {
+            GuestMsg::Watch { id, token, out, held, reply } => {
+                let admitted = match self.admit_guest(&token.0, out.clone(), held) {
                     Ok((guest, response)) => {
                         let _ = out.try_send(Outbound::Frame(encode(&ServerFrame::Ok { re: id, ok: response })));
                         Some(guest)
@@ -217,7 +222,12 @@ impl Core {
     }
 
     /// `guest.watch`: one generic `not_found` for an unknown, ended or turned-off token alike.
-    fn admit_guest(&mut self, token: &str, out: OutboundTx) -> Result<(SessionId, Response), ErrorBody> {
+    fn admit_guest(
+        &mut self,
+        token: &str,
+        out: OutboundTx,
+        held: oneshot::Sender<()>,
+    ) -> Result<(SessionId, Response), ErrorBody> {
         let not_found = || err(ErrorCode::NotFound, "this link does not work");
         if token.len() > 64 {
             return Err(not_found());
@@ -237,7 +247,7 @@ impl Core {
         let (sharer, preset) = (share.sharer, share.preset);
         let guest = self.allocate_session();
         let since = self.next_connection();
-        self.guests.insert(guest, Guest { share: id.clone(), out, watch: None, since });
+        self.guests.insert(guest, Guest { share: id.clone(), out, _held: held, watch: None, since });
         self.shares.get_mut(&id).expect("found above").guests.insert(guest);
         self.send_viewers(&id);
         let sharer = self.sessions.get(&sharer).map(|s| s.nickname.clone()).unwrap_or_default();
@@ -419,7 +429,8 @@ mod tests {
     /// `guest.watch` with `token`: the guest's id, or the error it was answered with.
     async fn guest(core: &CoreHandle, token: &str) -> Result<SessionId, ErrorBody> {
         let (out, mut frames) = mpsc::channel(OUTBOUND_QUEUE);
-        let admitted = core.guest_watch(1, token.into(), out).await;
+        let (held, _gone) = oneshot::channel();
+        let admitted = core.guest_watch(1, WatchToken(token.into()), out, held).await;
         let Some(Outbound::Frame(frame)) = frames.recv().await else { panic!("a reply") };
         // Kept: a guest whose queue closes is let go.
         std::mem::forget(frames);
@@ -482,6 +493,34 @@ mod tests {
             (refused.code, refused.message.as_str()),
             (ErrorCode::Busy, "this share has as many viewers as allowed")
         );
+    }
+
+    #[test]
+    fn a_guests_token_never_shows_in_debug_output() {
+        let secret = "s3cr3t-Watch-Token_0123456789abcdefghijklmno";
+        let (out, _frames) = mpsc::channel(1);
+        let (held, _gone) = oneshot::channel();
+        let (reply, _rx) = oneshot::channel();
+        let msg = GuestMsg::Watch { id: 1, token: WatchToken(secret.into()), out, held, reply };
+        let shown = format!("{msg:?} {msg:#?}");
+        assert!(!shown.contains(secret), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_guest_tells_its_connection_at_once() {
+        let (core, _notes) = core_with_bridge().await;
+        let token = linked_share(&core, 0).await;
+        let (out, _frames) = mpsc::channel(OUTBOUND_QUEUE);
+        let (held, mut gone) = oneshot::channel();
+        let guest = core.guest_watch(1, WatchToken(token.clone()), out, held).await.unwrap();
+        assert!(gone.try_recv().is_err(), "held while the guest is");
+        on_core(&core, move |core| core.turn_off_link("S")).await;
+        assert!(core.guest_watch(2, WatchToken(token), mpsc::channel(1).0, oneshot::channel().0).await.is_none());
+        assert!(matches!(gone.try_recv(), Err(oneshot::error::TryRecvError::Closed)), "guest {guest} let go");
+        // A refused guest's signal goes with the refusal.
+        let (held, gone) = oneshot::channel();
+        assert!(core.guest_watch(3, WatchToken("unknown".into()), mpsc::channel(1).0, held).await.is_none());
+        assert!(gone.await.is_err());
     }
 
     #[tokio::test]

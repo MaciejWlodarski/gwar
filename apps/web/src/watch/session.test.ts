@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { pageContextFromLocation } from "../net/address";
 import type { WatchParams } from "../voice/screen";
 import { PING_INTERVAL_MS, readToken, watchEndpoint, WatchSession, type SocketLike, type WatchStatus } from "./session";
 import { watchText } from "./text";
@@ -55,6 +56,14 @@ describe("watch page endpoint and token", () => {
     expect(watchEndpoint("", { protocol: "http:", hostname: "127.0.0.1", port: "8790" })).toBe("ws://127.0.0.1:8790/ws/watch");
     // A secure page never talks to a plaintext remote server.
     expect(watchEndpoint(`?server=${encodeURIComponent("ws://other.example/ws")}`, page)).toBeNull();
+  });
+
+  it("opens a same-origin IPv6 page's server, as the browser names its host", () => {
+    for (const href of ["http://[::1]:8790/watch", "https://[2001:db8::7]/watch"]) {
+      const url = new URL(href);
+      const expected = `${url.protocol === "https:" ? "wss" : "ws"}://${url.host}/ws/watch`;
+      expect(watchEndpoint("", pageContextFromLocation(url))).toBe(expected);
+    }
   });
 
   it("takes only a 43-character base64url token from the fragment", () => {

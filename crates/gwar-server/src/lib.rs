@@ -396,25 +396,29 @@ pub async fn start(config: Config) -> Result<Running> {
         .with_state(gateway);
     if let Some(root) = config.web_root {
         let index = root.join("index.html");
-        // The guests' watch page (a second entry of the web app) never sends a Referer.
+        // The guests' watch page (a second entry of the web app) never sends a Referer, and no
+        // other site may frame it. `/watch.html` is the same page with the same headers.
         let watch = root.join("watch.html");
-        app = app.route(
-            "/watch",
-            get(move || async move {
+        let page = get(move || {
+            let watch = watch.clone();
+            async move {
                 match tokio::fs::read(&watch).await {
                     Ok(page) => (
                         [
                             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
                             (header::REFERRER_POLICY, "no-referrer"),
                             (header::CACHE_CONTROL, "no-cache"),
+                            (header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'"),
+                            (header::X_FRAME_OPTIONS, "DENY"),
                         ],
                         page,
                     )
                         .into_response(),
                     Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
                 }
-            }),
-        );
+            }
+        });
+        app = app.route("/watch", page.clone()).route("/watch.html", page);
         app = app.fallback_service(ServeDir::new(root).fallback(ServeFile::new(index)));
     }
     if let Some(url) = config.connect_url {

@@ -490,10 +490,27 @@ pub enum PuppetCmd {
     Text {
         mode: u8,
         target: u16,
-        text: String,
+        text: MessageText,
         channel: Option<ChannelText>,
     },
     Quit,
+}
+
+/// A chat message on its way to TeamSpeak. Its `Debug` gives only its length: commands are
+/// logged, and a message may carry what logs must not (a watch link's token, people's chat).
+#[derive(Clone, PartialEq, Eq)]
+pub struct MessageText(pub String);
+
+impl std::fmt::Debug for MessageText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MessageText({} bytes)", self.0.len())
+    }
+}
+
+impl From<&str> for MessageText {
+    fn from(text: &str) -> Self {
+        Self(text.to_owned())
+    }
 }
 
 #[derive(Debug)]
@@ -966,8 +983,8 @@ async fn run(
                 }
                 if let PuppetCmd::Text { channel: Some(target), text, .. } = cmd {
                     match channel_text(own_channel(&con), moving.as_ref().map(|m| m.cid), route, target) {
-                        TextNow::Send => send_channel_text(&mut con, &mut pending, text),
-                        TextNow::Wait if waiting.len() < 64 => waiting.push((target.cid, text)),
+                        TextNow::Send => send_channel_text(&mut con, &mut pending, text.0),
+                        TextNow::Wait if waiting.len() < 64 => waiting.push((target.cid, text.0)),
                         TextNow::Wait | TextNow::Drop => {
                             debug!(session = spec.session, "channel text dropped across a move")
                         }
@@ -1191,7 +1208,7 @@ fn command_for(clid: u16, cmd: PuppetCmd) -> Option<OutCommand> {
         ),
         PuppetCmd::Text { mode, target, text, .. } => {
             // Only private messages name a target; channel and server ones must not.
-            let mut args = vec![("targetmode", mode.to_string()), ("msg", text)];
+            let mut args = vec![("targetmode", mode.to_string()), ("msg", text.0)];
             if mode == 1 {
                 args.push(("target", target.to_string()));
             }

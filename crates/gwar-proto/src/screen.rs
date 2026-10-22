@@ -3,6 +3,18 @@
 //! participation.
 use super::*;
 
+/// A watch link's token (docs/screen-share.md, "The link and its token"): a bearer secret, so
+/// its `Debug` shows none of it, and neither does any frame or message that carries it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WatchToken(pub String);
+
+impl std::fmt::Debug for WatchToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WatchToken(..)")
+    }
+}
+
 wire! {
     /// What the sharer picked, for display only.
     #[derive(Copy, Eq)]
@@ -75,7 +87,10 @@ wire! {
         /// The first frame: the watch link's token. Answers [`Response::Watching`], or `not_found`
         /// alike for an unknown, ended or revoked token.
         #[serde(rename = "guest.watch")]
-        Watch { token: String },
+        Watch {
+            #[cfg_attr(feature = "ts", ts(type = "string"))]
+            token: WatchToken,
+        },
         /// The guest's watch transport: one `recvonly` video slot. Once per connection; a second
         /// one closes it.
         #[serde(rename = "guest.offer")]
@@ -145,7 +160,7 @@ mod tests {
     fn guests_speak_only_the_watch_ops() {
         let frame: GuestFrame =
             serde_json::from_value(json!({"id": 1, "op": "guest.watch", "d": {"token": "t"}})).unwrap();
-        assert_eq!(frame.request, GuestRequest::Watch { token: "t".into() });
+        assert_eq!(frame.request, GuestRequest::Watch { token: WatchToken("t".into()) });
         let ping: GuestFrame = serde_json::from_value(json!({"id": 2, "op": "ping", "d": {}})).unwrap();
         assert_eq!(ping.request, GuestRequest::Ping {});
         for op in ["hello", "join", "screen.watch", "screen.watch.offer", "chat.send", "channel.join"] {
@@ -162,6 +177,19 @@ mod tests {
         let text = serde_json::to_string(&reply).unwrap();
         assert_eq!(text, r#"{"re":1,"ok":{"share":"s","sharer":"alice","preset":"text","ice_servers":[]}}"#);
         assert_eq!(serde_json::from_str::<ServerFrame>(&text).unwrap(), reply);
+    }
+
+    #[test]
+    fn a_watch_token_never_shows_in_debug_output() {
+        let secret = "s3cr3t-Watch-Token_0123456789abcdefghijklmno";
+        let raw = json!({"id": 1, "op": "guest.watch", "d": {"token": secret}});
+        let frame: GuestFrame = serde_json::from_value(raw.clone()).unwrap();
+        for shown in [format!("{frame:?}"), format!("{frame:#?}"), format!("{:?}", frame.request)] {
+            assert!(!shown.contains(secret), "{shown}");
+            assert!(shown.contains("WatchToken(..)"), "{shown}");
+        }
+        // The wire form is the token itself.
+        assert_eq!(serde_json::to_value(&frame).unwrap(), raw);
     }
 
     #[test]

@@ -31,7 +31,7 @@ use super::{
     install,
     listeners::{self, ChannelListeners},
     process::{ProcessConfig, TsProcess},
-    puppet::{self, ChannelText, PuppetCmd, PuppetEvent, PuppetHandle, PuppetSpec, Shared},
+    puppet::{self, ChannelText, MessageText, PuppetCmd, PuppetEvent, PuppetHandle, PuppetSpec, Shared},
     query::{Cmd, Query, QueryError, Record},
 };
 use crate::{
@@ -247,8 +247,9 @@ struct WatchPost {
     channel: ChannelId,
     /// The post: `🖥 {name} is sharing their screen. Watch: {url}`.
     text: String,
-    /// TeamSpeak users who were in the channel when it was posted, or were told since.
-    told: HashSet<u16>,
+    /// TeamSpeak users, by their unique identity (client ids are reused), who read the post
+    /// in the channel or were told since. Only a delivered post or message counts.
+    told: HashSet<String>,
 }
 
 /// A TeamSpeak user, mirrored as a remote session in our core.
@@ -263,6 +264,8 @@ struct Remote {
     talker: Option<bool>,
     /// Their TeamSpeak database id: whispering other TeamSpeak users is a permission on it.
     cldbid: Option<u64>,
+    /// Their TeamSpeak identity (`client_unique_identifier`): unlike `clid`, never another user's.
+    uid: String,
 }
 
 struct Bridge<'a> {
@@ -808,6 +811,7 @@ impl<'a> Bridge<'a> {
             away: away_of(r),
             talker: None,
             cldbid: r.get("client_database_id").and_then(|v| v.parse().ok()),
+            uid: uid.clone(),
         };
         let client = RemoteClient {
             uid: format!("ts:{uid}"),
@@ -1244,44 +1248,67 @@ impl<'a> Bridge<'a> {
         let Some(cid) = self.map.ts(channel) else { return };
         let Some(local) = self.locals.get(&session) else { return };
         let text = watch_text(&local.client.nickname, &url.0);
-        // Everyone in the channel now reads the post; who comes later is told privately.
-        let told: HashSet<u16> = self.remotes.iter().filter(|(_, r)| r.cid == cid).map(|(clid, _)| *clid).collect();
-        let readers = !told.is_empty();
+        let nickname = local.client.nickname.clone();
+        // Who reads the channel now; who comes later is told privately.
+        let readers: Vec<u16> = self.remotes.iter().filter(|(_, r)| r.cid == cid).map(|(clid, _)| *clid).collect();
         let puppet = local
             .puppet
             .as_ref()
             .filter(|_| local.client.channel == Some(channel))
             .map(|p| (p, ChannelText { cid, encrypted: false, route: local.route }));
-        if let Some((puppet, route)) = puppet {
-            for part in split_for_teamspeak(&text) {
-                puppet.send(PuppetCmd::Text { mode: 2, target: 0, text: part, channel: Some(route) });
-            }
-        } else if readers {
-            let signed = signed_text(&local.client.nickname, &text);
-            for part in split_for_teamspeak(&signed) {
+        // The sharer's puppet, if its queue takes every part; else ServerQuery, signed.
+        let parts = split_for_teamspeak(&text);
+        let by_puppet = puppet.is_some_and(|(puppet, route)| {
+            parts.into_iter().all(|part| {
+                puppet.send(PuppetCmd::Text { mode: 2, target: 0, text: MessageText(part), channel: Some(route) })
+            })
+        });
+        let mut posted = by_puppet;
+        if !by_puppet && !readers.is_empty() {
+            posted = true;
+            for part in split_for_teamspeak(&signed_text(&nickname, &text)) {
                 if let Err(e) = self.query_channel_message(cid, part).await {
                     warn!(share, "watch link post: {e:#}");
+                    posted = false;
+                    break;
                 }
             }
         }
+        // Those in the channel read the post; if it did not go out, they are told privately.
+        let told: HashSet<String> = if posted {
+            readers.iter().filter_map(|clid| Some(self.remotes.get(clid)?.uid.clone())).collect()
+        } else {
+            HashSet::new()
+        };
         self.links.insert(share, WatchPost { channel, text, told });
-    }
-
-    /// A TeamSpeak user entered channel `cid`: the watch links of shares running there reach them
-    /// once, as a private message from ServerQuery.
-    async fn tell_watch_links(&mut self, clid: u16, cid: u64) {
-        let mut texts = Vec::new();
-        for post in self.links.values_mut() {
-            if self.map.ts(post.channel) == Some(cid) && post.told.insert(clid) {
-                texts.push(post.text.clone());
+        if !posted {
+            for clid in readers {
+                self.tell_watch_links(clid, cid).await;
             }
         }
-        for text in texts {
+    }
+
+    /// A TeamSpeak user is in channel `cid`: the watch links of shares running there that have
+    /// not reached them yet do, as a private message from ServerQuery. They count as told once
+    /// the message went out.
+    async fn tell_watch_links(&mut self, clid: u16, cid: u64) {
+        let Some(uid) = self.remotes.get(&clid).map(|r| r.uid.clone()) else { return };
+        let due: Vec<(String, String)> = self
+            .links
+            .iter()
+            .filter(|(_, post)| self.map.ts(post.channel) == Some(cid) && !post.told.contains(&uid))
+            .map(|(share, post)| (share.clone(), post.text.clone()))
+            .collect();
+        'posts: for (share, text) in due {
             for part in split_for_teamspeak(&text) {
                 let cmd = Cmd::new("sendtextmessage").arg("targetmode", 1).arg("target", clid).arg("msg", part);
                 if let Err(e) = self.query.call(cmd).await {
                     debug!(clid, "watch link message: {e:#}");
+                    continue 'posts;
                 }
+            }
+            if let Some(post) = self.links.get_mut(&share) {
+                post.told.insert(uid.clone());
             }
         }
     }
@@ -1425,7 +1452,7 @@ impl<'a> Bridge<'a> {
         let body = ts_text(&m, self.public_url.as_deref().filter(|_| links));
         if let Some(puppet) = puppet {
             for text in split_for_teamspeak(&body) {
-                puppet.send(PuppetCmd::Text { mode, target, text, channel: channel_text });
+                puppet.send(PuppetCmd::Text { mode, target, text: MessageText(text), channel: channel_text });
             }
             return;
         }
@@ -1828,6 +1855,7 @@ mod tests {
             away: None,
             talker: None,
             cldbid: None,
+            uid: format!("uid-{session}"),
         }
     }
 
@@ -1839,6 +1867,15 @@ mod tests {
 
     /// The same, with `clientinfo` placing the client in `cid`.
     async fn channel_query_at(refuse: bool, cid: u64) -> (Query, Arc<std::sync::Mutex<Vec<String>>>) {
+        channel_query_texts(refuse, cid, Arc::default()).await
+    }
+
+    /// The same, refusing every `sendtextmessage` while `texts_fail` is set.
+    async fn channel_query_texts(
+        refuse: bool,
+        cid: u64,
+        texts_fail: Arc<std::sync::atomic::AtomicBool>,
+    ) -> (Query, Arc<std::sync::Mutex<Vec<String>>>) {
         use tokio::{
             io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
             net::TcpListener,
@@ -1855,7 +1892,9 @@ mod tests {
             while let Ok(Some(line)) = lines.next_line().await {
                 let name = line.split(' ').next().unwrap_or_default().to_owned();
                 seen.lock().unwrap().push(line);
+                let fail = texts_fail.load(std::sync::atomic::Ordering::SeqCst);
                 let reply = match name.as_str() {
+                    "sendtextmessage" if fail => "error id=2568 msg=insufficient\\sclient\\spermissions\n\r",
                     "clientmove" if refuse => "error id=2568 msg=insufficient\\sclient\\spermissions\n\r",
                     "clientinfo" => &format!("cid={cid}\n\rerror id=0 msg=ok\n\r"),
                     "whoami" => "client_id=1\n\rerror id=0 msg=ok\n\r",
@@ -2590,7 +2629,7 @@ mod tests {
         bridge.on_note(watch_link(1)).await;
         let Ok(PuppetCmd::Text { mode, target, text, channel }) = sent.try_recv() else { panic!("a puppet post") };
         assert_eq!((mode, target), (2, 0));
-        assert_eq!(text, format!("🖥 [\u{200B}b]alice is sharing their screen. Watch: {LINK}"));
+        assert_eq!(text.0, format!("🖥 [\u{200B}b]alice is sharing their screen. Watch: {LINK}"));
         assert_eq!(channel, Some(ChannelText { cid: 10, encrypted: false, route: 3 }));
         assert!(messages(&commands).is_empty(), "the puppet posts, not ServerQuery");
         assert!(bridge.links.contains_key("S"));
@@ -2665,6 +2704,82 @@ mod tests {
             assert!(messages(&commands).is_empty(), "channel {channel}, {access:?}: no ServerQuery post");
             assert!(bridge.links.is_empty(), "channel {channel}, {access:?}: nothing kept");
         }
+    }
+
+    #[tokio::test]
+    async fn a_puppet_that_cannot_take_the_post_leaves_it_to_serverquery() {
+        let (query, commands) = channel_query(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
+        let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
+        // A puppet whose queue is gone takes nothing.
+        let (cmds, sent) = mpsc::channel(8);
+        drop(sent);
+        bridge.locals.get_mut(&500).unwrap().puppet = Some(PuppetHandle::for_test(cmds));
+        bridge.remotes.insert(7, remote(70, 10));
+        bridge.on_note(watch_link(1)).await;
+        let text = format!("🖥 [\u{200B}b]alice is sharing their screen. Watch: {LINK}");
+        let signed = format!("[\u{200B}[\u{200B}b]alice] {text}");
+        assert_eq!(messages(&commands), vec![("2".into(), "10".into(), signed)]);
+        // The reader read it there and is not told again.
+        bridge.client_moved(7, 20).await;
+        bridge.client_moved(7, 10).await;
+        assert_eq!(messages(&commands).len(), 1);
+        assert_eq!(bridge.links["S"].told, HashSet::from(["uid-70".to_owned()]));
+    }
+
+    #[tokio::test]
+    async fn readers_count_as_told_only_once_a_message_went_out() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (query, commands) = channel_query_texts(false, 10, fail.clone()).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
+        let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
+        bridge.remotes.insert(7, remote(70, 10));
+        // Neither the signed post nor the private message to the reader goes out.
+        bridge.on_note(watch_link(1)).await;
+        assert!(bridge.links["S"].told.is_empty(), "nobody was told");
+        // Back and forth once ServerQuery may post again: the reader is told now, once.
+        fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        commands.lock().unwrap().clear();
+        bridge.client_moved(7, 20).await;
+        bridge.client_moved(7, 10).await;
+        let text = format!("🖥 [\u{200B}b]alice is sharing their screen. Watch: {LINK}");
+        assert_eq!(messages(&commands), vec![("1".into(), "7".into(), text)]);
+        bridge.client_moved(7, 20).await;
+        bridge.client_moved(7, 10).await;
+        assert_eq!(messages(&commands).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_late_joiner_who_gets_a_former_users_client_id_is_still_told() {
+        let (query, commands) = channel_query(false).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut identities = Identities::load(&dir.path().join("identities.json")).unwrap();
+        let (mut bridge, _core) = watch_bridge(query, dir.path(), &mut identities, FileAccess::Link).await;
+        bridge.on_note(watch_link(1)).await;
+        bridge.remotes.insert(7, remote(70, 20));
+        bridge.client_moved(7, 10).await;
+        assert_eq!(messages(&commands).len(), 1);
+        // They leave; someone else connects and TeamSpeak hands them the same client id.
+        bridge.remotes.remove(&7);
+        bridge.remotes.insert(7, remote(71, 20));
+        bridge.client_moved(7, 10).await;
+        let told: Vec<_> = messages(&commands).into_iter().map(|(mode, target, _)| (mode, target)).collect();
+        assert_eq!(told, vec![("1".into(), "7".into()), ("1".into(), "7".into())], "both users get the link");
+    }
+
+    #[test]
+    fn a_queued_puppet_post_never_shows_its_link_in_debug_output() {
+        let cmd = PuppetCmd::Text {
+            mode: 2,
+            target: 0,
+            text: MessageText(watch_text("alice", LINK)),
+            channel: Some(ChannelText { cid: 10, encrypted: false, route: 3 }),
+        };
+        let shown = format!("{cmd:?} {cmd:#?}");
+        let token = LINK.split('#').nth(1).unwrap();
+        assert!(!shown.contains(token) && !shown.contains("watch"), "{shown}");
     }
 
     #[tokio::test]

@@ -47,7 +47,7 @@ use gwar_proto::{
     Channel, ChannelAccess, ChannelCreate, ChannelId, ChannelUpdate, ChatMessage, ChatTarget, Client, ClientUpdate,
     DeviceCertificate, ErrorBody, ErrorCode, Event, FileAccess, Group, GroupId, IceServer, LeaveReason, MessageId,
     MessageSignature, NICKNAME_MAX_LEN, Permission, Platform, Request, Response, ServerFrame, ServerInfo, SessionId,
-    Uid, Unread, Welcome,
+    Uid, Unread, WatchToken, Welcome,
 };
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -280,9 +280,15 @@ impl CoreHandle {
 
     /// A guest's `guest.watch`: the core queues the reply on `out`; the guest's id, or `None`
     /// when refused.
-    pub async fn guest_watch(&self, id: u32, token: String, out: OutboundTx) -> Option<SessionId> {
+    pub async fn guest_watch(
+        &self,
+        id: u32,
+        token: WatchToken,
+        out: OutboundTx,
+        held: oneshot::Sender<()>,
+    ) -> Option<SessionId> {
         let (reply, rx) = oneshot::channel();
-        self.tx.send(CoreMsg::Guest(GuestMsg::Watch { id, token, out, reply })).await.ok()?;
+        self.tx.send(CoreMsg::Guest(GuestMsg::Watch { id, token, out, held, reply })).await.ok()?;
         rx.await.ok().flatten()
     }
 

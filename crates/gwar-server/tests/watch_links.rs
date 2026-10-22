@@ -338,6 +338,69 @@ async fn watch_connections_are_held_to_the_preauth_limits_by_subscriber() {
 }
 
 #[tokio::test]
+async fn guests_that_stop_reading_free_their_places_once_let_go() {
+    let (server, mut notes) = linked_server(|_| {}).await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let general = seed_channel(&alice, "General");
+    let share = share_linked(&mut alice, general).await;
+    let (_, token) = next_link(&mut notes).await;
+    // Three guests from one subscriber that never read again once admitted: no frame, no reply
+    // to the server's close.
+    let mut silent = Vec::new();
+    for _ in 0..3 {
+        let mut guest = Guest::connect(&server, "192.0.2.80").await;
+        guest.watch(&token).await.unwrap();
+        silent.push(guest);
+    }
+    assert_eq!(Guest::open(&server, "192.0.2.80").await.err(), Some(429));
+    alice.ok("screen.link.revoke", json!({"share": share})).await;
+    alice.next_event_where("screen.viewers", |v| v["guests"] == 0).await;
+    // Their connections end within the flush bound, well before any offer or idle deadline,
+    // and the subscriber may connect again.
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while Guest::open(&server, "192.0.2.80").await.is_err() {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("the silent guests' places to free");
+    assert!(started.elapsed() < Duration::from_secs(8));
+    drop(silent);
+}
+
+#[tokio::test]
+async fn a_second_watch_or_offer_closes_the_connection_even_past_the_rate_limit() {
+    let (server, mut notes) = linked_server(|_| {}).await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let general = seed_channel(&alice, "General");
+    share_linked(&mut alice, general).await;
+    let (_, token) = next_link(&mut notes).await;
+    for (i, offer_first) in [false, true].into_iter().enumerate() {
+        let mut guest = Guest::connect(&server, &format!("198.51.100.{}", 60 + i)).await;
+        guest.watch(&token).await.unwrap();
+        let _viewer = if offer_first { Some(guest.offer().await) } else { None };
+        // Empty the bucket: the next frames are past the rate limit.
+        for _ in 0..45 {
+            guest.send("ping", json!({})).await;
+        }
+        if offer_first {
+            guest.send("guest.offer", json!({"sdp": "v=0"})).await;
+        } else {
+            guest.send("guest.watch", json!({"token": token})).await;
+        }
+        // Answers to the pings, and refusals, may come first; then the connection closes.
+        within("the connection to close", async {
+            while let Some(frame) = recv(&mut guest.ws).await {
+                let ok = frame.get("ok").is_some() || frame["err"]["code"] == "rate_limited";
+                assert!(ok, "unexpected {frame}");
+            }
+        })
+        .await;
+    }
+}
+
+#[tokio::test]
 async fn ten_guests_per_share_at_most() {
     let (server, mut notes) = linked_server(|_| {}).await;
     let mut alice = Client::connect(&server, "alice").await;
@@ -508,14 +571,21 @@ fn links_open_this_servers_page_or_the_web_app_with_the_server() {
 }
 
 #[tokio::test]
-async fn the_watch_page_is_served_without_referrers() {
+async fn the_watch_page_is_served_without_referrers_or_framing() {
     let root = tempfile::tempdir().unwrap();
     std::fs::write(root.path().join("index.html"), "app").unwrap();
     std::fs::write(root.path().join("watch.html"), "watch page").unwrap();
     let dir = root.path().to_owned();
     let server = TestServer::start_with(move |c| c.web_root = Some(dir)).await;
-    let response = reqwest::get(format!("{}/watch", server.http())).await.unwrap();
-    assert_eq!(response.status(), 200);
-    assert_eq!(response.headers()["referrer-policy"], "no-referrer");
-    assert_eq!(response.text().await.unwrap(), "watch page");
+    for path in ["/watch", "/watch.html"] {
+        let response = reqwest::get(format!("{}{path}", server.http())).await.unwrap();
+        assert_eq!(response.status(), 200, "{path}");
+        let headers = response.headers();
+        assert_eq!(headers["referrer-policy"], "no-referrer", "{path}");
+        // No other site frames it.
+        assert_eq!(headers["content-security-policy"], "frame-ancestors 'none'", "{path}");
+        assert_eq!(headers["x-frame-options"], "DENY", "{path}");
+        assert_eq!(headers["cache-control"], "no-cache", "{path}");
+        assert_eq!(response.text().await.unwrap(), "watch page");
+    }
 }

@@ -220,8 +220,23 @@ async function share(page, server, postLink) {
 
 async function guest(browser, name, url) {
   const page = await newPage(browser, name, false);
+  // Every request the page makes, with the headers it actually sent.
+  page.sent = [];
+  page.on("request", request => { void request.allHeaders().then(headers => page.sent.push({ url: request.url(), headers })); });
+  page.on("websocket", ws => page.sent.push({ url: ws.url(), headers: {} }));
   await page.goto(url);
   return page;
+}
+
+/** The token goes nowhere but the page's own fragment: in no request URL and in no Referer. */
+function sentNoToken(page, url) {
+  const token = url.split("#")[1];
+  assert.ok(page.sent.length > 1, `${page.deviceName} made requests`);
+  for (const { url: sent, headers } of page.sent) {
+    assert.ok(!sent.includes(token), `${page.deviceName}: the token in ${sent}`);
+    const referer = Object.entries(headers).find(([name]) => name.toLowerCase() === "referer")?.[1];
+    assert.equal(referer, undefined, `${page.deviceName}: a Referer (${referer}) on ${sent}`);
+  }
 }
 const statusLine = page => page.locator("#status");
 
@@ -246,7 +261,7 @@ async function run(browsers, web, ws, token, server) {
     await keepsDecoding(page, "guest watches through the link");
     await painted(page, "guest watches through the link");
     // The page never carries the token anywhere but its own fragment.
-    assert.equal(await page.evaluate(() => document.referrer), "");
+    sentNoToken(page, url);
   }
   await sharer.getByTestId("screen-ts-link").getByText("TeamSpeak link on · 2 guests").waitFor({ timeout: 10_000 });
   checks.push({ check: "sharing bar counts guests", ok: true });
