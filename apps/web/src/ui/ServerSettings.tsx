@@ -160,6 +160,7 @@ function OverviewTab() {
   const [password, setPassword] = useState("");
   const [removePassword, setRemovePassword] = useState(false);
   const [membersOnlyFiles, setMembersOnlyFiles] = useState(server?.file_access === "members");
+  const [guestLinks, setGuestLinks] = useState(server?.screen_guest_links ?? true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const options = useMemo(() => sortedChannels(Object.values(channels)).map((c) => ({ value: String(c.id), label: c.name })), [channels]);
@@ -182,6 +183,7 @@ function OverviewTab() {
       else if (password) update.password = password;
       const fileAccess = membersOnlyFiles ? "members" : "link";
       if (fileAccess !== server?.file_access) update.file_access = fileAccess;
+      if (server?.teamspeak && guestLinks !== server.screen_guest_links) update.screen_guest_links = guestLinks;
     }
     setBusy(true);
     setError(null);
@@ -245,6 +247,9 @@ function OverviewTab() {
             {t("ss.removePassword")}
           </label>
           <Switch checked={membersOnlyFiles} onCheckedChange={setMembersOnlyFiles} label={t("ss.membersOnlyFiles")} description={t("ss.membersOnlyFilesHint")} />
+          {server?.teamspeak && (
+            <Switch checked={guestLinks} onCheckedChange={setGuestLinks} label={t("ss.screenGuestLinks")} description={t("ss.screenGuestLinksHint")} />
+          )}
         </>
       )}
       <ErrorLine>{error}</ErrorLine>

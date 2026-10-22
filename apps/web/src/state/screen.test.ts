@@ -17,8 +17,10 @@ describe("own share", () => {
     expect(s.own).toMatchObject({ phase: "starting", share: "A" });
     // Someone else's share going live is not mine.
     expect(run(s, { type: "live", share: "B" }).own?.phase).toBe("starting");
-    s = run(s, { type: "live", share: "A" }, { type: "viewers", share: "A", members: 3 }, { type: "viewers", share: "B", members: 9 });
-    expect(s.own).toMatchObject({ phase: "live", viewers: 3 });
+    s = run(s, { type: "live", share: "A" }, { type: "viewers", share: "A", members: 3, guests: 2 }, { type: "viewers", share: "B", members: 9, guests: 9 });
+    expect(s.own).toMatchObject({ phase: "live", viewers: 3, guests: 2 });
+    // The checkbox belongs to the preset menu: once started it stays as confirmed.
+    expect(run(s, { type: "guestLink", on: false }).own?.guestLink).toBe(true);
     expect(run(s, { type: "ownEnded", attempt: 1 }).own).toBeNull();
   });
 

@@ -45,7 +45,7 @@ function fakeBridge(reply?: (op: string) => unknown) {
       if (command === "ts_connect") {
         // An event races the welcome reply.
         listeners.get("ts://event")?.({ session: args?.session, frame: JSON.stringify({ ev: "voice.talking", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, client: 1, talking: true } }) } as never);
-        return { session: 1, uid: "uid", server: { name: "TS", welcome: "", version: "1", default_channel: 1, max_clients: 64, upload_limit: 0, file_access: "link", teamspeak: true, server_chat: { encrypted: false, history: false } }, permissions: [], groups: [], channels: [], clients: [], members: [], unread: [], conversations: [], ice_servers: [], file_access: "" };
+        return { session: 1, uid: "uid", server: { name: "TS", welcome: "", version: "1", default_channel: 1, max_clients: 64, upload_limit: 0, file_access: "link", teamspeak: true, screen_guest_links: true, server_chat: { encrypted: false, history: false } }, permissions: [], groups: [], channels: [], clients: [], members: [], unread: [], conversations: [], ice_servers: [], file_access: "" };
       }
       if (command === "ts_request") {
         if (reply) return reply(String(args?.op));
