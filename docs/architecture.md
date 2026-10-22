@@ -570,7 +570,11 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
       (`vendor/tsclientlib/GWAR-PATCH.md`): an offer after the deadline is
       ignored, and the adapter connects, sends the key and reads the file on
       a task of its own under that one deadline, cancelled with the
-      connection. A transfer keeps its slot until that task has ended (one
+      connection. It connects only to the server it is connected to: the
+      live connection's IP (a host name is not looked up again) at the
+      offer's port. An offer whose `ip` is anything but empty, a placeholder
+      (`0.0.0.0`, `::`) or that same IP is ignored, so nothing connects, and
+      the file counts as wrong. A transfer keeps its slot until that task has ended (one
       asked for and not yet offered runs nothing, so its slot frees at the
       deadline). A file must be a PNG, JPEG, GIF or WebP by its first bytes,
       whatever TeamSpeak calls it: SVG and anything else is refused.
@@ -581,7 +585,8 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
       considered. A full cache drops images no longer shown; an image that
       finds it full of images still shown waits, and is fetched again once
       that much room can be made. A file that was wrong (missing, refused,
-      too large, no image) is not asked for again while it is shown; one that
+      too large, no image, offered elsewhere) is not asked for again while it
+      is shown; one that
       timed out or whose connection broke is, after 1 and then 5 minutes, 3
       tries in all. No longer shown, a failure is forgotten. Group icons are
       wanted only for the badges sent (the same ordered, cut selection).

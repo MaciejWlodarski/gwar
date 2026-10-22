@@ -1383,10 +1383,11 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                     }
                 }
                 StreamItem::FileDownloadOffered(transfer, offer) => {
-                    // Connected to, keyed and read on a task of its own, within its limit and by its
-                    // deadline; the result comes back as a step. An offer not asked for is ignored.
-                    if let Some((limit, deadline)) = images.offered(transfer.0, offer.size) {
-                        let connect = tokio::net::TcpStream::connect(offer.address);
+                    // Connected to (only ever the server we are connected to), keyed and read on a task
+                    // of its own, within its limit and by its deadline; the result comes back as a
+                    // step. An offer not asked for, or pointing elsewhere, is ignored.
+                    if let Some((address, limit, deadline)) = images.accept(transfer.0, &offer) {
+                        let connect = tokio::net::TcpStream::connect(address);
                         reads.start(transfer.0, connect, offer.key, offer.size, limit, deadline);
                     } else {
                         let start = images.queued();

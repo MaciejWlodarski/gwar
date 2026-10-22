@@ -12,8 +12,10 @@
 //!
 //! A transfer holds its slot until its work has ended. Asked for, it waits for TeamSpeak's offer
 //! (`notifystartdownload`), which tsclientlib hands over without connecting (Gwar's patch, see
-//! `vendor/tsclientlib/GWAR-PATCH.md`); an offer that comes after the deadline is ignored. Then
-//! one task of [`Reads`] connects, sends the key and reads the file, all within the deadline; it
+//! `vendor/tsclientlib/GWAR-PATCH.md`); an offer that comes after the deadline is ignored, and
+//! one that points anywhere but the server we are connected to ([`transfer_address`]) fails the
+//! file. Then one task of [`Reads`] connects, sends the key and reads the file, all within the
+//! deadline; it
 //! keeps the slot until it has ended, and all of them end with the connection. A file that timed
 //! out or whose connection broke is asked for again later, [`RETRIES`] times in all at most.
 //!
@@ -22,6 +24,7 @@
 
 use std::{
     collections::{BTreeSet, HashMap},
+    net::{IpAddr, SocketAddr},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -174,6 +177,20 @@ impl TransferError {
     fn transient(self) -> bool {
         !matches!(self, Self::Size)
     }
+}
+
+/// Where to connect for a download TeamSpeak offered: always the server we are connected to
+/// (`server`, the live connection's address, so a host name is not looked up again), at the
+/// offer's `port`. The offer's `ip` may only say so: none, empty, a placeholder (`0.0.0.0`, `::`)
+/// or that same address, alone or as a comma-separated list of such. Any other host or address,
+/// or port 0, is `None`: nothing is connected to.
+pub fn transfer_address(server: SocketAddr, ip: Option<&str>, port: u16) -> Option<SocketAddr> {
+    let own = server.ip().to_canonical();
+    let ours = |entry: &str| {
+        let entry = entry.trim();
+        entry.is_empty() || entry.parse::<IpAddr>().is_ok_and(|ip| ip.is_unspecified() || ip.to_canonical() == own)
+    };
+    (port != 0 && ip.is_none_or(|ip| ip.split(',').all(ours))).then(|| SocketAddr::new(server.ip(), port))
 }
 
 /// Downloads a file of `size` bytes TeamSpeak offered: connects (`connect`), sends the transfer's
@@ -476,6 +493,22 @@ impl Images {
         }
         flight.stage = Stage::Running;
         Some((limit, flight.deadline))
+    }
+
+    /// TeamSpeak's `offer` for transfer `id`: where to connect, the most to read and the deadline,
+    /// for [`Reads::start`]; `None` to ignore it and connect nowhere (see [`Images::offered`]). An
+    /// offer pointing anywhere but the server we are connected to ([`transfer_address`]) fails
+    /// the file like a wrong one: not asked for again while it is shown.
+    pub fn accept(&mut self, id: u16, offer: &tsclientlib::FileDownloadOffer) -> Option<(SocketAddr, u64, Instant)> {
+        let Some(address) = transfer_address(offer.server, offer.ip.as_deref(), offer.port) else {
+            if let Some(flight) = self.flights.get(&id).filter(|f| f.stage == Stage::Asked) {
+                tracing::debug!(path = %flight.key.path(), ip = ?offer.ip, port = offer.port, "TeamSpeak offered a file elsewhere than its server: ignored");
+                self.end_asked(id, false);
+            }
+            return None;
+        };
+        let (limit, deadline) = self.offered(id, offer.size)?;
+        Some((address, limit, deadline))
     }
 
     /// TeamSpeak refused transfer `id` (a missing file, say). A running download reports itself.
@@ -810,6 +843,54 @@ mod tests {
             }
         }
         assert!(gone);
+    }
+
+    #[test]
+    fn offers_connect_only_to_the_server_we_are_connected_to() {
+        let server: SocketAddr = "192.0.2.7:9987".parse().unwrap();
+        let address: SocketAddr = "192.0.2.7:30033".parse().unwrap();
+        let here = Some(address);
+        let to = |ip: Option<&str>| transfer_address(server, ip, 30033);
+        for ip in [None, Some(""), Some(" "), Some("0.0.0.0"), Some("::"), Some("192.0.2.7"), Some("::ffff:192.0.2.7")]
+        {
+            assert_eq!(to(ip), here, "{ip:?}");
+        }
+        assert_eq!(to(Some("0.0.0.0, ::")), here);
+        assert_eq!(to(Some("0.0.0.0,192.0.2.7")), here);
+        for ip in
+            ["192.0.2.8", "127.0.0.1", "10.0.0.1", "::1", "[::1]", "evil.example", "0.0.0.0,10.0.0.1", "192.0.2.7:80"]
+        {
+            assert_eq!(to(Some(ip)), None, "{ip}");
+        }
+        assert_eq!(transfer_address(server, None, 0), None);
+        let v6: SocketAddr = "[2001:db8::7]:9987".parse().unwrap();
+        assert_eq!(transfer_address(v6, Some("2001:db8::7"), 30033), Some("[2001:db8::7]:30033".parse().unwrap()));
+        assert_eq!(transfer_address(v6, Some("2001:db8::8"), 30033), None);
+
+        // A foreign offer is ignored, so nothing connects, and that file is not asked for again
+        // while it is shown; one without an ip connects to the server.
+        let mut images = Images::new();
+        let (foreign, near) = (ImageKey::Icon(1000), ImageKey::Icon(1001));
+        let start = images.want(BTreeSet::from([foreign.clone(), near.clone()]));
+        let offer = |ip: Option<&str>| tsclientlib::FileDownloadOffer {
+            server,
+            ip: ip.map(Into::into),
+            port: 30033,
+            key: "key".into(),
+            size: 10,
+        };
+        assert_eq!(start.iter().map(|(_, k)| k).collect::<Vec<_>>(), [&foreign, &near]);
+        assert_eq!(images.accept(start[0].0, &offer(Some("10.0.0.1"))), None);
+        assert_eq!(images.busy(), 1, "its slot is free: nothing of it runs");
+        assert_eq!(
+            images.accept(start[1].0, &offer(None)).map(|(a, limit, _)| (a, limit)),
+            Some((address, ICON_LIMIT))
+        );
+        assert_eq!(images.accept(start[1].0, &offer(Some("10.0.0.1"))), None, "offered already");
+        assert_eq!(images.busy(), 1);
+        assert!(images.finished(start[1].0, Ok(PNG.to_vec())));
+        assert!(images.queued().is_empty());
+        assert!(!images.expire(Instant::now() + Duration::from_secs(86_400)), "never due again");
     }
 
     #[test]

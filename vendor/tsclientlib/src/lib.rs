@@ -165,17 +165,72 @@ pub struct FileDownloadResult {
 
 // Gwar: see GWAR-PATCH.md.
 /// A download the TeamSpeak server offered (`notifystartdownload`). tsclientlib does not connect
-/// for it: the application connects to `address`, sends `key` and reads `size` bytes itself, so
-/// it owns the transfer's deadline and cancellation, connect and key write included.
+/// for it: the application decides where to connect, sends `key` and reads `size` bytes itself,
+/// so it owns the transfer's destination, deadline and cancellation, connect and key write
+/// included.
 #[derive(Debug)]
 pub struct FileDownloadOffer {
-	/// Where the file transfer listens: the `ip` the server sent, else the server's address.
-	pub address: SocketAddr,
+	/// The address of the live connection to the server (as resolved and connected to).
+	pub server: SocketAddr,
+	/// The `ip` argument exactly as the server sent it, if it sent one: unparsed, so the
+	/// application can judge any value (empty, a placeholder, a list, a host name).
+	pub ip: Option<String>,
+	/// The file transfer's port.
+	pub port: u16,
 	/// The key to send first on the connection.
 	pub key: String,
 	/// The size of the requested file.
 	pub size: u64,
 }
+
+// Gwar: see GWAR-PATCH.md.
+/// The download offers of a `notifystartdownload` command, read leniently (an `ip` that is no
+/// address does not drop the offer); `None` for any other command. A part that lacks an
+/// argument takes the first part's, as TeamSpeak's lists do; one without the required arguments
+/// is skipped.
+fn download_offers(content: &[u8], server: SocketAddr) -> Option<Vec<(FiletransferHandle, FileDownloadOffer)>> {
+	let (name, parser) = CommandParser::new(content);
+	if name != b"notifystartdownload" {
+		return None;
+	}
+	let mut parts: Vec<Vec<(Vec<u8>, String)>> = vec![Vec::new()];
+	for item in parser {
+		match item {
+			CommandItem::NextCommand => parts.push(Vec::new()),
+			CommandItem::Argument(arg) => {
+				let value = arg.value().get_str().map(|v| v.into_owned()).unwrap_or_default();
+				parts.last_mut().expect("one part").push((arg.name().to_vec(), value));
+			}
+		}
+	}
+	let first = parts[0].clone();
+	let mut offers = Vec::new();
+	for part in &parts {
+		let get = |name: &[u8]| {
+			part.iter().chain(first.iter()).find(|(n, _)| n.as_slice() == name).map(|(_, v)| v.clone())
+		};
+		let offer = (|| {
+			let id = get(b"clientftfid")?.parse().ok()?;
+			let offer = FileDownloadOffer {
+				server,
+				ip: get(b"ip"),
+				port: get(b"port")?.parse().ok()?,
+				key: get(b"ftkey")?,
+				size: get(b"size")?.parse().ok()?,
+			};
+			Some((FiletransferHandle(id), offer))
+		})();
+		match offer {
+			Some(offer) => offers.push(offer),
+			None => warn!("Download offer without its arguments"),
+		}
+	}
+	Some(offers)
+}
+
+/// The result of an upload request.
+///
+/// A file upload can be started by [`Connection::upload_file`].
 
 /// The result of an upload request.
 ///
@@ -1360,6 +1415,13 @@ impl ConnectedConnection {
 		&mut self, book: &mut data::Connection, stream_items: &mut VecDeque<Result<StreamItem>>,
 		options: &mut ConnectOptions, cmd: InCommandBuf,
 	) -> Option<TemporaryDisconnectReason> {
+		// Gwar: download offers are read here, before the strict parse (see GWAR-PATCH.md).
+		if let Some(offers) = download_offers(cmd.data().packet().content(), self.client.address) {
+			for (ft_id, offer) in offers {
+				stream_items.push_back(Ok(StreamItem::FileDownloadOffered(ft_id, offer)));
+			}
+			return None;
+		}
 		let msg = match InMessage::new(cmd.data().packet().header(), cmd.data().packet().content())
 		{
 			Ok(r) => r,
@@ -1388,21 +1450,9 @@ impl ConnectedConnection {
 					handled = false;
 				}
 			}
-		} else if let InMessage::FileDownload(msg) = &msg {
-			for msg in msg.iter() {
-				let ft_id = FiletransferHandle(msg.client_filetransfer_id);
-				let ip = msg.ip.unwrap_or_else(|| self.client.address.ip());
-				let addr = SocketAddr::new(ip, msg.port);
-				let key = msg.filetransfer_key.to_string();
-				let size = msg.size;
-
-				// Gwar: no connection here (see GWAR-PATCH.md). Upstream connected and sent the key
-				// in a future of its own, which the application could neither time out nor cancel.
-				stream_items.push_back(Ok(StreamItem::FileDownloadOffered(
-					ft_id,
-					FileDownloadOffer { address: addr, key, size },
-				)));
-			}
+		} else if let InMessage::FileDownload(_) = &msg {
+			// Gwar: never reached, see download_offers (GWAR-PATCH.md). Upstream connected and sent
+			// the key here, in a future of its own the application could neither time out nor cancel.
 		} else if let InMessage::FileUpload(msg) = &msg {
 			for msg in msg.iter() {
 				let ft_id = FiletransferHandle(msg.client_filetransfer_id);
