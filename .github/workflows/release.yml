@@ -83,9 +83,12 @@ jobs:
         include:
           - name: macos
             os: macos-14
-            # One universal (arm64 + x86_64) disk image.
-            args: --target universal-apple-darwin --bundles dmg
-            files: target/universal-apple-darwin/release/bundle/dmg/*.dmg
+            # One universal (arm64 + x86_64) disk image, and the same app for the updater
+            # (`app` keeps it after the disk image is made; see "macOS update archive").
+            args: --target universal-apple-darwin --bundles app,dmg
+            files: |
+              target/universal-apple-darwin/release/bundle/dmg/*.dmg
+              target/universal-apple-darwin/release/bundle/macos/*.app.tar.gz
           - name: windows
             os: windows-2022
             args: --bundles nsis,msi
@@ -166,6 +169,19 @@ jobs:
           projectPath: apps/desktop
           tauriScript: pnpm tauri
           args: ${{ matrix.args }}
+
+      # The updater installs the macOS app from a tar.gz of it, and the Windows and Linux
+      # installers as they are. Tauri's own updater files (bundle > createUpdaterArtifacts)
+      # would need the signing key in this job; the sign job signs these files instead.
+      - name: macOS update archive
+        if: runner.os == 'macOS'
+        working-directory: target/universal-apple-darwin/release/bundle/macos
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          # The app folder alone, without macOS metadata: the updater unpacks it as Gwar.app.
+          COPYFILE_DISABLE=1 tar --no-mac-metadata --no-xattrs -czf "Gwar_${VERSION}_universal.app.tar.gz" Gwar.app
+          tar -tzf "Gwar_${VERSION}_universal.app.tar.gz" | head -n 5
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
@@ -258,7 +274,7 @@ jobs:
           done < "$files"
           ls -l dist
           missing=0
-          for pattern in '*.dmg' '*-setup.exe' '*.msi' '*.AppImage' '*.deb' \
+          for pattern in '*.dmg' '*.app.tar.gz' '*-setup.exe' '*.msi' '*.AppImage' '*.deb' \
             'gwar-server-*-x86_64-unknown-linux-gnu.tar.gz' 'gwar-server-*-aarch64-unknown-linux-gnu.tar.gz'; do
             if ! compgen -G "dist/$pattern" > /dev/null; then echo "::error::No $pattern was built."; missing=1; fi
           done
@@ -303,11 +319,13 @@ jobs:
 
   # Signs SHA256SUMS with the release key (minisign), so a download can be
   # checked against the key in this repository and not only against a
-  # checksum file that came with it. The key lives only in the `release`
+  # checksum file that came with it. It also signs the files the app's updater
+  # installs and writes latest.json, the update feed the app reads (from the
+  # latest published release). The key lives only in the `release`
   # environment, which accepts `v*` tags and waits for the owner's approval.
   sign:
     if: github.event_name == 'push'
-    needs: release
+    needs: [check, release]
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -323,11 +341,13 @@ jobs:
           path: dist
       - name: Install minisign
         run: sudo apt-get update && sudo apt-get install -y minisign
-      - name: Sign SHA256SUMS
+      - name: Sign SHA256SUMS and the updates
         working-directory: dist
         env:
           MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
           TAG: ${{ github.ref_name }}
+          VERSION: ${{ needs.check.outputs.version }}
+          RELEASE_URL: ${{ github.server_url }}/${{ github.repository }}/releases
         run: |
           if [ -z "$MINISIGN_SECRET_KEY" ]; then
             echo "::error::The release environment has no MINISIGN_SECRET_KEY."; exit 1
@@ -339,7 +359,35 @@ jobs:
           minisign -S -s "$key" -m SHA256SUMS -t "gwar $TAG SHA256SUMS"
           # The signature must check against the public key in the repository.
           minisign -V -p ../docs/release-key.pub -m SHA256SUMS
-      - name: Upload the signature
+
+          # The updater's files: "<updater targets> <file>", one file each. The app looks up
+          # "<os>-<arch>-<installer>" first, then "<os>-<arch>" (tauri-plugin-updater).
+          shopt -s nullglob
+          platforms='{}'
+          for entry in 'darwin-aarch64,darwin-x86_64 *_universal.app.tar.gz' 'windows-x86_64 *-setup.exe' \
+            'windows-x86_64-msi *.msi' 'linux-x86_64 *.AppImage' 'linux-x86_64-deb *.deb'; do
+            targets=${entry%% *}
+            # shellcheck disable=SC2206 # the pattern is meant to expand
+            files=(${entry#* })
+            if [ "${#files[@]}" -ne 1 ] || ! [[ ${files[0]} =~ ^[A-Za-z0-9._+-]+$ ]]; then
+              echo "::error::Expected one plainly named ${entry#* }, found: ${files[*]}"; exit 1
+            fi
+            file=${files[0]}
+            # The updater requires the version in the trusted comment (requireSignedVersion), so
+            # a feed cannot announce an older release's file as a newer version.
+            minisign -S -s "$key" -m "$file" -t "$(printf 'timestamp:%s\tfile:%s\tversion:%s' "$(date +%s)" "$file" "$VERSION")"
+            minisign -V -p ../docs/release-key.pub -m "$file"
+            # Tauri reads the whole .minisig file, in base64.
+            signature=$(base64 -w0 "$file.minisig")
+            for target in ${targets//,/ }; do
+              platforms=$(jq --arg t "$target" --arg url "$RELEASE_URL/download/$TAG/$file" --arg s "$signature" \
+                '.[$t] = {url: $url, signature: $s}' <<< "$platforms")
+            done
+          done
+          jq -n --arg v "$VERSION" --arg notes "$RELEASE_URL/tag/$TAG" --arg date "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --argjson platforms "$platforms" '{version: $v, notes: $notes, pub_date: $date, platforms: $platforms}' > latest.json
+          cat latest.json
+      - name: Upload the signatures and latest.json
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
@@ -348,4 +396,4 @@ jobs:
           if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft)" != "true" ]; then
             echo "::error::Release $TAG is already published; not changing it."; exit 1
           fi
-          gh release upload "$TAG" dist/SHA256SUMS.minisig --repo "$REPO" --clobber
+          gh release upload "$TAG" dist/*.minisig dist/latest.json --repo "$REPO" --clobber

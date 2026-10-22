@@ -9,6 +9,8 @@ mod shortcuts;
 mod tray;
 mod ts;
 mod ts_identity;
+#[cfg(test)]
+mod updater_tests;
 mod voice;
 mod webview;
 
@@ -68,6 +70,10 @@ pub fn run() {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
+        // App updates: the web UI checks, downloads and installs them (platform/updater.ts), then
+        // restarts the app; the feed and the release key are in tauri.conf.json (docs/releasing.md).
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         // TODO: tauri-plugin-autostart (launch at login) once there is a setting for it.
         .manage(voice::Voice::default())
         .manage(shortcuts::Shortcuts::default())

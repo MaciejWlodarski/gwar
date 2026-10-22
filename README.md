@@ -320,7 +320,9 @@ Prebuilt apps are on the [GitHub Releases page](https://github.com/MaciejWlodars
 - **Desktop app:** macOS (universal `.dmg`), Windows (`.exe` or `.msi`) and
   Linux (`.AppImage` or `.deb`). Builds may be unsigned: macOS and Windows then
   warn at the first start, and [docs/releasing.md](docs/releasing.md) shows how
-  to open them anyway.
+  to open them anyway. The app then updates itself: when a new version is out,
+  an icon at the bottom left downloads it, and a click installs it
+  ([how](docs/releasing.md#updates)).
 - **Server:** `gwar-server` and `gwar-connect` for Linux x86-64 and ARM64
   (`gwar-server-*.tar.gz`), so you do not need Rust to run your own. Unpack and
   continue with "Run a server" below, using `./gwar-server` instead of

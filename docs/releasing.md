@@ -35,11 +35,16 @@ GitHub release. Nothing is public until you publish the draft by hand.
    Approving hands the release key to that job, so first check that the run
    is for your tag, on the commit you pushed, and that nobody changed
    `.github/workflows/release.yml` there. Then approve it, and it adds
-   `SHA256SUMS.minisig` to the draft. Approve before publishing; it refuses to
-   change a published release.
-6. Once the sign job has finished and `SHA256SUMS.minisig` is on the draft,
-   open the draft under Releases. Edit the generated notes, optionally
-   download and try a few assets, then press **Publish release**.
+   `SHA256SUMS.minisig`, the signatures of the update files and `latest.json`
+   (see [Updates](#updates)) to the draft. Approve before publishing; it
+   refuses to change a published release.
+6. Once the sign job has finished and `SHA256SUMS.minisig` and `latest.json`
+   are on the draft, open the draft under Releases. Edit the generated notes,
+   optionally download and try a few assets, then press **Publish release**.
+   Publish it as a normal release, with **Set as the latest release** checked:
+   the desktop apps are only offered the latest release, so a pre-release is
+   not offered to them (use that on purpose for a release you do not want
+   installed automatically).
 
 Tags must look like `v1.2.3` (no `-rc1` suffixes: the Windows MSI format does
 not accept them). If a build fails, fix the problem, delete the tag
@@ -60,6 +65,7 @@ job only verifies that all versions agree with each other.
 | File | What |
 | --- | --- |
 | `Gwar_X.Y.Z_universal.dmg` | macOS desktop app, Apple Silicon and Intel, macOS 11+ |
+| `Gwar_X.Y.Z_universal.app.tar.gz` | the same app for the updater (installing by hand: use the `.dmg`) |
 | `Gwar_X.Y.Z_x64-setup.exe` | Windows installer (NSIS) |
 | `Gwar_X.Y.Z_x64_en-US.msi` | Windows installer (MSI) |
 | `Gwar_X.Y.Z_amd64.AppImage` | Linux desktop app, runs anywhere with a recent glibc |
@@ -68,6 +74,8 @@ job only verifies that all versions agree with each other.
 | `gwar-server-vX.Y.Z-aarch64-unknown-linux-gnu.tar.gz` | the same for Linux ARM64 (Oracle Ampere, Raspberry Pi 4/5 with a 64-bit OS) |
 | `SHA256SUMS` | SHA-256 of every file above |
 | `SHA256SUMS.minisig` | minisign signature of `SHA256SUMS` with the release key |
+| `*.minisig` (the others) | signatures of the files the updater installs (`.app.tar.gz`, `-setup.exe`, `.msi`, `.AppImage`, `.deb`) |
+| `latest.json` | the update feed: version, and the URL and signature of each update file |
 
 The desktop file names come from Tauri, so they can differ slightly from this
 table. The server archives hold a folder with `gwar-server`, `gwar-connect`,
@@ -121,9 +129,58 @@ proves where a file was built, not that the code was good.
 None of this removes the operating system warnings below: those need paid
 certificates.
 
+## Updates
+
+The desktop app updates itself from the latest published release
+(`tauri-plugin-updater`). Shortly after it starts, and then every six hours, it
+reads
+`https://github.com/MaciejWlodarski/gwar/releases/latest/download/latest.json`.
+If that names a newer version (compared as semver with the version in
+`tauri.conf.json`), it downloads the update in the background and shows an icon
+at the bottom of the server rail, with the progress in its tooltip. Nothing is
+installed until the user clicks the icon; the app then installs the update and
+restarts, asking first during a call or a screen share. An up-to-date app shows
+no icon, and a failed check (offline, or no published release yet) is retried
+quietly at the next one. A failed download or install shows a warning icon;
+clicking it starts again. The version and the commit an app was built from
+(`v0.1.2 · 31b65bd`, `-dirty` for uncommitted changes) are at the very bottom
+of the rail; clicking copies them, for bug reports.
+
+GitHub's `latest` is the newest published release that is not a pre-release,
+so drafts and pre-releases are never offered. The releases up to v0.1.2 are
+pre-releases without a `latest.json`: until a normal release with one is
+published, the check finds no feed and the apps show nothing.
+
+The app installs these files, listed per platform in `latest.json` (it looks
+up `<os>-<arch>-<installer>` first, then `<os>-<arch>`):
+
+| Feed key | File | Installed app |
+| --- | --- | --- |
+| `darwin-aarch64`, `darwin-x86_64` | `Gwar_X.Y.Z_universal.app.tar.gz` | macOS (replaces `Gwar.app`; asks for an administrator password when the user cannot write there) |
+| `windows-x86_64` | `Gwar_X.Y.Z_x64-setup.exe` | Windows, installed with the setup program (runs it with a progress bar) |
+| `windows-x86_64-msi` | `Gwar_X.Y.Z_x64_en-US.msi` | Windows, installed with the MSI |
+| `linux-x86_64` | `Gwar_X.Y.Z_amd64.AppImage` | the AppImage (replaces the file) |
+| `linux-x86_64-deb` | `Gwar_X.Y.Z_amd64.deb` | the Debian package (`dpkg -i`, asks for a password with `pkexec`) |
+
+The app checks every update file against the release key before installing
+it: the sign job signs each one with `minisign` (the public key is in
+`plugins > updater > pubkey` of `tauri.conf.json`, base64 of
+[release-key.pub](release-key.pub)). Each signature's trusted comment carries
+`version:X.Y.Z`, and the app (`requireSignedVersion`) refuses a file signed for
+another version than `latest.json` announces, so a tampered feed cannot pass
+off an older release as a newer one. `latest.json` itself is not signed.
+
+The build jobs need no key: Tauri's own updater files
+(`bundle > createUpdaterArtifacts`) would need its private key at build time,
+so the workflow packs the macOS app itself and serves the installers as they
+are. Locally built apps (`pnpm tauri build`) check for updates the same way, so
+a local 0.1.2 build is offered 0.1.3 once it is published. `tauri dev` and the
+web app never check.
+
 ## The release key
 
-`SHA256SUMS` is signed with a dedicated minisign key, used for nothing else.
+`SHA256SUMS` and the update files are signed with a dedicated minisign key,
+used for nothing else.
 Its public half is [release-key.pub](release-key.pub); the secret half exists
 only as the `MINISIGN_SECRET_KEY` secret of the `release` environment
 (Settings > Environments). That environment accepts only `v*` tags and needs
@@ -146,9 +203,13 @@ gh secret set MINISIGN_SECRET_KEY --env release < "$dir/release.key" &&
 ```
 
 If `gh secret set` fails, the new key stays in `$dir`; try again from there.
-Then update the key in "Verify a download" above, commit, and say in the next
-release notes that the key changed. Releases signed with the old key stay
-checkable with the old public key from the repository history.
+Then update the key in "Verify a download" above and the updater's key in
+`tauri.conf.json` (`base64 < docs/release-key.pub | tr -d '\n'`; a test of the
+desktop app checks that they match), commit, and say in the next release notes
+that the key changed. Releases signed with the old key stay checkable with the
+old public key from the repository history. Installed apps only accept updates
+signed with the key they were built with, so after a change everyone has to
+install the next version by hand once.
 
 ## Code signing and the secrets
 
