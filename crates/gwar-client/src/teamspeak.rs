@@ -496,16 +496,43 @@ fn badge_channel_groups<'a>(
         .filter(|g| listed.channel.as_ref().is_none_or(|ids| ids.contains(&g.id.0)))
 }
 
-/// The groups worth a badge, with their icons where they are here.
-fn badges(state: &tsclientlib::data::Connection, listed: &GroupLists, images: &Images) -> Vec<Badge> {
-    let icon = |id: tsclientlib::IconId| images.token(ImageKey::icon(id.0));
+/// The badges the view shows (ordered, named and cut as [`ordered_badges`] does), without their
+/// icons, each with its icon's image if that is a file. The one selection both [`badges`] and
+/// [`wanted_images`] use: an icon is wanted exactly when its badge is shown.
+fn badge_catalog(state: &tsclientlib::data::Connection, listed: &GroupLists) -> Vec<(Badge, Option<ImageKey>)> {
+    let mut icons: HashMap<(bool, u32), tsclientlib::IconId> = HashMap::new();
     let server = badge_server_groups(state, listed)
-        .filter_map(|g| badge(BadgeKind::Server, g.id.0, &g.name, g.sort_id, icon(g.icon)))
+        .filter_map(|g| {
+            let badge = badge(BadgeKind::Server, g.id.0, &g.name, g.sort_id, None)?;
+            icons.insert((true, badge.id), g.icon);
+            Some(badge)
+        })
         .collect();
     let channel = badge_channel_groups(state, listed)
-        .filter_map(|g| badge(BadgeKind::Channel, g.id.0, &g.name, g.sort_id, icon(g.icon)))
+        .filter_map(|g| {
+            let badge = badge(BadgeKind::Channel, g.id.0, &g.name, g.sort_id, None)?;
+            icons.insert((false, badge.id), g.icon);
+            Some(badge)
+        })
         .collect();
     ordered_badges(server, channel)
+        .into_iter()
+        .map(|badge| {
+            let icon = icons.get(&(badge.kind == BadgeKind::Server, badge.id)).and_then(|icon| ImageKey::icon(icon.0));
+            (badge, icon)
+        })
+        .collect()
+}
+
+/// The groups worth a badge, with their icons where they are here.
+fn badges(state: &tsclientlib::data::Connection, listed: &GroupLists, images: &Images) -> Vec<Badge> {
+    badge_catalog(state, listed)
+        .into_iter()
+        .map(|(mut badge, icon)| {
+            badge.icon = images.token(icon);
+            badge
+        })
+        .collect()
 }
 
 /// The images the view shows: the server's icon, the badge groups' and channels' icons, and
@@ -513,8 +540,7 @@ fn badges(state: &tsclientlib::data::Connection, listed: &GroupLists, images: &I
 fn wanted_images(state: &tsclientlib::data::Connection, listed: &GroupLists) -> BTreeSet<ImageKey> {
     let mut wanted = BTreeSet::new();
     wanted.extend(ImageKey::icon(state.server.icon.0));
-    wanted.extend(badge_server_groups(state, listed).filter_map(|g| ImageKey::icon(g.icon.0)));
-    wanted.extend(badge_channel_groups(state, listed).filter_map(|g| ImageKey::icon(g.icon.0)));
+    wanted.extend(badge_catalog(state, listed).into_iter().filter_map(|(_, icon)| icon));
     wanted.extend(state.channels.values().filter_map(|c| ImageKey::icon(c.icon?.0)));
     wanted.extend(state.clients.values().filter_map(|c| ImageKey::avatar(&c.uid.as_ref()?.0, &c.avatar_hash)));
     wanted
@@ -536,7 +562,7 @@ fn fetch(con: &mut TsConnection, images: &mut Images, start: Vec<(u16, ImageKey)
         tracing::debug!(id, path = %path, "TeamSpeak image wanted");
         match OutInitDownloadMessage::new(&mut std::iter::once(part)).send_with_result(con) {
             Ok(command) => images.sent(id, command),
-            Err(_) => images.fail(id),
+            Err(_) => images.unsent(id),
         }
     }
 }
@@ -1193,7 +1219,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
     // Icons and avatars follow the Welcome: each shows once it is here, as an update.
     let start = images.want(wanted_images(state, &view.listed));
     fetch(&mut con, &mut images, start);
-    // The files being read; dropped (so aborted) when the connection ends, with tsclientlib's setups.
+    // The downloads under way (connect, key, read); dropped, so aborted, when the connection ends.
     let mut reads = Reads::default();
 
     type ReplyTx = oneshot::Sender<Result<Value, ErrorBody>>;
@@ -1235,7 +1261,7 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
         Item(Option<Result<StreamItem, tsclientlib::Error>>),
         Request(Option<PendingRequest>),
         Mic(Option<TsMicrophone>),
-        Image((u16, Result<Vec<u8>, &'static str>)),
+        Image(images::Transferred),
         Tick,
     }
     loop {
@@ -1356,17 +1382,19 @@ async fn run(options: TsOptions, ready: oneshot::Sender<Result<TsConnected>>) {
                         }
                     }
                 }
-                StreamItem::FileDownload(transfer, file) => {
-                    // Read on a task of its own, within its limit and by its deadline; the result comes back as a step.
-                    if let Some((limit, deadline)) = images.opened(transfer.0, file.size) {
-                        reads.start(transfer.0, file.stream, file.size, limit, deadline);
+                StreamItem::FileDownloadOffered(transfer, offer) => {
+                    // Connected to, keyed and read on a task of its own, within its limit and by its
+                    // deadline; the result comes back as a step. An offer not asked for is ignored.
+                    if let Some((limit, deadline)) = images.offered(transfer.0, offer.size) {
+                        let connect = tokio::net::TcpStream::connect(offer.address);
+                        reads.start(transfer.0, connect, offer.key, offer.size, limit, deadline);
                     } else {
                         let start = images.queued();
                         fetch(&mut con, &mut images, start);
                     }
                 }
                 StreamItem::FiletransferFailed(transfer, _) => {
-                    images.fail(transfer.0);
+                    images.refused(transfer.0);
                     let start = images.queued();
                     fetch(&mut con, &mut images, start);
                 }
@@ -1780,17 +1808,57 @@ mod tests {
         r"notifyservergrouplist sgid=6 name=Server\sAdmin type=1 iconid=300 savedb=1 sortid=0 namemode=0 n_modifyp=75 n_member_addp=75 n_member_removep=75|sgid=8 name=Guest type=1 iconid=0 savedb=0 sortid=0 namemode=0 n_modifyp=75 n_member_addp=0 n_member_removep=0|sgid=9 name=Iconic type=1 iconid=412469435 savedb=1 sortid=0 namemode=0 n_modifyp=100 n_member_addp=100 n_member_removep=100",
     ];
 
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
     /// Lets every transfer `images` asks for bring a PNG.
     fn arrive(images: &mut Images, wanted: BTreeSet<ImageKey>) {
-        const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+        arrive_as(images, wanted, PNG);
+    }
+
+    /// Lets every transfer `images` asks for bring `file`.
+    fn arrive_as(images: &mut Images, wanted: BTreeSet<ImageKey>, file: &[u8]) {
         let mut start = images.want(wanted);
         while !start.is_empty() {
             for (id, _) in start {
-                images.opened(id, PNG.len() as u64).unwrap();
-                images.finished(id, Ok(PNG.to_vec()));
+                images.offered(id, file.len() as u64).unwrap();
+                images.finished(id, Ok(file.to_vec()));
             }
             start = images.queued();
         }
+    }
+
+    #[test]
+    fn only_the_icons_of_badges_shown_are_wanted() {
+        // 600 more groups, each with a full-size icon, their icon ids in the opposite order of
+        // their group ids: only the first BADGES_PER_KIND groups are badges.
+        let groups: Vec<String> = (1..=600u32)
+            .map(|n| {
+                let (id, icon) = (100 + n, 2_000_000 - n);
+                format!(r"sgid={id} name=G{n} type=1 iconid={icon} savedb=1 sortid=0 namemode=0 n_modifyp=0 n_member_addp=0 n_member_removep=0")
+            })
+            .collect();
+        let line = format!("notifyservergrouplist {}", groups.join("|"));
+        let mut lines = SERVER.to_vec();
+        lines.push(&line);
+        let book = book(&lines);
+        let listed = GroupLists::default();
+        let ours = |k: &ImageKey| matches!(k, ImageKey::Icon(id) if (1_999_000..2_000_000).contains(id));
+        let shown: BTreeSet<ImageKey> =
+            badge_catalog(&book, &listed).into_iter().filter_map(|(_, icon)| icon).filter(ours).collect();
+        let wanted = wanted_images(&book, &listed);
+        assert_eq!(wanted.iter().filter(|k| ours(k)).cloned().collect::<BTreeSet<_>>(), shown);
+        assert_eq!(shown.len(), BADGES_PER_KIND - 2, "Server Admin and Iconic come first");
+
+        // So every badge shown gets its icon, and carol her avatar, within the cache.
+        let mut file = PNG.to_vec();
+        file.resize(images::ICON_LIMIT as usize, 0);
+        let mut images = Images::new();
+        arrive_as(&mut images, wanted, &file);
+        let view = view_of(&book, &HashMap::new(), &View::default(), &images);
+        let badges = &view.server.as_ref().unwrap().badges;
+        assert_eq!(badges.iter().filter(|b| b.kind == BadgeKind::Server).count(), BADGES_PER_KIND);
+        assert!(badges.iter().filter(|b| b.name.starts_with('G')).all(|b| b.icon.is_some()));
+        assert!(view.clients[&37].avatar.is_some());
     }
 
     #[test]

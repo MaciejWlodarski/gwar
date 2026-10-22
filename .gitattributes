@@ -1,2 +1,3 @@
 # Preserve upstream formatting in the pinned dependency snapshot.
 vendor/openmls/** linguist-vendored -whitespace
+vendor/tsclientlib/** linguist-vendored -whitespace

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/desktop/src-tauri"]
-exclude = ["vendor/openmls"]
+exclude = ["vendor/openmls", "vendor/tsclientlib"]
 
 [workspace.package]
 edition = "2024"
@@ -51,3 +51,9 @@ strip = true
 # and regrows the tree in one commit. See vendor/openmls/GWAR-PATCH.md.
 [patch.crates-io]
 openmls = { path = "vendor/openmls" }
+
+# tsclientlib connects to a download's file transfer itself, where Gwar can
+# neither time it out nor cancel it; the patch hands the offer over instead.
+# See vendor/tsclientlib/GWAR-PATCH.md.
+[patch."https://github.com/ReSpeak/tsclientlib"]
+tsclientlib = { path = "vendor/tsclientlib" }

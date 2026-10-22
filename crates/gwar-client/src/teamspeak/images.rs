@@ -10,11 +10,12 @@
 //! must be a PNG, JPEG, GIF or WebP image by its first bytes ([`sniff`]); nothing else is kept,
 //! SVG included, whatever the server says the file is.
 //!
-//! A transfer holds its slot until its work has ended, not just until its deadline: tsclientlib
-//! connects to the file transfer and sends the key on its own (no way to cancel that from here),
-//! so a transfer past its deadline keeps its slot until tsclientlib reports it (or for
-//! [`SETUP_GRACE`] at most, longer than any system's TCP connect timeout); the file itself is read
-//! on a task of [`Reads`] that ends by the deadline, and all of them end with the connection.
+//! A transfer holds its slot until its work has ended. Asked for, it waits for TeamSpeak's offer
+//! (`notifystartdownload`), which tsclientlib hands over without connecting (Gwar's patch, see
+//! `vendor/tsclientlib/GWAR-PATCH.md`); an offer that comes after the deadline is ignored. Then
+//! one task of [`Reads`] connects, sends the key and reads the file, all within the deadline; it
+//! keeps the slot until it has ended, and all of them end with the connection. A file that timed
+//! out or whose connection broke is asked for again later, [`RETRIES`] times in all at most.
 //!
 //! The proto shapes carry a token per image ([`ImageKey::token`]) once it is here, never before,
 //! and the UI asks the connection for the bytes by token (`TsHandle::image`).
@@ -26,7 +27,10 @@ use std::{
 };
 
 use sha1::{Digest, Sha1};
-use tokio::{io::AsyncReadExt, time::Instant};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    time::Instant,
+};
 
 /// The largest icon kept. TeamSpeak's icons are 16×16 px, a few hundred bytes.
 pub const ICON_LIMIT: u64 = 64 * 1024;
@@ -36,10 +40,11 @@ pub const AVATAR_LIMIT: u64 = 300 * 1024;
 pub const CONCURRENT: usize = 4;
 /// From asking for a file to having all of it: a transfer's absolute deadline.
 pub const TIMEOUT: Duration = Duration::from_secs(15);
-/// How long a transfer past its deadline keeps its slot while tsclientlib may still be connecting
-/// for it: longer than the systems' TCP connect timeouts (about 21 s on Windows, 75 s on macOS,
-/// 127 s on Linux), after which that work has surely ended.
-pub const SETUP_GRACE: Duration = Duration::from_secs(180);
+/// Tries in all for a file that timed out or whose connection broke, while it is shown: the
+/// second after [`RETRY_DELAY`], each further one after five times the wait before.
+pub const RETRIES: u32 = 3;
+/// The wait before trying a file again the first time.
+pub const RETRY_DELAY: Duration = Duration::from_secs(60);
 /// All images of a connection together, in bytes.
 pub const CACHE_BYTES: usize = 32 << 20;
 /// Images of a connection, at most.
@@ -142,51 +147,95 @@ pub fn sniff(bytes: &[u8]) -> Option<Format> {
     }
 }
 
-/// Reads a file of `size` bytes TeamSpeak announced from its transfer `stream`: all of it, and
-/// at most `limit`, by `deadline`.
-pub async fn read_file(
-    stream: impl tokio::io::AsyncRead + Unpin,
-    size: u64,
-    limit: u64,
-    deadline: Instant,
-) -> Result<Vec<u8>, &'static str> {
-    if size == 0 || size > limit {
-        return Err("too large or empty");
+/// Why a transfer brought no file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransferError {
+    /// Not done by its deadline.
+    TimedOut,
+    /// The connection failed or broke.
+    Failed,
+    /// It ended before the announced size.
+    Short,
+    /// Announced empty or larger than its limit.
+    Size,
+}
+
+impl TransferError {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TimedOut => "timed out",
+            Self::Failed => "transfer failed",
+            Self::Short => "not the announced size",
+            Self::Size => "too large or empty",
+        }
     }
-    let mut data = Vec::with_capacity(size as usize);
-    // Exactly the announced bytes: TeamSpeak may keep the connection open after them.
-    let mut file = stream.take(size);
-    match tokio::time::timeout_at(deadline, file.read_to_end(&mut data)).await {
-        Err(_) => Err("timed out"),
-        Ok(Err(_)) => Err("transfer failed"),
-        Ok(Ok(_)) if data.len() as u64 != size => Err("not the announced size"),
-        Ok(Ok(_)) => Ok(data),
+
+    /// Whether the same file may come another time.
+    fn transient(self) -> bool {
+        !matches!(self, Self::Size)
     }
 }
 
-/// The files being read, each on a task of its own that ends by its transfer's deadline.
+/// Downloads a file of `size` bytes TeamSpeak offered: connects (`connect`), sends the transfer's
+/// `key`, and reads all of the file and at most `limit`, everything by `deadline`.
+pub async fn download<S>(
+    connect: impl Future<Output = std::io::Result<S>>,
+    key: String,
+    size: u64,
+    limit: u64,
+    deadline: Instant,
+) -> Result<Vec<u8>, TransferError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    if size == 0 || size > limit {
+        return Err(TransferError::Size);
+    }
+    let transfer = async {
+        let mut stream = connect.await.map_err(|_| TransferError::Failed)?;
+        stream.write_all(key.as_bytes()).await.map_err(|_| TransferError::Failed)?;
+        stream.flush().await.map_err(|_| TransferError::Failed)?;
+        let mut data = Vec::with_capacity(size as usize);
+        // Exactly the announced bytes: TeamSpeak may keep the connection open after them.
+        let mut file = stream.take(size);
+        file.read_to_end(&mut data).await.map_err(|_| TransferError::Failed)?;
+        if data.len() as u64 != size {
+            return Err(TransferError::Short);
+        }
+        Ok(data)
+    };
+    tokio::time::timeout_at(deadline, transfer).await.unwrap_or(Err(TransferError::TimedOut))
+}
+
+/// A transfer's end: its id and its file.
+pub type Transferred = (u16, Result<Vec<u8>, TransferError>);
+
+/// The transfers under way, each on a task of its own that ends by its deadline ([`download`]).
 /// Dropping this (the connection ended) aborts them all.
 #[derive(Default)]
 pub struct Reads {
-    tasks: tokio::task::JoinSet<(u16, Result<Vec<u8>, &'static str>)>,
+    tasks: tokio::task::JoinSet<Transferred>,
     ids: HashMap<tokio::task::Id, u16>,
 }
 
 impl Reads {
-    /// Reads transfer `id`'s file of `size` bytes from `stream` (see [`read_file`]).
-    pub fn start(
+    /// Downloads transfer `id`'s file (see [`download`]).
+    pub fn start<S>(
         &mut self,
         id: u16,
-        stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+        connect: impl Future<Output = std::io::Result<S>> + Send + 'static,
+        key: String,
         size: u64,
         limit: u64,
         deadline: Instant,
-    ) {
-        let task = self.tasks.spawn(async move { (id, read_file(stream, size, limit, deadline).await) });
+    ) where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let task = self.tasks.spawn(async move { (id, download(connect, key, size, limit, deadline).await) });
         self.ids.insert(task.id(), id);
     }
 
-    /// Reads under way.
+    /// Transfers under way.
     pub fn len(&self) -> usize {
         self.tasks.len()
     }
@@ -195,9 +244,8 @@ impl Reads {
         self.tasks.is_empty()
     }
 
-    /// The next read to end, once its task has: its transfer id and its file. Never, while none
-    /// runs. Cancel safe.
-    pub async fn next(&mut self) -> (u16, Result<Vec<u8>, &'static str>) {
+    /// The next transfer to end, once its task has. Never, while none runs. Cancel safe.
+    pub async fn next(&mut self) -> Transferred {
         loop {
             match self.tasks.join_next_with_id().await {
                 None => std::future::pending::<()>().await,
@@ -207,7 +255,7 @@ impl Reads {
                 }
                 Some(Err(error)) => {
                     if let Some(id) = self.ids.remove(&error.id()) {
-                        return (id, Err("transfer failed"));
+                        return (id, Err(TransferError::Failed));
                     }
                 }
             }
@@ -273,12 +321,10 @@ impl Store {
 /// Where a transfer is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
-    /// Asked for: TeamSpeak answers, then tsclientlib connects to the file transfer.
+    /// Asked for: waiting for TeamSpeak's answer and offer. Nothing of it runs here.
     Asked,
-    /// Its file is being read, on a task of [`Reads`] that ends by the deadline.
-    Reading,
-    /// Past its deadline while asked for: failed, but tsclientlib may still be connecting for it.
-    Expired,
+    /// Offered: a task of [`Reads`] downloads it, by the deadline.
+    Running,
 }
 
 /// A transfer under way: it holds one of the [`CONCURRENT`] slots until its work has ended.
@@ -290,6 +336,13 @@ struct Flight {
     stage: Stage,
 }
 
+/// A shown image whose file did not come.
+struct Failure {
+    tries: u32,
+    /// When to try again; never if the file itself was wrong (missing, refused, no image).
+    retry: Option<Instant>,
+}
+
 /// What the adapter knows of a connection's images: the ones ready (in the shared [`Store`]),
 /// the transfers under way, the files that failed, and the ones that found the cache full.
 pub struct Images {
@@ -297,8 +350,8 @@ pub struct Images {
     /// The images the view shows, at most [`WANTED_LIMIT`].
     wanted: BTreeSet<ImageKey>,
     flights: HashMap<u16, Flight>,
-    /// Shown images whose files failed: not asked for again while shown.
-    failed: BTreeSet<ImageKey>,
+    /// Shown images whose files did not come: asked for again only as [`Failure::retry`] says.
+    failed: HashMap<ImageKey, Failure>,
     /// Shown images that found the cache full of shown images, by size: asked for again once that
     /// much room can be made.
     deferred: HashMap<ImageKey, usize>,
@@ -317,7 +370,7 @@ impl Images {
             store: Arc::default(),
             wanted: BTreeSet::new(),
             flights: HashMap::new(),
-            failed: BTreeSet::new(),
+            failed: HashMap::new(),
             deferred: HashMap::new(),
             next_id: 0,
         }
@@ -341,31 +394,33 @@ impl Images {
     /// start for them (by transfer id). What is no longer shown is forgotten as failed or deferred.
     pub fn want(&mut self, wanted: BTreeSet<ImageKey>) -> Vec<(u16, ImageKey)> {
         self.wanted = wanted.into_iter().take(WANTED_LIMIT).collect();
-        self.failed.retain(|k| self.wanted.contains(k));
+        self.failed.retain(|k, _| self.wanted.contains(k));
         self.deferred.retain(|k, _| self.wanted.contains(k));
         self.queued()
     }
 
     /// Transfers to start, as free slots allow: images wanted, not here, not under way, not
-    /// failed, and not deferred unless room for them can be made now.
+    /// failed (unless due to be tried again), and not deferred unless room for them can be made.
     pub fn queued(&mut self) -> Vec<(u16, ImageKey)> {
         let free = CONCURRENT.saturating_sub(self.flights.len());
         if free == 0 {
             return Vec::new();
         }
+        let now = Instant::now();
         let store = self.lock();
         let (bytes, entries) = store.room(&self.wanted);
         let busy: BTreeSet<&ImageKey> = self.flights.values().map(|f| &f.key).collect();
         let start: Vec<ImageKey> = self
             .wanted
             .iter()
-            .filter(|k| !store.has(k) && !busy.contains(k) && !self.failed.contains(k))
+            .filter(|k| !store.has(k) && !busy.contains(k))
+            .filter(|k| self.failed.get(*k).is_none_or(|f| f.retry.is_some_and(|at| at <= now)))
             .filter(|k| self.deferred.get(*k).is_none_or(|&size| size <= bytes && entries > 0))
             .take(free)
             .cloned()
             .collect();
         drop(store);
-        let deadline = Instant::now() + TIMEOUT;
+        let deadline = now + TIMEOUT;
         start
             .into_iter()
             .map(|key| {
@@ -388,6 +443,11 @@ impl Images {
         }
     }
 
+    /// The `ftinitdownload` of transfer `id` could not be sent: tried again later.
+    pub fn unsent(&mut self, id: u16) {
+        self.end_asked(id, true);
+    }
+
     /// TeamSpeak answered a command; true if it was one of ours. A refusal fails the transfer.
     pub fn answered(&mut self, command: tsclientlib::MessageHandle, ok: bool) -> bool {
         let Some((&id, flight)) = self.flights.iter_mut().find(|(_, f)| f.command == Some(command)) else {
@@ -395,76 +455,69 @@ impl Images {
         };
         flight.command = None;
         if !ok {
-            self.fail(id);
+            self.end_asked(id, false);
         }
         true
     }
 
-    /// TeamSpeak opened transfer `id` for a file of `size` bytes: the most to read and the
-    /// deadline to read it by, for [`Reads::start`]. `None` to drop the stream: the transfer is
-    /// not ours, read already, past its deadline, or the file is too large (then it failed).
-    pub fn opened(&mut self, id: u16, size: u64) -> Option<(u64, Instant)> {
+    /// TeamSpeak offered transfer `id`'s file of `size` bytes: the most to read and the deadline,
+    /// for [`Reads::start`]. `None` to ignore the offer (connect nowhere): the transfer is not
+    /// one asked for (unknown, timed out, or offered already), or the file is too large (then it
+    /// failed).
+    pub fn offered(&mut self, id: u16, size: u64) -> Option<(u64, Instant)> {
         let flight = self.flights.get_mut(&id)?;
-        match flight.stage {
-            // Its read reports when it ends.
-            Stage::Reading => None,
-            // Its setup ended just now: the slot is free.
-            Stage::Expired => {
-                self.flights.remove(&id);
-                None
-            }
-            Stage::Asked => {
-                let limit = flight.key.limit();
-                if size == 0 || size > limit {
-                    self.fail(id);
-                    return None;
-                }
-                flight.stage = Stage::Reading;
-                Some((limit, flight.deadline))
-            }
+        if flight.stage != Stage::Asked {
+            return None;
+        }
+        let limit = flight.key.limit();
+        if size == 0 || size > limit {
+            self.end_asked(id, false);
+            return None;
+        }
+        flight.stage = Stage::Running;
+        Some((limit, flight.deadline))
+    }
+
+    /// TeamSpeak refused transfer `id` (a missing file, say). A running download reports itself.
+    pub fn refused(&mut self, id: u16) {
+        self.end_asked(id, false);
+    }
+
+    /// Ends transfer `id` if it is asked for and not running; its slot is free then.
+    fn end_asked(&mut self, id: u16, transient: bool) {
+        if self.flights.get(&id).is_some_and(|f| f.stage == Stage::Asked) {
+            let flight = self.flights.remove(&id).expect("present");
+            self.failed(flight.key, transient);
         }
     }
 
-    /// Transfer `id` failed (refused, missing file, no connection): its slot is free, unless a
-    /// read of it is under way (that reports when it ends).
-    pub fn fail(&mut self, id: u16) {
-        let Some(flight) = self.flights.get(&id) else { return };
-        match flight.stage {
-            Stage::Reading => {}
-            Stage::Expired => {
-                self.flights.remove(&id);
-            }
-            Stage::Asked => {
-                let key = flight.key.clone();
-                self.flights.remove(&id);
-                self.failed(key);
-            }
-        }
-    }
-
-    fn failed(&mut self, key: ImageKey) {
+    fn failed(&mut self, key: ImageKey, transient: bool) {
         // Only images shown count, so this stays within [`WANTED_LIMIT`].
-        if self.wanted.contains(&key) {
-            self.failed.insert(key);
+        if !self.wanted.contains(&key) {
+            return;
         }
+        let failure = self.failed.entry(key).or_insert(Failure { tries: 0, retry: None });
+        failure.tries += 1;
+        failure.retry =
+            (transient && failure.tries < RETRIES).then(|| Instant::now() + RETRY_DELAY * 5u32.pow(failure.tries - 1));
     }
 
-    /// Transfer `id`'s read ended with `data`: kept if it is an image and fits. True if the view
-    /// changes.
-    pub fn finished(&mut self, id: u16, data: Result<Vec<u8>, &'static str>) -> bool {
-        if self.flights.get(&id).is_none_or(|f| f.stage != Stage::Reading) {
+    /// Transfer `id`'s download ended (its task has) with `data`: kept if it is an image and fits.
+    /// True if the view changes.
+    pub fn finished(&mut self, id: u16, data: Result<Vec<u8>, TransferError>) -> bool {
+        if self.flights.get(&id).is_none_or(|f| f.stage != Stage::Running) {
             return false;
         }
         let Some(Flight { key, .. }) = self.flights.remove(&id) else { return false };
-        let data = match data {
-            Ok(data) if data.len() as u64 > key.limit() => Err("too large"),
-            Ok(data) if sniff(&data).is_none() => Err("not a PNG, JPEG, GIF or WebP image"),
-            other => other,
-        };
         match data {
+            Ok(data) if data.len() as u64 > key.limit() || sniff(&data).is_none() => {
+                tracing::debug!(path = %key.path(), "TeamSpeak image refused: not a PNG, JPEG, GIF or WebP image");
+                self.failed(key, false);
+            }
             Ok(data) => {
                 let size = data.len();
                 if self.lock().insert(key.clone(), data, &self.wanted) {
+                    self.failed.remove(&key);
                     self.deferred.remove(&key);
                     return self.wanted.contains(&key);
                 }
@@ -475,35 +528,28 @@ impl Images {
                 }
             }
             Err(error) => {
-                tracing::debug!(path = %key.path(), error, "TeamSpeak image refused");
-                self.failed(key);
+                tracing::debug!(path = %key.path(), error = error.as_str(), "TeamSpeak image not fetched");
+                self.failed(key, error.transient());
             }
         }
         false
     }
 
-    /// Fails transfers asked for and past their deadline; frees the slots of ones past it by
-    /// [`SETUP_GRACE`] too (tsclientlib's setup for them has ended by then). Reads end on their
-    /// own by the deadline. True if a slot was freed, so others can start.
+    /// Ends transfers asked for and not offered by their deadline (to be tried again later);
+    /// running ones end on their own by then. True if a slot was freed or a file is due to be
+    /// tried again, so transfers may start.
     pub fn expire(&mut self, now: Instant) -> bool {
-        let mut freed = false;
-        let mut late = Vec::new();
-        self.flights.retain(|_, f| match f.stage {
-            Stage::Asked if now >= f.deadline => {
-                f.stage = Stage::Expired;
-                late.push(f.key.clone());
-                true
-            }
-            Stage::Expired if now >= f.deadline + SETUP_GRACE => {
-                freed = true;
-                false
-            }
-            _ => true,
-        });
-        for key in late {
-            self.failed(key);
+        let late: Vec<u16> = self
+            .flights
+            .iter()
+            .filter(|(_, f)| f.stage == Stage::Asked && now >= f.deadline)
+            .map(|(&id, _)| id)
+            .collect();
+        for &id in &late {
+            self.end_asked(id, true);
         }
-        freed
+        let due = self.failed.values().any(|f| f.retry.is_some_and(|at| at <= now));
+        !late.is_empty() || due
     }
 
     /// Transfers holding a slot.
@@ -594,7 +640,7 @@ mod tests {
         images.sent(first, handle(1));
         assert!(images.answered(handle(1), true));
         assert!(!images.answered(handle(99), false), "not ours");
-        assert_eq!(images.opened(first, PNG.len() as u64).map(|(limit, _)| limit), Some(ICON_LIMIT));
+        assert_eq!(images.offered(first, PNG.len() as u64).map(|(limit, _)| limit), Some(ICON_LIMIT));
         assert!(images.finished(first, Ok(PNG.to_vec())));
         assert_eq!(images.token(Some(key.clone())), Some(key.token()));
         assert_eq!(images.store().lock().unwrap().get(&key.token()).as_deref(), Some(PNG));
@@ -602,20 +648,21 @@ mod tests {
         assert_eq!(next.len(), 1);
         assert!(next.iter().all(|(_, k)| *k != key));
 
-        // Refused by TeamSpeak, too large, not an image, timed out: failed, and not asked for again.
+        // Refused by TeamSpeak, too large, not an image, timed out: failed, and not asked for again
+        // now (the one that timed out is, later).
         let (refused, _) = started[1].clone();
         images.sent(refused, handle(2));
         assert!(images.answered(handle(2), false));
         let (large, _) = started[2].clone();
-        assert_eq!(images.opened(large, ICON_LIMIT + 1), None);
+        assert_eq!(images.offered(large, ICON_LIMIT + 1), None);
         let (svg, svg_key) = started[3].clone();
-        assert!(images.opened(svg, 10).is_some());
+        assert!(images.offered(svg, 10).is_some());
         assert!(!images.finished(svg, Ok(b"<svg onload=alert(1)>".to_vec())));
         assert_eq!(images.token(Some(svg_key)), None);
         let (late, _) = next[0].clone();
         assert!(!images.expire(Instant::now()));
-        assert!(!images.expire(Instant::now() + TIMEOUT), "past its deadline, but tsclientlib may still be connecting");
-        assert_eq!(images.opened(late, PNG.len() as u64), None, "then its stream is dropped");
+        assert!(images.expire(Instant::now() + TIMEOUT), "nothing of it runs: its slot is free at once");
+        assert_eq!(images.offered(late, PNG.len() as u64), None, "a late offer is ignored: nothing connects");
         assert!(!images.finished(late, Ok(PNG.to_vec())), "a timed-out transfer is over");
         let rest = images.want(wanted.clone());
         assert_eq!(rest.len(), CONCURRENT);
@@ -627,14 +674,15 @@ mod tests {
         let changed = images.want(BTreeSet::from([ImageKey::Icon(2000)]));
         assert!(changed.is_empty(), "all transfers busy");
         for (id, _) in rest {
-            images.fail(id);
+            images.refused(id);
         }
         assert_eq!(images.queued(), vec![(images.next_id, ImageKey::Icon(2000))]);
-        // A transfer TeamSpeak opens twice, or never asked for, is refused; the first read goes on.
-        assert_eq!(images.opened(images.next_id, 10).map(|(limit, _)| limit), Some(ICON_LIMIT));
-        assert_eq!(images.opened(images.next_id, 10), None);
-        assert_eq!(images.opened(4242, 10), None);
-        assert_eq!(images.busy(), 1);
+        // A transfer TeamSpeak offers twice, or never asked for, is ignored; the first download goes on.
+        assert_eq!(images.offered(images.next_id, 10).map(|(limit, _)| limit), Some(ICON_LIMIT));
+        assert_eq!(images.offered(images.next_id, 10), None);
+        assert_eq!(images.offered(4242, 10), None);
+        images.refused(images.next_id);
+        assert_eq!(images.busy(), 1, "a running download reports itself");
         assert!(images.finished(images.next_id, Ok(PNG.to_vec())));
     }
 
@@ -645,7 +693,7 @@ mod tests {
         while !start.is_empty() {
             for (id, _) in start {
                 started += 1;
-                images.opened(id, file.len() as u64).unwrap();
+                images.offered(id, file.len() as u64).unwrap();
                 images.finished(id, Ok(file.to_vec()));
             }
             start = images.queued();
@@ -653,63 +701,106 @@ mod tests {
         started
     }
 
+    type Connect = std::pin::Pin<Box<dyn Future<Output = std::io::Result<tokio::io::DuplexStream>> + Send>>;
+
     #[tokio::test(start_paused = true)]
     async fn a_transfer_holds_its_slot_until_its_work_has_ended() {
         let mut images = Images::new();
         let mut reads = Reads::default();
         let wanted: BTreeSet<_> = (1000..1100).map(ImageKey::Icon).collect();
-        // Four files open just before their deadline and never finish.
+        // Four offered just before their deadline: two connect and get no file, two never connect.
         let start = images.want(wanted.clone());
         tokio::time::advance(TIMEOUT - Duration::from_secs(1)).await;
         let mut servers = Vec::new();
-        for (id, _) in start {
-            let (client, server) = tokio::io::duplex(64);
-            servers.push(server);
-            let (limit, deadline) = images.opened(id, 10).unwrap();
-            reads.start(id, client, 10, limit, deadline);
+        for (n, (id, _)) in start.into_iter().enumerate() {
+            let connect: Connect = if n % 2 == 0 {
+                let (client, server) = tokio::io::duplex(64);
+                servers.push(server);
+                Box::pin(std::future::ready(Ok(client)))
+            } else {
+                Box::pin(std::future::pending())
+            };
+            let (limit, deadline) = images.offered(id, 10).unwrap();
+            reads.start(id, connect, "key".into(), 10, limit, deadline);
         }
-        // Long past every deadline, and past what used to free their slots: none is free until
-        // its read has ended, so no more than four run.
-        tokio::time::advance(TIMEOUT * 3).await;
+        // Long past every deadline: no slot is free until its download (connect included) has
+        // ended, so no more than four run.
+        tokio::time::advance(TIMEOUT * 20).await;
         assert!(!images.expire(Instant::now()));
         assert!(images.queued().is_empty());
         assert_eq!(images.busy(), CONCURRENT);
-        let mut ended = Vec::new();
         for _ in 0..CONCURRENT {
             let (id, data) = reads.next().await;
-            assert_eq!(data, Err("timed out"), "each read ends by its deadline");
+            assert_eq!(data, Err(TransferError::TimedOut), "each ends by its deadline, connected or not");
             assert!(!images.finished(id, data));
-            ended.push(id);
-            assert_eq!(images.busy(), reads.len(), "a slot is free only once its read has ended");
+            assert_eq!(images.busy(), reads.len(), "a slot is free only once its download has ended");
         }
         assert_eq!(images.busy(), 0);
 
-        // Four asked for whose files never open: past their deadline they fail, but tsclientlib may
-        // still be connecting for them, so they keep their slots until it reports them ...
+        // Four asked for and never offered: nothing of them runs, so at their deadline they end
+        // and free their slots; a late offer is ignored, and nothing connects for it.
         let start = images.queued();
         assert_eq!(start.len(), CONCURRENT);
         tokio::time::advance(TIMEOUT).await;
+        assert!(images.expire(Instant::now()));
+        assert_eq!(images.busy(), 0);
+        assert_eq!(images.offered(start[0].0, 10), None);
+        let failed: Vec<_> = start.iter().map(|(_, k)| k).collect();
+        assert!(images.queued().iter().all(|(_, k)| !failed.contains(&k)), "not asked for again at once");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_files_are_tried_again_a_few_times_later() {
+        let mut images = Images::new();
+        let key = ImageKey::Icon(1000);
+        let mut start = images.want(BTreeSet::from([key.clone()]));
+        let mut tries = 0;
+        let mut wait = RETRY_DELAY;
+        while !start.is_empty() {
+            tries += 1;
+            tokio::time::advance(TIMEOUT).await;
+            assert!(images.expire(Instant::now()));
+            // Not again at once, nor before its wait ...
+            assert!(images.queued().is_empty());
+            tokio::time::advance(wait - Duration::from_secs(1)).await;
+            assert!(!images.expire(Instant::now()));
+            assert!(images.queued().is_empty());
+            // ... but after it, until RETRIES tries are done.
+            tokio::time::advance(Duration::from_secs(1)).await;
+            images.expire(Instant::now());
+            start = images.queued();
+            wait *= 5;
+        }
+        assert_eq!(tries, RETRIES);
+        tokio::time::advance(Duration::from_secs(86_400)).await;
+        assert!(!images.expire(Instant::now()));
+        assert!(images.queued().is_empty(), "then never again while shown");
+        // No longer shown and shown again, it is tried anew.
+        images.want(BTreeSet::new());
+        let again = images.want(BTreeSet::from([key.clone()]));
+        assert_eq!(again.len(), 1);
+        // A broken connection counts like a timeout; a file that was wrong is not tried again.
+        let (id, _) = again[0].clone();
+        images.offered(id, 10).unwrap();
+        images.finished(id, Err(TransferError::Short));
+        tokio::time::advance(RETRY_DELAY).await;
+        assert!(images.expire(Instant::now()));
+        let (id, _) = images.queued().pop().unwrap();
+        images.offered(id, 10).unwrap();
+        images.finished(id, Ok(b"not an image".to_vec()));
+        tokio::time::advance(Duration::from_secs(86_400)).await;
         assert!(!images.expire(Instant::now()));
         assert!(images.queued().is_empty());
-        assert_eq!(images.opened(start[0].0, 10), None, "a late stream is dropped, freeing its slot");
-        images.fail(start[1].0);
-        assert_eq!(images.queued().len(), 2);
-        // ... or for SETUP_GRACE at most, when that setup has surely ended.
-        tokio::time::advance(SETUP_GRACE).await;
-        assert!(images.expire(Instant::now()));
-        assert_eq!(images.busy(), 2, "only the two started since");
-        let failed: Vec<_> = start.iter().map(|(_, k)| k).collect();
-        assert!(images.queued().iter().all(|(_, k)| !failed.contains(&k)), "timed out: not asked for again");
     }
 
     #[tokio::test]
-    async fn reads_end_with_the_connection() {
+    async fn downloads_end_with_the_connection() {
         let mut reads = Reads::default();
         let (client, mut server) = tokio::io::duplex(64);
-        reads.start(1, client, 10, ICON_LIMIT, Instant::now() + TIMEOUT);
+        reads.start(1, std::future::ready(Ok(client)), "key".into(), 10, ICON_LIMIT, Instant::now() + TIMEOUT);
         tokio::task::yield_now().await;
         drop(reads);
-        // The read's task is gone, and its end of the stream with it.
+        // The download's task is gone, and its end of the connection with it.
         let mut gone = false;
         for _ in 0..100 {
             tokio::task::yield_now().await;
@@ -750,7 +841,7 @@ mod tests {
         while !start.is_empty() {
             for (id, _) in start {
                 asked += 1;
-                images.fail(id);
+                images.refused(id);
             }
             start = images.queued();
         }
@@ -786,15 +877,52 @@ mod tests {
     #[tokio::test]
     async fn files_are_read_whole_within_their_limit() {
         let later = Instant::now() + TIMEOUT;
-        assert_eq!(read_file(&b"abcdef"[..], 6, 10, later).await, Ok(b"abcdef".to_vec()));
-        assert_eq!(read_file(&b"abc"[..], 6, 10, later).await, Err("not the announced size"));
+        /// Downloads `size` bytes from a server that, keyed `key`, sends `file`, then closes if `close`.
+        async fn from(
+            file: &'static [u8],
+            size: u64,
+            deadline: Instant,
+            close: bool,
+        ) -> Result<Vec<u8>, TransferError> {
+            let (client, mut server) = tokio::io::duplex(1024);
+            let serve = async move {
+                let mut key = [0u8; 3];
+                server.read_exact(&mut key).await.unwrap();
+                assert_eq!(&key, b"key", "the key comes first");
+                server.write_all(file).await.unwrap();
+                (!close).then_some(server)
+            };
+            let (data, _server) = tokio::join!(download(async { Ok(client) }, "key".into(), size, 10, deadline), serve);
+            data
+        }
+        assert_eq!(from(b"abcdef", 6, later, false).await, Ok(b"abcdef".to_vec()));
+        assert_eq!(from(b"abc", 6, later, true).await, Err(TransferError::Short));
+        let soon = Instant::now() + Duration::from_millis(50);
+        assert_eq!(from(b"abc", 6, soon, false).await, Err(TransferError::TimedOut));
         // What follows the announced bytes is not read.
-        assert_eq!(read_file(&b"abcdefgh"[..], 6, 10, later).await, Ok(b"abcdef".to_vec()));
-        assert_eq!(read_file(&b"abcdef"[..], 11, 10, later).await, Err("too large or empty"));
-        assert_eq!(read_file(&b""[..], 0, 10, later).await, Err("too large or empty"));
-        // A server that never finishes sending.
-        let (_tx, rx) = tokio::io::duplex(64);
+        assert_eq!(from(b"abcdefgh", 6, later, false).await, Ok(b"abcdef".to_vec()));
+        // Too large or empty: nowhere connected to.
+        let never = async { panic!("connected") };
+        assert_eq!(
+            download::<tokio::io::DuplexStream>(never, "key".into(), 11, 10, later).await,
+            Err(TransferError::Size)
+        );
+        let never = async { panic!("connected") };
+        assert_eq!(
+            download::<tokio::io::DuplexStream>(never, "key".into(), 0, 10, later).await,
+            Err(TransferError::Size)
+        );
+        // A refused connection, and a server that never answers.
+        let refused = async { Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)) };
+        assert_eq!(
+            download::<tokio::io::DuplexStream>(refused, "key".into(), 6, 10, later).await,
+            Err(TransferError::Failed)
+        );
         let soon = Instant::now() + Duration::from_millis(20);
-        assert_eq!(read_file(rx, 6, 10, soon).await, Err("timed out"));
+        assert_eq!(
+            download(std::future::pending::<std::io::Result<tokio::io::DuplexStream>>(), "key".into(), 6, 10, soon)
+                .await,
+            Err(TransferError::TimedOut)
+        );
     }
 }

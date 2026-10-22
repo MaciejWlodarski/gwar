@@ -565,22 +565,26 @@ therefore have different TS suffixes while retaining the same Gwar nickname.
     - Bounds: icons at most 64 KiB, avatars at most 300 KiB (TeamSpeak's
       default `i_client_max_avatar_filesize` is 200,000 bytes); 4 transfers
       at a time, each with an absolute deadline of 15 s from asking; exactly
-      the announced size is read. A transfer keeps its slot until its work has
-      ended: its read runs on a task that ends by the deadline (and with the
-      connection), and tsclientlib's own connect for it, which the adapter
-      cannot cancel, either reports or has surely ended after 180 s more
-      (longer than any system's TCP connect timeout). A file must be a PNG,
-      JPEG, GIF or WebP by its first bytes, whatever TeamSpeak calls it: SVG
-      and anything else is refused.
+      the announced size is read. tsclientlib is patched to hand TeamSpeak's
+      offer (`notifystartdownload`) over without connecting
+      (`vendor/tsclientlib/GWAR-PATCH.md`): an offer after the deadline is
+      ignored, and the adapter connects, sends the key and reads the file on
+      a task of its own under that one deadline, cancelled with the
+      connection. A transfer keeps its slot until that task has ended (one
+      asked for and not yet offered runs nothing, so its slot frees at the
+      deadline). A file must be a PNG, JPEG, GIF or WebP by its first bytes,
+      whatever TeamSpeak calls it: SVG and anything else is refused.
     - The cache is per connection and in memory only (nothing on disk): at
       most 32 MiB and 2048 images, keyed by icon id or by the avatar's owner
       and hash (`client_flag_avatar`), so an image is fetched again only when
       the id or hash changes. Only the first 2048 images the view shows are
       considered. A full cache drops images no longer shown; an image that
       finds it full of images still shown waits, and is fetched again once
-      that much room can be made. A file that failed (missing, refused, too
-      large, no image, timed out) is not asked for again while it is shown;
-      no longer shown, it is forgotten.
+      that much room can be made. A file that was wrong (missing, refused,
+      too large, no image) is not asked for again while it is shown; one that
+      timed out or whose connection broke is, after 1 and then 5 minutes, 3
+      tries in all. No longer shown, a failure is forgotten. Group icons are
+      wanted only for the badges sent (the same ordered, cut selection).
     - The UI gets the bytes by token from the desktop app (`ts_image`), checks
       their type and size again and shows them through `blob:` URLs of its own
       origin (`net/ts-images.ts`), which the CSP allows for images. It keeps

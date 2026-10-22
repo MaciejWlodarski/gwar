@@ -17,7 +17,8 @@ are used unmodified; their source code is at the repositories listed with them.
 The TeamSpeak client mode and the TeamSpeak bridge depend on
 [ReSpeak/tsclientlib](https://github.com/ReSpeak/tsclientlib) (MIT OR
 Apache-2.0), pinned to commit `ee3bc6f45a7137db7793ba5593a321df400d53e5` in the
-Cargo manifests and lockfiles.
+Cargo manifests and lockfiles. Its `tsclientlib` crate is vendored at that
+commit with one patch (`vendor/tsclientlib`, see its `GWAR-PATCH.md`).
 
 ## Noise suppression model
 
