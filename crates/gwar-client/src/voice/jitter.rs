@@ -730,15 +730,15 @@ impl JitterBuffer {
         true
     }
 
-    /// Discard queued packets that start before `before`, oldest first, retaining enough audio
-    /// (by the queued packets' own durations) for this refill as well as the target. Returns
-    /// whether any went; the window restarts then.
-    fn trim(&mut self, before: u64, demand: usize, now: Instant) -> bool {
+    /// Discard queued packets that start before `before`, oldest first, retaining at least `keep`
+    /// samples (by the queued packets' own durations). Returns whether any went; the window
+    /// restarts then.
+    fn trim(&mut self, before: u64, keep: u64, now: Instant) -> bool {
         let mut depth = self.depth().1;
         let mut trimmed = false;
         while self.packets.len() > 1 {
             let (&ts, packet) = self.packets.first_key_value().unwrap();
-            if ts >= before || depth - packet.samples < self.target_samples().max(demand as u64) {
+            if ts >= before || depth - packet.samples < keep {
                 break;
             }
             let (_, packet) = self.packets.pop_first().unwrap();
@@ -775,16 +775,18 @@ impl JitterBuffer {
             fade = std::mem::take(&mut self.skipped);
         }
         // More than `MAX_QUEUED` is beyond any target, refill and speaker headroom: the output
-        // stopped consuming, or a burst of more than that arrived. Holding it buys nothing, and
-        // no later refill can need more than this one's demand or the target.
+        // stopped consuming, or a burst of more than that arrived. Holding it buys nothing. This
+        // refill takes its demand, and the target stays behind it as the jitter reserve.
         if demand > 0 && std::mem::take(&mut self.overflowed) {
-            fade |= self.trim(u64::MAX, demand, now);
+            let keep = self.target_samples() + demand as u64;
+            fade |= self.trim(u64::MAX, keep, now);
         }
         if let Some(before) = self.recovering.as_ref().map(|recovery| recovery.before) {
             // Only discard media that starts behind the stalled timeline's deadline. A packet
             // straddling the deadline goes too: kept, it stayed as up to one packet of excess
             // delay that the fractional drain rarely removes before the next stall.
-            fade |= self.trim(before, demand, now);
+            let keep = self.target_samples().max(demand as u64);
+            fade |= self.trim(before, keep, now);
         }
         let Some(mut next) = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)) else {
             return Playout::Idle;
@@ -1655,17 +1657,52 @@ mod tests {
             for pattern in [vec![480], vec![960], vec![480, 960], vec![960, 480, 480]] {
                 let (played, concealments, levels, jb) = pause(clock, &pattern);
                 let packet = *pattern.iter().max().unwrap() as u64;
-                // The first refill after the pause trims the overflowed queue to the target
-                // (by the queued packets' durations), once, and playback goes on from the
-                // newest audio without a gap or a concealment.
+                // The first refill after the pause trims the overflowed queue to the target plus
+                // its demand (by the queued packets' durations), and playback goes on from the
+                // newest audio without a gap or a concealment. Whole packets can leave up to a
+                // packet above the target; the drain may take that as quiet cuts afterwards.
                 assert_eq!(concealments, 0, "{clock:?} {pattern:?}");
-                assert_eq!(jb.trim_events, 1, "{clock:?} {pattern:?}");
+                assert!(jb.trim_events >= 1, "{clock:?} {pattern:?}");
                 assert!(played.windows(2).all(|pair| pair[1] == pair[0] + 1), "{clock:?} {pattern:?}");
                 // From the first refill on, only the target and one packet are queued.
                 assert!(
                     levels.iter().all(|&level| level <= jb.target_samples() + packet),
                     "{clock:?} {pattern:?}: {levels:?}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn overflow_recovery_keeps_the_jitter_reserve() {
+        // 10 ms packets, every 50th delivered 10 ms late, so the target carries a reserve for it.
+        // The output pauses for 20 s and resumes; refills are longer than a packet. The trim
+        // keeps the target behind the first refill's demand, so the jitter stays covered.
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for refill in [2u64, 12] {
+                let stride = if clock == Clock::Sequence { FRAME } else { 480 };
+                let start = Instant::now();
+                let at = |ms: u64| start + Duration::from_millis(ms);
+                let arrival = |k: u64| k * 10 + if k % 50 == 49 { 10 } else { 0 };
+                let mut jb = JitterBuffer::new();
+                let mut player = Player::new(480, 240);
+                let (mut k, mut resumed_with) = (0, None);
+                for time in 1..=40_000u64 {
+                    while arrival(k) <= time {
+                        jb.push_at(k * stride, 480, k.to_le_bytes().to_vec(), at(arrival(k)), clock);
+                        k += 1;
+                    }
+                    let paused = (5_000..25_000).contains(&time);
+                    if time % (refill * 10) == 0 && !paused {
+                        if time >= 25_000 && resumed_with.is_none() {
+                            resumed_with = Some(player.concealed);
+                        }
+                        player.refill(&mut jb, at(time), (refill * 480) as usize);
+                    }
+                }
+                let before = resumed_with.unwrap();
+                assert_eq!(jb.trim_events, 1, "{clock:?} {refill}");
+                assert_eq!(player.concealed, before, "{clock:?} {refill}: concealed after the overflow trim");
             }
         }
     }
@@ -1735,7 +1772,8 @@ mod tests {
         assert!(data[0] > 3);
         assert_eq!(jb.trim_events, 1);
         let depth = jb.depth().1;
-        assert!(depth + 480 >= jb.target_samples() && depth < jb.target_samples(), "{depth}");
+        // The trim kept this refill's demand on top of the target.
+        assert!(depth >= jb.target_samples() && depth < jb.target_samples() + 480, "{depth}");
         assert_eq!(depth, (102 - u64::from(data[0])) * 480);
         let Playout::Packet { data: next, fade: false, .. } = jb.pop_for(start + Duration::from_millis(20), 480) else {
             panic!("no packet")

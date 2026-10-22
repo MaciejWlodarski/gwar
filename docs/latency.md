@@ -390,14 +390,16 @@ count of 512 packets remains as a memory bound only; at 2.5 ms per packet it is
 
 Exceeding 1 s is also the evidence that the backlog is worth nothing: either the
 output stopped consuming or more than a second of audio arrived at once. The
-next refill after that therefore trims the queue once, oldest first, down to the
-target and its own demand, by the queued packets' own durations (mixed 10/20 ms
-streams included; holes count as nothing, so at least the target of real audio
-stays). Short of such a burst, the output had not consumed for over 840 ms,
-longer than the speaker ring lasts, so no later catch-up refill needs more than
-this one's demand. It is
-the stall-recovery trim with its fade, counted as a trim event; the window
-restarts. A burst of more than a second at once is trimmed the same way, which
+next refill after that therefore trims the queue once, oldest first, down to
+that refill's demand plus the target, by the queued packets' own durations
+(mixed 10/20 ms streams included; holes count as nothing). The refill takes its
+demand and the target stays queued behind it as the jitter reserve: keeping only
+the larger of the two let a 20 ms refill on a 13 ms target empty the queue, and
+the next packet delivered 10 ms late was concealed
+(`overflow_recovery_keeps_the_jitter_reserve`, 20 and 120 ms refills, both
+clocks). Whole packets can leave up to one packet above the target; the drain
+takes that as quiet cuts. It is the stall-recovery trim with its fade, counted
+as a trim event; the window restarts. A burst of more than a second at once is trimmed the same way, which
 is acceptable: that much never arrives inside a jitter target. In simulation
 (`a_full_queue_keeps_the_newest_audio_and_trims_to_the_target_after_a_pause`,
 both clocks, 20 s pause) the first refill after the pause trimmed 990 ms (10 ms
