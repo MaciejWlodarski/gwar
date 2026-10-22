@@ -492,6 +492,7 @@ struct Watcher {
     focus: Option<String>,
     /// The viewer's queues, release bucket, socket cap and allocation, slot by slot.
     egress: Egress,
+    dropped_lanes: Vec<usize>,
     /// The probing target last given to str0m's BWE.
     desired: Option<u64>,
     /// Since when every slot is paused, or the estimator last restarted since.
@@ -500,6 +501,7 @@ struct Watcher {
 }
 
 /// A packet that passed ingress, to be written to every slot that carries its share.
+#[derive(Clone)]
 struct Forward {
     source: u64,
     timestamp: u32,
@@ -1140,7 +1142,13 @@ impl Sfu {
         for forward in &forwards {
             for &(session, index) in &slots {
                 let Some(w) = self.watchers.get_mut(&session) else { continue };
-                if enqueue(w, index, &origin, forward, now) {
+                let admitted = enqueue(w, index, &origin, forward, now);
+                let dropped = std::mem::take(&mut w.dropped_lanes);
+                for lane in dropped {
+                    self.ask_keyframe(session, lane, now);
+                }
+                let Some(w) = self.watchers.get_mut(&session) else { continue };
+                if admitted {
                     if !touched.contains(&session) {
                         touched.push(session);
                     }
@@ -1200,6 +1208,7 @@ impl Sfu {
         let now = Instant::now();
         let mut requests = Vec::new();
         release(&mut w, now);
+        requests.append(&mut w.dropped_lanes);
         let (socket, measured, shared) = (&self.socket, &mut self.measured, &self.shared);
         let mut send = |c: &[u8], to| transmit(socket, measured, shared, c, to);
         if drive(&mut w, now, &mut requests, &mut send) {
@@ -1211,6 +1220,8 @@ impl Sfu {
             return;
         }
         self.watchers.insert(session, w);
+        requests.sort_unstable();
+        requests.dedup();
         for slot in requests {
             self.ask_keyframe(session, slot, now);
         }
@@ -1536,6 +1547,7 @@ fn enqueue(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forwa
     for &lane in &dropped {
         w.slots[lane].segment.wait();
     }
+    w.dropped_lanes.extend(dropped.iter().copied());
     !dropped.contains(&index)
 }
 
@@ -1543,9 +1555,10 @@ fn enqueue(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forwa
 /// the next poll. Slots whose head reached its deadline were cleared and wait for a keyframe.
 fn release(w: &mut Watcher, now: Instant) {
     let (released, dropped) = w.egress.due(now);
-    for lane in dropped {
+    for &lane in &dropped {
         w.slots[lane].segment.wait();
     }
+    w.dropped_lanes.extend(dropped);
     for (lane, packet) in released {
         let slot = &mut w.slots[lane];
         let mut direct = w.rtc.direct_api();
@@ -1678,6 +1691,7 @@ fn watcher(
         connected: false,
         focus: None,
         egress: Egress::new(now),
+        dropped_lanes: Vec::new(),
         desired: None,
         stalled: None,
         deadline: now,
@@ -1895,7 +1909,7 @@ pub(crate) mod tests {
     pub(crate) fn assert_guest_revocation_stops_rtp(grant: Arc<WatchGrant>, revoke: impl FnOnce()) {
         let mut pair = Pair::new();
         let origin = grant.origin.clone();
-        assign(&mut pair.w, 0, grant.clone());
+        assign(&mut pair.w, 0, grant.clone(), 1, pair.now);
         let packet = |n: u64| Forward {
             source: 100 + n,
             timestamp: 9000 + (n / 10) as u32 * 3000,
@@ -1907,7 +1921,7 @@ pub(crate) mod tests {
         };
         let packets: Vec<_> = (0..30).map(packet).collect();
         for packet in &packets[..10] {
-            assert!(write(&mut pair.w, 0, &origin, packet, pair.now));
+            assert!(enqueue(&mut pair.w, 0, &origin, packet, pair.now));
         }
         pair.hold = true;
         let mut seen = 0;
@@ -1922,11 +1936,11 @@ pub(crate) mod tests {
         assert_eq!(sent, 10, "the real guest grant forwards before revocation");
         assert!(!pair.held.is_empty(), "the viewer's loss feedback is held back");
         for packet in &packets[10..20] {
-            assert!(write(&mut pair.w, 0, &origin, packet, pair.now));
+            assert!(enqueue(&mut pair.w, 0, &origin, packet, pair.now));
         }
         revoke();
         for packet in &packets[20..] {
-            assert!(!write(&mut pair.w, 0, &origin, packet, pair.now), "fresh RTP after revocation");
+            assert!(!enqueue(&mut pair.w, 0, &origin, packet, pair.now), "fresh RTP after revocation");
         }
         sweep(&mut pair.w);
         pair.hold = false;
@@ -1935,6 +1949,94 @@ pub(crate) mod tests {
         }
         let sent: usize = (0..20).map(|_| pair.step(&mut |_| false)).sum();
         assert_eq!(sent, 0, "neither queued RTP nor RTX leaves after revocation");
+    }
+
+    #[tokio::test]
+    async fn queue_evictions_request_keyframes_without_more_publisher_traffic() {
+        let mut pair = Pair::new();
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
+        assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
+        // A packet already at its deadline: flushing the viewer alone must request recovery.
+        let forward = Forward {
+            source: 1,
+            timestamp: 9000,
+            marker: true,
+            keyframe: true,
+            codec: VideoCodec::Vp8,
+            arrival: Instant::now() - egress::DEADLINE,
+            payload: Arc::from([0x10, 0, 1, 2].as_slice()),
+        };
+        assert!(enqueue(&mut pair.w, 0, &origin, &forward, pair.now));
+        let now = Instant::now();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (dispatch, _rx) = dispatch();
+        let core = crate::core::expiry_tests::test_core(crate::store::Store::in_memory().unwrap(), None);
+        let mut sfu = Sfu {
+            socket,
+            advertise: addr(6000),
+            core,
+            dropped: Arc::new(AtomicU64::new(0)),
+            owners: Owners { held: HashMap::new(), addrs: dispatch.addrs },
+            outbox: VecDeque::new(),
+            budgets: HashMap::new(),
+            publishers: HashMap::new(),
+            watchers: HashMap::from([(pair.w.session, pair.w)]),
+            next_id: 1,
+            shared: ScreenShared::new(300_000_000),
+            measured: Measured::new(now),
+            watches: 1,
+            next_allocation: now,
+        };
+        sfu.publishers.insert(
+            "share".into(),
+            Publisher {
+                id: 2,
+                origin: origin.clone(),
+                rtc: rtc(addr(6000), now, false).unwrap(),
+                ufrag: String::new(),
+                ssrc: 1.into(),
+                codecs: HashMap::new(),
+                meter: Meter::new(origin.cap_bps, now),
+                ingress: Ingress::new(origin.cap_bps, now),
+                rate: ShareMeter::default(),
+                ended: None,
+                connected: true,
+                created: now,
+                keyframes: Throttle::default(),
+                deadline: now,
+            },
+        );
+        sfu.flush_watcher(7);
+        assert!(sfu.publishers["share"].keyframes.pending);
+        assert!(sfu.watchers[&7].slots[0].asked.is_some());
+        assert!(sfu.watchers[&7].slots[0].segment.waiting());
+        assert!(sfu.budgets.contains_key(&7));
+
+        // Admission of a higher-priority slot evicts another lane. Its recovery request is
+        // collected even though that publisher sends nothing else.
+        let w = sfu.watchers.get_mut(&7).unwrap();
+        let other = ScreenOrigin::new(2, "other".into(), 1, false, false, 8_000_000);
+        assign(w, 1, WatchGrant::new(other.clone()), 2, now);
+        w.egress.set_estimate(100_000, now);
+        let lower = Forward {
+            source: 1,
+            timestamp: 1,
+            marker: false,
+            keyframe: true,
+            codec: VideoCodec::Vp8,
+            arrival: now,
+            payload: Arc::from(vec![0x10; 1100]),
+        };
+        let packets = w.egress.admission_bound() / (1100 + egress::ORIGINAL_OVERHEAD);
+        for source in 1..=packets as u64 {
+            let f = Forward { source, keyframe: source == 1, ..lower.clone() };
+            assert!(enqueue(w, 1, &other, &f, now));
+        }
+        let higher = Forward { source: 2, timestamp: 2, payload: Arc::from(vec![0x10; 1100]), ..forward };
+        assert!(enqueue(w, 0, &origin, &higher, now));
+        assert!(w.dropped_lanes.contains(&1));
+        sfu.flush_watcher(7);
+        assert!(sfu.watchers[&7].slots[1].asked.is_some());
     }
 
     /// Ends `slot`'s grant while the viewer's NACK for a lost packet is in flight, then lets the

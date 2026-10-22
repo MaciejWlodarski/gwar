@@ -4,19 +4,19 @@
  * Screen-sharing limits (docs/screen-share.md, "Limits"): server settings, replaced as a
  * whole by `server.update`.
  */
-export type ScreenLimits = { shares_per_channel: number, shares_per_server: number, viewers_per_share: number, 
+export type ScreenLimits = { shares_per_channel: number, shares_per_server: number, viewers_per_share: number,
 /**
  * Bitrate cap of each new share, kbps.
  */
-share_cap_kbps: number, 
+share_cap_kbps: number,
 /**
  * What all slot reservations and publish caps together may reach, Mbps.
  */
-budget_mbps: number, 
+budget_mbps: number,
 /**
  * Admins are warned when the month's outbound transfer reaches 80 % and 100 % of it, TB.
  */
-monthly_egress_tb: number, 
+monthly_egress_tb: number,
 /**
  * Past 100 % of `monthly_egress_tb`, new watches are refused.
  */

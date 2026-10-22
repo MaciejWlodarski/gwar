@@ -451,6 +451,7 @@ async fn screen_limits_are_server_settings_and_the_egress_counter_reports_the_mo
     assert!(["host", "container", "unavailable"].contains(&egress["scope"].as_str().unwrap()), "{egress}");
     let month = egress["month"].as_str().unwrap();
     assert!(month.len() == 7 && month.as_bytes()[4] == b'-', "{month}");
+    assert!(egress["incomplete"].is_boolean());
     assert_eq!((egress["screen_members"].as_u64(), egress["screen_guests"].as_u64()), (Some(0), Some(0)));
     assert_eq!(alice.fails("server.egress", json!({})).await, "forbidden");
 

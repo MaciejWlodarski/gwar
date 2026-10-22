@@ -195,6 +195,9 @@ pub struct Counts {
     queue_dropped: u64,
     /// The longest a packet waited in the bottleneck's queue.
     queue_max_ms: f64,
+    /// Actual relay send time minus scheduled release time; excludes intentional queueing.
+    scheduling_lateness_max_ms: f64,
+    scheduling_late_over_5ms: u64,
     reordered: u64,
     pending: usize,
     stall_windows: Vec<StallWindow>,
@@ -217,6 +220,8 @@ impl Counts {
         self.dropped += other.dropped;
         self.queue_dropped += other.queue_dropped;
         self.queue_max_ms = self.queue_max_ms.max(other.queue_max_ms);
+        self.scheduling_lateness_max_ms = self.scheduling_lateness_max_ms.max(other.scheduling_lateness_max_ms);
+        self.scheduling_late_over_5ms += other.scheduling_late_over_5ms;
         self.reordered += other.reordered;
         self.pending += other.pending;
         self.stall_windows.extend(other.stall_windows);
@@ -353,6 +358,9 @@ impl Scheduler {
         self.queue.pop_first().map(|(_, packet)| packet)
     }
     fn sent(&mut self, packet: &Packet, now: Duration) {
+        let lateness = now.saturating_sub(packet.due).as_secs_f64() * 1000.0;
+        self.counts.scheduling_lateness_max_ms = self.counts.scheduling_lateness_max_ms.max(lateness);
+        self.counts.scheduling_late_over_5ms += u64::from(lateness > 5.0);
         self.counts.forwarded += 1;
         self.counts.reordered += u64::from(self.highest_sent.is_some_and(|highest| packet.sequence < highest));
         self.highest_sent = Some(self.highest_sent.unwrap_or(0).max(packet.sequence));
@@ -383,6 +391,7 @@ pub struct Report {
 /// neither take CPU time from the clients and the in-process server nor wait for theirs.
 pub struct Relay {
     socket: std::net::UdpSocket,
+    voice: [std::net::UdpSocket; 2],
     browsers: bool,
     runtime: Option<tokio::runtime::Runtime>,
     task: Option<JoinHandle<Result<Report>>>,
@@ -392,7 +401,11 @@ impl Relay {
     pub async fn bind() -> Result<Self> {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").context("bind netem relay")?;
         socket.set_nonblocking(true)?;
-        Ok(Self { socket, browsers: false, runtime: None, task: None, stop: None })
+        let voice = [std::net::UdpSocket::bind("127.0.0.1:0")?, std::net::UdpSocket::bind("127.0.0.1:0")?];
+        for socket in &voice {
+            socket.set_nonblocking(true)?;
+        }
+        Ok(Self { socket, voice, browsers: false, runtime: None, task: None, stop: None })
     }
     /// For browser clients (apps/web/e2e/latency.mjs): every local ICE candidate that checks the
     /// relay is its own flow, and a candidate on a host interface reaches this loopback socket
@@ -408,15 +421,25 @@ impl Relay {
     pub fn address(&self) -> Result<SocketAddr> {
         Ok(self.socket.local_addr()?)
     }
+    /// Explicit voice roles keep random impairment streams stable when screen flows arrive first.
+    #[allow(dead_code)] // web_latency uses browser flows instead.
+    pub fn voice_address(&self, role: usize) -> Result<SocketAddr> {
+        Ok(self.voice[role].local_addr()?)
+    }
     pub fn start(&mut self, server: SocketAddr, spec: Spec, epoch: Instant) -> Result<()> {
         let (stop, receive) = oneshot::channel();
         self.stop = Some(stop);
         let runtime =
             tokio::runtime::Builder::new_multi_thread().worker_threads(1).thread_name("netem").enable_all().build()?;
         let (socket, browsers) = (self.socket.try_clone()?, self.browsers);
+        let voice = [self.voice[0].try_clone()?, self.voice[1].try_clone()?];
         self.task = Some(runtime.spawn(async move {
             let front = Arc::new(UdpSocket::from_std(socket)?);
-            relay(front, server, spec, epoch, receive, browsers).await
+            let voice = [
+                Arc::new(UdpSocket::from_std(voice[0].try_clone()?)?),
+                Arc::new(UdpSocket::from_std(voice[1].try_clone()?)?),
+            ];
+            relay(front, voice, server, spec, epoch, receive, browsers).await
         }));
         self.runtime = Some(runtime);
         Ok(())
@@ -439,6 +462,7 @@ impl Drop for Relay {
     }
 }
 struct Flow {
+    front: Arc<UdpSocket>,
     client: SocketAddr,
     upstream: Arc<UdpSocket>,
     up: Scheduler,
@@ -449,8 +473,10 @@ struct Incoming {
     at: Duration,
     data: Vec<u8>,
 }
+#[allow(clippy::too_many_arguments)]
 async fn relay(
     front: Arc<UdpSocket>,
+    voice: [Arc<UdpSocket>; 2],
     server: SocketAddr,
     spec: Spec,
     epoch: Instant,
@@ -463,7 +489,23 @@ async fn relay(
     let mut readers = JoinSet::<Result<()>>::new();
     let mut flows: Vec<Flow> = Vec::new();
     let mut by_client = HashMap::new();
-    let mut buffer = vec![0; 65_536];
+    let (arrivals, mut clients) = mpsc::channel(4096);
+    for (role, socket) in [(None, front.clone()), (Some(0), voice[0].clone()), (Some(1), voice[1].clone())] {
+        let arrivals = arrivals.clone();
+        readers.spawn(async move {
+            let mut buffer = vec![0; 65_536];
+            loop {
+                let (size, client) = socket.recv_from(&mut buffer).await.context("relay receive")?;
+                if arrivals
+                    .send((role, socket.clone(), client, epoch.elapsed(), buffer[..size].to_vec()))
+                    .await
+                    .is_err()
+                {
+                    return Ok(());
+                }
+            }
+        });
+    }
     let mut downlink_send_errors = 0;
     let (mut up_link, mut down_link) = (Link::default(), Link::default());
     loop {
@@ -475,7 +517,7 @@ async fn relay(
                 flow.up.sent(&packet, epoch.elapsed());
             }
             while let Some(packet) = flow.down.pop(epoch.elapsed()) {
-                match front.send_to(&packet.data, flow.client).await {
+                match flow.front.send_to(&packet.data, flow.client).await {
                     Err(_) if browsers => downlink_send_errors += 1,
                     sent => {
                         sent.context("relay downlink send")?;
@@ -492,11 +534,9 @@ async fn relay(
                 completed.context("missing relay reader")???;
                 bail!("relay reader stopped unexpectedly");
             }
-            received = front.recv_from(&mut buffer) => {
-                let (size, client) = received.context("relay receive")?;
+            Some((role, socket, client, at, data)) = clients.recv() => {
                 ensure!(browsers || client.ip().is_loopback(), "non-loopback relay client");
-                let at = epoch.elapsed();
-                let flow = if let Some(&flow) = by_client.get(&client) {
+                let flow = if let Some(&flow) = by_client.get(&(role, client)) {
                     flow
                 } else {
                     let limit = if browsers { MAX_BROWSER_FLOWS } else { MAX_NATIVE_FLOWS };
@@ -504,33 +544,33 @@ async fn relay(
                     let id = flows.len();
                     let upstream = Arc::new(UdpSocket::bind("127.0.0.1:0").await?);
                     upstream.connect(server).await?;
-                    let socket = upstream.clone();
+                    let upstream_reader = upstream.clone();
                     let incoming = incoming.clone();
                     readers.spawn(async move {
                         let mut buffer = vec![0; 65_536];
                         loop {
-                            let size = socket.recv(&mut buffer).await.context("relay upstream receive")?;
+                            let size = upstream_reader.recv(&mut buffer).await.context("relay upstream receive")?;
                             let packet = Incoming { flow: id, at: epoch.elapsed(), data: buffer[..size].to_vec() };
                             if incoming.send(packet).await.is_err() {
                                 return Ok(());
                             }
                         }
                     });
-                    // Separate random streams prevent cross-flow/direction interleaving
-                    // from changing packet decisions. Flow 0 is the first client.
-                    let flow_seed = (id as u64).wrapping_mul(0x9e3779b97f4a7c15);
+                    // Voice roles 0 and 1 are independent of screen arrival order.
+                    let flow_seed = role_seed(role, id);
                     let up_seed = spec.up.seed.unwrap_or(spec.seed) ^ flow_seed;
                     let down_seed = spec.down.seed.unwrap_or(spec.seed) ^ flow_seed ^ 0xd1b54a32d192ed03;
                     flows.push(Flow {
+                        front: socket,
                         client,
                         upstream,
                         up: Scheduler::new(spec.up.clone(), up_seed, id),
                         down: Scheduler::new(spec.down.clone(), down_seed, id),
                     });
-                    by_client.insert(client, id);
+                    by_client.insert((role, client), id);
                     id
                 };
-                flows[flow].up.enqueue(at, buffer[..size].to_vec(), &mut up_link)?;
+                flows[flow].up.enqueue(at, data, &mut up_link)?;
             }
             Some(packet) = replies.recv() => flows[packet.flow].down.enqueue(packet.at, packet.data, &mut down_link)?,
             _ = tokio::time::sleep_until(deadline.into()) => {},
@@ -558,9 +598,41 @@ async fn relay(
     Ok(report)
 }
 
+fn role_seed(voice: Option<u64>, arrival: usize) -> u64 {
+    voice.unwrap_or(arrival as u64 + 2).wrapping_mul(0x9e3779b97f4a7c15)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_voice_roles_keep_impairments_paired_with_or_without_screen_flows() {
+        let trace = |arrival, role| {
+            let spec = Spec::parse("seed=17;up:jitter=5ms,loss=10%,reorder=5%").unwrap();
+            let mut s = Scheduler::new(spec.up, spec.seed ^ role_seed(Some(role), arrival), arrival);
+            let mut link = Link::default();
+            for n in 0..100 {
+                s.enqueue(Duration::from_millis(n * 20), vec![n as u8; 100], &mut link).unwrap();
+            }
+            drain(&mut s)
+        };
+        assert_eq!(trace(0, 0), trace(6, 0));
+        assert_eq!(trace(1, 1), trace(7, 1));
+        assert_ne!(trace(0, 0), trace(1, 1));
+    }
+
+    #[test]
+    fn relay_lateness_is_separate_from_scheduled_queueing() {
+        let mut s = scheduler("up:delay=10ms");
+        s.enqueue(Duration::ZERO, vec![0; 100], &mut Link::default()).unwrap();
+        let p = s.pop(Duration::from_millis(37)).unwrap();
+        s.sent(&p, Duration::from_millis(37));
+        let c = s.finish();
+        assert_eq!(c.queue_max_ms, 0.0);
+        assert_eq!(c.scheduling_lateness_max_ms, 27.0);
+        assert_eq!(c.scheduling_late_over_5ms, 1);
+    }
 
     fn scheduler(source: &str) -> Scheduler {
         let spec = Spec::parse(source).unwrap();

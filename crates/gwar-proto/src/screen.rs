@@ -141,6 +141,8 @@ wire! {
         /// `YYYY-MM`, UTC.
         pub month: String,
         pub scope: EgressScope,
+        /// True when some traffic could not be attributed to this month or observed.
+        pub incomplete: bool,
         /// Bytes the interface sent this month, every service on it included; `null` where
         /// unavailable.
         #[cfg_attr(feature = "ts", ts(type = "number | null"))]
@@ -266,6 +268,7 @@ mod tests {
         let egress = ServerEgress {
             month: "2026-10".into(),
             scope: EgressScope::Container,
+            incomplete: true,
             total: None,
             screen_members: 5,
             screen_guests: 0,

@@ -42,6 +42,11 @@ const PROBE_CLUSTER: f64 = 0.030;
 /// The release bucket keeps at most this much of `B` when idle (and at least two packets).
 pub const RELEASE_BURST: f64 = 0.010;
 pub const RELEASE_BURST_FLOOR: f64 = 2.0 * 1200.0;
+/// Upper bound for originals: 12-byte RTP header + 4-byte extension header + 32 bytes
+/// for two-byte-form MID (up to 16 bytes), TWCC, absolute-send-time, slot generation and
+/// alignment + 16-byte SRTP tag. Originals carry no CSRC or RID. UDP/IP are outside the
+/// socket-byte cap. The socket bucket also checks the actual serialized length.
+pub const ORIGINAL_OVERHEAD: usize = 64;
 /// Averages decide pauses; sending stays peak-capable.
 pub const AVERAGE_WINDOW: Duration = Duration::from_secs(2);
 /// A slot whose average with the higher-priority ones exceeds `B` this long is paused.
@@ -109,7 +114,7 @@ impl Queued {
     }
 
     fn size(&self) -> usize {
-        self.payload.len()
+        self.payload.len() + ORIGINAL_OVERHEAD
     }
 }
 
@@ -140,6 +145,7 @@ pub struct ShareMeter {
 impl ShareMeter {
     /// One forwarded packet; a late repair of an older frame counts towards the average only.
     pub fn record(&mut self, source: u64, timestamp: u32, size: usize, keyframe: bool, now: Instant) {
+        let size = size + ORIGINAL_OVERHEAD;
         let newest = self.highest.is_none_or(|highest| source > highest);
         if newest {
             self.highest = Some(source);
@@ -229,7 +235,7 @@ pub enum Change {
 /// How an outgoing datagram is charged at the socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Class {
-    /// RTP on a slot's main SSRC: paced by the release bucket, only counted here.
+    /// RTP on a slot's main SSRC: paced at admission/release and checked by serialized size.
     Original,
     /// Any other RTP: RTX repairs, padding and str0m's probes.
     Extra,
@@ -245,6 +251,7 @@ pub struct EgressCounters {
     pub control_bytes: u64,
     /// Extras the socket cap dropped.
     pub extras_dropped: u64,
+    pub originals_dropped: u64,
     /// Originals evicted at their deadline, refused at admission, or cleared with them.
     pub evicted: u64,
     pub rejected: u64,
@@ -258,9 +265,10 @@ pub struct Egress {
     lanes: Vec<Lane>,
     focus: Option<usize>,
     estimate: f64,
-    /// The release bucket, bytes; it may run one packet into debt.
+    /// The release bucket, in reserved serialized bytes.
     tokens: f64,
     refilled: Instant,
+    originals: Bucket,
     extras: Bucket,
     queued: usize,
     /// Whole seconds since `start` in which the extras bucket dropped something.
@@ -280,6 +288,11 @@ impl Egress {
             estimate,
             tokens: (RELEASE_BURST * PLAN * estimate / 8.0).max(RELEASE_BURST_FLOOR),
             refilled: now,
+            originals: Bucket::new(
+                PLAN * estimate / 8.0,
+                (RELEASE_BURST * PLAN * estimate / 8.0).max(RELEASE_BURST_FLOOR),
+                now,
+            ),
             extras: Bucket::new(extras_rate(estimate), extras_burst(estimate), now),
             queued: 0,
             dropped_seconds: VecDeque::new(),
@@ -331,6 +344,8 @@ impl Egress {
     pub fn set_estimate(&mut self, estimate: u64, now: Instant) {
         self.refill(now);
         self.estimate = estimate.max(1) as f64;
+        self.tokens = self.tokens.min(self.release_burst());
+        self.originals.reconfigure(self.release_rate(), self.release_burst(), now);
         self.extras.reconfigure(extras_rate(self.estimate), extras_burst(self.estimate), now);
     }
 
@@ -494,11 +509,15 @@ impl Egress {
         let mut at = 0;
         while self.tokens > 0.0 && at < order.len() {
             let lane = order[at];
-            let Some(packet) = self.lanes[lane].queue.pop_front() else {
+            let Some(packet) = self.lanes[lane].queue.front() else {
                 at += 1;
                 continue;
             };
             let size = packet.size();
+            if size as f64 > self.tokens {
+                break;
+            }
+            let packet = self.lanes[lane].queue.pop_front().unwrap();
             self.lanes[lane].bytes -= size;
             self.queued -= size;
             self.tokens -= size as f64;
@@ -512,11 +531,11 @@ impl Egress {
         if self.queued == 0 {
             return None;
         }
-        let release = if self.tokens > 0.0 {
-            self.refilled
-        } else {
-            self.refilled + Duration::from_secs_f64((1.0 - self.tokens) / self.release_rate().max(1.0))
-        };
+        let size = self.priority().into_iter().find_map(|lane| self.lanes[lane].queue.front()).map_or(0, Queued::size);
+        let release = self.refilled
+            + Duration::from_secs_f64(
+                ((size as f64 - self.tokens).max(0.0) / self.release_rate().max(1.0)).max(0.000001),
+            );
         let expiry = self.lanes.iter().filter_map(|l| l.queue.front()).map(|p| p.arrival + DEADLINE).min();
         Some(expiry.map_or(release, |expiry| expiry.min(release)))
     }
@@ -524,7 +543,13 @@ impl Egress {
     /// Charges one outgoing datagram of the watch transport; false drops it at the socket.
     pub fn charge(&mut self, class: Class, size: usize, now: Instant) -> bool {
         match class {
-            Class::Original => self.counters.original_bytes += size as u64,
+            Class::Original => {
+                if self.cap && !self.originals.take(size as f64, now) {
+                    self.counters.originals_dropped += 1;
+                    return false;
+                }
+                self.counters.original_bytes += size as u64;
+            }
             Class::Control => self.counters.control_bytes += size as u64,
             Class::Extra => {
                 if self.cap && !self.extras.take(size as f64, now) {
@@ -558,7 +583,7 @@ impl Egress {
             self.dropped_seconds.pop_front();
         }
         if self.dropped_seconds.len() > ESCALATION_SECONDS
-            && let Some(&lowest) = order.last()
+            && let Some(&lowest) = order.iter().rev().find(|&&l| !self.lanes[l].ramping(now))
         {
             self.dropped_seconds.clear();
             self.counters.escalations += 1;
@@ -566,7 +591,9 @@ impl Egress {
             return Some((lowest, Change::Pause(ScreenPauseReason::Bandwidth)));
         }
         // Keyframes that do not fit, whatever the average says.
-        if let Some(&lane) = order.iter().rev().find(|&&l| self.lanes[l].failures.len() >= FAILURES) {
+        if let Some(&lane) =
+            order.iter().rev().find(|&&l| !self.lanes[l].ramping(now) && self.lanes[l].failures.len() >= FAILURES)
+        {
             self.pause(lane, ScreenPauseReason::Bandwidth);
             return Some((lane, Change::Pause(ScreenPauseReason::Bandwidth)));
         }
@@ -589,25 +616,52 @@ impl Egress {
             self.pause(lane, ScreenPauseReason::Bandwidth);
             return Some((lane, Change::Pause(ScreenPauseReason::Bandwidth)));
         }
-        // Resuming accounts for the keyframe it is about to need.
-        let used: f64 = order.iter().map(|&l| average(l)).sum();
-        let mut paused: Vec<usize> =
-            (0..self.lanes.len()).filter(|&l| self.lanes[l].assigned && self.lanes[l].paused.is_some()).collect();
-        paused.sort_by_key(|&l| self.rank(l));
+        // Select the intended set across active AND paused lanes. A higher-priority paused
+        // share reserves its return before lower active ones, so focusing it reclaims room.
+        let mut all: Vec<_> = (0..self.lanes.len()).filter(|&l| self.lanes[l].assigned).collect();
+        all.sort_by_key(|&l| self.rank(l));
+        let mut used = 0.0;
+        let mut wanted_paused = false;
+        let mut displaced = None;
         let mut resume = None;
-        for lane in paused {
+        for lane in all {
             let rate = rates.get(lane).copied().unwrap_or_default();
-            let need = (RESUME_HEADROOM * rate.average).max(rate.last_keyframe as f64 * 8.0 / DEADLINE.as_secs_f64());
-            let allowed = budget || self.lanes[lane].paused == Some(ScreenPauseReason::Bandwidth);
+            let paused = self.lanes[lane].paused;
+            let need = if paused.is_some() {
+                (RESUME_HEADROOM * rate.average).max(rate.last_keyframe as f64 * 8.0 / DEADLINE.as_secs_f64())
+            } else {
+                rate.average
+            };
+            let fits = used + need <= plan;
+            if paused.is_none() {
+                if !fits && wanted_paused && !self.lanes[lane].ramping(now) {
+                    displaced = Some(lane);
+                }
+                used += need;
+                continue;
+            }
             let l = &mut self.lanes[lane];
-            if allowed && plan - used >= need {
+            if fits {
+                used += need;
+                wanted_paused = true;
+                // The viewer's fit timer and global budget guard run concurrently. The
+                // guard gates the transition, not the beginning of the viewer's timer.
                 let since = *l.fits_since.get_or_insert(now);
-                if resume.is_none() && now.saturating_duration_since(since) >= RESUME_FOR {
+                if resume.is_none()
+                    && now.saturating_duration_since(since) >= RESUME_FOR
+                    && (budget || paused == Some(ScreenPauseReason::Bandwidth))
+                {
                     resume = Some(lane);
                 }
             } else {
                 l.fits_since = None;
             }
+        }
+        // Keep feedback flowing while the intended share's fit timer matures. Pause
+        // the displaced slot only when the return is ready; resume on the next tick.
+        if let Some(lane) = displaced.filter(|_| resume.is_some()) {
+            self.pause(lane, ScreenPauseReason::Bandwidth);
+            return Some((lane, Change::Pause(ScreenPauseReason::Bandwidth)));
         }
         let lane = resume?;
         self.resume(lane);
@@ -736,7 +790,7 @@ mod tests {
         for n in 0..170 {
             dropped = e.admit(1, packet(n, 9, n == 0, 1200, now), now);
             if !dropped.is_empty() {
-                assert_eq!(n, 100, "the 101st packet does not fit");
+                assert_eq!(n as usize, 120_000 / (1200 + ORIGINAL_OVERHEAD), "wire overhead counts at admission");
                 break;
             }
         }
@@ -860,7 +914,8 @@ mod tests {
         // Burst 64 KB, 12.5 KB/s.
         assert!(e.charge(Class::Extra, 60_000, now));
         assert!(!e.charge(Class::Extra, 10_000, now));
-        assert!(e.charge(Class::Control, 10_000, now) && e.charge(Class::Original, 10_000, now));
+        assert!(e.charge(Class::Control, 10_000, now));
+        assert!(!e.charge(Class::Original, 10_000, now), "originals also obey the socket cap");
         // Drops in the first second, then in the next: two seconds are not yet enough.
         assert_eq!(e.allocate(now, &rates, true), None);
         now += Duration::from_secs(1);
@@ -880,15 +935,91 @@ mod tests {
             meter.record(n, 1, 1000, n == 0, now);
         }
         // The keyframe is still arriving: it counts as far as it got.
-        assert_eq!(meter.rate(now).last_keyframe, 100_000);
+        assert_eq!(meter.rate(now).last_keyframe, 100 * (1000 + ORIGINAL_OVERHEAD));
         meter.record(101, 2, 500, false, now + 10 * MS);
         // A late repair of the keyframe counts towards the average only.
         meter.record(100, 1, 1000, false, now + 20 * MS);
         let rate = meter.rate(now + 20 * MS);
-        assert_eq!((rate.last_keyframe, rate.largest_keyframe), (100_000, 100_000));
-        assert_eq!(rate.average, 101_500.0 * 8.0 / 2.0);
+        assert_eq!(
+            (rate.last_keyframe, rate.largest_keyframe),
+            (100 * (1000 + ORIGINAL_OVERHEAD), 100 * (1000 + ORIGINAL_OVERHEAD))
+        );
+        assert_eq!(rate.average, (101_500 + 102 * ORIGINAL_OVERHEAD) as f64 * 8.0 / 2.0);
         assert_eq!(meter.rate(now + Duration::from_secs(3)).average, 0.0);
-        assert_eq!(meter.rate(now + Duration::from_secs(31)).largest_keyframe, 100_000, "the last one stays");
+        assert_eq!(
+            meter.rate(now + Duration::from_secs(31)).largest_keyframe,
+            100 * (1000 + ORIGINAL_OVERHEAD),
+            "the last one stays"
+        );
+    }
+
+    #[test]
+    fn tiny_originals_obey_wire_admission_pacing_and_socket_caps() {
+        let start = Instant::now();
+        let mut e = egress(100_000, 1, start);
+        let mut sent = 0;
+        for ms in 0..10_000 {
+            let now = start + Duration::from_millis(ms);
+            e.admit(0, packet(ms, ms as u32, true, 16, now), now);
+            assert!(e.queued() <= e.admission_bound());
+            for (_, packet) in e.due(now).0 {
+                let wire = packet.payload.len() + ORIGINAL_OVERHEAD;
+                assert!(e.charge(Class::Original, wire, now));
+                sent += wire;
+            }
+        }
+        assert!(sent as f64 <= 10.0 * e.release_rate() + e.release_burst());
+        assert_eq!(e.counters.original_bytes, sent as u64);
+        assert_eq!(e.counters.originals_dropped, 0);
+    }
+
+    #[test]
+    fn extras_escalation_cannot_bypass_a_new_slots_ramp() {
+        let start = Instant::now();
+        let mut e = Egress::new(start);
+        e.add_lane();
+        e.assign(0, 0, start);
+        for second in 0..10 {
+            let now = start + Duration::from_secs(second);
+            while e.charge(Class::Extra, 1200, now) {}
+            assert_eq!(e.allocate(now, &[ShareRate::default()], true), None);
+        }
+        assert_eq!(
+            e.allocate(start + RAMP, &[ShareRate::default()], true),
+            Some((0, Change::Pause(ScreenPauseReason::Bandwidth)))
+        );
+    }
+
+    #[test]
+    fn focusing_a_paused_share_reclaims_room_one_change_per_tick() {
+        let start = Instant::now();
+        let mut e = egress(5_000_000, 2, start);
+        let rates = [ShareRate { average: 3_000_000.0, ..Default::default() }; 2];
+        e.pause(1, ScreenPauseReason::Bandwidth);
+        e.focus(Some(1));
+        for second in 0..10 {
+            assert_eq!(e.allocate(start + Duration::from_secs(second), &rates, true), None);
+            assert_eq!(e.paused(0), None, "keep media feedback while the fit timer matures");
+        }
+        assert_eq!(
+            e.allocate(start + RESUME_FOR, &rates, true),
+            Some((0, Change::Pause(ScreenPauseReason::Bandwidth)))
+        );
+        assert_eq!(e.paused(1), Some(ScreenPauseReason::Bandwidth));
+        assert_eq!(e.allocate(start + RESUME_FOR + 100 * MS, &rates, true), Some((1, Change::Resume)));
+        assert_eq!(e.paused(0), Some(ScreenPauseReason::Bandwidth));
+    }
+
+    #[test]
+    fn budget_guard_and_viewer_fit_timer_run_concurrently() {
+        let start = Instant::now();
+        let mut e = egress(5_000_000, 1, start);
+        let rates = [ShareRate { average: 1_000_000.0, ..Default::default() }];
+        e.pause(0, ScreenPauseReason::Budget);
+        for second in 0..10 {
+            assert_eq!(e.allocate(start + Duration::from_secs(second), &rates, false), None);
+        }
+        assert_eq!(e.allocate(start + RESUME_FOR, &rates, true), Some((0, Change::Resume)));
     }
 
     #[test]

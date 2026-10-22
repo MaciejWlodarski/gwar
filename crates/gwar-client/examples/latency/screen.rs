@@ -135,6 +135,22 @@ struct Counters {
     received_packets: AtomicU64,
     pauses: AtomicU64,
     resumes: AtomicU64,
+    viewer_bytes: Vec<AtomicU64>,
+}
+
+#[derive(Clone, Serialize)]
+struct Sample {
+    unix_s: f64,
+    received_bytes: u64,
+    viewer_bytes: Vec<u64>,
+}
+
+fn sample(counters: &Counters) -> Sample {
+    Sample {
+        unix_s: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs_f64(),
+        received_bytes: counters.received_bytes.load(Ordering::Relaxed),
+        viewer_bytes: counters.viewer_bytes.iter().map(|n| n.load(Ordering::Relaxed)).collect(),
+    }
 }
 
 /// The load runs on its own runtime, so its str0m loops neither delay the voice clients' and
@@ -144,7 +160,8 @@ pub struct Load {
     spec: Spec,
     counters: Arc<Counters>,
     /// Received bytes when the viewers' slots are past their ramp, for the steady rate.
-    steady: Arc<std::sync::Mutex<Option<(Instant, u64)>>>,
+    samples: Arc<std::sync::Mutex<Vec<Sample>>>,
+    running: Running,
     runtime: Option<tokio::runtime::Runtime>,
     started: Instant,
 }
@@ -159,7 +176,7 @@ impl Drop for Load {
 
 /// What keeps the load going on its runtime: the str0m loops and the gwar connections.
 struct Running {
-    _tasks: Vec<JoinHandle<()>>,
+    tasks: Vec<JoinHandle<Result<()>>>,
     _connections: Vec<Connected>,
 }
 
@@ -221,7 +238,10 @@ impl Load {
             .thread_name("screen-load")
             .enable_all()
             .build()?;
-        let counters = Arc::new(Counters::default());
+        let counters = Arc::new(Counters {
+            viewer_bytes: (0..spec.viewers).map(|_| AtomicU64::new(0)).collect(),
+            ..Counters::default()
+        });
         let (url, load) = (url.to_owned(), spec.clone());
         let running = runtime.spawn(run(url, load, channel, advertised, relay, server, counters.clone()));
         let running = match running.await {
@@ -232,18 +252,16 @@ impl Load {
                 return Err(failed.map_err(anyhow::Error::from).and_then(|r| r.map(drop)).unwrap_err());
             }
         };
-        // The loops and connections live until the runtime shuts down.
-        runtime.spawn(async move {
-            let _running = running;
-            std::future::pending::<()>().await
-        });
-        let steady = Arc::new(std::sync::Mutex::new(None));
-        let (mark, received) = (steady.clone(), counters.clone());
+        let samples = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (mark, received) = (samples.clone(), counters.clone());
         runtime.spawn(async move {
             tokio::time::sleep(STEADY_AFTER).await;
-            *mark.lock().unwrap() = Some((Instant::now(), received.received_bytes.load(Ordering::Relaxed)));
+            loop {
+                mark.lock().unwrap().push(sample(&received));
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
         });
-        Ok(Self { spec, counters, steady, runtime: Some(runtime), started: Instant::now() })
+        Ok(Self { spec, counters, samples, running, runtime: Some(runtime), started: Instant::now() })
     }
 }
 
@@ -284,25 +302,42 @@ async fn run(
     for n in 0..spec.viewers {
         let mut viewer = join(url, &format!("screen viewer {n}")).await?;
         let through = matches!(spec.via, Via::Viewers | Via::All);
-        tasks.push(watch(&viewer, advertised, route(through), counters.clone()).await?);
+        tasks.push(watch(&viewer, n, advertised, route(through), counters.clone()).await?);
         for share in &shares {
             viewer.connection.request(Request::ScreenWatch { share: share.clone() }).await.context("screen.watch")?;
         }
         tasks.push(drain(&mut viewer, counters.clone()));
         connections.push(viewer);
     }
-    Ok(Running { _tasks: tasks, _connections: connections })
+    Ok(Running { tasks, _connections: connections })
 }
 
 impl Load {
-    pub fn report(&self) -> serde_json::Value {
+    pub async fn report(&mut self) -> Result<serde_json::Value> {
+        if let Some(index) = self.running.tasks.iter().position(JoinHandle::is_finished) {
+            self.running.tasks.swap_remove(index).await.context("screen load task panicked")??;
+            bail!("screen load task stopped unexpectedly");
+        }
         let c = &self.counters;
         let seconds = self.started.elapsed().as_secs_f64();
         let received = c.received_bytes.load(Ordering::Relaxed);
-        let steady = self.steady.lock().unwrap().map(|(at, bytes)| {
-            (received - bytes) as f64 * 8.0 / at.elapsed().as_secs_f64() / 1e6 / self.spec.viewers as f64
-        });
-        serde_json::json!({
+        let mut samples = self.samples.lock().unwrap().clone();
+        if !samples.is_empty() {
+            samples.push(sample(c));
+        }
+        let first = samples.first();
+        let last = samples.last();
+        let steady_rates: Vec<f64> = match (first, last) {
+            (Some(a), Some(b)) if b.unix_s > a.unix_s => a
+                .viewer_bytes
+                .iter()
+                .zip(&b.viewer_bytes)
+                .map(|(a_bytes, b_bytes)| (b_bytes - a_bytes) as f64 * 8.0 / (b.unix_s - a.unix_s) / 1e6)
+                .collect(),
+            _ => Vec::new(),
+        };
+        let steady = (!steady_rates.is_empty()).then(|| steady_rates.iter().sum::<f64>() / self.spec.viewers as f64);
+        Ok(serde_json::json!({
             "spec": self.spec,
             "seconds": seconds,
             "frames": c.frames.load(Ordering::Relaxed),
@@ -314,14 +349,17 @@ impl Load {
             "received_mbps_per_viewer": received as f64 * 8.0 / seconds / 1e6 / self.spec.viewers as f64,
             "steady_after_s": STEADY_AFTER.as_secs(),
             "steady_mbps_per_viewer": steady,
+            "steady_viewer_mbps": steady_rates,
+            "settled_unix_s": first.map(|s| s.unix_s),
+            "samples": samples,
             "pauses": c.pauses.load(Ordering::Relaxed),
             "resumes": c.resumes.load(Ordering::Relaxed),
-        })
+        }))
     }
 }
 
 /// Reads a connection's events, so that they never back up, counting pauses and resumes.
-fn drain(client: &mut Connected, counters: Arc<Counters>) -> JoinHandle<()> {
+fn drain(client: &mut Connected, counters: Arc<Counters>) -> JoinHandle<Result<()>> {
     let mut events = std::mem::replace(&mut client.events, tokio::sync::mpsc::channel(1).1);
     tokio::spawn(async move {
         while let Some(event) = events.recv().await {
@@ -331,6 +369,7 @@ fn drain(client: &mut Connected, counters: Arc<Counters>) -> JoinHandle<()> {
                 _ => 0,
             };
         }
+        bail!("screen control connection closed")
     })
 }
 
@@ -343,7 +382,7 @@ async fn publish(
     advertised: SocketAddr,
     media: SocketAddr,
     counters: Arc<Counters>,
-) -> Result<JoinHandle<()>> {
+) -> Result<JoinHandle<Result<()>>> {
     let (socket, local) = socket().await?;
     // Paced like a browser's sender: str0m's pacer at the share's rate, adapting to TWCC.
     let mut rtc = Rtc::builder()
@@ -365,9 +404,7 @@ async fn publish(
     rtc.bwe().set_desired_bitrate(Bitrate::bps(spec.bitrate * 3 / 2));
     let pt = rtc.codec_config().params().iter().find(|p| p.spec().codec == Codec::Vp9).context("VP9")?.pt();
     let (bitrate, fps, keyframe) = (spec.bitrate, spec.fps, spec.keyframe);
-    Ok(tokio::spawn(async move {
-        let _ = sender(rtc, socket, local, mid, pt, bitrate, fps, keyframe, counters).await;
-    }))
+    Ok(tokio::spawn(sender(rtc, socket, local, mid, pt, bitrate, fps, keyframe, counters)))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -437,10 +474,11 @@ async fn sender(
 /// A viewer's watch transport with four receive-only slots, counting what arrives.
 async fn watch(
     viewer: &Connected,
+    viewer_index: usize,
     advertised: SocketAddr,
     media: SocketAddr,
     counters: Arc<Counters>,
-) -> Result<JoinHandle<()>> {
+) -> Result<JoinHandle<Result<()>>> {
     let (socket, local) = socket().await?;
     let mut rtc =
         Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp9(true).enable_vp8(true).build(Instant::now());
@@ -460,9 +498,7 @@ async fn watch(
     let reply = viewer.connection.request(Request::ScreenWatchOffer(request)).await.context("screen.watch.offer")?;
     rtc.sdp_api().accept_answer(pending, answer(reply["sdp"].as_str().context("answer")?, advertised, media)?)?;
     let (ready, connected) = tokio::sync::oneshot::channel();
-    let task = tokio::spawn(async move {
-        let _ = receiver(rtc, socket, local, counters, ready).await;
-    });
+    let task = tokio::spawn(receiver(rtc, socket, local, counters, viewer_index, ready));
     tokio::time::timeout(Duration::from_secs(10), connected).await.context("watch transport connects")??;
     Ok(task)
 }
@@ -472,6 +508,7 @@ async fn receiver(
     socket: Arc<UdpSocket>,
     local: SocketAddr,
     counters: Arc<Counters>,
+    viewer_index: usize,
     ready: tokio::sync::oneshot::Sender<()>,
 ) -> Result<()> {
     let mut ready = Some(ready);
@@ -489,6 +526,7 @@ async fn receiver(
                     }
                 }
                 Output::Event(Event::RtpPacket(p)) => {
+                    counters.viewer_bytes[viewer_index].fetch_add(p.payload.len() as u64, Ordering::Relaxed);
                     counters.received_packets.fetch_add(1, Ordering::Relaxed);
                     counters.received_bytes.fetch_add(p.payload.len() as u64, Ordering::Relaxed);
                 }
@@ -510,6 +548,23 @@ async fn receiver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn load_task_failures_propagate_to_the_run() {
+        let task = tokio::spawn(async { anyhow::bail!("injected publisher failure") });
+        while !task.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        let mut load = Load {
+            spec: Spec::parse("shares=1,viewers=1").unwrap(),
+            counters: Arc::new(Counters::default()),
+            samples: Arc::new(std::sync::Mutex::new(Vec::new())),
+            running: Running { tasks: vec![task], _connections: Vec::new() },
+            runtime: None,
+            started: Instant::now(),
+        };
+        assert!(load.report().await.unwrap_err().to_string().contains("injected publisher failure"));
+    }
 
     #[test]
     fn specs_parse_strictly() {

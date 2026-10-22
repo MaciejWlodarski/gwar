@@ -634,15 +634,19 @@ async fn run(
             warmup_samples: settings.warmup_samples,
         })
     };
+    let voice_addresses = match &net {
+        Some((relay, _, _)) => [relay.voice_address(0)?, relay.voice_address(1)?],
+        None => [media_addr; 2],
+    };
     let receiver_io = io(&heard, false, settings.extra_delay_ms * RATE / 1000, settings.callback_jitter);
     let (va, vb) = match &calls {
         None => (
-            voice::start(&a.connection, io(&sent, true, 0, false), media_addr).await?,
-            voice::start(&b.connection, receiver_io, media_addr).await?,
+            voice::start(&a.connection, io(&sent, true, 0, false), voice_addresses[0]).await?,
+            voice::start(&b.connection, receiver_io, voice_addresses[1]).await?,
         ),
         Some((a_state, b_state)) => {
-            let (va, a_binding) = encrypted_start(&a, a_state, io(&sent, true, 0, false), media_addr).await?;
-            let (vb, b_binding) = encrypted_start(&b, b_state, receiver_io, media_addr).await?;
+            let (va, a_binding) = encrypted_start(&a, a_state, io(&sent, true, 0, false), voice_addresses[0]).await?;
+            let (vb, b_binding) = encrypted_start(&b, b_state, receiver_io, voice_addresses[1]).await?;
             mls::activate(va.keys().context("sender keys")?, &sender, &a_binding).await?;
             mls::activate(vb.keys().context("receiver keys")?, &receiver, &b_binding).await?;
             (va, vb)
@@ -715,7 +719,10 @@ async fn run(
         }
     }
     drop((va, vb));
-    let screen = load.map(|load| load.report());
+    let screen = match load {
+        Some(mut load) => Some(load.report().await?),
+        None => None,
+    };
     let network = if let Some((relay, _, _)) = &mut net { Some(relay.finish().await?) } else { None };
     let sent = sent.lock().unwrap();
     let heard = heard.lock().unwrap();

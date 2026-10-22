@@ -14,7 +14,7 @@ pub(super) const EGRESS_EVERY: Duration = Duration::from_secs(60);
 const TB: f64 = 1e12;
 
 /// One read of the interface's transmitted-bytes counter.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Reading {
     pub interface: String,
     pub transmitted: u64,
@@ -29,7 +29,28 @@ fn default_interface(route: &str) -> Option<String> {
         .filter_map(|line| {
             let fields: Vec<&str> = line.split_whitespace().collect();
             let metric: u64 = fields.get(6)?.parse().ok()?;
-            (fields.get(1) == Some(&"00000000")).then(|| (metric, fields[0].to_owned()))
+            let flags = u32::from_str_radix(fields.get(3)?, 16).ok()?;
+            (fields.get(1) == Some(&"00000000") && fields.get(7) == Some(&"00000000") && flags & 1 != 0)
+                .then(|| (metric, fields[0].to_owned()))
+        })
+        .min()
+        .map(|(_, interface)| interface)
+}
+
+/// IPv6 default routes: zero destination/prefix, UP, lowest hexadecimal metric.
+fn default_ipv6_interface(route: &str) -> Option<String> {
+    route
+        .lines()
+        .filter_map(|line| {
+            let f: Vec<_> = line.split_whitespace().collect();
+            let metric = u64::from_str_radix(f.get(5)?, 16).ok()?;
+            let flags = u32::from_str_radix(f.get(8)?, 16).ok()?;
+            (f.first() == Some(&"00000000000000000000000000000000")
+                && f.get(1) == Some(&"00")
+                && f.get(3) == Some(&"00")
+                && flags & 1 != 0
+                && flags & 0x200 == 0)
+                .then_some((metric, f.get(9)?.to_string()))
         })
         .min()
         .map(|(_, interface)| interface)
@@ -61,7 +82,10 @@ pub fn read() -> Option<Reading> {
     if !cfg!(target_os = "linux") {
         return None;
     }
-    let interface = default_interface(&std::fs::read_to_string("/proc/net/route").ok()?)?;
+    let interface =
+        std::fs::read_to_string("/proc/net/route").ok().and_then(|route| default_interface(&route)).or_else(|| {
+            std::fs::read_to_string("/proc/net/ipv6_route").ok().and_then(|route| default_ipv6_interface(&route))
+        })?;
     let transmitted = transmitted(&std::fs::read_to_string("/proc/net/dev").ok()?, &interface)?;
     let scope = if in_container() { EgressScope::Container } else { EgressScope::Host };
     Some(Reading { interface, transmitted, scope })
@@ -73,7 +97,7 @@ fn month(ms: i64) -> String {
 }
 
 /// The month's totals, mirrored from the store.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub(super) struct Egress {
     month: String,
     scope: Option<EgressScope>,
@@ -83,22 +107,21 @@ pub(super) struct Egress {
     /// The highest warning given this month: 0, 80 or 100.
     warned: u32,
     /// The screen SFU's cumulative counters at the last tick.
+    #[serde(skip)]
     seen: (u64, u64),
+    checkpoint: Option<(Reading, i64)>,
+    /// Some interval could not be attributed to this month, or was not observed.
+    incomplete: bool,
 }
 
 impl Egress {
     /// The month's totals as stored (a restart keeps counting).
     pub(super) fn load(store: &Store) -> Result<Self> {
-        let number = |key: &str| -> Result<u64> { Ok(store.meta(key)?.and_then(|v| v.parse().ok()).unwrap_or(0)) };
-        Ok(Self {
-            month: store.meta("egress_month")?.unwrap_or_default(),
-            scope: None,
-            total: number("egress_total")?,
-            screen_members: number("egress_screen_members")?,
-            screen_guests: number("egress_screen_guests")?,
-            warned: number("egress_warned")? as u32,
-            seen: (0, 0),
-        })
+        store
+            .meta("egress_checkpoint")?
+            .map(|value| serde_json::from_str(&value).map_err(Into::into))
+            .transpose()
+            .map(|value| value.unwrap_or_default())
     }
 }
 
@@ -134,38 +157,52 @@ impl Core {
         self.screen_limits.monthly_egress_stop && self.egress.total >= self.egress_limit()
     }
 
-    /// One minute's reading, at `now` (Unix ms). The interface counter's delta since the last
-    /// read joins the month's total; a counter lower than the last read (a reboot or a wrap),
-    /// or another interface, counts from zero. The first read ever only sets the baseline.
+    /// One atomic checkpoint. An interface switch or an interval crossing UTC months
+    /// rebaselines instead of assigning lifetime/downtime traffic to the current month.
     pub(super) fn egress_tick(&mut self, reading: Option<Reading>, shared: (u64, u64), now: i64) -> Result<()> {
-        let month = month(now);
-        if self.egress.month != month {
-            self.egress = Egress { month: month.clone(), seen: self.egress.seen, ..Egress::default() };
-            self.store.set_meta("egress_month", &month)?;
-            self.store.set_meta("egress_warned", "0")?;
-        }
-        let (members, guests) = shared;
-        self.egress.screen_members += members.saturating_sub(self.egress.seen.0);
-        self.egress.screen_guests += guests.saturating_sub(self.egress.seen.1);
-        self.egress.seen = shared;
-        self.egress.scope = Some(reading.as_ref().map_or(EgressScope::Unavailable, |r| r.scope));
+        let current = month(now);
+        let changed_month = self.egress.month != current;
+        let mut next = if changed_month {
+            Egress { month: current, seen: shared, incomplete: true, ..Egress::default() }
+        } else {
+            self.egress.clone()
+        };
+        next.screen_members += shared.0.saturating_sub(next.seen.0);
+        next.screen_guests += shared.1.saturating_sub(next.seen.1);
+        next.seen = shared;
+        next.scope = Some(reading.as_ref().map_or(EgressScope::Unavailable, |r| r.scope));
         if let Some(reading) = reading {
-            let last = self.store.meta("egress_counter")?;
-            let delta = match last.as_deref().and_then(|l| l.rsplit_once(':')) {
-                Some((interface, value)) if interface == reading.interface => match value.parse::<u64>() {
-                    Ok(value) if reading.transmitted >= value => reading.transmitted - value,
-                    _ => reading.transmitted,
-                },
-                Some(_) => reading.transmitted,
-                None => 0,
-            };
-            self.egress.total += delta;
-            self.store.set_meta("egress_counter", &format!("{}:{}", reading.interface, reading.transmitted))?;
+            if let Some((last, at)) = &next.checkpoint {
+                if month(*at) == next.month && last.interface == reading.interface {
+                    next.total += if reading.transmitted >= last.transmitted {
+                        reading.transmitted - last.transmitted
+                    } else {
+                        reading.transmitted
+                    };
+                } else {
+                    next.incomplete = true;
+                }
+            }
+            if !changed_month && next.checkpoint.is_none() {
+                next.incomplete = true;
+            }
+            next.checkpoint = Some((reading, now));
+        } else {
+            next.incomplete = true;
         }
-        self.store.set_meta("egress_total", &self.egress.total.to_string())?;
-        self.store.set_meta("egress_screen_members", &self.egress.screen_members.to_string())?;
-        self.store.set_meta("egress_screen_guests", &self.egress.screen_guests.to_string())?;
-        self.egress_warn()
+        let percent =
+            [100, 80].into_iter().find(|&p| next.total as f64 >= self.egress_limit() as f64 * p as f64 / 100.0);
+        let warning = percent.filter(|&p| p > next.warned);
+        if let Some(percent) = warning {
+            next.warned = percent;
+        }
+        let checkpoint = serde_json::to_string(&next)?;
+        self.store.atomically(|store| store.set_meta("egress_checkpoint", &checkpoint))?;
+        self.egress = next;
+        if let Some(percent) = warning {
+            self.broadcast_egress_warning(percent);
+        }
+        Ok(())
     }
 
     /// Warns admins once a month for each of 80 % and 100 % of the limit.
@@ -174,8 +211,17 @@ impl Core {
         let total = self.egress.total;
         let percent = [100, 80].into_iter().find(|&p| total as f64 >= limit as f64 * p as f64 / 100.0);
         let Some(percent) = percent.filter(|&p| p > self.egress.warned) else { return Ok(()) };
-        self.egress.warned = percent;
-        self.store.set_meta("egress_warned", &percent.to_string())?;
+        let mut next = self.egress.clone();
+        next.warned = percent;
+        let checkpoint = serde_json::to_string(&next)?;
+        self.store.atomically(|store| store.set_meta("egress_checkpoint", &checkpoint))?;
+        self.egress = next;
+        self.broadcast_egress_warning(percent);
+        Ok(())
+    }
+
+    fn broadcast_egress_warning(&mut self, percent: u32) {
+        let (total, limit) = (self.egress.total, self.egress_limit());
         warn!(
             month = self.egress.month,
             total, limit, "this month's outbound transfer reached {percent} % of the limit"
@@ -184,7 +230,6 @@ impl Core {
             self.sessions.keys().copied().filter(|&s| self.require(s, Permission::ManageServer).is_ok()).collect();
         let event = Event::ServerEgressWarning { month: self.egress.month.clone(), percent, total, limit };
         self.broadcast(event, |s| admins.contains(&s.id));
-        Ok(())
     }
 
     /// `server.egress`, for the server settings.
@@ -194,6 +239,7 @@ impl Core {
         Ok(Response::ServerEgress(ServerEgress {
             month: if self.egress.month.is_empty() { month(now_ms()) } else { self.egress.month.clone() },
             scope,
+            incomplete: self.egress.incomplete,
             total: (scope != EgressScope::Unavailable).then_some(self.egress.total),
             screen_members: self.egress.screen_members,
             screen_guests: self.egress.screen_guests,
@@ -279,9 +325,9 @@ mod tests {
         core.egress_tick(read("eth0", 2_000), (150, 7), october).unwrap();
         assert_eq!(core.egress.total, 6_000, "a lower counter (a reboot) counts from zero");
         core.egress_tick(read("eth1", 500), (150, 7), october).unwrap();
-        assert_eq!(core.egress.total, 6_500, "so does another interface");
+        assert_eq!(core.egress.total, 6_000, "another interface rebaselines");
         core.egress_tick(None, (150, 7), october).unwrap();
-        assert_eq!((core.egress.total, core.egress.scope), (6_500, Some(EgressScope::Unavailable)));
+        assert_eq!((core.egress.total, core.egress.scope), (6_000, Some(EgressScope::Unavailable)));
 
         // 1 TB: 80 % once, then 100 %.
         core.set_screen_limits(ScreenLimits { monthly_egress_tb: 1, ..Default::default() }).unwrap();
@@ -301,9 +347,54 @@ mod tests {
         let stored = Egress::load(&core.store).unwrap();
         assert_eq!((stored.month.as_str(), stored.total, stored.warned), ("2025-10", core.egress.total, 100));
         core.egress_tick(read("eth1", 500 + 1_000_000_001_000), (160, 7), november).unwrap();
-        assert_eq!((core.egress.month.as_str(), core.egress.total, core.egress.warned), ("2025-11", 1_000, 0));
-        assert_eq!((core.egress.screen_members, core.egress.screen_guests), (10, 0));
+        assert_eq!((core.egress.month.as_str(), core.egress.total, core.egress.warned), ("2025-11", 0, 0));
+        assert_eq!((core.egress.screen_members, core.egress.screen_guests), (0, 0));
         assert!(!core.egress_stopped());
+    }
+
+    #[test]
+    fn route_selection_rejects_half_defaults_down_routes_and_uses_ipv6() {
+        let route = "Iface Destination Gateway Flags RefCnt Use Metric Mask\n\
+            half 00000000 00000000 0001 0 0 0 00000080\n\
+            down 00000000 00000000 0000 0 0 0 00000000\n\
+            eth0 00000000 00000000 0001 0 0 100 00000000\n";
+        assert_eq!(default_interface(route).as_deref(), Some("eth0"));
+        let zero = "00000000000000000000000000000000";
+        let routes = format!(
+            "{zero} 01 {zero} 00 {zero} 00000000 0 0 00000001 half\n\
+            {zero} 00 {zero} 00 {zero} 00000001 0 0 00000201 reject\n\
+            {zero} 00 {zero} 00 {zero} 00000001 0 0 00000000 down\n\
+            {zero} 00 {zero} 00 {zero} 000000ff 0 0 00000001 eth1\n\
+            {zero} 00 {zero} 00 {zero} 00000010 0 0 00000001 eth0"
+        );
+        assert_eq!(default_ipv6_interface(&routes).as_deref(), Some("eth0"));
+    }
+
+    #[test]
+    fn failed_checkpoints_leave_memory_and_storage_unchanged_then_retry_once() {
+        let mut core = core();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("counter.db");
+        core.store = Store::open(&path).unwrap();
+        let now = 1_760_000_000_000;
+        let read = |n| Some(Reading { interface: "eth0".into(), transmitted: n, scope: EgressScope::Host });
+        core.egress_tick(read(1000), (0, 0), now).unwrap();
+        let before = core.egress.clone();
+        let db = rusqlite::Connection::open(&path).unwrap();
+        db.execute_batch("CREATE TRIGGER fail_checkpoint BEFORE UPDATE ON meta WHEN NEW.key='egress_checkpoint' BEGIN SELECT RAISE(ABORT, 'injected failure'); END;").unwrap();
+        assert!(core.egress_tick(read(2000), (100, 7), now + 60_000).is_err());
+        assert_eq!(core.egress, before);
+        assert_eq!(Egress::load(&core.store).unwrap(), before);
+        db.execute_batch("DROP TRIGGER fail_checkpoint;").unwrap();
+        core.egress_tick(read(2000), (100, 7), now + 60_000).unwrap();
+        assert_eq!((core.egress.total, core.egress.screen_members), (1000, 100));
+        core.egress = Egress::load(&core.store).unwrap();
+        core.egress_tick(read(2500), (0, 0), now + 120_000).unwrap();
+        assert_eq!((core.egress.total, core.egress.screen_members), (1500, 100));
+        core.egress_tick(read(9000), (0, 0), now + 30 * 86_400_000).unwrap();
+        assert_eq!(core.egress.total, 0);
+        assert!(core.egress.incomplete);
+        assert!(Egress::load(&core.store).unwrap().incomplete);
     }
 
     #[test]

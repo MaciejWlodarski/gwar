@@ -5,16 +5,20 @@ import type { ScreenLimits } from "./ScreenLimits";
 /**
  * `server.egress`: this calendar month's outbound transfer (UTC), for the server settings.
  */
-export type ServerEgress = { 
+export type ServerEgress = {
 /**
  * `YYYY-MM`, UTC.
  */
-month: string, scope: EgressScope, 
+month: string, scope: EgressScope,
+/**
+ * True when some traffic could not be attributed to this month or observed.
+ */
+incomplete: boolean,
 /**
  * Bytes the interface sent this month, every service on it included; `null` where
  * unavailable.
  */
-total: number | null, 
+total: number | null,
 /**
  * Of those, the screen SFU's to members and to guests.
  */

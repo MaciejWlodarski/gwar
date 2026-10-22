@@ -130,9 +130,10 @@ describe("gwar/4 runtime schemas", () => {
   it("bounds the egress report, its warnings and the screen limits", () => {
     const event = (ev: string, d: unknown) => parseFrame(JSON.stringify({ ev, d }))?.kind;
     const limits = { shares_per_channel: 4, shares_per_server: 32, viewers_per_share: 25, share_cap_kbps: 8000, budget_mbps: 300, monthly_egress_tb: 10, monthly_egress_stop: false };
-    const egress = { month: "2026-10", scope: "host", total: 123, screen_members: 4, screen_guests: 0, limits };
+    const egress = { month: "2026-10", scope: "host", incomplete: false, total: 123, screen_members: 4, screen_guests: 0, limits };
     expect(responseFor("server.egress", egress)).toBe(true);
     expect(responseFor("server.egress", { ...egress, scope: "unavailable", total: null })).toBe(true);
+    expect(responseFor("server.egress", { ...egress, incomplete: "false" })).toBe(false);
     expect(responseFor("server.egress", { ...egress, month: "October" })).toBe(false);
     expect(responseFor("server.egress", { ...egress, scope: "cloud" })).toBe(false);
     expect(responseFor("server.egress", { ...egress, limits: { ...limits, budget_mbps: 0 } })).toBe(false);

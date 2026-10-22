@@ -3,7 +3,8 @@
 
 Paired runs of the latency example, without and with a LATENCY_SCREEN load, alternating
 which goes first, per scenario. Each pair shares its LATENCY_NET seed. The gate compares
-the median of the per-pair deltas:
+the median of the per-pair deltas and allows at most one threshold violation per ten
+pairs (zero for a shortened run of fewer than ten pairs):
 
 - unconstrained (no rate limit): p95 and p99 within 2 ms of the baseline, and no more
   playout underruns than the baseline in total;
@@ -86,7 +87,53 @@ def gate(pairs, constrained):
             f"p99 within {UNCONSTRAINED_MS} ms": delta["p99_ms"] <= UNCONSTRAINED_MS,
             "no extra underruns": underruns["screen"] <= underruns["baseline"],
         }
-    return {"median_delta": delta, "underruns": underruns, "checks": checks, "pass": all(checks.values())}
+    def regresses(pair):
+        a, b = pair["baseline"], pair["screen"]
+        if constrained:
+            return (b["p99_ms"] - a["p99_ms"] > CONSTRAINED_MS
+                    or b["underrun_fraction"] - a["underrun_fraction"] > UNDERRUN_FRACTION)
+        return (b["p95_ms"] - a["p95_ms"] > UNCONSTRAINED_MS
+                or b["p99_ms"] - a["p99_ms"] > UNCONSTRAINED_MS
+                or b["underruns"] > a["underruns"])
+    tail_pairs = sum(regresses(p) for p in pairs)
+    allowed = len(pairs) // 10
+    checks[f"at most {allowed} regressing pairs"] = tail_pairs <= allowed
+    return {"median_delta": delta, "underruns": underruns, "tail_pairs": tail_pairs,
+            "allowed_tail_pairs": allowed, "checks": checks, "pass": all(checks.values())}
+
+
+def validate_load(meta, expected, constrained):
+    """A quiet SFU cannot pass the voice-under-load gate. Every viewer must carry video."""
+    load = meta.get("screen")
+    if not isinstance(load, dict) or load.get("spec", {}).get("source") != expected:
+        raise RuntimeError("missing or unexpected screen load spec")
+    spec = load["spec"]
+    expected_fields = dict(option.split("=") for option in expected.split(","))
+    bitrate = expected_fields["bitrate"]
+    expected_fields["bitrate"] = int(float(bitrate.removesuffix("mbit")) * 1e6)
+    for field in ("shares", "fps", "keyframe", "viewers"):
+        expected_fields[field] = int(expected_fields[field])
+    if any(spec.get(key) != value for key, value in expected_fields.items()):
+        raise RuntimeError("screen load fields differ from the expected spec")
+    # Downlink scenarios intentionally keep one of the two 3 Mbps shares running.
+    active_shares = 1 if constrained else spec["shares"]
+    minimum = spec["bitrate"] * active_shares / 1e6 * 0.6
+    rates = load.get("steady_viewer_mbps", [])
+    samples = load.get("samples", [])
+    if (len(rates) != spec["viewers"] or not samples
+            or samples[-1]["unix_s"] - samples[0]["unix_s"] < 1.0
+            or any(not isinstance(rate, (int, float)) or not minimum <= rate < float("inf") for rate in rates)):
+        raise RuntimeError(f"insufficient steady screen load: need all {spec['viewers']} viewers >= {minimum:.2f} Mbps; got {rates}")
+    return {"active_viewers": len(rates), "minimum_mbps_per_viewer": minimum, "steady_viewer_mbps": rates}
+
+
+def relay_timing(meta):
+    network = meta.get("network")
+    if not network:
+        return None
+    return {direction: {key: network[direction][key] for key in
+            ("queue_max_ms", "scheduling_lateness_max_ms", "scheduling_late_over_5ms")}
+            for direction in ("up", "down")}
 
 
 def main():
@@ -128,13 +175,17 @@ def main():
                     pid = run_client(args.binary, path, args.markers, env)
                     results.accept(run, which, pid, pair=pair)
                     meta = json.loads(Path(f"{path}.json").read_text())
-                    figures[which] = {**playout(meta), "screen": meta.get("screen")}
+                    load_check = validate_load(meta, screen, constrained) if which == "screen" else None
+                    figures[which] = {**playout(meta), "screen": meta.get("screen"),
+                                      "load_check": load_check, "relay_timing": relay_timing(meta)}
                 pairs.append(figures)
             results.finish()
         except BaseException as error:
             results.fail(error)
             raise
         verdict = gate(pairs, constrained)
+        verdict["relay_timing"] = {which: [p[which]["relay_timing"] for p in pairs]
+                                   for which in ("baseline", "screen")}
         summary["scenarios"][name] = {"net": net, "screen": screen, "constrained": constrained,
                                       "pairs": pairs, **verdict}
         write_json(args.out / "summary.json", summary)

@@ -503,10 +503,23 @@ datagrams reach the screen task without slowing voice down.
 
 **As built in PR 3b** (docs/latency.md, "Screen load"; `scripts/latency/screen_gate.py`):
 
-- The gate compares the **median of the per-pair deltas** (screen − baseline).
+- The gate compares the **median of the per-pair deltas** (screen − baseline)
+  and fails if more than **one of ten pairs** exceeds any applicable per-pair
+  latency/underrun threshold. Shortened runs allow `floor(pairs / 10)` such
+  pairs, so a median cannot hide intermittent starvation.
   "No extra underruns" is the screen runs' total against the baselines';
   the constrained underrun figure is underrun samples over samples played,
   in percentage points.
+- Every screen run must report the expected load spec and every expected viewer
+  must receive at least 60 % of the scenario's intended steady media rate
+  (8 Mbps for unconstrained/uplink; one 3 Mbps share for downlink), over at
+  least one settled second. A missing, failed or quiet load fails the run.
+- Voice sender/receiver have explicit relay roles, so shared seeds select the
+  same voice impairment streams even when screen flows arrive first. The
+  shared bottleneck still intentionally couples queueing across flows.
+- The gate output reports `queue_max_ms`, `scheduling_lateness_max_ms` (actual
+  relay send minus scheduled release) and `scheduling_late_over_5ms`, separately
+  for each direction and run. Queue residence excludes relay/runtime lateness.
 - `rate=` is one bottleneck per direction shared by every flow, so the voice
   sender shares the 10 Mbps uplink with the publisher, and the voice receiver
   the 5 Mbps downlink with the viewer. Loss variants add 1 % loss both ways.
@@ -548,7 +561,18 @@ datagrams reach the screen task without slowing voice down.
 - **Left for the VM:** the full ten-pair run, which decides the gate, on a
   host that runs nothing else. If the outlier mode shows there, the next
   step is the isolation the gate names: the screen task on its own thread,
-  off the runtime that carries voice.
+  off the runtime that carries voice. Round 1 adds relay lateness instrumentation;
+  it does not diagnose the outlier. Static inspection found no clear, cheap
+  blocking operation to remove from the SFU screen loop, so isolation remains
+  conditional on the full VM gate.
+
+Round-1 local sanity (debug binaries, one downlink-loss pair with eight markers
+per run): the earlier pair passed; the final pair failed p99 (+64.9 ms) and the
+new tail rule, with 2.25 Mbps still reaching the viewer. Its downstream queue
+max was 15.2 ms and relay scheduling lateness max was 23.5 ms (61 sends over
+5 ms). These short runs are not acceptance, and no outlier diagnosis is made.
+The separate CPU sanity check observed 4.01 Mbps over a shared 3.51 s interval;
+its one point is not a CPU scaling measurement.
 
 ### Admission and resource limits
 
@@ -747,6 +771,9 @@ Nothing is promised about downstream network queues; the SFU cannot see them.
   so it never overshoots. As built, a packet that would overshoot first takes
   the room of lower-priority slots (their queues drop, lowest first, and wait
   for a keyframe); only what still does not fit drops from its own slot.
+- Both kinds of drop immediately request a keyframe for every dropped lane,
+  including a lower slot evicted by admission, through the existing viewer
+  budget and publisher throttle. Recovery does not wait for publisher traffic.
 - Both kinds of drop are recorded per frame. A keyframe that loses any packet
   either way is a **failed keyframe**, which the pause rule counts.
 - **Pause, unwatch and drops clear the queue at once.** Only packets released
@@ -810,7 +837,11 @@ send function. SRTP leaves the RTP header in the clear, so each datagram is
 classified by its header, with no decryption:
 
 - **Originals:** RTP on a slot's main SSRC. They are already paced by the Gwar
-  queue at `B = 0.8 × estimate` and are only counted here.
+  queue at `B = 0.8 × estimate`, including a conservative 64 bytes per packet
+  for serialized RTP extensions/alignment and SRTP overhead. Admission and share
+  rate/keyframe meters include that same overhead. An originals bucket at the
+  socket checks the actual serialized bytes at `B`, with burst
+  `max(2400 B, 10 ms × B)`. UDP/IP bytes are outside this socket-byte cap.
 - **Extras:** RTP on any other SSRC, that is, the RTX SSRCs (repairs and
   padding) and str0m's probe SSRC. They pass through **one token bucket per
   viewer**:
@@ -821,7 +852,7 @@ classified by its header, with no decryption:
   always sent.
 
 A viewer's sustained egress is therefore at most `0.9 × estimate` plus control
-traffic, with bursts bounded by the extras burst. RFC 4588 §7 asks for exactly
+traffic, with bursts bounded by the sum of the originals and extras bursts. RFC 4588 §7 asks for exactly
 this: originals and retransmissions counted together. Voice runs on a
 separate transport and keeps the remaining 10 %.
 
@@ -837,19 +868,12 @@ That is immediate and needs no str0m change:
   lost. str0m's loss controller then lowers the estimate of an overloaded
   viewer, which is the right direction.
 
-**Found in PR 3b: tiny packets defeat the reserve.** str0m sizes probe
-clusters in payload bytes and builds them from cached packets
-(resend-as-padding). With the end-to-end tests' 6-byte payloads every probe
-datagram was about 52 bytes on the wire, roughly three times its payload, so
-the start-up probes overflowed the bucket. The dropped probes carry TWCC
-numbers, so the viewer reported them lost; str0m's loss controller cut the
-estimate from 2.5 Mbps to about 60 kbps, which shrank the bucket and `B`
-with it, and repairs and originals starved. Near-full packets (the tests now
-send 1 KB bodies) never drop. A real share's packets are near the MTU while
-it moves, but a static Text share sends small deltas, so the same spiral is
-possible there: worth watching in PR 4's browser runs. The remedies, if it
-shows, are charging extras by payload rather than wire bytes, or a packet
-allowance beside the byte bucket.
+**Small packets.** The pinned str0m 0.24.1 is vendored with one padding
+change (`vendor/str0m/GWAR-PATCH.md`): cached payloads smaller than 240 bytes
+are not reused for probes; blank padding is sent instead. Tiny deltas remain
+available for NACK repair. The extras bucket still charges serialized wire
+bytes. A 30 s simulation with a 20 KB keyframe and 16-byte deltas at 5 fps
+checks for local drops and pauses; the e2e tests again use 6-byte packets.
 
 The 64 KB floor matters at low estimates: it is 200 ms of a 2.5 Mbps link.
 The paired voice runs found that the probe *rate* matters more than this
@@ -857,8 +881,8 @@ volume, which the cap on the desired bitrate handles.
 
 **Escalation.** If the extras bucket drops packets in more than 2 s of any 5 s
 window, the viewer's lowest-priority slot is paused with reason `bandwidth`.
-The pause wipes that slot's cache, as above. Resuming follows the usual
-resume rule.
+The pause wipes that slot's cache, as above. This trigger also respects the
+10 s ramp. Resuming follows the usual resume rule.
 
 The 1.3 × charge in "Admission and resource limits" stays an admission
 estimate. This cap is what enforces it at egress, per viewer. The server-wide
@@ -1023,7 +1047,11 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
     204 KB keyframe is rejected at admission before any packet reaches its
     deadline.
 - **Resume** only when, for 10 s:
-  `B − Σ other slots' averages ≥ max(1.2 × its average, K_last / 400 ms)`.
+  `B − Σ higher-priority intended slots ≥ max(1.2 × its average, K_last / 400 ms)`.
+  The intended set includes active and paused slots in priority order. Focusing
+  an already-paused share reclaims room from lower active slots, one change per
+  tick. Lower slots keep media/feedback flowing while the fit timer matures,
+  then pause on one tick; the focused share resumes on the following tick.
   `K_last` is the share's last keyframe size. Resuming accounts for the
   keyframe it is about to need, so a viewer is not paused again by the very
   keyframe that resumes it. Resuming opens a new segment from a keyframe,
@@ -1051,7 +1079,8 @@ emit 204 KB keyframes every 2 s:
   204 KB keyframe fits the 240 KB admission bound but gets only about
   1.8 Mbps, so it expires at the deadline. The average trigger stays below
   `B`, and the keyframe trigger pauses the low-priority slot within two
-  keyframes. The stage share is unaffected.
+  keyframes. The stage share is unaffected during this forced-keyframe interval;
+  startup BWE undershoot/recovery is outside that interval.
 
 All three are built in `media/screen/sim.rs`, with the forced keyframes
 starting after the slot's ramp; "within two keyframes" is measured to the
@@ -1060,7 +1089,9 @@ shares on a constrained viewer pause the lower-priority one, the earlier
 watched unless `screen.focus` names the other. A viewer's Retry
 (`screen.watch` of a share it already watches) resumes a slot paused for
 bandwidth at once, through the keyframe throttle; a budget pause waits for
-the server's egress to fall.
+the server's egress to fall. The server's 10 s under-budget guard and the
+viewer's 10 s fit timer run concurrently, so a fitting share resumes after
+10 s of global room rather than waiting another 10 s.
 
 The sharer is never slowed by viewers. The SFU never relays viewers' estimates
 or REMB to the publisher. The sharer adapts only to its own uplink (TWCC on
@@ -1102,6 +1133,15 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
     default-route interface from `/proc/net/dev` (Linux). It adds the delta
     since the last read to a per-calendar-month total persisted in the store.
     A counter lower than the last read (a reboot or a wrap) counts from zero.
+    Default-route selection requires destination/mask zero and RTF_UP, lowest
+    metric, falling back to `/proc/net/ipv6_route` for an IPv6 default.
+    Interface changes rebaseline; they never add that interface's lifetime total.
+    The complete checkpoint (counter, UTC timestamp, totals, coverage and warning
+    level) is one transactional write; memory changes only after it succeeds.
+    An interval spanning UTC months rebaselines instead of charging downtime
+    traffic to the new month. Such a month, an initial partial month and any
+    unavailable interval have `incomplete: true` in `server.egress`; totals are
+    observed usage, not a claim of full-month coverage.
   - The total therefore **includes every service on the host and every
     outbound byte of that interface**: TeamSpeak, a reverse proxy, SSH,
     package updates and backups. Traffic Oracle does not bill (for example to
@@ -1117,7 +1157,7 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
     10). There is no automatic cut-off by default. An optional
     `monthly_egress_stop` refuses new watches above 100 %.
   - As built (PR 3b): `server.egress` (`manage_server`) answers with the
-    month (UTC), the scope (`host`, `container` or `unavailable`), the total
+    month (UTC), the scope (`host`, `container` or `unavailable`), `incomplete`, the total
     and the screen SFU's bytes to members and guests, and the limits. The
     `ScreenLimits` above are server settings, replaced as a whole through
     `server.update`. Admins online get `server.egress_warning` once per
@@ -1135,7 +1175,10 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
   - PR 3b re-measures this on the VM with `scripts/latency/screen_cpu.py`:
     one 4 Mbps share and 1–13 viewers against a separate `gwar-server`
     process, CPU from the process's own counters, the slope over forwarded
-    Mbps by least squares. Locally (the same laptop, shared with other
+    Mbps by least squares. CPU and received-byte deltas now use the same explicit
+    settled-load snapshot endpoints (CPU interpolated between 500 ms samples).
+    The script checks both separately built binaries. The older local figures
+    below predate this window correction and must be remeasured. Locally (the same laptop, shared with other
     builds), forwarding 4, 16, 32 and 52 Mbps cost 5.5, 8.8, 13.7 and 18.9 %
     of one core: **about 0.28 % of a core per Mbps** on top of 4.4 % for the
     rest of the server, about twice S3's figure. Not yet run on the VM.
@@ -2327,7 +2370,11 @@ person.
    Built in PR 3b, beyond the list: a 10 s ramp before a new slot's pauses
    count, the probing target capped at twice the estimate, stalled viewers
    reprobing every 15 s, Retry resuming bandwidth pauses, and the screen
-   load and gate harness. The ten-pair voice gate and the CPU figure on the
+   load and gate harness. Round-1 fixes add wire-byte original pacing/capping,
+   tiny-delta-safe probes, priority reclamation, immediate keyframe recovery,
+   atomic timestamped counters with incomplete coverage, paired voice roles,
+   validated screen load, a per-pair tail gate and relay lateness measurements.
+   The ten-pair voice gate and the CPU figure on the
    VM are still to run ("Voice headroom and acceptance", "Cost on the
    deployment VM").
 4. **Web sharing and watching, plaintext (L, 7–9 days).**

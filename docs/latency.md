@@ -279,7 +279,9 @@ within one marker. `up:jitter=10ms` cost far more than `down:jitter=10ms`
 - The run's JSON gains `screen`: frames, keyframes, keyframe requests, bytes
   published and received, pauses, resumes, the average received rate per
   viewer and `steady_mbps_per_viewer`, counted from 12 s after the load
-  started. Without `LATENCY_SCREEN` it is `null`.
+  started. `steady_viewer_mbps` reports each viewer separately, and `samples`
+  contains timestamped cumulative bytes from `settled_unix_s`. Any load task
+  failure fails the run. Without `LATENCY_SCREEN` it is `null`.
 
 `RUST_LOG` logs to stderr, for example
 `RUST_LOG=gwar_server::media::screen=trace` for each watch transport's estimate
@@ -290,7 +292,13 @@ with the load, alternating which goes first, sharing the pair's `LATENCY_NET`
 seed, in six scenarios (unconstrained, a 10 Mbps uplink with an 8 Mbps share,
 a 5 Mbps downlink with two shares, each also with 1 % loss). It writes each
 scenario's runs like `run_local.py`, and `summary.json` with the voice figures
-of every run, the median per-pair deltas and the gate verdict; it exits 1 when
+of every run, the median per-pair deltas, per-pair tail failures and the gate
+verdict. Every viewer must carry the scenario's steady load; a quiet/missing
+load fails. At most one of ten pairs may exceed a per-pair threshold (zero
+for fewer than ten). Voice relay roles preserve the impairment seed regardless
+of screen arrival order. The output also reports relay scheduling lateness
+(actual send minus due time), separately from bottleneck queue residence.
+It exits 1 when
 a scenario misses the gate:
 
 ```sh
@@ -301,7 +309,10 @@ python3 scripts/latency/screen_gate.py --binary target/release/examples/latency 
 
 `scripts/latency/screen_cpu.py` measures the screen SFU's CPU per forwarded
 Mbps against a separate `gwar-server` process (see its `--help`); run it on the
-host to be measured.
+host to be measured. Build `cargo build --release -p gwar-server --bin gwar-server`
+and `cargo build --release -p gwar-client --example latency` separately. CPU and
+throughput use identical settled-load snapshot endpoints; cumulative CPU is
+interpolated between the surrounding 500 ms process samples.
 
 ## Compare builds
 

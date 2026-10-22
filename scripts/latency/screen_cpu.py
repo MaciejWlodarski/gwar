@@ -8,7 +8,8 @@ in the example's process, so the server's figure is its own. The marginal cost i
 slope of CPU (percent of one core) over forwarded Mbps, by least squares.
 
 Run it on the host to be measured (the deployment VM) with both binaries built there:
-  cargo build --release -p gwar-server -p gwar-client --example latency
+  cargo build --release -p gwar-server --bin gwar-server
+  cargo build --release -p gwar-client --example latency
   python3 scripts/latency/screen_cpu.py --server target/release/gwar-server \\
     --load target/release/examples/latency --out /tmp/screen-cpu
 """
@@ -84,7 +85,7 @@ def step(args, http, media, viewers, out):
         started = time.monotonic()
         try:
             while load.poll() is None:
-                samples.append((time.monotonic() - started, cpu_seconds(args.server_pid)))
+                samples.append((time.time(), cpu_seconds(args.server_pid)))
                 time.sleep(0.5)
                 if time.monotonic() - started > SETTLE_S + args.seconds + 120:
                     raise RuntimeError(f"load with {viewers} viewers did not finish; see {csv.with_suffix('.txt')}")
@@ -94,16 +95,38 @@ def step(args, http, media, viewers, out):
         raise RuntimeError(f"load with {viewers} viewers failed; see {csv.with_suffix('.txt')}")
     meta = json.loads(Path(f"{csv}.json").read_text())
     screen = meta["screen"]
-    # The CPU window: from the settle point to the last sample before the run's end.
-    window = [s for s in samples if s[0] >= SETTLE_S]
+    return measurement(samples, screen, viewers, meta["p99_ms"], args.seconds)
+
+
+def interpolate(samples, at):
+    """Cumulative CPU at a load snapshot, bounded by the two surrounding CPU samples."""
+    for (t0, c0), (t1, c1) in zip(samples, samples[1:]):
+        if t0 <= at <= t1:
+            return c0 + (c1 - c0) * (at - t0) / (t1 - t0)
+    raise RuntimeError("load timestamp outside CPU sample coverage")
+
+
+def measurement(cpu, screen, viewers, voice_p99, seconds=None):
+    # Both deltas use the exact same settled load snapshot endpoints. Interpolate cumulative
+    # CPU between the surrounding 500 ms samples, rather than comparing unrelated windows.
+    window = [s for s in screen["samples"]
+              if max(screen["settled_unix_s"], cpu[0][0]) <= s["unix_s"] <= cpu[-1][0]]
+    if window and seconds is not None:
+        window = [s for s in window if s["unix_s"] <= window[0]["unix_s"] + seconds]
     if len(window) < 4:
-        raise RuntimeError(f"too few CPU samples after {SETTLE_S} s with {viewers} viewers")
-    (t0, c0), (t1, c1) = window[0], window[-2]
-    mbps = (screen["steady_mbps_per_viewer"] or 0.0) * viewers
+        raise RuntimeError(f"too few settled load/CPU samples with {viewers} viewers")
+    first, last = window[0], window[-1]
+    t0, t1 = first["unix_s"], last["unix_s"]
+    c0, c1 = interpolate(cpu, t0), interpolate(cpu, t1)
+    mbps = (last["received_bytes"] - first["received_bytes"]) * 8 / (t1 - t0) / 1e6
+    if mbps <= 0:
+        raise RuntimeError("no forwarded screen load in CPU interval")
     return {
         "viewers": viewers, "forwarded_mbps": mbps, "cpu_percent": (c1 - c0) / (t1 - t0) * 100,
-        "window_s": t1 - t0, "pauses": screen["pauses"], "voice_p99_ms": meta["p99_ms"],
+        "window_start_unix_s": t0, "window_end_unix_s": t1, "window_s": t1 - t0,
+        "pauses": screen["pauses"], "voice_p99_ms": voice_p99,
     }
+
 
 
 def measure(args, viewers):
@@ -149,6 +172,10 @@ def main():
     args = parser.parse_args()
     if not re.fullmatch(r"\d+(,\d+)*", args.viewers):
         raise ValueError("--viewers takes comma-separated counts")
+    for binary in (args.server, args.load):
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            raise ValueError(f"missing executable: {binary}; build the server and latency example separately")
+    args.server, args.load = args.server.resolve(), args.load.resolve()
     args.out.mkdir(parents=True, exist_ok=False)
     points = []
     for viewers in map(int, args.viewers.split(",")):

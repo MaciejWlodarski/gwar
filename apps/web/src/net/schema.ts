@@ -131,7 +131,7 @@ const invite = shape<Invite>({ code: str(128), uses: int(4294967295), max_uses: 
 const empty = shape<Record<string, never>>({});
 const month: Rule<string> = (v): v is string => str(7)(v) && /^[0-9]{4}-[0-9]{2}$/.test(v);
 const screenLimits = shape<ScreenLimits>({ shares_per_channel: int(16, 1), shares_per_server: int(1024, 1), viewers_per_share: int(1000, 1), share_cap_kbps: int(100000, 100), budget_mbps: int(100000, 1), monthly_egress_tb: int(100000, 1), monthly_egress_stop: bool });
-const serverEgress = shape<ServerEgress>({ month, scope: literal(["host", "container", "unavailable"]), total: nullable(int(Number.MAX_SAFE_INTEGER)), screen_members: int(Number.MAX_SAFE_INTEGER), screen_guests: int(Number.MAX_SAFE_INTEGER), limits: screenLimits });
+const serverEgress = shape<ServerEgress>({ month, scope: literal(["host", "container", "unavailable"]), incomplete: bool, total: nullable(int(Number.MAX_SAFE_INTEGER)), screen_members: int(Number.MAX_SAFE_INTEGER), screen_guests: int(Number.MAX_SAFE_INTEGER), limits: screenLimits });
 
 const mlsBlob = str(175000);
 const mlsChunk = str(65536);
