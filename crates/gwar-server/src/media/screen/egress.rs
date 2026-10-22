@@ -31,8 +31,8 @@ pub const DEADLINE: Duration = Duration::from_millis(400);
 pub const INITIAL_ESTIMATE: u64 = 2_500_000;
 /// Shares of the estimate: originals are released at `PLAN`, repairs and probes get `EXTRAS`,
 /// and voice, on its own transport, keeps the rest.
-const PLAN: f64 = 0.8;
-const EXTRAS: f64 = 0.1;
+pub const PLAN: f64 = 0.8;
+pub const EXTRAS: f64 = 0.1;
 /// Admission bound floor, bytes.
 const ADMISSION_FLOOR: f64 = 64.0 * 1024.0;
 /// Extras burst: `max(64 KB, 30 ms × 2 × estimate)`, room for one str0m probe cluster at up to
@@ -40,8 +40,8 @@ const ADMISSION_FLOOR: f64 = 64.0 * 1024.0;
 const EXTRAS_FLOOR: f64 = 64.0 * 1024.0;
 const PROBE_CLUSTER: f64 = 0.030;
 /// The release bucket keeps at most this much of `B` when idle (and at least two packets).
-const RELEASE_BURST: f64 = 0.010;
-const RELEASE_BURST_FLOOR: f64 = 2.0 * 1200.0;
+pub const RELEASE_BURST: f64 = 0.010;
+pub const RELEASE_BURST_FLOOR: f64 = 2.0 * 1200.0;
 /// Averages decide pauses; sending stays peak-capable.
 pub const AVERAGE_WINDOW: Duration = Duration::from_secs(2);
 /// A slot whose average with the higher-priority ones exceeds `B` this long is paused.
@@ -231,6 +231,8 @@ pub struct EgressCounters {
     pub rejected: u64,
     pub failed_keyframes: u64,
     pub pauses: u64,
+    /// Pauses for extras overflowing their reserve.
+    pub escalations: u64,
 }
 
 pub struct Egress {
@@ -300,6 +302,12 @@ impl Egress {
         self.queued
     }
 
+    /// What is queued, lane by lane: each packet's sequence number and arrival.
+    #[cfg(test)]
+    pub fn pending(&self) -> impl Iterator<Item = (usize, u64, Instant)> + '_ {
+        self.lanes.iter().enumerate().flat_map(|(lane, l)| l.queue.iter().map(move |p| (lane, p.out, p.arrival)))
+    }
+
     /// A new TWCC estimate, bits per second.
     pub fn set_estimate(&mut self, estimate: u64, now: Instant) {
         self.refill(now);
@@ -309,6 +317,15 @@ impl Egress {
 
     pub fn paused(&self, lane: usize) -> Option<ScreenPauseReason> {
         self.lanes.get(lane).and_then(|l| l.paused)
+    }
+
+    /// Every slot that carries a share is paused, one at least for bandwidth: no media flows,
+    /// so no feedback can move the estimate.
+    pub fn stalled(&self) -> bool {
+        let assigned = || self.lanes.iter().filter(|l| l.assigned);
+        assigned().next().is_some()
+            && assigned().all(|l| l.paused.is_some())
+            && assigned().any(|l| l.paused == Some(ScreenPauseReason::Bandwidth))
     }
 
     /// The slot carries a new share, `order`-th watched (lower is earlier): a fresh lane.
@@ -522,6 +539,7 @@ impl Egress {
             && let Some(&lowest) = order.last()
         {
             self.dropped_seconds.clear();
+            self.counters.escalations += 1;
             self.pause(lowest, ScreenPauseReason::Bandwidth);
             return Some((lowest, Change::Pause(ScreenPauseReason::Bandwidth)));
         }
@@ -601,7 +619,7 @@ fn extras_rate(estimate: f64) -> f64 {
     EXTRAS * estimate / 8.0
 }
 
-fn extras_burst(estimate: f64) -> f64 {
+pub fn extras_burst(estimate: f64) -> f64 {
     (PROBE_CLUSTER * 2.0 * estimate / 8.0).max(EXTRAS_FLOOR)
 }
 

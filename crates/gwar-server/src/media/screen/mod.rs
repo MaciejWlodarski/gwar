@@ -19,6 +19,8 @@
 mod egress;
 mod ingress;
 mod segment;
+#[cfg(test)]
+mod sim;
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -81,6 +83,11 @@ const TRANSPORT_BYTE_HEADROOM: f64 = 1.5;
 const ADDRESSES_PER_TRANSPORT: usize = 4;
 /// Allocation (pauses, resumes, probing targets) and the budget check run this often.
 const ALLOCATION_TICK: Duration = Duration::from_millis(100);
+/// A viewer whose every slot is paused sends nothing, and str0m 0.24.1 does not probe a
+/// loss-limited estimate without feedback; so this often its estimator restarts from a third of
+/// its estimate, whose initial probes (3x and 6x) then test 1x and 2x of it.
+const REPROBE_EVERY: Duration = Duration::from_secs(15);
+const REPROBE_FLOOR: u64 = 100_000;
 /// Measured egress over the server-wide budget this many seconds in a row pauses watches.
 const OVER_BUDGET_SECONDS: u32 = 5;
 /// Watches paused for the budget may resume once egress stayed under this share of it …
@@ -486,6 +493,8 @@ struct Watcher {
     egress: Egress,
     /// The probing target last given to str0m's BWE.
     desired: Option<u64>,
+    /// Since when every slot is paused, or the estimator last restarted since.
+    stalled: Option<Instant>,
     deadline: Instant,
 }
 
@@ -1393,6 +1402,12 @@ fn allocate(
         }
         w.desired = desired;
     }
+    if !w.egress.stalled() {
+        w.stalled = None;
+    } else if now.saturating_duration_since(*w.stalled.get_or_insert(now)) >= REPROBE_EVERY {
+        w.stalled = Some(now);
+        w.rtc.bwe().reset(Bitrate::bps((w.egress.estimate() / 3).max(REPROBE_FLOOR)));
+    }
     let (slot, change) = w.egress.allocate(now, &lanes, budget)?;
     apply(w, slot, change);
     Some((slot, change))
@@ -1652,6 +1667,7 @@ fn watcher(
         focus: None,
         egress: Egress::new(now),
         desired: None,
+        stalled: None,
         deadline: now,
     };
     Ok((watcher, answer.to_sdp_string()))
@@ -1793,8 +1809,6 @@ pub(crate) mod tests {
             self.w.rtc.handle_input(Input::Receive(self.now, receive)).unwrap();
         }
 
-        /// 5 ms of both sides. RTP from the SFU that `lose` picks (by sequence number) is lost;
-        /// returns how many RTP datagrams the SFU sent.
         /// Slot 0's main and RTX SSRCs, once its stream exists.
         fn ssrcs(&mut self) -> Option<(u32, Option<u32>)> {
             let mid = self.w.slots.first()?.mid;

@@ -1,0 +1,853 @@
+//! A viewer's watch transport in simulated time, behind an emulated downlink. The SFU side runs
+//! the screen task's own egress path (`enqueue`, `release`, `drive`, `allocate`) against a str0m
+//! viewer; synthetic shares stand in for publishers. Every datagram is recorded at the SFU's
+//! socket send, originals against their arrival from the publisher (docs/screen-share.md,
+//! "Queues and repairs").
+//!
+//! What it leaves out: the publish transports and ingress (3a's tests cover them), and the
+//! per-viewer keyframe budget; a share answers keyframe requests at most every 500 ms, as the
+//! per-share throttle does.
+
+use std::collections::VecDeque;
+
+use str0m::{change::SdpAnswer, media::Direction};
+
+use super::*;
+
+pub const MS: Duration = Duration::from_millis(1);
+/// RTP payload bytes per packet.
+const PACKET: usize = 1100;
+/// One-way propagation delay of either direction.
+const DELAY: Duration = Duration::from_millis(10);
+/// Per-datagram overhead below RTP on the wire (IPv4 and UDP).
+const WIRE: usize = 28;
+
+fn addr(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
+
+/// Picks datagrams for a link to drop.
+pub type Filter = Box<dyn FnMut(&[u8]) -> bool>;
+
+/// One direction of a path: a FIFO bottleneck at `rate` (none: unconstrained) whose queue holds
+/// at most `queue` of sending time, drop-tail; random loss; then the propagation delay.
+pub struct Link {
+    pub rate: Option<u64>,
+    pub queue: Duration,
+    pub loss: f64,
+    busy: Instant,
+    flight: VecDeque<(Instant, Vec<u8>)>,
+    seed: u64,
+    pub dropped: u64,
+    /// Drops the datagrams it picks.
+    pub filter: Option<Filter>,
+}
+
+impl Link {
+    fn new(rate: Option<u64>, now: Instant) -> Self {
+        Self {
+            rate,
+            queue: Duration::from_millis(100),
+            loss: 0.0,
+            busy: now,
+            flight: VecDeque::new(),
+            seed: 0x9e37_79b9_7f4a_7c15,
+            dropped: 0,
+            filter: None,
+        }
+    }
+
+    fn random(&mut self) -> f64 {
+        self.seed ^= self.seed << 13;
+        self.seed ^= self.seed >> 7;
+        self.seed ^= self.seed << 17;
+        (self.seed >> 11) as f64 / (1u64 << 53) as f64
+    }
+
+    fn send(&mut self, now: Instant, datagram: &[u8]) {
+        if self.filter.as_mut().is_some_and(|f| f(datagram)) || (self.loss > 0.0 && self.random() < self.loss) {
+            self.dropped += 1;
+            return;
+        }
+        let start = self.busy.max(now);
+        if let Some(rate) = self.rate {
+            if start - now > self.queue {
+                self.dropped += 1;
+                return;
+            }
+            self.busy = start + Duration::from_secs_f64((datagram.len() + WIRE) as f64 * 8.0 / rate as f64);
+        } else {
+            self.busy = now;
+        }
+        self.flight.push_back((self.busy + DELAY, datagram.to_vec()));
+    }
+
+    fn due(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        let mut due = Vec::new();
+        while self.flight.front().is_some_and(|(at, _)| *at <= now) {
+            due.push(self.flight.pop_front().unwrap().1);
+        }
+        due
+    }
+}
+
+/// What a datagram the SFU sent was, by its clear header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// On a slot's main SSRC; `arrival` from the publisher.
+    Original { slot: usize, seq: u16, arrival: Instant },
+    /// On a slot's RTX SSRC: a repair, or `blank` padding.
+    Repair { slot: usize, blank: bool },
+    /// On str0m's probe SSRC.
+    Probe,
+    /// RTCP, STUN, DTLS.
+    Control,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Sent {
+    pub at: Instant,
+    pub len: usize,
+    pub kind: Kind,
+}
+
+/// A synthetic share: frames of `bitrate / fps`, keyframes of `keyframe` bytes on the first
+/// frame, every `every`, and when a viewer's slot asks.
+pub struct Share {
+    pub origin: Arc<ScreenOrigin>,
+    pub slot: usize,
+    pub bitrate: u64,
+    pub fps: u32,
+    pub keyframe: usize,
+    pub every: Option<Duration>,
+    /// Sends nothing while false.
+    pub on: bool,
+    source: u64,
+    timestamp: u32,
+    next: Instant,
+    last_key: Option<Instant>,
+    wants_key: bool,
+    meter: ShareMeter,
+    /// When each keyframe was produced, its size, and the viewer's `B` then (bits per second).
+    pub keyframes: Vec<(Instant, usize, f64)>,
+    /// Packets its slot refused.
+    pub refused: u64,
+}
+
+/// A payload whose bytes follow from its source number, so the viewer's copy can be checked.
+pub fn payload(source: u64, first: bool, len: usize) -> Arc<[u8]> {
+    let mut bytes = vec![if first { 0x10 } else { 0x00 }];
+    bytes.extend_from_slice(&source.to_be_bytes());
+    bytes
+        .extend((0..len.saturating_sub(bytes.len())).map(|i| (source as usize).wrapping_mul(31).wrapping_add(i) as u8));
+    Arc::from(bytes)
+}
+
+/// The source number a payload was made from.
+pub fn source_of(payload: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(payload.get(1..9)?.try_into().ok()?))
+}
+
+pub struct Sim {
+    pub w: Watcher,
+    pub client: Rtc,
+    pub now: Instant,
+    pub start: Instant,
+    pub down: Link,
+    pub up: Link,
+    pub shares: Vec<Share>,
+    pub sent: Vec<Sent>,
+    /// The viewer's RTP: when, the SSRC, the extended sequence number and the payload.
+    pub received: Vec<(Instant, u32, u64, Arc<[u8]>)>,
+    pub changes: Vec<(Instant, usize, Change)>,
+    /// Holds the viewer's datagrams back instead of sending them.
+    pub hold: bool,
+    pub held: Vec<Vec<u8>>,
+    /// Every non-STUN datagram the viewer sent, and when.
+    pub uplink: Vec<(Instant, Vec<u8>)>,
+    /// The allocation runs every 100 ms, as in the screen task.
+    pub allocation: bool,
+    next_allocation: Instant,
+    arrivals: HashMap<(usize, u16), Instant>,
+}
+
+impl Sim {
+    /// A connected viewer behind a downlink of `rate` (none: unconstrained).
+    pub fn new(rate: Option<u64>) -> Self {
+        let now = Instant::now();
+        let mut client = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp8(true).build(now);
+        client.add_local_candidate(Candidate::host(addr(5000), "udp").unwrap());
+        // str0m's random mids can collide within one offer: redraw.
+        let (offer, pending) = loop {
+            let mut api = client.sdp_api();
+            let mids: HashSet<Mid> = (0..SCREEN_SLOTS)
+                .map(|_| api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None))
+                .collect();
+            if mids.len() == SCREEN_SLOTS {
+                break api.apply().unwrap();
+            }
+        };
+        let (w, answer) = watcher(1, 7, 1, Lease::new(), &offer.to_sdp_string(), addr(6000), now).unwrap();
+        client.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
+        let mut sim = Self {
+            w,
+            client,
+            now,
+            start: now,
+            down: Link::new(rate, now),
+            up: Link::new(None, now),
+            shares: Vec::new(),
+            sent: Vec::new(),
+            received: Vec::new(),
+            changes: Vec::new(),
+            hold: false,
+            held: Vec::new(),
+            uplink: Vec::new(),
+            allocation: true,
+            next_allocation: now,
+            arrivals: HashMap::new(),
+        };
+        for _ in 0..2000 {
+            if sim.w.connected && sim.w.slots.len() == SCREEN_SLOTS {
+                break;
+            }
+            sim.tick();
+        }
+        assert!(sim.w.connected && sim.w.slots.len() == SCREEN_SLOTS, "the viewer connects");
+        sim.start = sim.now;
+        sim
+    }
+
+    /// Starts watching a share in the next free slot, after the ones already watched.
+    pub fn watch(&mut self, name: &str, bitrate: u64, fps: u32, keyframe: usize, every: Option<Duration>) -> usize {
+        let slot = self.shares.len();
+        let origin = ScreenOrigin::new(1 + slot as SessionId, name.into(), 1, false, false, 8_000_000);
+        let grant = WatchGrant::new(origin.clone());
+        assign(&mut self.w, slot, grant, slot as u64 + 1);
+        self.shares.push(Share {
+            origin,
+            slot,
+            bitrate,
+            fps,
+            keyframe,
+            every,
+            on: true,
+            source: 1000,
+            timestamp: 0,
+            next: self.now,
+            last_key: None,
+            wants_key: true,
+            meter: ShareMeter::default(),
+            keyframes: Vec::new(),
+            refused: 0,
+        });
+        slot
+    }
+
+    /// `screen.focus` on a share.
+    pub fn focus(&mut self, share: usize) {
+        let slot = self.shares[share].slot;
+        self.w.egress.focus(Some(slot));
+        self.w.focus = Some(self.shares[share].origin.share.clone());
+    }
+
+    pub fn elapsed(&self) -> Duration {
+        self.now - self.start
+    }
+
+    pub fn run(&mut self, time: Duration) {
+        let end = self.now + time;
+        while self.now < end {
+            self.tick();
+        }
+    }
+
+    /// Slot `slot`'s main and RTX SSRCs.
+    pub fn ssrcs(&mut self, slot: usize) -> (u32, Option<u32>) {
+        let mid = self.w.slots[slot].mid;
+        let mut api = self.w.rtc.direct_api();
+        let stream = api.stream_tx_by_mid(mid, None).unwrap();
+        (*stream.ssrc(), stream.rtx().map(|r| *r))
+    }
+
+    fn frames(&mut self) {
+        let now = self.now;
+        let plan = self.w.egress.plan();
+        for share in &mut self.shares {
+            if !share.on || now < share.next {
+                continue;
+            }
+            share.next += Duration::from_secs(1) / share.fps;
+            share.timestamp = share.timestamp.wrapping_add(90_000 / share.fps);
+            let key = share.last_key.is_none()
+                || share.every.is_some_and(|every| now - share.last_key.unwrap() >= every)
+                || (share.wants_key && now - share.last_key.unwrap() >= Duration::from_millis(500));
+            let size = if key { share.keyframe } else { (share.bitrate / 8 / share.fps as u64) as usize };
+            if key {
+                share.last_key = Some(now);
+                share.wants_key = false;
+                share.keyframes.push((now, size, plan));
+            }
+            let packets = size.div_ceil(PACKET).max(1);
+            for n in 0..packets {
+                let len = if n + 1 == packets { size - n * PACKET } else { PACKET }.max(16);
+                let forward = Forward {
+                    source: share.source,
+                    timestamp: share.timestamp,
+                    marker: n + 1 == packets,
+                    keyframe: key && n == 0,
+                    codec: VideoCodec::Vp8,
+                    arrival: now,
+                    payload: payload(share.source, n == 0, len),
+                };
+                share.source += 1;
+                share.meter.record(forward.source, forward.timestamp, len, forward.keyframe, now);
+                if !enqueue(&mut self.w, share.slot, &share.origin, &forward, now) {
+                    share.refused += 1;
+                    let slot = &mut self.w.slots[share.slot];
+                    if self.w.egress.paused(share.slot).is_none()
+                        && slot.grant.is_some()
+                        && slot.segment.waiting()
+                        && slot.asked.is_none_or(|at| now.saturating_duration_since(at) >= WAITING_RETRY)
+                    {
+                        slot.asked = Some(now);
+                        share.wants_key = true;
+                    }
+                }
+            }
+        }
+    }
+
+    fn classify(&mut self, contents: &[u8]) -> Kind {
+        if !is_rtp(contents) {
+            return Kind::Control;
+        }
+        let ssrc = u32::from_be_bytes(contents[8..12].try_into().unwrap());
+        let seq = u16::from_be_bytes([contents[2], contents[3]]);
+        for slot in 0..self.w.slots.len() {
+            let mid = self.w.slots[slot].mid;
+            let mut api = self.w.rtc.direct_api();
+            let Some(stream) = api.stream_tx_by_mid(mid, None) else { continue };
+            if *stream.ssrc() == ssrc {
+                let arrival = self.arrivals.get(&(slot, seq)).copied().expect("an original was queued");
+                return Kind::Original { slot, seq, arrival };
+            }
+            if stream.rtx().is_some_and(|rtx| *rtx == ssrc) {
+                return Kind::Repair { slot, blank: contents[0] & 0x20 != 0 };
+            }
+        }
+        Kind::Probe
+    }
+
+    /// One millisecond of both sides.
+    pub fn tick(&mut self) {
+        let now = self.now;
+        self.frames();
+        for (lane, out, arrival) in self.w.egress.pending() {
+            self.arrivals.insert((lane, out as u16), arrival);
+        }
+        release(&mut self.w, now);
+        let mut requests = Vec::new();
+        let mut out = Vec::new();
+        drive(&mut self.w, now, &mut requests, &mut |c: &[u8], _| out.push(c.to_vec()));
+        for datagram in out {
+            let kind = self.classify(&datagram);
+            self.sent.push(Sent { at: now, len: datagram.len(), kind });
+            self.down.send(now, &datagram);
+        }
+        for slot in requests {
+            if let Some(share) = self.shares.iter_mut().find(|s| s.slot == slot) {
+                share.wants_key = true;
+            }
+        }
+        if self.allocation && now >= self.next_allocation {
+            self.next_allocation = now + ALLOCATION_TICK;
+            let rates: HashMap<String, ShareRate> =
+                self.shares.iter_mut().map(|s| (s.origin.share.clone(), s.meter.rate(now))).collect();
+            if let Some((slot, change)) = allocate(&mut self.w, now, &rates, true) {
+                self.changes.push((now, slot, change));
+                if change == Change::Resume
+                    && let Some(share) = self.shares.iter_mut().find(|s| s.slot == slot)
+                {
+                    share.wants_key = true;
+                }
+            }
+        }
+        for datagram in self.down.due(now) {
+            let receive = Receive {
+                proto: Protocol::Udp,
+                source: addr(6000),
+                destination: addr(5000),
+                contents: datagram.as_slice().try_into().unwrap(),
+            };
+            self.client.handle_input(Input::Receive(now, receive)).unwrap();
+        }
+        let mut due = 0;
+        loop {
+            match self.client.poll_output().unwrap() {
+                Output::Timeout(at) if at <= now && due < DUE_TIMEOUTS => {
+                    due += 1;
+                    self.client.handle_input(Input::Timeout(now)).unwrap();
+                }
+                Output::Timeout(_) => break,
+                Output::Transmit(t) => {
+                    if !matches!(t.contents.first(), Some(0..=3)) {
+                        self.uplink.push((now, t.contents.to_vec()));
+                    }
+                    if self.hold {
+                        self.held.push(t.contents.to_vec());
+                    } else {
+                        self.up.send(now, &t.contents);
+                    }
+                }
+                Output::Event(RtcEvent::RtpPacket(p)) => {
+                    self.received.push((now, *p.header.ssrc, *p.seq_no, p.payload.clone()));
+                }
+                Output::Event(_) => {}
+            }
+        }
+        for datagram in self.up.due(now) {
+            self.deliver(&datagram);
+        }
+        self.now += MS;
+        self.w.rtc.handle_input(Input::Timeout(self.now)).unwrap();
+        self.client.handle_input(Input::Timeout(self.now)).unwrap();
+    }
+
+    /// Hands the SFU a datagram from the viewer.
+    pub fn deliver(&mut self, datagram: &[u8]) {
+        let receive = Receive {
+            proto: Protocol::Udp,
+            source: addr(5000),
+            destination: addr(6000),
+            contents: datagram.try_into().unwrap(),
+        };
+        self.w.rtc.handle_input(Input::Receive(self.now, receive)).unwrap();
+    }
+
+    /// Bytes the SFU sent in `[from, to)`.
+    pub fn bytes(&self, from: Instant, to: Instant, kinds: impl Fn(&Kind) -> bool) -> usize {
+        self.sent.iter().filter(|s| s.at >= from && s.at < to && kinds(&s.kind)).map(|s| s.len).sum()
+    }
+
+    /// The latest original of each slot left at most this long after its arrival.
+    pub fn oldest_original(&self, slot: usize) -> Duration {
+        self.sent
+            .iter()
+            .filter_map(|s| match s.kind {
+                Kind::Original { slot: sl, arrival, .. } if sl == slot => Some(s.at - arrival),
+                _ => None,
+            })
+            .max()
+            .unwrap_or_default()
+    }
+
+    pub fn paused(&self, slot: usize) -> Option<ScreenPauseReason> {
+        self.w.egress.paused(slot)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::egress::{DEADLINE, EXTRAS, PLAN, RELEASE_BURST, RELEASE_BURST_FLOOR, extras_burst};
+    use super::*;
+
+    const SECOND: Duration = Duration::from_secs(1);
+    const KEYFRAME: usize = 204_800;
+
+    fn summary(sim: &Sim) -> String {
+        format!(
+            "t={:?} estimate={} paused={:?} changes={:?} counters={:?}",
+            sim.elapsed(),
+            sim.w.egress.estimate(),
+            (0..sim.shares.len()).map(|s| sim.paused(s)).collect::<Vec<_>>(),
+            sim.changes.iter().map(|(at, slot, c)| (*at - sim.start, *slot, *c)).collect::<Vec<_>>(),
+            sim.w.egress.counters
+        )
+    }
+
+    /// A Text-preset share, 0.4 Mbps at 5 fps, opened by a small keyframe; then `keyframes`
+    /// switches it to 204 KB keyframes every 2 s.
+    fn text(sim: &mut Sim) -> usize {
+        sim.watch("text", 400_000, 5, 20_000, None)
+    }
+
+    fn keyframes(sim: &mut Sim, share: usize) {
+        sim.shares[share].keyframe = KEYFRAME;
+        sim.shares[share].every = Some(2 * SECOND);
+    }
+
+    fn pauses(sim: &Sim, slot: usize) -> Vec<Duration> {
+        sim.changes
+            .iter()
+            .filter(|(_, s, c)| *s == slot && matches!(c, Change::Pause(_)))
+            .map(|(at, _, _)| *at - sim.start)
+            .collect()
+    }
+
+    fn resumes(sim: &Sim, slot: usize) -> usize {
+        sim.changes.iter().filter(|(_, s, c)| *s == slot && *c == Change::Resume).count()
+    }
+
+    /// Drops the next original of `ssrc` on the downlink.
+    fn lose_next(sim: &mut Sim, ssrc: u32) {
+        let mut done = false;
+        sim.down.filter = Some(Box::new(move |d: &[u8]| {
+            let hit = !done && is_rtp(d) && d[0] & 0x20 == 0 && d[8..12] == ssrc.to_be_bytes();
+            done |= hit;
+            hit
+        }));
+    }
+
+    /// Original or repair media of `slot` the SFU sent from `from` on (blank padding excluded).
+    fn media_of(sim: &Sim, slot: usize, from: Instant) -> usize {
+        sim.sent
+            .iter()
+            .filter(|s| s.at >= from)
+            .filter(|s| match s.kind {
+                Kind::Original { slot: sl, .. } => sl == slot,
+                Kind::Repair { slot: sl, blank } => sl == slot && !blank,
+                _ => false,
+            })
+            .count()
+    }
+
+    /// The viewer received this source number.
+    fn received(sim: &Sim, source: u64) -> bool {
+        sim.received.iter().any(|(_, _, _, p)| source_of(p) == Some(source))
+    }
+
+    #[test]
+    fn keyframes_have_room_on_unconstrained_and_20_mbps_viewers() {
+        for rate in [None, Some(20_000_000)] {
+            let mut sim = Sim::new(rate);
+            let t = text(&mut sim);
+            // Warm-up: the estimate grows from its initial 2.5 Mbps by probing.
+            sim.run(6 * SECOND);
+            keyframes(&mut sim, t);
+            sim.run(20 * SECOND);
+            let context = summary(&sim);
+            assert!(pauses(&sim, 0).is_empty(), "{rate:?} {context}");
+            let c = sim.w.egress.counters;
+            assert_eq!((c.evicted, c.rejected, c.failed_keyframes), (0, 0, 0), "{rate:?} {context}");
+            assert_eq!((sim.shares[0].refused, sim.down.dropped), (0, 0), "{rate:?} {context}");
+            let big: Vec<_> = sim.shares[0].keyframes.iter().filter(|k| k.1 == KEYFRAME).copied().collect();
+            assert_eq!(big.len(), 10, "{rate:?}");
+            for (at, size, plan) in big {
+                let left = sim
+                    .sent
+                    .iter()
+                    .filter(|s| matches!(s.kind, Kind::Original { arrival, .. } if arrival == at))
+                    .map(|s| s.at - at)
+                    .max()
+                    .unwrap();
+                let bound = Duration::from_secs_f64(size as f64 * 8.0 / plan) + 10 * MS;
+                assert!(left <= bound, "{rate:?}: a keyframe took {left:?}, more than K/B + 10 ms = {bound:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn keyframes_overflowing_admission_pause_a_3_mbps_viewer_for_good() {
+        let mut sim = Sim::new(Some(3_000_000));
+        let t = text(&mut sim);
+        sim.run(6 * SECOND);
+        keyframes(&mut sim, t);
+        sim.run(20 * SECOND);
+        let context = summary(&sim);
+        let c = sim.w.egress.counters;
+        assert!(c.rejected > 0 && c.failed_keyframes >= 2, "{context}");
+        let paused = pauses(&sim, 0);
+        assert_eq!(paused.len(), 1, "{context}");
+        let second = sim.shares[0].keyframes.iter().filter(|k| k.1 == KEYFRAME).nth(1).unwrap().0 - sim.start;
+        assert!(paused[0] <= second + ALLOCATION_TICK, "paused within two keyframes: {context}");
+        assert_eq!(sim.paused(0), Some(ScreenPauseReason::Bandwidth));
+        assert_eq!(resumes(&sim, 0), 0, "no resume while the estimate stays low: {context}");
+    }
+
+    #[test]
+    fn keyframes_missing_the_deadline_pause_the_low_priority_slot_and_spare_the_stage() {
+        let mut sim = Sim::new(Some(6_000_000));
+        let stage = sim.watch("stage", 3_000_000, 30, 60_000, None);
+        sim.focus(stage);
+        sim.run(8 * SECOND);
+        assert_eq!(sim.changes, [], "the stage share alone fits: {}", summary(&sim));
+        let t = text(&mut sim);
+        sim.run(SECOND);
+        keyframes(&mut sim, t);
+        sim.run(12 * SECOND);
+        let context = summary(&sim);
+        let c = sim.w.egress.counters;
+        assert!(c.evicted > 0 && c.failed_keyframes >= 2, "keyframes expire: {context}");
+        let paused = pauses(&sim, 1);
+        assert_eq!(paused.len(), 1, "{context}");
+        let second = sim.shares[1].keyframes.iter().filter(|k| k.1 == KEYFRAME).nth(1).unwrap().0 - sim.start;
+        assert!(paused[0] <= second + ALLOCATION_TICK, "paused within two keyframes: {context}");
+        assert!(pauses(&sim, 0).is_empty(), "{context}");
+        assert_eq!(sim.shares[0].refused, 0, "the stage share lost nothing: {context}");
+        let stage_late = sim
+            .sent
+            .iter()
+            .filter_map(|s| match s.kind {
+                Kind::Original { slot: 0, arrival, .. } if arrival >= sim.start + 8 * SECOND => Some(s.at - arrival),
+                _ => None,
+            })
+            .max()
+            .unwrap();
+        assert!(stage_late < Duration::from_millis(100), "{stage_late:?}: {context}");
+    }
+
+    #[test]
+    fn two_shares_on_a_constrained_viewer_pause_the_lower_priority_one() {
+        for focused in [Some(1), None] {
+            let mut sim = Sim::new(Some(6_000_000));
+            sim.watch("a", 3_000_000, 30, 60_000, None);
+            sim.watch("b", 3_000_000, 30, 60_000, None);
+            if let Some(share) = focused {
+                sim.focus(share);
+            }
+            sim.run(30 * SECOND);
+            let context = summary(&sim);
+            // The stage share comes first; otherwise watch order decides.
+            let (kept, paused) = if focused.is_some() { (1, 0) } else { (0, 1) };
+            assert_eq!(sim.paused(paused), Some(ScreenPauseReason::Bandwidth), "{context}");
+            assert!(pauses(&sim, kept).is_empty(), "{context}");
+        }
+    }
+
+    /// 4 Mbps on a 10 Mbps downlink that drops to 1 Mbps after 8 s, and back after 15 s.
+    fn collapse(cap: bool) -> (Sim, u64, u64) {
+        let mut sim = Sim::new(Some(10_000_000));
+        sim.w.egress.cap = cap;
+        sim.watch("game", 4_000_000, 30, 60_000, None);
+        sim.run(8 * SECOND);
+        assert_eq!(sim.changes, [], "{}", summary(&sim));
+        sim.down.rate = Some(1_000_000);
+        sim.run(15 * SECOND);
+        sim.down.rate = Some(10_000_000);
+        let (extras, dropped) = (sim.w.egress.counters.extra_bytes, sim.w.egress.counters.extras_dropped);
+        sim.run(45 * SECOND);
+        (sim, extras, dropped)
+    }
+
+    #[test]
+    fn a_bandwidth_collapse_sends_no_stale_original_and_pauses_the_viewer() {
+        let (sim, _, _) = collapse(true);
+        let context = summary(&sim);
+        assert!(sim.oldest_original(0) <= DEADLINE, "{context}");
+        let paused = pauses(&sim, 0);
+        assert!(!paused.is_empty() && paused[0] > 8 * SECOND, "{context}");
+        assert!(paused[0] < 8 * SECOND + 10 * SECOND, "paused soon after the collapse: {context}");
+    }
+
+    #[test]
+    fn probes_after_a_collapse_fit_the_reserve() {
+        let (capped, extras, dropped) = collapse(true);
+        let (uncapped, _, _) = collapse(false);
+        let context = summary(&capped);
+        let c = capped.w.egress.counters;
+        // With every slot paused nothing else flows: the viewer's estimator restarts and probes.
+        assert!(c.extra_bytes > extras + 100_000, "probes ran: {context}");
+        assert!(c.extras_dropped - dropped <= 1, "probes fit the extras burst: {context}");
+        let (a, b) = (capped.w.egress.estimate() as f64, uncapped.w.egress.estimate() as f64);
+        assert!((a - b).abs() <= 0.1 * b, "the cap does not slow recovery: {a} against {b}");
+    }
+
+    /// Two 2 Mbps shares; slot 1 loses an original whose NACK is held back while the slot
+    /// stops (`stop`), then the NACK arrives and the estimator is made to probe.
+    fn stop_with_a_nack_in_flight(stop: impl FnOnce(&mut Watcher)) -> (Sim, Instant) {
+        let mut sim = Sim::new(None);
+        sim.watch("a", 2_000_000, 30, 60_000, None);
+        sim.watch("b", 2_000_000, 30, 60_000, None);
+        sim.run(4 * SECOND);
+        let (ssrc, _) = sim.ssrcs(1);
+        lose_next(&mut sim, ssrc);
+        sim.hold = true;
+        sim.run(100 * MS);
+        assert!(sim.down.dropped == 1 && !sim.held.is_empty());
+        stop(&mut sim.w);
+        let stopped = sim.now;
+        sim.hold = false;
+        for datagram in std::mem::take(&mut sim.held) {
+            sim.deliver(&datagram);
+        }
+        sim.allocation = false;
+        let estimate = sim.w.egress.estimate();
+        sim.w.rtc.bwe().reset(Bitrate::bps(estimate / 3));
+        sim.run(3 * SECOND);
+        (sim, stopped)
+    }
+
+    #[test]
+    fn pause_and_unwatch_stop_everything_of_the_slot() {
+        let (paused, at) = stop_with_a_nack_in_flight(|w| apply(w, 1, Change::Pause(ScreenPauseReason::Bandwidth)));
+        let (unwatched, at2) = stop_with_a_nack_in_flight(|w| empty(w, 1));
+        for (sim, at) in [(paused, at), (unwatched, at2)] {
+            let context = summary(&sim);
+            assert_eq!(media_of(&sim, 1, at), 0, "nothing of the slot after it stopped: {context}");
+            let probes = sim.bytes(at, sim.now, |k| matches!(k, Kind::Probe | Kind::Repair { .. }));
+            assert!(probes > 0, "the estimator probed: {context}");
+            assert!(media_of(&sim, 0, at) > 0, "the other slot goes on");
+        }
+    }
+
+    #[test]
+    fn a_late_nack_after_a_reordered_publisher_repair_and_a_pause() {
+        let mut sim = Sim::new(None);
+        sim.watch("share", 0, 1, 0, None);
+        sim.shares[0].on = false;
+        let t0 = sim.now;
+        let origin = sim.shares[0].origin.clone();
+        let write = |sim: &mut Sim, source: u64, arrival: Instant| {
+            let forward = Forward {
+                source,
+                timestamp: source as u32 * 3000,
+                marker: true,
+                keyframe: source == 100,
+                codec: VideoCodec::Vp8,
+                arrival,
+                payload: payload(source, true, 1000),
+            };
+            assert!(enqueue(&mut sim.w, 0, &origin, &forward, sim.now), "{source} is queued");
+        };
+        write(&mut sim, 100, t0);
+        sim.run(390 * MS);
+        // 102 waited 390 ms; the viewer loses it and its NACK is held until 715 ms.
+        let (ssrc, _) = sim.ssrcs(0);
+        lose_next(&mut sim, ssrc);
+        sim.hold = true;
+        sim.uplink.clear();
+        write(&mut sim, 102, t0);
+        let mut next = 103;
+        let mut late = Some(t0 + 580 * MS);
+        while sim.now < t0 + 715 * MS {
+            if sim.now >= t0 + 390 * MS + (next - 102) as u32 * 25 * MS {
+                let now = sim.now;
+                write(&mut sim, next, now);
+                next += 1;
+            }
+            if late.is_some_and(|at| sim.now >= at) {
+                // A publisher repair of 101 that arrived at 570 ms.
+                write(&mut sim, 101, t0 + 570 * MS);
+                late = None;
+            }
+            sim.tick();
+        }
+        assert!(!received(&sim, 102));
+        let nacks: Vec<Vec<u8>> = sim.uplink.iter().map(|(_, d)| d.clone()).collect();
+        sim.hold = false;
+        for datagram in std::mem::take(&mut sim.held) {
+            sim.deliver(&datagram);
+        }
+        while sim.now < t0 + 1200 * MS {
+            if sim.now >= t0 + 390 * MS + (next - 102) as u32 * 25 * MS {
+                let now = sim.now;
+                write(&mut sim, next, now);
+                next += 1;
+            }
+            sim.tick();
+        }
+        sim.run(50 * MS);
+        // str0m 0.24.1 evicts in sequence order and stops at 101, cached at 580 ms: 102, sent at
+        // 390 ms, is still served at 715 ms. A change here means str0m's eviction changed.
+        // str0m 0.24.1 does not cache 101 at all: its sequence number precedes the cache's
+        // eviction position (`rtx_cache_buf.rs`, `push`), so it shields nothing, and 102 was
+        // evicted at 200 ms of age. A change here means str0m's cache changed: re-check the
+        // "Queues and repairs" reasoning.
+        assert!(!received(&sim, 102), "102 is no longer served at 715 ms");
+        for source in (100..next).filter(|&s| s != 102) {
+            assert!(received(&sim, source), "{source} reached the viewer");
+        }
+        for (_, _, _, p) in &sim.received {
+            let source = source_of(p).unwrap();
+            assert_eq!(*p, payload(source, true, 1000), "{source} is byte-identical");
+        }
+        // A pause wipes it: the same NACKs again get nothing of the slot.
+        apply(&mut sim.w, 0, Change::Pause(ScreenPauseReason::Bandwidth));
+        let paused = sim.now;
+        for datagram in &nacks {
+            sim.deliver(datagram);
+        }
+        sim.run(SECOND);
+        assert_eq!(media_of(&sim, 0, paused), 0);
+    }
+
+    #[test]
+    fn set_rtx_cache_empties_the_cache() {
+        for replace in [false, true] {
+            let mut sim = Sim::new(None);
+            sim.watch("share", 2_000_000, 30, 60_000, None);
+            sim.run(2 * SECOND);
+            let (ssrc, _) = sim.ssrcs(0);
+            lose_next(&mut sim, ssrc);
+            sim.hold = true;
+            sim.run(50 * MS);
+            let mid = sim.w.slots[0].mid;
+            if replace {
+                let mut api = sim.w.rtc.direct_api();
+                api.stream_tx_by_mid(mid, None).unwrap().set_rtx_cache(RTX_PACKETS, RTX_AGE, Some(RTX_RATIO));
+            }
+            let at = sim.now;
+            sim.shares[0].on = false;
+            sim.hold = false;
+            for datagram in std::mem::take(&mut sim.held) {
+                sim.deliver(&datagram);
+            }
+            sim.run(500 * MS);
+            let repairs =
+                sim.sent.iter().filter(|s| s.at >= at && matches!(s.kind, Kind::Repair { blank: false, .. })).count();
+            assert_eq!(repairs > 0, !replace, "replace: {replace}");
+        }
+    }
+
+    #[test]
+    fn a_nack_storm_stays_within_the_egress_cap_and_pauses_the_lowest_slot() {
+        // Media near B, so str0m's own RTX ratio cap (0.15) no longer keeps repairs within the
+        // 0.1 x estimate reserve.
+        let mut sim = Sim::new(Some(6_000_000));
+        sim.watch("a", 2_000_000, 30, 60_000, None);
+        sim.watch("b", 2_000_000, 30, 60_000, None);
+        sim.focus(0);
+        sim.run(6 * SECOND);
+        assert!(sim.changes.is_empty(), "{}", summary(&sim));
+        // The viewer loses some packets and NACKs them; every 20 ms its NACKs of the last
+        // 200 ms arrive again, so it keeps asking for most of what str0m still caches. Generic
+        // NACKs (RTPFB, FMT 1) lead their compound packets, which SRTCP leaves clear, and
+        // str0m's SRTCP has no replay protection.
+        sim.down.loss = 0.05;
+        let start = sim.now;
+        let mut allowance = 0.0;
+        let mut largest = 0;
+        while sim.now < start + 10 * SECOND {
+            if (sim.now - start).as_millis().is_multiple_of(20) {
+                let recent: Vec<Vec<u8>> = sim
+                    .uplink
+                    .iter()
+                    .filter(|(at, d)| sim.now - *at <= 200 * MS && d[0] & 0x1f == 1 && d[1] == 205)
+                    .map(|(_, d)| d.clone())
+                    .collect();
+                for datagram in &recent {
+                    sim.deliver(datagram);
+                }
+            }
+            let estimate = sim.w.egress.estimate();
+            largest = largest.max(estimate);
+            allowance += (PLAN + EXTRAS) * estimate as f64 / 8.0 * MS.as_secs_f64();
+            sim.tick();
+        }
+        let context = summary(&sim);
+        let media = sim.bytes(start, sim.now, |k| !matches!(k, Kind::Control));
+        let burst =
+            extras_burst(largest as f64) + (RELEASE_BURST * PLAN * largest as f64 / 8.0).max(RELEASE_BURST_FLOOR);
+        assert!(media as f64 <= allowance + burst, "{media} bytes against {allowance} + {burst}: {context}");
+        assert!(sim.w.egress.counters.extras_dropped > 0, "{context}");
+        // The lowest slot goes first; a storm that goes on against the stage share then pauses
+        // that one too.
+        assert_eq!(
+            sim.changes.first().map(|c| (c.1, c.2)),
+            Some((1, Change::Pause(ScreenPauseReason::Bandwidth))),
+            "{context}"
+        );
+        assert!(sim.w.egress.counters.escalations >= 1, "{context}");
+    }
+}
