@@ -506,7 +506,10 @@ impl Core {
     pub(super) fn screen_reserved(&self) -> u64 {
         self.shares
             .values()
-            .map(|s| s.origin.cap_bps + (SLOT_CHARGE * s.origin.cap_bps as f64) as u64 * s.viewers.len() as u64)
+            .map(|s| {
+                s.origin.cap_bps
+                    + (SLOT_CHARGE * s.origin.cap_bps as f64) as u64 * (s.viewers.len() + s.guests.len()) as u64
+            })
             .sum()
     }
 

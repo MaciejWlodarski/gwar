@@ -290,15 +290,30 @@ within one marker. `up:jitter=10ms` cost far more than `down:jitter=10ms`
 `RUST_LOG=gwar_server::media::screen=trace` for each watch transport's estimate
 and egress counters every 100 ms.
 
-`scripts/latency/screen_gate.py` runs the acceptance: paired runs without and
-with the load, alternating which goes first, sharing the pair's `LATENCY_NET`
-seed, in six scenarios (unconstrained, a 10 Mbps uplink with an 8 Mbps share,
-a 5 Mbps downlink with two shares, each also with 1 % loss). It writes each
-scenario's runs like `run_local.py`, and `summary.json` with the voice figures
-of every run, the median per-pair deltas, per-pair tail failures and the gate
-verdict. Every viewer must carry the scenario's steady load; a quiet/missing
-load fails. At most one of ten pairs may exceed a per-pair threshold (zero
-for fewer than ten). Voice relay roles preserve the impairment seed regardless
+`scripts/latency/screen_gate.py` runs calibrated acceptance in six scenarios
+(unconstrained, a 10 Mbps uplink with an 8 Mbps share, a 5 Mbps downlink with
+two shares, each also with 1 % loss). Each scenario collects two interleaved
+sets in one invocation of the same binary on the same host: A/A has no screen
+load in either arm; the screen set pairs a baseline without load with the
+scenario's load. Each pair index has four fresh process runs sharing its
+`LATENCY_NET` seed: even zero-based indices run
+`aa/baseline → aa/screen → screen/baseline → screen/screen`; odd indices
+reverse both set order and arm order. Eight pairs per set are the default.
+
+It writes each scenario's runs like `run_local.py`, and `summary.json` with
+every run's voice figures, signed median per-pair deltas, total underrun
+excess, tail counts for both sets and the calibrated comparison. Unconstrained
+screen median p95/p99 deltas may exceed A/A by at most 2 ms, with no additional
+total underrun excess. Constrained screen median p99 and underrun-fraction
+deltas may exceed A/A by at most 20 ms and 0.005, respectively. In both cases,
+the screen tail-pair count must be at most the A/A tail-pair count plus
+`floor(N / 10)`: zero additional tails at eight pairs, one at ten. A tail pair
+exceeds any original absolute per-pair latency or underrun rule; count its
+union once per pair. All applicable comparisons must pass, and equality
+passes. See docs/screen-share.md, "Owner-approved A/A calibration", for the
+complete rules. Every viewer must carry the scenario's steady load; a
+quiet/missing load fails.
+Voice relay roles preserve the impairment seed regardless
 of screen arrival order. The output also reports relay scheduling lateness
 (actual send minus due time), separately from bottleneck queue residence.
 `relay_timing.status` is `measured` when `LATENCY_NET` enables a relay. On the
@@ -314,7 +329,7 @@ python3 scripts/latency/screen_gate.py --binary target/release/examples/latency 
   --out target/latency/screen-gate
 ```
 
-Use `--null` to measure the gate's A/A noise, starting with the unconstrained
+Use `--null` to compare two interleaved A/A sets, starting with the unconstrained
 scenario where single underruns can move a pair's latency tail:
 
 ```sh
@@ -324,7 +339,7 @@ python3 scripts/latency/screen_gate.py --null \
 ```
 
 Choose a new output directory for each repetition. Omit `--scenario` to run all
-six scenarios. Both arms run without screen load; the second arm retains the
+six scenarios. Both sets run without screen load; each second arm retains the
 `screen` label in file names and comparisons. Warmup, pair seeds, alternating
 order, marker checks, thresholds and underrun/tail rules stay identical. The
 summary and each scenario manifest record `null: true` and `screen: null`.

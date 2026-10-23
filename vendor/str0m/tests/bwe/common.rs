@@ -31,24 +31,26 @@ pub fn connect_with_bwe(initial_bitrate: Bitrate, desired_bitrate: Bitrate) -> (
 
     let rtc2 = Rtc::builder().set_rtp_mode(true).build(start);
 
-    let (mut l, mut r) = connect_l_r_with_rtc(rtc1, rtc2);
-
-    // Use the RTC construction clock for both wrappers before normalizing time.
-    l.start = start;
-    r.start = start;
-
+    // RTCs, wrappers, and the handshake must share a single simulation clock.
+    // Sampling a new origin after construction changes the phase of seeded traffic.
+    let mut l = TestRtc::new_with_rtc(tracing::info_span!("L"), rtc1);
+    let mut r = TestRtc::new_with_rtc(tracing::info_span!("R"), rtc2);
+    for peer in [&mut l, &mut r] {
+        peer.start = start;
+        peer.last = start;
+        // Use the same resolution during the handshake and subsequent media.
+        peer.set_input_time_advance(Duration::from_micros(100));
+    }
+    let (mut l, mut r) = connect_test_rtcs(l, r);
     l.bwe().set_desired_bitrate(desired_bitrate);
 
-    // The resolution must be smaller than the fastest send rate we want to test.
-    l.set_forced_time_advance(Duration::from_micros(100));
-    r.set_forced_time_advance(Duration::from_micros(100));
-
-    // Normalize time after DTLS connection to make tests deterministic across backends
-    // This ensures all crypto backends start from the same simulated time
-    let normalized_time = l.start + Duration::from_millis(100);
-
-    l.last = normalized_time;
-    r.last = normalized_time;
+    // Reach the existing 100 ms startup boundary by processing every intervening
+    // timeout and packet. Reassigning `last` skips pending work or rewinds a peer
+    // whose handshake already passed it; neither resets the RTC or netem clocks.
+    let ready_at = start + Duration::from_millis(100);
+    while l.last < ready_at || r.last < ready_at {
+        progress(&mut l, &mut r).expect("clean startup progress");
+    }
 
     (l, r)
 }

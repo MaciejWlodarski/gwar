@@ -365,8 +365,15 @@ impl Core {
         if share.guests.len() >= GUESTS_PER_SHARE {
             return Err(err(ErrorCode::Busy, "this share has as many guests as allowed"));
         }
-        if share.viewers.len() + share.guests.len() >= VIEWERS_PER_SHARE {
+        if share.viewers.len() + share.guests.len() >= self.screen_limits.viewers_per_share as usize {
             return Err(err(ErrorCode::Busy, "this share has as many viewers as allowed"));
+        }
+        let charge = (SLOT_CHARGE * share.origin.cap_bps as f64) as u64;
+        if self.screen_reserved() + charge > self.screen_budget() {
+            return Err(err(ErrorCode::Busy, "the server's screen-sharing budget is full"));
+        }
+        if self.egress_stopped() {
+            return Err(err(ErrorCode::Busy, "this month's outbound transfer allowance is used up"));
         }
         let (sharer, preset) = (share.sharer, share.preset);
         let guest = self.allocate_session();
@@ -583,7 +590,7 @@ mod tests {
                     private_links: None,
                     viewers: (10_000..10_000 + viewers).collect(),
                     guests: BTreeSet::new(),
-                    origin: ScreenOrigin::new(sharer, "S".into(), channel, false, false),
+                    origin: ScreenOrigin::new(sharer, "S".into(), channel, false, false, 8_000_000),
                     live: true,
                     publish: None,
                 },
@@ -914,6 +921,44 @@ mod tests {
             (refused.code, refused.message.as_str()),
             (ErrorCode::Busy, "this share has as many viewers as allowed")
         );
+    }
+
+    #[tokio::test]
+    async fn guest_admission_uses_configured_viewer_limit_and_screen_budget() {
+        let (core, _notes) = core_with_bridge().await;
+        let token = linked_share(&core, 0).await;
+        on_core(&core, |core| core.screen_limits.viewers_per_share = 1).await;
+        let admitted = guest(&core, &token).await.unwrap();
+        let reserved = on_core(&core, |core| core.screen_reserved()).await;
+        assert_eq!(reserved, 8_000_000 + 10_400_000);
+        let refused = guest(&core, &token).await.unwrap_err();
+        assert_eq!(refused.message, "this share has as many viewers as allowed");
+        on_core(&core, move |core| {
+            core.drop_guest(admitted);
+            core.screen_limits.viewers_per_share = 25;
+            core.screen_limits.budget_mbps = 18;
+        })
+        .await;
+        let refused = guest(&core, &token).await.unwrap_err();
+        assert_eq!(refused.message, "the server's screen-sharing budget is full");
+        on_core(&core, |core| core.screen_limits.budget_mbps = 19).await;
+        guest(&core, &token).await.unwrap();
+        let refused = guest(&core, &token).await.unwrap_err();
+        assert_eq!(refused.message, "the server's screen-sharing budget is full");
+        let member = session(&core, 2, "bob").await;
+        let watched = on_core(&core, move |core| {
+            core.sessions.get_mut(&member).unwrap().watch = Some(Watch {
+                run: 1,
+                sdp: String::new(),
+                answer: None,
+                connected: true,
+                slots: Default::default(),
+                lease: Lease::new(),
+            });
+            core.screen_watch(member, "S")
+        })
+        .await;
+        assert_eq!(watched.unwrap_err().message, "the server's screen-sharing budget is full");
     }
 
     #[test]

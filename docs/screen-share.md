@@ -570,6 +570,25 @@ with `-D warnings`, workspace/vendor rustfmt and `git diff --check` passed.
 The full vendor run used canonical ignored capture fixtures from the locally
 cached str0m 0.24.1 package; those scratch copies are removed after validation.
 
+**Review follow-up after rebasing onto `main` at `a78f775`.** A plain revert of
+the BWE fixture origin edit passed ten consecutive cellular runs, but the second
+full vendor run failed capacity restoration at 644.878 kbps against its unchanged
+1 Mbps assertion. The final fixture configures one origin and 100 us resolution
+before the handshake, advances through the 100 ms startup boundary without
+reassigning live clocks, and schedules BWE's forced wakes from the current input
+instead of an older future deadline. Other vendor fixtures retain their existing
+scheduling. No BWE assertions, thresholds or production estimator code changed.
+The final cellular and capacity-restoration tests each passed ten consecutive
+isolated runs. Both complete vendor runs passed: 770 unit tests, 330 integration
+tests and 59 doctests per run, with the existing two doctest ignores.
+Post-rebase validation also passed: 335 server unit tests (all 70 recovery-grid
+cases, 60 zero-pause startup cases and the outage repros/variants), 10 screen
+integration tests, 15 watch-link integration tests, 27 latency tests, 120 protocol
+and binding-generation tests, and 19 Python tests. The no-default-features server
+check, server/proto/client and full-vendor all-targets clippy with warnings denied,
+workspace/vendor formatting and `git diff --check` passed. Builds used `-j 4`;
+server test code used `opt-level=1` with debug assertions and overflow checks.
+
 The earlier macOS loopback gate at `a4c76a1` used one pair of 40 markers
 per scenario:
 unconstrained, all five viewers at 7.87 Mbps with zero pauses,

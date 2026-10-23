@@ -78,6 +78,7 @@ pub struct TestRtc {
     pub events: Vec<(Instant, Event)>,
     pub pending: Netem<PendingPacket>,
     pub forced_time_advance: Duration,
+    advance_from_input: bool,
 }
 
 impl TestRtc {
@@ -116,6 +117,7 @@ impl TestRtc {
             events: vec![],
             pending: Netem::new(NetemConfig::new()),
             forced_time_advance: Duration::from_millis(10),
+            advance_from_input: false,
         }
     }
 
@@ -124,6 +126,13 @@ impl TestRtc {
     /// Should be set to the packet interval for the target bitrate (e.g., 0.2ms for 50 Mbps).
     pub fn set_forced_time_advance(&mut self, duration: Duration) {
         self.forced_time_advance = duration;
+    }
+
+    /// Use input-relative forced wakes for fine-grained BWE simulations. Other
+    /// integration fixtures retain their historical deadline-relative scheduling.
+    pub fn set_input_time_advance(&mut self, duration: Duration) {
+        self.forced_time_advance = duration;
+        self.advance_from_input = true;
     }
 
     /// Configure network emulation for incoming traffic to this RTC.
@@ -348,8 +357,15 @@ fn rtc_poll_to_timeout(
         // println!("next: {:?}", next);
         match next {
             Output::Timeout(v) => {
-                let tick = rtc.last + rtc.forced_time_advance;
-                rtc.last = if v == rtc.last { tick } else { tick.min(v) };
+                rtc.last = if rtc.advance_from_input {
+                    // `last` can still be a future wake when netem delivers a packet.
+                    // BWE needs the forced step to start at the input just handled.
+                    let tick = time + rtc.forced_time_advance;
+                    if v <= time { tick } else { tick.min(v) }
+                } else {
+                    let tick = rtc.last + rtc.forced_time_advance;
+                    if v == rtc.last { tick } else { tick.min(v) }
+                };
                 break;
             }
             Output::Transmit(v) => {
@@ -512,9 +528,13 @@ pub fn connect_l_r() -> (TestRtc, TestRtc) {
 }
 
 pub fn connect_l_r_with_rtc(rtc1: Rtc, rtc2: Rtc) -> (TestRtc, TestRtc) {
-    let mut l = TestRtc::new_with_rtc(info_span!("L"), rtc1);
-    let mut r = TestRtc::new_with_rtc(info_span!("R"), rtc2);
+    let l = TestRtc::new_with_rtc(info_span!("L"), rtc1);
+    let r = TestRtc::new_with_rtc(info_span!("R"), rtc2);
+    connect_test_rtcs(l, r)
+}
 
+/// Connect wrappers whose simulation clocks have already been configured by the caller.
+pub fn connect_test_rtcs(mut l: TestRtc, mut r: TestRtc) -> (TestRtc, TestRtc) {
     let host1 = Candidate::host((Ipv4Addr::new(1, 1, 1, 1), 1000).into(), "udp").unwrap();
     let host2 = Candidate::host((Ipv4Addr::new(2, 2, 2, 2), 2000).into(), "udp").unwrap();
     l.add_local_candidate(host1.clone());

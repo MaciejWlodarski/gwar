@@ -536,11 +536,19 @@ impl Measured {
 }
 
 /// Sends a datagram from the screen task, counting it.
-fn transmit(socket: &UdpSocket, measured: &mut Measured, shared: &ScreenShared, contents: &[u8], to: SocketAddr) {
+fn transmit(
+    socket: &UdpSocket,
+    measured: &mut Measured,
+    shared: &ScreenShared,
+    guest: bool,
+    contents: &[u8],
+    to: SocketAddr,
+) {
     // Under socket pressure a datagram drops, like voice's; video recovers by NACK or keyframe.
     if socket.try_send_to(contents, to).is_ok() {
         measured.bytes += contents.len() as u64;
-        shared.member_bytes.fetch_add(contents.len() as u64, Ordering::Relaxed);
+        let counter = if guest { &shared.guest_bytes } else { &shared.member_bytes };
+        counter.fetch_add(contents.len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -688,7 +696,8 @@ impl Sfu {
                 match watcher(id, session, run, lease, slots, &sdp, self.advertise, now) {
                     Ok((mut watcher, answer)) => {
                         let (socket, measured, shared) = (&self.socket, &mut self.measured, &self.shared);
-                        let mut send = |c: &[u8], to| transmit(socket, measured, shared, c, to);
+                        let guest = watcher.size == GUEST_SLOTS;
+                        let mut send = |c: &[u8], to| transmit(socket, measured, shared, guest, c, to);
                         if drive(&mut watcher, now, &mut Vec::new(), &mut send) {
                             self.signal(ScreenSignal::Watch { session, run, connected: true });
                         }
@@ -1082,7 +1091,7 @@ impl Sfu {
                     break;
                 }
                 Output::Transmit(t) => {
-                    transmit(&self.socket, &mut self.measured, &self.shared, &t.contents, t.destination);
+                    transmit(&self.socket, &mut self.measured, &self.shared, false, &t.contents, t.destination);
                 }
                 Output::Event(event) => match event {
                     RtcEvent::Connected => {
@@ -1209,7 +1218,8 @@ impl Sfu {
         let now = Instant::now();
         let mut requests = Vec::new();
         let (socket, measured, shared) = (&self.socket, &mut self.measured, &self.shared);
-        let mut send = |c: &[u8], to| transmit(socket, measured, shared, c, to);
+        let guest = w.size == GUEST_SLOTS;
+        let mut send = |c: &[u8], to| transmit(socket, measured, shared, guest, c, to);
         if drive(&mut w, now, &mut requests, &mut send) {
             self.signal(ScreenSignal::Watch { session: w.session, run: w.run, connected: true });
         }
@@ -2022,6 +2032,7 @@ pub(crate) mod tests {
         let mut seen = 0;
         let sent: usize = (0..10)
             .map(|_| {
+                release(&mut pair.w, pair.now);
                 pair.step(&mut |_| {
                     seen += 1;
                     seen == 3
@@ -2030,7 +2041,11 @@ pub(crate) mod tests {
             .sum();
         assert_eq!(sent, 10, "the real guest grant forwards before revocation");
         assert!(!pair.held.is_empty(), "the viewer's loss feedback is held back");
-        for packet in &packets[10..20] {
+        for packet in &packets[10..15] {
+            assert!(enqueue(&mut pair.w, 0, &origin, packet, pair.now));
+        }
+        release(&mut pair.w, pair.now);
+        for packet in &packets[15..20] {
             assert!(enqueue(&mut pair.w, 0, &origin, packet, pair.now));
         }
         revoke();
@@ -2042,8 +2057,11 @@ pub(crate) mod tests {
         for datagram in std::mem::take(&mut pair.held) {
             pair.send_to_sfu(&datagram);
         }
+        let repairs = pair.repairs;
         let sent: usize = (0..20).map(|_| pair.step(&mut |_| false)).sum();
-        assert_eq!(sent, 0, "neither queued RTP nor RTX leaves after revocation");
+        assert_eq!(sent, 0, "no queued RTP leaves after revocation");
+        assert_eq!(pair.repairs, repairs, "no delayed RTX leaves after revocation");
+        assert_eq!(pair.w.egress.queued(), 0, "revocation also clears the allocation queue");
     }
 
     #[test]

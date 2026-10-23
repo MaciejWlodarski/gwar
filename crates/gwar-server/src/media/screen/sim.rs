@@ -190,7 +190,8 @@ impl Sim {
                 break api.apply().unwrap();
             }
         };
-        let (w, answer) = watcher(1, 7, 1, Lease::new(), &offer.to_sdp_string(), addr(6000), now).unwrap();
+        let (w, answer) =
+            watcher(1, 7, 1, Lease::new(), SCREEN_SLOTS, &offer.to_sdp_string(), addr(6000), now).unwrap();
         client.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
         let mut sim = Self {
             w,

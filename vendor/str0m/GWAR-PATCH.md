@@ -70,13 +70,22 @@ successive outages at 0-2% loss without re-pauses, clean estimator resets across
 TWCC sequence wraparound, preserved paced-media clock advancement,
 the padding disable/reset/re-enable lifecycle, and 16-byte Text deltas at 5 fps.
 The e2e screen tests use 6-byte packets. Remove these changes when upstream
-provides equivalent protection. The BWE integration fixture also aligns both
-wrapper clock origins with the shared RTC construction clock before its existing
-100 ms normalization. Separate wall-clock origins made the upstream restoration
-test intermittent even at `e9f33d6`; its rate thresholds remain unchanged.
+provides equivalent protection.
+
+The BWE integration fixtures configure the RTCs and both wrappers with one
+clock origin and 100 us resolution before connecting. They reach the existing
+100 ms startup boundary by processing pending events, rather than assigning
+wrapper clocks after the handshake and skipping or rewinding live timers.
+The shared test driver opts BWE into scheduling each forced wake from the input
+time it just handled, not the previous scheduled wake (which can still be in the future
+when netem delivers a packet). Already-due timeouts advance from that input
+clock too. Other integration fixtures retain their historical scheduling.
+Aligning origins alone exposed a cellular failure; reverting alone
+left capacity restoration intermittent. These fixture-only changes keep both
+assertions and all rate thresholds unchanged.
 Changed upstream files:
 `src/streams/send.rs`, `src/streams/mod.rs`, `src/pacer/leaky.rs`,
 `src/bwe/probe/cluster.rs`, `src/bwe/probe/control.rs`, `src/bwe/mod.rs`,
-`src/bwe/api.rs`, `src/session.rs` and `tests/bwe/common.rs`. Two test-only lint cleanups in
+`src/bwe/api.rs`, `src/session.rs`, `tests/common.rs` and `tests/bwe/common.rs`. Two test-only lint cleanups in
 `src/packet/buffer_rx.rs` and `tests/change-ssrc-reset-receive.rs` allow the full
 vendor clippy run with warnings denied.
