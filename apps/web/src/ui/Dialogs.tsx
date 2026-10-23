@@ -202,7 +202,7 @@ function AddServerDialog({ editId }: { editId?: string }) {
         {!desktop && <p className="-mt-1 text-xs text-subtle">{t("connect.tsWebOnly")}</p>}
         <Field label={t("connect.address")} hint={kind === "teamspeak" ? t("connect.tsAddressHint") : t("connect.addressHint")}>
           {(id) => (
-            <Input id={id} value={address} onChange={(e) => setAddress(e.target.value)} placeholder={kind === "teamspeak" ? "ts.example.com" : "voice.example.com"} maxLength={255} spellCheck={false} autoCapitalize="none" autoFocus />
+            <Input id={id} value={address} onChange={(e) => setAddress(e.target.value)} placeholder={kind === "teamspeak" ? "ts.example.com" : "voice.example.com"} maxLength={255} autoComplete="url" spellCheck={false} autoCapitalize="none" autoFocus />
           )}
         </Field>
 
@@ -592,18 +592,26 @@ function ServerKeyDialog() {
       onOpenChange={(o) => !o && close()}
       title={t("security.fingerprint")}
       description={t("security.fingerprintHelp")}
-      width="max-w-sm"
-      footer={<Button onClick={close}>{t("common.close")}</Button>}
-    >
-      <div className="flex flex-col gap-2">
-        <p className="text-xs text-subtle wrap-anywhere">{endpoint}</p>
-        <div className="flex items-center gap-2 rounded-lg border border-line-strong bg-side p-2">
-          <code data-testid="server-fingerprint" className="min-w-0 flex-1 font-mono text-xs break-all select-all">{serverKey}</code>
-          <Button size="sm" onClick={() => void copy()}>
+      width="max-w-md"
+      footer={
+        <>
+          <Button onClick={() => void copy()}>
             {copied ? <Check className="size-4" /> : <Copy className="size-4" />}
             {copied ? t("toast.copied") : t("common.copy")}
           </Button>
-        </div>
+          <Button onClick={close}>{t("common.close")}</Button>
+        </>
+      }
+    >
+      <div className="flex flex-col gap-2">
+        <p className="text-xs text-subtle wrap-anywhere">{endpoint}</p>
+        {/* One unbroken line: a key split mid-way is hard to compare by eye. */}
+        <code
+          data-testid="server-fingerprint"
+          className="overflow-x-auto rounded-lg border border-line-strong bg-side px-3 py-2.5 text-center font-mono text-[13px] whitespace-nowrap select-all"
+        >
+          {serverKey}
+        </code>
       </div>
     </Dialog>
   );
