@@ -179,6 +179,10 @@ IndexedDB (`lib/local-state.ts`).
 - **Read path.** `main.tsx` awaits `localState.load()` before the first render:
   it opens the database through `openDatabase` and reads every entry into memory,
   so readers that run while rendering (`serverKey()`, badges) stay synchronous.
+  `load` runs once per page (later calls wait for the same read), and every
+  asynchronous read or write, and the handshake before its pin check, waits for
+  it: a page whose entry is not `main.tsx` (the browser test fixtures) loads it
+  on first use. A load that fails still fails every read and write.
 - **Write path.** Every change is one readwrite transaction (`durability:
   "strict"`) that reads the stored value and decides on it: a first server pin
   commits only if none is stored (a different stored key fails with

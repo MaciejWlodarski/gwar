@@ -542,6 +542,19 @@ describe("the security state (IndexedDB)", () => {
     expect(() => state.get(PIN)).toThrow(/no new key is trusted/);
     await expect(state.update(PIN, () => pinValue("K"))).rejects.toMatchObject({ name: "LocalStateUnavailableError" });
   });
+  it("loads itself on the first asynchronous read or write, once, and never reopens after close", async () => {
+    const name = fresh();
+    const state = createLocalState(name);
+    open.push(state);
+    expect(() => state.get(PIN)).toThrow(/no new key is trusted/);
+    await Promise.all([state.update(PIN, () => pinValue("K")), state.read(PIN), state.load()]);
+    expect(state.get(PIN)).toBe(pinValue("K"));
+    state.close();
+    await state.load();
+    await expect(state.read(PIN)).rejects.toMatchObject({ name: "LocalStateUnavailableError" });
+    await expect(state.update(PIN, () => pinValue("L"))).rejects.toMatchObject({ name: "LocalStateUnavailableError" });
+    expect((await tab(name)).get(PIN)).toBe(pinValue("K"));
+  });
   it("a database the browser closes withdraws everything: reads throw, writes reject, the app hears of it", async () => {
     let connection!: IDBDatabase;
     const state = await tab(fresh(), [(db, tx) => { connection = db; LOCAL_STATE_MIGRATIONS[0]!(db, tx); }]);

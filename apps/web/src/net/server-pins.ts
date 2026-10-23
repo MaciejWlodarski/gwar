@@ -7,6 +7,8 @@ export interface ServerPin {
 }
 
 export interface PinStore {
+  /** Resolves once the pins can be read synchronously (or have failed to load: `load` then throws). */
+  ready?(): Promise<void>;
   /** As this tab last read it; throws when the pins cannot be read: nothing is trusted then. */
   load(endpoint: string): ServerPin | undefined;
   /** Read from the database now (a transaction); rejects when the pins cannot be read. */
@@ -36,6 +38,7 @@ function parsePin(value: string): ServerPin {
 
 /** Pins in the device's security state (lib/local-state.ts). */
 export const serverPins: PinStore = {
+  ready: () => localState.load(),
   load(endpoint) {
     const value = localState.get(PREFIX + normalizeEndpoint(endpoint));
     return value === undefined ? undefined : parsePin(value);

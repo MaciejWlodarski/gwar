@@ -279,6 +279,22 @@ describe("persistent pins and canonical fields", () => {
       expect(sign).not.toHaveBeenCalled(); expect(socket.sent).toHaveLength(0);
     } finally { vi.unstubAllGlobals(); vi.resetModules(); }
   });
+  it("loads the security state itself on a page that did not load it at start (the e2e fixtures)", async () => {
+    vi.resetModules();
+    try {
+      // Fresh modules, as on a page whose entry is not main.tsx: nothing has called load().
+      const { Connection: Isolated } = await import("./connection");
+      const { serverPins: pins } = await import("./server-pins");
+      const url = `wss://fixture-${crypto.randomUUID()}.example/ws`;
+      const conn = new Isolated({ url, identity: fakeIdentity, nickname: "test",
+        client: { name: "test", version: "0", platform: "web" }, createSocket: (u) => new FakeSocket(u) });
+      const result = conn.connect(); const socket = FakeSocket.last(); socket.open(); socket.push(challenge());
+      await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+      await finishHandshake(socket); await result;
+      expect(pins.load(url)?.server_pk).toBe(testServerIdentity.publicKey);
+      conn.close();
+    } finally { vi.resetModules(); }
+  });
   it("trusts no key once the browser closed the pins' database (Sol r5 probe, inverted)", async () => {
     vi.resetModules();
     try {

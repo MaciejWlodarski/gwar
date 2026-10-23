@@ -498,6 +498,9 @@ export class Connection implements Link {
     decodeFixed(challenge.server_nonce, 32);
     const pins = this.options.pinStore ?? serverPins;
     const replacing = this.replacing;
+    // A page that did not load the security state at start (only main.tsx does) loads it now.
+    await pins.ready?.();
+    current();
     checkCandidate(endpoint, challenge.server_pk, pins, this.options.inviteServerKey, replacing);
     const hello: Hello = {
       protocol: PROTOCOL_VERSION,

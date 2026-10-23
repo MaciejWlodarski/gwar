@@ -90,7 +90,11 @@ export class LocalStateUnavailableError extends Error {
 export type LocalStateChange = (stored: string | undefined) => string | null | undefined;
 
 export interface LocalState {
-  /** Reads IndexedDB into memory; at start, before the first render. Never throws: see `error`. */
+  /**
+   * Reads IndexedDB into memory, once (later calls wait for the same read); at start, before the first
+   * render, so the synchronous readers have it. Asynchronous reads and writes call it themselves. Never
+   * throws: see `error`.
+   */
   load(): Promise<void>;
   /** The value as last committed or read; throws while the database cannot be used. */
   get(key: string): string | undefined;
@@ -205,28 +209,33 @@ export function createLocalState(name = LOCAL_STATE_DATABASE, migrations: readon
     try { globalThis.localStorage?.setItem(PING, JSON.stringify({ key, n: `${Date.now()}.${++pings}.${Math.random()}` })); } catch { /* the broadcast and the refreshes remain */ }
   };
 
+  let loading: Promise<void> | undefined;
+  let closed = false;
+  async function open(): Promise<void> {
+    try {
+      const indexedDb = factory ? factory() : globalThis.indexedDB;
+      if (!indexedDb) throw new Error("IndexedDB is not available");
+      const opened = await openDatabase(name, migrations, { factory: indexedDb });
+      // A newer version's tab upgrading the database (or anything deleting it): let go, use nothing.
+      opened.onversionchange = (event) => fail(event.newVersion === null ? new LocalStateUnavailableError() : new NewerDataError(NAME, event.newVersion, migrations.length));
+      // The browser closed it (storage cleared, the disk failed): nothing more can be checked.
+      opened.onclose = () => fail(new LocalStateUnavailableError(new Error("IndexedDB closed the database")));
+      const started = Date.now();
+      const store = opened.transaction(STORE, "readonly").objectStore(STORE);
+      const [keys, values] = await Promise.all([request(store.getAllKeys()), request(store.getAll())]);
+      if (problem !== undefined) return opened.close();
+      db = opened;
+      view = new Map(keys.map((k, i) => [String(k), values[i] as string]));
+      checked.set("", started);
+    } catch (error) {
+      fail(error);
+    }
+  }
+  /** Loads on first use: every asynchronous read or write waits for the first `load`, wherever it starts. */
+  const loaded = () => (closed ? Promise.resolve() : (loading ??= open()));
+
   return {
-    async load() {
-      if (db || problem !== undefined) return;
-      try {
-        const indexedDb = factory ? factory() : globalThis.indexedDB;
-        if (!indexedDb) throw new Error("IndexedDB is not available");
-        const opened = await openDatabase(name, migrations, { factory: indexedDb });
-        // A newer version's tab upgrading the database (or anything deleting it): let go, use nothing.
-        opened.onversionchange = (event) => fail(event.newVersion === null ? new LocalStateUnavailableError() : new NewerDataError(NAME, event.newVersion, migrations.length));
-        // The browser closed it (storage cleared, the disk failed): nothing more can be checked.
-        opened.onclose = () => fail(new LocalStateUnavailableError(new Error("IndexedDB closed the database")));
-        const started = Date.now();
-        const store = opened.transaction(STORE, "readonly").objectStore(STORE);
-        const [keys, values] = await Promise.all([request(store.getAllKeys()), request(store.getAll())]);
-        if (problem !== undefined) return opened.close();
-        db = opened;
-        view = new Map(keys.map((k, i) => [String(k), values[i] as string]));
-        checked.set("", started);
-      } catch (error) {
-        fail(error);
-      }
-    },
+    load: loaded,
     get(key) {
       return usable().view.get(key);
     },
@@ -234,12 +243,14 @@ export function createLocalState(name = LOCAL_STATE_DATABASE, migrations: readon
       if (problem !== undefined || !db) return 0;
       return Math.max(checked.get("") ?? 0, checked.get(prefix) ?? 0);
     },
-    refresh: (prefix = "") => reread({ prefix }),
+    refresh: async (prefix = "") => { await loaded(); return reread({ prefix }); },
     async read(key) {
+      await loaded();
       await reread({ key });
       return usable().view.get(key);
     },
     async update(key, change) {
+      await loaded();
       const started = Date.now();
       const tx = transaction("readwrite");
       let changed = false;
@@ -282,6 +293,7 @@ export function createLocalState(name = LOCAL_STATE_DATABASE, migrations: readon
     },
     error: () => problem,
     close() {
+      closed = true;
       channel?.close();
       globalThis.removeEventListener?.("storage", onStorage);
       globalThis.removeEventListener?.("focus", onFocus);
