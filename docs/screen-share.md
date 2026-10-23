@@ -691,7 +691,11 @@ python3 -B scripts/latency/screen_gate.py \
 ```
 
 The example embeds a fresh loopback server; a standalone server build is not
-needed for this command. Do not add `--null`. All six scenarios run by default.
+needed for this command. Do not add `--null`. All six scenarios run by default. For a targeted downlink rerun, add
+`--scenario downlink --scenario downlink-loss`; the repeatable selector preserves
+all calibration, load and tail rules. A shared-pacing change also needs an
+uplink sanity run (`--scenario uplink --pairs 4 --markers 100`) in a separate
+output directory.
 On a 4-vCPU host, ten pairs **per set** means 240 processes. The measurement
 window is `1 + 15 + 0.25 × markers + 2` seconds = **43 s** at 100 markers:
 **2 h 52 min** before setup/teardown, about **3.2 h** allowing five seconds
@@ -955,7 +959,9 @@ end-to-end layer.
   within a per-viewer egress cap, enforced at the socket send ("Per-viewer
   egress cap" below).
 
-Nothing is promised about downstream network queues; the SFU cannot see them.
+The SFU cannot observe every downstream queue. It smooths all screen RTP before
+transmission, reserving voice headroom in ordinary traffic and bounding probe
+rate and duration; the calibrated downlink gate measures the shared bottleneck.
 
 **Why str0m's pacer cannot be the queue:**
 
@@ -968,7 +974,7 @@ Nothing is promised about downstream network queues; the SFU cannot see them.
 **Original packets: a Gwar-owned queue.**
 
 - Every forwarded video `StreamTx` gets `set_unpaced(true)`. The pacer then
-  sends those packets on the next `poll_output` without holding them
+  bypasses its ordinary queue-draining rate policy for those packets
   (`pacer/leaky.rs`: "Unpaced packets … are sent immediately").
   - TWCC, BWE updates and probe eligibility stay active (`session.rs`).
   - str0m uses this mode for audio by default.
@@ -977,7 +983,9 @@ Nothing is promised about downstream network queues; the SFU cannot see them.
   - One leaky bucket per viewer releases them at that viewer's whole budget,
     serving slots in strict priority order ("Bandwidth allocation per viewer"
     below).
-  - Released packets go to `write_rtp` and leave on the same iteration's poll.
+  - Released packets go to `write_rtp`; a shared transport pacer then smooths
+    them together with repairs and probes before TWCC send times are assigned.
+    Originals are checked against their arrival deadline again at the socket.
 - **Deadline.** Each packet carries `deadline = arrival + 400 ms`. A packet
   still queued at its deadline is evicted, with every later packet of its
   frame, and the slot waits for a keyframe.
@@ -1032,77 +1040,80 @@ limit is a target, not a bound:
     `maybe_periodic_alr`);
   - when the estimate has stagnated for 15 s with unmet demand.
 
-  str0m 0.24.1 offers no public setting to cap or disable them; only the
-  desired bitrate steers them. Their volume is capped by the egress cap below,
-  and their rate by keeping the desired bitrate within twice the estimate
-  ("Probing for keyframe room").
+  The vendored transport bounds dispatched probes at **1.25 × estimate**,
+  in steady state; startup and recovery allow 2× during capacity discovery.
+  This is a combined RTP rate: media
+  sent during a probe consumes its budget instead of adding to padding.
+  Probes use a nominal 15 ms target. Coarse clocks allow two regular wakes
+  plus 2 ms, still within the existing byte reserve, for usable timestamps. Their purpose
+  is to test capacity above the estimate, so a short probe can temporarily
+  consume voice headroom; it cannot send a whole frame at line rate.
 
-**Per-viewer egress cap: originals, repairs and probes together.**
+**Per-viewer pacing and egress cap: originals, repairs and probes together.**
 
-Nothing inside str0m bounds repair or probe volume for a viewer:
+Each watch transport enables the vendored `Bwe::set_egress_pacing` before its
+first probe. This adds a shared wire-byte debt to str0m's pacer, including
+streams marked unpaced, RTX and generated padding. It operates before SRTP
+output and TWCC accounting; neither delayed encrypted datagrams nor false send
+timestamps are needed. Ordinary screen RTP is limited to **0.9 × estimate**;
+short steady-state probes are limited to **1.25 × estimate**. During the
+10 s assignment/resume ramp, and while every assigned slot is bandwidth-paused,
+probes may use **2 × estimate** to discover keyframe room before admission can
+carry feedback. Queue pressure cannot raise these limits. Normal bursts allow 2 ms of the rate, with a one-MTU floor and
+one packet of rounding. Regular scheduler cadences up to 20 ms are allowed;
+long stalls do not earn extra burst credit. Voice has its own transport and
+never waits in this screen pacer. Control traffic bypasses it.
 
-- unpaced streams also send queued resends at once (`streams/send.rs`,
-  `queue_state`);
-- the RTX ratio is recalculated every 50 ms, so repeated NACKs can burst
-  first;
-- padding bypasses it.
+Pacing and TWCC use serialized SRTP bytes plus 48 bytes for IPv6/UDP, also on
+IPv4. Previously probes and BWE counted payload bytes while the socket cap
+counted serialized bytes. Small padding packets therefore understated occupied
+capacity; the resulting estimate, multiplied by the allocator's 0.8, could
+incorrectly pause a fitting 3 Mbps share on a 5 Mbps link. Unpaced repairs and
+probe bursts could also queue voice despite an acceptable average bitrate.
+No random-loss exemption or minimum estimate is imposed: delay and loss BWE
+still detect actual congestion and collapse. A successful probe replaces both
+the loss-limited estimate and its state, as in WebRTC
+`LossBasedBweV2::SetBandwidthEstimate`; the previous decreasing/HOLD state
+cannot silently reapply its old cap to newly demonstrated capacity. Paced probes
+with a local send gap above 20 ms are discarded as scheduler-stalled samples;
+they cannot turn a delayed callback into a capacity collapse. Known lost sends
+participate in this gap check, so random network loss does not masquerade as a
+local stall. Regular sends that queue downstream remain valid congestion samples.
+The setting and probe ceiling
+survive estimator resets and track each new estimate.
 
-So Gwar enforces the bound where it owns the path: **at the socket send.**
-Every `Output::Transmit` of a watch transport goes through the screen task's
-send function. SRTP leaves the RTP header in the clear, so each datagram is
-classified by its header, with no decryption:
+Gwar retains its independent socket-volume backstops. Each outgoing datagram is
+classified by its clear header, without decryption:
 
-- **Originals:** RTP on a slot's main SSRC. They are already paced by the Gwar
-  queue at `B = 0.8 × estimate`, including a conservative 64 bytes per packet
-  for serialized RTP extensions/alignment and SRTP overhead. Admission and share
-  rate/keyframe meters include that same overhead. An originals bucket at the
-  socket checks the actual serialized bytes at `B`, with burst
-  `max(2400 B, 10 ms × B)`, expanding to 30 ms of `B` when measured
-  scheduler wakes exceed 10 ms. UDP/IP bytes are outside this socket-byte cap.
-- **Extras:** RTP on any other SSRC, that is, the RTX SSRCs (repairs and
-  padding) and str0m's probe SSRC. They pass through **one token bucket per
-  viewer**:
-  - rate `0.1 × estimate`;
-  - burst `max(64 KB, 30 ms × 2 × estimate)`, enough for a str0m probe
-    cluster at up to twice the estimate. This is the reserved probe capacity.
+- **Originals:** RTP on a slot's main SSRC. The Gwar queue admits and releases
+  conservative serialized bytes at `B = 0.8 × estimate`. Its admission and
+  share meters reserve 64 bytes per packet for RTP/SRTP overhead. The socket
+  bucket checks actual SRTP bytes at `B`, with burst `max(2400 B, 10 ms × B)`,
+  expanding to 30 ms when scheduler wakes exceed 10 ms. The socket backstop
+  adds one 1264-byte packet of rounding: the shared pacer can mix originals and
+  RTX at different burst boundaries from the release queue. It cannot send
+  beyond the shared wire-rate ceiling. An original that reaches
+  its 400 ms deadline after release is discarded at transmission, its lane is
+  cleared and recovery uses the existing keyframe budget and publisher throttle.
+- **Extras:** all other RTP (RTX and probe SSRCs). One viewer-wide socket
+  bucket allows `0.1 × estimate`, with burst `max(64 KB, 30 ms × 2 × estimate)`.
+  This is a volume reserve, **not permission for an instantaneous socket burst**:
+  the shared pacer spreads it over time. Background padding is suspended while
+  the reserve refills. Probe targets include header and packet-rounding room.
+- **Control:** RTCP, STUN and DTLS are sent immediately.
 
-  Ordinary background padding is suspended on watch transports while credit
-  accumulates between probe clusters, including at the lowest estimates.
-- **Control:** RTCP (payload types 192–223), STUN and DTLS are small and
-  always sent.
+Socket-volume accounting excludes UDP/IP; the pacer and BWE include it. The
+long-term socket bound remains `0.9 × estimate` plus control and initial bucket
+credit. Sustained originals get 80 %, extras 10 %, leaving 10 % for voice and
+other media. A rejected original clears its lane and counts its failed keyframe;
+a rejected extra can be retried by NACK or later probing. Pending BWE events
+are drained before originals are released, so both layers use the current
+estimate. Socket drops can reduce BWE through TWCC loss; accurate pacing avoids
+manufacturing those losses during ordinary probe and repair traffic.
 
-A viewer's sustained egress is therefore at most `0.9 × estimate` plus control
-traffic, with bursts bounded by the sum of the originals and extras bursts. RFC 4588 §7 asks for exactly
-this: originals and retransmissions counted together. Voice runs on a
-separate transport and keeps the remaining 10 %.
-
-Pending BWE events are drained before originals leave the Gwar queue. If an
-original is still rejected by the socket bucket after release, its lane is
-cleared and its stream wiped, its keyframe is counted as failed when applicable,
-and recovery enters the existing viewer budget and publisher throttle.
-
-**When the extras bucket is empty,** the datagram is **dropped at the socket**.
-That is immediate and needs no str0m change:
-
-- A dropped repair is like a lost one. The viewer NACKs again, or the slot
-  recovers through a keyframe.
-- A probe cut short can fail to give a valid result, or give one from the
-  packets that arrived, so the estimate can grow more slowly. That errs on the
-  safe side.
-- str0m already gave dropped packets TWCC numbers, so the viewer reports them
-  lost. str0m's loss controller then lowers the estimate of an overloaded
-  viewer, which is the right direction.
-
-**Small packets.** The pinned str0m 0.24.1 is vendored with one padding
-change (`vendor/str0m/GWAR-PATCH.md`): cached payloads smaller than 240 bytes
-are not reused for probes; blank padding is sent instead. Tiny deltas remain
-available for NACK repair. The extras bucket still charges serialized wire
-bytes. A 30 s simulation with a 20 KB keyframe and 16-byte deltas at 5 fps
-checks for local drops and pauses; the e2e tests again use 6-byte packets.
-
-The 64 KB floor matters at low estimates: it is 200 ms of a 2.5 Mbps link.
-The paired voice runs found that the probe *rate* matters more than this
-volume, which the cap on the desired bitrate handles.
+The small-packet protection remains: cached payloads smaller than 240 bytes
+are not reused for probes; blank padding is sent instead. They remain available
+for NACK repair. See `vendor/str0m/GWAR-PATCH.md`.
 
 **Escalation.** If the extras bucket drops packets in more than 2 s of any 5 s
 window, the viewer's lowest-priority slot is paused with reason `bandwidth`.
@@ -1197,24 +1208,18 @@ serves the voice acceptance instead. Results and deviations:
   individual padding packets instead of draining each generated burst. A
   240-byte blank packet per 2 ms wake limited discovery to about 1 Mbps even
   on a healthy link. The local str0m patch now drains each burst immediately
-  and spaces only successive bursts. Application-paced streams learn regular
-  scheduling cadences up to 20 ms; longer stalls never increase retained cadence.
-  The nominal 15 ms cluster may cover that regular cadence plus 2 ms of burst
-  spacing, but a separate payload-byte limit bounds it against the actual extras
-  reserve after worst-case RTP/SRTP headers and one MTU of rounding. A limited
-  first burst leaves a tail for a later timestamp. Late wakes consume only the
-  remaining budget. The already-required
-  minimum packet count is batched at low rates. Burst spacing starts at the
-  first actual send, including when padding was prepared on an earlier timeout.
-  Fallback probes inherit their media source's pacing mode, and screen slots
-  are configured before bootstrap. Paced media keeps its original scheduling
-  and first-burst size.
+  and spaces only successive bursts on transports without the shared ceiling.
+  Watch transports now queue a complete cluster for one wire-byte pacer, rather
+  than having padding generation and transmission each pace the same probe.
+  Regular cadences up to 20 ms can extend the nominal 15 ms target to two wakes
+  plus 2 ms for usable timestamps, within the existing byte reserve. Longer
+  stalls never increase retained cadence. Originals and repairs consume the
+  same probe rate, and actual transmission times drive feedback.
 
-  Recovering and coarsely scheduled screen-watch transports dispatch clusters
-  at least one second apart, including startup pairs, allowing the reserve to
-  refill. Recovery spacing lasts ten seconds after resume; fast active transports
-  otherwise retain normal probing. Target increases wait for a full reserve
-  within one MTU, and background padding stops at its source while it refills.
+  Every screen-watch transport dispatches clusters at least one second apart,
+  including startup pairs and fast active viewers. Target increases wait for a
+  full reserve within one MTU, and background padding stops at its source while
+  it refills. This prevents reserve exhaustion from manufacturing TWCC loss.
 
   A fully bandwidth-paused viewer restarts ordinary startup probing from the
   same 2.5 Mbps estimate as a fresh subscriber, as soon as the reserve is ready.
@@ -1373,18 +1378,21 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   the largest keyframe seen on the watched shares in the last 30 s, and at
   least 200 KB. The estimate can then grow enough for keyframes to meet the
   queue deadline, even for low-average shares. The cost is str0m's probes,
-  short clusters at up to 2× desired, which stay inside the viewer's extras
-  bucket ("Per-viewer egress cap").
+  short clusters capped at 1.25× estimate and paced together with media,
+  within the viewer's extras bucket ("Per-viewer egress cap").
 
   Removing the final assignment sets the desired bitrate to zero immediately.
   The socket suppresses any pending non-control datagrams while nothing is
   watched, including probe clusters already scheduled by str0m. A retained
   transport sends zero non-control bytes in the 30 s final-unwatch simulation.
 
-  The target is **at most 1.5 × the current estimate**. str0m's largest
-  periodic probe runs at twice that target: a 15 ms cluster uses
-  45 ms × estimate before headers, within the unchanged 60 ms × estimate
-  extras burst. Increases wait until the reserve has refilled to within one
+  The desired target is **at most 1.5 × the current estimate**; the actual
+  steady-state probe ceiling is **1.25 × estimate** (2× during the ramp and
+  stalled recovery). Both the estimator's probe plan and
+  its continuation threshold use the capped rate. A successful capped probe
+  can therefore continue discovering capacity, without waiting for a result
+  at the original higher target. The existing extras byte reserve also bounds
+  coarse-clock clusters. Target increases wait for reserve refill within one
   MTU. Screen-watch transports suspend ordinary background padding through
   `Bwe::set_padding_bitrate_limit(Some(Bitrate::ZERO))`, so it cannot consume
   the refill while the target waits. Once ready, the background-padding limit

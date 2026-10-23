@@ -455,8 +455,8 @@ struct Slot {
     configured: bool,
     ssrc: Option<u32>,
     asked: Option<Instant>,
-    /// Released originals still owned by str0m: sequence number and source keyframe, if any.
-    originals: VecDeque<(u16, Option<u32>)>,
+    /// Released originals still owned by str0m: sequence, source keyframe and arrival deadline.
+    originals: VecDeque<(u16, Option<u32>, Instant)>,
     written: u64,
 }
 
@@ -1409,18 +1409,22 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                     let lane = w.slots.iter().position(|s| s.ssrc == Some(ssrc)).unwrap();
                     let sequence = u16::from_be_bytes(t.contents[2..4].try_into().unwrap());
                     let pending = &mut w.slots[lane].originals;
-                    let key_frame = pending
+                    let (key_frame, expired) = pending
                         .iter()
-                        .position(|(seq, _)| *seq == sequence)
+                        .position(|(seq, _, _)| *seq == sequence)
                         .and_then(|at| pending.remove(at))
-                        .and_then(|(_, key)| key);
-                    Some((lane, key_frame))
+                        .map_or((None, false), |(_, key, arrival)| (key, now >= arrival + egress::DEADLINE));
+                    Some((lane, key_frame, expired))
                 } else {
                     None
                 };
-                if w.egress.charge(class, t.contents.len(), now) {
+                let expired = original.is_some_and(|(_, _, expired)| expired);
+                if !expired && w.egress.charge(class, t.contents.len(), now) {
                     send(&t.contents, t.destination);
-                } else if let Some((lane, key_frame)) = original {
+                } else if let Some((lane, key_frame, _)) = original {
+                    if expired {
+                        w.egress.counters.originals_dropped += 1;
+                    }
                     w.egress.reject_original(lane, key_frame, now);
                     let slot = &mut w.slots[lane];
                     slot.segment.wait();
@@ -1437,7 +1441,7 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                 RtcEvent::IceConnectionStateChange(IceConnectionState::Disconnected) => w.rtc.disconnect(),
                 RtcEvent::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => {
                     trace!(session = w.session, estimate = estimate.as_u64(), "screen watch estimate");
-                    w.egress.set_estimate(estimate.as_u64(), now);
+                    set_estimate(w, estimate.as_u64(), now);
                 }
                 RtcEvent::MediaAdded(added) if added.kind == MediaKind::Video => {
                     if added.direction.is_sending() && w.slots.len() < w.size {
@@ -1487,9 +1491,10 @@ fn allocate(
     );
     let stalled = w.egress.stalled();
     let recovering = w.restarted.is_some_and(|at| now.saturating_duration_since(at) < egress::RAMP);
-    let interval =
-        if stalled || recovering || w.egress.coarse_cadence() { Duration::from_secs(1) } else { Duration::ZERO };
-    w.rtc.bwe().set_min_probe_interval(interval);
+    pacing(w, now);
+    // Each cluster consumes the shared extras reserve. Space all clusters, including
+    // fast active viewers, so capacity discovery cannot manufacture socket-cap loss.
+    w.rtc.bwe().set_min_probe_interval(Duration::from_secs(1));
     w.rtc.bwe().set_probe_byte_limit(w.egress.probe_byte_limit());
     let probe_ready = w.egress.probe_ready(now);
     // Idle padding must not spend the credit a probe target increase is waiting for.
@@ -1526,9 +1531,28 @@ fn allocate(
     None
 }
 
-/// Synchronize the bounded desired target before starting ordinary startup probes.
-fn restart_estimator(w: &mut Watcher, estimate: u64, now: Instant, caps: &[u64], lanes: &[ShareRate]) {
+/// Keep queue admission and transport pacing on the same estimate.
+fn set_estimate(w: &mut Watcher, estimate: u64, now: Instant) {
     w.egress.set_estimate(estimate, now);
+    pacing(w, now);
+}
+
+fn pacing(w: &mut Watcher, now: Instant) {
+    let discovering = w.egress.ramping(now)
+        || w.egress.stalled()
+        || w.restarted.is_some_and(|at| now.saturating_duration_since(at) < egress::RAMP);
+    pace(&mut w.rtc, w.egress.estimate(), if discovering { 2.0 } else { egress::PROBE_PACE });
+}
+
+fn pace(rtc: &mut Rtc, estimate: u64, probe_factor: f64) {
+    rtc.bwe().set_egress_pacing(
+        Bitrate::bps((estimate as f64 * (egress::PLAN + egress::EXTRAS)) as u64),
+        Bitrate::bps((estimate as f64 * probe_factor) as u64),
+    );
+}
+
+fn restart_estimator(w: &mut Watcher, estimate: u64, now: Instant, caps: &[u64], lanes: &[ShareRate]) {
+    set_estimate(w, estimate, now);
     w.desired = w.egress.desired(caps, lanes);
     w.rtc.bwe().set_desired_bitrate(Bitrate::bps(w.desired.unwrap_or(0)));
     w.rtc.bwe().set_probe_byte_limit(w.egress.probe_byte_limit());
@@ -1661,8 +1685,8 @@ fn enqueue(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forwa
     !dropped.contains(&index)
 }
 
-/// Writes what the viewer's release bucket allows into str0m, whose unpaced streams send it on
-/// the next poll. Slots whose head reached its deadline were cleared and wait for a keyframe.
+/// Writes what the viewer's release bucket allows into str0m. Its shared RTP pacer smooths
+/// originals together with RTX and probes; transmission checks the original deadline again.
 fn release(w: &mut Watcher, now: Instant) {
     let (released, dropped) = w.egress.due(now);
     for &lane in &dropped {
@@ -1681,7 +1705,7 @@ fn release(w: &mut Watcher, now: Instant) {
         }
         let mut extensions = ExtensionValues::default();
         extensions.user_values.set(SlotGeneration(slot.generation));
-        slot.originals.push_back((packet.out as u16, packet.key_frame()));
+        slot.originals.push_back((packet.out as u16, packet.key_frame(), packet.arrival));
         // The wallclock is the packet's arrival, not its release: sender reports describe the
         // sharer's timeline.
         stream.write_rtp(
@@ -1705,6 +1729,9 @@ fn rtc(advertise: SocketAddr, now: Instant, bwe: bool) -> Result<Rtc, &'static s
         .enable_vp8(true)
         .enable_bwe(bwe.then(|| Bitrate::bps(INITIAL_ESTIMATE)))
         .build(now);
+    if bwe {
+        pace(&mut rtc, INITIAL_ESTIMATE, 2.0);
+    }
     rtc.add_local_candidate(Candidate::host(advertise, "udp").map_err(|_| "bad media address")?);
     Ok(rtc)
 }
@@ -2068,6 +2095,39 @@ pub(crate) mod tests {
         assert_eq!(sent, 0, "no queued RTP leaves after revocation");
         assert_eq!(pair.repairs, repairs, "no delayed RTX leaves after revocation");
         assert_eq!(pair.w.egress.queued(), 0, "revocation also clears the allocation queue");
+    }
+
+    #[test]
+    fn paced_originals_still_expire_at_the_socket() {
+        let mut pair = Pair::new();
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
+        assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
+        let forward = Forward {
+            source: 1,
+            timestamp: 9000,
+            marker: true,
+            keyframe: true,
+            codec: VideoCodec::Vp8,
+            arrival: pair.now,
+            payload: Arc::from(vec![0x10; 1100]),
+        };
+        assert!(enqueue(&mut pair.w, 0, &origin, &forward, pair.now));
+        release(&mut pair.w, pair.now);
+        assert_eq!(pair.w.slots[0].originals.len(), 1);
+        pair.now += egress::DEADLINE;
+        let mut originals = 0;
+        let mut requests = Vec::new();
+        let ssrc = pair.w.slots[0].ssrc.unwrap();
+        drive(&mut pair.w, pair.now, &mut requests, &mut |bytes, _| {
+            if egress::classify(bytes, |sent| sent == ssrc) == egress::Class::Original {
+                originals += 1;
+            }
+        });
+        assert_eq!(originals, 0, "pacing never extends the original deadline");
+        assert_eq!(pair.w.egress.counters.originals_dropped, 1);
+        assert_eq!(pair.w.egress.counters.failed_keyframes, 1);
+        assert!(requests.contains(&0), "expired keyframe enters normal recovery");
+        assert!(pair.w.slots[0].originals.is_empty());
     }
 
     #[test]

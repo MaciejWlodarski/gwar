@@ -100,6 +100,7 @@ pub(crate) struct Session {
     bwe: Option<Bwe>,
     bwe_last_event: Option<(Bitrate, bool)>,
     bwe_padding_bitrate_limit: Option<Bitrate>,
+    bwe_egress_pacing: Option<(Bitrate, Bitrate)>,
 
     enable_twcc_feedback: bool,
 
@@ -207,6 +208,7 @@ impl Session {
             bwe,
             bwe_last_event: None,
             bwe_padding_bitrate_limit: None,
+            bwe_egress_pacing: None,
             enable_twcc_feedback: false,
             pacer,
             pacer_control: PacerControl::new(),
@@ -362,7 +364,12 @@ impl Session {
         let do_probe = probe_media.is_some();
         let bwe = self.bwe.as_mut()?;
 
-        if let Some(probe_config) = bwe.handle_timeout(now, do_probe) {
+        if let Some(mut probe_config) = bwe.handle_timeout(now, do_probe) {
+            if let Some((_, probe)) = self.bwe_egress_pacing {
+                probe_config = probe_config
+                    .with_max_bitrate(probe)
+                    .with_max_send_gap(Duration::from_millis(20));
+            }
             // Only start the probe in the pacer if the estimator accepted it.
             if bwe.start_probe(probe_config, now) {
                 #[cfg(feature = "_internal_test_exports")]
@@ -1189,13 +1196,19 @@ impl Session {
             crate::log_stat!("PACKET_SENT", header.ssrc, payload_size, kind);
         }
 
-        self.pacer.register_send(now, payload_size.into(), midrid);
-
         if let Some(raw_packets) = &mut self.raw_packets {
             raw_packets.push_back(Box::new(RawPacket::RtpTx(header.clone(), buf.clone())));
         }
 
         let protected = srtp_tx.protect_rtp(buf, &header, *seq_no);
+        // Dedicated egress pacing and its feedback use the same wire-byte unit.
+        // Reserve IPv6 + UDP even on IPv4, retaining headroom for both paths.
+        let sent_size = if self.bwe_egress_pacing.is_some() {
+            protected.len() + 48
+        } else {
+            payload_size
+        };
+        self.pacer.register_send(now, sent_size.into(), midrid);
 
         if twcc_enabled {
             let packet_id = if let Some(cluster) = cluster_id {
@@ -1204,12 +1217,12 @@ impl Session {
                 TwccPacketId::new(twcc_seq)
             };
             self.twcc_tx_register
-                .register_seq(packet_id, now, payload_size);
+                .register_seq(packet_id, now, sent_size);
         }
 
         // Update BWE subsystem
         if let Some(bwe) = self.bwe.as_mut() {
-            bwe.on_media_sent(payload_size.into(), is_padding, now);
+            bwe.on_media_sent(sent_size.into(), is_padding, now);
         }
 
         if !is_padding && !header.ssrc.is_probe() {
@@ -1328,6 +1341,14 @@ impl Session {
         }
     }
 
+    pub fn set_bwe_egress_pacing(&mut self, media: Bitrate, probe: Bitrate) {
+        self.bwe_egress_pacing = Some((media, probe));
+        if let Some(bwe) = self.bwe.as_mut() {
+            bwe.set_probe_bitrate_limit(probe);
+        }
+        self.pacer.set_egress_pacing(media);
+    }
+
     pub fn set_bwe_padding_bitrate_limit(&mut self, limit: Option<Bitrate>) {
         self.bwe_padding_bitrate_limit = limit;
         self.configure_pacer();
@@ -1351,6 +1372,9 @@ impl Session {
             // Retain transport/SRTP sequence numbers, but discard old probe bursts,
             // scheduler cadence, debt and in-flight feedback from the previous BWE.
             self.pacer = PacerImpl::leaky_bucket(init_bitrate * 2.0);
+            if let Some((media, _)) = self.bwe_egress_pacing {
+                self.pacer.set_egress_pacing(media);
+            }
             self.streams.set_probe_media(None);
             for stream in self.streams.streams_tx() {
                 stream.clear_padding();

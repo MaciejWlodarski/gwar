@@ -28,8 +28,8 @@ crates.io str0m 0.24.1 was not affected.
 
 `Bwe::set_min_probe_interval` optionally spaces dispatched clusters, including
 the initial pair, and persists across estimator resets. Gwar watch transports
-use one second while fully paused, coarsely scheduled, or in the first ten
-seconds after resume. Fast active transports and the library default retain zero.
+use one second for every cluster, including fast active viewers and startup
+pairs. The library default retains zero.
 Fully paused viewers retry ordinary startup probing from 2.5 Mbps after 15 s
 with no lane fitting, waiting for existing socket credit before restarting.
 Continuous-fit timers and ready priority handoffs finish first. Resume starts fresh
@@ -96,3 +96,41 @@ str0m 0.24.1, commit `8c4c5284cb11b1e3c82962639cda5b3e95af73e8`. They total
 See `tests/data/README.md` for provenance and `tests/data/SHA256SUMS` for
 checksums. The narrow `.gitignore` exception retains these required fixtures
 so the entire vendor suite compiles and runs from a fresh checkout.
+
+
+`Bwe::set_egress_pacing(media, probe)` opts a dedicated screen transport into a
+shared RTP ceiling, including unpaced streams, RTX and probe padding. Debt uses
+serialized SRTP plus a conservative 48-byte IPv6/UDP allowance, and TWCC and ALR
+use that same byte unit. Rates and byte targets therefore describe occupied
+capacity even for small padding. Queue pressure cannot increase this ceiling.
+Ordinary bursts use 2 ms (one-MTU floor, one-packet rounding); regular wake
+cadences up to 20 ms are allowed, but longer stalls do not create burst credit.
+Probe configurations are capped before continuation thresholds are calculated,
+and again at dispatch before the estimator and pacer receive them. Probes queue
+a complete cluster for the shared pacer, avoiding two competing pacing clocks.
+Coarse scheduling allows two regular wakes plus 2 ms for distinct timestamps,
+within the existing byte reserve. Both rates survive BWE reset. Control traffic
+bypasses the RTP pacer; transports that do not opt in retain upstream behavior.
+Gwar enables this only on watch transports, at 90 % / 125 % of the current
+estimate in steady state, allowing short 200 % probes during the 10 s
+assignment/resume ramp and fully paused recovery. Independent voice transports keep their immediate path. Regressions
+cover a burst of unpaced repairs, probes, transmission-time deadlines, and
+5 Mbps downlinks at 0-1 % loss with both steady video and voice queue checks.
+Additional changed upstream file: `src/pacer/mod.rs`.
+
+
+`LossController::set_bandwidth_estimate` also replaces the loss-limited state
+with `DelayBased`, matching WebRTC `LossBasedBweV2::SetBandwidthEstimate`.
+Previously a successful probe could install a new estimate while retaining
+`Decreasing`; the old HOLD cap could then overwrite demonstrated capacity.
+An induced-loss regression verifies this transition. Loss thresholds and the
+inherent-loss model are unchanged. Additional changed file:
+`src/bwe/loss_controller.rs`.
+
+Shared-pacing probe configurations also limit gaps between local sends to 20 ms.
+The estimator retains ordered send timestamps (including known lost packets)
+and rejects a cluster interrupted by a longer scheduler stall. A paced probe
+spanning a 100 ms callback stall must not report that low send rate as network
+capacity. Regular local sends that queue downstream still produce a congestion
+estimate. Tests distinguish both paths; ordinary unconfigured transports retain
+their probe behavior. Additional changed file: `src/bwe/probe/estimator.rs`.

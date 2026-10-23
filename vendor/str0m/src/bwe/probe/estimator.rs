@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -84,6 +85,7 @@ struct ProbeEstimatorState {
     total_bytes: DataSize,
     /// Number of packets included in this probe (received packets only).
     packet_count: usize,
+    send_times: BTreeSet<Instant>,
 }
 
 impl ProbeEstimator {
@@ -245,10 +247,15 @@ impl ProbeEstimatorState {
             size_first_receive: DataSize::ZERO,
             total_bytes: DataSize::ZERO,
             packet_count: 0,
+            send_times: BTreeSet::new(),
         }
     }
 
     fn update(&mut self, record: &TwccSendRecord) -> bool {
+        if self.config.max_send_gap.is_some() {
+            // Include known lost sends too: random link loss is not a sender stall.
+            self.send_times.insert(record.local_send_time());
+        }
         // Only packets with a known remote receive time participate in probe estimation.
         let Some(recv_time) = record.remote_recv_time() else {
             return false; // lost/unreceived packet -> ignore for probe result
@@ -326,6 +333,19 @@ impl ProbeEstimatorState {
                 recv: self.total_bytes,
                 limit: min_bytes,
             };
+        }
+
+        if let Some(limit) = self.config.max_send_gap {
+            let gap = self
+                .send_times
+                .iter()
+                .zip(self.send_times.iter().skip(1))
+                .map(|(a, b)| b.saturating_duration_since(*a))
+                .max()
+                .unwrap_or_default();
+            if gap > limit {
+                return ProbeResult::SendGapTooLong { gap, limit };
+            }
         }
 
         // Get timing bounds
@@ -413,6 +433,8 @@ enum ProbeResult {
     InsufficientBytes { recv: DataSize, limit: DataSize },
     /// Send interval too long (> 1 second)
     SendIntervalTooLong { interval: Duration },
+    /// A local scheduler stall cannot measure network capacity.
+    SendGapTooLong { gap: Duration, limit: Duration },
     /// Send interval invalid (zero)
     SendIntervalInvalid { interval: Duration },
     /// Receive interval invalid (zero or > 1 second)
@@ -446,6 +468,9 @@ impl fmt::Display for ProbeResult {
                 limit: required,
             } => {
                 write!(f, "insufficient bytes ({} < {})", received, required)
+            }
+            ProbeResult::SendGapTooLong { gap, limit } => {
+                write!(f, "send gap too long ({gap:?} > {limit:?})")
             }
             ProbeResult::SendIntervalTooLong { interval } => {
                 write!(f, "send interval too long ({:?})", interval)
@@ -501,6 +526,44 @@ mod test {
         estimator.handle_timeout(now + Duration::from_secs(1));
         assert!(estimator.states.is_empty(), "All probes should be cleared");
         assert_eq!(estimator.poll_timeout(), not_happening());
+    }
+
+    #[test]
+    fn paced_probes_distinguish_sender_stalls_from_network_queueing() {
+        let base = Instant::now();
+        for (send_tail, recv_tail, expected) in [(100, 100, false), (16, 100, true), (16, 16, true)]
+        {
+            let mut estimator = ProbeEstimator::new();
+            let cluster: TwccClusterId = 7.into();
+            let config = ProbeClusterConfig::new(cluster, Bitrate::mbps(2), ProbeKind::Initial)
+                .with_max_send_gap(Duration::from_millis(20));
+            assert!(estimator.probe_start(config, base));
+            let packets: Vec<_> = (0..5)
+                .map(|i| {
+                    let sent = if i == 4 { send_tail } else { i * 4 };
+                    let received = if i == 4 { recv_tail } else { i * 4 };
+                    crate::rtp_::TwccSendRecord::test_new(
+                        TwccPacketId::with_cluster(1000 + i, cluster),
+                        base + Duration::from_millis(sent),
+                        1200,
+                        base + Duration::from_millis(150),
+                        Some(base + Duration::from_millis(received + 2)),
+                    )
+                })
+                .collect();
+            let results: Vec<_> = estimator.update(packets.iter()).collect();
+            assert_eq!(
+                !results.is_empty(),
+                expected,
+                "send={send_tail} recv={recv_tail}"
+            );
+            if expected && recv_tail == 100 {
+                assert!(
+                    results.last().unwrap().1 < Bitrate::mbps(1),
+                    "real queueing still reduces capacity"
+                );
+            }
+        }
     }
 
     #[test]

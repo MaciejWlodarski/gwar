@@ -90,6 +90,16 @@ impl<'a> Bwe<'a> {
         self.0.session.set_bwe_min_probe_interval(interval);
     }
 
+    /// Pace all RTP, including unpaced media, RTX and padding, before assigning TWCC send times.
+    ///
+    /// `media` bounds the combined ordinary egress; `probe` bounds short capacity probes.
+    /// Queue pressure cannot raise either rate. Control packets bypass this pacer.
+    /// The setting survives BWE resets. Use a dedicated video transport: audio on this
+    /// transport would share the limit too.
+    pub fn set_egress_pacing(&mut self, media: Bitrate, probe: Bitrate) {
+        self.0.session.set_bwe_egress_pacing(media, probe);
+    }
+
     /// Reset the BWE with a new init_bitrate
     ///
     /// This discards estimator/smoothing state, queued probes, pacer debt and

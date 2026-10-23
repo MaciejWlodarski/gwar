@@ -338,6 +338,28 @@ python3 scripts/latency/screen_gate.py --null \
   --pairs 10 --markers 100 --out /tmp/gwar-gate-aa-unconstrained
 ```
 
+For a targeted downlink acceptance rerun, keep eight pairs and 100 markers:
+
+```sh
+python3 -B scripts/latency/screen_gate.py --binary target/release/examples/latency \
+  --scenario downlink --scenario downlink-loss --pairs 8 --markers 100 \
+  --out /tmp/gwar-gate-downlink
+```
+
+The viewer transport paces originals, RTX and probes together before TWCC send
+timestamps are assigned: ordinary screen RTP at 90 % of estimated wire capacity,
+short steady-state probes at no more than 125 %. Startup, the 10 s resume ramp
+and fully paused recovery may probe at 200 % for capacity discovery. Clusters
+are at least one second apart. Probe feedback includes SRTP and
+UDP/IP overhead. Original packets still expire 400 ms after publisher arrival,
+including time in the transport pacer. Independent voice bypasses screen pacing.
+Probes interrupted by local send gaps over 20 ms are excluded from capacity
+estimation; actual downstream queueing still reduces the estimate.
+The downlink regression simulation includes a shared FIFO, independent voice,
+150 KB keyframes, two 3 Mbps shares, and eight seeds with 0 % and 1 % loss.
+Changing shared pacing also requires an uplink sanity run with at least four
+pairs. Thresholds and the 60 % minimum steady-load check remain unchanged.
+
 Choose a new output directory for each repetition. Omit `--scenario` to run all
 six scenarios. Both sets run without screen load; each second arm retains the
 `screen` label in file names and comparisons. Warmup, pair seeds, alternating

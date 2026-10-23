@@ -53,6 +53,7 @@ pub enum BandwidthLimitedCause {
 }
 
 pub struct ProbeControl {
+    bitrate_limit: Option<Bitrate>,
     config: Config,
     next_timeout: Instant,
     min_probe_interval: Duration,
@@ -101,6 +102,7 @@ struct LargeDrop {
 impl Default for ProbeControl {
     fn default() -> Self {
         Self {
+            bitrate_limit: None,
             config: Config::default(),
             enabled: false,
             next_timeout: not_happening(),
@@ -129,6 +131,10 @@ impl Default for ProbeControl {
 impl ProbeControl {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_bitrate_limit(&mut self, limit: Bitrate) {
+        self.bitrate_limit = Some(limit);
     }
 
     pub fn set_min_probe_interval(&mut self, interval: Duration) {
@@ -560,7 +566,9 @@ impl ProbeControl {
     fn queue_probe(&mut self, bitrate: Bitrate, kind: ProbeKind, desired: Bitrate, now: Instant) {
         // Cap at 2× desired bitrate.
         let max = desired * MAX_PROBE_BITRATE_FACTOR;
-        let bitrate = bitrate.min(max);
+        let bitrate = bitrate
+            .min(max)
+            .min(self.bitrate_limit.unwrap_or(Bitrate::INFINITY));
 
         // No probe at too small values.
         if bitrate < Bitrate::kbps(5) {
@@ -723,6 +731,33 @@ impl BandwidthLimitedCause {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn capped_probe_success_can_continue_capacity_discovery() {
+        let now = Instant::now();
+        let mut pc = ProbeControl::new();
+        pc.enable(true);
+        pc.set_desired_bitrate(Bitrate::mbps(50));
+        pc.set_estimated_bitrate(Bitrate::mbps(1), BandwidthLimitedCause::DelayBasedLimited);
+        pc.set_bitrate_limit(Bitrate::kbps(1250));
+        assert_eq!(
+            pc.handle_timeout(now).unwrap().target_bitrate(),
+            Bitrate::kbps(1250)
+        );
+        assert_eq!(
+            pc.handle_timeout(now).unwrap().target_bitrate(),
+            Bitrate::kbps(1250)
+        );
+        // A successful capped probe must use its actual target for the 70% guard,
+        // rather than waiting for 70% of the original, unreachable 6 Mbps target.
+        pc.set_estimated_bitrate(
+            Bitrate::kbps(1200),
+            BandwidthLimitedCause::DelayBasedLimited,
+        );
+        pc.set_bitrate_limit(Bitrate::kbps(1500));
+        let next = pc.handle_timeout(now + Duration::from_millis(10)).unwrap();
+        assert_eq!(next.target_bitrate(), Bitrate::kbps(1500));
+    }
 
     #[test]
     fn minimum_interval_spaces_initial_and_later_probes() {

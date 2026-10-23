@@ -40,6 +40,10 @@ pub struct LeakyBucketPacer {
     next_poll_time: Option<(Instant, PacerReason)>,
     /// The current media debt.
     media_debt: DataSize,
+    /// Optional application ceiling for all RTP, with independent wire-byte debt.
+    egress_rate: Option<Bitrate>,
+    egress_debt: DataSize,
+    egress_active_rate: Bitrate,
     /// The current padding debt.
     padding_debt: DataSize,
     /// The longest the average packet can spend in the queue before we force it to be drained.
@@ -108,6 +112,24 @@ impl Pacer for LeakyBucketPacer {
         }
         self.clear_debt(elapsed);
         self.maybe_update_adjusted_bitrate(now);
+        if let Some(media) = self.egress_rate {
+            self.egress_active_rate = self
+                .probe_queue
+                .front()
+                .map_or(media, |probe| probe.config().target_bitrate());
+            // Allow ordinary scheduler granularity, never accumulate credit over a stall.
+            let burst = (self.egress_active_rate
+                * self.bounded_wake_interval.max(Duration::from_millis(2)))
+            .max(DataSize::bytes(1200));
+            if self.egress_debt >= burst {
+                self.next_poll_queue = None;
+                self.next_poll_time = Some((
+                    now + self.egress_debt / self.egress_active_rate.max(Bitrate::bps(1)),
+                    PacerReason::Paced,
+                ));
+                return None;
+            }
+        }
 
         if let Some(request) = self.maybe_create_padding_request(now) {
             self.next_poll_queue = Some(request.midrid);
@@ -154,6 +176,9 @@ impl Pacer for LeakyBucketPacer {
     fn register_send(&mut self, now: Instant, packet_size: DataSize, _from: MidRid) {
         self.last_emitted = Some(now);
 
+        if self.egress_rate.is_some() {
+            self.egress_debt += packet_size;
+        }
         self.media_debt += packet_size;
         self.media_debt = self
             .media_debt
@@ -189,6 +214,9 @@ impl LeakyBucketPacer {
             next_poll_time: None,
             media_debt: DataSize::ZERO,
             padding_debt: DataSize::ZERO,
+            egress_rate: None,
+            egress_debt: DataSize::ZERO,
+            egress_active_rate: Bitrate::ZERO,
             queue_limit: DEFAULT_QUEUE_LIMIT,
             queue_states: vec![],
             next_poll_queue: None,
@@ -196,6 +224,10 @@ impl LeakyBucketPacer {
             completed_probe: None,
             needs_timeout_before_next_poll: true,
         }
+    }
+
+    pub fn set_egress_pacing(&mut self, rate: Bitrate) {
+        self.egress_rate = Some(rate.max(Bitrate::bps(1)));
     }
 
     /// Start executing a probe cluster.
@@ -250,6 +282,9 @@ impl LeakyBucketPacer {
     }
 
     fn clear_debt(&mut self, elapsed: Duration) {
+        self.egress_debt = self
+            .egress_debt
+            .saturating_sub(self.egress_active_rate * elapsed);
         self.media_debt = self
             .media_debt
             .saturating_sub(self.adjusted_bitrate * elapsed);
@@ -447,7 +482,10 @@ impl LeakyBucketPacer {
         if let Some(probe) = self.probe_queue.front_mut() {
             // Delegate probe timing and padding calculation to ProbeClusterState
             let bounded = probe.config().is_byte_limited();
-            if !(queue.unpaced && bounded) && !probe.should_send_now(now) {
+            if self.egress_rate.is_none()
+                && !(queue.unpaced && bounded)
+                && !probe.should_send_now(now)
+            {
                 // Not time yet - wait until next_probe_time
                 return None;
             }
@@ -461,7 +499,11 @@ impl LeakyBucketPacer {
             } else {
                 self.wake_interval
             };
-            let padding_size = probe.next_packet(now, wake_interval);
+            let padding_size = if self.egress_rate.is_some() {
+                probe.next_paced_packet(self.bounded_wake_interval)
+            } else {
+                probe.next_packet(now, wake_interval)
+            };
             let Some(padding_size) = padding_size else {
                 // Probe says no padding needed (already sent enough for this interval)
                 return None;
@@ -517,6 +559,71 @@ mod test {
     use crate::rtp_::{DataSize, Mid, RtpHeader};
     use queue::{PacketKind, Queue, QueuedPacket};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn egress_ceiling_spreads_unpaced_repairs_and_probes() {
+        use crate::bwe_::ProbeKind;
+
+        for probing in [false, true] {
+            let now = Instant::now();
+            let mut pacer = LeakyBucketPacer::new(Bitrate::mbps(100));
+            pacer.set_egress_pacing(Bitrate::mbps(4));
+            if probing {
+                pacer.start_probe(ProbeClusterConfig::new(
+                    0.into(),
+                    Bitrate::mbps(6),
+                    ProbeKind::Initial,
+                ));
+            }
+            let mut left = 60;
+            let mut sends = Vec::new();
+            for millis in 0..200 {
+                let at = now + Duration::from_millis(millis);
+                loop {
+                    // An old, large unpaced RTX queue would otherwise drain at once,
+                    // even when queue pressure raises adjusted_bitrate above the ceiling.
+                    let queue = QueueState {
+                        midrid: MidRid("screen".into(), None),
+                        unpaced: true,
+                        use_for_padding: false,
+                        snapshot: QueueSnapshot {
+                            created_at: now,
+                            byte_size: left * 1200,
+                            packet_count: left as u32,
+                            total_queue_time_origin: Duration::from_secs(left as u64 * 3),
+                            first_unsent: (left > 0).then_some(now),
+                            priority: QueuePriority::Media,
+                            ..Default::default()
+                        },
+                    };
+                    pacer.handle_timeout(at, [queue].into_iter());
+                    if left == 0 || pacer.poll_queue().is_none() {
+                        break;
+                    }
+                    left -= 1;
+                    sends.push(at);
+                    pacer.register_send(at, DataSize::bytes(1200), MidRid("screen".into(), None));
+                }
+            }
+            assert_eq!(left, 0, "sustained egress makes progress");
+            assert!(sends[59] - now >= Duration::from_millis(120));
+            assert!(
+                sends.windows(3).all(|burst| burst[0] != burst[2]),
+                "at most two MTUs per wake"
+            );
+            // Independent voice arriving after these sends shares a 5 Mbps FIFO.
+            // An unpaced 72 KB repair burst would queue it for over 100 ms.
+            let mut busy = now;
+            for at in sends {
+                busy = busy.max(at) + Duration::from_secs_f64(1200.0 * 8.0 / 5_000_000.0);
+                assert!(
+                    busy - at <= Duration::from_millis(10),
+                    "screen queued voice behind a burst"
+                );
+            }
+            assert!(pacer.active_cluster().is_none(), "the paced probe finishes");
+        }
+    }
 
     #[test]
     fn probe_deadline_without_media_or_regular_padding() {

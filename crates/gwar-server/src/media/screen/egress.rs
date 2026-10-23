@@ -33,6 +33,8 @@ pub const INITIAL_ESTIMATE: u64 = 2_500_000;
 /// and voice, on its own transport, keeps the rest.
 pub const PLAN: f64 = 0.8;
 pub const EXTRAS: f64 = 0.1;
+/// Short probes may exceed the estimate to discover capacity, without full-rate frame bursts.
+pub const PROBE_PACE: f64 = 1.25;
 /// Admission bound floor, bytes.
 const ADMISSION_FLOOR: f64 = 64.0 * 1024.0;
 /// Extras burst: `max(64 KB, 30 ms × 2 × estimate)`, room for one str0m probe cluster at up to
@@ -294,7 +296,7 @@ impl Egress {
             release_interval: Duration::ZERO,
             originals: Bucket::new(
                 PLAN * estimate / 8.0,
-                (RELEASE_BURST * PLAN * estimate / 8.0).max(RELEASE_BURST_FLOOR),
+                (RELEASE_BURST * PLAN * estimate / 8.0).max(RELEASE_BURST_FLOOR) + (1200 + ORIGINAL_OVERHEAD) as f64,
                 now,
             ),
             extras: Bucket::new(extras_rate(estimate), extras_burst(estimate), now),
@@ -328,6 +330,12 @@ impl Egress {
         self.release_interval > Duration::from_millis(10)
     }
 
+    fn socket_burst(&self) -> f64 {
+        // The transport pacer rounds its shared wire-byte burst by one packet.
+        // Its original/RTX mix need not match the release bucket's boundaries.
+        self.release_burst() + (1200 + ORIGINAL_OVERHEAD) as f64
+    }
+
     fn release_burst(&self) -> f64 {
         let interval = if self.coarse_cadence() { COARSE_RELEASE_BURST } else { RELEASE_BURST };
         (interval * self.release_rate()).max(RELEASE_BURST_FLOOR)
@@ -354,7 +362,7 @@ impl Egress {
         self.refill(now);
         self.estimate = estimate.max(1) as f64;
         self.tokens = self.tokens.min(self.release_burst());
-        self.originals.reconfigure(self.release_rate(), self.release_burst(), now);
+        self.originals.reconfigure(self.release_rate(), self.socket_burst(), now);
         self.extras.reconfigure(extras_rate(self.estimate), extras_burst(self.estimate), now);
     }
 
@@ -362,8 +370,12 @@ impl Egress {
         self.lanes.get(lane).and_then(|l| l.paused)
     }
 
-    /// Every slot that carries a share is paused, one at least for bandwidth: no media flows,
-    /// so no feedback can move the estimate.
+    /// At least one assigned share is still discovering capacity before pause decisions.
+    pub fn ramping(&self, now: Instant) -> bool {
+        self.lanes.iter().any(|lane| lane.assigned && lane.ramping(now))
+    }
+
+    /// Every assigned slot is paused, at least one for bandwidth: no media feeds BWE.
     pub fn stalled(&self) -> bool {
         let assigned = || self.lanes.iter().filter(|l| l.assigned);
         assigned().next().is_some()
@@ -534,7 +546,7 @@ impl Egress {
         }
         if burst != self.release_burst() {
             self.tokens = self.tokens.min(self.release_burst());
-            self.originals.reconfigure(self.release_rate(), self.release_burst(), now);
+            self.originals.reconfigure(self.release_rate(), self.socket_burst(), now);
         }
         let mut dropped = Vec::new();
         for lane in 0..self.lanes.len() {

@@ -31,6 +31,12 @@ impl PacerImpl {
         PacerImpl::Null(NullPacer::default())
     }
 
+    pub fn set_egress_pacing(&mut self, rate: Bitrate) {
+        if let PacerImpl::LeakyBucket(v) = self {
+            v.set_egress_pacing(rate);
+        }
+    }
+
     pub fn start_probe(&mut self, config: ProbeClusterConfig) {
         match self {
             PacerImpl::Null(_) => {

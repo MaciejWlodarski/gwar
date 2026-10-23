@@ -41,6 +41,7 @@ pub struct ProbeClusterConfig {
 
     /// Application payload-byte budget, before RTP/SRTP serialization.
     max_bytes: DataSize,
+    pub(crate) max_send_gap: Option<Duration>,
 }
 
 /// Kind of probe
@@ -76,12 +77,23 @@ impl ProbeClusterConfig {
             min_probe_delta: Duration::from_millis(2),
             kind,
             max_bytes: DataSize::bytes(i64::MAX),
+            max_send_gap: None,
         }
     }
 
     /// Bound the cluster payload target; allow one packet of rounding at the socket.
     pub(crate) fn with_max_bytes(mut self, max_bytes: DataSize) -> Self {
         self.max_bytes = max_bytes;
+        self
+    }
+
+    pub(crate) fn with_max_send_gap(mut self, gap: Duration) -> Self {
+        self.max_send_gap = Some(gap);
+        self
+    }
+
+    pub(crate) fn with_max_bitrate(mut self, bitrate: Bitrate) -> Self {
+        self.target_bitrate = self.target_bitrate.min(bitrate);
         self
     }
 
@@ -170,6 +182,7 @@ pub struct ProbeClusterState {
     last_padding_at: Instant,
     /// A requested burst has not reached its first actual socket send yet.
     padding_pending: bool,
+    paced_target_set: bool,
 }
 
 impl ProbeClusterState {
@@ -184,6 +197,7 @@ impl ProbeClusterState {
             last_packet_at: None,
             last_padding_at: already_happened(),
             padding_pending: false,
+            paced_target_set: false,
         }
     }
 
@@ -255,6 +269,26 @@ impl ProbeClusterState {
         let next_time = self.next_probe_time();
         let min_burst_time = self.last_padding_at + self.config.min_probe_delta();
         now >= next_time && now >= min_burst_time
+    }
+
+    /// Queue a complete probe for an external wire-byte pacer. The pacer, rather
+    /// than padding generation, owns send spacing. Coarse clocks need several
+    /// samples; they must not turn a single burst into a low capacity estimate.
+    pub(crate) fn next_paced_packet(&mut self, cadence: Duration) -> Option<DataSize> {
+        if self.padding_pending {
+            return None;
+        }
+        if !self.paced_target_set {
+            let duration = self
+                .config
+                .target_duration
+                .max(cadence * 2 + self.config.min_probe_delta);
+            self.byte_target = (self.config.target_bitrate * duration).min(self.config.max_bytes);
+            self.paced_target_set = true;
+        }
+        let remaining = self.byte_target.saturating_sub(self.bytes_sent);
+        self.padding_pending = true;
+        Some(remaining.max(MAX_PADDING_PACKET_SIZE))
     }
 
     /// Calculate how much padding should be generated for the next probe packet.

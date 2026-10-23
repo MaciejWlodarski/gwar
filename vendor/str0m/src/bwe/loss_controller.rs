@@ -170,6 +170,10 @@ impl LossController {
     /// Override the current bandwidth estimate.
     pub fn set_bandwidth_estimate(&mut self, bandwidth_estimate: Bitrate) {
         self.current_estimate.loss_limited_bandwidth = bandwidth_estimate;
+        // A successful probe replaces the loss-limited result too. Keeping Decreasing
+        // here reapplies the old HOLD rate to newly demonstrated capacity.
+        // Match WebRTC LossBasedBweV2::SetBandwidthEstimate.
+        self.state = LossControllerState::DelayBased;
     }
 
     /// Update the acknowledged bitrate based on TWCC feedback.
@@ -1160,6 +1164,34 @@ mod test {
             "Estimate should increase to delay based estimate, but not further"
         );
         assert_eq!(state, LossControllerState::DelayBased);
+    }
+
+    #[test]
+    fn a_successful_probe_replaces_the_loss_limited_result() {
+        let mut controller = LossController::new();
+        controller.set_acknowledged_bitrate(Bitrate::mbps(1));
+        controller.set_bandwidth_estimate(Bitrate::kbps(1250));
+        let mut packets = PacketBuilder::new(Instant::now()).num_packets(26);
+        for loss in [0.0, 0.5] {
+            packets = packets.with_loss(loss);
+            let batch = packets.build_packets();
+            controller.update_bandwidth_estimate(&batch, Bitrate::kbps(1500));
+            packets = packets.forward_time(Duration::from_millis(250));
+        }
+        assert_eq!(
+            controller.loss_based_result().state,
+            LossControllerState::Decreasing
+        );
+        assert!(controller.loss_based_result().bandwidth_estimate.unwrap() < Bitrate::mbps(1));
+        controller.set_bandwidth_estimate(Bitrate::mbps(3));
+        let result = controller.loss_based_result();
+        assert_eq!(
+            result.state,
+            LossControllerState::DelayBased,
+            "old HOLD must not cap the probe"
+        );
+        // The integration layer now selects the newly measured delay estimate, while
+        // subsequent observations can still detect fresh congestion normally.
     }
 
     #[test]
