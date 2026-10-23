@@ -81,7 +81,7 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
     @staticmethod
     def results(native, app):
         result = {"changes": {"result": "success", "outputs": {"native": native, "app": app}}}
-        for name in ["rust", "rust-voice", "teamspeak"]:
+        for name in ["rust", "rust-voice", "rust-screen-sim", "teamspeak"]:
             result[name] = {"result": "success" if native == "true" else "skipped"}
         for name in ["audit", "web", "desktop", "mls-wasm", "denoise-wasm", "native-build",
                      "browser-mls", "browser-smoke", "browser-voice", "browser-screen", "browser-private"]:
@@ -94,10 +94,11 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
 
     def test_failed_canceled_and_accidentally_skipped_jobs_fail(self):
         for status in ["failure", "cancelled", "skipped"]:
-            needs = self.results("true", "true")
-            needs["browser-screen"]["result"] = status
-            with self.assertRaises(ValueError):
-                check(needs)
+            for job in ["browser-screen", "rust-screen-sim"]:
+                needs = self.results("true", "true")
+                needs[job]["result"] = status
+                with self.subTest(status=status, job=job), self.assertRaises(ValueError):
+                    check(needs)
 
     def test_failed_or_missing_selection_fails(self):
         needs = self.results("false", "false")

@@ -2270,3 +2270,14 @@ pub mod unversioned {
         Vp8Depacketizer, Vp8Packetizer,
     };
 }
+
+/// Internal, test-only controls for Gwar's network simulations.
+#[cfg(feature = "_gwar_sim")]
+pub mod _gwar_sim {
+    /// Seed all non-cryptographic transport IDs and use a fixed RTP/NTP clock origin.
+    /// The RNG and clock are thread-local; production crypto randomness is unchanged.
+    pub fn start(seed: u64) -> std::time::Instant {
+        fastrand::seed(seed);
+        crate::util::simulation_start()
+    }
+}

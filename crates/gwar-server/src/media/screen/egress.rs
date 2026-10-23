@@ -459,6 +459,19 @@ impl Egress {
         l.fits_since = None;
     }
 
+    /// An estimator restart begins a fresh discovery period for active media too.
+    /// In particular, resuming from all-paused silence must not inherit the expired
+    /// assignment ramp while startup probes and stall-delayed feedback settle.
+    pub fn restart_ramp(&mut self, now: Instant) {
+        for lane in &mut self.lanes {
+            if lane.active() {
+                lane.ramp = Some(now + RAMP);
+                lane.failures.clear();
+                lane.over_since = None;
+            }
+        }
+    }
+
     /// Empties the slot's queue without counting it as a drop.
     fn clear(&mut self, lane: usize) {
         if let Some(l) = self.lanes.get_mut(lane) {
@@ -1011,6 +1024,43 @@ mod tests {
         assert_eq!(e.allocate(now, &rates, true), None, "ten seconds of room");
         now += Duration::from_secs(1);
         assert_eq!(e.allocate(now, &rates, true), Some((0, Change::Resume)));
+    }
+
+    #[test]
+    fn a_restarted_estimator_renews_the_resumed_lanes_ramp_but_not_its_deadlines() {
+        let start = Instant::now();
+        let mut e = egress(20_000_000, 1, start);
+        let rates = [ShareRate { average: 8_000_000.0, last_keyframe: 200_000, largest_keyframe: 200_000 }];
+        e.pause(0, ScreenPauseReason::Bandwidth);
+        let resumed = start + Duration::from_secs(57);
+        e.resume(0);
+        e.restart_ramp(resumed);
+
+        // The CI repro failed two keyframes 2.7 s after a BWE restart on resume.
+        // Queue deadlines still evict them; only the bandwidth decision gets the
+        // same bounded discovery interval as an initially assigned share.
+        for (frame, delay) in [(1, 2100), (2, 2700)] {
+            let arrival = resumed + Duration::from_millis(delay) - DEADLINE;
+            assert!(e.admit(0, packet(frame, frame as u32, true, 1200, arrival), arrival).is_empty());
+            let now = arrival + DEADLINE;
+            assert_eq!(e.due(now).1, [0]);
+            assert_eq!(e.allocate(now, &rates, true), None);
+        }
+        assert_eq!(e.counters.failed_keyframes, 2);
+        assert_eq!(e.counters.evicted, 2);
+        assert_eq!(e.paused(0), None);
+
+        // A fresh real constraint still pauses once discovery ends. Failures from
+        // the discovery period neither trigger immediately nor extend its end.
+        e.set_estimate(1_000_000, resumed + RAMP);
+        for (frame, delay) in [(3, RAMP), (4, RAMP + Duration::from_secs(1))] {
+            let now = resumed + delay;
+            e.fail_keyframe(0, frame, now);
+        }
+        assert_eq!(
+            e.allocate(resumed + RAMP + Duration::from_secs(1), &rates, true),
+            Some((0, Change::Pause(ScreenPauseReason::Bandwidth)))
+        );
     }
 
     #[test]

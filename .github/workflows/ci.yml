@@ -77,6 +77,41 @@ jobs:
         timeout-minutes: 15
         run: cargo test --workspace --exclude gwar-desktop
 
+  # The full network matrices run independently of the workspace's 15-minute Tests step.
+  # Default server tests retain every scheduler cadence protected by the voice gate.
+  rust-screen-sim:
+    needs: changes
+    if: needs.changes.outputs.native == 'true'
+    timeout-minutes: 40
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [voice_headroom, startup, recovery]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        timeout-minutes: 5
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        timeout-minutes: 5
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        timeout-minutes: 5
+        with:
+          prefix-key: ci-v2-debug0
+          cache-bin: false
+          shared-key: linux-tests
+          save-if: false
+      - name: System libraries (Opus, ALSA)
+        timeout-minutes: 8
+        run: bash scripts/ci/apt-install.sh libopus-dev libasound2-dev pkg-config
+      - name: Build simulations
+        timeout-minutes: 20
+        run: cargo test -j 4 -p gwar-server --no-default-features --lib --no-run
+      - name: Full screen simulation matrix
+        timeout-minutes: 15
+        run: cargo test -j 4 -p gwar-server --no-default-features --lib media::screen::sim::tests::full_${{ matrix.suite }}_matrix -- --ignored --nocapture
+
   # Keep whole-workspace feature unification in the native suites. The test command below
   # can later become a shard matrix without changing producers or the aggregate gate.
 
@@ -793,7 +828,7 @@ jobs:
 
   ci-ok:
     if: ${{ always() }}
-    needs: [changes, rust, rust-voice, teamspeak, audit, web, desktop, native-build, mls-wasm, denoise-wasm, browser-mls, browser-smoke, browser-voice, browser-screen, browser-private]
+    needs: [changes, rust, rust-voice, rust-screen-sim, teamspeak, audit, web, desktop, native-build, mls-wasm, denoise-wasm, browser-mls, browser-smoke, browser-voice, browser-screen, browser-private]
     runs-on: ubuntu-24.04
     timeout-minutes: 3
     steps:
