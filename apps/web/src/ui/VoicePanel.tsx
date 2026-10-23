@@ -109,7 +109,7 @@ export function VoicePanel() {
 
   if (me && me.channel === null) {
     return (
-      <div className="border-t border-line bg-side p-2">
+      <div className="m-2 mt-1 rounded-xl bg-raised p-2">
         <SelfRow
           subTitle={t("voice.notInHint")}
           sub={
@@ -154,7 +154,7 @@ export function VoicePanel() {
   );
 
   return (
-    <div className="flex flex-col gap-2 border-t border-line bg-side p-2">
+    <div className="m-2 mt-1 flex flex-col gap-2 rounded-xl bg-raised p-2">
       <div className="flex items-center gap-2 rounded-lg bg-hover py-1.5 pr-1.5 pl-2.5">
         <Wifi aria-hidden className={cn("size-4 shrink-0", tone, status.tone === "warn" && "animate-pulse")} />
         <div className="min-w-0 flex-1 leading-tight">

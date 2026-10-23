@@ -135,6 +135,9 @@ export const Button = forwardRef<
   );
 });
 
+/** The desktop panels (sidebar, chat, members, stage): rounded cards on the rail background. */
+export const panelCard = "overflow-hidden rounded-2xl border border-line";
+
 export const IconButton = forwardRef<
   HTMLButtonElement,
   ButtonHTMLAttributes<HTMLButtonElement> & {

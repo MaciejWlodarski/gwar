@@ -26,7 +26,7 @@ import { useChannelPermission, useRoster, useUidColor } from "./hooks";
 import { useMembersPanel } from "./members";
 import { useMentionAutocomplete } from "./MentionInput";
 import { DeafenButton, MicButton } from "./VoicePanel";
-import { Avatar, Button, EmptyState, IconButton, Spinner, Tooltip } from "./kit";
+import { Avatar, Button, EmptyState, IconButton, panelCard, Spinner, Tooltip } from "./kit";
 
 // -------------------------------------------------------------------- text
 
@@ -1152,7 +1152,7 @@ function ChatHeader() {
   );
 }
 
-export function ChatArea() {
+export function ChatArea({ card }: { card?: boolean }) {
   const t = useT();
   const active = useSession((s) => s.activeThread);
   const phase = useSession((s) => s.phase);
@@ -1185,7 +1185,7 @@ export function ChatArea() {
 
   return (
     <main
-      className="relative flex min-w-0 flex-1 flex-col bg-surface"
+      className={cn("relative flex min-w-0 flex-1 flex-col bg-surface", card && panelCard)}
       onDragEnter={onDragEnter}
       onDragOver={(e) => hasFiles(e) && e.preventDefault()}
       onDragLeave={onDragLeave}

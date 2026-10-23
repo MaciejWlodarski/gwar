@@ -2,6 +2,7 @@ import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { useEffect } from "react";
 import { useT } from "./i18n";
 import { accountActions } from "./state/account";
+import { cn } from "./lib/cn";
 import { useIsMobile } from "./lib/media";
 import { initDesktop } from "./platform/desktop";
 import { initUpdates } from "./platform/updater";
@@ -68,25 +69,25 @@ export function App() {
         <div className="flex min-h-0 w-full flex-1 overflow-hidden">
           {!isMobile && <ServerRail />}
           {showApp ? (
-            <>
-              {!isMobile && <Sidebar />}
+            <div className={cn("flex min-w-0 flex-1", !isMobile && "gap-2 py-2 pr-2")}>
+              {!isMobile && <Sidebar card />}
               {stageOpen ? (
                 <>
                   {/* Watching: the stage is the main content, the chat collapsible beside it. */}
-                  <Stage />
+                  <Stage card={!isMobile} />
                   {!isMobile && !chatHidden && (
-                    <div className="flex w-[min(380px,32vw)] min-w-0 shrink-0 border-l border-line">
-                      <ChatArea />
+                    <div className="flex w-[min(380px,32vw)] min-w-0 shrink-0">
+                      <ChatArea card />
                     </div>
                   )}
                 </>
               ) : (
                 <>
-                  <ChatArea />
-                  {!isMobile && members.open && <MemberList />}
+                  <ChatArea card={!isMobile} />
+                  {!isMobile && members.open && <MemberList card />}
                 </>
               )}
-            </>
+            </div>
           ) : (
             <ConnectScreen />
           )}
