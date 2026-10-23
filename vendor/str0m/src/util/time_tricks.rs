@@ -42,15 +42,40 @@ static BEGINNING_OF_TIME: LazyLock<(Instant, SystemTime)> = LazyLock::new(|| {
     (beginning_of_time, beginning_of_time_sys)
 });
 
+#[cfg(feature = "_gwar_sim")]
+thread_local! {
+    static SIMULATION_TIME: std::cell::Cell<Option<(Instant, SystemTime)>> = const { std::cell::Cell::new(None) };
+}
+
+fn time_base() -> (Instant, SystemTime) {
+    #[cfg(feature = "_gwar_sim")]
+    if let Some(base) = SIMULATION_TIME.get() {
+        return base;
+    }
+    *BEGINNING_OF_TIME
+}
+
+#[cfg(feature = "_gwar_sim")]
+pub(crate) fn simulation_start() -> Instant {
+    // Instant has no portable literal. Use one process anchor, with a fixed Unix mapping,
+    // and advance only by simulated durations. Keep sentinel instants in the past.
+    let origin = BEGINNING_OF_TIME.0 + Duration::from_secs(3600);
+    SIMULATION_TIME.set(Some((
+        BEGINNING_OF_TIME.0,
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+    )));
+    origin
+}
+
 pub fn epoch_to_beginning() -> Duration {
-    BEGINNING_OF_TIME
+    time_base()
         .1
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("beginning of time to be after epoch")
 }
 
 pub(crate) fn already_happened() -> Instant {
-    BEGINNING_OF_TIME.0
+    time_base().0
 }
 
 pub trait InstantExt {
@@ -93,13 +118,13 @@ impl InstantExt for Instant {
         // This is a bit fishy. We "freeze" a moment in time for Instant and SystemTime,
         // so we can make relative comparisons of Instant - Instant and translate that to
         // SystemTime - unix epoch. Hopefully the error is quite small.
-        if *self < BEGINNING_OF_TIME.0 {
+        if *self < time_base().0 {
             warn!("{}", Backtrace::force_capture());
             warn!("Time went backwards from beginning_of_time Instant");
         }
 
-        let duration_since_time_0 = self.duration_since(BEGINNING_OF_TIME.0);
-        let system_time = BEGINNING_OF_TIME.1 + duration_since_time_0;
+        let duration_since_time_0 = self.duration_since(time_base().0);
+        let system_time = time_base().1 + duration_since_time_0;
 
         system_time
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -114,13 +139,13 @@ impl InstantExt for Instant {
         // This is a bit fishy. We "freeze" a moment in time for Instant and SystemTime,
         // so we can make relative comparisons of Instant - Instant and translate that to
         // SystemTime - unix epoch. Hopefully the error is quite small.
-        if *self < BEGINNING_OF_TIME.0 {
+        if *self < time_base().0 {
             warn!("{}", Backtrace::force_capture());
             warn!("Time went backwards from beginning_of_time Instant");
         }
 
-        let duration_since_time_0 = self.duration_since(BEGINNING_OF_TIME.0);
-        BEGINNING_OF_TIME.1 + duration_since_time_0
+        let duration_since_time_0 = self.duration_since(time_base().0);
+        time_base().1 + duration_since_time_0
     }
 }
 

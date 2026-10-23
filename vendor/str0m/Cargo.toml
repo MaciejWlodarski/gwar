@@ -48,6 +48,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/algesten/str0m"
 
 [features]
+_gwar_sim = []
 _internal_dont_use_log_stats = []
 _internal_test_exports = [
     "str0m-proto/_internal_test_exports",

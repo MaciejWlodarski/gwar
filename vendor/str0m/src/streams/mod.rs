@@ -1,3 +1,7 @@
+#[cfg(feature = "_gwar_sim")]
+use std::collections::BTreeMap as StreamMap;
+#[cfg(not(feature = "_gwar_sim"))]
+use std::collections::HashMap as StreamMap;
 use std::collections::{HashMap, VecDeque};
 use std::fmt::{self};
 use std::sync::Arc;
@@ -124,7 +128,7 @@ impl RtpPacket {
 #[derive(Debug)]
 pub(crate) struct Streams {
     /// All incoming encoded streams.
-    streams_rx: HashMap<Ssrc, StreamRx>,
+    streams_rx: StreamMap<Ssrc, StreamRx>,
 
     /// Each incoming SSRC is mapped to a Mid/Ssrc. The Ssrc in the value is for the case
     /// where the incoming SSRC is for an RTX and we want the "main".
@@ -134,7 +138,7 @@ pub(crate) struct Streams {
     last_rx_lookup_cleanup: Instant,
 
     /// All outgoing encoded streams.
-    streams_tx: HashMap<Ssrc, StreamTx>,
+    streams_tx: StreamMap<Ssrc, StreamTx>,
 
     /// Non-media padding source. Its sequence counter survives media changes.
     probe_tx: StreamTx,

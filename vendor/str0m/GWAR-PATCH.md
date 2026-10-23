@@ -174,3 +174,13 @@ demonstrated capacity until the next complete loss observation. Partial feedback
 including during startup, cannot restore the unproven ceiling. The cap reports
 `Increasing` to the integration layer while preserving the successful probe's
 internal `DelayBased` transition, so stale HOLD/recovery limits are not reactivated.
+
+
+The dev-only `_gwar_sim` feature makes Gwar's screen simulations replayable:
+`_gwar_sim::start(seed)` seeds the existing thread-local fastrand source used by
+transport IDs and ICE, fixes Unix/NTP conversion around a process-local Instant
+anchor, and orders RX/TX stream maps by SSRC. Other maps remain lookups only.
+Production builds do not enable this feature. DTLS cryptographic randomness is
+unchanged; media replay checks exclude encrypted handshake content and its byte
+counts. Added/changed files: `src/lib.rs`, `src/util/mod.rs`,
+`src/util/time_tricks.rs`, `src/streams/mod.rs`, and `Cargo.toml`.
