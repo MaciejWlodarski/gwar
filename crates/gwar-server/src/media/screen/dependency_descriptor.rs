@@ -1,8 +1,21 @@
 //! AV1 Dependency Descriptor, RTP spec Appendix A.8:
 //! <https://aomediacodec.github.io/av1-rtp-spec/#a8-dependency>.
 //!
-//! Parses the complete wire syntax, including attached structures and custom frame
-//! dependencies. A2b must cache structures per source, fence changes/loss/reordering,
+//! # API and retained state
+//!
+//! [`parse_mandatory`] reads S/E, template ID and the network-order frame number without
+//! context. [`parse`] resolves the complete wire syntax using an attached structure or
+//! the caller's cached [`Structure`]. Attached structures override the cache; without
+//! either, full parsing fails rather than guessing a layer. Template IDs resolve modulo
+//! 64, and custom DTIs, frame/chain differences and active-target masks override template
+//! values. Structures expose templates, target layers, target-to-chain assignments and
+//! optional resolutions. Counts and bit reads are bounded; trailing padding is ignored.
+//!
+//! The L1T3 fixture in this module is reconstructed from the five template rows in
+//! <https://aomediacodec.github.io/av1-rtp-spec/#a1021>, with template offset 61, frame
+//! number 0x1234 and an optional 1920x1080 resolution.
+//!
+//! A2b must cache structures per source and sequence/generation, fence changes/loss/reordering,
 //! retain the active-target mask between packets, unwrap frame numbers, and implement
 //! dependency/chain-aware layer selection and descriptor rewriting. Parsing alone does
 //! not authorize dropping packets. No transport state or forwarding is changed here.
@@ -74,8 +87,8 @@ pub fn parse_mandatory(payload: &[u8]) -> Option<Mandatory> {
 }
 
 /// Resolve a descriptor with its attached structure, or a structure retained by A2b.
-/// Returns None on unknown template, missing context, truncated fields, invalid layer
-/// counts, or nonzero padding. The input and the cached structure remain unchanged.
+/// Returns None on unknown template, missing context, truncated fields or invalid layer
+/// counts. Trailing padding is ignored. The input and cached structure remain unchanged.
 pub fn parse(payload: &[u8], previous: Option<&Structure>) -> Option<Descriptor> {
     let mandatory = parse_mandatory(payload)?;
     let mut bits = Bits { bytes: payload, at: 24 };
@@ -120,11 +133,7 @@ pub fn parse(payload: &[u8], previous: Option<&Structure>) -> Option<Descriptor>
             *diff = bits.read(8)? as u8;
         }
     }
-    while bits.at < payload.len() * 8 {
-        if bits.read(1)? != 0 {
-            return None;
-        }
-    }
+    // Appendix A.8.3: receivers ignore padding after the descriptor's fields.
     Some(Descriptor { mandatory, structure: attached, active_decode_targets, dependencies })
 }
 
@@ -433,15 +442,26 @@ mod tests {
     }
 
     #[test]
-    fn malformed_truncation_padding_context_and_layer_limits() {
+    fn trailing_padding_is_ignored() {
+        let s = structure();
+        let expected = parse(&[0xfd, 0, 1, 0], Some(&s)).unwrap();
+        for padding in 0..8 {
+            assert_eq!(parse(&[0xfd, 0, 1, padding], Some(&s)), Some(expected.clone()));
+        }
+        let mut padded = vec![0xfd, 0, 1, 7];
+        padded.resize(MAX_BYTES, 0xff);
+        assert_eq!(parse(&padded, Some(&s)), Some(expected));
+        padded.push(0xff);
+        assert!(parse(&padded, Some(&s)).is_none(), "extension length bound still applies");
+        assert!(parse(&[0xfd, 0, 1, 0x08], Some(&s)).is_none(), "truncated custom chain diff");
+    }
+
+    #[test]
+    fn malformed_truncation_context_and_layer_limits() {
         for len in 0..L1T3.len() {
             assert!(parse(&L1T3[..len], None).is_none(), "accepted prefix {len}");
         }
-        let mut nonzero_padding = vec![0xfd, 0, 1, 1];
         let s = structure();
-        assert!(parse(&nonzero_padding, Some(&s)).is_none());
-        nonzero_padding[3] = 0;
-        assert!(parse(&nonzero_padding, Some(&s)).is_some());
         assert!(parse_mandatory(&[0; 256]).is_none());
         for (code, count) in [(0, 65), (1, 9), (2, 5)] {
             let mut fields = vec![(0xc0, 8), (0, 16), (16, 5), (0, 6), (0, 5)];

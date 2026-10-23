@@ -1,54 +1,8 @@
-# AV1 parser boundary and str0m capability check (A1b)
+# str0m 0.24.1 findings and A2b checklist (A1b)
 
-The native codec decision is AV1 when the sharer has hardware AV1 encoding and
-all relevant viewers can decode it, otherwise H.264. This change supplies parsing
-primitives only; A2b owns negotiation and transport integration. It does not
-change the codec ladder or the concurrent native-media plan.
-
-## Parser API
-
-- `crates/gwar-server/src/media/screen/av1.rs`: `parse` checks aggregation framing,
-  RTP element lengths, OBU headers, embedded sizes and complete sequence prefixes.
-  It exposes borrowed OBU elements, fragment boundaries, optional headers, layer
-  IDs, profile and operating point zero's level/tier. `parse_with_sequence` accepts
-  earlier sequence context for frame-only packets. A new-sequence flag discards
-  inherited context. Both return `None` for malformed framing or a truncated
-  prefix of a complete sequence/frame OBU being inspected.
-- `Payload::describe(first_packet_of_frame)` reuses `ingress::Descriptor`. The
-  caller supplies the frame boundary from ordered RTP timestamps or DD. Z=0
-  means a new OBU, and cannot alone distinguish the first packet of a frame.
-  N independently marks the start of a new coded video sequence.
-- A keyframe **candidate** needs N, a complete sequence OBU preceding a frame
-  header in this packet, and a visible KEY_FRAME prefix. Reduced still-picture
-  headers imply KEY_FRAME and show_frame. An ordinary header explicitly supplies
-  show_existing_frame, frame_type and show_frame. N alone never qualifies.
-- `crates/gwar-server/src/media/screen/dependency_descriptor.rs`:
-  `parse_mandatory` reads S/E, template ID and the network-order frame number
-  without context. `parse(bytes, cached_structure)` validates the entire DD wire
-  syntax, resolves template IDs modulo 64 and applies custom DTIs, frame/chain
-  differences and active-target masks. An attached structure overrides the cache.
-  Without either structure, full parsing fails rather than guessing a layer.
-  The structure exposes templates, target layers, target-to-chain assignments
-  and optional resolutions. Counts, bit reads and zero padding are checked.
-
-AV1 parsing deliberately stops at the required codec prefixes; it is not a full
-sequence/frame bitstream validator. Subsequent operating points and the remaining
-uncompressed header are not interpreted. Temporal delimiters and tile-list OBUs
-are accepted and ignored for classification, as required by the RTP spec;
-reserved OBU types and forbidden/reserved header bits are rejected. Fragment
-continuations are opaque. Split OBU headers/sizes are exposed as incomplete;
-the parser does not allocate a cross-packet reassembly buffer or claim a keyframe
-from a split sequence header. A2b needs bounded reassembly if that case is to be
-recognized. Retained sequence and DD state must be scoped to a source and its
-current sequence/generation, with explicit handling of packet loss and reordering.
-
-The L1T3 DD fixture is reconstructed from the five template rows in
-[Appendix A.10.2.1](https://aomediacodec.github.io/av1-rtp-spec/#a1021),
-with template offset 61, frame number 0x1234 and an optional 1920x1080 resolution.
-Other vectors cover lengths with W=0/1/2/3, fragmentation, normal/reduced frame
-headers, sequence timing/decoder-model prefixes, reserved/overflow/truncated data,
-DD overrides, spatial layers, chains, 32 targets and 65536-pixel dimensions.
-Both parsers also run deterministic random-byte tests without new dependencies.
+This temporary note will be folded into `docs/native-media.md` once PR #152
+merges. Parser API details live in the module-level documentation beside
+`av1.rs` and `dependency_descriptor.rs`.
 
 ## str0m 0.24.1: what exists
 
@@ -94,8 +48,16 @@ not a hypothetical vendored tree:
    changes and reordered/lost updates. Apply chain/dependency-aware temporal
    selection and keyframe confirmation; mandatory fields alone do not establish
    a safe drop policy. Rewrite descriptors consistently when switching sources.
-4. Test publish-to-SFU-to-watch AV1 and DD preservation, retransmissions, source
+4. Split sequence headers and sequence/frame headers in separate packets deliberately
+   produce no keyframe descriptor. Direct `Payload::describe()` wiring would leave
+   ingress waiting. A2b must buffer before admission, use bounded reassembly and
+   source-scoped sequence context to confirm the keyframe, then mark the actual first
+   packet of the buffered frame when admitting it. Do not mark the later packet that
+   merely supplies confirmation as the frame's start.
+5. Test publish-to-SFU-to-watch AV1 and DD preservation, retransmissions, source
    switching, loss/reordering, dependency-safe layer drops and decoder limits.
+   Include split/separate headers and confirmation that admission starts from the
+   buffered frame's actual first packet.
 
 References: [AV1 RTP specification](https://aomediacodec.github.io/av1-rtp-spec/),
 [AV1 codec syntax](https://github.com/AOMediaCodec/av1-spec/blob/master/06.bitstream.syntax.md).

@@ -1,9 +1,36 @@
 //! Packet-local AV1 inspection, without decoding or buffering encoded video.
 //!
+//! # API and admission boundary
+//!
+//! [`parse`] checks aggregation framing, RTP element lengths, OBU headers, embedded
+//! sizes and complete sequence prefixes. [`Payload`] exposes borrowed OBU elements,
+//! fragment boundaries, optional headers, layer IDs, profile and operating point zero's
+//! level/tier. [`parse_with_sequence`] accepts earlier sequence context for frame-only
+//! packets; N discards that context. Malformed framing or a truncated prefix of a complete
+//! sequence/frame OBU being inspected returns `None`.
+//!
+//! [`Payload::describe`] reuses [`super::ingress::Descriptor`]. Its caller establishes
+//! the first packet of a frame from ordered RTP timestamps or DD; Z=0 alone only starts
+//! an OBU. N independently starts a new coded sequence. A keyframe candidate requires N,
+//! a complete sequence OBU preceding a visible KEY_FRAME header in the same packet.
+//! Reduced still-picture headers imply KEY_FRAME and show_frame; ordinary headers
+//! explicitly supply show_existing_frame, frame_type and show_frame. N alone never
+//! qualifies. Split sequence headers and separate sequence/frame packets deliberately
+//! produce no keyframe descriptor, even with cached sequence context. Direct `describe()`
+//! wiring would leave ingress waiting; A2b must buffer before admission, confirm the
+//! keyframe, then mark the actual first packet when admitting the buffered frame.
+//!
+//! Fragment continuations are opaque, and split OBU headers/sizes are incomplete.
+//! Temporal delimiters, tile lists and reserved OBU types remain available as raw
+//! elements but are ignored for classification; framing checks still apply. Retained
+//! sequence state must be scoped to a source and sequence/generation, with explicit
+//! handling of loss/reordering and bounded reassembly when split headers are needed.
+//!
 //! RTP framing: <https://aomediacodec.github.io/av1-rtp-spec/#payload-format>.
 //! Codec prefixes: AV1 sections 5.5.1 and 5.9.2. Only the sequence prefix through
 //! operating point zero's level/tier and the frame prefix through show_frame are read;
-//! success is not validation of the rest of the AV1 bitstream.
+//! subsequent operating points and the remaining uncompressed header are not interpreted.
+//! Success is not validation of the rest of the AV1 bitstream.
 
 use super::ingress::Descriptor;
 
@@ -186,7 +213,7 @@ fn leb128_prefix(bytes: &[u8], at: &mut usize, allow_split: bool) -> Option<Opti
 fn obu_prefix(bytes: &[u8], complete: bool) -> Option<(Option<ObuHeader>, Option<&[u8]>)> {
     let first = *bytes.first()?;
     let obu_type = (first >> 3) & 15;
-    if first & 0x81 != 0 || !matches!(obu_type, 1..=8 | 15) {
+    if first & 0x81 != 0 {
         return None;
     }
     let mut header = ObuHeader {
@@ -497,6 +524,60 @@ mod tests {
     }
 
     #[test]
+    fn reserved_obus_preserve_surrounding_sequence_and_keyframe() {
+        for reduced in [false, true] {
+            let baseline_packet = key_packet(reduced, 0x10);
+            let baseline = parse(&baseline_packet).unwrap();
+            let seq = sequence(reduced, 8, 1, false);
+            let frame = [0x18, 0x10];
+            for reserved in [0, 9, 10, 11, 12, 13, 14] {
+                for ignored in [vec![reserved << 3, 0xff], vec![(reserved << 3) | 6, 0, 1, 0xff]] {
+                    for position in 0..3 {
+                        let mut obus = vec![seq.as_slice(), &frame];
+                        obus.insert(position, &ignored);
+                        for w in [0, 3] {
+                            let mut packet = vec![(w << 4) | 8];
+                            for (index, obu) in obus.iter().enumerate() {
+                                if w == 0 || index + 1 < obus.len() {
+                                    packet.push(obu.len() as u8);
+                                }
+                                packet.extend_from_slice(obu);
+                            }
+                            let parsed = parse(&packet).unwrap();
+                            assert_eq!(parsed.elements.len(), 3);
+                            assert_eq!(parsed.elements[position].header.unwrap().obu_type, reserved);
+                            assert_eq!(parsed.sequence, baseline.sequence);
+                            assert_eq!(parsed.frame, baseline.frame);
+                            assert_eq!(parsed.describe(false), baseline.describe(false));
+                            assert!(parsed.keyframe_candidate);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reserved_obus_still_require_valid_framing() {
+        let baseline = key_packet(false, 0x10);
+        for ignored in [
+            &[0x49, 0][..], // reserved header bit
+            &[0xc8, 0],     // forbidden header bit
+            &[0x4c],        // missing extension
+            &[0x4c, 1, 0],  // reserved extension bit
+            &[0x4a, 0x80],  // truncated size
+            &[0x4a, 2, 0],  // oversized body
+            &[0x4a, 0, 0],  // undersized body
+        ] {
+            let mut packet = baseline.clone();
+            packet[0] = 0x38;
+            packet.insert(packet.len() - 2, 2); // frame is no longer the implicit last element
+            packet.extend_from_slice(ignored);
+            assert!(parse(&packet).is_none(), "accepted {ignored:02x?}");
+        }
+    }
+
+    #[test]
     fn malformed_payload_vectors_and_leb128_limits() {
         for bytes in [
             &[][..],
@@ -521,9 +602,6 @@ mod tests {
             &[0x50, 0x32, 0xff, 0xff, 0xff, 0xff, 0x10],
         ] {
             assert!(parse(bytes).is_none(), "accepted {bytes:02x?}");
-        }
-        for reserved in [0, 9, 10, 11, 12, 13, 14] {
-            assert!(parse(&[0x10, reserved << 3, 0]).is_none());
         }
         assert_eq!(leb128(&[0xff, 0xff, 0xff, 0xff, 0x0f], &mut 0), Some(u32::MAX));
         assert_eq!(leb128(&[0x81, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0], &mut 0), Some(1));
