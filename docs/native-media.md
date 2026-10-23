@@ -487,17 +487,22 @@ For H.264
   that lets the two directions use different levels; it does not let a
   sender exceed a receiver: "the level to use in the offerer-to-answerer
   direction MUST be equal to the highest level the answerer supports for
-  receiving". A viewer's receive limits are the level of its
-  `profile-level-id` (or `max-recv-level`), extended by `max-fs`, `max-mbps`,
-  `max-br` and `max-dpb` when present (RFC 6184 §8.1).
+  receiving". The SFU's publish answer retains receive level 5.1 (`42e033`,
+  `640c33`, `640033`) when both peers allow asymmetry, enough for 1080p60,
+  1440p60 and 2160p30; without mutual asymmetry it narrows to the lower level.
+  Native viewers use the level of their `profile-level-id` (or `max-recv-level`),
+  extended by `max-fs`, `max-mbps`, `max-br` and `max-dpb` (RFC 6184 §8.1).
+  Browser watch transports explicitly select the receive-level policy in
+  [Browser interop](#browser-interop): a level-5.1 floor, with explicit lower
+  resource limits still enforced.
   - The SFU records the limits per viewer and payload type, and treats them
     as part of what the viewer decodes. A stream is compatible with a viewer
     only if codec, profile, level and those limits all fit.
   - Browser A2 reads each stream's profile and level from its in-band SPS
     and maps compatible viewer PTs without transcoding. It retains the raw
-    receive limits per offered PT; conservatively, `max-*` extensions alone
-    do not admit a higher SPS level until actual size/fps/reference metadata
-    is available. A native stream will declare its profile and level in the
+    receive limits per offered PT, applying the browser policy only to browser
+    watch transports; conservatively, explicit resource caps must cover the
+    whole SPS level until actual size/fps/reference metadata is available. A native stream will declare its profile and level in the
     sharer's layer declaration ([A3](#track-a-sfu-and-protocol)); the SFU will
     check it against the
     first three bytes after the SPS NAL header (`profile_idc`, constraint
@@ -508,10 +513,10 @@ For H.264
     compatible layer, a lazy compatibility layer at a lower output, or an
     explicit refusal for that watch. It never lowers the native primary for
     a new viewer, and never sends a level above a viewer's limits.
-  - Browsers often offer level 3.1 (`42e01f`), which covers 1280×720 at 30
-    fps but not 1080p. Which levels each browser offers, and whether that
-    can be raised, is **(to verify per browser; E1)**. If browsers offer only
-    3.1, 1080p H.264 reaches them through a 720p layer or the VP9 fallback.
+  - Browsers often offer level 3.1 (`42e01f`), which describes only 720p30.
+    Browser watch transports use the documented level-5.1 decode floor rather
+    than interpreting this factory default as a 720p ceiling; explicit lower
+    limits still win ([Browser interop](#browser-interop)).
   - Native viewers offer the level their decoder supports (5.1 for 2160p30).
 - **Payload types:** one m-line can carry several codecs. The publish m-line
   offers usable codecs (hardware AV1, H.264 and VP9/VP8), and the SFU
@@ -649,6 +654,36 @@ Native H.264 must play in every browser that watches.
 
 This is why Constrained Baseline is the default and why a viewer that cannot
 decode the share's codec must still be served ([codec negotiation](#codec-negotiation-across-mixed-viewers)).
+
+Browser SDP's default **level 3.1 is not a decoder capability probe**.
+[libwebrtc's H.264 factory](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/video_coding/codecs/h264/h264.cc)
+hardcodes 3.1 in its supported formats. Its
+[FFmpeg decoder](https://webrtc.googlesource.com/src.git/+/refs/heads/main/modules/video_coding/codecs/h264/h264_decoder_impl.cc)
+configures H.264 decoding without a negotiated SDP-level ceiling and allocates
+frames from decoded dimensions. Firefox's
+[GMP decoder adapter](https://raw.githubusercontent.com/mozilla/gecko-dev/master/dom/media/webrtc/libwebrtcglue/WebrtcGmpVideoCodec.cpp)
+similarly initializes the plugin without forwarding an SDP level. These
+implementation details support a browser interoperability policy; they do not
+prove every device can decode every level-5.1 stream.
+
+The web client and desktop webviews send `browser: true` on
+`screen.watch.offer` and `guest.offer`. For those transports the SFU treats an
+otherwise default H.264 receive offer as **at least level 5.1**, preserving
+packetization mode and profile matching. Explicit `max-recv-level` overrides
+the floor; explicit `max-fs`, `max-mbps`, `max-dpb` and `max-br` are resource
+ceilings and can refuse a stream. Until A3 provides actual stream requirements,
+these caps must conservatively cover the entire SPS level. Native clients omit
+`browser` (default `false`) and retain their real offered levels and RFC
+extension semantics. The publisher answer's independent level-5.1 receive
+capability follows [RFC 6184 §8.2.2](https://datatracker.ietf.org/doc/html/rfc6184#section-8.2.2)
+with mutual `level-asymmetry-allowed=1`; it does not inherit the viewer floor.
+
+The screen e2e uses a real 1920×1080 Chromium tab and the Game preset. It
+requires H.264 `getStats().frameWidth/frameHeight` of 1920×1080 at the sender,
+Chromium receiver and late-joining WebKit receiver, even though both viewers
+offer 3.1. Codec absence/profile incompatibility retains the per-viewer refusal
+and VP9 fallback policy. Firefox's plugin/platform availability remains a
+separate compatibility condition; this e2e does not run Firefox.
 
 ### Hardware encoders per platform
 
@@ -1768,8 +1803,9 @@ round of their own, as voice 5c/5d had.
   Unsupported codec/profile/level ends only the affected watch with a clear
   `screen.stopped {reason: "codec"}` message, including guest links.
 - Limits: receive-level admission is conservative at whole-level granularity;
-  `max-*` extensions are recorded but do not alone authorize a higher SPS
-  level without stream size/fps/reference metadata. A3's layer declarations
+  browser transports use the 5.1 floor above, with explicit lower resource caps.
+  Native `max-*` extensions do not alone authorize a higher SPS level without
+  stream size/fps/reference metadata. A3's layer declarations
   and native compatibility layers are not implemented here. Neither are AV1
   (A2b), encrypted H.264/SFrame, native capture/encode/watch, or automatic web
   VP9 fallback requests to an already-running sharer.
@@ -1779,13 +1815,17 @@ round of their own, as voice 5c/5d had.
   encoded/decoded codec `mimeType` through a real debug server, forces a VP9
   fallback share, and reports an H.264 capability gap when the installed
   browser has no H.264 encoder.
-- Local browser verification (2026-10-23): Chromium sent H.264 with OpenH264
-  at 1152×720 from a real captured tab through the SFU. Chromium and WebKit
-  viewers decoded it, including a late join with barcode validation. `getStats`
-  confirmed `video/H264` at sender and receiver; the forced `video/VP9` path
-  and incompatible-viewer refusal passed. The 1080p H.264 attempt was explicitly
-  refused for a level-3.1 viewer. Hardware encoding on Windows and higher
-  browser receive-level capability probing remain unverified by this run.
+- Local browser verification (2026-10-23, macOS, real debug server): Chromium
+  sent H.264 with OpenH264 from a real 1920×1080 captured tab using Game.
+  `getStats` measured **1920×1080 at the sender, Chromium receiver and WebKit
+  receiver**, with 60 fps reported at the sender and Chromium receiver.
+  WebKit also passed late-join barcode validation. Both viewers offered 3.1
+  (`42e01f`; WebKit also `640c1f`), the selected publish answer was `42e033`
+  with `level-asymmetry-allowed=1`, and the browser receive policy admitted
+  the full-size stream. Neither engine failed to decode 1080p. Forced VP9
+  fallback and incompatible-viewer refusal passed. The earlier Saver-preset
+  1152×720 run did not establish full-size support. Windows/RTX hardware
+  encoding and actual 1440p/2160p encoding remain outside this run.
 
 **A2b. AV1 on the screen transports (including Dependency Descriptor)** (M–L)
 - Builds: AV1/RTX and protocol codec negotiation, per-viewer payload types

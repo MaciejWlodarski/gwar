@@ -140,6 +140,7 @@ pub enum GuestMsg {
         guest: SessionId,
         id: u32,
         sdp: String,
+        browser: bool,
     },
     Keyframe {
         guest: SessionId,
@@ -318,7 +319,7 @@ impl Core {
                     self.drop_guest(guest);
                 }
             }
-            GuestMsg::Offer { guest, id, sdp } => self.guest_offer(guest, id, sdp),
+            GuestMsg::Offer { guest, id, sdp, browser } => self.guest_offer(guest, id, sdp, browser),
             GuestMsg::Keyframe { guest, id, share } => {
                 if !self.guest_current(guest) {
                     return;
@@ -421,7 +422,7 @@ impl Core {
     }
 
     /// `guest.offer`: the guest's one-slot watch transport, negotiated once.
-    fn guest_offer(&mut self, guest: SessionId, id: u32, sdp: String) {
+    fn guest_offer(&mut self, guest: SessionId, id: u32, sdp: String, browser: bool) {
         if !self.guest_current(guest) {
             return;
         }
@@ -445,13 +446,22 @@ impl Core {
         g.watch = Some(Watch {
             run: GUEST_RUN,
             sdp: sdp.clone(),
+            browser,
             answer: None,
             connected: false,
             slots: Default::default(),
             lease: lease.clone(),
         });
         let (reply, rx) = oneshot::channel();
-        permit.send(ScreenCmd::Watch { session: guest, run: GUEST_RUN, lease, slots: GUEST_SLOTS, sdp, reply });
+        permit.send(ScreenCmd::Watch {
+            session: guest,
+            run: GUEST_RUN,
+            lease,
+            slots: GUEST_SLOTS,
+            sdp,
+            browser,
+            reply,
+        });
         let Some(tx) = self.me.upgrade() else { return };
         tokio::spawn(async move {
             let answer = negotiated(rx).await;
@@ -993,6 +1003,7 @@ mod tests {
                     core.guests.get_mut(&guest).unwrap().watch = Some(Watch {
                         run: GUEST_RUN,
                         sdp: String::new(),
+                        browser: false,
                         answer: None,
                         connected: false,
                         slots: Default::default(),
@@ -1033,6 +1044,7 @@ mod tests {
                     core.guests.get_mut(&guest).unwrap().watch = Some(Watch {
                         run: GUEST_RUN,
                         sdp: String::new(),
+                        browser: false,
                         answer: None,
                         connected: false,
                         slots: Default::default(),
@@ -1044,7 +1056,7 @@ mod tests {
                 if connecting {
                     core.guest_watching(guest, GUEST_RUN, true);
                 } else {
-                    core.guest_offer(guest, 2, String::new());
+                    core.guest_offer(guest, 2, String::new(), false);
                 }
                 assert!(!core.guests.contains_key(&guest));
                 assert!(core.shares["S"].guests.is_empty(), "the admission is free");
@@ -1078,6 +1090,7 @@ mod tests {
             core.sessions.get_mut(&member).unwrap().watch = Some(Watch {
                 run: 1,
                 sdp: String::new(),
+                browser: false,
                 answer: None,
                 connected: true,
                 slots: Default::default(),
@@ -1120,6 +1133,7 @@ mod tests {
             core.sessions.get_mut(&member).unwrap().watch = Some(Watch {
                 run: 1,
                 sdp: String::new(),
+                browser: false,
                 answer: None,
                 connected: true,
                 slots: Default::default(),
@@ -1136,7 +1150,15 @@ mod tests {
     }
 
     fn connected_watch(lease: Arc<Lease>) -> Watch {
-        Watch { run: GUEST_RUN, sdp: String::new(), answer: None, connected: true, slots: Default::default(), lease }
+        Watch {
+            run: GUEST_RUN,
+            sdp: String::new(),
+            browser: false,
+            answer: None,
+            connected: true,
+            slots: Default::default(),
+            lease,
+        }
     }
 
     fn admitted_guest(core: &mut Core, token: &str, connect: bool) -> (SessionId, mpsc::Receiver<Outbound>) {

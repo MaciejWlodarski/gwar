@@ -66,6 +66,11 @@ wire! {
         #[cfg_attr(feature = "ts", ts(type = "number"))]
         pub run: u64,
         pub sdp: String,
+        /// Browser decoder policy: default SDP level 3.1 is not a hardware decode ceiling.
+        /// Omitted by native viewers, whose offered levels remain authoritative.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        #[cfg_attr(feature = "ts", ts(optional, as = "Option<_>"))]
+        pub browser: bool,
     }
 
     /// Why a share ended. `access`: its sharer lost `share_screen`, or, told to one viewer, that
@@ -94,7 +99,13 @@ wire! {
         /// The guest's watch transport: one `recvonly` video slot. Once per connection; a second
         /// one closes it.
         #[serde(rename = "guest.offer")]
-        Offer { sdp: String },
+        Offer {
+            sdp: String,
+            /// Same browser decoder policy as ScreenWatchOffer; native viewers omit it.
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            #[cfg_attr(feature = "ts", ts(optional, as = "Option<_>"))]
+            browser: bool,
+        },
         #[serde(rename = "screen.keyframe")]
         Keyframe { share: String },
         /// The heartbeat, every 20 s: WebSocket pings do not keep a connection open.
@@ -294,7 +305,19 @@ mod tests {
             serde_json::from_value(json!({"id": 1, "op": "screen.publish.offer", "d": offer})).unwrap();
         assert!(matches!(frame.request, Request::ScreenPublishOffer(ScreenPublishOffer { ssrc: 1, rtx_ssrc: 2, .. })));
         let watch = |run: serde_json::Value| json!({"id": 1, "op": "screen.watch.offer", "d": {"run": run, "sdp": ""}});
-        assert!(serde_json::from_value::<ClientFrame>(watch(json!(1))).is_ok());
+        let native: ClientFrame = serde_json::from_value(watch(json!(1))).unwrap();
+        assert!(matches!(native.request, Request::ScreenWatchOffer(ScreenWatchOffer { browser: false, .. })));
+        assert!(serde_json::to_value(native).unwrap()["d"].get("browser").is_none());
+        let mut browser = watch(json!(1));
+        browser["d"]["browser"] = json!(true);
+        let browser: ClientFrame = serde_json::from_value(browser).unwrap();
+        assert!(matches!(browser.request, Request::ScreenWatchOffer(ScreenWatchOffer { browser: true, .. })));
+        for browser in [false, true] {
+            let guest: GuestFrame =
+                serde_json::from_value(json!({"id": 1, "op": "guest.offer", "d": {"sdp": "", "browser": browser}}))
+                    .unwrap();
+            assert!(matches!(guest.request, GuestRequest::Offer { browser: value, .. } if value == browser));
+        }
         for run in [json!(0), json!(9007199254740992u64), json!(-1)] {
             assert!(serde_json::from_value::<ClientFrame>(watch(run.clone())).is_err(), "run {run}");
         }

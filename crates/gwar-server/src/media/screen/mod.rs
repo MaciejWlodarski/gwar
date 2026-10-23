@@ -324,6 +324,7 @@ pub enum ScreenCmd {
         lease: Arc<Lease>,
         slots: usize,
         sdp: String,
+        browser: bool,
         reply: oneshot::Sender<Result<String, &'static str>>,
     },
     EndWatch {
@@ -699,7 +700,7 @@ impl Sfu {
                 }
             }
             ScreenCmd::EndPublish { share } => self.end_publish(&share),
-            ScreenCmd::Watch { session, run, lease, slots, sdp, reply } => {
+            ScreenCmd::Watch { session, run, lease, slots, sdp, browser, reply } => {
                 if reply.is_closed() || !lease.alive() {
                     return;
                 }
@@ -709,7 +710,7 @@ impl Sfu {
                 }
                 self.end_watch(session);
                 let id = self.id();
-                match watcher(id, session, run, lease, slots, &sdp, self.advertise, now) {
+                match watcher(id, session, run, lease, slots, &sdp, browser, self.advertise, now) {
                     Ok((mut watcher, answer)) => {
                         let (socket, measured, shared) = (&self.socket, &mut self.measured, &self.shared);
                         let guest = watcher.size == GUEST_SLOTS;
@@ -1969,6 +1970,7 @@ fn watcher(
     lease: Arc<Lease>,
     size: usize,
     sdp: &str,
+    browser: bool,
     advertise: SocketAddr,
     now: Instant,
 ) -> Result<(Watcher, String), &'static str> {
@@ -1997,7 +1999,7 @@ fn watcher(
         ufrag,
         slots: Vec::with_capacity(size),
         size,
-        h264: codec::offered(sdp),
+        h264: codec::offered(sdp, browser),
         pending: Vec::new(),
         connected: false,
         focus: None,
@@ -2123,7 +2125,7 @@ pub(crate) mod tests {
                 }
             };
             let (w, answer) =
-                watcher(1, 7, 1, Lease::new(), SCREEN_SLOTS, &offer.to_sdp_string(), addr(6000), now).unwrap();
+                watcher(1, 7, 1, Lease::new(), SCREEN_SLOTS, &offer.to_sdp_string(), false, addr(6000), now).unwrap();
             client.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
             let mut pair = Self { w, client, now, hold: false, held: Vec::new(), checks: Vec::new(), repairs: 0 };
             for _ in 0..200 {
@@ -2816,6 +2818,7 @@ pub(crate) mod tests {
         pair.w.slots[0].pts.insert(VideoCodec::H264(0x42e033), 112.into());
         let caps = codec::offered(
             "m=video 9 X 112\na=mid:h\na=rtpmap:112 H264/90000\na=fmtp:112 packetization-mode=1;profile-level-id=42e01f\n",
+            false,
         );
         pair.w.slots[0].h264 = caps[&Mid::from("h")].clone();
         pair.w.slots[1].pts.insert(VideoCodec::Vp9, 98.into());
@@ -2877,6 +2880,11 @@ pub(crate) mod tests {
             let result = publisher(1, origin, ssrc, &sdp, addr(6000), now);
             assert_eq!(result.is_ok(), accepted, "profile={profile:x}, mode={mode}");
             if accepted {
+                let (publisher, answer) = result.unwrap();
+                let receive = if codec::profile(profile) == Some(0) { 0x42e033 } else { (profile & 0xffff00) | 0x33 };
+                assert!(answer.contains(&format!("profile-level-id={receive:06x}")), "{answer}");
+                assert!(answer.contains("level-asymmetry-allowed=1"));
+                assert!(publisher.codecs.values().any(|c| *c == VideoCodec::H264(receive)));
                 let mut config = Rtc::builder().set_rtp_mode(true).clear_codecs();
                 config.codec_config().add_h264(104.into(), Some(105.into()), true, profile);
                 let mut peer = config.build(now);
@@ -2885,7 +2893,8 @@ pub(crate) mod tests {
                 api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
                 let (offer, pending) = api.apply().unwrap();
                 let (_, answer) =
-                    watcher(1, 7, 1, Lease::new(), GUEST_SLOTS, &offer.to_sdp_string(), addr(6000), now).unwrap();
+                    watcher(1, 7, 1, Lease::new(), GUEST_SLOTS, &offer.to_sdp_string(), false, addr(6000), now)
+                        .unwrap();
                 assert!(answer.contains("a=rtpmap:104 H264/90000"));
                 assert!(answer.contains("packetization-mode=1"));
                 peer.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();

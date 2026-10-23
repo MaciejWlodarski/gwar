@@ -244,6 +244,7 @@ describe("watch requests across a reset (review round 2)", () => {
     const first = screen.watch("A");
     await flush();
     expect(calls.map(([op]) => op)).toEqual(["screen.watch.offer"]);
+    expect(calls[0]![1]).toMatchObject({ browser: true });
     // Answered, not connected yet; then the session resets (as on a reconnect).
     screen.reset();
     await first;

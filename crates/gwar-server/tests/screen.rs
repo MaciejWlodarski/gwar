@@ -284,6 +284,18 @@ async fn transports_are_negotiated_strictly() {
 
     // Watching needs a connected watch transport; runs only go up.
     assert_eq!(bob.fails("screen.watch", json!({"share": share})).await, "unavailable");
+    let client = &mut bob;
+    let viewer = screen::Viewer::negotiate(gwar_proto::SCREEN_SLOTS, 1, move |sdp| async move {
+        let answer = client.ok("screen.watch.offer", json!({"run": 1, "sdp": sdp})).await;
+        assert_eq!(
+            client.fails("screen.watch.offer", json!({"run": 1, "sdp": sdp, "browser": true})).await,
+            "conflict",
+            "a cached run cannot change its decoder policy"
+        );
+        answer["sdp"].as_str().unwrap().to_owned()
+    })
+    .await;
+    bob.viewer = Some(viewer);
     bob.watch(&share).await;
     assert_eq!(bob.fails("screen.watch.offer", json!({"run": 1, "sdp": "v=0"})).await, "conflict");
     // A new run replaces the transport and ends its watches.

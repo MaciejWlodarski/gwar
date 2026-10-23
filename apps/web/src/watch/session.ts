@@ -176,7 +176,7 @@ export class WatchSession {
       slots: 1,
       iceServers: ok.ice_servers,
       offer: async sdp => {
-        const answer = await this.request("guest.offer", { sdp });
+        const answer = await this.request("guest.offer", { sdp, browser: true });
         if (!isRecord(answer) || typeof answer.sdp !== "string") throw new Error("no answer");
         return answer.sdp;
       },

@@ -4,4 +4,8 @@
  * A TeamSpeak guest's frame on `/ws/watch` (docs/screen-share.md, "TeamSpeak watch links"):
  * `{"id": 1, "op": "guest.watch", "d": {...}}`. Guests speak nothing else.
  */
-export type GuestFrame = { id: number, } & ({ "op": "guest.watch", "d": { token: string, } } | { "op": "guest.offer", "d": { sdp: string, } } | { "op": "screen.keyframe", "d": { share: string, } } | { "op": "ping", "d": Record<symbol, never> });
+export type GuestFrame = { id: number, } & ({ "op": "guest.watch", "d": { token: string, } } | { "op": "guest.offer", "d": { sdp: string,
+/**
+ * Same browser decoder policy as ScreenWatchOffer; native viewers omit it.
+ */
+browser?: boolean, } } | { "op": "screen.keyframe", "d": { share: string, } } | { "op": "ping", "d": Record<symbol, never> });

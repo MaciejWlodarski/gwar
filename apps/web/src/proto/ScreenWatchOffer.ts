@@ -3,4 +3,9 @@
 /**
  * The session's watch transport. A greater `run` replaces it, like voice's run.
  */
-export type ScreenWatchOffer = { run: number, sdp: string, };
+export type ScreenWatchOffer = { run: number, sdp: string,
+/**
+ * Browser decoder policy: default SDP level 3.1 is not a hardware decode ceiling.
+ * Omitted by native viewers, whose offered levels remain authoritative.
+ */
+browser?: boolean, };

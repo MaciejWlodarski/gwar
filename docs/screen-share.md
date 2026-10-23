@@ -279,18 +279,30 @@ the Linux app sharing; the owner deferred it.
 - Receive preferences come only from `RTCRtpReceiver.getCapabilities`, with
   H.264, VP9 and VP8. A sender capability never implies decoder support.
   The SFU selects each slot's PT from that viewer's negotiated codecs and
-  offered H.264 profile/receive level. The SPS supplies the actual stream's
+  H.264 profile/receive capability. The SPS supplies the actual stream's
   profile and level. Receive `max-recv-level`, `max-fs`, `max-mbps`, `max-br`
   and `max-dpb` are retained per offered PT; A2 conservatively requires a
-  whole declared receive level to cover the SPS level. Extensions alone do
-  not admit a higher-level stream without actual size/fps/reference metadata.
+  whole effective receive level to cover the SPS level. The publish answer
+  advertises level 5.1 (`42e033` / `640c33` / `640033`) with mutual
+  `level-asymmetry-allowed=1`, allowing 1080p60, 1440p60 and 2160p30 within
+  the unchanged ingress frame/packet/byte bounds.
+- Browser watch transports (including webviews and guest links) send
+  `browser: true`. Their default SDP level 3.1 is promoted to a level-5.1
+  decode floor: [libwebrtc's factory hardcodes 3.1](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/video_coding/codecs/h264/h264.cc),
+  while its [decoder uses the bitstream's decoded dimensions](https://webrtc.googlesource.com/src.git/+/refs/heads/main/modules/video_coding/codecs/h264/h264_decoder_impl.cc).
+  Firefox's [GMP adapter](https://raw.githubusercontent.com/mozilla/gecko-dev/master/dom/media/webrtc/libwebrtcglue/WebrtcGmpVideoCodec.cpp)
+  also initializes decode without an SDP-level ceiling. Explicit lower
+  `max-recv-level`, `max-fs`, `max-mbps`, `max-dpb` or `max-br` still constrain
+  admission. Native viewers omit the flag and state their real level.
+  See [Browser interop](native-media.md#browser-interop) for sources and scope.
+  The screen e2e requires 1920×1080 H.264 at the Chromium sender and both
+  Chromium and WebKit receivers using `getStats` dimensions, with the Game preset.
 - A viewer that cannot decode a share gets its slot freed and
   `screen.stopped {reason: "codec"}`, with a clear browser/guest-page message.
   The share and other viewers continue. There is no transcoding, automatic
   publisher codec switch, or compatibility layer in A2. Asking a web sharer
   to fall back to VP9 is follow-up work; A3/B11a own native compatibility
-  layers. A level-3.1 viewer may need a 720p share even if the sender can
-  encode 1080p H.264.
+  layers. An explicitly limited native decoder may still need 720p.
 - Hardware encoding is chosen by the browser where available, with its
   software H.264 encoder otherwise. The sharing bar shows the negotiated
   codec and exposes the encoder implementation/hardware hint in its tooltip
@@ -1944,7 +1956,7 @@ included ([Queues and repairs](#queues-and-repairs)).
 | `screen.start` | `{call, participation, preset, surface, guest_link}` (`surface`: `screen`/`window`/`tab`/`unknown`, display only; `guest_link`: post a TeamSpeak watch link where one is possible) | `{share}`, a 16-byte random id; checks `share_screen`, limits and budget; refused in encrypted channels until PR 7. Not announced until its publish transport connects; one not answered 35 s after its start, or not connected 35 s after its answer, ends with `transport`, told to the sharer only |
 | `screen.publish.offer` | `{share, ssrc, rtx_ssrc, sdp}` | `{sdp}`; the share's own publish transport. Its first connection announces `screen.started` to the channel. One per share, never renegotiated |
 | `screen.stop` | `{share}` | ok; event `screen.stopped {share, reason: "stopped"}` |
-| `screen.watch.offer` | `{run, sdp}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run; a run is retired for good once offered, so a failed or closed run and every lower one answer `stale` |
+| `screen.watch.offer` | `{run, sdp, browser?}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run; a run is retired for good once offered, so a failed or closed run and every lower one answer `stale` |
 | `screen.watch` | `{share}` | `{slot}`; needs a connected watch transport (`unavailable` otherwise); the server assigns a slot, opens a segment at the next keyframe (throttled request), event `screen.slot` |
 | `screen.focus` | `{share}` | ok; the share on the viewer's stage gets first claim on its bandwidth |
 | `screen.unwatch` | `{share}` | ok; the slot is freed |
@@ -2117,7 +2129,7 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
   - The first frame is `guest.watch {token}`. The reply is
     `{share, sharer, preset, ice_servers}`, or one generic `not_found`
     for unknown, inactive, ended and revoked tokens alike.
-  - After that, only `guest.offer {sdp}` is accepted, **once per
+  - After that, only `guest.offer {sdp, browser?}` is accepted, **once per
     connection**, plus `screen.keyframe` and `ping {}`. The offer is a
     watch transport with **one** slot. A second offer closes the
     connection.

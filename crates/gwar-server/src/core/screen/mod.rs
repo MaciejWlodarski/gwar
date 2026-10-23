@@ -67,6 +67,7 @@ struct Publish {
 pub(super) struct Watch {
     run: u64,
     sdp: String,
+    browser: bool,
     answer: Option<String>,
     connected: bool,
     slots: [Option<(String, Arc<WatchGrant>)>; SCREEN_SLOTS],
@@ -311,7 +312,7 @@ impl Core {
         if offer.run == s.watch_run {
             // The run's transport failed or closed: retired for good.
             let Some(watch) = &s.watch else { return Some(Err(stale())) };
-            if watch.sdp != offer.sdp {
+            if watch.sdp != offer.sdp || watch.browser != offer.browser {
                 return Some(Err(err(ErrorCode::Conflict, "run reused with a different offer")));
             }
             return Some(
@@ -338,13 +339,22 @@ impl Core {
         s.watch = Some(Watch {
             run: offer.run,
             sdp: offer.sdp.clone(),
+            browser: offer.browser,
             answer: None,
             connected: false,
             slots: Default::default(),
             lease: lease.clone(),
         });
         let (reply, rx) = oneshot::channel();
-        permit.send(ScreenCmd::Watch { session, run: offer.run, lease, slots: SCREEN_SLOTS, sdp: offer.sdp, reply });
+        permit.send(ScreenCmd::Watch {
+            session,
+            run: offer.run,
+            lease,
+            slots: SCREEN_SLOTS,
+            sdp: offer.sdp,
+            browser: offer.browser,
+            reply,
+        });
         let tx = self.me.upgrade()?;
         let run = offer.run;
         tokio::spawn(async move {

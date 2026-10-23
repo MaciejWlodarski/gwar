@@ -417,7 +417,7 @@ export class ScreenController {
     const transport: ScreenWatchTransport = new ScreenWatchTransport({
       run,
       iceServers: useSession.getState().iceServers,
-      offer: async (sdp, run) => (await conn.request("screen.watch.offer", { run, sdp }, { timeoutMs: 35_000 })).sdp,
+      offer: async (sdp, run) => (await conn.request("screen.watch.offer", { run, sdp, browser: true }, { timeoutMs: 35_000 })).sdp,
       state: state => {
         if (this.transport !== transport) return;
         if (state === "failed") { fail(new Error(tNow("screen.watchFailed"))); return; }

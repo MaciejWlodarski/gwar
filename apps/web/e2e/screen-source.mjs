@@ -9,7 +9,7 @@
  * Draws the source's frames: a 20-cell barcode across the top quarter (4 bits of source id, a
  * 12-bit frame counter and a 4-bit check), and a moving block so every frame changes.
  */
-export function stampBarcode(canvas, id) {
+export function stampBarcode(canvas, id, fps = 20) {
   const ctx = canvas.getContext("2d");
   let counter = 0;
   const draw = () => {
@@ -27,7 +27,7 @@ export function stampBarcode(canvas, id) {
     bits.forEach((bit, i) => { ctx.fillStyle = bit ? "#000" : "#fff"; ctx.fillRect((i * w) / 20, 0, w / 20 + 1, h / 4); });
   };
   draw();
-  setInterval(draw, 50);
+  setInterval(draw, 1000 / fps);
 }
 
 /** Reads the barcode back from a decoded video: `{id, counter}`, `{invalid}` or null without a frame. */

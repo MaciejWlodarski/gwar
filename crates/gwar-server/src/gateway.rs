@@ -534,9 +534,9 @@ async fn guest_connection(mut socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         }
         match request {
             GuestRequest::Watch { .. } => unreachable!("closed above"),
-            GuestRequest::Offer { sdp } => {
+            GuestRequest::Offer { sdp, browser } => {
                 offered = true;
-                gateway.core.guest(GuestMsg::Offer { guest, id, sdp }).await;
+                gateway.core.guest(GuestMsg::Offer { guest, id, sdp, browser }).await;
             }
             GuestRequest::Keyframe { share } => gateway.core.guest(GuestMsg::Keyframe { guest, id, share }).await,
             GuestRequest::Ping {} => {

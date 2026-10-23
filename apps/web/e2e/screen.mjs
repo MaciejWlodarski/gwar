@@ -97,7 +97,7 @@ function devicePatch({ frequency, sources, sendCodec, receiveCodec }, stamp, rea
 }
 
 const sourcePage = `<!doctype html><title>${SOURCE_TITLE}</title><style>html,body{margin:0;height:100%;overflow:hidden;background:#777}canvas{display:block;width:100vw;height:100vh}</style>
-<canvas width="1280" height="720"></canvas><script>(${stampBarcode})(document.querySelector("canvas"), 1)</script>`;
+<canvas width="1920" height="1080"></canvas><script>(${stampBarcode})(document.querySelector("canvas"), 1, 60)</script>`;
 
 /** What a failure prints per device: each open peer connection's RTP streams and the stage's videos. */
 const diagnostics = page => page.evaluate(async () => ({
@@ -122,7 +122,7 @@ const diagnostics = page => page.evaluate(async () => ({
 const errors = page => page.errors.filter(e => !/Conversation synchronization|favicon|Failed to load resource|Screen capture constraints|WebSocket/.test(e));
 
 async function device(browser, web, server, name, { canvasId = null, frequency = 440, sendCodec = null, receiveCodec = null } = {}) {
-  const context = await browser.newContext({ locale: "en-US", viewport: { width: 1440, height: 900 } });
+  const context = await browser.newContext({ locale: "en-US", viewport: { width: 1920, height: 1080 } });
   await context.route("**/*", route => (new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort()));
   const sources = (canvasId === null ? [] : [canvasId].flat()).map(id => ({ id, size: SOURCE_SIZES[id] }));
   await context.addInitScript({ content: `(${devicePatch})(${JSON.stringify({ frequency, sources, sendCodec, receiveCodec })}, ${stampBarcode}, ${readBarcode}, ${canvasCapture})` });
@@ -215,10 +215,10 @@ const paintsUnreliably = page => page.engine === "webkit" && process.platform ==
 /**
  * Each source's frame size, all of different shapes: a decoded frame's aspect ratio names the
  * source even where no pixel can be read (and survives the encoder scaling it down). Source 1 is
- * the Chromium tab, whose page has the context's 1440×900 viewport, or a canvas of that size;
+ * the Chromium tab, whose page has the context's 1920×1080 viewport, or a canvas of that size;
  * source 6 is the restarting sharer's second share.
  */
-const SOURCE_SIZES = { 1: [1440, 900], 2: [640, 360], 3: [640, 480], 4: [480, 480], 5: [600, 400], 6: [560, 400] };
+const SOURCE_SIZES = { 1: [1920, 1080], 2: [640, 400], 3: [640, 480], 4: [480, 480], 5: [600, 400], 6: [560, 400] };
 function fromSource(id, width, height, what) {
   const [w, h] = SOURCE_SIZES[id];
   assert.ok(Math.abs(width / height - w / h) < 0.03, `${what}: a ${width}x${height} frame is not source ${id}'s ${w}x${h}`);
@@ -263,7 +263,7 @@ async function decodes(page, share, id, what) {
 }
 
 /** getStats codec evidence from the actual publish and receive transports, not SDP alone. */
-async function codecFlow(publisher, viewer, share, expected) {
+async function codecFlow(publisher, viewer, share, expected, size = null) {
   const slot = await session(viewer, (_, screen, __, share) => screen.watches.find(w => w.share === share)?.slot, share);
   const read = async (page, direction) => page.evaluate(async ({ direction, slot }) => {
     for (const pc of window.__pcs) {
@@ -274,14 +274,23 @@ async function codecFlow(publisher, viewer, share, expected) {
       const report = direction === "in" ? await target.receiver.getStats() : await pc.getStats();
       for (const s of report.values()) {
         if (s.type === (direction === "in" ? "inbound-rtp" : "outbound-rtp") && s.kind === "video" && (s.framesDecoded ?? s.framesEncoded) > 0)
-          return { mimeType: report.get(s.codecId)?.mimeType?.toLowerCase(), frames: s.framesDecoded ?? s.framesEncoded, encoder: s.encoderImplementation ?? null };
+          return { mimeType: report.get(s.codecId)?.mimeType?.toLowerCase(), frames: s.framesDecoded ?? s.framesEncoded, encoder: s.encoderImplementation ?? null,
+            frameWidth: s.frameWidth, frameHeight: s.frameHeight, fps: s.framesPerSecond,
+            fmtp: report.get(s.codecId)?.sdpFmtpLine,
+            offeredFmtp: pc.localDescription?.sdp?.split(/\r?\n/).filter(l => l.startsWith("a=fmtp:")),
+            answeredFmtp: pc.remoteDescription?.sdp?.split(/\r?\n/).filter(l => l.startsWith("a=fmtp:")) };
       }
     }
     return null;
   }, { direction, slot });
   let sent, received;
-  await waitFor(async () => { sent = await read(publisher, "out"); received = await read(viewer, "in"); return sent?.mimeType === expected && received?.mimeType === expected; }, `${expected} flows through the real SFU`);
-  checks.push({ check: "codec flow through SFU", share, sent, received });
+  await waitFor(async () => { sent = await read(publisher, "out"); received = await read(viewer, "in"); return sent?.mimeType === expected && received?.mimeType === expected &&
+    (!size || [sent, received].every(s => s.frameWidth === size[0] && s.frameHeight === size[1])); }, `${expected} flows through the real SFU`);
+  if (expected === "video/h264" && size) {
+    assert.ok(sent.answeredFmtp.some(l => /level-asymmetry-allowed=1/.test(l) && /profile-level-id=(42e0|640c|6400)33/.test(l)), "publisher answer retains receive level 5.1");
+    assert.ok(received.offeredFmtp.some(l => /profile-level-id=(42e0|640c|6400)1f/.test(l)), "viewer starts with the browser's default level 3.1");
+  }
+  checks.push({ check: "codec flow through SFU", share, viewer: viewer.deviceName, sent, received });
 }
 
 async function run(browsers, web, server, token) {
@@ -314,9 +323,8 @@ async function run(browsers, web, server, token) {
     c.mimeType.toLowerCase() === "video/h264" && /(^|;)\s*packetization-mode=1(?:;|$)/.test(c.sdpFmtpLine ?? "") &&
     /(^|;)\s*profile-level-id=(42[eEcC]0|640[cC]|6400)[0-9a-fA-F]{2}(?:;|$)/.test(c.sdpFmtpLine ?? "")));
 
-  // Current browsers offer H.264 receive level 3.1. Exercise its 720p envelope;
-  // a higher-level stream must be refused rather than sent above viewer limits.
-  const csShare = await share(cs, chromiumTab ? "Sharing a browser tab" : "Sharing your screen", hasH264 ? "Saver" : null);
+  // Browser SDP defaults to 3.1; Game must still encode and decode the full 1080p source.
+  const csShare = await share(cs, chromiumTab ? "Sharing a browser tab" : "Sharing your screen", "Game");
   checks.push({ check: "chromium real tab capture", ok: chromiumTab });
   const ws = await device(engine("webkit"), web, server, "ws-canvas", { frequency: 550, canvasId: 2, sendCodec: hasH264 ? null : "vp9" });
   await join(ws, channels.stage);
@@ -326,7 +334,7 @@ async function run(browsers, web, server, token) {
   await join(cv, channels.hall);
   await watch(cv, "cs-tab");
   await sees(cv, csShare, 1, "chromium → chromium, viewer in another channel");
-  await codecFlow(cs, cv, csShare, hasH264 ? "video/h264" : "video/vp9");
+  await codecFlow(cs, cv, csShare, hasH264 ? "video/h264" : "video/vp9", SOURCE_SIZES[1]);
   checks.push({ check: "H.264 browser capability", available: hasH264, gap: hasH264 ? null : "Browser exposes no H.264 encoder; actual VP9 fallback verified instead." });
   if (hasH264) {
     const incompatible = await device(engine("chromium"), web, server, "vp9-only-viewer", { receiveCodec: "vp9" });
@@ -346,6 +354,7 @@ async function run(browsers, web, server, token) {
   assert.equal(await shareOf(wv, "cs-tab"), csShare);
   await watch(wv, "cs-tab");
   await sees(wv, csShare, 1, "chromium → webkit, late joiner outside voice");
+  await codecFlow(cs, wv, csShare, hasH264 ? "video/h264" : "video/vp9", SOURCE_SIZES[1]);
   await watch(wv, "ws-canvas");
   await sees(wv, wsShare, 2, "webkit → webkit");
   await bar(ws).getByText("2 watching").waitFor({ timeout: 10_000 });
