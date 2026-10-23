@@ -1384,10 +1384,11 @@ it advertises software AV1:
   not qualify battery operation.
 - **Voice:** F4 runs the paired voice gate on this viewer machine with the
   same four-slot workload and sustained duration, against a voice-only
-  baseline. Voice p95 and p99 must stay within baseline + 2 ms unconstrained,
-  p99 within baseline + 20 ms constrained, and the underrun rate within
-  baseline + 0.5 percentage points. Keep PR 3b's pair-validity rules and
-  confirm the four slots sustain their caps in every loaded run.
+  baseline. Unconstrained, voice p95 and p99 must stay within baseline + 2 ms
+  with no extra underruns; constrained, p99 within baseline + 20 ms and the
+  underrun rate within baseline + 0.5 percentage points. Keep PR 3b's
+  pair-validity rules and confirm the four slots sustain their caps in every
+  loaded run.
 
 Advertise only tuples and power modes that pass every bound, with a report
 identifying the machine, software and workload. Untested or failing caps
@@ -2191,8 +2192,9 @@ before a native Linux UI exists.
 - Depends on: PR 3b's gate tooling; B4 for publishing; B5 and the relevant
   D1–D3 adapter for viewing.
 - Acceptance: both cases pass the same gate as PR 3b (voice p95 and p99
-  within 2 ms of the paired baseline unconstrained; p99 within 20 ms
-  constrained; underrun rate within baseline + 0.5 percentage points).
+  within 2 ms of the paired baseline and no extra underruns unconstrained;
+  p99 within 20 ms and underrun rate within baseline + 0.5 percentage points
+  constrained).
   The viewer case also passes every software decode resource bound; a
   publisher-only result cannot qualify dav1d caps.
 - Now: publishing after B4; viewing after B5 and the platform's D-item.
