@@ -2,10 +2,11 @@
 
 Status: **plan, not scheduled.** Nothing here has a date. It describes where
 the clients are going, which pieces exist, and which pieces a contributor can
-build, in what order, and how each one is accepted. Built so far: the AV1
-payload and Dependency Descriptor parsers (A1b,
-[#154](https://github.com/MaciejWlodarski/gwar/pull/154)); AV1 transport
-integration remains A2b.
+build, in what order, and how each one is accepted. Built so far: the H.264
+payload parser (A1, [#153](https://github.com/MaciejWlodarski/gwar/pull/153))
+and the AV1 payload and Dependency Descriptor parsers (A1b,
+[#154](https://github.com/MaciejWlodarski/gwar/pull/154)); transport
+integration remains A2 and A2b.
 
 It extends [screen-share.md](screen-share.md). That design ships screen
 sharing through the server's SFU from browsers and the Tauri desktop app's
