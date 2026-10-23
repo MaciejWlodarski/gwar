@@ -301,6 +301,12 @@ jobs:
           prefix-key: ci-v2-debug0
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # std-only crate: verify the same tests on Linux, macOS and Windows before app setup.
+      - name: Platform-neutral media tests
+        timeout-minutes: 2
+        env:
+          CARGO_BUILD_JOBS: "4"
+        run: cargo test --locked -p gwar-media
       - name: Linux libraries
         timeout-minutes: 8
         if: runner.os == 'Linux'

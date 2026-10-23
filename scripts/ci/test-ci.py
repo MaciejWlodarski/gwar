@@ -65,6 +65,12 @@ Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
             with self.subTest(path=path):
                 self.assertEqual(select([path]), {"native": True, "app": True})
 
+    def test_media_keeps_native_and_cross_platform_coverage(self):
+        for path in ["crates/gwar-media/src/lib.rs", "crates/gwar-media/Cargo.toml",
+                     "crates/gwar-media/tests/contracts.rs", "crates/gwar-media/README.md"]:
+            with self.subTest(path=path):
+                self.assertEqual(select([path]), {"native": True, "app": True})
+
     def test_main_always_full(self):
         self.assertEqual(select(["docs/e2e.md"], full=True), {"native": True, "app": True})
 

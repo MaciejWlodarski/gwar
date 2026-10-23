@@ -2941,6 +2941,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "gwar-media"
+version = "0.1.0"
+
+[[package]]
 name = "gwar-mls"
 version = "0.1.0"
 dependencies = [
