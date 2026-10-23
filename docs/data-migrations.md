@@ -195,6 +195,10 @@ IndexedDB (`lib/local-state.ts`).
   replaced key. Verifying a channel message first reads that server's channel
   record again (a transaction), and checks it with what this tab has not stored
   yet; a view of a record older than 30 s answers "incomplete" until read again.
+  The message list keeps the verifier's results without the channel lifecycle
+  and applies it as they are shown, re-rendering on this tab's changes, on the
+  record being stored or read again, and on a timer of its own when the view
+  reaches 30 s: a read still queued never keeps a shown result clean.
 - **Tabs.** After a commit the tab posts the key (no data) on a BroadcastChannel
   named after the database, and writes it to the localStorage ping
   `gwar-local.changed` (the key and a nonce, no data); the others read that key
@@ -213,7 +217,9 @@ IndexedDB (`lib/local-state.ts`).
   localStorage unsynchronised across processes, but Chromium (its renderer-side
   cache), Firefox (LSNG snapshots, held until the task ends) and WebKit (its
   StorageAreaMap) apply other tabs' changes to a page's copy only between tasks,
-  so one pass sees one state. Only the page's own code could change the copy
+  so one pass sees one state ([Chromium](https://chromium.googlesource.com/chromium/src/+/500947f508e484696c809b5ea84568bfd51b320a/third_party/blink/renderer/modules/storage/cached_storage_area.cc),
+  [Firefox](https://raw.githubusercontent.com/mozilla-firefox/firefox/main/dom/localstorage/LSSnapshot.cpp),
+  [WebKit](https://raw.githubusercontent.com/WebKit/WebKit/main/Source/WebKit/WebProcess/WebStorage/StorageAreaMap.cpp)). Only the page's own code could change the copy
   mid-pass; the pass still checks at the end that the listing is complete and
   unchanged, and otherwise aborts. localStorage that cannot be read aborts it
   the same way. The originals are left in localStorage,

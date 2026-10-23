@@ -25,7 +25,7 @@ vi.mock('../net/message-verification-cache', () => ({ MessageVerificationCache: 
   verify(msg: { id: number }, ctx: { serverKey: string }) { return new Promise<MessageVerification>((resolve) => held.jobs.push({ id: msg.id, serverKey: ctx.serverKey, resolve })); }
   refresh() { held.refreshes++; return Promise.resolve(); }
 } }));
-vi.mock('../net/channel-lifecycle', () => ({ withFreshChannelLifecycle: async (v: MessageVerification) => v }));
+vi.mock('../net/channel-lifecycle', () => ({ withFreshChannelLifecycle: async (v: MessageVerification) => v, withChannelLifecycle: (v: MessageVerification) => v, channels: { subscribe: () => () => {} } }));
 const valid: MessageVerification = { status: 'verified', continuity: 'proven', authorization: [] };
 let root: Root, div: HTMLDivElement;
 const item = (id: number) => ({ kind: 'msg' as const, key: `m${id}`, at: 1700000000000, msg: { id, target: { channel: 1 }, author: 2, author_uid: 'u', author_name: 'Alice', text: `body-${id}`, sent_at: 1700000000000 } });

@@ -25,6 +25,12 @@ export interface ChannelLifecycle {
   check(serverKey: string, id: number): "ok" | "reused" | "unknown";
   /** Reads the record again from the database (a transaction); never rejects (a failure makes it unknown). */
   refresh(serverKey: string): Promise<void>;
+  /**
+   * Calls `listener` whenever an answer of `check` for this server may have changed: this tab's changes, the
+   * record stored or read again, the state becoming unusable, and the moment this tab's view of the record
+   * gets older than `MAX_AGE_MS` (a timer of its own, so a read still queued does not keep an answer clean).
+   */
+  subscribe(serverKey: string, listener: () => void): () => void;
 }
 
 /** How old this tab's view of a record may be for `check` to answer from it. */
@@ -44,6 +50,7 @@ type Store = {
   update(key: string, change: LocalStateChange): Promise<unknown>;
   checkedAt?(key: string): number;
   read?(key: string): Promise<unknown>;
+  subscribe?(listener: (key: string | null) => void): () => void;
 };
 
 const isIds = (v: unknown): v is number[] =>
@@ -80,6 +87,8 @@ export function channelLifecycle(given?: Store): ChannelLifecycle {
   const pending = new Map<string, Pending>();
   const parsed = new Map<string, { raw: string | undefined; record: Stored }>();
   let uncertain = false;
+  const listeners = new Map<string, Set<() => void>>();
+  const changed = (serverKey: string) => { for (const listener of [...listeners.get(serverKey) ?? []]) listener(); };
   /** The stored record as the view holds it now; unreadable storage is an incomplete record. */
   const stored = (serverKey: string): Stored => {
     let raw: string | undefined;
@@ -121,7 +130,8 @@ export function channelLifecycle(given?: Store): ChannelLifecycle {
     let read = reading.get(serverKey);
     if (!read) {
       read = (async () => {
-        try { await storage().read?.(PREFIX + serverKey); } catch { /* unusable: the record reads as incomplete */ }
+        try { await storage().read?.(PREFIX + serverKey); } catch { return; /* unusable: the record reads as incomplete */ }
+        changed(serverKey); // fresh again, even if nothing changed
       })().finally(() => reading.delete(serverKey));
       reading.set(serverKey, read);
     }
@@ -183,6 +193,7 @@ export function channelLifecycle(given?: Store): ChannelLifecycle {
       const p = pendingFor(serverKey);
       p.deleted.delete(id); p.deleted.add(id);
       save(serverKey, p);
+      changed(serverKey);
     },
     check(serverKey, id) {
       const s = stored(serverKey), p = touch(serverKey);
@@ -194,6 +205,33 @@ export function channelLifecycle(given?: Store): ChannelLifecycle {
       return s.incomplete || p?.incomplete || uncertain ? "unknown" : "ok";
     },
     refresh,
+    subscribe(serverKey, listener) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      // Until the view of the record gets too old; a stale one is read again by the next `check`, whose
+      // result calls this again.
+      const arm = () => {
+        clearTimeout(timer);
+        timer = undefined;
+        const store = storage();
+        if (!store.checkedAt) return;
+        const age = Date.now() - store.checkedAt(PREFIX + serverKey);
+        if (age > MAX_AGE_MS) return;
+        timer = setTimeout(fire, MAX_AGE_MS - age + 1);
+        (timer as { unref?: () => void }).unref?.();
+      };
+      const fire = () => { arm(); listener(); };
+      let mine = listeners.get(serverKey);
+      if (!mine) listeners.set(serverKey, mine = new Set());
+      mine.add(fire);
+      const off = storage().subscribe?.((key) => { if (key === null || key === PREFIX + serverKey) fire(); });
+      arm();
+      return () => {
+        clearTimeout(timer);
+        off?.();
+        mine.delete(fire);
+        if (!mine.size) listeners.delete(serverKey);
+      };
+    },
   };
 }
 

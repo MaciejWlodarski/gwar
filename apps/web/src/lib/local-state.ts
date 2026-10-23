@@ -44,7 +44,11 @@ function allKeys(storage: Storage): string[] | null {
  * renderer-side cache (blink CachedStorageArea) applies them from IPC messages run as tasks,
  * Firefox's LSNG takes a snapshot (LSSnapshot) that holds until the current task ends, and
  * WebKit's StorageAreaMap applies them from IPC messages on the main run loop. So another tab's
- * change lands wholly before or after the pass. Only this page's own code could change the copy
+ * change lands wholly before or after the pass. Sources (reviewed for PR #151):
+ * https://chromium.googlesource.com/chromium/src/+/500947f508e484696c809b5ea84568bfd51b320a/third_party/blink/renderer/modules/storage/cached_storage_area.cc
+ * https://raw.githubusercontent.com/mozilla-firefox/firefox/main/dom/localstorage/LSDatabase.cpp
+ * https://raw.githubusercontent.com/mozilla-firefox/firefox/main/dom/localstorage/LSSnapshot.cpp
+ * https://raw.githubusercontent.com/WebKit/WebKit/main/Source/WebKit/WebProcess/WebStorage/StorageAreaMap.cpp Only this page's own code could change the copy
  * mid-pass, and none runs here; still, the pass checks at the end that the listing is complete and
  * unchanged, and otherwise fails the upgrade (nothing is committed; the next load imports again).
  * A localStorage that fails to read fails it the same way.
