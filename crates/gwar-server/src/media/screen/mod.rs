@@ -11,6 +11,8 @@
 //! access ends, so a packet already on its way is fenced before the command that releases the
 //! slot arrives.
 
+pub mod av1;
+pub mod dependency_descriptor;
 mod ingress;
 mod segment;
 
