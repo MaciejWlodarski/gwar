@@ -575,23 +575,62 @@ describe("the security state (IndexedDB)", () => {
       expect(state.error()).toBeUndefined();
       expect(state.get(PIN)).toBe(pin);
     });
-    it("never misses an entry when an earlier one goes while it lists the names", async () => {
+    it("another tab's changes, which reach this page between tasks, land wholly before or after the import", async () => {
+      // A version-1 tab keeps removing and restoring an entry listed before the pin, as browsers apply it: as a
+      // task of this page's, never inside a running script.
+      const { items, storage } = racing([["noise", "x"], [PIN, pin], [second, pin]], {});
+      vi.stubGlobal("localStorage", storage);
+      let churning = true;
+      const churn = () => {
+        if (!churning) return;
+        if (items.has("noise")) items.delete("noise"); else { const rest = [...items]; items.clear(); items.set("noise", "x"); for (const [k, v] of rest) items.set(k, v); }
+        setTimeout(churn, 0);
+      };
+      churn();
+      try {
+        for (let i = 0; i < 20; i++) {
+          const state = await tab(fresh());
+          expect(state.error()).toBeUndefined();
+          expect([state.get(PIN), state.get(second)]).toEqual([pin, pin]);
+        }
+      } finally { churning = false; }
+    });
+    it("a listing that changes during the pass commits nothing, even if it changes back (Sol r6 probe, inverted)", async () => {
+      // Only this page's own code could do this (no browser applies another tab's change mid-script); the
+      // import still refuses a listing it cannot trust instead of committing what it saw.
+      let names = ["noise", PIN], lengthReads = 0;
+      vi.stubGlobal("localStorage", {
+        get length() { if (++lengthReads === 3) names = ["noise", PIN]; return names.length; },
+        key(i: number) { const key = names[i] ?? null; if (i === 0) names = names.filter((k) => k !== "noise"); return key; },
+        getItem: (key: string) => (key === PIN ? pin : null),
+      });
+      const name = fresh();
+      const failed = await tab(name);
+      expect(failed.error()).toMatchObject({ message: expect.stringMatching(/changed while it was imported/) });
+      expect(() => failed.get(PIN)).toThrow();
+      expect((await indexedDB.databases()).find((d) => d.name === name)?.version ?? 0).toBe(0);
+      // Holding still, the next load imports it.
+      vi.stubGlobal("localStorage", racing([["noise", "x"], [PIN, pin]], {}).storage);
+      expect((await tab(name)).get(PIN)).toBe(pin);
+    });
+    it("an entry that goes while the names are listed fails the pass instead of being skipped", async () => {
       let removed = false;
       const { items, storage } = racing([["unrelated", "x"], [PIN, pin], [second, pin]], {
         key: (i) => { if (i === 0 && !removed) { removed = true; items.delete("unrelated"); } },
       });
       vi.stubGlobal("localStorage", storage);
-      const state = await tab(fresh());
-      expect(state.error()).toBeUndefined();
+      const name = fresh();
+      expect((await tab(name)).error()).toMatchObject({ message: expect.stringMatching(/changed while it was imported/) });
+      const state = await tab(name);
       expect([state.get(PIN), state.get(second)]).toEqual([pin, pin]);
     });
-    it("commits nothing while localStorage keeps changing, and imports once it holds still", async () => {
+    it("commits nothing when entries appear while it reads, and imports once localStorage holds still", async () => {
       let changing = true, n = 0;
       const { items, storage } = racing([[PIN, pin]], { getItem: () => { if (changing) items.set(`gwar.channels:${n++}`, "{}"); } });
       vi.stubGlobal("localStorage", storage);
       const name = fresh();
       const failed = await tab(name);
-      expect(failed.error()).toMatchObject({ message: expect.stringMatching(/kept changing/) });
+      expect(failed.error()).toMatchObject({ message: expect.stringMatching(/changed while it was imported/) });
       expect((await indexedDB.databases()).find((d) => d.name === name)?.version ?? 0).toBe(0);
       changing = false;
       const state = await tab(name);

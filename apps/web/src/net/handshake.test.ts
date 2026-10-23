@@ -7,6 +7,7 @@ import { Connection, type ConnectionOptions } from "./connection";
 import { generateIdentity } from "./identity";
 import { decodeFixed, helloStatement, proofStatement, verifyProof } from "./handshake";
 import { serverPins, checkCandidate, ServerIdentityChanged } from "./server-pins";
+import { localState as pageState } from "../lib/local-state";
 import { FakeSocket, fakeIdentity, testServerIdentity, challenge, finishHandshake, memoryPins } from "./testing";
 import type { Hello } from "../proto/Hello";
 
@@ -195,7 +196,7 @@ describe("persistent pins and canonical fields", () => {
     const [old, proven] = [fakeIdentity.publicKey, testServerIdentity.publicKey];
     const pinned = () => serverPins.load(url)?.server_pk;
     async function accepted(extra: Partial<ConnectionOptions> = {}) {
-      const { localState } = await import("../lib/local-state");
+      const localState = pageState;
       await localState.load();
       await localState.update("gwar.server-pin:" + url, () => JSON.stringify({ server_pk: old, first_seen: 1 }));
       return make({ url, pinStore: serverPins, inviteServerKey: proven, replaceServerKey: old, ...extra });
@@ -215,13 +216,42 @@ describe("persistent pins and canonical fields", () => {
       const other = (await generateIdentity()).publicKey;
       const conn = await accepted();
       const { socket, result } = await begin(conn);
-      const { localState } = await import("../lib/local-state");
+      const localState = pageState;
       await localState.update("gwar.server-pin:" + url, () => JSON.stringify({ server_pk: other, first_seen: 2 }));
       const hello = socket.sent[0]!.d as Hello;
       socket.push({ re: 1, ok: { server_proof: await testServerIdentity.sign(new TextEncoder().encode(await proofStatement(hello))) } });
       await expect(result).rejects.toMatchObject({ kind: "server_identity" });
       expect(socket.sent).toHaveLength(1);
       expect(pinned()).toBe(other);
+    });
+    it("reads the stored pin before signing: a tab that missed another tab's replacement signs nothing (Sol r6 probe, inverted)", async () => {
+      vi.resetModules();
+      vi.stubGlobal("BroadcastChannel", undefined);
+      try {
+        const { createLocalState } = await import("../lib/local-state");
+        const name = `stale-${crypto.randomUUID()}`;
+        const [writer, stale] = [createLocalState(name), createLocalState(name)];
+        await writer.load(); await stale.load();
+        const pinsOf = async (state: typeof writer) => {
+          vi.resetModules();
+          vi.doMock("../lib/local-state", async () => ({ ...await vi.importActual("../lib/local-state"), localState: state }));
+          return (await import("./server-pins")).serverPins;
+        };
+        const [mine, other] = [await pinsOf(stale), await pinsOf(writer)];
+        await other.commit(url, proven);
+        await stale.refresh();
+        // The other tab's user accepts a new key; this tab is not told.
+        await other.commit(url, old, proven);
+        expect(mine.load(url)?.server_pk).toBe(proven);
+        const { Connection: Isolated } = await import("./connection");
+        const sign = vi.fn(fakeIdentity.sign);
+        const conn = new Isolated({ url, identity: { ...fakeIdentity, sign }, nickname: "test", pinStore: mine,
+          client: { name: "test", version: "0", platform: "web" }, createSocket: (u) => new FakeSocket(u) });
+        const result = conn.connect(); const socket = FakeSocket.last(); socket.open(); socket.push(challenge());
+        await expect(result).rejects.toMatchObject({ kind: "server_identity", identityChange: { expected: old, candidate: proven } });
+        expect(sign).not.toHaveBeenCalled(); expect(socket.sent).toHaveLength(0);
+        writer.close(); stale.close();
+      } finally { vi.doUnmock("../lib/local-state"); vi.unstubAllGlobals(); vi.resetModules(); }
     });
     it("needs the accepted key: without it the old pin blocks before signing", async () => {
       const sign = vi.fn(fakeIdentity.sign);

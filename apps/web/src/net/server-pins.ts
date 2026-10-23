@@ -7,8 +7,10 @@ export interface ServerPin {
 }
 
 export interface PinStore {
-  /** Throws when the pins cannot be read: nothing is trusted then. */
+  /** As this tab last read it; throws when the pins cannot be read: nothing is trusted then. */
   load(endpoint: string): ServerPin | undefined;
+  /** Read from the database now (a transaction); rejects when the pins cannot be read. */
+  loadStored(endpoint: string): Promise<ServerPin | undefined>;
   /**
    * After the server proved `key`, in one transaction: first contact commits only if no pin is stored, and
    * a stored pin must match. With `replacing` (the user accepted `key` in place of that key) a pin still
@@ -38,6 +40,10 @@ export const serverPins: PinStore = {
     const value = localState.get(PREFIX + normalizeEndpoint(endpoint));
     return value === undefined ? undefined : parsePin(value);
   },
+  async loadStored(endpoint) {
+    const value = await localState.read(PREFIX + normalizeEndpoint(endpoint));
+    return value === undefined ? undefined : parsePin(value);
+  },
   async commit(endpoint, key, replacing) {
     await localState.update(PREFIX + normalizeEndpoint(endpoint), (stored) => {
       const pin = stored === undefined ? undefined : parsePin(stored);
@@ -48,6 +54,10 @@ export const serverPins: PinStore = {
   },
 };
 
+function checkPin(endpoint: string, candidate: string, pin: ServerPin | undefined, replacing?: string): void {
+  if (pin && pin.server_pk !== candidate && !(replacing !== undefined && pin.server_pk === replacing)) throw new ServerIdentityChanged(endpoint, pin.server_pk, candidate, "pin");
+}
+
 /** Before the hello: `candidate` must match the invite's key and the pin (or be the accepted replacement of it). */
 export function checkCandidate(endpoint: string, candidate: string, store: PinStore, inviteKey?: string, replacing?: string): void {
   serverPublicKey(candidate);
@@ -55,6 +65,14 @@ export function checkCandidate(endpoint: string, candidate: string, store: PinSt
     decodeFixed(inviteKey, 32);
     if (inviteKey !== candidate) throw new ServerIdentityChanged(endpoint, inviteKey, candidate, "invite");
   }
-  const pin = store.load(endpoint);
-  if (pin && pin.server_pk !== candidate && !(replacing !== undefined && pin.server_pk === replacing)) throw new ServerIdentityChanged(endpoint, pin.server_pk, candidate, "pin");
+  checkPin(endpoint, candidate, store.load(endpoint), replacing);
+}
+
+/**
+ * The same check against the pin as stored now, right before signing: this tab's view may miss another
+ * tab's change (a lost notification), and a hello signed for a key the user replaced would disclose this
+ * identity to it. The commit after the proof checks again, in its own transaction.
+ */
+export async function checkStoredCandidate(endpoint: string, candidate: string, store: PinStore, replacing?: string): Promise<void> {
+  checkPin(endpoint, candidate, await store.loadStored(endpoint), replacing);
 }

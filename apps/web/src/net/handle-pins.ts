@@ -14,7 +14,8 @@ import { localState } from "../lib/local-state";
  *
  * Another tab's acceptance normally arrives by broadcast, but nothing here depends on it: while statuses are
  * shown the pins are read again from the database every `REFRESH_MS`, and a view of them older than
- * `MAX_AGE_MS` (the reads failed, or the tab slept) shows every handle as pending until a read succeeds.
+ * `MAX_AGE_MS` (the reads failed or are stuck, or the tab slept) shows every handle as pending until a read
+ * succeeds; listeners are told when that age is reached, whatever the reads are doing.
  */
 export type HandleStatus = "verified" | "changed";
 
@@ -27,6 +28,7 @@ export const MAX_AGE_MS = 30_000;
 let version = 0;
 let refreshing: Promise<void> | undefined;
 let scheduled: ReturnType<typeof setTimeout> | undefined;
+let expiry: ReturnType<typeof setTimeout> | undefined;
 const listeners = new Set<() => void>();
 
 function notify() {
@@ -56,15 +58,26 @@ function refresh(): void {
   });
 }
 
-/** Whether the view of the pins is recent enough to show; keeps it so while statuses are being shown. */
+const unref = (timer: ReturnType<typeof setTimeout>) => (timer as { unref?: () => void }).unref?.();
+
+/**
+ * Whether the view of the pins is recent enough to show; keeps it so while statuses are being shown. Its
+ * expiry is a timer of its own: listeners hear of it when the view gets too old, even while a read is still
+ * queued behind another transaction (they then show every handle as pending).
+ */
 function fresh(): boolean {
   const age = Date.now() - localState.checkedAt(PREFIX);
   if (age >= REFRESH_MS) refresh();
   else if (scheduled === undefined) {
     scheduled = setTimeout(() => { scheduled = undefined; refresh(); }, REFRESH_MS - age);
-    (scheduled as { unref?: () => void }).unref?.();
+    unref(scheduled);
   }
-  return age <= MAX_AGE_MS;
+  const shown = age <= MAX_AGE_MS;
+  if (shown && expiry === undefined) {
+    expiry = setTimeout(() => { expiry = undefined; notify(); }, MAX_AGE_MS - age + 1);
+    unref(expiry);
+  }
+  return shown;
 }
 
 /**
@@ -109,6 +122,7 @@ localState.subscribe((key) => { if (key === null || key.startsWith(PREFIX)) noti
 /** Tests only. */
 export function resetHandlePins() {
   if (scheduled !== undefined) clearTimeout(scheduled);
-  scheduled = undefined;
+  if (expiry !== undefined) clearTimeout(expiry);
+  scheduled = expiry = undefined;
   version++;
 }

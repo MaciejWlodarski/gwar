@@ -1,6 +1,6 @@
 import { MessageVerificationCache } from "../net/message-verification-cache";
 import { messageStorage } from "../net/message-storage";
-import { withChannelLifecycle } from "../net/channel-lifecycle";
+import { withFreshChannelLifecycle } from "../net/channel-lifecycle";
 import { MessageVerificationIndicator, MessageVerificationPending } from "./MessageVerification";
 import { messageFingerprint, fullyVerified, DELETION_TEXT, type MessageVerification } from "../net/message-signature";
 import { AlertCircle, ArrowDown, Check, Hash, Headphones, Loader2, Lock, Menu, Megaphone, MessageSquare, Paperclip, Pencil, RotateCw, Send, Trash2, Users, X } from "lucide-react";
@@ -437,7 +437,7 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
         });
       };
       await Promise.all(rows.map(async ({ msg, ctx, fingerprint }) => {
-        const state = withChannelLifecycle(await verifier.verify(msg, ctx), ctx.serverKey, ctx.target);
+        const state = await withFreshChannelLifecycle(await verifier.verify(msg, ctx), ctx.serverKey, ctx.target);
         if (!active) return;
         pending.push([msg.id, { fingerprint, state }]);
         timer ??= setTimeout(flush, 16);

@@ -21,36 +21,45 @@ const NAME = "This browser's Gwar security data";
 /** What version 1 of the app kept in localStorage, by key prefix: imported once. */
 export const LEGACY_LOCAL_STORAGE_PREFIXES = ["gwar.server-pin:", "gwar.channels:", "gwar.connect.handle-pin:", "gwar.connect.service-key:"];
 
-const IMPORT_ATTEMPTS = 5;
-
-/** The names of localStorage's entries of `LEGACY_LOCAL_STORAGE_PREFIXES`, sorted. */
-function legacyKeys(storage: Storage): string[] {
+/** Every name localStorage lists, by index; null if the listing is not coherent (a name missing or twice). */
+function allKeys(storage: Storage): string[] | null {
+  const length = storage.length;
   const keys: string[] = [];
-  for (let i = 0; i < storage.length; i++) {
+  for (let i = 0; i < length; i++) {
     const key = storage.key(i);
-    if (key !== null && LEGACY_LOCAL_STORAGE_PREFIXES.some((p) => key.startsWith(p))) keys.push(key);
+    if (key === null) return null;
+    keys.push(key);
   }
-  return keys.sort();
+  return new Set(keys).size === length ? keys : null;
 }
 
 /**
- * The entries localStorage holds for `LEGACY_LOCAL_STORAGE_PREFIXES`; a localStorage that fails to
- * read fails this. Another tab may change localStorage meanwhile, and a removal shifts the index the
- * names are listed by, so an entry could be missed: the names are listed first, the values read by
- * name, and then both read again. The import takes only a snapshot that read the same twice, and
- * fails (commits nothing, runs again on the next load) if it never gets one.
+ * The entries localStorage holds for `LEGACY_LOCAL_STORAGE_PREFIXES`, read in one synchronous pass:
+ * every name, then every value, with nothing awaited in between, so the pass sees one state.
+ *
+ * Why one pass is coherent: the HTML Standard leaves localStorage across processes unsynchronised
+ * ("authors are encouraged to assume that there is no locking mechanism",
+ * https://html.spec.whatwg.org/multipage/webstorage.html#the-localstorage-attribute), but the
+ * engines give a page a copy that other tabs' changes reach only between tasks: Chromium's
+ * renderer-side cache (blink CachedStorageArea) applies them from IPC messages run as tasks,
+ * Firefox's LSNG takes a snapshot (LSSnapshot) that holds until the current task ends, and
+ * WebKit's StorageAreaMap applies them from IPC messages on the main run loop. So another tab's
+ * change lands wholly before or after the pass. Only this page's own code could change the copy
+ * mid-pass, and none runs here; still, the pass checks at the end that the listing is complete and
+ * unchanged, and otherwise fails the upgrade (nothing is committed; the next load imports again).
+ * A localStorage that fails to read fails it the same way.
  */
 function legacyEntries(): [string, string][] {
   if (typeof localStorage === "undefined") return [];
-  for (let attempt = 0; attempt < IMPORT_ATTEMPTS; attempt++) {
-    const keys = legacyKeys(localStorage);
-    const values = keys.map((key) => localStorage.getItem(key));
-    const again = legacyKeys(localStorage);
-    const consistent = again.length === keys.length && again.every((key, i) => key === keys[i])
-      && values.every((value, i) => value !== null && localStorage.getItem(keys[i]!) === value);
-    if (consistent) return keys.map((key, i) => [key, values[i]!]);
+  const keys = allKeys(localStorage);
+  const legacy = (keys ?? []).filter((key) => LEGACY_LOCAL_STORAGE_PREFIXES.some((p) => key.startsWith(p)));
+  const entries = legacy.map((key): [string, string | null] => [key, localStorage.getItem(key)]);
+  const after = allKeys(localStorage);
+  const unchanged = keys !== null && after !== null && after.length === keys.length && after.every((key, i) => key === keys[i]);
+  if (!unchanged || entries.some(([, value]) => value === null)) {
+    throw new Error("Gwar's saved data in this browser changed while it was imported. Reload the page.");
   }
-  throw new Error("Gwar's saved data in this browser kept changing while it was imported. Reload the page.");
+  return entries as [string, string][];
 }
 
 /**
@@ -81,10 +90,16 @@ export interface LocalState {
   load(): Promise<void>;
   /** The value as last committed or read; throws while the database cannot be used. */
   get(key: string): string | undefined;
-  /** When the entries under `prefix` were last read from the database (ms, `Date.now`); 0 if they cannot be. */
+  /**
+   * When the entries under `prefix` (or the key `prefix`) were last read from the database (ms,
+   * `Date.now`): by `load`, `refresh` of that prefix or of everything, or a `read` or `update` of that
+   * key; 0 if they cannot be.
+   */
   checkedAt(prefix: string): number;
   /** Reads the entries under `prefix` (all by default) again from the database. Rejects if it cannot. */
   refresh(prefix?: string): Promise<void>;
+  /** Reads `key` again from the database (a transaction) and returns it. Rejects if it cannot. */
+  read(key: string): Promise<string | undefined>;
   /** One transaction; resolves with the value stored after it, once committed. */
   update(key: string, change: LocalStateChange): Promise<string | undefined>;
   /** Called with a key that changed (here or in another tab), or null for everything. */
@@ -161,7 +176,8 @@ export function createLocalState(name = LOCAL_STATE_DATABASE, migrations: readon
       if (value === undefined) current.delete(key); else current.set(key, value);
       changed.push(key);
     }
-    if ("prefix" in target) checked.set(target.prefix, Math.max(checked.get(target.prefix) ?? 0, started));
+    const scopeName = "key" in target ? target.key : target.prefix;
+    checked.set(scopeName, Math.max(checked.get(scopeName) ?? 0, started));
     for (const key of changed) notify(key);
   }
   const quietly = (target: { key: string } | { prefix: string }) => { reread(target).catch(() => { /* failed: see `error` */ }); };
@@ -215,7 +231,12 @@ export function createLocalState(name = LOCAL_STATE_DATABASE, migrations: readon
       return Math.max(checked.get("") ?? 0, checked.get(prefix) ?? 0);
     },
     refresh: (prefix = "") => reread({ prefix }),
+    async read(key) {
+      await reread({ key });
+      return usable().view.get(key);
+    },
     async update(key, change) {
+      const started = Date.now();
       const tx = transaction("readwrite");
       let changed = false;
       const stored = await new Promise<string | undefined>((resolve, reject) => {
@@ -245,6 +266,8 @@ export function createLocalState(name = LOCAL_STATE_DATABASE, migrations: readon
       // Committed: memory follows, and other tabs read it again.
       const { view: current } = usable();
       if (stored === undefined) current.delete(key); else current.set(key, stored);
+      // The transaction read the stored value: this key is as fresh as its start.
+      checked.set(key, Math.max(checked.get(key) ?? 0, started));
       if (changed) { channel?.postMessage({ key }); ping(key); }
       notify(key);
       return stored;

@@ -1182,6 +1182,9 @@ describe("channel id reuse", () => {
     // The device's security state (lib/local-state.ts), as a map whose writes can be refused.
     const { localState } = await import("../lib/local-state");
     const get = vi.spyOn(localState, "get").mockImplementation((k) => store.get(k));
+    // A map is always fresh: reading it again changes nothing.
+    const checkedAt = vi.spyOn(localState, "checkedAt").mockImplementation(() => Date.now());
+    const read = vi.spyOn(localState, "read").mockImplementation(async (k) => store.get(k));
     const update = vi.spyOn(localState, "update").mockImplementation(async (k, change) => {
       const next = change(store.get(k));
       if (next === undefined) return store.get(k);
@@ -1220,7 +1223,7 @@ describe("channel id reuse", () => {
       // Under churn every other server's record is unsaved too: past the bound the whole session is uncertain.
       expect(result).toMatchObject({ status: "verified", authorization: [mode === "churn" ? "channel-history-incomplete" : "channel-reused"] });
       expect(fullyVerified(result)).toBe(false);
-    } finally { vi.unstubAllGlobals(); get.mockRestore(); update.mockRestore(); }
+    } finally { vi.unstubAllGlobals(); get.mockRestore(); update.mockRestore(); checkedAt.mockRestore(); read.mockRestore(); }
   });
 });
 

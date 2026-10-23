@@ -133,6 +133,28 @@ describe("handle continuity", () => {
         await vi.waitFor(() => expect(pins.handleStatus("alice", "B")).toBe("verified"));
       } finally { vi.useRealTimers(); }
     });
+    it("withdraws verification when the view gets too old, even while a read is stuck (Sol r6 probe, inverted)", async () => {
+      await acceptedElsewhere();
+      // Another connection's readwrite transaction that keeps going: this tab's reads queue behind it.
+      const db = await new Promise<IDBDatabase>((resolve, reject) => {
+        const r = indexedDB.open("gwar-local");
+        r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error);
+      });
+      let hold = true;
+      const store = db.transaction("entries", "readwrite").objectStore("entries");
+      const keepActive = () => { const r = store.get("hold"); r.onsuccess = () => { if (hold) keepActive(); }; };
+      keepActive();
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        pins.resetHandlePins();
+        const rendered = { status: pins.handleStatus("alice", "A") };
+        const unsubscribe = pins.subscribeHandlePins(() => { rendered.status = pins.handleStatus("alice", "A"); });
+        expect(rendered.status).toBe("verified");
+        await vi.advanceTimersByTimeAsync(pins.MAX_AGE_MS + 1);
+        unsubscribe();
+        expect(rendered.status).toBe("pending");
+      } finally { hold = false; db.close(); pins.resetHandlePins(); vi.useRealTimers(); }
+    });
     it("hears of another tab's change through the localStorage ping", async () => {
       await acceptedElsewhere();
       const changed = localStorage.getItem("gwar-local.changed");

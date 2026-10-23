@@ -18,9 +18,17 @@ export interface ChannelLifecycle {
   observe(serverKey: string, ids: number[]): void;
   created(serverKey: string, id: number): void;
   deleted(serverKey: string, id: number): void;
-  /** `reused`: this id was seen deleted; `unknown`: the record is incomplete; `ok`: neither. */
+  /**
+   * `reused`: this id was seen deleted; `unknown`: the record is incomplete, or this tab's view of it is
+   * older than `MAX_AGE_MS` (another tab may have stored a deletion it was not told of); `ok`: neither.
+   */
   check(serverKey: string, id: number): "ok" | "reused" | "unknown";
+  /** Reads the record again from the database (a transaction); never rejects (a failure makes it unknown). */
+  refresh(serverKey: string): Promise<void>;
 }
+
+/** How old this tab's view of a record may be for `check` to answer from it. */
+export const MAX_AGE_MS = 30_000;
 
 /** Ids kept per server; an honest server has and deletes far fewer channels than this. */
 export const MAX_IDS = 10_000;
@@ -30,7 +38,13 @@ const PREFIX = "gwar.channels:";
 type Stored = { known: Set<number>; deleted: Set<number>; incomplete: boolean };
 /** What this tab knows and the database does not (yet). `writing`: a write is in flight; `dirty`: it changed since. */
 type Pending = Stored & { writing: boolean; dirty: boolean };
-type Store = { get(key: string): string | undefined; update(key: string, change: LocalStateChange): Promise<unknown> };
+/** The security state, or a test's map (always fresh: it has no `checkedAt`). */
+type Store = {
+  get(key: string): string | undefined;
+  update(key: string, change: LocalStateChange): Promise<unknown>;
+  checkedAt?(key: string): number;
+  read?(key: string): Promise<unknown>;
+};
 
 const isIds = (v: unknown): v is number[] =>
   Array.isArray(v) && v.length <= MAX_IDS && v.every((n) => Number.isSafeInteger(n) && n >= 0);
@@ -97,6 +111,22 @@ export function channelLifecycle(given?: Store): ChannelLifecycle {
     }
     return p;
   };
+  const stale = (serverKey: string) => {
+    const store = storage();
+    return store.checkedAt !== undefined && Date.now() - store.checkedAt(PREFIX + serverKey) > MAX_AGE_MS;
+  };
+  // One read per record at a time: a screen of messages verifies at once.
+  const reading = new Map<string, Promise<void>>();
+  const refresh = (serverKey: string): Promise<void> => {
+    let read = reading.get(serverKey);
+    if (!read) {
+      read = (async () => {
+        try { await storage().read?.(PREFIX + serverKey); } catch { /* unusable: the record reads as incomplete */ }
+      })().finally(() => reading.delete(serverKey));
+      reading.set(serverKey, read);
+    }
+    return read;
+  };
   const isDeleted = (serverKey: string, id: number) => stored(serverKey).deleted.has(id) || !!pending.get(serverKey)?.deleted.has(id);
   const save = (serverKey: string, p: Pending) => {
     for (const id of p.deleted) p.known.delete(id);
@@ -157,18 +187,30 @@ export function channelLifecycle(given?: Store): ChannelLifecycle {
     check(serverKey, id) {
       const s = stored(serverKey), p = touch(serverKey);
       if (s.deleted.has(id) || p?.deleted.has(id)) return "reused";
+      if (stale(serverKey)) {
+        void refresh(serverKey);
+        return "unknown";
+      }
       return s.incomplete || p?.incomplete || uncertain ? "unknown" : "ok";
     },
+    refresh,
   };
 }
 
 export const channels = channelLifecycle();
 
-/** A message in a channel whose id this client saw deleted, or whose record is incomplete, is qualified: its
- *  signature may come from a deleted channel. */
+/** A message in a channel whose id this client saw deleted, or whose record is incomplete (or not read
+ *  recently enough), is qualified: its signature may come from a deleted channel. */
 export function withChannelLifecycle(v: MessageVerification, serverKey: string, target: string, lifecycle: ChannelLifecycle = channels): MessageVerification {
   const m = /^channel:(\d+)$/.exec(target);
   if (!m || v.status !== "verified" || !serverKey) return v;
   const state = lifecycle.check(serverKey, Number(m[1]));
   return state === "ok" ? v : { ...v, authorization: [...v.authorization, state === "reused" ? "channel-reused" : "channel-history-incomplete"] };
+}
+
+/** {@link withChannelLifecycle} after reading the server's record again from the database: what verifying a
+ *  message uses, so another tab's deletion counts even when no notification of it arrived. */
+export async function withFreshChannelLifecycle(v: MessageVerification, serverKey: string, target: string, lifecycle: ChannelLifecycle = channels): Promise<MessageVerification> {
+  if (v.status === "verified" && serverKey && /^channel:\d+$/.test(target)) await lifecycle.refresh(serverKey);
+  return withChannelLifecycle(v, serverKey, target, lifecycle);
 }

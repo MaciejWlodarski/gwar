@@ -9,7 +9,7 @@ import { encodeRequest, parseFrame, type ParsedFrame } from "./frames";
 import type { Identity } from "./identity";
 import type { Hello } from "../proto/Hello";
 import { certificateHash, decodeFixed, helloStatement, newNonce, normalizeEndpoint, verifyProof } from "./handshake";
-import { checkCandidate, serverPins, ServerIdentityChanged, type PinStore } from "./server-pins";
+import { checkCandidate, checkStoredCandidate, serverPins, ServerIdentityChanged, type PinStore } from "./server-pins";
 import { LocalStateUnavailableError } from "../lib/local-state";
 import { NewerDataError } from "../lib/stored-data";
 import { isPlaintextRemote } from "./address";
@@ -513,6 +513,7 @@ export class Connection implements Link {
       client,
     };
     if ([nickname, client.name, client.version].some((value) => /[\r\n]/.test(value))) throw new Error("invalid hello metadata");
+    await checkStoredCandidate(endpoint, challenge.server_pk, pins, replacing);
     current();
     hello.signature = await identity.sign(new TextEncoder().encode(helloStatement(hello)));
     decodeFixed(hello.signature, 64);

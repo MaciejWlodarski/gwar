@@ -1,6 +1,7 @@
 import "fake-indexeddb/auto";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { channelLifecycle, MAX_IDS, withChannelLifecycle } from "./channel-lifecycle";
+import { channelLifecycle, MAX_AGE_MS, MAX_IDS, withChannelLifecycle, withFreshChannelLifecycle } from "./channel-lifecycle";
+import { fullyVerified } from "./message-signature";
 import { createLocalState, type LocalState } from "../lib/local-state";
 import type { MessageVerification } from "./message-signature";
 
@@ -175,6 +176,39 @@ describe("channel records in the device's security state, with other tabs", () =
     // Before any write has committed, this tab knows its own deletion.
     expect(mine.check("server", 1)).toBe("reused");
     await vi.waitFor(() => expect([mine.check("server", 1), mine.check("server", 2)]).toEqual(["reused", "reused"]));
+  });
+  describe("without notifications from other tabs", () => {
+    afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+    /** Another tab stores a deletion of channel 5, and this tab is never told. */
+    async function deletedElsewhere() {
+      vi.stubGlobal("BroadcastChannel", undefined);
+      const [a, b] = await tabs();
+      const mine = channelLifecycle(a), other = channelLifecycle(b);
+      mine.observe("server", [5, 6]);
+      await vi.waitFor(() => expect(a.get("gwar.channels:server")).toBeDefined());
+      await b.refresh();
+      other.deleted("server", 5);
+      await vi.waitFor(() => expect(record(b).deleted).toContain(5));
+      expect(record(a).deleted).not.toContain(5);
+      return { a, mine };
+    }
+    it("verifying a message reads the record again first", async () => {
+      const { mine } = await deletedElsewhere();
+      const v = await withFreshChannelLifecycle(ok, "server", "channel:5", mine);
+      expect(v.authorization).toEqual(["channel-reused"]);
+      expect(fullyVerified(v)).toBe(false);
+    });
+    it("an answer from a view older than its bound is not clean (Sol r6 probe, inverted)", async () => {
+      const { a, mine } = await deletedElsewhere();
+      vi.spyOn(Date, "now").mockReturnValue(Date.now() + 120_000);
+      // Reading other entries (the handle pins' poll) does not make this record fresh.
+      await a.refresh("gwar.connect.handle-pin:");
+      expect(fullyVerified(withChannelLifecycle(ok, "server", "channel:5", mine))).toBe(false);
+      expect(mine.check("server", 6)).toBe("unknown");
+      expect(MAX_AGE_MS).toBeLessThan(120_000);
+      // The stale answer started a read: once it lands, the deletion counts.
+      await vi.waitFor(() => expect(mine.check("server", 5)).toBe("reused"));
+    });
   });
   it("a record already read fails closed once the database cannot be used (Sol r5 probe, inverted)", async () => {
     const [a, , name] = await tabs();

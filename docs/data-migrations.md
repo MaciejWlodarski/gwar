@@ -189,25 +189,34 @@ IndexedDB (`lib/local-state.ts`).
   stored; and a channel record is merged with the stored one (ids known and
   deleted are unions; "incomplete" sticks). Memory changes only once the
   transaction has committed, and the connection uses a new server key only after
-  its pin has. Channel checks read the record as the view holds it now, plus
-  what this tab has not stored yet.
+  its pin has, and right before signing the hello the connection checks the
+  candidate against the pin as stored then (a transaction), so a tab that
+  missed another tab's replacement does not disclose its identity to the
+  replaced key. Verifying a channel message first reads that server's channel
+  record again (a transaction), and checks it with what this tab has not stored
+  yet; a view of a record older than 30 s answers "incomplete" until read again.
 - **Tabs.** After a commit the tab posts the key (no data) on a BroadcastChannel
   named after the database, and writes it to the localStorage ping
   `gwar-local.changed` (the key and a nonce, no data); the others read that key
   again from IndexedDB. Neither is relied on: a tab reads everything again when
   it regains focus or becomes visible, and the handle badges read the handle
   pins again every 10 s while shown; a view of them older than 30 s shows every
-  handle as pending. Transactions on the store run in the order they were
+  handle as pending, and a timer of its own tells the badges when that age is
+  reached, even while a read is still queued. Transactions on the store run in the order they were
   created, so when two tabs write the same key the one created last wins, in
   every tab and after a reload.
 - **Import.** Step 1 of `LOCAL_STATE_MIGRATIONS` creates the store and copies the
   localStorage entries of version 1 (`LEGACY_LOCAL_STORAGE_PREFIXES`), inside the
   version-change transaction: the import commits with the database or not at all,
-  and an interrupted one runs again whole on the next load. It lists the entry
-  names first, reads the values by name, then lists and reads them again, and
-  takes only a snapshot that read the same twice (another tab's removal shifts
-  the index names are listed by); after five changing attempts it fails.
-  localStorage that cannot be read, or keeps changing, aborts it the same way. The originals are left in localStorage,
+  and an interrupted one runs again whole on the next load. It reads every
+  name and every value in one synchronous pass. The HTML Standard leaves
+  localStorage unsynchronised across processes, but Chromium (its renderer-side
+  cache), Firefox (LSNG snapshots, held until the task ends) and WebKit (its
+  StorageAreaMap) apply other tabs' changes to a page's copy only between tasks,
+  so one pass sees one state. Only the page's own code could change the copy
+  mid-pass; the pass still checks at the end that the listing is complete and
+  unchanged, and otherwise aborts. localStorage that cannot be read aborts it
+  the same way. The originals are left in localStorage,
   unused: a tab of version 1 still open may write them, and nothing reads that.
 - **Fail closed.** No IndexedDB, a database of a newer version, another tab
   upgrading it (`onversionchange`: this tab closes its connection and lets the

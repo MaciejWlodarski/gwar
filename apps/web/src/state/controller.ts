@@ -13,7 +13,7 @@ import { messageTarget } from "../lib/chat";
 import { uploadAttachment, localAttachmentMetadata, imageHints } from "../net/attachment";
 import { sealFile, SEALED_FILE_OVERHEAD, SEALED_MIME, SEALED_NAME } from "../net/sealed-file";
 import type { ServerIdentityChanged } from "../net/server-pins";
-import { channels as channelLifecycle, withChannelLifecycle } from "../net/channel-lifecycle";
+import { channels as channelLifecycle, withFreshChannelLifecycle } from "../net/channel-lifecycle";
 import { signMessage, sha256, MessageVerifier, fullyVerified, DELETION_TEXT, invalidVerification, sameMessageIdentity, notificationAllowed } from "../net/message-signature";
 import type { Attachment } from "../proto/Attachment";
 import type { MessageSignature } from "../proto/MessageSignature";
@@ -1841,7 +1841,7 @@ class Controller {
       const item = state.threads[sealed]?.items.find(i => i.kind === "msg" && i.msg.id === msg.id);
       if (item?.kind !== "msg" || !item.sealed) return invalidVerification();
       const serverKey = conn?.serverKey ?? "", target = item.sealed.conversation;
-      return withChannelLifecycle(await this.verifier.verify(msg, { serverKey, target,
+      return await withFreshChannelLifecycle(await this.verifier.verify(msg, { serverKey, target,
         participants: sealed.startsWith("dm:") ? [me!, sealed.slice(3)] : undefined, sealed: { group: item.sealed.group, epoch: item.sealed.epoch } }), serverKey, target);
     }
     else if (msg.target === "server") thread = "server";
@@ -1854,7 +1854,7 @@ class Controller {
       thread = `dm:${peer}`;
     }
     const ctx = { serverKey: conn?.serverKey ?? "", target: messageTarget(thread, msg.author_uid, me), participants: thread.startsWith("dm:") ? [me!, thread.slice(3)] as const : undefined };
-    return withChannelLifecycle(await this.verifier.verify(msg, ctx), ctx.serverKey, ctx.target);
+    return await withFreshChannelLifecycle(await this.verifier.verify(msg, ctx), ctx.serverKey, ctx.target);
   }
 
   private async checkedHistory(messages: ChatMessage[], channel: number): Promise<{ accepted: ChatMessage[]; authentic: boolean[] }> {
