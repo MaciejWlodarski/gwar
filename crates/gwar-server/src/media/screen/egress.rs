@@ -211,7 +211,7 @@ pub struct Lane {
     key: Option<u32>,
     failed: Option<u32>,
     failures: VecDeque<Instant>,
-    /// Until then (`RAMP` after the share was assigned) failures and averages do not count.
+    /// Until then (`RAMP` after assignment or an estimator restart) failures and averages do not count.
     ramp: Option<Instant>,
     over_since: Option<Instant>,
     fits_since: Option<Instant>,

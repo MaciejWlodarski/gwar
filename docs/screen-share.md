@@ -1235,6 +1235,22 @@ still enabled. The 1 ms voice case keeps its 10 ms bound; the 5/10 ms steady and
 startup bounds remain the existing cadence-plus-margin formulas. VM gate
 thresholds are unchanged.
 
+Local validation of this fix used `-j 4` and a disposable target directory under
+`/tmp`. The unchanged intermittent-stall test passed 20/20 isolated process
+runs (140 restored-link checks), with identical recovery traces. Three additional
+isolated replay tests produced the same media/estimate fingerprint. The seeded
+pre-fix test failed 3/3 times with the main-CI pause sequence. The complete
+default-feature server unit suite passed 391 tests in 51.12 s using four test
+threads, with the three full matrices explicitly ignored there. All full matrices
+passed separately: 96 voice cases in 58.49 s, 60 startup cases in 36.20 s and
+70 collapse cases in 284.31 s. These are local timings, not GitHub runner timings.
+The 95 default screen unit tests, 10 screen integration tests, 15 watch-link
+integration tests, 11 CI-selection/aggregate tests, workspace/vendor formatting,
+server all-targets clippy with `-D warnings`, and
+`cargo check -p gwar-server --no-default-features --tests` passed. A production
+library check with the simulation feature disabled also passed. The temporary
+target is removed after validation; no VM was accessed.
+
 Results and deviations:
 
 - **A bandwidth collapse** from 10 to 1 Mbps mid-share: no original is sent
