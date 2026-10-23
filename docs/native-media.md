@@ -319,7 +319,9 @@ AV1 is unavailable. Its profile, level and SFrame rules below still apply.
 
 The SFU reads only enough of each RTP payload to find frame and keyframe
 starts, as it does for VP9 and VP8 (`describe` in
-`media/screen/ingress.rs`, PR 3a). For H.264
+`media/screen/ingress.rs`, PR 3a). The H.264 payload parser (A1) is built in
+`media/screen/h264.rs`; transport integration and confirmation remain A2.
+For H.264
 ([RFC 6184](https://www.rfc-editor.org/rfc/rfc6184)):
 
 - The NAL unit type is the low 5 bits of the first payload byte.
@@ -1522,18 +1524,22 @@ round of their own, as voice 5c/5d had.
 
 ### Track A: SFU and protocol
 
-**A1. H.264 payload parser ★** (S)
-- Builds: `describe` for H.264 in `media/screen/ingress.rs`: single NAL,
+**A1. H.264 payload parser ★** (S) — **built**
+- Built: `describe` for H.264 in `media/screen/h264.rs`, reusing
+  `ingress::Descriptor`: single NAL,
   STAP-A and FU-A; frame start, keyframe candidate (SPS first), IDR slice
   start, the presence of a PPS, the three SPS profile and level bytes, and
   malformed payloads ([SFU payload handling](#sfu-payload-handling-a1-a2)).
-  No negotiation and no confirmation yet.
+  The caller supplies frame start from RTP timestamp tracking; the parser
+  also reports non-IDR slice starts for A2. Fragmented SPSs are not candidates
+  and expose no profile bytes without reassembly. No negotiation, confirmation
+  or transport integration yet.
 - Depends on: PR 3a (#136).
 - Acceptance: unit vectors for each packet kind, including a STAP-A with SPS
   and PPS, an FU-A IDR start and continuation, a truncated STAP-A, an FU-A
   with S and E set, and reserved types. Parsing never reads past the payload
-  (a fuzz test over random bytes).
-- Now: yes.
+  (a deterministic seeded fuzz-style test over random bytes and truncations).
+- Status: built; A2 integration remains separate.
 
 **A1b. AV1 payload parser ★** (S)
 - Builds: bounded aggregation-header/OBU parsing, frame-start metadata and

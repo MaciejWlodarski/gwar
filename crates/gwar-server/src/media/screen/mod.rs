@@ -13,6 +13,7 @@
 
 pub mod av1;
 pub mod dependency_descriptor;
+pub mod h264;
 mod ingress;
 mod segment;
 
