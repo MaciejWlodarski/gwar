@@ -18,10 +18,9 @@ use super::time::{TimeDelta, Timestamp};
 /// Estimation of an assumed Bernoulli distribution. This allows it to distinguish congestion
 /// induced loss from this inherent loss.
 ///
-/// The controller integrates with ALR (Application Limited Region) detection and link capacity
-/// tracking. When in ALR, it uses proven link capacity from successful ALR probes as an upper
-/// bound on estimates, preventing overestimation in application-limited scenarios. When
-/// transitioning into or out of ALR, the controller resets its observation window to avoid
+/// The controller integrates with ALR (Application Limited Region) detection. The ACK rate of
+/// an application-limited sender is not a capacity candidate. When transitioning into or out
+/// of ALR, the controller resets its observation window to avoid
 /// mixing traffic patterns from different network utilization regimes.
 ///
 /// The estimate is bounded by the output of the delay-based estimator, meaning this controller
@@ -85,9 +84,6 @@ pub struct LossController {
     /// ALR start time (None if not in ALR)
     alr_start_time: Option<Instant>,
 
-    /// Link capacity estimate from probes during ALR
-    link_capacity_estimate: Option<Bitrate>,
-
     /// Previous ALR state to detect transitions
     was_in_alr: bool,
 }
@@ -144,7 +140,6 @@ impl LossController {
             last_hold_info: HoldInfo::default(),
 
             alr_start_time: None,
-            link_capacity_estimate: None,
             was_in_alr: false,
 
             config,
@@ -199,11 +194,6 @@ impl LossController {
 
         self.alr_start_time = alr_start;
         self.was_in_alr = is_in_alr;
-    }
-
-    /// Set link capacity estimate from successful ALR probes.
-    pub fn set_link_capacity_estimate(&mut self, capacity: Option<Bitrate>) {
-        self.link_capacity_estimate = capacity;
     }
 
     /// Check if currently in ALR state
@@ -510,7 +500,10 @@ impl LossController {
 
         let candidate_bandwidth_upper_bound = self.get_candidate_bandwidth_upper_bound().as_f64();
 
-        if self.config.append_acknowledged_rate_candidate && self.acknowledged_bitrate.is_valid() {
+        if self.config.append_acknowledged_rate_candidate
+            && self.acknowledged_bitrate.is_valid()
+            && !self.is_in_alr()
+        {
             bandwidths.push(
                 (self.acknowledged_bitrate * self.config.bandwidth_backoff_lower_bound_factor)
                     .as_f64(),
@@ -696,16 +689,6 @@ impl LossController {
 
     fn get_candidate_bandwidth_upper_bound(&self) -> Bitrate {
         let mut upper_bound = self.max_bitrate;
-
-        // When in ALR and we have a link capacity estimate from probes,
-        // use it as the upper bound. This prevents estimating beyond proven capacity.
-        if self.is_in_alr() {
-            if let Some(capacity) = self.link_capacity_estimate {
-                if capacity.is_valid() {
-                    upper_bound = upper_bound.min(capacity);
-                }
-            }
-        }
 
         if self.is_bandwidth_limited_due_to_loss()
             && self.bandwidth_limit_in_current_window.is_valid()
@@ -1164,6 +1147,38 @@ mod test {
             "Estimate should increase to delay based estimate, but not further"
         );
         assert_eq!(state, LossControllerState::DelayBased);
+    }
+
+    #[test]
+    fn sparse_alr_feedback_with_one_percent_loss_preserves_capacity() {
+        let now = Instant::now();
+        let mut controller = LossController::new();
+        controller.set_bandwidth_estimate(Bitrate::mbps(6));
+        controller.set_acknowledged_bitrate(Bitrate::kbps(200));
+        controller.set_alr_start_time(Some(now));
+        let mut packets = PacketBuilder::new(now).num_packets(26).with_loss(0.01);
+        for _ in 0..60 {
+            let batch = packets.build_packets();
+            controller.update_bandwidth_estimate(&batch, Bitrate::mbps(8));
+            packets = packets.forward_time(Duration::from_millis(250));
+        }
+        let before = controller.loss_based_result().bandwidth_estimate.unwrap();
+        assert!(
+            before >= Bitrate::mbps(6),
+            "application-limited ACKs capped capacity at {before}"
+        );
+        packets = packets.with_loss(0.5);
+        for _ in 0..8 {
+            let batch = packets.build_packets();
+            controller.update_bandwidth_estimate(&batch, Bitrate::mbps(8));
+            packets = packets.forward_time(Duration::from_millis(250));
+        }
+        let after = controller.loss_based_result();
+        assert!(
+            after.bandwidth_estimate.unwrap() < before,
+            "real congestion must still back off"
+        );
+        assert_eq!(after.state, LossControllerState::Decreasing);
     }
 
     #[test]

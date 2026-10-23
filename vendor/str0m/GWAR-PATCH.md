@@ -112,8 +112,11 @@ Coarse scheduling allows two regular wakes plus 2 ms for distinct timestamps,
 within the existing byte reserve. Both rates survive BWE reset. Control traffic
 bypasses the RTP pacer; transports that do not opt in retain upstream behavior.
 Gwar enables this only on watch transports, at 90 % / 125 % of the current
-estimate in steady state, allowing short 200 % probes during the 10 s
-assignment/resume ramp and fully paused recovery. Independent voice transports keep their immediate path. Regressions
+estimate normally. Only the highest-priority share's cap, average and keyframe
+demand can raise the probe ceiling, bounded at 200 %. Idle gaps do not teach
+the shared pacer a coarse cadence. An active short probe keeps its dispatched
+rate: feeding its own partial estimate back into that measurement would report
+application backoff as lost capacity. Independent voice transports keep their immediate path. Regressions
 cover a burst of unpaced repairs, probes, transmission-time deadlines, and
 5 Mbps downlinks at 0-1 % loss with both steady video and voice queue checks.
 Additional changed upstream file: `src/pacer/mod.rs`.
@@ -126,6 +129,14 @@ Previously a successful probe could install a new estimate while retaining
 An induced-loss regression verifies this transition. Loss thresholds and the
 inherent-loss model are unchanged. Additional changed file:
 `src/bwe/loss_controller.rs`.
+
+The loss controller excludes application-limited ACK rates from its candidates,
+matching WebRTC's default ALR policy. The maximum successful ALR probe was
+incorrectly used as a hard capacity upper bound; that lower-bound observation
+could prevent later discovery. Its sole-purpose tracker and integration are
+removed (`src/bwe/link_capacity_estimator.rs`). Delay, loss and recovery-window
+bounds remain. A sparse-ACK/1% loss regression preserves demonstrated capacity,
+then verifies that actual 50% congestion still reduces the estimate.
 
 Shared-pacing probe configurations also limit gaps between local sends to 20 ms.
 The estimator retains ordered send timestamps (including known lost packets)

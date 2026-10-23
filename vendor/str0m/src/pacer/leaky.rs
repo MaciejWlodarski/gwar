@@ -98,6 +98,10 @@ impl Pacer for LeakyBucketPacer {
         self.next_poll_time = None;
 
         // This is called periodically and whenever packet is queued.
+        let was_backlogged = self
+            .queue_states
+            .iter()
+            .any(|queue| queue.snapshot.packet_count > 0);
         self.queue_states.clear();
         self.queue_states.extend(iter);
 
@@ -105,7 +109,9 @@ impl Pacer for LeakyBucketPacer {
 
         if !elapsed.is_zero() {
             self.wake_interval = elapsed.max(self.wake_interval.saturating_sub(elapsed / 20));
-            if elapsed <= Duration::from_millis(20) {
+            if (self.egress_rate.is_none() || was_backlogged)
+                && elapsed <= Duration::from_millis(20)
+            {
                 self.bounded_wake_interval =
                     elapsed.max(self.bounded_wake_interval.saturating_sub(elapsed / 20));
             }
@@ -559,6 +565,92 @@ mod test {
     use crate::rtp_::{DataSize, Mid, RtpHeader};
     use queue::{PacketKind, Queue, QueuedPacket};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn idle_time_does_not_enlarge_the_first_media_burst() {
+        let now = Instant::now();
+        let mut pacer = LeakyBucketPacer::new(Bitrate::mbps(100));
+        pacer.set_egress_pacing(Bitrate::mbps(4));
+        pacer.handle_timeout(now, std::iter::empty());
+        let at = now + Duration::from_millis(20);
+        let mut sent = 0;
+        loop {
+            let queue = QueueState {
+                midrid: MidRid("screen".into(), None),
+                unpaced: true,
+                use_for_padding: false,
+                snapshot: QueueSnapshot {
+                    created_at: at,
+                    byte_size: 120_000,
+                    packet_count: 100,
+                    first_unsent: Some(at),
+                    priority: QueuePriority::Media,
+                    ..Default::default()
+                },
+            };
+            pacer.handle_timeout(at, [queue].into_iter());
+            if pacer.poll_queue().is_none() {
+                break;
+            }
+            sent += 1;
+            pacer.register_send(at, DataSize::bytes(1200), MidRid("screen".into(), None));
+        }
+        assert!(
+            sent > 0 && sent <= 2,
+            "idle time minted a {sent}-packet burst"
+        );
+    }
+
+    #[test]
+    fn media_feedback_does_not_change_an_active_probe_plan() {
+        use crate::bwe_::ProbeKind;
+
+        let now = Instant::now();
+        let mut pacer = LeakyBucketPacer::new(Bitrate::mbps(100));
+        pacer.set_egress_pacing(Bitrate::mbps(4));
+        pacer.start_probe(
+            ProbeClusterConfig::new(0.into(), Bitrate::mbps(20), ProbeKind::Initial)
+                .with_duration(Duration::from_secs(1)),
+        );
+        let mut after_reduction = 0;
+        for millis in 0..50 {
+            let at = now + Duration::from_millis(millis);
+            if millis == 10 {
+                // Partial feedback changes ordinary media pacing. Slowing this
+                // measurement too would report our own backoff as lost capacity.
+                pacer.set_egress_pacing(Bitrate::mbps(2));
+            }
+            loop {
+                let queue = QueueState {
+                    midrid: MidRid("screen".into(), None),
+                    unpaced: true,
+                    use_for_padding: false,
+                    snapshot: QueueSnapshot {
+                        created_at: now,
+                        byte_size: 1_200_000,
+                        packet_count: 1000,
+                        first_unsent: Some(now),
+                        priority: QueuePriority::Media,
+                        ..Default::default()
+                    },
+                };
+                pacer.handle_timeout(at, [queue].into_iter());
+                if pacer.poll_queue().is_none() {
+                    break;
+                }
+                pacer.register_send(at, DataSize::bytes(1200), MidRid("screen".into(), None));
+                if millis >= 10 {
+                    after_reduction += 1200;
+                }
+            }
+        }
+        assert!(after_reduction > 0, "media still makes progress");
+        assert!(
+            after_reduction > 50_000,
+            "feedback changed the probe's measured send rate"
+        );
+        assert!(after_reduction <= 20_000_000 * 40 / 1000 / 8 + 2400);
+    }
 
     #[test]
     fn egress_ceiling_spreads_unpaced_repairs_and_probes() {

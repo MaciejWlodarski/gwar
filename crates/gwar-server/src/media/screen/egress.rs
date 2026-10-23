@@ -274,6 +274,7 @@ pub struct Egress {
     release_interval: Duration,
     originals: Bucket,
     extras: Bucket,
+    probe_need: f64,
     queued: usize,
     /// Whole seconds since `start` in which the extras bucket dropped something.
     dropped_seconds: VecDeque<u64>,
@@ -300,6 +301,7 @@ impl Egress {
                 now,
             ),
             extras: Bucket::new(extras_rate(estimate), extras_burst(estimate), now),
+            probe_need: 0.0,
             queued: 0,
             dropped_seconds: VecDeque::new(),
             start: now,
@@ -370,9 +372,21 @@ impl Egress {
         self.lanes.get(lane).and_then(|l| l.paused)
     }
 
-    /// At least one assigned share is still discovering capacity before pause decisions.
-    pub fn ramping(&self, now: Instant) -> bool {
-        self.lanes.iter().any(|lane| lane.assigned && lane.ramping(now))
+    /// Discover enough room for the highest-priority share. Lower-priority shares
+    /// must not force aggressive probes when this viewer can carry only one.
+    pub fn set_probe_need(&mut self, caps: &[u64], rates: &[ShareRate]) {
+        let first = (0..self.lanes.len()).filter(|&lane| self.lanes[lane].assigned).min_by_key(|&lane| self.rank(lane));
+        self.probe_need = first.map_or(0.0, |lane| {
+            let rate = rates.get(lane).copied().unwrap_or_default();
+            (DESIRED_HEADROOM * caps.get(lane).copied().unwrap_or(0) as f64)
+                .max(RESUME_HEADROOM * rate.average)
+                .max(rate.largest_keyframe as f64 * 8.0 / DEADLINE.as_secs_f64())
+                / PLAN
+        });
+    }
+
+    pub fn probe_rate(&self) -> u64 {
+        (PROBE_PACE * self.estimate).max(self.probe_need).min(2.0 * self.estimate) as u64
     }
 
     /// Every assigned slot is paused, at least one for bandwidth: no media feeds BWE.
@@ -397,6 +411,7 @@ impl Egress {
 
     /// The slot carries nothing any more.
     pub fn unassign(&mut self, lane: usize) {
+        self.probe_need = 0.0;
         self.clear(lane);
         if lane < self.lanes.len() {
             self.lanes[lane] = Lane::default();
@@ -408,6 +423,9 @@ impl Egress {
 
     /// The share on the viewer's stage gets first claim on the bandwidth.
     pub fn focus(&mut self, lane: Option<usize>) {
+        if self.focus != lane {
+            self.probe_need = 0.0;
+        }
         self.focus = lane;
     }
 
@@ -813,6 +831,23 @@ mod tests {
         }
         e.set_estimate(estimate, now);
         e
+    }
+
+    #[test]
+    fn discovery_uses_the_priority_shares_demand_without_amplifying_the_rest() {
+        let now = Instant::now();
+        let mut e = egress(5_000_000, 2, now);
+        let rates = [
+            ShareRate { average: 3_200_000.0, largest_keyframe: 158_000, ..Default::default() },
+            ShareRate { average: 8_500_000.0, largest_keyframe: 212_000, ..Default::default() },
+        ];
+        e.set_probe_need(&[4_000_000, 8_000_000], &rates);
+        assert_eq!(e.probe_rate(), 6_250_000, "a second share cannot force 2x probes");
+        e.set_estimate(2_500_000, now);
+        assert_eq!(e.probe_rate(), 5_000_000, "initial discovery stays within 2x");
+        e.focus(Some(1));
+        e.set_probe_need(&[4_000_000, 8_000_000], &rates);
+        assert_eq!(e.probe_rate(), 5_000_000, "larger priority demand remains bounded at 2x");
     }
 
     #[test]

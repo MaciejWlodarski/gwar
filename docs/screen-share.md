@@ -1040,9 +1040,9 @@ limit is a target, not a bound:
     `maybe_periodic_alr`);
   - when the estimate has stagnated for 15 s with unmet demand.
 
-  The vendored transport bounds dispatched probes at **1.25 × estimate**,
-  in steady state; startup and recovery allow 2× during capacity discovery.
-  This is a combined RTP rate: media
+  The default probe ceiling is **1.25 × estimate**. The highest-priority share's
+  demand can raise it to at most 2×; lower-priority shares cannot force that
+  increase. This is a combined RTP rate: media
   sent during a probe consumes its budget instead of adding to padding.
   Probes use a nominal 15 ms target. Coarse clocks allow two regular wakes
   plus 2 ms, still within the existing byte reserve, for usable timestamps. Their purpose
@@ -1056,12 +1056,15 @@ first probe. This adds a shared wire-byte debt to str0m's pacer, including
 streams marked unpaced, RTX and generated padding. It operates before SRTP
 output and TWCC accounting; neither delayed encrypted datagrams nor false send
 timestamps are needed. Ordinary screen RTP is limited to **0.9 × estimate**;
-short steady-state probes are limited to **1.25 × estimate**. During the
-10 s assignment/resume ramp, and while every assigned slot is bandwidth-paused,
-probes may use **2 × estimate** to discover keyframe room before admission can
-carry feedback. Queue pressure cannot raise these limits. Normal bursts allow 2 ms of the rate, with a one-MTU floor and
-one packet of rounding. Regular scheduler cadences up to 20 ms are allowed;
-long stalls do not earn extra burst credit. Voice has its own transport and
+short probes normally use **1.25 × estimate**. The actual ceiling is
+`min(2 × estimate, max(1.25 × estimate, N / 0.8))`, where `N` is the largest
+of 1.1× the highest-priority share's cap, 1.2× its measured average, and its
+largest keyframe divided by 400 ms, all in bits per second. This discovers
+keyframe room without letting a second share that cannot fit drive startup
+bursts. Queue pressure cannot raise these limits. Normal bursts allow 2 ms of
+the rate, with a one-MTU floor and one packet of rounding. Regular scheduler
+cadences up to 20 ms are learned only while RTP is queued: idle frame gaps
+cannot enlarge a later burst, and long stalls do not earn credit. Voice has its own transport and
 never waits in this screen pacer. Control traffic bypasses it.
 
 Pacing and TWCC use serialized SRTP bytes plus 48 bytes for IPv6/UDP, also on
@@ -1079,8 +1082,15 @@ with a local send gap above 20 ms are discarded as scheduler-stalled samples;
 they cannot turn a delayed callback into a capacity collapse. Known lost sends
 participate in this gap check, so random network loss does not masquerade as a
 local stall. Regular sends that queue downstream remain valid congestion samples.
-The setting and probe ceiling
-survive estimator resets and track each new estimate.
+The setting and probe ceiling survive estimator resets and track new estimates.
+An active short probe finishes its dispatched plan: changing its rate in response
+to its own partial feedback would turn application backoff into a false capacity
+measurement. Later clusters use the updated ceiling.
+
+Application-limited ACK throughput is not used as a capacity candidate. The
+previous maximum-of-probes tracker also no longer supplies a hard upper bound:
+proving one rate says the link can carry at least that rate, not that it cannot
+carry more. Delay and loss bounds still constrain growth and detect collapse.
 
 Gwar retains its independent socket-volume backstops. Each outgoing datagram is
 classified by its clear header, without decryption:
@@ -1387,8 +1397,8 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   transport sends zero non-control bytes in the 30 s final-unwatch simulation.
 
   The desired target is **at most 1.5 × the current estimate**; the actual
-  steady-state probe ceiling is **1.25 × estimate** (2× during the ramp and
-  stalled recovery). Both the estimator's probe plan and
+  default probe ceiling is **1.25 × estimate**, raised only for the priority
+  share's demand and bounded at 2×. Both the estimator's probe plan and
   its continuation threshold use the capped rate. A successful capped probe
   can therefore continue discovering capacity, without waiting for a result
   at the original higher target. The existing extras byte reserve also bounds

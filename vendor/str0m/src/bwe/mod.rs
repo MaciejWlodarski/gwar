@@ -25,7 +25,6 @@ mod acked_bitrate_estimator;
 mod alr_detector;
 pub(crate) mod api;
 mod delay;
-mod link_capacity_estimator;
 mod loss_controller;
 mod macros;
 mod probe;
@@ -35,7 +34,6 @@ mod time;
 use acked_bitrate_estimator::AckedBitrateEstimator;
 use alr_detector::AlrDetector;
 use delay::DelayController;
-use link_capacity_estimator::LinkCapacityEstimator;
 use loss_controller::{LossController, LossControllerState};
 use macros::log_loss;
 use smoother::EstimateSmoother;
@@ -165,7 +163,6 @@ struct SendSideBandwidthEstimator {
     probe_estimator: ProbeEstimator,
     started_at: Option<Instant>,
     alr_detector: AlrDetector,
-    link_capacity_estimator: LinkCapacityEstimator,
     last_updated_estimate: Option<Bitrate>,
 }
 
@@ -188,7 +185,6 @@ impl SendSideBandwidthEstimator {
             probe_estimator: ProbeEstimator::new(),
             started_at: None,
             alr_detector,
-            link_capacity_estimator: LinkCapacityEstimator::new(),
             last_updated_estimate: None,
         }
     }
@@ -217,16 +213,8 @@ impl SendSideBandwidthEstimator {
 
         // Feed records to probe estimator for analysis and process any new probe results
         let mut latest_probe_result = None;
-        for (config, bitrate) in self.probe_estimator.update(send_records.iter().copied()) {
+        for (_, bitrate) in self.probe_estimator.update(send_records.iter().copied()) {
             latest_probe_result = Some(bitrate);
-
-            // Update link capacity estimator for every successful ALR probe, not just the latest.
-            // The estimator internally takes the max of all probe results, building up knowledge
-            // of proven link capacity. This differs from the delay controller, which only receives
-            // the latest probe result (matching WebRTC's FetchAndResetLastEstimatedBitrate behavior).
-            if config.is_alr_probe() {
-                self.link_capacity_estimator.update_from_probe(bitrate, now);
-            }
         }
 
         let mut acked_packets = vec![];
@@ -343,11 +331,6 @@ impl SendSideBandwidthEstimator {
         }
 
         self.loss_controller.set_alr_start_time(alr_start_time);
-
-        // Get link capacity estimate and forward to loss controller.
-        let link_capacity = self.link_capacity_estimator.capacity_estimate(now);
-        self.loss_controller
-            .set_link_capacity_estimate(link_capacity);
 
         // Clean up expired probe cluster state
         self.probe_estimator.handle_timeout(now);

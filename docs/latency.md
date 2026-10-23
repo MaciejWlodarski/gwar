@@ -348,15 +348,17 @@ python3 -B scripts/latency/screen_gate.py --binary target/release/examples/laten
 
 The viewer transport paces originals, RTX and probes together before TWCC send
 timestamps are assigned: ordinary screen RTP at 90 % of estimated wire capacity,
-short steady-state probes at no more than 125 %. Startup, the 10 s resume ramp
-and fully paused recovery may probe at 200 % for capacity discovery. Clusters
-are at least one second apart. Probe feedback includes SRTP and
+short probes normally at 125 %. Only the priority share's cap, average and
+keyframe demand can raise that ceiling, bounded at 200 %; a second share that
+cannot fit does not amplify startup probes. Cadence learning excludes idle
+gaps. Clusters are at least one second apart. Probe feedback includes SRTP and
 UDP/IP overhead. Original packets still expire 400 ms after publisher arrival,
 including time in the transport pacer. Independent voice bypasses screen pacing.
 Probes interrupted by local send gaps over 20 ms are excluded from capacity
 estimation; actual downstream queueing still reduces the estimate.
 The downlink regression simulation includes a shared FIFO, independent voice,
-150 KB keyframes, two 3 Mbps shares, and eight seeds with 0 % and 1 % loss.
+150 KB keyframes, two 3 Mbps shares, and eight seeds with 0 % and 1 % loss,
+including a separate bound on the startup queue before the steady window.
 Changing shared pacing also requires an uplink sanity run with at least four
 pairs. Thresholds and the 60 % minimum steady-load check remain unchanged.
 

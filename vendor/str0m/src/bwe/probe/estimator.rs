@@ -132,6 +132,7 @@ impl ProbeEstimator {
             }
         }
 
+        trace!(cluster = ?config.cluster(), alr = config.is_alr_probe(), "Starting probe measurement");
         self.states.push_back(ProbeEstimatorState::new(config, now));
         true
     }

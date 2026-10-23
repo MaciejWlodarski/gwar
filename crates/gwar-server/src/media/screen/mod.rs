@@ -1491,7 +1491,8 @@ fn allocate(
     );
     let stalled = w.egress.stalled();
     let recovering = w.restarted.is_some_and(|at| now.saturating_duration_since(at) < egress::RAMP);
-    pacing(w, now);
+    w.egress.set_probe_need(&caps, &lanes);
+    pacing(w);
     // Each cluster consumes the shared extras reserve. Space all clusters, including
     // fast active viewers, so capacity discovery cannot manufacture socket-cap loss.
     w.rtc.bwe().set_min_probe_interval(Duration::from_secs(1));
@@ -1534,20 +1535,17 @@ fn allocate(
 /// Keep queue admission and transport pacing on the same estimate.
 fn set_estimate(w: &mut Watcher, estimate: u64, now: Instant) {
     w.egress.set_estimate(estimate, now);
-    pacing(w, now);
+    pacing(w);
 }
 
-fn pacing(w: &mut Watcher, now: Instant) {
-    let discovering = w.egress.ramping(now)
-        || w.egress.stalled()
-        || w.restarted.is_some_and(|at| now.saturating_duration_since(at) < egress::RAMP);
-    pace(&mut w.rtc, w.egress.estimate(), if discovering { 2.0 } else { egress::PROBE_PACE });
+fn pacing(w: &mut Watcher) {
+    pace(&mut w.rtc, w.egress.estimate(), w.egress.probe_rate());
 }
 
-fn pace(rtc: &mut Rtc, estimate: u64, probe_factor: f64) {
+fn pace(rtc: &mut Rtc, estimate: u64, probe_rate: u64) {
     rtc.bwe().set_egress_pacing(
         Bitrate::bps((estimate as f64 * (egress::PLAN + egress::EXTRAS)) as u64),
-        Bitrate::bps((estimate as f64 * probe_factor) as u64),
+        Bitrate::bps(probe_rate),
     );
 }
 
@@ -1730,7 +1728,7 @@ fn rtc(advertise: SocketAddr, now: Instant, bwe: bool) -> Result<Rtc, &'static s
         .enable_bwe(bwe.then(|| Bitrate::bps(INITIAL_ESTIMATE)))
         .build(now);
     if bwe {
-        pace(&mut rtc, INITIAL_ESTIMATE, 2.0);
+        pace(&mut rtc, INITIAL_ESTIMATE, (INITIAL_ESTIMATE as f64 * egress::PROBE_PACE) as u64);
     }
     rtc.add_local_candidate(Candidate::host(advertise, "udp").map_err(|_| "bad media address")?);
     Ok(rtc)

@@ -175,6 +175,7 @@ pub struct Sim {
     /// Queue residence seen by independent 100 kbps voice on the same bottleneck.
     voice: bool,
     voice_queue: Vec<Duration>,
+    voice_startup_queue_max: Duration,
 }
 
 impl Sim {
@@ -217,6 +218,7 @@ impl Sim {
             arrivals: HashMap::new(),
             voice: false,
             voice_queue: Vec::new(),
+            voice_startup_queue_max: Duration::ZERO,
         };
         for _ in 0..2000 {
             if sim.w.connected && sim.w.slots.len() == SCREEN_SLOTS {
@@ -403,6 +405,8 @@ impl Sim {
             let queued = self.down.busy.saturating_duration_since(now);
             if self.elapsed() >= Duration::from_secs(15) {
                 self.voice_queue.push(queued);
+            } else {
+                self.voice_startup_queue_max = self.voice_startup_queue_max.max(queued);
             }
             // Voice bypasses the SFU screen queues but serializes on the physical link.
             if let Some(rate) = self.down.rate {
@@ -699,8 +703,9 @@ mod tests {
                     .sum();
                 let mbps = bytes as f64 * 8.0 / 30.0 / 1e6;
                 println!("downlink p99={p99:?} mbps={mbps:.3} {context}");
-                if !pauses(&sim, 0).is_empty() || mbps < 2.7 || p99 > 10 * MS {
-                    failures.push(format!("p99={p99:?} mbps={mbps} {context}"));
+                if !pauses(&sim, 0).is_empty() || mbps < 2.7 || p99 > 10 * MS || sim.voice_startup_queue_max > 10 * MS {
+                    failures
+                        .push(format!("startup={:?} p99={p99:?} mbps={mbps} {context}", sim.voice_startup_queue_max));
                 }
             }
         }
