@@ -47,15 +47,18 @@ kept here ([Spikes](#spikes)).
   - Paired voice latency measurements under video load and on constrained
     links gate the server PR. A separate task alone does not prove zero voice
     impact.
-- **Codec: VP9 first, VP8 as the fallback, in every channel.** Encrypted
-  channels use SFrame. The spikes settled which byte layouts survive the
-  browsers' packetizers:
+- **Codec target (owner decision, 2026-10-23): H.264 preferred, VP9 only
+  without an H.264 encoder; VP8 dropped. Pending A2:** the SFU does not
+  negotiate H.264 yet, so the current browser path still sends VP9 then VP8.
+  Encrypted channels use SFrame. The spikes settled which byte layouts
+  survive the browsers' packetizers:
   - VP9 survives whole-frame SFrame.
   - VP8 needs its first 10 bytes (keyframe) or 3 bytes (delta) clear; they go
     into the AAD.
   - H.264 and AV1 send nothing at all when the whole frame is encrypted.
 
-  H.264 with hardware encoding (games) comes later, with NAL-aware SFrame.
+  A2 starts with browser H.264, hardware where available; encrypted H.264
+  also needs NAL-aware SFrame (B2/E2). AV1 + DD follows as A2b.
 - **Keys** come from the existing voice call group:
   `MLS-Exporter("gwar screen v1", u32be(leaf), 32)`. The call controller gains
   a second endpoint kind (screen beside audio), with explicit rules for
@@ -252,22 +255,29 @@ Tradeoffs we accept with the webview path:
 
 Phase 3 may bring native capture: macOS and Windows for games if measurements
 show the webview's encoder or throttling falls short. A native Linux path
-(portal and PipeWire capture, libvpx, str0m frame mode) is the one way to give
-the Linux app sharing; the owner deferred it.
+(portal and PipeWire capture, hardware AV1/H.264 or OpenH264 encode,
+str0m frame mode) is the one way to give the Linux app sharing; the owner
+deferred it.
 
 ## 2. Codecs and encoding
 
 ### Support
 
+Browser capabilities below do not imply Gwar negotiates every codec.
+The target follows the [2026-10-23 owner decision](native-media.md#native-codec-ladder-owner-decision-2026-10-23):
+web H.264 preferred after A2, VP9 only as an encoder fallback, no VP8 or HEVC.
+Native sending uses hardware AV1 → hardware H.264 → OpenH264; native VP9
+decode stays for browser compatibility.
+
 | Codec | Chrome send/recv | Firefox | Safari / WKWebView | Hardware encode (typical) | SFrame on whole frame (spike S3) |
 | --- | --- | --- | --- | --- | --- |
-| VP8 | yes | yes | yes | rare | **breaks**: depacketizer cannot see the keyframe → PLI storm, 0 frames decoded. Works with 10/3 clear bytes |
-| VP9 | yes | yes | yes (on by default) | Intel/NVIDIA on Windows; none on Apple | **works** (keyframe and size are in the clear RTP payload descriptor) |
-| H.264 | yes (HW where available) | yes | yes (VideoToolbox) | everywhere | **breaks**: packetizer sends nothing. Works with NAL headers clear (LiveKit also escapes start codes) |
+| VP8 (current path only; dropped from target) | yes | yes | yes | rare | **breaks**: depacketizer cannot see the keyframe → PLI storm, 0 frames decoded. Works with 10/3 clear bytes |
+| VP9 (target emergency fallback) | yes | yes | yes (on by default) | Intel/NVIDIA on Windows; none on Apple | **works** (keyframe and size are in the clear RTP payload descriptor) |
+| H.264 (target preference, pending A2) | yes (HW where available; absent in some Chromium builds) | yes (encoder needs OpenH264 plugin) | yes (VideoToolbox) | everywhere | **breaks**: packetizer sends nothing. Works with NAL headers clear (LiveKit also escapes start codes) |
 | AV1 | yes (screen-content tools) | 136+ | yes (decode needs M3/A17+) | rare (newest GPUs) | **breaks**: packetizer sends nothing; needs OBU-aware SFrame (LiveKit: unsupported) |
-| H.265 | 136+, HW only | no | yes | Apple, recent GPUs | not tested |
+| H.265 (not used or planned) | 136+, HW only | no | yes | Apple, recent GPUs | not tested |
 
-**Phase 1 codec rule:**
+**Current phase 1 codec rule (until A2 browser H.264 lands):**
 
 - Prefer **VP9 (profile 0)**, then **VP8**, in plaintext and encrypted channels
   alike.
@@ -277,14 +287,29 @@ the Linux app sharing; the owner deferred it.
   same list. The SFU writes the publisher's codec to each viewer, and every
   supported engine decodes both.
 
-H.264 with hardware encoding is the obvious next step for 1080p60 game sharing
-on weak CPUs. For encrypted channels it needs NAL-aware SFrame: everything up
-to and including the first slice NAL header stays clear, and the ciphertext is
+**Target, pending A2:** web sharers prefer H.264 with hardware encoding
+where available; OpenH264 is the software counterpart. VP9 (profile 0) is
+only the emergency fallback for browsers without an H.264 encoder, such as
+Chromium builds without proprietary codecs or Firefox without OpenH264.
+Every supported browser has VP9, so VP8 is dropped from the target. A2 starts
+with browser H.264; A2b adds AV1 + Dependency Descriptor later. The SFU does
+not negotiate H.264 yet; this decision changes the plan, not the web code.
+
+The owner reports high CPU and 144p/2 fps Chrome shares on Windows with an
+i5-13600KF and RTX 5070. Software VP9 is CPU-heavy; Chrome can instead encode
+H.264 in hardware through Media Foundation, subject to capability probing.
+The report motivates the change and is not an acceptance measurement.
+
+For encrypted channels H.264 needs NAL-aware SFrame: everything up to and
+including the first slice NAL header stays clear, and the ciphertext is
 start-code escaped, as LiveKit does. The spike's unescaped variant decoded 204
 of 204 frames in Chromium and 272 of 272 in WebKit. That was luck, not
 robustness: about one frame in 2^24 bytes of ciphertext forms a start code.
-This is phase 2 work. Plaintext H.264 could ship earlier, but one codec
-everywhere is simpler to test.
+Encrypted H.264 waits for B2/E2. Plaintext browser H.264 comes first with
+A2/E1. HEVC is not planned: browser WebRTC interop is uneven, patent pools
+add complexity, and the owner prefers royalty-free AV1 for efficiency.
+Any later HEVC reconsideration is native-to-native only, with every viewer
+able to decode it; see [native codec policy](native-media.md#av1-plan).
 
 ### Presets
 
@@ -3025,9 +3050,11 @@ known:
     leaves out Gwar's own process (macOS ScreenCaptureKit with
     `excludesCurrentProcessAudio`, Windows WASAPI process loopback excluding
     Gwar), fed into the webview's share as a track.
-11. **H.264 with hardware encoding (M, 4–5 days):** NAL-aware SFrame with
-    start-code escaping, and the "Game" preset prefers H.264 where the sharer
-    has a hardware encoder (`powerEfficientEncoder` in stats).
+11. **H.264 preferred for browser sending (M, 4–5 days):** pending A2/E1,
+    prefer H.264 for every preset, hardware where available
+    (`powerEfficientEncoder` in stats), VP9 only without an H.264 encoder,
+    and remove VP8. Encrypted H.264 also needs B2/E2's NAL-aware SFrame with
+    start-code escaping. Browser H.264 precedes A2b's AV1 + DD work.
 12. **Pop-out (M, 3–4 days):** a desktop second window, and Document PiP in
     Chromium.
 13. **Simulcast (L, 1–2 weeks)**, if temporal layers prove insufficient.
@@ -3059,8 +3086,8 @@ out Gwar's own voice. It replaces the first bullet below.
   measures it).
 - **Encoder CPU on the sharer** for VP9 1080p60 in software on weaker
   laptops. The spike's M5 is not representative. Mitigation: the Game preset
-  drops to 720p60 when `qualityLimitationReason` is `cpu`; H.264 hardware in
-  phase 2.
+  drops to 720p60 when `qualityLimitationReason` is `cpu`. Pending A2/E1,
+  prefer H.264 hardware for all presets and reserve VP9 for missing encoders.
 - **SFU CPU on the VM.** Extrapolated from an M5 (PR 3b measures).
 - **Voice under video load.** Isolation is designed, not yet measured. PR 3b's
   paired gate decides whether the shared-runtime task is enough, or whether

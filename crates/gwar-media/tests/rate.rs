@@ -145,13 +145,9 @@ fn recovery_requires_ten_continuous_seconds_and_only_advances_one_step() {
 }
 
 #[test]
-fn software_vp9_compatibility_pressure_never_changes_the_primary() {
+fn software_h264_compatibility_pressure_never_changes_the_primary() {
     let mut primary = RateController::new(config(Preset::Game, ResolutionTier::P1440), &[caps(AV1, true)]).unwrap();
-    let mut compat = RateController::new(
-        config(Preset::Game, ResolutionTier::P1440),
-        &[caps(CodecProfile::Vp9 { profile: 0 }, false)],
-    )
-    .unwrap();
+    let mut compat = RateController::new(config(Preset::Game, ResolutionTier::P1440), &[caps(H264, false)]).unwrap();
     let primary_start = primary.decision();
     let compat_start = encode(compat.decision());
     assert_eq!((compat_start.tier, compat_start.encoder.rate.max_fps), (ResolutionTier::P1080, 30));
@@ -165,7 +161,7 @@ fn software_vp9_compatibility_pressure_never_changes_the_primary() {
 }
 
 #[test]
-fn failure_walks_the_codec_ladder_without_software_av1_or_quality_promotion() {
+fn failure_walks_the_native_send_ladder_without_quality_promotion() {
     let encoders = [
         caps(CodecProfile::Vp8, false),
         caps(AV1, false),
@@ -173,24 +169,27 @@ fn failure_walks_the_codec_ladder_without_software_av1_or_quality_promotion() {
         caps(AV1, true),
         caps(CodecProfile::Vp9 { profile: 0 }, false),
         caps(H264, true),
+        caps(CodecProfile::Vp9 { profile: 0 }, true),
+        caps(CodecProfile::Vp8, true),
     ];
     let mut c = RateController::new(config(Preset::Game, ResolutionTier::P1080), &encoders).unwrap();
-    assert_eq!(encode(c.decision()).encoder.profile.codec(), Codec::Av1);
-    for (second, codec, hardware, fps) in [
-        (0, Codec::H264, true, 60),
-        (1, Codec::H264, false, 30),
-        (2, Codec::Vp9, false, 30),
-        (3, Codec::Vp8, false, 30),
-    ] {
+    let mut previous = encode(c.decision());
+    assert_eq!((previous.encoder_index, previous.encoder.profile.codec(), previous.hardware), (3, Codec::Av1, true));
+    for (second, index, hardware, fps) in [(0, 5, true, 60), (1, 2, false, 30)] {
         let target = encode(sample(&mut c, second, ControllerFeedback { encoder_failed: true, ..healthy() }));
         assert_eq!(
-            (target.encoder.profile.codec(), target.hardware, target.encoder.rate.max_fps),
-            (codec, hardware, fps)
+            (target.encoder_index, target.encoder.profile.codec(), target.hardware, target.encoder.rate.max_fps),
+            (index, Codec::H264, hardware, fps)
         );
+        assert!(target.encoder.size.width <= previous.encoder.size.width);
+        assert!(target.encoder.size.height <= previous.encoder.size.height);
+        assert!(target.encoder.rate.bitrate_bps <= previous.encoder.rate.bitrate_bps);
+        previous = target;
     }
+    assert_eq!(sample(&mut c, 2, ControllerFeedback { encoder_failed: true, ..healthy() }), RateDecision::Unavailable);
+    assert_eq!(c.decision(), RateDecision::Unavailable);
+    assert_eq!(sample(&mut c, 3, healthy()), RateDecision::Unavailable);
     assert_eq!(sample(&mut c, 4, ControllerFeedback { encoder_failed: true, ..healthy() }), RateDecision::Unavailable);
-    assert_eq!(sample(&mut c, 5, healthy()), RateDecision::Unavailable);
-    assert!(RateController::new(config(Preset::Game, ResolutionTier::P1080), &[caps(AV1, false)]).is_err());
 
     let mut c = RateController::new(config(Preset::Game, ResolutionTier::P1440), &encoders).unwrap();
     for second in 0..=2 {
@@ -203,12 +202,25 @@ fn failure_walks_the_codec_ladder_without_software_av1_or_quality_promotion() {
 }
 
 #[test]
+fn software_av1_and_all_vp9_vp8_encoders_are_rejected() {
+    let cfg = config(Preset::Game, ResolutionTier::P1080);
+    let excluded = [
+        caps(AV1, false),
+        caps(CodecProfile::Vp9 { profile: 0 }, false),
+        caps(CodecProfile::Vp9 { profile: 0 }, true),
+        caps(CodecProfile::Vp8, false),
+        caps(CodecProfile::Vp8, true),
+    ];
+    for encoder in &excluded {
+        assert!(RateController::new(cfg, std::slice::from_ref(encoder)).is_err());
+    }
+    assert!(RateController::new(cfg, &excluded).is_err());
+}
+
+#[test]
 fn unavailable_text_fallback_refuses_only_that_layer() {
-    let mut c = RateController::new(
-        config(Preset::Text, ResolutionTier::P2160),
-        &[caps(AV1, true), caps(CodecProfile::Vp9 { profile: 0 }, false)],
-    )
-    .unwrap();
+    let mut c = RateController::new(config(Preset::Text, ResolutionTier::P2160), &[caps(AV1, true), caps(H264, false)])
+        .unwrap();
     assert_eq!(sample(&mut c, 0, ControllerFeedback { encoder_failed: true, ..healthy() }), RateDecision::Unavailable);
 }
 
@@ -307,11 +319,7 @@ fn limits_aspect_ratio_and_software_caps_are_enforced() {
 fn eighty_percent_interval_and_cpu_boundaries_are_exact() {
     // Software has no hardware latency target: 30 fps, 80 percent interval = 26,666,666 ns.
     for (nanos, cpu, degrades) in [(26_666_666, 1500, false), (26_666_667, 1500, true), (1_000_000, 1501, true)] {
-        let mut c = RateController::new(
-            config(Preset::Game, ResolutionTier::P1080),
-            &[caps(CodecProfile::Vp9 { profile: 0 }, false)],
-        )
-        .unwrap();
+        let mut c = RateController::new(config(Preset::Game, ResolutionTier::P1080), &[caps(H264, false)]).unwrap();
         let before = c.decision();
         for second in 0..=2 {
             sample(
@@ -687,7 +695,7 @@ fn degraded_smooth_failovers_recover_with_the_same_nominal_rate() {
     let encoders = [
         CodecCaps { max_fps: 10, ..caps(AV1, true) },
         CodecCaps { max_size: ResolutionTier::P1080.size(), max_fps: 10, ..caps(H264, true) },
-        CodecCaps { max_fps: 10, ..caps(CodecProfile::Vp9 { profile: 0 }, false) },
+        CodecCaps { max_fps: 10, ..caps(H264, false) },
     ];
     let feedback = ControllerFeedback { bandwidth_bps: 1_250_000, ..healthy() };
     let pressure = ControllerFeedback { encoder_dropped: true, ..feedback };
@@ -718,7 +726,7 @@ fn degraded_smooth_failovers_recover_with_the_same_nominal_rate() {
             }
         }
         if failover {
-            // Repeat the degraded failover on H.264 -> software VP9.
+            // Repeat the degraded failover on hardware H.264 -> software H.264.
             for second in 97..=99 {
                 sample(&mut c, second, pressure);
             }
