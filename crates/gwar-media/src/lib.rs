@@ -9,12 +9,14 @@
 
 mod adapters;
 mod frame;
+mod rate;
 pub mod sframe;
 pub mod stamp;
 mod synthetic;
 
 pub use adapters::*;
 pub use frame::*;
+pub use rate::*;
 pub use synthetic::SyntheticScreenSource;
 
 /// An adapter or frame validation failure. Platform adapters retain details as text.
