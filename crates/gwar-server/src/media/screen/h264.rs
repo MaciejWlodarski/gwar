@@ -4,19 +4,42 @@
 
 use super::ingress::Descriptor;
 
+/// How this packet carries a NAL unit. FU-A's reserved bit is ignored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NalPart {
+    /// A whole NAL in a single-NAL packet or a STAP-A unit; no FU header.
+    Complete,
+    /// FU-A with S = 1, E = 0. The NAL is not complete yet.
+    Start,
+    /// FU-A with S = 0, E = 0.
+    Continuation,
+    /// FU-A with S = 0, E = 1. Completion requires a matching, gap-free start/continuation run.
+    End,
+}
+
+/// One NAL observation, including types unrelated to keyframes so A2 can detect interrupted FUs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NalObservation {
+    /// The original NAL type (1..=23), including for FU-A fragments.
+    pub nal_type: u8,
+    pub part: NalPart,
+}
+
 /// Packet-local observations, not confirmation that an access unit is a keyframe.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Description {
     /// `frame_start` comes from the caller's RTP timestamp tracking. `keyframe` is only a
     /// candidate: the first complete NAL in a single-NAL packet or STAP-A is an SPS.
     /// Do not pass it to ingress or a segment until A2 confirms the PPS and IDR prefix.
     pub descriptor: Descriptor,
-    /// A complete IDR slice NAL, or the start fragment of one.
-    pub idr_start: bool,
-    /// A complete non-IDR slice NAL (type 1), or the start fragment of one.
-    pub non_idr_start: bool,
-    /// A complete PPS NAL, or the start fragment of one; continuations do not set this.
-    pub pps: bool,
+    /// Every NAL in wire order: one per single NAL, STAP-A unit or FU-A fragment.
+    /// A2 must walk these in source sequence order, require a complete PPS before the first
+    /// IDR start, and reject non-IDR starts or interrupted/orphan FU chains in the prefix.
+    /// An IDR start is type 5 with `Complete` or `Start`; type 1 identifies non-IDR starts.
+    /// A PPS is complete at type 8 `Complete`, or at `End` only after a matching, uninterrupted
+    /// type 8 `Start`/`Continuation` run of consecutive packets with the same RTP timestamp.
+    /// A PPS start alone, or a PPS after the IDR in this list, cannot confirm a candidate.
+    pub nals: Vec<NalObservation>,
     /// The first complete SPS's `profile_idc`, constraint flags and `level_idc`, in wire order.
     /// Fragmented SPSs are not candidates and expose no profile bytes without reassembly.
     pub profile_level_id: Option<[u8; 3]>,
@@ -57,10 +80,12 @@ pub fn describe(payload: &[u8], frame_start: bool) -> Option<Description> {
                 return None;
             }
             // RFC 6184 §5.8: receivers ignore R; an FU payload may be empty.
-            // Only S identifies a NAL start, never a continuation or an end fragment.
-            if fu & 0x80 != 0 {
-                describe_start(nal_type, &mut description);
-            }
+            let part = match fu & 0xc0 {
+                0x80 => NalPart::Start,
+                0x40 => NalPart::End,
+                _ => NalPart::Continuation,
+            };
+            description.nals.push(NalObservation { nal_type, part });
         }
         _ => return None,
     }
@@ -77,7 +102,7 @@ fn describe_nal(nal: &[u8], first: bool, description: &mut Description) -> Optio
     if nal.len() < 2 && !matches!(nal_type, 10 | 11) {
         return None;
     }
-    describe_start(nal_type, description);
+    description.nals.push(NalObservation { nal_type, part: NalPart::Complete });
     if nal_type == 7 {
         let profile = nal.get(1..4)?.try_into().ok()?;
         // Validate every SPS, but report the first one's bytes rather than overwrite them.
@@ -85,15 +110,6 @@ fn describe_nal(nal: &[u8], first: bool, description: &mut Description) -> Optio
         description.descriptor.keyframe |= first;
     }
     Some(())
-}
-
-fn describe_start(nal_type: u8, description: &mut Description) {
-    match nal_type {
-        1 => description.non_idr_start = true,
-        5 => description.idr_start = true,
-        8 => description.pps = true,
-        _ => {}
-    }
 }
 
 #[cfg(test)]
@@ -114,22 +130,24 @@ mod tests {
         payload
     }
 
+    fn complete(nal_type: u8) -> NalObservation {
+        NalObservation { nal_type, part: NalPart::Complete }
+    }
+
     #[test]
-    fn single_nals_report_candidates_slices_and_parameter_sets() {
-        for (payload, candidate, idr_start, non_idr_start, pps, profile_level_id) in [
-            (SPS, true, false, false, false, Some([0x42, 0xe0, 0x1f])),
-            (PPS, false, false, false, true, None),
-            (IDR, false, true, false, false, None),
-            (DELTA, false, false, true, false, None),
-            (&[0x06, 0x80][..], false, false, false, false, None),
+    fn single_nals_report_candidates_and_complete_observations() {
+        for (payload, nal_type, candidate, profile_level_id) in [
+            (SPS, 7, true, Some([0x42, 0xe0, 0x1f])),
+            (PPS, 8, false, None),
+            (IDR, 5, false, None),
+            (DELTA, 1, false, None),
+            (&[0x06, 0x80][..], 6, false, None),
         ] {
             assert_eq!(
                 describe(payload, true),
                 Some(Description {
                     descriptor: Descriptor { frame_start: true, keyframe: candidate },
-                    idr_start,
-                    non_idr_start,
-                    pps,
+                    nals: vec![complete(nal_type)],
                     profile_level_id,
                 }),
                 "{payload:02x?}"
@@ -139,9 +157,10 @@ mod tests {
 
     #[test]
     fn end_of_sequence_and_stream_nals_need_no_body() {
-        for nal in [&[0x0a][..], &[0x0b]] {
-            assert_eq!(describe(nal, false), Some(Description::default()));
-            assert_eq!(describe(&stap(&[nal]), false), Some(Description::default()));
+        for nal_type in [10, 11] {
+            let expected = Description { nals: vec![complete(nal_type)], ..Default::default() };
+            assert_eq!(describe(&[nal_type], false), Some(expected.clone()));
+            assert_eq!(describe(&stap(&[&[nal_type]]), false), Some(expected));
         }
     }
 
@@ -158,17 +177,33 @@ mod tests {
     }
 
     #[test]
-    fn stap_sps_pps_and_idr_are_packet_local_observations() {
+    fn stap_sps_pps_and_idr_are_ordered_packet_local_observations() {
         let prefix = describe(&stap(&[SPS, PPS]), true).unwrap();
-        assert!(prefix.descriptor.keyframe && prefix.pps);
-        assert!(!prefix.idr_start);
+        assert!(prefix.descriptor.keyframe);
+        assert_eq!(prefix.nals, [complete(7), complete(8)]);
         assert_eq!(prefix.profile_level_id, Some([0x42, 0xe0, 0x1f]));
         let idr = describe(&stap(&[SPS, PPS, &[0x06, 0x80], IDR]), true).unwrap();
-        assert!(idr.descriptor.keyframe && idr.pps && idr.idr_start);
-        assert!(!idr.non_idr_start);
+        assert!(idr.descriptor.keyframe);
+        assert_eq!(idr.nals, [complete(7), complete(8), complete(6), complete(5)]);
         let delta = describe(&stap(&[SPS, PPS, DELTA]), true).unwrap();
-        assert!(delta.descriptor.keyframe && delta.non_idr_start);
-        assert!(!delta.idr_start, "a candidate is not confirmation");
+        assert!(delta.descriptor.keyframe, "a candidate is not confirmation");
+        assert_eq!(delta.nals, [complete(7), complete(8), complete(1)]);
+    }
+
+    #[test]
+    fn stap_parameter_sets_after_a_slice_remain_after_it() {
+        let ordered = describe(&stap(&[SPS, PPS, IDR]), true).unwrap();
+        assert_eq!(ordered.nals, [complete(7), complete(8), complete(5)]);
+        for (nals, types) in [
+            (vec![SPS, IDR, PPS], vec![7, 5, 8]),
+            (vec![SPS, DELTA, PPS, IDR], vec![7, 1, 8, 5]),
+            (vec![PPS, SPS, IDR], vec![8, 7, 5]),
+            (vec![IDR, SPS, PPS], vec![5, 7, 8]),
+        ] {
+            let reversed = describe(&stap(&nals), true).unwrap();
+            assert_eq!(reversed.nals, types.into_iter().map(complete).collect::<Vec<_>>());
+            assert_ne!(ordered, reversed);
+        }
     }
 
     #[test]
@@ -176,39 +211,74 @@ mod tests {
         for nals in [vec![PPS, SPS, IDR], vec![&[0x09, 0xf0][..], SPS, PPS, IDR]] {
             let description = describe(&stap(&nals), true).unwrap();
             assert!(!description.descriptor.keyframe);
-            assert!(description.pps && description.idr_start);
+            assert!(description.nals.contains(&complete(8)) && description.nals.contains(&complete(5)));
             assert_eq!(description.profile_level_id, Some([0x42, 0xe0, 0x1f]));
         }
         let second_sps = [0x67, 0x64, 0x0c, 0x33];
         let description = describe(&stap(&[SPS, &second_sps, PPS]), true).unwrap();
         assert!(description.descriptor.keyframe);
         assert_eq!(description.profile_level_id, Some([0x42, 0xe0, 0x1f]));
+        assert_eq!(description.nals, [complete(7), complete(7), complete(8)]);
     }
 
     #[test]
-    fn fu_idr_start_continuation_and_end() {
-        assert_eq!(describe(&[0x7c, 0x85, 0x88], false), Some(Description { idr_start: true, ..Default::default() }));
-        for fu in [0x05, 0x45] {
-            assert_eq!(describe(&[0x7c, fu, 0x88], false), Some(Description::default()));
+    fn fu_type_start_continuation_and_end_are_distinct_for_every_nal_type() {
+        for nal_type in 1..=23 {
+            for (flags, part) in [(0x80, NalPart::Start), (0, NalPart::Continuation), (0x40, NalPart::End)] {
+                assert_eq!(
+                    describe(&[0x7c, flags | nal_type, 0x88], false),
+                    Some(Description { nals: vec![NalObservation { nal_type, part }], ..Default::default() })
+                );
+            }
         }
-        assert_eq!(
-            describe(&[0x7c, 0x81, 0x9a], false),
-            Some(Description { non_idr_start: true, ..Default::default() })
-        );
-        assert_eq!(describe(&[0x7c, 0x88, 0xce], false), Some(Description { pps: true, ..Default::default() }));
-        for fu in [0x08, 0x48] {
-            assert_eq!(describe(&[0x7c, fu, 0xce], false), Some(Description::default()));
+        let sps = describe(&[0x7c, 0x87, 0x42, 0xe0, 0x1f], false).unwrap();
+        assert!(!sps.descriptor.keyframe);
+        assert_eq!(sps.profile_level_id, None);
+    }
+
+    #[test]
+    fn incomplete_pps_prefixes_do_not_look_like_complete_pps_prefixes() {
+        // Each vector is a run of consecutive source sequence numbers at one RTP timestamp.
+        // A2 must use these observations, not just the absence of packet loss, to confirm PPS.
+        let start = &[0x7c, 0x88, 0xce][..];
+        let continuation = &[0x7c, 0x08, 0x06][..];
+        let end = &[0x7c, 0x48, 0xe2][..];
+        let pps_start = NalObservation { nal_type: 8, part: NalPart::Start };
+        let pps_continuation = NalObservation { nal_type: 8, part: NalPart::Continuation };
+        let pps_end = NalObservation { nal_type: 8, part: NalPart::End };
+        for (packets, expected) in [
+            (vec![SPS, PPS, IDR], vec![complete(7), complete(8), complete(5)]),
+            (vec![SPS, start, IDR], vec![complete(7), pps_start, complete(5)]),
+            (vec![SPS, start, continuation, IDR], vec![complete(7), pps_start, pps_continuation, complete(5)]),
+            (vec![SPS, start, end, IDR], vec![complete(7), pps_start, pps_end, complete(5)]),
+            (
+                vec![SPS, start, continuation, end, IDR],
+                vec![complete(7), pps_start, pps_continuation, pps_end, complete(5)],
+            ),
+            (vec![SPS, end, IDR], vec![complete(7), pps_end, complete(5)]),
+            (vec![SPS, start, IDR, end], vec![complete(7), pps_start, complete(5), pps_end]),
+            (
+                vec![SPS, start, &[0x06, 0x80], end, IDR],
+                vec![complete(7), pps_start, complete(6), pps_end, complete(5)],
+            ),
+        ] {
+            let observed: Vec<_> =
+                packets.into_iter().flat_map(|packet| describe(packet, false).unwrap().nals).collect();
+            assert_eq!(observed, expected);
         }
-        assert_eq!(describe(&[0x7c, 0x87, 0x42, 0xe0, 0x1f], false), Some(Description::default()));
     }
 
     #[test]
     fn fu_reserved_bit_is_ignored_and_empty_fragments_are_allowed() {
-        let start = Description { idr_start: true, ..Default::default() };
-        assert_eq!(describe(&[0x7c, 0xa5, 0x88], false), Some(start));
-        assert_eq!(describe(&[0x7c, 0x85], false), Some(start));
-        for fu in [0x05, 0x45, 0x25, 0x65] {
-            assert_eq!(describe(&[0x7c, fu], false), Some(Description::default()));
+        for (flags, part) in [(0x80, NalPart::Start), (0, NalPart::Continuation), (0x40, NalPart::End)] {
+            let expected = Description { nals: vec![NalObservation { nal_type: 5, part }], ..Default::default() };
+            for reserved in [0, 0x20] {
+                for body in [&[][..], &[0x88]] {
+                    let mut payload = vec![0x7c, flags | reserved | 5];
+                    payload.extend_from_slice(body);
+                    assert_eq!(describe(&payload, false), Some(expected.clone()));
+                }
+            }
         }
     }
 
@@ -320,11 +390,11 @@ mod tests {
         }
         // Exercise long length walks as well as the full u16 NAL length boundary.
         let units = vec![IDR; 2048];
-        assert!(describe(&stap(&units), true).unwrap().idr_start);
+        assert_eq!(describe(&stap(&units), true).unwrap().nals, vec![complete(5); units.len()]);
         let mut large_nal = vec![0x80; u16::MAX as usize];
         large_nal[0] = 0x65;
         let large = stap(&[&large_nal]);
-        assert!(describe(&large, true).unwrap().idr_start);
+        assert_eq!(describe(&large, true).unwrap().nals, [complete(5)]);
         assert_eq!(describe(&large[..large.len() - 1], true), None);
     }
 }
