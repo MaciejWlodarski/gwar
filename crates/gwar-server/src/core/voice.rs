@@ -966,6 +966,7 @@ mod tests {
                 server_signer: Arc::new(signer),
                 teamspeak: false,
                 watch_base: None,
+                screen: crate::media::screen::ScreenShared::new(0),
             },
             Arc::new(ArcSwap::from_pointee(Routing::default())),
             media,

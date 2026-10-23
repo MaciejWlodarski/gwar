@@ -40,14 +40,21 @@ pub fn vp8(start: bool, keyframe: bool, body: &[u8]) -> Vec<u8> {
 /// A frame of `packets` packets with timestamp `timestamp`, each tagged with `tag` and its index.
 pub fn frame(sequence: u64, timestamp: u32, keyframe: bool, packets: usize, tag: u8) -> Vec<Packet> {
     (0..packets)
-        .map(|i| Packet {
-            sequence: sequence + i as u64,
-            timestamp,
-            marker: i + 1 == packets,
-            payload: vp8(i == 0, keyframe, &[tag, i as u8, 0xaa, 0x55]),
+        .map(|i| {
+            let mut body = vec![0x55; BODY];
+            body[..4].copy_from_slice(&[tag, i as u8, 0xaa, 0x55]);
+            Packet {
+                sequence: sequence + i as u64,
+                timestamp,
+                marker: i + 1 == packets,
+                payload: vp8(i == 0, keyframe, &body),
+            }
         })
         .collect()
 }
+
+/// A test packet's body: its tag, index and filler.
+const BODY: usize = 4;
 
 /// Which outgoing or incoming RTP datagrams a peer drops on purpose, by sequence number on the
 /// given stream: each listed number is dropped once, so its repair gets through.
@@ -183,7 +190,7 @@ impl Publisher {
                         let receive = Receive { proto: Protocol::Udp, source, destination: local, contents: bytes[..n].try_into().unwrap() };
                         let _ = rtc.handle_input(Input::Receive(Instant::now(), receive));
                     },
-                    _ = tokio::time::sleep_until(deadline.into()) => {}
+                    _ = tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_millis(50)).into()) => {}
                 }
                 let _ = rtc.handle_input(Input::Timeout(Instant::now()));
             }
@@ -207,11 +214,46 @@ impl Publisher {
     }
 }
 
+/// Holds a peer's outgoing datagrams back while closed (its NACKs, say), and lets them all go
+/// when opened.
+#[derive(Default, Clone)]
+pub struct Gate(Arc<Mutex<(bool, Vec<Held>)>>);
+
+type Held = (Vec<u8>, std::net::SocketAddr);
+
+impl Gate {
+    pub fn close(&self) {
+        self.0.lock().unwrap().0 = true;
+    }
+
+    pub fn open(&self) {
+        self.0.lock().unwrap().0 = false;
+    }
+
+    /// Whether anything is held.
+    pub fn holding(&self) -> bool {
+        !self.0.lock().unwrap().1.is_empty()
+    }
+
+    /// Holds the datagram if closed; otherwise what may go now, held ones first.
+    fn pass(&self, datagram: Option<(&[u8], std::net::SocketAddr)>) -> Vec<Held> {
+        let mut gate = self.0.lock().unwrap();
+        if let Some((contents, to)) = datagram {
+            gate.1.push((contents.to_vec(), to));
+        }
+        if gate.0 { Vec::new() } else { std::mem::take(&mut gate.1) }
+    }
+}
+
 pub struct Viewer {
     pub run: u64,
     rx: mpsc::Receiver<(usize, Packet)>,
     /// Incoming datagrams to lose on the way from the server, on any stream.
     pub loss: Loss,
+    /// Outgoing datagrams to hold back.
+    pub gate: Gate,
+    /// Drops every incoming repair (RTX: NACK answers and padding that reuses media) while set.
+    pub drop_repairs: Arc<std::sync::atomic::AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -256,6 +298,11 @@ impl Viewer {
         let (received, rx) = mpsc::channel(8192);
         let loss = Loss::default();
         let lose = loss.clone();
+        let gate = Gate::default();
+        let held = gate.clone();
+        let drop_repairs = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let repairs = drop_repairs.clone();
+        let rtx: HashSet<u8> = rtc.codec_config().params().iter().filter_map(|p| p.resend()).map(|pt| *pt).collect();
         let (ready, connected) = tokio::sync::oneshot::channel();
         let task = tokio::spawn(async move {
             let mut ready = Some(ready);
@@ -265,7 +312,9 @@ impl Viewer {
                     match rtc.poll_output().unwrap() {
                         Output::Timeout(at) => break at,
                         Output::Transmit(t) => {
-                            let _ = socket.send_to(&t.contents, t.destination).await;
+                            for (contents, to) in held.pass(Some((&t.contents, t.destination))) {
+                                let _ = socket.send_to(&contents, to).await;
+                            }
                         }
                         Output::Event(Event::Connected) => {
                             if let Some(tx) = ready.take() {
@@ -294,16 +343,23 @@ impl Viewer {
                         if lose.take(&bytes[..n], None) {
                             continue;
                         }
+                        let repair = rtp_ssrc(&bytes[..n]).is_some() && rtx.contains(&(bytes[1] & 0x7f));
+                        if repair && repairs.load(Ordering::Relaxed) {
+                            continue;
+                        }
                         let receive = Receive { proto: Protocol::Udp, source, destination: local, contents: bytes[..n].try_into().unwrap() };
                         let _ = rtc.handle_input(Input::Receive(Instant::now(), receive));
                     },
                     _ = tokio::time::sleep_until(deadline.into()) => {}
                 }
                 let _ = rtc.handle_input(Input::Timeout(Instant::now()));
+                for (contents, to) in held.pass(None) {
+                    let _ = socket.send_to(&contents, to).await;
+                }
             }
         });
         tokio::time::timeout(Duration::from_secs(5), connected).await.expect("watch transport connects").unwrap();
-        Self { run, rx, loss, task }
+        Self { run, rx, loss, gate, drop_repairs, task }
     }
 
     /// The next packet received in any slot.

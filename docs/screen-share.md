@@ -2,7 +2,8 @@
 
 Status: **design, with the owner's decisions of 2026-10-21 folded in**
 ([Owner decisions](#owner-decisions)). Built so far: the share state and its
-protocol (PR 2), the SFU's transports and forwarding (PR 3a), and sharing and
+protocol (PR 2), the SFU's transports and forwarding (PR 3a), its allocation,
+egress cap, budgets and measurements (PR 3b), and sharing and
 watching from the browser in plaintext channels (PR 4,
 [as built](#web-client-as-built-pr-4)), the same in the desktop app (PR 5,
 [as built](#desktop-app-as-built-pr-5)), and TeamSpeak watch links (PR 6,
@@ -482,8 +483,8 @@ datagrams reach the screen task without slowing voice down.
 - **On a viewer's downlink** the SFU's per-viewer allocation (below) never
   plans more than 80 % of the viewer's estimate. Voice is about 32–40 kbps per
   speaker and fits in the remainder.
-- **PR 3b acceptance compares voice with and without video,** paired runs, using
-  the `latency` example and `LATENCY_NET` relay from docs/latency.md:
+- **PR 3b acceptance calibrates voice under screen load against A/A on the same
+  host**, using the `latency` example and `LATENCY_NET` relay from docs/latency.md:
   - The relay gets a `rate=` bottleneck option with a bounded queue. The
     example gets a screen load generator: a str0m frame-mode client publishing
     synthetic VP9-sized frames at a preset's rate, through the same relay, and
@@ -492,13 +493,302 @@ datagrams reach the screen task without slowing voice down.
     viewers; a 10 Mbps sharer uplink with an 8 Mbps share; a 5 Mbps viewer
     downlink watching two 4 Mbps shares; each also with 1 % loss.
   - Report voice p50/p95/p99 mouth-to-ear, lost and late frames, playout
-    underruns and concealment, as the latency docs do. Ten pairs, alternating
-    order.
-  - Gate: unconstrained, voice p95 and p99 within 2 ms of the paired baseline
-    and no extra underruns. Constrained, voice p99 within 20 ms of baseline and
-    underruns within baseline + 0.5 %. Missing the gate blocks PR 3b until the
-    isolation is changed (own thread, separate port or a lower video
-    allocation).
+    underruns and concealment, as the latency docs do. Eight pairs **per set**
+    and 100 markers per run by default; A/A and screen sets are interleaved.
+  - Gate: each screen-set metric must be no worse than the same A/A metric
+    plus the tolerance defined below. Missing the calibrated gate blocks PR
+    3b until the isolation is changed (own thread, separate port or a lower
+    video allocation).
+
+**VM gate follow-up (`07e2f24`).** The supplied samples show viewer 0
+stopping near 15 s while the other four sustain 8.54 Mbps. That run logged
+only aggregate pause counts, so its exact allocator trigger is unavailable.
+The example uses a fresh server with a 300 Mbps default budget; budget
+allocation would select the newest watch (viewer 4). The observed pause of
+viewer 0 is therefore inconsistent with that path.
+A local replay with 8 ms process stalls during startup produced permanent
+bandwidth pauses with zero original socket-cap drops and zero extras
+escalations. One pause occurred before the 5 s average guard could expire,
+identifying the two-keyframe failure path. Separately, the unconstrained
+transport simulation sent zero originals and paused at 10.546 s, even
+without CPU contention. This is a server pacing/bootstrap defect; increasing
+harness worker counts does not repair it. The stalled replay is diagnostic,
+not a voice acceptance measurement.
+
+The fixes drain bounded unpaced/probe bursts without per-packet timer wakes,
+account for elapsed time on late probe wakes, and update the watch clock
+before polling. The probe target now respects the refilled extras reserve.
+Screen-watch transports suspend ordinary background padding at its source
+while the reserve refills; probe clusters remain enabled. Otherwise str0m's
+50 kbps padding can drain the extras bucket faster than its 10 kbps refill
+at a 100 kbps estimate,
+permanently blocking target growth even after the link recovers. The padding
+limit survives estimator updates and resets; background padding returns
+when the reserve is ready. The extras bucket capacity is unchanged.
+Regressions use an independent viewer clock with 1, 2, 5 and 10 ms SFU
+cadences plus periodic 10 ms stalls, require steady video throughput, restore
+a link after an actual bandwidth pause, and pin resume at exactly 10 s of
+continuous room. Pause thresholds and socket caps are unchanged.
+
+**Historical follow-up verification at `674633d`.** All builds used `CARGO_BUILD_JOBS=4`
+and the worktree's `target/`. Server unit tests: 287 passed (including 51
+screen tests and monthly egress); screen integration: 10; latency example:
+27; vendored str0m: 759 unit tests and 14 probe integration tests, including
+padding disable/reset/re-enable; Python harness: 9. The no-default-features
+server check, clippy with `-D warnings` for the server/proto/client and vendor
+library/probe regression, rustfmt and `git diff --check` passed.
+
+The `simple::bwe_cellular` failure was caused by Gwar's generic immediate-timeout
+patch, not by unchanged crates.io str0m 0.24.1. Reproducing it at `89dacfe`
+compared two revisions that already contained the faulty patch. Paced media
+now keeps upstream's one-microsecond clock advance, including during probes.
+Only application-paced media and generated padding bursts drain at the same
+clock. Scheduler-aware first-burst sizing applies only to application-paced
+streams. The cellular regression passes without lowering its thresholds.
+
+**Previous review-fix validation (`5628c4c`).** All builds used `CARGO_BUILD_JOBS=4` and the
+worktree's `target/`. The server's 288 unit tests passed, including 52 screen
+and egress tests and every recovery-matrix case; screen integration: 10;
+latency example: 27; Python harness: 19. The full vendored str0m suite with
+`--no-default-features --features aws-lc-rs,_internal_test_exports` passed:
+765 unit tests, 330 integration tests (including `simple::bwe_cellular`), and
+59 doctests; two doctests remain ignored. The no-default-features server
+check, server/proto/client and full-vendor all-targets clippy with
+`-D warnings`, workspace/vendor rustfmt, and `git diff --check` passed.
+No deployment host or VM was contacted.
+
+**Recovery follow-up validation.** All builds used `-j 4`. All 290 server unit
+tests passed, including the 70-case matrix, both exact review repros and six
+parameterized variants. Server unit test code used package `opt-level=1`,
+with debug assertions and overflow checks enabled. Screen integration: 10;
+latency example: 27; Python harness: 19. Full vendored str0m with
+`--no-default-features --features aws-lc-rs,_internal_test_exports`: 769 unit
+tests, 330 integration tests (including `bwe_cellular` and capacity restoration),
+and 59 doctests passed; two doctests remain ignored. The required
+`cargo check -p gwar-server --no-default-features --tests`, server test clippy
+with `-D warnings`, workspace/vendor rustfmt and `git diff --check` passed.
+The full vendor run used canonical ignored capture fixtures from the locally
+cached str0m 0.24.1 package; those scratch copies are removed after validation.
+
+**Review follow-up after rebasing onto `main` at `a78f775`.** A plain revert of
+the BWE fixture origin edit passed ten consecutive cellular runs, but the second
+full vendor run failed capacity restoration at 644.878 kbps against its unchanged
+1 Mbps assertion. The final fixture configures one origin and 100 us resolution
+before the handshake, advances through the 100 ms startup boundary without
+reassigning live clocks, and schedules BWE's forced wakes from the current input
+instead of an older future deadline. Other vendor fixtures retain their existing
+scheduling. No BWE assertions, thresholds or production estimator code changed.
+The final cellular and capacity-restoration tests each passed ten consecutive
+isolated runs. Both complete vendor runs passed: 770 unit tests, 330 integration
+tests and 59 doctests per run, with the existing two doctest ignores.
+Post-rebase validation also passed: 335 server unit tests (all 70 recovery-grid
+cases, 60 zero-pause startup cases and the outage repros/variants), 10 screen
+integration tests, 15 watch-link integration tests, 27 latency tests, 120 protocol
+and binding-generation tests, and 19 Python tests. The no-default-features server
+check, server/proto/client and full-vendor all-targets clippy with warnings denied,
+workspace/vendor formatting and `git diff --check` passed. Builds used `-j 4`;
+server test code used `opt-level=1` with debug assertions and overflow checks.
+
+The earlier macOS loopback gate at `a4c76a1` used one pair of 40 markers
+per scenario:
+unconstrained, all five viewers at 7.87 Mbps with zero pauses,
+voice p95/p99 deltas +0.60/+0.25 ms;
+downlink-loss, 3.08 Mbps still active, p99 delta
++14.92 ms. Both passed with zero underruns in baseline
+and screen runs. The final startup-stall replay kept every viewer at
+7.81 Mbps with zero pauses despite 13.78 ms maximum
+receive wake lateness; the original replay paused two viewers permanently.
+These shortened local runs do not replace the calibrated six-scenario VM
+gate or its CPU scaling measurement. No deployment service or VM was contacted.
+
+**As built in PR 3b** (docs/latency.md, "Screen load"; `scripts/latency/screen_gate.py`):
+
+**Owner-approved A/A calibration.** On the Oracle aarch64 deployment host
+(4 vCPU), the supplied `89dacfe` unconstrained A/A set (ten pairs, 100 markers)
+missed every old absolute rule with no video in either arm: median p95/p99
+deltas +5.567/+4.849 ms, six tail pairs, and 3 → 8 underruns. Individual
+latency deltas ranged from about −37 to +41 ms; playout underruns introduced
+steps of about 14.6 ms. The supplied `a4c76a1` screen set was better:
++0.009/+0.151 ms, two tails, and 1 → 2 underruns. These historical sets motivate
+calibration; they are different revisions and separate invocations, so they
+are **not** a calibrated acceptance result. Artifacts remain in
+`/tmp/gwar-gate-aa-89dacfe/` and `/tmp/gwar-gate-a4c76a1/`.
+
+- Each scenario collects two equal-sized sets in **one invocation of the same
+  binary on the same host**. A/A has no video in either arm; the screen set
+  has a baseline without video and a second arm with the scenario's load.
+  Both use the same pair-index seeds, voice impairment roles, 15 s warm-up,
+  marker count and alternating arm order. The second A/A arm retains the
+  artifact label `screen`; its set name is `aa` and its screen metadata is null.
+- One block contains four fresh processes: for even zero-based pair indices,
+  `aa/baseline → aa/screen → screen/baseline → screen/screen`; odd blocks
+  reverse both set order and arm order. The four runs share seed `index + 1`.
+  Thus matched sets are adjacent and slow host drift has balanced order over
+  each two blocks. Even pair counts are recommended for balance. Sets never
+  run concurrently and there is no retry, outlier removal or seed selection.
+- For each set, compute signed per-pair deltas (second arm − baseline), then
+  their medians for p95, p99 and underrun fraction. Underrun fraction is
+  underrun samples / samples played over the harness's full run, including
+  warm-up, identically in both sets. Also compute **total underrun excess**:
+  sum of second-arm underrun counts minus sum of baseline counts. Negative
+  A/A metrics remain signed; no absolute value, clipping to zero, or borrowing
+  a calibration from a different scenario or invocation is permitted.
+- **Unconstrained:** screen median p95 delta ≤ A/A median p95 delta + **2 ms**;
+  likewise p99; screen total underrun excess ≤ A/A total underrun excess
+  (**zero** extra-count tolerance).
+- **Constrained:** screen median p99 delta ≤ A/A median p99 delta + **20 ms**;
+  screen median underrun-fraction delta ≤ A/A median fraction delta +
+  **0.005** (0.5 percentage points, not 0.5 percent relative).
+- **Both:** screen tail-pair count ≤ A/A tail-pair count + `floor(N / 10)`.
+  A tail pair exceeds any original absolute per-pair rule: unconstrained,
+  p95 or p99 delta > 2 ms or any excess underrun count; constrained, p99
+  delta > 20 ms or fraction delta > 0.005. Count the union once per pair.
+  At eight pairs there are **zero additional tails** above A/A; at ten, one.
+  This keeps intermittent starvation visible even when the median is unchanged.
+  All applicable comparisons must pass; equality passes. Median latency is
+  still reported as a diagnostic, without a separate gate.
+
+**Statistical interpretation.** This deliberately uses a deterministic
+comparison of descriptive metrics, rather than a bootstrap/permutation
+p-value. Eight or ten pairs and rare underrun steps provide little information
+about the tail distribution; a bootstrap cannot recover unseen steps, while
+"no significant difference" in a low-power test would not establish that a
+regression is within tolerance. An upper confidence bound for noninferiority
+would be preferable for a powered experiment, but at this sample size it
+would often be inconclusive even for A/A. The chosen rule implements the
+owner's empirical noise allowance without presenting it as 95% confidence.
+
+It reduces false failures from host noise already visible in interleaved A/A.
+Finite-sample differences can still falsely fail two equivalent sets,
+especially signed underrun counts with zero tolerance. Conversely, unusually
+bad A/A can mask a real screen regression, and eight pairs can miss rare
+starvation. Interleaving and balanced seeds/order reduce drift bias; the
+separate tail/count checks catch regressions a median hides. They do not
+remove sampling uncertainty or establish an absolute latency bound. Preserve
+both sets and every failed run, investigate suspicious calibration, and do
+not rerun selectively until a pass. `--null` collects two interleaved A/A
+sets for repeatability diagnosis; it cannot establish acceptance under load.
+
+**Output and VM command.** `summary.json` records `sets.aa` and `sets.screen`
+side by side within every scenario: all pairs, median deltas, arm underrun
+totals, underrun excess and tail count. `comparison` lists A/A, screen,
+tolerance, limit, screen-minus-A/A and pass for each applicable metric;
+`checks` and `pass` give the scenario verdict. `execution_order` pins seeds
+and ordering; each set has its own manifest, CSVs, JSON and logs in
+`<scenario>/aa/` or `<scenario>/screen/`. Run/load errors are recorded and
+leave the overall verdict false.
+
+From the checked-out PR head at the repository root on an otherwise idle VM:
+
+```sh
+export CARGO_BUILD_JOBS=4
+export CARGO_TARGET_DIR="$PWD/target"
+cargo build --release -p gwar-client --example latency
+python3 -B -m unittest discover -s scripts/latency -p 'test_*.py'
+python3 -B scripts/latency/screen_gate.py \
+  --binary target/release/examples/latency --pairs 8 --markers 100 \
+  --out "/tmp/gwar-gate-calibrated-$(git rev-parse --short HEAD)-$(date -u +%Y%m%dT%H%M%SZ)"
+```
+
+The example embeds a fresh loopback server; a standalone server build is not
+needed for this command. Do not add `--null`. All six scenarios run by default. For a targeted downlink rerun, add
+`--scenario downlink --scenario downlink-loss`; the repeatable selector preserves
+all calibration, load and tail rules. A shared-pacing change also needs an
+uplink sanity run (`--scenario uplink --pairs 4 --markers 100`) in a separate
+output directory.
+On a 4-vCPU host, ten pairs **per set** means 240 processes. The measurement
+window is `1 + 15 + 0.25 × markers + 2` seconds = **43 s** at 100 markers:
+**2 h 52 min** before setup/teardown, about **3.2 h** allowing five seconds
+per process for startup, connections and shutdown. The recommended/default
+**eight pairs per set** means 192 processes, **2 h 18 min** of measurement,
+about **2.56 h (2 h 34 min)** with the same allowance. These are planning
+estimates, not measured timings on this head; build time is additional and
+host scheduling can extend them. Reducing pairs by 20% preserves even order
+balance and 100-marker p95/p99 sampling, with 800 markers per arm/set/scenario;
+it weakens rare-event coverage. Using fewer than 100 markers would make p99
+still more dependent on the maximum marker, so the marker count stays 100.
+Set `--pairs 10` for the longer run if the VM time budget permits.
+
+**Load validity and diagnostics:**
+
+- Every screen run must report the expected load spec and every expected viewer
+  must receive at least 60 % of the scenario's intended steady media rate
+  (8 Mbps for unconstrained/uplink; one 3 Mbps share for downlink), over at
+  least one settled second. Unconstrained runs must also report **zero pauses**,
+  including startup; even a resumed pause fails. Missing pause metadata fails.
+  A missing, failed or quiet load fails the run; load-task errors propagate
+  through the example's nonzero exit and are never calibrated away.
+- Voice sender/receiver have explicit relay roles: both plaintext and encrypted
+  voice rewrite their SDP answer candidates to the role's UDP endpoint. Shared
+  seeds select the same voice impairment streams even when screen flows arrive
+  first. The relay reports the seeds actually installed on each flow; a real
+  voice/relay/screen integration regression pins them. The shared bottleneck
+  still intentionally couples queueing across flows.
+- The gate output reports `queue_max_ms`, `scheduling_lateness_max_ms` (actual
+  relay send minus scheduled release) and `scheduling_late_over_5ms`, separately
+  for each direction and run. Queue residence excludes relay/runtime lateness.
+- Every viewer also reports `receive_scheduling` in the final JSON and each
+  500 ms sample: datagrams, maximum wake lateness, wakes over 5 ms, maximum
+  receive/str0m processing time and control-send errors. A 5 ms heartbeat
+  measures idle/paused viewers too. These are local processing times, not
+  kernel packet-arrival timestamps. `transitions` records the viewer, share,
+  reason and wall-clock time of every pause/resume. The gate enables screen
+  debug logs by default (unless `RUST_LOG` is supplied); bandwidth pauses name
+  their trigger: `average`, `keyframes`, `extras` or `priority`.
+- `rate=` is one bottleneck per direction shared by every flow, so the voice
+  sender shares the 10 Mbps uplink with the publisher, and the voice receiver
+  the 5 Mbps downlink with the viewer. Loss variants add 1 % loss both ways.
+  The unconstrained scenarios have five viewers, directly (no loss) or all
+  through the relay (loss); the uplink ones one viewer, directly.
+- **Deviation:** the downlink scenario uses two **3 Mbps** Smooth shares, not
+  4 Mbps. `B` is 80 % of an estimate that stays below the 5 Mbps link
+  (4.4–4.7 Mbps measured), so a 4 Mbps share never fits: both paused and no
+  video ran beside the voice. With 3 Mbps one share pauses and the other
+  runs at 3.0 Mbps.
+- The load runs on its own runtime and the relay on its own thread: on the
+  example's shared two-thread runtime, the relay forwarding 45 Mbps added
+  30–90 ms to the voice beside it, which is the harness and not the network.
+- **Historical results under the old absolute rule** (2026-10-22, Apple
+  silicon laptop with 10 cores, shared
+  with other agents' builds, load average 4–7; 60 markers a run after a 15 s
+  warm-up). Median per-pair deltas in ms (median / p95 / p99), underruns
+  baseline → screen:
+
+  | Scenario | Pairs | Δ median | Δ p95 | Δ p99 | Underruns | Gate |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | unconstrained, 5 × 7.8 Mbps | 2 | −5.7 | −5.1 | −4.6 | 1 → 0 | pass |
+  | unconstrained + 1 % loss | 2 | +1.0 | −6.9 | −2.3 | 0 → 0 | pass |
+  | uplink 10 Mbps, 7.7 Mbps share | 2 | +4.9 | +0.2 | −4.4 | 2 → 0 | pass |
+  | uplink + 1 % loss | 2 | −9.1 | −10.6 | −13.9 | 3 → 0 | pass |
+  | downlink 5 Mbps, 2 × 3 Mbps | 2 | +7.1 | −12.0 | −12.0 | 0 → 3 | pass |
+  | downlink + 1 % loss | 2 | +50.3 | +55.6 | +66.3 | 0 → 9 | **miss** |
+  | downlink, rerun | 4 | +18.1 | +23.1 | +23.1 | 0 → 8 | **miss** |
+  | downlink + 1 % loss, rerun | 4 | +12.1 | +2.5 | +2.7 | 1 → 1 | pass |
+
+  The baselines alone ranged from 46 to 90 ms median between runs of the
+  same build, so two pairs settle nothing; the misses come from **one
+  outlier pair each**. In those runs (2 of 12 constrained-downlink screen
+  runs) both shares ended paused, the voice receiver got no audio for about
+  140 ms around 12 s, and its playout stayed near 170 ms afterwards; the
+  relay's queue never exceeded 31 ms, so the gap was not on the simulated
+  link. Eight further single runs with tracing, and three with the failing
+  pair's seed, did not reproduce it. Without the outliers the downlink
+  scenarios cost voice about +10–20 ms median and a few ms at p95/p99.
+- **Left for the VM:** the calibrated six-scenario run above, which decides
+  the gate, on a host that runs nothing else. If the outlier mode shows there,
+  the next step is the isolation the gate names: the screen task on its own thread,
+  off the runtime that carries voice. Round 1 adds relay lateness instrumentation;
+  it does not diagnose the outlier. Static inspection found no clear, cheap
+  blocking operation to remove from the SFU screen loop, so isolation remains
+  conditional on the full VM gate.
+
+Round-1 local sanity (debug binaries, one downlink-loss pair with eight markers
+per run): the earlier pair passed; the final pair failed p99 (+64.9 ms) and the
+new tail rule, with 2.25 Mbps still reaching the viewer. Its downstream queue
+max was 15.2 ms and relay scheduling lateness max was 23.5 ms (61 sends over
+5 ms). These short runs are not acceptance, and no outlier diagnosis is made.
+The separate CPU sanity check observed 4.01 Mbps over a shared 3.51 s interval;
+its one point is not a CPU scaling measurement.
 
 ### Admission and resource limits
 
@@ -531,7 +821,11 @@ Limits are enforced continuously, not only when a share or watch is admitted:
     newest guest first, across all shares, until it fits. Those guests are
     paused (`screen.paused {reason: "budget"}`) and their reservations are
     released at once, so the member is admitted in the same request. Only
-    when no guest reservation is left does the member get `busy`.
+    when reclaiming every guest reservation would still be insufficient does
+    the member get `busy`; a refused request leaves existing guests alone.
+    Members also reclaim guest viewer slots on a full share before returning
+    `busy`. Paused guests keep counting toward the 10-guest connection limit,
+    but hold neither a viewer-slot reservation nor a live media grant.
   - **A paused guest resumes only by passing admission again.** Every 5 s
     the server re-admits paused guests, oldest pause first, while their
     reservation fits beside every member's. A member is never paused to
@@ -540,9 +834,15 @@ Limits are enforced continuously, not only when a share or watch is admitted:
     reserve 32 + 25 × 10.4 = 292 Mbps and lock members out, while real guest
     egress (around 200 Mbps) never trips the measured overrun below.
   - The screen task also measures real egress every second, including
-    retransmissions and padding, from str0m's `Event::PeerStats`, enabled with `set_stats_interval(1 s)`.
+    retransmissions and padding. As built it counts the bytes of every
+    datagram its transports hand to the socket (the send function that
+    enforces the per-viewer cap) rather than str0m's `Event::PeerStats`,
+    which reports per-stream RTP and would miss STUN, DTLS and RTCP.
   - When it stays over budget for 5 s, guest watches are paused first, then
-    the newest member watches.
+    the newest member watches, one a second while it stays over
+    (`screen.paused {reason: "budget"}`; guests arrive with PR 6). A paused
+    slot keeps its reservation. Budget pauses resume through the usual resume
+    rule once egress has stayed at or under 90 % of the budget for 10 s.
 - **Negotiation.**
   - At most 4 `screen.*.offer` per session per minute.
   - A guest connection gets exactly one accepted `guest.offer`. A second one
@@ -659,7 +959,9 @@ end-to-end layer.
   within a per-viewer egress cap, enforced at the socket send ("Per-viewer
   egress cap" below).
 
-Nothing is promised about downstream network queues; the SFU cannot see them.
+The SFU cannot observe every downstream queue. It smooths all screen RTP before
+transmission, reserving voice headroom in ordinary traffic and bounding probe
+rate and duration; the calibrated downlink gate measures the shared bottleneck.
 
 **Why str0m's pacer cannot be the queue:**
 
@@ -672,7 +974,7 @@ Nothing is promised about downstream network queues; the SFU cannot see them.
 **Original packets: a Gwar-owned queue.**
 
 - Every forwarded video `StreamTx` gets `set_unpaced(true)`. The pacer then
-  sends those packets on the next `poll_output` without holding them
+  bypasses its ordinary queue-draining rate policy for those packets
   (`pacer/leaky.rs`: "Unpaced packets … are sent immediately").
   - TWCC, BWE updates and probe eligibility stay active (`session.rs`).
   - str0m uses this mode for audio by default.
@@ -681,14 +983,21 @@ Nothing is promised about downstream network queues; the SFU cannot see them.
   - One leaky bucket per viewer releases them at that viewer's whole budget,
     serving slots in strict priority order ("Bandwidth allocation per viewer"
     below).
-  - Released packets go to `write_rtp` and leave on the same iteration's poll.
+  - Released packets go to `write_rtp`; a shared transport pacer then smooths
+    them together with repairs and probes before TWCC send times are assigned.
+    Originals are checked against their arrival deadline again at the socket.
 - **Deadline.** Each packet carries `deadline = arrival + 400 ms`. A packet
   still queued at its deadline is evicted, with every later packet of its
   frame, and the slot waits for a keyframe.
 - **Bounded admission.** A packet enters a slot's queue only if the viewer's
   queued bytes stay at or under `max(64 KB, 400 ms × release rate)`.
   Otherwise it is dropped like an eviction. The bound is checked per packet,
-  so it never overshoots.
+  so it never overshoots. As built, a packet that would overshoot first takes
+  the room of lower-priority slots (their queues drop, lowest first, and wait
+  for a keyframe); only what still does not fit drops from its own slot.
+- Both kinds of drop immediately request a keyframe for every dropped lane,
+  including a lower slot evicted by admission, through the existing viewer
+  budget and publisher throttle. Recovery does not wait for publisher traffic.
 - Both kinds of drop are recorded per frame. A keyframe that loses any packet
   either way is a **failed keyframe**, which the pause rule counts.
 - **Pause, unwatch and drops clear the queue at once.** Only packets released
@@ -704,9 +1013,12 @@ limit is a target, not a bound:
 - eviction runs only when a packet is cached
   (`streams/rtx_cache.rs`, `cache_sent_packet` → `maybe_evict`);
 - it scans in sequence order and stops at the first fresh entry
-  (`streams/rtx_cache_buf.rs`, `evict`). A delayed publisher repair with a
-  lower sequence number, cached later, therefore shields older entries behind
-  it while traffic continues;
+  (`streams/rtx_cache_buf.rs`, `evict`). The design expected a delayed
+  publisher repair with a lower sequence number, cached later, to shield
+  older entries behind it. PR 3b's test found that str0m 0.24.1 does not
+  cache it at all ("Do not cache values preceding evict position" in
+  `rtx_cache_buf.rs`, `push`): it shields nothing, and a viewer's NACK for
+  it goes unanswered, so that viewer repairs the frame with a keyframe;
 - lookup checks no age;
 - padding probes reuse cached packets without the NACK limiter
   (`streams/send.rs`, `poll_packet_padding`);
@@ -728,56 +1040,116 @@ limit is a target, not a bound:
     `maybe_periodic_alr`);
   - when the estimate has stagnated for 15 s with unmet demand.
 
-  str0m 0.24.1 offers no public setting to cap or disable them; only the
-  desired bitrate steers them. Their volume is capped by the egress cap below.
+  The default probe ceiling is **1.2 × estimate**. The highest-priority share's
+  demand can raise it to at most 2×; lower-priority shares cannot force that
+  increase. This is a combined RTP rate: media
+  sent during a probe consumes its budget instead of adding to padding.
+  Screen-watch probes use a nominal 10 ms target (two 5 ms wakes), retaining
+  the five-packet requirement and distinct send timestamps. Coarse clocks allow two regular wakes
+  plus 2 ms, still within the existing byte reserve, for usable timestamps. Their purpose
+  is to test capacity above the estimate, so a short probe can temporarily
+  consume voice headroom; it cannot send a whole frame at line rate.
 
-**Per-viewer egress cap: originals, repairs and probes together.**
+**Per-viewer pacing and egress cap: originals, repairs and probes together.**
 
-Nothing inside str0m bounds repair or probe volume for a viewer:
+Each watch transport enables the vendored `Bwe::set_egress_pacing` before its
+first probe. This adds a shared wire-byte debt to str0m's pacer, including
+streams marked unpaced, RTX and generated padding. It operates before SRTP
+output and TWCC accounting; neither delayed encrypted datagrams nor false send
+timestamps are needed. Ordinary screen RTP is limited to **0.8 × estimate**;
+short probes normally use **1.2 × estimate**. The actual ceiling is
+`min(2 × estimate, max(1.2 × estimate, N / 0.8))`, where `N` is the largest
+of 1.2× the highest-priority share's measured average and its largest keyframe
+divided by 400 ms, all in bits per second. Before any media has been measured,
+1.1× its admission cap supplies the bootstrap demand. That cap is the server's
+ceiling, not the encoder's rate; continuing to probe for it would repeatedly
+overload a smaller downlink even after its priority share fits. This discovers
+keyframe room without letting a second share that cannot fit drive startup
+bursts. Queue pressure cannot raise these limits. Normal bursts allow 2 ms of
+the rate, with a one-MTU floor and one packet of rounding. Regular scheduler
+cadences up to 20 ms are learned only while RTP is queued: idle frame gaps
+cannot enlarge a later burst, and long stalls do not earn credit. Queue counts
+are reduced after each send. Pacing wakes when the next packet becomes eligible,
+and cadence learning uses lateness against that deadline rather than treating an
+intentional debt-drain wait as scheduler delay. Otherwise the pacer can inflate
+its own bursts even with a fine runtime clock. Voice has its own transport and
+never waits in this screen pacer. Control traffic bypasses it.
 
-- unpaced streams also send queued resends at once (`streams/send.rs`,
-  `queue_state`);
-- the RTX ratio is recalculated every 50 ms, so repeated NACKs can burst
-  first;
-- padding bypasses it.
+Pacing and TWCC use serialized SRTP bytes plus 48 bytes for IPv6/UDP, also on
+IPv4. Previously probes and BWE counted payload bytes while the socket cap
+counted serialized bytes. Small padding packets therefore understated occupied
+capacity; the resulting estimate, multiplied by the allocator's 0.8, could
+incorrectly pause a fitting 3 Mbps share on a 5 Mbps link. Unpaced repairs and
+probe bursts could also queue voice despite an acceptable average bitrate.
+No random-loss exemption or minimum estimate is imposed: delay and loss BWE
+still detect actual congestion and collapse. A successful probe replaces both
+the loss-limited estimate and its state, as in WebRTC
+`LossBasedBweV2::SetBandwidthEstimate`; the previous decreasing/HOLD state
+cannot silently reapply its old cap to newly demonstrated capacity. Paced probes
+with a local send gap above 20 ms are discarded as scheduler-stalled samples;
+they cannot turn a delayed callback into a capacity collapse. Known lost sends
+participate in this gap check, so random network loss does not masquerade as a
+local stall. Regular sends that queue downstream remain valid congestion samples.
+The setting and probe ceiling survive estimator resets and track new estimates.
+An active short probe finishes its dispatched plan: changing its rate in response
+to its own partial feedback would turn application backoff into a false capacity
+measurement. Later clusters use the updated ceiling.
 
-So Gwar enforces the bound where it owns the path: **at the socket send.**
-Every `Output::Transmit` of a watch transport goes through the screen task's
-send function. SRTP leaves the RTP header in the clear, so each datagram is
-classified by its header, with no decryption:
+The explicit screen ceiling also marks these transports application-limited for
+loss estimation and periodic discovery. An 80% policy ceiling is above the
+automatic ALR detector's 65% threshold; an ACK rate under that policy is not a
+measurement of network capacity. Probe-SSRC bytes do not count as application
+media. An unsaturated underfilled probe can raise a capacity floor, but cannot
+lower a prior estimate or reset a genuine loss-limited state without new
+capacity evidence. Slower reception and ordinary delay/loss feedback still
+reduce the estimate on actual congestion.
 
-- **Originals:** RTP on a slot's main SSRC. They are already paced by the Gwar
-  queue at `B = 0.8 × estimate` and are only counted here.
-- **Extras:** RTP on any other SSRC, that is, the RTX SSRCs (repairs and
-  padding) and str0m's probe SSRC. They pass through **one token bucket per
-  viewer**:
-  - rate `0.1 × estimate`;
-  - burst `max(64 KB, 30 ms × 2 × estimate)`, enough for a str0m probe
-    cluster at up to twice the estimate. This is the reserved probe capacity.
-- **Control:** RTCP (payload types 192–223), STUN and DTLS are small and
-  always sent.
+Application-limited ACK throughput is not used as a capacity candidate. The
+previous maximum-of-probes tracker also no longer supplies a hard upper bound:
+proving one rate says the link can carry at least that rate, not that it cannot
+carry more. Delay and loss bounds still constrain growth and detect collapse.
 
-A viewer's sustained egress is therefore at most `0.9 × estimate` plus control
-traffic, with bursts bounded by the extras burst. RFC 4588 §7 asks for exactly
-this: originals and retransmissions counted together. Voice runs on a
-separate transport and keeps the remaining 10 %.
+Gwar retains its independent socket-volume backstops. Each outgoing datagram is
+classified by its clear header, without decryption:
 
-**When the extras bucket is empty,** the datagram is **dropped at the socket**.
-That is immediate and needs no str0m change:
+- **Originals:** RTP on a slot's main SSRC. The Gwar queue admits and releases
+  conservative serialized bytes at `B = 0.8 × estimate`. Its admission and
+  share meters reserve 64 bytes per packet for RTP/SRTP overhead. Release
+  credit retains one 1264-byte packet beyond its regular 10 ms refill
+  window, with a 2400-byte floor, so fractional packet credit is not clipped on
+  every wake. Otherwise a 3.7 Mbps allocation can deliver only 2.8 Mbps at a
+  10 ms cadence. The window expands to 30 ms when scheduler wakes exceed 10 ms.
+  The socket bucket checks actual SRTP bytes at `B` and adds one further
+  1264-byte packet of rounding: the shared pacer can mix originals and
+  RTX at different burst boundaries from the release queue. It cannot send
+  beyond the shared wire-rate ceiling. An original that reaches
+  its 400 ms deadline after release is discarded at transmission, its lane is
+  cleared and recovery uses the existing keyframe budget and publisher throttle.
+- **Extras:** all other RTP (RTX and probe SSRCs). One viewer-wide socket
+  bucket allows `0.1 × estimate`, with burst `max(64 KB, 30 ms × 2 × estimate)`.
+  This is a volume reserve, **not permission for an instantaneous socket burst**:
+  the shared pacer spreads it over time. Background padding is suspended while
+  the reserve refills. Probe targets include header and packet-rounding room.
+- **Control:** RTCP, STUN and DTLS are sent immediately.
 
-- A dropped repair is like a lost one. The viewer NACKs again, or the slot
-  recovers through a keyframe.
-- A probe cut short can fail to give a valid result, or give one from the
-  packets that arrived, so the estimate can grow more slowly. That errs on the
-  safe side.
-- str0m already gave dropped packets TWCC numbers, so the viewer reports them
-  lost. str0m's loss controller then lowers the estimate of an overloaded
-  viewer, which is the right direction.
+Socket-volume accounting excludes UDP/IP; the pacer and BWE include it. The
+long-term socket-volume bound remains `0.9 × estimate` plus control and initial
+bucket credit, while the shared wire pacer limits ordinary RTP to 80 %. Originals
+and repairs share that paced capacity, preserving 20 % for voice and other media
+even while repairs overlap a frame. A rejected original clears its lane and counts its failed keyframe;
+a rejected extra can be retried by NACK or later probing. Pending BWE events
+are drained before originals are released, so both layers use the current
+estimate. Socket drops can reduce BWE through TWCC loss; accurate pacing avoids
+manufacturing those losses during ordinary probe and repair traffic.
+
+The small-packet protection remains: cached payloads smaller than 240 bytes
+are not reused for probes; blank padding is sent instead. They remain available
+for NACK repair. See `vendor/str0m/GWAR-PATCH.md`.
 
 **Escalation.** If the extras bucket drops packets in more than 2 s of any 5 s
 window, the viewer's lowest-priority slot is paused with reason `bandwidth`.
-The pause wipes that slot's cache, as above. Resuming follows the usual
-resume rule.
+The pause wipes that slot's cache, as above. This trigger also respects the
+10 s ramp. Resuming follows the usual resume rule.
 
 The 1.3 × charge in "Admission and resource limits" stays an admission
 estimate. This cap is what enforces it at egress, per viewer. The server-wide
@@ -787,7 +1159,10 @@ egress check remains a backstop.
 `StreamTx::set_rtx_cache` **replaces the cache with an empty one**
 (`streams/send.rs`: "Dump old cache"). Pause, unwatch and slot reassignment
 call it on the slot's stream. After that, neither a late NACK nor a probe can
-send anything of the old media on that stream.
+send anything of the old media on that stream. As built, pause, unwatch and
+reassignment all use the local direction switch described under "Requests",
+which drops the stream's held packets and queued resends along with the
+cache; the pin test covers `set_rtx_cache` for the fallback.
 
 **Options considered and rejected:**
 
@@ -813,16 +1188,22 @@ send anything of the old media on that stream.
   eviction, repairs get a hard bound at no cost. That is worth proposing
   upstream, but phase 1 does not depend on it.
 
-**Tests in PR 3b**, with str0m viewers behind the relay's `rate=` bottleneck.
-Every check timestamps packets **at the SFU's socket send**, against their
-arrival from the publisher:
+**Tests in PR 3b**, with str0m viewers behind a constrained link. Every check
+timestamps packets **at the SFU's socket send**, against their arrival from
+the publisher. Built as `media/screen/sim.rs`: the screen task's watch
+transport, egress and allocation code driven on a simulated clock against a
+str0m viewer behind a simulated bottleneck (rate, 100 ms queue, loss, 10 ms
+delay), so the timings are exact and the runs repeatable. The relay's `rate=`
+serves the voice acceptance instead. Results and deviations:
 
 - **A bandwidth collapse** from 10 to 1 Mbps mid-share: no original is sent
   past 400 ms, and the viewer is paused by the allocation rule.
+  Built (`a_bandwidth_collapse_sends_no_stale_original_and_pauses_the_viewer`).
 - **Pause and unwatch:** after the pausing iteration, nothing of the slot's
   old media is sent. That covers originals, a NACK for a packet sent just
   before the pause, and a forced BWE probe on the same watch transport, which
-  sends only blank padding or other active slots' media.
+  sends only blank padding or other active slots' media. Built
+  (`pause_and_unwatch_stop_everything_of_the_slot`).
 - **A reordered publisher repair:**
   - 102 arrives at 0 ms and is sent at 390 ms;
   - a delayed 101 is sent at 580 ms;
@@ -832,16 +1213,165 @@ arrival from the publisher:
   The test records whether str0m still serves it, so a str0m change is
   noticed. It asserts the viewer's playout is unaffected (no extra freeze,
   frames byte-identical) and a pause still wipes the shielded entry.
+  Built (`a_late_nack_after_a_reordered_publisher_repair_and_a_pause`):
+  str0m 0.24.1 never cached the late 101, so 102 is not served (the test
+  asserts that); every other packet arrives byte-identical, and the pause
+  wipes the cache.
 - **A NACK storm:** a viewer NACKs the whole cache repeatedly, 50 times a
   second. Its bytes at the socket stay within
   `(0.8 + 0.1) × estimate × t + burst` plus control traffic. Its
   lowest-priority slot is paused by the escalation rule. Other viewers and the
   voice gate in "Voice headroom and acceptance" are unaffected.
+  Built (`a_nack_storm_stays_within_the_egress_cap_and_pauses_the_lowest_slot`)
+  with deviations: str0m's RTX ratio cap (0.15) answers only part of a storm,
+  which then fits the 0.1 reserve unless media runs near `B`, so the storm is
+  fresh NACKs for every packet, replayed every 20 ms, on a 6 Mbps link with
+  5 % loss and two shares. Replaying TWCC feedback as well collapsed the
+  estimate instead. The single-viewer simulation cannot show other viewers;
+  they share nothing with it but the screen task.
 - **Probes fit the reserve:** after the bandwidth collapse ends, allocation
   and periodic ALR probes go out whole within the extras burst, and the
-  estimate recovers to the link rate as it does with the cap disabled
-  (paired runs).
-- **A test pins str0m behavior:** `set_rtx_cache` empties the cache.
+  capped estimate does not trail the uncapped estimate by more than 10 %.
+  Capping can improve feedback by preventing probe loss. The
+  separate recovery regression requires resumed media above 60 % of its
+  intended rate. Built (`probes_after_a_collapse_fit_the_reserve`), with a
+  finding fixed after the `07e2f24` VM gate: the probe pacer waited between
+  individual padding packets instead of draining each generated burst. A
+  240-byte blank packet per 2 ms wake limited discovery to about 1 Mbps even
+  on a healthy link. The local str0m patch now drains each burst immediately
+  and spaces only successive bursts on transports without the shared ceiling.
+  Watch transports now queue a complete cluster for one wire-byte pacer, rather
+  than having padding generation and transmission each pace the same probe.
+  Regular cadences up to 20 ms can extend the nominal 10 ms target to two wakes
+  plus 2 ms for usable timestamps, within the existing byte reserve. Longer
+  stalls never increase retained cadence. Originals and repairs consume the
+  same probe rate, and actual transmission times drive feedback.
+
+  Every screen-watch transport dispatches clusters at least one second apart,
+  including startup pairs and fast active viewers. Target increases wait for a
+  full reserve within one MTU, and background padding stops at its source while
+  it refills. This prevents reserve exhaustion from manufacturing TWCC loss.
+
+  A fully bandwidth-paused viewer restarts ordinary startup probing from the
+  same 2.5 Mbps estimate as a fresh subscriber, as soon as the reserve is ready.
+  If no paused lane fits, it retries after 15 s once the reserve refills. A
+  continuous-fit guard in progress finishes before another reset, and ready
+  priority handoffs/resumes run first. There is no custom recovery probe,
+  estimate-progress tracking or adaptive target backoff. Resets discard
+  congestion/ACK/loss history, estimate smoothing,
+  in-flight TWCC send records, pending padding from both the fallback and every
+  media/RTX source, pacer debt and scheduler history. Queued media and repair
+  caches survive the reset. RTP, TWCC and SRTP sequence counters and the
+  transport stay intact.
+  Existing socket credit is preserved, never replenished by a reset. Both
+  desired-bitrate copies are clamped to 1.5 times the new estimate before reset.
+  Once the normal ten-second continuous-fit guard permits resume, sparse
+  pause-time feedback is discarded again at the measured capacity, so active
+  video starts with fresh measurements.
+
+  Capacity rediscovery also fills the first probe burst at the right clock.
+  Released media can start an unpaced cluster before padding is requested.
+  The first padding request now tops up that same burst, counting media already
+  sent, instead of waiting another scheduler wake and sending a large late tail.
+  That distorted burst pattern could undermeasure a healthy link and cause a
+  false re-pause after a successive or long outage. Byte-limited bursts still
+  leave a tail for a later timestamp, including when media starts the cluster.
+  Paced media retains its original timing and first-burst size.
+
+  Released media can also consume that reserved tail at the first timestamp.
+  Once their byte and packet targets are met, byte-limited probes remain open
+  for a later timestamp within the supported regular cadence (at most 20 ms).
+  If no media arrives then, one blank packet uses the existing MTU rounding
+  reserve. A longer scheduler stall ends that single-timestamp cluster without
+  tagging another packet; its invalid result is discarded, so scheduling delay
+  cannot become a false low-capacity sample. Without this guard, the estimator rejected zero-duration clusters,
+  leaving a healthy 20 Mbps viewer at about 7.75 Mbps estimated capacity and
+  pausing it at 15.06 s with 1% loss and 15 ms scheduling. The separate
+  outage-free regression requires zero pauses for every cadence from 1 through
+  20 ms at 0%, 1% and 2% loss (60 cases), plus at least 7.2 Mbps received in
+  each of the final three ten-second windows. Neither allocator thresholds nor
+  upstream's unbounded-probe timing changes.
+
+  This allocator-driven pause does not exist on current `main` (`a78f775`):
+  source comparison confirms it has no screen bandwidth allocator and its watch
+  transports do not enable BWE. This is a source-based comparison; the PR's
+  simulation cannot run unchanged there because that egress path is absent.
+
+  Permanent regressions include the reviewer's exact 15 ms cadence with a
+  100 ms stall every 2 s and a 12-42 s collapse, and the successive 12-42 s
+  and 222-251 s collapses with 1% loss. Parameterized cases cover 1/10/15/20 ms
+  cadences, 60/100/150/250 ms stalls every 1.3/2/3.5/5 s, one to three outages,
+  and 0-2% loss. Every restored interval requires resume within 180 s, no
+  re-pause, and at least 7.2 Mbps received in each of its final three ten-second
+  windows. The existing 70-case matrix keeps the same assertions.
+
+  The originals release and socket buckets retain 10 ms of credit at normal
+  cadences and allow 30 ms when measured wakes exceed 10 ms. This covers the
+  tested 20 ms cadence plus estimate-change margin; their rate remains
+  `0.8 × estimate`. The fixed 10 ms capacity discarded half the pacing credit
+  between 20 ms wakes and repeatedly starved resumed video. The extras rate,
+  socket cap and bucket capacity, and every pause/resume threshold remain
+  unchanged. Release and socket credit refill under the old burst window before
+  its size changes, so released media cannot spend credit the socket clipped.
+  Pacer snapshots refresh immediately after writing released originals.
+
+  The supported resume rule is **10 s of continuous measured room**.
+  Capacity rediscovery after physical restoration adds a delay that is not
+  bounded in general; neither 10 s nor the previous 45 s claim is a general
+  recovery deadline. The earlier regression missed 28/29 s collapses, slow
+  15/20 ms cadences and downlink loss.
+
+  The parameterized regression
+  (`game_recovers_after_different_collapse_durations`) runs an 8 Mbps/60 fps
+  Game share with a 200 KB keyframe. A 20 Mbps link collapses to 1 Mbps at
+  12 s for 15, 28, 29, 30, 30.1, 60 or 120 s. Each duration runs at 1, 5, 10,
+  15 and 20 ms SFU cadences, on a lossless link and with 1 % downlink loss
+  throughout: 70 cases. All observe another 360 s after restoration,
+  require resume within a generous 180 s test bound, forbid subsequent
+  pauses, and require at least 90 % of the intended payload rate in each
+  of the final three ten-second receiver windows. This is a deterministic
+  regression bound for these fixtures, not a production recovery guarantee.
+  Every case must have zero startup pauses and send originals before the
+  outage, then meet the same recovery assertions.
+  The separate scheduling-restoration case changes 10 ms back to 1 ms
+  40 s after restoration and applies the same resume and throughput checks.
+
+  These tables were regenerated from the complete 70-case regression with the
+  timestamp guard and complete padding-reset fixes above.
+
+  **Lossless: resume delay in seconds after physical restoration.**
+
+  | Collapse | 1 ms | 5 ms | 10 ms | 15 ms | 20 ms |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | 15 s | 28.644 | 15.845 | 14.550 | 54.735 | 33.960 |
+  | 28 s | 15.644 | 18.645 | 16.650 | 41.735 | 20.960 |
+  | 29 s | 14.644 | 17.645 | 15.550 | 40.735 | 19.960 |
+  | 30 s | 13.644 | 16.645 | 14.550 | 39.735 | 18.960 |
+  | 30.1 s | 13.544 | 16.545 | 14.450 | 39.635 | 18.860 |
+  | 60 s | 13.644 | 18.245 | 14.550 | 28.530 | 24.760 |
+  | 120 s | 39.644 | 21.445 | 14.550 | 19.035 | 18.460 |
+
+  **1 % downlink loss: resume delay in seconds after physical restoration.**
+
+  | Collapse | 1 ms | 5 ms | 10 ms | 15 ms | 20 ms |
+  | --- | ---: | ---: | ---: | ---: | ---: |
+  | 15 s | 28.844 | 15.645 | 15.550 | 39.090 | 32.460 |
+  | 28 s | 15.844 | 17.545 | 16.650 | 26.090 | 19.460 |
+  | 29 s | 14.844 | 16.545 | 15.550 | 25.090 | 18.460 |
+  | 30 s | 13.844 | 15.545 | 14.550 | 24.090 | 17.460 |
+  | 30.1 s | 13.744 | 15.445 | 14.450 | 23.990 | 17.360 |
+  | 60 s | 13.844 | 18.045 | 15.550 | 30.000 | 24.760 |
+  | 120 s | 40.844 | 21.445 | 15.550 | 22.080 | 19.660 |
+
+
+  The simulated receiver drains str0m after every datagram, preserving its
+  single pending RTP event when several packets arrive within one millisecond.
+- **Tests pin str0m behavior:** `set_rtx_cache` empties the cache. Built
+  (`set_rtx_cache_empties_the_cache`). The vendored str0m regression
+  `padding_limit_survives_reset_and_can_be_removed` checks actual RTP output:
+  disabling regular padding stops it at the source, the limit survives an
+  estimator reset and subsequent updates, probe clusters still run, and
+  removing the limit restores regular padding.
 
 ### Keyframes
 
@@ -879,8 +1409,40 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   the largest keyframe seen on the watched shares in the last 30 s, and at
   least 200 KB. The estimate can then grow enough for keyframes to meet the
   queue deadline, even for low-average shares. The cost is str0m's probes,
-  short clusters at up to 2× desired, which stay inside the viewer's extras
-  bucket ("Per-viewer egress cap").
+  short clusters normally capped at 1.2× estimate and paced together with media,
+  within the viewer's extras bucket ("Per-viewer egress cap").
+
+  Removing the final assignment sets the desired bitrate to zero immediately.
+  The socket suppresses any pending non-control datagrams while nothing is
+  watched, including probe clusters already scheduled by str0m. A retained
+  transport sends zero non-control bytes in the 30 s final-unwatch simulation.
+
+  The desired target is **at most 1.5 × the current estimate**; the actual
+  default probe ceiling is **1.2 × estimate**, raised only for the priority
+  share's demand and bounded at 2×. Both the estimator's probe plan and
+  its continuation threshold use the capped rate. A successful capped probe
+  can therefore continue discovering capacity, without waiting for a result
+  at the original higher target. The already-probed maximum also includes this
+  ceiling: reaching it stops exponential retries at the same rate instead of
+  manufacturing a new cluster on every one-second result timeout. Periodic
+  discovery and a raised ceiling remain available. The existing extras byte reserve also bounds
+  coarse-clock clusters. Target increases wait for reserve refill within one
+  MTU. Screen-watch transports suspend ordinary background padding through
+  `Bwe::set_padding_bitrate_limit(Some(Bitrate::ZERO))`, so it cannot consume
+  the refill while the target waits. Once ready, the background-padding limit
+  is removed. Probe clusters still supply TWCC feedback during a pause;
+  every extra datagram still passes the actual-byte cap. Decreases apply
+  immediately. The earlier 2× reach and its measurements predate the
+  per-packet timer fix and do not describe the corrected pacer's burst behavior.
+- **Ramp.** A slot that starts carrying a share is not paused for its first
+  10 s; failed keyframes and averages start counting after that. Added in
+  PR 3b: a watch transport's estimate starts at 2.5 Mbps, where `B` is
+  2 Mbps and admission 100 KB, so every 1080p share's first keyframe fails.
+  Historical loopback runs before the probe-burst fix needed periodic probes
+  to overcome initial undershoot; scheduling jitter could prevent that
+  bootstrap entirely. The corrected pacer discovers capacity without waiting
+  for original media to fit. The ramp still protects normal BWE startup.
+  A viewer too slow for a share sees broken video for up to 10 s before its pause.
 - **Pause** a slot for that viewer (`screen.paused {share, reason:
   "bandwidth"}`), lowest priority first, when either of these holds:
   - the sum of its 2 s average and the higher-priority slots' averages exceeds
@@ -891,8 +1453,12 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
     3 Mbps estimate, `B` is 2.4 Mbps and the admission bound 120 KB, so a
     204 KB keyframe is rejected at admission before any packet reaches its
     deadline.
-- **Resume** only when, for 10 s:
-  `B − Σ other slots' averages ≥ max(1.2 × its average, K_last / 400 ms)`.
+- **Resume** only after 10 s of continuous measured room:
+  `B − Σ higher-priority intended slots ≥ max(1.2 × its average, K_last / 400 ms)`.
+  The intended set includes active and paused slots in priority order. Focusing
+  an already-paused share reclaims room from lower active slots, one change per
+  tick. Lower slots keep media/feedback flowing while the fit timer matures,
+  then pause on one tick; the focused share resumes on the following tick.
   `K_last` is the share's last keyframe size. Resuming accounts for the
   keyframe it is about to need, so a viewer is not paused again by the very
   keyframe that resumes it. Resuming opens a new segment from a keyframe,
@@ -912,7 +1478,7 @@ emit 204 KB keyframes every 2 s:
 
 - **Room for keyframes.** An unconstrained viewer and a 20 Mbps viewer: neither
   is paused, no packet is dropped, and each keyframe leaves the SFU within
-  `K ÷ B` plus 10 ms.
+  `K ÷ B` plus 30 ms.
 - **Admission overflow.** A 3 Mbps viewer: the keyframes fail at admission,
   the viewer is paused within two keyframes, and it is not resumed while its
   estimate stays at 3 Mbps.
@@ -920,7 +1486,19 @@ emit 204 KB keyframes every 2 s:
   204 KB keyframe fits the 240 KB admission bound but gets only about
   1.8 Mbps, so it expires at the deadline. The average trigger stays below
   `B`, and the keyframe trigger pauses the low-priority slot within two
-  keyframes. The stage share is unaffected.
+  keyframes. The stage share is unaffected during this forced-keyframe interval;
+  startup BWE undershoot/recovery is outside that interval.
+
+All three are built in `media/screen/sim.rs`, with the forced keyframes
+starting after the slot's ramp; "within two keyframes" is measured to the
+second keyframe's deadline, when it fails. Also built there: two equal
+shares on a constrained viewer pause the lower-priority one, the earlier
+watched unless `screen.focus` names the other. A viewer's Retry
+(`screen.watch` of a share it already watches) resumes a slot paused for
+bandwidth at once, through the keyframe throttle; a budget pause waits for
+the server's egress to fall. The server's 10 s under-budget guard and the
+viewer's 10 s fit timer run concurrently, so a fitting share resumes after
+10 s of global room rather than waiting another 10 s.
 
 The sharer is never slowed by viewers. The SFU never relays viewers' estimates
 or REMB to the publisher. The sharer adapts only to its own uplink (TWCC on
@@ -962,6 +1540,16 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
     default-route interface from `/proc/net/dev` (Linux). It adds the delta
     since the last read to a per-calendar-month total persisted in the store.
     A counter lower than the last read (a reboot or a wrap) counts from zero.
+    Default-route selection requires destination/mask zero, RTF_UP and no
+    RTF_REJECT, lowest metric, falling back to `/proc/net/ipv6_route` for a
+    usable IPv6 default.
+    Interface changes rebaseline; they never add that interface's lifetime total.
+    The complete checkpoint (counter, UTC timestamp, totals, coverage and warning
+    level) is one transactional write; memory changes only after it succeeds.
+    An interval spanning UTC months rebaselines instead of charging downtime
+    traffic to the new month. Such a month, an initial partial month and any
+    unavailable interval have `incomplete: true` in `server.egress`; totals are
+    observed usage, not a claim of full-month coverage.
   - The total therefore **includes every service on the host and every
     outbound byte of that interface**: TeamSpeak, a reverse proxy, SSH,
     package updates and backups. Traffic Oracle does not bill (for example to
@@ -976,6 +1564,12 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
   - Admins get a warning at 80 % and 100 % of `monthly_egress_tb` (default
     10). There is no automatic cut-off by default. An optional
     `monthly_egress_stop` refuses new watches above 100 %.
+  - As built (PR 3b): `server.egress` (`manage_server`) answers with the
+    month (UTC), the scope (`host`, `container` or `unavailable`), `incomplete`, the total
+    and the screen SFU's bytes to members and guests, and the limits. The
+    `ScreenLimits` above are server settings, replaced as a whole through
+    `server.update`. Admins online get `server.egress_warning` once per
+    threshold and month.
 - **Network:** A1 shapes get 1 Gbps per OCPU, so bandwidth binds after CPU.
 - **CPU, measured in S3** on an Apple M5, with str0m RTP mode doing SRTP for
   every packet:
@@ -986,7 +1580,16 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
     0.4 % of an A1 core per Mbps**;
   - **100 Mbps of egress (25 viewers at 4 Mbps) ≈ 0.4 of one A1 core**, on a
     task separate from voice.
-  - PR 3b re-measures this on the VM.
+  - PR 3b re-measures this on the VM with `scripts/latency/screen_cpu.py`:
+    one 4 Mbps share and 1–13 viewers against a separate `gwar-server`
+    process, CPU from the process's own counters, the slope over forwarded
+    Mbps by least squares. CPU and received-byte deltas now use the same explicit
+    settled-load snapshot endpoints (CPU interpolated between 500 ms samples).
+    The script checks both separately built binaries. The older local figures
+    below predate this window correction and must be remeasured. Locally (the same laptop, shared with other
+    builds), forwarding 4, 16, 32 and 52 Mbps cost 5.5, 8.8, 13.7 and 18.9 %
+    of one core: **about 0.28 % of a core per Mbps** on top of 4.4 % for the
+    rest of the server, about twice S3's figure. Not yet run on the VM.
 - **Compute allowance.** The account is Always Free (confirmed by the owner,
   2026-10-21). Oracle's Always Free page gives 1,500 A1 OCPU-hours and
   9,000 GB-hours a month, which is 2 OCPUs and 12 GB running continuously.
@@ -2212,6 +2815,20 @@ person.
      and acceptance", including the `LATENCY_NET` `rate=` option and the
      screen load generator.
    - CPU per Mbps measured on the VM, recorded here.
+
+   Built in PR 3b, beyond the list: a 10 s ramp before a new slot's pauses
+   count, the probing target capped at 1.5 times the estimate, stalled viewers
+   retrying fresh startup after 15 s with no lane fitting, Retry resuming bandwidth pauses, and the screen
+   load and gate harness. Round-1 fixes add wire-byte original pacing/capping,
+   tiny-delta-safe probes, priority reclamation, immediate keyframe recovery,
+   atomic timestamped counters with incomplete coverage, paired voice roles,
+   validated screen load, a per-pair tail gate and relay lateness measurements.
+   The VM gate follow-up fixes padding-burst pacing and adds healthy-startup,
+   scheduling-jitter and automatic-recovery regressions, per-viewer receive
+   scheduling and explicit pause-trigger diagnostics.
+   The ten-pair voice gate and the CPU figure on the
+   VM are still to run ("Voice headroom and acceptance", "Cost on the
+   deployment VM").
 4. **Web sharing and watching, plaintext (L, 7–9 days).**
    - `voice/screen.ts`: publish and watch transports, the capture with presets
      and constraints, codec preference, sender parameters with uplink

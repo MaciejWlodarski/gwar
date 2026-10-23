@@ -189,8 +189,16 @@ and accept decimals (0 through 24 hours); percentages require `%` (0 through
   Nonzero `reorder` conflicts with `keep_order`.
 - `seed=42`: unsigned 64-bit seed, either global or inside a direction to
   override the global seed. The default global seed is 1.
+- `rate=5mbit`: a bottleneck of that rate (`kbit`, `mbit`, `gbit` or plain bits
+  per second, 8 kbit/s to 100 Gbit/s), **shared by every flow in the
+  direction**: all clients' uplinks queue behind one `up` link, all downlinks
+  behind one `down` link. A datagram occupies the link for its size plus 28
+  bytes (IPv4 and UDP headers) at the rate, after those queued before it.
+  `queue=100ms` (the default; needs `rate`) bounds the wait: a datagram that
+  would wait longer is dropped (`queue_dropped`, also counted in `dropped`).
+  `queue_max_ms` records the longest wait.
 
-Loss is applied first, then delay/jitter, the optional reorder hold, the stall,
+Loss is applied first, then the bottleneck, delay/jitter, the optional reorder hold, the stall,
 and finally order preservation. The relay treats every UDP datagram alike,
 including ICE/DTLS/RTCP; it never decrypts media. Severe impairments during
 startup can prevent the voice connection. Each direction applies to **both**
@@ -234,11 +242,163 @@ write useful output and still exit unsuccessfully if more than 5% of markers
 are unmatched. Inspect per-marker CSV timelines and applied stall windows,
 because a call's median alone can hide persistent latency after a stall.
 
+The relay runs on its own one-thread runtime, so its scheduling neither takes
+CPU time from the clients and the in-process server nor waits for theirs; with
+a screen load it forwards tens of Mbps.
+
+Sharing one link per direction stands in for a shared access link: with
+`LATENCY_SCREEN` a share's publisher and the voice sender queue behind the same
+`up`, and a viewer and the voice receiver behind the same `down`.
+
 On `a0f5686`, `up:stall=270ms@12s` left about +240 ms on every later marker
 of the call (the SFU re-stamps slot RTP time from arrival, so the burst looks
 like a new talk spurt), while `down:stall=270ms@12s` recovered to baseline
 within one marker. `up:jitter=10ms` cost far more than `down:jitter=10ms`
 (103 vs 63 ms median) for the same reason.
+
+## Screen load
+
+`LATENCY_SCREEN` adds screen shares beside the call (docs/screen-share.md,
+"Voice headroom and acceptance"), for example
+`LATENCY_SCREEN=shares=1,bitrate=8mbit,fps=60,keyframe=200000,viewers=5,via=none`:
+
+- `shares` (1–4) sharer connections join the call's channel and each start a
+  share with the preset whose cap fits `bitrate` (Saver, Text, Smooth, Game;
+  at most 8 Mbps). Each publishes through a str0m frame-mode VP9 sender:
+  synthetic frames of `bitrate / fps` bytes, `keyframe` bytes for the first
+  frame and for every keyframe request, paced by str0m's TWCC pacer.
+- `viewers` (1–13; with `shares`, at most 14, since the server takes 16
+  connections from one address) connections watch every share on a four-slot watch
+  transport and count what arrives and every `screen.paused`/`screen.resumed`.
+  Publish negotiation can complete before the SFU registers a share. A watch
+  retries only `NotFound`, with backoff from 50 ms to 500 ms and a 10 s deadline
+  covering requests and waits together. Other errors fail the run immediately.
+- `via`: which screen transports go through the `LATENCY_NET` relay:
+  `publishers`, `viewers`, `all`, or `none` (the default; all direct).
+- The load runs on its own two-thread runtime, so its str0m loops neither
+  delay the voice clients and the in-process server nor are delayed by them.
+  It starts before voice, so with `LATENCY_WARMUP_MS=15000` the markers start
+  after the slots' 10 s ramp.
+- The run's JSON gains `screen`: frames, keyframes, keyframe requests, bytes
+  published and received, pauses, resumes, the average received rate per
+  viewer and `steady_mbps_per_viewer`, counted from 12 s after the load
+  started. `steady_viewer_mbps` reports each viewer separately, and `samples`
+  contains timestamped cumulative bytes from `settled_unix_s`. Any load task
+  failure fails the run. Without `LATENCY_SCREEN` it is `null`.
+
+`RUST_LOG` logs to stderr, for example
+`RUST_LOG=gwar_server::media::screen=trace` for each watch transport's estimate
+and egress counters every 100 ms.
+
+`scripts/latency/screen_gate.py` runs calibrated acceptance in six scenarios
+(unconstrained, a 10 Mbps uplink with an 8 Mbps share, a 5 Mbps downlink with
+two shares, each also with 1 % loss). Each scenario collects two interleaved
+sets in one invocation of the same binary on the same host: A/A has no screen
+load in either arm; the screen set pairs a baseline without load with the
+scenario's load. Each pair index has four fresh process runs sharing its
+`LATENCY_NET` seed: even zero-based indices run
+`aa/baseline → aa/screen → screen/baseline → screen/screen`; odd indices
+reverse both set order and arm order. Eight pairs per set are the default.
+
+It writes each scenario's runs like `run_local.py`, and `summary.json` with
+every run's voice figures, signed median per-pair deltas, total underrun
+excess, tail counts for both sets and the calibrated comparison. Unconstrained
+screen median p95/p99 deltas may exceed A/A by at most 2 ms, with no additional
+total underrun excess. Constrained screen median p99 and underrun-fraction
+deltas may exceed A/A by at most 20 ms and 0.005, respectively. In both cases,
+the screen tail-pair count must be at most the A/A tail-pair count plus
+`floor(N / 10)`: zero additional tails at eight pairs, one at ten. A tail pair
+exceeds any original absolute per-pair latency or underrun rule; count its
+union once per pair. All applicable comparisons must pass, and equality
+passes. See docs/screen-share.md, "Owner-approved A/A calibration", for the
+complete rules. Every viewer must carry the scenario's steady load; a
+quiet/missing load fails.
+Voice relay roles preserve the impairment seed regardless
+of screen arrival order. The output also reports relay scheduling lateness
+(actual send minus due time), separately from bottleneck queue residence.
+`relay_timing.status` is `measured` when `LATENCY_NET` enables a relay. On the
+unconstrained direct path (`via=none`, no `LATENCY_NET`), it is `not_applicable`
+with an explanation: no relay exists to measure. Viewer receive scheduling is
+still recorded in `screen.receive_scheduling`; relay timing does not measure
+voice pipeline or device callback scheduling.
+It exits 1 when a scenario misses the gate:
+
+```sh
+CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=target cargo build --release -p gwar-client --example latency
+python3 scripts/latency/screen_gate.py --binary target/release/examples/latency \
+  --out target/latency/screen-gate
+```
+
+Use `--null` to compare two interleaved A/A sets, starting with the unconstrained
+scenario where single underruns can move a pair's latency tail:
+
+```sh
+python3 scripts/latency/screen_gate.py --null \
+  --binary target/release/examples/latency --scenario unconstrained \
+  --pairs 10 --markers 100 --out /tmp/gwar-gate-aa-unconstrained
+```
+
+For a targeted downlink acceptance rerun, keep eight pairs and 100 markers:
+
+```sh
+python3 -B scripts/latency/screen_gate.py --binary target/release/examples/latency \
+  --scenario downlink --scenario downlink-loss --pairs 8 --markers 100 \
+  --out /tmp/gwar-gate-downlink
+```
+
+The viewer transport paces originals, RTX and probes together before TWCC send
+timestamps are assigned: ordinary screen RTP at 80 % of estimated wire capacity,
+short probes normally at 120 %. Only the priority share's measured average and
+keyframe demand can raise that ceiling, bounded at 200 %; its admission cap is
+used only before media has been measured. A second share that
+cannot fit does not amplify startup probes. Cadence learning excludes idle
+gaps and intentional pacing waits. The rounded-deadline regression follows the
+runtime's requested wakes instead of polling at a fixed simulation step.
+Clusters target 10 ms (two 5 ms wakes), retaining packet-count and distinct-time
+requirements; coarser clocks extend that within the byte reserve. Clusters are
+at least one second apart. Probe feedback includes SRTP and
+UDP/IP overhead. Original packets still expire 400 ms after publisher arrival,
+including time in the transport pacer. Independent voice bypasses screen pacing.
+Probes interrupted by local send gaps over 20 ms are excluded from capacity
+estimation; actual downstream queueing still reduces the estimate.
+An unsaturated paced probe supplies a capacity floor: local underfill cannot
+lower the previous estimate. A receive rate below the send rate still supplies
+the conservative congestion estimate, and regular delay/loss feedback remains active.
+The explicit policy ceiling marks screen watches application-limited even above
+automatic ALR's 65% threshold. Policy-limited ACK rates cannot become network
+capacity caps, and probe SSRCs do not charge application-media utilization.
+Exponential discovery stops at its application ceiling; the one-second result
+timeout cannot repeatedly probe the same maximum. Periodic discovery continues.
+The downlink regression simulation includes a shared FIFO, independent voice,
+150 KB keyframes, two 3 Mbps shares with the live server's 8 Mbps admission cap,
+and eight seeds with 0 % and 1 % loss,
+including a separate bound on the startup queue before the steady window.
+The original 1 ms scheduler case retains 10 ms queue bounds. Additional 5/10 ms
+cadences use `max(10 ms, cadence + 2 ms)` steady and
+`max(10 ms, 2 × cadence + 2 ms)` startup bounds: one regular wake, or two for a
+probe, plus a fixed wire-packet margin. These simulation bounds do not replace
+the calibrated gate.
+The release bucket retains one packet of fractional credit across wakes; an
+allocated 3.7 Mbps must not round down to three packets per 10 ms and starve a
+3 Mbps share. Transmission still passes the shared wire pacer.
+Changing shared pacing also requires an uplink sanity run with at least four
+pairs. Thresholds and the 60 % minimum steady-load check remain unchanged.
+
+Choose a new output directory for each repetition. Omit `--scenario` to run all
+six scenarios. Both sets run without screen load; each second arm retains the
+`screen` label in file names and comparisons. Warmup, pair seeds, alternating
+order, marker checks, thresholds and underrun/tail rules stay identical. The
+summary and each scenario manifest record `null: true` and `screen: null`.
+Unexpected screen load fails an A/A run. An A/A failure measures gate noise and
+is not screen-load acceptance. The project lead decides any rule changes after
+examining repeated A/A data. See the [a4c76a1 artifact analysis](latency-a4c76a1.md).
+
+`scripts/latency/screen_cpu.py` measures the screen SFU's CPU per forwarded
+Mbps against a separate `gwar-server` process (see its `--help`); run it on the
+host to be measured. Build `cargo build --release -p gwar-server --bin gwar-server`
+and `cargo build --release -p gwar-client --example latency` separately. CPU and
+throughput use identical settled-load snapshot endpoints; cumulative CPU is
+interpolated between the surrounding 500 ms process samples.
 
 ## Compare builds
 

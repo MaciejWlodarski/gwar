@@ -515,6 +515,8 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
       return { ...state, shares: withoutShares(state.shares, s => s.share === event.d.share) };
     // The screen controller keeps these (state/screen.ts).
     case "screen.viewers": case "screen.link": case "screen.slot": return state;
+    // A paused card and the admins' egress warning come with their interface (docs/screen-share.md).
+    case "screen.paused": case "screen.resumed": case "server.egress_warning": return state;
     case "challenge":
     case "disconnected":
       return state;

@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/desktop/src-tauri"]
-exclude = ["vendor/tsclientlib"]
+exclude = ["vendor/tsclientlib", "vendor/str0m"]
 
 [workspace.package]
 edition = "2024"
@@ -46,6 +46,9 @@ lto = true
 codegen-units = 1
 panic = "abort"
 strip = true
+
+[patch.crates-io]
+str0m = { path = "vendor/str0m" }
 
 # tsclientlib connects to a download's file transfer itself, where Gwar can
 # neither time it out nor cancel it; the patch hands the offer over instead.

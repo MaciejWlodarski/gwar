@@ -64,7 +64,7 @@ async fn a_late_viewer_starts_at_a_keyframe_and_gets_every_byte_in_order() {
     // Byte for byte, and numbered without gaps from the keyframe on.
     let packets: Vec<_> = received.iter().map(|(_, p)| p).collect();
     assert!(packets.windows(2).all(|w| w[1].sequence == w[0].sequence + 1));
-    assert_eq!(packets[0].payload, screen::vp8(true, true, &[20, 0, 0xaa, 0x55]));
+    assert_eq!(packets[0].payload, screen::frame(0, 0, true, 1, 20)[0].payload);
     assert!(packets.iter().filter(|p| p.marker).count() == 4, "markers pass through");
 }
 
@@ -296,4 +296,181 @@ async fn transports_are_negotiated_strictly() {
     assert_eq!(bob.fails("screen.watch.offer", json!({"run": 9, "sdp": "v=0"})).await, "stale");
     assert_eq!(bob.fails("screen.watch.offer", json!({"run": 3, "sdp": "v=0"})).await, "stale");
     bob.viewer = Some(screen::Viewer::start(&mut bob, 10).await);
+}
+
+/// Streams into `slot` until the viewer has lost one packet and holds its NACK back; returns
+/// where the stream got to.
+async fn nack_in_flight(
+    viewer: &mut Client,
+    publisher: &screen::Publisher,
+    slot: usize,
+    at: (u64, u32),
+    tag: u8,
+) -> (u64, u32) {
+    let (sequence, timestamp) = stream(publisher, at.0, at.1, tag, 2, 2, true).await;
+    let received = viewer.viewer.as_mut().unwrap().collect(Duration::from_millis(300)).await;
+    let last =
+        received.iter().filter(|(s, _)| *s == slot).map(|(_, p)| p.sequence).max().expect("the viewer gets media");
+    let v = viewer.viewer.as_ref().unwrap();
+    v.gate.close();
+    v.drop_repairs.store(true, std::sync::atomic::Ordering::Relaxed);
+    v.loss.drop_once([(last + 2) as u16]);
+    let next = stream(publisher, sequence, timestamp, tag + 2, 2, 2, false).await;
+    let received = viewer.viewer.as_mut().unwrap().collect(Duration::from_millis(300)).await;
+    assert_eq!(tags(&received, slot).len(), 3, "one packet lost");
+    assert!(viewer.viewer.as_ref().unwrap().gate.holding(), "its NACK waits");
+    next
+}
+
+/// Once the slot ended: the held NACK reaches the server and the share goes on, but nothing of
+/// it reaches the viewer, repairs included.
+async fn nothing_after(viewer: &mut Client, publisher: &screen::Publisher, at: (u64, u32), tag: u8) -> (u64, u32) {
+    let v = viewer.viewer.as_ref().unwrap();
+    v.drop_repairs.store(false, std::sync::atomic::Ordering::Relaxed);
+    v.gate.open();
+    let next = stream(publisher, at.0, at.1, tag, 3, 2, true).await;
+    let received = viewer.viewer.as_mut().unwrap().collect(Duration::from_millis(600)).await;
+    assert!(received.is_empty(), "nothing after the slot ended: {:?}", tags(&received, 0));
+    next
+}
+
+fn group_id(reply: &serde_json::Value) -> u64 {
+    reply["group"]["id"].as_u64().expect("group id")
+}
+
+#[tokio::test]
+async fn a_viewer_outside_voice_watches_until_the_channel_is_hidden_from_it() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    // A private channel both may see, until bob is taken off its list.
+    let both = json!({"roles": [], "users": [alice.welcome.uid, bob.welcome.uid]});
+    let room = channel_id(&root.create_channel(json!({"name": "Room", "private": true, "access": both})).await);
+    let share = alice.share_in(room).await;
+    bob.ok("channel.leave", json!({})).await;
+    assert!(bob.ok("voice.state", json!({})).await["voice"].is_null(), "bob is not in voice");
+    let slot = bob.watch(&share).await as usize;
+
+    let at = nack_in_flight(&mut bob, alice.publisher(&share), slot, (0, 0), 1).await;
+    let only_alice = json!({"roles": [], "users": [alice.welcome.uid]});
+    root.ok("channel.update", json!({"channel": room, "access": only_alice})).await;
+    let ended = bob.next_event_where("screen.stopped", |e| e["share"] == share).await;
+    assert_eq!(ended["reason"], "access");
+    nothing_after(&mut bob, alice.publisher(&share), at, 10).await;
+}
+
+#[tokio::test]
+async fn losing_bypass_password_ends_the_media_nack_answers_included() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let keys = group_id(&root.ok("group.create", json!({"name": "Keys", "permissions": ["bypass_password"]})).await);
+    let uid = bob.welcome.uid.clone();
+    let roles = |groups: serde_json::Value| json!({"uid": uid, "groups": groups});
+    root.ok("member.groups", roles(json!([2, keys]))).await;
+    let vault = channel_id(&root.create_channel(json!({"name": "Vault", "password": "s3cret"})).await);
+    alice.ok("channel.join", json!({"channel": vault, "password": "s3cret"})).await;
+    let share = alice.share_here().await;
+    bob.ok("channel.leave", json!({})).await;
+    let override_keys =
+        |deny: serde_json::Value| json!({"channel": vault, "override": {"role": keys, "allow": [], "deny": deny}});
+
+    let mut at = (0, 0);
+    for (step, cause) in ["role edit", "override", "role removal"].into_iter().enumerate() {
+        let slot = bob.watch(&share).await as usize;
+        at = nack_in_flight(&mut bob, alice.publisher(&share), slot, at, 20 * step as u8 + 1).await;
+        match cause {
+            "role edit" => drop(root.ok("group.update", json!({"group": keys, "permissions": []})).await),
+            "override" => drop(root.ok("channel.override", override_keys(json!(["bypass_password"]))).await),
+            _ => drop(root.ok("member.groups", roles(json!([2]))).await),
+        }
+        let ended = bob.next_event_where("screen.stopped", |e| e["share"] == share).await;
+        assert_eq!(ended["reason"], "access", "{cause}");
+        at = nothing_after(&mut bob, alice.publisher(&share), at, 20 * step as u8 + 10).await;
+        // Back for the next step.
+        match cause {
+            "role edit" => {
+                drop(root.ok("group.update", json!({"group": keys, "permissions": ["bypass_password"]})).await)
+            }
+            "override" => drop(root.ok("channel.override", override_keys(json!([]))).await),
+            _ => {}
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_watch_from_inside_a_password_channel_ends_with_the_viewers_way_out() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let general = seed_channel(&root, "General");
+    let vault = channel_id(&root.create_channel(json!({"name": "Vault", "password": "s3cret"})).await);
+    let enter = json!({"channel": vault, "password": "s3cret"});
+    alice.ok("channel.join", enter.clone()).await;
+    let share = alice.share_here().await;
+    let bob_role = group_id(&root.ok("group.create", json!({"name": "Bob", "permissions": []})).await);
+    root.ok("member.groups", json!({"uid": bob.welcome.uid, "groups": [2, bob_role]})).await;
+
+    let mut at = (0, 0);
+    // The bridge never moves our own users (a moved puppet follows its user); the server's own
+    // move out, losing `connect`, stands for it.
+    for (step, exit) in ["leave", "switch", "moved", "connect"].into_iter().enumerate() {
+        bob.ok("channel.join", enter.clone()).await;
+        let slot = bob.watch(&share).await as usize;
+        at = nack_in_flight(&mut bob, alice.publisher(&share), slot, at, 20 * step as u8 + 1).await;
+        let deny = |deny: serde_json::Value| json!({"channel": vault, "override": {"role": bob_role, "allow": [], "deny": deny}});
+        match exit {
+            "leave" => drop(bob.ok("channel.leave", json!({})).await),
+            "switch" => drop(bob.ok("channel.join", json!({"channel": general})).await),
+            "moved" => drop(root.ok("client.move", json!({"client": bob.id(), "channel": general})).await),
+            _ => drop(root.ok("channel.override", deny(json!(["connect"]))).await),
+        }
+        let ended = bob.next_event_where("screen.stopped", |e| e["share"] == share).await;
+        assert_eq!(ended["reason"], "access", "{exit}");
+        at = nothing_after(&mut bob, alice.publisher(&share), at, 20 * step as u8 + 10).await;
+    }
+}
+
+#[tokio::test]
+async fn screen_limits_are_server_settings_and_the_egress_counter_reports_the_month() {
+    let server = TestServer::start().await;
+    let mut root = admin(&server, "root").await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let mut carol = Client::connect(&server, "carol").await;
+
+    let egress = root.ok("server.egress", json!({})).await;
+    let defaults = json!({
+        "shares_per_channel": 4, "shares_per_server": 32, "viewers_per_share": 25, "share_cap_kbps": 8000,
+        "budget_mbps": 300, "monthly_egress_tb": 10, "monthly_egress_stop": false,
+    });
+    assert_eq!(egress["limits"], defaults);
+    assert!(["host", "container", "unavailable"].contains(&egress["scope"].as_str().unwrap()), "{egress}");
+    let month = egress["month"].as_str().unwrap();
+    assert!(month.len() == 7 && month.as_bytes()[4] == b'-', "{month}");
+    assert!(egress["incomplete"].is_boolean());
+    assert_eq!((egress["screen_members"].as_u64(), egress["screen_guests"].as_u64()), (Some(0), Some(0)));
+    assert_eq!(alice.fails("server.egress", json!({})).await, "forbidden");
+
+    let mut limits = defaults.clone();
+    limits["budget_mbps"] = json!(0);
+    assert_eq!(root.fails("server.update", json!({"screen": limits})).await, "bad_request");
+    limits["budget_mbps"] = json!(300);
+    limits["viewers_per_share"] = json!(1);
+    root.ok("server.update", json!({"screen": limits})).await;
+    assert_eq!(root.ok("server.egress", json!({})).await["limits"], limits);
+
+    let share = alice.share_in(seed_channel(&root, "General")).await;
+    bob.watch(&share).await;
+    carol.viewer = Some(screen::Viewer::start(&mut carol, 1).await);
+    assert_eq!(carol.fails("screen.watch", json!({"share": share})).await, "busy", "one viewer per share");
+
+    // A share reserves its cap: a budget below it admits none.
+    limits["budget_mbps"] = json!(1);
+    root.ok("server.update", json!({"screen": limits})).await;
+    alice.ok("screen.stop", json!({"share": share})).await;
+    assert_eq!(alice.screen_start().await.unwrap_err().code, gwar_proto::ErrorCode::Busy);
 }

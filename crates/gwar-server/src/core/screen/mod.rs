@@ -16,15 +16,13 @@ use super::{
 };
 use crate::media::screen::{Lease, PUBLISH_CONNECT, PublishSignal, ScreenCmd, ScreenOrigin, WatchGrant, publish_ssrcs};
 use gwar_proto::{
-    SCREEN_SLOTS, ScreenPreset, ScreenPublishOffer, ScreenShare, ScreenStart, ScreenStopReason, ScreenSurface,
-    ScreenWatchOffer, VoiceParticipation,
+    SCREEN_SLOTS, ScreenPauseReason, ScreenPreset, ScreenPublishOffer, ScreenShare, ScreenStart, ScreenStopReason,
+    ScreenSurface, ScreenWatchOffer, VoiceParticipation,
 };
 
-/// Sharing limits (docs/screen-share.md, "Limits"). Server settings once the SFU enforces the
-/// budget that goes with them.
-const SHARES_PER_CHANNEL: usize = 4;
-const SHARES_PER_SERVER: usize = 32;
-const VIEWERS_PER_SHARE: usize = 25;
+/// Every slot reservation is charged this times its share's cap, for RTX, padding probes and
+/// headers (docs/screen-share.md, "Admission and resource limits"); the egress cap enforces it.
+const SLOT_CHARGE: f64 = 1.3;
 /// `screen.start` per session: a burst of 4, then 4 a minute.
 const STARTS_BURST: f64 = 4.0;
 const STARTS_PER_SECOND: f64 = 4.0 / 60.0;
@@ -172,12 +170,16 @@ impl Core {
         if self.sessions[&session].sharing.is_some() {
             return Err(err(ErrorCode::Conflict, "you are already sharing"));
         }
-        if self.shares.values().filter(|s| s.channel == channel).count() >= SHARES_PER_CHANNEL {
+        let limits = self.screen_limits;
+        if self.shares.values().filter(|s| s.channel == channel).count() >= limits.shares_per_channel as usize {
             return Err(err(ErrorCode::Busy, "this channel has as many shares as allowed"));
         }
-        if self.shares.len() >= SHARES_PER_SERVER {
+        if self.shares.len() >= limits.shares_per_server as usize {
             return Err(err(ErrorCode::Busy, "the server has as many shares as allowed"));
         }
+        let cap = limits.share_cap_kbps as u64 * 1000;
+        // A share's ingress costs CPU too: its cap is reserved for as long as it runs.
+        self.reclaim_guest_reservations(cap, None)?;
         let id = files::random_id(16);
         let private = self.channels.get(&channel).is_some_and(|c| c.private);
         let share = Share {
@@ -193,7 +195,7 @@ impl Core {
             private_links: None,
             viewers: BTreeSet::new(),
             guests: BTreeSet::new(),
-            origin: ScreenOrigin::new(session, id.clone(), channel, false, private),
+            origin: ScreenOrigin::new(session, id.clone(), channel, false, private, cap),
             live: false,
             publish: None,
         };
@@ -412,6 +414,33 @@ impl Core {
         }
     }
 
+    /// The screen SFU paused (`reason`) or resumed (`None`) a viewer's slot: the viewer hears of
+    /// it only while the exact assignment is still current and alive on that transport.
+    pub(super) fn screen_paused(
+        &mut self,
+        session: SessionId,
+        run: u64,
+        grant: &Arc<WatchGrant>,
+        reason: Option<ScreenPauseReason>,
+    ) {
+        if self.guests.contains_key(&session) {
+            self.guest_paused(session, run, grant, reason);
+            return;
+        }
+        let watching = self.sessions.get(&session).and_then(|s| s.watch.as_ref()).is_some_and(|w| {
+            w.run == run && grant.alive() && w.slots.iter().flatten().any(|(_, g)| Arc::ptr_eq(g, grant))
+        });
+        if !watching {
+            return;
+        }
+        let share = grant.share.clone();
+        let event = match reason {
+            Some(reason) => Event::ScreenPaused { share, reason },
+            None => Event::ScreenResumed { share },
+        };
+        self.send_event(session, event);
+    }
+
     /// Ends every watch of `session` (its transport is replaced or gone), telling it per slot
     /// when `tell`.
     fn drop_watches(&mut self, session: SessionId, tell: bool) {
@@ -477,6 +506,26 @@ impl Core {
             .collect()
     }
 
+    /// The bytes per second all reservations hold: every running share's cap, and 1.3 times
+    /// its cap for each of its viewers. Reserved by cap, not by current rate, so static content
+    /// cannot be admitted cheaply and then grow.
+    pub(super) fn screen_reserved(&self) -> u64 {
+        self.shares
+            .values()
+            .map(|s| {
+                s.origin.cap_bps
+                    + (SLOT_CHARGE * s.origin.cap_bps as f64) as u64
+                        * (s.viewers.len() + self.reserved_guests(s)) as u64
+            })
+            .sum()
+    }
+
+    fn screen_budget(&self) -> u64 {
+        self.screen_limits.budget_mbps as u64 * 1_000_000
+    }
+
+    /// Watches `id` in a free slot of the session's watch transport. Watching a share again
+    /// answers its slot and, if the slot is paused, tries again (Retry).
     pub(super) fn screen_watch(&mut self, session: SessionId, id: &str) -> Reply {
         let share = self.visible_share(session, id)?;
         if share.sharer == session {
@@ -484,17 +533,17 @@ impl Core {
         }
         self.may_watch(session, share)?;
         let watching = share.viewers.contains(&session);
-        // Guests count among the viewers (3b adds reclaiming their reservations for members).
-        let full = share.viewers.len() + share.guests.len() >= VIEWERS_PER_SHARE;
+        let charge = (SLOT_CHARGE * share.origin.cap_bps as f64) as u64;
         let Some(watch) = self.sessions[&session].watch.as_ref().filter(|w| w.connected) else {
             return Err(err(ErrorCode::Unavailable, "connect a watch transport first"));
         };
         if watching {
             let slot = watch.slots.iter().position(|s| s.as_ref().is_some_and(|(share, _)| share == id));
+            let _ = self.screen.try_send(ScreenCmd::Retry { session, share: id.to_owned() });
             return Ok(Response::ScreenSlot { slot: slot.expect("a watch holds a slot") as u32 });
         }
-        if full {
-            return Err(err(ErrorCode::Busy, "this share has as many viewers as allowed"));
+        if self.egress_stopped() {
+            return Err(err(ErrorCode::Busy, "this month's outbound transfer allowance is used up"));
         }
         let Some(slot) = watch.slots.iter().position(Option::is_none) else {
             return Err(err(ErrorCode::Busy, "you are watching as many shares as allowed"));
@@ -505,6 +554,7 @@ impl Core {
         let Ok(permit) = self.screen.clone().try_reserve_owned() else {
             return Err(err(ErrorCode::Unavailable, "screen engine busy"));
         };
+        self.reclaim_guest_reservations(charge, Some(id))?;
         let watch = self.sessions.get_mut(&session).and_then(|s| s.watch.as_mut()).expect("checked above");
         watch.slots[slot] = Some((id.to_owned(), grant.clone()));
         self.shares.get_mut(id).expect("checked above").viewers.insert(session);

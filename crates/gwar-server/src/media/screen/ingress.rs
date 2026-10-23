@@ -134,6 +134,20 @@ impl Bucket {
         self.at = now;
     }
 
+    /// New rate and burst from now on; tokens above the new burst are lost.
+    pub fn reconfigure(&mut self, rate: f64, burst: f64, now: Instant) {
+        self.refill(now);
+        self.rate = rate;
+        self.burst = burst;
+        self.tokens = self.tokens.min(burst);
+    }
+
+    /// Current credit after accounting for elapsed time.
+    pub fn available(&mut self, now: Instant) -> f64 {
+        self.refill(now);
+        self.tokens
+    }
+
     /// Whether it has refilled completely, so that dropping it loses nothing.
     pub fn full(&mut self, now: Instant) -> bool {
         self.refill(now);

@@ -20,6 +20,13 @@ Apache-2.0), pinned to commit `ee3bc6f45a7137db7793ba5593a321df400d53e5` in the
 Cargo manifests and lockfiles. Its `tsclientlib` crate is vendored at that
 commit with one patch (`vendor/tsclientlib`, see its `GWAR-PATCH.md`).
 
+## str0m
+
+The WebRTC transports use [str0m](https://github.com/algesten/str0m) 0.24.1
+(MIT OR Apache-2.0), vendored in `vendor/str0m` with probe-padding, probe-burst
+pacing and background-padding limit fixes.
+See `vendor/str0m/GWAR-PATCH.md`; its original licenses are included there.
+
 ## Noise suppression model
 
 The noise suppression uses **DeepFilterNet3** (low-latency model

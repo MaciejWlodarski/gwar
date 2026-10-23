@@ -36,6 +36,9 @@ import type { Managers } from "../proto/Managers";
 import type { OwnerInfo } from "../proto/OwnerInfo";
 import type { ScreenShare } from "../proto/ScreenShare";
 import type { ScreenStopReason } from "../proto/ScreenStopReason";
+import type { ScreenPauseReason } from "../proto/ScreenPauseReason";
+import type { ScreenLimits } from "../proto/ScreenLimits";
+import type { ServerEgress } from "../proto/ServerEgress";
 import type { EventData, EventName, Op, ResponseMap } from "./protocol";
 import { filePath } from "./address";
 import { MAX_FILE_BYTES } from "../platform/download";
@@ -126,6 +129,9 @@ const leave: Rule<LeaveReason> = (v): v is LeaveReason => {
 const ban = shape<Ban>({ id, uid: optional(nullable(uid)), ip: optional(nullable(str(64))), nickname: str(256), reason: optional(nullable(text)), by: str(256), created_at: id, expires_at: optional(nullable(id)) });
 const invite = shape<Invite>({ code: str(128), uses: int(4294967295), max_uses: optional(nullable(int(4294967295))), expires_at: optional(nullable(id)), group: optional(nullable(id)), created_by: str(256), created_at: id });
 const empty = shape<Record<string, never>>({});
+const month: Rule<string> = (v): v is string => str(7)(v) && /^[0-9]{4}-[0-9]{2}$/.test(v);
+const screenLimits = shape<ScreenLimits>({ shares_per_channel: int(16, 1), shares_per_server: int(1024, 1), viewers_per_share: int(1000, 1), share_cap_kbps: int(100000, 100), budget_mbps: int(100000, 1), monthly_egress_tb: int(100000, 1), monthly_egress_stop: bool });
+const serverEgress = shape<ServerEgress>({ month, scope: literal(["host", "container", "unavailable"]), incomplete: bool, total: nullable(int(Number.MAX_SAFE_INTEGER)), screen_members: int(Number.MAX_SAFE_INTEGER), screen_guests: int(Number.MAX_SAFE_INTEGER), limits: screenLimits });
 
 const mlsBlob = str(175000);
 const mlsChunk = str(65536);
@@ -155,6 +161,8 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "screen.stopped": shape({ share: shareId, reason: literal<ScreenStopReason>(["stopped", "moderator", "left", "limit", "transport", "budget", "access"]), by: optional(str(256)) }),
   "screen.viewers": shape({ share: shareId, members: int(4294967295), guests: int(4294967295) }), "screen.link": shape({ share: shareId, active: bool }),
   "screen.slot": shape({ run: int(Number.MAX_SAFE_INTEGER, 1), slot: int(3), share: nullable(shareId) }),
+  "screen.paused": shape({ share: shareId, reason: literal<ScreenPauseReason>(["bandwidth", "budget"]) }), "screen.resumed": shape({ share: shareId }),
+  "server.egress_warning": shape({ month, percent: int(100), total: int(Number.MAX_SAFE_INTEGER), limit: int(Number.MAX_SAFE_INTEGER) }),
   "voice.epoch.ack": shape({call:fixed(16),group:fixed(32),epoch:id,device:fixed(32)}),
   "voice.epoch.request": shape({call:fixed(16),group:fixed(32),epoch:id}),
   "voice.closed": shape({ ...voiceFields, reason: literal(["transport_failed", "channel_restarted", "channel_deleted", "epoch_exhausted", "stream_limit", "state_limit"]) }), "chat.read": (v): v is EventData<"chat.read"> => shape({ channel: id, message: id })(v) || shape({ conversation, message: id })(v), "disconnected": shape({ reason: leave }),
@@ -180,7 +188,7 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "chat.sealed.send": sealedMessage, "chat.sealed.edit": sealedMessage, "chat.delete_own": sealedMessage,
   "chat.sealed.history": shape({ sealed: array(sealedMessage, 100) }), "chat.sealed.remove": empty,
   "chat.send": message, "chat.edit": message, "chat.delete": empty, "chat.read": empty,
-  "chat.history": shape({ messages: array(message, 100) }), "server.update": empty,
+  "chat.history": shape({ messages: array(message, 100) }), "server.update": empty, "server.egress": serverEgress,
   "token.create": shape({ token: str(256) }), "token.redeem": shape({ groups: ids }),
   "file.upload": shape({ file: str(64), upload_url: path(true) }),
   "group.create": shape({ group }), "group.update": shape({ group }), "group.delete": empty, "group.reorder": empty,
