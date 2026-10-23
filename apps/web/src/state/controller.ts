@@ -12,8 +12,8 @@ import { conversationThread, sealedThread, threadConversation } from "../lib/cha
 import { messageTarget } from "../lib/chat";
 import { uploadAttachment, localAttachmentMetadata, imageHints } from "../net/attachment";
 import { sealFile, SEALED_FILE_OVERHEAD, SEALED_MIME, SEALED_NAME } from "../net/sealed-file";
-import { serverPins, type ServerIdentityChanged } from "../net/server-pins";
-import { channels as channelLifecycle, withChannelLifecycle } from "../net/channel-lifecycle";
+import type { ServerIdentityChanged } from "../net/server-pins";
+import { channels as channelLifecycle, withFreshChannelLifecycle } from "../net/channel-lifecycle";
 import { signMessage, sha256, MessageVerifier, fullyVerified, DELETION_TEXT, invalidVerification, sameMessageIdentity, notificationAllowed } from "../net/message-signature";
 import type { Attachment } from "../proto/Attachment";
 import type { MessageSignature } from "../proto/MessageSignature";
@@ -55,7 +55,7 @@ import {
 } from "../net/connection";
 import { TsConnection } from "../net/ts-connection";
 import type { pruneRequest } from "../lib/prune";
-import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, IdentityUnsupportedError, type Identity } from "../net/identity";
+import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, identityFailure, type Identity, type IdentityFailure } from "../net/identity";
 import { isDesktop } from "../platform";
 import { createVoiceEngine } from "../voice";
 import { ScreenController } from "./screen-controller";
@@ -80,7 +80,7 @@ type SessionSnapshot = ReturnType<typeof useSession.getState>;
 
 export class ConnectFailure extends Error {
   constructor(
-    readonly kind: ConnectError["kind"] | "address" | "identity",
+    readonly kind: ConnectError["kind"] | "address" | IdentityFailure,
     message: string,
     readonly serverName?: string,
     readonly ban?: BanNotice,
@@ -98,6 +98,8 @@ export interface ConnectParams {
   /** Invite code from a link: admits without the server password. */
   invite?: string;
   inviteServerKey?: string;
+  /** The pinned key the user accepted to replace by `inviteServerKey` (lib: `ConnectionOptions.replaceServerKey`). */
+  replaceServerKey?: string;
   /** The owner an invite link named: checked on first contact with its server. */
   inviteOwner?: string;
   insecureLan?: boolean;
@@ -158,6 +160,8 @@ export function describeJoinError(e: unknown): string {
   if (e instanceof RequestError && e.code === "forbidden") return tNow("err.join.forbidden");
   return describeRequestError(e);
 }
+
+export { identityFailure };
 
 export function describeConnectFailure(f: ConnectFailure): string {
   if (f.kind === "address") return f.message;
@@ -416,7 +420,7 @@ class Controller {
         identity = await this.getIdentity();
       } catch (e) {
         session.dispatch({ type: "phase", phase: "idle" });
-        throw new ConnectFailure("identity", e instanceof IdentityUnsupportedError ? e.message : String(e));
+        throw new ConnectFailure(identityFailure(e), e instanceof Error ? e.message : String(e));
       }
 
       conn = new Connection({
@@ -426,13 +430,15 @@ class Controller {
         serverPassword: params.password || undefined,
         invite: params.invite || undefined,
         inviteServerKey: params.inviteServerKey,
+        replaceServerKey: params.replaceServerKey,
         insecureLan: params.insecureLan,
         client: { name: "gwar-web", version: CLIENT_VERSION, platform: platform() },
       });
     }
     this.conn = conn;
     this.connections++;
-    this.connectionParams = { ...params };
+    // A later reconnect with these never replaces a pin: the acceptance was for this connection.
+    this.connectionParams = { ...params, replaceServerKey: undefined };
     this.wire(conn, params);
     try {
       if (conn instanceof Connection) {
@@ -555,8 +561,9 @@ class Controller {
       danger: true, serverIdentity: true,
       onConfirm: () => {
         if (change.source === "invite") return;
-        serverPins.forget(change.endpoint, change.expected);
-        void this.connectInteractive({ ...params, inviteServerKey: params.inviteServerKey ?? change.candidate }, opts);
+        // The pin stays until the new key is proven: the connection replaces it then, in one transaction, and
+        // only if it still is the key the user saw. The address is never left without a pin meanwhile.
+        void this.connectInteractive({ ...params, inviteServerKey: params.inviteServerKey ?? change.candidate, replaceServerKey: change.expected }, opts);
       },
     });
   }
@@ -1834,7 +1841,7 @@ class Controller {
       const item = state.threads[sealed]?.items.find(i => i.kind === "msg" && i.msg.id === msg.id);
       if (item?.kind !== "msg" || !item.sealed) return invalidVerification();
       const serverKey = conn?.serverKey ?? "", target = item.sealed.conversation;
-      return withChannelLifecycle(await this.verifier.verify(msg, { serverKey, target,
+      return await withFreshChannelLifecycle(await this.verifier.verify(msg, { serverKey, target,
         participants: sealed.startsWith("dm:") ? [me!, sealed.slice(3)] : undefined, sealed: { group: item.sealed.group, epoch: item.sealed.epoch } }), serverKey, target);
     }
     else if (msg.target === "server") thread = "server";
@@ -1847,7 +1854,7 @@ class Controller {
       thread = `dm:${peer}`;
     }
     const ctx = { serverKey: conn?.serverKey ?? "", target: messageTarget(thread, msg.author_uid, me), participants: thread.startsWith("dm:") ? [me!, thread.slice(3)] as const : undefined };
-    return withChannelLifecycle(await this.verifier.verify(msg, ctx), ctx.serverKey, ctx.target);
+    return await withFreshChannelLifecycle(await this.verifier.verify(msg, ctx), ctx.serverKey, ctx.target);
   }
 
   private async checkedHistory(messages: ChatMessage[], channel: number): Promise<{ accepted: ChatMessage[]; authentic: boolean[] }> {

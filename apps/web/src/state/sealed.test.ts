@@ -317,9 +317,8 @@ it("accepts the own edit echo arriving before the request reply", async () => {
   expect(request).toHaveBeenCalledOnce();
 });
 
-// The channel lifecycle record fails closed without storage.
-const local = new Map<string, string>();
-vi.stubGlobal("localStorage", { getItem: (k: string) => local.get(k) ?? null, setItem: (k: string, v: string) => void local.set(k, v) });
+// The channel lifecycle record fails closed without its storage (the device's security state).
+await (await import("../lib/local-state")).localState.load();
 const carol = await generateIdentity();
 const c = await uidForPublicKey(carol.publicKey);
 describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {

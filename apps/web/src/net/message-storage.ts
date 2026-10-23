@@ -4,6 +4,7 @@ import { connectJson } from "../connect/transport";
 import { revokeStatement } from "../connect/crypto";
 import { decodeFixed } from "./handshake";
 import { strictVerify } from "./message-signature";
+import { eachRecord, openDatabase, type IdbMigration } from "../lib/stored-data";
 
 export const MAX_CHECKPOINTS = 10_000;
 export const MAX_REVOCATIONS = 20_000;
@@ -25,8 +26,31 @@ export interface RevocationState { revokedAt?: number; fresh: boolean; read?: nu
 export function confirmedBefore(order: number | undefined, r: RevocationState | undefined): boolean {
   return order !== undefined && r?.read !== undefined && r.revokedAt === undefined && order < r.read;
 }
+export const MESSAGE_STORAGE_DATABASE = "gwar-message-auth-v3";
 const ORDER = "order";
-const VERSION = 3;
+/**
+ * The database's versions (docs/data-migrations.md): `MESSAGE_STORAGE_MIGRATIONS[i]` takes it from
+ * version i to i + 1, all in one upgrade transaction.
+ */
+export const MESSAGE_STORAGE_MIGRATIONS: readonly IdbMigration[] = [
+  // 1: never held anything; this database was first made at version 2.
+  () => {},
+  // 2: checkpoints (evicted oldest `at` first), account-signed revocations, feed cursors.
+  (db) => {
+    db.createObjectStore("checkpoints").createIndex("at", "at");
+    db.createObjectStore("revocations");
+    db.createObjectStore("feeds");
+  },
+  // 3: one counter ordering stored revisions and complete feed reads. Revisions stored before it
+  // came before every ordered read: order 0.
+  (db, tx) => {
+    db.createObjectStore(ORDER);
+    return eachRecord(tx.objectStore("checkpoints"), (value) => {
+      const checkpoint = value as Partial<Checkpoint>;
+      return checkpoint.order === undefined ? { ...checkpoint, order: 0 } : undefined;
+    });
+  },
+];
 /** Each works only if those before it do. */
 const CAPABILITIES = ["open", "readonly", "readwrite"] as const;
 type Capability = typeof CAPABILITIES[number];
@@ -49,7 +73,7 @@ export class MessageStorage {
     const entries = await this.transaction(["revocations"], "readonly", tx => requestValue<Revocation[]>(tx.objectStore("revocations").getAll()));
     this.known = entries.map(({ account_key, device_key, revoked_at, signature }) => ({ account_key, device_key, revoked_at, signature }));
   }
-  constructor(private name = "gwar-message-auth-v3") {}
+  constructor(private name = MESSAGE_STORAGE_DATABASE) {}
   /** Failures by what failed: opening, reading or writing. Each holds until that, or more, works
    *  again: a read succeeding while writes fail (a full disk) recovers nothing that needs a write. */
   private failures = new Map<Capability, string>();
@@ -81,36 +105,14 @@ export class MessageStorage {
     if (this.db) return this.db;
     let blocked = false;
     const opening: Promise<IDBDatabase> = new Promise((resolve, reject) => {
-      const request = indexedDB.open(this.name, VERSION);
       // A tab still holding an older version blocks the upgrade. Storage is unavailable until it
       // lets go: every operation meanwhile fails at once (another open would only queue behind
-      // this one), and this request then completes and reports storage working again.
-      request.onblocked = () => {
+      // this one), and this open then completes and reports storage working again.
+      const onBlocked = () => {
         blocked = true;
         reject(new Error("Message storage is being upgraded in another tab"));
       };
-      // Pre-release: no upgrades. A database of an older schema fails to open (storage unavailable);
-      // the reason, not the abort it causes, is what diagnostics report.
-      let upgrade: unknown;
-      request.onupgradeneeded = () => {
-        const db = request.result;
-        try {
-          db.createObjectStore("checkpoints").createIndex("at", "at");
-          db.createObjectStore("revocations");
-          db.createObjectStore("feeds");
-          // One counter ordering stored revisions and complete feed reads.
-          db.createObjectStore(ORDER);
-        } catch (error) {
-          upgrade = error;
-          request.transaction!.abort();
-        }
-      };
-      request.onerror = () => {
-        if (this.db === opening) this.db = undefined;
-        reject(upgrade ?? request.error);
-      };
-      request.onsuccess = () => {
-        const db = request.result;
+      openDatabase(this.name, MESSAGE_STORAGE_MIGRATIONS, { onBlocked }).then((db) => {
         if (this.db !== opening) return db.close();
         // A newer version of the app upgrades the database, or the browser closed the connection
         // (site data cleared, its storage process lost): the next operation opens it again.
@@ -120,7 +122,12 @@ export class MessageStorage {
         this.db = Promise.resolve(db);
         resolve(db);
         if (blocked) this.working("open");
-      };
+      }, (error: unknown) => {
+        // An upgrade that failed (its reason is what diagnostics report) or a database of a newer
+        // version: storage is unavailable, and nothing in it changed.
+        if (this.db === opening) this.db = undefined;
+        reject(error);
+      });
     });
     // A blocked open stays pending (see above); any other failure lets the next operation try again.
     opening.catch(() => { if (this.db === opening && !blocked) this.db = undefined; });

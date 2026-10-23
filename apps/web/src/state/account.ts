@@ -24,7 +24,7 @@ import {
   type ConnectRecord,
 } from "../net/identity";
 import { isDesktop } from "../platform";
-import { controller } from "./controller";
+import { controller, identityFailure } from "./controller";
 import { useSettings } from "./settings";
 import { useUi } from "./stores";
 import { tNow } from "../i18n";
@@ -236,7 +236,12 @@ export const accountActions = {
 
   /** Reads the stored sign-in (call once at startup). */
   async load(): Promise<void> {
-    await controller.getIdentity().catch((e: unknown) => console.warn("identity load skipped", e));
+    await controller.getIdentity().catch((e: unknown) => {
+      console.warn("identity load skipped", e);
+      // A stored identity or sign-in this version cannot read: say so now, not only on connecting.
+      const failure = identityFailure(e);
+      if (failure === "identity_unreadable" || failure === "storage_newer") useUi.getState().toast("error", tNow(`err.connect.${failure}`));
+    });
     const record = await loadConnectRecord();
     useAccount.setState({ account: record ? summarize(record) : null, loaded: true, certChecked: !record?.token });
     useSettings.getState().setBookmarkAccount(record?.accountKey ?? null);

@@ -389,7 +389,7 @@ gwar handle v1
 ```
 
 Clients refresh the key once per app session and cache it by Connect URL in memory
-and localStorage. A previously fetched key can be used during an outage; without
+and in the `gwar-local` IndexedDB database. A previously fetched key can be used during an outage; without
 a key, no handles or Connect badges appear. Local development permits loopback
 HTTP. Servers cache the entire attestation and omit it once expired.
 

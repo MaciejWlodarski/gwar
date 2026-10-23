@@ -1,16 +1,33 @@
 import { emptyChanges, stores, type Changes } from "./types";
+import { openDatabase, type IdbMigration } from "../lib/stored-data";
 export interface Persistence {
   load(): Promise<Changes>;
   write(changes: Changes): Promise<void>;
   close(): void;
 }
+/**
+ * The newest format of the agent's records this app reads: `STORE_FORMAT` in
+ * crates/gwar-mls/src/agent/mod.rs (a test keeps them equal). Only the start-up check uses it; the
+ * agent refuses newer state on its own.
+ */
+export const MLS_STORE_FORMAT = 1;
+/** One device's MLS database. */
+export const mlsDatabase = (device: string) => `gwar-mls-v2-${device}`;
+/**
+ * The database's versions (docs/data-migrations.md): `MLS_MIGRATIONS[i]` takes it from version i to
+ * i + 1. The agent's records in it carry their own format version (crates/gwar-mls, `@device`);
+ * the runtime's `@runtime/` jobs change with a version here.
+ */
+export const MLS_MIGRATIONS: readonly IdbMigration[] = [
+  // 1: the agent's stores, binary keys and values.
+  (db) => { for (const name of stores) db.createObjectStore(name); },
+];
 export async function openStorage(device: string, factory: IDBFactory = indexedDB): Promise<Persistence> {
+  let blocked = false;
   const db = await new Promise<IDBDatabase>((resolve, reject) => {
-    const request = factory.open(`gwar-mls-v2-${device}`, 1);
-    request.onupgradeneeded = () => { for (const name of stores) request.result.createObjectStore(name); };
-    request.onerror = () => reject(request.error);
-    request.onblocked = () => reject(new Error("MLS database upgrade blocked"));
-    request.onsuccess = () => resolve(request.result);
+    const onBlocked = () => { blocked = true; reject(new Error("MLS database upgrade blocked")); };
+    // Opened after being given up (blocked): closed, the next start opens it again.
+    openDatabase(mlsDatabase(device), MLS_MIGRATIONS, { factory, onBlocked }).then(db => blocked ? db.close() : resolve(db), reject);
   });
   db.onversionchange = () => db.close();
   return {

@@ -262,8 +262,17 @@ impl Store {
 
     fn init(db: Connection) -> Result<Self> {
         db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=NORMAL;")?;
-        db.execute_batch(SCHEMA)?;
+        // A database of a newer version is left as it is (docs/data-migrations.md).
         let applied: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if applied > MIGRATIONS.len() {
+            anyhow::bail!(
+                "the database was written by a newer gwar-connect (schema {applied}; this version knows up to {}): \
+                 run that version or a later one; nothing was changed",
+                MIGRATIONS.len()
+            );
+        }
+        db.execute_batch(SCHEMA)?;
+        // Each migration commits together with the new version, or not at all.
         for (i, migration) in MIGRATIONS.iter().enumerate().skip(applied) {
             let tx = db.unchecked_transaction()?;
             tx.execute_batch(migration).with_context(|| format!("migration {}", i + 1))?;
@@ -814,6 +823,81 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    /// The first 12 hex digits of each migration's SHA-256, in order. A released migration never
+    /// changes; a new one is appended here with a test of the data it moves (docs/data-migrations.md).
+    const MIGRATION_DIGESTS: &[&str] =
+        &["b551ff19a044", "504ef93a32c0", "6fec0f2606a2", "cf7b15196d43", "1d5bb27de94f"];
+
+    #[test]
+    fn migrations_are_append_only() {
+        let digests: Vec<String> = MIGRATIONS
+            .iter()
+            .map(|m| Sha256::digest(m.as_bytes()).iter().take(6).map(|b| format!("{b:02x}")).collect())
+            .collect();
+        assert_eq!(digests, MIGRATION_DIGESTS, "a migration changed, or one was added without its digest");
+    }
+
+    #[test]
+    fn every_older_schema_opens_at_the_current_one_with_its_rows() {
+        for version in 0..=MIGRATIONS.len() {
+            let db = Connection::open_in_memory().unwrap();
+            db.execute_batch(SCHEMA).unwrap();
+            for migration in &MIGRATIONS[..version] {
+                db.execute_batch(migration).unwrap();
+            }
+            db.pragma_update(None, "user_version", version).unwrap();
+            db.execute_batch("INSERT INTO accounts(id,handle,account_key,kdf,auth_hash,key_blob,recovery_hash,recovery_blob,created_at) VALUES(1,'a','k','{}','h','b','r','rb',0);").unwrap();
+            let store = Store::init(db).unwrap_or_else(|e| panic!("schema {version}: {e:#}"));
+            let current: usize = store.db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(current, MIGRATIONS.len());
+            let key: String =
+                store.db.query_row("SELECT account_key FROM accounts WHERE handle='a'", [], |r| r.get(0)).unwrap();
+            assert_eq!(key, "k", "schema {version}");
+        }
+    }
+
+    #[test]
+    fn a_database_of_a_newer_schema_is_refused_and_left_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connect.sqlite3");
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch("CREATE TABLE future(x)").unwrap();
+            db.pragma_update(None, "user_version", MIGRATIONS.len() + 1).unwrap();
+        }
+        let error = Store::open(&path).err().expect("refused").to_string();
+        assert!(error.contains("newer gwar-connect"), "{error}");
+        let db = Connection::open(&path).unwrap();
+        let tables: Vec<String> = db
+            .prepare("SELECT name FROM sqlite_master WHERE type='table'")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(tables, ["future"], "not even the first schema was added");
+    }
+
+    #[test]
+    fn a_failed_migration_commits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("connect.sqlite3");
+        {
+            let db = Connection::open(&path).unwrap();
+            db.execute_batch(SCHEMA).unwrap();
+            // What the first migration creates already exists: it fails part-way.
+            db.execute_batch("CREATE TABLE vaults(x)").unwrap();
+        }
+        assert!(Store::open(&path).is_err());
+        let db = Connection::open(&path).unwrap();
+        let version: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let device_key: bool = db
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name='device_key'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((version, device_key), (0, false), "neither the version nor the first statement committed");
+    }
 
     #[test]
     fn a_database_from_before_the_migrations_is_upgraded() {
