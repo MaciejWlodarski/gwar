@@ -619,20 +619,28 @@ impl Core {
 
     /// SFU notifications belong only to the guest's current, live assignment. Admission
     /// pauses are owned by the core, so delayed SFU resumes cannot overwrite them.
-    pub(super) fn guest_paused(&mut self, guest: SessionId, run: u64, id: &str, reason: Option<ScreenPauseReason>) {
+    pub(super) fn guest_paused(
+        &mut self,
+        guest: SessionId,
+        run: u64,
+        grant: &Arc<WatchGrant>,
+        reason: Option<ScreenPauseReason>,
+    ) {
         if !self.guest_current(guest) {
             return;
         }
         let g = &self.guests[&guest];
-        if g.share != id
+        if g.share != grant.share
             || g.paused.is_some()
-            || !g.watch.as_ref().is_some_and(|w| {
-                w.run == run && w.slots[0].as_ref().is_some_and(|(share, grant)| share == id && grant.alive())
-            })
+            || !grant.alive()
+            || !g
+                .watch
+                .as_ref()
+                .is_some_and(|w| w.run == run && w.slots[0].as_ref().is_some_and(|(_, g)| Arc::ptr_eq(g, grant)))
         {
             return;
         }
-        let share = id.to_owned();
+        let share = grant.share.clone();
         self.send_guest_event(
             guest,
             match reason {
@@ -1189,7 +1197,7 @@ mod tests {
             assert!(lease.alive(), "the guest's transport survives the pause");
             assert!(core.guests[&newest].paused.is_some());
             assert!(matches!(event(&mut guests[24].1), Event::ScreenPaused { reason: ScreenPauseReason::Budget, .. }));
-            core.screen_paused(newest, GUEST_RUN, "S", None);
+            core.screen_paused(newest, GUEST_RUN, &old, None);
             assert!(guests[24].1.try_recv().is_err(), "a delayed SFU resume cannot undo admission pause");
             assert!(core.screen_watch(member, "S1").is_ok());
             assert!(core.guests[&next].paused.is_some());
@@ -1309,6 +1317,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn readmitted_guests_ignore_pause_and_resume_from_the_replaced_assignment() {
+        let (core, _notes) = core_with_bridge().await;
+        let token = linked_share(&core, 0).await;
+        on_core(&core, move |core| {
+            let (screen, _commands) = mpsc::channel(16);
+            core.screen = screen;
+            let (guest, mut frames) = admitted_guest(core, &token, true);
+            let old = core.guests[&guest].watch.as_ref().unwrap().slots[0].as_ref().unwrap().1.clone();
+            core.screen_limits.budget_mbps = 19;
+            core.reclaim_guest_reservations(8_000_000, None).unwrap();
+            assert!(!old.alive());
+            assert!(matches!(event(&mut frames), Event::ScreenPaused { reason: ScreenPauseReason::Budget, .. }));
+            core.resume_guests();
+            let fresh = core.guests[&guest].watch.as_ref().unwrap().slots[0].as_ref().unwrap().1.clone();
+            assert!(fresh.alive() && !Arc::ptr_eq(&old, &fresh));
+            assert!(matches!(event(&mut frames), Event::ScreenResumed { .. }));
+            for signal in [
+                ScreenSignal::Paused {
+                    session: guest,
+                    run: GUEST_RUN,
+                    grant: old.clone(),
+                    reason: ScreenPauseReason::Bandwidth,
+                },
+                ScreenSignal::Resumed { session: guest, run: GUEST_RUN, grant: old.clone() },
+            ] {
+                core.handle(CoreMsg::Screen(signal));
+                assert!(frames.try_recv().is_err(), "a replaced assignment cannot overwrite re-admission status");
+            }
+            let unrelated = WatchGrant::new(core.shares["S"].origin.clone());
+            core.screen_paused(guest, GUEST_RUN, &unrelated, Some(ScreenPauseReason::Bandwidth));
+            assert!(frames.try_recv().is_err(), "a live grant for the same share is not the current assignment");
+            core.screen_paused(guest, GUEST_RUN, &fresh, Some(ScreenPauseReason::Bandwidth));
+            assert!(matches!(event(&mut frames), Event::ScreenPaused { reason: ScreenPauseReason::Bandwidth, .. }));
+            core.screen_paused(guest, GUEST_RUN, &fresh, None);
+            assert!(matches!(event(&mut frames), Event::ScreenResumed { .. }));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rewatching_members_ignore_pause_and_resume_from_the_replaced_assignment() {
+        let (core, _notes) = core_with_bridge().await;
+        linked_share(&core, 0).await;
+        let member = session(&core, 2, "bob").await;
+        on_core(&core, move |core| {
+            let (screen, _commands) = mpsc::channel(16);
+            core.screen = screen;
+            let (out, mut frames) = mpsc::channel(OUTBOUND_QUEUE);
+            let s = core.sessions.get_mut(&member).unwrap();
+            s.out = Some(out);
+            s.watch = Some(connected_watch(Lease::new()));
+            core.screen_watch(member, "S").unwrap();
+            let old = core.sessions[&member].watch.as_ref().unwrap().slots[0].as_ref().unwrap().1.clone();
+            core.screen_unwatch(member, "S").unwrap();
+            core.screen_watch(member, "S").unwrap();
+            let fresh = core.sessions[&member].watch.as_ref().unwrap().slots[0].as_ref().unwrap().1.clone();
+            assert!(!old.alive() && fresh.alive() && !Arc::ptr_eq(&old, &fresh));
+            while frames.try_recv().is_ok() {}
+            for signal in [
+                ScreenSignal::Paused {
+                    session: member,
+                    run: GUEST_RUN,
+                    grant: old.clone(),
+                    reason: ScreenPauseReason::Bandwidth,
+                },
+                ScreenSignal::Resumed { session: member, run: GUEST_RUN, grant: old.clone() },
+            ] {
+                core.handle(CoreMsg::Screen(signal));
+                assert!(frames.try_recv().is_err(), "a replaced assignment cannot overwrite re-watch status");
+            }
+            let unrelated = WatchGrant::new(core.shares["S"].origin.clone());
+            core.screen_paused(member, GUEST_RUN, &unrelated, Some(ScreenPauseReason::Bandwidth));
+            assert!(frames.try_recv().is_err(), "a live grant for the same share is not the current assignment");
+            core.screen_paused(member, GUEST_RUN, &fresh, Some(ScreenPauseReason::Bandwidth));
+            assert!(matches!(event(&mut frames), Event::ScreenPaused { reason: ScreenPauseReason::Bandwidth, .. }));
+            core.screen_paused(member, GUEST_RUN, &fresh, None);
+            assert!(matches!(event(&mut frames), Event::ScreenResumed { .. }));
+        })
+        .await;
+    }
+
+    #[tokio::test]
     async fn guest_pause_events_validate_the_assignment_and_close_on_backpressure() {
         for closed in [false, true] {
             let (core, _notes) = core_with_bridge().await;
@@ -1317,15 +1407,16 @@ mod tests {
                 let (screen, _commands) = mpsc::channel(8);
                 core.screen = screen;
                 let (guest, mut frames) = admitted_guest(core, &token, true);
-                core.screen_paused(guest, GUEST_RUN + 1, "S", Some(ScreenPauseReason::Bandwidth));
-                core.screen_paused(guest, GUEST_RUN, "another-share", None);
+                let grant = core.guests[&guest].watch.as_ref().unwrap().slots[0].as_ref().unwrap().1.clone();
+                let other = WatchGrant::new(ScreenOrigin::new(1, "another-share".into(), 1, false, false, 8_000_000));
+                core.screen_paused(guest, GUEST_RUN + 1, &grant, Some(ScreenPauseReason::Bandwidth));
+                core.screen_paused(guest, GUEST_RUN, &other, None);
                 assert!(frames.try_recv().is_err());
-                core.screen_paused(guest, GUEST_RUN, "S", Some(ScreenPauseReason::Bandwidth));
-                core.screen_paused(guest, GUEST_RUN, "S", None);
+                core.screen_paused(guest, GUEST_RUN, &grant, Some(ScreenPauseReason::Bandwidth));
+                core.screen_paused(guest, GUEST_RUN, &grant, None);
                 assert!(matches!(event(&mut frames), Event::ScreenPaused { reason: ScreenPauseReason::Bandwidth, .. }));
                 assert!(matches!(event(&mut frames), Event::ScreenResumed { .. }));
                 assert!(frames.try_recv().is_err(), "exactly two events");
-                let grant = core.guests[&guest].watch.as_ref().unwrap().slots[0].as_ref().unwrap().1.clone();
                 let lease = core.guests[&guest].lease.clone();
                 if closed {
                     drop(frames);
@@ -1334,7 +1425,7 @@ mod tests {
                         core.send_guest_event(guest, Event::ScreenResumed { share: "S".into() });
                     }
                 }
-                core.screen_paused(guest, GUEST_RUN, "S", Some(ScreenPauseReason::Budget));
+                core.screen_paused(guest, GUEST_RUN, &grant, Some(ScreenPauseReason::Budget));
                 assert!(!core.guests.contains_key(&guest));
                 assert!(!grant.alive() && !lease.alive());
                 assert_eq!(core.screen_reserved(), 8_000_000);
@@ -1355,12 +1446,13 @@ mod tests {
             let (screen, _commands) = mpsc::channel(8);
             core.screen = screen;
             let (guest, mut frames) = admitted_guest(core, url.0.rsplit_once('#').unwrap().1, true);
+            let grant = core.guests[&guest].watch.as_ref().unwrap().slots[0].as_ref().unwrap().1.clone();
             core.screen_limits.budget_mbps = 19;
             core.reclaim_guest_reservations(8_000_000, None).unwrap();
             assert!(matches!(event(&mut frames), Event::ScreenPaused { .. }));
             membership.end();
             core.resume_guests();
-            core.screen_paused(guest, GUEST_RUN, "S", None);
+            core.screen_paused(guest, GUEST_RUN, &grant, None);
             assert!(!core.guests.contains_key(&guest));
             assert!(frames.try_recv().is_err());
             assert_eq!(core.screen_reserved(), 8_000_000);

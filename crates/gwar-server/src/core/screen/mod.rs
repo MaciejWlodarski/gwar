@@ -415,21 +415,25 @@ impl Core {
     }
 
     /// The screen SFU paused (`reason`) or resumed (`None`) a viewer's slot: the viewer hears of
-    /// it if it still watches the share on that transport.
-    pub(super) fn screen_paused(&mut self, session: SessionId, run: u64, id: &str, reason: Option<ScreenPauseReason>) {
+    /// it only while the exact assignment is still current and alive on that transport.
+    pub(super) fn screen_paused(
+        &mut self,
+        session: SessionId,
+        run: u64,
+        grant: &Arc<WatchGrant>,
+        reason: Option<ScreenPauseReason>,
+    ) {
         if self.guests.contains_key(&session) {
-            self.guest_paused(session, run, id, reason);
+            self.guest_paused(session, run, grant, reason);
             return;
         }
-        let watching = self
-            .sessions
-            .get(&session)
-            .and_then(|s| s.watch.as_ref())
-            .is_some_and(|w| w.run == run && w.slots.iter().flatten().any(|(share, _)| share == id));
+        let watching = self.sessions.get(&session).and_then(|s| s.watch.as_ref()).is_some_and(|w| {
+            w.run == run && grant.alive() && w.slots.iter().flatten().any(|(_, g)| Arc::ptr_eq(g, grant))
+        });
         if !watching {
             return;
         }
-        let share = id.to_owned();
+        let share = grant.share.clone();
         let event = match reason {
             Some(reason) => Event::ScreenPaused { share, reason },
             None => Event::ScreenResumed { share },

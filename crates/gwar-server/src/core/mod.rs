@@ -776,11 +776,11 @@ impl Core {
             }
             CoreMsg::Guest(msg) => self.guest_msg(msg),
             CoreMsg::ResumeGuests => self.resume_guests(),
-            CoreMsg::Screen(ScreenSignal::Paused { session, run, share, reason }) => {
-                self.screen_paused(session, run, &share, Some(reason))
+            CoreMsg::Screen(ScreenSignal::Paused { session, run, grant, reason }) => {
+                self.screen_paused(session, run, &grant, Some(reason))
             }
-            CoreMsg::Screen(ScreenSignal::Resumed { session, run, share }) => {
-                self.screen_paused(session, run, &share, None)
+            CoreMsg::Screen(ScreenSignal::Resumed { session, run, grant }) => {
+                self.screen_paused(session, run, &grant, None)
             }
             CoreMsg::Egress(reading) => {
                 let shared = egress::screen_bytes(&self.screen_shared);

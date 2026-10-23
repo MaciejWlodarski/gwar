@@ -252,17 +252,18 @@ pub enum ScreenSignal {
         run: u64,
         connected: bool,
     },
-    /// A viewer's slot of `share` stopped carrying it for now, or carries it again.
+    /// An assignment stopped carrying media for now, or carries it again. The exact grant
+    /// fences delayed notifications when a slot is reassigned on the same transport run.
     Paused {
         session: SessionId,
         run: u64,
-        share: String,
+        grant: Arc<WatchGrant>,
         reason: ScreenPauseReason,
     },
     Resumed {
         session: SessionId,
         run: u64,
-        share: String,
+        grant: Arc<WatchGrant>,
     },
 }
 
@@ -910,11 +911,12 @@ impl Sfu {
                 !matches!(queued, ScreenSignal::Publish { share: s, signal: PublishSignal::Connected } if s == share)
             }),
             ScreenSignal::Publish { .. } => {}
-            // Only a viewer's latest pause or resume of a share matters.
-            ScreenSignal::Paused { session, share, .. } | ScreenSignal::Resumed { session, share, .. } => {
+            // Only a viewer's latest pause or resume of a share matters. Keep its exact
+            // grant so the core can reject it if the assignment has since been replaced.
+            ScreenSignal::Paused { session, grant, .. } | ScreenSignal::Resumed { session, grant, .. } => {
                 self.outbox.retain(|queued| match queued {
-                    ScreenSignal::Paused { session: s, share: h, .. }
-                    | ScreenSignal::Resumed { session: s, share: h, .. } => !(s == session && h == share),
+                    ScreenSignal::Paused { session: s, grant: g, .. }
+                    | ScreenSignal::Resumed { session: s, grant: g, .. } => !(s == session && g.share == grant.share),
                     _ => true,
                 })
             }
@@ -984,8 +986,8 @@ impl Sfu {
     }
 
     /// Compares the last second's egress with the server-wide budget. Over it for
-    /// `OVER_BUDGET_SECONDS`, the newest watch is paused, one a second while it stays over.
-    /// (Guests, which PR 6 brings, will go first.)
+    /// `OVER_BUDGET_SECONDS`, pause one active watch a second while it stays over:
+    /// guests before members, newest first within each group.
     fn measure(&mut self, now: Instant) {
         let elapsed = now.saturating_duration_since(self.measured.started);
         if elapsed < Duration::from_secs(1) {
@@ -1012,10 +1014,13 @@ impl Sfu {
         let newest = self
             .watchers
             .values()
-            .flat_map(|w| w.egress.orders().map(move |(slot, order)| (order, w.session, slot)))
+            .flat_map(|w| w.egress.orders().map(move |(slot, order)| (w.size == GUEST_SLOTS, order, w.session, slot)))
             .max();
-        if let Some((_, session, slot)) = newest {
-            warn!(rate, budget, "screen egress over budget: pausing the newest watch");
+        if let Some((guest, _, session, slot)) = newest {
+            warn!(
+                rate,
+                budget, guest, "screen egress over budget: pausing the newest watch in the lowest-priority group"
+            );
             if let Some(w) = self.watchers.get_mut(&session) {
                 apply(w, slot, Change::Pause(ScreenPauseReason::Budget));
             }
@@ -1042,18 +1047,19 @@ impl Sfu {
     /// asks for its keyframe.
     fn tell(&mut self, session: SessionId, slot: usize, change: Change, now: Instant) {
         let Some(w) = self.watchers.get(&session) else { return };
-        let Some(share) = w.slots.get(slot).and_then(|s| s.grant.as_ref()).map(|g| g.share.clone()) else { return };
+        let Some(grant) = w.slots.get(slot).and_then(|s| s.grant.clone()) else { return };
+        let share = &grant.share;
         let run = w.run;
         match change {
             Change::Pause(reason) => {
                 let (estimate, counters) = (w.egress.estimate(), w.egress.counters);
                 debug!(session, share, ?reason, estimate, ?counters, "screen slot paused");
-                self.signal(ScreenSignal::Paused { session, run, share, reason });
+                self.signal(ScreenSignal::Paused { session, run, grant, reason });
             }
             Change::Resume => {
                 debug!(session, share, "screen slot resumed");
                 self.ask_keyframe(session, slot, now);
-                self.signal(ScreenSignal::Resumed { session, run, share });
+                self.signal(ScreenSignal::Resumed { session, run, grant });
             }
         }
     }
@@ -2091,6 +2097,62 @@ pub(crate) mod tests {
         assert!(pair.w.slots[0].written <= 2, "release uses the reduced estimate");
         assert_eq!(pair.w.egress.counters.originals_dropped, 0);
         assert!(pair.w.egress.queued() > 0, "the rest stays owned by the deadline queue");
+    }
+
+    #[tokio::test]
+    async fn runtime_budget_pauses_newest_guests_before_any_members() {
+        let now = Instant::now();
+        let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let (dispatch, _rx) = dispatch();
+        let core = crate::core::expiry_tests::test_core(crate::store::Store::in_memory().unwrap(), None);
+        let mut sfu = Sfu {
+            socket,
+            advertise: addr(6000),
+            core,
+            dropped: Arc::new(AtomicU64::new(0)),
+            owners: Owners { held: HashMap::new(), addrs: dispatch.addrs },
+            outbox: VecDeque::new(),
+            budgets: HashMap::new(),
+            publishers: HashMap::new(),
+            watchers: HashMap::new(),
+            next_id: 1,
+            shared: ScreenShared::new(300_000_000),
+            measured: Measured::new(now),
+            watches: 4,
+            next_allocation: now,
+        };
+        // Every member is newer than every guest. Priority is by active assignment,
+        // not transport age, and an already paused guest must not be selected again.
+        for (session, order, guest) in [(1, 10, true), (2, 20, true), (3, 30, false), (4, 40, false)] {
+            let mut pair = Pair::new();
+            pair.w.session = session;
+            pair.w.size = if guest { GUEST_SLOTS } else { SCREEN_SLOTS };
+            let origin = ScreenOrigin::new(99, "share".into(), 1, false, false, 8_000_000);
+            assign(&mut pair.w, 0, WatchGrant::new(origin), order, pair.now);
+            sfu.watchers.insert(session, pair.w);
+        }
+        sfu.shared.budget_bps.store(1_000_000, Ordering::Relaxed);
+        let mut at = now;
+        for _ in 1..OVER_BUDGET_SECONDS {
+            at += Duration::from_secs(1);
+            sfu.measured.bytes = 250_000;
+            sfu.measure(at);
+            assert!(sfu.watchers.values().all(|w| w.egress.paused(0).is_none()));
+        }
+        let mut paused = HashSet::new();
+        for expected in [2, 1, 4, 3] {
+            at += Duration::from_secs(1);
+            sfu.measured.bytes = 250_000;
+            sfu.measure(at);
+            paused.insert(expected);
+            for (&session, w) in &sfu.watchers {
+                assert_eq!(
+                    w.egress.paused(0),
+                    paused.contains(&session).then_some(ScreenPauseReason::Budget),
+                    "budget must pause guest assignments first, newest first; selected {expected}, viewer {session}"
+                );
+            }
+        }
     }
 
     #[tokio::test]
