@@ -63,6 +63,8 @@ zip = { version = "9", default-features = false, features = ["deflate"], optiona
 libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
+# Test-only deterministic transport clock and stream iteration.
+str0m = { version = "0.24", default-features = false, features = ["_gwar_sim"] }
 openmls = "=0.9.2"
 openmls_rust_crypto = "=0.6.0"
 gwar-client = { path = "../gwar-client" }

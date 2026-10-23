@@ -7,6 +7,8 @@ pub(crate) use bit_pattern::BitPattern;
 pub(crate) mod value_history;
 
 mod time_tricks;
+#[cfg(feature = "_gwar_sim")]
+pub(crate) use time_tricks::simulation_start;
 pub(crate) use time_tricks::{InstantExt, SystemTimeExt, not_happening};
 pub(crate) use time_tricks::{already_happened, epoch_to_beginning};
 

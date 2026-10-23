@@ -31,6 +31,11 @@ opt-level = 3
 [profile.dev.package."*"]
 opt-level = 2
 
+# The network sims advance minutes of virtual time through server code. Keep the
+# debug assertions and overflow checks while avoiding unoptimized per-packet work.
+[profile.test.package.gwar-server]
+opt-level = 1
+
 [profile.wasm-release]
 inherits = "release"
 opt-level = "z"
