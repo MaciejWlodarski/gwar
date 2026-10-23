@@ -994,8 +994,9 @@ Starting points for H.264 hardware encoding. They are to be measured
   not an assumed percentage saving; the caps remain unchanged. B6 uses the
   same provisional rates for every codec until those measurements exist, with
   720p reference rates of 1.25/2/4 Mbps for Text/Smooth/Game. Rates scale
-  with actual pixel count and frame rate, with a 100 kbps floor. This is a
-  policy starting point, not a measured quality guarantee.
+  with actual pixel count and frame rate, using the monotone envelope below
+  and a 100 kbps floor. This is a policy starting point, not a measured
+  quality guarantee.
 
 ### SFU limits to raise
 
@@ -1121,9 +1122,21 @@ and rotate the tier bounds for portrait sources. Software is capped at
 that cannot retain its physical resolution. The requested preset/tier must
 fit the administrative bitrate cap before the controller is constructed.
 Every generated rung is also clamped to that cap, including capability-limited
-starting settings, failover and recovery targets. Finalized ladders, including
-fps-limited and inserted failover rungs, clamp each lower rung's nominal bitrate
-to at most the rung above it. Equal-bitrate lower rungs remain available to
+starting settings, failover and recovery targets.
+
+Nominal rates use one monotone envelope over the raw pixel/fps-scaled table:
+`nominal(w, h, fps) = min(raw(w, h, fps), raw(any dominating configuration))`.
+A configuration dominates another when both its pixel count and fps are at
+least as large. The minimum is evaluated at the aspect-fitted tier boundaries
+and source size within the original requested tier, independently of encoder
+capability limits. Between boundaries raw rates grow with pixel count; raw
+rates also grow with fps, so only boundary rates at the same fps can lower
+the minimum. This preserves already-monotonic rates, including every standard
+tier's table budget, and lowers only inversions caused by different tier pixel
+densities or even-pixel rounding. The 100 kbps floor and administrative cap
+apply afterwards. Construction, admission, inherited-fps failover settings,
+recovery and lower rungs all use this same function; no per-ladder or inherited
+bitrate ceiling is needed. Equal-bitrate lower rungs remain available to
 relieve CPU/encode/drop pressure without violating Text/Game quality floors.
 
 Recovery requires 10 continuous seconds with no late/dropped frames, at
@@ -1144,12 +1157,11 @@ immediately. At the quality floor, sustained pressure pauses the layer instead
 of breaking its preset; resumption also requires 10 s of headroom at that
 setting. A failed encoder is excluded for the controller's lifetime; outputs identify the exact B1
 capability candidate by its input index, and fallback cannot immediately raise
-resolution or fps. The replacement's starting nominal bitrate is capped at
-the prior rung's nominal bitrate, even when the encoders have different
-capability limits. Finalization carries that ceiling through lower rungs
-while preserving higher-fps recovery. If the prior fps falls below the
-replacement's normal ladder, fallback inserts that cadence at the highest
-supported resolution within the previous dimensions. Lower-resolution
+resolution or fps. The shared nominal envelope prevents a replacement with
+no more pixels or fps from needing more bitrate. Identical recovery settings
+keep the same rate across encoders with different capability limits. If the
+prior fps falls below the replacement's normal ladder, fallback inserts that
+cadence at the highest supported resolution within the previous dimensions. Lower-resolution
 degradation steps keep that cadence. Text/Smooth retain higher-fps recovery
 steps and can regain fps after the recovery hold; Game retains its prior cadence.
 Selection follows hardware AV1 → H.264 → VP9 → VP8,

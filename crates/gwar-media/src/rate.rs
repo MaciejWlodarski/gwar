@@ -110,21 +110,6 @@ struct EncoderPlan {
     steps: Vec<QualityTarget>,
 }
 
-impl EncoderPlan {
-    fn finalize(&mut self) {
-        // Tier pixel densities and inherited fps can invert nominal bitrate needs.
-        // Clamp downwards so pressure/recovery never face a costlier lower rung.
-        // Keep equal-bitrate rungs: smaller frames or lower cadence can still
-        // relieve CPU/encode/drop pressure while preserving the preset's floor.
-        let mut ceiling = u32::MAX;
-        for target in &mut self.steps {
-            let bitrate = &mut target.encoder.rate.bitrate_bps;
-            *bitrate = (*bitrate).min(ceiling);
-            ceiling = *bitrate;
-        }
-    }
-}
-
 /// Pure state machine for exactly one layer, with caller-provided monotonic time.
 ///
 /// Two seconds of continuous pressure lower one quality step. Ten seconds of continuous
@@ -142,7 +127,7 @@ impl EncoderPlan {
 /// holds, aggregate allocation, SVC metadata and encoder probing belong to A3/B11/B11a.
 #[derive(Debug)]
 pub struct RateController {
-    preset: Preset,
+    config: ControllerConfig,
     plans: Vec<EncoderPlan>,
     active: usize,
     step: usize,
@@ -167,7 +152,7 @@ impl RateController {
         }
         let fps = preset_fps(config.preset, config.tier);
         let size = fit_size(config.source_size, config.tier);
-        if bitrate(config.preset, config.tier, size, fps) > config.bitrate_cap_bps {
+        if nominal_bitrate(config, size, fps) > config.bitrate_cap_bps {
             return Err(MediaError::Invalid("preset tier exceeds the allocated bitrate cap"));
         }
         let mut candidates: Vec<_> = encoders.iter().enumerate().collect();
@@ -186,7 +171,7 @@ impl RateController {
         };
         let bitrate_bps = first.steps[0].encoder.rate.bitrate_bps;
         Ok(Self {
-            preset: config.preset,
+            config,
             plans,
             active: 0,
             step: 0,
@@ -319,9 +304,9 @@ impl RateController {
         while let Some(plan) = self.plans.get_mut(self.active) {
             // Only Game preserves cadence permanently. Text/Smooth must retain their
             // higher-fps recovery steps, even when failover starts on a degraded rung.
-            if self.preset == Preset::Game {
+            if self.config.preset == Preset::Game {
                 for target in &mut plan.steps {
-                    limit_fps(target, prior.encoder.rate.max_fps);
+                    limit_fps(target, prior.encoder.rate.max_fps, self.config);
                 }
                 plan.steps.dedup_by_key(|target| (target.encoder.size, target.encoder.rate.max_fps));
             }
@@ -341,22 +326,14 @@ impl RateController {
                 let size = plan.steps[first].encoder.size;
                 let step = plan.steps.iter().rposition(|target| target.encoder.size == size)? + 1;
                 let mut start = plan.steps[step - 1];
-                limit_fps(&mut start, prior.encoder.rate.max_fps);
+                limit_fps(&mut start, prior.encoder.rate.max_fps, self.config);
                 plan.steps.insert(step, start);
                 // Further pressure may reduce resolution, but must not increase fps.
                 for target in &mut plan.steps[step + 1..] {
-                    limit_fps(target, prior.encoder.rate.max_fps);
+                    limit_fps(target, prior.encoder.rate.max_fps, self.config);
                 }
                 Some(step)
             });
-            if let Some(step) = step {
-                // Independent capability limits can select a smaller frame with
-                // a denser tier's nominal rate. Inherit the prior nominal ceiling
-                // before finalizing lower rungs; keep higher-fps recovery intact.
-                let bitrate = &mut plan.steps[step].encoder.rate.bitrate_bps;
-                *bitrate = (*bitrate).min(prior.encoder.rate.bitrate_bps);
-            }
-            plan.finalize();
             if let Some(step) = step {
                 self.step = step;
                 self.bitrate_bps = self.bitrate_bps.min(plan.steps[step].encoder.rate.bitrate_bps);
@@ -367,11 +344,10 @@ impl RateController {
     }
 }
 
-fn limit_fps(target: &mut QualityTarget, max_fps: u32) {
+fn limit_fps(target: &mut QualityTarget, max_fps: u32, config: ControllerConfig) {
     let rate = &mut target.encoder.rate;
-    let fps = rate.max_fps.min(max_fps);
-    rate.bitrate_bps = ((u64::from(rate.bitrate_bps) * u64::from(fps) / u64::from(rate.max_fps)) as u32).max(100_000);
-    rate.max_fps = fps;
+    rate.max_fps = rate.max_fps.min(max_fps);
+    rate.bitrate_bps = nominal_bitrate(config, target.encoder.size, rate.max_fps).min(config.bitrate_cap_bps);
 }
 
 fn make_plan(config: ControllerConfig, caps: &CodecCaps, encoder_index: usize) -> Option<EncoderPlan> {
@@ -406,9 +382,7 @@ fn make_plan(config: ControllerConfig, caps: &CodecCaps, encoder_index: usize) -
             if steps.last().is_some_and(|last| last.encoder.size == size && last.encoder.rate.max_fps == max_fps) {
                 continue;
             }
-            // Tier reference rates and even-pixel rounding can make a lower tier's
-            // nominal need higher than the admitted request, especially for odd aspects.
-            let bitrate_bps = bitrate(config.preset, tier, size, max_fps).min(config.bitrate_cap_bps);
+            let bitrate_bps = nominal_bitrate(config, size, max_fps).min(config.bitrate_cap_bps);
             steps.push(QualityTarget {
                 encoder_index,
                 tier,
@@ -417,9 +391,7 @@ fn make_plan(config: ControllerConfig, caps: &CodecCaps, encoder_index: usize) -
             });
         }
     }
-    let mut plan = EncoderPlan { steps };
-    plan.finalize();
-    (!plan.steps.is_empty()).then_some(plan)
+    (!steps.is_empty()).then_some(EncoderPlan { steps })
 }
 
 fn preset_fps(preset: Preset, tier: ResolutionTier) -> u32 {
@@ -448,20 +420,45 @@ fn fit_size(source: Size, tier: ResolutionTier) -> Size {
     Size { width: (width as u32 & !1).max(2), height: (height as u32 & !1).max(2) }
 }
 
-fn bitrate(preset: Preset, tier: ResolutionTier, size: Size, fps: u32) -> u32 {
+/// Greatest non-decreasing rate below the raw tier rates for this source/request.
+/// Capability limits never change the envelope, so all encoders price equal settings alike.
+fn nominal_bitrate(config: ControllerConfig, size: Size, fps: u32) -> u32 {
+    let pixels = u64::from(size.width) * u64::from(size.height);
+    let mut value = raw_bitrate(config.preset, ResolutionTier::P720, size, fps);
+    let mut ceiling = u32::MAX;
+    for tier in [ResolutionTier::P720, ResolutionTier::P1080, ResolutionTier::P1440, ResolutionTier::P2160] {
+        if tier > config.tier {
+            break;
+        }
+        let boundary = fit_size(config.source_size, tier);
+        let boundary_pixels = u64::from(boundary.width) * u64::from(boundary.height);
+        // Between boundaries the raw rate increases with pixels using the lower
+        // tier's density. Only a boundary (including the source) can lower it.
+        if boundary_pixels <= pixels {
+            value = raw_bitrate(config.preset, tier, size, fps);
+        }
+        if boundary_pixels >= pixels {
+            ceiling = ceiling.min(raw_bitrate(config.preset, tier, boundary, fps));
+        }
+    }
+    // Raw rates increase with fps, so higher-fps dominators cannot lower this minimum.
+    value.min(ceiling).max(100_000)
+}
+
+fn raw_bitrate(preset: Preset, tier: ResolutionTier, size: Size, fps: u32) -> u32 {
     // Provisional H.264 reference rates, also used for VPx/AV1 until F3 measures them.
     let rates = match preset {
-        Preset::Text => [1_250_000_u64, 2_500_000, 3_500_000, 6_000_000],
+        Preset::Text => [1_250_000_u128, 2_500_000, 3_500_000, 6_000_000],
         Preset::Smooth => [2_000_000, 4_000_000, 7_000_000, 12_000_000],
         Preset::Game => [4_000_000, 8_000_000, 14_000_000, 20_000_000],
     };
     let reference = tier.size();
-    let pixels = u64::from(size.width) * u64::from(size.height);
-    let reference_pixels = u64::from(reference.width) * u64::from(reference.height);
+    let pixels = u128::from(size.width) * u128::from(size.height);
+    let reference_pixels = u128::from(reference.width) * u128::from(reference.height);
     // Game 2160p30 remains 30 fps even after downscaling to lower tiers.
     let value =
-        rates[tier as usize] * pixels * u64::from(fps) / (reference_pixels * u64::from(preset_fps(preset, tier)));
-    (value as u32).max(100_000)
+        rates[tier as usize] * pixels * u128::from(fps) / (reference_pixels * u128::from(preset_fps(preset, tier)));
+    value.min(u128::from(u32::MAX)) as u32
 }
 
 fn cpu_budget(target: QualityTarget) -> u32 {
@@ -494,6 +491,110 @@ fn encode_budget(target: QualityTarget, percent: u128) -> u128 {
 mod tests {
     use super::*;
     use crate::CodecProfile;
+
+    #[test]
+    fn nominal_rate_preserves_standard_tier_budgets_at_every_cadence() {
+        let tiers = [ResolutionTier::P720, ResolutionTier::P1080, ResolutionTier::P1440, ResolutionTier::P2160];
+        for preset in [Preset::Text, Preset::Smooth, Preset::Game] {
+            for requested in tiers {
+                for source_size in [requested.size(), ResolutionTier::P2160.size()] {
+                    let config = ControllerConfig { preset, tier: requested, source_size, bitrate_cap_bps: u32::MAX };
+                    for tier in tiers.into_iter().filter(|tier| *tier <= requested) {
+                        for fps in 1..=60 {
+                            assert_eq!(
+                                nominal_bitrate(config, tier.size(), fps),
+                                raw_bitrate(preset, tier, tier.size(), fps).max(100_000),
+                                "{config:?}, {tier:?}, {fps} fps"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nominal_rate_is_monotone_for_random_dominating_pixels_and_fps() {
+        // Deterministic random coverage without adding a dependency to the std-only crate.
+        let mut state = 0x00b6_0160_0005_u64;
+        let mut random = |bound| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % u64::from(bound)) as u32
+        };
+        let tiers = [ResolutionTier::P720, ResolutionTier::P1080, ResolutionTier::P1440, ResolutionTier::P2160];
+        for preset in [Preset::Text, Preset::Smooth, Preset::Game] {
+            for _ in 0..10_000 {
+                let config = ControllerConfig {
+                    preset,
+                    tier: tiers[random(4) as usize],
+                    source_size: Size { width: 2 + random(8191), height: 2 + random(8191) },
+                    bitrate_cap_bps: u32::MAX,
+                };
+                let bounds = fit_size(config.source_size, config.tier);
+                let mut a = Size { width: 1 + random(bounds.width), height: 1 + random(bounds.height) };
+                let mut b = Size { width: 1 + random(bounds.width), height: 1 + random(bounds.height) };
+                // Domination is by pixel count, including pairs with different aspect ratios.
+                if u64::from(a.width) * u64::from(a.height) < u64::from(b.width) * u64::from(b.height) {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                let b_fps = 1 + random(60);
+                let a_fps = b_fps + random(61 - b_fps);
+                assert!(
+                    nominal_bitrate(config, a, a_fps) >= nominal_bitrate(config, b, b_fps),
+                    "{config:?}: {a:?}@{a_fps} dominates {b:?}@{b_fps}"
+                );
+                // Check both dimensions of the policy separately, too.
+                assert!(nominal_bitrate(config, a, b_fps) >= nominal_bitrate(config, b, b_fps));
+                assert!(nominal_bitrate(config, b, a_fps) >= nominal_bitrate(config, b, b_fps));
+                // Tier/source boundaries are where density changes can invert raw rates.
+                for tier in tiers.into_iter().filter(|tier| *tier <= config.tier) {
+                    let boundary = fit_size(config.source_size, tier);
+                    let below = Size { width: boundary.width - 1, height: boundary.height };
+                    let above = Size { width: boundary.width + 1, height: boundary.height };
+                    let rate = nominal_bitrate(config, boundary, b_fps);
+                    assert!(nominal_bitrate(config, below, b_fps) <= rate);
+                    assert!(nominal_bitrate(config, above, b_fps) >= rate);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn nominal_rate_only_lowers_inverted_ladder_values() {
+        let tiers = [ResolutionTier::P720, ResolutionTier::P1080, ResolutionTier::P1440, ResolutionTier::P2160];
+        for preset in [Preset::Text, Preset::Smooth, Preset::Game] {
+            for source_size in [
+                Size { width: 640, height: 360 },
+                Size { width: 1930, height: 1080 },
+                Size { width: 1080, height: 1930 },
+                Size { width: 2559, height: 1439 },
+                ResolutionTier::P2160.size(),
+            ] {
+                for requested in tiers {
+                    let config = ControllerConfig { preset, tier: requested, source_size, bitrate_cap_bps: u32::MAX };
+                    for tier in tiers.into_iter().filter(|tier| *tier <= requested) {
+                        let size = fit_size(source_size, tier);
+                        let pixels = u64::from(size.width) * u64::from(size.height);
+                        for fps in [1, 3, 5, 10, 15, 20, 30, 60] {
+                            let raw = raw_bitrate(preset, tier, size, fps).max(100_000);
+                            let expected =
+                                tiers.into_iter().filter(|tier| *tier <= requested).fold(raw, |rate, tier| {
+                                    let boundary = fit_size(source_size, tier);
+                                    if u64::from(boundary.width) * u64::from(boundary.height) >= pixels {
+                                        rate.min(raw_bitrate(preset, tier, boundary, fps).max(100_000))
+                                    } else {
+                                        rate
+                                    }
+                                });
+                            assert_eq!(nominal_bitrate(config, size, fps), expected, "{config:?}: {tier:?}@{fps}");
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     fn assert_ladders(controller: &RateController, config: ControllerConfig) {
         for plan in &controller.plans {
@@ -549,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn finalized_ladder_bitrates_are_monotonic_across_policy_and_capability_sweep() {
+    fn ladder_bitrates_are_monotonic_across_policy_and_capability_sweep() {
         let tiers = [ResolutionTier::P720, ResolutionTier::P1080, ResolutionTier::P1440, ResolutionTier::P2160];
         let sources = [
             Size { width: 2, height: 2 },
@@ -583,7 +684,8 @@ mod tests {
         for preset in [Preset::Text, Preset::Smooth, Preset::Game] {
             for tier in tiers {
                 for source_size in sources {
-                    let admitted = bitrate(preset, tier, fit_size(source_size, tier), preset_fps(preset, tier));
+                    let request = ControllerConfig { preset, tier, source_size, bitrate_cap_bps: u32::MAX };
+                    let admitted = nominal_bitrate(request, fit_size(source_size, tier), preset_fps(preset, tier));
                     for bitrate_cap_bps in [100_000, admitted, admitted + 100_000, 50_000_000] {
                         let config = ControllerConfig { preset, tier, source_size, bitrate_cap_bps };
                         // AV1 and H.264 limits vary independently: sharing one

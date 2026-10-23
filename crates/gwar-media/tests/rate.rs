@@ -555,7 +555,9 @@ fn nonstandard_source_targets_stay_within_cap_at_construction_failover_and_recov
     let mut c = RateController::new(cfg, &encoders).unwrap();
     let initial = encode(c.decision());
     assert_eq!(initial.encoder.size, Size { width: 1920, height: 1074 });
-    assert_eq!(initial.encoder.rate.bitrate_bps, cfg.bitrate_cap_bps);
+    // The inverted 1080p cost now inherits the cheaper dominating source rate.
+    assert_eq!(initial.encoder.rate.bitrate_bps, 7_916_015);
+    assert!(initial.encoder.rate.bitrate_bps <= cfg.bitrate_cap_bps);
     for second in 0..=2 {
         let target = encode(sample(&mut c, second, ControllerFeedback { encoder_dropped: true, ..healthy() }));
         assert!(target.encoder.rate.bitrate_bps <= cfg.bitrate_cap_bps);
@@ -568,7 +570,8 @@ fn nonstandard_source_targets_stay_within_cap_at_construction_failover_and_recov
     assert_eq!(c.decision(), RateDecision::Encode(initial));
     let replacement = encode(sample(&mut c, 14, ControllerFeedback { encoder_failed: true, ..healthy() }));
     assert_eq!(replacement.encoder_index, 1);
-    assert_eq!(replacement.encoder.rate.bitrate_bps, cfg.bitrate_cap_bps);
+    assert_eq!(replacement.encoder.rate, initial.encoder.rate);
+    assert!(replacement.encoder.rate.bitrate_bps <= cfg.bitrate_cap_bps);
     sample(&mut c, 15, ControllerFeedback { bandwidth_bps: 100_000, ..healthy() });
     for second in 16..=26 {
         let target = encode(sample(&mut c, second, healthy()));
@@ -662,7 +665,7 @@ fn resolution_limited_smooth_failover_stays_at_steady_bandwidth_and_recovers() {
         assert_eq!(sample(&mut c, second, feedback), RateDecision::Encode(degraded));
     }
     assert_eq!(sample(&mut c, 104, feedback), RateDecision::Encode(replacement));
-    // The inherited bitrate ceiling must leave the higher-fps recovery rungs intact.
+    // The nominal envelope must leave the higher-fps recovery rungs intact.
     for (start, fps) in [(105, 15), (116, 20), (127, 30)] {
         let before = c.decision();
         for second in start..start + 10 {
@@ -672,5 +675,65 @@ fn resolution_limited_smooth_failover_stays_at_steady_bandwidth_and_recovers() {
         assert_eq!(recovered.encoder_index, 1);
         assert_eq!(recovered.encoder.size, replacement.encoder.size);
         assert_eq!(recovered.encoder.rate.max_fps, fps);
+    }
+}
+
+#[test]
+fn degraded_smooth_failovers_recover_with_the_same_nominal_rate() {
+    let cfg = ControllerConfig {
+        source_size: Size { width: 1930, height: 1080 },
+        ..config(Preset::Smooth, ResolutionTier::P2160)
+    };
+    let encoders = [
+        CodecCaps { max_fps: 10, ..caps(AV1, true) },
+        CodecCaps { max_size: ResolutionTier::P1080.size(), max_fps: 10, ..caps(H264, true) },
+        CodecCaps { max_fps: 10, ..caps(CodecProfile::Vp9 { profile: 0 }, false) },
+    ];
+    let feedback = ControllerFeedback { bandwidth_bps: 1_250_000, ..healthy() };
+    let pressure = ControllerFeedback { encoder_dropped: true, ..feedback };
+    let failure = ControllerFeedback { encoder_failed: true, ..feedback };
+    for failover in [false, true] {
+        let mut c = RateController::new(cfg, &encoders).unwrap();
+        // Six one-second drop samples reach 720p before AV1 fails.
+        for second in 0..=5 {
+            sample(&mut c, second, pressure);
+        }
+        let degraded = encode(c.decision());
+        assert_eq!(degraded.encoder.size, Size { width: 1280, height: 716 });
+        assert_eq!(degraded.encoder.rate.max_fps, 10);
+        if failover {
+            let replacement = encode(sample(&mut c, 6, failure));
+            assert_eq!(replacement.encoder_index, 1);
+            assert_eq!(replacement.encoder.size, degraded.encoder.size);
+        } else {
+            sample(&mut c, 6, feedback);
+        }
+        // AV1 and its resolution-limited H.264 replacement must both recover.
+        for second in 7..=96 {
+            let target = encode(sample(&mut c, second, feedback));
+            if second >= if failover { 17 } else { 27 } {
+                let expected = if failover { Size { width: 1920, height: 1074 } } else { cfg.source_size };
+                assert_eq!(target.encoder.size, expected);
+                assert_eq!(target.encoder.rate, RateControl { max_fps: 10, bitrate_bps: 1_005_208 });
+            }
+        }
+        if failover {
+            // Repeat the degraded failover on H.264 -> software VP9.
+            for second in 97..=99 {
+                sample(&mut c, second, pressure);
+            }
+            assert_eq!(encode(c.decision()).encoder.size, degraded.encoder.size);
+            let replacement = encode(sample(&mut c, 100, failure));
+            assert_eq!(replacement.encoder_index, 2);
+            assert!(!replacement.hardware);
+            assert_eq!(replacement.encoder.size, degraded.encoder.size);
+            for second in 101..=190 {
+                let target = encode(sample(&mut c, second, feedback));
+                if second >= 111 {
+                    assert_eq!(target.encoder.size, Size { width: 1920, height: 1074 });
+                    assert_eq!(target.encoder.rate, RateControl { max_fps: 10, bitrate_bps: 1_005_208 });
+                }
+            }
+        }
     }
 }
