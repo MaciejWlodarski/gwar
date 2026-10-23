@@ -58,7 +58,7 @@ export function SettingsLayout<T extends string>({
               <div className="flex h-14 shrink-0 items-center justify-between gap-2 px-4 md:px-5">
                 <DialogPrimitive.Title className="truncate text-base font-semibold text-fg">{title}</DialogPrimitive.Title>
                 <DialogPrimitive.Close asChild>
-                  <IconButton label={t("common.close")} size="sm" className="md:hidden">
+                  <IconButton label={t("common.close")} tooltip={false} size="sm" className="md:hidden">
                     <X className="size-4" />
                   </IconButton>
                 </DialogPrimitive.Close>
@@ -83,7 +83,7 @@ export function SettingsLayout<T extends string>({
               <div className="hidden h-14 shrink-0 items-center justify-between gap-2 border-b border-line px-6 md:flex">
                 <h2 className="truncate text-base font-semibold text-fg">{current?.label}</h2>
                 <DialogPrimitive.Close asChild>
-                  <IconButton label={t("common.close")} size="sm">
+                  <IconButton label={t("common.close")} tooltip={false} size="sm">
                     <X className="size-4" />
                   </IconButton>
                 </DialogPrimitive.Close>

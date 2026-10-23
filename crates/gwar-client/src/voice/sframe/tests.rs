@@ -802,3 +802,119 @@ fn sframe_cost() {
         packet.len()
     );
 }
+
+fn screen() -> Engine {
+    Engine { state: SframeState::new_screen(binding(), None), ..Engine::new() }
+}
+fn video_sealed(layout: VideoLayout, epoch: u64, leaf: u32, salt: u8, ctr: u64, pt: &[u8]) -> Vec<u8> {
+    let key = EncryptionKey::derive_from(SUITE, voice_kid(epoch, leaf), exporter(epoch, leaf, salt)).unwrap();
+    layout.seal(&key, &mut SingleUseCounter::new(ctr), pt).unwrap()
+}
+const VIDEO: [u8; 14] = [0x10, 0, 0, 0x9d, 1, 0x2a, 0x80, 2, 0xe0, 1, 4, 5, 6, 7];
+
+#[test]
+fn video_uses_separate_kind_with_shared_codec_counter_and_replay_window() {
+    assert_eq!(MediaKind::Screen.exporter_label(), "gwar screen v1");
+    assert_eq!(MediaKind::Voice.exporter_label(), "gwar voice v1");
+    let (mut a, mut b) = (screen(), screen());
+    assert!(a.state.encrypt_video(VideoLayout::Vp9, &VIDEO, a.now, a.wall).is_none());
+    let all = members(5, &[(0, 0), (1, 1)]);
+    a.enter(5, 0, &all, &[]);
+    b.enter(5, 1, &all, &[]);
+    assert!(a.encrypt(&OPUS).is_none());
+    for (ctr, layout) in [VideoLayout::Vp9, VideoLayout::Vp8, VideoLayout::Vp9].into_iter().enumerate() {
+        let wire = a.state.encrypt_video(layout, &VIDEO, a.now, a.wall).unwrap();
+        assert_eq!(layout.parse(&wire).unwrap().header().counter(), ctr as u64);
+        assert!(a.state.decrypt_video(layout, &wire, a.now).is_none());
+        let mut bad = wire.clone();
+        *bad.last_mut().unwrap() ^= 1;
+        assert!(b.state.decrypt_video(layout, &bad, b.now).is_none());
+        assert_eq!(b.state.decrypt_video(layout, &wire, b.now), Some(VIDEO.to_vec()));
+        assert!(b.state.decrypt_video(layout, &wire, b.now).is_none());
+        let other = if layout == VideoLayout::Vp8 { VideoLayout::Vp9 } else { VideoLayout::Vp8 };
+        let same_ctr = video_sealed(other, 5, 0, 0, ctr as u64, &VIDEO);
+        assert!(b.state.decrypt_video(other, &same_ctr, b.now).is_none());
+    }
+    let mut voice = Engine::new();
+    voice.enter(5, 1, &all, &[]);
+    assert!(voice.state.encrypt_video(VideoLayout::Vp9, &VIDEO, voice.now, voice.wall).is_none());
+    assert!(
+        voice
+            .state
+            .decrypt_video(VideoLayout::Vp9, &video_sealed(VideoLayout::Vp9, 5, 0, 0, 20, &VIDEO), voice.now)
+            .is_none()
+    );
+    assert_eq!(b.state.counters.decrypted, 3);
+}
+
+#[test]
+fn video_inherits_hold_removal_exact_retention_and_stop() {
+    for layout in [VideoLayout::Vp9, VideoLayout::Vp8] {
+        let mut b = screen();
+        let all = members(5, &[(0, 0), (1, 1)]);
+        b.enter(5, 1, &all, &[]);
+        let old = video_sealed(layout, 5, 0, 0, 0, &VIDEO);
+        b.enter(6, 1, &members(6, &[(0, 0), (1, 1)]), &[]);
+        b.now += RETAIN;
+        assert!(b.state.decrypt_video(layout, &old, b.now).is_none());
+        let current = video_sealed(layout, 6, 0, 0, 0, &VIDEO);
+        b.ok("hold", 6, json!({"removed": [device(0)]}));
+        assert!(b.state.encrypt_video(layout, &VIDEO, b.now, b.wall).is_none());
+        assert!(b.state.decrypt_video(layout, &current, b.now).is_none());
+        b.enter(7, 1, &members(7, &[(0, 2), (1, 1)]), &[]);
+        assert!(b.state.decrypt_video(layout, &video_sealed(layout, 7, 0, 0, 0, &VIDEO), b.now).is_some());
+        b.state.stop();
+        assert!(b.state.encrypt_video(layout, &VIDEO, b.now, b.wall).is_none());
+        assert!(b.state.decrypt_video(layout, &video_sealed(layout, 7, 0, 0, 1, &VIDEO), b.now).is_none());
+    }
+}
+
+#[test]
+fn video_rejects_wrong_base_and_full_epoch_collision_without_poisoning_replay() {
+    let mut b = screen();
+    b.enter(5, 1, &members(5, &[(0, 0), (1, 1)]), &[]);
+    b.enter(5 + (1 << 32), 1, &members(5 + (1 << 32), &[(0, 0), (1, 1)]), &[]);
+    for layout in [VideoLayout::Vp9, VideoLayout::Vp8] {
+        // Same low epoch/KID, but distinct full-epoch exporters. Wrong base must not consume CTR.
+        let wrong = video_sealed(layout, 5, 0, 99, 0, &VIDEO);
+        assert!(b.state.decrypt_video(layout, &wrong, b.now).is_none());
+        let new = video_sealed(layout, 5 + (1 << 32), 0, 0, 0, &VIDEO);
+        assert!(b.state.decrypt_video(layout, &new, b.now).is_some());
+        let old = video_sealed(layout, 5, 0, 0, 1, &VIDEO);
+        assert!(b.state.decrypt_video(layout, &old, b.now).is_some());
+        // Start fresh for the other codec.
+        b = screen();
+        b.enter(5, 1, &members(5, &[(0, 0), (1, 1)]), &[]);
+        b.enter(5 + (1 << 32), 1, &members(5 + (1 << 32), &[(0, 0), (1, 1)]), &[]);
+    }
+}
+
+#[test]
+fn video_bounds_counter_exhaustion_and_both_expiry_clocks() {
+    for layout in [VideoLayout::Vp9, VideoLayout::Vp8] {
+        let mut a = screen();
+        a.enter(5, 0, &members(5, &[(0, 0), (1, 1)]), &[]);
+        assert!(a.state.encrypt_video(layout, &vec![0; MAX_VIDEO_BYTES + 1], a.now, a.wall).is_none());
+        if layout == VideoLayout::Vp8 {
+            assert!(a.state.encrypt_video(layout, &[0; 9], a.now, a.wall).is_none());
+        }
+        let last = a.state.epochs.get_mut(&5).unwrap();
+        assert_eq!(last.counter, 0);
+        last.counter = COUNTER_LIMIT - 1;
+        assert!(a.state.encrypt_video(layout, &VIDEO, a.now, a.wall).is_some());
+        assert!(a.state.encrypt_video(layout, &VIDEO, a.now, a.wall).is_none());
+        assert!(!a.state.sending());
+        for wall_clock in [false, true] {
+            let mut a = screen();
+            a.enter(5, 0, &members(5, &[(0, 0), (1, 1)]), &[]);
+            assert_eq!(a.send("activate", 5, json!({"send_until": a.wall + 100})).result, Some(Outcome::Unchanged));
+            if wall_clock {
+                a.wall += 100;
+            } else {
+                a.now += Duration::from_millis(100);
+            }
+            assert!(a.state.encrypt_video(layout, &VIDEO, a.now, a.wall).is_none());
+            assert!(!a.state.sending());
+        }
+    }
+}

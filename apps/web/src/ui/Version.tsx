@@ -108,7 +108,7 @@ export function UpdateButton() {
         className={cn(
           "t relative inline-flex size-8 shrink-0 items-center justify-center rounded-full",
           clickable ? "cursor-pointer" : "cursor-default",
-          status.phase === "ready" && "bg-ok/15 text-ok hover:bg-ok hover:text-white",
+          status.phase === "ready" && "bg-ok/15 text-ok hover:bg-ok/25",
           status.phase === "failed" && "text-warn hover:bg-hover",
           (status.phase === "downloading" || status.phase === "installing") && "text-muted",
         )}

@@ -320,7 +320,7 @@ export function Lightbox({ attachment, verified }: { attachment: Attachment; ver
               </Tooltip>
             )}
             <DialogPrimitive.Close asChild>
-              <IconButton label={t("common.close")} size="sm">
+              <IconButton label={t("common.close")} tooltip={false} size="sm">
                 <X className="size-4" />
               </IconButton>
             </DialogPrimitive.Close>

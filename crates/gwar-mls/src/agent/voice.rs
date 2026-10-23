@@ -130,6 +130,32 @@ impl Agent {
         now: i64,
         revocations: &dyn Revocations,
     ) -> Result<VoiceKeys> {
+        self.media_keys(server, id, parent, now, revocations, "gwar voice v1")
+    }
+
+    /// Screen-video exporter, with the same live parent/credential/pending-commit gates as voice.
+    /// Install these keys only in a separate screen SFrame state. The KID format is shared;
+    /// label separation gives voice and screen independent keys, counters and replay windows.
+    pub fn screen_keys(
+        &self,
+        server: &str,
+        id: &[u8; 32],
+        parent: &Agent,
+        now: i64,
+        revocations: &dyn Revocations,
+    ) -> Result<VoiceKeys> {
+        self.media_keys(server, id, parent, now, revocations, "gwar screen v1")
+    }
+
+    fn media_keys(
+        &self,
+        server: &str,
+        id: &[u8; 32],
+        parent: &Agent,
+        now: i64,
+        revocations: &dyn Revocations,
+        label: &str,
+    ) -> Result<VoiceKeys> {
         let gate = self.gate(server, id, now, revocations)?;
         if !gate.can_send() || gate.pending_commit {
             return Err(AgentError::Blocked);
@@ -161,7 +187,7 @@ impl Agent {
                 return Err(AgentError::Blocked);
             }
             let key = voice
-                .export_secret(self.provider.crypto(), "gwar voice v1", &i.u32().to_be_bytes(), 32)
+                .export_secret(self.provider.crypto(), label, &i.u32().to_be_bytes(), 32)
                 .map_err(err("voice exporter"))?
                 .try_into()
                 .map_err(err("voice key length"))?;

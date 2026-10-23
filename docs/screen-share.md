@@ -1737,14 +1737,55 @@ So:
 
 ### Frame layout
 
-- **VP9:** `SFrameHeader || AEAD(frame)`, as voice does it.
-- **VP8:** `clear || SFrameHeader || AEAD(rest)`, where `clear` is the first
-  10 bytes of a keyframe or 3 of a delta frame (Jitsi and LiveKit use the
-  same split). `clear` is the RFC 9605 *metadata*, so it is authenticated:
-  AAD = `header || clear`. The web `seal`/`open` already take `metadata` for
-  this (`apps/web/src/voice/sframe/suite.ts`).
-- **Bounds.** Encrypted frames over 2 MiB are dropped before encryption. A
-  1080p keyframe is about 200 KB.
+The native byte layouts are implemented in `crates/gwar-media/src/sframe.rs`
+and use the same RFC 9605 `AES_128_GCM_SHA256_128` suite (0x0004) as voice.
+`H` below is a minimal RFC 9605 header (1–17 bytes), `C` is ciphertext of the
+same length as its plaintext, and `T` is the 16-byte AES-GCM tag. RTP payload
+descriptors are outside these layouts.
+
+```text
+VP9 key or delta:   H | C(entire encoded frame) | T
+                   AAD = H
+VP8 key (bit 0=0):  P[10] | H | C(frame[10..]) | T
+VP8 delta (bit 0=1):P[3]  | H | C(frame[3..])  | T
+                   AAD = H | P
+```
+
+- VP8 uses bit 0 of the first encoded byte (the frame tag) to choose the
+  prefix length on both seal and open. The prefix includes the frame tag
+  and, on keyframes, the sync code and dimensions. It is RFC 9605 metadata:
+  **all clear bytes are authenticated**, including that frame-type bit.
+  Fewer than 10 keyframe bytes or 3 delta bytes are rejected. The split
+  preserves bytes exactly; it does not validate compressed video syntax.
+  Prefix-only VP8 and empty VP9 have valid byte layouts (zero ciphertext
+  bytes plus a tag), independently of whether a decoder accepts them.
+- Header integers use the config byte's inline form for values 0–7, or
+  minimal big-endian extended KID/CTR values of 1–8 bytes each. Extended
+  values below 8 and leading-zero encodings are rejected, even with a valid
+  authentication tag; receivers never rewrite a header before opening it.
+  There is no additional VP9/VP8 canonicalization or escaping.
+- Keys are `MLS-Exporter("gwar screen v1", u32be(leaf), 32)` from the
+  accepted full epoch, with `KID = (epoch mod 2^32) << 32 | leaf`.
+  The label is not a wire field or an additional SFrame KDF step.
+  Native `Agent::screen_keys` applies the same live membership/credential
+  gates as voice. A separate `SframeState::new_screen` owns screen keys,
+  counters and replay windows; changing VP9/VP8 must reuse that instance.
+  Production sending retains voice's limit of 2^32 attempts per base key;
+  the low-level layout vectors also exercise all RFC counter widths.
+- Bounds are on the **encoded plaintext**, at most 2 MiB, checked before
+  encryption/allocation. The wire bound is 2 MiB + 33 bytes (widest header
+  and tag); opening also checks the recovered plaintext length from the
+  actual header width before authentication. This is separate from the
+  SFU's smaller per-frame ingress limits.
+- Shared vectors: `crates/gwar-media/tests/screen-sframe-vectors.json`.
+  Rust and `apps/web/src/voice/sframe/screen-vectors.test.ts` both seal and
+  open the same bytes, using the existing Rust SFrame library and unchanged
+  TypeScript `suite.ts`, respectively. The independent WebCrypto generator
+  is beside the JSON file. At base revision `4edc38ad`, the web worker is
+  **voice-only** and screen transports attach no encryption transform;
+  these tests establish primitive/layout compatibility, not deployed screen
+  worker or browser packetizer interoperability. Screen-worker integration
+  remains open. H.264/AV1 layouts remain open with E2/A2/A2b.
 
 The spike evidence for these layouts is **layout feasibility only**. S3 and S5
 used a scrambling transform with a checksum, not AES-GCM. They show:

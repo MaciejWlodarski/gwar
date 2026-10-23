@@ -16,7 +16,10 @@
 //! that do not fit the viewer's estimate are paused. The task also measures what it sends
 //! against the server-wide budget.
 
+pub mod av1;
+pub mod dependency_descriptor;
 mod egress;
+pub mod h264;
 mod ingress;
 mod segment;
 #[cfg(test)]

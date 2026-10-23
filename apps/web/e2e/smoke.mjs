@@ -1749,7 +1749,17 @@ async function main() {
 
   await check("connect: signing out never restores the account root; the recovery code signs in again", async () => {
     await c.getByRole("button", { name: "Sign out" }).last().click();
-    await c.getByText("Signed out.").first().waitFor();
+    // Substring text matching also finds the preceding "Password changed. Your other sessions
+    // were signed out." toast, while logout is still pending. Wait for this action's completion.
+    await c.getByText("Signed out. Your local identity is back.", { exact: true }).waitFor();
+    const signedOut = await c.evaluate(async () => {
+      const { kvGet } = await window.__gwarE2eImport("/src/net/kv.ts");
+      const { uidForPublicKey } = await window.__gwarE2eImport("/src/net/identity.ts");
+      const identity = await kvGet("identity");
+      return { account: !!(await kvGet("connect")), uid: identity && await uidForPublicKey(identity.jwk.x) };
+    });
+    if (signedOut.account) throw new Error("sign-out kept the Connect record");
+    if (signedOut.uid === accountUid) throw new Error("sign-out kept the plaintext account root");
     await c.getByRole("tab", { name: "Identity" }).click();
     if ((await readUid(c)) === localUid) throw new Error("sign-out restored the plaintext account root");
     await c.getByRole("tab", { name: "Account" }).click();
