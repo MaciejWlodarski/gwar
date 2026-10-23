@@ -13,8 +13,8 @@ import { MESSAGE_STORAGE_MIGRATIONS, MessageStorage } from "../net/message-stora
 import { mlsDatabase, MLS_MIGRATIONS, MLS_STORE_FORMAT, openStorage } from "../mls/storage";
 import { readdirSync } from "node:fs";
 import { translate, type Key } from "../i18n/translate";
-import { CONNECT_UPGRADES, IDENTITY_UPGRADES, IdentityUnreadableError, identityFailure, indexedDbConnectStore, indexedDbIdentityStore, loadConnectRecord, loadOrCreateIdentity, type ConnectRecord, type IdentityStore } from "../net/identity";
-import { LOCAL_STORAGE_MIGRATIONS, LOCAL_STORAGE_VERSION, LOCAL_STORAGE_VERSION_KEY, migrateLocalStorage } from "./local-storage";
+import { CONNECT_UPGRADES, IDENTITY_UPGRADES, IdentityUnreadableError, IdentityUnsupportedError, identityFailure, indexedDbConnectStore, indexedDbIdentityStore, loadActiveIdentity, loadConnectRecord, loadOrCreateIdentity, type ConnectRecord, type IdentityStore } from "../net/identity";
+import { copyLocalStorageForward, LOCAL_STORAGE_MIGRATIONS, LOCAL_STORAGE_VERSION, LOCAL_STORAGE_VERSION_KEY, localStorageKey, migrateLocalStorage } from "./local-storage";
 import { storedDataProblem } from "./stored-data-check";
 
 const request = <T>(r: IDBRequest<T>) => new Promise<T>((resolve, reject) => { r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
@@ -134,7 +134,7 @@ const RECORD_FIXTURES: Record<keyof typeof RECORDS, Record<number, { stored: Rec
 const LOCAL_FIXTURES: Record<number, { stored: Record<string, string>; check(storage: Storage): void }> = {
   1: {
     stored: { "gwar.settings": JSON.stringify({ state: { theme: "light", bookmarks: [] }, version: 1 }), "gwar.server-pin:example.com": JSON.stringify({ server_pk: "k", first_seen: 1 }) },
-    check: (storage) => expect(JSON.parse(storage.getItem("gwar.settings")!).state.theme).toBe("light"),
+    check: (storage) => expect(JSON.parse(storage.getItem(localStorageKey("gwar.settings"))!).state.theme).toBe("light"),
   },
 };
 
@@ -329,6 +329,29 @@ describe("the stored identity", () => {
     await expect(loadOrCreateIdentity(unreadable)).rejects.toBeInstanceOf(IdentityUnreadableError);
     expect(save).not.toHaveBeenCalled();
   });
+  // Well formed, but no Ed25519 key: a browser that has Ed25519 rejects it.
+  const x = "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo";
+  const damaged = { format: "gwar-identity", version: 1, jwk: { kty: "OKP", crv: "Ed25519", x, d: "AAAA" }, nickname: "N" };
+  it("whose key this browser rejects is unreadable, not a browser without Ed25519", async () => {
+    await make(KV_DATABASE, 1, (db) => db.createObjectStore("kv"), (db) => put(db, "kv", [["identity", damaged]]));
+    const failure = await loadOrCreateIdentity(indexedDbIdentityStore).catch((error: unknown) => error);
+    expect(failure).toBeInstanceOf(IdentityUnreadableError);
+    expect(identityFailure(failure)).toBe("identity_unreadable");
+    expect(await kvGet("identity")).toEqual(damaged);
+  });
+  it("of a Connect device whose key this browser rejects is unreadable too", async () => {
+    const record = { version: 1, handle: "h", accountKey: "a", token: "t", vaultKey: "v", deviceName: "d", deviceJwk: damaged.jwk, certificate: { account_key: "a", device_key: x } };
+    await make(KV_DATABASE, 1, (db) => db.createObjectStore("kv"), (db) => put(db, "kv", [["connect", { ...record, nickname: "N" }]]));
+    await expect(loadActiveIdentity()).rejects.toBeInstanceOf(IdentityUnreadableError);
+  });
+  it("in a browser without Ed25519 is reported as such", async () => {
+    await make(KV_DATABASE, 1, (db) => db.createObjectStore("kv"), (db) => put(db, "kv", [["identity", damaged]]));
+    const unsupported = () => Promise.reject(new DOMException("Unrecognized name", "NotSupportedError"));
+    vi.stubGlobal("crypto", { subtle: { importKey: unsupported, generateKey: unsupported } });
+    try {
+      await expect(loadOrCreateIdentity(indexedDbIdentityStore)).rejects.toBeInstanceOf(IdentityUnsupportedError);
+    } finally { vi.unstubAllGlobals(); }
+  });
   it("of a newer version fails to load and stays", async () => {
     await make(KV_DATABASE, 1, (db) => db.createObjectStore("kv"), (db) => put(db, "kv", [["identity", { format: "gwar-identity", version: IDENTITY_UPGRADES.length + 2 }]]));
     await expect(loadOrCreateIdentity(indexedDbIdentityStore)).rejects.toBeInstanceOf(NewerDataError);
@@ -383,6 +406,40 @@ describe("localStorage", () => {
       expect(() => appStorage.setItem("gwar.server-pin:example.com", "{}")).toThrow("newer version of Gwar");
       expect(() => appStorage.getItem("gwar.server-pin:example.com")).toThrow("newer version of Gwar");
       expect(storage.getItem("gwar.server-pin:example.com")).toBeNull();
+    } finally { vi.unstubAllGlobals(); vi.resetModules(); }
+  });
+  it("a write an older tab checked before a newer tab upgraded leaves the newer version's data alone", async () => {
+    // Across tabs a check and the write after it are not atomic: the older tab checks, the newer one
+    // upgrades and saves, then the older tab's write lands. Each version's own names make it harmless.
+    const storage = memory({ "gwar.settings": JSON.stringify({ state: { theme: "light" }, version: 1 }) });
+    const next = LOCAL_STORAGE_VERSION + 1;
+    const newerTab = () => {
+      const migrations = [...LOCAL_STORAGE_MIGRATIONS, (s: Storage) => copyLocalStorageForward(s, LOCAL_STORAGE_VERSION, (key, value) =>
+        key === "gwar.settings" ? JSON.stringify({ ...JSON.parse(value), state: { ...JSON.parse(value).state, future: [1] } }) : value)];
+      migrateLocalStorage(storage, migrations);
+      const saved = JSON.parse(storage.getItem(localStorageKey("gwar.settings", next))!);
+      storage.setItem(localStorageKey("gwar.settings", next), JSON.stringify({ ...saved, state: { ...saved.state, theme: "light", future: [1, 2] } }));
+    };
+    let paused = true;
+    const olderTab: Storage = {
+      ...storage,
+      get length() { return storage.length; }, key: (i) => storage.key(i), getItem: (k) => storage.getItem(k), removeItem: (k) => storage.removeItem(k), clear: () => storage.clear(),
+      setItem: (k, v) => {
+        // The older tab has passed its check; the newer tab runs before its write lands.
+        if (paused && k !== LOCAL_STORAGE_VERSION_KEY) { paused = false; newerTab(); }
+        storage.setItem(k, v);
+      },
+    };
+    vi.stubGlobal("localStorage", olderTab);
+    vi.stubGlobal("window", { localStorage: olderTab });
+    vi.resetModules();
+    try {
+      const { useSettings } = await import("../state/settings");
+      expect(useSettings.getState().theme).toBe("light");
+      useSettings.getState().setTheme("dark");
+      expect(paused).toBe(false);
+      expect(storage.getItem(LOCAL_STORAGE_VERSION_KEY)).toBe(String(next));
+      expect(JSON.parse(storage.getItem(localStorageKey("gwar.settings", next))!).state).toMatchObject({ theme: "light", future: [1, 2] });
     } finally { vi.unstubAllGlobals(); vi.resetModules(); }
   });
   it("settings are neither read nor written while localStorage is of a newer version", async () => {

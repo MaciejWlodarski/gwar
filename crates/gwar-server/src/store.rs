@@ -584,8 +584,11 @@ fn migrate_data(tx: &Connection, migration: &str) -> Result<()> {
         tx.execute("UPDATE groups SET position=?2 WHERE id=?1", params![MEMBER_GROUP, MEMBER_POSITION])?;
     }
     if migration.contains("Repair: role permissions still named as in roles version 1") {
-        // Only rows no version-2 server wrote: those holding a name of version 1. Every row a later
-        // server wrote has version-2 names only, and stays as its admins left it.
+        // Only rows no version-2 server wrote: those still holding a name of version 1. Such a row
+        // was never converted, so it also missed roles version 2, step 2, which gave Member joining,
+        // talking and writing. Every row a later server wrote has version-2 names only, and stays as
+        // its admins left it: a Member without them was set so on purpose, or cannot be told apart
+        // from that, and gains nothing.
         let rows: Vec<(GroupId, String)> = {
             let mut stmt = tx.prepare("SELECT id,permissions FROM groups")?;
             stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
@@ -601,6 +604,9 @@ fn migrate_data(tx: &Connection, migration: &str) -> Result<()> {
             if id == ADMIN_GROUP {
                 permissions = vec![Permission::Administrator];
             }
+            if id == MEMBER_GROUP {
+                permissions.extend([Permission::Connect, Permission::Speak, Permission::SendMessages]);
+            }
             permissions.sort_unstable();
             permissions.dedup();
             tx.execute(
@@ -608,27 +614,9 @@ fn migrate_data(tx: &Connection, migration: &str) -> Result<()> {
                 params![id, serde_json::to_string(&permissions)?],
             )?;
         }
-        // Member's defaults of roles version 2, step 2, and its place last: v0.1.0 wrote down
-        // `member_defaults`, servers of that step `member_channel_defaults`, later servers neither.
-        let meta = |key: &str| -> Result<bool> {
-            Ok(tx.query_row("SELECT EXISTS(SELECT 1 FROM meta WHERE key=?1)", [key], |r| r.get(0))?)
-        };
-        if meta("member_defaults")? && !meta("member_channel_defaults")? {
-            let stored: Option<String> =
-                tx.query_row("SELECT permissions FROM groups WHERE id=?1", [MEMBER_GROUP], |r| r.get(0)).optional()?;
-            if let Some(stored) = stored {
-                let mut permissions: Vec<Permission> = serde_json::from_str(&stored).unwrap_or_default();
-                permissions.extend([Permission::Connect, Permission::Speak, Permission::SendMessages]);
-                permissions.sort_unstable();
-                permissions.dedup();
-                tx.execute(
-                    "UPDATE groups SET permissions=?2 WHERE id=?1",
-                    params![MEMBER_GROUP, serde_json::to_string(&permissions)?],
-                )?;
-            }
-            tx.execute("UPDATE groups SET position=?2 WHERE id=?1", params![MEMBER_GROUP, MEMBER_POSITION])?;
-            tx.execute("INSERT INTO meta(key,value) VALUES('member_channel_defaults','1')", [])?;
-        }
+        // Member is always last (it outranks no role); servers from v0.1.2 on left it where
+        // "position = id" put it. Moving it down grants nothing.
+        tx.execute("UPDATE groups SET position=?2 WHERE id=?1", params![MEMBER_GROUP, MEMBER_POSITION])?;
     }
     if migration.contains("CREATE TABLE channel_overrides") {
         // Roles version 2, step 2: joining, talking and writing became permissions; members keep them.
@@ -3120,6 +3108,30 @@ mod tests {
         mods.sort_unstable();
         assert_eq!(permissions(3), mods);
         assert_eq!(permissions(4), vec![Permission::ManageMessages]);
+    }
+
+    #[test]
+    fn the_role_repair_never_gives_member_what_an_admin_took_away() {
+        // v0.1.0 straight to v0.1.2: `member_defaults` is still there, but an admin has since set
+        // Member to joining only, in version-2 names.
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("Repair: role permissions still named as in roles version 1");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            r#"INSERT INTO groups(id,name,permissions) VALUES(1,'Admin','["server_manage"]'),(2,'Member','["connect"]'),
+            (3,'Quiet','[]');
+            INSERT INTO meta VALUES('member_defaults','1');"#,
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        let groups = store.groups().unwrap();
+        let permissions = |id: GroupId| groups.iter().find(|g| g.id == id).unwrap().permissions.clone();
+        assert_eq!(permissions(MEMBER_GROUP), vec![Permission::Connect]);
+        assert_eq!(permissions(3), vec![]);
+        assert_eq!(permissions(ADMIN_GROUP), vec![Permission::Administrator]);
     }
 
     #[test]

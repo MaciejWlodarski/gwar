@@ -193,14 +193,28 @@ export function identitySeed(identity: Identity): Uint8Array {
   return seed.slice();
 }
 
-async function fromBackup(backup: IdentityBackup, device?: DeviceCertificate): Promise<Identity> {
+/** Whether this browser can make Ed25519 keys at all: tells a key it rejects from an algorithm it lacks. */
+async function ed25519Available(subtle: SubtleCrypto): Promise<boolean> {
+  try {
+    await subtle.generateKey(ALGORITHM, false, ["sign", "verify"]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * `invalid` is the error for key material this browser could use but rejects: by default a stored
+ * identity that cannot be read (kept, never replaced).
+ */
+async function fromBackup(backup: IdentityBackup, device?: DeviceCertificate, invalid: () => Error = () => new IdentityUnreadableError()): Promise<Identity> {
   const subtle = globalThis.crypto?.subtle;
   if (!subtle) throw new IdentityUnsupportedError();
   let key: CryptoKey;
   try {
     key = await subtle.importKey("jwk", backup.jwk, ALGORITHM, false, ["sign"]);
   } catch {
-    throw new IdentityUnsupportedError();
+    throw (await ed25519Available(subtle)) ? invalid() : new IdentityUnsupportedError();
   }
   const publicKey = backup.jwk.x as string;
   const identity: Identity = {
@@ -302,7 +316,7 @@ export async function importIdentity(text: string, store: IdentityStore = indexe
   // Normalise to exactly the fields we need; drop key_ops etc.
   const { kty, crv, x, d } = parsed.jwk;
   const backup: IdentityBackup = { format: "gwar-identity", version: 1, jwk: { kty, crv, x, d }, nickname: validNickname(parsed.nickname)! };
-  const identity = await fromBackup(backup);
+  const identity = await fromBackup(backup, undefined, () => new Error("invalid identity file"));
   // Make sure the public half really belongs to the private half.
   const probe = new TextEncoder().encode("probe");
   const sig = decodeBase64Url(await identity.sign(probe));
