@@ -1,4 +1,9 @@
-# Gwar
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/gwar-logo-on-dark.svg">
+    <img alt="Gwar" src="assets/brand/gwar-logo-on-light.svg" width="280">
+  </picture>
+</p>
 
 **Gwar** is an open-source, self-hosted voice chat. Run your own server,
 talk from the browser or the desktop app, and keep your friends who still use

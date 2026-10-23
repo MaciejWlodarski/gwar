@@ -239,7 +239,7 @@ export function TalkingAvatar({ talking, className, ...avatar }: Parameters<type
   return (
     <span
       data-talking={talking || undefined}
-      className={cn("t inline-flex shrink-0 rounded-full p-[3px]", talking && "shadow-[inset_0_0_0_2px_var(--ok)]", className)}
+      className={cn("t inline-flex shrink-0 rounded-full p-[3px]", talking && "talk-ring", className)}
     >
       <Avatar {...avatar} />
     </span>

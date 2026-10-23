@@ -3,55 +3,72 @@
 
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
-/* One neutral grey ramp + one accent. Semantic colours (talking, danger) are
-   the only other hues. Values swap with [data-theme]. */
+/* Graphite ramp with a slight teal cast + one teal accent. The brand gradient
+   (the logo's "w") marks voice: the talking ring and the mic level. Other hues
+   are semantic (ok, danger, warn). Values swap with [data-theme]. */
 :root,
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --rail: #0e0f12;
-  --side: #131418;
-  --surface: #17181d;
-  --raised: #1e2026;
+  --rail: #0c0f10;
+  --side: #111516;
+  --surface: #161b1c;
+  --raised: #1e2425;
   --hover: rgb(255 255 255 / 0.05);
   --active: rgb(255 255 255 / 0.09);
   --line: rgb(255 255 255 / 0.07);
   --line-strong: rgb(255 255 255 / 0.13);
-  --fg: #e9eaee;
-  --muted: #9a9eaa;
-  --subtle: #6b6f7b;
-  --accent: #7482f5;
-  --accent-strong: #5f6df0;
-  --accent-fg: #ffffff;
-  --accent-soft: rgb(116 130 245 / 0.16);
-  --ok: #3ddc97;
-  --danger: #f2646a;
-  --danger-soft: rgb(242 100 106 / 0.14);
-  --warn: #f2b84b;
+  --fg: #e8eeed;
+  --muted: #98a3a2;
+  --subtle: #6b7676;
+  --accent: #3fcfc0;
+  --accent-strong: #22b3a5;
+  --accent-fg: #06201d;
+  --accent-soft: rgb(63 207 192 / 0.14);
+  --ok: #6fcf97;
+  --danger: #f06a72;
+  --danger-soft: rgb(240 106 114 / 0.14);
+  --warn: #e8b25c;
+  --brand-1: #6cebc8;
+  --brand-2: #34d3cf;
+  --brand-3: #2ea8ff;
+  --talk: #34d3cf;
+  --talk-1: #6cebc8;
+  --talk-2: #34d3cf;
+  --talk-3: #2ea8ff;
+  --talk-glow: rgb(52 211 207 / 0.45);
   --shadow: 0 8px 28px rgb(0 0 0 / 0.45);
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --rail: #e6e8ee;
-  --side: #f3f4f7;
+  --rail: #e6ebeb;
+  --side: #f2f5f5;
   --surface: #ffffff;
-  --raised: #eef0f4;
-  --hover: rgb(15 20 40 / 0.05);
-  --active: rgb(15 20 40 / 0.09);
-  --line: rgb(15 20 40 / 0.09);
-  --line-strong: rgb(15 20 40 / 0.16);
-  --fg: #16181d;
-  --muted: #565b68;
-  --subtle: #858a97;
-  --accent: #4f5de0;
-  --accent-strong: #3f4cd0;
+  --raised: #eef2f2;
+  --hover: rgb(10 30 30 / 0.05);
+  --active: rgb(10 30 30 / 0.09);
+  --line: rgb(10 30 30 / 0.09);
+  --line-strong: rgb(10 30 30 / 0.16);
+  --fg: #121a1a;
+  --muted: #4f5b5b;
+  --subtle: #7a8585;
+  --accent: #097d74;
+  --accent-strong: #076a62;
   --accent-fg: #ffffff;
-  --accent-soft: rgb(79 93 224 / 0.12);
-  --ok: #17a56b;
-  --danger: #d8393f;
-  --danger-soft: rgb(216 57 63 / 0.1);
-  --warn: #b97a0a;
-  --shadow: 0 8px 28px rgb(20 25 45 / 0.18);
+  --accent-soft: rgb(9 125 116 / 0.1);
+  --ok: #157f4b;
+  --danger: #c93a45;
+  --danger-soft: rgb(201 58 69 / 0.1);
+  --warn: #9a6508;
+  --brand-1: #6cebc8;
+  --brand-2: #34d3cf;
+  --brand-3: #2ea8ff;
+  --talk: #14b3b0;
+  --talk-1: #22c79c;
+  --talk-2: #14b3b0;
+  --talk-3: #1f8fe0;
+  --talk-glow: rgb(20 179 176 / 0.3);
+  --shadow: 0 8px 28px rgb(15 35 35 / 0.18);
 }
 
 @theme inline {
@@ -76,6 +93,10 @@
   --color-danger: var(--danger);
   --color-danger-soft: var(--danger-soft);
   --color-warn: var(--warn);
+  --color-talk: var(--talk);
+  --color-talk-1: var(--talk-1);
+  --color-talk-2: var(--talk-2);
+  --color-talk-3: var(--talk-3);
   --shadow-pop: var(--shadow);
 }
 
@@ -249,5 +270,35 @@
   *::after {
     animation-duration: 1ms !important;
     transition-duration: 1ms !important;
+  }
+}
+
+/* The talking ring: a 2 px ring in the brand gradient with a soft glow, drawn
+   on the element's edge (give it padding so the ring does not cover content). */
+@layer components {
+  .talk-ring {
+    position: relative;
+  }
+  .talk-ring::before,
+  .talk-ring::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    pointer-events: none;
+  }
+  .talk-ring::before {
+    padding: 2px;
+    background: linear-gradient(135deg, var(--talk-1), var(--talk-2), var(--talk-3));
+    -webkit-mask:
+      linear-gradient(#000 0 0) content-box,
+      linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask:
+      linear-gradient(#000 0 0) content-box exclude,
+      linear-gradient(#000 0 0);
+  }
+  .talk-ring::after {
+    box-shadow: 0 0 8px var(--talk-glow);
   }
 }
