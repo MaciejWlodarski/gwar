@@ -241,6 +241,12 @@ impl ProbeControl {
         // Timeout fired - reset to not_happening until we compute the next one.
         self.next_timeout = not_happening();
 
+        // A consumed deadline cannot be returned again when a capped probe
+        // cannot continue; that would keep the RTC awake at the same instant.
+        self.scheduled_exponential = None;
+        self.scheduled_periodic_alr = None;
+        self.scheduled_stagnant = None;
+
         // Probing is disabled until first packet sent and padding queue exists.
         if !self.enabled {
             return None;
@@ -355,7 +361,8 @@ impl ProbeControl {
         let target = estimate * scale;
 
         // Already probed at max rate; no point probing again.
-        let max = desired * MAX_PROBE_BITRATE_FACTOR;
+        let max = (desired * MAX_PROBE_BITRATE_FACTOR)
+            .min(self.bitrate_limit.unwrap_or(Bitrate::INFINITY));
         if target >= max && last.further >= max * self.config.further_probe_threshold {
             return false;
         }
@@ -757,6 +764,35 @@ mod test {
         pc.set_bitrate_limit(Bitrate::kbps(1500));
         let next = pc.handle_timeout(now + Duration::from_millis(10)).unwrap();
         assert_eq!(next.target_bitrate(), Bitrate::kbps(1500));
+    }
+
+    #[test]
+    fn a_capped_probe_does_not_repeat_exponentially_at_the_same_ceiling() {
+        let now = Instant::now();
+        let mut pc = ProbeControl::new();
+        pc.enable(true);
+        pc.set_desired_bitrate(Bitrate::mbps(50));
+        pc.set_estimated_bitrate(Bitrate::mbps(5), BandwidthLimitedCause::DelayBasedLimited);
+        pc.set_bitrate_limit(Bitrate::kbps(6250));
+        pc.set_alr_start_time(now);
+        assert!(pc.handle_timeout(now).is_some());
+        assert!(pc.handle_timeout(now).is_some());
+        // The 70% continuation threshold is below the unchanged 5 Mbps estimate.
+        // It must not turn the one-second result timeout into endless 6.25 Mbps
+        // probes while desired is much higher than the application ceiling.
+        for seconds in 1..5 {
+            let at = now + Duration::from_secs(seconds);
+            assert!(pc.handle_timeout(at).is_none());
+            assert!(
+                pc.poll_timeout() > at,
+                "a consumed deadline cannot spin the RTC"
+            );
+        }
+        let periodic = pc.handle_timeout(now + Duration::from_secs(5)).unwrap();
+        assert!(
+            periodic.is_alr_probe(),
+            "capacity discovery remains available"
+        );
     }
 
     #[test]

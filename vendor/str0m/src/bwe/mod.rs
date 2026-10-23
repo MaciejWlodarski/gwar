@@ -83,9 +83,10 @@ impl Bwe {
         result.map(|config| config.with_max_bytes(self.probe_byte_limit))
     }
 
-    pub fn set_probe_bitrate_limit(&mut self, rate: Bitrate) {
+    pub fn set_egress_pacing(&mut self, rate: Bitrate) {
         self.probe_bitrate_limit = Some(rate);
         self.bwe.probe_control.set_bitrate_limit(rate);
+        self.bwe.application_paced = true;
     }
 
     pub fn set_probe_byte_limit(&mut self, bytes: usize) {
@@ -112,6 +113,7 @@ impl Bwe {
         self.bwe.reset(init_bitrate);
         if let Some(limit) = self.probe_bitrate_limit {
             self.bwe.probe_control.set_bitrate_limit(limit);
+            self.bwe.application_paced = true;
         }
         self.smoother = EstimateSmoother::new();
         self.bwe
@@ -164,6 +166,7 @@ struct SendSideBandwidthEstimator {
     started_at: Option<Instant>,
     alr_detector: AlrDetector,
     last_updated_estimate: Option<Bitrate>,
+    application_paced: bool,
 }
 
 impl SendSideBandwidthEstimator {
@@ -186,6 +189,7 @@ impl SendSideBandwidthEstimator {
             started_at: None,
             alr_detector,
             last_updated_estimate: None,
+            application_paced: false,
         }
     }
 
@@ -213,8 +217,29 @@ impl SendSideBandwidthEstimator {
 
         // Feed records to probe estimator for analysis and process any new probe results
         let mut latest_probe_result = None;
-        for (_, bitrate) in self.probe_estimator.update(send_records.iter().copied()) {
-            latest_probe_result = Some(bitrate);
+        let mut latest_probe_capacity = None;
+        let previous_delay_estimate = self.delay_controller.last_estimate();
+        let previous_estimate = self.last_estimate();
+        for (config, bitrate, saturated) in
+            self.probe_estimator.update(send_records.iter().copied())
+        {
+            // A paced probe whose receive rate matches its actual send rate only
+            // demonstrates a capacity floor. Local underfill cannot lower a prior
+            // estimate; ordinary delay/loss feedback still detects congestion.
+            let delay_probe = if config.max_send_gap.is_some() && !saturated {
+                if previous_estimate.is_some_and(|previous| bitrate < previous) {
+                    // No new capacity above the combined controller result was
+                    // demonstrated. Preserve genuine loss-limited backoff.
+                    continue;
+                }
+                // A floor can recover a lower loss estimate without inventing
+                // evidence for the higher delay ceiling, or lowering that ceiling.
+                bitrate.max(previous_delay_estimate.unwrap_or(bitrate))
+            } else {
+                bitrate
+            };
+            latest_probe_result = Some(delay_probe);
+            latest_probe_capacity = Some(bitrate);
         }
 
         let mut acked_packets = vec![];
@@ -243,8 +268,6 @@ impl SendSideBandwidthEstimator {
         // Use the latest probe result from this update, if any
         let probe_result = latest_probe_result;
 
-        let is_probe_result = probe_result.is_some();
-
         // Update delay controller with the latest probe result
         let maybe_estimate =
             self.delay_controller
@@ -263,13 +286,18 @@ impl SendSideBandwidthEstimator {
 
         // During startup with no loss, use delay-based estimate directly
         if in_startup_phase(self.started_at, now) && loss <= 0.001 {
-            self.loss_controller.set_bandwidth_estimate(delay_estimate);
+            self.loss_controller.set_bandwidth_estimate(
+                latest_probe_capacity
+                    .unwrap_or(delay_estimate)
+                    .min(delay_estimate),
+            );
             return;
         }
 
         // When probe succeeds, set bandwidth directly
-        if is_probe_result {
-            self.loss_controller.set_bandwidth_estimate(delay_estimate);
+        if let Some(capacity) = latest_probe_capacity {
+            self.loss_controller
+                .set_bandwidth_estimate(capacity.min(delay_estimate));
         }
 
         if let Some(acked_bitrate) = acked_bitrate {
@@ -323,7 +351,13 @@ impl SendSideBandwidthEstimator {
         }
 
         // Get ALR state and forward to both probe control and loss controller
-        let alr_start_time = self.alr_detector.alr_start_time();
+        // An explicit application ceiling is limited by policy even above the
+        // utilization detector's 65% threshold. Its ACK rate cannot be used as
+        // evidence that the network itself has lost capacity.
+        let alr_start_time = self
+            .alr_detector
+            .alr_start_time()
+            .or_else(|| self.application_paced.then_some(now));
         if let Some(t) = alr_start_time {
             self.probe_control.set_alr_start_time(t);
         } else {
@@ -502,6 +536,74 @@ impl fmt::Display for BandwidthUsage {
             BandwidthUsage::Overuse => write!(f, "overuse"),
             BandwidthUsage::Normal => write!(f, "normal"),
             BandwidthUsage::Underuse => write!(f, "underuse"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rtp_::{TwccClusterId, TwccPacketId};
+
+    #[test]
+    fn explicit_application_pacing_keeps_periodic_discovery_above_the_alr_threshold() {
+        for reset in [false, true] {
+            let base = Instant::now();
+            let mut controller = Bwe::new(Bitrate::mbps(5));
+            controller.set_egress_pacing(Bitrate::kbps(6250));
+            if reset {
+                controller.reset(Bitrate::mbps(5));
+            }
+            let bwe = &mut controller.bwe;
+            let mut periodic = false;
+            for tick in 0..=600 {
+                let at = base + Duration::from_millis(tick * 10);
+                // 4 Mbps is policy-limited to 80%, above automatic ALR's 65%.
+                bwe.on_media_sent(DataSize::bytes(5000), at);
+                if let Some(config) = bwe.handle_timeout(Bitrate::mbps(50), true, at) {
+                    periodic |= config.is_alr_probe();
+                }
+            }
+            assert!(
+                periodic,
+                "the policy ceiling cannot suppress capacity discovery"
+            );
+        }
+    }
+
+    #[test]
+    fn paced_probe_underfill_is_a_floor_but_network_queueing_still_reduces_capacity() {
+        for queued in [false, true] {
+            let base = Instant::now();
+            let mut bwe = SendSideBandwidthEstimator::new(Bitrate::mbps(5));
+            let cluster: TwccClusterId = 7.into();
+            let config = ProbeClusterConfig::new(cluster, Bitrate::mbps(10), ProbeKind::Initial)
+                .with_max_send_gap(Duration::from_millis(20));
+            assert!(bwe.probe_estimator.probe_start(config, base));
+            let packets: Vec<_> = (0..20)
+                .map(|i| {
+                    TwccSendRecord::test_new(
+                        TwccPacketId::with_cluster(1000 + i, cluster),
+                        base + Duration::from_millis(i * 4),
+                        1200,
+                        base + Duration::from_millis(300),
+                        Some(base + Duration::from_millis(i * if queued { 8 } else { 4 } + 2)),
+                    )
+                })
+                .collect();
+            bwe.update(packets.iter(), base + Duration::from_millis(300));
+            let estimate = bwe.last_estimate().unwrap();
+            if queued {
+                assert!(
+                    estimate < Bitrate::mbps(5),
+                    "real congestion must still reduce capacity"
+                );
+            } else {
+                assert!(
+                    estimate >= Bitrate::mbps(5),
+                    "local probe underfill manufactured a capacity drop"
+                );
+            }
         }
     }
 }

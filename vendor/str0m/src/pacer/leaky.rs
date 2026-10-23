@@ -34,6 +34,8 @@ pub struct LeakyBucketPacer {
     wake_interval: Duration,
     /// Regular application cadence, excluding stalls; used by byte-limited probes only.
     bounded_wake_interval: Duration,
+    /// Packets still queued after sends, rather than the pre-send snapshot.
+    egress_queued_packets: u64,
     /// The last time we indicated that a packet should be sent.
     last_emitted: Option<Instant>,
     /// The next time we should send a queued packet.
@@ -95,25 +97,37 @@ impl Pacer for LeakyBucketPacer {
         // Clear the poll time - it will be recalculated below if needed.
         // This is important because if we return early (e.g., next_poll_queue is already set),
         // we don't want the old Immediate timeout to keep firing.
+        let scheduled = self.next_poll_time.as_ref().map(|(at, _)| *at);
         self.next_poll_time = None;
 
         // This is called periodically and whenever packet is queued.
-        let was_backlogged = self
-            .queue_states
-            .iter()
-            .any(|queue| queue.snapshot.packet_count > 0);
+        let was_backlogged = self.egress_queued_packets > 0;
         self.queue_states.clear();
         self.queue_states.extend(iter);
+        self.egress_queued_packets = self
+            .queue_states
+            .iter()
+            .map(|queue| u64::from(queue.snapshot.packet_count))
+            .sum();
 
         let elapsed = self.update_handle_time_and_get_elapsed(now);
 
         if !elapsed.is_zero() {
             self.wake_interval = elapsed.max(self.wake_interval.saturating_sub(elapsed / 20));
+            let cadence = if self.egress_rate.is_some() {
+                // Intentional pacing waits are not scheduler granularity. Learning
+                // their full duration makes the pacer's own bursts grow each wake.
+                scheduled.map_or(elapsed, |at| {
+                    elapsed.min(now.saturating_duration_since(at) + Duration::from_millis(2))
+                })
+            } else {
+                elapsed
+            };
             if (self.egress_rate.is_none() || was_backlogged)
-                && elapsed <= Duration::from_millis(20)
+                && cadence <= Duration::from_millis(20)
             {
                 self.bounded_wake_interval =
-                    elapsed.max(self.bounded_wake_interval.saturating_sub(elapsed / 20));
+                    cadence.max(self.bounded_wake_interval.saturating_sub(elapsed / 20));
             }
         }
         self.clear_debt(elapsed);
@@ -130,7 +144,10 @@ impl Pacer for LeakyBucketPacer {
             if self.egress_debt >= burst {
                 self.next_poll_queue = None;
                 self.next_poll_time = Some((
-                    now + self.egress_debt / self.egress_active_rate.max(Bitrate::bps(1)),
+                    // Wake when another packet may start, rather than waiting to
+                    // clear the whole burst and teaching ourselves a coarser clock.
+                    now + (self.egress_debt.saturating_sub(burst) + DataSize::bytes(1))
+                        / self.egress_active_rate.max(Bitrate::bps(1)),
                     PacerReason::Paced,
                 ));
                 return None;
@@ -183,7 +200,14 @@ impl Pacer for LeakyBucketPacer {
         self.last_emitted = Some(now);
 
         if self.egress_rate.is_some() {
+            trace!(
+                bytes = packet_size.as_bytes_usize(),
+                rate = self.egress_active_rate.as_u64(),
+                cadence_us = self.bounded_wake_interval.as_micros(),
+                "Egress paced send"
+            );
             self.egress_debt += packet_size;
+            self.egress_queued_packets = self.egress_queued_packets.saturating_sub(1);
         }
         self.media_debt += packet_size;
         self.media_debt = self
@@ -216,6 +240,7 @@ impl LeakyBucketPacer {
             last_handle_time: None,
             wake_interval: Duration::ZERO,
             bounded_wake_interval: Duration::ZERO,
+            egress_queued_packets: 0,
             last_emitted: None,
             next_poll_time: None,
             media_debt: DataSize::ZERO,
@@ -567,38 +592,101 @@ mod test {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn idle_time_does_not_enlarge_the_first_media_burst() {
+    fn honoring_rounded_deadlines_does_not_inflate_the_burst() {
         let now = Instant::now();
         let mut pacer = LeakyBucketPacer::new(Bitrate::mbps(100));
         pacer.set_egress_pacing(Bitrate::mbps(4));
-        pacer.handle_timeout(now, std::iter::empty());
-        let at = now + Duration::from_millis(20);
-        let mut sent = 0;
-        loop {
+        let mut at = now;
+        let mut busy = now;
+        let mut left = 100;
+        while left > 0 && at < now + Duration::from_secs(1) {
             let queue = QueueState {
                 midrid: MidRid("screen".into(), None),
                 unpaced: true,
                 use_for_padding: false,
                 snapshot: QueueSnapshot {
-                    created_at: at,
-                    byte_size: 120_000,
-                    packet_count: 100,
-                    first_unsent: Some(at),
+                    created_at: now,
+                    byte_size: left * 1200,
+                    packet_count: left as u32,
+                    first_unsent: Some(now),
                     priority: QueuePriority::Media,
                     ..Default::default()
                 },
             };
             pacer.handle_timeout(at, [queue].into_iter());
-            if pacer.poll_queue().is_none() {
-                break;
+            if pacer.poll_queue().is_some() {
+                pacer.register_send(at, DataSize::bytes(1200), MidRid("screen".into(), None));
+                left -= 1;
+                busy = busy.max(at) + Duration::from_micros(1920); // 5 Mbps FIFO.
+                assert!(
+                    busy - at <= Duration::from_millis(10),
+                    "self-inflated burst"
+                );
+            } else {
+                // Unlike a fixed-step simulator, the runtime honors the pacer's
+                // requested deadline, rounded up to a 2 ms timer boundary.
+                let deadline = pacer.poll_timeout().0.unwrap();
+                let micros = deadline.saturating_duration_since(now).as_micros();
+                at = now + Duration::from_micros((micros.div_ceil(2000) * 2000) as u64);
             }
-            sent += 1;
-            pacer.register_send(at, DataSize::bytes(1200), MidRid("screen".into(), None));
         }
-        assert!(
-            sent > 0 && sent <= 2,
-            "idle time minted a {sent}-packet burst"
-        );
+        assert_eq!(left, 0, "pacing must still carry sustained media");
+        assert!(at - now >= Duration::from_millis(200));
+        assert!(pacer.bounded_wake_interval <= Duration::from_millis(4));
+    }
+
+    #[test]
+    fn idle_time_does_not_enlarge_the_first_media_burst() {
+        for previous_packets in [0, 1] {
+            let now = Instant::now();
+            let mut pacer = LeakyBucketPacer::new(Bitrate::mbps(100));
+            pacer.set_egress_pacing(Bitrate::mbps(4));
+            let previous = QueueState {
+                midrid: MidRid("screen".into(), None),
+                unpaced: true,
+                use_for_padding: false,
+                snapshot: QueueSnapshot {
+                    created_at: now,
+                    byte_size: previous_packets as usize * 1200,
+                    packet_count: previous_packets,
+                    first_unsent: (previous_packets > 0).then_some(now),
+                    priority: QueuePriority::Media,
+                    ..Default::default()
+                },
+            };
+            pacer.handle_timeout(now, [previous].into_iter());
+            if previous_packets > 0 {
+                assert!(pacer.poll_queue().is_some());
+                pacer.register_send(now, DataSize::bytes(1200), MidRid("screen".into(), None));
+            }
+            let at = now + Duration::from_millis(20);
+            let mut sent = 0;
+            loop {
+                let queue = QueueState {
+                    midrid: MidRid("screen".into(), None),
+                    unpaced: true,
+                    use_for_padding: false,
+                    snapshot: QueueSnapshot {
+                        created_at: at,
+                        byte_size: 120_000,
+                        packet_count: 100,
+                        first_unsent: Some(at),
+                        priority: QueuePriority::Media,
+                        ..Default::default()
+                    },
+                };
+                pacer.handle_timeout(at, [queue].into_iter());
+                if pacer.poll_queue().is_none() {
+                    break;
+                }
+                sent += 1;
+                pacer.register_send(at, DataSize::bytes(1200), MidRid("screen".into(), None));
+            }
+            assert!(
+                sent > 0 && sent <= 2,
+                "idle time minted a {sent}-packet burst"
+            );
+        }
     }
 
     #[test]

@@ -34,7 +34,7 @@ pub const INITIAL_ESTIMATE: u64 = 2_500_000;
 pub const PLAN: f64 = 0.8;
 pub const EXTRAS: f64 = 0.1;
 /// Short probes may exceed the estimate to discover capacity, without full-rate frame bursts.
-pub const PROBE_PACE: f64 = 1.25;
+pub const PROBE_PACE: f64 = 1.2;
 /// Admission bound floor, bytes.
 const ADMISSION_FLOOR: f64 = 64.0 * 1024.0;
 /// Extras burst: `max(64 KB, 30 ms × 2 × estimate)`, room for one str0m probe cluster at up to
@@ -340,7 +340,10 @@ impl Egress {
 
     fn release_burst(&self) -> f64 {
         let interval = if self.coarse_cadence() { COARSE_RELEASE_BURST } else { RELEASE_BURST };
-        (interval * self.release_rate()).max(RELEASE_BURST_FLOOR)
+        // Retain a fractional packet across a regular wake. A burst equal to
+        // exactly one interval's credit otherwise clips the leftover every tick
+        // (for example, 3.7 Mbps becomes only three 1164-byte packets per 10 ms).
+        (interval * self.release_rate() + (1200 + ORIGINAL_OVERHEAD) as f64).max(RELEASE_BURST_FLOOR)
     }
 
     /// The viewer's queued bytes may reach this: `max(64 KB, 400 ms × B)`.
@@ -378,10 +381,16 @@ impl Egress {
         let first = (0..self.lanes.len()).filter(|&lane| self.lanes[lane].assigned).min_by_key(|&lane| self.rank(lane));
         self.probe_need = first.map_or(0.0, |lane| {
             let rate = rates.get(lane).copied().unwrap_or_default();
-            (DESIRED_HEADROOM * caps.get(lane).copied().unwrap_or(0) as f64)
-                .max(RESUME_HEADROOM * rate.average)
-                .max(rate.largest_keyframe as f64 * 8.0 / DEADLINE.as_secs_f64())
-                / PLAN
+            let measured =
+                (RESUME_HEADROOM * rate.average).max(rate.largest_keyframe as f64 * 8.0 / DEADLINE.as_secs_f64());
+            // The origin cap is the server's admission ceiling, not the encoder's
+            // current demand. Probing for that ceiling after media arrives can
+            // repeatedly double the rate of a viewer that already fits the share.
+            if measured > 0.0 {
+                measured / PLAN
+            } else {
+                DESIRED_HEADROOM * caps.get(lane).copied().unwrap_or(0) as f64 / PLAN
+            }
         });
     }
 
@@ -841,10 +850,10 @@ mod tests {
             ShareRate { average: 3_200_000.0, largest_keyframe: 158_000, ..Default::default() },
             ShareRate { average: 8_500_000.0, largest_keyframe: 212_000, ..Default::default() },
         ];
-        e.set_probe_need(&[4_000_000, 8_000_000], &rates);
-        assert_eq!(e.probe_rate(), 6_250_000, "a second share cannot force 2x probes");
+        e.set_probe_need(&[8_000_000, 8_000_000], &rates);
+        assert_eq!(e.probe_rate(), 6_000_000, "a second share cannot force 2x probes");
         e.set_estimate(2_500_000, now);
-        assert_eq!(e.probe_rate(), 5_000_000, "initial discovery stays within 2x");
+        assert_eq!(e.probe_rate(), 4_800_000, "measured demand replaces the admission ceiling");
         e.focus(Some(1));
         e.set_probe_need(&[4_000_000, 8_000_000], &rates);
         assert_eq!(e.probe_rate(), 5_000_000, "larger priority demand remains bounded at 2x");
@@ -872,6 +881,32 @@ mod tests {
         assert!(order[..10].iter().all(|(lane, _, _)| *lane == 1), "{order:?}");
         let took = order.last().unwrap().2 - now;
         assert!(took >= 15 * MS && took <= 21 * MS, "{took:?}");
+    }
+
+    #[test]
+    fn ten_ms_release_preserves_fractional_packet_credit() {
+        let start = Instant::now();
+        let mut e = egress(4_632_171, 1, start);
+        e.tokens = 0.0;
+        for seq in 0..20 {
+            assert!(e.admit(0, packet(seq, 0, false, 1100, start), start).is_empty());
+        }
+        let mut seq = 20;
+        let mut sent = 0;
+        for tick in 1..=100 {
+            let now = start + tick * 10 * MS;
+            let (released, dropped) = e.due(now);
+            assert!(dropped.is_empty());
+            for (_, p) in released {
+                sent += p.size();
+                assert!(e.charge(Class::Original, p.size(), now));
+                assert!(e.admit(0, packet(seq, 0, false, 1100, now), now).is_empty());
+                seq += 1;
+            }
+        }
+        let expected = e.release_rate(); // One second of service.
+        assert!((expected - sent as f64).abs() < (1100 + ORIGINAL_OVERHEAD) as f64);
+        assert_eq!(e.counters.evicted, 0);
     }
 
     #[test]

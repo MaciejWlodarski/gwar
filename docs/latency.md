@@ -347,18 +347,40 @@ python3 -B scripts/latency/screen_gate.py --binary target/release/examples/laten
 ```
 
 The viewer transport paces originals, RTX and probes together before TWCC send
-timestamps are assigned: ordinary screen RTP at 90 % of estimated wire capacity,
-short probes normally at 125 %. Only the priority share's cap, average and
-keyframe demand can raise that ceiling, bounded at 200 %; a second share that
+timestamps are assigned: ordinary screen RTP at 80 % of estimated wire capacity,
+short probes normally at 120 %. Only the priority share's measured average and
+keyframe demand can raise that ceiling, bounded at 200 %; its admission cap is
+used only before media has been measured. A second share that
 cannot fit does not amplify startup probes. Cadence learning excludes idle
-gaps. Clusters are at least one second apart. Probe feedback includes SRTP and
+gaps and intentional pacing waits. The rounded-deadline regression follows the
+runtime's requested wakes instead of polling at a fixed simulation step.
+Clusters target 10 ms (two 5 ms wakes), retaining packet-count and distinct-time
+requirements; coarser clocks extend that within the byte reserve. Clusters are
+at least one second apart. Probe feedback includes SRTP and
 UDP/IP overhead. Original packets still expire 400 ms after publisher arrival,
 including time in the transport pacer. Independent voice bypasses screen pacing.
 Probes interrupted by local send gaps over 20 ms are excluded from capacity
 estimation; actual downstream queueing still reduces the estimate.
+An unsaturated paced probe supplies a capacity floor: local underfill cannot
+lower the previous estimate. A receive rate below the send rate still supplies
+the conservative congestion estimate, and regular delay/loss feedback remains active.
+The explicit policy ceiling marks screen watches application-limited even above
+automatic ALR's 65% threshold. Policy-limited ACK rates cannot become network
+capacity caps, and probe SSRCs do not charge application-media utilization.
+Exponential discovery stops at its application ceiling; the one-second result
+timeout cannot repeatedly probe the same maximum. Periodic discovery continues.
 The downlink regression simulation includes a shared FIFO, independent voice,
-150 KB keyframes, two 3 Mbps shares, and eight seeds with 0 % and 1 % loss,
+150 KB keyframes, two 3 Mbps shares with the live server's 8 Mbps admission cap,
+and eight seeds with 0 % and 1 % loss,
 including a separate bound on the startup queue before the steady window.
+The original 1 ms scheduler case retains 10 ms queue bounds. Additional 5/10 ms
+cadences use `max(10 ms, cadence + 2 ms)` steady and
+`max(10 ms, 2 × cadence + 2 ms)` startup bounds: one regular wake, or two for a
+probe, plus a fixed wire-packet margin. These simulation bounds do not replace
+the calibrated gate.
+The release bucket retains one packet of fractional credit across wakes; an
+allocated 3.7 Mbps must not round down to three packets per 10 ms and starve a
+3 Mbps share. Transmission still passes the shared wire pacer.
 Changing shared pacing also requires an uplink sanity run with at least four
 pairs. Thresholds and the 60 % minimum steady-load check remain unchanged.
 

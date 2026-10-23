@@ -368,6 +368,10 @@ impl Session {
             if let Some((_, probe)) = self.bwe_egress_pacing {
                 probe_config = probe_config
                     .with_max_bitrate(probe)
+                    // Two 5 ms wakes are enough to measure a paced cluster.
+                    // Limit overspeed residence while retaining the packet and
+                    // timestamp requirements; coarser clocks extend it below.
+                    .with_duration(Duration::from_millis(10))
                     .with_max_send_gap(Duration::from_millis(20));
             }
             // Only start the probe in the pacer if the estimator accepted it.
@@ -1222,7 +1226,7 @@ impl Session {
 
         // Update BWE subsystem
         if let Some(bwe) = self.bwe.as_mut() {
-            bwe.on_media_sent(sent_size.into(), is_padding, now);
+            bwe.on_media_sent(sent_size.into(), is_padding || header.ssrc.is_probe(), now);
         }
 
         if !is_padding && !header.ssrc.is_probe() {
@@ -1344,7 +1348,7 @@ impl Session {
     pub fn set_bwe_egress_pacing(&mut self, media: Bitrate, probe: Bitrate) {
         self.bwe_egress_pacing = Some((media, probe));
         if let Some(bwe) = self.bwe.as_mut() {
-            bwe.set_probe_bitrate_limit(probe);
+            bwe.set_egress_pacing(probe);
         }
         self.pacer.set_egress_pacing(media);
     }

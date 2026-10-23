@@ -105,21 +105,37 @@ use that same byte unit. Rates and byte targets therefore describe occupied
 capacity even for small padding. Queue pressure cannot increase this ceiling.
 Ordinary bursts use 2 ms (one-MTU floor, one-packet rounding); regular wake
 cadences up to 20 ms are allowed, but longer stalls do not create burst credit.
+Backlog counts decrease after sends. The next wake admits the next packet rather
+than clearing the whole burst debt; cadence learning uses deadline lateness so
+the pacer cannot teach itself larger bursts. A rounded-deadline regression covers
+the runtime path that fixed-step polling does not exercise.
 Probe configurations are capped before continuation thresholds are calculated,
-and again at dispatch before the estimator and pacer receive them. Probes queue
+and again at dispatch before the estimator and pacer receive them. Exponential
+discovery's already-probed maximum includes the application ceiling, preventing
+one-second retries at an unchanged capped rate while periodic discovery remains.
+Probes queue
 a complete cluster for the shared pacer, avoiding two competing pacing clocks.
-Coarse scheduling allows two regular wakes plus 2 ms for distinct timestamps,
+Screen-watch clusters use a nominal 10 ms target, with the existing five-packet
+and distinct-timestamp requirements, to bound overspeed residence. Coarse
+scheduling allows two regular wakes plus 2 ms for distinct timestamps,
 within the existing byte reserve. Both rates survive BWE reset. Control traffic
 bypasses the RTP pacer; transports that do not opt in retain upstream behavior.
-Gwar enables this only on watch transports, at 90 % / 125 % of the current
-estimate normally. Only the highest-priority share's cap, average and keyframe
-demand can raise the probe ceiling, bounded at 200 %. Idle gaps do not teach
+Gwar enables this only on watch transports, at 80 % / 120 % of the current
+estimate normally. Only the highest-priority share's measured average and
+keyframe demand can raise the probe ceiling, bounded at 200 %. Its server
+admission ceiling is used only before media has been measured, since that
+ceiling is not the encoder's demand. Idle gaps do not teach
 the shared pacer a coarse cadence. An active short probe keeps its dispatched
 rate: feeding its own partial estimate back into that measurement would report
 application backoff as lost capacity. Independent voice transports keep their immediate path. Regressions
 cover a burst of unpaced repairs, probes, transmission-time deadlines, and
 5 Mbps downlinks at 0-1 % loss with both steady video and voice queue checks.
 Additional changed upstream file: `src/pacer/mod.rs`.
+Unsaturated paced-probe results are capacity floors: a local send rate below
+the target cannot lower a previous delay estimate when reception matches that
+send rate. The existing 0.9 receive/send saturation boundary still permits real
+network queues to lower capacity. Ordinary delay and loss feedback remain active.
+The regression pairs local probe underfill with actual downstream serialization.
 
 
 `LossController::set_bandwidth_estimate` also replaces the loss-limited state
@@ -137,6 +153,13 @@ could prevent later discovery. Its sole-purpose tracker and integration are
 removed (`src/bwe/link_capacity_estimator.rs`). Delay, loss and recovery-window
 bounds remain. A sparse-ACK/1% loss regression preserves demonstrated capacity,
 then verifies that actual 50% congestion still reduces the estimate.
+The explicit egress policy marks screen watches application-limited even when
+media exceeds automatic ALR's 65% utilization threshold. This excludes a
+policy-limited ACK candidate and preserves periodic discovery. Probe-SSRC bytes
+are excluded from application-media accounting. Unsaturated probe underfill
+without a new capacity floor leaves both controller states intact, including
+genuine loss-limited backoff. A 4 Mbps policy on a 5 Mbps estimate verifies
+periodic discovery above the automatic ALR threshold.
 
 Shared-pacing probe configurations also limit gaps between local sends to 20 ms.
 The estimator retains ordered send timestamps (including known lost packets)

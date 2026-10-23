@@ -1040,11 +1040,12 @@ limit is a target, not a bound:
     `maybe_periodic_alr`);
   - when the estimate has stagnated for 15 s with unmet demand.
 
-  The default probe ceiling is **1.25 × estimate**. The highest-priority share's
+  The default probe ceiling is **1.2 × estimate**. The highest-priority share's
   demand can raise it to at most 2×; lower-priority shares cannot force that
   increase. This is a combined RTP rate: media
   sent during a probe consumes its budget instead of adding to padding.
-  Probes use a nominal 15 ms target. Coarse clocks allow two regular wakes
+  Screen-watch probes use a nominal 10 ms target (two 5 ms wakes), retaining
+  the five-packet requirement and distinct send timestamps. Coarse clocks allow two regular wakes
   plus 2 ms, still within the existing byte reserve, for usable timestamps. Their purpose
   is to test capacity above the estimate, so a short probe can temporarily
   consume voice headroom; it cannot send a whole frame at line rate.
@@ -1055,16 +1056,23 @@ Each watch transport enables the vendored `Bwe::set_egress_pacing` before its
 first probe. This adds a shared wire-byte debt to str0m's pacer, including
 streams marked unpaced, RTX and generated padding. It operates before SRTP
 output and TWCC accounting; neither delayed encrypted datagrams nor false send
-timestamps are needed. Ordinary screen RTP is limited to **0.9 × estimate**;
-short probes normally use **1.25 × estimate**. The actual ceiling is
-`min(2 × estimate, max(1.25 × estimate, N / 0.8))`, where `N` is the largest
-of 1.1× the highest-priority share's cap, 1.2× its measured average, and its
-largest keyframe divided by 400 ms, all in bits per second. This discovers
+timestamps are needed. Ordinary screen RTP is limited to **0.8 × estimate**;
+short probes normally use **1.2 × estimate**. The actual ceiling is
+`min(2 × estimate, max(1.2 × estimate, N / 0.8))`, where `N` is the largest
+of 1.2× the highest-priority share's measured average and its largest keyframe
+divided by 400 ms, all in bits per second. Before any media has been measured,
+1.1× its admission cap supplies the bootstrap demand. That cap is the server's
+ceiling, not the encoder's rate; continuing to probe for it would repeatedly
+overload a smaller downlink even after its priority share fits. This discovers
 keyframe room without letting a second share that cannot fit drive startup
 bursts. Queue pressure cannot raise these limits. Normal bursts allow 2 ms of
 the rate, with a one-MTU floor and one packet of rounding. Regular scheduler
 cadences up to 20 ms are learned only while RTP is queued: idle frame gaps
-cannot enlarge a later burst, and long stalls do not earn credit. Voice has its own transport and
+cannot enlarge a later burst, and long stalls do not earn credit. Queue counts
+are reduced after each send. Pacing wakes when the next packet becomes eligible,
+and cadence learning uses lateness against that deadline rather than treating an
+intentional debt-drain wait as scheduler delay. Otherwise the pacer can inflate
+its own bursts even with a fine runtime clock. Voice has its own transport and
 never waits in this screen pacer. Control traffic bypasses it.
 
 Pacing and TWCC use serialized SRTP bytes plus 48 bytes for IPv6/UDP, also on
@@ -1087,6 +1095,15 @@ An active short probe finishes its dispatched plan: changing its rate in respons
 to its own partial feedback would turn application backoff into a false capacity
 measurement. Later clusters use the updated ceiling.
 
+The explicit screen ceiling also marks these transports application-limited for
+loss estimation and periodic discovery. An 80% policy ceiling is above the
+automatic ALR detector's 65% threshold; an ACK rate under that policy is not a
+measurement of network capacity. Probe-SSRC bytes do not count as application
+media. An unsaturated underfilled probe can raise a capacity floor, but cannot
+lower a prior estimate or reset a genuine loss-limited state without new
+capacity evidence. Slower reception and ordinary delay/loss feedback still
+reduce the estimate on actual congestion.
+
 Application-limited ACK throughput is not used as a capacity candidate. The
 previous maximum-of-probes tracker also no longer supplies a hard upper bound:
 proving one rate says the link can carry at least that rate, not that it cannot
@@ -1097,10 +1114,13 @@ classified by its clear header, without decryption:
 
 - **Originals:** RTP on a slot's main SSRC. The Gwar queue admits and releases
   conservative serialized bytes at `B = 0.8 × estimate`. Its admission and
-  share meters reserve 64 bytes per packet for RTP/SRTP overhead. The socket
-  bucket checks actual SRTP bytes at `B`, with burst `max(2400 B, 10 ms × B)`,
-  expanding to 30 ms when scheduler wakes exceed 10 ms. The socket backstop
-  adds one 1264-byte packet of rounding: the shared pacer can mix originals and
+  share meters reserve 64 bytes per packet for RTP/SRTP overhead. Release
+  credit retains one 1264-byte packet beyond its regular 10 ms refill
+  window, with a 2400-byte floor, so fractional packet credit is not clipped on
+  every wake. Otherwise a 3.7 Mbps allocation can deliver only 2.8 Mbps at a
+  10 ms cadence. The window expands to 30 ms when scheduler wakes exceed 10 ms.
+  The socket bucket checks actual SRTP bytes at `B` and adds one further
+  1264-byte packet of rounding: the shared pacer can mix originals and
   RTX at different burst boundaries from the release queue. It cannot send
   beyond the shared wire-rate ceiling. An original that reaches
   its 400 ms deadline after release is discarded at transmission, its lane is
@@ -1113,9 +1133,10 @@ classified by its clear header, without decryption:
 - **Control:** RTCP, STUN and DTLS are sent immediately.
 
 Socket-volume accounting excludes UDP/IP; the pacer and BWE include it. The
-long-term socket bound remains `0.9 × estimate` plus control and initial bucket
-credit. Sustained originals get 80 %, extras 10 %, leaving 10 % for voice and
-other media. A rejected original clears its lane and counts its failed keyframe;
+long-term socket-volume bound remains `0.9 × estimate` plus control and initial
+bucket credit, while the shared wire pacer limits ordinary RTP to 80 %. Originals
+and repairs share that paced capacity, preserving 20 % for voice and other media
+even while repairs overlap a frame. A rejected original clears its lane and counts its failed keyframe;
 a rejected extra can be retried by NACK or later probing. Pending BWE events
 are drained before originals are released, so both layers use the current
 estimate. Socket drops can reduce BWE through TWCC loss; accurate pacing avoids
@@ -1221,7 +1242,7 @@ serves the voice acceptance instead. Results and deviations:
   and spaces only successive bursts on transports without the shared ceiling.
   Watch transports now queue a complete cluster for one wire-byte pacer, rather
   than having padding generation and transmission each pace the same probe.
-  Regular cadences up to 20 ms can extend the nominal 15 ms target to two wakes
+  Regular cadences up to 20 ms can extend the nominal 10 ms target to two wakes
   plus 2 ms for usable timestamps, within the existing byte reserve. Longer
   stalls never increase retained cadence. Originals and repairs consume the
   same probe rate, and actual transmission times drive feedback.
@@ -1388,7 +1409,7 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   the largest keyframe seen on the watched shares in the last 30 s, and at
   least 200 KB. The estimate can then grow enough for keyframes to meet the
   queue deadline, even for low-average shares. The cost is str0m's probes,
-  short clusters capped at 1.25× estimate and paced together with media,
+  short clusters normally capped at 1.2× estimate and paced together with media,
   within the viewer's extras bucket ("Per-viewer egress cap").
 
   Removing the final assignment sets the desired bitrate to zero immediately.
@@ -1397,11 +1418,14 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   transport sends zero non-control bytes in the 30 s final-unwatch simulation.
 
   The desired target is **at most 1.5 × the current estimate**; the actual
-  default probe ceiling is **1.25 × estimate**, raised only for the priority
+  default probe ceiling is **1.2 × estimate**, raised only for the priority
   share's demand and bounded at 2×. Both the estimator's probe plan and
   its continuation threshold use the capped rate. A successful capped probe
   can therefore continue discovering capacity, without waiting for a result
-  at the original higher target. The existing extras byte reserve also bounds
+  at the original higher target. The already-probed maximum also includes this
+  ceiling: reaching it stops exponential retries at the same rate instead of
+  manufacturing a new cluster on every one-second result timeout. Periodic
+  discovery and a raised ceiling remain available. The existing extras byte reserve also bounds
   coarse-clock clusters. Target increases wait for reserve refill within one
   MTU. Screen-watch transports suspend ordinary background padding through
   `Bwe::set_padding_bitrate_limit(Some(Bitrate::ZERO))`, so it cannot consume

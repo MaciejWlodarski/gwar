@@ -367,6 +367,16 @@ impl LossController {
         self.set_state(new_state);
 
         self.current_estimate = best_candidate;
+        trace!(
+            estimate = self.current_estimate.loss_limited_bandwidth.as_u64(),
+            delay = self.delay_based_estimate.as_u64(),
+            acked = self.acknowledged_bitrate.as_u64(),
+            loss = self.average_reported_loss_ratio(),
+            inherent_loss = self.current_estimate.inherent_loss,
+            state = ?self.state,
+            alr = self.is_in_alr(),
+            "Loss estimate"
+        );
         log_inherent_loss!(self.current_estimate.inherent_loss);
         log_loss_based_bitrate_estimate!(self.current_estimate.loss_limited_bandwidth.as_f64());
 

@@ -1544,7 +1544,8 @@ fn pacing(w: &mut Watcher) {
 
 fn pace(rtc: &mut Rtc, estimate: u64, probe_rate: u64) {
     rtc.bwe().set_egress_pacing(
-        Bitrate::bps((estimate as f64 * (egress::PLAN + egress::EXTRAS)) as u64),
+        // Keep the full 20% wire headroom even when repairs overlap originals.
+        Bitrate::bps((estimate as f64 * egress::PLAN) as u64),
         Bitrate::bps(probe_rate),
     );
 }

@@ -113,8 +113,8 @@ impl Spec {
     }
 }
 
-/// The preset whose cap fits `bitrate` (docs/screen-share.md, "Presets"): the SFU caps a
-/// share's ingress, and probes for its viewers, by its preset.
+/// The encoder preset whose rate fits `bitrate` (docs/screen-share.md, "Presets").
+/// The SFU's admission ceiling is server-wide; viewer demand uses measured media.
 fn preset(bitrate: u64) -> ScreenPreset {
     match bitrate {
         ..=1_500_000 => ScreenPreset::Saver,

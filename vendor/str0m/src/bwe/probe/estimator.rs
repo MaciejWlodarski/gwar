@@ -144,7 +144,7 @@ impl ProbeEstimator {
     pub fn update<'t>(
         &mut self,
         records: impl Iterator<Item = &'t TwccSendRecord>,
-    ) -> impl Iterator<Item = (ProbeClusterConfig, Bitrate)> + '_ {
+    ) -> impl Iterator<Item = (ProbeClusterConfig, Bitrate, bool)> + '_ {
         // Keep track of which clusters were updated in this call.
         self.did_update.clear();
 
@@ -215,7 +215,7 @@ impl ProbeEstimator {
             }
 
             let result = s.do_calculate_bitrate();
-            if let ProbeResult::Estimate(_) = result {
+            if let ProbeResult::Estimate(_, _) = result {
                 // Already logged in calculate_bitrate() during update().
             } else {
                 // Log the final rejection reason for the probe.
@@ -291,10 +291,10 @@ impl ProbeEstimatorState {
         true
     }
 
-    fn calculate_bitrate(&self) -> Option<(ProbeClusterConfig, Bitrate)> {
+    fn calculate_bitrate(&self) -> Option<(ProbeClusterConfig, Bitrate, bool)> {
         let result = self.do_calculate_bitrate();
 
-        let ProbeResult::Estimate(bitrate) = result else {
+        let ProbeResult::Estimate(bitrate, saturated) = result else {
             return None;
         };
 
@@ -302,7 +302,7 @@ impl ProbeEstimatorState {
         trace!(%result, "Probe result");
         log_probe_bitrate_estimate!(bitrate.as_f64());
 
-        Some((self.config, bitrate))
+        Some((self.config, bitrate, saturated))
     }
 
     /// Calculate the estimated bitrate for this probe cluster.
@@ -409,11 +409,12 @@ impl ProbeEstimatorState {
         // - if recv_rate is significantly lower than send_rate, assume saturation and
         //   return a conservative fraction of recv_rate.
         let mut estimate = send_rate.min(recv_rate);
-        if recv_rate < send_rate * MIN_RATIO_FOR_UNSATURATED_LINK {
+        let saturated = recv_rate < send_rate * MIN_RATIO_FOR_UNSATURATED_LINK;
+        if saturated {
             estimate = recv_rate * TARGET_UTILIZATION_FRACTION;
         }
 
-        ProbeResult::Estimate(estimate)
+        ProbeResult::Estimate(estimate, saturated)
     }
 
     fn end_probe(&mut self, now: Instant) {
@@ -425,7 +426,7 @@ impl ProbeEstimatorState {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ProbeResult {
     /// Successfully estimated bitrate
-    Estimate(Bitrate),
+    Estimate(Bitrate, bool),
     /// Not enough packets in cluster (< 4)
     ClusterTooSmall { recv: usize, limit: usize },
     /// Insufficient packets received (< 80% of sent)
@@ -451,7 +452,9 @@ enum ProbeResult {
 impl fmt::Display for ProbeResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProbeResult::Estimate(bitrate) => write!(f, "estimate={}", bitrate),
+            ProbeResult::Estimate(bitrate, saturated) => {
+                write!(f, "estimate={} saturated={}", bitrate, saturated)
+            }
             ProbeResult::ClusterTooSmall {
                 recv: received,
                 limit: required,
@@ -606,7 +609,7 @@ mod test {
         let results: Vec<_> = estimator.update(recv_vec.iter()).collect();
         let estimate_only_received = results
             .last()
-            .map(|(_, bitrate)| *bitrate)
+            .map(|(_, bitrate, _)| *bitrate)
             .expect("expected a probe estimate");
 
         // Second run: received + lost
@@ -617,7 +620,7 @@ mod test {
         let results: Vec<_> = estimator2.update(all_vec.iter()).collect();
         let estimate_with_lost = results
             .last()
-            .map(|(_, bitrate)| *bitrate)
+            .map(|(_, bitrate, _)| *bitrate)
             .expect("expected a probe estimate");
 
         assert_eq!(
