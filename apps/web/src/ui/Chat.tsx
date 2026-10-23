@@ -191,7 +191,7 @@ export const MessageRow = memo(function MessageRow({
     >
       <div className="w-10 shrink-0">
         {row.first ? (
-          <Avatar name={authorName} seed={msg.author_uid} uid={msg.author_uid} size={40} className="mt-0.5" />
+          <Avatar name={authorName} seed={msg.author_uid} uid={msg.author_uid} size={40} className="my-px" />
         ) : (
           // Always laid out (only hidden), one text line high: hovering never moves the chat.
           <time
@@ -277,7 +277,11 @@ function MessageEditor({ msg }: { msg: ChatMessage }) {
     const el = ref.current;
     if (!el) return;
     el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 240)}px`;
+    // scrollHeight leaves out the border, so a border-box height of just scrollHeight
+    // overflows by the border and shows a scrollbar even on one line.
+    const full = el.scrollHeight + el.offsetHeight - el.clientHeight;
+    el.style.height = `${Math.min(full, 240)}px`;
+    el.style.overflowY = full > 240 ? "auto" : "hidden";
   }, [text]);
   useEffect(() => {
     const el = ref.current;

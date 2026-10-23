@@ -180,6 +180,10 @@ export function ConnectScreen() {
                 value={address}
                 onChange={(e) => onAddressChange(e.target.value)}
                 placeholder={kind === "teamspeak" ? "ts.example.com" : "voice.example.com"}
+                // An address, not a login: without this the browser takes it for the username
+                // of the password below and offers saved account credentials.
+                name="server-address"
+                autoComplete="url"
                 autoCapitalize="none"
                 autoCorrect="off"
                 spellCheck={false}
@@ -200,7 +204,9 @@ export function ConnectScreen() {
                   type="password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  autoComplete="current-password"
+                  // A shared server password; "Remember" stores it, not the browser.
+                  name="server-password"
+                  autoComplete="off"
                   autoFocus={needPassword}
                   required={needPassword}
                 />
