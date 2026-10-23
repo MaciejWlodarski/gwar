@@ -105,6 +105,7 @@ describe("gwar/4 runtime schemas", () => {
     expect(event("screen.started", { ...share, share: "short" })).toBeUndefined();
     expect(event("screen.stopped", { share: share.share, reason: "moderator", by: "mod" })).toBe("event");
     expect(event("screen.stopped", { share: share.share, reason: "access" })).toBe("event");
+    expect(event("screen.stopped", { share: share.share, reason: "codec" })).toBe("event");
     expect(event("screen.stopped", { share: share.share, reason: "bored" })).toBeUndefined();
     expect(event("screen.viewers", { share: share.share, members: 2, guests: 0 })).toBe("event");
     expect(event("screen.link", { share: share.share, active: false })).toBe("event");

@@ -111,9 +111,10 @@ async fn socket() -> (UdpSocket, std::net::SocketAddr) {
     (socket, local)
 }
 
-fn rtc(local: std::net::SocketAddr) -> Rtc {
-    let mut rtc =
-        Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp8(true).enable_vp9(true).build(Instant::now());
+fn rtc(local: std::net::SocketAddr, h264_pt: u8) -> Rtc {
+    let mut config = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp8(true).enable_vp9(true);
+    config.codec_config().add_h264(h264_pt.into(), Some((h264_pt + 1).into()), true, 0x42e01f);
+    let mut rtc = config.build(Instant::now());
     rtc.add_local_candidate(Candidate::host(local, "udp").unwrap());
     rtc
 }
@@ -127,8 +128,12 @@ fn video_ssrcs(sdp: &str) -> (u32, u32) {
 impl Publisher {
     /// Negotiates the publish transport of `share` and waits until it is connected.
     pub async fn start(client: &mut Client, share: &str) -> Self {
+        Self::start_codec(client, share, Codec::Vp8).await
+    }
+
+    pub async fn start_codec(client: &mut Client, share: &str, codec: Codec) -> Self {
         let (socket, local) = socket().await;
-        let mut rtc = rtc(local);
+        let mut rtc = rtc(local, 118);
         let mut api = rtc.sdp_api();
         let mid = api.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
         let (offer, pending) = api.apply().unwrap();
@@ -139,7 +144,16 @@ impl Publisher {
         rtc.sdp_api()
             .accept_answer(pending, SdpAnswer::from_sdp_string(answer["sdp"].as_str().unwrap()).unwrap())
             .unwrap();
-        let pt = rtc.codec_config().params().iter().find(|p| p.spec().codec == Codec::Vp8).unwrap().pt();
+        let pt = rtc
+            .codec_config()
+            .params()
+            .iter()
+            .find(|p| {
+                p.spec().codec == codec
+                    && (codec != Codec::H264 || p.spec().format.profile_level_id.is_some_and(|id| id >> 8 == 0x42e0))
+            })
+            .unwrap()
+            .pt();
         let (tx, mut commands) = mpsc::channel::<Packet>(4096);
         let keyframe_requests = Arc::new(AtomicU64::new(0));
         let requests = keyframe_requests.clone();
@@ -248,6 +262,8 @@ impl Gate {
 pub struct Viewer {
     pub run: u64,
     rx: mpsc::Receiver<(usize, Packet)>,
+    /// Actual received (slot, SSRC, PT), after SRTP and RTX handling.
+    pub headers: Arc<Mutex<Vec<(usize, u32, u8)>>>,
     /// Incoming datagrams to lose on the way from the server, on any stream.
     pub loss: Loss,
     /// Outgoing datagrams to hold back.
@@ -281,7 +297,7 @@ impl Viewer {
         offer: impl FnOnce(String) -> F,
     ) -> Self {
         let (socket, local) = socket().await;
-        let mut rtc = rtc(local);
+        let mut rtc = rtc(local, 116);
         // str0m's random mids can collide within one offer: redraw.
         let (mids, sdp, pending) = loop {
             let mut api = rtc.sdp_api();
@@ -296,6 +312,8 @@ impl Viewer {
         let answer = offer(sdp.to_sdp_string()).await;
         rtc.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
         let (received, rx) = mpsc::channel(8192);
+        let headers = Arc::new(Mutex::new(Vec::new()));
+        let observed = headers.clone();
         let loss = Loss::default();
         let lose = loss.clone();
         let gate = Gate::default();
@@ -326,6 +344,7 @@ impl Viewer {
                                 continue;
                             };
                             let Some(slot) = mids.iter().position(|m| *m == slot) else { continue };
+                            observed.lock().unwrap().push((slot, *p.header.ssrc, *p.header.payload_type));
                             let packet = Packet {
                                 sequence: *p.seq_no,
                                 timestamp: p.header.timestamp,
@@ -359,7 +378,7 @@ impl Viewer {
             }
         });
         tokio::time::timeout(Duration::from_secs(5), connected).await.expect("watch transport connects").unwrap();
-        Self { run, rx, loss, gate, drop_repairs, task }
+        Self { run, rx, headers, loss, gate, drop_repairs, task }
     }
 
     /// The next packet received in any slot.

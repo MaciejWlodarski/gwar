@@ -124,6 +124,19 @@ describe("WatchSession", () => {
     expect(socket.sent.length).toBe(sent);
   });
 
+  it("keeps the explicit codec refusal when the guest socket closes", async () => {
+    const t = setup();
+    t.session.start("ws://x/ws/watch", TOKEN);
+    t.socket().open();
+    t.socket().receive({ re: 1, ok: watching });
+    await vi.waitFor(() => expect(t.socket().last("guest.offer")).toBeDefined());
+    const socket = t.socket();
+    socket.receive({ ev: "screen.stopped", d: { share: "s1", reason: "codec" } });
+    socket.onclose?.({} as CloseEvent);
+    expect(t.session.status).toBe("codec");
+    expect(t.transport.close).toHaveBeenCalled();
+  });
+
   it("says the link was turned off", async () => {
     const t = setup();
     t.session.start("ws://x/ws/watch", TOKEN);

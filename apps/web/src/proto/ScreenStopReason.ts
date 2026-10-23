@@ -4,4 +4,4 @@
  * Why a share ended. `access`: its sharer lost `share_screen`, or, told to one viewer, that
  * viewer may no longer watch it.
  */
-export type ScreenStopReason = "stopped" | "moderator" | "left" | "limit" | "transport" | "budget" | "access";
+export type ScreenStopReason = "stopped" | "moderator" | "left" | "limit" | "transport" | "budget" | "access" | "codec";

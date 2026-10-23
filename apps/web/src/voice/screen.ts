@@ -107,19 +107,22 @@ export async function applyCapturePreset(track: MediaStreamTrack, preset: Screen
   });
 }
 
-/** VP9 (profile 0), then VP8, then RTX: the only video the SFU forwards (docs/screen-share.md, "Codecs"). */
+/** H.264 mode 1 (Constrained Baseline first), VP9 profile 0, legacy VP8, then RTX. */
 export function preferredCodecs(codecs: readonly RTCRtpCodec[]): RTCRtpCodec[] {
   const mime = (c: RTCRtpCodec) => c.mimeType.toLowerCase();
+  const h264 = codecs.filter(c => mime(c) === "video/h264" && /(^|;)\s*packetization-mode=1(?:;|$)/.test(c.sdpFmtpLine ?? "") &&
+    /(^|;)\s*profile-level-id=(42[eEcC][0-9a-fA-F]|640[cC]|6400)[0-9a-fA-F]{2}(?:;|$)/.test(c.sdpFmtpLine ?? ""))
+    .sort((a, b) => Number(!/profile-level-id=42/i.test(a.sdpFmtpLine ?? "")) - Number(!/profile-level-id=42/i.test(b.sdpFmtpLine ?? "")));
   const vp9 = codecs.filter(c => mime(c) === "video/vp9" && (!c.sdpFmtpLine || /(^|;)\s*profile-id=0\b/.test(c.sdpFmtpLine) || !/profile-id=/.test(c.sdpFmtpLine)));
   const vp8 = codecs.filter(c => mime(c) === "video/vp8");
   const rtx = codecs.filter(c => mime(c) === "video/rtx");
-  return [...vp9, ...vp8, ...rtx];
+  return [...h264, ...vp9, ...vp8, ...rtx];
 }
 
-/** Applies `preferredCodecs` to a transceiver where the browser allows it; the SFU answers VP9/VP8 anyway. */
+/** Advertise only the selected side's capabilities: sender support never implies decoder support. */
 function preferCodecs(transceiver: RTCRtpTransceiver, side: "send" | "receive"): void {
   if (typeof transceiver.setCodecPreferences !== "function") return;
-  const sources = side === "send" ? [RTCRtpSender, RTCRtpReceiver] : [RTCRtpReceiver, RTCRtpSender];
+  const sources = side === "send" ? [RTCRtpSender] : [RTCRtpReceiver];
   for (const source of sources) {
     const codecs = preferredCodecs(source.getCapabilities?.("video")?.codecs ?? []);
     if (!codecs.some(c => c.mimeType.toLowerCase() !== "video/rtx")) continue;
@@ -156,6 +159,7 @@ export interface PublishStats {
   limitation: "none" | "cpu" | "bandwidth" | "other";
   /** e.g. "libvpx" (software) or "MediaFoundationVideoEncodeAccelerator"; engines may hide it. */
   encoder: string | null;
+  codec: string | null;
   /** True for a hardware encoder, when the engine says. */
   hardware: boolean | null;
 }
@@ -255,7 +259,8 @@ export class ScreenPublisher {
     if (!pc || this.closed) return null;
     try {
       let out: OutboundVideo | undefined;
-      (await pc.getStats()).forEach(s => {
+      const report = await pc.getStats();
+      report.forEach(s => {
         if (s.type === "outbound-rtp" && (s as OutboundVideo).kind === "video") out = s as OutboundVideo;
       });
       if (!out) return null;
@@ -270,6 +275,7 @@ export class ScreenPublisher {
         bitrate,
         limitation: reason === "cpu" || reason === "bandwidth" || reason === "other" ? reason : "none",
         encoder: out.encoderImplementation || null,
+        codec: out.codecId ? (report.get(out.codecId)?.mimeType as string | undefined)?.replace(/^video\//i, "") ?? null : null,
         hardware: typeof out.powerEfficientEncoder === "boolean" ? out.powerEfficientEncoder : null,
       };
     } catch { return null; }

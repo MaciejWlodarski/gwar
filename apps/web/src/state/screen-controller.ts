@@ -471,7 +471,7 @@ export class ScreenController {
       }
       case "screen.stopped": {
         const { share, reason, by } = event.d;
-        if (reason !== "access") dispatch({ type: "link", share, active: false });
+        if (reason !== "access" && reason !== "codec") dispatch({ type: "link", share, active: false });
         const own = useScreen.getState().own;
         if (own?.share === share) {
           this.endOwn();
@@ -487,7 +487,8 @@ export class ScreenController {
         if (!watched && !released) return;
         const onStage = watched ? screen.stage === share : released!.onStage;
         if (watched) dispatch({ type: "unwatch", share });
-        if (reason === "access") useUi.getState().toast("info", tNow("screen.noLongerWatch"));
+        if (reason === "codec") useUi.getState().toast("error", tNow("screen.cantDecode"));
+        else if (reason === "access") useUi.getState().toast("info", tNow("screen.noLongerWatch"));
         else if (onStage) useUi.getState().toast("info", tNow("screen.ended"));
         return;
       }
@@ -504,6 +505,7 @@ export class ScreenController {
       case "transport": return tNow("screen.stopped.transport");
       case "budget": return tNow("screen.stopped.budget");
       case "access": return tNow("screen.stopped.access");
+      case "codec": return tNow("screen.cantDecode");
     }
   }
 

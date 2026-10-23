@@ -779,6 +779,9 @@ impl Core {
             CoreMsg::Screen(ScreenSignal::Paused { session, run, grant, reason }) => {
                 self.screen_paused(session, run, &grant, Some(reason))
             }
+            CoreMsg::Screen(ScreenSignal::Incompatible { session, run, grant }) => {
+                self.screen_incompatible(session, run, &grant);
+            }
             CoreMsg::Screen(ScreenSignal::Resumed { session, run, grant }) => {
                 self.screen_paused(session, run, &grant, None)
             }

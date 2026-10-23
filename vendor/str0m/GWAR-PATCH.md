@@ -174,3 +174,10 @@ demonstrated capacity until the next complete loss observation. Partial feedback
 including during startup, cannot restore the unproven ceiling. The cap reports
 `Increasing` to the integration layer while preserving the successful probe's
 internal `DelayBased` transition, so stale HOLD/recovery limits are not reactivated.
+
+
+A2 also narrows H.264 answer levels to the lower peer level when either peer
+omits or disables `level-asymmetry-allowed`. Asymmetric levels require both
+peers to opt in; Level 1b uses the existing profile/level parser's ordering.
+`h264_answer_levels_require_mutual_asymmetry` covers these cases. Codec/PT
+selection and all pacing/BWE behavior are unchanged by this addition.

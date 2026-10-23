@@ -72,7 +72,7 @@ wire! {
     /// viewer may no longer watch it.
     #[derive(Copy, Eq)]
     #[serde(rename_all = "snake_case")]
-    pub enum ScreenStopReason { Stopped, Moderator, Left, Limit, Transport, Budget, Access }
+    pub enum ScreenStopReason { Stopped, Moderator, Left, Limit, Transport, Budget, Access, Codec }
 
     /// A TeamSpeak guest's frame on `/ws/watch` (docs/screen-share.md, "TeamSpeak watch links"):
     /// `{"id": 1, "op": "guest.watch", "d": {...}}`. Guests speak nothing else.

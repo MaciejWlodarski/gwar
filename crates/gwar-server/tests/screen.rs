@@ -474,3 +474,99 @@ async fn screen_limits_are_server_settings_and_the_egress_counter_reports_the_mo
     alice.ok("screen.stop", json!({"share": share})).await;
     assert_eq!(alice.screen_start().await.unwrap_err().code, gwar_proto::ErrorCode::Busy);
 }
+
+/// Canonical H.264 IDR prefix followed by FU-A IDR data; the server never decodes it.
+fn h264_frame(source: u64, timestamp: u32) -> Vec<Packet> {
+    [vec![0x67, 0x42, 0xe0, 0x1f, 0x80], vec![0x68, 0xce, 0x06], vec![0x7c, 0x85, 0x88], vec![0x7c, 0x45, 0x84]]
+        .into_iter()
+        .enumerate()
+        .map(|(i, payload)| Packet { sequence: source + i as u64, timestamp, marker: i == 3, payload })
+        .collect()
+}
+
+#[tokio::test]
+async fn h264_srtp_forwarding_late_join_pli_and_mixed_codec_slots() {
+    use str0m::format::Codec;
+    let server = TestServer::start().await;
+    let mut alice = Client::connect(&server, "h264").await;
+    let mut carol = Client::connect(&server, "vp9").await;
+    let mut bob = Client::connect(&server, "viewer").await;
+    let mut late = Client::connect(&server, "late").await;
+    let channel = seed_channel(&alice, "General");
+    alice.ok("channel.join", json!({"channel": channel})).await;
+    carol.ok("channel.join", json!({"channel": channel})).await;
+    let h264 = alice.share_here_codec(Codec::H264).await;
+    let vp9 = carol.share_here_codec(Codec::Vp9).await;
+    let hs = bob.watch(&h264).await as usize;
+    let vs = bob.watch(&vp9).await as usize;
+    alice.publisher(&h264).send(h264_frame(1000, 90000)).await;
+    let vp9_packet = Packet { sequence: 700, timestamp: 30000, marker: true, payload: vec![0x08, 0, 0xaa] };
+    carol.publisher(&vp9).send([vp9_packet.clone()]).await;
+    let received = bob.viewer.as_mut().unwrap().collect(Duration::from_millis(400)).await;
+    let hp: Vec<_> = received.iter().filter(|(s, _)| *s == hs).map(|(_, p)| p).collect();
+    assert_eq!(hp.len(), 4, "complete H.264 access unit");
+    assert_eq!(hp[0].sequence, 0, "publisher sequence 1000 is rewritten");
+    assert_eq!(hp[0].timestamp, 90000, "source clock is retained in the first segment");
+    {
+        let headers = bob.viewer.as_ref().unwrap().headers.lock().unwrap();
+        let h264_headers: Vec<_> = headers.iter().filter(|(slot, _, _)| *slot == hs).collect();
+        assert_eq!(h264_headers.len(), 4);
+        assert!(
+            h264_headers.iter().all(|(_, ssrc, pt)| *ssrc != alice.publisher(&h264).ssrc && *pt == 116),
+            "publisher H.264 PT 118 and SSRC are rewritten for the viewer's PT 116 slot"
+        );
+    }
+    assert_eq!(
+        hp.iter().map(|p| &p.payload).collect::<Vec<_>>(),
+        h264_frame(0, 0).iter().map(|p| &p.payload).collect::<Vec<_>>()
+    );
+    assert!(hp.windows(2).all(|w| w[1].sequence == w[0].sequence + 1));
+    assert_eq!(received.iter().find(|(s, _)| *s == vs).unwrap().1.payload, vp9_packet.payload);
+
+    let ls = late.watch(&h264).await as usize;
+    let before = alice.publisher(&h264).keyframe_requests();
+    // SPS and PPS without an IDR cannot open the late viewer's slot.
+    let mut invalid = h264_frame(1004, 93000);
+    invalid.truncate(2);
+    invalid[1].marker = true;
+    alice.publisher(&h264).send(invalid).await;
+    assert!(late.viewer.as_mut().unwrap().collect(Duration::from_millis(600)).await.is_empty());
+    assert!(alice.publisher(&h264).keyframe_requests() > before, "missing IDR requests a new keyframe");
+    let expected = h264_frame(1006, 96000);
+    alice.publisher(&h264).send(expected.clone()).await;
+    let a = bob.viewer.as_mut().unwrap().collect(Duration::from_millis(300)).await;
+    let b = late.viewer.as_mut().unwrap().collect(Duration::from_millis(300)).await;
+    assert_eq!(b.len(), 4);
+    assert!(b.iter().all(|(s, _)| *s == ls));
+    assert_eq!(
+        b.iter().map(|(_, p)| &p.payload).collect::<Vec<_>>(),
+        expected.iter().map(|p| &p.payload).collect::<Vec<_>>()
+    );
+    assert_eq!(a.iter().filter(|(s, p)| *s == hs && expected.iter().any(|e| e.payload == p.payload)).count(), 6);
+
+    // H.264 publisher loss repairs over its RTX PT into both already-open segments.
+    let repairs = alice.publisher(&h264).repairs();
+    alice.publisher(&h264).loss.drop_once([1012]);
+    alice.publisher(&h264).send(h264_frame(1010, 99000)).await;
+    let got = bob.viewer.as_mut().unwrap().collect(Duration::from_millis(800)).await;
+    let late_got = late.viewer.as_mut().unwrap().collect(Duration::from_millis(300)).await;
+    assert!(alice.publisher(&h264).repairs() > repairs, "H.264 ingress loss is repaired over RTX");
+    let mut packets: Vec<_> = got.iter().filter(|(s, _)| *s == hs).map(|(_, p)| p).collect();
+    packets.sort_by_key(|p| p.sequence);
+    assert_eq!(packets.iter().map(|p| p.sequence).collect::<Vec<_>>(), [10, 11, 12, 13]);
+    assert_eq!(
+        packets.iter().map(|p| &p.payload).collect::<Vec<_>>(),
+        h264_frame(0, 0).iter().map(|p| &p.payload).collect::<Vec<_>>()
+    );
+    assert_eq!(late_got.len(), 4);
+
+    // Viewer-side loss is repaired on its own H.264 RTX PT, without an upstream repair.
+    let repairs = alice.publisher(&h264).repairs();
+    bob.viewer.as_ref().unwrap().loss.drop_once([16]);
+    alice.publisher(&h264).send(h264_frame(1014, 102000)).await;
+    let got = bob.viewer.as_mut().unwrap().collect(Duration::from_millis(800)).await;
+    let mut packets: Vec<_> = got.iter().filter(|(s, _)| *s == hs).map(|(_, p)| p).collect();
+    packets.sort_by_key(|p| p.sequence);
+    assert_eq!(packets.iter().map(|p| p.sequence).collect::<Vec<_>>(), [14, 15, 16, 17]);
+    assert_eq!(alice.publisher(&h264).repairs(), repairs, "viewer NACK stays on its own leg");
+}

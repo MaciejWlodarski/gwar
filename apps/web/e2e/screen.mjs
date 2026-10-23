@@ -50,6 +50,7 @@ async function port() {
 function start(name, command, args, options = {}) {
   const child = spawn(command, args, { cwd: repoRoot, stdio: ["ignore", "pipe", "pipe"], detached: true, ...options });
   child.output = "";
+  child.taskName = name;
   child.stdout.on("data", b => { child.output += b; });
   child.stderr.on("data", b => { child.output += b; });
   children.push(child);
@@ -65,13 +66,21 @@ async function waitFor(check, what, timeout = 30_000) {
 }
 
 /** Per device: a synthetic microphone, the barcode reader and, for canvas sharers, the capture hook. */
-function devicePatch({ frequency, sources }, stamp, read, capture) {
+function devicePatch({ frequency, sources, sendCodec, receiveCodec }, stamp, read, capture) {
   window.__readBarcode = read;
   // Every peer connection, for the RTP diagnostics a failure prints.
   window.__pcs = [];
   window.RTCPeerConnection = new Proxy(window.RTCPeerConnection, {
     construct(target, args) { const pc = new target(...args); window.__pcs.push(pc); return pc; },
   });
+  for (const [type, selected] of [[RTCRtpSender, sendCodec], [RTCRtpReceiver, receiveCodec]]) {
+    if (!selected) continue;
+    const capabilities = type.getCapabilities.bind(type);
+    type.getCapabilities = kind => {
+      const caps = capabilities(kind);
+      return kind === "video" && caps ? { ...caps, codecs: caps.codecs.filter(c => ["video/rtx", `video/${selected}`].includes(c.mimeType.toLowerCase())) } : caps;
+    };
+  }
   const media = navigator.mediaDevices;
   media.getUserMedia = async () => {
     const context = new AudioContext();
@@ -102,7 +111,7 @@ const diagnostics = page => page.evaluate(async () => ({
       streams.push({ dir: s.type === "inbound-rtp" ? "in" : "out", mid: s.mid, codec: codecs[s.codecId], packets: s.packetsReceived ?? s.packetsSent, bytes: s.bytesReceived ?? s.bytesSent,
         frames: s.framesDecoded ?? s.framesEncoded, keyFrames: s.keyFramesDecoded ?? s.keyFramesEncoded, pli: s.pliCount, fir: s.firCount, nack: s.nackCount, size: `${s.frameWidth}x${s.frameHeight}` });
     });
-    return { state: pc.connectionState, streams };
+    return { state: pc.connectionState, streams, offeredCodecs: pc.localDescription?.sdp?.split(/\r?\n/).filter(l => /^m=video|^a=rtpmap:.*(H264|VP9|VP8)/i.test(l)), answeredCodecs: pc.remoteDescription?.sdp?.split(/\r?\n/).filter(l => /^m=video|^a=rtpmap:.*(H264|VP9|VP8)/i.test(l)) };
   })),
   videos: [...document.querySelectorAll("video[data-share]")].map(v => {
     const track = v.srcObject?.getVideoTracks?.()[0];
@@ -112,11 +121,11 @@ const diagnostics = page => page.evaluate(async () => ({
 
 const errors = page => page.errors.filter(e => !/Conversation synchronization|favicon|Failed to load resource|Screen capture constraints|WebSocket/.test(e));
 
-async function device(browser, web, server, name, { canvasId = null, frequency = 440 } = {}) {
+async function device(browser, web, server, name, { canvasId = null, frequency = 440, sendCodec = null, receiveCodec = null } = {}) {
   const context = await browser.newContext({ locale: "en-US", viewport: { width: 1440, height: 900 } });
   await context.route("**/*", route => (new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort()));
   const sources = (canvasId === null ? [] : [canvasId].flat()).map(id => ({ id, size: SOURCE_SIZES[id] }));
-  await context.addInitScript({ content: `(${devicePatch})(${JSON.stringify({ frequency, sources })}, ${stampBarcode}, ${readBarcode}, ${canvasCapture})` });
+  await context.addInitScript({ content: `(${devicePatch})(${JSON.stringify({ frequency, sources, sendCodec, receiveCodec })}, ${stampBarcode}, ${readBarcode}, ${canvasCapture})` });
   const page = await context.newPage();
   page.errors = [];
   page.on("pageerror", e => page.errors.push(String(e)));
@@ -172,11 +181,12 @@ const ownShare = page => session(page, (_, screen) => (screen.own?.phase === "li
 const bar = page => page.getByRole("status", { name: "You are sharing your screen" });
 
 /** Shares through the UI: the Share button opens the picker, then the preset menu. */
-async function share(page, surface) {
+async function share(page, surface, preset = null) {
   await page.getByRole("button", { name: "Share screen", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Share your screen" });
   await dialog.waitFor({ timeout: 20_000 });
   await dialog.getByText(surface, { exact: true }).waitFor();
+  if (preset) await dialog.getByRole("radio", { name: new RegExp(`^${preset}`) }).check();
   await dialog.getByRole("button", { name: "Share", exact: true }).click();
   await bar(page).getByText(/watching$/).waitFor({ timeout: 30_000 });
   const id = await ownShare(page);
@@ -252,6 +262,28 @@ async function decodes(page, share, id, what) {
   checks.push({ check: what, viewer: page.deviceName, ms, size: `${last.width}x${last.height}`, framesDecoded: last.framesDecoded, painted: false });
 }
 
+/** getStats codec evidence from the actual publish and receive transports, not SDP alone. */
+async function codecFlow(publisher, viewer, share, expected) {
+  const slot = await session(viewer, (_, screen, __, share) => screen.watches.find(w => w.share === share)?.slot, share);
+  const read = async (page, direction) => page.evaluate(async ({ direction, slot }) => {
+    for (const pc of window.__pcs) {
+      if (pc.connectionState !== "connected") continue;
+      const transceivers = pc.getTransceivers();
+      const target = direction === "in" ? transceivers[slot] : null;
+      if (direction === "in" && (!target || target.direction !== "recvonly" || target.receiver.track.kind !== "video")) continue;
+      const report = direction === "in" ? await target.receiver.getStats() : await pc.getStats();
+      for (const s of report.values()) {
+        if (s.type === (direction === "in" ? "inbound-rtp" : "outbound-rtp") && s.kind === "video" && (s.framesDecoded ?? s.framesEncoded) > 0)
+          return { mimeType: report.get(s.codecId)?.mimeType?.toLowerCase(), frames: s.framesDecoded ?? s.framesEncoded, encoder: s.encoderImplementation ?? null };
+      }
+    }
+    return null;
+  }, { direction, slot });
+  let sent, received;
+  await waitFor(async () => { sent = await read(publisher, "out"); received = await read(viewer, "in"); return sent?.mimeType === expected && received?.mimeType === expected; }, `${expected} flows through the real SFU`);
+  checks.push({ check: "codec flow through SFU", share, sent, received });
+}
+
 async function run(browsers, web, server, token) {
   const engine = name => browsers[engines.includes(name) ? name : engines[0]];
   const chromiumTab = engines.includes("chromium");
@@ -278,9 +310,15 @@ async function run(browsers, web, server, token) {
     await cs.bringToFront();
   }
   await join(cs, channels.stage);
-  const csShare = await share(cs, chromiumTab ? "Sharing a browser tab" : "Sharing your screen");
+  const hasH264 = await cs.evaluate(() => RTCRtpSender.getCapabilities("video").codecs.some(c =>
+    c.mimeType.toLowerCase() === "video/h264" && /(^|;)\s*packetization-mode=1(?:;|$)/.test(c.sdpFmtpLine ?? "") &&
+    /(^|;)\s*profile-level-id=(42[eEcC]0|640[cC]|6400)[0-9a-fA-F]{2}(?:;|$)/.test(c.sdpFmtpLine ?? "")));
+
+  // Current browsers offer H.264 receive level 3.1. Exercise its 720p envelope;
+  // a higher-level stream must be refused rather than sent above viewer limits.
+  const csShare = await share(cs, chromiumTab ? "Sharing a browser tab" : "Sharing your screen", hasH264 ? "Saver" : null);
   checks.push({ check: "chromium real tab capture", ok: chromiumTab });
-  const ws = await device(engine("webkit"), web, server, "ws-canvas", { frequency: 550, canvasId: 2 });
+  const ws = await device(engine("webkit"), web, server, "ws-canvas", { frequency: 550, canvasId: 2, sendCodec: hasH264 ? null : "vp9" });
   await join(ws, channels.stage);
   const wsShare = await share(ws, "Sharing your screen");
 
@@ -288,6 +326,16 @@ async function run(browsers, web, server, token) {
   await join(cv, channels.hall);
   await watch(cv, "cs-tab");
   await sees(cv, csShare, 1, "chromium → chromium, viewer in another channel");
+  await codecFlow(cs, cv, csShare, hasH264 ? "video/h264" : "video/vp9");
+  checks.push({ check: "H.264 browser capability", available: hasH264, gap: hasH264 ? null : "Browser exposes no H.264 encoder; actual VP9 fallback verified instead." });
+  if (hasH264) {
+    const incompatible = await device(engine("chromium"), web, server, "vp9-only-viewer", { receiveCodec: "vp9" });
+    await watch(incompatible, "cs-tab");
+    await incompatible.getByText("Your browser cannot decode this screen share. Ask the sharer to use a compatible browser or codec.").waitFor();
+    assert.equal(await shareOf(incompatible, "cs-tab"), csShare, "a codec refusal does not remove the running share");
+    assert.equal(await session(incompatible, (_, screen) => screen.watches.length), 0);
+    checks.push({ check: "incompatible viewer is explicitly refused", ok: true });
+  }
   await watch(cv, "ws-canvas");
   await sees(cv, wsShare, 2, "webkit → chromium");
   await bar(cs).getByText("1 watching").waitFor({ timeout: 10_000 });
@@ -303,7 +351,7 @@ async function run(browsers, web, server, token) {
   await bar(ws).getByText("2 watching").waitFor({ timeout: 10_000 });
 
   // Start → stop → start while watching two other shares: the watch transport is untouched.
-  const c3 = await device(engine("chromium"), web, server, "c3-restart", { frequency: 700, canvasId: [3, 6] });
+  const c3 = await device(engine("chromium"), web, server, "c3-restart", { frequency: 700, canvasId: [3, 6], sendCodec: "vp9" });
   await join(c3, channels.stage);
   await watch(c3, "cs-tab");
   await sees(c3, csShare, 1, "restarting sharer watches the tab share");
@@ -313,6 +361,7 @@ async function run(browsers, web, server, token) {
   const first = await share(c3, "Sharing your screen");
   await watch(cv, "c3-restart");
   await sees(cv, first, 3, "first share of the restarting sharer");
+  await codecFlow(c3, cv, first, "video/vp9");
   await stopSharing(c3);
   await waitFor(async () => (await shareOf(cv, "c3-restart")) === null, "the first share ends for viewers");
   const second = await share(c3, "Sharing your screen");
@@ -392,6 +441,10 @@ try {
   warnings = await run(browsers, web, ws, token);
 } catch (error) {
   failure = error;
+  for (const child of children) {
+    const codecs = child.output.split("\n").filter(line => line.includes("screen codec incompatible"));
+    if (codecs.length) console.error(JSON.stringify({ process: child.taskName, codecs }));
+  }
   for (const page of opened) {
     const state = await session(page, (s, screen) => ({ own: screen.own && { ...screen.own, stream: !!screen.own.stream }, transport: screen.transport, watches: screen.watches, slots: screen.slots, shares: Object.keys(s.shares) })).catch(e => String(e));
     const rtc = await diagnostics(page).catch(e => String(e));

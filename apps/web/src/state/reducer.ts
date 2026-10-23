@@ -511,7 +511,7 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
     case "screen.stopped":
       // `access` told to one viewer ends only that viewer's watch: the share runs on, and goes
       // with its sharer's `sharing` or its channel when it really ended or was hidden.
-      if (event.d.reason === "access" || !state.shares[event.d.share]) return state;
+      if (event.d.reason === "access" || event.d.reason === "codec" || !state.shares[event.d.share]) return state;
       return { ...state, shares: withoutShares(state.shares, s => s.share === event.d.share) };
     // The screen controller keeps these (state/screen.ts).
     case "screen.viewers": case "screen.link": case "screen.slot": return state;

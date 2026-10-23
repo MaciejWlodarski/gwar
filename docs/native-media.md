@@ -7,8 +7,9 @@ payload parser (A1, [#153](https://github.com/MaciejWlodarski/gwar/pull/153)),
 the AV1 payload and Dependency Descriptor parsers (A1b,
 [#154](https://github.com/MaciejWlodarski/gwar/pull/154)), the platform-neutral
 contracts and test source (B1, [#158](https://github.com/MaciejWlodarski/gwar/pull/158)),
-and the rate and quality controller (B6). Transport integration remains A2/A2b
-and B4/B5; native sharing is not wired yet.
+and the rate and quality controller (B6). Browser H.264 screen transports and
+H.264-first web sending (A2) are built. AV1 transport integration (A2b), native
+transports (B4/B5), and native sharing remain separate.
 
 It extends [screen-share.md](screen-share.md). That design ships screen
 sharing through the server's SFU from browsers and the Tauri desktop app's
@@ -39,7 +40,7 @@ official documentation is marked **(to verify)**. The list is collected in
 
 | Client | UI | Voice | Screen sharing |
 | --- | --- | --- | --- |
-| Web (`apps/web`) | React | WebRTC in the browser, SFrame worker | Being built: `getDisplayMedia`, VP9/VP8 ([screen-share.md](screen-share.md)) |
+| Web (`apps/web`) | React | WebRTC in the browser, SFrame worker | `getDisplayMedia`, H.264/VP9 with legacy VP8 ([screen-share.md](screen-share.md)) |
 | Desktop (`apps/desktop`, Tauri 2) | the same React UI in the system webview | **native**: `gwar-client` (str0m, cpal, Opus, SFrame in Rust) | macOS 14.6+ and Windows through the webview; none on Linux ([owner decision 1](screen-share.md#owner-decisions)) |
 | Android | being built separately (docs on its branch) | | |
 | iOS | none | none | none |
@@ -355,7 +356,8 @@ AV1 is unavailable. Its profile, level and SFrame rules below still apply.
 The SFU reads only enough of each RTP payload to find frame and keyframe
 starts, as it does for VP9 and VP8 (`describe` in
 `media/screen/ingress.rs`, PR 3a). The H.264 payload parser (A1) is built in
-`media/screen/h264.rs`; transport integration and confirmation remain A2.
+`media/screen/h264.rs`; A2 integrates transport negotiation, bounded prefix
+confirmation and plaintext browser forwarding.
 For H.264
 ([RFC 6184](https://www.rfc-editor.org/rfc/rfc6184)):
 
@@ -491,8 +493,13 @@ For H.264
   - The SFU records the limits per viewer and payload type, and treats them
     as part of what the viewer decodes. A stream is compatible with a viewer
     only if codec, profile, level and those limits all fit.
-  - The SFU knows each stream's profile and level from the sharer's layer
-    declaration ([A3](#track-a-sfu-and-protocol)) and checks it against the
+  - Browser A2 reads each stream's profile and level from its in-band SPS
+    and maps compatible viewer PTs without transcoding. It retains the raw
+    receive limits per offered PT; conservatively, `max-*` extensions alone
+    do not admit a higher SPS level until actual size/fps/reference metadata
+    is available. A native stream will declare its profile and level in the
+    sharer's layer declaration ([A3](#track-a-sfu-and-protocol)); the SFU will
+    check it against the
     first three bytes after the SPS NAL header (`profile_idc`, constraint
     flags, `level_idc`), which stay clear in every channel. A keyframe whose
     SPS does not match the declaration fails like a keyframe without an IDR.
@@ -914,7 +921,7 @@ this before mixed AV1/H.264 sharing ships.
    at share start. Native order is `[AV1, H.264, VP9, VP8]` with hardware
    AV1, `[H.264, VP9, VP8]` otherwise; offer only working encoders. If no
    hardware H.264 exists, the existing OpenH264/libvpx policy applies.
-   Web sharers keep `[VP9, VP8]`. Declare each layer's codec, profile,
+   Browser A2 sharers prefer `[H.264, VP9, VP8]` (VP8 is transitional). Declare each layer's codec, profile,
    level, size, fps and temporal modes from actual encoder output (SPS for
    H.264, sequence/frame headers for AV1), before its first keyframe.
 3. **Choose per share before first media.** Use the sharer's encoders × the
@@ -944,9 +951,10 @@ this before mixed AV1/H.264 sharing ships.
 6. **Release lazily.** After the last viewer needing a compatibility layer
    leaves, keep it for 30 s before stopping its encoder. Apply the same hold
    to primary promotion/removal after membership changes to avoid flapping.
-7. **Keep the legacy web send policy.** VP9/VP8 web sharers retain their
-   existing common-codec switch, at a keyframe or via publisher replacement
-   (E3), and the 30 s hold before switching back. Web AV1 sending is not
+7. **Browser A2 compatibility.** H.264/VP9/legacy VP8 browser sharers send
+   one stream. An incompatible watch is explicitly refused with reason
+   `codec`; the share continues. A request to the web sharer to fall back to
+   VP9, publisher codec replacement (E3), and a 30 s hold remain follow-ups. Web AV1 sending is not
    enabled. This legacy path does not change the native primary-retention
    rule above.
 8. **Failures are explicit.** If no compatible layer can be produced, end
@@ -1752,7 +1760,32 @@ round of their own, as voice 5c/5d had.
   - publisher-side loss is repaired into place, as for VP9;
   - offers with `packetization-mode=0` only, or only unsupported profiles,
     are refused before negotiation.
-- Now: after A1 and PR 3a/3b (#144); transport work waits for that foundation.
+- Now: browser A2 built: mode-1 Constrained Baseline/Constrained High/High
+  negotiation, actual SPS profile/level checks, per-viewer offered PT and
+  receive-limit records, bounded ordered prefix confirmation, ingress bounds,
+  and the existing egress/pause/keyframe-recovery path. Browser send order is
+  H.264, VP9 profile 0, transitional VP8, RTX. Main is explicitly excluded.
+  Unsupported codec/profile/level ends only the affected watch with a clear
+  `screen.stopped {reason: "codec"}` message, including guest links.
+- Limits: receive-level admission is conservative at whole-level granularity;
+  `max-*` extensions are recorded but do not alone authorize a higher SPS
+  level without stream size/fps/reference metadata. A3's layer declarations
+  and native compatibility layers are not implemented here. Neither are AV1
+  (A2b), encrypted H.264/SFrame, native capture/encode/watch, or automatic web
+  VP9 fallback requests to an already-running sharer.
+- Tests: ordered SPS/PPS/IDR, malformed/reordered/interrupted FU prefixes,
+  marker-before-repair, prefix/frame bounds, active-segment latency, mixed
+  H.264/VP9 slots, PLI and late joins over real SRTP. Browser e2e checks
+  encoded/decoded codec `mimeType` through a real debug server, forces a VP9
+  fallback share, and reports an H.264 capability gap when the installed
+  browser has no H.264 encoder.
+- Local browser verification (2026-10-23): Chromium sent H.264 with OpenH264
+  at 1152×720 from a real captured tab through the SFU. Chromium and WebKit
+  viewers decoded it, including a late join with barcode validation. `getStats`
+  confirmed `video/H264` at sender and receiver; the forced `video/VP9` path
+  and incompatible-viewer refusal passed. The 1080p H.264 attempt was explicitly
+  refused for a level-3.1 viewer. Hardware encoding on Windows and higher
+  browser receive-level capability probing remain unverified by this run.
 
 **A2b. AV1 on the screen transports (including Dependency Descriptor)** (M–L)
 - Builds: AV1/RTX and protocol codec negotiation, per-viewer payload types

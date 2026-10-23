@@ -619,6 +619,23 @@ impl Core {
 
     /// SFU notifications belong only to the guest's current, live assignment. Admission
     /// pauses are owned by the core, so delayed SFU resumes cannot overwrite them.
+    pub(super) fn guest_incompatible(&mut self, guest: SessionId, run: u64, grant: &Arc<WatchGrant>) {
+        if !self.guest_current(guest) {
+            return;
+        }
+        let current = self.guests.get(&guest).and_then(|g| g.watch.as_ref()).is_some_and(|w| {
+            w.run == run && grant.alive() && w.slots[0].as_ref().is_some_and(|(_, g)| Arc::ptr_eq(g, grant))
+        });
+        if !current {
+            return;
+        }
+        self.send_guest_event(
+            guest,
+            Event::ScreenStopped { share: grant.share.clone(), reason: ScreenStopReason::Codec, by: None },
+        );
+        self.drop_guest(guest);
+    }
+
     pub(super) fn guest_paused(
         &mut self,
         guest: SessionId,
@@ -1341,6 +1358,7 @@ mod tests {
                     reason: ScreenPauseReason::Bandwidth,
                 },
                 ScreenSignal::Resumed { session: guest, run: GUEST_RUN, grant: old.clone() },
+                ScreenSignal::Incompatible { session: guest, run: GUEST_RUN, grant: old.clone() },
             ] {
                 core.handle(CoreMsg::Screen(signal));
                 assert!(frames.try_recv().is_err(), "a replaced assignment cannot overwrite re-admission status");
@@ -1383,6 +1401,7 @@ mod tests {
                     reason: ScreenPauseReason::Bandwidth,
                 },
                 ScreenSignal::Resumed { session: member, run: GUEST_RUN, grant: old.clone() },
+                ScreenSignal::Incompatible { session: member, run: GUEST_RUN, grant: old.clone() },
             ] {
                 core.handle(CoreMsg::Screen(signal));
                 assert!(frames.try_recv().is_err(), "a replaced assignment cannot overwrite re-watch status");
@@ -1565,5 +1584,44 @@ mod tests {
         })
         .await;
         assert!(opened);
+    }
+
+    #[tokio::test]
+    async fn codec_refusal_ends_only_the_current_watch_for_members_and_guests() {
+        for is_guest in [false, true] {
+            let (core, _notes) = core_with_bridge().await;
+            let token = linked_share(&core, 0).await;
+            let member = session(&core, 2, "bob").await;
+            on_core(&core, move |core| {
+                let (screen, _commands) = mpsc::channel(16);
+                core.screen = screen;
+                let (viewer, mut frames, grant) = if is_guest {
+                    let (guest, frames) = admitted_guest(core, &token, true);
+                    let grant = core.guests[&guest].watch.as_ref().unwrap().slots[0].as_ref().unwrap().1.clone();
+                    (guest, frames, grant)
+                } else {
+                    let (out, mut frames) = mpsc::channel(OUTBOUND_QUEUE);
+                    let s = core.sessions.get_mut(&member).unwrap();
+                    s.out = Some(out);
+                    s.watch = Some(connected_watch(Lease::new()));
+                    core.screen_watch(member, "S").unwrap();
+                    while frames.try_recv().is_ok() {}
+                    let grant = core.sessions[&member].watch.as_ref().unwrap().slots[0].as_ref().unwrap().1.clone();
+                    (member, frames, grant)
+                };
+                core.screen_incompatible(viewer, GUEST_RUN + 1, &grant);
+                assert!(grant.alive() && frames.try_recv().is_err());
+                core.screen_incompatible(viewer, GUEST_RUN, &grant);
+                assert!(!grant.alive());
+                if !is_guest {
+                    assert!(matches!(event(&mut frames), Event::ScreenSlot { share: None, .. }));
+                }
+                assert!(matches!(event(&mut frames), Event::ScreenStopped { reason: ScreenStopReason::Codec, .. }));
+                assert!(core.shares["S"].origin.alive());
+                assert!(!core.shares["S"].viewers.contains(&viewer));
+                assert!(!core.shares["S"].guests.contains(&viewer));
+            })
+            .await;
+        }
     }
 }

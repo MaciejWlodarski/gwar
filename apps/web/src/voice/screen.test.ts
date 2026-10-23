@@ -27,10 +27,10 @@ describe("presets", () => {
 });
 
 describe("negotiation", () => {
-  it("prefers VP9 profile 0, then VP8, then RTX, and drops everything else", () => {
-    const list = [codec("video/H264", "profile-level-id=42e01f"), codec("video/VP8"), codec("video/rtx", "apt=96"), codec("video/VP9", "profile-id=2"),
+  it("prefers H.264 mode 1 Constrained Baseline, then VP9 profile 0, legacy VP8 and RTX", () => {
+    const list = [codec("video/H264", "packetization-mode=0;profile-level-id=42e01f"), codec("video/H264", "packetization-mode=1;profile-level-id=640c1f"), codec("video/H264", "packetization-mode=1;profile-level-id=42e01f"), codec("video/H264", "packetization-mode=1;profile-level-id=4d001f"), codec("video/VP8"), codec("video/rtx", "apt=96"), codec("video/VP9", "profile-id=2"),
       codec("video/VP9", "profile-id=0"), codec("video/AV1"), codec("video/red"), codec("video/ulpfec")];
-    expect(preferredCodecs(list).map(c => `${c.mimeType} ${c.sdpFmtpLine ?? ""}`.trim())).toEqual(["video/VP9 profile-id=0", "video/VP8", "video/rtx apt=96"]);
+    expect(preferredCodecs(list).map(c => `${c.mimeType} ${c.sdpFmtpLine ?? ""}`.trim())).toEqual(["video/H264 packetization-mode=1;profile-level-id=42e01f", "video/H264 packetization-mode=1;profile-level-id=640c1f", "video/VP9 profile-id=0", "video/VP8", "video/rtx apt=96"]);
   });
 
   it("reads the share's SSRC and its RTX from the offer's FID group", () => {
@@ -179,5 +179,32 @@ describe("capture", () => {
     vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
     void captureScreen();
     expect(getDisplayMedia).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe("H.264 sender diagnostics", () => {
+  it("reports codec, encoder and hardware independently while keeping preset parameters", async () => {
+    const track = { applyConstraints: vi.fn(async () => {}), contentHint: "" } as unknown as MediaStreamTrack;
+    const publisher = new ScreenPublisher({ track, preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!;
+    pc.stats.set("codec", { type: "codec", mimeType: "video/H264" });
+    pc.stats.set("out", { type: "outbound-rtp", kind: "video", codecId: "codec", timestamp: 1000, frameHeight: 1080,
+      frameWidth: 1920, framesPerSecond: 60, encoderImplementation: "MediaFoundationVideoEncodeAccelerator", powerEfficientEncoder: true });
+    expect(await publisher.stats()).toMatchObject({ codec: "H264", encoder: "MediaFoundationVideoEncodeAccelerator", hardware: true, height: 1080 });
+    await publisher.setPreset("game");
+    expect(track.contentHint).toBe("motion");
+    expect(pc.sendParams.at(-1)).toMatchObject({ degradationPreference: "maintain-framerate", encodings: [{ maxBitrate: 8_000_000, maxFramerate: 60 }] });
+    publisher.close();
+  });
+
+  it("uses only receiver capabilities for watch offers", async () => {
+    vi.stubGlobal("RTCRtpSender", { getCapabilities: () => ({ codecs: [codec("video/H264", "packetization-mode=1;profile-level-id=42e01f")] }) });
+    const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {} });
+    await transport.start();
+    const prefs = Peer.all[0]!.transceivers[0]!.setCodecPreferences.mock.calls[0]![0] as RTCRtpCodec[];
+    expect(prefs.some(c => c.mimeType === "video/H264")).toBe(false);
+    transport.close();
   });
 });

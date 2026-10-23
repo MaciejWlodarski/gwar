@@ -158,7 +158,7 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "voice.talking": shape({ ...voiceFields, client: int(4294967295), talking: bool }), "voice.slot": shape({ ...transportFields, slot: int(7), client: nullable(int(4294967295)) }),
   "voice.state": shape({ voice: nullable(voiceState) }),
   "screen.started": screenShare,
-  "screen.stopped": shape({ share: shareId, reason: literal<ScreenStopReason>(["stopped", "moderator", "left", "limit", "transport", "budget", "access"]), by: optional(str(256)) }),
+  "screen.stopped": shape({ share: shareId, reason: literal<ScreenStopReason>(["stopped", "moderator", "left", "limit", "transport", "budget", "access", "codec"]), by: optional(str(256)) }),
   "screen.viewers": shape({ share: shareId, members: int(4294967295), guests: int(4294967295) }), "screen.link": shape({ share: shareId, active: bool }),
   "screen.slot": shape({ run: int(Number.MAX_SAFE_INTEGER, 1), slot: int(3), share: nullable(shareId) }),
   "screen.paused": shape({ share: shareId, reason: literal<ScreenPauseReason>(["bandwidth", "budget"]) }), "screen.resumed": shape({ share: shareId }),

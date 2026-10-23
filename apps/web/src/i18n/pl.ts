@@ -440,6 +440,7 @@ export const pl: Record<Key, string> = {
   "screen.stopped.limit": "Twoje udostępnianie zatrzymano: wysyłało więcej, niż pozwala serwer.",
   "screen.stopped.transport": "Nie udało się połączyć udostępniania ekranu.",
   "screen.stopped.budget": "Twoje udostępnianie zatrzymano: serwer nie ma już miejsca na udostępnienia.",
+  "screen.cantDecode": "Twoja przeglądarka nie potrafi odkodować tego udostępnienia. Poproś udostępniającego o użycie zgodnej przeglądarki lub kodeka.",
   "screen.stopped.access": "Twoje udostępnianie zatrzymano: nie możesz już udostępniać na tym kanale.",
   "screen.stopOther": "Zatrzymaj udostępnianie",
   "screen.tsNotice": "Użytkownicy TeamSpeaka na tym kanale mogą oglądać przez link. Oglądać może każdy, kto ma ten link.",

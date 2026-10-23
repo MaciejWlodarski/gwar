@@ -206,7 +206,7 @@ function SenderStats() {
     : undefined;
   return (
     <span data-testid="screen-sender-stats" title={encoder} className="flex items-center gap-1.5 text-xs text-white/85 tabular-nums">
-      {`${stats.height}p · ${stats.fps} fps · ${mbps} Mb/s`}
+      {`${stats.height}p · ${stats.fps} fps · ${mbps} Mb/s${stats.codec ? ` · ${stats.codec}` : ""}`}
       {stats.limitation === "cpu" || stats.limitation === "bandwidth" ? (
         <span className="rounded bg-white/20 px-1.5 leading-5 font-medium text-white">
           {t(stats.limitation === "cpu" ? "screen.limitedCpu" : "screen.limitedBandwidth")}

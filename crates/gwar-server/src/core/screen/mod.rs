@@ -416,6 +416,27 @@ impl Core {
 
     /// The screen SFU paused (`reason`) or resumed (`None`) a viewer's slot: the viewer hears of
     /// it only while the exact assignment is still current and alive on that transport.
+    /// Refuse just this assignment. Delayed failures cannot stop a newer watch of the share.
+    pub(super) fn screen_incompatible(&mut self, session: SessionId, run: u64, grant: &Arc<WatchGrant>) {
+        if self.guests.contains_key(&session) {
+            self.guest_incompatible(session, run, grant);
+            return;
+        }
+        let current = self.sessions.get(&session).and_then(|s| s.watch.as_ref()).is_some_and(|w| {
+            w.run == run && grant.alive() && w.slots.iter().flatten().any(|(_, g)| Arc::ptr_eq(g, grant))
+        });
+        if !current {
+            return;
+        }
+        let id = &grant.share;
+        self.free_slot(session, id, true);
+        if let Some(share) = self.shares.get_mut(id) {
+            share.viewers.remove(&session);
+        }
+        self.send_event(session, Event::ScreenStopped { share: id.clone(), reason: ScreenStopReason::Codec, by: None });
+        self.send_viewers(id);
+    }
+
     pub(super) fn screen_paused(
         &mut self,
         session: SessionId,

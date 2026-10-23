@@ -11,9 +11,9 @@ import type { TransportState, WatchParams } from "../voice/screen";
 export type WatchStatus =
   | "connecting" | "watching" | "slow" | "paused"
   /** Final: nothing more happens on this page. */
-  | "ended" | "off" | "invalid" | "busy" | "lost" | "unsupported";
+  | "ended" | "off" | "invalid" | "busy" | "lost" | "unsupported" | "codec";
 
-const FINAL: ReadonlySet<WatchStatus> = new Set(["ended", "off", "invalid", "busy", "lost", "unsupported"]);
+const FINAL: ReadonlySet<WatchStatus> = new Set(["ended", "off", "invalid", "busy", "lost", "unsupported", "codec"]);
 
 /** The guest's ping interval, as `net/connection.ts` pings members. */
 export const PING_INTERVAL_MS = 20_000;
@@ -151,7 +151,7 @@ export class WatchSession {
     }
     if (typeof frame.ev !== "string" || !isRecord(frame.d) || frame.d.share !== this.share) return;
     switch (frame.ev) {
-      case "screen.stopped": return this.finish("ended");
+      case "screen.stopped": return this.finish(frame.d.reason === "codec" ? "codec" : "ended");
       case "screen.link": if (frame.d.active === false) this.finish("off"); return;
       // From the server's budget (PR 3b): a paused guest keeps its page and waits.
       case "screen.paused": return this.set(frame.d.reason === "budget" ? "paused" : "slow");
