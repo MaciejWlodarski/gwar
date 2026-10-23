@@ -6,8 +6,8 @@ import { consumeInviteFromLocation } from "./state/invite-boot";
 import { captureLogs } from "./lib/diagnostics";
 import { isDesktop, tauri } from "./platform";
 import { storedDataProblem } from "./lib/stored-data-check";
-import { localStorageError, localStorageUsable, prepareLocalStorage, watchLocalStorage } from "./lib/local-storage";
-import { useSettings } from "./state/settings";
+import { localStorageError, watchLocalStorage } from "./lib/local-storage";
+import { localState } from "./lib/local-state";
 import { StoredDataError } from "./ui/StoredDataError";
 
 // Recent warnings and errors, kept in memory for a bug report.
@@ -15,11 +15,8 @@ captureLogs();
 
 if (import.meta.env.MODE === "e2e") await import("./e2e");
 
-// localStorage before anything uses it: an upgrade runs in one tab at a time, and settings that
-// could not be read when their module loaded (an upgrade pending) are read once it is done.
-const settingsRead = localStorageUsable();
-await prepareLocalStorage();
-if (!settingsRead && localStorageUsable()) await useSettings.persist.rehydrate();
+// The device's security state (pins, channel records), read before anything renders.
+await localState.load();
 
 consumeInviteFromLocation();
 
@@ -28,7 +25,7 @@ consumeInviteFromLocation();
 const captureCheck = __CAPTURE_CHECK__ && isDesktop() && (await (await tauri()).invoke<boolean>("debug_capture_check").catch(() => false));
 const { CaptureCheck } = __CAPTURE_CHECK__ && captureCheck ? await import("./platform/capture-check") : { CaptureCheck: null };
 
-// Data saved by a newer version (or localStorage that could not be migrated) stops the app before
+// Data saved by a newer version (or a security state that cannot be read) stops the app before
 // anything reads or changes it; so does another tab of a newer version upgrading it later.
 const problem = await storedDataProblem();
 if (problem !== undefined) console.error("Saved data unusable:", problem);
@@ -44,5 +41,11 @@ if (problem === undefined) {
   watchLocalStorage(() => {
     console.error("Saved data changed by a newer version:", localStorageError());
     render(localStorageError());
+  });
+  // A newer version's tab upgraded the security state, or it went away: nothing more is trusted.
+  localState.subscribe((key) => {
+    if (key !== null || localState.error() === undefined) return;
+    console.error("Security state unusable:", localState.error());
+    render(localState.error());
   });
 }

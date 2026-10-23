@@ -1,5 +1,5 @@
 import { CONNECT_URL } from "../lib/official";
-import { appKeyOf, appStorage } from "../lib/local-storage";
+import { localState } from "../lib/local-state";
 
 /**
  * Handle continuity: the account (uid) this client first saw behind each verified Connect handle. Connect may
@@ -7,27 +7,25 @@ import { appKeyOf, appStorage } from "../lib/local-storage";
  * handle that turns up on a different account is shown as changed instead of verified, until the user accepts it.
  * Pins are scoped to the configured Connect service, not to its signing key, so a key change does not reset them.
  *
- * Each handle is its own localStorage entry, written once when first seen and again only when the user accepts
- * another account, so a change to one handle never rewrites another. Changes run under a Web Lock shared by all
- * tabs (where the browser has Web Locks) and decide on a fresh read of the entry. There is no size limit: an
- * entry is ~100 bytes, and a full storage only means new pins live in memory.
+ * Each handle is its own entry in the device's security state (lib/local-state.ts), written once when first seen
+ * and again only when the user accepts another account, each time in one transaction that decides on what is
+ * stored. A handle is shown verified only against a stored pin: while that state cannot be read or written,
+ * nothing is pinned and every handle stays pending.
  */
 export type HandleStatus = "verified" | "changed";
 
 const PREFIX = `gwar.connect.handle-pin:${CONNECT_URL}:`;
-const LOCK = `gwar.connect.handle-pins:${CONNECT_URL}`;
 
-/** Pinned uid per handle as last read (`null`: none stored). */
-const cache = new Map<string, string | null>();
-/** Pins storage refused, for this page. An accepted account outranks storage; a first sighting does not. */
-const unsaved = new Map<string, { uid: string; accepted: boolean }>();
 let version = 0;
 const listeners = new Set<() => void>();
 
+function notify() {
+  version++;
+  for (const listener of listeners) listener();
+}
+
 /** The stored uid (`null`: none, or corrupt, which only code on this origin can write); undefined if unreadable. */
-function readStored(handle: string): string | null | undefined {
-  let raw: string | null;
-  try { raw = appStorage.getItem(PREFIX + handle); } catch { return undefined; }
+function uidOf(raw: string | undefined): string | null {
   try {
     const uid = (JSON.parse(raw ?? "null") as { uid?: unknown } | null)?.uid;
     return typeof uid === "string" ? uid : null;
@@ -36,72 +34,31 @@ function readStored(handle: string): string | null | undefined {
   }
 }
 
-/** Reads storage into the cache and returns what it read; an unreadable storage keeps what is known. */
-function refresh(handle: string): string | null | undefined {
-  const stored = readStored(handle);
-  if (stored === undefined) return undefined;
-  cache.set(handle, stored);
-  if (stored && !unsaved.get(handle)?.accepted) unsaved.delete(handle); // a stored pin replaces an unsaved first sighting
-  return stored;
-}
-
 function pinOf(handle: string): string | null {
-  const mine = unsaved.get(handle);
-  if (mine?.accepted) return mine.uid;
-  // Read once while rendering; a failed read counts as unknown, and a later rememberHandle reads again and notifies.
-  if (!cache.has(handle)) cache.set(handle, readStored(handle) ?? null);
-  return cache.get(handle) ?? mine?.uid ?? null;
+  try { return uidOf(localState.get(PREFIX + handle)); } catch { return null; }
 }
 
-function notify() {
-  version++;
-  for (const listener of listeners) listener();
-}
-
-function write(handle: string, uid: string, accepted: boolean): boolean {
-  try {
-    appStorage.setItem(PREFIX + handle, JSON.stringify({ uid }));
-  } catch {
-    unsaved.set(handle, { uid, accepted });
-    return false;
-  }
-  unsaved.delete(handle);
-  cache.set(handle, uid);
-  return true;
-}
-
-async function locked<T>(run: () => T): Promise<T> {
-  const locks = typeof navigator !== "undefined" ? navigator.locks : undefined;
-  return locks ? await locks.request(LOCK, run) : run();
-}
-
-/** Read-only, safe while rendering. "pending": not pinned yet, so not shown until {@link rememberHandle} decides. */
+/** Read-only, safe while rendering. "pending": not pinned (yet), so not shown until {@link rememberHandle} decides. */
 export function handleStatus(handle: string, uid: string): HandleStatus | "pending" {
   const pin = pinOf(handle);
   return !pin ? "pending" : pin === uid ? "verified" : "changed";
 }
 
-/** Pins a handle seen for the first time; a handle already pinned (here, in storage or by another tab) stays. */
-export function rememberHandle(handle: string, uid: string): Promise<void> {
-  return locked(() => {
-    const before = pinOf(handle);
-    const mine = unsaved.get(handle);
-    const stored = refresh(handle);
-    // Stored here or by another tab: that pin stays. Nothing stored: this tab's first sighting (maybe one storage
-    // refused before) is stored now. Unreadable storage: remember it in memory, never write over what can't be seen.
-    if (stored === null && !mine?.accepted) write(handle, mine?.uid ?? uid, false);
-    else if (stored === undefined && !before) unsaved.set(handle, { uid, accepted: false });
-    if (pinOf(handle) !== before) notify();
-  });
+/** Pins a handle seen for the first time; a handle already pinned (here or by another tab) stays. */
+export async function rememberHandle(handle: string, uid: string): Promise<void> {
+  try {
+    await localState.update(PREFIX + handle, (stored) => (uidOf(stored) ? undefined : JSON.stringify({ uid })));
+  } catch { /* unreadable or full: nothing pinned, the handle stays pending */ }
 }
 
-/** The user accepted that the handle now belongs to `uid`. False if it could not be stored (it holds until reload). */
-export function acceptHandle(handle: string, uid: string): Promise<boolean> {
-  return locked(() => {
-    const saved = write(handle, uid, true);
-    notify();
-    return saved;
-  });
+/** The user accepted that the handle now belongs to `uid`. False if it could not be stored (then nothing changes). */
+export async function acceptHandle(handle: string, uid: string): Promise<boolean> {
+  try {
+    await localState.update(PREFIX + handle, () => JSON.stringify({ uid }));
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export function subscribeHandlePins(listener: () => void): () => void {
@@ -113,25 +70,10 @@ export function handlePinsVersion(): number {
   return version;
 }
 
-/**
- * A `storage` event: another tab pinned or accepted a handle, or cleared storage. Events carry the
- * stored name, which is this version's (lib/local-storage.ts), not the plain one. Unreadable storage
- * keeps what this tab knows.
- */
-export function handlePinStored(key: string | null): void {
-  if (key === null) for (const handle of cache.keys()) refresh(handle);
-  else {
-    const name = appKeyOf(key);
-    if (!name?.startsWith(PREFIX)) return;
-    refresh(name.slice(PREFIX.length));
-  }
-  notify();
-}
-if (typeof window !== "undefined") window.addEventListener("storage", (e) => handlePinStored(e.key));
+// Pinned or accepted here or in another tab, or the state became unusable.
+localState.subscribe((key) => { if (key === null || key.startsWith(PREFIX)) notify(); });
 
 /** Tests only. */
 export function resetHandlePins() {
-  cache.clear();
-  unsaved.clear();
   version++;
 }

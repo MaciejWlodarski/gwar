@@ -110,9 +110,13 @@ The server's Ed25519 seed is generated once, persisted atomically as
 `server-key.ed25519` in its data directory (0600 on Unix), and never logged.
 `gwar-server --data-dir <dir> server-key` prints the public key. Back up the seed
 with the database; losing it changes the authenticated server epoch.
-The web/desktop client keeps `{server_pk, first_seen}` in localStorage under
-`gwar.server-pin:<canonical endpoint>`. TOFU without a pin or trusted invite
-identifies a first-contact candidate; proof verification precedes pinning.
+The web/desktop client keeps `{server_pk, first_seen}` in the `gwar-local`
+IndexedDB database under `gwar.server-pin:<canonical endpoint>`
+([data-migrations.md](data-migrations.md)). TOFU without a pin or trusted invite
+identifies a first-contact candidate; proof verification precedes pinning, and
+the pin commits in one transaction before the connection is used. Pins that
+cannot be read (no IndexedDB, a newer version's database) trust no key: the
+connection fails with a storage error.
 Invite links include `server_key=<full public key>`, which must match the
 challenge. A pin mismatch is a blocking English/Polish dialog with both keys
 and an explicit dangerous forget-and-trust action. An invite mismatch blocks

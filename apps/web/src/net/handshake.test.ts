@@ -1,3 +1,4 @@
+import "fake-indexeddb/auto";
 import vectors from "../../../../crates/gwar-proto/tests/handshake-v4.json";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { encodeBase64Url } from "./base64url";
@@ -172,19 +173,36 @@ describe("gwar/4 transport", () => {
 });
 
 describe("persistent pins and canonical fields", () => {
-  it("persists canonical endpoint, key and first-seen time and requires an explicit forget", () => {
-    const values = new Map<string, string>();
-    vi.stubGlobal("localStorage", { getItem: (k: string) => values.get(k) ?? null, setItem: (k: string, v: string) => values.set(k, v), removeItem: (k: string) => values.delete(k) });
+  it("persists canonical endpoint, key and first-seen time and requires an explicit forget", async () => {
+    const { localState } = await import("../lib/local-state");
+    await localState.load();
+    await serverPins.commit("wss://SERVER.example.:443/ws", testServerIdentity.publicKey);
+    const pin = serverPins.load("wss://server.example/ws")!;
+    expect(pin.server_pk).toBe(testServerIdentity.publicKey); expect(pin.first_seen).toBeGreaterThan(0);
+    await serverPins.commit("wss://server.example/ws", testServerIdentity.publicKey);
+    expect(serverPins.load("wss://server.example/ws")).toEqual(pin);
+    expect(() => checkCandidate("wss://server.example/ws", fakeIdentity.publicKey, serverPins)).toThrow(ServerIdentityChanged);
+    await expect(serverPins.commit("wss://server.example/ws", fakeIdentity.publicKey)).rejects.toBeInstanceOf(ServerIdentityChanged);
+    await serverPins.forget("wss://server.example/ws", fakeIdentity.publicKey); expect(serverPins.load("wss://server.example/ws")).toEqual(pin);
+    await serverPins.forget("wss://server.example/ws", testServerIdentity.publicKey); expect(serverPins.load("wss://server.example/ws")).toBeUndefined();
+  });
+  it("trusts no key while the pins cannot be read: nothing pinned or signed, and a storage error", async () => {
+    vi.resetModules();
+    vi.stubGlobal("indexedDB", undefined);
     try {
-      serverPins.commit("wss://SERVER.example.:443/ws", testServerIdentity.publicKey);
-      const pin = serverPins.load("wss://server.example/ws")!;
-      expect(pin.server_pk).toBe(testServerIdentity.publicKey); expect(pin.first_seen).toBeGreaterThan(0);
-      serverPins.commit("wss://server.example/ws", testServerIdentity.publicKey);
-      expect(serverPins.load("wss://server.example/ws")).toEqual(pin);
-      expect(() => checkCandidate("wss://server.example/ws", fakeIdentity.publicKey, serverPins)).toThrow(ServerIdentityChanged);
-      serverPins.forget("wss://server.example/ws", fakeIdentity.publicKey); expect(serverPins.load("wss://server.example/ws")).toEqual(pin);
-      serverPins.forget("wss://server.example/ws", testServerIdentity.publicKey); expect(serverPins.load("wss://server.example/ws")).toBeUndefined();
-    } finally { vi.unstubAllGlobals(); }
+      const { localState } = await import("../lib/local-state");
+      await localState.load();
+      const { serverPins: pins } = await import("./server-pins");
+      expect(() => pins.load("wss://server.example/ws")).toThrow(/no new key is trusted/);
+      await expect(pins.commit("wss://server.example/ws", testServerIdentity.publicKey)).rejects.toMatchObject({ name: "LocalStateUnavailableError" });
+      const { Connection: Isolated } = await import("./connection");
+      const sign = vi.fn(fakeIdentity.sign);
+      const conn = new Isolated({ url: "wss://server.example/ws", identity: { ...fakeIdentity, sign }, nickname: "test",
+        client: { name: "test", version: "0", platform: "web" }, createSocket: (url) => new FakeSocket(url), pinStore: pins });
+      const result = conn.connect(); const socket = FakeSocket.last(); socket.open(); socket.push(challenge());
+      await expect(result).rejects.toMatchObject({ kind: "trust_storage" });
+      expect(sign).not.toHaveBeenCalled(); expect(socket.sent).toHaveLength(0);
+    } finally { vi.unstubAllGlobals(); vi.resetModules(); }
   });
   it.each(["A".repeat(43) + "=", "A".repeat(42) + "B", "bad\nkey", "AA"])("rejects noncanonical encodings: %s", (value) => expect(() => decodeFixed(value, 32)).toThrow());
   it("has exact statement bytes with no trailing newline", () => {

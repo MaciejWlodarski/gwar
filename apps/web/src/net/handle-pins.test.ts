@@ -1,208 +1,114 @@
 // @vitest-environment happy-dom
+import "fake-indexeddb/auto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { CONNECT_URL } from "../lib/official";
-import { acceptHandle, handleStatus, rememberHandle, resetHandlePins } from "./handle-pins";
 
 const PREFIX = `gwar.connect.handle-pin:${CONNECT_URL}:`;
+type Pins = typeof import("./handle-pins");
+type State = typeof import("../lib/local-state");
 
-/** localStorage whose reads or writes can be made to fail (happy-dom's cannot be spied on cleanly). */
-class FlakyStorage {
-  items = new Map<string, string>();
-  failReads = false;
-  failWrites = false;
-  get length() { return this.items.size; }
-  key(i: number) { return [...this.items.keys()][i] ?? null; }
-  getItem(key: string) { if (this.failReads) throw new Error("denied"); return this.items.get(key) ?? null; }
-  setItem(key: string, value: string) { if (this.failWrites) throw new Error("quota"); this.items.set(key, String(value)); }
-  removeItem(key: string) { this.items.delete(key); }
-  clear() { this.items.clear(); }
+let pins: Pins, state: State;
+const others: { close(): void }[] = [];
+/** Another tab: its own view of the same database. */
+async function otherTab() {
+  const tab = state.createLocalState();
+  others.push(tab);
+  await tab.load();
+  return tab;
 }
-let storage: FlakyStorage;
-const stored = (handle: string) => JSON.parse(localStorage.getItem(PREFIX + handle) ?? "null")?.uid ?? null;
-/** Another tab writing storage behind this tab's back (its storage event not delivered yet). */
-const otherTab = (handle: string, uid: string) => localStorage.setItem(PREFIX + handle, JSON.stringify({ uid }));
-const storageEvent = (key: string | null) => window.dispatchEvent(new StorageEvent("storage", { key }));
-const denyReads = () => { storage.failReads = true; };
-const denyWrites = () => { storage.failWrites = true; };
-const allow = () => { storage.failReads = false; storage.failWrites = false; };
+const stored = (handle: string) => JSON.parse(state.localState.get(PREFIX + handle) ?? "null")?.uid ?? null;
+const deleted = () => new Promise<void>((resolve, reject) => { const r = indexedDB.deleteDatabase("gwar-local"); r.onsuccess = () => resolve(); r.onerror = () => reject(r.error); });
 
 describe("handle continuity", () => {
-  beforeEach(() => { storage = new FlakyStorage(); vi.stubGlobal("localStorage", storage); resetHandlePins(); });
-  afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); });
+  beforeEach(async () => {
+    vi.resetModules();
+    state = await import("../lib/local-state");
+    await state.localState.load();
+    pins = await import("./handle-pins");
+  });
+  afterEach(async () => {
+    for (const tab of others.splice(0)) tab.close();
+    state.localState.close();
+    await deleted();
+  });
 
   it("pins the first account seen behind a handle", async () => {
-    expect(handleStatus("alice", "A")).toBe("pending");
-    await rememberHandle("alice", "A");
-    expect(handleStatus("alice", "A")).toBe("verified");
-    expect(handleStatus("alice", "B")).toBe("changed");
+    expect(pins.handleStatus("alice", "A")).toBe("pending");
+    await pins.rememberHandle("alice", "A");
+    expect(pins.handleStatus("alice", "A")).toBe("verified");
+    expect(pins.handleStatus("alice", "B")).toBe("changed");
   });
 
   it("never lets a later sighting replace the pin", async () => {
-    await rememberHandle("alice", "A");
-    await rememberHandle("alice", "B");
+    await pins.rememberHandle("alice", "A");
+    await pins.rememberHandle("alice", "B");
     expect(stored("alice")).toBe("A");
-    expect(handleStatus("alice", "B")).toBe("changed");
+    expect(pins.handleStatus("alice", "B")).toBe("changed");
   });
 
   it("moves the pin only when the user accepts the new account", async () => {
-    await rememberHandle("alice", "A");
-    expect(await acceptHandle("alice", "B")).toBe(true);
-    expect(handleStatus("alice", "B")).toBe("verified");
-    expect(handleStatus("alice", "A")).toBe("changed");
+    await pins.rememberHandle("alice", "A");
+    expect(await pins.acceptHandle("alice", "B")).toBe(true);
+    expect(pins.handleStatus("alice", "B")).toBe("verified");
+    expect(pins.handleStatus("alice", "A")).toBe("changed");
   });
 
-  it("survives a reload", async () => {
-    await rememberHandle("alice", "A");
-    resetHandlePins();
-    expect(handleStatus("alice", "B")).toBe("changed");
-  });
-
-  it("treats a corrupt entry as unpinned", () => {
-    localStorage.setItem(PREFIX + "alice", "{nope");
-    localStorage.setItem(PREFIX + "bob", JSON.stringify({ uid: 5 }));
-    otherTab("carol", "A");
-    expect(handleStatus("alice", "B")).toBe("pending");
-    expect(handleStatus("bob", "B")).toBe("pending");
-    expect(handleStatus("carol", "B")).toBe("changed");
-  });
-
-  it("writes a handle once: sightings after the first leave storage alone", async () => {
-    await rememberHandle("alice", "A");
-    const set = vi.spyOn(storage, "setItem");
-    await rememberHandle("alice", "A");
-    await rememberHandle("alice", "B");
-    expect(set).not.toHaveBeenCalled();
-  });
-
-  it("a change to one handle never rewrites another tab's pin", async () => {
-    expect(handleStatus("alice", "A")).toBe("pending"); // this tab has read alice as unpinned
-    otherTab("alice", "A");
-    await rememberHandle("bob", "B");
-    expect(stored("alice")).toBe("A");
+  it("treats a corrupt entry as unpinned, and pins over it", async () => {
+    await state.localState.update(PREFIX + "alice", () => "{nope");
+    await state.localState.update(PREFIX + "bob", () => JSON.stringify({ uid: 5 }));
+    expect(pins.handleStatus("alice", "B")).toBe("pending");
+    expect(pins.handleStatus("bob", "B")).toBe("pending");
+    await pins.rememberHandle("alice", "B");
+    expect(pins.handleStatus("alice", "B")).toBe("verified");
   });
 
   it("a first sighting yields to a pin another tab stored meanwhile", async () => {
-    expect(handleStatus("alice", "B")).toBe("pending");
-    otherTab("alice", "A");
-    await rememberHandle("alice", "B");
+    expect(pins.handleStatus("alice", "B")).toBe("pending");
+    await (await otherTab()).update(PREFIX + "alice", () => JSON.stringify({ uid: "A" }));
+    // This tab may not have heard of it yet; the transaction decides on what is stored.
+    await pins.rememberHandle("alice", "B");
     expect(stored("alice")).toBe("A");
-    expect(handleStatus("alice", "B")).toBe("changed");
+    expect(pins.handleStatus("alice", "B")).toBe("changed");
   });
 
-  it("follows another tab's acceptance through storage events", async () => {
-    await rememberHandle("alice", "A");
-    otherTab("alice", "B");
-    storageEvent(PREFIX + "alice");
-    expect(handleStatus("alice", "B")).toBe("verified");
-    await rememberHandle("alice", "A");
-    expect(stored("alice")).toBe("B");
+  it("follows another tab's acceptance, and so does every page loaded after it", async () => {
+    await pins.rememberHandle("alice", "A");
+    const changes = vi.fn();
+    pins.subscribeHandlePins(changes);
+    const tab = await otherTab();
+    await tab.update(PREFIX + "alice", () => JSON.stringify({ uid: "B" }));
+    await vi.waitFor(() => expect(pins.handleStatus("alice", "B")).toBe("verified"));
+    expect(pins.handleStatus("alice", "A")).toBe("changed");
+    expect(changes).toHaveBeenCalled();
+    // A reload reads what was committed.
+    const reloaded = await otherTab();
+    expect(JSON.parse(reloaded.get(PREFIX + "alice")!).uid).toBe("B");
   });
 
-  it("pins again after another tab cleared storage", async () => {
-    await rememberHandle("alice", "A");
-    localStorage.clear();
-    storageEvent(null);
-    expect(handleStatus("alice", "A")).toBe("pending");
-    await rememberHandle("alice", "A");
-    expect(stored("alice")).toBe("A");
+  it("two tabs accepting different accounts end on the one committed last, everywhere", async () => {
+    await pins.rememberHandle("alice", "A");
+    const tab = await otherTab();
+    // Transactions on one store run in the order they were made: this tab's, then the other's.
+    await Promise.all([pins.acceptHandle("alice", "B"), tab.update(PREFIX + "alice", () => JSON.stringify({ uid: "C" }))]);
+    const last = "C";
+    await vi.waitFor(() => expect(stored("alice")).toBe(last));
+    await vi.waitFor(() => expect(JSON.parse(tab.get(PREFIX + "alice")!).uid).toBe(last));
+    expect(JSON.parse((await otherTab()).get(PREFIX + "alice")!).uid).toBe(last);
   });
 
-  it("an acceptance storage refused holds for the page, over storage and events", async () => {
-    await rememberHandle("alice", "A");
-    denyWrites();
-    expect(await acceptHandle("alice", "B")).toBe(false);
-    storageEvent(PREFIX + "alice");
-    await rememberHandle("alice", "A");
-    expect(handleStatus("alice", "B")).toBe("verified");
-  });
-
-  it("a first sighting storage refused yields to another tab's pin and is stored once storage works", async () => {
-    denyWrites();
-    await rememberHandle("alice", "A");
-    expect(handleStatus("alice", "A")).toBe("verified");
-    allow();
-    await rememberHandle("alice", "A");
-    expect(stored("alice")).toBe("A");
-
-    denyWrites();
-    await rememberHandle("bob", "A");
-    allow();
-    otherTab("bob", "B");
-    await rememberHandle("bob", "A");
-    expect(handleStatus("bob", "B")).toBe("verified");
-  });
-
-  it("unreadable storage keeps what this tab knows, also through storage events", async () => {
-    await rememberHandle("alice", "A");
-    denyReads(); denyWrites();
-    storageEvent(PREFIX + "alice");
-    storageEvent(null);
-    expect(handleStatus("alice", "B")).toBe("changed");
-    await rememberHandle("bob", "B");
-    expect(handleStatus("bob", "B")).toBe("verified");
-  });
-
-  it("after reads recover, a stored pin takes over without two accounts verified", async () => {
-    otherTab("alice", "B");
-    denyReads(); denyWrites();
-    await rememberHandle("alice", "A");
-    expect(handleStatus("alice", "A")).toBe("verified");
-    allow();
-    expect(handleStatus("alice", "B")).toBe("changed");
-    await rememberHandle("alice", "B");
-    expect(handleStatus("alice", "B")).toBe("verified");
-    expect(handleStatus("alice", "A")).toBe("changed");
-  });
-
-  it("an unsaved first sighting does not come back after the stored pin is cleared", async () => {
-    denyWrites();
-    await rememberHandle("alice", "A");
-    allow();
-    otherTab("alice", "B");
-    await rememberHandle("alice", "A");
-    storage.clear();
-    storageEvent(null);
-    expect(handleStatus("alice", "A")).toBe("pending");
-  });
-
-  it("an unsaved first sighting does not come back after another tab's pin arrived by storage event", async () => {
-    denyWrites();
-    await rememberHandle("alice", "A");
-    allow();
-    otherTab("alice", "B");
-    storageEvent(PREFIX + "alice");
-    expect(handleStatus("alice", "B")).toBe("verified");
-    storage.clear();
-    storageEvent(null);
-    expect(handleStatus("alice", "A")).toBe("pending");
-  });
-
-  it("serializes changes through Web Locks when the browser has them", async () => {
-    const names: string[] = [];
-    vi.stubGlobal("navigator", { locks: { request: async (name: string, run: () => unknown) => { names.push(name); return run(); } } });
-    await rememberHandle("alice", "A");
-    await acceptHandle("alice", "B");
-    expect(names).toEqual([`gwar.connect.handle-pins:${CONNECT_URL}`, `gwar.connect.handle-pins:${CONNECT_URL}`]);
-  });
-
-  it("hears another tab's acceptance under the names of a later localStorage version", async () => {
-    // localStorage at version 2: the pins live under that version's names (lib/local-storage.ts).
-    const namespace = "0123456789abcdef";
-    storage.setItem("gwar.storage-version", `2.${namespace}`);
-    storage.setItem(`gwar.v2.${namespace}.storage-complete`, "1");
-    const stored = (handle: string) => `gwar.v2.${namespace}.${PREFIX.slice("gwar.".length)}${handle}`;
-    vi.resetModules();
-    vi.doMock("../lib/local-storage-migrations", () => ({ LOCAL_STORAGE_MIGRATIONS: [() => {}] }));
-    try {
-      const pins = await import("./handle-pins");
-      await pins.rememberHandle("alice", "A");
-      expect(JSON.parse(storage.getItem(stored("alice"))!).uid).toBe("A");
-      expect(pins.handleStatus("alice", "A")).toBe("verified");
-      // Another tab's user accepts account B for the handle.
-      storage.setItem(stored("alice"), JSON.stringify({ uid: "B" }));
-      storageEvent(stored("alice"));
-      expect(pins.handleStatus("alice", "A")).toBe("changed");
-      expect(pins.handleStatus("alice", "B")).toBe("verified");
-    } finally { vi.doUnmock("../lib/local-storage-migrations"); vi.resetModules(); }
+  it("while the security state cannot be used, nothing is pinned or shown as verified", async () => {
+    await pins.rememberHandle("alice", "A");
+    // A newer version's tab upgrades the database: this page lets go of it.
+    await new Promise<void>((resolve, reject) => {
+      const r = indexedDB.open("gwar-local", 2);
+      r.onsuccess = () => { r.result.close(); resolve(); };
+      r.onerror = () => reject(r.error);
+    });
+    expect(state.localState.error()).toMatchObject({ name: "NewerDataError" });
+    expect(pins.handleStatus("alice", "A")).toBe("pending");
+    await pins.rememberHandle("bob", "B");
+    expect(pins.handleStatus("bob", "B")).toBe("pending");
+    expect(await pins.acceptHandle("alice", "B")).toBe(false);
+    expect(pins.handleStatus("alice", "B")).toBe("pending");
   });
 });

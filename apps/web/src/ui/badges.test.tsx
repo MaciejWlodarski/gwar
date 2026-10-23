@@ -1,7 +1,10 @@
 // @vitest-environment happy-dom
+import "fake-indexeddb/auto";
 import { act, useLayoutEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import { CONNECT_URL } from "../lib/official";
+import { createLocalState, localState } from "../lib/local-state";
 import { acceptHandle, resetHandlePins } from "../net/handle-pins";
 import { useSettings } from "../state/settings";
 import { ConnectBadge } from "./badges";
@@ -12,16 +15,23 @@ const member = { uid: "uid" };
 
 describe("Connect badge", () => {
   let container: HTMLDivElement, root: Root;
-  beforeEach(() => {
+  const pin = `gwar.connect.handle-pin:${CONNECT_URL}:mallory`;
+  beforeAll(() => localState.load());
+  beforeEach(async () => {
     vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
     useSettings.setState({ language: "en" });
-    localStorage.clear(); resetHandlePins();
+    await localState.update(pin, () => null); resetHandlePins();
     container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   });
   afterEach(async () => {
     await act(async () => root.unmount()); container.remove(); vi.unstubAllGlobals();
   });
-  const show = (name?: string) => act(async () => root.render(<ConnectBadge member={member} name={name} />));
+  /** Renders, and lets the first sighting's pin commit (an IndexedDB transaction) and reach the view. */
+  const rendered = async (node: React.ReactNode) => {
+    await act(async () => root.render(node));
+    await act(async () => { await vi.waitFor(() => expect(localState.get(pin)).toBeDefined()); });
+  };
+  const show = (name?: string) => rendered(<ConnectBadge member={member} name={name} />);
 
   it("never vouches for a nickname that is not the handle", async () => {
     await show("Alice");
@@ -55,7 +65,7 @@ describe("Connect badge", () => {
   });
   it("pins the first account it verifies", async () => {
     await show("Alice");
-    await act(async () => root.render(<ConnectBadge member={{ uid: "other" }} name="Alice" />));
+    await rendered(<ConnectBadge member={{ uid: "other" }} name="Alice" />);
     expect(container.querySelector('[data-testid="connect-badge-changed"]')).not.toBeNull();
   });
   it("never shows two accounts as verified for the same new handle, not even for one commit", async () => {
@@ -65,15 +75,19 @@ describe("Connect badge", () => {
       useLayoutEffect(() => { commits.push(`${uid}:${connect?.status ?? "none"}`); });
       return null;
     }
-    await act(async () => root.render(<><Probe uid="A" /><Probe uid="B" /></>));
+    await rendered(<><Probe uid="A" /><Probe uid="B" /></>);
     expect(commits).not.toContain("B:verified");
     expect(commits.slice(-2)).toEqual(["A:verified", "B:changed"]);
   });
   it("shows the handle again after another tab cleared the pins", async () => {
     await show("Alice");
     expect(container.querySelector('[data-testid="connect-badge"]')).not.toBeNull();
-    localStorage.clear();
-    await act(async () => { window.dispatchEvent(new StorageEvent("storage", { key: null })); });
+    const other = createLocalState();
+    await other.load();
+    await other.update(pin, () => null);
+    // This tab hears of it, finds the handle unpinned and pins it again.
+    await act(async () => { await vi.waitFor(() => expect(other.get(pin)).toBeDefined()); });
+    other.close();
     expect(container.querySelector('[data-testid="connect-badge"]')).not.toBeNull();
   });
 });

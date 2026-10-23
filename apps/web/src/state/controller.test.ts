@@ -1179,10 +1179,16 @@ describe("channel id reuse", () => {
     const failing = mode !== "stored";
     const store = new Map<string, string>();
     let full = false;
-    vi.stubGlobal("localStorage", { getItem: (k: string) => store.get(k) ?? null, setItem: (k: string, v: string) => {
-      if (full && (mode === "churn" || !v.includes("\"incomplete\":true"))) throw new DOMException("quota", "QuotaExceededError");
-      store.set(k, v);
-    } });
+    // The device's security state (lib/local-state.ts), as a map whose writes can be refused.
+    const { localState } = await import("../lib/local-state");
+    const get = vi.spyOn(localState, "get").mockImplementation((k) => store.get(k));
+    const update = vi.spyOn(localState, "update").mockImplementation(async (k, change) => {
+      const next = change(store.get(k));
+      if (next === undefined) return store.get(k);
+      if (full && (mode === "churn" || !(next ?? "").includes("\"incomplete\":true"))) throw new DOMException("quota", "QuotaExceededError");
+      if (next === null) store.delete(k); else store.set(k, next);
+      return next ?? undefined;
+    });
     try {
       connectFake();
       const { keyFromSeed, signText } = await import("../connect/crypto");
@@ -1214,7 +1220,7 @@ describe("channel id reuse", () => {
       // Under churn every other server's record is unsaved too: past the bound the whole session is uncertain.
       expect(result).toMatchObject({ status: "verified", authorization: [mode === "churn" ? "channel-history-incomplete" : "channel-reused"] });
       expect(fullyVerified(result)).toBe(false);
-    } finally { vi.unstubAllGlobals(); }
+    } finally { vi.unstubAllGlobals(); get.mockRestore(); update.mockRestore(); }
   });
 });
 

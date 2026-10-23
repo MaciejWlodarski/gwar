@@ -557,8 +557,11 @@ class Controller {
       danger: true, serverIdentity: true,
       onConfirm: () => {
         if (change.source === "invite") return;
-        serverPins.forget(change.endpoint, change.expected);
-        void this.connectInteractive({ ...params, inviteServerKey: params.inviteServerKey ?? change.candidate }, opts);
+        // Connect again only once the old pin is gone for good.
+        void serverPins.forget(change.endpoint, change.expected).then(
+          () => this.connectInteractive({ ...params, inviteServerKey: params.inviteServerKey ?? change.candidate }, opts),
+          () => useUi.getState().toast("error", tNow("err.connect.trust_storage")),
+        );
       },
     });
   }

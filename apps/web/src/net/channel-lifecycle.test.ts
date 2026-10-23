@@ -4,21 +4,32 @@ import type { MessageVerification } from "./message-signature";
 
 const memory = () => {
   const m = new Map<string, string>();
-  // full: only the small incomplete marker fits; frozen: no write fits; broken: nothing works.
+  // full: only the small incomplete marker fits; frozen: no write fits; broken: nothing works. A write commits at
+  // once; its outcome reaches the record when the promise settles.
   const store = { full: false, frozen: false, broken: false, m,
-    getItem: (k: string) => { if (store.broken) throw new Error("denied"); return m.get(k) ?? null; },
-    setItem: (k: string, v: string) => { if (store.broken || store.frozen || (store.full && !v.includes("\"incomplete\":true"))) throw new DOMException("quota", "QuotaExceededError"); m.set(k, v); } };
+    get: (k: string) => { if (store.broken) throw new Error("denied"); return m.get(k); },
+    update: async (k: string, change: (stored: string | undefined) => string | null | undefined) => {
+      if (store.broken) throw new Error("denied");
+      const next = change(m.get(k));
+      if (next === undefined) return m.get(k);
+      if (store.frozen || (store.full && !(next ?? "").includes("\"incomplete\":true"))) throw new DOMException("quota", "QuotaExceededError");
+      if (next === null) m.delete(k); else m.set(k, next);
+      return next ?? undefined;
+    } };
   return store;
 };
+/** Until the outcomes of the writes made so far have reached their records. */
+const settled = () => new Promise((resolve) => setTimeout(resolve, 0));
 const ok: MessageVerification = { status: "verified", continuity: "proven", authorization: [] };
 
 describe("channel lifecycle", () => {
-  it("flags an id reused after an observed deletion, per server key, across reloads", () => {
+  it("flags an id reused after an observed deletion, per server key, across reloads", async () => {
     const store = memory(), c = channelLifecycle(store);
     c.observe("A", [1, 2]);
     c.deleted("A", 1);
     c.created("A", 1);
     expect([c.check("A", 1), c.check("A", 2), c.check("B", 1)]).toEqual(["reused", "ok", "ok"]);
+    await settled();
     expect(channelLifecycle(store).check("A", 1)).toBe("reused");
   });
   it("keeps a channel missing from a later welcome as hidden: it may return as the same channel", () => {
@@ -33,12 +44,14 @@ describe("channel lifecycle", () => {
     c.observe("A", [1, 2]);
     expect(c.check("A", 2)).toBe("reused");
   });
-  it("keeps an observed deletion in memory when storage is full, and stays incomplete after reload (Astra r3 probe, inverted)", () => {
+  it("keeps an observed deletion in memory when storage is full, and stays incomplete after reload (Astra r3 probe, inverted)", async () => {
     const store = memory(), c = channelLifecycle(store);
     c.observe("A", [1, 2]);
+    await settled();
     store.full = true;
     c.deleted("A", 1);
     expect(c.check("A", 1)).toBe("reused");
+    await settled();
     expect(c.check("A", 2)).toBe("unknown");
     expect(channelLifecycle(store).check("A", 1)).toBe("unknown");
   });
@@ -63,7 +76,7 @@ describe("channel lifecycle", () => {
     store.m.delete("gwar.channels:A");
     expect(channelLifecycle(store).check("A", 1)).toBe("ok");
   });
-  it("never drops an unsaved record from memory, however many servers pass through (Astra r4 probe, inverted)", () => {
+  it("never drops an unsaved record from memory, however many servers pass through (Astra r4 probe, inverted)", async () => {
     const store = memory(), c = channelLifecycle(store);
     c.observe("A", [1]);
     store.frozen = true;
@@ -74,12 +87,14 @@ describe("channel lifecycle", () => {
     store.frozen = false;
     for (let i = 0; i < 200; i++) c.check(`again${i}`, 1);
     c.observe("A", [1]);
+    await settled();
     expect([c.check("A", 1), channelLifecycle(store).check("A", 1)]).toEqual(["reused", "reused"]);
     expect(c.check("other0", 1)).toBe("ok");
   });
-  it("drops saved records first; past the bound of unsaved ones every record is uncertain for the session", () => {
+  it("drops saved records first; past the bound of unsaved ones every record is uncertain for the session", async () => {
     const store = memory(), c = channelLifecycle(store);
     c.observe("saved", [1]);
+    await settled();
     store.frozen = true;
     for (let i = 0; i < 63; i++) c.deleted(`s${i}`, 1);
     expect([c.check("s0", 1), c.check("saved", 1), c.check("fresh", 1)]).toEqual(["reused", "ok", "ok"]);
@@ -97,6 +112,18 @@ describe("channel lifecycle", () => {
     c.created("A", 7);
     expect(c.check("A", 7)).toBe("unknown");
     expect(c.check("B", 7)).toBe("ok");
+  });
+  it("keeps another tab's deletions when this tab saves the same server's record", async () => {
+    const store = memory(), mine = channelLifecycle(store);
+    mine.observe("A", [5, 6]);
+    await settled();
+    const other = channelLifecycle(store);
+    other.deleted("A", 5);
+    await settled();
+    mine.created("A", 7);
+    await settled();
+    expect(channelLifecycle(store).check("A", 5)).toBe("reused");
+    expect(JSON.parse(store.m.get("gwar.channels:A")!)).toEqual({ known: [6, 7], deleted: [5], incomplete: false });
   });
   it("qualifies only verified channel messages", () => {
     const c = channelLifecycle(memory());

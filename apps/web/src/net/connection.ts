@@ -10,6 +10,8 @@ import type { Identity } from "./identity";
 import type { Hello } from "../proto/Hello";
 import { certificateHash, decodeFixed, helloStatement, newNonce, normalizeEndpoint, verifyProof } from "./handshake";
 import { checkCandidate, serverPins, ServerIdentityChanged, type PinStore } from "./server-pins";
+import { LocalStateUnavailableError } from "../lib/local-state";
+import { NewerDataError } from "../lib/stored-data";
 import { isPlaintextRemote } from "./address";
 import {
   PROTOCOL_VERSION,
@@ -41,6 +43,7 @@ export type ConnectErrorKind =
   | "certificate_expired" // the Gwar Connect device certificate we sent has run out; renew it in Settings > Account
   | "rejected" // any other error reply to hello (bad nickname, ...)
   | "server_identity"
+  | "trust_storage" // this device's server pins cannot be read or written: no key is trusted
   | "insecure_transport"
   | "protocol"; // protocol version mismatch or malformed handshake
 
@@ -450,6 +453,7 @@ export class Connection implements Link {
             .catch((e: unknown) => {
               if (e instanceof ServerIdentityChanged) fail(new ConnectError("server_identity", e.message, serverName, undefined, e));
               else if (e instanceof ConnectError) fail(e);
+              else if (e instanceof LocalStateUnavailableError || e instanceof NewerDataError) fail(new ConnectError("trust_storage", e.message, serverName));
               else if (e instanceof RequestError) fail(mapHelloError(e.code, e.message, serverName, e.ban));
               else if (e instanceof RequestTimeoutError) fail(new ConnectError(e.op === "hello" ? "protocol" : "timeout", e.op === "hello" ? "missing server proof" : e.message, serverName));
               else fail(new ConnectError("protocol", e instanceof Error ? e.message : String(e), serverName));
@@ -506,7 +510,8 @@ export class Connection implements Link {
     const proof = await this.send(socket, "hello", hello as unknown as Record<string, unknown>, timeoutMs, 1);
     await verifyProof(hello, proof);
     current();
-    pins.commit(endpoint, hello.expected_server_pk);
+    await pins.commit(endpoint, hello.expected_server_pk);
+    current();
     this.serverKey_ = hello.expected_server_pk;
     return this.send(socket, "join", { server_password: serverPassword, invite: this.invite }, timeoutMs, 2);
   }

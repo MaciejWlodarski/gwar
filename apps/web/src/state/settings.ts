@@ -2,7 +2,7 @@ import { serverKey } from "../lib/server-key";
 import { useMemo } from "react";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
-import { guardedLocalStorage } from "../lib/local-storage";
+import { guardedLocalStorage, SETTINGS_KEY, SETTINGS_VERSION } from "../lib/local-storage";
 import type { InputMode } from "../voice/engine";
 
 export type Theme = "system" | "dark" | "light";
@@ -355,9 +355,9 @@ export const useSettings = create<SettingsState>()(
       setArchiveUploads: (archiveUploads) => set({ archiveUploads }),
     }),
     {
-      name: "gwar.settings",
-      // Its shape changes with the localStorage version (lib/local-storage.ts), not this one.
-      version: 1,
+      name: SETTINGS_KEY,
+      // A change of shape bumps it and adds a `migrate` step (docs/data-migrations.md).
+      version: SETTINGS_VERSION,
       // zustand's default storage (`window.localStorage`), guarded.
       storage: createJSONStorage(() => guardedLocalStorage(window.localStorage)),
       merge: (persisted, current) => {

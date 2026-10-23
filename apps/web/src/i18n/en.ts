@@ -33,7 +33,7 @@ export const en = {
   "member.uid": "Full user ID",
   "member.handleChanged": "@{handle} belonged to a different account before. Handles can move between accounts, so this may be someone else. If you know it is the same person (for example on a new account), accept it.",
   "member.acceptHandle": "Accept this account",
-  "member.acceptNotSaved": "Accepted for now, but this browser did not let Gwar save it; it will be asked again after a reload.",
+  "member.acceptNotSaved": "Not accepted: this browser did not let Gwar save it. Reload the page and try again.",
   "badge.connectAccount": "Gwar Connect account: @{handle}",
   "badge.handleChanged": "@{handle}: this handle belonged to a different account before",
 
@@ -513,6 +513,7 @@ export const en = {
   "err.connect.protocol": "This server speaks a different protocol version. Update the client or the server.",
   "err.connect.storage_newer": "A newer version of Gwar saved this device's identity or sign-in, and this version can't read it. Nothing was changed: reload the page or install the latest Gwar.",
   "err.connect.identity_unreadable": "The identity saved on this device can't be read by this version of Gwar. It was left as it is: update Gwar, or import a backup in Settings → Identity.",
+  "err.connect.trust_storage": "This device's saved server keys couldn't be read or saved, so Gwar trusts no server key right now. Reload the page; if a newer version of Gwar saved them, update Gwar.",
   "err.connect.identity_storage": "This device's saved identity couldn't be loaded because its storage failed. Reload the page; if this keeps happening, the browser may be blocking site data.",
   "err.connect.identity": "Your browser can't create a secure identity here. Use a recent browser over https (or localhost).",
   "err.connect.address": "That server address doesn't look right.",

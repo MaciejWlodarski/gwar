@@ -8,12 +8,17 @@ beforeEach(() => {
   vi.resetModules();
   vi.stubEnv("VITE_CONNECT_URL", "https://connect.example");
   storage = new Map();
-  vi.stubGlobal("localStorage", {
-    getItem: (k: string) => storage.get(k) ?? null,
-    setItem: (k: string, v: string) => storage.set(k, v),
-  });
+  // The device's security state (lib/local-state.ts), as a map.
+  vi.doMock("../lib/local-state", () => ({ localState: {
+    get: (k: string) => storage.get(k),
+    update: async (k: string, change: (stored: string | undefined) => string | null | undefined) => {
+      const next = change(storage.get(k));
+      if (next === null) storage.delete(k); else if (next !== undefined) storage.set(k, next);
+      return storage.get(k);
+    },
+  } }));
 });
-afterEach(() => { vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
+afterEach(() => { vi.doUnmock("../lib/local-state"); vi.unstubAllGlobals(); vi.unstubAllEnvs(); });
 
 describe("service key trust anchor", () => {
   it("fetches only configured Connect over HTTPS, once per session, and caches by URL", async () => {

@@ -4,6 +4,7 @@ import { MESSAGE_STORAGE_DATABASE, MESSAGE_STORAGE_MIGRATIONS } from "../net/mes
 import { mlsDatabase, MLS_MIGRATIONS, MLS_STORE_FORMAT } from "../mls/storage";
 import { CONNECT_KEY, KEY as IDENTITY_KEY, connectRecord, identityRecord } from "../net/identity";
 import { localStorageError } from "./local-storage";
+import { localState, LOCAL_STATE_DATABASE, LOCAL_STATE_MIGRATIONS } from "./local-state";
 import { NewerDataError } from "./stored-data";
 
 const request = <T>(r: IDBRequest<T>) => new Promise<T>((resolve, reject) => { r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
@@ -28,15 +29,15 @@ async function mlsFormat(factory: IDBFactory, name: string): Promise<number | un
 }
 
 /**
- * The first store or record of a newer version found, or why localStorage cannot be used; undefined
- * if none. Only databases the browser lists are read (an open would make a missing one); the rest
+ * The first store or record of a newer version found, or why the settings or the security state
+ * cannot be used; undefined if none. Only databases the browser lists are read (an open would make a missing one); the rest
  * are checked anyway when they are opened.
  */
 export async function storedDataProblem(factory: IDBFactory | undefined = globalThis.indexedDB): Promise<unknown> {
-  const local = localStorageError();
+  const local = localStorageError() ?? localState.error();
   if (local !== undefined) return local;
   if (!factory) return undefined;
-  const known = new Map([[KV_DATABASE, KV_MIGRATIONS.length], [MESSAGE_STORAGE_DATABASE, MESSAGE_STORAGE_MIGRATIONS.length]]);
+  const known = new Map([[KV_DATABASE, KV_MIGRATIONS.length], [MESSAGE_STORAGE_DATABASE, MESSAGE_STORAGE_MIGRATIONS.length], [LOCAL_STATE_DATABASE, LOCAL_STATE_MIGRATIONS.length]]);
   const databases = await factory.databases?.().catch(() => undefined) ?? [];
   try {
     for (const { name, version } of databases) {

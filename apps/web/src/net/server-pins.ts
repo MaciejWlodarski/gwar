@@ -1,5 +1,5 @@
 import { decodeFixed, normalizeEndpoint, serverPublicKey } from "./handshake";
-import { appStorage } from "../lib/local-storage";
+import { localState } from "../lib/local-state";
 
 export interface ServerPin {
   server_pk: string;
@@ -7,10 +7,12 @@ export interface ServerPin {
 }
 
 export interface PinStore {
+  /** Throws when the pins cannot be read: nothing is trusted then. */
   load(endpoint: string): ServerPin | undefined;
-  /** First contact commits only if the concurrent stored pin is absent or matches. */
-  commit(endpoint: string, key: string): void;
-  forget(endpoint: string, previous: string): void;
+  /** First contact commits only if the stored pin is absent or matches, in one transaction. */
+  commit(endpoint: string, key: string): Promise<void>;
+  /** Removes the pin if it still is `previous`. */
+  forget(endpoint: string, previous: string): Promise<void>;
 }
 
 export class ServerIdentityChanged extends Error {
@@ -20,22 +22,30 @@ export class ServerIdentityChanged extends Error {
 }
 
 const PREFIX = "gwar.server-pin:";
+
+function parsePin(value: string): ServerPin {
+  const pin: ServerPin = JSON.parse(value);
+  decodeFixed(pin.server_pk, 32);
+  if (!Number.isSafeInteger(pin.first_seen) || pin.first_seen < 0) throw new Error("invalid server pin");
+  return pin;
+}
+
+/** Pins in the device's security state (lib/local-state.ts). */
 export const serverPins: PinStore = {
   load(endpoint) {
-    const value = appStorage.getItem(PREFIX + normalizeEndpoint(endpoint));
-    if (value === null) return undefined;
-    const pin: ServerPin = JSON.parse(value);
-    decodeFixed(pin.server_pk, 32);
-    if (!Number.isSafeInteger(pin.first_seen) || pin.first_seen < 0) throw new Error("invalid server pin");
-    return pin;
+    const value = localState.get(PREFIX + normalizeEndpoint(endpoint));
+    return value === undefined ? undefined : parsePin(value);
   },
-  commit(endpoint, key) {
-    const old = this.load(endpoint);
-    if (old && old.server_pk !== key) throw new ServerIdentityChanged(endpoint, old.server_pk, key, "pin");
-    if (!old) appStorage.setItem(PREFIX + normalizeEndpoint(endpoint), JSON.stringify({ server_pk: key, first_seen: Date.now() }));
+  async commit(endpoint, key) {
+    await localState.update(PREFIX + normalizeEndpoint(endpoint), (stored) => {
+      if (stored === undefined) return JSON.stringify({ server_pk: key, first_seen: Date.now() });
+      const pin = parsePin(stored);
+      if (pin.server_pk !== key) throw new ServerIdentityChanged(endpoint, pin.server_pk, key, "pin");
+      return undefined;
+    });
   },
-  forget(endpoint, previous) {
-    if (this.load(endpoint)?.server_pk === previous) appStorage.removeItem(PREFIX + normalizeEndpoint(endpoint));
+  async forget(endpoint, previous) {
+    await localState.update(PREFIX + normalizeEndpoint(endpoint), (stored) => stored !== undefined && parsePin(stored).server_pk === previous ? null : undefined);
   },
 };
 

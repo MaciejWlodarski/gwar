@@ -6,7 +6,7 @@
  * Fixtures build older data the way the code of that version did; they are never changed afterwards.
  */
 import "fake-indexeddb/auto";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { eachRecord, NewerDataError, openDatabase, upgradeRecord, type IdbMigration } from "./stored-data";
 import { KV_DATABASE, KV_MIGRATIONS, kvGet } from "../net/kv";
 import { MESSAGE_STORAGE_MIGRATIONS, MessageStorage } from "../net/message-storage";
@@ -14,8 +14,8 @@ import { mlsDatabase, MLS_MIGRATIONS, MLS_STORE_FORMAT, openStorage } from "../m
 import { readdirSync } from "node:fs";
 import { translate, type Key } from "../i18n/translate";
 import { CONNECT_UPGRADES, IDENTITY_UPGRADES, IdentityUnreadableError, IdentityUnsupportedError, identityFailure, indexedDbConnectStore, indexedDbIdentityStore, loadActiveIdentity, loadConnectRecord, loadOrCreateIdentity, type ConnectRecord, type IdentityStore } from "../net/identity";
-import { copyLocalStorageForward, LOCAL_STORAGE_AUTHORITY, LOCAL_STORAGE_VERSION, LOCAL_STORAGE_VERSION_KEY, type LocalStorageMigration } from "./local-storage";
-import { LOCAL_STORAGE_MIGRATIONS } from "./local-storage-migrations";
+import { SETTINGS_KEY, SETTINGS_VERSION } from "./local-storage";
+import { createLocalState, LOCAL_STATE_MIGRATIONS } from "./local-state";
 import { storedDataProblem } from "./stored-data-check";
 
 const request = <T>(r: IDBRequest<T>) => new Promise<T>((resolve, reject) => { r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
@@ -101,6 +101,20 @@ const IDB_STORES: Record<string, IdbStore> = {
       },
     },
   },
+  "security state": {
+    name: (unique) => `local-${unique}`,
+    migrations: LOCAL_STATE_MIGRATIONS,
+    fixtures: {
+      1: {
+        build: (name) => make(name, 1, (db) => db.createObjectStore("entries"), (db) => put(db, "entries", [[PIN, pinValue("K")]])),
+        check: async (name) => {
+          const state = createLocalState(name);
+          await state.load();
+          try { expect(state.get(PIN)).toBe(pinValue("K")); } finally { state.close(); }
+        },
+      },
+    },
+  },
   "MLS state": {
     name: (unique) => mlsDatabase(unique),
     migrations: MLS_MIGRATIONS,
@@ -131,16 +145,18 @@ const RECORD_FIXTURES: Record<keyof typeof RECORDS, Record<number, { stored: Rec
   identity: { 1: { stored: { format: "gwar-identity", version: 1, jwk: { kty: "OKP" }, nickname: "N" }, loaded: { format: "gwar-identity", version: 1, jwk: { kty: "OKP" }, nickname: "N" } } },
   connect: { 1: { stored: { version: 1, handle: "h", accountKey: "a", vaultKey: "v" }, loaded: { version: 1, handle: "h", accountKey: "a", vaultKey: "v" } } },
 };
-/** localStorage per version (by the keys' version-1 names), and a check of the app's view after upgrading it. */
-const LOCAL_FIXTURES: Record<number, { stored: Record<string, string>; check(read: (key: string) => string | null): void }> = {
+/** The settings (localStorage) per version, and a check of the settings store after loading them. */
+const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: string; bookmarks: unknown[] }): void }> = {
   1: {
-    stored: { "gwar.settings": JSON.stringify({ state: { theme: "light", bookmarks: [] }, version: 1 }), "gwar.server-pin:example.com": JSON.stringify({ server_pk: "k", first_seen: 1 }) },
-    check: (read) => {
-      expect(JSON.parse(read("gwar.settings")!).state.theme).toBe("light");
-      expect(JSON.parse(read("gwar.server-pin:example.com")!).server_pk).toBe("k");
+    stored: { state: { theme: "light", bookmarks: [{ id: "a", name: "A", address: "a.example", kind: "gwar" }] }, version: 1 },
+    check: (state) => {
+      expect(state.theme).toBe("light");
+      expect(state.bookmarks).toMatchObject([{ id: "a", address: "a.example" }]);
     },
   },
 };
+const PIN = "gwar.server-pin:wss://a.example/ws";
+const pinValue = (key: string, first_seen = 1) => JSON.stringify({ server_pk: key, first_seen });
 
 const versions = (n: number) => Array.from({ length: n }, (_, i) => i + 1);
 let unique = 0;
@@ -155,8 +171,7 @@ describe("the guard", () => {
     for (const [record, upgrades] of Object.entries(RECORDS)) {
       expect(Object.keys(RECORD_FIXTURES[record as keyof typeof RECORDS]).map(Number), record).toEqual(versions(upgrades.length + 1));
     }
-    expect(Object.keys(LOCAL_FIXTURES).map(Number)).toEqual(versions(LOCAL_STORAGE_MIGRATIONS.length + 1));
-    expect(LOCAL_STORAGE_VERSION).toBe(LOCAL_STORAGE_MIGRATIONS.length + 1);
+    expect(Object.keys(LOCAL_FIXTURES).map(Number)).toEqual(versions(SETTINGS_VERSION));
   });
 });
 
@@ -363,7 +378,7 @@ describe("the stored identity", () => {
   });
 });
 
-describe("localStorage", () => {
+describe("the settings (localStorage)", () => {
   const memory = (entries: Record<string, string>): Storage => {
     const map = new Map(Object.entries(entries));
     return {
@@ -371,206 +386,140 @@ describe("localStorage", () => {
       getItem: (k) => map.get(k) ?? null, setItem: (k, v) => void map.set(k, v), removeItem: (k) => void map.delete(k),
     };
   };
-  /**
-   * localStorage as tabs of one browser see it: each tab has its own copy, its writes reach the
-   * browser and the other tabs when `deliver` runs, in the order it made them.
-   */
-  class Browser {
-    readonly items = new Map<string, string>();
-    readonly tabs: { items: Map<string, string>; outbox: [string, string | null][] }[] = [];
-    constructor(entries: Record<string, string> = {}) { for (const [k, v] of Object.entries(entries)) this.items.set(k, v); }
-    view() {
-      const tab = { items: new Map(this.items), outbox: [] as [string, string | null][] };
-      this.tabs.push(tab);
-      const write = (k: string, v: string | null) => { if (v === null) tab.items.delete(k); else tab.items.set(k, v); tab.outbox.push([k, v]); };
-      const storage: Storage & { deliver(): void } = {
-        get length() { return tab.items.size; }, key: (i) => [...tab.items.keys()][i] ?? null, clear: () => { for (const k of [...tab.items.keys()]) write(k, null); },
-        getItem: (k) => tab.items.get(k) ?? null, setItem: (k, v) => write(k, String(v)), removeItem: (k) => write(k, null),
-        deliver: () => {
-          for (const [k, v] of tab.outbox.splice(0)) for (const target of [this.items, ...this.tabs.filter((t) => t !== tab).map((t) => t.items)]) {
-            if (v === null) target.delete(k); else target.set(k, v);
-          }
-        },
-      };
-      return storage;
-    }
-  }
-  /** Web Locks: one holder at a time, in request order, shared by every tab. */
-  const lockManager = () => {
-    let queue: Promise<unknown> = Promise.resolve();
-    return { request: (_: string, run: () => Promise<unknown>) => { const result = queue.then(run); queue = result.catch(() => {}); return result; } };
-  };
-  /** One tab: its own instance of the code of the version `migrations` make, on its own view. */
-  async function tab(storage: Storage, migrations: readonly LocalStorageMigration[] = LOCAL_STORAGE_MIGRATIONS) {
-    vi.resetModules();
-    vi.doMock("./local-storage-migrations", () => ({ LOCAL_STORAGE_MIGRATIONS: migrations }));
-    try {
-      const code = await import("./local-storage");
-      code.useLocalStorageForTests(storage);
-      return code;
-    } finally { vi.doUnmock("./local-storage-migrations"); }
-  }
-  const copy = (change?: (key: string, value: string) => string | null): LocalStorageMigration => (s, from, to) => copyLocalStorageForward(s, from, to, change);
-  const PIN = "gwar.server-pin:wss://a.example/ws";
-  const pinOf = (raw: string | null) => raw === null ? null : (JSON.parse(raw) as { server_pk: string }).server_pk;
-  const later = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-  beforeEach(() => { vi.stubGlobal("navigator", { locks: lockManager() }); });
-  afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
-
-  it.each(versions(LOCAL_STORAGE_VERSION))("version %i upgrades to the current one", async (version) => {
-    expect(version).toBe(1); // a later version's fixture lays its entries out in its namespace, with the authority record
-    const storage = memory(LOCAL_FIXTURES[version]!.stored);
-    const current = await tab(storage);
-    await current.prepareLocalStorage();
-    expect(current.localStorageError()).toBeUndefined();
-    LOCAL_FIXTURES[version]!.check((key) => current.appStorage.getItem(key));
-    expect(storage.getItem(LOCAL_STORAGE_VERSION_KEY) ?? "1").toBe(String(LOCAL_STORAGE_VERSION));
-  });
-  it("a newer or unreadable version is refused and left as it is", async () => {
-    for (const stored of [`${LOCAL_STORAGE_VERSION + 1}.0123456789abcdef`, "garbage"]) {
-      const storage = memory({ [LOCAL_STORAGE_VERSION_KEY]: stored, "gwar.settings": "{}" });
-      const current = await tab(storage);
-      await current.prepareLocalStorage();
-      expect(current.localStorageError()).toMatchObject({ name: "NewerDataError" });
-      expect(current.localStorageUsable()).toBe(false);
-      expect([storage.getItem(LOCAL_STORAGE_VERSION_KEY), storage.getItem("gwar.settings"), storage.length]).toEqual([stored, "{}", 2]);
-    }
-    // Published as newer in IndexedDB, before this tab's copy shows it.
-    await make(KV_DATABASE, 1, (db) => db.createObjectStore("kv"), (db) => put(db, "kv", [[LOCAL_STORAGE_AUTHORITY, { version: LOCAL_STORAGE_VERSION + 1, namespace: "0123456789abcdef" }]]));
-    const storage = memory({ "gwar.settings": "{}" });
-    const current = await tab(storage);
-    await current.prepareLocalStorage();
-    expect(current.localStorageError()).toMatchObject({ name: "NewerDataError" });
-    expect(storage.getItem("gwar.settings")).toBe("{}");
-  });
-  it("one tab upgrades at a time: a tab that waited never writes over what the first published", async () => {
-    const browser = new Browser({ [PIN]: JSON.stringify({ server_pk: "old", first_seen: 1 }) });
-    const [viewA, viewB] = [browser.view(), browser.view()];
-    const [a, b] = [await tab(viewA, [copy()]), await tab(viewB, [copy()])];
-    const upgradedB = (async () => {
-      await b.prepareLocalStorage();
-      // B's user accepts the server's new key; B's write reaches the others at once.
-      b.appStorage.setItem(PIN, JSON.stringify({ server_pk: "new", first_seen: 2 }));
-      viewB.deliver();
-    })();
-    await a.prepareLocalStorage();
-    // A's writes take a while to reach the other tabs.
-    await later(20);
-    viewA.deliver();
-    await upgradedB;
-    viewA.deliver();
-    expect([a.localStorageError(), b.localStorageError()]).toEqual([undefined, undefined]);
-    expect(pinOf(b.appStorage.getItem(PIN))).toBe("new");
-    expect(pinOf(a.appStorage.getItem(PIN))).toBe("new");
-    expect(pinOf(browser.items.get(PIN) ?? null)).toBe("old"); // version 1's, for its tabs
-  });
-  it("a tab of the older version that writes after the upgrade leaves the newer version's entries alone", async () => {
-    const browser = new Browser({ "gwar.settings": JSON.stringify({ state: { theme: "light" }, version: 1 }) });
-    const [older, newer] = [browser.view(), browser.view()];
-    const [o, n] = [await tab(older), await tab(newer, [...LOCAL_STORAGE_MIGRATIONS, copy()])];
-    expect(o.localStorageUsable()).toBe(true);
-    await n.prepareLocalStorage();
-    n.appStorage.setItem("gwar.settings", JSON.stringify({ state: { theme: "light", future: [1] }, version: 1 }));
-    // The older tab's copy does not show the upgrade yet; its write lands after it, in its own entries.
-    o.appStorage.setItem("gwar.settings", JSON.stringify({ state: { theme: "dark" }, version: 1 }));
-    newer.deliver();
-    older.deliver();
-    expect(JSON.parse(n.appStorage.getItem("gwar.settings")!).state).toEqual({ theme: "light", future: [1] });
-    expect(JSON.parse(browser.view().getItem(n.localStorageKey("gwar.settings"))!).state).toEqual({ theme: "light", future: [1] });
-  });
-  it("a late publication of an older version never brings back what the current one removed", async () => {
-    const browser = new Browser({ [PIN]: JSON.stringify({ server_pk: "old", first_seen: 1 }) });
-    const viewC = browser.view();
-    const marks: string[] = [];
-    const setItem = viewC.setItem.bind(viewC);
-    viewC.setItem = (k, v) => { if (k === LOCAL_STORAGE_VERSION_KEY) marks.push(v); setItem(k, v); };
-    const c = await tab(viewC, [copy(), copy()]);
-    await c.prepareLocalStorage();
-    expect(marks.length).toBeGreaterThan(1);
-    // The current version forgets the pin (its user trusted the server's new key).
-    c.appStorage.removeItem(PIN);
-    viewC.deliver();
-    // The mark of version 2 arrives late (a delayed or dead tab's write).
-    const late = browser.view();
-    late.setItem(LOCAL_STORAGE_VERSION_KEY, marks[0]!);
-    late.deliver();
-    const d = await tab(browser.view(), [copy(), copy()]);
-    await d.prepareLocalStorage();
-    expect(d.localStorageError()).toBeUndefined();
-    expect(d.appStorage.getItem(PIN)).toBeNull();
-  });
-  it("an upgrade keeps the previous version's entries for its tabs and removes older and abandoned ones", async () => {
-    const browser = new Browser({ [PIN]: JSON.stringify({ server_pk: "old", first_seen: 1 }), "gwar.settings": "{}" });
-    // An upgrade that fails halfway leaves its namespace unpublished.
-    const broken = browser.view();
-    const e = await tab(broken, [(s, from, to) => { copyLocalStorageForward(s, from, to); throw new Error("storage full"); }]);
-    await e.prepareLocalStorage();
-    expect(e.localStorageError()).toMatchObject({ message: "storage full" });
-    broken.deliver();
-    expect(browser.items.size).toBeGreaterThan(2);
-    const second = browser.view();
-    const f = await tab(second, [copy()]);
-    await f.prepareLocalStorage();
-    second.deliver();
-    expect(pinOf(f.appStorage.getItem(PIN))).toBe("old");
-    // Version 1's two entries, version 2's two and its marker, and the mark.
-    expect(browser.items.size).toBe(6);
-    const third = browser.view();
-    const g = await tab(third, [copy(), copy()]);
-    await g.prepareLocalStorage();
-    third.deliver();
-    expect(pinOf(g.appStorage.getItem(PIN))).toBe("old");
-    // Version 1's are gone; version 2's stay for its tabs.
-    expect([browser.items.has(PIN), browser.items.has("gwar.settings")]).toEqual([false, false]);
-    expect(browser.items.size).toBe(7);
-  });
-  it("the theme before the first paint is the current version's", async () => {
-    const browser = new Browser({ "gwar.settings": JSON.stringify({ state: { theme: "light" }, version: 1 }) });
-    const view = browser.view();
-    const current = await tab(view, [copy()]);
-    await current.prepareLocalStorage();
-    current.appStorage.setItem("gwar.settings", JSON.stringify({ state: { theme: "dark" }, version: 1 }));
-    view.deliver();
-    const theme = await import("node:fs").then((fs) => fs.readFileSync(new URL("../../public/theme.js", import.meta.url), "utf8"));
-    const root = { dataset: {} as Record<string, string> };
-    new Function("localStorage", "matchMedia", "document", theme)(browser.view(), () => ({ matches: false }), { documentElement: root });
-    expect(root.dataset.theme).toBe("dark");
-  });
-  it("an open tab stops writing once a newer version's tab upgrades localStorage", async () => {
-    const storage = memory({ "gwar.settings": JSON.stringify({ state: { theme: "light" }, version: 1 }) });
-    const events = new EventTarget();
+  /** A page loaded on `storage`: a fresh settings store. */
+  async function page(storage: Storage) {
     vi.stubGlobal("localStorage", storage);
     vi.stubGlobal("window", { localStorage: storage });
+    vi.resetModules();
+    return { ...(await import("../state/settings")), ...(await import("./local-storage")) };
+  }
+  afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
+
+  it.each(versions(SETTINGS_VERSION))("version %i loads at the current one", async (version) => {
+    const { useSettings, localStorageError } = await page(memory({ [SETTINGS_KEY]: JSON.stringify(LOCAL_FIXTURES[version]!.stored) }));
+    expect(localStorageError()).toBeUndefined();
+    LOCAL_FIXTURES[version]!.check(useSettings.getState());
+  });
+  it("of a newer version, or unreadable, are neither read nor written", async () => {
+    for (const stored of [JSON.stringify({ state: { theme: "light" }, version: SETTINGS_VERSION + 1 }), "garbage"]) {
+      const storage = memory({ [SETTINGS_KEY]: stored });
+      const { useSettings, localStorageError } = await page(storage);
+      expect(useSettings.getState().theme).not.toBe("light");
+      useSettings.getState().setTheme("dark");
+      expect(storage.getItem(SETTINGS_KEY)).toBe(stored);
+      expect(localStorageError()).toMatchObject({ name: "NewerDataError" });
+    }
+  });
+  it("an open tab stops writing once a newer version's tab writes them", async () => {
+    const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ state: { theme: "light" }, version: 1 }) });
+    const events = new EventTarget();
     vi.stubGlobal("addEventListener", events.addEventListener.bind(events));
     vi.stubGlobal("removeEventListener", events.removeEventListener.bind(events));
-    vi.resetModules();
-    const { useSettings } = await import("../state/settings");
-    const { appStorage, watchLocalStorage } = await import("./local-storage");
+    const { useSettings, watchLocalStorage } = await page(storage);
     expect(useSettings.getState().theme).toBe("light");
     const unusable = vi.fn();
     watchLocalStorage(unusable);
-    // The newer tab: upgraded, with a setting this version does not know.
-    const upgraded = JSON.stringify({ state: { theme: "light", future: [1] }, version: 1 });
-    storage.setItem("gwar.settings", upgraded);
-    storage.setItem(LOCAL_STORAGE_VERSION_KEY, `${LOCAL_STORAGE_VERSION + 1}.0123456789abcdef`);
-    events.dispatchEvent(Object.assign(new Event("storage"), { key: LOCAL_STORAGE_VERSION_KEY }));
+    const newer = JSON.stringify({ state: { theme: "light", future: [1] }, version: SETTINGS_VERSION + 1 });
+    storage.setItem(SETTINGS_KEY, newer);
+    events.dispatchEvent(Object.assign(new Event("storage"), { key: SETTINGS_KEY, newValue: newer }));
     expect(unusable).toHaveBeenCalledOnce();
     useSettings.getState().setTheme("dark");
-    expect(storage.getItem("gwar.settings")).toBe(upgraded);
-    expect(() => appStorage.setItem("gwar.server-pin:example.com", "{}")).toThrow("newer version of Gwar");
-    expect(() => appStorage.getItem("gwar.server-pin:example.com")).toThrow("newer version of Gwar");
-    expect(storage.getItem("gwar.server-pin:example.com")).toBeNull();
+    expect(storage.getItem(SETTINGS_KEY)).toBe(newer);
   });
-  it("settings are neither read nor written while localStorage is of a newer version", async () => {
-    const storage = memory({ [LOCAL_STORAGE_VERSION_KEY]: `${LOCAL_STORAGE_VERSION + 1}.0123456789abcdef`, "gwar.settings": JSON.stringify({ state: { theme: "light" }, version: 1 }) });
-    vi.stubGlobal("localStorage", storage);
-    vi.stubGlobal("window", { localStorage: storage });
-    vi.resetModules();
-    const { useSettings } = await import("../state/settings");
-    expect(useSettings.getState().theme).not.toBe("light");
+  it("a write checks the stored version first, even before the storage event", async () => {
+    const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ state: { theme: "light" }, version: 1 }) });
+    const { useSettings, localStorageError } = await page(storage);
+    const newer = JSON.stringify({ state: { theme: "light", future: [1] }, version: SETTINGS_VERSION + 1 });
+    storage.setItem(SETTINGS_KEY, newer);
     useSettings.getState().setTheme("dark");
-    expect(JSON.parse(storage.getItem("gwar.settings")!).state.theme).toBe("light");
-    const { localStorageError } = await import("./local-storage");
+    expect(storage.getItem(SETTINGS_KEY)).toBe(newer);
     expect(localStorageError()).toMatchObject({ name: "NewerDataError" });
+  });
+});
+
+describe("the security state (IndexedDB)", () => {
+  const legacy = { [PIN]: pinValue("K"), "gwar.channels:S": JSON.stringify({ known: [1], deleted: [2], incomplete: false }),
+    "gwar.connect.handle-pin:https://connect.example:alice": JSON.stringify({ uid: "A" }), "gwar.connect.service-key:https://connect.example": "k".repeat(43) };
+  const browserStorage = (entries: Record<string, string>) => {
+    const map = new Map(Object.entries(entries));
+    return { map, storage: {
+      get length() { return map.size; }, key: (i: number) => [...map.keys()][i] ?? null, clear: () => map.clear(),
+      getItem: (k: string) => map.get(k) ?? null, setItem: (k: string, v: string) => void map.set(k, v), removeItem: (k: string) => void map.delete(k),
+    } as Storage };
+  };
+  const open: { close(): void }[] = [];
+  const tab = async (name: string, migrations = LOCAL_STATE_MIGRATIONS, factory?: () => IDBFactory | undefined) => {
+    const state = createLocalState(name, migrations, factory);
+    open.push(state);
+    await state.load();
+    return state;
+  };
+  afterEach(() => { for (const state of open.splice(0)) state.close(); vi.unstubAllGlobals(); });
+
+  it("imports what version 1 kept in localStorage, once, and leaves it there", async () => {
+    const { map, storage } = browserStorage({ ...legacy, [SETTINGS_KEY]: "{}", "other.key": "x" });
+    vi.stubGlobal("localStorage", storage);
+    const name = fresh();
+    const first = await tab(name);
+    for (const [key, value] of Object.entries(legacy)) expect(first.get(key)).toBe(value);
+    expect([first.get(SETTINGS_KEY), first.get("other.key")]).toEqual([undefined, undefined]);
+    expect(Object.fromEntries(map)).toEqual({ ...legacy, [SETTINGS_KEY]: "{}", "other.key": "x" });
+    // A tab of version 1 writes localStorage afterwards: nothing reads that any more.
+    map.set(PIN, pinValue("LATE"));
+    expect((await tab(name)).get(PIN)).toBe(pinValue("K"));
+  });
+  it("an import that fails halfway commits nothing and runs again whole", async () => {
+    vi.stubGlobal("localStorage", browserStorage(legacy).storage);
+    const name = fresh();
+    const crashing = await tab(name, [(db, tx) => { LOCAL_STATE_MIGRATIONS[0]!(db, tx); throw new Error("tab closed"); }]);
+    expect(crashing.error()).toMatchObject({ message: "tab closed" });
+    expect(() => crashing.get(PIN)).toThrow();
+    expect((await indexedDB.databases()).find((d) => d.name === name)?.version ?? 0).toBe(0);
+    const state = await tab(name);
+    expect(state.error()).toBeUndefined();
+    for (const [key, value] of Object.entries(legacy)) expect(state.get(key)).toBe(value);
+  });
+  it("a pin accepted before an upgrade is what the upgraded version reads, and the older tab stops", async () => {
+    const name = fresh();
+    const older = await tab(name);
+    await older.update(PIN, () => pinValue("A"));
+    // Accepted, then the newer version's tab upgrades (it only waits for the commit).
+    await older.update(PIN, () => pinValue("B", 2));
+    const newer = await tab(name, [...LOCAL_STATE_MIGRATIONS, () => {}]);
+    expect(newer.get(PIN)).toBe(pinValue("B", 2));
+    expect(older.error()).toMatchObject({ name: "NewerDataError" });
+    expect(() => older.get(PIN)).toThrow();
+    await expect(older.update(PIN, () => pinValue("C"))).rejects.toMatchObject({ name: "NewerDataError" });
+    expect(newer.get(PIN)).toBe(pinValue("B", 2));
+  });
+  it("another tab's acceptance reaches this tab, and a reload reads it", async () => {
+    const name = fresh();
+    const [mine, other] = [await tab(name), await tab(name)];
+    await mine.update(PIN, () => pinValue("A"));
+    await vi.waitFor(() => expect(other.get(PIN)).toBe(pinValue("A")));
+    await other.update(PIN, () => pinValue("B", 2));
+    await vi.waitFor(() => expect(mine.get(PIN)).toBe(pinValue("B", 2)));
+    expect((await tab(name)).get(PIN)).toBe(pinValue("B", 2));
+  });
+  it("two tabs replacing a pin at once end on the transaction committed last, everywhere", async () => {
+    const name = fresh();
+    const [one, two] = [await tab(name), await tab(name)];
+    await Promise.all([one.update(PIN, () => pinValue("ONE")), two.update(PIN, () => pinValue("TWO"))]);
+    await vi.waitFor(() => expect([one.get(PIN), two.get(PIN)]).toEqual([pinValue("TWO"), pinValue("TWO")]));
+    expect((await tab(name)).get(PIN)).toBe(pinValue("TWO"));
+  });
+  it("a newer version's database is refused and left as it is", async () => {
+    const name = fresh();
+    await make(name, LOCAL_STATE_MIGRATIONS.length + 1, (db) => db.createObjectStore("entries"), (db) => put(db, "entries", [[PIN, pinValue("K")]]));
+    const state = await tab(name);
+    expect(state.error()).toMatchObject({ name: "NewerDataError" });
+    expect(() => state.get(PIN)).toThrow(NewerDataError);
+    expect((await peek(name)).version).toBe(LOCAL_STATE_MIGRATIONS.length + 1);
+  });
+  it("without IndexedDB nothing is read or written: every read and write fails", async () => {
+    const state = await tab(fresh(), LOCAL_STATE_MIGRATIONS, () => undefined);
+    expect(state.error()).toBeDefined();
+    expect(() => state.get(PIN)).toThrow(/no new key is trusted/);
+    await expect(state.update(PIN, () => pinValue("K"))).rejects.toMatchObject({ name: "LocalStateUnavailableError" });
   });
 });
