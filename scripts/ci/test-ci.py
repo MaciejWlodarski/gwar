@@ -14,9 +14,41 @@ def module(name):
 
 select = module("changes").select
 check = module("check-results").check
+rewrite_sources = module("apt-sources").rewrite
 
 
 class Coverage(unittest.TestCase):
+    def test_ubuntu_mirrors_cover_runner_mirror_lists_and_fallback(self):
+        fixture = """Types: deb
+URIs: mirror+file:/etc/apt/apt-mirrors.txt
+Suites: noble noble-updates noble-backports
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+
+Types: deb
+URIs: mirror+file:/etc/apt/apt-mirrors-security.txt
+Suites: noble-security
+Components: main restricted universe multiverse
+Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg
+"""
+        for mirror in ["https://archive.ubuntu.com/ubuntu", "https://mirrors.edge.kernel.org/ubuntu"]:
+            fixture, count = rewrite_sources(fixture, mirror)
+            self.assertEqual(count, 2)
+            self.assertEqual(fixture.count(f"URIs: {mirror}\n"), 2)
+            self.assertNotIn("mirror+file:", fixture)
+            self.assertIn("Suites: noble-security", fixture)
+            self.assertIn("Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg", fixture)
+
+    def test_legacy_azure_sources_and_third_party_repositories(self):
+        fixture = ("deb http://azure.archive.ubuntu.com/ubuntu/ noble main\n"
+                   "deb http://security.ubuntu.com/ubuntu noble-security main\n"
+                   "deb https://packages.microsoft.com/ubuntu/24.04/prod noble main\n")
+        text, count = rewrite_sources(fixture, "https://archive.ubuntu.com/ubuntu")
+        self.assertEqual(count, 2)
+        self.assertNotIn("azure", text)
+        self.assertNotIn("security.ubuntu.com", text)
+        self.assertIn("https://packages.microsoft.com/ubuntu/24.04/prod", text)
+
     def test_documentation(self):
         self.assertEqual(select(["README.md", "docs/e2e.md", "docs/screenshot.png"]),
                          {"native": False, "app": False})

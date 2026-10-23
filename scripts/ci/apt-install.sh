@@ -15,22 +15,7 @@ EOF
 
 for mirror in https://archive.ubuntu.com/ubuntu https://mirrors.edge.kernel.org/ubuntu; do
   echo "Using Ubuntu mirror: $mirror"
-  sudo python3 - "$mirror" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-# Handle both Noble's deb822 sources and legacy .list files. Preserve suites, components,
-# signing keys and third-party repositories; replace Ubuntu archive AND security origins.
-sources = [Path('/etc/apt/sources.list'), *Path('/etc/apt/sources.list.d').glob('*.list'),
-           *Path('/etc/apt/sources.list.d').glob('*.sources')]
-for source in sources:
-    if not source.exists():
-        continue
-    text = source.read_text()
-    text = re.sub(r'https?://[^\s]+/ubuntu/?(?=\s|$)', sys.argv[1], text)
-    source.write_text(text)
-PY
+  sudo python3 scripts/ci/apt-sources.py "$mirror"
   # One attempt takes at most 75 s update + 135 s install (+ 10 s kill grace each).
   if timeout --kill-after=10s 75s sudo apt-get update; then
     if [[ $1 == --playwright ]]; then
