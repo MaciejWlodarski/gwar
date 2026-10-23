@@ -417,13 +417,14 @@ export class ScreenController {
     const transport: ScreenWatchTransport = new ScreenWatchTransport({
       run,
       iceServers: useSession.getState().iceServers,
-      offer: async (sdp, run) => (await conn.request("screen.watch.offer", { run, sdp, browser: true }, { timeoutMs: 35_000 })).sdp,
+      offer: async (sdp, run, h264 = []) => (await conn.request("screen.watch.offer", { run, sdp, browser: true, h264 }, { timeoutMs: 35_000 })).sdp,
       state: state => {
         if (this.transport !== transport) return;
         if (state === "failed") { fail(new Error(tNow("screen.watchFailed"))); return; }
         dispatch({ type: "transport", run, phase: state });
         if (state === "connected") settle.resolve(run);
       },
+      decodeFailed: (slot, share, generation) => { if (this.transport === transport) void conn.request("screen.decode_failed", { run, slot, share, generation }).catch(() => {}); },
       track: (slot, stream) => { if (this.transport === transport) dispatch({ type: "stream", run, slot, stream }); },
     });
     this.transport = transport;
@@ -451,6 +452,21 @@ export class ScreenController {
 
   handleEvent(event: Event): void {
     switch (event.ev) {
+      case "screen.recover": {
+        const publisher = this.publisher;
+        if (publisher && useScreen.getState().own?.share === event.d.share) void publisher.recover(event.d).catch((e: unknown) => {
+          if (this.publisher !== publisher || useScreen.getState().own?.share !== event.d.share) return;
+          console.warn("Screen recovery:", e);
+          void this.stopShare();
+          useUi.getState().toast("error", tNow("screen.stopped.transport"));
+        });
+        return;
+      }
+      case "screen.keyframe": {
+        const { run, slot, share, generation } = event.d;
+        if (run === this.transport?.run) this.transport.keyframe(slot, share, generation);
+        return;
+      }
       case "screen.started":
         dispatch({ type: "live", share: event.d.share });
         return;
@@ -466,6 +482,7 @@ export class ScreenController {
         // A slot the server frees on its own comes before `screen.stopped`, which says why.
         const ended = share === null && run === screen.transport.run ? screen.watches.find(w => w.slot === slot && w.status === "watching") : undefined;
         if (ended) this.released.set(ended.share, { onStage: screen.stage === ended.share });
+        if (this.transport?.run === run) this.transport.clearSlot(slot);
         dispatch({ type: "slot", run, slot, share });
         return;
       }

@@ -47,8 +47,8 @@ kept here ([Spikes](#spikes)).
   - Paired voice latency measurements under video load and on constrained
     links gate the server PR. A separate task alone does not prove zero voice
     impact.
-- **Plaintext browser codec: H.264 first, VP9 profile 0 as fallback, with VP8
-  retained for older clients.** A2 forwards H.264 mode 1 through the SFU.
+- **Plaintext browser codec: H.264 first, VP9 profile 0 as the only fallback.**
+  A2 forwards H.264 mode 1 through the SFU.
   Encrypted shares are still refused by the server; their future SFrame
   layouts follow the spike results:
   - VP9 survives whole-frame SFrame.
@@ -272,37 +272,38 @@ the Linux app sharing; the owner deferred it.
 
 - Send H.264 `packetization-mode=1`, preferring Constrained Baseline
   (`42e01f` / equivalent constraint flags), then Constrained High or High;
-  next VP9 profile 0, then legacy VP8, followed by RTX. Main (`4d001f`) and
+  next VP9 profile 0, followed by RTX. Main (`4d001f`) and
   mode 0 are excluded. The SFU accepts Constrained Baseline, Constrained
   High (`640cxx`) and High (`6400xx`); it advertises level 5.1 receive support
   and `level-asymmetry-allowed=1`.
 - Receive preferences come only from `RTCRtpReceiver.getCapabilities`, with
-  H.264, VP9 and VP8. A sender capability never implies decoder support.
+  H.264 and VP9. A sender capability never implies decoder support.
   The SFU selects each slot's PT from that viewer's negotiated codecs and
   H.264 profile/receive capability. The SPS supplies the actual stream's
   profile and level. Receive `max-recv-level`, `max-fs`, `max-mbps`, `max-br`
-  and `max-dpb` are retained per offered PT; A2 conservatively requires a
-  whole effective receive level to cover the SPS level. The publish answer
+  and `max-dpb` are retained per offered PT; SPS levels and actual size/rate
+  must fit that viewer. The publish answer
   advertises level 5.1 (`42e033` / `640c33` / `640033`) with mutual
   `level-asymmetry-allowed=1`, allowing 1080p60, 1440p60 and 2160p30 within
   the unchanged ingress frame/packet/byte bounds.
-- Browser watch transports (including webviews and guest links) send
-  `browser: true`. Their default SDP level 3.1 is promoted to a level-5.1
-  decode floor: [libwebrtc's factory hardcodes 3.1](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/video_coding/codecs/h264/h264.cc),
-  while its [decoder uses the bitstream's decoded dimensions](https://webrtc.googlesource.com/src.git/+/refs/heads/main/modules/video_coding/codecs/h264/h264_decoder_impl.cc).
-  Firefox's [GMP adapter](https://raw.githubusercontent.com/mozilla/gecko-dev/master/dom/media/webrtc/libwebrtcglue/WebrtcGmpVideoCodec.cpp)
-  also initializes decode without an SDP-level ceiling. Explicit lower
-  `max-recv-level`, `max-fs`, `max-mbps`, `max-dpb` or `max-br` still constrain
-  admission. Native viewers omit the flag and state their real level.
-  See [Browser interop](native-media.md#browser-interop) for sources and scope.
-  The screen e2e requires 1920×1080 H.264 at the Chromium sender and both
-  Chromium and WebKit receivers using `getStats` dimensions, with the Game preset.
+- Browser and guest viewers probe WebRTC H.264 decoding at 720p30, 1080p60
+  and 1440p60 for each admitted profile. The highest verified tuple is sent
+  in the bounded `h264` capability list. Without it, the SDP level remains
+  authoritative; `browser: true` alone never promotes a decoder. Explicit
+  resource ceilings still apply. Every SPS, including every aggregate SPS
+  and bounded reassembled FU-A, is checked against profile, level and coded
+  macroblock size. A two-second RTP timestamp window enforces max-mbps with
+  10% tolerance without treating arrival jitter as an overrun.
+  See [Browser interop](native-media.md#browser-interop) for the wire fields,
+  dimensions and recovery rules. The screen e2e requires Game 1920×1080 H.264
+  at the sender and Chromium/WebKit receivers using real decoded dimensions.
 - A viewer that cannot decode a share gets its slot freed and
   `screen.stopped {reason: "codec"}`, with a clear browser/guest-page message.
-  The share and other viewers continue. There is no transcoding, automatic
-  publisher codec switch, or compatibility layer in A2. Asking a web sharer
-  to fall back to VP9 is follow-up work; A3/B11a own native compatibility
-  layers. An explicitly limited native decoder may still need 720p.
+  The share and other viewers continue. There is no transcoding or native
+  compatibility layer in A2. A bounded decode-progress watchdog first asks
+  the browser publisher for a lower H.264 target, then VP9 if offered, with a
+  ten-second hold-down and no automatic switch back. A3/B11a own native
+  compatibility layers. An explicitly limited native decoder may still need 720p.
 - Hardware encoding is chosen by the browser where available, with its
   software H.264 encoder otherwise. The sharing bar shows the negotiated
   codec and exposes the encoder implementation/hardware hint in its tooltip
@@ -312,7 +313,8 @@ the Linux app sharing; the owner deferred it.
 Encrypted H.264 still needs NAL-aware SFrame and start-code escaping, as
 specified in [native-media.md](native-media.md#encryption-nal-aware-sframe).
 A2 does not enable encrypted shares, browser AV1, HEVC, or native clients.
-VP8 remains a transitional compatibility codec; its removal is separate.
+VP8 is dropped. Verified H.264 decode probes and bounded recovery are described
+in [native-media.md, Browser interop](native-media.md#browser-interop).
 
 ### Presets
 
@@ -447,7 +449,7 @@ Each session has at most two screen transports besides its voice transport
     watch transport. PR 4's e2e covers start, stop and start while watching
     two other shares.
 - **Codecs:** H.264 mode 1 (Constrained Baseline/Constrained High/High),
-  VP9 profile 0 and legacy VP8, with RTX; no AV1 or HEVC negotiation yet.
+  VP9 profile 0, with RTX; no AV1 or HEVC negotiation yet.
   Extensions are the defaults (transport-cc, abs-send-time, mid, rid) and a
   slot-generation extension on the watch transport like voice's
   (`gwar_proto::rtp`).
@@ -2859,7 +2861,7 @@ person.
    - The address-map dispatch and bounded hand-off from the voice task, and
      the screen task.
    - `screen.publish.offer` and `screen.watch.offer`, and their `Rtc`s
-     (H.264/VP9/VP8 + RTX), polling after every input. A share is announced when
+     (H.264/VP9 + RTX), polling after every input. A share is announced when
      its publish transport connects, and ends with `transport` if it has not
      35 s after the answer.
    - Share admission: the `ScreenOrigin` binding and byte/packet buckets.

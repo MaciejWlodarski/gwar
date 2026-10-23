@@ -141,6 +141,15 @@ pub enum GuestMsg {
         id: u32,
         sdp: String,
         browser: bool,
+        h264: Vec<gwar_proto::H264Capability>,
+    },
+    DecodeFailed {
+        guest: SessionId,
+        id: u32,
+        share: String,
+        slot: u32,
+        run: u64,
+        generation: u16,
     },
     Keyframe {
         guest: SessionId,
@@ -158,7 +167,7 @@ pub(in crate::core) struct Guest {
     out: OutboundTx,
     /// Dropped with the guest: the gateway's writer stops (see [`GuestMsg::Watch`]).
     _held: oneshot::Sender<()>,
-    watch: Option<Watch>,
+    pub(super) watch: Option<Watch>,
     /// Private guests retain the original TeamSpeak membership after admission.
     membership: Option<Arc<Lease>>,
     /// Shared with the transport and its cancellation waiter, even before an offer arrives.
@@ -319,7 +328,28 @@ impl Core {
                     self.drop_guest(guest);
                 }
             }
-            GuestMsg::Offer { guest, id, sdp, browser } => self.guest_offer(guest, id, sdp, browser),
+            GuestMsg::Offer { guest, id, sdp, browser, h264 } => self.guest_offer(guest, id, sdp, browser, h264),
+            GuestMsg::DecodeFailed { guest, id, share, slot, run, generation } => {
+                if !self.guest_current(guest) {
+                    return;
+                }
+                let current = slot == 0
+                    && self.guests.get(&guest).is_some_and(|g| {
+                        g.share == share
+                            && g.watch.as_ref().is_some_and(|w| {
+                                w.run == run && w.slots[0].as_ref().is_some_and(|(_, grant)| grant.alive())
+                            })
+                    });
+                let result = if current {
+                    self.screen
+                        .try_send(ScreenCmd::DecodeFailed { session: guest, share, slot, run, generation })
+                        .map(|_| Response::Empty {})
+                        .map_err(|_| err(ErrorCode::Unavailable, "screen engine busy"))
+                } else {
+                    Err(stale())
+                };
+                self.reply_guest(guest, id, result);
+            }
             GuestMsg::Keyframe { guest, id, share } => {
                 if !self.guest_current(guest) {
                     return;
@@ -422,7 +452,14 @@ impl Core {
     }
 
     /// `guest.offer`: the guest's one-slot watch transport, negotiated once.
-    fn guest_offer(&mut self, guest: SessionId, id: u32, sdp: String, browser: bool) {
+    fn guest_offer(
+        &mut self,
+        guest: SessionId,
+        id: u32,
+        sdp: String,
+        browser: bool,
+        h264: Vec<gwar_proto::H264Capability>,
+    ) {
         if !self.guest_current(guest) {
             return;
         }
@@ -447,6 +484,7 @@ impl Core {
             run: GUEST_RUN,
             sdp: sdp.clone(),
             browser,
+            h264: h264.clone(),
             answer: None,
             connected: false,
             slots: Default::default(),
@@ -460,6 +498,7 @@ impl Core {
             slots: GUEST_SLOTS,
             sdp,
             browser,
+            h264: h264.clone(),
             reply,
         });
         let Some(tx) = self.me.upgrade() else { return };
@@ -677,7 +716,7 @@ impl Core {
         );
     }
 
-    fn send_guest_event(&mut self, guest: SessionId, event: Event) {
+    pub(super) fn send_guest_event(&mut self, guest: SessionId, event: Event) {
         let Some(g) = self.guests.get(&guest) else { return };
         if g.out.try_send(Outbound::Frame(encode(&ServerFrame::Event(event)))).is_err() {
             self.drop_guest(guest);
@@ -1004,6 +1043,7 @@ mod tests {
                         run: GUEST_RUN,
                         sdp: String::new(),
                         browser: false,
+                        h264: vec![],
                         answer: None,
                         connected: false,
                         slots: Default::default(),
@@ -1045,6 +1085,7 @@ mod tests {
                         run: GUEST_RUN,
                         sdp: String::new(),
                         browser: false,
+                        h264: vec![],
                         answer: None,
                         connected: false,
                         slots: Default::default(),
@@ -1056,7 +1097,7 @@ mod tests {
                 if connecting {
                     core.guest_watching(guest, GUEST_RUN, true);
                 } else {
-                    core.guest_offer(guest, 2, String::new(), false);
+                    core.guest_offer(guest, 2, String::new(), false, vec![]);
                 }
                 assert!(!core.guests.contains_key(&guest));
                 assert!(core.shares["S"].guests.is_empty(), "the admission is free");
@@ -1091,6 +1132,7 @@ mod tests {
                 run: 1,
                 sdp: String::new(),
                 browser: false,
+                h264: vec![],
                 answer: None,
                 connected: true,
                 slots: Default::default(),
@@ -1134,6 +1176,7 @@ mod tests {
                 run: 1,
                 sdp: String::new(),
                 browser: false,
+                h264: vec![],
                 answer: None,
                 connected: true,
                 slots: Default::default(),
@@ -1154,6 +1197,7 @@ mod tests {
             run: GUEST_RUN,
             sdp: String::new(),
             browser: false,
+            h264: vec![],
             answer: None,
             connected: true,
             slots: Default::default(),

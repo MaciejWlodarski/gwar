@@ -77,6 +77,12 @@ jobs:
         timeout-minutes: 15
         run: cargo test --workspace --exclude gwar-desktop
 
+      - name: Vendored str0m payload and SDP negotiation regressions
+        timeout-minutes: 5
+        run: |
+          cargo test -j 4 --manifest-path vendor/str0m/Cargo.toml --no-default-features --features aws-lc-rs,_internal_test_exports --lib format::payload_params
+          cargo test -j 4 --manifest-path vendor/str0m/Cargo.toml --no-default-features --features aws-lc-rs,_internal_test_exports --test sdp-negotiation
+
   # The full network matrices run independently of the workspace's 15-minute Tests step.
   # Default server tests retain every scheduler cadence protected by the voice gate.
   rust-screen-sim:

@@ -178,7 +178,7 @@ async fn an_overrun_cuts_the_rest_until_a_keyframe_and_three_end_the_share() {
             sequence: *sequence + 2,
             timestamp: *timestamp,
             marker: true,
-            payload: screen::vp8(false, false, &[41, 0, 0xaa, 0x55]),
+            payload: screen::vp9(false, false, &[41, 0, 0xaa, 0x55]),
         };
         *sequence += 3;
         *timestamp += 2700;
@@ -489,11 +489,16 @@ async fn screen_limits_are_server_settings_and_the_egress_counter_reports_the_mo
 
 /// Canonical H.264 IDR prefix followed by FU-A IDR data; the server never decodes it.
 fn h264_frame(source: u64, timestamp: u32) -> Vec<Packet> {
-    [vec![0x67, 0x42, 0xe0, 0x1f, 0x80], vec![0x68, 0xce, 0x06], vec![0x7c, 0x85, 0x88], vec![0x7c, 0x45, 0x84]]
-        .into_iter()
-        .enumerate()
-        .map(|(i, payload)| Packet { sequence: source + i as u64, timestamp, marker: i == 3, payload })
-        .collect()
+    [
+        vec![0x67, 0x42, 0xe0, 0x1f, 0xf4, 0x05, 0x01, 0x6c, 0x80],
+        vec![0x68, 0xce, 0x06],
+        vec![0x7c, 0x85, 0x88],
+        vec![0x7c, 0x45, 0x84],
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, payload)| Packet { sequence: source + i as u64, timestamp, marker: i == 3, payload })
+    .collect()
 }
 
 #[tokio::test]

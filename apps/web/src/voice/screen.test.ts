@@ -30,7 +30,7 @@ describe("negotiation", () => {
   it("prefers H.264 mode 1 Constrained Baseline, then VP9 profile 0, legacy VP8 and RTX", () => {
     const list = [codec("video/H264", "packetization-mode=0;profile-level-id=42e01f"), codec("video/H264", "packetization-mode=1;profile-level-id=640c1f"), codec("video/H264", "packetization-mode=1;profile-level-id=42e01f"), codec("video/H264", "packetization-mode=1;profile-level-id=4d001f"), codec("video/VP8"), codec("video/rtx", "apt=96"), codec("video/VP9", "profile-id=2"),
       codec("video/VP9", "profile-id=0"), codec("video/AV1"), codec("video/red"), codec("video/ulpfec")];
-    expect(preferredCodecs(list).map(c => `${c.mimeType} ${c.sdpFmtpLine ?? ""}`.trim())).toEqual(["video/H264 packetization-mode=1;profile-level-id=42e01f", "video/H264 packetization-mode=1;profile-level-id=640c1f", "video/VP9 profile-id=0", "video/VP8", "video/rtx apt=96"]);
+    expect(preferredCodecs(list).map(c => `${c.mimeType} ${c.sdpFmtpLine ?? ""}`.trim())).toEqual(["video/H264 packetization-mode=1;profile-level-id=42e01f", "video/H264 packetization-mode=1;profile-level-id=640c1f", "video/VP9 profile-id=0", "video/rtx apt=96"]);
   });
 
   it("reads the share's SSRC and its RTX from the offer's FID group", () => {
@@ -88,7 +88,7 @@ describe("publish transport", () => {
     const pc = Peer.all[0]!;
     expect(pc.transceivers).toHaveLength(1);
     expect(pc.transceivers[0]!.init).toMatchObject({ direction: "sendonly", sendEncodings: [{ maxBitrate: 4_000_000, maxFramerate: 30, priority: "low", networkPriority: "low" }] });
-    expect(pc.transceivers[0]!.setCodecPreferences).toHaveBeenCalledWith([expect.objectContaining({ mimeType: "video/VP9" }), expect.objectContaining({ mimeType: "video/VP8" }), expect.objectContaining({ mimeType: "video/rtx" })]);
+    expect(pc.transceivers[0]!.setCodecPreferences).toHaveBeenCalledWith([expect.objectContaining({ mimeType: "video/VP9" }), expect.objectContaining({ mimeType: "video/rtx" })]);
     expect(offer).toHaveBeenCalledWith(expect.objectContaining({ ssrc: 10, rtx_ssrc: 11 }));
     expect(pc.sendParams.at(-1)).toMatchObject({ degradationPreference: "balanced", encodings: [{ maxBitrate: 4_000_000, priority: "low" }] });
     expect(publisher.bitrate).toBe(4_000_000);
@@ -154,7 +154,7 @@ describe("watch transport", () => {
     const pc = Peer.all[0]!;
     expect(pc.transceivers.map(t => t.direction)).toEqual(Array(SCREEN_SLOTS).fill("recvonly"));
     expect(pc.transceivers.every(t => t.receiver.jitterBufferTarget === 0)).toBe(true);
-    expect(offer).toHaveBeenCalledWith(expect.any(String), 5);
+    expect(offer).toHaveBeenCalledWith(expect.any(String), 5, []);
     pc.ontrack?.({ transceiver: pc.transceivers[2], track: "video", streams: [] });
     expect(tracks).toEqual([[2, { tracks: ["video"] }]]);
     transport.close();
@@ -207,4 +207,62 @@ describe("H.264 sender diagnostics", () => {
     expect(prefs.some(c => c.mimeType === "video/H264")).toBe(false);
     transport.close();
   });
+});
+
+describe("verified H.264 decode capability and progress", () => {
+  it("probes all three profiles and targets, keeps the highest successful tuple, and fails closed", async () => {
+    const decodingInfo = vi.fn(async (c: MediaDecodingConfiguration) => ({ supported: c.video!.width <= 1920, smooth: true, powerEfficient: false }));
+    vi.stubGlobal("navigator", { mediaCapabilities: { decodingInfo } });
+    const { probeH264 } = await import("./screen");
+    expect(await probeH264()).toEqual([0x42e02a, 0x64002a, 0x640c2a].map(profile_level_id => ({ profile_level_id, max_fs: 8160, max_mbps: 489600 })));
+    expect(decodingInfo).toHaveBeenCalledTimes(9);
+    expect(decodingInfo.mock.calls.every(([c]) => c.type === "webrtc" && c.video!.contentType.includes("packetization-mode=1"))).toBe(true);
+    decodingInfo.mockRejectedValue(new Error("unsupported"));
+    expect(await probeH264()).toEqual([]);
+  });
+  it("bounds probe time and never publishes an unverified or late tuple", async () => {
+    let finish!: (v: MediaCapabilitiesDecodingInfo) => void;
+    vi.stubGlobal("navigator", { mediaCapabilities: { decodingInfo: () => new Promise<MediaCapabilitiesDecodingInfo>(resolve => { finish = resolve; }) } });
+    const { probeH264 } = await import("./screen");
+    const pending = probeH264();
+    await vi.advanceTimersByTimeAsync(1500);
+    const caps = await pending;
+    expect(caps).toEqual([]);
+    finish({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null });
+    await Promise.resolve();
+    expect(caps).toEqual([]);
+  });
+  it("reports persistent zero decode under traffic, with bounded retries and no network-gap false failure", async () => {
+    const { DecodeWatchdog } = await import("./screen");
+    const watchdog = new DecodeWatchdog();
+    const reports = [];
+    for (let n = 0; n <= 20; n++) if (watchdog.observe(n * 1000, n * 100, 0)) reports.push(n);
+    expect(reports).toEqual([4, 10]);
+    const decoding = new DecodeWatchdog(), starved = new DecodeWatchdog();
+    for (let n = 0; n < 20; n++) {
+      expect(decoding.observe(n * 1000, n * 100, n)).toBe(false);
+      expect(starved.observe(n * 1000, Math.floor(n / 5), 0)).toBe(false);
+    }
+  });
+});
+
+it("keeps the original publisher alive until its replacement is accepted and retains VP9 for recovery", async () => {
+  vi.stubGlobal("RTCRtpSender", { getCapabilities: () => ({ codecs: [codec("video/H264", "packetization-mode=1;profile-level-id=42e01f"), codec("video/VP9", "profile-id=0"), codec("video/rtx")] }) });
+  let answer!: (sdp: string) => void;
+  const offer = vi.fn(async () => "answer");
+  const track = { applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }) } as unknown as MediaStreamTrack;
+  const publisher = new ScreenPublisher({ track, preset: "game", iceServers: [], offer, state: () => {} });
+  await publisher.start();
+  const original = Peer.all[0]!;
+  offer.mockImplementationOnce(() => new Promise<string>(resolve => { answer = resolve; }));
+  const pending = publisher.recover({ share: "s", codec: "h264", width: 1280, height: 720, fps: 30 });
+  await vi.waitFor(() => expect(offer).toHaveBeenCalledTimes(2));
+  expect(original.close).not.toHaveBeenCalled();
+  expect(Peer.all[1]!.transceivers[0]!.setCodecPreferences.mock.calls[0]![0]).toEqual(expect.arrayContaining([expect.objectContaining({ mimeType: "video/VP9" })]));
+  answer("answer"); await pending;
+  expect(original.close).toHaveBeenCalledOnce();
+  await publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
+  expect(Peer.all[2]!.transceivers[0]!.setCodecPreferences.mock.calls[0]![0].map((c: RTCRtpCodec) => c.mimeType)).toEqual(["video/VP9", "video/rtx"]);
+  expect(Peer.all[2]!.sendParams.at(-1)?.encodings[0]).toMatchObject({ maxFramerate: 30, scaleResolutionDownBy: 1.5 });
+  publisher.close();
 });

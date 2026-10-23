@@ -631,7 +631,7 @@ impl PayloadParams {
         if self.spec.codec == Codec::H264 {
             let asymmetric = self.spec.format.level_asymmetry_allowed == Some(true)
                 && first.spec.format.level_asymmetry_allowed == Some(true);
-            self.spec.format.level_asymmetry_allowed = Some(asymmetric);
+            self.spec.format.level_asymmetry_allowed = first.spec.format.level_asymmetry_allowed.map(|_| asymmetric);
             if !asymmetric {
                 let local = self.spec.format.profile_level_id
                     .and_then(|id| H264ProfileLevel::try_from(id).ok())
@@ -942,15 +942,29 @@ mod test {
                 (None, Some(true), 0x42e033, 0x42e01f, 0x42e01f),
                 (Some(false), Some(false), 0x42e01f, 0x42e033, 0x42e01f),
                 (None, None, 0x42e01f, 0x42f00b, 0x42f00b),
+                (None, None, 0x42e00b, 0x42f00b, 0x42f00b),
+                (None, None, 0x42f00b, 0x42e00b, 0x42f00b),
+                (None, None, 0x42e00a, 0x42f00b, 0x42e00a),
+                (None, None, 0x42f00b, 0x42e00a, 0x42e00a),
+                (None, None, 0x42e00a, 0x42e00b, 0x42e00a),
+                (None, None, 0x42e00b, 0x42e00a, 0x42e00a),
             ] {
-                let mut local = PayloadParams::new(108.into(), Some(109.into()),
-                    h264_codec_spec(local_asymmetry, Some(1), Some(local_id)));
-                let remote = PayloadParams::new(110.into(), Some(111.into()),
-                    h264_codec_spec(remote_asymmetry, Some(1), Some(remote_id)));
+                let mut local = PayloadParams::new(
+                    108.into(),
+                    Some(109.into()),
+                    h264_codec_spec(local_asymmetry, Some(1), Some(local_id)),
+                );
+                let remote = PayloadParams::new(
+                    110.into(),
+                    Some(111.into()),
+                    h264_codec_spec(remote_asymmetry, Some(1), Some(remote_id)),
+                );
                 local.update_param(&[remote], &mut [false; 128], false, &mut HashSet::new());
                 assert_eq!(local.spec.format.profile_level_id, Some(expected));
-                assert_eq!(local.spec.format.level_asymmetry_allowed,
-                    Some(local_asymmetry == Some(true) && remote_asymmetry == Some(true)));
+                assert_eq!(
+                    local.spec.format.level_asymmetry_allowed,
+                    remote_asymmetry.map(|_| local_asymmetry == Some(true) && remote_asymmetry == Some(true))
+                );
             }
         }
 

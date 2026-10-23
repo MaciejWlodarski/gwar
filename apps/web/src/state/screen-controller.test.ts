@@ -16,6 +16,8 @@ vi.mock("../voice/screen", async importOriginal => {
   class ScreenWatchTransport {
     readonly run: number;
     close = vi.fn();
+    clearSlot = vi.fn();
+    keyframe = vi.fn();
     constructor(readonly params: { run: number; state(s: string): void; offer(sdp: string, run: number): Promise<string> }) { this.run = params.run; media.transports.push(this); }
     async start() { await this.params.offer("watch-offer", this.run); }
     async stats() { return null; }

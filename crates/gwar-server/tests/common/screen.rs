@@ -1,4 +1,4 @@
-//! Screen-sharing peers for the server tests: a str0m publisher writing synthetic VP8 frames
+//! Screen-sharing peers for the server tests: a str0m publisher writing synthetic VP9 frames
 //! and a str0m viewer with the watch transport's slots, both in RTP mode over real SRTP.
 #![allow(dead_code)]
 use super::Client;
@@ -30,9 +30,9 @@ pub struct Packet {
     pub payload: Vec<u8>,
 }
 
-/// A VP8 payload: descriptor (S, partition 0) and payload header (keyframe bit), then `body`.
-pub fn vp8(start: bool, keyframe: bool, body: &[u8]) -> Vec<u8> {
-    let mut payload = vec![if start { 0x10 } else { 0x00 }, if keyframe { 0x00 } else { 0x01 }];
+/// A VP9 payload: descriptor (I/P/B flags and a one-byte picture id), then `body`.
+pub fn vp9(start: bool, keyframe: bool, body: &[u8]) -> Vec<u8> {
+    let mut payload = vec![0x80 | if start { 0x08 } else { 0 } | if keyframe { 0 } else { 0x40 }, 0];
     payload.extend_from_slice(body);
     payload
 }
@@ -47,7 +47,7 @@ pub fn frame(sequence: u64, timestamp: u32, keyframe: bool, packets: usize, tag:
                 sequence: sequence + i as u64,
                 timestamp,
                 marker: i + 1 == packets,
-                payload: vp8(i == 0, keyframe, &body),
+                payload: vp9(i == 0, keyframe, &body),
             }
         })
         .collect()
@@ -112,7 +112,7 @@ async fn socket() -> (UdpSocket, std::net::SocketAddr) {
 }
 
 fn rtc(local: std::net::SocketAddr, h264_pt: u8) -> Rtc {
-    let mut config = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp8(true).enable_vp9(true);
+    let mut config = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp9(true);
     config.codec_config().add_h264(h264_pt.into(), Some((h264_pt + 1).into()), true, 0x42e01f);
     let mut rtc = config.build(Instant::now());
     rtc.add_local_candidate(Candidate::host(local, "udp").unwrap());
@@ -128,7 +128,7 @@ fn video_ssrcs(sdp: &str) -> (u32, u32) {
 impl Publisher {
     /// Negotiates the publish transport of `share` and waits until it is connected.
     pub async fn start(client: &mut Client, share: &str) -> Self {
-        Self::start_codec(client, share, Codec::Vp8).await
+        Self::start_codec(client, share, Codec::Vp9).await
     }
 
     pub async fn start_codec(client: &mut Client, share: &str, codec: Codec) -> Self {

@@ -117,6 +117,7 @@ export interface ResponseMap {
   "screen.watch.offer": { sdp: string };
   "screen.focus": Empty;
   "screen.keyframe": Empty;
+  "screen.decode_failed": Empty;
   "owner.chain": { genesis: string; links: import("../proto/OwnerLinkStatement").OwnerLinkStatement[]; next: number | null };
   "owner.transfer": Empty;
   "managers.update": Empty;

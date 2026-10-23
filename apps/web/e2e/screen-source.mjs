@@ -61,12 +61,12 @@ export function readBarcode(video) {
 export function canvasCapture(sources, stamp) {
   let next = 0;
   navigator.mediaDevices.getDisplayMedia = async () => {
-    const { id, size } = sources[Math.min(next++, sources.length - 1)];
+    const { id, size, fps = 20 } = sources[Math.min(next++, sources.length - 1)];
     const canvas = document.createElement("canvas");
     [canvas.width, canvas.height] = size;
     canvas.style.cssText = "position:fixed;left:0;bottom:0;width:64px;height:36px;opacity:0.02;pointer-events:none;z-index:-1";
     document.body.appendChild(canvas);
-    stamp(canvas, id);
-    return canvas.captureStream(20);
+    stamp(canvas, id, fps);
+    return canvas.captureStream(fps);
   };
 }

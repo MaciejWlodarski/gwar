@@ -22,7 +22,9 @@ pub mod dependency_descriptor;
 mod egress;
 pub mod h264;
 mod h264_admission;
+mod h264_stream;
 mod ingress;
+mod recovery;
 mod segment;
 #[cfg(test)]
 mod sim;
@@ -110,6 +112,7 @@ pub struct ScreenOrigin {
     /// The bitrate cap its ingress byte bucket follows, and what each of its slots reserves.
     pub cap_bps: u64,
     alive: AtomicBool,
+    recovery: std::sync::Mutex<recovery::Recovery>,
 }
 
 impl ScreenOrigin {
@@ -121,7 +124,16 @@ impl ScreenOrigin {
         private: bool,
         cap_bps: u64,
     ) -> Arc<Self> {
-        Arc::new(Self { session, share, channel, encrypted, private, cap_bps, alive: AtomicBool::new(true) })
+        Arc::new(Self {
+            session,
+            share,
+            channel,
+            encrypted,
+            private,
+            cap_bps,
+            alive: AtomicBool::new(true),
+            recovery: Default::default(),
+        })
     }
     pub fn alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
@@ -270,6 +282,19 @@ pub enum ScreenSignal {
         run: u64,
         grant: Arc<WatchGrant>,
     },
+    Keyframe {
+        session: SessionId,
+        run: u64,
+        slot: u32,
+        generation: u16,
+        grant: Arc<WatchGrant>,
+    },
+    Recover {
+        session: SessionId,
+        run: u64,
+        grant: Arc<WatchGrant>,
+        plan: gwar_proto::ScreenRecovery,
+    },
     Resumed {
         session: SessionId,
         run: u64,
@@ -325,6 +350,7 @@ pub enum ScreenCmd {
         slots: usize,
         sdp: String,
         browser: bool,
+        h264: Vec<gwar_proto::H264Capability>,
         reply: oneshot::Sender<Result<String, &'static str>>,
     },
     EndWatch {
@@ -358,6 +384,13 @@ pub enum ScreenCmd {
     /// A viewer's `screen.keyframe`.
     Keyframe {
         session: SessionId,
+        share: String,
+    },
+    DecodeFailed {
+        session: SessionId,
+        run: u64,
+        slot: u32,
+        generation: u16,
         share: String,
     },
     Inspect {
@@ -444,7 +477,7 @@ struct Publisher {
     ssrc: Ssrc,
     codecs: HashMap<Pt, VideoCodec>,
     prefix: h264_admission::Prefix,
-    h264_profile: Option<(u64, u32)>,
+    h264_stream: h264_stream::Admission,
     meter: Meter,
     ingress: Ingress,
     /// What passed ingress: the share's average and keyframe sizes, for its viewers' allocation.
@@ -472,6 +505,9 @@ struct Slot {
     /// Released originals still owned by str0m: sequence, source keyframe and arrival deadline.
     originals: VecDeque<(u16, Option<u32>, Instant)>,
     written: u64,
+    keyframe_at: Option<Instant>,
+    last_h264: Option<(Instant, h264_stream::Requirements)>,
+    decode_cap: Option<(u32, u32)>,
 }
 
 impl Slot {
@@ -488,6 +524,9 @@ impl Slot {
             asked: None,
             originals: VecDeque::new(),
             written: 0,
+            keyframe_at: None,
+            last_h264: None,
+            decode_cap: None,
         }
     }
 }
@@ -504,6 +543,7 @@ struct Watcher {
     /// How many slots the offer has.
     size: usize,
     h264: HashMap<Mid, HashMap<Pt, codec::Limits>>,
+    decode_watchdog: bool,
     /// Assignments that arrived before the slot's m-line was seen, with their watch order.
     pending: Vec<(u32, Arc<WatchGrant>, u64)>,
     connected: bool,
@@ -521,6 +561,7 @@ struct Watcher {
 /// A packet that passed ingress, to be written to every slot that carries its share.
 #[derive(Clone)]
 struct Forward {
+    h264: Option<h264_stream::Requirements>,
     source: u64,
     timestamp: u32,
     marker: bool,
@@ -687,6 +728,17 @@ impl Sfu {
                 if reply.is_closed() || !origin.alive() {
                     return;
                 }
+                for (session, index) in self.slots_of(&origin.share) {
+                    if let Some(w) = self.watchers.get_mut(&session) {
+                        w.egress.clear(index);
+                        w.slots[index].segment.wait();
+                        w.slots[index].originals.clear();
+                        w.slots[index].generation = w.slots[index].generation.wrapping_add(1);
+                        w.slots[index].keyframe_at = None;
+                        w.slots[index].last_h264 = None;
+                        wipe(&mut w.rtc, w.slots[index].mid);
+                    }
+                }
                 self.end_publish(&origin.share);
                 let id = self.id();
                 match publisher(id, origin, ssrc, &sdp, self.advertise, now) {
@@ -700,7 +752,7 @@ impl Sfu {
                 }
             }
             ScreenCmd::EndPublish { share } => self.end_publish(&share),
-            ScreenCmd::Watch { session, run, lease, slots, sdp, browser, reply } => {
+            ScreenCmd::Watch { session, run, lease, slots, sdp, browser, h264, reply } => {
                 if reply.is_closed() || !lease.alive() {
                     return;
                 }
@@ -710,7 +762,7 @@ impl Sfu {
                 }
                 self.end_watch(session);
                 let id = self.id();
-                match watcher(id, session, run, lease, slots, &sdp, browser, self.advertise, now) {
+                match watcher(id, session, run, lease, slots, &sdp, browser, &h264, self.advertise, now) {
                     Ok((mut watcher, answer)) => {
                         let (socket, measured, shared) = (&self.socket, &mut self.measured, &self.shared);
                         let guest = watcher.size == GUEST_SLOTS;
@@ -773,6 +825,9 @@ impl Sfu {
                 if let Some(slot) = slot {
                     self.ask_keyframe(session, slot, now);
                 }
+            }
+            ScreenCmd::DecodeFailed { session, run, slot, generation, share } => {
+                self.decode_failed(session, run, slot as usize, generation, &share, now);
             }
             ScreenCmd::Inspect { reply } => {
                 let _ = reply.send(self.snapshot());
@@ -926,6 +981,8 @@ impl Sfu {
             ScreenSignal::Publish { share, signal: PublishSignal::Ended(_) } => self.outbox.retain(|queued| {
                 !matches!(queued, ScreenSignal::Publish { share: s, signal: PublishSignal::Connected } if s == share)
             }),
+            ScreenSignal::Keyframe { session, slot, .. } => self.outbox.retain(|queued| !matches!(queued, ScreenSignal::Keyframe { session: s, slot: i, .. } if s == session && i == slot)),
+            ScreenSignal::Recover { grant, .. } => self.outbox.retain(|queued| !matches!(queued, ScreenSignal::Recover { grant: g, .. } if g.share == grant.share)),
             ScreenSignal::Publish { .. } => {}
             // Only a viewer's latest pause or resume of a share matters. Keep its exact
             // grant so the core can reject it if the assignment has since been replaced.
@@ -1137,6 +1194,7 @@ impl Sfu {
                         let Some(codec) = p.codecs.get(&packet.header.payload_type).copied() else { continue };
                         if matches!(codec, VideoCodec::H264(_)) {
                             let forward = Forward {
+                                h264: None,
                                 source: *packet.seq_no,
                                 timestamp: packet.header.timestamp,
                                 marker: packet.header.marker,
@@ -1161,6 +1219,7 @@ impl Sfu {
                                 {
                                     p.rate.record(source, packet.header.timestamp, packet.payload.len(), keyframe, now);
                                     Forward {
+                                        h264: None,
                                         source,
                                         timestamp: packet.header.timestamp,
                                         marker: packet.header.marker,
@@ -1216,7 +1275,17 @@ impl Sfu {
                 if w.slots[index].grant.is_none() {
                     continue;
                 }
-                if slot_pt(&w.slots[index], forward.codec).is_none() {
+                let vp9_requested = w.slots[index]
+                    .grant
+                    .as_ref()
+                    .is_some_and(|g| g.origin.recovery.lock().expect("recovery lock").wants_vp9());
+                if slot_packet_pt(&w.slots[index], forward).is_none() || vp9_requested && forward.h264.is_some() {
+                    if w.slots[index].decode_cap.is_some()
+                        && let Some(need) = forward.h264
+                    {
+                        self.recover_slot(session, index, need, now);
+                        continue;
+                    }
                     debug!(session, slot = index, codec = ?forward.codec, "screen codec incompatible with viewer offer");
                     let grant = w.slots[index].grant.clone().expect("checked above");
                     let run = w.run;
@@ -1235,6 +1304,22 @@ impl Sfu {
                 }
                 let Some(w) = self.watchers.get_mut(&session) else { continue };
                 if admitted {
+                    if w.decode_watchdog
+                        && forward.keyframe
+                        && forward.h264.is_some()
+                        && w.slots[index].keyframe_at.is_none()
+                    {
+                        let slot = &mut w.slots[index];
+                        slot.keyframe_at = Some(now);
+                        let signal = ScreenSignal::Keyframe {
+                            session,
+                            run: w.run,
+                            slot: index as u32,
+                            generation: slot.generation,
+                            grant: slot.grant.clone().expect("assigned"),
+                        };
+                        self.signal(signal);
+                    }
                     if !touched.contains(&session) {
                         touched.push(session);
                     }
@@ -1310,6 +1395,56 @@ impl Sfu {
         requests.dedup();
         for slot in requests {
             self.ask_keyframe(session, slot, now);
+        }
+    }
+
+    fn decode_failed(
+        &mut self,
+        session: SessionId,
+        run: u64,
+        index: usize,
+        generation: u16,
+        share: &str,
+        now: Instant,
+    ) {
+        let Some(w) = self.watchers.get_mut(&session).filter(|w| w.run == run && w.decode_watchdog) else { return };
+        let Some(slot) = w.slots.get_mut(index) else { return };
+        if !slot.grant.as_ref().is_some_and(|g| g.alive() && g.share == share) {
+            return;
+        }
+        if slot.generation != generation
+            || !slot.keyframe_at.is_some_and(|at| now.saturating_duration_since(at) >= Duration::from_secs(4))
+        {
+            return;
+        }
+        let Some((at, need)) = slot.last_h264 else { return };
+        if now.saturating_duration_since(at) > Duration::from_secs(2) {
+            return;
+        }
+        self.recover_slot(session, index, need, now);
+    }
+
+    fn recover_slot(&mut self, session: SessionId, index: usize, need: h264_stream::Requirements, now: Instant) {
+        let Some(w) = self.watchers.get_mut(&session) else { return };
+        let run = w.run;
+        let slot = &mut w.slots[index];
+        let Some(grant) = slot.grant.clone().filter(|g| g.alive()) else { return };
+        let share = &grant.share;
+        let vp9 = slot.pts.contains_key(&VideoCodec::Vp9)
+            && self.publishers.get(share).is_some_and(|p| p.codecs.values().any(|c| *c == VideoCodec::Vp9));
+        let (plan, waiting, terminal) = {
+            let mut recovery = grant.origin.recovery.lock().expect("recovery lock");
+            let plan = recovery.fail(share, need.width, need.height, vp9, now);
+            (plan, recovery.waiting(now), recovery.terminal())
+        };
+        if let Some(plan) = plan {
+            let fs = plan.width.div_ceil(16) * plan.height.div_ceil(16);
+            slot.decode_cap = Some((fs, fs * plan.fps));
+            slot.segment.wait();
+            self.signal(ScreenSignal::Recover { session, run, grant, plan });
+        } else if !waiting && terminal {
+            empty(w, index);
+            self.signal(ScreenSignal::Incompatible { session, run, grant });
         }
     }
 
@@ -1395,7 +1530,6 @@ fn video_pts(rtc: &Rtc, mid: Mid) -> HashMap<VideoCodec, Pt> {
             continue;
         }
         let codec = match params.spec().codec {
-            Codec::Vp8 => VideoCodec::Vp8,
             Codec::Vp9 => VideoCodec::Vp9,
             Codec::H264 => VideoCodec::H264(params.spec().format.profile_level_id.unwrap_or(0x42e01f)),
             _ => continue,
@@ -1690,6 +1824,9 @@ fn empty(w: &mut Watcher, index: usize) {
     slot.grant = None;
     slot.segment.wait();
     slot.asked = None;
+    slot.keyframe_at = None;
+    slot.last_h264 = None;
+    slot.decode_cap = None;
     slot.originals.clear();
     w.egress.unassign(index);
     wipe(&mut w.rtc, slot.mid);
@@ -1740,11 +1877,29 @@ fn slot_pt(slot: &Slot, codec: VideoCodec) -> Option<Pt> {
     slot.pts.get(&codec).copied()
 }
 
+fn slot_packet_pt(slot: &Slot, packet: &Forward) -> Option<Pt> {
+    if let Some(need) = packet.h264 {
+        if let Some((fs, mbps)) = slot.decode_cap
+            && (need.frame_mbs > fs || u64::from(need.mbps) * 100 > u64::from(mbps) * 110)
+        {
+            return None;
+        }
+        return slot
+            .h264
+            .iter()
+            .filter(|(_, limits)| limits.accepts_stream(&need))
+            .map(|(pt, _)| *pt)
+            .filter(|pt| slot.pts.values().any(|p| p == pt))
+            .min_by_key(|pt| **pt);
+    }
+    slot_pt(slot, packet.codec)
+}
+
 /// Meter every packet on arrival. Existing segments receive immediately; only waiting slots
 /// receive a replay of the confirmed prefix. The replay is neither re-metered nor re-recorded.
 fn h264_packet(
     p: &mut Publisher,
-    mut packet: Forward,
+    packet: Forward,
     waiting: bool,
     now: Instant,
 ) -> (Vec<Forward>, Vec<Forward>, Option<Verdict>) {
@@ -1756,31 +1911,27 @@ fn h264_packet(
         }
         return (Vec::new(), Vec::new(), Some(verdict));
     }
-    let Some(description) = h264::describe(&packet.payload, false) else {
-        p.ingress.counters.dropped += 1;
-        let discarded = p.prefix.reject(&packet);
-        if p.ingress.waiting() {
-            p.ingress.counters.dropped += discarded as u64;
-        }
-        p.keyframes.pending |= waiting || p.ingress.waiting();
-        return (Vec::new(), Vec::new(), None);
-    };
-    if let Some(bytes) = description.profile_level_id {
-        let profile = u32::from_be_bytes([0, bytes[0], bytes[1], bytes[2]]);
-        let accepted = matches!(packet.codec, VideoCodec::H264(id) if codec::stream_fits(id, profile));
-        if !accepted {
+    let packets = match p.h264_stream.inspect(packet.clone()) {
+        Ok(packets) => packets,
+        Err(()) => {
             p.ingress.block_h264();
             p.ingress.counters.dropped += 1 + p.prefix.reject(&packet) as u64;
             p.keyframes.pending = true;
             return (Vec::new(), Vec::new(), Some(Verdict::Overrun));
         }
-        if p.h264_profile.is_none_or(|(source, _)| packet.source >= source) {
-            p.h264_profile = Some((packet.source, profile));
-        }
+    };
+    let mut live = Vec::new();
+    let mut held = Vec::new();
+    for packet in packets {
+        let (immediate, prefix) = h264_admitted(p, packet, waiting, now);
+        live.extend(immediate);
+        held.extend(prefix);
     }
-    if let Some((_, profile)) = p.h264_profile {
-        packet.codec = VideoCodec::H264(profile);
-    }
+    (live, held, None)
+}
+
+fn h264_admitted(p: &mut Publisher, packet: Forward, waiting: bool, now: Instant) -> (Vec<Forward>, Vec<Forward>) {
+    let description = h264::describe(&packet.payload, false).expect("admission checked framing");
     let blocked = p.ingress.waiting();
     let mut live = Vec::new();
     if !blocked {
@@ -1805,7 +1956,7 @@ fn h264_packet(
             }
         }
     }
-    (live, result.packets, None)
+    (live, result.packets)
 }
 
 /// Maps one forwarded packet onto a viewer's slot and queues it for the release bucket. False
@@ -1820,7 +1971,7 @@ fn enqueue(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forwa
     {
         return false;
     }
-    let Some(pt) = slot_pt(slot, forward.codec) else { return false };
+    let Some(pt) = slot_packet_pt(slot, forward) else { return false };
     let Some((out, timestamp)) = slot.segment.map(forward.source, forward.timestamp, forward.keyframe, now) else {
         return false;
     };
@@ -1839,7 +1990,11 @@ fn enqueue(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forwa
         w.slots[lane].segment.wait();
     }
     w.dropped_lanes.extend(dropped.iter().copied());
-    !dropped.contains(&index)
+    let admitted = !dropped.contains(&index);
+    if admitted && let Some(need) = forward.h264 {
+        w.slots[index].last_h264 = Some((now, need));
+    }
+    admitted
 }
 
 /// Writes what the viewer's release bucket allows into str0m. Its shared RTP pacer smooths
@@ -1888,7 +2043,7 @@ fn rtc(advertise: SocketAddr, now: Instant, bwe: bool) -> Result<Rtc, &'static s
     for (pt, rtx, profile) in [(108, 109, 0x42e033), (110, 111, 0x640c33), (112, 113, 0x640033)] {
         config.codec_config().add_h264(pt.into(), Some(rtx.into()), true, profile);
     }
-    config = config.enable_vp9(true).enable_vp8(true);
+    config = config.enable_vp9(true);
     // The browser fallback is VP9 profile 0. str0m's default also enables profile 2;
     // advertising it here would allow routing a 10-bit stream to a profile-0-only slot.
     let params = config
@@ -1931,14 +2086,13 @@ fn publisher(
         .iter()
         .filter(|p| remote.contains(&p.pt()))
         .filter_map(|p| match p.spec().codec {
-            Codec::Vp8 => Some((p.pt(), VideoCodec::Vp8)),
             Codec::Vp9 => Some((p.pt(), VideoCodec::Vp9)),
             Codec::H264 => Some((p.pt(), VideoCodec::H264(p.spec().format.profile_level_id.unwrap_or(0x42e01f)))),
             _ => None,
         })
         .collect();
     if codecs.is_empty() {
-        return Err("no supported H.264 mode 1, VP9 or VP8 in the offer");
+        return Err("no supported H.264 mode 1 or VP9 in the offer");
     }
     let cap = origin.cap_bps;
     let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
@@ -1950,7 +2104,7 @@ fn publisher(
         ssrc,
         codecs,
         prefix: h264_admission::Prefix::default(),
-        h264_profile: None,
+        h264_stream: h264_stream::Admission::default(),
         meter: Meter::new(cap, now),
         ingress: Ingress::new(cap, now),
         rate: ShareMeter::default(),
@@ -1972,6 +2126,7 @@ fn watcher(
     size: usize,
     sdp: &str,
     browser: bool,
+    h264: &[gwar_proto::H264Capability],
     advertise: SocketAddr,
     now: Instant,
 ) -> Result<(Watcher, String), &'static str> {
@@ -2000,7 +2155,8 @@ fn watcher(
         ufrag,
         slots: Vec::with_capacity(size),
         size,
-        h264: codec::offered(sdp, browser),
+        h264: codec::offered(sdp, if browser { h264 } else { &[] }),
+        decode_watchdog: browser,
         pending: Vec::new(),
         connected: false,
         focus: None,
@@ -2113,7 +2269,7 @@ pub(crate) mod tests {
     impl Pair {
         fn new() -> Self {
             let now = Instant::now();
-            let mut client = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp8(true).build(now);
+            let mut client = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp9(true).build(now);
             client.add_local_candidate(Candidate::host(addr(5000), "udp").unwrap());
             // str0m's random mids can collide within one offer: redraw.
             let (offer, pending) = loop {
@@ -2126,7 +2282,8 @@ pub(crate) mod tests {
                 }
             };
             let (w, answer) =
-                watcher(1, 7, 1, Lease::new(), SCREEN_SLOTS, &offer.to_sdp_string(), false, addr(6000), now).unwrap();
+                watcher(1, 7, 1, Lease::new(), SCREEN_SLOTS, &offer.to_sdp_string(), false, &[], addr(6000), now)
+                    .unwrap();
             client.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
             let mut pair = Self { w, client, now, hold: false, held: Vec::new(), checks: Vec::new(), repairs: 0 };
             for _ in 0..200 {
@@ -2225,11 +2382,12 @@ pub(crate) mod tests {
         let origin = grant.origin.clone();
         assign(&mut pair.w, 0, grant.clone(), 1, pair.now);
         let packet = |n: u64| Forward {
+            h264: None,
             source: 100 + n,
             timestamp: 9000 + (n / 10) as u32 * 3000,
             marker: n % 10 == 9,
             keyframe: n.is_multiple_of(10),
-            codec: VideoCodec::Vp8,
+            codec: VideoCodec::Vp9,
             arrival: pair.now,
             payload: Arc::from([if n.is_multiple_of(10) { 0x10 } else { 0x00 }, 0x00, n as u8, 0xaa].as_slice()),
         };
@@ -2279,11 +2437,12 @@ pub(crate) mod tests {
         let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
         assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
         let forward = Forward {
+            h264: None,
             source: 1,
             timestamp: 9000,
             marker: true,
             keyframe: true,
-            codec: VideoCodec::Vp8,
+            codec: VideoCodec::Vp9,
             arrival: pair.now,
             payload: Arc::from(vec![0x10; 1100]),
         };
@@ -2317,11 +2476,12 @@ pub(crate) mod tests {
         assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
         for source in 1..=50 {
             let forward = Forward {
+                h264: None,
                 source,
                 timestamp: 9000,
                 marker: source == 50,
                 keyframe: source == 1,
-                codec: VideoCodec::Vp8,
+                codec: VideoCodec::Vp9,
                 arrival: pair.now,
                 payload: Arc::from(vec![0x10; 1100]),
             };
@@ -2398,11 +2558,12 @@ pub(crate) mod tests {
         assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
         // A packet already at its deadline: flushing the viewer alone must request recovery.
         let forward = Forward {
+            h264: None,
             source: 1,
             timestamp: 9000,
             marker: true,
             keyframe: true,
-            codec: VideoCodec::Vp8,
+            codec: VideoCodec::Vp9,
             arrival: Instant::now() - egress::DEADLINE,
             payload: Arc::from([0x10, 0, 1, 2].as_slice()),
         };
@@ -2437,7 +2598,7 @@ pub(crate) mod tests {
                 ssrc: 1.into(),
                 codecs: HashMap::new(),
                 prefix: h264_admission::Prefix::default(),
-                h264_profile: None,
+                h264_stream: h264_stream::Admission::default(),
                 meter: Meter::new(origin.cap_bps, now),
                 ingress: Ingress::new(origin.cap_bps, now),
                 rate: ShareMeter::default(),
@@ -2461,11 +2622,12 @@ pub(crate) mod tests {
         assign(w, 1, WatchGrant::new(other.clone()), 2, now);
         w.egress.set_estimate(100_000, now);
         let lower = Forward {
+            h264: None,
             source: 1,
             timestamp: 1,
             marker: false,
             keyframe: true,
-            codec: VideoCodec::Vp8,
+            codec: VideoCodec::Vp9,
             arrival: now,
             payload: Arc::from(vec![0x10; 1100]),
         };
@@ -2488,11 +2650,12 @@ pub(crate) mod tests {
         let released_at = now + Duration::from_millis(100);
         for source in 1..=50 {
             let f = Forward {
+                h264: None,
                 source,
                 timestamp: 18000,
                 marker: source == 50,
                 keyframe: source == 1,
-                codec: VideoCodec::Vp8,
+                codec: VideoCodec::Vp9,
                 arrival: released_at,
                 payload: Arc::from(vec![0x10; 1100]),
             };
@@ -2544,11 +2707,12 @@ pub(crate) mod tests {
         let now = pair.now;
         for n in 0..10u64 {
             let forward = Forward {
+                h264: None,
                 source: 100 + n,
                 timestamp: 9000,
                 marker: n == 9,
                 keyframe: n == 0,
-                codec: VideoCodec::Vp8,
+                codec: VideoCodec::Vp9,
                 arrival: now,
                 payload: Arc::from([if n == 0 { 0x10 } else { 0x00 }, 0x00, n as u8, 0xaa].as_slice()),
             };
@@ -2588,11 +2752,12 @@ pub(crate) mod tests {
         let now = pair.now;
         for n in 0..10u64 {
             let forward = Forward {
+                h264: None,
                 source: 100 + n,
                 timestamp: 9000,
                 marker: n == 9,
                 keyframe: n == 0,
-                codec: VideoCodec::Vp8,
+                codec: VideoCodec::Vp9,
                 arrival: now,
                 payload: Arc::from([if n == 0 { 0x10 } else { 0x00 }, 0x00, n as u8, 0xaa].as_slice()),
             };
@@ -2736,6 +2901,74 @@ pub(crate) mod tests {
         assert_eq!(throttle.next(), Some(now + KEYFRAME_INTERVAL));
     }
 
+    #[tokio::test]
+    async fn h264_decode_recovery_fences_reports_and_retains_the_share_across_the_ladder() {
+        let mut pair = Pair::new();
+        let now = pair.now;
+        let mut publisher = h264_ingress_fixture(now);
+        let origin = publisher.origin.clone();
+        publisher.codecs.insert(98.into(), VideoCodec::Vp9);
+        assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, now);
+        let generation = pair.w.slots[0].generation;
+        let need = h264_stream::Requirements {
+            sps_id: 0,
+            profile: 0x42e02a,
+            width: 1920,
+            height: 1080,
+            frame_mbs: 8160,
+            mbps: 489600,
+        };
+        pair.w.slots[0].keyframe_at = Some(now);
+        pair.w.slots[0].last_h264 = Some((now + Duration::from_secs(5), need));
+        let (dispatch, _rx) = dispatch();
+        let core = crate::core::expiry_tests::test_core(crate::store::Store::in_memory().unwrap(), None);
+        let mut sfu = Sfu {
+            socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
+            advertise: addr(6000),
+            core,
+            dropped: Arc::new(AtomicU64::new(0)),
+            owners: Owners { held: HashMap::new(), addrs: dispatch.addrs },
+            outbox: VecDeque::new(),
+            budgets: HashMap::new(),
+            publishers: HashMap::from([("h264".into(), publisher)]),
+            watchers: HashMap::from([(7, pair.w)]),
+            next_id: 1,
+            shared: ScreenShared::new(300_000_000),
+            measured: Measured::new(now),
+            watches: 1,
+            next_allocation: now,
+        };
+        for (run, slot, report_generation, share, seconds) in [
+            (2, 0, generation, "h264", 5),
+            (1, 9, generation, "h264", 5),
+            (1, 0, generation + 1, "h264", 5),
+            (1, 0, generation, "other", 5),
+            (1, 0, generation, "h264", 3),
+        ] {
+            sfu.decode_failed(7, run, slot, report_generation, share, now + Duration::from_secs(seconds));
+            assert!(sfu.watchers[&7].slots[0].decode_cap.is_none());
+        }
+        sfu.decode_failed(7, 1, 0, generation, "h264", now + Duration::from_secs(5));
+        assert!(sfu.watchers[&7].slots[0].decode_cap.is_none(), "native transports do not opt into browser recovery");
+        sfu.watchers.get_mut(&7).unwrap().decode_watchdog = true;
+        sfu.decode_failed(7, 1, 0, generation, "h264", now + Duration::from_secs(5));
+        assert_eq!(sfu.watchers[&7].slots[0].decode_cap, Some((3600, 108000)));
+        assert!(sfu.watchers[&7].slots[0].grant.as_ref().unwrap().alive());
+        assert!(!origin.recovery.lock().unwrap().wants_vp9());
+        sfu.recover_slot(7, 0, need, now + Duration::from_secs(14));
+        assert!(!origin.recovery.lock().unwrap().wants_vp9(), "hold-down prevents flapping");
+        // A publisher still exceeding the first cap advances only after hold-down.
+        sfu.recover_slot(7, 0, need, now + Duration::from_secs(15));
+        assert!(origin.recovery.lock().unwrap().wants_vp9());
+        assert!(sfu.watchers[&7].slots[0].grant.as_ref().unwrap().alive());
+        sfu.recover_slot(7, 0, need, now + Duration::from_secs(25));
+        assert!(
+            sfu.watchers[&7].slots[0].grant.is_none(),
+            "a publisher ignoring both requests cannot strand the watch"
+        );
+        assert!(origin.alive(), "recovery never ends the underlying share");
+    }
+
     fn h264_ingress_fixture(now: Instant) -> Publisher {
         Publisher {
             id: 1,
@@ -2745,7 +2978,7 @@ pub(crate) mod tests {
             ssrc: 1.into(),
             codecs: HashMap::new(),
             prefix: h264_admission::Prefix::default(),
-            h264_profile: None,
+            h264_stream: h264_stream::Admission::default(),
             meter: Meter::new(1_000_000_000, now),
             ingress: Ingress::new(1_000_000_000, now),
             rate: ShareMeter::default(),
@@ -2759,6 +2992,7 @@ pub(crate) mod tests {
 
     fn h264_forward(source: u64, timestamp: u32, payload: &[u8], now: Instant) -> Forward {
         Forward {
+            h264: None,
             source,
             timestamp,
             marker: false,
@@ -2773,7 +3007,7 @@ pub(crate) mod tests {
     fn h264_prefix_is_metered_once_and_existing_segments_have_no_join_delay() {
         let now = Instant::now();
         let mut p = h264_ingress_fixture(now);
-        for (source, payload) in [(10, &[0x67, 0x42, 0xe0, 0x1f, 0x80][..]), (11, &[0x68, 1])] {
+        for (source, payload) in [(10, &[0x67, 0x42, 0xe0, 0x1f, 0xf4, 0x05, 0x01, 0x6c, 0x80][..]), (11, &[0x68, 1])] {
             let (live, held, verdict) = h264_packet(&mut p, h264_forward(source, 9000, payload, now), true, now);
             assert!(live.is_empty() && held.is_empty() && verdict.is_none());
         }
@@ -2783,8 +3017,12 @@ pub(crate) mod tests {
         assert_eq!(p.ingress.counters.dropped, 0, "holding a prefix is not a drop");
         assert!(!p.ingress.waiting());
         // An active segment sees a later SPS immediately even while a new viewer waits.
-        let (live, held, _) =
-            h264_packet(&mut p, h264_forward(13, 12000, &[0x67, 0x42, 0xe0, 0x1f, 0x80], now), true, now);
+        let (live, held, _) = h264_packet(
+            &mut p,
+            h264_forward(13, 12000, &[0x67, 0x42, 0xe0, 0x1f, 0xf4, 0x05, 0x01, 0x6c, 0x80], now),
+            true,
+            now,
+        );
         assert_eq!(live.len(), 1);
         assert!(held.is_empty());
         // Span includes time spent holding parameter sets.
@@ -2819,7 +3057,7 @@ pub(crate) mod tests {
         pair.w.slots[0].pts.insert(VideoCodec::H264(0x42e033), 112.into());
         let caps = codec::offered(
             "m=video 9 X 112\na=mid:h\na=rtpmap:112 H264/90000\na=fmtp:112 packetization-mode=1;profile-level-id=42e01f\n",
-            false,
+            &[],
         );
         pair.w.slots[0].h264 = caps[&Mid::from("h")].clone();
         pair.w.slots[1].pts.insert(VideoCodec::Vp9, 98.into());
@@ -2894,7 +3132,7 @@ pub(crate) mod tests {
                 api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
                 let (offer, pending) = api.apply().unwrap();
                 let (_, answer) =
-                    watcher(1, 7, 1, Lease::new(), GUEST_SLOTS, &offer.to_sdp_string(), false, addr(6000), now)
+                    watcher(1, 7, 1, Lease::new(), GUEST_SLOTS, &offer.to_sdp_string(), false, &[], addr(6000), now)
                         .unwrap();
                 assert!(answer.contains("a=rtpmap:104 H264/90000"));
                 assert!(answer.contains("packetization-mode=1"));
@@ -2924,13 +3162,14 @@ pub(crate) mod tests {
         let now = Instant::now();
         for profile in [[0x42, 0xe0, 0x28], [0x64, 0x0c, 0x1f], [0x42, 0xe0, 0xff]] {
             let mut p = h264_ingress_fixture(now);
-            let mut packet = h264_forward(1, 9000, &[0x67, profile[0], profile[1], profile[2], 0x80], now);
+            let mut packet =
+                h264_forward(1, 9000, &[0x67, profile[0], profile[1], profile[2], 0xf4, 0x05, 0x01, 0x6c, 0x80], now);
             packet.codec = VideoCodec::H264(0x42e01f);
             let (live, held, verdict) = h264_packet(&mut p, packet, true, now);
             assert!(live.is_empty() && held.is_empty());
             assert_eq!(verdict, Some(Verdict::Overrun));
             assert!(p.ingress.waiting() && p.keyframes.pending);
-            let packet = h264_forward(2, 12000, &[0x67, 0x42, 0xe0, 0x1f, 0x80], now);
+            let packet = h264_forward(2, 12000, &[0x67, 0x42, 0xe0, 0x1f, 0xf4, 0x05, 0x01, 0x6c, 0x80], now);
             h264_packet(&mut p, packet, true, now);
             h264_packet(&mut p, h264_forward(3, 12000, &[0x68, 1], now), true, now);
             let (_, held, verdict) = h264_packet(&mut p, h264_forward(4, 12000, &[0x65, 1], now), true, now);

@@ -94,7 +94,7 @@ describe("WatchSession", () => {
     await vi.waitFor(() => expect(socket.last("guest.offer")).toBeDefined());
     expect(t.names).toEqual(["alice"]);
     expect(t.params().slots).toBe(1);
-    expect(socket.last("guest.offer")!.d).toEqual({ sdp: "v=0 offer", browser: true });
+    expect(socket.last("guest.offer")!.d).toEqual({ sdp: "v=0 offer", browser: true, h264: [] });
     socket.receive({ re: socket.last("guest.offer")!.id, ok: { sdp: "v=0 answer" } });
     t.params().state("connected");
     expect(t.statuses).toEqual(["watching"]);

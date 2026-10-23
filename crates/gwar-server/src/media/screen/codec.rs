@@ -64,19 +64,18 @@ pub(super) fn stream_fits(declared: u32, actual: u32) -> bool {
 impl Limits {
     pub fn accepts(&self, codec: VideoCodec) -> bool {
         let VideoCodec::H264(id) = codec else { return false };
-        // Until A3 supplies actual size/fps/reference requirements, a stream must fit a
-        // whole advertised level. Extensions are retained, but cannot justify a higher SPS
-        // level on their own (other Annex A constraints could still exceed the decoder).
-        let within_level = resources(id)
-            .zip(resources(self.receive_level))
-            .is_some_and(|(need, cap)| need.iter().zip(cap).all(|(&need, cap)| need <= cap));
-        within_level
-            && profile(id).is_some()
-            && profile(id) == profile(self.profile)
-            && resources(id).is_some_and(|r| r.iter().zip(self.resources).all(|(&need, cap)| need <= cap))
+        profile(id) == profile(self.profile)
+            && stream_fits(self.receive_level, id)
+            && resources(id).is_some_and(|r| r[2] <= self.resources[2] && r[3] <= self.resources[3])
     }
 
-    fn parse(fmtp: &str, browser: bool) -> Option<Self> {
+    pub fn accepts_stream(&self, stream: &super::h264_stream::Requirements) -> bool {
+        self.accepts(VideoCodec::H264(stream.profile))
+            && stream.frame_mbs <= self.resources[1]
+            && u64::from(stream.mbps) * 100 <= u64::from(self.resources[0]) * 110
+    }
+
+    fn parse(fmtp: &str, verified: &[gwar_proto::H264Capability]) -> Option<Self> {
         let params: HashMap<_, _> = fmtp.split(';').filter_map(|p| p.trim().split_once('=')).collect();
         if params.get("packetization-mode") != Some(&"1") {
             return None;
@@ -84,27 +83,37 @@ impl Limits {
         let id = u32::from_str_radix(params.get("profile-level-id").copied().unwrap_or("42e01f"), 16).ok()?;
         profile(id)?;
         resources(id)?;
-        // Browser factories advertise a default 3.1 even when their decoder accepts 1080p/4K.
-        // This opt-in is sent only by web watch transports (including webview/guest links).
-        // Native viewers keep their real offer. See docs/native-media.md, Browser interop.
-        let mut level = if browser && (id as u8) < 51 { (id & 0xffff00) | 51 } else { id };
+        let mut level = id;
         if let Some(value) = params.get("max-recv-level") {
             level = (id & 0xff0000) | u16::from_str_radix(value, 16).ok()? as u32;
+        }
+        let cap = verified.iter().find(|c| c.valid() && profile(c.profile_level_id) == profile(id));
+        if let Some(cap) = cap
+            && stream_fits(cap.profile_level_id, level)
+        {
+            level = cap.profile_level_id;
         }
         let mut r = resources(level)?;
         for (index, name) in ["max-mbps", "max-fs", "max-dpb", "max-br"].iter().enumerate() {
             if let Some(value) = params.get(name) {
-                // max-dpb uses units of 8/3 macroblocks (RFC 6184 section 8.1).
                 let value = value.parse::<u32>().ok()?;
                 let value = if index == 2 { value.checked_mul(3)? / 8 } else { value };
-                r[index] = if browser { r[index].min(value) } else { r[index].max(value) };
+                r[index] = if cap.is_some() { r[index].min(value) } else { r[index].max(value) };
             }
+        }
+        if let Some(cap) = cap {
+            r[0] = r[0].min(cap.max_mbps);
+            r[1] = r[1].min(cap.max_fs);
         }
         Some(Self { profile: id, receive_level: level, resources: r })
     }
 }
 
-pub(super) fn offered(sdp: &str, browser: bool) -> HashMap<Mid, HashMap<Pt, Limits>> {
+pub(super) fn level_resources(id: u32) -> Option<(u32, u32)> {
+    resources(id).map(|r| (r[1], r[0]))
+}
+
+pub(super) fn offered(sdp: &str, verified: &[gwar_proto::H264Capability]) -> HashMap<Mid, HashMap<Pt, Limits>> {
     sections(sdp)
         .into_iter()
         .filter_map(|lines| {
@@ -115,7 +124,7 @@ pub(super) fn offered(sdp: &str, browser: bool) -> HashMap<Mid, HashMap<Pt, Limi
                 let Ok(pt) = pt.parse::<u8>() else { continue };
                 let rtpmap = format!("a=rtpmap:{pt} H264/90000");
                 if lines.iter().any(|l| l.eq_ignore_ascii_case(&rtpmap))
-                    && let Some(limit) = Limits::parse(fmtp, browser)
+                    && let Some(limit) = Limits::parse(fmtp, verified)
                 {
                     limits.insert(pt.into(), limit);
                 }
@@ -129,65 +138,40 @@ pub(super) fn offered(sdp: &str, browser: bool) -> HashMap<Mid, HashMap<Pt, Limi
 mod tests {
     use super::*;
     #[test]
-    fn profiles_levels_and_explicit_extensions_are_viewer_specific() {
-        let base = Limits::parse("packetization-mode=1;profile-level-id=42e01f", false).unwrap();
-        assert!(base.accepts(VideoCodec::H264(0x42c01f)));
-        assert!(!base.accepts(VideoCodec::H264(0x42e028)));
-        assert!(!base.accepts(VideoCodec::H264(0x640c1f)));
-        let high = Limits::parse("packetization-mode=1;profile-level-id=640c1f;max-recv-level=0c33", false).unwrap();
-        assert!(high.accepts(VideoCodec::H264(0x640c28)));
-        assert!(!high.accepts(VideoCodec::H264(0x640028)));
-        let extended = Limits::parse(
-            "packetization-mode=1;profile-level-id=42e01f;max-fs=8192;max-mbps=245760;max-dpb=87382;max-br=20000",
-            false,
-        )
-        .unwrap();
-        assert!(
-            !extended.accepts(VideoCodec::H264(0x42e028)),
-            "extensions do not establish every constraint of a higher SPS level"
-        );
-        assert_eq!(extended.resources[2], 32768);
+    fn promotion_requires_matching_verified_capability_even_for_explicit_low_levels() {
+        let cap = gwar_proto::H264Capability { profile_level_id: 0x42e02a, max_fs: 8160, max_mbps: 489600 };
+        for id in ["42e014", "42e01f"] {
+            let fmtp = format!("packetization-mode=1;profile-level-id={id}");
+            assert!(!Limits::parse(&fmtp, &[]).unwrap().accepts(VideoCodec::H264(0x42e02a)));
+            let limit = Limits::parse(&fmtp, std::slice::from_ref(&cap)).unwrap();
+            assert!(limit.accepts(VideoCodec::H264(0x42e02a)));
+            assert!(!limit.accepts(VideoCodec::H264(0x42e033)));
+            assert!(!limit.accepts(VideoCodec::H264(0x640c2a)));
+        }
+        let low = Limits::parse("packetization-mode=1;profile-level-id=42e014", &[]).unwrap();
+        assert!(!low.accepts(VideoCodec::H264(0x42e01f)));
+        let explicit = Limits::parse("packetization-mode=1;profile-level-id=42e01f;max-fs=3600", &[cap]).unwrap();
+        assert_eq!(explicit.resources[1], 3600);
+    }
+    #[test]
+    fn native_extensions_and_m_lines_remain_independent() {
+        let limit = Limits::parse("packetization-mode=1;profile-level-id=640c1f;max-recv-level=0c33;max-fs=40000", &[])
+            .unwrap();
+        assert!(limit.accepts(VideoCodec::H264(0x640c28)));
+        assert!(!limit.accepts(VideoCodec::H264(0x640028)));
+        assert_eq!(limit.resources[1], 40000);
         for fmtp in [
-            "packetization-mode=0;profile-level-id=42e01f",
+            "packetization-mode=0",
             "packetization-mode=1;profile-level-id=4d001f",
-            "packetization-mode=1;profile-level-id=640c1f;max-dpb=bogus",
+            "packetization-mode=1;max-dpb=bogus",
         ] {
-            assert!(Limits::parse(fmtp, false).is_none());
+            assert!(Limits::parse(fmtp, &[]).is_none());
         }
-    }
-    #[test]
-    fn browser_defaults_allow_1080p60_and_4k30_but_explicit_caps_and_profiles_still_apply() {
-        for profile in ["42e0", "640c", "6400"] {
-            let fmtp = format!("packetization-mode=1;profile-level-id={profile}1f");
-            let browser = Limits::parse(&fmtp, true).unwrap();
-            let native = Limits::parse(&fmtp, false).unwrap();
-            let id = u32::from_str_radix(profile, 16).unwrap() << 8;
-            for level in [0x2a, 0x33] {
-                assert!(browser.accepts(VideoCodec::H264(id | level)));
-                assert!(!native.accepts(VideoCodec::H264(id | level)));
-            }
-            assert!(!browser.accepts(VideoCodec::H264(id | 0x34)));
-        }
-        for cap in ["max-fs=3600", "max-mbps=108000", "max-dpb=48000", "max-br=14000", "max-recv-level=e01f"] {
-            let fmtp = format!("packetization-mode=1;profile-level-id=42e01f;{cap}");
-            let browser = Limits::parse(&fmtp, true).unwrap();
-            assert!(browser.accepts(VideoCodec::H264(0x42e01f)), "{cap}");
-            assert!(!browser.accepts(VideoCodec::H264(0x42e02a)), "{cap}");
-        }
-        let browser = Limits::parse("packetization-mode=1;profile-level-id=42e01f", true).unwrap();
-        assert!(!browser.accepts(VideoCodec::H264(0x640c2a)));
-        assert!(Limits::parse("packetization-mode=1;profile-level-id=42e0ff", true).is_none());
-    }
-
-    #[test]
-    fn raw_offers_keep_limits_and_pts_separate_for_each_m_line() {
-        let sdp = "m=video 9 X 100\na=mid:one\na=rtpmap:100 H264/90000\na=fmtp:100 packetization-mode=1;profile-level-id=42e01f\nm=video 9 X 102\na=mid:two\na=rtpmap:102 H264/90000\na=fmtp:102 packetization-mode=1;profile-level-id=640c28\n";
-        let caps = offered(sdp, false);
-        let browser = offered(sdp, true);
-        assert!(browser[&Mid::from("one")][&100.into()].accepts(VideoCodec::H264(0x42e02a)));
-        assert!(!browser[&Mid::from("two")][&102.into()].accepts(VideoCodec::H264(0x42e02a)));
+        let caps = offered(
+            "m=video 9 X 100\na=mid:one\na=rtpmap:100 H264/90000\na=fmtp:100 packetization-mode=1;profile-level-id=42e01f\nm=video 9 X 102\na=mid:two\na=rtpmap:102 H264/90000\na=fmtp:102 packetization-mode=1;profile-level-id=640c28\n",
+            &[],
+        );
         assert!(caps[&Mid::from("one")][&100.into()].accepts(VideoCodec::H264(0x42e01f)));
-        assert!(!caps[&Mid::from("one")][&100.into()].accepts(VideoCodec::H264(0x640c28)));
-        assert!(caps[&Mid::from("two")][&102.into()].accepts(VideoCodec::H264(0x640c28)));
+        assert!(!caps[&Mid::from("two")][&102.into()].accepts(VideoCodec::H264(0x42e01f)));
     }
 }

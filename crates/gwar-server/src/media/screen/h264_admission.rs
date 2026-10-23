@@ -94,11 +94,14 @@ impl Prefix {
         let Some((first, packet)) = self.packets.first_key_value() else { return Ok(None) };
         let description = h264::describe(&packet.payload, true).ok_or(())?;
         // An earlier SPS packet may still arrive out of order.
-        if !description.descriptor.keyframe {
+        if !description
+            .nals
+            .first()
+            .is_some_and(|n| n.nal_type == 7 && matches!(n.part, NalPart::Complete | NalPart::Start))
+        {
             return Ok(None);
         }
-        let profile = description.profile_level_id.ok_or(())?;
-        let profile = u32::from_be_bytes([0, profile[0], profile[1], profile[2]]);
+        let VideoCodec::H264(profile) = packet.codec else { return Err(()) };
         let mut pps = false;
         let mut sps = false;
         let mut fu = None;
@@ -114,10 +117,10 @@ impl Prefix {
                             return Err(());
                         }
                         if nal.nal_type == 7 {
-                            if sps || nal.part != NalPart::Complete {
+                            if sps {
                                 return Err(());
                             }
-                            sps = true;
+                            sps = nal.part == NalPart::Complete;
                         }
                         if nal.nal_type == 5 {
                             return if pps { Ok(Some(profile)) } else { Err(()) };
@@ -134,6 +137,7 @@ impl Prefix {
                         }
                         if nal.part == NalPart::End {
                             pps |= nal.nal_type == 8;
+                            sps |= nal.nal_type == 7;
                             fu = None;
                         }
                     }
@@ -153,6 +157,7 @@ mod tests {
     const IDR: &[u8] = &[0x65, 0x88, 0x84];
     fn packet(source: u64, payload: &[u8]) -> Forward {
         Forward {
+            h264: None,
             source,
             timestamp: 9000,
             marker: false,

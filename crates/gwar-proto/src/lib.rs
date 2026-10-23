@@ -301,6 +301,9 @@ wire! {
         /// Asks for a keyframe of a watched share (throttled).
         #[serde(rename = "screen.keyframe")]
         ScreenKeyframe { share: String },
+        /// H.264 arrived after a keyframe for four seconds without decode progress.
+        #[serde(rename = "screen.decode_failed")]
+        ScreenDecodeFailed { share: String, slot: u32, #[serde(deserialize_with = "voice::run")] #[cfg_attr(feature = "ts", ts(type = "number"))] run: u64, generation: u16 },
         #[serde(untagged)]
         Mls(MlsRequest),
         #[serde(untagged)]
@@ -761,6 +764,11 @@ wire! {
         /// `screen.resumed`, or when the viewer watches the share again (Retry).
         #[serde(rename = "screen.paused")]
         ScreenPaused { share: String, reason: ScreenPauseReason },
+        /// A confirmed H.264 keyframe prefix was forwarded on this exact assignment.
+        #[serde(rename = "screen.keyframe")]
+        ScreenKeyframe { share: String, slot: u32, #[serde(deserialize_with = "voice::run")] #[cfg_attr(feature = "ts", ts(type = "number"))] run: u64, generation: u16 },
+        #[serde(rename = "screen.recover")]
+        ScreenRecover(ScreenRecovery),
         #[serde(rename = "screen.resumed")]
         ScreenResumed { share: String },
         /// To admins (`manage_server`): the month's outbound transfer reached `percent` (80 or

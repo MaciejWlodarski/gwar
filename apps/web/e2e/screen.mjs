@@ -18,6 +18,7 @@
  * stop; and the Share button refusing in an encrypted channel.
  *
  *   E2E_BROWSERS=chromium,webkit   engines to use (default: both); with one, it plays every role
+ *   E2E_SCREEN_CANVAS=1          fixed 1080p60 canvas instead of adaptive tab capture
  *   GWAR_SERVER_BIN                 server binary (default: target/debug/gwar-server)
  */
 import { stopProcesses } from "./processes.mjs";
@@ -34,6 +35,7 @@ import { chromium, webkit } from "playwright";
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(webRoot, "../..");
 const engines = (process.env.E2E_BROWSERS ?? "chromium,webkit").split(",").map(s => s.trim()).filter(Boolean);
+const fixedCanvas = process.env.E2E_SCREEN_CANVAS === "1";
 const SOURCE_TITLE = "Gwar share source";
 const children = [];
 const opened = [];
@@ -109,10 +111,11 @@ const diagnostics = page => page.evaluate(async () => ({
     stats.forEach(s => {
       if (s.type !== "inbound-rtp" && s.type !== "outbound-rtp") return;
       streams.push({ dir: s.type === "inbound-rtp" ? "in" : "out", mid: s.mid, codec: codecs[s.codecId], packets: s.packetsReceived ?? s.packetsSent, bytes: s.bytesReceived ?? s.bytesSent,
-        frames: s.framesDecoded ?? s.framesEncoded, keyFrames: s.keyFramesDecoded ?? s.keyFramesEncoded, pli: s.pliCount, fir: s.firCount, nack: s.nackCount, size: `${s.frameWidth}x${s.frameHeight}` });
+        fps: s.framesPerSecond, limitation: s.qualityLimitationReason, encoder: s.encoderImplementation, frames: s.framesDecoded ?? s.framesEncoded, keyFrames: s.keyFramesDecoded ?? s.keyFramesEncoded, pli: s.pliCount, fir: s.firCount, nack: s.nackCount, size: `${s.frameWidth}x${s.frameHeight}` });
     });
     return { state: pc.connectionState, streams, offeredCodecs: pc.localDescription?.sdp?.split(/\r?\n/).filter(l => /^m=video|^a=rtpmap:.*(H264|VP9|VP8)/i.test(l)), answeredCodecs: pc.remoteDescription?.sdp?.split(/\r?\n/).filter(l => /^m=video|^a=rtpmap:.*(H264|VP9|VP8)/i.test(l)) };
   })),
+  capture: window.__pcs.flatMap(pc => pc.getSenders().filter(s => s.track?.kind === "video").map(s => ({ settings: s.track.getSettings(), parameters: s.getParameters() }))),
   videos: [...document.querySelectorAll("video[data-share]")].map(v => {
     const track = v.srcObject?.getVideoTracks?.()[0];
     return { share: v.dataset.share, readyState: v.readyState, size: `${v.videoWidth}x${v.videoHeight}`, paused: v.paused, track: track && `${track.readyState}${track.muted ? " muted" : ""}` };
@@ -124,7 +127,7 @@ const errors = page => page.errors.filter(e => !/Conversation synchronization|fa
 async function device(browser, web, server, name, { canvasId = null, frequency = 440, sendCodec = null, receiveCodec = null } = {}) {
   const context = await browser.newContext({ locale: "en-US", viewport: { width: 1920, height: 1080 } });
   await context.route("**/*", route => (new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort()));
-  const sources = (canvasId === null ? [] : [canvasId].flat()).map(id => ({ id, size: SOURCE_SIZES[id] }));
+  const sources = (canvasId === null ? [] : [canvasId].flat()).map(id => ({ id, size: SOURCE_SIZES[id], ...(id === 1 && fixedCanvas ? { fps: 60 } : {}) }));
   await context.addInitScript({ content: `(${devicePatch})(${JSON.stringify({ frequency, sources, sendCodec, receiveCodec })}, ${stampBarcode}, ${readBarcode}, ${canvasCapture})` });
   const page = await context.newPage();
   page.errors = [];
@@ -285,7 +288,8 @@ async function codecFlow(publisher, viewer, share, expected, size = null) {
   }, { direction, slot });
   let sent, received;
   await waitFor(async () => { sent = await read(publisher, "out"); received = await read(viewer, "in"); return sent?.mimeType === expected && received?.mimeType === expected &&
-    (!size || [sent, received].every(s => s.frameWidth === size[0] && s.frameHeight === size[1])); }, `${expected} flows through the real SFU`);
+    (!size || [sent, received].every(s => s.frameWidth === size[0] && s.frameHeight === size[1])) &&
+    (!(expected === "video/h264" && size?.[0] === 1920 && viewer.engine === "chromium") || sent.fps >= 50 && received.fps >= 50); }, `${expected} flows through the real SFU`);
   if (expected === "video/h264" && size) {
     assert.ok(sent.answeredFmtp.some(l => /level-asymmetry-allowed=1/.test(l) && /profile-level-id=(42e0|640c|6400)33/.test(l)), "publisher answer retains receive level 5.1");
     assert.ok(received.offeredFmtp.some(l => /profile-level-id=(42e0|640c|6400)1f/.test(l)), "viewer starts with the browser's default level 3.1");
@@ -295,7 +299,7 @@ async function codecFlow(publisher, viewer, share, expected, size = null) {
 
 async function run(browsers, web, server, token) {
   const engine = name => browsers[engines.includes(name) ? name : engines[0]];
-  const chromiumTab = engines.includes("chromium");
+  const chromiumTab = engines.includes("chromium") && !fixedCanvas;
 
   // A moderator viewer, in another channel's voice.
   const cv = await device(engine("chromium"), web, server, "cv-mod", { frequency: 300 });
@@ -325,7 +329,7 @@ async function run(browsers, web, server, token) {
 
   // Browser SDP defaults to 3.1; Game must still encode and decode the full 1080p source.
   const csShare = await share(cs, chromiumTab ? "Sharing a browser tab" : "Sharing your screen", "Game");
-  checks.push({ check: "chromium real tab capture", ok: chromiumTab });
+  checks.push({ check: "capture source", mode: chromiumTab ? "real tab" : "canvas", fixedCanvas });
   const ws = await device(engine("webkit"), web, server, "ws-canvas", { frequency: 550, canvasId: 2, sendCodec: hasH264 ? null : "vp9" });
   await join(ws, channels.stage);
   const wsShare = await share(ws, "Sharing your screen");
@@ -421,6 +425,44 @@ async function run(browsers, web, server, token) {
   assert.equal(await session(c4, (_, screen) => screen.own), null, "no capture in an encrypted channel");
   assert.equal(await c4.getByRole("dialog", { name: "Share your screen" }).count(), 0);
   checks.push({ check: "encrypted channel refuses", ok: true });
+
+  // Exercise the real recovery wire path while only the watchdog's decode counter stalls.
+  // Actual receiver stats/barcodes still prove that both replacement transports deliver video.
+  if (hasH264) {
+    const before = await session(wv, (_, screen, __, share) => screen.watches.find(w => w.share === share)?.slot, csShare);
+    await wv.evaluate(() => {
+      for (const pc of window.__pcs) {
+        const stats = pc.getStats.bind(pc);
+        pc.getStats = async (...args) => {
+          const report = await stats(...args), stalled = new Map();
+          report.forEach((s, key) => stalled.set(key, s.type === "inbound-rtp" && /video\/h264/i.test(report.get(s.codecId)?.mimeType ?? "") ? { ...s, framesDecoded: 0 } : s));
+          return stalled;
+        };
+      }
+    });
+    let capped;
+    await waitFor(async () => {
+      capped = await cs.evaluate(async () => {
+        for (const pc of window.__pcs) {
+          if (pc.connectionState !== "connected") continue;
+          const sender = pc.getSenders().find(s => s.track?.kind === "video" && s.getParameters().encodings[0]?.maxFramerate === 30);
+          if (!sender) continue;
+          const report = await pc.getStats();
+          for (const s of report.values()) if (s.type === "outbound-rtp" && s.kind === "video" && s.framesEncoded > 0 && report.get(s.codecId)?.mimeType?.toLowerCase() === "video/h264")
+            return { width: s.frameWidth, height: s.frameHeight, maxFramerate: sender.getParameters().encodings[0].maxFramerate };
+        }
+        return null;
+      });
+      return capped?.width > 0 && capped.width <= 1280 && capped.height <= 720;
+    }, "decode recovery applies the lower H.264 resolution and rate cap");
+    checks.push({ check: "H.264 decode recovery cap", ...capped });
+    await codecFlow(cs, wv, csShare, "video/h264");
+    await codecFlow(cs, wv, csShare, "video/vp9");
+    assert.equal(await ownShare(cs), csShare, "recovery retains the original share id");
+    assert.equal(await session(wv, (_, screen, __, share) => screen.watches.find(w => w.share === share)?.slot, csShare), before, "recovery retains the viewer's slot");
+    await sees(wv, csShare, 1, "VP9 decode after watchdog recovery");
+    checks.push({ check: "decode watchdog caps H.264 then fails over to VP9 without replacing watches", ok: true });
+  }
 
   const problems = opened.flatMap(p => errors(p).map(e => `${p.deviceName}: ${e}`));
   return problems;
