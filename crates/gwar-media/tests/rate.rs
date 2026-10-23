@@ -596,3 +596,32 @@ fn failover_below_the_replacement_fps_floor_inserts_a_recoverable_rung() {
         }
     }
 }
+
+#[test]
+fn nonstandard_smooth_failover_recovers_after_drops_at_steady_bandwidth() {
+    let cfg = ControllerConfig {
+        source_size: Size { width: 1930, height: 1080 },
+        ..config(Preset::Smooth, ResolutionTier::P2160)
+    };
+    let encoders = [CodecCaps { max_fps: 10, ..caps(AV1, true) }, CodecCaps { max_fps: 30, ..caps(H264, true) }];
+    let mut c = RateController::new(cfg, &encoders).unwrap();
+    let feedback = ControllerFeedback { bandwidth_bps: 1_250_000, ..healthy() };
+    let replacement = encode(sample(&mut c, 0, ControllerFeedback { encoder_failed: true, ..feedback }));
+    assert_eq!(replacement.encoder_index, 1);
+    assert_eq!(replacement.encoder.size, cfg.source_size);
+    assert_eq!(replacement.encoder.rate, RateControl { max_fps: 10, bitrate_bps: 1_005_208 });
+    for second in 1..=3 {
+        sample(&mut c, second, ControllerFeedback { encoder_dropped: true, ..feedback });
+    }
+    let degraded = encode(c.decision());
+    assert_eq!(degraded.encoder.size, Size { width: 1920, height: 1074 });
+    assert_eq!(degraded.encoder.rate, replacement.encoder.rate);
+    // Smaller frames remain useful for drop/CPU pressure even at the same bitrate.
+    // Healthy feedback must neither force another downscale nor block recovery.
+    for second in 4..=13 {
+        assert_eq!(sample(&mut c, second, feedback), RateDecision::Encode(degraded));
+    }
+    for second in 14..=90 {
+        assert_eq!(sample(&mut c, second, feedback), RateDecision::Encode(replacement));
+    }
+}

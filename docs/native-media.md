@@ -1121,7 +1121,10 @@ and rotate the tier bounds for portrait sources. Software is capped at
 that cannot retain its physical resolution. The requested preset/tier must
 fit the administrative bitrate cap before the controller is constructed.
 Every generated rung is also clamped to that cap, including capability-limited
-starting settings, failover and recovery targets.
+starting settings, failover and recovery targets. Finalized ladders, including
+fps-limited and inserted failover rungs, clamp each lower rung's nominal bitrate
+to at most the rung above it. Equal-bitrate lower rungs remain available to
+relieve CPU/encode/drop pressure without violating Text/Game quality floors.
 
 Recovery requires 10 continuous seconds with no late/dropped frames, at
 least 20 % spare bandwidth over the **next** setting's nominal need, CPU at

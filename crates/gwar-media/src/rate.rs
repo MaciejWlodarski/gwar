@@ -110,6 +110,21 @@ struct EncoderPlan {
     steps: Vec<QualityTarget>,
 }
 
+impl EncoderPlan {
+    fn finalize(&mut self) {
+        // Tier pixel densities and inherited fps can invert nominal bitrate needs.
+        // Clamp downwards so pressure/recovery never face a costlier lower rung.
+        // Keep equal-bitrate rungs: smaller frames or lower cadence can still
+        // relieve CPU/encode/drop pressure while preserving the preset's floor.
+        let mut ceiling = u32::MAX;
+        for target in &mut self.steps {
+            let bitrate = &mut target.encoder.rate.bitrate_bps;
+            *bitrate = (*bitrate).min(ceiling);
+            ceiling = *bitrate;
+        }
+    }
+}
+
 /// Pure state machine for exactly one layer, with caller-provided monotonic time.
 ///
 /// Two seconds of continuous pressure lower one quality step. Ten seconds of continuous
@@ -334,6 +349,7 @@ impl RateController {
                 }
                 Some(step)
             });
+            plan.finalize();
             if let Some(step) = step {
                 self.step = step;
                 self.bitrate_bps = self.bitrate_bps.min(plan.steps[step].encoder.rate.bitrate_bps);
@@ -394,7 +410,9 @@ fn make_plan(config: ControllerConfig, caps: &CodecCaps, encoder_index: usize) -
             });
         }
     }
-    (!steps.is_empty()).then_some(EncoderPlan { steps })
+    let mut plan = EncoderPlan { steps };
+    plan.finalize();
+    (!plan.steps.is_empty()).then_some(plan)
 }
 
 fn preset_fps(preset: Preset, tier: ResolutionTier) -> u32 {
@@ -463,4 +481,121 @@ fn hardware_latency(target: QualityTarget) -> u128 {
 
 fn encode_budget(target: QualityTarget, percent: u128) -> u128 {
     (1_000_000_000_u128 * percent / (100 * u128::from(target.encoder.rate.max_fps))).min(hardware_latency(target))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::CodecProfile;
+
+    fn assert_ladders(controller: &RateController, config: ControllerConfig) {
+        for plan in &controller.plans {
+            for target in &plan.steps {
+                assert!(
+                    (100_000..=config.bitrate_cap_bps).contains(&target.encoder.rate.bitrate_bps),
+                    "{config:?}: {plan:?}"
+                );
+                if config.preset == Preset::Text {
+                    assert_eq!(target.encoder.size, fit_size(config.source_size, config.tier));
+                }
+            }
+            for pair in plan.steps.windows(2) {
+                let [upper, lower] = pair else { unreachable!() };
+                assert!(lower.encoder.rate.bitrate_bps <= upper.encoder.rate.bitrate_bps, "{config:?}: {plan:?}");
+                assert!(lower.encoder.size.width <= upper.encoder.size.width);
+                assert!(lower.encoder.size.height <= upper.encoder.size.height);
+                assert!(lower.encoder.rate.max_fps <= upper.encoder.rate.max_fps);
+                if config.preset == Preset::Game {
+                    assert_eq!(lower.encoder.rate.max_fps, upper.encoder.rate.max_fps);
+                }
+            }
+        }
+    }
+
+    fn assert_failover_ladders(config: ControllerConfig, encoders: &[CodecCaps]) {
+        let Ok(initial) = RateController::new(config, encoders) else { return };
+        assert_ladders(&initial, config);
+        // Fail at every initial quality rung, then walk every remaining candidate.
+        // This includes inherited Game cadence and inserted Text/Smooth fps rungs.
+        for step in 0..initial.plans[0].steps.len() {
+            let mut controller = RateController::new(config, encoders).unwrap();
+            controller.step = step;
+            controller.bitrate_bps = controller.plans[0].steps[step].encoder.rate.bitrate_bps;
+            while controller.active < controller.plans.len() {
+                controller.fail_encoder();
+                assert_ladders(&controller, config);
+            }
+        }
+    }
+
+    #[test]
+    fn finalized_ladder_bitrates_are_monotonic_across_policy_and_capability_sweep() {
+        let tiers = [ResolutionTier::P720, ResolutionTier::P1080, ResolutionTier::P1440, ResolutionTier::P2160];
+        let sources = [
+            Size { width: 2, height: 2 },
+            Size { width: 640, height: 360 },
+            ResolutionTier::P720.size(),
+            ResolutionTier::P1080.size(),
+            Size { width: 1930, height: 1080 },
+            Size { width: 1080, height: 1930 },
+            Size { width: 2559, height: 1439 },
+            ResolutionTier::P1440.size(),
+            ResolutionTier::P2160.size(),
+            Size { width: 2160, height: 3840 },
+            Size { width: 3840, height: 1080 },
+            Size { width: 1440, height: 1440 },
+            Size { width: 4000, height: 3000 },
+        ];
+        let h264 = CodecProfile::H264 { profile_idc: 100, profile_iop: 0, level_idc: 52 };
+        let capabilities: Vec<_> = [false, true]
+            .into_iter()
+            .flat_map(|hardware| {
+                tiers.into_iter().flat_map(move |tier| {
+                    [0, 1, 3, 5, 10, 15, 20, 30, 60].into_iter().map(move |max_fps| CodecCaps {
+                        profile: h264,
+                        hardware,
+                        max_size: tier.size(),
+                        max_fps,
+                    })
+                })
+            })
+            .collect();
+        for preset in [Preset::Text, Preset::Smooth, Preset::Game] {
+            for tier in tiers {
+                for source_size in sources {
+                    let admitted = bitrate(preset, tier, fit_size(source_size, tier), preset_fps(preset, tier));
+                    for bitrate_cap_bps in [100_000, admitted, admitted + 100_000, 50_000_000] {
+                        let config = ControllerConfig { preset, tier, source_size, bitrate_cap_bps };
+                        for caps in &capabilities {
+                            let encoders = [
+                                CodecCaps {
+                                    profile: CodecProfile::Av1 {
+                                        profile: 0,
+                                        level_idx: 13,
+                                        high_tier: false,
+                                        bit_depth: 8,
+                                    },
+                                    ..caps.clone()
+                                },
+                                caps.clone(),
+                                CodecCaps {
+                                    profile: CodecProfile::Vp9 { profile: 0 },
+                                    hardware: true,
+                                    max_size: ResolutionTier::P2160.size(),
+                                    max_fps: 60,
+                                },
+                                CodecCaps {
+                                    profile: CodecProfile::Vp8,
+                                    hardware: false,
+                                    max_size: ResolutionTier::P1080.size(),
+                                    max_fps: 30,
+                                },
+                            ];
+                            assert_failover_ladders(config, &encoders);
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
