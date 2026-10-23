@@ -168,3 +168,9 @@ spanning a 100 ms callback stall must not report that low send rate as network
 capacity. Regular local sends that queue downstream still produce a congestion
 estimate. Tests distinguish both paths; ordinary unconfigured transports retain
 their probe behavior. Additional changed file: `src/bwe/probe/estimator.rs`.
+
+A probe below a preserved delay ceiling retains an effective cap at its
+demonstrated capacity until the next complete loss observation. Partial feedback,
+including during startup, cannot restore the unproven ceiling. The cap reports
+`Increasing` to the integration layer while preserving the successful probe's
+internal `DelayBased` transition, so stale HOLD/recovery limits are not reactivated.

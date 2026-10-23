@@ -66,6 +66,8 @@ pub struct LossController {
 
     /// The current estimate
     current_estimate: ChannelParameters,
+    /// Demonstrated probe capacity until the next complete loss observation.
+    pending_probe_estimate: Option<Bitrate>,
 
     /// The min bitrate we will emit as an estimate.
     min_bitrate: Bitrate,
@@ -129,6 +131,7 @@ impl LossController {
             bandwidth_limit_in_current_window: Bitrate::MAX,
 
             current_estimate: ChannelParameters::new(config.initial_inherent_loss_estimate),
+            pending_probe_estimate: None,
 
             min_bitrate: Bitrate::kbps(1),
             max_bitrate: Bitrate::INFINITY,
@@ -165,10 +168,19 @@ impl LossController {
     /// Override the current bandwidth estimate.
     pub fn set_bandwidth_estimate(&mut self, bandwidth_estimate: Bitrate) {
         self.current_estimate.loss_limited_bandwidth = bandwidth_estimate;
+        self.pending_probe_estimate = None;
         // A successful probe replaces the loss-limited result too. Keeping Decreasing
         // here reapplies the old HOLD rate to newly demonstrated capacity.
         // Match WebRTC LossBasedBweV2::SetBandwidthEstimate.
         self.state = LossControllerState::DelayBased;
+    }
+
+    /// Recover to demonstrated probe capacity without exposing a higher delay ceiling.
+    pub fn set_probe_estimate(&mut self, bandwidth_estimate: Bitrate, delay_estimate: Bitrate) {
+        self.set_bandwidth_estimate(bandwidth_estimate);
+        if bandwidth_estimate < delay_estimate {
+            self.pending_probe_estimate = Some(bandwidth_estimate);
+        }
     }
 
     /// Update the acknowledged bitrate based on TWCC feedback.
@@ -241,6 +253,9 @@ impl LossController {
             return;
         }
 
+        // Fresh loss evidence can replace the probe cap. Partial feedback must
+        // retain it without reactivating stale HOLD/recovery limits internally.
+        self.pending_probe_estimate = None;
         let mut best_candidate = self.current_estimate;
         let mut objective_max = f64::MIN;
 
@@ -408,6 +423,13 @@ impl LossController {
     }
 
     pub fn loss_based_result(&self) -> LossBasedBweResult {
+        if let Some(capacity) = self.pending_probe_estimate {
+            return LossBasedBweResult {
+                bandwidth_estimate: Some(capacity.min(self.delay_based_estimate)),
+                state: LossControllerState::Increasing,
+            };
+        }
+
         let mut result = LossBasedBweResult {
             bandwidth_estimate: self.current_estimate.loss_limited_bandwidth.as_valid(),
             state: self.state,
@@ -1189,6 +1211,32 @@ mod test {
             "real congestion must still back off"
         );
         assert_eq!(after.state, LossControllerState::Decreasing);
+    }
+
+    #[test]
+    fn a_probe_floor_caps_partial_observations_without_reactivating_old_recovery() {
+        let mut controller = LossController::new();
+        controller.set_probe_estimate(Bitrate::kbps(600), Bitrate::mbps(5));
+        let now = Instant::now();
+        for elapsed in [0, 100, 200] {
+            let batch = PacketBuilder::new(now)
+                .num_packets(1)
+                .forward_time(Duration::from_millis(elapsed))
+                .build_packets();
+            controller.update_bandwidth_estimate(&batch, Bitrate::mbps(5));
+            let result = controller.loss_based_result();
+            assert_eq!(result.bandwidth_estimate, Some(Bitrate::kbps(600)));
+            assert_eq!(result.state, LossControllerState::Increasing);
+            assert_eq!(controller.state, LossControllerState::DelayBased);
+            assert_eq!(controller.num_observations, 0);
+        }
+        let batch = PacketBuilder::new(now)
+            .num_packets(1)
+            .forward_time(Duration::from_millis(260))
+            .build_packets();
+        controller.update_bandwidth_estimate(&batch, Bitrate::mbps(5));
+        assert_eq!(controller.num_observations, 1);
+        assert!(controller.pending_probe_estimate.is_none());
     }
 
     #[test]

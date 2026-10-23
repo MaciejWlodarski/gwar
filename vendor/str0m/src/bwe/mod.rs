@@ -284,20 +284,21 @@ impl SendSideBandwidthEstimator {
         };
         log_loss!(loss);
 
-        // During startup with no loss, use delay-based estimate directly
-        if in_startup_phase(self.started_at, now) && loss <= 0.001 {
-            self.loss_controller.set_bandwidth_estimate(
-                latest_probe_capacity
-                    .unwrap_or(delay_estimate)
-                    .min(delay_estimate),
-            );
-            return;
-        }
-
-        // When probe succeeds, set bandwidth directly
+        // A probe can recover loss-limited capacity, but an unsaturated floor
+        // must not expose a higher delay ceiling before a loss observation completes.
         if let Some(capacity) = latest_probe_capacity {
             self.loss_controller
-                .set_bandwidth_estimate(capacity.min(delay_estimate));
+                .set_probe_estimate(capacity.min(delay_estimate), delay_estimate);
+        }
+
+        // Startup may follow delay directly only while loss is not limiting it.
+        // Otherwise even a later loss-free partial report could erase a probe cap.
+        if in_startup_phase(self.started_at, now)
+            && loss <= 0.001
+            && self.loss_controller.loss_based_result().state == LossControllerState::DelayBased
+        {
+            self.loss_controller.set_bandwidth_estimate(delay_estimate);
+            return;
         }
 
         if let Some(acked_bitrate) = acked_bitrate {
@@ -568,6 +569,93 @@ mod tests {
                 periodic,
                 "the policy ceiling cannot suppress capacity discovery"
             );
+        }
+    }
+
+    #[test]
+    fn probe_floor_caps_recovery_through_partial_loss_observations() {
+        for startup in [false, true] {
+            let base = Instant::now();
+            let mut controller = Bwe::new(Bitrate::mbps(5));
+            let bwe = &mut controller.bwe;
+            bwe.started_at = Some(if startup { base } else { base - STARTUP_PHASE });
+            bwe.loss_controller
+                .set_bandwidth_estimate(Bitrate::kbps(500));
+            let loss_packets: Vec<_> = (0..26)
+                .map(|i| {
+                    TwccSendRecord::test_new(
+                        TwccPacketId::new(i + 1),
+                        base + Duration::from_millis(i * 10),
+                        1200,
+                        base + Duration::from_millis(300),
+                        (i % 2 == 0).then_some(base + Duration::from_millis(i * 10 + 2)),
+                    )
+                })
+                .collect();
+            // Establish a loss-limited result below a still-valid 5 Mbps delay ceiling.
+            bwe.loss_controller.update_bandwidth_estimate(
+                &loss_packets.iter().collect::<Vec<_>>(),
+                Bitrate::mbps(5),
+            );
+            let next_loss_packets: Vec<_> = (0..26)
+                .map(|i| {
+                    TwccSendRecord::test_new(
+                        TwccPacketId::new(100 + i),
+                        base + Duration::from_millis(260 + i * 10),
+                        1200,
+                        base + Duration::from_millis(550),
+                        None,
+                    )
+                })
+                .collect();
+            bwe.loss_controller.update_bandwidth_estimate(
+                &next_loss_packets.iter().collect::<Vec<_>>(),
+                Bitrate::mbps(5),
+            );
+            assert!(bwe.last_estimate().unwrap() <= Bitrate::kbps(500));
+            assert_ne!(
+                bwe.loss_controller.loss_based_result().state,
+                LossControllerState::DelayBased
+            );
+
+            let cluster: TwccClusterId = 7.into();
+            let config = ProbeClusterConfig::new(cluster, Bitrate::mbps(10), ProbeKind::Initial)
+                .with_max_send_gap(Duration::from_millis(20));
+            let config = config.with_duration(Duration::from_millis(10));
+            let probe_start = base + Duration::from_millis(520);
+            assert!(bwe.start_probe(config, probe_start));
+            let packets: Vec<_> = (0..12)
+                .map(|i| {
+                    TwccSendRecord::test_new(
+                        TwccPacketId::with_cluster(1000 + i, cluster),
+                        probe_start + Duration::from_millis(i * 16),
+                        1200,
+                        base + Duration::from_millis(710),
+                        Some(probe_start + Duration::from_millis(i * 16 + 2)),
+                    )
+                })
+                .collect();
+            // Twelve 1200-byte packets spaced 16 ms apart demonstrate only 600 kbps.
+            bwe.update(packets.iter(), base + Duration::from_millis(710));
+            assert_eq!(bwe.delay_controller.last_estimate(), Some(Bitrate::mbps(5)));
+            assert_eq!(bwe.last_estimate(), Some(Bitrate::kbps(600)));
+            bwe.end_probe(base + Duration::from_millis(710), cluster);
+
+            // More feedback arrives before the 250 ms loss observation can complete.
+            for i in 0..3 {
+                let at = base + Duration::from_millis(710 + i * 10);
+                let record = TwccSendRecord::test_new(
+                    TwccPacketId::new(2000 + i),
+                    at,
+                    1200,
+                    at + Duration::from_millis(20),
+                    Some(at + Duration::from_millis(2)),
+                );
+                bwe.update([&record].into_iter(), at + Duration::from_millis(20));
+                assert_eq!(bwe.last_estimate(), Some(Bitrate::kbps(600)));
+            }
+            controller.handle_timeout(base + Duration::from_millis(750), true);
+            assert!(controller.poll_estimate().unwrap() <= Bitrate::kbps(600));
         }
     }
 
