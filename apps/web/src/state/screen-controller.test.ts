@@ -43,6 +43,7 @@ function fakeLink(handlers: Record<string, Handler>) {
   const calls: Array<[string, Record<string, unknown>]> = [];
   const link = {
     request: vi.fn(async (op: string, d: Record<string, unknown>) => {
+      if (op === "screen.capabilities") return handlers[op]?.(d) ?? { screen_h264: false };
       calls.push([op, d]);
       const handler = handlers[op];
       if (!handler) return {};
@@ -240,13 +241,40 @@ describe("watch requests (review round 1)", () => {
 });
 
 describe("watch requests across a reset (review round 2)", () => {
+  it.each([false, true])("gates watch extensions on the server advertisement (%s)", async screenH264 => {
+    const { link, calls } = fakeLink({ "screen.capabilities": () => {
+      if (!screenH264) throw new RequestError("bad_request", "malformed request");
+      return { screen_h264: true };
+    }, "screen.watch.offer": body => {
+      expect(Object.keys(body).sort()).toEqual(screenH264 ? ["browser", "h264", "run", "sdp"] : ["run", "sdp"]);
+      return { sdp: "answer" };
+    } });
+    const screen = new ScreenController(() => link, String);
+    const pending = screen.watch("A");
+    await flush();
+    expect(calls).toHaveLength(1);
+    screen.reset();
+    await pending;
+  });
+  it("sends no offer after reset while the feature query is pending", async () => {
+    const features = deferred<{ screen_h264: boolean }>();
+    const { link, calls } = fakeLink({ "screen.capabilities": () => features.promise });
+    const screen = new ScreenController(() => link, String);
+    const pending = screen.watch("A");
+    await flush();
+    screen.reset();
+    features.resolve({ screen_h264: true });
+    await flush();
+    await pending;
+    expect(calls).toEqual([]);
+  });
   it("a reset before the watch transport connects never blocks watching the same share again", async () => {
     const { link, calls } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => ({ slot: 0 }) });
     const screen = new ScreenController(() => link, String);
     const first = screen.watch("A");
     await flush();
     expect(calls.map(([op]) => op)).toEqual(["screen.watch.offer"]);
-    expect(calls[0]![1]).toMatchObject({ browser: true });
+    expect(calls[0]![1]).toEqual({ run: expect.any(Number), sdp: "watch-offer" });
     // Answered, not connected yet; then the session resets (as on a reconnect).
     screen.reset();
     await first;

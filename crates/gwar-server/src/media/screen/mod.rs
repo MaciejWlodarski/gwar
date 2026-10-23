@@ -74,6 +74,9 @@ const VIEWER_KEYFRAMES_BURST: f64 = 10.0;
 const VIEWER_KEYFRAMES_PER_SECOND: f64 = 10.0 / 60.0;
 /// A slot waiting for a keyframe asks again this often while the share keeps sending deltas.
 const WAITING_RETRY: Duration = Duration::from_secs(1);
+const DECODE_WINDOW: Duration = Duration::from_secs(4);
+/// Allow independent watchdog reports to meet before isolating a failed watch.
+const CORROBORATE_FOR: Duration = Duration::from_secs(2);
 /// A publish transport that has not connected by then fails.
 pub const PUBLISH_CONNECT: Duration = Duration::from_secs(30);
 /// RTX cache per forwarded stream: packets, age target and resend ratio cap ("Queues and
@@ -290,9 +293,7 @@ pub enum ScreenSignal {
         grant: Arc<WatchGrant>,
     },
     Recover {
-        session: SessionId,
-        run: u64,
-        grant: Arc<WatchGrant>,
+        origin: Arc<ScreenOrigin>,
         plan: gwar_proto::ScreenRecovery,
     },
     Resumed {
@@ -508,6 +509,7 @@ struct Slot {
     keyframe_at: Option<Instant>,
     last_h264: Option<(Instant, h264_stream::Requirements)>,
     decode_cap: Option<(u32, u32)>,
+    failed_at: Option<Instant>,
 }
 
 impl Slot {
@@ -527,6 +529,7 @@ impl Slot {
             keyframe_at: None,
             last_h264: None,
             decode_cap: None,
+            failed_at: None,
         }
     }
 }
@@ -622,6 +625,9 @@ struct Sfu {
     /// Each viewer's keyframe budget. It belongs to the session, not to a watch transport, so a
     /// new run does not refill it; one that refilled completely is dropped.
     budgets: HashMap<SessionId, Bucket>,
+    /// Viewer/share report throttling survives transport replacement; independent slots
+    /// can report without exhausting one another's watchdog retries.
+    decode_reports: HashMap<(SessionId, String), Instant>,
     publishers: HashMap<String, Publisher>,
     watchers: HashMap<SessionId, Watcher>,
     next_id: u64,
@@ -649,6 +655,7 @@ pub async fn run(
         owners: Owners { held: HashMap::new(), addrs },
         outbox: VecDeque::new(),
         budgets: HashMap::new(),
+        decode_reports: HashMap::new(),
         publishers: HashMap::new(),
         watchers: HashMap::new(),
         next_id: 1,
@@ -736,6 +743,7 @@ impl Sfu {
                         w.slots[index].generation = w.slots[index].generation.wrapping_add(1);
                         w.slots[index].keyframe_at = None;
                         w.slots[index].last_h264 = None;
+                        w.slots[index].failed_at = None;
                         wipe(&mut w.rtc, w.slots[index].mid);
                     }
                 }
@@ -743,6 +751,7 @@ impl Sfu {
                 let id = self.id();
                 match publisher(id, origin, ssrc, &sdp, self.advertise, now) {
                     Ok((publisher, answer)) => {
+                        publisher.origin.recovery.lock().expect("recovery lock").pending = false;
                         self.publishers.insert(publisher.origin.share.clone(), publisher);
                         let _ = reply.send(Ok(answer));
                     }
@@ -982,7 +991,7 @@ impl Sfu {
                 !matches!(queued, ScreenSignal::Publish { share: s, signal: PublishSignal::Connected } if s == share)
             }),
             ScreenSignal::Keyframe { session, slot, .. } => self.outbox.retain(|queued| !matches!(queued, ScreenSignal::Keyframe { session: s, slot: i, .. } if s == session && i == slot)),
-            ScreenSignal::Recover { grant, .. } => self.outbox.retain(|queued| !matches!(queued, ScreenSignal::Recover { grant: g, .. } if g.share == grant.share)),
+            ScreenSignal::Recover { origin, .. } => self.outbox.retain(|queued| !matches!(queued, ScreenSignal::Recover { origin: o, .. } if o.share == origin.share)),
             ScreenSignal::Publish { .. } => {}
             // Only a viewer's latest pause or resume of a share matters. Keep its exact
             // grant so the core can reject it if the assignment has since been replaced.
@@ -1106,6 +1115,7 @@ impl Sfu {
     /// Runs every viewer's allocation: at most one pause or resume per viewer and tick, and
     /// the probing target for its BWE.
     fn allocate(&mut self, now: Instant) {
+        self.recoveries(now);
         let rates: HashMap<String, ShareRate> =
             self.publishers.iter_mut().map(|(share, p)| (share.clone(), p.rate.rate(now))).collect();
         let budget = self.measured.under_since.is_some_and(|at| now.saturating_duration_since(at) >= UNDER_BUDGET_FOR);
@@ -1253,7 +1263,18 @@ impl Sfu {
         }
         let origin = p.origin.clone();
         self.publishers.insert(share.to_owned(), p);
-        if forwards.is_empty() {
+        self.forward_packets(share, &origin, forwards, now);
+    }
+
+    fn forward_packets(
+        &mut self,
+        share: &str,
+        origin: &Arc<ScreenOrigin>,
+        forwards: Vec<(Forward, bool)>,
+        now: Instant,
+    ) {
+        // All old-publisher media is dropped during replacement, without touching grants.
+        if origin.recovery.lock().expect("recovery lock").pending || forwards.is_empty() {
             return;
         }
         let mut touched = Vec::new();
@@ -1275,17 +1296,7 @@ impl Sfu {
                 if w.slots[index].grant.is_none() {
                     continue;
                 }
-                let vp9_requested = w.slots[index]
-                    .grant
-                    .as_ref()
-                    .is_some_and(|g| g.origin.recovery.lock().expect("recovery lock").wants_vp9());
-                if slot_packet_pt(&w.slots[index], forward).is_none() || vp9_requested && forward.h264.is_some() {
-                    if w.slots[index].decode_cap.is_some()
-                        && let Some(need) = forward.h264
-                    {
-                        self.recover_slot(session, index, need, now);
-                        continue;
-                    }
+                if slot_packet_pt(&w.slots[index], forward).is_none() {
                     debug!(session, slot = index, codec = ?forward.codec, "screen codec incompatible with viewer offer");
                     let grant = w.slots[index].grant.clone().expect("checked above");
                     let run = w.run;
@@ -1297,18 +1308,14 @@ impl Sfu {
                     continue;
                 }
                 let Some(w) = self.watchers.get_mut(&session) else { continue };
-                let admitted = enqueue(w, index, &origin, forward, now);
+                let admitted = enqueue(w, index, origin, forward, now);
                 let dropped = std::mem::take(&mut w.dropped_lanes);
                 for lane in dropped {
                     self.ask_keyframe(session, lane, now);
                 }
                 let Some(w) = self.watchers.get_mut(&session) else { continue };
                 if admitted {
-                    if w.decode_watchdog
-                        && forward.keyframe
-                        && forward.h264.is_some()
-                        && w.slots[index].keyframe_at.is_none()
-                    {
+                    if forward.keyframe && forward.h264.is_some() && w.slots[index].keyframe_at.is_none() {
                         let slot = &mut w.slots[index];
                         slot.keyframe_at = Some(now);
                         let signal = ScreenSignal::Keyframe {
@@ -1318,7 +1325,9 @@ impl Sfu {
                             generation: slot.generation,
                             grant: slot.grant.clone().expect("assigned"),
                         };
-                        self.signal(signal);
+                        if w.decode_watchdog {
+                            self.signal(signal);
+                        }
                     }
                     if !touched.contains(&session) {
                         touched.push(session);
@@ -1413,38 +1422,118 @@ impl Sfu {
             return;
         }
         if slot.generation != generation
-            || !slot.keyframe_at.is_some_and(|at| now.saturating_duration_since(at) >= Duration::from_secs(4))
+            || !slot.keyframe_at.is_some_and(|at| now.saturating_duration_since(at) >= DECODE_WINDOW)
         {
             return;
         }
-        let Some((at, need)) = slot.last_h264 else { return };
+        let Some((at, _)) = slot.last_h264 else { return };
         if now.saturating_duration_since(at) > Duration::from_secs(2) {
             return;
         }
-        self.recover_slot(session, index, need, now);
+        if self
+            .decode_reports
+            .get(&(session, share.to_owned()))
+            .is_some_and(|at| now.saturating_duration_since(*at) < recovery::HOLD_DOWN)
+        {
+            return;
+        }
+        self.decode_reports.insert((session, share.to_owned()), now);
+        self.watchers.get_mut(&session).expect("validated").slots[index].failed_at.get_or_insert(now);
+        if !self.try_recover(share, now) {
+            self.ask_keyframe(session, index, now);
+        }
     }
 
-    fn recover_slot(&mut self, session: SessionId, index: usize, need: h264_stream::Requirements, now: Instant) {
-        let Some(w) = self.watchers.get_mut(&session) else { return };
-        let run = w.run;
-        let slot = &mut w.slots[index];
-        let Some(grant) = slot.grant.clone().filter(|g| g.alive()) else { return };
-        let share = &grant.share;
-        let vp9 = slot.pts.contains_key(&VideoCodec::Vp9)
-            && self.publishers.get(share).is_some_and(|p| p.codecs.values().any(|c| *c == VideoCodec::Vp9));
-        let (plan, waiting, terminal) = {
-            let mut recovery = grant.origin.recovery.lock().expect("recovery lock");
-            let plan = recovery.fail(share, need.width, need.height, vp9, now);
-            (plan, recovery.waiting(now), recovery.terminal())
-        };
+    /// Only all currently active, mature H.264 watches can change the share. A
+    /// non-reporting browser or native viewer is positive evidence against a downgrade.
+    fn try_recover(&mut self, share: &str, now: Instant) -> bool {
+        let eligible: Vec<_> = self
+            .slots_of(share)
+            .into_iter()
+            .filter(|(session, index)| {
+                let w = &self.watchers[session];
+                let slot = &w.slots[*index];
+                w.connected
+                    && w.egress.paused(*index).is_none()
+                    && slot.grant.as_ref().is_some_and(|g| g.alive())
+                    && slot.keyframe_at.is_some_and(|at| now.saturating_duration_since(at) >= DECODE_WINDOW)
+                    && slot.last_h264.is_some()
+            })
+            .collect();
+        if eligible.is_empty() || eligible.iter().any(|(s, i)| self.watchers[s].slots[*i].failed_at.is_none()) {
+            return false;
+        }
+        let Some(p) = self.publishers.get(share) else { return false };
+        let vp9 = p.codecs.values().any(|c| *c == VideoCodec::Vp9)
+            && self.slots_of(share).iter().all(|(s, i)| self.watchers[s].slots[*i].pts.contains_key(&VideoCodec::Vp9));
+        let (session, index) = eligible[0];
+        let need = self.watchers[&session].slots[index].last_h264.expect("eligible").1;
+        let origin = p.origin.clone();
+        let plan = origin.recovery.lock().expect("recovery lock").fail(
+            share,
+            (need.width, need.height),
+            vp9,
+            eligible.iter().map(|(s, _)| *s).collect(),
+            now,
+        );
         if let Some(plan) = plan {
-            let fs = plan.width.div_ceil(16) * plan.height.div_ceil(16);
-            slot.decode_cap = Some((fs, fs * plan.fps));
+            self.apply_recovery(origin, plan, false);
+            return true;
+        }
+        false
+    }
+
+    fn apply_recovery(&mut self, origin: Arc<ScreenOrigin>, plan: gwar_proto::ScreenRecovery, restoring: bool) {
+        let fs = plan.width.div_ceil(16) * plan.height.div_ceil(16);
+        for (session, index) in self.slots_of(&origin.share) {
+            let w = self.watchers.get_mut(&session).expect("assigned");
+            w.egress.clear(index);
+            let slot = &mut w.slots[index];
+            slot.decode_cap = if restoring { None } else { Some((fs, fs * plan.fps)) };
+            slot.failed_at = None;
             slot.segment.wait();
-            self.signal(ScreenSignal::Recover { session, run, grant, plan });
-        } else if !waiting && terminal {
-            empty(w, index);
-            self.signal(ScreenSignal::Incompatible { session, run, grant });
+            slot.originals.clear();
+            wipe(&mut w.rtc, slot.mid);
+        }
+        self.signal(ScreenSignal::Recover { origin, plan });
+    }
+
+    fn recoveries(&mut self, now: Instant) {
+        self.decode_reports.retain(|_, at| now.saturating_duration_since(*at) < recovery::HOLD_DOWN);
+        let shares: Vec<_> = self.publishers.keys().cloned().collect();
+        for share in shares {
+            let origin = self.publishers[&share].origin.clone();
+            let active = self
+                .slots_of(&share)
+                .into_iter()
+                .filter(|(s, i)| self.watchers[s].slots[*i].grant.as_ref().is_some_and(|g| g.alive()))
+                .map(|(s, _)| s)
+                .collect();
+            let restore = origin.recovery.lock().expect("recovery lock").restore(&share, &active, now);
+            if let Some(plan) = restore {
+                self.apply_recovery(origin.clone(), plan, true);
+            }
+            if origin.recovery.lock().expect("recovery lock").pending {
+                continue;
+            }
+            let failed: Vec<_> = self
+                .slots_of(&share)
+                .into_iter()
+                .filter(|(s, i)| {
+                    self.watchers[s].slots[*i]
+                        .failed_at
+                        .is_some_and(|at| now.saturating_duration_since(at) >= CORROBORATE_FOR)
+                })
+                .collect();
+            if !failed.is_empty() && !self.try_recover(&share, now) {
+                for (session, index) in failed {
+                    let w = self.watchers.get_mut(&session).expect("assigned");
+                    let run = w.run;
+                    let grant = w.slots[index].grant.clone().expect("assigned");
+                    empty(w, index);
+                    self.signal(ScreenSignal::Incompatible { session, run, grant });
+                }
+            }
         }
     }
 
@@ -1827,6 +1916,7 @@ fn empty(w: &mut Watcher, index: usize) {
     slot.keyframe_at = None;
     slot.last_h264 = None;
     slot.decode_cap = None;
+    slot.failed_at = None;
     slot.originals.clear();
     w.egress.unassign(index);
     wipe(&mut w.rtc, slot.mid);
@@ -2509,6 +2599,7 @@ pub(crate) mod tests {
             owners: Owners { held: HashMap::new(), addrs: dispatch.addrs },
             outbox: VecDeque::new(),
             budgets: HashMap::new(),
+            decode_reports: HashMap::new(),
             publishers: HashMap::new(),
             watchers: HashMap::new(),
             next_id: 1,
@@ -2580,6 +2671,7 @@ pub(crate) mod tests {
             owners: Owners { held: HashMap::new(), addrs: dispatch.addrs },
             outbox: VecDeque::new(),
             budgets: HashMap::new(),
+            decode_reports: HashMap::new(),
             publishers: HashMap::new(),
             watchers: HashMap::from([(pair.w.session, pair.w)]),
             next_id: 1,
@@ -2901,15 +2993,11 @@ pub(crate) mod tests {
         assert_eq!(throttle.next(), Some(now + KEYFRAME_INTERVAL));
     }
 
-    #[tokio::test]
-    async fn h264_decode_recovery_fences_reports_and_retains_the_share_across_the_ladder() {
-        let mut pair = Pair::new();
-        let now = pair.now;
+    async fn recovery_fixture(viewers: &[SessionId]) -> (Sfu, Arc<ScreenOrigin>, Instant, h264_stream::Requirements) {
+        let now = Instant::now();
         let mut publisher = h264_ingress_fixture(now);
         let origin = publisher.origin.clone();
         publisher.codecs.insert(98.into(), VideoCodec::Vp9);
-        assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, now);
-        let generation = pair.w.slots[0].generation;
         let need = h264_stream::Requirements {
             sps_id: 0,
             profile: 0x42e02a,
@@ -2918,55 +3006,150 @@ pub(crate) mod tests {
             frame_mbs: 8160,
             mbps: 489600,
         };
-        pair.w.slots[0].keyframe_at = Some(now);
-        pair.w.slots[0].last_h264 = Some((now + Duration::from_secs(5), need));
+        let mut watchers = HashMap::new();
+        for &session in viewers {
+            let mut pair = Pair::new();
+            pair.w.session = session;
+            pair.w.decode_watchdog = true;
+            assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), session.into(), now);
+            pair.w.slots[0].keyframe_at = Some(now);
+            pair.w.slots[0].last_h264 = Some((now + Duration::from_secs(5), need));
+            watchers.insert(session, pair.w);
+        }
         let (dispatch, _rx) = dispatch();
-        let core = crate::core::expiry_tests::test_core(crate::store::Store::in_memory().unwrap(), None);
-        let mut sfu = Sfu {
+        let sfu = Sfu {
             socket: Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap()),
             advertise: addr(6000),
-            core,
+            core: crate::core::expiry_tests::test_core(crate::store::Store::in_memory().unwrap(), None),
             dropped: Arc::new(AtomicU64::new(0)),
             owners: Owners { held: HashMap::new(), addrs: dispatch.addrs },
             outbox: VecDeque::new(),
             budgets: HashMap::new(),
+            decode_reports: HashMap::new(),
             publishers: HashMap::from([("h264".into(), publisher)]),
-            watchers: HashMap::from([(7, pair.w)]),
+            watchers,
             next_id: 1,
             shared: ScreenShared::new(300_000_000),
             measured: Measured::new(now),
-            watches: 1,
+            watches: viewers.len() as u64,
             next_allocation: now,
         };
-        for (run, slot, report_generation, share, seconds) in [
+        (sfu, origin, now, need)
+    }
+
+    fn report(sfu: &mut Sfu, session: SessionId, now: Instant) {
+        let generation = sfu.watchers[&session].slots[0].generation;
+        sfu.decode_failed(session, 1, 0, generation, "h264", now);
+    }
+
+    #[tokio::test]
+    async fn one_reporter_is_isolated_without_changing_healthy_viewers_or_native_watches() {
+        for native in [false, true] {
+            let (mut sfu, origin, now, _) = recovery_fixture(&[7, 8]).await;
+            sfu.watchers.get_mut(&8).unwrap().decode_watchdog = !native;
+            let at = now + Duration::from_secs(5);
+            report(&mut sfu, 7, at);
+            assert!(!origin.recovery.lock().unwrap().pending);
+            sfu.recoveries(at + CORROBORATE_FOR);
+            assert!(sfu.watchers[&7].slots[0].grant.is_none());
+            assert!(sfu.watchers[&8].slots[0].grant.as_ref().unwrap().alive());
+            assert!(sfu.watchers[&8].slots[0].decode_cap.is_none());
+            assert!(origin.alive());
+        }
+    }
+
+    #[tokio::test]
+    async fn corroborated_failure_retains_every_slot_through_both_replacements() {
+        let (mut sfu, origin, now, need) = recovery_fixture(&[7, 8]).await;
+        let at = now + Duration::from_secs(5);
+        report(&mut sfu, 7, at);
+        report(&mut sfu, 8, at);
+        assert!(origin.recovery.lock().unwrap().pending);
+        for w in sfu.watchers.values() {
+            assert_eq!(w.slots[0].decode_cap, Some((3600, 108000)));
+        }
+        // An H.264 packet from the old publisher exceeds the new cap. It must be
+        // dropped before compatibility is checked, even for a non-reporting joiner.
+        let mut newcomer = Pair::new().w;
+        newcomer.session = 9;
+        assign(&mut newcomer, 0, WatchGrant::new(origin.clone()), 9, at);
+        sfu.watchers.insert(9, newcomer);
+        let mut old = h264_forward(1, 9000, &[0x65, 1], at);
+        old.h264 = Some(need);
+        sfu.forward_packets("h264", &origin, vec![(old.clone(), false)], at);
+        assert!(sfu.watchers.values().all(|w| w.slots[0].grant.is_some()));
+        // Replacement accepted: fresh watchdog window, as in ScreenCmd::Publish.
+        origin.recovery.lock().unwrap().pending = false;
+        let at = at + recovery::HOLD_DOWN;
+        for w in sfu.watchers.values_mut() {
+            w.slots[0].keyframe_at = Some(at - DECODE_WINDOW);
+            w.slots[0].last_h264 = Some((at, need));
+        }
+        report(&mut sfu, 7, at);
+        report(&mut sfu, 8, at);
+        assert!(!origin.recovery.lock().unwrap().pending, "new healthy viewer prevents another downgrade");
+        // The new viewer now independently corroborates failure.
+        sfu.watchers.get_mut(&9).unwrap().decode_watchdog = true;
+        report(&mut sfu, 9, at);
+        assert!(origin.recovery.lock().unwrap().pending);
+        sfu.forward_packets("h264", &origin, vec![(old, false)], at);
+        assert!(sfu.watchers.values().all(|w| w.slots[0].grant.is_some()));
+        origin.recovery.lock().unwrap().pending = false;
+        let delta = Forward {
+            h264: None,
+            codec: VideoCodec::Vp9,
+            source: 10,
+            timestamp: 18000,
+            marker: true,
+            keyframe: false,
+            arrival: at,
+            payload: Arc::from([0x40, 1]),
+        };
+        sfu.forward_packets("h264", &origin, vec![(delta.clone(), false)], at);
+        assert!(sfu.watchers.values().all(|w| w.slots[0].segment.waiting()));
+        let key = Forward { keyframe: true, source: 11, timestamp: 21000, payload: Arc::from([0x08, 1]), ..delta };
+        sfu.forward_packets("h264", &origin, vec![(key, false)], at);
+        assert!(
+            sfu.watchers.values().all(|w| w.slots[0].grant.is_some() && !w.slots[0].segment.waiting()),
+            "VP9 keyframe opens every retained slot without codec stops"
+        );
+    }
+
+    #[tokio::test]
+    async fn reports_are_fenced_throttled_and_hold_down_survives_publisher_replacement() {
+        let (mut sfu, origin, now, need) = recovery_fixture(&[7]).await;
+        let generation = sfu.watchers[&7].slots[0].generation;
+        for (run, index, g, share, t) in [
             (2, 0, generation, "h264", 5),
             (1, 9, generation, "h264", 5),
             (1, 0, generation + 1, "h264", 5),
             (1, 0, generation, "other", 5),
             (1, 0, generation, "h264", 3),
+            (1, 0, generation, "h264", 8),
         ] {
-            sfu.decode_failed(7, run, slot, report_generation, share, now + Duration::from_secs(seconds));
-            assert!(sfu.watchers[&7].slots[0].decode_cap.is_none());
+            sfu.decode_failed(7, run, index, g, share, now + Duration::from_secs(t));
+            assert!(!origin.recovery.lock().unwrap().pending);
         }
-        sfu.decode_failed(7, 1, 0, generation, "h264", now + Duration::from_secs(5));
-        assert!(sfu.watchers[&7].slots[0].decode_cap.is_none(), "native transports do not opt into browser recovery");
+        sfu.watchers.get_mut(&7).unwrap().decode_watchdog = false;
+        report(&mut sfu, 7, now + Duration::from_secs(5));
+        assert!(!origin.recovery.lock().unwrap().pending);
         sfu.watchers.get_mut(&7).unwrap().decode_watchdog = true;
-        sfu.decode_failed(7, 1, 0, generation, "h264", now + Duration::from_secs(5));
-        assert_eq!(sfu.watchers[&7].slots[0].decode_cap, Some((3600, 108000)));
-        assert!(sfu.watchers[&7].slots[0].grant.as_ref().unwrap().alive());
-        assert!(!origin.recovery.lock().unwrap().wants_vp9());
-        sfu.recover_slot(7, 0, need, now + Duration::from_secs(14));
-        assert!(!origin.recovery.lock().unwrap().wants_vp9(), "hold-down prevents flapping");
-        // A publisher still exceeding the first cap advances only after hold-down.
-        sfu.recover_slot(7, 0, need, now + Duration::from_secs(15));
-        assert!(origin.recovery.lock().unwrap().wants_vp9());
-        assert!(sfu.watchers[&7].slots[0].grant.as_ref().unwrap().alive());
-        sfu.recover_slot(7, 0, need, now + Duration::from_secs(25));
-        assert!(
-            sfu.watchers[&7].slots[0].grant.is_none(),
-            "a publisher ignoring both requests cannot strand the watch"
-        );
-        assert!(origin.alive(), "recovery never ends the underlying share");
+        report(&mut sfu, 7, now + Duration::from_secs(5));
+        assert!(origin.recovery.lock().unwrap().pending, "sole viewer may recover its share");
+        origin.recovery.lock().unwrap().pending = false;
+        sfu.watchers.get_mut(&7).unwrap().slots[0].last_h264 = Some((now + Duration::from_secs(10), need));
+        report(&mut sfu, 7, now + Duration::from_secs(10));
+        assert!(sfu.watchers[&7].slots[0].failed_at.is_none(), "per-session throttle ignores repeated reports");
+        sfu.watchers.get_mut(&7).unwrap().slots[0].last_h264 = Some((now + Duration::from_secs(15), need));
+        report(&mut sfu, 7, now + Duration::from_secs(15));
+        assert!(origin.recovery.lock().unwrap().pending);
+        origin.recovery.lock().unwrap().pending = false;
+        empty(sfu.watchers.get_mut(&7).unwrap(), 0);
+        sfu.recoveries(now + Duration::from_secs(24));
+        assert!(!origin.recovery.lock().unwrap().pending);
+        sfu.recoveries(now + Duration::from_secs(25));
+        assert!(origin.recovery.lock().unwrap().pending, "reporter departure restores H.264, after hold-down");
+        assert!(origin.alive());
     }
 
     fn h264_ingress_fixture(now: Instant) -> Publisher {

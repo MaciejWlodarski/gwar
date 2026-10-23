@@ -435,7 +435,10 @@ impl Core {
         self.shares.get_mut(&id).expect("found above").guests.insert(guest);
         self.send_viewers(&id);
         let sharer = self.sessions.get(&sharer).map(|s| s.nickname.clone()).unwrap_or_default();
-        Ok((guest, Response::Watching { share: id, sharer, preset, ice_servers: self.ice_servers.clone() }))
+        Ok((
+            guest,
+            Response::Watching { share: id, sharer, preset, ice_servers: self.ice_servers.clone(), screen_h264: true },
+        ))
     }
 
     /// Fence requests and delayed media callbacks even if membership cancellation has not

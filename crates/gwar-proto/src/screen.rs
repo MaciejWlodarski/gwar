@@ -321,6 +321,7 @@ mod tests {
             assert!(serde_json::from_value::<GuestFrame>(frame).is_err(), "{op}");
         }
         let watching = Response::Watching {
+            screen_h264: true,
             share: "s".into(),
             sharer: "alice".into(),
             preset: ScreenPreset::Text,
@@ -328,7 +329,10 @@ mod tests {
         };
         let reply = ServerFrame::Ok { re: 1, ok: watching };
         let text = serde_json::to_string(&reply).unwrap();
-        assert_eq!(text, r#"{"re":1,"ok":{"share":"s","sharer":"alice","preset":"text","ice_servers":[]}}"#);
+        assert_eq!(
+            text,
+            r#"{"re":1,"ok":{"share":"s","sharer":"alice","preset":"text","ice_servers":[],"screen_h264":true}}"#
+        );
         assert_eq!(serde_json::from_str::<ServerFrame>(&text).unwrap(), reply);
     }
 
@@ -402,6 +406,40 @@ mod tests {
         }
         let slot = json!({"ev": "screen.slot", "d": {"run": 1, "slot": 0}});
         assert!(serde_json::from_value::<ServerFrame>(slot).is_err(), "share must be present, even as null");
+    }
+
+    #[test]
+    fn legacy_watch_schemas_remain_accepted_in_both_directions() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct OldWatch {
+            run: u64,
+            sdp: String,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct OldGuestOffer {
+            sdp: String,
+        }
+        let old = json!({"run": 1, "sdp": "old"});
+        let current: ScreenWatchOffer = serde_json::from_value(old.clone()).unwrap();
+        assert!(!current.browser && current.h264.is_empty());
+        let back: OldWatch = serde_json::from_value(serde_json::to_value(&current).unwrap()).unwrap();
+        assert_eq!((back.run, back.sdp), (1, "old".into()));
+        for field in ["browser", "h264"] {
+            let mut extended = old.clone();
+            extended[field] = if field == "browser" { json!(true) } else { json!([]) };
+            assert!(
+                serde_json::from_value::<OldWatch>(extended).is_err(),
+                "negative control: old servers reject {field}, including an empty capability list"
+            );
+        }
+        let current: GuestFrame = serde_json::from_value(json!({"id":1,"op":"guest.offer","d":{"sdp":"old"}})).unwrap();
+        let body = serde_json::to_value(current).unwrap()["d"].clone();
+        assert_eq!(serde_json::from_value::<OldGuestOffer>(body).unwrap().sdp, "old");
+        let reply: Response =
+            serde_json::from_value(json!({"share":"s","sharer":"alice","preset":"text","ice_servers":[]})).unwrap();
+        assert!(matches!(reply, Response::Watching { screen_h264: false, .. }));
     }
 
     #[test]

@@ -414,17 +414,25 @@ export class ScreenController {
       settle.reject(e);
       if (lost) useUi.getState().toast("error", tNow("screen.watchFailed"));
     };
+    let screenH264 = false;
     const transport: ScreenWatchTransport = new ScreenWatchTransport({
       run,
       iceServers: useSession.getState().iceServers,
-      offer: async (sdp, run, h264 = []) => (await conn.request("screen.watch.offer", { run, sdp, browser: true, h264 }, { timeoutMs: 35_000 })).sdp,
+      offer: async (sdp, run, h264 = []) => {
+        // Query explicitly: adding fields to Welcome would break old clients' strict
+        // validators. An older server replies bad_request and retains legacy offers.
+        screenH264 = await conn.request("screen.capabilities", {}, { timeoutMs: 1_500 })
+          .then(features => features.screen_h264 === true).catch(() => false);
+        if (this.transport !== transport) throw new Error("the watch transport was replaced");
+        return (await conn.request("screen.watch.offer", { run, sdp, ...(screenH264 ? { browser: true, h264 } : {}) }, { timeoutMs: 35_000 })).sdp;
+      },
       state: state => {
         if (this.transport !== transport) return;
         if (state === "failed") { fail(new Error(tNow("screen.watchFailed"))); return; }
         dispatch({ type: "transport", run, phase: state });
         if (state === "connected") settle.resolve(run);
       },
-      decodeFailed: (slot, share, generation) => { if (this.transport === transport) void conn.request("screen.decode_failed", { run, slot, share, generation }).catch(() => {}); },
+      decodeFailed: (slot, share, generation) => { if (screenH264 && this.transport === transport) void conn.request("screen.decode_failed", { run, slot, share, generation }).catch(() => {}); },
       track: (slot, stream) => { if (this.transport === transport) dispatch({ type: "stream", run, slot, stream }); },
     });
     this.transport = transport;

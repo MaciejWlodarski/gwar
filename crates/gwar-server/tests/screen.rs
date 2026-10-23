@@ -37,6 +37,23 @@ async fn stream(
 }
 
 #[tokio::test]
+async fn optional_capability_query_keeps_legacy_clients_and_welcome_compatible() {
+    let server = TestServer::start().await;
+    let mut client = Client::connect(&server, "legacy").await;
+    assert!(
+        serde_json::to_value(&client.welcome).unwrap().get("screen_h264").is_none(),
+        "legacy strict Welcome schema stays unchanged"
+    );
+    assert_eq!(client.request("screen.capabilities", json!({})).await.unwrap(), json!({"screen_h264":true}));
+    // An unknown optional query must not retire an old server's connection.
+    assert_eq!(
+        client.request("screen.future_capabilities", json!({})).await.unwrap_err().code,
+        gwar_proto::ErrorCode::BadRequest
+    );
+    assert_eq!(client.request("screen.capabilities", json!({})).await.unwrap(), json!({"screen_h264":true}));
+}
+
+#[tokio::test]
 async fn a_late_viewer_starts_at_a_keyframe_and_gets_every_byte_in_order() {
     let server = TestServer::start().await;
     let mut alice = Client::connect(&server, "alice").await;

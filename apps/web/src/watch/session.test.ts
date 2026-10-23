@@ -81,6 +81,17 @@ describe("watch page endpoint and token", () => {
 });
 
 describe("WatchSession", () => {
+  it.each([false,true])("gates guest extensions on the server advertisement (%s)", async supported => {
+    const t = setup();
+    t.session.start("ws://127.0.0.1:1/ws/watch", TOKEN);
+    t.socket().open();
+    t.socket().receive({ re: 1, ok: { ...watching, ...(supported ? { screen_h264: true } : {}) } });
+    await vi.waitFor(() => expect(t.socket().last("guest.offer")).toBeDefined());
+    expect(t.socket().last("guest.offer")!.d).toEqual(supported ? { sdp: "v=0 offer", browser: true, h264: [] } : { sdp: "v=0 offer" });
+    t.params().decodeFailed?.(0,"s1",1);
+    expect(t.socket().last("screen.decode_failed") !== undefined).toBe(supported);
+    t.session.close();
+  });
   it("watches through one receive-only slot and pings every 20 s once admitted", async () => {
     const t = setup();
     t.session.start("ws://127.0.0.1:1/ws/watch", TOKEN);
@@ -94,7 +105,7 @@ describe("WatchSession", () => {
     await vi.waitFor(() => expect(socket.last("guest.offer")).toBeDefined());
     expect(t.names).toEqual(["alice"]);
     expect(t.params().slots).toBe(1);
-    expect(socket.last("guest.offer")!.d).toEqual({ sdp: "v=0 offer", browser: true, h264: [] });
+    expect(socket.last("guest.offer")!.d).toEqual({ sdp: "v=0 offer" });
     socket.receive({ re: socket.last("guest.offer")!.id, ok: { sdp: "v=0 answer" } });
     t.params().state("connected");
     expect(t.statuses).toEqual(["watching"]);

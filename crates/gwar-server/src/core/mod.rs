@@ -782,9 +782,7 @@ impl Core {
             CoreMsg::Screen(ScreenSignal::Keyframe { session, run, slot, generation, grant }) => {
                 self.screen_decode_keyframe(session, run, slot, generation, &grant)
             }
-            CoreMsg::Screen(ScreenSignal::Recover { session, run, grant, plan }) => {
-                self.screen_recover(session, run, &grant, plan)
-            }
+            CoreMsg::Screen(ScreenSignal::Recover { origin, plan }) => self.screen_recover(&origin, plan),
             CoreMsg::Screen(ScreenSignal::Incompatible { session, run, grant }) => {
                 self.screen_incompatible(session, run, &grant);
             }
@@ -1903,6 +1901,7 @@ impl Core {
             Request::ScreenStart(start) => self.screen_start(session, start),
             Request::ScreenPublishOffer(offer) => return self.screen_publish_offer(session, id, offer),
             Request::ScreenWatchOffer(offer) => return self.screen_watch_offer(session, id, offer),
+            Request::ScreenCapabilities {} => Ok(Response::ScreenCapabilities { screen_h264: true }),
             Request::ScreenFocus { share } => self.screen_focus(session, &share),
             Request::ScreenDecodeFailed { share, slot, run, generation } => {
                 self.screen_decode_failed(session, &share, slot, run, generation)

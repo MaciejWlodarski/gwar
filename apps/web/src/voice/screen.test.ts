@@ -264,5 +264,9 @@ it("keeps the original publisher alive until its replacement is accepted and ret
   await publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
   expect(Peer.all[2]!.transceivers[0]!.setCodecPreferences.mock.calls[0]![0].map((c: RTCRtpCodec) => c.mimeType)).toEqual(["video/VP9", "video/rtx"]);
   expect(Peer.all[2]!.sendParams.at(-1)?.encodings[0]).toMatchObject({ maxFramerate: 30, scaleResolutionDownBy: 1.5 });
+  await publisher.recover({ share: "s", codec: "h264", width: 1920, height: 1080, fps: 60 });
+  expect(Peer.all[3]!.transceivers[0]!.setCodecPreferences.mock.calls[0]![0][0].mimeType).toBe("video/H264");
+  expect(track.applyConstraints).toHaveBeenLastCalledWith({ width: { max: 1920 }, height: { max: 1080 }, frameRate: { max: 60 } });
+  expect(Peer.all[3]!.sendParams.at(-1)?.encodings[0]).toMatchObject({ maxFramerate: 60, scaleResolutionDownBy: 1 });
   publisher.close();
 });

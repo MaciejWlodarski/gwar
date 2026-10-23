@@ -67,7 +67,7 @@ export interface WatchView {
   stream(stream: MediaStream): void;
 }
 
-interface Watching { share: string; sharer: string; preset: string; ice_servers: IceServer[] }
+interface Watching { share: string; sharer: string; preset: string; ice_servers: IceServer[]; screen_h264?: boolean }
 
 type Pending = { resolve(ok: unknown): void; reject(code: string): void };
 
@@ -180,7 +180,7 @@ export class WatchSession {
       slots: 1,
       iceServers: ok.ice_servers,
       offer: async (sdp, _run, h264 = []) => {
-        const answer = await this.request("guest.offer", { sdp, browser: true, h264 });
+        const answer = await this.request("guest.offer", { sdp, ...(ok.screen_h264 === true ? { browser: true, h264 } : {}) });
         if (!isRecord(answer) || typeof answer.sdp !== "string") throw new Error("no answer");
         return answer.sdp;
       },
@@ -188,7 +188,7 @@ export class WatchSession {
         if (state === "failed") this.finish("lost");
         else if (state === "connected" && this.current === "connecting") this.set("watching");
       },
-      decodeFailed: (slot, share, generation) => { void this.request("screen.decode_failed", { slot, share, generation, run: 1 }).catch(() => {}); },
+      decodeFailed: (slot, share, generation) => { if (ok.screen_h264 === true) void this.request("screen.decode_failed", { slot, share, generation, run: 1 }).catch(() => {}); },
       track: (slot, stream) => { if (slot === 0) this.view.stream(stream); },
     });
     this.transport = transport;

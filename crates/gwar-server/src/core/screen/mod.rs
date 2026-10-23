@@ -670,22 +670,16 @@ impl Core {
         }
     }
 
-    pub(super) fn screen_recover(
-        &mut self,
-        session: SessionId,
-        run: u64,
-        grant: &Arc<WatchGrant>,
-        plan: gwar_proto::ScreenRecovery,
-    ) {
-        if !self.current_screen_grant(session, run, grant) {
+    pub(super) fn screen_recover(&mut self, origin: &Arc<ScreenOrigin>, plan: gwar_proto::ScreenRecovery) {
+        let Some(share) = self.shares.get_mut(&origin.share) else { return };
+        if !origin.alive() || !Arc::ptr_eq(&share.origin, origin) {
             return;
         }
-        let Some(share) = self.shares.get_mut(&grant.share) else { return };
-        // Only an SFU-authorized downward recovery reopens this one-shot negotiation.
+        // Only an SFU-authorized recovery/restoration reopens this one-shot negotiation.
         share.publish = None;
         let sharer = share.sharer;
         self.send_event(sharer, Event::ScreenRecover(plan));
-        self.connect_deadline(&grant.share, false);
+        self.connect_deadline(&origin.share, false);
     }
 
     /// A viewer's decryptor lost sync: a keyframe, within the viewer's budget.

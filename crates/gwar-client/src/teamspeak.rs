@@ -1104,6 +1104,7 @@ fn translate(request: &Request, own: u16, view: &View) -> Result<Vec<(Part, OutC
         | Request::ScreenLinkRevoke { .. }
         | Request::ScreenPublishOffer(_)
         | Request::ScreenWatchOffer(_)
+        | Request::ScreenCapabilities {}
         | Request::ScreenFocus { .. }
         | Request::ScreenDecodeFailed { .. }
         | Request::ScreenKeyframe { .. } => return Err(refused("screen sharing requires a Gwar server")),

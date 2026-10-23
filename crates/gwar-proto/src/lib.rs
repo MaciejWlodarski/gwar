@@ -295,6 +295,10 @@ wire! {
         /// Negotiates the session's watch transport ([`SCREEN_SLOTS`] `recvonly` video slots).
         #[serde(rename = "screen.watch.offer")]
         ScreenWatchOffer(ScreenWatchOffer),
+        /// Optional, bounded feature advertisement. Older servers reject this query;
+        /// clients then send the legacy watch offer without extension fields.
+        #[serde(rename = "screen.capabilities")]
+        ScreenCapabilities {},
         /// The share on the viewer's stage: it gets first claim on the viewer's bandwidth.
         #[serde(rename = "screen.focus")]
         ScreenFocus { share: String },
@@ -607,9 +611,15 @@ wire! {
         TeamspeakClaimable { claimable: Vec<Uid> },
         /// `guest.watch`: the share a watch link opens, its sharer's display name and how to
         /// connect. Nothing else about the server reaches a guest.
-        Watching { share: String, sharer: String, preset: ScreenPreset, ice_servers: Vec<IceServer> },
+        Watching { share: String, sharer: String, preset: ScreenPreset, ice_servers: Vec<IceServer>,
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            #[cfg_attr(feature = "ts", ts(optional, as = "Option<_>"))]
+            screen_h264: bool,
+        },
         /// `screen.start`: the new share's id.
         ScreenShare { share: String },
+        /// `screen.capabilities`; deliberately absent from the legacy Welcome shape.
+        ScreenCapabilities { screen_h264: bool },
         /// `screen.publish.offer`, `screen.watch.offer`: the SDP answer.
         ScreenAnswer { sdp: String },
         /// `screen.watch`: the watch transport's slot the share arrives in.

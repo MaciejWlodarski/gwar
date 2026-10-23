@@ -204,6 +204,7 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "voice.state": shape({voice:nullable(voiceState)}),
   "voice.epoch.ack": empty, "voice.epoch.repeat": empty,
   "screen.start": shape({ share: shareId }), "screen.stop": empty, "screen.watch": shape({ slot: int(3) }), "screen.unwatch": empty, "screen.stop_other": empty, "screen.link.revoke": empty,
+  "screen.capabilities": shape({ screen_h264: bool }),
   "screen.publish.offer": shape({ sdp: str(65536) }), "screen.watch.offer": shape({ sdp: str(65536) }), "screen.focus": empty, "screen.keyframe": empty, "screen.decode_failed": empty,
   "owner.chain": shape({ genesis: str(1024), links: array(shape({ statement: str(2048), signature: fixed(64) }), 64), next: nullable(id) }),
   "owner.transfer": empty, "managers.update": empty,

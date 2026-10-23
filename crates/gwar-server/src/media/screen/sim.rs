@@ -138,7 +138,7 @@ pub struct Share {
 
 /// A payload whose bytes follow from its source number, so the viewer's copy can be checked.
 pub fn payload(source: u64, first: bool, len: usize) -> Arc<[u8]> {
-    let mut bytes = vec![if first { 0x10 } else { 0x00 }];
+    let mut bytes = vec![if first { 0x08 } else { 0x00 }];
     bytes.extend_from_slice(&source.to_be_bytes());
     bytes
         .extend((0..len.saturating_sub(bytes.len())).map(|i| (source as usize).wrapping_mul(31).wrapping_add(i) as u8));
@@ -190,7 +190,7 @@ impl Sim {
     /// separate, explicit per-direction seeds, so handshake randomness cannot consume it.
     pub fn with_seed(rate: Option<u64>, seed: u64) -> Self {
         let now = str0m::_gwar_sim::start(seed);
-        let mut client = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp8(true).build(now);
+        let mut client = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp9(true).build(now);
         client.add_local_candidate(Candidate::host(addr(5000), "udp").unwrap());
         // str0m's random mids can collide within one offer: redraw.
         let (offer, pending) = loop {
@@ -330,7 +330,7 @@ impl Sim {
                     timestamp: share.timestamp,
                     marker: n + 1 == packets,
                     keyframe: key && n == 0,
-                    codec: VideoCodec::Vp8,
+                    codec: VideoCodec::Vp9,
                     arrival: now,
                     payload: payload(share.source, n == 0, len),
                 };
@@ -1193,7 +1193,7 @@ mod tests {
                 timestamp: source as u32 * 3000,
                 marker: true,
                 keyframe: source == 100,
-                codec: VideoCodec::Vp8,
+                codec: VideoCodec::Vp9,
                 arrival,
                 payload: payload(source, true, 1000),
             };

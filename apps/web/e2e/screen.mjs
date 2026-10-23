@@ -35,6 +35,9 @@ import { chromium, webkit } from "playwright";
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(webRoot, "../..");
 const engines = (process.env.E2E_BROWSERS ?? "chromium,webkit").split(",").map(s => s.trim()).filter(Boolean);
+// Keep codec/dimension admission deterministic: real-tab capture also drops to 480x270
+// on main's VP9 path with Chromium reporting bandwidth pressure and zero CPU limitation.
+// That separate capture/BWE investigation must not weaken this fixed-canvas H.264 gate.
 const fixedCanvas = process.env.E2E_SCREEN_CANVAS === "1";
 const SOURCE_TITLE = "Gwar share source";
 const children = [];
@@ -426,20 +429,46 @@ async function run(browsers, web, server, token) {
   assert.equal(await c4.getByRole("dialog", { name: "Share your screen" }).count(), 0);
   checks.push({ check: "encrypted channel refuses", ok: true });
 
-  // Exercise the real recovery wire path while only the watchdog's decode counter stalls.
-  // Actual receiver stats/barcodes still prove that both replacement transports deliver video.
+  // Exercise isolation first, then corroborate the same failure across every active
+  // viewer. Only the watchdog counters stall; real receiver stats/barcodes still
+  // prove each replacement delivers video and keeps the original watch slots.
   if (hasH264) {
-    const before = await session(wv, (_, screen, __, share) => screen.watches.find(w => w.share === share)?.slot, csShare);
-    await wv.evaluate(() => {
-      for (const pc of window.__pcs) {
-        const stats = pc.getStats.bind(pc);
-        pc.getStats = async (...args) => {
-          const report = await stats(...args), stalled = new Map();
-          report.forEach((s, key) => stalled.set(key, s.type === "inbound-rtp" && /video\/h264/i.test(report.get(s.codecId)?.mimeType ?? "") ? { ...s, framesDecoded: 0 } : s));
-          return stalled;
-        };
-      }
-    });
+    const stalled = async (page, enabled) => {
+      const slot = await session(page, (_, screen, __, share) => screen.watches.find(w => w.share === share)?.slot, csShare);
+      await page.evaluate(({ slot, enabled }) => {
+        window.__failH264Decode = enabled;
+        for (const pc of window.__pcs) {
+          const mid = pc.getTransceivers().filter(t => t.receiver.track.kind === "video")[slot]?.mid;
+          if (mid == null || pc.__recoveryStats) continue;
+          pc.__recoveryStats = pc.getStats.bind(pc);
+          pc.getStats = async (...args) => {
+            const report = await pc.__recoveryStats(...args), altered = new Map();
+            report.forEach((s, key) => altered.set(key, window.__failH264Decode && s.mid === mid && s.type === "inbound-rtp" && /video\/h264/i.test(report.get(s.codecId)?.mimeType ?? "") ? { ...s, framesDecoded: 0 } : s));
+            return altered;
+          };
+        }
+      }, { slot, enabled });
+    };
+    await cs.evaluate(() => { window.__publisherBeforeIsolation = window.__pcs.find(pc => pc.connectionState === "connected" && pc.getSenders().some(s => s.track?.kind === "video")); });
+    await stalled(wv, true);
+    await waitFor(async () => !(await session(wv, (_, screen, __, share) => screen.watches.some(w => w.share === share), csShare)), "one decode reporter is isolated");
+    await wv.getByText("Your browser cannot decode this screen share. Ask the sharer to use a compatible browser or codec.", { exact: true }).waitFor();
+    await codecFlow(cs, c3, csShare, "video/h264");
+    assert.equal(await cs.evaluate(() => window.__publisherBeforeIsolation?.connectionState), "connected", "one reporter does not replace the publisher");
+    await sees(c3, csShare, 1, "healthy viewer survives another viewer's decode failure");
+    assert.equal(await ownShare(cs), csShare, "one reporter never replaces the share");
+    checks.push({ check: "one reporter is isolated while healthy viewers keep the existing H.264 publisher", ok: true });
+    await stalled(wv, false);
+    await watch(wv, "cs-tab");
+    await sees(wv, csShare, 1, "isolated viewer may explicitly retry");
+    // Let the reporter's ten-second server throttle expire before an independent
+    // all-viewer incident; otherwise it cannot corroborate the healthy viewers.
+    await sleep(10_000);
+    // cv released this share during the four-slot limit check above. These
+    // are the two remaining active watches; both must corroborate failure.
+    const viewers = [wv, c3];
+    const before = await Promise.all(viewers.map(page => session(page, (_, screen, __, share) => screen.watches.find(w => w.share === share)?.slot, csShare)));
+    await Promise.all(viewers.map(page => stalled(page, true)));
     let capped;
     await waitFor(async () => {
       capped = await cs.evaluate(async () => {
@@ -459,9 +488,11 @@ async function run(browsers, web, server, token) {
     await codecFlow(cs, wv, csShare, "video/h264");
     await codecFlow(cs, wv, csShare, "video/vp9");
     assert.equal(await ownShare(cs), csShare, "recovery retains the original share id");
-    assert.equal(await session(wv, (_, screen, __, share) => screen.watches.find(w => w.share === share)?.slot, csShare), before, "recovery retains the viewer's slot");
-    await sees(wv, csShare, 1, "VP9 decode after watchdog recovery");
-    checks.push({ check: "decode watchdog caps H.264 then fails over to VP9 without replacing watches", ok: true });
+    for (const [index, page] of viewers.entries()) {
+      assert.equal(await session(page, (_, screen, __, share) => screen.watches.find(w => w.share === share)?.slot, csShare), before[index], "corroborated recovery retains every viewer's slot");
+      await sees(page, csShare, 1, "VP9 decode after corroborated watchdog recovery");
+    }
+    checks.push({ check: "corroborated watchdog caps H.264 then selects VP9 without stopping any watch", ok: true });
   }
 
   const problems = opened.flatMap(p => errors(p).map(e => `${p.deviceName}: ${e}`));

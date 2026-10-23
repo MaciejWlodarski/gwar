@@ -17,6 +17,13 @@ describe("bounded server frames", () => {
     expect(responseFor("chat.send", message)).toBe(true);
     expect(responseFor("chat.history", { messages: [message] })).toBe(true);
   });
+  it("bounds the optional screen capability reply without changing legacy welcome", () => {
+    expect(responseFor("screen.capabilities", { screen_h264: true })).toBe(true);
+    expect(responseFor("screen.capabilities", { screen_h264: false })).toBe(true);
+    for (const reply of [{}, { screen_h264: "true" }, { screen_h264: true, extra: true }]) expect(responseFor("screen.capabilities", reply)).toBe(false);
+    expect(responseFor("join", welcome())).toBe(true);
+    expect(responseFor("join", { ...welcome(), screen_h264: true })).toBe(false);
+  });
   it("distinguishes sealed history from plaintext history, including empty pages", () => {
     const sealedMessage = {
       id: 1, conversation: `dm:${"A".repeat(27)}:${"B".repeat(27)}`,

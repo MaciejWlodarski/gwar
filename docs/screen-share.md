@@ -56,7 +56,8 @@ kept here ([Spikes](#spikes)).
     into the AAD.
   - H.264 and AV1 send nothing at all when the whole frame is encrypted.
 
-  NAL-aware H.264 SFrame remains future work for encrypted channels.
+  A2 has landed with browser H.264, hardware where available; encrypted H.264
+  also needs NAL-aware SFrame (B2/E2). AV1 + DD follows as A2b.
 - **Keys** come from the existing voice call group:
   `MLS-Exporter("gwar screen v1", u32be(leaf), 32)`. The call controller gains
   a second endpoint kind (screen beside audio), with explicit rules for
@@ -253,20 +254,27 @@ Tradeoffs we accept with the webview path:
 
 Phase 3 may bring native capture: macOS and Windows for games if measurements
 show the webview's encoder or throttling falls short. A native Linux path
-(portal and PipeWire capture, libvpx, str0m frame mode) is the one way to give
-the Linux app sharing; the owner deferred it.
+(portal and PipeWire capture, hardware AV1/H.264 or OpenH264 encode,
+str0m frame mode) is the one way to give the Linux app sharing; the owner
+deferred it.
 
 ## 2. Codecs and encoding
 
 ### Support
 
+Browser capabilities below do not imply Gwar negotiates every codec.
+The target follows the [2026-10-23 owner decision](native-media.md#native-codec-ladder-owner-decision-2026-10-23):
+web H.264 preferred (A2 landed), VP9 as the emergency fallback, no VP8 or HEVC.
+Native sending uses hardware AV1 → hardware H.264 → OpenH264; native VP9
+decode stays for browser compatibility.
+
 | Codec | Chrome send/recv | Firefox | Safari / WKWebView | Hardware encode (typical) | SFrame on whole frame (spike S3) |
 | --- | --- | --- | --- | --- | --- |
-| VP8 | yes | yes | yes | rare | **breaks**: depacketizer cannot see the keyframe → PLI storm, 0 frames decoded. Works with 10/3 clear bytes |
-| VP9 | yes | yes | yes (on by default) | Intel/NVIDIA on Windows; none on Apple | **works** (keyframe and size are in the clear RTP payload descriptor) |
-| H.264 | yes (HW where available) | yes | yes (VideoToolbox) | everywhere | **breaks**: packetizer sends nothing. Works with NAL headers clear (LiveKit also escapes start codes) |
+| VP8 (dropped) | yes | yes | yes | rare | **breaks**: depacketizer cannot see the keyframe → PLI storm, 0 frames decoded. Works with 10/3 clear bytes |
+| VP9 (target emergency fallback) | yes | yes | yes (on by default) | Intel/NVIDIA on Windows; none on Apple | **works** (keyframe and size are in the clear RTP payload descriptor) |
+| H.264 (preferred, A2 landed) | yes (HW where available; absent in some Chromium builds) | yes (encoder needs OpenH264 plugin) | yes (VideoToolbox) | everywhere | **breaks**: packetizer sends nothing. Works with NAL headers clear (LiveKit also escapes start codes) |
 | AV1 | yes (screen-content tools) | 136+ | yes (decode needs M3/A17+) | rare (newest GPUs) | **breaks**: packetizer sends nothing; needs OBU-aware SFrame (LiveKit: unsupported) |
-| H.265 | 136+, HW only | no | yes | Apple, recent GPUs | not tested |
+| H.265 (not used or planned) | 136+, HW only | no | yes | Apple, recent GPUs | not tested |
 
 **Browser codec rule (A2, plaintext shares):**
 
@@ -300,9 +308,14 @@ the Linux app sharing; the owner deferred it.
 - A viewer that cannot decode a share gets its slot freed and
   `screen.stopped {reason: "codec"}`, with a clear browser/guest-page message.
   The share and other viewers continue. There is no transcoding or native
-  compatibility layer in A2. A bounded decode-progress watchdog first asks
-  the browser publisher for a lower H.264 target, then VP9 if offered, with a
-  ten-second hold-down and no automatic switch back. A3/B11a own native
+  compatibility layer in A2. The decode watchdog isolates one failing viewer
+  after a two-second corroboration window. Only failure reports from every active
+  H.264 viewer beyond the four-second watchdog window trigger share-wide recovery:
+  a lower H.264 target, then VP9 when all peers offered it. Reports are limited
+  per viewer/share to one every ten seconds; the share has a ten-second hold-down.
+  Watch slots survive replacement, old-publisher packets drop, and the replacement
+  keyframe opens the retained slots. Restore H.264 after reporters leave or two
+  minutes, then hold for a minute before another downgrade. A3/B11a own native
   compatibility layers. An explicitly limited native decoder may still need 720p.
 - Hardware encoding is chosen by the browser where available, with its
   software H.264 encoder otherwise. The sharing bar shows the negotiated
@@ -2013,15 +2026,21 @@ included ([Queues and repairs](#queues-and-repairs)).
 | Op | Body | Reply / effect |
 | --- | --- | --- |
 | `screen.start` | `{call, participation, preset, surface, guest_link}` (`surface`: `screen`/`window`/`tab`/`unknown`, display only; `guest_link`: post a TeamSpeak watch link where one is possible) | `{share}`, a 16-byte random id; checks `share_screen`, limits and budget; refused in encrypted channels until PR 7. Not announced until its publish transport connects; one not answered 35 s after its start, or not connected 35 s after its answer, ends with `transport`, told to the sharer only |
-| `screen.publish.offer` | `{share, ssrc, rtx_ssrc, sdp}` | `{sdp}`; the share's own publish transport. Its first connection announces `screen.started` to the channel. One per share, never renegotiated |
+| `screen.publish.offer` | `{share, ssrc, rtx_ssrc, sdp}` | `{sdp}`; the share's own publish transport. Its first connection announces `screen.started` to the channel. One per share, reopened only by bounded SFU `screen.recover` |
 | `screen.stop` | `{share}` | ok; event `screen.stopped {share, reason: "stopped"}` |
-| `screen.watch.offer` | `{run, sdp, browser?}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run; a run is retired for good once offered, so a failed or closed run and every lower one answer `stale` |
+| `screen.watch.offer` | `{run, sdp, browser?, h264?}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run; a run is retired for good once offered, so a failed or closed run and every lower one answer `stale` |
 | `screen.watch` | `{share}` | `{slot}`; needs a connected watch transport (`unavailable` otherwise); the server assigns a slot, opens a segment at the next keyframe (throttled request), event `screen.slot` |
 | `screen.focus` | `{share}` | ok; the share on the viewer's stage gets first claim on its bandwidth |
 | `screen.unwatch` | `{share}` | ok; the slot is freed |
 | `screen.keyframe` | `{share}` | ok; throttled PLI. Lets a viewer whose decryptor lost sync, for example after a key change, recover without re-watching |
 | `screen.stop_other` | `{share}` | needs `mute_members` in the channel and rank above the sharer; event `screen.stopped {reason: "moderator", by}` |
 | `screen.link.revoke` | `{share}` | the sharer, or `mute_members` with rank above the sharer; the share's watch link stops working and its guests are disconnected; final for that share |
+
+The optional `screen.capabilities {}` query replies `{screen_h264: true}`; the
+`guest.watch` reply's `screen_h264` boolean advertises A2 capability and recovery support. Clients omit `browser`,
+`h264` and decode reports unless the flag is true. An unsupported/timed-out query selects legacy fields.
+Servers retain the legacy Welcome shape and accept old clients
+that omit all new fields.
 
 Events:
 
@@ -2188,7 +2207,7 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
   - The first frame is `guest.watch {token}`. The reply is
     `{share, sharer, preset, ice_servers}`, or one generic `not_found`
     for unknown, inactive, ended and revoked tokens alike.
-  - After that, only `guest.offer {sdp, browser?}` is accepted, **once per
+  - After that, only `guest.offer {sdp, browser?, h264?}` is accepted, **once per
     connection**, plus `screen.keyframe` and `ping {}`. The offer is a
     watch transport with **one** slot. A second offer closes the
     connection.
@@ -3069,9 +3088,11 @@ known:
     leaves out Gwar's own process (macOS ScreenCaptureKit with
     `excludesCurrentProcessAudio`, Windows WASAPI process loopback excluding
     Gwar), fed into the webview's share as a track.
-11. **H.264 with hardware encoding (M, 4–5 days):** NAL-aware SFrame with
-    start-code escaping, and the "Game" preset prefers H.264 where the sharer
-    has a hardware encoder (`powerEfficientEncoder` in stats).
+11. **H.264 preferred for browser sending (A2/E1 landed):**
+    prefer H.264 for every preset, hardware where available
+    (`powerEfficientEncoder` in stats), VP9 only without an H.264 encoder,
+    and remove VP8. Encrypted H.264 also needs B2/E2's NAL-aware SFrame with
+    start-code escaping. Browser H.264 precedes A2b's AV1 + DD work.
 12. **Pop-out (M, 3–4 days):** a desktop second window, and Document PiP in
     Chromium.
 13. **Simulcast (L, 1–2 weeks)**, if temporal layers prove insufficient.
@@ -3103,8 +3124,8 @@ out Gwar's own voice. It replaces the first bullet below.
   measures it).
 - **Encoder CPU on the sharer** for VP9 1080p60 in software on weaker
   laptops. The spike's M5 is not representative. Mitigation: the Game preset
-  drops to 720p60 when `qualityLimitationReason` is `cpu`; H.264 hardware in
-  phase 2.
+  drops to 720p60 when `qualityLimitationReason` is `cpu`. A2/E1 prefers
+  H.264 hardware for all presets and reserves VP9 for emergency fallback.
 - **SFU CPU on the VM.** Extrapolated from an M5 (PR 3b measures).
 - **Voice under video load.** Isolation is designed, not yet measured. PR 3b's
   paired gate decides whether the shared-runtime task is enough, or whether
