@@ -49,9 +49,11 @@ first-class client beside them. For media this means:
 - **Native screen sharing on every platform:** macOS, Windows, Linux, Android
   and iOS. Capture, encoding, encryption and sending happen in native code,
   not in a webview.
-- **H.264 with hardware encoding** wherever the platform has an encoder, and
-  resolutions above today's 1080p cap (1440p, 2160p) where the network and
-  the server allow it.
+- **AV1 first when hardware encoding and viewer decoding support it; H.264
+  otherwise.** Choose per share and keep a lazy compatibility layer for
+  mixed viewers ([§3](#native-codec-ladder-owner-decision-2026-10-22)).
+  Resolutions above today's 1080p cap (1440p, 2160p) depend on the network
+  and the server limits.
 - **Screen plus audio sharing.** The share carries what the computer or phone
   plays.
 - **Gwar's own audio is never in the share.** Other people's voices, played by
@@ -62,12 +64,13 @@ first-class client beside them. For media this means:
 
 ### Non-goals
 
-- Changing the wire protocol or the SFU's model. Native clients are ordinary
-  WebRTC peers on the same `screen.publish.offer` and `screen.watch.offer`
+- Replacing the wire protocol or the SFU's forwarding model. Native clients
+  are ordinary WebRTC peers on the same `screen.publish.offer` and `screen.watch.offer`
   transports ([§2](#wire-compatibility)).
 - Transcoding on the server. The SFU forwards; it never decodes or re-encodes
   ([screen-share.md §3](screen-share.md#3-the-sfu)).
-- Camera video, recording, remote control and peer-to-peer. They stay where
+- Camera video (the codec ladder also applies when camera work is planned),
+  recording, remote control and peer-to-peer. They stay where
   [screen-share.md](screen-share.md#goals-and-non-goals) put them.
   Peer-to-peer is still that document's phase 3.
 - Game capture by injection (hooking a game's swap chain, as OBS's game
@@ -123,7 +126,7 @@ place. The target is one engine for voice and screen:
   (`crates/gwar-client/src/voice/sframe.rs`) is reused per media kind, with
   the video frame layouts from
   [screen-share.md, Frame layout](screen-share.md#frame-layout) and the H.264
-  layout from [§3](#encryption-nal-aware-sframe).
+  layout and the AV1 OBU-aware layout from [§3](#av1-plan).
 - **Pacing and bandwidth.** str0m's send-side estimate (TWCC) on the publish
   transport drives the encoder's target bitrate. str0m's pacer sends.
 - **Stats.** One counters type per transport, exported like
@@ -143,7 +146,7 @@ control), and platform adapters as modules or crates behind `cfg`:
 | `windows` | Windows | Windows.Graphics.Capture, WASAPI, Media Foundation |
 | `linux` | Linux | xdg-desktop-portal, PipeWire, VA-API |
 | `android` | Android | the Rust side of MediaCodec and MediaProjection hand-off |
-| `soft` | libvpx: all; OpenH264: macOS, Windows, Linux | libvpx (software VP9/VP8 encode and decode); Cisco's OpenH264 binary (software H.264), never on iOS or Android ([Software fallbacks](#software-fallbacks)) |
+| `soft` | libvpx: all; OpenH264 and dav1d: desktop only | libvpx (VP9/VP8 encode and decode); Cisco's OpenH264 binary (H.264); dav1d (AV1 decode only, up to about 1080p); no software AV1 encoder ([Software fallbacks](#software-fallbacks)) |
 
 Voice moves into `gwar-media` only if that makes sharing code simpler. Moving
 it is not a goal, and the voice engine's latency gates apply to any change
@@ -232,10 +235,11 @@ commands, like voice today. It keeps the command-surface rules of
 
 - The browser keeps capturing with `getDisplayMedia` and sending from the web
   layer, as designed in [screen-share.md](screen-share.md).
-- It needs **no server change** for native peers. A native sharer is just
-  another publisher; a native viewer is just another watch transport.
-- The only web changes are on the receiving side: decoding H.264 shares from
-  native sharers, and handling a codec switch
+- Native peers use the same server paths: a native sharer is another
+  publisher, a native viewer another watch transport. The common codec and
+  layer additions below serve web and native peers alike.
+- Web viewers gain H.264 and AV1 reception from native sharers; web sharers
+  keep VP9/VP8 and the existing codec-switch handling
   ([Track E](#track-e-web-side-changes)).
 
 ### Wire compatibility
@@ -243,16 +247,18 @@ commands, like voice today. It keeps the command-surface rules of
 - Same protocol: `screen.start`, `screen.publish.offer`,
   `screen.watch.offer`, `screen.watch`, `screen.keyframe` and the events in
   [screen-share.md, Requests](screen-share.md#requests-gwar4). A native
-  client sends the same SDP shapes a browser sends: one `sendonly` video
-  m-line with RTX per share, four `recvonly` video m-lines per watch
+  client starts with the same SDP shapes a browser sends: one `sendonly`
+  video m-line with RTX per share, extended with declared compatibility
+  layers by A3/B11a; four `recvonly` video m-lines per watch
   transport, and the audio m-lines of
   [Shared audio](screen-share.md#shared-audio-phase-2) once they exist.
 - Same SFU, same admission, same limits, same keyframe throttle. The SFU
   cannot tell a native peer from a browser, and must not need to.
 - Same keys: `MLS-Exporter("gwar screen v1", …)` for video and
   `"gwar screen audio v1"` for share audio, with the same frame layouts.
-- The protocol additions this plan needs (H.264 and codec switching, layer
-  declarations, publisher replacement, resolution tiers, simulcast) are
+- The protocol additions this plan needs (H.264/AV1, Dependency Descriptor,
+  codec switching, layer declarations, lazy compatibility layers, publisher
+  replacement, resolution tiers, simulcast/SVC) are
   additions every client gets, the web app included. They are in
   [Track A](#track-a-sfu-and-protocol).
 
@@ -265,16 +271,49 @@ commands, like voice today. It keeps the command-surface rules of
 | Web sharers (phase 1) | preferred | fallback | not sent | no | no |
 | SFU (PR 3a, #136) | forwarded | forwarded | **not negotiated** | no | no |
 | str0m 0.24.1 | packetizer, depacketizer | yes | yes (STAP-A out, FU-A) | yes | yes |
-| Browsers decode | all | all | all, see below | most | some |
-| Hardware encoders | some Intel/NVIDIA, none on Apple | rare | **everywhere** | newest GPUs | Apple, recent GPUs |
+| Browsers decode | all | all | all, see below | Chromium, Firefox; Safari depends on hardware/OS, see below | some |
+| Hardware encoders | some Intel/NVIDIA, none on Apple | rare | **everywhere** | RTX 40+, RDNA 3+, Intel Arc and newer media engines; none on Apple | Apple, recent GPUs |
 
-Sources: [screen-share.md, Support](screen-share.md#support), the str0m
-source.
+Sources: [screen-share.md, Support](screen-share.md#support), the pinned
+str0m source, and the platform/browser sources below. This checkout resolves
+str0m 0.24.1 from crates.io (`Cargo.lock`); it has no `vendor/str0m` tree.
+
+### Native codec ladder (owner decision, 2026-10-22)
+
+**Decided:** prefer AV1 for native screen sharing when the sharer has a
+usable hardware encoder and viewers can decode it; otherwise use H.264.
+AV1 is preferred for efficiency and screen content; F2/F3 measure the actual
+tradeoff. The same policy applies to camera later, without scheduling camera
+work here.
+
+- Probe the sharer's hardware encoders and the viewers' decode capabilities
+  at share start. Choose per share, including profile, level, size, frame
+  rate and available encoder sessions. Re-evaluate on every viewer join or
+  leave, with the hold in [Codec negotiation](#codec-negotiation-across-mixed-viewers).
+- With mixed viewers, retain the AV1 primary and add a **lazy H.264 layer**
+  only while someone needs it. The SFU selects compatible layers and never
+  transcodes. A new viewer must not downgrade everyone. Publisher replacement
+  may add the layer, but must preserve the primary codec and its viewers.
+- **Never software AV1 encode** in realtime, including after a hardware
+  failure. Desktop software AV1 decode through dav1d is allowed up to about
+  1080p, subject to measurements; phones receive AV1 only with hardware
+  decode. The cap is a policy, not a guarantee that every desktop can meet it.
+- Macs and iPhones publish H.264: current Apple media engines have AV1
+  decode, not encode. M3 and A17 Pro introduced hardware decode; later models
+  must still be probed ([Apple M3](https://www.apple.com/newsroom/2023/10/apple-unveils-m3-m3-pro-and-m3-max-the-most-advanced-chips-for-a-personal-computer/),
+  [A17 Pro](https://www.apple.com/newsroom/2023/09/apple-unveils-iphone-15-pro-and-iphone-15-pro-max/),
+  [current Mac specs](https://www.apple.com/macbook-pro/specs/)).
+- Web sharers keep VP9/VP8. Upstream WebRTC has a software
+  [libaom AV1 encoder](https://webrtc.googlesource.com/src/+/7864600a6ee3531652530b8fddad9bc49d20f3f7/modules/video_coding/codecs/av1/BUILD.gn);
+  SVT-AV1 is not the encoder in that source. An AV1 SDP entry does not prove
+  hardware encoding in Chromium. There is no reason to change the web send
+  plan or to enable software AV1 on the strength of S3's 720p timing.
 
 ### H.264 plan
 
-H.264 is the codec with hardware encoders on every target platform. It is the
-default for native sharers once the SFU and the web viewers handle it.
+H.264 has hardware encoders on every target platform. It is the native
+compatibility codec, the default on Apple, and the fallback when hardware
+AV1 is unavailable. Its profile, level and SFrame rules below still apply.
 
 #### SFU payload handling (A1, A2)
 
@@ -394,15 +433,16 @@ starts, as it does for VP9 and VP8 (`describe` in
     SPS does not match the declaration fails like a keyframe without an IDR.
   - For an incompatible viewer the rule of
     [Codec negotiation](#codec-negotiation-across-mixed-viewers) picks a
-    compatible layer, a codec switch, a lower publisher output, or an
-    explicit refusal. A viewer is never sent a level above its limits.
+    compatible layer, a lazy compatibility layer at a lower output, or an
+    explicit refusal for that watch. It never lowers the native primary for
+    a new viewer, and never sends a level above a viewer's limits.
   - Browsers often offer level 3.1 (`42e01f`), which covers 1280×720 at 30
     fps but not 1080p. Which levels each browser offers, and whether that
     can be raised, is **(to verify per browser; E1)**. If browsers offer only
     3.1, 1080p H.264 reaches them through a 720p layer or the VP9 fallback.
   - Native viewers offer the level their decoder supports (5.1 for 2160p30).
 - **Payload types:** one m-line can carry several codecs. The publish m-line
-  offers every codec the sharer can encode (H.264 and VP9/VP8), and the SFU
+  offers usable codecs (hardware AV1, H.264 and VP9/VP8), and the SFU
   maps each viewer's payload type for the codec in flight.
 
 #### Ingress frame bounds
@@ -543,14 +583,47 @@ decode the share's codec must still be served ([codec negotiation](#codec-negoti
 | Platform | API | Notes |
 | --- | --- | --- |
 | macOS, iOS | VideoToolbox (`VTCompressionSession`) | two configurations, below; output is AVCC with parameter sets in the format description, converted to Annex B by the adapter ([Publisher contract](#sfu-payload-handling-a1-a2)); takes `IOSurface`-backed pixel buffers from ScreenCaptureKit with no copy |
-| Windows | Media Foundation H.264 encoder MFTs | vendor hardware MFTs (NVIDIA NVENC, AMD AMF, Intel Quick Sync) are found with `MFTEnumEx` and `MFT_ENUM_FLAG_HARDWARE`; D3D11 textures in through the DXGI device manager ([Microsoft](https://learn.microsoft.com/en-us/windows/win32/medfound/h-264-video-encoder)); a direct NVENC path only if MFT latency falls short **(to verify)** |
+| Windows | Media Foundation hardware encoder MFTs | enumerate per codec with `MFTEnumEx` and `MFT_ENUM_FLAG_HARDWARE`, D3D11 textures through the DXGI device manager; AV1 GPU generations and vendor API limits are below |
 | Linux | VA-API (Intel, AMD), NVENC (NVIDIA) | dmabuf from PipeWire into VA-API without a copy; some distributions build Mesa without H.264 encode for patent reasons **(to verify which)**; Vulkan Video encode is a later option |
 | Android | MediaCodec | input `Surface` fed by the projection's virtual display; low-latency and priority keys vary by device **(to verify per vendor)** |
 
-Encoder settings for screen content, all platforms: no B-frames, one slice
-per frame unless the encoder needs more, infinite GOP with keyframes only on
-request (PLI) or on a resolution change, CBR-like rate control with a short
-window, and parameter sets on every IDR.
+**AV1 hardware candidates.** Probe an actual low-latency encode session;
+a GPU family name alone is not a capability declaration.
+
+| Platform | AV1 encode path | What is confirmed and what remains |
+| --- | --- | --- |
+| macOS, iOS | none; use VideoToolbox H.264 | Apple AV1 hardware is decode-only (sources above) |
+| Windows | Media Foundation first | [NVIDIA RTX 40 / Ada NVENC and later](https://www.nvidia.com/en-us/geforce/news/gfecnt/20235/av1-obs29-youtube/), [AMD RDNA 3 and later](https://www.amd.com/en/products/software/adrenalin/video-streaming.html), [Intel Arc A-series and later](https://cdrdv2-public.intel.com/771773/oneapi_optimization-guide-gpu_2023.0-771772-771773.pdf), and [Xe2 / Core Ultra 200V](https://cdrdv2-public.intel.com/829568/829568-004.pdf) support AV1 encode; older Iris Xe is not Arc. Exact SKU, driver and MFT availability **(to verify; C3, F2)** |
+| Linux | VA-API or NVENC on capable GPUs | probe AV1 profiles and entrypoints, low-latency controls and temporal layers **(to verify; C5, F2)** |
+| Android | MediaCodec `video/av01`, hardware encoder only | some recent SoCs may expose encode **(to verify; C7)**; no confirmed device list yet. [Dimensity 9500](https://www.mediatek.com/products/smartphones/mediatek-dimensity-9500) lists AV1 decode but only HEVC/AVC encode; do not infer encode from decode |
+
+On Windows, use `MFT_CATEGORY_VIDEO_ENCODER`, filter output for
+`MFVideoFormat_AV1`, and require a hardware transform
+([MFTEnumEx](https://learn.microsoft.com/en-us/windows/win32/api/mfapi/nf-mfapi-mftenumex),
+[subtype GUIDs](https://learn.microsoft.com/en-us/windows/win32/medfound/video-subtype-guids)).
+NVENC, AMF and Intel oneVPL/Quick Sync are vendor APIs, not names of standard
+Media Foundation transforms. Intel documents AV1 MFT exposure on Xe2; it is
+**(to verify)** for each NVIDIA/AMD driver and older Arc SKU. If no usable
+MFT exists, publish H.264 until a direct vendor adapter passes F2; neither
+GPU support nor an installed AV1 decoder implies an AV1 encoder MFT.
+
+On Android, enumerate encoders and decoders separately with `MediaCodecList`;
+check `isHardwareAccelerated`, `isSoftwareOnly`, profiles and performance
+points, then test the session
+([Android](https://developer.android.com/media/optimize/performance/codec)).
+Hardware decode exists on recent SoCs, e.g.
+[Snapdragon 8 Elite](https://docs.qualcomm.com/bundle/publicresource/87-83196-1_REV_A_Snapdragon_8_Elite_Mobile_Platform_Product_Brief.pdf)
+and Dimensity 9500; exact phone, OS, resolution and fps support is
+**(to verify; D4)**. Android's software AV1 decoder is not an eligible phone
+fallback.
+
+H.264 encoder settings for screen content, all platforms: no B-frames, one
+slice per frame unless the encoder needs more, infinite GOP with keyframes
+on request (PLI) or resolution change, CBR-like rate control with a short
+window, and parameter sets on every IDR. AV1 uses a realtime, no-reordering
+configuration, sequence header plus key frame on join/recovery, and
+`L1T2`/`L1T3` only where the hardware exposes usable dependency metadata
+**(to verify per adapter; B11)**.
 
 **Apple encoder configurations.** Apple documents that low-latency rate
 control (`kVTVideoEncoderSpecification_EnableLowLatencyRateControl`, macOS
@@ -579,8 +652,8 @@ So both configurations advertise what they actually produce:
 - **If the produced level does not fit a viewer**, nothing is forced on the
   wire: that viewer is handled by rule 4 of
   [Codec negotiation](#codec-negotiation-across-mixed-viewers) (another
-  layer, a codec switch, a lower output, or a refusal). For a lower output
-  the adapter opens a session at a smaller size or frame rate and again
+  compatible layer, a smaller compatibility session, or refusal of that
+  watch). For a smaller session the adapter reduces size or frame rate and again
   declares what its SPS shows.
 - Whether a fixed-level plain Baseline key (`kVTProfileLevel_H264_Baseline_3_1`
   and similar) produces an SPS with `constraint_set1_flag`, which would make
@@ -636,81 +709,170 @@ reference for tests and CI.
     ([Google](https://support.google.com/googleplay/android-developer/answer/9888379)).
     Android uses MediaCodec for H.264, and libvpx where MediaCodec lacks
     VP9 or VP8.
-- **VP9 and VP8: libvpx** (BSD), for software encode and decode. VP9 is the
-  fallback codec of the mixed-viewer rule below, and every web sharer sends
-  VP9 or VP8, so native viewers must decode both anyway.
+- **VP9 and VP8: libvpx** (BSD), for software encode and decode and legacy
+  compatibility where H.264 cannot be used. Every web sharer sends VP9 or
+  VP8, so native viewers must decode both anyway.
+- **AV1: dav1d, decode only on desktops**, at most 1080p30 per slot and only
+  at caps that pass the [desktop software decode gate](#desktop-av1-software-decode-gate)
+  (B3, D1–D3, F4 viewer runs). No software AV1 encoder is built or selected;
+  phones without hardware AV1 decode get H.264.
+  [dav1d](https://code.videolan.org/videolan/dav1d) is a standalone
+  decoder; using it does not add the FFmpeg framework.
 - **FFmpeg is not used.** Its licensing (LGPL or GPL by configuration) and its
   patent exposure need a review the OS APIs and libvpx do not
   ([screen-share.md](screen-share.md#why-not-native-capture-now) noted the
   same).
 
-### Later: AV1 and H.265
+### AV1 plan
 
-- **AV1** encodes screen content well (spike S3: 2.3 ms per 720p frame in
-  Chromium), but hardware encoders are only on the newest GPUs, and the SFU
-  would need the Dependency Descriptor extension for layers. Its SFrame needs
-  an OBU-aware layout; spike S3 showed whole-frame encryption sends nothing.
-- **H.265** has hardware encoders on Apple and recent GPUs, but Firefox does
-  not decode it and Chrome only with hardware
-  ([Support](screen-share.md#support)).
-- Neither is planned. Each would be one more `describe` and one more SFrame
-  layout, behind the same negotiation rules.
+AV1 is planned. H.265 stays deferred: it has hardware encoders on Apple and
+recent GPUs, but browser/WebRTC interoperability remains uneven
+([Support](screen-share.md#support)). It is not part of this ladder.
+
+#### RTP and Dependency Descriptor (A1b, A2b)
+
+The [AV1 RTP format](https://aomediacodec.github.io/av1-rtp-spec/) uses an
+aggregation header (`Z`, `Y`, `W`, `N`) and length-delimited OBU elements.
+A1b parses bounded LEB128 sizes, fragments and OBU types: sequence header
+(1), temporal delimiter (2), frame header (3), tile group (4), metadata (5),
+frame (6), redundant frame header (7) and padding (15). It does not decode
+pixels.
+
+- **Frame start:** Dependency Descriptor's start-of-frame when negotiated;
+  otherwise a new RTP timestamp with a non-continuation start (`Z=0`) for
+  the supported single-frame-per-temporal-unit publisher contract. `Z=0`
+  alone is not a frame boundary. Reject conflicting or missing starts.
+- **Random access:** require a sequence header followed by a shown key frame,
+  from the clear frame-header fields, not just `N=1`. The publisher repeats
+  the sequence header on each join/recovery keyframe. Bounded confirmation
+  retains the sequence-header prefix until that key frame is confirmed;
+  loss, timeout or malformed input opens no segment and requests a throttled
+  PLI. A sequence header alone is not a keyframe.
+- **Temporal layers:** negotiate the Dependency Descriptor (DD) RTP header
+  extension. Parse templates, frame numbers, decode targets and dependencies;
+  forward only complete frames whose dependencies the viewer has received.
+  Preserve or consistently remap DD state across loss, layer changes and
+  stable-slot source switches. `L1T2`/`L1T3` is preferred to extra simulcast
+  encoders where hardware supports it; it lowers fps, not resolution.
+
+**Existing str0m 0.24.1 support**, checked in the Cargo registry source
+(the requested `vendor/str0m` path is absent in this checkout):
+[`src/packet/av1.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/packet/av1.rs)
+has OBU packetization, fragmentation and depacketization; `enable_av1`
+configures AV1 at 90 kHz with RTX. AV1 SDP `profile`, `level-idx` and `tier`
+are parsed and serialized, but
+[`src/format/payload_params.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/format/payload_params.rs)
+requires equality for all three (defaults 0, 5, 0); directional level/tier
+limit matching is not implemented. A2b must handle that constraint and test
+viewer receive limits. str0m's keyframe helper checks only `N`; it does not
+supply Gwar's bounded sequence-header/key-frame confirmation.
+[`src/rtp/ext.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/rtp/ext.rs)
+has no built-in DD parser/serializer. `Extension::with_serializer` and
+`user_values` provide custom extension plumbing; a DD URI in an SDP test
+comment is not support. A2b must build and test DD parsing, serialization,
+negotiation, native frame-mode metadata hand-off and SFU forwarding. Gwar
+currently rebuilds outgoing extensions, so copying an SDP URI alone would
+lose DD on egress.
+
+#### Encryption: OBU-aware SFrame
+
+Spike S3 showed that encrypting the whole AV1 frame sends nothing: the
+packetizer still needs OBU structure. B2 defines an AV1 layout that leaves
+required OBU, sequence/frame-header and dependency fields readable, encrypts
+the coded content, and authenticates the canonical clear bytes. It must
+account for str0m/browser OBU size rewriting and omitted OBUs. DD remains
+readable for the SFU; B2/E2 must define its relationship to authenticated
+frame metadata and permitted SFU rewrites. No unproven whole-frame layout
+ships. Rust and browser vectors and seal → packetize → SFU → depacketize →
+open tests gate encrypted AV1, independently of plaintext support.
+
+#### Browser AV1 reception
+
+AV1 WebRTC decode is available in Chromium and
+[Firefox 136+](https://www.mozilla.org/firefox/136.0/releasenotes/).
+Safari 17 added AV1 playback on hardware-capable devices
+([WebKit](https://webkit.org/blog/14445/webkit-features-in-safari-17-0/));
+Safari 18 release notes specifically report a WebRTC AV1 hardware-decode
+fix on iPhone 15 Pro
+([WebKit](https://webkit.org/blog/15865/webkit-features-in-safari-18-0/)).
+This is not a promise for every Safari/WKWebView device. Safari Technology
+Preview 251 added a WebRTC software fallback
+([release notes](https://webkit.org/blog/18194/release-notes-for-safari-technology-preview-251/));
+its stable-release coverage is **(to verify; E1b)** and does not relax the
+phone hardware-only rule.
+
+E1b records real receive offers and `RTCRtpReceiver.getCapabilities`, then
+tests decode through the SFU. Exact profiles, levels, DD, OS/webview versions
+and mobile hardware decode are **(to verify)**. File playback or WebCodecs
+support alone is not proof of WebRTC support. On phones, advertise AV1 only
+when hardware decode is established; if browser APIs cannot establish it,
+use H.264. Desktop browser software decode stays within the measured 1080p
+budget. Browser capability reporting quirks are part of E1b's device matrix.
 
 ### Codec negotiation across mixed viewers
 
-The SFU forwards and never transcodes, so every viewer must decode what the
-sharer sends. The rule ([A3](#track-a-sfu-and-protocol)):
+The SFU forwards and never transcodes. **Owner decision 3 is decided
+(2026-10-22): keep the native primary; serve mismatched viewers with a lazy
+compatibility layer, never a whole-share downgrade.** A3 and B11a implement
+this before mixed AV1/H.264 sharing ships.
 
-1. **Viewers declare what they decode.** A watch offer's m-lines list the
-   codecs the viewer can receive, and for H.264 the profiles, levels and
-   limits of [Negotiation](#negotiation-a2). The SFU records the set per
-   watch transport. Today's browsers all list VP9 and VP8.
-2. **Sharers declare what they encode.** The publish m-line lists every codec
-   the sharer can send, preferred first. A native sharer offers
-   `[H.264, VP9, VP8]` when it has a hardware H.264 encoder, `[VP9, VP8,
-   H.264]` otherwise. Web sharers keep today's `[VP9, VP8]`. The sharer also
-   declares each layer it sends: codec, profile and level, resolution and
-   frame rate (the layer declaration, A3).
-3. **The sharer starts with its preferred codec.** No negotiation round
-   happens before the first frame.
-4. **A viewer that cannot decode what is sent is not silently refused.** A
-   layer is *compatible* with a viewer when its codec, profile, level and
-   the limits of rule 1 all fit. For a viewer with no compatible layer the
-   SFU assigns a slot that waits, then takes the first of these that
-   applies:
-   1. another layer of the share that is compatible (simulcast, A5);
-   2. a codec switch: `screen.codec {share, codec}`, a new event to the
-      sharer, for the best codec in the intersection of what the sharer
-      encodes and what every current viewer of the share decodes;
-   3. a lower output: `screen.codec` with the limits the sharer must stay
-      within (a lower level, size or frame rate), when the preset allows it
-      (the sharer's rate controller, B6, applies it; Text never trades
-      resolution, so it skips this step);
-   4. an explicit refusal (rule 8).
-5. **The sharer switches at a keyframe**, without a new SDP: a payload type
-   change on the same m-line, or a new encoder configuration on the same
-   payload type. Native publishers always switch in place. Browsers switch
-   in place where they can, otherwise through `screen.publish.replace`
-   ([E3](#track-e-web-side-changes), [A3](#track-a-sfu-and-protocol)), which
-   keeps the share and its viewers. Each slot's segment starts at the first
-   keyframe of a layer compatible with its viewer, using the existing
-   wait-for-keyframe rule.
-6. **Switching back** to the preferred codec happens when the last viewer
-   that needed the fallback leaves, after a 30 s hold so a viewer flapping in
-   and out cannot make the sharer flap.
-7. **The fallback may lower quality.** A sharer that switches from hardware
-   H.264 to software VP9 also lowers the resolution tier to what its CPU can
-   encode ([§4](#cpu-and-gpu-budgets)).
-8. **If nothing fits** (a viewer that decodes nothing the sharer encodes, or
-   whose limits the sharer cannot meet), the watch fails with
-   `screen.stopped {reason: "codec"}` and the UI says the viewer's browser
-   cannot play this share. This is not expected with VP8 in every list, but
-   must be handled.
+1. **Viewers declare what they decode.** Record codecs and limits per watch
+   transport: H.264 profiles/levels and the limits of
+   [Negotiation](#negotiation-a2); AV1 profile, level, tier, bit depth, size, fps
+   and eligible hardware/software decode path. Phone AV1 is hardware-only;
+   desktop software AV1 caps must pass the
+   [four-slot resource gate](#desktop-av1-software-decode-gate). Unknown
+   support is not advertised. Re-evaluate when a viewer joins, leaves or
+   updates its caps.
+2. **Sharers declare usable encoders, not just codec names.** Probe hardware
+   at share start. Native order is `[AV1, H.264, VP9, VP8]` with hardware
+   AV1, `[H.264, VP9, VP8]` otherwise; offer only working encoders. If no
+   hardware H.264 exists, the existing OpenH264/libvpx policy applies.
+   Web sharers keep `[VP9, VP8]`. Declare each layer's codec, profile,
+   level, size, fps and temporal modes from actual encoder output (SPS for
+   H.264, sequence/frame headers for AV1), before its first keyframe.
+3. **Choose per share before first media.** Use the sharer's encoders × the
+   current viewers' decode capabilities. Prefer hardware AV1 where useful;
+   if no current viewer can use AV1, start H.264. With no viewers, start the
+   preferred usable hardware codec. Mixed sets use AV1 plus the H.264 layer
+   below. Re-evaluation may promote an H.264 primary to AV1 at a keyframe,
+   while retaining H.264 for viewers that need it.
+4. **Handle only the incompatible viewers.** A slot waits for a compatible
+   keyframe; compatibility includes codec, profile, level and all limits.
+   Take the first applicable action:
+   1. route an existing compatible layer;
+   2. ask the sharer with `screen.codec {share, layer, codec, limits, action}`
+      to add a lazy H.264 compatibility layer for that subset; if H.264 is
+      unavailable to them, try a declared VP9/VP8 compatibility layer;
+   3. reduce only that compatibility layer's size/fps/level where the preset
+      allows (Text never trades resolution);
+   4. refuse only that watch with `screen.stopped {reason: "codec"}` and a
+      clear UI message. Resource/session limits may make a layer impossible;
+      they never authorize a global AV1-to-H.264 downgrade for a new viewer.
+5. **Start or switch layers at a keyframe.** Each viewer slot opens a new
+   stable-sequence segment only at a compatible keyframe. Add the layer in
+   place if negotiated; otherwise use `screen.publish.replace` (A3), keeping
+   the share id, watch link, slots and the primary's codec/quality. A replace
+   may briefly wait for fresh keyframes; it must not replace AV1 with a
+   lone H.264 stream. No new `screen.start` is used.
+6. **Release lazily.** After the last viewer needing a compatibility layer
+   leaves, keep it for 30 s before stopping its encoder. Apply the same hold
+   to primary promotion/removal after membership changes to avoid flapping.
+7. **Keep the legacy web send policy.** VP9/VP8 web sharers retain their
+   existing common-codec switch, at a keyframe or via publisher replacement
+   (E3), and the 30 s hold before switching back. Web AV1 sending is not
+   enabled. This legacy path does not change the native primary-retention
+   rule above.
+8. **Failures are explicit.** If no compatible layer can be produced, end
+   only the affected watch. A failed hardware AV1 session may recover with
+   H.264 through the same declared/keyframe transition; it must never start
+   software AV1 encoding. A desktop software compatibility encoder stays
+   within [CPU and GPU budgets](#cpu-and-gpu-budgets).
 
-An alternative is to refuse viewers that cannot decode H.264 and never
-switch. It is simpler, and it locks out Chromium builds without H.264 and
-Firefox without its plugin. The choice is an
-[owner decision](#owner-decisions-needed); this plan recommends switching.
+The compatibility stream is a separate codec layer, not a temporal layer of
+AV1. It consumes another encoder session and uplink, even when AV1 uses SVC.
+A3/B11a add the minimum multi-layer admission and publishing needed here;
+A5/B11 later add quality-based simulcast and temporal-layer selection.
 
 ## 4. Resolutions and quality
 
@@ -742,7 +904,8 @@ Starting points for H.264 hardware encoding. They are to be measured
   are not offered. Raising the defaults is an
   [open owner decision](#owner-decisions-needed).
 - VP9 needs roughly the bitrates above at equal quality **(to verify; F3)**;
-  its software encoder is the limit at 1440p60.
+  its software encoder is the limit at 1440p60. AV1 rates are measured by F3,
+  not an assumed percentage saving; the caps remain unchanged.
 
 ### SFU limits to raise
 
@@ -781,11 +944,19 @@ Layers let them watch at a lower quality instead.
 | --- | --- | --- | --- |
 | VP9 temporal layers (`L1T3`) | Chromium | drop by temporal id from the clear descriptor | screen-share PR 8; lowers fps only |
 | VP9 SVC (`L2T3`, `L3T3_KEY`) | Chromium | spatial and temporal dropping from the descriptor | optional; no Firefox or Safari senders |
-| **H.264 simulcast**, 2 layers | native sharers (two encoder sessions), Safari, Firefox | per-viewer layer choice, switch at keyframes | **the native plan** |
+| **AV1 temporal SVC (`L1T2`, `L1T3`)** | native hardware encoders that expose it **(to verify)** | DD-aware dependency-safe frame dropping (A2b) | preferred AV1 path; fps only |
+| **H.264 simulcast**, 2 layers | native sharers (two encoder sessions), Safari, Firefox | per-viewer layer choice, switch at keyframes | H.264 quality layers |
 | VP8 simulcast | all browsers | picture id rewriting (`RtpWrite::vp8_patch`) | screen-share PR 13 |
 
-The native plan is two H.264 layers: the share's tier, and a second layer at
-720p and at most 30 fps. Notes:
+For AV1, prefer one hardware encoder with temporal layers; use single-layer
+AV1 if the encoder cannot expose valid DD metadata. Temporal SVC does not
+solve a viewer's resolution limit: a lower spatial rendition is still
+needed, or that viewer waits/pauses under the existing allocation rule.
+The lazy H.264 codec fallback (B11a) is independent of SVC and is charged to
+the aggregate session/uplink budget; it is absent for an all-AV1 audience.
+
+For H.264 quality adaptation, the plan is two layers: the share's tier, and
+a second layer at 720p and at most 30 fps. Notes:
 
 - The publish m-line carries both layers by RID, as browsers do.
 - The SFU picks a layer per viewer from the allocation of
@@ -795,7 +966,8 @@ The native plan is two H.264 layers: the share's tier, and a second layer at
   stable-sequence model ([Forwarding](screen-share.md#forwarding-stable-sequence-mapping)).
 - Reservations charge the layer a viewer gets, not the top layer's cap.
 - The sharer's uplink carries both layers, about 25 % more than the top layer
-  alone.
+  alone for two H.264 quality layers; AV1 plus a compatibility encode must
+  be measured separately (F2/F7).
 - Hardware encoders limit concurrent sessions on some consumer GPUs
   **(to verify per vendor)**. A sharer that cannot open a second session
   sends one layer.
@@ -1164,16 +1336,65 @@ the same pause and resume events.
 
 | Platform | Hardware | Software fallback |
 | --- | --- | --- |
-| macOS | VideoToolbox (`VTDecompressionSession`); H.264 everywhere, VP9 on recent Apple silicon **(to verify per OS version)** | libvpx (VP9, VP8), OpenH264 (Cisco binary) |
-| iOS | VideoToolbox, as macOS; H.264 always in VideoToolbox | libvpx (VP9, VP8); no OpenH264 ([Software fallbacks](#software-fallbacks)) |
-| Windows | Media Foundation decoder MFTs with D3D11 (DXVA) for H.264 and VP9 | libvpx, OpenH264 (Cisco binary) |
-| Linux | VA-API, NVDEC | libvpx, OpenH264 (Cisco binary) |
-| Android | MediaCodec, with `KEY_LOW_LATENCY` where supported (API 30+) | libvpx through the NDK; no OpenH264 |
+| macOS | VideoToolbox (`VTDecompressionSession`); H.264 everywhere, AV1 on M3+, VP9 on recent Apple silicon **(to verify per OS/API version)** | libvpx (VP9, VP8), OpenH264 (Cisco binary), dav1d (AV1 up to about 1080p) |
+| iOS | VideoToolbox; H.264 always, AV1 on A17 Pro and later capable chips **(to verify per device/OS)** | libvpx (VP9, VP8); no OpenH264 or software AV1 |
+| Windows | Media Foundation decoder MFTs with D3D11 (DXVA), AV1 on capable GPUs **(to verify driver/OS)** | libvpx, OpenH264 (Cisco binary), dav1d (AV1 up to about 1080p) |
+| Linux | VA-API, NVDEC; probe AV1 separately from encode | libvpx, OpenH264 (Cisco binary), dav1d (AV1 up to about 1080p) |
+| Android | MediaCodec, with `KEY_LOW_LATENCY` where supported (API 30+); AV1 hardware support probed per device | libvpx through the NDK; no OpenH264 or software AV1 |
 
 Native viewers must decode VP9 and VP8 (every web sharer's codecs) and H.264.
+AV1 is advertised only for a usable decode path within its measured limits.
+Desktop dav1d is accepted by B3/D1–D3 and F4's viewer runs under the gate
+below; phone hardware decode by D1/D4.
 A decoder error resets the decoder, marks the slot waiting for a keyframe and
 sends `screen.keyframe`, as the web receiver does after a decoder reset
 ([Keyframe recovery](screen-share.md#keyframe-recovery-around-key-changes)).
+
+### Desktop AV1 software decode gate
+
+These are initial acceptance bounds for dav1d, not measured performance
+claims. B3 supplies fixtures; D1–D3 and F4 qualify the actual viewer before
+it advertises software AV1:
+
+- **Caps:** test each advertised profile, level, tier, bit depth and size/fps
+  tuple on the exact machine/OS/build and dav1d version. The initial frame
+  rates are 15 or 30 fps, at most 1920 × 1080 per slot; never advertise 60 fps
+  or a higher resolution for this fallback. A passing 720p15 run does not
+  qualify 1080p30 or an untested profile/bit depth.
+- **Sustained load:** after 5 min of warm-up, measure at least 30 continuous
+  min with four independent, continuously changing AV1 streams, each at the
+  candidate cap, through the real SFU, watch transport, SFrame open, dav1d
+  and renderer. Use scrolling text and high-motion fixtures, with native
+  voice send/receive and playback active on the viewer's machine. Force all
+  four slots to decode and render at full rate; thumbnail throttling, paused
+  slots and repeated static frames cannot qualify the cap. Rotate the stage
+  slot. Each slot must present at least 99 % of expected frames, with no
+  stage-frame drops, no growing queue and p50 glass-to-glass ≤ 100 ms on
+  loopback. Loss/recovery tests run separately from this steady-state gate.
+- **CPU:** sample the entire viewer process once per second, including
+  transport, SFrame, all decoders, rendering and voice. The mean must be
+  ≤ 2 core equivalents and p95 ≤ 2.5; neither statistic may exceed 50 % of
+  the machine's logical-CPU capacity. One core equivalent is one logical CPU
+  fully busy, summed across threads. Record both core equivalents and the
+  machine's logical-CPU count so percentages are comparable.
+- **Thermals:** no OS serious/critical thermal state or reported thermal
+  throttling during the measured interval. Record OS thermal state or CPU
+  temperature/clock/throttle telemetry; missing telemetry leaves the cap
+  unqualified. Repeat for every supported power mode; an AC-only pass does
+  not qualify battery operation.
+- **Voice:** F4 runs the paired voice gate on this viewer machine with the
+  same four-slot workload and sustained duration, against a voice-only
+  baseline. Unconstrained, voice p95 and p99 must stay within baseline + 2 ms
+  with no extra underruns; constrained, p99 within baseline + 20 ms and the
+  underrun rate within baseline + 0.5 percentage points. Keep PR 3b's
+  pair-validity rules and confirm the four slots sustain their caps in every
+  loaded run.
+
+Advertise only tuples and power modes that pass every bound, with a report
+identifying the machine, software and workload. Untested or failing caps
+are omitted; a lower size/fps cap needs its own passing run, otherwise use
+H.264. Revalidate after relevant decoder, OS or power-mode changes. This
+gate grants no software AV1 capability to iOS or Android.
 
 ### Rendering
 
@@ -1314,6 +1535,17 @@ round of their own, as voice 5c/5d had.
   (a fuzz test over random bytes).
 - Now: yes.
 
+**A1b. AV1 payload parser ★** (S)
+- Builds: bounded aggregation-header/OBU parsing, frame-start metadata and
+  sequence-header plus key-frame candidates for `describe`, following
+  [AV1 RTP](#rtp-and-dependency-descriptor-a1b-a2b). No negotiation yet.
+- Depends on: PR 3a.
+- Acceptance: vectors for aggregated/fragmented sequence and frame headers,
+  `N` without a key frame, `Z=0` mid-frame, illegal `N=1,Z=1`, truncated or
+  overflowing LEB128, unknown/reserved OBU types and empty payloads; fuzzing
+  never reads past the packet or exceeds a fixed parse budget.
+- Now: yes.
+
 **A2. H.264 on the screen transports** (M)
 - Builds: `enable_h264` with `packetization-mode=1` on publish and watch
   `Rtc`s; profile matching (Constrained Baseline, Constrained High, High
@@ -1323,7 +1555,9 @@ round of their own, as voice 5c/5d had.
   mapping; the bounded prefix buffer and IDR confirmation of
   [SFU payload handling](#sfu-payload-handling-a1-a2), in `Ingress` and in
   the hand-off to `Segment::map`.
-- Depends on: A1, PR 3a.
+- Depends on: A1, PR 3a, and PR 3b
+  ([#144](https://github.com/MaciejWlodarski/gwar/pull/144)) for the required
+  pacing/allocation foundation.
 - Acceptance, in `crates/gwar-server/tests/screen.rs` (added by PR 3a) with
   str0m frame-mode clients:
   - an H.264 publisher reaches two viewers, frames byte-identical;
@@ -1342,22 +1576,55 @@ round of their own, as voice 5c/5d had.
   - publisher-side loss is repaired into place, as for VP9;
   - offers with `packetization-mode=0` only, or only unsupported profiles,
     are refused before negotiation.
-- Now: after A1.
+- Now: after A1 and PR 3a/3b (#144); transport work waits for that foundation.
 
-**A3. Codec capabilities and switching** (M)
+**A2b. AV1 on the screen transports (including Dependency Descriptor)** (M–L)
+- Builds: AV1/RTX negotiation and per-viewer payload types and receive
+  limits; bounded random-access confirmation before opening a segment;
+  DD extension registration, parser/serializer and metadata hand-off through
+  str0m frame mode and SFU RTP mode; dependency-safe `L1T2`/`L1T3` forwarding
+  and consistent DD state across source/slot switches. Single-layer AV1 can
+  work without DD; no temporal dropping without valid DD. Keep the existing
+  ingress, RTX, keyframe-throttle, pacing and reservation limits.
+- Depends on: A1b, PR 3a/3b. Test with single-codec synthetic publishers;
+  A3 later adds mixed-codec admission.
+- Acceptance: real-SFU loopback: byte-identical AV1 to two viewers; a late
+  join receives sequence header plus key frame; a lost/reordered prefix or
+  sequence header without key frame opens no segment and causes a throttled
+  PLI; malformed DD and missing templates are bounded and fail closed for
+  temporal selection. Under loss/reorder and temporal up/down switches,
+  every forwarded frame has its dependencies; base-layer playback continues.
+  DD extmap IDs may differ per peer; RTX, frame-number wrap, pause/resume
+  and stable-slot source replacement retain decodable descriptor state.
+- Now: after A1b and PR 3a/3b; use recorded AV1 and synthetic DD in tests,
+  no encoder required. Real hardware temporal publishing is B11.
+
+**A3. Codec capabilities and switching** (L)
 - Builds: the rule in [Codec negotiation](#codec-negotiation-across-mixed-viewers):
-  per-viewer decodable sets with H.264 profiles, levels and limits from
-  watch offers; the sharer's encodable list from the publish offer; the
+  per-viewer decodable sets with H.264/AV1 profiles, levels and limits from
+  watch offers, plus eligible decode paths; hardware-only AV1 encode caps
+  and per-share selection at start and on viewer joins/leaves, with a
+  capability snapshot to the sharer before first media and updates through
+  `screen.codec`; the
   **layer declaration** (codec, profile and level, resolution, frame rate per
   layer), sent or updated by the sharer before the first keyframe it
-  describes and taken from that keyframe's SPS, never from encoder
-  settings, and its check against each keyframe's SPS bytes; compatibility by
-  codec, profile, level and limits; `screen.codec {share, codec, limits}` to
-  the sharer; slots that start only at a keyframe of a compatible layer; the
-  30 s hold before switching back; and `screen.stopped {reason: "codec"}`.
+  describes and taken from its SPS (H.264) or sequence/frame headers (AV1),
+  never just encoder settings, with a check against each keyframe;
+  compatibility by codec, profile, level and limits;
+  `screen.codec {share, layer, codec, limits, action}` to add, update or stop
+  a compatibility layer or request a primary transition; slots that start
+  only at a compatible keyframe; the 30 s hold; and codec refusal per watch.
+  - **Minimum codec-layer admission:** declare primary and lazy fallback
+    with separate main/RTX SSRC pairs and per-layer codec/PT mapping, ingress
+    bounds and origin fencing. A3 defines the negotiated m-line/RID mapping
+    without assuming browser simulcast can mix codecs. B11a publishes it;
+    this part does not wait for A5's quality adaptation. Combined layers
+    stay within the share's cap and the existing allocation model.
   - **`screen.publish.replace {share, ssrc, rtx_ssrc, sdp}`**: the sharer
     replaces its publish transport without ending the share, for browsers
-    that cannot switch codec in place (E3). The share keeps its id,
+    that cannot switch codec in place (E3), or to add a codec layer. Extend
+    it with layer/SSRC declarations; retain the primary codec and rendition
+    when adding fallback. The share keeps its id,
     announcement, watch link, reservations and every viewer's slot; slots
     wait for the new transport's first keyframe, which opens a new segment
     as after any drop; no `screen.stopped` or `screen.started` is sent. Only
@@ -1367,19 +1634,28 @@ round of their own, as voice 5c/5d had.
     [Requests](screen-share.md#requests-gwar4)
     ([Changes to earlier plans](#changes-to-earlier-plans)).
   - Protocol types in `gwar-proto`, generated TypeScript, client validators.
-- Depends on: A2. The owner decision on switching versus refusing.
+- Depends on: A2; A2b for AV1. Owner decision 3 is decided; B11a is
+  required for native mixed audiences to ship.
 - Acceptance:
-  - an H.264 publisher, an H.264 viewer and a VP9-only viewer: the VP9
-    viewer joins, the publisher is asked to switch, both viewers decode
-    after the switch keyframe, and the publisher is asked back 30 s after
-    the VP9 viewer leaves;
+  - an AV1 publisher and AV1 viewer (recorded encoder output in CI, hardware
+    with B11a): an H.264-only viewer joins,
+    only the lazy H.264 encoder starts, both viewers decode, and the AV1
+    viewer keeps its codec, tier and slot. After the H.264 viewer leaves,
+    stop fallback after 30 s. Cover all-H.264 initial viewers, no viewers,
+    late AV1 promotion and a phone with only software AV1 decode;
+  - an H.264 publisher and VP9-only viewer: add a VP9 compatibility layer
+    if resources allow; otherwise refuse that watch, without changing the
+    primary. Force encoder-session exhaustion and AV1 hardware failure;
+    the former affects only the new watch, the latter uses H.264 recovery
+    and never a software AV1 encoder;
   - a **level-limited viewer**: a str0m viewer that offers only `42e01f`
     (level 3.1, no `max-fs`) watching a 1080p30 H.264 share is never sent a
     keyframe whose SPS level or size exceeds level 3.1 (checked on every
-    keyframe it receives); it gets a compatible layer, a VP9 switch, a
-    lowered output, or `screen.stopped {reason: "codec"}`, in the order of
+    keyframe it receives); it gets a compatible layer, a lowered fallback
+    output, or `screen.stopped {reason: "codec"}`, in the order of
     the rule;
-  - a keyframe whose SPS contradicts the layer declaration opens no segment;
+  - a keyframe whose SPS or AV1 headers contradict the declaration opens no
+    segment; an AV1 offer beyond a viewer's decode budget is not routed;
   - **an encoder that picks its own level:** a test publisher configured
     for level 3.1 whose encoder emits level 4.0 (as VideoToolbox's
     auto-level Constrained Baseline may) declares 4.0 from its SPS; its
@@ -1388,10 +1664,10 @@ round of their own, as voice 5c/5d had.
   - both switch paths, with the other viewers' slots kept: a native (str0m)
     publisher switching in place, and a publisher using
     `screen.publish.replace`; after a replace the share id, viewer list and
-    watch link are unchanged;
-  - a viewer flapping every 5 s causes at most one switch per 30 s; an
-    empty intersection ends that watch only.
-- Now: after A2.
+    watch link are unchanged, and adding fallback by replace preserves AV1;
+  - a viewer flapping every 5 s does not repeatedly start/stop encoders; an
+    empty intersection ends that watch only. Legacy web switches pass E3.
+- Now: after A2; AV1 after A2b.
 
 **A4. Resolution tiers and scaled limits** (M)
 - Builds: a tier per share (`1080p`, `1440p`, `2160p`) in `screen.start`; a
@@ -1445,11 +1721,14 @@ are.
   ([§3](#encryption-nal-aware-sframe)) on top of the voice SFrame key state,
   per media kind, with the `"gwar screen v1"` label. The H.264 canonical form
   and the canonicalization applied before sealing and after depacketization.
-  Writes the H.264 byte rules into screen-share.md's
+  Adds the **AV1 OBU-aware layout** of [§3](#encryption-obu-aware-sframe):
+  canonical clear OBU/sequence/frame fields, authenticated metadata and the
+  DD relationship, ciphertext placement and reversible size reconstruction.
+  Writes the H.264 and AV1 byte rules into screen-share.md's
   [Frame layout](screen-share.md#frame-layout) and a shared vector file used
   by Rust and TypeScript.
-- Depends on: the VP9/VP8 layouts are specified now; the H.264 rules are
-  written in this item, together with E2; A2 for the end-to-end test.
+- Depends on: the VP9/VP8 layouts are specified now; the H.264 and AV1
+  rules are written in this item with E2; A2/A2b for codec end-to-end tests.
 - Acceptance:
   - vectors at the shortest and widest KID/CTR encodings, including
     non-canonical inputs and their canonical form;
@@ -1475,14 +1754,22 @@ are.
     (1 to 8 bytes each, including the `c0 01 00 00 00 00` case of
     [§3](#encryption-nal-aware-sframe)), on keyframes and delta frames;
   - mutation of any canonical clear byte, slice header prefix included,
-    fails authentication.
-- Now: yes for VP9/VP8; H.264 with E2.
+    fails authentication;
+  - AV1 sequence/key/delta frames, aggregated and fragmented OBUs, omitted
+    delimiter/padding and rewritten size fields round-trip through real
+    str0m and browser packetizers, all RFC 9605 KID/CTR widths; header or
+    ciphertext mutation fails authentication, and malformed sizes are
+    rejected with bounded work. S3's whole-frame failure is a regression
+    case: the accepted layout produces RTP and decodes. DD/source switches
+    cannot authenticate a frame under another frame's metadata.
+- Now: yes for VP9/VP8; H.264 with E2; AV1 layout spike now, interop after A2b.
 
 **B3. Software codecs** (M)
 - Builds: `soft` adapters: libvpx VP8/VP9 encode and decode on every
   platform; OpenH264 encode and decode on macOS, Windows and Linux only
   (Cisco binary through `libloading` in releases, source build for tests),
-  never compiled into iOS or Android builds
+  never compiled into iOS or Android builds; standalone dav1d AV1 decode
+  on desktop only, with no software AV1 encode adapter
   ([Software fallbacks](#software-fallbacks)); the encoder settings of
   [§3](#hardware-encoders-per-platform); canonical Annex B output with SPS
   and PPS on every IDR. The download and verification of Cisco's binary, and
@@ -1507,20 +1794,27 @@ are.
     rule 5 of [Codec negotiation](#codec-negotiation-across-mixed-viewers));
     re-enabling loads it again without a reinstall; a UI test finds the
     attribution text at the control;
-  - the iOS and Android build targets contain no OpenH264 code (a `cargo
+  - desktop dav1d decodes recorded AV1 fixtures at candidate caps up to
+    1080p30; advertising waits for D1–D3 and F4 viewer runs to pass every
+    [desktop software decode bound](#desktop-av1-software-decode-gate)
+    (four slots, duration, fps, latency, CPU, thermals and voice impact);
+    no AV1 software encoder can be selected;
+  - iOS and Android builds contain neither OpenH264 nor dav1d (a `cargo
     tree` check in CI);
   - `THIRD_PARTY_NOTICES.md` and the cargo-about listing updated.
-- Now: yes.
+- Now: yes for adapters and fixtures; advertising waits for D1–D3/F4.
 
 **B4. Native publish transport** (L)
 - Builds: `screen.publish.offer` from Rust: a str0m frame-mode `Rtc` with one
-  `sendonly` video m-line (H.264, VP9, VP8 and RTX); the encoder driven by
+  `sendonly` video m-line (AV1 when A2b is ready, H.264, VP9, VP8 and RTX);
+  AV1 frame/DD metadata from the hardware adapter; the encoder driven by
   the send-side estimate (`min(preset cap, 0.7 × estimate)`, as the web
   sharer does); keyframes on PLI; stats; the share lifecycle (start, stop,
-  restart as a new transport). One layer; two layers are B11. Codec and
+  restart as a new transport). One layer; lazy codec fallback is B11a and
+  quality layers are B11. Codec and
   encoder-configuration switches happen in place on this m-line once A3
   lands.
-- Depends on: B1, B3, A2 (for H.264).
+- Depends on: B1, B3, A2 (H.264); A2b and a hardware adapter for AV1.
 - Acceptance, against a real `gwar-server` in-process:
   - a native publisher and a str0m viewer: frames byte-identical;
   - a Chromium and a WebKit viewer decode it (Playwright, with E1);
@@ -1551,8 +1845,9 @@ are.
 - Depends on: B1 types only.
 - Acceptance: table-driven tests: Text keeps resolution, Game keeps frame
   rate; no oscillation under a feedback signal that alternates every second;
-  recovery only after 10 s of headroom; a codec switch to software VP9
-  lowers the tier.
+  recovery only after 10 s of headroom; a software VP9 compatibility layer
+  lowers only its own tier, never the primary. No AV1 software encoder is
+  selected when hardware fails.
 - Now: yes.
 
 **B7. Native screen key endpoints** (M–L)
@@ -1627,24 +1922,42 @@ are.
   `voice/screen.ts` (as `native-engine.ts` sits beside the web voice engine),
   and the command-surface table in architecture.md updated. The webview keeps
   the UI and, on macOS and Windows, keeps watching through WebRTC.
-- Depends on: B4, A3, and C1 or C3.
+- Depends on: B4, A3, B11a, and C1 or C3; E1b for AV1 webview watching.
 - Acceptance: the `e2e:native-voice` run extended with a native share
   watched by Chromium and WebKit in the same call; the manual checklist
   (F5) on macOS and Windows release builds.
 - Now: no.
 
-**B11. Native two-layer publisher (simulcast)** (L)
+**B11a. Lazy native compatibility publisher** (M–L)
+- Builds: one capture feeding the primary and an on-demand compatibility
+  encoder, A3's per-layer declaration/admission and publisher replacement;
+  H.264 for non-AV1 viewers, VP9/VP8 only for legacy codec gaps; per-layer
+  rate/keyframe requests, a shared uplink cap and the 30 s release hold.
+  Encrypted layers share B7's counter allocator, never counters per encoder.
+- Depends on: B4, B6, A3; A2b and a hardware AV1 adapter for AV1 primary;
+  B2/B7 for encrypted use. Does not depend on A5 or B11.
+- Acceptance: real native AV1 plus H.264-only viewers, join/leave/flapping,
+  level-limited fallback, both in-place and replace paths; the AV1 viewer's
+  codec/tier stays unchanged. Forced session or uplink exhaustion refuses
+  only the incompatible watch; aggregate bitrate stays within the share
+  cap, and encrypted counters never repeat across layer/transport restarts.
+- Now: after B4/A3; mixed AV1 use after A2b and C3/C5 (C7 if verified).
+
+**B11. Native layered publisher (simulcast or AV1 SVC)** (L)
 - Builds: the sending side of [Simulcast or SVC](#simulcast-or-svc) on top
   of B4:
-  - two encoder sessions (the share's tier and a 720p layer at most 30 fps)
-    fed from one capture, or one encoder with two outputs where the platform
+  - AV1 `L1T2`/`L1T3` from one hardware session where supported, with valid
+    DD metadata carried through B4; otherwise single-layer AV1. Temporal
+    layers do not claim to provide a lower resolution;
+  - for H.264, two encoder sessions (the share's tier and a 720p layer at
+    most 30 fps) fed from one capture, or one encoder with two outputs where the platform
     has it; a sharer that cannot open the second session falls back to one
     layer and says so in its layer declaration;
-  - RID and SSRC declarations: `a=rid` and `a=simulcast` on the publish
+  - H.264 RID and SSRC declarations: `a=rid` and `a=simulcast` on the publish
     m-line and two main/RTX SSRC pairs in `screen.publish.offer`, as A5
     admits them, with one layer declaration per layer (A3);
-  - per-layer keyframes: a per-layer PLI makes only that layer's encoder
-    produce an IDR;
+  - per-layer keyframes: a per-layer PLI makes only that H.264 encoder
+    produce an IDR; AV1 requests a base-layer random-access keyframe;
   - aggregate uplink allocation: the send-side estimate is split, the low
     layer first; the top layer gets the rest and is paused when the rest is
     below its minimum, and B6 runs per layer;
@@ -1653,7 +1966,8 @@ are.
     endpoint (B7), so no counter repeats across layers or restarts;
   - the platform-owned path: `EncoderControl` (B9) carries the layer for
     rate and keyframe requests.
-- Depends on: B4, B6, A5; B7 for encrypted channels; a hardware encoder
+- Depends on: B4, B6; A5 for H.264 simulcast, A2b for AV1 temporal layers;
+  B7 for encrypted channels; a hardware encoder
   adapter (C1, C3, C5, C7 or C9) for real use, B3 for tests.
 - Acceptance, against a real `gwar-server` in-process with a native viewer
   and Chromium:
@@ -1661,13 +1975,17 @@ are.
     bottleneck, a viewer whose estimate is below the top layer watches the
     low layer without a pause while an unconstrained viewer keeps the top
     layer; a level-limited viewer (`42e01f`) gets the low layer;
-  - a per-layer PLI produces an IDR on that layer only;
-  - the two layers' combined send rate stays within the estimate; when the
-    estimate falls below both, the top layer pauses first;
+  - AV1 temporal down/up switches keep a decodable base at unchanged
+    resolution under loss, and every emitted DD matches encoder dependencies;
+  - a per-layer PLI produces an IDR on that H.264 layer only;
+  - the two H.264 layers' combined rate stays within the estimate; when it
+    falls below both, the top layer pauses first. AV1 selects a decodable
+    temporal target within the estimate, or pauses if even the base cannot fit;
   - in an encrypted channel, counters from both layers over three transport
     restarts never repeat;
-  - a forced failure to open the second session sends one layer, and the
-    SFU serves every viewer from it.
+  - failure to open a second quality session leaves one rendition; a viewer
+    that cannot use it follows A3's compatibility/refusal rule. It does not
+    change another viewer's codec.
 - Now: no.
 
 Tiers that need layers (§4) are not offered until B11 passes these tests
@@ -1676,18 +1994,19 @@ with a real native encoder on at least one platform.
 ### Track C: per-platform capture and encode
 
 Each platform has a video item and an audio item. Video items include the
-hardware encoder adapter. Each item adds its platform's manual checklist to
-F5 and its numbers to F2.
+hardware encoder adapter: H.264 everywhere, AV1 only after a hardware probe
+and F2 validation. Apple remains H.264; no adapter substitutes software AV1.
+Each item adds its platform's manual checklist to F5 and its numbers to F2.
 
 | Item | What it builds | Depends on | Size | Now |
 | --- | --- | --- | --- | --- |
 | **C1. macOS video** | ScreenCaptureKit with `SCContentSharingPicker`, Gwar's windows excluded, `IOSurface` to VideoToolbox H.264 in the two [Apple encoder configurations](#hardware-encoders-per-platform) (`compat` Constrained Baseline by default, `low-latency` High only for viewers that accept it), the AVCC to Annex B conversion with SPS and PPS from the format description inserted before every IDR (shared with C9) | B1, B4 | L | B1 first |
 | **C2. macOS audio** | `capturesAudio` + `excludesCurrentProcessAudio`; Core Audio process tap as fallback; webview sounds handled | B1; B8 to send | M | B1 first |
-| **C3. Windows video** | Windows.Graphics.Capture (Gwar picker through interop, system picker as option), frame-rate limiting, HDR to SDR, `WDA_EXCLUDEFROMCAPTURE`, Media Foundation hardware MFTs | B1, B4 | L | B1 first |
+| **C3. Windows video** | Windows.Graphics.Capture (Gwar picker through interop, system picker as option), frame-rate limiting, HDR to SDR, `WDA_EXCLUDEFROMCAPTURE`, Media Foundation H.264 and probed AV1 hardware MFTs; record vendor/driver availability and temporal-mode support | B1, B4; A2b for AV1 | L | B1 first |
 | **C4. Windows audio** | WASAPI process loopback excluding Gwar's process tree; version detection; no fallback to the system mix without the explicit setting | B1; B8 to send | M | B1 first |
-| **C5. Linux video** | portal ScreenCast (`ashpd`), restore tokens, PipeWire dmabuf, VA-API or NVENC, software fallback | B1, B3, B4 | L | B1 first |
+| **C5. Linux video** | portal ScreenCast (`ashpd`), restore tokens, PipeWire dmabuf, VA-API or NVENC H.264/AV1 after per-device probing; software fallback excludes AV1 encode | B1, B3, B4; A2b for AV1 | L | B1 first |
 | **C6. Linux audio** | PipeWire per-application links excluding Gwar's nodes; PulseAudio-only and Flatpak detection | B1; B8 to send | M | B1 first |
-| **C7. Android video** | MediaProjection consent per session, foreground service, virtual display into a MediaCodec `Surface`, encoded frames to Rust | B9; the Android client | M–L | no |
+| **C7. Android video** | MediaProjection consent per session, foreground service, virtual display into a MediaCodec `Surface`, H.264 and hardware AV1 only if verified on the device, encoded frames/dependencies to Rust | B9; the Android client; A2b for AV1 | M–L | no |
 | **C8. Android audio** | `AudioPlaybackCapture` (media, game, unknown), Gwar's own players set to `ALLOW_CAPTURE_BY_SYSTEM` | B9; the Android client | S–M | no |
 | **C9. iOS video** | ScreenCaptureKit on iOS 27 (after verification), or the broadcast extension with VideoToolbox in the extension; C1's Apple encoder configurations and Annex B conversion with SPS/PPS insertion; no software H.264 | B9, C1's Apple adapter; an iOS client | L | no |
 | **C10. iOS audio** | ScreenCaptureKit audio (27+) or `.audioApp` buffers, only if Gwar's voice is shown to be absent | C9 | M | no |
@@ -1706,8 +2025,10 @@ Acceptance for every capture item:
   runs on a recorded fixture of the platform encoder's real output (sample
   buffers and format descriptions for VideoToolbox, output buffers for
   MediaCodec and MFTs) through the adapter's conversion code; on hardware it
-  runs live as part of F5. A viewer offering only Constrained Baseline gets
-  a Baseline stream (for Apple, the `compat` configuration).
+  runs live as part of F5. AV1 adapters repeat a sequence header with a shown
+  key frame on join/recovery, tested through A2b on recorded and live output.
+  A viewer offering only Constrained Baseline gets a Baseline stream (for
+  Apple, the `compat` configuration; beside AV1, the B11a fallback).
 - **Declared level equals produced level:** the layer declaration matches
   the SPS of every keyframe, including a session whose encoder chose a
   level other than the target (for Apple, a recorded `compat` session where
@@ -1724,17 +2045,22 @@ Acceptance for every capture item:
 
 | Item | What it builds | Depends on | Size | Now |
 | --- | --- | --- | --- | --- |
-| **D1. Apple decode and render** | VideoToolbox decode, `AVSampleBufferDisplayLayer` or Metal, libvpx fallback for VP9 where hardware lacks it | B5 | M | after B5 |
-| **D2. Windows decode and render** | Media Foundation/D3D11 decode, flip-model swap chain | B5 | M | after B5 |
-| **D3. Linux decode and render** | VA-API/NVDEC or software decode, dmabuf textures or wgpu, per the UI toolkit | B5; UI decision | M–L | after B5 |
-| **D4. Android decode and render** | MediaCodec into a `SurfaceView` | B5, B9 | M | no |
+| **D1. Apple decode and render** | VideoToolbox decode, `AVSampleBufferDisplayLayer` or Metal, libvpx fallback for VP9, AV1 hardware probe on M3+/A17 Pro+, dav1d only on macOS through about 1080p | B5, B3 for dav1d | M | after B5 |
+| **D2. Windows decode and render** | Media Foundation/D3D11 decode including probed AV1, desktop dav1d fallback, flip-model swap chain | B5, B3 | M | after B5 |
+| **D3. Linux decode and render** | VA-API/NVDEC including probed AV1, desktop dav1d fallback, dmabuf textures or wgpu, per the UI toolkit | B5, B3; UI decision | M–L | after B5 |
+| **D4. Android decode and render** | MediaCodec into a `SurfaceView`; AV1 only from a verified hardware decoder, otherwise request H.264 | B5, B9 | M | no |
 | **D5. Watching in the Tauri Linux app** | a spike first: can a native GTK child view sit over the webview's stage area, follow its layout and stay in sync? If yes, D3's renderer in it | B5, D3 | S spike, then M | spike now |
 
 Acceptance for D1–D4: glass-to-glass p50 within the
 [latency budget](screen-share.md#latency-budget) on loopback, measured with
 the frame stamp (F1); four slots decoding at once without dropping stage
 frames; a decoder reset recovers through `screen.keyframe` within 1 s; no
-frame is presented twice or out of order.
+frame is presented twice or out of order. Record AV1 profile/level/tier,
+bit depth and size/fps limits. Desktop dav1d must additionally pass every
+[software decode bound](#desktop-av1-software-decode-gate), including the
+sustained four-slot resource run and F4 viewer voice gate, before any cap is
+advertised. iOS/Android software AV1 is never advertised; unsupported phones
+receive H.264.
 
 D5 matters because it is the only way to give Linux desktop users watching
 before a native Linux UI exists.
@@ -1753,12 +2079,26 @@ before a native Linux UI exists.
   is whether each browser's IDRs carry SPS and PPS in band.
 - Now: after A2.
 
-**E2. H.264 SFrame in the web worker** (M)
+**E1b. Web watch receives AV1** (S–M)
+- Builds: AV1 receive offers with profile/level limits and negotiated DD;
+  measured desktop software-decode limits, phone hardware-only gating, and
+  H.264 fallback. Web VP9/VP8 sending stays unchanged.
+- Depends on: A2b, E1; A3/B11a for mixed-viewer fallback.
+- Acceptance: native hardware AV1 through the real SFU to Chromium,
+  Firefox and hardware-capable Safari/WKWebView; frame stamps, late join,
+  temporal changes and unsupported-device fallback. Record actual receive
+  offers, OS/device/browser versions and decode path, including pre-M3 Macs
+  and phones without AV1 hardware. Uncertain hardware on a phone selects
+  H.264. Safari stable versus Technology Preview coverage is recorded here.
+- Now: capability survey now; interop after A2b and a hardware adapter.
+
+**E2. H.264 and AV1 SFrame in the web worker** (M–L)
 - Builds: the NAL-aware layout's open (and seal, for screen-share PR 11's web
   H.264 sending) in the screen worker, against B2's shared vectors,
   including canonicalization after depacketization. This is the encryption
-  part of screen-share PR 11.
-- Depends on: B2 (vectors), screen-share PR 7.
+  part of screen-share PR 11. Adds AV1 OBU-aware open against B2's shared
+  vectors, including size canonicalization and the DD metadata contract.
+- Depends on: B2 (vectors), screen-share PR 7; A2b/E1b for AV1 interop.
 - Acceptance: the shared vectors pass in WebCrypto; an encrypted native H.264
   share plays in Chromium and WebKit; **seal → packetize → SFU → depacketize
   → open** with a native (str0m) sealer and Chromium and WebKit openers, for
@@ -1769,8 +2109,10 @@ before a native Linux UI exists.
   `pliCount` and `framesDropped` stay at the unencrypted baseline); any
   other rewrite a browser receiver makes to the clear bytes is
   recorded here and added to the canonical form or the publisher contract;
-  worker cost per 2160p keyframe measured.
-- Now: with B2.
+  worker cost per 2160p keyframe measured. AV1 repeats the path with key and
+  delta frames, fragmented OBUs and all KID/CTR widths through Chromium,
+  Firefox and eligible WebKit; frames decode and tampering fails to open.
+- Now: with B2; AV1 interop after E1b.
 
 **E3. Codec switch in the web client** (S)
 - Builds: handling `screen.codec` as a sharer and
@@ -1818,29 +2160,44 @@ before a native Linux UI exists.
 **F2. Encoder benchmark ★** (S)
 - Builds: a `cargo run --example encode-bench` that runs each available
   encoder over the B1 source at each tier and reports encode time, CPU, GPU
-  use where the OS reports it, and output bitrate.
+  use where the OS reports it, and output bitrate. Include hardware AV1
+  versus hardware H.264 on the same content, never software AV1 encode;
+  record API, adapter, driver, profile, temporal modes, latency, session
+  limits and AV1 + lazy H.264 concurrency/uplink cost.
 - Depends on: B1, B3; hardware adapters as they land.
-- Acceptance: results recorded in this document per machine.
-- Now: yes for software encoders.
+- Acceptance: results per machine, including fallback-session exhaustion,
+  realtime keyframe response, bitrate overshoot and voice impact with both
+  encoders active. AV1 is advertised only after a real hardware run passes.
+- Now: yes for existing software encoders; AV1 hardware as C3/C5/C7 land.
 
 **F3. Keyframe and bitrate study ★** (S)
 - Builds: measured keyframe sizes and bitrates for real screen content
   (code editor, document, web page, game footage) at 1080p, 1440p and 2160p,
-  H.264 and VP9, using recorded clips through B3 and hardware encoders.
+  H.264, VP9 and hardware AV1, using recorded clips through B3 and hardware
+  encoders; compare readable text and motion at equal quality, not bitrate
+  alone, and include AV1 sequence-header/keyframe recovery overhead.
 - Depends on: B3.
 - Acceptance: a table in this document that sets A4's limits and §4's
   bitrates.
 - Now: yes.
 
-**F4. Voice gate with a native sharer** (M)
-- Builds: PR 3b's paired voice gate rerun with the native publisher on the
-  same machine as the native voice engine, so capture, encode and the screen
-  transport compete with voice for CPU and uplink.
-- Depends on: B4, PR 3b's gate tooling.
-- Acceptance: the same gate as PR 3b (voice p95 and p99 within 2 ms of the
-  paired baseline unconstrained; p99 within 20 ms constrained; underruns
-  within baseline + 0.5 %).
-- Now: no.
+**F4. Voice gate with native sharing and watching** (M)
+- Builds: PR 3b's paired voice gate rerun in two separate cases on the same
+  machine as the native voice engine: a native publisher (capture, encode
+  and transport competing for CPU/uplink), and a native viewer with four
+  concurrent dav1d slots under the
+  [software decode workload and duration](#desktop-av1-software-decode-gate).
+  Each loaded run has a voice-only baseline of the same duration and network
+  conditions; retain PR 3b's pair-validity and active-load checks.
+- Depends on: PR 3b's gate tooling; B4 for publishing; B5 and the relevant
+  D1–D3 adapter for viewing.
+- Acceptance: both cases pass the same gate as PR 3b (voice p95 and p99
+  within 2 ms of the paired baseline and no extra underruns unconstrained;
+  p99 within 20 ms and underrun rate within baseline + 0.5 percentage points
+  constrained).
+  The viewer case also passes every software decode resource bound; a
+  publisher-only result cannot qualify dav1d caps.
+- Now: publishing after B4; viewing after B5 and the platform's D-item.
 
 **F5. Platform checklists ★** (S, ongoing)
 - Builds: one manual checklist per platform in this document: picker and
@@ -1899,19 +2256,19 @@ before a native Linux UI exists.
 
 | Stage | Items | What it gives |
 | --- | --- | --- |
-| 0. Now | A1, B1, B3, B6, F2, F3, F5, F6; D5 spike | parsers, traits, codecs, numbers and the audio harness; no user-visible change |
-| 1. After PR 3a/3b | A2, E1, B2 (VP9/VP8), B4, B5, F1 | a native publisher with the test source, watched by browsers and by a native viewer |
-| 2. First native sharing | A3, E3, C1, C3, B10, F4 | the desktop app on macOS and Windows shares natively with hardware H.264 (plaintext channels) |
-| 3. After screen-share PR 7 | B7, B2 (H.264), E2 | native shares in encrypted channels, with webview watching beside them |
+| 0. Now | A1, A1b, B1, B3 (incl. dav1d fixtures), B6, F2, F3, F5, F6; B2 AV1 layout spike, E1b survey, D5 spike | parsers, traits, codecs, numbers and the audio harness; no user-visible change |
+| 1. After PR 3a/3b | A2, A2b, E1, B2 (VP9/VP8), B4, B5, F1 | a native test publisher and viewers; AV1 transport groundwork |
+| 2. First native sharing | A3, B11a, E1b, E3, C1, C3, B10, F2 AV1 runs, F4 publisher runs | desktop native sharing: Apple H.264; Windows AV1 where verified, lazy H.264 for mixed viewers (plaintext channels) |
+| 3. After screen-share PR 7 | B7, B2 (H.264/AV1), E2 | encrypted native shares only after each codec's layout/interop passes |
 | 4. After screen-share PR 9 | B8, C2, C4, F8 | desktop shares with sound, without Gwar's voice |
-| 5. Linux | C5, C6, D3, D5 | the Linux desktop app shares (and watches, if D5 works) |
-| 6. Native watching and mobile | D1, D2, B9, C7, C8, D4, C9, C10 | native viewers; Android and iOS sharing |
-| 7. Higher tiers | A4, A5, B11, E4, F7 | 1440p and 2160p with simulcast |
+| 5. Linux | C5, C6, D3, D5, F4 Linux viewer runs | the Linux desktop app shares (and watches, if D5 works) |
+| 6. Native watching and mobile | D1, D2, B9, C7, C8, D4, C9, C10, F4 viewer runs | native viewers; Android and iOS sharing |
+| 7. Higher tiers and quality layers | A4, A5, B11, E4, F7 | 1440p/2160p with H.264 simulcast; AV1 temporal SVC where hardware supports it |
 
 Stages overlap. Stage 7's A4 can move earlier for the Text preset alone,
-which fits today's caps. Rough total: stages 0–2 about 10–14 working weeks
-for one person, and the whole plan several times that. These are planning
-figures, not dates.
+which fits today's caps. Nothing here has a delivery date. The earlier
+10–14 week estimate predates AV1 and lazy codec layers; re-estimate stages
+0–2 after A1b/A2b and the hardware survey.
 
 ## 9. Testing strategy
 
@@ -1933,13 +2290,15 @@ figures, not dates.
 - **Vectors.** SFrame video layouts share one vector file between Rust and
   TypeScript (B2, E2). H.264 frames also go seal → packetize → SFU →
   depacketize → open through the real packetizers, with non-canonical input
-  ([§3](#encryption-nal-aware-sframe)).
+  ([§3](#encryption-nal-aware-sframe)). AV1 follows B2/E2's OBU/size/DD
+  vectors through the same full path; no hardware encoder is needed for
+  parser/layout CI, which uses recorded hardware fixtures.
 - **Recorded encoder output.** Each hardware encoder adapter's conversion
   code (AVCC to Annex B, parameter-set insertion) runs in CI on fixtures
   recorded from the real encoder, including the late-join case of
   [Track C](#track-c-per-platform-capture-and-encode).
-- **Fuzzing.** Payload parsers (A1) and unescaping (B2) get fuzz targets;
-  CI runs them briefly, longer runs are manual.
+- **Fuzzing.** Payload parsers (A1/A1b), DD (A2b) and layouts (B2) get fuzz
+  targets; CI runs them briefly, longer runs are manual.
 
 ### CI constraints
 
@@ -2011,8 +2370,19 @@ the OS version, hardware and build, as screen-share PR 1's table does.
   - OS indicators (macOS menu bar, Windows border, Android chip) are kept.
     Turning off the Windows border needs the user's consent anyway.
 - **Hardware encoder quirks.** Rate control overshoot on scene changes,
-  session limits, driver bugs, and very different latency per vendor. F2's
-  matrix and the software fallback contain it.
+  session limits, driver bugs, and very different latency per vendor. AV1
+  hardware support does not guarantee an MFT, realtime settings or temporal
+  modes. Probe actual sessions, measure AV1 + H.264 together (F2), and use
+  H.264 if hardware AV1 fails; never software AV1 encoding.
+- **Mixed codecs cost two encodes.** Lazy H.264 adds sessions and uplink,
+  even beside AV1 SVC. A3/B11a bound aggregate work and refuse only a watch
+  that cannot be served; new viewers never lower everyone else's codec.
+- **AV1 decode and metadata gaps.** Desktop dav1d caps need the
+  [sustained four-slot resource and voice gate](#desktop-av1-software-decode-gate)
+  before advertisement. Phones require hardware decode;
+  Safari/WKWebView offers depend on OS/device. DD is new implementation
+  work, and OBU/size rewriting can break SFrame. A2b, B2 and E1b/E2 gate it;
+  plaintext AV1 passing does not qualify encrypted AV1.
 - **Bigger keyframes.** 2160p keyframes do not meet the 400 ms deadline for
   most viewers ([SFU limits to raise](#sfu-limits-to-raise)). Simulcast
   (A5 forwarding, B11 publishing) is the remedy; intra refresh (spreading a
@@ -2055,7 +2425,11 @@ the OS version, hardware and build, as screen-share PR 1's table does.
   (H.264 keyframe detection and negotiation in the SFU). Its NAL-aware SFrame
   is E2 here, with B2's shared vectors.
 - **Screen-share PR 13** (simulcast) is extended to H.264 (A5) and to native
-  senders (B11).
+  senders (B11). AV1 temporal SVC uses DD (A2b); lazy codec compatibility
+  (A3/B11a) is needed before higher-tier quality layers.
+- **Native H.264 default / AV1 deferred** in the original #138 plan is
+  superseded by the owner's 2026-10-22 AV1-first/H.264 decision. Web senders
+  remain VP9/VP8; H.265 remains deferred. Camera will reuse the ladder later.
 - **README's roadmap** item "Fully native clients later" now points here.
 
 ### Owner decisions needed
@@ -2070,8 +2444,14 @@ the OS version, hardware and build, as screen-share PR 1's table does.
    only what fits (Text up to 2160p, Smooth 1440p), or raise them as a
    server setting for admins who opt in. Default proposal: keep the defaults;
    admins may raise.
-3. **Codec mismatch:** switch the sharer to a codec every viewer decodes
-   (recommended), or refuse viewers that cannot decode H.264.
+3. **Codec ladder and mismatch — decided, 2026-10-22.** Prefer hardware AV1
+   per share, otherwise H.264. Retain the primary for existing native
+   viewers; add lazy H.264 for incompatible viewers (A3/B11a), with publisher
+   replacement if needed, never server transcoding or a whole-share
+   downgrade. No software AV1 encode; desktop dav1d up to about 1080p;
+   phones require hardware AV1 decode. Re-evaluate on joins/leaves.
+   [§3](#native-codec-ladder-owner-decision-2026-10-22) defines the rule;
+   web VP9/VP8 sending stays as planned.
 4. **OpenH264:** download Cisco's binary at first use for the software
    H.264 fallback on macOS, Windows and Linux (never iOS or Android), or ship
    no software H.264 encoder at all (VP9 when there is no hardware H.264).
@@ -2120,3 +2500,11 @@ The details are in the linked sections.
 | 23 | UniFFI: foreign handles; C# generators | [The UniFFI boundary](#the-uniffi-boundary) | B9, owner decision 1 |
 | 24 | VP9 versus H.264 bitrate at equal quality | [Presets beyond 1080p](#presets-beyond-1080p) | F3 |
 | 25 | Lip-sync tolerance (EBU R37) used as F6's initial bound | [Track F](#track-f-measurements-and-qa) | F6, F8 |
+| 26 | AV1 hardware encoder availability per Windows SKU/driver: usable MFT versus direct NVENC/AMF/oneVPL, low-latency modes and concurrent H.264 sessions | [Hardware encoders](#hardware-encoders-per-platform) | C3, B11a, F2 |
+| 27 | Linux AV1 VA-API/NVENC profiles, zero-copy, realtime settings and temporal dependency metadata | [Hardware encoders](#hardware-encoders-per-platform) | C5, B11, F2 |
+| 28 | Android SoCs exposing an AV1 hardware encoder through MediaCodec; input Surface, latency and temporal modes (no confirmed device list) | [Hardware encoders](#hardware-encoders-per-platform) | C7, B11, F2 |
+| 29 | Mobile AV1 hardware decode by exact device/OS, profile, size and fps; Apple VideoToolbox API coverage; no software AV1 on phones | [Decoding](#decoding) | D1, D4, F5 |
+| 30 | Safari/WKWebView AV1 WebRTC and DD by OS/device, stable versus Technology Preview software fallback, reliable phone hardware gating; Chromium/Firefox receive limits | [Browser AV1 reception](#browser-av1-reception) | E1b, F5 |
+| 31 | Desktop dav1d caps up to 1080p30: each advertised tuple passes sustained four-slot fps/latency, CPU, thermal and paired viewer voice bounds per machine/power mode | [Software decode gate](#desktop-av1-software-decode-gate) | B3, D1–D3, F4 viewer runs |
+| 32 | Hardware AV1 L1T2/L1T3 support and sufficient dependency metadata; AV1/H.264 quality, recovery bitrate and concurrent encode cost | [Simulcast or SVC](#simulcast-or-svc) | A2b, B11, F2, F3 |
+| 33 | AV1 OBU canonicalization, clear header boundary, DD authentication contract and browser packetizer rewrites | [AV1 encryption](#encryption-obu-aware-sframe) | B2, E2 |
