@@ -121,8 +121,9 @@ struct EncoderPlan {
 /// At the quality floor, sustained pressure pauses instead of violating Text/Game invariants.
 ///
 /// Capabilities must already be filtered for viewer/profile/platform eligibility and available
-/// sessions (including the OpenH264 release policy). Preference is hardware AV1, H.264, VP9,
-/// then VP8, with hardware before software within a codec. Software AV1 is always discarded.
+/// sessions (including the OpenH264 release policy). The native send ladder is hardware AV1,
+/// hardware H.264, then software H.264 (OpenH264). Software AV1 and all VP9/VP8 encoders are
+/// discarded; their codec types remain available for browser-compatible receive paths.
 /// Failed candidates are never retried or automatically promoted by this controller; membership
 /// holds, aggregate allocation, SVC metadata and encoder probing belong to A3/B11/B11a.
 #[derive(Debug)]
@@ -155,17 +156,22 @@ impl RateController {
         if nominal_bitrate(config, size, fps) > config.bitrate_cap_bps {
             return Err(MediaError::Invalid("preset tier exceeds the allocated bitrate cap"));
         }
-        let mut candidates: Vec<_> = encoders.iter().enumerate().collect();
-        candidates.sort_by_key(|(_, caps)| {
-            let codec = match caps.profile.codec() {
-                Codec::Av1 => 0,
-                Codec::H264 => 1,
-                Codec::Vp9 => 2,
-                Codec::Vp8 => 3,
-            };
-            (codec, !caps.hardware)
-        });
-        let plans: Vec<_> = candidates.into_iter().filter_map(|(index, caps)| make_plan(config, caps, index)).collect();
+        let mut candidates: Vec<_> = encoders
+            .iter()
+            .enumerate()
+            .filter_map(|(index, caps)| {
+                let preference = match (caps.profile.codec(), caps.hardware) {
+                    (Codec::Av1, true) => 0,
+                    (Codec::H264, true) => 1,
+                    (Codec::H264, false) => 2,
+                    _ => return None,
+                };
+                Some((preference, index, caps))
+            })
+            .collect();
+        candidates.sort_by_key(|(preference, _, _)| *preference);
+        let plans: Vec<_> =
+            candidates.into_iter().filter_map(|(_, index, caps)| make_plan(config, caps, index)).collect();
         let Some(first) = plans.first() else {
             return Err(MediaError::Invalid("no usable negotiated encoder for the preset"));
         };
@@ -351,7 +357,7 @@ fn limit_fps(target: &mut QualityTarget, max_fps: u32, config: ControllerConfig)
 }
 
 fn make_plan(config: ControllerConfig, caps: &CodecCaps, encoder_index: usize) -> Option<EncoderPlan> {
-    if caps.max_fps == 0 || (caps.profile.codec() == Codec::Av1 && !caps.hardware) {
+    if caps.max_fps == 0 {
         return None;
     }
     let fps = preset_fps(config.preset, config.tier).min(caps.max_fps).min(if caps.hardware { 60 } else { 30 });
