@@ -1903,7 +1903,7 @@ are.
 - Acceptance: unit tests for the stamp encoder and reader (round trip
   through scaling by 0.5 and 2); docs on each trait; builds on all CI
   runners; no platform dependency in the crate's default features.
-- Implementation: std-only, no unsafe code; deterministic unpaced `render`
+- Implementation: B1's source/traits are std-only, no unsafe code; deterministic unpaced `render`
   and a paced worker with interruptible stop, acknowledged reconfiguration,
   owned output and terminal-error delivery. Tests cover padded/odd CPU
   layouts, reference lifetimes, stamp corruption, time wrap, source
@@ -1921,8 +1921,27 @@ are.
 - Status: built; codecs, capture adapters, transports and measurement reports
   remain the later items below.
 
-**B2. Video SFrame layouts in Rust** (M)
-- Builds: VP9 whole-frame, VP8 clear-prefix and H.264 NAL-aware layouts
+**B2. Video SFrame layouts in Rust** (M) — **VP9/VP8 built; H.264/AV1 open**
+- Built: `gwar-media::sframe::VideoLayout::{Vp9,Vp8}` implements the exact
+  [Frame layout](screen-share.md#frame-layout) byte rules without codec-byte
+  rewriting. `SframeState::new_screen` reuses voice's controls, retention,
+  removal, expiry, attempt limit and replay state, with a common counter
+  across video codec switches and separate state from voice. Native
+  `Agent::screen_keys` exports `"gwar screen v1"` through voice's live gates.
+- Implementation: the existing `sframe` 2.1.0 suite, no new crypto primitive
+  or unsafe; bounded 2 MiB plaintext and minimal-header parsing. One shared
+  JSON file (`crates/gwar-media/tests/screen-sframe-vectors.json`) has 400
+  VP9/VP8 key/delta vectors covering compact headers and every 1–8-byte
+  KID/CTR width pairing, plus eight authenticated nonminimal rejection
+  vectors and their explicit canonical equivalents. Both Rust and the
+  unchanged TypeScript crypto primitives seal/open identical bytes. Tests
+  cover every-bit mutation, truncation, wrong keys/epochs, label-separated
+  MLS exports, random round trips, malformed input and screen lifecycle.
+- Status: VP9/VP8 Rust byte layouts and primitive interop built. This base's
+  browser SFrame worker handles voice only; encrypted screen transforms and
+  browser/SFU packetizer interop remain unbuilt, so no deployed screen-wire
+  claim is made. H.264/AV1 and their acceptance paths below remain open.
+- Remaining builds: H.264 NAL-aware layouts
   ([§3](#encryption-nal-aware-sframe)) on top of the voice SFrame key state,
   per media kind, with the `"gwar screen v1"` label. The H.264 canonical form
   and the canonicalization applied before sealing and after depacketization.

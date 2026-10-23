@@ -145,29 +145,36 @@ export const IconButton = forwardRef<
     side?: "top" | "right" | "bottom" | "left";
     /** sm 28 px, md 32 px, lg 36 px square; wide is 36 px high and fills its cell. */
     size?: "sm" | "md" | "lg" | "wide";
+    /** Skip the tooltip where the icon is self-explanatory (a dialog's close "x"); the label stays for screen readers. */
+    tooltip?: boolean;
   }
->(function IconButton({ label, shortcut, tone = "default", active, side, size = "md", className, children, ...props }, ref) {
-  return (
+>(function IconButton({ label, shortcut, tone = "default", active, side, size = "md", tooltip = true, className, children, ...props }, ref) {
+  const button = (
+    <button
+      ref={ref}
+      aria-label={label}
+      aria-pressed={active}
+      className={cn(
+        "t inline-flex shrink-0 cursor-pointer items-center justify-center rounded-md disabled:cursor-not-allowed disabled:opacity-40",
+        { sm: "size-7", md: "size-8", lg: "size-9", wide: "h-9 w-full" }[size],
+        tone === "danger"
+          ? "bg-danger-soft text-danger hover:bg-danger hover:text-white"
+          : tone === "accent"
+            ? "bg-accent-soft text-accent hover:bg-accent hover:text-accent-fg"
+            : "text-muted hover:bg-hover hover:text-fg",
+        className,
+      )}
+      {...props}
+    >
+      {children}
+    </button>
+  );
+  return tooltip ? (
     <Tooltip label={label} shortcut={shortcut} side={side}>
-      <button
-        ref={ref}
-        aria-label={label}
-        aria-pressed={active}
-        className={cn(
-          "t inline-flex shrink-0 cursor-pointer items-center justify-center rounded-md disabled:cursor-not-allowed disabled:opacity-40",
-          { sm: "size-7", md: "size-8", lg: "size-9", wide: "h-9 w-full" }[size],
-          tone === "danger"
-            ? "bg-danger-soft text-danger hover:bg-danger hover:text-white"
-            : tone === "accent"
-              ? "bg-accent-soft text-accent hover:bg-accent hover:text-accent-fg"
-              : "text-muted hover:bg-hover hover:text-fg",
-          className,
-        )}
-        {...props}
-      >
-        {children}
-      </button>
+      {button}
     </Tooltip>
+  ) : (
+    button
   );
 });
 
@@ -239,7 +246,7 @@ export function TalkingAvatar({ talking, className, ...avatar }: Parameters<type
   return (
     <span
       data-talking={talking || undefined}
-      className={cn("t inline-flex shrink-0 rounded-full p-[3px]", talking && "shadow-[inset_0_0_0_2px_var(--ok)]", className)}
+      className={cn("t inline-flex shrink-0 rounded-full p-[3px]", talking && "talk-ring", className)}
     >
       <Avatar {...avatar} />
     </span>
@@ -443,7 +450,7 @@ export function Dialog({
           {footer && <div className="flex justify-end gap-2 border-t border-line px-6 py-3">{footer}</div>}
           {/* Last in DOM so initial focus lands in the content, not on the close button. */}
           <DialogPrimitive.Close asChild>
-            <IconButton label={t("common.close")} size="sm" className="absolute top-4 right-4">
+            <IconButton label={t("common.close")} tooltip={false} size="sm" className="absolute top-4 right-4">
               <X className="size-4" />
             </IconButton>
           </DialogPrimitive.Close>

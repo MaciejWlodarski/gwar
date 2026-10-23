@@ -1,4 +1,4 @@
-import { AlertTriangle, CloudCog, Menu, Mic, ShieldAlert, Ticket } from "lucide-react";
+import { AlertTriangle, CloudCog, Menu, ShieldAlert, Ticket } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { useT } from "../i18n";
 import { addressLabel, pageContextFromLocation, sameOriginUrl } from "../net/address";
@@ -10,6 +10,7 @@ import { useAccount } from "../state/account";
 import { useConnectUi, useSession, useUi } from "../state/stores";
 import { Avatar, Button, Field, IconButton, Input, Segmented, Switch } from "./kit";
 import { TeamSpeakBadge } from "./badges";
+import { Wordmark } from "./Brand";
 import { useIsMobile } from "../lib/media";
 import { resolveIdentity } from "../connect/ts-list";
 import { useTsIdentities } from "./hooks";
@@ -131,9 +132,7 @@ export function ConnectScreen() {
           className="anim-pop flex w-full max-w-sm flex-col gap-4 rounded-2xl border border-line bg-side p-6 shadow-pop"
         >
           <div className="flex flex-col items-center gap-2 pb-1 text-center">
-            <div className="flex size-12 items-center justify-center rounded-2xl bg-accent text-accent-fg">
-              <Mic className="size-6" />
-            </div>
+            <Wordmark className="mb-2 h-10 w-auto text-fg" />
             <h1 className="text-xl font-semibold tracking-tight">{t("connect.title")}</h1>
             <p className="text-sm text-muted">{t("connect.subtitle")}</p>
           </div>
@@ -181,6 +180,10 @@ export function ConnectScreen() {
                 value={address}
                 onChange={(e) => onAddressChange(e.target.value)}
                 placeholder={kind === "teamspeak" ? "ts.example.com" : "voice.example.com"}
+                // An address, not a login: without this the browser takes it for the username
+                // of the password below and offers saved account credentials.
+                name="server-address"
+                autoComplete="url"
                 autoCapitalize="none"
                 autoCorrect="off"
                 spellCheck={false}
@@ -201,7 +204,9 @@ export function ConnectScreen() {
                   type="password"
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
-                  autoComplete="current-password"
+                  // A shared server password; "Remember" stores it, not the browser.
+                  name="server-password"
+                  autoComplete="off"
                   autoFocus={needPassword}
                   required={needPassword}
                 />

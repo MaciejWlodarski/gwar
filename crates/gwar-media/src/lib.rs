@@ -10,6 +10,7 @@
 mod adapters;
 mod frame;
 mod rate;
+pub mod sframe;
 pub mod stamp;
 mod synthetic;
 

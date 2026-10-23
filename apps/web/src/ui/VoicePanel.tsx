@@ -37,14 +37,14 @@ export function MicButton({ size = "lg" }: { size?: "md" | "lg" | "wide" }) {
       className={cn(
         "relative overflow-hidden",
         off ? "bg-danger-soft text-danger hover:bg-danger hover:text-white" : "bg-hover text-fg hover:bg-active",
-        talking && "ring-2 ring-ok",
-        ptt && pttActive && !off && "ring-2 ring-ok",
+        talking && "ring-2 ring-talk",
+        ptt && pttActive && !off && "ring-2 ring-talk",
       )}
     >
       {!off && (
         <span
           aria-hidden
-          className="absolute inset-x-0 bottom-0 bg-ok/30 transition-[height] duration-75"
+          className="absolute inset-x-0 bottom-0 bg-talk/30 transition-[height] duration-75"
           style={{ height: `${Math.round(level * 100)}%` }}
         />
       )}

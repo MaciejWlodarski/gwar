@@ -2828,6 +2828,7 @@ dependencies = [
  "ed25519-dalek",
  "futures",
  "gwar-denoise",
+ "gwar-media",
  "gwar-mls",
  "gwar-proto",
  "gwar-server",
@@ -2943,6 +2944,12 @@ dependencies = [
 [[package]]
 name = "gwar-media"
 version = "0.1.0"
+dependencies = [
+ "rand 0.9.5",
+ "serde",
+ "serde_json",
+ "sframe",
+]
 
 [[package]]
 name = "gwar-mls"
@@ -2950,6 +2957,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek",
+ "gwar-media",
  "gwar-proto",
  "hkdf 0.12.4",
  "hmac 0.12.1",
@@ -2962,6 +2970,7 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
+ "sframe",
  "sha2 0.10.9",
  "thiserror 2.0.21",
  "x25519-dalek 2.0.1",
