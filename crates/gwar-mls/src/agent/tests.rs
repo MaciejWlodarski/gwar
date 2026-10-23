@@ -2031,6 +2031,7 @@ fn voice_uses_external_joins_parent_gates_and_no_durable_chat_keys() {
     let info = a.create(signed.clone()).unwrap();
     a.take_changes();
     assert_eq!(a.voice_keys(&server(), &id, &parent, t, &()), Err(AgentError::Blocked));
+    assert_eq!(a.screen_keys(&server(), &id, &parent, t, &()), Err(AgentError::Blocked));
     let mut observer = Observer::create(&info, &server()).unwrap();
     let mut memory = a.durable.clone();
     assert!(Agent::load([11; 32], a.credential.clone(), memory.clone()).is_err());
@@ -2038,6 +2039,34 @@ fn voice_uses_external_joins_parent_gates_and_no_durable_chat_keys() {
     a.settle(&server(), &id, Some(&id)).unwrap();
     a.take_changes().apply(&mut memory);
     let keys = a.voice_keys(&server(), &id, &parent, t, &()).unwrap();
+    let screen = a.screen_keys(&server(), &id, &parent, t, &()).unwrap();
+    assert_eq!(screen.epoch, keys.epoch);
+    assert_eq!(screen.own_leaf, keys.own_leaf);
+    assert_eq!(screen.send_until, keys.send_until);
+    let voice = a.mls(&group_key(&server(), &id)).unwrap();
+    for (screen, audio) in screen.members.iter().zip(&keys.members) {
+        assert_eq!((screen.kid, screen.leaf, &screen.device), (audio.kid, audio.leaf, &audio.device));
+        assert_ne!(screen.key, audio.key);
+        let expected =
+            voice.export_secret(a.provider.crypto(), "gwar screen v1", &screen.leaf.to_be_bytes(), 32).unwrap();
+        assert_eq!(&screen.key[..], expected.as_slice());
+        // Actual MLS exports prove wrong-label rejection, not a stand-in random key.
+        use gwar_media::sframe::VideoLayout;
+        use sframe::{
+            CipherSuite,
+            frame::SingleUseCounter,
+            key::{DecryptionKey, EncryptionKey},
+        };
+        let enc = EncryptionKey::derive_from(CipherSuite::AesGcm128Sha256, screen.kid, screen.key).unwrap();
+        let dec = DecryptionKey::derive_from(CipherSuite::AesGcm128Sha256, screen.kid, screen.key).unwrap();
+        let voice_key = DecryptionKey::derive_from(CipherSuite::AesGcm128Sha256, audio.kid, audio.key).unwrap();
+        for layout in [VideoLayout::Vp9, VideoLayout::Vp8] {
+            let plaintext = [0x10, 0, 0, 0x9d, 1, 0x2a, 0x80, 2, 0xe0, 1, 4, 5];
+            let wire = layout.seal(&enc, &mut SingleUseCounter::new(0), &plaintext).unwrap();
+            assert_eq!(layout.open(&dec, &wire).unwrap(), plaintext);
+            assert!(layout.open(&voice_key, &wire).is_err());
+        }
+    }
     assert_eq!(keys.epoch, 0);
     assert_eq!(keys.members.len(), 1);
     assert!(a.epoch(&server(), &id, 0).is_none());
@@ -2050,6 +2079,7 @@ fn voice_uses_external_joins_parent_gates_and_no_durable_chat_keys() {
     let join = b.join_external(&server(), &info, None, t, &()).unwrap();
     b.take_changes();
     assert_eq!(b.voice_keys(&server(), &id, &other_parent, t, &()), Err(AgentError::Blocked));
+    assert_eq!(b.screen_keys(&server(), &id, &other_parent, t, &()), Err(AgentError::Blocked));
     observer = accept(observer, &join, t);
     acknowledge(&mut b, &id, &join);
     a.receive(&server(), &id, &join.commit, &[]).unwrap();
@@ -2058,6 +2088,7 @@ fn voice_uses_external_joins_parent_gates_and_no_durable_chat_keys() {
     b.take_changes();
     // Historical voice acceptance is independent of the parent's current sync.
     assert_eq!(a.voice_keys(&server(), &id, &parent, t, &()), Err(AgentError::Blocked));
+    assert_eq!(a.screen_keys(&server(), &id, &parent, t, &()), Err(AgentError::Blocked));
     assert_eq!(a.voice_parent_removals(&server(), &id, &parent, false), Err(AgentError::Blocked));
     let pj = other_parent.join_external(&server(), &parent_info, None, t, &()).unwrap();
     other_parent.take_changes();
@@ -2069,6 +2100,10 @@ fn voice_uses_external_joins_parent_gates_and_no_durable_chat_keys() {
     assert_eq!(
         a.voice_keys(&server(), &id, &parent, t, &()).unwrap().members,
         b.voice_keys(&server(), &id, &other_parent, t, &()).unwrap().members
+    );
+    assert_eq!(
+        a.screen_keys(&server(), &id, &parent, t, &()).unwrap().members,
+        b.screen_keys(&server(), &id, &other_parent, t, &()).unwrap().members
     );
     assert_eq!(observer.leaves().len(), 2);
     // A lost commit reply is settled from its exact bytes, keeping all old keys out of stores.
@@ -2088,6 +2123,7 @@ fn voice_uses_external_joins_parent_gates_and_no_durable_chat_keys() {
     acknowledge(&mut parent, &parent_id, &remove);
     assert_eq!(parent_observer.leaves().len(), 1);
     assert_eq!(a.voice_keys(&server(), &id, &parent, t, &()), Err(AgentError::Blocked));
+    assert_eq!(a.screen_keys(&server(), &id, &parent, t, &()), Err(AgentError::Blocked));
     assert_eq!(a.voice_parent_removals(&server(), &id, &parent, true).unwrap().len(), 1);
     assert_eq!(voice_kid(0x1_0000_0001, 7), 0x1_0000_0007);
     assert_eq!(voice_kid(u64::MAX, u32::MAX), u64::MAX);
@@ -2144,6 +2180,7 @@ fn voice_removal_hold_survives_competing_update_and_volatile_reload() {
     f.a.proposal(&server(), &f.id, &proposal).unwrap();
     f.a.take_changes();
     assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    assert_eq!(f.a.screen_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
     // C has not seen its own server Remove and wins with an ordinary update.
     let update = c.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
     c.take_changes();
@@ -2156,6 +2193,7 @@ fn voice_removal_hold_survives_competing_update_and_volatile_reload() {
     f.a.pending(&server(), &f.id, false).unwrap();
     f.a.take_changes();
     assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    assert_eq!(f.a.screen_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
     // Snapshot recovery replaces the hold with a pending-state barrier.
     let recovery =
         f.a.join_external(&server(), &update.group_info, Some(&f.observer.tree().unwrap().1), f.t, &()).unwrap();
@@ -2164,6 +2202,7 @@ fn voice_removal_hold_survives_competing_update_and_volatile_reload() {
     acknowledge(&mut f.a, &f.id, &recovery);
     f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
     assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    assert_eq!(f.a.screen_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
     let proposal = f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap();
     f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &[proposal]).unwrap();
     f.a.take_changes();
@@ -2213,6 +2252,7 @@ fn voice_recovery_pending_state(replaced: bool, reload: bool) {
     f.a.take_changes();
     reload_a(&mut f.a);
     assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    assert_eq!(f.a.screen_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
     f.observer = accept(f.observer, &recovery, f.t);
     acknowledge(&mut f.a, &f.id, &recovery);
     reload_a(&mut f.a);
@@ -2231,6 +2271,7 @@ fn voice_recovery_pending_state(replaced: bool, reload: bool) {
     acknowledge(&mut f.a, &f.id, &update);
     reload_a(&mut f.a);
     assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    assert_eq!(f.a.screen_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
     let proposals =
         if replaced { vec![] } else { vec![f.observer.propose_remove(&Ed25519Signer(key(200)), target).unwrap()] };
     // A delivered proposal is not a complete pending-state response.
@@ -2240,6 +2281,7 @@ fn voice_recovery_pending_state(replaced: bool, reload: bool) {
     }
     reload_a(&mut f.a);
     assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    assert_eq!(f.a.screen_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
     f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &proposals).unwrap();
     f.a.take_changes();
     reload_a(&mut f.a);
@@ -2249,6 +2291,7 @@ fn voice_recovery_pending_state(replaced: bool, reload: bool) {
         assert_eq!(keys.members.len(), 3);
     } else {
         assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+        assert_eq!(f.a.screen_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
         // Neither an empty replay nor the notification API cancels a learned hold.
         f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &[]).unwrap();
         f.a.take_changes();
@@ -2256,6 +2299,7 @@ fn voice_recovery_pending_state(replaced: bool, reload: bool) {
         f.a.take_changes();
         reload_a(&mut f.a);
         assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+        assert_eq!(f.a.screen_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
         let remove = f.a.commit(&server(), &f.id, &[], &[], f.t, &()).unwrap();
         f.a.take_changes();
         f.observer = accept(f.observer, &remove, f.t);
@@ -2302,6 +2346,7 @@ fn voice_pending_rejects_unaccepted_stale_and_partial_sync_after_reload() {
         assert_eq!(f.a.durable, before);
         f.a = Agent::load_voice([11; 32], f.a.credential.clone(), before).unwrap();
         assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+        assert_eq!(f.a.screen_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
     }
     // No partially processed proposal survived the failed atomic operation.
     f.a.voice_pending(&server(), &f.id, epoch, &[]).unwrap();
@@ -2328,6 +2373,7 @@ fn voice_recovery_barrier_survives_a_removal_commit_without_complete_sync() {
     acknowledge(&mut f.a, &f.id, &remove);
     f.a = Agent::load_voice([11; 32], f.a.credential.clone(), f.a.durable.clone()).unwrap();
     assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    assert_eq!(f.a.screen_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
     f.a.voice_pending(&server(), &f.id, f.observer.epoch(), &[]).unwrap();
     f.a.take_changes();
     assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).unwrap().members.len(), 2);
@@ -2340,6 +2386,7 @@ fn voice_own_pending_removal_blocks_export_but_chat_stays_available() {
     let out = f.a.commit(&server(), &f.id, &[], &[target], f.t, &()).unwrap();
     f.a.take_changes();
     assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    assert_eq!(f.a.screen_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
     f.observer = accept(f.observer, &out, f.t);
     acknowledge(&mut f.a, &f.id, &out);
     assert!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()).is_ok());
@@ -2372,6 +2419,7 @@ fn queued_parent_removal_blocks_voice_export_and_parent_removal_planning() {
     assert!(!parent.group(&server(), &parent_id).unwrap().server_pending);
     assert_eq!(f.a.voice_parent_removals(&server(), &f.id, &parent, true), Err(AgentError::Blocked));
     assert_eq!(f.a.voice_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
+    assert_eq!(f.a.screen_keys(&server(), &f.id, &parent, f.t, &()), Err(AgentError::Blocked));
     let remove = parent.commit(&server(), &parent_id, &[], &[], f.t, &()).unwrap();
     parent.take_changes();
     acknowledge(&mut parent, &parent_id, &remove);

@@ -13,6 +13,7 @@ deep-filter = ["gwar-denoise/embedded-model"]
 
 [dependencies]
 url = "2"
+gwar-media = { path = "../gwar-media" }
 gwar-proto = { path = "../gwar-proto", features = ["rtp"] }
 anyhow.workspace = true
 base64 = "0.22"

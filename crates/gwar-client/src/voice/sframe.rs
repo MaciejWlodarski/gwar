@@ -1,7 +1,8 @@
-//! The SFrame key state of one encrypted native voice run (docs/e2e-build.md
+//! The SFrame key state of one encrypted native media run (docs/e2e-build.md
 //! "SFrame and receiver state" and "Installation and activation"). It
 //! implements the browser worker's control contract
-//! (`apps/web/src/voice/sframe/state.ts`); the RTC task owns one instance and
+//! (`apps/web/src/voice/sframe/state.ts`); voice and screen use separate instances.
+//! The RTC task owns each instance and
 //! applies controls, encryption and decryption in order on one thread, so no
 //! result can outlive the control that invalidated it. Key material is never
 //! logged, persisted or archived; derived keys zeroize on drop.
@@ -12,6 +13,7 @@ use std::{
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use gwar_media::sframe::{MAX_FRAME_BYTES as MAX_VIDEO_BYTES, VideoLayout};
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sframe::{
@@ -451,7 +453,25 @@ enum End {
     Failed,
 }
 
+/// One media kind's key lifecycle. Voice and screen require distinct instances and exporter keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaKind {
+    Voice,
+    Screen,
+}
+
+impl MediaKind {
+    /// MLS exporter label. Export 32 bytes with the leaf's u32 big-endian context.
+    pub const fn exporter_label(self) -> &'static str {
+        match self {
+            Self::Voice => "gwar voice v1",
+            Self::Screen => "gwar screen v1",
+        }
+    }
+}
+
 pub struct SframeState {
+    media_kind: MediaKind,
     binding: Binding,
     /// The controller's highest processed epoch before a restart's own update.
     resume_after: Option<u64>,
@@ -473,7 +493,18 @@ pub struct SframeState {
 
 impl SframeState {
     pub fn new(binding: Binding, resume_after: Option<u64>, frame_samples: u32) -> Self {
+        Self::with_kind(binding, resume_after, frame_samples, MediaKind::Voice)
+    }
+
+    /// A separate screen run. Install only keys from `Agent::screen_keys` ("gwar screen v1").
+    /// VP9/VP8 switches use this same instance so they cannot reset counters or replay windows.
+    pub fn new_screen(binding: Binding, resume_after: Option<u64>) -> Self {
+        Self::with_kind(binding, resume_after, 0, MediaKind::Screen)
+    }
+
+    fn with_kind(binding: Binding, resume_after: Option<u64>, frame_samples: u32, media_kind: MediaKind) -> Self {
         Self {
+            media_kind,
             binding,
             resume_after,
             frame_samples,
@@ -757,10 +788,10 @@ impl SframeState {
 
     /// One Opus packet in, one SFrame ciphertext out, or `None` to drop it.
     pub fn encrypt(&mut self, plaintext: &[u8], now: Instant, wall_ms: u64) -> Option<Vec<u8>> {
-        if self.ended.is_some() {
+        if self.media_kind != MediaKind::Voice || self.ended.is_some() {
             return None;
         }
-        let epoch = self.sender?;
+        self.sender?;
         if plaintext.is_empty() || plaintext.len() > MAX_OPUS {
             self.counters.oversize_dropped += 1;
             return None;
@@ -773,6 +804,31 @@ impl SframeState {
         if samples != self.frame_samples {
             self.counters.unexpected_duration += 1;
         }
+        self.encrypt_payload(plaintext, &[], now, wall_ms)
+    }
+
+    /// Seal screen video under this run's separate exporter keys and common video counter.
+    pub fn encrypt_video(
+        &mut self,
+        layout: VideoLayout,
+        plaintext: &[u8],
+        now: Instant,
+        wall_ms: u64,
+    ) -> Option<Vec<u8>> {
+        if self.media_kind != MediaKind::Screen || self.ended.is_some() {
+            return None;
+        }
+        self.sender?;
+        if plaintext.len() > MAX_VIDEO_BYTES {
+            self.counters.oversize_dropped += 1;
+            return None;
+        }
+        let clear = layout.clear_len(plaintext).ok()?;
+        self.encrypt_payload(&plaintext[clear..], &plaintext[..clear], now, wall_ms)
+    }
+
+    fn encrypt_payload(&mut self, plaintext: &[u8], metadata: &[u8], now: Instant, wall_ms: u64) -> Option<Vec<u8>> {
+        let epoch = self.sender?;
         let keys = self.epochs.get_mut(&epoch)?;
         if keys.deadline.is_some_and(|deadline| now >= deadline) || keys.expires_ms.is_some_and(|e| wall_ms >= e) {
             self.close_sending(StatusReason::KeyExpired);
@@ -785,15 +841,15 @@ impl SframeState {
         }
         let ctr = keys.counter;
         keys.counter += 1;
-        let frame = MediaFrameView::try_new(&mut SingleUseCounter::new(ctr), plaintext).ok()?;
+        let frame = MediaFrameView::try_with_meta_data(&mut SingleUseCounter::new(ctr), plaintext, metadata).ok()?;
         let encrypted = frame.encrypt(&keys.own).ok()?;
         self.counters.encrypted += 1;
-        Some(encrypted.sframe_cipher_text().to_vec())
+        Some(encrypted.as_ref().to_vec())
     }
 
     /// One SFrame ciphertext in, a validated Opus packet out, or `None`.
     pub fn decrypt(&mut self, frame: &[u8], now: Instant) -> Option<Vec<u8>> {
-        if self.ended.is_some() {
+        if self.media_kind != MediaKind::Voice || self.ended.is_some() {
             return None;
         }
         if !(MIN_FRAME..=MAX_FRAME).contains(&frame.len()) {
@@ -804,6 +860,32 @@ impl SframeState {
             self.counters.auth_failed += 1;
             return None;
         };
+        let view = EncryptedFrameView::try_new(frame).ok()?;
+        self.decrypt_payload(kid, ctr, now, |key| view.decrypt(key).ok().map(|frame| frame.payload().to_vec()))
+    }
+
+    /// Open screen video with the voice lifecycle's retention, removal and replay rules.
+    pub fn decrypt_video(&mut self, layout: VideoLayout, wire: &[u8], now: Instant) -> Option<Vec<u8>> {
+        if self.media_kind != MediaKind::Screen || self.ended.is_some() {
+            return None;
+        }
+        let frame = match layout.parse(wire) {
+            Ok(frame) => frame,
+            Err(_) => {
+                self.counters.auth_failed += 1;
+                return None;
+            }
+        };
+        self.decrypt_payload(frame.header().key_id(), frame.header().counter(), now, |key| frame.open(key).ok())
+    }
+
+    fn decrypt_payload(
+        &mut self,
+        kid: u64,
+        ctr: u64,
+        now: Instant,
+        open: impl Fn(&DecryptionKey) -> Option<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
         // Retention is exact: an epoch past its window opens nothing, whatever the sweep timer.
         self.sweep(now);
         let (low, leaf) = (kid >> 32, kid as u32);
@@ -818,7 +900,6 @@ impl SframeState {
             self.counters.no_key += 1;
             return None;
         }
-        let view = EncryptedFrameView::try_new(frame).ok()?;
         let mut replayed = false;
         for epoch in candidates {
             let receiver = self.epochs.get_mut(&epoch)?.receivers.get_mut(&leaf)?;
@@ -827,11 +908,12 @@ impl SframeState {
                 continue;
             }
             // Only successful authentication and the final replay check admit a frame.
-            let Ok(opened) = view.decrypt(&receiver.key) else { continue };
+            let Some(payload) = open(&receiver.key) else { continue };
             receiver.replay.admit(ctr);
             let device = receiver.device.clone();
-            let payload = opened.payload();
-            if payload.len() > MAX_OPUS || gwar_proto::opus::packet_samples(payload).is_none() {
+            if self.media_kind == MediaKind::Voice
+                && (payload.len() > MAX_OPUS || gwar_proto::opus::packet_samples(&payload).is_none())
+            {
                 self.counters.unexpected_duration += 1;
                 return None;
             }
@@ -840,9 +922,8 @@ impl SframeState {
                 *last = (*last).max(epoch);
             }
             self.counters.decrypted += 1;
-            let out = payload.to_vec();
             self.sweep(now);
-            return Some(out);
+            return Some(payload);
         }
         if replayed {
             self.counters.replay_dropped += 1;
