@@ -319,17 +319,30 @@ AV1 is unavailable. Its profile, level and SFrame rules below still apply.
 
 The SFU reads only enough of each RTP payload to find frame and keyframe
 starts, as it does for VP9 and VP8 (`describe` in
-`media/screen/ingress.rs`, PR 3a). For H.264
+`media/screen/ingress.rs`, PR 3a). The H.264 payload parser (A1) is built in
+`media/screen/h264.rs`; transport integration and confirmation remain A2.
+For H.264
 ([RFC 6184](https://www.rfc-editor.org/rfc/rfc6184)):
 
 - The NAL unit type is the low 5 bits of the first payload byte.
   - 1–23: a single NAL unit packet.
   - 24 (STAP-A): aggregated NAL units, each with a 16-bit size. The SFU walks
-    them, bounded by the payload length.
-  - 28 (FU-A): a fragment. The FU header's S bit marks the first fragment, and
-    its type field is the fragmented NAL's type.
+    them in wire order, bounded by the payload length. That order is the NAL
+    decoding order in mode 1 ([RFC 6184 §5.5](https://www.rfc-editor.org/rfc/rfc6184#section-5.5)).
+  - 28 (FU-A): a fragment. The FU header's S bit marks the first fragment,
+    E marks the last, and its type field is the fragmented NAL's type.
   - Other types (STAP-B, MTAP, FU-B) are refused: they are not allowed in
     `packetization-mode=1`.
+- **A1 output:** `Description` reuses `ingress::Descriptor` for frame start
+  and the keyframe candidate, and exposes `nals: Vec<NalObservation>` in
+  wire order. Each observation has the original `nal_type` (1–23) and a
+  `NalPart`: `Complete` for a single NAL or STAP-A unit, `Start` for FU-A
+  S=1/E=0, `Continuation` for S=0/E=0, or `End` for S=0/E=1. All NAL types
+  are retained, so an intervening NAL cannot hide an interrupted FU chain.
+  `Complete` means transport-complete, not validation of the opaque NAL
+  body; `End` alone does not prove completion. The first complete SPS also
+  supplies `profile_level_id`. These observations replace the unordered
+  slice/PPS presence flags; confirmation must use the ordered list.
 - **Frame start:** the first packet of a new RTP timestamp, as for VP8/VP9.
 - **Publisher contract:** every IDR access unit is in the canonical form of
   [§3, Encryption](#encryption-nal-aware-sframe): it starts with one SPS
@@ -366,9 +379,20 @@ starts, as it does for VP9 and VP8 (`describe` in
   - at most 8 packets and 16 KB, all of one RTP timestamp, ordered by
     sequence number whatever their arrival order;
   - **confirmed** when the buffer holds a gap-free run of sequence numbers
-    from the SPS packet to the IDR slice start, containing a PPS before the
-    IDR, with no non-IDR slice (1) in between. The held packets are then
-    released in sequence order, the SPS packet marked as the keyframe start
+    from the SPS packet to the IDR slice start. A2 walks each packet's
+    `nals` in order: after the candidate SPS, a PPS (8) must **complete
+    before** the first IDR (5) `Complete` or `Start`, with no non-IDR slice
+    (1) `Complete` or `Start` in between. A PPS completes at `Complete`, or
+    at `End` only after a type-8 `Start` and zero or more type-8
+    `Continuation` observations in consecutive packets of the same RTP
+    timestamp. A2 evaluates FUs in source sequence order after reordering;
+    a gap leaves the chain unconfirmed until repaired within the bounds.
+    A type change, intervening NAL/new start, or orphan continuation/end
+    invalidates that chain. A pending FU must finish before a different NAL
+    can start in the prefix. Thus `SPS → IDR → PPS` within one STAP-A and
+    `SPS → PPS Start → IDR` across gap-free packets cannot confirm; neither
+    can an orphan PPS `End`. The held packets are then released in sequence
+    order, the SPS packet marked as the keyframe start
     (so `Segment::map`'s base is the SPS packet), followed by the IDR packet
     and the rest of the access unit as it arrives;
   - **failed** when the access unit ends first (marker bit or a newer
@@ -390,6 +414,12 @@ starts, as it does for VP9 and VP8 (`describe` in
   - *reordered parameter sets:* an IDR start that arrives before the SPS
     packet is held; the candidate is confirmed when the SPS packet arrives,
     if the bound is not exceeded;
+  - *NAL order:* a STAP-A with SPS, IDR, then PPS opens nothing; wire order
+    inside a packet is as significant as source sequence order across packets;
+  - *fragmented PPS:* SPS, PPS FU-A start, then IDR opens nothing even with
+    consecutive sequence numbers. Start, optional continuations, and end of
+    the same PPS must precede the IDR; missing starts/ends, interrupted chains,
+    or a different timestamp cannot supply a complete PPS;
   - *marker before repair:* when the access unit's marker packet arrives
     while the prefix still has a gap (a lost PPS packet awaiting RTX), the
     candidate fails. The later repair is forwarded only to slots already in
@@ -1522,18 +1552,27 @@ round of their own, as voice 5c/5d had.
 
 ### Track A: SFU and protocol
 
-**A1. H.264 payload parser ★** (S)
-- Builds: `describe` for H.264 in `media/screen/ingress.rs`: single NAL,
-  STAP-A and FU-A; frame start, keyframe candidate (SPS first), IDR slice
-  start, the presence of a PPS, the three SPS profile and level bytes, and
-  malformed payloads ([SFU payload handling](#sfu-payload-handling-a1-a2)).
-  No negotiation and no confirmation yet.
+**A1. H.264 payload parser ★** (S) — **built**
+- Built: `describe` for H.264 in `media/screen/h264.rs`, reusing
+  `ingress::Descriptor`: single NAL,
+  STAP-A and FU-A; frame start, keyframe candidate (SPS first), ordered
+  `NalObservation`s with the original NAL type and `NalPart`
+  (`Complete`/`Start`/`Continuation`/`End`), the three SPS profile and level
+  bytes, and malformed payloads
+  ([SFU payload handling](#sfu-payload-handling-a1-a2)). The caller supplies
+  frame start from RTP timestamp tracking. A2 uses the ordered observations
+  to require PPS completion before the first IDR start and to detect
+  non-IDR starts or interrupted FU chains. Fragmented SPSs are not candidates
+  and expose no profile bytes without reassembly. No negotiation, confirmation
+  or transport integration yet.
 - Depends on: PR 3a (#136).
 - Acceptance: unit vectors for each packet kind, including a STAP-A with SPS
-  and PPS, an FU-A IDR start and continuation, a truncated STAP-A, an FU-A
-  with S and E set, and reserved types. Parsing never reads past the payload
-  (a fuzz test over random bytes).
-- Now: yes.
+  and PPS; reversed SPS/IDR/PPS order; FU-A starts, continuations and ends
+  for every NAL type; incomplete, orphaned and interrupted PPS fragment
+  sequences before IDR; a truncated STAP-A; an FU-A with S and E set; and
+  reserved types. Parsing never reads past the payload
+  (a deterministic seeded fuzz-style test over random bytes and truncations).
+- Status: built; A2 integration remains separate.
 
 **A1b. AV1 payload parser ★** (S)
 - Builds: bounded aggregation-header/OBU parsing, frame-start metadata and
@@ -1554,7 +1593,9 @@ round of their own, as voice 5c/5d had.
   payload type ([Negotiation](#negotiation-a2)); per-viewer payload type
   mapping; the bounded prefix buffer and IDR confirmation of
   [SFU payload handling](#sfu-payload-handling-a1-a2), in `Ingress` and in
-  the hand-off to `Segment::map`.
+  the hand-off to `Segment::map`. Confirmation consumes A1's ordered
+  `nals`, requiring a complete PPS before the first IDR start, including
+  gap-free, uninterrupted FU-A completion when the PPS is fragmented.
 - Depends on: A1, PR 3a, and PR 3b
   ([#144](https://github.com/MaciejWlodarski/gwar/pull/144)) for the required
   pacing/allocation foundation.
@@ -1572,6 +1613,10 @@ round of their own, as voice 5c/5d had.
     Each opens no segment for a waiting viewer and causes one throttled PLI,
     or, for the reordered case within the bound, opens the segment at the
     SPS packet;
+  - SPS/IDR/PPS in one STAP-A and a PPS FU-A start followed directly by IDR
+    both open nothing; a PPS FU-A start/continuation/end run before IDR
+    confirms only within one timestamp, without gaps or intervening NALs;
+    an orphan continuation/end, a changed FU type or a missing end fails;
   - a slot already in a segment sees no added delay from the prefix buffer;
   - publisher-side loss is repaired into place, as for VP9;
   - offers with `packetization-mode=0` only, or only unsupported profiles,
