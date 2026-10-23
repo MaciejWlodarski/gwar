@@ -817,7 +817,11 @@ Limits are enforced continuously, not only when a share or watch is admitted:
     newest guest first, across all shares, until it fits. Those guests are
     paused (`screen.paused {reason: "budget"}`) and their reservations are
     released at once, so the member is admitted in the same request. Only
-    when no guest reservation is left does the member get `busy`.
+    when reclaiming every guest reservation would still be insufficient does
+    the member get `busy`; a refused request leaves existing guests alone.
+    Members also reclaim guest viewer slots on a full share before returning
+    `busy`. Paused guests keep counting toward the 10-guest connection limit,
+    but hold neither a viewer-slot reservation nor a live media grant.
   - **A paused guest resumes only by passing admission again.** Every 5 s
     the server re-admits paused guests, oldest pause first, while their
     reservation fits beside every member's. A member is never paused to

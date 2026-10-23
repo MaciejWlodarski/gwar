@@ -9,7 +9,7 @@ import type { IceServer } from "../proto/IceServer";
 import type { TransportState, WatchParams } from "../voice/screen";
 
 export type WatchStatus =
-  | "connecting" | "watching" | "slow"
+  | "connecting" | "watching" | "slow" | "paused"
   /** Final: nothing more happens on this page. */
   | "ended" | "off" | "invalid" | "busy" | "lost" | "unsupported";
 
@@ -154,8 +154,8 @@ export class WatchSession {
       case "screen.stopped": return this.finish("ended");
       case "screen.link": if (frame.d.active === false) this.finish("off"); return;
       // From the server's budget (PR 3b): a paused guest keeps its page and waits.
-      case "screen.paused": return this.set("slow");
-      case "screen.resumed": if (this.current === "slow") this.set("watching"); return;
+      case "screen.paused": return this.set(frame.d.reason === "budget" ? "paused" : "slow");
+      case "screen.resumed": if (this.current === "slow" || this.current === "paused") this.set("watching"); return;
     }
   }
 

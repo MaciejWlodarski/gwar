@@ -146,6 +146,23 @@ describe("WatchSession", () => {
     expect(t.statuses).toEqual(["watching", "slow", "watching"]);
   });
 
+  it("keeps a budget pause across transport connection and waits for the matching resume", async () => {
+    const t = setup();
+    t.session.start("ws://x/ws/watch", TOKEN);
+    t.socket().open();
+    t.socket().receive({ re: 1, ok: watching });
+    await vi.waitFor(() => expect(t.socket().last("guest.offer")).toBeDefined());
+    t.socket().receive({ ev: "screen.paused", d: { share: "s1", reason: "budget" } });
+    t.params().state("connected");
+    t.socket().receive({ ev: "screen.resumed", d: { share: "s2" } });
+    expect(t.session.status).toBe("paused");
+    expect(t.transport.close).not.toHaveBeenCalled();
+    expect(watchText("en").status.paused).toContain("Waiting to resume");
+    expect(watchText("pl").status.paused).toContain("Oczekiwanie na wznowienie");
+    t.socket().receive({ ev: "screen.resumed", d: { share: "s1" } });
+    expect(t.statuses).toEqual(["paused", "watching"]);
+  });
+
   it("answers not_found as a link that does not work, and busy as a full share", async () => {
     for (const [code, status] of [["not_found", "invalid"], ["busy", "busy"], ["rate_limited", "lost"]] as const) {
       const t = setup();

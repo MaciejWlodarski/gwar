@@ -143,6 +143,8 @@ pub enum CoreMsg {
     Screen(ScreenSignal),
     /// A TeamSpeak guest's watch connection (`/ws/watch`).
     Guest(GuestMsg),
+    /// Re-admit budget-paused guests against the current limits.
+    ResumeGuests,
     /// A minute's read of the host's transmitted bytes (`None` where unavailable).
     Egress(Option<egress::Reading>),
     Info(oneshot::Sender<ServerInfo>),
@@ -558,6 +560,15 @@ pub fn spawn(
     });
     let ticker = tx.downgrade();
     tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(5));
+        loop {
+            every.tick().await;
+            let Some(tx) = ticker.upgrade() else { break };
+            let _ = tx.send(CoreMsg::ResumeGuests).await;
+        }
+    });
+    let ticker = tx.downgrade();
+    tokio::spawn(async move {
         let mut every = tokio::time::interval(egress::EGRESS_EVERY);
         loop {
             every.tick().await;
@@ -764,6 +775,7 @@ impl Core {
                 self.screen_watching(session, run, connected)
             }
             CoreMsg::Guest(msg) => self.guest_msg(msg),
+            CoreMsg::ResumeGuests => self.resume_guests(),
             CoreMsg::Screen(ScreenSignal::Paused { session, run, share, reason }) => {
                 self.screen_paused(session, run, &share, Some(reason))
             }

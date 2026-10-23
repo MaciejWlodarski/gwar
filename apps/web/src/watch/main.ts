@@ -40,7 +40,7 @@ const show = (s: WatchStatus) => {
   const line = document.createElement("span");
   line.textContent = text.status[s];
   status.replaceChildren(...(line.textContent ? [line] : []));
-  if (s !== "watching" && s !== "slow" && s !== "connecting") {
+  if (s !== "watching" && s !== "slow" && s !== "paused" && s !== "connecting") {
     video.srcObject = null;
     video.hidden = true;
     fullscreen.hidden = pip.hidden = true;
