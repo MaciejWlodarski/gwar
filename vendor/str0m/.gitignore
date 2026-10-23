@@ -12,3 +12,6 @@ dimpl
 webrtc
 *.pcap
 .wt
+
+# Canonical upstream RTP fixtures required by tests/common.rs.
+!/tests/data/*.pcap

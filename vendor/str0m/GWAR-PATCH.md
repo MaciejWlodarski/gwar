@@ -89,3 +89,10 @@ Changed upstream files:
 `src/bwe/api.rs`, `src/session.rs`, `tests/common.rs` and `tests/bwe/common.rs`. Two test-only lint cleanups in
 `src/packet/buffer_rx.rs` and `tests/change-ssrc-reset-receive.rs` allow the full
 vendor clippy run with warnings denied.
+
+The seven canonical upstream PCAP test fixtures are included verbatim from
+str0m 0.24.1, commit `8c4c5284cb11b1e3c82962639cda5b3e95af73e8`. They total
+5,460,333 bytes and are redistributed under the preserved upstream MIT licence.
+See `tests/data/README.md` for provenance and `tests/data/SHA256SUMS` for
+checksums. The narrow `.gitignore` exception retains these required fixtures
+so the entire vendor suite compiles and runs from a fresh checkout.
