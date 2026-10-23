@@ -181,3 +181,12 @@ omits or disables `level-asymmetry-allowed`. Asymmetric levels require both
 peers to opt in; Level 1b uses the existing profile/level parser's ordering.
 `h264_answer_levels_require_mutual_asymmetry` covers these cases. Codec/PT
 selection and all pacing/BWE behavior are unchanged by this addition.
+
+The dev-only `_gwar_sim` feature makes Gwar's screen simulations replayable:
+`_gwar_sim::start(seed)` seeds the existing thread-local fastrand source used by
+transport IDs and ICE, fixes Unix/NTP conversion around a process-local Instant
+anchor, and orders RX/TX stream maps by SSRC. Other maps remain lookups only.
+Production builds do not enable this feature. DTLS cryptographic randomness is
+unchanged; media replay checks exclude encrypted handshake content and its byte
+counts. Added/changed files: `src/lib.rs`, `src/util/mod.rs`,
+`src/util/time_tricks.rs`, `src/streams/mod.rs`, and `Cargo.toml`.

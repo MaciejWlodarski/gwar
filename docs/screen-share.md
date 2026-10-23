@@ -1233,8 +1233,65 @@ timestamps packets **at the SFU's socket send**, against their arrival from
 the publisher. Built as `media/screen/sim.rs`: the screen task's watch
 transport, egress and allocation code driven on a simulated clock against a
 str0m viewer behind a simulated bottleneck (rate, 100 ms queue, loss, 10 ms
-delay), so the timings are exact and the runs repeatable. The relay's `rate=`
-serves the voice acceptance instead. Results and deviations:
+delay). The relay's `rate=` serves the voice acceptance instead.
+
+**Deterministic simulation and CI.** `Sim::with_seed` seeds str0m's thread-local
+non-cryptographic RNG before either peer is built, including MID, SSRC, sequence
+and ICE IDs. The test-only `_gwar_sim` feature orders stream iteration by SSRC
+and maps one process-local `Instant` anchor to a fixed Unix/NTP epoch. All later
+time comes from explicit simulated durations. Link loss keeps independent,
+explicit seeds per direction. The remaining Gwar maps are keyed lookups, not
+scheduling order. DTLS certificates, keys and signatures retain secure entropy;
+the handshake completes before media, and replay comparisons exclude control
+ciphertext/handshake byte counts. The replay regression compares every BWE
+sample, media send/receive trace, allocation change and media counter for the
+same seed, and checks a second seed changes the trace.
+
+The main-CI re-pause after PR #144 was an allocator recovery defect. Seed 1
+reproduces the exact 56.95 s resume, 59.66 s re-pause and 71.75 s second resume.
+Resuming after all-paused silence resets BWE, but previously retained the
+expired assignment ramp. Startup feedback under 20 ms scheduling, periodic
+150 ms stalls and 2% loss briefly lowered the estimate from about 21 Mbps to
+8.4 Mbps. Two failed keyframes then paused otherwise recoverable media. Every
+estimator restart now renews the existing 10 s discovery ramp for active lanes.
+The 400 ms deadline, queue admission, pacing and socket caps still apply, and a
+unit regression verifies a real constraint pauses again after discovery ends.
+The no-repause and received-throughput assertions are unchanged.
+
+Default tests retain representative collapse/startup cases and all 1/5/10 ms
+voice cadences. The full 96-case voice, 60-case startup and 70-case collapse
+matrices are ignored only in the ordinary workspace invocation. CI runs all of
+them in three `rust-screen-sim` shards, required by `ci-ok`, with compilation in
+a separate step. Run a full shard locally with:
+
+```sh
+cargo test -j 4 -p gwar-server --no-default-features --lib full_voice_headroom_matrix -- --ignored
+cargo test -j 4 -p gwar-server --no-default-features --lib full_startup_matrix -- --ignored
+cargo test -j 4 -p gwar-server --no-default-features --lib full_recovery_matrix -- --ignored
+```
+
+Server tests use package `opt-level=1`, with debug assertions and overflow checks
+still enabled. The 1 ms voice case keeps its 10 ms bound; the 5/10 ms steady and
+startup bounds remain the existing cadence-plus-margin formulas. VM gate
+thresholds are unchanged.
+
+Local validation of this fix used `-j 4` and a disposable target directory under
+`/tmp`. The unchanged intermittent-stall test passed 20/20 isolated process
+runs (140 restored-link checks), with identical recovery traces. Three additional
+isolated replay tests produced the same media/estimate fingerprint. The seeded
+pre-fix test failed 3/3 times with the main-CI pause sequence. The complete
+default-feature server unit suite passed 391 tests in 51.12 s using four test
+threads, with the three full matrices explicitly ignored there. All full matrices
+passed separately: 96 voice cases in 58.49 s, 60 startup cases in 36.20 s and
+70 collapse cases in 284.31 s. These are local timings, not GitHub runner timings.
+The 95 default screen unit tests, 10 screen integration tests, 15 watch-link
+integration tests, 11 CI-selection/aggregate tests, workspace/vendor formatting,
+server all-targets clippy with `-D warnings`, and
+`cargo check -p gwar-server --no-default-features --tests` passed. A production
+library check with the simulation feature disabled also passed. The temporary
+target is removed after validation; no VM was accessed.
+
+Results and deviations:
 
 - **A bandwidth collapse** from 10 to 1 Mbps mid-share: no original is sent
   past 400 ms, and the viewer is paused by the allocation rule.

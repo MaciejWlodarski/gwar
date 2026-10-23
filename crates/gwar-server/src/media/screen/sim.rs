@@ -183,7 +183,13 @@ pub struct Sim {
 impl Sim {
     /// A connected viewer behind a downlink of `rate` (none: unconstrained).
     pub fn new(rate: Option<u64>) -> Self {
-        let now = Instant::now();
+        Self::with_seed(rate, 1)
+    }
+
+    /// Seed the thread-local transport IDs before creating either peer. Link loss has
+    /// separate, explicit per-direction seeds, so handshake randomness cannot consume it.
+    pub fn with_seed(rate: Option<u64>, seed: u64) -> Self {
+        let now = str0m::_gwar_sim::start(seed);
         let mut client = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp8(true).build(now);
         client.add_local_candidate(Candidate::host(addr(5000), "udp").unwrap());
         // str0m's random mids can collide within one offer: redraw.
@@ -571,6 +577,64 @@ mod tests {
     }
 
     #[test]
+    fn seeded_simulations_replay_the_same_transport_and_allocation_trace() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+
+        fn replay(seed: u64) -> u64 {
+            let mut sim = Sim::with_seed(Some(20_000_000), seed);
+            sim.down.loss = 0.02;
+            sim.watch("game", 8_000_000, 60, 200_000, None);
+            let mut trace = DefaultHasher::new();
+            while sim.elapsed() < 90 * SECOND {
+                let elapsed = sim.elapsed();
+                sim.down.rate =
+                    Some(if (COLLAPSE..COLLAPSE + 30 * SECOND).contains(&elapsed) { 1_000_000 } else { 20_000_000 });
+                sim.server_interval = if elapsed.as_millis() % 3500 < 150 { 150 * MS } else { 20 * MS };
+                sim.tick();
+                sim.w.egress.estimate().hash(&mut trace);
+            }
+            for sent in &sim.sent {
+                let kind = match sent.kind {
+                    Kind::Original { slot, seq, arrival } => (0, slot, seq, arrival - sim.start),
+                    Kind::Repair { slot, blank } => (1 + u8::from(blank), slot, 0, Duration::ZERO),
+                    Kind::Probe => (3, 0, 0, Duration::ZERO),
+                    // DTLS stays cryptographically random; it is established before
+                    // media starts and its ciphertext is not a simulation input.
+                    Kind::Control => continue,
+                };
+                (sent.at - sim.start, sent.len, kind).hash(&mut trace);
+            }
+            for (at, ssrc, seq, payload) in &sim.received {
+                (*at - sim.start, ssrc, seq, source_of(payload)).hash(&mut trace);
+            }
+            for (at, slot, change) in &sim.changes {
+                (*at - sim.start, slot, format!("{change:?}")).hash(&mut trace);
+            }
+            let c = sim.w.egress.counters;
+            // Certificate/signature lengths can vary during the secure handshake.
+            // Compare all media counters; control ciphertext is deliberately unseeded.
+            (
+                c.original_bytes,
+                c.extra_bytes,
+                c.extras_dropped,
+                c.originals_dropped,
+                c.evicted,
+                c.rejected,
+                c.failed_keyframes,
+                c.pauses,
+                c.escalations,
+            )
+                .hash(&mut trace);
+            trace.finish()
+        }
+
+        let first = replay(1);
+        assert_eq!(first, replay(1), "same seed, packet ordering, clock, estimates and allocation");
+        assert_ne!(first, replay(2), "the transport seed is exercised");
+        println!("deterministic replay fingerprint={first:016x}");
+    }
+
+    #[test]
     fn keyframes_have_room_on_unconstrained_and_20_mbps_viewers() {
         for rate in [None, Some(20_000_000)] {
             let mut sim = Sim::new(rate);
@@ -681,11 +745,21 @@ mod tests {
 
     #[test]
     fn downlink_keeps_voice_headroom_and_one_share_at_one_percent_loss() {
+        voice_headroom(1..=1);
+    }
+
+    #[test]
+    #[ignore = "full seeded matrix runs in the rust-screen-sim CI job"]
+    fn full_voice_headroom_matrix() {
+        voice_headroom(1..=8);
+    }
+
+    fn voice_headroom(seeds: std::ops::RangeInclusive<u64>) {
         let mut failures = Vec::new();
         for interval in [MS, 5 * MS, 10 * MS] {
             for delay in [Duration::ZERO, DELAY] {
                 for loss in [0.0, 0.01] {
-                    for seed in 1..=8 {
+                    for seed in seeds.clone() {
                         let mut sim = Sim::new(Some(5_000_000));
                         sim.server_interval = interval;
                         sim.down.delay = delay;
@@ -757,8 +831,18 @@ mod tests {
 
     #[test]
     fn game_startup_without_outages_never_pauses_across_cadence_and_loss() {
+        game_startup(&[1, 5, 10, 15, 20]);
+    }
+
+    #[test]
+    #[ignore = "full cadence matrix runs in the rust-screen-sim CI job"]
+    fn full_startup_matrix() {
+        game_startup(&(1..=20).collect::<Vec<_>>());
+    }
+
+    fn game_startup(cadences: &[u32]) {
         for loss in [0.01, 0.02, 0.0] {
-            for cadence in [15, 20].into_iter().chain((1..20).filter(|c| *c != 15)) {
+            for &cadence in cadences {
                 let mut sim = Sim::new(Some(20_000_000));
                 sim.server_interval = cadence * MS;
                 sim.down.loss = loss;
@@ -801,6 +885,14 @@ mod tests {
 
     #[test]
     fn game_recovers_after_different_collapse_durations() {
+        for collapse in [15 * SECOND, 30 * SECOND + 100 * MS, 120 * SECOND] {
+            game_recovery(collapse, 20, 0.01, false, COLLAPSE + collapse + 210 * SECOND);
+        }
+    }
+
+    #[test]
+    #[ignore = "full collapse matrix runs in the rust-screen-sim CI job"]
+    fn full_recovery_matrix() {
         // Exercise coarse, lossy scheduling first so recovery failures surface early.
         for loss in [0.01, 0.0] {
             for cadence in [15, 20, 10, 5, 1] {

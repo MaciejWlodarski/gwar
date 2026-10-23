@@ -1628,6 +1628,7 @@ fn restart_estimator(w: &mut Watcher, estimate: u64, now: Instant, caps: &[u64],
     w.rtc.bwe().set_desired_bitrate(Bitrate::bps(w.desired.unwrap_or(0)));
     w.rtc.bwe().set_probe_byte_limit(w.egress.probe_byte_limit());
     w.rtc.bwe().reset(Bitrate::bps(estimate));
+    w.egress.restart_ramp(now);
 }
 
 /// Carries a pause or resume out on the transport. A pause stops everything of the slot's

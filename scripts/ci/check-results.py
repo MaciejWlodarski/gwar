@@ -10,7 +10,7 @@ def check(needs):
     flags = needs["changes"]["outputs"]
     if any(flags.get(name) not in {"true", "false"} for name in ("native", "app")):
         raise ValueError("missing/invalid changed-file outputs")
-    native = {"rust", "rust-voice", "teamspeak"}
+    native = {"rust", "rust-voice", "rust-screen-sim", "teamspeak"}
     app = {"audit", "web", "desktop", "mls-wasm", "denoise-wasm", "native-build",
            "browser-mls", "browser-smoke", "browser-voice", "browser-screen", "browser-private"}
     # An added/renamed job must be wired here and into ci-ok.needs deliberately.
