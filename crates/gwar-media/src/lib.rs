@@ -9,6 +9,7 @@
 
 mod adapters;
 mod frame;
+pub mod sframe;
 pub mod stamp;
 mod synthetic;
 
