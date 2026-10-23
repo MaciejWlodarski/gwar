@@ -625,3 +625,52 @@ fn nonstandard_smooth_failover_recovers_after_drops_at_steady_bandwidth() {
         assert_eq!(sample(&mut c, second, feedback), RateDecision::Encode(replacement));
     }
 }
+
+#[test]
+fn resolution_limited_smooth_failover_stays_at_steady_bandwidth_and_recovers() {
+    let cfg = ControllerConfig {
+        source_size: Size { width: 1930, height: 1080 },
+        ..config(Preset::Smooth, ResolutionTier::P2160)
+    };
+    let encoders = [
+        CodecCaps { max_fps: 10, ..caps(AV1, true) },
+        CodecCaps { max_size: ResolutionTier::P1080.size(), max_fps: 30, ..caps(H264, true) },
+    ];
+    let mut c = RateController::new(cfg, &encoders).unwrap();
+    let prior = encode(c.decision());
+    assert_eq!(prior.encoder.size, cfg.source_size);
+    assert_eq!(prior.encoder.rate, RateControl { max_fps: 10, bitrate_bps: 1_005_208 });
+    let feedback = ControllerFeedback { bandwidth_bps: 1_250_000, ..healthy() };
+    let replacement = encode(sample(&mut c, 0, ControllerFeedback { encoder_failed: true, ..feedback }));
+    assert_eq!(replacement.encoder_index, 1);
+    assert_eq!(replacement.encoder.profile, H264);
+    assert_eq!(replacement.encoder.size, Size { width: 1920, height: 1074 });
+    assert_eq!(replacement.encoder.rate, prior.encoder.rate);
+    // The limited replacement's own nominal need used to be 1,325,925 bps,
+    // causing an unnecessary 720p downscale at 3 s with no recovery by 90 s.
+    for second in 1..=90 {
+        assert_eq!(sample(&mut c, second, feedback), RateDecision::Encode(replacement));
+    }
+    for second in 91..=93 {
+        sample(&mut c, second, ControllerFeedback { encoder_dropped: true, ..feedback });
+    }
+    let degraded = encode(c.decision());
+    assert_eq!(degraded.encoder.size, Size { width: 1280, height: 716 });
+    assert_eq!(degraded.encoder.rate.max_fps, 10);
+    assert!(degraded.encoder.rate.bitrate_bps <= replacement.encoder.rate.bitrate_bps);
+    for second in 94..=103 {
+        assert_eq!(sample(&mut c, second, feedback), RateDecision::Encode(degraded));
+    }
+    assert_eq!(sample(&mut c, 104, feedback), RateDecision::Encode(replacement));
+    // The inherited bitrate ceiling must leave the higher-fps recovery rungs intact.
+    for (start, fps) in [(105, 15), (116, 20), (127, 30)] {
+        let before = c.decision();
+        for second in start..start + 10 {
+            assert_eq!(sample(&mut c, second, healthy()), before);
+        }
+        let recovered = encode(sample(&mut c, start + 10, healthy()));
+        assert_eq!(recovered.encoder_index, 1);
+        assert_eq!(recovered.encoder.size, replacement.encoder.size);
+        assert_eq!(recovered.encoder.rate.max_fps, fps);
+    }
+}

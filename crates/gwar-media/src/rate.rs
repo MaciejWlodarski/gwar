@@ -349,6 +349,13 @@ impl RateController {
                 }
                 Some(step)
             });
+            if let Some(step) = step {
+                // Independent capability limits can select a smaller frame with
+                // a denser tier's nominal rate. Inherit the prior nominal ceiling
+                // before finalizing lower rungs; keep higher-fps recovery intact.
+                let bitrate = &mut plan.steps[step].encoder.rate.bitrate_bps;
+                *bitrate = (*bitrate).min(prior.encoder.rate.bitrate_bps);
+            }
             plan.finalize();
             if let Some(step) = step {
                 self.step = step;
@@ -522,8 +529,21 @@ mod tests {
             controller.step = step;
             controller.bitrate_bps = controller.plans[0].steps[step].encoder.rate.bitrate_bps;
             while controller.active < controller.plans.len() {
+                let prior = controller.plans[controller.active].steps[controller.step];
                 controller.fail_encoder();
                 assert_ladders(&controller, config);
+                if let Some(plan) = controller.plans.get(controller.active) {
+                    // Inspect the nominal rung, not decision()'s transient send rate:
+                    // a cut send rate can hide an inverted pressure/recovery threshold.
+                    let start = plan.steps[controller.step];
+                    assert!(
+                        start.encoder.rate.bitrate_bps <= prior.encoder.rate.bitrate_bps,
+                        "{config:?}: {prior:?} -> {start:?}"
+                    );
+                    assert!(start.encoder.size.width <= prior.encoder.size.width);
+                    assert!(start.encoder.size.height <= prior.encoder.size.height);
+                    assert!(start.encoder.rate.max_fps <= prior.encoder.rate.max_fps);
+                }
             }
         }
     }
@@ -566,32 +586,36 @@ mod tests {
                     let admitted = bitrate(preset, tier, fit_size(source_size, tier), preset_fps(preset, tier));
                     for bitrate_cap_bps in [100_000, admitted, admitted + 100_000, 50_000_000] {
                         let config = ControllerConfig { preset, tier, source_size, bitrate_cap_bps };
-                        for caps in &capabilities {
-                            let encoders = [
-                                CodecCaps {
-                                    profile: CodecProfile::Av1 {
-                                        profile: 0,
-                                        level_idx: 13,
-                                        high_tier: false,
-                                        bit_depth: 8,
+                        // AV1 and H.264 limits vary independently: sharing one
+                        // capability ceiling misses cross-ladder bitrate inversions.
+                        for primary in &capabilities {
+                            for replacement in &capabilities {
+                                let encoders = [
+                                    CodecCaps {
+                                        profile: CodecProfile::Av1 {
+                                            profile: 0,
+                                            level_idx: 13,
+                                            high_tier: false,
+                                            bit_depth: 8,
+                                        },
+                                        ..primary.clone()
                                     },
-                                    ..caps.clone()
-                                },
-                                caps.clone(),
-                                CodecCaps {
-                                    profile: CodecProfile::Vp9 { profile: 0 },
-                                    hardware: true,
-                                    max_size: ResolutionTier::P2160.size(),
-                                    max_fps: 60,
-                                },
-                                CodecCaps {
-                                    profile: CodecProfile::Vp8,
-                                    hardware: false,
-                                    max_size: ResolutionTier::P1080.size(),
-                                    max_fps: 30,
-                                },
-                            ];
-                            assert_failover_ladders(config, &encoders);
+                                    replacement.clone(),
+                                    CodecCaps {
+                                        profile: CodecProfile::Vp9 { profile: 0 },
+                                        hardware: true,
+                                        max_size: ResolutionTier::P2160.size(),
+                                        max_fps: 60,
+                                    },
+                                    CodecCaps {
+                                        profile: CodecProfile::Vp8,
+                                        hardware: false,
+                                        max_size: ResolutionTier::P1080.size(),
+                                        max_fps: 30,
+                                    },
+                                ];
+                                assert_failover_ladders(config, &encoders);
+                            }
                         }
                     }
                 }
