@@ -145,6 +145,30 @@ function rtcConfig(iceServers: IceServer[]): RTCConfiguration {
 
 export type TransportState = "connecting" | "connected" | "failed";
 
+/** What the sharer's encoder does right now: the sharing bar's readout. */
+export interface PublishStats {
+  width: number;
+  height: number;
+  fps: number;
+  /** Bits per second sent over the last poll. */
+  bitrate: number;
+  /** Why the encoder lowered resolution or frame rate (`qualityLimitationReason`). */
+  limitation: "none" | "cpu" | "bandwidth" | "other";
+  /** e.g. "libvpx" (software) or "MediaFoundationVideoEncodeAccelerator"; engines may hide it. */
+  encoder: string | null;
+  /** True for a hardware encoder, when the engine says. */
+  hardware: boolean | null;
+}
+
+type OutboundVideo = RTCOutboundRtpStreamStats & {
+  frameWidth?: number;
+  frameHeight?: number;
+  framesPerSecond?: number;
+  qualityLimitationReason?: string;
+  encoderImplementation?: string;
+  powerEfficientEncoder?: boolean;
+};
+
 /** Reports a peer's connection state, failing it after 5 s disconnected or 15 s without connecting. */
 function watchState(pc: RTCPeerConnection, report: (state: TransportState) => void, alive: () => boolean): () => void {
   let disconnect: ReturnType<typeof setTimeout> | null = null;
@@ -182,6 +206,7 @@ export class ScreenPublisher {
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopWatching: () => void = () => {};
   private closed = false;
+  private sent: { bytes: number; at: number } | null = null;
 
   constructor(private readonly params: PublishParams) {
     this.preset = params.preset;
@@ -223,6 +248,32 @@ export class ScreenPublisher {
   }
 
   get bitrate(): number { return this.applied; }
+
+  /** The encoder's current output, for the sharing bar. */
+  async stats(): Promise<PublishStats | null> {
+    const pc = this.pc;
+    if (!pc || this.closed) return null;
+    try {
+      let out: OutboundVideo | undefined;
+      (await pc.getStats()).forEach(s => {
+        if (s.type === "outbound-rtp" && (s as OutboundVideo).kind === "video") out = s as OutboundVideo;
+      });
+      if (!out) return null;
+      const bytes = out.bytesSent ?? 0, at = out.timestamp;
+      const bitrate = this.sent && at > this.sent.at ? Math.max(0, ((bytes - this.sent.bytes) * 8000) / (at - this.sent.at)) : 0;
+      this.sent = { bytes, at };
+      const reason = out.qualityLimitationReason;
+      return {
+        width: out.frameWidth ?? 0,
+        height: out.frameHeight ?? 0,
+        fps: Math.round(out.framesPerSecond ?? 0),
+        bitrate,
+        limitation: reason === "cpu" || reason === "bandwidth" || reason === "other" ? reason : "none",
+        encoder: out.encoderImplementation || null,
+        hardware: typeof out.powerEfficientEncoder === "boolean" ? out.powerEfficientEncoder : null,
+      };
+    } catch { return null; }
+  }
 
   private async headroom(): Promise<void> {
     const pc = this.pc;

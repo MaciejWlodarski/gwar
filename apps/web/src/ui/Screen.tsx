@@ -15,7 +15,7 @@ import { guestLinkPossible, useCanWatch, useScreenSupport } from "../state/scree
 import { shareOf } from "../state/reducer";
 import { slotOf, useScreen } from "../state/screen";
 import { useSession } from "../state/stores";
-import { PRESET_CHOICES, type PresetChoice } from "../voice/screen";
+import { PRESET_CHOICES, type PresetChoice, type PublishStats } from "../voice/screen";
 import { useChannelPermission, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
 import { Button, Dialog, IconButton, panelCard, TalkingAvatar, Tooltip } from "./kit";
 
@@ -154,6 +154,7 @@ export function SharingBar() {
       <MonitorUp aria-hidden className="size-4 shrink-0" />
       <span className="font-medium">{t("screen.sharingBar")}</span>
       <span data-testid="screen-viewers" className="text-white/85">{watching}</span>
+      {own.phase === "live" && <SenderStats />}
       {linked && own.share && (
         <span data-testid="screen-ts-link" className="flex items-center gap-1.5 text-white/85">
           <span>{`${t("screen.tsLinkOn")} · ${t(countKey(lang, "screen.guests", own.guests), { count: own.guests })}`}</span>
@@ -181,6 +182,37 @@ export function SharingBar() {
       </span>
       {own.preview && <OwnPreview stream={own.stream} className="fixed right-3 bottom-3 z-40 w-56 rounded-md border border-line-strong bg-black shadow-pop" />}
     </div>
+  );
+}
+
+/**
+ * What my encoder sends, and why it is held back: "cpu" means this computer cannot encode the
+ * preset in time, "bandwidth" the connection. The encoder name tells software from hardware.
+ */
+function SenderStats() {
+  const t = useT();
+  const [stats, setStats] = useState<PublishStats | null>(null);
+  useEffect(() => {
+    let live = true;
+    const poll = () => void controller.screen.ownStats().then(s => { if (live) setStats(s); });
+    poll();
+    const timer = setInterval(poll, 2000);
+    return () => { live = false; clearInterval(timer); };
+  }, []);
+  if (!stats || !stats.height) return null;
+  const mbps = (stats.bitrate / 1e6).toFixed(1);
+  const encoder = stats.encoder
+    ? t("screen.encoder", { name: stats.encoder, kind: t(stats.hardware === true ? "screen.encoderHardware" : stats.hardware === false ? "screen.encoderSoftware" : "screen.encoderUnknown") })
+    : undefined;
+  return (
+    <span data-testid="screen-sender-stats" title={encoder} className="flex items-center gap-1.5 text-xs text-white/85 tabular-nums">
+      {`${stats.height}p · ${stats.fps} fps · ${mbps} Mb/s`}
+      {stats.limitation === "cpu" || stats.limitation === "bandwidth" ? (
+        <span className="rounded bg-white/20 px-1.5 leading-5 font-medium text-white">
+          {t(stats.limitation === "cpu" ? "screen.limitedCpu" : "screen.limitedBandwidth")}
+        </span>
+      ) : null}
+    </span>
   );
 }
 
