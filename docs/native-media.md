@@ -158,46 +158,75 @@ that touches it.
 
 ### Adapter traits
 
-The traits are sketches. Their final form is work item
-[B1](#track-b-shared-rust-media-core).
+B1 implements these object-safe contracts in
+[`gwar-media`](../crates/gwar-media/src/adapters.rs). The primary signatures
+are below; the source also documents all output sinks and lifecycle rules.
 
 ```rust
-/// A screen, window or app picked by the user through the platform picker.
 pub trait ScreenSource: Send {
-    fn caps(&self) -> SourceCaps;                 // max size, fps, cursor modes, HDR
+    fn caps(&self) -> SourceCaps;
     fn start(&mut self, cfg: CaptureConfig, sink: Box<dyn FrameSink>) -> Result<()>;
-    fn reconfigure(&mut self, cfg: CaptureConfig) -> Result<()>; // size and fps caps
+    fn reconfigure(&mut self, cfg: CaptureConfig) -> Result<()>;
     fn stop(&mut self);
 }
 
-/// System or application audio, with Gwar's own output excluded.
 pub trait AudioSource: Send {
-    fn exclusion(&self) -> Exclusion;             // OwnProcessExcluded | NotExcluded
+    fn exclusion(&self) -> Exclusion; // OwnProcessExcluded | NotExcluded
     fn start(&mut self, sink: Box<dyn AudioSink>) -> Result<()>; // 48 kHz stereo f32
     fn stop(&mut self);
 }
 
-pub trait VideoEncoder: Send {
-    fn caps(&self) -> EncoderCaps;                // codec, profiles, max size, hardware
+pub trait EncoderControl: Send {
+    fn set_rate(&mut self, rate: RateControl) -> Result<()>;
+    fn request_keyframe(&mut self) -> Result<()>;
+}
+
+pub trait VideoEncoder: EncoderControl {
+    fn caps(&self) -> EncoderCaps;
+    fn start(&mut self, cfg: EncoderConfig, sink: Box<dyn EncodedVideoSink>) -> Result<()>;
     fn encode(&mut self, frame: RawFrame, keyframe: bool) -> Result<()>;
-    fn set_rate(&mut self, bitrate_bps: u32, max_fps: u32);
-    // Output: EncodedFrame { codec, data (Annex B for H.264), keyframe, capture_ts }
+    fn stop(&mut self);
 }
 
 pub trait VideoDecoder: Send {
-    fn decode(&mut self, frame: EncodedFrame) -> Result<()>; // output to a VideoSink
+    fn caps(&self) -> DecoderCaps;
+    fn start(&mut self, profile: CodecProfile, sink: Box<dyn VideoSink>) -> Result<()>;
+    fn decode(&mut self, frame: EncodedFrame) -> Result<()>;
     fn reset(&mut self);
+    fn stop(&mut self);
 }
 
 pub trait VideoSink: Send {
-    fn present(&mut self, frame: DecodedFrame);  // GPU surface where possible
+    fn present(&mut self, frame: DecodedFrame) -> Result<()>;
+    fn on_error(&mut self, error: MediaError);
 }
 ```
 
-`RawFrame` and `DecodedFrame` carry a platform GPU surface (an `IOSurface`, a
-D3D11 texture, a dmabuf, an Android `Surface`) when the adapter can stay on
-the GPU, and CPU planes (NV12, I420, BGRA) otherwise. The zero-copy path is
-the normal one on every platform with a hardware encoder.
+Encoder and decoder output is explicitly attached by `start`; stop fences
+callbacks, and decoder reset discards queued pictures and references before
+returning. Sinks receive terminal asynchronous errors. Callbacks do bounded
+work and must not call back into their producer. `EncoderControl` controls
+one instance; B11/B11a route layer requests to the corresponding instance.
+A profile or size change stops and reconfigures the encoder with a keyframe;
+rate changes can report failure while retaining the prior settings.
+
+[`RawFrame` and `DecodedFrame`](../crates/gwar-media/src/frame.rs) share the
+same representation: validated, reference-counted CPU planes (NV12, I420,
+BGRA), or an `Arc<dyn VideoSurface>` that owns a native resource and can be
+downcast by its platform adapter. Platform wrappers enforce native lifetime,
+thread and synchronization rules. B1 imports no platform APIs. The zero-copy
+path remains the normal hardware path; each platform item supplies its
+surface wrapper and color conversion/tone mapping to SDR.
+
+`FrameInfo` preserves a source-run frame ID and full monotonic capture time
+(`Duration` from a caller-chosen shared epoch). `EncodedFrame` holds complete
+access-unit bytes, a `Codec` (VP8/VP9/H.264/AV1), explicit independent/known/
+unknown reference status, and optional layer/DD metadata even on keyframes.
+`is_keyframe()` means independent random access, with sequence/parameter
+headers required by the codec contract. Unknown dependencies never imply
+usable SVC. Codec profiles retain H.264's constraint byte and AV1's profile,
+level, tier and bit depth. B2 still owns encryption canonicalization, and
+B4 owns RTP timestamp/DD mapping; B1 performs neither.
 
 Two integration styles are allowed:
 
@@ -1794,15 +1823,27 @@ are.
 
 ### Track B: shared Rust media core
 
-**B1. `gwar-media` crate, traits and a test source ★** (S–M)
-- Builds: the crate, the traits of [Adapter traits](#adapter-traits), frame
+**B1. `gwar-media` crate, traits and a test source ★** (S–M) — **built**
+- Built: the crate, the traits of [Adapter traits](#adapter-traits), frame
   types, and a synthetic `ScreenSource` that draws screen-like content (text
   scrolling, a moving block) with a frame-stamp barcode, as spike S3 did.
 - Depends on: nothing.
 - Acceptance: unit tests for the stamp encoder and reader (round trip
   through scaling by 0.5 and 2); docs on each trait; builds on all CI
   runners; no platform dependency in the crate's default features.
-- Now: yes.
+- Implementation: std-only, no unsafe code; deterministic unpaced `render`
+  and a paced worker with interruptible stop, acknowledged reconfiguration,
+  owned output and terminal-error delivery. Tests cover padded/odd CPU
+  layouts, reference lifetimes, stamp corruption, time wrap, source
+  stop/restart/drop and output failure. The existing Rust workspace suite
+  runs the crate; the desktop matrix also tests it on Linux/macOS/Windows.
+- Stamp: S3's 20-bit capture-millisecond payload, with a marker and CRC-8
+  added (32 cells total). S3's original code was deleted; the browser's
+  later counter-based helper in `apps/web/e2e/screen-source.mjs` informed
+  the normalized geometry, but is not the same wire format. The reader
+  supports BGRA and YUV luma; it is for loopback with one shared epoch.
+- Status: built; codecs, capture adapters, transports and measurement reports
+  remain the later items below.
 
 **B2. Video SFrame layouts in Rust** (M)
 - Builds: VP9 whole-frame, VP8 clear-prefix and H.264 NAL-aware layouts
@@ -1912,7 +1953,7 @@ are.
     the encoder's rate follows the estimate down within 2 s and back up
     within 10 s, without a pause;
   - start → stop → start creates a new transport and new SSRCs.
-- Now: after B1 and B3; H.264 after A2.
+- Now: after B3; H.264 after A2.
 
 **B5. Native watch transport** (L)
 - Builds: `screen.watch.offer` from Rust: four `recvonly` slots, runs,
@@ -1924,7 +1965,7 @@ are.
   play on a native viewer, with the frame stamp read back after decoding;
   a slot reassigned to another share starts at a keyframe; four slots at
   once; a run restart recovers all slots.
-- Now: after B1.
+- Now: after B3 (B1 is built).
 
 **B6. Rate and quality controller ★** (S–M)
 - Builds: pure logic mapping preset, tier, estimate and encoder or capture
@@ -2088,12 +2129,12 @@ Each item adds its platform's manual checklist to F5 and its numbers to F2.
 
 | Item | What it builds | Depends on | Size | Now |
 | --- | --- | --- | --- | --- |
-| **C1. macOS video** | ScreenCaptureKit with `SCContentSharingPicker`, Gwar's windows excluded, `IOSurface` to VideoToolbox H.264 in the two [Apple encoder configurations](#hardware-encoders-per-platform) (`compat` Constrained Baseline by default, `low-latency` High only for viewers that accept it), the AVCC to Annex B conversion with SPS and PPS from the format description inserted before every IDR (shared with C9) | B1, B4 | L | B1 first |
-| **C2. macOS audio** | `capturesAudio` + `excludesCurrentProcessAudio`; Core Audio process tap as fallback; webview sounds handled | B1; B8 to send | M | B1 first |
-| **C3. Windows video** | Windows.Graphics.Capture (Gwar picker through interop, system picker as option), frame-rate limiting, HDR to SDR, `WDA_EXCLUDEFROMCAPTURE`, Media Foundation H.264 and probed AV1 hardware MFTs; record vendor/driver availability and temporal-mode support | B1, B4; A2b for AV1 | L | B1 first |
-| **C4. Windows audio** | WASAPI process loopback excluding Gwar's process tree; version detection; no fallback to the system mix without the explicit setting | B1; B8 to send | M | B1 first |
-| **C5. Linux video** | portal ScreenCast (`ashpd`), restore tokens, PipeWire dmabuf, VA-API or NVENC H.264/AV1 after per-device probing; software fallback excludes AV1 encode | B1, B3, B4; A2b for AV1 | L | B1 first |
-| **C6. Linux audio** | PipeWire per-application links excluding Gwar's nodes; PulseAudio-only and Flatpak detection | B1; B8 to send | M | B1 first |
+| **C1. macOS video** | ScreenCaptureKit with `SCContentSharingPicker`, Gwar's windows excluded, `IOSurface` to VideoToolbox H.264 in the two [Apple encoder configurations](#hardware-encoders-per-platform) (`compat` Constrained Baseline by default, `low-latency` High only for viewers that accept it), the AVCC to Annex B conversion with SPS and PPS from the format description inserted before every IDR (shared with C9) | B1, B4 | L | B1 built |
+| **C2. macOS audio** | `capturesAudio` + `excludesCurrentProcessAudio`; Core Audio process tap as fallback; webview sounds handled | B1; B8 to send | M | B1 built |
+| **C3. Windows video** | Windows.Graphics.Capture (Gwar picker through interop, system picker as option), frame-rate limiting, HDR to SDR, `WDA_EXCLUDEFROMCAPTURE`, Media Foundation H.264 and probed AV1 hardware MFTs; record vendor/driver availability and temporal-mode support | B1, B4; A2b for AV1 | L | B1 built |
+| **C4. Windows audio** | WASAPI process loopback excluding Gwar's process tree; version detection; no fallback to the system mix without the explicit setting | B1; B8 to send | M | B1 built |
+| **C5. Linux video** | portal ScreenCast (`ashpd`), restore tokens, PipeWire dmabuf, VA-API or NVENC H.264/AV1 after per-device probing; software fallback excludes AV1 encode | B1, B3, B4; A2b for AV1 | L | B1 built |
+| **C6. Linux audio** | PipeWire per-application links excluding Gwar's nodes; PulseAudio-only and Flatpak detection | B1; B8 to send | M | B1 built |
 | **C7. Android video** | MediaProjection consent per session, foreground service, virtual display into a MediaCodec `Surface`, H.264 and hardware AV1 only if verified on the device, encoded frames/dependencies to Rust | B9; the Android client; A2b for AV1 | M–L | no |
 | **C8. Android audio** | `AudioPlaybackCapture` (media, game, unknown), Gwar's own players set to `ALLOW_CAPTURE_BY_SYSTEM` | B9; the Android client | S–M | no |
 | **C9. iOS video** | ScreenCaptureKit on iOS 27 (after verification), or the broadcast extension with VideoToolbox in the extension; C1's Apple encoder configurations and Annex B conversion with SPS/PPS insertion; no software H.264 | B9, C1's Apple adapter; an iOS client | L | no |
@@ -2411,9 +2452,13 @@ the OS version, hardware and build, as screen-share PR 1's table does.
 
 ### Latency method
 
-- **Frame stamp.** The source draws a 20-bit barcode with its capture time;
-  the viewer reads it after decode and compares with the shared clock, as
-  spike S3 did. Loopback only (one clock).
+- **Frame stamp.** B1 draws 20 low bits of capture milliseconds with a
+  4-bit marker and CRC-8 (32 cells across the top quarter). The viewer reads
+  it after decode and compares with the same monotonic epoch. The payload
+  wraps every 2^20 ms; only delays below half that period are unambiguous.
+  Full capture timestamps also remain in frame metadata. This extends S3's
+  timestamp technique and differs from the browser e2e ID/counter stamp.
+  Loopback only (one clock); cross-host synchronization is F1 work.
 - **Physical.** For real displays: one camera filming both screens with a
   millisecond clock on the sharer's screen, or a photodiode on each screen.
   Used for release checks, not in CI.

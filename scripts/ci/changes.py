@@ -9,7 +9,8 @@ def select(paths, full=False):
     native = app = full
     for path in paths:
         # Shared inputs win over the documentation/web exceptions below.
-        if path.startswith((".github/", "scripts/", "apps/web/src/proto/")):
+        # gwar-media runs in the native Rust suite and on every desktop OS.
+        if path.startswith((".github/", "scripts/", "apps/web/src/proto/", "crates/gwar-media/")):
             return {"native": True, "app": True}
         name = PurePosixPath(path).name
         if "lock" in name or name in {"Cargo.toml", "package.json"}:

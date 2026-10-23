@@ -1,0 +1,10 @@
+[package]
+name = "gwar-media"
+version = "0.1.0"
+description = "Platform-neutral native media adapters and deterministic screen fixtures"
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+# Intentionally std-only. OS APIs and codecs belong in opt-in adapters.
+[dependencies]
