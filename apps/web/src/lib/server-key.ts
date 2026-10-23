@@ -18,7 +18,7 @@ function currentPage(): PageContext {
  * another name) match too; otherwise by the WebSocket URL the address opens. A TeamSpeak server is
  * compared by `host:port`. What does not parse compares as typed (trimmed, lower case).
  */
-export function serverKey(server: ServerRef, page: PageContext = currentPage(), pins: PinStore | null = storedPins()): string {
+export function serverKey(server: ServerRef, page: PageContext = currentPage(), pins: PinStore | null = serverPins): string {
   const kind = server.kind ?? "gwar";
   const typed = server.address.trim().toLowerCase();
   if (kind === "teamspeak") {
@@ -35,10 +35,6 @@ export function serverKey(server: ServerRef, page: PageContext = currentPage(), 
 
 export function sameServer(a: ServerRef, b: ServerRef): boolean {
   return serverKey(a) === serverKey(b);
-}
-
-function storedPins(): PinStore | null {
-  return typeof localStorage === "undefined" ? null : serverPins;
 }
 
 function pinned(pins: PinStore | null, endpoint: string): string | undefined {

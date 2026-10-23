@@ -5,7 +5,7 @@ import { ConnectionLostError, RequestError } from "../net/connection";
 import type { Identity } from "../net/identity";
 import { encodeBase64Url } from "../net/base64url";
 import { DELETION_TEXT, MessageVerifier, fullyVerified, notificationAllowed, sameMessageIdentity, signMessage } from "../net/message-signature";
-import { withChannelLifecycle } from "../net/channel-lifecycle";
+import { withFreshChannelLifecycle } from "../net/channel-lifecycle";
 import { sameAttachments } from "../net/sealed-file";
 import type { Attachment } from "../proto/Attachment";
 import type { MessageSignature } from "../proto/MessageSignature";
@@ -321,7 +321,7 @@ export class SealedConversations {
       if ("ok" in result) {
         Object.assign(msg, result.ok);
         const serverKey = this.link.serverKey!;
-        const verification = withChannelLifecycle(await this.verifier.verify(msg, { serverKey, target: row.conversation,
+        const verification = await withFreshChannelLifecycle(await this.verifier.verify(msg, { serverKey, target: row.conversation,
           participants: peer ? [this.uid, peer] : undefined, sealed: { group: row.group, epoch: row.epoch } }), serverKey, row.conversation);
         this.check(); if (epoch !== useSession.getState().epoch || wasRemoved() || gone()) return;
         if (verification.continuity === "fork" || verification.continuity === "rollback") return;

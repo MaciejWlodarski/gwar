@@ -51,6 +51,11 @@ is the development exception.
 - **Speech gate on the server.** Browsers send their audio level (RFC 6464);
   the server drops silence, drives the "talking" indicator and ends talk spurts
   for TeamSpeak clients.
+- **Data moves forward on its own.** Every store the server, Gwar Connect, the
+  desktop app and the web app keep has a version; an update upgrades older data
+  in place and an older version refuses newer data instead of misreading or
+  wiping it ([data-migrations.md](data-migrations.md)). How clients and servers
+  of different versions talk to each other: [compatibility.md](compatibility.md).
 
 ## The `gwar/4` protocol
 
@@ -105,12 +110,17 @@ The server's Ed25519 seed is generated once, persisted atomically as
 `server-key.ed25519` in its data directory (0600 on Unix), and never logged.
 `gwar-server --data-dir <dir> server-key` prints the public key. Back up the seed
 with the database; losing it changes the authenticated server epoch.
-The web/desktop client keeps `{server_pk, first_seen}` in localStorage under
-`gwar.server-pin:<canonical endpoint>`. TOFU without a pin or trusted invite
-identifies a first-contact candidate; proof verification precedes pinning.
+The web/desktop client keeps `{server_pk, first_seen}` in the `gwar-local`
+IndexedDB database under `gwar.server-pin:<canonical endpoint>`
+([data-migrations.md](data-migrations.md)). TOFU without a pin or trusted invite
+identifies a first-contact candidate; proof verification precedes pinning, and
+the pin commits in one transaction before the connection is used. Pins that
+cannot be read (no IndexedDB, a newer version's database) trust no key: the
+connection fails with a storage error.
 Invite links include `server_key=<full public key>`, which must match the
 challenge. A pin mismatch is a blocking English/Polish dialog with both keys
-and an explicit dangerous forget-and-trust action. An invite mismatch blocks
+and an explicit dangerous trust action, which replaces the pin only once the
+new key is proven (the address is never left unpinned meanwhile). An invite mismatch blocks
 without that override. The verified key is exposed as `Connection.serverKey`
 (native: `Connection.server_key`) for message context and shown under Server menu > Server key.
 Native clients require an expected key unless first-contact trust is explicitly
@@ -370,9 +380,11 @@ rollback/clearing is outside
 this protection; missing predecessors remain **continuity unproven**. Visible
 message/context fingerprints share cached and in-flight verification. Thread
 updates check only new fingerprints; the minute timer refreshes time-dependent
-authorization notes with one bulk read and no checkpoint writes. Before the
-release there are no upgrades: a database of an older schema does not open, and
-storage counts as unavailable (with the reason in diagnostics). A failed storage
+authorization notes with one bulk read and no checkpoint writes. An older
+database is upgraded in place, step by step, keeping its checkpoints
+([data migrations](data-migrations.md)); one of a newer version, or an upgrade
+that fails, leaves it as it is and storage counts as unavailable (with the
+reason in diagnostics). A failed storage
 transaction is tried once more on a new connection; a tab blocking an upgrade makes
 storage unavailable at once rather than pending. A message checked while storage was
 unavailable shows **checkpoints unavailable** until storage works again: then (at

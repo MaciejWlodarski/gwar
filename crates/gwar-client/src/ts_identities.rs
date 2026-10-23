@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::ts_identity::{self, Identity};
@@ -110,11 +110,49 @@ impl List {
     }
 }
 
-/// The list stored at `path`; `None` if there is none.
+/// The file's format, its `version` (docs/data-migrations.md); a file without one is version 1.
+pub const FORMAT: u64 = 1 + UPGRADES.len() as u64;
+/// `UPGRADES[i]` takes a file's JSON from version i + 1 to i + 2 as it is read; the next save
+/// stores the result.
+const UPGRADES: &[fn(serde_json::Value) -> Result<serde_json::Value>] = &[];
+
+/// The list stored at `path`; `None` if there is none. A file of a newer format is refused (and
+/// left as it is).
 pub fn load(path: &Path) -> Result<Option<List>> {
     match std::fs::read(path) {
         Ok(data) => {
-            let list: List = serde_json::from_slice(&data).context("invalid TeamSpeak identities file")?;
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&data).context("invalid TeamSpeak identities file")?;
+            let version = match value.get("version") {
+                None => 1,
+                Some(v) => v.as_u64().filter(|v| *v >= 1).context("invalid TeamSpeak identities file version")?,
+            };
+            if version > FORMAT {
+                bail!(
+                    "{} was saved by a newer version of Gwar (format {version}; this version knows up to {FORMAT}): \
+                     update Gwar; the file was not changed",
+                    path.display()
+                );
+            }
+            for upgrade in &UPGRADES[version as usize - 1..] {
+                value = upgrade(value)?;
+            }
+            if let Some(object) = value.as_object_mut() {
+                object.remove("version");
+            }
+            let list: List = serde_json::from_value(value).context("invalid TeamSpeak identities file")?;
+            // A stored key this version cannot read is refused with the whole file, never dropped:
+            // normalizing would lose it, and the next save would make that final. (Imports, through
+            // `from_texts`, skip what they cannot read.)
+            for entry in &list.identities {
+                entry.identity().with_context(|| {
+                    format!(
+                        "{}: TeamSpeak identity {:?} cannot be read by this version of Gwar; the file was not changed",
+                        path.display(),
+                        entry.name
+                    )
+                })?;
+            }
             Ok(Some(list.normalized()))
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -122,9 +160,11 @@ pub fn load(path: &Path) -> Result<Option<List>> {
     }
 }
 
-/// Stores `list` at `path`, private to the user and replaced in one step.
+/// Stores `list` at `path` (with its format), private to the user and replaced in one step.
 pub fn save(path: &Path, list: &List) -> Result<()> {
-    ts_identity::write_private(path, &serde_json::to_vec(list)?)
+    let mut value = serde_json::to_value(list)?;
+    value.as_object_mut().expect("a list is an object").insert("version".into(), FORMAT.into());
+    ts_identity::write_private(path, &serde_json::to_vec(&value)?)
 }
 
 #[cfg(test)]
@@ -225,5 +265,60 @@ mod tests {
         assert_eq!(repaired.identities.len(), 1);
         assert_eq!(repaired.identities[0].uid, uid(&a));
         assert_eq!(repaired.default.as_deref(), Some(uid(&a).as_str()));
+    }
+
+    /// A file as each format left it (`{identity}` is a real identity's text), one per format
+    /// (docs/data-migrations.md).
+    const FIXTURES: &[&str] = &[
+        // 1: v0.1.0 on, without a version.
+        r#"{"default":"{uid}","identities":[{"uid":"{uid}","name":"Main","identity":"{identity}"}]}"#,
+    ];
+
+    #[test]
+    fn every_format_loads_into_the_current_one_and_saves_as_it() {
+        assert_eq!(FIXTURES.len() as u64, FORMAT, "one fixture per format");
+        let dir = TempDir::new("ts-list");
+        let a = generate();
+        for (index, fixture) in FIXTURES.iter().enumerate() {
+            let path = dir.join(&format!("v{}.json", index + 1));
+            std::fs::write(&path, fixture.replace("{uid}", &uid(&a)).replace("{identity}", &export(&a))).unwrap();
+            let list = load(&path).unwrap().unwrap();
+            assert_eq!((list.identities[0].name.as_str(), list.default.as_deref()), ("Main", Some(uid(&a).as_str())));
+            save(&path, &list).unwrap();
+            let saved: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(saved["version"], FORMAT);
+            assert_eq!(load(&path).unwrap().unwrap(), list);
+        }
+    }
+
+    #[test]
+    fn a_file_of_a_newer_format_is_refused_and_left_alone() {
+        let dir = TempDir::new("ts-list");
+        let path = dir.join("list.json");
+        let text = format!(r#"{{"version":{},"lists":[]}}"#, FORMAT + 1);
+        std::fs::write(&path, &text).unwrap();
+        let error = load(&path).unwrap_err().to_string();
+        assert!(error.contains("newer version of Gwar"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    #[test]
+    fn a_file_with_an_unreadable_identity_is_refused_and_left_alone() {
+        let dir = TempDir::new("ts-list");
+        let path = dir.join("list.json");
+        let a = generate();
+        let text = serde_json::json!({
+            "version": 1,
+            "default": uid(&a),
+            "identities": [
+                {"uid": uid(&a), "name": "a", "identity": export(&a)},
+                {"uid": "future", "name": "Main", "identity": "a key of a format this version does not know"},
+            ],
+        })
+        .to_string();
+        std::fs::write(&path, &text).unwrap();
+        let error = format!("{:#}", load(&path).unwrap_err());
+        assert!(error.contains("\"Main\" cannot be read"), "{error}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
     }
 }

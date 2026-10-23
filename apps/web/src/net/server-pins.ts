@@ -1,4 +1,5 @@
 import { decodeFixed, normalizeEndpoint, serverPublicKey } from "./handshake";
+import { localState } from "../lib/local-state";
 
 export interface ServerPin {
   server_pk: string;
@@ -6,10 +7,18 @@ export interface ServerPin {
 }
 
 export interface PinStore {
+  /** Resolves once the pins can be read synchronously (or have failed to load: `load` then throws). */
+  ready?(): Promise<void>;
+  /** As this tab last read it; throws when the pins cannot be read: nothing is trusted then. */
   load(endpoint: string): ServerPin | undefined;
-  /** First contact commits only if the concurrent stored pin is absent or matches. */
-  commit(endpoint: string, key: string): void;
-  forget(endpoint: string, previous: string): void;
+  /** Read from the database now (a transaction); rejects when the pins cannot be read. */
+  loadStored(endpoint: string): Promise<ServerPin | undefined>;
+  /**
+   * After the server proved `key`, in one transaction: first contact commits only if no pin is stored, and
+   * a stored pin must match. With `replacing` (the user accepted `key` in place of that key) a pin still
+   * holding `replacing` is replaced by `key`. A pin is never removed: the address is never without one.
+   */
+  commit(endpoint: string, key: string, replacing?: string): Promise<void>;
 }
 
 export class ServerIdentityChanged extends Error {
@@ -19,31 +28,54 @@ export class ServerIdentityChanged extends Error {
 }
 
 const PREFIX = "gwar.server-pin:";
+
+function parsePin(value: string): ServerPin {
+  const pin: ServerPin = JSON.parse(value);
+  decodeFixed(pin.server_pk, 32);
+  if (!Number.isSafeInteger(pin.first_seen) || pin.first_seen < 0) throw new Error("invalid server pin");
+  return pin;
+}
+
+/** Pins in the device's security state (lib/local-state.ts). */
 export const serverPins: PinStore = {
+  ready: () => localState.load(),
   load(endpoint) {
-    const value = localStorage.getItem(PREFIX + normalizeEndpoint(endpoint));
-    if (value === null) return undefined;
-    const pin: ServerPin = JSON.parse(value);
-    decodeFixed(pin.server_pk, 32);
-    if (!Number.isSafeInteger(pin.first_seen) || pin.first_seen < 0) throw new Error("invalid server pin");
-    return pin;
+    const value = localState.get(PREFIX + normalizeEndpoint(endpoint));
+    return value === undefined ? undefined : parsePin(value);
   },
-  commit(endpoint, key) {
-    const old = this.load(endpoint);
-    if (old && old.server_pk !== key) throw new ServerIdentityChanged(endpoint, old.server_pk, key, "pin");
-    if (!old) localStorage.setItem(PREFIX + normalizeEndpoint(endpoint), JSON.stringify({ server_pk: key, first_seen: Date.now() }));
+  async loadStored(endpoint) {
+    const value = await localState.read(PREFIX + normalizeEndpoint(endpoint));
+    return value === undefined ? undefined : parsePin(value);
   },
-  forget(endpoint, previous) {
-    if (this.load(endpoint)?.server_pk === previous) localStorage.removeItem(PREFIX + normalizeEndpoint(endpoint));
+  async commit(endpoint, key, replacing) {
+    await localState.update(PREFIX + normalizeEndpoint(endpoint), (stored) => {
+      const pin = stored === undefined ? undefined : parsePin(stored);
+      if (pin?.server_pk === key) return undefined;
+      if (pin === undefined || (replacing !== undefined && pin.server_pk === replacing)) return JSON.stringify({ server_pk: key, first_seen: Date.now() });
+      throw new ServerIdentityChanged(endpoint, pin.server_pk, key, "pin");
+    });
   },
 };
 
-export function checkCandidate(endpoint: string, candidate: string, store: PinStore, inviteKey?: string): void {
+function checkPin(endpoint: string, candidate: string, pin: ServerPin | undefined, replacing?: string): void {
+  if (pin && pin.server_pk !== candidate && !(replacing !== undefined && pin.server_pk === replacing)) throw new ServerIdentityChanged(endpoint, pin.server_pk, candidate, "pin");
+}
+
+/** Before the hello: `candidate` must match the invite's key and the pin (or be the accepted replacement of it). */
+export function checkCandidate(endpoint: string, candidate: string, store: PinStore, inviteKey?: string, replacing?: string): void {
   serverPublicKey(candidate);
   if (inviteKey !== undefined) {
     decodeFixed(inviteKey, 32);
     if (inviteKey !== candidate) throw new ServerIdentityChanged(endpoint, inviteKey, candidate, "invite");
   }
-  const pin = store.load(endpoint);
-  if (pin && pin.server_pk !== candidate) throw new ServerIdentityChanged(endpoint, pin.server_pk, candidate, "pin");
+  checkPin(endpoint, candidate, store.load(endpoint), replacing);
+}
+
+/**
+ * The same check against the pin as stored now, right before signing: this tab's view may miss another
+ * tab's change (a lost notification), and a hello signed for a key the user replaced would disclose this
+ * identity to it. The commit after the proof checks again, in its own transaction.
+ */
+export async function checkStoredCandidate(endpoint: string, candidate: string, store: PinStore, replacing?: string): Promise<void> {
+  checkPin(endpoint, candidate, await store.loadStored(endpoint), replacing);
 }

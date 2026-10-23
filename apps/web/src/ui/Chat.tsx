@@ -1,6 +1,6 @@
 import { MessageVerificationCache } from "../net/message-verification-cache";
 import { messageStorage } from "../net/message-storage";
-import { withChannelLifecycle } from "../net/channel-lifecycle";
+import { channels, withChannelLifecycle, withFreshChannelLifecycle } from "../net/channel-lifecycle";
 import { MessageVerificationIndicator, MessageVerificationPending } from "./MessageVerification";
 import { messageFingerprint, fullyVerified, DELETION_TEXT, type MessageVerification } from "../net/message-signature";
 import { AlertCircle, ArrowDown, Check, Hash, Headphones, Loader2, Lock, Menu, Megaphone, MessageSquare, Paperclip, Pencil, RotateCw, Send, Trash2, Users, X } from "lucide-react";
@@ -393,7 +393,13 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
     const timer = setInterval(() => setAuthTick((n) => n + 1), 60_000), unsubscribe = messageStorage.subscribe(() => setAuthTick((n) => n + 1));
     return () => { clearInterval(timer); unsubscribe(); };
   }, []);
+  // The verifier's results, before the channel lifecycle: that is applied as they are shown, so a deletion
+  // (here or in another tab) or a view of the record too old to answer from qualifies them at once.
   const [verified, setVerified] = useState<Map<number, { fingerprint: string; state: MessageVerification }>>(new Map());
+  const [lifecycleTick, setLifecycleTick] = useState(0);
+  useEffect(() => (serverKey ? channels.subscribe(serverKey, () => setLifecycleTick((n) => n + 1)) : undefined), [serverKey]);
+  /** What is shown: a new value whenever a result or the lifecycle's answer may have changed. */
+  const shown = useMemo(() => ({ verified, lifecycle: lifecycleTick }), [verified, lifecycleTick]);
   const [signingUid, setSigningUid] = useState<string | undefined>();
   const verifier = useMemo(() => new MessageVerificationCache(), [serverKey, key]);
   // A new verifier starts with no results; reset while rendering so no frame shows the old ones.
@@ -437,7 +443,9 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
         });
       };
       await Promise.all(rows.map(async ({ msg, ctx, fingerprint }) => {
-        const state = withChannelLifecycle(await verifier.verify(msg, ctx), ctx.serverKey, ctx.target);
+        const state = await verifier.verify(msg, ctx);
+        // Read the channel record again before the first showing; the lifecycle is applied when shown.
+        await withFreshChannelLifecycle(state, ctx.serverKey, ctx.target);
         if (!active) return;
         pending.push([msg.id, { fingerprint, state }]);
         timer ??= setTimeout(flush, 16);
@@ -450,9 +458,10 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
   const rows = useMemo(() => buildRows((thread?.items ?? []).filter((i) => {
     if (unshared(i)) return false;
     if (i.kind !== "msg" || i.msg.text !== DELETION_TEXT) return true;
-    const entry = verified.get(i.msg.id);
-    return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target: targetFor(i.msg), sealed: i.sealed ? { group: i.sealed.group, epoch: i.sealed.epoch } : undefined }) || !quietDeletion(entry.state);
-  })), [thread?.items, verified, serverKey, key, signingUid, unshared]);
+    const entry = shown.verified.get(i.msg.id);
+    const target = targetFor(i.msg);
+    return entry?.fingerprint !== messageFingerprint(i.msg, { serverKey, target, sealed: i.sealed ? { group: i.sealed.group, epoch: i.sealed.epoch } : undefined }) || !quietDeletion(withChannelLifecycle(entry.state, serverKey, target));
+  })), [thread?.items, shown, serverKey, key, signingUid, unshared]);
   const ref = useRef<HTMLDivElement>(null);
   const stick = useRef(true);
   const restoreFrom = useRef<number | null>(null);
@@ -470,10 +479,10 @@ export function MessageList({ threadKey, editLastRef }: { threadKey: ThreadKey; 
   const editing = useUi((s) => s.editing);
 
   const verificationFor = useCallback((item: Extract<ChatItem, { kind: "msg" }>) => {
-    const entry = verified.get(item.msg.id);
+    const entry = shown.verified.get(item.msg.id);
     const ctx = { serverKey, target: messageTarget(key, item.msg.author_uid, signingUid), sealed: item.sealed ? { group: item.sealed.group, epoch: item.sealed.epoch } : undefined };
-    return entry?.fingerprint === messageFingerprint(item.msg, ctx) ? entry.state : undefined;
-  }, [verified, serverKey, key, signingUid]);
+    return entry?.fingerprint === messageFingerprint(item.msg, ctx) ? withChannelLifecycle(entry.state, serverKey, ctx.target) : undefined;
+  }, [shown, serverKey, key, signingUid]);
   useLayoutEffect(() => {
     if (!editLastRef) return;
     editLastRef.current = () => {

@@ -9,6 +9,9 @@ export const pl: Record<Key, string> = {
   "common.delete": "Usuń",
   "common.copy": "Kopiuj",
 
+  "storage.newer.title": "Gwar nie może otworzyć zapisanych danych",
+  "storage.newer.body": "Nowsza wersja Gwar zapisała dane w tej przeglądarce lub aplikacji, a ta wersja nie potrafi ich odczytać. Niczego nie zmieniono. Odśwież stronę albo zainstaluj najnowszy Gwar.",
+
   "nav.servers": "Serwery",
   "nav.channels": "Kanały i serwery",
 
@@ -32,7 +35,7 @@ export const pl: Record<Key, string> = {
   "member.uid": "Pełny identyfikator użytkownika",
   "member.handleChanged": "@{handle} należał wcześniej do innego konta. Handle może przejść na inne konto, więc to może być ktoś inny. Jeśli wiesz, że to ta sama osoba (np. na nowym koncie), zaakceptuj.",
   "member.acceptHandle": "Akceptuj to konto",
-  "member.acceptNotSaved": "Zaakceptowano na teraz, ale przeglądarka nie pozwoliła tego zapisać; po odświeżeniu pytanie wróci.",
+  "member.acceptNotSaved": "Nie zaakceptowano: przeglądarka nie pozwoliła tego zapisać. Odśwież stronę i spróbuj ponownie.",
   "badge.connectAccount": "Konto Gwar Connect: @{handle}",
   "badge.handleChanged": "@{handle}: ten handle należał wcześniej do innego konta",
 
@@ -520,6 +523,10 @@ export const pl: Record<Key, string> = {
   "err.connect.rejected": "Serwer odrzucił połączenie. Sprawdź pseudonim i spróbuj ponownie.",
   "err.connect.certificate_expired": "Certyfikat konta Gwar na tym urządzeniu wygasł, więc serwer go odrzuca. Otwórz Ustawienia → Konto i odnów go hasłem.",
   "err.connect.protocol": "Ten serwer używa innej wersji protokołu. Zaktualizuj klienta lub serwer.",
+  "err.connect.storage_newer": "Nowsza wersja Gwar zapisała tożsamość lub logowanie tego urządzenia, a ta wersja nie potrafi ich odczytać. Niczego nie zmieniono: odśwież stronę albo zainstaluj najnowszy Gwar.",
+  "err.connect.identity_unreadable": "Ta wersja Gwar nie potrafi odczytać tożsamości zapisanej na tym urządzeniu. Zostawiono ją bez zmian: zaktualizuj Gwar albo zaimportuj kopię w Ustawieniach → Tożsamość.",
+  "err.connect.trust_storage": "Nie udało się odczytać ani zapisać kluczy serwerów zapamiętanych na tym urządzeniu, więc Gwar nie ufa teraz żadnemu kluczowi serwera. Odśwież stronę; jeśli zapisała je nowsza wersja Gwar, zaktualizuj ją.",
+  "err.connect.identity_storage": "Nie udało się wczytać tożsamości zapisanej na tym urządzeniu, bo zawiódł jej magazyn danych. Odśwież stronę; jeśli to się powtarza, przeglądarka może blokować dane witryn.",
   "err.connect.identity": "Przeglądarka nie może tu utworzyć bezpiecznej tożsamości. Użyj aktualnej przeglądarki przez https (lub localhost).",
   "err.connect.address": "Ten adres serwera wygląda niepoprawnie.",
   "err.addr.empty": "Wpisz adres serwera.",

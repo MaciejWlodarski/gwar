@@ -11,7 +11,7 @@ import { AccountTab } from "./AccountSettings";
 import { isDesktop } from "../platform";
 import { notificationsPermission, requestNotifications, type NotificationsPermission } from "../platform/notify";
 import { acceleratorFromEvent, acceleratorParts } from "../platform/desktop";
-import { controller, describeVoiceError } from "../state/controller";
+import { controller, describeVoiceError, identityFailure } from "../state/controller";
 import { useSettings, type Language, type Theme } from "../state/settings";
 import { useSession, useUi, useVoice, type SettingsTab } from "../state/stores";
 import { VoiceError } from "../voice/engine";
@@ -437,7 +437,11 @@ function IdentityTab() {
         setPublicKey(accountKeyOf(id));
         setUid(u);
       })
-      .catch(() => alive && useUi.getState().toast("error", tNow("settings.identityUnavailable")));
+      .catch((e: unknown) => {
+        if (!alive) return;
+        const failure = identityFailure(e);
+        useUi.getState().toast("error", failure === "identity_storage" ? tNow("settings.identityUnavailable") : tNow(`err.connect.${failure}`));
+      });
     return () => {
       alive = false;
     };

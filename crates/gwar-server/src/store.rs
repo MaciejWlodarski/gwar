@@ -533,7 +533,126 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (ban, teamspeak)
     );
     "#,
+    // Databases of v0.1.0 that servers from v0.1.2 on migrated without converting their roles; the
+    // conversion is in migrate_data.
+    r#"
+    -- Repair: role permissions still named as in roles version 1
+    UPDATE groups SET permissions = permissions WHERE 0;
+    "#,
 ];
+
+/// What a migration changes in the rows themselves, run right after its SQL in its transaction.
+fn migrate_data(tx: &Connection, migration: &str) -> Result<()> {
+    if migration.contains("ADD COLUMN chunk_hash") {
+        let mut stmt = tx.prepare("SELECT id,chunk FROM mls_history")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            let chunk: Vec<u8> = row.get(1)?;
+            tx.execute(
+                "UPDATE mls_history SET chunk_hash=?2 WHERE id=?1",
+                params![id, Sha256::digest(chunk).as_slice()],
+            )?;
+        }
+        tx.execute("DELETE FROM mls_history WHERE rowid NOT IN (SELECT MIN(rowid) FROM mls_history GROUP BY group_id,recipient_device,chunk_hash)", [])?;
+    }
+    if migration.contains("ALTER TABLE groups ADD COLUMN position") {
+        // Roles version 2 (docs/roles.md): permission names of version 1 become their successors and
+        // unknown ones go; Admin holds `administrator`; Member stays last.
+        let rows: Vec<(GroupId, String)> = {
+            let mut stmt = tx.prepare("SELECT id,permissions FROM groups")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        };
+        for (id, stored) in rows {
+            let names: Vec<String> = serde_json::from_str(&stored).unwrap_or_default();
+            let mut permissions: Vec<Permission> = names
+                .iter()
+                .filter_map(|n| {
+                    serde_json::from_value(serde_json::Value::String(n.clone())).ok().or_else(|| permission_v1(n))
+                })
+                .collect();
+            if id == ADMIN_GROUP {
+                permissions = vec![Permission::Administrator];
+            }
+            permissions.sort_unstable();
+            permissions.dedup();
+            tx.execute(
+                "UPDATE groups SET permissions=?2 WHERE id=?1",
+                params![id, serde_json::to_string(&permissions)?],
+            )?;
+        }
+        tx.execute("UPDATE groups SET position=?2 WHERE id=?1", params![MEMBER_GROUP, MEMBER_POSITION])?;
+    }
+    if migration.contains("Repair: role permissions still named as in roles version 1") {
+        // Only rows no version-2 server wrote: those still holding a name of version 1. Such a row
+        // was never converted, so it also missed roles version 2, step 2, which gave Member joining,
+        // talking and writing. Every row a later server wrote has version-2 names only, and stays as
+        // its admins left it: a Member without them was set so on purpose, or cannot be told apart
+        // from that, and gains nothing.
+        let rows: Vec<(GroupId, String)> = {
+            let mut stmt = tx.prepare("SELECT id,permissions FROM groups")?;
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        };
+        let current = |n: &String| serde_json::from_value::<Permission>(serde_json::Value::String(n.clone())).ok();
+        for (id, stored) in rows {
+            let Ok(names) = serde_json::from_str::<Vec<String>>(&stored) else { continue };
+            if !names.iter().any(|n| current(n).is_none() && permission_v1(n).is_some()) {
+                continue;
+            }
+            let mut permissions: Vec<Permission> =
+                names.iter().filter_map(|n| current(n).or_else(|| permission_v1(n))).collect();
+            if id == ADMIN_GROUP {
+                permissions = vec![Permission::Administrator];
+            }
+            if id == MEMBER_GROUP {
+                permissions.extend([Permission::Connect, Permission::Speak, Permission::SendMessages]);
+            }
+            permissions.sort_unstable();
+            permissions.dedup();
+            tx.execute(
+                "UPDATE groups SET permissions=?2 WHERE id=?1",
+                params![id, serde_json::to_string(&permissions)?],
+            )?;
+        }
+        // Member is always last (it outranks no role); servers from v0.1.2 on left it where
+        // "position = id" put it. Moving it down grants nothing.
+        tx.execute("UPDATE groups SET position=?2 WHERE id=?1", params![MEMBER_GROUP, MEMBER_POSITION])?;
+    }
+    if migration.contains("CREATE TABLE channel_overrides") {
+        // Roles version 2, step 2: joining, talking and writing became permissions; members keep them.
+        let stored: Option<String> =
+            tx.query_row("SELECT permissions FROM groups WHERE id=?1", [MEMBER_GROUP], |r| r.get(0)).optional()?;
+        if let Some(stored) = stored {
+            let mut permissions: Vec<Permission> = serde_json::from_str(&stored).unwrap_or_default();
+            permissions.extend([Permission::Connect, Permission::Speak, Permission::SendMessages]);
+            permissions.sort_unstable();
+            permissions.dedup();
+            tx.execute(
+                "UPDATE groups SET permissions=?2 WHERE id=?1",
+                params![MEMBER_GROUP, serde_json::to_string(&permissions)?],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// The permission a name from before roles version 2 became, for databases of v0.1.0.
+fn permission_v1(name: &str) -> Option<Permission> {
+    Some(match name {
+        "server_manage" => Permission::ManageServer,
+        "channel_create" | "channel_edit" | "channel_delete" => Permission::ManageChannels,
+        "channel_join_locked" => Permission::BypassPassword,
+        "client_move" => Permission::MoveMembers,
+        "client_kick" => Permission::KickMembers,
+        "token_create" | "invite_create" => Permission::CreateInvites,
+        "client_ban" => Permission::BanMembers,
+        "group_manage" => Permission::ManageRoles,
+        "message_manage" => Permission::ManageMessages,
+        "file_upload" => Permission::AttachFiles,
+        "member_remove" | "member_nickname" => Permission::ManageMembers,
+        _ => return None,
+    })
+}
 
 fn write_overrides(tx: &Connection, channel: ChannelId, overrides: &[gwar_proto::ChannelOverride]) -> Result<()> {
     tx.execute("DELETE FROM channel_overrides WHERE channel=?1", [channel])?;
@@ -602,23 +721,20 @@ impl Store {
         db.execute_batch(
             "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA secure_delete=ON;",
         )?;
+        // Each migration and its data step commit together with the new version, or not at all
+        // (docs/data-migrations.md). A database of a newer version is left as it is.
         let version: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        if version > MIGRATIONS.len() {
+            bail!(
+                "the database was written by a newer gwar-server (schema {version}; this version knows up to {}): \
+                 run that version or a later one; nothing was changed",
+                MIGRATIONS.len()
+            );
+        }
         for (index, migration) in MIGRATIONS.iter().enumerate().skip(version) {
             let tx = db.unchecked_transaction()?;
-            tx.execute_batch(migration)?;
-            if migration.contains("ADD COLUMN chunk_hash") {
-                let mut stmt = tx.prepare("SELECT id,chunk FROM mls_history")?;
-                let mut rows = stmt.query([])?;
-                while let Some(row) = rows.next()? {
-                    let id: String = row.get(0)?;
-                    let chunk: Vec<u8> = row.get(1)?;
-                    tx.execute(
-                        "UPDATE mls_history SET chunk_hash=?2 WHERE id=?1",
-                        params![id, Sha256::digest(chunk).as_slice()],
-                    )?;
-                }
-                tx.execute("DELETE FROM mls_history WHERE rowid NOT IN (SELECT MIN(rowid) FROM mls_history GROUP BY group_id,recipient_device,chunk_hash)", [])?;
-            }
+            tx.execute_batch(migration).with_context(|| format!("database migration {}", index + 1))?;
+            migrate_data(&tx, migration).with_context(|| format!("database migration {}", index + 1))?;
             tx.pragma_update(None, "user_version", index + 1)?;
             tx.commit()?;
         }
@@ -2852,6 +2968,225 @@ mod tests {
         removal.overrides.sort_unstable();
         assert_eq!(removal.overrides, vec![a, b]);
         assert!(store.channel_overrides().unwrap().values().all(Vec::is_empty));
+    }
+
+    /// The first 12 hex digits of each migration's SHA-256, in order. A released migration never
+    /// changes (a database that ran it would differ from a new one); a new one is appended here
+    /// with a test of the data it moves (docs/data-migrations.md).
+    const MIGRATION_DIGESTS: &[&str] = &[
+        "bd51e0b87176",
+        "aa4db2988006",
+        "3b8fae93b38f",
+        "5c4f0e59331a",
+        "4beecd95796a",
+        "35e9f3a1c210",
+        "6f52db02bf57",
+        "973d30578f4d",
+        "6e95ff190c08",
+        "dfbf1cffdbe4",
+        "9077bc869064",
+        "ce69918c4d89",
+        "1e43433c6269",
+        "d321e6751094",
+        "1c4e05a1342a",
+        "548077520acf",
+        "2bdc570cb275",
+        "df9cbc8983b3",
+        "25eb5c05f26f",
+        "426c92f064b0",
+        "98fe653a8488",
+        "938dcc7e42d7",
+        "2ec764768ffe",
+        "58ae18589bac",
+        "68b292bd6928",
+        "65277f856a4c",
+        "5356d7b6cd5a",
+        "45ccaef915e0",
+        "bf59a24426a5",
+        "928cb2c96ff6",
+        "028f1b7a1bb7",
+    ];
+
+    #[test]
+    fn migrations_are_append_only() {
+        let digests: Vec<String> = MIGRATIONS
+            .iter()
+            .map(|m| Sha256::digest(m.as_bytes()).iter().take(6).map(|b| format!("{b:02x}")).collect())
+            .collect();
+        assert_eq!(digests, MIGRATION_DIGESTS, "a migration changed, or one was added without its digest");
+    }
+
+    #[test]
+    fn every_older_schema_opens_at_the_current_one_with_its_rows() {
+        for version in 0..=MIGRATIONS.len() {
+            let db = Connection::open_in_memory().unwrap();
+            for migration in &MIGRATIONS[..version] {
+                db.execute_batch(migration).unwrap();
+            }
+            db.pragma_update(None, "user_version", version).unwrap();
+            if version > 0 {
+                db.execute_batch(
+                    "INSERT INTO channels(id,name) VALUES(1,'Lobby');
+                    INSERT INTO users(uid,public_key,nickname,created_at,last_seen) VALUES('u','k','U',1,2);
+                    INSERT INTO messages(id,channel,author_uid,author_name,text,sent_at) VALUES(1,1,'u','U','kept',3);",
+                )
+                .unwrap();
+            }
+            let store = Store::init(db).unwrap_or_else(|e| panic!("schema {version}: {e:#}"));
+            let current: usize = store.db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+            assert_eq!(current, MIGRATIONS.len());
+            if version > 0 {
+                assert_eq!(store.history(1, None, 10).unwrap()[0].text, "kept", "schema {version}");
+                assert_eq!(store.user_by_uid("u").unwrap().unwrap().1.nickname, "U", "schema {version}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_database_of_a_newer_schema_is_refused_and_left_alone() {
+        let db = Connection::open_in_memory().unwrap();
+        db.execute_batch("CREATE TABLE future(x)").unwrap();
+        db.pragma_update(None, "user_version", MIGRATIONS.len() + 1).unwrap();
+        let error = Store::init(db).err().expect("refused").to_string();
+        assert!(error.contains("newer gwar-server"), "{error}");
+    }
+
+    #[test]
+    fn a_failed_migration_commits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gwar.sqlite3");
+        let before = migration_adding("CREATE TABLE channel_overrides");
+        {
+            let db = Connection::open(&path).unwrap();
+            for migration in &MIGRATIONS[..before] {
+                db.execute_batch(migration).unwrap();
+            }
+            db.pragma_update(None, "user_version", before).unwrap();
+            // What the migration creates already exists: it fails after its first statement.
+            db.execute_batch("CREATE TABLE channel_overrides(x)").unwrap();
+        }
+        assert!(Store::open(&path).is_err());
+        let db = Connection::open(&path).unwrap();
+        let version: usize = db.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let synced: bool = db
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('channels') WHERE name='synced'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!((version, synced), (before, false), "neither the version nor the first statement committed");
+    }
+
+    #[test]
+    fn roles_of_version_1_left_by_a_migration_without_conversion_are_repaired() {
+        // A database of v0.1.0 migrated by a server between v0.1.2 and the repair: its schema is
+        // current, its roles still carry names of version 1, one role was edited since.
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("Repair: role permissions still named as in roles version 1");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            r#"INSERT INTO groups(id,name,permissions) VALUES(1,'Admin','["server_manage"]'),
+            (2,'Member','["invite_create","file_upload"]'),(3,'Mods','["message_manage","channel_edit"]'),
+            (4,'Edited','["manage_messages"]');
+            INSERT INTO meta VALUES('member_defaults','1');"#,
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        let groups = store.groups().unwrap();
+        let permissions = |id: GroupId| groups.iter().find(|g| g.id == id).unwrap().permissions.clone();
+        assert_eq!(permissions(ADMIN_GROUP), vec![Permission::Administrator]);
+        let mut member = vec![
+            Permission::CreateInvites,
+            Permission::AttachFiles,
+            Permission::Connect,
+            Permission::Speak,
+            Permission::SendMessages,
+        ];
+        member.sort_unstable();
+        assert_eq!(permissions(MEMBER_GROUP), member);
+        let mut mods = vec![Permission::ManageMessages, Permission::ManageChannels];
+        mods.sort_unstable();
+        assert_eq!(permissions(3), mods);
+        assert_eq!(permissions(4), vec![Permission::ManageMessages]);
+    }
+
+    #[test]
+    fn the_role_repair_never_gives_member_what_an_admin_took_away() {
+        // v0.1.0 straight to v0.1.2: `member_defaults` is still there, but an admin has since set
+        // Member to joining only, in version-2 names.
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("Repair: role permissions still named as in roles version 1");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            r#"INSERT INTO groups(id,name,permissions) VALUES(1,'Admin','["server_manage"]'),(2,'Member','["connect"]'),
+            (3,'Quiet','[]');
+            INSERT INTO meta VALUES('member_defaults','1');"#,
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        let groups = store.groups().unwrap();
+        let permissions = |id: GroupId| groups.iter().find(|g| g.id == id).unwrap().permissions.clone();
+        assert_eq!(permissions(MEMBER_GROUP), vec![Permission::Connect]);
+        assert_eq!(permissions(3), vec![]);
+        assert_eq!(permissions(ADMIN_GROUP), vec![Permission::Administrator]);
+    }
+
+    #[test]
+    fn the_role_repair_leaves_roles_of_version_2_alone() {
+        // A database a version-2 server wrote: Admin narrowed by hand, Member without speaking.
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("Repair: role permissions still named as in roles version 1");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            r#"INSERT INTO groups(id,name,permissions) VALUES(1,'Admin','["manage_server"]'),(2,'Member','["connect"]');
+            INSERT INTO meta VALUES('member_defaults','1'),('member_channel_defaults','1');"#,
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        let groups = store.groups().unwrap();
+        let permissions = |id: GroupId| groups.iter().find(|g| g.id == id).unwrap().permissions.clone();
+        assert_eq!(permissions(ADMIN_GROUP), vec![Permission::ManageServer]);
+        assert_eq!(permissions(MEMBER_GROUP), vec![Permission::Connect]);
+    }
+
+    #[test]
+    fn roles_of_version_1_become_roles_of_version_2() {
+        // A database of v0.1.0: permission names from before roles version 2.
+        let db = Connection::open_in_memory().unwrap();
+        let before = migration_adding("ALTER TABLE groups ADD COLUMN position");
+        for migration in &MIGRATIONS[..before] {
+            db.execute_batch(migration).unwrap();
+        }
+        db.pragma_update(None, "user_version", before).unwrap();
+        db.execute_batch(
+            r#"INSERT INTO groups(id,name,permissions) VALUES(1,'Admin','["server_manage","client_kick"]'),
+            (2,'Member','["invite_create","file_upload","nonsense"]'),(3,'Mods','["message_manage","channel_edit","channel_create"]');
+            INSERT INTO meta VALUES('member_defaults','1');"#,
+        )
+        .unwrap();
+        let store = Store::init(db).unwrap();
+        let groups = store.groups().unwrap();
+        let permissions = |id: GroupId| groups.iter().find(|g| g.id == id).unwrap().permissions.clone();
+        assert_eq!(permissions(ADMIN_GROUP), vec![Permission::Administrator]);
+        let mut member = vec![
+            Permission::CreateInvites,
+            Permission::AttachFiles,
+            Permission::Connect,
+            Permission::Speak,
+            Permission::SendMessages,
+        ];
+        member.sort_unstable();
+        assert_eq!(permissions(MEMBER_GROUP), member);
+        let mut mods = vec![Permission::ManageMessages, Permission::ManageChannels];
+        mods.sort_unstable();
+        assert_eq!(permissions(3), mods);
+        assert_eq!(groups.last().unwrap().id, MEMBER_GROUP, "Member stays last");
     }
 }
 

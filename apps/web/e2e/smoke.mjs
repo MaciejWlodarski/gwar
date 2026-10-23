@@ -325,6 +325,36 @@ const escapeRe = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const treeItem = (page, name) => page.getByRole("treeitem", { name: typeof name === "string" ? new RegExp(escapeRe(name)) : name });
 
 /** The verified server key, read from the server menu's "Server key" dialog. */
+/**
+ * The server pin as the app stores it: the `gwar-local` IndexedDB database (lib/local-state.ts), which the app
+ * creates when it starts. Only call these once the app has rendered.
+ */
+async function storedPin(page, endpoint) {
+  return page.evaluate((key) => new Promise((resolve, reject) => {
+    const open = indexedDB.open("gwar-local");
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result, get = db.transaction("entries", "readonly").objectStore("entries").get(key);
+      get.onsuccess = () => { db.close(); resolve(get.result ?? null); };
+      get.onerror = () => { db.close(); reject(get.error); };
+    };
+  }), `gwar.server-pin:${endpoint}`);
+}
+/** Stores a pin as an earlier session would have, then reloads so the app starts with it. */
+async function storePin(page, endpoint, pin) {
+  await page.evaluate(({ key, pin }) => new Promise((resolve, reject) => {
+    const open = indexedDB.open("gwar-local");
+    open.onerror = () => reject(open.error);
+    open.onsuccess = () => {
+      const db = open.result, tx = db.transaction("entries", "readwrite");
+      tx.objectStore("entries").put(pin, key);
+      tx.oncomplete = () => { db.close(); resolve(); };
+      tx.onerror = () => { db.close(); reject(tx.error); };
+    };
+  }), { key: `gwar.server-pin:${endpoint}`, pin });
+  await page.reload();
+}
+
 async function serverFingerprint(page) {
   await page.getByRole("button", { name: /^(Server menu|Menu serwera)$/ }).click();
   await page.getByRole("menuitem", { name: /^(Server key|Klucz serwera)$/ }).click();
@@ -419,7 +449,7 @@ async function main() {
   });
   await check("verified server fingerprint is visible and pinned after first connection", async () => {
     const fingerprint = await serverFingerprint(a);
-    const stored = await a.evaluate((endpoint) => localStorage.getItem(`gwar.server-pin:${endpoint}`), CLIENT_ADDR);
+    const stored = await storedPin(a, CLIENT_ADDR);
     if (!stored || JSON.parse(stored).server_pk !== fingerprint || !/^[A-Za-z0-9_-]{43}$/.test(fingerprint)) throw new Error("missing verified fingerprint or pin");
   });
   await check("plaintext to loopback shows no impersonation warning", async () => {
@@ -451,7 +481,8 @@ async function main() {
       page.on("websocket", (ws) => ws.on("framesent", ({ payload }) => sent.push(String(payload))));
       await page.goto(WEB_URL);
       const oldPin = JSON.stringify({ server_pk: "A".repeat(43), first_seen: 1 });
-      await page.evaluate(({ endpoint, pin }) => localStorage.setItem(`gwar.server-pin:${endpoint}`, pin), { endpoint: CLIENT_ADDR, pin: oldPin });
+      await page.getByLabel(pl ? "Adres serwera" : "Server address").waitFor();
+      await storePin(page, CLIENT_ADDR, oldPin);
       await page.getByLabel(pl ? "Adres serwera" : "Server address").fill(CLIENT_ADDR);
       await setGlobalNickname(page, pl ? "PinPL" : "PinEN", { pl });
       await page.getByRole("button", { name: pl ? "Połącz" : "Connect", exact: true }).click();
@@ -463,14 +494,14 @@ async function main() {
       const active = await page.evaluate(() => document.activeElement?.textContent);
       if (active !== (pl ? "Anuluj" : "Cancel")) throw new Error("dangerous trust is the default focus");
       if (sent.length !== 0) throw new Error("client sent data after a pin mismatch");
-      const unchanged = await page.evaluate((endpoint) => localStorage.getItem(`gwar.server-pin:${endpoint}`), CLIENT_ADDR);
+      const unchanged = await storedPin(page, CLIENT_ADDR);
       if (unchanged !== oldPin) throw new Error("pin changed without explicit trust");
       await shot(page, pl ? "03-pin-changed-pl" : "03-pin-changed-en");
       await dialog.getByRole("button", { name: pl ? "Niebezpieczne: zapomnij stary klucz i zaufaj nowemu" : "Dangerous: forget old pin and trust new key", exact: true }).click();
       if (pl) await page.setViewportSize({ width: 1280, height: 800 });
       await page.getByRole("button", { name: /^(Server menu|Menu serwera)$/ }).waitFor({ timeout: 15000 });
       const fingerprint = await serverFingerprint(page);
-      const replacement = JSON.parse(await page.evaluate((endpoint) => localStorage.getItem(`gwar.server-pin:${endpoint}`), CLIENT_ADDR));
+      const replacement = JSON.parse(await storedPin(page, CLIENT_ADDR));
       if (replacement.server_pk !== fingerprint || replacement.first_seen <= 1) throw new Error("explicit trust did not persist the verified replacement");
       await ctx.close();
     });
@@ -792,7 +823,7 @@ async function main() {
 
   console.log("reconnect");
   await check("client reconnects after the socket drops and resyncs", async () => {
-    const pinBefore = await b.evaluate((endpoint) => localStorage.getItem(`gwar.server-pin:${endpoint}`), CLIENT_ALIAS);
+    const pinBefore = await storedPin(b, CLIENT_ALIAS);
     if (!pinBefore) throw new Error("first connection did not persist a server pin");
     const before = fa.events("client.joined").length;
     await b.evaluate(() => window.__sockets.filter((s) => s.url.endsWith("/ws")).forEach((s) => s.close()));
@@ -804,7 +835,7 @@ async function main() {
     await treeItem(b, /Alice/).waitFor();
     await b.getByRole("tab", { name: "Server" }).click();
     await b.getByText("Reconnected to the server").waitFor();
-    const pinAfter = await b.evaluate((endpoint) => localStorage.getItem(`gwar.server-pin:${endpoint}`), CLIENT_ALIAS);
+    const pinAfter = await storedPin(b, CLIENT_ALIAS);
     if (pinBefore !== pinAfter) throw new Error("second connection replaced the first-contact pin");
     const fingerprint = await serverFingerprint(b);
     if (fingerprint !== JSON.parse(pinAfter).server_pk) throw new Error("verified fingerprint is not visible");

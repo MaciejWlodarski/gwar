@@ -9,7 +9,9 @@ import { encodeRequest, parseFrame, type ParsedFrame } from "./frames";
 import type { Identity } from "./identity";
 import type { Hello } from "../proto/Hello";
 import { certificateHash, decodeFixed, helloStatement, newNonce, normalizeEndpoint, verifyProof } from "./handshake";
-import { checkCandidate, serverPins, ServerIdentityChanged, type PinStore } from "./server-pins";
+import { checkCandidate, checkStoredCandidate, serverPins, ServerIdentityChanged, type PinStore } from "./server-pins";
+import { LocalStateUnavailableError } from "../lib/local-state";
+import { NewerDataError } from "../lib/stored-data";
 import { isPlaintextRemote } from "./address";
 import {
   PROTOCOL_VERSION,
@@ -41,6 +43,7 @@ export type ConnectErrorKind =
   | "certificate_expired" // the Gwar Connect device certificate we sent has run out; renew it in Settings > Account
   | "rejected" // any other error reply to hello (bad nickname, ...)
   | "server_identity"
+  | "trust_storage" // this device's server pins cannot be read or written: no key is trusted
   | "insecure_transport"
   | "protocol"; // protocol version mismatch or malformed handshake
 
@@ -109,6 +112,11 @@ export interface ConnectionOptions {
   /** Invite code: admits without the server password. Used for the first connect only. */
   invite?: string;
   inviteServerKey?: string;
+  /**
+   * The pinned key the user accepted to replace by `inviteServerKey` (which must be set): the pin moves to
+   * that key once the server proves it, in one transaction, and only if it still holds this one.
+   */
+  replaceServerKey?: string;
   insecureLan?: boolean;
   pinStore?: PinStore;
   client: ClientInfo;
@@ -221,11 +229,15 @@ export class Connection implements Link {
   private abortHandshake: (() => void) | null = null;
   /** Spent after the first welcome: a reconnect is the same member, and the invite may be used up. */
   private invite: string | undefined;
+  /** Spent once a pin holds the new key: a reconnect never replaces a pin again. */
+  private replacing: string | undefined;
 
   constructor(private readonly options: ConnectionOptions) {
     try { this.endpoint = normalizeEndpoint(options.url); }
     catch (e) { throw new ConnectError("protocol", e instanceof Error ? e.message : String(e)); }
     this.invite = options.invite;
+    // A replacement is bound to the key the user accepted, which the invite key carries.
+    this.replacing = options.inviteServerKey === undefined ? undefined : options.replaceServerKey;
   }
 
   get identity(): Identity { return this.options.identity; }
@@ -450,6 +462,7 @@ export class Connection implements Link {
             .catch((e: unknown) => {
               if (e instanceof ServerIdentityChanged) fail(new ConnectError("server_identity", e.message, serverName, undefined, e));
               else if (e instanceof ConnectError) fail(e);
+              else if (e instanceof LocalStateUnavailableError || e instanceof NewerDataError) fail(new ConnectError("trust_storage", e.message, serverName));
               else if (e instanceof RequestError) fail(mapHelloError(e.code, e.message, serverName, e.ban));
               else if (e instanceof RequestTimeoutError) fail(new ConnectError(e.op === "hello" ? "protocol" : "timeout", e.op === "hello" ? "missing server proof" : e.message, serverName));
               else fail(new ConnectError("protocol", e instanceof Error ? e.message : String(e), serverName));
@@ -484,7 +497,11 @@ export class Connection implements Link {
     };
     decodeFixed(challenge.server_nonce, 32);
     const pins = this.options.pinStore ?? serverPins;
-    checkCandidate(endpoint, challenge.server_pk, pins, this.options.inviteServerKey);
+    const replacing = this.replacing;
+    // A page that did not load the security state at start (only main.tsx does) loads it now.
+    await pins.ready?.();
+    current();
+    checkCandidate(endpoint, challenge.server_pk, pins, this.options.inviteServerKey, replacing);
     const hello: Hello = {
       protocol: PROTOCOL_VERSION,
       nickname,
@@ -499,6 +516,7 @@ export class Connection implements Link {
       client,
     };
     if ([nickname, client.name, client.version].some((value) => /[\r\n]/.test(value))) throw new Error("invalid hello metadata");
+    await checkStoredCandidate(endpoint, challenge.server_pk, pins, replacing);
     current();
     hello.signature = await identity.sign(new TextEncoder().encode(helloStatement(hello)));
     decodeFixed(hello.signature, 64);
@@ -506,7 +524,9 @@ export class Connection implements Link {
     const proof = await this.send(socket, "hello", hello as unknown as Record<string, unknown>, timeoutMs, 1);
     await verifyProof(hello, proof);
     current();
-    pins.commit(endpoint, hello.expected_server_pk);
+    await pins.commit(endpoint, hello.expected_server_pk, replacing);
+    this.replacing = undefined;
+    current();
     this.serverKey_ = hello.expected_server_pk;
     return this.send(socket, "join", { server_password: serverPassword, invite: this.invite }, timeoutMs, 2);
   }
