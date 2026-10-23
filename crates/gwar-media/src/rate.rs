@@ -115,8 +115,9 @@ struct EncoderPlan {
 /// Two seconds of continuous pressure lower one quality step. Ten seconds of continuous
 /// headroom recover one step (or resume). Headroom means 20 percent spare bandwidth, CPU at
 /// most 80 percent of budget, encode time at most 60 percent of the prospective frame interval
-/// and 80 percent of the hardware latency target. Intermediate observations reset both timers.
-/// Bitrate cuts take effect immediately; increases share the recovery hold, avoiding BWE chatter.
+/// and 80 percent of the hardware latency target. Intermediate observations reset the matching timers.
+/// Bitrate cuts take effect immediately; restoration requires headroom for the current step
+/// for the same ten-second hold, independently of quality promotion, avoiding BWE chatter.
 /// At the quality floor, sustained pressure pauses instead of violating Text/Game invariants.
 ///
 /// Capabilities must already be filtered for viewer/profile/platform eligibility and available
@@ -126,6 +127,7 @@ struct EncoderPlan {
 /// holds, aggregate allocation, SVC metadata and encoder probing belong to A3/B11/B11a.
 #[derive(Debug)]
 pub struct RateController {
+    preset: Preset,
     plans: Vec<EncoderPlan>,
     active: usize,
     step: usize,
@@ -134,6 +136,7 @@ pub struct RateController {
     last_sample: Option<Duration>,
     pressure_since: Option<Duration>,
     headroom_since: Option<Duration>,
+    bitrate_headroom_since: Option<Duration>,
 }
 
 impl RateController {
@@ -168,6 +171,7 @@ impl RateController {
         };
         let bitrate_bps = first.steps[0].encoder.rate.bitrate_bps;
         Ok(Self {
+            preset: config.preset,
             plans,
             active: 0,
             step: 0,
@@ -176,6 +180,7 @@ impl RateController {
             last_sample: None,
             pressure_since: None,
             headroom_since: None,
+            bitrate_headroom_since: None,
         })
     }
 
@@ -236,13 +241,18 @@ impl RateController {
             || feedback.cpu_millicores > cpu_budget(current)
             || feedback.encode_time.as_nanos() > encode_budget(current, 80);
         let next = plan.steps[if self.paused { self.step } else { self.step.saturating_sub(1) }];
-        let headroom = !drops
-            && u64::from(feedback.bandwidth_bps) * 5 >= u64::from(next.encoder.rate.bitrate_bps) * 6
-            && feedback.cpu_millicores <= cpu_budget(next) * 4 / 5
-            && feedback.encode_time.as_nanos() <= encode_budget(next, 60).min(hardware_latency(next) / 5 * 4);
+        let has_headroom = |target: QualityTarget| {
+            !drops
+                && u64::from(feedback.bandwidth_bps) * 5 >= u64::from(target.encoder.rate.bitrate_bps) * 6
+                && feedback.cpu_millicores <= cpu_budget(target) * 4 / 5
+                && feedback.encode_time.as_nanos() <= encode_budget(target, 60).min(hardware_latency(target) / 5 * 4)
+        };
+        let bitrate_headroom =
+            !self.paused && self.bitrate_bps < current.encoder.rate.bitrate_bps && has_headroom(current);
 
         if pressure {
             self.headroom_since = None;
+            self.bitrate_headroom_since = None;
             let since = *self.pressure_since.get_or_insert(now);
             if now - since >= PRESSURE_HOLD {
                 if self.step + 1 < plan.steps.len() {
@@ -253,19 +263,31 @@ impl RateController {
                 }
                 self.reset_timers();
             }
-        } else if headroom {
-            self.pressure_since = None;
-            let since = *self.headroom_since.get_or_insert(now);
-            if now - since >= RECOVERY_HOLD {
-                if !self.paused {
-                    self.step = self.step.saturating_sub(1);
-                }
-                self.paused = false;
-                self.bitrate_bps = self.plans[self.active].steps[self.step].encoder.rate.bitrate_bps;
-                self.reset_timers();
-            }
         } else {
-            self.reset_timers();
+            self.pressure_since = None;
+            if has_headroom(next) {
+                let since = *self.headroom_since.get_or_insert(now);
+                if now - since >= RECOVERY_HOLD {
+                    if !self.paused {
+                        self.step = self.step.saturating_sub(1);
+                    }
+                    self.paused = false;
+                    self.bitrate_bps = self.plans[self.active].steps[self.step].encoder.rate.bitrate_bps;
+                    self.reset_timers();
+                    return Ok(self.decision());
+                }
+            } else {
+                self.headroom_since = None;
+            }
+            if bitrate_headroom {
+                let since = *self.bitrate_headroom_since.get_or_insert(now);
+                if now - since >= RECOVERY_HOLD {
+                    self.bitrate_bps = current.encoder.rate.bitrate_bps;
+                    self.bitrate_headroom_since = None;
+                }
+            } else {
+                self.bitrate_headroom_since = None;
+            }
         }
         Ok(self.decision())
     }
@@ -273,27 +295,40 @@ impl RateController {
     fn reset_timers(&mut self) {
         self.pressure_since = None;
         self.headroom_since = None;
+        self.bitrate_headroom_since = None;
     }
 
     fn fail_encoder(&mut self) {
         let prior = self.plans[self.active].steps[self.step];
         self.active += 1;
         while let Some(plan) = self.plans.get_mut(self.active) {
-            // Capabilities describe maxima. A 60-fps replacement can also retain a failed
-            // encoder's 30-fps cadence; failover must not reject that usable hardware path.
-            for target in &mut plan.steps {
-                let rate = &mut target.encoder.rate;
-                let fps = rate.max_fps.min(prior.encoder.rate.max_fps);
-                rate.bitrate_bps = (u64::from(rate.bitrate_bps) * u64::from(fps) / u64::from(rate.max_fps)) as u32;
-                rate.bitrate_bps = rate.bitrate_bps.max(100_000);
-                rate.max_fps = fps;
+            // Only Game preserves cadence permanently. Text/Smooth must retain their
+            // higher-fps recovery steps, even when failover starts on a degraded rung.
+            if self.preset == Preset::Game {
+                for target in &mut plan.steps {
+                    limit_fps(target, prior.encoder.rate.max_fps);
+                }
+                plan.steps.dedup_by_key(|target| (target.encoder.size, target.encoder.rate.max_fps));
             }
-            plan.steps.dedup_by_key(|target| (target.encoder.size, target.encoder.rate.max_fps));
-            if let Some(step) = plan.steps.iter().position(|target| {
+            let step = plan.steps.iter().position(|target| {
                 target.encoder.size.width <= prior.encoder.size.width
                     && target.encoder.size.height <= prior.encoder.size.height
                     && target.encoder.rate.max_fps <= prior.encoder.rate.max_fps
-            }) {
+            });
+            let step = step.or_else(|| {
+                // An unusually low capability fps can fall below every recovery rung.
+                // Append a safe floor without removing the replacement's recovery ladder.
+                let mut floor = *plan.steps.last()?;
+                if floor.encoder.size.width > prior.encoder.size.width
+                    || floor.encoder.size.height > prior.encoder.size.height
+                {
+                    return None;
+                }
+                limit_fps(&mut floor, prior.encoder.rate.max_fps);
+                plan.steps.push(floor);
+                Some(plan.steps.len() - 1)
+            });
+            if let Some(step) = step {
                 self.step = step;
                 self.bitrate_bps = self.bitrate_bps.min(plan.steps[step].encoder.rate.bitrate_bps);
                 return;
@@ -301,6 +336,13 @@ impl RateController {
             self.active += 1;
         }
     }
+}
+
+fn limit_fps(target: &mut QualityTarget, max_fps: u32) {
+    let rate = &mut target.encoder.rate;
+    let fps = rate.max_fps.min(max_fps);
+    rate.bitrate_bps = ((u64::from(rate.bitrate_bps) * u64::from(fps) / u64::from(rate.max_fps)) as u32).max(100_000);
+    rate.max_fps = fps;
 }
 
 fn make_plan(config: ControllerConfig, caps: &CodecCaps, encoder_index: usize) -> Option<EncoderPlan> {
@@ -335,7 +377,9 @@ fn make_plan(config: ControllerConfig, caps: &CodecCaps, encoder_index: usize) -
             if steps.last().is_some_and(|last| last.encoder.size == size && last.encoder.rate.max_fps == max_fps) {
                 continue;
             }
-            let bitrate_bps = bitrate(config.preset, tier, size, max_fps);
+            // Tier reference rates and even-pixel rounding can make a lower tier's
+            // nominal need higher than the admitted request, especially for odd aspects.
+            let bitrate_bps = bitrate(config.preset, tier, size, max_fps).min(config.bitrate_cap_bps);
             steps.push(QualityTarget {
                 encoder_index,
                 tier,

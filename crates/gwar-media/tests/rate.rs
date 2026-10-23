@@ -384,3 +384,136 @@ fn faster_replacement_hardware_retains_the_failed_encoders_cadence() {
         assert_eq!(sample(&mut c, second, healthy()), RateDecision::Encode(after));
     }
 }
+
+fn assert_degraded_failover_recovers(preset: Preset, degraded_fps: u32, recovered_fps: u32) {
+    let mut c =
+        RateController::new(config(preset, ResolutionTier::P1080), &[caps(AV1, true), caps(H264, true)]).unwrap();
+    for second in 0..=2 {
+        sample(&mut c, second, ControllerFeedback { encoder_dropped: true, ..healthy() });
+    }
+    let degraded = encode(c.decision());
+    assert_eq!(degraded.encoder.rate.max_fps, degraded_fps);
+    let replacement = encode(sample(&mut c, 3, ControllerFeedback { encoder_failed: true, ..healthy() }));
+    assert_eq!(replacement.encoder_index, 1);
+    assert_eq!(replacement.encoder.size, degraded.encoder.size);
+    assert_eq!(replacement.encoder.rate, degraded.encoder.rate);
+    for second in 4..=13 {
+        assert_eq!(sample(&mut c, second, healthy()), RateDecision::Encode(replacement));
+    }
+    let recovered = encode(sample(&mut c, 14, healthy()));
+    assert_eq!(recovered.encoder_index, 1);
+    assert_eq!(recovered.encoder.size, degraded.encoder.size);
+    assert_eq!(recovered.encoder.rate.max_fps, recovered_fps);
+}
+
+#[test]
+fn degraded_text_recovers_full_frame_rate_after_failover() {
+    assert_degraded_failover_recovers(Preset::Text, 10, 15);
+}
+
+#[test]
+fn degraded_smooth_recovers_full_frame_rate_after_failover() {
+    assert_degraded_failover_recovers(Preset::Smooth, 20, 30);
+}
+
+#[test]
+fn transient_bitrate_cut_recovers_at_the_current_rung_before_quality_promotion() {
+    let mut c = controller(Preset::Text, ResolutionTier::P1080);
+    for second in 0..=2 {
+        sample(&mut c, second, ControllerFeedback { encoder_dropped: true, ..healthy() });
+    }
+    let nominal = encode(c.decision());
+    assert_eq!(nominal.encoder.rate, RateControl { max_fps: 10, bitrate_bps: 1_666_666 });
+    let cut = encode(sample(&mut c, 3, ControllerFeedback { bandwidth_bps: 100_000, ..healthy() }));
+    assert_eq!(cut.encoder.rate, RateControl { max_fps: 10, bitrate_bps: 100_000 });
+    let current_headroom = ControllerFeedback { bandwidth_bps: 2_000_000, ..healthy() };
+    for second in 4..=13 {
+        assert_eq!(sample(&mut c, second, current_headroom), RateDecision::Encode(cut));
+    }
+    for second in 14..=25 {
+        assert_eq!(sample(&mut c, second, current_headroom), RateDecision::Encode(nominal));
+    }
+    let promotion_headroom = ControllerFeedback { bandwidth_bps: 3_000_000, ..healthy() };
+    for second in 26..=35 {
+        assert_eq!(sample(&mut c, second, promotion_headroom), RateDecision::Encode(nominal));
+    }
+    let promoted = encode(sample(&mut c, 36, promotion_headroom));
+    assert_eq!(promoted.encoder.rate, RateControl { max_fps: 15, bitrate_bps: 2_500_000 });
+}
+
+#[test]
+fn bitrate_restoration_does_not_restart_quality_promotion_hold() {
+    let mut c = controller(Preset::Text, ResolutionTier::P1080);
+    for second in 0..=2 {
+        sample(&mut c, second, ControllerFeedback { encoder_dropped: true, ..healthy() });
+    }
+    sample(&mut c, 3, ControllerFeedback { bandwidth_bps: 100_000, ..healthy() });
+    for second in 4..=8 {
+        sample(&mut c, second, ControllerFeedback { bandwidth_bps: 2_000_000, ..healthy() });
+    }
+    for second in 9..=13 {
+        let target = encode(sample(&mut c, second, healthy()));
+        assert_eq!(target.encoder.rate, RateControl { max_fps: 10, bitrate_bps: 100_000 });
+    }
+    for second in 14..=18 {
+        let target = encode(sample(&mut c, second, healthy()));
+        assert_eq!(target.encoder.rate, RateControl { max_fps: 10, bitrate_bps: 1_666_666 });
+    }
+    assert_eq!(encode(sample(&mut c, 19, healthy())).encoder.rate.max_fps, 15);
+}
+
+#[test]
+fn nonstandard_source_targets_stay_within_cap_at_construction_failover_and_recovery() {
+    let cfg = ControllerConfig {
+        source_size: Size { width: 1930, height: 1080 },
+        bitrate_cap_bps: 7_920_000,
+        ..config(Preset::Game, ResolutionTier::P1440)
+    };
+    let encoders = [
+        CodecCaps { max_size: ResolutionTier::P1080.size(), ..caps(AV1, true) },
+        CodecCaps { max_size: ResolutionTier::P1080.size(), ..caps(H264, true) },
+    ];
+    let mut c = RateController::new(cfg, &encoders).unwrap();
+    let initial = encode(c.decision());
+    assert_eq!(initial.encoder.size, Size { width: 1920, height: 1074 });
+    assert_eq!(initial.encoder.rate.bitrate_bps, cfg.bitrate_cap_bps);
+    for second in 0..=2 {
+        let target = encode(sample(&mut c, second, ControllerFeedback { encoder_dropped: true, ..healthy() }));
+        assert!(target.encoder.rate.bitrate_bps <= cfg.bitrate_cap_bps);
+    }
+    assert_eq!(encode(c.decision()).tier, ResolutionTier::P720);
+    for second in 3..=13 {
+        let target = encode(sample(&mut c, second, healthy()));
+        assert!(target.encoder.rate.bitrate_bps <= cfg.bitrate_cap_bps);
+    }
+    assert_eq!(c.decision(), RateDecision::Encode(initial));
+    let replacement = encode(sample(&mut c, 14, ControllerFeedback { encoder_failed: true, ..healthy() }));
+    assert_eq!(replacement.encoder_index, 1);
+    assert_eq!(replacement.encoder.rate.bitrate_bps, cfg.bitrate_cap_bps);
+    sample(&mut c, 15, ControllerFeedback { bandwidth_bps: 100_000, ..healthy() });
+    for second in 16..=26 {
+        let target = encode(sample(&mut c, second, healthy()));
+        assert!(target.encoder.rate.bitrate_bps <= cfg.bitrate_cap_bps);
+    }
+    assert_eq!(c.decision(), RateDecision::Encode(replacement));
+}
+
+#[test]
+fn failover_below_the_replacement_fps_floor_inserts_a_recoverable_rung() {
+    for (preset, recovery_fps) in [(Preset::Text, [5, 10, 15]), (Preset::Smooth, [15, 20, 30])] {
+        let encoders = [CodecCaps { max_fps: 3, ..caps(AV1, true) }, caps(H264, true)];
+        let mut c = RateController::new(config(preset, ResolutionTier::P720), &encoders).unwrap();
+        let replacement = encode(sample(&mut c, 0, ControllerFeedback { encoder_failed: true, ..healthy() }));
+        assert_eq!(replacement.encoder_index, 1);
+        assert_eq!(replacement.encoder.rate.max_fps, 3);
+        for (index, fps) in recovery_fps.into_iter().enumerate() {
+            let start = index as u64 * 11 + 1;
+            let before = c.decision();
+            for second in start..start + 10 {
+                assert_eq!(sample(&mut c, second, healthy()), before);
+            }
+            let recovered = encode(sample(&mut c, start + 10, healthy()));
+            assert_eq!(recovered.encoder.rate.max_fps, fps);
+        }
+    }
+}

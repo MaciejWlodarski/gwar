@@ -1120,23 +1120,30 @@ and rotate the tier bounds for portrait sources. Software is capped at
 1080p30 at construction/failover, including Game; Text refuses a fallback
 that cannot retain its physical resolution. The requested preset/tier must
 fit the administrative bitrate cap before the controller is constructed.
+Every generated rung is also clamped to that cap, including capability-limited
+starting settings, failover and recovery targets.
 
 Recovery requires 10 continuous seconds with no late/dropped frames, at
 least 20 % spare bandwidth over the **next** setting's nominal need, CPU at
 most 80 % of that setting's budget, and encode time at most 60 % of its
 frame interval and 80 % of its hardware latency target. Only one step
-recovers per hold. Intermediate feedback resets both holds; timestamps are
-strictly increasing and gaps over 1 s break continuity. Adapters must supply
-interval observations at least once a second; missing samples prove neither
-pressure nor headroom. The same 2 s hold damps transient drop reports.
+recovers per hold. Intermediate feedback resets the corresponding hold;
+timestamps are strictly increasing and gaps over 1 s break continuity.
+Adapters must supply interval observations at least once a second; missing
+samples prove neither pressure nor headroom. The same 2 s hold damps transient
+drop reports.
 
-Bitrate cuts follow a lower allocation immediately; increases require the
-same 10 s headroom hold. Zero bandwidth pauses immediately. At the quality
-floor, sustained pressure pauses the layer instead of breaking its preset;
-resumption also requires 10 s of headroom at that setting. A failed encoder
-is excluded for the controller's lifetime; outputs identify the exact B1
+Bitrate cuts follow a lower allocation immediately. Restoring the current
+rung's nominal bitrate requires 10 s of headroom for that **current** rung,
+independently of the next quality setting's hold. Restoring bitrate does not
+restart a quality promotion already in progress. Zero bandwidth pauses
+immediately. At the quality floor, sustained pressure pauses the layer instead
+of breaking its preset; resumption also requires 10 s of headroom at that
+setting. A failed encoder is excluded for the controller's lifetime; outputs identify the exact B1
 capability candidate by its input index, and fallback cannot immediately raise
-resolution or fps. Selection follows hardware AV1 → H.264 → VP9 → VP8,
+resolution or fps. Text/Smooth retain the replacement's full recovery ladder
+and can regain fps after the recovery hold; Game retains its prior cadence.
+Selection follows hardware AV1 → H.264 → VP9 → VP8,
 with hardware before software within each codec, and always rejects software
 AV1. Callers supply only verified, negotiated, platform-eligible B1 caps;
 OpenH264 availability/consent, codec membership holds, available sessions,
