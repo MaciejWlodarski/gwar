@@ -12,7 +12,7 @@ import { isDesktop, tauri } from "../platform";
 import type { Event } from "../proto/Event";
 import type { ScreenStopReason } from "../proto/ScreenStopReason";
 import { nextMediaRun } from "../voice/engine";
-import { applyCapturePreset, captureScreen, captureSupport, resolvePreset, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PresetChoice, type SlotStats } from "../voice/screen";
+import { applyCapturePreset, captureScreen, captureSupport, resolvePreset, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PresetChoice, type PublishStats, type SlotStats } from "../voice/screen";
 import { myChannelId } from "./reducer";
 import { useScreen, type ScreenAction } from "./screen";
 import { useSession, useUi } from "./stores";
@@ -382,6 +382,11 @@ export class ScreenController {
     const conn = this.link();
     const watch = useScreen.getState().watches.find(w => w.share === share);
     if (conn && watch?.status === "watching") void conn.request("screen.focus", { share }).catch(() => {});
+  }
+
+  /** What my own share's encoder sends (the sharing bar's readout). */
+  ownStats(): Promise<PublishStats | null> {
+    return this.publisher?.stats() ?? Promise.resolve(null);
   }
 
   /** What a watched share's slot decodes (the stage's quality badge). */
