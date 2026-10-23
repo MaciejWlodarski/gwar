@@ -535,7 +535,13 @@ export class Connection implements Link {
     this.nextId = 3;
     socket.onmessage = (msg) => {
       if (generation !== this.generation || typeof msg.data !== "string") return;
-      const frame = parseFrame(msg.data);
+      const frame = parseFrame(msg.data, () => {
+        // A rejected replacement plan cannot be acknowledged safely. Rejoin with
+        // a fresh Welcome, releasing the old session's fenced share and watches.
+        detach(socket);
+        socket.close(4002, "invalid screen recovery");
+        this.onSocketClosed();
+      });
       if (frame) this.routeFrame(frame);
     };
     socket.onclose = () => {

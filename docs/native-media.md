@@ -541,8 +541,10 @@ For H.264
     matching-profile decode probe; explicit resource ceilings still win ([Browser interop](#browser-interop)).
   - Native viewers offer the level their decoder supports (5.1 for 2160p30).
 - **Payload types:** one m-line can carry several codecs. The publish m-line
-  offers usable codecs (hardware AV1, H.264 and VP9), and the SFU
-  maps each viewer's payload type for the codec in flight.
+  offers usable codecs: native publishers offer hardware AV1 and H.264
+  (hardware or OpenH264); browser publishers offer H.264 with VP9 as an
+  emergency fallback. The SFU maps each viewer's payload type for the codec
+  in flight.
 
 #### Ingress frame bounds
 
@@ -1062,9 +1064,16 @@ this before mixed AV1/H.264 sharing ships.
 7. **Browser A2 compatibility.** H.264/VP9 browser sharers send
    one stream. An incompatible watch is explicitly refused with reason
    `codec`; the share continues. A request to the web sharer to fall back to
-   VP9, publisher codec replacement (E3), and a 30 s hold remain follow-ups. Web AV1 sending is not
-   enabled. This legacy path does not change the native primary-retention
-   rule above.
+   VP9 and publisher codec replacement (E3) are landed: corroborated decode
+   failures first cap H.264, then switch to VP9 while retaining watches.
+   Recovery changes have a 10 s hold; original-H.264 trials start after 2 min
+   (or after the reporters leave). A failed trial immediately rolls back to
+   the previous rendition, with later trials delayed by 4, 8, 16, then at
+   most 32 min until the share ends. Recovery plans retain the original
+   admitted dimensions, including 1440p and portrait shares; each axis is
+   bounded by level 5.1's 36864 macroblocks times 16 pixels. A rejected plan
+   forces the web connection to resync. Web AV1 sending is not enabled.
+   This browser path does not change the native primary-retention rule above.
 8. **Failures are explicit.** If no compatible layer can be produced, end
    only the affected watch. A failed hardware AV1 session may recover with
    H.264 through the same declared/keyframe transition; it must never start

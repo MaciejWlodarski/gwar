@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parseFrame } from "./frames";
 import { responseFor } from "./schema";
@@ -8,6 +9,27 @@ const message = { id: 1, target: { channel: 1 }, author: 1, author_uid: "uid", a
 const frame = (d: unknown) => JSON.stringify({ ev: "chat.message", d });
 
 describe("bounded server frames", () => {
+  it("round-trips the server's serialized original-size recovery plans", () => {
+    const frames: unknown[] = JSON.parse(readFileSync(new URL("../../../../crates/gwar-server/tests/screen-recovery-plans.json", import.meta.url), "utf8")) as unknown[];
+    for (const frame of frames) {
+      expect(parseFrame(JSON.stringify(frame))).toEqual({ kind: "event", event: frame });
+    }
+    for (const width of [0, -1, 1.5, 589825, Number.MAX_SAFE_INTEGER]) {
+      const onInvalid = vi.fn();
+      expect(parseFrame(JSON.stringify({ ev: "screen.recover", d: { share: "A".repeat(22), codec: "h264", width, height: 1440, fps: 60 } }), onInvalid)).toBeNull();
+      expect(onInvalid).toHaveBeenCalledOnce();
+    }
+    for (const envelope of [
+      { ev: "screen.recover", d: {}, extra: true },
+      { ev: "screen.recover", d: {}, re: 1 },
+      { ev: "screen.recover" },
+    ]) {
+      const onInvalid = vi.fn();
+      expect(parseFrame(JSON.stringify(envelope), onInvalid)).toBeNull();
+      expect(onInvalid).toHaveBeenCalledOnce();
+    }
+  });
+
   it("accepts typed events and responses and checks the expected operation", () => {
     expect(parseFrame(frame(message))?.kind).toBe("event");
     expect(parseFrame('{"re":1,"ok":{}}')?.kind).toBe("ok");

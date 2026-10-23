@@ -1,0 +1,42 @@
+[
+  {
+    "ev": "screen.recover",
+    "d": {
+      "share": "AAAAAAAAAAAAAAAAAAAAAA",
+      "codec": "h264",
+      "width": 2560,
+      "height": 1440,
+      "fps": 60
+    }
+  },
+  {
+    "ev": "screen.recover",
+    "d": {
+      "share": "AAAAAAAAAAAAAAAAAAAAAA",
+      "codec": "h264",
+      "width": 3840,
+      "height": 2160,
+      "fps": 60
+    }
+  },
+  {
+    "ev": "screen.recover",
+    "d": {
+      "share": "AAAAAAAAAAAAAAAAAAAAAA",
+      "codec": "h264",
+      "width": 589824,
+      "height": 16,
+      "fps": 60
+    }
+  },
+  {
+    "ev": "screen.recover",
+    "d": {
+      "share": "AAAAAAAAAAAAAAAAAAAAAA",
+      "codec": "h264",
+      "width": 16,
+      "height": 589824,
+      "fps": 60
+    }
+  }
+]

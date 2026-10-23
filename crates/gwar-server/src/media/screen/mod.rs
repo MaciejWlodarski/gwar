@@ -1446,6 +1446,7 @@ impl Sfu {
 
     /// Only all currently active, mature H.264 watches can change the share. A
     /// non-reporting browser or native viewer is positive evidence against a downgrade.
+    /// Returns true for an applied or deferred plan; only false permits isolation.
     fn try_recover(&mut self, share: &str, now: Instant) -> bool {
         let eligible: Vec<_> = self
             .slots_of(share)
@@ -1476,20 +1477,29 @@ impl Sfu {
             eligible.iter().map(|(s, _)| *s).collect(),
             now,
         );
-        if let Some(plan) = plan {
-            self.apply_recovery(origin, plan, false);
-            return true;
+        match plan {
+            recovery::Failure::Plan(plan) => {
+                self.apply_recovery(origin, plan, false);
+                true
+            }
+            // A hold-down fences replacement, not the viewer's right to its slot.
+            recovery::Failure::Deferred => true,
+            recovery::Failure::Incompatible => false,
         }
-        false
     }
 
     fn apply_recovery(&mut self, origin: Arc<ScreenOrigin>, plan: gwar_proto::ScreenRecovery, restoring: bool) {
-        let fs = plan.width.div_ceil(16) * plan.height.div_ceil(16);
+        let cap = if restoring {
+            None
+        } else {
+            let fs = plan.width.div_ceil(16) * plan.height.div_ceil(16);
+            Some((fs, fs * plan.fps))
+        };
         for (session, index) in self.slots_of(&origin.share) {
             let w = self.watchers.get_mut(&session).expect("assigned");
             w.egress.clear(index);
             let slot = &mut w.slots[index];
-            slot.decode_cap = if restoring { None } else { Some((fs, fs * plan.fps)) };
+            slot.decode_cap = cap;
             slot.failed_at = None;
             slot.segment.wait();
             slot.originals.clear();
@@ -3113,6 +3123,54 @@ pub(crate) mod tests {
             sfu.watchers.values().all(|w| w.slots[0].grant.is_some() && !w.slots[0].segment.waiting()),
             "VP9 keyframe opens every retained slot without codec stops"
         );
+    }
+
+    #[tokio::test]
+    async fn deferred_recovery_and_failed_restore_keep_every_viewer_slot() {
+        let (mut sfu, origin, now, need) = recovery_fixture(&[7, 8]).await;
+        let first = now + Duration::from_secs(5);
+        for session in [7, 8] {
+            report(&mut sfu, session, first);
+        }
+        origin.recovery.lock().unwrap().pending = false;
+        // Replacement's decoder can fail before the 10 s hold expires. That is
+        // deferred recovery, never incompatibility after the 2 s corroboration wait.
+        sfu.decode_reports.clear();
+        let early = first + DECODE_WINDOW;
+        for w in sfu.watchers.values_mut() {
+            w.slots[0].last_h264 = Some((early, need));
+        }
+        for session in [7, 8] {
+            report(&mut sfu, session, early);
+        }
+        sfu.recoveries(early + CORROBORATE_FOR);
+        assert!(!origin.recovery.lock().unwrap().pending);
+        assert!(sfu.watchers.values().all(|w| w.slots[0].grant.as_ref().unwrap().alive()));
+        let fallback = first + recovery::HOLD_DOWN;
+        sfu.recoveries(fallback);
+        assert!(origin.recovery.lock().unwrap().pending);
+        origin.recovery.lock().unwrap().pending = false;
+        let trial = fallback + Duration::from_secs(120);
+        sfu.recoveries(trial);
+        assert!(origin.recovery.lock().unwrap().pending);
+        origin.recovery.lock().unwrap().pending = false;
+        let failed = trial + DECODE_WINDOW;
+        for w in sfu.watchers.values_mut() {
+            w.slots[0].keyframe_at = Some(trial);
+            w.slots[0].last_h264 = Some((failed, need));
+        }
+        for session in [7, 8] {
+            report(&mut sfu, session, failed);
+        }
+        assert!(origin.recovery.lock().unwrap().pending, "failed trial immediately rolls back");
+        assert!(sfu.watchers.values().all(|w| w.slots[0].decode_cap == Some((3600, 108000))));
+        origin.recovery.lock().unwrap().pending = false;
+        sfu.recoveries(failed + CORROBORATE_FOR);
+        assert!(sfu.watchers.values().all(|w| w.slots[0].grant.as_ref().unwrap().alive()));
+        sfu.recoveries(failed + Duration::from_secs(239));
+        assert!(!origin.recovery.lock().unwrap().pending);
+        sfu.recoveries(failed + Duration::from_secs(240));
+        assert!(origin.recovery.lock().unwrap().pending, "next H.264 trial waits four minutes");
     }
 
     #[tokio::test]
