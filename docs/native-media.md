@@ -2,7 +2,10 @@
 
 Status: **plan, not scheduled.** Nothing here has a date. It describes where
 the clients are going, which pieces exist, and which pieces a contributor can
-build, in what order, and how each one is accepted.
+build, in what order, and how each one is accepted. Built so far: the AV1
+payload and Dependency Descriptor parsers (A1b,
+[#154](https://github.com/MaciejWlodarski/gwar/pull/154)); AV1 transport
+integration remains A2b.
 
 It extends [screen-share.md](screen-share.md). That design ships screen
 sharing through the server's SFU from browsers and the Tauri desktop app's
@@ -763,10 +766,10 @@ recent GPUs, but browser/WebRTC interoperability remains uneven
 
 The [AV1 RTP format](https://aomediacodec.github.io/av1-rtp-spec/) uses an
 aggregation header (`Z`, `Y`, `W`, `N`) and length-delimited OBU elements.
-A1b parses bounded LEB128 sizes, fragments and OBU types: sequence header
-(1), temporal delimiter (2), frame header (3), tile group (4), metadata (5),
-frame (6), redundant frame header (7) and padding (15). It does not decode
-pixels.
+A1b is built: its packet-local parser reads bounded LEB128 sizes, fragments
+and OBU types: sequence header (1), temporal delimiter (2), frame header
+(3), tile group (4), metadata (5), frame (6), redundant frame header (7) and
+padding (15). It does not decode pixels.
 
 - **Frame start:** Dependency Descriptor's start-of-frame when negotiated;
   otherwise a new RTP timestamp with a non-continuation start (`Z=0`) for
@@ -777,7 +780,14 @@ pixels.
   the sequence header on each join/recovery keyframe. Bounded confirmation
   retains the sequence-header prefix until that key frame is confirmed;
   loss, timeout or malformed input opens no segment and requests a throttled
-  PLI. A sequence header alone is not a keyframe.
+  PLI. A sequence header alone is not a keyframe. A1b's
+  `Payload::describe()` deliberately produces no keyframe descriptor for
+  split sequence headers or sequence/frame headers in separate packets,
+  even with cached sequence context. A2b must buffer before admission, use
+  bounded reassembly and source/sequence-scoped context to confirm the
+  keyframe, then mark the buffered frame's **actual first packet** when
+  admitting it. Marking the later packet that supplies confirmation loses
+  the prefix; directly wiring `describe()` would leave ingress waiting.
 - **Temporal layers:** negotiate the Dependency Descriptor (DD) RTP header
   extension. Parse templates, frame numbers, decode targets and dependencies;
   forward only complete frames whose dependencies the viewer has received.
@@ -786,23 +796,37 @@ pixels.
   encoders where hardware supports it; it lowers fps, not resolution.
 
 **Existing str0m 0.24.1 support**, checked in the Cargo registry source
-(the requested `vendor/str0m` path is absent in this checkout):
+for the crates.io version pinned by `Cargo.lock` (no `vendor/str0m` tree or
+str0m Cargo patch in this checkout):
 [`src/packet/av1.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/packet/av1.rs)
-has OBU packetization, fragmentation and depacketization; `enable_av1`
-configures AV1 at 90 kHz with RTX. AV1 SDP `profile`, `level-idx` and `tier`
-are parsed and serialized, but
+has `Av1Packetizer`/`Av1Depacketizer` for OBU framing, fragmentation and
+reconstruction, dispatched for `Codec::Av1` in `src/packet/mod.rs`.
+`RtcConfig::enable_av1` and `CodecConfig::enable_av1` configure AV1 at 90 kHz
+with RTX (default payload types 45/46). AV1 is enabled in upstream defaults;
+Gwar's screen transports call `clear_codecs` and enable only VP9/VP8.
+`src/format/codec.rs` supplies AV1 MIME/SDP naming;
+`src/format/format_params.rs` parses and serializes AV1 SDP `profile`,
+`level-idx` and `tier`, but
 [`src/format/payload_params.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/format/payload_params.rs)
 requires equality for all three (defaults 0, 5, 0); directional level/tier
 limit matching is not implemented. A2b must handle that constraint and test
-viewer receive limits. str0m's keyframe helper checks only `N`; it does not
-supply Gwar's bounded sequence-header/key-frame confirmation.
+viewer receive limits. Both `detect_av1_keyframe` and the depacketizer's
+`Av1CodecExtra::is_keyframe` metadata use only `N`; neither supplies Gwar's
+stricter candidate check or bounded sequence-header/key-frame confirmation.
 [`src/rtp/ext.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/rtp/ext.rs)
-has no built-in DD parser/serializer. `Extension::with_serializer` and
-`user_values` provide custom extension plumbing; a DD URI in an SDP test
-comment is not support. A2b must build and test DD parsing, serialization,
-negotiation, native frame-mode metadata hand-off and SFU forwarding. Gwar
-currently rebuilds outgoing extensions, so copying an SDP URI alone would
-lose DD on egress.
+has no built-in DD variant/parser/writer. `Extension::with_serializer`,
+`ExtensionSerializer`, `ExtensionValues::user_values` and `RtcConfig::set_extension`
+provide custom extension plumbing, including the two-byte extension form;
+a DD extmap in SDP test data is not implementation support. Gwar's bounded
+DD parser is built in A1b; A2b must wire it into serialization, negotiation,
+native frame-mode metadata hand-off and SFU forwarding. Register the
+[DD URI](https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension)
+on publish and watch transports and use the two-byte form for values over
+16 bytes. An upstream built-in DD implementation is optional, not a
+prerequisite. Gwar currently rebuilds outgoing extensions, so copying an
+SDP URI alone would lose DD on egress. Parser API details live beside
+[`av1.rs`](../crates/gwar-server/src/media/screen/av1.rs) and
+[`dependency_descriptor.rs`](../crates/gwar-server/src/media/screen/dependency_descriptor.rs).
 
 #### Encryption: OBU-aware SFrame
 
@@ -1575,15 +1599,20 @@ round of their own, as voice 5c/5d had.
 - Status: built; A2 integration remains separate.
 
 **A1b. AV1 payload parser ★** (S)
-- Builds: bounded aggregation-header/OBU parsing, frame-start metadata and
+- Built ([#154](https://github.com/MaciejWlodarski/gwar/pull/154)):
+  [`av1.rs`](../crates/gwar-server/src/media/screen/av1.rs) provides bounded
+  aggregation-header/OBU parsing, frame-start metadata and packet-local
   sequence-header plus key-frame candidates for `describe`, following
-  [AV1 RTP](#rtp-and-dependency-descriptor-a1b-a2b). No negotiation yet.
+  [AV1 RTP](#rtp-and-dependency-descriptor-a1b-a2b).
+  [`dependency_descriptor.rs`](../crates/gwar-server/src/media/screen/dependency_descriptor.rs)
+  parses mandatory and full DD syntax using attached or caller-cached
+  structures. No negotiation, retained transport state or forwarding yet.
 - Depends on: PR 3a.
 - Acceptance: vectors for aggregated/fragmented sequence and frame headers,
   `N` without a key frame, `Z=0` mid-frame, illegal `N=1,Z=1`, truncated or
   overflowing LEB128, unknown/reserved OBU types and empty payloads; fuzzing
   never reads past the packet or exceeds a fixed parse budget.
-- Now: yes.
+- Now: built; transport integration and split-header confirmation are A2b.
 
 **A2. H.264 on the screen transports** (M)
 - Builds: `enable_h264` with `packetization-mode=1` on publish and watch
@@ -1624,21 +1653,34 @@ round of their own, as voice 5c/5d had.
 - Now: after A1 and PR 3a/3b (#144); transport work waits for that foundation.
 
 **A2b. AV1 on the screen transports (including Dependency Descriptor)** (M–L)
-- Builds: AV1/RTX negotiation and per-viewer payload types and receive
-  limits; bounded random-access confirmation before opening a segment;
-  DD extension registration, parser/serializer and metadata hand-off through
-  str0m frame mode and SFU RTP mode; dependency-safe `L1T2`/`L1T3` forwarding
-  and consistent DD state across source/slot switches. Single-layer AV1 can
-  work without DD; no temporal dropping without valid DD. Keep the existing
-  ingress, RTX, keyframe-throttle, pacing and reservation limits.
+- Builds: AV1/RTX and protocol codec negotiation, per-viewer payload types
+  and receive limits under the hardware-dependent codec ladder and str0m's exact
+  profile/level/tier matching constraint; bounded pre-admission buffering
+  and random-access confirmation, marking the buffered frame's actual
+  first packet before opening a segment (including split/separate headers);
+  DD extension registration on both transports, A1b parser integration,
+  serialization/preservation with the two-byte form above 16 bytes, and
+  metadata hand-off through str0m frame mode and SFU RTP mode; dependency-safe
+  `L1T2`/`L1T3` forwarding and consistent DD state across source/slot switches.
+  Cache attached
+  structures per source and sequence/generation, retain active-target masks,
+  unwrap frame numbers and fence reordered/lost updates; mandatory fields
+  alone do not authorize drops. Use dependency/chain-aware temporal
+  selection and keyframe confirmation, rewriting DD consistently on source
+  switches. Single-layer AV1 can work without DD; no temporal dropping
+  without valid DD. Keep the existing ingress, RTX, keyframe-throttle,
+  pacing and reservation limits.
 - Depends on: A1b, PR 3a/3b. Test with single-codec synthetic publishers;
   A3 later adds mixed-codec admission.
 - Acceptance: real-SFU loopback: byte-identical AV1 to two viewers; a late
-  join receives sequence header plus key frame; a lost/reordered prefix or
-  sequence header without key frame opens no segment and causes a throttled
-  PLI; malformed DD and missing templates are bounded and fail closed for
+  join receives sequence header plus key frame, including split sequence
+  headers and sequence/frame headers in separate packets, with admission
+  starting at the buffered frame's actual first packet; a lost/reordered
+  prefix or sequence header without key frame opens no segment and causes a
+  throttled PLI; malformed DD and missing templates are bounded and fail closed for
   temporal selection. Under loss/reorder and temporal up/down switches,
   every forwarded frame has its dependencies; base-layer playback continues.
+  DD survives publish → SFU → watch with one- and two-byte extension forms.
   DD extmap IDs may differ per peer; RTX, frame-number wrap, pause/resume
   and stable-slot source replacement retain decodable descriptor state.
 - Now: after A1b and PR 3a/3b; use recorded AV1 and synthetic DD in tests,
@@ -2299,9 +2341,11 @@ before a native Linux UI exists.
 
 ### Order
 
+A1b's AV1 and DD parsers are built (#154); A2b supplies their transport integration.
+
 | Stage | Items | What it gives |
 | --- | --- | --- |
-| 0. Now | A1, A1b, B1, B3 (incl. dav1d fixtures), B6, F2, F3, F5, F6; B2 AV1 layout spike, E1b survey, D5 spike | parsers, traits, codecs, numbers and the audio harness; no user-visible change |
+| 0. Now | A1, B1, B3 (incl. dav1d fixtures), B6, F2, F3, F5, F6; B2 AV1 layout spike, E1b survey, D5 spike | parsers, traits, codecs, numbers and the audio harness; no user-visible change |
 | 1. After PR 3a/3b | A2, A2b, E1, B2 (VP9/VP8), B4, B5, F1 | a native test publisher and viewers; AV1 transport groundwork |
 | 2. First native sharing | A3, B11a, E1b, E3, C1, C3, B10, F2 AV1 runs, F4 publisher runs | desktop native sharing: Apple H.264; Windows AV1 where verified, lazy H.264 for mixed viewers (plaintext channels) |
 | 3. After screen-share PR 7 | B7, B2 (H.264/AV1), E2 | encrypted native shares only after each codec's layout/interop passes |
@@ -2313,7 +2357,7 @@ before a native Linux UI exists.
 Stages overlap. Stage 7's A4 can move earlier for the Text preset alone,
 which fits today's caps. Nothing here has a delivery date. The earlier
 10–14 week estimate predates AV1 and lazy codec layers; re-estimate stages
-0–2 after A1b/A2b and the hardware survey.
+0–2 after A2b and the hardware survey.
 
 ## 9. Testing strategy
 
@@ -2342,7 +2386,7 @@ which fits today's caps. Nothing here has a delivery date. The earlier
   code (AVCC to Annex B, parameter-set insertion) runs in CI on fixtures
   recorded from the real encoder, including the late-join case of
   [Track C](#track-c-per-platform-capture-and-encode).
-- **Fuzzing.** Payload parsers (A1/A1b), DD (A2b) and layouts (B2) get fuzz
+- **Fuzzing.** Payload parsers (A1/A1b), DD (A1b/A2b) and layouts (B2) get fuzz
   targets; CI runs them briefly, longer runs are manual.
 
 ### CI constraints
