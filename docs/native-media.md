@@ -712,10 +712,11 @@ reference for tests and CI.
 - **VP9 and VP8: libvpx** (BSD), for software encode and decode and legacy
   compatibility where H.264 cannot be used. Every web sharer sends VP9 or
   VP8, so native viewers must decode both anyway.
-- **AV1: dav1d, decode only on desktops**, up to about 1080p and only after
-  the workload passes the viewer latency/CPU gate (B3, D1–D3). No software
-  AV1 encoder is built or selected; phones without hardware AV1 decode get
-  H.264. [dav1d](https://code.videolan.org/videolan/dav1d) is a standalone
+- **AV1: dav1d, decode only on desktops**, at most 1080p30 per slot and only
+  at caps that pass the [desktop software decode gate](#desktop-av1-software-decode-gate)
+  (B3, D1–D3, F4 viewer runs). No software AV1 encoder is built or selected;
+  phones without hardware AV1 decode get H.264.
+  [dav1d](https://code.videolan.org/videolan/dav1d) is a standalone
   decoder; using it does not add the FFmpeg framework.
 - **FFmpeg is not used.** Its licensing (LGPL or GPL by configuration) and its
   patent exposure need a review the OS APIs and libvpx do not
@@ -757,8 +758,13 @@ pixels.
 **Existing str0m 0.24.1 support**, checked in the Cargo registry source
 (the requested `vendor/str0m` path is absent in this checkout):
 [`src/packet/av1.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/packet/av1.rs)
-has OBU packetization, fragmentation and depacketization; `enable_av1` and
-AV1 SDP support exist. Its keyframe helper checks only `N`; it does not
+has OBU packetization, fragmentation and depacketization; `enable_av1`
+configures AV1 at 90 kHz with RTX. AV1 SDP `profile`, `level-idx` and `tier`
+are parsed and serialized, but
+[`src/format/payload_params.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/format/payload_params.rs)
+requires equality for all three (defaults 0, 5, 0); directional level/tier
+limit matching is not implemented. A2b must handle that constraint and test
+viewer receive limits. str0m's keyframe helper checks only `N`; it does not
 supply Gwar's bounded sequence-header/key-frame confirmation.
 [`src/rtp/ext.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/rtp/ext.rs)
 has no built-in DD parser/serializer. `Extension::with_serializer` and
@@ -812,10 +818,12 @@ this before mixed AV1/H.264 sharing ships.
 
 1. **Viewers declare what they decode.** Record codecs and limits per watch
    transport: H.264 profiles/levels and the limits of
-   [Negotiation](#negotiation-a2); AV1 profile, level, bit depth, size, fps
+   [Negotiation](#negotiation-a2); AV1 profile, level, tier, bit depth, size, fps
    and eligible hardware/software decode path. Phone AV1 is hardware-only;
-   desktop software AV1 is capped at about 1080p. Unknown support is not
-   advertised. Re-evaluate when a viewer joins, leaves or updates its caps.
+   desktop software AV1 caps must pass the
+   [four-slot resource gate](#desktop-av1-software-decode-gate). Unknown
+   support is not advertised. Re-evaluate when a viewer joins, leaves or
+   updates its caps.
 2. **Sharers declare usable encoders, not just codec names.** Probe hardware
    at share start. Native order is `[AV1, H.264, VP9, VP8]` with hardware
    AV1, `[H.264, VP9, VP8]` otherwise; offer only working encoders. If no
@@ -1336,10 +1344,56 @@ the same pause and resume events.
 
 Native viewers must decode VP9 and VP8 (every web sharer's codecs) and H.264.
 AV1 is advertised only for a usable decode path within its measured limits.
-Desktop dav1d is accepted by B3/D1–D3; phone hardware decode by D1/D4.
+Desktop dav1d is accepted by B3/D1–D3 and F4's viewer runs under the gate
+below; phone hardware decode by D1/D4.
 A decoder error resets the decoder, marks the slot waiting for a keyframe and
 sends `screen.keyframe`, as the web receiver does after a decoder reset
 ([Keyframe recovery](screen-share.md#keyframe-recovery-around-key-changes)).
+
+### Desktop AV1 software decode gate
+
+These are initial acceptance bounds for dav1d, not measured performance
+claims. B3 supplies fixtures; D1–D3 and F4 qualify the actual viewer before
+it advertises software AV1:
+
+- **Caps:** test each advertised profile, level, tier, bit depth and size/fps
+  tuple on the exact machine/OS/build and dav1d version. The initial frame
+  rates are 15 or 30 fps, at most 1920 × 1080 per slot; never advertise 60 fps
+  or a higher resolution for this fallback. A passing 720p15 run does not
+  qualify 1080p30 or an untested profile/bit depth.
+- **Sustained load:** after 5 min of warm-up, measure at least 30 continuous
+  min with four independent, continuously changing AV1 streams, each at the
+  candidate cap, through the real SFU, watch transport, SFrame open, dav1d
+  and renderer. Use scrolling text and high-motion fixtures, with native
+  voice send/receive and playback active on the viewer's machine. Force all
+  four slots to decode and render at full rate; thumbnail throttling, paused
+  slots and repeated static frames cannot qualify the cap. Rotate the stage
+  slot. Each slot must present at least 99 % of expected frames, with no
+  stage-frame drops, no growing queue and p50 glass-to-glass ≤ 100 ms on
+  loopback. Loss/recovery tests run separately from this steady-state gate.
+- **CPU:** sample the entire viewer process once per second, including
+  transport, SFrame, all decoders, rendering and voice. The mean must be
+  ≤ 2 core equivalents and p95 ≤ 2.5; neither statistic may exceed 50 % of
+  the machine's logical-CPU capacity. One core equivalent is one logical CPU
+  fully busy, summed across threads. Record both core equivalents and the
+  machine's logical-CPU count so percentages are comparable.
+- **Thermals:** no OS serious/critical thermal state or reported thermal
+  throttling during the measured interval. Record OS thermal state or CPU
+  temperature/clock/throttle telemetry; missing telemetry leaves the cap
+  unqualified. Repeat for every supported power mode; an AC-only pass does
+  not qualify battery operation.
+- **Voice:** F4 runs the paired voice gate on this viewer machine with the
+  same four-slot workload and sustained duration, against a voice-only
+  baseline. Voice p95 and p99 must stay within baseline + 2 ms unconstrained,
+  p99 within baseline + 20 ms constrained, and the underrun rate within
+  baseline + 0.5 percentage points. Keep PR 3b's pair-validity rules and
+  confirm the four slots sustain their caps in every loaded run.
+
+Advertise only tuples and power modes that pass every bound, with a report
+identifying the machine, software and workload. Untested or failing caps
+are omitted; a lower size/fps cap needs its own passing run, otherwise use
+H.264. Revalidate after relevant decoder, OS or power-mode changes. This
+gate grants no software AV1 capability to iOS or Android.
 
 ### Rendering
 
@@ -1500,7 +1554,9 @@ round of their own, as voice 5c/5d had.
   mapping; the bounded prefix buffer and IDR confirmation of
   [SFU payload handling](#sfu-payload-handling-a1-a2), in `Ingress` and in
   the hand-off to `Segment::map`.
-- Depends on: A1, PR 3a.
+- Depends on: A1, PR 3a, and PR 3b
+  ([#144](https://github.com/MaciejWlodarski/gwar/pull/144)) for the required
+  pacing/allocation foundation.
 - Acceptance, in `crates/gwar-server/tests/screen.rs` (added by PR 3a) with
   str0m frame-mode clients:
   - an H.264 publisher reaches two viewers, frames byte-identical;
@@ -1519,7 +1575,7 @@ round of their own, as voice 5c/5d had.
   - publisher-side loss is repaired into place, as for VP9;
   - offers with `packetization-mode=0` only, or only unsupported profiles,
     are refused before negotiation.
-- Now: after A1.
+- Now: after A1 and PR 3a/3b (#144); transport work waits for that foundation.
 
 **A2b. AV1 on the screen transports (including Dependency Descriptor)** (M–L)
 - Builds: AV1/RTX negotiation and per-viewer payload types and receive
@@ -1539,8 +1595,8 @@ round of their own, as voice 5c/5d had.
   every forwarded frame has its dependencies; base-layer playback continues.
   DD extmap IDs may differ per peer; RTX, frame-number wrap, pause/resume
   and stable-slot source replacement retain decodable descriptor state.
-- Now: after A1b; use recorded AV1 and synthetic DD in tests, no encoder
-  required. Real hardware temporal publishing is B11.
+- Now: after A1b and PR 3a/3b; use recorded AV1 and synthetic DD in tests,
+  no encoder required. Real hardware temporal publishing is B11.
 
 **A3. Codec capabilities and switching** (L)
 - Builds: the rule in [Codec negotiation](#codec-negotiation-across-mixed-viewers):
@@ -1737,13 +1793,15 @@ are.
     rule 5 of [Codec negotiation](#codec-negotiation-across-mixed-viewers));
     re-enabling loads it again without a reinstall; a UI test finds the
     attribution text at the control;
-  - desktop dav1d decodes recorded AV1 fixtures through 1080p at the tested
-    fps within D1–D3's latency/CPU limits; above-budget capabilities are not
-    advertised; no AV1 software encoder can be selected;
+  - desktop dav1d decodes recorded AV1 fixtures at candidate caps up to
+    1080p30; advertising waits for D1–D3 and F4 viewer runs to pass every
+    [desktop software decode bound](#desktop-av1-software-decode-gate)
+    (four slots, duration, fps, latency, CPU, thermals and voice impact);
+    no AV1 software encoder can be selected;
   - iOS and Android builds contain neither OpenH264 nor dav1d (a `cargo
     tree` check in CI);
   - `THIRD_PARTY_NOTICES.md` and the cargo-about listing updated.
-- Now: yes.
+- Now: yes for adapters and fixtures; advertising waits for D1–D3/F4.
 
 **B4. Native publish transport** (L)
 - Builds: `screen.publish.offer` from Rust: a str0m frame-mode `Rtc` with one
@@ -1996,10 +2054,12 @@ Acceptance for D1–D4: glass-to-glass p50 within the
 [latency budget](screen-share.md#latency-budget) on loopback, measured with
 the frame stamp (F1); four slots decoding at once without dropping stage
 frames; a decoder reset recovers through `screen.keyframe` within 1 s; no
-frame is presented twice or out of order. Record AV1 profile/size/fps limits
-and four-slot CPU/thermal behaviour; desktop dav1d is capped at about 1080p
-per slot and advertised only when this workload passes. iOS/Android software
-AV1 is never advertised; unsupported phones receive H.264.
+frame is presented twice or out of order. Record AV1 profile/level/tier,
+bit depth and size/fps limits. Desktop dav1d must additionally pass every
+[software decode bound](#desktop-av1-software-decode-gate), including the
+sustained four-slot resource run and F4 viewer voice gate, before any cap is
+advertised. iOS/Android software AV1 is never advertised; unsupported phones
+receive H.264.
 
 D5 matters because it is the only way to give Linux desktop users watching
 before a native Linux UI exists.
@@ -2120,15 +2180,22 @@ before a native Linux UI exists.
   bitrates.
 - Now: yes.
 
-**F4. Voice gate with a native sharer** (M)
-- Builds: PR 3b's paired voice gate rerun with the native publisher on the
-  same machine as the native voice engine, so capture, encode and the screen
-  transport compete with voice for CPU and uplink.
-- Depends on: B4, PR 3b's gate tooling.
-- Acceptance: the same gate as PR 3b (voice p95 and p99 within 2 ms of the
-  paired baseline unconstrained; p99 within 20 ms constrained; underruns
-  within baseline + 0.5 %).
-- Now: no.
+**F4. Voice gate with native sharing and watching** (M)
+- Builds: PR 3b's paired voice gate rerun in two separate cases on the same
+  machine as the native voice engine: a native publisher (capture, encode
+  and transport competing for CPU/uplink), and a native viewer with four
+  concurrent dav1d slots under the
+  [software decode workload and duration](#desktop-av1-software-decode-gate).
+  Each loaded run has a voice-only baseline of the same duration and network
+  conditions; retain PR 3b's pair-validity and active-load checks.
+- Depends on: PR 3b's gate tooling; B4 for publishing; B5 and the relevant
+  D1–D3 adapter for viewing.
+- Acceptance: both cases pass the same gate as PR 3b (voice p95 and p99
+  within 2 ms of the paired baseline unconstrained; p99 within 20 ms
+  constrained; underrun rate within baseline + 0.5 percentage points).
+  The viewer case also passes every software decode resource bound; a
+  publisher-only result cannot qualify dav1d caps.
+- Now: publishing after B4; viewing after B5 and the platform's D-item.
 
 **F5. Platform checklists ★** (S, ongoing)
 - Builds: one manual checklist per platform in this document: picker and
@@ -2187,13 +2254,13 @@ before a native Linux UI exists.
 
 | Stage | Items | What it gives |
 | --- | --- | --- |
-| 0. Now | A1, A1b, B1, B3 (incl. dav1d), B6, F2, F3, F5, F6; B2 AV1 layout spike, E1b survey, D5 spike | parsers, traits, codecs, numbers and the audio harness; no user-visible change |
+| 0. Now | A1, A1b, B1, B3 (incl. dav1d fixtures), B6, F2, F3, F5, F6; B2 AV1 layout spike, E1b survey, D5 spike | parsers, traits, codecs, numbers and the audio harness; no user-visible change |
 | 1. After PR 3a/3b | A2, A2b, E1, B2 (VP9/VP8), B4, B5, F1 | a native test publisher and viewers; AV1 transport groundwork |
-| 2. First native sharing | A3, B11a, E1b, E3, C1, C3, B10, F2 AV1 runs, F4 | desktop native sharing: Apple H.264; Windows AV1 where verified, lazy H.264 for mixed viewers (plaintext channels) |
+| 2. First native sharing | A3, B11a, E1b, E3, C1, C3, B10, F2 AV1 runs, F4 publisher runs | desktop native sharing: Apple H.264; Windows AV1 where verified, lazy H.264 for mixed viewers (plaintext channels) |
 | 3. After screen-share PR 7 | B7, B2 (H.264/AV1), E2 | encrypted native shares only after each codec's layout/interop passes |
 | 4. After screen-share PR 9 | B8, C2, C4, F8 | desktop shares with sound, without Gwar's voice |
-| 5. Linux | C5, C6, D3, D5 | the Linux desktop app shares (and watches, if D5 works) |
-| 6. Native watching and mobile | D1, D2, B9, C7, C8, D4, C9, C10 | native viewers; Android and iOS sharing |
+| 5. Linux | C5, C6, D3, D5, F4 Linux viewer runs | the Linux desktop app shares (and watches, if D5 works) |
+| 6. Native watching and mobile | D1, D2, B9, C7, C8, D4, C9, C10, F4 viewer runs | native viewers; Android and iOS sharing |
 | 7. Higher tiers and quality layers | A4, A5, B11, E4, F7 | 1440p/2160p with H.264 simulcast; AV1 temporal SVC where hardware supports it |
 
 Stages overlap. Stage 7's A4 can move earlier for the Text preset alone,
@@ -2308,8 +2375,9 @@ the OS version, hardware and build, as screen-share PR 1's table does.
 - **Mixed codecs cost two encodes.** Lazy H.264 adds sessions and uplink,
   even beside AV1 SVC. A3/B11a bound aggregate work and refuse only a watch
   that cannot be served; new viewers never lower everyone else's codec.
-- **AV1 decode and metadata gaps.** Desktop dav1d's 1080p allowance needs
-  four-slot CPU/thermal measurements. Phones require hardware decode;
+- **AV1 decode and metadata gaps.** Desktop dav1d caps need the
+  [sustained four-slot resource and voice gate](#desktop-av1-software-decode-gate)
+  before advertisement. Phones require hardware decode;
   Safari/WKWebView offers depend on OS/device. DD is new implementation
   work, and OBU/size rewriting can break SFrame. A2b, B2 and E1b/E2 gate it;
   plaintext AV1 passing does not qualify encrypted AV1.
@@ -2435,6 +2503,6 @@ The details are in the linked sections.
 | 28 | Android SoCs exposing an AV1 hardware encoder through MediaCodec; input Surface, latency and temporal modes (no confirmed device list) | [Hardware encoders](#hardware-encoders-per-platform) | C7, B11, F2 |
 | 29 | Mobile AV1 hardware decode by exact device/OS, profile, size and fps; Apple VideoToolbox API coverage; no software AV1 on phones | [Decoding](#decoding) | D1, D4, F5 |
 | 30 | Safari/WKWebView AV1 WebRTC and DD by OS/device, stable versus Technology Preview software fallback, reliable phone hardware gating; Chromium/Firefox receive limits | [Browser AV1 reception](#browser-av1-reception) | E1b, F5 |
-| 31 | Desktop dav1d up to about 1080p: sustainable fps and four-slot CPU/thermal/voice impact per machine | [Software fallbacks](#software-fallbacks), [Decoding](#decoding) | B3, D1–D3, F4 |
+| 31 | Desktop dav1d caps up to 1080p30: each advertised tuple passes sustained four-slot fps/latency, CPU, thermal and paired viewer voice bounds per machine/power mode | [Software decode gate](#desktop-av1-software-decode-gate) | B3, D1–D3, F4 viewer runs |
 | 32 | Hardware AV1 L1T2/L1T3 support and sufficient dependency metadata; AV1/H.264 quality, recovery bitrate and concurrent encode cost | [Simulcast or SVC](#simulcast-or-svc) | A2b, B11, F2, F3 |
 | 33 | AV1 OBU canonicalization, clear header boundary, DD authentication contract and browser packetizer rewrites | [AV1 encryption](#encryption-obu-aware-sframe) | B2, E2 |
