@@ -184,4 +184,25 @@ describe("handle continuity", () => {
     await acceptHandle("alice", "B");
     expect(names).toEqual([`gwar.connect.handle-pins:${CONNECT_URL}`, `gwar.connect.handle-pins:${CONNECT_URL}`]);
   });
+
+  it("hears another tab's acceptance under the names of a later localStorage version", async () => {
+    // localStorage at version 2: the pins live under that version's names (lib/local-storage.ts).
+    const namespace = "0123456789abcdef";
+    storage.setItem("gwar.storage-version", `2.${namespace}`);
+    storage.setItem(`gwar.v2.${namespace}.storage-complete`, "1");
+    const stored = (handle: string) => `gwar.v2.${namespace}.${PREFIX.slice("gwar.".length)}${handle}`;
+    vi.resetModules();
+    vi.doMock("../lib/local-storage-migrations", () => ({ LOCAL_STORAGE_MIGRATIONS: [() => {}] }));
+    try {
+      const pins = await import("./handle-pins");
+      await pins.rememberHandle("alice", "A");
+      expect(JSON.parse(storage.getItem(stored("alice"))!).uid).toBe("A");
+      expect(pins.handleStatus("alice", "A")).toBe("verified");
+      // Another tab's user accepts account B for the handle.
+      storage.setItem(stored("alice"), JSON.stringify({ uid: "B" }));
+      storageEvent(stored("alice"));
+      expect(pins.handleStatus("alice", "A")).toBe("changed");
+      expect(pins.handleStatus("alice", "B")).toBe("verified");
+    } finally { vi.doUnmock("../lib/local-storage-migrations"); vi.resetModules(); }
+  });
 });

@@ -1,5 +1,5 @@
 import { CONNECT_URL } from "../lib/official";
-import { appStorage } from "../lib/local-storage";
+import { appKeyOf, appStorage } from "../lib/local-storage";
 
 /**
  * Handle continuity: the account (uid) this client first saw behind each verified Connect handle. Connect may
@@ -113,15 +113,21 @@ export function handlePinsVersion(): number {
   return version;
 }
 
-// Another tab pinned or accepted a handle, or cleared storage. Unreadable storage keeps what this tab knows.
-if (typeof window !== "undefined") {
-  window.addEventListener("storage", (e) => {
-    if (e.key === null) for (const handle of cache.keys()) refresh(handle);
-    else if (e.key.startsWith(PREFIX)) refresh(e.key.slice(PREFIX.length));
-    else return;
-    notify();
-  });
+/**
+ * A `storage` event: another tab pinned or accepted a handle, or cleared storage. Events carry the
+ * stored name, which is this version's (lib/local-storage.ts), not the plain one. Unreadable storage
+ * keeps what this tab knows.
+ */
+export function handlePinStored(key: string | null): void {
+  if (key === null) for (const handle of cache.keys()) refresh(handle);
+  else {
+    const name = appKeyOf(key);
+    if (!name?.startsWith(PREFIX)) return;
+    refresh(name.slice(PREFIX.length));
+  }
+  notify();
 }
+if (typeof window !== "undefined") window.addEventListener("storage", (e) => handlePinStored(e.key));
 
 /** Tests only. */
 export function resetHandlePins() {

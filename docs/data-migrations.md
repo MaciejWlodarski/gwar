@@ -22,8 +22,9 @@ question: [compatibility.md](compatibility.md).
   newer version to open again.
 - **Crash-safe.** A migration runs in one transaction with the version change
   where the store has transactions (IndexedDB, SQLite), so an interrupted one
-  commits nothing and runs again on the next open. Where it does not (files,
-  localStorage), every step is idempotent and the version is written last.
+  commits nothing and runs again on the next open. Files are written whole and replaced in one
+  step. localStorage is upgraded into a fresh namespace that is published in
+  IndexedDB only when complete (below).
 - **Released migrations never change.** A database that ran one would differ from
   a new one. A mistake is fixed by a new migration.
 - **Rollbacks.** A deploy that bumps a store version cannot be rolled back
@@ -59,7 +60,7 @@ its WebKit data directory.
 
 | Store | Holds | Version and mechanism |
 | --- | --- | --- |
-| IndexedDB `gwar`, store `kv` (`net/kv.ts`) | `identity`: the local identity, `{format: "gwar-identity", version: 1, jwk, nickname}` (the private key as a JWK; also the identity backup file format). `connect`: the Gwar Connect sign-in, `{version: 1, handle, nickname?, accountKey, deviceName, deviceJwk, certificate, token, vaultKey, archiveRecovery?, archiveRecoverySecret?}`. `moved-from-vc`: a timestamp left by the old rename move, unused. | Database version 1 (`KV_MIGRATIONS`). Each record has its own `version`, upgraded as it is read (`IDENTITY_UPGRADES`, `CONNECT_UPGRADES`, `upgradeRecord`). Every write and delete (save, sign-out, enrollment's removal of the old identity) reads the stored record in the same transaction and aborts if it is newer. **Never wiped**: an unreadable identity (including a key the browser rejects although it has Ed25519, which is not reported as a browser without Ed25519) fails to load and stays. |
+| IndexedDB `gwar`, store `kv` (`net/kv.ts`) | `identity`: the local identity, `{format: "gwar-identity", version: 1, jwk, nickname}` (the private key as a JWK; also the identity backup file format). `connect`: the Gwar Connect sign-in, `{version: 1, handle, nickname?, accountKey, deviceName, deviceJwk, certificate, token, vaultKey, archiveRecovery?, archiveRecoverySecret?}`. `moved-from-vc`: a timestamp left by the old rename move, unused. `local-storage`: which localStorage namespace is current (below). | Database version 1 (`KV_MIGRATIONS`). Each record has its own `version`, upgraded as it is read (`IDENTITY_UPGRADES`, `CONNECT_UPGRADES`, `upgradeRecord`). Every write and delete (save, sign-out, enrollment's removal of the old identity) reads the stored record in the same transaction and aborts if it is newer. **Never wiped**: an unreadable identity (including a key the browser rejects although it has Ed25519, which is not reported as a browser without Ed25519) fails to load and stays. |
 | IndexedDB `gwar-message-auth-v3` (`net/message-storage.ts`) | `checkpoints` (by `server/author/message`, index `at`): `{revision, hash, created, conversation, at, proven?, deleted?, files?, order}`; `revocations` (by `account:device`): account-signed revocations; `feeds` (by Connect URL): `{cursor, checked, available?, read?}`; `order`: one counter. | Database version 3 (`MESSAGE_STORAGE_MIGRATIONS`; version 1 never held data, the name started at 2). Not a cache: losing it loses rollback protection, so it is migrated, never emptied. |
 | IndexedDB `gwar-mls-v2-<device public key>` (`mls/storage.ts`) | The device's MLS agent: stores `openmls` (OpenMLS's own records), `groups` (`@device`, group records, `{server}/@server` owner pins, `@archive`), `epochs`, `outbox`; binary keys and values written by `crates/gwar-mls`. The runtime's jobs (`@runtime/…`, JSON) live in `outbox`. | Database version 1 (`MLS_MIGRATIONS`), which also versions the runtime's jobs. The agent's records have their own format, the `version` of `@device` (`STORE_FORMAT` in `crates/gwar-mls/src/agent/mod.rs`, currently 1): `STORE_UPGRADES` run as the agent loads and reach storage with its next write. OpenMLS's own records are keyed by its storage version, pinned by a test. **Never wiped**: an unreadable state fails to load and stays. |
 | localStorage `gwar.settings` (zustand `persist`) | Preferences, bookmarks (with server and channel passwords), removed bookmarks, the last server, per-server flags. | The localStorage version (below). zustand's own `version` stays 1. |
@@ -67,7 +68,7 @@ its WebKit data directory.
 | localStorage `gwar.channels:<server key>` | `{known, deleted, incomplete}`: channel ids seen and seen deleted. | The localStorage version. A record it cannot read becomes "incomplete" (fails closed), never clean. |
 | localStorage `gwar.connect.handle-pin:<Connect URL>:<handle>` | `{uid}`: the account first seen behind a handle. | The localStorage version. |
 | localStorage `gwar.connect.service-key:<Connect URL>` | Gwar Connect's service key. | Cache; refetched. |
-| localStorage `gwar.storage-version` | The version of all the keys above (`lib/local-storage.ts`); missing means 1. | — |
+| localStorage `gwar.storage-version` | Mirror of the published layout of the keys above (`lib/local-storage.ts`): `n.<id>`; missing means 1. | Written after the IndexedDB record `local-storage` in `gwar`, which decides. |
 | Cache Storage `gwar-denoise` | The noise suppression module and model. | Cache: entries not in use are deleted. |
 
 ### Desktop app (Tauri)
@@ -166,28 +167,47 @@ operation after it. Until then each load runs it again.
 
 ### localStorage
 
-`gwar.storage-version` holds one version for every key the app keeps there
-(missing: 1). `migrateLocalStorage` runs `LOCAL_STORAGE_MIGRATIONS` from it on
-and writes the version after each step.
+localStorage has no transactions, and across tabs it is not even consistent:
+each tab's process keeps its own copy and hears of other tabs' writes later, in
+the order each tab made them. So no upgrade is decided from what localStorage
+shows (`lib/local-storage.ts`):
 
-Each version keeps its entries under its own names: version 1 the plain ones
-(`gwar.settings`), version n `gwar.vn.settings` (`localStorageKey`). A migration
-copies the previous version's entries forward (`copyLocalStorageForward`,
-changing them on the way) and never changes or removes them. localStorage has
-no transactions, and across tabs not even a check followed by a write is atomic:
-each tab's process writes its own copy and tells the others afterwards, so
-neither a version check nor a lock (Web Locks only order the tabs, not when one
-sees another's writes) stops a tab of the older version from writing just after
-a newer tab upgraded. With separate names that late write lands in the older
-version's entries, which the newer version never reads again, so it cannot
-erase anything newer. Old entries may be deleted two versions later. Every key goes through the gate in
-`lib/local-storage.ts` (`guardedLocalStorage` for the settings, `appStorage` for
-the pins, channel records and service keys), which reads the version again
-before each read and write, so a tab opened before a newer version's tab
-upgraded localStorage stops writing at once. Other tabs also hear the change as
-a `storage` event and replace the app with the error screen. A newer or
-unreadable version, or a failed step, leaves everything untouched: nothing is
-read or written, and the app shows the "saved by a newer version" screen.
+- **Namespaces.** Each version keeps its entries under names of its own:
+  version 1 the plain ones (`gwar.settings`), a later version n
+  `gwar.vn.<id>.settings`, `<id>` random per upgrade (`localStorageKey`).
+- **IndexedDB decides.** The `local-storage` record of the `gwar` database names
+  the published namespace (`{version, namespace, previous}`); a missing record
+  means version 1. `gwar.storage-version` mirrors it (`n.<id>`) for the
+  synchronous checks and, through the `storage` event, for other tabs; it is
+  written only after the record.
+- **One upgrade at a time.** `prepareLocalStorage` runs at start, before the
+  first render. An upgrade runs under a Web Lock shared by the tabs: it reads the
+  record, waits until the published namespace's completion marker is visible in
+  this tab (entries written before it are then visible too), writes the next
+  version into a fresh namespace nobody reads yet (`LOCAL_STORAGE_MIGRATIONS`,
+  usually `copyLocalStorageForward`), writes its marker, and publishes it in one
+  IndexedDB transaction only if the record still names the namespace it started
+  from. The version only moves forward. A tab that waited for the lock finds the
+  upgrade published and never writes the namespace itself; a tab that died
+  halfway leaves an unpublished namespace, and the next attempt uses a new one,
+  so the dead tab's late writes land nowhere that is read. A late or replayed
+  mirror of an older version is ignored: the record decides, and the mirror is
+  written again from it.
+- **Older tabs.** A tab of the older version keeps writing its own namespace,
+  which the new version never reads: a late write cannot erase newer data, and
+  is lost to the new version.
+- **Retention.** After publishing version n, the upgrade removes every namespace
+  but n's and n − 1's: older versions and abandoned upgrades. Version n − 1's
+  stays for its open tabs; it goes with the next upgrade.
+- **Gate.** Every key goes through `guardedLocalStorage` (the settings) or
+  `appStorage` (the pins, channel records and service keys), which check the
+  mirror again on each read and write and use the current namespace; `storage`
+  events carry stored names, which `appKeyOf` maps back. The pre-paint theme
+  (`public/theme.js`) reads the settings under the mirror's namespace too.
+- A newer or unreadable version, in the record or the mirror, or a failed step,
+  leaves everything untouched: nothing is read or written, and the app shows the
+  "saved by a newer version" screen. Settings read before an upgrade finished
+  are read again once it has.
 
 ### Desktop files
 
@@ -231,9 +251,10 @@ Every kind has a test that fails when the version grows without a fixture:
   needs a store upgrade too.
 - **MLS runtime jobs:** a change to a job's shape is an `MLS_MIGRATIONS` step that
   rewrites the `@runtime/` records of `outbox`.
-- **localStorage:** append to `LOCAL_STORAGE_MIGRATIONS` a step that calls
-  `copyLocalStorageForward` (idempotent; never changes the previous version's
-  entries) and add the old data to `LOCAL_FIXTURES`. Do not bump
+- **localStorage:** append to `LOCAL_STORAGE_MIGRATIONS`
+  (`lib/local-storage-migrations.ts`) a step that writes the new version's
+  entries into `to` from `from`, usually with `copyLocalStorageForward`; it never
+  changes `from`. Add the old data to `LOCAL_FIXTURES`. Do not bump
   zustand's `version` for `gwar.settings`.
 - **Desktop TeamSpeak identities:** append to `UPGRADES` in
   `crates/gwar-client/src/ts_identities.rs` and add the old file to its

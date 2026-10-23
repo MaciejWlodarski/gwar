@@ -6,13 +6,20 @@ import { consumeInviteFromLocation } from "./state/invite-boot";
 import { captureLogs } from "./lib/diagnostics";
 import { isDesktop, tauri } from "./platform";
 import { storedDataProblem } from "./lib/stored-data-check";
-import { localStorageError, watchLocalStorage } from "./lib/local-storage";
+import { localStorageError, localStorageUsable, prepareLocalStorage, watchLocalStorage } from "./lib/local-storage";
+import { useSettings } from "./state/settings";
 import { StoredDataError } from "./ui/StoredDataError";
 
 // Recent warnings and errors, kept in memory for a bug report.
 captureLogs();
 
 if (import.meta.env.MODE === "e2e") await import("./e2e");
+
+// localStorage before anything uses it: an upgrade runs in one tab at a time, and settings that
+// could not be read when their module loaded (an upgrade pending) are read once it is done.
+const settingsRead = localStorageUsable();
+await prepareLocalStorage();
+if (!settingsRead && localStorageUsable()) await useSettings.persist.rehydrate();
 
 consumeInviteFromLocation();
 
