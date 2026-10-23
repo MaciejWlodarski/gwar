@@ -1842,6 +1842,10 @@ are.
   later counter-based helper in `apps/web/e2e/screen-source.mjs` informed
   the normalized geometry, but is not the same wire format. The reader
   supports BGRA and YUV luma; it is for loopback with one shared epoch.
+  It samples the central half of fractional cells before rounding to pixel
+  boundaries, preserving the 128x32 writer minimum even for odd dimensions.
+  Scaling regressions cover 2x2 box-filter halving (dropping odd trailing
+  rows/columns) and nearest-neighbor doubling, including a width sweep.
 - Status: built; codecs, capture adapters, transports and measurement reports
   remain the later items below.
 

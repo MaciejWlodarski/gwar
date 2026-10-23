@@ -5,7 +5,9 @@
 //! marker/payload bytes. Black is one. Unlike the browser e2e counter barcode, this measures
 //! time. Its period is 2^20 ms; interpret only loopback delays below half that period.
 //! Normalized cells survive resizing. Write at >=128x32; read at >=64x16, including after 0.5x
-//! scaling. Readback supports BGRA, NV12 and I420 (YUV uses the luma plane, including limited range).
+//! scaling. Odd trailing rows/columns may be dropped when halving with a 2x2 box filter;
+//! doubling with nearest-neighbor sampling is also supported. Readback supports BGRA, NV12 and
+//! I420 (YUV uses the luma plane, including limited range).
 
 use std::time::Duration;
 
@@ -87,24 +89,27 @@ pub fn write_bgra(size: Size, stride: usize, data: &mut [u8], stamp: FrameStamp)
 }
 
 /// Read a stamp from a captured/decoded CPU image, rejecting low contrast or a bad marker/CRC.
-/// Samples cell interiors rather than edges so resampling and YUV range conversion are tolerated.
+/// Samples the central half of each fractional cell, rounded to the nearest pixel boundaries.
+/// This keeps even two-pixel cells away from blended edges after halving odd-sized images,
+/// while averaging a wider interior at larger sizes to tolerate noise and YUV range conversion.
 pub fn read(frame: &CpuFrame) -> Result<FrameStamp> {
     let size = frame.size();
     if size.width < 64 || size.height < 16 {
         return Err(MediaError::Invalid("stamp reader needs at least 64x16"));
     }
-    let w = size.width as usize;
+    let w = u64::from(size.width);
     let h = size.height as usize;
     let plane = &frame.planes()[0];
     let mut word = 0u32;
     for cell in 0..32 {
-        let left = cell * w / 32;
-        let right = (cell + 1) * w / 32;
-        let inset = (right - left) / 4;
+        // Round the exact quarter/three-quarter positions, not previously floored cell edges.
+        // The central half is at least one pixel wide; u64 also covers every u32 frame width.
+        let left = (((4 * cell + 1) * w + 64) / 128) as usize;
+        let right = (((4 * cell + 3) * w + 64) / 128) as usize;
         let mut sum = 0u64;
         let mut count = 0u64;
         for y in h / 16..(3 * h / 16).max(h / 16 + 1) {
-            for x in left + inset..right - inset {
+            for x in left..right {
                 let offset = y * plane.stride;
                 sum += match frame.format() {
                     PixelFormat::Bgra => {
@@ -184,15 +189,41 @@ mod tests {
         }
     }
 
+    fn assert_scaling_round_trip(size: Size, millis: u64) {
+        let image = image(size, millis);
+        let expected = FrameStamp::from_capture_time(Duration::from_millis(millis));
+        assert_eq!(read(&image), Ok(expected), "original {size:?}, timestamp {millis}");
+        for twice in [false, true] {
+            let scaled = resize(&image, twice);
+            assert_eq!(read(&scaled), Ok(expected), "{size:?} -> {:?}, timestamp {millis}", scaled.size());
+        }
+    }
+
     #[test]
     fn stamp_survives_half_and_double_scaling_with_padded_and_odd_rows() {
-        for size in [Size { width: 128, height: 32 }, Size { width: 642, height: 362 }] {
+        for size in [
+            Size { width: 128, height: 32 },
+            Size { width: 129, height: 33 },
+            Size { width: 131, height: 33 }, // Regression: 2x2 box filter produces 65x16.
+            Size { width: 135, height: 35 },
+            Size { width: 159, height: 47 },
+            Size { width: 191, height: 63 },
+            Size { width: 257, height: 65 },
+            Size { width: 642, height: 362 },
+            Size { width: 643, height: 363 },
+        ] {
             for millis in [0, 1, 255, 65535, 0x55555, 0xaaaaa, u64::from(MASK), u64::from(PERIOD_MS) + 37] {
-                let image = image(size, millis);
-                let expected = FrameStamp::from_capture_time(Duration::from_millis(millis));
-                assert_eq!(read(&image), Ok(expected));
-                assert_eq!(read(&resize(&image, false)), Ok(expected));
-                assert_eq!(read(&resize(&image, true)), Ok(expected));
+                assert_scaling_round_trip(size, millis);
+            }
+        }
+    }
+
+    #[test]
+    fn stamp_scaling_sweeps_narrow_cell_widths_and_boundary_rounding() {
+        for width in 128..=385 {
+            let size = Size { width, height: 33 + (width % 4) * 2 };
+            for millis in [0, 0x55555, 0xaaaaa, u64::from(MASK)] {
+                assert_scaling_round_trip(size, millis);
             }
         }
     }
