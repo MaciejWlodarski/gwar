@@ -1141,8 +1141,11 @@ immediately. At the quality floor, sustained pressure pauses the layer instead
 of breaking its preset; resumption also requires 10 s of headroom at that
 setting. A failed encoder is excluded for the controller's lifetime; outputs identify the exact B1
 capability candidate by its input index, and fallback cannot immediately raise
-resolution or fps. Text/Smooth retain the replacement's full recovery ladder
-and can regain fps after the recovery hold; Game retains its prior cadence.
+resolution or fps. If the prior fps falls below the replacement's normal
+ladder, fallback inserts that cadence at the highest supported resolution
+within the previous dimensions. Lower-resolution degradation steps keep that
+cadence. Text/Smooth retain higher-fps recovery steps and can regain fps after
+the recovery hold; Game retains its prior cadence.
 Selection follows hardware AV1 → H.264 → VP9 → VP8,
 with hardware before software within each codec, and always rejects software
 AV1. Callers supply only verified, negotiated, platform-eligible B1 caps;

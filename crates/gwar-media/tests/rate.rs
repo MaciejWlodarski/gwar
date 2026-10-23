@@ -417,6 +417,85 @@ fn degraded_smooth_recovers_full_frame_rate_after_failover() {
 }
 
 #[test]
+fn low_fps_smooth_failover_keeps_the_highest_supported_resolution() {
+    for (tier, replacement_tier) in [
+        (ResolutionTier::P1440, ResolutionTier::P1440),
+        (ResolutionTier::P2160, ResolutionTier::P2160),
+        (ResolutionTier::P2160, ResolutionTier::P1440),
+    ] {
+        let encoders = [
+            CodecCaps { max_fps: 10, ..caps(AV1, true) },
+            CodecCaps { max_size: replacement_tier.size(), max_fps: 30, ..caps(H264, true) },
+        ];
+        let mut c = RateController::new(config(Preset::Smooth, tier), &encoders).unwrap();
+        let before = encode(c.decision());
+        assert_eq!(before.encoder.size, tier.size());
+        assert_eq!(before.encoder.rate.max_fps, 10);
+        let replacement = encode(sample(&mut c, 0, ControllerFeedback { encoder_failed: true, ..healthy() }));
+        assert_eq!(replacement.encoder_index, 1);
+        assert_eq!(replacement.encoder.profile, H264);
+        assert_eq!(replacement.tier, replacement_tier);
+        assert_eq!(replacement.encoder.size, replacement_tier.size());
+        assert_eq!(replacement.encoder.rate.max_fps, 10);
+    }
+}
+
+#[test]
+fn low_fps_smooth_failover_keeps_1440p_at_three_megabits() {
+    let encoders = [
+        CodecCaps { max_fps: 10, ..caps(AV1, true) },
+        CodecCaps { max_size: ResolutionTier::P1440.size(), max_fps: 30, ..caps(H264, true) },
+    ];
+    let mut c = RateController::new(config(Preset::Smooth, ResolutionTier::P1440), &encoders).unwrap();
+    let feedback = ControllerFeedback { bandwidth_bps: 3_000_000, ..healthy() };
+    let replacement = encode(sample(&mut c, 0, ControllerFeedback { encoder_failed: true, ..feedback }));
+    assert_eq!(replacement.encoder.profile, H264);
+    assert_eq!(replacement.encoder.size, ResolutionTier::P1440.size());
+    assert_eq!(replacement.encoder.rate, RateControl { max_fps: 10, bitrate_bps: 2_333_333 });
+    for second in 1..=90 {
+        assert_eq!(sample(&mut c, second, feedback), RateDecision::Encode(replacement));
+    }
+}
+
+#[test]
+fn low_fps_smooth_failover_retains_degradation_and_full_cadence_recovery() {
+    let encoders = [
+        CodecCaps { max_fps: 10, ..caps(AV1, true) },
+        CodecCaps { max_size: ResolutionTier::P1440.size(), max_fps: 30, ..caps(H264, true) },
+    ];
+    let mut c = RateController::new(config(Preset::Smooth, ResolutionTier::P1440), &encoders).unwrap();
+    sample(&mut c, 0, ControllerFeedback { encoder_failed: true, ..healthy() });
+    for (start, tier) in [(1, ResolutionTier::P1080), (4, ResolutionTier::P720)] {
+        let before = c.decision();
+        let pressure = ControllerFeedback { encoder_dropped: true, ..healthy() };
+        for second in start..start + 2 {
+            assert_eq!(sample(&mut c, second, pressure), before);
+        }
+        let degraded = encode(sample(&mut c, start + 2, pressure));
+        assert_eq!(degraded.tier, tier);
+        assert_eq!(degraded.encoder.size, tier.size());
+        assert_eq!(degraded.encoder.rate.max_fps, 10);
+    }
+    for (start, tier, fps) in [
+        (7, ResolutionTier::P1080, 10),
+        (18, ResolutionTier::P1440, 10),
+        (29, ResolutionTier::P1440, 15),
+        (40, ResolutionTier::P1440, 20),
+        (51, ResolutionTier::P1440, 30),
+    ] {
+        let before = c.decision();
+        for second in start..start + 10 {
+            assert_eq!(sample(&mut c, second, healthy()), before);
+        }
+        let recovered = encode(sample(&mut c, start + 10, healthy()));
+        assert_eq!(recovered.encoder_index, 1);
+        assert_eq!(recovered.tier, tier);
+        assert_eq!(recovered.encoder.size, tier.size());
+        assert_eq!(recovered.encoder.rate.max_fps, fps);
+    }
+}
+
+#[test]
 fn transient_bitrate_cut_recovers_at_the_current_rung_before_quality_promotion() {
     let mut c = controller(Preset::Text, ResolutionTier::P1080);
     for second in 0..=2 {

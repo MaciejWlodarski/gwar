@@ -317,16 +317,22 @@ impl RateController {
             });
             let step = step.or_else(|| {
                 // An unusually low capability fps can fall below every recovery rung.
-                // Append a safe floor without removing the replacement's recovery ladder.
-                let mut floor = *plan.steps.last()?;
-                if floor.encoder.size.width > prior.encoder.size.width
-                    || floor.encoder.size.height > prior.encoder.size.height
-                {
-                    return None;
+                // Keep the highest supported resolution within the previous dimensions,
+                // inserting its inherited cadence after the higher-fps recovery steps.
+                let first = plan.steps.iter().position(|target| {
+                    target.encoder.size.width <= prior.encoder.size.width
+                        && target.encoder.size.height <= prior.encoder.size.height
+                })?;
+                let size = plan.steps[first].encoder.size;
+                let step = plan.steps.iter().rposition(|target| target.encoder.size == size)? + 1;
+                let mut start = plan.steps[step - 1];
+                limit_fps(&mut start, prior.encoder.rate.max_fps);
+                plan.steps.insert(step, start);
+                // Further pressure may reduce resolution, but must not increase fps.
+                for target in &mut plan.steps[step + 1..] {
+                    limit_fps(target, prior.encoder.rate.max_fps);
                 }
-                limit_fps(&mut floor, prior.encoder.rate.max_fps);
-                plan.steps.push(floor);
-                Some(plan.steps.len() - 1)
+                Some(step)
             });
             if let Some(step) = step {
                 self.step = step;
