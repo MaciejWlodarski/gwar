@@ -3,10 +3,12 @@
 Status: **plan, not scheduled.** Nothing here has a date. It describes where
 the clients are going, which pieces exist, and which pieces a contributor can
 build, in what order, and how each one is accepted. Built so far: the H.264
-payload parser (A1, [#153](https://github.com/MaciejWlodarski/gwar/pull/153))
-and the AV1 payload and Dependency Descriptor parsers (A1b,
-[#154](https://github.com/MaciejWlodarski/gwar/pull/154)); transport
-integration remains A2 and A2b.
+payload parser (A1, [#153](https://github.com/MaciejWlodarski/gwar/pull/153)),
+the AV1 payload and Dependency Descriptor parsers (A1b,
+[#154](https://github.com/MaciejWlodarski/gwar/pull/154)), the platform-neutral
+contracts and test source (B1, [#158](https://github.com/MaciejWlodarski/gwar/pull/158)),
+and the rate and quality controller (B6). Transport integration remains A2/A2b
+and B4/B5; native sharing is not wired yet.
 
 It extends [screen-share.md](screen-share.md). That design ships screen
 sharing through the server's SFU from browsers and the Tauri desktop app's
@@ -989,7 +991,11 @@ Starting points for H.264 hardware encoding. They are to be measured
   [open owner decision](#owner-decisions-needed).
 - VP9 needs roughly the bitrates above at equal quality **(to verify; F3)**;
   its software encoder is the limit at 1440p60. AV1 rates are measured by F3,
-  not an assumed percentage saving; the caps remain unchanged.
+  not an assumed percentage saving; the caps remain unchanged. B6 uses the
+  same provisional rates for every codec until those measurements exist, with
+  720p reference rates of 1.25/2/4 Mbps for Text/Smooth/Game. Rates scale
+  with actual pixel count and frame rate, with a 100 kbps floor. This is a
+  policy starting point, not a measured quality guarantee.
 
 ### SFU limits to raise
 
@@ -1091,18 +1097,56 @@ Targets for a sharer, measured by [F2](#track-f-measurements-and-qa):
 | Software encode | 1080p30 at most; ≤ 1.5 cores |
 | Voice | unaffected: the paired voice gate of [F4](#track-f-measurements-and-qa) |
 
-When to downscale (work item [B6](#track-b-shared-rust-media-core)):
+The built [B6 controller](../crates/gwar-media/src/rate.rs) treats any of the
+following as pressure. Two continuous seconds lower one quality step:
 
-- The encoder reports late or dropped frames, or encode time stays above
-  80 % of the frame interval for 2 s.
-- The capture adapter reports dropped frames.
-- The send-side estimate stays below the current tier's need.
+- The encoder reports late/dropped frames, or capture reports dropped frames.
+- Encode time exceeds 80 % of the frame interval, or the hardware path's
+  8/12 ms target above (whichever is lower).
+- Attributable capture/encode/submission/SFrame/packetization CPU exceeds the
+  100/150/1500 millicore budget above (1000 means one full core).
+- The layer's allocated send-side estimate is below the current setting's
+  nominal need. The publisher reserves voice, overhead and other layers
+  before passing this allocation; B6 does not allocate aggregate uplink.
 
-Text keeps resolution and lowers frame rate (as `maintain-resolution`). Game
-keeps frame rate and lowers resolution, one tier at a time (as
-`maintain-framerate`). Recovery waits 10 s of headroom before stepping up,
-to avoid oscillation. A hardware encoder's own silicon is separate from the
-3D engine, so a game's frame rate should barely change; F2 measures it.
+Text keeps physical resolution and lowers 15 → 10 → 5 fps (as
+`maintain-resolution`). Game keeps its initial frame rate and lowers
+resolution one tier at a time to 720p (as `maintain-framerate`); a requested
+2160p Game share starts at 30 fps and keeps 30 fps when downscaled. Smooth
+lowers 30 → 20 → 15 fps, then resolution one tier at a time at 15 fps.
+These ladders skip duplicate settings for smaller sources or capability caps.
+Sizes preserve source aspect ratio within even-pixel rounding, never upscale,
+and rotate the tier bounds for portrait sources. Software is capped at
+1080p30 at construction/failover, including Game; Text refuses a fallback
+that cannot retain its physical resolution. The requested preset/tier must
+fit the administrative bitrate cap before the controller is constructed.
+
+Recovery requires 10 continuous seconds with no late/dropped frames, at
+least 20 % spare bandwidth over the **next** setting's nominal need, CPU at
+most 80 % of that setting's budget, and encode time at most 60 % of its
+frame interval and 80 % of its hardware latency target. Only one step
+recovers per hold. Intermediate feedback resets both holds; timestamps are
+strictly increasing and gaps over 1 s break continuity. Adapters must supply
+interval observations at least once a second; missing samples prove neither
+pressure nor headroom. The same 2 s hold damps transient drop reports.
+
+Bitrate cuts follow a lower allocation immediately; increases require the
+same 10 s headroom hold. Zero bandwidth pauses immediately. At the quality
+floor, sustained pressure pauses the layer instead of breaking its preset;
+resumption also requires 10 s of headroom at that setting. A failed encoder
+is excluded for the controller's lifetime; outputs identify the exact B1
+capability candidate by its input index, and fallback cannot immediately raise
+resolution or fps. Selection follows hardware AV1 → H.264 → VP9 → VP8,
+with hardware before software within each codec, and always rejects software
+AV1. Callers supply only verified, negotiated, platform-eligible B1 caps;
+OpenH264 availability/consent, codec membership holds, available sessions,
+SVC/DD and applying reconfiguration/keyframes remain B3/A3/B11/B11a work.
+Each primary or compatibility layer owns a separate controller. A failing
+software VP9 compatibility layer never changes the primary's settings.
+
+A hardware encoder's own silicon is separate from the 3D engine, so a game's
+frame rate should barely change; F2 measures it. B6's pure policy tests do
+not replace these platform/resource measurements.
 
 ## 5. Capture per platform
 
@@ -1971,8 +2015,8 @@ are.
   once; a run restart recovers all slots.
 - Now: after B3 (B1 is built).
 
-**B6. Rate and quality controller ★** (S–M)
-- Builds: pure logic mapping preset, tier, estimate and encoder or capture
+**B6. Rate and quality controller ★** (S–M) — **built**
+- Built: pure logic mapping preset, tier, estimate and encoder or capture
   feedback to (resolution, fps, bitrate), with the degradation rules of
   [CPU and GPU budgets](#cpu-and-gpu-budgets).
 - Depends on: B1 types only.
@@ -1981,7 +2025,17 @@ are.
   recovery only after 10 s of headroom; a software VP9 compatibility layer
   lowers only its own tier, never the primary. No AV1 software encoder is
   selected when hardware fails.
-- Now: yes.
+- Implementation: std-only, no unsafe code or I/O; per-layer `RateController`
+  reuses B1's `CodecCaps`, `EncoderConfig`, `RateControl` and `Size`. Explicit
+  monotonic samples drive 2 s pressure and 10 s headroom timers, bounded
+  preset ladders, immediate bitrate cuts, pause/resume and codec failover.
+  Table-driven tests cover the acceptance cases plus exact CPU/encode and
+  bandwidth boundaries, time gaps, invalid time, caps, aspect ratio, exhausted
+  ladders and unavailable fallbacks. B1's workspace and Linux/macOS/Windows
+  CI commands already run these tests; no workflow change is needed.
+- Status: built; applying decisions to capture/encoder adapters, transport
+  estimates, aggregate layer allocation and platform measurements remain
+  B4/B10/B11/B11a and Track F.
 
 **B7. Native screen key endpoints** (M–L)
 - Builds: during the transition the Tauri app runs two screen engines at
