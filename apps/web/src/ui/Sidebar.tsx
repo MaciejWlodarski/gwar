@@ -6,7 +6,7 @@ import { controller } from "../state/controller";
 import { useSession, useUi } from "../state/stores";
 import { ChannelTree } from "./ChannelTree";
 import { usePermission } from "./hooks";
-import { menuContent, menuItem, menuItemDanger, menuSeparator } from "./kit";
+import { menuContent, menuItem, menuItemDanger, menuSeparator, panelCard } from "./kit";
 import { TeamSpeakBadge, TsIcon } from "./badges";
 import { VoicePanel } from "./VoicePanel";
 
@@ -44,7 +44,7 @@ function ServerHeader() {
     <Dropdown.Root>
       <Dropdown.Trigger asChild>
         <button
-          className="t group flex h-12 w-full shrink-0 cursor-pointer items-center gap-2 border-b border-line px-4 text-left hover:bg-hover data-[state=open]:bg-hover"
+          className="t group m-2 mb-1 flex h-12 shrink-0 cursor-pointer items-center gap-2 rounded-xl px-3 text-left hover:bg-hover data-[state=open]:bg-hover"
           aria-label={t("server.menu")}
         >
           <span className="min-w-0 flex-1">
@@ -112,10 +112,10 @@ function ServerHeader() {
   );
 }
 
-export function Sidebar({ className }: { className?: string }) {
+export function Sidebar({ className, card }: { className?: string; card?: boolean }) {
   const phase = useSession((s) => s.phase);
   return (
-    <aside className={cn("flex h-full w-[280px] shrink-0 flex-col border-r border-line bg-side", className)}>
+    <aside className={cn("flex h-full w-[280px] shrink-0 flex-col bg-side", card ? panelCard : "border-r border-line", className)}>
       <ServerHeader />
       <div className={cn("min-h-0 flex-1 overflow-y-auto transition-opacity duration-150", phase === "reconnecting" && "opacity-50")}>
         <ChannelTree />

@@ -17,7 +17,7 @@ import { slotOf, useScreen } from "../state/screen";
 import { useSession } from "../state/stores";
 import { PRESET_CHOICES, type PresetChoice } from "../voice/screen";
 import { useChannelPermission, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
-import { Button, Dialog, IconButton, TalkingAvatar, Tooltip } from "./kit";
+import { Button, Dialog, IconButton, panelCard, TalkingAvatar, Tooltip } from "./kit";
 
 // -------------------------------------------------------------------- start
 
@@ -279,7 +279,7 @@ const stageButton = "text-white/80 hover:bg-white/10 hover:text-white";
  * The stage: the share in focus large, other shares of its channel and every other watched
  * share as cards (click to swap), with the chat beside it unless hidden.
  */
-export function Stage() {
+export function Stage({ card }: { card?: boolean }) {
   const t = useT();
   const stage = useScreen(s => s.stage);
   const watches = useScreen(s => s.watches);
@@ -326,7 +326,7 @@ export function Stage() {
   ];
 
   return (
-    <section aria-label={t("screen.stage")} className="flex min-w-0 flex-1 flex-col bg-[#0b0b0d] text-white">
+    <section aria-label={t("screen.stage")} className={cn("flex min-w-0 flex-1 flex-col bg-[#0b0b0d] text-white", card && panelCard)}>
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-white/10 px-3">
         {client && <TalkingAvatar name={name} seed={client.uid} size={24} talking={client.talking} />}
         <h2 className="min-w-0 truncate text-[15px] font-semibold">{t("screen.sharerTitle", { name })}</h2>
