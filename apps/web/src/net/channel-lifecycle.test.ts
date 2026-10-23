@@ -1,5 +1,7 @@
-import { describe, expect, it } from "vitest";
+import "fake-indexeddb/auto";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { channelLifecycle, MAX_IDS, withChannelLifecycle } from "./channel-lifecycle";
+import { createLocalState, type LocalState } from "../lib/local-state";
 import type { MessageVerification } from "./message-signature";
 
 const memory = () => {
@@ -91,15 +93,16 @@ describe("channel lifecycle", () => {
     expect([c.check("A", 1), channelLifecycle(store).check("A", 1)]).toEqual(["reused", "reused"]);
     expect(c.check("other0", 1)).toBe("ok");
   });
-  it("drops saved records first; past the bound of unsaved ones every record is uncertain for the session", async () => {
+  it("keeps only unsaved changes in memory; past their bound every record is uncertain for the session", async () => {
     const store = memory(), c = channelLifecycle(store);
     c.observe("saved", [1]);
     await settled();
     store.frozen = true;
     for (let i = 0; i < 63; i++) c.deleted(`s${i}`, 1);
     expect([c.check("s0", 1), c.check("saved", 1), c.check("fresh", 1)]).toEqual(["reused", "ok", "ok"]);
-    c.deleted("s63", 1); // 64 unsaved: memory holds nothing else
-    c.check("fresh2", 1); // so s1, the least recently used (s0 was checked above), has to go
+    c.deleted("s63", 1); // 64 unsaved: as many as memory keeps (reading a stored record takes no place)
+    expect(c.check("fresh2", 1)).toBe("ok");
+    c.deleted("s64", 1); // so s1, the least recently used (s0 was checked above), has to go
     store.frozen = false;
     expect(["saved", "fresh", "s1", "s63"].map((k) => c.check(k, 1))).toEqual(["unknown", "unknown", "unknown", "reused"]);
     expect(channelLifecycle(store).check("saved", 1)).toBe("ok");
@@ -135,5 +138,61 @@ describe("channel lifecycle", () => {
     expect(withChannelLifecycle(ok, "A", "channel:2", channelLifecycle(store)).authorization).toEqual(["channel-history-incomplete"]);
     const invalid = { ...ok, status: "invalid" as const };
     expect(withChannelLifecycle(invalid, "A", "channel:1", c)).toBe(invalid);
+  });
+});
+
+describe("channel records in the device's security state, with other tabs", () => {
+  const opened: LocalState[] = [];
+  /** Two tabs' views of one database. */
+  async function tabs() {
+    const name = `channels-${crypto.randomUUID()}`;
+    const [one, two] = [createLocalState(name), createLocalState(name)];
+    opened.push(one, two);
+    await one.load(); await two.load();
+    return [one, two, name] as const;
+  }
+  const record = (state: LocalState) => JSON.parse(state.get("gwar.channels:server")!) as { known: number[]; deleted: number[] };
+  afterEach(() => { for (const state of opened.splice(0)) state.close(); });
+
+  it("sees another tab's deletion at once, also after its own merged write (Sol r5 probe, inverted)", async () => {
+    const [a, b] = await tabs();
+    const mine = channelLifecycle(a), other = channelLifecycle(b);
+    mine.observe("server", [5, 6]);
+    await vi.waitFor(() => expect(b.get("gwar.channels:server")).toBeDefined());
+    other.deleted("server", 5);
+    await vi.waitFor(() => expect(record(a).deleted).toContain(5));
+    expect(mine.check("server", 5)).toBe("reused");
+    mine.created("server", 7);
+    await vi.waitFor(() => expect(record(a).known).toContain(7));
+    expect(record(a).deleted).toContain(5);
+    expect([mine.check("server", 5), mine.check("server", 7)]).toEqual(["reused", "ok"]);
+  });
+  it("keeps what it has not stored yet beside what other tabs stored", async () => {
+    const [a, b] = await tabs();
+    const mine = channelLifecycle(a), other = channelLifecycle(b);
+    mine.deleted("server", 1);
+    other.deleted("server", 2);
+    // Before any write has committed, this tab knows its own deletion.
+    expect(mine.check("server", 1)).toBe("reused");
+    await vi.waitFor(() => expect([mine.check("server", 1), mine.check("server", 2)]).toEqual(["reused", "reused"]));
+  });
+  it("a record already read fails closed once the database cannot be used (Sol r5 probe, inverted)", async () => {
+    const [a, , name] = await tabs();
+    const mine = channelLifecycle(a);
+    mine.deleted("server", 4);
+    await vi.waitFor(() => expect(a.get("gwar.channels:server")).toBeDefined());
+    expect([mine.check("server", 4), mine.check("server", 5)]).toEqual(["reused", "ok"]);
+    // A newer version's tab upgrades the database.
+    await new Promise<void>((resolve, reject) => {
+      const r = indexedDB.open(name, 2);
+      r.onsuccess = () => { r.result.close(); resolve(); };
+      r.onerror = () => reject(r.error);
+    });
+    expect(a.error()).toMatchObject({ name: "NewerDataError" });
+    expect(mine.check("server", 5)).toBe("unknown");
+    mine.deleted("server", 6);
+    expect(mine.check("server", 6)).toBe("reused");
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect([mine.check("server", 6), mine.check("server", 7)]).toEqual(["reused", "unknown"]);
   });
 });

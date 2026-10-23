@@ -1426,3 +1426,34 @@ it.each(["gwar", "teamspeak"] as const)("keeps default server chat plaintext in 
   expect(link.sent("chat.send").at(-1)?.d).toMatchObject({ target: "server", text: "plain server hello", signature: expect.any(Object) });
   expect(link.sent("chat.sealed.send")).toEqual([]);
 });
+
+describe("accepting a changed server key", () => {
+  it("keeps the old pin until the new key is proven, so no third key is trusted on first use meanwhile", async () => {
+    vi.useRealTimers();
+    const endpoint = "wss://changed.example/ws", key = "gwar.server-pin:" + endpoint;
+    const [old, accepted, third] = ["A".repeat(43), "B".repeat(42) + "A", "C".repeat(42) + "A"];
+    const store = new Map([[key, JSON.stringify({ server_pk: old, first_seen: 1 })]]);
+    // The device's security state, shared with "another tab" (serverPins below runs the same transactions on it).
+    const { localState } = await import("../lib/local-state");
+    const get = vi.spyOn(localState, "get").mockImplementation((k) => store.get(k));
+    const update = vi.spyOn(localState, "update").mockImplementation(async (k, change) => {
+      const next = change(store.get(k));
+      if (next === null) store.delete(k); else if (next !== undefined) store.set(k, next);
+      return store.get(k);
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const c = controller as any;
+    const connect = vi.spyOn(c, "connectInteractive").mockImplementation(async () => true);
+    try {
+      const { ServerIdentityChanged, serverPins } = await import("../net/server-pins");
+      c.confirmServerChange(new ServerIdentityChanged(endpoint, old, accepted, "pin"), { address: "changed.example" }, { remember: false });
+      (stores.useUi.getState().dialog as { onConfirm(): void }).onConfirm();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      // The reconnect to the accepted key is under way: the address still has its pin, so another tab's first
+      // contact with a third key is refused.
+      expect(JSON.parse(store.get(key) ?? "null")?.server_pk).toBe(old);
+      await expect(serverPins.commit(endpoint, third)).rejects.toBeInstanceOf(ServerIdentityChanged);
+      expect(connect).toHaveBeenCalledWith(expect.objectContaining({ inviteServerKey: accepted, replaceServerKey: old }), { remember: false });
+    } finally { get.mockRestore(); update.mockRestore(); connect.mockRestore(); }
+  });
+});

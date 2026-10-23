@@ -6,6 +6,7 @@
  * Fixtures build older data the way the code of that version did; they are never changed afterwards.
  */
 import "fake-indexeddb/auto";
+import { forceCloseDatabase } from "fake-indexeddb";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { eachRecord, NewerDataError, openDatabase, upgradeRecord, type IdbMigration } from "./stored-data";
 import { KV_DATABASE, KV_MIGRATIONS, kvGet } from "../net/kv";
@@ -426,6 +427,25 @@ describe("the settings (localStorage)", () => {
     useSettings.getState().setTheme("dark");
     expect(storage.getItem(SETTINGS_KEY)).toBe(newer);
   });
+  it("a read that fails is not an absence: the page then neither writes nor removes them (Sol r5 probe, inverted)", async () => {
+    const newer = JSON.stringify({ state: { theme: "light", future: [1] }, version: SETTINGS_VERSION + 1 });
+    let raw: string | null = newer, readable = false;
+    const storage = {
+      getItem: () => { if (!readable) throw new DOMException("read failed", "UnknownError"); return raw; },
+      setItem: (_: string, value: string) => { raw = value; },
+      removeItem: () => { raw = null; },
+    } as unknown as Storage;
+    const { guardedLocalStorage } = await page(memory({}));
+    const guarded = guardedLocalStorage(storage);
+    expect(guarded.getItem(SETTINGS_KEY)).toBeNull();
+    guarded.setItem(SETTINGS_KEY, JSON.stringify({ state: {}, version: 1 }));
+    guarded.removeItem(SETTINGS_KEY);
+    expect(raw).toBe(newer);
+    // Readable again, and of this version: still nothing, since what this page holds was never read.
+    readable = true; raw = JSON.stringify({ state: { theme: "light" }, version: 1 });
+    guarded.setItem(SETTINGS_KEY, JSON.stringify({ state: { theme: "dark" }, version: 1 }));
+    expect(JSON.parse(raw).state.theme).toBe("light");
+  });
   it("a write checks the stored version first, even before the storage event", async () => {
     const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ state: { theme: "light" }, version: 1 }) });
     const { useSettings, localStorageError } = await page(storage);
@@ -521,5 +541,62 @@ describe("the security state (IndexedDB)", () => {
     expect(state.error()).toBeDefined();
     expect(() => state.get(PIN)).toThrow(/no new key is trusted/);
     await expect(state.update(PIN, () => pinValue("K"))).rejects.toMatchObject({ name: "LocalStateUnavailableError" });
+  });
+  it("a database the browser closes withdraws everything: reads throw, writes reject, the app hears of it", async () => {
+    let connection!: IDBDatabase;
+    const state = await tab(fresh(), [(db, tx) => { connection = db; LOCAL_STATE_MIGRATIONS[0]!(db, tx); }]);
+    await state.update(PIN, () => pinValue("K"));
+    const changed = vi.fn();
+    state.subscribe(changed);
+    forceCloseDatabase(connection as never);
+    await vi.waitFor(() => expect(state.error()).toMatchObject({ name: "LocalStateUnavailableError" }));
+    expect(() => state.get(PIN)).toThrow(/no new key is trusted/);
+    expect(state.checkedAt("")).toBe(0);
+    await expect(state.update(PIN, () => pinValue("L"))).rejects.toMatchObject({ name: "LocalStateUnavailableError" });
+    await expect(state.refresh()).rejects.toMatchObject({ name: "LocalStateUnavailableError" });
+    expect(changed).toHaveBeenCalledWith(null);
+  });
+
+  describe("an import while another tab changes localStorage", () => {
+    /** localStorage whose `key` and `getItem` let a test act as another tab in between. */
+    const racing = (entries: [string, string][], meanwhile: { key?: (i: number) => void; getItem?: (key: string) => void }) => {
+      const items = new Map(entries);
+      return { items, storage: {
+        get length() { return items.size; },
+        key: (i: number) => { const key = [...items.keys()][i] ?? null; meanwhile.key?.(i); return key; },
+        getItem: (key: string) => { const value = items.get(key) ?? null; meanwhile.getItem?.(key); return value; },
+      } as unknown as Storage };
+    };
+    const pin = pinValue("K"), second = "gwar.server-pin:wss://b.example/ws";
+    it("never misses an entry when an earlier one goes while it reads (Sol r5 probe, inverted)", async () => {
+      const { items, storage } = racing([["unrelated", "x"], [PIN, pin]], { getItem: (key) => { if (key === "unrelated") items.delete(key); } });
+      vi.stubGlobal("localStorage", storage);
+      const state = await tab(fresh());
+      expect(state.error()).toBeUndefined();
+      expect(state.get(PIN)).toBe(pin);
+    });
+    it("never misses an entry when an earlier one goes while it lists the names", async () => {
+      let removed = false;
+      const { items, storage } = racing([["unrelated", "x"], [PIN, pin], [second, pin]], {
+        key: (i) => { if (i === 0 && !removed) { removed = true; items.delete("unrelated"); } },
+      });
+      vi.stubGlobal("localStorage", storage);
+      const state = await tab(fresh());
+      expect(state.error()).toBeUndefined();
+      expect([state.get(PIN), state.get(second)]).toEqual([pin, pin]);
+    });
+    it("commits nothing while localStorage keeps changing, and imports once it holds still", async () => {
+      let changing = true, n = 0;
+      const { items, storage } = racing([[PIN, pin]], { getItem: () => { if (changing) items.set(`gwar.channels:${n++}`, "{}"); } });
+      vi.stubGlobal("localStorage", storage);
+      const name = fresh();
+      const failed = await tab(name);
+      expect(failed.error()).toMatchObject({ message: expect.stringMatching(/kept changing/) });
+      expect((await indexedDB.databases()).find((d) => d.name === name)?.version ?? 0).toBe(0);
+      changing = false;
+      const state = await tab(name);
+      expect(state.error()).toBeUndefined();
+      expect(state.get(PIN)).toBe(pin);
+    });
   });
 });

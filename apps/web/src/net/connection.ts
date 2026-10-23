@@ -112,6 +112,11 @@ export interface ConnectionOptions {
   /** Invite code: admits without the server password. Used for the first connect only. */
   invite?: string;
   inviteServerKey?: string;
+  /**
+   * The pinned key the user accepted to replace by `inviteServerKey` (which must be set): the pin moves to
+   * that key once the server proves it, in one transaction, and only if it still holds this one.
+   */
+  replaceServerKey?: string;
   insecureLan?: boolean;
   pinStore?: PinStore;
   client: ClientInfo;
@@ -224,11 +229,15 @@ export class Connection implements Link {
   private abortHandshake: (() => void) | null = null;
   /** Spent after the first welcome: a reconnect is the same member, and the invite may be used up. */
   private invite: string | undefined;
+  /** Spent once a pin holds the new key: a reconnect never replaces a pin again. */
+  private replacing: string | undefined;
 
   constructor(private readonly options: ConnectionOptions) {
     try { this.endpoint = normalizeEndpoint(options.url); }
     catch (e) { throw new ConnectError("protocol", e instanceof Error ? e.message : String(e)); }
     this.invite = options.invite;
+    // A replacement is bound to the key the user accepted, which the invite key carries.
+    this.replacing = options.inviteServerKey === undefined ? undefined : options.replaceServerKey;
   }
 
   get identity(): Identity { return this.options.identity; }
@@ -488,7 +497,8 @@ export class Connection implements Link {
     };
     decodeFixed(challenge.server_nonce, 32);
     const pins = this.options.pinStore ?? serverPins;
-    checkCandidate(endpoint, challenge.server_pk, pins, this.options.inviteServerKey);
+    const replacing = this.replacing;
+    checkCandidate(endpoint, challenge.server_pk, pins, this.options.inviteServerKey, replacing);
     const hello: Hello = {
       protocol: PROTOCOL_VERSION,
       nickname,
@@ -510,7 +520,8 @@ export class Connection implements Link {
     const proof = await this.send(socket, "hello", hello as unknown as Record<string, unknown>, timeoutMs, 1);
     await verifyProof(hello, proof);
     current();
-    await pins.commit(endpoint, hello.expected_server_pk);
+    await pins.commit(endpoint, hello.expected_server_pk, replacing);
+    this.replacing = undefined;
     current();
     this.serverKey_ = hello.expected_server_pk;
     return this.send(socket, "join", { server_password: serverPassword, invite: this.invite }, timeoutMs, 2);

@@ -8,7 +8,6 @@ const key = "A".repeat(43);
 const pins = (byEndpoint: Record<string, string>): PinStore => ({
   load: (endpoint) => (byEndpoint[endpoint] ? { server_pk: byEndpoint[endpoint], first_seen: 1 } : undefined),
   commit: async () => {},
-  forget: async () => {},
 });
 
 describe("serverKey", () => {

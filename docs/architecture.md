@@ -119,7 +119,8 @@ cannot be read (no IndexedDB, a newer version's database) trust no key: the
 connection fails with a storage error.
 Invite links include `server_key=<full public key>`, which must match the
 challenge. A pin mismatch is a blocking English/Polish dialog with both keys
-and an explicit dangerous forget-and-trust action. An invite mismatch blocks
+and an explicit dangerous trust action, which replaces the pin only once the
+new key is proven (the address is never left unpinned meanwhile). An invite mismatch blocks
 without that override. The verified key is exposed as `Connection.serverKey`
 (native: `Connection.server_key`) for message context and shown under Server menu > Server key.
 Native clients require an expected key unless first-contact trust is explicitly

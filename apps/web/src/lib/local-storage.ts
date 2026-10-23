@@ -49,12 +49,27 @@ export function watchLocalStorage(listener: () => void): () => void {
   return () => { listeners.delete(listener); globalThis.removeEventListener?.("storage", changed); };
 }
 
-/** For zustand's `persist`: nothing is read or written while the stored settings are of a newer version. */
+const failed = Symbol("unreadable");
+
+/**
+ * For zustand's `persist`: nothing is read or written while the stored settings are of a newer version.
+ * A read that fails is not an absence: the settings may be there, of any version, so from then on this page
+ * neither writes nor removes them (what it holds in memory may not be what is stored).
+ */
 export function guardedLocalStorage(storage: Storage | undefined) {
-  const stored = (name: string) => { try { return storage?.getItem(name); } catch { return undefined; } };
+  let unreadable = false;
+  /** The stored settings (null: none), or `failed` when they could not be read. */
+  const stored = (name: string): string | null | typeof failed => {
+    try { return storage?.getItem(name) ?? null; } catch { unreadable = true; return failed; }
+  };
+  const writable = (name: string) => {
+    if (unreadable) return false;
+    const raw = stored(name);
+    return raw !== failed && acceptable(raw);
+  };
   return {
-    getItem: (name: string) => { const raw = stored(name); return acceptable(raw) ? raw ?? null : null; },
-    setItem: (name: string, value: string) => { if (acceptable(stored(name))) storage?.setItem(name, value); },
-    removeItem: (name: string) => { if (acceptable(stored(name))) storage?.removeItem(name); },
+    getItem: (name: string) => { const raw = stored(name); return raw !== failed && acceptable(raw) ? raw : null; },
+    setItem: (name: string, value: string) => { if (writable(name)) storage?.setItem(name, value); },
+    removeItem: (name: string) => { if (writable(name)) storage?.removeItem(name); },
   };
 }

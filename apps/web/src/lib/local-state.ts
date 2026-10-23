@@ -3,11 +3,15 @@
  * records and the Connect service key. IndexedDB is its only source of truth. Before the first
  * render `load` reads it all into memory, so readers (some run while rendering) stay synchronous;
  * every change is a read-modify-write transaction, and memory follows only once it has committed.
- * Other tabs hear of a change through a BroadcastChannel message naming the key (no data) and read
- * it again from IndexedDB.
+ * Other tabs hear of a change through a BroadcastChannel message naming the key (no data) and, as a
+ * second channel, a localStorage ping naming it (`<database>.changed`, no data either), and read it
+ * again from IndexedDB. Neither is relied on: the tab also reads everything again when it regains
+ * focus or becomes visible, and readers that show trust ask for `refresh` once their view is older
+ * than they accept (`checkedAt`).
  *
- * When the database cannot be read (no IndexedDB, a newer version's, an upgrade by another tab),
- * every read and write fails: nothing is trusted that could not be checked against it.
+ * When the database cannot be read (no IndexedDB, a newer version's, an upgrade by another tab, a
+ * connection the browser closed), every read and write fails: nothing is trusted that could not be
+ * checked against it.
  */
 import { NewerDataError, openDatabase, type IdbMigration } from "./stored-data";
 
@@ -17,16 +21,36 @@ const NAME = "This browser's Gwar security data";
 /** What version 1 of the app kept in localStorage, by key prefix: imported once. */
 export const LEGACY_LOCAL_STORAGE_PREFIXES = ["gwar.server-pin:", "gwar.channels:", "gwar.connect.handle-pin:", "gwar.connect.service-key:"];
 
-/** The entries localStorage holds for `LEGACY_LOCAL_STORAGE_PREFIXES`; a localStorage that fails to read fails this. */
+const IMPORT_ATTEMPTS = 5;
+
+/** The names of localStorage's entries of `LEGACY_LOCAL_STORAGE_PREFIXES`, sorted. */
+function legacyKeys(storage: Storage): string[] {
+  const keys: string[] = [];
+  for (let i = 0; i < storage.length; i++) {
+    const key = storage.key(i);
+    if (key !== null && LEGACY_LOCAL_STORAGE_PREFIXES.some((p) => key.startsWith(p))) keys.push(key);
+  }
+  return keys.sort();
+}
+
+/**
+ * The entries localStorage holds for `LEGACY_LOCAL_STORAGE_PREFIXES`; a localStorage that fails to
+ * read fails this. Another tab may change localStorage meanwhile, and a removal shifts the index the
+ * names are listed by, so an entry could be missed: the names are listed first, the values read by
+ * name, and then both read again. The import takes only a snapshot that read the same twice, and
+ * fails (commits nothing, runs again on the next load) if it never gets one.
+ */
 function legacyEntries(): [string, string][] {
   if (typeof localStorage === "undefined") return [];
-  const entries: [string, string][] = [];
-  for (let i = 0; i < localStorage.length; i++) {
-    const key = localStorage.key(i);
-    const value = key === null ? null : localStorage.getItem(key);
-    if (key !== null && value !== null && LEGACY_LOCAL_STORAGE_PREFIXES.some((p) => key.startsWith(p))) entries.push([key, value]);
+  for (let attempt = 0; attempt < IMPORT_ATTEMPTS; attempt++) {
+    const keys = legacyKeys(localStorage);
+    const values = keys.map((key) => localStorage.getItem(key));
+    const again = legacyKeys(localStorage);
+    const consistent = again.length === keys.length && again.every((key, i) => key === keys[i])
+      && values.every((value, i) => value !== null && localStorage.getItem(keys[i]!) === value);
+    if (consistent) return keys.map((key, i) => [key, values[i]!]);
   }
-  return entries;
+  throw new Error("Gwar's saved data in this browser kept changing while it was imported. Reload the page.");
 }
 
 /**
@@ -57,6 +81,10 @@ export interface LocalState {
   load(): Promise<void>;
   /** The value as last committed or read; throws while the database cannot be used. */
   get(key: string): string | undefined;
+  /** When the entries under `prefix` were last read from the database (ms, `Date.now`); 0 if they cannot be. */
+  checkedAt(prefix: string): number;
+  /** Reads the entries under `prefix` (all by default) again from the database. Rejects if it cannot. */
+  refresh(prefix?: string): Promise<void>;
   /** One transaction; resolves with the value stored after it, once committed. */
   update(key: string, change: LocalStateChange): Promise<string | undefined>;
   /** Called with a key that changed (here or in another tab), or null for everything. */
@@ -79,36 +107,82 @@ export function createLocalState(name = LOCAL_STATE_DATABASE, migrations: readon
     db = undefined;
     notify(null);
   };
+  const checked = new Map<string, number>();
   const channel = typeof BroadcastChannel === "undefined" ? undefined : new BroadcastChannel(name);
   (channel as { unref?: () => void } | undefined)?.unref?.();
+  const PING = `${name}.changed`;
+  let pings = 0;
 
   const request = <T>(r: IDBRequest<T>) => new Promise<T>((resolve, reject) => { r.onsuccess = () => resolve(r.result); r.onerror = () => reject(r.error); });
-  /** Reads `key` (or everything) again, after another tab changed it. */
-  async function reread(key: string | null): Promise<void> {
-    if (!db || !view) return;
-    try {
-      const store = db.transaction(STORE, "readonly").objectStore(STORE);
-      if (key === null) {
-        const [keys, values] = await Promise.all([request(store.getAllKeys()), request(store.getAll())]);
-        view = new Map(keys.map((k, i) => [String(k), values[i] as string]));
-      } else {
-        const value = await request(store.get(key)) as unknown;
-        if (typeof value === "string") view.set(key, value); else view.delete(key);
-      }
-      notify(key);
-    } catch (error) {
-      fail(new LocalStateUnavailableError(error));
-    }
-  }
-  if (channel) channel.onmessage = (event: MessageEvent) => {
-    const key = (event.data as { key?: unknown } | null)?.key;
-    void reread(typeof key === "string" ? key : null);
-  };
-
+  const usableError = () => { try { usable(); return new LocalStateUnavailableError(); } catch (error) { return error; } };
   const usable = () => {
-    if (problem !== undefined) throw problem instanceof NewerDataError ? problem : new LocalStateUnavailableError(problem);
+    if (problem !== undefined) throw problem instanceof NewerDataError || problem instanceof LocalStateUnavailableError ? problem : new LocalStateUnavailableError(problem);
     if (!db || !view) throw new LocalStateUnavailableError();
     return { db, view };
+  };
+  /** A transaction on the store; a connection the browser closed makes the state unusable. */
+  const transaction = (mode: IDBTransactionMode) => {
+    const { db: connection } = usable();
+    try {
+      return connection.transaction(STORE, mode, mode === "readwrite" ? { durability: "strict" } : undefined);
+    } catch (error) {
+      const unusable = new LocalStateUnavailableError(error);
+      fail(unusable);
+      throw unusable;
+    }
+  };
+
+  /** Reads `key` again, or every key under `prefix`, after another tab changed it. */
+  async function reread(target: { key: string } | { prefix: string }): Promise<void> {
+    const started = Date.now();
+    const store = transaction("readonly").objectStore(STORE);
+    let entries: [string, string][];
+    try {
+      if ("key" in target) {
+        const value = await request(store.get(target.key)) as unknown;
+        entries = typeof value === "string" ? [[target.key, value]] : [];
+      } else {
+        const range = target.prefix === "" ? undefined : IDBKeyRange.bound(target.prefix, target.prefix + "\uffff");
+        const [keys, values] = await Promise.all([request(store.getAllKeys(range)), request(store.getAll(range))]);
+        entries = keys.map((k, i) => [String(k), values[i] as string]);
+      }
+    } catch (error) {
+      const unusable = new LocalStateUnavailableError(error);
+      fail(unusable);
+      throw unusable;
+    }
+    const { view: current } = usable();
+    const fresh = new Map(entries);
+    const changed: string[] = [];
+    const scope = "key" in target ? [target.key] : [...current.keys()].filter((k) => k.startsWith(target.prefix));
+    for (const key of new Set([...scope, ...fresh.keys()])) {
+      const value = fresh.get(key);
+      if (current.get(key) === value) continue;
+      if (value === undefined) current.delete(key); else current.set(key, value);
+      changed.push(key);
+    }
+    if ("prefix" in target) checked.set(target.prefix, Math.max(checked.get(target.prefix) ?? 0, started));
+    for (const key of changed) notify(key);
+  }
+  const quietly = (target: { key: string } | { prefix: string }) => { reread(target).catch(() => { /* failed: see `error` */ }); };
+  if (channel) channel.onmessage = (event: MessageEvent) => {
+    const key = (event.data as { key?: unknown } | null)?.key;
+    quietly(typeof key === "string" ? { key } : { prefix: "" });
+  };
+  // The second channel, and reading everything again when the user comes back to this tab.
+  const onStorage = (event: StorageEvent) => {
+    if (event.key !== PING || event.newValue === null) return;
+    let key: unknown;
+    try { key = (JSON.parse(event.newValue) as { key?: unknown } | null)?.key; } catch { key = undefined; }
+    quietly(typeof key === "string" ? { key } : { prefix: "" });
+  };
+  const onFocus = () => { if (db) quietly({ prefix: "" }); };
+  const onVisible = () => { if (globalThis.document?.visibilityState !== "hidden") onFocus(); };
+  globalThis.addEventListener?.("storage", onStorage);
+  globalThis.addEventListener?.("focus", onFocus);
+  globalThis.document?.addEventListener?.("visibilitychange", onVisible);
+  const ping = (key: string) => {
+    try { globalThis.localStorage?.setItem(PING, JSON.stringify({ key, n: `${Date.now()}.${++pings}.${Math.random()}` })); } catch { /* the broadcast and the refreshes remain */ }
   };
 
   return {
@@ -120,11 +194,15 @@ export function createLocalState(name = LOCAL_STATE_DATABASE, migrations: readon
         const opened = await openDatabase(name, migrations, { factory: indexedDb });
         // A newer version's tab upgrading the database (or anything deleting it): let go, use nothing.
         opened.onversionchange = (event) => fail(event.newVersion === null ? new LocalStateUnavailableError() : new NewerDataError(NAME, event.newVersion, migrations.length));
+        // The browser closed it (storage cleared, the disk failed): nothing more can be checked.
+        opened.onclose = () => fail(new LocalStateUnavailableError(new Error("IndexedDB closed the database")));
+        const started = Date.now();
         const store = opened.transaction(STORE, "readonly").objectStore(STORE);
         const [keys, values] = await Promise.all([request(store.getAllKeys()), request(store.getAll())]);
         if (problem !== undefined) return opened.close();
         db = opened;
         view = new Map(keys.map((k, i) => [String(k), values[i] as string]));
+        checked.set("", started);
       } catch (error) {
         fail(error);
       }
@@ -132,13 +210,17 @@ export function createLocalState(name = LOCAL_STATE_DATABASE, migrations: readon
     get(key) {
       return usable().view.get(key);
     },
+    checkedAt(prefix) {
+      if (problem !== undefined || !db) return 0;
+      return Math.max(checked.get("") ?? 0, checked.get(prefix) ?? 0);
+    },
+    refresh: (prefix = "") => reread({ prefix }),
     async update(key, change) {
-      const { db: connection, view: current } = usable();
+      const tx = transaction("readwrite");
       let changed = false;
       const stored = await new Promise<string | undefined>((resolve, reject) => {
         let refused: unknown;
         let result: string | undefined;
-        const tx = connection.transaction(STORE, "readwrite", { durability: "strict" });
         const store = tx.objectStore(STORE);
         const read = store.get(key);
         read.onsuccess = () => {
@@ -155,12 +237,15 @@ export function createLocalState(name = LOCAL_STATE_DATABASE, migrations: readon
           changed = next !== undefined;
         };
         tx.oncomplete = () => resolve(result);
-        tx.onabort = () => reject(refused ?? tx.error ?? new Error("IndexedDB write aborted"));
-        tx.onerror = () => reject(refused ?? tx.error ?? new Error("IndexedDB write failed"));
+        // A transaction the closing of the connection ended is the state becoming unusable.
+        const failed = (fallback: string) => reject(refused ?? (problem !== undefined ? usableError() : tx.error ?? new Error(fallback)));
+        tx.onabort = () => failed("IndexedDB write aborted");
+        tx.onerror = () => failed("IndexedDB write failed");
       });
       // Committed: memory follows, and other tabs read it again.
+      const { view: current } = usable();
       if (stored === undefined) current.delete(key); else current.set(key, stored);
-      if (changed) channel?.postMessage({ key });
+      if (changed) { channel?.postMessage({ key }); ping(key); }
       notify(key);
       return stored;
     },
@@ -171,6 +256,9 @@ export function createLocalState(name = LOCAL_STATE_DATABASE, migrations: readon
     error: () => problem,
     close() {
       channel?.close();
+      globalThis.removeEventListener?.("storage", onStorage);
+      globalThis.removeEventListener?.("focus", onFocus);
+      globalThis.document?.removeEventListener?.("visibilitychange", onVisible);
       db?.close();
       db = undefined;
     },

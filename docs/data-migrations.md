@@ -31,6 +31,12 @@ question: [compatibility.md](compatibility.md).
   without stranding the users who already opened it with the new version: they
   get the "newer version" error until the deploy rolls forward again. Bump
   versions only in changes that are ready to stay.
+  A rollback across the move of the security state into IndexedDB (below) does
+  **not** preserve trust-on-first-use continuity: the older client reads only
+  the localStorage pins as they were at the import, so server and handle pins
+  added since vanish from its view (it trusts the next key it meets on first
+  use again), and a pin replaced since reappears with its old key (it reports
+  the accepted key as changed). Channel records lose what was added since.
 
 ## Supported versions
 
@@ -66,6 +72,7 @@ its WebKit data directory.
 | IndexedDB `gwar-mls-v2-<device public key>` (`mls/storage.ts`) | The device's MLS agent: stores `openmls` (OpenMLS's own records), `groups` (`@device`, group records, `{server}/@server` owner pins, `@archive`), `epochs`, `outbox`; binary keys and values written by `crates/gwar-mls`. The runtime's jobs (`@runtime/…`, JSON) live in `outbox`. | Database version 1 (`MLS_MIGRATIONS`), which also versions the runtime's jobs. The agent's records have their own format, the `version` of `@device` (`STORE_FORMAT` in `crates/gwar-mls/src/agent/mod.rs`, currently 1): `STORE_UPGRADES` run as the agent loads and reach storage with its next write. OpenMLS's own records are keyed by its storage version, pinned by a test. **Never wiped**: an unreadable state fails to load and stays. |
 | IndexedDB `gwar-local`, store `entries` (`lib/local-state.ts`) | The device's security state, by key (the names version 1 used in localStorage): `gwar.server-pin:<endpoint>` → `{server_pk, first_seen}`, the server key first seen at an address; `gwar.channels:<server key>` → `{known, deleted, incomplete}`, channel ids seen and seen deleted; `gwar.connect.handle-pin:<Connect URL>:<handle>` → `{uid}`, the account first seen behind a handle; `gwar.connect.service-key:<Connect URL>` → Gwar Connect's service key (a cache, refetched). Values are JSON strings. | Database version 1 (`LOCAL_STATE_MIGRATIONS`; step 1 imports the localStorage entries of version 1, below). The only source of truth: read into memory before the first render, every change one transaction (below). A channel record it cannot read becomes "incomplete" (fails closed), never clean. **Never wiped.** |
 | localStorage `gwar.settings` (zustand `persist`) | Preferences, bookmarks (with server and channel passwords), removed bookmarks, the last server, per-server flags. | zustand's `version` (`SETTINGS_VERSION` in `lib/local-storage.ts`, currently 1). |
+| localStorage `gwar-local.changed` | A ping: the name of the last `gwar-local` key this browser changed and a nonce, so other tabs read it again (no data). | Not data: missing or stale is harmless. |
 | localStorage `gwar.server-pin:*`, `gwar.channels:*`, `gwar.connect.handle-pin:*`, `gwar.connect.service-key:*` | What version 1 kept there, imported into `gwar-local` once. | **Unused** since the import; left in place for tabs and builds of version 1, and removed by a later release. |
 | Cache Storage `gwar-denoise` | The noise suppression module and model. | Cache: entries not in use are deleted. |
 
@@ -175,24 +182,38 @@ IndexedDB (`lib/local-state.ts`).
 - **Write path.** Every change is one readwrite transaction (`durability:
   "strict"`) that reads the stored value and decides on it: a first server pin
   commits only if none is stored (a different stored key fails with
-  `ServerIdentityChanged`), forgetting a pin removes it only if it still holds
-  the key the user replaced, a first handle pin yields to one another tab stored,
-  and a channel record is merged with the stored one (ids known and deleted are
-  unions; "incomplete" sticks). Memory changes only once the transaction has
-  committed, and the connection uses a new server key only after its pin has.
+  `ServerIdentityChanged`); a key the user accepted in place of the pinned one
+  replaces the pin only after the server proved it, and only if the pin still
+  holds the key the user saw (a pin is never removed, so the address is never
+  open to first use meanwhile); a first handle pin yields to one another tab
+  stored; and a channel record is merged with the stored one (ids known and
+  deleted are unions; "incomplete" sticks). Memory changes only once the
+  transaction has committed, and the connection uses a new server key only after
+  its pin has. Channel checks read the record as the view holds it now, plus
+  what this tab has not stored yet.
 - **Tabs.** After a commit the tab posts the key (no data) on a BroadcastChannel
-  named after the database; the others read that key again from IndexedDB.
-  Transactions on the store run in the order they were created, so when two tabs
-  write the same key the one created last wins, in every tab and after a reload.
+  named after the database, and writes it to the localStorage ping
+  `gwar-local.changed` (the key and a nonce, no data); the others read that key
+  again from IndexedDB. Neither is relied on: a tab reads everything again when
+  it regains focus or becomes visible, and the handle badges read the handle
+  pins again every 10 s while shown; a view of them older than 30 s shows every
+  handle as pending. Transactions on the store run in the order they were
+  created, so when two tabs write the same key the one created last wins, in
+  every tab and after a reload.
 - **Import.** Step 1 of `LOCAL_STATE_MIGRATIONS` creates the store and copies the
   localStorage entries of version 1 (`LEGACY_LOCAL_STORAGE_PREFIXES`), inside the
   version-change transaction: the import commits with the database or not at all,
-  and an interrupted one runs again whole on the next load. localStorage that
-  cannot be read aborts it the same way. The originals are left in localStorage,
+  and an interrupted one runs again whole on the next load. It lists the entry
+  names first, reads the values by name, then lists and reads them again, and
+  takes only a snapshot that read the same twice (another tab's removal shifts
+  the index names are listed by); after five changing attempts it fails.
+  localStorage that cannot be read, or keeps changing, aborts it the same way. The originals are left in localStorage,
   unused: a tab of version 1 still open may write them, and nothing reads that.
-- **Fail closed.** No IndexedDB, a database of a newer version, or another tab
+- **Fail closed.** No IndexedDB, a database of a newer version, another tab
   upgrading it (`onversionchange`: this tab closes its connection and lets the
-  upgrade go ahead) makes every read throw and every write reject. A server pin
+  upgrade go ahead), or the browser closing the connection (`onclose`) makes
+  every read throw and every write reject with `LocalStateUnavailableError` (or
+  `NewerDataError`). A server pin
   that cannot be read fails the connection with a storage error and nothing is
   signed or sent; handles show as unverified, accepting a handle reports that it
   was not saved, and channel records count as incomplete. The start check
@@ -207,7 +228,9 @@ IndexedDB (`lib/local-state.ts`).
 to zustand's `migrate`. Settings of a newer or unreadable version are neither
 read nor written (`guardedLocalStorage` checks the stored version again on every
 read and write) and the app shows the "saved by a newer version" screen; a
-`storage` event carrying a newer version stops an open tab at once. What is
+`storage` event carrying a newer version stops an open tab at once. A read that
+fails is not taken for an absence: from then on that page neither writes nor
+removes the settings. What is
 tolerated: an older tab that has not yet seen a newer version's write may write
 its own settings over it before its next check. That loses preferences, never
 keys or trust. The pre-paint theme (`public/theme.js`) reads `gwar.settings`

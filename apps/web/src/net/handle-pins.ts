@@ -11,12 +11,22 @@ import { localState } from "../lib/local-state";
  * and again only when the user accepts another account, each time in one transaction that decides on what is
  * stored. A handle is shown verified only against a stored pin: while that state cannot be read or written,
  * nothing is pinned and every handle stays pending.
+ *
+ * Another tab's acceptance normally arrives by broadcast, but nothing here depends on it: while statuses are
+ * shown the pins are read again from the database every `REFRESH_MS`, and a view of them older than
+ * `MAX_AGE_MS` (the reads failed, or the tab slept) shows every handle as pending until a read succeeds.
  */
 export type HandleStatus = "verified" | "changed";
 
 const PREFIX = `gwar.connect.handle-pin:${CONNECT_URL}:`;
 
+/** How often the pins are read again while statuses are shown, and how old a view of them may be. */
+export const REFRESH_MS = 10_000;
+export const MAX_AGE_MS = 30_000;
+
 let version = 0;
+let refreshing: Promise<void> | undefined;
+let scheduled: ReturnType<typeof setTimeout> | undefined;
 const listeners = new Set<() => void>();
 
 function notify() {
@@ -38,10 +48,33 @@ function pinOf(handle: string): string | null {
   try { return uidOf(localState.get(PREFIX + handle)); } catch { return null; }
 }
 
-/** Read-only, safe while rendering. "pending": not pinned (yet), so not shown until {@link rememberHandle} decides. */
+/** Reads the pins again from the database; listeners hear of it either way (a stale view may have become fresh). */
+function refresh(): void {
+  refreshing ??= localState.refresh(PREFIX).catch(() => { /* unusable: every status is pending */ }).finally(() => {
+    refreshing = undefined;
+    notify();
+  });
+}
+
+/** Whether the view of the pins is recent enough to show; keeps it so while statuses are being shown. */
+function fresh(): boolean {
+  const age = Date.now() - localState.checkedAt(PREFIX);
+  if (age >= REFRESH_MS) refresh();
+  else if (scheduled === undefined) {
+    scheduled = setTimeout(() => { scheduled = undefined; refresh(); }, REFRESH_MS - age);
+    (scheduled as { unref?: () => void }).unref?.();
+  }
+  return age <= MAX_AGE_MS;
+}
+
+/**
+ * Read-only, safe while rendering. "pending": not pinned (yet), so not shown until {@link rememberHandle} decides,
+ * or the pins could not be read recently enough.
+ */
 export function handleStatus(handle: string, uid: string): HandleStatus | "pending" {
   const pin = pinOf(handle);
-  return !pin ? "pending" : pin === uid ? "verified" : "changed";
+  if (!pin || !fresh()) return "pending";
+  return pin === uid ? "verified" : "changed";
 }
 
 /** Pins a handle seen for the first time; a handle already pinned (here or by another tab) stays. */
@@ -75,5 +108,7 @@ localState.subscribe((key) => { if (key === null || key.startsWith(PREFIX)) noti
 
 /** Tests only. */
 export function resetHandlePins() {
+  if (scheduled !== undefined) clearTimeout(scheduled);
+  scheduled = undefined;
   version++;
 }

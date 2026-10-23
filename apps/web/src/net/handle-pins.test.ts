@@ -96,6 +96,60 @@ describe("handle continuity", () => {
     expect(JSON.parse((await otherTab()).get(PREFIX + "alice")!).uid).toBe(last);
   });
 
+  describe("without broadcasts", () => {
+    beforeEach(async () => {
+      // Lost or unsupported: this page's modules and the other tab are made without a BroadcastChannel.
+      state.localState.close();
+      vi.stubGlobal("BroadcastChannel", undefined);
+      vi.resetModules();
+      state = await import("../lib/local-state");
+      await state.localState.load();
+      pins = await import("./handle-pins");
+    });
+    afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
+    const acceptedElsewhere = async () => {
+      await pins.rememberHandle("alice", "A");
+      expect(pins.handleStatus("alice", "A")).toBe("verified");
+      await (await otherTab()).update(PREFIX + "alice", () => JSON.stringify({ uid: "B" }));
+    };
+
+    it("an acceptance in another tab never stays shown as the old account for long (Sol r5 probe, inverted)", async () => {
+      await acceptedElsewhere();
+      const now = Date.now();
+      vi.spyOn(Date, "now").mockReturnValue(now + pins.MAX_AGE_MS + 1);
+      // Too old to show, and read again meanwhile.
+      expect(pins.handleStatus("alice", "A")).toBe("pending");
+      await vi.waitFor(() => expect(pins.handleStatus("alice", "B")).toBe("verified"));
+      expect(pins.handleStatus("alice", "A")).toBe("changed");
+    });
+    it("reads the pins again while they are shown, before the view is too old", async () => {
+      vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+      try {
+        pins.resetHandlePins();
+        await acceptedElsewhere();
+        expect(pins.handleStatus("alice", "A")).toBe("verified");
+        await vi.advanceTimersByTimeAsync(pins.REFRESH_MS + 1);
+        vi.useRealTimers();
+        await vi.waitFor(() => expect(pins.handleStatus("alice", "B")).toBe("verified"));
+      } finally { vi.useRealTimers(); }
+    });
+    it("hears of another tab's change through the localStorage ping", async () => {
+      await acceptedElsewhere();
+      const changed = localStorage.getItem("gwar-local.changed");
+      expect(changed).not.toBeNull();
+      expect(changed).not.toContain("uid");
+      window.dispatchEvent(new StorageEvent("storage", { key: "gwar-local.changed", newValue: changed }));
+      await vi.waitFor(() => expect(pins.handleStatus("alice", "B")).toBe("verified"));
+    });
+    it("reads everything again when the tab regains focus", async () => {
+      await acceptedElsewhere();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(pins.handleStatus("alice", "A")).toBe("verified"); // nothing else told this tab
+      window.dispatchEvent(new Event("focus"));
+      await vi.waitFor(() => expect(pins.handleStatus("alice", "B")).toBe("verified"));
+    });
+  });
+
   it("while the security state cannot be used, nothing is pinned or shown as verified", async () => {
     await pins.rememberHandle("alice", "A");
     // A newer version's tab upgrades the database: this page lets go of it.

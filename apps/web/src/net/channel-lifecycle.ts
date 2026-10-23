@@ -11,7 +11,8 @@ import { localState, type LocalStateChange } from "../lib/local-state";
  *  The record fails closed: when it cannot be kept complete (storage unreadable or full, or more ids than it
  *  holds) the server's record is marked incomplete for good, and every channel message there stays qualified.
  *  Records live in the device's security state (lib/local-state.ts); each write merges with what is stored in
- *  one transaction, so another tab's ids are kept. */
+ *  one transaction, so another tab's ids are kept, and every check reads the record as that state holds it now
+ *  (another tab's deletion counts at once) plus what this tab has not stored yet. */
 export interface ChannelLifecycle {
   /** A full channel list (welcome). Ids missing from it may be hidden, not deleted: they are kept. */
   observe(serverKey: string, ids: number[]): void;
@@ -23,33 +24,33 @@ export interface ChannelLifecycle {
 
 /** Ids kept per server; an honest server has and deletes far fewer channels than this. */
 export const MAX_IDS = 10_000;
-/** Servers whose records stay in memory. */
+/** Servers whose unsaved changes stay in memory, and whose parsed stored records are kept. */
 const MAX_SERVERS = 64;
 const PREFIX = "gwar.channels:";
-/** `unsaved`: storage does not hold what memory knows (yet), so this record must never be dropped from memory.
- *  `writing`: a write is in flight; `dirty`: the record changed since it started. */
-type Record = { known: Set<number>; deleted: Set<number>; incomplete: boolean; unsaved: boolean; writing?: boolean; dirty?: boolean };
+type Stored = { known: Set<number>; deleted: Set<number>; incomplete: boolean };
+/** What this tab knows and the database does not (yet). `writing`: a write is in flight; `dirty`: it changed since. */
+type Pending = Stored & { writing: boolean; dirty: boolean };
 type Store = { get(key: string): string | undefined; update(key: string, change: LocalStateChange): Promise<unknown> };
 
 const isIds = (v: unknown): v is number[] =>
   Array.isArray(v) && v.length <= MAX_IDS && v.every((n) => Number.isSafeInteger(n) && n >= 0);
 
 /** Exactly what `save` writes; anything else (or nothing readable) is an incomplete record, never a clean one. */
-function parse(raw: string | null): Record {
-  const empty = { known: new Set<number>(), deleted: new Set<number>(), unsaved: false };
+function parse(raw: string | null): Stored {
+  const empty = { known: new Set<number>(), deleted: new Set<number>() };
   if (raw === null) return { ...empty, incomplete: false };
   try {
     const v: unknown = JSON.parse(raw);
     if (typeof v === "object" && v !== null && !Array.isArray(v) && Object.keys(v).length === 3) {
       const { known, deleted, incomplete } = v as { [k: string]: unknown };
-      if (isIds(known) && isIds(deleted) && typeof incomplete === "boolean") return { known: new Set(known), deleted: new Set(deleted), incomplete, unsaved: false };
+      if (isIds(known) && isIds(deleted) && typeof incomplete === "boolean") return { known: new Set(known), deleted: new Set(deleted), incomplete };
     }
   } catch { /* malformed */ }
   return { ...empty, incomplete: true };
 }
 
-/** What `save` writes: `r` merged with the stored record (another tab's ids stay). */
-function merged(stored: string | undefined, r: Record): string {
+/** What a write stores: `r` merged with the stored record (another tab's ids stay). */
+function merged(stored: string | undefined, r: Stored): string {
   const s = parse(stored ?? null);
   const deleted = new Set([...s.deleted, ...r.deleted]);
   const known = new Set([...s.known, ...r.known].filter((id) => !deleted.has(id)));
@@ -59,83 +60,104 @@ function merged(stored: string | undefined, r: Record): string {
 
 export function channelLifecycle(given?: Store): ChannelLifecycle {
   const storage = () => given ?? localState;
-  // The record in memory is authoritative for this session; storage carries it across reloads. Saved records
-  // can be dropped from memory and read again; unsaved ones cannot, so they stay. When every slot holds one and
-  // another record is loaded, the oldest goes and every record is uncertain for the rest of the session.
-  const memory = new Map<string, Record>();
+  // The database (through the security state's view, which follows other tabs) is the record; this tab adds only
+  // what it has not stored yet. Unsaved changes are never dropped while they fit; past the bound the oldest goes
+  // and every record is uncertain for the rest of the session.
+  const pending = new Map<string, Pending>();
+  const parsed = new Map<string, { raw: string | undefined; record: Stored }>();
   let uncertain = false;
-  const load = (serverKey: string): Record => {
-    const cached = memory.get(serverKey);
-    if (cached) { memory.delete(serverKey); memory.set(serverKey, cached); return cached; }
-    let record: Record;
-    try { record = parse(storage().get(PREFIX + serverKey) ?? null); } catch { record = { ...parse(null), incomplete: true }; }
-    memory.set(serverKey, record);
-    // Never the record just loaded: the caller may change it, and a failed save must still find it here.
-    for (const [key, r] of memory) {
-      if (memory.size <= MAX_SERVERS) break;
-      if (!r.unsaved && key !== serverKey) memory.delete(key);
-    }
-    while (memory.size > MAX_SERVERS) {
-      const [key] = memory.keys();
-      memory.delete(key!);
-      uncertain = true;
-    }
+  /** The stored record as the view holds it now; unreadable storage is an incomplete record. */
+  const stored = (serverKey: string): Stored => {
+    let raw: string | undefined;
+    try { raw = storage().get(PREFIX + serverKey); } catch { return { known: new Set(), deleted: new Set(), incomplete: true }; }
+    const cached = parsed.get(serverKey);
+    if (cached && cached.raw === raw) return cached.record;
+    const record = parse(raw ?? null);
+    parsed.delete(serverKey);
+    parsed.set(serverKey, { raw, record });
+    if (parsed.size > MAX_SERVERS) parsed.delete(parsed.keys().next().value!);
     return record;
   };
-  const save = (serverKey: string, r: Record) => {
-    for (const id of r.deleted) r.known.delete(id);
-    if (r.known.size > MAX_IDS || r.deleted.size > MAX_IDS) {
-      r.incomplete = true;
-      r.known = new Set([...r.known].slice(-MAX_IDS));
-      r.deleted = new Set([...r.deleted].slice(-MAX_IDS));
-    }
-    // Unsaved until committed. One write at a time per record: changes made meanwhile go in the next one.
-    r.unsaved = true;
-    if (r.writing) { r.dirty = true; return; }
-    persist(serverKey, r);
+  const touch = (serverKey: string) => {
+    const p = pending.get(serverKey);
+    if (p) { pending.delete(serverKey); pending.set(serverKey, p); }
+    return p;
   };
-  const persist = (serverKey: string, r: Record) => {
-    r.writing = true;
-    r.dirty = false;
+  const pendingFor = (serverKey: string): Pending => {
+    const existing = touch(serverKey);
+    if (existing) return existing;
+    const p: Pending = { known: new Set(), deleted: new Set(), incomplete: false, writing: false, dirty: false };
+    pending.set(serverKey, p);
+    // Never the record just made; a dropped one's write still lands, and its outcome finds it gone.
+    for (const key of pending.keys()) {
+      if (pending.size <= MAX_SERVERS) break;
+      if (key === serverKey) continue;
+      pending.delete(key);
+      uncertain = true;
+    }
+    return p;
+  };
+  const isDeleted = (serverKey: string, id: number) => stored(serverKey).deleted.has(id) || !!pending.get(serverKey)?.deleted.has(id);
+  const save = (serverKey: string, p: Pending) => {
+    for (const id of p.deleted) p.known.delete(id);
+    if (p.known.size > MAX_IDS || p.deleted.size > MAX_IDS) {
+      p.incomplete = true;
+      p.known = new Set([...p.known].slice(-MAX_IDS));
+      p.deleted = new Set([...p.deleted].slice(-MAX_IDS));
+    }
+    // One write at a time per record: changes made meanwhile go in the next one.
+    if (p.writing) { p.dirty = true; return; }
+    persist(serverKey, p);
+  };
+  const persist = (serverKey: string, p: Pending) => {
+    p.writing = true;
+    p.dirty = false;
+    const written: Stored = { known: new Set(p.known), deleted: new Set(p.deleted), incomplete: p.incomplete };
     const store = (change: LocalStateChange) => {
       try { return storage().update(PREFIX + serverKey, change); } catch (error) { return Promise.reject(error); }
     };
-    const finish = (saved: boolean) => {
-      r.writing = false;
-      if (r.dirty) persist(serverKey, r);
-      else if (saved) r.unsaved = false;
+    const finish = () => {
+      p.writing = false;
+      if (p.dirty) persist(serverKey, p);
+      else if (!p.known.size && !p.deleted.size && !p.incomplete && pending.get(serverKey) === p) pending.delete(serverKey);
     };
-    void store((stored) => merged(stored, r)).then(
-      () => finish(true),
+    void store((current) => merged(current, written)).then(
+      () => {
+        // Committed: the database holds it now (and the view, which `check` reads); keep only what came since.
+        for (const id of written.known) p.known.delete(id);
+        for (const id of written.deleted) p.deleted.delete(id);
+        if (written.incomplete) p.incomplete = false;
+        finish();
+      },
       () => {
         // What was not stored is lost on reload: from now on the record is incomplete. The small marker usually
-        // fits; until something is stored, memory keeps the record.
-        r.incomplete = true;
-        return store((stored) => merged(stored, { known: new Set(), deleted: new Set(), incomplete: true, unsaved: true }))
-          .then(() => finish(true), () => finish(false));
+        // fits; either way this tab keeps what it knows.
+        p.incomplete = true;
+        return store((current) => merged(current, { known: new Set(), deleted: new Set(), incomplete: true })).catch(() => {}).then(finish);
       },
     );
   };
   return {
     observe(serverKey, current) {
-      const r = load(serverKey);
-      for (const id of current) if (!r.deleted.has(id)) r.known.add(id);
-      save(serverKey, r);
+      const p = pendingFor(serverKey);
+      for (const id of current) if (!isDeleted(serverKey, id)) p.known.add(id);
+      save(serverKey, p);
     },
     created(serverKey, id) {
-      const r = load(serverKey);
-      if (r.deleted.has(id)) return;
-      r.known.add(id);
-      save(serverKey, r);
+      if (isDeleted(serverKey, id)) return;
+      const p = pendingFor(serverKey);
+      p.known.add(id);
+      save(serverKey, p);
     },
     deleted(serverKey, id) {
-      const r = load(serverKey);
-      r.deleted.delete(id); r.deleted.add(id);
-      save(serverKey, r);
+      const p = pendingFor(serverKey);
+      p.deleted.delete(id); p.deleted.add(id);
+      save(serverKey, p);
     },
     check(serverKey, id) {
-      const r = load(serverKey);
-      return r.deleted.has(id) ? "reused" : r.incomplete || uncertain ? "unknown" : "ok";
+      const s = stored(serverKey), p = touch(serverKey);
+      if (s.deleted.has(id) || p?.deleted.has(id)) return "reused";
+      return s.incomplete || p?.incomplete || uncertain ? "unknown" : "ok";
     },
   };
 }

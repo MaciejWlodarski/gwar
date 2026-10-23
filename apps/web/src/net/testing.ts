@@ -92,11 +92,11 @@ export async function finishHandshake(s: FakeSocket, w = welcome()): Promise<voi
 export function memoryPins(): PinStore & { pins: Map<string, ServerPin> } {
   const pins = new Map<string, ServerPin>();
   return { pins, load: (endpoint) => pins.get(endpoint),
-    async commit(endpoint, server_pk) {
+    async commit(endpoint, server_pk, replacing) {
       const old = pins.get(endpoint);
-      if (old && old.server_pk !== server_pk) throw new Error("pin changed");
-      if (!old) pins.set(endpoint, { server_pk, first_seen: Date.now() });
+      if (old?.server_pk === server_pk) return;
+      if (old && old.server_pk !== replacing) throw new Error("pin changed");
+      pins.set(endpoint, { server_pk, first_seen: Date.now() });
     },
-    async forget(endpoint, previous) { if (pins.get(endpoint)?.server_pk === previous) pins.delete(endpoint); },
   };
 }

@@ -12,7 +12,7 @@ import { conversationThread, sealedThread, threadConversation } from "../lib/cha
 import { messageTarget } from "../lib/chat";
 import { uploadAttachment, localAttachmentMetadata, imageHints } from "../net/attachment";
 import { sealFile, SEALED_FILE_OVERHEAD, SEALED_MIME, SEALED_NAME } from "../net/sealed-file";
-import { serverPins, type ServerIdentityChanged } from "../net/server-pins";
+import type { ServerIdentityChanged } from "../net/server-pins";
 import { channels as channelLifecycle, withChannelLifecycle } from "../net/channel-lifecycle";
 import { signMessage, sha256, MessageVerifier, fullyVerified, DELETION_TEXT, invalidVerification, sameMessageIdentity, notificationAllowed } from "../net/message-signature";
 import type { Attachment } from "../proto/Attachment";
@@ -98,6 +98,8 @@ export interface ConnectParams {
   /** Invite code from a link: admits without the server password. */
   invite?: string;
   inviteServerKey?: string;
+  /** The pinned key the user accepted to replace by `inviteServerKey` (lib: `ConnectionOptions.replaceServerKey`). */
+  replaceServerKey?: string;
   /** The owner an invite link named: checked on first contact with its server. */
   inviteOwner?: string;
   insecureLan?: boolean;
@@ -428,13 +430,15 @@ class Controller {
         serverPassword: params.password || undefined,
         invite: params.invite || undefined,
         inviteServerKey: params.inviteServerKey,
+        replaceServerKey: params.replaceServerKey,
         insecureLan: params.insecureLan,
         client: { name: "gwar-web", version: CLIENT_VERSION, platform: platform() },
       });
     }
     this.conn = conn;
     this.connections++;
-    this.connectionParams = { ...params };
+    // A later reconnect with these never replaces a pin: the acceptance was for this connection.
+    this.connectionParams = { ...params, replaceServerKey: undefined };
     this.wire(conn, params);
     try {
       if (conn instanceof Connection) {
@@ -557,11 +561,9 @@ class Controller {
       danger: true, serverIdentity: true,
       onConfirm: () => {
         if (change.source === "invite") return;
-        // Connect again only once the old pin is gone for good.
-        void serverPins.forget(change.endpoint, change.expected).then(
-          () => this.connectInteractive({ ...params, inviteServerKey: params.inviteServerKey ?? change.candidate }, opts),
-          () => useUi.getState().toast("error", tNow("err.connect.trust_storage")),
-        );
+        // The pin stays until the new key is proven: the connection replaces it then, in one transaction, and
+        // only if it still is the key the user saw. The address is never left without a pin meanwhile.
+        void this.connectInteractive({ ...params, inviteServerKey: params.inviteServerKey ?? change.candidate, replaceServerKey: change.expected }, opts);
       },
     });
   }

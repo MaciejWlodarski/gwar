@@ -173,7 +173,7 @@ describe("gwar/4 transport", () => {
 });
 
 describe("persistent pins and canonical fields", () => {
-  it("persists canonical endpoint, key and first-seen time and requires an explicit forget", async () => {
+  it("persists canonical endpoint, key and first-seen time, and moves only to a key accepted in its place", async () => {
     const { localState } = await import("../lib/local-state");
     await localState.load();
     await serverPins.commit("wss://SERVER.example.:443/ws", testServerIdentity.publicKey);
@@ -183,8 +183,53 @@ describe("persistent pins and canonical fields", () => {
     expect(serverPins.load("wss://server.example/ws")).toEqual(pin);
     expect(() => checkCandidate("wss://server.example/ws", fakeIdentity.publicKey, serverPins)).toThrow(ServerIdentityChanged);
     await expect(serverPins.commit("wss://server.example/ws", fakeIdentity.publicKey)).rejects.toBeInstanceOf(ServerIdentityChanged);
-    await serverPins.forget("wss://server.example/ws", fakeIdentity.publicKey); expect(serverPins.load("wss://server.example/ws")).toEqual(pin);
-    await serverPins.forget("wss://server.example/ws", testServerIdentity.publicKey); expect(serverPins.load("wss://server.example/ws")).toBeUndefined();
+    // Accepted in place of another key than the pinned one: refused, the pin stays.
+    await expect(serverPins.commit("wss://server.example/ws", fakeIdentity.publicKey, "B".repeat(42) + "A")).rejects.toBeInstanceOf(ServerIdentityChanged);
+    expect(serverPins.load("wss://server.example/ws")).toEqual(pin);
+    await serverPins.commit("wss://server.example/ws", fakeIdentity.publicKey, testServerIdentity.publicKey);
+    expect(serverPins.load("wss://server.example/ws")?.server_pk).toBe(fakeIdentity.publicKey);
+  });
+  describe("accepting a changed server key", () => {
+    const url = "wss://replace.example/ws";
+    /** The key pinned before, the one the server now proves (`challenge` and `finishHandshake` use it), another. */
+    const [old, proven] = [fakeIdentity.publicKey, testServerIdentity.publicKey];
+    const pinned = () => serverPins.load(url)?.server_pk;
+    async function accepted(extra: Partial<ConnectionOptions> = {}) {
+      const { localState } = await import("../lib/local-state");
+      await localState.load();
+      await localState.update("gwar.server-pin:" + url, () => JSON.stringify({ server_pk: old, first_seen: 1 }));
+      return make({ url, pinStore: serverPins, inviteServerKey: proven, replaceServerKey: old, ...extra });
+    }
+    it("keeps the old pin until the new key is proven, so no third key is ever trusted on first use meanwhile", async () => {
+      const other = (await generateIdentity()).publicKey;
+      const conn = await accepted();
+      const { socket, result } = await begin(conn);
+      expect(pinned()).toBe(old);
+      // Another tab that was waiting for a first-contact proof from this address finishes now: refused.
+      await expect(serverPins.commit(url, other)).rejects.toBeInstanceOf(ServerIdentityChanged);
+      await finishHandshake(socket); await result;
+      expect(pinned()).toBe(proven);
+      conn.close();
+    });
+    it("is refused when the pin no longer holds the key the user replaced", async () => {
+      const other = (await generateIdentity()).publicKey;
+      const conn = await accepted();
+      const { socket, result } = await begin(conn);
+      const { localState } = await import("../lib/local-state");
+      await localState.update("gwar.server-pin:" + url, () => JSON.stringify({ server_pk: other, first_seen: 2 }));
+      const hello = socket.sent[0]!.d as Hello;
+      socket.push({ re: 1, ok: { server_proof: await testServerIdentity.sign(new TextEncoder().encode(await proofStatement(hello))) } });
+      await expect(result).rejects.toMatchObject({ kind: "server_identity" });
+      expect(socket.sent).toHaveLength(1);
+      expect(pinned()).toBe(other);
+    });
+    it("needs the accepted key: without it the old pin blocks before signing", async () => {
+      const sign = vi.fn(fakeIdentity.sign);
+      const conn = await accepted({ inviteServerKey: undefined, identity: { ...fakeIdentity, sign } });
+      const result = conn.connect(); const socket = FakeSocket.last(); socket.open(); socket.push(challenge());
+      await expect(result).rejects.toMatchObject({ kind: "server_identity" });
+      expect(sign).not.toHaveBeenCalled(); expect(pinned()).toBe(old);
+    });
   });
   it("trusts no key while the pins cannot be read: nothing pinned or signed, and a storage error", async () => {
     vi.resetModules();
@@ -203,6 +248,26 @@ describe("persistent pins and canonical fields", () => {
       await expect(result).rejects.toMatchObject({ kind: "trust_storage" });
       expect(sign).not.toHaveBeenCalled(); expect(socket.sent).toHaveLength(0);
     } finally { vi.unstubAllGlobals(); vi.resetModules(); }
+  });
+  it("trusts no key once the browser closed the pins' database (Sol r5 probe, inverted)", async () => {
+    vi.resetModules();
+    try {
+      let db!: IDBDatabase;
+      const { createLocalState, LOCAL_STATE_MIGRATIONS } = await import("../lib/local-state");
+      const state = createLocalState(`closed-${crypto.randomUUID()}`, [(opened, tx) => { db = opened; LOCAL_STATE_MIGRATIONS[0]!(opened, tx); }]);
+      await state.load();
+      vi.doMock("../lib/local-state", async () => ({ ...await vi.importActual("../lib/local-state"), localState: state }));
+      const { Connection: Isolated } = await import("./connection");
+      const { forceCloseDatabase } = await import("fake-indexeddb");
+      forceCloseDatabase(db as never);
+      await vi.waitFor(() => expect(state.error()).toBeDefined());
+      const sign = vi.fn(fakeIdentity.sign);
+      const conn = new Isolated({ url: "wss://closed.example/ws", identity: { ...fakeIdentity, sign }, nickname: "test",
+        client: { name: "test", version: "0", platform: "web" }, createSocket: (url) => new FakeSocket(url) });
+      const result = conn.connect(); const socket = FakeSocket.last(); socket.open(); socket.push(challenge());
+      await expect(result).rejects.toMatchObject({ kind: "trust_storage" });
+      expect(sign).not.toHaveBeenCalled(); expect(socket.sent).toHaveLength(0);
+    } finally { vi.doUnmock("../lib/local-state"); vi.resetModules(); }
   });
   it.each(["A".repeat(43) + "=", "A".repeat(42) + "B", "bad\nkey", "AA"])("rejects noncanonical encodings: %s", (value) => expect(() => decodeFixed(value, 32)).toThrow());
   it("has exact statement bytes with no trailing newline", () => {
