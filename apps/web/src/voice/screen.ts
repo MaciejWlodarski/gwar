@@ -8,6 +8,8 @@
  * transport (fresh DTLS and SSRCs), and the watch transport belongs to the session, with
  * `SCREEN_SLOTS` fixed receive-only slots the server fills (`screen.slot`).
  */
+import type { H264Capability } from "../proto/H264Capability";
+import type { ScreenRecovery } from "../proto/ScreenRecovery";
 import type { IceServer } from "../proto/IceServer";
 import type { ScreenPreset } from "../proto/ScreenPreset";
 import type { ScreenSurface } from "../proto/ScreenSurface";
@@ -107,23 +109,75 @@ export async function applyCapturePreset(track: MediaStreamTrack, preset: Screen
   });
 }
 
-/** VP9 (profile 0), then VP8, then RTX: the only video the SFU forwards (docs/screen-share.md, "Codecs"). */
+/** H.264 mode 1 (Constrained Baseline first), VP9 profile 0, then RTX. */
 export function preferredCodecs(codecs: readonly RTCRtpCodec[]): RTCRtpCodec[] {
   const mime = (c: RTCRtpCodec) => c.mimeType.toLowerCase();
+  const h264 = codecs.filter(c => mime(c) === "video/h264" && /(^|;)\s*packetization-mode=1(?:;|$)/.test(c.sdpFmtpLine ?? "") &&
+    /(^|;)\s*profile-level-id=(42[eEcC][0-9a-fA-F]|640[cC]|6400)[0-9a-fA-F]{2}(?:;|$)/.test(c.sdpFmtpLine ?? ""))
+    .sort((a, b) => Number(!/profile-level-id=42/i.test(a.sdpFmtpLine ?? "")) - Number(!/profile-level-id=42/i.test(b.sdpFmtpLine ?? "")));
   const vp9 = codecs.filter(c => mime(c) === "video/vp9" && (!c.sdpFmtpLine || /(^|;)\s*profile-id=0\b/.test(c.sdpFmtpLine) || !/profile-id=/.test(c.sdpFmtpLine)));
-  const vp8 = codecs.filter(c => mime(c) === "video/vp8");
   const rtx = codecs.filter(c => mime(c) === "video/rtx");
-  return [...vp9, ...vp8, ...rtx];
+  return [...h264, ...vp9, ...rtx];
 }
 
-/** Applies `preferredCodecs` to a transceiver where the browser allows it; the SFU answers VP9/VP8 anyway. */
-function preferCodecs(transceiver: RTCRtpTransceiver, side: "send" | "receive"): void {
+/** Advertise only the selected side's capabilities: sender support never implies decoder support. */
+function preferCodecs(transceiver: RTCRtpTransceiver, side: "send" | "receive", selected?: "h264" | "vp9"): void {
   if (typeof transceiver.setCodecPreferences !== "function") return;
-  const sources = side === "send" ? [RTCRtpSender, RTCRtpReceiver] : [RTCRtpReceiver, RTCRtpSender];
+  const sources = side === "send" ? [RTCRtpSender] : [RTCRtpReceiver];
   for (const source of sources) {
-    const codecs = preferredCodecs(source.getCapabilities?.("video")?.codecs ?? []);
+    const codecs = preferredCodecs(source.getCapabilities?.("video")?.codecs ?? []).filter(c => !selected || ["video/rtx", `video/${selected}`].includes(c.mimeType.toLowerCase()));
     if (!codecs.some(c => c.mimeType.toLowerCase() !== "video/rtx")) continue;
     try { transceiver.setCodecPreferences(codecs); return; } catch { /* some engines check the other side's list */ }
+  }
+}
+
+/** Each returned tuple has passed a real WebRTC decoder probe; unavailable/timeout means SDP only. */
+export async function probeH264(): Promise<H264Capability[]> {
+  const media = navigator.mediaCapabilities;
+  if (typeof media?.decodingInfo !== "function") return [];
+  const targets = [
+    { width: 1280, height: 720, framerate: 30, bitrate: 1_500_000, level: 31, max_fs: 3600, max_mbps: 108000 },
+    { width: 1920, height: 1080, framerate: 60, bitrate: 8_000_000, level: 42, max_fs: 8160, max_mbps: 489600 },
+    { width: 2560, height: 1440, framerate: 60, bitrate: 14_000_000, level: 51, max_fs: 14400, max_mbps: 864000 },
+  ];
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const result: H264Capability[] = [];
+  const probes = Promise.all([0x42e0, 0x640c, 0x6400].map(async profile => {
+    const supported = await Promise.all(targets.map(async t => {
+      const profile_level_id = profile * 256 + t.level;
+      try {
+        const info = await media.decodingInfo({ type: "webrtc" as MediaDecodingType, video: {
+          contentType: `video/H264;profile-level-id=${profile_level_id.toString(16).padStart(6, "0")};packetization-mode=1`,
+          width: t.width, height: t.height, framerate: t.framerate, bitrate: t.bitrate,
+        } });
+        return info.supported ? { profile_level_id, max_fs: t.max_fs, max_mbps: t.max_mbps } : null;
+      } catch { return null; }
+    }));
+    const highest = supported.findLast(c => c !== null);
+    if (highest) result.push(highest);
+  }));
+  await Promise.race([probes, new Promise<void>(resolve => { timer = setTimeout(resolve, 1500); })]);
+  clearTimeout(timer);
+  // Late probe completions cannot mutate the capability message after the timeout.
+  return [...result].sort((a, b) => a.profile_level_id - b.profile_level_id);
+}
+
+/** At most two reports per server-fenced generation, six seconds apart; network gaps restart the four-second clock. */
+export class DecodeWatchdog {
+  private since: number | null = null;
+  private frames: number | null = null;
+  private packets: number | null = null;
+  private last: number | null = null;
+  private reports = 0;
+  private reportedAt: number | null = null;
+  observe(now: number, packets: number, frames: number): boolean {
+    if (this.reports >= 2) return false;
+    if (this.frames === null || frames > this.frames || packets <= (this.packets ?? packets) || (this.last !== null && now - this.last > 1500)) this.since = now;
+    this.frames = frames;
+    const flowing = this.packets !== null && packets > this.packets;
+    this.packets = packets; this.last = now;
+    if (flowing && this.since !== null && now - this.since >= 4000 && (this.reportedAt === null || now - this.reportedAt >= 6000)) { this.reports++; this.reportedAt = now; return true; }
+    return false;
   }
 }
 
@@ -156,6 +210,7 @@ export interface PublishStats {
   limitation: "none" | "cpu" | "bandwidth" | "other";
   /** e.g. "libvpx" (software) or "MediaFoundationVideoEncodeAccelerator"; engines may hide it. */
   encoder: string | null;
+  codec: string | null;
   /** True for a hardware encoder, when the engine says. */
   hardware: boolean | null;
 }
@@ -207,6 +262,7 @@ export class ScreenPublisher {
   private stopWatching: () => void = () => {};
   private closed = false;
   private sent: { bytes: number; at: number } | null = null;
+  private recovery: ScreenRecovery | null = null;
 
   constructor(private readonly params: PublishParams) {
     this.preset = params.preset;
@@ -214,16 +270,18 @@ export class ScreenPublisher {
 
   async start(): Promise<void> {
     const { track, iceServers } = this.params;
+    if (this.recovery) await track.applyConstraints({ width: { max: this.recovery.width }, height: { max: this.recovery.height }, frameRate: { max: this.recovery.fps } });
+    if (this.closed) return;
     const pc = new RTCPeerConnection(rtcConfig(iceServers));
     this.pc = pc;
     this.stopWatching = watchState(pc, s => this.params.state(s), () => this.pc === pc);
-    const spec = PRESETS[this.preset];
+    const spec = this.spec();
     const transceiver = pc.addTransceiver(track, {
       direction: "sendonly",
-      sendEncodings: [{ maxBitrate: spec.maxBitrate, maxFramerate: spec.fps, priority: "low", networkPriority: "low" }],
+      sendEncodings: [{ ...this.scale(), maxBitrate: spec.maxBitrate, maxFramerate: spec.fps, priority: "low", networkPriority: "low" }],
     });
     this.sender = transceiver.sender;
-    preferCodecs(transceiver, "send");
+    preferCodecs(transceiver, "send", this.recovery?.codec === "vp9" ? "vp9" : undefined);
     await pc.setLocalDescription(await pc.createOffer());
     if (this.closed) return;
     const sdp = pc.localDescription?.sdp ?? "";
@@ -234,7 +292,7 @@ export class ScreenPublisher {
     await pc.setRemoteDescription({ type: "answer", sdp: answer });
     if (this.closed) return;
     // The latest preset: `setPreset` may have run while this negotiated.
-    await this.applyParameters(PRESETS[this.preset].maxBitrate);
+    await this.applyParameters(this.spec().maxBitrate);
     if (this.closed) return;
     this.timer = setInterval(() => void this.headroom(), HEADROOM_INTERVAL_MS);
   }
@@ -243,7 +301,8 @@ export class ScreenPublisher {
   async setPreset(preset: ScreenPreset): Promise<void> {
     this.preset = preset;
     await applyCapturePreset(this.params.track, preset);
-    await this.applyParameters(PRESETS[preset].maxBitrate);
+    if (this.recovery) await this.params.track.applyConstraints({ width: { max: this.recovery.width }, height: { max: this.recovery.height }, frameRate: { max: this.recovery.fps } });
+    await this.applyParameters(this.spec().maxBitrate);
     await this.headroom();
   }
 
@@ -255,7 +314,8 @@ export class ScreenPublisher {
     if (!pc || this.closed) return null;
     try {
       let out: OutboundVideo | undefined;
-      (await pc.getStats()).forEach(s => {
+      const report = await pc.getStats();
+      report.forEach(s => {
         if (s.type === "outbound-rtp" && (s as OutboundVideo).kind === "video") out = s as OutboundVideo;
       });
       if (!out) return null;
@@ -270,6 +330,7 @@ export class ScreenPublisher {
         bitrate,
         limitation: reason === "cpu" || reason === "bandwidth" || reason === "other" ? reason : "none",
         encoder: out.encoderImplementation || null,
+        codec: out.codecId ? (report.get(out.codecId)?.mimeType as string | undefined)?.replace(/^video\//i, "") ?? null : null,
         hardware: typeof out.powerEfficientEncoder === "boolean" ? out.powerEfficientEncoder : null,
       };
     } catch { return null; }
@@ -289,7 +350,7 @@ export class ScreenPublisher {
         if ((selected ? pair.id === selected : pair.nominated && pair.state === "succeeded") && pair.availableOutgoingBitrate) available = pair.availableOutgoingBitrate;
       });
     } catch { return; }
-    const target = headroomBitrate(PRESETS[this.preset].maxBitrate, available);
+    const target = headroomBitrate(this.spec().maxBitrate, available);
     // Small moves are not worth a parameter change.
     if (Math.abs(target - this.applied) > this.applied * 0.1) await this.applyParameters(target);
   }
@@ -297,8 +358,8 @@ export class ScreenPublisher {
   private async applyParameters(maxBitrate: number): Promise<void> {
     const sender = this.sender;
     if (!sender || this.closed) return;
-    const spec = PRESETS[this.preset];
-    const encoding: RTCRtpEncodingParameters = { maxBitrate, maxFramerate: spec.fps, priority: "low", networkPriority: "low" };
+    const spec = this.spec();
+    const encoding: RTCRtpEncodingParameters = { ...this.scale(), maxBitrate, maxFramerate: spec.fps, priority: "low", networkPriority: "low" };
     const fresh = (): RTCRtpSendParameters => {
       const params = sender.getParameters();
       params.encodings = params.encodings?.length ? params.encodings.map((e, i) => (i === 0 ? { ...e, ...encoding } : e)) : [encoding];
@@ -312,6 +373,30 @@ export class ScreenPublisher {
       catch (e) { console.warn("Screen sender parameters:", e); return; }
     }
     this.applied = maxBitrate;
+  }
+
+  private spec(): PresetSpec {
+    const spec = PRESETS[this.preset], r = this.recovery;
+    return r ? { ...spec, width: Math.min(spec.width, r.width), height: Math.min(spec.height, r.height), fps: Math.min(spec.fps, r.fps) } : spec;
+  }
+
+  private scale(): { scaleResolutionDownBy?: number } {
+    if (!this.recovery) return {};
+    const settings = this.params.track.getSettings?.() ?? {};
+    return { scaleResolutionDownBy: Math.max(1, (settings.width ?? this.recovery.width) / this.recovery.width, (settings.height ?? this.recovery.height) / this.recovery.height) };
+  }
+
+  async recover(plan: ScreenRecovery): Promise<void> {
+    if (this.closed) return;
+    this.recovery = plan;
+    if (this.timer) clearInterval(this.timer);
+    this.timer = null;
+    this.stopWatching();
+    const pc = this.pc; this.pc = null; this.sender = null; this.sent = null;
+    // Keep the old publish transport alive until the server has accepted its replacement.
+    // Closing it before the offer lets the server end the share on its DTLS close.
+    try { await this.start(); }
+    finally { if (pc) { pc.onconnectionstatechange = null; pc.close(); } }
   }
 
   close(): void {
@@ -332,7 +417,8 @@ export interface WatchParams {
   slots?: number;
   iceServers: IceServer[];
   /** `screen.watch.offer` with this run: the server's answer. */
-  offer(sdp: string, run: number): Promise<string>;
+  offer(sdp: string, run: number, h264?: H264Capability[]): Promise<string>;
+  decodeFailed?(slot: number, share: string, generation: number): void;
   state(state: TransportState): void;
   /** A slot's video track arrived (once per slot and transport). */
   track(slot: number, stream: MediaStream): void;
@@ -347,6 +433,9 @@ export interface SlotStats { width: number; height: number; fps: number; framesD
  * minimal (`jitterBufferTarget = 0`) where the engine supports it.
  */
 export class ScreenWatchTransport {
+  private watchdogs = new Map<number, { share: string; generation: number; watchdog: DecodeWatchdog }>();
+  private decodeTimer: ReturnType<typeof setInterval> | null = null;
+  private polling = false;
   readonly run: number;
   private pc: RTCPeerConnection | null = null;
   private transceivers: RTCRtpTransceiver[] = [];
@@ -375,9 +464,38 @@ export class ScreenWatchTransport {
     };
     await pc.setLocalDescription(await pc.createOffer());
     if (this.closed) return;
-    const answer = await this.params.offer(pc.localDescription?.sdp ?? "", this.run);
+    const h264 = await probeH264();
+    if (this.closed) return;
+    const answer = await this.params.offer(pc.localDescription?.sdp ?? "", this.run, h264);
     if (this.closed) return;
     await pc.setRemoteDescription({ type: "answer", sdp: answer });
+    if (!this.closed && this.params.decodeFailed) this.decodeTimer = setInterval(() => void this.checkDecode(), 1000);
+  }
+
+  keyframe(slot: number, share: string, generation: number): void {
+    if (slot < 0 || slot >= this.transceivers.length || this.closed) return;
+    const current = this.watchdogs.get(slot);
+    if (current?.share === share && current.generation === generation) return;
+    this.watchdogs.set(slot, { share, generation, watchdog: new DecodeWatchdog() });
+  }
+
+  clearSlot(slot: number): void { this.watchdogs.delete(slot); }
+
+  private async checkDecode(): Promise<void> {
+    const pc = this.pc;
+    if (!pc || this.closed || this.polling) return;
+    this.polling = true;
+    try {
+      const report = await pc.getStats();
+      if (pc !== this.pc || this.closed) return;
+      report.forEach(s => {
+        if (s.type !== "inbound-rtp" || s.kind !== "video" || !/video\/h264/i.test(String(report.get(s.codecId)?.mimeType))) return;
+        const slot = this.transceivers.findIndex(t => t.mid === s.mid);
+        const state = this.watchdogs.get(slot);
+        if (state?.watchdog.observe(performance.now(), Number(s.packetsReceived ?? 0), Number(s.framesDecoded ?? 0))) this.params.decodeFailed?.(slot, state.share, state.generation);
+      });
+    } catch { /* Missing stats cannot prove that an H.264 decoder failed. */ }
+    finally { this.polling = false; }
   }
 
   /** What one slot decodes, for the stage's quality badge. */
@@ -397,6 +515,9 @@ export class ScreenWatchTransport {
 
   close(): void {
     this.closed = true;
+    if (this.decodeTimer) clearInterval(this.decodeTimer);
+    this.decodeTimer = null;
+    this.watchdogs.clear();
     this.stopWatching();
     const pc = this.pc;
     this.pc = null;

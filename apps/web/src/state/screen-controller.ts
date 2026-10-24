@@ -414,16 +414,25 @@ export class ScreenController {
       settle.reject(e);
       if (lost) useUi.getState().toast("error", tNow("screen.watchFailed"));
     };
+    let screenH264 = false;
     const transport: ScreenWatchTransport = new ScreenWatchTransport({
       run,
       iceServers: useSession.getState().iceServers,
-      offer: async (sdp, run) => (await conn.request("screen.watch.offer", { run, sdp }, { timeoutMs: 35_000 })).sdp,
+      offer: async (sdp, run, h264 = []) => {
+        // Query explicitly: adding fields to Welcome would break old clients' strict
+        // validators. An older server replies bad_request and retains legacy offers.
+        screenH264 = await conn.request("screen.capabilities", {}, { timeoutMs: 1_500 })
+          .then(features => features.screen_h264 === true).catch(() => false);
+        if (this.transport !== transport) throw new Error("the watch transport was replaced");
+        return (await conn.request("screen.watch.offer", { run, sdp, ...(screenH264 ? { browser: true, h264 } : {}) }, { timeoutMs: 35_000 })).sdp;
+      },
       state: state => {
         if (this.transport !== transport) return;
         if (state === "failed") { fail(new Error(tNow("screen.watchFailed"))); return; }
         dispatch({ type: "transport", run, phase: state });
         if (state === "connected") settle.resolve(run);
       },
+      decodeFailed: (slot, share, generation) => { if (screenH264 && this.transport === transport) void conn.request("screen.decode_failed", { run, slot, share, generation }).catch(() => {}); },
       track: (slot, stream) => { if (this.transport === transport) dispatch({ type: "stream", run, slot, stream }); },
     });
     this.transport = transport;
@@ -451,6 +460,21 @@ export class ScreenController {
 
   handleEvent(event: Event): void {
     switch (event.ev) {
+      case "screen.recover": {
+        const publisher = this.publisher;
+        if (publisher && useScreen.getState().own?.share === event.d.share) void publisher.recover(event.d).catch((e: unknown) => {
+          if (this.publisher !== publisher || useScreen.getState().own?.share !== event.d.share) return;
+          console.warn("Screen recovery:", e);
+          void this.stopShare();
+          useUi.getState().toast("error", tNow("screen.stopped.transport"));
+        });
+        return;
+      }
+      case "screen.keyframe": {
+        const { run, slot, share, generation } = event.d;
+        if (run === this.transport?.run) this.transport.keyframe(slot, share, generation);
+        return;
+      }
       case "screen.started":
         dispatch({ type: "live", share: event.d.share });
         return;
@@ -466,12 +490,13 @@ export class ScreenController {
         // A slot the server frees on its own comes before `screen.stopped`, which says why.
         const ended = share === null && run === screen.transport.run ? screen.watches.find(w => w.slot === slot && w.status === "watching") : undefined;
         if (ended) this.released.set(ended.share, { onStage: screen.stage === ended.share });
+        if (this.transport?.run === run) this.transport.clearSlot(slot);
         dispatch({ type: "slot", run, slot, share });
         return;
       }
       case "screen.stopped": {
         const { share, reason, by } = event.d;
-        if (reason !== "access") dispatch({ type: "link", share, active: false });
+        if (reason !== "access" && reason !== "codec") dispatch({ type: "link", share, active: false });
         const own = useScreen.getState().own;
         if (own?.share === share) {
           this.endOwn();
@@ -487,7 +512,8 @@ export class ScreenController {
         if (!watched && !released) return;
         const onStage = watched ? screen.stage === share : released!.onStage;
         if (watched) dispatch({ type: "unwatch", share });
-        if (reason === "access") useUi.getState().toast("info", tNow("screen.noLongerWatch"));
+        if (reason === "codec") useUi.getState().toast("error", tNow("screen.cantDecode"));
+        else if (reason === "access") useUi.getState().toast("info", tNow("screen.noLongerWatch"));
         else if (onStage) useUi.getState().toast("info", tNow("screen.ended"));
         return;
       }
@@ -504,6 +530,7 @@ export class ScreenController {
       case "transport": return tNow("screen.stopped.transport");
       case "budget": return tNow("screen.stopped.budget");
       case "access": return tNow("screen.stopped.access");
+      case "codec": return tNow("screen.cantDecode");
     }
   }
 

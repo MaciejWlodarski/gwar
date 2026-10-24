@@ -141,6 +141,12 @@ const mlsWanted = shape({ group: mlsGroupId, device: fixed(32), assignment: opti
 const mlsLogEntry = shape({ epoch: id, proposals: mlsProposals, commit: mlsBlob });
 const cursor = nullable(str(1024));
 
+// Admission supports H.264 through level 5.1: at most 36864 macroblocks per
+// frame (server media/screen/codec.rs), hence at most 36864 * 16 pixels on
+// either axis, including portrait/ultrawide SPSs. Restore plans use the original
+// admitted size, not the smaller fallback size. Shared vectors pin both parsers.
+const SCREEN_RECOVERY_MAX_DIMENSION = 36864 * 16;
+
 export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "mls.commit": shape({ group: mlsGroupId, epoch: id, proposals: mlsProposals, commit: mlsBlob }),
   "mls.proposal": shape({ group: mlsGroupId, epoch: id, proposal: mlsBlob }),
@@ -158,9 +164,11 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "voice.talking": shape({ ...voiceFields, client: int(4294967295), talking: bool }), "voice.slot": shape({ ...transportFields, slot: int(7), client: nullable(int(4294967295)) }),
   "voice.state": shape({ voice: nullable(voiceState) }),
   "screen.started": screenShare,
-  "screen.stopped": shape({ share: shareId, reason: literal<ScreenStopReason>(["stopped", "moderator", "left", "limit", "transport", "budget", "access"]), by: optional(str(256)) }),
+  "screen.stopped": shape({ share: shareId, reason: literal<ScreenStopReason>(["stopped", "moderator", "left", "limit", "transport", "budget", "access", "codec"]), by: optional(str(256)) }),
   "screen.viewers": shape({ share: shareId, members: int(4294967295), guests: int(4294967295) }), "screen.link": shape({ share: shareId, active: bool }),
   "screen.slot": shape({ run: int(Number.MAX_SAFE_INTEGER, 1), slot: int(3), share: nullable(shareId) }),
+  "screen.keyframe": shape({ share: shareId, run: int(Number.MAX_SAFE_INTEGER, 1), slot: int(3), generation: int(65535) }),
+  "screen.recover": shape({ share: shareId, codec: literal(["h264", "vp9"]), width: int(SCREEN_RECOVERY_MAX_DIMENSION, 1), height: int(SCREEN_RECOVERY_MAX_DIMENSION, 1), fps: int(60, 1) }),
   "screen.paused": shape({ share: shareId, reason: literal<ScreenPauseReason>(["bandwidth", "budget"]) }), "screen.resumed": shape({ share: shareId }),
   "server.egress_warning": shape({ month, percent: int(100), total: int(Number.MAX_SAFE_INTEGER), limit: int(Number.MAX_SAFE_INTEGER) }),
   "voice.epoch.ack": shape({call:fixed(16),group:fixed(32),epoch:id,device:fixed(32)}),
@@ -202,7 +210,8 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "voice.state": shape({voice:nullable(voiceState)}),
   "voice.epoch.ack": empty, "voice.epoch.repeat": empty,
   "screen.start": shape({ share: shareId }), "screen.stop": empty, "screen.watch": shape({ slot: int(3) }), "screen.unwatch": empty, "screen.stop_other": empty, "screen.link.revoke": empty,
-  "screen.publish.offer": shape({ sdp: str(65536) }), "screen.watch.offer": shape({ sdp: str(65536) }), "screen.focus": empty, "screen.keyframe": empty,
+  "screen.capabilities": shape({ screen_h264: bool }),
+  "screen.publish.offer": shape({ sdp: str(65536) }), "screen.watch.offer": shape({ sdp: str(65536) }), "screen.focus": empty, "screen.keyframe": empty, "screen.decode_failed": empty,
   "owner.chain": shape({ genesis: str(1024), links: array(shape({ statement: str(2048), signature: fixed(64) }), 64), next: nullable(id) }),
   "owner.transfer": empty, "managers.update": empty,
 };

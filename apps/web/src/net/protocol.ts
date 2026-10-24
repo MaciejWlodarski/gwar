@@ -35,6 +35,7 @@ export type RequestData<O extends Op> = Extract<Request, { op: O }>["d"];
 
 /** Successful reply payload per request op. */
 export interface ResponseMap {
+  "screen.capabilities": { screen_h264: boolean };
   "mls.device.publish": Empty;
   "mls.key_packages.publish": { count: number };
   "mls.key_packages.claim": { packages: MlsPackage[]; next: string | null };
@@ -117,6 +118,7 @@ export interface ResponseMap {
   "screen.watch.offer": { sdp: string };
   "screen.focus": Empty;
   "screen.keyframe": Empty;
+  "screen.decode_failed": Empty;
   "owner.chain": { genesis: string; links: import("../proto/OwnerLinkStatement").OwnerLinkStatement[]; next: number | null };
   "owner.transfer": Empty;
   "managers.update": Empty;

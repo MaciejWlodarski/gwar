@@ -178,7 +178,24 @@ async fn a_guest_watches_a_share_through_its_link_until_it_ends() {
 
     let mut guest = Guest::connect(&server, "198.51.100.1").await;
     let welcome = guest.watch(&token).await.expect("guest.watch");
-    assert_eq!(welcome, json!({"share": share, "sharer": "alice", "preset": "text", "ice_servers": []}));
+    assert_eq!(
+        welcome,
+        json!({"share": share, "sharer": "alice", "preset": "text", "ice_servers": [], "screen_h264": true})
+    );
+    // The legacy guest validates only these fields and ignores extensions. It still
+    // sends the unextended guest.offer below and receives the share through its slot.
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct LegacyWatching {
+        share: String,
+        sharer: String,
+        preset: String,
+        ice_servers: Vec<Value>,
+    }
+    let legacy: LegacyWatching = serde_json::from_value(welcome).expect("legacy guest ignores screen_h264");
+    assert_eq!(
+        serde_json::to_value(legacy).unwrap(),
+        json!({"share": share, "sharer": "alice", "preset": "text", "ice_servers": []})
+    );
     assert_eq!(alice.next_event("screen.viewers").await, json!({"share": share, "members": 0, "guests": 1}));
 
     let mut viewer = guest.offer().await;

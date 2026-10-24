@@ -67,6 +67,8 @@ struct Publish {
 pub(super) struct Watch {
     run: u64,
     sdp: String,
+    browser: bool,
+    h264: Vec<gwar_proto::H264Capability>,
     answer: Option<String>,
     connected: bool,
     slots: [Option<(String, Arc<WatchGrant>)>; SCREEN_SLOTS],
@@ -311,7 +313,7 @@ impl Core {
         if offer.run == s.watch_run {
             // The run's transport failed or closed: retired for good.
             let Some(watch) = &s.watch else { return Some(Err(stale())) };
-            if watch.sdp != offer.sdp {
+            if watch.sdp != offer.sdp || watch.browser != offer.browser || watch.h264 != offer.h264 {
                 return Some(Err(err(ErrorCode::Conflict, "run reused with a different offer")));
             }
             return Some(
@@ -338,13 +340,24 @@ impl Core {
         s.watch = Some(Watch {
             run: offer.run,
             sdp: offer.sdp.clone(),
+            browser: offer.browser,
+            h264: offer.h264.clone(),
             answer: None,
             connected: false,
             slots: Default::default(),
             lease: lease.clone(),
         });
         let (reply, rx) = oneshot::channel();
-        permit.send(ScreenCmd::Watch { session, run: offer.run, lease, slots: SCREEN_SLOTS, sdp: offer.sdp, reply });
+        permit.send(ScreenCmd::Watch {
+            session,
+            run: offer.run,
+            lease,
+            slots: SCREEN_SLOTS,
+            sdp: offer.sdp,
+            browser: offer.browser,
+            h264: offer.h264.clone(),
+            reply,
+        });
         let tx = self.me.upgrade()?;
         let run = offer.run;
         tokio::spawn(async move {
@@ -416,6 +429,27 @@ impl Core {
 
     /// The screen SFU paused (`reason`) or resumed (`None`) a viewer's slot: the viewer hears of
     /// it only while the exact assignment is still current and alive on that transport.
+    /// Refuse just this assignment. Delayed failures cannot stop a newer watch of the share.
+    pub(super) fn screen_incompatible(&mut self, session: SessionId, run: u64, grant: &Arc<WatchGrant>) {
+        if self.guests.contains_key(&session) {
+            self.guest_incompatible(session, run, grant);
+            return;
+        }
+        let current = self.sessions.get(&session).and_then(|s| s.watch.as_ref()).is_some_and(|w| {
+            w.run == run && grant.alive() && w.slots.iter().flatten().any(|(_, g)| Arc::ptr_eq(g, grant))
+        });
+        if !current {
+            return;
+        }
+        let id = &grant.share;
+        self.free_slot(session, id, true);
+        if let Some(share) = self.shares.get_mut(id) {
+            share.viewers.remove(&session);
+        }
+        self.send_event(session, Event::ScreenStopped { share: id.clone(), reason: ScreenStopReason::Codec, by: None });
+        self.send_viewers(id);
+    }
+
     pub(super) fn screen_paused(
         &mut self,
         session: SessionId,
@@ -580,6 +614,72 @@ impl Core {
         }
         let _ = self.screen.try_send(ScreenCmd::Focus { session, share: id.to_owned() });
         Ok(Response::Empty {})
+    }
+
+    pub(super) fn screen_decode_failed(
+        &mut self,
+        session: SessionId,
+        share: &str,
+        slot: u32,
+        run: u64,
+        generation: u16,
+    ) -> Reply {
+        let current = self.sessions.get(&session).and_then(|s| s.watch.as_ref()).is_some_and(|w| {
+            w.run == run
+                && w.slots
+                    .get(slot as usize)
+                    .and_then(Option::as_ref)
+                    .is_some_and(|(id, grant)| id == share && grant.alive())
+        });
+        if !current {
+            return Err(stale());
+        }
+        self.screen
+            .try_send(ScreenCmd::DecodeFailed { session, run, slot, generation, share: share.into() })
+            .map_err(|_| err(ErrorCode::Unavailable, "screen engine busy"))?;
+        Ok(Response::Empty {})
+    }
+
+    fn current_screen_grant(&self, session: SessionId, run: u64, grant: &Arc<WatchGrant>) -> bool {
+        let watch = self
+            .sessions
+            .get(&session)
+            .and_then(|s| s.watch.as_ref())
+            .or_else(|| self.guests.get(&session).and_then(|g| g.watch.as_ref()));
+        watch.is_some_and(|w| {
+            w.run == run && grant.alive() && w.slots.iter().flatten().any(|(_, g)| Arc::ptr_eq(g, grant))
+        })
+    }
+
+    pub(super) fn screen_decode_keyframe(
+        &mut self,
+        session: SessionId,
+        run: u64,
+        slot: u32,
+        generation: u16,
+        grant: &Arc<WatchGrant>,
+    ) {
+        if !self.current_screen_grant(session, run, grant) {
+            return;
+        }
+        let event = Event::ScreenKeyframe { share: grant.share.clone(), run, slot, generation };
+        if self.guests.contains_key(&session) {
+            self.send_guest_event(session, event);
+        } else {
+            self.send_event(session, event);
+        }
+    }
+
+    pub(super) fn screen_recover(&mut self, origin: &Arc<ScreenOrigin>, plan: gwar_proto::ScreenRecovery) {
+        let Some(share) = self.shares.get_mut(&origin.share) else { return };
+        if !origin.alive() || !Arc::ptr_eq(&share.origin, origin) {
+            return;
+        }
+        // Only an SFU-authorized recovery/restoration reopens this one-shot negotiation.
+        share.publish = None;
+        let sharer = share.sharer;
+        self.send_event(sharer, Event::ScreenRecover(plan));
+        self.connect_deadline(&origin.share, false);
     }
 
     /// A viewer's decryptor lost sync: a keyframe, within the viewer's budget.

@@ -140,6 +140,16 @@ pub enum GuestMsg {
         guest: SessionId,
         id: u32,
         sdp: String,
+        browser: bool,
+        h264: Vec<gwar_proto::H264Capability>,
+    },
+    DecodeFailed {
+        guest: SessionId,
+        id: u32,
+        share: String,
+        slot: u32,
+        run: u64,
+        generation: u16,
     },
     Keyframe {
         guest: SessionId,
@@ -157,7 +167,7 @@ pub(in crate::core) struct Guest {
     out: OutboundTx,
     /// Dropped with the guest: the gateway's writer stops (see [`GuestMsg::Watch`]).
     _held: oneshot::Sender<()>,
-    watch: Option<Watch>,
+    pub(super) watch: Option<Watch>,
     /// Private guests retain the original TeamSpeak membership after admission.
     membership: Option<Arc<Lease>>,
     /// Shared with the transport and its cancellation waiter, even before an offer arrives.
@@ -318,7 +328,28 @@ impl Core {
                     self.drop_guest(guest);
                 }
             }
-            GuestMsg::Offer { guest, id, sdp } => self.guest_offer(guest, id, sdp),
+            GuestMsg::Offer { guest, id, sdp, browser, h264 } => self.guest_offer(guest, id, sdp, browser, h264),
+            GuestMsg::DecodeFailed { guest, id, share, slot, run, generation } => {
+                if !self.guest_current(guest) {
+                    return;
+                }
+                let current = slot == 0
+                    && self.guests.get(&guest).is_some_and(|g| {
+                        g.share == share
+                            && g.watch.as_ref().is_some_and(|w| {
+                                w.run == run && w.slots[0].as_ref().is_some_and(|(_, grant)| grant.alive())
+                            })
+                    });
+                let result = if current {
+                    self.screen
+                        .try_send(ScreenCmd::DecodeFailed { session: guest, share, slot, run, generation })
+                        .map(|_| Response::Empty {})
+                        .map_err(|_| err(ErrorCode::Unavailable, "screen engine busy"))
+                } else {
+                    Err(stale())
+                };
+                self.reply_guest(guest, id, result);
+            }
             GuestMsg::Keyframe { guest, id, share } => {
                 if !self.guest_current(guest) {
                     return;
@@ -404,7 +435,10 @@ impl Core {
         self.shares.get_mut(&id).expect("found above").guests.insert(guest);
         self.send_viewers(&id);
         let sharer = self.sessions.get(&sharer).map(|s| s.nickname.clone()).unwrap_or_default();
-        Ok((guest, Response::Watching { share: id, sharer, preset, ice_servers: self.ice_servers.clone() }))
+        Ok((
+            guest,
+            Response::Watching { share: id, sharer, preset, ice_servers: self.ice_servers.clone(), screen_h264: true },
+        ))
     }
 
     /// Fence requests and delayed media callbacks even if membership cancellation has not
@@ -421,7 +455,14 @@ impl Core {
     }
 
     /// `guest.offer`: the guest's one-slot watch transport, negotiated once.
-    fn guest_offer(&mut self, guest: SessionId, id: u32, sdp: String) {
+    fn guest_offer(
+        &mut self,
+        guest: SessionId,
+        id: u32,
+        sdp: String,
+        browser: bool,
+        h264: Vec<gwar_proto::H264Capability>,
+    ) {
         if !self.guest_current(guest) {
             return;
         }
@@ -445,13 +486,24 @@ impl Core {
         g.watch = Some(Watch {
             run: GUEST_RUN,
             sdp: sdp.clone(),
+            browser,
+            h264: h264.clone(),
             answer: None,
             connected: false,
             slots: Default::default(),
             lease: lease.clone(),
         });
         let (reply, rx) = oneshot::channel();
-        permit.send(ScreenCmd::Watch { session: guest, run: GUEST_RUN, lease, slots: GUEST_SLOTS, sdp, reply });
+        permit.send(ScreenCmd::Watch {
+            session: guest,
+            run: GUEST_RUN,
+            lease,
+            slots: GUEST_SLOTS,
+            sdp,
+            browser,
+            h264: h264.clone(),
+            reply,
+        });
         let Some(tx) = self.me.upgrade() else { return };
         tokio::spawn(async move {
             let answer = negotiated(rx).await;
@@ -619,6 +671,23 @@ impl Core {
 
     /// SFU notifications belong only to the guest's current, live assignment. Admission
     /// pauses are owned by the core, so delayed SFU resumes cannot overwrite them.
+    pub(super) fn guest_incompatible(&mut self, guest: SessionId, run: u64, grant: &Arc<WatchGrant>) {
+        if !self.guest_current(guest) {
+            return;
+        }
+        let current = self.guests.get(&guest).and_then(|g| g.watch.as_ref()).is_some_and(|w| {
+            w.run == run && grant.alive() && w.slots[0].as_ref().is_some_and(|(_, g)| Arc::ptr_eq(g, grant))
+        });
+        if !current {
+            return;
+        }
+        self.send_guest_event(
+            guest,
+            Event::ScreenStopped { share: grant.share.clone(), reason: ScreenStopReason::Codec, by: None },
+        );
+        self.drop_guest(guest);
+    }
+
     pub(super) fn guest_paused(
         &mut self,
         guest: SessionId,
@@ -650,7 +719,7 @@ impl Core {
         );
     }
 
-    fn send_guest_event(&mut self, guest: SessionId, event: Event) {
+    pub(super) fn send_guest_event(&mut self, guest: SessionId, event: Event) {
         let Some(g) = self.guests.get(&guest) else { return };
         if g.out.try_send(Outbound::Frame(encode(&ServerFrame::Event(event)))).is_err() {
             self.drop_guest(guest);
@@ -976,6 +1045,8 @@ mod tests {
                     core.guests.get_mut(&guest).unwrap().watch = Some(Watch {
                         run: GUEST_RUN,
                         sdp: String::new(),
+                        browser: false,
+                        h264: vec![],
                         answer: None,
                         connected: false,
                         slots: Default::default(),
@@ -1016,6 +1087,8 @@ mod tests {
                     core.guests.get_mut(&guest).unwrap().watch = Some(Watch {
                         run: GUEST_RUN,
                         sdp: String::new(),
+                        browser: false,
+                        h264: vec![],
                         answer: None,
                         connected: false,
                         slots: Default::default(),
@@ -1027,7 +1100,7 @@ mod tests {
                 if connecting {
                     core.guest_watching(guest, GUEST_RUN, true);
                 } else {
-                    core.guest_offer(guest, 2, String::new());
+                    core.guest_offer(guest, 2, String::new(), false, vec![]);
                 }
                 assert!(!core.guests.contains_key(&guest));
                 assert!(core.shares["S"].guests.is_empty(), "the admission is free");
@@ -1061,6 +1134,8 @@ mod tests {
             core.sessions.get_mut(&member).unwrap().watch = Some(Watch {
                 run: 1,
                 sdp: String::new(),
+                browser: false,
+                h264: vec![],
                 answer: None,
                 connected: true,
                 slots: Default::default(),
@@ -1103,6 +1178,8 @@ mod tests {
             core.sessions.get_mut(&member).unwrap().watch = Some(Watch {
                 run: 1,
                 sdp: String::new(),
+                browser: false,
+                h264: vec![],
                 answer: None,
                 connected: true,
                 slots: Default::default(),
@@ -1119,7 +1196,16 @@ mod tests {
     }
 
     fn connected_watch(lease: Arc<Lease>) -> Watch {
-        Watch { run: GUEST_RUN, sdp: String::new(), answer: None, connected: true, slots: Default::default(), lease }
+        Watch {
+            run: GUEST_RUN,
+            sdp: String::new(),
+            browser: false,
+            h264: vec![],
+            answer: None,
+            connected: true,
+            slots: Default::default(),
+            lease,
+        }
     }
 
     fn admitted_guest(core: &mut Core, token: &str, connect: bool) -> (SessionId, mpsc::Receiver<Outbound>) {
@@ -1341,6 +1427,7 @@ mod tests {
                     reason: ScreenPauseReason::Bandwidth,
                 },
                 ScreenSignal::Resumed { session: guest, run: GUEST_RUN, grant: old.clone() },
+                ScreenSignal::Incompatible { session: guest, run: GUEST_RUN, grant: old.clone() },
             ] {
                 core.handle(CoreMsg::Screen(signal));
                 assert!(frames.try_recv().is_err(), "a replaced assignment cannot overwrite re-admission status");
@@ -1383,6 +1470,7 @@ mod tests {
                     reason: ScreenPauseReason::Bandwidth,
                 },
                 ScreenSignal::Resumed { session: member, run: GUEST_RUN, grant: old.clone() },
+                ScreenSignal::Incompatible { session: member, run: GUEST_RUN, grant: old.clone() },
             ] {
                 core.handle(CoreMsg::Screen(signal));
                 assert!(frames.try_recv().is_err(), "a replaced assignment cannot overwrite re-watch status");
@@ -1565,5 +1653,44 @@ mod tests {
         })
         .await;
         assert!(opened);
+    }
+
+    #[tokio::test]
+    async fn codec_refusal_ends_only_the_current_watch_for_members_and_guests() {
+        for is_guest in [false, true] {
+            let (core, _notes) = core_with_bridge().await;
+            let token = linked_share(&core, 0).await;
+            let member = session(&core, 2, "bob").await;
+            on_core(&core, move |core| {
+                let (screen, _commands) = mpsc::channel(16);
+                core.screen = screen;
+                let (viewer, mut frames, grant) = if is_guest {
+                    let (guest, frames) = admitted_guest(core, &token, true);
+                    let grant = core.guests[&guest].watch.as_ref().unwrap().slots[0].as_ref().unwrap().1.clone();
+                    (guest, frames, grant)
+                } else {
+                    let (out, mut frames) = mpsc::channel(OUTBOUND_QUEUE);
+                    let s = core.sessions.get_mut(&member).unwrap();
+                    s.out = Some(out);
+                    s.watch = Some(connected_watch(Lease::new()));
+                    core.screen_watch(member, "S").unwrap();
+                    while frames.try_recv().is_ok() {}
+                    let grant = core.sessions[&member].watch.as_ref().unwrap().slots[0].as_ref().unwrap().1.clone();
+                    (member, frames, grant)
+                };
+                core.screen_incompatible(viewer, GUEST_RUN + 1, &grant);
+                assert!(grant.alive() && frames.try_recv().is_err());
+                core.screen_incompatible(viewer, GUEST_RUN, &grant);
+                assert!(!grant.alive());
+                if !is_guest {
+                    assert!(matches!(event(&mut frames), Event::ScreenSlot { share: None, .. }));
+                }
+                assert!(matches!(event(&mut frames), Event::ScreenStopped { reason: ScreenStopReason::Codec, .. }));
+                assert!(core.shares["S"].origin.alive());
+                assert!(!core.shares["S"].viewers.contains(&viewer));
+                assert!(!core.shares["S"].guests.contains(&viewer));
+            })
+            .await;
+        }
     }
 }

@@ -25,6 +25,8 @@ const OVERRUN_WINDOW: Duration = Duration::from_secs(10);
 pub enum VideoCodec {
     Vp8,
     Vp9,
+    /// Profile/constraint/level bytes, from SDP or the stream SPS.
+    H264(u32),
 }
 
 /// What the clear payload descriptor says about a packet.
@@ -41,6 +43,8 @@ pub struct Descriptor {
 pub fn describe(codec: VideoCodec, payload: &[u8]) -> Option<Descriptor> {
     let first = *payload.first()?;
     match codec {
+        // H.264 needs timestamp tracking and ordered prefix confirmation by its transport.
+        VideoCodec::H264(_) => None,
         // RFC 9628: |I|P|L|F|B|E|V|Z|. B starts a frame; P = 0 is not inter-predicted.
         VideoCodec::Vp9 => {
             vp9_descriptor_len(payload).filter(|&len| len < payload.len())?;
@@ -237,6 +241,20 @@ impl Ingress {
             }
             self.blocked = false;
         }
+        if let Some(verdict) = self.account(source, timestamp, size, now) {
+            return verdict;
+        }
+        self.counters.forwarded += 1;
+        Verdict::Forward { keyframe: newest && describe.keyframe }
+    }
+
+    /// Charge an H.264 packet on arrival, including a held prefix. Releasing it never charges
+    /// it again. This also bounds traffic while ingress waits for a confirmed IDR.
+    pub fn account(&mut self, source: u64, timestamp: u32, size: usize, now: Instant) -> Option<Verdict> {
+        let newest = self.highest.is_none_or(|highest| source >= highest);
+        if newest {
+            self.highest = Some(source);
+        }
         let mut within = self.packets.take(1.0, now) && self.bytes.take(size as f64, now);
         // Frame bounds follow the newest frame, counting each of its packets in whatever order
         // they arrive; a late repair of an older frame only counts against the buckets.
@@ -253,11 +271,19 @@ impl Ingress {
                 && now.saturating_duration_since(frame.first) <= FRAME_SPAN;
         }
         if within {
-            self.counters.forwarded += 1;
-            return Verdict::Forward { keyframe: newest && describe.keyframe };
+            return None;
         }
         self.counters.dropped += 1;
-        self.overrun(now)
+        Some(self.overrun(now))
+    }
+
+    /// A complete, bounded SPS/PPS/IDR prefix opens blocked H.264 ingress.
+    pub fn block_h264(&mut self) {
+        self.blocked = true;
+    }
+
+    pub fn confirmed_h264(&mut self) {
+        self.blocked = false;
     }
 
     /// Records an overrun: the share drops until its next keyframe, or stops on the third

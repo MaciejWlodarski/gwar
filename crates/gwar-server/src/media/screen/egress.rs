@@ -473,7 +473,7 @@ impl Egress {
     }
 
     /// Empties the slot's queue without counting it as a drop.
-    fn clear(&mut self, lane: usize) {
+    pub(super) fn clear(&mut self, lane: usize) {
         if let Some(l) = self.lanes.get_mut(lane) {
             self.queued -= l.bytes;
             l.bytes = 0;

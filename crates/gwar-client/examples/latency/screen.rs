@@ -572,7 +572,7 @@ async fn watch(
         }
     };
     let _: &SdpOffer = &offer;
-    let request = ScreenWatchOffer { run: 1, sdp: offer.to_sdp_string() };
+    let request = ScreenWatchOffer { run: 1, sdp: offer.to_sdp_string(), browser: false, h264: vec![] };
     let reply = viewer.connection.request(Request::ScreenWatchOffer(request)).await.context("screen.watch.offer")?;
     rtc.sdp_api().accept_answer(pending, answer(reply["sdp"].as_str().context("answer")?, advertised, media)?)?;
     let (ready, connected) = tokio::sync::oneshot::channel();

@@ -306,6 +306,28 @@ describe("reconnect", () => {
     expect(statuses.map((x) => x.state)).toEqual(["connecting", "online", "reconnecting", "reconnecting", "online"]);
   });
 
+  it("resyncs instead of silently losing a rejected screen recovery plan", async () => {
+    const conn = make();
+    const welcomes: boolean[] = [];
+    conn.onWelcome((_w, resync) => welcomes.push(resync));
+    const socket = await handshake(conn);
+    socket.push({ ev: "screen.recover", d: { share: "A".repeat(22), codec: "h264", width: 2560, height: 1440, fps: 60 } });
+    expect(conn.status.state).toBe("online");
+    socket.push({ ev: "screen.recover", d: { share: "A".repeat(22), codec: "hevc", width: 2560, height: 1440, fps: 60 } });
+    expect(socket.readyState).toBe(3);
+    expect(conn.status).toMatchObject({ state: "reconnecting" });
+    await vi.advanceTimersByTimeAsync(500);
+    const next = FakeSocket.last();
+    expect(next).not.toBe(socket);
+    next.open();
+    next.push(challenge());
+    await vi.waitFor(() => expect(next.sent.length).toBe(1));
+    await finishHandshake(next, welcome({ session: 9 }));
+    await vi.waitFor(() => expect(conn.status.state).toBe("online"));
+    expect(welcomes).toEqual([false, true]);
+    conn.close();
+  });
+
   it("stops for good when the server kicks us", async () => {
     const conn = make();
     const s = await handshake(conn);

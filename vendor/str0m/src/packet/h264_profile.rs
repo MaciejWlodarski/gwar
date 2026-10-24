@@ -166,12 +166,12 @@ impl TryFrom<u32> for H264ProfileLevel {
             H264ProfileIdc::X58,
         ]
         .contains(&profile_idc)
-            && profile_level == H264LevelIdc::Level1
+            && profile_level == H264LevelIdc::Level1_1
         {
             profile_level = if (profile_iop & CONSTRAINT_SET3_FLAG) != 0 {
                 H264LevelIdc::Level1B
             } else {
-                H264LevelIdc::Level1
+                H264LevelIdc::Level1_1
             };
         }
 

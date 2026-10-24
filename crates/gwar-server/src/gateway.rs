@@ -534,9 +534,12 @@ async fn guest_connection(mut socket: WebSocket, gateway: Gateway, ip: IpAddr) {
         }
         match request {
             GuestRequest::Watch { .. } => unreachable!("closed above"),
-            GuestRequest::Offer { sdp } => {
+            GuestRequest::Offer { sdp, browser, h264 } => {
                 offered = true;
-                gateway.core.guest(GuestMsg::Offer { guest, id, sdp }).await;
+                gateway.core.guest(GuestMsg::Offer { guest, id, sdp, browser, h264 }).await;
+            }
+            GuestRequest::DecodeFailed { share, slot, run, generation } => {
+                gateway.core.guest(GuestMsg::DecodeFailed { guest, id, share, slot, run, generation }).await
             }
             GuestRequest::Keyframe { share } => gateway.core.guest(GuestMsg::Keyframe { guest, id, share }).await,
             GuestRequest::Ping {} => {

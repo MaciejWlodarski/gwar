@@ -176,6 +176,12 @@ including during startup, cannot restore the unproven ceiling. The cap reports
 internal `DelayBased` transition, so stale HOLD/recovery limits are not reactivated.
 
 
+A2 also narrows H.264 answer levels to the lower peer level when either peer
+omits or disables `level-asymmetry-allowed`. Asymmetric levels require both
+peers to opt in; Level 1b uses the existing profile/level parser's ordering.
+`h264_answer_levels_require_mutual_asymmetry` covers these cases. Codec/PT
+selection and all pacing/BWE behavior are unchanged by this addition.
+
 The dev-only `_gwar_sim` feature makes Gwar's screen simulations replayable:
 `_gwar_sim::start(seed)` seeds the existing thread-local fastrand source used by
 transport IDs and ICE, fixes Unix/NTP conversion around a process-local Instant
@@ -184,3 +190,13 @@ Production builds do not enable this feature. DTLS cryptographic randomness is
 unchanged; media replay checks exclude encrypted handshake content and its byte
 counts. Added/changed files: `src/lib.rs`, `src/util/mod.rs`,
 `src/util/time_tricks.rs`, `src/streams/mod.rs`, and `Cargo.toml`.
+
+Review remediation: preserve an omitted peer `level-asymmetry-allowed` as `None`
+in the answer. RFC 6184 section 8.2.2 defaults omission to zero for deciding
+whether levels may differ; it does not require emitting an explicit zero.
+Mutual opt-in is still required. Existing `answer_change_order` and
+`answer_narrow` expectations remain unchanged. Level 1b now correctly reads
+constraint_set3 when level_idc is 11 (Level 1.1), not 10 (Level 1).
+Negotiation tests cover both directions across 1, 1b and 1.1. The required Rust
+CI job runs the payload parameter library tests and SDP negotiation integration
+suite, including those upstream expectations.

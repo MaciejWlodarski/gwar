@@ -81,6 +81,17 @@ describe("watch page endpoint and token", () => {
 });
 
 describe("WatchSession", () => {
+  it.each([false,true])("gates guest extensions on the server advertisement (%s)", async supported => {
+    const t = setup();
+    t.session.start("ws://127.0.0.1:1/ws/watch", TOKEN);
+    t.socket().open();
+    t.socket().receive({ re: 1, ok: { ...watching, ...(supported ? { screen_h264: true } : {}) } });
+    await vi.waitFor(() => expect(t.socket().last("guest.offer")).toBeDefined());
+    expect(t.socket().last("guest.offer")!.d).toEqual(supported ? { sdp: "v=0 offer", browser: true, h264: [] } : { sdp: "v=0 offer" });
+    t.params().decodeFailed?.(0,"s1",1);
+    expect(t.socket().last("screen.decode_failed") !== undefined).toBe(supported);
+    t.session.close();
+  });
   it("watches through one receive-only slot and pings every 20 s once admitted", async () => {
     const t = setup();
     t.session.start("ws://127.0.0.1:1/ws/watch", TOKEN);
@@ -122,6 +133,19 @@ describe("WatchSession", () => {
     const sent = socket.sent.length;
     vi.advanceTimersByTime(PING_INTERVAL_MS * 2);
     expect(socket.sent.length).toBe(sent);
+  });
+
+  it("keeps the explicit codec refusal when the guest socket closes", async () => {
+    const t = setup();
+    t.session.start("ws://x/ws/watch", TOKEN);
+    t.socket().open();
+    t.socket().receive({ re: 1, ok: watching });
+    await vi.waitFor(() => expect(t.socket().last("guest.offer")).toBeDefined());
+    const socket = t.socket();
+    socket.receive({ ev: "screen.stopped", d: { share: "s1", reason: "codec" } });
+    socket.onclose?.({} as CloseEvent);
+    expect(t.session.status).toBe("codec");
+    expect(t.transport.close).toHaveBeenCalled();
   });
 
   it("says the link was turned off", async () => {

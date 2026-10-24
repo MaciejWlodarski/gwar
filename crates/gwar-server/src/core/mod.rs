@@ -779,6 +779,13 @@ impl Core {
             CoreMsg::Screen(ScreenSignal::Paused { session, run, grant, reason }) => {
                 self.screen_paused(session, run, &grant, Some(reason))
             }
+            CoreMsg::Screen(ScreenSignal::Keyframe { session, run, slot, generation, grant }) => {
+                self.screen_decode_keyframe(session, run, slot, generation, &grant)
+            }
+            CoreMsg::Screen(ScreenSignal::Recover { origin, plan }) => self.screen_recover(&origin, plan),
+            CoreMsg::Screen(ScreenSignal::Incompatible { session, run, grant }) => {
+                self.screen_incompatible(session, run, &grant);
+            }
             CoreMsg::Screen(ScreenSignal::Resumed { session, run, grant }) => {
                 self.screen_paused(session, run, &grant, None)
             }
@@ -1894,7 +1901,11 @@ impl Core {
             Request::ScreenStart(start) => self.screen_start(session, start),
             Request::ScreenPublishOffer(offer) => return self.screen_publish_offer(session, id, offer),
             Request::ScreenWatchOffer(offer) => return self.screen_watch_offer(session, id, offer),
+            Request::ScreenCapabilities {} => Ok(Response::ScreenCapabilities { screen_h264: true }),
             Request::ScreenFocus { share } => self.screen_focus(session, &share),
+            Request::ScreenDecodeFailed { share, slot, run, generation } => {
+                self.screen_decode_failed(session, &share, slot, run, generation)
+            }
             Request::ScreenKeyframe { share } => self.screen_keyframe(session, &share),
             Request::ScreenStop { share } => self.screen_stop(session, &share),
             Request::ScreenWatch { share } => self.screen_watch(session, &share),

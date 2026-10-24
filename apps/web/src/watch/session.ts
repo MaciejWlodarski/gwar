@@ -11,9 +11,9 @@ import type { TransportState, WatchParams } from "../voice/screen";
 export type WatchStatus =
   | "connecting" | "watching" | "slow" | "paused"
   /** Final: nothing more happens on this page. */
-  | "ended" | "off" | "invalid" | "busy" | "lost" | "unsupported";
+  | "ended" | "off" | "invalid" | "busy" | "lost" | "unsupported" | "codec";
 
-const FINAL: ReadonlySet<WatchStatus> = new Set(["ended", "off", "invalid", "busy", "lost", "unsupported"]);
+const FINAL: ReadonlySet<WatchStatus> = new Set(["ended", "off", "invalid", "busy", "lost", "unsupported", "codec"]);
 
 /** The guest's ping interval, as `net/connection.ts` pings members. */
 export const PING_INTERVAL_MS = 20_000;
@@ -51,6 +51,7 @@ export interface SocketLike {
 }
 
 export interface TransportLike {
+  keyframe?(slot: number, share: string, generation: number): void;
   start(): Promise<void>;
   close(): void;
 }
@@ -66,7 +67,7 @@ export interface WatchView {
   stream(stream: MediaStream): void;
 }
 
-interface Watching { share: string; sharer: string; preset: string; ice_servers: IceServer[] }
+interface Watching { share: string; sharer: string; preset: string; ice_servers: IceServer[]; screen_h264?: boolean }
 
 type Pending = { resolve(ok: unknown): void; reject(code: string): void };
 
@@ -151,7 +152,10 @@ export class WatchSession {
     }
     if (typeof frame.ev !== "string" || !isRecord(frame.d) || frame.d.share !== this.share) return;
     switch (frame.ev) {
-      case "screen.stopped": return this.finish("ended");
+      case "screen.keyframe":
+        if (typeof frame.d.slot === "number" && typeof frame.d.generation === "number") this.transport?.keyframe?.(frame.d.slot, this.share!, frame.d.generation);
+        return;
+      case "screen.stopped": return this.finish(frame.d.reason === "codec" ? "codec" : "ended");
       case "screen.link": if (frame.d.active === false) this.finish("off"); return;
       // From the server's budget (PR 3b): a paused guest keeps its page and waits.
       case "screen.paused": return this.set(frame.d.reason === "budget" ? "paused" : "slow");
@@ -175,8 +179,8 @@ export class WatchSession {
       run: 0,
       slots: 1,
       iceServers: ok.ice_servers,
-      offer: async sdp => {
-        const answer = await this.request("guest.offer", { sdp });
+      offer: async (sdp, _run, h264 = []) => {
+        const answer = await this.request("guest.offer", { sdp, ...(ok.screen_h264 === true ? { browser: true, h264 } : {}) });
         if (!isRecord(answer) || typeof answer.sdp !== "string") throw new Error("no answer");
         return answer.sdp;
       },
@@ -184,6 +188,7 @@ export class WatchSession {
         if (state === "failed") this.finish("lost");
         else if (state === "connected" && this.current === "connecting") this.set("watching");
       },
+      decodeFailed: (slot, share, generation) => { if (ok.screen_h264 === true) void this.request("screen.decode_failed", { slot, share, generation, run: 1 }).catch(() => {}); },
       track: (slot, stream) => { if (slot === 0) this.view.stream(stream); },
     });
     this.transport = transport;

@@ -9,6 +9,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Button, Select } from "../ui/kit";
 import { tauri } from ".";
+import { preferredCodecs } from "../voice/screen";
 
 interface Sample {
   /** Seconds since the capture started. */
@@ -65,12 +66,11 @@ function summarize(samples: Sample[], visible: boolean): string {
   return `${rates.length} s, encoded fps min ${rates[0]?.toFixed(1)}, median ${median.toFixed(1)}, mean ${mean.toFixed(1)}`;
 }
 
-/** Puts VP9 first, as screen shares will (docs/screen-share.md "Codecs and encoding"). */
-function preferVp9(transceiver: RTCRtpTransceiver): void {
+/** Uses the production screen publisher codec policy. */
+function preferScreenCodecs(transceiver: RTCRtpTransceiver): void {
   const codecs = RTCRtpSender.getCapabilities?.("video")?.codecs;
   if (!codecs || !transceiver.setCodecPreferences) return;
-  const rank = (mime: string) => (mime === "video/VP9" ? 0 : mime === "video/VP8" ? 1 : 2);
-  transceiver.setCodecPreferences([...codecs].sort((a, b) => rank(a.mimeType) - rank(b.mimeType)));
+  transceiver.setCodecPreferences(preferredCodecs(codecs));
 }
 
 /** Sends the track from one peer connection to another on this page. */
@@ -91,7 +91,7 @@ async function connect(send: RTCPeerConnection, receive: RTCPeerConnection, trac
   send.onicecandidate = (e) => void (e.candidate && receive.addIceCandidate(e.candidate).catch(() => {}));
   receive.onicecandidate = (e) => void (e.candidate && send.addIceCandidate(e.candidate).catch(() => {}));
   const transceiver = send.addTransceiver(track, { direction: "sendonly" });
-  preferVp9(transceiver);
+  preferScreenCodecs(transceiver);
   const parameters = transceiver.sender.getParameters();
   for (const encoding of parameters.encodings ?? []) encoding.maxBitrate = 4_000_000;
   await transceiver.sender.setParameters(parameters).catch(() => {});

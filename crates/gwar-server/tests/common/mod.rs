@@ -624,6 +624,16 @@ impl Client {
 
     /// Shares into the current voice channel and connects the publish transport; returns the
     /// share's id once it is live (its own `screen.started` is consumed).
+    pub async fn share_here_codec(&mut self, codec: str0m::format::Codec) -> String {
+        let share = self.screen_start().await.expect("screen.start")["share"].as_str().unwrap().to_owned();
+        let publisher = screen::Publisher::start_codec(self, &share, codec).await;
+        self.publishers.push(publisher);
+        let me = self.id();
+        self.next_event_where("client.updated", |c| c["id"] == me && c["sharing"] == true).await;
+        self.drain_events("screen.started").await;
+        share
+    }
+
     pub async fn share_here(&mut self) -> String {
         let share = self.screen_start().await.expect("screen.start");
         let share = share["share"].as_str().expect("share id").to_owned();

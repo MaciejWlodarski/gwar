@@ -1104,7 +1104,9 @@ fn translate(request: &Request, own: u16, view: &View) -> Result<Vec<(Part, OutC
         | Request::ScreenLinkRevoke { .. }
         | Request::ScreenPublishOffer(_)
         | Request::ScreenWatchOffer(_)
+        | Request::ScreenCapabilities {}
         | Request::ScreenFocus { .. }
+        | Request::ScreenDecodeFailed { .. }
         | Request::ScreenKeyframe { .. } => return Err(refused("screen sharing requires a Gwar server")),
         Request::Sealed(_) => return Err(refused("encrypted direct messages require a Gwar server")),
         Request::Mls(_) => return Err(refused("MLS requires a Gwar server")),

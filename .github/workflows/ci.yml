@@ -77,6 +77,12 @@ jobs:
         timeout-minutes: 15
         run: cargo test --workspace --exclude gwar-desktop
 
+      - name: Vendored str0m payload and SDP negotiation regressions
+        timeout-minutes: 5
+        run: |
+          cargo test -j 4 --manifest-path vendor/str0m/Cargo.toml --no-default-features --features aws-lc-rs,_internal_test_exports --lib format::payload_params
+          cargo test -j 4 --manifest-path vendor/str0m/Cargo.toml --no-default-features --features aws-lc-rs,_internal_test_exports --test sdp-negotiation
+
   # The full network matrices run independently of the workspace's 15-minute Tests step.
   # Default server tests retain every scheduler cadence protected by the voice gate.
   rust-screen-sim:
@@ -754,6 +760,12 @@ jobs:
           pactl load-module module-null-sink sink_name=e2e
           pactl set-default-sink e2e
           pnpm --filter web e2e:screen
+      - name: Fixed 1080p60 H.264 through the SFU in Chromium and WebKit
+        timeout-minutes: 10
+        env:
+          E2E_SCREEN_CANVAS: "1"
+          E2E_SCREEN_REQUIRE_H264: "1"
+        run: pnpm --filter web e2e:screen
       # TeamSpeak watch links: guest pages in Chromium and WebKit, through the test hooks' stand-in
       # bridge (no TeamSpeak server), including the 150 s heartbeat.
       - name: Watch links for TeamSpeak guests

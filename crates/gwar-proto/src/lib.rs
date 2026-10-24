@@ -295,12 +295,19 @@ wire! {
         /// Negotiates the session's watch transport ([`SCREEN_SLOTS`] `recvonly` video slots).
         #[serde(rename = "screen.watch.offer")]
         ScreenWatchOffer(ScreenWatchOffer),
+        /// Optional, bounded feature advertisement. Older servers reject this query;
+        /// clients then send the legacy watch offer without extension fields.
+        #[serde(rename = "screen.capabilities")]
+        ScreenCapabilities {},
         /// The share on the viewer's stage: it gets first claim on the viewer's bandwidth.
         #[serde(rename = "screen.focus")]
         ScreenFocus { share: String },
         /// Asks for a keyframe of a watched share (throttled).
         #[serde(rename = "screen.keyframe")]
         ScreenKeyframe { share: String },
+        /// H.264 arrived after a keyframe for four seconds without decode progress.
+        #[serde(rename = "screen.decode_failed")]
+        ScreenDecodeFailed { share: String, slot: u32, #[serde(deserialize_with = "voice::run")] #[cfg_attr(feature = "ts", ts(type = "number"))] run: u64, generation: u16 },
         #[serde(untagged)]
         Mls(MlsRequest),
         #[serde(untagged)]
@@ -604,9 +611,15 @@ wire! {
         TeamspeakClaimable { claimable: Vec<Uid> },
         /// `guest.watch`: the share a watch link opens, its sharer's display name and how to
         /// connect. Nothing else about the server reaches a guest.
-        Watching { share: String, sharer: String, preset: ScreenPreset, ice_servers: Vec<IceServer> },
+        Watching { share: String, sharer: String, preset: ScreenPreset, ice_servers: Vec<IceServer>,
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            #[cfg_attr(feature = "ts", ts(optional, as = "Option<_>"))]
+            screen_h264: bool,
+        },
         /// `screen.start`: the new share's id.
         ScreenShare { share: String },
+        /// `screen.capabilities`; deliberately absent from the legacy Welcome shape.
+        ScreenCapabilities { screen_h264: bool },
         /// `screen.publish.offer`, `screen.watch.offer`: the SDP answer.
         ScreenAnswer { sdp: String },
         /// `screen.watch`: the watch transport's slot the share arrives in.
@@ -761,6 +774,11 @@ wire! {
         /// `screen.resumed`, or when the viewer watches the share again (Retry).
         #[serde(rename = "screen.paused")]
         ScreenPaused { share: String, reason: ScreenPauseReason },
+        /// A confirmed H.264 keyframe prefix was forwarded on this exact assignment.
+        #[serde(rename = "screen.keyframe")]
+        ScreenKeyframe { share: String, slot: u32, #[serde(deserialize_with = "voice::run")] #[cfg_attr(feature = "ts", ts(type = "number"))] run: u64, generation: u16 },
+        #[serde(rename = "screen.recover")]
+        ScreenRecover(ScreenRecovery),
         #[serde(rename = "screen.resumed")]
         ScreenResumed { share: String },
         /// To admins (`manage_server`): the month's outbound transfer reached `percent` (80 or

@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { parseFrame } from "./frames";
 import { responseFor } from "./schema";
@@ -8,6 +9,27 @@ const message = { id: 1, target: { channel: 1 }, author: 1, author_uid: "uid", a
 const frame = (d: unknown) => JSON.stringify({ ev: "chat.message", d });
 
 describe("bounded server frames", () => {
+  it("round-trips the server's serialized original-size recovery plans", () => {
+    const frames: unknown[] = JSON.parse(readFileSync(new URL("../../../../crates/gwar-server/tests/screen-recovery-plans.json", import.meta.url), "utf8")) as unknown[];
+    for (const frame of frames) {
+      expect(parseFrame(JSON.stringify(frame))).toEqual({ kind: "event", event: frame });
+    }
+    for (const width of [0, -1, 1.5, 589825, Number.MAX_SAFE_INTEGER]) {
+      const onInvalid = vi.fn();
+      expect(parseFrame(JSON.stringify({ ev: "screen.recover", d: { share: "A".repeat(22), codec: "h264", width, height: 1440, fps: 60 } }), onInvalid)).toBeNull();
+      expect(onInvalid).toHaveBeenCalledOnce();
+    }
+    for (const envelope of [
+      { ev: "screen.recover", d: {}, extra: true },
+      { ev: "screen.recover", d: {}, re: 1 },
+      { ev: "screen.recover" },
+    ]) {
+      const onInvalid = vi.fn();
+      expect(parseFrame(JSON.stringify(envelope), onInvalid)).toBeNull();
+      expect(onInvalid).toHaveBeenCalledOnce();
+    }
+  });
+
   it("accepts typed events and responses and checks the expected operation", () => {
     expect(parseFrame(frame(message))?.kind).toBe("event");
     expect(parseFrame('{"re":1,"ok":{}}')?.kind).toBe("ok");
@@ -16,6 +38,13 @@ describe("bounded server frames", () => {
     expect(responseFor("ping", {})).toBe(true);
     expect(responseFor("chat.send", message)).toBe(true);
     expect(responseFor("chat.history", { messages: [message] })).toBe(true);
+  });
+  it("bounds the optional screen capability reply without changing legacy welcome", () => {
+    expect(responseFor("screen.capabilities", { screen_h264: true })).toBe(true);
+    expect(responseFor("screen.capabilities", { screen_h264: false })).toBe(true);
+    for (const reply of [{}, { screen_h264: "true" }, { screen_h264: true, extra: true }]) expect(responseFor("screen.capabilities", reply)).toBe(false);
+    expect(responseFor("join", welcome())).toBe(true);
+    expect(responseFor("join", { ...welcome(), screen_h264: true })).toBe(false);
   });
   it("distinguishes sealed history from plaintext history, including empty pages", () => {
     const sealedMessage = {
@@ -105,6 +134,7 @@ describe("gwar/4 runtime schemas", () => {
     expect(event("screen.started", { ...share, share: "short" })).toBeUndefined();
     expect(event("screen.stopped", { share: share.share, reason: "moderator", by: "mod" })).toBe("event");
     expect(event("screen.stopped", { share: share.share, reason: "access" })).toBe("event");
+    expect(event("screen.stopped", { share: share.share, reason: "codec" })).toBe("event");
     expect(event("screen.stopped", { share: share.share, reason: "bored" })).toBeUndefined();
     expect(event("screen.viewers", { share: share.share, members: 2, guests: 0 })).toBe("event");
     expect(event("screen.link", { share: share.share, active: false })).toBe("event");

@@ -14,11 +14,17 @@ export function encodeRequest<O extends Op>(id: number, op: O, d: Partial<Reques
 }
 
 /** Classifies a server text frame. Returns null for anything malformed. */
-export function parseFrame(text: string): ParsedFrame | null {
-  const reject = () => { console.warn("Dropped malformed server frame"); return null; };
+export function parseFrame(text: string, onInvalidRecovery?: () => void): ParsedFrame | null {
+  let value: unknown;
+  const reject = () => {
+    // Recovery fences the publisher on the server. Losing its plan requires a
+    // resync, including when its envelope is malformed, or the share stays stuck.
+    if (record(value) && value.ev === "screen.recover") onInvalidRecovery?.();
+    console.warn("Dropped malformed server frame");
+    return null;
+  };
   // Limit before JSON.parse; nested structures are rejected by exact, non-recursive schemas.
   if (text.length > 2 * 1024 * 1024) return reject();
-  let value: unknown;
   try { value = JSON.parse(text); } catch { return reject(); }
   if (!record(value)) return reject();
   const o = value;

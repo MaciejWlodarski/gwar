@@ -453,10 +453,8 @@ impl PayloadParams {
         // parameter, so a level mismatch in either direction is allowed and
         // only penalizes the match score rather than rejecting the payload.
         //
-        // NOTE: this only affects *matching*. Unlike H.265/H.266, `update_param`
-        // does not narrow the answered H.264 level to `min(local, remote)`, so
-        // when `level-asymmetry-allowed` is absent we may answer with a level
-        // higher than the offer. See the note in `update_param`.
+        // `update_param` additionally narrows the answered level to min(local, remote)
+        // unless both peers allow level asymmetry.
         let level_difference: usize = c0_profile_level
             .level()
             .ordinal()
@@ -473,8 +471,8 @@ impl PayloadParams {
     /// - **Tiers** must match exactly (Main vs High tier are distinct)
     /// - **Levels** penalize score by `|c0_level - c1_level|` but never reject.
     ///   Both H.264 and H.265 tolerate level mismatches in either direction at
-    ///   match time. For H.265, `update_param` additionally narrows the
-    ///   negotiated level to `min(local, remote)` afterward; H.264 does not.
+    ///   match time. `update_param` additionally narrows H.265 levels and
+    ///   H.264 levels when the peers have not mutually enabled level asymmetry.
     ///
     /// # Matching Rules — Profile-only (at least one side lacks tier+level)
     ///
@@ -626,6 +624,26 @@ impl PayloadParams {
         // The first negotiated m-line determines TWCC support for this PT.
         if !self.locked {
             self.fb_transport_cc &= first.fb_transport_cc();
+        }
+
+        // RFC 6184 section 8.2.2: asymmetric levels require both peers to opt in.
+        // Otherwise the answer must narrow to the lower level, including Level 1b.
+        if self.spec.codec == Codec::H264 {
+            let asymmetric = self.spec.format.level_asymmetry_allowed == Some(true)
+                && first.spec.format.level_asymmetry_allowed == Some(true);
+            self.spec.format.level_asymmetry_allowed = first.spec.format.level_asymmetry_allowed.map(|_| asymmetric);
+            if !asymmetric {
+                let local = self.spec.format.profile_level_id
+                    .and_then(|id| H264ProfileLevel::try_from(id).ok())
+                    .unwrap_or(H264ProfileLevel::FALLBACK);
+                let remote = first.spec.format.profile_level_id
+                    .and_then(|id| H264ProfileLevel::try_from(id).ok())
+                    .unwrap_or(H264ProfileLevel::FALLBACK);
+                if remote.level().ordinal() < local.level().ordinal() {
+                    self.spec.format.profile_level_id =
+                        Some(first.spec.format.profile_level_id.unwrap_or(0x42e01f));
+                }
+            }
         }
 
         if self.spec.codec.is_tele() {
@@ -912,6 +930,41 @@ mod test {
                     profile_level_id,
                     ..Default::default()
                 },
+            }
+        }
+
+        #[test]
+        fn h264_answer_levels_require_mutual_asymmetry() {
+            for (local_asymmetry, remote_asymmetry, local_id, remote_id, expected) in [
+                (Some(true), Some(true), 0x42e033, 0x42e01f, 0x42e033),
+                (Some(true), Some(false), 0x42e033, 0x42e01f, 0x42e01f),
+                (Some(true), None, 0x42e033, 0x42e01f, 0x42e01f),
+                (None, Some(true), 0x42e033, 0x42e01f, 0x42e01f),
+                (Some(false), Some(false), 0x42e01f, 0x42e033, 0x42e01f),
+                (None, None, 0x42e01f, 0x42f00b, 0x42f00b),
+                (None, None, 0x42e00b, 0x42f00b, 0x42f00b),
+                (None, None, 0x42f00b, 0x42e00b, 0x42f00b),
+                (None, None, 0x42e00a, 0x42f00b, 0x42e00a),
+                (None, None, 0x42f00b, 0x42e00a, 0x42e00a),
+                (None, None, 0x42e00a, 0x42e00b, 0x42e00a),
+                (None, None, 0x42e00b, 0x42e00a, 0x42e00a),
+            ] {
+                let mut local = PayloadParams::new(
+                    108.into(),
+                    Some(109.into()),
+                    h264_codec_spec(local_asymmetry, Some(1), Some(local_id)),
+                );
+                let remote = PayloadParams::new(
+                    110.into(),
+                    Some(111.into()),
+                    h264_codec_spec(remote_asymmetry, Some(1), Some(remote_id)),
+                );
+                local.update_param(&[remote], &mut [false; 128], false, &mut HashSet::new());
+                assert_eq!(local.spec.format.profile_level_id, Some(expected));
+                assert_eq!(
+                    local.spec.format.level_asymmetry_allowed,
+                    remote_asymmetry.map(|_| local_asymmetry == Some(true) && remote_asymmetry == Some(true))
+                );
             }
         }
 

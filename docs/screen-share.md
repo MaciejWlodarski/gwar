@@ -47,17 +47,16 @@ kept here ([Spikes](#spikes)).
   - Paired voice latency measurements under video load and on constrained
     links gate the server PR. A separate task alone does not prove zero voice
     impact.
-- **Codec target (owner decision, 2026-10-23): H.264 preferred, VP9 only
-  without an H.264 encoder; VP8 dropped. Pending A2:** the SFU does not
-  negotiate H.264 yet, so the current browser path still sends VP9 then VP8.
-  Encrypted channels use SFrame. The spikes settled which byte layouts
-  survive the browsers' packetizers:
+- **Plaintext browser codec: H.264 first, VP9 profile 0 as the only fallback.**
+  A2 forwards H.264 mode 1 through the SFU.
+  Encrypted shares are still refused by the server; their future SFrame
+  layouts follow the spike results:
   - VP9 survives whole-frame SFrame.
   - VP8 needs its first 10 bytes (keyframe) or 3 bytes (delta) clear; they go
     into the AAD.
   - H.264 and AV1 send nothing at all when the whole frame is encrypted.
 
-  A2 starts with browser H.264, hardware where available; encrypted H.264
+  A2 has landed with browser H.264, hardware where available; encrypted H.264
   also needs NAL-aware SFrame (B2/E2). AV1 + DD follows as A2b.
 - **Keys** come from the existing voice call group:
   `MLS-Exporter("gwar screen v1", u32be(leaf), 32)`. The call controller gains
@@ -265,51 +264,72 @@ deferred it.
 
 Browser capabilities below do not imply Gwar negotiates every codec.
 The target follows the [2026-10-23 owner decision](native-media.md#native-codec-ladder-owner-decision-2026-10-23):
-web H.264 preferred after A2, VP9 only as an encoder fallback, no VP8 or HEVC.
+web H.264 preferred (A2 landed), VP9 as the emergency fallback, no VP8 or HEVC.
 Native sending uses hardware AV1 → hardware H.264 → OpenH264; native VP9
 decode stays for browser compatibility.
 
 | Codec | Chrome send/recv | Firefox | Safari / WKWebView | Hardware encode (typical) | SFrame on whole frame (spike S3) |
 | --- | --- | --- | --- | --- | --- |
-| VP8 (current path only; dropped from target) | yes | yes | yes | rare | **breaks**: depacketizer cannot see the keyframe → PLI storm, 0 frames decoded. Works with 10/3 clear bytes |
+| VP8 (dropped) | yes | yes | yes | rare | **breaks**: depacketizer cannot see the keyframe → PLI storm, 0 frames decoded. Works with 10/3 clear bytes |
 | VP9 (target emergency fallback) | yes | yes | yes (on by default) | Intel/NVIDIA on Windows; none on Apple | **works** (keyframe and size are in the clear RTP payload descriptor) |
-| H.264 (target preference, pending A2) | yes (HW where available; absent in some Chromium builds) | yes (encoder needs OpenH264 plugin) | yes (VideoToolbox) | everywhere | **breaks**: packetizer sends nothing. Works with NAL headers clear (LiveKit also escapes start codes) |
+| H.264 (preferred, A2 landed) | yes (HW where available; absent in some Chromium builds) | yes (encoder needs OpenH264 plugin) | yes (VideoToolbox) | everywhere | **breaks**: packetizer sends nothing. Works with NAL headers clear (LiveKit also escapes start codes) |
 | AV1 | yes (screen-content tools) | 136+ | yes (decode needs M3/A17+) | rare (newest GPUs) | **breaks**: packetizer sends nothing; needs OBU-aware SFrame (LiveKit: unsupported) |
 | H.265 (not used or planned) | 136+, HW only | no | yes | Apple, recent GPUs | not tested |
 
-**Current phase 1 codec rule (until A2 browser H.264 lands):**
+**Browser codec rule (A2, plaintext shares):**
 
-- Prefer **VP9 (profile 0)**, then **VP8**, in plaintext and encrypted channels
-  alike.
-- One codec rule keeps the SFU's per-codec code to two RTP payload descriptors.
-  VP9's descriptor also carries the temporal layer id that phase 2 uses.
-- The sender sets `setCodecPreferences([VP9, VP8, rtx])`. The viewer offers the
-  same list. The SFU writes the publisher's codec to each viewer, and every
-  supported engine decodes both.
+- Send H.264 `packetization-mode=1`, preferring Constrained Baseline
+  (`42e01f` / equivalent constraint flags), then Constrained High or High;
+  next VP9 profile 0, followed by RTX. Main (`4d001f`) and
+  mode 0 are excluded. The SFU accepts Constrained Baseline, Constrained
+  High (`640cxx`) and High (`6400xx`); it advertises level 5.1 receive support
+  and `level-asymmetry-allowed=1`.
+- Receive preferences come only from `RTCRtpReceiver.getCapabilities`, with
+  H.264 and VP9. A sender capability never implies decoder support.
+  The SFU selects each slot's PT from that viewer's negotiated codecs and
+  H.264 profile/receive capability. The SPS supplies the actual stream's
+  profile and level. Receive `max-recv-level`, `max-fs`, `max-mbps`, `max-br`
+  and `max-dpb` are retained per offered PT; SPS levels and actual size/rate
+  must fit that viewer. The publish answer
+  advertises level 5.1 (`42e033` / `640c33` / `640033`) with mutual
+  `level-asymmetry-allowed=1`, allowing 1080p60, 1440p60 and 2160p30 within
+  the unchanged ingress frame/packet/byte bounds.
+- Browser and guest viewers probe WebRTC H.264 decoding at 720p30, 1080p60
+  and 1440p60 for each admitted profile. The highest verified tuple is sent
+  in the bounded `h264` capability list. Without it, the SDP level remains
+  authoritative; `browser: true` alone never promotes a decoder. Explicit
+  resource ceilings still apply. Every SPS, including every aggregate SPS
+  and bounded reassembled FU-A, is checked against profile, level and coded
+  macroblock size. A two-second RTP timestamp window enforces max-mbps with
+  10% tolerance without treating arrival jitter as an overrun.
+  See [Browser interop](native-media.md#browser-interop) for the wire fields,
+  dimensions and recovery rules. The fixed-canvas screen e2e requires Game
+  1920×1080 H.264 at the sender and Chromium/WebKit receivers using real decoded
+  dimensions. CI also checks adaptive real-tab capture with the selected codec
+  and moving barcode, without requiring the capture to retain its maximum size.
+- A viewer that cannot decode a share gets its slot freed and
+  `screen.stopped {reason: "codec"}`, with a clear browser/guest-page message.
+  The share and other viewers continue. There is no transcoding or native
+  compatibility layer in A2. The decode watchdog isolates one failing viewer
+  after a two-second corroboration window. Only failure reports from every active
+  H.264 viewer beyond the four-second watchdog window trigger share-wide recovery:
+  a lower H.264 target, then VP9 when all peers offered it. Reports are limited
+  per viewer/share to one every ten seconds; the share has a ten-second hold-down.
+  Watch slots survive replacement, old-publisher packets drop, and the replacement
+  keyframe opens the retained slots. Restore H.264 after reporters leave or two
+  minutes, then hold for a minute before another downgrade. A3/B11a own native
+  compatibility layers. An explicitly limited native decoder may still need 720p.
+- Hardware encoding is chosen by the browser where available, with its
+  software H.264 encoder otherwise. The sharing bar shows the negotiated
+  codec and exposes the encoder implementation/hardware hint in its tooltip
+  when `getStats` reports them. Presets still set `contentHint`,
+  `degradationPreference`, frame rate and bitrate independently of codec.
 
-**Target, pending A2:** web sharers prefer H.264 with hardware encoding
-where available; OpenH264 is the software counterpart. VP9 (profile 0) is
-only the emergency fallback for browsers without an H.264 encoder, such as
-Chromium builds without proprietary codecs or Firefox without OpenH264.
-Every supported browser has VP9, so VP8 is dropped from the target. A2 starts
-with browser H.264; A2b adds AV1 + Dependency Descriptor later. The SFU does
-not negotiate H.264 yet; this decision changes the plan, not the web code.
-
-The owner reports high CPU and 144p/2 fps Chrome shares on Windows with an
-i5-13600KF and RTX 5070. Software VP9 is CPU-heavy; Chrome can instead encode
-H.264 in hardware through Media Foundation, subject to capability probing.
-The report motivates the change and is not an acceptance measurement.
-
-For encrypted channels H.264 needs NAL-aware SFrame: everything up to and
-including the first slice NAL header stays clear, and the ciphertext is
-start-code escaped, as LiveKit does. The spike's unescaped variant decoded 204
-of 204 frames in Chromium and 272 of 272 in WebKit. That was luck, not
-robustness: about one frame in 2^24 bytes of ciphertext forms a start code.
-Encrypted H.264 waits for B2/E2. Plaintext browser H.264 comes first with
-A2/E1. HEVC is not planned: browser WebRTC interop is uneven, patent pools
-add complexity, and the owner prefers royalty-free AV1 for efficiency.
-Any later HEVC reconsideration is native-to-native only, with every viewer
-able to decode it; see [native codec policy](native-media.md#av1-plan).
+Encrypted H.264 still needs NAL-aware SFrame and start-code escaping, as
+specified in [native-media.md](native-media.md#encryption-nal-aware-sframe).
+A2 does not enable encrypted shares, browser AV1, HEVC, or native clients.
+VP8 is dropped. Verified H.264 decode probes and bounded recovery are described
+in [native-media.md, Browser interop](native-media.md#browser-interop).
 
 ### Presets
 
@@ -443,7 +463,8 @@ Each session has at most two screen transports besides its voice transport
   - Watching other shares is unaffected, because it runs on the separate
     watch transport. PR 4's e2e covers start, stop and start while watching
     two other shares.
-- **Codecs:** `clear_codecs().enable_vp9(true).enable_vp8(true)`, with RTX.
+- **Codecs:** H.264 mode 1 (Constrained Baseline/Constrained High/High),
+  VP9 profile 0, with RTX; no AV1 or HEVC negotiation yet.
   Extensions are the defaults (transport-cc, abs-send-time, mid, rid) and a
   slot-generation extension on the watch transport like voice's
   (`gwar_proto::rtp`).
@@ -896,7 +917,8 @@ does not assemble frames before forwarding.
   - The SFU recognizes a frame by its RTP timestamp. It recognizes a keyframe
     start by the clear payload descriptor: VP9's start-of-frame bit with P = 0,
     or VP8's S bit with partition 0 and the key bit of the clear payload
-    header byte.
+    header byte. H.264 uses RTP timestamps for frame boundaries and A1
+    NAL observations for a confirmed SPS/PPS/IDR prefix.
   - The share's earlier packets of that frame stay forwarded, so the frame is
     incomplete.
   - The share goes to *waiting for keyframe* for **all** its slots, and one
@@ -918,6 +940,16 @@ does not assemble frames before forwarding.
   its packets arrive; a late repair of an older frame counts against the
   buckets only. The VP9 descriptor is parsed to its end (RFC 9628 §4.2), and a
   truncated one is not forwarded.
+- **H.264 joins and recovery hold only a bounded prefix:** at most 8 packets
+  and 16 KB of the newest RTP timestamp, in source sequence order. A complete
+  SPS, complete PPS (including uninterrupted FU-A completion), then an IDR
+  start must be present without gaps before a waiting slot opens at the SPS.
+  Marker-before-repair, a new timestamp, a non-IDR slice, malformed NALs or
+  a prefix overflow fail the candidate and request a throttled PLI. Active
+  segments receive on arrival. Held bytes/packets are metered on arrival,
+  including while ingress is blocked; replay is never charged again. The
+  same frame bounds, stable RTP mapping, queues, pause/resume and recovery
+  rules apply as for VP9. There are no H.264 spatial layers.
 - **The transport is metered too.** Every datagram of a publish transport,
   before str0m sees it (RTX, padding, duplicates, RTCP, STUN included), passes
   a meter of 2,500 packets/s and 1.5× the share's cap in bytes. Over it,
@@ -1996,9 +2028,9 @@ included ([Queues and repairs](#queues-and-repairs)).
 | Op | Body | Reply / effect |
 | --- | --- | --- |
 | `screen.start` | `{call, participation, preset, surface, guest_link}` (`surface`: `screen`/`window`/`tab`/`unknown`, display only; `guest_link`: post a TeamSpeak watch link where one is possible) | `{share}`, a 16-byte random id; checks `share_screen`, limits and budget; refused in encrypted channels until PR 7. Not announced until its publish transport connects; one not answered 35 s after its start, or not connected 35 s after its answer, ends with `transport`, told to the sharer only |
-| `screen.publish.offer` | `{share, ssrc, rtx_ssrc, sdp}` | `{sdp}`; the share's own publish transport. Its first connection announces `screen.started` to the channel. One per share, never renegotiated |
+| `screen.publish.offer` | `{share, ssrc, rtx_ssrc, sdp}` | `{sdp}`; the share's own publish transport. Its first connection announces `screen.started` to the channel. One per share, reopened only by bounded SFU `screen.recover` |
 | `screen.stop` | `{share}` | ok; event `screen.stopped {share, reason: "stopped"}` |
-| `screen.watch.offer` | `{run, sdp}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run; a run is retired for good once offered, so a failed or closed run and every lower one answer `stale` |
+| `screen.watch.offer` | `{run, sdp, browser?, h264?}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run; a run is retired for good once offered, so a failed or closed run and every lower one answer `stale` |
 | `screen.watch` | `{share}` | `{slot}`; needs a connected watch transport (`unavailable` otherwise); the server assigns a slot, opens a segment at the next keyframe (throttled request), event `screen.slot` |
 | `screen.focus` | `{share}` | ok; the share on the viewer's stage gets first claim on its bandwidth |
 | `screen.unwatch` | `{share}` | ok; the slot is freed |
@@ -2006,12 +2038,20 @@ included ([Queues and repairs](#queues-and-repairs)).
 | `screen.stop_other` | `{share}` | needs `mute_members` in the channel and rank above the sharer; event `screen.stopped {reason: "moderator", by}` |
 | `screen.link.revoke` | `{share}` | the sharer, or `mute_members` with rank above the sharer; the share's watch link stops working and its guests are disconnected; final for that share |
 
+The optional `screen.capabilities {}` query replies `{screen_h264: true}`; the
+`guest.watch` reply's `screen_h264` boolean advertises the server's A2 capability
+and recovery support to all guests. Legacy guest response validation ignores
+this extra field and continues with the legacy `guest.offer {sdp}`. Clients omit `browser`,
+`h264` and decode reports unless the flag is true. An unsupported/timed-out query selects legacy fields.
+Servers retain the legacy Welcome shape and accept old clients
+that omit all new fields.
+
 Events:
 
 - `screen.started {share, client, channel, preset, surface}`;
 - `screen.viewers {share, members, guests}`, to the sharer only, and
   `screen.link {share, active}` to the sharer and, once the share is announced, the channel's moderators;
-- `screen.stopped {share, reason: stopped|moderator|left|limit|transport|budget|access}`;
+- `screen.stopped {share, reason: stopped|moderator|left|limit|transport|budget|access|codec}`;
 - `screen.slot {run, slot, share | null}`, like `voice.slot`, tagged with the
   watch transport's `run`;
 - `screen.paused {share, reason: bandwidth}` and `screen.resumed {share}`.
@@ -2171,7 +2211,7 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
   - The first frame is `guest.watch {token}`. The reply is
     `{share, sharer, preset, ice_servers}`, or one generic `not_found`
     for unknown, inactive, ended and revoked tokens alike.
-  - After that, only `guest.offer {sdp}` is accepted, **once per
+  - After that, only `guest.offer {sdp, browser?, h264?}` is accepted, **once per
     connection**, plus `screen.keyframe` and `ping {}`. The offer is a
     watch transport with **one** slot. A second offer closes the
     connection.
@@ -2485,6 +2525,8 @@ badge, stage). Decisions taken while building it, where this design left room:
   starts.
 - **"Switch source"** is Chromium's own button, enabled by
   `surfaceSwitching: "include"`; Gwar adds none.
+- **`screen.stopped {reason: "codec"}`** ends only my incompatible watch,
+  preserves the listed share and watch link, and displays a decoding error.
 - **`screen.stopped {reason: "access"}`** ends only my watch. The share stays
   listed while its sharer's `Client.sharing` is on, because the same reason
   also ends a share whose sharer lost `share_screen`, and only the sharer's
@@ -2842,7 +2884,7 @@ person.
    - The address-map dispatch and bounded hand-off from the voice task, and
      the screen task.
    - `screen.publish.offer` and `screen.watch.offer`, and their `Rtc`s
-     (VP9/VP8 + RTX), polling after every input. A share is announced when
+     (H.264/VP9 + RTX), polling after every input. A share is announced when
      its publish transport connects, and ends with `transport` if it has not
      35 s after the answer.
    - Share admission: the `ScreenOrigin` binding and byte/packet buckets.
@@ -3050,7 +3092,7 @@ known:
     leaves out Gwar's own process (macOS ScreenCaptureKit with
     `excludesCurrentProcessAudio`, Windows WASAPI process loopback excluding
     Gwar), fed into the webview's share as a track.
-11. **H.264 preferred for browser sending (M, 4–5 days):** pending A2/E1,
+11. **H.264 preferred for browser sending (A2/E1 landed):**
     prefer H.264 for every preset, hardware where available
     (`powerEfficientEncoder` in stats), VP9 only without an H.264 encoder,
     and remove VP8. Encrypted H.264 also needs B2/E2's NAL-aware SFrame with
@@ -3086,8 +3128,8 @@ out Gwar's own voice. It replaces the first bullet below.
   measures it).
 - **Encoder CPU on the sharer** for VP9 1080p60 in software on weaker
   laptops. The spike's M5 is not representative. Mitigation: the Game preset
-  drops to 720p60 when `qualityLimitationReason` is `cpu`. Pending A2/E1,
-  prefer H.264 hardware for all presets and reserve VP9 for missing encoders.
+  drops to 720p60 when `qualityLimitationReason` is `cpu`. A2/E1 prefers
+  H.264 hardware for all presets and reserves VP9 for emergency fallback.
 - **SFU CPU on the VM.** Extrapolated from an M5 (PR 3b measures).
 - **Voice under video load.** Isolation is designed, not yet measured. PR 3b's
   paired gate decides whether the shared-runtime task is enough, or whether
