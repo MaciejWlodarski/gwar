@@ -48,6 +48,11 @@ fn resources(id: u32) -> Option<[u32; 4]> {
         42 => [522240, 8704, 34816, 50000],
         50 => [589824, 22080, 110400, 135000],
         51 => [983040, 36864, 184320, 240000],
+        // Receive-only levels: viewers may decode above the 5.1 publish ceiling.
+        52 => [2073600, 36864, 184320, 240000],
+        60 => [4177920, 139264, 696320, 240000],
+        61 => [8355840, 139264, 696320, 480000],
+        62 => [16711680, 139264, 696320, 800000],
         _ => return None,
     })
 }
@@ -152,6 +157,17 @@ mod tests {
         assert!(!low.accepts(VideoCodec::H264(0x42e01f)));
         let explicit = Limits::parse("packetization-mode=1;profile-level-id=42e01f;max-fs=3600", &[cap]).unwrap();
         assert_eq!(explicit.resources[1], 3600);
+    }
+    #[test]
+    fn receivers_above_the_publish_ceiling_accept_lower_level_streams() {
+        for id in ["640034", "640c3c", "42e03e"] {
+            let fmtp = format!("packetization-mode=1;profile-level-id={id}");
+            let limit = Limits::parse(&fmtp, &[]).unwrap();
+            let stream = u32::from_str_radix(id, 16).unwrap() & 0xffff00 | 0x33;
+            assert!(limit.accepts(VideoCodec::H264(stream)));
+        }
+        // A publisher SPS above its answered 5.1 level is still refused.
+        assert!(!stream_fits(0x640033, 0x640034));
     }
     #[test]
     fn native_extensions_and_m_lines_remain_independent() {
