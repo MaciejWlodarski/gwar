@@ -760,6 +760,12 @@ jobs:
           pactl load-module module-null-sink sink_name=e2e
           pactl set-default-sink e2e
           pnpm --filter web e2e:screen
+      - name: Fixed 1080p60 H.264 through the SFU in Chromium and WebKit
+        timeout-minutes: 10
+        env:
+          E2E_SCREEN_CANVAS: "1"
+          E2E_SCREEN_REQUIRE_H264: "1"
+        run: pnpm --filter web e2e:screen
       # TeamSpeak watch links: guest pages in Chromium and WebKit, through the test hooks' stand-in
       # bridge (no TeamSpeak server), including the 150 s heartbeat.
       - name: Watch links for TeamSpeak guests

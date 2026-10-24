@@ -741,12 +741,21 @@ raise a browser's receive level above its SDP level.
 The screen e2e uses the Game preset and a 1920×1080 Chromium tab.
 `E2E_SCREEN_CANVAS=1` uses a deterministic 1920×1080, 60 fps canvas source
 for the full-size encoder/SFU gate; Chromium may adapt a real tab capture
-below its requested maximum during bandwidth startup. It
-requires H.264 `getStats().frameWidth/frameHeight` of 1920×1080 at the sender,
+below its requested maximum during bandwidth startup. CI runs both modes:
+the real tab must deliver the selected codec and moving barcode; the fixed
+canvas (with `E2E_SCREEN_REQUIRE_H264=1`) requires an H.264 encoder and
+H.264 `getStats().frameWidth/frameHeight` of 1920×1080 at the sender,
 Chromium receiver and late-joining WebKit receiver, even though both viewers
-offer 3.1. Codec absence/profile incompatibility retains the per-viewer refusal
-and VP9 fallback policy. Firefox's plugin/platform availability remains a
-separate compatibility condition; this e2e does not run Firefox.
+offer 3.1, plus at least 50 fps on the Chromium path. Sender codec capabilities
+and WebRTC `encodingInfo` results are logged before the media checks. The Linux
+Playwright Chromium build uses OpenH264; its adaptive real-tab capture is not
+a resolution acceptance source. A secondary publisher exposes only VP9 sender
+capabilities and must encode VP9 through the SFU to both viewers, exercising
+encoder absence independently of the H.264 gate. This also avoids assuming
+WebKit's High profile intersects Linux Chromium's Constrained Baseline-only
+capabilities. Profile incompatibility retains the per-viewer refusal policy.
+Firefox's plugin/platform availability remains a separate compatibility condition;
+this e2e does not run Firefox.
 
 ### Hardware encoders per platform
 

@@ -19,6 +19,7 @@
  *
  *   E2E_BROWSERS=chromium,webkit   engines to use (default: both); with one, it plays every role
  *   E2E_SCREEN_CANVAS=1          fixed 1080p60 canvas instead of adaptive tab capture
+ *   E2E_SCREEN_REQUIRE_H264=1    fail if the main sharer exposes no H.264 encoder
  *   GWAR_SERVER_BIN                 server binary (default: target/debug/gwar-server)
  */
 import { stopProcesses } from "./processes.mjs";
@@ -292,7 +293,7 @@ async function codecFlow(publisher, viewer, share, expected, size = null) {
   let sent, received;
   await waitFor(async () => { sent = await read(publisher, "out"); received = await read(viewer, "in"); return sent?.mimeType === expected && received?.mimeType === expected &&
     (!size || [sent, received].every(s => s.frameWidth === size[0] && s.frameHeight === size[1])) &&
-    (!(expected === "video/h264" && size?.[0] === 1920 && viewer.engine === "chromium") || sent.fps >= 50 && received.fps >= 50); }, `${expected} flows through the real SFU`);
+    (!(expected === "video/h264" && size?.[0] === 1920 && viewer.engine === "chromium") || sent.fps >= 50 && received.fps >= 50); }, `${expected} flows through the real SFU${size ? ` at ${size.join("x")}` : ""}`);
   if (expected === "video/h264" && size) {
     assert.ok(sent.answeredFmtp.some(l => /level-asymmetry-allowed=1/.test(l) && /profile-level-id=(42e0|640c|6400)33/.test(l)), "publisher answer retains receive level 5.1");
     assert.ok(received.offeredFmtp.some(l => /profile-level-id=(42e0|640c|6400)1f/.test(l)), "viewer starts with the browser's default level 3.1");
@@ -330,10 +331,34 @@ async function run(browsers, web, server, token) {
     c.mimeType.toLowerCase() === "video/h264" && /(^|;)\s*packetization-mode=1(?:;|$)/.test(c.sdpFmtpLine ?? "") &&
     /(^|;)\s*profile-level-id=(42[eEcC]0|640[cC]|6400)[0-9a-fA-F]{2}(?:;|$)/.test(c.sdpFmtpLine ?? "")));
 
-  // Browser SDP defaults to 3.1; Game must still encode and decode the full 1080p source.
+  const encoding = await cs.evaluate(async () => {
+    const codecs = RTCRtpSender.getCapabilities("video")?.codecs.filter(c => c.mimeType.toLowerCase() === "video/h264") ?? [];
+    const probes = await Promise.all([30, 60].map(async framerate => {
+      try {
+        const info = await navigator.mediaCapabilities.encodingInfo({ type: "webrtc", video: {
+          contentType: "video/H264;profile-level-id=42e02a;packetization-mode=1",
+          width: 1920, height: 1080, framerate, bitrate: 8_000_000,
+        } });
+        return { framerate, supported: info.supported, smooth: info.smooth, powerEfficient: info.powerEfficient };
+      } catch (error) { return { framerate, error: String(error) }; }
+    }));
+    return { codecs, probes };
+  });
+  const capability = { check: "H.264 browser capability", engine: cs.engine, available: hasH264, ...encoding,
+    gap: hasH264 ? null : "Browser exposes no H.264 encoder; actual VP9 fallback is required below." };
+  checks.push(capability);
+  console.log(JSON.stringify(capability));
+  if (process.env.E2E_SCREEN_REQUIRE_H264 === "1") assert.ok(hasH264, "this CI gate requires an H.264 encoder");
+
+  // A real tab may adapt its capture size during bandwidth startup. The fixed
+  // canvas run separately requires full 1080p60 despite the viewers' SDP level 3.1.
+  const requiredSize = fixedCanvas ? SOURCE_SIZES[1] : null;
   const csShare = await share(cs, chromiumTab ? "Sharing a browser tab" : "Sharing your screen", "Game");
   checks.push({ check: "capture source", mode: chromiumTab ? "real tab" : "canvas", fixedCanvas });
-  const ws = await device(engine("webkit"), web, server, "ws-canvas", { frequency: 550, canvasId: 2, sendCodec: hasH264 ? null : "vp9" });
+  // Exercise encoder absence independently of the H.264 primary. A WebKit
+  // sender may select High while Linux Chromium exposes only Constrained Baseline;
+  // the generic lifecycle matrix must not assume those H.264 profiles intersect.
+  const ws = await device(engine("webkit"), web, server, "ws-canvas", { frequency: 550, canvasId: 2, sendCodec: "vp9" });
   await join(ws, channels.stage);
   const wsShare = await share(ws, "Sharing your screen");
 
@@ -341,8 +366,8 @@ async function run(browsers, web, server, token) {
   await join(cv, channels.hall);
   await watch(cv, "cs-tab");
   await sees(cv, csShare, 1, "chromium → chromium, viewer in another channel");
-  await codecFlow(cs, cv, csShare, hasH264 ? "video/h264" : "video/vp9", SOURCE_SIZES[1]);
-  checks.push({ check: "H.264 browser capability", available: hasH264, gap: hasH264 ? null : "Browser exposes no H.264 encoder; actual VP9 fallback verified instead." });
+  await codecFlow(cs, cv, csShare, hasH264 ? "video/h264" : "video/vp9", requiredSize);
+  checks.push({ check: "selected browser codec verified through SFU", codec: hasH264 ? "h264" : "vp9", fixedCanvas });
   if (hasH264) {
     const incompatible = await device(engine("chromium"), web, server, "vp9-only-viewer", { receiveCodec: "vp9" });
     await watch(incompatible, "cs-tab");
@@ -353,6 +378,7 @@ async function run(browsers, web, server, token) {
   }
   await watch(cv, "ws-canvas");
   await sees(cv, wsShare, 2, "webkit → chromium");
+  await codecFlow(ws, cv, wsShare, "video/vp9");
   await bar(cs).getByText("1 watching").waitFor({ timeout: 10_000 });
 
   // A late joiner, in no voice at all, learns of both from the Welcome.
@@ -361,9 +387,10 @@ async function run(browsers, web, server, token) {
   assert.equal(await shareOf(wv, "cs-tab"), csShare);
   await watch(wv, "cs-tab");
   await sees(wv, csShare, 1, "chromium → webkit, late joiner outside voice");
-  await codecFlow(cs, wv, csShare, hasH264 ? "video/h264" : "video/vp9", SOURCE_SIZES[1]);
+  await codecFlow(cs, wv, csShare, hasH264 ? "video/h264" : "video/vp9", requiredSize);
   await watch(wv, "ws-canvas");
   await sees(wv, wsShare, 2, "webkit → webkit");
+  await codecFlow(ws, wv, wsShare, "video/vp9");
   await bar(ws).getByText("2 watching").waitFor({ timeout: 10_000 });
 
   // Start → stop → start while watching two other shares: the watch transport is untouched.

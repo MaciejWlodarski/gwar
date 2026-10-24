@@ -303,8 +303,10 @@ decode stays for browser compatibility.
   macroblock size. A two-second RTP timestamp window enforces max-mbps with
   10% tolerance without treating arrival jitter as an overrun.
   See [Browser interop](native-media.md#browser-interop) for the wire fields,
-  dimensions and recovery rules. The screen e2e requires Game 1920×1080 H.264
-  at the sender and Chromium/WebKit receivers using real decoded dimensions.
+  dimensions and recovery rules. The fixed-canvas screen e2e requires Game
+  1920×1080 H.264 at the sender and Chromium/WebKit receivers using real decoded
+  dimensions. CI also checks adaptive real-tab capture with the selected codec
+  and moving barcode, without requiring the capture to retain its maximum size.
 - A viewer that cannot decode a share gets its slot freed and
   `screen.stopped {reason: "codec"}`, with a clear browser/guest-page message.
   The share and other viewers continue. There is no transcoding or native
@@ -2037,7 +2039,9 @@ included ([Queues and repairs](#queues-and-repairs)).
 | `screen.link.revoke` | `{share}` | the sharer, or `mute_members` with rank above the sharer; the share's watch link stops working and its guests are disconnected; final for that share |
 
 The optional `screen.capabilities {}` query replies `{screen_h264: true}`; the
-`guest.watch` reply's `screen_h264` boolean advertises A2 capability and recovery support. Clients omit `browser`,
+`guest.watch` reply's `screen_h264` boolean advertises the server's A2 capability
+and recovery support to all guests. Legacy guest response validation ignores
+this extra field and continues with the legacy `guest.offer {sdp}`. Clients omit `browser`,
 `h264` and decode reports unless the flag is true. An unsupported/timed-out query selects legacy fields.
 Servers retain the legacy Welcome shape and accept old clients
 that omit all new fields.
