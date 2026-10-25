@@ -382,7 +382,7 @@ describe("publisher capture guard", () => {
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("cannot learn pulse-induced growth through a same-preset update", async () => {
+  it("retains even pulse-induced settings growth through a same-preset update", async () => {
     const settings = { width: 1280, height: 720, frameRate: 20 };
     const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
       preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
@@ -404,30 +404,24 @@ describe("publisher capture guard", () => {
     });
     await vi.advanceTimersByTimeAsync(10_000);
     await publisher.setPreset("game");
-    const evidence = publisher as unknown as { captureSize: { width: number } };
-    expect(evidence.captureSize.width).toBe(1280);
+    const evidence = publisher as unknown as { ceiling: { width: number } };
+    expect(evidence.ceiling.width).toBe(1920);
     await vi.advanceTimersByTimeAsync(15_000);
-    expect(evidence.captureSize.width).toBe(1280);
     limitation = "none";
-    await vi.advanceTimersByTimeAsync(4000);
-    // Clearing a limitation cannot launder pulse-grown settings into proof.
-    expect(evidence.captureSize.width).toBe(1280);
     width = settings.width = 1280; height = settings.height = 720;
-    await vi.advanceTimersByTimeAsync(2000);
-    width = settings.width = 1920; height = settings.height = 1080;
     await vi.advanceTimersByTimeAsync(4000);
-    expect(evidence.captureSize.width).toBe(1920);
+    expect(evidence.ceiling.width).toBe(1920);
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
   // Round-3 reviewer repro: limitation "none" must not turn Saver's cap into
-  // physical resize evidence. Also exercise a custom 1600x900 / 24 fps target.
+  // a smaller ceiling. Also exercise a custom 1600x900 / 24 fps target.
   it.each([
     ["game", "none", "preset"], ["game", "bandwidth", "preset"],
     ["smooth", "none", "preset"], ["smooth", "bandwidth", "preset"],
     ["game", "none", "spec"], ["game", "bandwidth", "spec"],
     ["game", "none", "recovery"], ["game", "bandwidth", "recovery"],
-  ] as const)("retains proven surface size on %s, limitation=%s, after %s caps", async (preset, limitation, change) => {
+  ] as const)("retains the settings ceiling on %s, limitation=%s, after %s caps", async (preset, limitation, change) => {
     const original = PRESETS.smooth, originalGame = PRESETS.game;
     PRESETS.smooth = { ...original, width: 1600, height: 900, fps: 24, degradation: "maintain-framerate" };
     const settings = { width: 1920, height: 1080, frameRate: 20 };
@@ -460,7 +454,7 @@ describe("publisher capture guard", () => {
         ]);
       });
       await vi.advanceTimersByTimeAsync(12_000);
-      const size = (publisher as unknown as { captureSize: { width: number } }).captureSize.width;
+      const size = (publisher as unknown as { ceiling: { width: number } }).ceiling.width;
       const pulses = pc.sendParams.filter(p => p.degradationPreference === "maintain-resolution").length;
       expect({ size, pulses }).toEqual({ size: 1920, pulses: 1 });
       expect(last().encodings[0]?.maxFramerate).toBe(PRESETS[preset].fps);
@@ -920,260 +914,12 @@ describe("bounded guard outcomes and rearming", () => {
   });
 });
 
-describe("live captured surface provenance", () => {
-  it.each(["grow", "shrink", "switch", "adaptation", "pulse", "source-only"])("refreshes a %s without retaining stale surface/QP evidence", async kind => {
-    const settings = { width: kind === "grow" ? 1280 : 1920, height: kind === "grow" ? 720 : 1080, frameRate: 20, displaySurface: "window", deviceId: "one" };
-    const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
-      preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
-    await publisher.start();
-    const pc = Peer.all[0]!;
-    let width = settings.width, height = settings.height, limitation = "none";
-    pc.getStats.mockImplementation(async () => {
-      const at = performance.now();
-      return new Map([
-        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 13_000_000 }],
-        ["source", { width, height, framesPerSecond: 20 }],
-        ["out", { id: "out", type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, bytesSent: at * 10,
-          framesEncoded: 1 + at / 50, frameWidth: width, frameHeight: height, qualityLimitationReason: limitation, targetBitrate: 8_000_000 }],
-      ]);
-    });
-    await vi.advanceTimersByTimeAsync(4000);
-    const internals = publisher as unknown as { captureSize: { width: number; height: number }; guard: StuckCaptureGuard; phase: string | null };
-    const previous = internals.guard;
-    if (kind === "grow") { width = settings.width = 1920; height = settings.height = 1080; }
-    else if (kind === "source-only") { width = 1280; height = 720; }
-    else { width = settings.width = 1280; height = settings.height = 720; }
-    if (kind === "switch") settings.deviceId = "two";
-    if (kind === "adaptation") limitation = "bandwidth";
-    if (kind === "pulse") internals.phase = "pulse";
-    await vi.advanceTimersByTimeAsync(2000);
-    if (kind === "grow" || kind === "shrink") expect(internals.guard).toBe(previous); // needs two seconds of evidence
-    await vi.advanceTimersByTimeAsync(2000);
-    expect(internals.captureSize.width).toBe(kind === "grow" || kind === "adaptation" || kind === "pulse" || kind === "source-only" ? 1920 : 1280);
-    expect(internals.guard === previous).toBe(kind === "adaptation" || kind === "pulse" || kind === "source-only");
-    publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  });
-});
-
-
-// Round-4 reviewer repros: settings and source stats can describe different instants.
-describe("asynchronous surface observations", () => {
-  it.each(["together", "settings-first", "source-first"])("detects a real resize when observations arrive %s", async order => {
-    const settings = { width: 1920, height: 1080, frameRate: 20, deviceId: "one", displaySurface: "window" };
-    let width = 1920, height = 1080;
-    const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
-      preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
-    await publisher.start();
-    const pc = Peer.all[0]!;
-    pc.getStats.mockImplementation(async () => {
-      const at = performance.now();
-      return new Map([
-        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 13_000_000 }],
-        ["source", { width, height, framesPerSecond: 20 }],
-        ["out", { id: "out", type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, framesEncoded: 1 + at / 50,
-          bytesSent: at * 10, frameWidth: width, frameHeight: height, targetBitrate: 8_000_000, qualityLimitationReason: "none" }],
-      ]);
-    });
-    const state = publisher as unknown as { captureSize: { width: number; height: number }; guard: StuckCaptureGuard };
-    await vi.advanceTimersByTimeAsync(4000);
-    const previousGuard = state.guard;
-    if (order !== "source-first") { settings.width = 1280; settings.height = 720; }
-    if (order !== "settings-first") { width = 1280; height = 720; }
-    await vi.advanceTimersByTimeAsync(2000);
-    settings.width = width = 1280; settings.height = height = 720;
-    await vi.advanceTimersByTimeAsync(10_000);
-    const result = { width: state.captureSize.width, height: state.captureSize.height, refreshed: state.guard !== previousGuard,
-      pulses: pc.sendParams.filter(p => p.degradationPreference === "maintain-resolution").length };
-    publisher.close(); expect(vi.getTimerCount()).toBe(0);
-    expect(result).toEqual({ width: 1280, height: 720, refreshed: true, pulses: 0 });
-  });
-});
-
-describe("in-flight surface observations", () => {
-  it.each(["resize", "switch"])("keeps independent %s evidence across a pending pre-change stats response", async kind => {
-    const settings = { width: 1920, height: 1080, frameRate: 20, deviceId: "one", displaySurface: "window" };
-    let width = 1920, height = 1080;
-    const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
-      preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
-    await publisher.start();
-    const pc = Peer.all[0]!;
-    pc.getStats.mockImplementation(async () => {
-      const at = performance.now();
-      return new Map([
-        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 13_000_000 }],
-        ["source", { width, height, framesPerSecond: 20 }],
-        ["out", { id: "out", type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, framesEncoded: 1 + at / 50,
-          bytesSent: at * 10, frameWidth: width, frameHeight: height, targetBitrate: 8_000_000, qualityLimitationReason: "none" }],
-      ]);
-    });
-    const state = publisher as unknown as { captureSize: { width: number; height: number }; guard: StuckCaptureGuard };
-    await vi.advanceTimersByTimeAsync(4000);
-    const previousGuard = state.guard;
-    const read = pc.getStats.getMockImplementation()!;
-    let finish!: (stats: typeof pc.stats) => void;
-    pc.getStats.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
-    await vi.advanceTimersByTimeAsync(2000);
-    const preChangeReport = await read();
-    settings.width = 1280; settings.height = 720;
-    if (kind === "switch") settings.deviceId = "two";
-    finish(preChangeReport); await vi.advanceTimersByTimeAsync(0);
-    // Identity resets history immediately; stale source stats cannot prove the new size.
-    expect(state.guard === previousGuard).toBe(kind !== "switch");
-    expect(state.captureSize).toEqual({ width: 1920, height: 1080, known: true });
-    width = 1280; height = 720;
-    await vi.advanceTimersByTimeAsync(10_000);
-    const result = { ...state.captureSize, pulses: pc.sendParams.filter(p => p.degradationPreference === "maintain-resolution").length };
-    publisher.close(); expect(vi.getTimerCount()).toBe(0);
-    expect(result).toEqual({ width: 1280, height: 720, known: true, pulses: 0 });
-  });
-});
-
-
-it.each(["bandwidth", "cpu", "pulse", "constraints"])("discards pending resize evidence on %s before source stats catch up", async invalidation => {
-  const settings = { width: 1920, height: 1080, frameRate: 20 };
-  let width = 1920, height = 1080, limitation = "none";
-  const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
-    preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
-  await publisher.start();
-  const pc = Peer.all[0]!;
-  pc.getStats.mockImplementation(async () => {
-    const at = performance.now();
-    return new Map([
-      ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 13_000_000 }],
-      ["source", { width, height, framesPerSecond: 20 }],
-      ["out", { id: "out", type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, framesEncoded: 1 + at / 50,
-        bytesSent: at * 10, frameWidth: width, frameHeight: height, targetBitrate: 8_000_000, qualityLimitationReason: limitation }],
-    ]);
-  });
-  const state = publisher as unknown as { captureSize: { width: number; height: number }; phase: string | null };
-  await vi.advanceTimersByTimeAsync(4000);
-  settings.width = 1280; settings.height = 720;
-  await vi.advanceTimersByTimeAsync(2000); // Independent settings evidence, old source stats.
-  if (invalidation === "constraints") await publisher.setPreset("game");
-  else if (invalidation === "pulse") state.phase = "pulse";
-  else limitation = invalidation;
-  await vi.advanceTimersByTimeAsync(2000);
-  state.phase = null; limitation = "none";
-  width = 1280; height = 720;
-  await vi.advanceTimersByTimeAsync(10_000);
-  const result = { ...state.captureSize };
-  publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  expect(result).toEqual({ width: 1920, height: 1080, known: true });
-});
-
-describe("surface identity availability", () => {
-  it("learns a delayed media-source id without replacing the original surface ceiling", async () => {
-    const publisher = new ScreenPublisher({ track: { getSettings: () => ({ width: 1920, height: 1080, deviceId: "original" }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
-      preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
-    await publisher.start();
-    const internals = publisher as unknown as { captureSize: { width: number }; guard: StuckCaptureGuard };
-    const guard = internals.guard, pc = Peer.all[0]!;
-    await vi.advanceTimersByTimeAsync(2000); // no mediaSourceId yet
-    pc.stats.set("source", { width: 480, height: 270 });
-    pc.stats.set("out", { type: "outbound-rtp", kind: "video", mediaSourceId: "source", frameWidth: 480, frameHeight: 270, qualityLimitationReason: "bandwidth" });
-    await vi.advanceTimersByTimeAsync(2000);
-    expect(internals.captureSize.width).toBe(1920);
-    expect(internals.guard).toBe(guard);
-    publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  });
-});
-
-
-describe("switch and encoder adaptation provenance", () => {
-  async function fixture(width = 1920, height = 1080) {
-    const settings = { width, height, frameRate: 20, deviceId: "one", displaySurface: "window" };
-    const sample = { width, height, limitation: "none" };
-    const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
-      preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
-    await publisher.start();
-    const pc = Peer.all[0]!;
-    pc.getStats.mockImplementation(async () => {
-      const at = performance.now();
-      return new Map([
-        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 13_000_000 }],
-        ["source", { width: sample.width, height: sample.height, framesPerSecond: 20 }],
-        ["out", { id: "out", type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, framesEncoded: 1 + at / 50,
-          bytesSent: at * 10, frameWidth: sample.width, frameHeight: sample.height, targetBitrate: 8_000_000, qualityLimitationReason: sample.limitation }],
-      ]);
-    });
-    const state = publisher as unknown as { captureSize: { width: number; height: number; known: boolean }; guard: StuckCaptureGuard; phase: string | null };
-    const dimensions = (width: number, height: number) => {
-      settings.width = sample.width = width; settings.height = sample.height = height;
-    };
-    await vi.advanceTimersByTimeAsync(4000);
-    return { settings, sample, publisher, pc, state, dimensions };
-  }
-
-  // Round-5 reviewer repro: a pending switch must not bless later adapted settings.
-  it.each(["bandwidth", "cpu"])("preserves the native target when a pending switch is followed by %s downscale", async limitation => {
-    const f = await fixture();
-    f.settings.width = 1280; f.settings.height = 720;
-    await vi.advanceTimersByTimeAsync(2000);
-    const previousGuard = f.state.guard;
-    f.settings.deviceId = "two";
-    f.settings.width = 1600; f.settings.height = 900;
-    await vi.advanceTimersByTimeAsync(2000);
-    expect(f.state.guard).not.toBe(previousGuard);
-    expect(f.state.captureSize.width).toBe(1920);
-    f.dimensions(480, 270); f.sample.limitation = limitation;
-    await vi.advanceTimersByTimeAsync(4000);
-    const size = { ...f.state.captureSize };
-    f.sample.limitation = "none";
-    await vi.advanceTimersByTimeAsync(700_000);
-    const pulses = f.pc.sendParams.filter(p => p.degradationPreference === "maintain-resolution").length;
-    expect(size).toEqual({ width: 1920, height: 1080, known: true });
-    expect(f.state.captureSize).toEqual(size);
-    expect(pulses).toBeGreaterThan(0);
-    f.publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it.each(["bandwidth", "cpu"])("rejects adapted dimensions observed together with a switch under %s", async limitation => {
-    const f = await fixture();
-    const previousGuard = f.state.guard;
-    f.settings.deviceId = "two";
-    f.dimensions(480, 270); f.sample.limitation = limitation;
-    await vi.advanceTimersByTimeAsync(4000);
-    expect(f.state.guard).not.toBe(previousGuard);
-    f.sample.limitation = "none";
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(f.state.captureSize).toEqual({ width: 1920, height: 1080, known: true });
-    expect(f.pc.sendParams.some(p => p.degradationPreference === "maintain-resolution")).toBe(true);
-    f.publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it.each(["pulse", "outcome"])("rejects dimensions induced by the current surface's %s", async active => {
-    const f = await fixture();
-    f.settings.deviceId = "two";
-    await vi.advanceTimersByTimeAsync(4000); // The old surface's history is gone.
-    if (active === "pulse") f.state.phase = "pulse";
-    else vi.spyOn(f.state.guard, "tracking", "get").mockReturnValue(true);
-    f.dimensions(480, 270);
-    await vi.advanceTimersByTimeAsync(4000);
-    expect(f.state.captureSize).toEqual({ width: 1920, height: 1080, known: true });
-    await vi.advanceTimersByTimeAsync(10_000);
-    expect(f.state.captureSize).toEqual({ width: 1920, height: 1080, known: true });
-    f.publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it.each(["bandwidth", "cpu"])("rejects an adapted intermediate size above the old physical size under %s", async limitation => {
-    const f = await fixture(1280, 720);
-    // A larger window can still be adapted to a size above the previous surface.
-    f.settings.width = 3840; f.settings.height = 2160;
-    await vi.advanceTimersByTimeAsync(2000);
-    f.dimensions(1920, 1080); f.sample.limitation = limitation;
-    await vi.advanceTimersByTimeAsync(4000);
-    expect(f.state.captureSize).toEqual({ width: 1280, height: 720, known: true });
-    f.publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  });
-});
-
-
-// Reviewer repros from rounds 3, 5 and 6; round 4 is covered above.
-async function makeSurfaceReview(manual = false) {
+// Settings are the only dimension authority. Stats may lag either side of a switch.
+async function makeSurfaceReview(manual = false, observed: (settings: MediaTrackSettings) => void = () => {}) {
   const settings = { width: 1920, height: 1080, frameRate: 20, deviceId: "one", displaySurface: "window" };
   const sample = { width: 1920, height: 1080, outWidth: 1920, outHeight: 1080, limitation: "none", available: 13_000_000, target: 8_000_000, sourceId: "source" };
   let constraint: (c: MediaTrackConstraints) => Promise<void> = async () => {};
-  const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: (c: MediaTrackConstraints) => constraint(c) } as unknown as MediaStreamTrack,
+  const publisher = new ScreenPublisher({ track: { getSettings: () => { const snapshot = { ...settings }; observed(snapshot); return snapshot; }, applyConstraints: (c: MediaTrackConstraints) => constraint(c) } as unknown as MediaStreamTrack,
     preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
   await publisher.start();
   const pc = Peer.all.at(-1)!;
@@ -1187,14 +933,14 @@ async function makeSurfaceReview(manual = false) {
     ]);
   });
   const state = publisher as unknown as {
-    captureSize: { width: number; height: number; known: boolean };
-    guard: StuckCaptureGuard; phase: "pulse" | null; captureChanges: number;
+    ceiling: { width: number; height: number; known: boolean };
+    guard: StuckCaptureGuard; phase: "pulse" | null;
     timer: ReturnType<typeof setInterval> | null;
     phaseTimer: ReturnType<typeof setTimeout> | null;
     sampleTimer: ReturnType<typeof setTimeout> | null;
     polling: unknown;
     adaptationSent: { at: number } | null;
-    surfaceObservation: { width?: number; height?: number; clean: boolean } | null;
+    captureTarget(): { width: number; height: number };
     headroom(): Promise<void>;
   };
   const pulses = () => pc.sendParams.filter(p => p.degradationPreference === "maintain-resolution").length;
@@ -1211,7 +957,7 @@ async function makeSurfaceReview(manual = false) {
   return { settings, sample, publisher, pc, state, pulses, stop, dimensions, setConstraint: (fn: typeof constraint) => { constraint = fn; } };
 }
 
-describe("round six behavior-only dimension proof", () => {
+describe("round six switch behavior", () => {
   it.each(["pulse", "outcome"])("accepts a genuine smaller window switched during an active %s", async phase => {
     const f = await makeSurfaceReview();
     // First surface is 1920x1080. A real Chromium startup stall starts a pulse.
@@ -1227,7 +973,7 @@ describe("round six behavior-only dimension proof", () => {
     f.settings.deviceId = "two";
     f.dimensions(1280, 720); f.sample.limitation = "none";
     await vi.advanceTimersByTimeAsync(700_000);
-    const result = { target: { ...f.state.captureSize }, extraPulses: f.pulses() - before };
+    const result = { target: { ...f.state.ceiling }, extraPulses: f.pulses() - before };
     f.stop();
     expect(result).toEqual({ target: { width: 1280, height: 720, known: true }, extraPulses: 0 });
   });
@@ -1259,7 +1005,7 @@ it("can recover a later stall at the smaller switched window's healthy native ca
 });
 
 
-describe("round five adversarial pending provenance", () => {
+describe("round five asynchronous settings behavior", () => {
   it("does not block guard attempts or cooldown expiry when settings are never corroborated", async () => {
     const f = await makeSurfaceReview();
     f.dimensions(1280,720,"settings");
@@ -1273,7 +1019,7 @@ describe("round five adversarial pending provenance", () => {
     expect(f.pc.getStats.mock.calls.length-before).toBe(5);
     await vi.advanceTimersByTimeAsync(600_000);
     expect(f.pulses()).toBeGreaterThan(2);
-    expect(f.state.captureSize.width).toBe(1920);
+    expect(f.state.ceiling.width).toBe(1920);
     f.stop();
   });
 
@@ -1286,7 +1032,7 @@ describe("round five adversarial pending provenance", () => {
     await vi.advanceTimersByTimeAsync(2000);
     f.dimensions(1920,1080);
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(f.state.captureSize).toEqual({width:1920,height:1080,known:true});
+    expect(f.state.ceiling).toEqual({width:1920,height:1080,known:true});
     expect(f.pulses()).toBe(0);
     f.stop();
   });
@@ -1298,32 +1044,30 @@ describe("round five adversarial pending provenance", () => {
     f.sample.limitation=limitation;
     f.dimensions(480,270);
     await vi.advanceTimersByTimeAsync(4000);
-    expect(f.state.captureSize.width).toBe(1920);
+    expect(f.state.ceiling.width).toBe(1920);
     f.sample.limitation="none";
     await vi.advanceTimersByTimeAsync(4000);
-    expect(f.state.captureSize.width).toBe(1920);
+    expect(f.state.ceiling.width).toBe(1920);
     f.stop();
   });
 
-  it.each(["resolve","reject"])("clears pending evidence across a %s constraint write", async outcome => {
+  it.each(["resolve","reject"])("retains the ceiling across a %s constraint write", async outcome => {
     const f=await makeSurfaceReview();
     f.dimensions(1280,720,"settings");
     await vi.advanceTimersByTimeAsync(2000);
     let finish!:()=>void;
     f.setConstraint(()=>new Promise<void>((resolve,reject)=>{finish=outcome==="resolve"?resolve:()=>reject(new Error("rejected"));}));
     const changing=f.publisher.setPreset("game").catch(()=>{});
-    expect(f.state.captureChanges).toBe(1);
     f.dimensions(1280,720);
     await vi.advanceTimersByTimeAsync(2000);
-    expect(f.state.captureSize.width).toBe(1920);
+    expect(f.state.ceiling.width).toBe(1920);
     finish(); await changing;
     await vi.advanceTimersByTimeAsync(4000);
-    expect(f.state.captureChanges).toBe(0);
-    expect(f.state.captureSize.width).toBe(1920);
+    expect(f.state.ceiling.width).toBe(1920);
     f.stop();
   });
 
-  it("resets switch history immediately while retaining a pending resize until the new source is observed", async () => {
+  it("resets switch history and seeds new settings before source stats catch up", async () => {
     const f=await makeSurfaceReview();
     const previous=f.state.guard;
     f.dimensions(1280,720,"settings");
@@ -1332,10 +1076,10 @@ describe("round five adversarial pending provenance", () => {
     f.dimensions(1600,900,"settings");
     await vi.advanceTimersByTimeAsync(2000);
     expect(f.state.guard).not.toBe(previous);
-    expect(f.state.captureSize.width).toBe(1920);
+    expect(f.state.ceiling.width).toBe(1600);
     f.dimensions(1600,900);
     await vi.advanceTimersByTimeAsync(2000);
-    expect(f.state.captureSize).toEqual({width:1600,height:900,known:true});
+    expect(f.state.ceiling).toEqual({width:1600,height:900,known:true});
     expect(f.pulses()).toBe(0);
     f.stop();
   });
@@ -1349,18 +1093,18 @@ describe("round five adversarial pending provenance", () => {
     // New native window is 1600x900, still awaiting the new source dimensions.
     f.dimensions(1600,900,"settings");
     await vi.advanceTimersByTimeAsync(2000);
-    expect(f.state.captureSize.width).toBe(1920);
+    expect(f.state.ceiling.width).toBe(1600);
     // Chromium adapts capture and output before the first new-source report is observed.
     f.dimensions(480,270);
     f.sample.limitation=limitation;
     await vi.advanceTimersByTimeAsync(4000);
-    const size={...f.state.captureSize};
+    const size={...f.state.ceiling};
     // The source stays adapted after the limitation clears, with ample sustained capacity.
     f.sample.limitation="none";
     await vi.advanceTimersByTimeAsync(700_000);
     const pulses=f.pulses();
     f.stop();
-    expect({width:size.width,recoverable:pulses>0}).toEqual({width:1920,recoverable:true});
+    expect({width:size.width,recoverable:pulses>0}).toEqual({width:1600,recoverable:true});
   });
 
   it.each(["stats","constraints"])("cannot rearm timers after closing during pending %s", async kind => {
@@ -1382,7 +1126,6 @@ describe("round five adversarial pending provenance", () => {
     await vi.advanceTimersByTimeAsync(700_000);
     expect(f.pc.sendParams.length).toBe(count);
     expect(vi.getTimerCount()).toBe(0);
-    expect(f.state.captureChanges).toBe(0);
   });
 });
 
@@ -1434,142 +1177,275 @@ describe("independent round-three resource and lifecycle controls",()=> {
 });
 
 
-describe("surface proof sequence invariants", () => {
-  it("preserves provenance, bounded proof, current-target guards and stop across 3,072 seeded sequences", async () => {
-    // xorshift32. Keep the seed and event trace in every failure for exact replay.
-    let seed = 0x16806;
-    const random = (n: number) => {
-      seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5;
-      return (seed >>> 0) % n;
-    };
-    let now = 0;
-    vi.spyOn(performance, "now").mockImplementation(() => now);
-    const widths = [1280, 1600, 1920, 2560, 3840];
-    const coverage = new Set<string>(), exercised = new Set<string>();
-    for (let sequence = 0; sequence < 3072; sequence++) {
-      const initialSeed = seed >>> 0, trace: string[] = [];
-      const f = await makeSurfaceReview(true);
-      let physical = 1920, identity = 0, stopped = false;
-      const check = (ok: boolean, invariant: string) => {
-        if (!ok) throw new Error(`${invariant}; sequence=${sequence}, seed=${initialSeed}, events=${trace.join(",")}`);
-      };
-      const clean = () => { f.dimensions(physical, physical * 9 / 16); f.sample.limitation = "none"; };
-      const switchTo = (width: number) => {
-        if (f.state.phase) exercised.add("switch-during-pulse");
-        else if (f.state.guard.tracking) exercised.add("switch-during-outcome");
-        physical = width;
-        if (random(2)) { f.settings.deviceId = `surface-${++identity}`; exercised.add("surface-switch"); }
-        else { f.sample.sourceId = `source-${++identity}`; exercised.add("track-switch"); }
-        clean();
-      };
-      const poll = async (elapsed = 2000) => {
-        const before = { ...f.state.captureSize };
-        now += elapsed;
-        vi.advanceTimersByTime(elapsed); // Keep pulse deadlines on the same clock as stats.
-        await Promise.resolve(); await Promise.resolve(); // Drain any timer-triggered stats response.
-        // Avoid reading the same counters twice. Retry only if a restore fenced
-        // that timer poll, or an immediate event needs a fresh settings read.
-        if (elapsed === 0 || f.state.adaptationSent?.at !== now) await f.state.headroom();
-        await Promise.resolve();
-        // I1: a changed target must describe the actual physical surface in our
-        // independent oracle, never a Chromium/encoder/application adapted size.
-        const target = f.state.captureSize;
-        check(target.width === before.width || target.width === physical, "I1: adapted target");
-        check(target.height === target.width * 9 / 16, "I1: mixed dimensions");
-      };
-      const stop = async () => {
-        f.publisher.close(); stopped = true;
-        await f.state.headroom();
-        // I4 checks actual publisher timers and pending proof/outcome/request state.
-        check(vi.getTimerCount() === 0 && f.state.timer === null && f.state.phaseTimer === null &&
-          f.state.sampleTimer === null && f.state.phase === null && f.state.polling === null &&
-          f.state.surfaceObservation === null && f.state.captureChanges === 0 && !f.state.guard.tracking, `I4: pending after stop (timers=${vi.getTimerCount()}, phase=${f.state.phase}, poll=${f.state.polling !== null}, proof=${f.state.surfaceObservation !== null}, changes=${f.state.captureChanges}, tracking=${f.state.guard.tracking})`);
-      };
-      for (let event = 0; event < 16; event++) {
-        const kind = random(13);
-        const name = ["resize", "switch-larger", "switch-smaller", "switch-equal", "bandwidth", "cpu", "recovery",
-          "app-constraint", "pulse", "outcome", "settings-first", "stats-first", "stop"][kind]!;
-        trace.push(name); coverage.add(name);
-        if (kind === 0) { physical = widths[random(widths.length)]!; clean(); }
-        else if (kind >= 1 && kind <= 3) {
-          const index = widths.indexOf(physical);
-          switchTo(kind === 1 ? widths[Math.min(widths.length - 1, index + 1)]! :
-            kind === 2 ? widths[Math.max(0, index - 1)]! : physical);
-        } else if (kind === 4 || kind === 5 || kind === 8) {
-          f.dimensions(kind === 8 ? 480 : physical / 2, kind === 8 ? 270 : physical * 9 / 32);
-          f.sample.limitation = kind === 5 ? "cpu" : "bandwidth";
-          if (kind === 8) {
-            const before = f.pulses();
-            for (let i = 0; i < 4; i++) { await poll(); if (f.state.phase) break; }
-            if (f.pulses() > before) exercised.add("issued-pulse");
-            // Leave some pulses active for the next event; expire others into
-            // a real outcome through the independent deadline.
-            if (random(2)) { now += 1000; await vi.advanceTimersByTimeAsync(1000); }
-          }
-        } else if (kind === 6) clean();
-        else if (kind === 7) {
-          f.setConstraint(async () => f.dimensions(Math.min(physical, 1280), Math.min(physical, 1280) * 9 / 16));
-          await f.publisher.setPreset("game");
-          f.setConstraint(async () => {});
-        } else if (kind === 9) {
-          // Allow a real outcome to finish and consume the fuse if no gain held.
-          f.sample.limitation = "none";
-          await poll(18_000);
-        } else if (kind === 10 || kind === 11) {
-          physical = widths[random(widths.length)]!;
-          f.sample.limitation = "none";
-          f.dimensions(physical, physical * 9 / 16, kind === 10 ? "settings" : "source");
-          await poll();
-          clean();
-        } else if (kind === 12 && event >= 12) {
-          // A real pre-stop request completes after close; it cannot rearm anything.
-          const report = await f.pc.getStats();
-          let finish!: (stats: typeof report) => void;
-          f.pc.getStats.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
-          const pending = f.state.headroom();
-          let finishConstraints: (() => void) | undefined;
-          let changing: Promise<void> | undefined;
-          if (random(2)) {
-            f.setConstraint(() => new Promise(resolve => { finishConstraints = resolve; }));
-            changing = f.publisher.setPreset("game");
-            exercised.add("stop-with-pending-constraints");
-          }
-          await stop(); finish(report); finishConstraints?.(); await pending; await changing;
-          const sent = f.pc.sendParams.length;
-          now += 700_000; await vi.advanceTimersByTimeAsync(20_000);
-          check(f.pc.sendParams.length === sent && vi.getTimerCount() === 0, "I4: late completion");
-          break;
-        }
-        await poll((kind >= 1 && kind <= 3) || kind === 8 ? 0 : 2000);
-      }
-      if (!stopped) {
-        // I2 premise: a NEW independent observation of this genuine surface,
-        // outside any adaptation of this surface. Exercise equal-size switches
-        // as well as switches to smaller/larger surfaces during old outcomes.
-        trace.push("clean-proof"); switchTo(physical);
-        const pulses = f.pulses();
-        await poll(0); await poll();
-        // Proof requires 2 s of stable clean settings plus corroborating stats:
-        // at a 2 s polling cadence the bound from the physical event is <=4 s.
-        check(f.state.captureSize.width === physical, "I2: switched proof exceeded 4 s");
-        // A fresh ordinary resize has the same bound, without an identity reset.
-        physical = widths[(widths.indexOf(physical) + 1) % widths.length]!;
-        trace.push("clean-resize"); clean(); await poll(); await poll();
-        check(f.state.captureSize.width === physical, "I2: resized proof exceeded 4 s");
-        for (let i = 0; i < 6; i++) {
-          await poll();
-          check(f.state.captureSize.width === physical, "I2: lost clean proof");
-        }
-        const guard = f.state.guard as unknown as { unsuccessful: number };
-        // I3: native output cannot trigger attempts or consume a fuse priced at
-        // a previous surface. This checks the real guard/publisher path.
-        check(f.pulses() === pulses && guard.unsuccessful === 0 && !f.state.guard.tracking, "I3: stale-target attempt");
-        await stop();
-      }
-      Peer.all = []; // Do not retain 3,072 closed mock transports and call histories.
+describe("asymmetric ceiling behavior", () => {
+  it.each(["together", "settings-first", "source-first", "pending-stats"])("bounds a genuine shrink with %s observations (round four)", async order => {
+    const f = await makeSurfaceReview();
+    const guard = f.state.guard;
+    if (order === "pending-stats") {
+      const report = await f.pc.getStats();
+      let finish!: (stats: typeof report) => void;
+      f.pc.getStats.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+      const pending = f.state.headroom();
+      f.dimensions(1280, 700, "settings");
+      finish(report); await pending;
+    } else {
+      f.dimensions(1280, 700, order === "source-first" ? "source" : order === "settings-first" ? "settings" : "all");
+      await vi.advanceTimersByTimeAsync(2000);
     }
-    expect(coverage.size).toBe(13);
-    expect([...exercised].sort()).toEqual(["issued-pulse", "stop-with-pending-constraints", "surface-switch",
-      "switch-during-outcome", "switch-during-pulse", "track-switch"]);
+    f.dimensions(1280, 700);
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(f.state.ceiling).toEqual({ width: 1920, height: 1080, known: true });
+    expect(f.state.guard).toBe(guard);
+    expect(f.pulses()).toBe(2);
+    f.stop();
   });
+
+  it.each(["stats-first", "settings-first", "pending-stats"])("resets from one synchronous identity snapshot with %s lag (round four)", async order => {
+    const f = await makeSurfaceReview();
+    const old = f.state.guard;
+    if (order === "stats-first") {
+      f.sample.sourceId = "new-source"; f.dimensions(1280, 700, "source");
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(f.state.guard).toBe(old);
+      expect(f.state.ceiling.width).toBe(1920); // Settings still belong to the old identity.
+    }
+    let finish: (() => void) | undefined, pending: Promise<void> | undefined;
+    if (order === "pending-stats") {
+      const report = await f.pc.getStats();
+      f.pc.getStats.mockImplementationOnce(() => new Promise(resolve => { finish = () => resolve(report); }));
+      pending = f.state.headroom();
+    }
+    f.settings.deviceId = "two"; f.dimensions(1280, 700, "settings");
+    finish?.(); await pending;
+    await f.state.headroom();
+    expect(f.state.ceiling).toEqual({ width: 1280, height: 700, known: true });
+    expect(f.state.guard).not.toBe(old);
+    f.dimensions(1280, 700); f.sample.sourceId = "new-source";
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(f.pulses()).toBe(0); f.stop();
+  });
+
+  it("takes per-axis maxima across aspect changes without resetting the fuse", async () => {
+    const f = await makeSurfaceReview();
+    const guard = f.state.guard;
+    f.dimensions(1600, 1200, "settings");
+    await (f.publisher as unknown as { applyParameters(cap: number): Promise<void> }).applyParameters(8_000_000);
+    expect(f.state.ceiling).toEqual({ width: 1920, height: 1200, known: true });
+    expect(f.state.captureTarget()).toEqual({ width: 1920, height: 1080 });
+    expect(f.state.guard).toBe(guard); f.stop();
+  });
+
+  it("bounds repeated successful-but-still-undersized outcomes by seven pulses per ten minutes", () => {
+    const guard = new StuckCaptureGuard(), pulses: number[] = [];
+    let grownUntil = 0;
+    for (let now = 0; now <= 1_800_000; now += 250) {
+      const grown = now < grownUntil;
+      if (guard.observe(now, {
+        width: grown ? 1280 : 480, height: grown ? 700 : 270, sourceWidth: 1280, sourceHeight: 700,
+        targetWidth: 1920, targetHeight: 1050, captureWidth: 1920, captureHeight: 1050,
+        fps: 20, available: 13_000_000, targetBitrate: 8_000_000, bitrate: 80_000,
+        limitation: "none", framesEncoded: 1 + now / 50,
+      })) { pulses.push(now); grownUntil = now + 12_500; }
+      expect(pulses.filter(at => at > now - 600_000).length).toBeLessThanOrEqual(7);
+    }
+    expect(pulses.filter(at => at < 600_000)).toHaveLength(7);
+  });
+
+  it.each(["before", "after"])("retains delayed aspect-preserving cap frames %s resolution and retries after relaxing (round seven)", async timing => {
+    // Seed the identity at its non-16:9 native size, rather than first observing 1080p.
+    const f = await makeSurfaceReview();
+    f.settings.deviceId = "non-16:9"; f.dimensions(1920, 1050); await f.state.headroom();
+    const stats = f.pc.getStats.getMockImplementation()!;
+    let finish: (() => void) | undefined;
+    f.setConstraint(() => {
+      f.dimensions(1280, 720, "settings");
+      setTimeout(() => f.dimensions(1280, 700), 50);
+      return timing === "before" ? new Promise(resolve => { finish = resolve; }) : Promise.resolve();
+    });
+    const capped = f.publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
+    await vi.advanceTimersByTimeAsync(50); finish?.(); await capped;
+    Peer.all.at(-1)!.getStats.mockImplementation(stats);
+    f.setConstraint(async () => {});
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(f.state.ceiling).toEqual({ width: 1920, height: 1050, known: true });
+    expect(f.state.captureTarget()).toEqual({ width: 1280, height: 720 });
+    const relaxing = f.publisher.recover({ share: "s", codec: "vp9", width: 1920, height: 1080, fps: 60 });
+    expect(f.state.captureTarget()).toEqual({ width: 1920, height: 1050 }); // No clean tail or stats needed.
+    await relaxing;
+    const pc = Peer.all.at(-1)!; pc.getStats.mockImplementation(stats);
+    await vi.advanceTimersByTimeAsync(700_000);
+    expect(pc.sendParams.filter(p => p.degradationPreference === "maintain-resolution").length).toBeGreaterThan(0);
+    f.stop();
+  });
+
+  it.each(["none", "bandwidth", "cpu"])("retains capture-stage scaling under limitation %s and bounds retrying (round seven)", async limitation => {
+    const f = await makeSurfaceReview();
+    f.dimensions(480, 270); f.sample.limitation = limitation;
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(f.state.ceiling).toEqual({ width: 1920, height: 1080, known: true });
+    expect(f.pulses()).toBe(limitation === "cpu" ? 0 : 2);
+    f.stop();
+  });
+
+  it("seeds even an already-reduced switched identity without borrowing old dimensions", async () => {
+    const f = await makeSurfaceReview();
+    f.settings.deviceId = "two"; f.dimensions(480, 270, "settings");
+    await f.state.headroom();
+    expect(f.state.captureTarget()).toEqual({ width: 480, height: 270 });
+    f.dimensions(1600, 900, "settings"); await f.state.headroom();
+    f.dimensions(480, 270); await vi.advanceTimersByTimeAsync(10_000);
+    expect(f.state.captureTarget()).toEqual({ width: 1600, height: 900 });
+    expect(f.pulses()).toBe(1); f.stop();
+  });
+});
+
+// No clean tails: check the oracle after every partial transition and every poll.
+describe("asymmetric sequence invariants", () => {
+  it("checks J1–J4 at every step of 3,072 seeded asynchronous sequences", async () => {
+    let seed = 0x16807;
+    const random = (n: number) => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) % n; };
+    const sizes = [[1920, 1050], [1280, 700], [1600, 900], [900, 1200], [3840, 2160]] as const;
+    const coverage = new Set<string>();
+    const originalSpec = PRESETS.game, originalObserve = StuckCaptureGuard.prototype.observe;
+    let now = 0, record: (guard: StuckCaptureGuard, sample: Parameters<StuckCaptureGuard["observe"]>[1], pulse: boolean) => void = () => {};
+    vi.spyOn(performance, "now").mockImplementation(() => now);
+    vi.spyOn(StuckCaptureGuard.prototype, "observe").mockImplementation(function (this: StuckCaptureGuard, at, sample) {
+      const pulse = originalObserve.call(this, at, sample); record(this, sample, pulse); return pulse;
+    });
+    try {
+      for (let sequence = 0; sequence < 3072; sequence++) {
+        const initialSeed = seed >>> 0, trace: string[] = [];
+        let identity = "", width = 0, height = 0, generation = 0, stopped = false;
+        const check = (ok: boolean, name: string) => {
+          if (!ok) throw new Error(`${name}; sequence=${sequence}, seed=${initialSeed}, events=${trace.join(",")}`);
+        };
+        // Independent oracle consumes only synchronous track snapshots, including
+        // reads during async constraints. It never consults publisher internals.
+        const f = await makeSurfaceReview(true, settings => {
+          const key = `${settings.deviceId}/${settings.displaySurface}`;
+          if (key !== identity) { identity = key; width = 0; height = 0; }
+          width = Math.max(width, settings.width!); height = Math.max(height, settings.height!);
+        });
+        const pulses: { at: number; guard: StuckCaptureGuard }[] = [];
+        let liveSpec = PRESETS.game;
+        const target = () => ({ width: Math.min(width, liveSpec.width), height: Math.min(height, liveSpec.height) });
+        const assertState = () => {
+          const expected = target(), actual = f.state.captureTarget();
+          check(actual.width >= expected.width && actual.height >= expected.height, "J1: underestimated target");
+          check(actual.width === expected.width && actual.height === expected.height &&
+            f.state.ceiling.width === width && f.state.ceiling.height === height, "J2/R2: live clamp or identity reset");
+          const window = pulses.filter(p => p.at > now - 600_000);
+          check(window.length <= 100, "J3: reset-inclusive rate");
+          for (const guard of new Set(window.map(p => p.guard))) check(window.filter(p => p.guard === guard).length <= 7, "J3: guard rate");
+          if (stopped) check(vi.getTimerCount() === 0 && f.state.timer === null && f.state.phaseTimer === null &&
+            f.state.sampleTimer === null && f.state.phase === null && f.state.polling === null && !f.state.guard.tracking, "J4: pending after stop");
+        };
+        record = (guard, sample, pulse) => {
+          check(sample.targetWidth === target().width && sample.targetHeight === target().height, "J1/J2: guard received stale target");
+          if (pulse) pulses.push({ at: now, guard });
+        };
+        const poll = async (elapsed = 2000) => {
+          // Substeps keep timers, frame progress and the oracle on the same clock.
+          for (let remaining = elapsed; remaining > 0;) {
+            const step = Math.min(250, remaining); remaining -= step; now += step;
+            await vi.advanceTimersByTimeAsync(step); assertState();
+          }
+          await f.state.headroom(); assertState();
+        };
+        const switchSettings = async (w: number, h: number) => {
+          if (f.state.phase) coverage.add("switch-mid-pulse");
+          else if (f.state.guard.tracking) coverage.add("switch-mid-outcome");
+          f.settings.deviceId = `identity-${++generation}`; f.dimensions(w, h, "settings"); await poll(0);
+        };
+        const constrain = async (timing: "before" | "after") => {
+          if (f.state.phase) coverage.add("cap-mid-pulse");
+          liveSpec = PRESETS.game = { ...originalSpec, width: 1280, height: 720 };
+          let finish!: () => void;
+          f.setConstraint(() => {
+            f.dimensions(1280, 720, "settings");
+            setTimeout(() => f.dimensions(1280, 700), 50);
+            return timing === "before" ? new Promise(resolve => { finish = resolve; }) : Promise.resolve();
+          });
+          const changing = f.publisher.setPreset("game");
+          await poll(0); await poll(50); if (timing === "before") finish(); await changing;
+          f.setConstraint(async () => {}); assertState();
+        };
+        const stop = async () => { f.publisher.close(); stopped = true; await f.state.headroom(); assertState(); };
+        if (sequence % 64 === 0) {
+          trace.push("uncorroborated-settings"); coverage.add("uncorroborated-settings");
+          f.dimensions(1280, 700, "settings"); f.dimensions(480, 270, "output");
+          for (let step = 0; step < 50; step++) await poll();
+          check(pulses.length === 2, "J1: uncorroborated settings must not block recovery");
+          f.dimensions(1920, 1080);
+        }
+        // Each sequence starts at a different point in this scenario. Together
+        // they guarantee active pulse/switch/cap paths as well as random ordering.
+        for (let event = 0; event < 18; event++) {
+          const kind = event < 6 ? (sequence + event) % 6 : random(12);
+          const name = ["scale-none", "switch-stats-first", "switch-settings-first", "cap-before", "cap-after", "relax",
+            "resize", "cpu", "pulse", "pending-switch", "preset", "stop"][kind]!;
+          trace.push(name); coverage.add(name);
+          if (kind === 0 || kind === 8) {
+            f.dimensions(480, 270); f.sample.limitation = "none";
+            await poll(kind === 8 ? 8000 : 2000);
+          } else if (kind === 1) {
+            const [w, h] = sizes[random(sizes.length)]!;
+            f.sample.sourceId = `source-${generation + 1}`; f.dimensions(w, h, "source");
+            await poll(); // New stats, lagging old settings; no identity change yet.
+            await switchSettings(w, h);
+          } else if (kind === 2) {
+            const [w, h] = sizes[random(sizes.length)]!;
+            await switchSettings(w, h); await poll(); // Old-source dimensions arrive after the switch.
+            f.dimensions(w, h, "source"); await poll(0);
+          } else if (kind === 3 || kind === 4) await constrain(kind === 3 ? "before" : "after");
+          else if (kind === 5) {
+            liveSpec = PRESETS.game = originalSpec;
+            // J2 is asserted synchronously, before a new poll or constraint result.
+            assertState(); await f.publisher.setPreset("game"); assertState();
+          } else if (kind === 6) {
+            const [w, h] = sizes[random(sizes.length)]!; f.dimensions(w, h, "settings"); await poll();
+          } else if (kind === 7) { f.dimensions(480, 270); f.sample.limitation = "cpu"; await poll(); }
+          else if (kind === 9) {
+            const report = await f.pc.getStats();
+            let finish!: (stats: typeof report) => void;
+            f.pc.getStats.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+            const pending = f.state.headroom();
+            await switchSettings(1280, 700); finish(report); await pending; assertState();
+          } else if (kind === 10) {
+            liveSpec = PRESETS.saver; await f.publisher.setPreset("saver"); assertState();
+            liveSpec = PRESETS.game; await f.publisher.setPreset("game"); assertState();
+          } else if (kind === 11) {
+            const report = await f.pc.getStats();
+            let finish!: (stats: typeof report) => void, resolveConstraints!: () => void;
+            f.pc.getStats.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+            const pending = f.state.headroom();
+            f.setConstraint(() => new Promise(resolve => { resolveConstraints = resolve; }));
+            const changing = f.publisher.setPreset("game");
+            await stop(); const sent = f.pc.sendParams.length;
+            finish(report); resolveConstraints(); await pending; await changing;
+            await poll(2000); check(f.pc.sendParams.length === sent, "J4: late sender write"); break;
+          }
+          assertState();
+        }
+        if (!stopped && sequence % 64 === 0) {
+          // A permanently overestimated target must satisfy the sharper two-
+          // failure bound in EVERY sliding ten-minute window, including expiry.
+          coverage.add("failure-expiry"); trace.push("failure-expiry");
+          liveSpec = PRESETS.game = originalSpec;
+          await switchSettings(1920, 1050); f.dimensions(480, 270); f.sample.limitation = "none";
+          const start = now, guard = f.state.guard;
+          for (let step = 0; step < 700; step++) {
+            await poll(2000);
+            const window = pulses.filter(p => p.guard === guard && p.at > now - 600_000);
+            check(window.length <= 2, "J3: unsuccessful pulse rate");
+          }
+          check(pulses.filter(p => p.guard === guard && p.at > start).length >= 4, "J3: expiry must retry");
+        }
+        if (!stopped) await stop();
+        record = () => {}; PRESETS.game = originalSpec; Peer.all = [];
+      }
+    } finally { PRESETS.game = originalSpec; }
+    for (const event of ["scale-none", "switch-stats-first", "switch-settings-first", "cap-before", "cap-after", "relax", "resize", "cpu",
+      "pulse", "pending-switch", "preset", "stop", "switch-mid-pulse", "switch-mid-outcome", "cap-mid-pulse", "failure-expiry", "uncorroborated-settings"]) expect(coverage.has(event), event).toBe(true);
+  }, 60_000);
 });

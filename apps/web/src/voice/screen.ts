@@ -133,7 +133,7 @@ export class StuckCaptureGuard {
     width: number; height: number; sourceWidth: number; sourceHeight: number;
     targetWidth: number; targetHeight: number; fps: number;
     available: number; targetBitrate: number; bitrate: number; limitation: string;
-    /** Actual captured surface size before Chromium's capture adaptation starts. */
+    /** Largest settings dimensions observed for this capture identity. */
     captureWidth?: number; captureHeight?: number;
     quality?: EncoderQuality;
     framesEncoded?: number;
@@ -438,30 +438,23 @@ export class ScreenPublisher {
   private parameters: Promise<void> = Promise.resolve();
   private adaptationSent: { bytes: number; at: number } | null = null;
   private surfaceKey: (string | undefined)[] = [];
-  private surfaceObservation: { width?: number; height?: number; since: number; clean: boolean } | null = null;
-  private captureChanges = 0;
-  private readonly captureSize: { width: number; height: number; known: boolean };
+  private readonly ceiling: { width: number; height: number; known: boolean };
 
   constructor(private readonly params: PublishParams) {
     this.preset = params.preset;
-    const settings = params.track.getSettings?.(), spec = this.spec();
-    const width = settings?.width, height = settings?.height;
-    this.surfaceKey = [settings?.deviceId, settings?.displaySurface];
-    this.captureSize = {
-      width: width ?? spec.width, height: height ?? spec.height,
-      known: width !== undefined && height !== undefined && Number.isFinite(width * height) && width > 0 && height > 0,
-    };
+    const spec = this.spec();
+    this.ceiling = { width: spec.width, height: spec.height, known: false };
+    this.refreshSurface();
   }
 
   async start(): Promise<void> {
     const run = ++this.run;
     const { track, iceServers } = this.params, recovery = this.recovery;
-    if (recovery) await this.changeCapture(() => track.applyConstraints({ width: { max: recovery.width }, height: { max: recovery.height }, frameRate: { max: recovery.fps } }));
+    this.refreshSurface();
+    if (recovery) await track.applyConstraints({ width: { max: recovery.width }, height: { max: recovery.height }, frameRate: { max: recovery.fps } });
     if (this.closed || run !== this.run) return;
     const pc = new RTCPeerConnection(rtcConfig(iceServers));
     this.pc = pc;
-    // Media-source ids belong to the transport; replacement is not a surface switch.
-    this.surfaceKey = this.surfaceKey.slice(0, 2);
     this.stopWatching = watchState(pc, s => this.params.state(s), () => this.pc === pc);
     const spec = this.spec();
     const transceiver = pc.addTransceiver(track, {
@@ -482,6 +475,7 @@ export class ScreenPublisher {
     await pc.setRemoteDescription({ type: "answer", sdp: answer });
     if (this.closed || this.pc !== pc) return;
     // The latest preset: `setPreset` may have run while this negotiated.
+    this.refreshSurface();
     await this.applyParameters(this.spec().maxBitrate);
     if (this.closed || this.pc !== pc) return;
     this.timer = setInterval(() => void this.headroom(), HEADROOM_INTERVAL_MS);
@@ -490,17 +484,19 @@ export class ScreenPublisher {
   /** Changes the preset while sharing, with no renegotiation. */
   async setPreset(preset: ScreenPreset): Promise<void> {
     if (this.closed) return;
+    this.refreshSurface();
     if (preset !== this.preset) {
       this.cancelPhase();
       this.guard = new StuckCaptureGuard();
       this.preset = preset;
     }
     const revision = this.revision;
-    await this.changeCapture(() => applyCapturePreset(this.params.track, preset));
+    await applyCapturePreset(this.params.track, preset);
     if (this.closed || revision !== this.revision) return;
     const recovery = this.recovery;
-    if (recovery) await this.changeCapture(() => this.params.track.applyConstraints({ width: { max: recovery.width }, height: { max: recovery.height }, frameRate: { max: recovery.fps } }));
+    if (recovery) await this.params.track.applyConstraints({ width: { max: recovery.width }, height: { max: recovery.height }, frameRate: { max: recovery.fps } });
     if (this.closed || revision !== this.revision) return;
+    this.refreshSurface();
     await this.applyParameters(this.spec().maxBitrate);
     if (this.closed || revision !== this.revision) return;
     await this.headroom();
@@ -538,7 +534,9 @@ export class ScreenPublisher {
 
   private async headroom(): Promise<void> {
     const pc = this.pc;
-    if (!pc || this.closed || this.polling === pc) return;
+    if (!pc || this.closed) return;
+    this.refreshSurface();
+    if (this.polling === pc) return;
     this.polling = pc;
     try { await this.sampleHeadroom(pc); }
     finally { if (this.polling === pc) this.polling = null; }
@@ -549,9 +547,12 @@ export class ScreenPublisher {
     let available: number | undefined, guardAvailable: number | undefined, codec: string | undefined;
     let out: OutboundVideo | undefined;
     let source: { width?: number; height?: number; framesPerSecond?: number } | undefined;
+    let settings: MediaTrackSettings | undefined;
     try {
       const stats = await pc.getStats();
-      if (this.closed || this.pc !== pc || revision !== this.revision) return;
+      if (this.closed || this.pc !== pc) return;
+      settings = this.refreshSurface();
+      if (revision !== this.revision) return;
       stats.forEach(s => {
         if (s.type === "outbound-rtp" && s.kind === "video") out = s as OutboundVideo;
       });
@@ -567,14 +568,13 @@ export class ScreenPublisher {
     const bitrate = previous && at > previous.at && at - previous.at <= HEADROOM_INTERVAL_MS * 2.25 ? Math.max(0, (bytes - previous.bytes) * 8000 / (at - previous.at)) : NaN;
     this.adaptationSent = out ? { bytes, at } : null;
     if (spec.degradation === "maintain-framerate") {
-      const settings = this.params.track.getSettings?.();
-      this.refreshSurface(settings, source, out);
+      const captureTarget = this.captureTarget();
       if (this.guard.observe(performance.now(), {
         width: out?.frameWidth ?? 0, height: out?.frameHeight ?? 0,
         sourceWidth: source?.width ?? settings?.width ?? 0, sourceHeight: source?.height ?? settings?.height ?? 0,
-        targetWidth: Math.min(spec.width, this.captureSize.width), targetHeight: Math.min(spec.height, this.captureSize.height),
+        targetWidth: captureTarget.width, targetHeight: captureTarget.height,
         fps: Math.min(spec.fps, source?.framesPerSecond ?? settings?.frameRate ?? out?.framesPerSecond ?? 0),
-        captureWidth: this.captureSize.known ? this.captureSize.width : 0, captureHeight: this.captureSize.known ? this.captureSize.height : 0,
+        captureWidth: this.ceiling.known ? this.ceiling.width : 0, captureHeight: this.ceiling.known ? this.ceiling.height : 0,
         ...(out?.qpSum !== undefined && out.framesEncoded !== undefined && codec ? { quality: {
           id: out.id, encoder: out.encoderImplementation, codec, sum: out.qpSum, frames: out.framesEncoded, at: out.timestamp, width: out.frameWidth ?? 0, height: out.frameHeight ?? 0,
         } } : {}),
@@ -605,57 +605,45 @@ export class ScreenPublisher {
   }
 
   /**
-   * Surface proof rules:
-   * - Identity changes cancel the old surface's pulse/outcome and reset its history
-   *   BEFORE judging the new surface's evidence. Identity alone proves no size.
-   * - One settings observation owns its provenance and stability clock. Only clean
-   *   settings stable for two seconds, corroborated by source stats, prove a size.
-   * - Adaptation of THIS surface (CPU/bandwidth, pulse or outcome) contaminates that
-   *   observation, even after its limitation clears. A new clean settings size or
-   *   surface starts fresh; rejected evidence cannot poison that later observation.
-   * - Application writes discard pending proof, retain the proven size, and mark
-   *   their resulting settings as unproven. A cap is never a physical resize.
-   * - Guard, fuse and expiry always use the latest proven size under the live spec.
+   * Asymmetric target rules:
+   * R1. The ceiling only grows per axis within an identity. Per-axis maxima keep
+   *     both bounds across aspect changes; an overestimate is safer than a lost
+   *     recovery target. Caps clamp the live target, never the ceiling.
+   * R2. Identity is this publisher's track plus getSettings().deviceId and
+   *     displaySurface. A new track gets a new publisher. A changed known field
+   *     cancels pulses/outcomes and resets history BEFORE seeding the ceiling
+   *     from that same synchronous settings snapshot. Stats (including source
+   *     ids) never seed or reset it: they can describe the previous surface.
+   *     Unreported switches are indistinguishable and retain the higher ceiling.
+   * R3. Shrinks can overestimate. Two failed pulses fuse until ten minutes of
+   *     suppression plus healthy target capacity; expiry retries. No size proof.
+   * R4. Guard-only eligibility, QP escape, independent deadline, fuse and expiry
+   *     are unchanged; expiry capacity uses the live clamped target too.
    */
-  private async changeCapture(apply: () => Promise<void>): Promise<void> {
-    this.captureChanges++;
-    this.surfaceObservation = null;
-    try { await apply(); }
-    finally {
-      this.captureChanges = Math.max(0, this.captureChanges - 1);
-      if (!this.closed) {
-        const settings = this.params.track.getSettings?.();
-        this.surfaceObservation = { width: settings?.width, height: settings?.height, since: performance.now(), clean: false };
-      }
-    }
-  }
-
-  private refreshSurface(settings: MediaTrackSettings | undefined, source: { width?: number; height?: number } | undefined, out: OutboundVideo | undefined): void {
-    const key = [settings?.deviceId, settings?.displaySurface, out?.mediaSourceId];
+  private refreshSurface(): MediaTrackSettings | undefined {
+    const settings = this.params.track.getSettings?.();
+    const key = [settings?.deviceId, settings?.displaySurface];
     const switched = key.some((value, i) => value !== undefined && this.surfaceKey[i] !== undefined && value !== this.surfaceKey[i]);
     this.surfaceKey = key.map((value, i) => value ?? this.surfaceKey[i]);
     if (switched) {
       this.cancelPhase(); this.guard = new StuckCaptureGuard(); this.adaptationSent = null;
-      this.surfaceObservation = null;
+      this.ceiling.known = false;
       void this.applyParameters(this.desired || this.spec().maxBitrate);
     }
-    const now = performance.now(), width = settings?.width, height = settings?.height;
-    const clean = !this.captureChanges && !this.phase && !this.guard.tracking && out?.qualityLimitationReason === "none";
-    let observation = this.surfaceObservation;
-    if (!observation || observation.width !== width || observation.height !== height) {
-      observation = this.surfaceObservation = { width, height, since: now, clean };
+    const width = settings?.width, height = settings?.height;
+    if (width !== undefined && height !== undefined && Number.isFinite(width * height) && width > 0 && height > 0) {
+      this.ceiling.width = this.ceiling.known ? Math.max(this.ceiling.width, width) : width;
+      this.ceiling.height = this.ceiling.known ? Math.max(this.ceiling.height, height) : height;
+      this.ceiling.known = true;
+    } else if (switched) {
+      this.ceiling.width = this.spec().width; this.ceiling.height = this.spec().height;
     }
-    // Keep the dimensions when invalidating proof: unchanged adapted/capped settings
-    // must not become a fresh resize merely because their limitation later clears.
-    observation.clean &&= clean;
-    if (!observation.clean || width === undefined || height === undefined ||
-      !Number.isFinite(width * height) || width <= 0 || height <= 0 ||
-      source?.width !== width || source.height !== height ||
-      width < (out?.frameWidth ?? Infinity) || height < (out?.frameHeight ?? Infinity)) return;
-    if (now - observation.since < 2_000 ||
-      (this.captureSize.known && width === this.captureSize.width && height === this.captureSize.height)) return;
-    this.captureSize.width = width; this.captureSize.height = height; this.captureSize.known = true;
-    this.guard = new StuckCaptureGuard(); this.adaptationSent = null;
+    return settings;
+  }
+
+  private captureTarget(): { width: number; height: number } {
+    const spec = this.spec();
+    return { width: Math.min(spec.width, this.ceiling.width), height: Math.min(spec.height, this.ceiling.height) };
   }
 
   private cancelPhase(): void {
@@ -689,6 +677,7 @@ export class ScreenPublisher {
       if (!sender || !alive()) return;
       const spec = this.spec();
       const encoding: RTCRtpEncodingParameters = { ...this.scale(), maxBitrate, maxFramerate: spec.fps, priority: "low", networkPriority: "low" };
+      if (!alive()) return; // A synchronous settings read may have switched surfaces.
       const fresh = (): RTCRtpSendParameters => {
         const params = sender.getParameters();
         params.encodings = params.encodings?.length ? params.encodings.map((e, i) => (i === 0 ? { ...e, ...encoding } : e)) : [encoding];
@@ -716,7 +705,7 @@ export class ScreenPublisher {
   }
 
   private scale(): { scaleResolutionDownBy: number } {
-    const settings = this.params.track.getSettings?.() ?? {};
+    const settings = this.refreshSurface() ?? {};
     const recovery = this.recovery ? Math.max(1, (settings.width ?? this.recovery.width) / this.recovery.width, (settings.height ?? this.recovery.height) / this.recovery.height) : 1;
     return { scaleResolutionDownBy: recovery };
   }
@@ -739,8 +728,6 @@ export class ScreenPublisher {
   close(): void {
     this.closed = true;
     this.cancelPhase();
-    this.surfaceObservation = null;
-    this.captureChanges = 0;
     this.guard = new StuckCaptureGuard();
     this.adaptationSent = null;
     this.polling = null;

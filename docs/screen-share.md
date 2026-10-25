@@ -355,14 +355,14 @@ capture adaptation with a one-second `maintain-resolution` pulse, then restore t
 current spec using fresh sender parameters. It requires six continuous seconds of
 undersize, no CPU limitation, and both the encoder target and 70% of a fresh outgoing
 estimate above `larger pixels × max(15, source fps) × bpp × 1.5` bits/s. The target,
-cadence and cap come from the resolved spec, actual captured surface and effective
+cadence and cap come from the resolved spec, observed settings ceiling and effective
 codec-recovery limits. The larger step is capped at that target and otherwise four
 times the current pixels, with a 720p floor. The bpp budget is at least 0.04 and grows
 with measured payload demand, leaving genuinely expensive content alone.
 
 A low-QP escape handles a stalled encoder spending most of its bitrate target at a
 small size. It requires output below half the effective target pixels, known evidence
-of a larger captured surface before adaptation, and at least six seconds / 60 encoded
+of larger settings within this capture identity, and at least six seconds / 60 encoded
 frames of consecutive positive `qpSum` / `framesEncoded` deltas. H.264 uses QP ≤24 on its
 0–51 scale; VP9 uses ≤96 on its 0–255 scale. Both counters must advance, the ratio must
 be plausible, and outbound id, encoder implementation and codec must match. Missing QP
@@ -376,17 +376,42 @@ output with fresh encoded-frame progress after restore. Duplicate reads do not
 restart that clock; missing or frozen counters cannot establish recovery. Two unsuccessful attempts suppress further pulses;
 the QP escape is one-shot. Suppression expires after ten minutes plus thirty
 continuous seconds of healthy target capacity without CPU limitation. Successful
-recovery discards the old size reference. Surface identity changes immediately cancel
-the previous surface's pulse/outcome and reset guard/QP history. Physical dimensions
-need two seconds of stable clean settings corroborated by source stats; settings can
-arrive before or after those stats. The previous surface's pulse cannot exclude a
-new surface's clean proof. CPU/bandwidth adaptation, a pulse or an outcome of the
-current surface contaminate their observed dimensions even after the limitation
-clears; a new clean settings size or surface can establish proof again. Application
-constraint writes discard pending proof and mark their resulting settings unproven,
-while retaining the proven physical size. Pulse eligibility and suppression expiry
-use the latest proven target under the current preset and recovery caps. The one-second deadline is
-independent of sender promise completion, with serialized current-state restores.
+recovery discards the old outcome size reference.
+
+The target model is asymmetric: losing a recovery target can strand capture forever,
+whereas excess attempts are bounded. Each surface identity retains a **ceiling** of
+its largest observed settings width and height, independently per axis. This can
+combine dimensions from different aspect ratios, deliberately preferring an
+overestimate. The ceiling never shrinks for window resizes, capture-stage scaling,
+CPU/bandwidth adaptation, pulses, application caps, or delayed cap frames, even with
+limitation `none`. The guard target is `min(ceiling, live spec)` per axis; the spec
+includes recovery caps. Caps never overwrite the ceiling, so relaxing one restores
+the full target immediately. Suppression expiry uses this same live target.
+
+Identity is the publisher's track plus the synchronous `getSettings()` fields
+`deviceId` and `displaySurface`. A new track creates a new publisher. A change to a
+previously known field cancels the previous surface's pulse/outcome and resets its
+guard/QP history **before** seeding a new ceiling from that same settings snapshot.
+Stats dimensions and media-source ids cannot seed or reset the ceiling: stats can
+lead or lag settings and may still describe the previous identity. Until synchronous
+settings identify a switch, they belong to the previous identity. Missing identity
+fields or switches between indistinguishable surfaces retain the higher ceiling;
+there is no claim to prove physical dimensions. A switch first observed already
+reduced starts from those settings and grows as larger settings become available.
+
+For a permanently smaller, non-growing output under an unchanged identity and
+configuration, every pulse fails: **at most two issued one-second pulses in any
+half-open ten-minute window**, then expiry can retry. Expiry requires both ten
+minutes since suppression and thirty seconds of continuous healthy target capacity;
+these conditions can overlap. If output repeatedly gains 50% for ten seconds and
+regresses, even an overestimated target can record successes: backoff bounds these
+to **seven pulses per ten-minute window** (at most five once backoff reaches 120 s).
+This follows from the minimum successive gaps 20, 40, 80, then 120 seconds. Explicit
+surface/preset/codec resets start fresh history; including arbitrary such resets,
+the six-second eligibility window bounds a publisher to **100 pulses per half-open
+ten-minute window**. Ceiling growth alone never resets history. The one-second
+deadline is independent of sender promise completion, with serialized current-state
+restores.
 Preset changes, close and codec replacement fence queued parameters and cancel
 phase/sampling timers. `scaleResolutionDownBy` only enforces the existing
 codec-recovery ceiling from current track settings.
