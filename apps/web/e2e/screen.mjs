@@ -20,13 +20,15 @@
  *   E2E_BROWSERS=chromium,webkit   engines to use (default: both); with one, it plays every role
  *   E2E_SCREEN_CANVAS=1          fixed 1080p60 canvas instead of adaptive tab capture
  *   E2E_SCREEN_REQUIRE_H264=1    fail if the main sharer exposes no H.264 encoder
+ *   E2E_SCREEN_TRACE_DIR        retain server logs, browser events/state and watchdog samples
+ *   RUST_LOG=info,gwar_server::media::screen=debug  include SFU recovery decisions in the logs
  *   GWAR_SERVER_BIN                 server binary (default: target/debug/gwar-server)
  */
 import { stopProcesses } from "./processes.mjs";
 import { canvasCapture, readBarcode, stampBarcode } from "./screen-source.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -40,6 +42,7 @@ const engines = (process.env.E2E_BROWSERS ?? "chromium,webkit").split(",").map(s
 // on main's VP9 path with Chromium reporting bandwidth pressure and zero CPU limitation.
 // That separate capture/BWE investigation must not weaken this fixed-canvas H.264 gate.
 const fixedCanvas = process.env.E2E_SCREEN_CANVAS === "1";
+const traceDir = process.env.E2E_SCREEN_TRACE_DIR;
 const SOURCE_TITLE = "Gwar share source";
 const children = [];
 const opened = [];
@@ -72,7 +75,27 @@ async function waitFor(check, what, timeout = 30_000) {
 }
 
 /** Per device: a synthetic microphone, the barcode reader and, for canvas sharers, the capture hook. */
-function devicePatch({ frequency, sources, sendCodec, receiveCodec }, stamp, read, capture) {
+function devicePatch({ frequency, sources, sendCodec, receiveCodec, trace }, stamp, read, capture) {
+  window.__screenTrace = [];
+  if (trace) {
+    const record = (type, data) => window.__screenTrace.push({ at: Date.now(), type, ...data });
+    window.__traceScreen = record;
+    window.WebSocket = new Proxy(window.WebSocket, {
+      construct(target, args) {
+        const socket = new target(...args);
+        const inspect = (direction, data) => {
+          try {
+            const frame = JSON.parse(data);
+            if ((frame.ev ?? frame.op ?? "").startsWith("screen.")) record(direction, { frame });
+          } catch { /* Not a JSON screen frame. */ }
+        };
+        socket.addEventListener("message", event => inspect("event", event.data));
+        const send = socket.send.bind(socket);
+        socket.send = data => { inspect("request", data); return send(data); };
+        return socket;
+      },
+    });
+  }
   window.__readBarcode = read;
   // Every peer connection, for the RTP diagnostics a failure prints.
   window.__pcs = [];
@@ -132,7 +155,7 @@ async function device(browser, web, server, name, { canvasId = null, frequency =
   const context = await browser.newContext({ locale: "en-US", viewport: { width: 1920, height: 1080 } });
   await context.route("**/*", route => (new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort()));
   const sources = (canvasId === null ? [] : [canvasId].flat()).map(id => ({ id, size: SOURCE_SIZES[id], ...(id === 1 && fixedCanvas ? { fps: 60 } : {}) }));
-  await context.addInitScript({ content: `(${devicePatch})(${JSON.stringify({ frequency, sources, sendCodec, receiveCodec })}, ${stampBarcode}, ${readBarcode}, ${canvasCapture})` });
+  await context.addInitScript({ content: `(${devicePatch})(${JSON.stringify({ frequency, sources, sendCodec, receiveCodec, trace: !!traceDir })}, ${stampBarcode}, ${readBarcode}, ${canvasCapture})` });
   const page = await context.newPage();
   page.errors = [];
   page.on("pageerror", e => page.errors.push(String(e)));
@@ -153,6 +176,10 @@ async function device(browser, web, server, name, { canvasId = null, frequency =
   page.engine = browser.browserType().name();
   page.context_ = context;
   opened.push(page);
+  if (traceDir) await page.evaluate(async () => {
+    const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts");
+    useScreen.subscribe(screen => window.__traceScreen("state", { transport: screen.transport, watches: screen.watches, slots: screen.slots }));
+  });
   return page;
 }
 
@@ -471,6 +498,13 @@ async function run(browsers, web, server, token) {
           pc.getStats = async (...args) => {
             const report = await pc.__recoveryStats(...args), altered = new Map();
             report.forEach((s, key) => altered.set(key, window.__failH264Decode && s.mid === mid && s.type === "inbound-rtp" && /video\/h264/i.test(report.get(s.codecId)?.mimeType ?? "") ? { ...s, framesDecoded: 0 } : s));
+            if (window.__traceScreen) window.__traceScreen("watchdog-stats", {
+              mid, enabled: window.__failH264Decode,
+              streams: [...report.values()].filter(s => s.mid === mid && s.type === "inbound-rtp").map(s => ({
+                codec: report.get(s.codecId)?.mimeType, packets: s.packetsReceived,
+                actualFrames: s.framesDecoded, reportedFrames: altered.get(s.id)?.framesDecoded,
+              })),
+            });
             return altered;
           };
         }
@@ -560,9 +594,22 @@ try {
     console.error(JSON.stringify({ device: page.deviceName, state, rtc, errors: page.errors.slice(-20) }));
   }
 } finally {
-  for (const browser of Object.values(browsers)) await browser.close().catch(() => {});
-  await stopProcesses(children);
-  rmSync(dataDir, { recursive: true, force: true });
+  try {
+    if (traceDir) {
+      mkdirSync(traceDir, { recursive: true });
+      for (const child of children) writeFileSync(path.join(traceDir, `${child.taskName}.log`), child.output);
+      for (const page of opened) {
+        const state = await session(page, (s, screen) => ({ own: screen.own && { ...screen.own, stream: !!screen.own.stream }, transport: screen.transport, watches: screen.watches, slots: screen.slots, shares: Object.keys(s.shares) })).catch(e => String(e));
+        const rtc = await diagnostics(page).catch(e => String(e));
+        const trace = await page.evaluate(() => window.__screenTrace).catch(e => String(e));
+        writeFileSync(path.join(traceDir, `${page.deviceName}.json`), JSON.stringify({ state, rtc, trace }, null, 2));
+      }
+    }
+  } finally {
+    for (const browser of Object.values(browsers)) await browser.close().catch(() => {});
+    await stopProcesses(children);
+    rmSync(dataDir, { recursive: true, force: true });
+  }
 }
 for (const check of checks) console.log(JSON.stringify(check));
 if (warnings.length) console.log(JSON.stringify({ warnings }));

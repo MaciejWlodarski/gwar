@@ -751,6 +751,7 @@ impl Sfu {
                 let id = self.id();
                 match publisher(id, origin, ssrc, &sdp, self.advertise, now) {
                     Ok((publisher, answer)) => {
+                        debug!(share = publisher.origin.share, "screen publish accepted");
                         publisher.origin.recovery.lock().expect("recovery lock").pending = false;
                         self.publishers.insert(publisher.origin.share.clone(), publisher);
                         let _ = reply.send(Ok(answer));
@@ -1437,6 +1438,7 @@ impl Sfu {
         {
             return;
         }
+        debug!(session, run, slot = index, generation, share, "screen decode failure accepted");
         self.decode_reports.insert((session, share.to_owned()), now);
         self.watchers.get_mut(&session).expect("validated").slots[index].failed_at.get_or_insert(now);
         if !self.try_recover(share, now) {
@@ -1489,6 +1491,7 @@ impl Sfu {
     }
 
     fn apply_recovery(&mut self, origin: Arc<ScreenOrigin>, plan: gwar_proto::ScreenRecovery, restoring: bool) {
+        debug!(share = origin.share, ?plan, restoring, "screen recovery applied");
         let cap = if restoring {
             None
         } else {
@@ -1540,6 +1543,14 @@ impl Sfu {
                     let w = self.watchers.get_mut(&session).expect("assigned");
                     let run = w.run;
                     let grant = w.slots[index].grant.clone().expect("assigned");
+                    debug!(
+                        session,
+                        run,
+                        slot = index,
+                        share,
+                        generation = w.slots[index].generation,
+                        "screen decode reporter isolated"
+                    );
                     empty(w, index);
                     self.signal(ScreenSignal::Incompatible { session, run, grant });
                 }
