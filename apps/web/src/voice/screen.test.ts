@@ -1,23 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { captureScreen, headroomBitrate, MIN_BITRATE, preferredCodecs, PRESETS, publishSsrcs, resolvePreset, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, StuckCaptureGuard } from "./screen";
+import { captureScreen, headroomBitrate, MIN_BITRATE, preferredCodecs, publishSsrcs, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, StuckCaptureGuard } from "./screen";
 
+import { deriveSpec, legacySpec, type ScreenSpec } from "./screen-quality";
+import type { ScreenPreset } from "../proto/ScreenPreset";
+const TEST_SPECS = Object.fromEntries((["text", "smooth", "game", "saver"] as const).map(p => [p, { ...deriveSpec(legacySpec(p)), ...legacySpec(p) }])) as Record<ScreenPreset, ScreenSpec & ReturnType<typeof deriveSpec>>;
 const codec = (mimeType: string, sdpFmtpLine?: string) => ({ mimeType, clockRate: 90000, ...(sdpFmtpLine ? { sdpFmtpLine } : {}) }) as RTCRtpCodec;
 
-describe("presets", () => {
-  it("match the design's table", () => {
-    expect(PRESETS.text).toMatchObject({ height: 1080, fps: 15, hint: "detail", degradation: "maintain-resolution", maxBitrate: 2_500_000 });
-    expect(PRESETS.smooth).toMatchObject({ height: 1080, fps: 30, hint: "detail", degradation: "balanced", maxBitrate: 4_000_000 });
-    expect(PRESETS.game).toMatchObject({ height: 1080, fps: 60, hint: "motion", degradation: "maintain-framerate", maxBitrate: 8_000_000 });
-    expect(PRESETS.saver).toMatchObject({ height: 720, fps: 30, hint: "detail", degradation: "balanced", maxBitrate: 1_500_000 });
-  });
-
-  it("auto follows the surface; an explicit choice wins", () => {
-    expect(resolvePreset("auto", "screen")).toBe("smooth");
-    expect(resolvePreset("auto", "window")).toBe("text");
-    expect(resolvePreset("auto", "tab")).toBe("text");
-    expect(resolvePreset("game", "tab")).toBe("game");
-  });
-
+describe("voice headroom", () => {
   it("leaves 30 % of the uplink estimate, never above the cap", () => {
     expect(headroomBitrate(4_000_000, undefined)).toBe(4_000_000);
     expect(headroomBitrate(4_000_000, 10_000_000)).toBe(4_000_000);
@@ -84,14 +73,14 @@ describe("publish transport", () => {
   it("sends one low-priority video stream at the preset's cap, lowered under the uplink estimate", async () => {
     const offer = vi.fn(async (_body: { ssrc: number; rtx_ssrc: number; sdp: string }) => "answer");
     const track = { applyConstraints: vi.fn(async () => {}), contentHint: "" } as unknown as MediaStreamTrack;
-    const publisher = new ScreenPublisher({ track, preset: "smooth", iceServers: [], offer, state: () => {} });
+    const publisher = new ScreenPublisher({ track, quality: TEST_SPECS.smooth, iceServers: [], offer, state: () => {} });
     await publisher.start();
     const pc = Peer.all[0]!;
     expect(pc.transceivers).toHaveLength(1);
     expect(pc.transceivers[0]!.init).toMatchObject({ direction: "sendonly", sendEncodings: [{ maxBitrate: 4_000_000, maxFramerate: 30, priority: "low", networkPriority: "low" }] });
     expect(pc.transceivers[0]!.setCodecPreferences).toHaveBeenCalledWith([expect.objectContaining({ mimeType: "video/VP9" }), expect.objectContaining({ mimeType: "video/rtx" })]);
     expect(offer).toHaveBeenCalledWith(expect.objectContaining({ ssrc: 10, rtx_ssrc: 11 }));
-    expect(pc.sendParams.at(-1)).toMatchObject({ degradationPreference: "balanced", encodings: [{ maxBitrate: 4_000_000, priority: "low" }] });
+    expect(pc.sendParams.at(-1)).toMatchObject({ degradationPreference: "maintain-framerate", encodings: [{ maxBitrate: 4_000_000, priority: "low" }] });
     expect(publisher.bitrate).toBe(4_000_000);
 
     pc.stats.set("T", { type: "transport", selectedCandidatePairId: "P" });
@@ -100,7 +89,7 @@ describe("publish transport", () => {
     expect(publisher.bitrate).toBe(2_100_000);
 
     // A preset change needs no renegotiation.
-    await publisher.setPreset("text");
+    await publisher.setSpec(TEST_SPECS.text);
     expect(track.contentHint).toBe("detail");
     expect(track.applyConstraints).toHaveBeenCalledWith({ width: { max: 1920 }, height: { max: 1080 }, frameRate: { max: 15 } });
     expect(pc.sendParams.at(-1)).toMatchObject({ degradationPreference: "maintain-resolution", encodings: [{ maxFramerate: 15 }] });
@@ -112,7 +101,7 @@ describe("publish transport", () => {
 
   it("retries the current headroom cap after a transient failure of both sender writes", async () => {
     const publisher = new ScreenPublisher({ track: { applyConstraints: async () => {} } as unknown as MediaStreamTrack,
-      preset: "smooth", iceServers: [], offer: async () => "answer", state: () => {} });
+      quality: TEST_SPECS.smooth, iceServers: [], offer: async () => "answer", state: () => {} });
     await publisher.start();
     const pc = Peer.all[0]!, sender = pc.transceivers[0]!.sender;
     pc.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 2_000_000 });
@@ -128,7 +117,7 @@ describe("publish transport", () => {
   it("closed during its first parameter change, it leaves no timer behind", async () => {
     const offer = vi.fn(async (_body: { ssrc: number; rtx_ssrc: number; sdp: string }) => "answer");
     const track = { applyConstraints: vi.fn(async () => {}), contentHint: "" } as unknown as MediaStreamTrack;
-    const publisher = new ScreenPublisher({ track, preset: "smooth", iceServers: [], offer, state: () => {} });
+    const publisher = new ScreenPublisher({ track, quality: TEST_SPECS.smooth, iceServers: [], offer, state: () => {} });
     const starting = publisher.start();
     await vi.waitFor(() => expect(Peer.all[0]?.transceivers).toHaveLength(1));
     const sender = Peer.all[0]!.transceivers[0]!.sender as { setParameters: ReturnType<typeof vi.fn> };
@@ -141,19 +130,19 @@ describe("publish transport", () => {
     let answer!: (sdp: string) => void;
     const offer = vi.fn(() => new Promise<string>(resolve => { answer = resolve; }));
     const track = { applyConstraints: vi.fn(async () => {}), contentHint: "" } as unknown as MediaStreamTrack;
-    const publisher = new ScreenPublisher({ track, preset: "game", iceServers: [], offer, state: () => {} });
+    const publisher = new ScreenPublisher({ track, quality: TEST_SPECS.game, iceServers: [], offer, state: () => {} });
     const starting = publisher.start();
     await vi.waitFor(() => expect(offer).toHaveBeenCalled());
-    await publisher.setPreset("saver");
+    await publisher.setSpec(TEST_SPECS.saver);
     answer("answer");
     await starting;
-    expect(Peer.all[0]!.sendParams.at(-1)).toMatchObject({ degradationPreference: "balanced", encodings: [{ maxBitrate: 1_500_000, maxFramerate: 30 }] });
+    expect(Peer.all[0]!.sendParams.at(-1)).toMatchObject({ degradationPreference: "maintain-framerate", encodings: [{ maxBitrate: 1_500_000, maxFramerate: 30 }] });
     publisher.close();
   });
 
   it("refuses an offer without one video stream and its RTX", async () => {
     const offer = vi.fn();
-    const publisher = new ScreenPublisher({ track: {} as MediaStreamTrack, preset: "text", iceServers: [], offer, state: () => {} });
+    const publisher = new ScreenPublisher({ track: {} as MediaStreamTrack, quality: TEST_SPECS.text, iceServers: [], offer, state: () => {} });
     const sdp = Peer.offerSdp;
     Peer.offerSdp = "v=0\r\na=ssrc:1 c\r\n";
     try { await expect(publisher.start()).rejects.toThrow(/RTX/); } finally { Peer.offerSdp = sdp; }
@@ -202,7 +191,7 @@ describe("capture", () => {
 describe("H.264 sender diagnostics", () => {
   it("reports codec, encoder and hardware independently while keeping preset parameters", async () => {
     const track = { applyConstraints: vi.fn(async () => {}), contentHint: "" } as unknown as MediaStreamTrack;
-    const publisher = new ScreenPublisher({ track, preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+    const publisher = new ScreenPublisher({ track, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
     await publisher.start();
     const pc = Peer.all[0]!;
     pc.stats.set("codec", { type: "codec", mimeType: "video/H264" });
@@ -210,7 +199,7 @@ describe("H.264 sender diagnostics", () => {
       frameWidth: 1920, framesPerSecond: 60, encoderImplementation: "MediaFoundationVideoEncodeAccelerator", powerEfficientEncoder: true });
     expect(await publisher.stats()).toMatchObject({ codec: "H264", encoder: "MediaFoundationVideoEncodeAccelerator", hardware: true, height: 1080 });
     await vi.advanceTimersByTimeAsync(2_000);
-    await publisher.setPreset("game");
+    await publisher.setSpec(TEST_SPECS.game);
     expect(track.contentHint).toBe("motion");
     expect(pc.sendParams.at(-1)).toMatchObject({ degradationPreference: "maintain-framerate", encodings: [{ maxBitrate: 8_000_000, maxFramerate: 60 }] });
     publisher.close();
@@ -289,7 +278,7 @@ it("keeps the original publisher alive until its replacement is accepted and ret
   let answer!: (sdp: string) => void;
   const offer = vi.fn(async () => "answer");
   const track = { applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }) } as unknown as MediaStreamTrack;
-  const publisher = new ScreenPublisher({ track, preset: "game", iceServers: [], offer, state: () => {} });
+  const publisher = new ScreenPublisher({ track, quality: TEST_SPECS.game, iceServers: [], offer, state: () => {} });
   await publisher.start();
   const original = Peer.all[0]!;
   offer.mockImplementationOnce(() => new Promise<string>(resolve => { answer = resolve; }));
@@ -313,7 +302,7 @@ it("keeps the original publisher alive until its replacement is accepted and ret
 describe("publisher capture guard", () => {
   const make = (offer: () => Promise<string> = async () => "answer") => new ScreenPublisher({
     track: { applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080, frameRate: 20 }) } as unknown as MediaStreamTrack,
-    preset: "game", iceServers: [], offer, state: () => {},
+    quality: TEST_SPECS.game, iceServers: [], offer, state: () => {},
   });
   const last = (pc = Peer.all[0]!) => pc.sendParams.at(-1)!;
   const healthy = (pc: Peer) => {
@@ -335,18 +324,38 @@ describe("publisher capture guard", () => {
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("retains L3 history for an equal spec and resets it for each actual user control change", async () => {
+    const publisher = make();
+    await publisher.start();
+    const state = publisher as unknown as { guard: StuckCaptureGuard };
+    const guard = state.guard;
+    await publisher.setSpec({ mode: "smooth", height: 1080, fps: 60 });
+    expect(state.guard).toBe(guard);
+    for (const spec of [{ mode: "sharp", height: 1080, fps: 60 }, { mode: "sharp", height: 1440, fps: 60 }, { mode: "sharp", height: 1440, fps: 30 }] as const) {
+      const previous = state.guard;
+      await publisher.setSpec(spec);
+      expect(state.guard).not.toBe(previous);
+      await publisher.setSpec({ ...spec });
+      expect(state.guard).not.toBe(previous);
+      const unchanged = state.guard;
+      await publisher.setSpec({ ...spec });
+      expect(state.guard).toBe(unchanged);
+    }
+    publisher.close();
+  });
+
   it("derives target size, cadence and guard budget from the resolved spec", async () => {
-    const original = PRESETS.game;
-    PRESETS.game = { ...original, width: 1280, height: 720, fps: 30, maxBitrate: 1_000_000 };
+    const original = TEST_SPECS.game;
+    TEST_SPECS.game = { ...original, width: 1280, height: 720, fps: 30, maxBitrate: 1_500_000 };
     const publisher = make();
     try {
       await publisher.start();
       const pc = Peer.all[0]!; healthy(pc);
       await vi.advanceTimersByTimeAsync(40_000);
-      // Stats from a previous encoder target cannot override the resolved cap.
-      expect(pc.sendParams.every(p => p.degradationPreference === "maintain-framerate")).toBe(true);
-      expect(last().encodings[0]).toMatchObject({ maxBitrate: 1_000_000, maxFramerate: 30, scaleResolutionDownBy: 1 });
-    } finally { publisher.close(); PRESETS.game = original; }
+      // Guard evidence and constraints use the new 720p30 cap, including a temporary pulse.
+      expect(pc.sendParams.filter(p => p.degradationPreference === "maintain-resolution")).toHaveLength(2);
+      expect(last().encodings[0]).toMatchObject({ maxBitrate: 1_500_000, maxFramerate: 30, scaleResolutionDownBy: 1 });
+    } finally { publisher.close(); TEST_SPECS.game = original; }
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -356,12 +365,12 @@ describe("publisher capture guard", () => {
     await vi.advanceTimersByTimeAsync(10_000);
     expect(last().degradationPreference).toBe("maintain-resolution");
     if (action === "close") publisher.close();
-    else if (action === "preset") await publisher.setPreset("saver");
+    else if (action === "preset") await publisher.setSpec(TEST_SPECS.saver);
     else await publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
     const count = pc.sendParams.length;
     await vi.advanceTimersByTimeAsync(1500);
     expect(pc.sendParams).toHaveLength(count);
-    if (action === "preset") expect(last().degradationPreference).toBe("balanced");
+    if (action === "preset") expect(last().degradationPreference).toBe("maintain-framerate");
     if (action === "recover") expect(last(Peer.all[1]!)).toMatchObject({ degradationPreference: "maintain-framerate", encodings: [{ maxFramerate: 30, scaleResolutionDownBy: 1.5 }] });
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
@@ -397,16 +406,16 @@ describe("publisher capture guard", () => {
     let reject!: (e: Error) => void;
     sender.setParameters.mockImplementationOnce(() => new Promise<void>((_, no) => { reject = no; }));
     await vi.advanceTimersByTimeAsync(1000);
-    const changed = publisher.setPreset("saver");
+    const changed = publisher.setSpec(TEST_SPECS.saver);
     reject(new Error("stale transaction")); await changed;
-    expect(last()).toMatchObject({ degradationPreference: "balanced", encodings: [{ maxBitrate: 1_500_000, maxFramerate: 30 }] });
+    expect(last()).toMatchObject({ degradationPreference: "maintain-framerate", encodings: [{ maxBitrate: 1_500_000, maxFramerate: 30 }] });
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
   it("retains even pulse-induced settings growth through a same-preset update", async () => {
     const settings = { width: 1280, height: 720, frameRate: 20 };
     const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
-      preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+      quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
     await publisher.start();
     const pc = Peer.all[0]!;
     let width = 480, height = 270, limitation = "bandwidth";
@@ -424,7 +433,7 @@ describe("publisher capture guard", () => {
       ]);
     });
     await vi.advanceTimersByTimeAsync(10_000);
-    await publisher.setPreset("game");
+    await publisher.setSpec(TEST_SPECS.game);
     const evidence = publisher as unknown as { ceiling: { width: number } };
     expect(evidence.ceiling.width).toBe(1920);
     await vi.advanceTimersByTimeAsync(15_000);
@@ -443,26 +452,25 @@ describe("publisher capture guard", () => {
     ["game", "none", "spec"], ["game", "bandwidth", "spec"],
     ["game", "none", "recovery"], ["game", "bandwidth", "recovery"],
   ] as const)("retains the settings ceiling on %s, limitation=%s, after %s caps", async (preset, limitation, change) => {
-    const original = PRESETS.smooth, originalGame = PRESETS.game;
-    PRESETS.smooth = { ...original, width: 1600, height: 900, fps: 24, degradation: "maintain-framerate" };
+    const original = TEST_SPECS.smooth, originalGame = TEST_SPECS.game;
     const settings = { width: 1920, height: 1080, frameRate: 20 };
     const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async (constraints: MediaTrackConstraints) => {
       if ((constraints.width as ConstrainULongRange)?.max === 1280) { settings.width = 1280; settings.height = 720; }
       // Capture stays at 720p when the larger requested cap is restored.
-    } } as unknown as MediaStreamTrack, preset, iceServers: [], offer: async () => "answer", state: () => {} });
+    } } as unknown as MediaStreamTrack, quality: TEST_SPECS[preset], iceServers: [], offer: async () => "answer", state: () => {} });
     try {
       await publisher.start();
       if (change === "recovery") {
         await publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
         await publisher.recover({ share: "s", codec: "vp9", width: 1920, height: 1080, fps: 60 });
       } else if (change === "spec") {
-        PRESETS.game = { ...originalGame, width: 1280, height: 720, fps: 30 };
-        await publisher.setPreset("game");
-        PRESETS.game = originalGame;
-        await publisher.setPreset("game");
+        TEST_SPECS.game = { ...originalGame, width: 1280, height: 720, fps: 30 };
+        await publisher.setSpec(TEST_SPECS.game);
+        TEST_SPECS.game = originalGame;
+        await publisher.setSpec(TEST_SPECS.game);
       } else {
-        await publisher.setPreset("saver");
-        await publisher.setPreset(preset);
+        await publisher.setSpec(TEST_SPECS.saver);
+        await publisher.setSpec(TEST_SPECS[preset]);
       }
       const pc = Peer.all.at(-1)!;
       pc.getStats.mockImplementation(async () => {
@@ -478,8 +486,8 @@ describe("publisher capture guard", () => {
       const size = (publisher as unknown as { ceiling: { width: number } }).ceiling.width;
       const pulses = pc.sendParams.filter(p => p.degradationPreference === "maintain-resolution").length;
       expect({ size, pulses }).toEqual({ size: 1920, pulses: 1 });
-      expect(last().encodings[0]?.maxFramerate).toBe(PRESETS[preset].fps);
-    } finally { publisher.close(); PRESETS.smooth = original; PRESETS.game = originalGame; }
+      expect(last().encodings[0]?.maxFramerate).toBe(TEST_SPECS[preset].fps);
+    } finally { publisher.close(); TEST_SPECS.smooth = original; TEST_SPECS.game = originalGame; }
     expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -563,7 +571,7 @@ describe("publisher capture guard", () => {
 
   it.each(["fresh", "stale", "missing", "cpu", "low", "target", "unknown-source", "clock-change"])("reads codec QP deltas and requires a fresh healthy estimate: %s", async kind => {
     const publisher = kind === "unknown-source"
-      ? new ScreenPublisher({ track: { applyConstraints: async () => {} } as unknown as MediaStreamTrack, preset: "game", iceServers: [], offer: async () => "answer", state: () => {} }) : make();
+      ? new ScreenPublisher({ track: { applyConstraints: async () => {} } as unknown as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} }) : make();
     await publisher.start();
     const pc = Peer.all[0]!;
     pc.getStats.mockImplementation(async () => {
@@ -626,7 +634,7 @@ describe("publisher capture guard", () => {
       settings.height = (c.height as ConstrainULongRange).max!;
       settings.frameRate = (c.frameRate as ConstrainDoubleRange).max!;
     } } as unknown as MediaStreamTrack;
-    const publisher = new ScreenPublisher({ track, preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+    const publisher = new ScreenPublisher({ track, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
     await publisher.start();
     if (width === 1280) await publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
     else Object.assign(settings, { width, height: 810 });
@@ -797,7 +805,7 @@ describe("round 2 independent adversarial review", () => {
   it("updates the effective target after an observed window enlargement", async () => {
     const settings = {width: 1280, height: 720, frameRate: 20};
     const publisher = new ScreenPublisher({track: {getSettings:()=>({...settings}), applyConstraints:async()=>{}} as unknown as MediaStreamTrack,
-      preset: "game", iceServers:[], offer:async()=>"answer", state:()=>{}});
+      quality: TEST_SPECS.game, iceServers:[], offer:async()=>"answer", state:()=>{}});
     await publisher.start();
     const pc=Peer.all[0]!;
     pc.getStats.mockImplementation(async()=> {
@@ -818,7 +826,7 @@ describe("round 2 independent adversarial review", () => {
   });
   it("does not extend an applied pulse while its sender promise is pending", async () => {
     const publisher = new ScreenPublisher({track:{getSettings:()=>({width:1920,height:1080,frameRate:20}),applyConstraints:async()=>{}} as unknown as MediaStreamTrack,
-      preset:"game",iceServers:[],offer:async()=>"answer",state:()=>{}});
+      quality: TEST_SPECS.game,iceServers:[],offer:async()=>"answer",state:()=>{}});
     await publisher.start();
     const pc=Peer.all[0]!;
     pc.getStats.mockImplementation(async()=>{
@@ -846,7 +854,7 @@ describe("round 2 independent adversarial review", () => {
 describe("round 2 missing-QP fallback feedback",()=> {
   it("does not repeat actual publisher grow/shrink cycles that occur between stats polls",async()=> {
     const publisher=new ScreenPublisher({track:{getSettings:()=>({width:1920,height:1080,frameRate:20}),applyConstraints:async()=>{}} as unknown as MediaStreamTrack,
-      preset:"game",iceServers:[],offer:async()=>"answer",state:()=>{}});
+      quality: TEST_SPECS.game,iceServers:[],offer:async()=>"answer",state:()=>{}});
     await publisher.start();
     const pc=Peer.all[0]!;
     let width=480,height=270,bytes=0,changedAt=0,pulses=0,changes=0,rate=100_000;
@@ -941,7 +949,7 @@ async function makeSurfaceReview(manual = false, observed: (settings: MediaTrack
   const sample = { width: 1920, height: 1080, outWidth: 1920, outHeight: 1080, limitation: "none", available: 13_000_000, target: 8_000_000, sourceId: "source" };
   let constraint: (c: MediaTrackConstraints) => Promise<void> = async () => {};
   const publisher = new ScreenPublisher({ track: { getSettings: () => { const snapshot = { ...settings }; observed(snapshot); return snapshot; }, applyConstraints: (c: MediaTrackConstraints) => constraint(c) } as unknown as MediaStreamTrack,
-    preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+    quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
   await publisher.start();
   const pc = Peer.all.at(-1)!;
   pc.getStats.mockImplementation(async () => {
@@ -1078,7 +1086,7 @@ describe("round five asynchronous settings behavior", () => {
     await vi.advanceTimersByTimeAsync(2000);
     let finish!:()=>void;
     f.setConstraint(()=>new Promise<void>((resolve,reject)=>{finish=outcome==="resolve"?resolve:()=>reject(new Error("rejected"));}));
-    const changing=f.publisher.setPreset("game").catch(()=>{});
+    const changing=f.publisher.setSpec(TEST_SPECS.game).catch(()=>{});
     f.dimensions(1280,720);
     await vi.advanceTimersByTimeAsync(2000);
     expect(f.state.ceiling.width).toBe(1920);
@@ -1139,7 +1147,7 @@ describe("round five asynchronous settings behavior", () => {
       await vi.advanceTimersByTimeAsync(2000);
     } else {
       f.setConstraint(()=>new Promise<void>(resolve=>{finish=resolve;}));
-      pending=f.publisher.setPreset("game");
+      pending=f.publisher.setSpec(TEST_SPECS.game);
     }
     f.stop();
     const count=f.pc.sendParams.length;
@@ -1153,7 +1161,7 @@ describe("round five asynchronous settings behavior", () => {
 const makeResourceReview = async () => {
  const settings = {width:1920,height:1080,frameRate:20};
  const publisher = new ScreenPublisher({track:{getSettings:()=>({...settings}),applyConstraints:async()=>{}} as unknown as MediaStreamTrack,
-  preset:"game",iceServers:[],offer:async()=>"answer",state:()=>{}});
+  quality: TEST_SPECS.game,iceServers:[],offer:async()=>"answer",state:()=>{}});
  await publisher.start(); const pc=Peer.all.at(-1)!;
  pc.getStats.mockImplementation(async()=> {
   const at=performance.now();return new Map([
@@ -1189,7 +1197,7 @@ describe("independent round-three resource and lifecycle controls",()=> {
   pc.getStats.mockImplementationOnce(()=>new Promise(resolve=>{finish=resolve;}));
   await vi.advanceTimersByTimeAsync(250);
   if(action==="close")publisher.close();
-  else if(action==="preset")await publisher.setPreset("saver");
+  else if(action==="preset")await publisher.setSpec(TEST_SPECS.saver);
   else await publisher.recover({share:"s",codec:"vp9",width:1280,height:720,fps:30});
   const count=pc.sendParams.length;finish(pc.stats);await vi.advanceTimersByTimeAsync(2000);
   expect(pc.sendParams.length).toBe(count);expect((publisher as unknown as { phase: string | null; sampleTimer: unknown }).phase).toBe(null);
@@ -1358,7 +1366,7 @@ describe("asymmetric sequence invariants", () => {
     const random = (n: number) => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) % n; };
     const sizes = [[1920, 1050], [1280, 700], [1600, 900], [900, 1200], [3840, 2160]] as const;
     const coverage = new Set<string>();
-    const originalSpec = PRESETS.game, originalObserve = StuckCaptureGuard.prototype.observe;
+    const originalSpec = TEST_SPECS.game, originalObserve = StuckCaptureGuard.prototype.observe;
     let now = 0, record: (guard: StuckCaptureGuard, sample: Parameters<StuckCaptureGuard["observe"]>[1], pulse: boolean) => void = () => {};
     vi.spyOn(performance, "now").mockImplementation(() => now);
     vi.spyOn(StuckCaptureGuard.prototype, "observe").mockImplementation(function (this: StuckCaptureGuard, at, sample) {
@@ -1382,7 +1390,7 @@ describe("asymmetric sequence invariants", () => {
           width = Math.max(width, settings.width!); height = Math.max(height, settings.height!);
         });
         const pulses: { at: number; guard: StuckCaptureGuard }[] = [];
-        let liveSpec = PRESETS.game;
+        let liveSpec = TEST_SPECS.game;
         const target = () => ({ width: Math.min(width, liveSpec.width), height: Math.min(height, liveSpec.height) });
         const assertState = () => {
           const expected = target(), actual = f.state.captureTarget();
@@ -1429,14 +1437,14 @@ describe("asymmetric sequence invariants", () => {
         };
         const constrain = async (timing: "before" | "after") => {
           if (f.state.phase) coverage.add("cap-mid-pulse");
-          liveSpec = PRESETS.game = { ...originalSpec, width: 1280, height: 720 };
+          liveSpec = TEST_SPECS.game = { ...originalSpec, width: 1280, height: 720 };
           let finish!: () => void;
           f.setConstraint(() => {
             f.dimensions(1280, 720, "settings");
             setTimeout(() => f.dimensions(1280, 700), 50);
             return timing === "before" ? new Promise(resolve => { finish = resolve; }) : Promise.resolve();
           });
-          const changing = f.publisher.setPreset("game");
+          const changing = f.publisher.setSpec(TEST_SPECS.game);
           await poll(0); await poll(50); if (timing === "before") finish(); await changing;
           f.setConstraint(async () => {}); assertState();
         };
@@ -1482,9 +1490,9 @@ describe("asymmetric sequence invariants", () => {
             f.dimensions(w, h, "source"); await poll(0);
           } else if (kind === 3 || kind === 4) await constrain(kind === 3 ? "before" : "after");
           else if (kind === 5) {
-            liveSpec = PRESETS.game = originalSpec;
+            liveSpec = TEST_SPECS.game = originalSpec;
             // J2 is asserted synchronously, before a new poll or constraint result.
-            assertState(); await f.publisher.setPreset("game"); assertState();
+            await f.publisher.setSpec(TEST_SPECS.game); assertState();
           } else if (kind === 6) {
             const [w, h] = sizes[random(sizes.length)]!; surface = { width: w, height: h }; f.dimensions(w, h, "settings"); await poll();
           } else if (kind === 7) { f.dimensions(480, 270); f.sample.limitation = "cpu"; await poll(); }
@@ -1495,15 +1503,15 @@ describe("asymmetric sequence invariants", () => {
             const pending = f.state.headroom();
             await switchSettings(1280, 700); finish(report); await pending; assertState();
           } else if (kind === 10) {
-            liveSpec = PRESETS.saver; await f.publisher.setPreset("saver"); assertState();
-            liveSpec = PRESETS.game; await f.publisher.setPreset("game"); assertState();
+            liveSpec = TEST_SPECS.saver; await f.publisher.setSpec(TEST_SPECS.saver); assertState();
+            liveSpec = TEST_SPECS.game; await f.publisher.setSpec(TEST_SPECS.game); assertState();
           } else if (kind === 11) {
             const report = await f.pc.getStats();
             let finish!: (stats: typeof report) => void, resolveConstraints!: () => void;
             f.pc.getStats.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
             const pending = f.state.headroom();
             f.setConstraint(() => new Promise(resolve => { resolveConstraints = resolve; }));
-            const changing = f.publisher.setPreset("game");
+            const changing = f.publisher.setSpec(TEST_SPECS.game);
             await stop(); const sent = f.pc.sendParams.length;
             finish(report); resolveConstraints(); await pending; await changing;
             await poll(2000); check(f.pc.sendParams.length === sent, "J4: late sender write"); break;
@@ -1514,7 +1522,8 @@ describe("asymmetric sequence invariants", () => {
           // A permanently overestimated target must satisfy the sharper two-
           // failure bound in EVERY sliding ten-minute window, including expiry.
           coverage.add("failure-expiry"); trace.push("failure-expiry");
-          liveSpec = PRESETS.game = originalSpec;
+          liveSpec = TEST_SPECS.game = originalSpec;
+          await f.publisher.setSpec(TEST_SPECS.game);
           await switchSettings(1920, 1050); f.dimensions(480, 270); f.sample.limitation = "none";
           const start = now, guard = f.state.guard;
           for (let step = 0; step < 50; step++) await poll();
@@ -1529,9 +1538,9 @@ describe("asymmetric sequence invariants", () => {
           check(pulses.filter(p => p.guard === guard && p.at > start).length >= 4, "J5/J6: affordable expiry must retry");
         }
         if (!stopped) await stop();
-        record = () => {}; PRESETS.game = originalSpec; Peer.all = [];
+        record = () => {}; TEST_SPECS.game = originalSpec; Peer.all = [];
       }
-    } finally { PRESETS.game = originalSpec; }
+    } finally { TEST_SPECS.game = originalSpec; }
     for (const event of ["scale-none", "switch-stats-first", "switch-settings-first", "cap-before", "cap-after", "relax", "resize", "cpu",
       "pulse", "pending-switch", "preset", "stop", "switch-mid-pulse", "switch-mid-outcome", "cap-mid-pulse", "failure-expiry", "uncorroborated-settings", "hidden-growth", "adapted-switch"]) expect(coverage.has(event), event).toBe(true);
   }, 60_000);
@@ -1681,7 +1690,7 @@ describe("round eight backoff resets", () => {
     const delay = () => (f.state.guard as unknown as { retryDelay: number }).retryDelay;
     expect(delay()).toBe(1_200_000);
     if (change === "identity") { f.settings.deviceId = "new"; await f.state.headroom(); }
-    else if (change === "preset") await f.publisher.setPreset("saver");
+    else if (change === "preset") await f.publisher.setSpec(TEST_SPECS.saver);
     else await f.publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
     expect(delay()).toBe(600_000); f.stop();
   });

@@ -1,3 +1,4 @@
+import { legacySpec, type ScreenSpec } from "../voice/screen-quality";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RequestError, type Link } from "../net/connection";
 import { welcome } from "../net/testing";
@@ -9,7 +10,7 @@ import { useSession, useUi } from "./stores";
 
 const media = vi.hoisted(() => ({
   transports: [] as Array<{ params: { run: number; state(s: string): void; offer(sdp: string, run: number): Promise<string> }; close: () => void }>,
-  publishers: [] as Array<{ params: { preset: string; offer(body: object): Promise<string>; state(s: string): void }; close: () => void; setPreset: () => Promise<void> }>,
+  publishers: [] as Array<{ params: { quality: ScreenSpec; offer(body: object): Promise<string>; state(s: string): void }; close: () => void; setSpec: () => Promise<void> }>,
 }));
 vi.mock("../voice/screen", async importOriginal => {
   const actual = await importOriginal<typeof import("../voice/screen")>();
@@ -24,11 +25,11 @@ vi.mock("../voice/screen", async importOriginal => {
   }
   class ScreenPublisher {
     close = vi.fn();
-    setPreset = vi.fn(async () => {});
-    constructor(readonly params: { preset: string; offer(body: object): Promise<string>; state(s: string): void }) { media.publishers.push(this); }
+    setSpec = vi.fn(async () => {});
+    constructor(readonly params: { quality: ScreenSpec; offer(body: object): Promise<string>; state(s: string): void }) { media.publishers.push(this); }
     async start() { await this.params.offer({ ssrc: 1, rtx_ssrc: 2, sdp: "publish-offer" }); }
   }
-  return { ...actual, ScreenWatchTransport, ScreenPublisher, applyCapturePreset: vi.fn(async () => {}), captureSupport: () => "ok" as const };
+  return { ...actual, ScreenWatchTransport, ScreenPublisher, applyCaptureSpec: vi.fn(async () => {}), captureSupport: () => "ok" as const };
 });
 
 const ch = (id: number, encrypted = false): Channel => ({ id, parent: null, name: `c${id}`, topic: "", position: id, has_password: false, max_clients: null, encrypted, history: false, private: false, synced: false });
@@ -43,6 +44,7 @@ function fakeLink(handlers: Record<string, Handler>) {
   const calls: Array<[string, Record<string, unknown>]> = [];
   const link = {
     request: vi.fn(async (op: string, d: Record<string, unknown>) => {
+      if (op === "screen.spec.capabilities") return handlers[op]?.(d) ?? { screen_spec: false };
       if (op === "screen.capabilities") return handlers[op]?.(d) ?? { screen_h264: false };
       calls.push([op, d]);
       const handler = handlers[op];
@@ -315,9 +317,28 @@ describe("watch requests across a reset (review round 2)", () => {
 describe("sharing", () => {
   const track = () => ({ stop: vi.fn(), addEventListener: vi.fn(), getSettings: () => ({ displaySurface: "browser" }) });
   const choosing = (t = track()) => {
-    useScreen.setState({ own: { phase: "choosing", attempt: 1, share: null, stream: { getVideoTracks: () => [t], getTracks: () => [t] } as unknown as MediaStream, surface: "tab", choice: "auto", preset: "text", viewers: 0, guests: 0, guestLink: true, preview: false } });
+    useScreen.setState({ own: { phase: "choosing", attempt: 1, share: null, stream: { getVideoTracks: () => [t], getTracks: () => [t] } as unknown as MediaStream, surface: "tab", spec: legacySpec("text"), viewers: 0, guests: 0, guestLink: true, preview: false } });
     return t;
   };
+
+  it.each(["modern", "legacy", "unsupported"])("sends all quality choices safely to a %s server", async server => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    for (const mode of ["smooth", "sharp"] as const) for (const height of [720, 1080, 1440] as const) for (const fps of [15, 30, 60] as const) {
+      const spec = { mode, height, fps };
+      const { link, calls } = fakeLink({
+        "screen.spec.capabilities": () => { if (server === "unsupported") throw new Error("unknown operation"); return { screen_spec: server === "modern" }; },
+        "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }),
+      });
+      const screen = new ScreenController(() => link, String);
+      choosing(); useScreen.setState({ own: { ...useScreen.getState().own!, spec } });
+      await screen.confirmShare();
+      const sent = calls.find(([op]) => op === "screen.start")![1];
+      expect(sent.preset).toBe(mode === "sharp" ? "text" : fps === 60 ? "game" : height === 720 ? "saver" : "smooth");
+      if (server === "modern") expect(sent.spec).toEqual(spec);
+      else expect(Object.hasOwn(sent, "spec")).toBe(false);
+      await screen.stopShare();
+    }
+  });
 
   it("starts after the preset menu and publishes on the share's own transport", async () => {
     useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
@@ -342,12 +363,12 @@ describe("sharing", () => {
     const t = choosing();
     const confirming = screen.confirmShare();
     await flush();
-    screen.setPreset("saver");
+    screen.setQuality(legacySpec("saver"));
     started.resolve({ share: "M" });
     await confirming;
-    expect(media.publishers[0]!.params.preset).toBe("saver");
-    const { applyCapturePreset } = await import("../voice/screen");
-    expect(vi.mocked(applyCapturePreset).mock.calls.at(-1)).toEqual([t, "saver"]);
+    expect(media.publishers[0]!.params.quality).toEqual(legacySpec("saver"));
+    const { applyCaptureSpec } = await import("../voice/screen");
+    expect(vi.mocked(applyCaptureSpec).mock.calls.at(-1)).toEqual([t, legacySpec("saver")]);
   });
 
   it("refuses in an encrypted channel without sending anything", async () => {
@@ -374,7 +395,7 @@ describe("sharing", () => {
       choosing();
       configure(screen);
       await screen.confirmShare();
-      return { screen, start: calls[0]![1] };
+      return { screen, start: calls.find(([op]) => op === "screen.start")![1] };
     };
 
     it("asks for a link only where one is possible and the sharer left the checkbox on", async () => {

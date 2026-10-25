@@ -303,7 +303,7 @@ decode stays for browser compatibility.
   macroblock size. A two-second RTP timestamp window enforces max-mbps with
   10% tolerance without treating arrival jitter as an overrun.
   See [Browser interop](native-media.md#browser-interop) for the wire fields,
-  dimensions and recovery rules. The fixed-canvas screen e2e requires Game
+  dimensions and recovery rules. The fixed-canvas screen e2e requires smooth 1080p60
   1920×1080 H.264 at the sender and Chromium/WebKit receivers using real decoded
   dimensions. CI also checks adaptive real-tab capture with the selected codec
   and moving barcode, without requiring the capture to retain its maximum size.
@@ -335,24 +335,109 @@ A2 does not enable encrypted shares, browser AV1, HEVC, or native clients.
 VP8 is dropped. Verified H.264 decode probes and bounded recovery are described
 in [native-media.md, Browser interop](native-media.md#browser-interop).
 
-### Presets
+### Quality settings
 
-The user picks a preset. "Auto" is the default: Text for windows and tabs,
-Smooth for screens; Chromium's `displaySurface` setting tells which.
+Quality has three independent controls: **Mode** (Smoothness or Sharp text),
+**Resolution** (720p, 1080p or 1440p), and **Frame rate** (15, 30 or 60 fps).
+Polish mode labels are **Płynność** and **Ostry tekst**. There is no bitrate control.
+The resolved wire spec is `{mode: "smooth" | "sharp", height: 720 | 1080 | 1440,
+fps: 15 | 30 | 60}`. Capture preserves its aspect ratio, is bounded by the selected
+16:9 dimensions (1280×720, 1920×1080, 2560×1440), and is never upscaled.
 
-| Preset | Resolution cap | fps cap | `contentHint` | `degradationPreference` | max bitrate |
-| --- | --- | --- | --- | --- | --- |
-| Text (code, documents) | 1080p (native if smaller) | 15 | `detail` | `maintain-resolution` | 2.5 Mbps |
-| Smooth (default for screens) | 1080p | 30 | `detail` | `balanced` | 4 Mbps |
-| Game | 1080p | 60 | `motion` | `maintain-framerate` | 8 Mbps |
-| Saver | 720p | 30 | `detail` | `balanced` | 1.5 Mbps |
+| Mode | `contentHint` | `degradationPreference` |
+| --- | --- | --- |
+| Smoothness (`smooth`) | `motion` | `maintain-framerate` |
+| Sharp text (`sharp`) | `detail` | `maintain-resolution` |
 
-Game uses `maintain-framerate` from startup. The trial two-second resolution hold,
-even with a bounded early exit, delayed cadence and stable dimensions on shaped
-links, so the implementation uses a stuck-capture guard instead. There is no
-persistent sender size bound or resolution repricing controller. The capture caps,
-bitrate ceiling, priority and voice headroom remain the same; Text preserves
-resolution and Smooth/Saver keep `balanced`.
+With no saved choice, resolution is 1080p and cadence is 30 fps. Mode follows the
+captured surface: window/tab → sharp; screen/unknown → smooth. Clicking either
+mode saves it explicitly, including when it is already selected. Changing only
+resolution or cadence leaves the surface default in place for future shares.
+
+Bitrate is a pixel/frame budget: `min(12,000,000, max(250,000,
+round(width × height × fps × density(height) × modeFactor)))` bits/s.
+Smooth densities are `1,500,000/(1280×720×30)` at 720p,
+`4,000,000/(1920×1080×30)` at 1080p, and `6,000,000/(2560×1440×30)`
+at 1440p (approximately 0.05425, 0.06430 and 0.05425 bits/pixel/frame).
+`modeFactor` is 1 for smooth and 1.25 for sharp. The smaller/high-resolution
+budgets reflect codec overhead and spatial efficiency; the 12 Mb/s ceiling keeps
+1440p60 bounded. These are maximums, subject to the voice-headroom rule below.
+
+| Resolution | Smooth 15 / 30 / 60 fps (Mb/s) | Sharp 15 / 30 / 60 fps (Mb/s) |
+| --- | --- | --- |
+| 720p | 0.75 / 1.5 / 3 | 0.9375 / 1.875 / 3.75 |
+| 1080p | 2 / 4 / 8 | 2.5 / 5 / 10 |
+| 1440p | 3 / 6 / 12 | 3.75 / 7.5 / 12 |
+
+#### Persistence and migration
+
+Browser and desktop webview preferences share the existing localStorage
+`gwar.settings` store. Version 2 saves `screenMode` (null until explicitly picked),
+`screenHeight` and `screenFps` as separate values. Its automatic migration consumes
+an optional legacy `screenPreset`, preserves independently saved new fields,
+removes the old value, and is idempotent. Version 1 at the implementation base
+actually kept screen choices only in session memory; it had no screen preset
+localStorage key, native desktop store entry or server-side preference.
+`ServerSettings.tsx`'s color presets belong to role colors. No server database
+migration is needed for quality preferences.
+
+| Legacy choice | Migrated settings |
+| --- | --- |
+| text | sharp 1080p15 |
+| smooth | smooth 1080p30 |
+| game | smooth 1080p60 |
+| saver | smooth 720p30 |
+| auto / missing | surface-derived mode, 1080p30 |
+
+#### Updater-window wire compatibility
+
+A new client first queries `screen.spec.capabilities {}`. Only a successful
+`{screen_spec:true}` response opts that connection into specs. This is separate
+from the unchanged `screen.capabilities` H.264 advertisement, so old clients never
+receive unknown capability-response fields. Unknown operation / timeout falls
+back to legacy requests, without disconnecting. Negotiation is connection-local.
+
+| Sender / server / receiver | Representation |
+| --- | --- |
+| New client → old server | Required legacy `preset` only; no `spec` field |
+| Old client → new server | Legacy `preset` maps through the migration table |
+| New client → new server | Required legacy `preset` plus negotiated `spec`; server derives the legacy value from the spec |
+| New server → old client | Exact legacy `screen.started` / `Welcome.shares` shape; `preset` always present |
+| New server → opted-in client | `screen.started` includes `spec` and legacy `preset`; negotiation refreshes visible shares learned from Welcome |
+
+Fallback precedence: sharp → text; otherwise ≥45 fps → game; otherwise ≤720p →
+saver; otherwise smooth. `ScreenStart` and its nested spec reject unknown fields;
+new servers reject specs before negotiation. Welcome precedes negotiation and
+always has the legacy shape. TeamSpeak guest replies retain their legacy preset
+and unchanged H.264 advertisement; their loose watch parser needs no extension.
+Protocol, server integration, web frame-validator and client fallback tests cover
+these directions, invalid values and exact omission on legacy paths.
+
+#### Admission and native policy
+
+2560×1440 is 160×90 = **14,400 macroblocks/frame**, or **864,000 MB/s** at
+60 fps. H.264 level 5.1 admits 36,864 MB/frame and 983,040 MB/s; level 5.0
+admits only 589,824 MB/s. The existing 5.1 publish ceiling therefore stays.
+SPS and sender-clock admission tests exercise 1440p60; viewer capability checks
+remain authoritative and can request a lower codec-recovery cap.
+
+The default server per-share cap is now **12 Mb/s**. Explicit stored administrator
+limits (`meta.screen_limits`) remain authoritative, including existing 8 Mb/s
+limits; reservations, ingress byte buckets, egress pacing and the 300 Mb/s aggregate
+budget continue using that cap. The browser sends one layer; the SFU does not
+transcode or invent a 1080p tier. The native policy accepts `ScreenSpec` through
+`ControllerConfig::for_spec`, derives the matching tier/cadence and budget, preserves
+fps for smooth and resolution for sharp, and never enlarges small sources.
+Its legacy Text/Smooth/Game API retains the old ladders/rates for existing native
+callers and tests; new quality settings use the table above. Software fallback
+remains bounded to 1080p30. Encoder layers each apply their own quality policy.
+
+Smoothness uses `maintain-framerate` from startup. The trial two-second resolution
+hold delayed cadence on shaped links, so the implementation retains the bounded
+stuck-capture guard. There is no persistent sender size bound or resolution
+repricing controller. A repeated equal spec does not reset guard history: only an
+actual mode/height/fps change resets the user-settings backoff; surface identity
+and codec replacement retain their existing lifecycle resets.
 
 For a resolved `maintain-framerate` spec, the guard can reset Chromium's pending
 capture adaptation with a one-second `maintain-resolution` pulse, then restore the
@@ -419,7 +504,7 @@ immediately. It does not need spontaneous growth to enable pulses.
 retry envelopes, capped at sixty minutes, measured from the final pulse in the
 preceding cycle. One ordinary two-second polling interval is reserved inside each
 envelope for observing its completion; continuous eligibility and QP evidence survive
-suppression. Identity switches, preset/spec changes (including codec recovery caps),
+suppression. Identity switches, real mode/height/fps changes (and codec recovery),
 and fresh-frame improvement reset this backoff to ten minutes. Ceiling growth alone
 never resets it. With continuously healthy next-step capacity, valid advancing
 telemetry and ordinary polling, output below the spec gets a pulse within **at most
@@ -462,7 +547,7 @@ Notes on the table:
 - libwebrtc maps `detail`/`text` to maintain-resolution, turns off quality
   scaling, and enables VP9 screenshare tools. `motion` maps to
   maintain-framerate.
-- The server limits the bitrate per share (a server setting, default 8 Mbps)
+- The server limits the bitrate per share (a server setting, default 12 Mbps)
   and the SFU enforces it as a ceiling ([SFU](#3-the-sfu)).
 
 Measured at the spike's 4 Mbps cap with synthetic screen content (scrolling
@@ -630,7 +715,7 @@ datagrams reach the screen task without slowing voice down.
 - **On the sharer's uplink,** audio and video are separate peer connections
   with separate congestion controllers. Browser GCC is delay-based and backs
   off when the queue grows, which also protects audio. On top of that:
-  - the video `maxBitrate` is the preset cap, never more;
+  - the video `maxBitrate` is the resolved spec cap, never more;
   - the sharer lowers it to `0.7 × availableOutgoingBitrate` of the publish
     transport (from `getStats` `candidate-pair`) when that is lower, leaving
     30 % for voice and retransmissions;
@@ -1752,9 +1837,11 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
 - **Oracle's 10 TB/month of free outbound transfer** is about 5,500
   viewer-hours at 4 Mbps. For example, two shares a day, three hours each, five
   viewers each: 2 × 3 × 5 × 1.8 GB × 30 days ≈ 1.6 TB/month.
-  - At the limits, one full share (25 viewers × 8 Mbps = 200 Mbps, 90 GB an
-    hour) uses the 10 TB in **about 110 hours a month**. The whole 300 Mbps
-    budget uses it in about 74 hours.
+  - At the historical 8 Mbps setting, 25 viewers use 200 Mbps, 90 GB an
+    hour, or 10 TB in about 110 hours. At 12 Mbps the unchanged 300 Mbps
+    reservation budget limits viewer count before 25 full-rate slots (each reserves
+    another 30% for repairs/probes, plus publisher ingress). Actual 300 Mbps
+    outbound traffic uses 10 TB in about 74 hours.
   - Voice, the web app, file downloads and TeamSpeak count toward the same
     allowance.
 - **Monthly egress counter (PR 3b), from the network interface.** Counting
@@ -1828,7 +1915,7 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
 - Viewers per share: **25**, guests included.
 - Guests per share: **10** (`guests_per_share`).
 - Server-wide screen budget, reservations as above: **300 Mbps**.
-- Bitrate cap per share: **8 Mbps**.
+- Bitrate cap per share: **12 Mbps**.
 - TeamSpeak watch links: **on** (`screen_guest_links`).
 - Monthly egress warning: **10 TB** (`monthly_egress_tb`); no cut-off unless
   `monthly_egress_stop` is set.
@@ -1836,8 +1923,8 @@ Egress per viewer equals the share's rate (the SFU never transcodes):
   hidden channels are not revealed. For an encrypted share, from someone not
   in its call: `forbidden`.
 
-The owner confirmed these defaults (4 shares per channel, 25 viewers, 8 Mbps,
-300 Mbps) on 2026-10-21.
+The original 2026-10-21 defaults used 8 Mbps per share; quality settings raise
+that default to 12 Mbps for 1440p60 while retaining explicit saved limits.
 
 ## 4. Encryption
 
@@ -2137,7 +2224,7 @@ included ([Queues and repairs](#queues-and-repairs)).
 
 | Op | Body | Reply / effect |
 | --- | --- | --- |
-| `screen.start` | `{call, participation, preset, surface, guest_link}` (`surface`: `screen`/`window`/`tab`/`unknown`, display only; `guest_link`: post a TeamSpeak watch link where one is possible) | `{share}`, a 16-byte random id; checks `share_screen`, limits and budget; refused in encrypted channels until PR 7. Not announced until its publish transport connects; one not answered 35 s after its start, or not connected 35 s after its answer, ends with `transport`, told to the sharer only |
+| `screen.start` | `{call, participation, preset, spec?, surface, guest_link}` (`surface`: `screen`/`window`/`tab`/`unknown`, display only; `guest_link`: post a TeamSpeak watch link where one is possible) | `{share}`, a 16-byte random id; checks `share_screen`, limits and budget; refused in encrypted channels until PR 7. Not announced until its publish transport connects; one not answered 35 s after its start, or not connected 35 s after its answer, ends with `transport`, told to the sharer only |
 | `screen.publish.offer` | `{share, ssrc, rtx_ssrc, sdp}` | `{sdp}`; the share's own publish transport. Its first connection announces `screen.started` to the channel. One per share, reopened only by bounded SFU `screen.recover` |
 | `screen.stop` | `{share}` | ok; event `screen.stopped {share, reason: "stopped"}` |
 | `screen.watch.offer` | `{run, sdp, browser?, h264?}` | `{sdp}`; the session's watch transport (4 `recvonly` slots). `run` restarts it like voice's run; a run is retired for good once offered, so a failed or closed run and every lower one answer `stale` |
@@ -2158,7 +2245,7 @@ that omit all new fields.
 
 Events:
 
-- `screen.started {share, client, channel, preset, surface}`;
+- `screen.started {share, client, channel, preset, surface, spec?}` (spec only after negotiation);
 - `screen.viewers {share, members, guests}`, to the sharer only, and
   `screen.link {share, active}` to the sharer and, once the share is announced, the channel's moderators;
 - `screen.stopped {share, reason: stopped|moderator|left|limit|transport|budget|access|codec}`;
@@ -2557,10 +2644,9 @@ from native capture is PR 10.
     mute and deafen. It is disabled with a tooltip when missing permission,
     unsupported (Linux desktop, macOS < 14, mobile Chrome/Firefox) or in an
     encrypted channel without transforms.
-  - Click → the browser/OS picker → a small preset menu: Auto, Text, Smooth,
-    Game, Saver. In a bridged channel it has the TeamSpeak link notice and
+  - Click → the browser/OS picker → mode, resolution and frame-rate controls. In a bridged channel it has the TeamSpeak link notice and
     checkbox.
-  - The preset can change while sharing, with no renegotiation, through
+  - Mode, resolution and cadence can change while sharing, with no renegotiation, through
     `setParameters` and `applyConstraints`.
 - **While sharing.**
   - A red "You are sharing" bar with Stop (and Chromium's "Switch source"), at
@@ -2621,16 +2707,16 @@ badge, stage). Decisions taken while building it, where this design left room:
   "Screen sharing in encrypted channels is coming soon". The client also checks
   before `screen.start` and before watching, so nothing is captured, sent or
   watched there even if the server's refusal were missing.
-- **Auto preset without a surface.** Browsers that do not report
-  `displaySurface` (and canvas tracks) get Smooth, as screens do.
+- **Default mode without a surface.** Browsers that do not report
+  `displaySurface` (and canvas tracks) get Smoothness at 1080p30, as screens do.
 - **Uplink headroom floor.** The `0.7 × availableOutgoingBitrate` rule never
   lowers the cap below 250 kbps: an estimate that low recovers by probing, and a
   cap under it would starve the probe. It is re-read every 2 s and applied when
   it moves by more than 10 %.
-- **Changing the preset while sharing** changes the track constraints and the
-  sender parameters only. The server keeps announcing the preset the share
-  started with: there is no request to change it, and its per-share limit is
-  the server's cap, not the preset's. A change made while `screen.start` or
+- **Changing quality while sharing** changes the track constraints and the
+  sender parameters only. The server keeps announcing the initial quality and legacy
+  preset the share started with: there is no request to change it, and its per-share limit is
+  the server's cap, independent of the local quality setting. A change made while `screen.start` or
   the publish negotiation is still running is applied when the publisher
   starts.
 - **"Switch source"** is Chromium's own button, enabled by

@@ -220,7 +220,11 @@ async function share(page, surface, preset = null) {
   const dialog = page.getByRole("dialog", { name: "Share your screen" });
   await dialog.waitFor({ timeout: 20_000 });
   await dialog.getByText(surface, { exact: true }).waitFor();
-  if (preset) await dialog.getByRole("radio", { name: new RegExp(`^${preset}`) }).check();
+  if (preset) {
+    await dialog.getByRole("radio", { name: preset === "Text" ? "Sharp text" : "Smoothness", exact: true }).check();
+    await dialog.getByLabel("Resolution", { exact: true }).selectOption(preset === "Saver" ? "720" : "1080");
+    await dialog.getByLabel("Frame rate", { exact: true }).selectOption(preset === "Game" ? "60" : preset === "Text" ? "15" : "30");
+  }
   await dialog.getByRole("button", { name: "Share", exact: true }).click();
   await bar(page).getByText(/watching$/).waitFor({ timeout: 30_000 });
   const id = await ownShare(page);

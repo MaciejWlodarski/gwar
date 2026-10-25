@@ -83,18 +83,40 @@ wire! {
     #[serde(rename_all = "snake_case")]
     pub enum ScreenSurface { Screen, Window, Tab, Unknown }
 
-    /// The encoding preset a share starts with (docs/screen-share.md, "Presets").
+    /// Legacy encoding preset retained for updater-window compatibility.
     #[derive(Copy, Eq)]
     #[serde(rename_all = "snake_case")]
     pub enum ScreenPreset { Text, Smooth, Game, Saver }
 
-    /// Starts sharing into one's voice channel. Every field is required: a forgotten
+    /// Screen content preference, independent of size and cadence.
+    #[derive(Copy, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ScreenMode { Smooth, Sharp }
+
+    /// User quality settings. Only the advertised size/cadence choices are valid.
+    #[derive(Copy, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct ScreenSpec {
+        pub mode: ScreenMode,
+        #[serde(deserialize_with = "screen_height")]
+        #[cfg_attr(feature = "ts", ts(type = "720 | 1080 | 1440"))]
+        pub height: u16,
+        #[serde(deserialize_with = "screen_fps")]
+        #[cfg_attr(feature = "ts", ts(type = "15 | 30 | 60"))]
+        pub fps: u8,
+    }
+
+    /// Starts sharing into one's voice channel. Legacy fields stay required: a forgotten
     /// `guest_link` must never post a watch link.
     #[serde(deny_unknown_fields)]
     pub struct ScreenStart {
         pub call: String,
         pub participation: String,
         pub preset: ScreenPreset,
+        /// Present only after `screen.spec.capabilities` negotiation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        pub spec: Option<ScreenSpec>,
         pub surface: ScreenSurface,
         /// Post a TeamSpeak watch link where one is possible.
         pub guest_link: bool,
@@ -108,6 +130,10 @@ wire! {
         pub client: SessionId,
         pub channel: ChannelId,
         pub preset: ScreenPreset,
+        /// Present only after `screen.spec.capabilities` negotiation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        pub spec: Option<ScreenSpec>,
         pub surface: ScreenSurface,
     }
 
@@ -245,7 +271,7 @@ impl Default for ScreenLimits {
             shares_per_channel: 4,
             shares_per_server: 32,
             viewers_per_share: 25,
-            share_cap_kbps: 8_000,
+            share_cap_kbps: 12_000,
             budget_mbps: 300,
             monthly_egress_tb: 10,
             monthly_egress_stop: false,
@@ -287,6 +313,7 @@ mod tests {
                 client: 3,
                 channel: 4,
                 preset: ScreenPreset::Smooth,
+                spec: None,
                 surface: ScreenSurface::Screen,
             }),
             Event::ScreenStopped { share: "s".into(), reason: ScreenStopReason::Moderator, by: Some("mod".into()) },
@@ -476,5 +503,106 @@ mod tests {
         assert!(Permission::is_channel(Permission::ShareScreen));
         assert!(Permission::MEMBER_DEFAULT.contains(&Permission::ShareScreen));
         assert!(Permission::NEEDS_CONNECT.contains(&Permission::ShareScreen));
+    }
+}
+
+fn screen_height<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u16, D::Error> {
+    let value = <u16 as serde::Deserialize>::deserialize(d)?;
+    if [720, 1080, 1440].contains(&value) { Ok(value) } else { Err(serde::de::Error::custom("invalid screen height")) }
+}
+fn screen_fps<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u8, D::Error> {
+    let value = <u8 as serde::Deserialize>::deserialize(d)?;
+    if [15, 30, 60].contains(&value) { Ok(value) } else { Err(serde::de::Error::custom("invalid screen fps")) }
+}
+
+impl ScreenSpec {
+    /// Closest legacy representation for an older peer.
+    pub fn legacy(self) -> ScreenPreset {
+        match self.mode {
+            ScreenMode::Sharp => ScreenPreset::Text,
+            ScreenMode::Smooth if self.fps >= 45 => ScreenPreset::Game,
+            ScreenMode::Smooth if self.height <= 720 => ScreenPreset::Saver,
+            ScreenMode::Smooth => ScreenPreset::Smooth,
+        }
+    }
+}
+impl From<ScreenPreset> for ScreenSpec {
+    fn from(preset: ScreenPreset) -> Self {
+        match preset {
+            ScreenPreset::Text => Self { mode: ScreenMode::Sharp, height: 1080, fps: 15 },
+            ScreenPreset::Smooth => Self { mode: ScreenMode::Smooth, height: 1080, fps: 30 },
+            ScreenPreset::Game => Self { mode: ScreenMode::Smooth, height: 1080, fps: 60 },
+            ScreenPreset::Saver => Self { mode: ScreenMode::Smooth, height: 720, fps: 30 },
+        }
+    }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn quality_choices_legacy_mapping_and_invalid_wire_values() {
+        for mode in [ScreenMode::Smooth, ScreenMode::Sharp] {
+            for height in [720, 1080, 1440] {
+                for fps in [15, 30, 60] {
+                    let spec = ScreenSpec { mode, height, fps };
+                    assert_eq!(
+                        serde_json::from_value::<ScreenSpec>(serde_json::to_value(spec).unwrap()).unwrap(),
+                        spec
+                    );
+                    assert_eq!(
+                        spec.legacy(),
+                        if mode == ScreenMode::Sharp {
+                            ScreenPreset::Text
+                        } else if fps == 60 {
+                            ScreenPreset::Game
+                        } else if height == 720 {
+                            ScreenPreset::Saver
+                        } else {
+                            ScreenPreset::Smooth
+                        }
+                    );
+                }
+            }
+        }
+        for preset in [ScreenPreset::Text, ScreenPreset::Smooth, ScreenPreset::Game, ScreenPreset::Saver] {
+            assert_eq!(ScreenSpec::from(preset).legacy(), preset);
+        }
+        for spec in [
+            json!({"mode":"auto","height":1080,"fps":30}),
+            json!({"mode":"smooth","height":2160,"fps":60}),
+            json!({"mode":"sharp","height":1080,"fps":24}),
+            json!({"mode":"smooth","height":1440,"fps":60,"bitrate":12000000}),
+        ] {
+            assert!(serde_json::from_value::<ScreenSpec>(spec).is_err());
+        }
+    }
+
+    #[test]
+    fn legacy_start_remains_exact_and_new_start_is_an_explicit_extension() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct OldStart {
+            call: String,
+            participation: String,
+            preset: ScreenPreset,
+            surface: ScreenSurface,
+            guest_link: bool,
+        }
+        let legacy = json!({"call":"c","participation":"p","preset":"game","surface":"screen","guest_link":false});
+        let start: ScreenStart = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(start.spec, None);
+        assert_eq!(serde_json::to_value(start).unwrap(), legacy);
+        let old: OldStart = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            (old.call.as_str(), old.participation.as_str(), old.preset, old.surface, old.guest_link),
+            ("c", "p", ScreenPreset::Game, ScreenSurface::Screen, false)
+        );
+        let mut extended = legacy;
+        extended["spec"] = json!({"mode":"smooth","height":1440,"fps":60});
+        assert!(serde_json::from_value::<ScreenStart>(extended.clone()).unwrap().spec.is_some());
+        assert!(serde_json::from_value::<OldStart>(extended).is_err(), "client must omit spec on an old server");
     }
 }

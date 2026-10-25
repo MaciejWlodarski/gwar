@@ -143,6 +143,22 @@ pub(super) fn offered(sdp: &str, verified: &[gwar_proto::H264Capability]) -> Has
 mod tests {
     use super::*;
     #[test]
+    fn verified_1440p60_viewer_limits_admit_the_level_51_publish_stream() {
+        let cap = gwar_proto::H264Capability { profile_level_id: 0x42e033, max_fs: 14_400, max_mbps: 864_000 };
+        let limits = Limits::parse("packetization-mode=1;profile-level-id=42e01f", &[cap]).unwrap();
+        let stream = super::super::h264_stream::Requirements {
+            sps_id: 0,
+            profile: 0x42e033,
+            frame_mbs: 14_400,
+            width: 2560,
+            height: 1440,
+            mbps: 864_000,
+        };
+        assert!(limits.accepts_stream(&stream));
+        assert!(!Limits::parse("packetization-mode=1;profile-level-id=42e032", &[]).unwrap().accepts_stream(&stream));
+    }
+
+    #[test]
     fn promotion_requires_matching_verified_capability_even_for_explicit_low_levels() {
         let cap = gwar_proto::H264Capability { profile_level_id: 0x42e02a, max_fs: 8160, max_mbps: 489600 };
         for id in ["42e014", "42e01f"] {

@@ -473,7 +473,7 @@ async fn screen_limits_are_server_settings_and_the_egress_counter_reports_the_mo
 
     let egress = root.ok("server.egress", json!({})).await;
     let defaults = json!({
-        "shares_per_channel": 4, "shares_per_server": 32, "viewers_per_share": 25, "share_cap_kbps": 8000,
+        "shares_per_channel": 4, "shares_per_server": 32, "viewers_per_share": 25, "share_cap_kbps": 12000,
         "budget_mbps": 300, "monthly_egress_tb": 10, "monthly_egress_stop": false,
     });
     assert_eq!(egress["limits"], defaults);
@@ -603,4 +603,44 @@ async fn h264_srtp_forwarding_late_join_pli_and_mixed_codec_slots() {
     packets.sort_by_key(|p| p.sequence);
     assert_eq!(packets.iter().map(|p| p.sequence).collect::<Vec<_>>(), [14, 15, 16, 17]);
     assert_eq!(alice.publisher(&h264).repairs(), repairs, "viewer NACK stays on its own leg");
+}
+
+#[tokio::test]
+async fn quality_specs_require_negotiation_and_broadcast_only_to_negotiated_clients() {
+    let server = TestServer::start().await;
+    let mut sharer = Client::connect(&server, "new-sharer").await;
+    let mut legacy = Client::connect(&server, "legacy-viewer").await;
+    let mut modern = Client::connect(&server, "new-viewer").await;
+    let channel = seed_channel(&sharer, "General");
+    sharer.ok("channel.join", json!({"channel":channel})).await;
+    let voice = sharer.ok("voice.state", json!({})).await["voice"].clone();
+    let spec = json!({"mode":"smooth","height":1440,"fps":60});
+    let start = json!({"call":voice["call"],"participation":voice["participation"],"preset":"text","spec":spec,"surface":"screen","guest_link":false});
+    assert_eq!(
+        sharer.request("screen.start", start.clone()).await.unwrap_err().code,
+        gwar_proto::ErrorCode::BadRequest
+    );
+    assert_eq!(sharer.ok("screen.spec.capabilities", json!({})).await, json!({"screen_spec":true}));
+    modern.ok("screen.spec.capabilities", json!({})).await;
+    assert_eq!(legacy.ok("screen.capabilities", json!({})).await, json!({"screen_h264":true}));
+    let id = sharer.ok("screen.start", start).await["share"].as_str().unwrap().to_owned();
+    sharer.publish(&id).await;
+    let old_event = legacy.next_event("screen.started").await;
+    assert_eq!(old_event["preset"], "game", "server derives the closest legacy preset from the spec");
+    assert_eq!(old_event.as_object().unwrap().len(), 5, "old strict web schema receives exactly the legacy fields");
+    assert!(old_event.get("spec").is_none());
+    let new_event = modern.next_event("screen.started").await;
+    assert_eq!(new_event["spec"], spec);
+    assert_eq!(new_event["preset"], "game");
+    let late = Client::connect(&server, "late-legacy").await;
+    let welcome = serde_json::to_value(&late.welcome).unwrap();
+    assert_eq!(welcome["shares"][0]["preset"], "game");
+    assert!(welcome["shares"][0].get("spec").is_none(), "Welcome precedes negotiation");
+    sharer.ok("screen.stop", json!({"share":id})).await;
+    // An old sender is normalized even when a new receiver negotiated quality specs.
+    let id = legacy.share_in(channel).await;
+    let event = modern.next_event("screen.started").await;
+    assert_eq!(event["spec"], json!({"mode":"sharp","height":1080,"fps":15}));
+    assert_eq!(event["preset"], "text");
+    legacy.ok("screen.stop", json!({"share":id})).await;
 }

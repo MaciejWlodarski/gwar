@@ -5,6 +5,8 @@
  * The desktop app runs the same transports in its webview, beside the native voice engine: it
  * shares on macOS 14.6+ and Windows, watches on macOS and Windows, and does neither on Linux.
  */
+import { resolveQuality, legacyPreset, sameSpec, type ScreenSpec } from "../voice/screen-quality";
+import { useSettings } from "./settings";
 import { create } from "zustand";
 import { tNow } from "../i18n";
 import { RequestError, type Link } from "../net/connection";
@@ -12,7 +14,7 @@ import { isDesktop, tauri } from "../platform";
 import type { Event } from "../proto/Event";
 import type { ScreenStopReason } from "../proto/ScreenStopReason";
 import { nextMediaRun } from "../voice/engine";
-import { applyCapturePreset, captureScreen, captureSupport, resolvePreset, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PresetChoice, type PublishStats, type SlotStats } from "../voice/screen";
+import { applyCaptureSpec, captureScreen, captureSupport, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PublishStats, type SlotStats } from "../voice/screen";
 import { myChannelId } from "./reducer";
 import { useScreen, type ScreenAction } from "./screen";
 import { useSession, useUi } from "./stores";
@@ -69,7 +71,7 @@ async function loadDesktopCapture(): Promise<void> {
 }
 
 /**
- * Whether a share in my voice channel can get a TeamSpeak watch link, so the preset menu says so
+ * Whether a share in my voice channel can get a TeamSpeak watch link, so the quality menu says so
  * and offers the checkbox (docs/screen-share.md, "TeamSpeak watch links"): a bridged channel (on
  * a TeamSpeak server, plaintext and not private) where files open by link and watch links are on.
  */
@@ -123,7 +125,7 @@ export class ScreenController {
 
   /**
    * The Share button's click handler: opens the browser's picker at once, with nothing awaited
-   * before it (a user gesture and a focused document are required). The preset menu follows.
+   * before it (a user gesture and a focused document are required). The quality menu follows.
    */
   beginShare(): void {
     // The button refuses these too; the controller never relies on it.
@@ -131,7 +133,7 @@ export class ScreenController {
     const attempt = ++this.attempts;
     let picked: Promise<MediaStream>;
     try {
-      picked = captureScreen();
+      picked = captureScreen(resolveQuality(useSettings.getState(), "unknown"));
     } catch (e) {
       useUi.getState().toast("error", tNow("screen.captureFailed", { reason: e instanceof Error ? e.message : String(e) }));
       return;
@@ -145,6 +147,7 @@ export class ScreenController {
         // The browser's own "Stop sharing", or the shared window closing.
         track.addEventListener("ended", () => { if (useScreen.getState().own?.attempt === attempt) void this.stopShare(); });
         dispatch({ type: "picked", attempt, stream, surface: surfaceOf(track) });
+        dispatch({ type: "choose", spec: resolveQuality(useSettings.getState(), surfaceOf(track)) });
       },
       (e: unknown) => {
         dispatch({ type: "ownEnded", attempt });
@@ -162,18 +165,26 @@ export class ScreenController {
     );
   }
 
-  /** Picks the preset; while sharing it changes with no renegotiation. */
-  setPreset(choice: PresetChoice): void {
-    dispatch({ type: "choose", choice });
+  /** Saves only the changed controls; a surface-derived mode stays automatic until clicked. */
+  setQuality(patch: Partial<ScreenSpec>): void {
     const own = useScreen.getState().own;
-    if (own && (own.phase === "starting" || own.phase === "live")) void this.publisher?.setPreset(resolvePreset(choice, own.surface));
+    if (!own || own.phase === "picking") return;
+    useSettings.getState().setScreenQuality({
+      ...(patch.mode !== undefined ? { screenMode: patch.mode } : {}),
+      ...(patch.height !== undefined ? { screenHeight: patch.height } : {}),
+      ...(patch.fps !== undefined ? { screenFps: patch.fps } : {}),
+    });
+    const spec = { ...own.spec, ...patch };
+    if (sameSpec(spec, own.spec)) return;
+    dispatch({ type: "choose", spec });
+    if (own.phase === "starting" || own.phase === "live") void this.publisher?.setSpec(spec);
   }
 
   setPreview(on: boolean): void {
     dispatch({ type: "preview", on });
   }
 
-  /** The preset menu's "Post a watch link to TeamSpeak". */
+  /** The quality menu's "Post a watch link to TeamSpeak". */
   setGuestLink(on: boolean): void {
     dispatch({ type: "guestLink", on });
   }
@@ -190,14 +201,14 @@ export class ScreenController {
     catch (e) { useUi.getState().toast("error", this.describe(e)); }
   }
 
-  /** The preset menu's confirmation: `screen.start`, then the share's publish transport. */
+  /** The quality menu's confirmation: `screen.start`, then the share's publish transport. */
   async confirmShare(): Promise<void> {
     const own = useScreen.getState().own;
     const conn = this.link();
     const track = own?.stream?.getVideoTracks()[0];
     if (!own || own.phase !== "choosing" || !track) return;
-    const { attempt, preset, surface } = own;
-    // Only what the sharer saw and confirmed: the notice and the checkbox were in the preset menu.
+    const { attempt, spec, surface } = own;
+    // Only what the sharer saw and confirmed: the notice and the checkbox were in the quality menu.
     const guestLink = own.guestLink && this.guestLinkPossible();
     const current = () => useScreen.getState().own?.attempt === attempt && this.link() === conn;
     const s = useSession.getState();
@@ -207,10 +218,13 @@ export class ScreenController {
     // Never a share in the clear in an encrypted channel (docs/screen-share.md, "First release").
     if (s.channels[me.channel]?.encrypted) { this.endOwn(); useUi.getState().toast("info", tNow("screen.encryptedSoon")); return; }
     dispatch({ type: "starting", attempt });
-    await applyCapturePreset(track, preset);
+    await applyCaptureSpec(track, spec);
     let share: string;
     try {
-      share = (await conn.request("screen.start", { call: binding.call, participation: binding.participation, preset, surface, guest_link: guestLink })).share;
+      const screenSpec = await conn.request("screen.spec.capabilities", {}, { timeoutMs: 1_500 })
+        .then(features => features.screen_spec === true).catch(() => false);
+      if (!current()) return;
+      share = (await conn.request("screen.start", { call: binding.call, participation: binding.participation, preset: legacyPreset(spec), ...(screenSpec ? { spec } : {}), surface, guest_link: guestLink })).share;
     } catch (e) {
       if (!current()) return;
       this.endOwn();
@@ -219,16 +233,16 @@ export class ScreenController {
     }
     if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
     dispatch({ type: "started", attempt, share });
-    // The preset may have changed while `screen.start` ran: the publisher starts with the latest,
-    // and a later change reaches it through `setPreset`.
-    const latest = () => useScreen.getState().own?.preset ?? preset;
-    for (let applied = preset; latest() !== applied && current();) {
+    // Quality may have changed while `screen.start` ran: the publisher starts with the latest,
+    // and a later change reaches it through `setSpec`.
+    const latest = () => useScreen.getState().own?.spec ?? spec;
+    for (let applied = spec; !sameSpec(latest(), applied) && current();) {
       applied = latest();
-      await applyCapturePreset(track, applied);
+      await applyCaptureSpec(track, applied);
     }
     if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
     const publisher = new ScreenPublisher({
-      track, preset: latest(), iceServers: s.iceServers,
+      track, quality: latest(), iceServers: s.iceServers,
       offer: async body => (await conn.request("screen.publish.offer", { share, ...body }, { timeoutMs: 35_000 })).sdp,
       state: state => {
         if (state !== "failed" || this.publisher !== publisher) return;
@@ -246,7 +260,7 @@ export class ScreenController {
     }
   }
 
-  /** Stops my share (or closes the preset menu): locally at once, then on the server. */
+  /** Stops my share (or closes the quality menu): locally at once, then on the server. */
   async stopShare(): Promise<void> {
     const own = useScreen.getState().own;
     const conn = this.link();
@@ -421,6 +435,8 @@ export class ScreenController {
       offer: async (sdp, run, h264 = []) => {
         // Query explicitly: adding fields to Welcome would break old clients' strict
         // validators. An older server replies bad_request and retains legacy offers.
+        await conn.request("screen.spec.capabilities", {}, { timeoutMs: 1_500 }).catch(() => {});
+        if (this.transport !== transport) throw new Error("the watch transport was replaced");
         screenH264 = await conn.request("screen.capabilities", {}, { timeoutMs: 1_500 })
           .then(features => features.screen_h264 === true).catch(() => false);
         if (this.transport !== transport) throw new Error("the watch transport was replaced");

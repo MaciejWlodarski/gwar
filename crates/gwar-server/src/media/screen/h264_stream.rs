@@ -401,6 +401,23 @@ mod tests {
         v
     }
     #[test]
+    fn level_51_admits_1440p60_from_sps_and_sender_clock() {
+        let nal = make_sps(0x42e033, 160, 90, true, [0; 4]);
+        let parsed = sps(&nal).unwrap();
+        assert_eq!((parsed.width, parsed.height, parsed.frame_mbs), (2560, 1440, 14_400));
+        let (max_fs, max_mbps) = codec::level_resources(0x42e033).unwrap();
+        assert_eq!((max_fs, max_mbps), (36_864, 983_040));
+        assert!(parsed.frame_mbs <= max_fs && parsed.frame_mbs * 60 <= max_mbps);
+        assert!(parsed.frame_mbs * 60 > codec::level_resources(0x42e032).unwrap().1);
+        let mut admission = Admission::default();
+        admission.inspect(packet(0, 0, &nal, 0x42e033)).unwrap();
+        for n in 1..180u64 {
+            let ready = admission.inspect(packet(n, n as u32 * 1500, &[0x41, 1], 0x42e033)).unwrap();
+            assert_eq!(ready[0].h264.unwrap().frame_mbs, 14_400);
+        }
+    }
+
+    #[test]
     fn coded_macroblocks_cropping_interlacing_and_checked_sizes() {
         let r = sps(&make_sps(0x42e02a, 120, 68, true, [0, 0, 0, 4])).unwrap();
         assert_eq!((r.frame_mbs, r.width, r.height), (8160, 1920, 1080));

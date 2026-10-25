@@ -1,5 +1,5 @@
 /**
- * Screen sharing media in the web layer (docs/screen-share.md): the capture with its presets,
+ * Screen sharing media in the web layer (docs/screen-share.md): capture quality settings,
  * one share's publish transport and the session's watch transport. Plaintext channels only; the
  * server refuses shares in encrypted channels until encrypted shares land (PR 7), and nothing
  * here ever sends a share without being asked to.
@@ -11,35 +11,11 @@
 import type { H264Capability } from "../proto/H264Capability";
 import type { ScreenRecovery } from "../proto/ScreenRecovery";
 import type { IceServer } from "../proto/IceServer";
-import type { ScreenPreset } from "../proto/ScreenPreset";
+import { deriveSpec, sameSpec, type ScreenSpec, type ResolvedSpec } from "./screen-quality";
 import type { ScreenSurface } from "../proto/ScreenSurface";
 
 /** Receive slots of a watch transport (`gwar_proto::SCREEN_SLOTS`). */
 export const SCREEN_SLOTS = 4;
-
-/** What the sharer picks; "auto" follows the captured surface. */
-export type PresetChoice = "auto" | ScreenPreset;
-
-export interface PresetSpec {
-  /** Capture is capped at this size and never upscaled. */
-  width: number;
-  height: number;
-  fps: number;
-  hint: "detail" | "motion";
-  degradation: RTCDegradationPreference;
-  /** Bits per second. */
-  maxBitrate: number;
-}
-
-/** docs/screen-share.md, "Presets". */
-export const PRESETS: Record<ScreenPreset, PresetSpec> = {
-  text: { width: 1920, height: 1080, fps: 15, hint: "detail", degradation: "maintain-resolution", maxBitrate: 2_500_000 },
-  smooth: { width: 1920, height: 1080, fps: 30, hint: "detail", degradation: "balanced", maxBitrate: 4_000_000 },
-  game: { width: 1920, height: 1080, fps: 60, hint: "motion", degradation: "maintain-framerate", maxBitrate: 8_000_000 },
-  saver: { width: 1280, height: 720, fps: 30, hint: "detail", degradation: "balanced", maxBitrate: 1_500_000 },
-};
-
-export const PRESET_CHOICES: readonly PresetChoice[] = ["auto", "text", "smooth", "game", "saver"];
 
 /** The share of the uplink estimate video may use; the rest stays for voice and repairs. */
 export const UPLINK_SHARE = 0.7;
@@ -51,12 +27,6 @@ const HEADROOM_INTERVAL_MS = 2_000;
 export function surfaceOf(track: MediaStreamTrack): ScreenSurface {
   const surface = (track.getSettings() as { displaySurface?: string }).displaySurface;
   return surface === "monitor" ? "screen" : surface === "window" ? "window" : surface === "browser" ? "tab" : "unknown";
-}
-
-/** "Auto": Text for windows and tabs, Smooth for screens (and when the browser does not say). */
-export function resolvePreset(choice: PresetChoice, surface: ScreenSurface): ScreenPreset {
-  if (choice !== "auto") return choice;
-  return surface === "window" || surface === "tab" ? "text" : "smooth";
 }
 
 /** The video bitrate cap under the sharer's own uplink estimate (docs/screen-share.md, "Voice headroom"). */
@@ -254,14 +224,14 @@ type CaptureControllerCtor = new () => FocusController;
  * Chromium and WebKit refuse `getDisplayMedia` without a user gesture and a focused document,
  * so nothing may be awaited before it. Unknown dictionary members are ignored elsewhere.
  */
-export function captureScreen(): Promise<MediaStream> {
+export function captureScreen(spec: ScreenSpec = { mode: "smooth", height: 1080, fps: 30 }): Promise<MediaStream> {
   const Controller = (globalThis as { CaptureController?: CaptureControllerCtor }).CaptureController;
   const controller = typeof Controller === "function" ? new Controller() : null;
   const keepFocus = () => { try { controller?.setFocusBehavior?.("no-focus-change"); } catch { /* only allowed once, and only around the call */ } };
   // Sharing a window must not pull it in front of Gwar. Allowed before the call or right after it resolves.
   keepFocus();
   const options = {
-    video: { width: { max: 1920 }, height: { max: 1080 }, frameRate: { max: 60 } },
+    video: { width: { max: spec.height * 16 / 9 }, height: { max: spec.height }, frameRate: { max: spec.fps } },
     // No shared sound in phase 1 (docs/screen-share.md, "Shared audio").
     audio: false,
     systemAudio: "exclude",
@@ -272,9 +242,9 @@ export function captureScreen(): Promise<MediaStream> {
   return navigator.mediaDevices.getDisplayMedia(options).then(stream => { keepFocus(); return stream; });
 }
 
-/** The track's side of a preset: content hint and capture cap (`applyConstraints`, never upscaled). */
-export async function applyCapturePreset(track: MediaStreamTrack, preset: ScreenPreset): Promise<void> {
-  const spec = PRESETS[preset];
+/** The track's quality settings: content hint and capture cap (`applyConstraints`, never upscaled). */
+export async function applyCaptureSpec(track: MediaStreamTrack, quality: ScreenSpec): Promise<void> {
+  const spec = deriveSpec(quality);
   try { track.contentHint = spec.hint; } catch { /* not every engine knows the hint */ }
   await track.applyConstraints({ width: { max: spec.width }, height: { max: spec.height }, frameRate: { max: spec.fps } }).catch((e: unknown) => {
     console.warn("Screen capture constraints:", e);
@@ -310,7 +280,7 @@ export async function probeH264(): Promise<H264Capability[]> {
   const targets = [
     { width: 1280, height: 720, framerate: 30, bitrate: 1_500_000, level: 31, max_fs: 3600, max_mbps: 108000 },
     { width: 1920, height: 1080, framerate: 60, bitrate: 8_000_000, level: 42, max_fs: 8160, max_mbps: 489600 },
-    { width: 2560, height: 1440, framerate: 60, bitrate: 14_000_000, level: 51, max_fs: 14400, max_mbps: 864000 },
+    { width: 2560, height: 1440, framerate: 60, bitrate: 12_000_000, level: 51, max_fs: 14400, max_mbps: 864000 },
   ];
   let timer: ReturnType<typeof setTimeout> | undefined;
   const result: H264Capability[] = [];
@@ -421,7 +391,7 @@ function watchState(pc: RTCPeerConnection, report: (state: TransportState) => vo
 
 export interface PublishParams {
   track: MediaStreamTrack;
-  preset: ScreenPreset;
+  quality: ScreenSpec;
   iceServers: IceServer[];
   /** `screen.publish.offer` for this share: the server's answer. */
   offer(body: { ssrc: number; rtx_ssrc: number; sdp: string }): Promise<string>;
@@ -430,13 +400,13 @@ export interface PublishParams {
 
 /**
  * One share's publish transport: a `sendonly` video m-line with RTX, closed with the share.
- * The bitrate is the preset's cap, lowered to `UPLINK_SHARE` of the transport's own outgoing
+ * The bitrate is the resolved spec's cap, lowered to `UPLINK_SHARE` of the transport's own outgoing
  * estimate when that is lower; video is marked low priority so voice keeps the default.
  */
 export class ScreenPublisher {
   private pc: RTCPeerConnection | null = null;
   private sender: RTCRtpSender | null = null;
-  private preset: ScreenPreset;
+  private quality: ScreenSpec;
   private applied = 0;
   private desired = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -457,7 +427,7 @@ export class ScreenPublisher {
   private readonly ceiling: { width: number; height: number; known: boolean };
 
   constructor(private readonly params: PublishParams) {
-    this.preset = params.preset;
+    this.quality = { ...params.quality };
     const spec = this.spec();
     this.ceiling = { width: spec.width, height: spec.height, known: false };
     this.refreshSurface();
@@ -467,7 +437,7 @@ export class ScreenPublisher {
     const run = ++this.run;
     const { track, iceServers } = this.params, recovery = this.recovery;
     this.refreshSurface();
-    if (recovery) await track.applyConstraints({ width: { max: recovery.width }, height: { max: recovery.height }, frameRate: { max: recovery.fps } });
+    if (recovery) { const spec = this.spec(); await track.applyConstraints({ width: { max: spec.width }, height: { max: spec.height }, frameRate: { max: spec.fps } }); }
     if (this.closed || run !== this.run) return;
     const pc = new RTCPeerConnection(rtcConfig(iceServers));
     this.pc = pc;
@@ -490,27 +460,27 @@ export class ScreenPublisher {
     if (this.closed || this.pc !== pc) return;
     await pc.setRemoteDescription({ type: "answer", sdp: answer });
     if (this.closed || this.pc !== pc) return;
-    // The latest preset: `setPreset` may have run while this negotiated.
+    // The latest quality: `setSpec` may have run while this negotiated.
     this.refreshSurface();
     await this.applyParameters(this.spec().maxBitrate);
     if (this.closed || this.pc !== pc) return;
     this.timer = setInterval(() => void this.headroom(), HEADROOM_INTERVAL_MS);
   }
 
-  /** Changes the preset while sharing, with no renegotiation. */
-  async setPreset(preset: ScreenPreset): Promise<void> {
+  /** Changes quality while sharing, with no renegotiation. */
+  async setSpec(quality: ScreenSpec): Promise<void> {
     if (this.closed) return;
     this.refreshSurface();
-    if (preset !== this.preset) {
+    if (!sameSpec(quality, this.quality)) {
       this.cancelPhase();
       this.guard = new StuckCaptureGuard();
-      this.preset = preset;
+      this.quality = { ...quality };
     }
     const revision = this.revision;
-    await applyCapturePreset(this.params.track, preset);
+    await applyCaptureSpec(this.params.track, quality);
     if (this.closed || revision !== this.revision) return;
     const recovery = this.recovery;
-    if (recovery) await this.params.track.applyConstraints({ width: { max: recovery.width }, height: { max: recovery.height }, frameRate: { max: recovery.fps } });
+    if (recovery) { const spec = this.spec(); await this.params.track.applyConstraints({ width: { max: spec.width }, height: { max: spec.height }, frameRate: { max: spec.fps } }); }
     if (this.closed || revision !== this.revision) return;
     this.refreshSurface();
     await this.applyParameters(this.spec().maxBitrate);
@@ -642,7 +612,7 @@ export class ScreenPublisher {
    * L2. Expiry requires 30 seconds of healthy next-step capacity, not capacity
    *     for the full retained target. Continuous eligibility survives the fuse.
    * L3. Consecutive non-improving cycles back off 10/20/40/60 minutes, capped.
-   *     Improvement, identity and preset/spec changes reset that backoff. The
+   *     Improvement, identity and mode/size/fps changes reset that backoff. The
    *     2/7/100 pulses per half-open ten-minute window bounds still hold.
    */
   private refreshSurface(): MediaTrackSettings | undefined {
@@ -697,7 +667,7 @@ export class ScreenPublisher {
     const alive = () => !this.closed && this.pc === pc && this.sender === sender && this.revision === revision;
     if (sender && alive()) this.desired = maxBitrate;
     // Serialize read/modify/write transactions. A queued restore uses current state;
-    // a superseded preset or publisher cannot retry stale settings after an await.
+    // a superseded spec or publisher cannot retry stale settings after an await.
     this.parameters = this.parameters.then(async () => {
       if (!sender || !alive()) return;
       const spec = this.spec();
@@ -724,8 +694,8 @@ export class ScreenPublisher {
     return this.parameters;
   }
 
-  private spec(): PresetSpec {
-    const spec = PRESETS[this.preset], r = this.recovery;
+  private spec(): ResolvedSpec {
+    const spec = deriveSpec(this.quality), r = this.recovery;
     return r ? { ...spec, width: Math.min(spec.width, r.width), height: Math.min(spec.height, r.height), fps: Math.min(spec.fps, r.fps) } : spec;
   }
 

@@ -132,6 +132,7 @@ fn recovery_requires_ten_continuous_seconds_and_only_advances_one_step() {
         let recovered = encode(sample(&mut c, 27, healthy()));
         assert_ne!(RateDecision::Encode(recovered), degraded);
         let one_step = match preset {
+            Preset::Quality(_) => unreachable!("this test exercises legacy policies"),
             Preset::Text => (ResolutionTier::P1440, 10),
             Preset::Smooth => (ResolutionTier::P1440, 20),
             Preset::Game => (ResolutionTier::P1080, 60),
@@ -740,6 +741,34 @@ fn degraded_smooth_failovers_recover_with_the_same_nominal_rate() {
                 if second >= 111 {
                     assert_eq!(target.encoder.size, Size { width: 1920, height: 1074 });
                     assert_eq!(target.encoder.rate, RateControl { max_fps: 10, bitrate_bps: 1_005_208 });
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn quality_mode_preserves_resolution_or_cadence_under_pressure() {
+    use gwar_proto::{ScreenMode, ScreenSpec};
+    for mode in [ScreenMode::Smooth, ScreenMode::Sharp] {
+        for height in [720, 1080, 1440] {
+            for fps in [15, 30, 60] {
+                let spec = ScreenSpec { mode, height, fps };
+                let config = ControllerConfig::for_spec(spec, ResolutionTier::P2160.size(), 12_000_000).unwrap();
+                let mut c = RateController::new(config, &[caps(H264, true)]).unwrap();
+                let original = encode(c.decision());
+                assert_eq!(original.encoder.rate.max_fps, u32::from(fps));
+                assert_eq!(original.encoder.size, config.tier.size());
+                for n in 0..=30 {
+                    let decision = sample(&mut c, n, ControllerFeedback { encoder_dropped: true, ..healthy() });
+                    if let RateDecision::Encode(target) = decision {
+                        if mode == ScreenMode::Sharp {
+                            assert_eq!(target.encoder.size, original.encoder.size);
+                        } else {
+                            assert_eq!(target.encoder.rate.max_fps, original.encoder.rate.max_fps);
+                        }
+                        assert!(target.encoder.rate.bitrate_bps <= original.encoder.rate.bitrate_bps);
+                    }
                 }
             }
         }

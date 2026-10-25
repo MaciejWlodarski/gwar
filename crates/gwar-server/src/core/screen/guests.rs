@@ -804,6 +804,7 @@ mod tests {
                     channel,
                     call: String::new(),
                     preset: ScreenPreset::Smooth,
+                    spec: ScreenPreset::Smooth.into(),
                     surface: ScreenSurface::Screen,
                     guest_link: true,
                     link_revoked: false,
@@ -1248,6 +1249,7 @@ mod tests {
                         channel: s.channel,
                         call: s.call.clone(),
                         preset: s.preset,
+                        spec: s.spec,
                         surface: s.surface,
                         guest_link: true,
                         link_revoked: false,
@@ -1359,6 +1361,7 @@ mod tests {
                 call: v.call.clone(),
                 participation: v.participation.clone(),
                 preset: ScreenPreset::Smooth,
+                spec: None,
                 surface: ScreenSurface::Screen,
                 guest_link: false,
             };
@@ -1369,7 +1372,11 @@ mod tests {
             core.screen_limits.budget_mbps = 20;
             assert!(core.screen_start(member, start()).is_ok());
             assert!(core.guests[&guest].paused.is_some());
-            assert_eq!(core.screen_reserved(), 16_000_000, "pending guests release reservations too");
+            assert_eq!(
+                core.screen_reserved(),
+                20_000_000,
+                "8 Mbps existing share plus the new 12 Mbps default; pending guests release reservations too"
+            );
             assert!(matches!(event(&mut frames), Event::ScreenPaused { reason: ScreenPauseReason::Budget, .. }));
         })
         .await;

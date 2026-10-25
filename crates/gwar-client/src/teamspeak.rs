@@ -1104,6 +1104,7 @@ fn translate(request: &Request, own: u16, view: &View) -> Result<Vec<(Part, OutC
         | Request::ScreenLinkRevoke { .. }
         | Request::ScreenPublishOffer(_)
         | Request::ScreenWatchOffer(_)
+        | Request::ScreenSpecCapabilities {}
         | Request::ScreenCapabilities {}
         | Request::ScreenFocus { .. }
         | Request::ScreenDecodeFailed { .. }

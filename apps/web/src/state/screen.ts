@@ -6,12 +6,12 @@
  * (`SessionState.shares`), not this.
  */
 import { create } from "zustand";
-import type { ScreenPreset } from "../proto/ScreenPreset";
 import type { ScreenSurface } from "../proto/ScreenSurface";
-import { resolvePreset, SCREEN_SLOTS, type PresetChoice } from "../voice/screen";
+import { SCREEN_SLOTS } from "../voice/screen";
+import { resolveQuality, defaultQuality, sameSpec, type ScreenSpec } from "../voice/screen-quality";
 
 /**
- * My share: `picking` while the browser's picker is open, `choosing` in the preset menu,
+ * My share: `picking` while the browser's picker is open, `choosing` in the quality menu,
  * `starting` from `screen.start` until the server announces it, then `live`.
  */
 export type OwnPhase = "picking" | "choosing" | "starting" | "live";
@@ -23,13 +23,12 @@ export interface OwnShare {
   share: string | null;
   stream: MediaStream | null;
   surface: ScreenSurface;
-  choice: PresetChoice;
-  preset: ScreenPreset;
+  spec: ScreenSpec;
   /** Members watching, from `screen.viewers`. */
   viewers: number;
   /** TeamSpeak guests watching through the watch link, from `screen.viewers`. */
   guests: number;
-  /** The preset menu's "Post a watch link to TeamSpeak", on by default. */
+  /** The quality menu's "Post a watch link to TeamSpeak", on by default. */
   guestLink: boolean;
   /** The sharer's own thumbnail, off by default. */
   preview: boolean;
@@ -69,7 +68,7 @@ export interface ScreenState {
 export type ScreenAction =
   | { type: "pick"; attempt: number }
   | { type: "picked"; attempt: number; stream: MediaStream; surface: ScreenSurface }
-  | { type: "choose"; choice: PresetChoice }
+  | { type: "choose"; spec: ScreenSpec }
   | { type: "starting"; attempt: number }
   | { type: "started"; attempt: number; share: string }
   | { type: "live"; share: string }
@@ -119,13 +118,14 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
   switch (action.type) {
     case "pick":
       if (state.own) return state;
-      return { ...state, own: { phase: "picking", attempt: action.attempt, share: null, stream: null, surface: "unknown", choice: "auto", preset: "smooth", viewers: 0, guests: 0, guestLink: true, preview: false } };
+      return { ...state, own: { phase: "picking", attempt: action.attempt, share: null, stream: null, surface: "unknown", spec: resolveQuality(defaultQuality, "unknown"), viewers: 0, guests: 0, guestLink: true, preview: false } };
     case "picked":
-      return setOwn(state, action.attempt, ["picking"], { phase: "choosing", stream: action.stream, surface: action.surface, preset: resolvePreset("auto", action.surface) });
+      return setOwn(state, action.attempt, ["picking"], { phase: "choosing", stream: action.stream, surface: action.surface, spec: resolveQuality(defaultQuality, action.surface) });
     case "choose": {
       const own = state.own;
       if (!own || own.phase === "picking") return state;
-      return { ...state, own: { ...own, choice: action.choice, preset: resolvePreset(action.choice, own.surface) } };
+      if (sameSpec(own.spec, action.spec)) return state;
+      return { ...state, own: { ...own, spec: { ...action.spec } } };
     }
     case "starting":
       return setOwn(state, action.attempt, ["choosing"], { phase: "starting" });

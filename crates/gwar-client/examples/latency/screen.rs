@@ -1,5 +1,5 @@
 //! Screen load beside the voice measurement (docs/screen-share.md, "Voice headroom and
-//! acceptance"): str0m frame-mode publishers send synthetic VP9-sized frames at a preset's rate
+//! acceptance"): str0m frame-mode publishers send synthetic VP9-sized frames at the requested diagnostic rate
 //! into real shares, and str0m viewers watch them, through the same server as the voice clients.
 //!
 //! `LATENCY_SCREEN=shares=1,bitrate=8mbit,fps=60,keyframe=200000,viewers=5,via=none`:
@@ -12,8 +12,8 @@
 use anyhow::{Context, Result, bail, ensure};
 use gwar_client::{ClientError, ConnectOptions, Connected, Identity, connect};
 use gwar_proto::{
-    ClientSoftware, ErrorCode, Platform, Request, ScreenPreset, ScreenPublishOffer, ScreenStart, ScreenSurface,
-    ScreenWatchOffer,
+    ClientSoftware, ErrorCode, Platform, Request, ScreenMode, ScreenPublishOffer, ScreenSpec, ScreenStart,
+    ScreenSurface, ScreenWatchOffer,
 };
 use serde::Serialize;
 use std::{
@@ -106,21 +106,31 @@ impl Spec {
         ensure!((1..=MAX_SHARES).contains(&spec.shares), "shares must be within 1..{MAX_SHARES}");
         ensure!((1..=MAX_VIEWERS).contains(&spec.viewers), "viewers must be within 1..{MAX_VIEWERS}");
         ensure!(spec.shares + spec.viewers <= MAX_CONNECTIONS, "shares and viewers may be {MAX_CONNECTIONS} together");
-        ensure!((100_000..=8_000_000).contains(&spec.bitrate), "bitrate must be within 100kbit..8mbit (Game's cap)");
+        ensure!((100_000..=12_000_000).contains(&spec.bitrate), "bitrate must be within 100kbit..12mbit (quality cap)");
         ensure!((1..=120).contains(&spec.fps), "fps must be within 1..120");
         ensure!((1_000..=2_000_000).contains(&spec.keyframe), "keyframe must be within 1000..2000000 bytes");
         Ok(spec)
     }
 }
 
-/// The encoder preset whose rate fits `bitrate` (docs/screen-share.md, "Presets").
-/// The SFU's admission ceiling is server-wide; viewer demand uses measured media.
-fn preset(bitrate: u64) -> ScreenPreset {
-    match bitrate {
-        ..=1_500_000 => ScreenPreset::Saver,
-        1_500_001..=2_500_000 => ScreenPreset::Text,
-        2_500_001..=4_000_000 => ScreenPreset::Smooth,
-        _ => ScreenPreset::Game,
+/// Synthetic load settings are diagnostics; describe them with the closest supported quality.
+fn quality(load: &Spec) -> ScreenSpec {
+    ScreenSpec {
+        mode: ScreenMode::Smooth,
+        height: if load.bitrate > 8_000_000 {
+            1440
+        } else if load.bitrate <= 1_500_000 {
+            720
+        } else {
+            1080
+        },
+        fps: if load.fps > 30 {
+            60
+        } else if load.fps > 15 {
+            30
+        } else {
+            15
+        },
     }
 }
 
@@ -323,10 +333,18 @@ async fn run(
         sharer.connection.join(channel, None).await?;
         let state = sharer.connection.request(Request::VoiceState {}).await?;
         let binding = |key: &str| state["voice"][key].as_str().unwrap_or("AAAAAAAAAAAAAAAAAAAAAA").to_owned();
+        let quality = quality(&spec);
+        let negotiated = sharer
+            .connection
+            .request(Request::ScreenSpecCapabilities {})
+            .await
+            .ok()
+            .is_some_and(|reply| reply["screen_spec"] == true);
         let start = ScreenStart {
             call: binding("call"),
             participation: binding("participation"),
-            preset: preset(spec.bitrate),
+            preset: quality.legacy(),
+            spec: negotiated.then_some(quality),
             surface: ScreenSurface::Screen,
             guest_link: false,
         };
@@ -724,7 +742,7 @@ mod tests {
             "shares=0",
             "shares=5",
             "bitrate=1",
-            "bitrate=9mbit",
+            "bitrate=13mbit",
             "via=up",
             "fps=1,fps=2",
             "colour=red",

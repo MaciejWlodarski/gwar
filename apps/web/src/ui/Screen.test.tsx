@@ -11,7 +11,7 @@ import { useDesktopCapture, type DesktopCapture } from "../state/screen-controll
 import { useSettings } from "../state/settings";
 import { useSession } from "../state/stores";
 import { TooltipProvider } from "./kit";
-import { LiveBadge, ShareButton } from "./Screen";
+import { LiveBadge, ShareButton, SharingBar } from "./Screen";
 
 const channel = (id: number, extra: Partial<Channel> = {}): Channel => ({
   id, parent: null, name: `c${id}`, topic: "", position: id, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false, ...extra,
@@ -106,4 +106,20 @@ describe("the Share button and LIVE badge", () => {
     await show(true);
     expect(button()?.getAttribute("aria-label")).toBe("Screen sharing in encrypted channels is coming soon.");
   });
+});
+
+
+it("shows independent quality controls and saves an explicit click on the surface-default mode", async () => {
+  useSettings.setState({ screenMode: null, screenHeight: 1080, screenFps: 30, language: "pl" });
+  useScreen.getState().dispatch({ type: "pick", attempt: 1 });
+  useScreen.getState().dispatch({ type: "picked", attempt: 1, stream: {} as MediaStream, surface: "screen" });
+  useScreen.getState().dispatch({ type: "starting", attempt: 1 });
+  await act(async () => root.render(<SharingBar />));
+  expect(container.textContent).toContain("1080p30 · Płynność");
+  const modes = container.querySelectorAll<HTMLInputElement>('input[type="radio"]');
+  expect(modes).toHaveLength(2);
+  expect(container.textContent).toContain("Ostry tekst");
+  expect(container.querySelectorAll("select")).toHaveLength(2);
+  await act(async () => modes[0]!.click());
+  expect(useSettings.getState().screenMode).toBe("smooth");
 });

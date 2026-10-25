@@ -812,6 +812,18 @@ mod tests {
     }
 
     #[test]
+    fn quality_1440p60_uses_a_12mbit_share_without_an_8mbit_tier_clamp() {
+        let mut sim = Sim::with_seed(Some(40_000_000), 144060);
+        sim.watch_capped("1440p60", 12_000_000, 60, 200_000, None, 12_000_000);
+        while sim.elapsed() < 45 * SECOND {
+            sim.tick();
+        }
+        assert!(sim.changes.is_empty(), "{}", summary(&sim));
+        let bytes = sim.bytes(sim.now - 10 * SECOND, sim.now, |k| matches!(k, Kind::Original { .. }));
+        assert!(bytes as f64 * 8.0 / 10.0 > 8_000_000.0, "{}", summary(&sim));
+    }
+
+    #[test]
     fn game_startup_with_scheduler_jitter_does_not_pause_a_healthy_viewer() {
         for step in [1, 2, 5, 10] {
             let mut sim = Sim::new(None);
