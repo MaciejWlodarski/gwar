@@ -376,12 +376,16 @@ output with fresh encoded-frame progress after restore. Duplicate reads do not
 restart that clock; missing or frozen counters cannot establish recovery. Two unsuccessful attempts suppress further pulses;
 the QP escape is one-shot. Suppression expires after ten minutes plus thirty
 continuous seconds of healthy target capacity without CPU limitation. Successful
-recovery discards the old size reference. Stable surface enlargement, unpressured
-shrink and surface identity changes refresh the target and reset guard/QP history.
-Independent resize/switch settings evidence survives older in-flight source stats
-until corroborated; application constraint writes clear it. Encoder adaptation and
-pulse-induced growth cannot supply resize evidence. Preset caps never replace
-physical surface evidence; live observations update it through the same rule. The one-second deadline is
+recovery discards the old size reference. Surface identity changes immediately cancel
+the previous surface's pulse/outcome and reset guard/QP history. Physical dimensions
+need two seconds of stable clean settings corroborated by source stats; settings can
+arrive before or after those stats. The previous surface's pulse cannot exclude a
+new surface's clean proof. CPU/bandwidth adaptation, a pulse or an outcome of the
+current surface contaminate their observed dimensions even after the limitation
+clears; a new clean settings size or surface can establish proof again. Application
+constraint writes discard pending proof and mark their resulting settings unproven,
+while retaining the proven physical size. Pulse eligibility and suppression expiry
+use the latest proven target under the current preset and recovery caps. The one-second deadline is
 independent of sender promise completion, with serialized current-state restores.
 Preset changes, close and codec replacement fence queued parameters and cancel
 phase/sampling timers. `scaleResolutionDownBy` only enforces the existing

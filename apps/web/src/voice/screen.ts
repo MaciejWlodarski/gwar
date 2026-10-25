@@ -438,9 +438,7 @@ export class ScreenPublisher {
   private parameters: Promise<void> = Promise.resolve();
   private adaptationSent: { bytes: number; at: number } | null = null;
   private surfaceKey: (string | undefined)[] = [];
-  private surfaceCandidate: { width: number; height: number; since: number } | null = null;
-  private surfaceSettings: MediaTrackSettings | undefined;
-  private surfacePending: { width?: number; height?: number; since: number } | null = null;
+  private surfaceObservation: { width?: number; height?: number; since: number; clean: boolean } | null = null;
   private captureChanges = 0;
   private readonly captureSize: { width: number; height: number; known: boolean };
 
@@ -449,7 +447,6 @@ export class ScreenPublisher {
     const settings = params.track.getSettings?.(), spec = this.spec();
     const width = settings?.width, height = settings?.height;
     this.surfaceKey = [settings?.deviceId, settings?.displaySurface];
-    this.surfaceSettings = settings;
     this.captureSize = {
       width: width ?? spec.width, height: height ?? spec.height,
       known: width !== undefined && height !== undefined && Number.isFinite(width * height) && width > 0 && height > 0,
@@ -607,69 +604,57 @@ export class ScreenPublisher {
     this.sampleTimer = setTimeout(poll, 250);
   }
 
+  /**
+   * Surface proof rules:
+   * - Identity changes cancel the old surface's pulse/outcome and reset its history
+   *   BEFORE judging the new surface's evidence. Identity alone proves no size.
+   * - One settings observation owns its provenance and stability clock. Only clean
+   *   settings stable for two seconds, corroborated by source stats, prove a size.
+   * - Adaptation of THIS surface (CPU/bandwidth, pulse or outcome) contaminates that
+   *   observation, even after its limitation clears. A new clean settings size or
+   *   surface starts fresh; rejected evidence cannot poison that later observation.
+   * - Application writes discard pending proof, retain the proven size, and mark
+   *   their resulting settings as unproven. A cap is never a physical resize.
+   * - Guard, fuse and expiry always use the latest proven size under the live spec.
+   */
   private async changeCapture(apply: () => Promise<void>): Promise<void> {
-    // Settings changed by our own constraints are not independent resize evidence.
     this.captureChanges++;
-    this.surfaceCandidate = null;
-    this.surfacePending = null;
+    this.surfaceObservation = null;
     try { await apply(); }
     finally {
-      this.captureChanges--;
-      this.surfaceSettings = this.params.track.getSettings?.();
-      this.surfaceCandidate = null;
-      this.surfacePending = null;
+      this.captureChanges = Math.max(0, this.captureChanges - 1);
+      if (!this.closed) {
+        const settings = this.params.track.getSettings?.();
+        this.surfaceObservation = { width: settings?.width, height: settings?.height, since: performance.now(), clean: false };
+      }
     }
   }
 
   private refreshSurface(settings: MediaTrackSettings | undefined, source: { width?: number; height?: number } | undefined, out: OutboundVideo | undefined): void {
-    const previousSettings = this.surfaceSettings;
-    this.surfaceSettings = settings;
     const key = [settings?.deviceId, settings?.displaySurface, out?.mediaSourceId];
-    const keyChanged = key.some((value, i) => value !== undefined && this.surfaceKey[i] !== undefined && value !== this.surfaceKey[i]);
+    const switched = key.some((value, i) => value !== undefined && this.surfaceKey[i] !== undefined && value !== this.surfaceKey[i]);
     this.surfaceKey = key.map((value, i) => value ?? this.surfaceKey[i]);
-    // getSettings() can already describe a resize/switch while an in-flight
-    // getStats() still describes the old surface. Keep the independent evidence.
-    if (!this.captureChanges && (keyChanged || (previousSettings && (previousSettings.width !== settings?.width || previousSettings.height !== settings?.height)))) {
-      this.surfacePending = { width: settings?.width, height: settings?.height, since: performance.now() };
-    }
-    const width = source?.width ?? settings?.width ?? 0, height = source?.height ?? settings?.height ?? 0;
-    const valid = Number.isFinite(width * height) && width > 0 && height > 0;
-    // Capture the exclusion before a switch resets the pulse/outcome history.
-    const adapting = this.captureChanges > 0 || this.phase !== null || this.guard.tracking || out?.qualityLimitationReason !== "none";
-    if (keyChanged) {
+    if (switched) {
       this.cancelPhase(); this.guard = new StuckCaptureGuard(); this.adaptationSent = null;
+      this.surfaceObservation = null;
       void this.applyParameters(this.desired || this.spec().maxBitrate);
     }
-    // Identity resets history immediately, but never proves physical dimensions.
-    // Adaptation also invalidates pending sizes if source stats have not caught up.
-    if (!valid || adapting) {
-      this.surfaceCandidate = null;
-      this.surfacePending = null;
-      return;
+    const now = performance.now(), width = settings?.width, height = settings?.height;
+    const clean = !this.captureChanges && !this.phase && !this.guard.tracking && out?.qualityLimitationReason === "none";
+    let observation = this.surfaceObservation;
+    if (!observation || observation.width !== width || observation.height !== height) {
+      observation = this.surfaceObservation = { width, height, since: now, clean };
     }
-    const pending = this.surfacePending;
-    const matchesSettings = settings?.width === width && settings?.height === height;
-    const corroborated = matchesSettings && pending?.width === width && pending?.height === height;
-    if (corroborated) this.surfacePending = null;
-    const oldPixels = this.captureSize.width * this.captureSize.height;
-    const pixels = width * height;
-    const grows = !this.captureSize.known || pixels > oldPixels;
-    // A smaller media-source/output pair alone can be an application cap. Require
-    // a settings change with unchanged requested constraints, then stable evidence.
-    // Bandwidth/CPU adaptation can change settings too, so retain that exclusion.
-    const candidate = this.surfaceCandidate;
-    const resized = matchesSettings && (corroborated || (candidate?.width === width && candidate.height === height));
-    const shrinks = resized && pixels < oldPixels &&
-      width >= (out?.frameWidth ?? Infinity) && height >= (out?.frameHeight ?? Infinity);
-    if (!grows && !shrinks) { this.surfaceCandidate = null; return; }
-    const now = performance.now();
-    // Clean settings may precede source stats; retain their stability interval.
-    const since = corroborated ? pending.since : candidate?.width === width && candidate.height === height ? candidate.since : now;
-    if (now - since < 2_000) {
-      this.surfaceCandidate = { width, height, since }; return;
-    }
+    // Keep the dimensions when invalidating proof: unchanged adapted/capped settings
+    // must not become a fresh resize merely because their limitation later clears.
+    observation.clean &&= clean;
+    if (!observation.clean || width === undefined || height === undefined ||
+      !Number.isFinite(width * height) || width <= 0 || height <= 0 ||
+      source?.width !== width || source.height !== height ||
+      width < (out?.frameWidth ?? Infinity) || height < (out?.frameHeight ?? Infinity)) return;
+    if (now - observation.since < 2_000 ||
+      (this.captureSize.known && width === this.captureSize.width && height === this.captureSize.height)) return;
     this.captureSize.width = width; this.captureSize.height = height; this.captureSize.known = true;
-    this.surfaceCandidate = null;
     this.guard = new StuckCaptureGuard(); this.adaptationSent = null;
   }
 
@@ -680,7 +665,6 @@ export class ScreenPublisher {
     this.phase = null;
     if (this.sampleTimer) clearTimeout(this.sampleTimer);
     this.sampleTimer = null;
-    this.surfaceCandidate = null;
   }
 
   private endPhaseAfter(ms: number): void {
@@ -755,6 +739,11 @@ export class ScreenPublisher {
   close(): void {
     this.closed = true;
     this.cancelPhase();
+    this.surfaceObservation = null;
+    this.captureChanges = 0;
+    this.guard = new StuckCaptureGuard();
+    this.adaptationSent = null;
+    this.polling = null;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
     this.stopWatching();
