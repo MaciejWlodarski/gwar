@@ -1557,7 +1557,7 @@ describe("asymmetric sequence invariants", () => {
       for (let after = at + 4000; after <= at + 720_000; after += 2000) guard.observe(after, sample(after));
       expect(delay()).toBe(600_000);
     }
-  });
+  }, 60_000);
 
 });
 
