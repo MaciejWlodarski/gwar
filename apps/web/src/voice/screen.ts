@@ -191,7 +191,9 @@ export class StuckCaptureGuard {
     // Both GCC's estimate (after voice headroom) and its encoder target must support it.
     // Dense content may need much more than the nominal screen-content budget.
     // Do not reset legitimate quality scaling when the current size already uses it.
-    const largerSource = (sample.captureWidth ?? sample.sourceWidth) * (sample.captureHeight ?? sample.sourceHeight) > outputPixels * 1.5;
+    // L1 also applies to the QP escape: first observation may already be adapted.
+    const largerSource = Math.max((sample.captureWidth ?? sample.sourceWidth) * (sample.captureHeight ?? sample.sourceHeight),
+      (sample.specWidth ?? 0) * (sample.specHeight ?? 0)) > outputPixels * 1.5;
     const useQp = !this.qpAttempted && quality.low && outputPixels > 0 && outputPixels < pixels * 0.5 && largerSource;
     // At low QP, spending the encoder target at 270p does not price native
     // content: those bits buy excess precision at the stalled size. Still require

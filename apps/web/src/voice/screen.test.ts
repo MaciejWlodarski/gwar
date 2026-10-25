@@ -557,7 +557,7 @@ describe("publisher capture guard", () => {
     await vi.advanceTimersByTimeAsync(5000);
     if (kind === "clock-change") vi.setSystemTime(Date.now() + 60_000);
     await vi.advanceTimersByTimeAsync(3000);
-    expect(last().degradationPreference).toBe(kind === "fresh" || kind === "clock-change" ? "maintain-resolution" : "maintain-framerate");
+    expect(last().degradationPreference).toBe(kind === "fresh" || kind === "clock-change" || kind === "unknown-source" ? "maintain-resolution" : "maintain-framerate");
     await vi.advanceTimersByTimeAsync(1000);
     expect(last().degradationPreference).toBe("maintain-framerate");
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
@@ -1301,6 +1301,37 @@ describe("asymmetric ceiling behavior", () => {
 
 // No clean tails: check the oracle after every partial transition and every poll.
 describe("asymmetric sequence invariants", () => {
+  it.each([false, true])("checks J5 for a low-QP stall with retained larger dimensions=%s (round nine)", observed => {
+    // First seed ports the reviewer's exact 3,700-second VP9 QP-12 repro and
+    // retained-snapshot control; other seeds vary codec and polling phase.
+    for (let seed = 0; seed < 8; seed++) {
+      const guard = new StuckCaptureGuard(), pulses: number[] = [];
+      const start = seed * 17, codec = seed % 2 ? "video/H264" : "video/VP9";
+      let healthyAt = start;
+      for (let now = start; now <= start + 3_700_000; now += 2000) {
+        const frames = 1 + now / 50;
+        const pulse = guard.observe(now, {
+          width: 480, height: 270, sourceWidth: 480, sourceHeight: 270,
+          targetWidth: observed ? 1920 : 480, targetHeight: observed ? 1080 : 270,
+          specWidth: 1920, specHeight: 1080,
+          captureWidth: observed ? 1920 : 480, captureHeight: observed ? 1080 : 270,
+          fps: 20, available: 2_500_000, targetBitrate: 1_750_000,
+          bitrate: 1_200_000, limitation: "none", framesEncoded: frames,
+          quality: { id: "out", encoder: "libvpx", codec, sum: frames * 12,
+            frames, at: now, width: 480, height: 270 },
+        });
+        // The independent oracle prices nominal 720p20 + 50% spare at
+        // 1,105,920 bps, below the 1,750,000 bps budget. Adapted payload
+        // extrapolation would demand 12.8 Mb/s and violate this J5 bound.
+        if (pulse) { pulses.push(now); healthyAt = now; }
+        expect(now - healthyAt, `J5 observed=${observed}, seed=${seed}`).toBeLessThanOrEqual(3_600_000);
+        expect(pulses.filter(at => at > now - 600_000).length, `J6 seed=${seed}`).toBeLessThanOrEqual(2);
+      }
+      expect(pulses[0]).toBe(start + 6000);
+      expect(pulses.length).toBeGreaterThan(1); // Expiry must preserve QP liveness too.
+    }
+  });
+
   it("checks J1–J6 at every step of 3,072 seeded asynchronous sequences", async () => {
     let seed = 0x16807;
     const random = (n: number) => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) % n; };

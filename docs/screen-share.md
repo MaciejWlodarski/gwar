@@ -362,9 +362,11 @@ spec and otherwise four times the current pixels, with a 720p floor. The bpp bud
 with measured payload demand, leaving genuinely expensive content alone.
 
 A low-QP escape handles a stalled encoder spending most of its bitrate target at a
-small size. It requires output below half the effective target pixels, known evidence
-of larger settings within this capture identity, and at least six seconds / 60 encoded
-frames of consecutive positive `qpSum` / `framesEncoded` deltas. H.264 uses QP ≤24 on its
+small size. It requires output below half the effective target pixels, larger settings
+within this capture identity or the live-spec fallback (L1), and at least six seconds /
+60 encoded frames of consecutive positive `qpSum` / `framesEncoded` deltas. With that
+QP evidence, affordability uses the nominal next recovery step toward the live spec,
+without extrapolating payload demand from the adapted size. H.264 uses QP ≤24 on its
 0–51 scale; VP9 uses ≤96 on its 0–255 scale. Both counters must advance, the ratio must
 be plausible, and outbound id, encoder implementation and codec must match. Missing QP
 or identity, counter/geometry changes and polling gaps reset the window. The escape retains the nominal bpp floor, 50% margin and fresh
