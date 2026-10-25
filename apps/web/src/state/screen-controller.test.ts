@@ -7,10 +7,17 @@ import type { Client } from "../proto/Client";
 import { ScreenController } from "./screen-controller";
 import { initialScreen, useScreen } from "./screen";
 import { useSession, useUi } from "./stores";
+import { useSettings } from "./settings";
+
+interface PublisherOptions {
+  quality: ScreenSpec; legacy: boolean; automaticMode: boolean;
+  surfaceChanged(surface: "screen" | "window" | "tab" | "unknown", spec: ScreenSpec): void;
+  offer(body: object): Promise<string>; state(s: string): void;
+}
 
 const media = vi.hoisted(() => ({
   transports: [] as Array<{ params: { run: number; state(s: string): void; offer(sdp: string, run: number): Promise<string> }; close: () => void }>,
-  publishers: [] as Array<{ params: { quality: ScreenSpec; offer(body: object): Promise<string>; state(s: string): void }; close: () => void; setSpec: () => Promise<void> }>,
+  publishers: [] as Array<{ params: PublisherOptions; close: () => void; setSpec: (spec: ScreenSpec, automaticMode: boolean) => Promise<void> }>,
 }));
 vi.mock("../voice/screen", async importOriginal => {
   const actual = await importOriginal<typeof import("../voice/screen")>();
@@ -26,7 +33,7 @@ vi.mock("../voice/screen", async importOriginal => {
   class ScreenPublisher {
     close = vi.fn();
     setSpec = vi.fn(async () => {});
-    constructor(readonly params: { quality: ScreenSpec; offer(body: object): Promise<string>; state(s: string): void }) { media.publishers.push(this); }
+    constructor(readonly params: PublisherOptions) { media.publishers.push(this); }
     async start() { await this.params.offer({ ssrc: 1, rtx_ssrc: 2, sdp: "publish-offer" }); }
   }
   return { ...actual, ScreenWatchTransport, ScreenPublisher, applyCaptureSpec: vi.fn(async () => {}), captureSupport: () => "ok" as const };
@@ -67,6 +74,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   media.transports.length = 0;
   media.publishers.length = 0;
+  useSettings.setState({ screenMode: null, screenHeight: 1080, screenFps: 30 });
   toast.mockReset();
   useUi.setState({ toast });
   useScreen.setState({ ...initialScreen });
@@ -336,6 +344,9 @@ describe("sharing", () => {
       expect(sent.preset).toBe(mode === "sharp" ? "text" : fps === 60 ? "game" : height === 720 ? "saver" : "smooth");
       if (server === "modern") expect(sent.spec).toEqual(spec);
       else expect(Object.hasOwn(sent, "spec")).toBe(false);
+      expect(media.publishers.at(-1)!.params).toMatchObject({ quality: spec, legacy: server !== "modern", automaticMode: true });
+      const { applyCaptureSpec } = await import("../voice/screen");
+      expect(applyCaptureSpec).toHaveBeenLastCalledWith(expect.anything(), spec, server !== "modern");
       await screen.stopShare();
     }
   });
@@ -368,7 +379,27 @@ describe("sharing", () => {
     await confirming;
     expect(media.publishers[0]!.params.quality).toEqual(legacySpec("saver"));
     const { applyCaptureSpec } = await import("../voice/screen");
-    expect(vi.mocked(applyCaptureSpec).mock.calls.at(-1)).toEqual([t, legacySpec("saver")]);
+    expect(vi.mocked(applyCaptureSpec).mock.calls.at(-1)).toEqual([t, legacySpec("saver"), true]);
+  });
+
+  it("keeps automatic intent through size/fps edits and makes an equal mode click explicit", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String);
+    choosing();
+    await screen.confirmShare();
+    const publisher = media.publishers.at(-1)!;
+    screen.setQuality({ height: 1440, fps: 60 });
+    expect(publisher.setSpec).toHaveBeenLastCalledWith({ mode: "sharp", height: 1440, fps: 60 }, true);
+    publisher.params.surfaceChanged("screen", { mode: "smooth", height: 1440, fps: 60 });
+    expect(useScreen.getState().own).toMatchObject({ surface: "screen", spec: { mode: "smooth", height: 1440, fps: 60 } });
+    expect(useSettings.getState().screenMode).toBeNull();
+    screen.setQuality({ mode: "smooth" });
+    expect(publisher.setSpec).toHaveBeenLastCalledWith({ mode: "smooth", height: 1440, fps: 60 }, false);
+    expect(useSettings.getState().screenMode).toBe("smooth");
+    await screen.stopShare();
+    publisher.params.surfaceChanged("window", legacySpec("text"));
+    expect(useScreen.getState().own).toBeNull();
   });
 
   it("refuses in an encrypted channel without sending anything", async () => {

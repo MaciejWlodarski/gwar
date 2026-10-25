@@ -69,6 +69,7 @@ export type ScreenAction =
   | { type: "pick"; attempt: number }
   | { type: "picked"; attempt: number; stream: MediaStream; surface: ScreenSurface }
   | { type: "choose"; spec: ScreenSpec }
+  | { type: "surface"; attempt: number; surface: ScreenSurface; spec: ScreenSpec }
   | { type: "starting"; attempt: number }
   | { type: "started"; attempt: number; share: string }
   | { type: "live"; share: string }
@@ -129,6 +130,8 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
     }
     case "starting":
       return setOwn(state, action.attempt, ["choosing"], { phase: "starting" });
+    case "surface":
+      return setOwn(state, action.attempt, ["starting", "live"], { surface: action.surface, spec: { ...action.spec } });
     case "started":
       return setOwn(state, action.attempt, ["starting"], { share: action.share });
     case "live":

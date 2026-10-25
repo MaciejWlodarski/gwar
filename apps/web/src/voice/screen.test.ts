@@ -70,6 +70,24 @@ beforeEach(() => {
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
 describe("publish transport", () => {
+  it("keeps legacy ceilings through every live spec edit and codec recovery", async () => {
+    const track = { applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 2560, height: 1440 }) } as unknown as MediaStreamTrack;
+    const publisher = new ScreenPublisher({ track, quality: { mode: "smooth", height: 1440, fps: 60 }, legacy: true, iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    expect(Peer.all[0]!.transceivers[0]!.init.sendEncodings![0]!.maxBitrate).toBe(8_000_000);
+    expect(Peer.all[0]!.transceivers[0]!.init.sendEncodings![0]!.scaleResolutionDownBy).toBeCloseTo(4 / 3);
+    for (const mode of ["smooth", "sharp"] as const) for (const height of [720, 1080, 1440] as const) for (const fps of [15, 30, 60] as const) {
+      const spec = { mode, height, fps }, resolved = deriveSpec(spec, true);
+      await publisher.setSpec(spec);
+      expect(track.applyConstraints).toHaveBeenLastCalledWith({ width: { max: resolved.width }, height: { max: resolved.height }, frameRate: { max: fps } });
+      expect(Peer.all[0]!.sendParams.at(-1)!.encodings[0]).toMatchObject({ maxBitrate: resolved.maxBitrate, maxFramerate: fps });
+    }
+    await publisher.recover({ share: "s", codec: "vp9", width: 2560, height: 1440, fps: 60 });
+    expect(track.applyConstraints).toHaveBeenLastCalledWith({ width: { max: 1920 }, height: { max: 1080 }, frameRate: { max: 60 } });
+    expect(Peer.all[1]!.sendParams.at(-1)!.encodings[0]!.maxBitrate).toBe(2_500_000);
+    publisher.close();
+  });
+
   it("sends one low-priority video stream at the preset's cap, lowered under the uplink estimate", async () => {
     const offer = vi.fn(async (_body: { ssrc: number; rtx_ssrc: number; sdp: string }) => "answer");
     const track = { applyConstraints: vi.fn(async () => {}), contentHint: "" } as unknown as MediaStreamTrack;
@@ -944,12 +962,13 @@ describe("bounded guard outcomes and rearming", () => {
 });
 
 // Settings are the only dimension authority. Stats may lag either side of a switch.
-async function makeSurfaceReview(manual = false, observed: (settings: MediaTrackSettings) => void = () => {}) {
+async function makeSurfaceReview(manual = false, observed: (settings: MediaTrackSettings) => void = () => {}, automaticMode = false, legacy = false) {
   const settings = { width: 1920, height: 1080, frameRate: 20, deviceId: "one", displaySurface: "window" };
   const sample = { width: 1920, height: 1080, outWidth: 1920, outHeight: 1080, limitation: "none", available: 13_000_000, target: 8_000_000, sourceId: "source" };
   let constraint: (c: MediaTrackConstraints) => Promise<void> = async () => {};
-  const publisher = new ScreenPublisher({ track: { getSettings: () => { const snapshot = { ...settings }; observed(snapshot); return snapshot; }, applyConstraints: (c: MediaTrackConstraints) => constraint(c) } as unknown as MediaStreamTrack,
-    quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
+  const track = { contentHint: "", getSettings: () => { const snapshot = { ...settings }; observed(snapshot); return snapshot; }, applyConstraints: (c: MediaTrackConstraints) => constraint(c) };
+  const publisher = new ScreenPublisher({ track: track as unknown as MediaStreamTrack,
+    quality: automaticMode ? { mode: "sharp", height: 1440, fps: 60 } : TEST_SPECS.game, automaticMode, legacy, iceServers: [], offer: async () => "answer", state: () => {} });
   await publisher.start();
   const pc = Peer.all.at(-1)!;
   pc.getStats.mockImplementation(async () => {
@@ -964,6 +983,7 @@ async function makeSurfaceReview(manual = false, observed: (settings: MediaTrack
   const state = publisher as unknown as {
     ceiling: { width: number; height: number; known: boolean };
     guard: StuckCaptureGuard; phase: "pulse" | null;
+    quality: ScreenSpec;
     timer: ReturnType<typeof setInterval> | null;
     phaseTimer: ReturnType<typeof setTimeout> | null;
     sampleTimer: ReturnType<typeof setTimeout> | null;
@@ -983,7 +1003,7 @@ async function makeSurfaceReview(manual = false, observed: (settings: MediaTrack
     if (state.timer) clearInterval(state.timer);
     state.timer = null; // Sequence tests supply the ordinary polling schedule.
   } else await vi.advanceTimersByTimeAsync(4000);
-  return { settings, sample, publisher, pc, state, pulses, stop, dimensions, setConstraint: (fn: typeof constraint) => { constraint = fn; } };
+  return { settings, sample, publisher, pc, track, state, pulses, stop, dimensions, setConstraint: (fn: typeof constraint) => { constraint = fn; } };
 }
 
 describe("round six switch behavior", () => {
@@ -1683,7 +1703,7 @@ it("keeps even near-spec output live without waiting for a 25 percent deficit", 
 });
 
 describe("round eight backoff resets", () => {
-  it.each(["identity", "preset", "spec"] as const)("resets per-identity retry backoff on %s changes", async change => {
+  it.each(["identity", "preset", "spec"] as const)("resets per-identity retry backoff on explicit %s changes", async change => {
     const f = await makeSurfaceReview();
     f.dimensions(1280, 720);
     await vi.advanceTimersByTimeAsync(700_000);
@@ -1691,7 +1711,123 @@ describe("round eight backoff resets", () => {
     expect(delay()).toBe(1_200_000);
     if (change === "identity") { f.settings.deviceId = "new"; await f.state.headroom(); }
     else if (change === "preset") await f.publisher.setSpec(TEST_SPECS.saver);
-    else await f.publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
+    else await f.publisher.setSpec({ mode: "smooth", height: 1080, fps: 30 });
     expect(delay()).toBe(600_000); f.stop();
+  });
+
+  it("retains the twenty-minute L3 envelope and fuse across repeated automatic codec recovery", async () => {
+    const f = await makeSurfaceReview();
+    f.dimensions(1280, 720);
+    await vi.advanceTimersByTimeAsync(800_000);
+    const guard = f.state.guard;
+    const history = () => {
+      const { retryDelay, suppressedAt, unsuccessful, next, cooldown, qpAttempted } = guard as unknown as {
+        retryDelay: number; suppressedAt: number; unsuccessful: number; next: number; cooldown: number; qpAttempted: boolean;
+      };
+      return { retryDelay, suppressedAt, unsuccessful, next, cooldown, qpAttempted };
+    };
+    const before = history();
+    expect(before.retryDelay).toBe(1_200_000);
+    expect(before.unsuccessful).toBe(2);
+    for (const codec of ["vp9", "h264"] as const) {
+      await f.publisher.recover({ share: "s", codec, width: 1920, height: 1080, fps: 60 });
+      expect(f.state.guard).toBe(guard);
+      expect(history()).toEqual(before);
+      Peer.all.at(-1)!.getStats.mockImplementation(f.pc.getStats.getMockImplementation()!);
+    }
+    const replacement = Peer.all.at(-1)!;
+    // Old behavior resets to ten minutes and issues two pulses in this interval.
+    await vi.advanceTimersByTimeAsync(700_000);
+    expect(replacement.sendParams.every(p => p.degradationPreference === "maintain-framerate")).toBe(true);
+    expect(history()).toEqual(before);
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(replacement.sendParams.some(p => p.degradationPreference === "maintain-resolution")).toBe(true);
+    expect(history().retryDelay).toBe(2_400_000);
+    f.stop();
+  });
+
+  it("drops old QP evidence on recovery without granting a fresh attempt allowance", () => {
+    const guard = new StuckCaptureGuard();
+    const sample = (now: number) => ({ width: 480, height: 270, sourceWidth: 480, sourceHeight: 270,
+      captureWidth: 1920, captureHeight: 1080,
+      targetWidth: 1920, targetHeight: 1080, fps: 60, available: 13_000_000, targetBitrate: 8_000_000, bitrate: 7_500_000, limitation: "bandwidth",
+      framesEncoded: 1 + now * 0.06, quality: { id: "out", encoder: "encoder", codec: "video/H264", sum: (1 + now * 0.06) * 20,
+        frames: 1 + now * 0.06, at: now, width: 480, height: 270 } });
+    for (const at of [0, 2000, 4000]) expect(guard.observe(at, sample(at))).toBe(false);
+    guard.resetEncoder();
+    for (const at of [6000, 8000, 10_000]) expect(guard.observe(at, sample(at))).toBe(false);
+    expect(guard.observe(12_000, sample(12_000))).toBe(true);
+    guard.resetEncoder();
+    expect(guard.tracking).toBe(false);
+    expect((guard as unknown as { unsuccessful: number }).unsuccessful).toBe(1);
+    expect(guard.observe(14_000, sample(14_000))).toBe(false);
+  });
+});
+
+describe("automatic mode on confirmed source switches", () => {
+  it("flips mode with one identity reset, preserving size/fps and ignoring stale stats", async () => {
+    const f = await makeSurfaceReview(true, () => {}, true);
+    const state = f.publisher as unknown as { revision: number };
+    const before = state.revision, original = f.state.guard;
+    f.sample.sourceId = "old-monitor-stats";
+    await f.state.headroom();
+    expect(f.state.guard).toBe(original);
+    f.settings.displaySurface = "monitor"; f.settings.deviceId = "monitor";
+    await f.state.headroom();
+    expect(state.revision).toBe(before + 1);
+    expect(f.state.guard).not.toBe(original);
+    expect(f.state.quality).toEqual({ mode: "smooth", height: 1440, fps: 60 });
+    expect(f.track.contentHint).toBe("motion");
+    expect(f.pc.sendParams.at(-1)).toMatchObject({ degradationPreference: "maintain-framerate", encodings: [{ maxBitrate: 9_100_000, maxFramerate: 60 }] });
+    const switched = f.state.guard;
+    await f.publisher.setSpec({ mode: "sharp", height: 1440, fps: 60 }, true); // A stale UI mode on a size/fps-only edit.
+    expect(f.state.guard).toBe(switched);
+    f.settings.displaySurface = "browser";
+    await f.state.headroom();
+    expect(state.revision).toBe(before + 2);
+    expect(f.pc.sendParams.at(-1)!.degradationPreference).toBe("maintain-resolution");
+    expect(f.state.quality).toEqual({ mode: "sharp", height: 1440, fps: 60 });
+    expect(f.track.contentHint).toBe("detail");
+    expect(f.state.captureTarget()).toEqual({ width: 1920, height: 1080 });
+    f.stop();
+  });
+
+  it("keeps an explicitly selected equal mode across the next surface switch", async () => {
+    const f = await makeSurfaceReview(true, () => {}, true);
+    const original = f.state.guard;
+    await f.publisher.setSpec({ mode: "sharp", height: 1440, fps: 60 });
+    expect(f.state.guard).toBe(original);
+    f.settings.displaySurface = "monitor";
+    await f.state.headroom();
+    expect(f.pc.sendParams.at(-1)!.degradationPreference).toBe("maintain-resolution");
+    expect(f.pc.sendParams.at(-1)!.encodings[0]!.maxFramerate).toBe(60);
+    f.stop();
+  });
+
+  it("keeps the legacy bitrate ceiling when automatic mode changes", async () => {
+    const f = await makeSurfaceReview(true, () => {}, true, true);
+    expect(f.publisher.bitrate).toBe(2_500_000);
+    f.settings.displaySurface = "monitor";
+    await f.state.headroom();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.publisher.bitrate).toBe(8_000_000);
+    expect(f.state.quality).toEqual({ mode: "smooth", height: 1440, fps: 60 });
+    f.settings.displaySurface = "window";
+    await f.state.headroom();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(f.publisher.bitrate).toBe(2_500_000);
+    f.stop();
+  });
+
+  it("reports the latest size/fps when an automatic switch coincides with a user edit", async () => {
+    const f = await makeSurfaceReview(true, () => {}, true);
+    const changed = vi.fn();
+    (f.publisher as unknown as { params: { surfaceChanged: typeof changed } }).params.surfaceChanged = changed;
+    f.settings.displaySurface = "monitor";
+    await f.publisher.setSpec({ mode: "sharp", height: 720, fps: 30 }, true);
+    expect(changed).toHaveBeenLastCalledWith("screen", { mode: "smooth", height: 720, fps: 30 });
+    expect(f.state.quality).toEqual({ mode: "smooth", height: 720, fps: 30 });
+    expect(f.track.contentHint).toBe("motion");
+    f.stop();
   });
 });

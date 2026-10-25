@@ -352,7 +352,9 @@ fps: 15 | 30 | 60}`. Capture preserves its aspect ratio, is bounded by the selec
 With no saved choice, resolution is 1080p and cadence is 30 fps. Mode follows the
 captured surface: window/tab → sharp; screen/unknown → smooth. Clicking either
 mode saves it explicitly, including when it is already selected. Changing only
-resolution or cadence leaves the surface default in place for future shares.
+resolution or cadence keeps mode automatic for both this share and future shares.
+Confirmed `deviceId` / `displaySurface` identity changes re-resolve only the mode;
+resolution and cadence remain selected. Stats source ids never trigger a mode flip.
 
 Bitrate is a pixel/frame budget: `min(12,000,000, max(250,000,
 round(width × height × fps × density(height) × modeFactor)))` bits/s.
@@ -406,7 +408,11 @@ back to legacy requests, without disconnecting. Negotiation is connection-local.
 | New server → opted-in client | `screen.started` includes `spec` and legacy `preset`; negotiation refreshes visible shares learned from Welcome |
 
 Fallback precedence: sharp → text; otherwise ≥45 fps → game; otherwise ≤720p →
-saver; otherwise smooth. `ScreenStart` and its nested spec reject unknown fields;
+saver; otherwise smooth. A legacy publisher also clamps capture dimensions and
+encoder bitrate to that preset's old ceiling (text 2.5, smooth 4, game 8, saver
+1.5 Mb/s; at most 1080p). The ceiling follows later live edits and automatic mode
+changes and survives codec recovery; a smaller requested size/rate stays smaller.
+`ScreenStart` and its nested spec reject unknown fields;
 new servers reject specs before negotiation. Welcome precedes negotiation and
 always has the legacy shape. TeamSpeak guest replies retain their legacy preset
 and unchanged H.264 advertisement; their loose watch parser needs no extension.
@@ -436,8 +442,11 @@ Smoothness uses `maintain-framerate` from startup. The trial two-second resoluti
 hold delayed cadence on shaped links, so the implementation retains the bounded
 stuck-capture guard. There is no persistent sender size bound or resolution
 repricing controller. A repeated equal spec does not reset guard history: only an
-actual mode/height/fps change resets the user-settings backoff; surface identity
-and codec replacement retain their existing lifecycle resets.
+explicit mode/height/fps change resets the user-settings backoff. Surface identity
+changes reset it once; an automatic mode flip shares that reset and adds no second
+reset. Automatic codec replacement preserves the failure fuse, retry deadline,
+attempt spacing and L3 history, while clearing encoder-specific QP/outcome evidence.
+An interrupted attempt still consumes its allowance.
 
 For a resolved `maintain-framerate` spec, the guard can reset Chromium's pending
 capture adaptation with a one-second `maintain-resolution` pulse, then restore the
@@ -504,9 +513,9 @@ immediately. It does not need spontaneous growth to enable pulses.
 retry envelopes, capped at sixty minutes, measured from the final pulse in the
 preceding cycle. One ordinary two-second polling interval is reserved inside each
 envelope for observing its completion; continuous eligibility and QP evidence survive
-suppression. Identity switches, real mode/height/fps changes (and codec recovery),
-and fresh-frame improvement reset this backoff to ten minutes. Ceiling growth alone
-never resets it. With continuously healthy next-step capacity, valid advancing
+suppression. Identity switches, explicit mode/height/fps changes,
+and fresh-frame improvement reset this backoff to ten minutes. Codec recovery and
+ceiling growth never reset it. With continuously healthy next-step capacity, valid advancing
 telemetry and ordinary polling, output below the spec gets a pulse within **at most
 60 minutes**, including that polling interval. A fresh unfused guard needs six seconds
 of eligibility (at most eight seconds including its first ordinary poll). CPU pressure,

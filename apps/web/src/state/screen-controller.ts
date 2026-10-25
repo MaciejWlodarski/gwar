@@ -175,9 +175,9 @@ export class ScreenController {
       ...(patch.fps !== undefined ? { screenFps: patch.fps } : {}),
     });
     const spec = { ...own.spec, ...patch };
-    if (sameSpec(spec, own.spec)) return;
-    dispatch({ type: "choose", spec });
-    if (own.phase === "starting" || own.phase === "live") void this.publisher?.setSpec(spec);
+    if (!sameSpec(spec, own.spec)) dispatch({ type: "choose", spec });
+    // Clicking the already-resolved mode still makes it explicit.
+    if (own.phase === "starting" || own.phase === "live") void this.publisher?.setSpec(spec, useSettings.getState().screenMode === null);
   }
 
   setPreview(on: boolean): void {
@@ -218,11 +218,13 @@ export class ScreenController {
     // Never a share in the clear in an encrypted channel (docs/screen-share.md, "First release").
     if (s.channels[me.channel]?.encrypted) { this.endOwn(); useUi.getState().toast("info", tNow("screen.encryptedSoon")); return; }
     dispatch({ type: "starting", attempt });
-    await applyCaptureSpec(track, spec);
     let share: string;
+    let screenSpec: boolean;
     try {
-      const screenSpec = await conn.request("screen.spec.capabilities", {}, { timeoutMs: 1_500 })
+      screenSpec = await conn.request("screen.spec.capabilities", {}, { timeoutMs: 1_500 })
         .then(features => features.screen_spec === true).catch(() => false);
+      if (!current()) return;
+      await applyCaptureSpec(track, spec, !screenSpec);
       if (!current()) return;
       share = (await conn.request("screen.start", { call: binding.call, participation: binding.participation, preset: legacyPreset(spec), ...(screenSpec ? { spec } : {}), surface, guest_link: guestLink })).share;
     } catch (e) {
@@ -238,11 +240,14 @@ export class ScreenController {
     const latest = () => useScreen.getState().own?.spec ?? spec;
     for (let applied = spec; !sameSpec(latest(), applied) && current();) {
       applied = latest();
-      await applyCaptureSpec(track, applied);
+      await applyCaptureSpec(track, applied, !screenSpec);
     }
     if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
     const publisher = new ScreenPublisher({
-      track, quality: latest(), iceServers: s.iceServers,
+      track, quality: latest(), legacy: !screenSpec, automaticMode: useSettings.getState().screenMode === null, iceServers: s.iceServers,
+      surfaceChanged: (surface, spec) => {
+        if (current()) dispatch({ type: "surface", attempt, surface, spec });
+      },
       offer: async body => (await conn.request("screen.publish.offer", { share, ...body }, { timeoutMs: 35_000 })).sdp,
       state: state => {
         if (state !== "failed" || this.publisher !== publisher) return;

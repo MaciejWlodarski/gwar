@@ -28,4 +28,12 @@ describe("screen quality", () => {
     for (const [preset, rate] of [["text", 2_500_000], ["smooth", 4_000_000], ["game", 8_000_000], ["saver", 1_500_000]] as const) expect(deriveSpec(legacySpec(preset)).maxBitrate).toBe(rate);
     expect(deriveSpec({ mode: "smooth", height: 1440, fps: 60 }).maxBitrate).toBe(12_000_000);
   });
+  it("caps every legacy fallback by its old preset without raising a smaller request", () => {
+    for (const mode of ["smooth", "sharp"] as const) for (const height of HEIGHTS) for (const fps of FRAME_RATES) {
+      const spec = { mode, height, fps }, modern = deriveSpec(spec), legacy = deriveSpec(spec, true);
+      const ceiling = deriveSpec(legacySpec(legacyPreset(spec)));
+      expect(legacy).toEqual({ ...modern, width: Math.min(modern.width, ceiling.width), height: Math.min(modern.height, ceiling.height),
+        maxBitrate: Math.min(modern.maxBitrate, ceiling.maxBitrate) });
+    }
+  });
 });

@@ -11,7 +11,7 @@
 import type { H264Capability } from "../proto/H264Capability";
 import type { ScreenRecovery } from "../proto/ScreenRecovery";
 import type { IceServer } from "../proto/IceServer";
-import { deriveSpec, sameSpec, type ScreenSpec, type ResolvedSpec } from "./screen-quality";
+import { deriveSpec, resolveQuality, type ScreenSpec, type ResolvedSpec } from "./screen-quality";
 import type { ScreenSurface } from "../proto/ScreenSurface";
 
 /** Receive slots of a watch transport (`gwar_proto::SCREEN_SLOTS`). */
@@ -25,7 +25,11 @@ const HEADROOM_INTERVAL_MS = 2_000;
 
 /** What the sharer picked, from the track's settings (Chromium and Safari report it). */
 export function surfaceOf(track: MediaStreamTrack): ScreenSurface {
-  const surface = (track.getSettings() as { displaySurface?: string }).displaySurface;
+  return surfaceFromSettings(track.getSettings());
+}
+
+function surfaceFromSettings(settings?: MediaTrackSettings): ScreenSurface {
+  const surface = settings?.displaySurface;
   return surface === "monitor" ? "screen" : surface === "window" ? "window" : surface === "browser" ? "tab" : "unknown";
 }
 
@@ -99,6 +103,15 @@ export class StuckCaptureGuard {
   private spareSince: number | null = null;
 
   get tracking(): boolean { return this.outcome !== null; }
+
+  /** A replacement encoder cannot supply QP deltas or outcomes for its predecessor. */
+  resetEncoder(): void {
+    this.quality = new LowEncoderQp();
+    this.since = null; this.last = null; this.spareSince = null;
+    // An interrupted attempt still spent its allowance. Keep the fuse, pulse
+    // spacing, suppression deadline and L3 retry delay across automatic recovery.
+    if (this.outcome) { this.outcome = null; this.unsuccessful++; }
+  }
 
   observe(now: number, sample: {
     width: number; height: number; sourceWidth: number; sourceHeight: number;
@@ -243,8 +256,8 @@ export function captureScreen(spec: ScreenSpec = { mode: "smooth", height: 1080,
 }
 
 /** The track's quality settings: content hint and capture cap (`applyConstraints`, never upscaled). */
-export async function applyCaptureSpec(track: MediaStreamTrack, quality: ScreenSpec): Promise<void> {
-  const spec = deriveSpec(quality);
+export async function applyCaptureSpec(track: MediaStreamTrack, quality: ScreenSpec, legacy = false): Promise<void> {
+  const spec = deriveSpec(quality, legacy);
   try { track.contentHint = spec.hint; } catch { /* not every engine knows the hint */ }
   await track.applyConstraints({ width: { max: spec.width }, height: { max: spec.height }, frameRate: { max: spec.fps } }).catch((e: unknown) => {
     console.warn("Screen capture constraints:", e);
@@ -392,6 +405,11 @@ function watchState(pc: RTCPeerConnection, report: (state: TransportState) => vo
 export interface PublishParams {
   track: MediaStreamTrack;
   quality: ScreenSpec;
+  /** The server rejected spec negotiation: retain the legacy encoder ceilings. */
+  legacy?: boolean;
+  /** Follow confirmed source identity changes until the user chooses a mode. */
+  automaticMode?: boolean;
+  surfaceChanged?(surface: ScreenSurface, quality: ScreenSpec): void;
   iceServers: IceServer[];
   /** `screen.publish.offer` for this share: the server's answer. */
   offer(body: { ssrc: number; rtx_ssrc: number; sdp: string }): Promise<string>;
@@ -407,6 +425,7 @@ export class ScreenPublisher {
   private pc: RTCPeerConnection | null = null;
   private sender: RTCRtpSender | null = null;
   private quality: ScreenSpec;
+  private automaticMode: boolean;
   private applied = 0;
   private desired = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
@@ -428,6 +447,7 @@ export class ScreenPublisher {
 
   constructor(private readonly params: PublishParams) {
     this.quality = { ...params.quality };
+    this.automaticMode = params.automaticMode === true;
     const spec = this.spec();
     this.ceiling = { width: spec.width, height: spec.height, known: false };
     this.refreshSurface();
@@ -468,16 +488,19 @@ export class ScreenPublisher {
   }
 
   /** Changes quality while sharing, with no renegotiation. */
-  async setSpec(quality: ScreenSpec): Promise<void> {
+  async setSpec(quality: ScreenSpec, automaticMode = false): Promise<void> {
     if (this.closed) return;
-    this.refreshSurface();
-    if (!sameSpec(quality, this.quality)) {
+    this.automaticMode = automaticMode;
+    if (quality.height !== this.quality.height || quality.fps !== this.quality.fps || (!automaticMode && quality.mode !== this.quality.mode)) {
       this.cancelPhase();
       this.guard = new StuckCaptureGuard();
-      this.quality = { ...quality };
+      this.quality = { ...quality, mode: automaticMode ? this.quality.mode : quality.mode };
     }
+    // Resolve a coincident switch with the latest size/fps. The automatic mode
+    // flip belongs to refreshSurface's single identity reset, never a spec reset.
+    this.refreshSurface();
     const revision = this.revision;
-    await applyCaptureSpec(this.params.track, quality);
+    await applyCaptureSpec(this.params.track, this.quality, this.params.legacy);
     if (this.closed || revision !== this.revision) return;
     const recovery = this.recovery;
     if (recovery) { const spec = this.spec(); await this.params.track.applyConstraints({ width: { max: spec.width }, height: { max: spec.height }, frameRate: { max: spec.fps } }); }
@@ -612,18 +635,30 @@ export class ScreenPublisher {
    * L2. Expiry requires 30 seconds of healthy next-step capacity, not capacity
    *     for the full retained target. Continuous eligibility survives the fuse.
    * L3. Consecutive non-improving cycles back off 10/20/40/60 minutes, capped.
-   *     Improvement, identity and mode/size/fps changes reset that backoff. The
+   *     Improvement, identity and explicit mode/size/fps changes reset that backoff.
+   *     An automatic mode flip shares the identity reset; codec recovery retains it. The
    *     2/7/100 pulses per half-open ten-minute window bounds still hold.
    */
   private refreshSurface(): MediaTrackSettings | undefined {
     const settings = this.params.track.getSettings?.();
     const key = [settings?.deviceId, settings?.displaySurface];
+    const first = this.surfaceKey.length === 0;
     const switched = key.some((value, i) => value !== undefined && this.surfaceKey[i] !== undefined && value !== this.surfaceKey[i]);
     this.surfaceKey = key.map((value, i) => value ?? this.surfaceKey[i]);
     if (switched) {
       this.cancelPhase(); this.guard = new StuckCaptureGuard(); this.adaptationSent = null;
       this.ceiling.known = false;
-      void this.applyParameters(this.desired || this.spec().maxBitrate);
+    }
+    if (switched || first) {
+      const surface = surfaceFromSettings(settings);
+      if (this.automaticMode) {
+        this.quality = resolveQuality({ screenMode: null, screenHeight: this.quality.height, screenFps: this.quality.fps }, surface);
+        try { this.params.track.contentHint = this.spec().hint; } catch { /* unsupported hint */ }
+      }
+      this.params.surfaceChanged?.(surface, { ...this.quality });
+    }
+    if (switched) {
+      void this.applyParameters(Math.min(this.desired || this.spec().maxBitrate, this.spec().maxBitrate));
     }
     const width = settings?.width, height = settings?.height;
     if (width !== undefined && height !== undefined && Number.isFinite(width * height) && width > 0 && height > 0) {
@@ -695,20 +730,21 @@ export class ScreenPublisher {
   }
 
   private spec(): ResolvedSpec {
-    const spec = deriveSpec(this.quality), r = this.recovery;
+    const spec = deriveSpec(this.quality, this.params.legacy), r = this.recovery;
     return r ? { ...spec, width: Math.min(spec.width, r.width), height: Math.min(spec.height, r.height), fps: Math.min(spec.fps, r.fps) } : spec;
   }
 
   private scale(): { scaleResolutionDownBy: number } {
     const settings = this.refreshSurface() ?? {};
-    const recovery = this.recovery ? Math.max(1, (settings.width ?? this.recovery.width) / this.recovery.width, (settings.height ?? this.recovery.height) / this.recovery.height) : 1;
-    return { scaleResolutionDownBy: recovery };
+    const spec = this.spec();
+    const bounded = this.recovery || this.params.legacy;
+    return { scaleResolutionDownBy: bounded ? Math.max(1, (settings.width ?? spec.width) / spec.width, (settings.height ?? spec.height) / spec.height) : 1 };
   }
 
   async recover(plan: ScreenRecovery): Promise<void> {
     if (this.closed) return;
     this.cancelPhase();
-    this.guard = new StuckCaptureGuard();
+    this.guard.resetEncoder();
     this.recovery = plan;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
