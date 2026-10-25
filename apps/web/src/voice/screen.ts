@@ -440,7 +440,7 @@ export class ScreenPublisher {
   private surfaceKey: (string | undefined)[] = [];
   private surfaceCandidate: { width: number; height: number; since: number } | null = null;
   private surfaceSettings: MediaTrackSettings | undefined;
-  private surfacePending: { width?: number; height?: number; switched: boolean } | null = null;
+  private surfacePending: { width?: number; height?: number; since: number } | null = null;
   private captureChanges = 0;
   private readonly captureSize: { width: number; height: number; known: boolean };
 
@@ -630,34 +630,27 @@ export class ScreenPublisher {
     // getSettings() can already describe a resize/switch while an in-flight
     // getStats() still describes the old surface. Keep the independent evidence.
     if (!this.captureChanges && (keyChanged || (previousSettings && (previousSettings.width !== settings?.width || previousSettings.height !== settings?.height)))) {
-      this.surfacePending = { width: settings?.width, height: settings?.height, switched: keyChanged || this.surfacePending?.switched === true };
+      this.surfacePending = { width: settings?.width, height: settings?.height, since: performance.now() };
     }
     const width = source?.width ?? settings?.width ?? 0, height = source?.height ?? settings?.height ?? 0;
     const valid = Number.isFinite(width * height) && width > 0 && height > 0;
-    // A settings change seen during encoder adaptation cannot prove a resize,
-    // even if source stats catch up after the limitation has cleared.
-    if (out?.qualityLimitationReason !== "none" && !this.surfacePending?.switched) this.surfacePending = null;
+    // Capture the exclusion before a switch resets the pulse/outcome history.
+    const adapting = this.captureChanges > 0 || this.phase !== null || this.guard.tracking || out?.qualityLimitationReason !== "none";
+    if (keyChanged) {
+      this.cancelPhase(); this.guard = new StuckCaptureGuard(); this.adaptationSent = null;
+      void this.applyParameters(this.desired || this.spec().maxBitrate);
+    }
+    // Identity resets history immediately, but never proves physical dimensions.
+    // Adaptation also invalidates pending sizes if source stats have not caught up.
+    if (!valid || adapting) {
+      this.surfaceCandidate = null;
+      this.surfacePending = null;
+      return;
+    }
     const pending = this.surfacePending;
     const matchesSettings = settings?.width === width && settings?.height === height;
     const corroborated = matchesSettings && pending?.width === width && pending?.height === height;
-    const mismatched = source?.width !== undefined && source.height !== undefined && settings?.width !== undefined && settings.height !== undefined && !matchesSettings;
-    const switched = keyChanged || (corroborated && pending?.switched);
-    if (corroborated || (switched && !mismatched)) this.surfacePending = null;
-    if (switched) {
-      this.cancelPhase(); this.guard = new StuckCaptureGuard(); this.adaptationSent = null;
-      if (!mismatched) {
-        this.captureSize.known = valid;
-        this.captureSize.width = valid ? width : this.spec().width;
-        this.captureSize.height = valid ? height : this.spec().height;
-      }
-      void this.applyParameters(this.desired || this.spec().maxBitrate);
-    }
-    // A pulse changes capture settings too: it cannot prove a surface resize.
-    if (!valid || this.phase || this.guard.tracking) {
-      this.surfaceCandidate = null;
-      if (!pending?.switched) this.surfacePending = null;
-      return;
-    }
+    if (corroborated) this.surfacePending = null;
     const oldPixels = this.captureSize.width * this.captureSize.height;
     const pixels = width * height;
     const grows = !this.captureSize.known || pixels > oldPixels;
@@ -666,14 +659,15 @@ export class ScreenPublisher {
     // Bandwidth/CPU adaptation can change settings too, so retain that exclusion.
     const candidate = this.surfaceCandidate;
     const resized = matchesSettings && (corroborated || (candidate?.width === width && candidate.height === height));
-    const shrinks = !this.captureChanges && resized && pixels < oldPixels &&
-      width >= (out?.frameWidth ?? Infinity) && height >= (out?.frameHeight ?? Infinity) && out?.qualityLimitationReason === "none";
+    const shrinks = resized && pixels < oldPixels &&
+      width >= (out?.frameWidth ?? Infinity) && height >= (out?.frameHeight ?? Infinity);
     if (!grows && !shrinks) { this.surfaceCandidate = null; return; }
     const now = performance.now();
-    if (!candidate || candidate.width !== width || candidate.height !== height) {
-      this.surfaceCandidate = { width, height, since: now }; return;
+    // Clean settings may precede source stats; retain their stability interval.
+    const since = corroborated ? pending.since : candidate?.width === width && candidate.height === height ? candidate.since : now;
+    if (now - since < 2_000) {
+      this.surfaceCandidate = { width, height, since }; return;
     }
-    if (now - candidate.since < 2_000) return;
     this.captureSize.width = width; this.captureSize.height = height; this.captureSize.known = true;
     this.surfaceCandidate = null;
     this.guard = new StuckCaptureGuard(); this.adaptationSent = null;

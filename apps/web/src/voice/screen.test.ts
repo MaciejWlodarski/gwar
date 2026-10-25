@@ -388,7 +388,7 @@ describe("publisher capture guard", () => {
       preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
     await publisher.start();
     const pc = Peer.all[0]!;
-    let width = 480, height = 270;
+    let width = 480, height = 270, limitation = "bandwidth";
     pc.transceivers[0]!.sender.setParameters.mockImplementation(async params => {
       pc.sendParams.push(params);
       if (params.degradationPreference === "maintain-resolution") { width = settings.width = 1920; height = settings.height = 1080; }
@@ -399,7 +399,7 @@ describe("publisher capture guard", () => {
         ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 5_000_000 }],
         ["source", { width, height, framesPerSecond: 20 }],
         ["out", { type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, framesEncoded: 1 + at / 50,
-          bytesSent: at * 10, frameWidth: width, frameHeight: height, targetBitrate: 3_500_000, qualityLimitationReason: "bandwidth" }],
+          bytesSent: at * 10, frameWidth: width, frameHeight: height, targetBitrate: 3_500_000, qualityLimitationReason: limitation }],
       ]);
     });
     await vi.advanceTimersByTimeAsync(10_000);
@@ -407,6 +407,9 @@ describe("publisher capture guard", () => {
     const evidence = publisher as unknown as { captureSize: { width: number } };
     expect(evidence.captureSize.width).toBe(1280);
     await vi.advanceTimersByTimeAsync(15_000);
+    expect(evidence.captureSize.width).toBe(1280);
+    limitation = "none";
+    await vi.advanceTimersByTimeAsync(4000);
     expect(evidence.captureSize.width).toBe(1920);
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
@@ -785,7 +788,7 @@ describe("round 2 independent adversarial review", () => {
       return new Map([
         ["pair",{type:"candidate-pair",nominated:true,state:"succeeded",availableOutgoingBitrate:13_000_000,timestamp:performance.timeOrigin+at}],
         ["source",{width,height,framesPerSecond:20}],
-        ["out",{type:"outbound-rtp",kind:"video",mediaSourceId:"source",timestamp:at,framesEncoded:1+at/50,bytesSent:at*10,frameWidth:width,frameHeight:height,framesPerSecond:20,targetBitrate:8_000_000,qualityLimitationReason:"bandwidth"}],
+        ["out",{type:"outbound-rtp",kind:"video",mediaSourceId:"source",timestamp:at,framesEncoded:1+at/50,bytesSent:at*10,frameWidth:width,frameHeight:height,framesPerSecond:20,targetBitrate:8_000_000,qualityLimitationReason:large?"none":"bandwidth"}],
       ]);
     });
     await vi.advanceTimersByTimeAsync(60_000);
@@ -1066,5 +1069,93 @@ describe("surface identity availability", () => {
     expect(internals.captureSize.width).toBe(1920);
     expect(internals.guard).toBe(guard);
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+
+describe("switch and encoder adaptation provenance", () => {
+  async function fixture(width = 1920, height = 1080) {
+    const settings = { width, height, frameRate: 20, deviceId: "one", displaySurface: "window" };
+    const sample = { width, height, limitation: "none" };
+    const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
+      preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!;
+    pc.getStats.mockImplementation(async () => {
+      const at = performance.now();
+      return new Map([
+        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 13_000_000 }],
+        ["source", { width: sample.width, height: sample.height, framesPerSecond: 20 }],
+        ["out", { id: "out", type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, framesEncoded: 1 + at / 50,
+          bytesSent: at * 10, frameWidth: sample.width, frameHeight: sample.height, targetBitrate: 8_000_000, qualityLimitationReason: sample.limitation }],
+      ]);
+    });
+    const state = publisher as unknown as { captureSize: { width: number; height: number; known: boolean }; guard: StuckCaptureGuard; phase: string | null };
+    const dimensions = (width: number, height: number) => {
+      settings.width = sample.width = width; settings.height = sample.height = height;
+    };
+    await vi.advanceTimersByTimeAsync(4000);
+    return { settings, sample, publisher, pc, state, dimensions };
+  }
+
+  // Round-5 reviewer repro: a pending switch must not bless later adapted settings.
+  it.each(["bandwidth", "cpu"])("preserves the native target when a pending switch is followed by %s downscale", async limitation => {
+    const f = await fixture();
+    f.settings.width = 1280; f.settings.height = 720;
+    await vi.advanceTimersByTimeAsync(2000);
+    const previousGuard = f.state.guard;
+    f.settings.deviceId = "two";
+    f.settings.width = 1600; f.settings.height = 900;
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(f.state.guard).not.toBe(previousGuard);
+    expect(f.state.captureSize.width).toBe(1920);
+    f.dimensions(480, 270); f.sample.limitation = limitation;
+    await vi.advanceTimersByTimeAsync(4000);
+    const size = { ...f.state.captureSize };
+    f.sample.limitation = "none";
+    await vi.advanceTimersByTimeAsync(700_000);
+    const pulses = f.pc.sendParams.filter(p => p.degradationPreference === "maintain-resolution").length;
+    expect(size).toEqual({ width: 1920, height: 1080, known: true });
+    expect(f.state.captureSize).toEqual(size);
+    expect(pulses).toBeGreaterThan(0);
+    f.publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["bandwidth", "cpu"])("rejects adapted dimensions observed together with a switch under %s", async limitation => {
+    const f = await fixture();
+    const previousGuard = f.state.guard;
+    f.settings.deviceId = "two";
+    f.dimensions(480, 270); f.sample.limitation = limitation;
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(f.state.guard).not.toBe(previousGuard);
+    f.sample.limitation = "none";
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(f.state.captureSize).toEqual({ width: 1920, height: 1080, known: true });
+    expect(f.pc.sendParams.some(p => p.degradationPreference === "maintain-resolution")).toBe(true);
+    f.publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["pulse", "outcome"])("does not let a switch erase the %s dimension exclusion", async active => {
+    const f = await fixture();
+    if (active === "pulse") f.state.phase = "pulse";
+    else vi.spyOn(f.state.guard, "tracking", "get").mockReturnValue(true);
+    f.settings.deviceId = "two";
+    f.dimensions(480, 270);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(f.state.captureSize).toEqual({ width: 1920, height: 1080, known: true });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(f.state.captureSize).toEqual({ width: 1920, height: 1080, known: true });
+    f.publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["bandwidth", "cpu"])("rejects an adapted intermediate size above the old physical size under %s", async limitation => {
+    const f = await fixture(1280, 720);
+    // A larger window can still be adapted to a size above the previous surface.
+    f.settings.width = 3840; f.settings.height = 2160;
+    await vi.advanceTimersByTimeAsync(2000);
+    f.dimensions(1920, 1080); f.sample.limitation = limitation;
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(f.state.captureSize).toEqual({ width: 1280, height: 720, known: true });
+    f.publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 });
