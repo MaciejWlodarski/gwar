@@ -315,6 +315,10 @@ decode stays for browser compatibility.
   H.264 viewer beyond the four-second watchdog window trigger share-wide recovery:
   a lower H.264 target, then VP9 when all peers offered it. Reports are limited
   per viewer/share to one every ten seconds; the share has a ten-second hold-down.
+  The browser permits two reports per generation, with four-second detection and
+  a retry deadline ten seconds from the same observed stall. Anchoring both to
+  that stall avoids accumulating polling delays across the first report and retry,
+  which could otherwise exceed the corroboration window during replacement.
   Watch slots survive replacement, old-publisher packets drop, and the replacement
   keyframe opens the retained slots. Restore H.264 after reporters leave or two
   minutes, then hold for a minute before another downgrade. A3/B11a own native

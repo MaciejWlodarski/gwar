@@ -162,21 +162,29 @@ export async function probeH264(): Promise<H264Capability[]> {
   return [...result].sort((a, b) => a.profile_level_id - b.profile_level_id);
 }
 
-/** At most two reports per server-fenced generation, six seconds apart; network gaps restart the four-second clock. */
+/** At most two reports per server-fenced generation; network gaps restart the four-second clock. */
 export class DecodeWatchdog {
   private since: number | null = null;
   private frames: number | null = null;
   private packets: number | null = null;
   private last: number | null = null;
   private reports = 0;
-  private reportedAt: number | null = null;
+  private retryAt: number | null = null;
   observe(now: number, packets: number, frames: number): boolean {
     if (this.reports >= 2) return false;
     if (this.frames === null || frames > this.frames || packets <= (this.packets ?? packets) || (this.last !== null && now - this.last > 1500)) this.since = now;
     this.frames = frames;
     const flowing = this.packets !== null && packets > this.packets;
     this.packets = packets; this.last = now;
-    if (flowing && this.since !== null && now - this.since >= 4000 && (this.reportedAt === null || now - this.reportedAt >= 6000)) { this.reports++; this.reportedAt = now; return true; }
+    if (flowing && this.since !== null && now - this.since >= 4000 && (this.retryAt === null || now >= this.retryAt)) {
+      this.reports++;
+      // Anchor the retry to the observed stall, not the rounded first callback.
+      // Polling can round both 4 s and another 6 s up by a tick, separating
+      // replacement retries beyond the server's 2 s corroboration window.
+      // 10 s also outlasts its viewer/share throttle from the previous generation.
+      this.retryAt = this.since + 10_000;
+      return true;
+    }
     return false;
   }
 }

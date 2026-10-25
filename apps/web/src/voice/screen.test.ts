@@ -232,6 +232,27 @@ describe("verified H.264 decode capability and progress", () => {
     await Promise.resolve();
     expect(caps).toEqual([]);
   });
+  it("keeps replacement retries within the server corroboration window despite timer rounding", async () => {
+    const { DecodeWatchdog } = await import("./screen");
+    // Both first reports follow replacement before the server's 10 s viewer/share
+    // throttle expires. Each watchdog has only one retry left to corroborate the
+    // other. Rounding the 4 s observation AND another 6 s from its callback can
+    // put those retries over the server's 2 s isolation window apart.
+    const polls = [
+      // Observed milliseconds after the replacement keyframe in a failing
+      // macOS Chromium/WebKit fixed-canvas gate (e8fb01e3).
+      [693, 1699, 2703, 3707, 4709, 5715, 6718, 7725, 8726, 9732, 10735, 11737, 12743],
+      [824, 1823, 2824, 3823, 4823, 5824, 6823, 7824, 8823, 9823, 10825, 11823, 12826],
+    ];
+    const reports = polls.map(times => {
+      const watchdog = new DecodeWatchdog();
+      return times.filter((now, index) => watchdog.observe(now, index * 100, 0));
+    });
+    expect(reports.every(times => times.length === 2 && times[0]! < 10_000)).toBe(true);
+    const retries = reports.map(times => times[1]!);
+    expect(retries.every(now => now >= 10_000)).toBe(true);
+    expect(Math.max(...retries) - Math.min(...retries)).toBeLessThan(2000);
+  });
   it("reports persistent zero decode under traffic, with bounded retries and no network-gap false failure", async () => {
     const { DecodeWatchdog } = await import("./screen");
     const watchdog = new DecodeWatchdog();
