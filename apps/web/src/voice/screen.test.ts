@@ -975,7 +975,7 @@ describe("round six switch behavior", () => {
     await vi.advanceTimersByTimeAsync(700_000);
     const result = { target: { ...f.state.ceiling }, extraPulses: f.pulses() - before };
     f.stop();
-    expect(result).toEqual({ target: { width: 1280, height: 720, known: true }, extraPulses: 0 });
+    expect(result).toEqual({ target: { width: 1280, height: 720, known: true }, extraPulses: 3 });
   });
 });
 
@@ -1222,7 +1222,7 @@ describe("asymmetric ceiling behavior", () => {
     expect(f.state.guard).not.toBe(old);
     f.dimensions(1280, 700); f.sample.sourceId = "new-source";
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(f.pulses()).toBe(0); f.stop();
+    expect(f.pulses()).toBe(1); f.stop(); // L1 also probes below-spec native surfaces.
   });
 
   it("takes per-axis maxima across aspect changes without resetting the fuse", async () => {
@@ -1301,7 +1301,7 @@ describe("asymmetric ceiling behavior", () => {
 
 // No clean tails: check the oracle after every partial transition and every poll.
 describe("asymmetric sequence invariants", () => {
-  it("checks J1–J4 at every step of 3,072 seeded asynchronous sequences", async () => {
+  it("checks J1–J6 at every step of 3,072 seeded asynchronous sequences", async () => {
     let seed = 0x16807;
     const random = (n: number) => { seed ^= seed << 13; seed ^= seed >>> 17; seed ^= seed << 5; return (seed >>> 0) % n; };
     const sizes = [[1920, 1050], [1280, 700], [1600, 900], [900, 1200], [3840, 2160]] as const;
@@ -1316,11 +1316,14 @@ describe("asymmetric sequence invariants", () => {
       for (let sequence = 0; sequence < 3072; sequence++) {
         const initialSeed = seed >>> 0, trace: string[] = [];
         let identity = "", width = 0, height = 0, generation = 0, stopped = false;
+        // Hidden native surface changes are events, not getSettings() reads.
+        // Capture adaptation and application constraints cannot rewrite it.
+        let surface = { width: 1920, height: 1080 };
         const check = (ok: boolean, name: string) => {
           if (!ok) throw new Error(`${name}; sequence=${sequence}, seed=${initialSeed}, events=${trace.join(",")}`);
         };
-        // Independent oracle consumes only synchronous track snapshots, including
-        // reads during async constraints. It never consults publisher internals.
+        // Snapshot history checks R1/R2; hidden surface truth independently
+        // checks that recovery can reach dimensions never sampled by the app.
         const f = await makeSurfaceReview(true, settings => {
           const key = `${settings.deviceId}/${settings.displaySurface}`;
           if (key !== identity) { identity = key; width = 0; height = 0; }
@@ -1340,7 +1343,21 @@ describe("asymmetric sequence invariants", () => {
           if (stopped) check(vi.getTimerCount() === 0 && f.state.timer === null && f.state.phaseTimer === null &&
             f.state.sampleTimer === null && f.state.phase === null && f.state.polling === null && !f.state.guard.tracking, "J4: pending after stop");
         };
+        let healthyAt: number | null = null, healthyGuard: StuckCaptureGuard | null = null, lastObservation = now;
         record = (guard, sample, pulse) => {
+          const goal = Math.max(sample.targetWidth * sample.targetHeight, (sample.specWidth ?? 0) * (sample.specHeight ?? 0));
+          const native = Math.min(surface.width, liveSpec.width) * Math.min(surface.height, liveSpec.height);
+          check(goal >= native, "J1: hidden surface excluded from recovery");
+          const output = sample.width * sample.height, cadence = Math.max(15, sample.fps);
+          const step = Math.min(liveSpec.width * liveSpec.height, Math.max(output * 4, 1280 * 720));
+          const bpp = Math.max(0.04, 80_000 / (output * cadence));
+          const healthy = output > 0 && output < liveSpec.width * liveSpec.height && sample.limitation !== "cpu" &&
+            Math.min(sample.available * 0.7, sample.targetBitrate) >= step * cadence * bpp * 1.5;
+          if (!healthy || healthyGuard !== guard || now - lastObservation > 4500) healthyAt = null;
+          if (healthy) healthyAt ??= now;
+          if (healthyAt !== null) check(now - healthyAt <= 3_600_000, "J5: bounded healthy liveness");
+          if (pulse) healthyAt = now;
+          healthyGuard = guard; lastObservation = now;
           check(sample.targetWidth === target().width && sample.targetHeight === target().height, "J1/J2: guard received stale target");
           if (pulse) pulses.push({ at: now, guard });
         };
@@ -1355,6 +1372,7 @@ describe("asymmetric sequence invariants", () => {
         const switchSettings = async (w: number, h: number) => {
           if (f.state.phase) coverage.add("switch-mid-pulse");
           else if (f.state.guard.tracking) coverage.add("switch-mid-outcome");
+          surface = { width: w, height: h };
           f.settings.deviceId = `identity-${++generation}`; f.dimensions(w, h, "settings"); await poll(0);
         };
         const constrain = async (timing: "before" | "after") => {
@@ -1377,6 +1395,19 @@ describe("asymmetric sequence invariants", () => {
           for (let step = 0; step < 50; step++) await poll();
           check(pulses.length === 2, "J1: uncorroborated settings must not block recovery");
           f.dimensions(1920, 1080);
+          trace.push("hidden-growth"); coverage.add("hidden-growth");
+          await switchSettings(640, 360);
+          const before = pulses.length;
+          await poll(250); surface = { width: 1920, height: 1080 }; f.dimensions(1920, 1080);
+          // Neither explicit polling nor a timer reads the enlarged capture.
+          now += 500; await vi.advanceTimersByTimeAsync(500); f.dimensions(640, 360);
+          for (let step = 0; step < 5; step++) await poll();
+          check(pulses.length > before, "J5: unseen growth must remain live");
+          trace.push("adapted-switch"); coverage.add("adapted-switch");
+          await switchSettings(256, 144); surface = { width: 1920, height: 1080 };
+          const switched = pulses.length;
+          for (let step = 0; step < 5; step++) await poll();
+          check(pulses.length > switched, "J5: adapted identity must remain live");
         }
         // Each sequence starts at a different point in this scenario. Together
         // they guarantee active pulse/switch/cap paths as well as random ordering.
@@ -1403,7 +1434,7 @@ describe("asymmetric sequence invariants", () => {
             // J2 is asserted synchronously, before a new poll or constraint result.
             assertState(); await f.publisher.setPreset("game"); assertState();
           } else if (kind === 6) {
-            const [w, h] = sizes[random(sizes.length)]!; f.dimensions(w, h, "settings"); await poll();
+            const [w, h] = sizes[random(sizes.length)]!; surface = { width: w, height: h }; f.dimensions(w, h, "settings"); await poll();
           } else if (kind === 7) { f.dimensions(480, 270); f.sample.limitation = "cpu"; await poll(); }
           else if (kind === 9) {
             const report = await f.pc.getStats();
@@ -1434,18 +1465,172 @@ describe("asymmetric sequence invariants", () => {
           liveSpec = PRESETS.game = originalSpec;
           await switchSettings(1920, 1050); f.dimensions(480, 270); f.sample.limitation = "none";
           const start = now, guard = f.state.guard;
-          for (let step = 0; step < 700; step++) {
+          for (let step = 0; step < 50; step++) await poll();
+          check(pulses.filter(p => p.guard === guard && p.at > start).length === 2, "J6: initial failure fuse");
+          // Full retained 1080p is unaffordable, but the next 720p step is healthy.
+          f.sample.available = 2_500_000; f.sample.target = 1_750_000;
+          for (let step = 0; step < 650; step++) {
             await poll(2000);
             const window = pulses.filter(p => p.guard === guard && p.at > now - 600_000);
             check(window.length <= 2, "J3: unsuccessful pulse rate");
           }
-          check(pulses.filter(p => p.guard === guard && p.at > start).length >= 4, "J3: expiry must retry");
+          check(pulses.filter(p => p.guard === guard && p.at > start).length >= 4, "J5/J6: affordable expiry must retry");
         }
         if (!stopped) await stop();
         record = () => {}; PRESETS.game = originalSpec; Peer.all = [];
       }
     } finally { PRESETS.game = originalSpec; }
     for (const event of ["scale-none", "switch-stats-first", "switch-settings-first", "cap-before", "cap-after", "relax", "resize", "cpu",
-      "pulse", "pending-switch", "preset", "stop", "switch-mid-pulse", "switch-mid-outcome", "cap-mid-pulse", "failure-expiry", "uncorroborated-settings"]) expect(coverage.has(event), event).toBe(true);
+      "pulse", "pending-switch", "preset", "stop", "switch-mid-pulse", "switch-mid-outcome", "cap-mid-pulse", "failure-expiry", "uncorroborated-settings", "hidden-growth", "adapted-switch"]) expect(coverage.has(event), event).toBe(true);
   }, 60_000);
+
+  it("checks J5/J6 across seeded healthy tails, capped cycles and partial improvement", () => {
+    // Hidden physical size is independent of both observed capture and settings.
+    // Alternate a genuinely small surface and an adapted, never-observed large one.
+    for (let seed = 0; seed < 32; seed++) {
+      const surface = seed % 2 ? { width: 1920, height: 1080 } : { width: 1280, height: 720 };
+      const width = seed % 2 ? 256 : surface.width, height = seed % 2 ? 144 : surface.height;
+      const guard = new StuckCaptureGuard(), pulses: number[] = [];
+      const delay = () => (guard as unknown as { retryDelay: number }).retryDelay;
+      let healthyAt = 0;
+      const sample = (now: number) => ({ width, height, sourceWidth: width, sourceHeight: height,
+        targetWidth: width, targetHeight: height, specWidth: 1920, specHeight: 1080,
+        fps: 20, available: seed % 2 && now > 100_000 ? 2_500_000 : 13_000_000,
+        targetBitrate: seed % 2 && now > 100_000 ? 1_750_000 : 8_000_000,
+        bitrate: seed % 2 ? 20_000 : 80_000,
+        limitation: "none", framesEncoded: 1 + now / 50 });
+      const delays = new Set<number>();
+      // Odd seeds lose full-target capacity after poisoning the fuse, while
+      // retaining continuous affordability of the next step. Run more than
+      // three capped cycles and vary the polling phase independently.
+      for (let now = seed * 17; now <= 18_000_000; now += 2000) {
+        const pulse = guard.observe(now, sample(now));
+        if (pulse) { pulses.push(now); healthyAt = now; }
+        expect(now - healthyAt, `J5 seed=${seed}`).toBeLessThanOrEqual(3_600_000);
+        expect(delay(), `J6 seed=${seed}`).toBeLessThanOrEqual(3_600_000);
+        delays.add(delay());
+        expect(pulses.filter(at => at > now - 600_000).length, `J6 seed=${seed}`).toBeLessThanOrEqual(2);
+        if (now > 8_400_000) expect(pulses.filter(at => at > now - 3_600_000).length, `J6 capped seed=${seed}`).toBeLessThanOrEqual(2);
+      }
+      expect([...delays]).toEqual([600_000, 1_200_000, 2_400_000, 3_600_000]);
+      expect(pulses.length).toBeGreaterThan(10);
+      // A partial fresh-frame gain resets L3, even below the 50% fuse-success threshold.
+      let at = 18_002_000;
+      let issued = false;
+      for (; at <= 21_602_000; at += 2000) if (guard.observe(at, sample(at))) { issued = true; break; }
+      expect(issued, `J5 improvement setup seed=${seed}`).toBe(true);
+      guard.observe(at + 2000, { ...sample(at + 2000), width: width + 2 });
+      expect(delay()).toBe(600_000);
+      // A partially improving cycle is not counted as a non-improving cycle
+      // when it expires, even though it did not meet the fuse-success threshold.
+      for (let after = at + 4000; after <= at + 720_000; after += 2000) guard.observe(after, sample(after));
+      expect(delay()).toBe(600_000);
+    }
+  });
+
+});
+
+describe("round eight liveness repros", () => {
+  it("retries a switch first observed already adapted, without needing spontaneous growth", async () => {
+    const f = await makeSurfaceReview();
+    f.settings.deviceId = "second-surface";
+    f.dimensions(256, 144); f.sample.limitation = "none";
+    await f.state.headroom();
+    const before = f.pulses();
+    await vi.advanceTimersByTimeAsync(1_400_000);
+    const result = { target: f.state.captureTarget(), attempts: f.pulses() - before };
+    f.stop();
+    expect(result.attempts, JSON.stringify(result)).toBeGreaterThan(0);
+  });
+
+  it("recovers when resize growth and adaptation both occur between ordinary settings polls", async () => {
+    const f = await makeSurfaceReview();
+    // Switch to an initially small window, then retain this identity throughout.
+    f.settings.deviceId = "small-window"; f.dimensions(640, 360);
+    await f.state.headroom();
+    const guard = f.state.guard;
+    // The user's resize produces full-size frames briefly. A pending Chromium
+    // adaptation brings the capture back down before the next two-second poll.
+    await vi.advanceTimersByTimeAsync(250); f.dimensions(1920, 1080);
+    await vi.advanceTimersByTimeAsync(500); f.dimensions(640, 360);
+    f.sample.limitation = "none";
+    await vi.advanceTimersByTimeAsync(1_400_000);
+    const result = { target: f.state.captureTarget(), attempts: f.pulses(), sameGuard: f.state.guard === guard };
+    f.stop();
+    expect(result.attempts, JSON.stringify(result)).toBeGreaterThan(0);
+  });
+});
+
+
+describe("round eight overestimate expiry repro", () => {
+  it("retries a new affordable stall after a harmless same-identity shrink exhausted the fuse", async () => {
+    const f = await makeSurfaceReview();
+    // Ordinary drag-resize of the same window: ceiling deliberately remains 1080p.
+    f.dimensions(1280, 720); f.sample.limitation = "none";
+    await vi.advanceTimersByTimeAsync(100_000);
+    expect(f.pulses()).toBe(2);
+    // A temporary link dip now leaves the physically 720p window adapted to 270p.
+    // Available capacity supports 720p20 with 50% spare, but not stale 1080p20.
+    f.dimensions(480, 270); f.sample.limitation = "bandwidth";
+    f.sample.available = 500_000; f.sample.target = 350_000;
+    await vi.advanceTimersByTimeAsync(2000);
+    f.sample.limitation = "none";
+    f.sample.available = 2_500_000; f.sample.target = 1_750_000;
+    await vi.advanceTimersByTimeAsync(1_400_000);
+    const result = { target: f.state.captureTarget(), totalAttempts: f.pulses() };
+    f.stop();
+    expect(result.totalAttempts, JSON.stringify(result)).toBeGreaterThan(2);
+  });
+
+  it("control: the lower budget permits recovery attempts before the fuse is poisoned", () => {
+    const guard = new StuckCaptureGuard(), pulses: number[] = [];
+    for (let now=0; now<=100_000; now+=2000) {
+      if (guard.observe(now, { width:480, height:270, sourceWidth:480, sourceHeight:270,
+        targetWidth:1920, targetHeight:1080, captureWidth:1920, captureHeight:1080,
+        fps:20, available:2_500_000, targetBitrate:1_750_000, bitrate:80_000,
+        limitation:"none", framesEncoded:1+now/50 })) pulses.push(now);
+    }
+    expect(pulses).toEqual([6000, 28000]);
+  });
+});
+
+describe("round eight positive liveness control", () => {
+  it("does retry the resized window when a larger settings snapshot is sampled", async () => {
+    const f = await makeSurfaceReview();
+    f.settings.deviceId = "small-window"; f.dimensions(640, 360); await f.state.headroom();
+    await vi.advanceTimersByTimeAsync(250); f.dimensions(1920, 1080);
+    await f.state.headroom();
+    await vi.advanceTimersByTimeAsync(500); f.dimensions(640, 360);
+    await vi.advanceTimersByTimeAsync(100_000);
+    const result = { target: f.state.captureTarget(), attempts: f.pulses() };
+    f.stop();
+    expect(result.target).toEqual({width:1920,height:1080});
+    expect(result.attempts).toBe(2);
+  });
+});
+
+
+it("keeps even near-spec output live without waiting for a 25 percent deficit", () => {
+  const guard = new StuckCaptureGuard(), pulses: number[] = [];
+  for (let now = 0; now <= 8000; now += 2000) {
+    if (guard.observe(now, { width: 1856, height: 1044, sourceWidth: 1856, sourceHeight: 1044,
+      targetWidth: 1856, targetHeight: 1044, specWidth: 1920, specHeight: 1080,
+      fps: 20, available: 13_000_000, targetBitrate: 8_000_000, bitrate: 80_000,
+      limitation: "none", framesEncoded: 1 + now / 50 })) pulses.push(now);
+  }
+  expect(pulses).toEqual([6000]);
+});
+
+describe("round eight backoff resets", () => {
+  it.each(["identity", "preset", "spec"] as const)("resets per-identity retry backoff on %s changes", async change => {
+    const f = await makeSurfaceReview();
+    f.dimensions(1280, 720);
+    await vi.advanceTimersByTimeAsync(700_000);
+    const delay = () => (f.state.guard as unknown as { retryDelay: number }).retryDelay;
+    expect(delay()).toBe(1_200_000);
+    if (change === "identity") { f.settings.deviceId = "new"; await f.state.headroom(); }
+    else if (change === "preset") await f.publisher.setPreset("saver");
+    else await f.publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
+    expect(delay()).toBe(600_000); f.stop();
+  });
 });

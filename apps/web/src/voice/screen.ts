@@ -124,7 +124,8 @@ export class StuckCaptureGuard {
   private unsuccessful = 0;
   private qpAttempted = false;
   private suppressedAt: number | null = null;
-  private healthySince: number | null = null;
+  private retryDelay = 600_000;
+  private improved = false;
   private spareSince: number | null = null;
 
   get tracking(): boolean { return this.outcome !== null; }
@@ -132,6 +133,8 @@ export class StuckCaptureGuard {
   observe(now: number, sample: {
     width: number; height: number; sourceWidth: number; sourceHeight: number;
     targetWidth: number; targetHeight: number; fps: number;
+    /** Liveness fallback, independent of observed capture dimensions. */
+    specWidth?: number; specHeight?: number;
     available: number; targetBitrate: number; bitrate: number; limitation: string;
     /** Largest settings dimensions observed for this capture identity. */
     captureWidth?: number; captureHeight?: number;
@@ -139,20 +142,25 @@ export class StuckCaptureGuard {
     framesEncoded?: number;
   }): boolean {
     const quality = this.quality.observe(sample.quality);
-    const pixels = sample.targetWidth * sample.targetHeight;
+    const pixels = Math.max(sample.targetWidth * sample.targetHeight, (sample.specWidth ?? 0) * (sample.specHeight ?? 0));
     const outputPixels = sample.width * sample.height;
     const continuous = this.last !== null && now - this.last <= HEADROOM_INTERVAL_MS * 2.25;
     const cadence = Math.max(15, sample.fps);
     const budget = Math.min(sample.available * UPLINK_SHARE, sample.targetBitrate);
-    const capacity = sample.limitation !== "cpu" && sample.fps > 0 && pixels > 0 &&
-      Number.isFinite(budget) && budget >= pixels * cadence * 0.04 * 1.5;
-    this.healthySince = capacity ? (continuous ? this.healthySince ?? now : now) : null;
-    // Time alone cannot rearm a pressured/CPU-limited share. All suppression,
-    // including the QP one-shot, expires together after healthy target capacity.
-    if (!this.outcome && this.suppressedAt !== null && now - this.suppressedAt >= 600_000 &&
-      this.healthySince !== null && now - this.healthySince >= 30_000) {
-      this.unsuccessful = 0; this.qpAttempted = false; this.suppressedAt = null;
-      this.quality = new LowEncoderQp(); this.since = null;
+    const currentPixels = outputPixels || sample.sourceWidth * sample.sourceHeight;
+    // Price the next step, never the full retained ceiling: a stale 1080p
+    // observation must not lock out an affordable 720p recovery indefinitely.
+    const largerPixels = Math.min(pixels, Math.max(currentPixels * 4, 1280 * 720));
+    const spare = sample.limitation !== "cpu" && sample.fps > 0 && pixels > 0 && Number.isFinite(budget) &&
+      budget >= largerPixels * cadence * 0.04 * 1.5;
+    this.spareSince = spare ? (continuous ? this.spareSince ?? now : now) : null;
+    // Cooldowns are retry envelopes from the last pulse. Reserve one ordinary
+    // polling interval so the capped liveness bound includes observation latency.
+    // Keep continuous affordability/QP evidence, including while fused.
+    if (!this.outcome && this.suppressedAt !== null && now - this.suppressedAt >= this.retryDelay - HEADROOM_INTERVAL_MS &&
+      this.spareSince !== null && now - this.spareSince >= 30_000) {
+      if (this.unsuccessful > 0 && !this.improved) this.retryDelay = Math.min(3_600_000, this.retryDelay * 2);
+      this.unsuccessful = 0; this.qpAttempted = false; this.suppressedAt = null; this.improved = false;
     }
     if (this.outcome) {
       const outcome = this.outcome;
@@ -164,19 +172,23 @@ export class StuckCaptureGuard {
       // Regular and fast polls can read the same frame. A duplicate is not a
       // regression; a counter that stops advancing for a second is not recovery.
       const advancing = outcome.advancedAt !== null && now - outcome.advancedAt <= 1_000;
+      // Even a partial fresh-frame improvement ends consecutive non-improving
+      // cycles; the existing stronger success criterion still judges the fuse.
+      if (continuous && advancing && outputPixels > outcome.from) {
+        this.retryDelay = 600_000; this.improved = true;
+      }
       const gained = continuous && advancing && outputPixels >= outcome.from * 1.5;
       outcome.gainSince = gained && now >= outcome.restoreAt ? outcome.gainSince ?? now : null;
       if (outcome.gainSince !== null && now - outcome.gainSince >= 10_000) {
         // Successful recovery discards the old size; a later dip is a new event.
-        this.outcome = null; this.unsuccessful = 0;
+        this.outcome = null; this.unsuccessful = 0; this.retryDelay = 600_000;
       } else if (now >= outcome.until) {
-        this.outcome = null; this.unsuccessful++; this.suppressedAt = now;
+        this.outcome = null; this.unsuccessful++;
       }
     }
-    const small = (w: number, h: number) => w > 0 && h > 0 && w * h < pixels * 0.75;
+    const small = (w: number, h: number) => w > 0 && h > 0 && w * h < pixels;
     // Budget the larger size at the actual source cadence, with 50% spare capacity.
     // Both GCC's estimate (after voice headroom) and its encoder target must support it.
-    const currentPixels = sample.width * sample.height || sample.sourceWidth * sample.sourceHeight;
     // Dense content may need much more than the nominal screen-content budget.
     // Do not reset legitimate quality scaling when the current size already uses it.
     const largerSource = (sample.captureWidth ?? sample.sourceWidth) * (sample.captureHeight ?? sample.sourceHeight) > outputPixels * 1.5;
@@ -185,14 +197,8 @@ export class StuckCaptureGuard {
     // content: those bits buy excess precision at the stalled size. Still require
     // the nominal pixel floor AND 50% spare at the source's actual cadence.
     const bpp = useQp ? 0.04 : Math.max(0.04, currentPixels > 0 ? sample.bitrate / (currentPixels * cadence) : Infinity);
-    // A stalled 144p/270p capture need not have enough capacity for all of 1080p60:
-    // price four times the current pixels with a 720p floor, capped at the target.
-    const largerPixels = Math.min(pixels, Math.max(currentPixels * 4, 1280 * 720));
     const needed = largerPixels * cadence * bpp * 1.5;
-    const spare = sample.limitation !== "cpu" && sample.fps > 0 && pixels > 0 && Number.isFinite(budget) &&
-      budget >= largerPixels * cadence * 0.04 * 1.5;
-    this.spareSince = spare ? (continuous ? this.spareSince ?? now : now) : null;
-    const healthy = this.unsuccessful < 2 && !this.outcome && sample.limitation !== "cpu" && sample.fps > 0 && pixels > 0 &&
+    const healthy = !this.outcome && sample.limitation !== "cpu" && sample.fps > 0 && pixels > 0 &&
       Number.isFinite(needed) && Number.isFinite(sample.available) && Number.isFinite(sample.targetBitrate) && Math.min(sample.available * UPLINK_SHARE, sample.targetBitrate) >= needed;
     if (!healthy || !(small(sample.width, sample.height) || small(sample.sourceWidth, sample.sourceHeight))) {
       this.since = null;
@@ -205,10 +211,10 @@ export class StuckCaptureGuard {
     // The QP delta covers the preceding interval. Reuse already-observed healthy
     // larger-step capacity instead of starting another six seconds at its first result.
     const sustainedQp = useQp && quality.sustained && this.spareSince !== null && now - this.spareSince >= 6_000;
-    if (this.since === null || (!sustained && !sustainedQp) || now < this.next || (useQp && !quality.sustained)) return false;
+    if (this.unsuccessful >= 2 || this.outcome || this.since === null || (!sustained && !sustainedQp) || now < this.next || (useQp && !quality.sustained)) return false;
     this.since = null;
     this.qpAttempted ||= useQp;
-    if (useQp) this.suppressedAt ??= now;
+    this.suppressedAt = now;
     this.outcome = { from: currentPixels, restoreAt: now + 1_000, until: now + 16_000, gainSince: null, frames: sample.framesEncoded, advancedAt: null };
     this.next = now + this.cooldown;
     this.cooldown = Math.min(120_000, this.cooldown * 2);
@@ -573,6 +579,7 @@ export class ScreenPublisher {
         width: out?.frameWidth ?? 0, height: out?.frameHeight ?? 0,
         sourceWidth: source?.width ?? settings?.width ?? 0, sourceHeight: source?.height ?? settings?.height ?? 0,
         targetWidth: captureTarget.width, targetHeight: captureTarget.height,
+        specWidth: spec.width, specHeight: spec.height,
         fps: Math.min(spec.fps, source?.framesPerSecond ?? settings?.frameRate ?? out?.framesPerSecond ?? 0),
         captureWidth: this.ceiling.known ? this.ceiling.width : 0, captureHeight: this.ceiling.known ? this.ceiling.height : 0,
         ...(out?.qpSum !== undefined && out.framesEncoded !== undefined && codec ? { quality: {
@@ -615,10 +622,18 @@ export class ScreenPublisher {
    *     from that same synchronous settings snapshot. Stats (including source
    *     ids) never seed or reset it: they can describe the previous surface.
    *     Unreported switches are indistinguishable and retain the higher ceiling.
-   * R3. Shrinks can overestimate. Two failed pulses fuse until ten minutes of
-   *     suppression plus healthy target capacity; expiry retries. No size proof.
-   * R4. Guard-only eligibility, QP escape, independent deadline, fuse and expiry
-   *     are unchanged; expiry capacity uses the live clamped target too.
+   * R3. Shrinks can overestimate. The two-failure fuse and bounded retry
+   *     envelopes limit excess attempts; no settings sample proves native size.
+   * R4. Guard-only operation, QP escape, independent pulse deadline and the
+   *     20/40/80/120-second attempt spacing remain unchanged.
+   * L1. Output below the live spec remains eligible even if the ceiling never
+   *     observed growth. With continuous next-step affordability, retry within
+   *     at most 60 minutes (including one ordinary polling interval).
+   * L2. Expiry requires 30 seconds of healthy next-step capacity, not capacity
+   *     for the full retained target. Continuous eligibility survives the fuse.
+   * L3. Consecutive non-improving cycles back off 10/20/40/60 minutes, capped.
+   *     Improvement, identity and preset/spec changes reset that backoff. The
+   *     2/7/100 pulses per half-open ten-minute window bounds still hold.
    */
   private refreshSurface(): MediaTrackSettings | undefined {
     const settings = this.params.track.getSettings?.();

@@ -355,9 +355,10 @@ capture adaptation with a one-second `maintain-resolution` pulse, then restore t
 current spec using fresh sender parameters. It requires six continuous seconds of
 undersize, no CPU limitation, and both the encoder target and 70% of a fresh outgoing
 estimate above `larger pixels × max(15, source fps) × bpp × 1.5` bits/s. The target,
-cadence and cap come from the resolved spec, observed settings ceiling and effective
-codec-recovery limits. The larger step is capped at that target and otherwise four
-times the current pixels, with a 720p floor. The bpp budget is at least 0.04 and grows
+cadence and cap come from the live resolved spec, including effective codec-recovery
+limits. The retained settings target cannot exclude attempts toward that spec (L1).
+Any positive output below the spec is eligible. The larger step is capped at the
+spec and otherwise four times the current pixels, with a 720p floor. The bpp budget is at least 0.04 and grows
 with measured payload demand, leaving genuinely expensive content alone.
 
 A low-QP escape handles a stalled encoder spending most of its bitrate target at a
@@ -373,10 +374,15 @@ threshold justification and three-repeat cold-browser measurements.
 Retries retain 20, 40, 80 and 120 second backoff. Every pulse is judged across its
 restore using temporary 250 ms sampling: success needs ten seconds of larger
 output with fresh encoded-frame progress after restore. Duplicate reads do not
-restart that clock; missing or frozen counters cannot establish recovery. Two unsuccessful attempts suppress further pulses;
-the QP escape is one-shot. Suppression expires after ten minutes plus thirty
-continuous seconds of healthy target capacity without CPU limitation. Successful
-recovery discards the old outcome size reference.
+restart that clock; missing or frozen counters cannot establish recovery. Two unsuccessful
+attempts suppress further pulses; the QP escape is one-shot per cycle. **L2:** all
+suppression expires only with thirty continuous seconds of healthy capacity for the
+**next recovery step**, without CPU limitation. Full-target capacity is unnecessary:
+a 270p20 capture can retry with a 1.75 Mb/s encoder budget sufficient for the nominal
+720p20 step (1.106 Mb/s), even if the retained 1080p20 target needs 2.488 Mb/s.
+Successful recovery discards the old outcome size reference. Any fresh encoded-frame
+output improvement during an attempt resets the non-improving-cycle backoff; the
+stronger sustained 50% gain criterion still decides fuse success.
 
 The target model is asymmetric: losing a recovery target can strand capture forever,
 whereas excess attempts are bounded. Each surface identity retains a **ceiling** of
@@ -386,7 +392,10 @@ overestimate. The ceiling never shrinks for window resizes, capture-stage scalin
 CPU/bandwidth adaptation, pulses, application caps, or delayed cap frames, even with
 limitation `none`. The guard target is `min(ceiling, live spec)` per axis; the spec
 includes recovery caps. Caps never overwrite the ceiling, so relaxing one restores
-the full target immediately. Suppression expiry uses this same live target.
+the full target immediately. **L1:** the ceiling never vetoes an attempt toward the
+live spec. Growth and Chromium adaptation can both occur between polls, or a new
+identity can first appear already adapted; neither needs a larger observed snapshot
+to remain recoverable. The live spec supplies the independent liveness fallback.
 
 Identity is the publisher's track plus the synchronous `getSettings()` fields
 `deviceId` and `displaySurface`. A new track creates a new publisher. A change to a
@@ -397,20 +406,32 @@ lead or lag settings and may still describe the previous identity. Until synchro
 settings identify a switch, they belong to the previous identity. Missing identity
 fields or switches between indistinguishable surfaces retain the higher ceiling;
 there is no claim to prove physical dimensions. A switch first observed already
-reduced starts from those settings and grows as larger settings become available.
+reduced seeds its ceiling from those settings, with the spec fallback eligible
+immediately. It does not need spontaneous growth to enable pulses.
 
-For a permanently smaller, non-growing output under an unchanged identity and
+**L3:** consecutive non-improving attempt cycles use **10 → 20 → 40 → 60 minute**
+retry envelopes, capped at sixty minutes, measured from the final pulse in the
+preceding cycle. One ordinary two-second polling interval is reserved inside each
+envelope for observing its completion; continuous eligibility and QP evidence survive
+suppression. Identity switches, preset/spec changes (including codec recovery caps),
+and fresh-frame improvement reset this backoff to ten minutes. Ceiling growth alone
+never resets it. With continuously healthy next-step capacity, valid advancing
+telemetry and ordinary polling, output below the spec gets a pulse within **at most
+60 minutes**, including that polling interval. A fresh unfused guard needs six seconds
+of eligibility (at most eight seconds including its first ordinary poll). CPU pressure,
+unaffordable payload demand, invalid telemetry and polling stalls do not satisfy this
+liveness premise. The valid low-QP escape retains its evidence requirements.
+
+For a permanently smaller, non-growing surface under an unchanged identity and
 configuration, every pulse fails: **at most two issued one-second pulses in any
-half-open ten-minute window**, then expiry can retry. Expiry requires both ten
-minutes since suppression and thirty seconds of continuous healthy target capacity;
-these conditions can overlap. If output repeatedly gains 50% for ten seconds and
-regresses, even an overestimated target can record successes: backoff bounds these
-to **seven pulses per ten-minute window** (at most five once backoff reaches 120 s).
-This follows from the minimum successive gaps 20, 40, 80, then 120 seconds. Explicit
-surface/preset/codec resets start fresh history; including arbitrary such resets,
-the six-second eligibility window bounds a publisher to **100 pulses per half-open
-ten-minute window**. Ceiling growth alone never resets history. The one-second
-deadline is independent of sender promise completion, with serialized current-state
+half-open ten-minute window**. Once the sixty-minute cap is reached, the bound
+sharpens to **two pulses per half-open hour**. If output repeatedly gains 50% for
+ten seconds and regresses, even an
+overestimated target can record successes: the unchanged 20/40/80/120-second attempt
+spacing bounds these to **seven pulses per ten-minute window** (at most five once
+spacing reaches 120 s). Explicit surface/preset/codec resets start fresh history;
+including arbitrary such resets, six-second eligibility bounds a publisher to
+**100 pulses per half-open ten-minute window**. The one-second deadline is independent of sender promise completion, with serialized current-state
 restores.
 Preset changes, close and codec replacement fence queued parameters and cancel
 phase/sampling timers. `scaleResolutionDownBy` only enforces the existing
