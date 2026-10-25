@@ -274,168 +274,63 @@ it("keeps the original publisher alive until its replacement is accepted and ret
 });
 
 
-describe("Game capture adaptation", () => {
+describe("publisher capture guard", () => {
   const make = (offer: () => Promise<string> = async () => "answer") => new ScreenPublisher({
     track: { applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080, frameRate: 20 }) } as unknown as MediaStreamTrack,
     preset: "game", iceServers: [], offer, state: () => {},
   });
   const last = (pc = Peer.all[0]!) => pc.sendParams.at(-1)!;
+  const healthy = (pc: Peer) => {
+    pc.getStats.mockImplementation(async () => {
+      const timestamp = performance.now();
+      return new Map([
+        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 5_000_000, timestamp: performance.timeOrigin + performance.now() }],
+        ["source", { type: "media-source", width: 480, height: 270, framesPerSecond: 20 }],
+        ["out", { type: "outbound-rtp", kind: "video", framesEncoded: timestamp / 50, mediaSourceId: "source", timestamp, bytesSent: timestamp * 10, frameWidth: 480, frameHeight: 270, framesPerSecond: 20, targetBitrate: 3_500_000, qualityLimitationReason: "bandwidth" }],
+      ]);
+    });
+  };
 
-  it("protects the encoder before its answer, then restores with fresh parameters and the current cap", async () => {
+  it("uses the resolved frame-rate preference from the first answer, without a startup hold", async () => {
+    const publisher = make(); await publisher.start();
+    expect(last()).toMatchObject({ degradationPreference: "maintain-framerate", encodings: [{ maxBitrate: 8_000_000, scaleResolutionDownBy: 1, maxFramerate: 60, priority: "low", networkPriority: "low" }] });
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(Peer.all[0]!.sendParams.every(p => p.degradationPreference === "maintain-framerate")).toBe(true);
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("derives target size, cadence and guard budget from the resolved spec", async () => {
+    const original = PRESETS.game;
+    PRESETS.game = { ...original, width: 1280, height: 720, fps: 30, maxBitrate: 1_000_000 };
     const publisher = make();
-    await publisher.start();
-    const pc = Peer.all[0]!;
-    expect(last()).toMatchObject({ degradationPreference: "maintain-resolution", encodings: [{ maxBitrate: 8_000_000, maxFramerate: 60, priority: "low", networkPriority: "low" }] });
-    expect(pc.transceivers[0]!.sender.setParameters.mock.invocationCallOrder[0]).toBeLessThan(pc.setRemoteDescription.mock.invocationCallOrder[0]!);
-    pc.stats.set("p", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 3_000_000 });
-    await vi.advanceTimersByTimeAsync(1999);
-    expect(last().degradationPreference).toBe("maintain-resolution");
-    await vi.advanceTimersByTimeAsync(1);
-    expect(last()).toMatchObject({ degradationPreference: "maintain-framerate", encodings: [{ maxBitrate: 2_100_000 }] });
-    expect(new Set(pc.sendParams.map(p => p.transactionId)).size).toBe(pc.sendParams.length);
-    publisher.close();
+    try {
+      await publisher.start();
+      const pc = Peer.all[0]!; healthy(pc);
+      await vi.advanceTimersByTimeAsync(40_000);
+      // Stats from a previous encoder target cannot override the resolved cap.
+      expect(pc.sendParams.every(p => p.degradationPreference === "maintain-framerate")).toBe(true);
+      expect(last().encodings[0]).toMatchObject({ maxBitrate: 1_000_000, maxFramerate: 30, scaleResolutionDownBy: 1 });
+    } finally { publisher.close(); PRESETS.game = original; }
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("waits for the first encoded frame before counting the two-second window", async () => {
-    const publisher = make();
-    const starting = publisher.start();
-    Peer.all[0]!.stats.clear();
-    await starting;
-    await vi.advanceTimersByTimeAsync(5000);
-    expect(last().degradationPreference).toBe("maintain-resolution");
-    Peer.all[0]!.stats.set("out", { type: "outbound-rtp", kind: "video", framesEncoded: 1 });
-    await vi.advanceTimersByTimeAsync(250);
-    await vi.advanceTimersByTimeAsync(1999);
-    expect(last().degradationPreference).toBe("maintain-resolution");
-    await vi.advanceTimersByTimeAsync(1);
-    expect(last().degradationPreference).toBe("maintain-framerate");
-    publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("keeps fps on a measured constrained startup, and removes its sender bound after link recovery", async () => {
+  it.each(["close", "preset", "recover"])("cancels a bounded pulse on %s without a stale restore", async action => {
     const publisher = make(); await publisher.start();
-    const pc = Peer.all[0]!;
-    pc.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 1_500_000 });
-    pc.stats.set("source", { framesPerSecond: 60 });
-    pc.stats.set("out", { type: "outbound-rtp", kind: "video", framesEncoded: 1, mediaSourceId: "source", framesPerSecond: 10, qualityLimitationReason: "none" });
-    await vi.advanceTimersByTimeAsync(499);
-    expect(last().encodings[0]!.scaleResolutionDownBy).toBe(1);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(last().encodings[0]!.scaleResolutionDownBy).toBeCloseTo(Math.sqrt(8_000_000 / 1_050_000));
-    expect(last()).toMatchObject({ degradationPreference: "maintain-resolution", encodings: [{ maxBitrate: 1_050_000, maxFramerate: 60, priority: "low" }] });
+    const pc = Peer.all[0]!; healthy(pc);
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(last().degradationPreference).toBe("maintain-resolution");
+    if (action === "close") publisher.close();
+    else if (action === "preset") await publisher.setPreset("saver");
+    else await publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
+    const count = pc.sendParams.length;
     await vi.advanceTimersByTimeAsync(1500);
-    expect(last().degradationPreference).toBe("maintain-framerate");
-    expect(last().encodings[0]!.scaleResolutionDownBy).toBeGreaterThan(2);
-    const bounded = last().encodings[0]!.scaleResolutionDownBy;
-    for (const availableOutgoingBitrate of [1_400_000, 1_600_000, 1_500_000]) {
-      pc.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate });
-      await vi.advanceTimersByTimeAsync(2000);
-      expect(last().encodings[0]!.scaleResolutionDownBy).toBe(bounded);
-    }
-    pc.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 15_000_000 });
-    await vi.advanceTimersByTimeAsync(2000);
-    expect(last()).toMatchObject({ degradationPreference: "maintain-framerate", encodings: [{ maxBitrate: 8_000_000, scaleResolutionDownBy: 1 }] });
+    expect(pc.sendParams).toHaveLength(count);
+    if (action === "preset") expect(last().degradationPreference).toBe("balanced");
+    if (action === "recover") expect(last(Peer.all[1]!)).toMatchObject({ degradationPreference: "maintain-framerate", encodings: [{ maxFramerate: 30, scaleResolutionDownBy: 1.5 }] });
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("detects constrained cadence from frame counters before framesPerSecond is available", async () => {
-    const publisher = make(); await publisher.start();
-    const pc = Peer.all[0]!;
-    pc.getStats.mockImplementation(async () => new Map([
-      ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 1_500_000 }],
-      ["source", { framesPerSecond: 60 }],
-      ["out", { type: "outbound-rtp", kind: "video", mediaSourceId: "source", framesEncoded: 1 + Math.floor(performance.now() / 250) * 2, timestamp: performance.now(), qualityLimitationReason: "none" }],
-    ]));
-    await vi.advanceTimersByTimeAsync(749);
-    expect(last().encodings[0]!.scaleResolutionDownBy).toBe(1);
-    await vi.advanceTimersByTimeAsync(1);
-    expect(last().encodings[0]!.scaleResolutionDownBy).toBeGreaterThan(2);
-    publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it.each(["spare", "busy", "cpu", "slow", "gap"])("prices measured startup demand only with sustained healthy spare capacity: %s", async kind => {
-    const publisher = make(); await publisher.start();
-    const pc = Peer.all[0]!;
-    pc.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 1_500_000 });
-    pc.stats.set("source", { framesPerSecond: 60 });
-    const out = { type: "outbound-rtp", kind: "video", framesEncoded: 1, mediaSourceId: "source", framesPerSecond: 10, frameWidth: 854, frameHeight: 480, qualityLimitationReason: "none" };
-    pc.stats.set("out", out);
-    await vi.advanceTimersByTimeAsync(500);
-    expect(last().encodings[0]!.scaleResolutionDownBy).toBeGreaterThan(2);
-    Object.assign(out, { framesPerSecond: kind === "slow" ? 10 : 60, qualityLimitationReason: kind === "cpu" ? "cpu" : "none" });
-    let timestamp = 0;
-    const bitrate = kind === "busy" ? 1_000_000 : 100_000;
-    pc.getStats.mockImplementation(async () => {
-      timestamp += kind === "gap" ? 10_000 : 2000;
-      return new Map([...pc.stats, ["out", { ...out, timestamp, bytesSent: timestamp * bitrate / 8000 }]]);
-    });
-    await vi.advanceTimersByTimeAsync(9000);
-    expect(last().encodings[0]!.scaleResolutionDownBy).toBeGreaterThan(2);
-    await vi.advanceTimersByTimeAsync(500);
-    if (kind === "spare") expect(last().encodings[0]!.scaleResolutionDownBy).toBe(1);
-    else expect(last().encodings[0]!.scaleResolutionDownBy).toBeGreaterThan(2);
-    publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it.each(["sparse", "cpu", "brief"])("does not mistake %s startup for sustained bandwidth pressure", async kind => {
-    const publisher = make(); await publisher.start();
-    const pc = Peer.all[0]!;
-    pc.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 1_500_000 });
-    pc.stats.set("source", { framesPerSecond: kind === "sparse" ? 20 : 60 });
-    pc.stats.set("out", { type: "outbound-rtp", kind: "video", framesEncoded: 1, mediaSourceId: "source", framesPerSecond: kind === "sparse" ? 20 : 10, qualityLimitationReason: kind === "cpu" ? "cpu" : "none" });
-    await vi.advanceTimersByTimeAsync(250);
-    if (kind === "brief") pc.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 5_000_000 });
-    await vi.advanceTimersByTimeAsync(2000);
-    expect(last().encodings[0]!.scaleResolutionDownBy).toBe(1);
-    publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("clears constrained-startup scaling on a preset change or encoder replacement", async () => {
-    const publisher = make(); await publisher.start();
-    const pc = Peer.all[0]!;
-    pc.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 1_500_000 });
-    pc.stats.set("source", { framesPerSecond: 60 });
-    pc.stats.set("out", { type: "outbound-rtp", kind: "video", framesEncoded: 1, mediaSourceId: "source", framesPerSecond: 10 });
-    await vi.advanceTimersByTimeAsync(500);
-    expect(last().encodings[0]!.scaleResolutionDownBy).toBeGreaterThan(2);
-    await publisher.setPreset("text");
-    expect(last()).toMatchObject({ degradationPreference: "maintain-resolution", encodings: [{ scaleResolutionDownBy: 1, maxFramerate: 15 }] });
-    await publisher.setPreset("game");
-    await vi.advanceTimersByTimeAsync(500);
-    expect(last().encodings[0]!.scaleResolutionDownBy).toBeGreaterThan(2);
-    await publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
-    expect(last(Peer.all[1]!)).toMatchObject({ degradationPreference: "maintain-resolution", encodings: [{ scaleResolutionDownBy: 1.5, maxFramerate: 30 }] });
-    publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("does not spend the startup window waiting for signalling", async () => {
-    let answer!: (sdp: string) => void;
-    const publisher = make(() => new Promise(resolve => { answer = resolve; }));
-    const pending = publisher.start();
-    await vi.waitFor(() => expect(answer).toBeDefined());
-    await vi.advanceTimersByTimeAsync(5_000);
-    expect(last().degradationPreference).toBe("maintain-resolution");
-    answer("answer"); await pending;
-    await vi.advanceTimersByTimeAsync(1999);
-    expect(last().degradationPreference).toBe("maintain-resolution");
-    await vi.advanceTimersByTimeAsync(1);
-    expect(last().degradationPreference).toBe("maintain-framerate");
-    publisher.close();
-  });
-
-  it.each(["text", "smooth", "saver"] as const)("cancels startup when changed to %s", async preset => {
-    const publisher = make(); await publisher.start();
-    await vi.advanceTimersByTimeAsync(1000);
-    await publisher.setPreset(preset);
-    const count = Peer.all[0]!.sendParams.length;
-    await vi.advanceTimersByTimeAsync(3000);
-    expect(last().degradationPreference).toBe(PRESETS[preset].degradation);
-    expect(Peer.all[0]!.sendParams).toHaveLength(count);
-    publisher.close();
-  });
-
-  it("closing during negotiation cannot arm a startup restore", async () => {
+  it("closing during negotiation cannot arm a guard timer", async () => {
     let answer!: (sdp: string) => void;
     const publisher = make(() => new Promise(resolve => { answer = resolve; }));
     const pending = publisher.start();
@@ -446,78 +341,151 @@ describe("Game capture adaptation", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("closing during a pending encoder-stats poll cannot re-arm its timer", async () => {
+  it("closing during a pending guard-stats poll cannot re-arm a pulse", async () => {
     const publisher = make(); await publisher.start();
-    const pc = Peer.all[0]!;
+    const pc = Peer.all[0]!; healthy(pc);
+    await vi.advanceTimersByTimeAsync(8000);
     let finish!: (stats: typeof pc.stats) => void;
     pc.getStats.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
-    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(2000);
     publisher.close();
     finish(pc.stats); await vi.advanceTimersByTimeAsync(5000);
     expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("restarts the phase for a replacement publisher and cancels its predecessor's timer", async () => {
+  it("serializes an in-flight pulse restore with a preset change and never retries stale parameters", async () => {
     const publisher = make(); await publisher.start();
-    await vi.advanceTimersByTimeAsync(1000);
-    const old = Peer.all[0]!, count = old.sendParams.length;
-    await publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
-    const next = Peer.all[1]!;
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(old.sendParams).toHaveLength(count);
-    expect(last(next)).toMatchObject({ degradationPreference: "maintain-resolution", encodings: [{ maxFramerate: 30, scaleResolutionDownBy: 1.5 }] });
-    await vi.advanceTimersByTimeAsync(1000);
-    expect(last(next).degradationPreference).toBe("maintain-framerate");
-    publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("does not apply late stats from the replaced publisher to its new encoder", async () => {
-    const publisher = make(); await publisher.start();
-    const old = Peer.all[0]!;
-    await vi.advanceTimersByTimeAsync(2000);
-    let finish!: (stats: typeof old.stats) => void;
-    old.getStats.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
-    await vi.advanceTimersByTimeAsync(2000);
-    await publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
-    const next = Peer.all[1]!, count = next.sendParams.length;
-    old.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 100_000 });
-    finish(old.stats); await vi.advanceTimersByTimeAsync(0);
-    expect(next.sendParams).toHaveLength(count);
-    expect(last(next)).toMatchObject({ degradationPreference: "maintain-resolution", encodings: [{ maxBitrate: 8_000_000 }] });
-    publisher.close(); expect(vi.getTimerCount()).toBe(0);
-  });
-
-  it("serializes an in-flight restore with a preset change and never retries stale parameters", async () => {
-    const publisher = make(); await publisher.start();
-    const pc = Peer.all[0]!, sender = pc.transceivers[0]!.sender;
+    const pc = Peer.all[0]!; healthy(pc);
+    await vi.advanceTimersByTimeAsync(10_000);
+    const sender = pc.transceivers[0]!.sender;
     let reject!: (e: Error) => void;
     sender.setParameters.mockImplementationOnce(() => new Promise<void>((_, no) => { reject = no; }));
-    await vi.advanceTimersByTimeAsync(2000);
+    await vi.advanceTimersByTimeAsync(1000);
     const changed = publisher.setPreset("saver");
     reject(new Error("stale transaction")); await changed;
     expect(last()).toMatchObject({ degradationPreference: "balanced", encodings: [{ maxBitrate: 1_500_000, maxFramerate: 30 }] });
-    publisher.close();
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("pulses a sustained healthy undersize, preserves headroom, and cancels the pulse on preset change", async () => {
+  it("bounds pulses to one second, keeps headroom, and rate-limits an unresolved stall", async () => {
     const publisher = make(); await publisher.start();
-    const pc = Peer.all[0]!;
-    pc.stats.set("p", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 5_000_000 });
-    pc.stats.set("out", { type: "outbound-rtp", kind: "video", framesEncoded: 20, frameWidth: 480, frameHeight: 270, framesPerSecond: 20, targetBitrate: 3_500_000, qualityLimitationReason: "bandwidth" });
-    let timestamp = 0;
-    pc.getStats.mockImplementation(async () => {
-      timestamp += 2000;
-      return new Map([...pc.stats, ["out", { ...pc.stats.get("out"), timestamp, bytesSent: timestamp * 10 }]]);
-    });
-    await vi.advanceTimersByTimeAsync(10000);
+    const pc = Peer.all[0]!; healthy(pc);
+    await vi.advanceTimersByTimeAsync(10_000);
     expect(last()).toMatchObject({ degradationPreference: "maintain-resolution", encodings: [{ maxBitrate: 3_500_000 }] });
     await vi.advanceTimersByTimeAsync(1000);
     expect(last().degradationPreference).toBe("maintain-framerate");
-    await vi.advanceTimersByTimeAsync(19_000);
+    await vi.advanceTimersByTimeAsync(18_999);
+    expect(last().degradationPreference).toBe("maintain-framerate");
+    await vi.advanceTimersByTimeAsync(1);
     expect(last().degradationPreference).toBe("maintain-resolution");
-    await publisher.setPreset("saver"); await vi.advanceTimersByTimeAsync(1000);
-    expect(last().degradationPreference).toBe("balanced");
-    publisher.close();
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  // Reuse the reviewer's feedback model: the output size sets the next sample's
+  // byte demand. A fixed 3 Mb/s native scene and 1.4 Mb/s budget used to oscillate.
+  it("has no resolution reversals with constant per-pixel content cost over three minutes", async () => {
+    const publisher = make(); await publisher.start();
+    const pc = Peer.all[0]!;
+    let bytes = 0, lastAt = 0;
+    const sizes: number[] = [];
+    pc.getStats.mockImplementation(async () => {
+      const now = performance.now(), scale = last().encodings[0]!.scaleResolutionDownBy ?? 1;
+      const width = 1920 / scale, height = 1080 / scale;
+      sizes.push(width * height);
+      bytes += (now - lastAt) * (3_000_000 * width * height / (1920 * 1080)) / 8000;
+      lastAt = now;
+      return new Map([
+        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 2_000_000 }],
+        ["source", { type: "media-source", framesPerSecond: 60, width, height }],
+        ["out", { type: "outbound-rtp", kind: "video", framesEncoded: 1 + Math.min(now, 1000) / 1000 * 10 + Math.max(0, now - 1000) / 1000 * 60, mediaSourceId: "source", timestamp: now, bytesSent: bytes, frameWidth: width, frameHeight: height, framesPerSecond: now < 1000 ? 10 : 60, qualityLimitationReason: "none" }],
+      ]);
+    });
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(new Set(sizes)).toEqual(new Set([1920 * 1080]));
+    expect(pc.sendParams.every(p => p.degradationPreference === "maintain-framerate" && p.encodings[0]!.scaleResolutionDownBy === 1)).toBe(true);
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each(["fresh", "stale", "missing", "cpu", "low", "target", "unknown-source", "clock-change"])("reads codec QP deltas and requires a fresh healthy estimate: %s", async kind => {
+    const publisher = kind === "unknown-source"
+      ? new ScreenPublisher({ track: { applyConstraints: async () => {} } as unknown as MediaStreamTrack, preset: "game", iceServers: [], offer: async () => "answer", state: () => {} }) : make();
+    await publisher.start();
+    const pc = Peer.all[0]!;
+    pc.getStats.mockImplementation(async () => {
+      const timestamp = performance.now(), frames = 1 + timestamp * 0.06;
+      return new Map([
+        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: kind === "low" ? 2_000_000 : 13_000_000, ...(kind === "missing" ? {} : { timestamp: performance.timeOrigin + performance.now() - (kind === "stale" ? 5_000 : 0) }) }],
+        ["codec", { type: "codec", mimeType: "video/H264" }],
+        ["source", { type: "media-source", width: 480, height: 270, framesPerSecond: 60 }],
+        ["out", { type: "outbound-rtp", kind: "video", codecId: "codec", framesEncoded: frames, qpSum: frames * 20, mediaSourceId: "source", timestamp, bytesSent: timestamp * 7_500_000 / 8000, frameWidth: 480, frameHeight: 270, framesPerSecond: 60, targetBitrate: kind === "target" ? 3_000_000 : 8_000_000, qualityLimitationReason: kind === "cpu" ? "cpu" : "bandwidth" }],
+      ]);
+    });
+    await vi.advanceTimersByTimeAsync(5000);
+    if (kind === "clock-change") vi.setSystemTime(Date.now() + 60_000);
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(last().degradationPreference).toBe(kind === "fresh" || kind === "clock-change" ? "maintain-resolution" : "maintain-framerate");
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(last().degradationPreference).toBe("maintain-framerate");
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("feeds a successful guard pulse back into capture dimensions and never pulses again after recovery", async () => {
+    const publisher = make(); await publisher.start();
+    const pc = Peer.all[0]!;
+    let width = 480, height = 270, bytes = 0, lastAt = 0, pulses = 0;
+    pc.transceivers[0]!.sender.setParameters.mockImplementation(async p => {
+      pc.sendParams.push(p);
+      if (p.degradationPreference === "maintain-resolution") { width = 1920; height = 1080; pulses++; }
+    });
+    pc.getStats.mockImplementation(async () => {
+      const timestamp = performance.now();
+      bytes += (timestamp - lastAt) * 100_000 * width * height / (480 * 270) / 8000;
+      lastAt = timestamp;
+      return new Map([
+        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 5_000_000, timestamp: performance.timeOrigin + performance.now() }],
+        ["source", { type: "media-source", width, height, framesPerSecond: 20 }],
+        ["out", { type: "outbound-rtp", kind: "video", framesEncoded: 1 + timestamp / 50, mediaSourceId: "source", timestamp, bytesSent: bytes, frameWidth: width, frameHeight: height, framesPerSecond: 20, targetBitrate: 3_500_000, qualityLimitationReason: "bandwidth" }],
+      ]);
+    });
+    await vi.advanceTimersByTimeAsync(300_000);
+    expect(pulses).toBe(1);
+    expect([width, height]).toEqual([1920, 1080]);
+    expect(last().degradationPreference).toBe("maintain-framerate");
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  // The reviewer's two other adversarial cases: failed stats cannot leave a hold,
+  // and current capture dimensions/codec recovery must never be scaled a second time.
+  it("keeps frame-rate mode when stats remain unavailable beyond two seconds", async () => {
+    const publisher = make(); await publisher.start();
+    Peer.all[0]!.getStats.mockRejectedValue(new Error("stats unavailable"));
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(last().degradationPreference).toBe("maintain-framerate");
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it.each([1440, 1280])("does not compound a %ip input or real 720p30 codec recovery", async width => {
+    const settings = { width: 1920, height: 1080, frameRate: 60 };
+    const track = { getSettings: () => settings, applyConstraints: async (c: MediaTrackConstraints) => {
+      settings.width = (c.width as ConstrainULongRange).max!;
+      settings.height = (c.height as ConstrainULongRange).max!;
+      settings.frameRate = (c.frameRate as ConstrainDoubleRange).max!;
+    } } as unknown as MediaStreamTrack;
+    const publisher = new ScreenPublisher({ track, preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    if (width === 1280) await publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
+    else Object.assign(settings, { width, height: 810 });
+    const pc = Peer.all.at(-1)!;
+    pc.getStats.mockImplementation(async () => new Map([
+      ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 1_500_000 }],
+      ["source", { width: settings.width, height: settings.height, framesPerSecond: settings.frameRate }],
+      ["out", { type: "outbound-rtp", kind: "video", framesEncoded: 1 + performance.now() / 1000 * 5, mediaSourceId: "source", timestamp: performance.now(), framesPerSecond: 5, qualityLimitationReason: "none" }],
+    ]));
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(last(pc).encodings[0]!.scaleResolutionDownBy).toBe(1);
+    expect(last(pc).encodings[0]!.maxFramerate).toBe(settings.frameRate);
+    expect(last(pc).degradationPreference).toBe("maintain-framerate");
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 });
 
@@ -565,4 +533,67 @@ describe("stuck capture guard", () => {
     expect(feed(new StuckCaptureGuard(), 0, 6000, { ...sample, width: 0, height: 0 })).toEqual([6000]);
     expect(feed(new StuckCaptureGuard(), 0, 20000, { ...sample, width: 1280, height: 720, sourceWidth: 1280, sourceHeight: 720, targetWidth: 1280, targetHeight: 720 })).toEqual([]);
   });
+  const busy = (now: number, codec = "video/H264", qp = 20, width = 480, height = 270) => ({
+    ...sample, width, height, sourceWidth: width, sourceHeight: height,
+    captureWidth: 1920, captureHeight: 1080, fps: 60, available: 13_000_000, targetBitrate: 8_000_000, bitrate: 7_500_000,
+    quality: { codec, sum: (1 + now * 0.06) * qp, frames: 1 + now * 0.06, at: now, width, height },
+  });
+  it.each([["video/H264", 24], ["video/VP9", 96]] as const)("requires a sustained codec-specific low-QP window: %s ≤%i", (codec, threshold) => {
+    const guard = new StuckCaptureGuard();
+    for (const now of [0, 2000, 4000, 6000]) expect(guard.observe(now, busy(now, codec, threshold))).toBe(false);
+    expect(guard.observe(8000, busy(8000, codec, threshold))).toBe(true);
+    expect(feed(new StuckCaptureGuard(), 0, 20_000, busy(0, codec, threshold + 1))).toEqual([]);
+    const high = new StuckCaptureGuard();
+    for (let now = 0; now <= 30_000; now += 2000) expect(high.observe(now, busy(now, codec, threshold + 1))).toBe(false);
+  });
+  it("requires enough encoded frames as well as six seconds of low QP", () => {
+    const guard = new StuckCaptureGuard();
+    for (let now = 0; now <= 20_000; now += 2000) {
+      const s = busy(now), frames = 1 + now / 2000;
+      s.quality = { ...s.quality, frames, sum: frames * 20 };
+      expect(guard.observe(now, s)).toBe(false);
+    }
+  });
+  it.each(["codec", "gap", "frames", "sum", "missing", "size", "high"])("restarts the QP window after %s", kind => {
+    const guard = new StuckCaptureGuard();
+    for (const now of [0, 2000, 4000]) expect(guard.observe(now, busy(now))).toBe(false);
+    const bad = busy(6000);
+    if (kind === "codec") bad.quality.codec = "video/VP9";
+    if (kind === "gap") bad.quality.at = 20_000;
+    if (kind === "frames") bad.quality.frames = 1;
+    if (kind === "sum") bad.quality.sum = 1;
+    if (kind === "missing") bad.quality.sum = NaN;
+    if (kind === "size") bad.quality.width = 640;
+    if (kind === "high") bad.quality.sum *= 2;
+    expect(guard.observe(6000, bad)).toBe(false);
+    for (const now of [8000, 10_000, 12_000]) expect(guard.observe(now, busy(now))).toBe(false);
+  });
+  it.each([
+    { limitation: "cpu" }, { available: 2_000_000 }, { targetBitrate: 3_000_000 },
+    { captureWidth: 480, captureHeight: 270 }, { targetWidth: 480, targetHeight: 270 },
+    { width: 1440, height: 810, captureWidth: 1920, captureHeight: 1080 },
+  ])("keeps QP underuse behind source, CPU and nominal pixel-budget exclusions: %j", change => {
+    const guard = new StuckCaptureGuard();
+    for (let now = 0; now <= 30_000; now += 2000) expect(guard.observe(now, { ...busy(now), ...change })).toBe(false);
+  });
+  it.each([["video/H264", false, false], ["video/VP9", false, false], ["video/H264", true, false], ["video/VP9", true, false], ["video/H264", false, true], ["video/VP9", false, true], ["video/H264", true, true], ["video/VP9", true, true]] as const)("never repeats a pulse/shrink cycle after real bitrate pressure: %s, hidden=%s, cheap=%s", (codec, hidden, cheap) => {
+    const guard = new StuckCaptureGuard();
+    let width = 480, height = 270, sum = 0, frames = 1, pulseAt: number | null = null;
+    const pulses: number[] = [], sizes: number[] = [];
+    for (let now = 0; now <= 300_000; now += 2000) {
+      // The pulse changes the next output. Native content costs more than this
+      // fixed link can sustain, so Chromium shrinks again after four seconds.
+      if (pulseAt !== null) { width = now - pulseAt <= (hidden ? 0 : 4000) ? 1920 : 480; height = width * 9 / 16; }
+      frames += 120;
+      sum += 120 * (width === 1920 ? (codec === "video/VP9" ? 205 : 40) : 20);
+      const s = { ...busy(now, codec, 20, width, height), bitrate: width === 1920 ? 10_000_000 : cheap ? 625_000 : 7_500_000,
+        quality: { codec, sum, frames, at: now, width, height } };
+      sizes.push(width * height);
+      if (guard.observe(now, s)) { pulses.push(now); pulseAt = now; }
+    }
+    // A cheap measured budget starts its six-second clock at the first sample.
+    expect(pulses).toEqual([cheap ? 6000 : 8000]);
+    expect(sizes.filter((p, i) => i > 0 && p !== sizes[i - 1])).toEqual(hidden ? [] : [1920 * 1080, 480 * 270]);
+  });
+
 });

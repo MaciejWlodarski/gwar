@@ -49,11 +49,11 @@ function start(name, command, args, options = {}) {
   return child;
 }
 async function waitFor(check, what, timeout = 30_000) {
-  const started = Date.now();
+  const started = performance.now();
   for (;;) {
     if (interrupted) throw new Error("startup regression interrupted");
-    if (await check()) return Date.now() - started;
-    if (Date.now() - started > timeout) throw new Error(`timed out: ${what}`);
+    if (await check()) return performance.now() - started;
+    if (performance.now() - started > timeout) throw new Error(`timed out: ${what}`);
     await sleep(150);
   }
 }
@@ -265,7 +265,7 @@ try {
         const draw = kind === "busy60" ? `(${busySource})(document.querySelector('canvas'))` : `(${stampBarcode})(document.querySelector('canvas'), 1); window.__drawnFrames = 0; setInterval(() => window.__drawnFrames++, 50)`;
         await source.setContent(`<!doctype html><title>${SOURCE_TITLE}</title><style>html,body{margin:0;overflow:hidden}canvas{display:block;width:1920px;height:1080px}</style><canvas width="1920" height="1080"></canvas><script>${draw}</script>`);
         await sharer.bringToFront(); await join(sharer, channel);
-        const started = Date.now();
+        const started = performance.now(), wallStarted = Date.now();
         const id = await share(sharer, "Sharing a browser tab");
         await watch(admin, name);
         for (;;) {
@@ -282,7 +282,8 @@ try {
             }
             return {};
           });
-          row.elapsed = (Date.now() - started) / 1000;
+          row.elapsed = (performance.now() - started) / 1000;
+          row.wallElapsed = (Date.now() - wallStarted) / 1000;
           row.drawn = await source.evaluate(() => window.__drawnFrames);
           row.viewer = await session(admin, (_, __, controller, id) => controller.screen.stats(id), id);
           rows.push(row);
@@ -291,8 +292,10 @@ try {
           await sleep(500);
         }
         try {
+          assert.ok(rows.every(r => Math.abs(r.wallElapsed - r.elapsed) < 2), "uninterrupted clock: suspend/wall-clock change invalidates timing");
           const settled = rows.filter(r => r.elapsed >= seconds - 10);
           assert.ok(settled.length >= 15, "ten seconds of observations");
+          assert.ok(settled.every(r => r.viewer), "viewer stats throughout the settled window");
           const first = settled[0], last = settled.at(-1), dt = last.elapsed - first.elapsed;
           const cadence = (last.drawn - first.drawn) / dt;
           const payload = (last.out.bytesSent - first.out.bytesSent) * 8 / dt;
@@ -307,9 +310,12 @@ try {
             ? r.out?.frameWidth === last.out.frameWidth && r.out?.frameHeight === last.out.frameHeight && r.out?.framesPerSecond >= Math.max(1, settledFps * 0.8)
             : full(r) && r.out?.framesPerSecond >= expectedFps * 0.85;
           const stable = rows.find((r, i) => r.elapsed <= seconds - 5 && stableFrame(r) && rows.slice(i).every(stableFrame));
+          const stableDimensions = rows.find((r, i) => r.elapsed <= seconds - 5 && rows.slice(i).every(s =>
+            s.out?.frameWidth === last.out.frameWidth && s.out?.frameHeight === last.out.frameHeight));
+          const firstTarget = rows.find(full);
           const steadyFps = rows.find((r, i) => r.elapsed <= seconds - 5 && rows.slice(i).every(s => s.out?.framesPerSecond >= expectedFps * 0.85));
           const firstFiveFps = median(rows.filter(r => r.elapsed <= 5 && r.out?.framesPerSecond !== undefined).map(r => r.out.framesPerSecond));
-          const result = { name, preset, uplink, sourceFps: +cadence.toFixed(1), captureFps: median(settled.map(r => r.source?.framesPerSecond ?? 0)), output: `${last.out.frameWidth}x${last.out.frameHeight}`, source: `${last.source?.width}x${last.source?.height}`, viewer: `${last.viewer?.width}x${last.viewer?.height}`, fps: median(settled.map(r => r.out.framesPerSecond)), decodeFps: +decodeFps.toFixed(1), payloadMbps: +(payload / 1e6).toFixed(3), availableMbps: +(median(settled.map(r => r.pair.availableOutgoingBitrate)) / 1e6).toFixed(3), stableAt: stable?.elapsed ?? null, steadyFpsAt: steadyFps?.elapsed ?? null, firstFiveFps, pulses: rows.filter((r,i) => r.elapsed > 4 && r.params.degradationPreference === "maintain-resolution" && rows[i-1]?.params.degradationPreference === "maintain-framerate").length };
+          const result = { name, preset, uplink, sourceFps: +cadence.toFixed(1), captureFps: median(settled.map(r => r.source?.framesPerSecond ?? 0)), output: `${last.out.frameWidth}x${last.out.frameHeight}`, source: `${last.source?.width}x${last.source?.height}`, viewer: `${last.viewer?.width}x${last.viewer?.height}`, fps: median(settled.map(r => r.out.framesPerSecond)), decodeFps: +decodeFps.toFixed(1), payloadMbps: +(payload / 1e6).toFixed(3), availableMbps: +(median(settled.map(r => r.pair.availableOutgoingBitrate)) / 1e6).toFixed(3), stableAt: stable?.elapsed ?? null, stableDimensionsAt: stableDimensions?.elapsed ?? null, firstTargetAt: firstTarget?.elapsed ?? null, steadyFpsAt: steadyFps?.elapsed ?? null, firstFiveFps, pulses: rows.filter((r,i) => r.elapsed > 4 && r.params.degradationPreference === "maintain-resolution" && rows[i-1]?.params.degradationPreference === "maintain-framerate").length };
           results.push(result); console.log(JSON.stringify(result));
           if (process.env.E2E_STARTUP_STALL_CONTROL === "1") assert.ok(result.pulses >= 1, "guard control must observe a real recovery pulse");
           if (!uplink) {
@@ -325,7 +331,7 @@ try {
             assert.ok(Math.abs(last.viewer.width - last.out.frameWidth) <= 2 && Math.abs(last.viewer.height - last.out.frameHeight) <= 2, "viewer decodes the shaped output (codec crop tolerance)");
             assert.equal(result.pulses, 0, "no nudge on a genuinely constrained uplink");
           }
-        } catch (error) { failures.push(`${name}: ${error.message}`); console.error(JSON.stringify(await diagnostics(sharer))); }
+        } catch (error) { failures.push(`${name}: ${error.message}`); console.error(JSON.stringify({ sharer: await diagnostics(sharer), viewer: await diagnostics(admin) })); }
         await session(admin, (_, __, controller, id) => controller.screen.unwatch(id), id);
         await stopSharing(sharer); await sharer.context_.close();
       }

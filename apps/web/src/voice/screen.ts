@@ -65,19 +65,73 @@ export function headroomBitrate(cap: number, available: number | null | undefine
   return Math.min(cap, Math.max(MIN_BITRATE, Math.floor(UPLINK_SHARE * available)));
 }
 
-/** A conservative escape hatch for Chromium's pending capture-size adaptation. Game only. */
+interface EncoderQuality {
+  codec: string;
+  sum: number;
+  frames: number;
+  at: number;
+  width: number;
+  height: number;
+}
+
+/** QP is codec-specific: H.264 uses 0…51; VP9 bitstream QP uses 0…255. */
+class LowEncoderQp {
+  private previous: EncoderQuality | null = null;
+  private since: number | null = null;
+  private frames = 0;
+
+  observe(sample?: EncoderQuality): { low: boolean; sustained: boolean } {
+    const codec = sample?.codec.toLowerCase();
+    // H.264 matches WebRTC's upscale threshold (24). VP9's 96 is deliberately
+    // stricter than current libvpx's 149; see screen-startup-validation.md.
+    const threshold = codec === "video/h264" ? 24 : codec === "video/vp9" ? 96 : null;
+    if (!sample || threshold === null || ![sample.sum, sample.frames, sample.at, sample.width, sample.height].every(Number.isFinite) ||
+      sample.sum < 0 || sample.frames < 0 || sample.width <= 0 || sample.height <= 0) {
+      this.previous = null; this.since = null; this.frames = 0;
+      return { low: false, sustained: false };
+    }
+    const previous = this.previous;
+    this.previous = sample;
+    if (!previous || previous.codec.toLowerCase() !== codec || previous.width !== sample.width || previous.height !== sample.height ||
+      sample.at <= previous.at || sample.at - previous.at > HEADROOM_INTERVAL_MS * 2.25 || sample.frames <= previous.frames || sample.sum < previous.sum) {
+      this.since = null; this.frames = 0;
+      return { low: false, sustained: false };
+    }
+    const low = (sample.sum - previous.sum) / (sample.frames - previous.frames) <= threshold;
+    this.frames = low ? this.frames + sample.frames - previous.frames : 0;
+    this.since = low ? (this.since ?? previous.at) : null;
+    return { low, sustained: this.since !== null && sample.at - this.since >= 6_000 && this.frames >= 60 };
+  }
+}
+
+/** A conservative escape hatch for pending capture-size adaptation in frame-rate mode. */
 export class StuckCaptureGuard {
   private since: number | null = null;
   private last: number | null = null;
   private next = 0;
   private cooldown = 20_000;
+  private quality = new LowEncoderQp();
+  private pulse: { from: number; peak: number } | null = null;
+  private regressed = false;
+  private qpAttempted = false;
 
   observe(now: number, sample: {
     width: number; height: number; sourceWidth: number; sourceHeight: number;
     targetWidth: number; targetHeight: number; fps: number;
     available: number; targetBitrate: number; bitrate: number; limitation: string;
+    /** Actual captured surface size before Chromium's capture adaptation starts. */
+    captureWidth?: number; captureHeight?: number;
+    quality?: EncoderQuality;
   }): boolean {
+    const quality = this.quality.observe(sample.quality);
     const pixels = sample.targetWidth * sample.targetHeight;
+    const outputPixels = sample.width * sample.height;
+    if (this.pulse && outputPixels > 0) {
+      this.pulse.peak = Math.max(this.pulse.peak, outputPixels);
+      // A pulse that grew and then lost its pixels to real bandwidth adaptation
+      // must not become a pulse/shrink loop. Retry only with a new preset/encoder.
+      if (this.pulse.peak >= this.pulse.from * 1.5 && outputPixels < this.pulse.peak * 0.75 && sample.limitation === "bandwidth") this.regressed = true;
+    }
     const small = (w: number, h: number) => w > 0 && h > 0 && w * h < pixels * 0.75;
     // Budget the larger size at the actual source cadence, with 50% spare capacity.
     // Both GCC's estimate (after voice headroom) and its encoder target must support it.
@@ -85,12 +139,17 @@ export class StuckCaptureGuard {
     const currentPixels = sample.width * sample.height || sample.sourceWidth * sample.sourceHeight;
     // Dense content may need much more than the nominal screen-content budget.
     // Do not reset legitimate quality scaling when the current size already uses it.
-    const bpp = Math.max(0.04, currentPixels > 0 ? sample.bitrate / (currentPixels * cadence) : Infinity);
+    const largerSource = (sample.captureWidth ?? sample.sourceWidth) * (sample.captureHeight ?? sample.sourceHeight) > outputPixels * 1.5;
+    const useQp = !this.qpAttempted && quality.low && outputPixels > 0 && outputPixels < pixels * 0.5 && largerSource;
+    // At low QP, spending the encoder target at 270p does not price native
+    // content: those bits buy excess precision at the stalled size. Still require
+    // the nominal pixel floor AND 50% spare at the source's actual cadence.
+    const bpp = useQp ? 0.04 : Math.max(0.04, currentPixels > 0 ? sample.bitrate / (currentPixels * cadence) : Infinity);
     // A stalled 144p/270p capture need not have enough capacity for all of 1080p60:
     // price four times the current pixels with a 720p floor, capped at the target.
     const largerPixels = Math.min(pixels, Math.max(currentPixels * 4, 1280 * 720));
     const needed = largerPixels * cadence * bpp * 1.5;
-    const healthy = sample.limitation !== "cpu" && sample.fps > 0 && pixels > 0 &&
+    const healthy = !this.regressed && !this.qpAttempted && sample.limitation !== "cpu" && sample.fps > 0 && pixels > 0 &&
       Number.isFinite(needed) && Number.isFinite(sample.available) && Number.isFinite(sample.targetBitrate) && Math.min(sample.available * UPLINK_SHARE, sample.targetBitrate) >= needed;
     if (!healthy || !(small(sample.width, sample.height) || small(sample.sourceWidth, sample.sourceHeight))) {
       this.since = null;
@@ -99,8 +158,12 @@ export class StuckCaptureGuard {
       this.since ??= now;
     }
     this.last = now;
-    if (this.since === null || now - this.since < 6_000 || now < this.next) return false;
+    if (this.since === null || now - this.since < 6_000 || now < this.next || (useQp && !quality.sustained)) return false;
     this.since = null;
+    // One QP escape per preset/encoder, even if a very fast shrink happened
+    // between polls. A spent escape also blocks measured-budget retries.
+    this.qpAttempted ||= useQp;
+    this.pulse = { from: currentPixels, peak: currentPixels };
     this.next = now + this.cooldown;
     this.cooldown = Math.min(120_000, this.cooldown * 2);
     return true;
@@ -108,13 +171,14 @@ export class StuckCaptureGuard {
 }
 
 /** The selected transport's GCC estimate, with the legacy nominated-pair fallback. */
-function outgoingEstimate(stats: RTCStatsReport): number | undefined {
+function outgoingEstimate(stats: RTCStatsReport, freshAt?: number): number | undefined {
   let selected: string | undefined, available: number | undefined;
   stats.forEach(s => { if (s.type === "transport" && s.selectedCandidatePairId) selected = s.selectedCandidatePairId as string; });
   stats.forEach(s => {
     if (s.type !== "candidate-pair") return;
     const pair = s as RTCIceCandidatePairStats;
-    if ((selected ? pair.id === selected : pair.nominated && pair.state === "succeeded") && pair.availableOutgoingBitrate) available = pair.availableOutgoingBitrate;
+    const fresh = freshAt === undefined || (Number.isFinite(pair.timestamp) && freshAt - pair.timestamp >= -1_000 && freshAt - pair.timestamp <= HEADROOM_INTERVAL_MS * 2.25);
+    if ((selected ? pair.id === selected : pair.nominated && pair.state === "succeeded") && pair.availableOutgoingBitrate && fresh) available = pair.availableOutgoingBitrate;
   });
   return available;
 }
@@ -318,25 +382,23 @@ export class ScreenPublisher {
   private closed = false;
   private sent: { bytes: number; at: number } | null = null;
   private recovery: ScreenRecovery | null = null;
-  private phase: "startup" | "pulse" | null = null;
+  private phase: "pulse" | null = null;
   private phaseTimer: ReturnType<typeof setTimeout> | null = null;
   private guard = new StuckCaptureGuard();
-  private negotiated = false;
-  private constrainedStartup = false;
-  private lowStartupSince: number | null = null;
-  private spareStartupSince: number | null = null;
-  private startupFrames: { frames: number; at: number } | null = null;
-  private startupScale = 1;
   private run = 0;
   private revision = 0;
   private parameters: Promise<void> = Promise.resolve();
   private adaptationSent: { bytes: number; at: number } | null = null;
-  private readonly captureSize: { width: number; height: number };
+  private readonly captureSize: { width: number; height: number; known: boolean };
 
   constructor(private readonly params: PublishParams) {
     this.preset = params.preset;
-    const settings = params.track.getSettings?.();
-    this.captureSize = { width: settings?.width ?? PRESETS[params.preset].width, height: settings?.height ?? PRESETS[params.preset].height };
+    const settings = params.track.getSettings?.(), spec = this.spec();
+    const width = settings?.width, height = settings?.height;
+    this.captureSize = {
+      width: width ?? spec.width, height: height ?? spec.height,
+      known: width !== undefined && height !== undefined && Number.isFinite(width * height) && width > 0 && height > 0,
+    };
   }
 
   async start(): Promise<void> {
@@ -354,15 +416,9 @@ export class ScreenPublisher {
     });
     this.sender = transceiver.sender;
     this.parameters = Promise.resolve();
-    this.startupFrames = null;
     this.desired = 0;
-    this.negotiated = false;
-    this.phase = this.preset === "game" ? "startup" : null;
     preferCodecs(transceiver, "send", this.recovery?.codec === "vp9" ? "vp9" : undefined);
     await pc.setLocalDescription(await pc.createOffer());
-    if (this.closed || this.pc !== pc) return;
-    // Set the preference before the answer can start encoding at Chromium's 300 kb/s estimate.
-    if (this.phase === "startup") await this.applyParameters(this.spec().maxBitrate);
     if (this.closed || this.pc !== pc) return;
     const sdp = pc.localDescription?.sdp ?? "";
     const ssrcs = publishSsrcs(sdp);
@@ -371,11 +427,9 @@ export class ScreenPublisher {
     if (this.closed || this.pc !== pc) return;
     await pc.setRemoteDescription({ type: "answer", sdp: answer });
     if (this.closed || this.pc !== pc) return;
-    this.negotiated = true;
     // The latest preset: `setPreset` may have run while this negotiated.
     await this.applyParameters(this.spec().maxBitrate);
     if (this.closed || this.pc !== pc) return;
-    if (this.phase === "startup" && !this.phaseTimer) this.waitForEncoder();
     this.timer = setInterval(() => void this.headroom(), HEADROOM_INTERVAL_MS);
   }
 
@@ -386,7 +440,6 @@ export class ScreenPublisher {
       this.cancelPhase();
       this.guard = new StuckCaptureGuard();
       this.preset = preset;
-      this.phase = preset === "game" ? "startup" : null;
     }
     const revision = this.revision;
     await applyCapturePreset(this.params.track, preset);
@@ -394,13 +447,13 @@ export class ScreenPublisher {
     if (this.recovery) await this.params.track.applyConstraints({ width: { max: this.recovery.width }, height: { max: this.recovery.height }, frameRate: { max: this.recovery.fps } });
     if (this.closed || revision !== this.revision) return;
     const settings = this.params.track.getSettings?.();
-    if (settings?.width && settings.height && settings.width * settings.height > this.captureSize.width * this.captureSize.height) {
+    if (settings?.width && settings.height && settings.width > 0 && settings.height > 0 && Number.isFinite(settings.width * settings.height) && (!this.captureSize.known || settings.width * settings.height > this.captureSize.width * this.captureSize.height)) {
       this.captureSize.width = settings.width;
       this.captureSize.height = settings.height;
+      this.captureSize.known = true;
     }
     await this.applyParameters(this.spec().maxBitrate);
     if (this.closed || revision !== this.revision) return;
-    if (this.phase === "startup" && this.negotiated && !this.phaseTimer) this.waitForEncoder();
     await this.headroom();
   }
 
@@ -438,7 +491,7 @@ export class ScreenPublisher {
     const pc = this.pc;
     if (!pc || this.closed) return;
     const revision = this.revision;
-    let available: number | undefined;
+    let available: number | undefined, guardAvailable: number | undefined, codec: string | undefined;
     let out: OutboundVideo | undefined;
     let source: { width?: number; height?: number; framesPerSecond?: number } | undefined;
     try {
@@ -449,6 +502,8 @@ export class ScreenPublisher {
       });
       if (out?.mediaSourceId) source = stats.get(out.mediaSourceId) as typeof source;
       available = outgoingEstimate(stats);
+      guardAvailable = outgoingEstimate(stats, performance.timeOrigin + performance.now());
+      codec = out?.codecId ? stats.get(out.codecId)?.mimeType as string | undefined : undefined;
     } catch { return; }
     const spec = this.spec();
     const target = headroomBitrate(spec.maxBitrate, available);
@@ -456,15 +511,18 @@ export class ScreenPublisher {
     const at = out?.timestamp ?? 0, bytes = out?.bytesSent ?? 0;
     const bitrate = previous && at > previous.at && at - previous.at <= HEADROOM_INTERVAL_MS * 2.25 ? Math.max(0, (bytes - previous.bytes) * 8000 / (at - previous.at)) : NaN;
     this.adaptationSent = out ? { bytes, at } : null;
-    const resized = this.updateStartupScale(available, out, source?.framesPerSecond, bitrate);
-    if (this.preset === "game" && !this.phase && !this.constrainedStartup) {
+    if (spec.degradation === "maintain-framerate" && !this.phase) {
       const settings = this.params.track.getSettings?.();
       if (this.guard.observe(performance.now(), {
         width: out?.frameWidth ?? 0, height: out?.frameHeight ?? 0,
         sourceWidth: source?.width ?? settings?.width ?? 0, sourceHeight: source?.height ?? settings?.height ?? 0,
         targetWidth: Math.min(spec.width, this.captureSize.width), targetHeight: Math.min(spec.height, this.captureSize.height),
         fps: Math.min(spec.fps, source?.framesPerSecond ?? settings?.frameRate ?? out?.framesPerSecond ?? 0),
-        available: available ?? 0, targetBitrate: out?.targetBitrate ?? 0, bitrate, limitation: out?.qualityLimitationReason ?? "other",
+        captureWidth: this.captureSize.known ? this.captureSize.width : 0, captureHeight: this.captureSize.known ? this.captureSize.height : 0,
+        ...(out?.qpSum !== undefined && out.framesEncoded !== undefined && codec ? { quality: {
+          codec, sum: out.qpSum, frames: out.framesEncoded, at: out.timestamp, width: out.frameWidth ?? 0, height: out.frameHeight ?? 0,
+        } } : {}),
+        available: guardAvailable ?? 0, targetBitrate: Math.min(spec.maxBitrate, out?.targetBitrate ?? 0), bitrate, limitation: out?.qualityLimitationReason ?? "other",
       })) {
         this.phase = "pulse";
         await this.applyParameters(target);
@@ -473,7 +531,7 @@ export class ScreenPublisher {
       }
     }
     // Small moves are not worth a parameter change.
-    if (resized || Math.abs(target - this.applied) > this.applied * 0.1) await this.applyParameters(target);
+    if (Math.abs(target - this.applied) > this.applied * 0.1) await this.applyParameters(target);
   }
 
   private cancelPhase(): void {
@@ -481,90 +539,6 @@ export class ScreenPublisher {
     if (this.phaseTimer) clearTimeout(this.phaseTimer);
     this.phaseTimer = null;
     this.phase = null;
-    this.constrainedStartup = false;
-    this.lowStartupSince = null;
-    this.spareStartupSince = null;
-    this.startupFrames = null;
-    this.startupScale = 1;
-  }
-
-  private updateStartupScale(available: number | undefined, out: OutboundVideo | undefined, sourceFps: number | undefined, bitrate = NaN, observedFps = out?.framesPerSecond): boolean {
-    if (this.preset !== "game" || !available || !Number.isFinite(available)) return false;
-    const spec = this.spec();
-    const cadence = Math.min(spec.fps, sourceFps ?? this.params.track.getSettings?.().frameRate ?? spec.fps);
-    if (!this.constrainedStartup) {
-      // A low estimate alone is normal at startup. Require real frame-rate pressure too;
-      // a sparse 20 fps source delivering its 20 fps must keep its native resolution.
-      if (this.phase !== "startup" || available > 3_250_000 ||
-        (out?.framesEncoded ?? 0) <= 0 || observedFps === undefined || !Number.isFinite(observedFps) || observedFps < 0 || cadence <= 0 || observedFps >= cadence * 0.75 || out?.qualityLimitationReason === "cpu") {
-        this.lowStartupSince = null;
-        return false;
-      }
-      this.lowStartupSince ??= performance.now();
-      if (performance.now() - this.lowStartupSince < 500) return false;
-      this.constrainedStartup = true;
-    }
-    let nativeBudget = PRESETS.game.maxBitrate * (this.captureSize.width * this.captureSize.height) /
-      (PRESETS.game.width * PRESETS.game.height) * Math.max(15, cadence) / PRESETS.game.fps;
-    const target = headroomBitrate(spec.maxBitrate, available);
-    const pixels = (out?.frameWidth ?? 0) * (out?.frameHeight ?? 0);
-    // A cheap source need not ever probe at the busy-content ceiling. After six
-    // seconds of full cadence and at least 2x spare bitrate, price its measured
-    // pixel demand instead. This lets false-positive startup bounds recover too.
-    const spare = !this.phase && pixels > 0 && Number.isFinite(bitrate) && bitrate > 0 &&
-      bitrate * 2 < target && (out?.framesPerSecond ?? 0) >= cadence * 0.85 && out?.qualityLimitationReason !== "cpu";
-    this.spareStartupSince = spare ? (this.spareStartupSince ?? performance.now()) : null;
-    if (this.spareStartupSince !== null && performance.now() - this.spareStartupSince >= 6_000) {
-      nativeBudget = Math.min(nativeBudget, bitrate * this.captureSize.width * this.captureSize.height / pixels * 1.5);
-    }
-    const scale = Math.max(1, Math.sqrt(nativeBudget / target));
-    // A transient 4 Mb/s probe is not enough for native 1080p60. Release using
-    // the same pixel/cadence budget that selected the bound, not a separate threshold.
-    if (scale === 1) { this.constrainedStartup = false; this.lowStartupSince = null; this.spareStartupSince = null; }
-    // Five percent in each axis is about ten percent of the pixel budget.
-    // Track the existing headroom loop without delaying genuine congestion responses.
-    if (Math.abs(scale - this.startupScale) <= this.startupScale * 0.05 && !(scale === 1 && this.startupScale !== 1)) return false;
-    this.startupScale = scale;
-    return true;
-  }
-
-  private waitForEncoder(): void {
-    const pc = this.pc, revision = this.revision;
-    let endsAt: number | null = null;
-    const alive = () => !this.closed && this.pc === pc && this.revision === revision && this.phase === "startup";
-    const probe = async () => {
-      if (!pc || !alive()) return;
-      try {
-        const stats = await pc.getStats();
-        if (!alive()) return;
-        let out: OutboundVideo | undefined;
-        stats.forEach(s => { if (s.type === "outbound-rtp" && s.kind === "video") out = s as OutboundVideo; });
-        if ((out?.framesEncoded ?? 0) > 0) endsAt ??= performance.now() + 2_000;
-        const source = out?.mediaSourceId ? stats.get(out.mediaSourceId) as { framesPerSecond?: number } | undefined : undefined;
-        const available = outgoingEstimate(stats);
-        // Chromium's framesPerSecond can lag by a full second. Counter deltas
-        // let a constrained startup respond before that delayed statistic arrives.
-        const previous = this.startupFrames;
-        this.startupFrames = out ? { frames: out.framesEncoded ?? 0, at: out.timestamp } : null;
-        const fps = previous && out && out.timestamp > previous.at && out.timestamp - previous.at <= 1_000
-          ? Math.max(0, ((out.framesEncoded ?? 0) - previous.frames) * 1000 / (out.timestamp - previous.at)) : out?.framesPerSecond;
-        if (this.updateStartupScale(available, out, source?.framesPerSecond, NaN, fps)) {
-          await this.applyParameters(headroomBitrate(this.spec().maxBitrate, available));
-          if (!alive()) return;
-        }
-      } catch { /* A connecting encoder may not have stats yet. */ }
-      if (!alive()) return;
-      if (endsAt !== null && performance.now() >= endsAt) {
-        this.phaseTimer = null;
-        this.phase = null;
-        void this.applyParameters(this.desired || this.spec().maxBitrate);
-        return;
-      }
-      // ICE/DTLS can finish long after the answer. Count from actual encoding.
-      // Continue observing during warmup so a genuinely constrained link can keep fps.
-      this.phaseTimer = setTimeout(() => void probe(), endsAt === null ? 250 : Math.min(250, endsAt - performance.now()));
-    };
-    this.phaseTimer = setTimeout(() => void probe(), 0);
   }
 
   private endPhaseAfter(ms: number): void {
@@ -614,15 +588,13 @@ export class ScreenPublisher {
   private scale(): { scaleResolutionDownBy: number } {
     const settings = this.params.track.getSettings?.() ?? {};
     const recovery = this.recovery ? Math.max(1, (settings.width ?? this.recovery.width) / this.recovery.width, (settings.height ?? this.recovery.height) / this.recovery.height) : 1;
-    // Explicit 1 clears a previous startup bound on preset changes or link recovery.
-    return { scaleResolutionDownBy: Math.max(recovery, this.startupScale) };
+    return { scaleResolutionDownBy: recovery };
   }
 
   async recover(plan: ScreenRecovery): Promise<void> {
     if (this.closed) return;
     this.cancelPhase();
     this.guard = new StuckCaptureGuard();
-    this.negotiated = false;
     this.recovery = plan;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
