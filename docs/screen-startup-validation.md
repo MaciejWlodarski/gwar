@@ -83,7 +83,10 @@ by the VP9 busy acceptance comparison without reducing either evidence window.
 4. **Surface provenance.** Live track settings and media-source dimensions refresh
    the captured size after two seconds of stable enlargement outside a pulse/outcome
    window. Device/display-surface/media-source identity changes immediately reset
-   the guard and QP history. A smaller source resets them after two seconds only
+   the guard and QP history. Independent resize/switch settings evidence survives
+   an older in-flight stats response until source dimensions corroborate it;
+   application constraint writes clear that pending evidence. A smaller source
+   resets them after two seconds only
    with an independent track-settings resize under unchanged requested capture
    constraints, when it is at least as large as encoded output and the encoder
    reports no adaptation pressure. Preset/spec and codec-recovery constraint writes

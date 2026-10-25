@@ -377,8 +377,10 @@ restart that clock; missing or frozen counters cannot establish recovery. Two un
 the QP escape is one-shot. Suppression expires after ten minutes plus thirty
 continuous seconds of healthy target capacity without CPU limitation. Successful
 recovery discards the old size reference. Stable surface enlargement, unpressured
-shrink and surface identity changes refresh the target and reset guard/QP history;
-pulse-induced growth cannot supply surface evidence. Preset caps never replace
+shrink and surface identity changes refresh the target and reset guard/QP history.
+Independent resize/switch settings evidence survives older in-flight source stats
+until corroborated; application constraint writes clear it. Encoder adaptation and
+pulse-induced growth cannot supply resize evidence. Preset caps never replace
 physical surface evidence; live observations update it through the same rule. The one-second deadline is
 independent of sender promise completion, with serialized current-state restores.
 Preset changes, close and codec replacement fence queued parameters and cancel

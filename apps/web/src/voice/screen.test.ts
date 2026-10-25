@@ -947,6 +947,111 @@ describe("live captured surface provenance", () => {
 });
 
 
+// Round-4 reviewer repros: settings and source stats can describe different instants.
+describe("asynchronous surface observations", () => {
+  it.each(["together", "settings-first", "source-first"])("detects a real resize when observations arrive %s", async order => {
+    const settings = { width: 1920, height: 1080, frameRate: 20, deviceId: "one", displaySurface: "window" };
+    let width = 1920, height = 1080;
+    const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
+      preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!;
+    pc.getStats.mockImplementation(async () => {
+      const at = performance.now();
+      return new Map([
+        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 13_000_000 }],
+        ["source", { width, height, framesPerSecond: 20 }],
+        ["out", { id: "out", type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, framesEncoded: 1 + at / 50,
+          bytesSent: at * 10, frameWidth: width, frameHeight: height, targetBitrate: 8_000_000, qualityLimitationReason: "none" }],
+      ]);
+    });
+    const state = publisher as unknown as { captureSize: { width: number; height: number }; guard: StuckCaptureGuard };
+    await vi.advanceTimersByTimeAsync(4000);
+    const previousGuard = state.guard;
+    if (order !== "source-first") { settings.width = 1280; settings.height = 720; }
+    if (order !== "settings-first") { width = 1280; height = 720; }
+    await vi.advanceTimersByTimeAsync(2000);
+    settings.width = width = 1280; settings.height = height = 720;
+    await vi.advanceTimersByTimeAsync(10_000);
+    const result = { width: state.captureSize.width, height: state.captureSize.height, refreshed: state.guard !== previousGuard,
+      pulses: pc.sendParams.filter(p => p.degradationPreference === "maintain-resolution").length };
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+    expect(result).toEqual({ width: 1280, height: 720, refreshed: true, pulses: 0 });
+  });
+});
+
+describe("in-flight surface observations", () => {
+  it.each(["resize", "switch"])("keeps independent %s evidence across a pending pre-change stats response", async kind => {
+    const settings = { width: 1920, height: 1080, frameRate: 20, deviceId: "one", displaySurface: "window" };
+    let width = 1920, height = 1080;
+    const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
+      preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!;
+    pc.getStats.mockImplementation(async () => {
+      const at = performance.now();
+      return new Map([
+        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 13_000_000 }],
+        ["source", { width, height, framesPerSecond: 20 }],
+        ["out", { id: "out", type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, framesEncoded: 1 + at / 50,
+          bytesSent: at * 10, frameWidth: width, frameHeight: height, targetBitrate: 8_000_000, qualityLimitationReason: "none" }],
+      ]);
+    });
+    const state = publisher as unknown as { captureSize: { width: number; height: number }; guard: StuckCaptureGuard };
+    await vi.advanceTimersByTimeAsync(4000);
+    const previousGuard = state.guard;
+    const read = pc.getStats.getMockImplementation()!;
+    let finish!: (stats: typeof pc.stats) => void;
+    pc.getStats.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+    await vi.advanceTimersByTimeAsync(2000);
+    const preChangeReport = await read();
+    settings.width = 1280; settings.height = 720;
+    if (kind === "switch") settings.deviceId = "two";
+    finish(preChangeReport); await vi.advanceTimersByTimeAsync(0);
+    // Identity resets history immediately; stale source stats cannot prove the new size.
+    expect(state.guard === previousGuard).toBe(kind !== "switch");
+    expect(state.captureSize).toEqual({ width: 1920, height: 1080, known: true });
+    width = 1280; height = 720;
+    await vi.advanceTimersByTimeAsync(10_000);
+    const result = { ...state.captureSize, pulses: pc.sendParams.filter(p => p.degradationPreference === "maintain-resolution").length };
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+    expect(result).toEqual({ width: 1280, height: 720, known: true, pulses: 0 });
+  });
+});
+
+
+it.each(["bandwidth", "cpu", "pulse", "constraints"])("discards pending resize evidence on %s before source stats catch up", async invalidation => {
+  const settings = { width: 1920, height: 1080, frameRate: 20 };
+  let width = 1920, height = 1080, limitation = "none";
+  const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
+    preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+  await publisher.start();
+  const pc = Peer.all[0]!;
+  pc.getStats.mockImplementation(async () => {
+    const at = performance.now();
+    return new Map([
+      ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 13_000_000 }],
+      ["source", { width, height, framesPerSecond: 20 }],
+      ["out", { id: "out", type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, framesEncoded: 1 + at / 50,
+        bytesSent: at * 10, frameWidth: width, frameHeight: height, targetBitrate: 8_000_000, qualityLimitationReason: limitation }],
+    ]);
+  });
+  const state = publisher as unknown as { captureSize: { width: number; height: number }; phase: string | null };
+  await vi.advanceTimersByTimeAsync(4000);
+  settings.width = 1280; settings.height = 720;
+  await vi.advanceTimersByTimeAsync(2000); // Independent settings evidence, old source stats.
+  if (invalidation === "constraints") await publisher.setPreset("game");
+  else if (invalidation === "pulse") state.phase = "pulse";
+  else limitation = invalidation;
+  await vi.advanceTimersByTimeAsync(2000);
+  state.phase = null; limitation = "none";
+  width = 1280; height = 720;
+  await vi.advanceTimersByTimeAsync(10_000);
+  const result = { ...state.captureSize };
+  publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  expect(result).toEqual({ width: 1920, height: 1080, known: true });
+});
+
 describe("surface identity availability", () => {
   it("learns a delayed media-source id without replacing the original surface ceiling", async () => {
     const publisher = new ScreenPublisher({ track: { getSettings: () => ({ width: 1920, height: 1080, deviceId: "original" }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,

@@ -440,6 +440,7 @@ export class ScreenPublisher {
   private surfaceKey: (string | undefined)[] = [];
   private surfaceCandidate: { width: number; height: number; since: number } | null = null;
   private surfaceSettings: MediaTrackSettings | undefined;
+  private surfacePending: { width?: number; height?: number; switched: boolean } | null = null;
   private captureChanges = 0;
   private readonly captureSize: { width: number; height: number; known: boolean };
 
@@ -610,11 +611,13 @@ export class ScreenPublisher {
     // Settings changed by our own constraints are not independent resize evidence.
     this.captureChanges++;
     this.surfaceCandidate = null;
+    this.surfacePending = null;
     try { await apply(); }
     finally {
       this.captureChanges--;
       this.surfaceSettings = this.params.track.getSettings?.();
       this.surfaceCandidate = null;
+      this.surfacePending = null;
     }
   }
 
@@ -622,19 +625,39 @@ export class ScreenPublisher {
     const previousSettings = this.surfaceSettings;
     this.surfaceSettings = settings;
     const key = [settings?.deviceId, settings?.displaySurface, out?.mediaSourceId];
-    const switched = key.some((value, i) => value !== undefined && this.surfaceKey[i] !== undefined && value !== this.surfaceKey[i]);
+    const keyChanged = key.some((value, i) => value !== undefined && this.surfaceKey[i] !== undefined && value !== this.surfaceKey[i]);
     this.surfaceKey = key.map((value, i) => value ?? this.surfaceKey[i]);
+    // getSettings() can already describe a resize/switch while an in-flight
+    // getStats() still describes the old surface. Keep the independent evidence.
+    if (!this.captureChanges && (keyChanged || (previousSettings && (previousSettings.width !== settings?.width || previousSettings.height !== settings?.height)))) {
+      this.surfacePending = { width: settings?.width, height: settings?.height, switched: keyChanged || this.surfacePending?.switched === true };
+    }
     const width = source?.width ?? settings?.width ?? 0, height = source?.height ?? settings?.height ?? 0;
     const valid = Number.isFinite(width * height) && width > 0 && height > 0;
+    // A settings change seen during encoder adaptation cannot prove a resize,
+    // even if source stats catch up after the limitation has cleared.
+    if (out?.qualityLimitationReason !== "none" && !this.surfacePending?.switched) this.surfacePending = null;
+    const pending = this.surfacePending;
+    const matchesSettings = settings?.width === width && settings?.height === height;
+    const corroborated = matchesSettings && pending?.width === width && pending?.height === height;
+    const mismatched = source?.width !== undefined && source.height !== undefined && settings?.width !== undefined && settings.height !== undefined && !matchesSettings;
+    const switched = keyChanged || (corroborated && pending?.switched);
+    if (corroborated || (switched && !mismatched)) this.surfacePending = null;
     if (switched) {
       this.cancelPhase(); this.guard = new StuckCaptureGuard(); this.adaptationSent = null;
-      this.captureSize.known = valid;
-      this.captureSize.width = valid ? width : this.spec().width;
-      this.captureSize.height = valid ? height : this.spec().height;
+      if (!mismatched) {
+        this.captureSize.known = valid;
+        this.captureSize.width = valid ? width : this.spec().width;
+        this.captureSize.height = valid ? height : this.spec().height;
+      }
       void this.applyParameters(this.desired || this.spec().maxBitrate);
     }
     // A pulse changes capture settings too: it cannot prove a surface resize.
-    if (!valid || this.phase || this.guard.tracking) { this.surfaceCandidate = null; return; }
+    if (!valid || this.phase || this.guard.tracking) {
+      this.surfaceCandidate = null;
+      if (!pending?.switched) this.surfacePending = null;
+      return;
+    }
     const oldPixels = this.captureSize.width * this.captureSize.height;
     const pixels = width * height;
     const grows = !this.captureSize.known || pixels > oldPixels;
@@ -642,9 +665,7 @@ export class ScreenPublisher {
     // a settings change with unchanged requested constraints, then stable evidence.
     // Bandwidth/CPU adaptation can change settings too, so retain that exclusion.
     const candidate = this.surfaceCandidate;
-    const resized = settings?.width === width && settings?.height === height && (
-      (previousSettings && (previousSettings.width !== width || previousSettings.height !== height)) ||
-      (candidate?.width === width && candidate.height === height));
+    const resized = matchesSettings && (corroborated || (candidate?.width === width && candidate.height === height));
     const shrinks = !this.captureChanges && resized && pixels < oldPixels &&
       width >= (out?.frameWidth ?? Infinity) && height >= (out?.frameHeight ?? Infinity) && out?.qualityLimitationReason === "none";
     if (!grows && !shrinks) { this.surfaceCandidate = null; return; }
