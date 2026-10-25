@@ -7,4 +7,16 @@
 # webpki-roots 1.x, which is locked at a patched version (>= 1.0.10), so the
 # emSign roots RUSTSEC-2026-0381 flags are not in the build. Drop this when
 # rustls-acme (async-web-client) and tokio-tungstenite move to webpki-roots 1.
-ignore = ["RUSTSEC-2026-0330", "RUSTSEC-2026-0331", "RUSTSEC-2026-0381"]
+# crypto-bigint 0.5.5 (RUSTSEC-2026-0387, timing variability in constant-time
+# operations) comes in through elliptic-curve 0.13 → p256 0.13; the fix exists
+# only in crypto-bigint >= 0.7.6, which needs the elliptic-curve 0.14 line that
+# hpke-rs-rust-crypto 0.7, openmls_rust_crypto 0.6 and tsproto-types do not
+# support yet. MLS never runs P-256: Gwar's provider supports only
+# MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 and rejects the P-256 suite
+# (gwar-mls crypto tests). P-256 runs only in TS3 protocol handshakes: the
+# server's bridge puppets with the operator's own local TS3 server, and the
+# desktop TeamSpeak mode with the TS3 servers its user chooses to join. Those
+# use one ECDH and a few ECDSA operations per connection, so a remote server
+# gets few, network-jittered timing samples; accepted until a fix is reachable.
+# Drop this when those crates move to elliptic-curve 0.14.
+ignore = ["RUSTSEC-2026-0330", "RUSTSEC-2026-0331", "RUSTSEC-2026-0381", "RUSTSEC-2026-0387"]
