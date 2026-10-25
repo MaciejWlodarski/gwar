@@ -347,6 +347,112 @@ Smooth for screens; Chromium's `displaySurface` setting tells which.
 | Game | 1080p | 60 | `motion` | `maintain-framerate` | 8 Mbps |
 | Saver | 720p | 30 | `detail` | `balanced` | 1.5 Mbps |
 
+Game uses `maintain-framerate` from startup. The trial two-second resolution hold,
+even with a bounded early exit, delayed cadence and stable dimensions on shaped
+links, so the implementation uses a stuck-capture guard instead. There is no
+persistent sender size bound or resolution repricing controller. The capture caps,
+bitrate ceiling, priority and voice headroom remain the same; Text preserves
+resolution and Smooth/Saver keep `balanced`.
+
+For a resolved `maintain-framerate` spec, the guard can reset Chromium's pending
+capture adaptation with a one-second `maintain-resolution` pulse, then restore the
+current spec using fresh sender parameters. It requires six continuous seconds of
+undersize, no CPU limitation, and both the encoder target and 70% of a fresh outgoing
+estimate above `larger pixels × max(15, source fps) × bpp × 1.5` bits/s. The target,
+cadence and cap come from the live resolved spec, including effective codec-recovery
+limits. The retained settings target cannot exclude attempts toward that spec (L1).
+Any positive output below the spec is eligible. The larger step is capped at the
+spec and otherwise four times the current pixels, with a 720p floor. The bpp budget is at least 0.04 and grows
+with measured payload demand, leaving genuinely expensive content alone.
+
+A low-QP escape handles a stalled encoder spending most of its bitrate target at a
+small size. It requires output below half the effective target pixels, larger settings
+within this capture identity or the live-spec fallback (L1), and at least six seconds /
+60 encoded frames of consecutive positive `qpSum` / `framesEncoded` deltas. With that
+QP evidence, affordability uses the nominal next recovery step toward the live spec,
+without extrapolating payload demand from the adapted size. H.264 uses QP ≤24 on its
+0–51 scale; VP9 uses ≤96 on its 0–255 scale. Both counters must advance, the ratio must
+be plausible, and outbound id, encoder implementation and codec must match. Missing QP
+or identity, counter/geometry changes and polling gaps reset the window. The escape retains the nominal bpp floor, 50% margin and fresh
+estimate / CPU exclusions. See [startup validation](screen-startup-validation.md) for
+threshold justification and three-repeat cold-browser measurements.
+
+Retries retain 20, 40, 80 and 120 second backoff. Every pulse is judged across its
+restore using temporary 250 ms sampling: success needs ten seconds of larger
+output with fresh encoded-frame progress after restore. Duplicate reads do not
+restart that clock; missing or frozen counters cannot establish recovery. Two unsuccessful
+attempts suppress further pulses; the QP escape is one-shot per cycle. **L2:** all
+suppression expires only with thirty continuous seconds of healthy capacity for the
+**next recovery step**, without CPU limitation. Full-target capacity is unnecessary:
+a 270p20 capture can retry with a 1.75 Mb/s encoder budget sufficient for the nominal
+720p20 step (1.106 Mb/s), even if the retained 1080p20 target needs 2.488 Mb/s.
+Successful recovery discards the old outcome size reference. Any fresh encoded-frame
+output improvement during an attempt resets the non-improving-cycle backoff; the
+stronger sustained 50% gain criterion still decides fuse success.
+
+The target model is asymmetric: losing a recovery target can strand capture forever,
+whereas excess attempts are bounded. Each surface identity retains a **ceiling** of
+its largest observed settings width and height, independently per axis. This can
+combine dimensions from different aspect ratios, deliberately preferring an
+overestimate. The ceiling never shrinks for window resizes, capture-stage scaling,
+CPU/bandwidth adaptation, pulses, application caps, or delayed cap frames, even with
+limitation `none`. The guard target is `min(ceiling, live spec)` per axis; the spec
+includes recovery caps. Caps never overwrite the ceiling, so relaxing one restores
+the full target immediately. **L1:** the ceiling never vetoes an attempt toward the
+live spec. Growth and Chromium adaptation can both occur between polls, or a new
+identity can first appear already adapted; neither needs a larger observed snapshot
+to remain recoverable. The live spec supplies the independent liveness fallback.
+
+Identity is the publisher's track plus the synchronous `getSettings()` fields
+`deviceId` and `displaySurface`. A new track creates a new publisher. A change to a
+previously known field cancels the previous surface's pulse/outcome and resets its
+guard/QP history **before** seeding a new ceiling from that same settings snapshot.
+Stats dimensions and media-source ids cannot seed or reset the ceiling: stats can
+lead or lag settings and may still describe the previous identity. Until synchronous
+settings identify a switch, they belong to the previous identity. Missing identity
+fields or switches between indistinguishable surfaces retain the higher ceiling;
+there is no claim to prove physical dimensions. A switch first observed already
+reduced seeds its ceiling from those settings, with the spec fallback eligible
+immediately. It does not need spontaneous growth to enable pulses.
+
+**L3:** consecutive non-improving attempt cycles use **10 → 20 → 40 → 60 minute**
+retry envelopes, capped at sixty minutes, measured from the final pulse in the
+preceding cycle. One ordinary two-second polling interval is reserved inside each
+envelope for observing its completion; continuous eligibility and QP evidence survive
+suppression. Identity switches, preset/spec changes (including codec recovery caps),
+and fresh-frame improvement reset this backoff to ten minutes. Ceiling growth alone
+never resets it. With continuously healthy next-step capacity, valid advancing
+telemetry and ordinary polling, output below the spec gets a pulse within **at most
+60 minutes**, including that polling interval. A fresh unfused guard needs six seconds
+of eligibility (at most eight seconds including its first ordinary poll). CPU pressure,
+unaffordable payload demand, invalid telemetry and polling stalls do not satisfy this
+liveness premise. The valid low-QP escape retains its evidence requirements.
+
+For a permanently smaller, non-growing surface under an unchanged identity and
+configuration, every pulse fails: **at most two issued one-second pulses in any
+half-open ten-minute window**. Once the sixty-minute cap is reached, the bound
+sharpens to **two pulses per half-open hour**. If output repeatedly gains 50% for
+ten seconds and regresses, even an
+overestimated target can record successes: the unchanged 20/40/80/120-second attempt
+spacing bounds these to **seven pulses per ten-minute window** (at most five once
+spacing reaches 120 s). Explicit surface/preset/codec resets start fresh history;
+including arbitrary such resets, six-second eligibility bounds a publisher to
+**100 pulses per half-open ten-minute window**. The one-second deadline is independent of sender promise completion, with serialized current-state
+restores.
+Preset changes, close and codec replacement fence queued parameters and cancel
+phase/sampling timers. `scaleResolutionDownBy` only enforces the existing
+codec-recovery ceiling from current track settings.
+
+`pnpm --filter web e2e:screen-startup` checks repeated fresh real-tab publishes
+with a sparse 20 fps barcode and busy 1080p60 content, using VP9 and H.264. It
+checks rendered and captured cadence, outbound resolution and viewer decoding
+through the local SFU after settling. `E2E_STARTUP_RESULTS` retains JSON timelines;
+`E2E_STARTUP_UPLINK=1500000` or `3000000` exercises Chromium's global p2p shaper
+and reports the constrained-link tradeoff.
+`E2E_STARTUP_PRESET` can check Text, Smooth and Saver directly. The Ubuntu
+`browser-screen-startup` job is diagnostic and excluded from `ci-ok` until its repeatability is established.
+The existing required #166 fixed 1080p60 H.264 canvas gate is unchanged.
+
 Notes on the table:
 
 - Resolution is capped with `track.applyConstraints({width, height,
