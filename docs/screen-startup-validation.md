@@ -6,6 +6,45 @@ WebKit, local SFU and real browser viewers. Main is pinned to
 `b331b2387b8f79369409049e9137ccfde628b269`. All services use loopback;
 the screen servers run with `--no-connect`. No VM or production service is used.
 
+## Round 3 application-cap provenance follow-up
+
+The full matrices below are retained from `17878f6d`. The follow-up preserves
+proven surface dimensions across preset changes, same-preset spec changes, and
+#166 recovery caps. Every application constraint write refreshes the independent
+track-settings baseline; a smaller media-source/output pair alone cannot establish
+a physical resize. Independent settings changes still use the existing two-second
+stability check and CPU/bandwidth exclusions; surface switches still reset immediately.
+
+The reviewer's Game → Saver → Game reproduction now covers both `none` and
+`bandwidth`, plus a custom 1600×900 / 24 fps spec, same-preset constraint changes,
+and recovery caps. Every case retains a 1920-wide proven surface and issues one
+pulse after the cap is relaxed. The `none` Game/custom cases failed on the reviewed
+head with width 1280 and zero pulses. A source-only shrink negative control also
+failed before the fix; real resize/switch and the earlier lifecycle controls pass.
+
+Local validation: typecheck passed; lint has zero errors and the same four warnings;
+1,432 tests across 116 files passed with one worker and unchanged deadlines,
+including 121 focused screen tests. Chromium/WebKit screen e2e passed; smoke
+passed 66/66 checks. An initial full-suite run concurrent with the local Rust
+rebuild had four existing-test 5-second timeouts; all passed on the complete serial
+rerun. The local server/Connect binaries were verified with an offline four-job build.
+
+The 30-second H.264 sparse spot-check reached sustained source/encoder/viewer
+1920×1080 at 10.85 s, with 20 fps and one pulse. The first 60-second busy attempt
+reached 1080p at 14.90 s, then reported CPU limitation and ended at 1440×810.
+A fresh exact-`17878f6d` control under the same competing Cargo build also failed,
+ending at 960×540. A second candidate run reached 1080p at 10.64 s but failed
+the cadence assertion at 36 fps while a separate Chromium/WebKit screen suite
+was active. A 60-second VP9 busy check sustained 60 fps but reported a physical
+capture/source/viewer size of 1920×992, failing the 1080p assertion. These attempts
+are retained rather than counted as passes. No clean busy-startup pass was
+established on this shared host; the exact baseline also failed, so these runs
+do not establish a revision-specific regression or prove its absence. Test
+thresholds and the startup harness are unchanged.
+
+Logs, JSONL, summaries, source hashes and the exact baseline archive are retained in
+`/tmp/gwar-pr168-r3-fix-X8eF8d`. All services are local; no VM or production access.
+
 ## Guard and round 2 fixes
 
 Game starts with `maintain-framerate`. Six seconds of undersized output and healthy
@@ -44,9 +83,12 @@ by the VP9 busy acceptance comparison without reducing either evidence window.
 4. **Surface provenance.** Live track settings and media-source dimensions refresh
    the captured size after two seconds of stable enlargement outside a pulse/outcome
    window. Device/display-surface/media-source identity changes immediately reset
-   the guard and QP history. A smaller source resets them after two seconds when it
-   is at least as large as encoded output and the encoder reports no adaptation
-   pressure. Chromium can shrink both capture settings and source stats under
+   the guard and QP history. A smaller source resets them after two seconds only
+   with an independent track-settings resize under unchanged requested capture
+   constraints, when it is at least as large as encoded output and the encoder
+   reports no adaptation pressure. Preset/spec and codec-recovery constraint writes
+   refresh the settings baseline without replacing the proven physical surface.
+   Chromium can shrink both capture settings and source stats under
    bandwidth/CPU pressure; equal smaller source/output dimensions in that condition
    are ambiguous and retain the known surface target. This conservative rule avoids
    misclassifying Chromium's own downscale as a user resize. Browsers that expose no

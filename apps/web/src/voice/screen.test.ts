@@ -411,28 +411,52 @@ describe("publisher capture guard", () => {
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
-  it("retains proven surface size across an application cap and a return to Game", async () => {
+  // Round-3 reviewer repro: limitation "none" must not turn Saver's cap into
+  // physical resize evidence. Also exercise a custom 1600x900 / 24 fps target.
+  it.each([
+    ["game", "none", "preset"], ["game", "bandwidth", "preset"],
+    ["smooth", "none", "preset"], ["smooth", "bandwidth", "preset"],
+    ["game", "none", "spec"], ["game", "bandwidth", "spec"],
+    ["game", "none", "recovery"], ["game", "bandwidth", "recovery"],
+  ] as const)("retains proven surface size on %s, limitation=%s, after %s caps", async (preset, limitation, change) => {
+    const original = PRESETS.smooth, originalGame = PRESETS.game;
+    PRESETS.smooth = { ...original, width: 1600, height: 900, fps: 24, degradation: "maintain-framerate" };
     const settings = { width: 1920, height: 1080, frameRate: 20 };
     const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async (constraints: MediaTrackConstraints) => {
       if ((constraints.width as ConstrainULongRange)?.max === 1280) { settings.width = 1280; settings.height = 720; }
-      // The capture remains adapted to 720p when Game's larger cap is restored.
-    } } as unknown as MediaStreamTrack, preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
-    await publisher.start();
-    await publisher.setPreset("saver");
-    await publisher.setPreset("game");
-    const pc = Peer.all[0]!;
-    pc.getStats.mockImplementation(async () => {
-      const at = performance.now();
-      return new Map([
-        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 5_000_000 }],
-        ["source", { width: 1280, height: 720, framesPerSecond: 20 }],
-        ["out", { type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, framesEncoded: 1 + at / 50,
-          bytesSent: at * 10, frameWidth: 1280, frameHeight: 720, targetBitrate: 3_500_000, qualityLimitationReason: "bandwidth" }],
-      ]);
-    });
-    await vi.advanceTimersByTimeAsync(12_000);
-    expect(pc.sendParams.some(p => p.degradationPreference === "maintain-resolution")).toBe(true);
-    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+      // Capture stays at 720p when the larger requested cap is restored.
+    } } as unknown as MediaStreamTrack, preset, iceServers: [], offer: async () => "answer", state: () => {} });
+    try {
+      await publisher.start();
+      if (change === "recovery") {
+        await publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
+        await publisher.recover({ share: "s", codec: "vp9", width: 1920, height: 1080, fps: 60 });
+      } else if (change === "spec") {
+        PRESETS.game = { ...originalGame, width: 1280, height: 720, fps: 30 };
+        await publisher.setPreset("game");
+        PRESETS.game = originalGame;
+        await publisher.setPreset("game");
+      } else {
+        await publisher.setPreset("saver");
+        await publisher.setPreset(preset);
+      }
+      const pc = Peer.all.at(-1)!;
+      pc.getStats.mockImplementation(async () => {
+        const at = performance.now();
+        return new Map([
+          ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 5_000_000 }],
+          ["source", { width: 1280, height: 720, framesPerSecond: 20 }],
+          ["out", { type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, framesEncoded: 1 + at / 50,
+            bytesSent: at * 10, frameWidth: 1280, frameHeight: 720, targetBitrate: 3_500_000, qualityLimitationReason: limitation }],
+        ]);
+      });
+      await vi.advanceTimersByTimeAsync(12_000);
+      const size = (publisher as unknown as { captureSize: { width: number } }).captureSize.width;
+      const pulses = pc.sendParams.filter(p => p.degradationPreference === "maintain-resolution").length;
+      expect({ size, pulses }).toEqual({ size: 1920, pulses: 1 });
+      expect(last().encodings[0]?.maxFramerate).toBe(PRESETS[preset].fps);
+    } finally { publisher.close(); PRESETS.smooth = original; PRESETS.game = originalGame; }
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("does not confuse a replacement transport's source id with a smaller captured surface", async () => {
@@ -888,7 +912,7 @@ describe("bounded guard outcomes and rearming", () => {
 });
 
 describe("live captured surface provenance", () => {
-  it.each(["grow", "shrink", "switch", "adaptation", "pulse"])("refreshes a %s without retaining stale surface/QP evidence", async kind => {
+  it.each(["grow", "shrink", "switch", "adaptation", "pulse", "source-only"])("refreshes a %s without retaining stale surface/QP evidence", async kind => {
     const settings = { width: kind === "grow" ? 1280 : 1920, height: kind === "grow" ? 720 : 1080, frameRate: 20, displaySurface: "window", deviceId: "one" };
     const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
       preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
@@ -908,6 +932,7 @@ describe("live captured surface provenance", () => {
     const internals = publisher as unknown as { captureSize: { width: number; height: number }; guard: StuckCaptureGuard; phase: string | null };
     const previous = internals.guard;
     if (kind === "grow") { width = settings.width = 1920; height = settings.height = 1080; }
+    else if (kind === "source-only") { width = 1280; height = 720; }
     else { width = settings.width = 1280; height = settings.height = 720; }
     if (kind === "switch") settings.deviceId = "two";
     if (kind === "adaptation") limitation = "bandwidth";
@@ -915,8 +940,8 @@ describe("live captured surface provenance", () => {
     await vi.advanceTimersByTimeAsync(2000);
     if (kind === "grow" || kind === "shrink") expect(internals.guard).toBe(previous); // needs two seconds of evidence
     await vi.advanceTimersByTimeAsync(2000);
-    expect(internals.captureSize.width).toBe(kind === "grow" || kind === "adaptation" || kind === "pulse" ? 1920 : 1280);
-    expect(internals.guard === previous).toBe(kind === "adaptation" || kind === "pulse");
+    expect(internals.captureSize.width).toBe(kind === "grow" || kind === "adaptation" || kind === "pulse" || kind === "source-only" ? 1920 : 1280);
+    expect(internals.guard === previous).toBe(kind === "adaptation" || kind === "pulse" || kind === "source-only");
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 });

@@ -439,6 +439,8 @@ export class ScreenPublisher {
   private adaptationSent: { bytes: number; at: number } | null = null;
   private surfaceKey: (string | undefined)[] = [];
   private surfaceCandidate: { width: number; height: number; since: number } | null = null;
+  private surfaceSettings: MediaTrackSettings | undefined;
+  private captureChanges = 0;
   private readonly captureSize: { width: number; height: number; known: boolean };
 
   constructor(private readonly params: PublishParams) {
@@ -446,6 +448,7 @@ export class ScreenPublisher {
     const settings = params.track.getSettings?.(), spec = this.spec();
     const width = settings?.width, height = settings?.height;
     this.surfaceKey = [settings?.deviceId, settings?.displaySurface];
+    this.surfaceSettings = settings;
     this.captureSize = {
       width: width ?? spec.width, height: height ?? spec.height,
       known: width !== undefined && height !== undefined && Number.isFinite(width * height) && width > 0 && height > 0,
@@ -454,8 +457,8 @@ export class ScreenPublisher {
 
   async start(): Promise<void> {
     const run = ++this.run;
-    const { track, iceServers } = this.params;
-    if (this.recovery) await track.applyConstraints({ width: { max: this.recovery.width }, height: { max: this.recovery.height }, frameRate: { max: this.recovery.fps } });
+    const { track, iceServers } = this.params, recovery = this.recovery;
+    if (recovery) await this.changeCapture(() => track.applyConstraints({ width: { max: recovery.width }, height: { max: recovery.height }, frameRate: { max: recovery.fps } }));
     if (this.closed || run !== this.run) return;
     const pc = new RTCPeerConnection(rtcConfig(iceServers));
     this.pc = pc;
@@ -495,9 +498,10 @@ export class ScreenPublisher {
       this.preset = preset;
     }
     const revision = this.revision;
-    await applyCapturePreset(this.params.track, preset);
+    await this.changeCapture(() => applyCapturePreset(this.params.track, preset));
     if (this.closed || revision !== this.revision) return;
-    if (this.recovery) await this.params.track.applyConstraints({ width: { max: this.recovery.width }, height: { max: this.recovery.height }, frameRate: { max: this.recovery.fps } });
+    const recovery = this.recovery;
+    if (recovery) await this.changeCapture(() => this.params.track.applyConstraints({ width: { max: recovery.width }, height: { max: recovery.height }, frameRate: { max: recovery.fps } }));
     if (this.closed || revision !== this.revision) return;
     await this.applyParameters(this.spec().maxBitrate);
     if (this.closed || revision !== this.revision) return;
@@ -602,7 +606,21 @@ export class ScreenPublisher {
     this.sampleTimer = setTimeout(poll, 250);
   }
 
+  private async changeCapture(apply: () => Promise<void>): Promise<void> {
+    // Settings changed by our own constraints are not independent resize evidence.
+    this.captureChanges++;
+    this.surfaceCandidate = null;
+    try { await apply(); }
+    finally {
+      this.captureChanges--;
+      this.surfaceSettings = this.params.track.getSettings?.();
+      this.surfaceCandidate = null;
+    }
+  }
+
   private refreshSurface(settings: MediaTrackSettings | undefined, source: { width?: number; height?: number } | undefined, out: OutboundVideo | undefined): void {
+    const previousSettings = this.surfaceSettings;
+    this.surfaceSettings = settings;
     const key = [settings?.deviceId, settings?.displaySurface, out?.mediaSourceId];
     const switched = key.some((value, i) => value !== undefined && this.surfaceKey[i] !== undefined && value !== this.surfaceKey[i]);
     this.surfaceKey = key.map((value, i) => value ?? this.surfaceKey[i]);
@@ -620,14 +638,17 @@ export class ScreenPublisher {
     const oldPixels = this.captureSize.width * this.captureSize.height;
     const pixels = width * height;
     const grows = !this.captureSize.known || pixels > oldPixels;
-    // Equal source/output sizes under bandwidth or CPU pressure are ambiguous:
-    // Chromium adapts BOTH. Accept a shrink only with a source at least as large
-    // as output and without adaptation pressure. Never erase the target on GCC's
-    // own downscale. A surface identity change always invalidates it immediately.
-    const shrinks = pixels < oldPixels && width >= (out?.frameWidth ?? Infinity) && height >= (out?.frameHeight ?? Infinity) &&
-      out?.qualityLimitationReason === "none";
+    // A smaller media-source/output pair alone can be an application cap. Require
+    // a settings change with unchanged requested constraints, then stable evidence.
+    // Bandwidth/CPU adaptation can change settings too, so retain that exclusion.
+    const candidate = this.surfaceCandidate;
+    const resized = settings?.width === width && settings?.height === height && (
+      (previousSettings && (previousSettings.width !== width || previousSettings.height !== height)) ||
+      (candidate?.width === width && candidate.height === height));
+    const shrinks = !this.captureChanges && resized && pixels < oldPixels &&
+      width >= (out?.frameWidth ?? Infinity) && height >= (out?.frameHeight ?? Infinity) && out?.qualityLimitationReason === "none";
     if (!grows && !shrinks) { this.surfaceCandidate = null; return; }
-    const now = performance.now(), candidate = this.surfaceCandidate;
+    const now = performance.now();
     if (!candidate || candidate.width !== width || candidate.height !== height) {
       this.surfaceCandidate = { width, height, since: now }; return;
     }
