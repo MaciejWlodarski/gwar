@@ -363,28 +363,34 @@ with measured payload demand, leaving genuinely expensive content alone.
 A low-QP escape handles a stalled encoder spending most of its bitrate target at a
 small size. It requires output below half the effective target pixels, known evidence
 of a larger captured surface before adaptation, and at least six seconds / 60 encoded
-frames of consecutive low `qpSum` / `framesEncoded` deltas. H.264 uses QP ≤24 on its
-0–51 scale; VP9 uses ≤96 on its 0–255 scale. Counter, codec, geometry or polling gaps
-reset the window. The escape retains the nominal bpp floor, 50% margin and fresh
+frames of consecutive positive `qpSum` / `framesEncoded` deltas. H.264 uses QP ≤24 on its
+0–51 scale; VP9 uses ≤96 on its 0–255 scale. Both counters must advance, the ratio must
+be plausible, and outbound id, encoder implementation and codec must match. Missing QP
+or identity, counter/geometry changes and polling gaps reset the window. The escape retains the nominal bpp floor, 50% margin and fresh
 estimate / CPU exclusions. See [startup validation](screen-startup-validation.md) for
 threshold justification and three-repeat cold-browser measurements.
 
-Ordinary measured-budget retries retain 20, 40, 80 and 120 second backoff. A QP escape
-fuses all further guard pulses for that preset/encoder, including retries through the
-measured-budget path. An observed post-pulse growth followed by a bandwidth-driven
-shrink also disables further pulses. Preset changes or codec replacement reset this
-state; close and replacement fence queued parameters and cancel the pulse timer.
-This prevents pulse/shrink feedback while keeping Chromium in charge of congestion
-adaptation. `scaleResolutionDownBy` only enforces the existing codec-recovery ceiling
-from the current track settings.
+Retries retain 20, 40, 80 and 120 second backoff. Every pulse is judged across its
+restore using temporary 250 ms sampling: success needs ten seconds of larger
+output with fresh encoded-frame progress after restore. Duplicate reads do not
+restart that clock; missing or frozen counters cannot establish recovery. Two unsuccessful attempts suppress further pulses;
+the QP escape is one-shot. Suppression expires after ten minutes plus thirty
+continuous seconds of healthy target capacity without CPU limitation. Successful
+recovery discards the old size reference. Stable surface enlargement, unpressured
+shrink and surface identity changes refresh the target and reset guard/QP history;
+pulse-induced growth cannot supply surface evidence. Preset caps never replace
+physical surface evidence; live observations update it through the same rule. The one-second deadline is
+independent of sender promise completion, with serialized current-state restores.
+Preset changes, close and codec replacement fence queued parameters and cancel
+phase/sampling timers. `scaleResolutionDownBy` only enforces the existing
+codec-recovery ceiling from current track settings.
 
 `pnpm --filter web e2e:screen-startup` checks repeated fresh real-tab publishes
 with a sparse 20 fps barcode and busy 1080p60 content, using VP9 and H.264. It
 checks rendered and captured cadence, outbound resolution and viewer decoding
 through the local SFU after settling. `E2E_STARTUP_RESULTS` retains JSON timelines;
 `E2E_STARTUP_UPLINK=1500000` or `3000000` exercises Chromium's global p2p shaper
-and reports the constrained-link tradeoff. `E2E_STARTUP_STALL_CONTROL=1` requires
-a real guard pulse and resolution recovery;
+and reports the constrained-link tradeoff.
 `E2E_STARTUP_PRESET` can check Text, Smooth and Saver directly. The Ubuntu
 `browser-screen-startup` job is diagnostic and excluded from `ci-ok` until its repeatability is established.
 The existing required #166 fixed 1080p60 H.264 canvas gate is unchanged.

@@ -110,6 +110,21 @@ describe("publish transport", () => {
     expect(pc.close).toHaveBeenCalled();
   });
 
+  it("retries the current headroom cap after a transient failure of both sender writes", async () => {
+    const publisher = new ScreenPublisher({ track: { applyConstraints: async () => {} } as unknown as MediaStreamTrack,
+      preset: "smooth", iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!, sender = pc.transceivers[0]!.sender;
+    pc.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 2_000_000 });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    sender.setParameters.mockRejectedValueOnce(new Error("transient")).mockRejectedValueOnce(new Error("transient fallback"));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(publisher.bitrate).toBe(4_000_000);
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(publisher.bitrate).toBe(1_400_000);
+    publisher.close();
+  });
+
   it("closed during its first parameter change, it leaves no timer behind", async () => {
     const offer = vi.fn(async (_body: { ssrc: number; rtx_ssrc: number; sdp: string }) => "answer");
     const track = { applyConstraints: vi.fn(async () => {}), contentHint: "" } as unknown as MediaStreamTrack;
@@ -367,6 +382,98 @@ describe("publisher capture guard", () => {
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
+  it("cannot learn pulse-induced growth through a same-preset update", async () => {
+    const settings = { width: 1280, height: 720, frameRate: 20 };
+    const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
+      preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!;
+    let width = 480, height = 270;
+    pc.transceivers[0]!.sender.setParameters.mockImplementation(async params => {
+      pc.sendParams.push(params);
+      if (params.degradationPreference === "maintain-resolution") { width = settings.width = 1920; height = settings.height = 1080; }
+    });
+    pc.getStats.mockImplementation(async () => {
+      const at = performance.now();
+      return new Map([
+        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 5_000_000 }],
+        ["source", { width, height, framesPerSecond: 20 }],
+        ["out", { type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, framesEncoded: 1 + at / 50,
+          bytesSent: at * 10, frameWidth: width, frameHeight: height, targetBitrate: 3_500_000, qualityLimitationReason: "bandwidth" }],
+      ]);
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await publisher.setPreset("game");
+    const evidence = publisher as unknown as { captureSize: { width: number } };
+    expect(evidence.captureSize.width).toBe(1280);
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(evidence.captureSize.width).toBe(1920);
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("retains proven surface size across an application cap and a return to Game", async () => {
+    const settings = { width: 1920, height: 1080, frameRate: 20 };
+    const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async (constraints: MediaTrackConstraints) => {
+      if ((constraints.width as ConstrainULongRange)?.max === 1280) { settings.width = 1280; settings.height = 720; }
+      // The capture remains adapted to 720p when Game's larger cap is restored.
+    } } as unknown as MediaStreamTrack, preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    await publisher.setPreset("saver");
+    await publisher.setPreset("game");
+    const pc = Peer.all[0]!;
+    pc.getStats.mockImplementation(async () => {
+      const at = performance.now();
+      return new Map([
+        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 5_000_000 }],
+        ["source", { width: 1280, height: 720, framesPerSecond: 20 }],
+        ["out", { type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, framesEncoded: 1 + at / 50,
+          bytesSent: at * 10, frameWidth: 1280, frameHeight: 720, targetBitrate: 3_500_000, qualityLimitationReason: "bandwidth" }],
+      ]);
+    });
+    await vi.advanceTimersByTimeAsync(12_000);
+    expect(pc.sendParams.some(p => p.degradationPreference === "maintain-resolution")).toBe(true);
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not confuse a replacement transport's source id with a smaller captured surface", async () => {
+    const publisher = make(); await publisher.start();
+    const old = Peer.all[0]!; healthy(old);
+    await vi.advanceTimersByTimeAsync(2000);
+    await publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
+    const pc = Peer.all[1]!; healthy(pc);
+    const read = pc.getStats.getMockImplementation()!;
+    pc.getStats.mockImplementation(async () => {
+      const stats = await read();
+      const source = stats.get("source")!;
+      stats.delete("source"); stats.set("replacement-source", source);
+      stats.get("out")!.mediaSourceId = "replacement-source";
+      return stats;
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(pc.sendParams.some(p => p.degradationPreference === "maintain-resolution")).toBe(true);
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("fences a late pulse rejection before fallback can reapply the expired preference", async () => {
+    const publisher = make(); await publisher.start();
+    const pc = Peer.all[0]!; healthy(pc);
+    const sender = pc.transceivers[0]!.sender;
+    const fresh = sender.getParameters;
+    sender.getParameters = () => ({ ...fresh(), degradationPreference: last().degradationPreference });
+    let reject!: (e: Error) => void;
+    sender.setParameters.mockImplementation(async p => {
+      pc.sendParams.push(p);
+      if (p.degradationPreference === "maintain-resolution") await new Promise<void>((_, no) => { reject = no; });
+    });
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect((publisher as unknown as { phase: string | null }).phase).toBe(null);
+    const count = pc.sendParams.length;
+    reject(new Error("delayed pulse rejection"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pc.sendParams.slice(count).map(p => p.degradationPreference)).toEqual(["maintain-framerate"]);
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("bounds pulses to one second, keeps headroom, and rate-limits an unresolved stall", async () => {
     const publisher = make(); await publisher.start();
     const pc = Peer.all[0]!; healthy(pc);
@@ -376,7 +483,7 @@ describe("publisher capture guard", () => {
     expect(last().degradationPreference).toBe("maintain-framerate");
     await vi.advanceTimersByTimeAsync(18_999);
     expect(last().degradationPreference).toBe("maintain-framerate");
-    await vi.advanceTimersByTimeAsync(1);
+    await vi.advanceTimersByTimeAsync(2001);
     expect(last().degradationPreference).toBe("maintain-resolution");
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
@@ -417,12 +524,12 @@ describe("publisher capture guard", () => {
         ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: kind === "low" ? 2_000_000 : 13_000_000, ...(kind === "missing" ? {} : { timestamp: performance.timeOrigin + performance.now() - (kind === "stale" ? 5_000 : 0) }) }],
         ["codec", { type: "codec", mimeType: "video/H264" }],
         ["source", { type: "media-source", width: 480, height: 270, framesPerSecond: 60 }],
-        ["out", { type: "outbound-rtp", kind: "video", codecId: "codec", framesEncoded: frames, qpSum: frames * 20, mediaSourceId: "source", timestamp, bytesSent: timestamp * 7_500_000 / 8000, frameWidth: 480, frameHeight: 270, framesPerSecond: 60, targetBitrate: kind === "target" ? 3_000_000 : 8_000_000, qualityLimitationReason: kind === "cpu" ? "cpu" : "bandwidth" }],
+        ["out", { type: "outbound-rtp", kind: "video", id: "out", encoderImplementation: "encoder", codecId: "codec", framesEncoded: frames, qpSum: frames * 20, mediaSourceId: "source", timestamp, bytesSent: timestamp * 7_500_000 / 8000, frameWidth: 480, frameHeight: 270, framesPerSecond: 60, targetBitrate: kind === "target" ? 3_000_000 : 8_000_000, qualityLimitationReason: kind === "cpu" ? "cpu" : "bandwidth" }],
       ]);
     });
     await vi.advanceTimersByTimeAsync(5000);
     if (kind === "clock-change") vi.setSystemTime(Date.now() + 60_000);
-    await vi.advanceTimersByTimeAsync(5000);
+    await vi.advanceTimersByTimeAsync(3000);
     expect(last().degradationPreference).toBe(kind === "fresh" || kind === "clock-change" ? "maintain-resolution" : "maintain-framerate");
     await vi.advanceTimersByTimeAsync(1000);
     expect(last().degradationPreference).toBe("maintain-framerate");
@@ -496,8 +603,8 @@ describe("stuck capture guard", () => {
     for (let now = start; now <= end; now += 2000) if (guard.observe(now, s)) nudges.push(now);
     return nudges;
   };
-  it("requires six continuous seconds, then backs off 20, 40 and 80 seconds", () => {
-    expect(feed(new StuckCaptureGuard(), 0, 150_000)).toEqual([6000, 26000, 66000, 146000]);
+  it("requires six continuous seconds, backs off and stops after two unsuccessful pulses", () => {
+    expect(feed(new StuckCaptureGuard(), 0, 150_000)).toEqual([6000, 28000]);
   });
   it.each([
     { limitation: "cpu" }, { available: 1_500_000 }, { targetBitrate: 300_000 }, { available: 0 }, { available: NaN }, { available: Infinity }, { targetBitrate: NaN }, { bitrate: NaN }, { fps: 0 },
@@ -536,16 +643,31 @@ describe("stuck capture guard", () => {
   const busy = (now: number, codec = "video/H264", qp = 20, width = 480, height = 270) => ({
     ...sample, width, height, sourceWidth: width, sourceHeight: height,
     captureWidth: 1920, captureHeight: 1080, fps: 60, available: 13_000_000, targetBitrate: 8_000_000, bitrate: 7_500_000,
-    quality: { codec, sum: (1 + now * 0.06) * qp, frames: 1 + now * 0.06, at: now, width, height },
+    quality: { id: "out", encoder: "encoder", codec, sum: (1 + now * 0.06) * qp, frames: 1 + now * 0.06, at: now, width, height },
   });
   it.each([["video/H264", 24], ["video/VP9", 96]] as const)("requires a sustained codec-specific low-QP window: %s ≤%i", (codec, threshold) => {
     const guard = new StuckCaptureGuard();
-    for (const now of [0, 2000, 4000, 6000]) expect(guard.observe(now, busy(now, codec, threshold))).toBe(false);
-    expect(guard.observe(8000, busy(8000, codec, threshold))).toBe(true);
+    for (const now of [0, 2000, 4000]) expect(guard.observe(now, busy(now, codec, threshold))).toBe(false);
+    expect(guard.observe(6000, busy(6000, codec, threshold))).toBe(true);
     expect(feed(new StuckCaptureGuard(), 0, 20_000, busy(0, codec, threshold + 1))).toEqual([]);
     const high = new StuckCaptureGuard();
     for (let now = 0; now <= 30_000; now += 2000) expect(high.observe(now, busy(now, codec, threshold + 1))).toBe(false);
   });
+  it("counts six seconds of the affordable larger step without requiring full-target capacity", () => {
+    const guard = new StuckCaptureGuard();
+    for (const now of [0, 2000, 4000]) expect(guard.observe(now, { ...busy(now), available: 6_000_000, targetBitrate: 4_200_000 })).toBe(false);
+    expect(guard.observe(6000, { ...busy(6000), available: 6_000_000, targetBitrate: 4_200_000 })).toBe(true);
+  });
+
+  it("cannot backdate healthy capacity using a low-QP window from a congested link", () => {
+    const guard = new StuckCaptureGuard();
+    for (let now = 0; now <= 12_000; now += 2000) {
+      const eligible = guard.observe(now, { ...busy(now), available: now < 8000 ? 1_000_000 : 13_000_000 });
+      expect(eligible).toBe(false);
+    }
+    expect(guard.observe(14_000, busy(14_000))).toBe(true);
+  });
+
   it("requires enough encoded frames as well as six seconds of low QP", () => {
     const guard = new StuckCaptureGuard();
     for (let now = 0; now <= 20_000; now += 2000) {
@@ -576,7 +698,7 @@ describe("stuck capture guard", () => {
     const guard = new StuckCaptureGuard();
     for (let now = 0; now <= 30_000; now += 2000) expect(guard.observe(now, { ...busy(now), ...change })).toBe(false);
   });
-  it.each([["video/H264", false, false], ["video/VP9", false, false], ["video/H264", true, false], ["video/VP9", true, false], ["video/H264", false, true], ["video/VP9", false, true], ["video/H264", true, true], ["video/VP9", true, true]] as const)("never repeats a pulse/shrink cycle after real bitrate pressure: %s, hidden=%s, cheap=%s", (codec, hidden, cheap) => {
+  it.each([["video/H264", false, false], ["video/VP9", false, false], ["video/H264", true, false], ["video/VP9", true, false], ["video/H264", false, true], ["video/VP9", false, true], ["video/H264", true, true], ["video/VP9", true, true]] as const)("bounds pulse/shrink cycles after real bitrate pressure: %s, hidden=%s, cheap=%s", (codec, hidden, cheap) => {
     const guard = new StuckCaptureGuard();
     let width = 480, height = 270, sum = 0, frames = 1, pulseAt: number | null = null;
     const pulses: number[] = [], sizes: number[] = [];
@@ -587,13 +709,232 @@ describe("stuck capture guard", () => {
       frames += 120;
       sum += 120 * (width === 1920 ? (codec === "video/VP9" ? 205 : 40) : 20);
       const s = { ...busy(now, codec, 20, width, height), bitrate: width === 1920 ? 10_000_000 : cheap ? 625_000 : 7_500_000,
-        quality: { codec, sum, frames, at: now, width, height } };
+        quality: { id: "out", encoder: "encoder", codec, sum, frames, at: now, width, height } };
       sizes.push(width * height);
       if (guard.observe(now, s)) { pulses.push(now); pulseAt = now; }
     }
     // A cheap measured budget starts its six-second clock at the first sample.
-    expect(pulses).toEqual([cheap ? 6000 : 8000]);
-    expect(sizes.filter((p, i) => i > 0 && p !== sizes[i - 1])).toEqual(hidden ? [] : [1920 * 1080, 480 * 270]);
+    expect(pulses).toEqual(cheap ? [6000, 28000] : [6000]);
+    expect(sizes.filter((p, i) => i > 0 && p !== sizes[i - 1])).toEqual(hidden ? [] : cheap ? [1920 * 1080, 480 * 270, 1920 * 1080, 480 * 270] : [1920 * 1080, 480 * 270]);
   });
 
+});
+
+describe("round 2 independent adversarial review", () => {
+  const base = { width: 480, height: 270, sourceWidth: 480, sourceHeight: 270, captureWidth: 1920, captureHeight: 1080,
+    targetWidth: 1920, targetHeight: 1080, fps: 60, available: 13_000_000, targetBitrate: 8_000_000, bitrate: 7_500_000, limitation: "bandwidth" };
+  it("does not interpret a retained, non-advancing qpSum as fresh low QP", () => {
+    const guard = new StuckCaptureGuard();
+    const pulses: number[] = [];
+    for(let now=0; now<=30_000; now+=2000) {
+      const quality = {id: "out", encoder: "encoder", codec: "video/H264", sum: 40_000, frames: 1000 + now*0.06, at: now, width: 480, height: 270};
+      if(guard.observe(now, {...base, quality})) pulses.push(now);
+    }
+    expect(pulses).toEqual([]);
+  });
+  it("can recover a new stall after ten healthy minutes following a transient dip", () => {
+    const guard = new StuckCaptureGuard();
+    const pulses: number[] = [];
+    for(let now=0; now<=700_000; now+=2000) {
+      const full = now>=8000 && now<20_000;
+      const dip = now>=20_000 && now<30_000;
+      const s = {...base, fps: 20, bitrate: 100_000, available: dip ? 500_000 : 13_000_000,
+        targetBitrate: dip ? 300_000 : 8_000_000,
+        width: full ? 1920 : 480, height: full ? 1080 : 270,
+        sourceWidth: full ? 1920 : 480, sourceHeight: full ? 1080 : 270};
+      if(guard.observe(now,s)) pulses.push(now);
+    }
+    expect(pulses.some(at=>at>630_000)).toBe(true);
+  });
+  it("updates the effective target after an observed window enlargement", async () => {
+    const settings = {width: 1280, height: 720, frameRate: 20};
+    const publisher = new ScreenPublisher({track: {getSettings:()=>({...settings}), applyConstraints:async()=>{}} as unknown as MediaStreamTrack,
+      preset: "game", iceServers:[], offer:async()=>"answer", state:()=>{}});
+    await publisher.start();
+    const pc=Peer.all[0]!;
+    pc.getStats.mockImplementation(async()=> {
+      const at=performance.now();
+      // Full 1080p is observed after window resize; a later Chromium adaptation stalls at 720p.
+      const large = at<=6000;
+      const width=large?1920:1280, height=large?1080:720;
+      settings.width=width; settings.height=height;
+      return new Map([
+        ["pair",{type:"candidate-pair",nominated:true,state:"succeeded",availableOutgoingBitrate:13_000_000,timestamp:performance.timeOrigin+at}],
+        ["source",{width,height,framesPerSecond:20}],
+        ["out",{type:"outbound-rtp",kind:"video",mediaSourceId:"source",timestamp:at,framesEncoded:1+at/50,bytesSent:at*10,frameWidth:width,frameHeight:height,framesPerSecond:20,targetBitrate:8_000_000,qualityLimitationReason:"bandwidth"}],
+      ]);
+    });
+    await vi.advanceTimersByTimeAsync(60_000);
+    publisher.close();
+    expect(pc.sendParams.some(p=>p.degradationPreference==="maintain-resolution")).toBe(true);
+  });
+  it("does not extend an applied pulse while its sender promise is pending", async () => {
+    const publisher = new ScreenPublisher({track:{getSettings:()=>({width:1920,height:1080,frameRate:20}),applyConstraints:async()=>{}} as unknown as MediaStreamTrack,
+      preset:"game",iceServers:[],offer:async()=>"answer",state:()=>{}});
+    await publisher.start();
+    const pc=Peer.all[0]!;
+    pc.getStats.mockImplementation(async()=>{
+      const at=performance.now();
+      return new Map([
+        ["pair",{type:"candidate-pair",nominated:true,state:"succeeded",availableOutgoingBitrate:5_000_000,timestamp:performance.timeOrigin+at}],
+        ["source",{width:480,height:270,framesPerSecond:20}],
+        ["out",{type:"outbound-rtp",kind:"video",mediaSourceId:"source",timestamp:at,framesEncoded:1+at/50,bytesSent:at*10,frameWidth:480,frameHeight:270,framesPerSecond:20,targetBitrate:3_500_000,qualityLimitationReason:"bandwidth"}],
+      ]);
+    });
+    let finish!:()=>void;
+    pc.transceivers[0]!.sender.setParameters.mockImplementation(async p=>{
+      pc.sendParams.push(p);
+      if(p.degradationPreference==="maintain-resolution") await new Promise<void>(resolve=>{finish=resolve;});
+    });
+    await vi.advanceTimersByTimeAsync(15_000);
+    const phase = (publisher as unknown as {phase:string|null}).phase;
+    finish(); await vi.advanceTimersByTimeAsync(0);
+    publisher.close();
+    expect(phase).toBe(null);
+  });
+});
+
+
+describe("round 2 missing-QP fallback feedback",()=> {
+  it("does not repeat actual publisher grow/shrink cycles that occur between stats polls",async()=> {
+    const publisher=new ScreenPublisher({track:{getSettings:()=>({width:1920,height:1080,frameRate:20}),applyConstraints:async()=>{}} as unknown as MediaStreamTrack,
+      preset:"game",iceServers:[],offer:async()=>"answer",state:()=>{}});
+    await publisher.start();
+    const pc=Peer.all[0]!;
+    let width=480,height=270,bytes=0,changedAt=0,pulses=0,changes=0,rate=100_000;
+    const accrue=()=>{const at=performance.now();bytes+=(at-changedAt)*rate/8000;changedAt=at;};
+    pc.transceivers[0]!.sender.setParameters.mockImplementation(async p=> {
+      accrue();pc.sendParams.push(p);
+      const grow=p.degradationPreference==="maintain-resolution";
+      const nextWidth=grow?1920:480;
+      if(nextWidth!==width)changes++;
+      if(grow)pulses++;
+      width=nextWidth;height=grow?1080:270;rate=grow?10_000_000:100_000;
+    });
+    pc.getStats.mockImplementation(async()=>{
+      accrue();const at=performance.now();
+      return new Map([
+        ["pair",{type:"candidate-pair",nominated:true,state:"succeeded",availableOutgoingBitrate:5_000_000,timestamp:performance.timeOrigin+at}],
+        ["source",{width,height,framesPerSecond:20}],
+        ["out",{type:"outbound-rtp",kind:"video",mediaSourceId:"source",timestamp:at,framesEncoded:1+at/50,bytesSent:bytes,frameWidth:width,frameHeight:height,framesPerSecond:20,targetBitrate:3_500_000,qualityLimitationReason:"bandwidth"}],
+      ]);
+    });
+    await vi.advanceTimersByTimeAsync(300_000);
+    publisher.close();expect(vi.getTimerCount()).toBe(0);
+    expect({pulses,changes}).toEqual({pulses:2,changes:4});
+  });
+});
+
+describe("bounded guard outcomes and rearming", () => {
+  const sample = (now: number, extra = {}) => ({ width: 480, height: 270, sourceWidth: 480, sourceHeight: 270,
+    captureWidth: 1920, captureHeight: 1080, targetWidth: 1920, targetHeight: 1080,
+    fps: 60, available: 13_000_000, targetBitrate: 8_000_000, bitrate: 100_000, limitation: "bandwidth",
+    framesEncoded: 1 + now * 0.06, ...extra });
+  const qp = (now: number, extra = {}) => ({ id: "out", encoder: "encoder", codec: "video/H264",
+    sum: (1 + now * 0.06) * 20, frames: 1 + now * 0.06, at: now, width: 480, height: 270, ...extra });
+  it.each(["id", "encoder", "codec", "retained", "impossible", "missing-identity"])("resets the QP evidence on %s", kind => {
+    const guard = new StuckCaptureGuard();
+    for (const now of [0, 2000, 4000]) expect(guard.observe(now, sample(now, { bitrate: 7_500_000, quality: qp(now) }))).toBe(false);
+    const change = kind === "id" ? { id: "replacement" } : kind === "encoder" ? { encoder: "replacement" } : kind === "codec" ? { codec: "video/VP9" }
+      : kind === "retained" ? { sum: qp(4000).sum } : kind === "missing-identity" ? { id: "" } : { sum: 1e9 };
+    expect(guard.observe(6000, sample(6000, { bitrate: 7_500_000, quality: qp(6000, change) }))).toBe(false);
+    for (const now of [8000, 10_000, 12_000]) expect(guard.observe(now, sample(now, { bitrate: 7_500_000, quality: qp(now) }))).toBe(false);
+  });
+  it.each(["cpu", "low", "gap"])("does not expire a two-attempt fuse on elapsed time alone: %s", kind => {
+    const guard = new StuckCaptureGuard(), pulses: number[] = [];
+    for (let now = 0; now <= 720_000; now += 2000) {
+      if (kind === "gap" && now > 50_000 && now < 710_000) continue;
+      const change = now > 50_000 && now < 710_000 ? kind === "cpu" ? { limitation: "cpu" } : { available: 1_000_000 } : {};
+      if (guard.observe(now, sample(now, change))) pulses.push(now);
+    }
+    expect(pulses).toEqual([6000, 28000]);
+    let rearmed = false;
+    for (let now = 722_000; now <= 760_000; now += 2000) rearmed ||= guard.observe(now, sample(now));
+    expect(rearmed).toBe(true);
+  });
+  it("requires ten seconds of advancing larger output after restore, and discards that outcome after success", () => {
+    const guard = new StuckCaptureGuard(), pulses: number[] = [];
+    for (let now = 0; now <= 80_000; now += 250) {
+      const full = now >= 6250 && now < 30_000;
+      if (guard.observe(now, sample(now, full ? { width: 1920, height: 1080, sourceWidth: 1920, sourceHeight: 1080 } : {}))) pulses.push(now);
+      if (now === 16_750) expect(guard.tracking).toBe(true);
+      if (now === 17_000) expect(guard.tracking).toBe(false);
+    }
+    expect(pulses[0]).toBe(6000);
+    expect(pulses[1]).toBeGreaterThan(30_000);
+  });
+  it("ignores duplicate polls when judging success, preserving two attempts for a later stall", () => {
+    const guard = new StuckCaptureGuard(), pulses: number[] = [];
+    for (let now = 0; now <= 90_000; now += 250) {
+      const full = now >= 6250 && now < 30_000;
+      const s = sample(now, full ? { width: 1920, height: 1080, sourceWidth: 1920, sourceHeight: 1080 } : {});
+      if (guard.observe(now, s)) pulses.push(now);
+      if (now % 2000 === 0 && guard.observe(now, s)) pulses.push(now);
+    }
+    expect(pulses).toEqual([6000, 36000, 76000]);
+  });
+
+  it.each(["retained", "missing"])("does not count %s large frames as a sustained recovery", kind => {
+    const guard = new StuckCaptureGuard();
+    for (let now = 0; now <= 50_000; now += 250) {
+      const pulse = now > 6000;
+      const s = sample(now, pulse ? { width: 1920, height: 1080, sourceWidth: 1920, sourceHeight: 1080, framesEncoded: 361 } : {});
+      const { framesEncoded, ...withoutFrames } = s;
+      void framesEncoded;
+      guard.observe(now, kind === "missing" && pulse ? withoutFrames : s);
+    }
+    expect((guard as unknown as { unsuccessful: number }).unsuccessful).toBe(1);
+  });
+});
+
+describe("live captured surface provenance", () => {
+  it.each(["grow", "shrink", "switch", "adaptation", "pulse"])("refreshes a %s without retaining stale surface/QP evidence", async kind => {
+    const settings = { width: kind === "grow" ? 1280 : 1920, height: kind === "grow" ? 720 : 1080, frameRate: 20, displaySurface: "window", deviceId: "one" };
+    const publisher = new ScreenPublisher({ track: { getSettings: () => ({ ...settings }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
+      preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!;
+    let width = settings.width, height = settings.height, limitation = "none";
+    pc.getStats.mockImplementation(async () => {
+      const at = performance.now();
+      return new Map([
+        ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", timestamp: performance.timeOrigin + at, availableOutgoingBitrate: 13_000_000 }],
+        ["source", { width, height, framesPerSecond: 20 }],
+        ["out", { id: "out", type: "outbound-rtp", kind: "video", mediaSourceId: "source", timestamp: at, bytesSent: at * 10,
+          framesEncoded: 1 + at / 50, frameWidth: width, frameHeight: height, qualityLimitationReason: limitation, targetBitrate: 8_000_000 }],
+      ]);
+    });
+    await vi.advanceTimersByTimeAsync(4000);
+    const internals = publisher as unknown as { captureSize: { width: number; height: number }; guard: StuckCaptureGuard; phase: string | null };
+    const previous = internals.guard;
+    if (kind === "grow") { width = settings.width = 1920; height = settings.height = 1080; }
+    else { width = settings.width = 1280; height = settings.height = 720; }
+    if (kind === "switch") settings.deviceId = "two";
+    if (kind === "adaptation") limitation = "bandwidth";
+    if (kind === "pulse") internals.phase = "pulse";
+    await vi.advanceTimersByTimeAsync(2000);
+    if (kind === "grow" || kind === "shrink") expect(internals.guard).toBe(previous); // needs two seconds of evidence
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(internals.captureSize.width).toBe(kind === "grow" || kind === "adaptation" || kind === "pulse" ? 1920 : 1280);
+    expect(internals.guard === previous).toBe(kind === "adaptation" || kind === "pulse");
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+
+describe("surface identity availability", () => {
+  it("learns a delayed media-source id without replacing the original surface ceiling", async () => {
+    const publisher = new ScreenPublisher({ track: { getSettings: () => ({ width: 1920, height: 1080, deviceId: "original" }), applyConstraints: async () => {} } as unknown as MediaStreamTrack,
+      preset: "game", iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const internals = publisher as unknown as { captureSize: { width: number }; guard: StuckCaptureGuard };
+    const guard = internals.guard, pc = Peer.all[0]!;
+    await vi.advanceTimersByTimeAsync(2000); // no mediaSourceId yet
+    pc.stats.set("source", { width: 480, height: 270 });
+    pc.stats.set("out", { type: "outbound-rtp", kind: "video", mediaSourceId: "source", frameWidth: 480, frameHeight: 270, qualityLimitationReason: "bandwidth" });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(internals.captureSize.width).toBe(1920);
+    expect(internals.guard).toBe(guard);
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
 });

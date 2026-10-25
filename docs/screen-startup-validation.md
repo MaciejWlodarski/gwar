@@ -1,213 +1,242 @@
 # Chromium startup adaptation validation
 
-25 October 2026. Main is pinned to `e8fb01e358ed6a5e6f855025c4417829ede379e1`
-(includes #166 and was verified as live main). The starting PR head was `70ce6168`.
-macOS arm64, Playwright full Chromium 153.0.8010.12. Real tab capture, local SFU and
-real browser viewer, with a fresh cold browser for every case; every server uses loopback and `--no-connect`. No VM or production
-service was used. Existing frozen dependencies and generated WASM packages were reused.
+25 October 2026. Local macOS arm64, full Playwright Chromium 153.0.8010.12,
+WebKit, local SFU and real browser viewers. Main is pinned to
+`e8fb01e358ed6a5e6f855025c4417829ede379e1`; the previous candidate is
+`b331b2387b8f79369409049e9137ccfde628b269`. All services use loopback;
+the screen servers run with `--no-connect`. No VM or production service is used.
 
-## Design and review findings
+## Guard and round 2 fixes
 
-**Guard only.** The two-second startup hold and the trial congestion fallback are removed,
-along with the persistent sender size bound, nominal-demand controller and repricing state.
-The hold with a bounded early exit still failed the shaped-link timing limits below, so this
-uses the owner's explicit guard-only fallback. Sparse recovery therefore takes a pulse;
-it does **not** satisfy the original ≤2 s hold target.
+Game starts with `maintain-framerate`. Six seconds of undersized output and healthy
+capacity can issue a one-second `maintain-resolution` pulse. There is no startup
+hold, sender size bound, or resolution repricing. Capture constraints, bitrate ceiling,
+low priority, 70% voice-headroom rule, CPU exclusions, and 20/40/80/120 second
+retry backoff are retained. The guard uses the resolved preset and codec-recovery
+limits, with at least 0.04 bits/pixel/frame and a 50% spare-capacity margin.
 
-The remaining guard requires six seconds of continuous undersize with a healthy estimate,
-encoder target and pixel budget. An additional bounded escape accepts sustained low encoder
-QP when an already undersized encoder spends most of its target on excess precision. It never starts a pulse on CPU limitation or a
-low estimate. A pulse lasts one second and preserves voice headroom and low priority. The measured-budget
-path retains its 20, 40, 80, then at most 120 second retry backoff until a QP escape spends
-the one-shot fuse. Preset changes, codec replacement and close cancel
-its timer and fence queued sender transactions. The guard's QP escape is one-shot per preset/encoder and fuses **all** subsequent guard paths,
-including the measured-budget path if a fast shrink happened between polls. If an observed recovery grows and then
-shrinks under bandwidth pressure, the guard suppresses all further pulses for that publisher
-until a preset/codec replacement resets it. This prevents pulse/shrink feedback even when the
-brief growth occurred between polls. The guard's target size and cadence come
-from the resolved spec plus effective recovery limits; its budget cannot exceed the spec cap.
-Eligibility follows the spec's `maintain-framerate` preference rather than a Game name check.
+The QP escape uses its existing six-second delta window together with continuous
+healthy larger-step capacity; it does not start an additional six-second wait when
+the first low-QP delta becomes available. This removes the redundant delay exposed
+by the VP9 busy acceptance comparison without reducing either evidence window.
 
-Both P2 findings are removed at their source: there is no persistent resolution pricing to
-oscillate, and no startup scale to compound Chromium's capture downscale or #166 recovery.
-`scaleResolutionDownBy` is used only for #166's existing recovery ceiling, derived from current
-track settings. There is no congestion size bound, release timer, or reapplication loop.
+1. **QP validity.** Both `qpSum` and `framesEncoded` must advance. The delta ratio
+   must be positive and no greater than 51 for H.264 or 255 for VP9.
+   Outbound id, encoder implementation, codec, and dimensions must match; missing
+   identity/QP, counter resets, non-advancing counters, or gaps over 4.5 s reset
+   the window. Low QP must persist for six seconds and at least 60 frames: H.264
+   ≤24 or VP9 ≤96. Missing QP never enables the QP escape.
+2. **Outcome fuse.** Every attempt gets the same outcome window, independent of
+   whether it used QP. Sampling temporarily increases to 250 ms across the pulse,
+   restore, and outcome window. Larger output must have advancing encoded frames
+   and persist for ten seconds after restore. Duplicate reads of the same frame
+   are tolerated while progress remains fresh within one second; missing, frozen
+   or regressed counters cannot establish recovery. An attempt without that gain within
+   sixteen seconds is unsuccessful. After two unsuccessful attempts, all pulses
+   are suppressed. QP itself remains a one-shot escape until expiry. Faster sampling
+   stops after sixteen seconds even if stats fail or hang.
+3. **Expiry.** Suppression expires after ten minutes from the relevant attempt/failure
+   and at least thirty continuous seconds with enough estimate/encoder-target budget
+   for the effective target, without CPU limitation. Time alone, a polling gap, low
+   capacity, or CPU limitation cannot rearm it. A successful outcome discards its old
+   size reference and unsuccessful count; a later transient dip cannot compare
+   against an immortal remembered peak.
+4. **Surface provenance.** Live track settings and media-source dimensions refresh
+   the captured size after two seconds of stable enlargement outside a pulse/outcome
+   window. Device/display-surface/media-source identity changes immediately reset
+   the guard and QP history. A smaller source resets them after two seconds when it
+   is at least as large as encoded output and the encoder reports no adaptation
+   pressure. Chromium can shrink both capture settings and source stats under
+   bandwidth/CPU pressure; equal smaller source/output dimensions in that condition
+   are ambiguous and retain the known surface target. This conservative rule avoids
+   misclassifying Chromium's own downscale as a user resize. Browsers that expose no
+   identity change and report a real resize with bandwidth pressure cannot distinguish
+   that resize from capture adaptation using these stats alone.
+5. **Independent deadline.** The one-second deadline is armed when the transaction
+   is issued. It expires the phase even with a pending sender promise. Parameter
+   writes remain serialized and read current phase/preset state, so delayed
+   completions cannot enqueue a stale pulse or restore stale preset settings.
 
-## QP window and source evidence
+The supplied round 2 reviewer regressions are retained in `screen.test.ts`; the
+missing-QP case now expects the owner's selected bound of two attempts/four size
+changes rather than the review's original one-attempt assertion. Added cases cover
+QP identity/plausibility, expiry after CPU/congestion/gaps, advancing frames,
+success followed by a new stall, window enlargement/shrink/switch, pulse provenance, transport replacement, and Game → Saver → Game without
+erasing the proven physical surface.
+The obsolete startup-bypass control has been removed.
 
-QP is computed from `qpSum` / `framesEncoded` **deltas**, never from a lifetime average.
-Each consecutive interval must be low for at least six seconds, with at least 60 encoded frames. Codec switches, output-size
-changes, non-advancing/reset counters, invalid values and gaps over 4.5 s reset the window.
+The codec-specific thresholds are retained from `b331b238`. Neither threshold
+bypasses capacity, cadence, source-size, or CPU checks.
 
-- H.264: interval QP ≤24 on its 0–51 scale, matching WebRTC OpenH264's low-QP upscale
-  threshold in [H264EncoderImpl](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/video_coding/codecs/h264/h264_encoder_impl.cc#76).
-- VP9: interval bitstream QP ≤96 on its 0–255 scale. This is deliberately stricter than
-  current libvpx's low-QP upscale threshold of 149 in
-  [LibvpxVp9Encoder](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/video_coding/codecs/vp9/libvpx_vp9_encoder.cc#107),
-  requiring substantial quality surplus before discounting measured bits per pixel.
+## Method
 
-The QP path requires encoded area below half the effective target and a larger captured
-surface. Only measured positive source dimensions qualify; preset defaults cannot supply
-this evidence. The surface ceiling is measured from the track **before encoder adaptation starts**;
-Chromium's live track/media-source dimensions also shrink in this capture stall, so those
-live dimensions alone cannot prove the surface's original size. Naturally small captures
-and #166 recovery targets remain bounded by that actual surface and the resolved spec.
+Each startup case has three fresh cold-browser runs per arm in the final comparison.
+The initial matrix used interleaved serial main/candidate pairs, reversing arm order
+in repetition two. It exposed a VP9 busy median of 12.57 s versus main 8.65 s,
+failing the +2 s criterion. After correcting the redundant QP delay, every candidate case was repeated.
+That block passed VP9 timing but exposed a 12.62 s H.264 busy median versus the
+historical `b331b238` median of 10.61 s. The QP capacity window was then aligned
+with the existing larger-step budget; full-target capacity remains required for
+rearm. Every candidate case was repeated again against the same pinned, unchanged
+main references. The complete preceding matrices are retained in
+`before-qp-timing/` and `before-step-budget/`; none of their candidate runs count
+as final passes. A later regression exposed duplicate regular/fast samples resetting
+the successful-gain clock. After fixing frame-progress sampling and centralizing all
+surface evidence in the live observation path, the complete candidate matrix and
+checks were repeated again on one frozen source. The preceding complete matrix and
+controls are retained in `before-outcome-progress/`. Sparse runs last
+30 s, unconstrained busy runs 60 s, and shaped runs 40 s. The source, caps, shaper,
+durations, and measurements match the `b331b238` validation. Tables give median
+[minimum–maximum] seconds. Sampling is about 0.5 s, so sub-sample differences should
+be interpreted at that precision. A failure to reach the target is censored, not
+replaced with an invented ramp time. All arms and failures are retained.
 
-The chosen candidate-pair estimate must have a timestamp no more than 4.5 s old.
-Its age uses `performance.timeOrigin + performance.now()`, the
-[RTCStats clock domain](https://www.w3.org/TR/webrtc-stats/#basic-concepts), so wall-clock
-corrections do not falsely age a fresh estimate. A clock-adjustment regression covers this. CPU limitation,
-a low/stale/missing estimate, or an encoder target below the nominal larger-frame budget blocks
-both paths. QP never bypasses the 0.04 bits/pixel/frame floor, actual source cadence, 50% spare
-margin or voice headroom. No minimum bitrate or higher cap is introduced.
+- Sparse recovery: source, encoder, and viewer remain 1920×1080 through the end,
+  for at least five seconds.
+- Busy steady: the same dimensions plus encoded cadence ≥51 fps.
+- Continuous ≥51 fps: every subsequent encoded-cadence sample is ≥51 fps.
+- Stable dimensions: encoded dimensions match the final dimensions through the end,
+  measured separately from cadence.
 
-## Method and timing definitions
+The sparse barcode draws 20 distinct frames/s; the busy source redraws large moving
+blocks and real capture is capped at 60 fps. CDP
+`Network.emulateNetworkConditionsByRule` uses an empty URL pattern to include
+WebRTC, 20 ms latency, and a 50-packet queue. Payload and GCC estimates must prove
+that the uplink is actually shaped. Settled checks cover source cadence, negotiated
+codec, encoded dimensions/fps, and viewer decode.
 
-Each case has **three fresh cold-browser runs per arm**. Main was collected in serial main/candidate pairs, reversed for repetition 2. After the final
-one-shot fuse was added, all candidate cases were repeated three times in a separate serial
-block against those pinned, unchanged main references. The hold trial is retained separately. Every raw run, including expected
-main sparse failures, is retained. Cells show **median [minimum–maximum]**, in seconds unless
-specified. Sampling is about 0.5 seconds using monotonic elapsed time, so differences below one sample should be read with
-that precision. Sparse publishes last 30 s, busy unconstrained publishes 60 s, and shaped
-publishes 40 s. Assertions cover actual source cadence, negotiated codec, encoder output and
-viewer decode in the final ten seconds.
+The fixed #166 1080p60 H.264 gate runs ten times on pinned main and ten times
+on the frozen final candidate. Main was initially paired with preliminary candidates;
+the final candidate is repeated in a separate serial block after code freeze. All
+preliminary runs are retained separately, without selecting by outcome. These counts
+attribute the symptom, rather than establish a causal difference in flake rate. The
+baseline is a fresh archive of pinned main. Rust
+source/lockfiles match main, so both arms use the same local binary. The normal
+screen test and smoke run separately. `caffeinate -di` prevents system sleep;
+startup timing rejects wall/monotonic divergence over two seconds.
 
-- Sparse recovery: first sample from which source, encoder and viewer all remain 1920×1080
-  through the end, for at least five seconds.
-- Busy steady output: first sample from which all three remain 1920×1080 and encoded cadence
-  remains ≥51 fps through the end, for at least five seconds.
-- Continuous ≥51 fps: first sample after which every encoded-cadence sample is ≥51 fps.
-- Stable dimensions: first sample after which encoded dimensions equal the final dimensions
-  through the end, independently of cadence. This is recorded separately in the harness.
+An interim H.264 busy block was slower than the historical b331 median, so
+three fresh b331/candidate pairs are also run for that case, alternating order.
+Both the historical comparison and this direct revision comparison are reported;
+the extra candidate runs do not replace any startup-matrix run.
 
-The sparse barcode draws 20 distinct frames/s; the busy source redraws large moving blocks
-at about 62.5 draws/s and real capture is capped at 60 fps. The content and bitrate cap are
-unchanged from the starting PR. Shaping uses CDP `Network.emulateNetworkConditionsByRule`
-with an empty URL pattern (including WebRTC), 20 ms latency and a 50-packet queue. Active
-payload and GCC estimates must demonstrate that the WebRTC uplink was actually shaped.
+## Startup results
 
-## Unconstrained main versus guard only
-
-| Case / metric | Main | Guard only | Guard encoded fps | Guard pulses |
+| Case / metric | Main | Candidate | Candidate encoded fps | Candidate pulses |
 | --- | --- | --- | --- | --- |
-| VP9 sparse 20: sustained 1080p | not reached by 30 s [>30] (0/3 reached) | 12.66 [10.72–12.76] | 20.0 [20.0–20.0] | 1 [1–1] |
-| H.264 sparse 20: sustained 1080p | not reached by 30 s [>30] (0/3 reached) | 10.74 [10.62–12.59] | 20.0 [20.0–20.0] | 1 [1–1] |
-| VP9 busy 60: steady 1080p ≥51 fps | not reached by 60 s [>60] (0/3 reached) | 12.55 [8.58–12.61] | 60.0 [60.0–60.0] | 1 [0–1] |
-| H.264 busy 60: steady 1080p ≥51 fps | 20.72 [20.72–>60] (2/3 reached) | 10.61 [10.60–12.64] | 60.0 [60.0–60.0] | 1 [1–1] |
+| VP9 sparse: sustained 1080p | not reached (0/3 reached) | 10.51 [8.58–10.60] | 20.00 [20.00–20.00] | 1.00 [1.00–1.00] |
+| H.264 sparse: sustained 1080p | not reached (0/3 reached) | 10.56 [8.67–10.59] | 20.00 [20.00–20.00] | 1.00 [1.00–1.00] |
+| VP9 busy: steady 1080p ≥51 fps | 8.65 [8.60–censored] (2/3 reached) | 8.64 [8.56–10.49] | 60.00 [60.00–60.00] | 0.00 [0.00–1.00] |
+| H.264 busy: steady 1080p ≥51 fps | 22.77 [20.78–censored] (2/3 reached) | 10.60 [10.51–16.67] | 60.00 [60.00–60.00] | 1.00 [1.00–1.00] |
 
 ## Shaped H.264 busy 60
 
-| Uplink | Main continuous ≥51 fps | Guard continuous ≥51 fps | Main stable dimensions | Guard stable dimensions |
+| Uplink | Main continuous ≥51 fps | Candidate continuous ≥51 fps | Main stable dimensions | Candidate stable dimensions |
 | --- | --- | --- | --- | --- |
-| 1.5 Mb/s | 2.02 [2.01–2.13] | 2.09 [2.01–2.09] | 2.52 [2.52–2.64] | 2.60 [2.52–2.60] |
-| 3 Mb/s | 2.02 [2.01–2.03] | 2.09 [2.01–2.11] | 0.50 [0.48–0.51] | 0.57 [0.49–0.59] |
+| 1.5 Mb/s | 2.03 [2.01–2.10] | 2.07 [2.02–2.09] | 2.54 [2.52–2.61] | 2.58 [2.53–2.60] |
+| 3 Mb/s | 2.01 [1.50–2.07] | 2.00 [2.00–2.10] | 0.49 [0.49–0.55] | 0.48 [0.47–0.58] |
 
-| Uplink / arm | Final encoded size | Encoded / decoded fps | Payload Mb/s | Estimate Mb/s | Pulses |
+| Uplink / arm | Final dimensions | Encode / decode fps | Payload Mb/s | Estimate Mb/s | Pulses |
 | --- | --- | --- | --- | --- | --- |
-| 1.5 Mb/s / main | 480×270 (3/3) | 60.0 [60.0–60.0] / 59.9 [59.9–60.2] | 1.129 [0.904–1.194] | 1.755 [1.421–1.838] | 0 [0–0] |
-| 1.5 Mb/s / guard | 480×270 (3/3) | 60.0 [60.0–60.0] / 60.0 [60.0–60.1] | 1.003 [0.976–1.062] | 1.544 [1.493–1.649] | 0 [0–0] |
-| 3 Mb/s / main | 640×360 (3/3) | 60.0 [60.0–60.0] / 60.0 [60.0–60.0] | 2.214 [1.984–2.299] | 3.394 [3.017–3.463] | 0 [0–0] |
-| 3 Mb/s / guard | 640×360 (3/3) | 60.0 [60.0–60.0] / 60.0 [60.0–60.1] | 2.132 [1.995–2.264] | 3.211 [3.074–3.425] | 0 [0–0] |
+| 1.5 / main | 480x270, 480x270, 480x270 | 60.00 [60.00–60.00] / 60.00 [60.00–60.10] | 1.16 [1.06–1.22] | 1.77 [1.61–1.88] | 0.00 [0.00–0.00] |
+| 1.5 / guard | 480x270, 480x270, 480x270 | 60.00 [60.00–60.00] / 60.10 [60.10–60.10] | 1.05 [0.99–1.16] | 1.63 [1.52–1.79] | 0.00 [0.00–0.00] |
+| 3 / main | 640x360, 640x360, 640x360 | 60.00 [60.00–60.00] / 60.10 [60.00–60.60] | 2.01 [1.96–2.20] | 2.96 [2.67–3.32] | 0.00 [0.00–0.00] |
+| 3 / guard | 640x360, 640x360, 640x360 | 60.00 [60.00–60.00] / 60.00 [60.00–60.10] | 2.10 [1.93–2.33] | 3.18 [2.91–3.50] | 0.00 [0.00–0.00] |
 
-All shaped viewers decode the final encoded size within the existing two-pixel H.264 crop
-tolerance. These cadence and dimensions measurements are separate; stable dimensions no
-longer hide a long-running resolution controller.
+## Recovery versus b331b238
 
-## Rejected hold with bounded fallback
+- vp9-barcode20: historical b331 median 12.66 s; primary candidate median 10.51 s.
+- vp9-busy60: historical b331 median 12.55 s; primary candidate median 8.64 s.
+- h264-barcode20: historical b331 median 10.74 s; primary candidate median 10.56 s.
+- h264-busy60: historical b331 median 10.61 s; primary candidate median 10.60 s.
 
-The trial retained the cancel-safe two-second hold but ended it once after 500 ms of encoded
-cadence below 75% of the actual source and an available video budget below half the resolved
-spec cap. Counter deltas avoided waiting for Chromium's delayed `framesPerSecond` statistic.
-It handed control back to `maintain-framerate`, with no sender scaling or later reapplication.
-An independent deadline restored the preference even if later stats failed or hung.
+The primary matrix is retained in full, including its ranges. To attribute the
+H.264 variation, a fresh independently built archive of exact
+`b331b2387b8f79369409049e9137ccfde628b269` is compared in three serial pairs
+against the frozen final source, reversing order for pair two. Harness, source,
+60-second duration and local binary are identical. The extra candidate runs do not
+replace any primary matrix run. This compares the revisions directly rather than
+treating an older three-run timing as a constant.
 
-| Uplink | Main continuous ≥51 fps | Hold + early exit | Main stable dimensions | Hold + early exit stable dimensions |
-| --- | --- | --- | --- | --- |
-| 1.5 Mb/s | 2.09 [2.09–2.15] | 14.21 [14.17–14.21] | 2.60 [2.59–2.66] | 13.20 [13.16–13.20] |
-| 3 Mb/s | 2.11 [2.00–2.11] | 5.13 [4.60–5.13] | 0.59 [0.48–0.59] | 8.66 [8.64–8.66] |
-
-The hold trial fails the +1 s cadence and +3 s stable-dimension limits at both rates. Its larger
-final resolutions (640×360 at 1.5 Mb/s; 960×540 at 3 Mb/s) do not compensate for those delays.
-No guard pulse occurred in any shaped trial. All trial timelines remain available; they are
-not counted as final-candidate passes.
-
-## Acceptance deltas and checks
-
-The following compare final-candidate and pinned-main median times. A main failure at 60 s is censored, not substituted with a ramp time:
-
-| Metric | Difference of medians, seconds | Allowed |
+| H.264 busy pair | b331b238 steady 1080p60 | Candidate steady 1080p60 |
 | --- | --- | --- |
-| Unconstrained VP9 steady | < -47.45 (main censored) | +2 s |
-| Unconstrained H.264 steady | -10.12 | +2 s |
-| 1.5 Mb/s continuous ≥51 fps | +0.07 | +1 s |
-| 3 Mb/s continuous ≥51 fps | +0.07 | +1 s |
-| 1.5 Mb/s stable dimensions | +0.07 | +3 s |
-| 3 Mb/s stable dimensions | +0.07 | +3 s |
+| 1 | 16.71 s | 10.51 s |
+| 2 | 12.71 s | 8.48 s |
+| 3 | 12.69 s | 36.81 s |
+| Median | 12.71 s | 10.51 s |
 
-Final required checks passed on the final source. The first fixed-canvas run timed out waiting
-for WebKit to report the replacement VP9 codec while Chromium decoded that stream. The
-unchanged final gate then passed all 35 checks; pinned main also passed all 35 checks through
-the exact Node entrypoint. The initial failure is retained and its cause is not established.
-The first main comparison stopped before tests because pnpm refused the isolated dependency
-symlink; direct script execution resolved that setup issue without changing assertions.
+The candidate control range is 8.48–36.81 s; the b331 range is 12.69–16.71 s. The slow candidate control first reached native dimensions at 8.55 s, then Chromium reduced resolution under bandwidth pressure and returned to sustained native output at 36.81 s. It had 1 app pulse(s). This larger H.264 tail is retained. The acceptance comparisons use the same three-repeat median method as the earlier validation; these data do not establish uniform per-run improvement.
 
-All command outcomes, including those failures and retests:
+The fresh matched revision comparison passes. `acceptance.json` retains both the
+historical delta and the selected fresh reference, with its method stated explicitly.
+All six main timing comparisons also pass, and all six shaped candidate publishes
+have zero pulses. No acceptance threshold, codec/QP threshold, or fixed-gate
+assertion was weakened.
 
-- `matrix`: exit 0; 1685.4 s; log `/tmp/gwar-pr168-r2-evidence/matrix.log`.
-- `typecheck`: exit 0; 3.0 s; log `/tmp/gwar-pr168-r2-evidence/typecheck.log`.
-- `lint`: exit 0; 4.8 s; log `/tmp/gwar-pr168-r2-evidence/lint.log`.
-- `web-tests`: exit 0; 59.5 s; log `/tmp/gwar-pr168-r2-evidence/web-tests.log`.
-- `screen`: exit 0; 54.4 s; log `/tmp/gwar-pr168-r2-evidence/screen.log`.
-- `screen-fixed`: exit 1; 85.9 s; log `/tmp/gwar-pr168-r2-evidence/screen-fixed.log`.
-- `smoke`: exit 0; 114.8 s; log `/tmp/gwar-pr168-r2-evidence/smoke.log`.
-- `screen-fixed-main`: exit 1; 0.1 s; log `/tmp/gwar-pr168-r2-evidence/screen-fixed-main.log`.
-- `screen-fixed-final`: exit 0; 68.4 s; log `/tmp/gwar-pr168-r2-evidence/screen-fixed-final.log`.
-- `startup-final-candidate`: exit 0; 843.8 s; log `/tmp/gwar-pr168-r2-evidence/final-candidate.log`.
-- `screen-fixed-main-direct`: exit 0; 68.0 s; log `/tmp/gwar-pr168-r2-evidence/screen-fixed-main-direct.log`.
+## Fixed-gate attribution
 
-The reviewer's `/tmp/gwar-pr168-review-g8rya_sc/review.test.ts` scenarios were reused and
-changed from bug reproduction to regression assertions. The per-pixel demand model feeds
-sampled output into the next sample for three simulated minutes without resolution reversals.
-A successful guard pulse updates subsequent capture/output dimensions for five simulated
-minutes and never triggers another pulse. Additional tests cover codec-specific QP windows, stale estimates, visible and between-poll pressure-driven shrink cycles, CPU/congestion exclusions,
-rate limiting, pending stats and sender operations, close/preset/recovery cancellation,
-1440×810 capture adaptation, actual 720p30 recovery, and retargeting the resolved preset spec.
-The earlier hold/fallback feedback and independent-deadline tests passed before that trial
-was removed. The final implementation has neither hold nor fallback state to oscillate.
+| Source | Failures / runs |
+| --- | --- |
+| Pinned main e8fb01e3 | 2/10 |
+| Final candidate | 3/10 |
 
-The required #166 fixed 1080p60 H.264 gate is unchanged. `browser-screen-startup` retains
-`continue-on-error: true` and remains excluded from `ci-ok`; no required job is weakened.
-Rust source is unchanged. All 1,393 web tests in 116 files passed, including 82 focused screen tests. Lint had four
-pre-existing warnings and zero errors. Local server/Connect binaries were built offline with four jobs and
-`CARGO_TARGET_DIR=/tmp/gwar-pr168-r2-target`; that temporary target directory is deleted after
-validation.
+Every counted failure is the same timeout waiting for WebKit's replacement VP9
+flow. The dump shows WebKit's original watch already removed, while Chromium
+continues decoding the publisher's replacement VP9 stream at 1280×720. Main
+reproduces the symptom, so it predates this PR. The exact triggering sequence is
+not established. The server's two-second reporter-isolation window is a possible
+mechanism, not a proven cause. The #166 product logic, test assertions and timeouts
+are unchanged. No harness fix was needed to attribute it.
 
-## Reproduction and evidence
+Main's ten runs initially alternated with preliminary candidates. The counted final
+candidate runs are the ten on the frozen final source; earlier runs are
+retained separately, including failures. The blocks establish reproduction on main;
+their rates are not a causal estimate of a revision-specific flake increase.
+
+## Final validation and source binding
+
+- Web typecheck: passed.
+- ESLint: zero errors, the same four pre-existing warnings.
+- Web tests: 1,424 passed across 116 files; 113 focused screen tests.
+- Normal Chromium/WebKit screen e2e: passed on the final source.
+- Smoke: 66/66 passed on the final source.
+- Required fixed 1080p60 gate: executed ten times per counted arm, with the
+  pre-existing failure counts above.
+
+The first normal-screen attempt had the same pre-existing timeout; its unchanged
+retry and subsequent final-source runs passed. All attempts remain in `runtime.json`.
+Earlier typecheck/test logs are also retained rather than overwritten.
+
+All final candidate matrix runs, the repeated b331/current revision comparison,
+web checks, normal screen e2e, smoke and counted fixed runs use one frozen final
+implementation. The final complete rerun followed the duplicate-frame outcome
+correction and centralized preset provenance. Source hashes and the freeze time
+are in `experiment.json`; every source file is checked again at the end of the
+runner. Earlier method-only equivalence evidence is historical and superseded by
+this full revalidation.
+
+The Ubuntu startup job remains diagnostic/non-required and excluded from `ci-ok`.
+The required #166 gate is unchanged. Rust source and lockfiles match pinned main;
+server/Connect binaries were built offline with four jobs into
+`CARGO_TARGET_DIR=/tmp/gwar-pr168-r3-target`. All task-owned build/snapshot/bundle
+directories are removed after validation; evidence and reproduction scripts remain.
+
+## Reproduction and retained artifacts
 
 ```sh
-# Build each arm independently in e2e mode, selecting main's pinned source or the PR patch.
+CARGO_TARGET_DIR=/tmp/gwar-screen-target CARGO_BUILD_JOBS=4 cargo build -j 4 -p gwar-server -p gwar-connect --locked --offline
 NODE_ENV=development pnpm --filter web exec vite build --mode e2e --outDir /tmp/startup-dist
-
-# Three repeats of both codecs and both unconstrained sources.
-GWAR_SERVER_BIN=/path/to/gwar-server E2E_STARTUP_DIST=/tmp/startup-dist E2E_STARTUP_REPEATS=3 E2E_STARTUP_RESULTS=/tmp/startup-unconstrained pnpm --filter web e2e:screen-startup
-
-# Repeat for E2E_STARTUP_UPLINK=3000000 as well.
-GWAR_SERVER_BIN=/path/to/gwar-server E2E_STARTUP_DIST=/tmp/startup-dist E2E_STARTUP_REPEATS=3 E2E_STARTUP_CODECS=h264 E2E_STARTUP_SOURCES=busy60 E2E_STARTUP_SECONDS=40 E2E_STARTUP_UPLINK=1500000 E2E_STARTUP_RESULTS=/tmp/startup-shaped pnpm --filter web e2e:screen-startup
+GWAR_SERVER_BIN=/tmp/gwar-screen-target/debug/gwar-server E2E_STARTUP_DIST=/tmp/startup-dist E2E_STARTUP_REPEATS=3 E2E_STARTUP_RESULTS=/tmp/startup-unconstrained pnpm --filter web e2e:screen-startup
+GWAR_SERVER_BIN=/tmp/gwar-screen-target/debug/gwar-server E2E_STARTUP_DIST=/tmp/startup-dist E2E_STARTUP_REPEATS=3 E2E_STARTUP_CODECS=h264 E2E_STARTUP_SOURCES=busy60 E2E_STARTUP_SECONDS=40 E2E_STARTUP_UPLINK=1500000 E2E_STARTUP_RESULTS=/tmp/startup-shaped pnpm --filter web e2e:screen-startup
+# Repeat the shaped command with E2E_STARTUP_UPLINK=3000000.
+GWAR_SERVER_BIN=/tmp/gwar-screen-target/debug/gwar-server E2E_SCREEN_CANVAS=1 E2E_SCREEN_REQUIRE_H264=1 pnpm --filter web e2e:screen
 ```
 
-The initial matched serial runner is `/tmp/gwar-pr168-r2-run.py`; final fused-candidate
-repetitions are `/tmp/gwar-pr168-r2-final-candidate.py`. Check orchestration is retained in
-`/tmp/gwar-pr168-r2-final-validation.py` and `/tmp/gwar-pr168-r2-postchecks.py`. `interrupted/` retains a collection affected by wall/monotonic jumps exceeding 900 s,
-launch failures and a sparse VP9 run with no viewer stats (publisher reached 1080p; viewer
-failure cause unconfirmed). It is excluded in full, not filtered by outcome. The final matrix
-uses scoped `caffeinate -di` and rejects >2 s wall/monotonic divergence; no global power setting
-is changed. Both publisher and viewer diagnostics are logged on failure.
-
-Raw JSONL, per-run summaries, command logs,
-source hashes and derived metrics are retained in `/tmp/gwar-pr168-r2-evidence`.
-`experiment.json` pins the tested source bytes; `metrics.json` retains every timing value
-rather than only aggregate cells. `before-qp-fuse/` retains the complete pre-fuse candidate matrix. The added cheap-payload feedback case exposed a retry through the measured-budget path after a QP escape; all final candidate cases were rerun after fusing that path. `qp-pilot/` retains early live QP probes before the final known-source/window safeguards; these are excluded from the final aggregates. `unrefined/` retains the interrupted first guard-only matrix, including both codecs' 60 s
-busy stalls on main and the original guard, plus sparse one-pulse recovery. This exposed
-why the owner authorized the QP refinement. These preliminary runs are not counted as
-final-candidate passes. The earlier PR's evidence remains in
-`/tmp/gwar-startup-evidence` and is not mixed into these fresh aggregates.
+Raw JSONL, per-run summaries, logs, source hashes, exact commands and derived metrics
+are retained in `/tmp/gwar-pr168-r3-evidence`. `experiment.json` binds the revisions
+and source bytes. `metrics.json`, `acceptance.json`, `b331-reference.json` and
+`flake-counts.json` retain the numbers behind these tables. The complete preceding
+matrices are in `before-qp-timing/`, `before-step-budget/` and
+`before-outcome-progress/`; the fresh direct revision
+comparison is in `b331-matched-h264/`. Older evidence in
+`/tmp/gwar-pr168-r2-evidence` and `/tmp/gwar-startup-evidence` is preserved separately.

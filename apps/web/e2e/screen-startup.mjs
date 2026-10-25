@@ -6,7 +6,6 @@
  * E2E_STARTUP_CODECS=vp9,h264 (default), E2E_STARTUP_REPEATS=2, E2E_STARTUP_SECONDS=60.
  * E2E_STARTUP_UPLINK=1500000 or 3000000 enables CDP's global p2p shaper and records tradeoffs
  * instead of requiring 1080p. All services and requests are local; no Connect/production.
- * E2E_STARTUP_STALL_CONTROL=1 bypasses only startup protection to exercise the real guard.
  * E2E_STARTUP_PRESET=text|smooth|saver checks the other presets (default game).
  * E2E_STARTUP_DIST may select an independently built main bundle for before/after evidence.
  */
@@ -244,18 +243,6 @@ try {
             return original.call(this, codecs.filter(c => ["video/rtx", `video/${codec}`].includes(c.mimeType.toLowerCase())));
           };
         }, codec);
-        if (process.env.E2E_STARTUP_STALL_CONTROL === "1") await sharer.evaluate(() => {
-          const original = RTCRtpSender.prototype.setParameters;
-          let began = null;
-          RTCRtpSender.prototype.setParameters = function(parameters) {
-            // Fault injection: reproduce unprotected encoder startup; subsequent pulses are real.
-            if (this.track?.kind === "video") {
-              began ??= performance.now();
-              if (performance.now() - began < 4000) parameters.degradationPreference = "maintain-framerate";
-            }
-            return original.call(this, parameters);
-          };
-        });
         if (uplink) {
           const cdp = await sharer.context_.newCDPSession(sharer);
           // Empty URL pattern explicitly includes WebRTC/p2p, unlike HTTP-only route throttling.
@@ -317,7 +304,6 @@ try {
           const firstFiveFps = median(rows.filter(r => r.elapsed <= 5 && r.out?.framesPerSecond !== undefined).map(r => r.out.framesPerSecond));
           const result = { name, preset, uplink, sourceFps: +cadence.toFixed(1), captureFps: median(settled.map(r => r.source?.framesPerSecond ?? 0)), output: `${last.out.frameWidth}x${last.out.frameHeight}`, source: `${last.source?.width}x${last.source?.height}`, viewer: `${last.viewer?.width}x${last.viewer?.height}`, fps: median(settled.map(r => r.out.framesPerSecond)), decodeFps: +decodeFps.toFixed(1), payloadMbps: +(payload / 1e6).toFixed(3), availableMbps: +(median(settled.map(r => r.pair.availableOutgoingBitrate)) / 1e6).toFixed(3), stableAt: stable?.elapsed ?? null, stableDimensionsAt: stableDimensions?.elapsed ?? null, firstTargetAt: firstTarget?.elapsed ?? null, steadyFpsAt: steadyFps?.elapsed ?? null, firstFiveFps, pulses: rows.filter((r,i) => r.elapsed > 4 && r.params.degradationPreference === "maintain-resolution" && rows[i-1]?.params.degradationPreference === "maintain-framerate").length };
           results.push(result); console.log(JSON.stringify(result));
-          if (process.env.E2E_STARTUP_STALL_CONTROL === "1") assert.ok(result.pulses >= 1, "guard control must observe a real recovery pulse");
           if (!uplink) {
             assert.ok(result.captureFps >= expectedFps * 0.85 && result.captureFps <= expectedFps * 1.12, `captured source cadence ${result.captureFps}`);
             assert.ok(result.fps >= expectedFps * 0.85, `encoded cadence ${result.fps}`);
