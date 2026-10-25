@@ -343,6 +343,53 @@ Smooth for screens; Chromium's `displaySurface` setting tells which.
 | Game | 1080p | 60 | `motion` | `maintain-framerate` | 8 Mbps |
 | Saver | 720p | 30 | `detail` | `balanced` | 1.5 Mbps |
 
+Game protects Chromium's encoder startup with `maintain-resolution` until two
+seconds after the first encoded frame, then restores `maintain-framerate` with
+fresh sender parameters. This avoids the 300 kb/s startup estimate shrinking a
+real-tab capture into an outstanding resolution adaptation. Publisher replacement
+(including codec recovery) repeats the phase; preset changes and close cancel it.
+The capture constraints, bitrate ceiling, priority and voice headroom remain the
+same. Text already preserves resolution; Smooth and Saver keep `balanced`.
+
+During the startup phase, 500 ms of both an estimate below 3.25 Mb/s and
+encoded fps below 75% of the source cadence indicates a constrained uplink.
+Startup probes use frame-counter deltas because `framesPerSecond` can lag by a second. A
+sender-side size bound then preserves Game's frame rate instead of waiting for
+Chromium's slow quality-scaler steps. It uses the same 70% headroom budget and
+Game's nominal pixels/fps budget, with 5% size hysteresis and no capture-constraint
+change. It clears when that budget supports native size at the source cadence, or
+the preset/publisher changes. Sparse sources already delivering their source cadence
+and CPU-limited encoders do not activate it. Intentional startup bounds do not
+trigger the stuck-capture guard. Resolution can continue following the estimate;
+this is a frame-rate protection, not a promise of fixed dimensions on a shaped link.
+After six seconds of full cadence and at least twice the measured payload in spare
+bitrate, the bound prices native size from measured bits per pixel with 50% margin.
+This also releases false-positive bounds on cheap content that never probes at the
+busy-content ceiling; CPU limitation, low cadence or a saturated target disable it.
+
+A Game-only guard can reset an already stuck capture with a one-second
+`maintain-resolution` pulse. It requires six continuous seconds below 75% of the
+effective target pixels, no CPU limitation, and both the encoder target and 70%
+of the outgoing estimate above `larger pixels × max(15, source fps) × bpp × 1.5`
+bits/s. The bpp budget is at least 0.04 and grows with measured payload demand at
+the current size, so dense content already filling the bitrate cap is left alone.
+The larger step is at most the effective target and otherwise four times the current
+pixels, with a 720p floor, so partial recovery need not require full 1080p60
+capacity. Missing/invalid estimates disable it. Pulses are separated by at least
+20 seconds, then 40, 80 and 120 seconds. The effective target respects the original
+capture size and any codec-recovery size cap.
+
+`pnpm --filter web e2e:screen-startup` checks repeated fresh real-tab publishes
+with a sparse 20 fps barcode and busy 1080p60 content, using VP9 and H.264. It
+checks rendered and captured cadence, outbound resolution and viewer decoding
+through the local SFU after settling. `E2E_STARTUP_RESULTS` retains JSON timelines;
+`E2E_STARTUP_UPLINK=1500000` or `3000000` exercises Chromium's global p2p shaper
+and reports the constrained-link tradeoff. `E2E_STARTUP_STALL_CONTROL=1` bypasses
+only the initial protection to require a real guard pulse and resolution recovery;
+`E2E_STARTUP_PRESET` can check Text, Smooth and Saver directly. The Ubuntu
+`browser-screen-startup` job is diagnostic and excluded from `ci-ok` until its repeatability is established.
+The existing required #166 fixed 1080p60 H.264 canvas gate is unchanged.
+
 Notes on the table:
 
 - Resolution is capped with `track.applyConstraints({width, height,
