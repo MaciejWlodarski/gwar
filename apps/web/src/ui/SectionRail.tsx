@@ -47,7 +47,7 @@ export function SectionRail() {
   const openDialog = useUi((s) => s.openDialog);
 
   return (
-    <nav aria-label={t("nav.sections")} className="flex h-full w-16 shrink-0 flex-col items-center gap-2 border-r border-line bg-rail py-3">
+    <nav aria-label={t("nav.sections")} className="flex h-full w-16 shrink-0 flex-col items-center gap-2 bg-rail py-3">
       <div aria-hidden className="mb-1 flex h-8 items-center justify-center">
         <BrandMark className="h-5 w-auto" />
       </div>

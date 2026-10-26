@@ -5,17 +5,18 @@ import { cn } from "../lib/cn";
 import { useBookmarks, useSettings } from "../state/settings";
 import { useUi } from "../state/stores";
 import { TeamSpeakBadge } from "./badges";
-import { Avatar, Tooltip, menuContent, menuItem, menuItemDanger } from "./kit";
+import { Avatar, Tooltip, menuContent, menuItem, menuItemDanger, panelCard } from "./kit";
 import { useBookmarkOpener } from "./nav";
 
-export function ServerRail() {
+/** The saved servers: a card of its own beside the others on desktop, a plain column in the mobile drawer. */
+export function ServerRail({ card }: { card?: boolean }) {
   const t = useT();
   const bookmarks = useBookmarks();
   const openDialog = useUi((s) => s.openDialog);
   const { isActive, open } = useBookmarkOpener();
 
   return (
-    <nav aria-label={t("rail.label")} className="flex h-full w-16 shrink-0 flex-col items-center bg-rail py-3">
+    <nav aria-label={t("rail.label")} className={cn("flex w-16 shrink-0 flex-col items-center", card ? cn(panelCard, "bg-side py-1.5") : "h-full bg-rail py-3")}>
       <div className="flex min-h-0 flex-1 flex-col items-center gap-2 overflow-y-auto overflow-x-hidden px-2.5 py-1.5">
         {bookmarks.map((b) => {
           const active = isActive(b);
@@ -30,14 +31,14 @@ export function ServerRail() {
                       aria-current={active ? "true" : undefined}
                       className={cn(
                         "t cursor-pointer overflow-hidden transition-[border-radius,box-shadow] duration-150",
-                        active ? "rounded-xl ring-2 ring-accent ring-offset-2 ring-offset-rail" : "rounded-[22px] hover:rounded-xl",
+                        active ? cn("rounded-xl ring-2 ring-accent ring-offset-2", card ? "ring-offset-side" : "ring-offset-rail") : "rounded-[22px] hover:rounded-xl",
                       )}
                     >
                       <Avatar name={b.name} seed={b.address} size={44} square className="!rounded-none" />
                     </button>
                   </Tooltip>
                   {b.kind === "teamspeak" && (
-                    <TeamSpeakBadge short className="pointer-events-none absolute right-0 -bottom-0.5 ring-2 ring-rail" />
+                    <TeamSpeakBadge short className={cn("pointer-events-none absolute right-0 -bottom-0.5 ring-2", card ? "ring-side" : "ring-rail")} />
                   )}
                 </div>
               </ContextMenu.Trigger>

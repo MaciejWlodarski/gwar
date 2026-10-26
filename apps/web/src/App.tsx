@@ -77,10 +77,10 @@ export function App() {
           {/* Home and the overview lie over the server view instead of replacing it: the chat keeps
               its drafts, files and scroll position, and a watched share keeps playing underneath. */}
           <div className="relative flex min-w-0 flex-1">
-            <div inert={home} className={cn("flex min-w-0 flex-1", home && "invisible")}>
-              {!isMobile && <ServerRail />}
+            <div inert={home} className={cn("flex min-w-0 flex-1", !isMobile && "gap-2 py-2 pr-2", home && "invisible")}>
+              {!isMobile && <ServerRail card />}
               {showApp ? (
-                <div className={cn("flex min-w-0 flex-1", !isMobile && "gap-2 py-2 pr-2")}>
+                <div className={cn("flex min-w-0 flex-1", !isMobile && "gap-2")}>
                   {!isMobile && <Sidebar card />}
                   {stageOpen ? (
                     <>
@@ -107,11 +107,11 @@ export function App() {
                   )}
                 </div>
               ) : (
-                <ConnectScreen />
+                <ConnectScreen card={!isMobile} />
               )}
             </div>
             {home && (
-              <div className={cn("absolute inset-0 flex", !isMobile && "p-2")}>
+              <div className={cn("absolute inset-0 flex", !isMobile && "py-2 pr-2")}>
                 <Home card={!isMobile} />
               </div>
             )}
