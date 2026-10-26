@@ -14,7 +14,7 @@ import { controller } from "../state/controller";
 import { guestLinkPossible, useCanWatch, useScreenSupport } from "../state/screen-controller";
 import { shareOf } from "../state/reducer";
 import { slotOf, useScreen } from "../state/screen";
-import { useSession } from "../state/stores";
+import { useSession, useUi } from "../state/stores";
 import { type PublishStats } from "../voice/screen";
 import { HEIGHTS, FRAME_RATES, type ScreenSpec } from "../voice/screen-quality";
 import { useChannelPermission, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
@@ -349,6 +349,8 @@ export function Stage({ card }: { card?: boolean }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
+      // Not while Home covers the stage: it would go fullscreen unseen.
+      if (useUi.getState().section !== "servers") return;
       if (e.key.toLowerCase() !== "f" || e.ctrlKey || e.metaKey || e.altKey || target?.closest("input, textarea, select, [contenteditable=true]")) return;
       e.preventDefault();
       toggleFullscreen();

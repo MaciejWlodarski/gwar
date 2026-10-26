@@ -101,7 +101,8 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
   const { channel } = node;
   // `current`: the voice channel I am in. `selected`: the chat I have open.
   const current = useSession((s) => myChannelId(s) === channel.id);
-  const selected = useSession((s) => s.activeThread === "channel" && s.viewChannel === channel.id);
+  const chatShown = useUi((s) => !s.overview);
+  const selected = useSession((s) => s.activeThread === "channel" && s.viewChannel === channel.id) && chatShown;
   const unread = useSession((s) => channelUnread(s, channel.id));
   const mentions = useSession((s) => channelMentions(s, channel.id));
   const isDefault = useSession((s) => s.server?.default_channel === channel.id);

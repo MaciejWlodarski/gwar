@@ -182,7 +182,7 @@ function isActive(state: SessionState, key: StoredThreadKey): boolean {
 
 /** The thread is open and the user can see it: new messages there count as read. */
 function isViewing(state: SessionState, key: StoredThreadKey): boolean {
-  return isActive(state, key) && (!key.startsWith("ch:") || state.focused);
+  return isActive(state, key) && state.focused;
 }
 
 /** Id of the newest message in a thread, 0 if it has none. */

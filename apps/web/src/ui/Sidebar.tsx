@@ -1,5 +1,5 @@
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
-import { ChevronDown, Copy, Fingerprint, KeyRound, LogOut, Plus, Pencil, Settings2, Ticket, UserPlus } from "lucide-react";
+import { ChevronDown, Copy, Fingerprint, KeyRound, LayoutDashboard, LogOut, Plus, Pencil, Settings2, Ticket, UserPlus } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { controller } from "../state/controller";
@@ -112,12 +112,39 @@ function ServerHeader() {
   );
 }
 
+/** The server's overview, above its channels: who talks where, what is new. */
+function OverviewRow() {
+  const t = useT();
+  const selected = useUi((s) => s.overview);
+  const showOverview = useUi((s) => s.showOverview);
+  const setDrawer = useUi((s) => s.setDrawer);
+  return (
+    <div className="px-2 pt-2">
+      <button
+        onClick={() => {
+          showOverview();
+          setDrawer(false);
+        }}
+        aria-current={selected ? "page" : undefined}
+        className={cn(
+          "t flex h-8 w-full cursor-pointer items-center gap-2 rounded-md px-2 text-left text-sm",
+          selected ? "bg-active font-medium text-fg" : "text-muted hover:bg-hover hover:text-fg",
+        )}
+      >
+        <LayoutDashboard className="size-4 shrink-0 text-subtle" />
+        <span className="truncate">{t("overview.title")}</span>
+      </button>
+    </div>
+  );
+}
+
 export function Sidebar({ className, card }: { className?: string; card?: boolean }) {
   const phase = useSession((s) => s.phase);
   return (
     <aside className={cn("flex h-full w-[280px] shrink-0 flex-col bg-side", card ? panelCard : "border-r border-line", className)}>
       <ServerHeader />
       <div className={cn("min-h-0 flex-1 overflow-y-auto transition-opacity duration-150", phase === "reconnecting" && "opacity-50")}>
+        <OverviewRow />
         <ChannelTree />
       </div>
       <VoicePanel />

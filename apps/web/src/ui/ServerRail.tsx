@@ -1,59 +1,36 @@
 import * as ContextMenu from "@radix-ui/react-context-menu";
-import { Plus, Settings } from "lucide-react";
+import { Plus } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
-import { sameServer } from "../lib/server-key";
-import { bookmarkParams, controller } from "../state/controller";
-import { useBookmarks, useSettings, type Bookmark } from "../state/settings";
-import { useSession, useUi } from "../state/stores";
+import { useBookmarks, useSettings } from "../state/settings";
+import { useUi } from "../state/stores";
 import { TeamSpeakBadge } from "./badges";
-import { Avatar, IconButton, Tooltip, menuContent, menuItem, menuItemDanger } from "./kit";
-import { AlphaBadge, BugReportButton } from "./BugReport";
-import { UpdateButton, VersionLabel } from "./Version";
+import { Avatar, Tooltip, menuContent, menuItem, menuItemDanger } from "./kit";
+import { useBookmarkOpener } from "./nav";
 
 export function ServerRail() {
   const t = useT();
   const bookmarks = useBookmarks();
-  const phase = useSession((s) => s.phase);
-  const address = useSession((s) => s.address);
-  const kind = useSession((s) => s.kind);
   const openDialog = useUi((s) => s.openDialog);
-  const setDrawer = useUi((s) => s.setDrawer);
-
-  const isActive = (b: Bookmark) => phase !== "idle" && sameServer(b, { kind, address, insecureLan: b.insecureLan });
-
-  const open = (b: Bookmark) => {
-    if (isActive(b) && phase === "online") {
-      setDrawer(false);
-      return;
-    }
-    setDrawer(false);
-    void controller.connectInteractive(bookmarkParams(b), { remember: false });
-  };
+  const { isActive, open } = useBookmarkOpener();
 
   return (
-    <nav aria-label={t("rail.label")} className="flex h-full w-[72px] shrink-0 flex-col items-center gap-2 bg-rail py-3">
-      <div className="flex min-h-0 flex-1 flex-col items-center gap-2 overflow-y-auto overflow-x-hidden px-3 py-1">
+    <nav aria-label={t("rail.label")} className="flex h-full w-16 shrink-0 flex-col items-center bg-rail py-3">
+      <div className="flex min-h-0 flex-1 flex-col items-center gap-2 overflow-y-auto overflow-x-hidden px-2.5 py-1.5">
         {bookmarks.map((b) => {
           const active = isActive(b);
           return (
             <ContextMenu.Root key={b.id}>
               <ContextMenu.Trigger asChild>
                 <div className="relative flex w-full justify-center">
-                  <span
-                    className={cn(
-                      "absolute top-1/2 -left-3 w-1 -translate-y-1/2 rounded-r-full bg-fg transition-all duration-150",
-                      active ? "h-8 opacity-100" : "h-0 opacity-0",
-                    )}
-                  />
                   <Tooltip label={`${b.name}${b.kind === "teamspeak" ? ` · ${t("badge.teamspeak")}` : ""}`} side="right">
                     <button
                       onClick={() => open(b)}
                       aria-label={b.name}
                       aria-current={active ? "true" : undefined}
                       className={cn(
-                        "t cursor-pointer overflow-hidden transition-[border-radius] duration-150",
-                        active ? "rounded-xl" : "rounded-[22px] hover:rounded-xl",
+                        "t cursor-pointer overflow-hidden transition-[border-radius,box-shadow] duration-150",
+                        active ? "rounded-xl ring-2 ring-accent ring-offset-2 ring-offset-rail" : "rounded-[22px] hover:rounded-xl",
                       )}
                     >
                       <Avatar name={b.name} seed={b.address} size={44} square className="!rounded-none" />
@@ -93,13 +70,6 @@ export function ServerRail() {
           </button>
         </Tooltip>
       </div>
-      <UpdateButton />
-      <BugReportButton />
-      <IconButton label={t("settings.title")} side="right" onClick={() => openDialog({ kind: "settings", tab: "audio" })}>
-        <Settings className="size-5" />
-      </IconButton>
-      <VersionLabel />
-      <AlphaBadge />
     </nav>
   );
 }

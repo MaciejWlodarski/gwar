@@ -58,6 +58,7 @@ import type { pruneRequest } from "../lib/prune";
 import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, identityFailure, type Identity, type IdentityFailure } from "../net/identity";
 import { isDesktop } from "../platform";
 import { createVoiceEngine } from "../voice";
+import { useScreen } from "./screen";
 import { ScreenController } from "./screen-controller";
 import { microphoneSsrc } from "../voice/sdp";
 import { VoiceError, type VoiceEngine } from "../voice/engine";
@@ -367,9 +368,23 @@ class Controller {
     // Tell the server what I have read.
     useSession.subscribe((s) => this.checkRead(s));
 
-    // Messages only count as read while the window is visible and focused.
-    const syncFocus = () =>
-      useSession.getState().dispatch({ type: "focus", focused: document.visibilityState === "visible" && document.hasFocus() });
+    // Messages only count as read while the window is visible and focused, with the chat on screen: not
+    // covered by Home or the server overview, and not left out beside a watched share (collapsed, or on a
+    // phone, where the stage takes the whole screen).
+    const narrow = typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 799px)") : null;
+    const syncFocus = () => {
+      const ui = useUi.getState(), screen = useScreen.getState();
+      const chatShown = ui.section === "servers" && (screen.stage !== null ? !narrow?.matches && !screen.chatHidden : !ui.overview);
+      const focused = document.visibilityState === "visible" && document.hasFocus() && chatShown;
+      useSession.getState().dispatch({ type: "focus", focused });
+    };
+    useUi.subscribe((ui, before) => {
+      if (ui.section !== before.section || ui.overview !== before.overview) syncFocus();
+    });
+    useScreen.subscribe((screen, before) => {
+      if ((screen.stage === null) !== (before.stage === null) || screen.chatHidden !== before.chatHidden) syncFocus();
+    });
+    narrow?.addEventListener("change", syncFocus);
     window.addEventListener("focus", syncFocus);
     window.addEventListener("blur", syncFocus);
     document.addEventListener("visibilitychange", syncFocus);
@@ -570,6 +585,10 @@ class Controller {
 
   private wire(conn: Link, params: ConnectParams): void {
     const session = useSession.getState();
+    session.setRtt(null);
+    conn.onRtt?.((ms) => {
+      if (this.conn === conn) session.setRtt(Math.round(ms));
+    });
     conn.onWelcome((welcome, resync) => {
       if (this.conn !== conn) return;
       // A new session: shares and watches of the one before ended with it.
@@ -701,6 +720,7 @@ class Controller {
           session.dispatch({ type: "phase", phase: "online" });
           break;
         case "reconnecting":
+          session.setRtt(null);
           this.nativeFiles(null);
           // A new session starts outside voice: remember where to go back to.
           this.rejoin ??= myChannelId(useSession.getState());
