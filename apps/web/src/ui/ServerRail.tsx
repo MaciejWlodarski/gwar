@@ -3,7 +3,8 @@ import * as Dropdown from "@radix-ui/react-dropdown-menu";
 import { Check, ChevronRight, Plus } from "lucide-react";
 import { useT, useLanguage, countKey } from "../i18n";
 import { cn } from "../lib/cn";
-import { useBookmarks, useSettings, type Bookmark, type ServerGroup } from "../state/settings";
+import { useEffect, useRef, type RefObject } from "react";
+import { useBookmarks, useServerGroups, useSettings, type Bookmark, type ServerGroup } from "../state/settings";
 import { useUi } from "../state/stores";
 import { TeamSpeakBadge } from "./badges";
 import { Avatar, Tooltip, menuContent, menuItem, menuItemDanger, menuSeparator, panelCard } from "./kit";
@@ -12,7 +13,7 @@ import { railLayout, useBookmarkOpener, type ShownGroup } from "./nav";
 /** Moving a server between groups, or into a new one: the same entries in its context menu and its group's menu. */
 function GroupSubmenu({ server }: { server: Bookmark }) {
   const t = useT();
-  const groups = useSettings((s) => s.serverGroups);
+  const groups = useServerGroups();
   const openDialog = useUi((s) => s.openDialog);
   const current = groups.find((g) => g.servers.includes(server.id));
   return (
@@ -92,7 +93,7 @@ function ServerButton({ b, card }: { b: Bookmark; card?: boolean }) {
 }
 
 /** The group's coloured name above its servers: folds or unfolds it, and edits it from its context menu. */
-function GroupLabel({ group }: { group: ServerGroup }) {
+function GroupLabel({ group, labelRef }: { group: ServerGroup; labelRef: RefObject<HTMLButtonElement | null> }) {
   const t = useT();
   const openDialog = useUi((s) => s.openDialog);
   const toggle = () => useSettings.getState().updateServerGroup(group.id, { collapsed: !group.collapsed });
@@ -100,6 +101,7 @@ function GroupLabel({ group }: { group: ServerGroup }) {
     <ContextMenu.Root>
       <ContextMenu.Trigger asChild>
         <button
+          ref={labelRef}
           onClick={toggle}
           aria-expanded={!group.collapsed}
           title={`${group.name} · ${group.collapsed ? t("group.expand") : t("group.collapse")}`}
@@ -132,7 +134,7 @@ function GroupLabel({ group }: { group: ServerGroup }) {
  * A folded group: one tile with up to four of its servers, which opens a menu of them beside the column
  * (the column does not move). Ringed in the accent while the open server is one of them.
  */
-function GroupTile({ group, servers, card }: ShownGroup & { card?: boolean }) {
+function GroupTile({ group, servers, card, onUnfold }: ShownGroup & { card?: boolean; onUnfold: () => void }) {
   const t = useT();
   const lang = useLanguage();
   const openDialog = useUi((s) => s.openDialog);
@@ -158,24 +160,36 @@ function GroupTile({ group, servers, card }: ShownGroup & { card?: boolean }) {
         </Dropdown.Trigger>
       </Tooltip>
       <Dropdown.Portal>
-        <Dropdown.Content side="right" align="start" sideOffset={10} className={cn(menuContent, "w-64 p-1.5")}>
-          <div className="flex items-center gap-2 px-2 pt-1 pb-2 text-sm font-semibold">
+        <Dropdown.Content
+          side="right"
+          align="start"
+          sideOffset={10}
+          collisionPadding={8}
+          // A long group scrolls between its name and its buttons instead of running off the screen.
+          className={cn(menuContent, "flex max-h-[var(--radix-dropdown-menu-content-available-height)] w-64 flex-col p-1.5")}
+        >
+          <div className="flex shrink-0 items-center gap-2 px-2 pt-1 pb-2 text-sm font-semibold">
             <span className="size-2.5 shrink-0 rounded-[3px]" style={{ background: group.color }} />
             <span className="flex-1 truncate">{group.name}</span>
             <span className="text-xs font-normal text-subtle">{t(countKey(lang, "group.count", servers.length), { count: servers.length })}</span>
           </div>
-          {servers.map((b) => (
-            <Dropdown.Item key={b.id} className={cn(menuItem, "h-9")} onSelect={() => open(b)}>
-              <Avatar name={b.name} seed={b.address} size={24} square />
-              <span className="flex-1 truncate font-medium">{b.name}</span>
-              {b.kind === "teamspeak" && <TeamSpeakBadge short />}
-              {isActive(b) && <span className="text-xs text-accent">{t("group.current")}</span>}
-            </Dropdown.Item>
-          ))}
-          <div className="mt-1.5 flex gap-1.5 border-t border-line px-0.5 pt-2">
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            {servers.map((b) => (
+              <Dropdown.Item key={b.id} className={cn(menuItem, "h-9")} onSelect={() => open(b)}>
+                <Avatar name={b.name} seed={b.address} size={24} square />
+                <span className="flex-1 truncate font-medium">{b.name}</span>
+                {b.kind === "teamspeak" && <TeamSpeakBadge short />}
+                {isActive(b) && <span className="text-xs text-accent">{t("group.current")}</span>}
+              </Dropdown.Item>
+            ))}
+          </div>
+          <div className="mt-1.5 flex shrink-0 gap-1.5 border-t border-line px-0.5 pt-2">
             <Dropdown.Item
               className={cn(menuItem, "flex-1 justify-center whitespace-nowrap bg-hover text-xs text-muted")}
-              onSelect={() => useSettings.getState().updateServerGroup(group.id, { collapsed: false })}
+              onSelect={() => {
+                onUnfold();
+                useSettings.getState().updateServerGroup(group.id, { collapsed: false });
+              }}
             >
               {t("group.expand")}
             </Dropdown.Item>
@@ -190,11 +204,20 @@ function GroupTile({ group, servers, card }: ShownGroup & { card?: boolean }) {
 }
 
 function RailGroup({ group, servers, card }: ShownGroup & { card?: boolean }) {
+  const label = useRef<HTMLButtonElement>(null);
+  // Unfolding from the tile's menu removes the tile, which held the focus: the group's name takes it.
+  const refocus = useRef(false);
+  useEffect(() => {
+    if (group.collapsed || !refocus.current) return;
+    refocus.current = false;
+    const frame = requestAnimationFrame(() => label.current?.focus());
+    return () => cancelAnimationFrame(frame);
+  }, [group.collapsed]);
   return (
     <div role="group" aria-label={group.name} className="relative flex w-full flex-col items-center gap-2">
-      <GroupLabel group={group} />
+      <GroupLabel group={group} labelRef={label} />
       {group.collapsed ? (
-        <GroupTile group={group} servers={servers} card={card} />
+        <GroupTile group={group} servers={servers} card={card} onUnfold={() => (refocus.current = true)} />
       ) : (
         <>
           {/* The bracket: a coloured line along the unfolded group's servers. */}
@@ -212,7 +235,7 @@ function RailGroup({ group, servers, card }: ShownGroup & { card?: boolean }) {
 export function ServerRail({ card }: { card?: boolean }) {
   const t = useT();
   const bookmarks = useBookmarks();
-  const groups = useSettings((s) => s.serverGroups);
+  const groups = useServerGroups();
   const openDialog = useUi((s) => s.openDialog);
   const layout = railLayout(bookmarks, groups);
 

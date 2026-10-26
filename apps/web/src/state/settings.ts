@@ -46,6 +46,8 @@ export interface ServerGroup {
   /** Folded into one tile; its servers open from a menu beside it. */
   collapsed: boolean;
   servers: string[];
+  /** The Gwar Connect account whose servers it groups, like {@link Bookmark.account}: another account's stay hidden. */
+  account?: string;
 }
 
 /** The colours a group can take. */
@@ -57,11 +59,12 @@ export function validGroups(value: unknown): ServerGroup[] {
   const seen = new Set<string>();
   return value.flatMap((g) => {
     if (typeof g !== "object" || g === null) return [];
-    const { id, name, color, collapsed, servers } = g as Record<string, unknown>;
+    const { id, name, color, collapsed, servers, account } = g as Record<string, unknown>;
     if (typeof id !== "string" || !id || typeof name !== "string" || !name.trim() || typeof color !== "string" || !Array.isArray(servers)) return [];
     const members = servers.filter((s): s is string => typeof s === "string" && !seen.has(s));
     members.forEach((s) => seen.add(s));
-    return [{ id, name, color, collapsed: collapsed === true, servers: members }];
+    const group: ServerGroup = { id, name, color, collapsed: collapsed === true, servers: members };
+    return [typeof account === "string" ? { ...group, account } : group];
   });
 }
 
@@ -106,6 +109,33 @@ export function useBookmarks(): Bookmark[] {
   return useMemo(() => bookmarks.filter((b) => inAccount(b, account)), [bookmarks, account]);
 }
 
+/** The server groups shown now: like {@link useBookmarks}, another account's stay hidden. */
+export function useServerGroups(): ServerGroup[] {
+  const groups = useSettings((s) => s.serverGroups);
+  const account = useSettings((s) => s.bookmarkAccount);
+  return useMemo(() => groups.filter((g) => inAccount(g, account)), [groups, account]);
+}
+
+/**
+ * Groups after deduplication merged bookmarks (`merged`: dropped id → kept id): the kept bookmark takes a
+ * dropped one's place unless it is in a group of its own already, so merging never ungroups a server.
+ */
+export function mergeGroupMembers(groups: ServerGroup[], merged: Record<string, string>): ServerGroup[] {
+  if (Object.keys(merged).length === 0) return groups;
+  const grouped = new Set(groups.flatMap((g) => g.servers));
+  return groups.map((g) => {
+    if (!g.servers.some((id) => merged[id])) return g;
+    const servers = g.servers.flatMap((id) => {
+      const kept = merged[id];
+      if (!kept) return [id];
+      if (grouped.has(kept)) return [];
+      grouped.add(kept);
+      return [kept];
+    });
+    return { ...g, servers };
+  });
+}
+
 /** Whether two bookmarks differ in what Gwar Connect syncs. */
 function syncedChange(a: BookmarkInput, b: BookmarkInput): boolean {
   return (
@@ -137,7 +167,7 @@ export function dedupeBookmarks(
   removed: Record<string, BookmarkRemoval>,
   account: string | null,
   preferred?: string,
-): { bookmarks: Bookmark[]; removed: Record<string, BookmarkRemoval>; changed: boolean } {
+): { bookmarks: Bookmark[]; removed: Record<string, BookmarkRemoval>; changed: boolean; merged: Record<string, string> } {
   const shown = bookmarks.filter((b) => inAccount(b, account));
   const order = [...shown.filter((b) => b.id === preferred), ...shown.filter((b) => b.id !== preferred)];
   const groups = new Map<string, Bookmark[]>();
@@ -147,6 +177,7 @@ export function dedupeBookmarks(
   }
   const stays = new Map<string, Bookmark>();
   const dropped: Record<string, BookmarkRemoval> = {};
+  const merged: Record<string, string> = {};
   for (const group of groups.values()) {
     if (group.length < 2) continue;
     // One time for the whole group, after every version in it: the kept bookmark and the removals
@@ -160,14 +191,16 @@ export function dedupeBookmarks(
       if (!kept.channel && b.channel) kept = { ...kept, channel: b.channel, channelPassword: b.channelPassword };
       const owner = b.account ?? account ?? undefined;
       dropped[b.id] = owner === undefined ? { at } : { at, account: owner };
+      merged[b.id] = kept.id;
     }
     stays.set(kept.id, kept);
   }
-  if (Object.keys(dropped).length === 0) return { bookmarks, removed, changed: false };
+  if (Object.keys(dropped).length === 0) return { bookmarks, removed, changed: false, merged };
   return {
     bookmarks: bookmarks.flatMap((b) => (dropped[b.id] ? [] : [stays.get(b.id) ?? b])),
     removed: { ...removed, ...dropped },
     changed: true,
+    merged,
   };
 }
 
@@ -368,6 +401,7 @@ export const useSettings = create<SettingsState>()(
           return {
             bookmarks: deduped.bookmarks,
             removedBookmarks: deduped.removed,
+            serverGroups: mergeGroupMembers(s.serverGroups, deduped.merged),
             bookmarkEdits: s.bookmarkEdits + (changed || deduped.changed ? 1 : 0),
           };
         }),
@@ -385,9 +419,19 @@ export const useSettings = create<SettingsState>()(
         set((s) => {
           // Two devices may have saved the same server under different ids: the vault then has both.
           const deduped = dedupeBookmarks(list, pruneRemoved(s.removedBookmarks, Date.now()), s.bookmarkAccount);
-          return { bookmarks: deduped.bookmarks, removedBookmarks: deduped.removed, bookmarkEdits: s.bookmarkEdits + (deduped.changed ? 1 : 0) };
+          return {
+            bookmarks: deduped.bookmarks,
+            removedBookmarks: deduped.removed,
+            serverGroups: mergeGroupMembers(s.serverGroups, deduped.merged),
+            bookmarkEdits: s.bookmarkEdits + (deduped.changed ? 1 : 0),
+          };
         }),
-      setBookmarkAccount: (bookmarkAccount) => set({ bookmarkAccount }),
+      // Groups made while signed out belong to the next account, like the bookmarks in them.
+      setBookmarkAccount: (bookmarkAccount) =>
+        set((s) => ({
+          bookmarkAccount,
+          serverGroups: bookmarkAccount ? s.serverGroups.map((g) => (g.account === undefined ? { ...g, account: bookmarkAccount } : g)) : s.serverGroups,
+        })),
       dropAccountBookmarks: (account) =>
         set((s) => ({
           bookmarks: s.bookmarks.filter((b) => b.account !== account || !syncable(b)),
@@ -403,7 +447,7 @@ export const useSettings = create<SettingsState>()(
         set((s) => ({
           serverGroups: [
             ...s.serverGroups.map((g) => ({ ...g, servers: g.servers.filter((m) => !servers.includes(m)) })),
-            { id, name: name.trim(), color, collapsed: false, servers },
+            { id, name: name.trim(), color, collapsed: false, servers, ...(s.bookmarkAccount ? { account: s.bookmarkAccount } : {}) },
           ],
         }));
         return id;
