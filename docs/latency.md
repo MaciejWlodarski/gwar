@@ -1003,7 +1003,7 @@ A/B of 2026-10-23: 144 runs without configured loss, 100 ms timelines):
 - 26 output-underrun steps; 24 of them in the timeline interval holding the
   predicted 2^20 crossing (device start + 21.845 s, the start being marker 0
   minus the warmup). Runs whose devices started 0.41--0.49 s after the epoch
-  (screen arms, slower setup) moved with it: underrun in (22.25, 22.43] s
+  (screen arms, slower setup) moved with it: underrun in (22.21, 22.43] s
   instead of (21.97, 22.13] s. It follows the device's sample count, not wall
   time or the marker phase (markers 27--28 only by coincidence).
 - 24 of 144 runs (17 %) have that underrun, and all 24 are tails: p99
@@ -1018,31 +1018,35 @@ A/B of 2026-10-23: 144 runs without configured loss, 100 ms timelines):
   policies behave as documented: the headroom step is released after 5 s (the
   surplus moves into the packet queue), a 480-sample trim follows 13.4 s after
   the event (a jitter-target bump at 29.4 s restarted the window), and the
-  final 223 samples stay, below the 240 samples a correction needs (surplus
-  above the 120-sample safety, itself at least 120 samples).
+  final 223 samples stay: a correction needs 240 (the 120-sample safety plus
+  a surplus of at least 120).
 
-The kernel path on the VM cannot be read back from the artifacts. Reproduced in
-Docker (Linux 7.0 aarch64, glibc 2.36, 4 CPUs, transparent huge pages
+The kernel path on the VM cannot be read back from the artifacts. The callback
+stall itself (not the gate statistic) was reproduced in Docker (Linux 7.0 aarch64, glibc 2.36, 4 CPUs, transparent huge pages
 `always`) on a loaded Mac:
 
-- With the default allocator the growths are `mremap` calls (0.2--0.4 ms in
-  `strace`, the 2^20 one 0.38 ms), cheap there. `mremap` still takes the
-  process's memory-map lock for writing and flushes every CPU's TLB, which on
-  a busy 4 vCPU VM (CPU pressure 9--18 % in the gate's host samples) waits for
-  preempted vCPUs; it runs on the device thread at a deterministic point.
+- With the default allocator the growths are `mremap` calls (0.2--0.4 ms of
+  syscall time in `strace`, the 2^20 one 0.38 ms). `mremap` takes the
+  process's memory-map lock for writing and flushes every CPU's TLB, so on a
+  busy host it can hold up the device and every other thread: the growing
+  callbacks took up to 9.5 ms (2 of the 9 recorded over 5 ms, 12 runs). The gate
+  VM (4 vCPUs, CPU pressure 9--18 % in the gate's host samples) also runs it
+  on the device thread at the same deterministic point.
 - With the copying path forced (`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=33554432`,
-  as an earlier large free can leave the dynamic threshold), the callbacks that
-  grew the buffer took 9.0--36.4 ms (10 of the 14 recorded); 6 runs.
+  as an earlier large free can leave the dynamic threshold), 19 of the 23
+  recorded growing callbacks took 5.6--36.4 ms (12 runs).
 - Only reserving the capacity was not enough: the first write to each 2 MB of
   the untouched reservation (every 2.73 s, a transparent huge page) stalled
   the callback by up to 16.8 ms, 16 callbacks over 5 ms in 6 runs.
 
 The receiver's record is now allocated for the longest run (30 s connection
 wait + markers, matching window and warmup + 2 s) and written once before the
-devices' start time is set (`playout_record`). With the forced copying path,
-the longest receiver callback per run was 14.3--40.0 ms before (all 6 runs) and
-1.2--3.4 ms after, except two runs during 180--290 ms host stalls (40 and
-79 ms, with equally late callbacks). The Docker host was too loaded
+devices' start time is set (`playout_record`). In 18 runs of the fixed build
+(12 of them with the copying path forced), no callback grew or first touched
+the record. With the copying path forced, the longest receiver callback per run
+was 6.6--40.0 ms before (12 runs) and 0.5--3.9 ms after in 9 of 12 runs; the
+other three (21.3, 40 and 79 ms) coincided with host stalls that also made
+callbacks start 17--290 ms late. The Docker host was too loaded
 (fake device lateness 10--290 ms in most runs, both builds) for its marker
 latencies to be compared with the VM's; the before/after gate comparison
 belongs on the VM.
