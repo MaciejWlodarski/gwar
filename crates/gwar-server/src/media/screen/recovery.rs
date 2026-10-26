@@ -9,6 +9,29 @@ pub(super) const HOLD_DOWN: Duration = Duration::from_secs(10);
 const RESTORE_AFTER: Duration = Duration::from_secs(120);
 const MAX_BACKOFF: u8 = 4; // 2, 4, 8, 16, then 32 minutes until the share ends.
 
+/// The rate of an H.264 rendition replacing AV1.
+pub(super) const AV1_REPLACEMENT_FPS: u32 = 60;
+
+/// The H.264 rendition replacing an AV1 share of `width`×`height`: scaled down, keeping the
+/// aspect ratio, to the largest share (1440p in either orientation), with even sides of at
+/// least one macroblock. At 60 fps that stays within H.264 level 5.1 (36,864 MBs per frame,
+/// 983,040 per second), the most the SFU's publish answer accepts.
+pub(super) fn h264_replacement(width: u32, height: u32) -> (u32, u32) {
+    let (long, short) = (u64::from(width.max(height)), u64::from(width.min(height)));
+    // The tighter of the two bounds, as a ratio no larger than 1.
+    let (num, den) = if 2560 * short <= 1440 * long { (2560, long) } else { (1440, short) };
+    let (num, den) = if num >= den { (1, 1) } else { (num, den) };
+    let side = |value: u32| ((u64::from(value) * num / den) as u32 & !1).max(16);
+    (side(width), side(height))
+}
+
+/// Macroblocks per frame and per second of an H.264 replacement at `width`×`height`.
+pub(super) fn h264_replacement_load(width: u32, height: u32) -> (u32, u32) {
+    let (width, height) = h264_replacement(width, height);
+    let frame = width.div_ceil(16) * height.div_ceil(16);
+    (frame, frame * AV1_REPLACEMENT_FPS)
+}
+
 #[derive(Debug)]
 pub(super) enum Failure {
     Plan(ScreenRecovery),
@@ -85,7 +108,8 @@ impl Recovery {
         self.no_av1 = true;
     }
 
-    /// A viewer cannot decode the share's AV1: one replacement with H.264 at the same size.
+    /// A viewer cannot decode the share's AV1: one replacement with H.264 at about the same
+    /// size ([`h264_replacement`]).
     /// Without a decode failure there is nothing to cap or restore later.
     pub fn downgrade_av1(
         &mut self,
@@ -103,12 +127,13 @@ impl Recovery {
         }
         self.pending = true;
         self.last = Some(now);
+        let (width, height) = h264_replacement(size.width, size.height);
         Some(ScreenRecovery {
             share: share.into(),
             codec: ScreenRecoveryCodec::H264,
-            width: size.width,
-            height: size.height,
-            fps: 60,
+            width,
+            height,
+            fps: AV1_REPLACEMENT_FPS,
         })
     }
 
@@ -157,6 +182,36 @@ mod tests {
         let mut failed = Recovery::default();
         plan_of(failed.fail("s", (1920, 1080), false, HashSet::from([1]), now));
         assert!(!failed.av1());
+    }
+
+    #[test]
+    fn av1_replacements_fit_the_largest_share_and_h264_level_51() {
+        let (max_fs, max_mbps) = crate::media::screen::codec::level_resources(0x42e033).unwrap();
+        for ((width, height), expected) in [
+            ((1920, 1080), (1920, 1080)),
+            ((2560, 1440), (2560, 1440)),
+            ((1080, 1920), (1080, 1920)),
+            ((1921, 1081), (1920, 1080)),
+            ((1279, 719), (1278, 718)),
+            ((3840, 2160), (2560, 1440)),
+            ((7680, 4320), (2560, 1440)),
+            ((4320, 7680), (1440, 2560)),
+            ((65536, 65536), (1440, 1440)),
+            ((65536, 1), (2560, 16)),
+            ((1, 65536), (16, 2560)),
+            ((3440, 1440), (2560, 1070)),
+            ((1, 1), (16, 16)),
+        ] {
+            let (w, h) = h264_replacement(width, height);
+            assert_eq!((w, h), expected, "{width}x{height}");
+            assert!(w % 2 == 0 && h % 2 == 0 && w <= 2560 && h <= 2560 && w.min(h) <= 1440);
+            let (fs, mbps) = h264_replacement_load(width, height);
+            assert!(fs <= max_fs && mbps <= max_mbps, "{width}x{height}: {fs} MBs, {mbps} MB/s");
+        }
+        // The plan carries the replacement size.
+        let huge = crate::media::screen::av1_stream::Requirements { width: 65536, height: 65536, level: 31, tier: 0 };
+        let plan = Recovery::default().downgrade_av1("s", huge, Instant::now()).unwrap();
+        assert_eq!((plan.width, plan.height, plan.fps), (1440, 1440, 60));
     }
 
     fn plan_of(failure: Failure) -> ScreenRecovery {

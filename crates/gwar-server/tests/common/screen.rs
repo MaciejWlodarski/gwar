@@ -341,6 +341,16 @@ impl Viewer {
         .await
     }
 
+    /// Like [`Viewer::start`], as a browser reporting `h264` (verified H.264 decode limits).
+    pub async fn start_h264(client: &mut Client, run: u64, h264: serde_json::Value) -> Self {
+        Self::negotiate(gwar_proto::SCREEN_SLOTS, run, move |sdp| async move {
+            let offer = json!({"run": run, "sdp": sdp, "browser": true, "h264": h264});
+            let answer = client.ok("screen.watch.offer", offer).await;
+            answer["sdp"].as_str().unwrap().to_owned()
+        })
+        .await
+    }
+
     /// Like [`Viewer::start`], also offering AV1 at `level-idx` 9 (4.1, 1080p60) with the
     /// Dependency Descriptor and reporting `capability` (the verified AV1 decode size) in the
     /// watch offer.

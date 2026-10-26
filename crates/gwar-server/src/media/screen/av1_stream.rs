@@ -73,14 +73,11 @@ impl Requirements {
     }
 
     /// A well-formed sequence the SFU will not forward (profile, level, tier or size outside
-    /// its limits), as the size an H.264 replacement is asked for: the encoder's own frame
-    /// size, each side bounded by level 5.1's largest.
+    /// its limits), as the encoder declared it.
     fn refused(sequence: &SequenceHeader) -> Self {
-        let &(.., max_width, max_height) = LEVELS.last().expect("levels");
-        let side = max_width.max(max_height);
         Self {
-            width: sequence.max_frame_width.min(side),
-            height: sequence.max_frame_height.min(side),
+            width: sequence.max_frame_width,
+            height: sequence.max_frame_height,
             level: sequence.seq_level_idx,
             tier: sequence.seq_tier,
         }
@@ -542,10 +539,10 @@ pub(super) mod tests {
         let mut unsupported = forward(30, rtp(false, false, true, &[&sequence_obu(2, 1920, 1080), &KEY]), None);
         assert!(admission.inspect(&mut unsupported).is_err());
         assert_eq!(admission.take_refused().map(|r| (r.width, r.height)), Some((1920, 1080)));
-        // An oversized frame is asked of H.264 at no more than the largest size forwarded.
+        // The size is the encoder's own; the H.264 replacement is sized by the recovery.
         let mut huge = forward(40, rtp(false, false, true, &[&sequence_obu_at(0, 16384, 1080, 31, 0), &KEY]), None);
         assert!(admission.inspect(&mut huge).is_err());
-        assert_eq!(admission.take_refused(), Some(Requirements { width: 8192, height: 1080, level: 31, tier: 0 }));
+        assert_eq!(admission.take_refused(), Some(Requirements { width: 16384, height: 1080, level: 31, tier: 0 }));
     }
 
     #[test]

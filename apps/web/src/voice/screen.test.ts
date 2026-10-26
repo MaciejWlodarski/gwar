@@ -2117,6 +2117,13 @@ describe("AV1", () => {
     expect(declareAv1Level(sdp, 9).split("\r\n")).toEqual(["v=0", "m=video 9 UDP/TLS/RTP/SAVPF 45 46 98 47", "a=rtpmap:45 AV1/90000", "a=fmtp:45 profile=0;tier=0;level-idx=9",
       "a=rtpmap:46 rtx/90000", "a=fmtp:46 apt=45", "a=rtpmap:98 H264/90000", "a=fmtp:98 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
       "a=rtpmap:47 av1/90000", "a=fmtp:47 level-idx=9", ""]);
+    // Every receive slot repeats the same payload types; each declares the level.
+    const slot = (mid: number) => ["m=video 9 UDP/TLS/RTP/SAVPF 45 47", `a=mid:${mid}`, "a=rtpmap:45 AV1/90000", "a=fmtp:45 level-idx=5;profile=0;tier=0", "a=rtpmap:47 AV1/90000"];
+    const four = ["v=0", ...[0, 1, 2, 3].flatMap(slot), ""].join("\r\n");
+    const declared = (text: string, pt: number) => [...text.matchAll(new RegExp(`^a=fmtp:${pt} .*level-idx=(\\d+)`, "gm"))].map(m => Number(m[1]));
+    const rewritten = declareAv1Level(four, 9);
+    expect([declared(rewritten, 45), declared(rewritten, 47)]).toEqual([[9, 9, 9, 9], [9, 9, 9, 9]]);
+    expect(rewritten.match(/^a=fmtp:4[57] /gm)).toHaveLength(8);
 
     // The watch transport sends the declared level, never the engine's nominal one.
     const offerSdp = Peer.offerSdp;

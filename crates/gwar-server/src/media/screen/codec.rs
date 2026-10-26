@@ -75,9 +75,13 @@ impl Limits {
     }
 
     pub fn accepts_stream(&self, stream: &super::h264_stream::Requirements) -> bool {
-        self.accepts(VideoCodec::H264(stream.profile))
-            && stream.frame_mbs <= self.resources[1]
-            && u64::from(stream.mbps) * 100 <= u64::from(self.resources[0]) * 110
+        self.accepts(VideoCodec::H264(stream.profile)) && self.accepts_load(stream.frame_mbs, stream.mbps)
+    }
+
+    /// Whether frames of `frame_mbs` macroblocks at `mbps` per second are within this receive
+    /// level's MaxFS and MaxMBPS (with the 10% rate tolerance streams get).
+    pub fn accepts_load(&self, frame_mbs: u32, mbps: u32) -> bool {
+        frame_mbs <= self.resources[1] && u64::from(mbps) * 100 <= u64::from(self.resources[0]) * 110
     }
 
     fn parse(fmtp: &str, verified: &[gwar_proto::H264Capability]) -> Option<Self> {

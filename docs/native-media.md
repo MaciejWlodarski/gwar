@@ -1098,10 +1098,14 @@ this before mixed AV1/H.264 sharing ships.
    only and send one stream too: until A3/B11a provide the lazy H.264
    layer, the first assigned viewer that cannot decode the AV1 stream (no
    AV1 payload type, no verified AV1 size, or a stream above it) but can
-   decode H.264 turns the share to H.264 once, through the same recovery
-   plan (`screen.recover`, H.264 at the AV1 stream's size, 60 fps). Any
-   recovery plan or decode-failure report retires AV1 for the rest of the
-   share; viewers that decode neither are refused as above.
+   decode the H.264 replacement turns the share to H.264 once, through the
+   same recovery plan (`screen.recover`, 60 fps, at the AV1 stream's size
+   scaled down to at most 1440p with the aspect ratio kept, which stays
+   within H.264 level 5.1). The replacement must fit one of the viewer's
+   negotiated H.264 payload types: MaxFS and MaxMBPS of its receive level,
+   verified or declared, and any decode-failure cap. Any recovery plan or
+   decode-failure report retires AV1 for the rest of the share; viewers
+   that decode neither are refused as above and leave the share as it is.
    This browser path does not change the native primary-retention rule above.
 8. **Failures are explicit.** If no compatible layer can be produced, end
    only the affected watch. A failed hardware AV1 session may recover with
@@ -2007,8 +2011,9 @@ production server is involved.
     native. Browsers declare `level-idx=5` (3.1) whatever their decoder does,
     so the web client rewrites the AV1 `level-idx` of the watch offer it sends
     to the level its probed size needs at 60 fps: 8 (4.0) for 720p, 9 (4.1)
-    for 1080p, 12 (5.0) for 1440p. The DD extension (id 12) is registered on
-    both transports.
+    for 1080p, 12 (5.0) for 1440p. It does so in every receive slot (media
+    section), since browsers repeat the same payload types in each. The DD
+    extension (id 12) is registered on both transports.
   - Admission: the bounded H.264 join prefix also confirms AV1. The first
     buffered packet must start a temporal unit (`Z=0`, `N=1`, DD start of
     frame when present) and its DD must attach a template structure; a
@@ -2025,24 +2030,29 @@ production server is involved.
     `Z`/`Y`/`N`; conflicts drop the packet.
   - Refused sequences: an encoder repeats its sequence header at every
     keyframe, so one the SFU refuses (another profile, a level above 5.1 or
-    31, high tier, or a frame too large for its level) would only earn more keyframe
-    requests. When such a header is read on arrival (whole in one packet,
+    31, high tier, or a frame too large for its level) would only earn more
+    keyframe requests. When such a header is read on arrival (whole in one packet,
     or split over consecutive packets), the SFU instead turns the share to
     H.264 in place through the same one-time `screen.recover` plan as a
-    viewer without AV1: H.264 at the sequence's maximum frame size, each side
-    capped at 8192, 60 fps. It logs that once, and the old transport's
+    viewer without AV1: H.264 at 60 fps, at the sequence's maximum frame
+    size scaled down to at most 1440p (either orientation, aspect ratio
+    kept, even sides of at least 16), so within H.264 level 5.1's 36,864
+    MBs per frame and 983,040 per second. It logs that once, and the old transport's
     media stays fenced until the replacement is accepted. The plan retires
     AV1 for the rest of the share, so AV1 is never answered again and the
-    share cannot flap; refused AV1 arriving later plans nothing more. A split header that arrives
-    reordered is read only by the prefix, which just refuses that keyframe;
-    the next keyframe repeats the header.
+    share cannot flap; refused AV1 arriving later plans nothing more. A
+    split header that arrives reordered is read only by the prefix, which
+    just refuses that keyframe; the next keyframe repeats the header.
   - Viewers below the stream's level: a viewer whose declared `level-idx`
     or tier is below the stream's, or whose verified size is smaller, gets
-    the existing "viewer without AV1" outcome. If it decodes H.264, the
-    share turns to H.264 once (above, and [Codec
-    negotiation](#codec-negotiation-across-mixed-viewers), item 7). If not,
-    or once AV1 is already given up, it is refused: its watch stops with
-    `screen.stopped {reason: "codec"}`. A slot never stays silently black.
+    the existing "viewer without AV1" outcome. If it decodes the H.264
+    replacement (its H.264 receive level takes the replacement's frame size
+    and macroblock rate), the share turns to H.264 once (above, and [Codec
+    negotiation](#codec-negotiation-across-mixed-viewers), item 7). If not
+    (for example H.264 only at level 3.1 for a 1080p60 share), or once AV1
+    is already given up, that watch alone is refused: it stops with
+    `screen.stopped {reason: "codec"}` and the share keeps its codec. A slot
+    never stays silently black.
   - Forwarding: DD bytes are forwarded unchanged apart from the frame number,
     which each slot remaps so that a new segment (keyframe, source switch,
     pause/resume) continues one after the last forwarded frame. Values over

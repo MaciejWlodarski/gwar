@@ -375,10 +375,21 @@ export function av1Level(capability: Av1Capability): number {
   return capability.height >= 1440 ? 12 : capability.height >= 1080 ? 9 : 8;
 }
 
-/** The offer with every AV1 payload type declaring `level` as what this side receives. */
+/**
+ * The offer with every AV1 payload type declaring `level` as what this side receives. Payload
+ * types are per media section, and browsers repeat the same ones in every receive slot.
+ */
 export function declareAv1Level(sdp: string, level: number): string {
   const eol = sdp.includes("\r\n") ? "\r\n" : "\n";
-  const lines = sdp.split(/\r?\n/);
+  const sections: string[][] = [];
+  for (const line of sdp.split(/\r?\n/)) {
+    if (line.startsWith("m=") || sections.length === 0) sections.push([]);
+    sections[sections.length - 1]!.push(line);
+  }
+  return sections.flatMap(lines => declareSectionAv1Level(lines, level)).join(eol);
+}
+
+function declareSectionAv1Level(lines: string[], level: number): string[] {
   const pts = new Set(lines.flatMap(l => /^a=rtpmap:(\d+) AV1\/90000$/i.exec(l)?.[1] ?? []));
   const out: string[] = [];
   for (const line of lines) {
@@ -397,7 +408,7 @@ export function declareAv1Level(sdp: string, level: number): string {
       pts.delete(rtpmap[1]!);
     }
   }
-  return out.join(eol);
+  return out;
 }
 
 /** Each returned tuple has passed a real WebRTC decoder probe; unavailable/timeout means SDP only. */

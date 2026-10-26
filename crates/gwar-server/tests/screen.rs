@@ -855,6 +855,7 @@ async fn av1_srtp_forwarding_keeps_descriptors_and_gives_way_to_h264_for_a_viewe
     let mut bob = Client::connect(&server, "viewer").await;
     let mut dave = Client::connect(&server, "second").await;
     let mut carol = Client::connect(&server, "h264-only").await;
+    let mut erin = Client::connect(&server, "h264-31").await;
     assert_eq!(alice.ok("screen.av1.capabilities", json!({})).await, json!({"screen_av1": true}));
     let channel = seed_channel(&alice, "General");
     alice.ok("channel.join", json!({"channel": channel})).await;
@@ -883,11 +884,24 @@ async fn av1_srtp_forwarding_keeps_descriptors_and_gives_way_to_h264_for_a_viewe
         assert_eq!(descriptors, [Some(ATTACHED.to_vec()), Some(vec![0xc1, 0x12, 0x35])]);
     }
 
-    // A viewer who cannot decode AV1 (no capability, no AV1 PT) turns the share to H.264 once.
-    let cs = carol.watch(&share).await as usize;
+    // A viewer who decodes neither the AV1 stream nor its 1080p60 H.264 replacement (H.264
+    // level 3.1 only) is refused, and the share keeps AV1.
+    erin.watch(&share).await;
     alice
         .publisher(&share)
         .send_described([(Packet { sequence: 502, timestamp: 96000, ..inter.clone() }, Some(vec![0xc1, 0x12, 0x36]))])
+        .await;
+    let stopped = erin.next_event("screen.stopped").await;
+    assert_eq!((&stopped["share"], &stopped["reason"]), (&json!(share), &json!("codec")));
+    assert!(alice.drain_events("screen.recover").await.is_empty(), "the share keeps AV1");
+
+    // A viewer who cannot decode AV1 (no capability, no AV1 PT) but decodes the replacement
+    // turns the share to H.264 once.
+    let verified = json!([{"profile_level_id": 0x42e02a, "max_fs": 8160, "max_mbps": 489600}]);
+    let cs = carol.watch_h264(&share, verified).await as usize;
+    alice
+        .publisher(&share)
+        .send_described([(Packet { sequence: 503, timestamp: 99000, ..inter.clone() }, Some(vec![0xc1, 0x12, 0x37]))])
         .await;
     let recover = alice.next_event("screen.recover").await;
     assert_eq!(recover, json!({"share": share, "codec": "h264", "width": 1920, "height": 1080, "fps": 60}));

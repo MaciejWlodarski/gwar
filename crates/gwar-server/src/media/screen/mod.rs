@@ -1662,9 +1662,9 @@ impl Sfu {
                 if slot_packet_pt(&w.slots[index], forward).is_none() {
                     // A browser publisher has one encoder and no compatibility layer yet (A3):
                     // AV1 gives way to H.264 for the whole share rather than refusing a viewer
-                    // who decodes H.264. Every slot waits for the replacement's keyframe.
+                    // who decodes the H.264 replacement. Every slot waits for its keyframe.
                     if let Some(size) = forward.av1
-                        && w.slots[index].pts.keys().any(|c| matches!(c, VideoCodec::H264(_)))
+                        && decodes_h264_replacement(&w.slots[index], size)
                         && self.downgrade_av1(origin, size, "a viewer cannot decode it", now)
                     {
                         return;
@@ -2472,6 +2472,18 @@ fn slot_packet_pt(slot: &Slot, packet: &Forward) -> Option<Pt> {
             .min_by_key(|pt| **pt);
     }
     slot_pt(slot, packet.codec)
+}
+
+/// Whether the slot could decode the H.264 rendition that would replace an AV1 stream of
+/// `size`: one of its negotiated H.264 payload types, at a receive level (and any earlier
+/// decode-failure cap) that takes the replacement's frame size and macroblock rate.
+fn decodes_h264_replacement(slot: &Slot, size: av1_stream::Requirements) -> bool {
+    let (frame_mbs, mbps) = recovery::h264_replacement_load(size.width, size.height);
+    slot.decode_cap.is_none_or(|(fs, cap)| frame_mbs <= fs && u64::from(mbps) * 100 <= u64::from(cap) * 110)
+        && slot
+            .h264
+            .iter()
+            .any(|(pt, limits)| slot.pts.values().any(|p| p == pt) && limits.accepts_load(frame_mbs, mbps))
 }
 
 /// H.264 and AV1: meter every packet on arrival. Existing segments receive immediately; only
@@ -5202,7 +5214,9 @@ pub(crate) mod tests {
                     codec::Av1Declared { level: 13, tier: 0 },
                 ));
             } else {
-                slot.pts.insert(VideoCodec::H264(0x42e01f), 102.into());
+                // H.264 level 5.1: decodes the 1080p60 replacement.
+                slot.pts.insert(VideoCodec::H264(0x42e033), 102.into());
+                slot.h264 = h264_limits(102, 0x42e033);
             }
         }
         let key = Forward {
@@ -5304,14 +5318,17 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn a_viewer_who_declared_too_low_a_level_gets_h264_or_a_refusal_never_a_silent_slot() {
-        for h264 in [true, false] {
+        // The viewer's H.264: level 4.2 decodes the 1080p60 replacement, level 3.1 does not.
+        for h264 in [Some(0x42e02a), Some(0x42e01f), None] {
             let (mut sfu, origin, now, _) = recovery_fixture(&[1]).await;
             let slot = &mut sfu.watchers.get_mut(&1).unwrap().slots[0];
             slot.keyframe_at = None;
             slot.pts.clear();
             slot.pts.insert(VideoCodec::Av1, 45.into());
-            if h264 {
-                slot.pts.insert(VideoCodec::H264(0x42e01f), 102.into());
+            slot.h264.clear();
+            if let Some(profile) = h264 {
+                slot.pts.insert(VideoCodec::H264(profile), 102.into());
+                slot.h264 = h264_limits(102, profile);
             }
             // Browsers decode 1080p but declared the default level 3.1; the stream is 4.1.
             slot.av1 = Some(codec::Av1Limits::new(
@@ -5326,16 +5343,47 @@ pub(crate) mod tests {
             sfu.forward_packets("h264", &origin, vec![(key, true)], now);
             let slot = &sfu.watchers[&1].slots[0];
             let recovery = origin.recovery.lock().unwrap();
-            if h264 {
+            if h264 == Some(0x42e02a) {
                 // The existing "viewer without AV1" switch: the share turns to H.264.
                 assert!(recovery.pending && !recovery.av1());
                 assert!(slot.grant.is_some() && slot.segment.waiting());
             } else {
-                // Nothing it decodes: refused, as a viewer without a matching codec is.
-                assert!(!recovery.pending && recovery.av1());
-                assert!(slot.grant.is_none());
+                // Nothing it decodes, the replacement included: refused, as a viewer without a
+                // matching codec is, and the share keeps AV1.
+                assert!(!recovery.pending && recovery.av1(), "{h264:x?}");
+                assert!(slot.grant.is_none(), "{h264:x?}");
             }
         }
+    }
+
+    /// The limits of one offered H.264 payload type, without verified capabilities.
+    fn h264_limits(pt: u8, profile_level_id: u32) -> HashMap<Pt, codec::Limits> {
+        let sdp = format!(
+            "m=video 9 UDP/TLS/RTP/SAVPF {pt}\r\na=mid:0\r\na=rtpmap:{pt} H264/90000\r\n\
+             a=fmtp:{pt} packetization-mode=1;profile-level-id={profile_level_id:06x}\r\n"
+        );
+        codec::offered(&sdp, &[]).remove(&Mid::from("0")).unwrap()
+    }
+
+    #[test]
+    fn only_a_viewer_who_decodes_the_h264_replacement_turns_an_av1_share() {
+        let mut slot = Slot::new(Mid::from("a"), HashMap::from([(VideoCodec::H264(0x42e01f), Pt::from(102))]));
+        slot.h264 = h264_limits(102, 0x42e01f);
+        let main = av1_stream::tests::main;
+        // Level 3.1: 720p30-class frames only (3,600 MBs, 108,000 MB/s).
+        assert!(!decodes_h264_replacement(&slot, main(1920, 1080)));
+        assert!(!decodes_h264_replacement(&slot, main(1280, 720)), "720p at 60 fps exceeds 3.1");
+        slot.h264 = h264_limits(102, 0x42e033);
+        for size in [main(1280, 720), main(1920, 1080), main(2560, 1440), main(3840, 2160)] {
+            assert!(decodes_h264_replacement(&slot, size), "{size:?}: replaced at no more than 1440p60");
+        }
+        // A cap from an earlier decode failure bounds it too.
+        slot.decode_cap = Some((3600, 108_000));
+        assert!(!decodes_h264_replacement(&slot, main(1920, 1080)));
+        slot.decode_cap = None;
+        // Limits of a payload type the slot did not negotiate do not count.
+        slot.pts.clear();
+        assert!(!decodes_h264_replacement(&slot, main(1920, 1080)));
     }
 
     #[tokio::test]
