@@ -1,10 +1,9 @@
 import * as ContextMenu from "@radix-ui/react-context-menu";
-import * as Dropdown from "@radix-ui/react-dropdown-menu";
-import { Check, ChevronRight, Plus } from "lucide-react";
-import { useT, useLanguage, countKey } from "../i18n";
+import { Check, ChevronRight, Folder, Plus } from "lucide-react";
+import type { CSSProperties } from "react";
+import { useT } from "../i18n";
 import { cn } from "../lib/cn";
-import { useEffect, useRef, type RefObject } from "react";
-import { useBookmarks, useServerGroups, useSettings, type Bookmark, type ServerGroup } from "../state/settings";
+import { useBookmarks, useServerGroups, useSettings, type Bookmark } from "../state/settings";
 import { useUi } from "../state/stores";
 import { TeamSpeakBadge } from "./badges";
 import { Avatar, Tooltip, menuContent, menuItem, menuItemDanger, menuSeparator, panelCard } from "./kit";
@@ -46,7 +45,11 @@ function GroupSubmenu({ server }: { server: Bookmark }) {
   );
 }
 
-function ServerButton({ b, card }: { b: Bookmark; card?: boolean }) {
+/** How strongly an unfolded group tints the column behind its servers. */
+const WASH_PERCENT = 10;
+
+/** `wash`: the colour of the group it sits in, whose faint wash its badge's cut-out then matches. */
+function ServerButton({ b, card, wash }: { b: Bookmark; card?: boolean; wash?: string }) {
   const t = useT();
   const openDialog = useUi((s) => s.openDialog);
   const { isActive, open } = useBookmarkOpener();
@@ -61,15 +64,20 @@ function ServerButton({ b, card }: { b: Bookmark; card?: boolean }) {
               aria-label={b.name}
               aria-current={active ? "true" : undefined}
               className={cn(
-                "t cursor-pointer overflow-hidden transition-[border-radius,box-shadow] duration-150",
-                active ? cn("rounded-xl ring-2 ring-accent ring-offset-2", card ? "ring-offset-side" : "ring-offset-rail") : "rounded-[22px] hover:rounded-xl",
+                "t cursor-pointer overflow-hidden transition-[border-radius] duration-150",
+                // An outline, not a ring: its gap shows whatever is behind it, the column or a group's wash.
+                active ? "rounded-xl outline-2 outline-offset-2 outline-accent" : "rounded-[22px] hover:rounded-xl",
               )}
             >
               <Avatar name={b.name} seed={b.address} size={44} square className="!rounded-none" />
             </button>
           </Tooltip>
           {b.kind === "teamspeak" && (
-            <TeamSpeakBadge short className={cn("pointer-events-none absolute right-0 -bottom-0.5 ring-2", card ? "ring-side" : "ring-rail")} />
+            <TeamSpeakBadge
+              short
+              className={cn("pointer-events-none absolute right-0 -bottom-0.5 ring-2", card ? "ring-side" : "ring-rail")}
+              style={wash ? ({ "--tw-ring-color": `color-mix(in srgb, ${wash} ${WASH_PERCENT}%, var(--${card ? "side" : "rail"}))` } as CSSProperties) : undefined}
+            />
           )}
         </div>
       </ContextMenu.Trigger>
@@ -92,141 +100,66 @@ function ServerButton({ b, card }: { b: Bookmark; card?: boolean }) {
   );
 }
 
-/** The group's coloured name above its servers: folds or unfolds it, and edits it from its context menu. */
-function GroupLabel({ group, labelRef }: { group: ServerGroup; labelRef: RefObject<HTMLButtonElement | null> }) {
-  const t = useT();
-  const openDialog = useUi((s) => s.openDialog);
-  const toggle = () => useSettings.getState().updateServerGroup(group.id, { collapsed: !group.collapsed });
-  return (
-    <ContextMenu.Root>
-      <ContextMenu.Trigger asChild>
-        <button
-          ref={labelRef}
-          onClick={toggle}
-          aria-expanded={!group.collapsed}
-          title={`${group.name} · ${group.collapsed ? t("group.expand") : t("group.collapse")}`}
-          // The column's full width (past its padding), so short names fit unclipped.
-          className="t -mx-2.5 w-16 cursor-pointer truncate px-1 text-center text-[9.5px] leading-4 font-bold tracking-[0.02em] uppercase opacity-90 hover:opacity-100"
-          style={{ color: group.color }}
-        >
-          {group.name}
-        </button>
-      </ContextMenu.Trigger>
-      <ContextMenu.Portal>
-        <ContextMenu.Content className={menuContent}>
-          <ContextMenu.Item className={menuItem} onSelect={toggle}>
-            {group.collapsed ? t("group.expand") : t("group.collapse")}
-          </ContextMenu.Item>
-          <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "serverGroup", id: group.id })}>
-            {t("group.edit")}
-          </ContextMenu.Item>
-          <ContextMenu.Separator className={menuSeparator} />
-          <ContextMenu.Item className={cn(menuItem, menuItemDanger)} onSelect={() => useSettings.getState().removeServerGroup(group.id)}>
-            {t("group.delete")}
-          </ContextMenu.Item>
-        </ContextMenu.Content>
-      </ContextMenu.Portal>
-    </ContextMenu.Root>
-  );
-}
-
 /**
- * A folded group: one tile with up to four of its servers, which opens a menu of them beside the column
- * (the column does not move). Ringed in the accent while the open server is one of them.
+ * A group, folded like a Discord folder: one button that is a tile of four of its servers while folded
+ * and a folder icon over them while unfolded, inside a faint wash of the group's colour. Its name is only
+ * in the tooltip; its context menu edits it.
  */
-function GroupTile({ group, servers, card, onUnfold }: ShownGroup & { card?: boolean; onUnfold: () => void }) {
-  const t = useT();
-  const lang = useLanguage();
-  const openDialog = useUi((s) => s.openDialog);
-  const { isActive, open } = useBookmarkOpener();
-  const active = servers.some(isActive);
-  return (
-    <Dropdown.Root>
-      <Tooltip label={group.name} side="right">
-        <Dropdown.Trigger asChild>
-          <button
-            aria-label={t("group.tile", { name: group.name })}
-            aria-current={active ? "true" : undefined}
-            className={cn(
-              "t grid size-11 shrink-0 cursor-pointer grid-cols-2 gap-0.5 rounded-xl border p-1 transition-shadow",
-              active && cn("ring-2 ring-accent ring-offset-2", card ? "ring-offset-side" : "ring-offset-rail"),
-            )}
-            style={{ background: `${group.color}22`, borderColor: `${group.color}55` }}
-          >
-            {servers.slice(0, 4).map((b) => (
-              <Avatar key={b.id} name={b.name} seed={b.address} size={16} square className="!rounded-[4px]" />
-            ))}
-          </button>
-        </Dropdown.Trigger>
-      </Tooltip>
-      <Dropdown.Portal>
-        <Dropdown.Content
-          side="right"
-          align="start"
-          sideOffset={10}
-          collisionPadding={8}
-          // A long group scrolls between its name and its buttons instead of running off the screen.
-          className={cn(menuContent, "flex max-h-[var(--radix-dropdown-menu-content-available-height)] w-64 flex-col p-1.5")}
-        >
-          <div className="flex shrink-0 items-center gap-2 px-2 pt-1 pb-2 text-sm font-semibold">
-            <span className="size-2.5 shrink-0 rounded-[3px]" style={{ background: group.color }} />
-            <span className="flex-1 truncate">{group.name}</span>
-            <span className="text-xs font-normal text-subtle">{t(countKey(lang, "group.count", servers.length), { count: servers.length })}</span>
-          </div>
-          <div className="min-h-0 flex-1 overflow-y-auto">
-            {servers.map((b) => (
-              <Dropdown.Item key={b.id} className={cn(menuItem, "h-9")} onSelect={() => open(b)}>
-                <Avatar name={b.name} seed={b.address} size={24} square />
-                <span className="flex-1 truncate font-medium">{b.name}</span>
-                {b.kind === "teamspeak" && <TeamSpeakBadge short />}
-                {isActive(b) && <span className="text-xs text-accent">{t("group.current")}</span>}
-              </Dropdown.Item>
-            ))}
-          </div>
-          <div className="mt-1.5 flex shrink-0 gap-1.5 border-t border-line px-0.5 pt-2">
-            <Dropdown.Item
-              className={cn(menuItem, "flex-1 justify-center whitespace-nowrap bg-hover text-xs text-muted")}
-              onSelect={() => {
-                onUnfold();
-                useSettings.getState().updateServerGroup(group.id, { collapsed: false });
-              }}
-            >
-              {t("group.expand")}
-            </Dropdown.Item>
-            <Dropdown.Item className={cn(menuItem, "flex-1 justify-center whitespace-nowrap bg-hover text-xs text-muted")} onSelect={() => openDialog({ kind: "serverGroup", id: group.id })}>
-              {t("group.edit")}
-            </Dropdown.Item>
-          </div>
-        </Dropdown.Content>
-      </Dropdown.Portal>
-    </Dropdown.Root>
-  );
-}
-
 function RailGroup({ group, servers, card }: ShownGroup & { card?: boolean }) {
-  const label = useRef<HTMLButtonElement>(null);
-  // Unfolding from the tile's menu removes the tile, which held the focus: the group's name takes it.
-  const refocus = useRef(false);
-  useEffect(() => {
-    if (group.collapsed || !refocus.current) return;
-    refocus.current = false;
-    const frame = requestAnimationFrame(() => label.current?.focus());
-    return () => cancelAnimationFrame(frame);
-  }, [group.collapsed]);
+  const t = useT();
+  const openDialog = useUi((s) => s.openDialog);
+  const { isActive } = useBookmarkOpener();
+  const toggle = () => useSettings.getState().updateServerGroup(group.id, { collapsed: !group.collapsed });
+  // While folded the tile stands in for the open server, so it takes the server's ring.
+  const active = group.collapsed && servers.some(isActive);
   return (
-    <div role="group" aria-label={group.name} className="relative flex w-full flex-col items-center gap-2">
-      <GroupLabel group={group} labelRef={label} />
-      {group.collapsed ? (
-        <GroupTile group={group} servers={servers} card={card} onUnfold={() => (refocus.current = true)} />
-      ) : (
-        <>
-          {/* The bracket: a coloured line along the unfolded group's servers. */}
-          <span aria-hidden className="absolute top-6 bottom-0 -left-1.5 w-[3px] rounded-full" style={{ background: group.color }} />
-          {servers.map((b) => (
-            <ServerButton key={b.id} b={b} card={card} />
-          ))}
-        </>
-      )}
+    <div
+      role="group"
+      aria-label={group.name}
+      className={cn("flex shrink-0 flex-col items-center gap-2", !group.collapsed && "-mx-1.5 w-14 rounded-[22px] py-1.5")}
+      style={group.collapsed ? undefined : { background: `color-mix(in srgb, ${group.color} ${WASH_PERCENT}%, transparent)`, boxShadow: `inset 0 0 0 1px ${group.color}2e` }}
+    >
+      <ContextMenu.Root>
+        <ContextMenu.Trigger asChild>
+          <div className="flex w-full justify-center">
+            <Tooltip label={group.name} side="right">
+              <button
+                onClick={toggle}
+                aria-label={group.name}
+                aria-expanded={!group.collapsed}
+                aria-current={active ? "true" : undefined}
+                className={cn(
+                  "t size-11 shrink-0 cursor-pointer",
+                  group.collapsed ? "grid grid-cols-2 place-items-center rounded-2xl p-1.5" : "flex items-center justify-center rounded-[22px] hover:rounded-xl",
+                  active && "outline-2 outline-offset-2 outline-accent",
+                )}
+                style={group.collapsed ? { background: `${group.color}26` } : undefined}
+              >
+                {group.collapsed ? (
+                  servers.slice(0, 4).map((b) => <Avatar key={b.id} name={b.name} seed={b.address} size={14} square className="!rounded-[4px]" />)
+                ) : (
+                  <Folder className="size-5" fill="currentColor" style={{ color: group.color }} />
+                )}
+              </button>
+            </Tooltip>
+          </div>
+        </ContextMenu.Trigger>
+        <ContextMenu.Portal>
+          <ContextMenu.Content className={menuContent}>
+            <ContextMenu.Item className={menuItem} onSelect={toggle}>
+              {group.collapsed ? t("group.expand") : t("group.collapse")}
+            </ContextMenu.Item>
+            <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "serverGroup", id: group.id })}>
+              {t("group.edit")}
+            </ContextMenu.Item>
+            <ContextMenu.Separator className={menuSeparator} />
+            <ContextMenu.Item className={cn(menuItem, menuItemDanger)} onSelect={() => useSettings.getState().removeServerGroup(group.id)}>
+              {t("group.delete")}
+            </ContextMenu.Item>
+          </ContextMenu.Content>
+        </ContextMenu.Portal>
+      </ContextMenu.Root>
+      {!group.collapsed && servers.map((b) => <ServerButton key={b.id} b={b} card={card} wash={group.color} />)}
     </div>
   );
 }
