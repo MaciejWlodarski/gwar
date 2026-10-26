@@ -1,5 +1,5 @@
 // @vitest-environment happy-dom
-import { act } from "react";
+import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { welcome } from "../net/testing";
@@ -139,32 +139,40 @@ describe("watched video frames", () => {
   }
   const visible = (video: HTMLVideoElement) => !video.classList.contains("opacity-0");
 
-  it("requests a keyframe after binding each replacement media player", async () => {
-    vi.useFakeTimers();
-    const frames = vi.spyOn(controller.screen, "requestFrame").mockImplementation(() => {
-      expect(container.querySelector("video")?.srcObject).not.toBeNull();
-    });
-    try {
-      const stream = new MediaStream();
-      const video = await grant(1, 1, stream);
-      expect(frames).toHaveBeenCalledExactlyOnceWith("A", 1, 1);
-      await act(async () => vi.advanceTimersByTimeAsync(1000));
-      expect(frames).toHaveBeenCalledTimes(2);
-      await act(async () => video.dispatchEvent(new Event("loadeddata")));
-      expect(visible(video)).toBe(true);
-      await act(async () => vi.advanceTimersByTimeAsync(70_000));
-      expect(frames).toHaveBeenCalledTimes(2);
-      // A new player needs a keyframe even if the same live stream has already played.
-      await act(async () => root.render(null));
-      const replacement = await grant(1, 1, stream);
-      expect(replacement).not.toBe(video);
-      expect(frames.mock.calls).toEqual([["A", 1, 1], ["A", 1, 1], ["A", 1, 1]]);
-      expect(visible(replacement)).toBe(false);
-      await act(async () => replacement.dispatchEvent(new Event("loadeddata")));
-      expect(visible(replacement)).toBe(true);
-      await act(async () => vi.advanceTimersByTimeAsync(70_000));
-      expect(frames).toHaveBeenCalledTimes(3);
-    } finally { frames.mockRestore(); vi.useRealTimers(); }
+  it("keeps the attached media player and a static frame through a view remount", async () => {
+    const stream = new MediaStream();
+    const video = await grant(1, 1, stream);
+    await act(async () => video.dispatchEvent(new Event("loadeddata")));
+    await act(async () => root.render(null));
+    expect(video.srcObject).toBe(stream);
+    const replacement = await grant(1, 1, stream);
+    expect(replacement).toBe(video);
+    expect(visible(replacement)).toBe(true);
+    expect(container.textContent).not.toContain("Connecting");
+  });
+
+  it("does not detach or rebind the stream during StrictMode's effect remount", async () => {
+    const stream = new MediaStream();
+    const video = await grant(1, 1, stream);
+    const bind = vi.fn();
+    Object.defineProperty(video, "srcObject", { configurable: true, get: () => stream, set: bind });
+    await act(async () => root.render(<StrictMode><ShareVideo share="A" /></StrictMode>));
+    expect(container.querySelector("video")).toBe(video);
+    expect(bind).not.toHaveBeenCalled();
+    await act(async () => video.dispatchEvent(new Event("loadeddata")));
+    expect(visible(video)).toBe(true);
+  });
+
+  it("detaches an unmounted player when its transport retires", async () => {
+    const stream = new MediaStream();
+    const video = await grant(1, 1, stream);
+    await act(async () => root.render(null));
+    expect(video.srcObject).toBe(stream);
+    await act(async () => useScreen.getState().dispatch({ type: "transport", run: 2, phase: "connecting" }));
+    expect(video.srcObject).toBeNull();
+    const replacement = await grant(2, 1, new MediaStream());
+    expect(replacement).not.toBe(video);
+    expect(visible(replacement)).toBe(false);
   });
 
   it("first use shows its first frame without waiting for another frame", async () => {

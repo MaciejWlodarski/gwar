@@ -3,7 +3,7 @@
  * menu, the sharing bar, LIVE badges and the stage.
  */
 import { Maximize, MessageSquare, MessageSquareOff, Minimize, MonitorOff, MonitorUp, PictureInPicture2, ScreenShareOff, X } from "lucide-react";
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { cn } from "../lib/cn";
 import { isDesktop } from "../platform";
@@ -249,53 +249,71 @@ export function LiveBadge({ client, name }: { client: Client; name: string }) {
 
 // -------------------------------------------------------------------- stage
 
+// Linux WebKit can stop supplying a replacement player's frames/metadata even while
+// its receiver keeps decoding. Keep one attached player per slot stream and move it
+// between views. A new transport supplies new streams, so it cannot inherit old pixels.
+const slotVideos = new Map<MediaStream, { video: HTMLVideoElement; received: boolean }>();
+useScreen.subscribe(screen => {
+  for (const [stream, player] of slotVideos) {
+    if (screen.streams.includes(stream)) continue;
+    player.video.srcObject = null;
+    slotVideos.delete(stream);
+  }
+});
+
 /** A watched share's video, from its slot's stream. */
 export function ShareVideo({ share, className, onDoubleClick, videoRef }: { share: string; className?: string; onDoubleClick?: () => void; videoRef?: (video: HTMLVideoElement | null) => void }) {
   const t = useT();
   const run = useScreen(s => s.transport.run);
   const watchId = useScreen(s => s.watches.find(w => w.share === share)?.id);
   const stream = useScreen(s => { const slot = slotOf(s, share); return slot === null ? null : (s.streams[slot] ?? null); });
-  const ref = useRef<HTMLVideoElement | null>(null);
+  const host = useRef<HTMLDivElement | null>(null);
   const [shown, setShown] = useState<MediaStream | null>(null);
   const showing = stream !== null && shown === stream;
-  useEffect(() => {
-    const video = ref.current;
-    if (!video) return;
-    if (video.srcObject !== stream) video.srcObject = stream;
-    if (stream) {
-      void video.play().catch(() => {});
-      // Linux WebKit's new media player needs a keyframe after binding, even when
-      // the receiver already counts decoded frames. The watch-start PLI may be earlier.
-      if (watchId !== undefined) controller.screen.requestFrame(share, run, watchId);
+  useLayoutEffect(() => {
+    const mount = host.current;
+    if (!mount) return;
+    let player = stream ? slotVideos.get(stream) : undefined;
+    if (!player) {
+      const video = document.createElement("video");
+      video.muted = true;
+      video.autoplay = true;
+      video.playsInline = true;
+      player = { video, received: false };
+      if (stream) slotVideos.set(stream, player);
     }
-    return () => { video.srcObject = null; };
-  }, [stream, share, run, watchId]);
-  useEffect(() => {
-    if (!stream || showing || watchId === undefined) return;
-    // Binding the player is asynchronous. Retry within the server's existing PLI
-    // budget until that player receives a frame; never reveal on a timer or stats.
-    const retry = setInterval(() => controller.screen.requestFrame(share, run, watchId), 1000);
-    return () => clearInterval(retry);
-  }, [stream, showing, share, run, watchId]);
-  const received = () => {
-    setShown(stream);
-    if (stream && watchId !== undefined) controller.screen.frameReceived(share, run, watchId);
-  };
+    const { video } = player;
+    video.dataset.share = share;
+    video.className = "size-full object-contain opacity-0";
+    const received = () => {
+      if (!stream) return;
+      player.received = true;
+      video.classList.remove("opacity-0");
+      setShown(stream);
+      if (watchId !== undefined) controller.screen.frameReceived(share, run, watchId);
+    };
+    video.addEventListener("loadeddata", received);
+    video.addEventListener("resize", received);
+    if (onDoubleClick) video.addEventListener("dblclick", onDoubleClick);
+    mount.appendChild(video);
+    videoRef?.(video);
+    if (video.srcObject !== stream) video.srcObject = stream;
+    if (stream) void video.play().catch(() => {});
+    // A static share keeps its one decoded frame when its view remounts.
+    if (player.received || video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) received();
+    return () => {
+      video.removeEventListener("loadeddata", received);
+      video.removeEventListener("resize", received);
+      if (onDoubleClick) video.removeEventListener("dblclick", onDoubleClick);
+      videoRef?.(null);
+      if (video.parentElement === mount) video.remove();
+      // Keep the binding through view/StrictMode remounts. The stream's retirement
+      // above detaches it and bounds the cache to the run's receive slots.
+    };
+  }, [stream, share, run, watchId, onDoubleClick, videoRef]);
   return (
     <div className={cn("relative flex min-h-0 items-center justify-center overflow-hidden bg-black", className)}>
-      <video
-        // A replacement run/watch must discard the media element's own cached frame too.
-        key={`${run}:${watchId}`}
-        ref={video => { ref.current = video; videoRef?.(video); }}
-        data-share={share}
-        muted
-        autoPlay
-        playsInline
-        onLoadedData={received}
-        onResize={received}
-        onDoubleClick={onDoubleClick}
-        className={cn("size-full object-contain", !showing && "opacity-0")}
-      />
+      <div ref={host} className="contents" />
       {!showing && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-white/70">{t("screen.connecting")}</div>
       )}

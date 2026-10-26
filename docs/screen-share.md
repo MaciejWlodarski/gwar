@@ -2707,22 +2707,22 @@ from native capture is PR 10.
     `voice.talking` event.
   - When a member viewer reuses a receive slot with no other active or pending
     watch, the client renews the transport to discard the old receiver's decoded
-    frames. Each watch/run also gets a fresh video element. Streams stay intact
-    within their run; first-use slots keep the current transport.
+    frames. Each slot stream gets one attached video element, moved between the
+    stage and thumbnails without rebinding. Retiring the stream detaches and
+    discards that player; a new transport's streams always get fresh elements.
+    The cache is bounded by the run's receive slots. First-use slots keep the
+    current transport.
   - With another active or pending watch, slot reuse keeps the transport and
     leaves those watches uninterrupted. Known cosmetic limitation: the reused
     slot may briefly show the previous share's last frame until the new share's
     first keyframe decodes.
-  - The first decoded frame reveals the video, including a static share's single
-    startup keyframe. Watch assignment already requests a budgeted, retried PLI.
-    Each video attachment also requests a keyframe through the existing protocol,
-    retrying once per second within the server's PLI budget until that player
-    receives a frame (and cancelling retries on detachment):
-    Linux WebKit's replacement media player can otherwise stay at 0×0 while the
-    receiver counts decoded frames, if the watch-start keyframe arrived before
-    attachment. This also covers moving a watch between the stage and thumbnails;
-    it neither renews the transport nor restarts another watch. One post-attachment
-    keyframe is enough, with no new server notification or timed reveal. The
+  - Linux WebKit can leave a replacement media player at 0×0 even while the
+    receiver decodes fresh keyframes. Preserving the attached player avoids this
+    and keeps a static share visible through view/StrictMode remounts without
+    requesting another frame. A first-use or renewed slot reveals its first
+    decoded frame, including a static share's single startup keyframe. Watch
+    assignment already requests a budgeted, retried PLI; no new server
+    notification, extra frame-counter gate or timed reveal is required. The
     existing offer/connect and H.264 recovery watchdogs still apply. A connected
     receiver that never supplies a first frame ends its watch 35 s after its
     grant through the normal unwatch/error path, also for VP9 and older servers.

@@ -432,12 +432,13 @@ async function run(browsers, web, server, token) {
   await codecFlow(ws, wv, wsShare, "video/vp9");
   await bar(ws).getByText("2 watching").waitFor({ timeout: 10_000 });
 
-  // Both media players remount when the real Stage swaps focus. WebKit needs a
-  // post-attachment keyframe even though both original receivers keep decoding.
+  // The real Stage moves both players without rebinding their live streams.
   const beforeFocus = await session(wv, (_, screen) => ({ transport: screen.transport, watches: screen.watches }));
+  await wv.evaluate(() => { window.__stageVideos = new Map([...document.querySelectorAll("video[data-share]")].map(v => [v.dataset.share, v])); });
   await wv.evaluate(share => document.querySelector(`video[data-share="${share}"]`).closest('[role="button"]').click(), csShare);
-  await sees(wv, csShare, 1, "stage switch renders the focused share in a replacement player");
-  await sees(wv, wsShare, 2, "stage switch renders the thumbnail in a replacement player");
+  await sees(wv, csShare, 1, "stage switch keeps the focused share's player rendering");
+  await sees(wv, wsShare, 2, "stage switch keeps the thumbnail's player rendering");
+  assert.ok(await wv.evaluate(() => [...window.__stageVideos].every(([share, video]) => document.querySelector(`video[data-share="${share}"]`) === video)), "a focus change preserves both attached media players");
   assert.deepEqual(await session(wv, (_, screen) => ({ transport: screen.transport, watches: screen.watches })), beforeFocus, "a focus change keeps the transport and watches");
 
   // Start → stop → start while watching two other shares: the watch transport is untouched.
