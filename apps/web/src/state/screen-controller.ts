@@ -24,6 +24,8 @@ export type ShareAvailability = Exclude<ScreenSupport, "ok"> | "ok" | "teamspeak
 
 /** How long `screen.watch` is retried while the server has not seen the watch transport connect. */
 const WATCH_UNAVAILABLE_MS = 5_000;
+/** A watch's first frame must arrive within this long after its grant, across stage changes. */
+const FIRST_FRAME_TIMEOUT_MS = 35_000;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -96,6 +98,8 @@ export class ScreenController {
   private transportReady: Promise<number> | null = null;
   /** A receiver that carried a share can still hold its last decoded frame. */
   private readonly usedSlots = new Set<number>();
+  /** Owned by the grant, not by a stage/thumbnail video that can remount. */
+  private readonly firstFrameTimers = new Map<number, { run: number; timer: ReturnType<typeof setTimeout> }>();
   private attempts = 0;
   private watchIds = 0;
   /** Each share's watch requests, one at a time. */
@@ -355,11 +359,13 @@ export class ScreenController {
         await this.startWatch(conn, share, id, generation);
         return;
       }
+      this.expectFirstFrame(share, run, id);
       dispatch({ type: "granted", run, id, slot });
       if (useScreen.getState().stage === share) void conn.request("screen.focus", { share }).catch(() => {});
     } catch (e) {
       if (!alive() || (run !== undefined && useScreen.getState().transport.run !== run)) return;
       const text = this.watchError(e);
+      this.clearFirstFrame(id);
       dispatch({ type: "unwatch", share });
       useUi.getState().toast("error", text);
     }
@@ -401,7 +407,9 @@ export class ScreenController {
 
   async unwatch(share: string): Promise<void> {
     const conn = this.link();
-    if (!useScreen.getState().watches.some(w => w.share === share)) return;
+    const watch = useScreen.getState().watches.find(w => w.share === share);
+    if (!watch) return;
+    this.clearFirstFrame(watch.id);
     dispatch({ type: "unwatch", share });
     const next = useScreen.getState().stage;
     if (next && conn) void conn.request("screen.focus", { share: next }).catch(() => {});
@@ -412,6 +420,25 @@ export class ScreenController {
         if (this.generation === generation && this.link() === conn) await conn.request("screen.unwatch", { share }).catch(() => {});
       });
     }
+  }
+
+  private expectFirstFrame(share: string, run: number, id: number): void {
+    this.clearFirstFrame(id);
+    const timer = setTimeout(() => this.frameFailed(share, run, id), FIRST_FRAME_TIMEOUT_MS);
+    this.firstFrameTimers.set(id, { run, timer });
+  }
+
+  private clearFirstFrame(id: number): void {
+    const pending = this.firstFrameTimers.get(id);
+    if (pending) clearTimeout(pending.timer);
+    this.firstFrameTimers.delete(id);
+  }
+
+  /** Once satisfied, a static share never needs another frame on a stage change. */
+  frameReceived(share: string, run: number, id: number): void {
+    const screen = useScreen.getState();
+    if (screen.transport.run !== run || !screen.watches.some(w => w.id === id && w.share === share && w.status === "watching")) return;
+    if (this.firstFrameTimers.get(id)?.run === run) this.clearFirstFrame(id);
   }
 
   /** A connected receiver can stay silent without tripping the H.264 decode watchdog. */
@@ -511,6 +538,8 @@ export class ScreenController {
    * also cancels its connection timeout, so nothing else would ever settle that wait.
    */
   private dropTransport(): void {
+    for (const { timer } of this.firstFrameTimers.values()) clearTimeout(timer);
+    this.firstFrameTimers.clear();
     this.transport?.close();
     this.usedSlots.clear();
     this.transport = null;
@@ -553,7 +582,10 @@ export class ScreenController {
         const screen = useScreen.getState();
         // A slot the server frees on its own comes before `screen.stopped`, which says why.
         const ended = share === null && run === screen.transport.run ? screen.watches.find(w => w.slot === slot && w.status === "watching") : undefined;
-        if (ended) this.released.set(ended.share, { onStage: screen.stage === ended.share });
+        if (ended) {
+          this.clearFirstFrame(ended.id);
+          this.released.set(ended.share, { onStage: screen.stage === ended.share });
+        }
         if (this.transport?.run === run) this.transport.clearSlot(slot);
         dispatch({ type: "slot", run, slot, share });
         return;
@@ -572,10 +604,13 @@ export class ScreenController {
         const screen = useScreen.getState();
         const released = this.released.get(share);
         this.released.delete(share);
-        const watched = screen.watches.some(w => w.share === share);
+        const watched = screen.watches.find(w => w.share === share);
         if (!watched && !released) return;
         const onStage = watched ? screen.stage === share : released!.onStage;
-        if (watched) dispatch({ type: "unwatch", share });
+        if (watched) {
+          this.clearFirstFrame(watched.id);
+          dispatch({ type: "unwatch", share });
+        }
         if (reason === "codec") useUi.getState().toast("error", tNow("screen.cantDecode"));
         else if (reason === "access") useUi.getState().toast("info", tNow("screen.noLongerWatch"));
         else if (onStage) useUi.getState().toast("info", tNow("screen.ended"));

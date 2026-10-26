@@ -265,13 +265,10 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef }: { shar
     if (stream) void video.play().catch(() => {});
     return () => { video.srcObject = null; };
   }, [stream, run, watchId]);
-  useEffect(() => {
-    if (!stream || watchId === undefined || showing) return;
-    // Allow the server's budgeted startup PLI retries and H.264 recovery, but end a
-    // silent watch rather than wait forever (also on older servers and VP9).
-    const timer = setTimeout(() => controller.screen.frameFailed(share, run, watchId), 35_000);
-    return () => clearTimeout(timer);
-  }, [share, stream, run, watchId, showing]);
+  const received = () => {
+    setShown(stream);
+    if (stream && watchId !== undefined) controller.screen.frameReceived(share, run, watchId);
+  };
   return (
     <div className={cn("relative flex min-h-0 items-center justify-center overflow-hidden bg-black", className)}>
       <video
@@ -282,8 +279,8 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef }: { shar
         muted
         autoPlay
         playsInline
-        onLoadedData={() => setShown(stream)}
-        onResize={() => setShown(stream)}
+        onLoadedData={received}
+        onResize={received}
         onDoubleClick={onDoubleClick}
         className={cn("size-full object-contain", !showing && "opacity-0")}
       />

@@ -2717,8 +2717,11 @@ from native capture is PR 10.
     startup keyframe. Watch assignment already requests a budgeted, retried PLI;
     no extra frame, new server notification or timed reveal is required. The
     existing offer/connect and H.264 recovery watchdogs still apply. A connected
-    receiver that never supplies a first frame ends its watch after 35 s through
-    the normal unwatch/error path, also for VP9 and older servers. Rapid
+    receiver that never supplies a first frame ends its watch 35 s after its
+    grant through the normal unwatch/error path, also for VP9 and older servers.
+    The controller owns this deadline per run/watch ID: switching the stage or
+    remounting a video cannot restart it. The first frame, unwatch, server
+    release/stop, or transport retirement clears it. Rapid
     sole-watch reuse can hit the existing offer rate limit and its bounded retry
     delay.
   - No sound in the first release; phase 2 adds a volume slider and mute per

@@ -329,6 +329,41 @@ describe("reused receive slots", () => {
     expect(toast).toHaveBeenCalledExactlyOnceWith("error", "The connection for watching screen shares was lost.");
     screen.reset();
   });
+
+  it("clears only the matching first-frame deadline and never rearms it", async () => {
+    const { screen, start } = setup();
+    const old = await start(false);
+    const watch = useScreen.getState().watches[0]!;
+    const failed = vi.spyOn(screen, "frameFailed");
+    expect(vi.getTimerCount()).toBe(1);
+    screen.frameReceived("B", old.params.run - 1, watch.id);
+    screen.frameReceived("B", old.params.run, watch.id - 1);
+    screen.frameReceived("A", old.params.run, watch.id);
+    expect(vi.getTimerCount()).toBe(1);
+    screen.frameReceived("B", old.params.run, watch.id);
+    expect(vi.getTimerCount()).toBe(0);
+    screen.frameReceived("B", old.params.run, watch.id);
+    await vi.advanceTimersByTimeAsync(70_000);
+    expect(failed).not.toHaveBeenCalled();
+    expect(useScreen.getState().watches).toHaveLength(1);
+    screen.reset();
+  });
+
+  it.each(["unwatch", "release", "stop", "failure", "reset"])("clears a pending first-frame deadline on %s", async how => {
+    const { screen, start } = setup();
+    const old = await start(false);
+    const failed = vi.spyOn(screen, "frameFailed");
+    expect(vi.getTimerCount()).toBe(1);
+    if (how === "unwatch") await screen.unwatch("B");
+    if (how === "release") screen.handleEvent({ ev: "screen.slot", d: { run: old.params.run, slot: 1, share: null } });
+    if (how === "stop") screen.handleEvent({ ev: "screen.stopped", d: { share: "B", reason: "stopped" } });
+    if (how === "failure") old.params.state("failed");
+    if (how === "reset") screen.reset();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(failed).not.toHaveBeenCalled();
+    screen.reset();
+  });
 });
 
 describe("watch requests (review round 1)", () => {

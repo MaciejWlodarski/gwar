@@ -455,7 +455,15 @@ async function run(browsers, web, server, token) {
   const oldViewerRun = await session(cv, (_, screen) => screen.transport.run);
   await cv.evaluate(share => {
     const video = document.querySelector(`video[data-share="${share}"]`);
-    window.__otherWatch = { video, stream: video.srcObject };
+    const observation = window.__otherWatch = { video, stream: video.srcObject, visible: true, counters: [] };
+    const sample = () => {
+      const current = document.querySelector(`video[data-share="${share}"]`);
+      observation.visible &&= current === video && current.srcObject === observation.stream && getComputedStyle(current).opacity === "1";
+      const frame = window.__readBarcode(current);
+      if (frame && !frame.invalid) observation.counters.push(frame.counter);
+      observation.sampler = requestAnimationFrame(sample);
+    };
+    sample();
   }, wsShare);
   const oldSoloRun = await session(ws, (_, screen) => screen.transport.run);
   await ws.evaluate(share => {
@@ -481,13 +489,27 @@ async function run(browsers, web, server, token) {
   }, wsShare), "the other active watch keeps its video element, stream and visibility");
   checks.push({ check: "slot reuse leaves other active watches uninterrupted", ok: true });
   await sees(ws, second, 6, "sole watch after slot reuse");
+  const otherWatch = await cv.evaluate(() => {
+    cancelAnimationFrame(window.__otherWatch.sampler);
+    return { visible: window.__otherWatch.visible, frames: new Set(window.__otherWatch.counters).size };
+  });
+  assert.ok(otherWatch.visible, "the untouched watch stays visible throughout sole-watch renewal");
+  if (paintsUnreliably(cv)) checks.push({ check: "untouched watch's barcode progresses during sole-watch renewal", skipped: true, reason: "WebKit on Linux paints remote video unreliably" });
+  else {
+    assert.ok(otherWatch.frames > 1, "the untouched watch's frames progress during sole-watch renewal");
+    checks.push({ check: "untouched watch stays visible and frames progress during sole-watch renewal", ok: true });
+  }
   const reuseFrames = await ws.evaluate(() => {
     cancelAnimationFrame(window.__reuseSampler);
     return window.__reuseFrames;
   });
-  if (!paintsUnreliably(ws)) assert.ok(reuseFrames.length > 0 && reuseFrames.every(id => id === 6), `sole reused slot showed another share: ${reuseFrames}`);
+  if (paintsUnreliably(ws)) checks.push({ check: "sole reused slot displays only the new share's barcode", skipped: true, reason: "WebKit on Linux paints remote video unreliably" });
+  else {
+    assert.ok(reuseFrames.length > 0 && reuseFrames.every(id => id === 6), `sole reused slot showed another share: ${reuseFrames}`);
+    checks.push({ check: "sole reused slot displays only the new share's barcode", ok: true });
+  }
   assert.ok(await session(ws, (_, screen) => screen.transport.run) > oldSoloRun, "a sole reused slot renews its receiver");
-  checks.push({ check: "sole slot reuse renews without displaying the previous share's barcode", ok: true });
+  checks.push({ check: "sole slot reuse renews its receiver", ok: true });
   await session(ws, (_, __, controller, share) => controller.screen.unwatch(share), second);
   await sees(c3, csShare, 1, "still watching the tab share after start → stop → start");
   await sees(c3, wsShare, 2, "still watching the canvas share after start → stop → start");

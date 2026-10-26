@@ -237,16 +237,15 @@ describe("watched video frames", () => {
     } finally { failed.mockRestore(); vi.useRealTimers(); }
   });
 
-  it("bounds a silent receiver's first-frame wait without revealing its pixels", async () => {
-    vi.useFakeTimers();
-    const failed = vi.spyOn(controller.screen, "frameFailed").mockImplementation(() => {});
+  it("reports the first frame with its run/watch ID without creating a component deadline", async () => {
+    const received = vi.spyOn(controller.screen, "frameReceived");
     try {
       const video = await grant(2, 2, new MediaStream());
-      await act(async () => vi.advanceTimersByTimeAsync(34_999));
-      expect(failed).not.toHaveBeenCalled();
-      await act(async () => vi.advanceTimersByTimeAsync(1));
-      expect(failed).toHaveBeenCalledExactlyOnceWith("A", 2, 2);
+      expect(received).not.toHaveBeenCalled();
       expect(visible(video)).toBe(false);
-    } finally { failed.mockRestore(); vi.useRealTimers(); }
+      await act(async () => video.dispatchEvent(new Event("loadeddata")));
+      expect(received).toHaveBeenCalledExactlyOnceWith("A", 2, 2);
+      expect(visible(video)).toBe(true);
+    } finally { received.mockRestore(); }
   });
 });
