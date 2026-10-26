@@ -8,6 +8,7 @@
  * transport (fresh DTLS and SSRCs), and the watch transport belongs to the session, with
  * `SCREEN_SLOTS` fixed receive-only slots the server fills (`screen.slot`).
  */
+import type { Av1Capability } from "../proto/Av1Capability";
 import type { H264Capability } from "../proto/H264Capability";
 import type { ScreenRecovery } from "../proto/ScreenRecovery";
 import type { IceServer } from "../proto/IceServer";
@@ -264,26 +265,150 @@ export async function applyCaptureSpec(track: MediaStreamTrack, quality: ScreenS
   });
 }
 
-/** H.264 mode 1 (Constrained Baseline first), VP9 profile 0, then RTX. */
-export function preferredCodecs(codecs: readonly RTCRtpCodec[]): RTCRtpCodec[] {
+/**
+ * H.264 mode 1 (Constrained Baseline first), VP9 profile 0, then RTX; with `av1`, AV1 profile 0
+ * (Main) ahead of them all (docs/native-media.md, "Codec policy").
+ */
+export function preferredCodecs(codecs: readonly RTCRtpCodec[], av1 = false): RTCRtpCodec[] {
   const mime = (c: RTCRtpCodec) => c.mimeType.toLowerCase();
+  const main = av1 ? codecs.filter(c => mime(c) === "video/av1" && !/(^|;)\s*profile=[^0;]/.test(c.sdpFmtpLine ?? "")) : [];
   const h264 = codecs.filter(c => mime(c) === "video/h264" && /(^|;)\s*packetization-mode=1(?:;|$)/.test(c.sdpFmtpLine ?? "") &&
     /(^|;)\s*profile-level-id=(42[eEcC][0-9a-fA-F]|640[cC]|6400)[0-9a-fA-F]{2}(?:;|$)/.test(c.sdpFmtpLine ?? ""))
     .sort((a, b) => Number(!/profile-level-id=42/i.test(a.sdpFmtpLine ?? "")) - Number(!/profile-level-id=42/i.test(b.sdpFmtpLine ?? "")));
   const vp9 = codecs.filter(c => mime(c) === "video/vp9" && (!c.sdpFmtpLine || /(^|;)\s*profile-id=0\b/.test(c.sdpFmtpLine) || !/profile-id=/.test(c.sdpFmtpLine)));
   const rtx = codecs.filter(c => mime(c) === "video/rtx");
-  return [...h264, ...vp9, ...rtx];
+  return [...main, ...h264, ...vp9, ...rtx];
 }
 
 /** Advertise only the selected side's capabilities: sender support never implies decoder support. */
-function preferCodecs(transceiver: RTCRtpTransceiver, side: "send" | "receive", selected?: "h264" | "vp9"): void {
+function preferCodecs(transceiver: RTCRtpTransceiver, side: "send" | "receive", selected?: "h264" | "vp9", av1 = false): void {
   if (typeof transceiver.setCodecPreferences !== "function") return;
   const sources = side === "send" ? [RTCRtpSender] : [RTCRtpReceiver];
   for (const source of sources) {
-    const codecs = preferredCodecs(source.getCapabilities?.("video")?.codecs ?? []).filter(c => !selected || ["video/rtx", `video/${selected}`].includes(c.mimeType.toLowerCase()));
+    const codecs = preferredCodecs(source.getCapabilities?.("video")?.codecs ?? [], av1).filter(c => !selected || ["video/rtx", `video/${selected}`].includes(c.mimeType.toLowerCase()));
     if (!codecs.some(c => c.mimeType.toLowerCase() !== "video/rtx")) continue;
     try { transceiver.setCodecPreferences(codecs); return; } catch { /* some engines check the other side's list */ }
   }
+}
+
+/** The AV1 RTP specification's Dependency Descriptor header extension. */
+export const DEPENDENCY_DESCRIPTOR = "https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension";
+
+type HeaderExtension = { uri: string; direction: RTCRtpTransceiverDirection };
+type WithHeaderExtensions = RTCRtpTransceiver & {
+  getHeaderExtensionsToNegotiate?(): HeaderExtension[];
+  setHeaderExtensionsToNegotiate?(extensions: HeaderExtension[]): void;
+};
+
+/**
+ * Offers the Dependency Descriptor, which Chromium lists but stops by default. AV1 works without
+ * it: the SFU then finds frame boundaries in the OBUs, and engines without the API just omit it.
+ */
+function negotiateDescriptor(transceiver: RTCRtpTransceiver, direction: "sendonly" | "recvonly"): void {
+  const t = transceiver as WithHeaderExtensions;
+  if (typeof t.getHeaderExtensionsToNegotiate !== "function" || typeof t.setHeaderExtensionsToNegotiate !== "function") return;
+  try {
+    const extensions = t.getHeaderExtensionsToNegotiate();
+    if (!extensions.some(e => e.uri === DEPENDENCY_DESCRIPTOR)) return;
+    t.setHeaderExtensionsToNegotiate(extensions.map(e => e.uri === DEPENDENCY_DESCRIPTOR ? { ...e, direction } : e));
+  } catch { /* the engine keeps its default list */ }
+}
+
+/** Promise.race with a deadline: `fallback` once `ms` pass, whatever settles later. */
+function within<T>(promise: Promise<T>, ms: number, fallback: T): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([promise, new Promise<T>(resolve => { timer = setTimeout(() => resolve(fallback), ms); })]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * Whether this browser has a hardware AV1 encoder for screen shares. AV1 is hardware-only
+ * (docs/native-media.md, "Codec policy"): MediaCapabilities must report a supported and
+ * power-efficient WebRTC encoder at 1080p60; anything else, unavailable or slow, is H.264.
+ */
+export async function probeAv1Encoder(): Promise<boolean> {
+  const media = navigator.mediaCapabilities;
+  if (typeof media?.encodingInfo !== "function") return false;
+  const probe = media.encodingInfo({ type: "webrtc" as MediaEncodingType, video: {
+    contentType: "video/AV1", width: 1920, height: 1080, framerate: 60, bitrate: 8_000_000,
+  } }).then(info => info.supported && info.powerEfficient, () => false);
+  return within(probe, 1500, false);
+}
+
+/** Mobile browsers decode AV1 only in hardware for us: software decode drains the battery. */
+function mobile(): boolean {
+  const data = (navigator as Navigator & { userAgentData?: { mobile?: boolean } }).userAgentData;
+  return data?.mobile ?? /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent ?? "");
+}
+
+/**
+ * The largest AV1 size (720p, 1080p or 1440p, at 60 fps) that passed a real WebRTC decoder probe:
+ * hardware, or software on a desktop up to 1080p. `null` (none, unavailable or slow) keeps AV1
+ * out of the watch offer, so no AV1 stream ever reaches this viewer.
+ */
+export async function probeAv1(): Promise<Av1Capability | null> {
+  const media = navigator.mediaCapabilities;
+  if (typeof media?.decodingInfo !== "function") return null;
+  const software = !mobile();
+  const targets = [
+    { width: 1280, height: 720, bitrate: 3_000_000 },
+    { width: 1920, height: 1080, bitrate: 8_000_000 },
+    { width: 2560, height: 1440, bitrate: 12_000_000 },
+  ];
+  const probes = Promise.all(targets.map(async t => {
+    try {
+      const info = await media.decodingInfo({ type: "webrtc" as MediaDecodingType, video: { contentType: "video/AV1", width: t.width, height: t.height, framerate: 60, bitrate: t.bitrate } });
+      return info.supported && (info.powerEfficient || (software && t.height <= 1080));
+    } catch { return false; }
+  })).then(ok => {
+    const found = targets.findLast((_, i) => ok[i]);
+    return found ? { width: found.width, height: found.height } : null;
+  });
+  return within(probes, 1500, null);
+}
+
+/**
+ * The AV1 `level-idx` that covers a verified decode size at 60 fps (AV1 Annex A): 4.0 for 720p,
+ * 4.1 for 1080p, 5.0 for 1440p. Browsers declare 3.1 (`level-idx=5`) whatever their decoder
+ * does, and the SFU sends each viewer no more than its SDP declares (AV1 RTP §7.2.3).
+ */
+export function av1Level(capability: Av1Capability): number {
+  return capability.height >= 1440 ? 12 : capability.height >= 1080 ? 9 : 8;
+}
+
+/**
+ * The offer with every AV1 payload type declaring `level` as what this side receives. Payload
+ * types are per media section, and browsers repeat the same ones in every receive slot.
+ */
+export function declareAv1Level(sdp: string, level: number): string {
+  const eol = sdp.includes("\r\n") ? "\r\n" : "\n";
+  const sections: string[][] = [];
+  for (const line of sdp.split(/\r?\n/)) {
+    if (line.startsWith("m=") || sections.length === 0) sections.push([]);
+    sections[sections.length - 1]!.push(line);
+  }
+  return sections.flatMap(lines => declareSectionAv1Level(lines, level)).join(eol);
+}
+
+function declareSectionAv1Level(lines: string[], level: number): string[] {
+  const pts = new Set(lines.flatMap(l => /^a=rtpmap:(\d+) AV1\/90000$/i.exec(l)?.[1] ?? []));
+  const out: string[] = [];
+  for (const line of lines) {
+    const fmtp = /^a=fmtp:(\d+) (.*)$/.exec(line);
+    if (fmtp && pts.has(fmtp[1]!)) {
+      const params = fmtp[2]!.split(";").filter(p => p.trim() && !/^\s*level-idx=/.test(p));
+      out.push(`a=fmtp:${fmtp[1]} ${[...params, `level-idx=${level}`].join(";")}`);
+      pts.delete(fmtp[1]!);
+      continue;
+    }
+    out.push(line);
+    const rtpmap = /^a=rtpmap:(\d+) AV1\/90000$/i.exec(line);
+    // A payload type without parameters gets them right after its rtpmap.
+    if (rtpmap && !lines.some(l => l.startsWith(`a=fmtp:${rtpmap[1]} `))) {
+      out.push(`a=fmtp:${rtpmap[1]} level-idx=${level}`);
+      pts.delete(rtpmap[1]!);
+    }
+  }
+  return out;
 }
 
 /** Each returned tuple has passed a real WebRTC decoder probe; unavailable/timeout means SDP only. */
@@ -414,6 +539,8 @@ export interface PublishParams {
   automaticMode?: boolean;
   surfaceChanged?(surface: ScreenSurface, quality: ScreenSpec): void;
   iceServers: IceServer[];
+  /** The browser has a hardware AV1 encoder ([`probeAv1Encoder`]): offer AV1 first. */
+  av1?: boolean;
   /** `screen.publish.offer` for this share: the server's answer. */
   offer(body: { ssrc: number; rtx_ssrc: number; sdp: string }): Promise<string>;
   state(state: TransportState): void;
@@ -450,6 +577,11 @@ export class ScreenPublisher {
   private parameters: Promise<void> = Promise.resolve();
   private adaptationSent: { bytes: number; at: number } | null = null;
   private surfaceKey: (string | undefined)[] = [];
+  /** AV1 is done for this share: a recovery plan, or the encoder fell back to software. */
+  private av1Retired = false;
+  /** The negotiated codec the encoder was switched to in place, once it left AV1. */
+  private sendCodec: RTCRtpCodec | null = null;
+  private softwareAv1 = 0;
   private readonly ceiling: { width: number; height: number; known: boolean };
 
   constructor(private readonly params: PublishParams) {
@@ -481,7 +613,11 @@ export class ScreenPublisher {
     this.sender = transceiver.sender;
     this.parameters = Promise.resolve();
     this.desired = 0;
-    preferCodecs(transceiver, "send", this.recovery?.codec === "vp9" ? "vp9" : undefined);
+    // A recovery plan names H.264 or VP9: AV1 never comes back within the share.
+    const av1 = this.params.av1 === true && !recovery && !this.av1Retired;
+    this.sendCodec = null; this.softwareAv1 = 0;
+    preferCodecs(transceiver, "send", recovery?.codec === "vp9" ? "vp9" : undefined, av1);
+    if (av1) negotiateDescriptor(transceiver, "sendonly");
     await pc.setLocalDescription(await pc.createOffer());
     if (this.closed || this.pc !== pc) return;
     const sdp = pc.localDescription?.sdp ?? "";
@@ -589,6 +725,7 @@ export class ScreenPublisher {
       guardAvailable = outgoingEstimate(stats, performance.timeOrigin + performance.now());
       codec = out?.codecId ? stats.get(out.codecId)?.mimeType as string | undefined : undefined;
     } catch { return; }
+    this.watchAv1(out, codec);
     const spec = this.spec();
     const target = headroomBitrate(spec.maxBitrate, available);
     const previous = this.adaptationSent;
@@ -620,6 +757,32 @@ export class ScreenPublisher {
     }
     // Small moves are not worth a parameter change.
     if (Math.abs(target - this.desired) > this.desired * 0.1) void this.applyParameters(target);
+  }
+
+  /**
+   * AV1 is hardware-only. Two polls in a row of a software AV1 encoder (the engine fell back)
+   * switch the encoder in place to the negotiated H.264; the SFU follows the codec change at the
+   * next keyframe. An engine that cannot switch (still software AV1 three polls later) ends the
+   * transport rather than keep encoding AV1 in software.
+   */
+  private watchAv1(out: OutboundVideo | undefined, codec: string | undefined): void {
+    if (codec?.toLowerCase() !== "video/av1") { this.softwareAv1 = 0; return; }
+    const software = out?.powerEfficientEncoder === false && (out.framesEncoded ?? 0) > 0;
+    this.softwareAv1 = software ? this.softwareAv1 + 1 : 0;
+    if (this.softwareAv1 === 2 && !this.av1Retired) {
+      this.av1Retired = true;
+      const h264 = this.sender?.getParameters().codecs?.find(c => c.mimeType.toLowerCase() === "video/h264");
+      if (h264) {
+        this.sendCodec = { mimeType: h264.mimeType, clockRate: h264.clockRate, ...(h264.sdpFmtpLine ? { sdpFmtpLine: h264.sdpFmtpLine } : {}) };
+        void this.applyParameters(this.desired || this.spec().maxBitrate);
+        return;
+      }
+    }
+    if (this.softwareAv1 >= 5 && this.av1Retired) {
+      this.softwareAv1 = 0;
+      console.warn("Screen encoder: AV1 fell back to software and cannot switch to H.264");
+      this.params.state("failed");
+    }
   }
 
   private sampleOutcome(): void {
@@ -725,7 +888,9 @@ export class ScreenPublisher {
     this.parameters = this.parameters.then(async () => {
       if (!sender || !alive()) return;
       const spec = this.spec();
-      const encoding: RTCRtpEncodingParameters = { ...this.scale(), maxBitrate, maxFramerate: spec.fps, priority: "low", networkPriority: "low" };
+      const encoding: RTCRtpEncodingParameters & { codec?: RTCRtpCodec } = {
+        ...this.scale(), maxBitrate, maxFramerate: spec.fps, priority: "low", networkPriority: "low", ...(this.sendCodec ? { codec: this.sendCodec } : {}),
+      };
       if (!alive()) return; // A synchronous settings read may have switched surfaces.
       const fresh = (): RTCRtpSendParameters => {
         const params = sender.getParameters();
@@ -794,8 +959,10 @@ export interface WatchParams {
   /** Receive slots: `SCREEN_SLOTS` for members, 1 for a TeamSpeak guest's watch page. */
   slots?: number;
   iceServers: IceServer[];
+  /** Probe and offer AV1 decode (members of an AV1-capable server; never TeamSpeak guests). */
+  av1?: boolean;
   /** `screen.watch.offer` with this run: the server's answer. */
-  offer(sdp: string, run: number, h264?: H264Capability[]): Promise<string>;
+  offer(sdp: string, run: number, h264?: H264Capability[], av1?: Av1Capability | null): Promise<string>;
   decodeFailed?(slot: number, share: string, generation: number): void;
   state(state: TransportState): void;
   /** A slot's video track arrived (once per slot and transport). */
@@ -827,9 +994,13 @@ export class ScreenWatchTransport {
   async start(): Promise<void> {
     const pc = new RTCPeerConnection(rtcConfig(this.params.iceServers));
     this.pc = pc;
+    // Without a verified AV1 decoder the offer leaves AV1 out altogether.
+    const av1 = this.params.av1 ? await probeAv1() : null;
+    if (this.closed) return;
     for (let i = 0; i < (this.params.slots ?? SCREEN_SLOTS); i++) {
       const transceiver = pc.addTransceiver("video", { direction: "recvonly" });
-      preferCodecs(transceiver, "receive");
+      preferCodecs(transceiver, "receive", undefined, av1 !== null);
+      if (av1) negotiateDescriptor(transceiver, "recvonly");
       const receiver = transceiver.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null };
       if ("jitterBufferTarget" in receiver) { try { receiver.jitterBufferTarget = 0; } catch { /* out of range on some engines */ } }
       this.transceivers.push(transceiver);
@@ -843,7 +1014,9 @@ export class ScreenWatchTransport {
     if (this.closed) return;
     const h264 = await probeH264();
     if (this.closed) return;
-    const answer = await this.params.offer(pc.localDescription?.sdp ?? "", this.run, h264);
+    // The engine's local description keeps its nominal level; the SFU reads the declared one.
+    const local = pc.localDescription?.sdp ?? "";
+    const answer = await this.params.offer(av1 ? declareAv1Level(local, av1Level(av1)) : local, this.run, h264, av1);
     if (this.closed) return;
     await pc.setRemoteDescription({ type: "answer", sdp: answer });
     if (this.closed) return;
@@ -868,12 +1041,12 @@ export class ScreenWatchTransport {
       const report = await pc.getStats();
       if (pc !== this.pc || this.closed) return;
       report.forEach(s => {
-        if (s.type !== "inbound-rtp" || s.kind !== "video" || !/video\/h264/i.test(String(report.get(s.codecId)?.mimeType))) return;
+        if (s.type !== "inbound-rtp" || s.kind !== "video" || !/video\/(h264|av1)$/i.test(String(report.get(s.codecId)?.mimeType))) return;
         const slot = this.transceivers.findIndex(t => t.mid === s.mid);
         const state = this.watchdogs.get(slot);
         if (state?.watchdog.observe(performance.now(), Number(s.packetsReceived ?? 0), Number(s.framesDecoded ?? 0))) this.params.decodeFailed?.(slot, state.share, state.generation);
       });
-    } catch { /* Missing stats cannot prove that an H.264 decoder failed. */ }
+    } catch { /* Missing stats cannot prove that a decoder failed. */ }
     finally { this.polling = false; }
   }
 

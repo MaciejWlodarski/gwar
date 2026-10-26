@@ -663,6 +663,22 @@ impl Client {
         }
         self.ok("screen.watch", json!({"share": share})).await["slot"].as_u64().expect("slot")
     }
+
+    /// Watches `share` over a transport reporting `h264`, verified H.264 decode limits.
+    pub async fn watch_h264(&mut self, share: &str, h264: Value) -> u64 {
+        if self.viewer.is_none() {
+            self.viewer = Some(screen::Viewer::start_h264(self, 1, h264).await);
+        }
+        self.ok("screen.watch", json!({"share": share})).await["slot"].as_u64().expect("slot")
+    }
+
+    /// Watches `share` over a transport that also offers AV1, reporting `capability`.
+    pub async fn watch_av1(&mut self, share: &str, capability: Value) -> u64 {
+        if self.viewer.is_none() {
+            self.viewer = Some(screen::Viewer::start_av1(self, 1, capability).await);
+        }
+        self.ok("screen.watch", json!({"share": share})).await["slot"].as_u64().expect("slot")
+    }
 }
 
 /// A client holding the Admin group (redeems the server's first-start token).

@@ -76,6 +76,7 @@ pub(super) struct Watch {
     sdp: String,
     browser: bool,
     h264: Vec<gwar_proto::H264Capability>,
+    av1: Option<gwar_proto::Av1Capability>,
     answer: Option<String>,
     connected: bool,
     slots: [Option<(String, Arc<WatchGrant>)>; SCREEN_SLOTS],
@@ -341,7 +342,11 @@ impl Core {
         if offer.run == s.watch_run {
             // The run's transport failed or closed: retired for good.
             let Some(watch) = &s.watch else { return Some(Err(stale())) };
-            if watch.sdp != offer.sdp || watch.browser != offer.browser || watch.h264 != offer.h264 {
+            if watch.sdp != offer.sdp
+                || watch.browser != offer.browser
+                || watch.h264 != offer.h264
+                || watch.av1 != offer.av1
+            {
                 return Some(Err(err(ErrorCode::Conflict, "run reused with a different offer")));
             }
             return Some(
@@ -370,6 +375,7 @@ impl Core {
             sdp: offer.sdp.clone(),
             browser: offer.browser,
             h264: offer.h264.clone(),
+            av1: offer.av1,
             answer: None,
             connected: false,
             slots: Default::default(),
@@ -384,6 +390,7 @@ impl Core {
             sdp: offer.sdp,
             browser: offer.browser,
             h264: offer.h264.clone(),
+            av1: offer.av1,
             reply,
         });
         let tx = self.me.upgrade()?;

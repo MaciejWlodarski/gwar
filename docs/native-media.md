@@ -8,8 +8,10 @@ the AV1 payload and Dependency Descriptor parsers (A1b,
 [#154](https://github.com/MaciejWlodarski/gwar/pull/154)), the platform-neutral
 contracts and test source (B1, [#158](https://github.com/MaciejWlodarski/gwar/pull/158)),
 and the rate and quality controller (B6). Browser H.264 screen transports and
-H.264-first web sending (A2) are built. AV1 transport integration (A2b), native
-transports (B4/B5), and native sharing remain separate.
+H.264-first web sending (A2) are built, and so is plaintext AV1 with the
+Dependency Descriptor on the screen transports (A2b), sent by browsers only
+with a hardware AV1 encoder. Native transports (B4/B5) and native sharing
+remain separate.
 
 It extends [screen-share.md](screen-share.md). That design ships screen
 sharing through the server's SFU from browsers and the Tauri desktop app's
@@ -308,8 +310,8 @@ commands, like voice today. It keeps the command-surface rules of
 
 | | H.264 | VP9 | AV1 | HEVC |
 | --- | --- | --- | --- | --- |
-| Browser screen transport (A2) | preferred, hardware or OpenH264 | emergency fallback, profile 0 | future hardware-only A2b | not used |
-| SFU (A2) | mode 1, three admitted profiles | profile 0 | future A2b | not used |
+| Browser screen transport (A2, A2b) | preferred without a hardware AV1 encoder; hardware or OpenH264 | emergency fallback, profile 0 | first with a hardware encoder (A2b); decode verified per size | not used |
+| SFU (A2, A2b) | mode 1, three admitted profiles | profile 0 | profile 0, receives up to level 5.1 (`level-idx=13`) main tier, sends within each viewer's declared level/tier, with DD | not used |
 
 VP8 is dropped from screen negotiation. Historical browser/API inventories
 below may mention codecs exposed by the platform; they are not Gwar offers.
@@ -328,7 +330,7 @@ the layer is unavailable.
 | Target role | AV1 | H.264 | VP9 | VP8 | HEVC/H.265 |
 | --- | --- | --- | --- | --- | --- |
 | Native send | hardware only, preferred | hardware, then OpenH264 on desktops | never | dropped | not planned |
-| Web send (A2 landed) | not enabled | preferred; hardware where available | emergency fallback for encoder/decode failures | dropped | not planned |
+| Web send (A2, A2b landed) | hardware only (MediaCapabilities `powerEfficient`), preferred | preferred without hardware AV1; hardware where available | emergency fallback for encoder/decode failures | dropped | not planned |
 | Viewer decode | hardware; desktop dav1d up to about 1080p | universal baseline | browser-compatibility decode while browsers may send it | dropped | not planned |
 
 Every supported browser has VP9. The remaining browser VP9 send cases are
@@ -368,7 +370,11 @@ work here.
   Chrome can use hardware H.264 through Media Foundation on that platform
   ([Chromium encoder](https://github.com/chromium/chromium/blob/main/media/gpu/windows/media_foundation_video_encode_accelerator_win.cc));
   actual availability is probed by the browser. A2 implements this decision. An AV1 SDP entry does not establish hardware encoding;
-  browser software AV1 encode remains excluded.
+  browser software AV1 encode remains excluded. A2b has landed: a web
+  sharer offers AV1 first only when `MediaCapabilities.encodingInfo` reports
+  a supported, power-efficient WebRTC AV1 encoder at 1080p60, and leaves AV1
+  in place for the negotiated H.264 if `getStats` later reports a software
+  AV1 encoder ([A2b](#a2b-status)).
 
 ### H.264 plan
 
@@ -953,22 +959,27 @@ padding (15). It does not decode pixels.
   encoders where hardware supports it; it lowers fps, not resolution.
 
 **Existing str0m 0.24.1 support**, checked in the Cargo registry source
-for the crates.io version pinned by `Cargo.lock` (no `vendor/str0m` tree or
-str0m Cargo patch in this checkout):
+for the crates.io version (now vendored as `vendor/str0m`, see
+`GWAR-PATCH.md`):
 [`src/packet/av1.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/packet/av1.rs)
 has `Av1Packetizer`/`Av1Depacketizer` for OBU framing, fragmentation and
 reconstruction, dispatched for `Codec::Av1` in `src/packet/mod.rs`.
 `RtcConfig::enable_av1` and `CodecConfig::enable_av1` configure AV1 at 90 kHz
 with RTX (default payload types 45/46). AV1 is enabled in upstream defaults;
-Gwar's A2 screen transports call `clear_codecs` and enable H.264 mode 1
-and VP9 profile 0 with RTX. VP8 is dropped.
+Gwar's screen transports call `clear_codecs` and enable H.264 mode 1
+and VP9 profile 0 with RTX; since A2b, AV1 profile 0, `level-idx=13`
+(level 5.1), tier 0 on PT 45 with RTX 46 comes first while the share may
+still use AV1. VP8 is dropped.
 `src/format/codec.rs` supplies AV1 MIME/SDP naming;
 `src/format/format_params.rs` parses and serializes AV1 SDP `profile`,
 `level-idx` and `tier`, but
 [`src/format/payload_params.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/format/payload_params.rs)
 requires equality for all three (defaults 0, 5, 0); directional level/tier
-limit matching is not implemented. A2b must handle that constraint and test
-viewer receive limits. Both `detect_av1_keyframe` and the depacketizer's
+limit matching is not implemented. A2b patches the vendored copy to match
+AV1 on `profile` alone (`GWAR-PATCH.md`): `level-idx` and `tier` are each
+receiver's own limits (AV1 RTP §7.2.3), so offers at any level negotiate,
+the SFU's answer declares what it receives (level 5.1, main tier), and the
+SFU keeps what it sends within each viewer's declared level and tier. Both `detect_av1_keyframe` and the depacketizer's
 `Av1CodecExtra::is_keyframe` metadata use only `N`; neither supplies Gwar's
 stricter candidate check or bounded sequence-header/key-frame confirmation.
 [`src/rtp/ext.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/rtp/ext.rs)
@@ -976,8 +987,10 @@ has no built-in DD variant/parser/writer. `Extension::with_serializer`,
 `ExtensionSerializer`, `ExtensionValues::user_values` and `RtcConfig::set_extension`
 provide custom extension plumbing, including the two-byte extension form;
 a DD extmap in SDP test data is not implementation support. Gwar's bounded
-DD parser is built in A1b; A2b must wire it into serialization, negotiation,
-native frame-mode metadata hand-off and SFU forwarding. Register the
+DD parser is built in A1b; A2b wires it into serialization, negotiation and
+SFU forwarding (`dependency_descriptor::extension()`, extmap id 12 on both
+transports, remapped by URI to each peer's id); native frame-mode metadata
+hand-off waits for native transports (B4/B5). Register the
 [DD URI](https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension)
 on publish and watch transports and use the two-byte form for values over
 16 bytes. An upstream built-in DD implementation is optional, not a
@@ -1081,7 +1094,25 @@ this before mixed AV1/H.264 sharing ships.
    most 32 min until the share ends. Recovery plans retain the original
    admitted dimensions, including 1440p and portrait shares; each axis is
    bounded by level 5.1's 36864 macroblocks times 16 pixels. A rejected plan
-   forces the web connection to resync. Web AV1 sending is not enabled.
+   forces the web connection to resync. A2b web AV1 sharers are hardware
+   only and send one stream too: until A3/B11a provide the lazy H.264
+   layer, the first assigned viewer that cannot decode the AV1 stream (no
+   AV1 payload type, no verified AV1 size, or a stream above it) but can
+   decode the H.264 replacement turns the share to H.264 once, through the
+   same recovery plan (`screen.recover`, 60 fps, at the AV1 stream's size
+   scaled down to at most 1440p with the aspect ratio kept, which stays
+   within H.264 level 5.1). The replacement must fit one of the viewer's
+   negotiated H.264 payload types: MaxFS, MaxMBPS and each side within
+   sqrt(8 × MaxFS) macroblocks of its receive level, verified or declared,
+   and any decode-failure cap. A revoked watch whose release has not
+   reached the SFU yet is skipped and changes nothing. The switch commits
+   only while the triggering viewer's grant is still live: the SFU checks
+   it under the same lock that revoking a grant or lease takes, before it
+   changes any recovery state, so a viewer who leaves in between changes
+   nothing. A publisher whose own AV1 sequence is refused needs no viewer. A committed
+   recovery plan, including a committed decode-recovery plan, retires AV1 for the
+   rest of the share (an uncorroborated decode-failure report alone does not); viewers
+   that decode neither are refused as above and leave the share as it is.
    This browser path does not change the native primary-retention rule above.
 8. **Failures are explicit.** If no compatible layer can be produced, end
    only the affected watch. A failed hardware AV1 session may recover with
@@ -1851,7 +1882,7 @@ round of their own, as voice 5c/5d had.
   `N` without a key frame, `Z=0` mid-frame, illegal `N=1,Z=1`, truncated or
   overflowing LEB128, unknown/reserved OBU types and empty payloads; fuzzing
   never reads past the packet or exceeds a fixed parse budget.
-- Now: built; transport integration and split-header confirmation are A2b.
+- Now: built; transport integration and split-header confirmation landed in A2b.
 
 **A2. H.264 on the screen transports** (landed)
 - Delivery order: start with browser H.264 on publish/watch (E1), then A2b
@@ -1971,6 +2002,103 @@ production server is involved.
   and stable-slot source replacement retain decodable descriptor state.
 - Now: with A2 browser H.264 (landed), A1b and PR 3a/3b; use recorded AV1 and synthetic DD in tests,
   no encoder required. Real hardware temporal publishing is B11.
+- <a id="a2b-status"></a>Status (2026-10-26): **built for plaintext browser
+  shares.** What landed and where it deviates from the plan above:
+  - Negotiation: AV1 profile 0 (PT 45, RTX 46) is answered first on publish
+    transports while the share may still use AV1 (not encrypted, not
+    retired), and always on watch transports. Offers match on the profile;
+    `level-idx` and `tier` are each receiver's own limits (AV1 RTP §7.2.3).
+    The SFU's publish answer declares `level-idx=13` (level 5.1; 5.0 already
+    covers the largest share, 1440p60) and main tier. A viewer receives a
+    stream only within the `level-idx`/`tier` its offer declared for that
+    payload type (defaults 5 and 0) **and** within its verified decode size:
+    watch offers carry an optional `av1: {width, height}` (720p, 1080p or
+    1440p at 60 fps) after `screen.av1.capabilities` answers
+    `{screen_av1: true}`; without it no AV1 reaches the viewer, browser or
+    native. Browsers declare `level-idx=5` (3.1) whatever their decoder does,
+    so the web client rewrites the AV1 `level-idx` of the watch offer it sends
+    to the level its probed size needs at 60 fps: 8 (4.0) for 720p, 9 (4.1)
+    for 1080p, 12 (5.0) for 1440p. It does so in every receive slot (media
+    section), since browsers repeat the same payload types in each. The DD
+    extension (id 12) is registered on both transports.
+  - Admission: the bounded H.264 join prefix also confirms AV1. The first
+    buffered packet must start a temporal unit (`Z=0`, `N=1`, DD start of
+    frame when present) and its DD must attach a template structure; a
+    complete profile-0 sequence header must precede a shown key frame
+    header. Operating point 0's `seq_level_idx` must be a defined level no
+    higher than 5.1 (13; reserved values and 31, "maximum parameters", are
+    refused), its tier main, and the maximum frame size within that level's
+    MaxPicSize/MaxHSize/MaxVSize. Headers are reassembled within 2 KB from contiguous packets
+    (split sequence headers and separate sequence/frame headers included).
+    Admission marks the buffered frame's first packet. Live split sequence
+    headers are reassembled only from consecutive newest packets; a lost or
+    reordered piece of one opens no segment and requests a throttled PLI,
+    like H.264's fragmented SPS. Mandatory DD fields are checked against
+    `Z`/`Y`/`N`; conflicts drop the packet.
+  - Refused sequences: an encoder repeats its sequence header at every
+    keyframe, so one the SFU refuses (another profile, a level above 5.1 or
+    31, high tier, or a frame too large for its level) would only earn more
+    keyframe requests. When such a header is read on arrival (whole in one packet,
+    or split over consecutive packets), the SFU instead turns the share to
+    H.264 in place through the same one-time `screen.recover` plan as a
+    viewer without AV1: H.264 at 60 fps, at the sequence's maximum frame
+    size scaled down to at most 1440p (either orientation, aspect ratio
+    kept, even sides of at least 16), so within H.264 level 5.1's 36,864
+    MBs per frame and 983,040 per second. It logs that once, and the old transport's
+    media stays fenced until the replacement is accepted. The plan retires
+    AV1 for the rest of the share, so AV1 is never answered again and the
+    share cannot flap; refused AV1 arriving later plans nothing more. A
+    split header that arrives reordered is read only by the prefix, which
+    just refuses that keyframe; the next keyframe repeats the header.
+  - Viewers below the stream's level: a viewer whose declared `level-idx`
+    or tier is below the stream's, or whose verified size is smaller, gets
+    the existing "viewer without AV1" outcome. If it decodes the H.264
+    replacement (its H.264 receive level takes the replacement's frame
+    size, macroblock rate and each side), the share turns to H.264 once
+    (above, and [Codec
+    negotiation](#codec-negotiation-across-mixed-viewers), item 7). If not
+    (for example H.264 only at level 3.1 for a 1080p60 share), or once AV1
+    is already given up, that watch alone is refused: it stops with
+    `screen.stopped {reason: "codec"}` and the share keeps its codec. A slot
+    never stays silently black.
+  - Forwarding: DD bytes are forwarded unchanged apart from the frame number,
+    which each slot remaps so that a new segment (keyframe, source switch,
+    pause/resume) continues one after the last forwarded frame. Values over
+    16 bytes use the two-byte form; extmap ids differ per peer.
+  - **Deviation: no temporal-layer selection.** Every frame is forwarded, so
+    no frame loses a dependency to the SFU. Per-source structure caching,
+    active decode-target masks, frame-number unwrapping for dependency
+    checks and chain-aware dropping arrive with the first temporal selection
+    policy (A5/B11), which is also when malformed or template-less DD must
+    fail closed for selection; today a segment simply does not open without
+    an attached structure.
+  - **Deviation: mixed viewers downgrade the browser share** to H.264 once
+    (see [Codec negotiation](#codec-negotiation-across-mixed-viewers),
+    item 7) instead of a lazy compatibility layer, which needs A3/B11a.
+  - **Deviation: TeamSpeak guests** (watch links) do not offer AV1 yet; a
+    guest watching an AV1 share triggers the H.264 downgrade.
+  - Web: the sharer offers AV1 only with a hardware encoder (above), enables
+    DD with `setHeaderExtensionsToNegotiate` where available, and never
+    offers AV1 after a recovery plan. A software AV1 encoder reported by
+    `getStats` twice in a row switches in place to the negotiated H.264
+    (`RTCRtpEncodingParameters.codec`); the SFU follows the codec change at
+    its next keyframe, and an engine that cannot switch ends the transport.
+    Viewers probe `decodingInfo` for WebRTC AV1 and offer it only for a size
+    that is power-efficient, or, on desktops, up to 1080p in software. The
+    decode watchdog covers AV1 like H.264. The sharing bar shows "AV1".
+  - Tests: Rust unit tests (sequence-header operating points, split and
+    reordered prefixes, descriptor checks, seeded random input, limits,
+    frame-number remapping, downgrade and retirement, the one-time switch
+    for a refused sequence and none for a valid one, viewers below the
+    stream's level), a real-SRTP str0m loopback (byte-identical AV1 with
+    one- and two-byte DD to two viewers, per-peer PTs and extmap ids, the
+    H.264 downgrade for a viewer without AV1, and a level-31 sequence
+    producing one `screen.recover`), web unit tests, and the browser e2e,
+    which asserts that the publish offer carries AV1 exactly when the
+    encoder is hardware.
+    Headless CI Chromium has no hardware AV1 encoder, so the browser e2e
+    keeps exercising H.264; real AV1 browser sending needs a capable GPU
+    (Windows NVIDIA RTX 40+, AMD RDNA 3+, Intel Arc) and is not covered in CI.
 
 **A3. Codec capabilities and switching** (L)
 - Builds: the rule in [Codec negotiation](#codec-negotiation-across-mixed-viewers):
@@ -2040,7 +2168,7 @@ production server is involved.
     watch link are unchanged, and adding fallback by replace preserves AV1;
   - a viewer flapping every 5 s does not repeatedly start/stop encoders; an
     empty intersection ends that watch only. Legacy web switches pass E3.
-- Now: with A2 landed; AV1 after A2b.
+- Now: with A2 and A2b landed.
 
 **A4. Resolution tiers and scaled limits** (M)
 - Builds: a tier per share (`1080p`, `1440p`, `2160p`) in `screen.start`; a

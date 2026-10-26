@@ -20,6 +20,11 @@ pub struct Segment {
     highest_out: Option<u64>,
     /// The last timestamp written and when, so a new segment continues the slot's timeline.
     last: Option<(u32, Instant)>,
+    /// AV1 Dependency Descriptor frame numbers: the newest written, and the offset a segment's
+    /// first descriptor fixes so that frames keep counting up across segments and sources.
+    last_frame: Option<u16>,
+    frame_offset: u16,
+    frame_pending: bool,
 }
 
 impl Segment {
@@ -44,6 +49,7 @@ impl Segment {
                 return None;
             }
             self.waiting = false;
+            self.frame_pending = true;
             self.base_source = source;
             self.resume = source;
             self.base_out = self.highest_out.map_or(0, |highest| highest + 1 + SEGMENT_GAP);
@@ -64,6 +70,20 @@ impl Segment {
             self.last = Some((stamp, now));
         }
         Some((out, stamp))
+    }
+
+    /// The slot's frame number for a descriptor of a packet [`Segment::map`] just admitted.
+    /// The first descriptor of a segment continues one after the newest frame written before.
+    pub fn frame_number(&mut self, frame: u16) -> u16 {
+        if std::mem::take(&mut self.frame_pending) {
+            let next = self.last_frame.map_or(frame, |last| last.wrapping_add(1));
+            self.frame_offset = next.wrapping_sub(frame);
+        }
+        let out = frame.wrapping_add(self.frame_offset);
+        if self.last_frame.is_none_or(|last| (1..0x8000).contains(&out.wrapping_sub(last))) {
+            self.last_frame = Some(out);
+        }
+        out
     }
 }
 
@@ -104,6 +124,28 @@ mod tests {
         assert_eq!(segment.map(5001, 126_456, false, later), Some((out + 1, stamp + 3000)));
         // Its stale packets from before the new segment drop.
         assert_eq!(segment.map(4999, 120_456, false, later), None);
+    }
+
+    #[test]
+    fn descriptor_frame_numbers_count_on_across_segments_and_sources() {
+        let now = Instant::now();
+        let mut segment = Segment::new();
+        segment.map(10, 1000, true, now);
+        assert_eq!(segment.frame_number(500), 500, "the first segment keeps the publisher's numbers");
+        segment.map(11, 4000, false, now);
+        assert_eq!(segment.frame_number(501), 501);
+        // A reordered older frame maps consistently and does not move the newest.
+        assert_eq!(segment.frame_number(499), 499);
+        segment.wait();
+        // Another source restarts its own numbering near the wrap.
+        segment.map(7000, 9, true, now);
+        assert_eq!(segment.frame_number(65535), 502);
+        segment.map(7001, 3009, false, now);
+        assert_eq!(segment.frame_number(0), 503, "the publisher's wrap carries through");
+        segment.map(7002, 6009, false, now);
+        assert_eq!(segment.frame_number(1), 504);
+        // Packets of one frame share its number.
+        assert_eq!(segment.frame_number(1), 504);
     }
 
     #[test]

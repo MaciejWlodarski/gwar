@@ -28,9 +28,10 @@
 //!
 //! RTP framing: <https://aomediacodec.github.io/av1-rtp-spec/#payload-format>.
 //! Codec prefixes: AV1 sections 5.5.1 and 5.9.2. Only the sequence prefix through
-//! operating point zero's level/tier and the frame prefix through show_frame are read;
-//! subsequent operating points and the remaining uncompressed header are not interpreted.
-//! Success is not validation of the rest of the AV1 bitstream.
+//! `max_frame_height_minus_1` (operating point zero's level/tier, every operating point
+//! skipped bit-exactly) and the frame prefix through show_frame are read; the remaining
+//! sequence and uncompressed headers are not interpreted. Success is not validation of the
+//! rest of the AV1 bitstream.
 
 use super::ingress::Descriptor;
 
@@ -58,6 +59,9 @@ pub struct SequenceHeader {
     pub seq_level_idx: u8,
     pub seq_tier: u8,
     pub reduced_still_picture_header: bool,
+    /// The largest frame the coded sequence may contain (`max_frame_*_minus_1 + 1`).
+    pub max_frame_width: u32,
+    pub max_frame_height: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -260,6 +264,8 @@ fn sequence_prefix(bytes: &[u8]) -> Option<SequenceHeader> {
     if reduced {
         seq_level_idx = bits.read(5)? as u8;
     } else {
+        // Present only with timing info: the decoder model's buffer delay field width.
+        let mut buffer_delay_length = None;
         if bits.read(1)? != 0 {
             bits.read(32)?; // num_units_in_display_tick
             bits.read(32)?; // time_scale
@@ -267,21 +273,46 @@ fn sequence_prefix(bytes: &[u8]) -> Option<SequenceHeader> {
                 bits.uvlc()?; // num_ticks_per_picture_minus_1
             }
             if bits.read(1)? != 0 {
-                bits.read(5)?; // buffer_delay_length_minus_1
+                buffer_delay_length = Some(bits.read(5)? as usize + 1);
                 bits.read(32)?; // num_units_in_decoding_tick
                 bits.read(5)?; // buffer_removal_time_length_minus_1
                 bits.read(5)?; // frame_presentation_time_length_minus_1
             }
         }
-        bits.read(1)?; // initial_display_delay_present_flag
-        bits.read(5)?; // operating_points_cnt_minus_1
-        bits.read(12)?; // operating_point_idc[0]
-        seq_level_idx = bits.read(5)? as u8;
-        if seq_level_idx > 7 {
-            seq_tier = bits.read(1)? as u8;
+        let initial_display_delay = bits.read(1)? != 0;
+        let operating_points = bits.read(5)? + 1;
+        let mut level = None;
+        for _ in 0..operating_points {
+            bits.read(12)?; // operating_point_idc
+            let idx = bits.read(5)? as u8;
+            let tier = if idx > 7 { bits.read(1)? as u8 } else { 0 };
+            // Operating point zero is the one a decoder chooses by default.
+            level.get_or_insert((idx, tier));
+            if let Some(n) = buffer_delay_length
+                && bits.read(1)? != 0
+            {
+                bits.read(n)?; // decoder_buffer_delay
+                bits.read(n)?; // encoder_buffer_delay
+                bits.read(1)?; // low_delay_mode_flag
+            }
+            if initial_display_delay && bits.read(1)? != 0 {
+                bits.read(4)?; // initial_display_delay_minus_1
+            }
         }
+        (seq_level_idx, seq_tier) = level?;
     }
-    Some(SequenceHeader { seq_profile, seq_level_idx, seq_tier, reduced_still_picture_header: reduced })
+    let width_bits = bits.read(4)? as usize + 1;
+    let height_bits = bits.read(4)? as usize + 1;
+    let max_frame_width = bits.read(width_bits)? + 1;
+    let max_frame_height = bits.read(height_bits)? + 1;
+    Some(SequenceHeader {
+        seq_profile,
+        seq_level_idx,
+        seq_tier,
+        reduced_still_picture_header: reduced,
+        max_frame_width,
+        max_frame_height,
+    })
 }
 
 fn frame_prefix(bytes: &[u8], sequence: SequenceHeader) -> Option<FrameHeader> {
@@ -349,6 +380,9 @@ mod tests {
         out
     }
 
+    /// 1920x1080 in 11-bit fields.
+    const FRAME_SIZE: [(u32, usize); 4] = [(10, 4), (10, 4), (1919, 11), (1079, 11)];
+
     fn sequence(reduced: bool, level: u32, tier: u32, timing: bool) -> Vec<u8> {
         let mut fields = vec![(0, 3), (u32::from(reduced), 1), (u32::from(reduced), 1)];
         if reduced {
@@ -363,7 +397,11 @@ mod tests {
             if level > 7 {
                 fields.push((tier, 1));
             }
+            if timing {
+                fields.push((0, 1)); // decoder_model_present_for_this_op
+            }
         }
+        fields.extend(FRAME_SIZE);
         let mut bytes = vec![0x08];
         bytes.extend(pack(&fields));
         bytes
@@ -502,7 +540,7 @@ mod tests {
         }
         assert_eq!(Bits::new(&[0; 5]).uvlc(), None, "missing terminator");
         let mut packet = vec![0x10, 0x08];
-        packet.extend(pack(&[
+        let mut fields = vec![
             (0, 3),
             (0, 1),
             (0, 1),
@@ -518,9 +556,35 @@ mod tests {
             (0, 12),
             (13, 5),
             (1, 1),
-        ]));
+        ];
+        fields.extend(FRAME_SIZE);
+        packet.extend(pack(&fields));
         let s = parse(&packet).unwrap().sequence.unwrap();
         assert_eq!((s.seq_level_idx, s.seq_tier), (13, 1));
+    }
+
+    #[test]
+    fn every_operating_point_is_skipped_before_the_maximum_frame_size() {
+        let mut fields = vec![(0, 3), (0, 1), (0, 1), (1, 1), (1, 32), (60, 32), (0, 1)];
+        // Decoder model: 10-bit buffer delays; initial display delays present.
+        fields.extend([(1, 1), (9, 5), (1, 32), (4, 5), (4, 5), (1, 1), (2, 5)]);
+        // Operating point 0: level 4.1, high tier, decoder model and display delay.
+        fields.extend([(0x103, 12), (9, 5), (1, 1), (1, 1), (700, 10), (300, 10), (1, 1), (1, 1), (3, 4)]);
+        // Operating point 1: level 3.0, neither.
+        fields.extend([(0x101, 12), (4, 5), (0, 1), (0, 1)]);
+        // Operating point 2: level 5.0 main tier, decoder model only.
+        fields.extend([(0x107, 12), (12, 5), (0, 1), (1, 1), (5, 10), (6, 10), (0, 1), (0, 1)]);
+        fields.extend([(11, 4), (10, 4), (2559, 12), (1439, 11)]);
+        let mut packet = vec![0x10, 0x08];
+        packet.extend(pack(&fields));
+        let s = parse(&packet).unwrap().sequence.unwrap();
+        assert_eq!((s.seq_level_idx, s.seq_tier), (9, 1), "operating point zero");
+        assert_eq!((s.max_frame_width, s.max_frame_height), (2560, 1440));
+        // A complete OBU that ends inside the frame size is malformed.
+        fields.truncate(fields.len() - 2);
+        let mut short = vec![0x10, 0x08];
+        short.extend(pack(&fields));
+        assert!(parse(&short).is_none());
     }
 
     #[test]
@@ -632,6 +696,8 @@ mod tests {
                         seq_level_idx: 5,
                         seq_tier: 0,
                         reduced_still_picture_header: true,
+                        max_frame_width: 1920,
+                        max_frame_height: 1080,
                     }),
                 ] {
                     if let Some(p) = parse_with_sequence(&bytes, seq) {

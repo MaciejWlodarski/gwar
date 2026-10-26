@@ -202,8 +202,18 @@ impl Sim {
                 break api.apply().unwrap();
             }
         };
-        let (w, answer) =
-            watcher(1, 7, 1, Lease::new(), SCREEN_SLOTS, &offer.to_sdp_string(), false, &[], addr(6000), now).unwrap();
+        let (w, answer) = watcher(
+            1,
+            7,
+            1,
+            Lease::new(),
+            SCREEN_SLOTS,
+            &offer.to_sdp_string(),
+            Caps { browser: false, h264: &[], av1: None },
+            addr(6000),
+            now,
+        )
+        .unwrap();
         client.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
         let mut sim = Self {
             w,
@@ -326,6 +336,8 @@ impl Sim {
                 let len = if n + 1 == packets { size - n * PACKET } else { PACKET }.max(16);
                 let forward = Forward {
                     h264: None,
+                    av1: None,
+                    dd: None,
                     source: share.source,
                     timestamp: share.timestamp,
                     marker: n + 1 == packets,
@@ -1201,6 +1213,8 @@ mod tests {
         let write = |sim: &mut Sim, source: u64, arrival: Instant| {
             let forward = Forward {
                 h264: None,
+                av1: None,
+                dd: None,
                 source,
                 timestamp: source as u32 * 3000,
                 marker: true,

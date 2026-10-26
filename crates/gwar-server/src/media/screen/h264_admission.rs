@@ -1,10 +1,16 @@
-//! Bounded H.264 join/recovery prefix. Payloads remain opaque apart from A1 observations.
+//! Bounded H.264 and AV1 join/recovery prefix. Payloads remain opaque apart from A1/A1b
+//! observations; AV1 confirmation lives in [`super::av1_stream`].
 use std::collections::BTreeMap;
 
 use super::{
-    Forward, VideoCodec,
+    Forward, VideoCodec, av1_stream,
     h264::{self, NalPart},
 };
+
+enum Confirmed {
+    H264(u32),
+    Av1(av1_stream::Requirements),
+}
 
 #[derive(Default)]
 pub(super) struct Prefix {
@@ -69,10 +75,13 @@ impl Prefix {
             return Result { packets: Vec::new(), failed: true, discarded };
         }
         match self.confirm() {
-            Ok(Some(profile)) => {
+            Ok(Some(confirmed)) => {
                 let mut packets: Vec<_> = std::mem::take(&mut self.packets).into_values().collect();
                 for packet in &mut packets {
-                    packet.codec = VideoCodec::H264(profile);
+                    match confirmed {
+                        Confirmed::H264(profile) => packet.codec = VideoCodec::H264(profile),
+                        Confirmed::Av1(need) => packet.av1 = Some(need),
+                    }
                 }
                 packets[0].keyframe = true;
                 self.reset();
@@ -90,7 +99,14 @@ impl Prefix {
         }
     }
 
-    fn confirm(&self) -> std::result::Result<Option<u32>, ()> {
+    fn confirm(&self) -> std::result::Result<Option<Confirmed>, ()> {
+        if self.packets.first_key_value().is_some_and(|(_, packet)| packet.codec == VideoCodec::Av1) {
+            return Ok(av1_stream::confirm(&self.packets)?.map(Confirmed::Av1));
+        }
+        Ok(self.confirm_h264()?.map(Confirmed::H264))
+    }
+
+    fn confirm_h264(&self) -> std::result::Result<Option<u32>, ()> {
         let Some((first, packet)) = self.packets.first_key_value() else { return Ok(None) };
         let description = h264::describe(&packet.payload, true).ok_or(())?;
         // An earlier SPS packet may still arrive out of order.
@@ -158,6 +174,8 @@ mod tests {
     fn packet(source: u64, payload: &[u8]) -> Forward {
         Forward {
             h264: None,
+            av1: None,
+            dd: None,
             source,
             timestamp: 9000,
             marker: false,

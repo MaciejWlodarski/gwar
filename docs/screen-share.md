@@ -57,7 +57,9 @@ kept here ([Spikes](#spikes)).
   - H.264 and AV1 send nothing at all when the whole frame is encrypted.
 
   A2 has landed with browser H.264, hardware where available; encrypted H.264
-  also needs NAL-aware SFrame (B2/E2). AV1 + DD follows as A2b.
+  also needs NAL-aware SFrame (B2/E2). A2b has landed with plaintext AV1 +
+  DD from browsers with a hardware AV1 encoder; encrypted AV1 needs the
+  OBU-aware layout (B2).
 - **Keys** come from the existing voice call group:
   `MLS-Exporter("gwar screen v1", u32be(leaf), 32)`. The call controller gains
   a second endpoint kind (screen beside audio), with explicit rules for
@@ -333,7 +335,14 @@ decode stays for browser compatibility.
 
 Encrypted H.264 still needs NAL-aware SFrame and start-code escaping, as
 specified in [native-media.md](native-media.md#encryption-nal-aware-sframe).
-A2 does not enable encrypted shares, browser AV1, HEVC, or native clients.
+A2 does not enable encrypted shares, HEVC, or native clients. A2b adds
+browser AV1 for sharers whose browser reports a hardware (power-efficient)
+AV1 encoder; everyone else keeps H.264. Viewers receive AV1 only at a size
+their decoder passed a probe for. A viewer who cannot decode the AV1 stream
+turns the share to H.264 once, but only if it can decode the H.264
+replacement (its H.264 level takes the replacement's size, each side and
+macroblock rate). Otherwise only that watch is refused, and the share keeps
+AV1 ([native-media.md, A2b](native-media.md#a2b-status)).
 VP8 is dropped. Verified H.264 decode probes and bounded recovery are described
 in [native-media.md, Browser interop](native-media.md#browser-interop).
 
@@ -674,11 +683,12 @@ Each session has at most two screen transports besides its voice transport
   - Watching other shares is unaffected, because it runs on the separate
     watch transport. PR 4's e2e covers start, stop and start while watching
     two other shares.
-- **Codecs:** H.264 mode 1 (Constrained Baseline/Constrained High/High),
-  VP9 profile 0, with RTX; no AV1 or HEVC negotiation yet.
-  Extensions are the defaults (transport-cc, abs-send-time, mid, rid) and a
-  slot-generation extension on the watch transport like voice's
-  (`gwar_proto::rtp`).
+- **Codecs:** AV1 profile 0 (A2b, first while the share may use it),
+  H.264 mode 1 (Constrained Baseline/Constrained High/High), VP9 profile 0,
+  with RTX; no HEVC.
+  Extensions are the defaults (transport-cc, abs-send-time, mid, rid), the
+  AV1 Dependency Descriptor on both transports, and a slot-generation
+  extension on the watch transport like voice's (`gwar_proto::rtp`).
 
 ### Socket ownership and dispatch
 
@@ -2267,6 +2277,15 @@ this extra field and continues with the legacy `guest.offer {sdp}`. Clients omit
 `h264` and decode reports unless the flag is true. An unsupported/timed-out query selects legacy fields.
 Servers retain the legacy Welcome shape and accept old clients
 that omit all new fields.
+
+The optional `screen.av1.capabilities {}` query (A2b) replies
+`{screen_av1: true}`. Only then may a browser's watch offer carry
+`av1: {width, height}`, the largest size (1280×720, 1920×1080 or 2560×1440 at
+60 fps) its AV1 decoder passed a WebRTC probe for; servers without A2b reject
+the unknown field, so clients send it only after the query. A viewer without
+it never receives AV1, nor a stream above the AV1 `level-idx`/`tier` its SDP
+declares; the web client declares the level its probed size needs (8, 9 or 12).
+Guests (`guest.offer`) carry no AV1 yet.
 
 Events:
 
