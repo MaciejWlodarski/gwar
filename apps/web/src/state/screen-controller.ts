@@ -335,7 +335,7 @@ export class ScreenController {
     const alive = () => this.generation === generation && this.link() === conn && useScreen.getState().watches.some(w => w.id === id);
     let run: number | undefined;
     try {
-      if (!alive() || useScreen.getState().watches.find(w => w.id === id)?.status !== "requesting") return;
+      if (!alive()) return;
       run = await this.ensureTransport(conn);
       const current = () => alive() && useScreen.getState().transport.run === run;
       if (!current()) return;
@@ -347,16 +347,11 @@ export class ScreenController {
       const reused = this.usedSlots.has(slot);
       this.usedSlots.add(slot);
       if (!current()) { await conn.request("screen.unwatch", { share }).catch(() => {}); return; }
-      if (reused) {
-        // Never attach a new share to an old decoder's pixels. A new run gives every
-        // watch a fresh receiver and requests its startup keyframe, including static
-        // shares. Keep the other watches; their per-share queues fence late releases.
-        const watches = useScreen.getState().watches;
+      if (reused && useScreen.getState().watches.every(w => w.id === id)) {
+        // With no other watch to interrupt, discard the old receiver's decoded frame.
+        // Otherwise keep the transport: a brief stale frame in this slot is cosmetic,
+        // and must not reload another active (or pending) watch to hide it.
         this.dropTransport();
-        void this.ensureTransport(conn).catch(() => {});
-        for (const watch of watches) {
-          if (watch.id !== id) void this.serial(watch.share, () => this.startWatch(conn, watch.share, watch.id, generation));
-        }
         await this.startWatch(conn, share, id, generation);
         return;
       }

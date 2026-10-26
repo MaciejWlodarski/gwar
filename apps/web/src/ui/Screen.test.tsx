@@ -195,6 +195,48 @@ describe("watched video frames", () => {
     expect(visible(fresh)).toBe(true);
   });
 
+  it("keeps another watch's element and stream on reuse, revealing a single frame without a new gate", async () => {
+    vi.useFakeTimers();
+    const failed = vi.spyOn(controller.screen, "frameFailed");
+    try {
+      const streams = [new MediaStream(), new MediaStream()];
+      await act(async () => {
+        const { dispatch } = useScreen.getState();
+        dispatch({ type: "transport", run: 1, phase: "connected" });
+        for (const [slot, share] of ["A", "B"].entries()) {
+          dispatch({ type: "watch", share, id: slot + 1 });
+          dispatch({ type: "granted", run: 1, id: slot + 1, slot });
+          dispatch({ type: "stream", run: 1, slot, stream: streams[slot]! });
+        }
+        root.render(<div><ShareVideo key="A" share="A" /><ShareVideo key="B" share="B" /></div>);
+      });
+      const active = container.querySelector<HTMLVideoElement>('video[data-share="A"]')!;
+      const old = container.querySelector<HTMLVideoElement>('video[data-share="B"]')!;
+      await act(async () => {
+        active.dispatchEvent(new Event("loadeddata"));
+        old.dispatchEvent(new Event("loadeddata"));
+      });
+      await act(async () => {
+        const { dispatch } = useScreen.getState();
+        dispatch({ type: "unwatch", share: "B" });
+        dispatch({ type: "watch", share: "C", id: 3 });
+        dispatch({ type: "granted", run: 1, id: 3, slot: 1 });
+        root.render(<div><ShareVideo key="A" share="A" /><ShareVideo key="C" share="C" /></div>);
+      });
+      const reused = container.querySelector<HTMLVideoElement>('video[data-share="C"]')!;
+      expect(container.querySelector('video[data-share="A"]')).toBe(active);
+      expect(active.srcObject).toBe(streams[0]);
+      expect(visible(active)).toBe(true);
+      // Preserve the reused receiver, including its known cosmetic cached-frame limitation.
+      expect(reused.srcObject).toBe(streams[1]);
+      await act(async () => reused.dispatchEvent(new Event("loadeddata")));
+      await act(async () => vi.advanceTimersByTimeAsync(35_001));
+      expect(visible(reused)).toBe(true);
+      expect(visible(active)).toBe(true);
+      expect(failed).not.toHaveBeenCalled();
+    } finally { failed.mockRestore(); vi.useRealTimers(); }
+  });
+
   it("bounds a silent receiver's first-frame wait without revealing its pixels", async () => {
     vi.useFakeTimers();
     const failed = vi.spyOn(controller.screen, "frameFailed").mockImplementation(() => {});

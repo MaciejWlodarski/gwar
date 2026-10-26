@@ -2705,18 +2705,22 @@ from native capture is PR 10.
     `getStats`), and "Stop watching".
   - The sharer's speaking ring shows on their card, from the existing
     `voice.talking` event.
-  - Before a member viewer reuses a receive slot, the client renews the watch
-    transport and re-watches its active shares. This briefly reloads the other
-    watched shares too, but discards the old receiver's decoded frames entirely;
-    each watch/run also gets a fresh video element. Streams stay intact within
-    their run. First-use slots keep the current transport.
+  - When a member viewer reuses a receive slot with no other active or pending
+    watch, the client renews the transport to discard the old receiver's decoded
+    frames. Each watch/run also gets a fresh video element. Streams stay intact
+    within their run; first-use slots keep the current transport.
+  - With another active or pending watch, slot reuse keeps the transport and
+    leaves those watches uninterrupted. Known cosmetic limitation: the reused
+    slot may briefly show the previous share's last frame until the new share's
+    first keyframe decodes.
   - The first decoded frame reveals the video, including a static share's single
     startup keyframe. Watch assignment already requests a budgeted, retried PLI;
     no extra frame, new server notification or timed reveal is required. The
     existing offer/connect and H.264 recovery watchdogs still apply. A connected
     receiver that never supplies a first frame ends its watch after 35 s through
-    the normal unwatch/error path, also for VP9 and older servers. Rapid reuse
-    can hit the existing offer rate limit and its bounded retry delay.
+    the normal unwatch/error path, also for VP9 and older servers. Rapid
+    sole-watch reuse can hit the existing offer rate limit and its bounded retry
+    delay.
   - No sound in the first release; phase 2 adds a volume slider and mute per
     share ([Shared audio](#shared-audio-phase-2)).
 - **Encrypted.** The same lock as voice ("End-to-end encrypted") on the stage,
