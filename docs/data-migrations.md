@@ -263,6 +263,12 @@ sharp 1080p15, smooth → smooth 1080p30, game → smooth 1080p60, saver → smo
 old value. Browser and desktop webviews use the same store; the base version had
 no separately persisted screen choice. See [Quality settings](screen-share.md#quality-settings).
 
+`serverGroups` (the server column's groups) came without a version bump: it is a
+new key, not a change of shape. Missing or malformed, it reads as no groups
+(`validGroups`), and an older client keeps it untouched. Ids of removed
+bookmarks in a group are ignored when shown. Groups stay on the device; Gwar
+Connect does not sync them.
+
 ### Desktop files
 
 JSON files carry `version` (missing: 1). The loader refuses a newer version

@@ -2,7 +2,7 @@ import { expect, it } from "vitest";
 import { DELETION_TEXT } from "../net/message-signature";
 import type { ChatMessage } from "../proto/ChatMessage";
 import type { ChatItem } from "../state/types";
-import { newsworthy, stillHeld } from "./nav";
+import { newsworthy, railLayout, stillHeld } from "./nav";
 
 const msg = (text: string, extra: Partial<Extract<ChatItem, { kind: "msg" }>> = {}): ChatItem => ({
   kind: "msg",
@@ -43,4 +43,13 @@ it("keeps shown news the thread still holds unchanged, and drops it once changed
   expect(stillHeld([a, b], [])).toEqual([]);
   // Sealed again in another group: verified anew before it shows.
   expect(stillHeld([a], [{ ...a, sealed: { group: "g", epoch: 1 } as never }])).toEqual([]);
+});
+
+it("lays out the server column: ungrouped first, then groups with their saved servers", () => {
+  const b = (id: string) => ({ id, name: id, address: `${id}.example`, kind: "gwar" as const, updatedAt: 1 });
+  const group = (id: string, servers: string[]) => ({ id, name: id, color: "#fff", collapsed: false, servers });
+  const layout = railLayout([b("a"), b("b"), b("c"), b("d")], [group("g1", ["c", "gone", "a"]), group("g2", ["a"]), group("empty", ["gone"])]);
+  expect(layout.loose.map((x) => x.id)).toEqual(["b", "d"]);
+  // A removed server is skipped, one in two groups shows in the first only, and a group left empty is hidden.
+  expect(layout.groups.map((g) => [g.group.id, g.servers.map((x) => x.id)])).toEqual([["g1", ["c", "a"]]]);
 });

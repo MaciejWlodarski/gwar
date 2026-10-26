@@ -129,7 +129,7 @@ export function App() {
                 e.preventDefault();
                 (e.currentTarget as HTMLElement).focus();
               }}
-              className="anim-drawer fixed inset-y-0 left-0 z-40 flex max-w-[92vw] flex-col bg-rail outline-none"
+              className="anim-drawer fixed inset-y-0 left-0 z-40 flex min-w-[min(300px,92vw)] max-w-[92vw] flex-col bg-rail outline-none"
             >
               <DialogPrimitive.Title className="sr-only">{t("nav.channels")}</DialogPrimitive.Title>
               <div className="flex min-h-0 flex-1">
