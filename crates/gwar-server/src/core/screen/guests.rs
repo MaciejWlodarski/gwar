@@ -1228,6 +1228,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_unconnected_watch_releases_guest_and_member_reservations() {
+        let (handle, _notes) = core_with_bridge().await;
+        let token = linked_share(&handle, 0).await;
+        let member = session(&handle, 2, "bob").await;
+        on_core(&handle, move |core| {
+            let (screen, _commands) = mpsc::channel(32);
+            core.screen = screen;
+            let (guest, _frames) = admitted_guest(core, &token, false);
+            let guest_lease = core.guests[&guest].lease.clone();
+            core.guests.get_mut(&guest).unwrap().watch = Some(connected_watch(guest_lease));
+            core.guests.get_mut(&guest).unwrap().watch.as_mut().unwrap().connected = false;
+            assert_eq!(core.reserved_guests(&core.shares["S"]), 1);
+            let lease = core.guests[&guest].lease.clone();
+            core.screen_watching(guest, GUEST_RUN, false);
+            assert!(!core.guests.contains_key(&guest));
+            assert!(!lease.alive());
+            assert_eq!(core.reserved_guests(&core.shares["S"]), 0);
+            let mut watch = connected_watch(Lease::new());
+            let grant = WatchGrant::new(core.shares["S"].origin.clone());
+            watch.slots[0] = Some(("S".into(), grant.clone()));
+            core.shares.get_mut("S").unwrap().viewers.insert(member);
+            core.sessions.get_mut(&member).unwrap().watch = Some(watch);
+            core.screen_watching(member, GUEST_RUN, false);
+            assert!(core.sessions[&member].watch.is_none());
+            assert!(!grant.alive());
+            assert!(!core.shares["S"].viewers.contains(&member));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn negotiations_reply_when_share_ends_or_watch_run_is_superseded() {
+        let (handle, _notes) = core_with_bridge().await;
+        linked_share(&handle, 0).await;
+        let (publish, first_watch, mut frames, _commands) = on_core(&handle, |core| {
+            let session = core.shares["S"].sharer;
+            let (out, frames) = mpsc::channel(32);
+            core.sessions.get_mut(&session).unwrap().out = Some(out);
+            let (screen, mut commands) = mpsc::channel(32);
+            core.screen = screen;
+            assert!(core.screen_publish_offer(session, 71, gwar_proto::ScreenPublishOffer {
+                share: "S".into(), ssrc: 1, rtx_ssrc: 2,
+                sdp: "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 98 99\r\na=sendonly\r\na=ssrc:1 cname:p\r\na=ssrc:2 cname:p\r\na=ssrc-group:FID 1 2\r\n".into(),
+            }).is_none());
+            let ScreenCmd::Publish { reply: publish, .. } = commands.try_recv().unwrap() else { panic!("publish") };
+            core.end_share("S", ScreenStopReason::Stopped, None);
+            for run in [1, 2] {
+                assert!(core.screen_watch_offer(session, 71 + run as u32, gwar_proto::ScreenWatchOffer {
+                    run, sdp: "pending".into(), browser: false, h264: vec![],
+                }).is_none());
+            }
+            let first = loop {
+                if let ScreenCmd::Watch { reply, .. } = commands.try_recv().unwrap() { break reply; }
+            };
+            // Keep the newer negotiation pending while the older one completes.
+            (publish, first, frames, commands)
+        }).await;
+        publish.send(Ok("late publish answer".into())).unwrap();
+        first_watch.send(Ok("old watch answer".into())).unwrap();
+        let mut replies = HashMap::new();
+        while replies.len() < 2 {
+            let frame = tokio::time::timeout(Duration::from_secs(2), frames.recv()).await.unwrap().unwrap();
+            if let Outbound::Frame(frame) = frame
+                && let ServerFrame::Err { re, err } = serde_json::from_str(&frame).unwrap()
+            {
+                replies.insert(re, err.code);
+            }
+        }
+        assert_eq!(replies[&71], ErrorCode::NotFound);
+        assert_eq!(replies[&72], ErrorCode::Stale);
+    }
+
+    #[tokio::test]
     async fn members_reclaim_newest_guests_across_shares_and_resume_oldest_pause_first() {
         let (core, _notes) = core_with_bridge().await;
         let token = linked_share(&core, 0).await;

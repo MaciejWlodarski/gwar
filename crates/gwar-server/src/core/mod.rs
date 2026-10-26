@@ -452,7 +452,7 @@ pub struct Core {
     /// `screen.start` rate per session.
     screen_starts: HashMap<SessionId, voice::Bucket>,
     /// `screen.*.offer` rate per session.
-    screen_offers: HashMap<SessionId, voice::Bucket>,
+    screen_offers: HashMap<(SessionId, screen::OfferKind), voice::Bucket>,
     screen: mpsc::Sender<ScreenCmd>,
     /// See [`CoreConfig::watch_base`].
     watch_base: Option<String>,

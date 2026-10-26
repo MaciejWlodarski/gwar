@@ -11,8 +11,9 @@ use std::{
 pub const FRAME_BYTES: usize = 512 * 1024;
 /// … this many packets …
 pub const FRAME_PACKETS: usize = 600;
-/// … and must end within this long of its first packet.
-pub const FRAME_SPAN: Duration = Duration::from_millis(500);
+/// Bounds the lifetime of current-timestamp accounting, not a frame buffer. Allow
+/// publisher pacing on slow uplinks; bytes, packets and buckets stay bounded.
+pub const FRAME_SPAN: Duration = Duration::from_secs(2);
 /// Packets per second a share may send, and its packet burst (`FRAME_PACKETS`).
 const PACKET_RATE: f64 = 2_000.0;
 /// The byte bucket's rate is this times the share's cap.
@@ -194,6 +195,10 @@ pub struct IngressCounters {
     pub forwarded: u64,
     pub dropped: u64,
     pub overruns: u64,
+    pub frame_span: u64,
+    pub frame_bytes: u64,
+    pub frame_packets: u64,
+    pub bucket: u64,
     /// Datagrams the publish transport's meter dropped before str0m.
     pub transport_dropped: u64,
 }
@@ -256,6 +261,9 @@ impl Ingress {
             self.highest = Some(source);
         }
         let mut within = self.packets.take(1.0, now) && self.bytes.take(size as f64, now);
+        if !within {
+            self.counters.bucket += 1;
+        }
         // Frame bounds follow the newest frame, counting each of its packets in whatever order
         // they arrive; a late repair of an older frame only counts against the buckets.
         let current = self.frame.as_ref().is_some_and(|frame| frame.timestamp == timestamp);
@@ -266,9 +274,12 @@ impl Ingress {
             };
             frame.bytes += size;
             frame.packets += 1;
-            within &= frame.bytes <= FRAME_BYTES
-                && frame.packets <= FRAME_PACKETS
-                && now.saturating_duration_since(frame.first) <= FRAME_SPAN;
+            let size_ok = frame.bytes <= FRAME_BYTES && frame.packets <= FRAME_PACKETS;
+            let span_ok = now.saturating_duration_since(frame.first) <= FRAME_SPAN;
+            self.counters.frame_bytes += u64::from(frame.bytes > FRAME_BYTES);
+            self.counters.frame_packets += u64::from(frame.packets > FRAME_PACKETS);
+            self.counters.frame_span += u64::from(!span_ok);
+            within &= size_ok && span_ok;
         }
         if within {
             return None;
@@ -386,6 +397,36 @@ mod tests {
     }
 
     #[test]
+    fn paced_large_keyframes_fit_without_weakening_abuse_limits() {
+        let now = Instant::now();
+        let mut ingress = Ingress::new(3_000_000, now);
+        // 400 KB over 1.2 s, repeated within the old ten-second Stop window.
+        for frame in 0..4u64 {
+            for packet in 0..400u64 {
+                let at = now + Duration::from_millis(frame * 1500 + packet * 3);
+                assert!(matches!(
+                    ingress.admit(frame * 400 + packet, frame as u32, 1024, if packet == 0 { KEY } else { MORE }, at),
+                    Verdict::Forward { .. }
+                ));
+            }
+        }
+        assert_eq!(ingress.counters.overruns, 0);
+        // An oversized timestamp still overruns, and repeated abuse still stops.
+        let mut abuse = Ingress::new(1_000_000_000, now);
+        for attempt in 0..3u64 {
+            let at = now + Duration::from_secs(attempt);
+            assert_eq!(
+                abuse.admit(attempt * 2, attempt as u32, FRAME_BYTES, KEY, at),
+                Verdict::Forward { keyframe: true }
+            );
+            assert_eq!(
+                abuse.admit(attempt * 2 + 1, attempt as u32, 1, MORE, at),
+                if attempt == 2 { Verdict::Stop } else { Verdict::Overrun }
+            );
+        }
+    }
+
+    #[test]
     fn frame_bounds_cut_frames_without_a_boundary() {
         let now = Instant::now();
         // Spaced so the buckets keep refilling: only the frame bound can cut. `reversed` sends
@@ -394,7 +435,7 @@ mod tests {
             ("bytes", 1200, FRAME_BYTES / 1200 + 1, Duration::from_micros(100), false),
             ("packets", 10, FRAME_PACKETS + 1, Duration::from_micros(500), false),
             ("reordered packets", 10, FRAME_PACKETS + 1, Duration::from_micros(500), true),
-            ("span", 10, 12, Duration::from_millis(50), false),
+            ("span", 10, 42, Duration::from_millis(50), false),
         ] {
             let mut ingress = Ingress::new(1_000_000_000, now);
             let mut at = now;
@@ -424,8 +465,9 @@ mod tests {
         let mut overrun = |ingress: &mut Ingress, at: Instant| {
             assert!(matches!(ingress.admit(sequence, sequence as u32, 10, KEY, at), Verdict::Forward { .. }));
             sequence += 1;
-            // A continuation 600 ms later breaks the span bound.
-            let verdict = ingress.admit(sequence, (sequence - 1) as u32, 10, MORE, at + Duration::from_millis(600));
+            // A continuation just beyond the allowance breaks the span bound.
+            let verdict =
+                ingress.admit(sequence, (sequence - 1) as u32, 10, MORE, at + FRAME_SPAN + Duration::from_millis(100));
             sequence += 1;
             verdict
         };
@@ -433,6 +475,6 @@ mod tests {
         assert_eq!(overrun(&mut ingress, now + Duration::from_secs(4)), Verdict::Overrun);
         // The first one is more than 10 s old by now.
         assert_eq!(overrun(&mut ingress, now + Duration::from_secs(11)), Verdict::Overrun);
-        assert_eq!(overrun(&mut ingress, now + Duration::from_secs(12)), Verdict::Stop);
+        assert_eq!(overrun(&mut ingress, now + Duration::from_secs(14)), Verdict::Stop);
     }
 }

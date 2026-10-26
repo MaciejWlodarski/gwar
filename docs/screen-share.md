@@ -1101,7 +1101,9 @@ Limits are enforced continuously, not only when a share or watch is admitted:
     slot keeps its reservation. Budget pauses resume through the usual resume
     rule once egress has stayed at or under 90 % of the budget for 10 s.
 - **Negotiation.**
-  - At most 4 `screen.*.offer` per session per minute.
+  - Publish and watch offers have separate per-session buckets: each allows a
+    burst of 4 and refills at 4 per minute. Watching cannot spend recovery-publish
+    credit. Watch re-offers retry a fresh run after rate-limit refill.
   - A guest connection gets exactly one accepted `guest.offer`. A second one
     closes the connection, so renegotiating means reconnecting through the
     gateway's pre-authentication limits
@@ -1135,11 +1137,14 @@ does not assemble frames before forwarding.
   - The share goes to *waiting for keyframe* for **all** its slots, and one
     throttled PLI goes to the publisher.
 - **The server bounds frames.** One RTP timestamp may carry at most 512 KB
-  (the byte burst), at most 600 packets (the packet burst), and must end, by a
-  marker bit or a new timestamp, within 500 ms of its first packet.
+  (the byte burst), at most 600 packets (the packet burst), and is tracked for
+  at most 2 s from its first packet, until a new timestamp arrives. This bounds current-timestamp
+  accounting, not buffered media: ingress forwards or drops each packet immediately.
+  The allowance accommodates a publisher pacing a large keyframe over a slow uplink
+  (the regression sends 400 KB over 1.2 s), independently of SFU arrival jitter.
   - A packet that breaks any of these is treated exactly like a bucket overrun.
   - So a publisher that sends continuations without ever starting a new frame
-    is cut off after 500 ms at most. It cannot postpone the drop.
+    is cut off when its next packet exceeds the 2 s span, byte or packet bound.
 - **Repeated overruns end the share.** Three overruns of one share within 10 s
   stop it with `screen.stopped {reason: "limit"}`. An honest sharer's frames
   fit far inside these bounds: the largest frame measured was 204 KB, a
@@ -2224,8 +2229,12 @@ feeds or polls a watch transport, so a NACK arriving before the `Release`
 finds an empty RTX cache. Commands that end things are also fenced: a
 transport whose share or lease (a watch transport's, ended when the core drops
 it) has ended closes within 100 ms even if its command was lost to a full
-queue, and an assignment is recorded only once the queue has room for it. The
-screen task's own signals to the core (connected, ended) arrive in order: what
+queue, and an assignment is recorded only once the queue has room for it.
+A watch transport that never connects expires 25 s after its offer is accepted,
+for members and guests alike. The SFU reports the failed run to the core, which
+releases member slots and reservations; guests are disconnected and their guest
+reservation is freed. Connected transports use the existing ICE failure handling.
+The screen task's own signals to the core (connected, ended) arrive in order: what
 the core's full queue does not take waits behind one reservation in that
 queue, in line with every other sender, so a busy core cannot keep passing
 over them. Waiting signals a later one makes moot leave (a viewer's earlier
@@ -3547,3 +3556,340 @@ Smaller defaults chosen in this design, which the owner may change:
   `monthly_egress_stop` is set;
 - in phase 2, "Mute the shared tab for me" starts off, until PR 9 measures
   echo.
+
+### Server audit scheduling and signaling (October 2026)
+
+The SFU keeps one indexed deadline per transport. Datagram wakes drain only the
+transport receiving the datagram and viewers receiving forwarded media, plus
+transports whose RTC deadline, deliverable PLI or egress wake is due. Forwarding
+still catches the viewer clock up before polling and again after releasing
+originals, preserving TWCC timestamps and pacer snapshots. Atomic authority is
+checked on every forward/drain. Ended-origin and lease reclamation, keyframe-budget
+cleanup, measured-budget enforcement and allocation run on their independent
+100 ms tick. A pending PLI does not arm a timer until its publisher is connected
+and its receive stream exists. Deadline entries are replaced and removed with the
+transport; they cannot accumulate across packets or replacement runs.
+
+Publish offers and watch offers have separate per-session buckets. Each keeps a
+burst of four and refills at four per minute. Replaying an already answered offer
+does not consume credit. Web watch re-offers rejected with `rate_limited` close the
+unconnected peer while waiting 15.25 s for refill, then retry a fresh run (at most
+two retries). Replacement/reset fences both retries and errors from superseded
+runs. A publish answer arriving after its share ended replies `not_found`; an
+answer for a superseded or retired watch run replies `stale` immediately.
+Guest frames validate the `id`/`op`/`d` envelope separately from the strict
+operation payload, rejecting extra keys at either level without Serde's
+`flatten`/`deny_unknown_fields` interaction.
+
+Ingress diagnostics distinguish timestamp-span, frame-size and bucket violations,
+in addition to transport drops and sent PLIs. Transport drain counts are exposed
+in `ScreenSnapshot` for scheduler regressions. Limit decisions log the bounded
+counters once per violation, with the share ID, to correlate receiver freezes
+with actual ingress enforcement rather than infer a cause from browser stats.
+
+Coalesced keyframe requests spend one viewer credit when they first make a
+publisher PLI pending; duplicates while it is pending spend none. A PLI sent for
+the same publisher after a deferred request also satisfies it without a second
+viewer credit. The ten-per-minute viewer bucket and one-PLI-per-share-per-500-ms
+throttle still bound new requests.
+Previously a burst of queue-recovery/RTCP requests could consume all ten credits
+without sending ten PLIs, delaying the next recovery by the six-second refill.
+Debug samples include PLI credit denials and per-viewer egress counters/waiting-slot
+bits to distinguish queue recovery from ingress enforcement or aggregate-budget pauses.
+
+Initial keyframe requests use admission-sized waves. For each measured source,
+reserve `max(4 × observed keyframe, observed keyframe + 64 KiB)`, capped at the
+per-frame ingress limit including the 64-byte original-packet reserve for up to
+600 packets. Unknown sources reserve the existing 200 KiB probe floor. The
+combined outstanding response reservations must fit admission and the 400 ms
+release deadline before PLIs can be sent together. Flowing shares' delta backlog
+is not another startup reservation. Higher-priority flowing media retains its
+measured release share; lower-priority media cannot veto the new stage share.
+The actual priority pacer, socket cap and packet admission/deadline bounds still
+apply. A single seed can run when no other response reservation is outstanding,
+even if its conservative reservation does not fit, without requiring the whole
+viewer queue to empty. The bootstrap fit guard applies until the initial
+admission deadline below.
+
+An initial response keeps its reservation until its complete keyframe drains.
+Recent recovery PLIs on already playing slots retain their existing 500 ms
+reservation, so a new initial request cannot ignore an outstanding recovery.
+The same egress wake then serves the next wave, without a fixed 500 ms wait or
+an additional housekeeping tick. A silent source releases its reservation after
+500 ms; one that has started a keyframe keeps it until drain or loss, with a
+hard 2.9 s expiry (500 ms response window + 2 s ingress span + 400 ms deadline).
+This keeps small-frame startup prompt while preventing historical small frames
+from soliciting a simultaneous burst of larger responses into a cold viewer's
+queue. A slot's first PLI deferred for one second can bypass conservative
+admission and bootstrap fit, oldest first. Admission-loss retries retain the
+bootstrap fit guard to preserve discovery credit. Forced requests retain the 500 ms
+viewer spacing, normal viewer credit and publisher throttle: at most one forced
+request per spacing interval. A silent publisher, incomplete response or missing
+drain therefore cannot hold other initial requests indefinitely. Admission loss
+still queues the existing budgeted retry; the escape never raises packet bounds.
+
+Retries and credit-limited requests retain the 500 ms viewer spacing. Deferred
+requests are retained per slot independently of segment state, including active
+slots asking for decoder recovery. If admission drops an initial response, its
+reservation clears and a retry is queued immediately with its previous service
+age, ahead of newer work while preserving older deferred requests. The retry
+uses the same credits, publisher throttle and bootstrap fit guard; the first-PLI
+escape does not apply to retries. Serving it
+updates its age, so repeated failures cannot monopolize the queue. The 100 ms
+housekeeping tick also serves requests when publishers send no more packets.
+Initial requests win ties over retries; repeated reports preserve their age.
+Paused slots retain requests until resumed. Assignment and transport teardown
+clear reservations together with deferred requests.
+
+For a live, unpaused assignment whose publisher is connected and has established
+its receive stream, the conservative scheduling bound is **30 s** from the request
+(or from becoming eligible after resume/connection). With at most four pending
+slots, even an empty viewer bucket supplies four credits in at most 4 × 6 s;
+allow 100 ms per credit for the housekeeping tick, up to 5 s for bootstrap fit
+deferral, and 500 ms for the publisher throttle: 29.9 s in total. With available
+credits and no fit deferral, silent publishers still get four requests within
+2.9 s (four 600 ms service opportunities plus the publisher throttle). A partial
+response keeps its reservation for up to 2.9 s, but cannot defer another initial
+request past the one-second admission deadline plus earlier service
+opportunities. Four initial requests with available credit advance within about
+3 s even without a drain. Credit exhaustion can still require the six-second
+refill; the admission deadline adds no further wait once credit is available,
+so it does not extend the conservative 30 s bound above.
+Fresh-credit initial requests whose combined reservations fit start together;
+others advance in waves as admission drains.
+Generated 1-4-publisher scenarios and connected-SRTP regressions require both
+PLI receipt and complete small-keyframe receipt under 200 ms. A prompt initial
+request cannot bypass the spacing held by an older deferred retry. Coalescing
+can shorten these bounds.
+They assume the task continues receiving its normal 100 ms housekeeping service;
+they bound PLI requests, not a publisher's response. New reports, retries and
+replacement assignments join behind older requests, so churn cannot extend their
+queue position.
+
+During the first 5 s after a viewer's first keyframe request, a known keyframe
+that cannot fit the current per-slot release share within 400 ms is deferred
+without spending viewer credit, including recovery requests on active segments.
+The start of a keyframe can activate a segment before the complete frame fits;
+using that state to bypass the guard would spend credits during the same cold
+queue pressure. The calculation reserves higher-priority media's
+measured average. One initial request always seeds media/feedback; unknown sizes
+are allowed. The guard ends when the estimate fits the frame or after those 5 s;
+initial requests also have the one-second admission escape. A conservative
+estimate therefore cannot suppress recovery permanently. Rate samples
+come from the existing allocation tick. Probe targets and pacing limits are not
+raised by this guard.
+
+The round-2 startup regression uses connected SRTP peers, fresh credits and
+small established static sources that answer the first PLI with one complete
+keyframe. Five trials each cover 1-4 publishers. Timing starts before the watch
+grant round trip and ends at the publisher's PLI receipt or viewer's keyframe
+receipt; every publisher must stay below 200 ms. The unfixed branch reproduced
+609.7/615.2 ms for the second publisher's PLI/keyframe. With prompt admission:
+
+| Publishers | Last publisher median PLI receipt | Last publisher median keyframe receipt |
+| --- | ---: | ---: |
+| 1 | 28.1 ms | 31.1 ms |
+| 2 | 28.1 ms | 32.1 ms |
+| 3 | 27.0 ms | 31.2 ms |
+| 4 | 27.4 ms | 31.9 ms |
+
+The slowest receipt across those 20 trials was 32.0 ms for a PLI and 36.0 ms for
+a keyframe. Generated scheduling coverage adds 32 fresh-credit cases (1-4 slots,
+rotated request order and measured keyframe sizes) to the 32 adversarial cases.
+The exhausted-budget check still schedules first PLIs at 6/12/18/24 s and sends
+15 PLIs over 90 s; five independent teardown paths clear deferred state.
+
+#### Round-3 admission growth regression
+
+Historical 21,280-byte frames do not bound the next response. The review repro
+has four publishers grow their next keyframe to 85,120 reserved bytes. Before
+this fix all four initial PLIs ran together: only one response completed, with
+three failed keyframes and 110 evicted packets. The ported regression answers
+only the first PLI per source, preventing retries from hiding initial loss.
+With growth reservations and drain-driven waves, all four first responses
+complete by **1.427 s**, with **zero** evictions, rejections or failed keyframes.
+Five connected-SRTP trials each receive all **[80,80,80,80]** response packets;
+the slowest trial completes in **1.099 s**.
+
+The stronger connected-SRTP regression uses four 200-packet keyframes (212,800
+reserved bytes each), with both unknown and known-large histories and a real
+cold estimator. All complete within **4.563 s** for unknown sources (**9 PLIs**)
+and **5.285 s** for known-large sources (**5 PLIs**), below the 30 s bound.
+The deterministic counterpart checks an exclusive seed's admission loss before
+capacity discovery, followed by fair, credit-limited recovery of all four
+sources with five PLIs. A separate regression checks that a failed initial PLI
+cannot satisfy its own retry when the failure shares its timestamp or an older
+request was already deferred. Mixed startup/recovery also retains the active
+slot's reservation.
+
+The latency regression is stronger than the round-2 tiny-packet test above:
+each established static source answers with eight 1,000-byte RTP payloads
+(8,512 reserved bytes), and timing ends at the complete keyframe's marker.
+All 20 connected-SRTP trials (five each for 1-4 publishers) stay below 200 ms.
+The slowest PLI receipt is **131.2 ms** and complete-keyframe receipt **163.6 ms**.
+Last-publisher medians are:
+
+| Publishers | PLI receipt | Complete keyframe receipt |
+| --- | ---: | ---: |
+| 1 | 26.9 ms | 58.1 ms |
+| 2 | 60.7 ms | 88.2 ms |
+| 3 | 95.3 ms | 128.2 ms |
+| 4 | 130.0 ms | 160.9 ms |
+
+Fairness remains **[4,4,3]**, active recovery **1→2**, and the empty-budget test
+still requests all four sources by **24 s** and sends **15 PLIs over 90 s**.
+The five cleanup paths also clear startup reservations. Round-3 artifacts are
+retained under `/tmp/gwar-pr173-r3-fix/`.
+
+#### Round-4 bounded initial admission
+
+The ported busy-queue repro keeps a healthy playing share at 41–42 KB of
+backlog for 31 s. At `1d420600`, the new stage share received no initial PLI.
+Response reservations now exclude steady delta backlog; release-fit accounting
+respects stage priority, and an exclusive seed does not require a globally empty
+queue. A one-second initial-admission deadline permits oldest-first progress,
+with the same 500 ms viewer spacing, credit bucket and publisher throttle.
+Growth reservations and budgeted admission-loss retries remain in place; the
+first-PLI escape cannot bypass the bootstrap fit guard on those retries.
+
+The regression now schedules the first PLI at **0 ms**. Its measured 30 KB
+response drains in **117 ms**, with **zero** evictions, rejections, failed
+keyframes or pauses. Separate production-scheduler cases cover a PLI-ignoring
+source, a partial response, cold fit and a drain that never arrives: the latter
+three schedule the oldest blocked source at **1.01 s**, then the next requests
+at **1.51/2.01 s** despite newer stage-priority reports. Departing mid-wave leaves
+the surviving viewer progressing at **0/0.5/1/1.5 s**.
+
+The round-3 growth repro still delivers all four first responses, one PLI per
+source and **zero loss**, by **1.569 s**. Five real SRTP trials each receive
+**[80,80,80,80]** packets with one PLI per source; the slowest completes in
+**1.126 s**. Across all 20 startup trials (1–4 publishers), maximum
+PLI receipt is **133.5 ms** and complete-keyframe receipt **163.2 ms**.
+Four unknown/known-large sources complete within **4.892/5.251 s**, using
+**12/8 PLIs**. Fairness remains **[4,4,3]**, active recovery **1→2**,
+empty-credit first PLIs **6/12/18/24 s**, and **15 PLIs over 90 s**. Cleanup
+continues to cover all five teardown paths.
+
+The unchanged supplied driver ran for five minutes with four textured 720p30
+sources, Chromium/WebKit viewers and 26 watches, including the existing churn.
+The canonical analyzer measured **0.76%** frozen stream-time (round 3:
+**0.72%**), **0.36%** outside the first five seconds after churn,
+and a longest sampled freeze of **7.67 s**. Viewer credit was denied on
+**4548 scheduling attempts** after churn (round 3: **0**). Repeated service
+attempts for one deferred request can each increment this counter; these are
+not extra transmitted PLIs. The affected receiver had decoded frames before
+the first denials. This run does **not** reproduce the earlier zero-denial
+soak; later recovery pressure remains a validation limitation. The corresponding
+trace and counter evidence is in `soak-credit-analysis.json` alongside the raw
+samples. Ingress overruns, dispatch drops and aggregate-budget pauses were
+**0/0/0**. Mean/peak CPU was **16.88/23.65%** of one core;
+peak RSS was **37.19 MiB**. This remains a short, unpaired measurement.
+
+Validation passed the required no-default-features test check, **145 screen**
+and **86 core** tests, the **96/60/70-case** voice/startup/recovery matrices,
+**16 screen + 2 admission + 15 watch-link + 3 preauth + 58 protocol** integration
+tests, Clippy with `-D warnings`, formatting and the Chromium/WebKit
+fixed-1080p60 H.264 screen gate. Only the named pre-existing malformed-flood
+protocol flake was skipped. All services were local; no production connection
+or native Gwar application was used. Cargo used four jobs and a disposable
+target, deleted after validation. Logs, source digests and canonical soak
+analysis are retained under `/tmp/gwar-pr173-r4-fix/`.
+
+#### Matched local audit soaks, 2026-10-26
+
+Both runs used the same temporary driver derived from `apps/web/e2e/screen.mjs`:
+four 720p30 textured canvas sources (two H.264, two VP9), five viewers including
+WebKit, and the first two sharers watching the other sources: 26 watches over
+seven watch transports. Each run measured ten minutes, with one watch transport
+replaced each minute and one publisher stopped/restarted every three minutes.
+Both servers used the same no-default-features dev build profile and a 600 Mb/s
+budget, on this macOS host. No network shaping was applied.
+
+One-second decoded-frame samples count missing receiver stats as zero frames,
+skip counter-reset intervals and the first five seconds of each share, and retain
+churn/startup waits. The second freeze metric additionally excludes the first
+five seconds after scheduled churn. Mean CPU per stream includes publisher/voice
+work. These measurements are one matched pair, not a cross-machine capacity gate.
+
+| Metric | Instrumented main `9c783f02` | Fixed server |
+| --- | ---: | ---: |
+| Frozen stream-time | 0.82% | 0.70% |
+| Frozen time outside the first 5 s after scheduled churn | 0.38% | 0.21% |
+| Longest sampled freeze | 11.84 s | 7.70 s |
+| Mean CPU (one core = 100%) | 25.51% | 18.35% |
+| Peak sampled CPU | 44.16% | 24.41% |
+| Mean CPU / 26 watched streams | 0.98 pp | 0.71 pp |
+| Peak RSS | 33.55 MiB | 34.95 MiB |
+| RSS after 10 s idle | 32.55 MiB | 33.39 MiB |
+| Transport drains per received datagram | 18.63 | 6.60 |
+
+The baseline reproduced an approximately 11 s zero-video-byte VP9 wait after watch
+churn while the publisher kept encoding and other viewers received it. Ingress
+overruns, dispatch drops and aggregate-budget pauses were zero in both measured
+runs (peak egress 57.89 and 46.48 Mb/s against 600 Mb/s). Cold-viewer egress
+samples exposed keyframe queue evictions and retry-credit exhaustion; the final
+run logged zero retry-credit denials after the bounded startup guard. Short cold
+startup waits remain, as the per-viewer estimate ramps within the existing
+pacing/queue limits.
+
+The matched pair above predates the round-1 scheduler correction. A separate
+five-minute follow-up used the same driver with oldest-request-first service,
+active-slot deferral, later-PLI coalescing and the fit guard on active recovery.
+The existing analyzer measured **0.63%** frozen stream-time,
+**0.22%** outside the first 5 s after scheduled churn,
+and an **8.70 s** longest sampled freeze. Mean CPU was
+21.74% of one core (peak 36.13%), peak RSS
+35.62 MiB, and transport drains per datagram 6.70.
+Viewer-credit denials, ingress overruns, dispatch drops and budget pauses were
+all zero. The bounded queues, request spacing, bootstrap guard and coalescing
+thus remain effective with fair, persistent recovery. This shorter, unpaired
+check is not a replacement for the matched ten-minute measurements. Final
+artifacts are in `/tmp/gwar-pr173-fix/soak-final/`; the preceding exploratory run
+is retained separately in `/tmp/gwar-pr173-fix/soak/`.
+
+The round-2 prompt-startup follow-up used the same driver for five minutes,
+with main `fe832443` integrated. The same analyzer measured
+**0.72%** frozen stream-time (previous follow-up: 0.63%),
+**0.28%** outside the first 5 s after scheduled churn,
+and a **7.68 s** longest sampled freeze. Viewer-credit denials were
+**0**; ingress overruns, dispatch drops and budget pauses were also zero.
+Mean CPU was 17.80% of one core (peak 32.82%),
+with peak RSS 36.17 MiB. This is another short, unpaired check;
+artifacts are in `/tmp/gwar-pr173-r2-fix/soak/`.
+
+The round-3 admission-wave follow-up used the unchanged driver for five minutes
+and the same canonical analyzer. Frozen stream-time was **0.72%**, compared
+with **0.72%** above; steady frozen time was **0.26%**, and the longest
+sampled freeze **7.66 s**. Viewer-credit denials remained **0**. Ingress
+overruns, dispatch drops and aggregate-budget pauses were also zero. Mean CPU
+was 16.89% of one core (peak 22.66%), with peak RSS 36.73 MiB.
+This is a short, unpaired comparison. Raw artifacts, analysis and the comparison
+are retained in `/tmp/gwar-pr173-r3-fix/soak/` and
+`/tmp/gwar-pr173-r3-fix/soak-comparison.json`.
+
+Round-3 validation passed the required no-default-features test check, 142 focused
+screen tests, 86 core tests, all three full simulation matrices, 16 SRTP screen
+tests, two new admission SRTP tests, 15 watch-link tests, three preauth tests,
+Clippy with `-D warnings`, formatting and the Chromium/WebKit fixed-1080p60 H.264
+gate. The known pre-existing malformed-flood protocol flake failed again;
+the other 58 protocol tests passed. It remains out of scope. Temporary Cargo
+targets were deleted after validation; source probes and logs remain.
+
+Round-2 validation passed the required no-default-features test check, 139 focused screen
+tests, 86 core tests, all three full simulation matrices, 16 SRTP screen tests,
+15 watch-link tests, three preauth tests, the Chromium/WebKit fixed-1080p60 H.264
+gate and all 1,522 web tests after integrating main. The protocol suite passed
+58 of 59 tests: `malformed_floods_use_up_the_allowance_and_then_the_connection`
+failed while reading disconnect/close. Five isolated trials at the original
+`ad466518` head reproduced that failure three times and passed twice, using a
+separate clean target. The protocol harness remains unchanged. Logs and the
+structured results are in `/tmp/gwar-pr173-r2-fix/validation.json`.
+
+The earlier deleted-log soak reported 8.5% frozen stream-time, 85.8% peak CPU,
+about 2.5 CPU percentage points per watched stream, and 42.3 MiB peak RSS. That
+aggregate freeze rate was not reproduced on instrumented main here. Its exact
+historical cause cannot be recovered from its summary alone; the new artifacts
+establish the reproduced cold-watch failure path without attributing every old
+freeze to it. The driver, freeze timestamps, raw logs, intermediate runs and
+canonical comparison are retained under `/tmp/gwar-soak-*` and
+`/tmp/gwar-soak-final-comparison.json` on the validation host.

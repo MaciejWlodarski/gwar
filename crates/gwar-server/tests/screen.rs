@@ -188,7 +188,7 @@ async fn an_overrun_cuts_the_rest_until_a_keyframe_and_three_end_the_share() {
         assert_eq!(viewer.next().await, (slot, frame(0, 0, true, 3, 1)[i].clone()));
     }
 
-    // A frame that never ends: its continuation 600 ms later breaks the 500 ms bound.
+    // A frame that never ends: its continuation 2.1 s later breaks the 2 s bound.
     let overrun = |sequence: &mut u64, timestamp: &mut u32| {
         let start = frame(*sequence, *timestamp, false, 2, 40);
         let late = Packet {
@@ -205,7 +205,7 @@ async fn an_overrun_cuts_the_rest_until_a_keyframe_and_three_end_the_share() {
     let (start, late) = overrun(&mut sequence, &mut timestamp);
     publisher.send(start).await;
     assert_eq!(tags(&[viewer.next().await, viewer.next().await], slot), [(40, 0), (40, 1)], "the prefix stays");
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep(Duration::from_millis(2100)).await;
     publisher.send([late]).await;
     // Deltas after the cut drop too, until the next keyframe.
     let (next_sequence, next_timestamp) = stream(publisher, sequence, timestamp, 50, 2, 2, false).await;
@@ -228,7 +228,7 @@ async fn an_overrun_cuts_the_rest_until_a_keyframe_and_three_end_the_share() {
         let viewer = bob.viewer.as_mut().unwrap();
         let got = [viewer.next().await, viewer.next().await, viewer.next().await];
         assert_eq!(tags(&got, slot), [(70, 0), (40, 0), (40, 1)]);
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep(Duration::from_millis(2100)).await;
         publisher.send([late]).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -253,13 +253,22 @@ async fn keyframe_requests_are_throttled_per_share_and_per_viewer() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let flood = alice.publisher(&share).keyframe_requests() - before;
     assert!((1..=3).contains(&flood), "{flood} requests");
-    // The viewer's budget (10 a minute, the watch used one) is spent: later requests do nothing.
+    // Coalesced duplicates did not exhaust the viewer's credits: distinct later
+    // requests still work, while at most ten new pending PLIs a minute are funded.
     let spent = alice.publisher(&share).keyframe_requests();
     for _ in 0..3 {
         bob.ok("screen.keyframe", json!({"share": share})).await;
         tokio::time::sleep(Duration::from_millis(600)).await;
     }
-    assert!(alice.publisher(&share).keyframe_requests() - spent <= 2);
+    assert!((1..=4).contains(&(alice.publisher(&share).keyframe_requests() - spent)));
+    for _ in 0..12 {
+        bob.ok("screen.keyframe", json!({"share": share})).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Includes the initial flood and the continuously refilling credit: no more
+    // than the ten-credit burst plus two refills over this interval reached RTP.
+    assert!(alice.publisher(&share).keyframe_requests() - before <= 12);
     // A new watch transport does not bring a new budget: watching again and asking again
     // reach the sharer at most once (what refilled meanwhile).
     let spent = alice.publisher(&share).keyframe_requests();
@@ -643,4 +652,144 @@ async fn quality_specs_require_negotiation_and_broadcast_only_to_negotiated_clie
     assert_eq!(event["spec"], json!({"mode":"sharp","height":1080,"fps":15}));
     assert_eq!(event["preset"], "text");
     legacy.ok("screen.stop", json!({"share":id})).await;
+}
+
+/// Regression: connected publishers acknowledge transport but do not create RTP
+/// automatically. A PLI is required to wake an idle/static third source.
+#[tokio::test]
+async fn review_idle_third_publisher_gets_its_first_keyframe_request() {
+    let server = TestServer::start().await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut carol = Client::connect(&server, "carol").await;
+    let mut dave = Client::connect(&server, "dave").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let channel = seed_channel(&alice, "General");
+    let a = alice.share_in(channel).await;
+    let b = carol.share_in(channel).await;
+    let c = dave.share_in(channel).await;
+    // Establish each receive stream before the late viewer joins, then hold media.
+    alice.publisher(&a).send(frame(1, 9000, true, 1, 1)).await;
+    carol.publisher(&b).send(frame(1, 9000, true, 1, 2)).await;
+    dave.publisher(&c).send(frame(1, 9000, true, 1, 3)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = std::time::Instant::now();
+    bob.watch(&a).await;
+    bob.watch(&b).await;
+    bob.watch(&c).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let counts = [
+        alice.publisher(&a).keyframe_requests(),
+        carol.publisher(&b).keyframe_requests(),
+        dave.publisher(&c).keyframe_requests(),
+    ];
+    eprintln!("actual SRTP publisher PLI counts after 8s: {counts:?}");
+    assert!(counts.iter().all(|count| *count > 0), "every waiting share receives an initial request");
+    assert!(
+        counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1,
+        "PLI-ignoring publishers share retry opportunities fairly: {counts:?}"
+    );
+    let budget = 10 + (started.elapsed().as_secs() / 6);
+    assert!(counts.iter().sum::<u64>() <= budget, "the shared viewer credit budget still holds");
+}
+
+#[tokio::test]
+async fn review_spaced_request_on_an_active_slot_is_not_lost() {
+    let server = TestServer::start().await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut carol = Client::connect(&server, "carol").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let channel = seed_channel(&alice, "General");
+    let a = alice.share_in(channel).await;
+    let b = carol.share_in(channel).await;
+    alice.publisher(&a).send(frame(1, 9000, true, 1, 1)).await;
+    carol.publisher(&b).send(frame(1, 9000, true, 1, 2)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    bob.watch(&a).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    alice.publisher(&a).send(frame(2, 12000, true, 1, 3)).await;
+    bob.viewer.as_mut().unwrap().next().await;
+    // The SFU segment is now active. Allow the initial per-viewer spacing to expire.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let before = alice.publisher(&a).keyframe_requests();
+    bob.watch(&b).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    bob.ok("screen.keyframe", json!({"share": a})).await;
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let after = alice.publisher(&a).keyframe_requests();
+    eprintln!(
+        "active share PLIs before={before}, after={after}; second share PLIs={}",
+        carol.publisher(&b).keyframe_requests()
+    );
+    assert!(after > before, "spacing dropped an active slot's recovery request instead of deferring it");
+}
+
+/// Regression for the round-2 startup repro: connected SRTP transports, fresh
+/// credits and established small static streams must complete prompt startup waves.
+#[tokio::test]
+async fn fresh_credit_startup_for_one_to_four_publishers_takes_under_200ms() {
+    use std::time::Instant;
+    let limit = Duration::from_millis(200);
+    for count in 1..=4 {
+        for trial in 0..5 {
+            let server = TestServer::start().await;
+            let mut bob = Client::connect(&server, "viewer").await;
+            let channel = seed_channel(&bob, "General");
+            let mut sources = Vec::new();
+            let mut shares = Vec::new();
+            for i in 0..count {
+                let mut source = Client::connect(&server, &format!("source-{i}")).await;
+                let share = source.share_in(channel).await;
+                let mut seed = frame(1, 9000, true, 8, 1);
+                for packet in &mut seed {
+                    packet.payload.resize(1000, 0x55);
+                }
+                source.publisher(&share).send(seed).await;
+                sources.push(source);
+                shares.push(share);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            bob.viewer = Some(screen::Viewer::start(&mut bob, 1).await);
+            let mut granted = Vec::new();
+            let mut slots = Vec::new();
+            for share in &shares {
+                // Start before the grant round trip: peer receipt bounds server
+                // send latency too, without adding production timing probes.
+                granted.push(Instant::now());
+                let reply = bob.ok("screen.watch", json!({"share": share})).await;
+                slots.push(reply["slot"].as_u64().unwrap() as usize);
+            }
+            let mut first_pli = vec![None; count];
+            let mut first_key = vec![None; count];
+            let end = Instant::now() + Duration::from_secs(8);
+            while first_key.iter().any(Option::is_none) && Instant::now() < end {
+                for (i, source) in sources.iter().enumerate() {
+                    let publisher = source.publisher(&shares[i]);
+                    if first_pli[i].is_none() {
+                        let observed = publisher.request_times.lock().unwrap().first().copied();
+                        if let Some(at) = observed {
+                            first_pli[i] = Some(at.saturating_duration_since(granted[i]));
+                            let mut response = frame(9, 12000, true, 8, 10 + i as u8);
+                            for packet in &mut response {
+                                packet.payload.resize(1000, 0x55);
+                            }
+                            publisher.send(response).await;
+                        }
+                    }
+                }
+                for (slot, packet) in bob.viewer.as_mut().unwrap().collect(Duration::from_millis(1)).await {
+                    if packet.payload[2] >= 10 && packet.marker {
+                        let i = slots.iter().position(|s| *s == slot).unwrap();
+                        first_key[i].get_or_insert(Instant::now().saturating_duration_since(granted[i]));
+                    }
+                }
+            }
+            eprintln!(
+                "STARTUP publishers={count} trial={trial} grant_to_pli={first_pli:?} grant_to_forwarded_keyframe={first_key:?}"
+            );
+            assert!(
+                first_pli.iter().chain(&first_key).all(|delay| delay.is_some_and(|delay| delay < limit)),
+                "fresh-credit startup exceeds 200ms: publishers={count}, trial={trial}, PLI={first_pli:?}, keyframe={first_key:?}"
+            );
+        }
+    }
 }

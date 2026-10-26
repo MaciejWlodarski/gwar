@@ -26,11 +26,17 @@ const SLOT_CHARGE: f64 = 1.3;
 /// `screen.start` per session: a burst of 4, then 4 a minute.
 const STARTS_BURST: f64 = 4.0;
 const STARTS_PER_SECOND: f64 = 4.0 / 60.0;
-/// `screen.*.offer` per session: 4 a minute.
+/// Each of publish and watch offers per session: burst 4, then 4 a minute.
 const OFFERS_BURST: f64 = 4.0;
 const OFFERS_PER_SECOND: f64 = 4.0 / 60.0;
 /// Largest SDP offer or answer.
 const SDP_LIMIT: usize = 64 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum OfferKind {
+    Publish,
+    Watch,
+}
 
 pub(super) struct Share {
     sharer: SessionId,
@@ -160,9 +166,9 @@ impl Core {
         Ok(())
     }
 
-    fn take_offer(&mut self, session: SessionId) -> Result<(), ErrorBody> {
+    fn take_offer(&mut self, session: SessionId, kind: OfferKind) -> Result<(), ErrorBody> {
         self.screen_offers
-            .entry(session)
+            .entry((session, kind))
             .or_insert_with(|| voice::Bucket::new(OFFERS_PER_SECOND, OFFERS_BURST))
             .take()
             .map_err(|_| err(ErrorCode::RateLimited, "screen transports are negotiated too often"))
@@ -283,7 +289,7 @@ impl Core {
             Ok(Some(answer)) => return Some(Ok(answer)),
             Ok(None) => {}
         }
-        if let Err(e) = self.take_offer(session) {
+        if let Err(e) = self.take_offer(session, OfferKind::Publish) {
             return Some(Err(e));
         }
         let Ok(permit) = self.screen.clone().try_reserve_owned() else {
@@ -298,7 +304,10 @@ impl Core {
         tokio::spawn(async move {
             let answer = negotiated(rx).await;
             let resume = move |core: &mut Core| {
-                let Some(share) = core.shares.get_mut(&name) else { return };
+                let Some(share) = core.shares.get_mut(&name) else {
+                    core.reply(session, id, Err(err(ErrorCode::NotFound, "the share ended during negotiation")));
+                    return;
+                };
                 let result = match answer {
                     Ok(sdp) => {
                         if let Some(publish) = &mut share.publish {
@@ -346,7 +355,7 @@ impl Core {
         if offer.sdp.len() > SDP_LIMIT {
             return Some(Err(err(ErrorCode::TooLarge, "SDP too large")));
         }
-        if let Err(e) = self.take_offer(session) {
+        if let Err(e) = self.take_offer(session, OfferKind::Watch) {
             return Some(Err(e));
         }
         let Ok(permit) = self.screen.clone().try_reserve_owned() else {
@@ -382,10 +391,11 @@ impl Core {
         tokio::spawn(async move {
             let answer = negotiated(rx).await;
             let resume = move |core: &mut Core| {
-                let Some(watch) = core.sessions.get_mut(&session).and_then(|s| s.watch.as_mut()) else { return };
-                if watch.run != run {
+                let watch = core.sessions.get_mut(&session).and_then(|s| s.watch.as_mut()).filter(|w| w.run == run);
+                let Some(watch) = watch else {
+                    core.reply(session, id, Err(stale()));
                     return;
-                }
+                };
                 let result = match answer {
                     Ok(sdp) => {
                         watch.answer = Some(sdp.clone());
@@ -818,7 +828,7 @@ impl Core {
     /// A session that is going away stops watching; its own share ended when it left voice.
     pub(super) fn screen_session_gone(&mut self, session: SessionId) {
         self.screen_starts.remove(&session);
-        self.screen_offers.remove(&session);
+        self.screen_offers.retain(|(owner, _), _| *owner != session);
         self.drop_watches(session, false);
         if self.sessions.get_mut(&session).and_then(|s| s.watch.take()).is_some() {
             let _ = self.screen.try_send(ScreenCmd::EndWatch { session });
@@ -875,4 +885,25 @@ async fn negotiated(rx: oneshot::Receiver<Result<String, &'static str>>) -> Resu
         .and_then(Result::ok)
         .unwrap_or(Err("media negotiation stopped"))
         .and_then(|sdp| if sdp.len() <= SDP_LIMIT { Ok(sdp) } else { Err("answer too large") })
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn publish_and_watch_offer_budgets_are_independent() {
+        let handle = super::super::expiry_tests::test_core(Store::in_memory().unwrap(), None);
+        super::super::expiry_tests::on_core(&handle, |core| {
+            for _ in 0..4 {
+                core.take_offer(7, OfferKind::Watch).unwrap();
+            }
+            assert_eq!(core.take_offer(7, OfferKind::Watch).unwrap_err().code, ErrorCode::RateLimited);
+            for _ in 0..4 {
+                core.take_offer(7, OfferKind::Publish).unwrap();
+            }
+            assert_eq!(core.take_offer(7, OfferKind::Publish).unwrap_err().code, ErrorCode::RateLimited);
+        })
+        .await;
+    }
 }

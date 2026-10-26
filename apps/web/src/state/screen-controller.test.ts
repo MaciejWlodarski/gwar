@@ -89,6 +89,50 @@ beforeEach(() => {
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe("watching", () => {
+  it("retries rate-limited watch offers after refill with a fresh run", async () => {
+    let offers = 0;
+    const { link } = fakeLink({
+      "screen.watch.offer": () => { if (offers++ === 0) throw new RequestError("rate_limited", "too often"); return { sdp: "answer" }; },
+      "screen.watch": () => ({ slot: 0 }),
+    });
+    const screen = new ScreenController(() => link, String);
+    const watching = screen.watch("A");
+    await flush();
+    expect(media.transports[0]!.close).toHaveBeenCalled();
+    expect(toast).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(15_250);
+    expect(media.transports).toHaveLength(2);
+    expect(media.transports[1]!.params.run).toBeGreaterThan(media.transports[0]!.params.run);
+    media.transports[1]!.params.state("connected");
+    await watching;
+    expect(useScreen.getState().watches[0]?.status).toBe("watching");
+    expect(toast).not.toHaveBeenCalled();
+    screen.reset();
+  });
+
+  it("ignores a stale error from a superseded watch run", async () => {
+    const answer = deferred<{ sdp: string }>();
+    let offers = 0;
+    const { link } = fakeLink({
+      "screen.watch.offer": () => offers++ === 0 ? answer.promise : { sdp: "answer" },
+      "screen.watch": () => ({ slot: 0 }),
+    });
+    const screen = new ScreenController(() => link, String);
+    const first = screen.watch("A");
+    await flush();
+    screen.reset();
+    await first;
+    const fresh = screen.watch("A");
+    await flush();
+    answer.reject(new RequestError("stale", "run superseded"));
+    await flush();
+    media.transports[1]!.params.state("connected");
+    await fresh;
+    expect(useScreen.getState().watches[0]?.status).toBe("watching");
+    expect(toast).not.toHaveBeenCalled();
+    screen.reset();
+  });
+
   it("watches without joining voice: one watch transport, then the slot, then focus", async () => {
     let unavailable = 2;
     const { link, ops, calls } = fakeLink({

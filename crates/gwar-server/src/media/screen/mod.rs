@@ -30,7 +30,7 @@ mod segment;
 mod sim;
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     pin::Pin,
     sync::{
@@ -74,11 +74,18 @@ const VIEWER_KEYFRAMES_BURST: f64 = 10.0;
 const VIEWER_KEYFRAMES_PER_SECOND: f64 = 10.0 / 60.0;
 /// A slot waiting for a keyframe asks again this often while the share keeps sending deltas.
 const WAITING_RETRY: Duration = Duration::from_secs(1);
+/// Initial admission must progress even if a response or queue drain never arrives.
+const INITIAL_ADMISSION_WAIT: Duration = Duration::from_secs(1);
+/// After one seed request, avoid spending cold-viewer credits on known unserviceable
+/// keyframes while initial probes ramp. Bounded so an estimate cannot strand a slot.
+const KEYFRAME_BOOTSTRAP: Duration = Duration::from_secs(5);
 const DECODE_WINDOW: Duration = Duration::from_secs(4);
 /// Allow independent watchdog reports to meet before isolating a failed watch.
 const CORROBORATE_FOR: Duration = Duration::from_secs(2);
 /// A publish transport that has not connected by then fails.
 pub const PUBLISH_CONNECT: Duration = Duration::from_secs(30);
+/// Members and guests must connect their watch transport before this deadline.
+pub const WATCH_CONNECT: Duration = Duration::from_secs(25);
 /// RTX cache per forwarded stream: packets, age target and resend ratio cap ("Queues and
 /// repairs"). Setting it also wipes it.
 const RTX_PACKETS: usize = 1024;
@@ -414,6 +421,7 @@ pub struct ScreenSnapshot {
     pub viewers: HashMap<SessionId, ViewerSnapshot>,
     /// Measured egress over the server-wide budget, seconds in a row.
     pub over_budget: u32,
+    pub drives: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -436,6 +444,8 @@ struct Throttle {
     last: Option<Instant>,
     pending: bool,
     sent: u64,
+    received: u64,
+    budget_denied: u64,
 }
 
 impl Throttle {
@@ -491,6 +501,26 @@ struct Publisher {
     deadline: Instant,
 }
 
+impl Publisher {
+    fn keyframe_wake(&mut self) -> Option<Instant> {
+        // A pending PLI cannot be delivered before ICE and the receive stream exist.
+        // Keeping its old throttle deadline armed here would busy-spin the task.
+        if self.connected && self.rtc.direct_api().stream_rx(&self.ssrc).is_some() {
+            self.keyframes.next()
+        } else {
+            None
+        }
+    }
+
+    fn wake(&mut self) -> Instant {
+        let mut at = self.deadline;
+        if !self.connected {
+            at = at.min(self.created + PUBLISH_CONNECT);
+        }
+        self.keyframe_wake().map_or(at, |next| at.min(next))
+    }
+}
+
 struct Slot {
     mid: Mid,
     grant: Option<Arc<WatchGrant>>,
@@ -503,6 +533,15 @@ struct Slot {
     configured: bool,
     ssrc: Option<u32>,
     asked: Option<Instant>,
+    /// Reserve startup responses until their keyframe drains. A silent source
+    /// only holds a wave for the publisher throttle interval. The flag records
+    /// whether this response has started; partial frames also have a hard expiry.
+    initial_in_flight: Option<(Instant, bool)>,
+    initial_delivered: Option<Instant>,
+    /// A PLI sent before this loss cannot satisfy its queued retry.
+    initial_failed: Option<Instant>,
+    /// Oldest unsatisfied request, independent of whether the segment is active.
+    keyframe_pending: Option<Instant>,
     /// Released originals still owned by str0m: sequence, source keyframe and arrival deadline.
     originals: VecDeque<(u16, Option<u32>, Instant)>,
     written: u64,
@@ -524,12 +563,25 @@ impl Slot {
             configured: false,
             ssrc: None,
             asked: None,
+            initial_in_flight: None,
+            initial_delivered: None,
+            initial_failed: None,
+            keyframe_pending: None,
             originals: VecDeque::new(),
             written: 0,
             keyframe_at: None,
             last_h264: None,
             decode_cap: None,
             failed_at: None,
+        }
+    }
+
+    fn dropped(&mut self, now: Instant) {
+        self.segment.wait();
+        self.initial_in_flight = None;
+        if self.initial_delivered.is_none() {
+            self.initial_failed = Some(now);
+            self.keyframe_pending.get_or_insert(now);
         }
     }
 }
@@ -550,6 +602,10 @@ struct Watcher {
     /// Assignments that arrived before the slot's m-line was seen, with their watch order.
     pending: Vec<(u32, Arc<WatchGrant>, u64)>,
     connected: bool,
+    created: Instant,
+    /// Last funded request; spaces retries and admission/credit-limited startup.
+    keyframe_at: Option<Instant>,
+    keyframes_started: Option<Instant>,
     focus: Option<String>,
     /// The viewer's queues, release bucket, socket cap and allocation, slot by slot.
     egress: Egress,
@@ -559,6 +615,55 @@ struct Watcher {
     /// Last estimator restart; also bounds post-resume probe spacing.
     restarted: Option<Instant>,
     deadline: Instant,
+}
+
+impl Watcher {
+    fn wake(&self) -> Instant {
+        let mut at = self.egress.wake().map_or(self.deadline, |wake| self.deadline.min(wake));
+        if !self.connected {
+            at = at.min(self.created + WATCH_CONNECT);
+        }
+        at
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Timer {
+    Publish(String),
+    Watch(SessionId),
+}
+
+/// Exactly one indexed wake per transport; packet wakes never scan unrelated transports.
+#[derive(Default)]
+struct Timers {
+    due: BTreeSet<(Instant, Timer)>,
+    indexed: HashMap<Timer, Instant>,
+}
+
+impl Timers {
+    fn set(&mut self, key: Timer, at: Instant) {
+        if self.indexed.get(&key) == Some(&at) {
+            return;
+        }
+        self.remove(&key);
+        self.due.insert((at, key.clone()));
+        self.indexed.insert(key, at);
+    }
+
+    fn remove(&mut self, key: &Timer) {
+        if let Some(at) = self.indexed.remove(key) {
+            self.due.remove(&(at, key.clone()));
+        }
+    }
+
+    fn pop(&mut self, now: Instant) -> Option<Timer> {
+        if self.due.first().is_none_or(|(at, _)| *at > now) {
+            return None;
+        }
+        let (_, key) = self.due.pop_first().expect("due timer");
+        self.indexed.remove(&key);
+        Some(key)
+    }
 }
 
 /// A packet that passed ingress, to be written to every slot that carries its share.
@@ -628,6 +733,8 @@ struct Sfu {
     /// Viewer/share report throttling survives transport replacement; independent slots
     /// can report without exhausting one another's watchdog retries.
     decode_reports: HashMap<(SessionId, String), Instant>,
+    /// The allocation tick's rates, also used by cold-viewer keyframe admission.
+    rates: HashMap<String, ShareRate>,
     publishers: HashMap<String, Publisher>,
     watchers: HashMap<SessionId, Watcher>,
     next_id: u64,
@@ -636,6 +743,12 @@ struct Sfu {
     /// Watch order across all viewers: the newest watch is paused first for the budget.
     watches: u64,
     next_allocation: Instant,
+    timers: Timers,
+    /// Number of actual transport drains, for bounded diagnostics and cost regressions.
+    drives: u64,
+    wakes: u64,
+    datagram_wakes: u64,
+    timer_wakes: u64,
 }
 
 pub async fn run(
@@ -656,6 +769,7 @@ pub async fn run(
         outbox: VecDeque::new(),
         budgets: HashMap::new(),
         decode_reports: HashMap::new(),
+        rates: HashMap::new(),
         publishers: HashMap::new(),
         watchers: HashMap::new(),
         next_id: 1,
@@ -663,6 +777,11 @@ pub async fn run(
         measured: Measured::new(now),
         watches: 0,
         next_allocation: now,
+        timers: Timers::default(),
+        drives: 0,
+        wakes: 0,
+        datagram_wakes: 0,
+        timer_wakes: 0,
     };
     // While signals wait, one reservation stands in the core's queue, in line with every other
     // sender: a busy core cannot keep passing over them.
@@ -682,7 +801,7 @@ pub async fn run(
                 None => break,
             },
             datagram = rx.recv() => match datagram {
-                Some(datagram) => sfu.datagram(datagram),
+                Some(datagram) => { sfu.datagram_wakes += 1; sfu.datagram(datagram); },
                 None => break,
             },
             reserved = reserved(&mut slot), if waiting => {
@@ -692,8 +811,9 @@ pub async fn run(
                     None => sfu.outbox.clear(),
                 }
             }
-            _ = sleep_until(deadline.into()) => {}
+            _ = sleep_until(deadline.into()) => { sfu.timer_wakes += 1; }
         }
+        sfu.wakes += 1;
         sfu.timeouts(Instant::now());
     }
 }
@@ -707,20 +827,19 @@ async fn reserved(slot: &mut Option<Pin<Box<dyn Future<Output = Option<ScreenSlo
 
 impl Sfu {
     fn deadline(&self) -> Instant {
-        let mut at = Instant::now() + Duration::from_millis(100);
-        for p in self.publishers.values() {
-            at = at.min(p.deadline);
-            if let Some(next) = p.keyframes.next() {
-                at = at.min(next);
-            }
+        self.timers.due.first().map_or(self.next_allocation, |(at, _)| (*at).min(self.next_allocation))
+    }
+
+    fn schedule_publisher(&mut self, share: &str) {
+        if let Some(p) = self.publishers.get_mut(share) {
+            self.timers.set(Timer::Publish(share.to_owned()), p.wake());
         }
-        for w in self.watchers.values() {
-            at = at.min(w.deadline);
-            if let Some(wake) = w.egress.wake() {
-                at = at.min(wake);
-            }
+    }
+
+    fn schedule_watcher(&mut self, session: SessionId) {
+        if let Some(w) = self.watchers.get(&session) {
+            self.timers.set(Timer::Watch(session), w.wake());
         }
-        at.min(self.next_allocation)
     }
 
     fn id(&mut self) -> u64 {
@@ -753,7 +872,9 @@ impl Sfu {
                     Ok((publisher, answer)) => {
                         debug!(share = publisher.origin.share, "screen publish accepted");
                         publisher.origin.recovery.lock().expect("recovery lock").pending = false;
-                        self.publishers.insert(publisher.origin.share.clone(), publisher);
+                        let share = publisher.origin.share.clone();
+                        self.publishers.insert(share.clone(), publisher);
+                        self.flush_publisher(&share);
                         let _ = reply.send(Ok(answer));
                     }
                     Err(message) => {
@@ -777,10 +898,12 @@ impl Sfu {
                         let (socket, measured, shared) = (&self.socket, &mut self.measured, &self.shared);
                         let guest = watcher.size == GUEST_SLOTS;
                         let mut send = |c: &[u8], to| transmit(socket, measured, shared, guest, c, to);
+                        self.drives += 1;
                         if drive(&mut watcher, now, &mut Vec::new(), &mut send) {
                             self.signal(ScreenSignal::Watch { session, run, connected: true });
                         }
                         self.watchers.insert(session, watcher);
+                        self.schedule_watcher(session);
                         let _ = reply.send(Ok(answer));
                     }
                     Err(message) => {
@@ -880,27 +1003,160 @@ impl Sfu {
                 })
                 .collect(),
             over_budget: self.measured.over,
+            drives: self.drives,
         }
     }
 
-    /// Asks the share in `session`'s slot for a keyframe, within the viewer's budget.
+    /// Retains a request until it schedules or joins a pending publisher PLI.
     fn ask_keyframe(&mut self, session: SessionId, slot: usize, now: Instant) {
         let Some(w) = self.watchers.get_mut(&session) else { return };
-        if w.egress.paused(slot).is_some() {
-            return;
-        }
         let Some(s) = w.slots.get_mut(slot) else { return };
-        let Some(grant) = s.grant.as_ref().filter(|g| g.alive()) else { return };
-        s.asked = Some(now);
-        let budget = self
-            .budgets
-            .entry(session)
-            .or_insert_with(|| Bucket::new(VIEWER_KEYFRAMES_PER_SECOND, VIEWER_KEYFRAMES_BURST, now));
-        if !budget.take(1.0, now) {
+        if s.grant.as_ref().is_none_or(|g| !g.alive()) {
             return;
         }
-        if let Some(p) = self.publishers.get_mut(&grant.share) {
-            p.keyframes.pending = true;
+        s.keyframe_pending.get_or_insert(now);
+        self.request_keyframes(session, now);
+    }
+
+    /// Oldest deferred request first, regardless of media priority. Repeated reports
+    /// preserve their place; a serviced slot's next retry joins the tail. Initial
+    /// requests win ties over retries, so PLI-ignoring publishers cannot monopolize
+    /// the spacing opportunities or the session's shared credits.
+    fn request_keyframes(&mut self, session: SessionId, now: Instant) {
+        let Some(w) = self.watchers.get(&session) else { return };
+        let mut pending: Vec<_> = w
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, s)| {
+                let at = s.keyframe_pending?;
+                let grant = s.grant.as_ref().filter(|g| g.alive())?;
+                // A lost initial response retains its service age for one fair
+                // retry ahead of newer work, without treating the old PLI as a
+                // response to this new request. Older deferred work still wins.
+                let age = if s.initial_failed.is_some() { s.asked.map_or(at, |asked| asked.min(at)) } else { at };
+                w.egress.paused(slot).is_none().then(|| (age, at, s.asked.is_some(), slot, grant.share.clone()))
+            })
+            .collect();
+        pending.sort_unstable();
+        let mut deferred = false;
+        for (_, requested, retry, slot, share) in pending {
+            let Some(p) = self.publishers.get(&share) else { continue };
+            // Another viewer can send this publisher's PLI between our request
+            // and the next housekeeping tick. It satisfies the deferred request
+            // just as joining a still-pending PLI does.
+            let s = &self.watchers[&session].slots[slot];
+            let already_sent = p
+                .keyframes
+                .last
+                .is_some_and(|sent| sent >= requested && s.initial_failed.is_none_or(|failed| sent > failed));
+            let coalesced = p.keyframes.pending || already_sent;
+            let w = self.watchers.get_mut(&session).expect("watch found above");
+            if !coalesced {
+                let mut rates = [ShareRate::default(); SCREEN_SLOTS];
+                for (i, s) in w.slots.iter().enumerate() {
+                    rates[i] = s.grant.as_ref().and_then(|g| self.rates.get(&g.share)).copied().unwrap_or_default();
+                }
+                let credits =
+                    self.budgets.get_mut(&session).map_or(VIEWER_KEYFRAMES_BURST, |budget| budget.available(now));
+                // Reserve unanswered startup frames even before their packets
+                // reach admission. A completed wave releases its reservation on
+                // drain, allowing the next wave on that same transport wake.
+                let initial = w
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, s)| {
+                        s.asked.is_none()
+                            && s.grant.as_ref().is_some_and(|g| g.alive())
+                            && w.egress.paused(*i).is_none()
+                    })
+                    .count()
+                    .max(1);
+                let batch: Vec<_> = w
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| {
+                        (i == slot
+                            || (s.grant.as_ref().is_some_and(|g| g.alive())
+                                && w.egress.paused(i).is_none()
+                                && (s.initial_in_flight.is_some_and(|(at, started)| {
+                                    let elapsed = now.saturating_duration_since(at);
+                                    elapsed < KEYFRAME_INTERVAL
+                                        || (started
+                                            && elapsed < KEYFRAME_INTERVAL + ingress::FRAME_SPAN + egress::DEADLINE)
+                                })
+                                    // Keep the existing reservation for a recent
+                                    // recovery PLI on an already playing slot.
+                                    || s.initial_delivered.is_some_and(|delivered| {
+                                        s.asked.is_some_and(|at| {
+                                            at != delivered && now.saturating_duration_since(at) < KEYFRAME_INTERVAL
+                                        })
+                                    }))))
+                        .then_some(i)
+                    })
+                    .collect();
+                // A single seed may exceed its conservative reservation.
+                // Flowing delta queues do not hold startup reservations; waiting
+                // for a globally empty queue would strand a new stage share.
+                let previous_drained = w.keyframe_at.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= KEYFRAME_INTERVAL
+                        || w.slots.iter().any(|s| s.initial_delivered == Some(last))
+                });
+                let admission = w.egress.keyframes_fit(slot, &batch, &rates[..w.slots.len()])
+                    || (batch.len() == 1 && previous_drained);
+                // Oldest initial work gets a bounded escape from conservative
+                // reservations and bootstrap fit, even if a publisher ignores
+                // PLIs or a partial response never drains. Initial-loss retries
+                // retain the bootstrap guard to preserve discovery credit.
+                // The viewer spacing
+                // below permits only one such request per 500 ms, still funded
+                // by its normal credit and subject to the publisher throttle.
+                let overdue_initial = !retry && now.saturating_duration_since(requested) >= INITIAL_ADMISSION_WAIT;
+                let prompt_initial = !deferred
+                    && !retry
+                    && !overdue_initial
+                    && w.slots[slot].segment.waiting()
+                    && credits >= initial as f64
+                    && admission;
+                if (w.slots[slot].initial_delivered.is_none() && !admission && !overdue_initial)
+                    || (!prompt_initial
+                        && w.keyframe_at.is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_INTERVAL))
+                {
+                    deferred = true;
+                    continue;
+                }
+                if !overdue_initial
+                    && w.keyframes_started.is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_BOOTSTRAP)
+                    && !w.egress.keyframe_fits(slot, &rates[..w.slots.len()])
+                {
+                    deferred = true;
+                    continue;
+                }
+                let budget = self
+                    .budgets
+                    .entry(session)
+                    .or_insert_with(|| Bucket::new(VIEWER_KEYFRAMES_PER_SECOND, VIEWER_KEYFRAMES_BURST, now));
+                if !budget.take(1.0, now) {
+                    self.publishers.get_mut(&share).expect("publisher found above").keyframes.budget_denied += 1;
+                    deferred = true;
+                    continue;
+                }
+                w.keyframe_at = Some(now);
+                w.keyframes_started.get_or_insert(now);
+                self.publishers.get_mut(&share).expect("publisher found above").keyframes.pending = true;
+            }
+            let s = &mut w.slots[slot];
+            s.asked = Some(now);
+            s.initial_failed = None;
+            if s.initial_delivered.is_none() {
+                s.initial_in_flight = Some((now, false));
+            }
+            s.keyframe_pending = None;
+            if !already_sent {
+                self.schedule_publisher(&share);
+            }
         }
     }
 
@@ -1030,44 +1286,64 @@ impl Sfu {
     }
 
     fn timeouts(&mut self, now: Instant) {
-        // Transports whose share or lease the core ended close even if their command was lost.
-        let ended: Vec<String> =
+        if now >= self.next_allocation {
+            self.next_allocation = now + ALLOCATION_TICK;
+            self.housekeeping(now);
+        }
+        // Take this wake's due work once. A bounded pacer catch-up may legitimately
+        // return an already-due timeout; it runs again on the next task wake.
+        let mut due = Vec::new();
+        while let Some(key) = self.timers.pop(now) {
+            due.push(key);
+        }
+        for key in due {
+            match key {
+                Timer::Publish(share) => self.flush_publisher_at(&share, now),
+                Timer::Watch(session) => self.flush_watcher_at(session, now),
+            }
+        }
+    }
+
+    fn housekeeping(&mut self, now: Instant) {
+        // Atomic authority is still checked at every forward/drain; this tick also
+        // reclaims transports if an end command was lost.
+        let ended: Vec<_> =
             self.publishers.iter().filter(|(_, p)| !p.origin.alive()).map(|(share, _)| share.clone()).collect();
         for share in ended {
             self.end_publish(&share);
         }
-        let ended: Vec<SessionId> =
+        let ended: Vec<_> =
             self.watchers.iter().filter(|(_, w)| !w.lease.alive()).map(|(session, _)| *session).collect();
         for session in ended {
             self.end_watch(session);
         }
         let watchers = &self.watchers;
         self.budgets.retain(|session, budget| watchers.contains_key(session) || !budget.full(now));
-        let shares: Vec<String> = self.publishers.keys().cloned().collect();
-        for share in shares {
-            let Some(p) = self.publishers.get_mut(&share) else { continue };
-            if !p.connected && now.saturating_duration_since(p.created) > PUBLISH_CONNECT {
-                p.rtc.disconnect();
-            }
-            if p.deadline <= now && p.rtc.is_alive() && p.rtc.handle_input(Input::Timeout(now)).is_err() {
-                p.rtc.disconnect();
-            }
-            self.flush_publisher(&share);
-        }
-        if now >= self.next_allocation {
-            self.next_allocation = now + ALLOCATION_TICK;
-            self.measure(now);
-            self.allocate(now);
-        }
-        let sessions: Vec<SessionId> = self.watchers.keys().copied().collect();
+        self.measure(now);
+        self.allocate(now);
+        // Allocation can change pacing, paused queues and desired bitrate. Drive
+        // those outputs on this independent tick, preserving the TWCC catch-up.
+        let sessions: Vec<_> = self.watchers.keys().copied().collect();
         for session in sessions {
-            let Some(w) = self.watchers.get_mut(&session) else { continue };
-            sweep(w);
-            if w.deadline <= now && w.rtc.is_alive() && w.rtc.handle_input(Input::Timeout(now)).is_err() {
-                w.rtc.disconnect();
-            }
-            self.flush_watcher(session);
+            self.flush_watcher_at(session, now);
+            self.retry_keyframes(session, now);
         }
+    }
+
+    fn retry_keyframes(&mut self, session: SessionId, now: Instant) {
+        if let Some(w) = self.watchers.get_mut(&session) {
+            // Enqueue the whole batch before serving it. A request keeps its
+            // original age across ticks, packet floods and bootstrap deferral.
+            for s in &mut w.slots {
+                if s.segment.waiting()
+                    && s.grant.as_ref().is_some_and(|g| g.alive())
+                    && s.asked.is_none_or(|at| now.saturating_duration_since(at) >= WAITING_RETRY)
+                {
+                    s.keyframe_pending.get_or_insert(now);
+                }
+            }
+        }
+        self.request_keyframes(session, now);
     }
 
     /// Compares the last second's egress with the server-wide budget. Over it for
@@ -1082,6 +1358,31 @@ impl Sfu {
         self.measured.started = now;
         self.measured.bytes = 0;
         let budget = self.shared.budget_bps.load(Ordering::Relaxed) as f64;
+        debug!(
+            rate,
+            budget,
+            drives = self.drives,
+            wakes = self.wakes,
+            datagram_wakes = self.datagram_wakes,
+            timer_wakes = self.timer_wakes,
+            dispatch_dropped = self.dropped.load(Ordering::Relaxed),
+            "screen budget sample"
+        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for (share, p) in &self.publishers {
+                debug!(share, counters = ?p.ingress.counters, plis = p.keyframes.sent, keyframes = p.keyframes.received,
+                    pending_pli = p.keyframes.pending, budget_denied = p.keyframes.budget_denied, "screen ingress sample");
+            }
+            for w in self.watchers.values() {
+                let waiting = w
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |bits, (i, s)| bits | (u32::from(s.grant.is_some() && s.segment.waiting()) << i));
+                debug!(session = w.session, run = w.run, estimate = w.egress.estimate(),
+                    counters = ?w.egress.counters, waiting, "screen egress sample");
+            }
+        }
         if rate > budget {
             self.measured.over += 1;
             self.measured.under_since = None;
@@ -1127,6 +1428,7 @@ impl Sfu {
                 self.tell(session, slot, change, now);
             }
         }
+        self.rates = rates;
     }
 
     /// A slot was paused or resumed (`apply`): the core tells the viewer, and a resumed slot
@@ -1153,8 +1455,18 @@ impl Sfu {
     /// Drives a publisher until it sleeps, forwards what it received and sends due keyframe
     /// requests. Closes it, and tells the core, once it is dead.
     fn flush_publisher(&mut self, share: &str) {
+        self.flush_publisher_at(share, Instant::now());
+    }
+
+    fn flush_publisher_at(&mut self, share: &str, now: Instant) {
         let Some(mut p) = self.publishers.remove(share) else { return };
-        let now = Instant::now();
+        self.drives += 1;
+        if !p.connected && now >= p.created + PUBLISH_CONNECT {
+            p.rtc.disconnect();
+        }
+        if p.deadline <= now && p.rtc.is_alive() && p.rtc.handle_input(Input::Timeout(now)).is_err() {
+            p.rtc.disconnect();
+        }
         if p.keyframes.due(now)
             && p.connected
             && let Some(stream) = p.rtc.direct_api().stream_rx(&p.ssrc)
@@ -1163,6 +1475,7 @@ impl Sfu {
             p.keyframes.pending = false;
             p.keyframes.last = Some(now);
             p.keyframes.sent += 1;
+            debug!(share, sent = p.keyframes.sent, received = p.keyframes.received, "screen keyframe requested");
         }
         let mut forwards = Vec::new();
         let waiting = self.slots_of(share).iter().any(|(session, index)| {
@@ -1225,6 +1538,9 @@ impl Sfu {
                         }
                         let Some(describe) = describe(codec, &packet.payload) else { continue };
                         let source = *packet.seq_no;
+                        if describe.keyframe {
+                            p.keyframes.received += 1;
+                        }
                         match p.ingress.admit(source, packet.header.timestamp, packet.payload.len(), describe, now) {
                             Verdict::Forward { keyframe } => forwards.push((
                                 {
@@ -1255,6 +1571,7 @@ impl Sfu {
             }
         }
         if !p.rtc.is_alive() {
+            self.timers.remove(&Timer::Publish(share.to_owned()));
             self.owners.forget(Owner::Publish(p.id));
             if p.origin.alive() {
                 let signal = PublishSignal::Ended(p.ended.unwrap_or(ScreenStopReason::Transport));
@@ -1264,6 +1581,7 @@ impl Sfu {
         }
         let origin = p.origin.clone();
         self.publishers.insert(share.to_owned(), p);
+        self.schedule_publisher(share);
         self.forward_packets(share, &origin, forwards, now);
     }
 
@@ -1351,6 +1669,7 @@ impl Sfu {
     /// Applies an ingress overrun: every slot of the share waits for its next keyframe and the
     /// publisher is asked for one. The third within the window ends the share with `limit`.
     fn overrun(&mut self, p: &mut Publisher, verdict: Verdict) {
+        debug!(share = p.origin.share, ?verdict, counters = ?p.ingress.counters, "screen ingress limit");
         match verdict {
             Verdict::Overrun => {
                 p.prefix.reset();
@@ -1386,8 +1705,16 @@ impl Sfu {
     /// Releases what the viewer's egress allows, drives the transport until it sleeps and
     /// sends the viewer's keyframe requests on.
     fn flush_watcher(&mut self, session: SessionId) {
+        self.flush_watcher_at(session, Instant::now());
+    }
+
+    fn flush_watcher_at(&mut self, session: SessionId, now: Instant) {
         let Some(mut w) = self.watchers.remove(&session) else { return };
-        let now = Instant::now();
+        self.drives += 1;
+        if !w.connected && now >= w.created + WATCH_CONNECT {
+            debug!(session, run = w.run, "screen watch connect deadline expired");
+            w.rtc.disconnect();
+        }
         let mut requests = Vec::new();
         let (socket, measured, shared) = (&self.socket, &mut self.measured, &self.shared);
         let guest = w.size == GUEST_SLOTS;
@@ -1396,16 +1723,21 @@ impl Sfu {
             self.signal(ScreenSignal::Watch { session: w.session, run: w.run, connected: true });
         }
         if !w.rtc.is_alive() {
+            self.timers.remove(&Timer::Watch(session));
             self.owners.forget(Owner::Watch(w.id));
             self.signal(ScreenSignal::Watch { session: w.session, run: w.run, connected: false });
             return;
         }
         self.watchers.insert(session, w);
+        self.schedule_watcher(session);
         requests.sort_unstable();
         requests.dedup();
         for slot in requests {
             self.ask_keyframe(session, slot, now);
         }
+        // An egress release may have drained the previous startup wave. Do not
+        // wait for the 100 ms housekeeping tick to request the next one.
+        self.request_keyframes(session, now);
     }
 
     fn decode_failed(
@@ -1559,6 +1891,8 @@ impl Sfu {
     }
 
     fn end_publish(&mut self, share: &str) {
+        self.rates.remove(share);
+        self.timers.remove(&Timer::Publish(share.to_owned()));
         if let Some(mut p) = self.publishers.remove(share) {
             p.rtc.disconnect();
             self.owners.forget(Owner::Publish(p.id));
@@ -1566,6 +1900,7 @@ impl Sfu {
     }
 
     fn end_watch(&mut self, session: SessionId) {
+        self.timers.remove(&Timer::Watch(session));
         if let Some(mut w) = self.watchers.remove(&session) {
             w.rtc.disconnect();
             self.owners.forget(Owner::Watch(w.id));
@@ -1743,7 +2078,7 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                     }
                     w.egress.reject_original(lane, key_frame, now);
                     let slot = &mut w.slots[lane];
-                    slot.segment.wait();
+                    slot.dropped(now);
                     slot.originals.clear();
                     wipe(&mut w.rtc, slot.mid);
                     requests.push(lane);
@@ -1886,6 +2221,7 @@ fn apply(w: &mut Watcher, slot: usize, change: Change) {
             }
             let s = &mut w.slots[slot];
             s.segment.wait();
+            s.initial_in_flight = None;
             s.asked = None;
             s.originals.clear();
             wipe(&mut w.rtc, s.mid);
@@ -1934,6 +2270,10 @@ fn empty(w: &mut Watcher, index: usize) {
     slot.grant = None;
     slot.segment.wait();
     slot.asked = None;
+    slot.initial_in_flight = None;
+    slot.initial_delivered = None;
+    slot.initial_failed = None;
+    slot.keyframe_pending = None;
     slot.keyframe_at = None;
     slot.last_h264 = None;
     slot.decode_cap = None;
@@ -2059,6 +2399,7 @@ fn h264_admitted(p: &mut Publisher, packet: Forward, waiting: bool, now: Instant
         p.ingress.counters.dropped += result.discarded as u64;
     }
     if !result.packets.is_empty() {
+        p.keyframes.received += 1;
         p.ingress.confirmed_h264();
         if blocked {
             for packet in &result.packets {
@@ -2098,10 +2439,16 @@ fn enqueue(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forwa
     );
     let dropped = w.egress.admit(index, packet, now);
     for &lane in &dropped {
-        w.slots[lane].segment.wait();
+        w.slots[lane].dropped(now);
     }
     w.dropped_lanes.extend(dropped.iter().copied());
     let admitted = !dropped.contains(&index);
+    if admitted
+        && forward.keyframe
+        && let Some((_, started)) = &mut w.slots[index].initial_in_flight
+    {
+        *started = true;
+    }
     if admitted && let Some(need) = forward.h264 {
         w.slots[index].last_h264 = Some((now, need));
     }
@@ -2113,11 +2460,16 @@ fn enqueue(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forwa
 fn release(w: &mut Watcher, now: Instant) {
     let (released, dropped) = w.egress.due(now);
     for &lane in &dropped {
-        w.slots[lane].segment.wait();
+        w.slots[lane].dropped(now);
     }
     w.dropped_lanes.extend(dropped);
     for (lane, packet) in released {
         let slot = &mut w.slots[lane];
+        if packet.marker && packet.key_frame().is_some() {
+            slot.initial_in_flight = None;
+            slot.initial_delivered = Some(slot.asked.unwrap_or(now));
+            slot.initial_failed = None;
+        }
         let mut direct = w.rtc.direct_api();
         let Some(stream) = direct.stream_tx_by_mid(slot.mid, None) else { continue };
         if !slot.configured {
@@ -2270,6 +2622,9 @@ fn watcher(
         decode_watchdog: browser,
         pending: Vec::new(),
         connected: false,
+        created: now,
+        keyframe_at: None,
+        keyframes_started: None,
         focus: None,
         egress: Egress::new(now),
         dropped_lanes: Vec::new(),
@@ -2621,6 +2976,7 @@ pub(crate) mod tests {
             outbox: VecDeque::new(),
             budgets: HashMap::new(),
             decode_reports: HashMap::new(),
+            rates: HashMap::new(),
             publishers: HashMap::new(),
             watchers: HashMap::new(),
             next_id: 1,
@@ -2628,6 +2984,11 @@ pub(crate) mod tests {
             measured: Measured::new(now),
             watches: 4,
             next_allocation: now,
+            timers: Timers::default(),
+            drives: 0,
+            wakes: 0,
+            datagram_wakes: 0,
+            timer_wakes: 0,
         };
         // Every member is newer than every guest. Priority is by active assignment,
         // not transport age, and an already paused guest must not be selected again.
@@ -2693,6 +3054,7 @@ pub(crate) mod tests {
             outbox: VecDeque::new(),
             budgets: HashMap::new(),
             decode_reports: HashMap::new(),
+            rates: HashMap::new(),
             publishers: HashMap::new(),
             watchers: HashMap::from([(pair.w.session, pair.w)]),
             next_id: 1,
@@ -2700,6 +3062,11 @@ pub(crate) mod tests {
             measured: Measured::new(now),
             watches: 1,
             next_allocation: now,
+            timers: Timers::default(),
+            drives: 0,
+            wakes: 0,
+            datagram_wakes: 0,
+            timer_wakes: 0,
         };
         sfu.publishers.insert(
             "share".into(),
@@ -2753,7 +3120,8 @@ pub(crate) mod tests {
         assert!(enqueue(w, 0, &origin, &higher, now));
         assert!(w.dropped_lanes.contains(&1));
         sfu.flush_watcher(7);
-        assert!(sfu.watchers[&7].slots[1].asked.is_some());
+        assert!(sfu.watchers[&7].slots[1].segment.waiting());
+        assert!(sfu.watchers[&7].slots[1].asked.is_none(), "another slot's request defers this recovery");
 
         // An estimate can still fall after originals have entered str0m. The socket rejection
         // must fail their keyframe, wipe the stream and use the same budgeted recovery path.
@@ -2804,7 +3172,12 @@ pub(crate) mod tests {
         assert_eq!(w.egress.counters.failed_keyframes, failures + 1);
         assert!(w.slots[0].segment.waiting());
         assert!(w.slots[0].originals.is_empty());
-        assert!(w.slots[0].asked.is_some());
+        assert!(w.slots[0].asked.is_none(), "socket recovery is deferred while the viewer's request spacing holds");
+        // Recovery deferred by the per-viewer spacing must still be requested
+        // by the tick, without another publisher packet or viewer datagram.
+        tokio::time::sleep_until((now + WAITING_RETRY + KEYFRAME_INTERVAL).into()).await;
+        sfu.housekeeping(Instant::now());
+        assert!(sfu.watchers[&7].slots[0].asked.is_some());
         assert!(sfu.publishers["share"].keyframes.pending);
         assert!(sfu.budgets.contains_key(&7));
     }
@@ -3047,6 +3420,7 @@ pub(crate) mod tests {
             outbox: VecDeque::new(),
             budgets: HashMap::new(),
             decode_reports: HashMap::new(),
+            rates: HashMap::new(),
             publishers: HashMap::from([("h264".into(), publisher)]),
             watchers,
             next_id: 1,
@@ -3054,8 +3428,516 @@ pub(crate) mod tests {
             measured: Measured::new(now),
             watches: viewers.len() as u64,
             next_allocation: now,
+            timers: Timers::default(),
+            drives: 0,
+            wakes: 0,
+            datagram_wakes: 0,
+            timer_wakes: 0,
         };
         (sfu, origin, now, need)
+    }
+
+    #[tokio::test]
+    async fn coalesced_keyframe_requests_spend_one_credit_and_new_requests_stay_bounded() {
+        let (mut sfu, _, _, _) = recovery_fixture(&[1, 2]).await;
+        let now = Instant::now();
+        for _ in 0..100 {
+            sfu.ask_keyframe(1, 0, now);
+        }
+        assert_eq!(sfu.budgets.get_mut(&1).unwrap().available(now), VIEWER_KEYFRAMES_BURST - 1.0);
+        assert!(sfu.publishers["h264"].keyframes.pending);
+        assert_eq!(sfu.publishers["h264"].keyframes.sent, 0);
+        sfu.ask_keyframe(2, 0, now);
+        assert!(!sfu.budgets.contains_key(&2), "another viewer joins the same pending PLI without being charged");
+        // Nine further distinct publisher requests use the remaining credit.
+        let mut at = now;
+        for _ in 1..10 {
+            at += KEYFRAME_INTERVAL;
+            sfu.publishers.get_mut("h264").unwrap().keyframes.pending = false;
+            sfu.ask_keyframe(1, 0, at);
+            assert!(sfu.publishers["h264"].keyframes.pending);
+        }
+        at += KEYFRAME_INTERVAL;
+        sfu.publishers.get_mut("h264").unwrap().keyframes.pending = false;
+        sfu.ask_keyframe(1, 0, at);
+        assert!(!sfu.publishers["h264"].keyframes.pending);
+        assert_eq!(sfu.publishers["h264"].keyframes.budget_denied, 1);
+    }
+
+    #[tokio::test]
+    async fn a_pli_sent_during_deferral_satisfies_active_recovery_without_another_credit() {
+        let (mut sfu, _, now, _) = recovery_fixture(&[1]).await;
+        let w = sfu.watchers.get_mut(&1).unwrap();
+        w.slots[0].segment.map(1, 9000, true, now).unwrap();
+        w.keyframe_at = Some(now);
+        let requested = now + Duration::from_millis(100);
+        sfu.ask_keyframe(1, 0, requested);
+        assert_eq!(sfu.watchers[&1].slots[0].keyframe_pending, Some(requested));
+        // A different viewer funds a PLI before this viewer's spacing expires.
+        sfu.publishers.get_mut("h264").unwrap().keyframes.last = Some(requested + ALLOCATION_TICK);
+        sfu.retry_keyframes(1, now + KEYFRAME_INTERVAL);
+        assert!(sfu.watchers[&1].slots[0].keyframe_pending.is_none());
+        assert!(!sfu.publishers["h264"].keyframes.pending);
+        assert!(!sfu.budgets.contains_key(&1), "a later PLI satisfies recovery without another viewer credit");
+        // An older PLI cannot satisfy a subsequent request.
+        sfu.ask_keyframe(1, 0, now + WAITING_RETRY);
+        assert!(sfu.publishers["h264"].keyframes.pending);
+        assert!(sfu.budgets.contains_key(&1));
+    }
+
+    #[tokio::test]
+    async fn recovery_requests_for_a_viewers_slots_are_spaced_and_deferred_without_spending_credit() {
+        let (mut sfu, _, _, _) = recovery_fixture(&[1]).await;
+        let now = Instant::now();
+        let mut other = h264_ingress_fixture(now);
+        other.origin = ScreenOrigin::new(99, "other".into(), 1, false, false, 8_000_000);
+        let origin = other.origin.clone();
+        sfu.publishers.insert("other".into(), other);
+        assign(sfu.watchers.get_mut(&1).unwrap(), 1, WatchGrant::new(origin), 2, now);
+        sfu.ask_keyframe(1, 0, now);
+        sfu.ask_keyframe(1, 1, now);
+        assert!(sfu.publishers["h264"].keyframes.pending);
+        assert!(!sfu.publishers["other"].keyframes.pending);
+        assert!(sfu.watchers[&1].slots[1].asked.is_none(), "deferred work remains eligible for the tick");
+        assert_eq!(sfu.budgets.get_mut(&1).unwrap().available(now), 9.0);
+        sfu.housekeeping(now + KEYFRAME_INTERVAL);
+        assert!(sfu.publishers["other"].keyframes.pending, "the tick requests a deferred idle source");
+    }
+
+    #[tokio::test]
+    async fn initial_requests_keep_spacing_when_admission_or_credits_are_tight_and_retries_cannot_be_overtaken() {
+        for mode in ["admission", "credits", "retry", "older", "active"] {
+            let (mut sfu, _, now, _) = recovery_fixture(&[1]).await;
+            let mut other = h264_ingress_fixture(now);
+            other.origin = ScreenOrigin::new(99, "other".into(), 1, false, false, 8_000_000);
+            assign(sfu.watchers.get_mut(&1).unwrap(), 1, WatchGrant::new(other.origin.clone()), 2, now);
+            sfu.publishers.insert("other".into(), other);
+            for name in ["h264", "other"] {
+                let size = if mode == "admission" { 60_000 } else { 1000 };
+                sfu.rates.insert(name.into(), ShareRate { largest_keyframe: size, ..Default::default() });
+            }
+            if mode == "credits" {
+                let mut budget = Bucket::new(VIEWER_KEYFRAMES_PER_SECOND, VIEWER_KEYFRAMES_BURST, now);
+                assert!(budget.take(VIEWER_KEYFRAMES_BURST - 1.0, now));
+                sfu.budgets.insert(1, budget);
+            }
+            if mode == "retry" {
+                sfu.watchers.get_mut(&1).unwrap().slots[1].asked = Some(now - WAITING_RETRY);
+            }
+            if mode == "active" {
+                let slot = &mut sfu.watchers.get_mut(&1).unwrap().slots[0];
+                slot.initial_delivered = Some(now - WAITING_RETRY);
+                slot.segment.map(1, 9000, true, now).unwrap();
+            }
+            sfu.ask_keyframe(1, 0, now);
+            let at = now + Duration::from_millis(2);
+            if mode == "older" {
+                sfu.publishers.get_mut("h264").unwrap().keyframes.pending = false;
+                sfu.ask_keyframe(1, 0, now + Duration::from_millis(1));
+                assert!(sfu.watchers[&1].slots[0].keyframe_pending.is_some());
+            }
+            let credit = sfu.budgets.get_mut(&1).unwrap().available(at);
+            sfu.ask_keyframe(1, 1, at);
+            assert!(!sfu.publishers["other"].keyframes.pending, "mode={mode}");
+            assert!(sfu.watchers[&1].slots[1].keyframe_pending.is_some(), "mode={mode}");
+            assert_eq!(sfu.budgets.get_mut(&1).unwrap().available(at), credit, "mode={mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn cold_keyframe_retries_preserve_credit_until_the_frame_fits_and_the_deferral_is_bounded() {
+        let (mut sfu, _, _, _) = recovery_fixture(&[1]).await;
+        let now = Instant::now();
+        sfu.rates.insert("h264".into(), ShareRate { largest_keyframe: 200 * 1024, ..Default::default() });
+        sfu.ask_keyframe(1, 0, now); // One seed is always allowed, even before probes have media.
+        sfu.publishers.get_mut("h264").unwrap().keyframes.pending = false;
+        // Receiving the start of a keyframe makes the segment active before
+        // the whole frame fits. Active decoder recovery must preserve credit too.
+        sfu.watchers.get_mut(&1).unwrap().slots[0].segment.map(1, 9000, true, now).unwrap();
+        let at = now + KEYFRAME_INTERVAL;
+        sfu.ask_keyframe(1, 0, at);
+        assert!(!sfu.publishers["h264"].keyframes.pending);
+        assert!(sfu.budgets.get_mut(&1).unwrap().available(at) >= 9.0);
+        // The one-second initial escape cannot turn a known unserviceable
+        // retry into another credit spend while capacity is still ramping.
+        let at = now + Duration::from_secs(2);
+        sfu.retry_keyframes(1, at);
+        assert!(!sfu.publishers["h264"].keyframes.pending);
+        assert!(sfu.budgets.get_mut(&1).unwrap().available(at) >= 9.0);
+        sfu.watchers.get_mut(&1).unwrap().egress.set_estimate(10_000_000, at);
+        sfu.ask_keyframe(1, 0, at);
+        assert!(sfu.publishers["h264"].keyframes.pending, "headroom permits the next retry");
+        sfu.publishers.get_mut("h264").unwrap().keyframes.pending = false;
+        let at = now + KEYFRAME_BOOTSTRAP;
+        sfu.watchers.get_mut(&1).unwrap().egress.set_estimate(100_000, at);
+        sfu.ask_keyframe(1, 0, at);
+        assert!(sfu.publishers["h264"].keyframes.pending, "an under-estimate cannot defer recovery forever");
+    }
+
+    /// Exercise the production scheduler with generated slot counts, request order,
+    /// active/static slots, an empty budget, oversized bootstrap frames, floods and
+    /// a late viewer. The transport throttle is advanced explicitly; the SRTP tests
+    /// in tests/screen.rs cover delivery through real publisher peers.
+    #[tokio::test]
+    async fn generated_multi_publisher_requests_are_fair_bounded_and_budgeted() {
+        // Typical startup: 1-4 publishers, rotated request order, known small
+        // keyframes and fresh credits. Advance the same production throttle as
+        // the stress cases below; every initial PLI must start before 200 ms.
+        for slots in 1..=SCREEN_SLOTS {
+            for seed in 0..8usize {
+                let (mut sfu, _, now, _) = recovery_fixture(&[1]).await;
+                sfu.publishers.clear();
+                let names: Vec<_> = (0..slots).map(|i| format!("startup-{i}")).collect();
+                for (slot, name) in names.iter().enumerate() {
+                    let mut p = h264_ingress_fixture(now);
+                    p.origin = ScreenOrigin::new(100 + slot as u32, name.clone(), 1, false, false, 8_000_000);
+                    assign(
+                        sfu.watchers.get_mut(&1).unwrap(),
+                        slot,
+                        WatchGrant::new(p.origin.clone()),
+                        slot as u64,
+                        now,
+                    );
+                    sfu.rates
+                        .insert(name.clone(), ShareRate { largest_keyframe: (seed + 1) * 1024, ..Default::default() });
+                    sfu.publishers.insert(name.clone(), p);
+                }
+                for offset in 0..slots {
+                    sfu.ask_keyframe(1, (offset + seed) % slots, now);
+                }
+                // Small established sources answer after 10 ms. Their actual
+                // 1-8 KiB frames drain through production admission/release;
+                // conservative reservations may require several prompt waves.
+                let mut first_pli = vec![None; slots];
+                for tick in 0..200u32 {
+                    let at = now + Duration::from_millis(tick as u64);
+                    sfu.retry_keyframes(1, at);
+                    for (slot, name) in names.iter().enumerate() {
+                        let p = sfu.publishers.get_mut(name).unwrap();
+                        if p.keyframes.due(at) {
+                            p.keyframes.pending = false;
+                            p.keyframes.last = Some(at);
+                            p.keyframes.sent += 1;
+                            first_pli[slot].get_or_insert(at);
+                        }
+                        if first_pli[slot].is_some_and(|sent| at - sent == Duration::from_millis(10)) {
+                            let origin = p.origin.clone();
+                            for packet in 0..=seed {
+                                let forward = Forward {
+                                    h264: None,
+                                    source: packet as u64,
+                                    timestamp: 9000,
+                                    marker: packet == seed,
+                                    keyframe: packet == 0,
+                                    codec: VideoCodec::Vp9,
+                                    arrival: at,
+                                    payload: Arc::from(vec![0; 1024]),
+                                };
+                                assert!(enqueue(sfu.watchers.get_mut(&1).unwrap(), slot, &origin, &forward, at));
+                            }
+                        }
+                    }
+                    release(sfu.watchers.get_mut(&1).unwrap(), at);
+                    sfu.request_keyframes(1, at);
+                }
+                assert!(first_pli.iter().all(|at| at.is_some_and(|at| at - now < Duration::from_millis(200))));
+                let w = &sfu.watchers[&1];
+                assert!(
+                    w.slots[..slots].iter().all(|s| s.initial_delivered.is_some()),
+                    "startup: {slots} publishers, seed {seed}"
+                );
+                assert_eq!(w.egress.counters.evicted + w.egress.counters.rejected, 0);
+                let at = now + Duration::from_millis(199);
+                let expected = VIEWER_KEYFRAMES_BURST - slots as f64 + 0.199 * VIEWER_KEYFRAMES_PER_SECOND;
+                assert!((sfu.budgets.get_mut(&1).unwrap().available(at) - expected).abs() < 1e-9);
+            }
+        }
+        for seed in 0..32u64 {
+            let (mut sfu, _, now, _) = recovery_fixture(&[1, 2]).await;
+            let slots = 3 + ((seed >> 4) as usize % 2);
+            let names: Vec<_> = (0..slots).map(|i| format!("publisher-{i}")).collect();
+            sfu.publishers.clear();
+            sfu.rates.clear();
+            for (i, name) in names.iter().enumerate() {
+                let mut p = h264_ingress_fixture(now);
+                p.origin = ScreenOrigin::new(100 + i as u32, name.clone(), 1, false, false, 8_000_000);
+                for w in sfu.watchers.values_mut() {
+                    assign(w, i, WatchGrant::new(p.origin.clone()), i as u64, now);
+                    // Half the generated cases mix active recovery with waiting
+                    // static/PLI-ignoring publishers. No source sends deltas.
+                    if seed & (1 << (i + 1)) != 0 {
+                        w.slots[i].segment.map(1, 9000, true, now).unwrap();
+                        w.slots[i].asked = Some(now - WAITING_RETRY);
+                    }
+                }
+                if seed & 4 != 0 {
+                    sfu.rates.insert(name.clone(), ShareRate { largest_keyframe: 200 * 1024, ..Default::default() });
+                }
+                sfu.publishers.insert(name.clone(), p);
+            }
+            for w in sfu.watchers.values_mut() {
+                w.egress.set_estimate(100_000, now);
+                w.keyframes_started = Some(now);
+            }
+            if seed & 1 != 0 {
+                for session in [1, 2] {
+                    let mut budget = Bucket::new(VIEWER_KEYFRAMES_PER_SECOND, VIEWER_KEYFRAMES_BURST, now);
+                    assert!(budget.take(VIEWER_KEYFRAMES_BURST, now));
+                    sfu.budgets.insert(session, budget);
+                }
+            }
+            let mut random = seed + 1;
+            let mut outstanding = HashMap::<(SessionId, usize), Instant>::new();
+            let mut sent = vec![Vec::new(); slots];
+            for tick in 0..=900 {
+                let at = now + ALLOCATION_TICK * tick;
+                // Initial requests in rotated order; viewer 2 arrives after 2 s.
+                for session in [1, 2] {
+                    if tick == if session == 1 { 0 } else { 20 } {
+                        for offset in 0..slots {
+                            let slot = (offset + seed as usize) % slots;
+                            outstanding.entry((session, slot)).or_insert(at);
+                            sfu.ask_keyframe(session, slot, at);
+                        }
+                    }
+                }
+                random = random.wrapping_mul(6364136223846793005).wrapping_add(1);
+                let slot = (random >> 32) as usize % slots;
+                // A noisy high-priority publisher and active-slot recovery must
+                // retain the oldest request rather than refresh its queue age.
+                for slot in [0, slot] {
+                    outstanding.entry((1, slot)).or_insert(at);
+                    sfu.ask_keyframe(1, slot, at);
+                }
+                sfu.retry_keyframes(1, at);
+                if tick >= 20 {
+                    sfu.retry_keyframes(2, at);
+                }
+                for (slot, name) in names.iter().enumerate() {
+                    let p = sfu.publishers.get_mut(name).unwrap();
+                    if p.keyframes.due(at) {
+                        if let Some(last) = sent[slot].last() {
+                            assert!(at - *last >= KEYFRAME_INTERVAL, "seed {seed}, publisher {slot}");
+                        }
+                        p.keyframes.pending = false;
+                        p.keyframes.last = Some(at);
+                        p.keyframes.sent += 1;
+                        sent[slot].push(at);
+                        outstanding.retain(|&(_, requested), _| requested != slot);
+                    }
+                }
+                if tick == 29 && seed & 5 == 0 {
+                    assert!(sent.iter().all(|requests| !requests.is_empty()), "available-credit bound: seed {seed}");
+                }
+                assert!(
+                    outstanding.values().all(|requested| at - *requested < Duration::from_secs(30)),
+                    "request exceeded the 30 s bound: seed {seed}, tick {tick}, outstanding {outstanding:?}"
+                );
+                let total: usize = sent.iter().map(Vec::len).sum();
+                let initial = if seed & 1 == 0 { 2.0 * VIEWER_KEYFRAMES_BURST } else { 0.0 };
+                let limit = initial + 2.0 * (at - now).as_secs_f64() * VIEWER_KEYFRAMES_PER_SECOND;
+                assert!(total as f64 <= limit + 1e-9, "viewer credit limit: seed {seed}, sent {total}, limit {limit}");
+            }
+            assert!(sent.iter().all(|requests| !requests.is_empty()), "seed {seed}: every static source is requested");
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_active_recovery_survives_pause_but_not_assignment_replacement() {
+        let (mut sfu, origin, now, _) = recovery_fixture(&[1]).await;
+        let w = sfu.watchers.get_mut(&1).unwrap();
+        w.slots[0].segment.map(1, 9000, true, now).unwrap();
+        w.keyframe_at = Some(now);
+        sfu.ask_keyframe(1, 0, now);
+        assert_eq!(sfu.watchers[&1].slots[0].keyframe_pending, Some(now));
+        apply(sfu.watchers.get_mut(&1).unwrap(), 0, Change::Pause(ScreenPauseReason::Bandwidth));
+        sfu.retry_keyframes(1, now + WAITING_RETRY);
+        assert!(!sfu.publishers["h264"].keyframes.pending);
+        apply(sfu.watchers.get_mut(&1).unwrap(), 0, Change::Resume);
+        sfu.retry_keyframes(1, now + WAITING_RETRY);
+        assert!(sfu.publishers["h264"].keyframes.pending);
+        assert!(sfu.watchers[&1].slots[0].keyframe_pending.is_none());
+        sfu.publishers.get_mut("h264").unwrap().keyframes.pending = false;
+        sfu.ask_keyframe(1, 0, now + WAITING_RETRY);
+        assert!(sfu.watchers[&1].slots[0].keyframe_pending.is_some());
+        assign(sfu.watchers.get_mut(&1).unwrap(), 0, WatchGrant::new(origin), 2, now + WAITING_RETRY);
+        assert!(sfu.watchers[&1].slots[0].keyframe_pending.is_none(), "replacement cannot inherit old recovery");
+    }
+
+    #[tokio::test]
+    async fn empty_budget_four_slots_and_churn_obey_30s_and_15_pli_budget() {
+        // One viewer has no refill credit at t=0; all four publishers ignore PLIs.
+        // Older requests must survive fit deferral and floods on the first slot.
+        let (mut sfu, _, now, _) = recovery_fixture(&[1]).await;
+        sfu.publishers.clear();
+        let names: Vec<_> = (0..4).map(|i| format!("bound-{i}")).collect();
+        for (slot, name) in names.iter().enumerate() {
+            let mut p = h264_ingress_fixture(now);
+            p.origin = ScreenOrigin::new(100 + slot as u32, name.clone(), 1, false, false, 8_000_000);
+            assign(sfu.watchers.get_mut(&1).unwrap(), slot, WatchGrant::new(p.origin.clone()), slot as u64, now);
+            sfu.rates.insert(name.clone(), ShareRate { largest_keyframe: 200 * 1024, ..Default::default() });
+            sfu.publishers.insert(name.clone(), p);
+        }
+        let w = sfu.watchers.get_mut(&1).unwrap();
+        w.egress.set_estimate(100_000, now);
+        w.keyframes_started = Some(now);
+        let mut bucket = Bucket::new(VIEWER_KEYFRAMES_PER_SECOND, VIEWER_KEYFRAMES_BURST, now);
+        assert!(bucket.take(VIEWER_KEYFRAMES_BURST, now));
+        sfu.budgets.insert(1, bucket);
+        let mut first = [None; 4];
+        let mut total = 0;
+        for slot in 0..4 {
+            sfu.ask_keyframe(1, slot, now);
+        }
+        for tick in 0..=900 {
+            let at = now + ALLOCATION_TICK * tick;
+            // The noisy first slot cannot move ahead of any older request.
+            for _ in 0..10 {
+                sfu.ask_keyframe(1, 0, at);
+            }
+            sfu.retry_keyframes(1, at);
+            for (slot, name) in names.iter().enumerate() {
+                let p = sfu.publishers.get_mut(name).unwrap();
+                if p.keyframes.due(at) {
+                    assert!(p.keyframes.last.is_none_or(|last| at - last >= KEYFRAME_INTERVAL));
+                    p.keyframes.pending = false;
+                    p.keyframes.last = Some(at);
+                    p.keyframes.sent += 1;
+                    total += 1;
+                    first[slot].get_or_insert(at - now);
+                }
+            }
+            assert!(total as f64 <= (at - now).as_secs_f64() * VIEWER_KEYFRAMES_PER_SECOND + 1e-9);
+            if tick == 299 {
+                assert!(first.iter().all(Option::is_some), "30s bound: {first:?}");
+            }
+        }
+        eprintln!("BOUND empty credits, 4 slots, first PLIs: {first:?}; sent over 90s={total}");
+        assert!(first.iter().all(|delay| delay.unwrap() < Duration::from_secs(30)));
+        assert!(total <= 15, "waiting-slot retries must use the same viewer bucket");
+    }
+
+    #[tokio::test]
+    async fn deferred_keyframe_state_is_reclaimed_by_all_teardown_paths() {
+        for mode in ["release", "grant", "publisher", "viewer", "replacement"] {
+            let (mut sfu, origin, now, _) = recovery_fixture(&[1]).await;
+            sfu.watchers.get_mut(&1).unwrap().keyframe_at = Some(now);
+            sfu.ask_keyframe(1, 0, now);
+            assert!(sfu.watchers[&1].slots[0].keyframe_pending.is_some());
+            sfu.watchers.get_mut(&1).unwrap().slots[0].initial_in_flight = Some((now, false));
+            sfu.watchers.get_mut(&1).unwrap().slots[0].initial_failed = Some(now);
+            match mode {
+                "release" => {
+                    let run = sfu.watchers[&1].run;
+                    sfu.command(ScreenCmd::Release { session: 1, run, slot: 0 });
+                }
+                "grant" => {
+                    sfu.watchers[&1].slots[0].grant.as_ref().unwrap().end();
+                    sfu.housekeeping(now + ALLOCATION_TICK);
+                }
+                "publisher" => {
+                    origin.end();
+                    sfu.housekeeping(now + ALLOCATION_TICK);
+                    assert!(sfu.publishers.is_empty());
+                }
+                "viewer" => {
+                    sfu.watchers[&1].lease.end();
+                    sfu.housekeeping(now + ALLOCATION_TICK);
+                    assert!(sfu.watchers.is_empty());
+                }
+                "replacement" => assign(sfu.watchers.get_mut(&1).unwrap(), 0, WatchGrant::new(origin), 2, now),
+                _ => unreachable!(),
+            }
+            assert!(
+                sfu.watchers.values().flat_map(|w| &w.slots).all(|s| s.keyframe_pending.is_none()
+                    && s.initial_in_flight.is_none()
+                    && s.initial_failed.is_none()),
+                "mode={mode}"
+            );
+            eprintln!("CLEANUP {mode}: pending state removed");
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_keyframe_on_unconnected_publisher_never_arms_a_past_deadline() {
+        let (mut sfu, _, _, _) = recovery_fixture(&[]).await;
+        let now = Instant::now();
+        sfu.next_allocation = now + ALLOCATION_TICK;
+        let p = sfu.publishers.get_mut("h264").unwrap();
+        p.connected = false;
+        p.deadline = now + Duration::from_secs(1);
+        p.keyframes.pending = true;
+        p.keyframes.last = Some(now - Duration::from_secs(2));
+        sfu.schedule_publisher("h264");
+        assert!(sfu.deadline() > now);
+        assert!(sfu.publishers["h264"].keyframes.pending);
+        // Connected without a receive stream is also undeliverable.
+        let p = sfu.publishers.get_mut("h264").unwrap();
+        p.connected = true;
+        p.ssrc = 999_999.into();
+        sfu.schedule_publisher("h264");
+        assert!(sfu.deadline() > now);
+    }
+
+    #[tokio::test]
+    async fn datagram_drains_do_not_scale_with_unrelated_watchers() {
+        for viewers in [1u32, 26] {
+            let sessions: Vec<_> = (1..=viewers).collect();
+            let (mut sfu, _, _, _) = recovery_fixture(&sessions).await;
+            let mut pair = Pair::new();
+            pair.w.id = 1000;
+            pair.w.session = 1;
+            let check = pair.checks.last().expect("STUN check").clone();
+            sfu.watchers.insert(1, pair.w);
+            let now = Instant::now();
+            sfu.next_allocation = now + Duration::from_secs(60);
+            for w in sfu.watchers.values_mut() {
+                w.deadline = now + Duration::from_secs(60);
+            }
+            sfu.publishers.clear();
+            for session in &sessions {
+                sfu.schedule_watcher(*session);
+            }
+            for _ in 0..100 {
+                sfu.datagram(Datagram { at: now, source: addr(5000), contents: check.clone() });
+                sfu.timeouts(now);
+            }
+            assert_eq!(sfu.drives, 100, "one touched transport per datagram with {viewers} watchers");
+            // Reproduce the old unconditional timeout sweep on the same workload.
+            let before = sfu.drives;
+            for _ in 0..100 {
+                sfu.datagram(Datagram { at: now, source: addr(5000), contents: check.clone() });
+                for session in &sessions {
+                    sfu.flush_watcher(*session);
+                }
+            }
+            let old = sfu.drives - before;
+            assert_eq!(old, 100 * u64::from(viewers + 1));
+            eprintln!("datagram drive cost: watchers={viewers}, before={old}/100, after=100/100");
+            assert_eq!(sfu.timers.due.len(), viewers as usize, "indexed wakes stay bounded");
+        }
+    }
+
+    #[tokio::test]
+    async fn never_connected_member_and_guest_watches_expire_but_connected_ones_survive() {
+        let (mut sfu, _, _, _) = recovery_fixture(&[1, 2, 3]).await;
+        let now = Instant::now();
+        sfu.next_allocation = now + Duration::from_secs(60);
+        sfu.publishers.clear();
+        for (session, w) in &mut sfu.watchers {
+            w.created = now - WATCH_CONNECT;
+            w.connected = *session == 3;
+            w.size = if *session == 2 { GUEST_SLOTS } else { SCREEN_SLOTS };
+            w.deadline = now + Duration::from_secs(60);
+        }
+        for session in [1, 2, 3] {
+            sfu.schedule_watcher(session);
+        }
+        sfu.timeouts(now);
+        assert!(!sfu.watchers.contains_key(&1));
+        assert!(!sfu.watchers.contains_key(&2));
+        assert!(sfu.watchers.contains_key(&3));
+        assert_eq!(sfu.timers.due.len(), 1);
     }
 
     fn report(sfu: &mut Sfu, session: SessionId, now: Instant) {
@@ -3278,8 +4160,12 @@ pub(crate) mod tests {
         assert_eq!(live.len(), 1);
         assert!(held.is_empty());
         // Span includes time spent holding parameter sets.
-        let (_, _, verdict) =
-            h264_packet(&mut p, h264_forward(14, 12000, &[0x68, 1], now), true, now + Duration::from_millis(501));
+        let (_, _, verdict) = h264_packet(
+            &mut p,
+            h264_forward(14, 12000, &[0x68, 1], now),
+            true,
+            now + ingress::FRAME_SPAN + Duration::from_millis(1),
+        );
         assert_eq!(verdict, Some(Verdict::Overrun));
     }
 
@@ -3428,5 +4314,412 @@ pub(crate) mod tests {
             assert_eq!(held.len(), 3, "a new valid access unit recovers");
             assert!(verdict.is_none());
         }
+    }
+    #[tokio::test]
+    async fn initial_admission_loss_does_not_coalesce_with_the_failed_pli() {
+        for older_pending in [false, true] {
+            let (mut sfu, origin, now, _) = recovery_fixture(&[1]).await;
+            sfu.ask_keyframe(1, 0, now);
+            let failure = if older_pending { now + Duration::from_millis(100) } else { now };
+            let requested = if older_pending { now + Duration::from_millis(50) } else { now };
+            if older_pending {
+                sfu.watchers.get_mut(&1).unwrap().slots[0].keyframe_pending = Some(requested);
+            }
+            let p = sfu.publishers.get_mut("h264").unwrap();
+            p.keyframes.pending = false;
+            p.keyframes.last = Some(failure);
+            // One SFU flush can send a PLI and process an admission failure at the
+            // same timestamp. That PLI cannot satisfy the resulting recovery,
+            // even if it was sent after an older deferred request.
+            let w = sfu.watchers.get_mut(&1).unwrap();
+            for packet in 0..100 {
+                let forward = Forward {
+                    h264: None,
+                    source: packet,
+                    timestamp: 9000,
+                    marker: packet == 99,
+                    keyframe: packet == 0,
+                    codec: VideoCodec::Vp9,
+                    arrival: failure,
+                    payload: Arc::from(vec![0; 1000]),
+                };
+                enqueue(w, 0, &origin, &forward, failure);
+            }
+            assert_eq!(std::mem::take(&mut w.dropped_lanes), [0]);
+            assert!(w.slots[0].initial_in_flight.is_none());
+            sfu.ask_keyframe(1, 0, failure);
+            assert_eq!(sfu.watchers[&1].slots[0].keyframe_pending, Some(requested));
+            assert!(!sfu.publishers["h264"].keyframes.pending);
+            let expected = 9.0 + (failure - now).as_secs_f64() * VIEWER_KEYFRAMES_PER_SECOND;
+            assert!((sfu.budgets.get_mut(&1).unwrap().available(failure) - expected).abs() < 1e-9);
+            sfu.retry_keyframes(1, now + KEYFRAME_INTERVAL);
+            assert!(sfu.publishers["h264"].keyframes.pending);
+            assert!(sfu.watchers[&1].slots[0].keyframe_pending.is_none());
+        }
+    }
+
+    /// Port of the round-3 review repro: every publisher answers its first PLI
+    /// only. Passing therefore cannot hide simultaneous admission loss by retry.
+    #[tokio::test]
+    async fn growing_keyframes_do_not_recreate_batch_evictions() {
+        initial_keyframe_waves(20, 80, false).await;
+    }
+
+    #[tokio::test]
+    async fn four_unknown_or_large_keyframes_recover_within_30s_without_a_storm() {
+        initial_keyframe_waves(0, 200, true).await;
+        initial_keyframe_waves(200, 200, true).await;
+    }
+
+    async fn initial_keyframe_waves(history: usize, packets: usize, ramp: bool) {
+        let (mut sfu, _, now, _) = recovery_fixture(&[1]).await;
+        sfu.publishers.clear();
+        let names: Vec<_> = (0..4).map(|i| format!("burst-{i}")).collect();
+        for (slot, name) in names.iter().enumerate() {
+            let mut publisher = h264_ingress_fixture(now);
+            publisher.origin = ScreenOrigin::new(100 + slot as u32, name.clone(), 1, false, false, 8_000_000);
+            for packet in 0..history {
+                publisher.rate.record(packet as u64, 9000, 1000, packet == 0, now);
+            }
+            let rate = publisher.rate.rate(now);
+            assert_eq!(rate.largest_keyframe, history * 1064);
+            sfu.rates.insert(name.clone(), rate);
+            assign(
+                sfu.watchers.get_mut(&1).unwrap(),
+                slot,
+                WatchGrant::new(publisher.origin.clone()),
+                slot as u64,
+                now,
+            );
+            sfu.publishers.insert(name.clone(), publisher);
+        }
+        for slot in 0..4 {
+            sfu.ask_keyframe(1, slot, now);
+        }
+        assert_eq!(sfu.publishers.values().filter(|p| p.keyframes.pending).count(), 1);
+        let mut completed = [None; 4];
+        let mut responses = [None; 4];
+        let mut failures = std::collections::BTreeSet::new();
+        for tick in 0..=30_000u32 {
+            let at = now + Duration::from_millis(tick as u64);
+            // A cold viewer discovers capacity through its existing probes.
+            // Before this step even one 212,800-byte frame cannot fit; no
+            // scheduler can promise its delivery at the initial 2.5 Mbps.
+            if ramp && tick == 200 {
+                sfu.watchers.get_mut(&1).unwrap().egress.set_estimate(10_000_000, at);
+            }
+            sfu.retry_keyframes(1, at);
+            for (slot, name) in names.iter().enumerate() {
+                let p = sfu.publishers.get_mut(name).unwrap();
+                if p.keyframes.due(at) {
+                    p.keyframes.pending = false;
+                    p.keyframes.last = Some(at);
+                    p.keyframes.sent += 1;
+                    assert!(p.keyframes.sent <= 2, "retry storm for {name}");
+                    if ramp || p.keyframes.sent == 1 {
+                        responses[slot] = Some((at, p.keyframes.sent));
+                    }
+                }
+            }
+            for (slot, name) in names.iter().enumerate() {
+                let Some((sent, attempt)) = responses[slot] else { continue };
+                let elapsed = at.saturating_duration_since(sent).as_millis();
+                if !(30..30 + packets as u128).contains(&elapsed) {
+                    continue;
+                }
+                let packet = (elapsed - 30) as u64;
+                let forward = Forward {
+                    h264: None,
+                    source: attempt * 1000 + packet,
+                    timestamp: 12000 * attempt as u32,
+                    marker: packet == packets as u64 - 1,
+                    keyframe: packet == 0,
+                    codec: VideoCodec::Vp9,
+                    arrival: at,
+                    payload: Arc::from(vec![0u8; 1000]),
+                };
+                let origin = sfu.publishers[name].origin.clone();
+                sfu.publishers.get_mut(name).unwrap().rate.record(
+                    forward.source,
+                    forward.timestamp,
+                    1000,
+                    forward.keyframe,
+                    at,
+                );
+                enqueue(sfu.watchers.get_mut(&1).unwrap(), slot, &origin, &forward, at);
+            }
+            if tick % 100 == 0 {
+                sfu.rates = sfu.publishers.iter_mut().map(|(name, p)| (name.clone(), p.rate.rate(at))).collect();
+            }
+            let w = sfu.watchers.get_mut(&1).unwrap();
+            release(w, at);
+            let dropped = std::mem::take(&mut w.dropped_lanes);
+            for (slot, complete) in completed.iter_mut().enumerate() {
+                if w.slots[slot].initial_delivered.is_some() {
+                    complete.get_or_insert(at - now);
+                }
+            }
+            for lane in dropped {
+                failures.insert(lane);
+                sfu.ask_keyframe(1, lane, at);
+            }
+            sfu.request_keyframes(1, at);
+            if completed.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        let counts: Vec<_> = names.iter().map(|name| sfu.publishers[name].keyframes.sent).collect();
+        let counters = sfu.watchers[&1].egress.counters;
+        eprintln!(
+            "WAVES history={history} packets={packets} completed={completed:?} PLIs={counts:?} failures={failures:?} counters={counters:?}"
+        );
+        assert!(completed.iter().all(|delay| delay.is_some_and(|delay| delay < Duration::from_secs(30))));
+        if ramp {
+            // The only failure is the exclusive seed before capacity discovery.
+            assert_eq!(failures.len(), 1);
+            assert_eq!(counts.iter().sum::<u64>(), 5);
+        } else {
+            assert!(failures.is_empty());
+            assert_eq!(counters.evicted + counters.rejected + counters.failed_keyframes, 0);
+            assert_eq!(counts, [1, 1, 1, 1]);
+            assert!(completed.iter().all(|delay| delay.unwrap() < Duration::from_secs(2)));
+        }
+    }
+    /// A healthy assigned share has 200 ms of backlog and then sends exactly the
+    /// viewer's 2 Mbps release plan. No overflow, expiry, pause or lost response is
+    /// involved. An idle second source already has a measured 30 KB keyframe.
+    #[tokio::test]
+    async fn busy_flowing_queue_does_not_strand_initial_pli() {
+        let (mut sfu, origin, fixture_now, _) = recovery_fixture(&[1]).await;
+        let now = fixture_now + Duration::from_secs(2);
+        let warm = now - Duration::from_secs(1);
+        let packet = |source, keyframe, at| Forward {
+            h264: None,
+            source,
+            timestamp: source as u32 * 3000,
+            marker: true,
+            keyframe,
+            codec: VideoCodec::Vp9,
+            arrival: at,
+            payload: Arc::from(vec![0; 936]), // exactly 1000 serialized bytes
+        };
+        let w = sfu.watchers.get_mut(&1).unwrap();
+        w.slots[0].asked = Some(warm);
+        assert!(enqueue(w, 0, &origin, &packet(0, true, warm), warm));
+        release(w, warm);
+        assert_eq!(w.egress.queued(), 0);
+        w.keyframe_at = Some(warm);
+        w.keyframes_started = Some(warm - KEYFRAME_BOOTSTRAP);
+        for n in 1..=50 {
+            assert!(enqueue(w, 0, &origin, &packet(n, false, now), now));
+        }
+        let mut other = h264_ingress_fixture(now);
+        other.origin = ScreenOrigin::new(99, "other".into(), 1, false, false, 8_000_000);
+        assign(w, 1, WatchGrant::new(other.origin.clone()), 2, now);
+        w.egress.focus(Some(1)); // the new stage share can preempt the playing share
+        sfu.publishers.insert("other".into(), other);
+        let rates = [
+            ShareRate { average: 2_000_000.0, largest_keyframe: 1000, ..Default::default() },
+            ShareRate { largest_keyframe: 30_000, ..Default::default() },
+            ShareRate::default(),
+            ShareRate::default(),
+        ];
+        sfu.rates.insert("h264".into(), rates[0]);
+        sfu.rates.insert("other".into(), rates[1]);
+        sfu.ask_keyframe(1, 1, now);
+        let mut first = None;
+        let mut min_queue = usize::MAX;
+        let mut max_queue = 0;
+        let mut released_count = 0;
+        for tick in 0..=31_000u64 {
+            let at = now + Duration::from_millis(tick);
+            let w = sfu.watchers.get_mut(&1).unwrap();
+            if tick != 0 && tick % 4 == 0 {
+                assert!(enqueue(w, 0, &origin, &packet(50 + tick / 4, false, at), at));
+            }
+            // Production application-pacer drain; no need to serialize these
+            // already-playing originals through SRTP to inspect PLI scheduling.
+            let (released, dropped) = w.egress.due(at);
+            assert!(dropped.is_empty());
+            released_count += released.len();
+            min_queue = min_queue.min(w.egress.queued());
+            max_queue = max_queue.max(w.egress.queued());
+            if tick % 100 == 0 {
+                assert!(w.egress.allocate(at, &rates, true).is_none());
+            }
+            sfu.retry_keyframes(1, at);
+            let p = sfu.publishers.get_mut("other").unwrap();
+            if p.keyframes.due(at) {
+                first.get_or_insert(at - now);
+                p.keyframes.pending = false;
+                p.keyframes.last = Some(at);
+                p.keyframes.sent += 1;
+            }
+        }
+        // Demonstrate that the actual measured response is serviceable: if an
+        // external request supplies it, priority delivery finishes without a drop.
+        let answer_at = now + Duration::from_secs(31);
+        let other_origin = sfu.publishers["other"].origin.clone();
+        let w = sfu.watchers.get_mut(&1).unwrap();
+        for n in 0..30u64 {
+            let mut f = packet(n, n == 0, answer_at);
+            f.timestamp = 12000;
+            f.marker = n == 29;
+            assert!(enqueue(w, 1, &other_origin, &f, answer_at));
+        }
+        let mut answer_complete = None;
+        let mut answer_packets = 0;
+        for tick in 1..=399u64 {
+            let at = answer_at + Duration::from_millis(tick);
+            if tick % 4 == 0 {
+                assert!(enqueue(w, 0, &origin, &packet(7800 + tick / 4, false, at), at));
+            }
+            let (released, dropped) = w.egress.due(at);
+            assert!(dropped.is_empty());
+            for (lane, p) in released {
+                if lane == 1 {
+                    answer_packets += 1;
+                    if p.marker {
+                        answer_complete = Some(at - answer_at);
+                    }
+                }
+            }
+        }
+        assert_eq!(answer_packets, 30);
+        assert!(answer_complete.is_some());
+        assert_eq!(w.egress.counters.evicted + w.egress.counters.rejected, 0);
+        eprintln!("BUSY_QUEUE actual_frame_packets={answer_packets} actual_frame_completed={answer_complete:?}");
+        let w = &sfu.watchers[&1];
+        eprintln!(
+            "BUSY_QUEUE first_PLI={first:?} min_queue={min_queue} max_queue={max_queue} released={released_count} paused={:?} pending={:?} counters={:?}",
+            w.egress.paused(1),
+            w.slots[1].keyframe_pending.map(|at| at - now),
+            w.egress.counters
+        );
+        assert_eq!(first, Some(Duration::ZERO), "a flowing share must not block the new stage share");
+        assert!(answer_complete.unwrap() < Duration::from_millis(200));
+    }
+
+    /// Real admission/release is deliberately left undrained in the stall case.
+    /// Otherwise a silent publisher or a partial frame holds the reservation.
+    /// Newer high-priority reports must not overtake older initial requests.
+    #[tokio::test]
+    async fn initial_admission_deadline_survives_silent_partial_and_stalled_responses() {
+        for mode in ["silent", "partial", "stalled", "cold"] {
+            let (mut sfu, _, now, _) = recovery_fixture(&[1]).await;
+            sfu.publishers.clear();
+            let names: Vec<_> = (0..4).map(|slot| format!("deadline-{slot}")).collect();
+            for (slot, name) in names.iter().enumerate() {
+                let mut p = h264_ingress_fixture(now);
+                p.origin = ScreenOrigin::new(100 + slot as u32, name.clone(), 1, false, false, 8_000_000);
+                assign(sfu.watchers.get_mut(&1).unwrap(), slot, WatchGrant::new(p.origin.clone()), slot as u64, now);
+                sfu.rates.insert(name.clone(), ShareRate { largest_keyframe: 80_000, ..Default::default() });
+                sfu.publishers.insert(name.clone(), p);
+            }
+            if mode == "cold" {
+                sfu.watchers.get_mut(&1).unwrap().egress.set_estimate(100_000, now);
+            }
+            sfu.ask_keyframe(1, 0, now);
+            let origin = sfu.publishers[&names[0]].origin.clone();
+            if mode == "partial" || mode == "stalled" {
+                let w = sfu.watchers.get_mut(&1).unwrap();
+                assert!(enqueue(
+                    w,
+                    0,
+                    &origin,
+                    &Forward {
+                        h264: None,
+                        source: 1,
+                        timestamp: 9000,
+                        marker: mode == "stalled",
+                        keyframe: true,
+                        codec: VideoCodec::Vp9,
+                        arrival: now,
+                        payload: Arc::from(vec![0; 1000]),
+                    },
+                    now
+                ));
+            }
+            // Slot 3 requests first; slot 1 is newer but has stage priority.
+            for (slot, delay) in [(3, 10), (2, 20), (1, 30)] {
+                sfu.ask_keyframe(1, slot, now + Duration::from_millis(delay));
+            }
+            sfu.watchers.get_mut(&1).unwrap().egress.focus(Some(1));
+            let mut first = [None; 4];
+            for tick in 0..=2100u64 {
+                let at = now + Duration::from_millis(tick);
+                // No release at all in stalled mode. Partial mode releases the
+                // bytes, but has no marker to complete the initial response.
+                if mode == "partial" {
+                    release(sfu.watchers.get_mut(&1).unwrap(), at);
+                }
+                sfu.retry_keyframes(1, at);
+                for (slot, name) in names.iter().enumerate() {
+                    let p = sfu.publishers.get_mut(name).unwrap();
+                    if p.keyframes.due(at) {
+                        p.keyframes.pending = false;
+                        p.keyframes.last = Some(at);
+                        p.keyframes.sent += 1;
+                        first[slot].get_or_insert(at - now);
+                    }
+                }
+            }
+            eprintln!("INITIAL_DEADLINE mode={mode} first={first:?}");
+            assert_eq!(first[0], Some(Duration::ZERO));
+            assert!(first[3].unwrap() <= Duration::from_millis(1010), "{mode}");
+            assert!(first[3] < first[2] && first[2] < first[1], "oldest first: {mode}");
+            for (older, newer) in [(3, 2), (2, 1)] {
+                assert!(first[newer].unwrap() - first[older].unwrap() >= KEYFRAME_INTERVAL);
+            }
+            assert!(first[1].unwrap() <= Duration::from_millis(2010), "{mode}");
+            assert!(sfu.watchers[&1].slots[0].initial_delivered.is_none());
+            if mode == "stalled" {
+                assert!(sfu.watchers[&1].egress.queued() > 0, "no drain arrived");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn departing_viewer_does_not_hold_another_viewers_initial_wave() {
+        let (mut sfu, _, now, _) = recovery_fixture(&[1, 2]).await;
+        sfu.publishers.clear();
+        let names: Vec<_> = (0..4).map(|slot| format!("depart-{slot}")).collect();
+        for (slot, name) in names.iter().enumerate() {
+            let mut p = h264_ingress_fixture(now);
+            p.origin = ScreenOrigin::new(100 + slot as u32, name.clone(), 1, false, false, 8_000_000);
+            for w in sfu.watchers.values_mut() {
+                assign(w, slot, WatchGrant::new(p.origin.clone()), slot as u64, now);
+            }
+            sfu.rates.insert(name.clone(), ShareRate { largest_keyframe: 80_000, ..Default::default() });
+            sfu.publishers.insert(name.clone(), p);
+        }
+        for session in [1, 2] {
+            for slot in 0..4 {
+                sfu.ask_keyframe(session, slot, now);
+            }
+        }
+        assert!(sfu.watchers[&1].slots[0].initial_in_flight.is_some());
+        let mut first = [None; 4];
+        for tick in 0..=2500u64 {
+            let at = now + Duration::from_millis(tick);
+            if tick == 250 {
+                sfu.end_watch(1);
+                assert!(!sfu.watchers.contains_key(&1));
+                assert!(!sfu.timers.indexed.contains_key(&Timer::Watch(1)));
+            }
+            sfu.retry_keyframes(2, at);
+            for (slot, name) in names.iter().enumerate() {
+                let p = sfu.publishers.get_mut(name).unwrap();
+                if p.keyframes.due(at) {
+                    p.keyframes.pending = false;
+                    p.keyframes.last = Some(at);
+                    p.keyframes.sent += 1;
+                    first[slot].get_or_insert(at - now);
+                }
+            }
+        }
+        eprintln!("DEPARTING_VIEWER first={first:?}");
+        assert!(first.iter().all(|at| at.is_some_and(|at| at <= Duration::from_secs(2))));
+        assert_eq!(sfu.watchers.len(), 1);
     }
 }
