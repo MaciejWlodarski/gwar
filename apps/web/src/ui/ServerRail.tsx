@@ -15,28 +15,22 @@ export function ServerRail() {
   const { isActive, open } = useBookmarkOpener();
 
   return (
-    <nav aria-label={t("rail.label")} className="flex h-full w-[72px] shrink-0 flex-col items-center bg-rail py-3">
-      <div className="flex min-h-0 flex-1 flex-col items-center gap-2 overflow-y-auto overflow-x-hidden px-3 py-1">
+    <nav aria-label={t("rail.label")} className="flex h-full w-16 shrink-0 flex-col items-center bg-rail py-3">
+      <div className="flex min-h-0 flex-1 flex-col items-center gap-2 overflow-y-auto overflow-x-hidden px-2.5 py-1.5">
         {bookmarks.map((b) => {
           const active = isActive(b);
           return (
             <ContextMenu.Root key={b.id}>
               <ContextMenu.Trigger asChild>
                 <div className="relative flex w-full justify-center">
-                  <span
-                    className={cn(
-                      "absolute top-1/2 -left-3 w-1 -translate-y-1/2 rounded-r-full bg-fg transition-all duration-150",
-                      active ? "h-8 opacity-100" : "h-0 opacity-0",
-                    )}
-                  />
                   <Tooltip label={`${b.name}${b.kind === "teamspeak" ? ` · ${t("badge.teamspeak")}` : ""}`} side="right">
                     <button
                       onClick={() => open(b)}
                       aria-label={b.name}
                       aria-current={active ? "true" : undefined}
                       className={cn(
-                        "t cursor-pointer overflow-hidden transition-[border-radius] duration-150",
-                        active ? "rounded-xl" : "rounded-[22px] hover:rounded-xl",
+                        "t cursor-pointer overflow-hidden transition-[border-radius,box-shadow] duration-150",
+                        active ? "rounded-xl ring-2 ring-accent ring-offset-2 ring-offset-rail" : "rounded-[22px] hover:rounded-xl",
                       )}
                     >
                       <Avatar name={b.name} seed={b.address} size={44} square className="!rounded-none" />

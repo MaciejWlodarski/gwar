@@ -125,7 +125,7 @@ export function App() {
               <DialogPrimitive.Title className="sr-only">{t("nav.channels")}</DialogPrimitive.Title>
               <div className="flex min-h-0 flex-1">
                 <ServerRail />
-                {showApp && <Sidebar className="w-[min(280px,calc(92vw-72px))]" />}
+                {showApp && <Sidebar className="w-[min(280px,calc(92vw-64px))]" />}
               </div>
               {/* Phones have no global rail: its sections are tabs here. */}
               <SectionTabs />

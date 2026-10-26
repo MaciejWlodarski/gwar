@@ -14,32 +14,24 @@ function SectionButton({ section, label, icon, badge }: { section: Section; labe
   const current = useUi((s) => s.section === section);
   const setSection = useUi((s) => s.setSection);
   return (
-    <div className="relative flex w-full justify-center">
-      <span
+    <Tooltip label={label} side="right">
+      <button
+        onClick={() => setSection(section)}
+        aria-label={label}
+        aria-current={current ? "page" : undefined}
         className={cn(
-          "absolute top-1/2 left-0 w-[3px] -translate-y-1/2 rounded-r-full bg-accent transition-all duration-150",
-          current ? "h-6 opacity-100" : "h-0 opacity-0",
+          "t relative flex size-11 shrink-0 cursor-pointer items-center justify-center rounded-xl",
+          current ? "bg-accent-soft text-accent" : "text-subtle hover:bg-hover hover:text-fg",
         )}
-      />
-      <Tooltip label={label} side="right">
-        <button
-          onClick={() => setSection(section)}
-          aria-label={label}
-          aria-current={current ? "page" : undefined}
-          className={cn(
-            "t relative flex size-10 cursor-pointer items-center justify-center rounded-xl",
-            current ? "bg-active text-fg" : "text-subtle hover:bg-hover hover:text-fg",
-          )}
-        >
-          {icon}
-          {!!badge && (
-            <span className="absolute -top-0.5 -right-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-danger px-1 text-[10px] leading-none font-semibold text-white ring-2 ring-rail">
-              {badge > 99 ? "99+" : badge}
-            </span>
-          )}
-        </button>
-      </Tooltip>
-    </div>
+      >
+        {icon}
+        {!!badge && (
+          <span className="absolute -top-0.5 -right-0.5 flex h-4 min-w-4 items-center justify-center rounded-full bg-danger px-1 text-[10px] leading-none font-semibold text-white ring-2 ring-rail">
+            {badge > 99 ? "99+" : badge}
+          </span>
+        )}
+      </button>
+    </Tooltip>
   );
 }
 
@@ -55,8 +47,8 @@ export function SectionRail() {
   const openDialog = useUi((s) => s.openDialog);
 
   return (
-    <nav aria-label={t("nav.sections")} className="flex h-full w-14 shrink-0 flex-col items-center gap-1.5 border-r border-line bg-rail py-3">
-      <div aria-hidden className="mb-2 flex h-8 items-center justify-center">
+    <nav aria-label={t("nav.sections")} className="flex h-full w-16 shrink-0 flex-col items-center gap-2 border-r border-line bg-rail py-3">
+      <div aria-hidden className="mb-1 flex h-8 items-center justify-center">
         <BrandMark className="h-5 w-auto" />
       </div>
       <SectionButton section="home" label={t("nav.home")} icon={<House className="size-5" />} />
@@ -64,7 +56,7 @@ export function SectionRail() {
       <div className="flex-1" />
       <UpdateButton />
       <BugReportButton />
-      <IconButton label={t("settings.title")} side="right" size="lg" onClick={() => openDialog({ kind: "settings", tab: "audio" })}>
+      <IconButton label={t("settings.title")} side="right" onClick={() => openDialog({ kind: "settings", tab: "audio" })}>
         <Settings className="size-5" />
       </IconButton>
       <Tooltip label={t("nav.account")} side="right">
