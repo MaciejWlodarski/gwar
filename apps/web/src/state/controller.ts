@@ -368,11 +368,13 @@ class Controller {
     // Tell the server what I have read.
     useSession.subscribe((s) => this.checkRead(s));
 
-    // Messages only count as read while the window is visible and focused, with the chat on screen
-    // (not covered by Home or the server overview).
+    // Messages only count as read while the window is visible and focused, with the chat on screen: not
+    // covered by Home or the server overview, and not left out beside a watched share (collapsed, or on a
+    // phone, where the stage takes the whole screen).
+    const narrow = typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 799px)") : null;
     const syncFocus = () => {
-      const ui = useUi.getState();
-      const chatShown = ui.section === "servers" && (!ui.overview || useScreen.getState().stage !== null);
+      const ui = useUi.getState(), screen = useScreen.getState();
+      const chatShown = ui.section === "servers" && (screen.stage !== null ? !narrow?.matches && !screen.chatHidden : !ui.overview);
       const focused = document.visibilityState === "visible" && document.hasFocus() && chatShown;
       useSession.getState().dispatch({ type: "focus", focused });
     };
@@ -380,8 +382,9 @@ class Controller {
       if (ui.section !== before.section || ui.overview !== before.overview) syncFocus();
     });
     useScreen.subscribe((screen, before) => {
-      if ((screen.stage === null) !== (before.stage === null)) syncFocus();
+      if ((screen.stage === null) !== (before.stage === null) || screen.chatHidden !== before.chatHidden) syncFocus();
     });
+    narrow?.addEventListener("change", syncFocus);
     window.addEventListener("focus", syncFocus);
     window.addEventListener("blur", syncFocus);
     document.addEventListener("visibilitychange", syncFocus);

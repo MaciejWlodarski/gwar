@@ -3,7 +3,11 @@ import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useLanguage, useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { useIsMobile } from "../lib/media";
+import { messageTarget } from "../lib/chat";
 import { formatRelative } from "../lib/time";
+import { fullyVerified } from "../net/message-signature";
+import { messageStorage } from "../net/message-storage";
+import { MessageVerificationCache } from "../net/message-verification-cache";
 import type { Client } from "../proto/Client";
 import { controller } from "../state/controller";
 import { channelUnread, myChannelId } from "../state/reducer";
@@ -79,7 +83,51 @@ function VoiceRoom({ id, name, people, mine }: { id: number; name: string; peopl
   );
 }
 
-function newsText(item: Extract<ChatItem, { kind: "msg" }>, t: ReturnType<typeof useT>): string {
+type News = Extract<ChatItem, { kind: "msg" }>;
+
+/**
+ * The latest server messages fit to repeat. On Gwar each is verified again here, as the chat does, and
+ * again every minute and whenever the revocation feed changes: the flag cached when it arrived does not
+ * learn of a revocation since. TeamSpeak messages carry no signatures and are shown like in the chat.
+ */
+function useNews(items: ChatItem[] | undefined, teamspeak: boolean, serverKey: string): News[] {
+  // Another server starts with an empty cache.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const verifier = useMemo(() => new MessageVerificationCache(), [serverKey]);
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    const timer = setInterval(() => setTick((n) => n + 1), 60_000);
+    const unsubscribe = messageStorage.subscribe(() => setTick((n) => n + 1));
+    return () => {
+      clearInterval(timer);
+      unsubscribe();
+    };
+  }, []);
+  const candidates = useMemo(() => (items ?? []).filter((i) => newsworthy(i, teamspeak)), [items, teamspeak]);
+  const [checked, setChecked] = useState<{ verifier: MessageVerificationCache; items: News[] }>({ verifier, items: [] });
+  useEffect(() => {
+    if (teamspeak) return;
+    let active = true;
+    void (async () => {
+      const uid = await controller.messageUid;
+      if (tick) await verifier.refresh();
+      const picked: News[] = [];
+      for (let i = candidates.length - 1; i >= 0 && picked.length < NEWS_SHOWN; i--) {
+        const item = candidates[i]!;
+        const ctx = { serverKey, target: messageTarget("server", item.msg.author_uid, uid), sealed: item.sealed ? { group: item.sealed.group, epoch: item.sealed.epoch } : undefined };
+        if (fullyVerified(await verifier.verify(item.msg, ctx))) picked.push(item);
+      }
+      if (active) setChecked({ verifier, items: picked });
+    })().catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [candidates, verifier, serverKey, tick, teamspeak]);
+  if (teamspeak) return candidates.slice(-NEWS_SHOWN).reverse();
+  return checked.verifier === verifier ? checked.items : [];
+}
+
+function newsText(item: News, t: ReturnType<typeof useT>): string {
   if (item.msg.text) return item.msg.text;
   return item.msg.attachments?.length ? t("overview.attachment") : "";
 }
@@ -141,10 +189,7 @@ export function Overview({ card }: { card?: boolean }) {
   );
   const dms = Object.entries(threads).filter(([k, th]) => k.startsWith("dm:") && th.unread > 0);
   const serverThread = threads["server"];
-  const news = (serverThread?.items ?? [])
-    .filter((i) => newsworthy(i, kind === "teamspeak"))
-    .slice(-NEWS_SHOWN)
-    .reverse();
+  const news = useNews(serverThread?.items, kind === "teamspeak", controller.messageServerKey);
 
   // The hero's way in: the busiest room, or the default channel when nobody talks.
   const target = rooms.find((r) => r.id !== myChannel) ?? null;

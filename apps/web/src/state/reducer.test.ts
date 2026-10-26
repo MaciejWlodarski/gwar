@@ -400,6 +400,15 @@ describe("unread", () => {
     expect(channelUnread(s, 1)).toBe(0);
   });
 
+  it("counts the open server chat while it is not on screen, and clears on focus", () => {
+    let s = reduce(withUnread(), { type: "setActive", key: "server" });
+    s = reduce(s, { type: "focus", focused: false });
+    s = ev(s, { ev: "chat.message", d: msg(10, { target: "server" }) });
+    expect(s.threads["server"]?.unread).toBe(1);
+    s = reduce(s, { type: "focus", focused: true });
+    expect(s.threads["server"]?.unread).toBe(0);
+  });
+
   it("counts the open channel while another tab (server chat) is showing", () => {
     let s = withUnread();
     s = reduce(s, { type: "setActive", key: "server" });
