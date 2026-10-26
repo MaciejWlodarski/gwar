@@ -333,15 +333,10 @@ export class ScreenController {
         const run = await this.ensureTransport(conn);
         const current = () => alive() && useScreen.getState().transport.run === run;
         if (!current()) return;
-        // Snapshot before asking for media: the first frame may decode before
-        // the grant's reply, or before any ShareVideo mounts. Snapshot every
-        // receiver because the server chooses the slot in its answer.
-        const baselines = await Promise.all(Array.from({ length: SCREEN_SLOTS }, (_, slot) => this.transport!.stats(slot)));
-        if (!current()) return;
         const slot = await this.requestWatch(conn, share, current);
         if (slot === null) return;
         if (!current()) { await conn.request("screen.unwatch", { share }).catch(() => {}); return; }
-        dispatch({ type: "granted", run, id, slot, framesDecoded: baselines[slot]?.framesDecoded ?? null });
+        dispatch({ type: "granted", run, id, slot });
         if (useScreen.getState().stage === share) void conn.request("screen.focus", { share }).catch(() => {});
       } catch (e) {
         if (!alive()) return;
@@ -499,7 +494,20 @@ export class ScreenController {
       }
       case "screen.keyframe": {
         const { run, slot, share, generation } = event.d;
-        if (run === this.transport?.run) this.transport.keyframe(slot, share, generation);
+        const transport = this.transport;
+        if (run !== transport?.run) return;
+        transport.keyframe(slot, share, generation);
+        const screen = useScreen.getState();
+        const watch = screen.watches.find(w => w.share === share && (w.slot === null || w.slot === slot));
+        if (!watch || screen.slots[slot] !== share || watch.video?.ready || (watch.video?.slot === slot && watch.video.generation === generation)) return;
+        const assignment = { run, id: watch.id, slot, share, generation };
+        // Take the baseline only once the server has forwarded this assignment's
+        // keyframe. Keep the event even if it beats the grant reply or video mount.
+        const baseline = transport.stats(slot);
+        dispatch({ type: "watchKeyframe", ...assignment, at: Date.now() });
+        void baseline.then(stats => {
+          if (stats && this.transport === transport) dispatch({ type: "watchBaseline", ...assignment, framesDecoded: stats.framesDecoded });
+        });
         return;
       }
       case "screen.started":

@@ -262,21 +262,22 @@ function ShareVideo({ share, className, onDoubleClick, videoRef }: { share: stri
     if (!video) return;
     if (video.srcObject !== stream) video.srcObject = stream;
     if (stream) void video.play().catch(() => {});
-    if (!stream || !grant || grant.slot === null || showing) return;
+    const keyframe = grant?.video;
+    if (!stream || !grant || grant.slot === null || !keyframe || showing) return;
     let active = true, timer: ReturnType<typeof setTimeout> | undefined, frame: number | undefined;
-    let presented = false;
-    const fallbackAt = Date.now() + 2_000;
-    // Prefer confirmation that the video presented a frame. Static capture can
-    // decode before this element mounts, so fall back after two seconds with
-    // valid dimensions and decoder progress since the grant's saved baseline.
-    if (video.requestVideoFrameCallback) frame = video.requestVideoFrameCallback(() => { presented = true; });
+    const assignment = { run, id: grant.id, slot: grant.slot, share, generation: keyframe.generation };
+    // Arm presentation and the static-share fallback only after this assignment's
+    // server keyframe event. Neither cached dimensions nor an outgoing decode
+    // can open a grant that has received no new media.
+    if (video.requestVideoFrameCallback) frame = video.requestVideoFrameCallback(() => {
+      if (active) useScreen.getState().dispatch({ type: "watchFrame", ...assignment, presented: true });
+    });
     const check = async () => {
       const stats = await controller.screen.stats(share);
       if (!active) return;
-      if (stats) {
-        const visible = stats.width > 0 && stats.height > 0 && (presented || Date.now() >= fallbackAt);
-        useScreen.getState().dispatch({ type: "watchFrame", run, id: grant.id, slot: grant.slot!, framesDecoded: stats.framesDecoded, presented: visible });
-        if (visible && grant.video?.baseline !== null && stats.framesDecoded > (grant.video?.baseline ?? Infinity)) return;
+      if (stats && stats.width > 0 && stats.height > 0) {
+        useScreen.getState().dispatch({ type: "watchFrame", ...assignment, framesDecoded: stats.framesDecoded, fallback: Date.now() >= keyframe.at + 2_000 });
+        if (useScreen.getState().watches.find(w => w.id === grant.id)?.video?.ready) return;
       }
       timer = setTimeout(() => { void check(); }, 250);
     };
