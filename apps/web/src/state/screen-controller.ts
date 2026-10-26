@@ -494,20 +494,7 @@ export class ScreenController {
       }
       case "screen.keyframe": {
         const { run, slot, share, generation } = event.d;
-        const transport = this.transport;
-        if (run !== transport?.run) return;
-        transport.keyframe(slot, share, generation);
-        const screen = useScreen.getState();
-        const watch = screen.watches.find(w => w.share === share && (w.slot === null || w.slot === slot));
-        if (!watch || screen.slots[slot] !== share || watch.video?.ready || (watch.video?.slot === slot && watch.video.generation === generation)) return;
-        const assignment = { run, id: watch.id, slot, share, generation };
-        // Take the baseline only once the server has forwarded this assignment's
-        // keyframe. Keep the event even if it beats the grant reply or video mount.
-        const baseline = transport.stats(slot);
-        dispatch({ type: "watchKeyframe", ...assignment, at: Date.now() });
-        void baseline.then(stats => {
-          if (stats && this.transport === transport) dispatch({ type: "watchBaseline", ...assignment, framesDecoded: stats.framesDecoded });
-        });
+        if (run === this.transport?.run) this.transport.keyframe(slot, share, generation);
         return;
       }
       case "screen.started":

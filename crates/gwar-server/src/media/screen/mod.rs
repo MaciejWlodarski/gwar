@@ -1316,7 +1316,7 @@ impl Sfu {
                 }
                 let Some(w) = self.watchers.get_mut(&session) else { continue };
                 if admitted {
-                    if forward.keyframe && w.slots[index].keyframe_at.is_none() {
+                    if forward.keyframe && forward.h264.is_some() && w.slots[index].keyframe_at.is_none() {
                         let slot = &mut w.slots[index];
                         slot.keyframe_at = Some(now);
                         let signal = ScreenSignal::Keyframe {
@@ -1326,9 +1326,9 @@ impl Sfu {
                             generation: slot.generation,
                             grant: slot.grant.clone().expect("assigned"),
                         };
-                        // Every viewer uses this assignment's first keyframe as media
-                        // evidence, including VP9 and guests without decode watchdogs.
-                        self.signal(signal);
+                        if w.decode_watchdog {
+                            self.signal(signal);
+                        }
                     }
                     if !touched.contains(&session) {
                         touched.push(session);
@@ -3061,50 +3061,6 @@ pub(crate) mod tests {
     fn report(sfu: &mut Sfu, session: SessionId, now: Instant) {
         let generation = sfu.watchers[&session].slots[0].generation;
         sfu.decode_failed(session, 1, 0, generation, "h264", now);
-    }
-
-    #[tokio::test]
-    async fn vp9_keyframe_signals_each_assignment_without_a_decode_watchdog() {
-        let (mut sfu, origin, now, _) = recovery_fixture(&[7]).await;
-        // Keep notifications observable in the SFU outbox while its core is busy.
-        // This current-thread test cannot drain the core until its next await.
-        assert!(
-            (0..10_000)
-                .any(|_| sfu.core.try_screen(ScreenSignal::Watch { session: 0, run: 0, connected: false }).is_err())
-        );
-        let w = sfu.watchers.get_mut(&7).unwrap();
-        w.decode_watchdog = false;
-        w.slots[0].keyframe_at = None;
-        w.slots[0].last_h264 = None;
-        let key = Forward {
-            h264: None,
-            codec: VideoCodec::Vp9,
-            source: 1,
-            timestamp: 9000,
-            marker: true,
-            keyframe: true,
-            arrival: now,
-            payload: Arc::from([0x08, 1]),
-        };
-        for assignment in 0..2 {
-            let grant = sfu.watchers[&7].slots[0].grant.clone().unwrap();
-            let generation = sfu.watchers[&7].slots[0].generation;
-            sfu.forward_packets("h264", &origin, vec![(key.clone(), false)], now);
-            assert!(
-                sfu.outbox.iter().any(|signal| matches!(signal,
-                    ScreenSignal::Keyframe { session: 7, run: 1, slot: 0, generation: g, grant: current }
-                    if *g == generation && Arc::ptr_eq(current, &grant)
-                )),
-                "assignment {assignment} needs new-media evidence for VP9 too"
-            );
-            sfu.outbox.clear();
-            sfu.forward_packets("h264", &origin, vec![(key.clone(), false)], now);
-            assert!(
-                !sfu.outbox.iter().any(|signal| matches!(signal, ScreenSignal::Keyframe { .. })),
-                "one event per assignment"
-            );
-            assign(sfu.watchers.get_mut(&7).unwrap(), 0, WatchGrant::new(origin.clone()), 1, now);
-        }
     }
 
     #[tokio::test]

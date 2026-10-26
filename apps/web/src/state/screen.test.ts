@@ -41,25 +41,6 @@ describe("own share", () => {
 });
 
 describe("watching", () => {
-  it("requires the assignment keyframe and fences readiness by grant, run, share and generation", () => {
-    let s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "granted", run: 7, id: 1, slot: 0 });
-    const assignment = { run: 7, id: 1, slot: 0, share: "A", generation: 2 };
-    const sample = { type: "watchFrame" as const, ...assignment, framesDecoded: 100 };
-    expect(run(s, { ...sample, presented: true, fallback: true })).toBe(s);
-    s = run(s, { type: "watchKeyframe", ...assignment, at: 10 });
-    expect(run(s, sample)).toBe(s); // An unknown baseline is never zero.
-    s = run(s, { type: "watchBaseline", ...assignment, framesDecoded: 100 });
-    expect(s.watches[0]?.video).toMatchObject({ baseline: 100, ready: false });
-    expect(run(s, sample)).toBe(s);
-    for (const stale of [{ run: 6 }, { id: 2 }, { share: "B" }, { slot: 1 }, { generation: 1 }]) {
-      expect(run(s, { ...sample, ...stale, framesDecoded: 101, presented: true, fallback: true })).toBe(s);
-      expect(run(s, { type: "watchBaseline", ...assignment, ...stale, framesDecoded: 99 })).toBe(s);
-    }
-    s = run(s, { ...sample, framesDecoded: 101 });
-    expect(s.watches[0]?.video?.ready).toBe(true);
-    expect(run(s, { type: "transport", run: 8, phase: "connecting" }).watches[0]?.video).toBeUndefined();
-  });
-
   it("watches on the stage once its own request is answered", () => {
     let s = run(connected(), { type: "watch", share: "A", id: 1 });
     expect(s.stage).toBe("A");
@@ -101,18 +82,6 @@ describe("watching", () => {
     expect(s.watches).toEqual([{ share: "A", id: 2, slot: null, status: "requesting" }]);
     s = run(s, { type: "slot", run: 7, slot: 3, share: "A" }, { type: "granted", run: 7, id: 2, slot: 3 });
     expect(slotOf(s, "A")).toBe(3);
-  });
-
-  it("retires the previous assignment's early keyframe when a pending rewatch sees its release", () => {
-    const assignment = { run: 7, slot: 0, share: "A", id: 2, generation: 1 };
-    let s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "unwatch", share: "A" }, { type: "watch", share: "A", id: 2 },
-      { type: "slot", run: 7, slot: 0, share: "A" }, { type: "watchKeyframe", ...assignment, at: 0 });
-    s = run(s, { type: "slot", run: 7, slot: 0, share: null }, { type: "slot", run: 7, slot: 0, share: "A" }, { type: "granted", run: 7, id: 2, slot: 0 });
-    expect(s.watches[0]?.video).toBeUndefined();
-    expect(run(s, { type: "watchBaseline", ...assignment, framesDecoded: 10 })).toBe(s);
-    expect(run(s, { type: "watchFrame", ...assignment, presented: true, fallback: true })).toBe(s);
-    s = run(s, { type: "watchKeyframe", ...assignment, generation: 2, at: 2_000 });
-    expect(s.watches[0]?.video).toMatchObject({ generation: 2, ready: false });
   });
 
   it("puts a share already watched back on the stage instead of watching it twice", () => {

@@ -882,9 +882,7 @@ export class ScreenWatchTransport {
     const receiver = this.transceivers[slot]?.receiver;
     if (!receiver || this.closed) return null;
     try {
-      // An unused receiver has decoded zero frames. Keep errors distinct from
-      // that valid baseline so a reused slot never assumes an unknown count is zero.
-      let found: SlotStats = { width: 0, height: 0, fps: 0, framesDecoded: 0 };
+      let found: SlotStats | null = null;
       (await receiver.getStats()).forEach(s => {
         if (s.type !== "inbound-rtp") return;
         const r = s as RTCInboundRtpStreamStats;

@@ -17,7 +17,7 @@ interface PublisherOptions {
 }
 
 const media = vi.hoisted(() => ({
-  transports: [] as Array<{ params: { run: number; state(s: string): void; offer(sdp: string, run: number): Promise<string> }; close: () => void; stats: ReturnType<typeof vi.fn> }>,
+  transports: [] as Array<{ params: { run: number; state(s: string): void; offer(sdp: string, run: number): Promise<string> }; close: () => void }>,
   publishers: [] as Array<{ params: PublisherOptions; close: () => void; setSpec: (spec: ScreenSpec, automaticMode: boolean) => Promise<void> }>,
 }));
 vi.mock("../voice/screen", async importOriginal => {
@@ -29,7 +29,7 @@ vi.mock("../voice/screen", async importOriginal => {
     keyframe = vi.fn();
     constructor(readonly params: { run: number; state(s: string): void; offer(sdp: string, run: number): Promise<string> }) { this.run = params.run; media.transports.push(this); }
     async start() { await this.params.offer("watch-offer", this.run); }
-    stats = vi.fn(async (_slot: number) => ({ width: 640, height: 360, fps: 0, framesDecoded: 10 }));
+    async stats() { return null; }
   }
   class ScreenPublisher {
     close = vi.fn();
@@ -89,59 +89,6 @@ beforeEach(() => {
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe("watching", () => {
-  it("takes the baseline at the new keyframe, even before the grant reply and video mount", async () => {
-    const answer = deferred<{ slot: number }>();
-    const { link, calls } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => answer.promise });
-    const screen = new ScreenController(() => link, String);
-    const watching = screen.watch("A");
-    await flush();
-    const transport = media.transports[0]!;
-    const run = transport.params.run;
-    transport.params.state("connected");
-    await flush();
-    expect(calls.some(([op]) => op === "screen.watch")).toBe(true);
-    expect(transport.stats).not.toHaveBeenCalled();
-    screen.handleEvent({ ev: "screen.slot", d: { run, slot: 0, share: "A" } });
-    for (const d of [{ run: run - 1, slot: 0, share: "A", generation: 1 }, { run, slot: 0, share: "B", generation: 1 }, { run, slot: 1, share: "A", generation: 1 }]) {
-      screen.handleEvent({ ev: "screen.keyframe", d });
-    }
-    expect(transport.stats).not.toHaveBeenCalled();
-    screen.handleEvent({ ev: "screen.keyframe", d: { run, slot: 0, share: "A", generation: 2 } });
-    await flush();
-    expect(transport.stats).toHaveBeenCalledExactlyOnceWith(0);
-    // The new share decodes once before signalling returns and never changes again.
-    transport.stats.mockResolvedValue({ width: 640, height: 360, fps: 0, framesDecoded: 11 });
-    answer.resolve({ slot: 0 });
-    await watching;
-    expect(useScreen.getState().watches[0]?.video).toMatchObject({ slot: 0, generation: 2, baseline: 10, ready: false });
-    // Duplicate events must not replace the baseline or postpone the fallback.
-    screen.handleEvent({ ev: "screen.keyframe", d: { run, slot: 0, share: "A", generation: 2 } });
-    expect(transport.stats).toHaveBeenCalledTimes(1);
-    screen.reset();
-  });
-
-  it("ignores a keyframe baseline that settles after the slot is granted again", async () => {
-    const { link } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => ({ slot: 0 }) });
-    const screen = new ScreenController(() => link, String);
-    const watching = screen.watch("A");
-    await flush();
-    const transport = media.transports[0]!;
-    const run = transport.params.run;
-    transport.params.state("connected");
-    await watching;
-    const baseline = deferred<{ width: number; height: number; fps: number; framesDecoded: number }>();
-    transport.stats.mockReturnValueOnce(baseline.promise);
-    screen.handleEvent({ ev: "screen.keyframe", d: { run, slot: 0, share: "A", generation: 1 } });
-    await screen.unwatch("A");
-    await screen.watch("A");
-    screen.handleEvent({ ev: "screen.keyframe", d: { run, slot: 0, share: "A", generation: 2 } });
-    await flush();
-    baseline.resolve({ width: 640, height: 360, fps: 0, framesDecoded: 99 });
-    await flush();
-    expect(useScreen.getState().watches[0]?.video).toMatchObject({ generation: 2, baseline: 10, ready: false });
-    screen.reset();
-  });
-
   it("watches without joining voice: one watch transport, then the slot, then focus", async () => {
     let unavailable = 2;
     const { link, ops, calls } = fakeLink({

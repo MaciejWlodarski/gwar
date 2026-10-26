@@ -2696,10 +2696,7 @@ from native capture is PR 10.
     `getStats`), and "Stop watching".
   - The sharer's speaking ring shows on their card, from the existing
     `voice.talking` event.
-  - Reusing a receive slot keeps its stream, because no second `ontrack` arrives.
-    The video stays hidden until `framesDecoded` advances after the new watch
-    grant. Cached `loadeddata`, resize events and old stats results
-    cannot reveal the previous share's last frame.
+  - Reused slot may briefly show the previous share's last frame until the new keyframe decodes (cosmetic).
   - No sound in the first release; phase 2 adds a volume slider and mute per
     share ([Shared audio](#shared-audio-phase-2)).
 - **Encrypted.** The same lock as voice ("End-to-end encrypted") on the stage,

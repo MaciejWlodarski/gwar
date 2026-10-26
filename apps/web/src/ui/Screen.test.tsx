@@ -7,12 +7,11 @@ import type { Channel } from "../proto/Channel";
 import type { Client } from "../proto/Client";
 import { initialState } from "../state/reducer";
 import { initialScreen, useScreen } from "../state/screen";
-import { controller } from "../state/controller";
 import { useDesktopCapture, type DesktopCapture } from "../state/screen-controller";
 import { useSettings } from "../state/settings";
 import { useSession } from "../state/stores";
 import { TooltipProvider } from "./kit";
-import { LiveBadge, ShareButton, SharingBar, Stage } from "./Screen";
+import { LiveBadge, ShareButton, SharingBar } from "./Screen";
 
 const channel = (id: number, extra: Partial<Channel> = {}): Channel => ({
   id, parent: null, name: `c${id}`, topic: "", position: id, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false, ...extra,
@@ -109,6 +108,7 @@ describe("the Share button and LIVE badge", () => {
   });
 });
 
+
 it("shows independent quality controls and saves an explicit click on the surface-default mode", async () => {
   useSettings.setState({ screenMode: null, screenHeight: 1080, screenFps: 30, language: "pl" });
   useScreen.getState().dispatch({ type: "pick", attempt: 1 });
@@ -122,183 +122,4 @@ it("shows independent quality controls and saves an explicit click on the surfac
   expect(container.querySelectorAll("select")).toHaveLength(2);
   await act(async () => modes[0]!.click());
   expect(useSettings.getState().screenMode).toBe("smooth");
-});
-
-it("hides a reused slot's cached frame until decode advances, fencing old grants and stats", async () => {
-  vi.useFakeTimers();
-  let frames = 10, defer = false;
-  let stale!: (stats: { width: number; height: number; fps: number; framesDecoded: number }) => void;
-  const sample = () => ({ width: 640, height: 360, fps: 20, framesDecoded: frames });
-  const stats = vi.spyOn(controller.screen, "stats").mockImplementation(async () => defer ? new Promise(resolve => { stale = resolve; }) : sample());
-  const play = vi.spyOn(HTMLVideoElement.prototype, "play").mockResolvedValue();
-  const stream = new MediaStream(), dispatch = useScreen.getState().dispatch;
-  const grant = (id: number, share = "S") => {
-    dispatch({ type: "watch", share, id });
-    dispatch({ type: "granted", run: 1, id, slot: 0 });
-    dispatch({ type: "watchKeyframe", run: 1, id, slot: 0, share, generation: id, at: Date.now() });
-    dispatch({ type: "watchBaseline", run: 1, id, slot: 0, share, generation: id, framesDecoded: frames });
-  };
-  const poll = () => act(async () => { await vi.advanceTimersByTimeAsync(250); });
-  const hidden = () => container.querySelector("video")!.classList.contains("opacity-0");
-  try {
-    dispatch({ type: "transport", run: 1, phase: "connected" });
-    dispatch({ type: "stream", run: 1, slot: 0, stream });
-    grant(1);
-    await act(async () => root.render(<TooltipProvider><Stage /></TooltipProvider>));
-    expect(hidden()).toBe(true);
-    await act(async () => {
-      container.querySelector("video")!.dispatchEvent(new Event("loadeddata"));
-      container.querySelector("video")!.dispatchEvent(new Event("resize"));
-    });
-    await poll(); // Cached data without decoder progress must stay hidden.
-    expect(hidden()).toBe(true);
-    frames++; await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
-    expect(hidden()).toBe(false);
-    const calls = stats.mock.calls.length;
-    await poll();
-    expect(stats).toHaveBeenCalledTimes(calls); // No readiness polling after the first new frame.
-
-    await act(async () => { dispatch({ type: "slot", run: 1, slot: 0, share: null }); grant(2, "T"); });
-    expect(useScreen.getState().streams[0]).toBe(stream);
-    expect(container.querySelector("video")!.srcObject).toBe(stream);
-    expect(hidden()).toBe(true);
-    defer = true; await poll(); defer = false;
-    expect(stale).toBeDefined();
-    await act(async () => { dispatch({ type: "slot", run: 1, slot: 0, share: null }); grant(3, "T"); });
-    await act(async () => stale({ ...sample(), framesDecoded: 99 }));
-    expect(hidden()).toBe(true);
-    await poll(); expect(hidden()).toBe(true);
-    frames++; await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
-    expect(hidden()).toBe(false);
-
-    await act(async () => { dispatch({ type: "transport", run: 2, phase: "connecting" }); });
-    expect(hidden()).toBe(true);
-    await act(async () => root.render(null));
-    expect(vi.getTimerCount()).toBe(0);
-  } finally {
-    await act(async () => root.render(null));
-    stats.mockRestore(); play.mockRestore(); vi.useRealTimers();
-  }
-});
-
-it.each([0, 10])("an already decoded static frame is visible without another decoder increment (baseline %i)", async baseline => {
-  vi.useFakeTimers();
-  const stats = vi.spyOn(controller.screen, "stats").mockResolvedValue({ width: 640, height: 360, fps: 0, framesDecoded: baseline + 1 });
-  const play = vi.spyOn(HTMLVideoElement.prototype, "play").mockResolvedValue();
-  const stream = new MediaStream(), dispatch = useScreen.getState().dispatch;
-  try {
-    dispatch({ type: "transport", run: 1, phase: "connected" });
-    dispatch({ type: "stream", run: 1, slot: 0, stream });
-    dispatch({ type: "watch", share: "S", id: 1 });
-    dispatch({ type: "granted", run: 1, id: 1, slot: 0 });
-    dispatch({ type: "watchKeyframe", run: 1, id: 1, slot: 0, share: "S", generation: 1, at: Date.now() });
-    dispatch({ type: "watchBaseline", run: 1, id: 1, slot: 0, share: "S", generation: 1, framesDecoded: baseline });
-    await act(async () => root.render(<TooltipProvider><Stage /></TooltipProvider>));
-    await act(async () => { container.querySelector("video")!.dispatchEvent(new Event("loadeddata")); });
-    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
-    expect(container.querySelector("video")!.classList.contains("opacity-0")).toBe(false);
-    await act(async () => root.render(null));
-    await act(async () => root.render(<TooltipProvider><Stage /></TooltipProvider>));
-    expect(container.querySelector("video")!.classList.contains("opacity-0")).toBe(false);
-    const calls = stats.mock.calls.length;
-    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
-    expect(stats).toHaveBeenCalledTimes(calls);
-    // Reusing the same stream for a new grant must reset readiness.
-    await act(async () => {
-      dispatch({ type: "slot", run: 1, slot: 0, share: null });
-      dispatch({ type: "watch", share: "S", id: 2 });
-      dispatch({ type: "granted", run: 1, id: 2, slot: 0 });
-    });
-    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
-    expect(container.querySelector("video")!.classList.contains("opacity-0")).toBe(true);
-  } finally {
-    await act(async () => root.render(null)); stats.mockRestore(); play.mockRestore(); vi.useRealTimers();
-  }
-});
-
-it("does not reveal A's last decode while B's reused slot has received no keyframe", async () => {
-  vi.useFakeTimers();
-  let frames = 10;
-  const stats = vi.spyOn(controller.screen, "stats").mockImplementation(async () => ({ width: 640, height: 360, fps: 0, framesDecoded: frames }));
-  const play = vi.spyOn(HTMLVideoElement.prototype, "play").mockResolvedValue();
-  const dispatch = useScreen.getState().dispatch;
-  // Preserve the old action field so this exact repro also fails on e87c20c.
-  // Current grants ignore it and take their baseline only at the keyframe event.
-  const grant = (id: number) => ({ type: "granted" as const, run: 1, id, slot: 0, framesDecoded: 10 });
-  try {
-    dispatch({ type: "transport", run: 1, phase: "connected" });
-    dispatch({ type: "stream", run: 1, slot: 0, stream: new MediaStream() });
-    dispatch({ type: "watch", share: "A", id: 1 });
-    dispatch(grant(1));
-    // A's unwatch is still pending when B requests its grant at framesDecoded=10.
-    dispatch({ type: "unwatch", share: "A" });
-    dispatch({ type: "watch", share: "B", id: 2 });
-    frames = 11; // A's final frame decodes before the server grants B slot 0.
-    dispatch({ type: "slot", run: 1, slot: 0, share: "B" });
-    dispatch(grant(2));
-    await act(async () => root.render(<TooltipProvider><Stage /></TooltipProvider>));
-    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
-    expect(container.querySelector("video")!.classList.contains("opacity-0")).toBe(true);
-  } finally {
-    await act(async () => root.render(null)); stats.mockRestore(); play.mockRestore(); vi.useRealTimers();
-  }
-});
-
-it("uses the keyframe event's fallback deadline across remounts when a static decode is already counted", async () => {
-  vi.useFakeTimers();
-  const stats = vi.spyOn(controller.screen, "stats").mockResolvedValue({ width: 640, height: 360, fps: 0, framesDecoded: 11 });
-  const play = vi.spyOn(HTMLVideoElement.prototype, "play").mockResolvedValue();
-  const dispatch = useScreen.getState().dispatch;
-  try {
-    dispatch({ type: "transport", run: 1, phase: "connected" });
-    dispatch({ type: "stream", run: 1, slot: 0, stream: new MediaStream() });
-    dispatch({ type: "watch", share: "S", id: 1 });
-    dispatch({ type: "granted", run: 1, id: 1, slot: 0 });
-    dispatch({ type: "watchKeyframe", run: 1, id: 1, slot: 0, share: "S", generation: 1, at: Date.now() });
-    // B's only decode completed before the asynchronous event-time stats read.
-    dispatch({ type: "watchBaseline", run: 1, id: 1, slot: 0, share: "S", generation: 1, framesDecoded: 11 });
-    await act(async () => root.render(<TooltipProvider><Stage /></TooltipProvider>));
-    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
-    expect(container.querySelector("video")!.classList.contains("opacity-0")).toBe(true);
-    await act(async () => root.render(null));
-    await act(async () => { await vi.advanceTimersByTimeAsync(1_000); });
-    await act(async () => root.render(<TooltipProvider><Stage /></TooltipProvider>));
-    expect(container.querySelector("video")!.classList.contains("opacity-0")).toBe(false);
-  } finally {
-    await act(async () => root.render(null)); stats.mockRestore(); play.mockRestore(); vi.useRealTimers();
-  }
-});
-
-it("arms frame presentation only after the new assignment's keyframe, without requiring stats", async () => {
-  const stats = vi.spyOn(controller.screen, "stats").mockResolvedValue(null);
-  const play = vi.spyOn(HTMLVideoElement.prototype, "play").mockResolvedValue();
-  const proto = HTMLVideoElement.prototype;
-  const originalRequest = Object.getOwnPropertyDescriptor(proto, "requestVideoFrameCallback");
-  const originalCancel = Object.getOwnPropertyDescriptor(proto, "cancelVideoFrameCallback");
-  let callback!: VideoFrameRequestCallback;
-  const request = vi.fn((cb: VideoFrameRequestCallback) => { callback = cb; return 1; });
-  const cancel = vi.fn();
-  Object.defineProperty(proto, "requestVideoFrameCallback", { configurable: true, value: request });
-  Object.defineProperty(proto, "cancelVideoFrameCallback", { configurable: true, value: cancel });
-  const dispatch = useScreen.getState().dispatch;
-  try {
-    dispatch({ type: "transport", run: 1, phase: "connected" });
-    dispatch({ type: "stream", run: 1, slot: 0, stream: new MediaStream() });
-    dispatch({ type: "watch", share: "S", id: 1 });
-    dispatch({ type: "granted", run: 1, id: 1, slot: 0 });
-    await act(async () => root.render(<TooltipProvider><Stage /></TooltipProvider>));
-    expect(request).not.toHaveBeenCalled();
-    await act(async () => dispatch({ type: "watchKeyframe", run: 1, id: 1, slot: 0, share: "S", generation: 1, at: Date.now() }));
-    expect(request).toHaveBeenCalledTimes(1);
-    expect(container.querySelector("video")!.classList.contains("opacity-0")).toBe(true);
-    await act(async () => callback(0, {} as VideoFrameCallbackMetadata));
-    expect(container.querySelector("video")!.classList.contains("opacity-0")).toBe(false);
-    expect(cancel).toHaveBeenCalledWith(1);
-  } finally {
-    await act(async () => root.render(null)); stats.mockRestore(); play.mockRestore();
-    if (originalRequest) Object.defineProperty(proto, "requestVideoFrameCallback", originalRequest);
-    else Reflect.deleteProperty(proto, "requestVideoFrameCallback");
-    if (originalCancel) Object.defineProperty(proto, "cancelVideoFrameCallback", originalCancel);
-    else Reflect.deleteProperty(proto, "cancelVideoFrameCallback");
-  }
 });

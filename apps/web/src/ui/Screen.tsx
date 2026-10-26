@@ -253,41 +253,14 @@ export function LiveBadge({ client, name }: { client: Client; name: string }) {
 function ShareVideo({ share, className, onDoubleClick, videoRef }: { share: string; className?: string; onDoubleClick?: () => void; videoRef?: (video: HTMLVideoElement | null) => void }) {
   const t = useT();
   const stream = useScreen(s => { const slot = slotOf(s, share); return slot === null ? null : (s.streams[slot] ?? null); });
-  const grant = useScreen(s => s.watches.find(w => w.share === share && w.status === "watching"));
-  const run = useScreen(s => s.transport.run);
   const ref = useRef<HTMLVideoElement | null>(null);
-  const showing = !!stream && grant?.video?.ready === true;
+  const [showing, setShowing] = useState(false);
   useEffect(() => {
     const video = ref.current;
     if (!video) return;
     if (video.srcObject !== stream) video.srcObject = stream;
     if (stream) void video.play().catch(() => {});
-    const keyframe = grant?.video;
-    if (!stream || !grant || grant.slot === null || !keyframe || showing) return;
-    let active = true, timer: ReturnType<typeof setTimeout> | undefined, frame: number | undefined;
-    const assignment = { run, id: grant.id, slot: grant.slot, share, generation: keyframe.generation };
-    // Arm presentation and the static-share fallback only after this assignment's
-    // server keyframe event. Neither cached dimensions nor an outgoing decode
-    // can open a grant that has received no new media.
-    if (video.requestVideoFrameCallback) frame = video.requestVideoFrameCallback(() => {
-      if (active) useScreen.getState().dispatch({ type: "watchFrame", ...assignment, presented: true });
-    });
-    const check = async () => {
-      const stats = await controller.screen.stats(share);
-      if (!active) return;
-      if (stats && stats.width > 0 && stats.height > 0) {
-        useScreen.getState().dispatch({ type: "watchFrame", ...assignment, framesDecoded: stats.framesDecoded, fallback: Date.now() >= keyframe.at + 2_000 });
-        if (useScreen.getState().watches.find(w => w.id === grant.id)?.video?.ready) return;
-      }
-      timer = setTimeout(() => { void check(); }, 250);
-    };
-    void check();
-    return () => {
-      active = false;
-      if (timer !== undefined) clearTimeout(timer);
-      if (frame !== undefined) video.cancelVideoFrameCallback(frame);
-    };
-  }, [stream, grant, run, share, showing]);
+  }, [stream]);
   return (
     <div className={cn("relative flex min-h-0 items-center justify-center overflow-hidden bg-black", className)}>
       <video
@@ -296,8 +269,10 @@ function ShareVideo({ share, className, onDoubleClick, videoRef }: { share: stri
         muted
         autoPlay
         playsInline
+        onLoadedData={() => setShowing(true)}
+        onResize={() => setShowing(true)}
         onDoubleClick={onDoubleClick}
-        className={cn("size-full object-contain", !showing && "opacity-0")}
+        className="size-full object-contain"
       />
       {!showing && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-white/70">{t("screen.connecting")}</div>

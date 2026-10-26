@@ -43,8 +43,6 @@ export interface Watch {
   id: number;
   slot: number | null;
   status: "requesting" | "watching";
-  /** New-assignment keyframe evidence and readiness survive video remounts. */
-  video?: { slot: number; generation: number; at: number; baseline: number | null; ready: boolean };
 }
 
 export type TransportPhase = "none" | "connecting" | "connected" | "failed";
@@ -84,9 +82,6 @@ export type ScreenAction =
   | { type: "stream"; run: number; slot: number; stream: MediaStream }
   | { type: "watch"; share: string; id: number }
   | { type: "granted"; run: number; id: number; slot: number }
-  | { type: "watchKeyframe"; run: number; id: number; slot: number; share: string; generation: number; at: number }
-  | { type: "watchBaseline"; run: number; id: number; slot: number; share: string; generation: number; framesDecoded: number }
-  | { type: "watchFrame"; run: number; id: number; slot: number; share: string; generation: number; framesDecoded?: number; presented?: boolean; fallback?: boolean }
   | { type: "slot"; run: number; slot: number; share: string | null }
   | { type: "unwatch"; share: string }
 
@@ -158,7 +153,7 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       if (run < state.transport.run) return state;
       if (run > state.transport.run) {
         // A new run: nothing of the old one's slots carries over; watches wait for new slots.
-        return { ...state, transport: { run, phase }, slots: emptySlots(), streams: emptySlots(), watches: state.watches.map(({ video: _, ...w }) => ({ ...w, slot: null, status: "requesting" as const })) };
+        return { ...state, transport: { run, phase }, slots: emptySlots(), streams: emptySlots(), watches: state.watches.map(w => ({ ...w, slot: null, status: "requesting" as const })) };
       }
       if (phase === "failed") {
         // The server ends every watch of a transport that is gone.
@@ -184,47 +179,14 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       if (!watch) return state;
       const slots = state.slots.slice();
       slots[slot] = watch.share;
-      return { ...state, slots, watches: state.watches.map(w => {
-        if (w !== watch) return w;
-        const { video, ...rest } = w;
-        return { ...rest, slot, status: "watching", ...(video?.slot === slot ? { video } : {}) };
-      }) };
-    }
-    case "watchKeyframe": {
-      if (action.run !== state.transport.run || state.slots[action.slot] !== action.share) return state;
-      const watch = state.watches.find(w => w.id === action.id && w.share === action.share && (w.slot === null || w.slot === action.slot));
-      if (!watch || watch.video?.ready || (watch.video?.slot === action.slot && watch.video.generation === action.generation)) return state;
-      const video = { slot: action.slot, generation: action.generation, at: action.at, baseline: null, ready: false };
-      return { ...state, watches: state.watches.map(w => w === watch ? { ...w, video } : w) };
-    }
-    case "watchBaseline":
-    case "watchFrame": {
-      if (action.run !== state.transport.run || state.slots[action.slot] !== action.share) return state;
-      const watch = state.watches.find(w => w.id === action.id && w.share === action.share);
-      const video = watch?.video;
-      if (!watch || !video || video.ready || video.slot !== action.slot || video.generation !== action.generation) return state;
-      let next = video;
-      if (action.type === "watchBaseline") {
-        if (video.baseline === null) next = { ...video, baseline: action.framesDecoded };
-      } else if (watch.status === "watching" && watch.slot === action.slot &&
-        (action.presented || action.fallback || (video.baseline !== null && action.framesDecoded !== undefined && action.framesDecoded > video.baseline))) {
-        next = { ...video, ready: true };
-      }
-      return next !== video ? { ...state, watches: state.watches.map(w => w === watch ? { ...w, video: next } : w) } : state;
+      return { ...state, slots, watches: state.watches.map(w => (w === watch ? { ...w, slot, status: "watching" } : w)) };
     }
     case "slot": {
       const { run, slot, share } = action;
       if (run !== state.transport.run || slot < 0 || slot >= SCREEN_SLOTS) return state;
       const slots = state.slots.slice();
       slots[slot] = share;
-      // A pending rewatch may have seen the preceding grant's keyframe.
-      // Every server assignment/release retires that evidence before its reply.
-      const watches = state.watches.map(w => {
-        if (w.status !== "requesting" || w.video?.slot !== slot) return w;
-        const { video: _, ...rest } = w;
-        return rest;
-      });
-      const next: ScreenState = { ...state, slots, watches };
+      const next: ScreenState = { ...state, slots };
       if (share !== null) return next;
       // The server freed the slot: the watch it granted ended (unwatched, stopped, no access).
       // A watch asked again since then is still requesting, and waits for its own answer.
