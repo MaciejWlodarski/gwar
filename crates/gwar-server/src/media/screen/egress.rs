@@ -497,6 +497,25 @@ impl Egress {
         key == 0 || higher + key as f64 * 8.0 / DEADLINE.as_secs_f64() <= self.plan()
     }
 
+    /// Can a batch of initial PLIs share one service opportunity without a
+    /// simultaneous keyframe burst overflowing admission or its release deadline?
+    /// Unknown sources reserve the existing probe floor until measured.
+    pub(super) fn keyframes_fit(&self, lanes: &[usize], rates: &[ShareRate]) -> bool {
+        let keys: usize = lanes
+            .iter()
+            .map(|&lane| match rates.get(lane).map_or(0, |r| r.largest_keyframe) {
+                0 => KEYFRAME_FLOOR,
+                key => key,
+            })
+            .sum();
+        let other: f64 = (0..self.lanes.len())
+            .filter(|lane| self.lanes[*lane].active() && !lanes.contains(lane))
+            .map(|lane| rates.get(lane).map_or(0.0, |r| r.average))
+            .sum();
+        let bytes = self.queued.saturating_add(keys);
+        bytes <= self.admission_bound() && other + bytes as f64 * 8.0 / DEADLINE.as_secs_f64() <= self.plan()
+    }
+
     /// Active lanes, most important first.
     pub(super) fn priority(&self) -> Vec<usize> {
         let mut lanes: Vec<usize> = (0..self.lanes.len()).filter(|&l| self.lanes[l].active()).collect();
@@ -879,6 +898,28 @@ mod tests {
         assert!(!e.keyframe_fits(1, &rates));
         e.focus(Some(1));
         assert!(e.keyframe_fits(1, &rates));
+    }
+
+    #[test]
+    fn initial_keyframe_batches_reserve_combined_admission_and_other_media() {
+        let now = Instant::now();
+        let mut e = egress(INITIAL_ESTIMATE, 3, now);
+        let mut rates = [ShareRate { largest_keyframe: 60_000, ..Default::default() }; 3];
+        assert!(e.keyframe_fits(0, &rates) && e.keyframe_fits(1, &rates));
+        assert!(!e.keyframes_fit(&[0, 1], &rates), "individually fitting frames can overflow together");
+        rates[0].largest_keyframe = 30_000;
+        rates[1].largest_keyframe = 30_000;
+        assert!(e.keyframes_fit(&[0, 1], &rates));
+        rates[2].average = 1_000_000.0;
+        assert!(!e.keyframes_fit(&[0, 1], &rates), "other active media keeps its release share");
+        rates[2].average = 0.0;
+        for n in 0..40 {
+            assert!(e.admit(2, packet(n, 0, n == 0, 1000, now), now).is_empty());
+        }
+        assert!(!e.keyframes_fit(&[0, 1], &rates), "already queued bytes keep their admission");
+        e.clear(2);
+        rates[0].largest_keyframe = 0;
+        assert!(!e.keyframes_fit(&[0, 1], &rates), "unknown keyframes reserve the probe floor");
     }
 
     #[test]

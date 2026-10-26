@@ -582,7 +582,7 @@ struct Watcher {
     pending: Vec<(u32, Arc<WatchGrant>, u64)>,
     connected: bool,
     created: Instant,
-    /// Space new publisher requests across this viewer's slots during bootstrap/recovery.
+    /// Last funded request; spaces retries and admission/credit-limited startup.
     keyframe_at: Option<Instant>,
     keyframes_started: Option<Instant>,
     focus: Option<String>,
@@ -1014,7 +1014,8 @@ impl Sfu {
             })
             .collect();
         pending.sort_unstable();
-        for (requested, _, slot, share) in pending {
+        let mut deferred = false;
+        for (requested, retry, slot, share) in pending {
             let Some(p) = self.publishers.get(&share) else { continue };
             // Another viewer can send this publisher's PLI between our request
             // and the next housekeeping tick. It satisfies the deferred request
@@ -1023,18 +1024,52 @@ impl Sfu {
             let coalesced = p.keyframes.pending || already_sent;
             let w = self.watchers.get_mut(&session).expect("watch found above");
             if !coalesced {
+                let mut rates = [ShareRate::default(); SCREEN_SLOTS];
+                for (i, s) in w.slots.iter().enumerate() {
+                    rates[i] = s.grant.as_ref().and_then(|g| self.rates.get(&g.share)).copied().unwrap_or_default();
+                }
+                let credits =
+                    self.budgets.get_mut(&session).map_or(VIEWER_KEYFRAMES_BURST, |budget| budget.available(now));
+                // Initial requests may share a service opportunity if their expected
+                // frames fit together and credits cover the remaining initial slots.
+                // Include recently requested frames even before they reach the queue.
+                let initial = w
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, s)| {
+                        s.asked.is_none()
+                            && s.grant.as_ref().is_some_and(|g| g.alive())
+                            && w.egress.paused(*i).is_none()
+                    })
+                    .count()
+                    .max(1);
+                let batch: Vec<_> = w
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, s)| {
+                        (i == slot || s.asked.is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_INTERVAL))
+                            .then_some(i)
+                    })
+                    .collect();
+                let prompt_initial = !deferred
+                    && !retry
+                    && credits >= initial as f64
+                    && w.egress.keyframes_fit(&batch, &rates[..w.slots.len()]);
                 // Coalescing spends neither a spacing opportunity nor viewer credit.
-                if w.keyframe_at.is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_INTERVAL) {
+                // Retries and tight startup retain the fair, spaced service path.
+                if !prompt_initial
+                    && w.keyframe_at.is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_INTERVAL)
+                {
+                    deferred = true;
                     continue;
                 }
-                if w.keyframes_started.is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_BOOTSTRAP) {
-                    let mut rates = [ShareRate::default(); SCREEN_SLOTS];
-                    for (i, s) in w.slots.iter().enumerate() {
-                        rates[i] = s.grant.as_ref().and_then(|g| self.rates.get(&g.share)).copied().unwrap_or_default();
-                    }
-                    if !w.egress.keyframe_fits(slot, &rates[..w.slots.len()]) {
-                        continue;
-                    }
+                if w.keyframes_started.is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_BOOTSTRAP)
+                    && !w.egress.keyframe_fits(slot, &rates[..w.slots.len()])
+                {
+                    deferred = true;
+                    continue;
                 }
                 let budget = self
                     .budgets
@@ -1042,6 +1077,7 @@ impl Sfu {
                     .or_insert_with(|| Bucket::new(VIEWER_KEYFRAMES_PER_SECOND, VIEWER_KEYFRAMES_BURST, now));
                 if !budget.take(1.0, now) {
                     self.publishers.get_mut(&share).expect("publisher found above").keyframes.budget_denied += 1;
+                    deferred = true;
                     continue;
                 }
                 w.keyframe_at = Some(now);
@@ -3384,6 +3420,41 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn initial_requests_keep_spacing_when_admission_or_credits_are_tight_and_retries_cannot_be_overtaken() {
+        for mode in ["admission", "credits", "retry", "older"] {
+            let (mut sfu, _, now, _) = recovery_fixture(&[1]).await;
+            let mut other = h264_ingress_fixture(now);
+            other.origin = ScreenOrigin::new(99, "other".into(), 1, false, false, 8_000_000);
+            assign(sfu.watchers.get_mut(&1).unwrap(), 1, WatchGrant::new(other.origin.clone()), 2, now);
+            sfu.publishers.insert("other".into(), other);
+            for name in ["h264", "other"] {
+                let size = if mode == "admission" { 60_000 } else { 1000 };
+                sfu.rates.insert(name.into(), ShareRate { largest_keyframe: size, ..Default::default() });
+            }
+            if mode == "credits" {
+                let mut budget = Bucket::new(VIEWER_KEYFRAMES_PER_SECOND, VIEWER_KEYFRAMES_BURST, now);
+                assert!(budget.take(VIEWER_KEYFRAMES_BURST - 1.0, now));
+                sfu.budgets.insert(1, budget);
+            }
+            if mode == "retry" {
+                sfu.watchers.get_mut(&1).unwrap().slots[1].asked = Some(now - WAITING_RETRY);
+            }
+            sfu.ask_keyframe(1, 0, now);
+            let at = now + Duration::from_millis(2);
+            if mode == "older" {
+                sfu.publishers.get_mut("h264").unwrap().keyframes.pending = false;
+                sfu.ask_keyframe(1, 0, now + Duration::from_millis(1));
+                assert!(sfu.watchers[&1].slots[0].keyframe_pending.is_some());
+            }
+            let credit = sfu.budgets.get_mut(&1).unwrap().available(at);
+            sfu.ask_keyframe(1, 1, at);
+            assert!(!sfu.publishers["other"].keyframes.pending, "mode={mode}");
+            assert!(sfu.watchers[&1].slots[1].keyframe_pending.is_some(), "mode={mode}");
+            assert_eq!(sfu.budgets.get_mut(&1).unwrap().available(at), credit, "mode={mode}");
+        }
+    }
+
+    #[tokio::test]
     async fn cold_keyframe_retries_preserve_credit_until_the_frame_fits_and_the_deferral_is_bounded() {
         let (mut sfu, _, _, _) = recovery_fixture(&[1]).await;
         let now = Instant::now();
@@ -3413,6 +3484,42 @@ pub(crate) mod tests {
     /// in tests/screen.rs cover delivery through real publisher peers.
     #[tokio::test]
     async fn generated_multi_publisher_requests_are_fair_bounded_and_budgeted() {
+        // Typical startup: 1-4 publishers, rotated request order, known small
+        // keyframes and fresh credits. Advance the same production throttle as
+        // the stress cases below; every initial PLI must start before 200 ms.
+        for slots in 1..=SCREEN_SLOTS {
+            for seed in 0..8usize {
+                let (mut sfu, _, now, _) = recovery_fixture(&[1]).await;
+                sfu.publishers.clear();
+                let names: Vec<_> = (0..slots).map(|i| format!("startup-{i}")).collect();
+                for (slot, name) in names.iter().enumerate() {
+                    let mut p = h264_ingress_fixture(now);
+                    p.origin = ScreenOrigin::new(100 + slot as u32, name.clone(), 1, false, false, 8_000_000);
+                    assign(
+                        sfu.watchers.get_mut(&1).unwrap(),
+                        slot,
+                        WatchGrant::new(p.origin.clone()),
+                        slot as u64,
+                        now,
+                    );
+                    sfu.rates
+                        .insert(name.clone(), ShareRate { largest_keyframe: (seed + 1) * 1024, ..Default::default() });
+                    sfu.publishers.insert(name.clone(), p);
+                }
+                for offset in 0..slots {
+                    sfu.ask_keyframe(1, (offset + seed) % slots, now);
+                }
+                let at = now + ALLOCATION_TICK;
+                sfu.retry_keyframes(1, at);
+                for name in &names {
+                    assert!(sfu.publishers[name].keyframes.due(at), "startup: {slots} publishers, seed {seed}, {name}");
+                    let slot = names.iter().position(|n| n == name).unwrap();
+                    assert!(sfu.watchers[&1].slots[slot].asked.unwrap() - now < Duration::from_millis(200));
+                }
+                assert!(at - now < Duration::from_millis(200));
+                assert_eq!(sfu.budgets.get_mut(&1).unwrap().available(now), VIEWER_KEYFRAMES_BURST - slots as f64);
+            }
+        }
         for seed in 0..32u64 {
             let (mut sfu, _, now, _) = recovery_fixture(&[1, 2]).await;
             let slots = 3 + ((seed >> 4) as usize % 2);
@@ -3523,6 +3630,93 @@ pub(crate) mod tests {
         assert!(sfu.watchers[&1].slots[0].keyframe_pending.is_some());
         assign(sfu.watchers.get_mut(&1).unwrap(), 0, WatchGrant::new(origin), 2, now + WAITING_RETRY);
         assert!(sfu.watchers[&1].slots[0].keyframe_pending.is_none(), "replacement cannot inherit old recovery");
+    }
+
+    #[tokio::test]
+    async fn empty_budget_four_slots_and_churn_obey_30s_and_15_pli_budget() {
+        // One viewer has no refill credit at t=0; all four publishers ignore PLIs.
+        // Older requests must survive fit deferral and floods on the first slot.
+        let (mut sfu, _, now, _) = recovery_fixture(&[1]).await;
+        sfu.publishers.clear();
+        let names: Vec<_> = (0..4).map(|i| format!("bound-{i}")).collect();
+        for (slot, name) in names.iter().enumerate() {
+            let mut p = h264_ingress_fixture(now);
+            p.origin = ScreenOrigin::new(100 + slot as u32, name.clone(), 1, false, false, 8_000_000);
+            assign(sfu.watchers.get_mut(&1).unwrap(), slot, WatchGrant::new(p.origin.clone()), slot as u64, now);
+            sfu.rates.insert(name.clone(), ShareRate { largest_keyframe: 200 * 1024, ..Default::default() });
+            sfu.publishers.insert(name.clone(), p);
+        }
+        let w = sfu.watchers.get_mut(&1).unwrap();
+        w.egress.set_estimate(100_000, now);
+        w.keyframes_started = Some(now);
+        let mut bucket = Bucket::new(VIEWER_KEYFRAMES_PER_SECOND, VIEWER_KEYFRAMES_BURST, now);
+        assert!(bucket.take(VIEWER_KEYFRAMES_BURST, now));
+        sfu.budgets.insert(1, bucket);
+        let mut first = [None; 4];
+        let mut total = 0;
+        for slot in 0..4 {
+            sfu.ask_keyframe(1, slot, now);
+        }
+        for tick in 0..=900 {
+            let at = now + ALLOCATION_TICK * tick;
+            // The noisy first slot cannot move ahead of any older request.
+            for _ in 0..10 {
+                sfu.ask_keyframe(1, 0, at);
+            }
+            sfu.retry_keyframes(1, at);
+            for (slot, name) in names.iter().enumerate() {
+                let p = sfu.publishers.get_mut(name).unwrap();
+                if p.keyframes.due(at) {
+                    assert!(p.keyframes.last.is_none_or(|last| at - last >= KEYFRAME_INTERVAL));
+                    p.keyframes.pending = false;
+                    p.keyframes.last = Some(at);
+                    p.keyframes.sent += 1;
+                    total += 1;
+                    first[slot].get_or_insert(at - now);
+                }
+            }
+            assert!(total as f64 <= (at - now).as_secs_f64() * VIEWER_KEYFRAMES_PER_SECOND + 1e-9);
+            if tick == 299 {
+                assert!(first.iter().all(Option::is_some), "30s bound: {first:?}");
+            }
+        }
+        eprintln!("BOUND empty credits, 4 slots, first PLIs: {first:?}; sent over 90s={total}");
+        assert!(first.iter().all(|delay| delay.unwrap() < Duration::from_secs(30)));
+        assert!(total <= 15, "waiting-slot retries must use the same viewer bucket");
+    }
+
+    #[tokio::test]
+    async fn deferred_keyframe_state_is_reclaimed_by_all_teardown_paths() {
+        for mode in ["release", "grant", "publisher", "viewer", "replacement"] {
+            let (mut sfu, origin, now, _) = recovery_fixture(&[1]).await;
+            sfu.watchers.get_mut(&1).unwrap().keyframe_at = Some(now);
+            sfu.ask_keyframe(1, 0, now);
+            assert!(sfu.watchers[&1].slots[0].keyframe_pending.is_some());
+            match mode {
+                "release" => {
+                    let run = sfu.watchers[&1].run;
+                    sfu.command(ScreenCmd::Release { session: 1, run, slot: 0 });
+                }
+                "grant" => {
+                    sfu.watchers[&1].slots[0].grant.as_ref().unwrap().end();
+                    sfu.housekeeping(now + ALLOCATION_TICK);
+                }
+                "publisher" => {
+                    origin.end();
+                    sfu.housekeeping(now + ALLOCATION_TICK);
+                    assert!(sfu.publishers.is_empty());
+                }
+                "viewer" => {
+                    sfu.watchers[&1].lease.end();
+                    sfu.housekeeping(now + ALLOCATION_TICK);
+                    assert!(sfu.watchers.is_empty());
+                }
+                "replacement" => assign(sfu.watchers.get_mut(&1).unwrap(), 0, WatchGrant::new(origin), 2, now),
+                _ => unreachable!(),
+            }
+            assert!(sfu.watchers.values().flat_map(|w| &w.slots).all(|s| s.keyframe_pending.is_none()), "mode={mode}");
+            eprintln!("CLEANUP {mode}: pending state removed");
+        }
     }
 
     #[tokio::test]

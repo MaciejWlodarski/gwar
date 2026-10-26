@@ -92,6 +92,8 @@ pub struct Publisher {
     tx: mpsc::Sender<Packet>,
     /// Keyframe requests (PLI/FIR) the server sent.
     pub keyframe_requests: Arc<AtomicU64>,
+    /// Receipt times of the server's keyframe requests, for startup latency checks.
+    pub request_times: Arc<Mutex<Vec<Instant>>>,
     /// Retransmissions sent on the RTX stream, answering the server's NACKs.
     pub repairs: Arc<AtomicU64>,
     /// Outgoing originals to lose on the way to the server.
@@ -157,6 +159,8 @@ impl Publisher {
         let (tx, mut commands) = mpsc::channel::<Packet>(4096);
         let keyframe_requests = Arc::new(AtomicU64::new(0));
         let requests = keyframe_requests.clone();
+        let request_times = Arc::new(Mutex::new(Vec::new()));
+        let received_at = request_times.clone();
         let repairs = Arc::new(AtomicU64::new(0));
         let repaired = repairs.clone();
         let loss = Loss::default();
@@ -183,6 +187,7 @@ impl Publisher {
                             }
                         }
                         Output::Event(Event::KeyframeRequest(_)) => {
+                            received_at.lock().unwrap().push(Instant::now());
                             requests.fetch_add(1, Ordering::Relaxed);
                         }
                         _ => {}
@@ -210,7 +215,7 @@ impl Publisher {
             }
         });
         tokio::time::timeout(Duration::from_secs(5), connected).await.expect("publish transport connects").unwrap();
-        Self { share: share.to_owned(), ssrc, rtx, tx, keyframe_requests, repairs, loss, task }
+        Self { share: share.to_owned(), ssrc, rtx, tx, keyframe_requests, request_times, repairs, loss, task }
     }
 
     pub async fn send(&self, packets: impl IntoIterator<Item = Packet>) {

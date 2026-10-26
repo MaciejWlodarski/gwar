@@ -722,3 +722,66 @@ async fn review_spaced_request_on_an_active_slot_is_not_lost() {
     );
     assert!(after > before, "spacing dropped an active slot's recovery request instead of deferring it");
 }
+
+/// Regression for the round-2 startup repro: connected SRTP transports, fresh
+/// credits and tiny static streams must not serialize different publishers' PLIs.
+#[tokio::test]
+async fn fresh_credit_startup_for_one_to_four_publishers_takes_under_200ms() {
+    use std::time::Instant;
+    let limit = Duration::from_millis(200);
+    for count in 1..=4 {
+        for trial in 0..5 {
+            let server = TestServer::start().await;
+            let mut bob = Client::connect(&server, "viewer").await;
+            let channel = seed_channel(&bob, "General");
+            let mut sources = Vec::new();
+            let mut shares = Vec::new();
+            for i in 0..count {
+                let mut source = Client::connect(&server, &format!("source-{i}")).await;
+                let share = source.share_in(channel).await;
+                source.publisher(&share).send(frame(1, 9000, true, 1, 1)).await;
+                sources.push(source);
+                shares.push(share);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            bob.viewer = Some(screen::Viewer::start(&mut bob, 1).await);
+            let mut granted = Vec::new();
+            let mut slots = Vec::new();
+            for share in &shares {
+                // Start before the grant round trip: peer receipt bounds server
+                // send latency too, without adding production timing probes.
+                granted.push(Instant::now());
+                let reply = bob.ok("screen.watch", json!({"share": share})).await;
+                slots.push(reply["slot"].as_u64().unwrap() as usize);
+            }
+            let mut first_pli = vec![None; count];
+            let mut first_key = vec![None; count];
+            let end = Instant::now() + Duration::from_secs(8);
+            while first_key.iter().any(Option::is_none) && Instant::now() < end {
+                for (i, source) in sources.iter().enumerate() {
+                    let publisher = source.publisher(&shares[i]);
+                    if first_pli[i].is_none() {
+                        let observed = publisher.request_times.lock().unwrap().first().copied();
+                        if let Some(at) = observed {
+                            first_pli[i] = Some(at.saturating_duration_since(granted[i]));
+                            publisher.send(frame(2, 12000, true, 1, 10 + i as u8)).await;
+                        }
+                    }
+                }
+                for (slot, packet) in bob.viewer.as_mut().unwrap().collect(Duration::from_millis(1)).await {
+                    if packet.payload[2] >= 10 {
+                        let i = slots.iter().position(|s| *s == slot).unwrap();
+                        first_key[i].get_or_insert(Instant::now().saturating_duration_since(granted[i]));
+                    }
+                }
+            }
+            eprintln!(
+                "STARTUP publishers={count} trial={trial} grant_to_pli={first_pli:?} grant_to_forwarded_keyframe={first_key:?}"
+            );
+            assert!(
+                first_pli.iter().chain(&first_key).all(|delay| delay.is_some_and(|delay| delay < limit)),
+                "fresh-credit startup exceeds 200ms: publishers={count}, trial={trial}, PLI={first_pli:?}, keyframe={first_key:?}"
+            );
+        }
+    }
+}

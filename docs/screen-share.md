@@ -3597,7 +3597,14 @@ without sending ten PLIs, delaying the next recovery by the six-second refill.
 Debug samples include PLI credit denials and per-viewer egress counters/waiting-slot
 bits to distinguish queue recovery from ingress enforcement or aggregate-budget pauses.
 
-A viewer also spaces new keyframe requests across its slots by at least 500 ms.
+A viewer spaces retries and admission/credit-limited initial keyframe requests
+across its slots by at least 500 ms. Initial requests for different publishers
+share a service opportunity when credits cover the remaining initial slots and
+their combined expected keyframes fit admission and the 400 ms release deadline.
+The fit check includes frames requested in the preceding 500 ms, already queued
+bytes and the measured average of other active media. Unknown sizes reserve the
+existing 200 KiB probe floor for this batch check. Serviceable small-keyframe
+startup therefore does not incur one 500 ms delay per additional publisher.
 A new multi-share watch used to solicit all its large keyframes together into
 one cold 2.5 Mb/s egress estimator and its bounded queue. Queue evictions could
 then trigger another simultaneous batch and exhaust recovery credits. Deferred
@@ -3618,12 +3625,17 @@ its receive stream, the conservative scheduling bound is **30 s** from the reque
 slots, even an empty viewer bucket supplies four credits in at most 4 × 6 s;
 allow 100 ms per credit for the housekeeping tick, up to 5 s for bootstrap fit
 deferral, and 500 ms for the publisher throttle: 29.9 s in total. With available
-credits and no fit deferral, four slots need at most 2.9 s by the same conservative
-calculation (four 600 ms service opportunities plus the publisher throttle).
-Coalescing can shorten these bounds. They assume the task continues receiving
-its normal 100 ms housekeeping service; they bound PLI requests, not a publisher's
-response. New reports, retries and replacement assignments join behind older
-requests, so churn cannot extend their queue position.
+credits and no fit deferral, the spaced fallback for four slots needs at most
+2.9 s by the same conservative calculation (four 600 ms service opportunities
+plus the publisher throttle). Fresh-credit initial requests whose combined
+keyframes fit start together; generated 1-4-publisher scenarios require scheduling
+under 200 ms, and the connected-SRTP regression checks both PLI receipt and
+forwarded keyframe receipt under 200 ms. A prompt initial request cannot bypass
+the spacing held by an older deferred retry. Coalescing can shorten these bounds.
+They assume the task continues receiving its normal 100 ms housekeeping service;
+they bound PLI requests, not a publisher's response. New reports, retries and
+replacement assignments join behind older requests, so churn cannot extend their
+queue position.
 
 During the first 5 s after a viewer's first keyframe request, a known keyframe
 that cannot fit the current per-slot release share within 400 ms is deferred
@@ -3636,6 +3648,26 @@ are allowed. The guard ends when the estimate fits the frame or after those 5 s,
 so a conservative estimate cannot suppress recovery permanently. Rate samples
 come from the existing allocation tick. Probe targets and pacing limits are not
 raised by this guard.
+
+The round-2 startup regression uses connected SRTP peers, fresh credits and
+small established static sources that answer the first PLI with one complete
+keyframe. Five trials each cover 1-4 publishers. Timing starts before the watch
+grant round trip and ends at the publisher's PLI receipt or viewer's keyframe
+receipt; every publisher must stay below 200 ms. The unfixed branch reproduced
+609.7/615.2 ms for the second publisher's PLI/keyframe. With prompt admission:
+
+| Publishers | Last publisher median PLI receipt | Last publisher median keyframe receipt |
+| --- | ---: | ---: |
+| 1 | 28.1 ms | 31.1 ms |
+| 2 | 28.1 ms | 32.1 ms |
+| 3 | 27.0 ms | 31.2 ms |
+| 4 | 27.4 ms | 31.9 ms |
+
+The slowest receipt across those 20 trials was 32.0 ms for a PLI and 36.0 ms for
+a keyframe. Generated scheduling coverage adds 32 fresh-credit cases (1-4 slots,
+rotated request order and measured keyframe sizes) to the 32 adversarial cases.
+The exhausted-budget check still schedules first PLIs at 6/12/18/24 s and sends
+15 PLIs over 90 s; five independent teardown paths clear deferred state.
 
 #### Matched local audit soaks, 2026-10-26
 
@@ -3688,6 +3720,26 @@ thus remain effective with fair, persistent recovery. This shorter, unpaired
 check is not a replacement for the matched ten-minute measurements. Final
 artifacts are in `/tmp/gwar-pr173-fix/soak-final/`; the preceding exploratory run
 is retained separately in `/tmp/gwar-pr173-fix/soak/`.
+
+The round-2 prompt-startup follow-up used the same driver for five minutes,
+with main `fe832443` integrated. The same analyzer measured
+**0.72%** frozen stream-time (previous follow-up: 0.63%),
+**0.28%** outside the first 5 s after scheduled churn,
+and a **7.68 s** longest sampled freeze. Viewer-credit denials were
+**0**; ingress overruns, dispatch drops and budget pauses were also zero.
+Mean CPU was 17.80% of one core (peak 32.82%),
+with peak RSS 36.17 MiB. This is another short, unpaired check;
+artifacts are in `/tmp/gwar-pr173-r2-fix/soak/`.
+
+Validation passed the required no-default-features test check, 139 focused screen
+tests, 86 core tests, all three full simulation matrices, 16 SRTP screen tests,
+15 watch-link tests, three preauth tests, the Chromium/WebKit fixed-1080p60 H.264
+gate and all 1,522 web tests after integrating main. The protocol suite passed
+58 of 59 tests: `malformed_floods_use_up_the_allowance_and_then_the_connection`
+failed while reading disconnect/close. Five isolated trials at the original
+`ad466518` head reproduced that failure three times and passed twice, using a
+separate clean target. The protocol harness remains unchanged. Logs and the
+structured results are in `/tmp/gwar-pr173-r2-fix/validation.json`.
 
 The earlier deleted-log soak reported 8.5% frozen stream-time, 85.8% peak CPU,
 about 2.5 CPU percentage points per watched stream, and 42.3 MiB peak RSS. That
