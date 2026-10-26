@@ -267,29 +267,92 @@ fn detect_onsets(samples: &[(f64, f32)]) -> Vec<Onset> {
 
 /// The longest wait for both voice transports before markers are armed (`LATENCY_WAIT_CONNECTED`).
 const CONNECT_WAIT: Duration = Duration::from_secs(30);
+/// At most 250 s of markers: the playout record (16 bytes a sample) stays below about 250 MB.
+const MAX_MARKERS: usize = 1000;
 
-/// Room for every receiver playout sample of a run, allocated and written before the device
-/// starts, so the callback never grows or first touches it. Grown in the callback, the buffer
-/// reallocated at each power of two; the move at 2^20 samples (21.8 s) coincided with a single
-/// underrun and a lasting 15 ms latency step in about one gate run in six (docs/latency.md). A
-/// reservation alone is not enough: with transparent huge pages, the first write to each 2 MB
-/// of it (every 2.7 s) stalled the callback for up to 17 ms.
-fn playout_record(run_for: Duration, wait_connected: bool) -> Vec<(f64, f32)> {
-    let wait = if wait_connected { CONNECT_WAIT } else { Duration::ZERO };
-    // Voice signaling and device start come on top of the connection wait.
-    let samples = ((run_for + wait + Duration::from_secs(2)).as_secs_f64() * RATE as f64) as usize;
-    let mut record = Vec::with_capacity(samples);
-    record.resize(samples, (0.0, 0.0));
-    record.clear();
-    record
+/// A fixed-capacity buffer for the device callbacks: allocated and written once before the
+/// devices start, so a callback never grows or first touches it. Past its capacity it counts
+/// what it could not keep. Grown in the callback, the playout record reallocated at each power
+/// of two; the move at 2^20 samples (21.8 s) coincided with a single underrun and a lasting
+/// 15 ms latency step in about one gate run in six (docs/latency.md). A reservation alone is not
+/// enough: with transparent huge pages, the first write to each 2 MB of it (every 2.7 s)
+/// stalled the callback for up to 17 ms.
+struct Record<T> {
+    items: Vec<T>,
+    dropped: u64,
+}
+impl<T: Copy> Record<T> {
+    fn new(capacity: usize, fill: T) -> Self {
+        let mut items = Vec::with_capacity(capacity);
+        items.resize(items.capacity(), fill);
+        items.clear();
+        Self { items, dropped: 0 }
+    }
+
+    /// Keeps `item` if there is room; never reallocates.
+    fn push(&mut self, item: T) -> bool {
+        if self.items.len() < self.items.capacity() {
+            self.items.push(item);
+            true
+        } else {
+            self.dropped += 1;
+            false
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        self.items.capacity()
+    }
+
+    /// Capacity, use and overflow, for the run's JSON.
+    fn report(&self) -> serde_json::Value {
+        serde_json::json!({
+            "capacity_samples": self.capacity(),
+            "recorded_samples": self.len(),
+            "overflow_samples": self.dropped,
+        })
+    }
+}
+impl<T> std::ops::Deref for Record<T> {
+    type Target = [T];
+    fn deref(&self) -> &[T] {
+        &self.items
+    }
+}
+impl<T: Serialize> Serialize for Record<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.items.serialize(serializer)
+    }
 }
 
-#[derive(Default)]
+/// Room for every receiver playout sample of a run: from the device start through voice
+/// signaling, the connection wait, warmup, markers and matching window, until the devices are
+/// stopped. Anything beyond is counted as overflow and fails the run.
+fn playout_record(run_for: Duration, wait_connected: bool) -> Record<(f64, f32)> {
+    let wait = if wait_connected { CONNECT_WAIT } else { Duration::ZERO };
+    let samples = ((run_for + wait + Duration::from_secs(5)).as_secs_f64() * RATE as f64) as usize;
+    Record::new(samples, (0.0, 0.0))
+}
+
 struct Measurements {
-    captures: Vec<Marker>,
-    samples: Vec<(f64, f32)>,
+    captures: Record<Marker>,
+    samples: Record<(f64, f32)>,
     underflows: usize,
     device: DeviceTiming,
+}
+impl Measurements {
+    fn sender(markers: usize) -> Self {
+        Self::new(markers, Record::new(0, (0.0, 0.0)))
+    }
+
+    fn receiver(samples: Record<(f64, f32)>) -> Self {
+        Self::new(0, samples)
+    }
+
+    fn new(markers: usize, samples: Record<(f64, f32)>) -> Self {
+        let captures = Record::new(markers, Marker { capture_s: 0.0, identity: 0 });
+        Self { captures, samples, underflows: 0, device: DeviceTiming::new() }
+    }
 }
 
 /// Fake device callbacks that started late or ran long. A late callback is followed by
@@ -297,17 +360,20 @@ struct Measurements {
 const LATE_CALLBACK: Duration = Duration::from_millis(5);
 const LONG_CALLBACK: Duration = Duration::from_millis(2);
 const MAX_SLOW_CALLBACKS: usize = 32;
-#[derive(Default, Serialize)]
+#[derive(Serialize)]
 struct DeviceTiming {
     callbacks: u64,
     max_lateness_ms: f64,
     max_busy_ms: f64,
     late_over_5ms: u64,
     busy_over_2ms: u64,
-    /// The first slow callbacks, on the measurement clock.
-    slow: Vec<SlowCallback>,
+    /// The first slow callbacks, on the measurement clock; `slow_dropped` counts the rest.
+    slow: Record<SlowCallback>,
+    slow_dropped: u64,
+    /// Why the callbacks ended (`stopped` or `mic_ring_full`); null while running.
+    termination: Option<&'static str>,
 }
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 struct SlowCallback {
     at_s: f64,
     lateness_ms: f64,
@@ -316,6 +382,21 @@ struct SlowCallback {
     recorded_samples: usize,
 }
 impl DeviceTiming {
+    fn new() -> Self {
+        let empty = SlowCallback { at_s: 0.0, lateness_ms: 0.0, busy_ms: 0.0, recorded_samples: 0 };
+        Self {
+            callbacks: 0,
+            max_lateness_ms: 0.0,
+            max_busy_ms: 0.0,
+            late_over_5ms: 0,
+            busy_over_2ms: 0,
+            slow: Record::new(MAX_SLOW_CALLBACKS, empty),
+            slow_dropped: 0,
+            termination: None,
+        }
+    }
+
+    /// Constant time and allocation-free, so `busy` may end just before it.
     fn record(&mut self, at_s: f64, lateness: Duration, busy: Duration, recorded_samples: usize) {
         self.callbacks += 1;
         let (lateness_ms, busy_ms) = (lateness.as_secs_f64() * 1000.0, busy.as_secs_f64() * 1000.0);
@@ -324,11 +405,46 @@ impl DeviceTiming {
         let (late, long) = (lateness > LATE_CALLBACK, busy > LONG_CALLBACK);
         self.late_over_5ms += u64::from(late);
         self.busy_over_2ms += u64::from(long);
-        if (late || long) && self.slow.len() < MAX_SLOW_CALLBACKS {
-            self.slow.push(SlowCallback { at_s, lateness_ms, busy_ms, recorded_samples });
+        if (late || long) && !self.slow.push(SlowCallback { at_s, lateness_ms, busy_ms, recorded_samples }) {
+            self.slow_dropped += 1;
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Termination {
+    Stopped,
+    MicRingFull,
+}
+impl Termination {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::MicRingFull => "mic_ring_full",
+        }
+    }
+}
+
+/// Stops a fake device from outside and waits until its last callback has stored its
+/// measurements.
+#[derive(Clone, Default)]
+struct DeviceControl {
+    stop: Arc<AtomicBool>,
+    finished: Arc<AtomicBool>,
+}
+impl DeviceControl {
+    async fn stop(&self) -> anyhow::Result<()> {
+        self.stop.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !self.finished.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .context("fake audio device did not stop within 2 seconds")
+    }
+}
+
 struct FakeIo {
     markers_ready: Arc<AtomicBool>,
     data: Arc<Mutex<Measurements>>,
@@ -337,7 +453,7 @@ struct FakeIo {
     epoch: Instant,
     /// When both devices' first callbacks run.
     start: Instant,
-    stop: Arc<AtomicBool>,
+    control: DeviceControl,
     count: usize,
     delay_samples: usize,
     callback_jitter: bool,
@@ -356,89 +472,146 @@ impl Drop for Guard {
         }
     }
 }
-impl AudioIo for FakeIo {
-    fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
-        let (mut mic_tx, mic) = RingBuffer::new(RATE);
-        let (speaker, mut speaker_rx) = RingBuffer::new(RATE / 2);
-        let output = Arc::new(OutputTiming::default());
-        let timing = output.clone();
-        let stop = self.stop.clone();
-        let thread_stop = stop.clone();
-        let thread = thread::Builder::new().name("latency-audio".into()).spawn(move || {
-            // Both devices start on the same phase; only the receiver varies its
-            // block sizes when callback jitter is enabled.
-            let start = self.start;
-            if let Some(wait) = start.checked_duration_since(Instant::now()) {
+
+/// A ring whose pages have all been written once, so the device's first pass through it does
+/// not fault them in.
+fn prefaulted_ring<T: Copy>(capacity: usize, fill: T) -> (rtrb::Producer<T>, rtrb::Consumer<T>) {
+    let (mut producer, mut consumer) = RingBuffer::new(capacity);
+    while producer.push(fill).is_ok() {}
+    while consumer.pop().is_ok() {}
+    (producer, consumer)
+}
+
+/// One fake device's callback state. Everything a callback writes is allocated before the
+/// first one runs.
+struct Callbacks {
+    io: Box<FakeIo>,
+    mic: rtrb::Producer<CaptureSample>,
+    speaker: rtrb::Consumer<f32>,
+    timing: Arc<OutputTiming>,
+    /// Delays decoded audio, including silence and carrier, before playout. Capture/playout
+    /// timestamps always remain the actual callback times.
+    delay: DelayLine,
+    position: usize,
+    callback: usize,
+    marker_start: Option<usize>,
+    stats: DeviceTiming,
+}
+impl Callbacks {
+    fn new(
+        io: Box<FakeIo>,
+        mic: rtrb::Producer<CaptureSample>,
+        speaker: rtrb::Consumer<f32>,
+        timing: Arc<OutputTiming>,
+    ) -> Self {
+        let delay = DelayLine::new(io.delay_samples);
+        // The first lock may allocate (a lazily boxed pthread mutex on macOS): take it here.
+        drop(io.data.lock().unwrap());
+        Self {
+            io,
+            mic,
+            speaker,
+            timing,
+            delay,
+            position: 0,
+            callback: 0,
+            marker_start: None,
+            stats: DeviceTiming::new(),
+        }
+    }
+
+    fn due(&self) -> Instant {
+        self.io.start + Duration::from_secs_f64(self.position as f64 / RATE as f64)
+    }
+
+    /// One callback, run at `now`.
+    fn run(&mut self, now: Instant) -> Result<(), Termination> {
+        let io = &*self.io;
+        // Only the receiver varies its block sizes when callback jitter is enabled.
+        let block = if io.callback_jitter { [480, 960, 240][self.callback % 3] } else { BLOCK };
+        let lateness = now.saturating_duration_since(self.due());
+        if self.marker_start.is_none() && io.markers_ready.load(Ordering::Acquire) {
+            self.marker_start = Some(self.position + io.warmup_samples);
+        }
+        let warmup = self.marker_start.unwrap_or(usize::MAX);
+        let mut missing = 0;
+        let mut data = io.data.lock().unwrap();
+        let recorded = data.samples.len();
+        for i in 0..block {
+            let at = self.position + i;
+            let in_marker = at >= warmup && (at - warmup) / PERIOD < io.count && (at - warmup) % PERIOD < MARKER;
+            if io.tone && at >= warmup && (at - warmup).is_multiple_of(PERIOD) && data.captures.len() < io.count {
+                data.captures.push(Marker {
+                    capture_s: (now - io.epoch).as_secs_f64() + i as f64 / RATE as f64,
+                    identity: (at - warmup) / PERIOD % TONES.len(),
+                });
+            }
+            let frequency = if in_marker { TONES[(at - warmup) / PERIOD % TONES.len()] } else { 400.0 };
+            let amplitude = if in_marker { 0.6 } else { 0.08 };
+            let value = if io.tone {
+                (at as f64 * frequency * std::f64::consts::TAU / RATE as f64).sin() as f32 * amplitude
+            } else {
+                0.0
+            };
+            if self.mic.push(CaptureSample { captured_at: Instant::now(), position: at as u64, value }).is_err() {
+                return Err(Termination::MicRingFull);
+            }
+            let value = self.speaker.pop().unwrap_or_else(|_| {
+                data.underflows += 1;
+                missing += 1;
+                0.0
+            });
+            if !io.tone {
+                let playout_s = (now - io.epoch).as_secs_f64() + i as f64 / RATE as f64;
+                data.samples.push((playout_s, self.delay.process(value)));
+            }
+        }
+        drop(data);
+        self.timing.report(block, missing);
+        self.stats.record((now - io.epoch).as_secs_f64(), lateness, now.elapsed(), recorded);
+        self.callback += 1;
+        self.position += block;
+        Ok(())
+    }
+
+    /// Every exit stores the measurements and why the callbacks ended.
+    fn finish(mut self, termination: Termination) {
+        self.stats.termination = Some(termination.name());
+        self.io.data.lock().unwrap().device = self.stats;
+        self.io.control.finished.store(true, Ordering::Release);
+    }
+
+    fn run_until_stopped(mut self) {
+        // Both devices start on the same phase.
+        if let Some(wait) = self.io.start.checked_duration_since(Instant::now()) {
+            thread::sleep(wait);
+        }
+        let stop = self.io.control.stop.clone();
+        let termination = loop {
+            if stop.load(Ordering::Relaxed) {
+                break Termination::Stopped;
+            }
+            if let Err(termination) = self.run(Instant::now()) {
+                break termination;
+            }
+            if let Some(wait) = self.due().checked_duration_since(Instant::now()) {
                 thread::sleep(wait);
             }
-            let mut position = 0usize;
-            // Delay decoded audio, including silence and carrier, before playout.
-            // Capture/playout timestamps always remain the actual callback times.
-            let mut delay = DelayLine::new(self.delay_samples);
-            let mut callback = 0;
-            let mut marker_start = None;
-            let mut timing_stats = DeviceTiming::default();
-            while !thread_stop.load(Ordering::Relaxed) {
-                let block = if self.callback_jitter { [480, 960, 240][callback % 3] } else { BLOCK };
-                let mut missing = 0;
-                let now = Instant::now();
-                let lateness =
-                    now.saturating_duration_since(start + Duration::from_secs_f64(position as f64 / RATE as f64));
-                if marker_start.is_none() && self.markers_ready.load(Ordering::Acquire) {
-                    marker_start = Some(position + self.warmup_samples);
-                }
-                let warmup = marker_start.unwrap_or(usize::MAX);
-                let mut data = self.data.lock().unwrap();
-                let recorded = data.samples.len();
-                for i in 0..block {
-                    let at = position + i;
-                    let in_marker =
-                        at >= warmup && (at - warmup) / PERIOD < self.count && (at - warmup) % PERIOD < MARKER;
-                    if self.tone
-                        && at >= warmup
-                        && (at - warmup).is_multiple_of(PERIOD)
-                        && data.captures.len() < self.count
-                    {
-                        data.captures.push(Marker {
-                            capture_s: (now - self.epoch).as_secs_f64() + i as f64 / RATE as f64,
-                            identity: (at - warmup) / PERIOD % TONES.len(),
-                        });
-                    }
-                    let frequency = if in_marker { TONES[(at - warmup) / PERIOD % TONES.len()] } else { 400.0 };
-                    let amplitude = if in_marker { 0.6 } else { 0.08 };
-                    let value = if self.tone {
-                        (at as f64 * frequency * std::f64::consts::TAU / RATE as f64).sin() as f32 * amplitude
-                    } else {
-                        0.0
-                    };
-                    if mic_tx
-                        .push(CaptureSample { captured_at: std::time::Instant::now(), position: at as u64, value })
-                        .is_err()
-                    {
-                        return;
-                    }
-                    let value = speaker_rx.pop().unwrap_or_else(|_| {
-                        data.underflows += 1;
-                        missing += 1;
-                        0.0
-                    });
-                    if !self.tone {
-                        data.samples
-                            .push(((now - self.epoch).as_secs_f64() + i as f64 / RATE as f64, delay.process(value)));
-                    }
-                }
-                drop(data);
-                timing.report(block, missing);
-                timing_stats.record((now - self.epoch).as_secs_f64(), lateness, now.elapsed(), recorded);
-                callback += 1;
-                position += block;
-                let due = start + Duration::from_secs_f64(position as f64 / RATE as f64);
-                if let Some(wait) = due.checked_duration_since(Instant::now()) {
-                    thread::sleep(wait);
-                }
-            }
-            self.data.lock().unwrap().device = timing_stats;
-        })?;
+        };
+        self.finish(termination);
+    }
+}
+
+impl AudioIo for FakeIo {
+    fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
+        let blank = CaptureSample { captured_at: Instant::now(), position: 0, value: 0.0 };
+        let (mic_tx, mic) = prefaulted_ring(RATE, blank);
+        let (speaker, speaker_rx) = prefaulted_ring(RATE / 2, 0.0);
+        let output = Arc::new(OutputTiming::default());
+        let stop = self.control.stop.clone();
+        let callbacks = Callbacks::new(self, mic_tx, speaker_rx, output.clone());
+        let thread =
+            thread::Builder::new().name("latency-audio".into()).spawn(move || callbacks.run_until_stopped())?;
         Ok(AudioPorts { mic, speaker, output, _guard: Box::new(Guard { stop, thread: Some(thread) }) })
     }
 }
@@ -530,6 +703,7 @@ async fn main() -> anyhow::Result<()> {
     let count: usize = args.next().map(|s| s.parse()).transpose().context("invalid marker count")?.unwrap_or(100);
     anyhow::ensure!(args.next().is_none(), "usage: latency output.csv [marker-count]");
     anyhow::ensure!(count > 0, "marker count must be positive");
+    anyhow::ensure!(count <= MAX_MARKERS, "marker count must be at most {MAX_MARKERS}");
     let remote = match (std::env::var("LATENCY_URL"), std::env::var("LATENCY_SERVER")) {
         (Ok(url), Ok(addr)) => Some((url, addr.parse().context("LATENCY_SERVER must be IP:port")?)),
         (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => None,
@@ -716,11 +890,9 @@ async fn run(
             + count as f64 * PERIOD as f64 / RATE as f64
             + MATCH_WINDOW_MS / 1000.0,
     );
-    let sent = Arc::new(Mutex::new(Measurements::default()));
-    let heard = Arc::new(Mutex::new(Measurements {
-        samples: playout_record(run_for, settings.wait_connected),
-        ..Measurements::default()
-    }));
+    let sent = Arc::new(Mutex::new(Measurements::sender(count)));
+    let heard = Arc::new(Mutex::new(Measurements::receiver(playout_record(run_for, settings.wait_connected))));
+    let controls = [DeviceControl::default(), DeviceControl::default()];
     // After the screen load, whose start can take seconds, and the playout record: a device
     // that starts late runs ahead to catch up and overflows its ring.
     let start = Instant::now() + Duration::from_millis(200);
@@ -731,7 +903,7 @@ async fn run(
             tone,
             epoch,
             start,
-            stop: Arc::new(AtomicBool::new(false)),
+            control: controls[usize::from(!tone)].clone(),
             count,
             delay_samples,
             callback_jitter,
@@ -800,6 +972,10 @@ async fn run(
             ));
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Before any blocking write: recording ends here, within the playout record's budget.
+    for control in &controls {
+        control.stop().await?;
     }
     std::fs::write(format!("{output}.timeline.csv"), timeline)?;
     let receiver_stats = vb.stats();
@@ -928,11 +1104,18 @@ async fn run(
         "warmup_samples": settings.warmup_samples,
     });
     metadata["receiver_device"] = serde_json::to_value(&heard.device)?;
+    metadata["receiver_record"] = heard.samples.report();
     metadata["sender_device"] = serde_json::to_value(&sent.device)?;
     metadata["sframe"] = serde_json::json!(settings.sframe);
     metadata["screen"] = serde_json::json!(screen);
     metadata["receiver_sframe"] = serde_json::to_value(crypto)?;
     std::fs::write(format!("{output}.json"), serde_json::to_string_pretty(&metadata)?)?;
+    anyhow::ensure!(
+        heard.samples.dropped == 0,
+        "the playout record overflowed by {} samples (capacity {}); see {output}.json",
+        heard.samples.dropped,
+        heard.samples.capacity()
+    );
     anyhow::ensure!(
         matching.rejected.is_empty(),
         "rejected {} onsets below {:.3} ms; see {output}.json",
@@ -954,6 +1137,62 @@ async fn run(
         "no sender talking indicator; see {output}.json"
     );
     Ok(())
+}
+
+/// Counts the allocations made on one thread while it runs a closure.
+#[cfg(test)]
+mod counting {
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        cell::Cell,
+    };
+
+    thread_local! {
+        static COUNTING: Cell<bool> = const { Cell::new(false) };
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    struct Counting;
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            note();
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            note();
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            note();
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: Counting = Counting;
+
+    fn note() {
+        let _ = COUNTING.try_with(|on| {
+            if on.get() {
+                COUNT.with(|count| count.set(count.get() + 1));
+            }
+        });
+    }
+
+    /// Allocations and reallocations made on this thread while `run` runs.
+    pub fn allocations(run: impl FnOnce()) -> u64 {
+        COUNT.with(|count| count.set(0));
+        COUNTING.with(|on| on.set(true));
+        run();
+        COUNTING.with(|on| on.set(false));
+        COUNT.with(Cell::get)
+    }
 }
 
 #[cfg(test)]
@@ -1052,11 +1291,11 @@ mod tests {
             let io = || {
                 Box::new(FakeIo {
                     markers_ready: Arc::new(AtomicBool::new(false)),
-                    data: Arc::new(Mutex::new(Measurements::default())),
+                    data: Arc::new(Mutex::new(Measurements::receiver(Record::new(RATE * 20, (0.0, 0.0))))),
                     tone: false,
                     epoch,
                     start: Instant::now() + Duration::from_millis(50),
-                    stop: Arc::new(AtomicBool::new(false)),
+                    control: DeviceControl::default(),
                     count: 1,
                     delay_samples: 0,
                     callback_jitter: false,
@@ -1184,7 +1423,7 @@ mod tests {
     #[test]
     fn playout_record_holds_the_longest_run_without_growing() {
         let run_for = Duration::from_secs(43); // 15 s warmup, 100 markers
-        for (wait_connected, seconds) in [(false, 45), (true, 75)] {
+        for (wait_connected, seconds) in [(false, 48), (true, 78)] {
             let record = playout_record(run_for, wait_connected);
             assert!(record.is_empty());
             assert!(record.capacity() >= seconds * RATE, "{}", record.capacity());
@@ -1192,8 +1431,23 @@ mod tests {
     }
 
     #[test]
+    fn a_full_record_counts_overflow_and_never_grows() {
+        let mut record = Record::new(3, 0u8);
+        let capacity = record.capacity();
+        let kept: Vec<_> = (0..5).map(|i| record.push(i)).collect();
+        assert_eq!(&kept[..capacity], vec![true; capacity]);
+        assert!(kept[capacity..].iter().all(|kept| !kept));
+        assert_eq!((record.capacity(), record.len(), record.dropped), (capacity, capacity, (5 - capacity) as u64));
+        assert_eq!(
+            record.report(),
+            serde_json::json!({"capacity_samples": capacity, "recorded_samples": capacity,
+                "overflow_samples": 5 - capacity})
+        );
+    }
+
+    #[test]
     fn device_timing_keeps_the_first_slow_callbacks_and_counts_all() {
-        let mut timing = DeviceTiming::default();
+        let mut timing = DeviceTiming::new();
         let ms = Duration::from_millis;
         timing.record(1.0, ms(1), Duration::from_micros(30), 0);
         assert!(timing.slow.is_empty());
@@ -1202,9 +1456,76 @@ mod tests {
         }
         timing.record(50.0, ms(1), ms(17), 1 << 21);
         assert_eq!((timing.callbacks, timing.late_over_5ms, timing.busy_over_2ms), (42, 40, 41));
-        assert_eq!(timing.slow.len(), MAX_SLOW_CALLBACKS);
+        assert_eq!((timing.slow.len(), timing.slow_dropped), (MAX_SLOW_CALLBACKS, 41 - MAX_SLOW_CALLBACKS as u64));
         assert_eq!(timing.slow[0].recorded_samples, 1 << 20);
         assert!((timing.max_busy_ms - 17.0).abs() < 1e-9 && (timing.max_lateness_ms - 6.0).abs() < 1e-9);
+    }
+
+    /// A fake device's callbacks with its own measurements, started now, markers armed.
+    fn device(
+        tone: bool,
+        markers: usize,
+        samples: usize,
+        mic_ring: usize,
+    ) -> (Callbacks, rtrb::Consumer<CaptureSample>, rtrb::Producer<f32>, Arc<Mutex<Measurements>>, DeviceControl) {
+        let now = Instant::now();
+        let data = Arc::new(Mutex::new(Measurements::new(markers, Record::new(samples, (0.0, 0.0)))));
+        let control = DeviceControl::default();
+        let io = Box::new(FakeIo {
+            markers_ready: Arc::new(AtomicBool::new(true)),
+            data: data.clone(),
+            tone,
+            epoch: now,
+            start: now,
+            control: control.clone(),
+            count: markers,
+            delay_samples: 0,
+            callback_jitter: false,
+            warmup_samples: 0,
+        });
+        let (mic_tx, mic) = prefaulted_ring(mic_ring, CaptureSample { captured_at: now, position: 0, value: 0.0 });
+        let (speaker, speaker_rx) = prefaulted_ring(RATE / 2, 0.0);
+        (Callbacks::new(io, mic_tx, speaker_rx, Arc::new(OutputTiming::default())), mic, speaker, data, control)
+    }
+
+    #[test]
+    fn callbacks_never_allocate_even_when_slow_or_full() {
+        // The receiver's record holds ten callbacks; forty run, every one late.
+        let (mut receiver, mut mic, mut speaker, heard, _) = device(false, 0, 10 * BLOCK, RATE);
+        let (mut sender, mut sender_mic, _, sent, _) = device(true, 2, 0, RATE);
+        let capacity = heard.lock().unwrap().samples.capacity();
+        assert_eq!(counting::allocations(|| drop(std::hint::black_box(Vec::<u8>::with_capacity(8)))), 1);
+        let allocations = counting::allocations(|| {
+            for _ in 0..40 {
+                for _ in 0..BLOCK / 2 {
+                    let _ = speaker.push(0.25);
+                }
+                receiver.run(receiver.due() + Duration::from_millis(6)).unwrap();
+                sender.run(sender.due()).unwrap();
+                while mic.pop().is_ok() {}
+                while sender_mic.pop().is_ok() {}
+            }
+        });
+        assert_eq!(allocations, 0);
+        let heard = heard.lock().unwrap();
+        assert_eq!(heard.samples.capacity(), capacity, "the record never grows");
+        assert_eq!(heard.samples.dropped, (40 * BLOCK - capacity) as u64);
+        assert_eq!(heard.underflows, 40 * BLOCK / 2);
+        assert_eq!((receiver.stats.callbacks, receiver.stats.late_over_5ms), (40, 40));
+        assert_eq!(receiver.stats.slow_dropped, 40 - MAX_SLOW_CALLBACKS as u64);
+        assert_eq!(sent.lock().unwrap().captures.len(), 2); // markers at 0 and 12 000 samples
+    }
+
+    #[test]
+    fn an_early_exit_still_stores_the_measurements() {
+        // A mic ring that nobody drains is full during the third callback.
+        let (receiver, _mic, _speaker, heard, control) = device(false, 0, RATE, 2 * BLOCK + 40);
+        receiver.run_until_stopped();
+        assert!(control.finished.load(Ordering::Acquire));
+        let heard = heard.lock().unwrap();
+        assert_eq!(heard.device.termination, Some("mic_ring_full"));
+        assert_eq!(heard.device.callbacks, 2);
+        assert_eq!(heard.samples.len(), 2 * BLOCK + 40);
     }
 
     #[test]

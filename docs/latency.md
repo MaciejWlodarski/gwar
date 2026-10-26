@@ -50,7 +50,7 @@ python3 scripts/latency/run_local.py \
 ```
 
 Usage: `latency output.csv [marker-count]`; count defaults to 100 and must be
-positive. Create the output parent first. Each local run uses a fresh server,
+from 1 to 1000. Create the output parent first. Each local run uses a fresh server,
 random loopback HTTP/UDP ports and a temporary data directory beside the CSV,
 removed on completion, errors or Ctrl-C. Allow roughly `5 + 0.25 * count` seconds
 plus setup. Unset `LATENCY_URL` and `LATENCY_SERVER` for local mode; the local
@@ -493,14 +493,21 @@ only callbacks during playback.
 
 `receiver_device` and `sender_device` time the fake devices' own callbacks:
 `callbacks`, `max_lateness_ms` (callback start behind its due time),
-`max_busy_ms` (callback body), `late_over_5ms`, `busy_over_2ms`, and the first 32
+`max_busy_ms` (callback body), `late_over_5ms`, `busy_over_2ms`, the first 32
 such callbacks in `slow` (measurement-clock time, lateness, busy time and, for
-the receiver, the playout samples recorded before it). A late callback is
-followed by back-to-back catch-up callbacks that can drain the speaker ring
-faster than real time, so an underrun next to a slow device callback is the
-harness's, not the pipeline's (see "Fake device stalls" below). The screen gate
-copies the receiver's `late_over_5ms` and `max_busy_ms` into each run's figures
-as `device_late_over_5ms` and `device_max_busy_ms`; they are not gate inputs.
+the receiver, the playout samples recorded before it), `slow_dropped` for the
+rest, and `termination`: `stopped`, or `mic_ring_full` if the engine stopped
+draining the capture ring. A late callback is followed by back-to-back catch-up
+callbacks that can drain the speaker ring faster than real time, so a slow
+device callback can cause an underrun of its own; adjacency alone does not
+prove it did (see "Fake device stalls" below). `receiver_record` gives the
+playout record's `capacity_samples`, `recorded_samples` and
+`overflow_samples`; any overflow fails the run. The screen gate copies the
+receiver's `late_over_5ms`, `max_busy_ms` and the record overflow into each
+run's figures as `device_late_over_5ms`, `device_max_busy_ms` and
+`record_overflow_samples`, with `device_timing` saying whether the run had
+them (`unavailable`, null figures, for binaries from before 2026-10-26). They
+are not gate inputs.
 
 Fractional corrections use the minimum queue + staged PCM margin observed
 before refills over a full trailing five seconds. This retains sparse low-water
@@ -1039,11 +1046,23 @@ stall itself (not the gate statistic) was reproduced in Docker (Linux 7.0 aarch6
   the untouched reservation (every 2.73 s, a transparent huge page) stalled
   the callback by up to 16.8 ms, 16 callbacks over 5 ms in 6 runs.
 
-The receiver's record is now allocated for the longest run (30 s connection
-wait + markers, matching window and warmup + 2 s) and written once before the
-devices' start time is set (`playout_record`). In 18 runs of the fixed build
-(12 of them with the copying path forced), no callback grew or first touched
-the record. With the copying path forced, the longest receiver callback per run
+The callbacks now write only fixed-capacity storage, allocated and written once
+before the devices' start time is set (`Record`): the receiver's playout record
+(30 s connection wait + markers, matching window and warmup + 5 s;
+`playout_record`), the sender's marker captures and the slow-callback list.
+Past its capacity a record counts what it could not keep instead of growing.
+The devices are stopped, and their last callback has stored its
+measurements, before any output file is written, so a slow write cannot run
+them past the budget. Both rings (microphone and speaker) are written through
+once before the start too, and each device takes its measurement lock once
+before its first callback (the first lock of a std mutex allocates on macOS).
+A test runs forty late callbacks, past both capacities, under a counting
+allocator and expects zero allocations. Marker counts are capped at 1000
+(250 s); the record is about 60 MB for a gate run (15 s warmup, 100 markers).
+
+In 18 Docker runs of the first fix (`b122a06`, the playout record only; 12 of
+them with the copying path forced), no callback grew or first touched the
+record. With the copying path forced, the longest receiver callback per run
 was 6.6--40.0 ms before (12 runs) and 0.5--3.9 ms after in 9 of 12 runs; the
 other three (21.3, 40 and 79 ms) coincided with host stalls that also made
 callbacks start 17--290 ms late. The Docker host was too loaded
