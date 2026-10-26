@@ -2,7 +2,7 @@ import { sameServer } from "../lib/server-key";
 import { DELETION_TEXT } from "../net/message-signature";
 import { bookmarkParams, controller } from "../state/controller";
 import { totalDmUnread } from "../state/reducer";
-import type { Bookmark } from "../state/settings";
+import type { Bookmark, ServerGroup } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import type { ChatItem } from "../state/types";
 
@@ -59,4 +59,26 @@ export function stillHeld(shown: MsgItem[], current: ChatItem[]): MsgItem[] {
     const now = byId.get(s.msg.id);
     return now && (now === s || content(now) === content(s)) ? [now] : [];
   });
+}
+
+/** A group as shown: its servers that are still saved (and in the signed-in account's list), in order. */
+export interface ShownGroup {
+  group: ServerGroup;
+  servers: Bookmark[];
+}
+
+/** Splits the saved servers into the ungrouped ones (in their saved order) and the groups that have any. */
+export function railLayout(bookmarks: Bookmark[], groups: ServerGroup[]): { loose: Bookmark[]; groups: ShownGroup[] } {
+  const byId = new Map(bookmarks.map((b) => [b.id, b]));
+  const grouped = new Set<string>();
+  const shown = groups.flatMap((group) => {
+    const servers = group.servers.flatMap((id) => {
+      const b = byId.get(id);
+      if (!b || grouped.has(id)) return [];
+      grouped.add(id);
+      return [b];
+    });
+    return servers.length ? [{ group, servers }] : [];
+  });
+  return { loose: bookmarks.filter((b) => !grouped.has(b.id)), groups: shown };
 }
