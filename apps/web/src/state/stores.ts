@@ -48,7 +48,11 @@ export const useSession = create<SessionStore>()((set) => ({
   insecureConnection: false,
   setSecurity: (serverKey, endpoint, insecureConnection) => set({ serverKey, endpoint, insecureConnection }),
   setFileSession: (fileSession, fileAccess = null) => set({ fileSession, fileAccess }),
-  dispatch: (action) => set((s) => reduce(s, action)),
+  dispatch: (action) => {
+    set((s) => reduce(s, action));
+    // Opening a conversation leaves the server overview (and the home section) for the chat.
+    if (action.type === "selectChannel" || action.type === "setActive" || action.type === "openDm") useUi.getState().showChat();
+  },
   setClose: (closeReason) => set({ closeReason }),
   setAddress: (address, kind = "gwar", httpOrigin = null) => set({ address, kind, httpOrigin }),
 }));
@@ -92,6 +96,9 @@ export interface Toast {
   kind: ToastKind;
   text: string;
 }
+
+/** The global rail's sections: home hides the server column and the channel panel. */
+export type Section = "home" | "servers";
 
 export type SettingsTab = "audio" | "notifications" | "appearance" | "identity" | "account" | "language";
 export type ServerSettingsTab = "overview" | "roles" | "members" | "ownership" | "cleanup" | "bans" | "invites";
@@ -145,6 +152,12 @@ interface UiStore {
   joining: number | null;
   /** The message being edited in place (channel messages only). */
   editing: number | null;
+  section: Section;
+  /** The server overview fills the main area in place of the chat. */
+  overview: boolean;
+  setSection(section: Section): void;
+  showOverview(): void;
+  showChat(): void;
   setEditing(message: number | null): void;
   toast(kind: ToastKind, text: string): void;
   dismissToast(id: number): void;
@@ -166,6 +179,11 @@ export const useUi = create<UiStore>()((set) => ({
   collapsed: {},
   joining: null,
   editing: null,
+  section: "servers",
+  overview: false,
+  setSection: (section) => set({ section }),
+  showOverview: () => set({ section: "servers", overview: true }),
+  showChat: () => set({ section: "servers", overview: false }),
   setEditing: (editing) => set({ editing }),
   toast: (kind, text) => {
     const id = toastId++;

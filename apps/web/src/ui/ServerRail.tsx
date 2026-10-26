@@ -1,38 +1,21 @@
 import * as ContextMenu from "@radix-ui/react-context-menu";
-import { Plus, Settings } from "lucide-react";
+import { Plus } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
-import { sameServer } from "../lib/server-key";
-import { bookmarkParams, controller } from "../state/controller";
-import { useBookmarks, useSettings, type Bookmark } from "../state/settings";
-import { useSession, useUi } from "../state/stores";
+import { useBookmarks, useSettings } from "../state/settings";
+import { useUi } from "../state/stores";
 import { TeamSpeakBadge } from "./badges";
-import { Avatar, IconButton, Tooltip, menuContent, menuItem, menuItemDanger } from "./kit";
-import { AlphaBadge, BugReportButton } from "./BugReport";
-import { UpdateButton, VersionLabel } from "./Version";
+import { Avatar, Tooltip, menuContent, menuItem, menuItemDanger } from "./kit";
+import { useBookmarkOpener } from "./nav";
 
 export function ServerRail() {
   const t = useT();
   const bookmarks = useBookmarks();
-  const phase = useSession((s) => s.phase);
-  const address = useSession((s) => s.address);
-  const kind = useSession((s) => s.kind);
   const openDialog = useUi((s) => s.openDialog);
-  const setDrawer = useUi((s) => s.setDrawer);
-
-  const isActive = (b: Bookmark) => phase !== "idle" && sameServer(b, { kind, address, insecureLan: b.insecureLan });
-
-  const open = (b: Bookmark) => {
-    if (isActive(b) && phase === "online") {
-      setDrawer(false);
-      return;
-    }
-    setDrawer(false);
-    void controller.connectInteractive(bookmarkParams(b), { remember: false });
-  };
+  const { isActive, open } = useBookmarkOpener();
 
   return (
-    <nav aria-label={t("rail.label")} className="flex h-full w-[72px] shrink-0 flex-col items-center gap-2 bg-rail py-3">
+    <nav aria-label={t("rail.label")} className="flex h-full w-[72px] shrink-0 flex-col items-center bg-rail py-3">
       <div className="flex min-h-0 flex-1 flex-col items-center gap-2 overflow-y-auto overflow-x-hidden px-3 py-1">
         {bookmarks.map((b) => {
           const active = isActive(b);
@@ -93,13 +76,6 @@ export function ServerRail() {
           </button>
         </Tooltip>
       </div>
-      <UpdateButton />
-      <BugReportButton />
-      <IconButton label={t("settings.title")} side="right" onClick={() => openDialog({ kind: "settings", tab: "audio" })}>
-        <Settings className="size-5" />
-      </IconButton>
-      <VersionLabel />
-      <AlphaBadge />
     </nav>
   );
 }
