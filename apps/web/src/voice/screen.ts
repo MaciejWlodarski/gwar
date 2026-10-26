@@ -208,6 +208,45 @@ export class StuckCaptureGuard {
   }
 }
 
+/**
+ * When to make Chromium re-probe a stale uplink estimate (docs/screen-share.md, "Stale
+ * estimate probe"). Chromium probes above its estimate at startup, periodically for screen
+ * content (the sharp mode's `detail` hint) and when the sender's allocation rises past the
+ * estimate while it sends less than the estimate allows. A smooth share of sparse content
+ * gets none of these: after a low first estimate (a briefly busy uplink at share start) the
+ * estimate never grows, the encoder target stays below what a larger size needs, and the
+ * share stays at 270p for good. The headroom cap keeps the allocation below the estimate,
+ * so the publisher lifts it past the estimate for a moment instead.
+ */
+export class StaleEstimateProbe {
+  private since: number | null = null;
+  private last: number | null = null;
+  private base = 0;
+  private wait = 10_000;
+  private probedFrom: number | null = null;
+
+  observe(now: number, sample: { available: number; cap: number; bitrate: number; limitation: string; undersized: boolean }): boolean {
+    const { available, cap, bitrate } = sample;
+    const continuous = this.last !== null && now - this.last <= HEADROOM_INTERVAL_MS * 2.25;
+    this.last = now;
+    const valid = [available, cap, bitrate].every(Number.isFinite) && available > 0;
+    // A probe that raised the estimate restarts the backoff; a failed one keeps it.
+    if (valid && this.probedFrom !== null && available >= this.probedFrom * 1.25) { this.wait = 10_000; this.probedFrom = null; }
+    // The encoder sends a smaller size for want of bitrate, the estimate holds back the cap, and
+    // the share sends well under the estimate (application-limited, where Chromium's allocation
+    // probe applies).
+    const stalled = valid && sample.undersized && sample.limitation === "bandwidth" && UPLINK_SHARE * available < cap && bitrate < available * 0.5;
+    if (!stalled) { this.since = null; return false; }
+    // An estimate still growing on its own needs no probe.
+    if (!continuous || this.since === null || available > this.base * 1.1) { this.since = now; this.base = available; return false; }
+    this.base = Math.min(this.base, available);
+    if (now - this.since < this.wait) return false;
+    this.since = now; this.base = available; this.probedFrom = available;
+    this.wait = Math.min(300_000, this.wait * 2);
+    return true;
+  }
+}
+
 /** The selected transport's GCC estimate, with the legacy nominated-pair fallback. */
 function outgoingEstimate(stats: RTCStatsReport, freshAt?: number): number | undefined {
   let selected: string | undefined, available: number | undefined;
@@ -572,6 +611,10 @@ export class ScreenPublisher {
   private sampleTimer: ReturnType<typeof setTimeout> | null = null;
   private polling: RTCPeerConnection | null = null;
   private guard = new StuckCaptureGuard();
+  private probe = new StaleEstimateProbe();
+  private probeTimer: ReturnType<typeof setTimeout> | null = null;
+  /** The latest uplink estimate, for the cap a probe restores. */
+  private available: number | undefined;
   private run = 0;
   private revision = 0;
   private parameters: Promise<void> = Promise.resolve();
@@ -755,6 +798,21 @@ export class ScreenPublisher {
       if (this.guard.tracking && !this.sampleTimer) this.sampleOutcome();
       if (!this.guard.tracking && this.sampleTimer) { clearTimeout(this.sampleTimer); this.sampleTimer = null; }
     }
+    this.available = available;
+    const size = this.captureTarget(), outputPixels = (out?.frameWidth ?? 0) * (out?.frameHeight ?? 0);
+    if (!this.phase && !this.probeTimer && this.probe.observe(performance.now(), {
+      available: guardAvailable ?? NaN, cap: spec.maxBitrate, bitrate, limitation: out?.qualityLimitationReason ?? "other",
+      undersized: outputPixels > 0 && outputPixels < size.width * size.height,
+    })) {
+      // Chromium probes (up to twice its estimate) when the allocation rises past the estimate.
+      // One second later the headroom cap returns, at the then-current estimate.
+      void this.applyParameters(spec.maxBitrate);
+      this.probeTimer = setTimeout(() => {
+        this.probeTimer = null;
+        if (!this.closed && this.pc === pc) void this.applyParameters(headroomBitrate(this.spec().maxBitrate, this.available));
+      }, 1_000);
+      return;
+    }
     // Small moves are not worth a parameter change.
     if (Math.abs(target - this.desired) > this.desired * 0.1) void this.applyParameters(target);
   }
@@ -865,6 +923,8 @@ export class ScreenPublisher {
     this.phase = null;
     if (this.sampleTimer) clearTimeout(this.sampleTimer);
     this.sampleTimer = null;
+    if (this.probeTimer) clearTimeout(this.probeTimer);
+    this.probeTimer = null;
   }
 
   private endPhaseAfter(ms: number): void {
@@ -929,6 +989,8 @@ export class ScreenPublisher {
     if (this.closed) return;
     this.cancelPhase();
     this.guard.resetEncoder();
+    // A new transport starts its own estimate.
+    this.probe = new StaleEstimateProbe();
     this.recovery = plan;
     this.stopWatching();
     const pc = this.pc; this.pc = null; this.sender = null; this.sent = null; this.adaptationSent = null;

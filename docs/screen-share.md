@@ -548,12 +548,43 @@ Preset changes, close and codec replacement fence queued parameters and cancel
 phase/sampling timers. `scaleResolutionDownBy` only enforces the existing
 codec-recovery ceiling from current track settings.
 
+**Stale estimate probe.** The guard prices the next size against the uplink
+estimate, so it cannot help when the estimate itself is stuck low. Chromium probes
+above its estimate at startup, every few seconds for screen content (the sharp mode's
+`detail` hint), and when the sender's allocation rises past the estimate while it is
+application-limited. A smooth share of sparse content gets none of these: when a
+briefly busy uplink holds the startup probe to about 1 Mb/s, the estimate never moves
+again, the encoder target stays below what a larger size needs, and the share stays
+at 480×270 even after the uplink frees. The 70 % headroom cap keeps the allocation
+below the estimate, so allocation probes never fire either. CI run `40370486469`
+showed exactly this (1.14 Mb/s for the whole minute on loopback), and locally a
+1 Mb/s uplink for the first 8 s left four of six fresh shares at 480×270.
+
+`StaleEstimateProbe` watches for an encoder that is smaller than the capture
+target, limited by `bandwidth`, under a cap that 70 % of the estimate holds back,
+while sending less than half the estimate. After ten seconds without the estimate
+growing more than 10 %, the publisher lifts `maxBitrate` to the spec's cap for one
+second: Chromium probes (up to twice its estimate, further while probes succeed),
+then the headroom cap returns at the latest estimate. The degradation preference does
+not change. Failed probes back off 10 → 20 → 40 → … → 300 s; a probe that raised
+the estimate by 25 % restarts the backoff. Busy content, which fills its cap, never
+qualifies; neither does a share already at native size. A close, codec recovery or
+spec change cancels a pending restore. With the probe the same eight-second 1 Mb/s
+startup recovers 1080p in 12/12 local shares (13–29 s; main: 2/6), and the default
+startup matrix issues no probe.
+
 `pnpm --filter web e2e:screen-startup` checks repeated fresh real-tab publishes
 with a sparse 20 fps barcode and busy 1080p60 content, using VP9 and H.264. It
 checks rendered and captured cadence, outbound resolution and viewer decoding
 through the local SFU after settling. `E2E_STARTUP_RESULTS` retains JSON timelines;
 `E2E_STARTUP_UPLINK=1500000` or `3000000` exercises Chromium's global p2p shaper
-and reports the constrained-link tradeoff.
+and reports the constrained-link tradeoff; adding `E2E_STARTUP_RELEASE=8` lifts the
+shaper after 8 s and requires 1080p again (the stale estimate probe above).
+A settled window the encoder reports as CPU-limited is recorded instead of failing
+the size and cadence checks: Chromium's single-threaded OpenH264 needs 12–20 ms per
+busy 1080p frame even on a 10-core Mac, and the 4-vCPU runner cannot keep libvpx at
+1080p60 next to capture, canvas and viewer decode. Such a share must still have
+reached native size at startup and the viewer must decode what is sent.
 `E2E_STARTUP_PRESET` can check Text, Smooth and Saver directly. The Ubuntu
 `browser-screen-startup` job is diagnostic and excluded from `ci-ok` until its repeatability is established.
 The existing required #166 fixed 1080p60 H.264 canvas gate is unchanged.

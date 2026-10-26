@@ -1,6 +1,6 @@
 import { WatchSession, type SocketLike } from "../watch/session";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { captureScreen, DEPENDENCY_DESCRIPTOR, headroomBitrate, MIN_BITRATE, preferredCodecs, publishSsrcs, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, StuckCaptureGuard } from "./screen";
+import { captureScreen, DEPENDENCY_DESCRIPTOR, headroomBitrate, MIN_BITRATE, preferredCodecs, publishSsrcs, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, StaleEstimateProbe, StuckCaptureGuard } from "./screen";
 
 import { deriveSpec, legacySpec, type ScreenSpec } from "./screen-quality";
 import type { ScreenPreset } from "../proto/ScreenPreset";
@@ -771,6 +771,101 @@ describe("publisher capture guard", () => {
     expect(last(pc).encodings[0]!.scaleResolutionDownBy).toBe(1);
     expect(last(pc).encodings[0]!.maxFramerate).toBe(settings.frameRate);
     expect(last(pc).degradationPreference).toBe("maintain-framerate");
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
+describe("stale estimate probe", () => {
+  // CI run 40370486469: a sparse H.264 share whose first estimate stayed at 1.14 Mb/s for the whole minute.
+  const sample = { available: 1_140_000, cap: 8_000_000, bitrate: 64_000, limitation: "bandwidth", undersized: true };
+  const feed = (probe: StaleEstimateProbe, start: number, end: number, s: typeof sample | ((now: number) => typeof sample) = sample) => {
+    const probes = [];
+    for (let now = start; now <= end; now += 2000) if (probe.observe(now, typeof s === "function" ? s(now) : s)) probes.push(now);
+    return probes;
+  };
+  it("probes after ten seconds of a stale estimate, then backs off while probes fail", () => {
+    expect(feed(new StaleEstimateProbe(), 0, 200_000)).toEqual([10_000, 30_000, 70_000, 150_000]);
+  });
+  it("caps the backoff at five minutes", () => {
+    const probes = feed(new StaleEstimateProbe(), 0, 1_500_000);
+    expect(probes.slice(-3).map((t, i, a) => (i ? t - a[i - 1]! : 0))).toEqual([0, 300_000, 300_000]);
+  });
+  it("restarts the backoff once a probe raised the estimate", () => {
+    const probe = new StaleEstimateProbe();
+    expect(feed(probe, 0, 10_000)).toEqual([10_000]);
+    expect(feed(probe, 12_000, 40_000, { ...sample, available: 1_500_000 })).toEqual([22_000]);
+  });
+  it.each([
+    { limitation: "cpu" }, { limitation: "none" },
+    // Native size already: a stale estimate costs this share nothing.
+    { undersized: false },
+    // Sending most of the estimate: not application-limited, the estimate grows by itself.
+    { bitrate: 700_000 },
+    // An estimate that already covers the cap under the headroom rule.
+    { available: 12_000_000 },
+    { available: 0 }, { available: NaN }, { bitrate: NaN }, { cap: NaN },
+  ])("leaves alone what a probe cannot help: %j", change => {
+    expect(feed(new StaleEstimateProbe(), 0, 60_000, { ...sample, ...change })).toEqual([]);
+  });
+  it("waits while the estimate still grows on its own", () => {
+    expect(feed(new StaleEstimateProbe(), 0, 30_000, now => ({ ...sample, available: 1_000_000 * 1.12 ** (now / 2000) }))).toEqual([]);
+  });
+  it("needs continuous observations", () => {
+    const probe = new StaleEstimateProbe();
+    expect(feed(probe, 0, 8000)).toEqual([]);
+    expect(feed(probe, 13_000, 21_000)).toEqual([]);
+    expect(feed(probe, 23_000, 23_000)).toEqual([23_000]);
+  });
+});
+
+describe("publisher stale estimate probe", () => {
+  const stale = (pc: Peer, available = 900_000) => pc.getStats.mockImplementation(async () => {
+    const timestamp = performance.now();
+    return new Map([
+      ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: available, timestamp: performance.timeOrigin + performance.now() }],
+      ["out", { type: "outbound-rtp", kind: "video", framesEncoded: timestamp / 50, timestamp, bytesSent: timestamp * 8, frameWidth: 480, frameHeight: 270, framesPerSecond: 20, targetBitrate: 630_000, qualityLimitationReason: "bandwidth" }],
+    ]);
+  });
+  const make = () => new ScreenPublisher({ track: { applyConstraints: vi.fn(async () => {}) } as unknown as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
+
+  it("lifts the cap past a stale estimate for one second, then restores the headroom cap", async () => {
+    const publisher = make(); await publisher.start();
+    const pc = Peer.all[0]!; stale(pc);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(publisher.bitrate).toBe(630_000);
+    const before = pc.sendParams.length;
+    // The first stalled poll (4 s) needs a byte delta; ten seconds later the probe lifts the cap.
+    await vi.advanceTimersByTimeAsync(12_000);
+    const caps = pc.sendParams.slice(before).map(p => p.encodings[0]!.maxBitrate);
+    expect(caps).toEqual([8_000_000]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(pc.sendParams.slice(before).map(p => p.encodings[0]!.maxBitrate)).toEqual([8_000_000, 630_000]);
+    // The degradation preference never changes for a probe.
+    expect(pc.sendParams.every(p => p.degradationPreference === "maintain-framerate")).toBe(true);
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("follows the estimate the probe found", async () => {
+    const publisher = make(); await publisher.start();
+    const pc = Peer.all[0]!; stale(pc);
+    await vi.advanceTimersByTimeAsync(14_000);
+    expect(publisher.bitrate).toBe(8_000_000);
+    stale(pc, 5_000_000);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(publisher.bitrate).toBe(3_500_000);
+    publisher.close();
+  });
+
+  it.each(["close", "recover"])("a pending restore cannot outlive %s", async action => {
+    const publisher = make(); await publisher.start();
+    const pc = Peer.all[0]!; stale(pc);
+    await vi.advanceTimersByTimeAsync(14_000);
+    expect(pc.sendParams.at(-1)!.encodings[0]!.maxBitrate).toBe(8_000_000);
+    if (action === "close") publisher.close();
+    else await publisher.recover({ share: "s", codec: "vp9", width: 1920, height: 1080, fps: 60 });
+    const count = pc.sendParams.length;
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(pc.sendParams).toHaveLength(count);
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 });

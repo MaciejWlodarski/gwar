@@ -1,5 +1,66 @@
 # Chromium startup adaptation validation
 
+## CI diagnostic triage (26 October 2026)
+
+`browser-screen-startup` failed in 64 of the 66 runs that executed it among the last
+100 CI runs (25–26 October). Every run's log and retained timeline (132 publishes per
+case) was classified by its settled window, using the encoder's own
+`qualityLimitationReason` and `totalEncodeTime`.
+
+| Case and assertion | Failures | Measured | Cause |
+| --- | --- | --- | --- |
+| H.264 busy: recover 1920×1080 | 109 | final 1440×810 (86) or 960×540 (23), CPU-limited | runner / encoder |
+| H.264 busy: recover 1920×1080 | 2 | 960×540 at the 8 Mb/s cap, `bandwidth`, QP ≈ 20 | open, below |
+| H.264 busy: encoded cadence | 2 | 49–50 fps, CPU-limited | runner / encoder |
+| VP9 busy: encoded cadence | 75 | 35–50 fps (median 46.6), CPU-limited | runner |
+| VP9 busy: recover 1920×1080 | 36 | 1440×810 or 960×540, CPU-limited | runner |
+| VP9 busy: captured source cadence | 12 | 46–50 fps capture, CPU-limited | runner |
+| H.264 barcode: recover 1920×1080 | 1 | 480×270 for 60 s, estimate frozen at 1.14 Mb/s | **product** |
+| VP9 barcode | 0 | — | — |
+
+**Busy 1080p60 is CPU-bound on the runner, not held down by Gwar.** Every busy publish
+reached native 1080p at startup (H.264 median 11.4 s, max 47.3 s; VP9 median 13.5 s,
+max 17.9 s). 232 of the 236 later drops from 1080p happened with
+`qualityLimitationReason: "cpu"`, about 20 s after reaching it, while the estimate
+(8–13 Mb/s) and the 8 Mb/s cap had room. At 1080p, before Chromium flagged CPU,
+OpenH264 took 18.1 ms per frame (median, 11.6–22.8) and libvpx 21.0 ms (10.8–27.3)
+against a 16.7 ms frame budget, so VP9 already encoded only 47 fps. Chromium's
+OpenH264 runs single-threaded: on a 10-core arm64 Mac it needs 12–20 ms per busy
+1080p frame and also adapts to 1440×810 in some runs, while libvpx there sustains
+1080p60 at 4–7 ms. `maintain-framerate` trading size for cadence under CPU limitation
+is the designed behaviour; the guard deliberately never pulses against it.
+
+**Resolution:** a settled window with CPU limitation is now recorded (encoder,
+encode ms/frame, size and cadence in `summary.json` and the log), not asserted.
+Such a publish must still have reached native size at startup, and the viewer must
+decode the adapted size at ≥75 % of the encoded cadence. Without CPU limitation,
+every original assertion applies unchanged. Replaying the new rule over the 264
+busy timelines leaves the two H.264 `bandwidth` cases failing and passes the rest;
+with the stale-estimate barcode run, 3 of the 66 runs would have failed.
+
+**The stale estimate (one H.264 barcode run) is a product bug,** fixed in this change
+(docs/screen-share.md, "Stale estimate probe"). A low startup estimate never grows for
+a sparse smooth share: it sends far below the estimate, Chromium only probes on
+allocation rises in that state, and the 70 % cap keeps the allocation below the
+estimate. A new CI step reproduces it with a 1 Mb/s uplink for the first 8 s. The slower
+recoveries wait ten seconds of stale estimate, the probe, then the guard's six seconds:
+
+| Local macOS, 1 Mb/s for 8 s, then free | Recovered 1080p | Time to 1080p |
+| --- | --- | --- |
+| main `0004a312` (VP9 3, H.264 3) | 2/6 | 12.8, 15.0 s; four stayed 480×270 |
+| this change (VP9 3, H.264 3) | 6/6 | 12.7, 14.8, 26.4, 26.9, 28.9, 28.9 s |
+| an earlier block, before the undersized condition | 6/6 | 13.2–28.7 s |
+
+Lifting the cap alone (no headroom rule) also stays at 480×270, so the 70 % rule is
+not the root cause; the missing probe is. The default local matrix (VP9/H.264,
+barcode/busy, two repeats) passes with the change and issues no probe.
+
+**Open:** two H.264 busy publishes (runs `40225445809`, `40315496650`) dropped from
+1440×810 to 960×540 once the encoder reached the 8 Mb/s cap, at QP ≈ 20, with no CPU
+limitation, and stayed there. This is Chromium's own bandwidth adaptation at the cap;
+the guard prices the next step at the current bits per pixel and leaves it. It still
+fails the diagnostic, which is deliberate.
+
 25 October 2026. Local macOS arm64, full Playwright Chromium 153.0.8010.12,
 WebKit, local SFU and real browser viewers. Main is pinned to
 `e8fb01e358ed6a5e6f855025c4417829ede379e1`; the previous candidate is
