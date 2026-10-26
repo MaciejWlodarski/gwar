@@ -1,6 +1,7 @@
 import { AlertTriangle, CloudCog, Menu, ShieldAlert, Ticket } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { useT } from "../i18n";
+import { cn } from "../lib/cn";
 import { addressLabel, pageContextFromLocation, sameOriginUrl } from "../net/address";
 import { parseInviteLink } from "../net/invite";
 import { bookmarkParams, controller, describeBan } from "../state/controller";
@@ -8,7 +9,7 @@ import { isDesktop } from "../platform";
 import { useBookmarks, useSettings, type ServerKind } from "../state/settings";
 import { useAccount } from "../state/account";
 import { useConnectUi, useSession, useUi } from "../state/stores";
-import { Avatar, Button, Field, IconButton, Input, Segmented, Switch } from "./kit";
+import { Avatar, Button, Field, IconButton, Input, Segmented, Switch, panelCard } from "./kit";
 import { TeamSpeakBadge } from "./badges";
 import { Wordmark } from "./Brand";
 import { useIsMobile } from "../lib/media";
@@ -34,7 +35,7 @@ async function probeSameOriginServer(): Promise<string | null> {
   }
 }
 
-export function ConnectScreen() {
+export function ConnectScreen({ card }: { card?: boolean }) {
   const t = useT();
   const isMobile = useIsMobile();
   const lastAddress = useSettings((s) => s.lastAddress);
@@ -118,7 +119,7 @@ export function ConnectScreen() {
   const notice = closeNotice(closeReason, t);
 
   return (
-    <main className="relative flex min-w-0 flex-1 flex-col items-center overflow-y-auto bg-surface">
+    <main className={cn("relative flex min-w-0 flex-1 flex-col items-center overflow-y-auto bg-surface", card && panelCard)}>
       {isMobile && (
         <div className="flex h-12 w-full shrink-0 items-center px-2">
           <IconButton label={t("nav.servers")} onClick={() => setDrawer(true)}>
