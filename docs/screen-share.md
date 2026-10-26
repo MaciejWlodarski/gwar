@@ -3598,3 +3598,49 @@ are allowed. The guard ends when the estimate fits the frame or after those 5 s,
 so a conservative estimate cannot suppress recovery permanently. Rate samples
 come from the existing allocation tick. Probe targets and pacing limits are not
 raised by this guard.
+
+#### Matched local audit soaks, 2026-10-26
+
+Both runs used the same temporary driver derived from `apps/web/e2e/screen.mjs`:
+four 720p30 textured canvas sources (two H.264, two VP9), five viewers including
+WebKit, and the first two sharers watching the other sources: 26 watches over
+seven watch transports. Each run measured ten minutes, with one watch transport
+replaced each minute and one publisher stopped/restarted every three minutes.
+Both servers used the same no-default-features dev build profile and a 600 Mb/s
+budget, on this macOS host. No network shaping was applied.
+
+One-second decoded-frame samples count missing receiver stats as zero frames,
+skip counter-reset intervals and the first five seconds of each share, and retain
+churn/startup waits. The second freeze metric additionally excludes the first
+five seconds after scheduled churn. Mean CPU per stream includes publisher/voice
+work. These measurements are one matched pair, not a cross-machine capacity gate.
+
+| Metric | Instrumented main `9c783f02` | Fixed server |
+| --- | ---: | ---: |
+| Frozen stream-time | 0.82% | 0.70% |
+| Frozen time outside the first 5 s after scheduled churn | 0.38% | 0.21% |
+| Longest sampled freeze | 11.84 s | 7.70 s |
+| Mean CPU (one core = 100%) | 25.51% | 18.35% |
+| Peak sampled CPU | 44.16% | 24.41% |
+| Mean CPU / 26 watched streams | 0.98 pp | 0.71 pp |
+| Peak RSS | 33.55 MiB | 34.95 MiB |
+| RSS after 10 s idle | 32.55 MiB | 33.39 MiB |
+| Transport drains per received datagram | 18.63 | 6.60 |
+
+The baseline reproduced an approximately 11 s zero-video-byte VP9 wait after watch
+churn while the publisher kept encoding and other viewers received it. Ingress
+overruns, dispatch drops and aggregate-budget pauses were zero in both measured
+runs (peak egress 57.89 and 46.48 Mb/s against 600 Mb/s). Cold-viewer egress
+samples exposed keyframe queue evictions and retry-credit exhaustion; the final
+run logged zero retry-credit denials after the bounded startup guard. Short cold
+startup waits remain, as the per-viewer estimate ramps within the existing
+pacing/queue limits.
+
+The earlier deleted-log soak reported 8.5% frozen stream-time, 85.8% peak CPU,
+about 2.5 CPU percentage points per watched stream, and 42.3 MiB peak RSS. That
+aggregate freeze rate was not reproduced on instrumented main here. Its exact
+historical cause cannot be recovered from its summary alone; the new artifacts
+establish the reproduced cold-watch failure path without attributing every old
+freeze to it. The driver, freeze timestamps, raw logs, intermediate runs and
+canonical comparison are retained under `/tmp/gwar-soak-*` and
+`/tmp/gwar-soak-final-comparison.json` on the validation host.
