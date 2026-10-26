@@ -80,8 +80,22 @@ impl Limits {
 
     /// Whether frames of `frame_mbs` macroblocks at `mbps` per second are within this receive
     /// level's MaxFS and MaxMBPS (with the 10% rate tolerance streams get).
-    pub fn accepts_load(&self, frame_mbs: u32, mbps: u32) -> bool {
+    fn accepts_load(&self, frame_mbs: u32, mbps: u32) -> bool {
         frame_mbs <= self.resources[1] && u64::from(mbps) * 100 <= u64::from(self.resources[0]) * 110
+    }
+
+    /// Whether `width`×`height` at `fps` is within this receive level: MaxFS and MaxMBPS, and
+    /// neither side wider than sqrt(8 × MaxFS) macroblocks (H.264 A.3.1).
+    pub fn accepts_rendition(&self, width: u32, height: u32, fps: u32) -> bool {
+        let (columns, rows) = (u64::from(width.div_ceil(16)), u64::from(height.div_ceil(16)));
+        let side = 8 * u64::from(self.resources[1]);
+        let frame_mbs = columns * rows;
+        columns * columns <= side
+            && rows * rows <= side
+            && u32::try_from(frame_mbs)
+                .ok()
+                .zip(u32::try_from(frame_mbs * u64::from(fps)).ok())
+                .is_some_and(|(frame_mbs, mbps)| self.accepts_load(frame_mbs, mbps))
     }
 
     fn parse(fmtp: &str, verified: &[gwar_proto::H264Capability]) -> Option<Self> {

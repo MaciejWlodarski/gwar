@@ -208,6 +208,17 @@ mod tests {
             let (fs, mbps) = h264_replacement_load(width, height);
             assert!(fs <= max_fs && mbps <= max_mbps, "{width}x{height}: {fs} MBs, {mbps} MB/s");
         }
+        // Every source size, in either orientation, stays within the bounds.
+        for width in 1..=65536u32 {
+            for height in [1, 15, 16, 17, 719, 720, 721, 1079, 1080, 1081, 1439, 1440, 1441, 2559, 2560, 2561, 65536] {
+                for (width, height) in [(width, height), (height, width)] {
+                    let (w, h) = h264_replacement(width, height);
+                    assert!(w % 2 == 0 && h % 2 == 0 && w.min(h) >= 16 && w.max(h) <= 2560 && w.min(h) <= 1440);
+                    let (fs, mbps) = h264_replacement_load(width, height);
+                    assert!(fs <= max_fs && mbps <= max_mbps);
+                }
+            }
+        }
         // The plan carries the replacement size.
         let huge = crate::media::screen::av1_stream::Requirements { width: 65536, height: 65536, level: 31, tier: 0 };
         let plan = Recovery::default().downgrade_av1("s", huge, Instant::now()).unwrap();

@@ -1656,7 +1656,9 @@ impl Sfu {
                     continue;
                 }
                 let Some(w) = self.watchers.get_mut(&session) else { continue };
-                if w.slots[index].grant.is_none() {
+                // A revoked watch (its release still queued) neither receives nor changes the
+                // share for the viewers who remain.
+                if !w.slots[index].grant.as_ref().is_some_and(|g| g.alive()) {
                     continue;
                 }
                 if slot_packet_pt(&w.slots[index], forward).is_none() {
@@ -2475,15 +2477,16 @@ fn slot_packet_pt(slot: &Slot, packet: &Forward) -> Option<Pt> {
 }
 
 /// Whether the slot could decode the H.264 rendition that would replace an AV1 stream of
-/// `size`: one of its negotiated H.264 payload types, at a receive level (and any earlier
-/// decode-failure cap) that takes the replacement's frame size and macroblock rate.
+/// `size`: one of its negotiated H.264 payload types, at a receive level that takes the
+/// replacement's frame size, macroblock rate and each of its sides, within any earlier
+/// decode-failure cap.
 fn decodes_h264_replacement(slot: &Slot, size: av1_stream::Requirements) -> bool {
+    let (width, height) = recovery::h264_replacement(size.width, size.height);
     let (frame_mbs, mbps) = recovery::h264_replacement_load(size.width, size.height);
     slot.decode_cap.is_none_or(|(fs, cap)| frame_mbs <= fs && u64::from(mbps) * 100 <= u64::from(cap) * 110)
-        && slot
-            .h264
-            .iter()
-            .any(|(pt, limits)| slot.pts.values().any(|p| p == pt) && limits.accepts_load(frame_mbs, mbps))
+        && slot.h264.iter().any(|(pt, limits)| {
+            slot.pts.values().any(|p| p == pt) && limits.accepts_rendition(width, height, recovery::AV1_REPLACEMENT_FPS)
+        })
 }
 
 /// H.264 and AV1: meter every packet on arrival. Existing segments receive immediately; only
@@ -5384,6 +5387,145 @@ pub(crate) mod tests {
         // Limits of a payload type the slot did not negotiate do not count.
         slot.pts.clear();
         assert!(!decodes_h264_replacement(&slot, main(1920, 1080)));
+    }
+
+    #[test]
+    fn the_h264_replacement_must_fit_each_side_of_the_viewer_level() {
+        // Level 3.0: MaxFS 1,620, so no side over sqrt(8 × 1,620) ≈ 113.8 macroblocks. A 2560×16
+        // replacement fits its area (160 MBs) and rate (9,600 MB/s) but is 160 MBs wide.
+        let mut slot = Slot::new(Mid::from("a"), HashMap::from([(VideoCodec::H264(0x42e01e), Pt::from(102))]));
+        slot.h264 = h264_limits(102, 0x42e01e);
+        let main = av1_stream::tests::main;
+        assert_eq!(recovery::h264_replacement(2560, 16), (2560, 16));
+        assert_eq!(recovery::h264_replacement_load(2560, 16), (160, 9600));
+        for size in [main(2560, 16), main(16, 2560), main(1824, 16)] {
+            assert!(!decodes_h264_replacement(&slot, size), "{size:?}");
+        }
+        // 113 MBs (1808 px) is the widest level 3.0 takes, in either orientation.
+        for size in [main(1808, 16), main(16, 1808)] {
+            assert!(decodes_h264_replacement(&slot, size), "{size:?}");
+        }
+    }
+
+    #[test]
+    fn the_h264_replacement_is_checked_against_the_effective_viewer_level() {
+        let offer = "m=video 9 UDP/TLS/RTP/SAVPF 102\r\na=mid:0\r\na=rtpmap:102 H264/90000\r\n\
+                     a=fmtp:102 packetization-mode=1;profile-level-id=42e01f\r\n";
+        let high = gwar_proto::H264Capability { profile_level_id: 0x42e02a, max_fs: 8160, max_mbps: 489600 };
+        let low = gwar_proto::H264Capability { profile_level_id: 0x42e01f, max_fs: 3600, max_mbps: 108000 };
+        // (offer, verified capabilities, decodes a 1080p60 replacement)
+        for (offer, verified, decodes) in [
+            (offer.to_owned(), vec![], false),
+            (offer.to_owned(), vec![high], true),
+            (offer.replace("42e01f", "42e033"), vec![low], false),
+            (offer.replace("42e01f", "42e02a"), vec![], true),
+        ] {
+            let mut slot = Slot::new(Mid::from("0"), HashMap::from([(VideoCodec::H264(0x42e01f), Pt::from(102))]));
+            slot.h264 = codec::offered(&offer, &verified).remove(&Mid::from("0")).unwrap();
+            let hd = av1_stream::tests::main(1920, 1080);
+            assert_eq!(decodes_h264_replacement(&slot, hd), decodes, "{offer} {verified:?}");
+            slot.decode_cap = Some((3600, 108_000));
+            assert!(!decodes_h264_replacement(&slot, hd), "a decode-failure cap bounds it");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_viewer_whose_level_is_too_narrow_for_the_replacement_does_not_turn_the_share() {
+        let (mut sfu, origin, now, _) = recovery_fixture(&[1]).await;
+        let slot = &mut sfu.watchers.get_mut(&1).unwrap().slots[0];
+        slot.keyframe_at = None;
+        slot.pts = HashMap::from([(VideoCodec::H264(0x42e01e), Pt::from(102))]);
+        slot.h264 = h264_limits(102, 0x42e01e);
+        slot.av1 = None;
+        let key = Forward {
+            av1: Some(av1_stream::tests::main(2560, 16)),
+            keyframe: true,
+            ..av1_forward(100, 9000, rtp(false, false, true, &[&KEY]), None, now)
+        };
+        sfu.forward_packets("h264", &origin, vec![(key, true)], now);
+        let recovery = origin.recovery.lock().unwrap();
+        assert!(!recovery.pending && recovery.av1(), "the share keeps AV1");
+        assert!(sfu.watchers[&1].slots[0].grant.is_none(), "the viewer is refused");
+    }
+
+    #[tokio::test]
+    async fn a_revoked_watch_cannot_turn_the_share_for_the_viewers_who_remain() {
+        let (mut sfu, origin, now, _) = recovery_fixture(&[1, 2]).await;
+        for (&session, w) in &mut sfu.watchers {
+            let slot = &mut w.slots[0];
+            slot.keyframe_at = None;
+            slot.pts = HashMap::from([(VideoCodec::H264(0x42e02a), Pt::from(102))]);
+            slot.h264 = h264_limits(102, 0x42e02a);
+            if session == 1 {
+                slot.pts.insert(VideoCodec::Av1, 45.into());
+                slot.av1 = Some(codec::Av1Limits::new(
+                    &gwar_proto::Av1Capability { width: 1920, height: 1080 },
+                    codec::Av1Declared { level: 13, tier: 0 },
+                ));
+            }
+        }
+        // The core revokes a watch before the release it queues reaches the SFU.
+        sfu.watchers[&2].slots[0].grant.as_ref().unwrap().end();
+        let key = Forward {
+            av1: Some(HD),
+            keyframe: true,
+            ..av1_forward(100, 9000, rtp(false, false, true, &[&KEY]), Some(ATTACHED.to_vec()), now)
+        };
+        sfu.forward_packets("h264", &origin, vec![(key, true)], now);
+        let recovery = origin.recovery.lock().unwrap();
+        assert!(!recovery.pending && recovery.av1(), "the H.264 viewer that left changes nothing");
+        assert!(!sfu.watchers[&1].slots[0].segment.waiting(), "the remaining AV1 viewer is served");
+    }
+
+    #[tokio::test]
+    async fn after_the_switch_every_viewer_is_checked_against_the_h264_replacement() {
+        let (mut sfu, origin, now, need) = recovery_fixture(&[1, 2, 3, 4]).await;
+        // Viewers 1 and 2 decode the 1080p60 replacement in H.264; 3 has H.264 level 3.1 only;
+        // 4 decodes the AV1 stream but its H.264 is level 3.1 too.
+        for (&session, w) in &mut sfu.watchers {
+            let slot = &mut w.slots[0];
+            slot.keyframe_at = None;
+            let id = if session <= 2 { 0x42e02a } else { 0x42e01f };
+            slot.pts = HashMap::from([(VideoCodec::H264(id), Pt::from(102))]);
+            slot.h264 = h264_limits(102, id);
+            if session == 4 {
+                slot.pts.insert(VideoCodec::Av1, 45.into());
+                slot.av1 = Some(codec::Av1Limits::new(
+                    &gwar_proto::Av1Capability { width: 1920, height: 1080 },
+                    codec::Av1Declared { level: 13, tier: 0 },
+                ));
+            }
+        }
+        let av1 = Forward {
+            av1: Some(HD),
+            keyframe: true,
+            ..av1_forward(100, 9000, rtp(false, false, true, &[&KEY]), Some(ATTACHED.to_vec()), now)
+        };
+        sfu.forward_packets("h264", &origin, vec![(av1.clone(), true)], now);
+        {
+            let recovery = origin.recovery.lock().unwrap();
+            assert!(recovery.pending && !recovery.av1());
+        }
+        // Viewer 1 leaves and viewer 2 watches again while the replacement is pending.
+        empty(sfu.watchers.get_mut(&1).unwrap(), 0);
+        empty(sfu.watchers.get_mut(&2).unwrap(), 0);
+        assign(sfu.watchers.get_mut(&2).unwrap(), 0, WatchGrant::new(origin.clone()), 5, now);
+        sfu.forward_packets("h264", &origin, vec![(av1, true)], now);
+        assert!(origin.recovery.lock().unwrap().pending, "old-codec media stays fenced");
+        assert!(sfu.watchers[&2].slots[0].grant.is_some());
+        // The H.264 replacement arrives: each viewer takes it or is refused, and AV1 stays off.
+        origin.recovery.lock().unwrap().pending = false;
+        let h264 = Forward {
+            h264: Some(need),
+            keyframe: true,
+            marker: true,
+            codec: VideoCodec::H264(need.profile),
+            ..h264_forward(200, 18000, &[0x65, 1], now)
+        };
+        sfu.forward_packets("h264", &origin, vec![(h264, true)], now);
+        let granted: Vec<_> = (1..=4).map(|s| sfu.watchers[&s].slots[0].grant.is_some()).collect();
+        assert_eq!(granted, [false, true, false, false]);
+        assert!(!origin.recovery.lock().unwrap().av1());
     }
 
     #[tokio::test]

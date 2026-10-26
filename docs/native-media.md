@@ -1102,8 +1102,10 @@ this before mixed AV1/H.264 sharing ships.
    same recovery plan (`screen.recover`, 60 fps, at the AV1 stream's size
    scaled down to at most 1440p with the aspect ratio kept, which stays
    within H.264 level 5.1). The replacement must fit one of the viewer's
-   negotiated H.264 payload types: MaxFS and MaxMBPS of its receive level,
-   verified or declared, and any decode-failure cap. Any recovery plan or
+   negotiated H.264 payload types: MaxFS, MaxMBPS and each side within
+   sqrt(8 × MaxFS) macroblocks of its receive level, verified or declared,
+   and any decode-failure cap. A revoked watch whose release has not
+   reached the SFU yet is skipped and changes nothing. Any recovery plan or
    decode-failure report retires AV1 for the rest of the share; viewers
    that decode neither are refused as above and leave the share as it is.
    This browser path does not change the native primary-retention rule above.
@@ -2046,8 +2048,9 @@ production server is involved.
   - Viewers below the stream's level: a viewer whose declared `level-idx`
     or tier is below the stream's, or whose verified size is smaller, gets
     the existing "viewer without AV1" outcome. If it decodes the H.264
-    replacement (its H.264 receive level takes the replacement's frame size
-    and macroblock rate), the share turns to H.264 once (above, and [Codec
+    replacement (its H.264 receive level takes the replacement's frame
+    size, macroblock rate and each side), the share turns to H.264 once
+    (above, and [Codec
     negotiation](#codec-negotiation-across-mixed-viewers), item 7). If not
     (for example H.264 only at level 3.1 for a 1080p60 share), or once AV1
     is already given up, that watch alone is refused: it stops with

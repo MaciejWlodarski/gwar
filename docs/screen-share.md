@@ -338,8 +338,11 @@ specified in [native-media.md](native-media.md#encryption-nal-aware-sframe).
 A2 does not enable encrypted shares, HEVC, or native clients. A2b adds
 browser AV1 for sharers whose browser reports a hardware (power-efficient)
 AV1 encoder; everyone else keeps H.264. Viewers receive AV1 only at a size
-their decoder passed a probe for; a viewer who cannot decode the AV1 stream
-turns the share to H.264 once ([native-media.md, A2b](native-media.md#a2b-status)).
+their decoder passed a probe for. A viewer who cannot decode the AV1 stream
+turns the share to H.264 once, but only if it can decode the H.264
+replacement (its H.264 level takes the replacement's size, each side and
+macroblock rate). Otherwise only that watch is refused, and the share keeps
+AV1 ([native-media.md, A2b](native-media.md#a2b-status)).
 VP8 is dropped. Verified H.264 decode probes and bounded recovery are described
 in [native-media.md, Browser interop](native-media.md#browser-interop).
 
