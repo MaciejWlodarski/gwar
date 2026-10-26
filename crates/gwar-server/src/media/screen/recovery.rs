@@ -26,6 +26,10 @@ pub(super) struct Recovery {
     reporters: HashSet<SessionId>,
     trial: bool,
     backoff: u8,
+    /// AV1 was given up for this share: a viewer could not decode it, a decode failure moved
+    /// it to H.264, or the publisher left it. A browser publisher has one encoder; a share
+    /// does not return to AV1 before compatibility layers exist (A3).
+    no_av1: bool,
     /// Old-publisher media is fenced until the replacement offer is accepted.
     pub pending: bool,
 }
@@ -41,6 +45,7 @@ impl Recovery {
         if self.pending {
             return Failure::Deferred;
         }
+        self.no_av1 = true;
         if self.trial {
             // A failed trial must immediately return to the last working rendition,
             // even during hold-down. Keep its dimensions, codec and every watch.
@@ -72,6 +77,41 @@ impl Recovery {
         Failure::Plan(ScreenRecovery { share: share.into(), codec, width, height, fps })
     }
 
+    pub fn av1(&self) -> bool {
+        !self.no_av1
+    }
+
+    pub fn retire_av1(&mut self) {
+        self.no_av1 = true;
+    }
+
+    /// A viewer cannot decode the share's AV1: one replacement with H.264 at the same size.
+    /// Without a decode failure there is nothing to cap or restore later.
+    pub fn downgrade_av1(
+        &mut self,
+        share: &str,
+        size: super::av1_stream::Requirements,
+        now: Instant,
+    ) -> Option<ScreenRecovery> {
+        if self.no_av1 {
+            return None;
+        }
+        self.no_av1 = true;
+        // A replacement already on its way is negotiated without AV1.
+        if self.pending {
+            return None;
+        }
+        self.pending = true;
+        self.last = Some(now);
+        Some(ScreenRecovery {
+            share: share.into(),
+            codec: ScreenRecoveryCodec::H264,
+            width: size.width,
+            height: size.height,
+            fps: 60,
+        })
+    }
+
     pub fn restore(&mut self, share: &str, active: &HashSet<SessionId>, now: Instant) -> Option<ScreenRecovery> {
         let elapsed = now.saturating_duration_since(self.last?);
         let delay = RESTORE_AFTER * (1 << self.backoff);
@@ -96,6 +136,33 @@ impl Recovery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn av1_gives_way_to_h264_once_and_decode_failures_retire_it() {
+        let now = Instant::now();
+        let size = super::super::av1_stream::Requirements { width: 2560, height: 1440 };
+        let mut r = Recovery::default();
+        assert!(r.av1());
+        let plan = r.downgrade_av1("s", size, now).unwrap();
+        assert_eq!((plan.codec, plan.width, plan.height, plan.fps), (ScreenRecoveryCodec::H264, 2560, 1440, 60));
+        assert!(r.pending && !r.av1());
+        r.pending = false;
+        assert!(r.downgrade_av1("s", size, now).is_none(), "once per share");
+        // It is not a decode failure: nothing is restored later.
+        assert!(r.restore("s", &HashSet::new(), now + RESTORE_AFTER * 64).is_none());
+        // A pending replacement absorbs the downgrade.
+        let mut pending = Recovery { pending: true, ..Recovery::default() };
+        assert!(pending.downgrade_av1("s", size, now).is_none());
+        assert!(!pending.av1());
+        let mut failed = Recovery::default();
+        plan_of(failed.fail("s", (1920, 1080), false, HashSet::from([1]), now));
+        assert!(!failed.av1());
+    }
+
+    fn plan_of(failure: Failure) -> ScreenRecovery {
+        let Failure::Plan(plan) = failure else { panic!("expected plan, got {failure:?}") };
+        plan
+    }
 
     fn plan(failure: Failure) -> ScreenRecovery {
         let Failure::Plan(plan) = failure else { panic!("expected plan, got {failure:?}") };

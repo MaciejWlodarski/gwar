@@ -793,3 +793,99 @@ async fn fresh_credit_startup_for_one_to_four_publishers_takes_under_200ms() {
         }
     }
 }
+
+/// Packs `(value, width)` fields most significant bit first.
+fn bits(fields: &[(u32, usize)]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (at, bit) in
+        fields.iter().flat_map(|&(value, width)| (0..width).rev().map(move |s| (value >> s) & 1)).enumerate()
+    {
+        if at % 8 == 0 {
+            out.push(0);
+        }
+        *out.last_mut().unwrap() |= (bit as u8) << (7 - at % 8);
+    }
+    out
+}
+
+/// An AV1 keyframe in one packet: a 1920x1080 profile 0 sequence header and a shown KEY_FRAME
+/// frame OBU, both length-prefixed (W=0, N=1).
+fn av1_keyframe() -> Vec<u8> {
+    let mut sequence = vec![0x08];
+    sequence.extend(bits(&[
+        (0, 3),
+        (0, 1),
+        (0, 1),
+        (0, 1),
+        (0, 1),
+        (0, 5),
+        (0, 12),
+        (8, 5),
+        (0, 1),
+        (15, 4),
+        (15, 4),
+        (1919, 16),
+        (1079, 16),
+    ]));
+    let frame = [0x30, 0x10, 0xaa, 0xbb];
+    let mut payload = vec![0x08, sequence.len() as u8];
+    payload.extend(sequence);
+    payload.push(frame.len() as u8);
+    payload.extend(frame);
+    payload
+}
+
+// The AV1 RTP specification's L1T3 descriptor: start and end of frame 0x1234, structure attached
+// (20 bytes, so the packet needs RFC 8285's two-byte header form).
+const ATTACHED: [u8; 20] = [
+    0xfd, 0x12, 0x34, 0x87, 0xa2, 0x14, 0xea, 0xaa, 0x44, 0x10, 0x4d, 0x14, 0x10, 0x20, 0x84, 0x27, 0x07, 0x7f, 0x04,
+    0x37,
+];
+
+#[tokio::test]
+async fn av1_srtp_forwarding_keeps_descriptors_and_gives_way_to_h264_for_a_viewer_without_av1() {
+    use str0m::format::Codec;
+    let server = TestServer::start().await;
+    let mut alice = Client::connect(&server, "av1").await;
+    let mut bob = Client::connect(&server, "viewer").await;
+    let mut dave = Client::connect(&server, "second").await;
+    let mut carol = Client::connect(&server, "h264-only").await;
+    assert_eq!(alice.ok("screen.av1.capabilities", json!({})).await, json!({"screen_av1": true}));
+    let channel = seed_channel(&alice, "General");
+    alice.ok("channel.join", json!({"channel": channel})).await;
+    let share = alice.share_here_codec(Codec::Av1).await;
+    let hd = json!({"width": 1920, "height": 1080});
+    let bs = bob.watch_av1(&share, hd.clone()).await as usize;
+    let ds = dave.watch_av1(&share, hd).await as usize;
+
+    let keyframe = Packet { sequence: 500, timestamp: 90000, marker: true, payload: av1_keyframe() };
+    // A delta frame with only the mandatory descriptor fields (one-byte header form).
+    let inter =
+        Packet { sequence: 501, timestamp: 93000, marker: true, payload: vec![0x00, 0x04, 0x30, 0x30, 0xaa, 0xbb] };
+    alice
+        .publisher(&share)
+        .send_described([(keyframe.clone(), Some(ATTACHED.to_vec())), (inter.clone(), Some(vec![0xc1, 0x12, 0x35]))])
+        .await;
+    for (client, slot) in [(&mut bob, bs), (&mut dave, ds)] {
+        let viewer = client.viewer.as_mut().unwrap();
+        let received = viewer.collect(Duration::from_millis(400)).await;
+        let payloads: Vec<_> = received.iter().filter(|(s, _)| *s == slot).map(|(_, p)| &p.payload).collect();
+        assert_eq!(payloads, [&keyframe.payload, &inter.payload], "AV1 payloads are forwarded byte for byte");
+        let headers = viewer.headers.lock().unwrap();
+        assert!(headers.iter().all(|&(_, _, pt)| pt == 47), "publisher PT 41 is rewritten for the viewer's PT 47");
+        let descriptors: Vec<_> = viewer.descriptors.lock().unwrap().iter().map(|(_, _, dd)| dd.clone()).collect();
+        // The slot's first segment starts at the publisher's frame number, so both are unchanged.
+        assert_eq!(descriptors, [Some(ATTACHED.to_vec()), Some(vec![0xc1, 0x12, 0x35])]);
+    }
+
+    // A viewer who cannot decode AV1 (no capability, no AV1 PT) turns the share to H.264 once.
+    let cs = carol.watch(&share).await as usize;
+    alice
+        .publisher(&share)
+        .send_described([(Packet { sequence: 502, timestamp: 96000, ..inter.clone() }, Some(vec![0xc1, 0x12, 0x36]))])
+        .await;
+    let recover = alice.next_event("screen.recover").await;
+    assert_eq!(recover, json!({"share": share, "codec": "h264", "width": 1920, "height": 1080, "fps": 60}));
+    let carol_got = carol.viewer.as_mut().unwrap().collect(Duration::from_millis(300)).await;
+    assert!(carol_got.iter().all(|(s, _)| *s != cs), "AV1 never reaches a slot without AV1");
+}

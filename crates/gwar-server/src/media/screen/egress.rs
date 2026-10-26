@@ -23,7 +23,10 @@ use std::{
 use gwar_proto::ScreenPauseReason;
 use str0m::media::Pt;
 
-use super::ingress::{self, Bucket};
+use super::{
+    dependency_descriptor::Raw,
+    ingress::{self, Bucket},
+};
 
 /// An original packet leaves at most this long after it arrived from the publisher.
 pub const DEADLINE: Duration = Duration::from_millis(400);
@@ -92,6 +95,8 @@ pub struct Queued {
     pub frame: u32,
     /// The first packet of a keyframe.
     pub keyframe: bool,
+    /// The AV1 Dependency Descriptor to send, with the slot's frame number.
+    pub dd: Option<Raw>,
     /// Part of the keyframe the slot is in; set by [`Egress::admit`].
     key: bool,
 }
@@ -108,7 +113,12 @@ impl Queued {
         frame: u32,
         keyframe: bool,
     ) -> Self {
-        Self { out, timestamp, marker, pt, arrival, payload, frame, keyframe, key: false }
+        Self { out, timestamp, marker, pt, arrival, payload, frame, keyframe, dd: None, key: false }
+    }
+
+    pub fn with_dd(mut self, dd: Option<Raw>) -> Self {
+        self.dd = dd;
+        self
     }
 
     pub fn key_frame(&self) -> Option<u32> {
@@ -116,7 +126,8 @@ impl Queued {
     }
 
     fn size(&self) -> usize {
-        self.payload.len() + ORIGINAL_OVERHEAD
+        // A descriptor adds its value, its two-byte-form element header and alignment.
+        self.payload.len() + ORIGINAL_OVERHEAD + self.dd.as_ref().map_or(0, |dd| dd.0.len() + 4)
     }
 }
 

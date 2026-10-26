@@ -114,6 +114,26 @@ impl Limits {
     }
 }
 
+/// AV1 sizes one viewer decodes. str0m answers AV1 only for an exact profile 0, `level-idx` 5,
+/// tier 0 match (no directional level negotiation), so the SDP says nothing about size: the
+/// viewer's verified decode probe does. Sizes compare by area and by the longer side, which
+/// admits portrait shares of a landscape probe.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Av1Limits {
+    pixels: u64,
+    side: u32,
+}
+
+impl Av1Limits {
+    pub fn verified(cap: &gwar_proto::Av1Capability) -> Self {
+        Self { pixels: u64::from(cap.width) * u64::from(cap.height), side: cap.width.max(cap.height) }
+    }
+
+    pub fn accepts(&self, need: &super::av1_stream::Requirements) -> bool {
+        need.pixels() <= self.pixels && need.width.max(need.height) <= self.side
+    }
+}
+
 pub(super) fn level_resources(id: u32) -> Option<(u32, u32)> {
     resources(id).map(|r| (r[1], r[0]))
 }
@@ -142,6 +162,22 @@ pub(super) fn offered(sdp: &str, verified: &[gwar_proto::H264Capability]) -> Has
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn av1_limits_follow_the_verified_size_in_either_orientation() {
+        use super::super::av1_stream::Requirements;
+        let limits = Av1Limits::verified(&gwar_proto::Av1Capability { width: 1920, height: 1080 });
+        for (width, height, fits) in [
+            (1920, 1080, true),
+            (1080, 1920, true),
+            (1280, 720, true),
+            (2560, 1440, false),
+            (1921, 1080, false),
+            (2000, 1000, false),
+        ] {
+            assert_eq!(limits.accepts(&Requirements { width, height }), fits, "{width}x{height}");
+        }
+    }
+
     #[test]
     fn verified_1440p60_viewer_limits_admit_the_level_51_publish_stream() {
         let cap = gwar_proto::H264Capability { profile_level_id: 0x42e033, max_fs: 14_400, max_mbps: 864_000 };

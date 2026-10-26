@@ -488,6 +488,7 @@ impl Core {
             sdp: sdp.clone(),
             browser,
             h264: h264.clone(),
+            av1: None,
             answer: None,
             connected: false,
             slots: Default::default(),
@@ -502,6 +503,7 @@ impl Core {
             sdp,
             browser,
             h264: h264.clone(),
+            av1: None,
             reply,
         });
         let Some(tx) = self.me.upgrade() else { return };
@@ -1048,6 +1050,7 @@ mod tests {
                         sdp: String::new(),
                         browser: false,
                         h264: vec![],
+                        av1: None,
                         answer: None,
                         connected: false,
                         slots: Default::default(),
@@ -1090,6 +1093,7 @@ mod tests {
                         sdp: String::new(),
                         browser: false,
                         h264: vec![],
+                        av1: None,
                         answer: None,
                         connected: false,
                         slots: Default::default(),
@@ -1137,6 +1141,7 @@ mod tests {
                 sdp: String::new(),
                 browser: false,
                 h264: vec![],
+                av1: None,
                 answer: None,
                 connected: true,
                 slots: Default::default(),
@@ -1181,6 +1186,7 @@ mod tests {
                 sdp: String::new(),
                 browser: false,
                 h264: vec![],
+                av1: None,
                 answer: None,
                 connected: true,
                 slots: Default::default(),
@@ -1202,6 +1208,7 @@ mod tests {
             sdp: String::new(),
             browser: false,
             h264: vec![],
+            av1: None,
             answer: None,
             connected: true,
             slots: Default::default(),
@@ -1276,7 +1283,7 @@ mod tests {
             core.end_share("S", ScreenStopReason::Stopped, None);
             for run in [1, 2] {
                 assert!(core.screen_watch_offer(session, 71 + run as u32, gwar_proto::ScreenWatchOffer {
-                    run, sdp: "pending".into(), browser: false, h264: vec![],
+                    run, sdp: "pending".into(), browser: false, h264: vec![], av1: None,
                 }).is_none());
             }
             let first = loop {

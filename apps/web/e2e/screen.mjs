@@ -20,6 +20,10 @@
  *   E2E_BROWSERS=chromium,webkit   engines to use (default: both); with one, it plays every role
  *   E2E_SCREEN_CANVAS=1          fixed 1080p60 canvas instead of adaptive tab capture
  *   E2E_SCREEN_REQUIRE_H264=1    fail if the main sharer exposes no H.264 encoder
+ *
+ * AV1 is hardware-only: the main sharer must offer AV1 exactly when MediaCapabilities reports a
+ * power-efficient AV1 encoder. Headless CI Chromium has none, so the share stays H.264 there;
+ * on a machine with one, the H.264-specific recovery checks are skipped.
  *   E2E_SCREEN_TRACE_DIR        retain server logs, browser events/state and watchdog samples
  *   RUST_LOG=info,gwar_server::media::screen=debug  include SFU recovery decisions in the logs
  *   GWAR_SERVER_BIN                 server binary (default: target/debug/gwar-server)
@@ -140,7 +144,7 @@ const diagnostics = page => page.evaluate(async () => ({
       streams.push({ dir: s.type === "inbound-rtp" ? "in" : "out", mid: s.mid, codec: codecs[s.codecId], packets: s.packetsReceived ?? s.packetsSent, bytes: s.bytesReceived ?? s.bytesSent,
         fps: s.framesPerSecond, limitation: s.qualityLimitationReason, encoder: s.encoderImplementation, frames: s.framesDecoded ?? s.framesEncoded, keyFrames: s.keyFramesDecoded ?? s.keyFramesEncoded, pli: s.pliCount, fir: s.firCount, nack: s.nackCount, size: `${s.frameWidth}x${s.frameHeight}` });
     });
-    return { state: pc.connectionState, streams, offeredCodecs: pc.localDescription?.sdp?.split(/\r?\n/).filter(l => /^m=video|^a=rtpmap:.*(H264|VP9|VP8)/i.test(l)), answeredCodecs: pc.remoteDescription?.sdp?.split(/\r?\n/).filter(l => /^m=video|^a=rtpmap:.*(H264|VP9|VP8)/i.test(l)) };
+    return { state: pc.connectionState, streams, offeredCodecs: pc.localDescription?.sdp?.split(/\r?\n/).filter(l => /^m=video|^a=rtpmap:.*(AV1|H264|VP9|VP8)/i.test(l)), answeredCodecs: pc.remoteDescription?.sdp?.split(/\r?\n/).filter(l => /^m=video|^a=rtpmap:.*(AV1|H264|VP9|VP8)/i.test(l)) };
   })),
   capture: window.__pcs.flatMap(pc => pc.getSenders().filter(s => s.track?.kind === "video").map(s => ({ settings: s.track.getSettings(), parameters: s.getParameters() }))),
   videos: [...document.querySelectorAll("video[data-share]")].map(v => {
@@ -307,8 +311,11 @@ async function decodes(page, share, id, what) {
   checks.push({ check: what, viewer: page.deviceName, ms, size: `${last.width}x${last.height}`, framesDecoded: last.framesDecoded, painted: false });
 }
 
-/** getStats codec evidence from the actual publish and receive transports, not SDP alone. */
-async function codecFlow(publisher, viewer, share, expected, size = null) {
+/**
+ * getStats codec evidence from the actual publish and receive transports, not SDP alone.
+ * `expected` may list several codecs; the publisher and the viewer must then agree on one.
+ */
+async function codecFlow(publisher, viewer, share, expectedCodecs, size = null) {
   const slot = await session(viewer, (_, screen, __, share) => screen.watches.find(w => w.share === share)?.slot, share);
   const read = async (page, direction) => page.evaluate(async ({ direction, slot }) => {
     for (const pc of window.__pcs) {
@@ -328,8 +335,10 @@ async function codecFlow(publisher, viewer, share, expected, size = null) {
     }
     return null;
   }, { direction, slot });
-  let sent, received;
-  await waitFor(async () => { sent = await read(publisher, "out"); received = await read(viewer, "in"); return sent?.mimeType === expected && received?.mimeType === expected &&
+  let sent, received, expected;
+  await waitFor(async () => {
+    sent = await read(publisher, "out"); received = await read(viewer, "in"); expected = sent?.mimeType;
+    return [expectedCodecs].flat().includes(expected) && received?.mimeType === expected &&
     (!size || [sent, received].every(s => s.frameWidth === size[0] && s.frameHeight === size[1])) &&
     (!(expected === "video/h264" && size?.[0] === 1920 && viewer.engine === "chromium") || sent.fps >= 50 && received.fps >= 50); }, `${expected} flows through the real SFU${size ? ` at ${size.join("x")}` : ""}`);
   if (expected === "video/h264" && size) {
@@ -387,12 +396,28 @@ async function run(browsers, web, server, token) {
   checks.push(capability);
   console.log(JSON.stringify(capability));
   if (process.env.E2E_SCREEN_REQUIRE_H264 === "1") assert.ok(hasH264, "this CI gate requires an H.264 encoder");
+  const av1Encoder = await cs.evaluate(async () => {
+    try {
+      const info = await navigator.mediaCapabilities.encodingInfo({ type: "webrtc", video: { contentType: "video/AV1", width: 1920, height: 1080, framerate: 60, bitrate: 8_000_000 } });
+      return { supported: info.supported, powerEfficient: info.powerEfficient };
+    } catch (error) { return { error: String(error) }; }
+  });
+  const hardwareAv1 = av1Encoder.supported === true && av1Encoder.powerEfficient === true;
+  checks.push({ check: "AV1 hardware encoder", engine: cs.engine, ...av1Encoder,
+    gap: hardwareAv1 ? null : "No hardware AV1 encoder: the share must not offer AV1 (hardware-only) and stays H.264." });
+  const primary = hardwareAv1 ? "video/av1" : hasH264 ? "video/h264" : "video/vp9";
+  // Only H.264 shares run the H.264-specific refusal and recovery checks below.
+  const h264Share = hasH264 && !hardwareAv1;
 
   // A real tab may adapt its capture size during bandwidth startup. The fixed
   // canvas run separately requires full 1080p60 despite the viewers' SDP level 3.1.
   const requiredSize = fixedCanvas ? SOURCE_SIZES[1] : null;
   const csShare = await share(cs, chromiumTab ? "Sharing a browser tab" : "Sharing your screen", "Game");
   checks.push({ check: "capture source", mode: chromiumTab ? "real tab" : "canvas", fixedCanvas });
+  const offersAv1 = await cs.evaluate(() => window.__pcs.some(pc => pc.connectionState !== "closed" &&
+    pc.getTransceivers().some(t => t.direction === "sendonly") && /^a=rtpmap:\d+ AV1\//im.test(pc.localDescription?.sdp ?? "")));
+  assert.equal(offersAv1, hardwareAv1, "the publish offer carries AV1 exactly when the encoder is hardware");
+  checks.push({ check: "AV1 offered only with a hardware encoder", offersAv1, hardwareAv1 });
   // Exercise encoder absence independently of the H.264 primary. A WebKit
   // sender may select High while Linux Chromium exposes only Constrained Baseline;
   // the generic lifecycle matrix must not assume those H.264 profiles intersect.
@@ -404,9 +429,9 @@ async function run(browsers, web, server, token) {
   await join(cv, channels.hall);
   await watch(cv, "cs-tab");
   await sees(cv, csShare, 1, "chromium → chromium, viewer in another channel");
-  await codecFlow(cs, cv, csShare, hasH264 ? "video/h264" : "video/vp9", requiredSize);
-  checks.push({ check: "selected browser codec verified through SFU", codec: hasH264 ? "h264" : "vp9", fixedCanvas });
-  if (hasH264) {
+  await codecFlow(cs, cv, csShare, primary, requiredSize);
+  checks.push({ check: "selected browser codec verified through SFU", codec: primary.replace("video/", ""), fixedCanvas });
+  if (h264Share) {
     const incompatible = await device(engine("chromium"), web, server, "vp9-only-viewer", { receiveCodec: "vp9" });
     await watch(incompatible, "cs-tab");
     await incompatible.getByText("Your browser cannot decode this screen share. Ask the sharer to use a compatible browser or codec.").waitFor();
@@ -425,7 +450,8 @@ async function run(browsers, web, server, token) {
   assert.equal(await shareOf(wv, "cs-tab"), csShare);
   await watch(wv, "cs-tab");
   await sees(wv, csShare, 1, "chromium → webkit, late joiner outside voice");
-  await codecFlow(cs, wv, csShare, hasH264 ? "video/h264" : "video/vp9", requiredSize);
+  // A viewer without AV1 decode turns an AV1 share to H.264 (docs/native-media.md, A2b).
+  await codecFlow(cs, wv, csShare, hardwareAv1 ? ["video/av1", "video/h264"] : primary, hardwareAv1 ? null : requiredSize);
   await watch(wv, "ws-canvas");
   await sees(wv, wsShare, 2, "webkit → webkit");
   await codecFlow(ws, wv, wsShare, "video/vp9");
@@ -497,7 +523,7 @@ async function run(browsers, web, server, token) {
   // Exercise isolation first, then corroborate the same failure across every active
   // viewer. Only the watchdog counters stall; real receiver stats/barcodes still
   // prove each replacement delivers video and keeps the original watch slots.
-  if (hasH264) {
+  if (h264Share) {
     const stalled = async (page, enabled) => {
       const slot = await session(page, (_, screen, __, share) => screen.watches.find(w => w.share === share)?.slot, csShare);
       await page.evaluate(({ slot, enabled }) => {

@@ -1,6 +1,6 @@
 import { WatchSession, type SocketLike } from "../watch/session";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { captureScreen, headroomBitrate, MIN_BITRATE, preferredCodecs, publishSsrcs, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, StuckCaptureGuard } from "./screen";
+import { captureScreen, DEPENDENCY_DESCRIPTOR, headroomBitrate, MIN_BITRATE, preferredCodecs, publishSsrcs, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, StuckCaptureGuard } from "./screen";
 
 import { deriveSpec, legacySpec, type ScreenSpec } from "./screen-quality";
 import type { ScreenPreset } from "../proto/ScreenPreset";
@@ -40,7 +40,9 @@ class Peer {
   ontrack: ((ev: unknown) => void) | null = null;
   close = vi.fn();
   sendParams: Array<RTCRtpSendParameters> = [];
-  transceivers: Array<{ direction: string; init: RTCRtpTransceiverInit; setCodecPreferences: ReturnType<typeof vi.fn>; receiver: Record<string, unknown>; sender: { getParameters: () => RTCRtpSendParameters; setParameters: ReturnType<typeof vi.fn> } }> = [];
+  transceivers: Array<{ direction: string; init: RTCRtpTransceiverInit; setCodecPreferences: ReturnType<typeof vi.fn>; setHeaderExtensionsToNegotiate: ReturnType<typeof vi.fn>; receiver: Record<string, unknown>; sender: { getParameters: () => RTCRtpSendParameters; setParameters: ReturnType<typeof vi.fn> } }> = [];
+  /** What `getParameters().codecs` reports: the negotiated codecs. */
+  codecs: RTCRtpCodecParameters[] = [];
   stats = new Map<string, Record<string, unknown>>([["out", { type: "outbound-rtp", kind: "video", framesEncoded: 1 }]]);
   createOffer = vi.fn(async () => ({ type: "offer" as const, sdp: Peer.offerSdp }));
   setLocalDescription = vi.fn(async (d: RTCSessionDescriptionInit) => { this.localDescription = d; });
@@ -50,10 +52,12 @@ class Peer {
   addTransceiver(_kind: unknown, init: RTCRtpTransceiverInit) {
     let transaction = 0;
     const sender = {
-      getParameters: () => ({ transactionId: `t${++transaction}`, encodings: [{ ...init.sendEncodings?.[0] }], codecs: [], headerExtensions: [], rtcp: {} }),
+      getParameters: () => ({ transactionId: `t${++transaction}`, encodings: [{ ...init.sendEncodings?.[0] }], codecs: this.codecs, headerExtensions: [], rtcp: {} }),
       setParameters: vi.fn(async (p: RTCRtpSendParameters) => { this.sendParams.push(p); }),
     };
-    const t = { direction: init.direction!, init, setCodecPreferences: vi.fn(), receiver: { jitterBufferTarget: null }, sender };
+    const extensions = [{ uri: "urn:ietf:params:rtp-hdrext:sdes:mid", direction: "sendrecv" }, { uri: DEPENDENCY_DESCRIPTOR, direction: "stopped" }];
+    const t = { direction: init.direction!, init, setCodecPreferences: vi.fn(), getHeaderExtensionsToNegotiate: () => extensions.map(e => ({ ...e })), setHeaderExtensionsToNegotiate: vi.fn(),
+      receiver: { jitterBufferTarget: null }, sender };
     this.transceivers.push(t);
     return t;
   }
@@ -278,7 +282,7 @@ describe("watch transport", () => {
     const pc = Peer.all[0]!;
     expect(pc.transceivers.map(t => t.direction)).toEqual(Array(SCREEN_SLOTS).fill("recvonly"));
     expect(pc.transceivers.every(t => t.receiver.jitterBufferTarget === 0)).toBe(true);
-    expect(offer).toHaveBeenCalledWith(expect.any(String), 5, []);
+    expect(offer).toHaveBeenCalledWith(expect.any(String), 5, [], null);
     pc.ontrack?.({ transceiver: pc.transceivers[2], track: "video", streams: [] });
     expect(tracks).toEqual([[2, { tracks: ["video"] }]]);
     transport.close();
@@ -1988,4 +1992,136 @@ it.each(["initial offer", "recovery offer"])("silently stopped capture is detect
     expect(ended).toHaveBeenCalledTimes(1);
     expect(Peer.all.at(-1)!.getStats).not.toHaveBeenCalled();
   } finally { publisher.close(); answer("answer"); await starting; }
+});
+
+describe("AV1", () => {
+  const av1 = codec("video/AV1", "level-idx=5;profile=0;tier=0");
+  const all = [codec("video/H264", "packetization-mode=1;profile-level-id=42e01f"), codec("video/VP9", "profile-id=0"), av1, codec("video/AV1", "level-idx=5;profile=1;tier=0"), codec("video/rtx")];
+  const track = () => ({ applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }), contentHint: "" }) as unknown as MediaStreamTrack;
+  const mimes = (pc: Peer) => (pc.transceivers[0]!.setCodecPreferences.mock.calls[0]![0] as RTCRtpCodec[]).map(c => `${c.mimeType} ${c.sdpFmtpLine ?? ""}`.trim());
+
+  it("comes first only when asked for, and only profile 0", () => {
+    expect(preferredCodecs(all).some(c => c.mimeType === "video/AV1")).toBe(false);
+    expect(preferredCodecs(all, true).map(c => c.mimeType)).toEqual(["video/AV1", "video/H264", "video/VP9", "video/rtx"]);
+    expect(preferredCodecs([codec("video/AV1"), ...all], true).filter(c => c.mimeType === "video/AV1")).toHaveLength(2);
+  });
+
+  it("needs a supported, power-efficient WebRTC encoder, within the deadline", async () => {
+    const { probeAv1Encoder } = await import("./screen");
+    const encodingInfo = vi.fn(async () => ({ supported: true, smooth: true, powerEfficient: true }));
+    vi.stubGlobal("navigator", { mediaCapabilities: { encodingInfo } });
+    expect(await probeAv1Encoder()).toBe(true);
+    expect(encodingInfo).toHaveBeenCalledWith(expect.objectContaining({ type: "webrtc", video: expect.objectContaining({ contentType: "video/AV1", height: 1080, framerate: 60 }) }));
+    encodingInfo.mockResolvedValueOnce({ supported: true, smooth: true, powerEfficient: false });
+    expect(await probeAv1Encoder()).toBe(false);
+    encodingInfo.mockRejectedValueOnce(new Error("unsupported"));
+    expect(await probeAv1Encoder()).toBe(false);
+    encodingInfo.mockImplementationOnce(() => new Promise(() => {}));
+    const pending = probeAv1Encoder();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(await pending).toBe(false);
+    vi.stubGlobal("navigator", {});
+    expect(await probeAv1Encoder()).toBe(false);
+  });
+
+  it("decodes in hardware, or in software on desktops up to 1080p", async () => {
+    const { probeAv1 } = await import("./screen");
+    let hardware = false, mobile = false;
+    const decodingInfo = vi.fn(async (c: MediaDecodingConfiguration) => ({ supported: true, smooth: true, powerEfficient: hardware && c.video!.height <= 1440 }));
+    vi.stubGlobal("navigator", { mediaCapabilities: { decodingInfo }, get userAgentData() { return { mobile }; } });
+    expect(await probeAv1()).toEqual({ width: 1920, height: 1080 });
+    expect(decodingInfo.mock.calls.every(([c]) => c.type === "webrtc" && c.video!.contentType === "video/AV1" && c.video!.framerate === 60)).toBe(true);
+    hardware = true;
+    expect(await probeAv1()).toEqual({ width: 2560, height: 1440 });
+    hardware = false; mobile = true;
+    expect(await probeAv1()).toBeNull();
+    decodingInfo.mockImplementation(() => new Promise(() => {}));
+    const pending = probeAv1();
+    await vi.advanceTimersByTimeAsync(1500);
+    expect(await pending).toBeNull();
+  });
+
+  it("is offered first with its descriptor by a hardware encoder, and never after a recovery plan", async () => {
+    vi.stubGlobal("RTCRtpSender", { getCapabilities: () => ({ codecs: all }) });
+    const publisher = new ScreenPublisher({ track: track(), quality: TEST_SPECS.game, av1: true, iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    expect(mimes(Peer.all[0]!)[0]).toBe("video/AV1 level-idx=5;profile=0;tier=0");
+    expect(Peer.all[0]!.transceivers[0]!.setHeaderExtensionsToNegotiate).toHaveBeenCalledWith([expect.objectContaining({ direction: "sendrecv" }), { uri: DEPENDENCY_DESCRIPTOR, direction: "sendonly" }]);
+    await publisher.recover({ share: "s", codec: "h264", width: 1920, height: 1080, fps: 60 });
+    expect(mimes(Peer.all[1]!).some(m => m.startsWith("video/AV1"))).toBe(false);
+    expect(Peer.all[1]!.transceivers[0]!.setHeaderExtensionsToNegotiate).not.toHaveBeenCalled();
+    publisher.close();
+
+    const plain = new ScreenPublisher({ track: track(), quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
+    await plain.start();
+    expect(mimes(Peer.all[2]!).some(m => m.startsWith("video/AV1"))).toBe(false);
+    plain.close();
+  });
+
+  it("leaves a software AV1 encoder for the negotiated H.264 in place, or ends the transport", async () => {
+    const state = vi.fn();
+    const publisher = new ScreenPublisher({ track: track(), quality: TEST_SPECS.game, av1: true, iceServers: [], offer: async () => "answer", state });
+    await publisher.start();
+    const pc = Peer.all[0]!;
+    pc.codecs = [{ mimeType: "video/AV1", clockRate: 90000, payloadType: 45, sdpFmtpLine: "level-idx=5;profile=0;tier=0" }, { mimeType: "video/H264", clockRate: 90000, payloadType: 108, sdpFmtpLine: "packetization-mode=1;profile-level-id=42e033" }];
+    pc.stats.set("codec", { type: "codec", mimeType: "video/AV1" });
+    let at = 0;
+    const encode = (powerEfficientEncoder: boolean) => pc.stats.set("out", { type: "outbound-rtp", kind: "video", codecId: "codec", framesEncoded: 60 + at, timestamp: at += 2000, encoderImplementation: "libaom", powerEfficientEncoder });
+    encode(true);
+    await vi.advanceTimersByTimeAsync(2_000);
+    encode(false);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(pc.sendParams.some(p => "codec" in (p.encodings[0] ?? {}))).toBe(false);
+    encode(false);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(pc.sendParams.at(-1)?.encodings[0]).toMatchObject({ codec: { mimeType: "video/H264", clockRate: 90000, sdpFmtpLine: "packetization-mode=1;profile-level-id=42e033" } });
+    // This engine ignores the switch: AV1 stays in software, so the transport ends.
+    for (let i = 0; i < 3; i++) { encode(false); await vi.advanceTimersByTimeAsync(2_000); }
+    expect(state).toHaveBeenCalledWith("failed");
+    publisher.close();
+  });
+
+  it("is received only with a verified decoder, which the offer then reports", async () => {
+    vi.stubGlobal("RTCRtpReceiver", { getCapabilities: () => ({ codecs: all }) });
+    const decodingInfo = vi.fn(async (_c: MediaDecodingConfiguration) => ({ supported: true, smooth: true, powerEfficient: true }));
+    vi.stubGlobal("navigator", { mediaCapabilities: { decodingInfo } });
+    const offer = vi.fn(async () => "answer");
+    const transport = new ScreenWatchTransport({ run: 1, av1: true, iceServers: [], offer, state: () => {}, track: () => {} });
+    await transport.start();
+    expect(mimes(Peer.all[0]!)[0]).toBe("video/AV1 level-idx=5;profile=0;tier=0");
+    expect(Peer.all[0]!.transceivers[0]!.setHeaderExtensionsToNegotiate).toHaveBeenCalledWith(expect.arrayContaining([{ uri: DEPENDENCY_DESCRIPTOR, direction: "recvonly" }]));
+    expect(offer).toHaveBeenCalledWith(expect.any(String), 1, expect.any(Array), { width: 2560, height: 1440 });
+    transport.close();
+
+    decodingInfo.mockResolvedValue({ supported: false, smooth: false, powerEfficient: false });
+    const without = new ScreenWatchTransport({ run: 2, av1: true, iceServers: [], offer, state: () => {}, track: () => {} });
+    await without.start();
+    expect(mimes(Peer.all[1]!).some(m => m.startsWith("video/AV1"))).toBe(false);
+    expect(offer).toHaveBeenLastCalledWith(expect.any(String), 2, [], null);
+    without.close();
+
+    // A guest's page never probes or offers AV1.
+    const guest = new ScreenWatchTransport({ run: 3, slots: 1, iceServers: [], offer, state: () => {}, track: () => {} });
+    decodingInfo.mockClear();
+    await guest.start();
+    expect(mimes(Peer.all[2]!).some(m => m.startsWith("video/AV1"))).toBe(false);
+    expect(decodingInfo.mock.calls.some(([c]) => c.video?.contentType === "video/AV1")).toBe(false);
+    guest.close();
+  });
+
+  it("watches AV1 decode progress like H.264", async () => {
+    const decodeFailed = vi.fn();
+    const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {}, decodeFailed });
+    await transport.start();
+    const pc = Peer.all[0]!;
+    (pc.transceivers[0] as unknown as { mid: string }).mid = "0";
+    pc.stats = new Map([["codec", { type: "codec", mimeType: "video/AV1" }]]);
+    transport.keyframe(0, "A", 1);
+    for (let i = 1; i <= 6; i++) {
+      pc.stats.set("in", { type: "inbound-rtp", kind: "video", mid: "0", codecId: "codec", packetsReceived: i * 100, framesDecoded: 0 });
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    expect(decodeFailed).toHaveBeenCalledWith(0, "A", 1);
+    transport.close();
+  });
 });

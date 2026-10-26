@@ -2,6 +2,7 @@
 //! and a str0m viewer with the watch transport's slots, both in RTP mode over real SRTP.
 #![allow(dead_code)]
 use super::Client;
+use gwar_server::media::screen::dependency_descriptor::{self, Raw};
 use serde_json::json;
 use std::{
     collections::HashSet,
@@ -15,9 +16,9 @@ use str0m::{
     Candidate, Event, Input, Output, Rtc,
     change::SdpAnswer,
     format::Codec,
-    media::{Direction, MediaKind, Mid},
+    media::{Direction, Frequency, MediaKind, Mid},
     net::{Protocol, Receive},
-    rtp::RtpWrite,
+    rtp::{ExtensionValues, RtpWrite},
 };
 use tokio::{net::UdpSocket, sync::mpsc};
 
@@ -89,7 +90,7 @@ pub struct Publisher {
     pub share: String,
     pub ssrc: u32,
     pub rtx: u32,
-    tx: mpsc::Sender<Packet>,
+    tx: mpsc::Sender<(Packet, Option<Vec<u8>>)>,
     /// Keyframe requests (PLI/FIR) the server sent.
     pub keyframe_requests: Arc<AtomicU64>,
     /// Receipt times of the server's keyframe requests, for startup latency checks.
@@ -113,12 +114,35 @@ async fn socket() -> (UdpSocket, std::net::SocketAddr) {
     (socket, local)
 }
 
-fn rtc(local: std::net::SocketAddr, h264_pt: u8) -> Rtc {
-    let mut config = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp9(true);
+/// A str0m peer with VP9 and H.264 (PT `h264_pt`); with `av1`, also AV1 profile 0 level 5.1 on
+/// PT `pt` and the Dependency Descriptor on extension id `dd`.
+fn rtc(local: std::net::SocketAddr, h264_pt: u8, av1: Option<Av1>) -> Rtc {
+    let mut config = Rtc::builder().set_rtp_mode(true).clear_codecs();
+    if let Some(Av1 { pt, dd }) = av1 {
+        let format =
+            str0m::format::FormatParams { profile: Some(0), level_idx: Some(5), tier: Some(0), ..Default::default() };
+        config = config.set_extension(dd, dependency_descriptor::extension());
+        config.codec_config().add_config(
+            pt.into(),
+            Some((pt + 1).into()),
+            Codec::Av1,
+            Frequency::NINETY_KHZ,
+            None,
+            format,
+        );
+    }
+    config = config.enable_vp9(true);
     config.codec_config().add_h264(h264_pt.into(), Some((h264_pt + 1).into()), true, 0x42e01f);
     let mut rtc = config.build(Instant::now());
     rtc.add_local_candidate(Candidate::host(local, "udp").unwrap());
     rtc
+}
+
+/// A peer's AV1 payload type and Dependency Descriptor extension id.
+#[derive(Clone, Copy)]
+pub struct Av1 {
+    pub pt: u8,
+    pub dd: u8,
 }
 
 fn video_ssrcs(sdp: &str) -> (u32, u32) {
@@ -135,7 +159,9 @@ impl Publisher {
 
     pub async fn start_codec(client: &mut Client, share: &str, codec: Codec) -> Self {
         let (socket, local) = socket().await;
-        let mut rtc = rtc(local, 118);
+        // AV1 on other numbers than the server's, and the descriptor on another extension id.
+        let av1 = (codec == Codec::Av1).then_some(Av1 { pt: 41, dd: 7 });
+        let mut rtc = rtc(local, 118, av1);
         let mut api = rtc.sdp_api();
         let mid = api.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
         let (offer, pending) = api.apply().unwrap();
@@ -156,7 +182,7 @@ impl Publisher {
             })
             .unwrap()
             .pt();
-        let (tx, mut commands) = mpsc::channel::<Packet>(4096);
+        let (tx, mut commands) = mpsc::channel::<(Packet, Option<Vec<u8>>)>(4096);
         let keyframe_requests = Arc::new(AtomicU64::new(0));
         let requests = keyframe_requests.clone();
         let request_times = Arc::new(Mutex::new(Vec::new()));
@@ -195,12 +221,17 @@ impl Publisher {
                 };
                 tokio::select! {
                     packet = commands.recv() => {
-                        let Some(p) = packet else { return };
+                        let Some((p, dd)) = packet else { return };
+                        let mut ext_vals = ExtensionValues::default();
+                        if let Some(dd) = dd {
+                            ext_vals.user_values.set(Raw::new(&dd).unwrap());
+                        }
                         let mut direct = rtc.direct_api();
                         let stream = direct.stream_tx_by_mid(mid, None).unwrap();
                         stream.write_rtp(
                             RtpWrite::new(pt, p.sequence.into(), p.timestamp, Instant::now(), p.payload)
                                 .marker(p.marker)
+                                .ext_vals(ext_vals)
                                 .nackable(true),
                         );
                     },
@@ -219,6 +250,11 @@ impl Publisher {
     }
 
     pub async fn send(&self, packets: impl IntoIterator<Item = Packet>) {
+        self.send_described(packets.into_iter().map(|p| (p, None))).await;
+    }
+
+    /// Sends packets with their Dependency Descriptor bytes, if any.
+    pub async fn send_described(&self, packets: impl IntoIterator<Item = (Packet, Option<Vec<u8>>)>) {
         for packet in packets {
             self.tx.send(packet).await.unwrap();
         }
@@ -264,11 +300,16 @@ impl Gate {
     }
 }
 
+/// A received packet's slot, sequence number and Dependency Descriptor bytes.
+pub type Described = (usize, u64, Option<Vec<u8>>);
+
 pub struct Viewer {
     pub run: u64,
     rx: mpsc::Receiver<(usize, Packet)>,
     /// Actual received (slot, SSRC, PT), after SRTP and RTX handling.
     pub headers: Arc<Mutex<Vec<(usize, u32, u8)>>>,
+    /// Dependency Descriptor bytes as received, per packet.
+    pub descriptors: Arc<Mutex<Vec<Described>>>,
     /// Incoming datagrams to lose on the way from the server, on any stream.
     pub loss: Loss,
     /// Outgoing datagrams to hold back.
@@ -294,6 +335,17 @@ impl Viewer {
         .await
     }
 
+    /// Like [`Viewer::start`], also offering AV1 with the Dependency Descriptor and reporting
+    /// `capability` (the verified AV1 decode size) in the watch offer.
+    pub async fn start_av1(client: &mut Client, run: u64, capability: serde_json::Value) -> Self {
+        Self::negotiate_with(gwar_proto::SCREEN_SLOTS, run, Some(Av1 { pt: 47, dd: 14 }), move |sdp| async move {
+            let offer = json!({"run": run, "sdp": sdp, "av1": capability});
+            let answer = client.ok("screen.watch.offer", offer).await;
+            answer["sdp"].as_str().unwrap().to_owned()
+        })
+        .await
+    }
+
     /// A watch transport of `slots` receive-only video slots, negotiated by `offer` (which
     /// answers the SDP answer); waits until it is connected.
     pub async fn negotiate<F: std::future::Future<Output = String>>(
@@ -301,8 +353,17 @@ impl Viewer {
         run: u64,
         offer: impl FnOnce(String) -> F,
     ) -> Self {
+        Self::negotiate_with(slots, run, None, offer).await
+    }
+
+    async fn negotiate_with<F: std::future::Future<Output = String>>(
+        slots: usize,
+        run: u64,
+        av1: Option<Av1>,
+        offer: impl FnOnce(String) -> F,
+    ) -> Self {
         let (socket, local) = socket().await;
-        let mut rtc = rtc(local, 116);
+        let mut rtc = rtc(local, 116, av1);
         // str0m's random mids can collide within one offer: redraw.
         let (mids, sdp, pending) = loop {
             let mut api = rtc.sdp_api();
@@ -319,6 +380,8 @@ impl Viewer {
         let (received, rx) = mpsc::channel(8192);
         let headers = Arc::new(Mutex::new(Vec::new()));
         let observed = headers.clone();
+        let descriptors = Arc::new(Mutex::new(Vec::new()));
+        let described = descriptors.clone();
         let loss = Loss::default();
         let lose = loss.clone();
         let gate = Gate::default();
@@ -350,6 +413,8 @@ impl Viewer {
                             };
                             let Some(slot) = mids.iter().position(|m| *m == slot) else { continue };
                             observed.lock().unwrap().push((slot, *p.header.ssrc, *p.header.payload_type));
+                            let dd = p.header.ext_vals.user_values.get::<Raw>().map(|raw| raw.0.to_vec());
+                            described.lock().unwrap().push((slot, *p.seq_no, dd));
                             let packet = Packet {
                                 sequence: *p.seq_no,
                                 timestamp: p.header.timestamp,
@@ -383,7 +448,7 @@ impl Viewer {
             }
         });
         tokio::time::timeout(Duration::from_secs(5), connected).await.expect("watch transport connects").unwrap();
-        Self { run, rx, headers, loss, gate, drop_repairs, task }
+        Self { run, rx, headers, descriptors, loss, gate, drop_repairs, task }
     }
 
     /// The next packet received in any slot.

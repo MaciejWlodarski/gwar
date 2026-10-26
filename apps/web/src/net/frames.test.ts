@@ -51,6 +51,8 @@ describe("bounded server frames", () => {
     expect(responseFor("screen.spec.capabilities", { screen_spec: true, extra: 1 })).toBe(false);
     // Old clients' capability shape is unchanged.
     expect(responseFor("screen.capabilities", { screen_h264: true, screen_spec: true })).toBe(false);
+    expect(responseFor("screen.av1.capabilities", { screen_av1: true })).toBe(true);
+    for (const reply of [{}, { screen_av1: 1 }, { screen_av1: true, screen_h264: true }]) expect(responseFor("screen.av1.capabilities", reply)).toBe(false);
     const share = { share: "A".repeat(22), client: 1, channel: 1, preset: "game", surface: "screen" };
     const frame = (d: unknown) => JSON.stringify({ ev: "screen.started", d });
     expect(parseFrame(frame(share))?.kind).toBe("event");
