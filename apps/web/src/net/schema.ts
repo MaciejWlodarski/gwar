@@ -103,7 +103,8 @@ const ownerInfo = shape<OwnerInfo>({ uid: fixed(20), generation: int(Number.MAX_
 const envelope = str(32768);
 const managers = shape<Managers>({ anchor: nullable(envelope), list: nullable(envelope), pending: array(uid, 10000), stale: array(uid, 10000) });
 const shareId = fixed(16);
-const screenShare = shape<ScreenShare>({ share: shareId, client: id, channel: id, preset: literal(["text", "smooth", "game", "saver"]), surface: literal(["screen", "window", "tab", "unknown"]) });
+const screenSpec = shape<import("../proto/ScreenSpec").ScreenSpec>({ mode: literal(["smooth", "sharp"]), height: (v): v is 720 | 1080 | 1440 => v === 720 || v === 1080 || v === 1440, fps: (v): v is 15 | 30 | 60 => v === 15 || v === 30 || v === 60 });
+const screenShare = shape<ScreenShare>({ share: shareId, client: id, channel: id, preset: literal(["text", "smooth", "game", "saver"]), spec: optional(screenSpec), surface: literal(["screen", "window", "tab", "unknown"]) });
 const welcome = shape<Welcome>({ session: id, uid, server, permissions: array(permissions, 32), groups: array(group, 128), channels: array(channel, 1024), clients: array(client, 4096), members: array(member, 10000), unread: array(unread, 1024), conversations: array(conversationUnread, 10000), ice_servers: array(ice, 32), file_access: bearer, owner: optional(nullable(ownerInfo)), managers: optional(nullable(managers)), shares: optional(array(screenShare, 256)) });
 const target: Rule<ChatTarget> = (v): v is ChatTarget => v === "server" || shape<{ channel: number }>({ channel: id })(v) || shape<{ client: number }>({ client: id })(v);
 const certificate = shape<DeviceCertificate>({ account_key: fixed(32), device_key: fixed(32), issued_at: id, expires_at: id, signature: fixed(64) });
@@ -210,6 +211,7 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "voice.state": shape({voice:nullable(voiceState)}),
   "voice.epoch.ack": empty, "voice.epoch.repeat": empty,
   "screen.start": shape({ share: shareId }), "screen.stop": empty, "screen.watch": shape({ slot: int(3) }), "screen.unwatch": empty, "screen.stop_other": empty, "screen.link.revoke": empty,
+  "screen.spec.capabilities": shape({ screen_spec: bool }),
   "screen.capabilities": shape({ screen_h264: bool }),
   "screen.publish.offer": shape({ sdp: str(65536) }), "screen.watch.offer": shape({ sdp: str(65536) }), "screen.focus": empty, "screen.keyframe": empty, "screen.decode_failed": empty,
   "owner.chain": shape({ genesis: str(1024), links: array(shape({ statement: str(2048), signature: fixed(64) }), 64), next: nullable(id) }),

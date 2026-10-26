@@ -152,3 +152,21 @@ it("two devices that keep different twins of one server still end with one bookm
     vi.useRealTimers();
   }
 });
+
+it.each(["text", "smooth", "game", "saver", "auto"] as const)("migrates saved %s quality on hydration and keeps independent fields across reloads", async screenPreset => {
+  const data = new Map<string, string>([["gwar.settings", JSON.stringify({ version: 1, state: { screenPreset, theme: "dark" } })]]);
+  const storage = { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => data.set(key, value), removeItem: (key: string) => data.delete(key) };
+  vi.stubGlobal("window", { localStorage: storage });
+  vi.resetModules();
+  const { useSettings } = await import("./settings");
+  const { legacySpec, defaultQuality } = await import("../voice/screen-quality");
+  const expected = screenPreset === "auto" ? defaultQuality : { screenMode: legacySpec(screenPreset).mode, screenHeight: legacySpec(screenPreset).height, screenFps: legacySpec(screenPreset).fps };
+  expect(useSettings.getState()).toMatchObject(expected);
+  const saved = JSON.parse(data.get("gwar.settings")!);
+  expect(saved.version).toBe(2);
+  expect(saved.state.screenPreset).toBeUndefined();
+  useSettings.getState().setScreenQuality({ screenHeight: 1440 });
+  useSettings.getState().setScreenQuality({ screenFps: 60 });
+  await useSettings.persist.rehydrate();
+  expect(useSettings.getState()).toMatchObject({ ...expected, screenHeight: 1440, screenFps: 60 });
+});

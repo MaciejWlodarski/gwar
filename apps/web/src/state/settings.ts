@@ -1,3 +1,4 @@
+import { defaultQuality, migrateQuality, type QualitySettings } from "../voice/screen-quality";
 import { serverKey } from "../lib/server-key";
 import { useMemo } from "react";
 import { create } from "zustand";
@@ -175,7 +176,7 @@ export interface NotificationSettings {
   allMessages: boolean;
 }
 
-export interface SettingsState {
+export interface SettingsState extends QualitySettings {
   theme: Theme;
   language: Language;
   compact: boolean;
@@ -204,6 +205,7 @@ export interface SettingsState {
   /** "Back up message keys to Gwar Connect" (docs/e2e-build.md, section 7): off means no uploads; reading and transfers still work. */
   archiveUploads: boolean;
 
+  setScreenQuality(patch: Partial<QualitySettings>): void;
   setTheme(theme: Theme): void;
   setLanguage(language: Language): void;
   setCompact(compact: boolean): void;
@@ -253,6 +255,8 @@ export const defaultDesktop: DesktopSettings = { muteShortcut: null, deafenShort
 export const useSettings = create<SettingsState>()(
   persist(
     (set) => ({
+      ...defaultQuality,
+      setScreenQuality: (patch) => set(patch),
       theme: "system",
       language: detectLanguage(),
       compact: false,
@@ -360,8 +364,9 @@ export const useSettings = create<SettingsState>()(
       version: SETTINGS_VERSION,
       // zustand's default storage (`window.localStorage`), guarded.
       storage: createJSONStorage(() => guardedLocalStorage(window.localStorage)),
+      migrate: (persisted) => migrateQuality((persisted ?? {}) as Record<string, unknown>),
       merge: (persisted, current) => {
-        const p = (persisted ?? {}) as Partial<SettingsState>;
+        const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
         return { ...current, ...p, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},

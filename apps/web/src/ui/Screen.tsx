@@ -15,7 +15,8 @@ import { guestLinkPossible, useCanWatch, useScreenSupport } from "../state/scree
 import { shareOf } from "../state/reducer";
 import { slotOf, useScreen } from "../state/screen";
 import { useSession } from "../state/stores";
-import { PRESET_CHOICES, type PresetChoice, type PublishStats } from "../voice/screen";
+import { type PublishStats } from "../voice/screen";
+import { HEIGHTS, FRAME_RATES, type ScreenSpec } from "../voice/screen-quality";
 import { useChannelPermission, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
 import { Button, Dialog, IconButton, panelCard, TalkingAvatar, Tooltip } from "./kit";
 
@@ -72,9 +73,33 @@ export function ShareButton() {
   );
 }
 
-const presetLabel = (choice: PresetChoice): Key => `screen.preset.${choice}` as Key;
+function QualityControls({ spec, bar = false }: { spec: ScreenSpec; bar?: boolean }) {
+  const t = useT();
+  const selectStyle = bar ? "h-7 rounded-md border border-white/30 bg-white/15 px-1.5 text-xs text-white [&>option]:text-black" : "h-8 rounded-md border border-line bg-side px-2 text-sm text-fg";
+  return <div className="flex flex-wrap items-center gap-3">
+    <fieldset>
+      <legend className="mb-1 text-xs">{t("screen.mode")}</legend>
+      <div role="radiogroup" aria-label={t("screen.mode")} className="flex gap-1">
+        {(["smooth", "sharp"] as const).map(mode => <label key={mode} className={cn("flex cursor-pointer items-center gap-1.5 rounded-md border px-2 py-1 text-xs", bar ? "border-white/30" : spec.mode === mode ? "border-accent bg-accent-soft" : "border-line hover:bg-hover")}>
+          <input type="radio" name={bar ? "sharing-mode" : "screen-mode"} className="accent-[var(--accent)]" checked={spec.mode === mode} onClick={() => { if (spec.mode === mode) controller.screen.setQuality({ mode }); }} onChange={() => controller.screen.setQuality({ mode })} />
+          {t(`screen.mode.${mode}`)}
+        </label>)}
+      </div>
+    </fieldset>
+    <label className="flex flex-col gap-1 text-xs">{t("screen.resolution")}
+      <select aria-label={t("screen.resolution")} value={spec.height} className={selectStyle} onChange={e => controller.screen.setQuality({ height: Number(e.target.value) as ScreenSpec["height"] })}>
+        {HEIGHTS.map(height => <option key={height} value={height}>{height}p</option>)}
+      </select>
+    </label>
+    <label className="flex flex-col gap-1 text-xs">{t("screen.frameRate")}
+      <select aria-label={t("screen.frameRate")} value={spec.fps} className={selectStyle} onChange={e => controller.screen.setQuality({ fps: Number(e.target.value) as ScreenSpec["fps"] })}>
+        {FRAME_RATES.map(fps => <option key={fps} value={fps}>{fps} fps</option>)}
+      </select>
+    </label>
+  </div>;
+}
 
-/** The preset menu, after the browser's picker and before anything is published. */
+/** The quality menu, after the browser's picker and before anything is published. */
 export function SharePresetDialog() {
   const t = useT();
   const own = useScreen(s => s.own);
@@ -98,20 +123,7 @@ export function SharePresetDialog() {
       }
     >
       <OwnPreview stream={own.stream} className="mb-3 aspect-video w-full rounded-md bg-black" />
-      <fieldset>
-        <legend className="mb-1.5 text-xs font-medium text-muted">{t("screen.preset")}</legend>
-        <div role="radiogroup" aria-label={t("screen.preset")} className="flex flex-col gap-1">
-          {PRESET_CHOICES.map(choice => (
-            <label key={choice} className={cn("t flex cursor-pointer items-start gap-2 rounded-md border px-3 py-2", own.choice === choice ? "border-accent bg-accent-soft" : "border-line hover:bg-hover")}>
-              <input type="radio" name="screen-preset" className="mt-1 accent-[var(--accent)]" checked={own.choice === choice} onChange={() => controller.screen.setPreset(choice)} />
-              <span className="min-w-0">
-                <span className="block text-sm font-medium text-fg">{t(presetLabel(choice))}</span>
-                <span className="block text-xs text-muted">{t(`screen.presetHint.${choice}` as Key)}</span>
-              </span>
-            </label>
-          ))}
-        </div>
-      </fieldset>
+      <QualityControls spec={own.spec} />
       <p className="mt-3 text-xs text-subtle">{t("screen.presetHint")}</p>
       {linkable && (
         // Shown before anything is published: no link exists until the share starts with it.
@@ -140,7 +152,7 @@ function OwnPreview({ stream, className }: { stream: MediaStream | null; classNa
 
 // ------------------------------------------------------------------ sharing
 
-/** The red bar while I share: viewers, the preset, an optional preview and Stop. */
+/** The red bar while I share: viewers, quality settings, an optional preview and Stop. */
 export function SharingBar() {
   const t = useT();
   const lang = useLanguage();
@@ -165,13 +177,8 @@ export function SharingBar() {
         </span>
       )}
       <span className="ml-auto flex items-center gap-2">
-        <label className="flex items-center gap-1.5 text-xs">
-          {t("screen.preset")}
-          <select value={own.choice} onChange={e => controller.screen.setPreset(e.target.value as PresetChoice)}
-            className="h-7 cursor-pointer rounded-md border border-white/30 bg-white/15 px-1.5 text-xs text-white [&>option]:text-black">
-            {PRESET_CHOICES.map(choice => <option key={choice} value={choice}>{t(presetLabel(choice))}</option>)}
-          </select>
-        </label>
+        <span className="text-xs">{`${own.spec.height}p${own.spec.fps} · ${t(`screen.mode.${own.spec.mode}`)}`}</span>
+        <QualityControls spec={own.spec} bar />
         <Button size="sm" variant="secondary" aria-pressed={own.preview} className={cn("border-white/40 text-white hover:bg-white/15", own.preview && "bg-white/20")}
           onClick={() => controller.screen.setPreview(!own.preview)}>
           {t("screen.preview")}
@@ -187,7 +194,7 @@ export function SharingBar() {
 
 /**
  * What my encoder sends, and why it is held back: "cpu" means this computer cannot encode the
- * preset in time, "bandwidth" the connection. The encoder name tells software from hardware.
+ * selected settings in time, "bandwidth" the connection. The encoder name tells software from hardware.
  */
 function SenderStats() {
   const t = useT();

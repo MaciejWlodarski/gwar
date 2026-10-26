@@ -46,6 +46,17 @@ describe("bounded server frames", () => {
     expect(responseFor("join", welcome())).toBe(true);
     expect(responseFor("join", { ...welcome(), screen_h264: true })).toBe(false);
   });
+  it("parses legacy and negotiated shares while bounding every spec field", () => {
+    expect(responseFor("screen.spec.capabilities", { screen_spec: true })).toBe(true);
+    expect(responseFor("screen.spec.capabilities", { screen_spec: true, extra: 1 })).toBe(false);
+    // Old clients' capability shape is unchanged.
+    expect(responseFor("screen.capabilities", { screen_h264: true, screen_spec: true })).toBe(false);
+    const share = { share: "A".repeat(22), client: 1, channel: 1, preset: "game", surface: "screen" };
+    const frame = (d: unknown) => JSON.stringify({ ev: "screen.started", d });
+    expect(parseFrame(frame(share))?.kind).toBe("event");
+    expect(parseFrame(frame({ ...share, spec: { mode: "smooth", height: 1440, fps: 60 } }))?.kind).toBe("event");
+    for (const spec of [{ mode: "auto", height: 1080, fps: 30 }, { mode: "sharp", height: 2160, fps: 60 }, { mode: "smooth", height: 720, fps: 24 }, { mode: "sharp", height: 1080, fps: 15, bitrate: 1 }]) expect(parseFrame(frame({ ...share, spec }))).toBeNull();
+  });
   it("distinguishes sealed history from plaintext history, including empty pages", () => {
     const sealedMessage = {
       id: 1, conversation: `dm:${"A".repeat(27)}:${"B".repeat(27)}`,

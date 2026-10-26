@@ -371,6 +371,7 @@ struct Session {
     sharing: Option<String>,
     /// That share is live (`Client.sharing`): its publish transport connected.
     shared: bool,
+    screen_spec: bool,
     /// The session's screen watch transport.
     watch: Option<screen::Watch>,
     /// The highest watch-transport run offered; runs at or below it never come back.
@@ -959,6 +960,11 @@ impl Core {
             }
             Event::ChatDeleted { channel, .. } if hidden(*channel) => EventView::Hidden,
             Event::ScreenStarted(share) if hidden(share.channel) => EventView::Hidden,
+            Event::ScreenStarted(share) if share.spec.is_some() && !viewer.is_some_and(|s| s.screen_spec) => {
+                let mut legacy = share.clone();
+                legacy.spec = None;
+                EventView::Masked(Box::new(Event::ScreenStarted(legacy)))
+            }
             Event::ChatRead { target: gwar_proto::ChatReadTarget::Channel { channel }, .. } if hidden(*channel) => {
                 EventView::Hidden
             }
@@ -1344,6 +1350,7 @@ impl Core {
             used_ssrcs: BTreeSet::new(),
             sharing: None,
             shared: false,
+            screen_spec: false,
             watch: None,
             watch_run: 0,
             out: Some(r.out),
@@ -1667,6 +1674,7 @@ impl Core {
                     used_ssrcs: BTreeSet::new(),
                     sharing: None,
                     shared: false,
+                    screen_spec: false,
                     watch: None,
                     watch_run: 0,
                     out: None,
@@ -1901,6 +1909,14 @@ impl Core {
             Request::ScreenStart(start) => self.screen_start(session, start),
             Request::ScreenPublishOffer(offer) => return self.screen_publish_offer(session, id, offer),
             Request::ScreenWatchOffer(offer) => return self.screen_watch_offer(session, id, offer),
+            Request::ScreenSpecCapabilities {} => {
+                self.sessions.get_mut(&session).expect("authenticated").screen_spec = true;
+                // Welcome predates negotiation. Refresh visible shares only for this opting-in peer.
+                for share in self.shares_for(session) {
+                    self.send_event(session, Event::ScreenStarted(share));
+                }
+                Ok(Response::ScreenSpecCapabilities { screen_spec: true })
+            }
             Request::ScreenCapabilities {} => Ok(Response::ScreenCapabilities { screen_h264: true }),
             Request::ScreenFocus { share } => self.screen_focus(session, &share),
             Request::ScreenDecodeFailed { share, slot, run, generation } => {

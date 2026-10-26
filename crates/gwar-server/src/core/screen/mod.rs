@@ -38,6 +38,7 @@ pub(super) struct Share {
     /// The call it was started in: an encrypted share is watched from inside it.
     call: String,
     preset: ScreenPreset,
+    spec: gwar_proto::ScreenSpec,
     surface: ScreenSurface,
     /// The sharer asked for a TeamSpeak watch link (`screen.start {guest_link}`).
     guest_link: bool,
@@ -93,7 +94,14 @@ fn not_found() -> ErrorBody {
 impl Core {
     fn share_view(&self, id: &str) -> ScreenShare {
         let s = &self.shares[id];
-        ScreenShare { share: id.to_owned(), client: s.sharer, channel: s.channel, preset: s.preset, surface: s.surface }
+        ScreenShare {
+            share: id.to_owned(),
+            client: s.sharer,
+            channel: s.channel,
+            preset: s.preset,
+            spec: Some(s.spec),
+            surface: s.surface,
+        }
     }
 
     /// The running shares `session` can see, for `Welcome`.
@@ -102,7 +110,13 @@ impl Core {
         self.shares
             .iter()
             .filter(|(_, s)| s.live && self.admitted(viewer, s.channel))
-            .map(|(id, _)| self.share_view(id))
+            .map(|(id, _)| {
+                let mut share = self.share_view(id);
+                if !self.sessions[&session].screen_spec {
+                    share.spec = None;
+                }
+                share
+            })
             .collect()
     }
 
@@ -155,6 +169,10 @@ impl Core {
     }
 
     pub(super) fn screen_start(&mut self, session: SessionId, start: ScreenStart) -> Reply {
+        if start.spec.is_some() && !self.sessions[&session].screen_spec {
+            return Err(bad("screen specs were not negotiated"));
+        }
+        let spec = start.spec.unwrap_or_else(|| start.preset.into());
         self.screen_starts
             .entry(session)
             .or_insert_with(|| voice::Bucket::new(STARTS_PER_SECOND, STARTS_BURST))
@@ -188,7 +206,8 @@ impl Core {
             sharer: session,
             channel,
             call: binding.call,
-            preset: start.preset,
+            preset: spec.legacy(),
+            spec,
             surface: start.surface,
             guest_link: start.guest_link,
             link_revoked: false,
@@ -834,7 +853,13 @@ impl Core {
             .shares
             .iter()
             .filter(|(_, s)| s.live && s.channel == channel)
-            .map(|(id, _)| self.share_view(id))
+            .map(|(id, _)| {
+                let mut share = self.share_view(id);
+                if !self.sessions[&session].screen_spec {
+                    share.spec = None;
+                }
+                share
+            })
             .collect();
         for share in shares {
             self.send_event(session, Event::ScreenStarted(share));

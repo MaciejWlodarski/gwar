@@ -162,7 +162,9 @@ async function share(page, surface) {
   const dialog = page.getByRole("dialog", { name: "Share your screen" });
   await dialog.waitFor({ timeout: 20_000 });
   await dialog.getByText(surface, { exact: true }).waitFor();
-  await dialog.getByText(preset[0].toUpperCase() + preset.slice(1), { exact: true }).click();
+  await dialog.getByRole("radio", { name: preset === "text" ? "Sharp text" : "Smoothness", exact: true }).check();
+  await dialog.getByLabel("Resolution", { exact: true }).selectOption(preset === "saver" ? "720" : "1080");
+  await dialog.getByLabel("Frame rate", { exact: true }).selectOption(preset === "game" ? "60" : preset === "text" ? "15" : "30");
   await dialog.getByRole("button", { name: "Share", exact: true }).click();
   await bar(page).getByText(/watching$/).waitFor({ timeout: 30_000 });
   const id = await ownShare(page);
@@ -308,7 +310,7 @@ try {
             assert.ok(result.captureFps >= expectedFps * 0.85 && result.captureFps <= expectedFps * 1.12, `captured source cadence ${result.captureFps}`);
             assert.ok(result.fps >= expectedFps * 0.85, `encoded cadence ${result.fps}`);
             assert.ok(settled.every(full), `${name}: source, encoder and viewer must recover to ${targetWidth}x${targetHeight}`);
-            assert.ok(settled.every(r => r.params.degradationPreference === ({ game: "maintain-framerate", text: "maintain-resolution", smooth: "balanced", saver: "balanced" })[preset]), "preset restored");
+            assert.ok(settled.every(r => r.params.degradationPreference === ({ game: "maintain-framerate", text: "maintain-resolution", smooth: "maintain-framerate", saver: "maintain-framerate" })[preset]), "preset restored");
             assert.ok(decodeFps >= expectedFps * 0.75, `viewer cadence ${decodeFps}`);
           } else {
             assert.ok(payload <= uplink * 1.15 && payload > uplink * 0.15, `active shaped payload ${payload}`);

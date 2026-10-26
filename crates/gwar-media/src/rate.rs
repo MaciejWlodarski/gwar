@@ -1,5 +1,6 @@
 //! Deterministic, per-encoder quality policy. No clocks, adapters or transports are owned here.
 
+use gwar_proto::{ScreenMode, ScreenSpec};
 use std::time::Duration;
 
 use crate::{Codec, CodecCaps, EncoderConfig, MediaError, RateControl, Result, Size};
@@ -8,15 +9,26 @@ const PRESSURE_HOLD: Duration = Duration::from_secs(2);
 const RECOVERY_HOLD: Duration = Duration::from_secs(10);
 const MAX_SAMPLE_GAP: Duration = Duration::from_secs(1);
 
-/// Screen-content policy, using the plan's existing preset names.
+/// Screen-content quality policy, with legacy ladders for existing native callers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Preset {
+    /// Independent mode, resolution and cadence; legacy variants retain their old ladders.
+    Quality(ScreenSpec),
     /// Preserve physical resolution; reduce 15 to 10 to 5 fps.
     Text,
     /// Reduce 30 to 20 to 15 fps, then reduce resolution at 15 fps.
     Smooth,
     /// Preserve frame rate and reduce resolution, one tier at a time.
     Game,
+}
+
+impl Preset {
+    fn sharp(self) -> bool {
+        matches!(self, Self::Text | Self::Quality(ScreenSpec { mode: ScreenMode::Sharp, .. }))
+    }
+    fn motion(self) -> bool {
+        matches!(self, Self::Game | Self::Quality(ScreenSpec { mode: ScreenMode::Smooth, .. }))
+    }
 }
 
 /// Physical resolution cap. The 720p tier is also the degradation floor.
@@ -56,6 +68,22 @@ pub struct ControllerConfig {
     pub source_size: Size,
     /// Administrative encoded-video budget allocated to this layer, excluding overhead.
     pub bitrate_cap_bps: u32,
+}
+
+impl ControllerConfig {
+    /// Builds a native policy from the negotiated quality settings, without upscaling sources.
+    pub fn for_spec(spec: ScreenSpec, source_size: Size, bitrate_cap_bps: u32) -> Result<Self> {
+        let tier = match spec.height {
+            720 => ResolutionTier::P720,
+            1080 => ResolutionTier::P1080,
+            1440 => ResolutionTier::P1440,
+            _ => return Err(MediaError::Invalid("screen height")),
+        };
+        if ![15, 30, 60].contains(&spec.fps) {
+            return Err(MediaError::Invalid("screen fps"));
+        }
+        Ok(Self { preset: Preset::Quality(spec), tier, source_size, bitrate_cap_bps })
+    }
 }
 
 /// Observations over the interval ending at the explicit sample time.
@@ -148,6 +176,12 @@ impl RateController {
     /// cannot retain its requested physical resolution; other presets may start at a lower tier.
     /// Capability fps limits apply at construction/failover; Game then preserves that frame rate.
     pub fn new(config: ControllerConfig, encoders: &[CodecCaps]) -> Result<Self> {
+        if let Preset::Quality(spec) = config.preset {
+            let checked = ControllerConfig::for_spec(spec, config.source_size, config.bitrate_cap_bps)?;
+            if checked.tier != config.tier {
+                return Err(MediaError::Invalid("screen spec tier"));
+            }
+        }
         if config.source_size.width < 2 || config.source_size.height < 2 {
             return Err(MediaError::Invalid("rate controller source must be at least 2 by 2"));
         }
@@ -308,9 +342,10 @@ impl RateController {
         let prior = self.plans[self.active].steps[self.step];
         self.active += 1;
         while let Some(plan) = self.plans.get_mut(self.active) {
-            // Only Game preserves cadence permanently. Text/Smooth must retain their
+            // Motion quality and legacy Game preserve cadence permanently. Detail and
+            // legacy Text/Smooth must retain their
             // higher-fps recovery steps, even when failover starts on a degraded rung.
-            if self.config.preset == Preset::Game {
+            if self.config.preset.motion() {
                 for target in &mut plan.steps {
                     limit_fps(target, prior.encoder.rate.max_fps, self.config);
                 }
@@ -363,7 +398,7 @@ fn make_plan(config: ControllerConfig, caps: &CodecCaps, encoder_index: usize) -
     let fps = preset_fps(config.preset, config.tier).min(caps.max_fps).min(if caps.hardware { 60 } else { 30 });
     let mut steps: Vec<QualityTarget> = Vec::new();
     for tier in [ResolutionTier::P2160, ResolutionTier::P1440, ResolutionTier::P1080, ResolutionTier::P720] {
-        if tier > config.tier || (config.preset == Preset::Text && tier != config.tier) {
+        if tier > config.tier || (config.preset.sharp() && tier != config.tier) {
             continue;
         }
         let size = fit_size(config.source_size, tier);
@@ -379,10 +414,12 @@ fn make_plan(config: ControllerConfig, caps: &CodecCaps, encoder_index: usize) -
             continue;
         }
         let rates: Vec<_> = match config.preset {
-            Preset::Text => [fps, fps.min(10), fps.min(5)].into_iter().collect(),
+            Preset::Quality(ScreenSpec { mode: ScreenMode::Sharp, .. }) | Preset::Text => {
+                [fps, fps.min(10), fps.min(5)].into_iter().collect()
+            }
             Preset::Smooth if steps.is_empty() => [fps, fps.min(20), fps.min(15)].into_iter().collect(),
             Preset::Smooth => vec![fps.min(15)],
-            Preset::Game => vec![fps],
+            Preset::Quality(_) | Preset::Game => vec![fps],
         };
         for max_fps in rates {
             if steps.last().is_some_and(|last| last.encoder.size == size && last.encoder.rate.max_fps == max_fps) {
@@ -402,6 +439,7 @@ fn make_plan(config: ControllerConfig, caps: &CodecCaps, encoder_index: usize) -
 
 fn preset_fps(preset: Preset, tier: ResolutionTier) -> u32 {
     match preset {
+        Preset::Quality(spec) => u32::from(spec.fps),
         Preset::Text => 15,
         Preset::Smooth => 30,
         Preset::Game if tier == ResolutionTier::P2160 => 30,
@@ -452,8 +490,17 @@ fn nominal_bitrate(config: ControllerConfig, size: Size, fps: u32) -> u32 {
 }
 
 fn raw_bitrate(preset: Preset, tier: ResolutionTier, size: Size, fps: u32) -> u32 {
+    if let Preset::Quality(spec) = preset {
+        let reference = tier.size();
+        let rate = [1_500_000_u128, 4_000_000, 6_000_000, 6_000_000][tier as usize];
+        let factor = if spec.mode == ScreenMode::Sharp { 5 } else { 4 };
+        return (rate * u128::from(size.width) * u128::from(size.height) * u128::from(fps) * factor
+            / (u128::from(reference.width) * u128::from(reference.height) * 30 * 4))
+            .min(12_000_000) as u32;
+    }
     // Provisional H.264 reference rates, also used for VPx/AV1 until F3 measures them.
     let rates = match preset {
+        Preset::Quality(_) => unreachable!("handled above"),
         Preset::Text => [1_250_000_u128, 2_500_000, 3_500_000, 6_000_000],
         Preset::Smooth => [2_000_000, 4_000_000, 7_000_000, 12_000_000],
         Preset::Game => [4_000_000, 8_000_000, 14_000_000, 20_000_000],
@@ -497,6 +544,32 @@ fn encode_budget(target: QualityTarget, percent: u128) -> u128 {
 mod tests {
     use super::*;
     use crate::CodecProfile;
+
+    #[test]
+    fn negotiated_quality_uses_the_same_budget_as_web_without_changing_legacy_ladders() {
+        for (preset, bitrate) in [
+            (gwar_proto::ScreenPreset::Text, 2_500_000),
+            (gwar_proto::ScreenPreset::Smooth, 4_000_000),
+            (gwar_proto::ScreenPreset::Game, 8_000_000),
+            (gwar_proto::ScreenPreset::Saver, 1_500_000),
+        ] {
+            let spec: ScreenSpec = preset.into();
+            let config = ControllerConfig::for_spec(spec, Size { width: 2560, height: 1440 }, u32::MAX).unwrap();
+            assert_eq!(nominal_bitrate(config, config.tier.size(), u32::from(spec.fps)), bitrate);
+        }
+        for mode in [ScreenMode::Smooth, ScreenMode::Sharp] {
+            for height in [720, 1080, 1440] {
+                for fps in [15, 30, 60] {
+                    let spec = ScreenSpec { mode, height, fps };
+                    let config =
+                        ControllerConfig::for_spec(spec, Size { width: 2560, height: 1440 }, u32::MAX).unwrap();
+                    assert!(nominal_bitrate(config, config.tier.size(), u32::from(fps)) <= 12_000_000);
+                    let small = Size { width: 640, height: 360 };
+                    assert_eq!(fit_size(small, config.tier), small);
+                }
+            }
+        }
+    }
 
     #[test]
     fn nominal_rate_preserves_standard_tier_budgets_at_every_cadence() {
@@ -609,7 +682,7 @@ mod tests {
                     (100_000..=config.bitrate_cap_bps).contains(&target.encoder.rate.bitrate_bps),
                     "{config:?}: {plan:?}"
                 );
-                if config.preset == Preset::Text {
+                if config.preset.sharp() {
                     assert_eq!(target.encoder.size, fit_size(config.source_size, config.tier));
                 }
             }
@@ -619,7 +692,7 @@ mod tests {
                 assert!(lower.encoder.size.width <= upper.encoder.size.width);
                 assert!(lower.encoder.size.height <= upper.encoder.size.height);
                 assert!(lower.encoder.rate.max_fps <= upper.encoder.rate.max_fps);
-                if config.preset == Preset::Game {
+                if config.preset.motion() {
                     assert_eq!(lower.encoder.rate.max_fps, upper.encoder.rate.max_fps);
                 }
             }

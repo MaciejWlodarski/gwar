@@ -10,9 +10,9 @@ describe("own share", () => {
     let s = run(initialScreen, { type: "pick", attempt: 1 });
     expect(s.own?.phase).toBe("picking");
     s = run(s, { type: "picked", attempt: 1, stream, surface: "window" });
-    expect(s.own).toMatchObject({ phase: "choosing", choice: "auto", preset: "text", surface: "window" });
-    s = run(s, { type: "choose", choice: "game" });
-    expect(s.own?.preset).toBe("game");
+    expect(s.own).toMatchObject({ phase: "choosing", spec: { mode: "sharp", height: 1080, fps: 30 }, surface: "window" });
+    s = run(s, { type: "choose", spec: { mode: "smooth", height: 1080, fps: 60 } });
+    expect(s.own?.spec).toEqual({ mode: "smooth", height: 1080, fps: 60 });
     s = run(s, { type: "starting", attempt: 1 }, { type: "started", attempt: 1, share: "A" });
     expect(s.own).toMatchObject({ phase: "starting", share: "A" });
     // Someone else's share going live is not mine.
@@ -25,8 +25,8 @@ describe("own share", () => {
   });
 
   it("auto picks Smooth for screens and unknown surfaces, Text for windows and tabs", () => {
-    const picked = (surface: "screen" | "window" | "tab" | "unknown") => run(initialScreen, { type: "pick", attempt: 1 }, { type: "picked", attempt: 1, stream, surface }).own?.preset;
-    expect([picked("screen"), picked("unknown"), picked("window"), picked("tab")]).toEqual(["smooth", "smooth", "text", "text"]);
+    const picked = (surface: "screen" | "window" | "tab" | "unknown") => run(initialScreen, { type: "pick", attempt: 1 }, { type: "picked", attempt: 1, stream, surface }).own?.spec.mode;
+    expect([picked("screen"), picked("unknown"), picked("window"), picked("tab")]).toEqual(["smooth", "smooth", "sharp", "sharp"]);
   });
 
   it("ignores late results of an earlier attempt", () => {
