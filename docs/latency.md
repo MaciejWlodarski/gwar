@@ -1053,7 +1053,10 @@ before the devices' start time is set (`Record`): the receiver's playout record
 Past its capacity a record counts what it could not keep instead of growing.
 The devices are stopped, and their last callback has stored its
 measurements, before any output file is written, so a slow write cannot run
-them past the budget. Both rings (microphone and speaker) are written through
+them past the budget. Both are signaled before either is awaited; one that has
+not finished within 2 s fails the run, and its thread is left detached after
+another second rather than joined, so a stuck device cannot keep the run
+from returning that error. Both rings (microphone and speaker) are written through
 once before the start too, and each device takes its measurement lock once
 before its first callback (the first lock of a std mutex allocates on macOS).
 A test runs forty late callbacks, past both capacities, under a counting

@@ -432,17 +432,29 @@ struct DeviceControl {
     stop: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
 }
+/// How long a stopping device may take to finish its callback; one is at most a few ms.
+const STOP_WAIT: Duration = Duration::from_secs(2);
+/// How long a dropped device's thread may take to finish before it is left detached, so a
+/// stuck device cannot keep a failing run from returning.
+const DROP_WAIT: Duration = Duration::from_secs(1);
 impl DeviceControl {
-    async fn stop(&self) -> anyhow::Result<()> {
-        self.stop.store(true, Ordering::Relaxed);
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while !self.finished.load(Ordering::Acquire) {
-                tokio::time::sleep(Duration::from_millis(1)).await;
-            }
-        })
-        .await
-        .context("fake audio device did not stop within 2 seconds")
+    fn finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
     }
+}
+
+/// Signals every device first, then waits for all of them together, at most `STOP_WAIT`.
+async fn stop_devices(controls: &[DeviceControl]) -> anyhow::Result<()> {
+    for control in controls {
+        control.stop.store(true, Ordering::Relaxed);
+    }
+    tokio::time::timeout(STOP_WAIT, async {
+        while !controls.iter().all(DeviceControl::finished) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .with_context(|| format!("a fake audio device did not stop within {} s", STOP_WAIT.as_secs()))
 }
 
 struct FakeIo {
@@ -460,14 +472,21 @@ struct FakeIo {
     warmup_samples: usize,
 }
 struct Guard {
-    stop: Arc<AtomicBool>,
+    control: DeviceControl,
     thread: Option<thread::JoinHandle<()>>,
 }
 impl Drop for Guard {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        // Wait for the last callback before taking the measurement snapshot.
-        if let Some(thread) = self.thread.take() {
+        self.control.stop.store(true, Ordering::Relaxed);
+        // Wait for the last callback, but never unboundedly: a thread still running after
+        // `DROP_WAIT` is stuck and is left detached.
+        let deadline = Instant::now() + DROP_WAIT;
+        while !self.control.finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        if let Some(thread) = self.thread.take()
+            && self.control.finished()
+        {
             let _ = thread.join();
         }
     }
@@ -608,11 +627,11 @@ impl AudioIo for FakeIo {
         let (mic_tx, mic) = prefaulted_ring(RATE, blank);
         let (speaker, speaker_rx) = prefaulted_ring(RATE / 2, 0.0);
         let output = Arc::new(OutputTiming::default());
-        let stop = self.control.stop.clone();
+        let control = self.control.clone();
         let callbacks = Callbacks::new(self, mic_tx, speaker_rx, output.clone());
         let thread =
             thread::Builder::new().name("latency-audio".into()).spawn(move || callbacks.run_until_stopped())?;
-        Ok(AudioPorts { mic, speaker, output, _guard: Box::new(Guard { stop, thread: Some(thread) }) })
+        Ok(AudioPorts { mic, speaker, output, _guard: Box::new(Guard { control, thread: Some(thread) }) })
     }
 }
 /// Routes the voice answer's ICE candidates through the selected relay role (or direct socket).
@@ -974,9 +993,7 @@ async fn run(
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     // Before any blocking write: recording ends here, within the playout record's budget.
-    for control in &controls {
-        control.stop().await?;
-    }
+    stop_devices(&controls).await?;
     std::fs::write(format!("{output}.timeline.csv"), timeline)?;
     let receiver_stats = vb.stats();
     let crypto = vb.keys().map(|keys| keys.counters());
@@ -1514,6 +1531,48 @@ mod tests {
         assert_eq!((receiver.stats.callbacks, receiver.stats.late_over_5ms), (40, 40));
         assert_eq!(receiver.stats.slow_dropped, 40 - MAX_SLOW_CALLBACKS as u64);
         assert_eq!(sent.lock().unwrap().captures.len(), 2); // markers at 0 and 12 000 samples
+    }
+
+    /// A receiver device on its own thread, starting `after` from now.
+    fn open_device(after: Duration) -> (AudioPorts, Arc<Mutex<Measurements>>, DeviceControl) {
+        let now = Instant::now();
+        let data = Arc::new(Mutex::new(Measurements::receiver(Record::new(RATE, (0.0, 0.0)))));
+        let control = DeviceControl::default();
+        let io = Box::new(FakeIo {
+            markers_ready: Arc::new(AtomicBool::new(false)),
+            data: data.clone(),
+            tone: false,
+            epoch: now,
+            start: now + after,
+            control: control.clone(),
+            count: 0,
+            delay_samples: 0,
+            callback_jitter: false,
+            warmup_samples: 0,
+        });
+        (io.open().unwrap(), data, control)
+    }
+
+    #[tokio::test]
+    async fn a_device_stuck_forever_cannot_hang_the_run() {
+        let (stuck, data, stuck_control) = open_device(Duration::from_millis(200));
+        let (running, _, running_control) = open_device(Duration::ZERO);
+        // Its first callback blocks on the measurement lock, never released.
+        std::mem::forget(data.lock().unwrap());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = Instant::now();
+        let error = stop_devices(&[stuck_control.clone(), running_control.clone()]).await.unwrap_err();
+        assert!(error.to_string().contains("did not stop"), "{error}");
+        // Both were signaled before either was awaited: the other one stopped normally.
+        assert!(running_control.finished() && !stuck_control.finished());
+        // Dropping the ports, as an error return does, waits for the stuck thread only so long.
+        let (dropped, done) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            drop((stuck, running));
+            let _ = dropped.send(());
+        });
+        assert!(done.recv_timeout(DROP_WAIT + Duration::from_secs(1)).is_ok(), "dropping a stuck device hung");
+        assert!(started.elapsed() < STOP_WAIT + DROP_WAIT + Duration::from_secs(1), "{:?}", started.elapsed());
     }
 
     #[test]
