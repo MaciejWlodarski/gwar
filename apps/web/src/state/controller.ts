@@ -570,6 +570,10 @@ class Controller {
 
   private wire(conn: Link, params: ConnectParams): void {
     const session = useSession.getState();
+    session.setRtt(null);
+    conn.onRtt?.((ms) => {
+      if (this.conn === conn) session.setRtt(Math.round(ms));
+    });
     conn.onWelcome((welcome, resync) => {
       if (this.conn !== conn) return;
       // A new session: shares and watches of the one before ended with it.
@@ -701,6 +705,7 @@ class Controller {
           session.dispatch({ type: "phase", phase: "online" });
           break;
         case "reconnecting":
+          session.setRtt(null);
           this.nativeFiles(null);
           // A new session starts outside voice: remember where to go back to.
           this.rejoin ??= myChannelId(useSession.getState());

@@ -186,6 +186,8 @@ export interface Link {
   onWelcome(handler: (welcome: Welcome, resync: boolean) => void): () => void;
   on<E extends EventName>(ev: E, handler: (data: EventData<E>) => void): () => void;
   onEvent(handler: (event: Event) => void): () => void;
+  /** Round trips to the server, in ms, as the keepalive measures them (WebSocket links only). */
+  onRtt?(handler: (ms: number) => void): () => void;
   connect(): Promise<Welcome>;
   request<O extends Op>(op: O, d: RequestInput<O>, opts?: { timeoutMs?: number }): Promise<ResponseMap[O]>;
   retryNow(): void;
@@ -219,6 +221,7 @@ export class Connection implements Link {
   private anyHandlers = new Set<(event: Event) => void>();
   private welcomeHandlers = new Set<(welcome: Welcome, resync: boolean) => void>();
   private statusHandlers = new Set<(status: ConnectionStatus) => void>();
+  private rttHandlers = new Set<(ms: number) => void>();
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private pingTimer: ReturnType<typeof setInterval> | null = null;
   private attempt = 0;
@@ -271,6 +274,11 @@ export class Connection implements Link {
   onEvent(handler: (event: Event) => void): () => void {
     this.anyHandlers.add(handler);
     return () => this.anyHandlers.delete(handler);
+  }
+
+  onRtt(handler: (ms: number) => void): () => void {
+    this.rttHandlers.add(handler);
+    return () => this.rttHandlers.delete(handler);
   }
 
   /** First connection. Rejects with {@link ConnectError}; never retries by itself. */
@@ -628,19 +636,31 @@ export class Connection implements Link {
 
   private startPing(): void {
     this.stopPing();
-    const interval = this.options.pingIntervalMs ?? 20_000;
-    this.pingTimer = setInterval(() => {
-      const socket = this.socket;
-      if (!socket) return;
-      this.request("ping", {}, { timeoutMs: 10_000 }).catch((e: unknown) => {
+    // Often enough that the voice panel's round trip stays current.
+    const interval = this.options.pingIntervalMs ?? 10_000;
+    this.pingTimer = setInterval(() => this.ping(), interval);
+  }
+
+  /** A keepalive that also measures the round trip; no pong in time means the link is dead. */
+  private ping(): void {
+    const socket = this.socket;
+    if (!socket) return;
+    const sent = performance.now();
+    this.request("ping", {}, { timeoutMs: 10_000 }).then(
+      () => {
+        if (this.socket !== socket) return;
+        const ms = performance.now() - sent;
+        for (const h of this.rttHandlers) h(ms);
+      },
+      (e: unknown) => {
         // No pong in time: treat the link as dead so reconnect kicks in.
         if (e instanceof RequestTimeoutError && this.socket === socket) {
           detach(socket);
           socket.close();
           this.onSocketClosed();
         }
-      });
-    }, interval);
+      },
+    );
   }
 
   private stopPing(): void {

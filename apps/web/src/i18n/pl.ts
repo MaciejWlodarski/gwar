@@ -397,6 +397,7 @@ export const pl: Record<Key, string> = {
   "voice.retryMic": "Spróbuj ponownie",
   "voice.openPrivacySettings": "Otwórz ustawienia prywatności",
   "voice.leave": "Opuść kanał głosowy",
+  "voice.rtt": "Opóźnienie do serwera (w obie strony): {ms} ms",
   "voice.notIn": "Poza kanałem głosowym",
   "voice.notInHint": "Kliknij kanał dwukrotnie, aby rozmawiać",
   "voice.pttHint": "Naciśnij i mów: przytrzymaj {key}",

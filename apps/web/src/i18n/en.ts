@@ -395,6 +395,7 @@ export const en = {
   "voice.retryMic": "Try again",
   "voice.openPrivacySettings": "Open privacy settings",
   "voice.leave": "Leave voice",
+  "voice.rtt": "Round trip to the server: {ms} ms",
   "voice.notIn": "Not in voice",
   "voice.notInHint": "Double-click a channel to talk",
   "voice.pttHint": "Push to talk: hold {key}",

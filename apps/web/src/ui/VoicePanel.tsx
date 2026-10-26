@@ -1,4 +1,4 @@
-import { Headphones, HeadphoneOff, Mic, MicOff, PhoneOff, Wifi } from "lucide-react";
+import { Headphones, HeadphoneOff, Mic, MicOff, PhoneOff, SignalHigh, SignalLow, SignalMedium } from "lucide-react";
 import type { ReactNode } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
@@ -21,9 +21,7 @@ export function MicButton({ size = "lg" }: { size?: "md" | "lg" | "wide" }) {
   const pttActive = useVoice((s) => s.pttActive);
   const mode = useSettings((s) => s.audio.inputMode);
   const pttKey = useSettings((s) => s.audio.pttKey);
-  const me = useMe();
   const off = muted || deafened || !!micError;
-  const talking = !!me?.talking && !off;
   const ptt = mode === "ptt";
   const label = micError ? describeVoiceError(micError) : off ? t("voice.unmute") : t("voice.mute");
 
@@ -37,7 +35,6 @@ export function MicButton({ size = "lg" }: { size?: "md" | "lg" | "wide" }) {
       className={cn(
         "relative overflow-hidden",
         off ? "bg-danger-soft text-danger hover:bg-danger hover:text-white" : "bg-hover text-fg hover:bg-active",
-        talking && "ring-2 ring-talk",
         ptt && pttActive && !off && "ring-2 ring-talk",
       )}
     >
@@ -93,6 +90,20 @@ function SelfRow({ sub, subTitle }: { sub: ReactNode; subTitle?: string }) {
   );
 }
 
+/** The round trip to the server, as signal bars and ms; nothing until the first measurement. */
+function RoundTrip() {
+  const t = useT();
+  const rtt = useSession((s) => s.rtt);
+  if (rtt === null) return null;
+  const [Icon, tone] = rtt < 100 ? [SignalHigh, "text-ok"] : rtt < 200 ? [SignalMedium, "text-warn"] : [SignalLow, "text-danger"];
+  return (
+    <span className={cn("ml-auto flex shrink-0 items-center gap-0.5 tabular-nums", tone)} title={t("voice.rtt", { ms: String(rtt) })}>
+      <Icon aria-hidden className="size-3.5" />
+      {rtt < 1 ? "<1" : rtt} ms
+    </span>
+  );
+}
+
 export function VoicePanel() {
   const t = useT();
   const voiceState = useVoice((s) => s.state);
@@ -106,6 +117,7 @@ export function VoicePanel() {
   // TeamSpeak servers always keep you in a channel: there is nothing to leave.
   const canLeave = useSession((s) => s.kind === "gwar");
   const canSpeak = useChannelPermission(me?.channel ?? null, "speak");
+  const member = useSession((s) => (s.me ? s.members[s.me.uid] : undefined));
 
   if (me && me.channel === null) {
     return (
@@ -155,11 +167,26 @@ export function VoicePanel() {
 
   return (
     <div className="m-2 mt-1 flex flex-col gap-2 rounded-xl bg-raised p-2">
-      <div className="flex items-center gap-2 rounded-lg bg-hover py-1.5 pr-1.5 pl-2.5">
-        <Wifi aria-hidden className={cn("size-4 shrink-0", tone, status.tone === "warn" && "animate-pulse")} />
-        <div className="min-w-0 flex-1 leading-tight">
-          <div className={cn("truncate text-[13px] font-medium", tone)}>{status.text}</div>
-          {channelName && <div className="truncate text-xs text-muted">{channelName}</div>}
+      {/* Who I am, where, and how well: one row, the way out at its end. */}
+      <div className="flex min-w-0 items-center gap-2 pl-1">
+        {me && <TalkingAvatar name={me.nickname} seed={me.uid} uid={me.uid} size={32} talking={me.talking} />}
+        <div className="min-w-0 flex-1 leading-tight" title={me?.away ?? undefined}>
+          <div className="flex min-w-0 items-center gap-1">
+            <span className="truncate text-sm font-semibold">{me?.nickname}</span>
+            {me && <ConnectBadge member={member} name={me.nickname} />}
+          </div>
+          <div className="flex min-w-0 items-center gap-1.5 text-xs" title={status.text}>
+            <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone, status.tone === "warn" && "animate-pulse")} />
+            {status.tone === "ok" && channelName ? (
+              <>
+                <span className="sr-only">{status.text}</span>
+                <span className="truncate text-muted">{channelName}</span>
+              </>
+            ) : (
+              <span className={cn("truncate", tone)}>{status.text}</span>
+            )}
+            {status.tone === "ok" && <RoundTrip />}
+          </div>
         </div>
         {unavailable && phase === "online" && (
           <Button size="sm" variant="secondary" onClick={() => controller.retryVoice()}>
@@ -194,7 +221,6 @@ export function VoicePanel() {
           <span className="min-w-0">{silencedNote}</span>
         </div>
       )}
-      <SelfRow sub={me?.away ? <span className="truncate">{me.away}</span> : null} />
       <div className="grid auto-cols-fr grid-flow-col gap-1.5">
         <MicButton size="wide" />
         <DeafenButton size="wide" />

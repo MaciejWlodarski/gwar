@@ -28,6 +28,9 @@ interface SessionStore extends SessionState {
   serverKey: string | null;
   endpoint: string | null;
   insecureConnection: boolean;
+  /** The last round trip to the server in ms (the keepalive's), null until measured or on TeamSpeak. */
+  rtt: number | null;
+  setRtt(rtt: number | null): void;
   setSecurity(serverKey: string | null, endpoint: string | null, insecureConnection: boolean): void;
   setFileSession(fileSession: string | null, fileAccess?: string | null): void;
   dispatch(action: Action): void;
@@ -46,6 +49,8 @@ export const useSession = create<SessionStore>()((set) => ({
   serverKey: null,
   endpoint: null,
   insecureConnection: false,
+  rtt: null,
+  setRtt: (rtt) => set({ rtt }),
   setSecurity: (serverKey, endpoint, insecureConnection) => set({ serverKey, endpoint, insecureConnection }),
   setFileSession: (fileSession, fileAccess = null) => set({ fileSession, fileAccess }),
   dispatch: (action) => {
