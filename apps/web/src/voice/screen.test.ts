@@ -57,7 +57,7 @@ class Peer {
     };
     const extensions = [{ uri: "urn:ietf:params:rtp-hdrext:sdes:mid", direction: "sendrecv" }, { uri: DEPENDENCY_DESCRIPTOR, direction: "stopped" }];
     const t = { direction: init.direction!, init, setCodecPreferences: vi.fn(), getHeaderExtensionsToNegotiate: () => extensions.map(e => ({ ...e })), setHeaderExtensionsToNegotiate: vi.fn(),
-      receiver: { jitterBufferTarget: null, track: Object.assign(new EventTarget(), { kind: "video", id: `rx-${this.transceivers.length}`, enabled: true, muted: true }) }, sender };
+      receiver: { jitterBufferTarget: null }, sender };
     this.transceivers.push(t);
     return t;
   }
@@ -73,12 +73,6 @@ beforeEach(() => {
   vi.stubGlobal("MediaStream", class { constructor(readonly tracks: unknown[]) {} });
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
-
-async function startWatch(transport: ScreenWatchTransport) {
-  const starting = transport.start();
-  await vi.advanceTimersByTimeAsync(0);
-  await starting;
-}
 
 describe.each(["publisher", "watch"] as const)("%s connection budget", kind => {
   const make = (offer: () => Promise<string>, state = vi.fn()) => kind === "publisher"
@@ -111,7 +105,6 @@ describe.each(["publisher", "watch"] as const)("%s connection budget", kind => {
     const state = vi.fn(), transport = make(async () => "answer", state), starting = transport.start();
     const pc = Peer.all[0]!;
     pc.setRemoteDescription.mockImplementation(async () => { pc.connectionState = "connected"; });
-    await vi.advanceTimersByTimeAsync(0);
     await starting;
     expect(state).toHaveBeenCalledExactlyOnceWith("connected");
     await vi.advanceTimersByTimeAsync(20_000);
@@ -139,7 +132,6 @@ describe.each(["publisher", "watch"] as const)("%s connection budget", kind => {
     const transport = make(async () => "answer", vi.fn(() => transport.close())), starting = transport.start();
     const pc = Peer.all[0]!;
     pc.setRemoteDescription.mockImplementation(async () => { pc.connectionState = "failed"; });
-    await vi.advanceTimersByTimeAsync(0);
     await starting;
     expect(pc.close).toHaveBeenCalledTimes(1);
     expect(vi.getTimerCount()).toBe(0);
@@ -262,21 +254,9 @@ describe("publish transport", () => {
 });
 
 describe("watch transport", () => {
-  it("does not negotiate a retired run after yielding to player initialization", async () => {
-    const offer = vi.fn(async () => "answer");
-    const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer, state: () => {}, track: () => {} });
-    const starting = transport.start();
-    transport.close();
-    await vi.advanceTimersByTimeAsync(0); await starting;
-    expect(offer).not.toHaveBeenCalled();
-    expect(Peer.all[0]!.setRemoteDescription).not.toHaveBeenCalled();
-    expect(vi.getTimerCount()).toBe(0);
-  });
-
   it("polls decode stats only while at least one slot has a watchdog", async () => {
     const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {}, decodeFailed: vi.fn() });
-    const starting = transport.start();
-    await vi.advanceTimersByTimeAsync(0); await starting;
+    await transport.start();
     const pc = Peer.all[0]!;
     await vi.advanceTimersByTimeAsync(3000);
     expect(pc.getStats).not.toHaveBeenCalled();
@@ -294,40 +274,18 @@ describe("watch transport", () => {
     expect(pc.getStats).toHaveBeenCalledTimes(3);
     transport.close(); expect(vi.getTimerCount()).toBe(0);
   });
-  it("provides each stable receive stream before offering, with a minimal jitter buffer", async () => {
+  it("offers exactly the receive slots, with a minimal jitter buffer, and maps tracks to slots", async () => {
     const tracks: Array<[number, unknown]> = [];
-    const offer = vi.fn(async (_sdp: string, _run: number) => {
-      expect(tracks).toHaveLength(SCREEN_SLOTS);
-      return "answer";
-    });
+    const offer = vi.fn(async (_sdp: string, _run: number) => "answer");
     const transport = new ScreenWatchTransport({ run: 5, iceServers: [], offer, state: () => {}, track: (slot, stream) => tracks.push([slot, stream]) });
-    const starting = transport.start();
-    expect(tracks).toHaveLength(SCREEN_SLOTS);
-    expect(offer).not.toHaveBeenCalled(); // The media players get a task to initialize first.
-    await vi.advanceTimersByTimeAsync(0); await starting;
+    await transport.start();
     const pc = Peer.all[0]!;
     expect(pc.transceivers.map(t => t.direction)).toEqual(Array(SCREEN_SLOTS).fill("recvonly"));
     expect(pc.transceivers.every(t => t.receiver.jitterBufferTarget === 0)).toBe(true);
     expect(offer).toHaveBeenCalledWith(expect.any(String), 5, [], null);
-    expect(tracks).toEqual(pc.transceivers.map((t, slot) => [slot, { tracks: [t.receiver.track] }]));
-    const track = pc.transceivers[2]!.receiver.track as EventTarget;
-    let enabled = true;
-    const changes: boolean[] = [];
-    Object.defineProperty(track, "enabled", { get: () => enabled, set: (value: boolean) => { enabled = value; changes.push(value); } });
-    pc.ontrack?.({ transceiver: pc.transceivers[2], track, streams: [] });
-    expect(changes).toEqual([]);
-    track.dispatchEvent(new Event("unmute"));
-    expect(changes).toEqual([false, true]);
-    track.dispatchEvent(new Event("unmute"));
-    expect(changes).toEqual([false, true]); // A displayed/static track is never reset again.
-    expect(tracks).toHaveLength(SCREEN_SLOTS); // No event replaces the prebound streams.
-    const late = pc.transceivers[3]!.receiver.track as EventTarget;
-    pc.ontrack?.({ transceiver: pc.transceivers[3], track: late, streams: [] });
-    const lateChange = vi.fn();
-    Object.defineProperty(late, "enabled", { get: () => true, set: lateChange });
+    pc.ontrack?.({ transceiver: pc.transceivers[2], track: "video", streams: [] });
+    expect(tracks).toEqual([[2, { tracks: ["video"] }]]);
     transport.close();
-    late.dispatchEvent(new Event("unmute"));
-    expect(lateChange).not.toHaveBeenCalled(); // A retired run cannot reactivate it.
     pc.ontrack = null;
     expect(pc.close).toHaveBeenCalled();
   });
@@ -373,8 +331,7 @@ describe("H.264 sender diagnostics", () => {
   it("uses only receiver capabilities for watch offers", async () => {
     vi.stubGlobal("RTCRtpSender", { getCapabilities: () => ({ codecs: [codec("video/H264", "packetization-mode=1;profile-level-id=42e01f")] }) });
     const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {} });
-    const starting = transport.start();
-    await vi.advanceTimersByTimeAsync(0); await starting;
+    await transport.start();
     const prefs = Peer.all[0]!.transceivers[0]!.setCodecPreferences.mock.calls[0]![0] as RTCRtpCodec[];
     expect(prefs.some(c => c.mimeType === "video/H264")).toBe(false);
     transport.close();
@@ -2130,7 +2087,7 @@ describe("AV1", () => {
     vi.stubGlobal("navigator", { mediaCapabilities: { decodingInfo } });
     const offer = vi.fn(async () => "answer");
     const transport = new ScreenWatchTransport({ run: 1, av1: true, iceServers: [], offer, state: () => {}, track: () => {} });
-    await startWatch(transport);
+    await transport.start();
     expect(mimes(Peer.all[0]!)[0]).toBe("video/AV1 level-idx=5;profile=0;tier=0");
     expect(Peer.all[0]!.transceivers[0]!.setHeaderExtensionsToNegotiate).toHaveBeenCalledWith(expect.arrayContaining([{ uri: DEPENDENCY_DESCRIPTOR, direction: "recvonly" }]));
     expect(offer).toHaveBeenCalledWith(expect.any(String), 1, expect.any(Array), { width: 2560, height: 1440 });
@@ -2138,7 +2095,7 @@ describe("AV1", () => {
 
     decodingInfo.mockResolvedValue({ supported: false, smooth: false, powerEfficient: false });
     const without = new ScreenWatchTransport({ run: 2, av1: true, iceServers: [], offer, state: () => {}, track: () => {} });
-    await startWatch(without);
+    await without.start();
     expect(mimes(Peer.all[1]!).some(m => m.startsWith("video/AV1"))).toBe(false);
     expect(offer).toHaveBeenLastCalledWith(expect.any(String), 2, [], null);
     without.close();
@@ -2146,7 +2103,7 @@ describe("AV1", () => {
     // A guest's page never probes or offers AV1.
     const guest = new ScreenWatchTransport({ run: 3, slots: 1, iceServers: [], offer, state: () => {}, track: () => {} });
     decodingInfo.mockClear();
-    await startWatch(guest);
+    await guest.start();
     expect(mimes(Peer.all[2]!).some(m => m.startsWith("video/AV1"))).toBe(false);
     expect(decodingInfo.mock.calls.some(([c]) => c.video?.contentType === "video/AV1")).toBe(false);
     guest.close();
@@ -2174,7 +2131,7 @@ describe("AV1", () => {
     vi.stubGlobal("navigator", { mediaCapabilities: { decodingInfo: async (c: MediaDecodingConfiguration) => ({ supported: c.video!.height <= 1080, smooth: true, powerEfficient: true }) } });
     const offer = vi.fn(async (_sdp: string) => "answer");
     const transport = new ScreenWatchTransport({ run: 1, av1: true, iceServers: [], offer, state: () => {}, track: () => {} });
-    await startWatch(transport);
+    await transport.start();
     expect(offer.mock.calls[0]![0]).toContain("a=fmtp:45 profile=0;tier=0;level-idx=9");
     transport.close();
     Peer.offerSdp = offerSdp;
@@ -2183,7 +2140,7 @@ describe("AV1", () => {
   it("watches AV1 decode progress like H.264", async () => {
     const decodeFailed = vi.fn();
     const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {}, decodeFailed });
-    await startWatch(transport);
+    await transport.start();
     const pc = Peer.all[0]!;
     (pc.transceivers[0] as unknown as { mid: string }).mid = "0";
     pc.stats = new Map([["codec", { type: "codec", mimeType: "video/AV1" }]]);

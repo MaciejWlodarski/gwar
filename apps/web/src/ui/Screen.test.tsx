@@ -139,37 +139,55 @@ describe("watched video frames", () => {
   }
   const visible = (video: HTMLVideoElement) => video.closest<HTMLElement>("[data-screen-video]")?.dataset.ready === "true";
 
-  it("binds the receiver stream before its grant and displays an already-arrived static frame", async () => {
-    const stream = new MediaStream();
-    const create = vi.spyOn(document, "createElement");
-    // happy-dom does not expose HTMLMediaElement's readiness constants.
-    const ready = Object.getOwnPropertyDescriptor(HTMLMediaElement, "HAVE_CURRENT_DATA");
-    if (!ready) Object.defineProperty(HTMLMediaElement, "HAVE_CURRENT_DATA", { configurable: true, value: 2 });
+  it.each([false, true])("repairs a warm receiver once, while one static frame reveals immediately (frame first: %s)", async frameFirst => {
+    vi.useFakeTimers();
+    const stats = vi.spyOn(controller.screen, "stats").mockResolvedValue({ width: 640, height: 400, fps: 0, framesDecoded: 1 });
+    const request = vi.spyOn(controller.screen, "requestFrame").mockImplementation(() => {});
     try {
-      const { dispatch } = useScreen.getState();
-      dispatch({ type: "transport", run: 1, phase: "connected" });
-      dispatch({ type: "stream", run: 1, slot: 0, stream });
-      const prepared = create.mock.results.find(r => r.type === "return" && r.value instanceof HTMLVideoElement)?.value as HTMLVideoElement;
-      expect(prepared).toBeInstanceOf(HTMLVideoElement);
-      expect(prepared.srcObject).toBe(stream);
-      expect(prepared.isConnected).toBe(true);
-      const parking = prepared.closest<HTMLDivElement>("[data-screen-players]")!;
-      expect(parking.getAttribute("aria-hidden")).toBe("true");
-      expect(parking.style.opacity).toBe("0");
-      expect(parking.style.zIndex).toBe("0");
-      expect(prepared.classList.contains("opacity-0")).toBe(false);
-      expect(container.querySelector("video")).toBeNull();
-      // Its single startup keyframe can precede the grant and the React commit.
-      Object.defineProperty(prepared, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_CURRENT_DATA });
+      const stream = new MediaStream();
       const video = await grant(1, 1, stream);
-      expect(video).toBe(prepared);
-      expect(visible(video)).toBe(true);
-      expect(container.textContent).not.toContain("Connecting");
-    } finally {
-      create.mockRestore();
-      if (!ready) Reflect.deleteProperty(HTMLMediaElement, "HAVE_CURRENT_DATA");
-    }
+      if (frameFirst) await act(async () => video.dispatchEvent(new Event("loadeddata")));
+      await act(async () => vi.advanceTimersByTimeAsync(100));
+      expect(request.mock.calls).toEqual(frameFirst ? [] : [["A", 1, 1]]);
+      expect(visible(video)).toBe(frameFirst);
+      await act(async () => root.render(null));
+      const moved = await grant(1, 1, stream);
+      await act(async () => vi.advanceTimersByTimeAsync(1000));
+      expect(request).toHaveBeenCalledTimes(frameFirst ? 0 : 1);
+      // No new receiver frame/counter is required: its one loaded frame is enough.
+      if (!frameFirst) await act(async () => moved.dispatchEvent(new Event("loadeddata")));
+      await act(async () => vi.advanceTimersByTimeAsync(70_000));
+      expect(visible(moved)).toBe(true);
+      expect(request).toHaveBeenCalledTimes(frameFirst ? 0 : 1);
+    } finally { stats.mockRestore(); request.mockRestore(); vi.useRealTimers(); }
   });
+
+  it("ignores a pending warmup probe after its view unmounts", async () => {
+    vi.useFakeTimers();
+    let resolve!: (value: { width: number; height: number; fps: number; framesDecoded: number }) => void;
+    const stats = vi.spyOn(controller.screen, "stats").mockImplementation(() => new Promise(r => { resolve = r; }));
+    const request = vi.spyOn(controller.screen, "requestFrame").mockImplementation(() => {});
+    try {
+      await grant(1, 1, new MediaStream());
+      await act(async () => vi.advanceTimersByTimeAsync(100));
+      await act(async () => root.render(null));
+      await act(async () => resolve({ width: 640, height: 400, fps: 0, framesDecoded: 1 }));
+      expect(request).not.toHaveBeenCalled();
+    } finally { stats.mockRestore(); request.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it("does not mistake metadata-only resize for a loaded frame", async () => {
+    const received = vi.spyOn(controller.screen, "frameReceived");
+    try {
+      const video = await grant(1, 1, new MediaStream());
+      await act(async () => video.dispatchEvent(new Event("resize")));
+      expect(visible(video)).toBe(false);
+      expect(received).not.toHaveBeenCalled();
+      await act(async () => video.dispatchEvent(new Event("loadeddata")));
+      expect(visible(video)).toBe(true);
+    } finally { received.mockRestore(); }
+  });
+
 
   it("keeps the attached media player and a static frame through a view remount", async () => {
     const stream = new MediaStream();

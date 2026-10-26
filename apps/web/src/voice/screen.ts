@@ -965,7 +965,7 @@ export interface WatchParams {
   offer(sdp: string, run: number, h264?: H264Capability[], av1?: Av1Capability | null): Promise<string>;
   decodeFailed?(slot: number, share: string, generation: number): void;
   state(state: TransportState): void;
-  /** A slot's stable receive track, provided before negotiation can start media. */
+  /** A slot's video track arrived (once per slot and transport). */
   track(slot: number, stream: MediaStream): void;
 }
 
@@ -1004,27 +1004,12 @@ export class ScreenWatchTransport {
       const receiver = transceiver.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null };
       if ("jitterBufferTarget" in receiver) { try { receiver.jitterBufferTarget = 0; } catch { /* out of range on some engines */ } }
       this.transceivers.push(transceiver);
-      // receiver.track already exists and is the same track reported by ontrack.
-      // Let the player bind before SDP/media, not after the first codec metadata.
-      this.params.track(i, new MediaStream([receiver.track]));
-      if (this.closed) return;
     }
-    pc.ontrack = ({ track }) => {
-      const activate = () => {
-        if (this.pc !== pc || this.closed || !track.enabled) return;
-        // WebKit/GStreamer can retain an empty stream selection for an idle
-        // receiver. Repost it on its first unmute, before the first video sample.
-        // Once only: reactivating a watched/static track could discard its frame.
-        track.enabled = false;
-        track.enabled = true;
-      };
-      if (track.muted) track.addEventListener("unmute", activate, { once: true });
-      else activate();
+    pc.ontrack = ev => {
+      const slot = this.transceivers.indexOf(ev.transceiver);
+      // One stream per slot: the server may name the same stream in every slot.
+      if (this.pc === pc && slot >= 0) this.params.track(slot, new MediaStream([ev.track]));
     };
-    // srcObject/load starts media resource selection in a later task. Let the
-    // players initialize before SDP can deliver their first codec metadata.
-    await new Promise<void>(resolve => setTimeout(resolve, 0));
-    if (this.closed) return;
     await pc.setLocalDescription(await pc.createOffer());
     if (this.closed) return;
     const h264 = await probeH264();

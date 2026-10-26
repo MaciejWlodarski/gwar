@@ -252,7 +252,7 @@ export function LiveBadge({ client, name }: { client: Client; name: string }) {
 // Linux WebKit can stop supplying a replacement player's frames/metadata even while
 // its receiver keeps decoding. Keep one attached player per slot stream and move it
 // between views. A new transport supplies new streams, so it cannot inherit old pixels.
-const slotVideos = new Map<MediaStream, { video: HTMLVideoElement; received: boolean }>();
+const slotVideos = new Map<MediaStream, { video: HTMLVideoElement; received: boolean; repairFor?: number }>();
 let slotVideoParking: HTMLDivElement | null = null;
 function parkSlotVideo(video: HTMLVideoElement) {
   if (!slotVideoParking) {
@@ -278,17 +278,7 @@ function prepareSlotVideo(stream: MediaStream | null) {
   video.autoplay = true;
   video.playsInline = true;
   const player = { video, received: false };
-  if (stream) {
-    slotVideos.set(stream, player);
-    // WebKit needs a live rendering consumer before negotiation supplies codec
-    // metadata. Keep unused players connected in the transparent parking layer.
-    parkSlotVideo(video);
-    // Create its renderer now, before media can arrive during SDP negotiation.
-    void video.offsetWidth;
-    video.srcObject = stream;
-    video.load();
-    void video.play().catch(() => {});
-  }
+  if (stream) slotVideos.set(stream, player);
   return player;
 }
 useScreen.subscribe(screen => {
@@ -299,11 +289,6 @@ useScreen.subscribe(screen => {
     slotVideos.delete(stream);
   }
   if (slotVideos.size === 0) { slotVideoParking?.remove(); slotVideoParking = null; }
-  // Receive tracks are supplied before negotiation. Binding only when the watch
-  // grant renders can be too late for Linux WebKit, even with later keyframes.
-  for (const stream of screen.streams) {
-    if (stream && !slotVideos.has(stream)) prepareSlotVideo(stream);
-  }
 });
 
 /** A watched share's video, from its slot's stream. */
@@ -321,24 +306,47 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef }: { shar
     let player = stream ? slotVideos.get(stream) : undefined;
     if (!player) player = prepareSlotVideo(stream);
     const { video } = player;
+    let live = true, probe: ReturnType<typeof setTimeout> | undefined;
+    const hasFrame = () => video.readyState >= (HTMLMediaElement.HAVE_CURRENT_DATA ?? 2);
     video.dataset.share = share;
     video.className = "size-full object-contain";
-    const received = () => {
-      if (!stream) return;
+    const received = (event?: Event) => {
+      if (!stream || (event?.type === "resize" && !hasFrame())) return;
       player.received = true;
+      clearTimeout(probe);
       setShown(stream);
       if (watchId !== undefined) controller.screen.frameReceived(share, run, watchId);
+    };
+    const repair = async () => {
+      if (!live || player.received || watchId === undefined || player.repairFor === watchId) return;
+      const stats = await controller.screen.stats(share).catch(() => null);
+      if (!live || player.received) return;
+      if (hasFrame()) { received(); return; }
+      if (stats && stats.framesDecoded > 0) {
+        // WebKit's media-player decoder can miss the receiver's startup keyframe
+        // while selecting its stream. Ask once AFTER input exists, rather than
+        // during attachment. Never gate reveal on another frame/counter advance.
+        player.repairFor = watchId;
+        controller.screen.requestFrame(share, run, watchId);
+      } else probe = setTimeout(() => void repair(), 100);
     };
     video.addEventListener("loadeddata", received);
     video.addEventListener("resize", received);
     if (onDoubleClick) video.addEventListener("dblclick", onDoubleClick);
     mount.appendChild(video);
     videoRef?.(video);
-    if (video.srcObject !== stream) video.srcObject = stream;
+    if (video.srcObject !== stream) {
+      // Initialize WebKit's renderer in its mounted host before binding media.
+      void video.offsetWidth;
+      video.srcObject = stream;
+    }
     if (stream) void video.play().catch(() => {});
     // A static share keeps its one decoded frame when its view remounts.
-    if (player.received || video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) received();
+    if (player.received || hasFrame()) received();
+    else if (stream && watchId !== undefined) probe = setTimeout(() => void repair(), 100);
     return () => {
+      live = false;
+      clearTimeout(probe);
       video.removeEventListener("loadeddata", received);
       video.removeEventListener("resize", received);
       if (onDoubleClick) video.removeEventListener("dblclick", onDoubleClick);

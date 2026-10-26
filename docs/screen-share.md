@@ -2726,12 +2726,9 @@ from native capture is PR 10.
     `voice.talking` event.
   - When a member viewer reuses a receive slot with no other active or pending
     watch, the client renews the transport to discard the old receiver's decoded
-    frames. Each slot stream gets one video element, bound when its receiver is
-    created. Negotiation yields one task so media resource selection can start
-    before SDP or a startup keyframe. Unused players stay connected in a transparent
-    parent at a nonnegative z-index: parking behind the document background can
-    stall Linux WebKit's idle slots at 0×0. Active players move between
-    the stage and thumbnails without rebinding. Retiring the stream detaches and
+    frames. Each slot stream gets one video element on its first mount. Players
+    move between the stage and thumbnails without rebinding; unmounted players
+    stay connected in a transparent parent. Retiring the stream detaches and
     discards that player; a new transport's streams always get fresh elements.
     The cache is bounded by the run's receive slots. First-use slots keep the
     current transport.
@@ -2740,17 +2737,18 @@ from native capture is PR 10.
     slot may briefly show the previous share's last frame until the new share's
     first keyframe decodes.
   - Linux WebKit can leave a replacement media player at 0×0 even while the
-    receiver decodes fresh keyframes. Binding in the DOM before media starts and
-    preserving the player avoids this and keeps a static share visible through
-    view/StrictMode remounts without requesting another frame. A first-use or
-    renewed slot reveals its first decoded frame, including a static share's
-    single startup keyframe. Each receive track refreshes its local stream
-    selection once at its first unmute:
-    Linux WebKit can otherwise keep an idle slot's selection empty despite RTP
-    decode progress. This does not repeat on view moves or subsequent frames.
-    Watch assignment already requests a budgeted, retried PLI; no new server
-    notification, extra frame-counter gate or timed reveal is required. The
-    existing offer/connect and H.264 recovery watchdogs still apply. A connected
+    receiver decodes fresh keyframes. Preserving the player keeps a static share
+    visible through view/StrictMode remounts without requesting another frame.
+    The first loaded frame reveals immediately; metadata-only resize does not.
+    Watch assignment already requests a budgeted, retried PLI, but Linux WebKit's
+    media-player decoder may initialize after that first receiver input. If the
+    receiver has decoded input but the player still has no current
+    frame, the client requests one repair keyframe for that grant. This marker
+    survives view moves; a loaded first frame always reveals immediately without
+    waiting for another counter advance, and static shares need no later frame.
+    Repair requests retain run/watch-ID fencing and do not restart the deadline.
+    No new server notification, frame-counter reveal gate or timed reveal is used.
+    The existing offer/connect and H.264 recovery watchdogs still apply. A connected
     receiver that never supplies a first frame ends its watch 35 s after its
     grant through the normal unwatch/error path, also for VP9 and older servers.
     The controller owns this deadline per run/watch ID: switching the stage or
