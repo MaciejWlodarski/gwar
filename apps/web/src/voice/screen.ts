@@ -1009,6 +1009,18 @@ export class ScreenWatchTransport {
       this.params.track(i, new MediaStream([receiver.track]));
       if (this.closed) return;
     }
+    pc.ontrack = ({ track }) => {
+      const activate = () => {
+        if (this.pc !== pc || this.closed || !track.enabled) return;
+        // WebKit/GStreamer can retain an empty stream selection for an idle
+        // receiver. Repost it on its first unmute, before the first video sample.
+        // Once only: reactivating a watched/static track could discard its frame.
+        track.enabled = false;
+        track.enabled = true;
+      };
+      if (track.muted) track.addEventListener("unmute", activate, { once: true });
+      else activate();
+    };
     // srcObject/load starts media resource selection in a later task. Let the
     // players initialize before SDP can deliver their first codec metadata.
     await new Promise<void>(resolve => setTimeout(resolve, 0));

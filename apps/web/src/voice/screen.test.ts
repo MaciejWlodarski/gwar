@@ -57,7 +57,7 @@ class Peer {
     };
     const extensions = [{ uri: "urn:ietf:params:rtp-hdrext:sdes:mid", direction: "sendrecv" }, { uri: DEPENDENCY_DESCRIPTOR, direction: "stopped" }];
     const t = { direction: init.direction!, init, setCodecPreferences: vi.fn(), getHeaderExtensionsToNegotiate: () => extensions.map(e => ({ ...e })), setHeaderExtensionsToNegotiate: vi.fn(),
-      receiver: { jitterBufferTarget: null, track: { kind: "video", id: `rx-${this.transceivers.length}` } }, sender };
+      receiver: { jitterBufferTarget: null, track: Object.assign(new EventTarget(), { kind: "video", id: `rx-${this.transceivers.length}`, enabled: true, muted: true }) }, sender };
     this.transceivers.push(t);
     return t;
   }
@@ -310,8 +310,24 @@ describe("watch transport", () => {
     expect(pc.transceivers.every(t => t.receiver.jitterBufferTarget === 0)).toBe(true);
     expect(offer).toHaveBeenCalledWith(expect.any(String), 5, [], null);
     expect(tracks).toEqual(pc.transceivers.map((t, slot) => [slot, { tracks: [t.receiver.track] }]));
-    expect(pc.ontrack).toBeNull(); // No later event replaces the already-bound streams.
+    const track = pc.transceivers[2]!.receiver.track as EventTarget;
+    let enabled = true;
+    const changes: boolean[] = [];
+    Object.defineProperty(track, "enabled", { get: () => enabled, set: (value: boolean) => { enabled = value; changes.push(value); } });
+    pc.ontrack?.({ transceiver: pc.transceivers[2], track, streams: [] });
+    expect(changes).toEqual([]);
+    track.dispatchEvent(new Event("unmute"));
+    expect(changes).toEqual([false, true]);
+    track.dispatchEvent(new Event("unmute"));
+    expect(changes).toEqual([false, true]); // A displayed/static track is never reset again.
+    expect(tracks).toHaveLength(SCREEN_SLOTS); // No event replaces the prebound streams.
+    const late = pc.transceivers[3]!.receiver.track as EventTarget;
+    pc.ontrack?.({ transceiver: pc.transceivers[3], track: late, streams: [] });
+    const lateChange = vi.fn();
+    Object.defineProperty(late, "enabled", { get: () => true, set: lateChange });
     transport.close();
+    late.dispatchEvent(new Event("unmute"));
+    expect(lateChange).not.toHaveBeenCalled(); // A retired run cannot reactivate it.
     pc.ontrack = null;
     expect(pc.close).toHaveBeenCalled();
   });

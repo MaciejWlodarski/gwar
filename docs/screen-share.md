@@ -2743,9 +2743,12 @@ from native capture is PR 10.
     receiver decodes fresh keyframes. Binding in the DOM before media starts and
     preserving the player avoids this and keeps a static share visible through
     view/StrictMode remounts without requesting another frame. A first-use or
-    renewed slot reveals its first
-    decoded frame, including a static share's single startup keyframe. Watch
-    assignment already requests a budgeted, retried PLI; no new server
+    renewed slot reveals its first decoded frame, including a static share's
+    single startup keyframe. Each receive track refreshes its local stream
+    selection once at its first unmute:
+    Linux WebKit can otherwise keep an idle slot's selection empty despite RTP
+    decode progress. This does not repeat on view moves or subsequent frames.
+    Watch assignment already requests a budgeted, retried PLI; no new server
     notification, extra frame-counter gate or timed reveal is required. The
     existing offer/connect and H.264 recovery watchdogs still apply. A connected
     receiver that never supplies a first frame ends its watch 35 s after its
