@@ -48,7 +48,7 @@ beforeEach(async () => {
   useScreen.setState({ ...initialScreen });
   useSession.getState().dispatch({
     type: "welcome", resync: false, now: 1,
-    welcome: welcome({ shares: ["A", "B"].map(share => ({ share, client: 2, channel: 1, preset: "text", surface: "screen" })) }),
+    welcome: welcome({ shares: ["A", "B", "C"].map(share => ({ share, client: 2, channel: 1, preset: "text", surface: "screen" })) }),
   });
   container = document.createElement("div");
   document.body.appendChild(container);
@@ -132,4 +132,70 @@ it("moves both attached players with their static frames when the real Stage swi
   expect(video("B").closest<HTMLElement>("[data-screen-video]")?.dataset.ready).toBe("true");
   expect(useScreen.getState().watches).toEqual(watches);
   expect(request.mock.calls.filter(([op]) => op === "screen.keyframe")).toHaveLength(0);
+});
+
+
+it.each(["silent", "receive time", "presentation time"] as const)("keeps a reused slot's readiness and deadline with its new grant (%s)", async frame => {
+  const failed = vi.spyOn(screen, "frameFailed");
+  const received = vi.spyOn(screen, "frameReceived");
+  vi.spyOn(screen, "stats").mockResolvedValue({ width: 640, height: 400, fps: 0, framesDecoded: 1 });
+  await act(async () => {
+    video("A").dispatchEvent(new Event("loadeddata"));
+    video("B").dispatchEvent(new Event("loadeddata"));
+  });
+  const active = video("A"), old = video("B");
+  const run = useScreen.getState().transport.run;
+  let frames = 5, callback: VideoFrameRequestCallback | undefined;
+  Object.defineProperties(old, {
+    readyState: { configurable: true, value: 2 },
+    getVideoPlaybackQuality: { configurable: true, value: () => ({ totalVideoFrames: frames }) },
+    requestVideoFrameCallback: { configurable: true, value: vi.fn((cb: VideoFrameRequestCallback) => { callback = cb; return 1; }) },
+    cancelVideoFrameCallback: { configurable: true, value: vi.fn() },
+  });
+  await act(async () => screen.unwatch("B"));
+  received.mockClear(); request.mockClear();
+  await act(async () => screen.watch("C"));
+  const replacement = useScreen.getState().watches.find(w => w.share === "C")!;
+  const ready = () => video("C").closest<HTMLElement>("[data-screen-video]")?.dataset.ready;
+  expect(video("C")).toBe(old);
+  expect(video("A")).toBe(active);
+  expect(useScreen.getState().transport.run).toBe(run);
+  expect(ready()).toBe("false");
+  await act(async () => {
+    old.dispatchEvent(new Event("loadeddata"));
+    old.dispatchEvent(new Event("resize"));
+    // A delayed callback for B cannot certify C, even if submitted again later.
+    callback?.(performance.now(), { receiveTime: -1, presentationTime: performance.now() + 1 } as VideoFrameCallbackMetadata);
+    // Without receipt metadata, presenting the same cached input is insufficient.
+    callback?.(performance.now(), { presentationTime: performance.now() + 1 } as VideoFrameCallbackMetadata);
+  });
+  await advance(100);
+  expect(ready()).toBe("false");
+  expect(received.mock.calls.filter(([share]) => share === "C")).toEqual([]);
+  expect(request.mock.calls.filter(([op]) => op === "screen.keyframe")).toEqual([["screen.keyframe", { share: "C" }]]);
+  await focus("A");
+  expect(video("C")).toBe(old);
+  await advance(100);
+  expect(ready()).toBe("false");
+  expect(request.mock.calls.filter(([op]) => op === "screen.keyframe")).toHaveLength(1);
+  if (frame !== "silent") {
+    // One fresh static frame suffices, also without optional WebRTC metadata.
+    frames++;
+    await act(async () => callback?.(performance.now(), {
+      presentationTime: performance.now() + 1,
+      ...(frame === "receive time" ? { receiveTime: performance.now() + 1 } : {}),
+    } as VideoFrameCallbackMetadata));
+    expect(ready()).toBe("true");
+    await advance(70_000);
+    expect(failed).not.toHaveBeenCalled();
+    expect(useScreen.getState().watches.map(w => w.share)).toEqual(["A", "C"]);
+  } else {
+    await advance(34_799);
+    expect(failed).not.toHaveBeenCalled();
+    await advance(1);
+    expect(failed).toHaveBeenCalledExactlyOnceWith("C", run, replacement.id);
+    expect(useScreen.getState().watches.map(w => w.share)).toEqual(["A"]);
+  }
+  expect(video("A")).toBe(active);
+  expect(video("A").closest<HTMLElement>("[data-screen-video]")?.dataset.ready).toBe("true");
 });

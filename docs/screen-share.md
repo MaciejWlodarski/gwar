@@ -2733,26 +2733,32 @@ from native capture is PR 10.
     The cache is bounded by the run's receive slots. First-use slots keep the
     current transport.
   - With another active or pending watch, slot reuse keeps the transport and
-    leaves those watches uninterrupted. Known cosmetic limitation: the reused
-    slot may briefly show the previous share's last frame until the new share's
-    first keyframe decodes.
+    leaves those watches uninterrupted. The reused player stays covered until
+    a post-grant frame arrives; its previous watch's cached frame cannot reveal
+    the new watch or satisfy its first-frame deadline. Readiness and the repair
+    marker belong to the run/watch ID, so Stage moves preserve only that grant's
+    state. A frame callback must report receipt after the grant; without optional
+    receipt metadata, both later presentation and player frame-count advancement
+    are required. Cached loadeddata/resize/current-data state is insufficient.
   - Linux WebKit can leave a replacement media player at 0×0 even while the
     receiver decodes fresh keyframes. Preserving the player keeps a static share
     visible through view/StrictMode remounts without requesting another frame.
-    The first loaded frame reveals immediately; metadata-only resize does not.
+    Metadata-only resize cannot certify a first frame.
     Watch assignment already requests a budgeted, retried PLI, but Linux WebKit's
     media-player decoder may initialize after that first receiver input. If the
-    receiver has decoded input but the player still has no current
-    frame, the client requests one repair keyframe for that grant. This marker
-    survives view moves; a loaded first frame always reveals immediately without
-    waiting for another counter advance, and static shares need no later frame.
+    receiver has decoded input but the player still lacks a frame for the current
+    grant, the client requests one repair keyframe for that grant. This marker
+    survives view moves. First-use players reveal on their first loaded frame;
+    reused players reveal on their first qualifying post-grant frame callback.
+    Static shares need no later frame after that receipt.
     Repair requests retain run/watch-ID fencing and do not restart the deadline.
-    No new server notification, frame-counter reveal gate or timed reveal is used.
+    No new server notification or timed reveal is used.
     The existing offer/connect and H.264 recovery watchdogs still apply. A connected
-    receiver that never supplies a first frame ends its watch 35 s after its
-    grant through the normal unwatch/error path, also for VP9 and older servers.
+    receiver that never supplies an identifiable first frame for its current grant
+    ends its watch 35 s after that grant through the normal unwatch/error path,
+    also for VP9, older servers, or a reused player without frame callbacks.
     The controller owns this deadline per run/watch ID: switching the stage or
-    remounting a video cannot restart it. The first frame, unwatch, server
+    remounting a video cannot restart it. Only that grant's first frame, unwatch, server
     release/stop, or transport retirement clears it. Rapid
     sole-watch reuse can hit the existing offer rate limit and its bounded retry
     delay.

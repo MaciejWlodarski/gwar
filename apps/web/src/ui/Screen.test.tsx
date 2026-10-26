@@ -284,7 +284,7 @@ describe("watched video frames", () => {
     expect(visible(fresh)).toBe(true);
   });
 
-  it("keeps another watch's element and stream on reuse, revealing a single frame without a new gate", async () => {
+  it("keeps another watch uninterrupted while waiting for the reused slot's fresh frame", async () => {
     vi.useFakeTimers();
     const failed = vi.spyOn(controller.screen, "frameFailed");
     try {
@@ -301,6 +301,11 @@ describe("watched video frames", () => {
       });
       const active = container.querySelector<HTMLVideoElement>('video[data-share="A"]')!;
       const old = container.querySelector<HTMLVideoElement>('video[data-share="B"]')!;
+      let frame: VideoFrameRequestCallback | undefined;
+      Object.defineProperties(old, {
+        requestVideoFrameCallback: { configurable: true, value: (cb: VideoFrameRequestCallback) => { frame = cb; return 1; } },
+        cancelVideoFrameCallback: { configurable: true, value: vi.fn() },
+      });
       await act(async () => {
         active.dispatchEvent(new Event("loadeddata"));
         old.dispatchEvent(new Event("loadeddata"));
@@ -316,9 +321,11 @@ describe("watched video frames", () => {
       expect(container.querySelector('video[data-share="A"]')).toBe(active);
       expect(active.srcObject).toBe(streams[0]);
       expect(visible(active)).toBe(true);
-      // Preserve the reused receiver, including its known cosmetic cached-frame limitation.
       expect(reused.srcObject).toBe(streams[1]);
+      expect(visible(reused)).toBe(false);
       await act(async () => reused.dispatchEvent(new Event("loadeddata")));
+      expect(visible(reused)).toBe(false);
+      await act(async () => frame?.(performance.now(), { receiveTime: performance.now() + 1 } as VideoFrameCallbackMetadata));
       await act(async () => vi.advanceTimersByTimeAsync(35_001));
       expect(visible(reused)).toBe(true);
       expect(visible(active)).toBe(true);

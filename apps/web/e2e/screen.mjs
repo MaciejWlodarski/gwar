@@ -480,6 +480,10 @@ async function run(browsers, web, server, token) {
   await watch(cv, "c3-restart");
   await sees(cv, first, 3, "first share of the restarting sharer");
   await codecFlow(c3, cv, first, "video/vp9");
+  // Also reuse a WebKit slot while its two other watches stay active.
+  const concurrentWebKitRun = await session(wv, (_, screen) => screen.transport.run);
+  await watch(wv, "c3-restart");
+  await sees(wv, first, 3, "concurrent WebKit watch before slot reuse");
   // The WebKit sharer has no other watches: its receive transport may renew safely.
   await watch(ws, "c3-restart");
   await sees(ws, first, 3, "sole watch before slot reuse");
@@ -516,6 +520,9 @@ async function run(browsers, web, server, token) {
   }, second);
   await watch(cv, "c3-restart");
   await watch(ws, "c3-restart");
+  await watch(wv, "c3-restart");
+  await sees(wv, second, 6, "concurrent WebKit watch reveals its new grant's frame");
+  assert.equal(await session(wv, (_, screen) => screen.transport.run), concurrentWebKitRun, "WebKit reuse preserves its other active watches' transport");
   // The second share has its own source (6, another shape): its frames cannot be the first's.
   await sees(cv, second, 6, "second share of the restarting sharer");
   assert.equal(await session(cv, (_, screen) => screen.transport.run), oldViewerRun, "another active watch prevents renewal");

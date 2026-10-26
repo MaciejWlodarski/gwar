@@ -357,8 +357,8 @@ export class ScreenController {
       if (!current()) { await conn.request("screen.unwatch", { share }).catch(() => {}); return; }
       if (reused && useScreen.getState().watches.every(w => w.id === id)) {
         // With no other watch to interrupt, discard the old receiver's decoded frame.
-        // Otherwise keep the transport: a brief stale frame in this slot is cosmetic,
-        // and must not reload another active (or pending) watch to hide it.
+        // Otherwise keep the transport and fence this slot's readiness to its grant;
+        // hiding its old frame must not reload another active (or pending) watch.
         this.dropTransport();
         await this.startWatch(conn, share, id, generation);
         return;
