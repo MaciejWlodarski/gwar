@@ -23,7 +23,7 @@ use std::{
 use gwar_proto::ScreenPauseReason;
 use str0m::media::Pt;
 
-use super::ingress::Bucket;
+use super::ingress::{self, Bucket};
 
 /// An original packet leaves at most this long after it arrived from the publisher.
 pub const DEADLINE: Duration = Duration::from_millis(400);
@@ -351,7 +351,7 @@ impl Egress {
         (DEADLINE.as_secs_f64() * self.release_rate()).max(ADMISSION_FLOOR) as usize
     }
 
-    #[cfg(test)]
+    /// Serialized bytes still waiting for application-paced release.
     pub fn queued(&self) -> usize {
         self.queued
     }
@@ -499,14 +499,16 @@ impl Egress {
 
     /// Can a batch of initial PLIs share one service opportunity without a
     /// simultaneous keyframe burst overflowing admission or its release deadline?
-    /// Unknown sources reserve the existing probe floor until measured.
+    /// History needs growth headroom; unknown sources reserve the probe floor.
+    /// Every reservation is bounded by the serialized per-frame ingress cap.
     pub(super) fn keyframes_fit(&self, lanes: &[usize], rates: &[ShareRate]) -> bool {
         let keys: usize = lanes
             .iter()
             .map(|&lane| match rates.get(lane).map_or(0, |r| r.largest_keyframe) {
                 0 => KEYFRAME_FLOOR,
-                key => key,
+                key => key.saturating_mul(4).max(key.saturating_add(64 * 1024)),
             })
+            .map(|key| key.min(ingress::FRAME_BYTES + ingress::FRAME_PACKETS * ORIGINAL_OVERHEAD))
             .sum();
         let other: f64 = (0..self.lanes.len())
             .filter(|lane| self.lanes[*lane].active() && !lanes.contains(lane))
@@ -909,11 +911,13 @@ mod tests {
         assert!(!e.keyframes_fit(&[0, 1], &rates), "individually fitting frames can overflow together");
         rates[0].largest_keyframe = 30_000;
         rates[1].largest_keyframe = 30_000;
+        assert!(!e.keyframes_fit(&[0, 1], &rates), "small historical frames still reserve growth headroom");
+        e.set_estimate(6_000_000, now);
         assert!(e.keyframes_fit(&[0, 1], &rates));
-        rates[2].average = 1_000_000.0;
+        rates[2].average = 1_000_001.0;
         assert!(!e.keyframes_fit(&[0, 1], &rates), "other active media keeps its release share");
         rates[2].average = 0.0;
-        for n in 0..40 {
+        for n in 0..100 {
             assert!(e.admit(2, packet(n, 0, n == 0, 1000, now), now).is_empty());
         }
         assert!(!e.keyframes_fit(&[0, 1], &rates), "already queued bytes keep their admission");

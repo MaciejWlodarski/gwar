@@ -724,7 +724,7 @@ async fn review_spaced_request_on_an_active_slot_is_not_lost() {
 }
 
 /// Regression for the round-2 startup repro: connected SRTP transports, fresh
-/// credits and tiny static streams must not serialize different publishers' PLIs.
+/// credits and established small static streams must complete prompt startup waves.
 #[tokio::test]
 async fn fresh_credit_startup_for_one_to_four_publishers_takes_under_200ms() {
     use std::time::Instant;
@@ -739,7 +739,11 @@ async fn fresh_credit_startup_for_one_to_four_publishers_takes_under_200ms() {
             for i in 0..count {
                 let mut source = Client::connect(&server, &format!("source-{i}")).await;
                 let share = source.share_in(channel).await;
-                source.publisher(&share).send(frame(1, 9000, true, 1, 1)).await;
+                let mut seed = frame(1, 9000, true, 8, 1);
+                for packet in &mut seed {
+                    packet.payload.resize(1000, 0x55);
+                }
+                source.publisher(&share).send(seed).await;
                 sources.push(source);
                 shares.push(share);
             }
@@ -764,12 +768,16 @@ async fn fresh_credit_startup_for_one_to_four_publishers_takes_under_200ms() {
                         let observed = publisher.request_times.lock().unwrap().first().copied();
                         if let Some(at) = observed {
                             first_pli[i] = Some(at.saturating_duration_since(granted[i]));
-                            publisher.send(frame(2, 12000, true, 1, 10 + i as u8)).await;
+                            let mut response = frame(9, 12000, true, 8, 10 + i as u8);
+                            for packet in &mut response {
+                                packet.payload.resize(1000, 0x55);
+                            }
+                            publisher.send(response).await;
                         }
                     }
                 }
                 for (slot, packet) in bob.viewer.as_mut().unwrap().collect(Duration::from_millis(1)).await {
-                    if packet.payload[2] >= 10 {
+                    if packet.payload[2] >= 10 && packet.marker {
                         let i = slots.iter().position(|s| *s == slot).unwrap();
                         first_key[i].get_or_insert(Instant::now().saturating_duration_since(granted[i]));
                     }

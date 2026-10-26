@@ -531,6 +531,13 @@ struct Slot {
     configured: bool,
     ssrc: Option<u32>,
     asked: Option<Instant>,
+    /// Reserve startup responses until their keyframe drains. A silent source
+    /// only holds a wave for the publisher throttle interval. The flag records
+    /// whether this response has started; partial frames also have a hard expiry.
+    initial_in_flight: Option<(Instant, bool)>,
+    initial_delivered: Option<Instant>,
+    /// A PLI sent before this loss cannot satisfy its queued retry.
+    initial_failed: Option<Instant>,
     /// Oldest unsatisfied request, independent of whether the segment is active.
     keyframe_pending: Option<Instant>,
     /// Released originals still owned by str0m: sequence, source keyframe and arrival deadline.
@@ -554,6 +561,9 @@ impl Slot {
             configured: false,
             ssrc: None,
             asked: None,
+            initial_in_flight: None,
+            initial_delivered: None,
+            initial_failed: None,
             keyframe_pending: None,
             originals: VecDeque::new(),
             written: 0,
@@ -561,6 +571,15 @@ impl Slot {
             last_h264: None,
             decode_cap: None,
             failed_at: None,
+        }
+    }
+
+    fn dropped(&mut self, now: Instant) {
+        self.segment.wait();
+        self.initial_in_flight = None;
+        if self.initial_delivered.is_none() {
+            self.initial_failed = Some(now);
+            self.keyframe_pending.get_or_insert(now);
         }
     }
 }
@@ -1010,17 +1029,25 @@ impl Sfu {
             .filter_map(|(slot, s)| {
                 let at = s.keyframe_pending?;
                 let grant = s.grant.as_ref().filter(|g| g.alive())?;
-                w.egress.paused(slot).is_none().then(|| (at, s.asked.is_some(), slot, grant.share.clone()))
+                // A lost initial response retains its service age for one fair
+                // retry ahead of newer work, without treating the old PLI as a
+                // response to this new request. Older deferred work still wins.
+                let age = if s.initial_failed.is_some() { s.asked.map_or(at, |asked| asked.min(at)) } else { at };
+                w.egress.paused(slot).is_none().then(|| (age, at, s.asked.is_some(), slot, grant.share.clone()))
             })
             .collect();
         pending.sort_unstable();
         let mut deferred = false;
-        for (requested, retry, slot, share) in pending {
+        for (_, requested, retry, slot, share) in pending {
             let Some(p) = self.publishers.get(&share) else { continue };
             // Another viewer can send this publisher's PLI between our request
             // and the next housekeeping tick. It satisfies the deferred request
             // just as joining a still-pending PLI does.
-            let already_sent = p.keyframes.last.is_some_and(|sent| sent >= requested);
+            let s = &self.watchers[&session].slots[slot];
+            let already_sent = p
+                .keyframes
+                .last
+                .is_some_and(|sent| sent >= requested && s.initial_failed.is_none_or(|failed| sent > failed));
             let coalesced = p.keyframes.pending || already_sent;
             let w = self.watchers.get_mut(&session).expect("watch found above");
             if !coalesced {
@@ -1030,9 +1057,9 @@ impl Sfu {
                 }
                 let credits =
                     self.budgets.get_mut(&session).map_or(VIEWER_KEYFRAMES_BURST, |budget| budget.available(now));
-                // Initial requests may share a service opportunity if their expected
-                // frames fit together and credits cover the remaining initial slots.
-                // Include recently requested frames even before they reach the queue.
+                // Reserve unanswered startup frames even before their packets
+                // reach admission. A completed wave releases its reservation on
+                // drain, allowing the next wave on that same transport wake.
                 let initial = w
                     .slots
                     .iter()
@@ -1049,18 +1076,39 @@ impl Sfu {
                     .iter()
                     .enumerate()
                     .filter_map(|(i, s)| {
-                        (i == slot || s.asked.is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_INTERVAL))
-                            .then_some(i)
+                        (i == slot
+                            || (s.grant.as_ref().is_some_and(|g| g.alive())
+                                && w.egress.paused(i).is_none()
+                                && (s.initial_in_flight.is_some_and(|(at, started)| {
+                                    let elapsed = now.saturating_duration_since(at);
+                                    elapsed < KEYFRAME_INTERVAL
+                                        || (started
+                                            && elapsed < KEYFRAME_INTERVAL + ingress::FRAME_SPAN + egress::DEADLINE)
+                                })
+                                    // Keep the existing reservation for a recent
+                                    // recovery PLI on an already playing slot.
+                                    || s.initial_delivered.is_some_and(|delivered| {
+                                        s.asked.is_some_and(|at| {
+                                            at != delivered && now.saturating_duration_since(at) < KEYFRAME_INTERVAL
+                                        })
+                                    }))))
+                        .then_some(i)
                     })
                     .collect();
-                let prompt_initial = !deferred
-                    && !retry
-                    && credits >= initial as f64
-                    && w.egress.keyframes_fit(&batch, &rates[..w.slots.len()]);
-                // Coalescing spends neither a spacing opportunity nor viewer credit.
-                // Retries and tight startup retain the fair, spaced service path.
-                if !prompt_initial
-                    && w.keyframe_at.is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_INTERVAL)
+                // A single seed may exceed its conservative reservation. It
+                // gets exclusive admission until drained (or silent for 500 ms);
+                // the existing bootstrap guard still holds known unfit frames.
+                let previous_drained = w.keyframe_at.is_none_or(|last| {
+                    now.saturating_duration_since(last) >= KEYFRAME_INTERVAL
+                        || w.slots.iter().any(|s| s.initial_delivered == Some(last))
+                });
+                let admission = w.egress.keyframes_fit(&batch, &rates[..w.slots.len()])
+                    || (batch.len() == 1 && w.egress.queued() == 0 && previous_drained);
+                let prompt_initial =
+                    !deferred && !retry && w.slots[slot].segment.waiting() && credits >= initial as f64 && admission;
+                if (w.slots[slot].initial_delivered.is_none() && !admission)
+                    || (!prompt_initial
+                        && w.keyframe_at.is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_INTERVAL))
                 {
                     deferred = true;
                     continue;
@@ -1086,6 +1134,10 @@ impl Sfu {
             }
             let s = &mut w.slots[slot];
             s.asked = Some(now);
+            s.initial_failed = None;
+            if s.initial_delivered.is_none() {
+                s.initial_in_flight = Some((now, false));
+            }
             s.keyframe_pending = None;
             if !already_sent {
                 self.schedule_publisher(&share);
@@ -1668,6 +1720,9 @@ impl Sfu {
         for slot in requests {
             self.ask_keyframe(session, slot, now);
         }
+        // An egress release may have drained the previous startup wave. Do not
+        // wait for the 100 ms housekeeping tick to request the next one.
+        self.request_keyframes(session, now);
     }
 
     fn decode_failed(
@@ -2008,7 +2063,7 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                     }
                     w.egress.reject_original(lane, key_frame, now);
                     let slot = &mut w.slots[lane];
-                    slot.segment.wait();
+                    slot.dropped(now);
                     slot.originals.clear();
                     wipe(&mut w.rtc, slot.mid);
                     requests.push(lane);
@@ -2151,6 +2206,7 @@ fn apply(w: &mut Watcher, slot: usize, change: Change) {
             }
             let s = &mut w.slots[slot];
             s.segment.wait();
+            s.initial_in_flight = None;
             s.asked = None;
             s.originals.clear();
             wipe(&mut w.rtc, s.mid);
@@ -2199,6 +2255,9 @@ fn empty(w: &mut Watcher, index: usize) {
     slot.grant = None;
     slot.segment.wait();
     slot.asked = None;
+    slot.initial_in_flight = None;
+    slot.initial_delivered = None;
+    slot.initial_failed = None;
     slot.keyframe_pending = None;
     slot.keyframe_at = None;
     slot.last_h264 = None;
@@ -2365,10 +2424,16 @@ fn enqueue(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forwa
     );
     let dropped = w.egress.admit(index, packet, now);
     for &lane in &dropped {
-        w.slots[lane].segment.wait();
+        w.slots[lane].dropped(now);
     }
     w.dropped_lanes.extend(dropped.iter().copied());
     let admitted = !dropped.contains(&index);
+    if admitted
+        && forward.keyframe
+        && let Some((_, started)) = &mut w.slots[index].initial_in_flight
+    {
+        *started = true;
+    }
     if admitted && let Some(need) = forward.h264 {
         w.slots[index].last_h264 = Some((now, need));
     }
@@ -2380,11 +2445,16 @@ fn enqueue(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forwa
 fn release(w: &mut Watcher, now: Instant) {
     let (released, dropped) = w.egress.due(now);
     for &lane in &dropped {
-        w.slots[lane].segment.wait();
+        w.slots[lane].dropped(now);
     }
     w.dropped_lanes.extend(dropped);
     for (lane, packet) in released {
         let slot = &mut w.slots[lane];
+        if packet.marker && packet.key_frame().is_some() {
+            slot.initial_in_flight = None;
+            slot.initial_delivered = Some(slot.asked.unwrap_or(now));
+            slot.initial_failed = None;
+        }
         let mut direct = w.rtc.direct_api();
         let Some(stream) = direct.stream_tx_by_mid(slot.mid, None) else { continue };
         if !slot.configured {
@@ -3421,7 +3491,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn initial_requests_keep_spacing_when_admission_or_credits_are_tight_and_retries_cannot_be_overtaken() {
-        for mode in ["admission", "credits", "retry", "older"] {
+        for mode in ["admission", "credits", "retry", "older", "active"] {
             let (mut sfu, _, now, _) = recovery_fixture(&[1]).await;
             let mut other = h264_ingress_fixture(now);
             other.origin = ScreenOrigin::new(99, "other".into(), 1, false, false, 8_000_000);
@@ -3438,6 +3508,11 @@ pub(crate) mod tests {
             }
             if mode == "retry" {
                 sfu.watchers.get_mut(&1).unwrap().slots[1].asked = Some(now - WAITING_RETRY);
+            }
+            if mode == "active" {
+                let slot = &mut sfu.watchers.get_mut(&1).unwrap().slots[0];
+                slot.initial_delivered = Some(now - WAITING_RETRY);
+                slot.segment.map(1, 9000, true, now).unwrap();
             }
             sfu.ask_keyframe(1, 0, now);
             let at = now + Duration::from_millis(2);
@@ -3509,15 +3584,51 @@ pub(crate) mod tests {
                 for offset in 0..slots {
                     sfu.ask_keyframe(1, (offset + seed) % slots, now);
                 }
-                let at = now + ALLOCATION_TICK;
-                sfu.retry_keyframes(1, at);
-                for name in &names {
-                    assert!(sfu.publishers[name].keyframes.due(at), "startup: {slots} publishers, seed {seed}, {name}");
-                    let slot = names.iter().position(|n| n == name).unwrap();
-                    assert!(sfu.watchers[&1].slots[slot].asked.unwrap() - now < Duration::from_millis(200));
+                // Small established sources answer after 10 ms. Their actual
+                // 1-8 KiB frames drain through production admission/release;
+                // conservative reservations may require several prompt waves.
+                let mut first_pli = vec![None; slots];
+                for tick in 0..200u32 {
+                    let at = now + Duration::from_millis(tick as u64);
+                    sfu.retry_keyframes(1, at);
+                    for (slot, name) in names.iter().enumerate() {
+                        let p = sfu.publishers.get_mut(name).unwrap();
+                        if p.keyframes.due(at) {
+                            p.keyframes.pending = false;
+                            p.keyframes.last = Some(at);
+                            p.keyframes.sent += 1;
+                            first_pli[slot].get_or_insert(at);
+                        }
+                        if first_pli[slot].is_some_and(|sent| at - sent == Duration::from_millis(10)) {
+                            let origin = p.origin.clone();
+                            for packet in 0..=seed {
+                                let forward = Forward {
+                                    h264: None,
+                                    source: packet as u64,
+                                    timestamp: 9000,
+                                    marker: packet == seed,
+                                    keyframe: packet == 0,
+                                    codec: VideoCodec::Vp9,
+                                    arrival: at,
+                                    payload: Arc::from(vec![0; 1024]),
+                                };
+                                assert!(enqueue(sfu.watchers.get_mut(&1).unwrap(), slot, &origin, &forward, at));
+                            }
+                        }
+                    }
+                    release(sfu.watchers.get_mut(&1).unwrap(), at);
+                    sfu.request_keyframes(1, at);
                 }
-                assert!(at - now < Duration::from_millis(200));
-                assert_eq!(sfu.budgets.get_mut(&1).unwrap().available(now), VIEWER_KEYFRAMES_BURST - slots as f64);
+                assert!(first_pli.iter().all(|at| at.is_some_and(|at| at - now < Duration::from_millis(200))));
+                let w = &sfu.watchers[&1];
+                assert!(
+                    w.slots[..slots].iter().all(|s| s.initial_delivered.is_some()),
+                    "startup: {slots} publishers, seed {seed}"
+                );
+                assert_eq!(w.egress.counters.evicted + w.egress.counters.rejected, 0);
+                let at = now + Duration::from_millis(199);
+                let expected = VIEWER_KEYFRAMES_BURST - slots as f64 + 0.199 * VIEWER_KEYFRAMES_PER_SECOND;
+                assert!((sfu.budgets.get_mut(&1).unwrap().available(at) - expected).abs() < 1e-9);
             }
         }
         for seed in 0..32u64 {
@@ -3692,6 +3803,8 @@ pub(crate) mod tests {
             sfu.watchers.get_mut(&1).unwrap().keyframe_at = Some(now);
             sfu.ask_keyframe(1, 0, now);
             assert!(sfu.watchers[&1].slots[0].keyframe_pending.is_some());
+            sfu.watchers.get_mut(&1).unwrap().slots[0].initial_in_flight = Some((now, false));
+            sfu.watchers.get_mut(&1).unwrap().slots[0].initial_failed = Some(now);
             match mode {
                 "release" => {
                     let run = sfu.watchers[&1].run;
@@ -3714,7 +3827,12 @@ pub(crate) mod tests {
                 "replacement" => assign(sfu.watchers.get_mut(&1).unwrap(), 0, WatchGrant::new(origin), 2, now),
                 _ => unreachable!(),
             }
-            assert!(sfu.watchers.values().flat_map(|w| &w.slots).all(|s| s.keyframe_pending.is_none()), "mode={mode}");
+            assert!(
+                sfu.watchers.values().flat_map(|w| &w.slots).all(|s| s.keyframe_pending.is_none()
+                    && s.initial_in_flight.is_none()
+                    && s.initial_failed.is_none()),
+                "mode={mode}"
+            );
             eprintln!("CLEANUP {mode}: pending state removed");
         }
     }
@@ -4174,6 +4292,176 @@ pub(crate) mod tests {
             let (_, held, verdict) = h264_packet(&mut p, h264_forward(4, 12000, &[0x65, 1], now), true, now);
             assert_eq!(held.len(), 3, "a new valid access unit recovers");
             assert!(verdict.is_none());
+        }
+    }
+    #[tokio::test]
+    async fn initial_admission_loss_does_not_coalesce_with_the_failed_pli() {
+        for older_pending in [false, true] {
+            let (mut sfu, origin, now, _) = recovery_fixture(&[1]).await;
+            sfu.ask_keyframe(1, 0, now);
+            let failure = if older_pending { now + Duration::from_millis(100) } else { now };
+            let requested = if older_pending { now + Duration::from_millis(50) } else { now };
+            if older_pending {
+                sfu.watchers.get_mut(&1).unwrap().slots[0].keyframe_pending = Some(requested);
+            }
+            let p = sfu.publishers.get_mut("h264").unwrap();
+            p.keyframes.pending = false;
+            p.keyframes.last = Some(failure);
+            // One SFU flush can send a PLI and process an admission failure at the
+            // same timestamp. That PLI cannot satisfy the resulting recovery,
+            // even if it was sent after an older deferred request.
+            let w = sfu.watchers.get_mut(&1).unwrap();
+            for packet in 0..100 {
+                let forward = Forward {
+                    h264: None,
+                    source: packet,
+                    timestamp: 9000,
+                    marker: packet == 99,
+                    keyframe: packet == 0,
+                    codec: VideoCodec::Vp9,
+                    arrival: failure,
+                    payload: Arc::from(vec![0; 1000]),
+                };
+                enqueue(w, 0, &origin, &forward, failure);
+            }
+            assert_eq!(std::mem::take(&mut w.dropped_lanes), [0]);
+            assert!(w.slots[0].initial_in_flight.is_none());
+            sfu.ask_keyframe(1, 0, failure);
+            assert_eq!(sfu.watchers[&1].slots[0].keyframe_pending, Some(requested));
+            assert!(!sfu.publishers["h264"].keyframes.pending);
+            let expected = 9.0 + (failure - now).as_secs_f64() * VIEWER_KEYFRAMES_PER_SECOND;
+            assert!((sfu.budgets.get_mut(&1).unwrap().available(failure) - expected).abs() < 1e-9);
+            sfu.retry_keyframes(1, now + KEYFRAME_INTERVAL);
+            assert!(sfu.publishers["h264"].keyframes.pending);
+            assert!(sfu.watchers[&1].slots[0].keyframe_pending.is_none());
+        }
+    }
+
+    /// Port of the round-3 review repro: every publisher answers its first PLI
+    /// only. Passing therefore cannot hide simultaneous admission loss by retry.
+    #[tokio::test]
+    async fn growing_keyframes_do_not_recreate_batch_evictions() {
+        initial_keyframe_waves(20, 80, false).await;
+    }
+
+    #[tokio::test]
+    async fn four_unknown_or_large_keyframes_recover_within_30s_without_a_storm() {
+        initial_keyframe_waves(0, 200, true).await;
+        initial_keyframe_waves(200, 200, true).await;
+    }
+
+    async fn initial_keyframe_waves(history: usize, packets: usize, ramp: bool) {
+        let (mut sfu, _, now, _) = recovery_fixture(&[1]).await;
+        sfu.publishers.clear();
+        let names: Vec<_> = (0..4).map(|i| format!("burst-{i}")).collect();
+        for (slot, name) in names.iter().enumerate() {
+            let mut publisher = h264_ingress_fixture(now);
+            publisher.origin = ScreenOrigin::new(100 + slot as u32, name.clone(), 1, false, false, 8_000_000);
+            for packet in 0..history {
+                publisher.rate.record(packet as u64, 9000, 1000, packet == 0, now);
+            }
+            let rate = publisher.rate.rate(now);
+            assert_eq!(rate.largest_keyframe, history * 1064);
+            sfu.rates.insert(name.clone(), rate);
+            assign(
+                sfu.watchers.get_mut(&1).unwrap(),
+                slot,
+                WatchGrant::new(publisher.origin.clone()),
+                slot as u64,
+                now,
+            );
+            sfu.publishers.insert(name.clone(), publisher);
+        }
+        for slot in 0..4 {
+            sfu.ask_keyframe(1, slot, now);
+        }
+        assert_eq!(sfu.publishers.values().filter(|p| p.keyframes.pending).count(), 1);
+        let mut completed = [None; 4];
+        let mut responses = [None; 4];
+        let mut failures = std::collections::BTreeSet::new();
+        for tick in 0..=30_000u32 {
+            let at = now + Duration::from_millis(tick as u64);
+            // A cold viewer discovers capacity through its existing probes.
+            // Before this step even one 212,800-byte frame cannot fit; no
+            // scheduler can promise its delivery at the initial 2.5 Mbps.
+            if ramp && tick == 200 {
+                sfu.watchers.get_mut(&1).unwrap().egress.set_estimate(10_000_000, at);
+            }
+            sfu.retry_keyframes(1, at);
+            for (slot, name) in names.iter().enumerate() {
+                let p = sfu.publishers.get_mut(name).unwrap();
+                if p.keyframes.due(at) {
+                    p.keyframes.pending = false;
+                    p.keyframes.last = Some(at);
+                    p.keyframes.sent += 1;
+                    assert!(p.keyframes.sent <= 2, "retry storm for {name}");
+                    if ramp || p.keyframes.sent == 1 {
+                        responses[slot] = Some((at, p.keyframes.sent));
+                    }
+                }
+            }
+            for (slot, name) in names.iter().enumerate() {
+                let Some((sent, attempt)) = responses[slot] else { continue };
+                let elapsed = at.saturating_duration_since(sent).as_millis();
+                if !(30..30 + packets as u128).contains(&elapsed) {
+                    continue;
+                }
+                let packet = (elapsed - 30) as u64;
+                let forward = Forward {
+                    h264: None,
+                    source: attempt * 1000 + packet,
+                    timestamp: 12000 * attempt as u32,
+                    marker: packet == packets as u64 - 1,
+                    keyframe: packet == 0,
+                    codec: VideoCodec::Vp9,
+                    arrival: at,
+                    payload: Arc::from(vec![0u8; 1000]),
+                };
+                let origin = sfu.publishers[name].origin.clone();
+                sfu.publishers.get_mut(name).unwrap().rate.record(
+                    forward.source,
+                    forward.timestamp,
+                    1000,
+                    forward.keyframe,
+                    at,
+                );
+                enqueue(sfu.watchers.get_mut(&1).unwrap(), slot, &origin, &forward, at);
+            }
+            if tick % 100 == 0 {
+                sfu.rates = sfu.publishers.iter_mut().map(|(name, p)| (name.clone(), p.rate.rate(at))).collect();
+            }
+            let w = sfu.watchers.get_mut(&1).unwrap();
+            release(w, at);
+            let dropped = std::mem::take(&mut w.dropped_lanes);
+            for (slot, complete) in completed.iter_mut().enumerate() {
+                if w.slots[slot].initial_delivered.is_some() {
+                    complete.get_or_insert(at - now);
+                }
+            }
+            for lane in dropped {
+                failures.insert(lane);
+                sfu.ask_keyframe(1, lane, at);
+            }
+            sfu.request_keyframes(1, at);
+            if completed.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        let counts: Vec<_> = names.iter().map(|name| sfu.publishers[name].keyframes.sent).collect();
+        let counters = sfu.watchers[&1].egress.counters;
+        eprintln!(
+            "WAVES history={history} packets={packets} completed={completed:?} PLIs={counts:?} failures={failures:?} counters={counters:?}"
+        );
+        assert!(completed.iter().all(|delay| delay.is_some_and(|delay| delay < Duration::from_secs(30))));
+        if ramp {
+            // The only failure is the exclusive seed before capacity discovery.
+            assert_eq!(failures.len(), 1);
+            assert_eq!(counts.iter().sum::<u64>(), 5);
+        } else {
+            assert!(failures.is_empty());
+            assert_eq!(counters.evicted + counters.rejected + counters.failed_keyframes, 0);
+            assert_eq!(counts, [1, 1, 1, 1]);
+            assert!(completed.iter().all(|delay| delay.unwrap() < Duration::from_secs(2)));
         }
     }
 }
