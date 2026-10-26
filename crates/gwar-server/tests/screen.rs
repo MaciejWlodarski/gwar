@@ -811,6 +811,11 @@ fn bits(fields: &[(u32, usize)]) -> Vec<u8> {
 /// An AV1 keyframe in one packet: a 1920x1080 profile 0 sequence header at level 4.1 (1080p60),
 /// main tier, and a shown KEY_FRAME frame OBU, both length-prefixed (W=0, N=1).
 fn av1_keyframe() -> Vec<u8> {
+    av1_keyframe_at(9)
+}
+
+/// A 1080p AV1 keyframe whose sequence declares `level` (main tier).
+fn av1_keyframe_at(level: u32) -> Vec<u8> {
     let mut sequence = vec![0x08];
     sequence.extend(bits(&[
         (0, 3),
@@ -820,7 +825,7 @@ fn av1_keyframe() -> Vec<u8> {
         (0, 1),
         (0, 5),
         (0, 12),
-        (9, 5),
+        (level, 5),
         (0, 1),
         (15, 4),
         (15, 4),
@@ -888,4 +893,24 @@ async fn av1_srtp_forwarding_keeps_descriptors_and_gives_way_to_h264_for_a_viewe
     assert_eq!(recover, json!({"share": share, "codec": "h264", "width": 1920, "height": 1080, "fps": 60}));
     let carol_got = carol.viewer.as_mut().unwrap().collect(Duration::from_millis(300)).await;
     assert!(carol_got.iter().all(|(s, _)| *s != cs), "AV1 never reaches a slot without AV1");
+}
+
+#[tokio::test]
+async fn an_av1_sequence_beyond_the_sfu_limits_turns_the_share_to_h264_once() {
+    use str0m::format::Codec;
+    let server = TestServer::start().await;
+    let mut alice = Client::connect(&server, "av1").await;
+    assert_eq!(alice.ok("screen.av1.capabilities", json!({})).await, json!({"screen_av1": true}));
+    let channel = seed_channel(&alice, "General");
+    alice.ok("channel.join", json!({"channel": channel})).await;
+    let share = alice.share_here_codec(Codec::Av1).await;
+    // seq_level_idx 31 (unconstrained): never forwarded, and every keyframe repeats it.
+    let keyframe = |sequence, timestamp| Packet { sequence, timestamp, marker: true, payload: av1_keyframe_at(31) };
+    alice.publisher(&share).send_described([(keyframe(500, 90000), Some(ATTACHED.to_vec()))]).await;
+    let recover = alice.next_event("screen.recover").await;
+    assert_eq!(recover, json!({"share": share, "codec": "h264", "width": 1920, "height": 1080, "fps": 60}));
+    // Further refused keyframes from the old transport ask for nothing more.
+    alice.publisher(&share).send_described([(keyframe(501, 93000), Some(ATTACHED.to_vec()))]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(alice.drain_events("screen.recover").await.is_empty());
 }

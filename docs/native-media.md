@@ -2023,6 +2023,26 @@ production server is involved.
     reordered piece of one opens no segment and requests a throttled PLI,
     like H.264's fragmented SPS. Mandatory DD fields are checked against
     `Z`/`Y`/`N`; conflicts drop the packet.
+  - Refused sequences: an encoder repeats its sequence header at every
+    keyframe, so one the SFU refuses (another profile, a level above 5.1 or
+    31, high tier, or a frame too large for its level) would only earn more keyframe
+    requests. When such a header is read on arrival (whole in one packet,
+    or split over consecutive packets), the SFU instead turns the share to
+    H.264 in place through the same one-time `screen.recover` plan as a
+    viewer without AV1: H.264 at the sequence's maximum frame size, each side
+    capped at 8192, 60 fps. It logs that once, and the old transport's
+    media stays fenced until the replacement is accepted. The plan retires
+    AV1 for the rest of the share, so AV1 is never answered again and the
+    share cannot flap; refused AV1 arriving later plans nothing more. A split header that arrives
+    reordered is read only by the prefix, which just refuses that keyframe;
+    the next keyframe repeats the header.
+  - Viewers below the stream's level: a viewer whose declared `level-idx`
+    or tier is below the stream's, or whose verified size is smaller, gets
+    the existing "viewer without AV1" outcome. If it decodes H.264, the
+    share turns to H.264 once (above, and [Codec
+    negotiation](#codec-negotiation-across-mixed-viewers), item 7). If not,
+    or once AV1 is already given up, it is refused: its watch stops with
+    `screen.stopped {reason: "codec"}`. A slot never stays silently black.
   - Forwarding: DD bytes are forwarded unchanged apart from the frame number,
     which each slot remaps so that a new segment (keyframe, source switch,
     pause/resume) continues one after the last forwarded frame. Values over
@@ -2050,11 +2070,14 @@ production server is involved.
     decode watchdog covers AV1 like H.264. The sharing bar shows "AV1".
   - Tests: Rust unit tests (sequence-header operating points, split and
     reordered prefixes, descriptor checks, seeded random input, limits,
-    frame-number remapping, downgrade and retirement), a real-SRTP str0m
-    loopback (byte-identical AV1 with one- and two-byte DD to two viewers,
-    per-peer PTs and extmap ids, the H.264 downgrade for a viewer without
-    AV1), web unit tests, and the browser e2e, which asserts that the
-    publish offer carries AV1 exactly when the encoder is hardware.
+    frame-number remapping, downgrade and retirement, the one-time switch
+    for a refused sequence and none for a valid one, viewers below the
+    stream's level), a real-SRTP str0m loopback (byte-identical AV1 with
+    one- and two-byte DD to two viewers, per-peer PTs and extmap ids, the
+    H.264 downgrade for a viewer without AV1, and a level-31 sequence
+    producing one `screen.recover`), web unit tests, and the browser e2e,
+    which asserts that the publish offer carries AV1 exactly when the
+    encoder is hardware.
     Headless CI Chromium has no hardware AV1 encoder, so the browser e2e
     keeps exercising H.264; real AV1 browser sending needs a capable GPU
     (Windows NVIDIA RTX 40+, AMD RDNA 3+, Intel Arc) and is not covered in CI.

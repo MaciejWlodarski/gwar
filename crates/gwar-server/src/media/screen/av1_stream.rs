@@ -72,6 +72,20 @@ impl Requirements {
             .then_some(Self { width, height, level, tier: sequence.seq_tier })
     }
 
+    /// A well-formed sequence the SFU will not forward (profile, level, tier or size outside
+    /// its limits), as the size an H.264 replacement is asked for: the encoder's own frame
+    /// size, each side bounded by level 5.1's largest.
+    fn refused(sequence: &SequenceHeader) -> Self {
+        let &(.., max_width, max_height) = LEVELS.last().expect("levels");
+        let side = max_width.max(max_height);
+        Self {
+            width: sequence.max_frame_width.min(side),
+            height: sequence.max_frame_height.min(side),
+            level: sequence.seq_level_idx,
+            tier: sequence.seq_tier,
+        }
+    }
+
     pub fn pixels(&self) -> u64 {
         u64::from(self.width) * u64::from(self.height)
     }
@@ -122,6 +136,7 @@ pub(super) struct Admission {
     current: Option<(u64, Requirements)>,
     fragment: Option<Fragment>,
     highest: Option<u64>,
+    refused: Option<Requirements>,
 }
 
 impl Admission {
@@ -190,11 +205,21 @@ impl Admission {
     }
 
     fn admit(&mut self, source: u64, sequence: &SequenceHeader) -> Result<(), ()> {
-        let need = Requirements::of(sequence).ok_or(())?;
+        let Some(need) = Requirements::of(sequence) else {
+            self.refused = Some(Requirements::refused(sequence));
+            return Err(());
+        };
         if self.current.is_none_or(|(at, _)| source >= at) {
             self.current = Some((source, need));
         }
         Ok(())
+    }
+
+    /// The publisher's encoder produced a sequence the SFU never forwards. Every keyframe
+    /// repeats it, so waiting for another one cannot help; the share has to leave AV1. Read
+    /// on arrival, from a header in one packet or split over consecutive ones.
+    pub fn take_refused(&mut self) -> Option<Requirements> {
+        self.refused.take()
     }
 
     /// A confirmed keyframe prefix carries the sequence its frames belong to.
@@ -512,8 +537,15 @@ pub(super) mod tests {
             // The failure clears the fragment.
             admission.inspect(&mut forward(20, rtp(false, false, false, &[&INTER]), None)).unwrap();
         }
+        // Malformed input is not a refused sequence: it says nothing about the encoder.
+        assert_eq!(admission.take_refused(), None);
         let mut unsupported = forward(30, rtp(false, false, true, &[&sequence_obu(2, 1920, 1080), &KEY]), None);
         assert!(admission.inspect(&mut unsupported).is_err());
+        assert_eq!(admission.take_refused().map(|r| (r.width, r.height)), Some((1920, 1080)));
+        // An oversized frame is asked of H.264 at no more than the largest size forwarded.
+        let mut huge = forward(40, rtp(false, false, true, &[&sequence_obu_at(0, 16384, 1080, 31, 0), &KEY]), None);
+        assert!(admission.inspect(&mut huge).is_err());
+        assert_eq!(admission.take_refused(), Some(Requirements { width: 8192, height: 1080, level: 31, tier: 0 }));
     }
 
     #[test]
@@ -541,6 +573,10 @@ pub(super) mod tests {
             let mut packet = forward(1, rtp(false, false, true, &[&seq, &KEY]), Some(ATTACHED));
             let mut admission = Admission::default();
             assert_eq!(admission.inspect(&mut packet).is_ok(), admitted, "{case}");
+            // A refusal is reported once, with what the encoder asked for.
+            let refused = (!admitted).then_some(Requirements { width, height, level: level as u8, tier: tier as u8 });
+            assert_eq!(admission.take_refused(), refused, "{case}");
+            assert_eq!(admission.take_refused(), None, "{case}");
             assert_eq!(confirm(&prefix(vec![packet])), need.ok_or(()).map(Some), "{case}");
             // The same header split across packets, live and reassembled.
             let first = forward(10, rtp(false, true, true, &[&seq[..3]]), None);
@@ -548,6 +584,7 @@ pub(super) mod tests {
             let mut admission = Admission::default();
             admission.inspect(&mut first.clone()).unwrap();
             assert_eq!(admission.inspect(&mut second.clone()).is_ok(), admitted, "{case}: live split");
+            assert_eq!(admission.take_refused(), refused, "{case}: live split");
             assert_eq!(confirm(&prefix(vec![first, second])), need.ok_or(()).map(Some), "{case}: reassembled");
         }
     }

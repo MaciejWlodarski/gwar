@@ -1576,6 +1576,7 @@ impl Sfu {
                                 forwards.clear();
                                 self.overrun(&mut p, verdict);
                             }
+                            self.refuse_av1(&mut p, now);
                             continue;
                         }
                         let Some(describe) = describe(codec, &packet.payload) else { continue };
@@ -1664,7 +1665,7 @@ impl Sfu {
                     // who decodes H.264. Every slot waits for the replacement's keyframe.
                     if let Some(size) = forward.av1
                         && w.slots[index].pts.keys().any(|c| matches!(c, VideoCodec::H264(_)))
-                        && self.downgrade_av1(origin, size, now)
+                        && self.downgrade_av1(origin, size, "a viewer cannot decode it", now)
                     {
                         return;
                     }
@@ -1767,16 +1768,32 @@ impl Sfu {
         }
     }
 
-    /// An assigned viewer cannot decode the share's AV1: replace the publisher with H.264 at
-    /// the same size, once, keeping the share and every watch. Whether a replacement is on its
-    /// way; without one (AV1 was already given up), the viewer is refused instead.
-    fn downgrade_av1(&mut self, origin: &Arc<ScreenOrigin>, size: av1_stream::Requirements, now: Instant) -> bool {
+    /// The publisher's AV1 sequence is one the SFU never forwards (another profile, a level
+    /// above 5.1 or unconstrained, high tier, or a frame too large for its level). Every keyframe repeats
+    /// it, so instead of asking for keyframes forever the share gives way to H.264, once.
+    fn refuse_av1(&mut self, p: &mut Publisher, now: Instant) {
+        let Some(sequence) = p.av1_stream.take_refused() else { return };
+        let origin = p.origin.clone();
+        self.downgrade_av1(&origin, sequence, "the publisher's sequence exceeds the SFU's limits", now);
+    }
+
+    /// The share's AV1 cannot go on (`why`): replace the publisher with H.264 at `size`, once,
+    /// keeping the share and every watch. Whether a replacement is on its way; without one (AV1
+    /// was already given up), an AV1 viewer is refused and AV1 media stays blocked.
+    fn downgrade_av1(
+        &mut self,
+        origin: &Arc<ScreenOrigin>,
+        size: av1_stream::Requirements,
+        why: &'static str,
+        now: Instant,
+    ) -> bool {
         let (plan, pending) = {
             let mut recovery = origin.recovery.lock().expect("recovery lock");
             let plan = recovery.downgrade_av1(&origin.share, size, now);
             (plan, recovery.pending)
         };
         if let Some(plan) = plan {
+            info!(share = origin.share, why, level = size.level, tier = size.tier, "screen share leaves AV1 for H.264");
             self.apply_recovery(origin.clone(), plan, false);
         }
         pending
@@ -4960,7 +4977,7 @@ pub(crate) mod tests {
         assert_eq!(sfu.watchers.len(), 1);
     }
 
-    use av1_stream::tests::{ATTACHED, INTER, KEY, rtp, sequence_obu};
+    use av1_stream::tests::{ATTACHED, INTER, KEY, rtp, sequence_obu, sequence_obu_at};
 
     const HD: av1_stream::Requirements = av1_stream::tests::main(1920, 1080);
 
@@ -5211,6 +5228,114 @@ pub(crate) mod tests {
         sfu.forward_packets("h264", &origin, vec![(next, true)], now);
         assert!(sfu.watchers[&2].slots[0].grant.is_none(), "refused once AV1 was given up");
         assert!(!sfu.watchers[&1].slots[0].segment.waiting(), "the AV1 viewer is served again");
+    }
+
+    #[tokio::test]
+    async fn a_publisher_sequence_the_sfu_refuses_turns_the_share_to_h264_once() {
+        // The H.264 size asked for comes from `take_refused`, tested with the admission; the
+        // plan built from it, with the recovery.
+        for (level, tier, width, height) in
+            [(31, 0, 1920, 1080), (14, 0, 1920, 1080), (13, 1, 2560, 1440), (9, 0, 2560, 1440), (31, 0, 16384, 2160)]
+        {
+            let case = format!("level {level} tier {tier} {width}x{height}");
+            let (mut sfu, origin, now, _) = recovery_fixture(&[1]).await;
+            let w = sfu.watchers.get_mut(&1).unwrap();
+            w.slots[0].pts.insert(VideoCodec::Av1, 45.into());
+            w.slots[0].av1 = Some(codec::Av1Limits::new(
+                &gwar_proto::Av1Capability { width: 2560, height: 1440 },
+                codec::Av1Declared { level: 13, tier: 0 },
+            ));
+            let mut p = sfu.publishers.remove("h264").unwrap();
+            let seq = sequence_obu_at(0, width, height, level, tier);
+            let key = |source: u64| Forward {
+                marker: true,
+                ..av1_forward(
+                    source,
+                    source as u32 * 3000,
+                    rtp(false, false, true, &[&seq, &KEY]),
+                    Some(ATTACHED.to_vec()),
+                    now,
+                )
+            };
+            let (_, held, verdict) = prefix_packet(&mut p, key(1), true, now);
+            assert!(held.is_empty() && verdict.is_some(), "{case}: never forwarded");
+            sfu.refuse_av1(&mut p, now);
+            {
+                let recovery = origin.recovery.lock().unwrap();
+                assert!(recovery.pending && !recovery.av1(), "{case}: H.264 replacement asked for");
+            }
+            let slot = &sfu.watchers[&1].slots[0];
+            assert!(slot.grant.is_some() && slot.segment.waiting(), "{case}: the viewer keeps its watch");
+            // One switch per share: AV1 arriving again once the replacement is accepted plans
+            // nothing more, so the share cannot flap between codecs.
+            origin.recovery.lock().unwrap().pending = false;
+            for source in [2, 3] {
+                prefix_packet(&mut p, key(source), true, now);
+                sfu.refuse_av1(&mut p, now);
+                let recovery = origin.recovery.lock().unwrap();
+                assert!(!recovery.pending && !recovery.av1(), "{case}: no second plan");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_publisher_sequence_within_the_sfu_limits_keeps_av1() {
+        let (mut sfu, origin, now, _) = recovery_fixture(&[1]).await;
+        let mut p = sfu.publishers.remove("h264").unwrap();
+        for (source, (level, width, height)) in [(1, (8, 1280, 720)), (2, (9, 1920, 1080)), (3, (13, 2560, 1440))] {
+            let seq = sequence_obu_at(0, width, height, level, 0);
+            let key = Forward {
+                marker: true,
+                ..av1_forward(
+                    source,
+                    source as u32 * 3000,
+                    rtp(false, false, true, &[&seq, &KEY]),
+                    Some(ATTACHED.to_vec()),
+                    now,
+                )
+            };
+            let (_, held, verdict) = prefix_packet(&mut p, key, true, now);
+            assert!(verdict.is_none() && held.len() == 1, "level {level}: the keyframe opens a segment");
+            sfu.refuse_av1(&mut p, now);
+        }
+        let recovery = origin.recovery.lock().unwrap();
+        assert!(!recovery.pending && recovery.av1());
+    }
+
+    #[tokio::test]
+    async fn a_viewer_who_declared_too_low_a_level_gets_h264_or_a_refusal_never_a_silent_slot() {
+        for h264 in [true, false] {
+            let (mut sfu, origin, now, _) = recovery_fixture(&[1]).await;
+            let slot = &mut sfu.watchers.get_mut(&1).unwrap().slots[0];
+            slot.keyframe_at = None;
+            slot.pts.clear();
+            slot.pts.insert(VideoCodec::Av1, 45.into());
+            if h264 {
+                slot.pts.insert(VideoCodec::H264(0x42e01f), 102.into());
+            }
+            // Browsers decode 1080p but declared the default level 3.1; the stream is 4.1.
+            slot.av1 = Some(codec::Av1Limits::new(
+                &gwar_proto::Av1Capability { width: 1920, height: 1080 },
+                codec::Av1Declared::default(),
+            ));
+            let key = Forward {
+                av1: Some(av1_stream::Requirements { level: 9, ..HD }),
+                keyframe: true,
+                ..av1_forward(100, 9000, rtp(false, false, true, &[&KEY]), Some(ATTACHED.to_vec()), now)
+            };
+            sfu.forward_packets("h264", &origin, vec![(key, true)], now);
+            let slot = &sfu.watchers[&1].slots[0];
+            let recovery = origin.recovery.lock().unwrap();
+            if h264 {
+                // The existing "viewer without AV1" switch: the share turns to H.264.
+                assert!(recovery.pending && !recovery.av1());
+                assert!(slot.grant.is_some() && slot.segment.waiting());
+            } else {
+                // Nothing it decodes: refused, as a viewer without a matching codec is.
+                assert!(!recovery.pending && recovery.av1());
+                assert!(slot.grant.is_none());
+            }
+        }
     }
 
     #[tokio::test]
