@@ -434,7 +434,14 @@ export class ScreenController {
     this.firstFrameTimers.delete(id);
   }
 
-  /** Once satisfied, a static share never needs another frame on a stage change. */
+  /** A newly attached media player may need its own keyframe, including on a stage change. */
+  requestFrame(share: string, run: number, id: number): void {
+    const screen = useScreen.getState();
+    if (screen.transport.run !== run || !screen.watches.some(w => w.id === id && w.share === share && w.status === "watching")) return;
+    void this.link()?.request("screen.keyframe", { share }).catch(() => {});
+  }
+
+  /** Once satisfied, a static share's grant deadline stays cleared on a stage change. */
   frameReceived(share: string, run: number, id: number): void {
     const screen = useScreen.getState();
     if (screen.transport.run !== run || !screen.watches.some(w => w.id === id && w.share === share && w.status === "watching")) return;

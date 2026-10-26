@@ -265,7 +265,7 @@ function fromSource(id, width, height, what) {
 
 const revealed = (page, share) => waitFor(() => page.evaluate(share => {
   const video = document.querySelector(`video[data-share="${share}"]`);
-  return video && getComputedStyle(video).opacity === "1";
+  return video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0 && getComputedStyle(video).opacity === "1";
 }, share), "the new watch reveals its decoded frame");
 
 /** Waits until `page` decodes `share` with the source's barcode, twice with different counters. */
@@ -431,6 +431,14 @@ async function run(browsers, web, server, token) {
   await sees(wv, wsShare, 2, "webkit → webkit");
   await codecFlow(ws, wv, wsShare, "video/vp9");
   await bar(ws).getByText("2 watching").waitFor({ timeout: 10_000 });
+
+  // Both media players remount when the real Stage swaps focus. WebKit needs a
+  // post-attachment keyframe even though both original receivers keep decoding.
+  const beforeFocus = await session(wv, (_, screen) => ({ transport: screen.transport, watches: screen.watches }));
+  await wv.evaluate(share => document.querySelector(`video[data-share="${share}"]`).closest('[role="button"]').click(), csShare);
+  await sees(wv, csShare, 1, "stage switch renders the focused share in a replacement player");
+  await sees(wv, wsShare, 2, "stage switch renders the thumbnail in a replacement player");
+  assert.deepEqual(await session(wv, (_, screen) => ({ transport: screen.transport, watches: screen.watches })), beforeFocus, "a focus change keeps the transport and watches");
 
   // Start → stop → start while watching two other shares: the watch transport is untouched.
   const c3 = await device(engine("chromium"), web, server, "c3-restart", { frequency: 700, canvasId: [3, 6], sendCodec: "vp9" });

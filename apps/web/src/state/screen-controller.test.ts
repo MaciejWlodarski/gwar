@@ -349,6 +349,27 @@ describe("reused receive slots", () => {
     screen.reset();
   });
 
+  it("fences a player's keyframe request without restarting its grant deadline", async () => {
+    const { screen, start, ops } = setup();
+    const old = await start(false);
+    const watch = useScreen.getState().watches[0]!;
+    screen.requestFrame("B", old.params.run - 1, watch.id);
+    screen.requestFrame("B", old.params.run, watch.id - 1);
+    screen.requestFrame("A", old.params.run, watch.id);
+    expect(ops()).not.toContain("screen.keyframe");
+    screen.requestFrame("B", old.params.run, watch.id);
+    expect(ops().filter(op => op === "screen.keyframe")).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(1);
+    screen.frameReceived("B", old.params.run, watch.id);
+    screen.requestFrame("B", old.params.run, watch.id);
+    expect(ops().filter(op => op === "screen.keyframe")).toHaveLength(2);
+    expect(vi.getTimerCount()).toBe(0);
+    await screen.unwatch("B");
+    screen.requestFrame("B", old.params.run, watch.id);
+    expect(ops().filter(op => op === "screen.keyframe")).toHaveLength(2);
+    screen.reset();
+  });
+
   it.each(["unwatch", "release", "stop", "failure", "reset"])("clears a pending first-frame deadline on %s", async how => {
     const { screen, start } = setup();
     const old = await start(false);

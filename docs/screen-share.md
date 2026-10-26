@@ -2714,8 +2714,15 @@ from native capture is PR 10.
     slot may briefly show the previous share's last frame until the new share's
     first keyframe decodes.
   - The first decoded frame reveals the video, including a static share's single
-    startup keyframe. Watch assignment already requests a budgeted, retried PLI;
-    no extra frame, new server notification or timed reveal is required. The
+    startup keyframe. Watch assignment already requests a budgeted, retried PLI.
+    Each video attachment also requests a keyframe through the existing protocol,
+    retrying once per second within the server's PLI budget until that player
+    receives a frame (and cancelling retries on detachment):
+    Linux WebKit's replacement media player can otherwise stay at 0×0 while the
+    receiver counts decoded frames, if the watch-start keyframe arrived before
+    attachment. This also covers moving a watch between the stage and thumbnails;
+    it neither renews the transport nor restarts another watch. One post-attachment
+    keyframe is enough, with no new server notification or timed reveal. The
     existing offer/connect and H.264 recovery watchdogs still apply. A connected
     receiver that never supplies a first frame ends its watch 35 s after its
     grant through the normal unwatch/error path, also for VP9 and older servers.

@@ -106,3 +106,29 @@ it("keeps a static share's first-frame deadline satisfied after Stage remounts",
   expect(failed.mock.calls).toEqual([["B", transport.run, watches.find(w => w.share === "B")!.id]]);
   expect(useScreen.getState().watches.map(w => w.share)).toEqual(["A"]);
 });
+
+it("requests post-attachment keyframes for both players after a Stage switch", async () => {
+  await act(async () => {
+    video("A").dispatchEvent(new Event("loadeddata"));
+    video("B").dispatchEvent(new Event("loadeddata"));
+  });
+  const { transport, watches } = useScreen.getState();
+  const oldVideos = [video("A"), video("B")];
+  request.mockClear();
+  await focus("A");
+  expect(video("A")).not.toBe(oldVideos[0]);
+  expect(video("B")).not.toBe(oldVideos[1]);
+  expect(request.mock.calls.filter(([op]) => op === "screen.keyframe").map(([, d]) => d.share).sort()).toEqual(["A", "B"]);
+  expect(useScreen.getState().transport).toEqual(transport);
+  expect(useScreen.getState().watches).toEqual(watches);
+  // A static share becomes visible on just its requested keyframe, without a second frame.
+  await act(async () => {
+    video("A").dispatchEvent(new Event("loadeddata"));
+    video("B").dispatchEvent(new Event("loadeddata"));
+  });
+  await advance(70_000);
+  expect(video("A").classList.contains("opacity-0")).toBe(false);
+  expect(video("B").classList.contains("opacity-0")).toBe(false);
+  expect(useScreen.getState().watches).toEqual(watches);
+  expect(request.mock.calls.filter(([op]) => op === "screen.keyframe")).toHaveLength(2);
+});

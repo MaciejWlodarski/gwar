@@ -262,9 +262,21 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef }: { shar
     const video = ref.current;
     if (!video) return;
     if (video.srcObject !== stream) video.srcObject = stream;
-    if (stream) void video.play().catch(() => {});
+    if (stream) {
+      void video.play().catch(() => {});
+      // Linux WebKit's new media player needs a keyframe after binding, even when
+      // the receiver already counts decoded frames. The watch-start PLI may be earlier.
+      if (watchId !== undefined) controller.screen.requestFrame(share, run, watchId);
+    }
     return () => { video.srcObject = null; };
-  }, [stream, run, watchId]);
+  }, [stream, share, run, watchId]);
+  useEffect(() => {
+    if (!stream || showing || watchId === undefined) return;
+    // Binding the player is asynchronous. Retry within the server's existing PLI
+    // budget until that player receives a frame; never reveal on a timer or stats.
+    const retry = setInterval(() => controller.screen.requestFrame(share, run, watchId), 1000);
+    return () => clearInterval(retry);
+  }, [stream, showing, share, run, watchId]);
   const received = () => {
     setShown(stream);
     if (stream && watchId !== undefined) controller.screen.frameReceived(share, run, watchId);

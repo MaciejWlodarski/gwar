@@ -139,6 +139,34 @@ describe("watched video frames", () => {
   }
   const visible = (video: HTMLVideoElement) => !video.classList.contains("opacity-0");
 
+  it("requests a keyframe after binding each replacement media player", async () => {
+    vi.useFakeTimers();
+    const frames = vi.spyOn(controller.screen, "requestFrame").mockImplementation(() => {
+      expect(container.querySelector("video")?.srcObject).not.toBeNull();
+    });
+    try {
+      const stream = new MediaStream();
+      const video = await grant(1, 1, stream);
+      expect(frames).toHaveBeenCalledExactlyOnceWith("A", 1, 1);
+      await act(async () => vi.advanceTimersByTimeAsync(1000));
+      expect(frames).toHaveBeenCalledTimes(2);
+      await act(async () => video.dispatchEvent(new Event("loadeddata")));
+      expect(visible(video)).toBe(true);
+      await act(async () => vi.advanceTimersByTimeAsync(70_000));
+      expect(frames).toHaveBeenCalledTimes(2);
+      // A new player needs a keyframe even if the same live stream has already played.
+      await act(async () => root.render(null));
+      const replacement = await grant(1, 1, stream);
+      expect(replacement).not.toBe(video);
+      expect(frames.mock.calls).toEqual([["A", 1, 1], ["A", 1, 1], ["A", 1, 1]]);
+      expect(visible(replacement)).toBe(false);
+      await act(async () => replacement.dispatchEvent(new Event("loadeddata")));
+      expect(visible(replacement)).toBe(true);
+      await act(async () => vi.advanceTimersByTimeAsync(70_000));
+      expect(frames).toHaveBeenCalledTimes(3);
+    } finally { frames.mockRestore(); vi.useRealTimers(); }
+  });
+
   it("first use shows its first frame without waiting for another frame", async () => {
     const stream = new MediaStream();
     const video = await grant(1, 1, stream);
