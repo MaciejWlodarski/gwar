@@ -43,3 +43,9 @@ export function useBookmarkOpener() {
 export function newsworthy(item: ChatItem, teamspeak: boolean): item is Extract<ChatItem, { kind: "msg" }> {
   return item.kind === "msg" && !item.removed && !item.cannotOpen && item.msg.text !== DELETION_TEXT && (teamspeak || item.verified === true);
 }
+
+/** The messages of `shown` that `current` still holds as they were (same message object, so unedited and undeleted). */
+export function stillHeld<T extends Extract<ChatItem, { kind: "msg" }>>(shown: T[], current: ChatItem[]): T[] {
+  const held = new Set(current.flatMap((i) => (i.kind === "msg" ? [i.msg] : [])));
+  return shown.every((i) => held.has(i.msg)) ? shown : shown.filter((i) => held.has(i.msg));
+}

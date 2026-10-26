@@ -2,7 +2,7 @@ import { expect, it } from "vitest";
 import { DELETION_TEXT } from "../net/message-signature";
 import type { ChatMessage } from "../proto/ChatMessage";
 import type { ChatItem } from "../state/types";
-import { newsworthy } from "./nav";
+import { newsworthy, stillHeld } from "./nav";
 
 const msg = (text: string, extra: Partial<Extract<ChatItem, { kind: "msg" }>> = {}): ChatItem => ({
   kind: "msg",
@@ -25,4 +25,14 @@ it("repeats only verified, readable, undeleted server messages on Gwar", () => {
 it("repeats TeamSpeak messages, which carry no signatures, like the chat does", () => {
   expect(newsworthy(msg("hi"), true)).toBe(true);
   expect(newsworthy(msg(DELETION_TEXT), true)).toBe(false);
+});
+
+it("drops shown news the thread no longer holds as it was", () => {
+  const a = msg("a", { verified: true }), b = msg("b", { verified: true });
+  const shown = [a, b] as Extract<ChatItem, { kind: "msg" }>[];
+  expect(stillHeld(shown, [a, b])).toBe(shown);
+  // b deleted by its author: the thread holds a new message object for it.
+  const deleted = { ...b, msg: { ...(b as Extract<ChatItem, { kind: "msg" }>).msg, text: DELETION_TEXT } };
+  expect(stillHeld(shown, [a, deleted])).toEqual([a]);
+  expect(stillHeld(shown, [])).toEqual([]);
 });

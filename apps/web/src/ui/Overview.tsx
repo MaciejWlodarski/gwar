@@ -16,7 +16,7 @@ import type { ChatItem } from "../state/types";
 import { TeamSpeakBadge, TsIcon, UnreadBadge } from "./badges";
 import { useChannelPermission, usePermission } from "./hooks";
 import { Avatar, Button, IconButton, TalkingAvatar, panelCard } from "./kit";
-import { newsworthy } from "./nav";
+import { newsworthy, stillHeld } from "./nav";
 import { LiveBadge } from "./Screen";
 
 /** How many people the overview names before "and N more". */
@@ -124,7 +124,9 @@ function useNews(items: ChatItem[] | undefined, teamspeak: boolean, serverKey: s
     };
   }, [candidates, verifier, serverKey, tick, teamspeak]);
   if (teamspeak) return candidates.slice(-NEWS_SHOWN).reverse();
-  return checked.verifier === verifier ? checked.items : [];
+  // Until a check finishes, what it last let through shows only while the thread still holds it unchanged:
+  // an edit or a deletion takes it away at once.
+  return checked.verifier === verifier ? stillHeld(checked.items, candidates) : [];
 }
 
 function newsText(item: News, t: ReturnType<typeof useT>): string {
