@@ -35,7 +35,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex, MutexGuard, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -175,6 +175,15 @@ impl ScreenShared {
 /// Slots of a TeamSpeak guest's watch transport: it watches the one share its link opens.
 pub const GUEST_SLOTS: usize = 1;
 
+/// Revoking a viewer's authority (a watch grant or a lease ending) and committing a share-wide
+/// change on that viewer's behalf are serialized. The commit re-checks the viewer's grant under
+/// this lock, so it either sees the revocation or happens before it.
+static REVOCATION: Mutex<()> = Mutex::new(());
+
+fn revocation() -> MutexGuard<'static, ()> {
+    REVOCATION.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
 /// One viewer's right to one share in one slot. The core ends it the moment access ends; it
 /// also ends with its share and, for guests, its link and original TeamSpeak membership.
 #[derive(Debug)]
@@ -202,6 +211,7 @@ impl WatchGrant {
         self.alive.load(Ordering::Acquire) && self.origin.alive() && self.leases.iter().all(|lease| lease.alive())
     }
     pub fn end(&self) {
+        let _revoking = revocation();
         self.alive.store(false, Ordering::Release);
     }
 }
@@ -333,7 +343,10 @@ impl Lease {
         }
     }
     pub fn end(&self) {
-        self.0.store(false, Ordering::Release);
+        {
+            let _revoking = revocation();
+            self.0.store(false, Ordering::Release);
+        }
         self.1.notify_waiters();
     }
 }
@@ -1667,7 +1680,8 @@ impl Sfu {
                     // who decodes the H.264 replacement. Every slot waits for its keyframe.
                     if let Some(size) = forward.av1
                         && decodes_h264_replacement(&w.slots[index], size)
-                        && self.downgrade_av1(origin, size, "a viewer cannot decode it", now)
+                        && let Some(grant) = w.slots[index].grant.clone()
+                        && self.downgrade_av1(origin, size, Some(&grant), "a viewer cannot decode it", now)
                     {
                         return;
                     }
@@ -1776,20 +1790,33 @@ impl Sfu {
     fn refuse_av1(&mut self, p: &mut Publisher, now: Instant) {
         let Some(sequence) = p.av1_stream.take_refused() else { return };
         let origin = p.origin.clone();
-        self.downgrade_av1(&origin, sequence, "the publisher's sequence exceeds the SFU's limits", now);
+        self.downgrade_av1(&origin, sequence, None, "the publisher's sequence exceeds the SFU's limits", now);
     }
 
     /// The share's AV1 cannot go on (`why`): replace the publisher with H.264 at `size`, once,
     /// keeping the share and every watch. Whether a replacement is on its way; without one (AV1
     /// was already given up), an AV1 viewer is refused and AV1 media stays blocked.
+    ///
+    /// `viewer`: the grant of the viewer the change is for. It must still be live when the
+    /// change commits, checked under [`REVOCATION`]; a viewer who already left changes nothing.
     fn downgrade_av1(
         &mut self,
         origin: &Arc<ScreenOrigin>,
         size: av1_stream::Requirements,
+        viewer: Option<&Arc<WatchGrant>>,
         why: &'static str,
         now: Instant,
     ) -> bool {
+        #[cfg(test)]
+        tests::revocation_hook(tests::Commit::Before);
         let (plan, pending) = {
+            let _revocation = viewer.map(|_| revocation());
+            if viewer.is_some_and(|grant| !grant.alive()) {
+                debug!(share = origin.share, why, "screen AV1 downgrade dropped: the viewer left");
+                return false;
+            }
+            #[cfg(test)]
+            tests::revocation_hook(tests::Commit::Holding);
             let mut recovery = origin.recovery.lock().expect("recovery lock");
             let plan = recovery.downgrade_av1(&origin.share, size, now);
             (plan, recovery.pending)
@@ -5446,6 +5473,97 @@ pub(crate) mod tests {
         let recovery = origin.recovery.lock().unwrap();
         assert!(!recovery.pending && recovery.av1(), "the share keeps AV1");
         assert!(sfu.watchers[&1].slots[0].grant.is_none(), "the viewer is refused");
+    }
+
+    /// Where a viewer-triggered downgrade calls [`revocation_hook`]: before taking the
+    /// revocation lock, and while holding it, just before committing.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Commit {
+        Before,
+        Holding,
+    }
+
+    type Hook = Option<(Commit, Box<dyn FnOnce()>)>;
+
+    thread_local! {
+        static REVOCATION_HOOK: std::cell::RefCell<Hook> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Runs the hook set for `at` on this thread, once.
+    pub(super) fn revocation_hook(at: Commit) {
+        let hook = REVOCATION_HOOK.with(|hook| {
+            let mut hook = hook.borrow_mut();
+            if hook.as_ref().is_some_and(|(when, _)| *when == at) { hook.take() } else { None }
+        });
+        if let Some((_, hook)) = hook {
+            hook();
+        }
+    }
+
+    fn set_revocation_hook(at: Commit, hook: impl FnOnce() + 'static) {
+        REVOCATION_HOOK.with(|slot| *slot.borrow_mut() = Some((at, Box::new(hook))));
+    }
+
+    /// An AV1 viewer (1) and an H.264 viewer who cannot decode AV1 (2) of one share.
+    async fn av1_and_h264_viewers() -> (Sfu, Arc<ScreenOrigin>, Instant, Forward) {
+        let (mut sfu, origin, now, _) = recovery_fixture(&[1, 2]).await;
+        for (&session, w) in &mut sfu.watchers {
+            let slot = &mut w.slots[0];
+            slot.keyframe_at = None;
+            slot.pts = HashMap::from([(VideoCodec::H264(0x42e02a), Pt::from(102))]);
+            slot.h264 = h264_limits(102, 0x42e02a);
+            if session == 1 {
+                slot.pts.insert(VideoCodec::Av1, 45.into());
+                slot.av1 = Some(codec::Av1Limits::new(
+                    &gwar_proto::Av1Capability { width: 1920, height: 1080 },
+                    codec::Av1Declared { level: 13, tier: 0 },
+                ));
+            }
+        }
+        let key = Forward {
+            av1: Some(HD),
+            keyframe: true,
+            ..av1_forward(100, 9000, rtp(false, false, true, &[&KEY]), Some(ATTACHED.to_vec()), now)
+        };
+        (sfu, origin, now, key)
+    }
+
+    #[tokio::test]
+    async fn a_watch_revoked_after_its_check_cannot_commit_the_downgrade() {
+        let (mut sfu, origin, now, key) = av1_and_h264_viewers().await;
+        let grant = sfu.watchers[&2].slots[0].grant.clone().unwrap();
+        // The viewer passed the liveness and compatibility checks; the core revokes its watch
+        // on another thread before the downgrade commits.
+        set_revocation_hook(Commit::Before, move || std::thread::spawn(move || grant.end()).join().unwrap());
+        sfu.forward_packets("h264", &origin, vec![(key, true)], now);
+        let recovery = origin.recovery.lock().unwrap();
+        assert!(!recovery.pending && recovery.av1(), "nothing changes for the viewer who remains");
+    }
+
+    #[tokio::test]
+    async fn a_revocation_racing_a_committing_downgrade_waits_for_it() {
+        let (mut sfu, origin, now, key) = av1_and_h264_viewers().await;
+        let grant = sfu.watchers[&2].slots[0].grant.clone().unwrap();
+        let revoked = Arc::new(std::sync::OnceLock::new());
+        let handle = revoked.clone();
+        // The revocation starts while the downgrade holds the lock: it completes only after
+        // the commit, so the commit was made for a live viewer.
+        set_revocation_hook(Commit::Holding, move || {
+            let thread = std::thread::spawn({
+                let grant = grant.clone();
+                move || grant.end()
+            });
+            std::thread::sleep(Duration::from_millis(50));
+            assert!(grant.alive() && !thread.is_finished(), "the revocation waits for the commit");
+            handle.set(thread).unwrap();
+        });
+        sfu.forward_packets("h264", &origin, vec![(key, true)], now);
+        {
+            let recovery = origin.recovery.lock().unwrap();
+            assert!(recovery.pending && !recovery.av1(), "committed while the viewer was live");
+        }
+        Arc::into_inner(revoked).unwrap().into_inner().unwrap().join().unwrap();
+        assert!(!sfu.watchers[&2].slots[0].grant.as_ref().unwrap().alive());
     }
 
     #[tokio::test]

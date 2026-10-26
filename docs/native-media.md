@@ -1105,7 +1105,11 @@ this before mixed AV1/H.264 sharing ships.
    negotiated H.264 payload types: MaxFS, MaxMBPS and each side within
    sqrt(8 × MaxFS) macroblocks of its receive level, verified or declared,
    and any decode-failure cap. A revoked watch whose release has not
-   reached the SFU yet is skipped and changes nothing. Any recovery plan or
+   reached the SFU yet is skipped and changes nothing. The switch commits
+   only while the triggering viewer's grant is still live: the SFU checks
+   it under the same lock that revoking a grant or lease takes, before it
+   changes any recovery state, so a viewer who leaves in between changes
+   nothing. A publisher whose own AV1 sequence is refused needs no viewer. Any recovery plan or
    decode-failure report retires AV1 for the rest of the share; viewers
    that decode neither are refused as above and leave the share as it is.
    This browser path does not change the native primary-retention rule above.
