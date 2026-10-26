@@ -2721,7 +2721,11 @@ from native capture is PR 10.
     and keeps a static share visible through view/StrictMode remounts without
     requesting another frame. A first-use or renewed slot reveals its first
     decoded frame, including a static share's single startup keyframe. Watch
-    assignment already requests a budgeted, retried PLI; no new server
+    assignment already requests a budgeted, retried PLI. A newly attached player
+    also requests a keyframe, retrying once per second within the server's budget
+    until its first frame: binding is asynchronous and can miss the watch-start
+    keyframe. View detachment cancels retries; moving an already-playing player
+    needs no further request. Requests retain run/watch-ID fencing. No new server
     notification, extra frame-counter gate or timed reveal is required. The
     existing offer/connect and H.264 recovery watchdogs still apply. A connected
     receiver that never supplies a first frame ends its watch 35 s after its

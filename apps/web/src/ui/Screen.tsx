@@ -285,8 +285,11 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef }: { shar
     const { video } = player;
     video.dataset.share = share;
     video.className = "size-full object-contain opacity-0";
+    let retry: ReturnType<typeof setInterval> | undefined;
     const received = () => {
       if (!stream) return;
+      clearInterval(retry);
+      retry = undefined;
       player.received = true;
       video.classList.remove("opacity-0");
       setShown(stream);
@@ -301,7 +304,15 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef }: { shar
     if (stream) void video.play().catch(() => {});
     // A static share keeps its one decoded frame when its view remounts.
     if (player.received || video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) received();
+    else if (stream && watchId !== undefined) {
+      // The watch-start PLI can precede this player's asynchronous binding.
+      // Retry within the server's budget until its first frame, never a timed reveal.
+      const request = () => controller.screen.requestFrame(share, run, watchId);
+      request();
+      retry = setInterval(request, 1000);
+    }
     return () => {
+      clearInterval(retry);
       video.removeEventListener("loadeddata", received);
       video.removeEventListener("resize", received);
       if (onDoubleClick) video.removeEventListener("dblclick", onDoubleClick);

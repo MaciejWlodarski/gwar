@@ -151,6 +151,24 @@ describe("watched video frames", () => {
     expect(container.textContent).not.toContain("Connecting");
   });
 
+  it("requests a keyframe after initial binding and stops retrying on a static first frame", async () => {
+    vi.useFakeTimers();
+    const frames = vi.spyOn(controller.screen, "requestFrame");
+    try {
+      const stream = new MediaStream();
+      const video = await grant(1, 1, stream);
+      expect(frames).toHaveBeenCalledExactlyOnceWith("A", 1, 1);
+      await act(async () => vi.advanceTimersByTimeAsync(1000));
+      expect(frames).toHaveBeenCalledTimes(2);
+      await act(async () => video.dispatchEvent(new Event("loadeddata")));
+      await act(async () => root.render(null));
+      expect(await grant(1, 1, stream)).toBe(video);
+      await act(async () => vi.advanceTimersByTimeAsync(70_000));
+      expect(visible(video)).toBe(true);
+      expect(frames).toHaveBeenCalledTimes(2);
+    } finally { frames.mockRestore(); vi.useRealTimers(); }
+  });
+
   it("does not detach or rebind the stream during StrictMode's effect remount", async () => {
     const stream = new MediaStream();
     const video = await grant(1, 1, stream);
