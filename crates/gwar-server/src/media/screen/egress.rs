@@ -352,6 +352,7 @@ impl Egress {
     }
 
     /// Serialized bytes still waiting for application-paced release.
+    #[cfg(test)]
     pub fn queued(&self) -> usize {
         self.queued
     }
@@ -501,7 +502,7 @@ impl Egress {
     /// simultaneous keyframe burst overflowing admission or its release deadline?
     /// History needs growth headroom; unknown sources reserve the probe floor.
     /// Every reservation is bounded by the serialized per-frame ingress cap.
-    pub(super) fn keyframes_fit(&self, lanes: &[usize], rates: &[ShareRate]) -> bool {
+    pub(super) fn keyframes_fit(&self, lane: usize, lanes: &[usize], rates: &[ShareRate]) -> bool {
         let keys: usize = lanes
             .iter()
             .map(|&lane| match rates.get(lane).map_or(0, |r| r.largest_keyframe) {
@@ -511,11 +512,16 @@ impl Egress {
             .map(|key| key.min(ingress::FRAME_BYTES + ingress::FRAME_PACKETS * ORIGINAL_OVERHEAD))
             .sum();
         let other: f64 = (0..self.lanes.len())
-            .filter(|lane| self.lanes[*lane].active() && !lanes.contains(lane))
+            .filter(|&other| {
+                self.lanes[other].active() && !lanes.contains(&other) && self.rank(other) < self.rank(lane)
+            })
             .map(|lane| rates.get(lane).map_or(0.0, |r| r.average))
             .sum();
-        let bytes = self.queued.saturating_add(keys);
-        bytes <= self.admission_bound() && other + bytes as f64 * 8.0 / DEADLINE.as_secs_f64() <= self.plan()
+        // Reservations already cover each outstanding initial response, queued
+        // or not. Steady delta backlog must not be counted as another response.
+        // Preserve higher-priority flowing media's release share; the actual
+        // priority pacer and admission bound still govern every packet.
+        keys <= self.admission_bound() && other + keys as f64 * 8.0 / DEADLINE.as_secs_f64() <= self.plan()
     }
 
     /// Active lanes, most important first.
@@ -908,22 +914,26 @@ mod tests {
         let mut e = egress(INITIAL_ESTIMATE, 3, now);
         let mut rates = [ShareRate { largest_keyframe: 60_000, ..Default::default() }; 3];
         assert!(e.keyframe_fits(0, &rates) && e.keyframe_fits(1, &rates));
-        assert!(!e.keyframes_fit(&[0, 1], &rates), "individually fitting frames can overflow together");
+        assert!(!e.keyframes_fit(1, &[0, 1], &rates), "individually fitting frames can overflow together");
         rates[0].largest_keyframe = 30_000;
         rates[1].largest_keyframe = 30_000;
-        assert!(!e.keyframes_fit(&[0, 1], &rates), "small historical frames still reserve growth headroom");
+        assert!(!e.keyframes_fit(1, &[0, 1], &rates), "small historical frames still reserve growth headroom");
         e.set_estimate(6_000_000, now);
-        assert!(e.keyframes_fit(&[0, 1], &rates));
+        assert!(e.keyframes_fit(1, &[0, 1], &rates));
+        e.focus(Some(2));
         rates[2].average = 1_000_001.0;
-        assert!(!e.keyframes_fit(&[0, 1], &rates), "other active media keeps its release share");
+        assert!(!e.keyframes_fit(1, &[0, 1], &rates), "higher-priority media keeps its release share");
+        e.focus(Some(1));
+        assert!(e.keyframes_fit(1, &[0, 1], &rates), "lower-priority media cannot veto the stage");
+        e.focus(Some(2));
         rates[2].average = 0.0;
         for n in 0..100 {
             assert!(e.admit(2, packet(n, 0, n == 0, 1000, now), now).is_empty());
         }
-        assert!(!e.keyframes_fit(&[0, 1], &rates), "already queued bytes keep their admission");
+        assert!(e.keyframes_fit(1, &[0, 1], &rates), "steady backlog does not duplicate startup reservations");
         e.clear(2);
         rates[0].largest_keyframe = 0;
-        assert!(!e.keyframes_fit(&[0, 1], &rates), "unknown keyframes reserve the probe floor");
+        assert!(!e.keyframes_fit(1, &[0, 1], &rates), "unknown keyframes reserve the probe floor");
     }
 
     #[test]

@@ -3601,10 +3601,15 @@ Initial keyframe requests use admission-sized waves. For each measured source,
 reserve `max(4 × observed keyframe, observed keyframe + 64 KiB)`, capped at the
 per-frame ingress limit including the 64-byte original-packet reserve for up to
 600 packets. Unknown sources reserve the existing 200 KiB probe floor. The
-combined reservations, already queued bytes and other active media must fit
-admission and the 400 ms release deadline before PLIs can be sent together.
-A single seed can run exclusively when the queue is empty, even if its
-conservative reservation does not fit; the bootstrap fit guard still applies.
+combined outstanding response reservations must fit admission and the 400 ms
+release deadline before PLIs can be sent together. Flowing shares' delta backlog
+is not another startup reservation. Higher-priority flowing media retains its
+measured release share; lower-priority media cannot veto the new stage share.
+The actual priority pacer, socket cap and packet admission/deadline bounds still
+apply. A single seed can run when no other response reservation is outstanding,
+even if its conservative reservation does not fit, without requiring the whole
+viewer queue to empty. The bootstrap fit guard applies until the initial
+admission deadline below.
 
 An initial response keeps its reservation until its complete keyframe drains.
 Recent recovery PLIs on already playing slots retain their existing 500 ms
@@ -3615,14 +3620,21 @@ an additional housekeeping tick. A silent source releases its reservation after
 hard 2.9 s expiry (500 ms response window + 2 s ingress span + 400 ms deadline).
 This keeps small-frame startup prompt while preventing historical small frames
 from soliciting a simultaneous burst of larger responses into a cold viewer's
-queue.
+queue. A slot's first PLI deferred for one second can bypass conservative
+admission and bootstrap fit, oldest first. Admission-loss retries retain the
+bootstrap fit guard to preserve discovery credit. Forced requests retain the 500 ms
+viewer spacing, normal viewer credit and publisher throttle: at most one forced
+request per spacing interval. A silent publisher, incomplete response or missing
+drain therefore cannot hold other initial requests indefinitely. Admission loss
+still queues the existing budgeted retry; the escape never raises packet bounds.
 
 Retries and credit-limited requests retain the 500 ms viewer spacing. Deferred
 requests are retained per slot independently of segment state, including active
 slots asking for decoder recovery. If admission drops an initial response, its
 reservation clears and a retry is queued immediately with its previous service
 age, ahead of newer work while preserving older deferred requests. The retry
-uses the same credits, publisher throttle and bootstrap fit guard. Serving it
+uses the same credits, publisher throttle and bootstrap fit guard; the first-PLI
+escape does not apply to retries. Serving it
 updates its age, so repeated failures cannot monopolize the queue. The 100 ms
 housekeeping tick also serves requests when publishers send no more packets.
 Initial requests win ties over retries; repeated reports preserve their age.
@@ -3637,10 +3649,12 @@ allow 100 ms per credit for the housekeeping tick, up to 5 s for bootstrap fit
 deferral, and 500 ms for the publisher throttle: 29.9 s in total. With available
 credits and no fit deferral, silent publishers still get four requests within
 2.9 s (four 600 ms service opportunities plus the publisher throttle). A partial
-response may hold a wave for up to 2.9 s; allowing 100 ms per wave and the publisher
-throttle gives a conservative 12.5 s for four such waves. Even with the 5 s
-bootstrap guard this stays below 30 s. A partial reservation expires before the
-6 s credit refill, so it does not extend the empty-bucket bound above.
+response keeps its reservation for up to 2.9 s, but cannot defer another initial
+request past the one-second admission deadline plus earlier service
+opportunities. Four initial requests with available credit advance within about
+3 s even without a drain. Credit exhaustion can still require the six-second
+refill; the admission deadline adds no further wait once credit is available,
+so it does not extend the conservative 30 s bound above.
 Fresh-credit initial requests whose combined reservations fit start together;
 others advance in waves as admission drains.
 Generated 1-4-publisher scenarios and connected-SRTP regressions require both
@@ -3659,8 +3673,9 @@ The start of a keyframe can activate a segment before the complete frame fits;
 using that state to bypass the guard would spend credits during the same cold
 queue pressure. The calculation reserves higher-priority media's
 measured average. One initial request always seeds media/feedback; unknown sizes
-are allowed. The guard ends when the estimate fits the frame or after those 5 s,
-so a conservative estimate cannot suppress recovery permanently. Rate samples
+are allowed. The guard ends when the estimate fits the frame or after those 5 s;
+initial requests also have the one-second admission escape. A conservative
+estimate therefore cannot suppress recovery permanently. Rate samples
 come from the existing allocation tick. Probe targets and pacing limits are not
 raised by this guard.
 
@@ -3725,6 +3740,60 @@ Fairness remains **[4,4,3]**, active recovery **1→2**, and the empty-budget te
 still requests all four sources by **24 s** and sends **15 PLIs over 90 s**.
 The five cleanup paths also clear startup reservations. Round-3 artifacts are
 retained under `/tmp/gwar-pr173-r3-fix/`.
+
+#### Round-4 bounded initial admission
+
+The ported busy-queue repro keeps a healthy playing share at 41–42 KB of
+backlog for 31 s. At `1d420600`, the new stage share received no initial PLI.
+Response reservations now exclude steady delta backlog; release-fit accounting
+respects stage priority, and an exclusive seed does not require a globally empty
+queue. A one-second initial-admission deadline permits oldest-first progress,
+with the same 500 ms viewer spacing, credit bucket and publisher throttle.
+Growth reservations and budgeted admission-loss retries remain in place; the
+first-PLI escape cannot bypass the bootstrap fit guard on those retries.
+
+The regression now schedules the first PLI at **0 ms**. Its measured 30 KB
+response drains in **117 ms**, with **zero** evictions, rejections, failed
+keyframes or pauses. Separate production-scheduler cases cover a PLI-ignoring
+source, a partial response, cold fit and a drain that never arrives: the latter
+three schedule the oldest blocked source at **1.01 s**, then the next requests
+at **1.51/2.01 s** despite newer stage-priority reports. Departing mid-wave leaves
+the surviving viewer progressing at **0/0.5/1/1.5 s**.
+
+The round-3 growth repro still delivers all four first responses, one PLI per
+source and **zero loss**, by **1.569 s**. Five real SRTP trials each receive
+**[80,80,80,80]** packets with one PLI per source; the slowest completes in
+**1.126 s**. Across all 20 startup trials (1–4 publishers), maximum
+PLI receipt is **133.5 ms** and complete-keyframe receipt **163.2 ms**.
+Four unknown/known-large sources complete within **4.892/5.251 s**, using
+**12/8 PLIs**. Fairness remains **[4,4,3]**, active recovery **1→2**,
+empty-credit first PLIs **6/12/18/24 s**, and **15 PLIs over 90 s**. Cleanup
+continues to cover all five teardown paths.
+
+The unchanged supplied driver ran for five minutes with four textured 720p30
+sources, Chromium/WebKit viewers and 26 watches, including the existing churn.
+The canonical analyzer measured **0.76%** frozen stream-time (round 3:
+**0.72%**), **0.36%** outside the first five seconds after churn,
+and a longest sampled freeze of **7.67 s**. Viewer credit was denied on
+**4548 scheduling attempts** after churn (round 3: **0**). Repeated service
+attempts for one deferred request can each increment this counter; these are
+not extra transmitted PLIs. The affected receiver had decoded frames before
+the first denials. This run does **not** reproduce the earlier zero-denial
+soak; later recovery pressure remains a validation limitation. The corresponding
+trace and counter evidence is in `soak-credit-analysis.json` alongside the raw
+samples. Ingress overruns, dispatch drops and aggregate-budget pauses were
+**0/0/0**. Mean/peak CPU was **16.88/23.65%** of one core;
+peak RSS was **37.19 MiB**. This remains a short, unpaired measurement.
+
+Validation passed the required no-default-features test check, **145 screen**
+and **86 core** tests, the **96/60/70-case** voice/startup/recovery matrices,
+**16 screen + 2 admission + 15 watch-link + 3 preauth + 58 protocol** integration
+tests, Clippy with `-D warnings`, formatting and the Chromium/WebKit
+fixed-1080p60 H.264 screen gate. Only the named pre-existing malformed-flood
+protocol flake was skipped. All services were local; no production connection
+or native Gwar application was used. Cargo used four jobs and a disposable
+target, deleted after validation. Logs, source digests and canonical soak
+analysis are retained under `/tmp/gwar-pr173-r4-fix/`.
 
 #### Matched local audit soaks, 2026-10-26
 
