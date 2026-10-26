@@ -323,6 +323,8 @@ decode stays for browser compatibility.
   keyframe opens the retained slots. Restore H.264 after reporters leave or two
   minutes, then hold for a minute before another downgrade. A3/B11a own native
   compatibility layers. An explicitly limited native decoder may still need 720p.
+  The browser skips decode-watchdog stats while no slot has a watchdog, even
+  though the watch transport remains available for later watches.
 - Hardware encoding is chosen by the browser where available, with its
   software H.264 encoder otherwise. The sharing bar shows the negotiated
   codec and exposes the encoder implementation/hardware hint in its tooltip
@@ -632,6 +634,11 @@ every input. `gwar-server`'s voice loop already handles one datagram and then
 drives the peer. The screen task must do the same.
 
 ### Transports
+
+The web publisher and watch transport allow 15 seconds to connect after
+`setRemoteDescription` applies the answer. Offer requests retain their existing
+timeouts; signalling and decoder-capability probes do not consume the ICE/DTLS
+connection budget. Once connected, a five-second disconnect grace still applies.
 
 Each session has at most two screen transports besides its voice transport
 (a session shares at most one thing at a time):
@@ -2461,6 +2468,8 @@ attachment (`ts_text`, `plain`, `split_for_teamspeak`):
 - Polish or English from `navigator.language`;
 - a small bundle (target under 100 KB gzipped);
 - it watches in every browser that can watch: Chrome, Firefox and Safari.
+- `pagehide` closes the session. A persisted `pageshow` reloads the page to
+  reconnect after a back/forward-cache restore, preserving the fragment token.
 
 **What the sharer sees.**
 
@@ -2676,6 +2685,9 @@ from native capture is PR 10.
     mirrored screen is confusing.
   - Browsers add their own indicators (Chrome's "Stop sharing" bar, macOS's
     menu-bar indicator).
+  - The existing two-second publisher poll also checks for an ended capture
+    track. A page-initiated `track.stop()` emits no `ended` event, but still
+    takes the normal stop path and releases its watches without a new timer.
 - **Discovering.**
   - A "LIVE" badge next to the sharer in the channel tree and the voice panel,
     in every channel one can see.
@@ -2693,6 +2705,7 @@ from native capture is PR 10.
     `getStats`), and "Stop watching".
   - The sharer's speaking ring shows on their card, from the existing
     `voice.talking` event.
+  - Reused slot may briefly show the previous share's last frame until the new keyframe decodes (cosmetic).
   - No sound in the first release; phase 2 adds a volume slider and mute per
     share ([Shared audio](#shared-audio-phase-2)).
 - **Encrypted.** The same lock as voice ("End-to-end encrypted") on the stage,

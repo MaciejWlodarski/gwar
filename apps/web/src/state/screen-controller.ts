@@ -245,6 +245,7 @@ export class ScreenController {
     if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
     const publisher = new ScreenPublisher({
       track, quality: latest(), legacy: !screenSpec, automaticMode: useSettings.getState().screenMode === null, iceServers: s.iceServers,
+      ended: () => { if (this.publisher === publisher) void this.stopShare(); },
       surfaceChanged: (surface, spec) => {
         if (current()) dispatch({ type: "surface", attempt, surface, spec });
       },

@@ -28,7 +28,7 @@ function setup() {
   const streams: MediaStream[] = [];
   let socket: FakeSocket | null = null;
   let params: WatchParams | null = null;
-  const transport = { start: vi.fn(async () => { await params!.offer("v=0 offer", params!.run); }), close: vi.fn() };
+  const transport = { keyframe: vi.fn(), start: vi.fn(async () => { await params!.offer("v=0 offer", params!.run); }), close: vi.fn() };
   const session = new WatchSession(
     { status: s => statuses.push(s), sharer: n => names.push(n), stream: s => streams.push(s) },
     { socket: url => (socket = new FakeSocket(url)), transport: p => { params = p; return transport; } },
@@ -81,6 +81,23 @@ describe("watch page endpoint and token", () => {
 });
 
 describe("WatchSession", () => {
+  it("bounds unanswered admission and clears request timers when closed", async () => {
+    const t = setup();
+    t.session.start("ws://127.0.0.1/ws/watch", TOKEN);
+    t.socket().open();
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(t.session.status).toBe("lost");
+    expect(t.socket().closed).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    const u = setup();
+    u.session.start("ws://127.0.0.1/ws/watch", TOKEN);
+    u.socket().open();
+    expect(vi.getTimerCount()).toBe(1);
+    u.session.close();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.each([false,true])("gates guest extensions on the server advertisement (%s)", async supported => {
     const t = setup();
     t.session.start("ws://127.0.0.1:1/ws/watch", TOKEN);
@@ -92,6 +109,19 @@ describe("WatchSession", () => {
     expect(t.socket().last("screen.decode_failed") !== undefined).toBe(supported);
     t.session.close();
   });
+  it.each([false, true])("delivers matching keyframes to the guest transport independently of watchdog support (%s)", async supported => {
+    const t = setup();
+    t.session.start("ws://127.0.0.1:1/ws/watch", TOKEN);
+    t.socket().open();
+    t.socket().receive({ re: 1, ok: { ...watching, screen_h264: supported } });
+    await vi.advanceTimersByTimeAsync(0);
+    t.socket().receive({ ev: "screen.keyframe", d: { share: "other", slot: 0, generation: 1, run: 1 } });
+    expect(t.transport.keyframe).not.toHaveBeenCalled();
+    t.socket().receive({ ev: "screen.keyframe", d: { share: "s1", slot: 0, generation: 2, run: 1 } });
+    expect(t.transport.keyframe).toHaveBeenCalledExactlyOnceWith(0, "s1", 2);
+    t.session.close();
+  });
+
   it("watches through one receive-only slot and pings every 20 s once admitted", async () => {
     const t = setup();
     t.session.start("ws://127.0.0.1:1/ws/watch", TOKEN);
