@@ -79,6 +79,15 @@ wire! {
         pub max_mbps: u32,
     }
 
+    /// Largest AV1 size a viewer's decoder passed a real WebRTC decode probe at, 60 fps
+    /// (MediaCapabilities in browsers: hardware, or software on desktops up to 1080p).
+    #[derive(Copy, Eq)]
+    #[serde(deny_unknown_fields)]
+    pub struct Av1Capability {
+        pub width: u32,
+        pub height: u32,
+    }
+
     /// A server-requested replacement of the publisher, retaining the share and watches.
     #[derive(Copy, Eq)]
     #[serde(rename_all = "snake_case")]
@@ -93,6 +102,21 @@ wire! {
         pub height: u32,
         pub fps: u32,
     }
+}
+
+impl Av1Capability {
+    /// Only the probed sizes are meaningful.
+    pub fn valid(&self) -> bool {
+        matches!((self.width, self.height), (1280, 720) | (1920, 1080) | (2560, 1440))
+    }
+}
+
+fn av1_capability<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Av1Capability>, D::Error> {
+    let cap = Av1Capability::deserialize(d)?;
+    if !cap.valid() {
+        return Err(serde::de::Error::custom("invalid AV1 decoder capability"));
+    }
+    Ok(Some(cap))
 }
 
 impl H264Capability {
@@ -191,6 +215,10 @@ wire! {
         #[serde(default, deserialize_with = "h264_capabilities", skip_serializing_if = "Vec::is_empty")]
         #[cfg_attr(feature = "ts", ts(optional, as = "Option<_>"))]
         pub h264: Vec<H264Capability>,
+        /// Verified AV1 decode size, after `screen.av1.capabilities`. Omission: no AV1.
+        #[serde(default, deserialize_with = "av1_capability", skip_serializing_if = "Option::is_none")]
+        #[cfg_attr(feature = "ts", ts(optional))]
+        pub av1: Option<Av1Capability>,
     }
 
     /// Why a share ended. `access`: its sharer lost `share_screen`, or, told to one viewer, that

@@ -72,6 +72,19 @@ def playout(meta):
         "concealments": sum(slot["concealments"] for slot in slots),
         "late_drops": sum(slot["late_drops"] for slot in slots),
         "frames_received": meta["receiver_frames_received"],
+        **device_health(meta),
+    }
+
+
+def device_health(meta):
+    """Harness health, not a gate input: a stalled fake device can force underruns of its own.
+    Runs from binaries before these diagnostics have none; they are reported unavailable."""
+    device, record = meta.get("receiver_device"), meta.get("receiver_record")
+    return {
+        "device_timing": "available" if device else "unavailable",
+        "device_late_over_5ms": device["late_over_5ms"] if device else None,
+        "device_max_busy_ms": device["max_busy_ms"] if device else None,
+        "record_overflow_samples": record["overflow_samples"] if record else None,
     }
 
 

@@ -3,6 +3,7 @@ import { sameServer } from "../lib/server-key";
 import { Check, Copy } from "lucide-react";
 import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { useT } from "../i18n";
+import { cn } from "../lib/cn";
 import { RequestError } from "../net/connection";
 import type { Channel } from "../proto/Channel";
 import type { ChannelAccess } from "../proto/ChannelAccess";
@@ -13,7 +14,7 @@ import { rebaseAccess, sameAccess } from "../lib/access";
 import { bookmarkParams, controller, describeJoinError, describeRequestError } from "../state/controller";
 import { sortedChannels } from "../state/reducer";
 import { isDesktop } from "../platform";
-import { newId, useSettings, type ServerKind } from "../state/settings";
+import { GROUP_COLORS, newId, useSettings, type ServerKind } from "../state/settings";
 import { useSession, useUi, type DialogState } from "../state/stores";
 import { Button, Dialog, Field, Input, Segmented, Select, Textarea, Switch } from "./kit";
 import { SettingsDialog } from "./Settings";
@@ -40,6 +41,8 @@ export function Dialogs() {
       return <SettingsDialog tab={dialog.tab} />;
     case "bugReport":
       return <BugReportDialog />;
+    case "serverGroup":
+      return <ServerGroupDialog id={dialog.id} server={dialog.server} />;
     case "addServer":
       return <AddServerDialog editId={dialog.editId} />;
     case "channelEdit":
@@ -122,6 +125,78 @@ function ConfirmDialog({ title, memberTitle, body, confirmLabel, danger, serverI
       }
     >
       {serverIdentity ? <p className="whitespace-pre-line wrap-anywhere text-sm text-muted">{body}</p> : <span className="sr-only">{body}</span>}
+    </Dialog>
+  );
+}
+
+// ------------------------------------------------------------- server group
+
+function ServerGroupDialog({ id, server }: { id?: string; server?: string }) {
+  const t = useT();
+  const close = useClose();
+  const existing = useSettings((s) => s.serverGroups.find((g) => g.id === id));
+  const count = useSettings((s) => s.serverGroups.length);
+  const [name, setName] = useState(existing?.name ?? "");
+  const [color, setColor] = useState<string>(existing?.color ?? GROUP_COLORS[count % GROUP_COLORS.length]!);
+
+  const save = (e?: FormEvent) => {
+    e?.preventDefault();
+    if (!name.trim()) return;
+    const settings = useSettings.getState();
+    if (existing) settings.updateServerGroup(existing.id, { name, color });
+    else settings.addServerGroup(name, color, server ? [server] : []);
+    close();
+  };
+
+  return (
+    <Dialog
+      open
+      onOpenChange={(o) => !o && close()}
+      title={existing ? t("group.edit") : t("group.newTitle")}
+      description={t("group.description")}
+      footer={
+        <>
+          {existing && (
+            <Button
+              variant="danger"
+              className="mr-auto"
+              onClick={() => {
+                useSettings.getState().removeServerGroup(existing.id);
+                close();
+              }}
+            >
+              {t("group.delete")}
+            </Button>
+          )}
+          <Button onClick={close}>{t("common.cancel")}</Button>
+          <Button variant="primary" onClick={() => save()} disabled={!name.trim()}>
+            {t("common.save")}
+          </Button>
+        </>
+      }
+    >
+      <form onSubmit={save} className="flex flex-col gap-4">
+        <Field label={t("group.name")}>
+          {(fieldId) => <Input id={fieldId} value={name} onChange={(e) => setName(e.target.value)} maxLength={24} autoFocus />}
+        </Field>
+        <div role="radiogroup" aria-label={t("group.color")} className="flex flex-col gap-2">
+          <span className="text-sm font-medium text-fg">{t("group.color")}</span>
+          <div className="flex gap-2">
+            {GROUP_COLORS.map((c, i) => (
+              <button
+                key={c}
+                type="button"
+                role="radio"
+                aria-checked={color === c}
+                aria-label={t("group.colorN", { n: i + 1 })}
+                onClick={() => setColor(c)}
+                className={cn("t size-8 cursor-pointer rounded-lg", color === c && "ring-2 ring-fg ring-offset-2 ring-offset-surface")}
+                style={{ background: c }}
+              />
+            ))}
+          </div>
+        </div>
+      </form>
     </Dialog>
   );
 }

@@ -383,6 +383,8 @@ mod tests {
     fn packet(source: u64, timestamp: u32, payload: &[u8], declared: u32) -> Forward {
         Forward {
             h264: None,
+            av1: None,
+            dd: None,
             source,
             timestamp,
             marker: false,

@@ -394,11 +394,11 @@ impl PayloadParams {
     }
 
     fn match_av1_score(c0: CodecSpec, c1: CodecSpec) -> Option<usize> {
-        // TODO: consider media direction for a proper less or equal matching
-        // The AV1 stream sent by either the offerer or the answerer MUST be
-        // encoded with a profile, level and tier, lesser or equal to the values
-        // of the level-idx, profile and tier declared in the SDP by the receiving
-        // agent.
+        // GWAR-PATCH: level-idx and tier are asymmetric: each side declares what it
+        // receives, and the answerer MAY declare its own. The AV1 stream sent by either
+        // side MUST be encoded with a profile, level and tier lesser or equal to the
+        // values the receiving agent declared, which the sending application enforces.
+        // Only the profile has to agree for the payload types to match.
         // https://aomediacodec.github.io/av1-rtp-spec/#723-usage-with-the-sdp-offeranswer-model
 
         // Default values: profile = 0, level-idx = 5, tier = 0
@@ -406,18 +406,6 @@ impl PayloadParams {
         let c0_profile = c0.format.profile.unwrap_or(0);
         let c1_profile = c1.format.profile.unwrap_or(0);
         if c0_profile != c1_profile {
-            return None;
-        }
-
-        let c0_level_idx = c0.format.level_idx.unwrap_or(5);
-        let c1_level_idx = c1.format.level_idx.unwrap_or(5);
-        if c0_level_idx != c1_level_idx {
-            return None;
-        }
-
-        let c0_tier = c0.format.tier.unwrap_or(0);
-        let c1_tier = c1.format.tier.unwrap_or(0);
-        if c0_tier != c1_tier {
             return None;
         }
 
@@ -931,6 +919,31 @@ mod test {
                     ..Default::default()
                 },
             }
+        }
+
+        #[test]
+        fn av1_levels_and_tiers_are_declared_per_receiver() {
+            let av1 = |profile, level_idx, tier| CodecSpec {
+                codec: Codec::Av1,
+                clock_rate: Frequency::NINETY_KHZ,
+                channels: None,
+                format: FormatParams { profile, level_idx, tier, ..Default::default() },
+            };
+            let local = av1(Some(0), Some(13), Some(0));
+            for (level, tier) in [(None, None), (Some(5), Some(0)), (Some(8), Some(1)), (Some(12), Some(0)), (Some(13), Some(1))] {
+                let mut answer = PayloadParams::new(45.into(), Some(46.into()), local);
+                assert!(answer.match_score(&PayloadParams::new(35.into(), None, av1(Some(0), level, tier))).is_some());
+                answer.update_param(
+                    &[PayloadParams::new(35.into(), None, av1(None, level, tier))],
+                    &mut [false; 128],
+                    false,
+                    &mut HashSet::new(),
+                );
+                // The answer keeps declaring what this side receives.
+                assert_eq!((answer.spec.format.level_idx, answer.spec.format.tier), (Some(13), Some(0)));
+            }
+            let answer = PayloadParams::new(45.into(), Some(46.into()), local);
+            assert!(answer.match_score(&PayloadParams::new(35.into(), None, av1(Some(1), Some(13), Some(0)))).is_none());
         }
 
         #[test]

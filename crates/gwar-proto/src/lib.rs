@@ -302,6 +302,10 @@ wire! {
         /// Opts this connection into quality specs. Unknown on older servers.
         #[serde(rename = "screen.spec.capabilities")]
         ScreenSpecCapabilities {},
+        /// Whether the server forwards AV1 screen shares and accepts `av1` in watch offers.
+        /// Unknown on older servers.
+        #[serde(rename = "screen.av1.capabilities")]
+        ScreenAv1Capabilities {},
         /// The share on the viewer's stage: it gets first claim on the viewer's bandwidth.
         #[serde(rename = "screen.focus")]
         ScreenFocus { share: String },
@@ -624,6 +628,7 @@ wire! {
         /// `screen.capabilities`; deliberately absent from the legacy Welcome shape.
         ScreenCapabilities { screen_h264: bool },
         ScreenSpecCapabilities { screen_spec: bool },
+        ScreenAv1Capabilities { screen_av1: bool },
         /// `screen.publish.offer`, `screen.watch.offer`: the SDP answer.
         ScreenAnswer { sdp: String },
         /// `screen.watch`: the watch transport's slot the share arrives in.

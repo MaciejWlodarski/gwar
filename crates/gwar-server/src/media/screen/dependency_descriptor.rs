@@ -15,14 +15,91 @@
 //! <https://aomediacodec.github.io/av1-rtp-spec/#a1021>, with template offset 61, frame
 //! number 0x1234 and an optional 1920x1080 resolution.
 //!
-//! A2b must cache structures per source and sequence/generation, fence changes/loss/reordering,
-//! retain the active-target mask between packets, unwrap frame numbers, and implement
-//! dependency/chain-aware layer selection and descriptor rewriting. Parsing alone does
-//! not authorize dropping packets. No transport state or forwarding is changed here.
+//! # Transport (A2b)
+//!
+//! [`extension`] registers the descriptor on the screen transports. Its serializer keeps
+//! each packet's descriptor as opaque bytes ([`Raw`]), so it survives publish → SFU →
+//! watch unchanged, apart from the frame number each viewer slot remaps
+//! ([`Raw::with_frame_number`]). Values over 16 bytes use RFC 8285's two-byte form. Ingress
+//! checks the mandatory fields of every AV1 packet and resolves attached structures; a
+//! segment only opens at a keyframe that attaches one.
+//!
+//! Temporal-layer selection is not built: every frame is forwarded, so nothing is dropped
+//! on the strength of a descriptor. A selection policy must add per-source structure
+//! caching scoped to sequence/generation, fencing of changes/loss/reordering, the retained
+//! active-target mask, frame-number unwrapping and dependency/chain-aware selection.
+
+use std::sync::Arc;
+
+use str0m::rtp::{Extension, ExtensionSerializer, ExtensionValues};
 
 /// RFC 8285 extension values have at most 255 bytes.
 const MAX_BYTES: usize = 255;
 const MAX_TEMPLATES: usize = 64;
+
+pub const URI: &str = "https://aomediacodec.github.io/av1-rtp-spec/#dependency-descriptor-rtp-header-extension";
+
+/// The descriptor of one RTP packet, as received: at least the three mandatory bytes and at
+/// most [`MAX_BYTES`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Raw(pub Arc<[u8]>);
+
+impl Raw {
+    pub fn new(bytes: &[u8]) -> Option<Self> {
+        (3..=MAX_BYTES).contains(&bytes.len()).then(|| Self(bytes.into()))
+    }
+
+    pub fn mandatory(&self) -> Option<Mandatory> {
+        parse_mandatory(&self.0)
+    }
+
+    /// Whether a template dependency structure is attached (the first extended flag).
+    pub fn attaches_structure(&self) -> bool {
+        self.0.get(3).is_some_and(|flags| flags & 0x80 != 0)
+    }
+
+    /// The same descriptor with another frame number; everything else is relative to it.
+    pub fn with_frame_number(&self, frame_number: u16) -> Self {
+        let mut bytes = self.0.to_vec();
+        bytes[1..3].copy_from_slice(&frame_number.to_be_bytes());
+        Self(bytes.into())
+    }
+}
+
+/// The descriptor extension for video m-lines; its ID follows each peer's extmap.
+pub fn extension() -> Extension {
+    Extension::UnknownUri(URI.into(), Arc::new(Serializer))
+}
+
+#[derive(Debug)]
+struct Serializer;
+
+impl ExtensionSerializer for Serializer {
+    fn write_to(&self, buf: &mut [u8], values: &ExtensionValues) -> usize {
+        let Some(raw) = values.user_values.get::<Raw>() else { return 0 };
+        let Some(out) = buf.get_mut(..raw.0.len()) else { return 0 };
+        out.copy_from_slice(&raw.0);
+        raw.0.len()
+    }
+
+    fn parse_value(&self, buf: &[u8], values: &mut ExtensionValues) -> bool {
+        let Some(raw) = Raw::new(buf) else { return false };
+        values.user_values.set(raw);
+        true
+    }
+
+    fn is_video(&self) -> bool {
+        true
+    }
+
+    fn is_audio(&self) -> bool {
+        false
+    }
+
+    fn requires_two_byte_form(&self, values: &ExtensionValues) -> bool {
+        values.user_values.get::<Raw>().is_some_and(|raw| raw.0.len() > 16)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mandatory {
@@ -280,6 +357,39 @@ mod tests {
 
     fn structure() -> Structure {
         parse(L1T3, None).unwrap().structure.unwrap()
+    }
+
+    #[test]
+    fn serializer_round_trips_one_and_two_byte_values_and_remaps_frame_numbers() {
+        for bytes in [&[0x80, 0x12, 0x34][..], &[0xc1, 0, 1, 0x0f, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], L1T3] {
+            let mut received = ExtensionValues::default();
+            assert!(Serializer.parse_value(bytes, &mut received));
+            let raw = received.user_values.get::<Raw>().unwrap().clone();
+            assert_eq!(&*raw.0, bytes);
+            assert_eq!(Serializer.requires_two_byte_form(&received), bytes.len() > 16);
+            let mut out = [0; 255];
+            assert_eq!(Serializer.write_to(&mut out, &received), bytes.len());
+            assert_eq!(&out[..bytes.len()], bytes);
+            assert_eq!(Serializer.write_to(&mut out[..bytes.len() - 1], &received), 0, "no partial value");
+            let remapped = raw.with_frame_number(0xfffe);
+            assert_eq!(remapped.mandatory().unwrap().frame_number, 0xfffe);
+            assert_eq!(remapped.0[0], bytes[0]);
+            assert_eq!(remapped.0[3..], bytes[3..]);
+        }
+        let attached = Raw::new(L1T3).unwrap();
+        assert!(attached.attaches_structure());
+        assert!(!Raw::new(&[0x80, 0, 0]).unwrap().attaches_structure());
+        assert_eq!(
+            parse(&attached.with_frame_number(7).0, None).unwrap().structure,
+            parse(L1T3, None).unwrap().structure
+        );
+        let mut values = ExtensionValues::default();
+        for bad in [&[][..], &[0x80, 0], &[0; 256]] {
+            assert!(!Serializer.parse_value(bad, &mut values));
+        }
+        assert!(values.user_values.get::<Raw>().is_none());
+        assert_eq!(Serializer.write_to(&mut [0; 8], &values), 0, "absent descriptor writes nothing");
+        assert!(!Serializer.requires_two_byte_form(&values));
     }
 
     #[test]

@@ -14,7 +14,7 @@ import { isDesktop, tauri } from "../platform";
 import type { Event } from "../proto/Event";
 import type { ScreenStopReason } from "../proto/ScreenStopReason";
 import { nextMediaRun } from "../voice/engine";
-import { applyCaptureSpec, captureScreen, captureSupport, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PublishStats, type SlotStats } from "../voice/screen";
+import { applyCaptureSpec, captureScreen, captureSupport, probeAv1Encoder, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PublishStats, type SlotStats } from "../voice/screen";
 import { myChannelId } from "./reducer";
 import { useScreen, type ScreenAction } from "./screen";
 import { useSession, useUi } from "./stores";
@@ -226,6 +226,8 @@ export class ScreenController {
     dispatch({ type: "starting", attempt });
     let share: string;
     let screenSpec: boolean;
+    // AV1 needs a hardware encoder here; an older server simply answers without AV1.
+    const av1 = probeAv1Encoder();
     try {
       screenSpec = await conn.request("screen.spec.capabilities", {}, { timeoutMs: 1_500 })
         .then(features => features.screen_spec === true).catch(() => false);
@@ -249,8 +251,10 @@ export class ScreenController {
       await applyCaptureSpec(track, applied, !screenSpec);
     }
     if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
+    const hardwareAv1 = await av1;
+    if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
     const publisher = new ScreenPublisher({
-      track, quality: latest(), legacy: !screenSpec, automaticMode: useSettings.getState().screenMode === null, iceServers: s.iceServers,
+      track, quality: latest(), legacy: !screenSpec, av1: hardwareAv1, automaticMode: useSettings.getState().screenMode === null, iceServers: s.iceServers,
       ended: () => { if (this.publisher === publisher) void this.stopShare(); },
       surfaceChanged: (surface, spec) => {
         if (current()) dispatch({ type: "surface", attempt, surface, spec });
@@ -490,8 +494,9 @@ export class ScreenController {
     let screenH264 = false;
     const transport: ScreenWatchTransport = new ScreenWatchTransport({
       run,
+      av1: true,
       iceServers: useSession.getState().iceServers,
-      offer: async (sdp, run, h264 = []) => {
+      offer: async (sdp, run, h264 = [], av1 = null) => {
         // Query explicitly: adding fields to Welcome would break old clients' strict
         // validators. An older server replies bad_request and retains legacy offers.
         await conn.request("screen.spec.capabilities", {}, { timeoutMs: 1_500 }).catch(() => {});
@@ -499,7 +504,11 @@ export class ScreenController {
         screenH264 = await conn.request("screen.capabilities", {}, { timeoutMs: 1_500 })
           .then(features => features.screen_h264 === true).catch(() => false);
         if (this.transport !== transport) throw new Error("the watch transport was replaced");
-        return (await conn.request("screen.watch.offer", { run, sdp, ...(screenH264 ? { browser: true, h264 } : {}) }, { timeoutMs: 35_000 })).sdp;
+        // Only a server that knows the field may see it: older ones reject unknown fields.
+        const screenAv1 = screenH264 && av1 !== null && await conn.request("screen.av1.capabilities", {}, { timeoutMs: 1_500 })
+          .then(features => features.screen_av1 === true).catch(() => false);
+        if (this.transport !== transport) throw new Error("the watch transport was replaced");
+        return (await conn.request("screen.watch.offer", { run, sdp, ...(screenH264 ? { browser: true, h264 } : {}), ...(screenAv1 && av1 ? { av1 } : {}) }, { timeoutMs: 35_000 })).sdp;
       },
       state: state => {
         if (this.transport !== transport) return;

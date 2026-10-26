@@ -120,6 +120,8 @@ export type DialogState =
   | { kind: "none" }
   | { kind: "settings"; tab: SettingsTab }
   | { kind: "addServer"; editId?: string }
+  /** A new server group (holding `server` if given), or the group `id` to edit. */
+  | { kind: "serverGroup"; id?: string; server?: string }
   | { kind: "channelEdit"; mode: "create"; parent: number | null }
   | { kind: "channelEdit"; mode: "edit"; channel: number }
   | { kind: "channelPermissions"; channel: number }
