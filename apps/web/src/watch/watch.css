@@ -8,7 +8,7 @@ h1 { flex: 1; margin: 0; font-size: 15px; font-weight: 600; overflow: hidden; te
 .controls { display: flex; gap: 8px; }
 button { font: inherit; font-size: 13px; color: inherit; background: #1e2425; border: 1px solid #2c3536; border-radius: 6px; padding: 6px 10px; cursor: pointer; }
 button:hover { background: #263031; }
-button:focus-visible { outline: 2px solid #3fcfc0; outline-offset: 2px; }
+button:focus-visible { outline: 2px solid #22d3ee; outline-offset: 2px; }
 #frame { position: relative; flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; background: #000; }
 video { width: 100%; height: 100%; object-fit: contain; background: #000; }
 #status { position: absolute; inset: auto 0 50% 0; margin: 0; padding: 0 24px; text-align: center; font-size: 16px; transform: translateY(50%); }
