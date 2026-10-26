@@ -1094,7 +1094,9 @@ Limits are enforced continuously, not only when a share or watch is admitted:
     slot keeps its reservation. Budget pauses resume through the usual resume
     rule once egress has stayed at or under 90 % of the budget for 10 s.
 - **Negotiation.**
-  - At most 4 `screen.*.offer` per session per minute.
+  - Publish and watch offers have separate per-session buckets: each allows a
+    burst of 4 and refills at 4 per minute. Watching cannot spend recovery-publish
+    credit. Watch re-offers retry a fresh run after rate-limit refill.
   - A guest connection gets exactly one accepted `guest.offer`. A second one
     closes the connection, so renegotiating means reconnecting through the
     gateway's pre-authentication limits
@@ -1128,11 +1130,14 @@ does not assemble frames before forwarding.
   - The share goes to *waiting for keyframe* for **all** its slots, and one
     throttled PLI goes to the publisher.
 - **The server bounds frames.** One RTP timestamp may carry at most 512 KB
-  (the byte burst), at most 600 packets (the packet burst), and must end, by a
-  marker bit or a new timestamp, within 500 ms of its first packet.
+  (the byte burst), at most 600 packets (the packet burst), and is tracked for
+  at most 2 s from its first packet, until a new timestamp arrives. This bounds current-timestamp
+  accounting, not buffered media: ingress forwards or drops each packet immediately.
+  The allowance accommodates a publisher pacing a large keyframe over a slow uplink
+  (the regression sends 400 KB over 1.2 s), independently of SFU arrival jitter.
   - A packet that breaks any of these is treated exactly like a bucket overrun.
   - So a publisher that sends continuations without ever starting a new frame
-    is cut off after 500 ms at most. It cannot postpone the drop.
+    is cut off when its next packet exceeds the 2 s span, byte or packet bound.
 - **Repeated overruns end the share.** Three overruns of one share within 10 s
   stop it with `screen.stopped {reason: "limit"}`. An honest sharer's frames
   fit far inside these bounds: the largest frame measured was 204 KB, a
@@ -2217,8 +2222,12 @@ feeds or polls a watch transport, so a NACK arriving before the `Release`
 finds an empty RTX cache. Commands that end things are also fenced: a
 transport whose share or lease (a watch transport's, ended when the core drops
 it) has ended closes within 100 ms even if its command was lost to a full
-queue, and an assignment is recorded only once the queue has room for it. The
-screen task's own signals to the core (connected, ended) arrive in order: what
+queue, and an assignment is recorded only once the queue has room for it.
+A watch transport that never connects expires 25 s after its offer is accepted,
+for members and guests alike. The SFU reports the failed run to the core, which
+releases member slots and reservations; guests are disconnected and their guest
+reservation is freed. Connected transports use the existing ICE failure handling.
+The screen task's own signals to the core (connected, ended) arrive in order: what
 the core's full queue does not take waits behind one reservation in that
 queue, in line with every other sender, so a busy core cannot keep passing
 over them. Waiting signals a later one makes moot leave (a viewer's earlier
@@ -3534,3 +3543,58 @@ Smaller defaults chosen in this design, which the owner may change:
   `monthly_egress_stop` is set;
 - in phase 2, "Mute the shared tab for me" starts off, until PR 9 measures
   echo.
+
+### Server audit scheduling and signaling (October 2026)
+
+The SFU keeps one indexed deadline per transport. Datagram wakes drain only the
+transport receiving the datagram and viewers receiving forwarded media, plus
+transports whose RTC deadline, deliverable PLI or egress wake is due. Forwarding
+still catches the viewer clock up before polling and again after releasing
+originals, preserving TWCC timestamps and pacer snapshots. Atomic authority is
+checked on every forward/drain. Ended-origin and lease reclamation, keyframe-budget
+cleanup, measured-budget enforcement and allocation run on their independent
+100 ms tick. A pending PLI does not arm a timer until its publisher is connected
+and its receive stream exists. Deadline entries are replaced and removed with the
+transport; they cannot accumulate across packets or replacement runs.
+
+Publish offers and watch offers have separate per-session buckets. Each keeps a
+burst of four and refills at four per minute. Replaying an already answered offer
+does not consume credit. Web watch re-offers rejected with `rate_limited` close the
+unconnected peer while waiting 15.25 s for refill, then retry a fresh run (at most
+two retries). Replacement/reset fences both retries and errors from superseded
+runs. A publish answer arriving after its share ended replies `not_found`; an
+answer for a superseded or retired watch run replies `stale` immediately.
+Guest frames validate the `id`/`op`/`d` envelope separately from the strict
+operation payload, rejecting extra keys at either level without Serde's
+`flatten`/`deny_unknown_fields` interaction.
+
+Ingress diagnostics distinguish timestamp-span, frame-size and bucket violations,
+in addition to transport drops and sent PLIs. Transport drain counts are exposed
+in `ScreenSnapshot` for scheduler regressions. Limit decisions log the bounded
+counters once per violation, with the share ID, to correlate receiver freezes
+with actual ingress enforcement rather than infer a cause from browser stats.
+
+Coalesced keyframe requests spend one viewer credit when they first make a
+publisher PLI pending; duplicates while it is pending spend none. The ten-per-minute
+viewer bucket and one-PLI-per-share-per-500-ms throttle still bound new requests.
+Previously a burst of queue-recovery/RTCP requests could consume all ten credits
+without sending ten PLIs, delaying the next recovery by the six-second refill.
+Debug samples include PLI credit denials and per-viewer egress counters/waiting-slot
+bits to distinguish queue recovery from ingress enforcement or aggregate-budget pauses.
+
+A viewer also spaces new keyframe requests across its slots by at least 500 ms.
+A new multi-share watch used to solicit all its large keyframes together into
+one cold 2.5 Mb/s egress estimator and its bounded queue. Queue evictions could
+then trigger another simultaneous batch and exhaust recovery credits. Deferred
+slots retry from the housekeeping tick in stage/watch priority order, including
+when the publisher has no delta traffic. This keeps the 400 ms egress deadlines,
+queue bounds, voice headroom and existing estimator/probe policy intact.
+
+During the first 5 s after a viewer's first keyframe request, a known keyframe
+that cannot fit the current per-slot release share within 400 ms is deferred
+without spending viewer credit. The calculation reserves higher-priority media's
+measured average. One initial request always seeds media/feedback; unknown sizes
+are allowed. The guard ends when the estimate fits the frame or after those 5 s,
+so a conservative estimate cannot suppress recovery permanently. Rate samples
+come from the existing allocation tick. Probe targets and pacing limits are not
+raised by this guard.

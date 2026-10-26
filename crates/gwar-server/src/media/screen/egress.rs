@@ -486,8 +486,19 @@ impl Egress {
         (self.focus != Some(lane), self.lanes[lane].order)
     }
 
+    /// Can the known keyframe fit this lane's release share within its deadline?
+    /// Unknown sizes allow a seed request; higher-priority media keeps its claim.
+    pub(super) fn keyframe_fits(&self, lane: usize, rates: &[ShareRate]) -> bool {
+        let key = rates.get(lane).map_or(0, |r| r.largest_keyframe);
+        let higher: f64 = (0..self.lanes.len())
+            .filter(|&other| self.lanes[other].active() && self.rank(other) < self.rank(lane))
+            .map(|other| rates.get(other).map_or(0.0, |r| r.average))
+            .sum();
+        key == 0 || higher + key as f64 * 8.0 / DEADLINE.as_secs_f64() <= self.plan()
+    }
+
     /// Active lanes, most important first.
-    fn priority(&self) -> Vec<usize> {
+    pub(super) fn priority(&self) -> Vec<usize> {
         let mut lanes: Vec<usize> = (0..self.lanes.len()).filter(|&l| self.lanes[l].active()).collect();
         lanes.sort_by_key(|&l| self.rank(l));
         lanes
@@ -853,6 +864,21 @@ mod tests {
         }
         e.set_estimate(estimate, now);
         e
+    }
+
+    #[test]
+    fn cold_keyframe_admission_reserves_higher_priority_media() {
+        let now = Instant::now();
+        let mut e = egress(2_500_000, 2, now);
+        let mut rates = [ShareRate::default(), ShareRate { largest_keyframe: 200 * 1024, ..Default::default() }];
+        assert!(!e.keyframe_fits(1, &rates));
+        e.set_estimate(10_000_000, now);
+        rates[0].average = 3_000_000.0;
+        assert!(e.keyframe_fits(1, &rates));
+        rates[0].average = 5_000_000.0;
+        assert!(!e.keyframe_fits(1, &rates));
+        e.focus(Some(1));
+        assert!(e.keyframe_fits(1, &rates));
     }
 
     #[test]

@@ -30,7 +30,7 @@ mod segment;
 mod sim;
 
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     net::SocketAddr,
     pin::Pin,
     sync::{
@@ -74,11 +74,16 @@ const VIEWER_KEYFRAMES_BURST: f64 = 10.0;
 const VIEWER_KEYFRAMES_PER_SECOND: f64 = 10.0 / 60.0;
 /// A slot waiting for a keyframe asks again this often while the share keeps sending deltas.
 const WAITING_RETRY: Duration = Duration::from_secs(1);
+/// After one seed request, avoid spending cold-viewer credits on known unserviceable
+/// keyframes while initial probes ramp. Bounded so an estimate cannot strand a slot.
+const KEYFRAME_BOOTSTRAP: Duration = Duration::from_secs(5);
 const DECODE_WINDOW: Duration = Duration::from_secs(4);
 /// Allow independent watchdog reports to meet before isolating a failed watch.
 const CORROBORATE_FOR: Duration = Duration::from_secs(2);
 /// A publish transport that has not connected by then fails.
 pub const PUBLISH_CONNECT: Duration = Duration::from_secs(30);
+/// Members and guests must connect their watch transport before this deadline.
+pub const WATCH_CONNECT: Duration = Duration::from_secs(25);
 /// RTX cache per forwarded stream: packets, age target and resend ratio cap ("Queues and
 /// repairs"). Setting it also wipes it.
 const RTX_PACKETS: usize = 1024;
@@ -414,6 +419,7 @@ pub struct ScreenSnapshot {
     pub viewers: HashMap<SessionId, ViewerSnapshot>,
     /// Measured egress over the server-wide budget, seconds in a row.
     pub over_budget: u32,
+    pub drives: u64,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -436,6 +442,8 @@ struct Throttle {
     last: Option<Instant>,
     pending: bool,
     sent: u64,
+    received: u64,
+    budget_denied: u64,
 }
 
 impl Throttle {
@@ -489,6 +497,26 @@ struct Publisher {
     created: Instant,
     keyframes: Throttle,
     deadline: Instant,
+}
+
+impl Publisher {
+    fn keyframe_wake(&mut self) -> Option<Instant> {
+        // A pending PLI cannot be delivered before ICE and the receive stream exist.
+        // Keeping its old throttle deadline armed here would busy-spin the task.
+        if self.connected && self.rtc.direct_api().stream_rx(&self.ssrc).is_some() {
+            self.keyframes.next()
+        } else {
+            None
+        }
+    }
+
+    fn wake(&mut self) -> Instant {
+        let mut at = self.deadline;
+        if !self.connected {
+            at = at.min(self.created + PUBLISH_CONNECT);
+        }
+        self.keyframe_wake().map_or(at, |next| at.min(next))
+    }
 }
 
 struct Slot {
@@ -550,6 +578,10 @@ struct Watcher {
     /// Assignments that arrived before the slot's m-line was seen, with their watch order.
     pending: Vec<(u32, Arc<WatchGrant>, u64)>,
     connected: bool,
+    created: Instant,
+    /// Space new publisher requests across this viewer's slots during bootstrap/recovery.
+    keyframe_at: Option<Instant>,
+    keyframes_started: Option<Instant>,
     focus: Option<String>,
     /// The viewer's queues, release bucket, socket cap and allocation, slot by slot.
     egress: Egress,
@@ -559,6 +591,55 @@ struct Watcher {
     /// Last estimator restart; also bounds post-resume probe spacing.
     restarted: Option<Instant>,
     deadline: Instant,
+}
+
+impl Watcher {
+    fn wake(&self) -> Instant {
+        let mut at = self.egress.wake().map_or(self.deadline, |wake| self.deadline.min(wake));
+        if !self.connected {
+            at = at.min(self.created + WATCH_CONNECT);
+        }
+        at
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Timer {
+    Publish(String),
+    Watch(SessionId),
+}
+
+/// Exactly one indexed wake per transport; packet wakes never scan unrelated transports.
+#[derive(Default)]
+struct Timers {
+    due: BTreeSet<(Instant, Timer)>,
+    indexed: HashMap<Timer, Instant>,
+}
+
+impl Timers {
+    fn set(&mut self, key: Timer, at: Instant) {
+        if self.indexed.get(&key) == Some(&at) {
+            return;
+        }
+        self.remove(&key);
+        self.due.insert((at, key.clone()));
+        self.indexed.insert(key, at);
+    }
+
+    fn remove(&mut self, key: &Timer) {
+        if let Some(at) = self.indexed.remove(key) {
+            self.due.remove(&(at, key.clone()));
+        }
+    }
+
+    fn pop(&mut self, now: Instant) -> Option<Timer> {
+        if self.due.first().is_none_or(|(at, _)| *at > now) {
+            return None;
+        }
+        let (_, key) = self.due.pop_first().expect("due timer");
+        self.indexed.remove(&key);
+        Some(key)
+    }
 }
 
 /// A packet that passed ingress, to be written to every slot that carries its share.
@@ -628,6 +709,8 @@ struct Sfu {
     /// Viewer/share report throttling survives transport replacement; independent slots
     /// can report without exhausting one another's watchdog retries.
     decode_reports: HashMap<(SessionId, String), Instant>,
+    /// The allocation tick's rates, also used by cold-viewer keyframe admission.
+    rates: HashMap<String, ShareRate>,
     publishers: HashMap<String, Publisher>,
     watchers: HashMap<SessionId, Watcher>,
     next_id: u64,
@@ -636,6 +719,12 @@ struct Sfu {
     /// Watch order across all viewers: the newest watch is paused first for the budget.
     watches: u64,
     next_allocation: Instant,
+    timers: Timers,
+    /// Number of actual transport drains, for bounded diagnostics and cost regressions.
+    drives: u64,
+    wakes: u64,
+    datagram_wakes: u64,
+    timer_wakes: u64,
 }
 
 pub async fn run(
@@ -656,6 +745,7 @@ pub async fn run(
         outbox: VecDeque::new(),
         budgets: HashMap::new(),
         decode_reports: HashMap::new(),
+        rates: HashMap::new(),
         publishers: HashMap::new(),
         watchers: HashMap::new(),
         next_id: 1,
@@ -663,6 +753,11 @@ pub async fn run(
         measured: Measured::new(now),
         watches: 0,
         next_allocation: now,
+        timers: Timers::default(),
+        drives: 0,
+        wakes: 0,
+        datagram_wakes: 0,
+        timer_wakes: 0,
     };
     // While signals wait, one reservation stands in the core's queue, in line with every other
     // sender: a busy core cannot keep passing over them.
@@ -682,7 +777,7 @@ pub async fn run(
                 None => break,
             },
             datagram = rx.recv() => match datagram {
-                Some(datagram) => sfu.datagram(datagram),
+                Some(datagram) => { sfu.datagram_wakes += 1; sfu.datagram(datagram); },
                 None => break,
             },
             reserved = reserved(&mut slot), if waiting => {
@@ -692,8 +787,9 @@ pub async fn run(
                     None => sfu.outbox.clear(),
                 }
             }
-            _ = sleep_until(deadline.into()) => {}
+            _ = sleep_until(deadline.into()) => { sfu.timer_wakes += 1; }
         }
+        sfu.wakes += 1;
         sfu.timeouts(Instant::now());
     }
 }
@@ -707,20 +803,19 @@ async fn reserved(slot: &mut Option<Pin<Box<dyn Future<Output = Option<ScreenSlo
 
 impl Sfu {
     fn deadline(&self) -> Instant {
-        let mut at = Instant::now() + Duration::from_millis(100);
-        for p in self.publishers.values() {
-            at = at.min(p.deadline);
-            if let Some(next) = p.keyframes.next() {
-                at = at.min(next);
-            }
+        self.timers.due.first().map_or(self.next_allocation, |(at, _)| (*at).min(self.next_allocation))
+    }
+
+    fn schedule_publisher(&mut self, share: &str) {
+        if let Some(p) = self.publishers.get_mut(share) {
+            self.timers.set(Timer::Publish(share.to_owned()), p.wake());
         }
-        for w in self.watchers.values() {
-            at = at.min(w.deadline);
-            if let Some(wake) = w.egress.wake() {
-                at = at.min(wake);
-            }
+    }
+
+    fn schedule_watcher(&mut self, session: SessionId) {
+        if let Some(w) = self.watchers.get(&session) {
+            self.timers.set(Timer::Watch(session), w.wake());
         }
-        at.min(self.next_allocation)
     }
 
     fn id(&mut self) -> u64 {
@@ -753,7 +848,9 @@ impl Sfu {
                     Ok((publisher, answer)) => {
                         debug!(share = publisher.origin.share, "screen publish accepted");
                         publisher.origin.recovery.lock().expect("recovery lock").pending = false;
-                        self.publishers.insert(publisher.origin.share.clone(), publisher);
+                        let share = publisher.origin.share.clone();
+                        self.publishers.insert(share.clone(), publisher);
+                        self.flush_publisher(&share);
                         let _ = reply.send(Ok(answer));
                     }
                     Err(message) => {
@@ -777,10 +874,12 @@ impl Sfu {
                         let (socket, measured, shared) = (&self.socket, &mut self.measured, &self.shared);
                         let guest = watcher.size == GUEST_SLOTS;
                         let mut send = |c: &[u8], to| transmit(socket, measured, shared, guest, c, to);
+                        self.drives += 1;
                         if drive(&mut watcher, now, &mut Vec::new(), &mut send) {
                             self.signal(ScreenSignal::Watch { session, run, connected: true });
                         }
                         self.watchers.insert(session, watcher);
+                        self.schedule_watcher(session);
                         let _ = reply.send(Ok(answer));
                     }
                     Err(message) => {
@@ -880,28 +979,61 @@ impl Sfu {
                 })
                 .collect(),
             over_budget: self.measured.over,
+            drives: self.drives,
         }
     }
 
     /// Asks the share in `session`'s slot for a keyframe, within the viewer's budget.
     fn ask_keyframe(&mut self, session: SessionId, slot: usize, now: Instant) {
         let Some(w) = self.watchers.get_mut(&session) else { return };
+        // A cold watch has one small release/admission budget for all its slots.
+        // Simultaneous keyframes evict one another before BWE can ramp. Spread
+        // new requests, with the tick retrying deferred slots in stage order.
+        if w.keyframe_at.is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_INTERVAL) {
+            return;
+        }
         if w.egress.paused(slot).is_some() {
             return;
         }
         let Some(s) = w.slots.get_mut(slot) else { return };
         let Some(grant) = s.grant.as_ref().filter(|g| g.alive()) else { return };
         s.asked = Some(now);
+        let share = grant.share.clone();
+        if s.segment.waiting()
+            && w.keyframes_started.is_some_and(|at| now.saturating_duration_since(at) < KEYFRAME_BOOTSTRAP)
+        {
+            let mut rates = [ShareRate::default(); SCREEN_SLOTS];
+            for (i, s) in w.slots.iter().enumerate() {
+                rates[i] = s.grant.as_ref().and_then(|g| self.rates.get(&g.share)).copied().unwrap_or_default();
+            }
+            if !w.egress.keyframe_fits(slot, &rates[..w.slots.len()]) {
+                return;
+            }
+        }
+        // Coalescing does not create another publisher request. Charging every
+        // duplicate (including queue-recovery and RTCP requests) could spend all
+        // ten credits before a single pending PLI was sent, stranding a slot for
+        // the six-second refill even after the viewer's estimate recovered.
+        if self.publishers.get(&share).is_none_or(|p| p.keyframes.pending) {
+            return;
+        }
         let budget = self
             .budgets
             .entry(session)
             .or_insert_with(|| Bucket::new(VIEWER_KEYFRAMES_PER_SECOND, VIEWER_KEYFRAMES_BURST, now));
         if !budget.take(1.0, now) {
+            if let Some(p) = self.publishers.get_mut(&share) {
+                p.keyframes.budget_denied += 1;
+            }
             return;
         }
-        if let Some(p) = self.publishers.get_mut(&grant.share) {
+        let w = self.watchers.get_mut(&session).expect("watch found above");
+        w.keyframe_at = Some(now);
+        w.keyframes_started.get_or_insert(now);
+        if let Some(p) = self.publishers.get_mut(&share) {
             p.keyframes.pending = true;
         }
+        self.schedule_publisher(&share);
     }
 
     fn datagram(&mut self, datagram: Datagram) {
@@ -1030,43 +1162,65 @@ impl Sfu {
     }
 
     fn timeouts(&mut self, now: Instant) {
-        // Transports whose share or lease the core ended close even if their command was lost.
-        let ended: Vec<String> =
+        if now >= self.next_allocation {
+            self.next_allocation = now + ALLOCATION_TICK;
+            self.housekeeping(now);
+        }
+        // Take this wake's due work once. A bounded pacer catch-up may legitimately
+        // return an already-due timeout; it runs again on the next task wake.
+        let mut due = Vec::new();
+        while let Some(key) = self.timers.pop(now) {
+            due.push(key);
+        }
+        for key in due {
+            match key {
+                Timer::Publish(share) => self.flush_publisher_at(&share, now),
+                Timer::Watch(session) => self.flush_watcher_at(session, now),
+            }
+        }
+    }
+
+    fn housekeeping(&mut self, now: Instant) {
+        // Atomic authority is still checked at every forward/drain; this tick also
+        // reclaims transports if an end command was lost.
+        let ended: Vec<_> =
             self.publishers.iter().filter(|(_, p)| !p.origin.alive()).map(|(share, _)| share.clone()).collect();
         for share in ended {
             self.end_publish(&share);
         }
-        let ended: Vec<SessionId> =
+        let ended: Vec<_> =
             self.watchers.iter().filter(|(_, w)| !w.lease.alive()).map(|(session, _)| *session).collect();
         for session in ended {
             self.end_watch(session);
         }
         let watchers = &self.watchers;
         self.budgets.retain(|session, budget| watchers.contains_key(session) || !budget.full(now));
-        let shares: Vec<String> = self.publishers.keys().cloned().collect();
-        for share in shares {
-            let Some(p) = self.publishers.get_mut(&share) else { continue };
-            if !p.connected && now.saturating_duration_since(p.created) > PUBLISH_CONNECT {
-                p.rtc.disconnect();
-            }
-            if p.deadline <= now && p.rtc.is_alive() && p.rtc.handle_input(Input::Timeout(now)).is_err() {
-                p.rtc.disconnect();
-            }
-            self.flush_publisher(&share);
-        }
-        if now >= self.next_allocation {
-            self.next_allocation = now + ALLOCATION_TICK;
-            self.measure(now);
-            self.allocate(now);
-        }
-        let sessions: Vec<SessionId> = self.watchers.keys().copied().collect();
+        self.measure(now);
+        self.allocate(now);
+        // Allocation can change pacing, paused queues and desired bitrate. Drive
+        // those outputs on this independent tick, preserving the TWCC catch-up.
+        let sessions: Vec<_> = self.watchers.keys().copied().collect();
         for session in sessions {
-            let Some(w) = self.watchers.get_mut(&session) else { continue };
-            sweep(w);
-            if w.deadline <= now && w.rtc.is_alive() && w.rtc.handle_input(Input::Timeout(now)).is_err() {
-                w.rtc.disconnect();
+            self.flush_watcher_at(session, now);
+            let retry: Vec<_> = self
+                .watchers
+                .get(&session)
+                .map(|w| {
+                    w.egress
+                        .priority()
+                        .into_iter()
+                        .filter(|&slot| {
+                            let s = &w.slots[slot];
+                            s.segment.waiting()
+                                && s.grant.as_ref().is_some_and(|g| g.alive())
+                                && s.asked.is_none_or(|at| now.saturating_duration_since(at) >= WAITING_RETRY)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            for slot in retry {
+                self.ask_keyframe(session, slot, now);
             }
-            self.flush_watcher(session);
         }
     }
 
@@ -1082,6 +1236,31 @@ impl Sfu {
         self.measured.started = now;
         self.measured.bytes = 0;
         let budget = self.shared.budget_bps.load(Ordering::Relaxed) as f64;
+        debug!(
+            rate,
+            budget,
+            drives = self.drives,
+            wakes = self.wakes,
+            datagram_wakes = self.datagram_wakes,
+            timer_wakes = self.timer_wakes,
+            dispatch_dropped = self.dropped.load(Ordering::Relaxed),
+            "screen budget sample"
+        );
+        if tracing::enabled!(tracing::Level::DEBUG) {
+            for (share, p) in &self.publishers {
+                debug!(share, counters = ?p.ingress.counters, plis = p.keyframes.sent, keyframes = p.keyframes.received,
+                    pending_pli = p.keyframes.pending, budget_denied = p.keyframes.budget_denied, "screen ingress sample");
+            }
+            for w in self.watchers.values() {
+                let waiting = w
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .fold(0u32, |bits, (i, s)| bits | (u32::from(s.grant.is_some() && s.segment.waiting()) << i));
+                debug!(session = w.session, run = w.run, estimate = w.egress.estimate(),
+                    counters = ?w.egress.counters, waiting, "screen egress sample");
+            }
+        }
         if rate > budget {
             self.measured.over += 1;
             self.measured.under_since = None;
@@ -1127,6 +1306,7 @@ impl Sfu {
                 self.tell(session, slot, change, now);
             }
         }
+        self.rates = rates;
     }
 
     /// A slot was paused or resumed (`apply`): the core tells the viewer, and a resumed slot
@@ -1153,8 +1333,18 @@ impl Sfu {
     /// Drives a publisher until it sleeps, forwards what it received and sends due keyframe
     /// requests. Closes it, and tells the core, once it is dead.
     fn flush_publisher(&mut self, share: &str) {
+        self.flush_publisher_at(share, Instant::now());
+    }
+
+    fn flush_publisher_at(&mut self, share: &str, now: Instant) {
         let Some(mut p) = self.publishers.remove(share) else { return };
-        let now = Instant::now();
+        self.drives += 1;
+        if !p.connected && now >= p.created + PUBLISH_CONNECT {
+            p.rtc.disconnect();
+        }
+        if p.deadline <= now && p.rtc.is_alive() && p.rtc.handle_input(Input::Timeout(now)).is_err() {
+            p.rtc.disconnect();
+        }
         if p.keyframes.due(now)
             && p.connected
             && let Some(stream) = p.rtc.direct_api().stream_rx(&p.ssrc)
@@ -1163,6 +1353,7 @@ impl Sfu {
             p.keyframes.pending = false;
             p.keyframes.last = Some(now);
             p.keyframes.sent += 1;
+            debug!(share, sent = p.keyframes.sent, received = p.keyframes.received, "screen keyframe requested");
         }
         let mut forwards = Vec::new();
         let waiting = self.slots_of(share).iter().any(|(session, index)| {
@@ -1225,6 +1416,9 @@ impl Sfu {
                         }
                         let Some(describe) = describe(codec, &packet.payload) else { continue };
                         let source = *packet.seq_no;
+                        if describe.keyframe {
+                            p.keyframes.received += 1;
+                        }
                         match p.ingress.admit(source, packet.header.timestamp, packet.payload.len(), describe, now) {
                             Verdict::Forward { keyframe } => forwards.push((
                                 {
@@ -1255,6 +1449,7 @@ impl Sfu {
             }
         }
         if !p.rtc.is_alive() {
+            self.timers.remove(&Timer::Publish(share.to_owned()));
             self.owners.forget(Owner::Publish(p.id));
             if p.origin.alive() {
                 let signal = PublishSignal::Ended(p.ended.unwrap_or(ScreenStopReason::Transport));
@@ -1264,6 +1459,7 @@ impl Sfu {
         }
         let origin = p.origin.clone();
         self.publishers.insert(share.to_owned(), p);
+        self.schedule_publisher(share);
         self.forward_packets(share, &origin, forwards, now);
     }
 
@@ -1351,6 +1547,7 @@ impl Sfu {
     /// Applies an ingress overrun: every slot of the share waits for its next keyframe and the
     /// publisher is asked for one. The third within the window ends the share with `limit`.
     fn overrun(&mut self, p: &mut Publisher, verdict: Verdict) {
+        debug!(share = p.origin.share, ?verdict, counters = ?p.ingress.counters, "screen ingress limit");
         match verdict {
             Verdict::Overrun => {
                 p.prefix.reset();
@@ -1386,8 +1583,16 @@ impl Sfu {
     /// Releases what the viewer's egress allows, drives the transport until it sleeps and
     /// sends the viewer's keyframe requests on.
     fn flush_watcher(&mut self, session: SessionId) {
+        self.flush_watcher_at(session, Instant::now());
+    }
+
+    fn flush_watcher_at(&mut self, session: SessionId, now: Instant) {
         let Some(mut w) = self.watchers.remove(&session) else { return };
-        let now = Instant::now();
+        self.drives += 1;
+        if !w.connected && now >= w.created + WATCH_CONNECT {
+            debug!(session, run = w.run, "screen watch connect deadline expired");
+            w.rtc.disconnect();
+        }
         let mut requests = Vec::new();
         let (socket, measured, shared) = (&self.socket, &mut self.measured, &self.shared);
         let guest = w.size == GUEST_SLOTS;
@@ -1396,11 +1601,13 @@ impl Sfu {
             self.signal(ScreenSignal::Watch { session: w.session, run: w.run, connected: true });
         }
         if !w.rtc.is_alive() {
+            self.timers.remove(&Timer::Watch(session));
             self.owners.forget(Owner::Watch(w.id));
             self.signal(ScreenSignal::Watch { session: w.session, run: w.run, connected: false });
             return;
         }
         self.watchers.insert(session, w);
+        self.schedule_watcher(session);
         requests.sort_unstable();
         requests.dedup();
         for slot in requests {
@@ -1559,6 +1766,8 @@ impl Sfu {
     }
 
     fn end_publish(&mut self, share: &str) {
+        self.rates.remove(share);
+        self.timers.remove(&Timer::Publish(share.to_owned()));
         if let Some(mut p) = self.publishers.remove(share) {
             p.rtc.disconnect();
             self.owners.forget(Owner::Publish(p.id));
@@ -1566,6 +1775,7 @@ impl Sfu {
     }
 
     fn end_watch(&mut self, session: SessionId) {
+        self.timers.remove(&Timer::Watch(session));
         if let Some(mut w) = self.watchers.remove(&session) {
             w.rtc.disconnect();
             self.owners.forget(Owner::Watch(w.id));
@@ -2059,6 +2269,7 @@ fn h264_admitted(p: &mut Publisher, packet: Forward, waiting: bool, now: Instant
         p.ingress.counters.dropped += result.discarded as u64;
     }
     if !result.packets.is_empty() {
+        p.keyframes.received += 1;
         p.ingress.confirmed_h264();
         if blocked {
             for packet in &result.packets {
@@ -2270,6 +2481,9 @@ fn watcher(
         decode_watchdog: browser,
         pending: Vec::new(),
         connected: false,
+        created: now,
+        keyframe_at: None,
+        keyframes_started: None,
         focus: None,
         egress: Egress::new(now),
         dropped_lanes: Vec::new(),
@@ -2621,6 +2835,7 @@ pub(crate) mod tests {
             outbox: VecDeque::new(),
             budgets: HashMap::new(),
             decode_reports: HashMap::new(),
+            rates: HashMap::new(),
             publishers: HashMap::new(),
             watchers: HashMap::new(),
             next_id: 1,
@@ -2628,6 +2843,11 @@ pub(crate) mod tests {
             measured: Measured::new(now),
             watches: 4,
             next_allocation: now,
+            timers: Timers::default(),
+            drives: 0,
+            wakes: 0,
+            datagram_wakes: 0,
+            timer_wakes: 0,
         };
         // Every member is newer than every guest. Priority is by active assignment,
         // not transport age, and an already paused guest must not be selected again.
@@ -2693,6 +2913,7 @@ pub(crate) mod tests {
             outbox: VecDeque::new(),
             budgets: HashMap::new(),
             decode_reports: HashMap::new(),
+            rates: HashMap::new(),
             publishers: HashMap::new(),
             watchers: HashMap::from([(pair.w.session, pair.w)]),
             next_id: 1,
@@ -2700,6 +2921,11 @@ pub(crate) mod tests {
             measured: Measured::new(now),
             watches: 1,
             next_allocation: now,
+            timers: Timers::default(),
+            drives: 0,
+            wakes: 0,
+            datagram_wakes: 0,
+            timer_wakes: 0,
         };
         sfu.publishers.insert(
             "share".into(),
@@ -2753,7 +2979,8 @@ pub(crate) mod tests {
         assert!(enqueue(w, 0, &origin, &higher, now));
         assert!(w.dropped_lanes.contains(&1));
         sfu.flush_watcher(7);
-        assert!(sfu.watchers[&7].slots[1].asked.is_some());
+        assert!(sfu.watchers[&7].slots[1].segment.waiting());
+        assert!(sfu.watchers[&7].slots[1].asked.is_none(), "another slot's request defers this recovery");
 
         // An estimate can still fall after originals have entered str0m. The socket rejection
         // must fail their keyframe, wipe the stream and use the same budgeted recovery path.
@@ -2804,7 +3031,12 @@ pub(crate) mod tests {
         assert_eq!(w.egress.counters.failed_keyframes, failures + 1);
         assert!(w.slots[0].segment.waiting());
         assert!(w.slots[0].originals.is_empty());
-        assert!(w.slots[0].asked.is_some());
+        assert!(w.slots[0].asked.is_none(), "socket recovery is deferred while the viewer's request spacing holds");
+        // Recovery deferred by the per-viewer spacing must still be requested
+        // by the tick, without another publisher packet or viewer datagram.
+        tokio::time::sleep_until((now + WAITING_RETRY + KEYFRAME_INTERVAL).into()).await;
+        sfu.housekeeping(Instant::now());
+        assert!(sfu.watchers[&7].slots[0].asked.is_some());
         assert!(sfu.publishers["share"].keyframes.pending);
         assert!(sfu.budgets.contains_key(&7));
     }
@@ -3047,6 +3279,7 @@ pub(crate) mod tests {
             outbox: VecDeque::new(),
             budgets: HashMap::new(),
             decode_reports: HashMap::new(),
+            rates: HashMap::new(),
             publishers: HashMap::from([("h264".into(), publisher)]),
             watchers,
             next_id: 1,
@@ -3054,8 +3287,162 @@ pub(crate) mod tests {
             measured: Measured::new(now),
             watches: viewers.len() as u64,
             next_allocation: now,
+            timers: Timers::default(),
+            drives: 0,
+            wakes: 0,
+            datagram_wakes: 0,
+            timer_wakes: 0,
         };
         (sfu, origin, now, need)
+    }
+
+    #[tokio::test]
+    async fn coalesced_keyframe_requests_spend_one_credit_and_new_requests_stay_bounded() {
+        let (mut sfu, _, _, _) = recovery_fixture(&[1, 2]).await;
+        let now = Instant::now();
+        for _ in 0..100 {
+            sfu.ask_keyframe(1, 0, now);
+        }
+        assert_eq!(sfu.budgets.get_mut(&1).unwrap().available(now), VIEWER_KEYFRAMES_BURST - 1.0);
+        assert!(sfu.publishers["h264"].keyframes.pending);
+        assert_eq!(sfu.publishers["h264"].keyframes.sent, 0);
+        sfu.ask_keyframe(2, 0, now);
+        assert!(!sfu.budgets.contains_key(&2), "another viewer joins the same pending PLI without being charged");
+        // Nine further distinct publisher requests use the remaining credit.
+        let mut at = now;
+        for _ in 1..10 {
+            at += KEYFRAME_INTERVAL;
+            sfu.publishers.get_mut("h264").unwrap().keyframes.pending = false;
+            sfu.ask_keyframe(1, 0, at);
+            assert!(sfu.publishers["h264"].keyframes.pending);
+        }
+        at += KEYFRAME_INTERVAL;
+        sfu.publishers.get_mut("h264").unwrap().keyframes.pending = false;
+        sfu.ask_keyframe(1, 0, at);
+        assert!(!sfu.publishers["h264"].keyframes.pending);
+        assert_eq!(sfu.publishers["h264"].keyframes.budget_denied, 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_requests_for_a_viewers_slots_are_spaced_and_deferred_without_spending_credit() {
+        let (mut sfu, _, _, _) = recovery_fixture(&[1]).await;
+        let now = Instant::now();
+        let mut other = h264_ingress_fixture(now);
+        other.origin = ScreenOrigin::new(99, "other".into(), 1, false, false, 8_000_000);
+        let origin = other.origin.clone();
+        sfu.publishers.insert("other".into(), other);
+        assign(sfu.watchers.get_mut(&1).unwrap(), 1, WatchGrant::new(origin), 2, now);
+        sfu.ask_keyframe(1, 0, now);
+        sfu.ask_keyframe(1, 1, now);
+        assert!(sfu.publishers["h264"].keyframes.pending);
+        assert!(!sfu.publishers["other"].keyframes.pending);
+        assert!(sfu.watchers[&1].slots[1].asked.is_none(), "deferred work remains eligible for the tick");
+        assert_eq!(sfu.budgets.get_mut(&1).unwrap().available(now), 9.0);
+        sfu.housekeeping(now + KEYFRAME_INTERVAL);
+        assert!(sfu.publishers["other"].keyframes.pending, "the tick requests a deferred idle source");
+    }
+
+    #[tokio::test]
+    async fn cold_keyframe_retries_preserve_credit_until_the_frame_fits_and_the_deferral_is_bounded() {
+        let (mut sfu, _, _, _) = recovery_fixture(&[1]).await;
+        let now = Instant::now();
+        sfu.rates.insert("h264".into(), ShareRate { largest_keyframe: 200 * 1024, ..Default::default() });
+        sfu.ask_keyframe(1, 0, now); // One seed is always allowed, even before probes have media.
+        sfu.publishers.get_mut("h264").unwrap().keyframes.pending = false;
+        let at = now + KEYFRAME_INTERVAL;
+        sfu.ask_keyframe(1, 0, at);
+        assert!(!sfu.publishers["h264"].keyframes.pending);
+        assert!(sfu.budgets.get_mut(&1).unwrap().available(at) >= 9.0);
+        sfu.watchers.get_mut(&1).unwrap().egress.set_estimate(10_000_000, at);
+        sfu.ask_keyframe(1, 0, at);
+        assert!(sfu.publishers["h264"].keyframes.pending, "headroom permits the next retry");
+        sfu.publishers.get_mut("h264").unwrap().keyframes.pending = false;
+        let at = now + KEYFRAME_BOOTSTRAP;
+        sfu.watchers.get_mut(&1).unwrap().egress.set_estimate(100_000, at);
+        sfu.ask_keyframe(1, 0, at);
+        assert!(sfu.publishers["h264"].keyframes.pending, "an under-estimate cannot defer recovery forever");
+    }
+
+    #[tokio::test]
+    async fn pending_keyframe_on_unconnected_publisher_never_arms_a_past_deadline() {
+        let (mut sfu, _, _, _) = recovery_fixture(&[]).await;
+        let now = Instant::now();
+        sfu.next_allocation = now + ALLOCATION_TICK;
+        let p = sfu.publishers.get_mut("h264").unwrap();
+        p.connected = false;
+        p.deadline = now + Duration::from_secs(1);
+        p.keyframes.pending = true;
+        p.keyframes.last = Some(now - Duration::from_secs(2));
+        sfu.schedule_publisher("h264");
+        assert!(sfu.deadline() > now);
+        assert!(sfu.publishers["h264"].keyframes.pending);
+        // Connected without a receive stream is also undeliverable.
+        let p = sfu.publishers.get_mut("h264").unwrap();
+        p.connected = true;
+        p.ssrc = 999_999.into();
+        sfu.schedule_publisher("h264");
+        assert!(sfu.deadline() > now);
+    }
+
+    #[tokio::test]
+    async fn datagram_drains_do_not_scale_with_unrelated_watchers() {
+        for viewers in [1u32, 26] {
+            let sessions: Vec<_> = (1..=viewers).collect();
+            let (mut sfu, _, _, _) = recovery_fixture(&sessions).await;
+            let mut pair = Pair::new();
+            pair.w.id = 1000;
+            pair.w.session = 1;
+            let check = pair.checks.last().expect("STUN check").clone();
+            sfu.watchers.insert(1, pair.w);
+            let now = Instant::now();
+            sfu.next_allocation = now + Duration::from_secs(60);
+            for w in sfu.watchers.values_mut() {
+                w.deadline = now + Duration::from_secs(60);
+            }
+            sfu.publishers.clear();
+            for session in &sessions {
+                sfu.schedule_watcher(*session);
+            }
+            for _ in 0..100 {
+                sfu.datagram(Datagram { at: now, source: addr(5000), contents: check.clone() });
+                sfu.timeouts(now);
+            }
+            assert_eq!(sfu.drives, 100, "one touched transport per datagram with {viewers} watchers");
+            // Reproduce the old unconditional timeout sweep on the same workload.
+            let before = sfu.drives;
+            for _ in 0..100 {
+                sfu.datagram(Datagram { at: now, source: addr(5000), contents: check.clone() });
+                for session in &sessions {
+                    sfu.flush_watcher(*session);
+                }
+            }
+            let old = sfu.drives - before;
+            assert_eq!(old, 100 * u64::from(viewers + 1));
+            eprintln!("datagram drive cost: watchers={viewers}, before={old}/100, after=100/100");
+            assert_eq!(sfu.timers.due.len(), viewers as usize, "indexed wakes stay bounded");
+        }
+    }
+
+    #[tokio::test]
+    async fn never_connected_member_and_guest_watches_expire_but_connected_ones_survive() {
+        let (mut sfu, _, _, _) = recovery_fixture(&[1, 2, 3]).await;
+        let now = Instant::now();
+        sfu.next_allocation = now + Duration::from_secs(60);
+        sfu.publishers.clear();
+        for (session, w) in &mut sfu.watchers {
+            w.created = now - WATCH_CONNECT;
+            w.connected = *session == 3;
+            w.size = if *session == 2 { GUEST_SLOTS } else { SCREEN_SLOTS };
+            w.deadline = now + Duration::from_secs(60);
+        }
+        for session in [1, 2, 3] {
+            sfu.schedule_watcher(session);
+        }
+        sfu.timeouts(now);
+        assert!(!sfu.watchers.contains_key(&1));
+        assert!(!sfu.watchers.contains_key(&2));
+        assert!(sfu.watchers.contains_key(&3));
+        assert_eq!(sfu.timers.due.len(), 1);
     }
 
     fn report(sfu: &mut Sfu, session: SessionId, now: Instant) {
@@ -3278,8 +3665,12 @@ pub(crate) mod tests {
         assert_eq!(live.len(), 1);
         assert!(held.is_empty());
         // Span includes time spent holding parameter sets.
-        let (_, _, verdict) =
-            h264_packet(&mut p, h264_forward(14, 12000, &[0x68, 1], now), true, now + Duration::from_millis(501));
+        let (_, _, verdict) = h264_packet(
+            &mut p,
+            h264_forward(14, 12000, &[0x68, 1], now),
+            true,
+            now + ingress::FRAME_SPAN + Duration::from_millis(1),
+        );
         assert_eq!(verdict, Some(Verdict::Overrun));
     }
 

@@ -41,6 +41,34 @@ fn h264_capabilities<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<H264C
     d.deserialize_seq(Bounded)
 }
 
+/// A TeamSpeak guest's frame on `/ws/watch` (docs/screen-share.md, "TeamSpeak watch links"):
+/// `{"id": 1, "op": "guest.watch", "d": {...}}`. Guests speak nothing else.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "ts", derive(TS), ts(export))]
+pub struct GuestFrame {
+    pub id: u32,
+    #[serde(flatten)]
+    pub request: GuestRequest,
+}
+
+impl<'de> Deserialize<'de> for GuestFrame {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Serde does not support deny_unknown_fields together with flatten.
+        // Validate the envelope separately, then the strict adjacent-tag request.
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Envelope {
+            id: u32,
+            op: String,
+            d: serde_json::Value,
+        }
+        let raw = Envelope::deserialize(deserializer)?;
+        let request =
+            serde_json::from_value(serde_json::json!({"op": raw.op, "d": raw.d})).map_err(serde::de::Error::custom)?;
+        Ok(Self { id: raw.id, request })
+    }
+}
+
 wire! {
     /// Highest successful MediaCapabilities WebRTC decode probe for one H.264 profile.
     #[derive(Eq)]
@@ -171,15 +199,7 @@ wire! {
     #[serde(rename_all = "snake_case")]
     pub enum ScreenStopReason { Stopped, Moderator, Left, Limit, Transport, Budget, Access, Codec }
 
-    /// A TeamSpeak guest's frame on `/ws/watch` (docs/screen-share.md, "TeamSpeak watch links"):
-    /// `{"id": 1, "op": "guest.watch", "d": {...}}`. Guests speak nothing else.
-    pub struct GuestFrame {
-        pub id: u32,
-        #[serde(flatten)]
-        pub request: GuestRequest,
-    }
-
-    #[serde(tag = "op", content = "d")]
+    #[serde(tag = "op", content = "d", deny_unknown_fields)]
     pub enum GuestRequest {
         /// The first frame: the watch link's token. Answers [`Response::Watching`], or `not_found`
         /// alike for an unknown, ended or revoked token.
@@ -334,6 +354,30 @@ mod tests {
             serde_json::to_value(ServerFrame::Event(stopped)).unwrap(),
             json!({"ev": "screen.stopped", "d": {"share": "s", "reason": "access"}})
         );
+    }
+
+    #[test]
+    fn guest_frames_and_requests_reject_extra_fields() {
+        for (op, d) in [
+            ("guest.watch", json!({"token":"t"})),
+            ("guest.offer", json!({"sdp":"offer"})),
+            ("screen.keyframe", json!({"share":"s"})),
+            ("screen.decode_failed", json!({"share":"s","slot":0,"run":1,"generation":0})),
+            ("ping", json!({})),
+        ] {
+            let good = json!({"id":1,"op":op,"d":d});
+            let parsed: GuestFrame = serde_json::from_value(good.clone()).unwrap();
+            assert_eq!(serde_json::to_value(parsed).unwrap(), good);
+            let mut outer = good.clone();
+            outer["extra"] = json!(true);
+            assert!(serde_json::from_value::<GuestFrame>(outer).is_err());
+            let mut inner = good;
+            inner["d"]["extra"] = json!(true);
+            assert!(serde_json::from_value::<GuestFrame>(inner.clone()).is_err());
+            inner.as_object_mut().unwrap().remove("id");
+            assert!(serde_json::from_value::<GuestRequest>(inner).is_err());
+        }
+        assert!(serde_json::from_str::<GuestFrame>(r#"{"id":1,"op":"ping","op":"ping","d":{}}"#).is_err());
     }
 
     #[test]

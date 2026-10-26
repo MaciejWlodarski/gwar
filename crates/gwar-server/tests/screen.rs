@@ -188,7 +188,7 @@ async fn an_overrun_cuts_the_rest_until_a_keyframe_and_three_end_the_share() {
         assert_eq!(viewer.next().await, (slot, frame(0, 0, true, 3, 1)[i].clone()));
     }
 
-    // A frame that never ends: its continuation 600 ms later breaks the 500 ms bound.
+    // A frame that never ends: its continuation 2.1 s later breaks the 2 s bound.
     let overrun = |sequence: &mut u64, timestamp: &mut u32| {
         let start = frame(*sequence, *timestamp, false, 2, 40);
         let late = Packet {
@@ -205,7 +205,7 @@ async fn an_overrun_cuts_the_rest_until_a_keyframe_and_three_end_the_share() {
     let (start, late) = overrun(&mut sequence, &mut timestamp);
     publisher.send(start).await;
     assert_eq!(tags(&[viewer.next().await, viewer.next().await], slot), [(40, 0), (40, 1)], "the prefix stays");
-    tokio::time::sleep(Duration::from_millis(600)).await;
+    tokio::time::sleep(Duration::from_millis(2100)).await;
     publisher.send([late]).await;
     // Deltas after the cut drop too, until the next keyframe.
     let (next_sequence, next_timestamp) = stream(publisher, sequence, timestamp, 50, 2, 2, false).await;
@@ -228,7 +228,7 @@ async fn an_overrun_cuts_the_rest_until_a_keyframe_and_three_end_the_share() {
         let viewer = bob.viewer.as_mut().unwrap();
         let got = [viewer.next().await, viewer.next().await, viewer.next().await];
         assert_eq!(tags(&got, slot), [(70, 0), (40, 0), (40, 1)]);
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        tokio::time::sleep(Duration::from_millis(2100)).await;
         publisher.send([late]).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -253,13 +253,22 @@ async fn keyframe_requests_are_throttled_per_share_and_per_viewer() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     let flood = alice.publisher(&share).keyframe_requests() - before;
     assert!((1..=3).contains(&flood), "{flood} requests");
-    // The viewer's budget (10 a minute, the watch used one) is spent: later requests do nothing.
+    // Coalesced duplicates did not exhaust the viewer's credits: distinct later
+    // requests still work, while at most ten new pending PLIs a minute are funded.
     let spent = alice.publisher(&share).keyframe_requests();
     for _ in 0..3 {
         bob.ok("screen.keyframe", json!({"share": share})).await;
         tokio::time::sleep(Duration::from_millis(600)).await;
     }
-    assert!(alice.publisher(&share).keyframe_requests() - spent <= 2);
+    assert!((1..=4).contains(&(alice.publisher(&share).keyframe_requests() - spent)));
+    for _ in 0..12 {
+        bob.ok("screen.keyframe", json!({"share": share})).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    // Includes the initial flood and the continuously refilling credit: no more
+    // than the ten-credit burst plus two refills over this interval reached RTP.
+    assert!(alice.publisher(&share).keyframe_requests() - before <= 12);
     // A new watch transport does not bring a new budget: watching again and asking again
     // reach the sharer at most once (what refilled meanwhile).
     let spent = alice.publisher(&share).keyframe_requests();

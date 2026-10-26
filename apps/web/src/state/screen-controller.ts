@@ -416,7 +416,7 @@ export class ScreenController {
   }
 
   /** The session's watch transport, negotiated on the first watch and kept; resolves to its run once connected. */
-  private ensureTransport(conn: Link): Promise<number> {
+  private ensureTransport(conn: Link, retries = 2): Promise<number> {
     const phase = useScreen.getState().transport.phase;
     if (this.transport && this.transportReady && (phase === "connecting" || phase === "connected")) return this.transportReady;
     this.dropTransport();
@@ -460,7 +460,22 @@ export class ScreenController {
     this.transportReady = ready;
     this.retireReady = () => settle.reject(new Error("the watch transport was replaced"));
     dispatch({ type: "transport", run, phase: "connecting" });
-    transport.start().catch((e: unknown) => { if (this.transport === transport) fail(e); });
+    transport.start().catch(async (e: unknown) => {
+      if (this.transport !== transport) return;
+      if (e instanceof RequestError && e.code === "rate_limited" && retries > 0) {
+        // Retire the PC and its connect timer while the per-kind offer bucket refills.
+        // Keep the pending watches and their shared promise until the new run connects.
+        transport.close();
+        await sleep(15_250);
+        if (this.transport !== transport || this.link() !== conn) return;
+        this.retireReady = null;
+        this.transport = null;
+        this.transportReady = null;
+        this.ensureTransport(conn, retries - 1).then(settle.resolve, settle.reject);
+        return;
+      }
+      fail(e);
+    });
     return ready;
   }
 
