@@ -128,8 +128,8 @@ it("moves both attached players with their static frames when the real Stage swi
   expect(useScreen.getState().watches).toEqual(watches);
   // No extra frame or keyframe request is needed for an already displayed static share.
   await advance(70_000);
-  expect(video("A").classList.contains("opacity-0")).toBe(false);
-  expect(video("B").classList.contains("opacity-0")).toBe(false);
+  expect(video("A").closest<HTMLElement>("[data-screen-video]")?.dataset.ready).toBe("true");
+  expect(video("B").closest<HTMLElement>("[data-screen-video]")?.dataset.ready).toBe("true");
   expect(useScreen.getState().watches).toEqual(watches);
   expect(request.mock.calls.filter(([op]) => op === "screen.keyframe")).toHaveLength(0);
 });

@@ -145,7 +145,8 @@ const diagnostics = page => page.evaluate(async () => ({
   capture: window.__pcs.flatMap(pc => pc.getSenders().filter(s => s.track?.kind === "video").map(s => ({ settings: s.track.getSettings(), parameters: s.getParameters() }))),
   videos: [...document.querySelectorAll("video[data-share]")].map(v => {
     const track = v.srcObject?.getVideoTracks?.()[0];
-    return { share: v.dataset.share, readyState: v.readyState, size: `${v.videoWidth}x${v.videoHeight}`, paused: v.paused, track: track && `${track.readyState}${track.muted ? " muted" : ""}` };
+    return { share: v.dataset.share, readyState: v.readyState, size: `${v.videoWidth}x${v.videoHeight}`, paused: v.paused, track: track && `${track.readyState}${track.muted ? " muted" : ""}`,
+      box: `${v.clientWidth}x${v.clientHeight}`, opacity: getComputedStyle(v).opacity, covered: v.closest("[data-screen-video]")?.dataset.ready !== "true", visibility: document.visibilityState };
   }),
 }));
 
@@ -265,7 +266,7 @@ function fromSource(id, width, height, what) {
 
 const revealed = (page, share) => waitFor(() => page.evaluate(share => {
   const video = document.querySelector(`video[data-share="${share}"]`);
-  return video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0 && getComputedStyle(video).opacity === "1";
+  return video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0 && video.closest("[data-screen-video]")?.dataset.ready === "true" && getComputedStyle(video).opacity === "1";
 }, share), "the new watch reveals its decoded frame");
 
 /** Waits until `page` decodes `share` with the source's barcode, twice with different counters. */
@@ -467,7 +468,7 @@ async function run(browsers, web, server, token) {
     const observation = window.__otherWatch = { video, stream: video.srcObject, visible: true, counters: [] };
     const sample = () => {
       const current = document.querySelector(`video[data-share="${share}"]`);
-      observation.visible &&= current === video && current.srcObject === observation.stream && getComputedStyle(current).opacity === "1";
+      observation.visible &&= current === video && current.srcObject === observation.stream && current.closest("[data-screen-video]")?.dataset.ready === "true" && getComputedStyle(current).opacity === "1";
       const frame = window.__readBarcode(current);
       if (frame && !frame.invalid) observation.counters.push(frame.counter);
       observation.sampler = requestAnimationFrame(sample);
@@ -479,7 +480,7 @@ async function run(browsers, web, server, token) {
     window.__reuseFrames = [];
     const sample = () => {
       const video = document.querySelector(`video[data-share="${share}"]`);
-      if (video && getComputedStyle(video).opacity === "1") {
+      if (video && video.closest("[data-screen-video]")?.dataset.ready === "true" && getComputedStyle(video).opacity === "1") {
         const frame = window.__readBarcode(video);
         if (frame && !frame.invalid) window.__reuseFrames.push(frame.id);
       }
@@ -494,7 +495,7 @@ async function run(browsers, web, server, token) {
   assert.equal(await session(cv, (_, screen) => screen.transport.run), oldViewerRun, "another active watch prevents renewal");
   assert.ok(await cv.evaluate(share => {
     const video = document.querySelector(`video[data-share="${share}"]`);
-    return video === window.__otherWatch.video && video.srcObject === window.__otherWatch.stream && getComputedStyle(video).opacity === "1";
+    return video === window.__otherWatch.video && video.srcObject === window.__otherWatch.stream && video.closest("[data-screen-video]")?.dataset.ready === "true" && getComputedStyle(video).opacity === "1";
   }, wsShare), "the other active watch keeps its video element, stream and visibility");
   checks.push({ check: "slot reuse leaves other active watches uninterrupted", ok: true });
   await sees(ws, second, 6, "sole watch after slot reuse");

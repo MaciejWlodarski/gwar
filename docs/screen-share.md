@@ -2719,7 +2719,10 @@ from native capture is PR 10.
   - Linux WebKit can leave a replacement media player at 0×0 even while the
     receiver decodes fresh keyframes. Preserving the attached player avoids this
     and keeps a static share visible through view/StrictMode remounts without
-    requesting another frame. A first-use or renewed slot reveals its first
+    requesting another frame. While waiting, the video keeps an opaque, full-size
+    rendering surface beneath a black loading cover; making the player itself
+    transparent can stall Linux WebKit's first frame/metadata. The cover prevents
+    cached pixels from appearing before readiness. A first-use or renewed slot reveals its first
     decoded frame, including a static share's single startup keyframe. Watch
     assignment already requests a budgeted, retried PLI. A newly attached player
     also requests a keyframe, retrying once per second within the server's budget

@@ -284,14 +284,15 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef }: { shar
     }
     const { video } = player;
     video.dataset.share = share;
-    video.className = "size-full object-contain opacity-0";
+    // Keep the player renderable while waiting: hiding it with opacity can stall
+    // Linux WebKit's first frame/metadata. The opaque cover below hides its pixels.
+    video.className = "absolute inset-0 size-full object-contain";
     let retry: ReturnType<typeof setInterval> | undefined;
     const received = () => {
       if (!stream) return;
       clearInterval(retry);
       retry = undefined;
       player.received = true;
-      video.classList.remove("opacity-0");
       setShown(stream);
       if (watchId !== undefined) controller.screen.frameReceived(share, run, watchId);
     };
@@ -323,10 +324,10 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef }: { shar
     };
   }, [stream, share, run, watchId, onDoubleClick, videoRef]);
   return (
-    <div className={cn("relative flex min-h-0 items-center justify-center overflow-hidden bg-black", className)}>
+    <div data-screen-video data-ready={showing} className={cn("relative flex min-h-0 items-center justify-center overflow-hidden bg-black", className)}>
       <div ref={host} className="contents" />
       {!showing && (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-white/70">{t("screen.connecting")}</div>
+        <div data-screen-placeholder className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-black text-sm text-white/70">{t("screen.connecting")}</div>
       )}
     </div>
   );

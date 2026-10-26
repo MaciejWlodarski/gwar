@@ -137,7 +137,7 @@ describe("watched video frames", () => {
     });
     return container.querySelector("video")!;
   }
-  const visible = (video: HTMLVideoElement) => !video.classList.contains("opacity-0");
+  const visible = (video: HTMLVideoElement) => video.closest<HTMLElement>("[data-screen-video]")?.dataset.ready === "true";
 
   it("keeps the attached media player and a static frame through a view remount", async () => {
     const stream = new MediaStream();
@@ -198,8 +198,12 @@ describe("watched video frames", () => {
     const video = await grant(1, 1, stream);
     expect(video.srcObject).toBe(stream);
     expect(visible(video)).toBe(false);
+    expect(video.classList.contains("opacity-0")).toBe(false);
+    expect(video.classList.contains("absolute")).toBe(true);
+    expect(container.querySelector("[data-screen-placeholder]")?.classList.contains("bg-black")).toBe(true);
     await act(async () => video.dispatchEvent(new Event("loadeddata")));
     expect(visible(video)).toBe(true);
+    expect(container.querySelector("[data-screen-placeholder]")).toBeNull();
     expect(container.textContent).not.toContain("Connecting");
   });
 
