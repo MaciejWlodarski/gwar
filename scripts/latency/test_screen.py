@@ -175,7 +175,7 @@ class ScreenMeasurements(unittest.TestCase):
 
 class ScreenGateRuns(unittest.TestCase):
     def run_gate(self, out, scenarios, *, null=False, regress=False, unexpected_load=False,
-                 missing_load=False, load_failure=False):
+                 missing_load=False, load_failure=False, legacy=False):
         calls = []
 
         def client(binary, path, markers, env):
@@ -211,6 +211,10 @@ class ScreenGateRuns(unittest.TestCase):
                                      "slots": [{"concealments": 0, "late_drops": 0}]},
                 "screen": load,
             }
+            if not legacy:
+                meta["receiver_device"] = {"late_over_5ms": 0, "max_busy_ms": 0.05}
+                meta["receiver_record"] = {"capacity_samples": 3_744_000, "recorded_samples": 2_100_000,
+                                           "overflow_samples": 0}
             with path.open("x", newline="") as file:
                 writer = csv.writer(file)
                 writer.writerow(["marker", "identity", "latency_ms", "capture_s", "playout_s", "playout_sample"])
@@ -270,6 +274,23 @@ class ScreenGateRuns(unittest.TestCase):
                     for pair in values["pairs"]:
                         self.assertIsNone(pair["baseline"]["screen"])
                         self.assertEqual(pair["screen"]["load_check"] is not None, set_name == "screen")
+
+    def test_runs_without_device_diagnostics_still_gate_and_report_them_unavailable(self):
+        # Metadata from binaries before receiver_device/receiver_record (archived runs included).
+        for legacy in (True, False):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory(prefix="gwar-gate-test-") as tmp:
+                out = Path(tmp) / "out"
+                self.run_gate(out, ["unconstrained"], legacy=legacy)
+                summary = json.loads((out / "summary.json").read_text())
+                self.assertTrue(summary["pass"])
+                pair = summary["scenarios"]["unconstrained"]["sets"]["aa"]["pairs"][0]["baseline"]
+                if legacy:
+                    self.assertEqual(pair["device_timing"], "unavailable")
+                    self.assertIsNone(pair["device_late_over_5ms"])
+                    self.assertIsNone(pair["record_overflow_samples"])
+                else:
+                    self.assertEqual(pair["device_timing"], "available")
+                    self.assertEqual((pair["device_late_over_5ms"], pair["record_overflow_samples"]), (0, 0))
 
     def test_null_runs_two_interleaved_aa_sets_without_load(self):
         with tempfile.TemporaryDirectory(prefix="gwar-gate-test-") as tmp:
