@@ -46,7 +46,7 @@ export interface ServerGroup {
   /** Folded into one tile; its servers open from a menu beside it. */
   collapsed: boolean;
   servers: string[];
-  /** The Gwar Connect account whose servers it groups, like {@link Bookmark.account}: another account's stay hidden. */
+  /** The Gwar Connect account it was made in: while it has no servers, another account's stays hidden (see `shownGroups`). */
   account?: string;
 }
 
@@ -109,11 +109,25 @@ export function useBookmarks(): Bookmark[] {
   return useMemo(() => bookmarks.filter((b) => inAccount(b, account)), [bookmarks, account]);
 }
 
-/** The server groups shown now: like {@link useBookmarks}, another account's stay hidden. */
+/**
+ * The server groups shown now. A group follows its servers: shown while one of them is (whichever account
+ * they sync with by then), hidden while all of them are another account's. An empty one belongs to the
+ * account it was made in, like {@link useBookmarks}.
+ */
+export function shownGroups(groups: ServerGroup[], bookmarks: Bookmark[], account: string | null): ServerGroup[] {
+  const shown = new Set(bookmarks.filter((b) => inAccount(b, account)).map((b) => b.id));
+  const saved = new Set(bookmarks.map((b) => b.id));
+  return groups.filter((g) => {
+    const members = g.servers.filter((id) => saved.has(id));
+    return members.length ? members.some((id) => shown.has(id)) : inAccount(g, account);
+  });
+}
+
 export function useServerGroups(): ServerGroup[] {
   const groups = useSettings((s) => s.serverGroups);
+  const bookmarks = useSettings((s) => s.bookmarks);
   const account = useSettings((s) => s.bookmarkAccount);
-  return useMemo(() => groups.filter((g) => inAccount(g, account)), [groups, account]);
+  return useMemo(() => shownGroups(groups, bookmarks, account), [groups, bookmarks, account]);
 }
 
 /**
@@ -426,12 +440,7 @@ export const useSettings = create<SettingsState>()(
             bookmarkEdits: s.bookmarkEdits + (deduped.changed ? 1 : 0),
           };
         }),
-      // Groups made while signed out belong to the next account, like the bookmarks in them.
-      setBookmarkAccount: (bookmarkAccount) =>
-        set((s) => ({
-          bookmarkAccount,
-          serverGroups: bookmarkAccount ? s.serverGroups.map((g) => (g.account === undefined ? { ...g, account: bookmarkAccount } : g)) : s.serverGroups,
-        })),
+      setBookmarkAccount: (bookmarkAccount) => set({ bookmarkAccount }),
       dropAccountBookmarks: (account) =>
         set((s) => ({
           bookmarks: s.bookmarks.filter((b) => b.account !== account || !syncable(b)),

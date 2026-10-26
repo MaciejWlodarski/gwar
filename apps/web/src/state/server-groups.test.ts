@@ -1,5 +1,5 @@
 import { beforeEach, expect, it } from "vitest";
-import { mergeGroupMembers, useSettings, validGroups } from "./settings";
+import { mergeGroupMembers, shownGroups, useSettings, validGroups } from "./settings";
 
 beforeEach(() => useSettings.setState({ serverGroups: [], bookmarks: [], bookmarkAccount: null }));
 
@@ -41,20 +41,20 @@ it("reads stored groups defensively", () => {
   ]);
 });
 
-it("keeps a group with the account it was made in", () => {
-  const s = () => useSettings.getState();
-  s().setBookmarkAccount("A");
-  const a = s().addServerGroup("A's", "#fff", []);
-  expect(s().serverGroups.find((g) => g.id === a)?.account).toBe("A");
-  // Made while signed out: the next account takes it, like the bookmarks in it.
-  s().setBookmarkAccount(null);
-  const loose = s().addServerGroup("Loose", "#fff", []);
-  expect(s().serverGroups.find((g) => g.id === loose)?.account).toBeUndefined();
-  s().setBookmarkAccount("B");
-  expect(s().serverGroups.map((g) => g.account)).toEqual(["A", "B"]);
-  // Another account's group survives a round trip through storage.
-  expect(validGroups(JSON.parse(JSON.stringify(s().serverGroups))).map((g) => g.account)).toEqual(["A", "B"]);
-  s().setBookmarkAccount(null);
+it("shows a group while one of its servers is shown, an empty one in the account it was made in", () => {
+  const bm = (id: string, account?: string) => ({ id, name: id, address: `${id}.example`, kind: "gwar" as const, updatedAt: 1, ...(account ? { account } : {}) });
+  const g = (id: string, servers: string[], account?: string) => ({ id, name: id, color: "#fff", collapsed: false, servers, ...(account ? { account } : {}) });
+  const groups = [g("loose", ["l"], "A"), g("a", ["a"]), g("emptyA", [], "A"), g("empty", []), g("stale", ["gone"], "A")];
+  const bookmarks = [bm("l"), bm("a", "A")];
+  // Signed out: the server saved without an account shows its group, whoever made it; A's stay hidden.
+  expect(shownGroups(groups, bookmarks, null).map((x) => x.id)).toEqual(["loose", "empty"]);
+  expect(shownGroups(groups, bookmarks, "A").map((x) => x.id)).toEqual(["loose", "a", "emptyA", "empty", "stale"]);
+  // The loose server synced into B's list: its group follows it there.
+  expect(shownGroups(groups, [bm("l", "B"), bm("a", "A")], "B").map((x) => x.id)).toEqual(["loose", "empty"]);
+  // A new group is made in the signed-in account.
+  useSettings.setState({ bookmarkAccount: "A" });
+  const made = useSettings.getState().addServerGroup("New", "#fff", []);
+  expect(useSettings.getState().serverGroups.find((x) => x.id === made)?.account).toBe("A");
 });
 
 it("moves group membership to the bookmark that survives deduplication", () => {
