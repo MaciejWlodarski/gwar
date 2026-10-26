@@ -17,7 +17,7 @@ interface PublisherOptions {
 }
 
 const media = vi.hoisted(() => ({
-  transports: [] as Array<{ params: { run: number; state(s: string): void; offer(sdp: string, run: number): Promise<string> }; close: () => void }>,
+  transports: [] as Array<{ params: { run: number; state(s: string): void; offer(sdp: string, run: number): Promise<string> }; close: () => void; stats: ReturnType<typeof vi.fn> }>,
   publishers: [] as Array<{ params: PublisherOptions; close: () => void; setSpec: (spec: ScreenSpec, automaticMode: boolean) => Promise<void> }>,
 }));
 vi.mock("../voice/screen", async importOriginal => {
@@ -29,7 +29,7 @@ vi.mock("../voice/screen", async importOriginal => {
     keyframe = vi.fn();
     constructor(readonly params: { run: number; state(s: string): void; offer(sdp: string, run: number): Promise<string> }) { this.run = params.run; media.transports.push(this); }
     async start() { await this.params.offer("watch-offer", this.run); }
-    async stats() { return null; }
+    stats = vi.fn(async (_slot: number) => ({ width: 640, height: 360, fps: 0, framesDecoded: 10 }));
   }
   class ScreenPublisher {
     close = vi.fn();
@@ -89,6 +89,25 @@ beforeEach(() => {
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe("watching", () => {
+  it("saves the decoder baseline before a grant can deliver its only static frame", async () => {
+    const answer = deferred<{ slot: number }>();
+    const { link, calls } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => answer.promise });
+    const screen = new ScreenController(() => link, String);
+    const watching = screen.watch("A");
+    await flush();
+    const transport = media.transports[0]!;
+    transport.params.state("connected");
+    await flush();
+    expect(calls.some(([op]) => op === "screen.watch")).toBe(true);
+    expect(transport.stats).toHaveBeenCalledTimes(4);
+    // The new share decodes before signalling returns and never changes again.
+    transport.stats.mockResolvedValue({ width: 640, height: 360, fps: 0, framesDecoded: 11 });
+    answer.resolve({ slot: 0 });
+    await watching;
+    expect(useScreen.getState().watches[0]?.video).toEqual({ baseline: 10, ready: false });
+    screen.reset();
+  });
+
   it("watches without joining voice: one watch transport, then the slot, then focus", async () => {
     let unavailable = 2;
     const { link, ops, calls } = fakeLink({
@@ -105,7 +124,7 @@ describe("watching", () => {
     await watching;
     expect(ops()).toEqual(["screen.watch.offer", "screen.watch", "screen.watch", "screen.watch", "screen.focus"]);
     expect(calls[0]![1]).toMatchObject({ run: transport.params.run, sdp: "watch-offer" });
-    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 1, status: "watching" }]);
+    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 1, status: "watching", video: { baseline: 10, ready: false } }]);
     // A second watch reuses the transport.
     useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "screen.started", d: share("B", 2, 2) } });
     await screen.watch("B").catch(() => {});
@@ -162,7 +181,7 @@ describe("watch requests (review round 1)", () => {
     const asksForA = calls.filter(([op, d]) => op === "screen.watch" && d.share === "A").length;
     await vi.advanceTimersByTimeAsync(6_000);
     expect(calls.filter(([op, d]) => op === "screen.watch" && d.share === "A").length).toBe(asksForA);
-    expect(useScreen.getState().watches).toEqual([{ share: "B", id: expect.any(Number), slot: 0, status: "watching" }]);
+    expect(useScreen.getState().watches).toEqual([{ share: "B", id: expect.any(Number), slot: 0, status: "watching", video: { baseline: 10, ready: false } }]);
     expect(toast.mock.calls).toEqual([["error", "The connection for watching screen shares was lost."]]);
   });
 
@@ -203,7 +222,7 @@ describe("watch requests (review round 1)", () => {
     screen.handleEvent({ ev: "screen.slot", d: { run, slot: 1, share: "A" } });
     answers[1]!.resolve({ slot: 1 });
     await Promise.all([first, stopping, second]);
-    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 1, status: "watching" }]);
+    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 1, status: "watching", video: { baseline: 10, ready: false } }]);
     // The second request goes out only after the first watch's release.
     expect(ops().slice(1)).toEqual(["screen.watch", "screen.unwatch", "screen.unwatch", "screen.watch", "screen.focus"]);
   });
@@ -295,7 +314,7 @@ describe("watch requests across a reset (review round 2)", () => {
     await vi.advanceTimersByTimeAsync(100);
     await again;
     expect(calls.map(([op]) => op)).toEqual(["screen.watch.offer", "screen.watch.offer", "screen.watch", "screen.focus"]);
-    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 0, status: "watching" }]);
+    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 0, status: "watching", video: { baseline: 10, ready: false } }]);
   });
 
   it("requests of the old session send nothing on the new one, and do not hold it up", async () => {
@@ -319,7 +338,7 @@ describe("watch requests across a reset (review round 2)", () => {
     expect(old.ops().filter(op => op === "screen.watch").length).toBeLessThanOrEqual(1);
     expect(old.ops()).not.toContain("screen.unwatch");
     expect(fresh.ops()).toEqual(["screen.watch.offer", "screen.watch", "screen.focus"]);
-    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 2, status: "watching" }]);
+    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 2, status: "watching", video: { baseline: 10, ready: false } }]);
   });
 });
 

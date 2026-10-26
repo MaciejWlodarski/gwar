@@ -333,10 +333,15 @@ export class ScreenController {
         const run = await this.ensureTransport(conn);
         const current = () => alive() && useScreen.getState().transport.run === run;
         if (!current()) return;
+        // Snapshot before asking for media: the first frame may decode before
+        // the grant's reply, or before any ShareVideo mounts. Snapshot every
+        // receiver because the server chooses the slot in its answer.
+        const baselines = await Promise.all(Array.from({ length: SCREEN_SLOTS }, (_, slot) => this.transport!.stats(slot)));
+        if (!current()) return;
         const slot = await this.requestWatch(conn, share, current);
         if (slot === null) return;
         if (!current()) { await conn.request("screen.unwatch", { share }).catch(() => {}); return; }
-        dispatch({ type: "granted", run, id, slot });
+        dispatch({ type: "granted", run, id, slot, framesDecoded: baselines[slot]?.framesDecoded ?? null });
         if (useScreen.getState().stage === share) void conn.request("screen.focus", { share }).catch(() => {});
       } catch (e) {
         if (!alive()) return;

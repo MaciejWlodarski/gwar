@@ -81,6 +81,23 @@ describe("watch page endpoint and token", () => {
 });
 
 describe("WatchSession", () => {
+  it("bounds unanswered admission and clears request timers when closed", async () => {
+    const t = setup();
+    t.session.start("ws://127.0.0.1/ws/watch", TOKEN);
+    t.socket().open();
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(t.session.status).toBe("lost");
+    expect(t.socket().closed).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+    const u = setup();
+    u.session.start("ws://127.0.0.1/ws/watch", TOKEN);
+    u.socket().open();
+    expect(vi.getTimerCount()).toBe(1);
+    u.session.close();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it.each([false,true])("gates guest extensions on the server advertisement (%s)", async supported => {
     const t = setup();
     t.session.start("ws://127.0.0.1:1/ws/watch", TOKEN);

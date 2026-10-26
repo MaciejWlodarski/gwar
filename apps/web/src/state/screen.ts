@@ -43,6 +43,8 @@ export interface Watch {
   id: number;
   slot: number | null;
   status: "requesting" | "watching";
+  /** Decoder baseline and readiness belong to this grant, across video remounts. */
+  video?: { baseline: number | null; ready: boolean };
 }
 
 export type TransportPhase = "none" | "connecting" | "connected" | "failed";
@@ -81,7 +83,8 @@ export type ScreenAction =
   | { type: "transport"; run: number; phase: TransportPhase }
   | { type: "stream"; run: number; slot: number; stream: MediaStream }
   | { type: "watch"; share: string; id: number }
-  | { type: "granted"; run: number; id: number; slot: number }
+  | { type: "granted"; run: number; id: number; slot: number; framesDecoded: number | null }
+  | { type: "watchFrame"; run: number; id: number; slot: number; framesDecoded: number; presented: boolean }
   | { type: "slot"; run: number; slot: number; share: string | null }
   | { type: "unwatch"; share: string }
 
@@ -153,7 +156,7 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       if (run < state.transport.run) return state;
       if (run > state.transport.run) {
         // A new run: nothing of the old one's slots carries over; watches wait for new slots.
-        return { ...state, transport: { run, phase }, slots: emptySlots(), streams: emptySlots(), watches: state.watches.map(w => ({ ...w, slot: null, status: "requesting" as const })) };
+        return { ...state, transport: { run, phase }, slots: emptySlots(), streams: emptySlots(), watches: state.watches.map(({ video: _, ...w }) => ({ ...w, slot: null, status: "requesting" as const })) };
       }
       if (phase === "failed") {
         // The server ends every watch of a transport that is gone.
@@ -179,7 +182,18 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       if (!watch) return state;
       const slots = state.slots.slice();
       slots[slot] = watch.share;
-      return { ...state, slots, watches: state.watches.map(w => (w === watch ? { ...w, slot, status: "watching" } : w)) };
+      return { ...state, slots, watches: state.watches.map(w => (w === watch ? { ...w, slot, status: "watching", video: { baseline: action.framesDecoded, ready: false } } : w)) };
+    }
+    case "watchFrame": {
+      if (action.run !== state.transport.run) return state;
+      const watch = state.watches.find(w => w.id === action.id && w.slot === action.slot && w.status === "watching");
+      const video = watch?.video;
+      if (!watch || !video || video.ready || state.slots[action.slot] !== watch.share) return state;
+      // A failed pre-grant stats read is unknown, never an implicit zero.
+      // Establish a conservative baseline from the first successful sample.
+      const next = video.baseline === null ? { baseline: action.framesDecoded, ready: false }
+        : action.presented && action.framesDecoded > video.baseline ? { ...video, ready: true } : null;
+      return next ? { ...state, watches: state.watches.map(w => w === watch ? { ...w, video: next } : w) } : state;
     }
     case "slot": {
       const { run, slot, share } = action;

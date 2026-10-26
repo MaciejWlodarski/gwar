@@ -41,6 +41,20 @@ describe("own share", () => {
 });
 
 describe("watching", () => {
+  it("keeps an unknown decoder baseline conservative and fences readiness by grant and run", () => {
+    let s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "granted", run: 7, id: 1, slot: 0, framesDecoded: null });
+    const sample = { type: "watchFrame" as const, run: 7, id: 1, slot: 0, framesDecoded: 100, presented: true };
+    s = run(s, sample);
+    expect(s.watches[0]?.video).toEqual({ baseline: 100, ready: false });
+    expect(run(s, sample)).toBe(s);
+    expect(run(s, { ...sample, run: 6, framesDecoded: 101 })).toBe(s);
+    expect(run(s, { ...sample, id: 2, framesDecoded: 101 })).toBe(s);
+    expect(run(s, { ...sample, framesDecoded: 101, presented: false })).toBe(s);
+    s = run(s, { ...sample, framesDecoded: 101 });
+    expect(s.watches[0]?.video?.ready).toBe(true);
+    expect(run(s, { type: "transport", run: 8, phase: "connecting" }).watches[0]?.video).toBeUndefined();
+  });
+
   it("watches on the stage once its own request is answered", () => {
     let s = run(connected(), { type: "watch", share: "A", id: 1 });
     expect(s.stage).toBe("A");
@@ -49,21 +63,21 @@ describe("watching", () => {
     // The server's slot event comes first; only the answer makes it a watch.
     s = run(s, { type: "slot", run: 7, slot: 2, share: "A" });
     expect(slotOf(s, "A")).toBeNull();
-    s = run(s, { type: "granted", run: 7, id: 1, slot: 2 });
+    s = run(s, { type: "granted", run: 7, id: 1, slot: 2, framesDecoded: 0 });
     expect(slotOf(s, "A")).toBe(2);
     expect(s.slots).toEqual([null, null, "A", null]);
   });
 
   it("ignores answers of other runs", () => {
-    const s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "granted", run: 8, id: 1, slot: 1 });
+    const s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "granted", run: 8, id: 1, slot: 1, framesDecoded: 0 });
     expect(slotOf(s, "A")).toBeNull();
     expect(run(s, { type: "stream", run: 6, slot: 0, stream }).streams[0]).toBeNull();
     expect(run(s, { type: "stream", run: 7, slot: 0, stream }).streams[0]).toBe(stream);
   });
 
   it("ends a watch when the server frees its slot, and moves the stage on", () => {
-    let s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "granted", run: 7, id: 1, slot: 0 },
-      { type: "watch", share: "B", id: 2 }, { type: "granted", run: 7, id: 2, slot: 1 });
+    let s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "granted", run: 7, id: 1, slot: 0, framesDecoded: 0 },
+      { type: "watch", share: "B", id: 2 }, { type: "granted", run: 7, id: 2, slot: 1, framesDecoded: 0 });
     expect(s.stage).toBe("B");
     s = run(s, { type: "stage", share: "A" });
     expect(s.stage).toBe("A");
@@ -78,9 +92,9 @@ describe("watching", () => {
   it("watch → stop → watch: the first watch's grant and release never touch the second", () => {
     let s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "unwatch", share: "A" }, { type: "watch", share: "A", id: 2 });
     // The first request's assignment, its answer and its release all arrive after the second watch began.
-    s = run(s, { type: "slot", run: 7, slot: 0, share: "A" }, { type: "granted", run: 7, id: 1, slot: 0 }, { type: "slot", run: 7, slot: 0, share: null });
+    s = run(s, { type: "slot", run: 7, slot: 0, share: "A" }, { type: "granted", run: 7, id: 1, slot: 0, framesDecoded: 0 }, { type: "slot", run: 7, slot: 0, share: null });
     expect(s.watches).toEqual([{ share: "A", id: 2, slot: null, status: "requesting" }]);
-    s = run(s, { type: "slot", run: 7, slot: 3, share: "A" }, { type: "granted", run: 7, id: 2, slot: 3 });
+    s = run(s, { type: "slot", run: 7, slot: 3, share: "A" }, { type: "granted", run: 7, id: 2, slot: 3, framesDecoded: 0 });
     expect(slotOf(s, "A")).toBe(3);
   });
 
@@ -93,7 +107,7 @@ describe("watching", () => {
   });
 
   it("a new run waits for new answers; a failed transport ends every watch", () => {
-    let s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "granted", run: 7, id: 1, slot: 0 }, { type: "stream", run: 7, slot: 0, stream });
+    let s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "granted", run: 7, id: 1, slot: 0, framesDecoded: 0 }, { type: "stream", run: 7, slot: 0, stream });
     const renewed = run(s, { type: "transport", run: 9, phase: "connecting" });
     expect(renewed.watches).toEqual([{ share: "A", id: 1, slot: null, status: "requesting" }]);
     expect(renewed.streams[0]).toBeNull();
@@ -104,8 +118,8 @@ describe("watching", () => {
   });
 
   it("watching is independent of my own share, which start → stop → start leaves alone", () => {
-    let s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "granted", run: 7, id: 1, slot: 0 },
-      { type: "watch", share: "B", id: 2 }, { type: "granted", run: 7, id: 2, slot: 1 });
+    let s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "granted", run: 7, id: 1, slot: 0, framesDecoded: 0 },
+      { type: "watch", share: "B", id: 2 }, { type: "granted", run: 7, id: 2, slot: 1, framesDecoded: 0 });
     const watching = s.watches;
     s = run(s, { type: "pick", attempt: 1 }, { type: "picked", attempt: 1, stream, surface: "tab" }, { type: "starting", attempt: 1 },
       { type: "started", attempt: 1, share: "M1" }, { type: "live", share: "M1" }, { type: "ownEnded", attempt: 1 },

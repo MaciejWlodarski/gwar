@@ -135,7 +135,7 @@ it("hides a reused slot's cached frame until decode advances, fencing old grants
   const stream = new MediaStream(), dispatch = useScreen.getState().dispatch;
   const grant = (id: number, share = "S") => {
     dispatch({ type: "watch", share, id });
-    dispatch({ type: "granted", run: 1, id, slot: 0 });
+    dispatch({ type: "granted", run: 1, id, slot: 0, framesDecoded: frames });
   };
   const poll = () => act(async () => { await vi.advanceTimersByTimeAsync(250); });
   const hidden = () => container.querySelector("video")!.classList.contains("opacity-0");
@@ -151,7 +151,7 @@ it("hides a reused slot's cached frame until decode advances, fencing old grants
     });
     await poll(); // Cached data without decoder progress must stay hidden.
     expect(hidden()).toBe(true);
-    frames++; await poll();
+    frames++; await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
     expect(hidden()).toBe(false);
     const calls = stats.mock.calls.length;
     await poll();
@@ -167,7 +167,7 @@ it("hides a reused slot's cached frame until decode advances, fencing old grants
     await act(async () => stale({ ...sample(), framesDecoded: 99 }));
     expect(hidden()).toBe(true);
     await poll(); expect(hidden()).toBe(true);
-    frames++; await poll();
+    frames++; await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
     expect(hidden()).toBe(false);
 
     await act(async () => { dispatch({ type: "transport", run: 2, phase: "connecting" }); });
@@ -177,5 +177,38 @@ it("hides a reused slot's cached frame until decode advances, fencing old grants
   } finally {
     await act(async () => root.render(null));
     stats.mockRestore(); play.mockRestore(); vi.useRealTimers();
+  }
+});
+
+it.each([0, 10])("an already decoded static frame is visible without another decoder increment (baseline %i)", async baseline => {
+  vi.useFakeTimers();
+  const stats = vi.spyOn(controller.screen, "stats").mockResolvedValue({ width: 640, height: 360, fps: 0, framesDecoded: baseline + 1 });
+  const play = vi.spyOn(HTMLVideoElement.prototype, "play").mockResolvedValue();
+  const stream = new MediaStream(), dispatch = useScreen.getState().dispatch;
+  try {
+    dispatch({ type: "transport", run: 1, phase: "connected" });
+    dispatch({ type: "stream", run: 1, slot: 0, stream });
+    dispatch({ type: "watch", share: "S", id: 1 });
+    dispatch({ type: "granted", run: 1, id: 1, slot: 0, framesDecoded: baseline });
+    await act(async () => root.render(<TooltipProvider><Stage /></TooltipProvider>));
+    await act(async () => { container.querySelector("video")!.dispatchEvent(new Event("loadeddata")); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(2_000); });
+    expect(container.querySelector("video")!.classList.contains("opacity-0")).toBe(false);
+    await act(async () => root.render(null));
+    await act(async () => root.render(<TooltipProvider><Stage /></TooltipProvider>));
+    expect(container.querySelector("video")!.classList.contains("opacity-0")).toBe(false);
+    const calls = stats.mock.calls.length;
+    await act(async () => { await vi.advanceTimersByTimeAsync(250); });
+    expect(stats).toHaveBeenCalledTimes(calls);
+    // Reusing the same stream for a new grant must reset readiness.
+    await act(async () => {
+      dispatch({ type: "slot", run: 1, slot: 0, share: null });
+      dispatch({ type: "watch", share: "S", id: 2 });
+      dispatch({ type: "granted", run: 1, id: 2, slot: 0, framesDecoded: baseline + 1 });
+    });
+    await act(async () => { await vi.advanceTimersByTimeAsync(10_000); });
+    expect(container.querySelector("video")!.classList.contains("opacity-0")).toBe(true);
+  } finally {
+    await act(async () => root.render(null)); stats.mockRestore(); play.mockRestore(); vi.useRealTimers();
   }
 });

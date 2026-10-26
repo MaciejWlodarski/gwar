@@ -429,6 +429,7 @@ export interface PublishParams {
 export class ScreenPublisher {
   private pc: RTCPeerConnection | null = null;
   private sender: RTCRtpSender | null = null;
+  private negotiated = false;
   private quality: ScreenSpec;
   private automaticMode: boolean;
   private applied = 0;
@@ -460,7 +461,12 @@ export class ScreenPublisher {
   }
 
   async start(): Promise<void> {
+    if (this.closed) return;
     const run = ++this.run;
+    this.negotiated = false;
+    // The same poll covers capture lifetime through constraints, signalling and
+    // recovery. Encoder adaptation starts only after negotiation completes.
+    if (!this.timer) this.timer = setInterval(() => void this.headroom(), HEADROOM_INTERVAL_MS);
     const { track, iceServers } = this.params, recovery = this.recovery;
     this.refreshSurface();
     if (recovery) { const spec = this.spec(); await track.applyConstraints({ width: { max: spec.width }, height: { max: spec.height }, frameRate: { max: spec.fps } }); }
@@ -490,7 +496,7 @@ export class ScreenPublisher {
     this.refreshSurface();
     await this.applyParameters(this.spec().maxBitrate);
     if (this.closed || this.pc !== pc) return;
-    this.timer = setInterval(() => void this.headroom(), HEADROOM_INTERVAL_MS);
+    this.negotiated = true;
   }
 
   /** Changes quality while sharing, with no renegotiation. */
@@ -549,13 +555,14 @@ export class ScreenPublisher {
 
   private async headroom(): Promise<void> {
     const pc = this.pc;
-    if (!pc || this.closed) return;
+    if (this.closed) return;
     // MediaStreamTrack.stop() changes readyState without firing `ended`.
     // Use this existing poll even when stats are unavailable or still pending.
     if (this.params.track.readyState === "ended") {
       if (!this.trackEnded) { this.trackEnded = true; this.params.ended?.(); }
       return;
     }
+    if (!pc || !this.negotiated) return;
     this.refreshSurface();
     if (this.polling === pc) return;
     this.polling = pc;
@@ -758,8 +765,6 @@ export class ScreenPublisher {
     this.cancelPhase();
     this.guard.resetEncoder();
     this.recovery = plan;
-    if (this.timer) clearInterval(this.timer);
-    this.timer = null;
     this.stopWatching();
     const pc = this.pc; this.pc = null; this.sender = null; this.sent = null; this.adaptationSent = null;
     // Keep the old publish transport alive until the server has accepted its replacement.
@@ -877,7 +882,9 @@ export class ScreenWatchTransport {
     const receiver = this.transceivers[slot]?.receiver;
     if (!receiver || this.closed) return null;
     try {
-      let found: SlotStats | null = null;
+      // An unused receiver has decoded zero frames. Keep errors distinct from
+      // that valid baseline so a reused slot never assumes an unknown count is zero.
+      let found: SlotStats = { width: 0, height: 0, fps: 0, framesDecoded: 0 };
       (await receiver.getStats()).forEach(s => {
         if (s.type !== "inbound-rtp") return;
         const r = s as RTCInboundRtpStreamStats;

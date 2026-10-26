@@ -13,7 +13,7 @@ import type { ScreenShare } from "../proto/ScreenShare";
 import { controller } from "../state/controller";
 import { guestLinkPossible, useCanWatch, useScreenSupport } from "../state/screen-controller";
 import { shareOf } from "../state/reducer";
-import { slotOf, useScreen, type Watch } from "../state/screen";
+import { slotOf, useScreen } from "../state/screen";
 import { useSession } from "../state/stores";
 import { type PublishStats } from "../voice/screen";
 import { HEIGHTS, FRAME_RATES, type ScreenSpec } from "../voice/screen-quality";
@@ -256,32 +256,37 @@ function ShareVideo({ share, className, onDoubleClick, videoRef }: { share: stri
   const grant = useScreen(s => s.watches.find(w => w.share === share && w.status === "watching"));
   const run = useScreen(s => s.transport.run);
   const ref = useRef<HTMLVideoElement | null>(null);
-  const [shown, setShown] = useState<{ stream: MediaStream; grant: Watch; run: number } | null>(null);
-  const showing = !!shown && shown.stream === stream && shown.grant === grant && shown.run === run;
+  const showing = !!stream && grant?.video?.ready === true;
   useEffect(() => {
     const video = ref.current;
     if (!video) return;
     if (video.srcObject !== stream) video.srcObject = stream;
     if (stream) void video.play().catch(() => {});
-    if (!stream || !grant) return;
-    let active = true, timer: ReturnType<typeof setTimeout> | undefined, baseline: number | null = null;
-    // A reused receive track already has loaded data. Require fresh decoder
-    // progress; poll only this receiver, only until its first new frame.
+    if (!stream || !grant || grant.slot === null || showing) return;
+    let active = true, timer: ReturnType<typeof setTimeout> | undefined, frame: number | undefined;
+    let presented = false;
+    const fallbackAt = Date.now() + 2_000;
+    // Prefer confirmation that the video presented a frame. Static capture can
+    // decode before this element mounts, so fall back after two seconds with
+    // valid dimensions and decoder progress since the grant's saved baseline.
+    if (video.requestVideoFrameCallback) frame = video.requestVideoFrameCallback(() => { presented = true; });
     const check = async () => {
       const stats = await controller.screen.stats(share);
       if (!active) return;
       if (stats) {
-        if (baseline !== null && stats.framesDecoded > baseline) {
-          setShown({ stream, grant, run });
-          return;
-        }
-        baseline = stats.framesDecoded;
+        const visible = stats.width > 0 && stats.height > 0 && (presented || Date.now() >= fallbackAt);
+        useScreen.getState().dispatch({ type: "watchFrame", run, id: grant.id, slot: grant.slot!, framesDecoded: stats.framesDecoded, presented: visible });
+        if (visible && grant.video?.baseline !== null && stats.framesDecoded > (grant.video?.baseline ?? Infinity)) return;
       }
       timer = setTimeout(() => { void check(); }, 250);
     };
     void check();
-    return () => { active = false; if (timer !== undefined) clearTimeout(timer); };
-  }, [stream, grant, run, share]);
+    return () => {
+      active = false;
+      if (timer !== undefined) clearTimeout(timer);
+      if (frame !== undefined) video.cancelVideoFrameCallback(frame);
+    };
+  }, [stream, grant, run, share, showing]);
   return (
     <div className={cn("relative flex min-h-0 items-center justify-center overflow-hidden bg-black", className)}>
       <video

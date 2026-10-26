@@ -1,3 +1,4 @@
+import { WatchSession, type SocketLike } from "../watch/session";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { captureScreen, headroomBitrate, MIN_BITRATE, preferredCodecs, publishSsrcs, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, StuckCaptureGuard } from "./screen";
 
@@ -1930,4 +1931,61 @@ describe("automatic mode on confirmed source switches", () => {
     expect(f.track.contentHint).toBe("motion");
     f.stop();
   });
+});
+
+it("an unanswered guest offer has an overall deadline", async () => {
+  class Socket implements SocketLike {
+    readyState = 1;
+    onopen = null as SocketLike["onopen"];
+    onmessage = null as SocketLike["onmessage"];
+    onclose = null as SocketLike["onclose"];
+    onerror = null as SocketLike["onerror"];
+    sent: Array<{id: number; op: string}> = [];
+    send(data: string) {
+      const request = JSON.parse(data); this.sent.push(request);
+      // Keep the socket responsive; omit only the media answer.
+      if (request.op === "ping") this.receive({ re: request.id, ok: {} });
+    }
+    receive(frame: object) { this.onmessage?.({ data: JSON.stringify(frame) } as MessageEvent); }
+    close() { this.readyState = 3; }
+  }
+  const socket = new Socket();
+  const session = new WatchSession({ status() {}, sharer() {}, stream() {} }, {
+    socket: () => socket, transport: params => new ScreenWatchTransport(params),
+  });
+  try {
+    session.start("ws://127.0.0.1/ws/watch", "A".repeat(43));
+    socket.onopen?.(new Event("open"));
+    socket.receive({ re: 1, ok: { share: "s1", sharer: "alice", preset: "smooth", ice_servers: [] } });
+    await vi.waitFor(() => expect(socket.sent.some(x => x.op === "guest.offer")).toBe(true));
+    await vi.advanceTimersByTimeAsync(34_000);
+    expect(session.status).toBe("connecting");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(session.status).toBe("lost");
+    expect(socket.readyState).toBe(3);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { session.close(); await vi.advanceTimersByTimeAsync(0); }
+});
+
+it.each(["initial offer", "recovery offer"])("silently stopped capture is detected during %s", async phase => {
+  let answer!: (sdp: string) => void;
+  const pending = new Promise<string>(resolve => { answer = resolve; });
+  const track = { readyState: "live", applyConstraints: vi.fn(async () => {}) } as unknown as MediaStreamTrack;
+  const ended = vi.fn();
+  const offer = vi.fn(async () => phase === "initial offer" || offer.mock.calls.length > 1 ? pending : "answer");
+  const publisher = new ScreenPublisher({ track, quality: TEST_SPECS.game, iceServers: [], offer, state() {}, ended });
+  let starting: Promise<void>;
+  if (phase === "recovery offer") {
+    await publisher.start();
+    starting = publisher.recover({ share: "s1", codec: "vp9", width: 1280, height: 720, fps: 30 });
+  } else starting = publisher.start();
+  try {
+    await vi.waitFor(() => expect(offer).toHaveBeenCalledTimes(phase === "initial offer" ? 1 : 2));
+    Object.defineProperty(track, "readyState", { value: "ended" });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(ended).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(Peer.all.at(-1)!.getStats).not.toHaveBeenCalled();
+  } finally { publisher.close(); answer("answer"); await starting; }
 });
