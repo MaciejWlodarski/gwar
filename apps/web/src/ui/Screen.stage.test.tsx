@@ -135,7 +135,7 @@ it("moves both attached players with their static frames when the real Stage swi
 });
 
 
-it.each(["silent", "receive time", "presentation time"] as const)("keeps a reused slot's readiness and deadline with its new grant (%s)", async frame => {
+it.each(["silent", "receive time", "presentation time", "counter reset"] as const)("keeps a reused slot's readiness and deadline with its new grant (%s)", async frame => {
   const failed = vi.spyOn(screen, "frameFailed");
   const received = vi.spyOn(screen, "frameReceived");
   vi.spyOn(screen, "stats").mockResolvedValue({ width: 640, height: 400, fps: 0, framesDecoded: 1 });
@@ -145,13 +145,14 @@ it.each(["silent", "receive time", "presentation time"] as const)("keeps a reuse
   });
   const active = video("A"), old = video("B");
   const run = useScreen.getState().transport.run;
-  let frames = 5, callback: VideoFrameRequestCallback | undefined;
+  let frames = frame === "counter reset" ? 22 : 5, callback: VideoFrameRequestCallback | undefined;
   Object.defineProperties(old, {
     readyState: { configurable: true, value: 2 },
     getVideoPlaybackQuality: { configurable: true, value: () => ({ totalVideoFrames: frames }) },
     requestVideoFrameCallback: { configurable: true, value: vi.fn((cb: VideoFrameRequestCallback) => { callback = cb; return 1; }) },
     cancelVideoFrameCallback: { configurable: true, value: vi.fn() },
   });
+  await advance(2_000);
   await act(async () => screen.unwatch("B"));
   received.mockClear(); request.mockClear();
   await act(async () => screen.watch("C"));
@@ -164,10 +165,11 @@ it.each(["silent", "receive time", "presentation time"] as const)("keeps a reuse
   await act(async () => {
     old.dispatchEvent(new Event("loadeddata"));
     old.dispatchEvent(new Event("resize"));
+    if (frame === "counter reset") frames = 1; // WebKit resets playback quality on a player move.
     // A delayed callback for B cannot certify C, even if submitted again later.
-    callback?.(performance.now(), { receiveTime: -1, presentationTime: performance.now() + 1 } as VideoFrameCallbackMetadata);
-    // Without receipt metadata, presenting the same cached input is insufficient.
-    callback?.(performance.now(), { presentationTime: performance.now() + 1 } as VideoFrameCallbackMetadata);
+    callback?.(performance.now(), { receiveTime: 1469, presentationTime: performance.now() + 1 } as VideoFrameCallbackMetadata);
+    // Moving the player and delaying a callback cannot refresh its old frame's timestamp.
+    callback?.(performance.now(), { presentationTime: 1469 } as VideoFrameCallbackMetadata);
   });
   await advance(100);
   expect(ready()).toBe("false");
@@ -180,7 +182,7 @@ it.each(["silent", "receive time", "presentation time"] as const)("keeps a reuse
   expect(request.mock.calls.filter(([op]) => op === "screen.keyframe")).toHaveLength(1);
   if (frame !== "silent") {
     // One fresh static frame suffices, also without optional WebRTC metadata.
-    frames++;
+    frames = frame === "counter reset" ? 2 : frames + 1;
     await act(async () => callback?.(performance.now(), {
       presentationTime: performance.now() + 1,
       ...(frame === "receive time" ? { receiveTime: performance.now() + 1 } : {}),

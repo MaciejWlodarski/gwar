@@ -506,7 +506,7 @@ async function run(browsers, web, server, token) {
     sample();
   }, wsShare);
   const oldSoloRun = await session(ws, (_, screen) => screen.transport.run);
-  await ws.evaluate(share => {
+  for (const viewer of [ws, wv]) await viewer.evaluate(share => {
     window.__reuseFrames = [];
     const sample = () => {
       const video = document.querySelector(`video[data-share="${share}"]`);
@@ -542,14 +542,17 @@ async function run(browsers, web, server, token) {
     assert.ok(otherWatch.frames > 1, "the untouched watch's frames progress during sole-watch renewal");
     checks.push({ check: "untouched watch stays visible and frames progress during sole-watch renewal", ok: true });
   }
-  const reuseFrames = await ws.evaluate(() => {
-    cancelAnimationFrame(window.__reuseSampler);
-    return window.__reuseFrames;
-  });
-  if (paintsUnreliably(ws)) checks.push({ check: "sole reused slot displays only the new share's barcode", skipped: true, reason: "WebKit on Linux paints remote video unreliably" });
-  else {
-    assert.ok(reuseFrames.length > 0 && reuseFrames.every(id => id === 6), `sole reused slot showed another share: ${reuseFrames}`);
-    checks.push({ check: "sole reused slot displays only the new share's barcode", ok: true });
+  for (const [viewer, label] of [[ws, "sole"], [wv, "concurrent WebKit"]]) {
+    const reuseFrames = await viewer.evaluate(() => {
+      cancelAnimationFrame(window.__reuseSampler);
+      return window.__reuseFrames;
+    });
+    const check = `${label} reused slot displays only the new share's barcode`;
+    if (paintsUnreliably(viewer)) checks.push({ check, skipped: true, reason: "WebKit on Linux paints remote video unreliably" });
+    else {
+      assert.ok(reuseFrames.length > 0 && reuseFrames.every(id => id === 6), `${label} reused slot showed another share: ${reuseFrames}`);
+      checks.push({ check, ok: true });
+    }
   }
   assert.ok(await session(ws, (_, screen) => screen.transport.run) > oldSoloRun, "a sole reused slot renews its receiver");
   checks.push({ check: "sole slot reuse renews its receiver", ok: true });

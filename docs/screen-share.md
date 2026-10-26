@@ -2738,8 +2738,10 @@ from native capture is PR 10.
     the new watch or satisfy its first-frame deadline. Readiness and the repair
     marker belong to the run/watch ID, so Stage moves preserve only that grant's
     state. A frame callback must report receipt after the grant; without optional
-    receipt metadata, both later presentation and player frame-count advancement
-    are required. Cached loadeddata/resize/current-data state is insufficient.
+    receipt metadata, it uses the frame's original presentation timestamp after
+    the grant. Delaying a cached frame's callback does not refresh that timestamp.
+    Playback-quality counts are not used: WebKit can reset them when the player
+    moves. Cached loadeddata/resize/current-data state is insufficient.
   - Linux WebKit can leave a replacement media player at 0×0 even while the
     receiver decodes fresh keyframes. Preserving the player keeps a static share
     visible through view/StrictMode remounts without requesting another frame.

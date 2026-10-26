@@ -252,14 +252,14 @@ export function LiveBadge({ client, name }: { client: Client; name: string }) {
 // Linux WebKit can stop supplying a replacement player's frames/metadata even while
 // its receiver keeps decoding. Keep one attached player per slot stream and move it
 // between views. A new transport supplies new streams, so it cannot inherit old pixels.
-type SlotGrant = { run: number; id: number; received: boolean; repair: boolean; after?: { time: number; frames: number } };
+type SlotGrant = { run: number; id: number; received: boolean; repair: boolean; after?: { time: number } };
 type SlotVideo = { video: HTMLVideoElement; grant?: SlotGrant };
 const slotVideos = new Map<MediaStream, SlotVideo>();
 function assignSlotVideo(player: SlotVideo, run: number, id: number): SlotGrant {
   if (player.grant?.run === run && player.grant.id === id) return player.grant;
   // Snapshot at the grant, before React moves the player. Its cached pixels and
   // readiness belong to the previous watch, even though the stream is unchanged.
-  const after = player.grant ? { time: performance.now(), frames: (player.video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0) } : undefined;
+  const after = player.grant ? { time: performance.now() } : undefined;
   return player.grant = { run, id, received: false, repair: false, after };
 }
 let slotVideoParking: HTMLDivElement | null = null;
@@ -337,10 +337,10 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef }: { shar
       if (!live || !grant || player.grant !== grant || grant.received) return;
       const after = grant.after!;
       // A delayed callback may still describe the old frame. Prefer its network
-      // receipt time; without it, require both a later presentation and new input
-      // to this player. Neither loadeddata nor HAVE_CURRENT_DATA proves freshness.
-      const fresh = metadata.receiveTime !== undefined ? metadata.receiveTime > after.time
-        : metadata.presentationTime > after.time && (video.getVideoPlaybackQuality?.().totalVideoFrames ?? 0) > after.frames;
+      // receipt time; otherwise use the frame's original presentation timestamp,
+      // not the callback's invocation time. WebKit resets playback-quality counts
+      // on a player move, but a cached frame keeps its pre-grant timestamp.
+      const fresh = (metadata.receiveTime ?? metadata.presentationTime) > after.time;
       if (fresh) received(undefined, true);
       else frame = video.requestVideoFrameCallback(presented);
     };
