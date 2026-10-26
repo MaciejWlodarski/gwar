@@ -34,7 +34,8 @@ export function App() {
   const serverName = useSession((s) => s.server?.name);
   const unread = useServerUnread();
   const address = useSession((s) => s.address);
-  const section = useUi((s) => s.section);
+  const home = useUi((s) => s.section === "home");
+  // With a share on stage the stage wins; the overview waits until it closes.
   const overview = useUi((s) => s.overview);
   const drawerOpen = useUi((s) => s.drawerOpen);
   const setDrawer = useUi((s) => s.setDrawer);
@@ -73,12 +74,10 @@ export function App() {
         {showApp && <SharingBar />}
         <div className="flex min-h-0 w-full flex-1 overflow-hidden">
           {!isMobile && <SectionRail />}
-          {section === "home" ? (
-            <div className={cn("flex min-w-0 flex-1", !isMobile && "p-2")}>
-              <Home card={!isMobile} />
-            </div>
-          ) : (
-            <>
+          {/* Home and the overview lie over the server view instead of replacing it: the chat keeps
+              its drafts, files and scroll position, and a watched share keeps playing underneath. */}
+          <div className="relative flex min-w-0 flex-1">
+            <div inert={home} className={cn("flex min-w-0 flex-1", home && "invisible")}>
               {!isMobile && <ServerRail />}
               {showApp ? (
                 <div className={cn("flex min-w-0 flex-1", !isMobile && "gap-2 py-2 pr-2")}>
@@ -93,20 +92,30 @@ export function App() {
                         </div>
                       )}
                     </>
-                  ) : overview ? (
-                    <Overview card={!isMobile} />
                   ) : (
-                    <>
-                      <ChatArea card={!isMobile} />
-                      {!isMobile && members.open && <MemberList card />}
-                    </>
+                    <div className="relative flex min-w-0 flex-1">
+                      <div inert={overview} className={cn("flex min-w-0 flex-1", !isMobile && "gap-2", overview && "invisible")}>
+                        <ChatArea card={!isMobile} />
+                        {!isMobile && members.open && <MemberList card />}
+                      </div>
+                      {overview && (
+                        <div className="absolute inset-0 flex">
+                          <Overview card={!isMobile} />
+                        </div>
+                      )}
+                    </div>
                   )}
                 </div>
               ) : (
                 <ConnectScreen />
               )}
-            </>
-          )}
+            </div>
+            {home && (
+              <div className={cn("absolute inset-0 flex", !isMobile && "p-2")}>
+                <Home card={!isMobile} />
+              </div>
+            )}
+          </div>
         </div>
       </div>
       {isMobile && (

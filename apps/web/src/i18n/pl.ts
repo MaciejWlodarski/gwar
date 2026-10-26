@@ -48,7 +48,6 @@ export const pl: Record<Key, string> = {
   "overview.notInVoice": "Online",
   "overview.more": "i {count} więcej",
   "overview.noNews": "Na razie brak wiadomości.",
-  "overview.encryptedMessage": "Zaszyfrowana wiadomość",
   "overview.attachment": "Załącznik",
   "overview.unread": "Nieprzeczytane",
   "overview.allRead": "Wszystko przeczytane.",

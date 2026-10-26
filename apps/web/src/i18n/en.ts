@@ -46,7 +46,6 @@ export const en = {
   "overview.notInVoice": "Online",
   "overview.more": "and {count} more",
   "overview.noNews": "No messages yet.",
-  "overview.encryptedMessage": "Encrypted message",
   "overview.attachment": "Attachment",
   "overview.unread": "Unread",
   "overview.allRead": "All caught up.",

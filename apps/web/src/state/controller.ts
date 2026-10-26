@@ -58,6 +58,7 @@ import type { pruneRequest } from "../lib/prune";
 import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, identityFailure, type Identity, type IdentityFailure } from "../net/identity";
 import { isDesktop } from "../platform";
 import { createVoiceEngine } from "../voice";
+import { useScreen } from "./screen";
 import { ScreenController } from "./screen-controller";
 import { microphoneSsrc } from "../voice/sdp";
 import { VoiceError, type VoiceEngine } from "../voice/engine";
@@ -367,9 +368,20 @@ class Controller {
     // Tell the server what I have read.
     useSession.subscribe((s) => this.checkRead(s));
 
-    // Messages only count as read while the window is visible and focused.
-    const syncFocus = () =>
-      useSession.getState().dispatch({ type: "focus", focused: document.visibilityState === "visible" && document.hasFocus() });
+    // Messages only count as read while the window is visible and focused, with the chat on screen
+    // (not covered by Home or the server overview).
+    const syncFocus = () => {
+      const ui = useUi.getState();
+      const chatShown = ui.section === "servers" && (!ui.overview || useScreen.getState().stage !== null);
+      const focused = document.visibilityState === "visible" && document.hasFocus() && chatShown;
+      useSession.getState().dispatch({ type: "focus", focused });
+    };
+    useUi.subscribe((ui, before) => {
+      if (ui.section !== before.section || ui.overview !== before.overview) syncFocus();
+    });
+    useScreen.subscribe((screen, before) => {
+      if ((screen.stage === null) !== (before.stage === null)) syncFocus();
+    });
     window.addEventListener("focus", syncFocus);
     window.addEventListener("blur", syncFocus);
     document.addEventListener("visibilitychange", syncFocus);

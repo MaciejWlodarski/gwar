@@ -10,8 +10,9 @@ import { channelUnread, myChannelId } from "../state/reducer";
 import { useSession, useUi } from "../state/stores";
 import type { ChatItem } from "../state/types";
 import { TeamSpeakBadge, TsIcon, UnreadBadge } from "./badges";
-import { usePermission } from "./hooks";
+import { useChannelPermission, usePermission } from "./hooks";
 import { Avatar, Button, IconButton, TalkingAvatar, panelCard } from "./kit";
+import { newsworthy } from "./nav";
 import { LiveBadge } from "./Screen";
 
 /** How many people the overview names before "and N more". */
@@ -40,7 +41,8 @@ function Quiet({ children }: { children: ReactNode }) {
 function VoiceRoom({ id, name, people, mine }: { id: number; name: string; people: Client[]; mine: boolean }) {
   const t = useT();
   const nicknames = useSession((s) => s.members);
-  const canJoin = usePermission("connect");
+  // Per channel, overrides included (docs/roles.md).
+  const canJoin = useChannelPermission(id, "connect");
   const sharer = people.find((c) => c.sharing);
   return (
     <li className="flex items-center gap-3 rounded-lg px-2 py-2 hover:bg-hover">
@@ -78,10 +80,10 @@ function VoiceRoom({ id, name, people, mine }: { id: number; name: string; peopl
 }
 
 function newsText(item: Extract<ChatItem, { kind: "msg" }>, t: ReturnType<typeof useT>): string {
-  if (item.cannotOpen) return t("overview.encryptedMessage");
   if (item.msg.text) return item.msg.text;
   return item.msg.attachments?.length ? t("overview.attachment") : "";
 }
+
 
 /**
  * The server at a glance, in place of the chat: who talks in which room (with a
@@ -104,7 +106,6 @@ export function Overview({ card }: { card?: boolean }) {
   const myChannel = useSession(myChannelId);
   const dispatch = useSession((s) => s.dispatch);
   const canInvite = usePermission("create_invites") && kind === "gwar";
-  const canJoin = usePermission("connect");
 
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
@@ -141,7 +142,7 @@ export function Overview({ card }: { card?: boolean }) {
   const dms = Object.entries(threads).filter(([k, th]) => k.startsWith("dm:") && th.unread > 0);
   const serverThread = threads["server"];
   const news = (serverThread?.items ?? [])
-    .filter((i): i is Extract<ChatItem, { kind: "msg" }> => i.kind === "msg" && !i.removed)
+    .filter((i) => newsworthy(i, kind === "teamspeak"))
     .slice(-NEWS_SHOWN)
     .reverse();
 
@@ -149,6 +150,7 @@ export function Overview({ card }: { card?: boolean }) {
   const target = rooms.find((r) => r.id !== myChannel) ?? null;
   const fallback = server && channels[server.default_channel] && server.default_channel !== myChannel ? server.default_channel : null;
   const joinId = myChannel === null ? (target?.id ?? fallback) : null;
+  const canJoin = useChannelPermission(joinId, "connect");
 
   return (
     <main className={cn("relative flex min-w-0 flex-1 flex-col bg-surface", card && panelCard)}>
