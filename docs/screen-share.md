@@ -3575,8 +3575,10 @@ counters once per violation, with the share ID, to correlate receiver freezes
 with actual ingress enforcement rather than infer a cause from browser stats.
 
 Coalesced keyframe requests spend one viewer credit when they first make a
-publisher PLI pending; duplicates while it is pending spend none. The ten-per-minute
-viewer bucket and one-PLI-per-share-per-500-ms throttle still bound new requests.
+publisher PLI pending; duplicates while it is pending spend none. A PLI sent for
+the same publisher after a deferred request also satisfies it without a second
+viewer credit. The ten-per-minute viewer bucket and one-PLI-per-share-per-500-ms
+throttle still bound new requests.
 Previously a burst of queue-recovery/RTCP requests could consume all ten credits
 without sending ten PLIs, delaying the next recovery by the six-second refill.
 Debug samples include PLI credit denials and per-viewer egress counters/waiting-slot
@@ -3586,13 +3588,36 @@ A viewer also spaces new keyframe requests across its slots by at least 500 ms.
 A new multi-share watch used to solicit all its large keyframes together into
 one cold 2.5 Mb/s egress estimator and its bounded queue. Queue evictions could
 then trigger another simultaneous batch and exhaust recovery credits. Deferred
-slots retry from the housekeeping tick in stage/watch priority order, including
-when the publisher has no delta traffic. This keeps the 400 ms egress deadlines,
-queue bounds, voice headroom and existing estimator/probe policy intact.
+requests are retained per slot independently of segment state, including active
+slots asking for decoder recovery. The 100 ms housekeeping tick serves the oldest
+pending request, including when the publisher has no delta traffic. Initial
+requests win ties over retries; a serviced slot's next retry joins the tail.
+Repeated reports do not reset its age. PLI-ignoring high-priority publishers thus
+cannot overtake an already queued initial or recovery request. A request clears
+only when it schedules a PLI, coalesces into a pending PLI for that publisher, or
+its assignment ends. Paused slots retain requests until resumed. This keeps the
+400 ms egress deadlines, queue bounds, voice headroom and estimator/probe policy
+intact.
+
+For a live, unpaused assignment whose publisher is connected and has established
+its receive stream, the conservative scheduling bound is **30 s** from the request
+(or from becoming eligible after resume/connection). With at most four pending
+slots, even an empty viewer bucket supplies four credits in at most 4 × 6 s;
+allow 100 ms per credit for the housekeeping tick, up to 5 s for bootstrap fit
+deferral, and 500 ms for the publisher throttle: 29.9 s in total. With available
+credits and no fit deferral, four slots need at most 2.9 s by the same conservative
+calculation (four 600 ms service opportunities plus the publisher throttle).
+Coalescing can shorten these bounds. They assume the task continues receiving
+its normal 100 ms housekeeping service; they bound PLI requests, not a publisher's
+response. New reports, retries and replacement assignments join behind older
+requests, so churn cannot extend their queue position.
 
 During the first 5 s after a viewer's first keyframe request, a known keyframe
 that cannot fit the current per-slot release share within 400 ms is deferred
-without spending viewer credit. The calculation reserves higher-priority media's
+without spending viewer credit, including recovery requests on active segments.
+The start of a keyframe can activate a segment before the complete frame fits;
+using that state to bypass the guard would spend credits during the same cold
+queue pressure. The calculation reserves higher-priority media's
 measured average. One initial request always seeds media/feedback; unknown sizes
 are allowed. The guard ends when the estimate fits the frame or after those 5 s,
 so a conservative estimate cannot suppress recovery permanently. Rate samples
@@ -3635,6 +3660,21 @@ samples exposed keyframe queue evictions and retry-credit exhaustion; the final
 run logged zero retry-credit denials after the bounded startup guard. Short cold
 startup waits remain, as the per-viewer estimate ramps within the existing
 pacing/queue limits.
+
+The matched pair above predates the round-1 scheduler correction. A separate
+five-minute follow-up used the same driver with oldest-request-first service,
+active-slot deferral, later-PLI coalescing and the fit guard on active recovery.
+The existing analyzer measured **0.63%** frozen stream-time,
+**0.22%** outside the first 5 s after scheduled churn,
+and an **8.70 s** longest sampled freeze. Mean CPU was
+21.74% of one core (peak 36.13%), peak RSS
+35.62 MiB, and transport drains per datagram 6.70.
+Viewer-credit denials, ingress overruns, dispatch drops and budget pauses were
+all zero. The bounded queues, request spacing, bootstrap guard and coalescing
+thus remain effective with fair, persistent recovery. This shorter, unpaired
+check is not a replacement for the matched ten-minute measurements. Final
+artifacts are in `/tmp/gwar-pr173-fix/soak-final/`; the preceding exploratory run
+is retained separately in `/tmp/gwar-pr173-fix/soak/`.
 
 The earlier deleted-log soak reported 8.5% frozen stream-time, 85.8% peak CPU,
 about 2.5 CPU percentage points per watched stream, and 42.3 MiB peak RSS. That

@@ -653,3 +653,72 @@ async fn quality_specs_require_negotiation_and_broadcast_only_to_negotiated_clie
     assert_eq!(event["preset"], "text");
     legacy.ok("screen.stop", json!({"share":id})).await;
 }
+
+/// Regression: connected publishers acknowledge transport but do not create RTP
+/// automatically. A PLI is required to wake an idle/static third source.
+#[tokio::test]
+async fn review_idle_third_publisher_gets_its_first_keyframe_request() {
+    let server = TestServer::start().await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut carol = Client::connect(&server, "carol").await;
+    let mut dave = Client::connect(&server, "dave").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let channel = seed_channel(&alice, "General");
+    let a = alice.share_in(channel).await;
+    let b = carol.share_in(channel).await;
+    let c = dave.share_in(channel).await;
+    // Establish each receive stream before the late viewer joins, then hold media.
+    alice.publisher(&a).send(frame(1, 9000, true, 1, 1)).await;
+    carol.publisher(&b).send(frame(1, 9000, true, 1, 2)).await;
+    dave.publisher(&c).send(frame(1, 9000, true, 1, 3)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let started = std::time::Instant::now();
+    bob.watch(&a).await;
+    bob.watch(&b).await;
+    bob.watch(&c).await;
+    tokio::time::sleep(Duration::from_secs(8)).await;
+    let counts = [
+        alice.publisher(&a).keyframe_requests(),
+        carol.publisher(&b).keyframe_requests(),
+        dave.publisher(&c).keyframe_requests(),
+    ];
+    eprintln!("actual SRTP publisher PLI counts after 8s: {counts:?}");
+    assert!(counts.iter().all(|count| *count > 0), "every waiting share receives an initial request");
+    assert!(
+        counts.iter().max().unwrap() - counts.iter().min().unwrap() <= 1,
+        "PLI-ignoring publishers share retry opportunities fairly: {counts:?}"
+    );
+    let budget = 10 + (started.elapsed().as_secs() / 6);
+    assert!(counts.iter().sum::<u64>() <= budget, "the shared viewer credit budget still holds");
+}
+
+#[tokio::test]
+async fn review_spaced_request_on_an_active_slot_is_not_lost() {
+    let server = TestServer::start().await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut carol = Client::connect(&server, "carol").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let channel = seed_channel(&alice, "General");
+    let a = alice.share_in(channel).await;
+    let b = carol.share_in(channel).await;
+    alice.publisher(&a).send(frame(1, 9000, true, 1, 1)).await;
+    carol.publisher(&b).send(frame(1, 9000, true, 1, 2)).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    bob.watch(&a).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    alice.publisher(&a).send(frame(2, 12000, true, 1, 3)).await;
+    bob.viewer.as_mut().unwrap().next().await;
+    // The SFU segment is now active. Allow the initial per-viewer spacing to expire.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let before = alice.publisher(&a).keyframe_requests();
+    bob.watch(&b).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    bob.ok("screen.keyframe", json!({"share": a})).await;
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    let after = alice.publisher(&a).keyframe_requests();
+    eprintln!(
+        "active share PLIs before={before}, after={after}; second share PLIs={}",
+        carol.publisher(&b).keyframe_requests()
+    );
+    assert!(after > before, "spacing dropped an active slot's recovery request instead of deferring it");
+}
