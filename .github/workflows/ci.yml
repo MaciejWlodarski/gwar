@@ -784,7 +784,7 @@ jobs:
     if: needs.changes.outputs.app == 'true'
     continue-on-error: true
     runs-on: ubuntu-24.04
-    timeout-minutes: 36
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 5
@@ -838,11 +838,13 @@ jobs:
       # "Stale estimate probe").
       - name: Startup estimate recovery after a briefly busy uplink (diagnostic, non-required)
         if: success() || failure()
-        timeout-minutes: 6
+        timeout-minutes: 14
         env:
           E2E_STARTUP_RESULTS: ${{ runner.temp }}/screen-startup/released
           E2E_STARTUP_SOURCES: barcode20
-          E2E_STARTUP_REPEATS: "1"
+          E2E_STARTUP_CODECS: vp9
+          E2E_STARTUP_WEBRTC_LOG: "1"
+          E2E_STARTUP_REPEATS: "8"
           E2E_STARTUP_SECONDS: "45"
           E2E_STARTUP_UPLINK: "1000000"
           E2E_STARTUP_RELEASE: "8"
