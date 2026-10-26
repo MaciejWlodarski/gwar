@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn av1_gives_way_to_h264_once_and_decode_failures_retire_it() {
         let now = Instant::now();
-        let size = super::super::av1_stream::Requirements { width: 2560, height: 1440 };
+        let size = super::super::av1_stream::tests::main(2560, 1440);
         let mut r = Recovery::default();
         assert!(r.av1());
         let plan = r.downgrade_av1("s", size, now).unwrap();

@@ -617,6 +617,8 @@ struct Watcher {
     h264: HashMap<Mid, HashMap<Pt, codec::Limits>>,
     /// The viewer's verified AV1 decode size; viewers without one are not sent AV1.
     av1: Option<gwar_proto::Av1Capability>,
+    /// The `level-idx` and `tier` each AV1 payload type of the offer declared, per m-line.
+    av1_offered: HashMap<Mid, HashMap<Pt, codec::Av1Declared>>,
     decode_watchdog: bool,
     /// Assignments that arrived before the slot's m-line was seen, with their watch order.
     pending: Vec<(u32, Arc<WatchGrant>, u64)>,
@@ -2339,7 +2341,12 @@ fn add_slot(w: &mut Watcher, mid: Mid) -> usize {
     }
     let mut slot = Slot::new(mid, pts);
     slot.h264 = w.h264.remove(&mid).unwrap_or_default();
-    slot.av1 = w.av1.as_ref().map(codec::Av1Limits::verified);
+    // AV1 needs a verified size and the level its payload type declared (default 3.1).
+    let declared = slot
+        .pts
+        .get(&VideoCodec::Av1)
+        .map(|pt| w.av1_offered.get(&mid).and_then(|pts| pts.get(pt)).copied().unwrap_or_default());
+    slot.av1 = w.av1.as_ref().zip(declared).map(|(cap, declared)| codec::Av1Limits::new(cap, declared));
     w.slots.push(slot);
     w.egress.add_lane();
     w.slots.len() - 1
@@ -2638,8 +2645,9 @@ const AV1_PT: u8 = 45;
 const AV1_RTX_PT: u8 = 46;
 
 /// A screen transport; a watch transport (`bwe`) estimates its viewer's downlink. With `av1`,
-/// AV1 profile 0 (str0m matches profile, `level-idx` 5 and tier exactly) is answered before
-/// H.264, which makes it what a publisher sends.
+/// AV1 profile 0 is answered before H.264, which makes it what a publisher sends. Its
+/// `level-idx` and tier declare what the SFU receives (level 5.1, main tier); offers match on
+/// the profile alone, as each side declares its own receive limits (AV1 RTP §7.2.3).
 fn rtc(advertise: SocketAddr, now: Instant, bwe: bool, av1: bool) -> Result<Rtc, &'static str> {
     let mut config = Rtc::builder()
         .set_extension(SLOT_GENERATION_ID, slot_generation_extension())
@@ -2649,8 +2657,12 @@ fn rtc(advertise: SocketAddr, now: Instant, bwe: bool, av1: bool) -> Result<Rtc,
         .clear_codecs()
         .enable_bwe(bwe.then(|| Bitrate::bps(INITIAL_ESTIMATE)));
     if av1 {
-        let format =
-            str0m::format::FormatParams { profile: Some(0), level_idx: Some(5), tier: Some(0), ..Default::default() };
+        let format = str0m::format::FormatParams {
+            profile: Some(0),
+            level_idx: Some(av1_stream::RECEIVE_LEVEL),
+            tier: Some(av1_stream::RECEIVE_TIER),
+            ..Default::default()
+        };
         config.codec_config().add_config(
             AV1_PT.into(),
             Some(AV1_RTX_PT.into()),
@@ -2791,6 +2803,7 @@ fn watcher(
         size,
         h264: codec::offered(sdp, if caps.browser { caps.h264 } else { &[] }),
         av1: caps.av1.filter(gwar_proto::Av1Capability::valid),
+        av1_offered: codec::offered_av1(sdp),
         decode_watchdog: caps.browser,
         pending: Vec::new(),
         connected: false,
@@ -4949,14 +4962,35 @@ pub(crate) mod tests {
 
     use av1_stream::tests::{ATTACHED, INTER, KEY, rtp, sequence_obu};
 
-    const HD: av1_stream::Requirements = av1_stream::Requirements { width: 1920, height: 1080 };
+    const HD: av1_stream::Requirements = av1_stream::tests::main(1920, 1080);
 
     fn av1_peer(direction: Direction, now: Instant) -> (Rtc, String, str0m::change::SdpPendingOffer) {
-        let mut config = Rtc::builder()
-            .set_rtp_mode(true)
-            .clear_codecs()
-            .set_extension(5, dependency_descriptor::extension())
-            .enable_av1(true);
+        av1_peer_at(direction, 5, 0, now)
+    }
+
+    /// A peer offering AV1 profile 0 at `level-idx` `level` and `tier`, and H.264.
+    fn av1_peer_at(
+        direction: Direction,
+        level: u8,
+        tier: u8,
+        now: Instant,
+    ) -> (Rtc, String, str0m::change::SdpPendingOffer) {
+        let mut config =
+            Rtc::builder().set_rtp_mode(true).clear_codecs().set_extension(5, dependency_descriptor::extension());
+        let format = str0m::format::FormatParams {
+            profile: Some(0),
+            level_idx: Some(level),
+            tier: Some(tier),
+            ..Default::default()
+        };
+        config.codec_config().add_config(
+            35.into(),
+            Some(36.into()),
+            Codec::Av1,
+            str0m::media::Frequency::NINETY_KHZ,
+            None,
+            format,
+        );
         config.codec_config().add_h264(102.into(), Some(103.into()), true, 0x42e01f);
         let mut peer = config.build(now);
         peer.add_local_candidate(Candidate::host(addr(5000), "udp").unwrap());
@@ -4985,7 +5019,7 @@ pub(crate) mod tests {
                 // The answer's first payload type is what the browser sends.
                 let first = video_line(&answer).split(' ').nth(3).unwrap().to_owned();
                 assert!(answer.contains(&format!("a=rtpmap:{first} AV1/90000")), "{answer}");
-                assert!(answer.contains("profile=0") && answer.contains("level-idx=5") && answer.contains("tier=0"));
+                assert!(answer.contains("profile=0") && answer.contains("level-idx=13") && answer.contains("tier=0"));
             }
             assert!(answer.contains(&format!("a=extmap:5 {}", dependency_descriptor::URI)), "{answer}");
         }
@@ -5006,14 +5040,57 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn av1_offers_negotiate_at_any_level_and_viewers_receive_up_to_their_own() {
+        let now = Instant::now();
+        for (level, tier) in [(5, 0), (8, 0), (8, 1), (12, 0), (13, 0), (13, 1)] {
+            // A publisher's offer declares what it would receive: the SFU answers with its own
+            // receive limit, level 5.1 main tier, whatever the offer said.
+            let (_, sdp, _) = av1_peer_at(Direction::SendOnly, level, tier, now);
+            let (ssrc, _) = publish_ssrcs(&sdp).unwrap();
+            let origin = ScreenOrigin::new(1, "av1".into(), 1, false, false, 1_000_000);
+            let (publisher, answer) = publisher(1, origin, ssrc, &sdp, addr(6000), now).unwrap();
+            assert!(publisher.codecs.values().any(|c| *c == VideoCodec::Av1), "{level}/{tier}: {answer}");
+            let fmtp = answer.lines().find(|l| l.starts_with("a=fmtp:35 ")).expect("AV1 answered");
+            assert!(fmtp.contains("level-idx=13") && fmtp.contains("tier=0"), "{fmtp}");
+            // A viewer's offer declares what it receives: AV1 is negotiated, and its slots
+            // take streams up to that level and tier.
+            let (_, sdp, _) = av1_peer_at(Direction::RecvOnly, level, tier, now);
+            let caps =
+                Caps { browser: true, h264: &[], av1: Some(gwar_proto::Av1Capability { width: 2560, height: 1440 }) };
+            let (mut w, answer) = watcher(1, 7, 1, Lease::new(), GUEST_SLOTS, &sdp, caps, addr(6000), now).unwrap();
+            assert!(answer.contains("AV1/90000"), "{level}/{tier}: {answer}");
+            let mid = *w.av1_offered.keys().next().unwrap();
+            let index = add_slot(&mut w, mid);
+            let slot = &w.slots[index];
+            assert_eq!(slot.pts.get(&VideoCodec::Av1), Some(&35.into()));
+            let stream = |level, tier| Forward {
+                codec: VideoCodec::Av1,
+                av1: Some(av1_stream::Requirements { level, tier, ..HD }),
+                ..h264_forward(1, 9000, &[0], now)
+            };
+            for (stream_level, stream_tier) in [(9, 0), (12, 0), (13, 0), (13, 1)] {
+                let fits = stream_level <= level && stream_tier <= tier;
+                assert_eq!(
+                    slot_packet_pt(slot, &stream(stream_level, stream_tier)).is_some(),
+                    fits,
+                    "viewer {level}/{tier}, stream {stream_level}/{stream_tier}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn av1_slots_need_a_verified_size_that_fits_the_sequence() {
         let mut slot = Slot::new(Mid::from("a"), HashMap::from([(VideoCodec::Av1, Pt::from(45))]));
         let packet =
             |need| Forward { codec: VideoCodec::Av1, av1: need, ..h264_forward(1, 9000, &[0], Instant::now()) };
         assert_eq!(slot_packet_pt(&slot, &packet(Some(HD))), None, "no verified decode size");
-        slot.av1 = Some(codec::Av1Limits::verified(&gwar_proto::Av1Capability { width: 1920, height: 1080 }));
+        slot.av1 = Some(codec::Av1Limits::new(
+            &gwar_proto::Av1Capability { width: 1920, height: 1080 },
+            codec::Av1Declared { level: 13, tier: 0 },
+        ));
         assert_eq!(slot_packet_pt(&slot, &packet(Some(HD))), Some(45.into()));
-        assert_eq!(slot_packet_pt(&slot, &packet(Some(av1_stream::Requirements { width: 2560, height: 1440 }))), None);
+        assert_eq!(slot_packet_pt(&slot, &packet(Some(av1_stream::tests::main(2560, 1440)))), None);
         assert_eq!(slot_packet_pt(&slot, &packet(None)), None, "an undescribed AV1 packet is never sent");
         slot.pts.clear();
         assert_eq!(slot_packet_pt(&slot, &packet(Some(HD))), None, "the viewer did not offer AV1");
@@ -5103,7 +5180,10 @@ pub(crate) mod tests {
             slot.keyframe_at = None;
             if session == 1 {
                 slot.pts.insert(VideoCodec::Av1, 45.into());
-                slot.av1 = Some(codec::Av1Limits::verified(&gwar_proto::Av1Capability { width: 1920, height: 1080 }));
+                slot.av1 = Some(codec::Av1Limits::new(
+                    &gwar_proto::Av1Capability { width: 1920, height: 1080 },
+                    codec::Av1Declared { level: 13, tier: 0 },
+                ));
             } else {
                 slot.pts.insert(VideoCodec::H264(0x42e01f), 102.into());
             }
@@ -5138,7 +5218,10 @@ pub(crate) mod tests {
         let (mut sfu, origin, now, _) = recovery_fixture(&[1]).await;
         let w = sfu.watchers.get_mut(&1).unwrap();
         w.slots[0].pts.insert(VideoCodec::Av1, 45.into());
-        w.slots[0].av1 = Some(codec::Av1Limits::verified(&gwar_proto::Av1Capability { width: 1920, height: 1080 }));
+        w.slots[0].av1 = Some(codec::Av1Limits::new(
+            &gwar_proto::Av1Capability { width: 1920, height: 1080 },
+            codec::Av1Declared { level: 13, tier: 0 },
+        ));
         let key = |source, frame: u16| Forward {
             av1: Some(HD),
             keyframe: true,

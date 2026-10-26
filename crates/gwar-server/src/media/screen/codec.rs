@@ -114,24 +114,85 @@ impl Limits {
     }
 }
 
-/// AV1 sizes one viewer decodes. str0m answers AV1 only for an exact profile 0, `level-idx` 5,
-/// tier 0 match (no directional level negotiation), so the SDP says nothing about size: the
-/// viewer's verified decode probe does. Sizes compare by area and by the longer side, which
-/// admits portrait shares of a landscape probe.
+/// What one viewer's AV1 payload type receives: the `level-idx` and `tier` its offer declared
+/// (AV1 RTP §7.2.3; defaults 5 and 0), and the sizes its decode probe verified. A stream must
+/// satisfy both. Sizes compare by area and by the longer side, which admits portrait shares of
+/// a landscape probe.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Av1Limits {
     pixels: u64,
     side: u32,
+    level: u8,
+    tier: u8,
+}
+
+/// The `level-idx` and `tier` an offer declares for an AV1 payload type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Av1Declared {
+    pub level: u8,
+    pub tier: u8,
+}
+
+impl Default for Av1Declared {
+    fn default() -> Self {
+        Self { level: 5, tier: 0 }
+    }
 }
 
 impl Av1Limits {
-    pub fn verified(cap: &gwar_proto::Av1Capability) -> Self {
-        Self { pixels: u64::from(cap.width) * u64::from(cap.height), side: cap.width.max(cap.height) }
+    pub fn new(cap: &gwar_proto::Av1Capability, declared: Av1Declared) -> Self {
+        Self {
+            pixels: u64::from(cap.width) * u64::from(cap.height),
+            side: cap.width.max(cap.height),
+            level: declared.level,
+            tier: declared.tier,
+        }
     }
 
     pub fn accepts(&self, need: &super::av1_stream::Requirements) -> bool {
-        need.pixels() <= self.pixels && need.width.max(need.height) <= self.side
+        need.pixels() <= self.pixels
+            && need.width.max(need.height) <= self.side
+            && need.level <= self.level
+            && need.tier <= self.tier
     }
+}
+
+/// Each m-line's AV1 profile 0 payload types and what they declare. Unparsable values drop the
+/// payload type: nothing is assumed beyond the defaults of omitted parameters.
+pub(super) fn offered_av1(sdp: &str) -> HashMap<Mid, HashMap<Pt, Av1Declared>> {
+    sections(sdp)
+        .into_iter()
+        .filter_map(|lines| {
+            let mid = lines.iter().find_map(|l| l.strip_prefix("a=mid:"))?;
+            let mut declared = HashMap::new();
+            for line in &lines {
+                let Some(pt) =
+                    line.strip_prefix("a=rtpmap:").and_then(|s| s.split_once(' ')).and_then(|(pt, codec)| {
+                        codec.eq_ignore_ascii_case("AV1/90000").then(|| pt.parse::<u8>().ok()).flatten()
+                    })
+                else {
+                    continue;
+                };
+                let prefix = format!("a=fmtp:{pt} ");
+                let fmtp = lines.iter().find_map(|l| l.strip_prefix(prefix.as_str())).unwrap_or("");
+                let mut av1 = Some(Av1Declared::default());
+                let mut profile = 0;
+                for (key, value) in fmtp.split(';').filter_map(|p| p.trim().split_once('=')) {
+                    let value = value.trim().parse::<u8>().ok();
+                    match key.trim() {
+                        "profile" => profile = value.unwrap_or(u8::MAX),
+                        "level-idx" => av1 = av1.zip(value).map(|(a, level)| Av1Declared { level, ..a }),
+                        "tier" => av1 = av1.zip(value).map(|(a, tier)| Av1Declared { tier, ..a }),
+                        _ => {}
+                    }
+                }
+                if let Some(av1) = av1.filter(|_| profile == 0) {
+                    declared.insert(Pt::from(pt), av1);
+                }
+            }
+            Some((Mid::from(mid), declared))
+        })
+        .collect()
 }
 
 pub(super) fn level_resources(id: u32) -> Option<(u32, u32)> {
@@ -165,7 +226,8 @@ mod tests {
     #[test]
     fn av1_limits_follow_the_verified_size_in_either_orientation() {
         use super::super::av1_stream::Requirements;
-        let limits = Av1Limits::verified(&gwar_proto::Av1Capability { width: 1920, height: 1080 });
+        let declared = Av1Declared { level: 13, tier: 0 };
+        let limits = Av1Limits::new(&gwar_proto::Av1Capability { width: 1920, height: 1080 }, declared);
         for (width, height, fits) in [
             (1920, 1080, true),
             (1080, 1920, true),
@@ -174,7 +236,51 @@ mod tests {
             (1921, 1080, false),
             (2000, 1000, false),
         ] {
-            assert_eq!(limits.accepts(&Requirements { width, height }), fits, "{width}x{height}");
+            assert_eq!(limits.accepts(&Requirements { width, height, level: 9, tier: 0 }), fits, "{width}x{height}");
+        }
+    }
+
+    #[test]
+    fn av1_streams_stay_within_the_level_and_tier_each_viewer_declared() {
+        use super::super::av1_stream::Requirements;
+        let sdp = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 35 36 37 38 39\r\na=mid:0\r\n\
+            a=rtpmap:35 AV1/90000\r\na=fmtp:35 level-idx=5;profile=0;tier=0\r\n\
+            a=rtpmap:36 AV1/90000\r\na=fmtp:36 profile=0;level-idx=8;tier=1\r\n\
+            a=rtpmap:37 av1/90000\r\na=fmtp:37 level-idx=12\r\n\
+            a=rtpmap:38 AV1/90000\r\n\
+            a=rtpmap:39 AV1/90000\r\na=fmtp:39 level-idx=13;profile=1;tier=0\r\n\
+            a=rtpmap:40 AV1/90000\r\na=fmtp:40 level-idx=x\r\n";
+        let offered = &offered_av1(sdp)[&Mid::from("0")];
+        let at = |level, tier| Av1Declared { level, tier };
+        assert_eq!(
+            offered,
+            &HashMap::from([
+                (35.into(), at(5, 0)),
+                (36.into(), at(8, 1)),
+                (37.into(), at(12, 0)),
+                (38.into(), at(5, 0))
+            ])
+        );
+        let cap = gwar_proto::Av1Capability { width: 2560, height: 1440 };
+        let stream = |level, tier| Requirements { width: 1920, height: 1080, level, tier };
+        // (declared level, declared tier, stream level, stream tier, accepted)
+        for (level, tier, stream_level, stream_tier, accepted) in [
+            (5, 0, 9, 0, false),
+            (8, 0, 9, 0, false),
+            (8, 1, 8, 0, true),
+            (8, 0, 8, 1, false),
+            (12, 0, 9, 0, true),
+            (12, 0, 13, 0, false),
+            (13, 0, 13, 0, true),
+            (13, 1, 13, 1, true),
+            (13, 0, 13, 1, false),
+        ] {
+            let limits = Av1Limits::new(&cap, at(level, tier));
+            assert_eq!(
+                limits.accepts(&stream(stream_level, stream_tier)),
+                accepted,
+                "declared {level}/{tier}, stream {stream_level}/{stream_tier}"
+            );
         }
     }
 

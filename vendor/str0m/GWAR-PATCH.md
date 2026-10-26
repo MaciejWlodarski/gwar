@@ -200,3 +200,11 @@ constraint_set3 when level_idc is 11 (Level 1.1), not 10 (Level 1).
 Negotiation tests cover both directions across 1, 1b and 1.1. The required Rust
 CI job runs the payload parameter library tests and SDP negotiation integration
 suite, including those upstream expectations.
+
+A2b matches AV1 payload types on `profile` alone. `level-idx` and `tier` are
+each receiver's own limits (AV1 RTP §7.2.3: asymmetric; the answerer may
+declare its own), so an answer keeps the locally configured values and the
+sending application keeps every stream within what the receiver declared.
+Upstream required equality of all three, so an offer whose level or tier
+differed from the local configuration in either direction lost AV1. `av1_levels_and_tiers_are_declared_per_receiver`
+covers this.

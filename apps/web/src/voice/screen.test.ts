@@ -2109,6 +2109,27 @@ describe("AV1", () => {
     guest.close();
   });
 
+  it("declares the level its verified size needs in the offer the SFU reads", async () => {
+    const { av1Level, declareAv1Level } = await import("./screen");
+    expect([[1280, 720], [1920, 1080], [2560, 1440]].map(([width, height]) => av1Level({ width: width!, height: height! }))).toEqual([8, 9, 12]);
+    const sdp = ["v=0", "m=video 9 UDP/TLS/RTP/SAVPF 45 46 98 47", "a=rtpmap:45 AV1/90000", "a=fmtp:45 level-idx=5;profile=0;tier=0", "a=rtpmap:46 rtx/90000", "a=fmtp:46 apt=45",
+      "a=rtpmap:98 H264/90000", "a=fmtp:98 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f", "a=rtpmap:47 av1/90000", ""].join("\r\n");
+    expect(declareAv1Level(sdp, 9).split("\r\n")).toEqual(["v=0", "m=video 9 UDP/TLS/RTP/SAVPF 45 46 98 47", "a=rtpmap:45 AV1/90000", "a=fmtp:45 profile=0;tier=0;level-idx=9",
+      "a=rtpmap:46 rtx/90000", "a=fmtp:46 apt=45", "a=rtpmap:98 H264/90000", "a=fmtp:98 level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
+      "a=rtpmap:47 av1/90000", "a=fmtp:47 level-idx=9", ""]);
+
+    // The watch transport sends the declared level, never the engine's nominal one.
+    const offerSdp = Peer.offerSdp;
+    Peer.offerSdp = sdp;
+    vi.stubGlobal("navigator", { mediaCapabilities: { decodingInfo: async (c: MediaDecodingConfiguration) => ({ supported: c.video!.height <= 1080, smooth: true, powerEfficient: true }) } });
+    const offer = vi.fn(async (_sdp: string) => "answer");
+    const transport = new ScreenWatchTransport({ run: 1, av1: true, iceServers: [], offer, state: () => {}, track: () => {} });
+    await transport.start();
+    expect(offer.mock.calls[0]![0]).toContain("a=fmtp:45 profile=0;tier=0;level-idx=9");
+    transport.close();
+    Peer.offerSdp = offerSdp;
+  });
+
   it("watches AV1 decode progress like H.264", async () => {
     const decodeFailed = vi.fn();
     const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {}, decodeFailed });

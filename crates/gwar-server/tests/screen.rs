@@ -808,8 +808,8 @@ fn bits(fields: &[(u32, usize)]) -> Vec<u8> {
     out
 }
 
-/// An AV1 keyframe in one packet: a 1920x1080 profile 0 sequence header and a shown KEY_FRAME
-/// frame OBU, both length-prefixed (W=0, N=1).
+/// An AV1 keyframe in one packet: a 1920x1080 profile 0 sequence header at level 4.1 (1080p60),
+/// main tier, and a shown KEY_FRAME frame OBU, both length-prefixed (W=0, N=1).
 fn av1_keyframe() -> Vec<u8> {
     let mut sequence = vec![0x08];
     sequence.extend(bits(&[
@@ -820,7 +820,7 @@ fn av1_keyframe() -> Vec<u8> {
         (0, 1),
         (0, 5),
         (0, 12),
-        (8, 5),
+        (9, 5),
         (0, 1),
         (15, 4),
         (15, 4),

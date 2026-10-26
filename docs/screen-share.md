@@ -2280,7 +2280,9 @@ The optional `screen.av1.capabilities {}` query (A2b) replies
 `av1: {width, height}`, the largest size (1280×720, 1920×1080 or 2560×1440 at
 60 fps) its AV1 decoder passed a WebRTC probe for; servers without A2b reject
 the unknown field, so clients send it only after the query. A viewer without
-it never receives AV1. Guests (`guest.offer`) carry no AV1 yet.
+it never receives AV1, nor a stream above the AV1 `level-idx`/`tier` its SDP
+declares; the web client declares the level its probed size needs (8, 9 or 12).
+Guests (`guest.offer`) carry no AV1 yet.
 
 Events:
 

@@ -366,6 +366,40 @@ export async function probeAv1(): Promise<Av1Capability | null> {
   return within(probes, 1500, null);
 }
 
+/**
+ * The AV1 `level-idx` that covers a verified decode size at 60 fps (AV1 Annex A): 4.0 for 720p,
+ * 4.1 for 1080p, 5.0 for 1440p. Browsers declare 3.1 (`level-idx=5`) whatever their decoder
+ * does, and the SFU sends each viewer no more than its SDP declares (AV1 RTP §7.2.3).
+ */
+export function av1Level(capability: Av1Capability): number {
+  return capability.height >= 1440 ? 12 : capability.height >= 1080 ? 9 : 8;
+}
+
+/** The offer with every AV1 payload type declaring `level` as what this side receives. */
+export function declareAv1Level(sdp: string, level: number): string {
+  const eol = sdp.includes("\r\n") ? "\r\n" : "\n";
+  const lines = sdp.split(/\r?\n/);
+  const pts = new Set(lines.flatMap(l => /^a=rtpmap:(\d+) AV1\/90000$/i.exec(l)?.[1] ?? []));
+  const out: string[] = [];
+  for (const line of lines) {
+    const fmtp = /^a=fmtp:(\d+) (.*)$/.exec(line);
+    if (fmtp && pts.has(fmtp[1]!)) {
+      const params = fmtp[2]!.split(";").filter(p => p.trim() && !/^\s*level-idx=/.test(p));
+      out.push(`a=fmtp:${fmtp[1]} ${[...params, `level-idx=${level}`].join(";")}`);
+      pts.delete(fmtp[1]!);
+      continue;
+    }
+    out.push(line);
+    const rtpmap = /^a=rtpmap:(\d+) AV1\/90000$/i.exec(line);
+    // A payload type without parameters gets them right after its rtpmap.
+    if (rtpmap && !lines.some(l => l.startsWith(`a=fmtp:${rtpmap[1]} `))) {
+      out.push(`a=fmtp:${rtpmap[1]} level-idx=${level}`);
+      pts.delete(rtpmap[1]!);
+    }
+  }
+  return out.join(eol);
+}
+
 /** Each returned tuple has passed a real WebRTC decoder probe; unavailable/timeout means SDP only. */
 export async function probeH264(): Promise<H264Capability[]> {
   const media = navigator.mediaCapabilities;
@@ -969,7 +1003,9 @@ export class ScreenWatchTransport {
     if (this.closed) return;
     const h264 = await probeH264();
     if (this.closed) return;
-    const answer = await this.params.offer(pc.localDescription?.sdp ?? "", this.run, h264, av1);
+    // The engine's local description keeps its nominal level; the SFU reads the declared one.
+    const local = pc.localDescription?.sdp ?? "";
+    const answer = await this.params.offer(av1 ? declareAv1Level(local, av1Level(av1)) : local, this.run, h264, av1);
     if (this.closed) return;
     await pc.setRemoteDescription({ type: "answer", sdp: answer });
     if (this.closed) return;

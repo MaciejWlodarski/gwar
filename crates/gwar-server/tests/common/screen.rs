@@ -114,13 +114,17 @@ async fn socket() -> (UdpSocket, std::net::SocketAddr) {
     (socket, local)
 }
 
-/// A str0m peer with VP9 and H.264 (PT `h264_pt`); with `av1`, also AV1 profile 0 level 5.1 on
-/// PT `pt` and the Dependency Descriptor on extension id `dd`.
+/// A str0m peer with VP9 and H.264 (PT `h264_pt`); with `av1`, also AV1 profile 0 on PT `pt`,
+/// declaring `level`, and the Dependency Descriptor on extension id `dd`.
 fn rtc(local: std::net::SocketAddr, h264_pt: u8, av1: Option<Av1>) -> Rtc {
     let mut config = Rtc::builder().set_rtp_mode(true).clear_codecs();
-    if let Some(Av1 { pt, dd }) = av1 {
-        let format =
-            str0m::format::FormatParams { profile: Some(0), level_idx: Some(5), tier: Some(0), ..Default::default() };
+    if let Some(Av1 { pt, dd, level }) = av1 {
+        let format = str0m::format::FormatParams {
+            profile: Some(0),
+            level_idx: Some(level),
+            tier: Some(0),
+            ..Default::default()
+        };
         config = config.set_extension(dd, dependency_descriptor::extension());
         config.codec_config().add_config(
             pt.into(),
@@ -138,11 +142,12 @@ fn rtc(local: std::net::SocketAddr, h264_pt: u8, av1: Option<Av1>) -> Rtc {
     rtc
 }
 
-/// A peer's AV1 payload type and Dependency Descriptor extension id.
+/// A peer's AV1 payload type, Dependency Descriptor extension id and receive `level-idx`.
 #[derive(Clone, Copy)]
 pub struct Av1 {
     pub pt: u8,
     pub dd: u8,
+    pub level: u8,
 }
 
 fn video_ssrcs(sdp: &str) -> (u32, u32) {
@@ -160,7 +165,8 @@ impl Publisher {
     pub async fn start_codec(client: &mut Client, share: &str, codec: Codec) -> Self {
         let (socket, local) = socket().await;
         // AV1 on other numbers than the server's, and the descriptor on another extension id.
-        let av1 = (codec == Codec::Av1).then_some(Av1 { pt: 41, dd: 7 });
+        // Like a browser, the publisher declares level 3.1 for what it would receive.
+        let av1 = (codec == Codec::Av1).then_some(Av1 { pt: 41, dd: 7, level: 5 });
         let mut rtc = rtc(local, 118, av1);
         let mut api = rtc.sdp_api();
         let mid = api.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
@@ -335,10 +341,12 @@ impl Viewer {
         .await
     }
 
-    /// Like [`Viewer::start`], also offering AV1 with the Dependency Descriptor and reporting
-    /// `capability` (the verified AV1 decode size) in the watch offer.
+    /// Like [`Viewer::start`], also offering AV1 at `level-idx` 9 (4.1, 1080p60) with the
+    /// Dependency Descriptor and reporting `capability` (the verified AV1 decode size) in the
+    /// watch offer.
     pub async fn start_av1(client: &mut Client, run: u64, capability: serde_json::Value) -> Self {
-        Self::negotiate_with(gwar_proto::SCREEN_SLOTS, run, Some(Av1 { pt: 47, dd: 14 }), move |sdp| async move {
+        let av1 = Av1 { pt: 47, dd: 14, level: 9 };
+        Self::negotiate_with(gwar_proto::SCREEN_SLOTS, run, Some(av1), move |sdp| async move {
             let offer = json!({"run": run, "sdp": sdp, "av1": capability});
             let answer = client.ok("screen.watch.offer", offer).await;
             answer["sdp"].as_str().unwrap().to_owned()

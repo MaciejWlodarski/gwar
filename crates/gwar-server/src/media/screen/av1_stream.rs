@@ -4,8 +4,9 @@
 //!
 //! A frame starts at a packet with Z=0 and, when the packet carries a descriptor, its
 //! start-of-frame flag; a descriptor that contradicts the aggregation header is malformed.
-//! Random access requires N=1 on that first packet, a complete sequence header with profile 0
-//! and a supported size, then a shown KEY_FRAME header, in that order. Sequence and frame
+//! Random access requires N=1 on that first packet, a complete sequence header with profile 0,
+//! a defined level up to [`RECEIVE_LEVEL`], main tier and a size within that level, then a
+//! shown KEY_FRAME header, in that order. Sequence and frame
 //! headers may be split across packets or sent in separate ones: the prefix is reassembled
 //! from consecutive packets, bounded per OBU, before [`super::av1::parse`] reads it. A
 //! descriptor on the first packet must attach its template structure, or viewers that join
@@ -18,10 +19,25 @@ use super::{
     dependency_descriptor::{self as dd, Raw},
 };
 
-/// AV1 level 5.1 picture limits (Annex A.3): MaxPicSize, MaxHSize and MaxVSize.
-const MAX_PICTURE: u64 = 8_912_896;
-const MAX_WIDTH: u32 = 8192;
-const MAX_HEIGHT: u32 = 4352;
+/// The `level-idx` the SFU declares as receiver on publish transports: level 5.1, main tier
+/// (AV1 RTP §7.2.3). Level 5.0 already covers the largest share, 1440p60; 5.1 leaves room for
+/// encoders that pick the next level up.
+pub(super) const RECEIVE_LEVEL: u8 = 13;
+pub(super) const RECEIVE_TIER: u8 = 0;
+
+/// Picture limits of the defined levels up to [`RECEIVE_LEVEL`] (Annex A.3): `seq_level_idx`,
+/// MaxPicSize, MaxHSize and MaxVSize. Other indices are undefined or reserved; 31 sets no
+/// limits at all.
+const LEVELS: [(u8, u64, u32, u32); 8] = [
+    (0, 147_456, 2048, 1152),
+    (1, 278_784, 2816, 1584),
+    (4, 665_856, 4352, 2448),
+    (5, 1_065_024, 5504, 3096),
+    (8, 2_359_296, 6144, 3456),
+    (9, 2_359_296, 6144, 3456),
+    (12, 8_912_896, 8192, 4352),
+    (13, 8_912_896, 8192, 4352),
+];
 /// Bytes kept of each OBU while reassembling headers. A sequence header that does not fit is
 /// refused; only the first bytes of a frame OBU are needed.
 const OBU_PREFIX: usize = 2048;
@@ -29,22 +45,31 @@ const OBU_SEQUENCE_HEADER: u8 = 1;
 const OBU_FRAME_HEADER: u8 = 3;
 const OBU_FRAME: u8 = 6;
 
-/// What a coded sequence asks of a decoder: its largest frame.
+/// What a coded sequence asks of a decoder: its largest frame, and its level and tier
+/// (operating point 0, which every viewer decodes while the SFU selects no layers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Requirements {
     pub width: u32,
     pub height: u32,
+    pub level: u8,
+    pub tier: u8,
 }
 
 impl Requirements {
-    /// Main profile (8/10-bit 4:2:0, the only one negotiated) within level 5.1's picture size.
+    /// Main profile (8/10-bit 4:2:0, the only one negotiated) at a defined level no higher than
+    /// the one the SFU declared, main tier, with its largest frame inside that level's limits.
     fn of(sequence: &SequenceHeader) -> Option<Self> {
         let (width, height) = (sequence.max_frame_width, sequence.max_frame_height);
+        let level = sequence.seq_level_idx;
+        let &(_, picture, max_width, max_height) = LEVELS.iter().find(|(idx, ..)| *idx == level)?;
         (sequence.seq_profile == 0
-            && width <= MAX_WIDTH
-            && height <= MAX_HEIGHT
-            && u64::from(width) * u64::from(height) <= MAX_PICTURE)
-            .then_some(Self { width, height })
+            && level <= RECEIVE_LEVEL
+            // Main tier only: the SFU declares no more.
+            && sequence.seq_tier == RECEIVE_TIER
+            && width <= max_width
+            && height <= max_height
+            && u64::from(width) * u64::from(height) <= picture)
+            .then_some(Self { width, height, level, tier: sequence.seq_tier })
     }
 
     pub fn pixels(&self) -> u64 {
@@ -298,25 +323,32 @@ pub(super) mod tests {
         out
     }
 
-    /// A sequence header OBU without a size field: one operating point at level 4.0.
+    /// A sequence header OBU without a size field: one operating point at level 5.0, main tier.
     pub(in crate::media::screen) fn sequence_obu(profile: u32, width: u32, height: u32) -> Vec<u8> {
+        sequence_obu_at(profile, width, height, 12, 0)
+    }
+
+    /// The same at `seq_level_idx` `level` (with `seq_tier` above level 3.3).
+    pub(in crate::media::screen) fn sequence_obu_at(
+        profile: u32,
+        width: u32,
+        height: u32,
+        level: u32,
+        tier: u32,
+    ) -> Vec<u8> {
+        let mut fields = vec![(profile, 3), (0, 1), (0, 1), (0, 1), (0, 1), (0, 5), (0, 12), (level, 5)];
+        if level > 7 {
+            fields.push((tier, 1));
+        }
+        fields.extend([(15, 4), (15, 4), (width - 1, 16), (height - 1, 16)]);
         let mut obu = vec![0x08];
-        obu.extend(bits(&[
-            (profile, 3),
-            (0, 1),
-            (0, 1),
-            (0, 1),
-            (0, 1),
-            (0, 5),
-            (0, 12),
-            (8, 5),
-            (0, 1),
-            (15, 4),
-            (15, 4),
-            (width - 1, 16),
-            (height - 1, 16),
-        ]));
+        obu.extend(bits(&fields));
         obu
+    }
+
+    /// Requirements of [`sequence_obu`]'s headers.
+    pub(in crate::media::screen) const fn main(width: u32, height: u32) -> Requirements {
+        Requirements { width, height, level: 12, tier: 0 }
     }
 
     pub(in crate::media::screen) const KEY: [u8; 4] = [0x30, 0x10, 0xaa, 0xbb];
@@ -356,7 +388,7 @@ pub(super) mod tests {
         0xfd, 0x12, 0x34, 0x87, 0xa2, 0x14, 0xea, 0xaa, 0x44, 0x10, 0x4d, 0x14, 0x10, 0x20, 0x84, 0x27, 0x07, 0x7f,
         0x04, 0x37,
     ];
-    const HD: Requirements = Requirements { width: 1920, height: 1080 };
+    const HD: Requirements = main(1920, 1080);
 
     #[test]
     fn a_keyframe_in_one_packet_is_confirmed_and_annotated() {
@@ -376,7 +408,7 @@ pub(super) mod tests {
     #[test]
     fn split_and_separate_headers_confirm_at_the_actual_first_packet() {
         let seq = sequence_obu(0, 1280, 720);
-        let need = Requirements { width: 1280, height: 720 };
+        let need = main(1280, 720);
         // Sequence header split in two, then the frame header in its own packet.
         let first = forward(10, rtp(false, true, true, &[&seq[..4]]), None);
         let second = forward(11, rtp(true, false, false, &[&seq[4..]]), None);
@@ -466,7 +498,7 @@ pub(super) mod tests {
         admission.inspect(&mut repair).unwrap();
         let mut rest = forward(6, rtp(true, false, false, &[&wide[3..], &KEY]), None);
         admission.inspect(&mut rest).unwrap();
-        assert_eq!(rest.av1, Some(Requirements { width: 2560, height: 1440 }));
+        assert_eq!(rest.av1, Some(main(2560, 1440)));
         // A gap, a new frame or an unsupported profile inside a fragment fails.
         let bad = sequence_obu(1, 1920, 1080);
         for (head, second_source, second) in [
@@ -482,6 +514,42 @@ pub(super) mod tests {
         }
         let mut unsupported = forward(30, rtp(false, false, true, &[&sequence_obu(2, 1920, 1080), &KEY]), None);
         assert!(admission.inspect(&mut unsupported).is_err());
+    }
+
+    #[test]
+    fn levels_and_tiers_above_the_declared_ceiling_never_open_a_segment() {
+        // (seq_level_idx, seq_tier, width, height, admitted)
+        for (level, tier, width, height, admitted) in [
+            (8, 0, 1920, 1080, true),
+            (9, 0, 1920, 1080, true),
+            (12, 0, 2560, 1440, true),
+            (13, 0, 2560, 1440, true),
+            (13, 1, 1920, 1080, false),
+            (23, 1, 1920, 1080, false),
+            (14, 0, 1920, 1080, false),
+            (31, 0, 1920, 1080, false),
+            (31, 1, 1920, 1080, false),
+            (6, 0, 1280, 720, false),
+            (24, 0, 1280, 720, false),
+            (9, 0, 2560, 1440, false),
+            (5, 0, 1920, 1080, false),
+        ] {
+            let seq = sequence_obu_at(0, width, height, level, tier);
+            let need = admitted.then_some(Requirements { width, height, level: level as u8, tier: tier as u8 });
+            let case = format!("level {level} tier {tier} {width}x{height}");
+            // A complete header in one packet, inspected live and confirmed.
+            let mut packet = forward(1, rtp(false, false, true, &[&seq, &KEY]), Some(ATTACHED));
+            let mut admission = Admission::default();
+            assert_eq!(admission.inspect(&mut packet).is_ok(), admitted, "{case}");
+            assert_eq!(confirm(&prefix(vec![packet])), need.ok_or(()).map(Some), "{case}");
+            // The same header split across packets, live and reassembled.
+            let first = forward(10, rtp(false, true, true, &[&seq[..3]]), None);
+            let second = forward(11, rtp(true, false, false, &[&seq[3..], &KEY]), None);
+            let mut admission = Admission::default();
+            admission.inspect(&mut first.clone()).unwrap();
+            assert_eq!(admission.inspect(&mut second.clone()).is_ok(), admitted, "{case}: live split");
+            assert_eq!(confirm(&prefix(vec![first, second])), need.ok_or(()).map(Some), "{case}: reassembled");
+        }
     }
 
     #[test]

@@ -311,7 +311,7 @@ commands, like voice today. It keeps the command-surface rules of
 | | H.264 | VP9 | AV1 | HEVC |
 | --- | --- | --- | --- | --- |
 | Browser screen transport (A2, A2b) | preferred without a hardware AV1 encoder; hardware or OpenH264 | emergency fallback, profile 0 | first with a hardware encoder (A2b); decode verified per size | not used |
-| SFU (A2, A2b) | mode 1, three admitted profiles | profile 0 | profile 0, level 5.1 (`level-idx=5`), main tier, with DD | not used |
+| SFU (A2, A2b) | mode 1, three admitted profiles | profile 0 | profile 0, receives up to level 5.1 (`level-idx=13`) main tier, sends within each viewer's declared level/tier, with DD | not used |
 
 VP8 is dropped from screen negotiation. Historical browser/API inventories
 below may mention codecs exposed by the platform; they are not Gwar offers.
@@ -967,19 +967,19 @@ reconstruction, dispatched for `Codec::Av1` in `src/packet/mod.rs`.
 `RtcConfig::enable_av1` and `CodecConfig::enable_av1` configure AV1 at 90 kHz
 with RTX (default payload types 45/46). AV1 is enabled in upstream defaults;
 Gwar's screen transports call `clear_codecs` and enable H.264 mode 1
-and VP9 profile 0 with RTX; since A2b, AV1 profile 0, `level-idx=5`, tier 0
-on PT 45 with RTX 46 comes first while the share may still use AV1. VP8 is
-dropped.
+and VP9 profile 0 with RTX; since A2b, AV1 profile 0, `level-idx=13`
+(level 5.1), tier 0 on PT 45 with RTX 46 comes first while the share may
+still use AV1. VP8 is dropped.
 `src/format/codec.rs` supplies AV1 MIME/SDP naming;
 `src/format/format_params.rs` parses and serializes AV1 SDP `profile`,
 `level-idx` and `tier`, but
 [`src/format/payload_params.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/format/payload_params.rs)
 requires equality for all three (defaults 0, 5, 0); directional level/tier
-limit matching is not implemented. A2b handles that constraint by
-answering only that one AV1 format (the AV1 RTP specification's default)
-and taking each viewer's AV1 size limit from a verified decode capability
-in its watch offer, not from SDP; the sequence header's maximum frame size
-must fit both level 5.1 and that limit. Both `detect_av1_keyframe` and the depacketizer's
+limit matching is not implemented. A2b patches the vendored copy to match
+AV1 on `profile` alone (`GWAR-PATCH.md`): `level-idx` and `tier` are each
+receiver's own limits (AV1 RTP §7.2.3), so offers at any level negotiate,
+the SFU's answer declares what it receives (level 5.1, main tier), and the
+SFU keeps what it sends within each viewer's declared level and tier. Both `detect_av1_keyframe` and the depacketizer's
 `Av1CodecExtra::is_keyframe` metadata use only `N`; neither supplies Gwar's
 stricter candidate check or bounded sequence-header/key-frame confirmation.
 [`src/rtp/ext.rs`](https://docs.rs/crate/str0m/0.24.1/source/src/rtp/ext.rs)
@@ -1993,18 +1993,30 @@ production server is involved.
   no encoder required. Real hardware temporal publishing is B11.
 - <a id="a2b-status"></a>Status (2026-10-26): **built for plaintext browser
   shares.** What landed and where it deviates from the plan above:
-  - Negotiation: AV1 profile 0 / `level-idx=5` / tier 0 (PT 45, RTX 46) is
-    answered first on publish transports while the share may still use AV1
-    (not encrypted, not retired), and always on watch transports. The DD
-    extension (id 12) is registered on both. Watch offers carry an optional
-    `av1: {width, height}` (720p, 1080p or 1440p at 60 fps) after
-    `screen.av1.capabilities` answers `{screen_av1: true}`; without it no AV1
-    reaches the viewer, browser or native.
+  - Negotiation: AV1 profile 0 (PT 45, RTX 46) is answered first on publish
+    transports while the share may still use AV1 (not encrypted, not
+    retired), and always on watch transports. Offers match on the profile;
+    `level-idx` and `tier` are each receiver's own limits (AV1 RTP §7.2.3).
+    The SFU's publish answer declares `level-idx=13` (level 5.1; 5.0 already
+    covers the largest share, 1440p60) and main tier. A viewer receives a
+    stream only within the `level-idx`/`tier` its offer declared for that
+    payload type (defaults 5 and 0) **and** within its verified decode size:
+    watch offers carry an optional `av1: {width, height}` (720p, 1080p or
+    1440p at 60 fps) after `screen.av1.capabilities` answers
+    `{screen_av1: true}`; without it no AV1 reaches the viewer, browser or
+    native. Browsers declare `level-idx=5` (3.1) whatever their decoder does,
+    so the web client rewrites the AV1 `level-idx` of the watch offer it sends
+    to the level its probed size needs at 60 fps: 8 (4.0) for 720p, 9 (4.1)
+    for 1080p, 12 (5.0) for 1440p. The DD extension (id 12) is registered on
+    both transports.
   - Admission: the bounded H.264 join prefix also confirms AV1. The first
     buffered packet must start a temporal unit (`Z=0`, `N=1`, DD start of
     frame when present) and its DD must attach a template structure; a
-    complete profile-0 sequence header within level 5.1 must precede a shown
-    key frame header, reassembled within 2 KB from contiguous packets
+    complete profile-0 sequence header must precede a shown key frame
+    header. Operating point 0's `seq_level_idx` must be a defined level no
+    higher than 5.1 (13; reserved values and 31, "maximum parameters", are
+    refused), its tier main, and the maximum frame size within that level's
+    MaxPicSize/MaxHSize/MaxVSize. Headers are reassembled within 2 KB from contiguous packets
     (split sequence headers and separate sequence/frame headers included).
     Admission marks the buffered frame's first packet. Live split sequence
     headers are reassembled only from consecutive newest packets; a lost or
