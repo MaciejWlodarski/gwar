@@ -219,7 +219,8 @@ async function share(page, surface, preset = null) {
   await page.getByRole("button", { name: "Share screen", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Share your screen" });
   await dialog.waitFor({ timeout: 20_000 });
-  await dialog.getByText(surface, { exact: true }).waitFor();
+  // Synthetic canvas tracks may report either an unknown surface or a monitor.
+  await dialog.getByText(surface === "Sharing your screen" ? /^Sharing your (?:entire )?screen$/ : surface, { exact: true }).waitFor();
   if (preset) {
     await dialog.getByRole("radio", { name: preset === "Text" ? "Sharp text" : "Smoothness", exact: true }).check();
     await dialog.getByLabel("Resolution", { exact: true }).selectOption(preset === "Saver" ? "720" : "1080");
@@ -447,9 +448,29 @@ async function run(browsers, web, server, token) {
   await waitFor(async () => (await shareOf(cv, "c3-restart")) === null, "the first share ends for viewers");
   const second = await share(c3, "Sharing your screen");
   assert.notEqual(second, first, "a new share gets a new id");
+  const oldViewerRun = await session(cv, (_, screen) => screen.transport.run);
+  await cv.evaluate(share => {
+    window.__reuseFrames = [];
+    const sample = () => {
+      const video = document.querySelector(`video[data-share="${share}"]`);
+      if (video && getComputedStyle(video).opacity === "1") {
+        const frame = window.__readBarcode(video);
+        if (frame && !frame.invalid) window.__reuseFrames.push(frame.id);
+      }
+      window.__reuseSampler = requestAnimationFrame(sample);
+    };
+    sample();
+  }, second);
   await watch(cv, "c3-restart");
   // The second share has its own source (6, another shape): its frames cannot be the first's.
   await sees(cv, second, 6, "second share of the restarting sharer");
+  const reuseFrames = await cv.evaluate(() => {
+    cancelAnimationFrame(window.__reuseSampler);
+    return window.__reuseFrames;
+  });
+  assert.ok(reuseFrames.length > 0 && reuseFrames.every(id => id === 6), `reused slot showed another share: ${reuseFrames}`);
+  assert.ok(await session(cv, (_, screen) => screen.transport.run) > oldViewerRun, "slot reuse renewed the viewer's receiver");
+  checks.push({ check: "slot reuse never displays the previous share's barcode", ok: true });
   await sees(c3, csShare, 1, "still watching the tab share after start → stop → start");
   await sees(c3, wsShare, 2, "still watching the canvas share after start → stop → start");
   assert.deepEqual(await session(c3, (_, screen) => screen.transport), transport, "the watch transport stayed the same");

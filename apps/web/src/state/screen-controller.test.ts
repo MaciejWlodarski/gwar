@@ -137,7 +137,7 @@ describe("watching", () => {
     let unavailable = 2;
     const { link, ops, calls } = fakeLink({
       "screen.watch.offer": () => ({ sdp: "answer" }),
-      "screen.watch": () => { if (unavailable-- > 0) throw new RequestError("unavailable", "connect a watch transport first"); return { slot: 1 }; },
+      "screen.watch": d => { if (unavailable-- > 0) throw new RequestError("unavailable", "connect a watch transport first"); return { slot: d.share === "A" ? 1 : 2 }; },
     });
     const screen = new ScreenController(() => link, String);
     const watching = screen.watch("A");
@@ -182,6 +182,112 @@ describe("watching", () => {
     screen.handleEvent({ ev: "screen.stopped", d: { share: "A", reason: "access" } });
     expect(useScreen.getState().stage).toBeNull();
     expect(toast).toHaveBeenCalledWith("info", "You can no longer watch this screen share.");
+  });
+});
+
+describe("reused receive slots", () => {
+  function setup() {
+    for (const id of ["B", "C", "D"]) useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "screen.started", d: share(id, 2, 2) } });
+    let offers = 0;
+    const pending = deferred<{ slot: number }>();
+    const { link, ops } = fakeLink({
+      "screen.watch.offer": () => { offers++; return { sdp: "answer" }; },
+      "screen.watch": d => offers === 1
+        ? d.share === "D" ? pending.promise : { slot: d.share === "A" ? 0 : 1 }
+        : { slot: d.share === "C" ? 0 : d.share === "A" ? 1 : 2 },
+    });
+    const screen = new ScreenController(() => link, String);
+    const start = async () => {
+      const watching = screen.watch("A");
+      await flush();
+      media.transports[0]!.params.state("connected");
+      await watching;
+      await screen.watch("B");
+      return media.transports[0]!;
+    };
+    return { screen, start, pending, ops };
+  }
+
+  it.each(["unwatch", "release"])("renews only on reuse after %s, preserving the other watches", async how => {
+    const { screen, start } = setup();
+    const old = await start();
+    const stream = {} as MediaStream;
+    useScreen.getState().dispatch({ type: "stream", run: old.params.run, slot: 1, stream });
+    if (how === "unwatch") await screen.unwatch("B");
+    else screen.handleEvent({ ev: "screen.slot", d: { run: old.params.run, slot: 1, share: null } });
+    // Keep the track for this run; only a new run can supply a new receiver.
+    expect(useScreen.getState().streams[1]).toBe(stream);
+    const watching = screen.watch("C");
+    await flush();
+    expect(old.close).toHaveBeenCalledOnce();
+    expect(media.transports).toHaveLength(2);
+    expect(useScreen.getState().watches).toMatchObject([
+      { share: "A", status: "requesting", slot: null }, { share: "C", status: "requesting", slot: null },
+    ]);
+    expect(useScreen.getState().streams.every(s => s === null)).toBe(true);
+    media.transports[1]!.params.state("connected");
+    await watching;
+    await flush();
+    expect(useScreen.getState().watches).toMatchObject([
+      { share: "A", status: "watching", slot: 1 }, { share: "C", status: "watching", slot: 0 },
+    ]);
+    expect(useScreen.getState().stage).toBe("C");
+    expect(toast).not.toHaveBeenCalled();
+    screen.reset();
+  });
+
+  it.each(["answer", "error"])("an old run's late %s cannot release or end a replacement watch", async how => {
+    const { screen, start, pending, ops } = setup();
+    await start();
+    const slow = screen.watch("D");
+    await flush();
+    await screen.unwatch("B");
+    const watching = screen.watch("C");
+    await flush();
+    media.transports[1]!.params.state("connected");
+    await watching;
+    const releases = ops().filter(op => op === "screen.unwatch").length;
+    if (how === "answer") pending.resolve({ slot: 2 });
+    else pending.reject(new Error("old run ended"));
+    await slow;
+    await flush();
+    expect(useScreen.getState().watches).toMatchObject([
+      { share: "A", status: "watching" }, { share: "D", status: "watching" }, { share: "C", status: "watching" },
+    ]);
+    expect(ops().filter(op => op === "screen.unwatch")).toHaveLength(releases);
+    expect(toast).not.toHaveBeenCalled();
+    screen.reset();
+  });
+
+  it("ends waiting watches through the existing transport failure path", async () => {
+    const { screen, start } = setup();
+    await start();
+    await screen.unwatch("B");
+    const watching = screen.watch("C");
+    await flush();
+    media.transports[1]!.params.state("failed");
+    await watching;
+    await flush();
+    expect(useScreen.getState().watches).toEqual([]);
+    expect(useScreen.getState().stage).toBeNull();
+    expect(toast).toHaveBeenCalledExactlyOnceWith("error", "The connection for watching screen shares was lost.");
+    screen.reset();
+  });
+
+  it("ends a silent watch, fencing a retired element's first-frame timeout", async () => {
+    const { screen, start, ops } = setup();
+    const old = await start();
+    const watch = useScreen.getState().watches.find(w => w.share === "B")!;
+    screen.frameFailed("B", old.params.run - 1, watch.id);
+    screen.frameFailed("B", old.params.run, watch.id - 1);
+    expect(useScreen.getState().watches).toHaveLength(2);
+    expect(toast).not.toHaveBeenCalled();
+    screen.frameFailed("B", old.params.run, watch.id);
+    await flush();
+    expect(useScreen.getState().watches.map(w => w.share)).toEqual(["A"]);
+    expect(ops().filter(op => op === "screen.unwatch")).toHaveLength(1);
+    expect(toast).toHaveBeenCalledExactlyOnceWith("error", "The connection for watching screen shares was lost.");
+    screen.reset();
   });
 });
 

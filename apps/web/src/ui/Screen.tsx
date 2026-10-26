@@ -250,29 +250,42 @@ export function LiveBadge({ client, name }: { client: Client; name: string }) {
 // -------------------------------------------------------------------- stage
 
 /** A watched share's video, from its slot's stream. */
-function ShareVideo({ share, className, onDoubleClick, videoRef }: { share: string; className?: string; onDoubleClick?: () => void; videoRef?: (video: HTMLVideoElement | null) => void }) {
+export function ShareVideo({ share, className, onDoubleClick, videoRef }: { share: string; className?: string; onDoubleClick?: () => void; videoRef?: (video: HTMLVideoElement | null) => void }) {
   const t = useT();
+  const run = useScreen(s => s.transport.run);
+  const watchId = useScreen(s => s.watches.find(w => w.share === share)?.id);
   const stream = useScreen(s => { const slot = slotOf(s, share); return slot === null ? null : (s.streams[slot] ?? null); });
   const ref = useRef<HTMLVideoElement | null>(null);
-  const [showing, setShowing] = useState(false);
+  const [shown, setShown] = useState<MediaStream | null>(null);
+  const showing = stream !== null && shown === stream;
   useEffect(() => {
     const video = ref.current;
     if (!video) return;
     if (video.srcObject !== stream) video.srcObject = stream;
     if (stream) void video.play().catch(() => {});
-  }, [stream]);
+    return () => { video.srcObject = null; };
+  }, [stream, run, watchId]);
+  useEffect(() => {
+    if (!stream || watchId === undefined || showing) return;
+    // Allow the server's budgeted startup PLI retries and H.264 recovery, but end a
+    // silent watch rather than wait forever (also on older servers and VP9).
+    const timer = setTimeout(() => controller.screen.frameFailed(share, run, watchId), 35_000);
+    return () => clearTimeout(timer);
+  }, [share, stream, run, watchId, showing]);
   return (
     <div className={cn("relative flex min-h-0 items-center justify-center overflow-hidden bg-black", className)}>
       <video
+        // A replacement run/watch must discard the media element's own cached frame too.
+        key={`${run}:${watchId}`}
         ref={video => { ref.current = video; videoRef?.(video); }}
         data-share={share}
         muted
         autoPlay
         playsInline
-        onLoadedData={() => setShowing(true)}
-        onResize={() => setShowing(true)}
+        onLoadedData={() => setShown(stream)}
+        onResize={() => setShown(stream)}
         onDoubleClick={onDoubleClick}
-        className="size-full object-contain"
+        className={cn("size-full object-contain", !showing && "opacity-0")}
       />
       {!showing && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-white/70">{t("screen.connecting")}</div>

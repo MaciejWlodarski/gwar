@@ -94,6 +94,8 @@ export class ScreenController {
   private publisher: ScreenPublisher | null = null;
   private transport: ScreenWatchTransport | null = null;
   private transportReady: Promise<number> | null = null;
+  /** A receiver that carried a share can still hold its last decoded frame. */
+  private readonly usedSlots = new Set<number>();
   private attempts = 0;
   private watchIds = 0;
   /** Each share's watch requests, one at a time. */
@@ -326,25 +328,46 @@ export class ScreenController {
     const id = ++this.watchIds;
     const generation = this.generation;
     dispatch({ type: "watch", share, id });
+    await this.serial(share, () => this.startWatch(conn, share, id, generation));
+  }
+
+  private async startWatch(conn: Link, share: string, id: number, generation: number): Promise<void> {
     const alive = () => this.generation === generation && this.link() === conn && useScreen.getState().watches.some(w => w.id === id);
-    await this.serial(share, async () => {
-      try {
-        if (!alive()) return;
-        const run = await this.ensureTransport(conn);
-        const current = () => alive() && useScreen.getState().transport.run === run;
-        if (!current()) return;
-        const slot = await this.requestWatch(conn, share, current);
-        if (slot === null) return;
-        if (!current()) { await conn.request("screen.unwatch", { share }).catch(() => {}); return; }
-        dispatch({ type: "granted", run, id, slot });
-        if (useScreen.getState().stage === share) void conn.request("screen.focus", { share }).catch(() => {});
-      } catch (e) {
-        if (!alive()) return;
-        const text = this.watchError(e);
-        dispatch({ type: "unwatch", share });
-        useUi.getState().toast("error", text);
+    let run: number | undefined;
+    try {
+      if (!alive() || useScreen.getState().watches.find(w => w.id === id)?.status !== "requesting") return;
+      run = await this.ensureTransport(conn);
+      const current = () => alive() && useScreen.getState().transport.run === run;
+      if (!current()) return;
+      const slot = await this.requestWatch(conn, share, current);
+      if (slot === null) return;
+      // A retired run has already lost all its grants. Releasing by share there could
+      // instead release a watch that has since moved to the replacement transport.
+      if (useScreen.getState().transport.run !== run) return;
+      const reused = this.usedSlots.has(slot);
+      this.usedSlots.add(slot);
+      if (!current()) { await conn.request("screen.unwatch", { share }).catch(() => {}); return; }
+      if (reused) {
+        // Never attach a new share to an old decoder's pixels. A new run gives every
+        // watch a fresh receiver and requests its startup keyframe, including static
+        // shares. Keep the other watches; their per-share queues fence late releases.
+        const watches = useScreen.getState().watches;
+        this.dropTransport();
+        void this.ensureTransport(conn).catch(() => {});
+        for (const watch of watches) {
+          if (watch.id !== id) void this.serial(watch.share, () => this.startWatch(conn, watch.share, watch.id, generation));
+        }
+        await this.startWatch(conn, share, id, generation);
+        return;
       }
-    });
+      dispatch({ type: "granted", run, id, slot });
+      if (useScreen.getState().stage === share) void conn.request("screen.focus", { share }).catch(() => {});
+    } catch (e) {
+      if (!alive() || (run !== undefined && useScreen.getState().transport.run !== run)) return;
+      const text = this.watchError(e);
+      dispatch({ type: "unwatch", share });
+      useUi.getState().toast("error", text);
+    }
   }
 
   /**
@@ -394,6 +417,14 @@ export class ScreenController {
         if (this.generation === generation && this.link() === conn) await conn.request("screen.unwatch", { share }).catch(() => {});
       });
     }
+  }
+
+  /** A connected receiver can stay silent without tripping the H.264 decode watchdog. */
+  frameFailed(share: string, run: number, id: number): void {
+    const screen = useScreen.getState();
+    if (screen.transport.run !== run || !screen.watches.some(w => w.id === id && w.share === share && w.status === "watching")) return;
+    void this.unwatch(share);
+    useUi.getState().toast("error", tNow("screen.watchFailed"));
   }
 
   /** Puts a watched share on the stage: it gets the first claim on my bandwidth. */
@@ -486,6 +517,7 @@ export class ScreenController {
    */
   private dropTransport(): void {
     this.transport?.close();
+    this.usedSlots.clear();
     this.transport = null;
     this.transportReady = null;
     const retire = this.retireReady;

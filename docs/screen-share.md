@@ -2705,7 +2705,18 @@ from native capture is PR 10.
     `getStats`), and "Stop watching".
   - The sharer's speaking ring shows on their card, from the existing
     `voice.talking` event.
-  - Reused slot may briefly show the previous share's last frame until the new keyframe decodes (cosmetic).
+  - Before a member viewer reuses a receive slot, the client renews the watch
+    transport and re-watches its active shares. This briefly reloads the other
+    watched shares too, but discards the old receiver's decoded frames entirely;
+    each watch/run also gets a fresh video element. Streams stay intact within
+    their run. First-use slots keep the current transport.
+  - The first decoded frame reveals the video, including a static share's single
+    startup keyframe. Watch assignment already requests a budgeted, retried PLI;
+    no extra frame, new server notification or timed reveal is required. The
+    existing offer/connect and H.264 recovery watchdogs still apply. A connected
+    receiver that never supplies a first frame ends its watch after 35 s through
+    the normal unwatch/error path, also for VP9 and older servers. Rapid reuse
+    can hit the existing offer rate limit and its bounded retry delay.
   - No sound in the first release; phase 2 adds a volume slider and mute per
     share ([Shared audio](#shared-audio-phase-2)).
 - **Encrypted.** The same lock as voice ("End-to-end encrypted") on the stage,
