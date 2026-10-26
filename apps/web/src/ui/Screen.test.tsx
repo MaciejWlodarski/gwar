@@ -153,7 +153,11 @@ describe("watched video frames", () => {
       expect(prepared).toBeInstanceOf(HTMLVideoElement);
       expect(prepared.srcObject).toBe(stream);
       expect(prepared.isConnected).toBe(true);
-      expect(prepared.closest("[data-screen-players]")?.getAttribute("aria-hidden")).toBe("true");
+      const parking = prepared.closest<HTMLDivElement>("[data-screen-players]")!;
+      expect(parking.getAttribute("aria-hidden")).toBe("true");
+      expect(parking.style.opacity).toBe("0");
+      expect(parking.style.zIndex).toBe("0");
+      expect(prepared.classList.contains("opacity-0")).toBe(false);
       expect(container.querySelector("video")).toBeNull();
       // Its single startup keyframe can precede the grant and the React commit.
       Object.defineProperty(prepared, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_CURRENT_DATA });

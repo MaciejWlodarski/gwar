@@ -259,7 +259,9 @@ function parkSlotVideo(video: HTMLVideoElement) {
     slotVideoParking = document.createElement("div");
     slotVideoParking.dataset.screenPlayers = "";
     slotVideoParking.setAttribute("aria-hidden", "true");
-    slotVideoParking.style.cssText = "position:fixed;top:0;left:0;width:16px;height:16px;display:grid;grid-template: minmax(0,1fr) / minmax(0,1fr);overflow:hidden;pointer-events:none;z-index:-1";
+    // A negative layer behind the document can stall WebKit's idle players at
+    // HAVE_NOTHING. Keep their renderers present; hide the parent, not each video.
+    slotVideoParking.style.cssText = "position:fixed;top:0;left:0;width:16px;height:16px;display:grid;grid-template: minmax(0,1fr) / minmax(0,1fr);overflow:hidden;pointer-events:none;opacity:0;z-index:0";
     const cover = document.createElement("div");
     cover.style.cssText = "position:absolute;inset:0;background:black;z-index:1";
     slotVideoParking.appendChild(cover);
@@ -279,7 +281,7 @@ function prepareSlotVideo(stream: MediaStream | null) {
   if (stream) {
     slotVideos.set(stream, player);
     // WebKit needs a live rendering consumer before negotiation supplies codec
-    // metadata. Keep unused players connected under an opaque mask, behind the app.
+    // metadata. Keep unused players connected in the transparent parking layer.
     parkSlotVideo(video);
     // Create its renderer now, before media can arrive during SDP negotiation.
     void video.offsetWidth;

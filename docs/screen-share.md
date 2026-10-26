@@ -2728,8 +2728,9 @@ from native capture is PR 10.
     watch, the client renews the transport to discard the old receiver's decoded
     frames. Each slot stream gets one video element, bound when its receiver is
     created. Negotiation yields one task so media resource selection can start
-    before SDP or a startup keyframe. Unused players stay connected under a black
-    cover behind the app; active players move between
+    before SDP or a startup keyframe. Unused players stay connected in a transparent
+    parent at a nonnegative z-index: parking behind the document background can
+    stall Linux WebKit's idle slots at 0×0. Active players move between
     the stage and thumbnails without rebinding. Retiring the stream detaches and
     discards that player; a new transport's streams always get fresh elements.
     The cache is bounded by the run's receive slots. First-use slots keep the
