@@ -44,8 +44,19 @@ export function newsworthy(item: ChatItem, teamspeak: boolean): item is Extract<
   return item.kind === "msg" && !item.removed && !item.cannotOpen && item.msg.text !== DELETION_TEXT && (teamspeak || item.verified === true);
 }
 
-/** The messages of `shown` that `current` still holds as they were (same message object, so unedited and undeleted). */
-export function stillHeld<T extends Extract<ChatItem, { kind: "msg" }>>(shown: T[], current: ChatItem[]): T[] {
-  const held = new Set(current.flatMap((i) => (i.kind === "msg" ? [i.msg] : [])));
-  return shown.every((i) => held.has(i.msg)) ? shown : shown.filter((i) => held.has(i.msg));
+type MsgItem = Extract<ChatItem, { kind: "msg" }>;
+
+/** What verifying a server message covers: the message and the group it was sealed in. */
+const content = (i: MsgItem) => JSON.stringify([i.sealed?.group, i.sealed?.epoch, i.msg]);
+
+/**
+ * The messages of `shown` that `current` still holds unchanged, as `current` holds them. Compared by
+ * content, not by object: a history reload brings equal copies, while an edit or a deletion changes it.
+ */
+export function stillHeld(shown: MsgItem[], current: ChatItem[]): MsgItem[] {
+  const byId = new Map(current.flatMap((i) => (i.kind === "msg" ? [[i.msg.id, i] as const] : [])));
+  return shown.flatMap((s) => {
+    const now = byId.get(s.msg.id);
+    return now && (now === s || content(now) === content(s)) ? [now] : [];
+  });
 }
