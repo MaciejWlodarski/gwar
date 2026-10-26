@@ -1039,6 +1039,8 @@ async fn request_bursts_are_rate_limited() {
 async fn malformed_floods_use_up_the_allowance_and_then_the_connection() {
     let server = TestServer::start().await;
     let mut a = Client::connect(&server, "alice").await;
+    let mut observer = Client::connect(&server, "observer").await;
+    let session = a.id();
     // Garbage is charged like any request: after it, a real request is refused...
     for _ in 0..40 {
         a.send_raw("{").await;
@@ -1047,9 +1049,24 @@ async fn malformed_floods_use_up_the_allowance_and_then_the_connection() {
     assert_eq!(a.reply(id).await.unwrap_err().code, gwar_proto::ErrorCode::RateLimited);
     // ...and a client that keeps going past the limit is dropped.
     for _ in 0..200 {
-        a.send_raw("{").await;
+        a.send_refused("{").await;
     }
-    assert_eq!(a.expect_disconnect().await["kind"], "timeout");
+    // The flood can still be writing when the server closes its socket. Unread incoming data
+    // can reset TCP before the final `disconnected` frame reaches the flooding peer. Check the
+    // reason through a healthy connection, and still require the flood's socket to close.
+    let left = observer.next_event_where("client.left", |d| d["client"] == session).await;
+    assert_eq!(left["reason"]["kind"], "timeout");
+    within("flooded connection closes", async {
+        while let Some(frame) = a.raw_frame().await {
+            if frame["ev"] == "disconnected" {
+                assert_eq!(frame["d"]["reason"]["kind"], "timeout");
+            }
+        }
+    })
+    .await;
+    observer.sync().await;
+    let fresh = Client::connect(&server, "fresh").await;
+    assert!(fresh.welcome.clients.iter().all(|c| c.id != session));
 }
 
 // -------------------------------------------------------- screen sharing

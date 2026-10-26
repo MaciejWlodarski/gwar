@@ -157,7 +157,11 @@ async function newPage(browser, name, share) {
 async function member(browser, web, server, name) {
   const page = await newPage(browser, name, true);
   await page.goto(web);
-  await page.getByLabel("Server address").fill(server);
+  const address = page.getByLabel("Server address");
+  // The same-origin /health probe also writes this field. Let it finish before fill() selects
+  // and replaces the value, or its result can land between selection and text insertion.
+  await waitFor(async () => await address.inputValue() === new URL(web).host, "same-origin server address");
+  await address.fill(server);
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   await page.getByRole("tab", { name: "Identity", exact: true }).click();
   const nickname = page.getByRole("dialog").getByLabel("Nickname", { exact: true });
@@ -344,7 +348,7 @@ try {
   failure = error;
   for (const page of opened) {
     const status = await page.locator("#status").textContent({ timeout: 1_000 }).catch(() => null);
-    console.error(JSON.stringify({ page: page.deviceName, url: page.url().replace(/#.*/, "#…"), status, decoded: await decoded(page).catch(e => String(e)), errors: page.errors.slice(-20) }));
+    console.error(JSON.stringify({ page: page.deviceName, url: page.url().replace(/#.*/, "#…"), status, address: await page.getByLabel("Server address").inputValue({ timeout: 1_000 }).catch(() => null), alerts: await page.getByRole("alert").allTextContents(), decoded: await decoded(page).catch(e => String(e)), errors: page.errors.slice(-20) }));
   }
   if (server) console.error(server.output.split("\n").filter(l => !l.includes("watch link")).slice(-40).join("\n"));
 } finally {
