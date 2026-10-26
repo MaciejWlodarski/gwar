@@ -1073,6 +1073,12 @@ callbacks start 17--290 ms late. The Docker host was too loaded
 latencies to be compared with the VM's; the before/after gate comparison
 belongs on the VM.
 
+On the VM, an unconstrained A/A run of the merged fix (`3237fe3`, `--null`,
+ten pairs per set, 100 markers, 40 runs) had no underrun and no concealment in
+any run. p99 was 46.52--46.76 ms (median 46.53 ms), against the earlier archive's
+24 of 144 runs with a 56.7--91.4 ms p99 tail. The longest fake-device callback
+was 2.6 ms, one callback started more than 5 ms late, and nothing overflowed.
+
 A second, smaller mode is unrelated: 17 runs without configured loss stepped
 about +10 ms (p99 53.9--63.7 ms) after a single concealment at a random time,
 with no underrun and the jitter target rising above one packet. That is one
