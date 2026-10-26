@@ -7,7 +7,7 @@ import { cn } from "../lib/cn";
 import { unreadLabel } from "../lib/chat";
 import { badgesOf } from "../lib/ts-badges";
 import { useSession } from "../state/stores";
-import { useMemo } from "react";
+import { useMemo, type CSSProperties } from "react";
 import { useTsImage } from "./ts-images";
 
 /** A TeamSpeak icon (a group's, a channel's or the server's) by its image token, 16 px like TeamSpeak's; nothing until it is loaded. */
@@ -46,11 +46,12 @@ export function MentionBadge({ count, className }: { count: number; className?: 
 }
 
 /** Marks a server as a TeamSpeak server (as opposed to a native gwar/1 one). */
-export function TeamSpeakBadge({ className, short }: { className?: string; short?: boolean }) {
+export function TeamSpeakBadge({ className, short, style }: { className?: string; short?: boolean; style?: CSSProperties }) {
   const t = useT();
   return (
     <span
       title={t("badge.teamspeak")}
+      style={style}
       className={cn("shrink-0 rounded bg-accent-soft px-1.5 py-px text-[10px] leading-4 font-semibold tracking-wide text-accent uppercase", className)}
     >
       {short ? t("badge.teamspeakShort") : t("badge.teamspeak")}
