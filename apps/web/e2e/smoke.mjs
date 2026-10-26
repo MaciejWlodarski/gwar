@@ -1448,7 +1448,7 @@ async function main() {
       const dir = mkdtempSync(path.join(tmpdir(), "gwar-e2e-web-"));
       const child = spawn(
         bin,
-        ["--data-dir", dir, "--http", `127.0.0.1:${port}`, "--media", `127.0.0.1:${port}`, "--public-ip", "127.0.0.1", "--public-endpoint", `ws://127.0.0.1:${port}/ws`, "--web-root", dist],
+        ["--data-dir", dir, "--http", `127.0.0.1:${port}`, "--media", `127.0.0.1:${port}`, "--public-ip", "127.0.0.1", "--public-endpoint", `ws://127.0.0.1:${port}/ws`, "--web-root", dist, "--no-connect"],
         { env: { ...process.env, GWAR_NO_TEAMSPEAK: "true" } },
       );
       children.push(child);
