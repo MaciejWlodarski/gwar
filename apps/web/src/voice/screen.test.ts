@@ -53,7 +53,7 @@ class Peer {
       getParameters: () => ({ transactionId: `t${++transaction}`, encodings: [{ ...init.sendEncodings?.[0] }], codecs: [], headerExtensions: [], rtcp: {} }),
       setParameters: vi.fn(async (p: RTCRtpSendParameters) => { this.sendParams.push(p); }),
     };
-    const t = { direction: init.direction!, init, setCodecPreferences: vi.fn(), receiver: { jitterBufferTarget: null }, sender };
+    const t = { direction: init.direction!, init, setCodecPreferences: vi.fn(), receiver: { jitterBufferTarget: null, track: { kind: "video", id: `rx-${this.transceivers.length}` } }, sender };
     this.transceivers.push(t);
     return t;
   }
@@ -101,6 +101,7 @@ describe.each(["publisher", "watch"] as const)("%s connection budget", kind => {
     const state = vi.fn(), transport = make(async () => "answer", state), starting = transport.start();
     const pc = Peer.all[0]!;
     pc.setRemoteDescription.mockImplementation(async () => { pc.connectionState = "connected"; });
+    await vi.advanceTimersByTimeAsync(0);
     await starting;
     expect(state).toHaveBeenCalledExactlyOnceWith("connected");
     await vi.advanceTimersByTimeAsync(20_000);
@@ -128,6 +129,7 @@ describe.each(["publisher", "watch"] as const)("%s connection budget", kind => {
     const transport = make(async () => "answer", vi.fn(() => transport.close())), starting = transport.start();
     const pc = Peer.all[0]!;
     pc.setRemoteDescription.mockImplementation(async () => { pc.connectionState = "failed"; });
+    await vi.advanceTimersByTimeAsync(0);
     await starting;
     expect(pc.close).toHaveBeenCalledTimes(1);
     expect(vi.getTimerCount()).toBe(0);
@@ -250,9 +252,21 @@ describe("publish transport", () => {
 });
 
 describe("watch transport", () => {
+  it("does not negotiate a retired run after yielding to player initialization", async () => {
+    const offer = vi.fn(async () => "answer");
+    const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer, state: () => {}, track: () => {} });
+    const starting = transport.start();
+    transport.close();
+    await vi.advanceTimersByTimeAsync(0); await starting;
+    expect(offer).not.toHaveBeenCalled();
+    expect(Peer.all[0]!.setRemoteDescription).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("polls decode stats only while at least one slot has a watchdog", async () => {
     const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {}, decodeFailed: vi.fn() });
-    await transport.start();
+    const starting = transport.start();
+    await vi.advanceTimersByTimeAsync(0); await starting;
     const pc = Peer.all[0]!;
     await vi.advanceTimersByTimeAsync(3000);
     expect(pc.getStats).not.toHaveBeenCalled();
@@ -270,17 +284,23 @@ describe("watch transport", () => {
     expect(pc.getStats).toHaveBeenCalledTimes(3);
     transport.close(); expect(vi.getTimerCount()).toBe(0);
   });
-  it("offers exactly the receive slots, with a minimal jitter buffer, and maps tracks to slots", async () => {
+  it("provides each stable receive stream before offering, with a minimal jitter buffer", async () => {
     const tracks: Array<[number, unknown]> = [];
-    const offer = vi.fn(async (_sdp: string, _run: number) => "answer");
+    const offer = vi.fn(async (_sdp: string, _run: number) => {
+      expect(tracks).toHaveLength(SCREEN_SLOTS);
+      return "answer";
+    });
     const transport = new ScreenWatchTransport({ run: 5, iceServers: [], offer, state: () => {}, track: (slot, stream) => tracks.push([slot, stream]) });
-    await transport.start();
+    const starting = transport.start();
+    expect(tracks).toHaveLength(SCREEN_SLOTS);
+    expect(offer).not.toHaveBeenCalled(); // The media players get a task to initialize first.
+    await vi.advanceTimersByTimeAsync(0); await starting;
     const pc = Peer.all[0]!;
     expect(pc.transceivers.map(t => t.direction)).toEqual(Array(SCREEN_SLOTS).fill("recvonly"));
     expect(pc.transceivers.every(t => t.receiver.jitterBufferTarget === 0)).toBe(true);
     expect(offer).toHaveBeenCalledWith(expect.any(String), 5, []);
-    pc.ontrack?.({ transceiver: pc.transceivers[2], track: "video", streams: [] });
-    expect(tracks).toEqual([[2, { tracks: ["video"] }]]);
+    expect(tracks).toEqual(pc.transceivers.map((t, slot) => [slot, { tracks: [t.receiver.track] }]));
+    expect(pc.ontrack).toBeNull(); // No later event replaces the already-bound streams.
     transport.close();
     pc.ontrack = null;
     expect(pc.close).toHaveBeenCalled();
@@ -327,7 +347,8 @@ describe("H.264 sender diagnostics", () => {
   it("uses only receiver capabilities for watch offers", async () => {
     vi.stubGlobal("RTCRtpSender", { getCapabilities: () => ({ codecs: [codec("video/H264", "packetization-mode=1;profile-level-id=42e01f")] }) });
     const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {} });
-    await transport.start();
+    const starting = transport.start();
+    await vi.advanceTimersByTimeAsync(0); await starting;
     const prefs = Peer.all[0]!.transceivers[0]!.setCodecPreferences.mock.calls[0]![0] as RTCRtpCodec[];
     expect(prefs.some(c => c.mimeType === "video/H264")).toBe(false);
     transport.close();

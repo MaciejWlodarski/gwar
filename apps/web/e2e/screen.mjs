@@ -146,7 +146,7 @@ const diagnostics = page => page.evaluate(async () => ({
   videos: [...document.querySelectorAll("video[data-share]")].map(v => {
     const track = v.srcObject?.getVideoTracks?.()[0];
     return { share: v.dataset.share, readyState: v.readyState, size: `${v.videoWidth}x${v.videoHeight}`, paused: v.paused, track: track && `${track.readyState}${track.muted ? " muted" : ""}`,
-      box: `${v.clientWidth}x${v.clientHeight}`, opacity: getComputedStyle(v).opacity, covered: v.closest("[data-screen-video]")?.dataset.ready !== "true", visibility: document.visibilityState };
+      box: `${v.clientWidth}x${v.clientHeight}`, opacity: getComputedStyle(v).opacity, visibility: document.visibilityState };
   }),
 }));
 

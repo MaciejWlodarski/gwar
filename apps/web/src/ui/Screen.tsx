@@ -253,11 +253,54 @@ export function LiveBadge({ client, name }: { client: Client; name: string }) {
 // its receiver keeps decoding. Keep one attached player per slot stream and move it
 // between views. A new transport supplies new streams, so it cannot inherit old pixels.
 const slotVideos = new Map<MediaStream, { video: HTMLVideoElement; received: boolean }>();
+let slotVideoParking: HTMLDivElement | null = null;
+function parkSlotVideo(video: HTMLVideoElement) {
+  if (!slotVideoParking) {
+    slotVideoParking = document.createElement("div");
+    slotVideoParking.dataset.screenPlayers = "";
+    slotVideoParking.setAttribute("aria-hidden", "true");
+    slotVideoParking.style.cssText = "position:fixed;top:0;left:0;width:16px;height:16px;display:grid;grid-template: minmax(0,1fr) / minmax(0,1fr);overflow:hidden;pointer-events:none;z-index:-1";
+    const cover = document.createElement("div");
+    cover.style.cssText = "position:absolute;inset:0;background:black;z-index:1";
+    slotVideoParking.appendChild(cover);
+    document.body.appendChild(slotVideoParking);
+  }
+  video.removeAttribute("data-share");
+  video.className = "size-full object-contain";
+  video.style.gridArea = "1 / 1";
+  slotVideoParking.prepend(video);
+}
+function prepareSlotVideo(stream: MediaStream | null) {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  const player = { video, received: false };
+  if (stream) {
+    slotVideos.set(stream, player);
+    // WebKit needs a live rendering consumer before negotiation supplies codec
+    // metadata. Keep unused players connected under an opaque mask, behind the app.
+    parkSlotVideo(video);
+    // Create its renderer now, before media can arrive during SDP negotiation.
+    void video.offsetWidth;
+    video.srcObject = stream;
+    video.load();
+    void video.play().catch(() => {});
+  }
+  return player;
+}
 useScreen.subscribe(screen => {
   for (const [stream, player] of slotVideos) {
     if (screen.streams.includes(stream)) continue;
     player.video.srcObject = null;
+    player.video.remove();
     slotVideos.delete(stream);
+  }
+  if (slotVideos.size === 0) { slotVideoParking?.remove(); slotVideoParking = null; }
+  // Receive tracks are supplied before negotiation. Binding only when the watch
+  // grant renders can be too late for Linux WebKit, even with later keyframes.
+  for (const stream of screen.streams) {
+    if (stream && !slotVideos.has(stream)) prepareSlotVideo(stream);
   }
 });
 
@@ -274,24 +317,12 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef }: { shar
     const mount = host.current;
     if (!mount) return;
     let player = stream ? slotVideos.get(stream) : undefined;
-    if (!player) {
-      const video = document.createElement("video");
-      video.muted = true;
-      video.autoplay = true;
-      video.playsInline = true;
-      player = { video, received: false };
-      if (stream) slotVideos.set(stream, player);
-    }
+    if (!player) player = prepareSlotVideo(stream);
     const { video } = player;
     video.dataset.share = share;
-    // Keep the player renderable while waiting: hiding it with opacity can stall
-    // Linux WebKit's first frame/metadata. The opaque cover below hides its pixels.
-    video.className = "absolute inset-0 size-full object-contain";
-    let retry: ReturnType<typeof setInterval> | undefined;
+    video.className = "size-full object-contain";
     const received = () => {
       if (!stream) return;
-      clearInterval(retry);
-      retry = undefined;
       player.received = true;
       setShown(stream);
       if (watchId !== undefined) controller.screen.frameReceived(share, run, watchId);
@@ -305,20 +336,19 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef }: { shar
     if (stream) void video.play().catch(() => {});
     // A static share keeps its one decoded frame when its view remounts.
     if (player.received || video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) received();
-    else if (stream && watchId !== undefined) {
-      // The watch-start PLI can precede this player's asynchronous binding.
-      // Retry within the server's budget until its first frame, never a timed reveal.
-      const request = () => controller.screen.requestFrame(share, run, watchId);
-      request();
-      retry = setInterval(request, 1000);
-    }
     return () => {
-      clearInterval(retry);
       video.removeEventListener("loadeddata", received);
       video.removeEventListener("resize", received);
       if (onDoubleClick) video.removeEventListener("dblclick", onDoubleClick);
       videoRef?.(null);
-      if (video.parentElement === mount) video.remove();
+      const screen = useScreen.getState();
+      if (document.pictureInPictureElement === video && !screen.watches.some(w => w.id === watchId && w.share === share && w.status === "watching")) {
+        void document.exitPictureInPicture().catch(() => {});
+      }
+      if (video.parentElement === mount) {
+        if (stream && screen.streams.includes(stream)) parkSlotVideo(video);
+        else video.remove();
+      }
       // Keep the binding through view/StrictMode remounts. The stream's retirement
       // above detaches it and bounds the cache to the run's receive slots.
     };

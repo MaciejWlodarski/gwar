@@ -139,34 +139,46 @@ describe("watched video frames", () => {
   }
   const visible = (video: HTMLVideoElement) => video.closest<HTMLElement>("[data-screen-video]")?.dataset.ready === "true";
 
+  it("binds the receiver stream before its grant and displays an already-arrived static frame", async () => {
+    const stream = new MediaStream();
+    const create = vi.spyOn(document, "createElement");
+    // happy-dom does not expose HTMLMediaElement's readiness constants.
+    const ready = Object.getOwnPropertyDescriptor(HTMLMediaElement, "HAVE_CURRENT_DATA");
+    if (!ready) Object.defineProperty(HTMLMediaElement, "HAVE_CURRENT_DATA", { configurable: true, value: 2 });
+    try {
+      const { dispatch } = useScreen.getState();
+      dispatch({ type: "transport", run: 1, phase: "connected" });
+      dispatch({ type: "stream", run: 1, slot: 0, stream });
+      const prepared = create.mock.results.find(r => r.type === "return" && r.value instanceof HTMLVideoElement)?.value as HTMLVideoElement;
+      expect(prepared).toBeInstanceOf(HTMLVideoElement);
+      expect(prepared.srcObject).toBe(stream);
+      expect(prepared.isConnected).toBe(true);
+      expect(prepared.closest("[data-screen-players]")?.getAttribute("aria-hidden")).toBe("true");
+      expect(container.querySelector("video")).toBeNull();
+      // Its single startup keyframe can precede the grant and the React commit.
+      Object.defineProperty(prepared, "readyState", { configurable: true, value: HTMLMediaElement.HAVE_CURRENT_DATA });
+      const video = await grant(1, 1, stream);
+      expect(video).toBe(prepared);
+      expect(visible(video)).toBe(true);
+      expect(container.textContent).not.toContain("Connecting");
+    } finally {
+      create.mockRestore();
+      if (!ready) Reflect.deleteProperty(HTMLMediaElement, "HAVE_CURRENT_DATA");
+    }
+  });
+
   it("keeps the attached media player and a static frame through a view remount", async () => {
     const stream = new MediaStream();
     const video = await grant(1, 1, stream);
     await act(async () => video.dispatchEvent(new Event("loadeddata")));
     await act(async () => root.render(null));
     expect(video.srcObject).toBe(stream);
+    expect(video.isConnected).toBe(true);
+    expect(video.dataset.share).toBeUndefined();
     const replacement = await grant(1, 1, stream);
     expect(replacement).toBe(video);
     expect(visible(replacement)).toBe(true);
     expect(container.textContent).not.toContain("Connecting");
-  });
-
-  it("requests a keyframe after initial binding and stops retrying on a static first frame", async () => {
-    vi.useFakeTimers();
-    const frames = vi.spyOn(controller.screen, "requestFrame");
-    try {
-      const stream = new MediaStream();
-      const video = await grant(1, 1, stream);
-      expect(frames).toHaveBeenCalledExactlyOnceWith("A", 1, 1);
-      await act(async () => vi.advanceTimersByTimeAsync(1000));
-      expect(frames).toHaveBeenCalledTimes(2);
-      await act(async () => video.dispatchEvent(new Event("loadeddata")));
-      await act(async () => root.render(null));
-      expect(await grant(1, 1, stream)).toBe(video);
-      await act(async () => vi.advanceTimersByTimeAsync(70_000));
-      expect(visible(video)).toBe(true);
-      expect(frames).toHaveBeenCalledTimes(2);
-    } finally { frames.mockRestore(); vi.useRealTimers(); }
   });
 
   it("does not detach or rebind the stream during StrictMode's effect remount", async () => {
@@ -188,6 +200,7 @@ describe("watched video frames", () => {
     expect(video.srcObject).toBe(stream);
     await act(async () => useScreen.getState().dispatch({ type: "transport", run: 2, phase: "connecting" }));
     expect(video.srcObject).toBeNull();
+    expect(document.querySelector("[data-screen-players]")).toBeNull();
     const replacement = await grant(2, 1, new MediaStream());
     expect(replacement).not.toBe(video);
     expect(visible(replacement)).toBe(false);
@@ -198,12 +211,8 @@ describe("watched video frames", () => {
     const video = await grant(1, 1, stream);
     expect(video.srcObject).toBe(stream);
     expect(visible(video)).toBe(false);
-    expect(video.classList.contains("opacity-0")).toBe(false);
-    expect(video.classList.contains("absolute")).toBe(true);
-    expect(container.querySelector("[data-screen-placeholder]")?.classList.contains("bg-black")).toBe(true);
     await act(async () => video.dispatchEvent(new Event("loadeddata")));
     expect(visible(video)).toBe(true);
-    expect(container.querySelector("[data-screen-placeholder]")).toBeNull();
     expect(container.textContent).not.toContain("Connecting");
   });
 

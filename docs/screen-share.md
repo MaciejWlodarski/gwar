@@ -2707,8 +2707,11 @@ from native capture is PR 10.
     `voice.talking` event.
   - When a member viewer reuses a receive slot with no other active or pending
     watch, the client renews the transport to discard the old receiver's decoded
-    frames. Each slot stream gets one attached video element, moved between the
-    stage and thumbnails without rebinding. Retiring the stream detaches and
+    frames. Each slot stream gets one video element, bound when its receiver is
+    created. Negotiation yields one task so media resource selection can start
+    before SDP or a startup keyframe. Unused players stay
+    connected under a black cover behind the app; active players move between
+    the stage and thumbnails without rebinding. Retiring the stream detaches and
     discards that player; a new transport's streams always get fresh elements.
     The cache is bounded by the run's receive slots. First-use slots keep the
     current transport.
@@ -2717,18 +2720,12 @@ from native capture is PR 10.
     slot may briefly show the previous share's last frame until the new share's
     first keyframe decodes.
   - Linux WebKit can leave a replacement media player at 0×0 even while the
-    receiver decodes fresh keyframes. Preserving the attached player avoids this
-    and keeps a static share visible through view/StrictMode remounts without
-    requesting another frame. While waiting, the video keeps an opaque, full-size
-    rendering surface beneath a black loading cover; making the player itself
-    transparent can stall Linux WebKit's first frame/metadata. The cover prevents
-    cached pixels from appearing before readiness. A first-use or renewed slot reveals its first
+    receiver decodes fresh keyframes. Binding in the DOM before media starts and
+    preserving the player avoids this and keeps a static share visible through
+    view/StrictMode remounts without
+    requesting another frame. A first-use or renewed slot reveals its first
     decoded frame, including a static share's single startup keyframe. Watch
-    assignment already requests a budgeted, retried PLI. A newly attached player
-    also requests a keyframe, retrying once per second within the server's budget
-    until its first frame: binding is asynchronous and can miss the watch-start
-    keyframe. View detachment cancels retries; moving an already-playing player
-    needs no further request. Requests retain run/watch-ID fencing. No new server
+    assignment already requests a budgeted, retried PLI; no new server
     notification, extra frame-counter gate or timed reveal is required. The
     existing offer/connect and H.264 recovery watchdogs still apply. A connected
     receiver that never supplies a first frame ends its watch 35 s after its

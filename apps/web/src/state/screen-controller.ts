@@ -434,13 +434,6 @@ export class ScreenController {
     this.firstFrameTimers.delete(id);
   }
 
-  /** A player bound after the watch-start keyframe may need a fresh one. */
-  requestFrame(share: string, run: number, id: number): void {
-    const screen = useScreen.getState();
-    if (screen.transport.run !== run || !screen.watches.some(w => w.id === id && w.share === share && w.status === "watching")) return;
-    void this.link()?.request("screen.keyframe", { share }).catch(() => {});
-  }
-
   /** Once satisfied, a static share never needs another frame on a stage change. */
   frameReceived(share: string, run: number, id: number): void {
     const screen = useScreen.getState();
