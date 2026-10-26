@@ -262,6 +262,11 @@ function fromSource(id, width, height, what) {
   assert.ok(Math.abs(width / height - w / h) < 0.03, `${what}: a ${width}x${height} frame is not source ${id}'s ${w}x${h}`);
 }
 
+const revealed = (page, share) => waitFor(() => page.evaluate(share => {
+  const video = document.querySelector(`video[data-share="${share}"]`);
+  return video && getComputedStyle(video).opacity === "1";
+}, share), "the new watch reveals its decoded frame");
+
 /** Waits until `page` decodes `share` with the source's barcode, twice with different counters. */
 async function sees(page, share, id, what) {
   if (paintsUnreliably(page)) return decodes(page, share, id, what);
@@ -277,6 +282,7 @@ async function sees(page, share, id, what) {
   const stats = await session(page, (_, __, controller, share) => controller.screen.stats(share), share);
   assert.ok(stats && stats.framesDecoded > 0, `${what}: frames decoded`);
   fromSource(id, stats.width, stats.height, `${what} (receiver)`);
+  await revealed(page, share);
   checks.push({ check: what, viewer: page.deviceName, ms, size: `${last.width}x${last.height}`, framesDecoded: stats.framesDecoded });
 }
 
@@ -297,6 +303,7 @@ async function decodes(page, share, id, what) {
     return last.framesDecoded >= first.framesDecoded + 5;
   }, `${what}: ${page.deviceName} keeps decoding (last ${JSON.stringify(last)})`, 30_000);
   fromSource(id, last.width, last.height, what);
+  await revealed(page, share);
   checks.push({ check: what, viewer: page.deviceName, ms, size: `${last.width}x${last.height}`, framesDecoded: last.framesDecoded, painted: false });
 }
 
@@ -559,6 +566,20 @@ async function run(browsers, web, server, token) {
     }
     checks.push({ check: "corroborated watchdog caps H.264 then selects VP9 without stopping any watch", ok: true });
   }
+
+  // A page stopping capture emits no `ended` event. The existing publisher poll
+  // must end the share and free every viewer's slot through the normal path.
+  await cs.evaluate(() => {
+    const sender = window.__pcs.filter(pc => pc.connectionState !== "closed")
+      .flatMap(pc => pc.getSenders()).find(s => s.track?.kind === "video" && s.track.readyState === "live");
+    if (!sender?.track) throw new Error("no live screen capture to stop");
+    sender.track.stop();
+  });
+  await waitFor(async () => (await ownShare(cs)) === null, "silent track stop ends the share", 10_000);
+  for (const viewer of [cv, wv, c3]) {
+    await waitFor(async () => !(await session(viewer, (_, screen, __, share) => screen.watches.some(w => w.share === share) || screen.slots.includes(share), csShare)), "silent track stop releases viewer slots", 10_000);
+  }
+  checks.push({ check: "page-initiated track.stop ends the share and releases watch slots", ok: true });
 
   const problems = opened.flatMap(p => errors(p).map(e => `${p.deviceName}: ${e}`));
   return problems;

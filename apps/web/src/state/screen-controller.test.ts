@@ -10,6 +10,7 @@ import { useSession, useUi } from "./stores";
 import { useSettings } from "./settings";
 
 interface PublisherOptions {
+  ended(): void;
   quality: ScreenSpec; legacy: boolean; automaticMode: boolean;
   surfaceChanged(surface: "screen" | "window" | "tab" | "unknown", spec: ScreenSpec): void;
   offer(body: object): Promise<string>; state(s: string): void;
@@ -328,6 +329,24 @@ describe("sharing", () => {
     useScreen.setState({ own: { phase: "choosing", attempt: 1, share: null, stream: { getVideoTracks: () => [t], getTracks: () => [t] } as unknown as MediaStream, surface: "tab", spec: legacySpec("text"), viewers: 0, guests: 0, guestLink: true, preview: false } });
     return t;
   };
+
+  it("stops a silently ended capture through the normal path and ignores an old publisher", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String), t = choosing();
+    await screen.confirmShare();
+    const publisher = media.publishers[0]!;
+    publisher.params.ended(); await flush();
+    expect(useScreen.getState().own).toBeNull();
+    expect(t.stop).toHaveBeenCalledTimes(1);
+    expect(publisher.close).toHaveBeenCalledTimes(1);
+    expect(calls.filter(([op]) => op === "screen.stop")).toEqual([["screen.stop", { share: "M" }]]);
+    expect(toast).not.toHaveBeenCalled();
+    choosing(); await screen.confirmShare();
+    publisher.params.ended(); await flush();
+    expect(useScreen.getState().own?.share).toBe("M");
+    await screen.stopShare();
+  });
 
   it.each(["modern", "legacy", "unsupported"])("sends all quality choices safely to a %s server", async server => {
     useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });

@@ -262,6 +262,18 @@ async function run(browsers, web, ws, token, server) {
     await painted(page, "guest watches through the link");
     // The page never carries the token anywhere but its own fragment.
     sentNoToken(page, url);
+    // Exercise the bfcache lifecycle even when an engine declines to cache a
+    // page with WebRTC: pagehide closes it, persisted pageshow must reconnect.
+    await page.evaluate(() => dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
+    assert.equal(await page.evaluate(() => window.__pcs.every(pc => pc.connectionState === "closed")), true, "pagehide closes the guest transport");
+    await Promise.all([
+      page.waitForEvent("load"),
+      page.evaluate(() => dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true }))),
+    ]);
+    assert.equal(page.url(), url, "restore preserves the watch link and token");
+    await keepsDecoding(page, "guest reconnects after persisted pageshow");
+    await painted(page, "guest reconnects after persisted pageshow");
+    sentNoToken(page, url);
   }
   await sharer.getByTestId("screen-ts-link").getByText("TeamSpeak link on · 2 guests").waitFor({ timeout: 10_000 });
   checks.push({ check: "sharing bar counts guests", ok: true });

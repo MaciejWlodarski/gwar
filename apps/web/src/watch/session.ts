@@ -17,6 +17,8 @@ const FINAL: ReadonlySet<WatchStatus> = new Set(["ended", "off", "invalid", "bus
 
 /** The guest's ping interval, as `net/connection.ts` pings members. */
 export const PING_INTERVAL_MS = 20_000;
+/** Match the member screen negotiation request budget. */
+const REQUEST_TIMEOUT_MS = 35_000;
 
 /** The guest endpoint: `?server=` (as in invite links) when the page has one, else this page's own server. */
 export function watchEndpoint(search: string, page: PageContext): string | null {
@@ -69,7 +71,7 @@ export interface WatchView {
 
 interface Watching { share: string; sharer: string; preset: string; ice_servers: IceServer[]; screen_h264?: boolean }
 
-type Pending = { resolve(ok: unknown): void; reject(code: string): void };
+type Pending = { resolve(ok: unknown): void; reject(code: string): void; timer: ReturnType<typeof setTimeout> };
 
 const OPEN = 1;
 
@@ -115,7 +117,7 @@ export class WatchSession {
     if (report) this.set(status);
     else if (!FINAL.has(this.current)) this.current = status;
     if (this.ping) { clearInterval(this.ping); this.ping = null; }
-    for (const p of this.pending.values()) p.reject("closed");
+    for (const p of this.pending.values()) { clearTimeout(p.timer); p.reject("closed"); }
     this.pending.clear();
     const transport = this.transport, socket = this.socket;
     this.transport = null;
@@ -132,8 +134,13 @@ export class WatchSession {
     if (!socket || socket.readyState !== OPEN) return Promise.reject("closed");
     const id = this.nextId++;
     return new Promise((resolve, reject) => {
-      this.pending.set(id, { resolve, reject });
-      socket.send(JSON.stringify({ id, op, d }));
+      const timer = setTimeout(() => {
+        this.pending.delete(id);
+        reject("timeout");
+      }, REQUEST_TIMEOUT_MS);
+      this.pending.set(id, { resolve, reject, timer });
+      try { socket.send(JSON.stringify({ id, op, d })); }
+      catch (e) { clearTimeout(timer); this.pending.delete(id); reject(e); }
     });
   }
 
@@ -146,6 +153,7 @@ export class WatchSession {
       const p = this.pending.get(frame.re);
       if (!p) return;
       this.pending.delete(frame.re);
+      clearTimeout(p.timer);
       if ("ok" in frame) p.resolve(frame.ok);
       else p.reject(isRecord(frame.err) && typeof frame.err.code === "string" ? frame.err.code : "internal");
       return;

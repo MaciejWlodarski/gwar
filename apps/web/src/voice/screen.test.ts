@@ -1,3 +1,4 @@
+import { WatchSession, type SocketLike } from "../watch/session";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { captureScreen, headroomBitrate, MIN_BITRATE, preferredCodecs, publishSsrcs, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, StuckCaptureGuard } from "./screen";
 
@@ -69,7 +70,87 @@ beforeEach(() => {
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
+describe.each(["publisher", "watch"] as const)("%s connection budget", kind => {
+  const make = (offer: () => Promise<string>, state = vi.fn()) => kind === "publisher"
+    ? new ScreenPublisher({ track: {} as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer, state })
+    : new ScreenWatchTransport({ run: 1, iceServers: [], offer, state, track: () => {}, decodeFailed: vi.fn() });
+
+  it("allows slow signalling and answer application, then gives ICE the full 15 seconds", async () => {
+    let answer!: (sdp: string) => void, applied!: () => void;
+    const offer = vi.fn(() => new Promise<string>(resolve => { answer = resolve; })), state = vi.fn();
+    const transport = make(offer, state), starting = transport.start();
+    await vi.waitFor(() => expect(offer).toHaveBeenCalled());
+    const pc = Peer.all[0]!;
+    pc.setRemoteDescription.mockImplementation(() => new Promise<void>(resolve => { applied = resolve; }));
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(state).not.toHaveBeenCalled();
+    answer("answer");
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(pc.setRemoteDescription).toHaveBeenCalled();
+    expect(state).not.toHaveBeenCalled();
+    applied(); await starting;
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(state).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(state).toHaveBeenCalledExactlyOnceWith("failed");
+    transport.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("observes a peer already connected while applying the answer and retains the disconnect grace", async () => {
+    const state = vi.fn(), transport = make(async () => "answer", state), starting = transport.start();
+    const pc = Peer.all[0]!;
+    pc.setRemoteDescription.mockImplementation(async () => { pc.connectionState = "connected"; });
+    await starting;
+    expect(state).toHaveBeenCalledExactlyOnceWith("connected");
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(state).toHaveBeenCalledTimes(1);
+    pc.connectionState = "disconnected"; pc.onconnectionstatechange?.();
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(state).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(state).toHaveBeenLastCalledWith("failed");
+    transport.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("does not arm a timer after closing during signalling", async () => {
+    let answer!: (sdp: string) => void;
+    const offer = vi.fn(() => new Promise<string>(resolve => { answer = resolve; })), state = vi.fn();
+    const transport = make(offer, state), starting = transport.start();
+    await vi.waitFor(() => expect(offer).toHaveBeenCalled());
+    transport.close(); answer("answer"); await starting;
+    expect(Peer.all[0]!.setRemoteDescription).not.toHaveBeenCalled();
+    expect(vi.getTimerCount()).toBe(0);
+    expect(state).not.toHaveBeenCalled();
+  });
+
+  it("leaves no timer if the peer fails while the answer is applied", async () => {
+    const transport = make(async () => "answer", vi.fn(() => transport.close())), starting = transport.start();
+    const pc = Peer.all[0]!;
+    pc.setRemoteDescription.mockImplementation(async () => { pc.connectionState = "failed"; });
+    await starting;
+    expect(pc.close).toHaveBeenCalledTimes(1);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+});
+
 describe("publish transport", () => {
+  it("detects a silently stopped capture in the existing poll, even with pending stats", async () => {
+    const track = { readyState: "live" } as MediaStreamTrack, ended = vi.fn();
+    const publisher = new ScreenPublisher({ track, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {}, ended });
+    await publisher.start();
+    const pc = Peer.all[0]!;
+    pc.getStats.mockImplementation(() => new Promise(() => {}));
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(ended).not.toHaveBeenCalled();
+    Object.defineProperty(track, "readyState", { value: "ended" });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(ended).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(4000);
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(pc.getStats).toHaveBeenCalledTimes(1);
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
   it("keeps legacy ceilings through every live spec edit and codec recovery", async () => {
     const track = { applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 2560, height: 1440 }) } as unknown as MediaStreamTrack;
     const publisher = new ScreenPublisher({ track, quality: { mode: "smooth", height: 1440, fps: 60 }, legacy: true, iceServers: [], offer: async () => "answer", state: () => {} });
@@ -169,6 +250,26 @@ describe("publish transport", () => {
 });
 
 describe("watch transport", () => {
+  it("polls decode stats only while at least one slot has a watchdog", async () => {
+    const transport = new ScreenWatchTransport({ run: 1, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {}, decodeFailed: vi.fn() });
+    await transport.start();
+    const pc = Peer.all[0]!;
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(pc.getStats).not.toHaveBeenCalled();
+    transport.keyframe(0, "A", 1); transport.keyframe(1, "B", 1);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(pc.getStats).toHaveBeenCalledTimes(1);
+    transport.clearSlot(0);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(pc.getStats).toHaveBeenCalledTimes(2);
+    transport.clearSlot(1);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(pc.getStats).toHaveBeenCalledTimes(2);
+    transport.keyframe(0, "C", 2);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(pc.getStats).toHaveBeenCalledTimes(3);
+    transport.close(); expect(vi.getTimerCount()).toBe(0);
+  });
   it("offers exactly the receive slots, with a minimal jitter buffer, and maps tracks to slots", async () => {
     const tracks: Array<[number, unknown]> = [];
     const offer = vi.fn(async (_sdp: string, _run: number) => "answer");
@@ -1830,4 +1931,61 @@ describe("automatic mode on confirmed source switches", () => {
     expect(f.track.contentHint).toBe("motion");
     f.stop();
   });
+});
+
+it("an unanswered guest offer has an overall deadline", async () => {
+  class Socket implements SocketLike {
+    readyState = 1;
+    onopen = null as SocketLike["onopen"];
+    onmessage = null as SocketLike["onmessage"];
+    onclose = null as SocketLike["onclose"];
+    onerror = null as SocketLike["onerror"];
+    sent: Array<{id: number; op: string}> = [];
+    send(data: string) {
+      const request = JSON.parse(data); this.sent.push(request);
+      // Keep the socket responsive; omit only the media answer.
+      if (request.op === "ping") this.receive({ re: request.id, ok: {} });
+    }
+    receive(frame: object) { this.onmessage?.({ data: JSON.stringify(frame) } as MessageEvent); }
+    close() { this.readyState = 3; }
+  }
+  const socket = new Socket();
+  const session = new WatchSession({ status() {}, sharer() {}, stream() {} }, {
+    socket: () => socket, transport: params => new ScreenWatchTransport(params),
+  });
+  try {
+    session.start("ws://127.0.0.1/ws/watch", "A".repeat(43));
+    socket.onopen?.(new Event("open"));
+    socket.receive({ re: 1, ok: { share: "s1", sharer: "alice", preset: "smooth", ice_servers: [] } });
+    await vi.waitFor(() => expect(socket.sent.some(x => x.op === "guest.offer")).toBe(true));
+    await vi.advanceTimersByTimeAsync(34_000);
+    expect(session.status).toBe("connecting");
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(session.status).toBe("lost");
+    expect(socket.readyState).toBe(3);
+    expect(vi.getTimerCount()).toBe(0);
+  } finally { session.close(); await vi.advanceTimersByTimeAsync(0); }
+});
+
+it.each(["initial offer", "recovery offer"])("silently stopped capture is detected during %s", async phase => {
+  let answer!: (sdp: string) => void;
+  const pending = new Promise<string>(resolve => { answer = resolve; });
+  const track = { readyState: "live", applyConstraints: vi.fn(async () => {}) } as unknown as MediaStreamTrack;
+  const ended = vi.fn();
+  const offer = vi.fn(async () => phase === "initial offer" || offer.mock.calls.length > 1 ? pending : "answer");
+  const publisher = new ScreenPublisher({ track, quality: TEST_SPECS.game, iceServers: [], offer, state() {}, ended });
+  let starting: Promise<void>;
+  if (phase === "recovery offer") {
+    await publisher.start();
+    starting = publisher.recover({ share: "s1", codec: "vp9", width: 1280, height: 720, fps: 30 });
+  } else starting = publisher.start();
+  try {
+    await vi.waitFor(() => expect(offer).toHaveBeenCalledTimes(phase === "initial offer" ? 1 : 2));
+    Object.defineProperty(track, "readyState", { value: "ended" });
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(ended).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(ended).toHaveBeenCalledTimes(1);
+    expect(Peer.all.at(-1)!.getStats).not.toHaveBeenCalled();
+  } finally { publisher.close(); answer("answer"); await starting; }
 });
