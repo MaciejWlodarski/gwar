@@ -1533,42 +1533,39 @@ mod tests {
         assert_eq!(sent.lock().unwrap().captures.len(), 2); // markers at 0 and 12 000 samples
     }
 
-    /// A receiver device on its own thread, starting `after` from now.
-    fn open_device(after: Duration) -> (AudioPorts, Arc<Mutex<Measurements>>, DeviceControl) {
-        let now = Instant::now();
-        let data = Arc::new(Mutex::new(Measurements::receiver(Record::new(RATE, (0.0, 0.0)))));
-        let control = DeviceControl::default();
-        let io = Box::new(FakeIo {
-            markers_ready: Arc::new(AtomicBool::new(false)),
-            data: data.clone(),
-            tone: false,
-            epoch: now,
-            start: now + after,
-            control: control.clone(),
-            count: 0,
-            delay_samples: 0,
-            callback_jitter: false,
-            warmup_samples: 0,
-        });
-        (io.open().unwrap(), data, control)
+    /// Runs `callbacks` on a thread of its own, owned by a `Guard` as an opened device's is.
+    fn spawn_device(callbacks: Callbacks, control: &DeviceControl) -> Guard {
+        Guard { control: control.clone(), thread: Some(thread::spawn(move || callbacks.run_until_stopped())) }
     }
 
     #[tokio::test]
     async fn a_device_stuck_forever_cannot_hang_the_run() {
-        let (stuck, data, stuck_control) = open_device(Duration::from_millis(200));
-        let (running, _, running_control) = open_device(Duration::ZERO);
-        // Its first callback blocks on the measurement lock, never released.
-        std::mem::forget(data.lock().unwrap());
-        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Its measurement lock is taken, never to be released, before its thread exists: the
+        // first callback blocks before it touches a ring, whatever the scheduling.
+        let (stuck, _stuck_mic, _stuck_speaker, stuck_data, stuck_control) = device(false, 0, RATE, RATE);
+        std::mem::forget(stuck_data.lock().unwrap());
+        let stuck = spawn_device(stuck, &stuck_control);
+        // The healthy device's mic ring is drained until it finishes, so only a stop can end it.
+        let (healthy, mut healthy_mic, _healthy_speaker, healthy_data, healthy_control) = device(false, 0, RATE, RATE);
+        let drained = healthy_control.clone();
+        let drainer = thread::spawn(move || {
+            while !drained.finished() {
+                while healthy_mic.pop().is_ok() {}
+                thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let healthy = spawn_device(healthy, &healthy_control);
         let started = Instant::now();
-        let error = stop_devices(&[stuck_control.clone(), running_control.clone()]).await.unwrap_err();
+        let error = stop_devices(&[stuck_control.clone(), healthy_control.clone()]).await.unwrap_err();
         assert!(error.to_string().contains("did not stop"), "{error}");
-        // Both were signaled before either was awaited: the other one stopped normally.
-        assert!(running_control.finished() && !stuck_control.finished());
-        // Dropping the ports, as an error return does, waits for the stuck thread only so long.
+        // Both were signaled before either was awaited: the healthy one stopped normally.
+        assert!(healthy_control.finished() && !stuck_control.finished());
+        assert_eq!(healthy_data.lock().unwrap().device.termination, Some("stopped"));
+        drainer.join().unwrap();
+        // Dropping the devices, as an error return does, waits for the stuck thread only so long.
         let (dropped, done) = std::sync::mpsc::channel();
         thread::spawn(move || {
-            drop((stuck, running));
+            drop((stuck, healthy));
             let _ = dropped.send(());
         });
         assert!(done.recv_timeout(DROP_WAIT + Duration::from_secs(1)).is_ok(), "dropping a stuck device hung");
