@@ -32,7 +32,7 @@ and it stands in wherever the wordmark would be too small.
 Brand gradient (the "w", left to right): `#6CEBC8` → `#34D3CF` → `#2EA8FF`.
 
 The app's themes live in `apps/web/src/index.css`: a graphite ramp with a
-slight teal cast, one teal accent, and the brand gradient for voice (the
+slight teal cast, one cyan accent, and the brand gradient for voice (the
 talking ring and the mic level). Main tokens:
 
 | Token | Dark | Light |
@@ -40,9 +40,9 @@ talking ring and the mic level). Main tokens:
 | `--rail` (background) | `#0C0F10` | `#E6EBEB` |
 | `--surface` | `#161B1C` | `#FFFFFF` |
 | `--fg` | `#E8EEED` | `#121A1A` |
-| `--accent` | `#3FCFC0` | `#097D74` |
-| `--accent-strong` | `#22B3A5` | `#076A62` |
-| `--accent-fg` (text on accent) | `#06201D` | `#FFFFFF` |
+| `--accent` | `#22D3EE` | `#0C6F8B` |
+| `--accent-strong` | `#06B6D4` | `#155E75` |
+| `--accent-fg` (text on accent) | `#052A33` | `#FFFFFF` |
 | `--talk-1 … --talk-3` (talking ring) | brand gradient | `#22C79C` → `#14B3B0` → `#1F8FE0` |
 | `--ok` | `#6FCF97` | `#157F4B` |
 | `--warn` | `#E8B25C` | `#9A6508` |

@@ -3,7 +3,7 @@
 
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
-/* Graphite ramp with a slight teal cast + one teal accent. The brand gradient
+/* Graphite ramp with a slight teal cast + one cyan accent. The brand gradient
    (the logo's "w") marks voice: the talking ring and the mic level. Other hues
    are semantic (ok, danger, warn). Values swap with [data-theme]. */
 :root,
@@ -20,10 +20,10 @@
   --fg: #e8eeed;
   --muted: #98a3a2;
   --subtle: #6b7676;
-  --accent: #3fcfc0;
-  --accent-strong: #22b3a5;
-  --accent-fg: #06201d;
-  --accent-soft: rgb(63 207 192 / 0.14);
+  --accent: #22d3ee;
+  --accent-strong: #06b6d4;
+  --accent-fg: #052a33;
+  --accent-soft: rgb(34 211 238 / 0.14);
   --ok: #6fcf97;
   --danger: #f06a72;
   --danger-soft: rgb(240 106 114 / 0.14);
@@ -52,10 +52,10 @@
   --fg: #121a1a;
   --muted: #4f5b5b;
   --subtle: #7a8585;
-  --accent: #097d74;
-  --accent-strong: #076a62;
+  --accent: #0c6f8b;
+  --accent-strong: #155e75;
   --accent-fg: #ffffff;
-  --accent-soft: rgb(9 125 116 / 0.1);
+  --accent-soft: rgb(12 111 139 / 0.1);
   --ok: #157f4b;
   --danger: #c93a45;
   --danger-soft: rgb(201 58 69 / 0.1);
