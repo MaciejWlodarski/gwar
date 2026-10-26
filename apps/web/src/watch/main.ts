@@ -66,3 +66,5 @@ const session = new WatchSession({
 show("connecting");
 session.start(watchEndpoint(location.search, pageContextFromLocation()), readToken(location.hash));
 addEventListener("pagehide", () => session.close());
+// A cached page resumes with the closed session; the fragment preserves its watch link.
+addEventListener("pageshow", event => { if (event.persisted) location.reload(); });

@@ -7,11 +7,12 @@ import type { Channel } from "../proto/Channel";
 import type { Client } from "../proto/Client";
 import { initialState } from "../state/reducer";
 import { initialScreen, useScreen } from "../state/screen";
+import { controller } from "../state/controller";
 import { useDesktopCapture, type DesktopCapture } from "../state/screen-controller";
 import { useSettings } from "../state/settings";
 import { useSession } from "../state/stores";
 import { TooltipProvider } from "./kit";
-import { LiveBadge, ShareButton, SharingBar } from "./Screen";
+import { LiveBadge, ShareButton, SharingBar, Stage } from "./Screen";
 
 const channel = (id: number, extra: Partial<Channel> = {}): Channel => ({
   id, parent: null, name: `c${id}`, topic: "", position: id, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false, ...extra,
@@ -122,4 +123,59 @@ it("shows independent quality controls and saves an explicit click on the surfac
   expect(container.querySelectorAll("select")).toHaveLength(2);
   await act(async () => modes[0]!.click());
   expect(useSettings.getState().screenMode).toBe("smooth");
+});
+
+it("hides a reused slot's cached frame until decode advances, fencing old grants and stats", async () => {
+  vi.useFakeTimers();
+  let frames = 10, defer = false;
+  let stale!: (stats: { width: number; height: number; fps: number; framesDecoded: number }) => void;
+  const sample = () => ({ width: 640, height: 360, fps: 20, framesDecoded: frames });
+  const stats = vi.spyOn(controller.screen, "stats").mockImplementation(async () => defer ? new Promise(resolve => { stale = resolve; }) : sample());
+  const play = vi.spyOn(HTMLVideoElement.prototype, "play").mockResolvedValue();
+  const stream = new MediaStream(), dispatch = useScreen.getState().dispatch;
+  const grant = (id: number, share = "S") => {
+    dispatch({ type: "watch", share, id });
+    dispatch({ type: "granted", run: 1, id, slot: 0 });
+  };
+  const poll = () => act(async () => { await vi.advanceTimersByTimeAsync(250); });
+  const hidden = () => container.querySelector("video")!.classList.contains("opacity-0");
+  try {
+    dispatch({ type: "transport", run: 1, phase: "connected" });
+    dispatch({ type: "stream", run: 1, slot: 0, stream });
+    grant(1);
+    await act(async () => root.render(<TooltipProvider><Stage /></TooltipProvider>));
+    expect(hidden()).toBe(true);
+    await act(async () => {
+      container.querySelector("video")!.dispatchEvent(new Event("loadeddata"));
+      container.querySelector("video")!.dispatchEvent(new Event("resize"));
+    });
+    await poll(); // Cached data without decoder progress must stay hidden.
+    expect(hidden()).toBe(true);
+    frames++; await poll();
+    expect(hidden()).toBe(false);
+    const calls = stats.mock.calls.length;
+    await poll();
+    expect(stats).toHaveBeenCalledTimes(calls); // No readiness polling after the first new frame.
+
+    await act(async () => { dispatch({ type: "slot", run: 1, slot: 0, share: null }); grant(2, "T"); });
+    expect(useScreen.getState().streams[0]).toBe(stream);
+    expect(container.querySelector("video")!.srcObject).toBe(stream);
+    expect(hidden()).toBe(true);
+    defer = true; await poll(); defer = false;
+    expect(stale).toBeDefined();
+    await act(async () => { dispatch({ type: "slot", run: 1, slot: 0, share: null }); grant(3, "T"); });
+    await act(async () => stale({ ...sample(), framesDecoded: 99 }));
+    expect(hidden()).toBe(true);
+    await poll(); expect(hidden()).toBe(true);
+    frames++; await poll();
+    expect(hidden()).toBe(false);
+
+    await act(async () => { dispatch({ type: "transport", run: 2, phase: "connecting" }); });
+    expect(hidden()).toBe(true);
+    await act(async () => root.render(null));
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    await act(async () => root.render(null));
+    stats.mockRestore(); play.mockRestore(); vi.useRealTimers();
+  }
 });

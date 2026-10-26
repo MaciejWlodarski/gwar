@@ -13,7 +13,7 @@ import type { ScreenShare } from "../proto/ScreenShare";
 import { controller } from "../state/controller";
 import { guestLinkPossible, useCanWatch, useScreenSupport } from "../state/screen-controller";
 import { shareOf } from "../state/reducer";
-import { slotOf, useScreen } from "../state/screen";
+import { slotOf, useScreen, type Watch } from "../state/screen";
 import { useSession } from "../state/stores";
 import { type PublishStats } from "../voice/screen";
 import { HEIGHTS, FRAME_RATES, type ScreenSpec } from "../voice/screen-quality";
@@ -253,14 +253,35 @@ export function LiveBadge({ client, name }: { client: Client; name: string }) {
 function ShareVideo({ share, className, onDoubleClick, videoRef }: { share: string; className?: string; onDoubleClick?: () => void; videoRef?: (video: HTMLVideoElement | null) => void }) {
   const t = useT();
   const stream = useScreen(s => { const slot = slotOf(s, share); return slot === null ? null : (s.streams[slot] ?? null); });
+  const grant = useScreen(s => s.watches.find(w => w.share === share && w.status === "watching"));
+  const run = useScreen(s => s.transport.run);
   const ref = useRef<HTMLVideoElement | null>(null);
-  const [showing, setShowing] = useState(false);
+  const [shown, setShown] = useState<{ stream: MediaStream; grant: Watch; run: number } | null>(null);
+  const showing = !!shown && shown.stream === stream && shown.grant === grant && shown.run === run;
   useEffect(() => {
     const video = ref.current;
     if (!video) return;
     if (video.srcObject !== stream) video.srcObject = stream;
     if (stream) void video.play().catch(() => {});
-  }, [stream]);
+    if (!stream || !grant) return;
+    let active = true, timer: ReturnType<typeof setTimeout> | undefined, baseline: number | null = null;
+    // A reused receive track already has loaded data. Require fresh decoder
+    // progress; poll only this receiver, only until its first new frame.
+    const check = async () => {
+      const stats = await controller.screen.stats(share);
+      if (!active) return;
+      if (stats) {
+        if (baseline !== null && stats.framesDecoded > baseline) {
+          setShown({ stream, grant, run });
+          return;
+        }
+        baseline = stats.framesDecoded;
+      }
+      timer = setTimeout(() => { void check(); }, 250);
+    };
+    void check();
+    return () => { active = false; if (timer !== undefined) clearTimeout(timer); };
+  }, [stream, grant, run, share]);
   return (
     <div className={cn("relative flex min-h-0 items-center justify-center overflow-hidden bg-black", className)}>
       <video
@@ -269,10 +290,8 @@ function ShareVideo({ share, className, onDoubleClick, videoRef }: { share: stri
         muted
         autoPlay
         playsInline
-        onLoadedData={() => setShowing(true)}
-        onResize={() => setShowing(true)}
         onDoubleClick={onDoubleClick}
-        className="size-full object-contain"
+        className={cn("size-full object-contain", !showing && "opacity-0")}
       />
       {!showing && (
         <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-white/70">{t("screen.connecting")}</div>

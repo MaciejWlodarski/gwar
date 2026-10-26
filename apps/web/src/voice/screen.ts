@@ -387,18 +387,21 @@ type OutboundVideo = RTCOutboundRtpStreamStats & {
   powerEfficientEncoder?: boolean;
 };
 
-/** Reports a peer's connection state, failing it after 5 s disconnected or 15 s without connecting. */
+/** Start after the answer is applied: allow 15 s to connect, then 5 s disconnected. */
 function watchState(pc: RTCPeerConnection, report: (state: TransportState) => void, alive: () => boolean): () => void {
   let disconnect: ReturnType<typeof setTimeout> | null = null;
   const connect = setTimeout(() => { if (alive() && pc.connectionState !== "connected") report("failed"); }, 15_000);
-  pc.onconnectionstatechange = () => {
+  const changed = () => {
     if (!alive()) return;
     if (disconnect) { clearTimeout(disconnect); disconnect = null; }
     const state = pc.connectionState;
     if (state === "connected") { clearTimeout(connect); report("connected"); }
-    else if (state === "failed" || state === "closed") report("failed");
+    else if (state === "failed" || state === "closed") { clearTimeout(connect); report("failed"); }
     else if (state === "disconnected") disconnect = setTimeout(() => { if (alive() && pc.connectionState === "disconnected") report("failed"); }, 5_000);
   };
+  pc.onconnectionstatechange = changed;
+  // Applying the answer may already have connected the peer.
+  changed();
   return () => { clearTimeout(connect); if (disconnect) clearTimeout(disconnect); };
 }
 
@@ -414,6 +417,8 @@ export interface PublishParams {
   /** `screen.publish.offer` for this share: the server's answer. */
   offer(body: { ssrc: number; rtx_ssrc: number; sdp: string }): Promise<string>;
   state(state: TransportState): void;
+  /** Capture ended, including a page-initiated stop that emits no `ended` event. */
+  ended?(): void;
 }
 
 /**
@@ -431,6 +436,7 @@ export class ScreenPublisher {
   private timer: ReturnType<typeof setInterval> | null = null;
   private stopWatching: () => void = () => {};
   private closed = false;
+  private trackEnded = false;
   private sent: { bytes: number; at: number } | null = null;
   private recovery: ScreenRecovery | null = null;
   private phase: "pulse" | null = null;
@@ -461,7 +467,6 @@ export class ScreenPublisher {
     if (this.closed || run !== this.run) return;
     const pc = new RTCPeerConnection(rtcConfig(iceServers));
     this.pc = pc;
-    this.stopWatching = watchState(pc, s => this.params.state(s), () => this.pc === pc);
     const spec = this.spec();
     const transceiver = pc.addTransceiver(track, {
       direction: "sendonly",
@@ -480,6 +485,7 @@ export class ScreenPublisher {
     if (this.closed || this.pc !== pc) return;
     await pc.setRemoteDescription({ type: "answer", sdp: answer });
     if (this.closed || this.pc !== pc) return;
+    this.stopWatching = watchState(pc, s => this.params.state(s), () => this.pc === pc);
     // The latest quality: `setSpec` may have run while this negotiated.
     this.refreshSurface();
     await this.applyParameters(this.spec().maxBitrate);
@@ -544,6 +550,12 @@ export class ScreenPublisher {
   private async headroom(): Promise<void> {
     const pc = this.pc;
     if (!pc || this.closed) return;
+    // MediaStreamTrack.stop() changes readyState without firing `ended`.
+    // Use this existing poll even when stats are unavailable or still pending.
+    if (this.params.track.readyState === "ended") {
+      if (!this.trackEnded) { this.trackEnded = true; this.params.ended?.(); }
+      return;
+    }
     this.refreshSurface();
     if (this.polling === pc) return;
     this.polling = pc;
@@ -810,7 +822,6 @@ export class ScreenWatchTransport {
   async start(): Promise<void> {
     const pc = new RTCPeerConnection(rtcConfig(this.params.iceServers));
     this.pc = pc;
-    this.stopWatching = watchState(pc, s => this.params.state(s), () => this.pc === pc);
     for (let i = 0; i < (this.params.slots ?? SCREEN_SLOTS); i++) {
       const transceiver = pc.addTransceiver("video", { direction: "recvonly" });
       preferCodecs(transceiver, "receive");
@@ -830,6 +841,8 @@ export class ScreenWatchTransport {
     const answer = await this.params.offer(pc.localDescription?.sdp ?? "", this.run, h264);
     if (this.closed) return;
     await pc.setRemoteDescription({ type: "answer", sdp: answer });
+    if (this.closed) return;
+    this.stopWatching = watchState(pc, s => this.params.state(s), () => this.pc === pc);
     if (!this.closed && this.params.decodeFailed) this.decodeTimer = setInterval(() => void this.checkDecode(), 1000);
   }
 
@@ -844,7 +857,7 @@ export class ScreenWatchTransport {
 
   private async checkDecode(): Promise<void> {
     const pc = this.pc;
-    if (!pc || this.closed || this.polling) return;
+    if (!pc || this.closed || this.polling || this.watchdogs.size === 0) return;
     this.polling = true;
     try {
       const report = await pc.getStats();
