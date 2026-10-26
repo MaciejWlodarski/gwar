@@ -207,6 +207,7 @@ class ScreenGateRuns(unittest.TestCase):
                 "detected_onsets": [{"identity": 0, "sample": 48000, "playout_s": 1 + latency / 1000}],
                 "median_ms": latency, "p95_ms": latency, "p99_ms": latency,
                 "receiver_frames_received": 100,
+                "receiver_device": {"late_over_5ms": 0, "max_busy_ms": 0.05},
                 "receiver_playout": {"underruns": int(regressed), "underrun_samples": 223 if regressed else 0,
                                      "slots": [{"concealments": 0, "late_drops": 0}]},
                 "screen": load,

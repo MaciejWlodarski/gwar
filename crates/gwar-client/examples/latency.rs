@@ -265,11 +265,69 @@ fn detect_onsets(samples: &[(f64, f32)]) -> Vec<Onset> {
     onsets
 }
 
+/// The longest wait for both voice transports before markers are armed (`LATENCY_WAIT_CONNECTED`).
+const CONNECT_WAIT: Duration = Duration::from_secs(30);
+
+/// Room for every receiver playout sample of a run, allocated and written before the device
+/// starts, so the callback never grows or first touches it. Grown in the callback, the buffer
+/// reallocated at each power of two; the move at 2^20 samples (21.8 s) coincided with a single
+/// underrun and a lasting 15 ms latency step in about one gate run in six (docs/latency.md). A
+/// reservation alone is not enough: with transparent huge pages, the first write to each 2 MB
+/// of it (every 2.7 s) stalled the callback for up to 17 ms.
+fn playout_record(run_for: Duration, wait_connected: bool) -> Vec<(f64, f32)> {
+    let wait = if wait_connected { CONNECT_WAIT } else { Duration::ZERO };
+    // Voice signaling and device start come on top of the connection wait.
+    let samples = ((run_for + wait + Duration::from_secs(2)).as_secs_f64() * RATE as f64) as usize;
+    let mut record = Vec::with_capacity(samples);
+    record.resize(samples, (0.0, 0.0));
+    record.clear();
+    record
+}
+
 #[derive(Default)]
 struct Measurements {
     captures: Vec<Marker>,
     samples: Vec<(f64, f32)>,
     underflows: usize,
+    device: DeviceTiming,
+}
+
+/// Fake device callbacks that started late or ran long. A late callback is followed by
+/// back-to-back catch-up callbacks, which can drain the speaker ring faster than real time.
+const LATE_CALLBACK: Duration = Duration::from_millis(5);
+const LONG_CALLBACK: Duration = Duration::from_millis(2);
+const MAX_SLOW_CALLBACKS: usize = 32;
+#[derive(Default, Serialize)]
+struct DeviceTiming {
+    callbacks: u64,
+    max_lateness_ms: f64,
+    max_busy_ms: f64,
+    late_over_5ms: u64,
+    busy_over_2ms: u64,
+    /// The first slow callbacks, on the measurement clock.
+    slow: Vec<SlowCallback>,
+}
+#[derive(Serialize)]
+struct SlowCallback {
+    at_s: f64,
+    lateness_ms: f64,
+    busy_ms: f64,
+    /// Playout samples recorded before this callback (receiver only).
+    recorded_samples: usize,
+}
+impl DeviceTiming {
+    fn record(&mut self, at_s: f64, lateness: Duration, busy: Duration, recorded_samples: usize) {
+        self.callbacks += 1;
+        let (lateness_ms, busy_ms) = (lateness.as_secs_f64() * 1000.0, busy.as_secs_f64() * 1000.0);
+        self.max_lateness_ms = self.max_lateness_ms.max(lateness_ms);
+        self.max_busy_ms = self.max_busy_ms.max(busy_ms);
+        let (late, long) = (lateness > LATE_CALLBACK, busy > LONG_CALLBACK);
+        self.late_over_5ms += u64::from(late);
+        self.busy_over_2ms += u64::from(long);
+        if (late || long) && self.slow.len() < MAX_SLOW_CALLBACKS {
+            self.slow.push(SlowCallback { at_s, lateness_ms, busy_ms, recorded_samples });
+        }
+    }
 }
 struct FakeIo {
     markers_ready: Arc<AtomicBool>,
@@ -319,15 +377,19 @@ impl AudioIo for FakeIo {
             let mut delay = DelayLine::new(self.delay_samples);
             let mut callback = 0;
             let mut marker_start = None;
+            let mut timing_stats = DeviceTiming::default();
             while !thread_stop.load(Ordering::Relaxed) {
                 let block = if self.callback_jitter { [480, 960, 240][callback % 3] } else { BLOCK };
                 let mut missing = 0;
                 let now = Instant::now();
+                let lateness =
+                    now.saturating_duration_since(start + Duration::from_secs_f64(position as f64 / RATE as f64));
                 if marker_start.is_none() && self.markers_ready.load(Ordering::Acquire) {
                     marker_start = Some(position + self.warmup_samples);
                 }
                 let warmup = marker_start.unwrap_or(usize::MAX);
                 let mut data = self.data.lock().unwrap();
+                let recorded = data.samples.len();
                 for i in 0..block {
                     let at = position + i;
                     let in_marker =
@@ -367,6 +429,7 @@ impl AudioIo for FakeIo {
                 }
                 drop(data);
                 timing.report(block, missing);
+                timing_stats.record((now - self.epoch).as_secs_f64(), lateness, now.elapsed(), recorded);
                 callback += 1;
                 position += block;
                 let due = start + Duration::from_secs_f64(position as f64 / RATE as f64);
@@ -374,6 +437,7 @@ impl AudioIo for FakeIo {
                     thread::sleep(wait);
                 }
             }
+            self.data.lock().unwrap().device = timing_stats;
         })?;
         Ok(AudioPorts { mic, speaker, output, _guard: Box::new(Guard { stop, thread: Some(thread) }) })
     }
@@ -646,11 +710,20 @@ async fn run(
         None => None,
     };
     let markers_ready = Arc::new(AtomicBool::new(!settings.wait_connected));
-    // After the screen load, whose start can take seconds: a device that starts late runs
-    // ahead to catch up and overflows its ring.
-    let start = Instant::now() + Duration::from_millis(200);
+    // Markers, then their matching window, after the warmup.
+    let run_for = Duration::from_secs_f64(
+        1.0 + settings.warmup_samples as f64 / RATE as f64
+            + count as f64 * PERIOD as f64 / RATE as f64
+            + MATCH_WINDOW_MS / 1000.0,
+    );
     let sent = Arc::new(Mutex::new(Measurements::default()));
-    let heard = Arc::new(Mutex::new(Measurements::default()));
+    let heard = Arc::new(Mutex::new(Measurements {
+        samples: playout_record(run_for, settings.wait_connected),
+        ..Measurements::default()
+    }));
+    // After the screen load, whose start can take seconds, and the playout record: a device
+    // that starts late runs ahead to catch up and overflows its ring.
+    let start = Instant::now() + Duration::from_millis(200);
     let io = |data: &Arc<Mutex<Measurements>>, tone: bool, delay_samples: usize, callback_jitter: bool| {
         Box::new(FakeIo {
             markers_ready: markers_ready.clone(),
@@ -684,7 +757,7 @@ async fn run(
         }
     };
     let connected_s = if settings.wait_connected {
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(CONNECT_WAIT, async {
             loop {
                 let links = [va.stats().link, vb.stats().link];
                 anyhow::ensure!(!links.contains(&voice::LinkState::Lost), "voice lost while waiting to arm markers");
@@ -703,11 +776,6 @@ async fn run(
         None
     };
     // The receiver's playout state every 100 ms, to see where a latency step sits.
-    let run_for = Duration::from_secs_f64(
-        1.0 + settings.warmup_samples as f64 / RATE as f64
-            + count as f64 * PERIOD as f64 / RATE as f64
-            + MATCH_WINDOW_MS / 1000.0,
-    );
     let mut timeline = String::from(
         "t_s,queued_samples,staged_samples,target_samples,shrink_samples,concealments,late_drops,trim_events,speaker_samples,callback_samples,headroom_samples,underruns\n",
     );
@@ -859,6 +927,8 @@ async fn run(
         "marker_interval_samples": PERIOD,
         "warmup_samples": settings.warmup_samples,
     });
+    metadata["receiver_device"] = serde_json::to_value(&heard.device)?;
+    metadata["sender_device"] = serde_json::to_value(&sent.device)?;
     metadata["sframe"] = serde_json::json!(settings.sframe);
     metadata["screen"] = serde_json::json!(screen);
     metadata["receiver_sframe"] = serde_json::to_value(crypto)?;
@@ -1109,6 +1179,32 @@ mod tests {
                 .collect();
             assert_eq!(identify_tone(&samples).0, None);
         }
+    }
+
+    #[test]
+    fn playout_record_holds_the_longest_run_without_growing() {
+        let run_for = Duration::from_secs(43); // 15 s warmup, 100 markers
+        for (wait_connected, seconds) in [(false, 45), (true, 75)] {
+            let record = playout_record(run_for, wait_connected);
+            assert!(record.is_empty());
+            assert!(record.capacity() >= seconds * RATE, "{}", record.capacity());
+        }
+    }
+
+    #[test]
+    fn device_timing_keeps_the_first_slow_callbacks_and_counts_all() {
+        let mut timing = DeviceTiming::default();
+        let ms = Duration::from_millis;
+        timing.record(1.0, ms(1), Duration::from_micros(30), 0);
+        assert!(timing.slow.is_empty());
+        for i in 0..40 {
+            timing.record(2.0 + f64::from(i), ms(6), ms(3), 1 << 20);
+        }
+        timing.record(50.0, ms(1), ms(17), 1 << 21);
+        assert_eq!((timing.callbacks, timing.late_over_5ms, timing.busy_over_2ms), (42, 40, 41));
+        assert_eq!(timing.slow.len(), MAX_SLOW_CALLBACKS);
+        assert_eq!(timing.slow[0].recorded_samples, 1 << 20);
+        assert!((timing.max_busy_ms - 17.0).abs() < 1e-9 && (timing.max_lateness_ms - 6.0).abs() < 1e-9);
     }
 
     #[test]

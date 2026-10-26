@@ -72,6 +72,9 @@ def playout(meta):
         "concealments": sum(slot["concealments"] for slot in slots),
         "late_drops": sum(slot["late_drops"] for slot in slots),
         "frames_received": meta["receiver_frames_received"],
+        # Harness health, not a gate input: a stalled fake device forces underruns of its own.
+        "device_late_over_5ms": meta["receiver_device"]["late_over_5ms"],
+        "device_max_busy_ms": meta["receiver_device"]["max_busy_ms"],
     }
 
 

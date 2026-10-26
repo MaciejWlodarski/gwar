@@ -491,6 +491,17 @@ the concealment. All sample counts use 48 kHz mono; divide by 48 for ms. These c
 receiver underflows also include idle callbacks, whereas playout underruns count
 only callbacks during playback.
 
+`receiver_device` and `sender_device` time the fake devices' own callbacks:
+`callbacks`, `max_lateness_ms` (callback start behind its due time),
+`max_busy_ms` (callback body), `late_over_5ms`, `busy_over_2ms`, and the first 32
+such callbacks in `slow` (measurement-clock time, lateness, busy time and, for
+the receiver, the playout samples recorded before it). A late callback is
+followed by back-to-back catch-up callbacks that can drain the speaker ring
+faster than real time, so an underrun next to a slow device callback is the
+harness's, not the pipeline's (see "Fake device stalls" below). The screen gate
+copies the receiver's `late_over_5ms` and `max_busy_ms` into each run's figures
+as `device_late_over_5ms` and `device_max_busy_ms`; they are not gate inputs.
+
 Fractional corrections use the minimum queue + staged PCM margin observed
 before refills over a full trailing five seconds. This retains sparse low-water
 evidence such as a 5 ms packet delay every three seconds. The margin excludes
@@ -975,6 +986,72 @@ the manifest. Remote runs also retain server and tunnel logs.
 Compare loss and underflows alongside latency. Frame counters cover warmup too.
 Inspect individual call levels: startup buffering or network drift can dominate
 pooled p95. The runners impose no fixed performance pass threshold.
+
+## Fake device stalls: the 61 ms plateau (2026-10-26)
+
+Gate runs were bimodal: most played every marker at about 46.4 ms, but some
+stepped once to about 61.2 ms (+14.6 ms) and stayed there, so their p99 was the
+plateau. It appeared in every revision, baseline arms and A/A included. The
+cause is in the harness, not in Gwar: until 2026-10-26 the receiver's fake
+output device appended every playout sample to a `Vec` inside its callback,
+which reallocated at each power of two. The move at 2^20 samples (16 to 32 MB,
+21.845 s after the device starts) coincided with the step.
+
+Evidence, from the archived VM gate artifacts (gate `3725c3c` and the uplink
+A/B of 2026-10-23: 144 runs without configured loss, 100 ms timelines):
+
+- 26 output-underrun steps; 24 of them in the timeline interval holding the
+  predicted 2^20 crossing (device start + 21.845 s, the start being marker 0
+  minus the warmup). Runs whose devices started 0.41--0.49 s after the epoch
+  (screen arms, slower setup) moved with it: underrun in (22.25, 22.43] s
+  instead of (21.97, 22.13] s. It follows the device's sample count, not wall
+  time or the marker phase (markers 27--28 only by coincidence).
+- 24 of 144 runs (17 %) have that underrun, and all 24 are tails: p99
+  56.7--91.4 ms, 19 of them 61.2 +/- 1 ms. Three loss-scenario runs show the
+  same event. The remaining two underrun steps were in one heavily jittered
+  uplink run.
+- Anatomy (downlink A/A run 1): one concealment and one 223-sample underrun in
+  the same 100 ms; staged PCM 0 -> 463 and speaker headroom 480 -> 720, 703
+  samples = 14.6 ms in all. That is the whole-process stall the event
+  implies: packets arrived late (concealment) and the device then caught up
+  faster than the pipeline refilled (underrun). Afterwards the playout
+  policies behave as documented: the headroom step is released after 5 s (the
+  surplus moves into the packet queue), a 480-sample trim follows 13.4 s after
+  the event (a jitter-target bump at 29.4 s restarted the window), and the
+  final 223 samples stay, below the 240 samples a correction needs (surplus
+  above the 120-sample safety, itself at least 120 samples).
+
+The kernel path on the VM cannot be read back from the artifacts. Reproduced in
+Docker (Linux 7.0 aarch64, glibc 2.36, 4 CPUs, transparent huge pages
+`always`) on a loaded Mac:
+
+- With the default allocator the growths are `mremap` calls (0.2--0.4 ms in
+  `strace`, the 2^20 one 0.38 ms), cheap there. `mremap` still takes the
+  process's memory-map lock for writing and flushes every CPU's TLB, which on
+  a busy 4 vCPU VM (CPU pressure 9--18 % in the gate's host samples) waits for
+  preempted vCPUs; it runs on the device thread at a deterministic point.
+- With the copying path forced (`GLIBC_TUNABLES=glibc.malloc.mmap_threshold=33554432`,
+  as an earlier large free can leave the dynamic threshold), the callbacks that
+  grew the buffer took 9.0--36.4 ms (10 of the 14 recorded); 6 runs.
+- Only reserving the capacity was not enough: the first write to each 2 MB of
+  the untouched reservation (every 2.73 s, a transparent huge page) stalled
+  the callback by up to 16.8 ms, 16 callbacks over 5 ms in 6 runs.
+
+The receiver's record is now allocated for the longest run (30 s connection
+wait + markers, matching window and warmup + 2 s) and written once before the
+devices' start time is set (`playout_record`). With the forced copying path,
+the longest receiver callback per run was 14.3--40.0 ms before (all 6 runs) and
+1.2--3.4 ms after, except two runs during 180--290 ms host stalls (40 and
+79 ms, with equally late callbacks). The Docker host was too loaded
+(fake device lateness 10--290 ms in most runs, both builds) for its marker
+latencies to be compared with the VM's; the before/after gate comparison
+belongs on the VM.
+
+A second, smaller mode is unrelated: 17 runs without configured loss stepped
+about +10 ms (p99 53.9--63.7 ms) after a single concealment at a random time,
+with no underrun and the jitter target rising above one packet. That is one
+genuinely late packet and the deliberately slow drain ("Level steps" above),
+not a harness artifact.
 
 ## Echo cancellation and gain control
 

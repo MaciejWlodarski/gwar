@@ -94,3 +94,18 @@ underrun rule, but do not explain that pair's marker latency difference.
 The screen run has no pauses and zero viewer wakes over 5 ms; relay maxima
 are 1.331 ms up / 3.041 ms down (baseline: 0.142 / 0.323 ms), with zero sends
 over 5 ms late. These aggregate measurements do not identify a trigger.
+
+## Cause (2026-10-26)
+
+The shared trigger was the harness, not the voice path or screen load. The
+receiver's fake output device grew its sample `Vec` inside the callback, and
+the reallocation at 2^20 samples, 21.845 s after the device starts, coincided
+with the underrun in 24 of 26 underrun steps in later gate artifacts. The
+first 0.2 s of each run are setup, so this falls at about 22.05 s, between
+markers 27 and 28; screen arms start their devices later and moved with it.
+The next growth (2^21) comes 43.69 s after device start: about 43.89 s with
+the usual 0.2 s setup, inside the (43.831, 43.932] s interval of the
+`run-08-baseline` underrun. Whether `run-07-screen` (48.2 s) started its
+devices 4.5 s late cannot be checked; these artifacts are no longer kept. The harness
+now allocates and touches the whole record before the devices start; see
+"Fake device stalls" in [latency.md](latency.md).
