@@ -1,4 +1,4 @@
-import { Hash, LayoutDashboard, LogIn, Megaphone, Menu, MessageSquare, UserPlus, Volume2 } from "lucide-react";
+import { Hash, LayoutDashboard, LogIn, Megaphone, MessageSquare, UserPlus, Volume2 } from "lucide-react";
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { useLanguage, useT } from "../i18n";
 import { cn } from "../lib/cn";
@@ -15,7 +15,7 @@ import { useSession, useUi } from "../state/stores";
 import type { ChatItem } from "../state/types";
 import { TeamSpeakBadge, TsIcon, UnreadBadge } from "./badges";
 import { useChannelPermission, usePermission } from "./hooks";
-import { Avatar, Button, IconButton, TalkingAvatar, panelCard } from "./kit";
+import { Avatar, BackButton, Button, TalkingAvatar, panelCard } from "./kit";
 import { newsworthy, stillHeld } from "./nav";
 import { LiveBadge } from "./Screen";
 
@@ -144,7 +144,7 @@ export function Overview({ card }: { card?: boolean }) {
   const t = useT();
   const lang = useLanguage();
   const isMobile = useIsMobile();
-  const setDrawer = useUi((s) => s.setDrawer);
+  const setPane = useUi((s) => s.setPane);
   const openDialog = useUi((s) => s.openDialog);
   const server = useSession((s) => s.server);
   const kind = useSession((s) => s.kind);
@@ -202,11 +202,7 @@ export function Overview({ card }: { card?: boolean }) {
   return (
     <main className={cn("relative flex min-w-0 flex-1 flex-col bg-surface", card && panelCard)}>
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-line px-3 md:px-4">
-        {isMobile && (
-          <IconButton label={t("nav.channels")} onClick={() => setDrawer(true)} className="-ml-1">
-            <Menu className="size-5" />
-          </IconButton>
-        )}
+        {isMobile && <BackButton label={t("nav.toChannels")} onClick={() => setPane("list")} />}
         <LayoutDashboard className="size-5 text-subtle" />
         <div className="min-w-0 flex-1">
           <h2 className="truncate text-[15px] leading-tight font-semibold">{t("overview.title")}</h2>

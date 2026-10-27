@@ -264,22 +264,16 @@ function recordFrames(page) {
   };
 }
 
-/** Escape first dismisses a focused member tooltip, then its containing drawer. */
-async function dismissDialog(page, name) {
-  const dialog = page.getByRole("dialog", { name, exact: true });
-  for (let attempt = 0; attempt < 3 && await dialog.isVisible(); attempt++) {
-    await page.keyboard.press("Escape");
-    await page.waitForTimeout(100);
-  }
-  await dialog.waitFor({ state: "detached" });
-}
-
 /** Set the identity's profile through Settings, before the first join. */
 async function setGlobalNickname(page, nickname, { mobile = false, pl = false } = {}) {
-  const settings = page.getByRole("button", { name: pl ? "Ustawienia" : "Settings", exact: true }).first();
-  if (mobile && !(await settings.isVisible())) await page.getByRole("button", { name: pl ? "Serwery" : "Servers", exact: true }).click();
-  await settings.click();
-  await page.getByRole("tab", { name: pl ? "Tożsamość" : "Identity", exact: true }).click();
+  if (mobile) {
+    // Phones: More's Profile tile opens the identity page straight away.
+    await sectionTab(page, pl ? "Więcej" : "More").click();
+    await page.getByRole("dialog", { name: pl ? "Więcej" : "More", exact: true }).getByRole("button", { name: pl ? "Profil" : "Profile", exact: true }).click();
+  } else {
+    await page.getByRole("button", { name: pl ? "Ustawienia" : "Settings", exact: true }).first().click();
+    await page.getByRole("tab", { name: pl ? "Tożsamość" : "Identity", exact: true }).click();
+  }
   const field = page.getByLabel(pl ? "Pseudonim" : "Nickname", { exact: true });
   await waitFor(async () => (await field.inputValue()) !== "", "identity nickname", 10000);
   await field.fill(nickname);
@@ -287,9 +281,12 @@ async function setGlobalNickname(page, nickname, { mobile = false, pl = false } 
   await save.click();
   await waitFor(() => save.isEnabled(), "saved identity nickname", 15000);
   await page.getByText(pl ? "Zapisano" : "Saved", { exact: true }).waitFor();
-  await page.keyboard.press("Escape");
-  if (mobile) await dismissDialog(page, pl ? "Kanały i serwery" : "Channels and servers");
+  if (mobile) await sectionTab(page, pl ? "Serwery" : "Servers").click();
+  else await page.keyboard.press("Escape");
 }
+
+/** A phone's tab bar button. */
+const sectionTab = (page, name) => page.getByRole("navigation", { name: /^(Sections|Sekcje)$/ }).getByRole("button", { name, exact: true });
 
 async function changeServerNickname(page, nickname) {
   await page.getByRole("button", { name: "Server menu" }).click();
@@ -306,9 +303,8 @@ async function connect(page, nickname, { mobile = false, address = CLIENT_ADDR }
   await setGlobalNickname(page, nickname, { mobile });
   if (await page.getByLabel("Nickname").count()) throw new Error("connect screen still asks for a nickname");
   await page.getByRole("button", { name: "Connect", exact: true }).click();
-  // After connecting you are on the server, not in voice. On phones the voice panel lives in the drawer.
-  if (mobile) await page.getByRole("button", { name: "Channels and servers" }).waitFor({ timeout: 20000 });
-  else await page.getByText("Not in voice").waitFor({ timeout: 20000 });
+  // After connecting you are on the server, not in voice; phones land on the channel list, voice panel included.
+  await page.getByText("Not in voice").waitFor({ timeout: 20000 });
 }
 
 /** Joins a channel's voice with the small button that appears when hovering its row. */
@@ -928,49 +924,110 @@ async function main() {
   // Mobile
   const ctxM = await newCtx({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
   const m = await ctxM.newPage();
-  await check("mobile layout connects and opens the drawer", async () => {
+  const tabBar = m.getByRole("navigation", { name: "Sections", exact: true });
+  const mPill = m.getByRole("region", { name: "Voice connection", exact: true });
+  // By CSS: the open sheet (a modal) hides the tab bar from the accessibility tree.
+  const current = async (name) => (await m.locator(`nav[aria-label="Sections"] button[aria-label="${name}"]`).getAttribute("aria-current")) === "page";
+  await check("phones: a tab bar, the channel list as the Servers page, a conversation and its members full screen", async () => {
     await connect(m, "Carol", { mobile: true });
-    await shot(m, "11-mobile-dark-chat");
-    await m.getByRole("button", { name: "Channels and servers" }).click();
-    await treeItem(m, GAMES).waitFor();
-    await shot(m, "12-mobile-dark-drawer");
+    const tabs = await tabBar.getByRole("button").evaluateAll((buttons) => buttons.map((b) => b.getAttribute("aria-label")));
+    if (tabs.join() !== "Home,Servers,More") throw new Error(`tab bar: ${tabs}`);
+    if (!(await current("Servers"))) throw new Error("the Servers tab is not marked");
+    // The join button has no hover on touch screens: it is always there. Joining keeps the list.
+    await m.getByRole("button", { name: `Join voice in ${GAMES}` }).click();
+    await m.getByText("Voice connected").first().waitFor({ timeout: 20000 });
+    await sectionTab(m, "Servers").locator(".bg-ok").waitFor();
+    if (await mPill.count()) throw new Error("the pill is shown on the Servers page");
+    await shot(m, "m3-servers-in-voice-dark");
+    // A channel opens its conversation full screen, without the tab bar.
     await treeItem(m, GAMES).click();
     await m.getByRole("tab", { name: new RegExp(escapeRe(GAMES)) }).waitFor();
-    // The join button has no hover on touch screens: it is always there.
-    await m.getByRole("button", { name: "Channels and servers" }).click();
-    await m.getByRole("button", { name: `Join voice in ${GAMES}` }).waitFor();
-    await dismissDialog(m, "Channels and servers");
-    await m.getByRole("button", { name: "Members" }).click();
-    await memberSection(m, "Online").getByText("Carol").waitFor();
-    await shot(m, "12b-mobile-dark-members");
-    await dismissDialog(m, "Members");
-  });
-  await check("phones: Settings is a drawer tab, and the voice pill fits above the sections' content", async () => {
-    const drawerTab = (name) => m.getByRole("navigation", { name: "Sections" }).getByRole("button", { name, exact: true });
-    await m.getByRole("button", { name: "Channels and servers" }).click();
-    await m.getByRole("button", { name: `Join voice in ${GAMES}` }).click();
-    if (!(await drawerTab("Home").isVisible())) await m.getByRole("button", { name: "Channels and servers" }).click();
-    await drawerTab("Home").click();
-    const pill = m.getByRole("region", { name: "Voice connection", exact: true });
-    await pill.getByText("Voice connected").waitFor({ timeout: 20000 });
-    const box = await pill.boundingBox();
-    if (!box || box.x < 0 || box.x + box.width > 390) throw new Error(`the pill does not fit: ${JSON.stringify(box)}`);
-    await shot(m, "55-mobile-home-pill-dark");
-    await m.getByRole("button", { name: "Channels and servers" }).click();
-    await drawerTab("Settings").click();
-    await m.getByRole("main", { name: "Settings" }).waitFor();
-    await pill.waitFor();
-    await shot(m, "56-mobile-settings-pill-dark");
-    await pill.getByRole("button", { name: "Leave voice" }).click();
-    await pill.waitFor({ state: "detached" });
-    await m.getByRole("button", { name: "Channels and servers" }).click();
-    await drawerTab("Servers").click();
+    await tabBar.waitFor({ state: "detached" });
+    await shot(m, "m4-chat-dark");
+    await m.getByRole("button", { name: "Members", exact: true }).click();
+    const members = m.getByRole("complementary", { name: "Members", exact: true });
+    await memberSection(m, "In voice").getByText("Carol").waitFor();
+    await shot(m, "m5-members-dark");
+    await members.getByRole("button", { name: "Back", exact: true }).click();
+    await members.waitFor({ state: "detached" });
+    await m.getByRole("button", { name: "Back to channels", exact: true }).click();
+    await tabBar.waitFor();
+    await treeItem(m, GAMES).waitFor();
+    // The system's back goes the same way.
     await treeItem(m, GAMES).click();
+    await tabBar.waitFor({ state: "detached" });
+    await m.evaluate(() => history.back());
+    await tabBar.waitFor();
+    await treeItem(m, GAMES).waitFor();
+  });
+  const sheet = m.getByRole("dialog", { name: "More", exact: true });
+  // The sheet slides in: wait for it to stand still before a screenshot or a swipe on its handle.
+  const sheetOpen = async () => {
+    await sheet.waitFor();
+    await sheet.evaluate((el) => Promise.all(el.getAnimations().map((a) => a.finished)));
+  };
+  await check("phones: More is a sheet over the tab bar, closed by Esc, a tap outside, a swipe down and a pick", async () => {
+    await sectionTab(m, "Home").click();
+    await mPill.getByText("Voice connected").waitFor();
+    await shot(m, "m1-home-pill-dark");
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    if (!(await current("More")) || (await current("Home"))) throw new Error("More is not the marked tab while open");
+    await shot(m, "m2-more-dark");
+    await m.keyboard.press("Escape");
+    await sheet.waitFor({ state: "detached" });
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    await m.mouse.click(195, 120);
+    await sheet.waitFor({ state: "detached" });
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    const handle = await sheet.locator(".cursor-grab").boundingBox();
+    await m.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
+    await m.mouse.down();
+    await m.mouse.move(handle.x + handle.width / 2, handle.y + 300, { steps: 6 });
+    await m.mouse.up();
+    await sheet.waitFor({ state: "detached" });
+    if (!(await current("Home"))) throw new Error("Home is not marked again");
+  });
+  await check("phones: Settings is a list, a category opens over it with a way back; the pill fits a 360 px phone", async () => {
+    await sectionTab(m, "More").click();
+    await sheet.getByRole("button", { name: "Settings", exact: true }).click();
+    const settings = m.getByRole("main", { name: "Settings" });
+    await settings.waitFor();
+    await sheet.waitFor({ state: "detached" });
+    if (!(await current("More"))) throw new Error("More is not marked on Settings");
+    await mPill.waitFor();
+    await shot(m, "m6-settings-dark");
+    await settings.getByRole("button", { name: /^Audio/ }).click();
+    await settings.getByRole("heading", { name: "Audio", exact: true, level: 2 }).waitFor();
+    await shot(m, "m7-settings-audio-dark");
+    await settings.getByRole("button", { name: "Back", exact: true }).click();
+    await settings.getByRole("button", { name: /^Language/ }).click();
+    await settings.getByRole("heading", { name: "Language", exact: true, level: 2 }).waitFor();
+    await m.evaluate(() => history.back());
+    await settings.getByRole("button", { name: /^Language/ }).waitFor();
+    await sectionTab(m, "More").click();
+    await sheet.getByRole("button", { name: "Report a bug", exact: true }).click();
+    await m.getByRole("main", { name: "Report a bug" }).waitFor();
+    await shot(m, "m8-bug-report-dark");
+    // The pill fits the narrowest phones, above the tab bar.
+    await m.setViewportSize({ width: 360, height: 740 });
+    await sleep(200);
+    const box = await mPill.boundingBox();
+    const bar = await tabBar.boundingBox();
+    if (!box || box.x < 0 || box.x + box.width > 360 || box.y + box.height > bar.y) throw new Error(`the pill does not fit: ${JSON.stringify({ box, bar })}`);
+    await m.setViewportSize({ width: 390, height: 844 });
+    await mPill.getByRole("button", { name: "Leave voice" }).click();
+    await mPill.waitFor({ state: "detached" });
+    await sectionTab(m, "Servers").click();
+    await treeItem(m, GAMES).click();
+    await tabBar.waitFor({ state: "detached" });
   });
   await m.emulateMedia({ colorScheme: "light" });
   await shot(m, "13-mobile-light-chat");
-  await m.getByRole("button", { name: "Channels and servers" }).click();
-  await shot(m, "14-mobile-light-drawer");
+  await m.getByRole("button", { name: "Back to channels", exact: true }).click();
+  await shot(m, "14-mobile-light-servers");
 
   // Polish UI
   const ctxP = await newCtx({ locale: "pl-PL", colorScheme: "light" });

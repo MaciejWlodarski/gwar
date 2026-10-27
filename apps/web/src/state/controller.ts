@@ -369,17 +369,17 @@ class Controller {
     useSession.subscribe((s) => this.checkRead(s));
 
     // Messages only count as read while the window is visible and focused, with the chat on screen: not
-    // covered by Home or the server overview, and not left out beside a watched share (collapsed, or on a
-    // phone, where the stage takes the whole screen).
+    // covered by another section or the server overview, not behind the channel list or members on a phone,
+    // and not left out beside a watched share (collapsed, or on a phone, where the stage takes the whole screen).
     const narrow = typeof window.matchMedia === "function" ? window.matchMedia("(max-width: 799px)") : null;
     const syncFocus = () => {
       const ui = useUi.getState(), screen = useScreen.getState();
-      const chatShown = ui.section === "servers" && (screen.stage !== null ? !narrow?.matches && !screen.chatHidden : !ui.overview);
+      const chatShown = ui.section === "servers" && (!narrow?.matches || ui.pane === "chat") && (screen.stage !== null ? !narrow?.matches && !screen.chatHidden : !ui.overview);
       const focused = document.visibilityState === "visible" && document.hasFocus() && chatShown;
       useSession.getState().dispatch({ type: "focus", focused });
     };
     useUi.subscribe((ui, before) => {
-      if (ui.section !== before.section || ui.overview !== before.overview) syncFocus();
+      if (ui.section !== before.section || ui.overview !== before.overview || ui.pane !== before.pane) syncFocus();
     });
     useScreen.subscribe((screen, before) => {
       if ((screen.stage === null) !== (before.stage === null) || screen.chatHidden !== before.chatHidden) syncFocus();

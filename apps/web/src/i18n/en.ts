@@ -11,10 +11,13 @@ export const en = {
   "storage.newer.body": "A newer version of Gwar saved data in this browser or app, and this version cannot read it. Nothing was changed. Reload the page or install the latest Gwar.",
 
   "nav.servers": "Servers",
-  "nav.channels": "Channels and servers",
   "nav.sections": "Sections",
   "nav.home": "Home",
   "nav.account": "Your profile",
+  "nav.back": "Back",
+  "nav.more": "More",
+  "nav.profile": "Profile",
+  "nav.toChannels": "Back to channels",
 
   "rail.label": "Saved servers",
   "rail.connect": "Connect",

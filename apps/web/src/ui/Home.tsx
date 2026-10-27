@@ -1,13 +1,12 @@
-import { ArrowRight, House, Menu, Plus, Volume2 } from "lucide-react";
+import { ArrowRight, House, Plus, Volume2 } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
-import { useIsMobile } from "../lib/media";
 import { useAccountIdentity } from "../state/identity";
 import { myChannelId } from "../state/reducer";
 import { useBookmarks } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { TeamSpeakBadge } from "./badges";
-import { Avatar, Button, IconButton, panelCard } from "./kit";
+import { Avatar, Button, panelCard } from "./kit";
 import { useBookmarkOpener, useVoicePill } from "./nav";
 import { VoicePill } from "./VoicePanel";
 
@@ -17,7 +16,6 @@ import { VoicePill } from "./VoicePanel";
  */
 export function Home({ card }: { card?: boolean }) {
   const t = useT();
-  const isMobile = useIsMobile();
   const nickname = useAccountIdentity((s) => s.nickname);
   const bookmarks = useBookmarks();
   const phase = useSession((s) => s.phase);
@@ -27,7 +25,6 @@ export function Home({ card }: { card?: boolean }) {
     return id === null ? null : (s.channels[id]?.name ?? null);
   });
   const setSection = useUi((s) => s.setSection);
-  const setDrawer = useUi((s) => s.setDrawer);
   const openDialog = useUi((s) => s.openDialog);
   const { isActive, open } = useBookmarkOpener();
   const connected = phase === "online" || phase === "reconnecting";
@@ -36,11 +33,6 @@ export function Home({ card }: { card?: boolean }) {
   return (
     <main className={cn("relative flex min-w-0 flex-1 flex-col bg-surface", card && panelCard)}>
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-line px-3 md:px-4">
-        {isMobile && (
-          <IconButton label={t("nav.channels")} onClick={() => setDrawer(true)} className="-ml-1">
-            <Menu className="size-5" />
-          </IconButton>
-        )}
         <House className="size-5 text-subtle" />
         <h2 className="truncate text-[15px] font-semibold">{t("nav.home")}</h2>
       </header>

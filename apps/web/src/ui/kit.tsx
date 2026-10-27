@@ -3,7 +3,7 @@ import * as SelectPrimitive from "@radix-ui/react-select";
 import * as SliderPrimitive from "@radix-ui/react-slider";
 import * as SwitchPrimitive from "@radix-ui/react-switch";
 import * as TooltipPrimitive from "@radix-ui/react-tooltip";
-import { Check, ChevronDown, X } from "lucide-react";
+import { Check, ChevronDown, ChevronLeft, X } from "lucide-react";
 import {
   forwardRef,
   useId,
@@ -180,6 +180,22 @@ export const IconButton = forwardRef<
     button
   );
 });
+
+/** Phones: back to the page this one was opened from, a "‹" (with `text`, "‹ Back"). */
+export function BackButton({ label, text, onClick }: { label?: string; text?: boolean; onClick: () => void }) {
+  const t = useT();
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-label={label ?? t("nav.back")}
+      className="t -ml-1.5 flex h-9 shrink-0 cursor-pointer items-center gap-0.5 rounded-md pr-2 pl-0.5 text-sm font-medium text-accent hover:bg-hover"
+    >
+      <ChevronLeft aria-hidden className="size-6" />
+      {text && <span>{label ?? t("nav.back")}</span>}
+    </button>
+  );
+}
 
 export function Spinner({ className }: { className?: string }) {
   return (

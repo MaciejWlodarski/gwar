@@ -9,7 +9,7 @@ import { initialState } from "../state/reducer";
 import { useSettings } from "../state/settings";
 import { useSession, useUi, type Section } from "../state/stores";
 import { TooltipProvider } from "./kit";
-import { SectionRail, SectionTabs } from "./SectionRail";
+import { SectionRail } from "./SectionRail";
 import { SettingsSection } from "./Settings";
 import { VoicePill } from "./VoicePanel";
 
@@ -56,7 +56,7 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   mock.selectChannel.mockClear();
   useSettings.setState({ language: "en" });
-  useUi.setState({ section: "servers", back: "servers", settingsTab: "audio", gearTab: "audio", overview: false, collapsed: {}, drawerOpen: false, dialog: { kind: "none" } });
+  useUi.setState({ section: "servers", back: "servers", settingsTab: "audio", gearTab: "audio", overview: false, collapsed: {}, pane: "list", moreOpen: false, settingsDrill: false, dialog: { kind: "none" } });
   useSession.setState({ ...initialState, phase: "idle" });
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
 });
@@ -93,14 +93,6 @@ describe("the rail's pages", () => {
     await click(byLabel("Your profile"));
     await click(byLabel("Settings"));
     expect(useUi.getState()).toMatchObject({ section: "settings", settingsTab: "appearance", back: "servers" });
-  });
-
-  it("has Settings as a tab of the phone's drawer", async () => {
-    useUi.setState({ drawerOpen: true });
-    await render(<SectionTabs />);
-    await click(byLabel("Settings"));
-    expect(useUi.getState()).toMatchObject({ section: "settings", drawerOpen: false });
-    expect(byLabel("Settings")!.getAttribute("aria-current")).toBe("page");
   });
 
   it("marks the Servers section while in a voice channel, apart from the unread count", async () => {

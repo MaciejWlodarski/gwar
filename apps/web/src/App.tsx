@@ -1,13 +1,11 @@
-import * as DialogPrimitive from "@radix-ui/react-dialog";
 import { useEffect } from "react";
-import { useT } from "./i18n";
 import { accountActions } from "./state/account";
 import { cn } from "./lib/cn";
 import { useIsMobile } from "./lib/media";
 import { initDesktop } from "./platform/desktop";
 import { initUpdates } from "./platform/updater";
 import { controller } from "./state/controller";
-import { useSession, useUi } from "./state/stores";
+import { useSession, useUi, type ServerPane } from "./state/stores";
 import { BugReportSection } from "./ui/BugReport";
 import { ChatArea } from "./ui/Chat";
 import { ConnectionWarning } from "./ui/ConnectionWarning";
@@ -19,8 +17,9 @@ import { MemberList } from "./ui/MemberList";
 import { useMembersPanel } from "./ui/members";
 import { Home } from "./ui/Home";
 import { Overview } from "./ui/Overview";
-import { useServerUnread } from "./ui/nav";
-import { SectionRail, SectionTabs } from "./ui/SectionRail";
+import { MoreSheet, TabBar } from "./ui/MobileNav";
+import { useBackHistory, useServerUnread } from "./ui/nav";
+import { SectionRail } from "./ui/SectionRail";
 import { ServerRail } from "./ui/ServerRail";
 import { SettingsSection } from "./ui/Settings";
 import { SharePresetDialog, SharingBar, Stage } from "./ui/Screen";
@@ -29,7 +28,6 @@ import { Sidebar } from "./ui/Sidebar";
 import { Toaster } from "./ui/Toaster";
 
 export function App() {
-  const t = useT();
   const isMobile = useIsMobile();
   const insecureConnection = useSession((s) => s.insecureConnection);
   const phase = useSession((s) => s.phase);
@@ -40,10 +38,8 @@ export function App() {
   const covered = section !== "servers";
   // With a share on stage the stage wins; the overview waits until it closes.
   const overview = useUi((s) => s.overview);
-  const drawerOpen = useUi((s) => s.drawerOpen);
-  const setDrawer = useUi((s) => s.setDrawer);
-  const membersDrawerOpen = useUi((s) => s.membersDrawerOpen);
-  const setMembersDrawer = useUi((s) => s.setMembersDrawer);
+  const pane = useUi((s) => s.pane);
+  const setPane = useUi((s) => s.setPane);
   const members = useMembersPanel();
   const showApp = phase === "online" || phase === "reconnecting";
   const stageOpen = useScreen((s) => s.stage !== null);
@@ -60,15 +56,21 @@ export function App() {
     document.title = `${unread > 0 ? `(${unread}) ` : ""}${showApp && serverName ? `${serverName} · ` : ""}Gwar`;
   }, [unread, serverName, showApp]);
 
-  // Another server opens on its chat, as before; the overview is a place to go, not a landing page.
-  useEffect(() => useUi.getState().showChat(), [address]);
+  // Another server opens on its chat (phones: on its channel list); the overview is a place to go, not a landing page.
+  useEffect(() => {
+    useUi.getState().showChat();
+    useUi.getState().setPane("list");
+  }, [address]);
 
   useEffect(() => {
-    if (!isMobile) {
-      setDrawer(false);
-      setMembersDrawer(false);
-    }
-  }, [isMobile, setDrawer, setMembersDrawer]);
+    if (!isMobile) useUi.getState().setMore(false);
+  }, [isMobile]);
+  useBackHistory(isMobile);
+
+  // Phones show one page of the server section at a time. The conversation and its members fill the
+  // screen without the tab bar, leaving room for the keyboard.
+  const paneShown = (p: ServerPane) => !isMobile || pane === p;
+  const fullScreen = isMobile && !covered && showApp && pane !== "list";
 
   return (
     <TooltipProvider>
@@ -81,31 +83,44 @@ export function App() {
               keeps its drafts, files and scroll position, and voice and a watched share keep running underneath. */}
           <div className="relative flex min-w-0 flex-1">
             <div inert={covered} className={cn("flex min-w-0 flex-1", !isMobile && "gap-2 py-2 pr-2", covered && "invisible")}>
-              {!isMobile && <ServerRail card />}
+              {(!isMobile || !showApp) && <ServerRail card={!isMobile} />}
               {showApp ? (
-                <div className={cn("flex min-w-0 flex-1", !isMobile && "gap-2")}>
+                <div className={cn("relative flex min-w-0 flex-1", !isMobile && "gap-2")}>
                   {!isMobile && <Sidebar card />}
-                  {stageOpen ? (
-                    <>
-                      {/* Watching: the stage is the main content, the chat collapsible beside it. */}
-                      <Stage card={!isMobile} />
-                      {!isMobile && !chatHidden && (
-                        <div className="flex w-[min(380px,32vw)] min-w-0 shrink-0">
-                          <ChatArea card />
+                  <div inert={!paneShown("chat")} className={cn("flex min-w-0 flex-1", !isMobile && "gap-2", !paneShown("chat") && "invisible")}>
+                    {stageOpen ? (
+                      <>
+                        {/* Watching: the stage is the main content, the chat collapsible beside it. */}
+                        <Stage card={!isMobile} />
+                        {!isMobile && !chatHidden && (
+                          <div className="flex w-[min(380px,32vw)] min-w-0 shrink-0">
+                            <ChatArea card />
+                          </div>
+                        )}
+                      </>
+                    ) : (
+                      <div className="relative flex min-w-0 flex-1">
+                        <div inert={overview} className={cn("flex min-w-0 flex-1", !isMobile && "gap-2", overview && "invisible")}>
+                          <ChatArea card={!isMobile} />
+                          {!isMobile && members.open && <MemberList card />}
                         </div>
-                      )}
-                    </>
-                  ) : (
-                    <div className="relative flex min-w-0 flex-1">
-                      <div inert={overview} className={cn("flex min-w-0 flex-1", !isMobile && "gap-2", overview && "invisible")}>
-                        <ChatArea card={!isMobile} />
-                        {!isMobile && members.open && <MemberList card />}
+                        {overview && (
+                          <div className="absolute inset-0 flex">
+                            <Overview card={!isMobile} />
+                          </div>
+                        )}
                       </div>
-                      {overview && (
-                        <div className="absolute inset-0 flex">
-                          <Overview card={!isMobile} />
-                        </div>
-                      )}
+                    )}
+                  </div>
+                  {isMobile && pane === "list" && (
+                    <div className="absolute inset-0 flex">
+                      <ServerRail />
+                      <Sidebar fill />
+                    </div>
+                  )}
+                  {isMobile && pane === "members" && (
+                    <div className="absolute inset-0 flex">
+                      <MemberList onBack={() => setPane("chat")} />
                     </div>
                   )}
                 </div>
@@ -126,45 +141,9 @@ export function App() {
             )}
           </div>
         </div>
+        {isMobile && !fullScreen && <TabBar />}
       </div>
-      {isMobile && (
-        <DialogPrimitive.Root open={drawerOpen} onOpenChange={setDrawer}>
-          <DialogPrimitive.Portal>
-            <DialogPrimitive.Overlay className="anim-fade fixed inset-0 z-40 bg-black/55" />
-            <DialogPrimitive.Content
-              aria-describedby={undefined}
-              onOpenAutoFocus={(e) => {
-                // Do not focus (and tooltip) the first server button.
-                e.preventDefault();
-                (e.currentTarget as HTMLElement).focus();
-              }}
-              className="anim-drawer fixed inset-y-0 left-0 z-40 flex min-w-[min(300px,92vw)] max-w-[92vw] flex-col bg-rail outline-none"
-            >
-              <DialogPrimitive.Title className="sr-only">{t("nav.channels")}</DialogPrimitive.Title>
-              <div className="flex min-h-0 flex-1">
-                <ServerRail />
-                {showApp && <Sidebar className="w-[min(280px,calc(92vw-64px))]" />}
-              </div>
-              {/* Phones have no global rail: its sections are tabs here. */}
-              <SectionTabs />
-            </DialogPrimitive.Content>
-          </DialogPrimitive.Portal>
-        </DialogPrimitive.Root>
-      )}
-      {isMobile && showApp && (
-        <DialogPrimitive.Root open={membersDrawerOpen} onOpenChange={setMembersDrawer}>
-          <DialogPrimitive.Portal>
-            <DialogPrimitive.Overlay className="anim-fade fixed inset-0 z-40 bg-black/55" />
-            <DialogPrimitive.Content
-              aria-describedby={undefined}
-              className="anim-drawer-right fixed inset-y-0 right-0 z-40 flex max-w-[88vw] bg-side outline-none"
-            >
-              <DialogPrimitive.Title className="sr-only">{t("chat.members")}</DialogPrimitive.Title>
-              <MemberList className="w-72 max-w-[88vw]" />
-            </DialogPrimitive.Content>
-          </DialogPrimitive.Portal>
-        </DialogPrimitive.Root>
-      )}
+      {isMobile && <MoreSheet />}
       <Dialogs />
       {showApp && <SharePresetDialog />}
       <Toaster />

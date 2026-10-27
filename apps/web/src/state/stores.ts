@@ -108,6 +108,9 @@ export interface Toast {
  */
 export type Section = "home" | "servers" | "settings" | "bugReport";
 
+/** Phones show one page of the server section at a time (see `pane`). */
+export type ServerPane = "list" | "chat" | "members";
+
 export type SettingsTab = "audio" | "notifications" | "appearance" | "identity" | "account" | "language";
 /** The settings tabs the rail's account avatar stands for; the gear stands for the rest. */
 export const profileTabs: readonly SettingsTab[] = ["identity", "account"];
@@ -153,9 +156,13 @@ export type DialogState =
 interface UiStore {
   toasts: Toast[];
   dialog: DialogState;
-  drawerOpen: boolean;
-  /** The member list drawer (narrow layouts; wide ones use the `membersOpen` setting). */
-  membersDrawerOpen: boolean;
+  /**
+   * Phones: which page of the server section is shown, one at a time: the server and channel list,
+   * the open conversation (or the overview, or a watched share), or its member list.
+   */
+  pane: ServerPane;
+  /** Phones: the "More" sheet over the tab bar. */
+  moreOpen: boolean;
   /** Collapsed channel ids (UI only). */
   collapsed: Record<number, boolean>;
   /** Channel I asked to join and the server has not confirmed yet. */
@@ -169,11 +176,14 @@ interface UiStore {
   settingsTab: SettingsTab;
   /** The tab the gear opens: the last one open that is not a profile tab. */
   gearTab: SettingsTab;
+  /** Phones: the settings page shows its open tab, not the list of tabs. */
+  settingsDrill: boolean;
   /** The server overview fills the main area in place of the chat. */
   overview: boolean;
   setSection(section: Section): void;
-  /** The settings page, on `tab` or on the gear's. */
+  /** The settings page, on `tab` or on the gear's (on phones: inside `tab`, or on the list of tabs). */
   openSettings(tab?: SettingsTab): void;
+  setSettingsDrill(drill: boolean): void;
   setSettingsTab(tab: SettingsTab): void;
   /** Leaves the settings or bug report page for the section it was opened from. */
   goBack(): void;
@@ -184,8 +194,8 @@ interface UiStore {
   dismissToast(id: number): void;
   openDialog(dialog: DialogState): void;
   closeDialog(): void;
-  setDrawer(open: boolean): void;
-  setMembersDrawer(open: boolean): void;
+  setPane(pane: ServerPane): void;
+  setMore(open: boolean): void;
   toggleCollapsed(channel: number): void;
   setJoining(channel: number | null): void;
 }
@@ -200,8 +210,8 @@ const pageBack = (s: Pick<UiStore, "section" | "back">): Section => (s.section =
 export const useUi = create<UiStore>()((set) => ({
   toasts: [],
   dialog: { kind: "none" },
-  drawerOpen: false,
-  membersDrawerOpen: false,
+  pane: "list",
+  moreOpen: false,
   collapsed: {},
   joining: null,
   editing: null,
@@ -209,13 +219,16 @@ export const useUi = create<UiStore>()((set) => ({
   back: "servers",
   settingsTab: "audio",
   gearTab: "audio",
+  settingsDrill: false,
   overview: false,
-  setSection: (section) => set((s) => ({ section, back: pageBack(s) })),
-  openSettings: (tab) => set((s) => ({ ...tabState(s, tab ?? s.gearTab), section: "settings", back: pageBack(s) })),
+  setSection: (section) => set((s) => ({ section, back: pageBack(s), moreOpen: false })),
+  openSettings: (tab) =>
+    set((s) => ({ ...tabState(s, tab ?? s.gearTab), section: "settings", back: pageBack(s), settingsDrill: tab !== undefined, moreOpen: false })),
+  setSettingsDrill: (settingsDrill) => set({ settingsDrill }),
   setSettingsTab: (tab) => set((s) => tabState(s, tab)),
   goBack: () => set((s) => ({ section: s.back })),
-  showOverview: () => set({ section: "servers", overview: true }),
-  showChat: () => set({ section: "servers", overview: false }),
+  showOverview: () => set({ section: "servers", overview: true, pane: "chat" }),
+  showChat: () => set({ section: "servers", overview: false, pane: "chat" }),
   setEditing: (editing) => set({ editing }),
   toast: (kind, text) => {
     const id = toastId++;
@@ -236,8 +249,8 @@ export const useUi = create<UiStore>()((set) => ({
       if (s.dialog.kind === "tsClaim") s.dialog.resolve(false);
       return { dialog: { kind: "none" } };
     }),
-  setDrawer: (drawerOpen) => set({ drawerOpen }),
-  setMembersDrawer: (membersDrawerOpen) => set({ membersDrawerOpen }),
+  setPane: (pane) => set({ pane }),
+  setMore: (moreOpen) => set({ moreOpen }),
   toggleCollapsed: (channel) => set((s) => ({ collapsed: { ...s.collapsed, [channel]: !s.collapsed[channel] } })),
   setJoining: (joining) => set({ joining }),
 }));

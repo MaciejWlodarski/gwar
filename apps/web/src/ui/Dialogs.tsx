@@ -553,7 +553,6 @@ function ChannelPasswordDialog({ channel }: { channel: number }) {
         return;
       }
       close();
-      useUi.getState().setDrawer(false);
     } catch (err) {
       setError(err instanceof RequestError && err.code === "wrong_password" ? t("channelPassword.wrong") : describeJoinError(err));
       setBusy(false);

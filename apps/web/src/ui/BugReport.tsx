@@ -1,4 +1,4 @@
-import { Bug, ImagePlus, Menu, X } from "lucide-react";
+import { Bug, ImagePlus, X } from "lucide-react";
 import { useEffect, useRef, useState, type ClipboardEvent, type DragEvent } from "react";
 import { useT } from "../i18n";
 import { connectApi } from "../connect/api";
@@ -9,9 +9,8 @@ import { useAccount } from "../state/account";
 import { controller, describeRequestError } from "../state/controller";
 import { useUi } from "../state/stores";
 import { cn } from "../lib/cn";
-import { useIsMobile } from "../lib/media";
 import { leavePage, useEscapeBack } from "./hooks";
-import { Button, Field, IconButton, panelCard, Switch, Textarea, Tooltip } from "./kit";
+import { Button, Field, panelCard, Switch, Textarea, Tooltip } from "./kit";
 import { useVoicePill } from "./nav";
 import { VoicePill } from "./VoicePanel";
 
@@ -34,8 +33,6 @@ export function AlphaBadge() {
 /** Text, optional diagnostics and up to five screenshots, sent privately to Gwar Connect. Esc goes back. */
 export function BugReportSection({ card }: { card?: boolean }) {
   const t = useT();
-  const isMobile = useIsMobile();
-  const setDrawer = useUi((s) => s.setDrawer);
   const pill = useVoicePill();
   const toast = useUi((s) => s.toast);
   const account = useAccount((s) => s.account);
@@ -101,11 +98,6 @@ export function BugReportSection({ card }: { card?: boolean }) {
   return (
     <main aria-label={t("report.title")} className={cn("relative flex min-w-0 flex-1 flex-col bg-surface", card && panelCard)}>
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-line px-3 md:px-4">
-        {isMobile && (
-          <IconButton label={t("nav.channels")} onClick={() => setDrawer(true)} className="-ml-1">
-            <Menu className="size-5" />
-          </IconButton>
-        )}
         <Bug className="size-5 text-subtle" />
         <h1 className="truncate text-[15px] font-semibold">{t("report.title")}</h1>
       </header>

@@ -164,7 +164,7 @@ function RailGroup({ group, servers, card }: ShownGroup & { card?: boolean }) {
   );
 }
 
-/** The saved servers: a card of its own beside the others on desktop, a plain column in the mobile drawer. */
+/** The saved servers: a card of its own beside the others on desktop, a plain column beside the channels on a phone. */
 export function ServerRail({ card }: { card?: boolean }) {
   const t = useT();
   const bookmarks = useBookmarks();

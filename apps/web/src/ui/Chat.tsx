@@ -3,7 +3,7 @@ import { messageStorage } from "../net/message-storage";
 import { channels, withChannelLifecycle, withFreshChannelLifecycle } from "../net/channel-lifecycle";
 import { MessageVerificationIndicator, MessageVerificationPending } from "./MessageVerification";
 import { messageFingerprint, fullyVerified, DELETION_TEXT, type MessageVerification } from "../net/message-signature";
-import { AlertCircle, ArrowDown, Check, Hash, Headphones, Loader2, Lock, Menu, Megaphone, MessageSquare, Paperclip, Pencil, RotateCw, Send, Trash2, Users, X } from "lucide-react";
+import { AlertCircle, ArrowDown, Check, Hash, Headphones, Loader2, Lock, Megaphone, MessageSquare, Paperclip, Pencil, RotateCw, Send, Trash2, Users, X } from "lucide-react";
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent, type MouseEvent } from "react";
 import { countKey, useLanguage, useT, type TFn } from "../i18n";
 import { cn } from "../lib/cn";
@@ -26,7 +26,7 @@ import { useChannelPermission, useRoster, useUidColor } from "./hooks";
 import { useMembersPanel } from "./members";
 import { useMentionAutocomplete } from "./MentionInput";
 import { DeafenButton, MicButton } from "./VoicePanel";
-import { Avatar, Button, EmptyState, IconButton, panelCard, Spinner, Tooltip } from "./kit";
+import { Avatar, BackButton, Button, EmptyState, IconButton, panelCard, Spinner, Tooltip } from "./kit";
 
 // -------------------------------------------------------------------- text
 
@@ -1068,7 +1068,7 @@ function ChatHeader() {
   const lang = useLanguage();
   const isMobile = useIsMobile();
   const active = useSession((s) => s.activeThread);
-  const setDrawer = useUi((s) => s.setDrawer);
+  const setPane = useUi((s) => s.setPane);
   const server = useSession((s) => s.server);
   const phase = useSession((s) => s.phase);
   const viewChannel = useSession((s) => s.viewChannel);
@@ -1102,11 +1102,7 @@ function ChatHeader() {
 
   return (
     <header className="flex h-12 shrink-0 items-center gap-2 border-b border-line px-3 md:px-4">
-      {isMobile && (
-        <IconButton label={t("nav.channels")} onClick={() => setDrawer(true)} className="-ml-1">
-          <Menu className="size-5" />
-        </IconButton>
-      )}
+      {isMobile && <BackButton label={t("nav.toChannels")} onClick={() => setPane("list")} />}
       {icon}
       <div className="min-w-0 flex-1">
         <h2 className="truncate text-[15px] leading-tight font-semibold">{title}</h2>

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { flushSync } from "react-dom";
 import { tsBridge, type TsListInfo } from "../connect/teamspeak";
 import { useAccount } from "../state/account";
@@ -138,14 +138,18 @@ export function leavePage(): void {
 const escapeLayers = '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]';
 
 /**
- * Esc on a page goes back to the section it was opened from, as it would close a dialog. Not while
+ * Esc on a page goes back (by default to the section it was opened from), as it would close a dialog. Not while
  * typing, and not when the key closed a popup (Radix marks it handled; the popup is still in the DOM).
  */
-export function useEscapeBack(): void {
+export function useEscapeBack(back: () => void = leavePage): void {
+  const latest = useRef(back);
+  useEffect(() => {
+    latest.current = back;
+  });
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== "Escape" || isEditable(e.target) || (e.defaultPrevented && document.querySelector(escapeLayers))) return;
-      leavePage();
+      latest.current();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);

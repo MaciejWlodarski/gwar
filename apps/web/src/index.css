@@ -174,17 +174,9 @@
     opacity: 1;
   }
 }
-@keyframes slide-in-right {
+@keyframes slide-in-up {
   from {
-    transform: translateX(100%);
-  }
-  to {
-    transform: none;
-  }
-}
-@keyframes slide-in-left {
-  from {
-    transform: translateX(-100%);
+    transform: translateY(100%);
   }
   to {
     transform: none;
@@ -219,11 +211,8 @@
   .anim-fade {
     animation: fade-in 120ms ease-out;
   }
-  .anim-drawer {
-    animation: slide-in-left 150ms ease-out;
-  }
-  .anim-drawer-right {
-    animation: slide-in-right 150ms ease-out;
+  .anim-sheet {
+    animation: slide-in-up 180ms ease-out;
   }
   .anim-toast {
     animation: toast-in 150ms ease-out;
