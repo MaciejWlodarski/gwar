@@ -1,4 +1,4 @@
-import { AlertTriangle, CloudCog, Menu, ShieldAlert, Ticket } from "lucide-react";
+import { AlertTriangle, CloudCog, ShieldAlert, Ticket } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
@@ -9,10 +9,9 @@ import { isDesktop } from "../platform";
 import { useBookmarks, useSettings, type ServerKind } from "../state/settings";
 import { useAccount } from "../state/account";
 import { useConnectUi, useSession, useUi } from "../state/stores";
-import { Avatar, Button, Field, IconButton, Input, Segmented, Switch, panelCard } from "./kit";
+import { Avatar, Button, Field, Input, Segmented, Switch, panelCard } from "./kit";
 import { TeamSpeakBadge } from "./badges";
 import { Wordmark } from "./Brand";
-import { useIsMobile } from "../lib/media";
 import { resolveIdentity } from "../connect/ts-list";
 import { useTsIdentities } from "./hooks";
 import { sameServer } from "../lib/server-key";
@@ -37,15 +36,13 @@ async function probeSameOriginServer(): Promise<string | null> {
 
 export function ConnectScreen({ card }: { card?: boolean }) {
   const t = useT();
-  const isMobile = useIsMobile();
   const lastAddress = useSettings((s) => s.lastAddress);
   const lastKind = useSettings((s) => s.lastKind);
   const desktop = isDesktop();
   const bookmarks = useBookmarks();
   const { busy, error, needPassword, serverName, invite } = useConnectUi();
   const closeReason = useSession((s) => s.closeReason);
-  const setDrawer = useUi((s) => s.setDrawer);
-  const openDialog = useUi((s) => s.openDialog);
+  const openSettings = useUi((s) => s.openSettings);
   const account = useAccount((s) => s.account);
   const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "gwar");
   const [address, setAddress] = useState(invite?.server ? addressLabel(invite.server, pageContextFromLocation()) : lastAddress);
@@ -120,13 +117,6 @@ export function ConnectScreen({ card }: { card?: boolean }) {
 
   return (
     <main className={cn("relative flex min-w-0 flex-1 flex-col items-center overflow-y-auto bg-surface", card && panelCard)}>
-      {isMobile && (
-        <div className="flex h-12 w-full shrink-0 items-center px-2">
-          <IconButton label={t("nav.servers")} onClick={() => setDrawer(true)}>
-            <Menu className="size-5" />
-          </IconButton>
-        </div>
-      )}
       <div className="flex w-full flex-1 flex-col items-center justify-center gap-6 px-4 py-8">
         <form
           onSubmit={submit}
@@ -237,7 +227,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
 
         <button
           type="button"
-          onClick={() => openDialog({ kind: "settings", tab: "account" })}
+          onClick={() => openSettings("account")}
           className="t -mt-2 flex w-full max-w-sm cursor-pointer items-center gap-3 rounded-lg border border-line px-3 py-2 text-left hover:bg-hover"
         >
           <CloudCog className="size-4 shrink-0 text-muted" />

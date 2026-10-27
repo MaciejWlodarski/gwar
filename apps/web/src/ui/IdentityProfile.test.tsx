@@ -3,8 +3,8 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useSettings } from "../state/settings";
-import { useSession } from "../state/stores";
-import { SettingsDialog } from "./Settings";
+import { useSession, useUi } from "../state/stores";
+import { SettingsSection } from "./Settings";
 import { TooltipProvider } from "./kit";
 
 const mock = vi.hoisted(() => ({ update: vi.fn(async (_: object) => ({})) }));
@@ -29,7 +29,7 @@ describe("profile", () => {
   });
 
   it("sends the away message only when edited here", async () => {
-    await act(async () => root.render(<TooltipProvider><SettingsDialog tab="identity" /></TooltipProvider>));
+    await act(async () => { useUi.getState().openSettings("identity"); root.render(<TooltipProvider><SettingsSection /></TooltipProvider>); });
     const label = [...document.querySelectorAll("label")].find((l) => l.textContent?.startsWith("Away message"))!;
     const input = document.getElementById(label.htmlFor) as HTMLInputElement;
     const save = () => [...label.closest("section, div")!.parentElement!.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent === "Save")!;

@@ -11,10 +11,13 @@ export const en = {
   "storage.newer.body": "A newer version of Gwar saved data in this browser or app, and this version cannot read it. Nothing was changed. Reload the page or install the latest Gwar.",
 
   "nav.servers": "Servers",
-  "nav.channels": "Channels and servers",
   "nav.sections": "Sections",
   "nav.home": "Home",
   "nav.account": "Your profile",
+  "nav.back": "Back",
+  "nav.more": "More",
+  "nav.profile": "Profile",
+  "nav.toChannels": "Back to channels",
 
   "rail.label": "Saved servers",
   "rail.connect": "Connect",
@@ -406,6 +409,8 @@ export const en = {
   "voice.retryMic": "Try again",
   "voice.openPrivacySettings": "Open privacy settings",
   "voice.leave": "Leave voice",
+  "voice.pill": "Voice connection",
+  "voice.pillOpen": "Go to the voice channel",
   "voice.rtt": "Round trip to the server: {ms} ms",
   "voice.notIn": "Not in voice",
   "voice.notInHint": "Double-click a channel to talk",

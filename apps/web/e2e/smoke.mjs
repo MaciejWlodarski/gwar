@@ -264,32 +264,29 @@ function recordFrames(page) {
   };
 }
 
-/** Escape first dismisses a focused member tooltip, then its containing drawer. */
-async function dismissDialog(page, name) {
-  const dialog = page.getByRole("dialog", { name, exact: true });
-  for (let attempt = 0; attempt < 3 && await dialog.isVisible(); attempt++) {
-    await page.keyboard.press("Escape");
-    await page.waitForTimeout(100);
-  }
-  await dialog.waitFor({ state: "detached" });
-}
-
 /** Set the identity's profile through Settings, before the first join. */
 async function setGlobalNickname(page, nickname, { mobile = false, pl = false } = {}) {
-  const settings = page.getByRole("button", { name: pl ? "Ustawienia" : "Settings", exact: true }).first();
-  if (mobile && !(await settings.isVisible())) await page.getByRole("button", { name: pl ? "Serwery" : "Servers", exact: true }).click();
-  await settings.click();
-  await page.getByRole("tab", { name: pl ? "Tożsamość" : "Identity", exact: true }).click();
+  if (mobile) {
+    // Phones: More's Profile tile opens the identity page straight away.
+    await sectionTab(page, pl ? "Więcej" : "More").click();
+    await page.getByRole("dialog", { name: pl ? "Więcej" : "More", exact: true }).getByRole("button", { name: pl ? "Profil" : "Profile", exact: true }).click();
+  } else {
+    await page.getByRole("button", { name: pl ? "Ustawienia" : "Settings", exact: true }).first().click();
+    await page.getByRole("tab", { name: pl ? "Tożsamość" : "Identity", exact: true }).click();
+  }
   const field = page.getByLabel(pl ? "Pseudonim" : "Nickname", { exact: true });
   await waitFor(async () => (await field.inputValue()) !== "", "identity nickname", 10000);
   await field.fill(nickname);
-  const save = page.getByRole("dialog").getByRole("button", { name: pl ? "Zapisz" : "Save", exact: true }).first();
+  const save = page.getByRole("main", { name: pl ? "Ustawienia" : "Settings" }).getByRole("button", { name: pl ? "Zapisz" : "Save", exact: true }).first();
   await save.click();
   await waitFor(() => save.isEnabled(), "saved identity nickname", 15000);
   await page.getByText(pl ? "Zapisano" : "Saved", { exact: true }).waitFor();
-  await page.keyboard.press("Escape");
-  if (mobile) await dismissDialog(page, pl ? "Kanały i serwery" : "Channels and servers");
+  if (mobile) await sectionTab(page, pl ? "Serwery" : "Servers").click();
+  else await page.keyboard.press("Escape");
 }
+
+/** A phone's tab bar button. */
+const sectionTab = (page, name) => page.getByRole("navigation", { name: /^(Sections|Sekcje)$/ }).getByRole("button", { name, exact: true });
 
 async function changeServerNickname(page, nickname) {
   await page.getByRole("button", { name: "Server menu" }).click();
@@ -306,9 +303,8 @@ async function connect(page, nickname, { mobile = false, address = CLIENT_ADDR }
   await setGlobalNickname(page, nickname, { mobile });
   if (await page.getByLabel("Nickname").count()) throw new Error("connect screen still asks for a nickname");
   await page.getByRole("button", { name: "Connect", exact: true }).click();
-  // After connecting you are on the server, not in voice. On phones the voice panel lives in the drawer.
-  if (mobile) await page.getByRole("button", { name: "Channels and servers" }).waitFor({ timeout: 20000 });
-  else await page.getByText("Not in voice").waitFor({ timeout: 20000 });
+  // After connecting you are on the server, not in voice; phones land on the channel list, voice panel included.
+  await page.getByText("Not in voice").waitFor({ timeout: 20000 });
 }
 
 /** Joins a channel's voice with the small button that appears when hovering its row. */
@@ -868,6 +864,59 @@ async function main() {
   await shot(a, "09-settings-identity-dark");
   await a.keyboard.press("Escape");
 
+  await check("the pages take focus when opened from the keyboard and give it back when left", async () => {
+    const focused = () => a.evaluate(() => {
+      const el = document.activeElement;
+      return { role: el?.getAttribute("role"), selected: el?.getAttribute("aria-selected"), label: el?.getAttribute("aria-label"), text: el?.textContent?.trim(), tag: el?.tagName };
+    });
+    await a.getByRole("main", { name: "Settings" }).waitFor({ state: "detached" });
+    // Settings: the gear opens it onto its open tab; Esc goes back with focus on the gear.
+    await a.getByRole("button", { name: "Settings", exact: true }).first().focus();
+    await a.keyboard.press("Enter");
+    await a.getByRole("main", { name: "Settings" }).waitFor();
+    await waitFor(async () => { const f = await focused(); return f.role === "tab" && f.selected === "true"; }, "focus on the open settings tab", 5000);
+    await a.keyboard.press("Escape");
+    await a.getByRole("main", { name: "Settings" }).waitFor({ state: "detached" });
+    await waitFor(async () => (await focused()).label === "Settings", `focus back on the gear (${JSON.stringify(await focused())})`, 5000);
+    // The bug report: its text field takes focus; Cancel goes back with focus on the bug button.
+    await a.getByRole("button", { name: "Report a bug", exact: true }).focus();
+    await a.keyboard.press("Enter");
+    await a.getByRole("main", { name: "Report a bug" }).waitFor();
+    await waitFor(async () => (await focused()).tag === "TEXTAREA", "focus in the report", 5000);
+    await a.getByRole("main", { name: "Report a bug" }).getByRole("button", { name: "Cancel" }).focus();
+    await a.keyboard.press("Enter");
+    await a.getByRole("main", { name: "Report a bug" }).waitFor({ state: "detached" });
+    await waitFor(async () => (await focused()).label === "Report a bug", `focus back on the bug button (${JSON.stringify(await focused())})`, 5000);
+    // The tooltip shown by that focus would cover the rail.
+    await a.keyboard.press("Escape");
+  });
+
+  await check("settings and the bug report are pages; the voice pill stands in for the voice panel elsewhere", async () => {
+    const pill = a.getByRole("region", { name: "Voice connection", exact: true });
+    // The server view keeps its voice panel; the Servers icon says I am in voice.
+    await a.getByRole("main", { name: "Settings" }).waitFor({ state: "detached" });
+    await a.getByText("Voice connected").first().waitFor({ timeout: 20000 });
+    if (await pill.count()) throw new Error("the pill is shown in the server view");
+    await shot(a, "50-servers-in-voice-dark");
+    await a.getByRole("button", { name: "Settings", exact: true }).first().click();
+    await a.getByRole("tab", { name: "Audio" }).click();
+    await pill.getByText("Voice connected").waitFor();
+    await shot(a, "51-settings-audio-pill-dark");
+    await a.getByRole("button", { name: "Your profile" }).click();
+    await a.getByRole("tab", { name: "Identity", selected: true }).waitFor();
+    await a.getByRole("tab", { name: "Account" }).click();
+    await shot(a, "52-settings-account-dark");
+    await a.getByRole("button", { name: "Report a bug" }).click();
+    await a.getByRole("main", { name: "Report a bug" }).waitFor();
+    await shot(a, "53-bug-report-pill-dark");
+    await a.getByRole("button", { name: "Home", exact: true }).click();
+    await shot(a, "54-home-pill-dark");
+    // The pill leads back to the voice channel.
+    await pill.getByRole("button", { name: new RegExp(escapeRe(GAMES)) }).click();
+    await pill.waitFor({ state: "detached" });
+    await a.getByRole("tab", { name: new RegExp(escapeRe(GAMES)), selected: true }).waitFor();
+  });
+
   await a.getByRole("button", { name: "Server menu" }).click();
   await shot(a, "10-server-menu-dark");
   await a.keyboard.press("Escape");
@@ -875,27 +924,239 @@ async function main() {
   // Mobile
   const ctxM = await newCtx({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true, deviceScaleFactor: 2 });
   const m = await ctxM.newPage();
-  await check("mobile layout connects and opens the drawer", async () => {
+  const tabBar = m.getByRole("navigation", { name: "Sections", exact: true });
+  const mPill = m.getByRole("region", { name: "Voice connection", exact: true });
+  // By CSS: the open sheet (a modal) hides the tab bar from the accessibility tree.
+  const current = async (name) => (await m.locator(`nav[aria-label="Sections"] button[aria-label="${name}"]`).getAttribute("aria-current")) === "page";
+  await check("phones: a tab bar, the channel list as the Servers page, a conversation and its members full screen", async () => {
     await connect(m, "Carol", { mobile: true });
-    await shot(m, "11-mobile-dark-chat");
-    await m.getByRole("button", { name: "Channels and servers" }).click();
-    await treeItem(m, GAMES).waitFor();
-    await shot(m, "12-mobile-dark-drawer");
+    const tabs = await tabBar.getByRole("button").evaluateAll((buttons) => buttons.map((b) => b.getAttribute("aria-label")));
+    if (tabs.join() !== "Home,Servers,More") throw new Error(`tab bar: ${tabs}`);
+    if (!(await current("Servers"))) throw new Error("the Servers tab is not marked");
+    // The join button has no hover on touch screens: it is always there. Joining keeps the list.
+    await m.getByRole("button", { name: `Join voice in ${GAMES}` }).click();
+    await m.getByText("Voice connected").first().waitFor({ timeout: 20000 });
+    await sectionTab(m, "Servers").locator(".bg-ok").waitFor();
+    if (await mPill.count()) throw new Error("the pill is shown on the Servers page");
+    await shot(m, "m3-servers-in-voice-dark");
+    // A channel opens its conversation full screen, without the tab bar.
     await treeItem(m, GAMES).click();
     await m.getByRole("tab", { name: new RegExp(escapeRe(GAMES)) }).waitFor();
-    // The join button has no hover on touch screens: it is always there.
-    await m.getByRole("button", { name: "Channels and servers" }).click();
-    await m.getByRole("button", { name: `Join voice in ${GAMES}` }).waitFor();
-    await dismissDialog(m, "Channels and servers");
-    await m.getByRole("button", { name: "Members" }).click();
-    await memberSection(m, "Online").getByText("Carol").waitFor();
-    await shot(m, "12b-mobile-dark-members");
-    await dismissDialog(m, "Members");
+    await tabBar.waitFor({ state: "detached" });
+    await shot(m, "m4-chat-dark");
+    await m.getByRole("button", { name: "Members", exact: true }).click();
+    const members = m.getByRole("complementary", { name: "Members", exact: true });
+    await memberSection(m, "In voice").getByText("Carol").waitFor();
+    await shot(m, "m5-members-dark");
+    // Each way back puts focus on what is shown: the conversation's way back, then the open channel's row.
+    const focused = (test) => waitFor(() => m.evaluate(test), "focus after a way back", 5000);
+    const onBackToChannels = () => document.activeElement?.getAttribute("aria-label") === "Back to channels";
+    const onRow = (name) => focused(new Function(`return document.activeElement?.getAttribute("role") === "treeitem" && document.activeElement.textContent.includes(${JSON.stringify(name)})`));
+    await members.getByRole("button", { name: "Back", exact: true }).click();
+    await members.waitFor({ state: "detached" });
+    await focused(onBackToChannels);
+    await m.getByRole("button", { name: "Back to channels", exact: true }).click();
+    await tabBar.waitFor();
+    await onRow(GAMES);
+    // The system's back goes the same way.
+    await treeItem(m, GAMES).click();
+    await tabBar.waitFor({ state: "detached" });
+    await m.getByRole("button", { name: "Members", exact: true }).click();
+    await members.waitFor();
+    await m.evaluate(() => history.back());
+    await members.waitFor({ state: "detached" });
+    await focused(onBackToChannels);
+    await m.evaluate(() => history.back());
+    await tabBar.waitFor();
+    await onRow(GAMES);
+  });
+  const sheet = m.getByRole("dialog", { name: "More", exact: true });
+  // The sheet slides in: wait for it to stand still before a screenshot or a swipe on its handle.
+  const sheetOpen = async () => {
+    await sheet.waitFor();
+    await sheet.evaluate((el) => Promise.all(el.getAnimations().map((a) => a.finished)));
+  };
+  await check("phones: More is a sheet over the tab bar, closed by Esc, a tap outside, a swipe down and a pick", async () => {
+    await sectionTab(m, "Home").click();
+    await mPill.getByText("Voice connected").waitFor();
+    await shot(m, "m1-home-pill-dark");
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    if (!(await current("More")) || (await current("Home"))) throw new Error("More is not the marked tab while open");
+    await shot(m, "m2-more-dark");
+    await m.keyboard.press("Escape");
+    await sheet.waitFor({ state: "detached" });
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    await m.mouse.click(195, 120);
+    await sheet.waitFor({ state: "detached" });
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    const handle = await sheet.locator(".cursor-grab").boundingBox();
+    await m.mouse.move(handle.x + handle.width / 2, handle.y + handle.height / 2);
+    await m.mouse.down();
+    await m.mouse.move(handle.x + handle.width / 2, handle.y + 300, { steps: 6 });
+    await m.mouse.up();
+    await sheet.waitFor({ state: "detached" });
+    if (!(await current("Home"))) throw new Error("Home is not marked again");
+  });
+  const activeIs = (page, test) => page.evaluate(test);
+  await check("phones: Esc over More closes only the sheet, the page and a report draft stay; focus follows the sheet and its picks", async () => {
+    const onMore = () => activeIs(m, () => document.activeElement?.hasAttribute("data-more"));
+    // Over a settings page.
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    await sheet.getByRole("button", { name: "Settings", exact: true }).click();
+    const settings = m.getByRole("main", { name: "Settings" });
+    await waitFor(() => activeIs(m, () => document.activeElement?.getAttribute("data-page") === "audio"), "focus on the open tab's row", 5000);
+    await settings.getByRole("button", { name: /^Audio/ }).click();
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    if ((await sheet.getAttribute("aria-modal")) !== "true") throw new Error("the More sheet is not modal");
+    await m.keyboard.press("Escape");
+    await sheet.waitFor({ state: "detached" });
+    await waitFor(onMore, "focus back on More", 5000);
+    await sleep(200);
+    if (!(await settings.getByRole("heading", { name: "Audio", exact: true, level: 2 }).isVisible())) throw new Error("Esc over More left the Audio page");
+    // Over a bug report with a draft.
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    await sheet.getByRole("button", { name: "Report a bug", exact: true }).click();
+    const report = m.getByRole("main", { name: "Report a bug" });
+    await waitFor(() => activeIs(m, () => document.activeElement?.tagName === "TEXTAREA"), "focus in the report", 5000);
+    await m.keyboard.type("a draft");
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    await m.keyboard.press("Escape");
+    await sheet.waitFor({ state: "detached" });
+    await sleep(200);
+    if (!(await report.isVisible())) throw new Error("Esc over More left the bug report");
+    if ((await report.locator("textarea").inputValue()) !== "a draft") throw new Error("Esc over More dropped the draft");
+    await waitFor(onMore, "focus back on More", 5000);
+    // The browser's back leaves the page as its own way back does: focus stays in the app.
+    await m.evaluate(() => history.back());
+    await report.waitFor({ state: "detached" });
+    await waitFor(() => activeIs(m, () => document.activeElement !== document.body), "focus after the browser's back", 5000);
+    await sectionTab(m, "Home").click();
+  });
+  await check("phones: Settings is a list, a category opens over it with a way back; the pill fits a 360 px phone", async () => {
+    await sectionTab(m, "More").click();
+    await sheet.getByRole("button", { name: "Settings", exact: true }).click();
+    const settings = m.getByRole("main", { name: "Settings" });
+    await settings.waitFor();
+    await sheet.waitFor({ state: "detached" });
+    if (!(await current("More"))) throw new Error("More is not marked on Settings");
+    await mPill.waitFor();
+    await shot(m, "m6-settings-dark");
+    await settings.getByRole("button", { name: /^Audio/ }).click();
+    await settings.getByRole("heading", { name: "Audio", exact: true, level: 2 }).waitFor();
+    await shot(m, "m7-settings-audio-dark");
+    await settings.getByRole("button", { name: "Back", exact: true }).click();
+    await settings.getByRole("button", { name: /^Language/ }).click();
+    await settings.getByRole("heading", { name: "Language", exact: true, level: 2 }).waitFor();
+    await m.evaluate(() => history.back());
+    await settings.getByRole("button", { name: /^Language/ }).waitFor();
+    await sectionTab(m, "More").click();
+    await sheet.getByRole("button", { name: "Report a bug", exact: true }).click();
+    await m.getByRole("main", { name: "Report a bug" }).waitFor();
+    await shot(m, "m8-bug-report-dark");
+    // The pill fits the narrowest phones, above the tab bar.
+    await m.setViewportSize({ width: 360, height: 740 });
+    await sleep(200);
+    const box = await mPill.boundingBox();
+    const bar = await tabBar.boundingBox();
+    if (!box || box.x < 0 || box.x + box.width > 360 || box.y + box.height > bar.y) throw new Error(`the pill does not fit: ${JSON.stringify({ box, bar })}`);
+    await m.setViewportSize({ width: 390, height: 844 });
+    await mPill.getByRole("button", { name: "Leave voice" }).click();
+    await mPill.waitFor({ state: "detached" });
+    await sectionTab(m, "Servers").click();
+    await treeItem(m, GAMES).click();
+    await tabBar.waitFor({ state: "detached" });
   });
   await m.emulateMedia({ colorScheme: "light" });
   await shot(m, "13-mobile-light-chat");
-  await m.getByRole("button", { name: "Channels and servers" }).click();
-  await shot(m, "14-mobile-light-drawer");
+  await m.getByRole("button", { name: "Back to channels", exact: true }).click();
+  await shot(m, "14-mobile-light-servers");
+  await check("phones: the browser's Back and Forward, a reload, a crafted entry and resizes keep to the app's own steps", async () => {
+    // A context of its own: nothing remembered, so nothing connects.
+    const ctxR = await newCtx({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const r = await ctxR.newPage();
+    const errors = [];
+    r.on("pageerror", (e) => errors.push(e.message));
+    await r.goto(WEB_URL);
+    const rSheet = r.getByRole("dialog", { name: "More", exact: true });
+    const settings = r.getByRole("main", { name: "Settings" });
+    const audio = settings.getByRole("heading", { name: "Audio", exact: true, level: 2 });
+    const audioRow = settings.getByRole("button", { name: /^Audio/ });
+    const length = () => r.evaluate(() => history.length);
+    const still = async (what) => {
+      await sleep(300);
+      if (!r.url().startsWith(WEB_URL)) throw new Error(`${what}: left the app for ${r.url()}`);
+    };
+    const openSettings = async () => {
+      await sectionTab(r, "More").click();
+      await rSheet.waitFor();
+      await rSheet.getByRole("button", { name: "Settings", exact: true }).click();
+      await settings.waitFor();
+    };
+    await openSettings();
+    await audioRow.click();
+    await audio.waitFor();
+    // Back, then Forward: forward again, not another step back.
+    await r.evaluate(() => history.back());
+    await audio.waitFor({ state: "detached" });
+    await r.evaluate(() => history.forward());
+    await audio.waitFor();
+    // A reload shows the same page again without navigating; Back then goes through the earlier pages.
+    const before = await length();
+    await r.reload();
+    await audio.waitFor();
+    await still("reload");
+    // The More sheet is no entry: opening it and reloading, three times over, adds none and leaves none to step through.
+    for (let i = 0; i < 3; i++) {
+      await sectionTab(r, "More").click();
+      await rSheet.waitFor();
+      await r.reload();
+      await audio.waitFor();
+      if ((await rSheet.count()) !== 0) throw new Error("the More sheet came back with a reload");
+    }
+    if ((await length()) !== before) throw new Error(`history grew from ${before} to ${await length()}`);
+    await r.evaluate(() => history.back());
+    await audioRow.waitFor();
+    await r.evaluate(() => history.back());
+    await settings.waitFor({ state: "detached" });
+    await r.getByLabel("Server address").waitFor();
+    await still("back after the reloads");
+    // An entry another script made, claiming to be deep in, with a crafted tab and a store field: it shows a sane
+    // page, and the app's own way back from it stays where it is.
+    await r.evaluate(() => history.pushState({ gwarNav: { id: "crafted", index: 2, view: { section: "settings", settingsTab: 'x"]???', settingsDrill: true, setSection: null } } }, ""));
+    await r.evaluate(() => history.back());
+    await sleep(200);
+    await r.evaluate(() => history.forward());
+    await audio.waitFor();
+    await r.keyboard.press("Escape");
+    await audioRow.waitFor();
+    await r.keyboard.press("Escape");
+    await settings.waitFor({ state: "detached" });
+    await still("the way back from a crafted entry");
+    await openSettings();
+    await audioRow.waitFor();
+    if (errors.length) throw new Error(`page errors: ${errors.join("; ")}`);
+    // A page and the sheet open, the window wide (the desktop closes the sheet), Back, then narrow again: still in the app.
+    await sectionTab(r, "More").click();
+    await rSheet.waitFor();
+    await r.setViewportSize({ width: 1280, height: 800 });
+    await rSheet.waitFor({ state: "detached" });
+    await r.evaluate(() => history.back());
+    await r.setViewportSize({ width: 390, height: 844 });
+    await still("resize");
+    await openSettings();
+    await r.setViewportSize({ width: 1280, height: 800 });
+    await r.setViewportSize({ width: 390, height: 844 });
+    await still("resize without back");
+    await settings.waitFor();
+    await ctxR.close();
+  });
 
   // Polish UI
   const ctxP = await newCtx({ locale: "pl-PL", colorScheme: "light" });
@@ -931,7 +1192,9 @@ async function main() {
         const pc = [...window.__pcs].reverse().find((x) => x.connectionState === "connected");
         return pc?.getSenders()[0]?.track?.enabled;
       });
+    // The gear reopens the tab it showed last.
     await a.getByRole("button", { name: "Settings" }).first().click();
+    await a.getByRole("tab", { name: "Audio" }).click();
     await a.getByRole("radio", { name: "Push to talk" }).click();
     await a.getByRole("button", { name: "Set push-to-talk key" }).click();
     await a.keyboard.press("KeyV");
@@ -1558,7 +1821,7 @@ async function main() {
     localUid = await settingsUid(c);
     if (!localUid) throw new Error("no local uid");
     await c.getByLabel("Nickname").fill("Account nickname");
-    await c.getByRole("dialog").getByRole("button", { name: "Save", exact: true }).first().click();
+    await c.getByRole("main", { name: "Settings" }).getByRole("button", { name: "Save", exact: true }).first().click();
     await c.getByText("Saved", { exact: true }).waitFor();
     await c.getByRole("tab", { name: "Account" }).click();
     await c.getByRole("button", { name: /Create an account/ }).click();
@@ -1576,7 +1839,7 @@ async function main() {
     await shot(c, "20-account-recovery-code");
     await c.getByRole("checkbox", { name: "I saved my recovery code" }).check();
     await cont.click();
-    await c.getByText(`Signed in as @${acct}`).first().waitFor();
+    await c.getByRole("main", { name: "Settings" }).getByText(`Signed in as @${acct}`).waitFor();
     await c.getByRole("tab", { name: "Identity" }).click();
     accountUid = await readUid(c);
     if (accountUid !== localUid) throw new Error(`kept identity changed uid: ${localUid} -> ${accountUid}`);

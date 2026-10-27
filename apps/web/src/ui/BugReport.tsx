@@ -8,13 +8,17 @@ import { fitDiagnostics, fitScreenshot } from "../lib/diagnostics";
 import { useAccount } from "../state/account";
 import { controller, describeRequestError } from "../state/controller";
 import { useUi } from "../state/stores";
-import { Button, Dialog, Field, IconButton, Switch, Textarea, Tooltip } from "./kit";
+import { cn } from "../lib/cn";
+import { leavePage, useEscapeBack } from "./hooks";
+import { Button, Field, panelCard, Switch, Textarea, Tooltip } from "./kit";
+import { useVoicePill } from "./nav";
+import { VoicePill } from "./VoicePanel";
 
 const MAX_SHOTS = 5;
 
 interface Shot { id: number; blob: Blob; url: string }
 
-/** "Alpha" and the way to report a bug, at the bottom of the server rail. */
+/** "Alpha", at the bottom of the global rail. */
 export function AlphaBadge() {
   const t = useT();
   return (
@@ -26,20 +30,10 @@ export function AlphaBadge() {
   );
 }
 
-export function BugReportButton() {
+/** Text, optional diagnostics and up to five screenshots, sent privately to Gwar Connect. Esc goes back. */
+export function BugReportSection({ card }: { card?: boolean }) {
   const t = useT();
-  const openDialog = useUi((s) => s.openDialog);
-  return (
-    <IconButton label={t("report.open")} side="right" onClick={() => openDialog({ kind: "bugReport" })}>
-      <Bug className="size-5" />
-    </IconButton>
-  );
-}
-
-/** Text, optional diagnostics and up to five screenshots, sent privately to Gwar Connect. */
-export function BugReportDialog() {
-  const t = useT();
-  const close = useUi((s) => s.closeDialog);
+  const pill = useVoicePill();
   const toast = useUi((s) => s.toast);
   const account = useAccount((s) => s.account);
   const [text, setText] = useState("");
@@ -52,8 +46,9 @@ export function BugReportDialog() {
   const nextId = useRef(0);
   const file = useRef<HTMLInputElement>(null);
 
+  useEscapeBack();
   useEffect(() => { void controller.reportDiagnostics().then((d) => setDiagnostics(fitDiagnostics(d))); }, []);
-  // Preview URLs are released with the dialog.
+  // Preview URLs are released with the page.
   const shotsRef = useRef<Shot[]>([]);
   useEffect(() => { shotsRef.current = shots; }, [shots]);
   useEffect(() => () => { for (const s of shotsRef.current) URL.revokeObjectURL(s.url); }, []);
@@ -93,7 +88,7 @@ export function BugReportDialog() {
       const record = await loadConnectRecord().catch(() => undefined);
       const id = await connectApi.report({ text: text.trim(), diagnostics: withDiagnostics && diagnostics ? diagnostics : { app: { omitted: true } }, images }, record?.token);
       toast("success", t("report.sent", { id }));
-      close();
+      if (useUi.getState().section === "bugReport") leavePage();
     } catch (err) {
       setError(describeRequestError(err));
       setBusy(false);
@@ -101,60 +96,60 @@ export function BugReportDialog() {
   };
 
   return (
-    <Dialog
-      open
-      onOpenChange={(o) => !o && close()}
-      title={t("report.title")}
-      description={t("report.description")}
-      width="max-w-lg"
-      footer={
-        <>
-          <Button onClick={close}>{t("common.cancel")}</Button>
-          <Button variant="primary" busy={busy} disabled={!text.trim()} onClick={() => void send()}>{t("report.send")}</Button>
-        </>
-      }
-    >
-      <div className="flex flex-col gap-3" onPaste={onPaste} onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
-        <Field label={t("report.what")}>
-          {(id) => <Textarea id={id} value={text} onChange={(e) => setText(e.target.value)} rows={5} maxLength={10_000} placeholder={t("report.placeholder")} autoFocus />}
-        </Field>
-        <div className="flex flex-col gap-2">
-          <div className="flex flex-wrap items-center gap-2">
-            {shots.map((s) => (
-              <span key={s.id} className="relative">
-                <img src={s.url} alt="" className="size-16 rounded-md border border-line object-cover" />
-                <button type="button" aria-label={t("report.removeShot")} onClick={() => remove(s.id)}
-                  className="absolute -top-1.5 -right-1.5 flex size-5 cursor-pointer items-center justify-center rounded-full bg-surface text-muted shadow ring-1 ring-line hover:text-danger">
-                  <X className="size-3" />
-                </button>
-              </span>
-            ))}
-            {shots.length < MAX_SHOTS && (
-              <Button size="sm" onClick={() => file.current?.click()}>
-                <ImagePlus className="size-4" /> {t("report.addShot")}
-              </Button>
-            )}
-            <input ref={file} type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden
-              onChange={(e) => { void add(e.target.files ?? []); e.target.value = ""; }} />
+    <main aria-label={t("report.title")} className={cn("relative flex min-w-0 flex-1 flex-col bg-surface", card && panelCard)}>
+      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-line px-3 md:px-4">
+        <Bug className="size-5 text-subtle" />
+        <h1 className="truncate text-[15px] font-semibold">{t("report.title")}</h1>
+      </header>
+      <div className={cn("min-h-0 flex-1 overflow-y-auto", pill && "pb-20")}>
+        <div className="mx-auto flex w-full max-w-2xl flex-col gap-3 p-4 md:p-8" onPaste={onPaste} onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
+          <p className="text-sm text-muted">{t("report.description")}</p>
+          <Field label={t("report.what")}>
+            {(id) => <Textarea id={id} value={text} onChange={(e) => setText(e.target.value)} rows={5} maxLength={10_000} placeholder={t("report.placeholder")} autoFocus data-entry />}
+          </Field>
+          <div className="flex flex-col gap-2">
+            <div className="flex flex-wrap items-center gap-2">
+              {shots.map((s) => (
+                <span key={s.id} className="relative">
+                  <img src={s.url} alt="" className="size-16 rounded-md border border-line object-cover" />
+                  <button type="button" aria-label={t("report.removeShot")} onClick={() => remove(s.id)}
+                    className="absolute -top-1.5 -right-1.5 flex size-5 cursor-pointer items-center justify-center rounded-full bg-surface text-muted shadow ring-1 ring-line hover:text-danger">
+                    <X className="size-3" />
+                  </button>
+                </span>
+              ))}
+              {shots.length < MAX_SHOTS && (
+                <Button size="sm" onClick={() => file.current?.click()}>
+                  <ImagePlus className="size-4" /> {t("report.addShot")}
+                </Button>
+              )}
+              <input ref={file} type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple hidden
+                onChange={(e) => { void add(e.target.files ?? []); e.target.value = ""; }} />
+            </div>
+            <p className="text-xs text-subtle">{t("report.shotHint")}</p>
           </div>
-          <p className="text-xs text-subtle">{t("report.shotHint")}</p>
+          <Switch checked={withDiagnostics} onCheckedChange={setWithDiagnostics} label={t("report.diagnostics")} description={t("report.diagnosticsHint")} />
+          {withDiagnostics && (
+            <div>
+              <button type="button" className="cursor-pointer text-xs text-accent underline underline-offset-2" onClick={() => setShowDiagnostics((v) => !v)}>
+                {t(showDiagnostics ? "report.hideDiagnostics" : "report.showDiagnostics")}
+              </button>
+              {showDiagnostics && (
+                <pre className="mt-1 max-h-48 overflow-auto rounded-md bg-side p-2 text-[11px] whitespace-pre-wrap text-muted">
+                  {diagnostics ? JSON.stringify(diagnostics, null, 2) : "…"}
+                </pre>
+              )}
+            </div>
+          )}
+          <p className="text-xs text-subtle">{account ? t("report.privacyAccount", { handle: account.handle }) : t("report.privacy")}</p>
+          {error && <p role="alert" className="text-sm text-danger">{error}</p>}
+          <div className="flex justify-end gap-2 pt-1">
+            <Button onClick={leavePage}>{t("common.cancel")}</Button>
+            <Button variant="primary" busy={busy} disabled={!text.trim()} onClick={() => void send()}>{t("report.send")}</Button>
+          </div>
         </div>
-        <Switch checked={withDiagnostics} onCheckedChange={setWithDiagnostics} label={t("report.diagnostics")} description={t("report.diagnosticsHint")} />
-        {withDiagnostics && (
-          <div>
-            <button type="button" className="cursor-pointer text-xs text-accent underline underline-offset-2" onClick={() => setShowDiagnostics((v) => !v)}>
-              {t(showDiagnostics ? "report.hideDiagnostics" : "report.showDiagnostics")}
-            </button>
-            {showDiagnostics && (
-              <pre className="mt-1 max-h-48 overflow-auto rounded-md bg-side p-2 text-[11px] whitespace-pre-wrap text-muted">
-                {diagnostics ? JSON.stringify(diagnostics, null, 2) : "…"}
-              </pre>
-            )}
-          </div>
-        )}
-        <p className="text-xs text-subtle">{account ? t("report.privacyAccount", { handle: account.handle }) : t("report.privacy")}</p>
-        {error && <p role="alert" className="text-sm text-danger">{error}</p>}
       </div>
-    </Dialog>
+      <VoicePill />
+    </main>
   );
 }

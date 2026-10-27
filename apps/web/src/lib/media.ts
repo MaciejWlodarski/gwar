@@ -12,7 +12,14 @@ export function useMediaQuery(query: string): boolean {
   return matches;
 }
 
-/** True below the desktop layout breakpoint (sidebar becomes a drawer). */
+const MOBILE_QUERY = "(max-width: 799px)";
+
+/** True below the desktop layout breakpoint: one page at a time, with a tab bar instead of the rails. */
 export function useIsMobile(): boolean {
-  return useMediaQuery("(max-width: 799px)");
+  return useMediaQuery(MOBILE_QUERY);
+}
+
+/** `useIsMobile` outside of components. */
+export function isMobileNow(): boolean {
+  return typeof window.matchMedia === "function" && window.matchMedia(MOBILE_QUERY).matches;
 }

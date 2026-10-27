@@ -6,7 +6,7 @@ import { cn } from "../lib/cn";
 import { isTeamSpeak, PLATFORM_LABEL } from "../lib/platform";
 import { formatRelative } from "../lib/time";
 import { useSession, useUi } from "../state/stores";
-import { Avatar, menuContent, menuItem, menuLabel, panelCard, Tooltip } from "./kit";
+import { Avatar, BackButton, menuContent, menuItem, menuLabel, panelCard, Tooltip } from "./kit";
 import { ModerationItems } from "./ModerationMenu";
 import { ConnectBadge, IdentityLine, TsGroupBadges } from "./badges";
 import { groupMembers, type MemberEntry } from "./members";
@@ -24,7 +24,6 @@ function MemberRow({ entry, mine, now }: { entry: MemberEntry; mine: boolean; no
   const open = () => {
     if (mine) return;
     useSession.getState().dispatch({ type: "openDm", uid: entry.uid, name: entry.nickname });
-    useUi.getState().setMembersDrawer(false);
   };
   return (
     <li>
@@ -105,7 +104,8 @@ function Section({ title, entries, mineUid, now }: { title: string; entries: Mem
 }
 
 /** Who is on the server: in voice, online, and everyone else who was ever here. */
-export function MemberList({ className, card }: { className?: string; card?: boolean }) {
+/** The member list: a panel beside the chat, or (with `onBack`) a phone's page of its own. */
+export function MemberList({ className, card, onBack }: { className?: string; card?: boolean; onBack?: () => void }) {
   const t = useT();
   const clients = useSession((s) => s.clients);
   const members = useSession((s) => s.members);
@@ -124,8 +124,11 @@ export function MemberList({ className, card }: { className?: string; card?: boo
   );
 
   return (
-    <aside aria-label={t("chat.members")} className={cn("flex h-full w-60 shrink-0 flex-col bg-side", card ? panelCard : "border-l border-line", className)}>
-      <h2 className="flex h-12 shrink-0 items-center border-b border-line px-4 text-[15px] font-semibold">{t("members.title")}</h2>
+    <aside aria-label={t("chat.members")} className={cn("flex h-full flex-col bg-side", onBack ? "min-w-0 flex-1" : "w-60 shrink-0", card ? panelCard : !onBack && "border-l border-line", className)}>
+      <header className={cn("flex h-12 shrink-0 items-center gap-1 border-b border-line", onBack ? "px-3" : "px-4")}>
+        {onBack && <BackButton entry onClick={onBack} />}
+        <h2 className="text-[15px] font-semibold">{t("members.title")}</h2>
+      </header>
       <div className="min-h-0 flex-1 overflow-y-auto pb-3">
         <Section title={t("members.voice")} entries={voice} mineUid={mineUid} now={now} />
         {hoisted.map((h) => (

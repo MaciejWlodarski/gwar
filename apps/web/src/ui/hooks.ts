@@ -1,11 +1,12 @@
-import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { flushSync } from "react-dom";
 import { tsBridge, type TsListInfo } from "../connect/teamspeak";
 import { useAccount } from "../state/account";
 import type { Permission } from "../proto/Permission";
 import { controller } from "../state/controller";
 import { hasGlobalShortcut, isGlobalShortcutEvent } from "../platform/desktop";
 import { useSettings } from "../state/settings";
-import { useSession, useVoice } from "../state/stores";
+import { useSession, useUi, useVoice, type Section } from "../state/stores";
 import { memberName } from "../lib/member-name";
 import { nameColor, type Who } from "../lib/permissions";
 import { channelPermissions } from "../lib/channel-permissions";
@@ -104,6 +105,96 @@ export function useTheme(): void {
 function isEditable(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+}
+
+const isPage = (section: Section) => section === "settings" || section === "bugReport";
+
+/** What had focus when the pages (settings, bug report) opened: the gear, the avatar, a link. */
+let pageOpener: Element | null = null;
+useUi.subscribe((ui, before) => {
+  if (isPage(ui.section) && !isPage(before.section) && typeof document !== "undefined") pageOpener = document.activeElement;
+});
+
+/** On screen and reachable: not removed, hidden or under an inert section. */
+const reachable = (el: Element | null): el is HTMLElement =>
+  el instanceof HTMLElement && el.isConnected && !el.closest("[inert]") && el.getClientRects().length > 0;
+
+/** The first control of the shown main card. */
+const firstInMain = () => {
+  const main = [...document.querySelectorAll("main")].find(reachable);
+  return [...(main?.querySelectorAll("button, a[href], input, textarea, select, [tabindex]:not([tabindex='-1'])") ?? [])].find(reachable);
+};
+
+/**
+ * Focus onto what is shown: its starting point (marked `data-entry`: the open tab, the report's text, the open
+ * channel's row, the conversation's way back), else the main card's first control, else the channel list.
+ */
+export function focusPage(): void {
+  const entry = [...document.querySelectorAll("[data-entry]")].find(reachable);
+  (entry ?? firstInMain() ?? [...document.querySelectorAll('[role="treeitem"]')].find(reachable))?.focus();
+}
+
+/** How an in-app way back is applied: on phones its history step goes with it (`nav.ts` sets it). */
+let backHandler = (apply: () => void) => apply();
+export function setBackHandler(handler: (apply: () => void) => void): void {
+  backHandler = handler;
+}
+
+/** An in-app way back (a back button, Esc out of a page, a tab back to a section's top). */
+export function backInApp(apply: () => void): void {
+  backHandler(apply);
+}
+
+/**
+ * Leaves a page through `apply` (Esc, Cancel, a sent report, the system's back), as closing a dialog would:
+ * focus goes back to what opened it, or else into the section's main card.
+ */
+export function exitPage(apply: () => void): void {
+  const opener = pageOpener;
+  pageOpener = null;
+  flushSync(apply);
+  if (reachable(opener)) return opener.focus();
+  firstInMain()?.focus();
+}
+
+/** Leaves a page for the section it was opened from. */
+export function leavePage(): void {
+  backInApp(() => exitPage(() => useUi.getState().goBack()));
+}
+
+/** Layers that Esc closes before it may leave a page. Not a tooltip: one still fading out (the gear's, its focus
+ *  just moved into the page) marks the key handled too, and would swallow the first Esc. */
+const escapeLayers = '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]';
+
+/**
+ * The Esc presses that found a layer open, noted before anything handles them: by the time the key reaches
+ * the window, the layer it closed (the More sheet, a dialog) may already be gone from the DOM.
+ */
+const layerEscapes = new WeakSet<Event>();
+if (typeof document !== "undefined") {
+  // Registered on load, so ahead of the layers' own listeners (on the document, capturing).
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && document.querySelector(escapeLayers)) layerEscapes.add(e);
+  }, true);
+}
+
+/**
+ * Esc on a page goes back (by default to the section it was opened from), as it would close a dialog. Not while
+ * typing, and not when the key closed a layer (Radix marks it handled).
+ */
+export function useEscapeBack(back: () => void = leavePage): void {
+  const latest = useRef(back);
+  useEffect(() => {
+    latest.current = back;
+  });
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || isEditable(e.target) || (e.defaultPrevented && layerEscapes.has(e))) return;
+      latest.current();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 }
 
 /** Mute / deafen shortcuts and push-to-talk. */

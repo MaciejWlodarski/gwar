@@ -301,10 +301,10 @@ async function device(browser, web, url, role, config) {
   await page.getByLabel("Server address").fill(url);
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   await page.getByRole("tab", { name: "Identity", exact: true }).click();
-  const nickname = page.getByRole("dialog").getByLabel("Nickname", { exact: true });
+  const nickname = page.getByRole("main", { name: "Settings" }).getByLabel("Nickname", { exact: true });
   await waitFor(async () => (await nickname.inputValue()) !== "", "identity");
   await nickname.fill(role);
-  await page.getByRole("dialog").getByRole("button", { name: "Save", exact: true }).first().click();
+  await page.getByRole("main", { name: "Settings" }).getByRole("button", { name: "Save", exact: true }).first().click();
   await page.getByText("Saved", { exact: true }).waitFor();
   await page.keyboard.press("Escape");
   await page.getByRole("button", { name: "Connect", exact: true }).click();

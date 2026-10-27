@@ -13,10 +13,13 @@ export const pl: Record<Key, string> = {
   "storage.newer.body": "Nowsza wersja Gwar zapisała dane w tej przeglądarce lub aplikacji, a ta wersja nie potrafi ich odczytać. Niczego nie zmieniono. Odśwież stronę albo zainstaluj najnowszy Gwar.",
 
   "nav.servers": "Serwery",
-  "nav.channels": "Kanały i serwery",
   "nav.sections": "Sekcje",
   "nav.home": "Start",
   "nav.account": "Twój profil",
+  "nav.back": "Wstecz",
+  "nav.more": "Więcej",
+  "nav.profile": "Profil",
+  "nav.toChannels": "Wróć do kanałów",
 
   "rail.label": "Zapisane serwery",
   "rail.connect": "Połącz",
@@ -408,6 +411,8 @@ export const pl: Record<Key, string> = {
   "voice.retryMic": "Spróbuj ponownie",
   "voice.openPrivacySettings": "Otwórz ustawienia prywatności",
   "voice.leave": "Opuść kanał głosowy",
+  "voice.pill": "Połączenie głosowe",
+  "voice.pillOpen": "Przejdź do kanału głosowego",
   "voice.rtt": "Opóźnienie do serwera (w obie strony): {ms} ms",
   "voice.notIn": "Poza kanałem głosowym",
   "voice.notInHint": "Kliknij kanał dwukrotnie, aby rozmawiać",

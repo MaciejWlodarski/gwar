@@ -13,18 +13,18 @@ const WIDE_QUERY = "(min-width: 1100px)";
 
 /**
  * Whether the member list is shown and how to toggle it. Wide windows follow
- * the remembered setting (open by default only when there is room); narrow
- * layouts use a drawer that always starts closed.
+ * the remembered setting (open by default only when there is room); phones
+ * show it as a page of its own over the conversation.
  */
 export function useMembersPanel() {
   const isMobile = useIsMobile();
   const wide = useMediaQuery(WIDE_QUERY);
   const preference = useSettings((s) => s.membersOpen);
   const setPreference = useSettings((s) => s.setMembersOpen);
-  const drawer = useUi((s) => s.membersDrawerOpen);
-  const setDrawer = useUi((s) => s.setMembersDrawer);
-  const open = isMobile ? drawer : (preference ?? wide);
-  return { open, isMobile, toggle: () => (isMobile ? setDrawer(!drawer) : setPreference(!open)) };
+  const page = useUi((s) => s.pane === "members");
+  const setPane = useUi((s) => s.setPane);
+  const open = isMobile ? page : (preference ?? wide);
+  return { open, isMobile, toggle: () => (isMobile ? setPane(page ? "chat" : "members") : setPreference(!open)) };
 }
 
 export interface MemberEntry {

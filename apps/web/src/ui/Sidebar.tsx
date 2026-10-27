@@ -117,14 +117,10 @@ function OverviewRow() {
   const t = useT();
   const selected = useUi((s) => s.overview);
   const showOverview = useUi((s) => s.showOverview);
-  const setDrawer = useUi((s) => s.setDrawer);
   return (
     <div className="px-2 pt-2">
       <button
-        onClick={() => {
-          showOverview();
-          setDrawer(false);
-        }}
+        onClick={showOverview}
         aria-current={selected ? "page" : undefined}
         className={cn(
           "t flex h-8 w-full cursor-pointer items-center gap-2 rounded-md px-2 text-left text-sm",
@@ -138,10 +134,11 @@ function OverviewRow() {
   );
 }
 
-export function Sidebar({ className, card }: { className?: string; card?: boolean }) {
+/** The server's channels and my voice panel: a column of the server view, or (`fill`) a phone's page. */
+export function Sidebar({ card, fill }: { card?: boolean; fill?: boolean }) {
   const phase = useSession((s) => s.phase);
   return (
-    <aside className={cn("flex h-full w-[280px] shrink-0 flex-col bg-side", card ? panelCard : "border-r border-line", className)}>
+    <aside className={cn("flex h-full flex-col bg-side", fill ? "min-w-0 flex-1" : "w-[280px] shrink-0", card && panelCard)}>
       <ServerHeader />
       <div className={cn("min-h-0 flex-1 overflow-y-auto transition-opacity duration-150", phase === "reconnecting" && "opacity-50")}>
         <OverviewRow />

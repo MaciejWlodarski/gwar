@@ -1,4 +1,4 @@
-import { Bell, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
+import { Bell, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, Settings as SettingsIcon, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { tNow, useT } from "../i18n";
 import { cn } from "../lib/cn";
@@ -17,24 +17,39 @@ import { useSession, useUi, useVoice, type SettingsTab } from "../state/stores";
 import { VoiceError } from "../voice/engine";
 import { keyLabel } from "./hooks";
 import { Button, Field, Input, Section, Segmented, Select, Slider, Switch } from "./kit";
-import { SettingsLayout, type SettingsPage } from "./SettingsLayout";
+import { AlphaBadge } from "./BugReport";
+import { SettingsPageLayout, type SettingsPage } from "./SettingsLayout";
+import { VersionLabel } from "./Version";
 
 const DEFAULT = "__default";
 
-export function SettingsDialog({ tab }: { tab: SettingsTab }) {
+/** The settings section: the gear opens it on the last tab, the account avatar on the identity tab. */
+export function SettingsSection({ card }: { card?: boolean }) {
   const t = useT();
-  const close = useUi((s) => s.closeDialog);
-  const [current, setCurrent] = useState<SettingsTab>(tab);
+  const tab = useUi((s) => s.settingsTab);
+  const setTab = useUi((s) => s.setSettingsTab);
+  // What the phones' list shows beside each page, where it is a word or two.
+  const inputMode = useSettings((s) => s.audio.inputMode);
+  const theme = useSettings((s) => s.theme);
+  const language = useSettings((s) => s.language);
+  const nickname = useAccountIdentity((s) => s.nickname);
+  const handle = useAccount((s) => s.account?.handle);
   const tabs: Array<SettingsPage<SettingsTab>> = [
-    { id: "audio", label: t("settings.audio"), icon: <SlidersHorizontal className="size-4" /> },
+    { id: "audio", label: t("settings.audio"), icon: <SlidersHorizontal className="size-4" />, value: t(inputMode === "ptt" ? "audio.ptt" : "audio.vad") },
     { id: "notifications", label: t("settings.notifications"), icon: <Bell className="size-4" /> },
-    { id: "appearance", label: t("settings.appearance"), icon: <Palette className="size-4" /> },
-    { id: "identity", label: t("settings.identity"), icon: <UserRound className="size-4" /> },
-    { id: "account", label: t("settings.account"), icon: <CloudCog className="size-4" /> },
-    { id: "language", label: t("settings.language"), icon: <Languages className="size-4" /> },
+    { id: "appearance", label: t("settings.appearance"), icon: <Palette className="size-4" />, value: t(`appearance.${theme}`) },
+    { id: "identity", label: t("settings.identity"), icon: <UserRound className="size-4" />, value: nickname || undefined, group: 1 },
+    { id: "account", label: t("settings.account"), icon: <CloudCog className="size-4" />, value: handle ? `@${handle}` : undefined, group: 1 },
+    { id: "language", label: t("settings.language"), icon: <Languages className="size-4" />, value: language === "pl" ? "Polski" : "English" },
   ];
+  const footer = (
+    <div className="flex flex-col items-center gap-1.5 pt-1">
+      <VersionLabel />
+      <AlphaBadge />
+    </div>
+  );
   return (
-    <SettingsLayout title={t("settings.title")} pages={tabs} value={current} onValueChange={setCurrent} onClose={close}>
+    <SettingsPageLayout title={t("settings.title")} icon={<SettingsIcon />} pages={tabs} value={tab} onValueChange={setTab} card={card} footer={footer}>
       {(page) =>
         page === "audio" ? <AudioTab />
         : page === "notifications" ? <NotificationsTab />
@@ -42,7 +57,7 @@ export function SettingsDialog({ tab }: { tab: SettingsTab }) {
         : page === "identity" ? <IdentityTab />
         : page === "account" ? <AccountTab />
         : <LanguageTab />}
-    </SettingsLayout>
+    </SettingsPageLayout>
   );
 }
 

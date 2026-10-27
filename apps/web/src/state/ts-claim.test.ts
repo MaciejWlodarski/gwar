@@ -82,7 +82,7 @@ describe("offering the TeamSpeak claim", () => {
   });
 
   it("takes a dialog closed by something else for no", async () => {
-    for (const close of [() => useUi.getState().closeDialog(), () => useUi.getState().openDialog({ kind: "bugReport" })]) {
+    for (const close of [() => useUi.getState().closeDialog(), () => useUi.getState().openDialog({ kind: "redeem" })]) {
       useSettings.setState({ tsClaimAsked: {} });
       const { ts, signed } = bridge(["A="]);
       const { link } = server(["ts:A="]);

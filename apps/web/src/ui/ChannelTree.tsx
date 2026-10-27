@@ -133,11 +133,14 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
   });
 
   const join = () => {
-    if (canJoin) void controller.joinChannelInteractive(channel.id);
+    if (!canJoin) return;
+    // Joining opens the channel's chat beside the tree, but a phone stays on the tree, by its voice panel.
+    const { pane } = useUi.getState();
+    void controller.joinChannelInteractive(channel.id);
+    useUi.getState().setPane(pane);
   };
   const select = () => {
     controller.selectChannel(channel.id);
-    useUi.getState().setDrawer(false);
   };
 
   const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
@@ -162,6 +165,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           aria-expanded={expandable ? !collapsed : undefined}
           aria-selected={selected}
           aria-current={current ? "true" : undefined}
+          data-entry={selected || undefined}
           data-treeitem
           tabIndex={0}
           onClick={select}
@@ -352,7 +356,6 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
   const openDm = () => {
     if (isMe) return;
     useSession.getState().dispatch({ type: "openDm", uid: client.uid, name: client.nickname });
-    useUi.getState().setDrawer(false);
   };
   const avatarSize = compact ? 18 : 22; // plus the ring: the row height
   const silenced = client.muted || client.deafened;
