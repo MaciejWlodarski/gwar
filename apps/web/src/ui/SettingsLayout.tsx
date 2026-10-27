@@ -1,7 +1,7 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import * as Tabs from "@radix-ui/react-tabs";
 import { Menu, X } from "lucide-react";
-import type { ReactNode } from "react";
+import { useEffect, useRef, type ReactNode } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { useIsMobile } from "../lib/media";
@@ -113,7 +113,7 @@ export function SettingsLayout<T extends string>({
 /**
  * Settings as a section of the app: the pages in a card of their own where the server column and channel
  * panel stand in the server view, the open page in the main card. On phones one column, the pages on top.
- * Esc goes back to the section it was opened from.
+ * It takes focus when it opens; Esc goes back to the section it was opened from, and focus with it.
  */
 export function SettingsPageLayout<T extends string>({
   title,
@@ -137,7 +137,10 @@ export function SettingsPageLayout<T extends string>({
   const setDrawer = useUi((s) => s.setDrawer);
   const pill = useVoicePill();
   const current = pages.find((p) => p.id === value);
+  const list = useRef<HTMLDivElement>(null);
   useEscapeBack();
+  // Opening the page moves focus into it, onto the open tab, as the dialog did.
+  useEffect(() => list.current?.querySelector<HTMLElement>('[role="tab"][data-state="active"]')?.focus(), []);
   return (
     <Tabs.Root
       value={value}
@@ -156,6 +159,7 @@ export function SettingsPageLayout<T extends string>({
           <h1 className="truncate text-base font-semibold text-fg">{title}</h1>
         </div>
         <Tabs.List
+          ref={list}
           aria-label={title}
           className={cn("flex gap-1 px-3 pb-3", isMobile ? "overflow-x-auto" : "min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto")}
         >

@@ -868,6 +868,33 @@ async function main() {
   await shot(a, "09-settings-identity-dark");
   await a.keyboard.press("Escape");
 
+  await check("the pages take focus when opened from the keyboard and give it back when left", async () => {
+    const focused = () => a.evaluate(() => {
+      const el = document.activeElement;
+      return { role: el?.getAttribute("role"), selected: el?.getAttribute("aria-selected"), label: el?.getAttribute("aria-label"), text: el?.textContent?.trim(), tag: el?.tagName };
+    });
+    await a.getByRole("main", { name: "Settings" }).waitFor({ state: "detached" });
+    // Settings: the gear opens it onto its open tab; Esc goes back with focus on the gear.
+    await a.getByRole("button", { name: "Settings", exact: true }).first().focus();
+    await a.keyboard.press("Enter");
+    await a.getByRole("main", { name: "Settings" }).waitFor();
+    await waitFor(async () => { const f = await focused(); return f.role === "tab" && f.selected === "true"; }, "focus on the open settings tab", 5000);
+    await a.keyboard.press("Escape");
+    await a.getByRole("main", { name: "Settings" }).waitFor({ state: "detached" });
+    await waitFor(async () => (await focused()).label === "Settings", `focus back on the gear (${JSON.stringify(await focused())})`, 5000);
+    // The bug report: its text field takes focus; Cancel goes back with focus on the bug button.
+    await a.getByRole("button", { name: "Report a bug", exact: true }).focus();
+    await a.keyboard.press("Enter");
+    await a.getByRole("main", { name: "Report a bug" }).waitFor();
+    await waitFor(async () => (await focused()).tag === "TEXTAREA", "focus in the report", 5000);
+    await a.getByRole("main", { name: "Report a bug" }).getByRole("button", { name: "Cancel" }).focus();
+    await a.keyboard.press("Enter");
+    await a.getByRole("main", { name: "Report a bug" }).waitFor({ state: "detached" });
+    await waitFor(async () => (await focused()).label === "Report a bug", `focus back on the bug button (${JSON.stringify(await focused())})`, 5000);
+    // The tooltip shown by that focus would cover the rail.
+    await a.keyboard.press("Escape");
+  });
+
   await check("settings and the bug report are pages; the voice pill stands in for the voice panel elsewhere", async () => {
     const pill = a.getByRole("region", { name: "Voice connection", exact: true });
     // The server view keeps its voice panel; the Servers icon says I am in voice.

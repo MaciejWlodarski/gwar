@@ -1,11 +1,12 @@
 import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
+import { flushSync } from "react-dom";
 import { tsBridge, type TsListInfo } from "../connect/teamspeak";
 import { useAccount } from "../state/account";
 import type { Permission } from "../proto/Permission";
 import { controller } from "../state/controller";
 import { hasGlobalShortcut, isGlobalShortcutEvent } from "../platform/desktop";
 import { useSettings } from "../state/settings";
-import { useSession, useUi, useVoice } from "../state/stores";
+import { useSession, useUi, useVoice, type Section } from "../state/stores";
 import { memberName } from "../lib/member-name";
 import { nameColor, type Who } from "../lib/permissions";
 import { channelPermissions } from "../lib/channel-permissions";
@@ -106,15 +107,45 @@ function isEditable(target: EventTarget | null): boolean {
   return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
 }
 
+const isPage = (section: Section) => section === "settings" || section === "bugReport";
+
+/** What had focus when the pages (settings, bug report) opened: the gear, the avatar, a link. */
+let pageOpener: Element | null = null;
+useUi.subscribe((ui, before) => {
+  if (isPage(ui.section) && !isPage(before.section) && typeof document !== "undefined") pageOpener = document.activeElement;
+});
+
+/** On screen and reachable: not removed, hidden or under an inert section. */
+const reachable = (el: Element | null): el is HTMLElement =>
+  el instanceof HTMLElement && el.isConnected && !el.closest("[inert]") && el.getClientRects().length > 0;
+
 /**
- * Esc on a page (settings, bug report) goes back to the section it was opened from, as it would close
- * a dialog. Not while typing, and not when the key already closed something (Radix layers mark it handled).
+ * Leaves a page for the section it was opened from (Esc, Cancel, a sent report), as closing a dialog
+ * would: focus goes back to what opened it, or else into the section's main card.
+ */
+export function leavePage(): void {
+  const opener = pageOpener;
+  pageOpener = null;
+  flushSync(() => useUi.getState().goBack());
+  if (reachable(opener)) return opener.focus();
+  const main = [...document.querySelectorAll("main")].find(reachable);
+  const first = [...(main?.querySelectorAll("button, a[href], input, textarea, select, [tabindex]:not([tabindex='-1'])") ?? [])].find(reachable);
+  first?.focus();
+}
+
+/** Layers that Esc closes before it may leave a page. Not a tooltip: one still fading out (the gear's, its focus
+ *  just moved into the page) marks the key handled too, and would swallow the first Esc. */
+const escapeLayers = '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]';
+
+/**
+ * Esc on a page goes back to the section it was opened from, as it would close a dialog. Not while
+ * typing, and not when the key closed a popup (Radix marks it handled; the popup is still in the DOM).
  */
 export function useEscapeBack(): void {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || e.defaultPrevented || isEditable(e.target)) return;
-      useUi.getState().goBack();
+      if (e.key !== "Escape" || isEditable(e.target) || (e.defaultPrevented && document.querySelector(escapeLayers))) return;
+      leavePage();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);

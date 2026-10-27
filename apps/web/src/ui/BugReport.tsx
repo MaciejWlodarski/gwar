@@ -10,7 +10,7 @@ import { controller, describeRequestError } from "../state/controller";
 import { useUi } from "../state/stores";
 import { cn } from "../lib/cn";
 import { useIsMobile } from "../lib/media";
-import { useEscapeBack } from "./hooks";
+import { leavePage, useEscapeBack } from "./hooks";
 import { Button, Field, IconButton, panelCard, Switch, Textarea, Tooltip } from "./kit";
 import { useVoicePill } from "./nav";
 import { VoicePill } from "./VoicePanel";
@@ -35,7 +35,6 @@ export function AlphaBadge() {
 export function BugReportSection({ card }: { card?: boolean }) {
   const t = useT();
   const isMobile = useIsMobile();
-  const close = useUi((s) => s.goBack);
   const setDrawer = useUi((s) => s.setDrawer);
   const pill = useVoicePill();
   const toast = useUi((s) => s.toast);
@@ -92,7 +91,7 @@ export function BugReportSection({ card }: { card?: boolean }) {
       const record = await loadConnectRecord().catch(() => undefined);
       const id = await connectApi.report({ text: text.trim(), diagnostics: withDiagnostics && diagnostics ? diagnostics : { app: { omitted: true } }, images }, record?.token);
       toast("success", t("report.sent", { id }));
-      if (useUi.getState().section === "bugReport") close();
+      if (useUi.getState().section === "bugReport") leavePage();
     } catch (err) {
       setError(describeRequestError(err));
       setBusy(false);
@@ -153,7 +152,7 @@ export function BugReportSection({ card }: { card?: boolean }) {
           <p className="text-xs text-subtle">{account ? t("report.privacyAccount", { handle: account.handle }) : t("report.privacy")}</p>
           {error && <p role="alert" className="text-sm text-danger">{error}</p>}
           <div className="flex justify-end gap-2 pt-1">
-            <Button onClick={close}>{t("common.cancel")}</Button>
+            <Button onClick={leavePage}>{t("common.cancel")}</Button>
             <Button variant="primary" busy={busy} disabled={!text.trim()} onClick={() => void send()}>{t("report.send")}</Button>
           </div>
         </div>

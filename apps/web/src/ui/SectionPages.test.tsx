@@ -132,12 +132,38 @@ describe("the settings page", () => {
     const input = container.querySelector("input")!;
     await act(async () => input.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
     expect(useUi.getState().section).toBe("settings");
-    const handled = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
-    handled.preventDefault();
-    await act(async () => window.dispatchEvent(handled));
+    // A popup (here a menu) took the key; a closing tooltip, which marks it handled too, does not count.
+    const handled = () => {
+      const e = new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true });
+      e.preventDefault();
+      return e;
+    };
+    const menu = document.body.appendChild(document.createElement("div"));
+    menu.setAttribute("role", "menu");
+    await act(async () => window.dispatchEvent(handled()));
     expect(useUi.getState().section).toBe("settings");
+    menu.remove();
+    await act(async () => window.dispatchEvent(handled()));
+    expect(useUi.getState().section).toBe("home");
+    await act(async () => useUi.getState().openSettings("identity"));
     await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
     expect(useUi.getState().section).toBe("home");
+  });
+
+  it("takes focus onto the open tab, and gives it back to the gear on Esc", async () => {
+    function Shell() {
+      const settings = useUi((s) => s.section === "settings");
+      return <><SectionRail />{settings && <SettingsSection />}</>;
+    }
+    await render(<Shell />);
+    const gear = byLabel("Settings")!;
+    gear.focus();
+    await click(gear);
+    expect(document.activeElement?.getAttribute("role")).toBe("tab");
+    expect(document.activeElement?.getAttribute("aria-selected")).toBe("true");
+    await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    expect(useUi.getState().section).toBe("servers");
+    expect(document.activeElement).toBe(gear);
   });
 });
 
