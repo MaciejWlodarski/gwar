@@ -91,6 +91,22 @@ allocation probe in the default matrix, and one VP9 release share is recorded as
 unrecovered. Judging by Chromium's `cpu` flag alone would also fail three busy runs encoded at 46–50 fps
 while the encoder needed about 18 ms per frame, before Chromium flagged the overload.
 
+**Review round 2 (27 October).** A restore that cannot be written within ten seconds
+of the lift now ends the transport (reported as failed) instead of retrying for ever,
+and `pagehide` cancels lifts and retries. The CPU rule changed: an average of 85 % of
+the frame interval per frame also matched an encoder idle half the time (15 ms frames
+at 30 fps), so a sample is now CPU-limited only when Chromium reports `cpu` or the
+encoder spent at least 0.8 s per second encoding over four seconds, and only `cpu`
+samples may be smaller than native. Replayed over the 641 default-matrix and 20
+release timelines still retained on GitHub (82 artifacts, 19–27 October), the rule
+fails five runs, the same five as the round-1 rule. Those are two stale startup estimates
+on branches without the probe (H.264 `40370486469`, VP9 `40353165175`, 480×270
+for the whole minute) and three H.264 busy shares adapted for `bandwidth` (`40225445809`,
+`40315496650`, `40415803712`). The release runs pass, with one VP9 share recorded as
+unrecovered. No default run makes an allocation probe. Chromium's `cpu` flag alone
+would fail three more busy runs on cadence (48–50 fps, encoder load 0.88–0.99), and
+a 0.9 threshold one more (46 fps, load 0.83–0.99).
+
 25 October 2026. Local macOS arm64, full Playwright Chromium 153.0.8010.12,
 WebKit, local SFU and real browser viewers. Main is pinned to
 `e8fb01e358ed6a5e6f855025c4417829ede379e1`; the previous candidate is

@@ -574,7 +574,12 @@ preference does not change. A lift carries its own deadline and generation, so a
 queued behind an earlier sender transaction, or retried after a late rejection, is
 dropped once its second has passed. The restore is pending until a write of the
 headroom cap succeeds: a rejected restore retries on its own timer (1 → 2 → 4 → 8 s),
-independent of stats polling, and no new lift starts meanwhile. Failed probes back off
+independent of stats polling, and no new lift starts meanwhile. A watchdog outside the
+write queue bounds it: if the cap is not back ten seconds after the lift (every write
+rejected, or one that never settles holding the queue), the publisher closes the
+transport and reports it failed, the same path as a failed connection, which ends the
+share with a notice. The share never keeps sending above its cap. A page going away
+(`pagehide`) cancels a lift and its restore retries. Failed probes back off
 10 → 20 → 40 → … → 300 s; a probe that raised the estimate by 25 % restarts the
 backoff. Busy content, which fills its cap, never qualifies; neither does a share
 already at native size. A close or codec recovery cancels a pending lift and restore;
@@ -612,13 +617,24 @@ shaper after 8 s and requires 1080p again (the stale estimate probe above).
 Settled intervals where the encoder is CPU-limited are recorded instead of failing
 the size and cadence checks: Chromium's single-threaded OpenH264 needs 12–20 ms per
 busy 1080p frame even on a 10-core Mac, and the 4-vCPU runner cannot keep libvpx at
-1080p60 next to capture, canvas and viewer decode. A sample is CPU-limited when
-Chromium reports `cpu`, or when the encoder needed at least 85 % of the frame
-interval per frame over the preceding two seconds (Chromium flags the overload tens
-of seconds late). Every other settled sample keeps the strict size and cadence
-checks; a share with CPU-limited samples must still have reached native size, and
-the viewer must always decode the encoded size at 75 % of the encoded cadence. The
-rules live in `e2e/screen-startup-judge.mjs` with unit tests run in the web job.
+1080p60 next to capture, canvas and viewer decode. The settled window is judged
+like this (`e2e/screen-startup-judge.mjs`, with unit tests in the web job):
+
+- *Size:* every settled sample must be at native size for source, encoder and
+  viewer, except samples where Chromium reports `cpu`. A `bandwidth` sample is never
+  excused, whatever the encoder's load.
+- *Cadence:* the median capture and encode cadence of the samples that are not
+  CPU-limited must hold 85 % of the expected rate. A sample is CPU-limited when
+  Chromium reports `cpu`, or when the encoder was saturated over the preceding four
+  seconds: at least 0.8 s of encode time per wall second. A share's frames are encoded
+  one at a time, so 1.0 is a fully busy encoder. Chromium flags the overload tens of
+  seconds late: on the runner OpenH264 encodes busy 1080p at 46–50 fps, 18 ms per
+  frame and 0.83–0.99 s per second, with the reason still `none`. Time per frame
+  alone is not overload: 15 ms frames at 30 fps leave the encoder idle half the time.
+- *Viewer:* at the last sample the viewer decodes the encoded size (±2 px); over the
+  window it decodes 75 % of the encoded frames, and 75 % of the expected rate when no
+  sample was CPU-limited.
+- A share with a CPU-limited sample must have reached native size at some point.
 The harness also counts allocation probes (the cap written back up to the spec's
 ceiling while 70 % of the estimate is below it): none on an open uplink, and no more
 than the backoff allows after a release or on a shaped link.

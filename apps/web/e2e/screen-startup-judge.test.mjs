@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { allocationProbes, cpuLimitedRows, judgeSettled, probeBound } from "./screen-startup-judge.mjs";
+import { allocationProbes, cpuLimitedRows, encoderLoad, judgeSettled, probeBound } from "./screen-startup-judge.mjs";
 
 const full = r => r.out?.frameWidth === 1920 && r.out?.frameHeight === 1080 && r.source?.width === 1920 && r.source?.height === 1080 && r.viewer?.width === 1920 && r.viewer?.height === 1080;
 
@@ -34,7 +34,7 @@ test("one CPU sample does not exempt a bandwidth-limited quarter-size window", (
   const rows = run({ at: t => t < 10 ? {} : { size: [960, 540], limitation: t === 50 ? "cpu" : "bandwidth" } });
   const verdict = judge(rows);
   assert.equal(verdict.cpuLimited, true);
-  assert.deepEqual(verdict.errors, ["source, encoder and viewer must recover to native size outside CPU-limited intervals"]);
+  assert.deepEqual(verdict.errors, ["source, encoder and viewer must recover to native size outside CPU adaptation"]);
 });
 
 test("a fully CPU-limited window is recorded once native size was reached", () => {
@@ -46,13 +46,30 @@ test("a fully CPU-limited window is recorded once native size was reached", () =
   assert.deepEqual(judge(never, { expectedFps: 60 }).errors, ["source, encoder and viewer must reach native size before any CPU adaptation"]);
 });
 
-test("encode time marks CPU-bound intervals Chromium has not flagged yet", () => {
-  // OpenH264 at 18 ms per frame against a 16.7 ms budget, reason still "none".
+test("a saturated encoder marks CPU-bound intervals Chromium has not flagged yet", () => {
+  // OpenH264 at 18 ms per frame encodes 48 fps: 0.86 s per second, reason still "none".
   const rows = run({ fps: 48, encodeMs: 18 });
-  assert.equal(cpuLimitedRows(rows, 60).size, rows.length - 4);
+  assert.ok(Math.abs(encoderLoad(rows).get(rows.at(-1)) - 0.864) < 1e-9);
+  assert.equal(cpuLimitedRows(rows).size, rows.length - 8); // a full four-second window first
   assert.deepEqual(judge(rows, { expectedFps: 60 }).errors, []);
   // Fast frames are not CPU-limited: their low cadence stays fatal.
   assert.deepEqual(judge(run({ fps: 48, encodeMs: 4 }), { expectedFps: 60 }).errors, ["captured source cadence 48", "encoded cadence 48"]);
+  // Nor is a short burst: two seconds of saturation inside an otherwise idle window.
+  const burst = run({ fps: 48, encodeMs: 4, at: t => t >= 56 && t < 58 ? { encodeMs: 20 } : {} });
+  assert.equal(cpuLimitedRows(burst).size, 0);
+});
+
+test("slow frames at a low cadence are not CPU saturation, and bandwidth never waives size", () => {
+  // Sol's round-2 repro: native first, then 960x540 with `bandwidth` and 15 ms frames, for 60 fps.
+  const quarter = (fps, encodeMs) => run({ fps: 60, at: t => t < 10 ? {} : { size: [960, 540], fps, encodeMs, limitation: "bandwidth" } });
+  // 15 ms frames at 30 fps keep the encoder busy 0.45 s per second.
+  const slow = judge(quarter(30, 15), { expectedFps: 60 });
+  assert.equal(slow.cpuLimited, false);
+  assert.deepEqual(slow.errors, ["viewer cadence 30", "captured source cadence 30", "encoded cadence 30", "source, encoder and viewer must recover to native size"]);
+  // At 60 fps the same frames saturate the encoder (0.9): its cadence would be waived, its size is not.
+  const busy = judge(quarter(60, 15), { expectedFps: 60 });
+  assert.equal(busy.cpuLimited, true);
+  assert.deepEqual(busy.errors, ["source, encoder and viewer must recover to native size"]);
 });
 
 test("the viewer must decode a CPU-limited output", () => {

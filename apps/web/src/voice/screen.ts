@@ -23,6 +23,8 @@ export const UPLINK_SHARE = 0.7;
 /** Below this the headroom rule stops lowering the cap: an estimate that low recovers by probing. */
 export const MIN_BITRATE = 250_000;
 const HEADROOM_INTERVAL_MS = 2_000;
+/** A lift's cap must be back this long after the lift (writes rejected or stuck in the queue), or the transport ends. */
+const RESTORE_DEADLINE_MS = 10_000;
 
 /** What the sharer picked, from the track's settings (Chromium and Safari report it). */
 export function surfaceOf(track: MediaStreamTrack): ScreenSurface {
@@ -629,6 +631,8 @@ export class ScreenPublisher {
   private probe = new StaleEstimateProbe();
   /** The pending lift's restore, or the next retry of a failed restore. */
   private probeTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Ends the transport if a lift's cap is not back by `RESTORE_DEADLINE_MS`; independent of the write queue. */
+  private restoreWatchdog: ReturnType<typeof setTimeout> | null = null;
   /** A lift's cap must still come back: set until a write of the headroom cap succeeds. */
   private restoring = false;
   private lift = 0;
@@ -645,8 +649,11 @@ export class ScreenPublisher {
   private sendCodec: RTCRtpCodec | null = null;
   private softwareAv1 = 0;
   private readonly ceiling: { width: number; height: number; known: boolean };
+  /** A page going away stops lifts and restore retries; its transport closes with it. */
+  private readonly pageHide = () => this.endProbe();
 
   constructor(private readonly params: PublishParams) {
+    globalThis.addEventListener?.("pagehide", this.pageHide);
     this.quality = { ...params.quality };
     this.automaticMode = params.automaticMode === true;
     const spec = this.spec();
@@ -944,6 +951,8 @@ export class ScreenPublisher {
   private endProbe(): void {
     if (this.probeTimer) clearTimeout(this.probeTimer);
     this.probeTimer = null;
+    if (this.restoreWatchdog) clearTimeout(this.restoreWatchdog);
+    this.restoreWatchdog = null;
     this.restoring = false;
     this.lift++;
   }
@@ -964,13 +973,22 @@ export class ScreenPublisher {
    * Chromium probes (up to twice its estimate) when the allocation rises past the estimate. The
    * lift is valid for one second from now: a write still queued behind an earlier transaction,
    * or a fallback retry after a rejection, past that deadline never runs. The headroom cap then
-   * comes back and keeps being retried until a write of it succeeds.
+   * comes back and keeps being retried until a write of it succeeds. A cap still not back after
+   * `RESTORE_DEADLINE_MS` (writes rejected or never settling) ends the transport, as a failed
+   * transport does: the share must not keep sending above its cap.
    */
   private liftCap(cap: number): void {
     const lift = ++this.lift, deadline = performance.now() + 1_000;
     this.restoring = true;
     void this.applyParameters(cap, () => this.lift === lift && performance.now() < deadline);
     this.probeTimer = setTimeout(() => this.restoreCap(lift, 1_000), 1_000);
+    this.restoreWatchdog = setTimeout(() => {
+      this.restoreWatchdog = null;
+      if (this.closed || !this.restoring) return;
+      console.warn("Screen sender: the bitrate cap could not be restored after a probe");
+      this.close();
+      this.params.state("failed");
+    }, RESTORE_DEADLINE_MS);
   }
 
   private restoreCap(lift: number, retry: number): void {
@@ -980,7 +998,7 @@ export class ScreenPublisher {
     if (this.lift === lift) this.lift++; // the lift is over, even if its write is still queued
     void this.applyParameters(headroomBitrate(this.spec().maxBitrate, this.available)).then(written => {
       if (this.closed || this.pc !== pc) { this.restoring = false; return; }
-      if (written) { this.restoring = false; return; }
+      if (written) { this.endProbe(); return; }
       this.probeTimer = setTimeout(() => this.restoreCap(lift, Math.min(8_000, retry * 2)), retry);
     });
   }
@@ -1051,6 +1069,7 @@ export class ScreenPublisher {
 
   close(): void {
     this.closed = true;
+    globalThis.removeEventListener?.("pagehide", this.pageHide);
     this.cancelPhase();
     this.endProbe();
     this.guard = new StuckCaptureGuard();

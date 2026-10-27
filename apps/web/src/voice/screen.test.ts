@@ -943,6 +943,58 @@ describe("publisher stale estimate probe", () => {
   });
 
   it.each([
+    ["rejected", () => Promise.reject(new Error("persistent"))],
+    ["never settling", () => new Promise<void>(() => {})],
+  ] as const)("ends the transport when every restore write is %s", async (_, write) => {
+    const state = vi.fn();
+    const publisher = new ScreenPublisher({ track: { applyConstraints: vi.fn(async () => {}) } as unknown as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state });
+    await publisher.start();
+    const pc = Peer.all[0]!; stale(pc); pc.connectionState = "connected";
+    const { writes, sender } = record(pc);
+    await vi.advanceTimersByTimeAsync(14_000);
+    expect(publisher.bitrate).toBe(8_000_000);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    sender.setParameters.mockImplementation(async (p: RTCRtpSendParameters) => { writes.push({ at: performance.now(), cap: p.encodings[0]!.maxBitrate }); return write(); });
+    await vi.advanceTimersByTimeAsync(2_000);
+    // A quality edit queued behind the stuck restore does not keep the transport alive.
+    void publisher.setSpec(TEST_SPECS.saver);
+    await vi.advanceTimersByTimeAsync(7_500);
+    expect(state).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(500);
+    // Ten seconds after the lift the transport ends, as a failed one does; nothing is written after it.
+    expect(state).toHaveBeenCalledWith("failed");
+    expect(pc.close).toHaveBeenCalled();
+    const count = writes.length;
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(writes).toHaveLength(count);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("stops restore retries when the page goes away", async () => {
+    const page = new EventTarget();
+    vi.stubGlobal("addEventListener", page.addEventListener.bind(page));
+    vi.stubGlobal("removeEventListener", page.removeEventListener.bind(page));
+    try {
+      const state = vi.fn();
+      const publisher = new ScreenPublisher({ track: { applyConstraints: vi.fn(async () => {}) } as unknown as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state });
+      await publisher.start();
+      const pc = Peer.all[0]!; stale(pc); pc.connectionState = "connected";
+      const { writes, sender } = record(pc);
+      await vi.advanceTimersByTimeAsync(14_000);
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      sender.setParameters.mockImplementation(async (p: RTCRtpSendParameters) => { writes.push({ at: performance.now(), cap: p.encodings[0]!.maxBitrate }); throw new Error("persistent"); });
+      pc.getStats.mockImplementation(() => new Promise(() => {}));
+      await vi.advanceTimersByTimeAsync(1_500);
+      page.dispatchEvent(new Event("pagehide"));
+      const count = writes.length;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(writes).toHaveLength(count);
+      expect(state).not.toHaveBeenCalled();
+      publisher.close(); expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
+  it.each([
     ["frozen", () => ({ framesEncoded: 1, bytesSent: 1 })],
     ["missing", () => ({ framesEncoded: undefined, bytesSent: undefined })],
   ] as const)("does not probe on %s send counters", async (_, out) => {
