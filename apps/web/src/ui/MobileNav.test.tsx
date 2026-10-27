@@ -358,6 +358,25 @@ describe("phone steps as browser history", () => {
     expect(history.left).toBe(true);
   });
 
+  it("after a reload an in-app way back rewrites the entry instead of going back, so Back shows that page once more", async () => {
+    await render(<Shell />);
+    await nav(() => ui().openSettings("audio"));
+    await reload();
+    const go = vi.spyOn(history, "go");
+    const length = history.length;
+    await nav(() => backInApp(() => ui().setSettingsDrill(false)));
+    // The reloaded entry is no entry of this load's: the step back rewrites it, it does not go back in history.
+    expect(go).not.toHaveBeenCalled();
+    expect(history.length).toBe(length);
+    expect(ui()).toMatchObject({ section: "settings", settingsDrill: false });
+    // The accepted cost: the entry below holds the same page, so the first Back shows it again.
+    await nav(() => history.back());
+    expect(ui()).toMatchObject({ section: "settings", settingsDrill: false });
+    await nav(() => history.back());
+    expect(ui().section).toBe("home");
+    expect(history.left).toBe(false);
+  });
+
   it("the More sheet is no entry: opening it and reloading, again and again, adds nothing", async () => {
     await render(<Shell />);
     await nav(() => ui().openSettings());

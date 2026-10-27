@@ -146,11 +146,14 @@ function restore(view: NavView): void {
 /*
  * Phones: each step back (a conversation and its members over the channel list, a page, a settings tab) is a history
  * entry of its own, holding its view, so the system's back takes the steps one at a time. The rules:
- * - popstate never navigates: it applies the view of the entry it lands on, checked field by field (else the base view);
+ * - popstate never navigates: a browser's back or forward applies the view of the entry it lands on, checked field by
+ *   field (else the base view); the popstate of our own `history.back()` applies nothing, the app already shows the
+ *   view it went back to, and only rewrites the entry it landed on to hold it;
  * - only an in-app way back (`backInApp`: a back button, Esc out of a page, a tab back to a section's top) goes back
  *   in history, one entry, and only from an entry this page load pushed: so it lands on this load's own entries or base;
  * - every other change pushes the steps it adds or rewrites the current entry;
- * - a load (a reload) shows the page its entry holds, under an id of its own.
+ * - a load (a reload) shows the page its entry holds, under an id of its own. Its entries are not this load's, so an
+ *   in-app way back from there rewrites the entry rather than going back: the next Back shows that page once more.
  * The desktop only applies the entries it lands on.
  */
 let mobile = false;
