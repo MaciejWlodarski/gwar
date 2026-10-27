@@ -12,7 +12,8 @@ import { TooltipProvider } from "./kit";
 import { useMembersPanel } from "./members";
 import { MoreSheet, TabBar } from "./MobileNav";
 import { BugReportSection } from "./BugReport";
-import { backDepth, navView, stepBack, useBackHistory } from "./nav";
+import { backInApp } from "./hooks";
+import { backDepth, navView, paneBack, readView, stepBack, useBackHistory } from "./nav";
 import { SettingsSection } from "./Settings";
 
 vi.mock("../state/controller", () => ({
@@ -157,19 +158,16 @@ describe("the settings list on a phone", () => {
 });
 
 describe("back on a phone", () => {
-  it("counts and takes the steps back: the sheet, the inner pages, then the page", () => {
+  it("counts and takes the steps back: a settings tab, the page, the members, the conversation", () => {
     const ui = () => navView(useUi.getState());
     useUi.getState().showChat();
     useUi.getState().setPane("members");
-    useUi.getState().setMore(true);
-    expect(backDepth(ui(), true)).toBe(3);
+    expect(backDepth(ui(), true)).toBe(2);
     const steps = [ui()];
-    for (let i = 0; i < 3; i++) steps.push(stepBack(steps[i]!, true));
-    expect(steps.map((v) => [v.moreOpen, v.pane])).toEqual([[true, "members"], [false, "members"], [false, "chat"], [false, "list"]]);
-    expect(stepBack(steps[3]!, true)).toBe(steps[3]);
-
+    for (let i = 0; i < 2; i++) steps.push(stepBack(steps[i]!, true));
+    expect(steps.map((v) => v.pane)).toEqual(["members", "chat", "list"]);
+    expect(stepBack(steps[2]!, true)).toBe(steps[2]);
     // A page counts the steps of the view it goes back to.
-    useUi.getState().setMore(false);
     useUi.getState().openSettings("audio");
     expect(backDepth(ui(), true)).toBe(4);
     expect(stepBack(stepBack(ui(), true), true)).toMatchObject({ section: "servers", pane: "members" });
@@ -178,14 +176,36 @@ describe("back on a phone", () => {
   });
 });
 
+describe("a history entry's view", () => {
+  const view = (v: unknown) => readView({ gwarNav: { id: "x", view: v } });
+
+  it("is rebuilt from the known fields, each from its own values", () => {
+    expect(readView(null)).toBeNull();
+    expect(readView({ gwarNav: "settings" })).toBeNull();
+    expect(view({ settingsTab: "audio" })).toBeNull();
+    expect(view({ section: "admin" })).toBeNull();
+    const full = { section: "settings", back: "home", pane: "chat", settingsTab: "language", settingsDrill: true };
+    expect(view(full)).toEqual(full);
+    // A retired or crafted tab is the first one; a page can't be where a page goes back to.
+    expect(view({ ...full, settingsTab: "retired-tab" })?.settingsTab).toBe("audio");
+    expect(view({ ...full, settingsTab: 'x"]???' })?.settingsTab).toBe("audio");
+    expect(view({ ...full, back: "settings", pane: "lobby", settingsDrill: "yes" })).toMatchObject({ back: "servers", pane: "list", settingsDrill: false });
+    // Nothing else comes along.
+    expect(Object.keys(view({ ...full, setSection: null, moreOpen: true, __proto__: { polluted: 1 } })!).sort()).toEqual(Object.keys(full).sort());
+  });
+});
+
 /**
  * Session history as a browser keeps it: a site before Gwar, then Gwar's entries. Back and Forward fire
- * popstate a moment later, as browsers do; going back past Gwar's first entry leaves the app.
+ * popstate a moment later, as browsers do; going back past Gwar's first entry leaves the app. It notes any
+ * navigation started while a popstate is being handled: there should be none.
  */
 class FakeHistory {
   entries: Array<{ state: unknown; gwar: boolean }> = [{ state: null, gwar: false }, { state: null, gwar: true }];
   at = 1;
   left = false;
+  inPopstate = false;
+  navigatedInPopstate = 0;
   get state() {
     return this.entries[this.at]!.state;
   }
@@ -200,11 +220,16 @@ class FakeHistory {
     this.entries[this.at]!.state = structuredClone(state);
   }
   go(delta: number) {
+    if (this.inPopstate) this.navigatedInPopstate++;
     const to = this.at + delta;
     if (delta === 0 || to < 0 || to >= this.entries.length) return;
     this.at = to;
     if (!this.entries[to]!.gwar) return void (this.left = true);
-    setTimeout(() => window.dispatchEvent(new PopStateEvent("popstate", { state: this.state })));
+    setTimeout(() => {
+      this.inPopstate = true;
+      window.dispatchEvent(new PopStateEvent("popstate", { state: this.state }));
+      this.inPopstate = false;
+    });
   }
   back() {
     this.go(-1);
@@ -220,11 +245,14 @@ describe("phone steps as browser history", () => {
     history = new FakeHistory();
     vi.spyOn(window, "history", "get").mockReturnValue(history as unknown as History);
   });
-  afterEach(() => vi.restoreAllMocks());
+  afterEach(() => {
+    expect(history.navigatedInPopstate).toBe(0);
+    vi.restoreAllMocks();
+  });
 
-  function Shell({ mobile = true }: { mobile?: boolean }) {
+  function Shell({ mobile = true, children }: { mobile?: boolean; children?: React.ReactNode }) {
     useBackHistory(mobile);
-    return null;
+    return <>{children}</>;
   }
   // Lets a popstate fire and its effects settle.
   const settle = () => act(async () => new Promise((r) => setTimeout(r, 5)));
@@ -233,8 +261,15 @@ describe("phone steps as browser history", () => {
     await settle();
   };
   const ui = () => useUi.getState();
+  const reload = async (node: React.ReactNode = <Shell />) => {
+    await act(async () => root.unmount());
+    useUi.setState({ section: "servers", back: "servers", settingsTab: "audio", settingsDrill: false, moreOpen: false, pane: "list" });
+    root = createRoot(container);
+    await render(node);
+    await settle();
+  };
 
-  it("Back and Forward restore the view they land on; Back from the base leaves", async () => {
+  it("Back and Forward apply the view they land on; Back from the base leaves", async () => {
     online(null);
     await render(<Shell />);
     await nav(() => ui().showChat());
@@ -242,7 +277,6 @@ describe("phone steps as browser history", () => {
     expect(history.at).toBe(3);
     await nav(() => history.back());
     expect(ui().pane).toBe("chat");
-    // Forward goes forward.
     await nav(() => history.forward());
     expect(ui().pane).toBe("members");
     await nav(() => history.back());
@@ -253,56 +287,68 @@ describe("phone steps as browser history", () => {
     expect(history.left).toBe(true);
   });
 
-  it("drops the entries the app's own way back leaves behind", async () => {
+  it("an in-app way back takes the entry this load pushed with it, one step", async () => {
     online(null);
     await render(<Shell />);
     await nav(() => ui().showChat());
     await nav(() => ui().setPane("members"));
-    await nav(() => ui().setSection("home"));
-    expect(history.at).toBe(1);
-    expect(ui()).toMatchObject({ section: "home", pane: "members" });
-    // Its Forward entries are still there to come back to.
+    await nav(() => paneBack("chat"));
+    expect([history.at, ui().pane]).toEqual([2, "chat"]);
+    await nav(() => paneBack("list"));
+    expect([history.at, ui().pane]).toEqual([1, "list"]);
+    // What it went back from is Forward of here.
     await nav(() => history.forward());
-    expect(ui()).toMatchObject({ section: "servers", pane: "chat" });
-  });
-
-  it("never leaves the app when the window is resized in the middle", async () => {
-    await render(<Shell />);
-    await nav(() => ui().setMore(true));
+    expect(ui().pane).toBe("chat");
+    // A tab back to a top from two steps in: one entry back, which now holds the top.
+    await nav(() => ui().setPane("members"));
+    await nav(() => backInApp(() => ui().setSection("home")));
     expect(history.at).toBe(2);
-    // The desktop closes the sheet; its Back lands on the entry below and restores it.
-    await render(<Shell mobile={false} />);
-    await nav(() => ui().setMore(false));
+    expect(readView(history.state)?.section).toBe("home");
     await nav(() => history.back());
-    await render(<Shell />);
-    await settle();
+    expect(ui()).toMatchObject({ section: "servers", pane: "list" });
     expect(history.left).toBe(false);
-    expect(history.at).toBe(1);
-    // A phone again with the sheet's entry still on top: it is dropped, nothing more.
-    await nav(() => ui().setMore(true));
-    await render(<Shell mobile={false} />);
-    await nav(() => ui().setMore(false));
-    await render(<Shell />);
-    await settle();
-    expect(history.left).toBe(false);
-    expect(history.at).toBe(1);
-    expect(ui().moreOpen).toBe(false);
   });
 
-  it("after a reload, takes over the entries left behind without navigating, and each Back still does something", async () => {
+  it("never goes back over an entry it did not push: a crafted one stays where it is", async () => {
+    online(null);
+    const go = vi.spyOn(history, "go");
+    await render(<Shell />);
+    // Another script's entry, claiming to be two steps in; the app's own steps go on top of it.
+    history.pushState({ gwarNav: { id: "foreign", index: 2, view: { section: "servers", pane: "list" } } });
+    await nav(() => ui().showChat());
+    expect(history.at).toBe(3);
+    await nav(() => history.back());
+    expect(ui().pane).toBe("list");
+    await nav(() => ui().showChat());
+    await nav(() => paneBack("list"));
+    await nav(() => backInApp(() => ui().setSection("home")));
+    expect([history.at, history.left, ui().section]).toEqual([2, false, "home"]);
+    expect(go.mock.calls.every(([delta]) => Math.abs(delta) === 1)).toBe(true);
+  });
+
+  it("takes only checked fields from an entry: no unknown tab, no store field from outside", async () => {
+    await render(<Shell><Page /></Shell>);
+    await nav(() => ui().openSettings());
+    const setSection = ui().setSection;
+    history.pushState({ gwarNav: { id: "x", view: { section: "settings", settingsTab: 'x"]???', settingsDrill: true, setSection: null } } });
+    history.pushState({ gwarNav: { id: "y", view: { section: "nowhere" } } });
+    await nav(() => history.back());
+    expect(ui()).toMatchObject({ section: "settings", settingsTab: "audio", settingsDrill: true });
+    expect(ui().setSection).toBe(setSection);
+    expect(container.querySelector("main header h2")?.textContent).toBe("Audio");
+    // An entry without a view of ours is the base view.
+    await nav(() => history.forward());
+    expect(ui()).toMatchObject({ section: "servers", pane: "list" });
+  });
+
+  it("a reload shows the page its entry holds, and Back goes through the earlier pages", async () => {
     await render(<Shell />);
     await nav(() => ui().openSettings("audio"));
-    expect(history.at).toBe(3);
-    // Reload: a new page load on the same entry, its UI back at the start.
-    await act(async () => root.unmount());
-    useUi.setState({ section: "home", back: "servers", settingsDrill: false, moreOpen: false, pane: "list" });
-    const go = vi.spyOn(history, "go");
-    root = createRoot(container);
-    await render(<Shell />);
-    await settle();
-    expect(go).not.toHaveBeenCalled();
-    expect(history.at).toBe(3);
     expect(history.length).toBe(4);
+    const go = vi.spyOn(history, "go");
+    await reload();
+    expect(go).not.toHaveBeenCalled();
+    expect(ui()).toMatchObject({ section: "settings", settingsTab: "audio", settingsDrill: true });
     await nav(() => history.back());
     expect(ui()).toMatchObject({ section: "settings", settingsDrill: false });
     await nav(() => history.back());
@@ -310,6 +356,41 @@ describe("phone steps as browser history", () => {
     expect(history.left).toBe(false);
     await nav(() => history.back());
     expect(history.left).toBe(true);
+  });
+
+  it("the More sheet is no entry: opening it and reloading, again and again, adds nothing", async () => {
+    await render(<Shell />);
+    await nav(() => ui().openSettings());
+    const length = history.length;
+    for (let i = 0; i < 3; i++) {
+      await nav(() => ui().setMore(true));
+      expect(history.length).toBe(length);
+      await reload();
+      expect(ui()).toMatchObject({ section: "settings", moreOpen: false });
+    }
+    expect(history.length).toBe(length);
+    // Back from it is the page below, and then the app is left.
+    await nav(() => ui().setMore(true));
+    await nav(() => history.back());
+    expect(ui()).toMatchObject({ section: "home", moreOpen: false });
+    await nav(() => history.back());
+    expect(history.left).toBe(true);
+  });
+
+  it("never navigates when the window is resized in the middle", async () => {
+    await render(<Shell />);
+    await nav(() => ui().openSettings("audio"));
+    await nav(() => ui().setMore(true));
+    // The desktop closes the sheet and only applies what Back lands on.
+    await render(<Shell mobile={false} />);
+    await nav(() => ui().setMore(false));
+    await nav(() => history.back());
+    expect(ui()).toMatchObject({ section: "settings", settingsDrill: false });
+    await nav(() => ui().setSection("home"));
+    const at = history.at;
+    await render(<Shell />);
+    await settle();
+    expect([history.at, history.left]).toEqual([at, false]);
   });
 
   it("leaves a page on Back as its own way back does, giving focus back to what opened it", async () => {
@@ -321,6 +402,28 @@ describe("phone steps as browser history", () => {
     await nav(() => history.back());
     expect(ui().section).toBe("home");
     expect(document.activeElement).toBe(opener);
+  });
+
+  it("focus follows the server panes on Back: the conversation's way back, then the open channel's row", async () => {
+    // The panes as the server section shows them on a phone, marked as the real ones are.
+    function Panes() {
+      const pane = useUi((s) => s.pane);
+      if (pane === "list") return <div role="tree"><div role="treeitem" tabIndex={0}>General</div><div role="treeitem" tabIndex={0} data-entry>Lobby</div></div>;
+      if (pane === "chat") return <main><button data-entry>Back to channels</button><textarea /></main>;
+      return <aside><button data-entry>Back</button></aside>;
+    }
+    online(null);
+    await render(<Shell><Panes /></Shell>);
+    await nav(() => ui().showChat());
+    await nav(() => ui().setPane("members"));
+    await nav(() => history.back());
+    expect(document.activeElement?.textContent).toBe("Back to channels");
+    await nav(() => history.back());
+    expect(document.activeElement?.textContent).toBe("Lobby");
+    // The in-app buttons go the same way.
+    await nav(() => history.forward());
+    await nav(() => paneBack("list"));
+    expect(document.activeElement?.textContent).toBe("Lobby");
   });
 });
 

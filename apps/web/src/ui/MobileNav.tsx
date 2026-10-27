@@ -4,7 +4,7 @@ import { useRef, useState, type PointerEvent } from "react";
 import { useT, type Key } from "../i18n";
 import { cn } from "../lib/cn";
 import { profileTabs, useUi, type Section } from "../state/stores";
-import { focusPage } from "./hooks";
+import { backInApp, focusPage } from "./hooks";
 import { useInVoice, useServerUnread } from "./nav";
 
 /** Every section of the app as the phone shows it, in the tab bar or as a tile in More. */
@@ -23,18 +23,21 @@ const TILES: ReadonlyArray<{ id: string; label: Key; icon: LucideIcon; section: 
   ...(Object.keys(SECTIONS) as Section[])
     .filter((section) => !PINNED.includes(section))
     .map((section) => ({ id: section, ...SECTIONS[section], section, open: () => openSection(section) })),
-  { id: "profile", label: "nav.profile", icon: UserRound, section: "settings", open: () => useUi.getState().openSettings("identity") },
+  { id: "profile", label: "nav.profile", icon: UserRound, section: "settings", open: () => backInApp(() => useUi.getState().openSettings("identity")) },
 ];
 
 /** The tab bar's height without the safe area below it; the More sheet sits just above. */
 const BAR = "58px";
 
+/** A tab or a tile: to the section's top, as a way back when it is less deep than where the app is. */
 function openSection(section: Section) {
   const ui = useUi.getState();
-  if (section === "settings") ui.openSettings();
-  // Tapping Servers again goes back to the channel list, as a tab bar's tab returns to its top.
-  else if (section === "servers" && ui.section === "servers") ui.setPane("list");
-  else ui.setSection(section);
+  backInApp(() => {
+    if (section === "settings") ui.openSettings();
+    // Tapping Servers again goes back to the channel list, as a tab bar's tab returns to its top.
+    else if (section === "servers" && ui.section === "servers") ui.setPane("list");
+    else ui.setSection(section);
+  });
 }
 
 function Tab({ label, icon: Icon, current, onClick, badge = 0, voice, more }: { label: string; icon: LucideIcon; current: boolean; onClick: () => void; badge?: number; voice?: boolean; more?: boolean }) {

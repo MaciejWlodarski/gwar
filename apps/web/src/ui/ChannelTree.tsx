@@ -165,6 +165,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           aria-expanded={expandable ? !collapsed : undefined}
           aria-selected={selected}
           aria-current={current ? "true" : undefined}
+          data-entry={selected || undefined}
           data-treeitem
           tabIndex={0}
           onClick={select}

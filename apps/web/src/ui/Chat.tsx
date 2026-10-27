@@ -24,6 +24,7 @@ import { AttachmentList } from "./Attachments";
 import { ConnectBadge, MentionBadge, UnreadBadge } from "./badges";
 import { useChannelPermission, useRoster, useUidColor } from "./hooks";
 import { useMembersPanel } from "./members";
+import { paneBack } from "./nav";
 import { useMentionAutocomplete } from "./MentionInput";
 import { DeafenButton, MicButton } from "./VoicePanel";
 import { Avatar, BackButton, Button, EmptyState, IconButton, panelCard, Spinner, Tooltip } from "./kit";
@@ -1068,7 +1069,6 @@ function ChatHeader() {
   const lang = useLanguage();
   const isMobile = useIsMobile();
   const active = useSession((s) => s.activeThread);
-  const setPane = useUi((s) => s.setPane);
   const server = useSession((s) => s.server);
   const phase = useSession((s) => s.phase);
   const viewChannel = useSession((s) => s.viewChannel);
@@ -1102,7 +1102,7 @@ function ChatHeader() {
 
   return (
     <header className="flex h-12 shrink-0 items-center gap-2 border-b border-line px-3 md:px-4">
-      {isMobile && <BackButton label={t("nav.toChannels")} onClick={() => setPane("list")} />}
+      {isMobile && <BackButton label={t("nav.toChannels")} entry onClick={() => paneBack("list")} />}
       {icon}
       <div className="min-w-0 flex-1">
         <h2 className="truncate text-[15px] leading-tight font-semibold">{title}</h2>

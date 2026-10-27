@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { flushSync } from "react-dom";
 import { isMobileNow } from "../lib/media";
 import { sameServer } from "../lib/server-key";
@@ -8,7 +8,7 @@ import { myChannelId, totalDmUnread } from "../state/reducer";
 import type { Bookmark, ServerGroup } from "../state/settings";
 import { useSession, useUi, type Section, type ServerPane, type SettingsTab } from "../state/stores";
 import type { ChatItem } from "../state/types";
-import { exitPage, focusPage } from "./hooks";
+import { backInApp, exitPage, focusPage, setBackHandler } from "./hooks";
 
 /** Unread messages on the connected server, private conversations included. */
 export function useServerUnread(): number {
@@ -46,162 +46,196 @@ export function showVoiceChannel(): void {
   if (isMobileNow()) useUi.getState().setPane("list");
 }
 
-/** Where the app is, as far as its steps back go: what a history entry keeps. */
+/** Where the app is, as far as its steps back go: what a history entry keeps. Not the More sheet: it is no step of its own. */
 export interface NavView {
   section: Section;
   back: Section;
   pane: ServerPane;
   settingsTab: SettingsTab;
   settingsDrill: boolean;
-  moreOpen: boolean;
 }
 
-export const navView = ({ section, back, pane, settingsTab, settingsDrill, moreOpen }: NavView): NavView => ({ section, back, pane, settingsTab, settingsDrill, moreOpen });
+export const navView = ({ section, back, pane, settingsTab, settingsDrill }: NavView): NavView => ({ section, back, pane, settingsTab, settingsDrill });
 
 const isPage = (section: Section) => section === "settings" || section === "bugReport";
 
 /**
- * The view one step back on a phone: the More sheet closes, then a settings tab goes back to the list of tabs,
- * a page to the section it was opened from, the members to their conversation and that to the channel list.
+ * The view one step back on a phone: a settings tab goes back to the list of tabs, a page to the section it was
+ * opened from, the members to their conversation and that to the channel list.
  */
 export function stepBack(v: NavView, connected: boolean): NavView {
-  if (v.moreOpen) return { ...v, moreOpen: false };
   if (v.section === "settings" && v.settingsDrill) return { ...v, settingsDrill: false };
   if (isPage(v.section)) return { ...v, section: v.back };
   if (v.section === "servers" && connected && v.pane !== "list") return { ...v, pane: v.pane === "members" ? "chat" : "list" };
   return v;
 }
 
-/** How many steps back a view is from the app's base (a top section's top page). */
+/** How many steps back a view is from its base (a top section's top page). */
 export function backDepth(v: NavView, connected: boolean): number {
   let depth = 0;
   for (let at = v, back = stepBack(at, connected); back !== at; at = back, back = stepBack(at, connected)) depth++;
   return depth;
 }
 
-/** A history entry of Gwar's: which page load wrote it, how many steps back it is, and its view. */
-interface NavEntry {
-  id: string;
-  index: number;
-  view: NavView;
-}
+const baseOf = (v: NavView, connected: boolean): NavView => {
+  for (let back = stepBack(v, connected); back !== v; v = back, back = stepBack(v, connected));
+  return v;
+};
 
 const KEY = "gwarNav";
 const SECTIONS: readonly Section[] = ["home", "servers", "settings", "bugReport"];
+const TOP: readonly Section[] = ["home", "servers"];
 const PANES: readonly ServerPane[] = ["list", "chat", "members"];
+const TABS = Object.keys({ audio: 1, notifications: 1, appearance: 1, identity: 1, account: 1, language: 1 } satisfies Record<SettingsTab, 1>) as SettingsTab[];
 
-/** Gwar's entry in a history state, if it has a valid one (it may come from an earlier version). */
-function entryOf(state: unknown): NavEntry | null {
-  const e = (state as { [KEY]?: Partial<NavEntry> } | null)?.[KEY];
-  const v = e?.view;
-  const valid =
-    typeof e?.id === "string" && Number.isInteger(e.index) && e.index! >= 0 && !!v &&
-    SECTIONS.includes(v.section) && SECTIONS.includes(v.back) && !isPage(v.back) && PANES.includes(v.pane) &&
-    typeof v.settingsTab === "string" && typeof v.settingsDrill === "boolean" && typeof v.moreOpen === "boolean";
-  return valid ? (e as NavEntry) : null;
+const isObject = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
+const oneOf = <T extends string>(value: unknown, allowed: readonly T[]): T | undefined => (allowed as readonly unknown[]).includes(value) ? (value as T) : undefined;
+
+/**
+ * The view a history state holds, rebuilt from the known fields only (anything may be in there: an older version's,
+ * another script's, a crafted one). None without a known section; a retired settings tab becomes the first one.
+ */
+export function readView(state: unknown): NavView | null {
+  const nav = isObject(state) ? state[KEY] : undefined;
+  const v = isObject(nav) ? nav.view : undefined;
+  const section = isObject(v) ? oneOf(v.section, SECTIONS) : undefined;
+  if (!isObject(v) || !section) return null;
+  return {
+    section,
+    back: oneOf(v.back, TOP) ?? "servers",
+    pane: oneOf(v.pane, PANES) ?? "list",
+    settingsTab: oneOf(v.settingsTab, TABS) ?? "audio",
+    settingsDrill: v.settingsDrill === true,
+  };
 }
 
-function write(push: boolean, entry: NavEntry): void {
+const entryId = (state: unknown): string | null => {
+  const nav = isObject(state) ? state[KEY] : undefined;
+  return isObject(nav) && typeof nav.id === "string" ? nav.id : null;
+};
+const newId = () => Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, "0")).join("");
+
+/** Writes a view to the current entry (keeping what else it holds) or to a new one; returns the entry's id. */
+function write(push: boolean, view: NavView, id = newId()): string {
   const state = window.history.state as unknown;
-  // Keep whatever else the entry holds; a new entry holds only ours.
-  const others = !push && state && typeof state === "object" && !Array.isArray(state) ? state : {};
   try {
-    if (push) window.history.pushState({ [KEY]: entry }, "");
-    else window.history.replaceState({ ...others, [KEY]: entry }, "");
+    if (push) window.history.pushState({ [KEY]: { id, view } }, "");
+    else window.history.replaceState({ ...(isObject(state) ? state : {}), [KEY]: { id, view } }, "");
   } catch {
     // Browsers limit how often these may be called; the next change writes again.
   }
+  return id;
 }
 
-const loadId = () => Array.from(crypto.getRandomValues(new Uint8Array(8)), (b) => b.toString(16).padStart(2, "0")).join("");
 const isConnected = () => ["online", "reconnecting"].includes(useSession.getState().phase);
 
-/** Applies a history entry's view: leaving a page gives focus back as its own way back does, opening one moves focus in. */
-function restore(view: NavView): void {
-  const was = useUi.getState().section;
-  const apply = () => useUi.setState(view);
-  if (isPage(was) && !isPage(view.section)) exitPage(apply);
-  else if (!isPage(was) && isPage(view.section)) {
-    flushSync(apply);
-    focusPage();
-  } else apply();
-}
-
 /**
- * Phones: every step back (the More sheet, the conversation and its members, a page, a settings tab) is a
- * history entry of its own, so the system's back takes them one at a time and leaves the app only from its
- * base. Each entry carries its view and how many steps back it is, so Back and Forward restore the view they
- * land on; the app's own way back drops the entries it leaves behind. Only entries known to be Gwar's are
- * ever gone back over, and the app never navigates by itself on load. Exported for tests.
+ * Applies a view: leaving a page gives focus back as its own way back does, a page or a server pane shown
+ * anew takes it (the open tab, the open channel's row, the conversation's way back). Never the More sheet.
  */
-export function historyNav(id = loadId()) {
-  let mobile = false;
-  // Our own `history.go`, until its popstate comes.
-  let pending = false;
-
-  const sync = () => {
-    if (!mobile || pending) return;
-    const connected = isConnected();
-    const view = navView(useUi.getState());
-    const depth = backDepth(view, connected);
-    const entry = entryOf(window.history.state);
-    const at = entry?.index ?? 0;
-    if (depth < at) {
-      // Gone back in the app: drop the entries above. They are Gwar's, as each index counts the ones below it.
-      pending = true;
-      window.history.go(depth - at);
-      return;
-    }
-    if (depth === at && entry?.id === id && JSON.stringify(entry.view) === JSON.stringify(view)) return;
-    const views = [view];
-    for (let i = depth; i > at; i--) views.unshift(stepBack(views[0]!, connected));
-    write(false, { id, index: at, view: views[0]! });
-    views.slice(1).forEach((v, i) => write(true, { id, index: at + 1 + i, view: v }));
-  };
-
-  return {
-    /** On load: the entry it was loaded on becomes this load's base. One left by an earlier load (a reload) is taken over as is. */
-    start() {
-      if (entryOf(window.history.state)?.id === id) return;
-      const connected = isConnected();
-      let view = navView(useUi.getState());
-      for (let back = stepBack(view, connected); back !== view; view = back, back = stepBack(view, connected));
-      write(false, { id, index: 0, view });
-      sync();
-    },
-    setMobile(on: boolean) {
-      mobile = on;
-      sync();
-    },
-    sync,
-    onPop(e: PopStateEvent) {
-      if (pending) {
-        pending = false;
-        return sync();
-      }
-      const entry = entryOf(e.state);
-      // Not Gwar's: nothing of ours to restore.
-      if (!entry) return;
-      // An earlier load's step (Back after a reload) is restored and adopted, so it stays a step that does something.
-      if (entry.id !== id) write(false, { ...entry, id });
-      restore(entry.view);
-      sync();
-    },
-  };
+function restore(view: NavView): void {
+  const ui = useUi.getState();
+  const apply = () => useUi.setState({ ...navView(view), moreOpen: false });
+  if (isPage(ui.section) && !isPage(view.section)) return exitPage(apply);
+  const moved = isPage(view.section) ? view.section !== ui.section : view.section === "servers" && ui.section === "servers" && view.pane !== ui.pane;
+  if (!moved) return apply();
+  flushSync(apply);
+  focusPage();
 }
 
-/** The phone's steps back as browser history entries (see `historyNav`); the desktop only restores entries it lands on. */
-export function useBackHistory(mobile: boolean): void {
-  const [nav] = useState(() => historyNav());
+/*
+ * Phones: each step back (a conversation and its members over the channel list, a page, a settings tab) is a history
+ * entry of its own, holding its view, so the system's back takes the steps one at a time. The rules:
+ * - popstate never navigates: it applies the view of the entry it lands on, checked field by field (else the base view);
+ * - only an in-app way back (`backInApp`: a back button, Esc out of a page, a tab back to a section's top) goes back
+ *   in history, one entry, and only from an entry this page load pushed: so it lands on this load's own entries or base;
+ * - every other change pushes the steps it adds or rewrites the current entry;
+ * - a load (a reload) shows the page its entry holds, under an id of its own.
+ * The desktop only applies the entries it lands on.
+ */
+let mobile = false;
+/** Entries this page load pushed: the only ones an in-app way back goes back over. */
+let pushed = new Set<string>();
+/** Our own `history.back()`, until its popstate comes. */
+let pending = false;
+/** An in-app way back is being applied: a sync it causes (an effect of a `flushSync`) may take the step. */
+let goingBack = false;
+
+function sync(mayGoBack: boolean): void {
+  if (!mobile || pending) return;
+  mayGoBack ||= goingBack;
+  const connected = isConnected();
+  const view = navView(useUi.getState());
+  const depth = backDepth(view, connected);
+  const at = readView(window.history.state);
+  const atDepth = at ? backDepth(at, connected) : 0;
+  const id = entryId(window.history.state);
+  if (mayGoBack && depth < atDepth && id !== null && pushed.has(id)) {
+    pending = true;
+    window.history.back();
+    return;
+  }
+  if (depth <= atDepth) {
+    if (id === null || JSON.stringify(at) !== JSON.stringify(view)) write(false, view, id ?? undefined);
+    return;
+  }
+  const views = [view];
+  for (let i = depth; i > atDepth; i--) views.unshift(stepBack(views[0]!, connected));
+  write(false, views[0]!, id ?? undefined);
+  for (const v of views.slice(1)) pushed.add(write(true, v));
+}
+
+setBackHandler((apply) => {
+  goingBack = true;
+  try {
+    apply();
+  } finally {
+    goingBack = false;
+  }
+  sync(true);
+});
+
+function onPop(e: PopStateEvent): void {
+  if (pending) {
+    // Where our own step back landed: it now holds the view the app went back to.
+    pending = false;
+    return sync(false);
+  }
+  restore(readView(e.state) ?? baseOf(navView(useUi.getState()), isConnected()));
+  sync(false);
+}
+
+/** On load: the entry's page is shown again (phones; the More sheet stays closed), and the entry becomes this load's. */
+function start(): void {
+  pushed = new Set();
+  pending = false;
+  const stored = readView(window.history.state);
+  if (stored && isMobileNow()) useUi.setState({ ...navView(stored), moreOpen: false });
+  write(false, navView(useUi.getState()));
+}
+
+/** Server panes: one step back to `pane`, focus onto what it shows (the open channel's row, the conversation's way back). */
+export function paneBack(pane: ServerPane): void {
+  backInApp(() => {
+    flushSync(() => useUi.getState().setPane(pane));
+    focusPage();
+  });
+}
+
+/** The phone's steps back as browser history entries (see above). */
+export function useBackHistory(isMobile: boolean): void {
   const view = useUi((ui) => JSON.stringify(navView(ui)));
   const connected = useSession((s) => s.phase === "online" || s.phase === "reconnecting");
   useEffect(() => {
-    window.addEventListener("popstate", nav.onPop);
-    return () => window.removeEventListener("popstate", nav.onPop);
-  }, [nav]);
-  useEffect(() => nav.start(), [nav]);
-  useEffect(() => nav.setMobile(mobile), [nav, mobile]);
-  useEffect(() => nav.sync(), [nav, view, connected]);
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+  useEffect(() => start(), []);
+  useEffect(() => {
+    mobile = isMobile;
+    sync(false);
+  }, [isMobile]);
+  useEffect(() => sync(false), [view, connected]);
 }
 
 /** Whether a saved server is the one this session is on, and opening one (connecting unless it is). */

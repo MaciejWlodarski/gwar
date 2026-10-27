@@ -16,7 +16,7 @@ import type { ChatItem } from "../state/types";
 import { TeamSpeakBadge, TsIcon, UnreadBadge } from "./badges";
 import { useChannelPermission, usePermission } from "./hooks";
 import { Avatar, BackButton, Button, TalkingAvatar, panelCard } from "./kit";
-import { newsworthy, stillHeld } from "./nav";
+import { newsworthy, paneBack, stillHeld } from "./nav";
 import { LiveBadge } from "./Screen";
 
 /** How many people the overview names before "and N more". */
@@ -144,7 +144,6 @@ export function Overview({ card }: { card?: boolean }) {
   const t = useT();
   const lang = useLanguage();
   const isMobile = useIsMobile();
-  const setPane = useUi((s) => s.setPane);
   const openDialog = useUi((s) => s.openDialog);
   const server = useSession((s) => s.server);
   const kind = useSession((s) => s.kind);
@@ -202,7 +201,7 @@ export function Overview({ card }: { card?: boolean }) {
   return (
     <main className={cn("relative flex min-w-0 flex-1 flex-col bg-surface", card && panelCard)}>
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-line px-3 md:px-4">
-        {isMobile && <BackButton label={t("nav.toChannels")} onClick={() => setPane("list")} />}
+        {isMobile && <BackButton label={t("nav.toChannels")} entry onClick={() => paneBack("list")} />}
         <LayoutDashboard className="size-5 text-subtle" />
         <div className="min-w-0 flex-1">
           <h2 className="truncate text-[15px] leading-tight font-semibold">{t("overview.title")}</h2>

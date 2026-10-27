@@ -948,17 +948,27 @@ async function main() {
     const members = m.getByRole("complementary", { name: "Members", exact: true });
     await memberSection(m, "In voice").getByText("Carol").waitFor();
     await shot(m, "m5-members-dark");
+    // Each way back puts focus on what is shown: the conversation's way back, then the open channel's row.
+    const focused = (test) => waitFor(() => m.evaluate(test), "focus after a way back", 5000);
+    const onBackToChannels = () => document.activeElement?.getAttribute("aria-label") === "Back to channels";
+    const onRow = (name) => focused(new Function(`return document.activeElement?.getAttribute("role") === "treeitem" && document.activeElement.textContent.includes(${JSON.stringify(name)})`));
     await members.getByRole("button", { name: "Back", exact: true }).click();
     await members.waitFor({ state: "detached" });
+    await focused(onBackToChannels);
     await m.getByRole("button", { name: "Back to channels", exact: true }).click();
     await tabBar.waitFor();
-    await treeItem(m, GAMES).waitFor();
+    await onRow(GAMES);
     // The system's back goes the same way.
     await treeItem(m, GAMES).click();
     await tabBar.waitFor({ state: "detached" });
+    await m.getByRole("button", { name: "Members", exact: true }).click();
+    await members.waitFor();
+    await m.evaluate(() => history.back());
+    await members.waitFor({ state: "detached" });
+    await focused(onBackToChannels);
     await m.evaluate(() => history.back());
     await tabBar.waitFor();
-    await treeItem(m, GAMES).waitFor();
+    await onRow(GAMES);
   });
   const sheet = m.getByRole("dialog", { name: "More", exact: true });
   // The sheet slides in: wait for it to stand still before a screenshot or a swipe on its handle.
@@ -1067,38 +1077,72 @@ async function main() {
   await shot(m, "13-mobile-light-chat");
   await m.getByRole("button", { name: "Back to channels", exact: true }).click();
   await shot(m, "14-mobile-light-servers");
-  await check("phones: the browser's Back and Forward, a resize and a reload keep to the app's own steps", async () => {
+  await check("phones: the browser's Back and Forward, a reload, a crafted entry and resizes keep to the app's own steps", async () => {
     // A context of its own: nothing remembered, so nothing connects.
     const ctxR = await newCtx({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
     const r = await ctxR.newPage();
+    const errors = [];
+    r.on("pageerror", (e) => errors.push(e.message));
     await r.goto(WEB_URL);
     const rSheet = r.getByRole("dialog", { name: "More", exact: true });
     const settings = r.getByRole("main", { name: "Settings" });
     const audio = settings.getByRole("heading", { name: "Audio", exact: true, level: 2 });
+    const audioRow = settings.getByRole("button", { name: /^Audio/ });
+    const length = () => r.evaluate(() => history.length);
     const still = async (what) => {
       await sleep(300);
       if (!r.url().startsWith(WEB_URL)) throw new Error(`${what}: left the app for ${r.url()}`);
     };
-    await sectionTab(r, "More").click();
-    await rSheet.waitFor();
-    await rSheet.getByRole("button", { name: "Settings", exact: true }).click();
-    await settings.getByRole("button", { name: /^Audio/ }).click();
+    const openSettings = async () => {
+      await sectionTab(r, "More").click();
+      await rSheet.waitFor();
+      await rSheet.getByRole("button", { name: "Settings", exact: true }).click();
+      await settings.waitFor();
+    };
+    await openSettings();
+    await audioRow.click();
     await audio.waitFor();
     // Back, then Forward: forward again, not another step back.
     await r.evaluate(() => history.back());
     await audio.waitFor({ state: "detached" });
     await r.evaluate(() => history.forward());
     await audio.waitFor();
-    // A reload starts afresh on the same entry without navigating; Back then goes through the steps left behind.
+    // A reload shows the same page again without navigating; Back then goes through the earlier pages.
+    const before = await length();
     await r.reload();
-    await r.getByLabel("Server address").waitFor();
+    await audio.waitFor();
     await still("reload");
+    // The More sheet is no entry: opening it and reloading, three times over, adds none and leaves none to step through.
+    for (let i = 0; i < 3; i++) {
+      await sectionTab(r, "More").click();
+      await rSheet.waitFor();
+      await r.reload();
+      await audio.waitFor();
+      if ((await rSheet.count()) !== 0) throw new Error("the More sheet came back with a reload");
+    }
+    if ((await length()) !== before) throw new Error(`history grew from ${before} to ${await length()}`);
     await r.evaluate(() => history.back());
-    await settings.getByRole("button", { name: /^Audio/ }).waitFor();
+    await audioRow.waitFor();
     await r.evaluate(() => history.back());
     await settings.waitFor({ state: "detached" });
-    await still("back after the reload");
-    // The sheet open, the window wide (the desktop closes it), Back, then narrow again: still in the app.
+    await r.getByLabel("Server address").waitFor();
+    await still("back after the reloads");
+    // An entry another script made, claiming to be deep in, with a crafted tab and a store field: it shows a sane
+    // page, and the app's own way back from it stays where it is.
+    await r.evaluate(() => history.pushState({ gwarNav: { id: "crafted", index: 2, view: { section: "settings", settingsTab: 'x"]???', settingsDrill: true, setSection: null } } }, ""));
+    await r.evaluate(() => history.back());
+    await sleep(200);
+    await r.evaluate(() => history.forward());
+    await audio.waitFor();
+    await r.keyboard.press("Escape");
+    await audioRow.waitFor();
+    await r.keyboard.press("Escape");
+    await settings.waitFor({ state: "detached" });
+    await still("the way back from a crafted entry");
+    await openSettings();
+    await audioRow.waitFor();
+    if (errors.length) throw new Error(`page errors: ${errors.join("; ")}`);
+    // A page and the sheet open, the window wide (the desktop closes the sheet), Back, then narrow again: still in the app.
     await sectionTab(r, "More").click();
     await rSheet.waitFor();
     await r.setViewportSize({ width: 1280, height: 800 });
@@ -1106,12 +1150,11 @@ async function main() {
     await r.evaluate(() => history.back());
     await r.setViewportSize({ width: 390, height: 844 });
     await still("resize");
-    await sectionTab(r, "More").click();
-    await rSheet.waitFor();
+    await openSettings();
     await r.setViewportSize({ width: 1280, height: 800 });
     await r.setViewportSize({ width: 390, height: 844 });
     await still("resize without back");
-    await r.getByLabel("Server address").waitFor();
+    await settings.waitFor();
     await ctxR.close();
   });
 

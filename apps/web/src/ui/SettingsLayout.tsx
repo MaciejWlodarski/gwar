@@ -6,7 +6,7 @@ import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { useIsMobile } from "../lib/media";
 import { useUi } from "../state/stores";
-import { leavePage, useEscapeBack } from "./hooks";
+import { backInApp, leavePage, useEscapeBack } from "./hooks";
 import { BackButton, IconButton, panelCard } from "./kit";
 import { useVoicePill } from "./nav";
 import { VoicePill } from "./VoicePanel";
@@ -186,13 +186,14 @@ function SettingsPageList<T extends string>({ title, icon, pages, value, onValue
   const setDrill = useUi((s) => s.setSettingsDrill);
   const current = pages.find((p) => p.id === value);
   const main = useRef<HTMLElement>(null);
-  useEscapeBack(() => (useUi.getState().settingsDrill ? setDrill(false) : leavePage()));
+  useEscapeBack(() => (useUi.getState().settingsDrill ? backInApp(() => setDrill(false)) : leavePage()));
   // Focus follows: onto the open page's way back, or back onto its row of the list.
   const opened = useRef(false);
   useEffect(() => {
     if (!opened.current && !drill) return void (opened.current = true);
     opened.current = true;
-    main.current?.querySelector<HTMLElement>(drill ? "header button" : `[data-page="${value}"]`)?.focus();
+    const rows = [...(main.current?.querySelectorAll<HTMLElement>("[data-page]") ?? [])];
+    (drill ? main.current?.querySelector<HTMLElement>("header button") : rows.find((row) => row.dataset.page === value))?.focus();
   }, [drill, value]);
   const groups = [...new Set(pages.map((p) => p.group ?? 0))].map((g) => pages.filter((p) => (p.group ?? 0) === g));
   return (
@@ -200,7 +201,7 @@ function SettingsPageList<T extends string>({ title, icon, pages, value, onValue
       {drill && current ? (
         <>
           <header className="flex h-12 shrink-0 items-center gap-1 border-b border-line px-3">
-            <BackButton text entry onClick={() => setDrill(false)} />
+            <BackButton text entry onClick={() => backInApp(() => setDrill(false))} />
             <h2 className="min-w-0 truncate text-[15px] font-semibold">{current.label}</h2>
           </header>
           <div className={cn("min-h-0 flex-1 overflow-y-auto px-4 py-5", pill && "pb-20")}>{children(current.id)}</div>

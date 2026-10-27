@@ -126,7 +126,7 @@ export function MemberList({ className, card, onBack }: { className?: string; ca
   return (
     <aside aria-label={t("chat.members")} className={cn("flex h-full flex-col bg-side", onBack ? "min-w-0 flex-1" : "w-60 shrink-0", card ? panelCard : !onBack && "border-l border-line", className)}>
       <header className={cn("flex h-12 shrink-0 items-center gap-1 border-b border-line", onBack ? "px-3" : "px-4")}>
-        {onBack && <BackButton onClick={onBack} />}
+        {onBack && <BackButton entry onClick={onBack} />}
         <h2 className="text-[15px] font-semibold">{t("members.title")}</h2>
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto pb-3">

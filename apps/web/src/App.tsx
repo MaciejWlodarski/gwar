@@ -18,7 +18,7 @@ import { useMembersPanel } from "./ui/members";
 import { Home } from "./ui/Home";
 import { Overview } from "./ui/Overview";
 import { MoreSheet, TabBar } from "./ui/MobileNav";
-import { useBackHistory, useServerUnread } from "./ui/nav";
+import { paneBack, useBackHistory, useServerUnread } from "./ui/nav";
 import { SectionRail } from "./ui/SectionRail";
 import { ServerRail } from "./ui/ServerRail";
 import { SettingsSection } from "./ui/Settings";
@@ -39,7 +39,6 @@ export function App() {
   // With a share on stage the stage wins; the overview waits until it closes.
   const overview = useUi((s) => s.overview);
   const pane = useUi((s) => s.pane);
-  const setPane = useUi((s) => s.setPane);
   const members = useMembersPanel();
   const showApp = phase === "online" || phase === "reconnecting";
   const stageOpen = useScreen((s) => s.stage !== null);
@@ -120,7 +119,7 @@ export function App() {
                   )}
                   {isMobile && pane === "members" && (
                     <div className="absolute inset-0 flex">
-                      <MemberList onBack={() => setPane("chat")} />
+                      <MemberList onBack={() => paneBack("chat")} />
                     </div>
                   )}
                 </div>

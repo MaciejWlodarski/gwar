@@ -19,6 +19,7 @@ import { type PublishStats } from "../voice/screen";
 import { HEIGHTS, FRAME_RATES, type ScreenSpec } from "../voice/screen-quality";
 import { useChannelPermission, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
 import { BackButton, Button, Dialog, IconButton, panelCard, TalkingAvatar, Tooltip } from "./kit";
+import { paneBack } from "./nav";
 
 // -------------------------------------------------------------------- start
 
@@ -493,7 +494,7 @@ export function Stage({ card }: { card?: boolean }) {
   return (
     <section aria-label={t("screen.stage")} className={cn("flex min-w-0 flex-1 flex-col bg-[#0b0b0d] text-white", card && panelCard)}>
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-white/10 px-3">
-        {!card && <BackButton label={t("nav.toChannels")} onClick={() => useUi.getState().setPane("list")} />}
+        {!card && <BackButton label={t("nav.toChannels")} entry onClick={() => paneBack("list")} />}
         {client && <TalkingAvatar name={name} seed={client.uid} size={24} talking={client.talking} />}
         <h2 className="min-w-0 truncate text-[15px] font-semibold">{t("screen.sharerTitle", { name })}</h2>
         <span className="shrink-0 rounded bg-danger px-1 text-[10px] leading-4 font-bold tracking-wide">{t("screen.live")}</span>

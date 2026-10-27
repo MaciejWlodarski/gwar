@@ -125,10 +125,24 @@ const firstInMain = () => {
   return [...(main?.querySelectorAll("button, a[href], input, textarea, select, [tabindex]:not([tabindex='-1'])") ?? [])].find(reachable);
 };
 
-/** Focus onto the shown page's starting point (marked `data-entry`: the open tab, the report's text), else into its main card. */
+/**
+ * Focus onto what is shown: its starting point (marked `data-entry`: the open tab, the report's text, the open
+ * channel's row, the conversation's way back), else the main card's first control, else the channel list.
+ */
 export function focusPage(): void {
   const entry = [...document.querySelectorAll("[data-entry]")].find(reachable);
-  (entry ?? firstInMain())?.focus();
+  (entry ?? firstInMain() ?? [...document.querySelectorAll('[role="treeitem"]')].find(reachable))?.focus();
+}
+
+/** How an in-app way back is applied: on phones its history step goes with it (`nav.ts` sets it). */
+let backHandler = (apply: () => void) => apply();
+export function setBackHandler(handler: (apply: () => void) => void): void {
+  backHandler = handler;
+}
+
+/** An in-app way back (a back button, Esc out of a page, a tab back to a section's top). */
+export function backInApp(apply: () => void): void {
+  backHandler(apply);
 }
 
 /**
@@ -145,7 +159,7 @@ export function exitPage(apply: () => void): void {
 
 /** Leaves a page for the section it was opened from. */
 export function leavePage(): void {
-  exitPage(() => useUi.getState().goBack());
+  backInApp(() => exitPage(() => useUi.getState().goBack()));
 }
 
 /** Layers that Esc closes before it may leave a page. Not a tooltip: one still fading out (the gear's, its focus
