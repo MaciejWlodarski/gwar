@@ -581,15 +581,19 @@ rejected, or one that never settles holding the queue), the publisher closes the
 transport and reports it failed, the same path as a failed connection, which ends the
 share with a notice. The share never keeps sending above its cap. A page going away
 (`pagehide`) cancels a lift and its restore retries. Each restoration has its own
-generation, which a close or `pagehide` advances: a write, fallback, completion
-or retry of a cancelled restoration does nothing, so a late completion cannot clear a
-later restoration or its watchdog. Failed probes back off
+generation, which a close, recovery or `pagehide` advances: a write, fallback, completion
+or retry of a cancelled restoration does nothing, so a late completion from a replaced
+transport cannot clear the new transport's pending restore or watchdog. Failed probes back off
 10 → 20 → 40 → … → 300 s; a probe that raised the estimate by 25 % restarts the
 backoff. Busy content, which fills its cap, never qualifies; neither does a share
 already at native size. A close cancels a pending lift and restore. A codec recovery
-keeps the old transport open until the server accepts its replacement, so it first waits
-for a pending restoration to end (the cap is back, or the watchdog ended the share);
-the replacement starts at the headroom cap itself. With the probe the same eight-second 1 Mb/s
+negotiates its replacement at once, but the old transport stays open until the server
+accepts it, so a lifted old sender keeps its own restoration: the headroom cap, queued
+behind its own pending writes, with the same retries and the lift's ten-second deadline.
+Retiring the transport ends it. A cap still not back by the deadline closes only the old
+transport; the replacement, which never sent above its cap, keeps negotiating. The
+replacement starts at the spec's resolved cap, and its own polling then applies the
+headroom cap from its estimate. With the probe the same eight-second 1 Mb/s
 startup recovers 1080p in 12/12 local shares (13–29 s; main: 2/6), and the default
 startup matrix issues no probe. On the Ubuntu runner both H.264 shares recovered through
 a probe; nine of ten VP9 shares recovered, and six of the seven VP9 lifts probed.

@@ -638,8 +638,10 @@ export class ScreenPublisher {
   private lift = 0;
   /** The current lift's restoration: `endProbe` advances it, so its stale writes, completions and retries stop. */
   private restoration = 0;
-  /** Recoveries waiting for the lifted sender's restoration to end; `endProbe` releases them. */
-  private restored: (() => void)[] = [];
+  /** When the current lift's cap must be back (`RESTORE_DEADLINE_MS` after the lift). */
+  private restoreBy = 0;
+  /** Restorations of lifted senders a recovery replaced, each by its cancel. */
+  private readonly retiring = new Set<() => void>();
   /** The latest uplink estimate, for the cap a probe restores. */
   private available: number | undefined;
   private run = 0;
@@ -654,7 +656,7 @@ export class ScreenPublisher {
   private softwareAv1 = 0;
   private readonly ceiling: { width: number; height: number; known: boolean };
   /** A page going away stops lifts and restore retries; its transport closes with it. */
-  private readonly pageHide = () => this.endProbe();
+  private readonly pageHide = () => { this.endProbe(); this.endRetiring(); };
 
   constructor(private readonly params: PublishParams) {
     globalThis.addEventListener?.("pagehide", this.pageHide);
@@ -962,7 +964,10 @@ export class ScreenPublisher {
     this.restoring = false;
     this.lift++;
     this.restoration++;
-    for (const release of this.restored.splice(0)) release();
+  }
+
+  private endRetiring(): void {
+    for (const cancel of [...this.retiring]) cancel();
   }
 
   private endPhaseAfter(ms: number): void {
@@ -991,6 +996,7 @@ export class ScreenPublisher {
     void this.applyParameters(cap, () => this.lift === lift && performance.now() < deadline);
     // Set after the lift's own write: only writes queued behind it can restore the cap.
     this.restoring = true;
+    this.restoreBy = performance.now() + RESTORE_DEADLINE_MS;
     this.probeTimer = setTimeout(() => this.restoreCap(lift, restoration, 1_000), 1_000);
     this.restoreWatchdog = setTimeout(() => {
       if (this.restoration !== restoration || this.closed) return;
@@ -1070,12 +1076,14 @@ export class ScreenPublisher {
   }
 
   async recover(plan: ScreenRecovery): Promise<void> {
-    // The old transport outlives the replacement's negotiation, so a lifted sender is retired
-    // only once its restoration ends: its cap is back, or the watchdog ended the share.
-    while (this.restoring && !this.closed) await new Promise<void>(release => this.restored.push(release));
     if (this.closed) return;
     this.cancelPhase();
     this.guard.resetEncoder();
+    // The old transport outlives the replacement's negotiation: a lifted sender keeps restoring
+    // its cap, by the lift's deadline, until it is retired.
+    const retire = this.restoring && this.pc && this.sender
+      ? this.restoreRetiring(this.pc, this.sender, headroomBitrate(this.spec().maxBitrate, this.available), this.restoreBy)
+      : () => {};
     // A new transport starts its own estimate.
     this.endProbe();
     this.probe = new StaleEstimateProbe();
@@ -1085,7 +1093,48 @@ export class ScreenPublisher {
     // Keep the old publish transport alive until the server has accepted its replacement.
     // Closing it before the offer lets the server end the share on its DTLS close.
     try { await this.start(); }
-    finally { if (pc) { pc.onconnectionstatechange = null; pc.close(); } }
+    finally { retire(); if (pc) { pc.onconnectionstatechange = null; pc.close(); } }
+  }
+
+  /**
+   * The restoration of a lifted sender that a recovery is replacing, behind the old transport's
+   * own parameter queue and with the same retries. Retirement, a written cap, close or `pagehide`
+   * ends it. A cap still not back by the lift's deadline force-closes only that old transport:
+   * the replacement is already negotiating and never sent above its cap, so it is not failed.
+   */
+  private restoreRetiring(pc: RTCPeerConnection, sender: RTCRtpSender, cap: number, deadline: number): () => void {
+    let queue = this.parameters, ended = false, timer: ReturnType<typeof setTimeout> | null = null;
+    const cancel = () => {
+      ended = true;
+      if (timer) clearTimeout(timer);
+      clearTimeout(watchdog);
+      this.retiring.delete(cancel);
+    };
+    const watchdog = setTimeout(() => {
+      if (ended) return;
+      cancel();
+      console.warn("Screen sender: the replaced transport's bitrate cap could not be restored after a probe");
+      pc.onconnectionstatechange = null; pc.close();
+    }, Math.max(0, deadline - performance.now()));
+    const attempt = (retry: number) => {
+      timer = null;
+      queue = queue.then(async () => {
+        if (ended) return;
+        try {
+          const params = sender.getParameters();
+          params.encodings = params.encodings?.length ? params.encodings.map((e, i) => (i === 0 ? { ...e, maxBitrate: cap } : e)) : [{ maxBitrate: cap }];
+          await sender.setParameters(params);
+          cancel();
+        } catch (e) {
+          if (ended) return;
+          console.warn("Screen sender parameters:", e);
+          timer = setTimeout(() => attempt(Math.min(8_000, retry * 2)), retry);
+        }
+      });
+    };
+    this.retiring.add(cancel);
+    attempt(1_000);
+    return cancel;
   }
 
   close(): void {
@@ -1093,6 +1142,7 @@ export class ScreenPublisher {
     globalThis.removeEventListener?.("pagehide", this.pageHide);
     this.cancelPhase();
     this.endProbe();
+    this.endRetiring();
     this.guard = new StuckCaptureGuard();
     this.adaptationSent = null;
     this.polling = null;
