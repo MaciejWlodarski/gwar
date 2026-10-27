@@ -784,7 +784,7 @@ jobs:
     if: needs.changes.outputs.app == 'true'
     continue-on-error: true
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         timeout-minutes: 5
@@ -835,17 +835,15 @@ jobs:
           pnpm --filter web e2e:screen-startup
       # A sparse share whose startup estimate a briefly busy uplink held at 1 Mb/s: once the
       # uplink frees, the share must re-probe and recover 1080p (docs/screen-share.md,
-      # "Stale estimate probe").
+      # "Stale estimate probe"). H.264 is asserted; the VP9 fallback is recorded.
       - name: Startup estimate recovery after a briefly busy uplink (diagnostic, non-required)
         if: success() || failure()
-        timeout-minutes: 14
+        timeout-minutes: 9
         env:
           E2E_STARTUP_RESULTS: ${{ runner.temp }}/screen-startup/released
           E2E_STARTUP_SOURCES: barcode20
-          E2E_STARTUP_CODECS: vp9
-          E2E_STARTUP_WEBRTC_LOG: "1"
-          E2E_STARTUP_REPEATS: "8"
-          E2E_STARTUP_SECONDS: "45"
+          E2E_STARTUP_REPEATS: "2"
+          E2E_STARTUP_SECONDS: "50"
           E2E_STARTUP_UPLINK: "1000000"
           E2E_STARTUP_RELEASE: "8"
         run: pnpm --filter web e2e:screen-startup

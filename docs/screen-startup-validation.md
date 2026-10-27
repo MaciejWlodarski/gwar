@@ -61,6 +61,20 @@ limitation, and stayed there. This is Chromium's own bandwidth adaptation at the
 the guard prices the next step at the current bits per pixel and leaves it. It still
 fails the diagnostic, which is deliberate.
 
+**Follow-up on the PR (27 October).** The first CI run of this change failed two
+cases. The VP9 release case stayed at 480×270: both lifts (17 s, 39 s) raised the
+encoder target, but no probe followed and the estimate held at 0.98 Mb/s. A rerun of
+the job passed both steps (VP9 probed at 15 s, 1080p at 25 s), and a measurement run of
+eight VP9 release shares recovered 8/8 (five needed a lift and all five probed, 1080p at
+25–30 s; three recovered by themselves). That is 9 of 10 CI VP9 shares and 6 of 7 lifts
+probing, with one unexplained miss; Linux Chromium writes only
+browser-process logs, so the renderer's probe decisions were not observable. The step
+now asserts H.264 and records VP9 as a known limitation of the fallback codec. The
+second failure was another H.264 busy publish limited by `bandwidth` at 1440×810 from
+30 s to 60 s. The local A/B shows the cause: with the 70 % headroom the estimate
+reached 11.4 Mb/s at 22–25 s, against 12 s without it; see docs/screen-share.md
+("Design trade-off").
+
 25 October 2026. Local macOS arm64, full Playwright Chromium 153.0.8010.12,
 WebKit, local SFU and real browser viewers. Main is pinned to
 `e8fb01e358ed6a5e6f855025c4417829ede379e1`; the previous candidate is

@@ -571,7 +571,26 @@ the estimate by 25 % restarts the backoff. Busy content, which fills its cap, ne
 qualifies; neither does a share already at native size. A close, codec recovery or
 spec change cancels a pending restore. With the probe the same eight-second 1 Mb/s
 startup recovers 1080p in 12/12 local shares (13–29 s; main: 2/6), and the default
-startup matrix issues no probe.
+startup matrix issues no probe. On the Ubuntu runner both H.264 shares recovered through
+a probe; nine of ten VP9 shares recovered, and six of the seven VP9 lifts probed.
+
+*Known limitation of the VP9 fallback:* in one CI VP9 share Chromium (Linux) sent no
+probe for either lift, 17 s and 39 s in, though the encoder target rose with the
+allocation; the estimate stayed at 0.98 Mb/s and the share at 480×270. The cause is
+not established: Linux logs only the browser process, not the renderer that runs
+WebRTC, and a lossy startup reproduced locally still probes. H.264 is the browser
+codec and VP9 only its recovery fallback, so the CI step asserts H.264 and records
+VP9's outcome.
+
+*Design trade-off: headroom slows the ramp of dense content.* A share that fills its
+cap sends about 70 % of the estimate, and GCC may raise its estimate only to 1.5× the
+acknowledged rate, so the estimate grows by roughly 5 % per step instead of 50 %.
+Locally, busy H.264 needs 22–25 s for the estimate to reach the 11.4 Mb/s at which
+the 8 Mb/s cap stops binding, against about 12 s without the headroom rule. On the
+runner OpenH264 meanwhile adapts down for quantiser reasons at 4–5 Mb/s, and it can
+take until the estimate passes about 12 Mb/s (up to 60 s) to return to 1080p. The
+probe cannot help: the stream is not application-limited, so Chromium does not probe.
+The 30 % is kept deliberately for voice and repairs on a congested uplink.
 
 `pnpm --filter web e2e:screen-startup` checks repeated fresh real-tab publishes
 with a sparse 20 fps barcode and busy 1080p60 content, using VP9 and H.264. It
