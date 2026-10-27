@@ -75,6 +75,22 @@ second failure was another H.264 busy publish limited by `bandwidth` at 1440×81
 reached 11.4 Mb/s at 22–25 s, against 12 s without it; see docs/screen-share.md
 ("Design trade-off").
 
+**Review fixes (27 October).** The probe now runs for smooth shares only, gives each lift
+a one-second deadline and generation (an expired lift is never written or retried), keeps
+its restore pending with its own 1 → 8 s retries until the headroom cap is written, and
+reads the sending rate only from advancing counters of one outbound stream, encoder and
+codec. The diagnostic judges each settled sample on its own: a sample is CPU-limited when
+Chromium reports `cpu` or the encoder spent at least 85 % of the frame interval per frame
+over two seconds; all other samples keep the size and cadence checks. A VP9 release share
+may stay small but must keep its cadence and be decoded. The harness counts allocation
+probes and expects none on an open uplink. Replayed over the 552 retained CI timelines
+(138 per codec and source), the new rules fail exactly the four runs that were real: the
+stale H.264 barcode estimate (`40370486469`) and three H.264 busy runs limited by
+`bandwidth` (`40225445809`, `40315496650` and this PR's first run). They find no
+allocation probe in the default matrix, and one VP9 release share is recorded as
+unrecovered. Judging by Chromium's `cpu` flag alone would also fail three busy runs encoded at 46–50 fps
+while the encoder needed about 18 ms per frame, before Chromium flagged the overload.
+
 25 October 2026. Local macOS arm64, full Playwright Chromium 153.0.8010.12,
 WebKit, local SFU and real browser viewers. Main is pinned to
 `e8fb01e358ed6a5e6f855025c4417829ede379e1`; the previous candidate is

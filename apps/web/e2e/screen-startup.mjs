@@ -6,11 +6,12 @@
  * E2E_STARTUP_CODECS=vp9,h264 (default), E2E_STARTUP_REPEATS=2, E2E_STARTUP_SECONDS=60.
  * E2E_STARTUP_UPLINK=1500000 or 3000000 enables CDP's global p2p shaper and records tradeoffs
  * instead of requiring 1080p; with E2E_STARTUP_RELEASE=8 the shaper lifts after 8 s and the share
- * must recover 1080p from that low startup estimate (H.264; the VP9 fallback is recorded). All services and requests are local; no
+ * must recover 1080p from that low startup estimate (H.264; VP9 may stay small but must keep
+ * its cadence and be decoded). All services and requests are local; no
  * Connect/production.
- * A settled window the encoder reports as CPU-limited (Chromium's own CPU adaptation, e.g. the
- * single-threaded OpenH264 at 1080p60 or libvpx on a 4-vCPU runner) is recorded, not asserted:
- * the share must still have reached native size, and the viewer must decode what is sent.
+ * Settled intervals where the encoder is CPU-limited (Chromium's own CPU adaptation, e.g. the
+ * single-threaded OpenH264 at 1080p60 or libvpx on a 4-vCPU runner) are recorded, not asserted;
+ * every other interval keeps the strict size and cadence rules (screen-startup-judge.mjs).
  * E2E_STARTUP_PRESET=text|smooth|saver checks the other presets (default game).
  * E2E_STARTUP_DIST may select an independently built main bundle for before/after evidence.
  */
@@ -24,6 +25,7 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { stopProcesses } from "./processes.mjs";
 import { canvasCapture, readBarcode, stampBarcode } from "./screen-source.mjs";
+import { allocationProbes, judgeSettled, probeBound } from "./screen-startup-judge.mjs";
 
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(webRoot, "../..");
@@ -318,37 +320,26 @@ try {
           const steadyFps = rows.find((r, i) => r.elapsed <= seconds - 5 && rows.slice(i).every(s => s.out?.framesPerSecond >= expectedFps * 0.85));
           const firstFiveFps = median(rows.filter(r => r.elapsed <= 5 && r.out?.framesPerSecond !== undefined).map(r => r.out.framesPerSecond));
           const result = { name, preset, uplink, sourceFps: +cadence.toFixed(1), captureFps: median(settled.map(r => r.source?.framesPerSecond ?? 0)), output: `${last.out.frameWidth}x${last.out.frameHeight}`, source: `${last.source?.width}x${last.source?.height}`, viewer: `${last.viewer?.width}x${last.viewer?.height}`, fps: median(settled.map(r => r.out.framesPerSecond)), decodeFps: +decodeFps.toFixed(1), payloadMbps: +(payload / 1e6).toFixed(3), availableMbps: +(median(settled.map(r => r.pair.availableOutgoingBitrate)) / 1e6).toFixed(3), stableAt: stable?.elapsed ?? null, stableDimensionsAt: stableDimensions?.elapsed ?? null, firstTargetAt: firstTarget?.elapsed ?? null, steadyFpsAt: steadyFps?.elapsed ?? null, firstFiveFps, pulses: rows.filter((r,i) => r.elapsed > 4 && r.params.degradationPreference === "maintain-resolution" && rows[i-1]?.params.degradationPreference === "maintain-framerate").length,
-            encoder: last.out.encoderImplementation, limitation: last.out.qualityLimitationReason, cpuLimited: settled.some(r => r.out?.qualityLimitationReason === "cpu"),
+            encoder: last.out.encoderImplementation, limitation: last.out.qualityLimitationReason, probes: allocationProbes(rows),
             encodedFps: +((last.out.framesEncoded - first.out.framesEncoded) / dt).toFixed(1),
             encodeMsPerFrame: +((last.out.totalEncodeTime - first.out.totalEncodeTime) * 1000 / Math.max(1, last.out.framesEncoded - first.out.framesEncoded)).toFixed(1) };
+          const verdict = uplink ? null : judgeSettled({ rows, settled, full, expectedFps, codec, release });
+          if (verdict) Object.assign(result, { cpuLimited: verdict.cpuLimited, unrecovered: verdict.unrecovered });
           results.push(result); console.log(JSON.stringify(result));
           if (!uplink) {
             assert.ok(settled.every(r => r.params.degradationPreference === ({ game: "maintain-framerate", text: "maintain-resolution", smooth: "maintain-framerate", saver: "maintain-framerate" })[preset]), "preset restored");
             if (release) assert.ok(median(rows.filter(r => r.elapsed >= 2 && r.elapsed < release).map(r => r.pair?.availableOutgoingBitrate ?? Infinity)) < shapedUplink * 1.5, "the shaper held the startup estimate down");
-            if (result.cpuLimited) {
-              // Chromium's own CPU adaptation (qualityLimitationReason "cpu") trades size or
-              // cadence for this machine's encode time: a property of the runner, recorded, not
-              // asserted. What the share controls still holds: native size reached at startup,
-              // and the viewer decodes what the encoder sends at its cadence.
-              assert.ok(firstTarget, `${name}: source, encoder and viewer must reach ${targetWidth}x${targetHeight} before any CPU adaptation`);
-              assert.ok(Math.abs(last.viewer.width - last.out.frameWidth) <= 2 && Math.abs(last.viewer.height - last.out.frameHeight) <= 2, "viewer decodes the CPU-adapted output (codec crop tolerance)");
-              assert.ok(decodeFps >= result.encodedFps * 0.75, `viewer cadence ${decodeFps} of encoded ${result.encodedFps}`);
-            } else if (release && codec === "vp9" && !settled.every(full)) {
-              // The VP9 fallback's known limitation (docs/screen-share.md, "Stale estimate probe"):
-              // Chromium on Linux occasionally sends no probe for it. Recorded, not asserted.
-              result.unrecovered = true;
-            } else {
-              assert.ok(result.captureFps >= expectedFps * 0.85 && result.captureFps <= expectedFps * 1.12, `captured source cadence ${result.captureFps}`);
-              assert.ok(result.fps >= expectedFps * 0.85, `encoded cadence ${result.fps}`);
-              assert.ok(settled.every(full), `${name}: source, encoder and viewer must recover to ${targetWidth}x${targetHeight}`);
-              assert.ok(decodeFps >= expectedFps * 0.75, `viewer cadence ${decodeFps}`);
-            }
+            // An open uplink never leaves a stale estimate, so it never probes; after a release, the backoff bounds them.
+            if (release) assert.ok(result.probes <= probeBound(seconds), `allocation probes ${result.probes} within the backoff`);
+            else assert.equal(result.probes, 0, "no allocation probe on an open uplink");
+            assert.deepEqual(verdict.errors, [], name);
           } else {
             assert.ok(payload <= uplink * 1.15 && payload > uplink * 0.15, `active shaped payload ${payload}`);
             assert.ok(result.availableMbps * 1e6 < uplink * 1.5, "shaper must affect WebRTC, not just HTTP");
             assert.ok(result.fps >= expectedFps * 0.85 && decodeFps >= expectedFps * 0.75, `active shaped encode/decode cadence ${result.fps}/${decodeFps}`);
             assert.ok(Math.abs(last.viewer.width - last.out.frameWidth) <= 2 && Math.abs(last.viewer.height - last.out.frameHeight) <= 2, "viewer decodes the shaped output (codec crop tolerance)");
             assert.equal(result.pulses, 0, "no nudge on a genuinely constrained uplink");
+            assert.ok(result.probes <= probeBound(seconds), `allocation probes ${result.probes} within the backoff`);
           }
         } catch (error) { failures.push(`${name}: ${error.message}`); console.error(JSON.stringify({ sharer: await diagnostics(sharer), viewer: await diagnostics(admin) })); }
         await session(admin, (_, __, controller, id) => controller.screen.unwatch(id), id);

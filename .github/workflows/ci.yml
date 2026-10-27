@@ -290,6 +290,8 @@ jobs:
         timeout-minutes: 5
       - run: pnpm --filter web test:latency
         timeout-minutes: 5
+      - run: pnpm --filter web test:screen-startup
+        timeout-minutes: 5
       - run: pnpm --filter web build
         timeout-minutes: 5
       - name: Browser system dependencies

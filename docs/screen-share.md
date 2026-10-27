@@ -560,16 +560,25 @@ below the estimate, so allocation probes never fire either. CI run `40370486469`
 showed exactly this (1.14 Mb/s for the whole minute on loopback), and locally a
 1 Mb/s uplink for the first 8 s left four of six fresh shares at 480×270.
 
-`StaleEstimateProbe` watches for an encoder that is smaller than the capture
+`StaleEstimateProbe` runs for smooth shares only (the sharp mode already gets
+Chromium's periodic probes). It watches for an encoder that is smaller than the capture
 target, limited by `bandwidth`, under a cap that 70 % of the estimate holds back,
-while sending less than half the estimate. After ten seconds without the estimate
-growing more than 10 %, the publisher lifts `maxBitrate` to the spec's cap for one
-second: Chromium probes (up to twice its estimate, further while probes succeed),
-then the headroom cap returns at the latest estimate. The degradation preference does
-not change. Failed probes back off 10 → 20 → 40 → … → 300 s; a probe that raised
-the estimate by 25 % restarts the backoff. Busy content, which fills its cap, never
-qualifies; neither does a share already at native size. A close, codec recovery or
-spec change cancels a pending restore. With the probe the same eight-second 1 Mb/s
+while sending less than half the estimate. The sending rate comes only from deltas of
+the same outbound stream, encoder and codec, with bytes, frames and timestamps all
+advancing; a missing or reset counter, a replaced outbound stream or an encoder or
+codec change (such as the AV1 → H.264 retirement) restarts the wait. After ten seconds
+without the estimate growing more than 10 %, the publisher lifts `maxBitrate` to the
+spec's cap for one second: Chromium probes (up to twice its estimate, further while
+probes succeed), then the headroom cap returns at the latest estimate. The degradation
+preference does not change. A lift carries its own deadline and generation, so a lift
+queued behind an earlier sender transaction, or retried after a late rejection, is
+dropped once its second has passed. The restore is pending until a write of the
+headroom cap succeeds: a rejected restore retries on its own timer (1 → 2 → 4 → 8 s),
+independent of stats polling, and no new lift starts meanwhile. Failed probes back off
+10 → 20 → 40 → … → 300 s; a probe that raised the estimate by 25 % restarts the
+backoff. Busy content, which fills its cap, never qualifies; neither does a share
+already at native size. A close or codec recovery cancels a pending lift and restore;
+a recovery rewrites the headroom cap itself. With the probe the same eight-second 1 Mb/s
 startup recovers 1080p in 12/12 local shares (13–29 s; main: 2/6), and the default
 startup matrix issues no probe. On the Ubuntu runner both H.264 shares recovered through
 a probe; nine of ten VP9 shares recovered, and six of the seven VP9 lifts probed.
@@ -580,7 +589,8 @@ allocation; the estimate stayed at 0.98 Mb/s and the share at 480×270. The caus
 not established: Linux logs only the browser process, not the renderer that runs
 WebRTC, and a lossy startup reproduced locally still probes. H.264 is the browser
 codec and VP9 only its recovery fallback, so the CI step asserts H.264 and records
-VP9's outcome.
+VP9's resolution; a VP9 share must still keep its capture and encode cadence, and the
+viewer must decode its smaller output.
 
 *Design trade-off: headroom slows the ramp of dense content.* A share that fills its
 cap sends about 70 % of the estimate, and GCC may raise its estimate only to 1.5× the
@@ -599,11 +609,19 @@ through the local SFU after settling. `E2E_STARTUP_RESULTS` retains JSON timelin
 `E2E_STARTUP_UPLINK=1500000` or `3000000` exercises Chromium's global p2p shaper
 and reports the constrained-link tradeoff; adding `E2E_STARTUP_RELEASE=8` lifts the
 shaper after 8 s and requires 1080p again (the stale estimate probe above).
-A settled window the encoder reports as CPU-limited is recorded instead of failing
+Settled intervals where the encoder is CPU-limited are recorded instead of failing
 the size and cadence checks: Chromium's single-threaded OpenH264 needs 12–20 ms per
 busy 1080p frame even on a 10-core Mac, and the 4-vCPU runner cannot keep libvpx at
-1080p60 next to capture, canvas and viewer decode. Such a share must still have
-reached native size at startup and the viewer must decode what is sent.
+1080p60 next to capture, canvas and viewer decode. A sample is CPU-limited when
+Chromium reports `cpu`, or when the encoder needed at least 85 % of the frame
+interval per frame over the preceding two seconds (Chromium flags the overload tens
+of seconds late). Every other settled sample keeps the strict size and cadence
+checks; a share with CPU-limited samples must still have reached native size, and
+the viewer must always decode the encoded size at 75 % of the encoded cadence. The
+rules live in `e2e/screen-startup-judge.mjs` with unit tests run in the web job.
+The harness also counts allocation probes (the cap written back up to the spec's
+ceiling while 70 % of the estimate is below it): none on an open uplink, and no more
+than the backoff allows after a release or on a shaped link.
 `E2E_STARTUP_PRESET` can check Text, Smooth and Saver directly. The Ubuntu
 `browser-screen-startup` job is diagnostic and excluded from `ci-ok` until its repeatability is established.
 The existing required #166 fixed 1080p60 H.264 canvas gate is unchanged.

@@ -224,12 +224,24 @@ export class StaleEstimateProbe {
   private base = 0;
   private wait = 10_000;
   private probedFrom: number | null = null;
+  private previous: SendCounters | null = null;
 
-  observe(now: number, sample: { available: number; cap: number; bitrate: number; limitation: string; undersized: boolean }): boolean {
-    const { available, cap, bitrate } = sample;
+  observe(now: number, sample: { available: number; cap: number; limitation: string; undersized: boolean; send?: SendCounters }): boolean {
+    const { available, cap, send } = sample;
     const continuous = this.last !== null && now - this.last <= HEADROOM_INTERVAL_MS * 2.25;
     this.last = now;
-    const valid = [available, cap, bitrate].every(Number.isFinite) && available > 0;
+    // The send rate comes only from advancing counters of one outbound stream, encoder and
+    // codec. A replaced or reset stream starts over: its first sample has no rate.
+    const previous = this.previous;
+    const live = !!send && !!send.id && !!send.encoder && !!send.codec &&
+      [send.bytesSent, send.framesEncoded, send.timestamp].every(Number.isFinite);
+    this.previous = live ? send : null;
+    const same = live && !!previous && previous.id === send.id && previous.encoder === send.encoder && previous.codec === send.codec;
+    const advancing = same && send.bytesSent > previous.bytesSent && send.framesEncoded > previous.framesEncoded &&
+      send.timestamp > previous.timestamp && send.timestamp - previous.timestamp <= HEADROOM_INTERVAL_MS * 2.25;
+    if (!same) this.since = null;
+    const bitrate = advancing ? (send.bytesSent - previous.bytesSent) * 8000 / (send.timestamp - previous.timestamp) : NaN;
+    const valid = advancing && [available, cap].every(Number.isFinite) && available > 0;
     // A probe that raised the estimate restarts the backoff; a failed one keeps it.
     if (valid && this.probedFrom !== null && available >= this.probedFrom * 1.25) { this.wait = 10_000; this.probedFrom = null; }
     // The encoder sends a smaller size for want of bitrate, the estimate holds back the cap, and
@@ -246,6 +258,9 @@ export class StaleEstimateProbe {
     return true;
   }
 }
+
+/** One outbound stream's send counters, as `getStats` reports them. */
+export interface SendCounters { id: string; encoder: string; codec: string; bytesSent: number; framesEncoded: number; timestamp: number }
 
 /** The selected transport's GCC estimate, with the legacy nominated-pair fallback. */
 function outgoingEstimate(stats: RTCStatsReport, freshAt?: number): number | undefined {
@@ -612,7 +627,11 @@ export class ScreenPublisher {
   private polling: RTCPeerConnection | null = null;
   private guard = new StuckCaptureGuard();
   private probe = new StaleEstimateProbe();
+  /** The pending lift's restore, or the next retry of a failed restore. */
   private probeTimer: ReturnType<typeof setTimeout> | null = null;
+  /** A lift's cap must still come back: set until a write of the headroom cap succeeds. */
+  private restoring = false;
+  private lift = 0;
   /** The latest uplink estimate, for the cap a probe restores. */
   private available: number | undefined;
   private run = 0;
@@ -800,17 +819,13 @@ export class ScreenPublisher {
     }
     this.available = available;
     const size = this.captureTarget(), outputPixels = (out?.frameWidth ?? 0) * (out?.frameHeight ?? 0);
-    if (!this.phase && !this.probeTimer && this.probe.observe(performance.now(), {
-      available: guardAvailable ?? NaN, cap: spec.maxBitrate, bitrate, limitation: out?.qualityLimitationReason ?? "other",
+    // Smooth mode only: Chromium already probes periodically for the sharp mode's screen content.
+    if (spec.degradation === "maintain-framerate" && !this.phase && !this.probeTimer && !this.restoring && this.probe.observe(performance.now(), {
+      available: guardAvailable ?? NaN, cap: spec.maxBitrate, limitation: out?.qualityLimitationReason ?? "other",
       undersized: outputPixels > 0 && outputPixels < size.width * size.height,
+      ...(out ? { send: { id: out.id, encoder: out.encoderImplementation ?? "", codec: codec ?? "", bytesSent: out.bytesSent ?? NaN, framesEncoded: out.framesEncoded ?? NaN, timestamp: out.timestamp } } : {}),
     })) {
-      // Chromium probes (up to twice its estimate) when the allocation rises past the estimate.
-      // One second later the headroom cap returns, at the then-current estimate.
-      void this.applyParameters(spec.maxBitrate);
-      this.probeTimer = setTimeout(() => {
-        this.probeTimer = null;
-        if (!this.closed && this.pc === pc) void this.applyParameters(headroomBitrate(this.spec().maxBitrate, this.available));
-      }, 1_000);
+      this.liftCap(spec.maxBitrate);
       return;
     }
     // Small moves are not worth a parameter change.
@@ -923,8 +938,14 @@ export class ScreenPublisher {
     this.phase = null;
     if (this.sampleTimer) clearTimeout(this.sampleTimer);
     this.sampleTimer = null;
+  }
+
+  /** A closed or replaced transport needs no restore: its successor starts at the spec's cap. */
+  private endProbe(): void {
     if (this.probeTimer) clearTimeout(this.probeTimer);
     this.probeTimer = null;
+    this.restoring = false;
+    this.lift++;
   }
 
   private endPhaseAfter(ms: number): void {
@@ -939,10 +960,37 @@ export class ScreenPublisher {
     }, ms);
   }
 
-  private applyParameters(maxBitrate: number): Promise<void> {
+  /**
+   * Chromium probes (up to twice its estimate) when the allocation rises past the estimate. The
+   * lift is valid for one second from now: a write still queued behind an earlier transaction,
+   * or a fallback retry after a rejection, past that deadline never runs. The headroom cap then
+   * comes back and keeps being retried until a write of it succeeds.
+   */
+  private liftCap(cap: number): void {
+    const lift = ++this.lift, deadline = performance.now() + 1_000;
+    this.restoring = true;
+    void this.applyParameters(cap, () => this.lift === lift && performance.now() < deadline);
+    this.probeTimer = setTimeout(() => this.restoreCap(lift, 1_000), 1_000);
+  }
+
+  private restoreCap(lift: number, retry: number): void {
+    this.probeTimer = null;
+    const pc = this.pc;
+    if (this.closed || !pc) { this.restoring = false; return; }
+    if (this.lift === lift) this.lift++; // the lift is over, even if its write is still queued
+    void this.applyParameters(headroomBitrate(this.spec().maxBitrate, this.available)).then(written => {
+      if (this.closed || this.pc !== pc) { this.restoring = false; return; }
+      if (written) { this.restoring = false; return; }
+      this.probeTimer = setTimeout(() => this.restoreCap(lift, Math.min(8_000, retry * 2)), retry);
+    });
+  }
+
+  /** Resolves true once this cap is written; `valid` can expire the transaction before either write. */
+  private applyParameters(maxBitrate: number, valid: () => boolean = () => true): Promise<boolean> {
     const sender = this.sender, pc = this.pc, revision = this.revision;
-    const alive = () => !this.closed && this.pc === pc && this.sender === sender && this.revision === revision;
+    const alive = () => !this.closed && this.pc === pc && this.sender === sender && this.revision === revision && valid();
     if (sender && alive()) this.desired = maxBitrate;
+    let written = false;
     // Serialize read/modify/write transactions. A queued restore uses current state;
     // a superseded spec or publisher cannot retry stale settings after an await.
     this.parameters = this.parameters.then(async () => {
@@ -968,9 +1016,9 @@ export class ScreenPublisher {
           console.warn("Screen sender parameters:", e); return;
         }
       }
-      if (alive()) this.applied = maxBitrate;
+      if (alive()) { this.applied = maxBitrate; written = true; }
     });
-    return this.parameters;
+    return this.parameters.then(() => written);
   }
 
   private spec(): ResolvedSpec {
@@ -990,6 +1038,7 @@ export class ScreenPublisher {
     this.cancelPhase();
     this.guard.resetEncoder();
     // A new transport starts its own estimate.
+    this.endProbe();
     this.probe = new StaleEstimateProbe();
     this.recovery = plan;
     this.stopWatching();
@@ -1003,6 +1052,7 @@ export class ScreenPublisher {
   close(): void {
     this.closed = true;
     this.cancelPhase();
+    this.endProbe();
     this.guard = new StuckCaptureGuard();
     this.adaptationSent = null;
     this.polling = null;
