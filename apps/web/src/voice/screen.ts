@@ -638,6 +638,12 @@ export class ScreenPublisher {
   private lift = 0;
   /** The current lift's restoration: `endProbe` advances it, so its stale writes, completions and retries stop. */
   private restoration = 0;
+  /** When the current lift's cap must be back (`RESTORE_DEADLINE_MS` after the lift). */
+  private restoreBy = 0;
+  /** Restorations of lifted senders a recovery replaced, each by its cancel. */
+  private readonly retiring = new Set<() => void>();
+  /** Old transports a recovery keeps open until the server accepts their replacement; teardown closes them. */
+  private readonly superseded = new Set<RTCPeerConnection>();
   /** The latest uplink estimate, for the cap a probe restores. */
   private available: number | undefined;
   private run = 0;
@@ -651,8 +657,8 @@ export class ScreenPublisher {
   private sendCodec: RTCRtpCodec | null = null;
   private softwareAv1 = 0;
   private readonly ceiling: { width: number; height: number; known: boolean };
-  /** A page going away stops lifts and restore retries; its transport closes with it. */
-  private readonly pageHide = () => this.endProbe();
+  /** A page going away stops lifts and restore retries; its transport closes with it, and superseded ones now. */
+  private readonly pageHide = () => { this.endProbe(); this.endSuperseded(); };
 
   constructor(private readonly params: PublishParams) {
     globalThis.addEventListener?.("pagehide", this.pageHide);
@@ -962,6 +968,17 @@ export class ScreenPublisher {
     this.restoration++;
   }
 
+  /** Teardown: stops the old senders' restorations, then closes their transports, so none stays open uncapped. */
+  private endSuperseded(): void {
+    for (const cancel of [...this.retiring]) cancel();
+    for (const pc of [...this.superseded]) this.retirePeer(pc);
+  }
+
+  private retirePeer(pc: RTCPeerConnection): void {
+    this.superseded.delete(pc);
+    pc.onconnectionstatechange = null; pc.close();
+  }
+
   private endPhaseAfter(ms: number): void {
     const pc = this.pc, revision = this.revision;
     this.phaseTimer = setTimeout(() => {
@@ -978,14 +995,17 @@ export class ScreenPublisher {
    * Chromium probes (up to twice its estimate) when the allocation rises past the estimate. The
    * lift is valid for one second from now: a write still queued behind an earlier transaction,
    * or a fallback retry after a rejection, past that deadline never runs. The headroom cap then
-   * comes back and keeps being retried until a write of it succeeds. A cap still not back after
-   * `RESTORE_DEADLINE_MS` (writes rejected or never settling) ends the transport, as a failed
-   * transport does: the share must not keep sending above its cap.
+   * comes back and keeps being retried until a write of it succeeds (the restore's own, or any
+   * later write within the headroom cap). A cap still not back after `RESTORE_DEADLINE_MS`
+   * (writes rejected or never settling) ends the transport, as a failed transport does: the
+   * share must not keep sending above its cap.
    */
   private liftCap(cap: number): void {
     const lift = ++this.lift, restoration = ++this.restoration, deadline = performance.now() + 1_000;
-    this.restoring = true;
     void this.applyParameters(cap, () => this.lift === lift && performance.now() < deadline);
+    // Set after the lift's own write: only writes queued behind it can restore the cap.
+    this.restoring = true;
+    this.restoreBy = performance.now() + RESTORE_DEADLINE_MS;
     this.probeTimer = setTimeout(() => this.restoreCap(lift, restoration, 1_000), 1_000);
     this.restoreWatchdog = setTimeout(() => {
       if (this.restoration !== restoration || this.closed) return;
@@ -1015,6 +1035,8 @@ export class ScreenPublisher {
   private applyParameters(maxBitrate: number, valid: () => boolean = () => true): Promise<boolean> {
     const sender = this.sender, pc = this.pc, revision = this.revision;
     const alive = () => !this.closed && this.pc === pc && this.sender === sender && this.revision === revision && valid();
+    // The restoration pending when this write was issued, so queued behind its lift.
+    const restoration = this.restoring ? this.restoration : null;
     if (sender && alive()) this.desired = maxBitrate;
     let written = false;
     // Serialize read/modify/write transactions. A queued restore uses current state;
@@ -1042,7 +1064,10 @@ export class ScreenPublisher {
           console.warn("Screen sender parameters:", e); return;
         }
       }
-      if (alive()) { this.applied = maxBitrate; written = true; }
+      if (!alive()) return;
+      this.applied = maxBitrate; written = true;
+      // Any write within the headroom cap (a quality edit, a headroom move) restores the lift.
+      if (this.restoring && restoration === this.restoration && maxBitrate <= headroomBitrate(this.spec().maxBitrate, this.available)) this.endProbe();
     });
     return this.parameters.then(() => written);
   }
@@ -1063,16 +1088,64 @@ export class ScreenPublisher {
     if (this.closed) return;
     this.cancelPhase();
     this.guard.resetEncoder();
+    // The old transport outlives the replacement's negotiation: a lifted sender keeps restoring
+    // its cap, by the lift's deadline, until it is retired.
+    const retire = this.restoring && this.pc && this.sender
+      ? this.restoreRetiring(this.pc, this.sender, headroomBitrate(this.spec().maxBitrate, this.available), this.restoreBy)
+      : () => {};
     // A new transport starts its own estimate.
     this.endProbe();
     this.probe = new StaleEstimateProbe();
     this.recovery = plan;
     this.stopWatching();
     const pc = this.pc; this.pc = null; this.sender = null; this.sent = null; this.adaptationSent = null;
+    if (pc) this.superseded.add(pc);
     // Keep the old publish transport alive until the server has accepted its replacement.
     // Closing it before the offer lets the server end the share on its DTLS close.
     try { await this.start(); }
-    finally { if (pc) { pc.onconnectionstatechange = null; pc.close(); } }
+    finally { retire(); if (pc) this.retirePeer(pc); }
+  }
+
+  /**
+   * The restoration of a lifted sender that a recovery is replacing, behind the old transport's
+   * own parameter queue and with the same retries. Retirement, a written cap, close or `pagehide`
+   * ends it; only a written cap leaves the transport open, and teardown closes it. A cap still
+   * not back by the lift's deadline force-closes only that old transport: the replacement never
+   * sent above its cap, so it is not failed here.
+   */
+  private restoreRetiring(pc: RTCPeerConnection, sender: RTCRtpSender, cap: number, deadline: number): () => void {
+    let queue = this.parameters, ended = false, timer: ReturnType<typeof setTimeout> | null = null;
+    const cancel = () => {
+      ended = true;
+      if (timer) clearTimeout(timer);
+      clearTimeout(watchdog);
+      this.retiring.delete(cancel);
+    };
+    const watchdog = setTimeout(() => {
+      if (ended) return;
+      cancel();
+      console.warn("Screen sender: the replaced transport's bitrate cap could not be restored after a probe");
+      this.retirePeer(pc);
+    }, Math.max(0, deadline - performance.now()));
+    const attempt = (retry: number) => {
+      timer = null;
+      queue = queue.then(async () => {
+        if (ended) return;
+        try {
+          const params = sender.getParameters();
+          params.encodings = params.encodings?.length ? params.encodings.map((e, i) => (i === 0 ? { ...e, maxBitrate: cap } : e)) : [{ maxBitrate: cap }];
+          await sender.setParameters(params);
+          cancel();
+        } catch (e) {
+          if (ended) return;
+          console.warn("Screen sender parameters:", e);
+          timer = setTimeout(() => attempt(Math.min(8_000, retry * 2)), retry);
+        }
+      });
+    };
+    this.retiring.add(cancel);
+    attempt(1_000);
+    return cancel;
   }
 
   close(): void {
@@ -1080,6 +1153,7 @@ export class ScreenPublisher {
     globalThis.removeEventListener?.("pagehide", this.pageHide);
     this.cancelPhase();
     this.endProbe();
+    this.endSuperseded();
     this.guard = new StuckCaptureGuard();
     this.adaptationSent = null;
     this.polling = null;

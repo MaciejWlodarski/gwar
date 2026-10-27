@@ -572,8 +572,9 @@ spec's cap for one second: Chromium probes (up to twice its estimate, further wh
 probes succeed), then the headroom cap returns at the latest estimate. The degradation
 preference does not change. A lift carries its own deadline and generation, so a lift
 queued behind an earlier sender transaction, or retried after a late rejection, is
-dropped once its second has passed. The restore is pending until a write of the
-headroom cap succeeds: a rejected restore retries on its own timer (1 → 2 → 4 → 8 s),
+dropped once its second has passed. The restore is pending until a write within the
+headroom cap succeeds, the restore's own or any later one (a quality edit, a headroom
+move): a rejected restore retries on its own timer (1 → 2 → 4 → 8 s),
 independent of stats polling, and no new lift starts meanwhile. A watchdog outside the
 write queue bounds it: if the cap is not back ten seconds after the lift (every write
 rejected, or one that never settles holding the queue), the publisher closes the
@@ -585,8 +586,16 @@ or retry of a cancelled restoration does nothing, so a late completion from a re
 transport cannot clear the new transport's pending restore or watchdog. Failed probes back off
 10 → 20 → 40 → … → 300 s; a probe that raised the estimate by 25 % restarts the
 backoff. Busy content, which fills its cap, never qualifies; neither does a share
-already at native size. A close or codec recovery cancels a pending lift and restore;
-a recovery rewrites the headroom cap itself. With the probe the same eight-second 1 Mb/s
+already at native size. A close cancels a pending lift and restore. A codec recovery
+negotiates its replacement at once, but the old transport stays open until the server
+accepts it, so a lifted old sender keeps its own restoration: the headroom cap, queued
+behind its own pending writes, with the same retries and the lift's ten-second deadline.
+Retiring the transport ends it; a close or `pagehide` ends it and closes the old transport
+at once. A cap still not back by the deadline closes only the old transport and does not
+fail the replacement, which never sent above its cap. If the server has not accepted the
+replacement yet, though, that close can end the whole share on the old transport's DTLS
+close, revoking its viewers' grants. The replacement starts at the spec's resolved cap,
+and its own polling then applies the headroom cap from its estimate. With the probe the same eight-second 1 Mb/s
 startup recovers 1080p in 12/12 local shares (13–29 s; main: 2/6), and the default
 startup matrix issues no probe. On the Ubuntu runner both H.264 shares recovered through
 a probe; nine of ten VP9 shares recovered, and six of the seven VP9 lifts probed.
