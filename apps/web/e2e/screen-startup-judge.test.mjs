@@ -59,6 +59,30 @@ test("a saturated encoder marks CPU-bound intervals Chromium has not flagged yet
   assert.equal(cpuLimitedRows(burst).size, 0);
 });
 
+test("the load window covers one stream: a switch or an interior reset restarts it", () => {
+  const row = (elapsed, id, total, frames = elapsed * 30) => ({ elapsed, out: { id, encoderImplementation: "OpenH264", codecId: "h264", totalEncodeTime: total, framesEncoded: frames } });
+  // Sol's round-3 repro: a new outbound's counters would read as 2.275 encode-seconds per second.
+  const switched = [row(0, "old", 1), row(1, "old", 1.1), row(2, "old", 1.2), row(3, "new", 10), row(4, "new", 10.1)];
+  assert.equal(encoderLoad(switched).has(switched.at(-1)), false);
+  // A reset inside the window whose endpoints still differ by a positive amount.
+  const reset = [row(0, "out", 0), row(1, "out", 0.9), row(2, "out", 0, 0), row(3, "out", 0.9, 30), row(4, "out", 1.8, 60), row(5, "out", 2.7, 90)];
+  assert.equal(encoderLoad(reset).has(reset.at(-1)), false);
+  const after = [...reset, row(6, "out", 3.6, 120)];
+  assert.ok(Math.abs(encoderLoad(after).get(after.at(-1)) - 0.9) < 1e-9);
+  // Missing counters and another encoder or codec restart it too.
+  for (const change of [{ totalEncodeTime: undefined }, { encoderImplementation: "libvpx" }, { codecId: "vp9" }]) {
+    const rows = [row(0, "out", 0), row(1, "out", 0.5), row(2, "out", 1), row(3, "out", 1.5), row(4, "out", 2), row(5, "out", 2.5)];
+    Object.assign(rows[2].out, change);
+    assert.equal(encoderLoad(rows).has(rows.at(-1)), false, JSON.stringify(change));
+  }
+  // So a 30 fps regression right after an outbound replacement stays fatal.
+  const regression = run({ fps: 60, at: t => t < 50 ? { encodeMs: 0.5 } : { fps: 30, encodeMs: 3 } });
+  regression.forEach(r => { r.out.id = r.elapsed < 50 ? "old" : "new"; if (r.elapsed >= 50) r.out.totalEncodeTime += 10; });
+  const verdict = judge(regression, { expectedFps: 60 });
+  assert.equal(verdict.cpuLimited, false);
+  assert.deepEqual(verdict.errors, ["viewer cadence 30", "captured source cadence 30", "encoded cadence 30"]);
+});
+
 test("slow frames at a low cadence are not CPU saturation, and bandwidth never waives size", () => {
   // Sol's round-2 repro: native first, then 960x540 with `bandwidth` and 15 ms frames, for 60 fps.
   const quarter = (fps, encodeMs) => run({ fps: 60, at: t => t < 10 ? {} : { size: [960, 540], fps, encodeMs, limitation: "bandwidth" } });

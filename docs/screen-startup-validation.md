@@ -107,6 +107,14 @@ unrecovered. No default run makes an allocation probe. Chromium's `cpu` flag alo
 would fail three more busy runs on cadence (48–50 fps, encoder load 0.88–0.99), and
 a 0.9 threshold one more (46 fps, load 0.83–0.99).
 
+**Review round 3 (27 October).** Restore writes, fallbacks, completions and retries
+carry the restoration's generation, so a late completion from a replaced transport or
+a rejection after `pagehide` no longer touches the current restore. The encoder-load
+window now restarts on a new outbound id, encoder or codec, a missing counter or a
+counter decrease, and needs four seconds of one stream's history. The replay of the
+same 661 timelines is unchanged: five failures, the same runs, and 302 runs with
+CPU-limited samples. With the round-2 CI run added (673 timelines), there are still five failures.
+
 25 October 2026. Local macOS arm64, full Playwright Chromium 153.0.8010.12,
 WebKit, local SFU and real browser viewers. Main is pinned to
 `e8fb01e358ed6a5e6f855025c4417829ede379e1`; the previous candidate is

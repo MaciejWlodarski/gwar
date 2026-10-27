@@ -994,6 +994,55 @@ describe("publisher stale estimate probe", () => {
     } finally { vi.unstubAllGlobals(); }
   });
 
+  it("a late restore of a replaced transport cannot cancel the new transport's watchdog", async () => {
+    const state = vi.fn();
+    const publisher = new ScreenPublisher({ track: { applyConstraints: vi.fn(async () => {}) } as unknown as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state });
+    await publisher.start();
+    const old = Peer.all[0]!; stale(old); old.connectionState = "connected";
+    const { sender: oldSender } = record(old);
+    await vi.advanceTimersByTimeAsync(14_000);
+    let releaseOld!: () => void;
+    oldSender.setParameters.mockImplementationOnce(() => new Promise<void>(r => { releaseOld = r; }));
+    await vi.advanceTimersByTimeAsync(1_500); // the old restore (15 s) hangs
+    await publisher.recover({ share: "s", codec: "h264", width: 1920, height: 1080, fps: 60 });
+    const pc = Peer.all[1]!; stale(pc); pc.connectionState = "connected";
+    const { sender } = record(pc);
+    await vi.advanceTimersByTimeAsync(12_500); // the new transport's lift
+    expect(publisher.bitrate).toBe(8_000_000);
+    releaseOld(); await vi.advanceTimersByTimeAsync(0);
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    sender.setParameters.mockImplementation(() => new Promise<void>(() => {}));
+    pc.getStats.mockImplementation(() => new Promise(() => {}));
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(pc.close).toHaveBeenCalled();
+    expect(state).toHaveBeenCalledWith("failed");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a restore rejected after the page went away neither falls back nor retries", async () => {
+    const page = new EventTarget();
+    vi.stubGlobal("addEventListener", page.addEventListener.bind(page));
+    vi.stubGlobal("removeEventListener", page.removeEventListener.bind(page));
+    try {
+      const publisher = make(); await publisher.start();
+      const pc = Peer.all[0]!; stale(pc); pc.connectionState = "connected";
+      const { sender } = record(pc);
+      await vi.advanceTimersByTimeAsync(14_000);
+      let reject!: (e: Error) => void;
+      sender.setParameters.mockImplementationOnce(() => new Promise<void>((_, r) => { reject = r; }));
+      await vi.advanceTimersByTimeAsync(1_500);
+      pc.getStats.mockImplementation(() => new Promise(() => {}));
+      page.dispatchEvent(new Event("pagehide"));
+      const writes = sender.setParameters.mock.calls.length;
+      sender.setParameters.mockRejectedValue(new Error("gone"));
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      reject(new Error("page gone"));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(sender.setParameters).toHaveBeenCalledTimes(writes);
+      publisher.close(); expect(vi.getTimerCount()).toBe(0);
+    } finally { vi.unstubAllGlobals(); }
+  });
+
   it.each([
     ["frozen", () => ({ framesEncoded: 1, bytesSent: 1 })],
     ["missing", () => ({ framesEncoded: undefined, bytesSent: undefined })],

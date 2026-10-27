@@ -579,7 +579,10 @@ write queue bounds it: if the cap is not back ten seconds after the lift (every 
 rejected, or one that never settles holding the queue), the publisher closes the
 transport and reports it failed, the same path as a failed connection, which ends the
 share with a notice. The share never keeps sending above its cap. A page going away
-(`pagehide`) cancels a lift and its restore retries. Failed probes back off
+(`pagehide`) cancels a lift and its restore retries. Each restoration has its own
+generation, which a close, recovery or `pagehide` advances: a write, fallback, completion
+or retry of a cancelled restoration does nothing, so a late completion from a replaced
+transport cannot clear the new transport's pending restore or watchdog. Failed probes back off
 10 → 20 → 40 → … → 300 s; a probe that raised the estimate by 25 % restarts the
 backoff. Busy content, which fills its cap, never qualifies; neither does a share
 already at native size. A close or codec recovery cancels a pending lift and restore;
@@ -626,7 +629,9 @@ like this (`e2e/screen-startup-judge.mjs`, with unit tests in the web job):
 - *Cadence:* the median capture and encode cadence of the samples that are not
   CPU-limited must hold 85 % of the expected rate. A sample is CPU-limited when
   Chromium reports `cpu`, or when the encoder was saturated over the preceding four
-  seconds: at least 0.8 s of encode time per wall second. A share's frames are encoded
+  seconds: at least 0.8 s of encode time per wall second. Those four seconds must
+  come from one stream: a new outbound id, encoder or codec, a missing counter or a
+  counter that went back restarts the window. A share's frames are encoded
   one at a time, so 1.0 is a fully busy encoder. Chromium flags the overload tens of
   seconds late: on the runner OpenH264 encodes busy 1080p at 46–50 fps, 18 ms per
   frame and 0.83–0.99 s per second, with the reason still `none`. Time per frame

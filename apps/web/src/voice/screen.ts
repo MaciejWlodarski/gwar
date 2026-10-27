@@ -636,6 +636,8 @@ export class ScreenPublisher {
   /** A lift's cap must still come back: set until a write of the headroom cap succeeds. */
   private restoring = false;
   private lift = 0;
+  /** The current lift's restoration: `endProbe` advances it, so its stale writes, completions and retries stop. */
+  private restoration = 0;
   /** The latest uplink estimate, for the cap a probe restores. */
   private available: number | undefined;
   private run = 0;
@@ -955,6 +957,7 @@ export class ScreenPublisher {
     this.restoreWatchdog = null;
     this.restoring = false;
     this.lift++;
+    this.restoration++;
   }
 
   private endPhaseAfter(ms: number): void {
@@ -978,28 +981,31 @@ export class ScreenPublisher {
    * transport does: the share must not keep sending above its cap.
    */
   private liftCap(cap: number): void {
-    const lift = ++this.lift, deadline = performance.now() + 1_000;
+    const lift = ++this.lift, restoration = ++this.restoration, deadline = performance.now() + 1_000;
     this.restoring = true;
     void this.applyParameters(cap, () => this.lift === lift && performance.now() < deadline);
-    this.probeTimer = setTimeout(() => this.restoreCap(lift, 1_000), 1_000);
+    this.probeTimer = setTimeout(() => this.restoreCap(lift, restoration, 1_000), 1_000);
     this.restoreWatchdog = setTimeout(() => {
+      if (this.restoration !== restoration || this.closed) return;
       this.restoreWatchdog = null;
-      if (this.closed || !this.restoring) return;
       console.warn("Screen sender: the bitrate cap could not be restored after a probe");
       this.close();
       this.params.state("failed");
     }, RESTORE_DEADLINE_MS);
   }
 
-  private restoreCap(lift: number, retry: number): void {
+  /** Every step is fenced by `restoration`: a cancelled restore (close, recover, pagehide) never writes, retries or clears state. */
+  private restoreCap(lift: number, restoration: number, retry: number): void {
+    const current = () => this.restoration === restoration && !this.closed;
+    if (!current()) return;
     this.probeTimer = null;
     const pc = this.pc;
-    if (this.closed || !pc) { this.restoring = false; return; }
+    if (!pc) { this.endProbe(); return; }
     if (this.lift === lift) this.lift++; // the lift is over, even if its write is still queued
-    void this.applyParameters(headroomBitrate(this.spec().maxBitrate, this.available)).then(written => {
-      if (this.closed || this.pc !== pc) { this.restoring = false; return; }
+    void this.applyParameters(headroomBitrate(this.spec().maxBitrate, this.available), current).then(written => {
+      if (!current() || this.pc !== pc) return;
       if (written) { this.endProbe(); return; }
-      this.probeTimer = setTimeout(() => this.restoreCap(lift, Math.min(8_000, retry * 2)), retry);
+      this.probeTimer = setTimeout(() => this.restoreCap(lift, restoration, Math.min(8_000, retry * 2)), retry);
     });
   }
 

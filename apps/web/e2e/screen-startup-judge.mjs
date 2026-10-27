@@ -15,16 +15,22 @@ export const LOAD_WINDOW = 4;
 /**
  * The encoder's load before each row: seconds spent encoding per wall second over the preceding
  * `LOAD_WINDOW` seconds. A share's frames are encoded one at a time, so 1 is a saturated encoder.
- * Undefined until a full window exists.
+ * The window covers one stream only: a new outbound id, encoder or codec, a missing counter or
+ * a counter that went back restarts it, and a row has a load only after a full window of that
+ * stream's history.
  */
 export function encoderLoad(rows) {
   const load = new Map();
+  const same = (a, b) => a.id === b.id && a.encoderImplementation === b.encoderImplementation && a.codecId === b.codecId;
+  let start = 0;
   rows.forEach((row, i) => {
+    const out = row.out, previous = rows[i - 1]?.out;
+    if (!out || !Number.isFinite(out.totalEncodeTime) || !Number.isFinite(out.framesEncoded)) { start = i + 1; return; }
+    if (i > start && (!same(out, previous) || out.totalEncodeTime < previous.totalEncodeTime || out.framesEncoded < previous.framesEncoded)) start = i;
     let j = i;
-    while (j >= 0 && row.elapsed - rows[j].elapsed < LOAD_WINDOW) j--;
-    if (j < 0) return;
-    const busy = (row.out?.totalEncodeTime ?? NaN) - (rows[j].out?.totalEncodeTime ?? NaN);
-    if (busy >= 0) load.set(row, busy / (row.elapsed - rows[j].elapsed));
+    while (j >= start && row.elapsed - rows[j].elapsed < LOAD_WINDOW) j--;
+    if (j < start) return;
+    load.set(row, (out.totalEncodeTime - rows[j].out.totalEncodeTime) / (row.elapsed - rows[j].elapsed));
   });
   return load;
 }
