@@ -604,13 +604,15 @@ viewer must decode its smaller output.
 cap sends about 70 % of the estimate, and GCC may raise its estimate only to 1.5× the
 acknowledged rate: across 162 CI busy H.264 shares the estimate sat at 1.58× the
 transport's send rate (median of each share's median; 1.57–1.62 for the middle 80 %).
-Each cap write therefore lets the estimate grow by about 12 %, and the cap moves only
-every second poll (4 s), so a busy share gains about 3 % per second instead of GCC's 8 %. Locally, busy H.264
+Each cap write therefore lets the estimate grow by about 12 %. The cap may move every
+2 s poll when the target changes by more than 10 %, but in the measured runs it moved
+about every second poll (4 s), so a busy share gained about 3 % per second instead of
+GCC's 8 %. Locally, busy H.264
 needs 23–28 s for the estimate to reach the 11.4 Mb/s at which the 8 Mb/s cap stops
 binding (median 24.8 s), against about 12 s without the headroom rule. Writing the
-cap more often does not help: after every `maxBitrate` write Chromium sets the
-encoder target to exactly 1/1.2 of the new cap for about a second (944 of 949 upward
-writes in CI), which cancels the gain. On the runner OpenH264 meanwhile adapts down
+cap more often did not help in these runs: after almost every `maxBitrate` write
+Chromium set the encoder target to exactly 1/1.2 of the new cap for about a second
+(944 of 949 upward writes in CI, 112 of 112 locally), which cancels the gain. On the runner OpenH264 meanwhile adapts down
 at 1440×810 or 960×540 (docs/screen-startup-validation.md, "Busy H.264 ramp"), and it
 can take until the estimate passes about 12 Mb/s (up to 60 s) to return to 1080p. The
 probe cannot help: the stream is not application-limited, so Chromium does not probe.

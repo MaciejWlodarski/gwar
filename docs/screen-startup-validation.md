@@ -53,8 +53,11 @@ variant that wrote the cap on every 2 % move made 11–13 writes per share inste
 **Fixed: the last step to the cap.** In 148 CI shares, 70 % of the estimate covered the
 spec's 8 Mb/s for the whole settled window. In 122 of them, and in 9 of 9 local main runs,
 the cap still never reached 8 Mb/s. The estimate had passed 11.4 Mb/s in a step under
-10 %, and the cap stayed up to 9 % below (median 4.2 %) for the rest of the share. A smooth share now writes the spec's cap as soon as 70 % of the estimate covers
-it. The headroom share is unchanged, and the cap never exceeds 70 % of the estimate.
+10 %, and the cap stayed up to 9 % below (median 4.2 %) for the rest of the share. A
+smooth share now writes the spec's cap as soon as 70 % of the sampled estimate covers
+it. The headroom share is unchanged, and this ceiling write never exceeds 70 % of the
+estimate it was computed from (the dead band, the minimum floor and the allocation
+probe behave as before).
 
 | Local busy H.264, 60 s | main `db3d5bd9` (9) | this change (6) |
 | --- | --- | --- |
@@ -78,7 +81,8 @@ effect on voice under a congested uplink was not measured.
 
 **Verdict.** The slow ramp is a real property of the product, not a CI artefact. It is
 the documented headroom trade-off (docs/screen-share.md, "Design trade-off"), and it
-applies to every busy smooth share that starts below about 11 Mb/s. It becomes a CI
+applies to every busy smooth share whose startup estimate is below `spec.maxBitrate / 0.7`
+(about 11.4 Mb/s for the tested 8 Mb/s cap). It becomes a CI
 failure only when a low startup estimate meets the runner's slow encoder. The failures
 stay in the diagnostic, which is deliberate. Shortening the ramp needs a larger share,
 or a lift past 70 % while the share fills its cap; both are the owner's decision.
