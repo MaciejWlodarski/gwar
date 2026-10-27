@@ -837,8 +837,10 @@ export class ScreenPublisher {
       this.liftCap(spec.maxBitrate);
       return;
     }
-    // Small moves are not worth a parameter change.
-    if (Math.abs(target - this.desired) > this.desired * 0.1) void this.applyParameters(target);
+    // Small moves are not worth a parameter change, except the last one up to the spec's cap: a
+    // smooth share whose estimate grew past it would otherwise keep up to 10 % less for good.
+    const ceiling = spec.degradation === "maintain-framerate" && target === spec.maxBitrate && this.desired < target;
+    if (ceiling || Math.abs(target - this.desired) > this.desired * 0.1) void this.applyParameters(target);
   }
 
   /**

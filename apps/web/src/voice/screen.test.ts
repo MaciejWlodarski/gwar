@@ -202,6 +202,28 @@ describe("publish transport", () => {
     expect(pc.close).toHaveBeenCalled();
   });
 
+  it.each([
+    // Game's 8 Mb/s cap: down to 6.3, up to 7.28 (91 %), then 7.56 and 70 % of 12 Mb/s, past the cap.
+    ["smooth", TEST_SPECS.game, [9_000_000, 10_400_000, 10_800_000, 12_000_000], [6_300_000, 7_280_000, 7_280_000, 8_000_000]],
+    // Text's 2.5 Mb/s cap: sharp keeps the 10 % rule up to the cap as well.
+    ["sharp", TEST_SPECS.text, [2_800_000, 3_250_000, 3_350_000, 4_000_000], [1_959_999, 2_275_000, 2_275_000, 2_275_000]],
+  ] as const)("a %s share skips small cap moves; smooth still takes the last one up to the spec's cap", async (_, quality, estimates, caps) => {
+    const publisher = new ScreenPublisher({ track: { applyConstraints: async () => {} } as unknown as MediaStreamTrack, quality, iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!, seen: number[] = [];
+    for (const available of estimates) {
+      pc.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: available });
+      await vi.advanceTimersByTimeAsync(2_000);
+      seen.push(publisher.bitrate);
+    }
+    // The last two moves are under 10 % (4 % below the cap, 10 % short of it): only smooth writes the cap.
+    expect(seen).toEqual(caps);
+    const writes = pc.sendParams.length;
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(pc.sendParams).toHaveLength(writes);
+    publisher.close();
+  });
+
   it("retries the current headroom cap after a transient failure of both sender writes", async () => {
     const publisher = new ScreenPublisher({ track: { applyConstraints: async () => {} } as unknown as MediaStreamTrack,
       quality: TEST_SPECS.smooth, iceServers: [], offer: async () => "answer", state: () => {} });
