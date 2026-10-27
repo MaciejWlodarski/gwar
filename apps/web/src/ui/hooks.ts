@@ -5,7 +5,7 @@ import type { Permission } from "../proto/Permission";
 import { controller } from "../state/controller";
 import { hasGlobalShortcut, isGlobalShortcutEvent } from "../platform/desktop";
 import { useSettings } from "../state/settings";
-import { useSession, useVoice } from "../state/stores";
+import { useSession, useUi, useVoice } from "../state/stores";
 import { memberName } from "../lib/member-name";
 import { nameColor, type Who } from "../lib/permissions";
 import { channelPermissions } from "../lib/channel-permissions";
@@ -104,6 +104,21 @@ export function useTheme(): void {
 function isEditable(target: EventTarget | null): boolean {
   const el = target as HTMLElement | null;
   return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+}
+
+/**
+ * Esc on a page (settings, bug report) goes back to the section it was opened from, as it would close
+ * a dialog. Not while typing, and not when the key already closed something (Radix layers mark it handled).
+ */
+export function useEscapeBack(): void {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape" || e.defaultPrevented || isEditable(e.target)) return;
+      useUi.getState().goBack();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
 }
 
 /** Mute / deafen shortcuts and push-to-talk. */

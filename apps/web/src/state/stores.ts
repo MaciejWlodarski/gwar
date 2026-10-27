@@ -102,10 +102,15 @@ export interface Toast {
   text: string;
 }
 
-/** The global rail's sections: home hides the server column and the channel panel. */
-export type Section = "home" | "servers";
+/**
+ * The global rail's sections. Every one but `servers` lies over the server view (which stays mounted
+ * underneath, so voice, chat and a watched share keep running).
+ */
+export type Section = "home" | "servers" | "settings" | "bugReport";
 
 export type SettingsTab = "audio" | "notifications" | "appearance" | "identity" | "account" | "language";
+/** The settings tabs the rail's account avatar stands for; the gear stands for the rest. */
+export const profileTabs: readonly SettingsTab[] = ["identity", "account"];
 export type ServerSettingsTab = "overview" | "roles" | "members" | "ownership" | "cleanup" | "bans" | "invites";
 
 /** Whom a moderation dialog is about: an online session and/or a known member. */
@@ -118,7 +123,6 @@ export interface PersonRef {
 
 export type DialogState =
   | { kind: "none" }
-  | { kind: "settings"; tab: SettingsTab }
   | { kind: "addServer"; editId?: string }
   /** A new server group (holding `server` if given), or the group `id` to edit. */
   | { kind: "serverGroup"; id?: string; server?: string }
@@ -137,7 +141,6 @@ export type DialogState =
   | { kind: "removeMember"; person: PersonRef; back?: ServerSettingsTab }
   | { kind: "lightbox"; attachment: Attachment; verified: boolean }
   | { kind: "redeem" }
-  | { kind: "bugReport" }
   | { kind: "createToken" }
   | { kind: "serverKey" }
   | { kind: "readers"; thread: SealedThreadKey }
@@ -160,9 +163,20 @@ interface UiStore {
   /** The message being edited in place (channel messages only). */
   editing: number | null;
   section: Section;
+  /** Where Esc (or Cancel) on the settings and bug report pages goes back to: the section before them. */
+  back: Section;
+  /** The settings page's open tab. */
+  settingsTab: SettingsTab;
+  /** The tab the gear opens: the last one open that is not a profile tab. */
+  gearTab: SettingsTab;
   /** The server overview fills the main area in place of the chat. */
   overview: boolean;
   setSection(section: Section): void;
+  /** The settings page, on `tab` or on the gear's. */
+  openSettings(tab?: SettingsTab): void;
+  setSettingsTab(tab: SettingsTab): void;
+  /** Leaves the settings or bug report page for the section it was opened from. */
+  goBack(): void;
   showOverview(): void;
   showChat(): void;
   setEditing(message: number | null): void;
@@ -178,6 +192,11 @@ interface UiStore {
 
 let toastId = 1;
 
+const tabState = (s: Pick<UiStore, "gearTab">, tab: SettingsTab) => ({ settingsTab: tab, gearTab: profileTabs.includes(tab) ? s.gearTab : tab });
+
+/** The way back from a page: where it was opened from, kept while moving between the pages. */
+const pageBack = (s: Pick<UiStore, "section" | "back">): Section => (s.section === "settings" || s.section === "bugReport" ? s.back : s.section);
+
 export const useUi = create<UiStore>()((set) => ({
   toasts: [],
   dialog: { kind: "none" },
@@ -187,8 +206,14 @@ export const useUi = create<UiStore>()((set) => ({
   joining: null,
   editing: null,
   section: "servers",
+  back: "servers",
+  settingsTab: "audio",
+  gearTab: "audio",
   overview: false,
-  setSection: (section) => set({ section }),
+  setSection: (section) => set((s) => ({ section, back: pageBack(s) })),
+  openSettings: (tab) => set((s) => ({ ...tabState(s, tab ?? s.gearTab), section: "settings", back: pageBack(s) })),
+  setSettingsTab: (tab) => set((s) => tabState(s, tab)),
+  goBack: () => set((s) => ({ section: s.back })),
   showOverview: () => set({ section: "servers", overview: true }),
   showChat: () => set({ section: "servers", overview: false }),
   setEditing: (editing) => set({ editing }),

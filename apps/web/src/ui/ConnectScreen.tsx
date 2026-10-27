@@ -45,7 +45,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
   const { busy, error, needPassword, serverName, invite } = useConnectUi();
   const closeReason = useSession((s) => s.closeReason);
   const setDrawer = useUi((s) => s.setDrawer);
-  const openDialog = useUi((s) => s.openDialog);
+  const openSettings = useUi((s) => s.openSettings);
   const account = useAccount((s) => s.account);
   const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "gwar");
   const [address, setAddress] = useState(invite?.server ? addressLabel(invite.server, pageContextFromLocation()) : lastAddress);
@@ -237,7 +237,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
 
         <button
           type="button"
-          onClick={() => openDialog({ kind: "settings", tab: "account" })}
+          onClick={() => openSettings("account")}
           className="t -mt-2 flex w-full max-w-sm cursor-pointer items-center gap-3 rounded-lg border border-line px-3 py-2 text-left hover:bg-hover"
         >
           <CloudCog className="size-4 shrink-0 text-muted" />

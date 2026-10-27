@@ -804,7 +804,7 @@ class Controller {
     // A changed server identity is about the next attempt, not the ended session: it stays, whatever the timing.
     const dialog = useUi.getState().dialog;
     const nextAttempt = dialog.kind === "confirm" && dialog.serverIdentity === true;
-    if (dialog.kind !== "none" && dialog.kind !== "settings" && dialog.kind !== "addServer" && !nextAttempt) useUi.getState().closeDialog();
+    if (dialog.kind !== "none" && dialog.kind !== "addServer" && !nextAttempt) useUi.getState().closeDialog();
     useOutbox.getState().clear();
     this.uploaded.clear();
     useSession.getState().dispatch({ type: "reset" });

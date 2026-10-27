@@ -1,7 +1,7 @@
 import { sameServer } from "../lib/server-key";
 import { DELETION_TEXT } from "../net/message-signature";
 import { bookmarkParams, controller } from "../state/controller";
-import { totalDmUnread } from "../state/reducer";
+import { myChannelId, totalDmUnread } from "../state/reducer";
 import type { Bookmark, ServerGroup } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import type { ChatItem } from "../state/types";
@@ -13,6 +13,29 @@ export function useServerUnread(): number {
     const ch = Object.entries(s.threads).reduce((n, [k, th]) => (k === "server" || k.startsWith("ch:") ? n + th.unread : n), 0);
     return dm + ch;
   });
+}
+
+/** In a voice channel of the server this session is on (also while it reconnects). */
+export function useInVoice(): boolean {
+  return useSession((s) => (s.phase === "online" || s.phase === "reconnecting") && myChannelId(s) !== null);
+}
+
+/** The floating voice pill stands in for the voice panel wherever the server view is not shown. */
+export function useVoicePill(): boolean {
+  const covered = useUi((s) => s.section !== "servers");
+  return useInVoice() && covered;
+}
+
+/** Back to the server view with my voice channel open: its chat, and its row unfolded in the tree. */
+export function showVoiceChannel(): void {
+  const s = useSession.getState();
+  const channel = myChannelId(s);
+  if (channel === null) return;
+  const unfold: Record<number, boolean> = {};
+  for (let id = s.channels[channel]?.parent ?? null, n = 0; id !== null && n < 64; id = s.channels[id]?.parent ?? null, n++) unfold[id] = false;
+  useUi.setState((ui) => ({ collapsed: { ...ui.collapsed, ...unfold } }));
+  useUi.getState().showChat();
+  controller.selectChannel(channel);
 }
 
 /** Whether a saved server is the one this session is on, and opening one (connecting unless it is). */

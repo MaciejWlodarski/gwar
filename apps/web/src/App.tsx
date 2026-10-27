@@ -8,6 +8,7 @@ import { initDesktop } from "./platform/desktop";
 import { initUpdates } from "./platform/updater";
 import { controller } from "./state/controller";
 import { useSession, useUi } from "./state/stores";
+import { BugReportSection } from "./ui/BugReport";
 import { ChatArea } from "./ui/Chat";
 import { ConnectionWarning } from "./ui/ConnectionWarning";
 import { ConnectScreen } from "./ui/ConnectScreen";
@@ -21,6 +22,7 @@ import { Overview } from "./ui/Overview";
 import { useServerUnread } from "./ui/nav";
 import { SectionRail, SectionTabs } from "./ui/SectionRail";
 import { ServerRail } from "./ui/ServerRail";
+import { SettingsSection } from "./ui/Settings";
 import { SharePresetDialog, SharingBar, Stage } from "./ui/Screen";
 import { useScreen } from "./state/screen";
 import { Sidebar } from "./ui/Sidebar";
@@ -34,7 +36,8 @@ export function App() {
   const serverName = useSession((s) => s.server?.name);
   const unread = useServerUnread();
   const address = useSession((s) => s.address);
-  const home = useUi((s) => s.section === "home");
+  const section = useUi((s) => s.section);
+  const covered = section !== "servers";
   // With a share on stage the stage wins; the overview waits until it closes.
   const overview = useUi((s) => s.overview);
   const drawerOpen = useUi((s) => s.drawerOpen);
@@ -74,10 +77,10 @@ export function App() {
         {showApp && <SharingBar />}
         <div className="flex min-h-0 w-full flex-1 overflow-hidden">
           {!isMobile && <SectionRail />}
-          {/* Home and the overview lie over the server view instead of replacing it: the chat keeps
-              its drafts, files and scroll position, and a watched share keeps playing underneath. */}
+          {/* The other sections and the overview lie over the server view instead of replacing it: the chat
+              keeps its drafts, files and scroll position, and voice and a watched share keep running underneath. */}
           <div className="relative flex min-w-0 flex-1">
-            <div inert={home} className={cn("flex min-w-0 flex-1", !isMobile && "gap-2 py-2 pr-2", home && "invisible")}>
+            <div inert={covered} className={cn("flex min-w-0 flex-1", !isMobile && "gap-2 py-2 pr-2", covered && "invisible")}>
               {!isMobile && <ServerRail card />}
               {showApp ? (
                 <div className={cn("flex min-w-0 flex-1", !isMobile && "gap-2")}>
@@ -110,9 +113,15 @@ export function App() {
                 <ConnectScreen card={!isMobile} />
               )}
             </div>
-            {home && (
+            {covered && (
               <div className={cn("absolute inset-0 flex", !isMobile && "py-2 pr-2")}>
-                <Home card={!isMobile} />
+                {section === "home" ? (
+                  <Home card={!isMobile} />
+                ) : section === "settings" ? (
+                  <SettingsSection card={!isMobile} />
+                ) : (
+                  <BugReportSection card={!isMobile} />
+                )}
               </div>
             )}
           </div>

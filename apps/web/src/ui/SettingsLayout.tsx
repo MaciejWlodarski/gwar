@@ -1,11 +1,15 @@
 import * as DialogPrimitive from "@radix-ui/react-dialog";
 import * as Tabs from "@radix-ui/react-tabs";
-import { X } from "lucide-react";
+import { Menu, X } from "lucide-react";
 import type { ReactNode } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { useIsMobile } from "../lib/media";
-import { IconButton } from "./kit";
+import { useUi } from "../state/stores";
+import { useEscapeBack } from "./hooks";
+import { IconButton, panelCard } from "./kit";
+import { useVoicePill } from "./nav";
+import { VoicePill } from "./VoicePanel";
 
 export interface SettingsPage<T extends string> {
   id: T;
@@ -14,6 +18,9 @@ export interface SettingsPage<T extends string> {
   /** Lists and two-column editors use the full width; forms stay readable at a narrower one. */
   wide?: boolean;
 }
+
+const tabTrigger =
+  "t flex h-9 shrink-0 cursor-pointer focus-visible:outline-offset-[-2px] items-center gap-2.5 rounded-md px-2.5 text-left text-sm text-muted hover:bg-hover hover:text-fg data-[state=active]:bg-active data-[state=active]:font-medium data-[state=active]:text-fg [&>svg]:shrink-0";
 
 /** A settings window of a fixed size: pages on the left (on top on phones), the open page on the right.
  *  The size never depends on the page, so switching pages keeps the navigation where it was. */
@@ -71,7 +78,7 @@ export function SettingsLayout<T extends string>({
                   <Tabs.Trigger
                     key={p.id}
                     value={p.id}
-                    className="t flex h-9 shrink-0 cursor-pointer focus-visible:outline-offset-[-2px] items-center gap-2.5 rounded-md px-2.5 text-left text-sm text-muted hover:bg-hover hover:text-fg data-[state=active]:bg-active data-[state=active]:font-medium data-[state=active]:text-fg [&>svg]:shrink-0"
+                    className={tabTrigger}
                   >
                     {p.icon}
                     <span className="truncate">{p.label}</span>
@@ -100,5 +107,81 @@ export function SettingsLayout<T extends string>({
         </DialogPrimitive.Content>
       </DialogPrimitive.Portal>
     </DialogPrimitive.Root>
+  );
+}
+
+/**
+ * Settings as a section of the app: the pages in a card of their own where the server column and channel
+ * panel stand in the server view, the open page in the main card. On phones one column, the pages on top.
+ * Esc goes back to the section it was opened from.
+ */
+export function SettingsPageLayout<T extends string>({
+  title,
+  icon,
+  pages,
+  value,
+  onValueChange,
+  card,
+  children,
+}: {
+  title: string;
+  icon: ReactNode;
+  pages: Array<SettingsPage<T>>;
+  value: T;
+  onValueChange: (v: T) => void;
+  card?: boolean;
+  children: (page: T) => ReactNode;
+}) {
+  const t = useT();
+  const isMobile = useIsMobile();
+  const setDrawer = useUi((s) => s.setDrawer);
+  const pill = useVoicePill();
+  const current = pages.find((p) => p.id === value);
+  useEscapeBack();
+  return (
+    <Tabs.Root
+      value={value}
+      onValueChange={(v) => onValueChange(v as T)}
+      orientation={isMobile ? "horizontal" : "vertical"}
+      className={cn("flex min-w-0 flex-1", isMobile ? "flex-col bg-surface" : "gap-2")}
+    >
+      <div className={cn("flex shrink-0 flex-col", isMobile ? "border-b border-line" : cn("w-[280px] bg-side", card && panelCard))}>
+        <div className={cn("flex shrink-0 items-center gap-2", isMobile ? "h-12 px-3" : "h-14 px-5")}>
+          {isMobile && (
+            <IconButton label={t("nav.channels")} onClick={() => setDrawer(true)} className="-ml-1">
+              <Menu className="size-5" />
+            </IconButton>
+          )}
+          <span className="text-subtle [&>svg]:size-5">{icon}</span>
+          <h1 className="truncate text-base font-semibold text-fg">{title}</h1>
+        </div>
+        <Tabs.List
+          aria-label={title}
+          className={cn("flex gap-1 px-3 pb-3", isMobile ? "overflow-x-auto" : "min-h-0 flex-1 flex-col overflow-x-hidden overflow-y-auto")}
+        >
+          {pages.map((p) => (
+            <Tabs.Trigger key={p.id} value={p.id} className={tabTrigger}>
+              {p.icon}
+              <span className="truncate">{p.label}</span>
+            </Tabs.Trigger>
+          ))}
+        </Tabs.List>
+      </div>
+      <main aria-label={title} className={cn("relative flex min-h-0 min-w-0 flex-1 flex-col bg-surface", card && panelCard)}>
+        {!isMobile && (
+          <header className="flex h-14 shrink-0 items-center gap-2 border-b border-line px-6">
+            <h2 className="truncate text-base font-semibold text-fg">{current?.label}</h2>
+          </header>
+        )}
+        <div className={cn("min-h-0 flex-1 overflow-y-auto [scrollbar-gutter:stable]", pill && "pb-20")}>
+          {pages.map((p) => (
+            <Tabs.Content key={p.id} value={p.id} className={cn("px-4 py-5 outline-none md:px-6", !p.wide && "max-w-[720px]")}>
+              {children(p.id)}
+            </Tabs.Content>
+          ))}
+        </div>
+        <VoicePill />
+      </main>
+    </Tabs.Root>
   );
 }

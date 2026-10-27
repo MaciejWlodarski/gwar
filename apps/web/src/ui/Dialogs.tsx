@@ -9,7 +9,6 @@ import type { Channel } from "../proto/Channel";
 import type { ChannelAccess } from "../proto/ChannelAccess";
 import { AccessPicker } from "./ChannelAccess";
 import { ChannelPermissionsDialog } from "./ChannelPermissions";
-import { BugReportDialog } from "./BugReport";
 import { rebaseAccess, sameAccess } from "../lib/access";
 import { bookmarkParams, controller, describeJoinError, describeRequestError } from "../state/controller";
 import { sortedChannels } from "../state/reducer";
@@ -17,7 +16,6 @@ import { isDesktop } from "../platform";
 import { GROUP_COLORS, newId, useSettings, type ServerKind } from "../state/settings";
 import { useSession, useUi, type DialogState } from "../state/stores";
 import { Button, Dialog, Field, Input, Segmented, Select, Textarea, Switch } from "./kit";
-import { SettingsDialog } from "./Settings";
 import { HearersDialog, ReadersDialog } from "./Readers";
 import { BanDialog } from "./BanDialog";
 import { ChannelInfoDialog, PokeDialog } from "./TeamspeakDialogs";
@@ -37,10 +35,6 @@ export function Dialogs() {
   switch (dialog.kind) {
     case "none":
       return null;
-    case "settings":
-      return <SettingsDialog tab={dialog.tab} />;
-    case "bugReport":
-      return <BugReportDialog />;
     case "serverGroup":
       return <ServerGroupDialog id={dialog.id} server={dialog.server} />;
     case "addServer":

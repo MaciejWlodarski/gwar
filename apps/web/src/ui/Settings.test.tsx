@@ -3,9 +3,9 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { defaultAudio, useSettings } from "../state/settings";
-import { useVoice } from "../state/stores";
+import { useUi, useVoice } from "../state/stores";
 import { VoiceError } from "../voice/engine";
-import { SettingsDialog } from "./Settings";
+import { SettingsSection } from "./Settings";
 import { TooltipProvider } from "./kit";
 
 const voice = vi.hoisted(() => ({
@@ -45,7 +45,7 @@ afterEach(async () => {
 const button = (label: string) => [...document.querySelectorAll<HTMLButtonElement>("button")].find((b) => b.textContent === label)!;
 const meter = () => document.querySelector('[role="meter"]')!;
 async function startTest() {
-  await act(async () => root.render(<TooltipProvider><SettingsDialog tab="audio" /></TooltipProvider>));
+  await act(async () => { useUi.getState().openSettings("audio"); root.render(<TooltipProvider><SettingsSection /></TooltipProvider>); });
   await act(async () => button("Test microphone").click());
   expect(voice.startMicTest).toHaveBeenCalledTimes(1);
 }
@@ -100,7 +100,7 @@ describe("microphone test replacement", () => {
 
 describe("capture processing", () => {
   it("offers noise suppression's strength beside echo cancellation", async () => {
-    await act(async () => root.render(<TooltipProvider><SettingsDialog tab="audio" /></TooltipProvider>));
+    await act(async () => { useUi.getState().openSettings("audio"); root.render(<TooltipProvider><SettingsSection /></TooltipProvider>); });
     const strength = document.querySelector<HTMLElement>('[role="slider"][aria-label="Noise suppression strength"]')!;
     expect(strength.getAttribute("aria-valuenow")).toBe("100");
     expect([...document.querySelectorAll("*")].some((e) => e.children.length === 0 && e.textContent === "Echo cancellation")).toBe(true);

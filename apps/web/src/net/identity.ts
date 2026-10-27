@@ -6,7 +6,7 @@
  * Storage decision: the key is persisted as a JWK in IndexedDB and imported
  * into WebCrypto as a *non-extractable* CryptoKey for signing at runtime. We
  * deliberately do not store a non-extractable CryptoKeyPair, because the
- * settings dialog must be able to export the identity (backup / move to
+ * settings page must be able to export the identity (backup / move to
  * another device or the desktop app) and import one later. A non-extractable
  * key can never be exported, so that would make backups impossible. The cost:
  * script running on our origin can read the JWK from IndexedDB; that is the

@@ -1,4 +1,4 @@
-import { Bell, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
+import { Bell, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, Settings as SettingsIcon, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { tNow, useT } from "../i18n";
 import { cn } from "../lib/cn";
@@ -17,14 +17,15 @@ import { useSession, useUi, useVoice, type SettingsTab } from "../state/stores";
 import { VoiceError } from "../voice/engine";
 import { keyLabel } from "./hooks";
 import { Button, Field, Input, Section, Segmented, Select, Slider, Switch } from "./kit";
-import { SettingsLayout, type SettingsPage } from "./SettingsLayout";
+import { SettingsPageLayout, type SettingsPage } from "./SettingsLayout";
 
 const DEFAULT = "__default";
 
-export function SettingsDialog({ tab }: { tab: SettingsTab }) {
+/** The settings section: the gear opens it on the last tab, the account avatar on the identity tab. */
+export function SettingsSection({ card }: { card?: boolean }) {
   const t = useT();
-  const close = useUi((s) => s.closeDialog);
-  const [current, setCurrent] = useState<SettingsTab>(tab);
+  const tab = useUi((s) => s.settingsTab);
+  const setTab = useUi((s) => s.setSettingsTab);
   const tabs: Array<SettingsPage<SettingsTab>> = [
     { id: "audio", label: t("settings.audio"), icon: <SlidersHorizontal className="size-4" /> },
     { id: "notifications", label: t("settings.notifications"), icon: <Bell className="size-4" /> },
@@ -34,7 +35,7 @@ export function SettingsDialog({ tab }: { tab: SettingsTab }) {
     { id: "language", label: t("settings.language"), icon: <Languages className="size-4" /> },
   ];
   return (
-    <SettingsLayout title={t("settings.title")} pages={tabs} value={current} onValueChange={setCurrent} onClose={close}>
+    <SettingsPageLayout title={t("settings.title")} icon={<SettingsIcon />} pages={tabs} value={tab} onValueChange={setTab} card={card}>
       {(page) =>
         page === "audio" ? <AudioTab />
         : page === "notifications" ? <NotificationsTab />
@@ -42,7 +43,7 @@ export function SettingsDialog({ tab }: { tab: SettingsTab }) {
         : page === "identity" ? <IdentityTab />
         : page === "account" ? <AccountTab />
         : <LanguageTab />}
-    </SettingsLayout>
+    </SettingsPageLayout>
   );
 }
 

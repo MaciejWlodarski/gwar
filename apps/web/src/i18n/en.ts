@@ -406,6 +406,8 @@ export const en = {
   "voice.retryMic": "Try again",
   "voice.openPrivacySettings": "Open privacy settings",
   "voice.leave": "Leave voice",
+  "voice.pill": "Voice connection",
+  "voice.pillOpen": "Go to the voice channel",
   "voice.rtt": "Round trip to the server: {ms} ms",
   "voice.notIn": "Not in voice",
   "voice.notInHint": "Double-click a channel to talk",

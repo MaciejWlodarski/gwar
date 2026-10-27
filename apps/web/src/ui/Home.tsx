@@ -8,7 +8,8 @@ import { useBookmarks } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { TeamSpeakBadge } from "./badges";
 import { Avatar, Button, IconButton, panelCard } from "./kit";
-import { useBookmarkOpener } from "./nav";
+import { useBookmarkOpener, useVoicePill } from "./nav";
+import { VoicePill } from "./VoicePanel";
 
 /**
  * The home section: where I am connected, and every saved server one click away.
@@ -30,6 +31,7 @@ export function Home({ card }: { card?: boolean }) {
   const openDialog = useUi((s) => s.openDialog);
   const { isActive, open } = useBookmarkOpener();
   const connected = phase === "online" || phase === "reconnecting";
+  const pill = useVoicePill();
 
   return (
     <main className={cn("relative flex min-w-0 flex-1 flex-col bg-surface", card && panelCard)}>
@@ -42,7 +44,7 @@ export function Home({ card }: { card?: boolean }) {
         <House className="size-5 text-subtle" />
         <h2 className="truncate text-[15px] font-semibold">{t("nav.home")}</h2>
       </header>
-      <div className="min-h-0 flex-1 overflow-y-auto">
+      <div className={cn("min-h-0 flex-1 overflow-y-auto", pill && "pb-20")}>
         <div className="mx-auto flex w-full max-w-4xl flex-col gap-6 p-4 md:p-8">
           <h1 className="text-2xl font-semibold tracking-tight">{nickname ? t("home.greeting", { name: nickname }) : t("home.greetingAnon")}</h1>
 
@@ -100,6 +102,7 @@ export function Home({ card }: { card?: boolean }) {
           </section>
         </div>
       </div>
+      <VoicePill />
     </main>
   );
 }

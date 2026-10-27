@@ -283,7 +283,7 @@ async function setGlobalNickname(page, nickname, { mobile = false, pl = false } 
   const field = page.getByLabel(pl ? "Pseudonim" : "Nickname", { exact: true });
   await waitFor(async () => (await field.inputValue()) !== "", "identity nickname", 10000);
   await field.fill(nickname);
-  const save = page.getByRole("dialog").getByRole("button", { name: pl ? "Zapisz" : "Save", exact: true }).first();
+  const save = page.getByRole("main", { name: pl ? "Ustawienia" : "Settings" }).getByRole("button", { name: pl ? "Zapisz" : "Save", exact: true }).first();
   await save.click();
   await waitFor(() => save.isEnabled(), "saved identity nickname", 15000);
   await page.getByText(pl ? "Zapisano" : "Saved", { exact: true }).waitFor();
@@ -868,6 +868,32 @@ async function main() {
   await shot(a, "09-settings-identity-dark");
   await a.keyboard.press("Escape");
 
+  await check("settings and the bug report are pages; the voice pill stands in for the voice panel elsewhere", async () => {
+    const pill = a.getByRole("region", { name: "Voice connection", exact: true });
+    // The server view keeps its voice panel; the Servers icon says I am in voice.
+    await a.getByRole("main", { name: "Settings" }).waitFor({ state: "detached" });
+    await a.getByText("Voice connected").first().waitFor({ timeout: 20000 });
+    if (await pill.count()) throw new Error("the pill is shown in the server view");
+    await shot(a, "50-servers-in-voice-dark");
+    await a.getByRole("button", { name: "Settings", exact: true }).first().click();
+    await a.getByRole("tab", { name: "Audio" }).click();
+    await pill.getByText("Voice connected").waitFor();
+    await shot(a, "51-settings-audio-pill-dark");
+    await a.getByRole("button", { name: "Your profile" }).click();
+    await a.getByRole("tab", { name: "Identity", selected: true }).waitFor();
+    await a.getByRole("tab", { name: "Account" }).click();
+    await shot(a, "52-settings-account-dark");
+    await a.getByRole("button", { name: "Report a bug" }).click();
+    await a.getByRole("main", { name: "Report a bug" }).waitFor();
+    await shot(a, "53-bug-report-pill-dark");
+    await a.getByRole("button", { name: "Home", exact: true }).click();
+    await shot(a, "54-home-pill-dark");
+    // The pill leads back to the voice channel.
+    await pill.getByRole("button", { name: new RegExp(escapeRe(GAMES)) }).click();
+    await pill.waitFor({ state: "detached" });
+    await a.getByRole("tab", { name: new RegExp(escapeRe(GAMES)), selected: true }).waitFor();
+  });
+
   await a.getByRole("button", { name: "Server menu" }).click();
   await shot(a, "10-server-menu-dark");
   await a.keyboard.press("Escape");
@@ -891,6 +917,28 @@ async function main() {
     await memberSection(m, "Online").getByText("Carol").waitFor();
     await shot(m, "12b-mobile-dark-members");
     await dismissDialog(m, "Members");
+  });
+  await check("phones: Settings is a drawer tab, and the voice pill fits above the sections' content", async () => {
+    const drawerTab = (name) => m.getByRole("navigation", { name: "Sections" }).getByRole("button", { name, exact: true });
+    await m.getByRole("button", { name: "Channels and servers" }).click();
+    await m.getByRole("button", { name: `Join voice in ${GAMES}` }).click();
+    if (!(await drawerTab("Home").isVisible())) await m.getByRole("button", { name: "Channels and servers" }).click();
+    await drawerTab("Home").click();
+    const pill = m.getByRole("region", { name: "Voice connection", exact: true });
+    await pill.getByText("Voice connected").waitFor({ timeout: 20000 });
+    const box = await pill.boundingBox();
+    if (!box || box.x < 0 || box.x + box.width > 390) throw new Error(`the pill does not fit: ${JSON.stringify(box)}`);
+    await shot(m, "55-mobile-home-pill-dark");
+    await m.getByRole("button", { name: "Channels and servers" }).click();
+    await drawerTab("Settings").click();
+    await m.getByRole("main", { name: "Settings" }).waitFor();
+    await pill.waitFor();
+    await shot(m, "56-mobile-settings-pill-dark");
+    await pill.getByRole("button", { name: "Leave voice" }).click();
+    await pill.waitFor({ state: "detached" });
+    await m.getByRole("button", { name: "Channels and servers" }).click();
+    await drawerTab("Servers").click();
+    await treeItem(m, GAMES).click();
   });
   await m.emulateMedia({ colorScheme: "light" });
   await shot(m, "13-mobile-light-chat");
@@ -931,7 +979,9 @@ async function main() {
         const pc = [...window.__pcs].reverse().find((x) => x.connectionState === "connected");
         return pc?.getSenders()[0]?.track?.enabled;
       });
+    // The gear reopens the tab it showed last.
     await a.getByRole("button", { name: "Settings" }).first().click();
+    await a.getByRole("tab", { name: "Audio" }).click();
     await a.getByRole("radio", { name: "Push to talk" }).click();
     await a.getByRole("button", { name: "Set push-to-talk key" }).click();
     await a.keyboard.press("KeyV");
@@ -1558,7 +1608,7 @@ async function main() {
     localUid = await settingsUid(c);
     if (!localUid) throw new Error("no local uid");
     await c.getByLabel("Nickname").fill("Account nickname");
-    await c.getByRole("dialog").getByRole("button", { name: "Save", exact: true }).first().click();
+    await c.getByRole("main", { name: "Settings" }).getByRole("button", { name: "Save", exact: true }).first().click();
     await c.getByText("Saved", { exact: true }).waitFor();
     await c.getByRole("tab", { name: "Account" }).click();
     await c.getByRole("button", { name: /Create an account/ }).click();
@@ -1576,7 +1626,7 @@ async function main() {
     await shot(c, "20-account-recovery-code");
     await c.getByRole("checkbox", { name: "I saved my recovery code" }).check();
     await cont.click();
-    await c.getByText(`Signed in as @${acct}`).first().waitFor();
+    await c.getByRole("main", { name: "Settings" }).getByText(`Signed in as @${acct}`).waitFor();
     await c.getByRole("tab", { name: "Identity" }).click();
     accountUid = await readUid(c);
     if (accountUid !== localUid) throw new Error(`kept identity changed uid: ${localUid} -> ${accountUid}`);

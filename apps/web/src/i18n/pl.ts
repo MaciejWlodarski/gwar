@@ -408,6 +408,8 @@ export const pl: Record<Key, string> = {
   "voice.retryMic": "Spróbuj ponownie",
   "voice.openPrivacySettings": "Otwórz ustawienia prywatności",
   "voice.leave": "Opuść kanał głosowy",
+  "voice.pill": "Połączenie głosowe",
+  "voice.pillOpen": "Przejdź do kanału głosowego",
   "voice.rtt": "Opóźnienie do serwera (w obie strony): {ms} ms",
   "voice.notIn": "Poza kanałem głosowym",
   "voice.notInHint": "Kliknij kanał dwukrotnie, aby rozmawiać",
