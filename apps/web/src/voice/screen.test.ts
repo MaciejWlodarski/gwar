@@ -1082,6 +1082,87 @@ describe("publisher stale estimate probe", () => {
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
+  it.each(["close", "pagehide"] as const)("%s closes a replaced lifted sender while its replacement answer is pending", async action => {
+    const page = new EventTarget();
+    vi.stubGlobal("addEventListener", page.addEventListener.bind(page));
+    vi.stubGlobal("removeEventListener", page.removeEventListener.bind(page));
+    const offer = vi.fn(async () => "answer");
+    const publisher = new ScreenPublisher({ track: { applyConstraints: vi.fn(async () => {}) } as unknown as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer, state: vi.fn() });
+    await publisher.start();
+    const old = Peer.all[0]!; stale(old); old.connectionState = "connected";
+    await vi.advanceTimersByTimeAsync(14_000);
+    expect(caps(old).at(-1)).toBe(8_000_000);
+    old.transceivers[0]!.sender.setParameters.mockImplementation(() => new Promise<void>(() => {}));
+    let answer!: (sdp: string) => void;
+    offer.mockImplementationOnce(() => new Promise<string>(r => { answer = r; }));
+    const recovering = publisher.recover({ share: "s", codec: "h264", width: 1920, height: 1080, fps: 60 });
+    await vi.advanceTimersByTimeAsync(1_000);
+    if (action === "close") publisher.close();
+    else page.dispatchEvent(new Event("pagehide"));
+    // Teardown cancels the old sender's restoration and closes its transport with it, at once.
+    expect(caps(old).at(-1)).toBe(8_000_000);
+    expect(old.close).toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(10_000);
+    answer("answer"); await recovering; publisher.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a late restore completion of a replaced sender cannot clear the replacement's watchdog", async () => {
+    const offer = vi.fn(async () => "answer"), state = vi.fn();
+    const publisher = new ScreenPublisher({ track: { applyConstraints: vi.fn(async () => {}) } as unknown as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer, state });
+    await publisher.start();
+    const old = Peer.all[0]!; stale(old); old.connectionState = "connected";
+    await vi.advanceTimersByTimeAsync(14_000);
+    let release!: () => void, answer!: (sdp: string) => void;
+    old.transceivers[0]!.sender.setParameters.mockImplementationOnce(() => new Promise<void>(r => { release = r; }));
+    offer.mockImplementationOnce(() => new Promise<string>(r => { answer = r; }));
+    const recovering = publisher.recover({ share: "s", codec: "h264", width: 1920, height: 1080, fps: 60 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(release).toBeTypeOf("function");
+    answer("answer"); await recovering;
+    const replacement = Peer.all[1]!; stale(replacement); replacement.connectionState = "connected";
+    await vi.advanceTimersByTimeAsync(14_000);
+    expect(publisher.bitrate).toBe(8_000_000);
+    release(); await vi.advanceTimersByTimeAsync(0);
+    replacement.transceivers[0]!.sender.setParameters.mockImplementation(() => new Promise<void>(() => {}));
+    replacement.getStats.mockImplementation(() => new Promise(() => {}));
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(replacement.close).toHaveBeenCalled();
+    expect(state).toHaveBeenCalledWith("failed");
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("a second recovery leaves the first replaced sender's deadline and the latest transport independent", async () => {
+    const offer = vi.fn(async () => "answer"), state = vi.fn();
+    const publisher = new ScreenPublisher({ track: { applyConstraints: vi.fn(async () => {}) } as unknown as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer, state });
+    await publisher.start();
+    const old = Peer.all[0]!; stale(old); old.connectionState = "connected";
+    await vi.advanceTimersByTimeAsync(14_000);
+    let reject!: (e: Error) => void, firstAnswer!: (sdp: string) => void;
+    old.transceivers[0]!.sender.setParameters.mockImplementationOnce(() => new Promise<void>((_, r) => { reject = r; }));
+    offer.mockImplementationOnce(() => new Promise<string>(r => { firstAnswer = r; }));
+    const first = publisher.recover({ share: "s", codec: "h264", width: 1920, height: 1080, fps: 60 });
+    await vi.advanceTimersByTimeAsync(0);
+    const intermediate = Peer.all[1]!;
+    await publisher.recover({ share: "s", codec: "vp9", width: 1280, height: 720, fps: 30 });
+    const latest = Peer.all[2]!; stale(latest); latest.connectionState = "connected";
+    expect(intermediate.close).toHaveBeenCalled();
+    expect(old.close).not.toHaveBeenCalled();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(old.close).toHaveBeenCalled();
+    expect(latest.close).not.toHaveBeenCalled();
+    expect(state).not.toHaveBeenCalledWith("failed");
+    const oldWrites = old.transceivers[0]!.sender.setParameters.mock.calls.length;
+    reject(new Error("late old failure")); firstAnswer("answer"); await first;
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(old.transceivers[0]!.sender.setParameters).toHaveBeenCalledTimes(oldWrites);
+    expect(latest.close).not.toHaveBeenCalled();
+    expect(publisher.bitrate).toBe(8_000_000);
+    publisher.close(); expect(vi.getTimerCount()).toBe(0);
+  });
+
   it("a replaced sender retries a rejected restore on its own queue until the cap is back", async () => {
     let answer!: (sdp: string) => void;
     const offer = vi.fn(async () => "answer");

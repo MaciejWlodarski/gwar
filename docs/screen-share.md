@@ -590,10 +590,12 @@ already at native size. A close cancels a pending lift and restore. A codec reco
 negotiates its replacement at once, but the old transport stays open until the server
 accepts it, so a lifted old sender keeps its own restoration: the headroom cap, queued
 behind its own pending writes, with the same retries and the lift's ten-second deadline.
-Retiring the transport ends it. A cap still not back by the deadline closes only the old
-transport; the replacement, which never sent above its cap, keeps negotiating. The
-replacement starts at the spec's resolved cap, and its own polling then applies the
-headroom cap from its estimate. With the probe the same eight-second 1 Mb/s
+Retiring the transport ends it; a close or `pagehide` ends it and closes the old transport
+at once. A cap still not back by the deadline closes only the old transport and does not
+fail the replacement, which never sent above its cap. If the server has not accepted the
+replacement yet, though, that close can end the whole share on the old transport's DTLS
+close, revoking its viewers' grants. The replacement starts at the spec's resolved cap,
+and its own polling then applies the headroom cap from its estimate. With the probe the same eight-second 1 Mb/s
 startup recovers 1080p in 12/12 local shares (13–29 s; main: 2/6), and the default
 startup matrix issues no probe. On the Ubuntu runner both H.264 shares recovered through
 a probe; nine of ten VP9 shares recovered, and six of the seven VP9 lifts probed.

@@ -642,6 +642,8 @@ export class ScreenPublisher {
   private restoreBy = 0;
   /** Restorations of lifted senders a recovery replaced, each by its cancel. */
   private readonly retiring = new Set<() => void>();
+  /** Old transports a recovery keeps open until the server accepts their replacement; teardown closes them. */
+  private readonly superseded = new Set<RTCPeerConnection>();
   /** The latest uplink estimate, for the cap a probe restores. */
   private available: number | undefined;
   private run = 0;
@@ -655,8 +657,8 @@ export class ScreenPublisher {
   private sendCodec: RTCRtpCodec | null = null;
   private softwareAv1 = 0;
   private readonly ceiling: { width: number; height: number; known: boolean };
-  /** A page going away stops lifts and restore retries; its transport closes with it. */
-  private readonly pageHide = () => { this.endProbe(); this.endRetiring(); };
+  /** A page going away stops lifts and restore retries; its transport closes with it, and superseded ones now. */
+  private readonly pageHide = () => { this.endProbe(); this.endSuperseded(); };
 
   constructor(private readonly params: PublishParams) {
     globalThis.addEventListener?.("pagehide", this.pageHide);
@@ -966,8 +968,15 @@ export class ScreenPublisher {
     this.restoration++;
   }
 
-  private endRetiring(): void {
+  /** Teardown: stops the old senders' restorations, then closes their transports, so none stays open uncapped. */
+  private endSuperseded(): void {
     for (const cancel of [...this.retiring]) cancel();
+    for (const pc of [...this.superseded]) this.retirePeer(pc);
+  }
+
+  private retirePeer(pc: RTCPeerConnection): void {
+    this.superseded.delete(pc);
+    pc.onconnectionstatechange = null; pc.close();
   }
 
   private endPhaseAfter(ms: number): void {
@@ -1090,17 +1099,19 @@ export class ScreenPublisher {
     this.recovery = plan;
     this.stopWatching();
     const pc = this.pc; this.pc = null; this.sender = null; this.sent = null; this.adaptationSent = null;
+    if (pc) this.superseded.add(pc);
     // Keep the old publish transport alive until the server has accepted its replacement.
     // Closing it before the offer lets the server end the share on its DTLS close.
     try { await this.start(); }
-    finally { retire(); if (pc) { pc.onconnectionstatechange = null; pc.close(); } }
+    finally { retire(); if (pc) this.retirePeer(pc); }
   }
 
   /**
    * The restoration of a lifted sender that a recovery is replacing, behind the old transport's
    * own parameter queue and with the same retries. Retirement, a written cap, close or `pagehide`
-   * ends it. A cap still not back by the lift's deadline force-closes only that old transport:
-   * the replacement is already negotiating and never sent above its cap, so it is not failed.
+   * ends it; only a written cap leaves the transport open, and teardown closes it. A cap still
+   * not back by the lift's deadline force-closes only that old transport: the replacement never
+   * sent above its cap, so it is not failed here.
    */
   private restoreRetiring(pc: RTCPeerConnection, sender: RTCRtpSender, cap: number, deadline: number): () => void {
     let queue = this.parameters, ended = false, timer: ReturnType<typeof setTimeout> | null = null;
@@ -1114,7 +1125,7 @@ export class ScreenPublisher {
       if (ended) return;
       cancel();
       console.warn("Screen sender: the replaced transport's bitrate cap could not be restored after a probe");
-      pc.onconnectionstatechange = null; pc.close();
+      this.retirePeer(pc);
     }, Math.max(0, deadline - performance.now()));
     const attempt = (retry: number) => {
       timer = null;
@@ -1142,7 +1153,7 @@ export class ScreenPublisher {
     globalThis.removeEventListener?.("pagehide", this.pageHide);
     this.cancelPhase();
     this.endProbe();
-    this.endRetiring();
+    this.endSuperseded();
     this.guard = new StuckCaptureGuard();
     this.adaptationSent = null;
     this.polling = null;
