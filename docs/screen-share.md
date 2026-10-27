@@ -602,11 +602,17 @@ viewer must decode its smaller output.
 
 *Design trade-off: headroom slows the ramp of dense content.* A share that fills its
 cap sends about 70 % of the estimate, and GCC may raise its estimate only to 1.5× the
-acknowledged rate, so the estimate grows by roughly 5 % per step instead of 50 %.
-Locally, busy H.264 needs 22–25 s for the estimate to reach the 11.4 Mb/s at which
-the 8 Mb/s cap stops binding, against about 12 s without the headroom rule. On the
-runner OpenH264 meanwhile adapts down for quantiser reasons at 4–5 Mb/s, and it can
-take until the estimate passes about 12 Mb/s (up to 60 s) to return to 1080p. The
+acknowledged rate: across 162 CI busy H.264 shares the estimate sat at 1.58× the
+transport's send rate (median of each share's median; 1.57–1.62 for the middle 80 %).
+Each cap write therefore lets the estimate grow by about 12 %, and the cap moves only
+every second poll (4 s), so a busy share gains about 3 % per second instead of GCC's 8 %. Locally, busy H.264
+needs 23–28 s for the estimate to reach the 11.4 Mb/s at which the 8 Mb/s cap stops
+binding (median 24.8 s), against about 12 s without the headroom rule. Writing the
+cap more often does not help: after every `maxBitrate` write Chromium sets the
+encoder target to exactly 1/1.2 of the new cap for about a second (944 of 949 upward
+writes in CI), which cancels the gain. On the runner OpenH264 meanwhile adapts down
+at 1440×810 or 960×540 (docs/screen-startup-validation.md, "Busy H.264 ramp"), and it
+can take until the estimate passes about 12 Mb/s (up to 60 s) to return to 1080p. The
 probe cannot help: the stream is not application-limited, so Chromium does not probe.
 The 30 % is kept deliberately for voice and repairs on a congested uplink.
 
@@ -2890,7 +2896,9 @@ badge, stage). Decisions taken while building it, where this design left room:
 - **Uplink headroom floor.** The `0.7 × availableOutgoingBitrate` rule never
   lowers the cap below 250 kbps: an estimate that low recovers by probing, and a
   cap under it would starve the probe. It is re-read every 2 s and applied when
-  it moves by more than 10 %.
+  it moves by more than 10 %, or, for a smooth share, when it reaches the spec's cap:
+  otherwise a share whose estimate grew past the cap in steps under 10 % keeps sending
+  up to 10 % below it for the rest of the share.
 - **Changing quality while sharing** changes the track constraints and the
   sender parameters only. The server keeps announcing the initial quality and legacy
   preset the share started with: there is no request to change it, and its per-share limit is

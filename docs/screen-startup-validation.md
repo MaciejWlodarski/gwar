@@ -1,5 +1,88 @@
 # Chromium startup adaptation validation
 
+## Busy H.264 ramp (27 October 2026)
+
+The replay above left three H.264 busy shares failing on size: `40225445809` (share 1),
+`40315496650` (share 0) and the first attempt of `40415803712` (share 1). Each was limited
+by `bandwidth` at 1440×810 for about 30 s. Their estimate was not stale; it grew, slowly.
+All 162 retained CI H.264 busy timelines (81 artifacts, 19–27 October) and 24 local runs
+were read for the estimate, encoder target, payload, cap, size, QP and encoder load.
+
+**Cause: the headroom cap paces GCC's ramp.** GCC raises its delay-based estimate to at
+most 1.5× the acknowledged rate. Across the CI busy shares the estimate sat at 1.58× the
+transport's send rate (median of each share's median; 1.57–1.62 for the middle 80 %). A share that fills its
+cap sends 70 % of the estimate, so each cap write lets the estimate grow about 12 %. The
+10 % rule then waits for that growth, and the cap moves every second poll (4 s): about
+3 % per second. None of the other candidates fits the data:
+
+- *Encoder overshoot:* no. Over 13,681 two-second windows at a constant cap, the payload
+  was 0.98× the cap (median), 1.02× at p99.
+- *High-motion content:* only because busy content fills its cap. A sparse share sends
+  below it and needs the stale estimate probe instead.
+- *`maintain-framerate`:* it trades size for cadence when the target is short, as
+  designed. On the runner it trades more, because the encoder is near its limit.
+
+**Why only these three failed:** they started lowest. Their estimate 3 s into the share
+was 3.16, 4.64 and 4.85 Mb/s, against a median of 5.95 (10th percentile 4.91). Of the 20
+shares that started below 5 Mb/s, three failed; of the 142 above, none. They reached the
+11.4 Mb/s at which the 8 Mb/s cap stops binding after 45.5, 35.6 and 33.4 s.
+
+| Run (share) | Estimate at 3 s | Estimate ≥ 11.4 Mb/s | What the encoder did |
+| --- | --- | --- | --- |
+| `40415803712` attempt 1 (1) | 3.16 Mb/s | 45.5 s | 480×270 to 27 s, then 1440×810 (0.60–0.66 s of encoding per s), QP 31 → 24 as the cap rose; cap held at 7.43 Mb/s by the 10 % rule with QP 23.8–24.0, 1080p only at 60 s |
+| `40225445809` (1) | 4.64 Mb/s | 35.6 s | 1440×810 from 16 s at 0.79–0.91 s/s; at the 7.87 Mb/s cap, QP 22, Chromium went to 960×540 at 41 s for good |
+| `40315496650` (0) | 4.85 Mb/s | 33.4 s | 1440×810 from 14 s at 0.85–0.92 s/s, capture 49–57 fps; 960×540 at 36 s, 1.5 s after the cap reached 8 Mb/s, QP 20–22 |
+
+The two drops to 960×540 are reported as `bandwidth` at QP 20–22, far below OpenH264's
+high-QP threshold (37). The encoder was near saturation and capture had fallen below
+60 fps, so we attribute the step to the runner; Linux CI does not log the renderer, so
+the trigger is not confirmed.
+
+**Locally the same ramp passes.** On the 10-core Mac (Playwright Chromium 153), busy
+H.264 starts at 5.3–6.0 Mb/s, and the estimate needs 23.3–27.8 s (median 24.8 s, 9 runs)
+to reach 11.4 Mb/s, at the same 1.56–1.6× ratio. OpenH264 keeps 1080p there (QP 35 → 26,
+0.7 s/s), so every run passes, with steady 1080p60 at 8.6–16.7 s. With nine CPU burners
+the encoder is limited by `cpu` at 1440×810 instead, which the judge records.
+
+**Writing the cap more often does not help.** After every `maxBitrate` write Chromium
+sets the encoder target to exactly 1/1.2 of the new cap for about one second: 944 of
+949 upward writes in CI and 112 of 112 locally. Resolution changes do the same. A
+variant that wrote the cap on every 2 % move made 11–13 writes per share instead of
+7–8. It reached 11.4 Mb/s after 21.3–28.8 s (3 runs), no faster than main, and was dropped.
+
+**Fixed: the last step to the cap.** In 148 CI shares, 70 % of the estimate covered the
+spec's 8 Mb/s for the whole settled window. In 122 of them, and in 9 of 9 local main runs,
+the cap still never reached 8 Mb/s. The estimate had passed 11.4 Mb/s in a step under
+10 %, and the cap stayed up to 9 % below (median 4.2 %) for the rest of the share. A smooth share now writes the spec's cap as soon as 70 % of the estimate covers
+it. The headroom share is unchanged, and the cap never exceeds 70 % of the estimate.
+
+| Local busy H.264, 60 s | main `db3d5bd9` (9) | this change (6) |
+| --- | --- | --- |
+| Estimate ≥ 11.4 Mb/s | 24.8 s [23.3–27.8] | 25.4 s [24.3–28.3] |
+| Cap at 8 Mb/s | never (final 7.28–7.94) | 26.8 s [24.8–28.8] |
+| Settled payload | 7.6 Mb/s [7.3–8.0] | 8.0 Mb/s [8.0–8.0] |
+| Settled QP at 1080p | 26.8 [26.1–27.5] | 25.9 [25.9–26.0] |
+| Steady 1080p60 | 12.6 s [8.6–16.7] | 12.6 s [10.7–14.7] |
+| Cap writes per share | 7 [7–8] | 9 [8–9] |
+
+The VP9 and H.264 barcode cases of the default matrix also pass with the change, with
+no allocation probe. The change does not shorten the ramp. In the run that held 7.43 Mb/s
+it would have written 8 Mb/s at 46 s. Whether that lowers QP enough for Chromium to
+upscale sooner is not established.
+
+**Measured for the owner, not changed: an 85 % share.** The same local busy H.264 with
+`UPLINK_SHARE = 0.85` reached the 8 Mb/s cap after 10.6–10.7 s (3 runs), against
+24.8–28.8 s with 70 %. Steady 1080p60 came at 10.7–11.2 s, and the settled payload was
+8.0 Mb/s. The harness's allocation-probe count assumes 70 % and miscounts that arm. Its
+effect on voice under a congested uplink was not measured.
+
+**Verdict.** The slow ramp is a real property of the product, not a CI artefact. It is
+the documented headroom trade-off (docs/screen-share.md, "Design trade-off"), and it
+applies to every busy smooth share that starts below about 11 Mb/s. It becomes a CI
+failure only when a low startup estimate meets the runner's slow encoder. The failures
+stay in the diagnostic, which is deliberate. Shortening the ramp needs a larger share,
+or a lift past 70 % while the share fills its cap; both are the owner's decision.
+
 ## CI diagnostic triage (26 October 2026)
 
 `browser-screen-startup` failed in 64 of the 66 runs that executed it among the last
@@ -59,7 +142,8 @@ barcode/busy, two repeats) passes with the change and issues no probe.
 1440×810 to 960×540 once the encoder reached the 8 Mb/s cap, at QP ≈ 20, with no CPU
 limitation, and stayed there. This is Chromium's own bandwidth adaptation at the cap;
 the guard prices the next step at the current bits per pixel and leaves it. It still
-fails the diagnostic, which is deliberate.
+fails the diagnostic, which is deliberate. "Busy H.264 ramp" above traces both runs to
+the headroom ramp and a low startup estimate.
 
 **Follow-up on the PR (27 October).** The first CI run of this change failed two
 cases. The VP9 release case stayed at 480×270: both lifts (17 s, 39 s) raised the
