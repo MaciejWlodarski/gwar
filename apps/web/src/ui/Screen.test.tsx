@@ -1,17 +1,18 @@
 // @vitest-environment happy-dom
-import { act } from "react";
+import { act, StrictMode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { welcome } from "../net/testing";
 import type { Channel } from "../proto/Channel";
 import type { Client } from "../proto/Client";
 import { initialState } from "../state/reducer";
+import { controller } from "../state/controller";
 import { initialScreen, useScreen } from "../state/screen";
 import { useDesktopCapture, type DesktopCapture } from "../state/screen-controller";
 import { useSettings } from "../state/settings";
 import { useSession } from "../state/stores";
 import { TooltipProvider } from "./kit";
-import { LiveBadge, ShareButton, SharingBar } from "./Screen";
+import { LiveBadge, ShareButton, ShareVideo, SharingBar } from "./Screen";
 
 const channel = (id: number, extra: Partial<Channel> = {}): Channel => ({
   id, parent: null, name: `c${id}`, topic: "", position: id, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false, ...extra,
@@ -122,4 +123,225 @@ it("shows independent quality controls and saves an explicit click on the surfac
   expect(container.querySelectorAll("select")).toHaveLength(2);
   await act(async () => modes[0]!.click());
   expect(useSettings.getState().screenMode).toBe("smooth");
+});
+
+describe("watched video frames", () => {
+  async function grant(run: number, id: number, stream: MediaStream, share = "A") {
+    await act(async () => {
+      const { dispatch } = useScreen.getState();
+      dispatch({ type: "transport", run, phase: "connected" });
+      dispatch({ type: "watch", share, id });
+      dispatch({ type: "granted", run, id, slot: 0 });
+      dispatch({ type: "stream", run, slot: 0, stream });
+      root.render(<ShareVideo share={share} />);
+    });
+    return container.querySelector("video")!;
+  }
+  const visible = (video: HTMLVideoElement) => video.closest<HTMLElement>("[data-screen-video]")?.dataset.ready === "true";
+
+  it.each([false, true])("repairs a warm receiver once, while one static frame reveals immediately (frame first: %s)", async frameFirst => {
+    vi.useFakeTimers();
+    const stats = vi.spyOn(controller.screen, "stats").mockResolvedValue({ width: 640, height: 400, fps: 0, framesDecoded: 1 });
+    const request = vi.spyOn(controller.screen, "requestFrame").mockImplementation(() => {});
+    try {
+      const stream = new MediaStream();
+      const video = await grant(1, 1, stream);
+      if (frameFirst) await act(async () => video.dispatchEvent(new Event("loadeddata")));
+      await act(async () => vi.advanceTimersByTimeAsync(100));
+      expect(request.mock.calls).toEqual(frameFirst ? [] : [["A", 1, 1]]);
+      expect(visible(video)).toBe(frameFirst);
+      await act(async () => root.render(null));
+      const moved = await grant(1, 1, stream);
+      await act(async () => vi.advanceTimersByTimeAsync(1000));
+      expect(request).toHaveBeenCalledTimes(frameFirst ? 0 : 1);
+      // No new receiver frame/counter is required: its one loaded frame is enough.
+      if (!frameFirst) await act(async () => moved.dispatchEvent(new Event("loadeddata")));
+      await act(async () => vi.advanceTimersByTimeAsync(70_000));
+      expect(visible(moved)).toBe(true);
+      expect(request).toHaveBeenCalledTimes(frameFirst ? 0 : 1);
+    } finally { stats.mockRestore(); request.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it("ignores a pending warmup probe after its view unmounts", async () => {
+    vi.useFakeTimers();
+    let resolve!: (value: { width: number; height: number; fps: number; framesDecoded: number }) => void;
+    const stats = vi.spyOn(controller.screen, "stats").mockImplementation(() => new Promise(r => { resolve = r; }));
+    const request = vi.spyOn(controller.screen, "requestFrame").mockImplementation(() => {});
+    try {
+      await grant(1, 1, new MediaStream());
+      await act(async () => vi.advanceTimersByTimeAsync(100));
+      await act(async () => root.render(null));
+      await act(async () => resolve({ width: 640, height: 400, fps: 0, framesDecoded: 1 }));
+      expect(request).not.toHaveBeenCalled();
+    } finally { stats.mockRestore(); request.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it("does not mistake metadata-only resize for a loaded frame", async () => {
+    const received = vi.spyOn(controller.screen, "frameReceived");
+    try {
+      const video = await grant(1, 1, new MediaStream());
+      await act(async () => video.dispatchEvent(new Event("resize")));
+      expect(visible(video)).toBe(false);
+      expect(received).not.toHaveBeenCalled();
+      await act(async () => video.dispatchEvent(new Event("loadeddata")));
+      expect(visible(video)).toBe(true);
+    } finally { received.mockRestore(); }
+  });
+
+
+  it("keeps the attached media player and a static frame through a view remount", async () => {
+    const stream = new MediaStream();
+    const video = await grant(1, 1, stream);
+    await act(async () => video.dispatchEvent(new Event("loadeddata")));
+    await act(async () => root.render(null));
+    expect(video.srcObject).toBe(stream);
+    expect(video.isConnected).toBe(true);
+    expect(video.dataset.share).toBeUndefined();
+    const replacement = await grant(1, 1, stream);
+    expect(replacement).toBe(video);
+    expect(visible(replacement)).toBe(true);
+    expect(container.textContent).not.toContain("Connecting");
+  });
+
+  it("does not detach or rebind the stream during StrictMode's effect remount", async () => {
+    const stream = new MediaStream();
+    const video = await grant(1, 1, stream);
+    const bind = vi.fn();
+    Object.defineProperty(video, "srcObject", { configurable: true, get: () => stream, set: bind });
+    await act(async () => root.render(<StrictMode><ShareVideo share="A" /></StrictMode>));
+    expect(container.querySelector("video")).toBe(video);
+    expect(bind).not.toHaveBeenCalled();
+    await act(async () => video.dispatchEvent(new Event("loadeddata")));
+    expect(visible(video)).toBe(true);
+  });
+
+  it("detaches an unmounted player when its transport retires", async () => {
+    const stream = new MediaStream();
+    const video = await grant(1, 1, stream);
+    await act(async () => root.render(null));
+    expect(video.srcObject).toBe(stream);
+    await act(async () => useScreen.getState().dispatch({ type: "transport", run: 2, phase: "connecting" }));
+    expect(video.srcObject).toBeNull();
+    expect(document.querySelector("[data-screen-players]")).toBeNull();
+    const replacement = await grant(2, 1, new MediaStream());
+    expect(replacement).not.toBe(video);
+    expect(visible(replacement)).toBe(false);
+  });
+
+  it("first use shows its first frame without waiting for another frame", async () => {
+    const stream = new MediaStream();
+    const video = await grant(1, 1, stream);
+    expect(video.srcObject).toBe(stream);
+    expect(visible(video)).toBe(false);
+    await act(async () => video.dispatchEvent(new Event("loadeddata")));
+    expect(visible(video)).toBe(true);
+    expect(container.textContent).not.toContain("Connecting");
+  });
+
+  it("detaches the old frame on renewal and shows a static share's single fresh frame", async () => {
+    vi.useFakeTimers();
+    const failed = vi.spyOn(controller.screen, "frameFailed");
+    try {
+      const oldStream = new MediaStream();
+      const old = await grant(1, 1, oldStream);
+      await act(async () => old.dispatchEvent(new Event("loadeddata")));
+      expect(visible(old)).toBe(true);
+      // Reuse renews the run before granting the new watch, so it has no old stream.
+      await act(async () => {
+        useScreen.getState().dispatch({ type: "unwatch", share: "A" });
+        useScreen.getState().dispatch({ type: "watch", share: "B", id: 2 });
+        useScreen.getState().dispatch({ type: "transport", run: 2, phase: "connecting" });
+        root.render(<ShareVideo share="B" />);
+      });
+      const waiting = container.querySelector("video")!;
+      expect(waiting).not.toBe(old);
+      expect(old.srcObject).toBeNull();
+      expect(waiting.srcObject).toBeNull();
+      expect(visible(waiting)).toBe(false);
+      await act(async () => old.dispatchEvent(new Event("loadeddata")));
+      expect(visible(waiting)).toBe(false);
+      const freshStream = new MediaStream();
+      const video = await grant(2, 2, freshStream, "B");
+      expect(video.srcObject).toBe(freshStream);
+      expect(visible(video)).toBe(false);
+      // One keyframe is enough: no frame counter, timer or second frame is required.
+      await act(async () => video.dispatchEvent(new Event("loadeddata")));
+      expect(visible(video)).toBe(true);
+      await act(async () => vi.advanceTimersByTimeAsync(35_001));
+      expect(visible(video)).toBe(true);
+      expect(failed).not.toHaveBeenCalled();
+    } finally { failed.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it("replaces the media element when the same share is rewatched in a new run", async () => {
+    const old = await grant(1, 1, new MediaStream());
+    await act(async () => old.dispatchEvent(new Event("loadeddata")));
+    const fresh = await grant(2, 1, new MediaStream());
+    expect(fresh).not.toBe(old);
+    expect(old.srcObject).toBeNull();
+    expect(visible(fresh)).toBe(false);
+    await act(async () => fresh.dispatchEvent(new Event("loadeddata")));
+    expect(visible(fresh)).toBe(true);
+  });
+
+  it("keeps another watch uninterrupted while waiting for the reused slot's fresh frame", async () => {
+    vi.useFakeTimers();
+    const failed = vi.spyOn(controller.screen, "frameFailed");
+    try {
+      const streams = [new MediaStream(), new MediaStream()];
+      await act(async () => {
+        const { dispatch } = useScreen.getState();
+        dispatch({ type: "transport", run: 1, phase: "connected" });
+        for (const [slot, share] of ["A", "B"].entries()) {
+          dispatch({ type: "watch", share, id: slot + 1 });
+          dispatch({ type: "granted", run: 1, id: slot + 1, slot });
+          dispatch({ type: "stream", run: 1, slot, stream: streams[slot]! });
+        }
+        root.render(<div><ShareVideo key="A" share="A" /><ShareVideo key="B" share="B" /></div>);
+      });
+      const active = container.querySelector<HTMLVideoElement>('video[data-share="A"]')!;
+      const old = container.querySelector<HTMLVideoElement>('video[data-share="B"]')!;
+      let frame: VideoFrameRequestCallback | undefined;
+      Object.defineProperties(old, {
+        requestVideoFrameCallback: { configurable: true, value: (cb: VideoFrameRequestCallback) => { frame = cb; return 1; } },
+        cancelVideoFrameCallback: { configurable: true, value: vi.fn() },
+      });
+      await act(async () => {
+        active.dispatchEvent(new Event("loadeddata"));
+        old.dispatchEvent(new Event("loadeddata"));
+      });
+      await act(async () => {
+        const { dispatch } = useScreen.getState();
+        dispatch({ type: "unwatch", share: "B" });
+        dispatch({ type: "watch", share: "C", id: 3 });
+        dispatch({ type: "granted", run: 1, id: 3, slot: 1 });
+        root.render(<div><ShareVideo key="A" share="A" /><ShareVideo key="C" share="C" /></div>);
+      });
+      const reused = container.querySelector<HTMLVideoElement>('video[data-share="C"]')!;
+      expect(container.querySelector('video[data-share="A"]')).toBe(active);
+      expect(active.srcObject).toBe(streams[0]);
+      expect(visible(active)).toBe(true);
+      expect(reused.srcObject).toBe(streams[1]);
+      expect(visible(reused)).toBe(false);
+      await act(async () => reused.dispatchEvent(new Event("loadeddata")));
+      expect(visible(reused)).toBe(false);
+      await act(async () => frame?.(performance.now(), { receiveTime: performance.now() + 1 } as VideoFrameCallbackMetadata));
+      await act(async () => vi.advanceTimersByTimeAsync(35_001));
+      expect(visible(reused)).toBe(true);
+      expect(visible(active)).toBe(true);
+      expect(failed).not.toHaveBeenCalled();
+    } finally { failed.mockRestore(); vi.useRealTimers(); }
+  });
+
+  it("reports the first frame with its run/watch ID without creating a component deadline", async () => {
+    const received = vi.spyOn(controller.screen, "frameReceived");
+    try {
+      const video = await grant(2, 2, new MediaStream());
+      expect(received).not.toHaveBeenCalled();
+      expect(visible(video)).toBe(false);
+      await act(async () => video.dispatchEvent(new Event("loadeddata")));
+      expect(received).toHaveBeenCalledExactlyOnceWith("A", 2, 2);
+      expect(visible(video)).toBe(true);
+    } finally { received.mockRestore(); }
+  });
 });

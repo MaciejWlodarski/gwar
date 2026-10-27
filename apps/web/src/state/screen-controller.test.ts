@@ -137,7 +137,7 @@ describe("watching", () => {
     let unavailable = 2;
     const { link, ops, calls } = fakeLink({
       "screen.watch.offer": () => ({ sdp: "answer" }),
-      "screen.watch": () => { if (unavailable-- > 0) throw new RequestError("unavailable", "connect a watch transport first"); return { slot: 1 }; },
+      "screen.watch": d => { if (unavailable-- > 0) throw new RequestError("unavailable", "connect a watch transport first"); return { slot: d.share === "A" ? 1 : 2 }; },
     });
     const screen = new ScreenController(() => link, String);
     const watching = screen.watch("A");
@@ -182,6 +182,204 @@ describe("watching", () => {
     screen.handleEvent({ ev: "screen.stopped", d: { share: "A", reason: "access" } });
     expect(useScreen.getState().stage).toBeNull();
     expect(toast).toHaveBeenCalledWith("info", "You can no longer watch this screen share.");
+  });
+});
+
+describe("reused receive slots", () => {
+  function setup(holdGrant = false) {
+    for (const id of ["B", "C", "D"]) useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "screen.started", d: share(id, 2, 2) } });
+    let offers = 0;
+    const pending = deferred<{ slot: number }>();
+    const grant = deferred<{ slot: number }>();
+    const { link, ops } = fakeLink({
+      "screen.watch.offer": () => { offers++; return { sdp: "answer" }; },
+      "screen.watch": d => offers === 1
+        ? d.share === "D" ? pending.promise : d.share === "C" && holdGrant ? grant.promise : { slot: d.share === "A" ? 0 : 1 }
+        : { slot: d.share === "C" ? 0 : d.share === "A" ? 1 : 2 },
+    });
+    const screen = new ScreenController(() => link, String);
+    const start = async (otherWatch = true) => {
+      const watching = screen.watch(otherWatch ? "A" : "B");
+      await flush();
+      media.transports[0]!.params.state("connected");
+      await watching;
+      if (otherWatch) await screen.watch("B");
+      return media.transports[0]!;
+    };
+    return { screen, start, pending, grant, ops };
+  }
+
+  it.each(["unwatch", "release"])("renews a reused slot after %s when it is the only watch", async how => {
+    const { screen, start } = setup();
+    const old = await start(false);
+    const stream = {} as MediaStream;
+    useScreen.getState().dispatch({ type: "stream", run: old.params.run, slot: 1, stream });
+    if (how === "unwatch") await screen.unwatch("B");
+    else screen.handleEvent({ ev: "screen.slot", d: { run: old.params.run, slot: 1, share: null } });
+    // Keep the track for this run; only a new run can supply a new receiver.
+    expect(useScreen.getState().streams[1]).toBe(stream);
+    const watching = screen.watch("C");
+    await flush();
+    expect(old.close).toHaveBeenCalledOnce();
+    expect(media.transports).toHaveLength(2);
+    expect(useScreen.getState().watches).toMatchObject([{ share: "C", status: "requesting", slot: null }]);
+    expect(useScreen.getState().streams.every(s => s === null)).toBe(true);
+    media.transports[1]!.params.state("connected");
+    await watching;
+    await flush();
+    expect(useScreen.getState().watches).toMatchObject([{ share: "C", status: "watching", slot: 0 }]);
+    // Events from the retired run cannot free the new watch's slot.
+    screen.handleEvent({ ev: "screen.slot", d: { run: old.params.run, slot: 0, share: null } });
+    expect(useScreen.getState().watches).toHaveLength(1);
+    expect(useScreen.getState().stage).toBe("C");
+    expect(toast).not.toHaveBeenCalled();
+    screen.reset();
+  });
+
+  it.each(["unwatch", "release"])("keeps the receiver and other active watches uninterrupted after %s", async how => {
+    const { screen, start, ops } = setup();
+    const old = await start();
+    const active = useScreen.getState().watches.find(w => w.share === "A")!;
+    const streams = [{} as MediaStream, {} as MediaStream];
+    streams.forEach((stream, slot) => useScreen.getState().dispatch({ type: "stream", run: old.params.run, slot, stream }));
+    if (how === "unwatch") await screen.unwatch("B");
+    else screen.handleEvent({ ev: "screen.slot", d: { run: old.params.run, slot: 1, share: null } });
+    await screen.watch("C");
+    expect(media.transports).toHaveLength(1);
+    expect(old.close).not.toHaveBeenCalled();
+    expect(useScreen.getState().transport).toEqual({ run: old.params.run, phase: "connected" });
+    expect(useScreen.getState().watches.find(w => w.share === "A")).toBe(active);
+    expect(useScreen.getState().streams.slice(0, 2)).toEqual(streams);
+    expect(useScreen.getState().watches).toMatchObject([
+      { share: "A", status: "watching", slot: 0 }, { share: "C", status: "watching", slot: 1 },
+    ]);
+    expect(ops().filter(op => op === "screen.watch.offer")).toHaveLength(1);
+    expect(ops().filter(op => op === "screen.watch")).toHaveLength(3);
+    expect(toast).not.toHaveBeenCalled();
+    screen.reset();
+  });
+
+  it("does not renew while another watch is pending", async () => {
+    const { screen, start, pending } = setup();
+    const old = await start(false);
+    await screen.unwatch("B");
+    const slow = screen.watch("D");
+    await flush();
+    await screen.watch("C");
+    expect(media.transports).toHaveLength(1);
+    expect(old.close).not.toHaveBeenCalled();
+    pending.resolve({ slot: 2 });
+    await slow;
+    expect(useScreen.getState().watches).toMatchObject([
+      { share: "D", status: "watching", slot: 2 }, { share: "C", status: "watching", slot: 1 },
+    ]);
+    screen.reset();
+  });
+
+  it("checks for other watches when the reused-slot grant arrives", async () => {
+    const { screen, start, grant } = setup(true);
+    const old = await start(false);
+    await screen.unwatch("B");
+    const watching = screen.watch("C");
+    await flush();
+    await screen.watch("A");
+    grant.resolve({ slot: 1 });
+    await watching;
+    expect(media.transports).toHaveLength(1);
+    expect(old.close).not.toHaveBeenCalled();
+    expect(useScreen.getState().watches).toMatchObject([
+      { share: "C", status: "watching", slot: 1 }, { share: "A", status: "watching", slot: 0 },
+    ]);
+    screen.reset();
+  });
+
+  it("ends waiting watches through the existing transport failure path", async () => {
+    const { screen, start } = setup();
+    await start(false);
+    await screen.unwatch("B");
+    const watching = screen.watch("C");
+    await flush();
+    media.transports[1]!.params.state("failed");
+    await watching;
+    await flush();
+    expect(useScreen.getState().watches).toEqual([]);
+    expect(useScreen.getState().stage).toBeNull();
+    expect(toast).toHaveBeenCalledExactlyOnceWith("error", "The connection for watching screen shares was lost.");
+    screen.reset();
+  });
+
+  it.each([false, true])("bounds a silent receiver with another active watch = %s, fencing old timeouts", async otherWatch => {
+    const { screen, start, ops } = setup();
+    await start(otherWatch);
+    await screen.unwatch("B");
+    const watching = screen.watch("C");
+    await flush();
+    if (!otherWatch) media.transports[1]!.params.state("connected");
+    await watching;
+    const { transport, watches } = useScreen.getState();
+    const watch = watches.find(w => w.share === "C")!;
+    screen.frameFailed("C", transport.run - 1, watch.id);
+    screen.frameFailed("C", transport.run, watch.id - 1);
+    expect(useScreen.getState().watches).toHaveLength(otherWatch ? 2 : 1);
+    expect(toast).not.toHaveBeenCalled();
+    screen.frameFailed("C", transport.run, watch.id);
+    await flush();
+    expect(useScreen.getState().watches.map(w => w.share)).toEqual(otherWatch ? ["A"] : []);
+    expect(ops().filter(op => op === "screen.unwatch")).toHaveLength(2);
+    expect(toast).toHaveBeenCalledExactlyOnceWith("error", "The connection for watching screen shares was lost.");
+    screen.reset();
+  });
+
+  it("clears only the matching first-frame deadline and never rearms it", async () => {
+    const { screen, start } = setup();
+    const old = await start(false);
+    const watch = useScreen.getState().watches[0]!;
+    const failed = vi.spyOn(screen, "frameFailed");
+    expect(vi.getTimerCount()).toBe(1);
+    screen.frameReceived("B", old.params.run - 1, watch.id);
+    screen.frameReceived("B", old.params.run, watch.id - 1);
+    screen.frameReceived("A", old.params.run, watch.id);
+    expect(vi.getTimerCount()).toBe(1);
+    screen.frameReceived("B", old.params.run, watch.id);
+    expect(vi.getTimerCount()).toBe(0);
+    screen.frameReceived("B", old.params.run, watch.id);
+    await vi.advanceTimersByTimeAsync(70_000);
+    expect(failed).not.toHaveBeenCalled();
+    expect(useScreen.getState().watches).toHaveLength(1);
+    screen.reset();
+  });
+
+  it("fences player repair by run/watch ID without restarting the first-frame deadline", async () => {
+    const { screen, start, ops } = setup();
+    const old = await start(false);
+    const watch = useScreen.getState().watches[0]!;
+    screen.requestFrame("B", old.params.run - 1, watch.id);
+    screen.requestFrame("B", old.params.run, watch.id - 1);
+    screen.requestFrame("A", old.params.run, watch.id);
+    expect(ops()).not.toContain("screen.keyframe");
+    screen.requestFrame("B", old.params.run, watch.id);
+    expect(ops().filter(op => op === "screen.keyframe")).toHaveLength(1);
+    expect(vi.getTimerCount()).toBe(1);
+    await screen.unwatch("B");
+    screen.requestFrame("B", old.params.run, watch.id);
+    expect(ops().filter(op => op === "screen.keyframe")).toHaveLength(1);
+    screen.reset();
+  });
+
+  it.each(["unwatch", "release", "stop", "failure", "reset"])("clears a pending first-frame deadline on %s", async how => {
+    const { screen, start } = setup();
+    const old = await start(false);
+    const failed = vi.spyOn(screen, "frameFailed");
+    expect(vi.getTimerCount()).toBe(1);
+    if (how === "unwatch") await screen.unwatch("B");
+    if (how === "release") screen.handleEvent({ ev: "screen.slot", d: { run: old.params.run, slot: 1, share: null } });
+    if (how === "stop") screen.handleEvent({ ev: "screen.stopped", d: { share: "B", reason: "stopped" } });
+    if (how === "failure") old.params.state("failed");
+    if (how === "reset") screen.reset();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(35_000);
+    expect(failed).not.toHaveBeenCalled();
+    screen.reset();
   });
 });
 

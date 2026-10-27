@@ -3,7 +3,7 @@
  * menu, the sharing bar, LIVE badges and the stage.
  */
 import { Maximize, MessageSquare, MessageSquareOff, Minimize, MonitorOff, MonitorUp, PictureInPicture2, ScreenShareOff, X } from "lucide-react";
-import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { cn } from "../lib/cn";
 import { isDesktop } from "../platform";
@@ -249,33 +249,157 @@ export function LiveBadge({ client, name }: { client: Client; name: string }) {
 
 // -------------------------------------------------------------------- stage
 
+// Linux WebKit can stop supplying a replacement player's frames/metadata even while
+// its receiver keeps decoding. Keep one attached player per slot stream and move it
+// between views. A new transport supplies new streams, so it cannot inherit old pixels.
+type SlotGrant = { run: number; id: number; received: boolean; repair: boolean; after?: { time: number } };
+type SlotVideo = { video: HTMLVideoElement; grant?: SlotGrant };
+const slotVideos = new Map<MediaStream, SlotVideo>();
+function assignSlotVideo(player: SlotVideo, run: number, id: number): SlotGrant {
+  if (player.grant?.run === run && player.grant.id === id) return player.grant;
+  // Snapshot at the grant, before React moves the player. Its cached pixels and
+  // readiness belong to the previous watch, even though the stream is unchanged.
+  const after = player.grant ? { time: performance.now() } : undefined;
+  return player.grant = { run, id, received: false, repair: false, after };
+}
+let slotVideoParking: HTMLDivElement | null = null;
+function parkSlotVideo(video: HTMLVideoElement) {
+  if (!slotVideoParking) {
+    slotVideoParking = document.createElement("div");
+    slotVideoParking.dataset.screenPlayers = "";
+    slotVideoParking.setAttribute("aria-hidden", "true");
+    // A negative layer behind the document can stall WebKit's idle players at
+    // HAVE_NOTHING. Keep their renderers present; hide the parent, not each video.
+    slotVideoParking.style.cssText = "position:fixed;top:0;left:0;width:16px;height:16px;display:grid;grid-template: minmax(0,1fr) / minmax(0,1fr);overflow:hidden;pointer-events:none;opacity:0;z-index:0";
+    const cover = document.createElement("div");
+    cover.style.cssText = "position:absolute;inset:0;background:black;z-index:1";
+    slotVideoParking.appendChild(cover);
+    document.body.appendChild(slotVideoParking);
+  }
+  video.removeAttribute("data-share");
+  video.className = "size-full object-contain";
+  video.style.gridArea = "1 / 1";
+  slotVideoParking.prepend(video);
+}
+function prepareSlotVideo(stream: MediaStream | null) {
+  const video = document.createElement("video");
+  video.muted = true;
+  video.autoplay = true;
+  video.playsInline = true;
+  const player: SlotVideo = { video };
+  if (stream) slotVideos.set(stream, player);
+  return player;
+}
+useScreen.subscribe(screen => {
+  for (const [stream, player] of slotVideos) {
+    const slot = screen.streams.indexOf(stream);
+    if (slot !== -1) {
+      const watch = screen.watches.find(w => w.slot === slot && w.status === "watching");
+      if (watch) assignSlotVideo(player, screen.transport.run, watch.id);
+      continue;
+    }
+    player.video.srcObject = null;
+    player.video.remove();
+    slotVideos.delete(stream);
+  }
+  if (slotVideos.size === 0) { slotVideoParking?.remove(); slotVideoParking = null; }
+});
+
 /** A watched share's video, from its slot's stream. */
-function ShareVideo({ share, className, onDoubleClick, videoRef }: { share: string; className?: string; onDoubleClick?: () => void; videoRef?: (video: HTMLVideoElement | null) => void }) {
+export function ShareVideo({ share, className, onDoubleClick, videoRef }: { share: string; className?: string; onDoubleClick?: () => void; videoRef?: (video: HTMLVideoElement | null) => void }) {
   const t = useT();
+  const run = useScreen(s => s.transport.run);
+  const watchId = useScreen(s => s.watches.find(w => w.share === share)?.id);
   const stream = useScreen(s => { const slot = slotOf(s, share); return slot === null ? null : (s.streams[slot] ?? null); });
-  const ref = useRef<HTMLVideoElement | null>(null);
-  const [showing, setShowing] = useState(false);
-  useEffect(() => {
-    const video = ref.current;
-    if (!video) return;
-    if (video.srcObject !== stream) video.srcObject = stream;
+  const host = useRef<HTMLDivElement | null>(null);
+  const [shown, setShown] = useState<{ stream: MediaStream; run: number; id: number } | null>(null);
+  const showing = stream !== null && shown?.stream === stream && shown.run === run && shown.id === watchId;
+  useLayoutEffect(() => {
+    const mount = host.current;
+    if (!mount) return;
+    let player = stream ? slotVideos.get(stream) : undefined;
+    if (!player) player = prepareSlotVideo(stream);
+    const { video } = player;
+    const grant = watchId === undefined ? undefined : assignSlotVideo(player, run, watchId);
+    let live = true, probe: ReturnType<typeof setTimeout> | undefined, frame: number | undefined;
+    const hasFrame = () => video.readyState >= (HTMLMediaElement.HAVE_CURRENT_DATA ?? 2);
+    video.dataset.share = share;
+    video.className = "size-full object-contain";
+    const received = (event?: Event, fresh = false) => {
+      if (!live || !stream || !grant || player.grant !== grant || (event?.type === "resize" && !hasFrame())) return;
+      if (grant.after && !grant.received && !fresh) return;
+      grant.received = true;
+      clearTimeout(probe);
+      setShown({ stream, run, id: grant.id });
+      controller.screen.frameReceived(share, run, grant.id);
+    };
+    const presented: VideoFrameRequestCallback = (_, metadata) => {
+      if (!live || !grant || player.grant !== grant || grant.received) return;
+      const after = grant.after!;
+      // A delayed callback may still describe the old frame. Prefer its network
+      // receipt time; otherwise use the frame's original presentation timestamp,
+      // not the callback's invocation time. WebKit resets playback-quality counts
+      // on a player move, but a cached frame keeps its pre-grant timestamp.
+      const fresh = (metadata.receiveTime ?? metadata.presentationTime) > after.time;
+      if (fresh) received(undefined, true);
+      else frame = video.requestVideoFrameCallback(presented);
+    };
+    const repair = async () => {
+      if (!live || !grant || player.grant !== grant || grant.received || grant.repair) return;
+      const stats = await controller.screen.stats(share).catch(() => null);
+      if (!live || player.grant !== grant || grant.received) return;
+      if (!grant.after && hasFrame()) { received(); return; }
+      if (stats && stats.framesDecoded > 0) {
+        // WebKit's media-player decoder can miss the receiver's startup keyframe
+        // while selecting its stream. Ask once AFTER input exists, rather than
+        // during attachment. Repair never requires a second fresh frame to reveal.
+        grant.repair = true;
+        controller.screen.requestFrame(share, run, grant.id);
+      } else probe = setTimeout(() => void repair(), 100);
+    };
+    video.addEventListener("loadeddata", received);
+    video.addEventListener("resize", received);
+    if (onDoubleClick) video.addEventListener("dblclick", onDoubleClick);
+    mount.appendChild(video);
+    videoRef?.(video);
+    if (video.srcObject !== stream) {
+      // Initialize WebKit's renderer in its mounted host before binding media.
+      void video.offsetWidth;
+      video.srcObject = stream;
+    }
     if (stream) void video.play().catch(() => {});
-  }, [stream]);
+    // Static readiness survives view moves only within the same grant. Reuse
+    // keeps the binding but covers its old frame until a post-grant frame arrives.
+    if (grant?.received || (!grant?.after && hasFrame())) received();
+    if (stream && grant && !grant.received) {
+      if (grant.after && typeof video.requestVideoFrameCallback === "function") frame = video.requestVideoFrameCallback(presented);
+      probe = setTimeout(() => void repair(), 100);
+    }
+    return () => {
+      live = false;
+      clearTimeout(probe);
+      if (frame !== undefined) video.cancelVideoFrameCallback(frame);
+      video.removeEventListener("loadeddata", received);
+      video.removeEventListener("resize", received);
+      if (onDoubleClick) video.removeEventListener("dblclick", onDoubleClick);
+      videoRef?.(null);
+      const screen = useScreen.getState();
+      if (document.pictureInPictureElement === video && !screen.watches.some(w => w.id === watchId && w.share === share && w.status === "watching")) {
+        void document.exitPictureInPicture().catch(() => {});
+      }
+      if (video.parentElement === mount) {
+        if (stream && screen.streams.includes(stream)) parkSlotVideo(video);
+        else video.remove();
+      }
+      // Keep the binding through view/StrictMode remounts. The stream's retirement
+      // above detaches it and bounds the cache to the run's receive slots.
+    };
+  }, [stream, share, run, watchId, onDoubleClick, videoRef]);
   return (
-    <div className={cn("relative flex min-h-0 items-center justify-center overflow-hidden bg-black", className)}>
-      <video
-        ref={video => { ref.current = video; videoRef?.(video); }}
-        data-share={share}
-        muted
-        autoPlay
-        playsInline
-        onLoadedData={() => setShowing(true)}
-        onResize={() => setShowing(true)}
-        onDoubleClick={onDoubleClick}
-        className="size-full object-contain"
-      />
+    <div data-screen-video data-ready={showing} className={cn("relative flex min-h-0 items-center justify-center overflow-hidden bg-black", className)}>
+      <div ref={host} className="contents" />
       {!showing && (
-        <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-white/70">{t("screen.connecting")}</div>
+        <div data-screen-placeholder className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-black text-sm text-white/70">{t("screen.connecting")}</div>
       )}
     </div>
   );

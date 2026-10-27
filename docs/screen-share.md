@@ -2774,7 +2774,46 @@ from native capture is PR 10.
     `getStats`), and "Stop watching".
   - The sharer's speaking ring shows on their card, from the existing
     `voice.talking` event.
-  - Reused slot may briefly show the previous share's last frame until the new keyframe decodes (cosmetic).
+  - When a member viewer reuses a receive slot with no other active or pending
+    watch, the client renews the transport to discard the old receiver's decoded
+    frames. Each slot stream gets one video element on its first mount. Players
+    move between the stage and thumbnails without rebinding; unmounted players
+    stay connected in a transparent parent. Retiring the stream detaches and
+    discards that player; a new transport's streams always get fresh elements.
+    The cache is bounded by the run's receive slots. First-use slots keep the
+    current transport.
+  - With another active or pending watch, slot reuse keeps the transport and
+    leaves those watches uninterrupted. The reused player stays covered until
+    a post-grant frame arrives; its previous watch's cached frame cannot reveal
+    the new watch or satisfy its first-frame deadline. Readiness and the repair
+    marker belong to the run/watch ID, so Stage moves preserve only that grant's
+    state. A frame callback must report receipt after the grant; without optional
+    receipt metadata, it uses the frame's original presentation timestamp after
+    the grant. Delaying a cached frame's callback does not refresh that timestamp.
+    Playback-quality counts are not used: WebKit can reset them when the player
+    moves. Cached loadeddata/resize/current-data state is insufficient.
+  - Linux WebKit can leave a replacement media player at 0×0 even while the
+    receiver decodes fresh keyframes. Preserving the player keeps a static share
+    visible through view/StrictMode remounts without requesting another frame.
+    Metadata-only resize cannot certify a first frame.
+    Watch assignment already requests a budgeted, retried PLI, but Linux WebKit's
+    media-player decoder may initialize after that first receiver input. If the
+    receiver has decoded input but the player still lacks a frame for the current
+    grant, the client requests one repair keyframe for that grant. This marker
+    survives view moves. First-use players reveal on their first loaded frame;
+    reused players reveal on their first qualifying post-grant frame callback.
+    Static shares need no later frame after that receipt.
+    Repair requests retain run/watch-ID fencing and do not restart the deadline.
+    No new server notification or timed reveal is used.
+    The existing offer/connect and H.264 recovery watchdogs still apply. A connected
+    receiver that never supplies an identifiable first frame for its current grant
+    ends its watch 35 s after that grant through the normal unwatch/error path,
+    also for VP9, older servers, or a reused player without frame callbacks.
+    The controller owns this deadline per run/watch ID: switching the stage or
+    remounting a video cannot restart it. Only that grant's first frame, unwatch, server
+    release/stop, or transport retirement clears it. Rapid
+    sole-watch reuse can hit the existing offer rate limit and its bounded retry
+    delay.
   - No sound in the first release; phase 2 adds a volume slider and mute per
     share ([Shared audio](#shared-audio-phase-2)).
 - **Encrypted.** The same lock as voice ("End-to-end encrypted") on the stage,

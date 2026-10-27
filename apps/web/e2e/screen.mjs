@@ -149,7 +149,8 @@ const diagnostics = page => page.evaluate(async () => ({
   capture: window.__pcs.flatMap(pc => pc.getSenders().filter(s => s.track?.kind === "video").map(s => ({ settings: s.track.getSettings(), parameters: s.getParameters() }))),
   videos: [...document.querySelectorAll("video[data-share]")].map(v => {
     const track = v.srcObject?.getVideoTracks?.()[0];
-    return { share: v.dataset.share, readyState: v.readyState, size: `${v.videoWidth}x${v.videoHeight}`, paused: v.paused, track: track && `${track.readyState}${track.muted ? " muted" : ""}` };
+    return { share: v.dataset.share, readyState: v.readyState, size: `${v.videoWidth}x${v.videoHeight}`, paused: v.paused, track: track && `${track.readyState}${track.muted ? " muted" : ""}`,
+      box: `${v.clientWidth}x${v.clientHeight}`, opacity: getComputedStyle(v).opacity, visibility: document.visibilityState };
   }),
 }));
 
@@ -223,7 +224,8 @@ async function share(page, surface, preset = null) {
   await page.getByRole("button", { name: "Share screen", exact: true }).click();
   const dialog = page.getByRole("dialog", { name: "Share your screen" });
   await dialog.waitFor({ timeout: 20_000 });
-  await dialog.getByText(surface, { exact: true }).waitFor();
+  // Synthetic canvas tracks may report either an unknown surface or a monitor.
+  await dialog.getByText(surface === "Sharing your screen" ? /^Sharing your (?:entire )?screen$/ : surface, { exact: true }).waitFor();
   if (preset) {
     await dialog.getByRole("radio", { name: preset === "Text" ? "Sharp text" : "Smoothness", exact: true }).check();
     await dialog.getByLabel("Resolution", { exact: true }).selectOption(preset === "Saver" ? "720" : "1080");
@@ -268,7 +270,7 @@ function fromSource(id, width, height, what) {
 
 const revealed = (page, share) => waitFor(() => page.evaluate(share => {
   const video = document.querySelector(`video[data-share="${share}"]`);
-  return video && getComputedStyle(video).opacity === "1";
+  return video && video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA && video.videoWidth > 0 && video.videoHeight > 0 && video.closest("[data-screen-video]")?.dataset.ready === "true" && getComputedStyle(video).opacity === "1";
 }, share), "the new watch reveals its decoded frame");
 
 /** Waits until `page` decodes `share` with the source's barcode, twice with different counters. */
@@ -457,6 +459,15 @@ async function run(browsers, web, server, token) {
   await codecFlow(ws, wv, wsShare, "video/vp9");
   await bar(ws).getByText("2 watching").waitFor({ timeout: 10_000 });
 
+  // The real Stage moves both players without rebinding their live streams.
+  const beforeFocus = await session(wv, (_, screen) => ({ transport: screen.transport, watches: screen.watches }));
+  await wv.evaluate(() => { window.__stageVideos = new Map([...document.querySelectorAll("video[data-share]")].map(v => [v.dataset.share, v])); });
+  await wv.evaluate(share => document.querySelector(`video[data-share="${share}"]`).closest('[role="button"]').click(), csShare);
+  await sees(wv, csShare, 1, "stage switch keeps the focused share's player rendering");
+  await sees(wv, wsShare, 2, "stage switch keeps the thumbnail's player rendering");
+  assert.ok(await wv.evaluate(() => [...window.__stageVideos].every(([share, video]) => document.querySelector(`video[data-share="${share}"]`) === video)), "a focus change preserves both attached media players");
+  assert.deepEqual(await session(wv, (_, screen) => ({ transport: screen.transport, watches: screen.watches })), beforeFocus, "a focus change keeps the transport and watches");
+
   // Start → stop → start while watching two other shares: the watch transport is untouched.
   const c3 = await device(engine("chromium"), web, server, "c3-restart", { frequency: 700, canvasId: [3, 6], sendCodec: "vp9" });
   await join(c3, channels.stage);
@@ -469,13 +480,83 @@ async function run(browsers, web, server, token) {
   await watch(cv, "c3-restart");
   await sees(cv, first, 3, "first share of the restarting sharer");
   await codecFlow(c3, cv, first, "video/vp9");
+  // Also reuse a WebKit slot while its two other watches stay active.
+  const concurrentWebKitRun = await session(wv, (_, screen) => screen.transport.run);
+  await watch(wv, "c3-restart");
+  await sees(wv, first, 3, "concurrent WebKit watch before slot reuse");
+  // The WebKit sharer has no other watches: its receive transport may renew safely.
+  await watch(ws, "c3-restart");
+  await sees(ws, first, 3, "sole watch before slot reuse");
   await stopSharing(c3);
   await waitFor(async () => (await shareOf(cv, "c3-restart")) === null, "the first share ends for viewers");
+  await waitFor(() => session(ws, (_, screen) => screen.watches.length === 0), "the sole watch ends");
   const second = await share(c3, "Sharing your screen");
   assert.notEqual(second, first, "a new share gets a new id");
+  const oldViewerRun = await session(cv, (_, screen) => screen.transport.run);
+  await cv.evaluate(share => {
+    const video = document.querySelector(`video[data-share="${share}"]`);
+    const observation = window.__otherWatch = { video, stream: video.srcObject, visible: true, counters: [] };
+    const sample = () => {
+      const current = document.querySelector(`video[data-share="${share}"]`);
+      observation.visible &&= current === video && current.srcObject === observation.stream && current.closest("[data-screen-video]")?.dataset.ready === "true" && getComputedStyle(current).opacity === "1";
+      const frame = window.__readBarcode(current);
+      if (frame && !frame.invalid) observation.counters.push(frame.counter);
+      observation.sampler = requestAnimationFrame(sample);
+    };
+    sample();
+  }, wsShare);
+  const oldSoloRun = await session(ws, (_, screen) => screen.transport.run);
+  for (const viewer of [ws, wv]) await viewer.evaluate(share => {
+    window.__reuseFrames = [];
+    const sample = () => {
+      const video = document.querySelector(`video[data-share="${share}"]`);
+      if (video && video.closest("[data-screen-video]")?.dataset.ready === "true" && getComputedStyle(video).opacity === "1") {
+        const frame = window.__readBarcode(video);
+        if (frame && !frame.invalid) window.__reuseFrames.push(frame.id);
+      }
+      window.__reuseSampler = requestAnimationFrame(sample);
+    };
+    sample();
+  }, second);
   await watch(cv, "c3-restart");
+  await watch(ws, "c3-restart");
+  await watch(wv, "c3-restart");
+  await sees(wv, second, 6, "concurrent WebKit watch reveals its new grant's frame");
+  assert.equal(await session(wv, (_, screen) => screen.transport.run), concurrentWebKitRun, "WebKit reuse preserves its other active watches' transport");
   // The second share has its own source (6, another shape): its frames cannot be the first's.
   await sees(cv, second, 6, "second share of the restarting sharer");
+  assert.equal(await session(cv, (_, screen) => screen.transport.run), oldViewerRun, "another active watch prevents renewal");
+  assert.ok(await cv.evaluate(share => {
+    const video = document.querySelector(`video[data-share="${share}"]`);
+    return video === window.__otherWatch.video && video.srcObject === window.__otherWatch.stream && video.closest("[data-screen-video]")?.dataset.ready === "true" && getComputedStyle(video).opacity === "1";
+  }, wsShare), "the other active watch keeps its video element, stream and visibility");
+  checks.push({ check: "slot reuse leaves other active watches uninterrupted", ok: true });
+  await sees(ws, second, 6, "sole watch after slot reuse");
+  const otherWatch = await cv.evaluate(() => {
+    cancelAnimationFrame(window.__otherWatch.sampler);
+    return { visible: window.__otherWatch.visible, frames: new Set(window.__otherWatch.counters).size };
+  });
+  assert.ok(otherWatch.visible, "the untouched watch stays visible throughout sole-watch renewal");
+  if (paintsUnreliably(cv)) checks.push({ check: "untouched watch's barcode progresses during sole-watch renewal", skipped: true, reason: "WebKit on Linux paints remote video unreliably" });
+  else {
+    assert.ok(otherWatch.frames > 1, "the untouched watch's frames progress during sole-watch renewal");
+    checks.push({ check: "untouched watch stays visible and frames progress during sole-watch renewal", ok: true });
+  }
+  for (const [viewer, label] of [[ws, "sole"], [wv, "concurrent WebKit"]]) {
+    const reuseFrames = await viewer.evaluate(() => {
+      cancelAnimationFrame(window.__reuseSampler);
+      return window.__reuseFrames;
+    });
+    const check = `${label} reused slot displays only the new share's barcode`;
+    if (paintsUnreliably(viewer)) checks.push({ check, skipped: true, reason: "WebKit on Linux paints remote video unreliably" });
+    else {
+      assert.ok(reuseFrames.length > 0 && reuseFrames.every(id => id === 6), `${label} reused slot showed another share: ${reuseFrames}`);
+      checks.push({ check, ok: true });
+    }
+  }
+  assert.ok(await session(ws, (_, screen) => screen.transport.run) > oldSoloRun, "a sole reused slot renews its receiver");
+  checks.push({ check: "sole slot reuse renews its receiver", ok: true });
+  await session(ws, (_, __, controller, share) => controller.screen.unwatch(share), second);
   await sees(c3, csShare, 1, "still watching the tab share after start → stop → start");
   await sees(c3, wsShare, 2, "still watching the canvas share after start → stop → start");
   assert.deepEqual(await session(c3, (_, screen) => screen.transport), transport, "the watch transport stayed the same");

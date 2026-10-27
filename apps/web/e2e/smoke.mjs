@@ -751,8 +751,11 @@ async function main() {
 
   await check("private messages verify in both directions across endpoint aliases, with unread badges", async () => {
     await treeItem(b, /Alice/).dblclick();
+    await b.getByRole("tab", { name: "Alice", exact: true, selected: true }).waitFor();
     await composer(b).fill("psst");
-    await composer(b).press("Enter");
+    // Opening an encrypted conversation can disable the composer again while its group settles.
+    // press() sends a key even then; click() waits for the Send button to be enabled.
+    await b.getByRole("button", { name: "Send message", exact: true }).click();
     await a.getByRole("tab", { name: /Bob/ }).waitFor();
     await a.getByRole("tab", { name: /Bob 1/ }).waitFor();
     await a.getByRole("tab", { name: /Bob/ }).click();
@@ -763,7 +766,7 @@ async function main() {
       await waitFor(() => row.getAttribute("data-message-verification").then((v) => v === "verified"), "verified private message");
     }
     await composer(a).fill(`alias DM reply ${rid}`);
-    await composer(a).press("Enter");
+    await a.getByRole("button", { name: "Send message", exact: true }).click();
     for (const page of [a, b]) {
       const row = page.locator("[data-message]").filter({ hasText: `alias DM reply ${rid}` });
       await row.waitFor();
@@ -1445,7 +1448,7 @@ async function main() {
       const dir = mkdtempSync(path.join(tmpdir(), "gwar-e2e-web-"));
       const child = spawn(
         bin,
-        ["--data-dir", dir, "--http", `127.0.0.1:${port}`, "--media", `127.0.0.1:${port}`, "--public-ip", "127.0.0.1", "--public-endpoint", `ws://127.0.0.1:${port}/ws`, "--web-root", dist],
+        ["--data-dir", dir, "--http", `127.0.0.1:${port}`, "--media", `127.0.0.1:${port}`, "--public-ip", "127.0.0.1", "--public-endpoint", `ws://127.0.0.1:${port}/ws`, "--web-root", dist, "--no-connect"],
         { env: { ...process.env, GWAR_NO_TEAMSPEAK: "true" } },
       );
       children.push(child);
