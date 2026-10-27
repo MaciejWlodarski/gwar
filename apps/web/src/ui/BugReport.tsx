@@ -105,7 +105,7 @@ export function BugReportSection({ card }: { card?: boolean }) {
         <div className="mx-auto flex w-full max-w-2xl flex-col gap-3 p-4 md:p-8" onPaste={onPaste} onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
           <p className="text-sm text-muted">{t("report.description")}</p>
           <Field label={t("report.what")}>
-            {(id) => <Textarea id={id} value={text} onChange={(e) => setText(e.target.value)} rows={5} maxLength={10_000} placeholder={t("report.placeholder")} autoFocus />}
+            {(id) => <Textarea id={id} value={text} onChange={(e) => setText(e.target.value)} rows={5} maxLength={10_000} placeholder={t("report.placeholder")} autoFocus data-entry />}
           </Field>
           <div className="flex flex-col gap-2">
             <div className="flex flex-wrap items-center gap-2">

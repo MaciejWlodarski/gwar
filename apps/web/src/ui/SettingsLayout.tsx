@@ -152,7 +152,7 @@ function SettingsPageCards<T extends string>({ title, icon, pages, value, onValu
         </div>
         <Tabs.List ref={list} aria-label={title} className="flex min-h-0 flex-1 flex-col gap-1 overflow-x-hidden overflow-y-auto px-3 pb-3">
           {pages.map((p) => (
-            <Tabs.Trigger key={p.id} value={p.id} className={tabTrigger}>
+            <Tabs.Trigger key={p.id} value={p.id} data-entry={p.id === value || undefined} className={tabTrigger}>
               {p.icon}
               <span className="truncate">{p.label}</span>
             </Tabs.Trigger>
@@ -200,7 +200,7 @@ function SettingsPageList<T extends string>({ title, icon, pages, value, onValue
       {drill && current ? (
         <>
           <header className="flex h-12 shrink-0 items-center gap-1 border-b border-line px-3">
-            <BackButton text onClick={() => setDrill(false)} />
+            <BackButton text entry onClick={() => setDrill(false)} />
             <h2 className="min-w-0 truncate text-[15px] font-semibold">{current.label}</h2>
           </header>
           <div className={cn("min-h-0 flex-1 overflow-y-auto px-4 py-5", pill && "pb-20")}>{children(current.id)}</div>
@@ -218,6 +218,7 @@ function SettingsPageList<T extends string>({ title, icon, pages, value, onValue
                   <li key={p.id}>
                     <button
                       data-page={p.id}
+                      data-entry={p.id === value || undefined}
                       onClick={() => {
                         onValueChange(p.id);
                         setDrill(true);

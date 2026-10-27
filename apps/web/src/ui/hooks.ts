@@ -119,18 +119,33 @@ useUi.subscribe((ui, before) => {
 const reachable = (el: Element | null): el is HTMLElement =>
   el instanceof HTMLElement && el.isConnected && !el.closest("[inert]") && el.getClientRects().length > 0;
 
+/** The first control of the shown main card. */
+const firstInMain = () => {
+  const main = [...document.querySelectorAll("main")].find(reachable);
+  return [...(main?.querySelectorAll("button, a[href], input, textarea, select, [tabindex]:not([tabindex='-1'])") ?? [])].find(reachable);
+};
+
+/** Focus onto the shown page's starting point (marked `data-entry`: the open tab, the report's text), else into its main card. */
+export function focusPage(): void {
+  const entry = [...document.querySelectorAll("[data-entry]")].find(reachable);
+  (entry ?? firstInMain())?.focus();
+}
+
 /**
- * Leaves a page for the section it was opened from (Esc, Cancel, a sent report), as closing a dialog
- * would: focus goes back to what opened it, or else into the section's main card.
+ * Leaves a page through `apply` (Esc, Cancel, a sent report, the system's back), as closing a dialog would:
+ * focus goes back to what opened it, or else into the section's main card.
  */
-export function leavePage(): void {
+export function exitPage(apply: () => void): void {
   const opener = pageOpener;
   pageOpener = null;
-  flushSync(() => useUi.getState().goBack());
+  flushSync(apply);
   if (reachable(opener)) return opener.focus();
-  const main = [...document.querySelectorAll("main")].find(reachable);
-  const first = [...(main?.querySelectorAll("button, a[href], input, textarea, select, [tabindex]:not([tabindex='-1'])") ?? [])].find(reachable);
-  first?.focus();
+  firstInMain()?.focus();
+}
+
+/** Leaves a page for the section it was opened from. */
+export function leavePage(): void {
+  exitPage(() => useUi.getState().goBack());
 }
 
 /** Layers that Esc closes before it may leave a page. Not a tooltip: one still fading out (the gear's, its focus
@@ -138,8 +153,20 @@ export function leavePage(): void {
 const escapeLayers = '[role="dialog"], [role="alertdialog"], [role="menu"], [role="listbox"]';
 
 /**
+ * The Esc presses that found a layer open, noted before anything handles them: by the time the key reaches
+ * the window, the layer it closed (the More sheet, a dialog) may already be gone from the DOM.
+ */
+const layerEscapes = new WeakSet<Event>();
+if (typeof document !== "undefined") {
+  // Registered on load, so ahead of the layers' own listeners (on the document, capturing).
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && document.querySelector(escapeLayers)) layerEscapes.add(e);
+  }, true);
+}
+
+/**
  * Esc on a page goes back (by default to the section it was opened from), as it would close a dialog. Not while
- * typing, and not when the key closed a popup (Radix marks it handled; the popup is still in the DOM).
+ * typing, and not when the key closed a layer (Radix marks it handled).
  */
 export function useEscapeBack(back: () => void = leavePage): void {
   const latest = useRef(back);
@@ -148,7 +175,7 @@ export function useEscapeBack(back: () => void = leavePage): void {
   });
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      if (e.key !== "Escape" || isEditable(e.target) || (e.defaultPrevented && document.querySelector(escapeLayers))) return;
+      if (e.key !== "Escape" || isEditable(e.target) || (e.defaultPrevented && layerEscapes.has(e))) return;
       latest.current();
     };
     window.addEventListener("keydown", onKey);

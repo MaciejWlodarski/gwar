@@ -130,12 +130,13 @@ describe("the settings page", () => {
       e.preventDefault();
       return e;
     };
+    // Dispatched where a key press starts, on an element, so it passes the document on its way.
     const menu = document.body.appendChild(document.createElement("div"));
     menu.setAttribute("role", "menu");
-    await act(async () => window.dispatchEvent(handled()));
+    await act(async () => document.body.dispatchEvent(handled()));
     expect(useUi.getState().section).toBe("settings");
     menu.remove();
-    await act(async () => window.dispatchEvent(handled()));
+    await act(async () => document.body.dispatchEvent(handled()));
     expect(useUi.getState().section).toBe("home");
     await act(async () => useUi.getState().openSettings("identity"));
     await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));

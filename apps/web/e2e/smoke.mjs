@@ -990,6 +990,45 @@ async function main() {
     await sheet.waitFor({ state: "detached" });
     if (!(await current("Home"))) throw new Error("Home is not marked again");
   });
+  const activeIs = (page, test) => page.evaluate(test);
+  await check("phones: Esc over More closes only the sheet, the page and a report draft stay; focus follows the sheet and its picks", async () => {
+    const onMore = () => activeIs(m, () => document.activeElement?.hasAttribute("data-more"));
+    // Over a settings page.
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    await sheet.getByRole("button", { name: "Settings", exact: true }).click();
+    const settings = m.getByRole("main", { name: "Settings" });
+    await waitFor(() => activeIs(m, () => document.activeElement?.getAttribute("data-page") === "audio"), "focus on the open tab's row", 5000);
+    await settings.getByRole("button", { name: /^Audio/ }).click();
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    if ((await sheet.getAttribute("aria-modal")) !== "true") throw new Error("the More sheet is not modal");
+    await m.keyboard.press("Escape");
+    await sheet.waitFor({ state: "detached" });
+    await waitFor(onMore, "focus back on More", 5000);
+    await sleep(200);
+    if (!(await settings.getByRole("heading", { name: "Audio", exact: true, level: 2 }).isVisible())) throw new Error("Esc over More left the Audio page");
+    // Over a bug report with a draft.
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    await sheet.getByRole("button", { name: "Report a bug", exact: true }).click();
+    const report = m.getByRole("main", { name: "Report a bug" });
+    await waitFor(() => activeIs(m, () => document.activeElement?.tagName === "TEXTAREA"), "focus in the report", 5000);
+    await m.keyboard.type("a draft");
+    await sectionTab(m, "More").click();
+    await sheetOpen();
+    await m.keyboard.press("Escape");
+    await sheet.waitFor({ state: "detached" });
+    await sleep(200);
+    if (!(await report.isVisible())) throw new Error("Esc over More left the bug report");
+    if ((await report.locator("textarea").inputValue()) !== "a draft") throw new Error("Esc over More dropped the draft");
+    await waitFor(onMore, "focus back on More", 5000);
+    // The browser's back leaves the page as its own way back does: focus stays in the app.
+    await m.evaluate(() => history.back());
+    await report.waitFor({ state: "detached" });
+    await waitFor(() => activeIs(m, () => document.activeElement !== document.body), "focus after the browser's back", 5000);
+    await sectionTab(m, "Home").click();
+  });
   await check("phones: Settings is a list, a category opens over it with a way back; the pill fits a 360 px phone", async () => {
     await sectionTab(m, "More").click();
     await sheet.getByRole("button", { name: "Settings", exact: true }).click();
@@ -1028,6 +1067,53 @@ async function main() {
   await shot(m, "13-mobile-light-chat");
   await m.getByRole("button", { name: "Back to channels", exact: true }).click();
   await shot(m, "14-mobile-light-servers");
+  await check("phones: the browser's Back and Forward, a resize and a reload keep to the app's own steps", async () => {
+    // A context of its own: nothing remembered, so nothing connects.
+    const ctxR = await newCtx({ viewport: { width: 390, height: 844 }, isMobile: true, hasTouch: true });
+    const r = await ctxR.newPage();
+    await r.goto(WEB_URL);
+    const rSheet = r.getByRole("dialog", { name: "More", exact: true });
+    const settings = r.getByRole("main", { name: "Settings" });
+    const audio = settings.getByRole("heading", { name: "Audio", exact: true, level: 2 });
+    const still = async (what) => {
+      await sleep(300);
+      if (!r.url().startsWith(WEB_URL)) throw new Error(`${what}: left the app for ${r.url()}`);
+    };
+    await sectionTab(r, "More").click();
+    await rSheet.waitFor();
+    await rSheet.getByRole("button", { name: "Settings", exact: true }).click();
+    await settings.getByRole("button", { name: /^Audio/ }).click();
+    await audio.waitFor();
+    // Back, then Forward: forward again, not another step back.
+    await r.evaluate(() => history.back());
+    await audio.waitFor({ state: "detached" });
+    await r.evaluate(() => history.forward());
+    await audio.waitFor();
+    // A reload starts afresh on the same entry without navigating; Back then goes through the steps left behind.
+    await r.reload();
+    await r.getByLabel("Server address").waitFor();
+    await still("reload");
+    await r.evaluate(() => history.back());
+    await settings.getByRole("button", { name: /^Audio/ }).waitFor();
+    await r.evaluate(() => history.back());
+    await settings.waitFor({ state: "detached" });
+    await still("back after the reload");
+    // The sheet open, the window wide (the desktop closes it), Back, then narrow again: still in the app.
+    await sectionTab(r, "More").click();
+    await rSheet.waitFor();
+    await r.setViewportSize({ width: 1280, height: 800 });
+    await rSheet.waitFor({ state: "detached" });
+    await r.evaluate(() => history.back());
+    await r.setViewportSize({ width: 390, height: 844 });
+    await still("resize");
+    await sectionTab(r, "More").click();
+    await rSheet.waitFor();
+    await r.setViewportSize({ width: 1280, height: 800 });
+    await r.setViewportSize({ width: 390, height: 844 });
+    await still("resize without back");
+    await r.getByLabel("Server address").waitFor();
+    await ctxR.close();
+  });
 
   // Polish UI
   const ctxP = await newCtx({ locale: "pl-PL", colorScheme: "light" });

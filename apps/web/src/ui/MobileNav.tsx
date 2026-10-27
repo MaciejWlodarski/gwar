@@ -4,6 +4,7 @@ import { useRef, useState, type PointerEvent } from "react";
 import { useT, type Key } from "../i18n";
 import { cn } from "../lib/cn";
 import { profileTabs, useUi, type Section } from "../state/stores";
+import { focusPage } from "./hooks";
 import { useInVoice, useServerUnread } from "./nav";
 
 /** Every section of the app as the phone shows it, in the tab bar or as a tile in More. */
@@ -36,10 +37,11 @@ function openSection(section: Section) {
   else ui.setSection(section);
 }
 
-function Tab({ label, icon: Icon, current, onClick, badge = 0, voice }: { label: string; icon: LucideIcon; current: boolean; onClick: () => void; badge?: number; voice?: boolean }) {
+function Tab({ label, icon: Icon, current, onClick, badge = 0, voice, more }: { label: string; icon: LucideIcon; current: boolean; onClick: () => void; badge?: number; voice?: boolean; more?: boolean }) {
   return (
     <button
       onClick={onClick}
+      data-more={more || undefined}
       aria-label={label}
       aria-current={current ? "page" : undefined}
       className={cn("t flex flex-1 cursor-pointer flex-col items-center justify-center gap-1 text-[11px] font-medium", current ? "text-accent" : "text-muted hover:text-fg")}
@@ -80,7 +82,7 @@ export function TabBar() {
           voice={s === "servers" && inVoice}
         />
       ))}
-      <Tab label={t("nav.more")} icon={LayoutGrid} current={moreOpen || !PINNED.includes(section)} onClick={() => setMore(!moreOpen)} />
+      <Tab label={t("nav.more")} icon={LayoutGrid} current={moreOpen || !PINNED.includes(section)} onClick={() => setMore(!moreOpen)} more />
     </nav>
   );
 }
@@ -96,6 +98,8 @@ export function MoreSheet() {
   const [drag, setDrag] = useState(0);
   const start = useRef<number | null>(null);
   const sheet = useRef<HTMLDivElement>(null);
+  // A tile was picked: focus goes to the page it opened, not back to More.
+  const picked = useRef(false);
   const down = (e: PointerEvent) => {
     start.current = e.clientY;
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -115,6 +119,14 @@ export function MoreSheet() {
         <DialogPrimitive.Content
           ref={sheet}
           aria-describedby={undefined}
+          aria-modal="true"
+          onOpenAutoFocus={() => void (picked.current = false)}
+          onCloseAutoFocus={(e) => {
+            // The More tab opened the sheet (it is no Radix trigger, so Radix would leave focus on the page's body).
+            e.preventDefault();
+            if (picked.current) focusPage();
+            else document.querySelector<HTMLElement>("[data-more]")?.focus();
+          }}
           className="anim-sheet fixed inset-x-0 z-40 rounded-t-2xl border-t border-line bg-side px-4 pb-4 outline-none"
           style={{ bottom: `calc(${BAR} + env(safe-area-inset-bottom))`, transform: drag ? `translateY(${drag}px)` : undefined }}
         >
@@ -128,7 +140,10 @@ export function MoreSheet() {
               return (
                 <button
                   key={id}
-                  onClick={go}
+                  onClick={() => {
+                    picked.current = true;
+                    go();
+                  }}
                   aria-current={here ? "page" : undefined}
                   className={cn(
                     "t flex h-20 cursor-pointer flex-col items-center justify-center gap-2 rounded-[14px] bg-raised px-1 text-center text-xs font-medium",

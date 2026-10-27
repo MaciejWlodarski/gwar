@@ -182,12 +182,14 @@ export const IconButton = forwardRef<
 });
 
 /** Phones: back to the page this one was opened from, a "‹" (with `text`, "‹ Back"). */
-export function BackButton({ label, text, onClick }: { label?: string; text?: boolean; onClick: () => void }) {
+/** `entry`: the page's starting point for focus (see `focusPage`). */
+export function BackButton({ label, text, entry, onClick }: { label?: string; text?: boolean; entry?: boolean; onClick: () => void }) {
   const t = useT();
   return (
     <button
       type="button"
       onClick={onClick}
+      data-entry={entry || undefined}
       aria-label={label ?? t("nav.back")}
       className="t -ml-1.5 flex h-9 shrink-0 cursor-pointer items-center gap-0.5 rounded-md pr-2 pl-0.5 text-sm font-medium text-accent hover:bg-hover"
     >
