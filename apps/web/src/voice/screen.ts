@@ -638,6 +638,8 @@ export class ScreenPublisher {
   private lift = 0;
   /** The current lift's restoration: `endProbe` advances it, so its stale writes, completions and retries stop. */
   private restoration = 0;
+  /** Recoveries waiting for the lifted sender's restoration to end; `endProbe` releases them. */
+  private restored: (() => void)[] = [];
   /** The latest uplink estimate, for the cap a probe restores. */
   private available: number | undefined;
   private run = 0;
@@ -960,6 +962,7 @@ export class ScreenPublisher {
     this.restoring = false;
     this.lift++;
     this.restoration++;
+    for (const release of this.restored.splice(0)) release();
   }
 
   private endPhaseAfter(ms: number): void {
@@ -978,14 +981,16 @@ export class ScreenPublisher {
    * Chromium probes (up to twice its estimate) when the allocation rises past the estimate. The
    * lift is valid for one second from now: a write still queued behind an earlier transaction,
    * or a fallback retry after a rejection, past that deadline never runs. The headroom cap then
-   * comes back and keeps being retried until a write of it succeeds. A cap still not back after
-   * `RESTORE_DEADLINE_MS` (writes rejected or never settling) ends the transport, as a failed
-   * transport does: the share must not keep sending above its cap.
+   * comes back and keeps being retried until a write of it succeeds (the restore's own, or any
+   * later write within the headroom cap). A cap still not back after `RESTORE_DEADLINE_MS`
+   * (writes rejected or never settling) ends the transport, as a failed transport does: the
+   * share must not keep sending above its cap.
    */
   private liftCap(cap: number): void {
     const lift = ++this.lift, restoration = ++this.restoration, deadline = performance.now() + 1_000;
-    this.restoring = true;
     void this.applyParameters(cap, () => this.lift === lift && performance.now() < deadline);
+    // Set after the lift's own write: only writes queued behind it can restore the cap.
+    this.restoring = true;
     this.probeTimer = setTimeout(() => this.restoreCap(lift, restoration, 1_000), 1_000);
     this.restoreWatchdog = setTimeout(() => {
       if (this.restoration !== restoration || this.closed) return;
@@ -1015,6 +1020,8 @@ export class ScreenPublisher {
   private applyParameters(maxBitrate: number, valid: () => boolean = () => true): Promise<boolean> {
     const sender = this.sender, pc = this.pc, revision = this.revision;
     const alive = () => !this.closed && this.pc === pc && this.sender === sender && this.revision === revision && valid();
+    // The restoration pending when this write was issued, so queued behind its lift.
+    const restoration = this.restoring ? this.restoration : null;
     if (sender && alive()) this.desired = maxBitrate;
     let written = false;
     // Serialize read/modify/write transactions. A queued restore uses current state;
@@ -1042,7 +1049,10 @@ export class ScreenPublisher {
           console.warn("Screen sender parameters:", e); return;
         }
       }
-      if (alive()) { this.applied = maxBitrate; written = true; }
+      if (!alive()) return;
+      this.applied = maxBitrate; written = true;
+      // Any write within the headroom cap (a quality edit, a headroom move) restores the lift.
+      if (this.restoring && restoration === this.restoration && maxBitrate <= headroomBitrate(this.spec().maxBitrate, this.available)) this.endProbe();
     });
     return this.parameters.then(() => written);
   }
@@ -1060,6 +1070,9 @@ export class ScreenPublisher {
   }
 
   async recover(plan: ScreenRecovery): Promise<void> {
+    // The old transport outlives the replacement's negotiation, so a lifted sender is retired
+    // only once its restoration ends: its cap is back, or the watchdog ended the share.
+    while (this.restoring && !this.closed) await new Promise<void>(release => this.restored.push(release));
     if (this.closed) return;
     this.cancelPhase();
     this.guard.resetEncoder();

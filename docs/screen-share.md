@@ -572,21 +572,24 @@ spec's cap for one second: Chromium probes (up to twice its estimate, further wh
 probes succeed), then the headroom cap returns at the latest estimate. The degradation
 preference does not change. A lift carries its own deadline and generation, so a lift
 queued behind an earlier sender transaction, or retried after a late rejection, is
-dropped once its second has passed. The restore is pending until a write of the
-headroom cap succeeds: a rejected restore retries on its own timer (1 → 2 → 4 → 8 s),
+dropped once its second has passed. The restore is pending until a write within the
+headroom cap succeeds, the restore's own or any later one (a quality edit, a headroom
+move): a rejected restore retries on its own timer (1 → 2 → 4 → 8 s),
 independent of stats polling, and no new lift starts meanwhile. A watchdog outside the
 write queue bounds it: if the cap is not back ten seconds after the lift (every write
 rejected, or one that never settles holding the queue), the publisher closes the
 transport and reports it failed, the same path as a failed connection, which ends the
 share with a notice. The share never keeps sending above its cap. A page going away
 (`pagehide`) cancels a lift and its restore retries. Each restoration has its own
-generation, which a close, recovery or `pagehide` advances: a write, fallback, completion
-or retry of a cancelled restoration does nothing, so a late completion from a replaced
-transport cannot clear the new transport's pending restore or watchdog. Failed probes back off
+generation, which a close or `pagehide` advances: a write, fallback, completion
+or retry of a cancelled restoration does nothing, so a late completion cannot clear a
+later restoration or its watchdog. Failed probes back off
 10 → 20 → 40 → … → 300 s; a probe that raised the estimate by 25 % restarts the
 backoff. Busy content, which fills its cap, never qualifies; neither does a share
-already at native size. A close or codec recovery cancels a pending lift and restore;
-a recovery rewrites the headroom cap itself. With the probe the same eight-second 1 Mb/s
+already at native size. A close cancels a pending lift and restore. A codec recovery
+keeps the old transport open until the server accepts its replacement, so it first waits
+for a pending restoration to end (the cap is back, or the watchdog ended the share);
+the replacement starts at the headroom cap itself. With the probe the same eight-second 1 Mb/s
 startup recovers 1080p in 12/12 local shares (13–29 s; main: 2/6), and the default
 startup matrix issues no probe. On the Ubuntu runner both H.264 shares recovered through
 a probe; nine of ten VP9 shares recovered, and six of the seven VP9 lifts probed.
