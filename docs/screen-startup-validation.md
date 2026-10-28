@@ -94,6 +94,9 @@ so it does not reproduce the exact new CI failure. The sender now leaves WebKitG
 answer unchanged as a compatibility exception; Chromium on Linux and native macOS
 WKWebView still get every supported video codec's start hint. The GTK exception is
 covered by unit tests and keeps its browser-default GCC start and the reserve rule.
+A sender that still encodes nothing 5 s after connecting now renegotiates without
+the hint, then with the next codec, then stops the share (docs/screen-share.md,
+"First encoded frame").
 
 Voice latency, jitter, loss, concealment and mouth-to-ear percentiles were not
 measured in this browser ramp harness. Its shaper and synthetic media can demonstrate

@@ -486,6 +486,7 @@ export const en = {
   "screen.stopped.moderator": "{name} stopped your screen share.",
   "screen.stopped.limit": "Your screen share was stopped: it sent more than the server allows.",
   "screen.stopped.transport": "Your screen share could not connect.",
+  "screen.stopped.encoder": "Your screen share was stopped: this browser could not encode the video.",
   "screen.stopped.budget": "Your screen share was stopped: the server's screen sharing capacity is full.",
   "screen.cantDecode": "Your browser cannot decode this screen share. Ask the sharer to use a compatible browser or codec.",
   "screen.stopped.access": "Your screen share was stopped: you can no longer share in this channel.",

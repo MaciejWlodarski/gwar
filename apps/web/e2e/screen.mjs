@@ -715,6 +715,8 @@ try {
   }
   if (engines.includes("webkit")) browsers.webkit = await webkit.launch({ headless: true });
   warnings = await run(browsers, web, ws, token);
+  // A working encoder never trips the publisher's first-frame guard (docs/screen-share.md, "First encoded frame").
+  for (const page of opened) for (const text of page.errors.filter(e => e.startsWith("Screen sender: no frame encoded"))) warnings.push({ device: page.deviceName, text });
 } catch (error) {
   failure = error;
   for (const child of children) {

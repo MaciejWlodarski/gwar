@@ -5,7 +5,7 @@ import { useSession, useUi } from "../state/stores";
 import { welcome } from "../net/testing";
 import type { Link } from "../net/connection";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { captureScreen, DEPENDENCY_DESCRIPTOR, headroomBitrate, MIN_BITRATE, preferredCodecs, publishSsrcs, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, StaleEstimateProbe, StuckCaptureGuard } from "./screen";
+import { captureScreen, DEPENDENCY_DESCRIPTOR, headroomBitrate, MIN_BITRATE, preferredCodecs, publishSsrcs, ScreenPublisher, type PublishParams, ScreenWatchTransport, SCREEN_SLOTS, StaleEstimateProbe, StuckCaptureGuard } from "./screen";
 
 import { deriveSpec, legacySpec, type ScreenSpec } from "./screen-quality";
 import type { ScreenPreset } from "../proto/ScreenPreset";
@@ -2815,5 +2815,152 @@ describe("AV1", () => {
     }
     expect(decodeFailed).toHaveBeenCalledWith(0, "A", 1);
     transport.close();
+  });
+});
+
+describe("first-frame guard", () => {
+  const answer = [
+    "v=0", "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99",
+    "a=rtpmap:96 H264/90000", "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f", "a=rtpmap:97 rtx/90000", "a=fmtp:97 apt=96",
+    "a=rtpmap:98 VP9/90000", "a=fmtp:98 profile-id=0", "a=rtpmap:99 rtx/90000", "a=fmtp:99 apt=98", "",
+  ].join("\r\n");
+  const remote = (pc: Peer) => (pc.setRemoteDescription.mock.calls as unknown as [RTCSessionDescriptionInit][]).map(([d]) => d.sdp!);
+  const share = async (patch: Partial<PublishParams> = {}) => {
+    const track = { readyState: "live", muted: false, applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }), contentHint: "" };
+    const state = vi.fn(), encodeFailed = vi.fn(), warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const publisher = new ScreenPublisher({ track: track as unknown as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => answer, state, encodeFailed, ...patch });
+    await publisher.start();
+    const pc = Peer.all.at(-1)!;
+    pc.stats = new Map();
+    pc.connectionState = "connected"; pc.onconnectionstatechange?.();
+    return { publisher, pc, track, state, encodeFailed, warn };
+  };
+  const encode = (pc: Peer, framesEncoded: number) => pc.stats.set("out", { type: "outbound-rtp", kind: "video", framesEncoded });
+
+  it("leaves a first frame that comes late, but within the wait, alone", async () => {
+    const { publisher, pc, encodeFailed, warn } = await share();
+    encode(pc, 0);
+    await vi.advanceTimersByTimeAsync(4_900);
+    encode(pc, 2);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(1);
+    expect(remote(pc)).toHaveLength(1);
+    expect(encodeFailed).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    // A reconnect is not a new start.
+    pc.connectionState = "disconnected"; pc.onconnectionstatechange?.();
+    pc.connectionState = "connected"; pc.onconnectionstatechange?.();
+    encode(pc, 0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(1);
+    publisher.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("renegotiates once without the start hint, and keeps it off for the rest of the share", async () => {
+    const { publisher, pc, encodeFailed, warn } = await share();
+    expect(remote(pc)[0]).toContain("x-google-start-bitrate=4000");
+    await vi.advanceTimersByTimeAsync(4_999);
+    expect(pc.createOffer).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(pc.createOffer).toHaveBeenCalledTimes(2);
+    expect(remote(pc)).toEqual([expect.stringContaining("x-google-start-bitrate"), answer]);
+    expect(warn).toHaveBeenCalledExactlyOnceWith("Screen sender: no frame encoded 5 s after connecting (codec h264, start hint on); renegotiating without the start-bitrate hint");
+    // The cap is written again for the rebuilt encoder.
+    expect(pc.sendParams.at(-1)!.encodings[0]).toMatchObject({ maxBitrate: 8_000_000 });
+    encode(pc, 30);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(2);
+    expect(encodeFailed).not.toHaveBeenCalled();
+    // A server recovery's new transport starts without the hint too.
+    await publisher.recover({ share: "s", codec: "h264", width: 1920, height: 1080, fps: 60 });
+    expect(remote(Peer.all[1]!)).toEqual([answer]);
+    publisher.close();
+  });
+
+  it("falls back to the plan's next codec when the encoder stays silent without the hint", async () => {
+    const { publisher, pc, encodeFailed, warn } = await share();
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(3);
+    const vp9 = remote(pc).at(-1)!;
+    expect(vp9).toContain("m=video 9 UDP/TLS/RTP/SAVPF 98 99\r\n");
+    expect(vp9).not.toMatch(/H264|x-google-start-bitrate/);
+    expect(warn).toHaveBeenLastCalledWith("Screen sender: no frame encoded 5 s after connecting (codec h264, start hint off); renegotiating with vp9");
+    encode(pc, 1);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(3);
+    expect(encodeFailed).not.toHaveBeenCalled();
+    // H.264 stays out of this share's answers while VP9 is negotiated.
+    await publisher.recover({ share: "s", codec: "h264", width: 1920, height: 1080, fps: 60 });
+    expect(remote(Peer.all[1]!)).toEqual([vp9]);
+    publisher.close();
+  });
+
+  it("goes to the codec fallback first where the engine got no start hint", async () => {
+    vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", platform: "Linux x86_64" });
+    const { publisher, pc, warn } = await share();
+    expect(remote(pc)).toEqual([answer]);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(remote(pc).at(-1)).toContain("m=video 9 UDP/TLS/RTP/SAVPF 98 99\r\n");
+    expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("(codec h264, start hint off); renegotiating with vp9"));
+    publisher.close();
+  });
+
+  it("reports one failure and stops when nothing ever encodes", async () => {
+    const { publisher, pc, state, encodeFailed, warn } = await share();
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(encodeFailed).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenLastCalledWith("Screen sender: no frame encoded 5 s after connecting (codec vp9, start hint off); no fallback left; stopping the share");
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(3);
+    expect(encodeFailed).toHaveBeenCalledTimes(1);
+    expect(state).not.toHaveBeenCalledWith("failed");
+    // Without an encoder callback the transport fails instead, also once.
+    publisher.close();
+    const plain = await share({ encodeFailed: undefined });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(plain.state.mock.calls.filter(([s]) => s === "failed")).toHaveLength(1);
+    plain.publisher.close();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("gives up when the engine changes the video stream on renegotiation", async () => {
+    const { publisher, pc, encodeFailed, warn } = await share();
+    pc.createOffer.mockResolvedValueOnce({ type: "offer", sdp: "v=0\r\na=ssrc-group:FID 12 13\r\n" });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(remote(pc)).toHaveLength(1);
+    expect(encodeFailed).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenLastCalledWith(expect.stringContaining("the new offer changed the video SSRCs"));
+    publisher.close();
+  });
+
+  it("does nothing once the capture ends or the share stops during the wait", async () => {
+    const ended = await share();
+    await vi.advanceTimersByTimeAsync(3_000);
+    ended.track.readyState = "ended";
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(ended.pc.createOffer).toHaveBeenCalledTimes(1);
+    expect(ended.encodeFailed).not.toHaveBeenCalled();
+    ended.publisher.close();
+
+    const stopped = await share();
+    await vi.advanceTimersByTimeAsync(3_000);
+    stopped.publisher.close();
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(stopped.pc.createOffer).toHaveBeenCalledTimes(1);
+    expect(stopped.encodeFailed).not.toHaveBeenCalled();
+    expect(stopped.warn).not.toHaveBeenCalled();
+  });
+
+  it("holds the wait while the track is muted", async () => {
+    const { publisher, pc, track } = await share();
+    track.muted = true;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(1);
+    track.muted = false;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(2);
+    publisher.close();
   });
 });
