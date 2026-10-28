@@ -86,6 +86,17 @@ over the observation interval. The 8 Mb/s arm's first observed estimate was 5.71
 so that observation is not a claim of exact 8 Mb/s initialization. The system
 WKWebView honors the 4 Mb/s parameter and accepts the higher hint without breaking
 video. This checks the desktop app's engine, not a full packaged-app screen-picker run.
+The same native fixture also decoded VP9 in all three arms: the first estimates
+were 300 kb/s without a hint, 4.001 Mb/s with 4 Mb/s, and exactly 8 Mb/s with 8 Mb/s.
+
+The first two CI attempts failed the unchanged screen suite: Linux WebKitGTK
+negotiated VP9 with `x-google-start-bitrate=4000` but encoded zero frames. A local
+fixed-screen candidate also timed out on the WebKit → Chromium flow. Pinned main's
+local suite reached that flow but later failed a separate H.264 recovery assertion,
+so it does not reproduce the exact new CI failure. The sender now leaves WebKitGTK's
+answer unchanged as a compatibility exception; Chromium on Linux and native macOS
+WKWebView still get every supported video codec's start hint. The GTK exception is
+covered by unit tests and keeps its browser-default GCC start and the reserve rule.
 
 Voice latency, jitter, loss, concealment and mouth-to-ear percentiles were not
 measured in this browser ramp harness. Its shaper and synthetic media can demonstrate

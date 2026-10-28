@@ -635,6 +635,11 @@ payload's fmtp, creating a line when absent and preserving codec parameters and 
 This is an initial GCC estimate, not `x-google-min-bitrate`: loss/delay response and
 the ordinary headroom cap can reduce it immediately. Watch and voice answers are unchanged.
 The latest resolved spec (including an edit during signalling) bounds the hint.
+WebKitGTK on Linux keeps its original answer and browser-default start: two CI
+attempts with the extension negotiated VP9 but encoded zero frames. The compatibility
+exception does not apply to Chromium on Linux or native macOS WKWebView, which
+decoded H.264 and VP9 with the hint in local controls. The Linux desktop app does not
+support screen sharing; GTK is still used by the browser regression suite.
 
 With no history it starts at `min(spec cap, 4 Mb/s)`. Four Mb/s covers the default
 1080p30 budget and avoids climbing from Chromium's roughly 300 kb/s default, while
