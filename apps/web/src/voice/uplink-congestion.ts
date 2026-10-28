@@ -14,39 +14,55 @@ export interface UplinkStatus {
 
 /** Entry needs `minSamples` elevated samples covering `holdMs` within the last `windowMs`. */
 export interface UplinkTiming {
+  /** At least this, and at least `minSamples` update intervals, so a slow RTT source can still warn. */
   windowMs: number;
   holdMs: number;
   minSamples: number;
   /** A longer silence drops the verdict (not the floor): it proves neither congestion nor recovery. */
   maxGapMs: number;
+  /** Time away from the floor before a flat new level may be adopted. */
+  rebaseMs: number;
 }
 
-/** WebRTC stats, polled every 1–2.5 s. */
-export const RTC_UPLINK: UplinkTiming = { windowMs: 6_000, holdMs: 4_000, minSamples: 3, maxGapMs: 12_000 };
-/** The 10 s server ping also measures JS-thread stalls: three pings, so one stall or late pong never warns. */
-export const PING_UPLINK: UplinkTiming = { windowMs: 35_000, holdMs: 15_000, minSamples: 3, maxGapMs: 25_000 };
+/** WebRTC stats: polled every 1–2 s, updated every 1–5 s. */
+export const RTC_UPLINK: UplinkTiming = { windowMs: 6_000, holdMs: 4_000, minSamples: 3, maxGapMs: 12_000, rebaseMs: 120_000 };
+/**
+ * The 10 s server ping also measures JS-thread stalls: three pings, so one stall or late pong never warns.
+ * Its few samples make a jagged queue look flat more easily, so the flat test needs four minutes of them.
+ */
+export const PING_UPLINK: UplinkTiming = { windowMs: 35_000, holdMs: 15_000, minSamples: 3, maxGapMs: 25_000, rebaseMs: 240_000 };
 
 const FLOOR_MS = 60_000;
-const REBASE_MS = 120_000;
-const STALE_FLOOR_MS = 600_000;
+/** A route step is flat in absolute terms; a queue is not, however deep it is. */
+const FLAT_MS = 30;
+/** Backups and uploads run for hours; a floor this old is no longer evidence. */
+const STALE_FLOOR_MS = 1_800_000;
 const RECOVER_MS = 5_000;
 
 interface Point { at: number; ms: number }
 const lowest = (points: Point[]) => Math.min(...points.map(p => p.ms));
 
-/** Lowest server ping of this session. The SFU shares the server's host, so it bounds a new peer's floor. */
-let serverFloorMs: number | null = null;
-export function setServerFloor(ms: number | null): void {
-  serverFloorMs = ms !== null && Number.isFinite(ms) && ms > 0 ? ms : null;
+/** The session's Gwar server pings. The SFU shares the server's host, so the lowest bounds a new peer's floor. */
+export interface ServerPing { floorMs: number; latestMs: number }
+let serverPing: ServerPing | null = null;
+export function noteServerPing(ms: number): void {
+  if (!Number.isFinite(ms) || ms <= 0) return;
+  serverPing = { floorMs: Math.min(serverPing?.floorMs ?? Infinity, ms), latestMs: ms };
 }
+export function resetServerPing(): void { serverPing = null; }
+export const currentServerPing = (): ServerPing | null => serverPing;
 
 export class UplinkCongestion {
   /** Healthy samples (below baseline + 75 ms) of the last minute, or the frozen minimum once they aged out. */
   private floor: Point[] = [];
-  /** Every sample of the last two minutes. */
+  /** Every sample of the last `rebaseMs`. */
   private recent: Point[] = [];
+  /** Entry evidence never spans a gap. */
+  private segmentAt = 0;
   private healthyAt = 0;
-  private hintMs: number | null = null;
+  private hintPing: ServerPing | null = null;
+  /** The floor is the server-ping seed, not yet confirmed by a media sample near it. */
+  private hinted = false;
   private path: string | null = null;
   private last: number | null = null;
   private lowSince: number | null = null;
@@ -54,8 +70,12 @@ export class UplinkCongestion {
 
   constructor(private readonly timing: UplinkTiming = RTC_UPLINK) {}
 
-  /** A floor from another path to the same host. It seeds an empty floor and then ages like any healthy sample. */
-  hint(ms: number | null): void { this.hintMs = ms; }
+  /**
+   * Server pings from another path to the same host. The floor seeds an empty floor and then ages like any
+   * healthy sample. Until a media sample confirms it, the media path may simply be longer (a distant TURN
+   * relay), so warning also needs the latest server ping to be elevated.
+   */
+  hint(ping: ServerPing | null): void { this.hintPing = ping; }
 
   /** Call with null when stats fail or repeat; missing observations never count as recovery. */
   observe(now: number, sample: UplinkSample | null): UplinkStatus | null {
@@ -63,15 +83,20 @@ export class UplinkCongestion {
     if (this.last !== null && now < this.last) this.reset();
     // ICE `disconnected`, a throttled hidden webview or a hung getStats: drop the verdict but keep
     // the floor, or a gap during congestion would make the bloated RTT the new normal.
-    if (this.last !== null && now - this.last > this.timing.maxGapMs) this.clearVerdict();
+    if (this.last !== null && now - this.last > this.timing.maxGapMs) { this.clearVerdict(); this.segmentAt = now; }
     if (!sample || !Number.isFinite(sample.rttMs) || sample.rttMs <= 0) return this.status;
     // A different selected candidate pair (or an ICE restart) is a different path with its own floor.
     if (this.path !== null && this.path !== sample.path) this.reset();
+    if (this.last === null) this.segmentAt = now;
     this.path = sample.path;
     this.last = now;
     const ms = sample.rttMs;
-    if (!this.floor.length && this.hintMs !== null) { this.floor.push({ at: now, ms: this.hintMs }); this.healthyAt = now; }
-    this.recent = this.recent.filter(p => now - p.at <= REBASE_MS);
+    if (!this.floor.length && this.hintPing) {
+      this.floor.push({ at: now, ms: this.hintPing.floorMs });
+      this.healthyAt = now;
+      this.hinted = true;
+    }
+    this.recent = this.recent.filter(p => now - p.at <= Math.max(this.timing.rebaseMs, FLOOR_MS));
     this.recent.push({ at: now, ms });
     const fresh = this.floor.filter(p => now - p.at <= FLOOR_MS);
     // Freeze the minimum when the floor ages out: a standing queue must not become normal after a minute.
@@ -82,6 +107,7 @@ export class UplinkCongestion {
       baselineMs = lowest(this.recent.filter(p => now - p.at <= FLOOR_MS));
       this.floor = [{ at: now, ms: baselineMs }];
       this.healthyAt = now;
+      this.hinted = false;
       this.clearVerdict();
     }
     // Only near-floor samples join the floor, so moderate bloat cannot creep into it.
@@ -89,6 +115,7 @@ export class UplinkCongestion {
     if (healthy) {
       this.floor.push({ at: now, ms });
       this.healthyAt = now;
+      this.hinted = false;
       baselineMs = Math.min(baselineMs, ms);
     }
     let congested = this.status?.congested ?? false;
@@ -114,8 +141,13 @@ export class UplinkCongestion {
    * The latest `minSamples` must all be elevated, so isolated stalls never add up.
    */
   private entered(now: number, baselineMs: number): boolean {
-    const { windowMs, holdMs, minSamples } = this.timing;
-    const window = this.recent.filter(p => now - p.at <= windowMs);
+    const { holdMs, minSamples } = this.timing;
+    if (this.hinted && !(this.hintPing && this.hintPing.latestMs >= this.hintPing.floorMs + 75)) return false;
+    const segment = this.recent.filter(p => p.at >= this.segmentAt);
+    // Fresh samples only reach here, so the intervals are the source's real update cadence.
+    const intervals = segment.slice(-minSamples - 1).map((p, i, a) => i ? p.at - a[i - 1]!.at : 0);
+    const windowMs = Math.max(this.timing.windowMs, minSamples * Math.max(...intervals));
+    const window = segment.filter(p => now - p.at <= windowMs);
     const run = window.slice(Math.max(0, window.findIndex(p => p.ms >= baselineMs + 75)));
     const elevated = run.filter(p => p.ms >= baselineMs + 75).length;
     const high = run.filter(p => p.ms > Math.max(baselineMs + 150, baselineMs * 2)).length;
@@ -125,16 +157,17 @@ export class UplinkCongestion {
 
   /**
    * A route or radio change moves RTT to a new level that is flat; bloat is jagged. So adopt the
-   * last minute's minimum as the floor after two minutes away from it with p90 − p10 within
-   * max(30 ms, 25 % of p10), or unconditionally after ten minutes: a floor that old is not evidence.
+   * last minute's minimum as the floor after `rebaseMs` away from it with p90 − p10 within 30 ms,
+   * or unconditionally after thirty minutes: a floor that old is not evidence.
    */
   private shouldRebase(now: number): boolean {
     const away = now - this.healthyAt;
     if (away >= STALE_FLOOR_MS) return true;
-    if (away < REBASE_MS || this.recent.length < 6 || now - this.recent[0]!.at < REBASE_MS * 0.75) return false;
+    const { rebaseMs } = this.timing;
+    if (away < rebaseMs || this.recent.length < 6 || now - this.recent[0]!.at < rebaseMs * 0.75) return false;
     const sorted = this.recent.map(p => p.ms).sort((a, b) => a - b);
     const p10 = sorted[Math.floor((sorted.length - 1) * 0.1)]!, p90 = sorted[Math.ceil((sorted.length - 1) * 0.9)]!;
-    return p90 - p10 <= Math.max(30, p10 / 4);
+    return p90 - p10 <= FLAT_MS;
   }
 
   private clearVerdict(): void {
@@ -142,7 +175,7 @@ export class UplinkCongestion {
   }
 
   reset(): void {
-    this.floor = []; this.recent = []; this.healthyAt = 0;
+    this.floor = []; this.recent = []; this.healthyAt = 0; this.hinted = false;
     this.path = null; this.last = null; this.clearVerdict();
   }
 }
@@ -183,7 +216,7 @@ export class RtcUplinkObserver {
         if (fresh(path, s.roundTripTimeMeasurements ?? s.timestamp)) sample = { path, rttMs: s.roundTripTime * 1000, availableOutgoingBitrate: pair?.availableOutgoingBitrate };
       });
     }
-    this.detector.hint(serverFloorMs);
+    this.detector.hint(serverPing);
     return this.detector.observe(now, sample);
   }
 }

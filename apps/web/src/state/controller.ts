@@ -1,4 +1,4 @@
-import { PING_UPLINK, setServerFloor, UplinkCongestion, type UplinkStatus } from "../voice/uplink-congestion";
+import { noteServerPing, PING_UPLINK, resetServerPing, UplinkCongestion, type UplinkStatus } from "../voice/uplink-congestion";
 import { useUplink } from "./uplink";
 import { claimAll, claimableIdentities, offerClaims } from "./ts-claim";
 import { permissionsOf } from "../lib/permissions";
@@ -227,7 +227,6 @@ class Controller {
   private nativeUplink = new UplinkCongestion(PING_UPLINK);
   private nativeUplinkStatus: UplinkStatus | null = null;
   private nativeUplinkExpiry: ReturnType<typeof setTimeout> | null = null;
-  private serverFloor: number | null = null;
 
   private initialised = false;
   private loadingOlder = false;
@@ -251,8 +250,7 @@ class Controller {
 
   private resetNativeUplink(): void {
     this.nativeUplink.reset();
-    this.serverFloor = null;
-    setServerFloor(null);
+    resetServerPing();
     this.setNativeUplink(null);
   }
 
@@ -624,7 +622,7 @@ class Controller {
       if (this.conn !== conn) return;
       session.setRtt(Math.round(ms));
       if (useSession.getState().kind !== "gwar" || useSession.getState().phase !== "online") return;
-      if (ms > 0 && ms < (this.serverFloor ?? Infinity)) setServerFloor(this.serverFloor = ms);
+      noteServerPing(ms);
       if (isDesktop()) this.setNativeUplink(this.nativeUplink.observe(performance.now(), { path: "native-server-ping", rttMs: ms }));
     });
     conn.onWelcome((welcome, resync) => {

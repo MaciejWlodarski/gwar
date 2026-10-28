@@ -2948,17 +2948,24 @@ The same copy is available in English and Polish; downloads may remain unaffecte
   frozen, so a standing queue does not become normal after a minute.
 - **Entry.** Bufferbloat under a bulk upload is jagged (a TCP sawtooth), so entry
   is a fraction rule, not "every sample high". From the first elevated sample in
-  the entry window (6 s for WebRTC), at least 75 % of samples must stay at or above
-  the recovery line, at least half must exceed `max(baseline + 150 ms, 2 × baseline)`,
-  the latest three must all be elevated, and the evidence must cover 4 s.
+  the entry window, at least 75 % of samples must stay at or above the recovery
+  line (a queue that drained in between starts over), at least half must exceed
+  `max(baseline + 150 ms, 2 × baseline)`, the latest three must all be elevated,
+  and the evidence must cover 4 s. The window is 6 s for WebRTC, but always at
+  least three update intervals of the source (the largest of its last three), so a
+  slow RTT source such as the ~5 s RTCP fallback can still warn. Only fresh
+  measurements count, and the window never spans a gap.
 - **Recovery.** Five continuous seconds below `baseline + 75 ms`.
 - **Rebase.** A route or radio change moves RTT to a new, flat level. After two
-  minutes without a healthy sample, with p90 − p10 of those samples within
-  `max(30 ms, 25 % of p10)`, the last minute's minimum becomes the floor and any
-  warning clears. After ten minutes without a healthy sample the floor is rebased
-  unconditionally. A flat bloated queue (rather than a jagged one) is therefore
-  also adopted after two minutes; this is the cost of not warning forever after
-  a permanent RTT step on the same ICE pair.
+  minutes without a healthy sample, with at least six samples covering 90 s and
+  p90 − p10 of them within 30 ms, the last minute's minimum becomes the floor and
+  any warning clears. The tolerance is absolute: a route step is flat in
+  milliseconds, while a queue stays jagged however deep it is (a 560–640 ms queue
+  is not flat). After thirty minutes without a healthy sample the floor is rebased
+  unconditionally; backups and uploads can run for hours, so a shorter limit would
+  silence exactly the case the warning is for. A queue that is flat within 30 ms
+  is still adopted after two minutes; this is the cost of not warning forever
+  after a permanent RTT step on the same ICE pair.
 - **Gaps and paths.** A gap longer than 12 s (ICE `disconnected`, a throttled
   hidden webview, a hung `getStats`) drops the verdict but keeps the floor, so the
   warning returns within seconds instead of the bloated RTT becoming the new
@@ -2966,9 +2973,12 @@ The same copy is available in English and Polish; downloads may remain unaffecte
   restart) or a replacement peer starts a new floor.
 - **Server floor.** The session's lowest Gwar server ping seeds each new WebRTC
   floor (the SFU shares the server's host), so a call that starts while already
-  congested can still warn. The seed ages like any healthy sample; a media path
-  much longer than the signalling path (a distant TURN relay) can therefore warn
-  until the flat-level rebase adopts its real floor.
+  congested can still warn. The seed ages like any healthy sample. Until a media
+  sample near it confirms it, the media path may simply be longer than the
+  signalling path (a distant TURN relay), so warning also needs the latest server
+  ping to be at least the server floor + 75 ms; a long but healthy relay path is
+  adopted by the flat-level rebase instead. Only Gwar connections feed it; a
+  welcome (including a resync) and teardown reset it.
 
 No settings or network history are persisted, and no bitrate/adaptation controls
 change.
@@ -2985,7 +2995,9 @@ Desktop voice is native Rust, with no media RTT exposed over IPC today. Voice-on
 native calls therefore use the existing 10-second Gwar server ping, with a
 25-second evidence expiry. The ping also measures JS-thread stalls, so entry needs
 three consecutive elevated pings (a 35 s window covering at least 15 s); recovery
-can take another ping interval. The detector learns from pings for the whole
+can take another ping interval. With so few samples a jagged queue can look flat by
+chance, so the flat-level rebase needs four minutes away from the floor (at least
+three of them covered) instead of two. The detector learns from pings for the whole
 online session, so a call that starts congested still warns, but the warning is
 shown only while voice is connected. This fallback measures the signalling path,
 not media RTT. TeamSpeak connections do not use it. Desktop screen publishing still

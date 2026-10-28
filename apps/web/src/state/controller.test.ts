@@ -1466,6 +1466,34 @@ describe("accepting a changed server key", () => {
 });
 
 
+describe("server ping seed for WebRTC floors", () => {
+  it("tracks the lowest and latest Gwar server ping and resets on welcome and teardown", async () => {
+    const { currentServerPing } = await import("../voice/uplink-congestion");
+    connectFake();
+    expect(currentServerPing()).toBeNull();
+    for (const ms of [40, 25, 0, 60]) link.rtt(ms);
+    expect(currentServerPing()).toEqual({ floorMs: 25, latestMs: 60 });
+    // A resync is a new session, possibly over another path.
+    link.welcomeNow(welcome(), true);
+    expect(currentServerPing()).toBeNull();
+    link.rtt(30);
+    expect(currentServerPing()).toEqual({ floorMs: 30, latestMs: 30 });
+    await controller.disconnect(true);
+    expect(currentServerPing()).toBeNull();
+    // A closed connection's late pong is ignored.
+    link.rtt(10);
+    expect(currentServerPing()).toBeNull();
+  });
+
+  it("ignores TeamSpeak pings: they do not reach the SFU's host", async () => {
+    const { currentServerPing } = await import("../voice/uplink-congestion");
+    connectFake({ kind: "teamspeak" });
+    link.rtt(30);
+    expect(currentServerPing()).toBeNull();
+    expect(session().rtt).toBe(30);
+  });
+});
+
 describe("native voice uplink fallback", () => {
   const voiceState = (state: string) => engineHandlers.get("state")!(state);
 
