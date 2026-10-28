@@ -84,6 +84,7 @@ class FakeLink implements Link {
   }
 }
 
+const engineHandlers = new Map<string, (value: unknown) => void>();
 function fakeEngine() {
   const engine = {
     capabilities: { outputDeviceSelection: false, encryptedVoice: async () => true },
@@ -102,7 +103,7 @@ function fakeEngine() {
     setSlotOwner: vi.fn(),
     listDevices: vi.fn(async () => ({ inputs: [], outputs: [] })),
     startMicTest: vi.fn(async () => () => {}),
-    on: vi.fn(() => () => {}),
+    on: vi.fn((event: string, handler: (value: never) => void) => { engineHandlers.set(event, handler as (value: unknown) => void); return () => {}; }),
   };
   return engine satisfies VoiceEngine;
 }
@@ -1466,27 +1467,55 @@ describe("accepting a changed server key", () => {
 
 
 describe("native voice uplink fallback", () => {
-  it("uses the existing ping without a share and expires/reset its warning", async () => {
+  const voiceState = (state: string) => engineHandlers.get("state")!(state);
+
+  it("learns from pings before the call, shows only while connected, and expires without losing the floor", async () => {
     vi.spyOn(performance, "now").mockImplementation(() => Date.now());
     const { useUplink } = await import("./uplink");
     connectFake();
     await vi.advanceTimersByTimeAsync(10);
     const win: { __TAURI_INTERNALS__?: object; location: object } = { __TAURI_INTERNALS__: {}, location: { protocol: "http:", hostname: "localhost", port: "5173" } };
     vi.stubGlobal("window", win);
+    const ping = async (ms: number) => { await vi.advanceTimersByTimeAsync(10000); link.rtt(ms); };
     try {
-      stores.useVoice.setState({ state: "connected" });
-      link.rtt(20);
-      await vi.advanceTimersByTimeAsync(10000); link.rtt(480);
-      expect(useUplink.getState().voice?.congested).toBe(false);
-      await vi.advanceTimersByTimeAsync(10000); link.rtt(480);
-      expect(useUplink.getState().voice).toMatchObject({ congested: true, rttMs: 480 });
+      link.rtt(20); await ping(20);
+      // The upload saturates before the user joins voice.
+      await ping(480); await ping(480);
+      expect(useUplink.getState().voice).toBeNull();
+      await ping(480);
+      expect(useUplink.getState().voice).toBeNull();
+      voiceState("connected");
+      expect(useUplink.getState().voice).toMatchObject({ congested: true, rttMs: 480, baselineMs: 20 });
+      voiceState("starting");
+      expect(useUplink.getState().voice).toBeNull();
+      voiceState("connected");
+      expect(useUplink.getState().voice?.congested).toBe(true);
       await vi.advanceTimersByTimeAsync(25000);
       expect(useUplink.getState().voice).toBeNull();
-      link.rtt(480);
-      expect(useUplink.getState().voice?.congested).toBe(false);
+      // A silent gap (two lost pings) drops the verdict, not the healthy floor.
+      await vi.advanceTimersByTimeAsync(5000); link.rtt(480);
+      expect(useUplink.getState().voice).toMatchObject({ congested: false, baselineMs: 20 });
+      await ping(480); await ping(480);
+      expect(useUplink.getState().voice?.congested).toBe(true);
       await controller.disconnect(true);
       link.rtt(900);
       expect(useUplink.getState().voice).toBeNull();
-    } finally { delete win.__TAURI_INTERNALS__; }
+    } finally { delete win.__TAURI_INTERNALS__; voiceState("idle"); }
+  });
+
+  it("does not warn for one or two stalled pings", async () => {
+    vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+    const { useUplink } = await import("./uplink");
+    connectFake();
+    const win: { __TAURI_INTERNALS__?: object; location: object } = { __TAURI_INTERNALS__: {}, location: { protocol: "http:", hostname: "localhost", port: "5173" } };
+    vi.stubGlobal("window", win);
+    try {
+      voiceState("connected");
+      for (const ms of [20, 20, 900, 20, 600, 600, 20]) {
+        link.rtt(ms);
+        expect(useUplink.getState().voice?.congested).toBe(false);
+        await vi.advanceTimersByTimeAsync(10000);
+      }
+    } finally { delete win.__TAURI_INTERNALS__; voiceState("idle"); }
   });
 });

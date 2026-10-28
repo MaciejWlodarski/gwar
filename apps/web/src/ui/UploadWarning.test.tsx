@@ -9,6 +9,7 @@ import { useSettings } from "../state/settings";
 import { useSession, useUi, useVoice } from "../state/stores";
 import { useUplink } from "../state/uplink";
 import { SharingBar } from "./Screen";
+import { UploadCongestionAnnouncer } from "./UploadWarning";
 import { VoicePanel, VoicePill } from "./VoicePanel";
 import { TooltipProvider } from "./kit";
 
@@ -68,4 +69,23 @@ it("shows voice congestion in the sharing bar even before encoder stats arrive",
   useUplink.setState({ voice: bloated });
   await render(<SharingBar />);
   expect(container.textContent).toContain("Łącze wysyłania zapchane · 480 ms");
+});
+
+it("announces congestion once when it starts, not on every RTT update", async () => {
+  await render(<><UploadCongestionAnnouncer /><VoicePanel /></>);
+  const region = container.querySelector('[data-testid="upload-announcer"]')!;
+  expect(region.getAttribute("role")).toBe("status");
+  expect(region.getAttribute("aria-live")).toBe("polite");
+  expect(region.textContent).toBe("");
+  await act(async () => useUplink.setState({ voice: bloated }));
+  expect(region.textContent).toBe("Łącze wysyłania zapchane · 480 ms");
+  // The visible warning stays silent, also inside the sharing bar's status region.
+  expect(container.querySelector('[data-testid="upload-warning"]')?.getAttribute("aria-live")).toBe("off");
+  await act(async () => useUplink.setState({ voice: { ...bloated, rttMs: 510 } }));
+  expect(region.textContent).toBe("Łącze wysyłania zapchane · 480 ms");
+  expect(container.textContent).toContain("Łącze wysyłania zapchane · 510 ms");
+  await act(async () => useUplink.setState({ voice: { ...bloated, congested: false, rttMs: 30 } }));
+  expect(region.textContent).toBe("");
+  await act(async () => useUplink.setState({ voice: { ...bloated, rttMs: 620 } }));
+  expect(region.textContent).toBe("Łącze wysyłania zapchane · 620 ms");
 });

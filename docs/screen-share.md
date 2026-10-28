@@ -2940,14 +2940,38 @@ when the client's RTT rises persistently above its recent healthy floor. Tap/cli
 or keyboard-activate the warning to read the explanation and suggested actions.
 The same copy is available in English and Polish; downloads may remain unaffected.
 
-`voice/uplink-congestion.ts` contains the pure, session-local detector. It keeps a
-60-second minimum RTT, flags a rise above `max(baseline + 150 ms, 2 × baseline)`
-for at least four seconds, and clears after five continuous seconds below
-`baseline + 75 ms`. The healthy baseline freezes during a suspected/confirmed
-rise, so a long queue does not clear itself after a minute. A replacement peer or
-selected ICE path starts a new baseline. Missing evidence expires after 12 seconds;
-short gaps neither prove congestion nor recovery. No settings or network history
-are persisted, and no bitrate/adaptation controls change.
+`voice/uplink-congestion.ts` contains the pure, session-local detector:
+
+- **Floor.** The baseline is the minimum of the last minute's *healthy* samples,
+  those below `baseline + 75 ms` (the recovery line). Moderate bloat therefore
+  never creeps into it. When no healthy sample is left, the old minimum stays
+  frozen, so a standing queue does not become normal after a minute.
+- **Entry.** Bufferbloat under a bulk upload is jagged (a TCP sawtooth), so entry
+  is a fraction rule, not "every sample high". From the first elevated sample in
+  the entry window (6 s for WebRTC), at least 75 % of samples must stay at or above
+  the recovery line, at least half must exceed `max(baseline + 150 ms, 2 × baseline)`,
+  the latest three must all be elevated, and the evidence must cover 4 s.
+- **Recovery.** Five continuous seconds below `baseline + 75 ms`.
+- **Rebase.** A route or radio change moves RTT to a new, flat level. After two
+  minutes without a healthy sample, with p90 − p10 of those samples within
+  `max(30 ms, 25 % of p10)`, the last minute's minimum becomes the floor and any
+  warning clears. After ten minutes without a healthy sample the floor is rebased
+  unconditionally. A flat bloated queue (rather than a jagged one) is therefore
+  also adopted after two minutes; this is the cost of not warning forever after
+  a permanent RTT step on the same ICE pair.
+- **Gaps and paths.** A gap longer than 12 s (ICE `disconnected`, a throttled
+  hidden webview, a hung `getStats`) drops the verdict but keeps the floor, so the
+  warning returns within seconds instead of the bloated RTT becoming the new
+  normal. Only a different selected candidate pair (including after an ICE
+  restart) or a replacement peer starts a new floor.
+- **Server floor.** The session's lowest Gwar server ping seeds each new WebRTC
+  floor (the SFU shares the server's host), so a call that starts while already
+  congested can still warn. The seed ages like any healthy sample; a media path
+  much longer than the signalling path (a distant TURN relay) can therefore warn
+  until the flat-level rebase adopts its real floor.
+
+No settings or network history are persisted, and no bitrate/adaptation controls
+change.
 
 Browser voice polls its peer once a second, including when not sharing or muted.
 The publisher uses its existing two-second headroom poll. Fresh selected
@@ -2959,16 +2983,21 @@ voice-only calls and some browsers do not expose a GCC estimate.
 
 Desktop voice is native Rust, with no media RTT exposed over IPC today. Voice-only
 native calls therefore use the existing 10-second Gwar server ping, with a
-25-second evidence expiry. Entry/recovery can take another ping interval. This
-fallback measures the signalling path, not media RTT. TeamSpeak connections do
-not use it. Desktop screen publishing still uses WebRTC measurements.
+25-second evidence expiry. The ping also measures JS-thread stalls, so entry needs
+three consecutive elevated pings (a 35 s window covering at least 15 s); recovery
+can take another ping interval. The detector learns from pings for the whole
+online session, so a call that starts congested still warns, but the warning is
+shown only while voice is connected. This fallback measures the signalling path,
+not media RTT. TeamSpeak connections do not use it. Desktop screen publishing still
+uses WebRTC measurements.
 
 This is a queueing-delay heuristic, not proof of direction or which process is
 uploading: server load, a route change, or downlink congestion can also raise RTT.
-A call that connects while already congested has no known healthy floor and may
-not warn until a lower RTT has been observed. The help text says something on
+A session that connects while already congested has no known healthy floor and
+may not warn until a lower RTT has been observed. The help text says something on
 the device/network **may** be uploading, and suggests pausing sync/backups/another
-call or enabling router SQM/QoS.
+call or enabling router SQM/QoS. Screen readers hear one polite announcement when
+the warning appears; later RTT updates are silent.
 
 For owner UI approval, run `node apps/web/e2e/uplink.mjs`. The isolated Vite fixture
 renders the real sharing bar, voice panel and pill using mocked WebRTC reports,

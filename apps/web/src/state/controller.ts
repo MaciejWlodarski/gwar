@@ -1,4 +1,4 @@
-import { UplinkCongestion } from "../voice/uplink-congestion";
+import { PING_UPLINK, setServerFloor, UplinkCongestion, type UplinkStatus } from "../voice/uplink-congestion";
 import { useUplink } from "./uplink";
 import { claimAll, claimableIdentities, offerClaims } from "./ts-claim";
 import { permissionsOf } from "../lib/permissions";
@@ -222,8 +222,12 @@ class Controller {
   private voiceRun = 0;
   // Native voice has no WebRTC stats IPC. Its existing 10 s server ping is a
   // slower, direction-agnostic fallback; it never borrows the screen baseline.
-  private nativeUplink = new UplinkCongestion(25_000);
+  // It learns for the whole online session, so a call that starts congested
+  // still has a floor, and shows only during a connected call.
+  private nativeUplink = new UplinkCongestion(PING_UPLINK);
+  private nativeUplinkStatus: UplinkStatus | null = null;
   private nativeUplinkExpiry: ReturnType<typeof setTimeout> | null = null;
+  private serverFloor: number | null = null;
 
   private initialised = false;
   private loadingOlder = false;
@@ -247,9 +251,21 @@ class Controller {
 
   private resetNativeUplink(): void {
     this.nativeUplink.reset();
+    this.serverFloor = null;
+    setServerFloor(null);
+    this.setNativeUplink(null);
+  }
+
+  /** Expiry hides stale evidence; the detector itself keeps its floor across the gap. */
+  private setNativeUplink(status: UplinkStatus | null): void {
     if (this.nativeUplinkExpiry) clearTimeout(this.nativeUplinkExpiry);
-    this.nativeUplinkExpiry = null;
-    useUplink.setState({ voice: null });
+    this.nativeUplinkExpiry = status ? setTimeout(() => this.setNativeUplink(null), 25_000) : null;
+    this.nativeUplinkStatus = status;
+    this.showNativeUplink();
+  }
+
+  private showNativeUplink(): void {
+    if (isDesktop()) useUplink.setState({ voice: useVoice.getState().state === "connected" ? this.nativeUplinkStatus : null });
   }
 
   /** Swap in another engine (desktop) before the first connect. */
@@ -271,8 +287,9 @@ class Controller {
     e.on("level", (level) => useVoice.getState().set({ level }));
     e.on("uplink", voice => useUplink.setState({ voice }));
     e.on("state", (state) => {
-      if (state !== "connected") this.resetNativeUplink();
       useVoice.getState().set({ state });
+      if (state !== "connected") useUplink.setState({ voice: null });
+      this.showNativeUplink();
       if (state === "failed") this.scheduleVoiceRetry();
       if (state === "connected") this.voiceRetries = 0;
     });
@@ -606,11 +623,9 @@ class Controller {
     conn.onRtt?.((ms) => {
       if (this.conn !== conn) return;
       session.setRtt(Math.round(ms));
-      if (isDesktop() && useSession.getState().kind === "gwar" && useSession.getState().phase === "online" && useVoice.getState().state === "connected") {
-        useUplink.setState({ voice: this.nativeUplink.observe(performance.now(), { path: "native-server-ping", rttMs: ms }) });
-        if (this.nativeUplinkExpiry) clearTimeout(this.nativeUplinkExpiry);
-        this.nativeUplinkExpiry = setTimeout(() => this.resetNativeUplink(), 25_000);
-      }
+      if (useSession.getState().kind !== "gwar" || useSession.getState().phase !== "online") return;
+      if (ms > 0 && ms < (this.serverFloor ?? Infinity)) setServerFloor(this.serverFloor = ms);
+      if (isDesktop()) this.setNativeUplink(this.nativeUplink.observe(performance.now(), { path: "native-server-ping", rttMs: ms }));
     });
     conn.onWelcome((welcome, resync) => {
       if (this.conn !== conn) return;

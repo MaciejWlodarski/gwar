@@ -26,6 +26,7 @@ import { SharePresetDialog, SharingBar, Stage } from "./ui/Screen";
 import { useScreen } from "./state/screen";
 import { Sidebar } from "./ui/Sidebar";
 import { Toaster } from "./ui/Toaster";
+import { UploadCongestionAnnouncer } from "./ui/UploadWarning";
 
 export function App() {
   const isMobile = useIsMobile();
@@ -76,6 +77,7 @@ export function App() {
       <div className="flex h-dvh w-full flex-col overflow-hidden bg-rail">
         <ConnectionWarning phase={phase} insecure={insecureConnection} />
         {showApp && <SharingBar />}
+        {showApp && <UploadCongestionAnnouncer />}
         <div className="flex min-h-0 w-full flex-1 overflow-hidden">
           {!isMobile && <SectionRail />}
           {/* The other sections and the overview lie over the server view instead of replacing it: the chat
