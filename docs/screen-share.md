@@ -642,6 +642,9 @@ retain their original parameters and browser-default start on GTK/WPE. H.264's
 factory accepts the extra key and its fast start is validated in Linux CI. See
 [the GTK/WPE investigation](screen-startup-validation.md#webkitgtk-and-wpe-start-hint-investigation-october-2026)
 for SDP, runtime versions, source trace, failed alternatives and startup measurements.
+This applies to libwebrtc builds (Playwright WPE, and GTK/WPE releases after the
+GstWebRTC backend was removed in July 2026). Older distro builds on GstWebRTC pass the
+hint through as a caps field that rate control ignores; that path is untested.
 Chromium on Linux, native macOS WKWebView and Windows WebView2 keep the existing
 all-supported-codec hint path. This changes the browser transport's startup; the
 Linux desktop app's screen-sharing deferral is unchanged.
