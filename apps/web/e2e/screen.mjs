@@ -134,6 +134,7 @@ const sourcePage = `<!doctype html><title>${SOURCE_TITLE}</title><style>html,bod
 
 /** What a failure prints per device: each open peer connection's RTP streams and the stage's videos. */
 const diagnostics = page => page.evaluate(async () => ({
+  userAgent: navigator.userAgent, platform: navigator.platform,
   rtp: await Promise.all(window.__pcs.filter(pc => pc.connectionState !== "closed").map(async pc => {
     const stats = await pc.getStats();
     const codecs = {};

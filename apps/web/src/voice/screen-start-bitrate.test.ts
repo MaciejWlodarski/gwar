@@ -76,6 +76,12 @@ describe("remembered uplink", () => {
 });
 
 describe("screen answer start hint", () => {
+  it("recognizes GTK's platform even when its user agent identifies as macOS Safari", () => {
+    const answer = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP9/90000\r\na=fmtp:96 profile-id=0\r\n";
+    const userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/18.4 Safari/605.1.15";
+    expect(withScreenStartBitrate(answer, 4_000_000, userAgent, "Linux x86_64")).toBe(answer);
+    expect(withScreenStartBitrate(answer, 4_000_000, userAgent, "MacIntel")).toContain("x-google-start-bitrate=4000");
+  });
   it.each([
     ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 Version/60.5 Safari/605.1.15", false],
     ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153.0.0.0 Safari/537.36", true],
