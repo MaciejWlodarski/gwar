@@ -1389,6 +1389,11 @@ rate and duration; the calibrated downlink gate measures the shared bottleneck.
   budget and publisher throttle. Recovery does not wait for publisher traffic.
 - Both kinds of drop are recorded per frame. A keyframe that loses any packet
   either way is a **failed keyframe**, which the pause rule counts.
+- **The viewer sees these drops as loss.** The stable mapping keeps gaps, and
+  a new segment jumps 64 ahead, so `packetsLost` in `webrtc-internals` counts
+  the SFU's queue drops as well as the network's, and the viewer NACKs and
+  sends PLIs for them. The 2026-10-28 viewer's 2837 "lost" packets were SFU
+  drops (below).
 - **Pause, unwatch and drops clear the queue at once.** Only packets released
   to str0m in the current loop iteration can still leave.
 - **Measured, not sampled.** The queue's bytes and oldest age come from Gwar's
@@ -1698,12 +1703,13 @@ Results and deviations:
   full reserve within one MTU, and background padding stops at its source while
   it refills. This prevents reserve exhaustion from manufacturing TWCC loss.
 
-  A fully bandwidth-paused viewer restarts ordinary startup probing from the
-  same 2.5 Mbps estimate as a fresh subscriber, as soon as the reserve is ready.
-  If no paused lane fits, it retries after 15 s once the reserve refills. A
-  continuous-fit guard in progress finishes before another reset, and ready
-  priority handoffs/resumes run first. There is no custom recovery probe,
-  estimate-progress tracking or adaptive target backoff. Resets discard
+  A fully bandwidth-paused viewer no longer waits for probing alone: after a
+  backoff (15 s, doubling with each failed retry up to 120 s) it resumes its
+  most important bandwidth-paused share from an optimistic start, once the
+  reserve is ready ("Bandwidth allocation per viewer", "Retry"). A
+  continuous-fit guard in progress finishes first, and ready priority
+  handoffs/resumes run first. There is no custom recovery probe or
+  estimate-progress tracking. Resets discard
   congestion/ACK/loss history, estimate smoothing,
   in-flight TWCC send records, pending padding from both the fallback and every
   media/RTX source, pacer debt and scheduler history. Queued media and repair
@@ -1880,15 +1886,49 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   every extra datagram still passes the actual-byte cap. Decreases apply
   immediately. The earlier 2× reach and its measurements predate the
   per-packet timer fix and do not describe the corrected pacer's burst behavior.
+- **Optimistic start.** A watch transport is created at 2.5 Mbps, where `B`
+  is 2 Mbps and admission 100 KB. Until October 2026 it also started watching
+  there, so a 4–12 Mbps share's first seconds overflowed the queue: every
+  1080p keyframe failed, and the viewer counted the SFU's drops as lost
+  packets (see "The 2026-10-28 stall" below). Now a slot that starts carrying
+  a share while nothing else flows on the transport resets the estimator to
+  the share's **start estimate** first:
+  `max(1.2 × its 2 s average, K_max / 400 ms) / 0.8`, never below 2.5 Mbps and
+  never above what its ingress lets through (1.25 × its cap, and the frame
+  limit within the deadline). The release rate, admission bound, pacing and
+  probe ceiling follow, so its first keyframe and everything after it are
+  forwarded in full. The viewer's own last proven estimate (below) raises it,
+  and the server-wide budget caps it. A share that sent nothing yet has no
+  rate, and its viewer starts at 2.5 Mbps as before: its cap is an admission
+  ceiling, not the encoder's rate. A share added next to one already flowing
+  joins at the measured estimate and grows by probing.
+
+  The start moves only ceilings: the SFU still forwards no more than the share
+  sends, probes stay within the extras reserve, and nothing a client sends
+  raises it. A hostile client gains nothing it could not get by watching.
+
+  Backing off is TWCC's job. On a link slower than the start, delay and loss
+  feedback lower the estimate within a few seconds, and the pause rules below
+  take over. That overshoot is the price of the start: the simulated 5 Mbps
+  viewer with voice met up to the bottleneck's 100 ms queue for at most 3.75 s
+  after joining, and nothing afterwards (`full_voice_headroom_matrix`). Room
+  for the keyframe within half the deadline doubled the overshoot; over 384
+  seeded runs it paused a lossy 5 Mbps viewer's 3 Mbps share 20 times, against
+  never with the deadline, and 4–5 times from a cold start.
+- **Proven estimates.** The last TWCC estimate a transport reported while a
+  slot carried media past its ramp, with none paused for bandwidth, is its
+  proven estimate; a bandwidth pause forgets it. When the transport ends, the
+  server keeps it in memory for the session for 10 minutes (at most 4096
+  sessions, the oldest dropped first), and the session's next watch transport
+  starts from the higher of it and the share's start estimate. Clients report
+  no estimate of their own.
 - **Ramp.** A slot that starts carrying a share is not paused for its first
-  10 s; failed keyframes and averages start counting after that. Added in
-  PR 3b: a watch transport's estimate starts at 2.5 Mbps, where `B` is
-  2 Mbps and admission 100 KB, so every 1080p share's first keyframe fails.
-  Historical loopback runs before the probe-burst fix needed periodic probes
-  to overcome initial undershoot; scheduling jitter could prevent that
-  bootstrap entirely. The corrected pacer discovers capacity without waiting
-  for original media to fit. The ramp still protects normal BWE startup.
-  A viewer too slow for a share sees broken video for up to 10 s before its pause.
+  10 s; failed keyframes and averages start counting after that. Even an
+  optimistic start usually backs off once, on a coarse scheduler cadence's
+  delay or random loss, to about 0.85 × what was acknowledged, just under the
+  share; probing then needs a few seconds. A 3 s ramp paused healthy 20 Mbps
+  viewers at a 15 ms cadence. A viewer too slow for a share sees broken video
+  for up to 10 s before its pause.
 - **Pause** a slot for that viewer (`screen.paused {share, reason:
   "bandwidth"}`), lowest priority first, when either of these holds:
   - the sum of its 2 s average and the higher-priority slots' averages exceeds
@@ -1909,8 +1949,28 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   keyframe it is about to need, so a viewer is not paused again by the very
   keyframe that resumes it. Resuming opens a new segment from a keyframe,
   with `screen.resumed`.
-- The viewer sees "Your connection is too slow for this share" on a paused
-  card, with a Retry button (throttled as above).
+- **Retry.** A viewer whose every slot is paused, one at least for bandwidth,
+  sends only probes, and its estimate can collapse far below the share: TWCC
+  loss feedback can cut it tenfold, and at 0.1–1 Mbps the extras reserve
+  (64 KB at a tenth of the estimate) lets the probing target rise 1.5× only
+  every 5–30 s. Waiting for probing to reach the resume threshold could take
+  minutes; production never got there (below). So 15 s after such a viewer's
+  pause, doubling with each retry that failed up to 120 s, the SFU resumes its
+  most important bandwidth-paused slot from an optimistic start, once the
+  reserve is ready. A link that still cannot carry it backs off and pauses
+  again on the rules above; one that can keeps it. Media flowing 60 s after a
+  retry forgets the failed ones. The continuous-fit resume still applies, and
+  may come first.
+- The viewer sees "Your connection is too slow for this share right now"
+  over the last frame of a paused share, with a Try again button (one ask per
+  5 s, and throttled as above), or that the server is making room for a
+  budget pause; a card shows "Paused", and so does the quality badge instead
+  of the last resolution at 0 fps. Try again on a fully paused viewer is a
+  retry from an optimistic start.
+- **Logs.** Each pause and resume is logged at info level, at most one line
+  per viewer every 10 s (with the count of lines left out): the reason, its
+  trigger (`average`, `keyframes`, `extras`, `priority` or `budget`), the
+  estimate, the share's 2 s average and largest keyframe, and the retries.
 
 This is deliberately crude: no per-frame prediction, one pacer per viewer, and
 two pause triggers that are both measured. It can pause a viewer of a
@@ -1960,6 +2020,41 @@ Phase 2:
   keyframes. Browser support is uneven: Firefox has VP8/H.264/AV1 simulcast but
   no VP9; Safari has VP8/H.264. This needs codec-specific rules, so it comes
   after temporal layers.
+
+#### The 2026-10-28 stall
+
+A viewer joined a healthy 1288p H.264 share (the sharer sent 5–11 Mb/s at
+50–60 fps with no loss; RTT about 35 ms, a 600 Mb/s downlink). From its
+`webrtc-internals` dump:
+
+- For about 12 s, the slot received 2057 packets and "lost" 2837; the
+  transport carried 0.6–4.5 Mb/s. The publisher meanwhile received two SFU
+  PLIs a second, the share's throttle limit, and sent a keyframe each time.
+  Its network was clean, so these losses were the SFU's own queue drops at a
+  2.5 Mbps start: each keyframe overflowed admission, and the next one was
+  requested. The earlier viewer of dump 1 joined while the sharer was still
+  ramping, and its 658 lost packets at join were the same drops, fewer.
+- Then the slot was paused for bandwidth, after its 10 s ramp. For the next
+  60 s the transport received 30–330 kb/s of padding only, on another slot's
+  RTX stream: probes at a collapsed estimate. The resume threshold (about
+  13 Mbps for this share) was never reached, and the 15 s restarts at 2.5 Mbps
+  never got there either.
+- The web client ignored `screen.paused`: the stage kept the last frame with
+  "1232p · 0 fps".
+
+The simulator reproduces both halves. A 10 Mbps share with 300 KB keyframes,
+joined on a 200 Mbps link from 2.5 Mbps, lost 1159 packets at the SFU in its
+first 3 s before the estimate caught up. On a 2 Mbps link, the paused
+viewer's estimate fell to 145 kbps. It now starts optimistically, without a
+single drop
+(`an_optimistic_start_gives_a_fast_viewer_the_whole_share_at_once`); a
+paused viewer recovers by retry
+(`a_slow_viewer_pauses_cleanly_and_recovers_once_its_link_improves`); a slow
+viewer's pauses and keyframe requests leave a fast viewer of the same share
+untouched (`viewers_on_different_links_do_not_affect_each_other`). Why the
+production estimate did not grow during the first 12 s, as it does in the
+simulator, is not known: the server logged allocation at debug level only,
+which the info-level lines above now cover.
 
 ### Cost on the deployment VM
 
@@ -2944,8 +3039,8 @@ badge, stage). Decisions taken while building it, where this design left room:
   settles whoever waits for it, and a reset starts the queues afresh: an
   earlier session's requests settle without sending anything and hold up
   nothing of the next.
-- **`screen.paused` / `screen.resumed`** arrive with PR 3b; the stage does not
-  show "Your connection is too slow" yet.
+- **`screen.paused` / `screen.resumed`** mark the watch paused until it
+  resumes ("Bandwidth allocation per viewer").
 - **The stage** shows the share in focus, then every other watched share and
   every unwatched share of the same channel as cards. Moderators get "Stop
   screen share" on the stage and in the channel tree's menu. On narrow screens

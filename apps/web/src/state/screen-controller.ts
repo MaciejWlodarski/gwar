@@ -460,6 +460,16 @@ export class ScreenController {
     useUi.getState().toast("error", tNow("screen.watchFailed"));
   }
 
+  /**
+   * Asks the server to try a share paused for my bandwidth again: `screen.watch` of a share I
+   * already watch. The server resumes it from a fresh start, through its keyframe throttle.
+   */
+  retry(share: string): void {
+    const watch = useScreen.getState().watches.find(w => w.share === share);
+    if (watch?.status !== "watching" || watch.paused !== "bandwidth") return;
+    void this.link()?.request("screen.watch", { share }).catch(() => {});
+  }
+
   /** Puts a watched share on the stage: it gets the first claim on my bandwidth. */
   focus(share: string): void {
     dispatch({ type: "stage", share });
@@ -586,6 +596,12 @@ export class ScreenController {
       }
       case "screen.started":
         dispatch({ type: "live", share: event.d.share });
+        return;
+      case "screen.paused":
+        dispatch({ type: "paused", share: event.d.share, reason: event.d.reason });
+        return;
+      case "screen.resumed":
+        dispatch({ type: "resumed", share: event.d.share });
         return;
       case "screen.viewers":
         dispatch({ type: "viewers", share: event.d.share, members: event.d.members, guests: event.d.guests });

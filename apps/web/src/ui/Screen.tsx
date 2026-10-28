@@ -2,13 +2,14 @@
  * Screen-sharing interface (docs/screen-share.md, "Interface"): the Share button, the preset
  * menu, the sharing bar, LIVE badges and the stage.
  */
-import { Maximize, MessageSquare, MessageSquareOff, Minimize, MonitorOff, MonitorUp, PictureInPicture2, ScreenShareOff, X } from "lucide-react";
+import { Maximize, MessageSquare, MessageSquareOff, Minimize, MonitorOff, MonitorUp, PictureInPicture2, RotateCw, ScreenShareOff, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { cn } from "../lib/cn";
 import { isDesktop } from "../platform";
 import { canActOn } from "../lib/permissions";
 import type { Client } from "../proto/Client";
+import type { ScreenPauseReason } from "../proto/ScreenPauseReason";
 import type { ScreenShare } from "../proto/ScreenShare";
 import { controller } from "../state/controller";
 import { guestLinkPossible, useCanWatch, useScreenSupport } from "../state/screen-controller";
@@ -306,10 +307,14 @@ useScreen.subscribe(screen => {
   if (slotVideos.size === 0) { slotVideoParking?.remove(); slotVideoParking = null; }
 });
 
-/** A watched share's video, from its slot's stream. */
-export function ShareVideo({ share, className, onDoubleClick, videoRef }: { share: string; className?: string; onDoubleClick?: () => void; videoRef?: (video: HTMLVideoElement | null) => void }) {
+/**
+ * A watched share's video, from its slot's stream, and why the server holds it back while it
+ * does (`compact` on a card: the reason only).
+ */
+export function ShareVideo({ share, className, onDoubleClick, videoRef, compact }: { share: string; className?: string; onDoubleClick?: () => void; videoRef?: (video: HTMLVideoElement | null) => void; compact?: boolean }) {
   const t = useT();
   const run = useScreen(s => s.transport.run);
+  const paused = useScreen(s => s.watches.find(w => w.share === share && w.status === "watching")?.paused);
   const watchId = useScreen(s => s.watches.find(w => w.share === share)?.id);
   const stream = useScreen(s => { const slot = slotOf(s, share); return slot === null ? null : (s.streams[slot] ?? null); });
   const host = useRef<HTMLDivElement | null>(null);
@@ -399,8 +404,39 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef }: { shar
   return (
     <div data-screen-video data-ready={showing} className={cn("relative flex min-h-0 items-center justify-center overflow-hidden bg-black", className)}>
       <div ref={host} className="contents" />
-      {!showing && (
+      {!showing && !paused && (
         <div data-screen-placeholder className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-black text-sm text-white/70">{t("screen.connecting")}</div>
+      )}
+      {paused && <PausedOverlay share={share} reason={paused} compact={compact} />}
+    </div>
+  );
+}
+
+/** Over the last frame, while the server holds a watched share back for my connection or its budget. */
+function PausedOverlay({ share, reason, compact }: { share: string; reason: ScreenPauseReason; compact?: boolean }) {
+  const t = useT();
+  const [asked, setAsked] = useState(false);
+  useEffect(() => {
+    if (!asked) return;
+    // The server answers through its keyframe throttle; one ask per few seconds is plenty.
+    const timer = setTimeout(() => setAsked(false), 5000);
+    return () => clearTimeout(timer);
+  }, [asked]);
+  const text = t(reason === "bandwidth" ? "screen.pausedBandwidth" : "screen.pausedBudget");
+  return (
+    <div data-screen-paused={reason} role="status" className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/75 p-3 text-center text-white">
+      {compact ? (
+        <span className="rounded bg-white/15 px-1.5 text-[11px] leading-5 font-medium" title={text}>{t("screen.pausedShort")}</span>
+      ) : (
+        <>
+          <p className="max-w-sm text-sm text-white/90">{text}</p>
+          {reason === "bandwidth" && (
+            <Button size="sm" variant="secondary" disabled={asked} className="border-white/30 text-white hover:bg-white/10"
+              onClick={e => { e.stopPropagation(); setAsked(true); controller.screen.retry(share); }}>
+              <RotateCw className="size-4" /> {t("screen.retry")}
+            </Button>
+          )}
+        </>
       )}
     </div>
   );
@@ -423,6 +459,8 @@ function useMayStop(share: ScreenShare | undefined, client: Client | undefined):
 }
 
 function QualityBadge({ share }: { share: string }) {
+  const t = useT();
+  const paused = useScreen(s => s.watches.some(w => w.share === share && w.paused));
   const [label, setLabel] = useState("");
   useEffect(() => {
     let live = true;
@@ -433,6 +471,8 @@ function QualityBadge({ share }: { share: string }) {
     const timer = setInterval(poll, 2000);
     return () => { live = false; clearInterval(timer); };
   }, [share]);
+  // A paused slot's last resolution at 0 fps would read as a frozen stream.
+  if (paused) return <span data-testid="screen-quality" className="rounded bg-white/10 px-1.5 text-[11px] leading-5 text-white/80">{t("screen.pausedShort")}</span>;
   if (!label) return null;
   return <span data-testid="screen-quality" className="rounded bg-white/10 px-1.5 text-[11px] leading-5 text-white/80 tabular-nums">{label}</span>;
 }
@@ -546,7 +586,7 @@ function ShareCard({ share, watched }: { share: string; watched: boolean }) {
   const open = () => (watched ? controller.screen.focus(share) : void controller.screen.watch(share));
   const onKey = (e: ReactKeyboardEvent) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
   let body: ReactNode;
-  if (watched) body = <ShareVideo share={share} className="aspect-video w-full" />;
+  if (watched) body = <ShareVideo share={share} className="aspect-video w-full" compact />;
   else body = (
     <div className="flex aspect-video w-full items-center justify-center bg-white/5">
       <span className="rounded-md bg-white/10 px-2 py-1 text-xs font-medium">{t("screen.watch")}</span>

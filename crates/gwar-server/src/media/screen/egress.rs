@@ -9,6 +9,8 @@
 //!   `max(64 KB, 400 ms × B)`; a drop either way clears the slot, which waits for a keyframe;
 //! - everything else str0m sends on the transport, repairs and probes, passes one extras bucket
 //!   at the socket, `0.1 × estimate`;
+//! - a viewer joining a share starts from an estimate that already carries it
+//!   ([`start_estimate`]), and backs off from there on its own TWCC feedback;
 //! - slots are paused, lowest priority first, when their averages or their keyframes do not
 //!   fit, and resumed once they would, keyframe included.
 //!
@@ -30,7 +32,8 @@ use super::{
 
 /// An original packet leaves at most this long after it arrived from the publisher.
 pub const DEADLINE: Duration = Duration::from_millis(400);
-/// The estimate a watch transport starts with, before TWCC feedback and its first probes.
+/// The estimate a watch transport is created with, before it carries anything. Joining a share
+/// raises it at once to [`start_estimate`]; it is also the floor of that start.
 pub const INITIAL_ESTIMATE: u64 = 2_500_000;
 /// Shares of the estimate: originals are released at `PLAN`, repairs and probes get `EXTRAS`,
 /// and voice, on its own transport, keeps the rest.
@@ -57,10 +60,10 @@ pub const ORIGINAL_OVERHEAD: usize = 64;
 pub const AVERAGE_WINDOW: Duration = Duration::from_secs(2);
 /// A slot whose average with the higher-priority ones exceeds `B` this long is paused.
 const OVER_FOR: Duration = Duration::from_secs(5);
-/// A slot that starts carrying a share is not paused for this long: the estimate needs it to
-/// grow from its last value (2.5 Mbps on a fresh transport) toward the share's rate and the
-/// keyframe room the SFU probes for. str0m probes an application-limited sender every 5 s, so
-/// this covers two rounds.
+/// A slot that starts carrying a share is not paused for this long. Even an optimistic start
+/// usually backs off once, on a coarse scheduler cadence's delay or on random loss, to about
+/// 0.85 × what was acknowledged, just under the share; the estimate then needs to grow again by
+/// probing. str0m probes an application-limited sender every 5 s, so this covers two rounds.
 pub const RAMP: Duration = Duration::from_secs(10);
 /// Two failed keyframes within ten seconds pause a slot.
 const FAILURES: usize = 2;
@@ -238,6 +241,31 @@ impl Lane {
     }
 }
 
+/// The estimate a viewer joining a share starts from: room at `PLAN` for its 2 s average with
+/// resume headroom, and for its largest recent keyframe within the deadline (the bound
+/// `keyframe_fits` uses). Never above what the share's ingress lets through, never below
+/// `INITIAL_ESTIMATE`.
+///
+/// A share that sent nothing yet has no rate to start from: its cap is an admission ceiling,
+/// not the encoder's rate, and starting there overshoots a slow link for nothing. Simulated
+/// on a lossy 5 Mbps link with voice, a 3 Mbps share then paused about twice as often as from a
+/// cold start (over 384 seeded runs), against never for a measured one. Room for a keyframe
+/// within half the deadline overshot the same way: 20 pauses in 384.
+///
+/// It only moves the pacing ceiling and the admission bound: the SFU still forwards no more
+/// than the share sends, and probes stay within the extras reserve.
+pub fn start_estimate(rate: ShareRate, cap: u64) -> u64 {
+    if rate.average <= 0.0 {
+        return INITIAL_ESTIMATE;
+    }
+    let room = |average: f64, keyframe: usize| average.max(keyframe as f64 * 8.0 / DEADLINE.as_secs_f64()) / PLAN;
+    let frame = ingress::FRAME_BYTES + ingress::FRAME_PACKETS * ORIGINAL_OVERHEAD;
+    let start = room(RESUME_HEADROOM * rate.average, rate.largest_keyframe);
+    // As much as the share's ingress lets through: its byte bucket and its frame limit.
+    let ceiling = room(RESUME_HEADROOM * ingress::BYTE_HEADROOM * cap as f64, frame);
+    start.min(ceiling).max(INITIAL_ESTIMATE as f64) as u64
+}
+
 /// What the allocator decided for a slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Change {
@@ -290,6 +318,8 @@ pub struct Egress {
     /// Whole seconds since `start` in which the extras bucket dropped something.
     dropped_seconds: VecDeque<u64>,
     start: Instant,
+    /// What caused the last pause the allocator decided, for the log.
+    pub trigger: &'static str,
     /// The socket cap applies (always, but for the paired runs in the tests).
     pub cap: bool,
     pub counters: EgressCounters,
@@ -316,6 +346,7 @@ impl Egress {
             queued: 0,
             dropped_seconds: VecDeque::new(),
             start: now,
+            trigger: "",
             cap: true,
             counters: EgressCounters::default(),
         }
@@ -416,6 +447,25 @@ impl Egress {
         assigned().next().is_some()
             && assigned().all(|l| l.paused.is_some())
             && assigned().any(|l| l.paused == Some(ScreenPauseReason::Bandwidth))
+    }
+
+    /// Some slot carries media, past its ramp, and none is paused for bandwidth: the estimate
+    /// is one this viewer's link has shown it carries.
+    pub fn proven(&self, now: Instant) -> bool {
+        self.lanes.iter().any(|l| l.active() && !l.ramping(now))
+            && self.lanes.iter().all(|l| l.paused != Some(ScreenPauseReason::Bandwidth))
+    }
+
+    /// Any slot other than `lane` carries media.
+    pub fn others_active(&self, lane: usize) -> bool {
+        self.lanes.iter().enumerate().any(|(i, l)| i != lane && l.active())
+    }
+
+    /// The most important slot paused for bandwidth.
+    pub fn first_bandwidth_paused(&self) -> Option<usize> {
+        (0..self.lanes.len())
+            .filter(|&l| self.lanes[l].assigned && self.lanes[l].paused == Some(ScreenPauseReason::Bandwidth))
+            .min_by_key(|&l| self.rank(l))
     }
 
     /// A bandwidth-paused lane is accumulating the continuous-fit guard.
@@ -733,6 +783,7 @@ impl Egress {
             self.dropped_seconds.clear();
             self.counters.escalations += 1;
             tracing::debug!(lane = lowest, trigger = "extras", estimate = self.estimate(), "screen bandwidth pause");
+            self.trigger = "extras";
             self.pause(lowest, ScreenPauseReason::Bandwidth);
             return Some((lowest, Change::Pause(ScreenPauseReason::Bandwidth)));
         }
@@ -747,6 +798,7 @@ impl Egress {
                 failures = self.lanes[lane].failures.len(),
                 "screen bandwidth pause"
             );
+            self.trigger = "keyframes";
             self.pause(lane, ScreenPauseReason::Bandwidth);
             return Some((lane, Change::Pause(ScreenPauseReason::Bandwidth)));
         }
@@ -774,6 +826,7 @@ impl Egress {
                 average = average(lane),
                 "screen bandwidth pause"
             );
+            self.trigger = "average";
             self.pause(lane, ScreenPauseReason::Bandwidth);
             return Some((lane, Change::Pause(ScreenPauseReason::Bandwidth)));
         }
@@ -822,6 +875,7 @@ impl Egress {
         // the displaced slot only when the return is ready; resume on the next tick.
         if let Some(lane) = displaced.filter(|_| resume.is_some()) {
             tracing::debug!(lane, trigger = "priority", "screen bandwidth pause");
+            self.trigger = "priority";
             self.pause(lane, ScreenPauseReason::Bandwidth);
             return Some((lane, Change::Pause(ScreenPauseReason::Bandwidth)));
         }
@@ -902,6 +956,29 @@ mod tests {
         }
         e.set_estimate(estimate, now);
         e
+    }
+
+    #[test]
+    fn a_start_covers_the_measured_share_and_its_keyframe_within_what_ingress_passes() {
+        let rate =
+            |average: f64, keyframe: usize| ShareRate { average, last_keyframe: keyframe, largest_keyframe: keyframe };
+        // Nothing measured yet: the cap is no measure of the encoder's rate.
+        assert_eq!(start_estimate(ShareRate::default(), 12_000_000), INITIAL_ESTIMATE);
+        // The 2026-10-28 share: about 9 Mbps with 250 KB keyframes.
+        let start = start_estimate(rate(9_000_000.0, 250_000), 12_000_000);
+        assert_eq!(start, (1.2 * 9_000_000.0 / PLAN) as u64);
+        let mut e = Egress::new(Instant::now());
+        e.set_estimate(start, Instant::now());
+        assert!(e.admission_bound() >= 2 * 250_000, "room for the keyframe and what follows it");
+        // A text share with a large keyframe: the keyframe within the deadline decides.
+        assert_eq!(start_estimate(rate(500_000.0, 200_000), 8_000_000), (200_000.0 * 8.0 / 0.4 / PLAN) as u64);
+        // A small share: never below the transport's initial estimate.
+        assert_eq!(start_estimate(rate(100_000.0, 10_000), 8_000_000), INITIAL_ESTIMATE);
+        // Never above what the share's ingress lets through, whatever the meter says.
+        let ceiling = (1.2 * 1.25 * 4_000_000.0_f64)
+            .max((ingress::FRAME_BYTES + ingress::FRAME_PACKETS * 64) as f64 * 20.0)
+            / PLAN;
+        assert_eq!(start_estimate(rate(50_000_000.0, 2_000_000), 4_000_000), ceiling as u64);
     }
 
     #[test]

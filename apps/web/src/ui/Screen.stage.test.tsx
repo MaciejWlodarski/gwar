@@ -201,3 +201,28 @@ it.each(["silent", "receive time", "presentation time", "counter reset"] as cons
   expect(video("A")).toBe(active);
   expect(video("A").closest<HTMLElement>("[data-screen-video]")?.dataset.ready).toBe("true");
 });
+
+it("shows why the server holds a share back instead of its last resolution at 0 fps, and retries", async () => {
+  // B, watched last, is on the stage; A is a card.
+  expect(useScreen.getState().stage).toBe("B");
+  await act(async () => { screen.handleEvent({ ev: "screen.paused", d: { share: "B", reason: "bandwidth" } }); });
+  const stage = container.querySelector<HTMLElement>('[data-screen-paused="bandwidth"]')!;
+  expect(stage.textContent).toContain("Your connection is too slow for this share right now");
+  expect(container.querySelector('[data-testid="screen-quality"]')?.textContent).toBe("Paused");
+  request.mockClear();
+  const retry = [...stage.querySelectorAll("button")].find(b => b.textContent?.includes("Try again"))!;
+  await act(async () => retry.click());
+  expect(request).toHaveBeenCalledWith("screen.watch", { share: "B" });
+  expect(retry.disabled).toBe(true);
+  await advance(5000);
+  expect(retry.disabled).toBe(false);
+  // A card says it briefly; a budget pause offers no retry.
+  await act(async () => { screen.handleEvent({ ev: "screen.paused", d: { share: "A", reason: "budget" } }); });
+  const card = container.querySelector<HTMLElement>('[data-screen-paused="budget"]')!;
+  expect(card.textContent).toBe("Paused");
+  await act(async () => {
+    screen.handleEvent({ ev: "screen.resumed", d: { share: "B" } });
+    screen.handleEvent({ ev: "screen.resumed", d: { share: "A" } });
+  });
+  expect(container.querySelector("[data-screen-paused]")).toBeNull();
+});

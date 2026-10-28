@@ -177,8 +177,15 @@ pub struct Sim {
     /// Queue residence seen by independent 100 kbps voice on the same bottleneck.
     voice: bool,
     voice_queue: Vec<Duration>,
+    /// Worst queue voice met within `JOIN` of the start, and from then to 15 s.
+    voice_join_queue_max: Duration,
     voice_startup_queue_max: Duration,
 }
+
+/// An optimistic start may overshoot a link slower than the share's start estimate until the
+/// estimator backs off on its delay and loss feedback: this long after joining. On the 5 Mbps
+/// voice-headroom link with voice flowing, that took up to 3.75 s.
+pub const JOIN: Duration = Duration::from_secs(5);
 
 impl Sim {
     /// A connected viewer behind a downlink of `rate` (none: unconstrained).
@@ -236,6 +243,7 @@ impl Sim {
             arrivals: HashMap::new(),
             voice: false,
             voice_queue: Vec::new(),
+            voice_join_queue_max: Duration::ZERO,
             voice_startup_queue_max: Duration::ZERO,
         };
         for _ in 0..2000 {
@@ -281,6 +289,51 @@ impl Sim {
             last_key: None,
             wants_key: true,
             meter: ShareMeter::default(),
+            keyframes: Vec::new(),
+            refused: 0,
+        });
+        slot
+    }
+
+    /// Joins a share that has been running for a while: its 2 s average and keyframe size are
+    /// already measured, as the screen task's allocation tick has them, and it answers the
+    /// join's keyframe request with its next frame.
+    pub fn join(&mut self, name: &str, bitrate: u64, fps: u32, keyframe: usize, cap: u64) -> usize {
+        let frame = Duration::from_secs(1) / fps;
+        let mut meter = ShareMeter::default();
+        let (mut source, mut timestamp) = (1000, 0u32);
+        let mut at = self.now - egress::AVERAGE_WINDOW;
+        let mut key = true;
+        while at < self.now {
+            let size = if key { keyframe } else { (bitrate / 8 / fps as u64) as usize };
+            for n in 0..size.div_ceil(PACKET).max(1) {
+                let len = if (n + 1) * PACKET >= size { size - n * PACKET } else { PACKET }.max(16);
+                meter.record(source, timestamp, len, key && n == 0, at);
+                source += 1;
+            }
+            timestamp = timestamp.wrapping_add(90_000 / fps);
+            at += frame;
+            key = false;
+        }
+        let slot = self.shares.len();
+        let origin = ScreenOrigin::new(1 + slot as SessionId, name.into(), 1, false, false, cap);
+        origin.measured(meter.rate(self.now));
+        let grant = WatchGrant::new(origin.clone());
+        assign(&mut self.w, slot, grant, slot as u64 + 1, self.now);
+        self.shares.push(Share {
+            origin,
+            slot,
+            bitrate,
+            fps,
+            keyframe,
+            every: None,
+            on: true,
+            source,
+            timestamp,
+            next: self.now,
+            last_key: None,
+            wants_key: true,
+            meter,
             keyframes: Vec::new(),
             refused: 0,
         });
@@ -410,8 +463,15 @@ impl Sim {
             }
             if self.allocation && now >= self.next_allocation {
                 self.next_allocation = now + ALLOCATION_TICK;
-                let rates: HashMap<String, ShareRate> =
-                    self.shares.iter_mut().map(|s| (s.origin.share.clone(), s.meter.rate(now))).collect();
+                let rates: HashMap<String, ShareRate> = self
+                    .shares
+                    .iter_mut()
+                    .map(|s| {
+                        let rate = s.meter.rate(now);
+                        s.origin.measured(rate);
+                        (s.origin.share.clone(), rate)
+                    })
+                    .collect();
                 if let Some((slot, change)) = allocate(&mut self.w, now, &rates, true) {
                     self.changes.push((now, slot, change));
                     if change == Change::Resume
@@ -426,6 +486,8 @@ impl Sim {
             let queued = self.down.busy.saturating_duration_since(now);
             if self.elapsed() >= Duration::from_secs(15) {
                 self.voice_queue.push(queued);
+            } else if self.elapsed() < JOIN {
+                self.voice_join_queue_max = self.voice_join_queue_max.max(queued);
             } else {
                 self.voice_startup_queue_max = self.voice_startup_queue_max.max(queued);
             }
@@ -679,22 +741,36 @@ mod tests {
     }
 
     #[test]
-    fn keyframes_overflowing_admission_pause_a_3_mbps_viewer_for_good() {
+    fn keyframes_overflowing_admission_pause_a_3_mbps_viewer_and_its_retries_back_off() {
         let mut sim = Sim::new(Some(3_000_000));
         let t = text(&mut sim);
         // Failures count once the slot's ramp is over.
         sim.run(RAMP);
         keyframes(&mut sim, t);
-        sim.run(20 * SECOND);
+        sim.run(140 * SECOND);
         let context = summary(&sim);
         let c = sim.w.egress.counters;
         assert!(c.rejected > 0 && c.failed_keyframes >= 2, "{context}");
         let paused = pauses(&sim, 0);
-        assert_eq!(paused.len(), 1, "{context}");
         let second = sim.shares[0].keyframes.iter().filter(|k| k.1 == KEYFRAME).nth(1).unwrap().0 - sim.start;
         assert!(paused[0] <= second + ALLOCATION_TICK, "paused within two keyframes: {context}");
         assert_eq!(sim.paused(0), Some(ScreenPauseReason::Bandwidth));
-        assert_eq!(resumes(&sim, 0), 0, "no resume while the estimate stays low: {context}");
+        // While the link stays at 3 Mbps, each optimistic retry fails within its ramp and the
+        // next one waits twice as long: 15 s, 30 s, 60 s.
+        let resumed: Vec<Duration> = sim
+            .changes
+            .iter()
+            .filter(|(_, s, c)| *s == 0 && *c == Change::Resume)
+            .map(|(at, _, _)| *at - sim.start)
+            .collect();
+        assert_eq!(resumed.len(), 3, "{context}");
+        assert_eq!(paused.len(), 4, "{context}");
+        for (n, at) in resumed.iter().enumerate() {
+            let gap = *at - paused[n];
+            let backoff = RETRY_FIRST * (1 << n);
+            assert!(gap >= backoff && gap <= backoff + SECOND, "retry {n} after {gap:?}: {context}");
+            assert!(paused[n + 1] - *at <= RAMP + 2 * SECOND, "retry {n} pauses again: {context}");
+        }
     }
 
     #[test]
@@ -782,8 +858,10 @@ mod tests {
                         sim.down.loss = loss;
                         sim.up.loss = loss;
                         sim.voice = true;
-                        sim.watch("a", 3_000_000, 30, 150_000, None);
-                        sim.watch("b", 3_000_000, 30, 150_000, None);
+                        // Both shares already run: the first starts optimistically from its
+                        // measured rate, above this link; the second joins next to it.
+                        sim.join("a", 3_000_000, 30, 150_000, 8_000_000);
+                        sim.join("b", 3_000_000, 30, 150_000, 8_000_000);
                         sim.run(60 * SECOND);
                         let context =
                             format!("interval={interval:?} delay={delay:?} loss={loss} seed={seed}: {}", summary(&sim));
@@ -806,14 +884,18 @@ mod tests {
                         // The calibrated VM gate remains unchanged and authoritative.
                         let steady_limit = (10 * MS).max(interval + 2 * MS);
                         let startup_limit = (10 * MS).max(2 * interval + 2 * MS);
+                        // Until the estimator backs off from the optimistic start, voice can
+                        // meet the bottleneck's own queue, but only within `JOIN`.
+                        let join_limit = sim.down.queue + 2 * MS;
                         if !pauses(&sim, 0).is_empty()
                             || mbps < 2.7
                             || p99 > steady_limit
+                            || sim.voice_join_queue_max > join_limit
                             || sim.voice_startup_queue_max > startup_limit
                         {
                             failures.push(format!(
-                                "startup={:?} p99={p99:?} mbps={mbps} {context}",
-                                sim.voice_startup_queue_max
+                                "join={:?} startup={:?} p99={p99:?} mbps={mbps} {context}",
+                                sim.voice_join_queue_max, sim.voice_startup_queue_max
                             ));
                         }
                     }
@@ -948,8 +1030,9 @@ mod tests {
         assert!(sim.changes.is_empty(), "healthy bootstrap: {}", summary(&sim));
         assert!(sim.w.egress.counters.original_bytes > 0, "{}", summary(&sim));
         sim.down.rate = Some(1_000_000);
+        let outage = sim.now;
         sim.run(collapse);
-        assert_eq!(sim.paused(0), Some(ScreenPauseReason::Bandwidth), "{}", summary(&sim));
+        assert!(paused_since(&sim, outage), "{}", summary(&sim));
         sim.down.rate = Some(20_000_000);
         sim.run(restore_scheduling - restore_link);
         if restore_cadence {
@@ -992,8 +1075,9 @@ mod tests {
             assert!(sim.w.egress.counters.original_bytes > 0, "{schedule}: {}", summary(&sim));
             for outage in 0..outages {
                 sim.down.rate = Some(1_000_000);
+                let start = sim.now;
                 run(&mut sim, 30 * SECOND);
-                assert_eq!(sim.paused(0), Some(ScreenPauseReason::Bandwidth), "{schedule}: {}", summary(&sim));
+                assert!(paused_since(&sim, start), "{schedule}: {}", summary(&sim));
                 sim.down.rate = Some(20_000_000);
                 let restore = sim.now;
                 run(&mut sim, 360 * SECOND);
@@ -1021,8 +1105,9 @@ mod tests {
             assert!(sim.w.egress.counters.original_bytes > 0, "{}", summary(&sim));
             for (outage, duration) in outages.into_iter().enumerate() {
                 sim.down.rate = Some(1_000_000);
+                let start = sim.now;
                 sim.run(duration);
-                assert_eq!(sim.paused(0), Some(ScreenPauseReason::Bandwidth), "{}", summary(&sim));
+                assert!(paused_since(&sim, start), "{}", summary(&sim));
                 sim.down.rate = Some(20_000_000);
                 let restore = sim.now;
                 sim.run(180 * SECOND);
@@ -1031,19 +1116,25 @@ mod tests {
         }
     }
 
+    /// Slot 0 was paused at `from` or later.
+    fn paused_since(sim: &Sim, from: Instant) -> bool {
+        sim.changes.iter().any(|(at, slot, change)| *slot == 0 && *at >= from && matches!(change, Change::Pause(_)))
+    }
+
     fn assert_game_recovery(sim: &mut Sim, restore: Instant, scenario: &str) {
         let context = format!("{scenario}: {}", summary(sim));
+        // The resume that lasted: a retry late in the outage may already have made it, or may
+        // still fail on its ramp once (its keyframes met the outage), but no more than that.
         let resumed = sim
             .changes
             .iter()
-            .find_map(|(at, slot, change)| (*slot == 0 && *at >= restore && *change == Change::Resume).then_some(*at))
+            .rev()
+            .find_map(|(at, slot, change)| (*slot == 0 && *change == Change::Resume).then_some(*at))
             .unwrap_or_else(|| panic!("the healthy link must resume: {context}"));
-        assert!(resumed - restore <= 180 * SECOND, "resume within 180 s: {context}");
+        assert!(resumed.saturating_duration_since(restore) <= 180 * SECOND, "resume within 180 s: {context}");
         assert_eq!(sim.paused(0), None, "{context}");
-        assert!(
-            sim.changes.iter().all(|(at, _, change)| { *at <= resumed || !matches!(change, Change::Pause(_)) }),
-            "video stays resumed: {context}"
-        );
+        let repaused = sim.changes.iter().filter(|(at, _, c)| *at >= restore && matches!(c, Change::Pause(_))).count();
+        assert!(repaused <= 1, "video stays resumed: {context}");
         let ssrc = sim.ssrcs(0).0;
         let mut rates = Vec::new();
         for ago in [20, 10, 0] {
@@ -1061,7 +1152,7 @@ mod tests {
         }
         println!(
             "{scenario} resume_after={:?} received_bps={rates:?} extras_dropped={} estimate={}",
-            resumed - restore,
+            resumed.saturating_duration_since(restore),
             sim.w.egress.counters.extras_dropped,
             sim.w.egress.estimate()
         );
@@ -1368,5 +1459,136 @@ mod tests {
             Some((1, Change::Pause(ScreenPauseReason::Bandwidth))),
             "{context}"
         );
+    }
+
+    /// The viewer got at least 90 % of the share's bytes in every second from `from` for
+    /// `seconds`, with no drop at the SFU or on the way and no gap in its sequence numbers.
+    fn assert_whole_share(sim: &mut Sim, from: Instant, seconds: u32, bitrate: u64, context: &str) {
+        let c = sim.w.egress.counters;
+        assert_eq!((c.evicted, c.rejected, c.failed_keyframes, c.originals_dropped), (0, 0, 0, 0), "{context}");
+        assert_eq!(sim.down.dropped, 0, "{context}");
+        let ssrc = sim.ssrcs(0).0;
+        for second in 0..seconds {
+            let start = from + second * SECOND;
+            let bytes: usize = sim
+                .received
+                .iter()
+                .filter(|(at, source, _, _)| *at >= start && *at < start + SECOND && *source == ssrc)
+                .map(|(_, _, _, payload)| payload.len())
+                .sum();
+            let bps = bytes as f64 * 8.0;
+            assert!(bps >= 0.9 * bitrate as f64, "second {second}: {bps} bps: {context}");
+        }
+        let mut seqs: Vec<u64> = sim.received.iter().filter(|r| r.1 == ssrc).map(|r| r.2).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.last().unwrap() - seqs[0] + 1, seqs.len() as u64, "no gap at the viewer: {context}");
+    }
+
+    #[test]
+    fn an_optimistic_start_gives_a_fast_viewer_the_whole_share_at_once() {
+        // The 2026-10-28 incident: a 4-12 Mbps share with large screen keyframes, a fast
+        // viewer 35 ms away. Starting at 2.5 Mbps, its first 12 s lost most packets at the SFU.
+        for (bitrate, keyframe, cadence) in
+            [(4_000_000, 150_000, 1), (8_000_000, 250_000, 5), (12_000_000, 350_000, 10), (12_000_000, 350_000, 1)]
+        {
+            let mut sim = Sim::new(Some(200_000_000));
+            sim.server_interval = cadence * MS;
+            sim.down.delay = 17 * MS;
+            sim.up.delay = 17 * MS;
+            sim.join("game", bitrate, 60, keyframe, 12_000_000);
+            let joined = sim.now;
+            sim.run(30 * SECOND);
+            let context = format!("bitrate={bitrate} keyframe={keyframe} cadence={cadence}: {}", summary(&sim));
+            assert!(sim.changes.is_empty(), "{context}");
+            assert_whole_share(&mut sim, joined, 30, bitrate, &context);
+        }
+    }
+
+    #[test]
+    fn a_slow_viewer_pauses_cleanly_and_recovers_once_its_link_improves() {
+        let mut sim = Sim::new(Some(2_000_000));
+        sim.join("game", 8_000_000, 60, 200_000, 12_000_000);
+        sim.run(40 * SECOND);
+        let context = summary(&sim);
+        let paused = pauses(&sim, 0);
+        assert!(!paused.is_empty() && paused[0] <= RAMP + SECOND, "paused after its ramp: {context}");
+        // Cleanly: nothing of the slot is sent between a pause and the next resume.
+        for at in &paused {
+            let from = sim.start + *at + ALLOCATION_TICK;
+            let to = sim
+                .changes
+                .iter()
+                .find_map(|(t, s, c)| (*s == 0 && *t > from && *c == Change::Resume).then_some(*t))
+                .unwrap_or(sim.now);
+            let media = sim.sent.iter().filter(|s| s.at >= from && s.at < to).filter(|s| match s.kind {
+                Kind::Original { slot, .. } | Kind::Repair { slot, blank: false } => slot == 0,
+                _ => false,
+            });
+            assert_eq!(media.count(), 0, "nothing of a paused slot: {context}");
+        }
+        // Paused, with nothing else flowing, the estimate fell far below the share: probing
+        // alone used to leave such a viewer paused for good.
+        sim.down.rate = Some(50_000_000);
+        let improved = sim.now;
+        sim.run(150 * SECOND);
+        assert_game_recovery(&mut sim, improved, "2 Mbps, then 50 Mbps");
+    }
+
+    /// Two viewers of the same share on their own links, behind one publisher: `b`'s share
+    /// mirrors `a`'s frame for frame, and either viewer's keyframe request gives both the
+    /// keyframe, as the per-share throttle does.
+    struct Duo {
+        a: Sim,
+        b: Sim,
+    }
+
+    impl Duo {
+        fn new(a: Option<u64>, b: Option<u64>) -> Self {
+            let mut a = Sim::with_seed(a, 1);
+            let mut b = Sim::with_seed(b, 2);
+            while a.now < b.now {
+                a.tick();
+            }
+            while b.now < a.now {
+                b.tick();
+            }
+            (a.start, b.start) = (a.now, b.now);
+            Self { a, b }
+        }
+
+        fn join(&mut self, bitrate: u64, keyframe: usize) {
+            self.a.join("game", bitrate, 60, keyframe, 12_000_000);
+            self.b.join("game", bitrate, 60, keyframe, 12_000_000);
+        }
+
+        fn run(&mut self, time: Duration) {
+            let end = self.a.now + time;
+            while self.a.now < end {
+                let wants = self.a.shares[0].wants_key || self.b.shares[0].wants_key;
+                self.a.shares[0].wants_key = wants;
+                self.b.shares[0].wants_key = wants;
+                self.a.tick();
+                self.b.tick();
+            }
+        }
+    }
+
+    #[test]
+    fn viewers_on_different_links_do_not_affect_each_other() {
+        let mut duo = Duo::new(Some(200_000_000), Some(2_000_000));
+        duo.join(8_000_000, 200_000);
+        let joined = duo.a.now;
+        duo.run(90 * SECOND);
+        let (fast, slow) = (&mut duo.a, &duo.b);
+        assert_eq!(fast.shares[0].keyframes.len(), slow.shares[0].keyframes.len(), "one publisher");
+        let context = format!("fast: {} slow: {}", summary(fast), summary(slow));
+        assert!(!pauses(slow, 0).is_empty(), "{context}");
+        assert!(
+            fast.shares[0].keyframes.len() > 1,
+            "the slow viewer's requests reached the publisher, and the fast one carried them: {context}"
+        );
+        assert!(fast.changes.is_empty(), "{context}");
+        assert_whole_share(fast, joined, 90, 8_000_000, &context);
     }
 }

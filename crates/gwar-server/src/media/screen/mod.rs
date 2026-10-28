@@ -101,9 +101,19 @@ const TRANSPORT_BYTE_HEADROOM: f64 = 1.5;
 const ADDRESSES_PER_TRANSPORT: usize = 4;
 /// Allocation (pauses, resumes, probing targets) and the budget check run this often.
 const ALLOCATION_TICK: Duration = Duration::from_millis(100);
-/// A fully paused viewer with no lane fitting retries standard startup probing from
-/// a clean estimator. The existing continuous-fit guard takes precedence over retries.
-const RESTART_EVERY: Duration = Duration::from_secs(15);
+/// A viewer whose every slot is paused, at least one for bandwidth, retries its most important
+/// one from an optimistic start this long after the pause, doubling with each retry that
+/// failed, up to `RETRY_MAX`. The continuous-fit resume may come first.
+const RETRY_FIRST: Duration = Duration::from_secs(15);
+const RETRY_MAX: Duration = Duration::from_secs(120);
+/// Media flowing this long after a retry clears the viewer's failed retries.
+const RETRY_RESET: Duration = Duration::from_secs(60);
+/// A session's last proven estimate outlives its watch transport this long, at most
+/// `REMEMBERED` sessions.
+const REMEMBER_FOR: Duration = Duration::from_secs(600);
+const REMEMBERED: usize = 4096;
+/// Pause and resume lines at info level: one per viewer this often, the rest counted.
+const LOG_EVERY: Duration = Duration::from_secs(10);
 /// Measured egress over the server-wide budget this many seconds in a row pauses watches.
 const OVER_BUDGET_SECONDS: u32 = 5;
 /// Watches paused for the budget may resume once egress stayed under this share of it …
@@ -124,6 +134,9 @@ pub struct ScreenOrigin {
     pub cap_bps: u64,
     alive: AtomicBool,
     recovery: std::sync::Mutex<recovery::Recovery>,
+    /// What a viewer joining it starts from, refreshed from its measured rate every allocation
+    /// tick (`egress::start_estimate`); zero until the first tick.
+    start_bps: AtomicU64,
 }
 
 impl ScreenOrigin {
@@ -144,7 +157,17 @@ impl ScreenOrigin {
             cap_bps,
             alive: AtomicBool::new(true),
             recovery: Default::default(),
+            start_bps: AtomicU64::new(0),
         })
+    }
+
+    /// The estimate a viewer joining it starts from.
+    pub fn start_estimate(&self) -> u64 {
+        self.start_bps.load(Ordering::Relaxed).max(INITIAL_ESTIMATE)
+    }
+
+    fn measured(&self, rate: ShareRate) {
+        self.start_bps.store(egress::start_estimate(rate, self.cap_bps), Ordering::Relaxed);
     }
     pub fn alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
@@ -648,6 +671,20 @@ struct Watcher {
     desired: Option<u64>,
     /// Last estimator restart; also bounds post-resume probe spacing.
     restarted: Option<Instant>,
+    /// The last estimate this transport's link carried media at, and the one the session's
+    /// previous transport left; an optimistic start takes the higher with the share's need.
+    proven: Option<u64>,
+    remembered: Option<u64>,
+    /// The server-wide budget: no optimistic start goes above it.
+    ceiling: u64,
+    /// The next optimistic retry of a fully paused viewer, the retries that failed since media
+    /// last kept flowing, and the last one.
+    retry_at: Option<Instant>,
+    retries: u32,
+    retried: Option<Instant>,
+    /// The last info-level pause or resume line, and the lines left out since.
+    logged: Option<Instant>,
+    unlogged: u32,
     deadline: Instant,
 }
 
@@ -772,6 +809,8 @@ struct Sfu {
     decode_reports: HashMap<(SessionId, String), Instant>,
     /// The allocation tick's rates, also used by cold-viewer keyframe admission.
     rates: HashMap<String, ShareRate>,
+    /// Each session's last proven watch estimate, from its previous transport, and when.
+    remembered: HashMap<SessionId, (u64, Instant)>,
     publishers: HashMap<String, Publisher>,
     watchers: HashMap<SessionId, Watcher>,
     next_id: u64,
@@ -807,6 +846,7 @@ pub async fn run(
         budgets: HashMap::new(),
         decode_reports: HashMap::new(),
         rates: HashMap::new(),
+        remembered: HashMap::new(),
         publishers: HashMap::new(),
         watchers: HashMap::new(),
         next_id: 1,
@@ -929,11 +969,17 @@ impl Sfu {
                     let _ = reply.send(Err("stale watch run"));
                     return;
                 }
-                self.end_watch(session);
+                self.end_watch(session, now);
                 let id = self.id();
                 let caps = Caps { browser, h264: &h264, av1 };
                 match watcher(id, session, run, lease, slots, &sdp, caps, self.advertise, now) {
                     Ok((mut watcher, answer)) => {
+                        watcher.remembered = self
+                            .remembered
+                            .get(&session)
+                            .filter(|(_, at)| now.saturating_duration_since(*at) < REMEMBER_FOR)
+                            .map(|(estimate, _)| *estimate);
+                        watcher.ceiling = self.shared.budget_bps.load(Ordering::Relaxed);
                         let (socket, measured, shared) = (&self.socket, &mut self.measured, &self.shared);
                         let guest = watcher.size == GUEST_SLOTS;
                         let mut send = |c: &[u8], to| transmit(socket, measured, shared, guest, c, to);
@@ -950,7 +996,7 @@ impl Sfu {
                     }
                 }
             }
-            ScreenCmd::EndWatch { session } => self.end_watch(session),
+            ScreenCmd::EndWatch { session } => self.end_watch(session, now),
             ScreenCmd::Assign { session, run, slot, grant } => {
                 let Some(w) = self.watchers.get_mut(&session).filter(|w| w.run == run) else { return };
                 w.pending.retain(|(s, _, _)| *s != slot);
@@ -986,7 +1032,12 @@ impl Sfu {
                     return;
                 };
                 if w.egress.paused(slot) == Some(ScreenPauseReason::Bandwidth) {
-                    apply(w, slot, Change::Resume);
+                    if w.egress.stalled() {
+                        // Nothing else feeds this viewer's estimate: start over optimistically.
+                        retry(w, slot, &self.rates, now);
+                    } else {
+                        apply(w, slot, Change::Resume);
+                    }
                     self.tell(session, slot, Change::Resume, now);
                 }
             }
@@ -1354,7 +1405,7 @@ impl Sfu {
         let ended: Vec<_> =
             self.watchers.iter().filter(|(_, w)| !w.lease.alive()).map(|(session, _)| *session).collect();
         for session in ended {
-            self.end_watch(session);
+            self.end_watch(session, now);
         }
         let watchers = &self.watchers;
         self.budgets.retain(|session, budget| watchers.contains_key(session) || !budget.full(now));
@@ -1457,12 +1508,21 @@ impl Sfu {
     /// the probing target for its BWE.
     fn allocate(&mut self, now: Instant) {
         self.recoveries(now);
-        let rates: HashMap<String, ShareRate> =
-            self.publishers.iter_mut().map(|(share, p)| (share.clone(), p.rate.rate(now))).collect();
+        let rates: HashMap<String, ShareRate> = self
+            .publishers
+            .iter_mut()
+            .map(|(share, p)| {
+                let rate = p.rate.rate(now);
+                p.origin.measured(rate);
+                (share.clone(), rate)
+            })
+            .collect();
         let budget = self.measured.under_since.is_some_and(|at| now.saturating_duration_since(at) >= UNDER_BUDGET_FOR);
+        let ceiling = self.shared.budget_bps.load(Ordering::Relaxed);
         let sessions: Vec<SessionId> = self.watchers.keys().copied().collect();
         for session in sessions {
             let Some(w) = self.watchers.get_mut(&session) else { continue };
+            w.ceiling = ceiling;
             if let Some((slot, change)) = allocate(w, now, &rates, budget) {
                 self.tell(session, slot, change, now);
             }
@@ -1473,10 +1533,41 @@ impl Sfu {
     /// A slot was paused or resumed (`apply`): the core tells the viewer, and a resumed slot
     /// asks for its keyframe.
     fn tell(&mut self, session: SessionId, slot: usize, change: Change, now: Instant) {
-        let Some(w) = self.watchers.get(&session) else { return };
+        let Some(w) = self.watchers.get_mut(&session) else { return };
         let Some(grant) = w.slots.get(slot).and_then(|s| s.grant.clone()) else { return };
         let share = &grant.share;
         let run = w.run;
+        let rate = self.rates.get(share).copied().unwrap_or_default();
+        // Production incidents need these at the default level; a flapping viewer must not
+        // flood it, so one line per viewer and `LOG_EVERY`, counting the ones left out.
+        if w.logged.is_none_or(|at| now.saturating_duration_since(at) >= LOG_EVERY) {
+            let (estimate, retries, skipped) = (w.egress.estimate(), w.retries, w.unlogged);
+            let (average, keyframe) = (rate.average as u64, rate.largest_keyframe);
+            match change {
+                Change::Pause(reason) => {
+                    let trigger = if reason == ScreenPauseReason::Bandwidth { w.egress.trigger } else { "budget" };
+                    info!(
+                        session,
+                        share,
+                        ?reason,
+                        trigger,
+                        estimate,
+                        average,
+                        keyframe,
+                        retries,
+                        skipped,
+                        "screen watch paused"
+                    );
+                }
+                Change::Resume => {
+                    info!(session, share, estimate, average, keyframe, retries, skipped, "screen watch resumed");
+                }
+            }
+            w.logged = Some(now);
+            w.unlogged = 0;
+        } else {
+            w.unlogged += 1;
+        }
         match change {
             Change::Pause(reason) => {
                 let (estimate, counters) = (w.egress.estimate(), w.egress.counters);
@@ -2040,12 +2131,28 @@ impl Sfu {
         }
     }
 
-    fn end_watch(&mut self, session: SessionId) {
+    fn end_watch(&mut self, session: SessionId, now: Instant) {
         self.timers.remove(&Timer::Watch(session));
         if let Some(mut w) = self.watchers.remove(&session) {
             w.rtc.disconnect();
             self.owners.forget(Owner::Watch(w.id));
+            if let Some(estimate) = w.proven {
+                self.remember(session, estimate, now);
+            }
         }
+    }
+
+    /// Keeps a session's last proven estimate for its next watch transport; bounded in time
+    /// and count, the oldest going first.
+    fn remember(&mut self, session: SessionId, estimate: u64, now: Instant) {
+        self.remembered.retain(|_, (_, at)| now.saturating_duration_since(*at) < REMEMBER_FOR);
+        if self.remembered.len() >= REMEMBERED
+            && !self.remembered.contains_key(&session)
+            && let Some(oldest) = self.remembered.iter().min_by_key(|(_, (_, at))| *at).map(|(s, _)| *s)
+        {
+            self.remembered.remove(&oldest);
+        }
+        self.remembered.insert(session, (estimate, now));
     }
 }
 
@@ -2235,6 +2342,9 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                 RtcEvent::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => {
                     trace!(session = w.session, estimate = estimate.as_u64(), "screen watch estimate");
                     set_estimate(w, estimate.as_u64(), now);
+                    if w.egress.proven(now) {
+                        w.proven = Some(estimate.as_u64());
+                    }
                 }
                 RtcEvent::MediaAdded(added) if added.kind == MediaKind::Video => {
                     if added.direction.is_sending() && w.slots.len() < w.size {
@@ -2306,23 +2416,70 @@ fn allocate(
             w.restarted = Some(now);
         }
         apply(w, slot, change);
+        if change == Change::Pause(ScreenPauseReason::Bandwidth) {
+            // The link did not carry it: nothing about this estimate is proven any more.
+            w.proven = None;
+        }
         return Some((slot, change));
     }
     if !stalled {
         if !recovering {
             w.restarted = None;
         }
-    } else if w.restarted.is_none_or(|at| now.saturating_duration_since(at) >= RESTART_EVERY)
-        && !w.egress.fitting()
-        && probe_ready
-    {
-        // Nothing fits: retry normal startup with clean congestion/ACK history.
-        // Existing socket credit is never minted, and a continuous-fit timer
-        // already in progress must finish instead of being reset by the retry.
-        restart_estimator(w, INITIAL_ESTIMATE, now, &caps, &lanes);
-        w.restarted = Some(now);
+        w.retry_at = None;
+        if w.retried.is_some_and(|at| now.saturating_duration_since(at) >= RETRY_RESET) {
+            w.retries = 0;
+            w.retried = None;
+        }
+        return None;
     }
-    None
+    // Nothing feeds this viewer's estimate any more, and padding alone may never lift it to
+    // the share: after a backoff, try the most important share again from an optimistic start.
+    // A link that still cannot carry it backs off on its own feedback and pauses again within
+    // seconds; the continuous-fit resume can still come first. Existing socket credit is
+    // never minted, and a continuous-fit timer in progress finishes first.
+    let backoff = RETRY_FIRST.saturating_mul(1 << w.retries.min(8)).min(RETRY_MAX);
+    let at = *w.retry_at.get_or_insert(now + backoff);
+    if now < at || w.egress.fitting() || !probe_ready {
+        return None;
+    }
+    let slot = w.egress.first_bandwidth_paused()?;
+    w.retries = w.retries.saturating_add(1);
+    retry(w, slot, rates, now);
+    Some((slot, Change::Resume))
+}
+
+/// The estimate an optimistic start of `slot` uses: what its share needs, or the viewer's
+/// higher proven or remembered estimate, within the server-wide budget; never lower than the
+/// current one.
+fn start_target(w: &Watcher, slot: usize) -> u64 {
+    let need = w.slots[slot].grant.as_ref().map_or(0, |g| g.origin.start_estimate());
+    let known = w.proven.max(w.remembered).unwrap_or(0);
+    need.max(known).min(w.ceiling).max(w.egress.estimate())
+}
+
+/// Starts the estimator over at `slot`'s optimistic target.
+fn start_optimistic(w: &mut Watcher, slot: usize, rates: &HashMap<String, ShareRate>, now: Instant) {
+    let target = start_target(w, slot);
+    if target <= w.egress.estimate() {
+        return;
+    }
+    let lanes: Vec<ShareRate> = w
+        .slots
+        .iter()
+        .map(|s| s.grant.as_ref().and_then(|g| rates.get(&g.share)).copied().unwrap_or_default())
+        .collect();
+    let caps: Vec<u64> = w.slots.iter().map(|s| s.grant.as_ref().map_or(0, |g| g.origin.cap_bps)).collect();
+    restart_estimator(w, target, now, &caps, &lanes);
+}
+
+/// Resumes a bandwidth-paused `slot` of a fully paused viewer from an optimistic start.
+fn retry(w: &mut Watcher, slot: usize, rates: &HashMap<String, ShareRate>, now: Instant) {
+    apply(w, slot, Change::Resume);
+    start_optimistic(w, slot, rates, now);
+    w.restarted = Some(now);
+    w.retry_at = None;
+    w.retried = Some(now);
 }
 
 /// Keep queue admission and transport pacing on the same estimate.
@@ -2409,6 +2566,12 @@ fn assign(w: &mut Watcher, index: usize, grant: Arc<WatchGrant>, order: u64, now
     w.egress.assign(index, order, now);
     if focused {
         w.egress.focus(Some(index));
+    }
+    // Joining a share with nothing else flowing: start from an estimate that carries it, so
+    // its first keyframe and everything after it are forwarded in full from the start. Next
+    // to a share already flowing, the estimate is measured and grows by probing instead.
+    if !w.egress.others_active(index) {
+        start_optimistic(w, index, &HashMap::new(), now);
     }
 }
 
@@ -2874,6 +3037,14 @@ fn watcher(
         dropped_lanes: Vec::new(),
         desired: None,
         restarted: None,
+        proven: None,
+        remembered: None,
+        ceiling: u64::MAX,
+        retry_at: None,
+        retries: 0,
+        retried: None,
+        logged: None,
+        unlogged: 0,
         deadline: now,
     };
     Ok((watcher, answer.to_sdp_string()))
@@ -3005,6 +3176,10 @@ pub(crate) mod tests {
             .unwrap();
             client.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
             let mut pair = Self { w, client, now, hold: false, held: Vec::new(), checks: Vec::new(), repairs: 0 };
+            // A pair keeps its estimate where its test puts it: these tests exercise a viewer
+            // with no room for an optimistic start (a budget that leaves none, or a share added
+            // next to one already flowing). `sim.rs` covers optimistic starts.
+            pair.w.ceiling = INITIAL_ESTIMATE;
             for _ in 0..200 {
                 if pair.w.connected && pair.w.slots.len() == SCREEN_SLOTS {
                     break;
@@ -3189,6 +3364,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_watch_with_nothing_else_flowing_starts_from_its_share_or_the_sessions_higher_estimate() {
+        let measured = |cap| {
+            let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, cap);
+            origin.measured(ShareRate { average: 8_000_000.0, last_keyframe: 200_000, largest_keyframe: 200_000 });
+            origin
+        };
+        let mut pair = Pair::new();
+        pair.w.ceiling = u64::MAX;
+        assign(&mut pair.w, 0, WatchGrant::new(measured(12_000_000)), 1, pair.now);
+        let start = (1.2 * 8_000_000.0 / egress::PLAN) as u64;
+        assert_eq!(pair.w.egress.estimate(), start);
+        // A second share joins next to the flowing one at the measured estimate.
+        pair.w.egress.set_estimate(5_000_000, pair.now);
+        assign(&mut pair.w, 1, WatchGrant::new(measured(12_000_000)), 2, pair.now);
+        assert_eq!(pair.w.egress.estimate(), 5_000_000);
+
+        // The session's previous transport carried more: the higher one, within the budget.
+        let mut pair = Pair::new();
+        pair.w.remembered = Some(30_000_000);
+        pair.w.ceiling = 20_000_000;
+        assign(&mut pair.w, 0, WatchGrant::new(measured(12_000_000)), 1, pair.now);
+        assert_eq!(pair.w.egress.estimate(), 20_000_000);
+    }
+
+    #[tokio::test]
+    async fn remembered_estimates_are_bounded_in_time_and_count() {
+        let (mut sfu, _, now, _) = recovery_fixture(&[]).await;
+        sfu.remember(1, 9_000_000, now);
+        sfu.remember(2, 9_000_000, now + REMEMBER_FOR);
+        assert!(!sfu.remembered.contains_key(&1), "expired");
+        for session in 3..3 + REMEMBERED as SessionId {
+            sfu.remember(session, 9_000_000, now + REMEMBER_FOR + Duration::from_millis(session.into()));
+        }
+        assert_eq!(sfu.remembered.len(), REMEMBERED);
+        assert!(!sfu.remembered.contains_key(&2), "the oldest goes first");
+    }
+
+    #[test]
     fn pending_estimate_is_applied_before_originals_are_released() {
         let mut pair = Pair::new();
         pair.w.egress.set_estimate(100_000_000, pair.now);
@@ -3236,6 +3449,7 @@ pub(crate) mod tests {
             budgets: HashMap::new(),
             decode_reports: HashMap::new(),
             rates: HashMap::new(),
+            remembered: HashMap::new(),
             publishers: HashMap::new(),
             watchers: HashMap::new(),
             next_id: 1,
@@ -3316,6 +3530,7 @@ pub(crate) mod tests {
             budgets: HashMap::new(),
             decode_reports: HashMap::new(),
             rates: HashMap::new(),
+            remembered: HashMap::new(),
             publishers: HashMap::new(),
             watchers: HashMap::from([(pair.w.session, pair.w)]),
             next_id: 1,
@@ -3692,6 +3907,7 @@ pub(crate) mod tests {
             budgets: HashMap::new(),
             decode_reports: HashMap::new(),
             rates: HashMap::new(),
+            remembered: HashMap::new(),
             publishers: HashMap::from([("h264".into(), publisher)]),
             watchers,
             next_id: 1,
@@ -4999,7 +5215,7 @@ pub(crate) mod tests {
         for tick in 0..=2500u64 {
             let at = now + Duration::from_millis(tick);
             if tick == 250 {
-                sfu.end_watch(1);
+                sfu.end_watch(1, at);
                 assert!(!sfu.watchers.contains_key(&1));
                 assert!(!sfu.timers.indexed.contains_key(&Timer::Watch(1)));
             }
