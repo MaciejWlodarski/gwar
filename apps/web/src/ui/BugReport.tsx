@@ -39,7 +39,10 @@ export function BugReportSection({ card }: { card?: boolean }) {
   useEscapeBack();
   useEffect(() => { void controller.reportDiagnostics().then((d) => setDiagnostics(fitDiagnostics(d))); }, []);
 
+  // While a send is going the draft stays as sent: what it sends is what is dropped once it went through.
+  const sending = () => useReportDraft.getState().busy;
   const add = async (files: Iterable<Blob>) => {
+    if (sending()) return;
     draft({ error: null });
     let room = MAX_SHOTS - shots.length;
     for (const f of files) {
@@ -47,13 +50,14 @@ export function BugReportSection({ card }: { card?: boolean }) {
       if (room <= 0) { draft({ error: t("report.tooManyShots", { max: MAX_SHOTS }) }); return; }
       try {
         const blob = await fitScreenshot(f);
+        if (sending()) return;
         const shot = { id: newShotId(), blob, url: URL.createObjectURL(blob) };
         room--;
         draft((d) => ({ shots: [...d.shots, shot] }));
       } catch { draft({ error: t("report.badShot") }); }
     }
   };
-  const remove = (id: number) => draft((d) => ({ shots: d.shots.filter((s) => {
+  const remove = (id: number) => !busy && draft((d) => ({ shots: d.shots.filter((s) => {
     if (s.id === id) URL.revokeObjectURL(s.url);
     return s.id !== id;
   }) }));
@@ -81,7 +85,7 @@ export function BugReportSection({ card }: { card?: boolean }) {
         <div className="mx-auto flex w-full max-w-2xl flex-col gap-3 p-4 md:p-8" onPaste={onPaste} onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
           <p className="text-sm text-muted">{t("report.description")}</p>
           <Field label={t("report.what")}>
-            {(id) => <Textarea id={id} value={text} onChange={(e) => draft({ text: e.target.value })} rows={5} maxLength={10_000} placeholder={t("report.placeholder")} autoFocus data-entry />}
+            {(id) => <Textarea id={id} value={text} onChange={(e) => draft({ text: e.target.value })} disabled={busy} rows={5} maxLength={10_000} placeholder={t("report.placeholder")} autoFocus data-entry />}
           </Field>
           <div className="flex flex-col gap-2">
             <div className="flex flex-wrap items-center gap-2">
@@ -95,7 +99,7 @@ export function BugReportSection({ card }: { card?: boolean }) {
                 </span>
               ))}
               {shots.length < MAX_SHOTS && (
-                <Button size="sm" onClick={() => file.current?.click()}>
+                <Button size="sm" disabled={busy} onClick={() => file.current?.click()}>
                   <ImagePlus className="size-4" /> {t("report.addShot")}
                 </Button>
               )}
@@ -104,7 +108,7 @@ export function BugReportSection({ card }: { card?: boolean }) {
             </div>
             <p className="text-xs text-subtle">{t("report.shotHint")}</p>
           </div>
-          <Switch checked={withDiagnostics} onCheckedChange={(on) => draft({ withDiagnostics: on })} label={t("report.diagnostics")} description={t("report.diagnosticsHint")} />
+          <Switch checked={withDiagnostics} onCheckedChange={(on) => !busy && draft({ withDiagnostics: on })} label={t("report.diagnostics")} description={t("report.diagnosticsHint")} />
           {withDiagnostics && (
             <div>
               <button type="button" className="cursor-pointer text-xs text-accent underline underline-offset-2" onClick={() => setShowDiagnostics((v) => !v)}>
@@ -120,7 +124,7 @@ export function BugReportSection({ card }: { card?: boolean }) {
           <p className="text-xs text-subtle">{account ? t("report.privacyAccount", { handle: account.handle }) : t("report.privacy")}</p>
           {error && <p role="alert" className="text-sm text-danger">{error}</p>}
           <div className="flex justify-end gap-2 pt-1">
-            <Button onClick={cancel}>{t("common.cancel")}</Button>
+            <Button disabled={busy} onClick={cancel}>{t("common.cancel")}</Button>
             <Button variant="primary" busy={busy} disabled={!text.trim()} onClick={() => void sendReport(diagnostics)}>{t("report.send")}</Button>
           </div>
         </div>

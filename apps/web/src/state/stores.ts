@@ -189,6 +189,11 @@ interface UiStore {
   goBack(): void;
   showOverview(): void;
   showChat(): void;
+  /**
+   * Where a connection the user asked for opens: its server's chat (phones: its channel list), the same server again
+   * too. Not the pane the last session was left on, nor the one a reload brought back; the overview is a place to go.
+   */
+  landOnServer(): void;
   setEditing(message: number | null): void;
   toast(kind: ToastKind, text: string): void;
   dismissToast(id: number): void;
@@ -229,6 +234,7 @@ export const useUi = create<UiStore>()((set) => ({
   goBack: () => set((s) => ({ section: s.back })),
   showOverview: () => set({ section: "servers", overview: true, pane: "chat" }),
   showChat: () => set({ section: "servers", overview: false, pane: "chat" }),
+  landOnServer: () => set({ section: "servers", overview: false, pane: "list" }),
   setEditing: (editing) => set({ editing }),
   toast: (kind, text) => {
     const id = toastId++;

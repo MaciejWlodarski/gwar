@@ -162,28 +162,55 @@ function restore(view: NavView): void {
  * Phones: each step back (a conversation and its members over the channel list, a page, a settings tab) is a history
  * entry of its own, holding its view, so the system's back takes the steps one at a time. The rules:
  * - popstate never navigates: a browser's back or forward applies the view of the entry it lands on, checked field by
- *   field (else the base view); the popstate of our own `history.back()` applies nothing, the app already shows the
- *   view it went back to, and only rewrites the entry it landed on to hold it (after the event, as is any step back
- *   still to take from there);
- * - only a way back goes back in history, one entry at a time, and only from an entry this page load pushed: so it
- *   lands on this load's own entries or base. A way back is an in-app one (`backInApp`: a back button, Esc out of a
- *   page, a tab back to a section's top), or any change to a view the current entry goes back to (writing to someone
- *   from the members, a notification opening a conversation, the voice pill). Where that view is more than one entry
- *   down, or another way back came meanwhile, the next step back follows once the last one has landed;
+ *   field (else the base view). The popstate of our own way back applies nothing when it lands on the entry it went to
+ *   (the app already shows that view), and only rewrites that entry to hold it, after the event (as is a queued way
+ *   back, taken from there). Landing anywhere else (a user's Back came along with ours) it is the user's: its view is
+ *   applied. Our way back's popstate not coming within a second (a browser dropped it), or the page coming back from
+ *   the back/forward cache, ends the wait for it: the current entry is rewritten to hold the view;
+ * - only a way back goes back in history, from an entry of this load's own over the entries it pushed, down to its
+ *   base at most (the entry it loaded on, or a foreign one it pushed from), never below. A way back is an in-app one
+ *   (`backInApp`: a back button, Esc out of a page, a tab back to a section's top), or any change to a view the
+ *   current entry goes back to (writing to someone from the members, a notification opening a conversation, the voice
+ *   pill). It goes one entry back, and on over every entry below that holds a view further in than the one shown, in a
+ *   single `history.go(-n)`: one wait, during which a user's Back can come between, not one per entry;
  * - every other change pushes the steps it adds or rewrites the current entry;
- * - a load (a reload) shows the page its entry holds, under an id of its own. Its entries are not this load's, so an
- *   in-app way back from there rewrites the entry rather than going back: the next Back shows that page once more.
- * The desktop only applies the entries it lands on.
+ * - a load (a reload) shows the page its entry holds, under an id of its own, and that entry is its base. The entries
+ *   below are not this load's, so an in-app way back from there rewrites the entry rather than going back: the next
+ *   Back shows that page once more.
+ * The More sheet is no entry. The desktop only applies the entries it lands on.
  */
 let mobile = false;
-/** Entries this page load pushed: the only ones an in-app way back goes back over. */
-let pushed = new Set<string>();
-/** Our own `history.back()`, until its popstate comes. */
-let pending = false;
+interface Entry {
+  id: string;
+  view: NavView;
+}
+/** This load's entries, in history order: the base, then those pushed over it, each with the view it holds. */
+let entries: Entry[] = [];
+const indexOf = (id: string | null) => (id === null ? -1 : entries.findIndex((e) => e.id === id));
+/** The entry our own way back goes to, until its popstate comes (or the wait for it ends). */
+let pending: string | null = null;
 /** An in-app way back came while `pending`: it is taken once that one lands. */
 let queuedBack = false;
 /** An in-app way back is being applied: a sync it causes (an effect of a `flushSync`) may take the step. */
 let goingBack = false;
+/** How long our way back's popstate may take; browsers drop a traversal now and then (their rate limits). */
+export const LOST_POP_MS = 1000;
+let watchdog: ReturnType<typeof setTimeout> | undefined;
+
+/** Stops waiting for our own way back's popstate. */
+function stopWaiting(): void {
+  clearTimeout(watchdog);
+  pending = null;
+  queuedBack = false;
+}
+
+/** Writes a view to the current entry, keeping this load's record of it. */
+function rewrite(view: NavView, id: string | null): string {
+  const written = write(false, view, id ?? undefined);
+  const at = indexOf(written);
+  if (at >= 0) entries[at] = { id: written, view };
+  return written;
+}
 
 /**
  * Brings the history in line with the view. `mayGoBack`: an in-app way back; `steps`: the view changed in the app, so
@@ -191,7 +218,7 @@ let goingBack = false;
  */
 function sync(mayGoBack: boolean, steps = false): void {
   if (!mobile) return;
-  if (pending) {
+  if (pending !== null) {
     queuedBack ||= mayGoBack || goingBack;
     return;
   }
@@ -202,19 +229,35 @@ function sync(mayGoBack: boolean, steps = false): void {
   const at = readView(window.history.state);
   const atDepth = at ? backDepth(at, connected) : 0;
   const id = entryId(window.history.state);
-  if (depth < atDepth && id !== null && pushed.has(id) && (mayGoBack || (steps && behind(view, at!, connected)))) {
-    pending = true;
-    window.history.back();
+  const here = indexOf(id);
+  if (depth < atDepth && here > 0 && (mayGoBack || (steps && behind(view, at!, connected)))) {
+    let to = here - 1;
+    while (to > 0 && behind(view, entries[to]!.view, connected)) to--;
+    pending = entries[to]!.id;
+    clearTimeout(watchdog);
+    watchdog = setTimeout(() => {
+      stopWaiting();
+      sync(false);
+    }, LOST_POP_MS);
+    window.history.go(to - here);
     return;
   }
   if (depth <= atDepth) {
-    if (id === null || JSON.stringify(at) !== JSON.stringify(view)) write(false, view, id ?? undefined);
+    if (id === null || JSON.stringify(at) !== JSON.stringify(view)) rewrite(view, id);
     return;
   }
   const views = [view];
   for (let i = depth; i > atDepth; i--) views.unshift(stepBack(views[0]!, connected));
-  write(false, views[0]!, id ?? undefined);
-  for (const v of views.slice(1)) pushed.add(write(true, v));
+  const from = rewrite(views[0]!, id);
+  // Pushing from an entry that is no entry of this load's makes it the base: the browser drops all above it.
+  if (here < 0) entries = [{ id: from, view: views[0]! }];
+  else entries.splice(here + 1);
+  for (const v of views.slice(1)) {
+    const pushed = write(true, v);
+    // Refused (a browser's rate limit): no entry to go back over.
+    if (entryId(window.history.state) !== pushed) break;
+    entries.push({ id: pushed, view: v });
+  }
 }
 
 setBackHandler((apply) => {
@@ -228,27 +271,32 @@ setBackHandler((apply) => {
 });
 
 function onPop(e: PopStateEvent): void {
-  if (pending) {
-    // Where our own step back landed: it now holds the view the app went back to, unless a step back is still to
-    // take. That one goes after this popstate, which never navigates.
-    pending = false;
+  if (pending !== null) {
+    const ours = entryId(e.state) === pending;
     const again = queuedBack;
-    queuedBack = false;
-    setTimeout(() => sync(again, true));
-    return;
+    stopWaiting();
+    // Where our own way back went: it now holds the view the app went back to, unless a way back is still to take.
+    // That one goes after this popstate, which never navigates.
+    if (ours) return void setTimeout(() => sync(again, true));
   }
   restore(readView(e.state) ?? baseOf(navView(useUi.getState()), isConnected()));
   sync(false);
 }
 
-/** On load: the entry's page is shown again (phones; the More sheet stays closed), and the entry becomes this load's. */
+/** Back from the back/forward cache: a popstate that was awaited when the page was left won't come any more. */
+function onShow(e: PageTransitionEvent): void {
+  if (!e.persisted || pending === null) return;
+  stopWaiting();
+  sync(false);
+}
+
+/** On load: the entry's page is shown again (phones; the More sheet stays closed), and the entry becomes this load's base. */
 function start(): void {
-  pushed = new Set();
-  pending = false;
-  queuedBack = false;
+  stopWaiting();
   const stored = readView(window.history.state);
   if (stored && isMobileNow()) useUi.setState({ ...navView(stored), moreOpen: false });
-  write(false, navView(useUi.getState()));
+  const view = navView(useUi.getState());
+  entries = [{ id: write(false, view), view }];
 }
 
 /** Server panes: one step back to `pane`, focus onto what it shows (the open channel's row, the conversation's way back). */
@@ -265,7 +313,12 @@ export function useBackHistory(isMobile: boolean): void {
   const connected = useSession((s) => s.phase === "online" || s.phase === "reconnecting");
   useEffect(() => {
     window.addEventListener("popstate", onPop);
-    return () => window.removeEventListener("popstate", onPop);
+    window.addEventListener("pageshow", onShow);
+    return () => {
+      window.removeEventListener("popstate", onPop);
+      window.removeEventListener("pageshow", onShow);
+      stopWaiting();
+    };
   }, []);
   useEffect(() => start(), []);
   useEffect(() => {
@@ -273,19 +326,6 @@ export function useBackHistory(isMobile: boolean): void {
     sync(false);
   }, [isMobile]);
   useEffect(() => sync(false, true), [view, connected]);
-}
-
-/**
- * A connection opens on its server's chat (phones: on its channel list), the same server again too: not on the pane
- * the last session was left on, or the one a reload brought back. The overview is a place to go, not a landing page.
- */
-export function useConnectLanding(): void {
-  const phase = useSession((s) => s.phase);
-  useEffect(() => {
-    if (phase !== "connecting") return;
-    useUi.getState().showChat();
-    useUi.getState().setPane("list");
-  }, [phase]);
 }
 
 /** Whether a saved server is the one this session is on, and opening one (connecting unless it is). */
@@ -300,8 +340,6 @@ export function useBookmarkOpener() {
   const open = (b: Bookmark) => {
     setSection("servers");
     if (isActive(b) && phase === "online") return;
-    useUi.getState().showChat();
-    useUi.getState().setPane("list");
     void controller.connectInteractive(bookmarkParams(b), { remember: false });
   };
   return { isActive, open };

@@ -18,7 +18,7 @@ import { useMembersPanel } from "./ui/members";
 import { Home } from "./ui/Home";
 import { Overview } from "./ui/Overview";
 import { MoreSheet, TabBar } from "./ui/MobileNav";
-import { paneBack, useBackHistory, useConnectLanding, useServerUnread } from "./ui/nav";
+import { paneBack, useBackHistory, useServerUnread } from "./ui/nav";
 import { SectionRail } from "./ui/SectionRail";
 import { ServerRail } from "./ui/ServerRail";
 import { SettingsSection } from "./ui/Settings";
@@ -53,8 +53,6 @@ export function App() {
   useEffect(() => {
     document.title = `${unread > 0 ? `(${unread}) ` : ""}${showApp && serverName ? `${serverName} · ` : ""}Gwar`;
   }, [unread, serverName, showApp]);
-
-  useConnectLanding();
 
   useEffect(() => {
     if (!isMobile) useUi.getState().setMore(false);

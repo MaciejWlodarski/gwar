@@ -3,6 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { connectApi } from "../connect/api";
+import { useAccountIdentity } from "../state/identity";
 import { initialState } from "../state/reducer";
 import { useSettings } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
@@ -42,7 +43,7 @@ function Page() {
 
 const render = () => act(async () => root.render(<TooltipProvider><Page /></TooltipProvider>));
 const textarea = () => container.querySelector("textarea");
-const button = (label: string) => [...container.querySelectorAll("button")].find((b) => b.textContent === label)!;
+const button = (label: string) => [...container.querySelectorAll("button")].find((b) => b.textContent?.trim() === label)!;
 const type = (text: string) =>
   act(async () => {
     Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")!.set!.call(textarea(), text);
@@ -104,6 +105,55 @@ describe("the bug report draft", () => {
     expect(textarea()?.value).toBe("it broke");
     expect(container.querySelector('[role="alert"]')?.textContent).toBe("Connect is unreachable");
     expect(button("Send report").disabled).toBe(false);
+  });
+
+  it("is dropped when another identity takes over (signing in or out, an import), screenshots too", async () => {
+    const revoke = vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    await render();
+    await type("my private notes");
+    await act(async () => useReportDraft.setState({ shots: [shot], withDiagnostics: false }));
+    // A nickname picked up from the vault is the same person: the draft stays.
+    await act(async () => useAccountIdentity.setState({ nickname: "renamed" }));
+    expect(textarea()?.value).toBe("my private notes");
+    await act(async () => useAccountIdentity.setState((s) => ({ replaced: s.replaced + 1 })));
+    expect(textarea()?.value).toBe("");
+    expect(container.querySelector("img")).toBeNull();
+    expect(revoke).toHaveBeenCalledWith("blob:shot");
+    expect(useReportDraft.getState()).toMatchObject({ text: "", shots: [], withDiagnostics: true, busy: false });
+  });
+
+  it("holds still while it is being sent: no edits, no Cancel", async () => {
+    vi.spyOn(connectApi, "report").mockReturnValue(new Promise(() => {}));
+    await render();
+    await type("it broke");
+    await act(async () => button("Send report").click());
+    expect([textarea()?.disabled, button("Cancel").disabled, button("Add screenshot").disabled]).toEqual([true, true, true]);
+  });
+
+  it("a send's result stays with the draft it was sent from: a newer one is neither dropped nor given its error", async () => {
+    const results: Array<{ ok: (id: number) => void; fail: (e: Error) => void }> = [];
+    vi.spyOn(connectApi, "report").mockImplementation(() => new Promise((ok, fail) => void results.push({ ok, fail })));
+    await render();
+    await type("first");
+    await act(async () => button("Send report").click());
+    // The person is signed out while it goes; whoever comes next writes their own.
+    await act(async () => useAccountIdentity.setState((s) => ({ replaced: s.replaced + 1 })));
+    await type("second");
+    await act(async () => results[0]!.ok(7));
+    expect([useUi.getState().section, textarea()?.value]).toEqual(["bugReport", "second"]);
+    expect(useUi.getState().toasts.map((x) => x.text)).toEqual(["Thank you! Report #7 was sent."]);
+    // Sent too; the first one failing now says so in a toast only.
+    await act(async () => button("Send report").click());
+    expect(button("Send report").disabled).toBe(true);
+    await act(async () => useAccountIdentity.setState((s) => ({ replaced: s.replaced + 1 })));
+    await type("third");
+    await act(async () => button("Send report").click());
+    await act(async () => results[1]!.fail(new Error("Connect is unreachable")));
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(button("Send report").disabled).toBe(true);
+    expect(useUi.getState().toasts.at(-1)?.text).toBe("The bug report was not sent: Connect is unreachable");
+    await act(async () => results[2]!.ok(9));
+    expect([useUi.getState().section, useReportDraft.getState().text]).toEqual(["servers", ""]);
   });
 
   it("a send that fails on the page says so on the page, without a toast", async () => {
