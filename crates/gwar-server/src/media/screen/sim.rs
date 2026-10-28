@@ -180,11 +180,14 @@ pub struct Sim {
     /// Worst queue voice met within `JOIN` of the start, and from then to 15 s.
     voice_join_queue_max: Duration,
     voice_startup_queue_max: Duration,
+    /// Every voice sample: when, and the queue it met.
+    voice_trace: Vec<(Instant, Duration)>,
 }
 
 /// An optimistic start may overshoot a link slower than the share's start estimate until the
 /// estimator backs off on its delay and loss feedback: this long after joining. On the 5 Mbps
-/// voice-headroom link with voice flowing, that took up to 3.75 s.
+/// voice-headroom link with voice flowing, the backoff came within 3.75 s, and voice met 50 ms
+/// of queue or more for at most 540 ms of it.
 pub const JOIN: Duration = Duration::from_secs(5);
 
 impl Sim {
@@ -245,6 +248,7 @@ impl Sim {
             voice_queue: Vec::new(),
             voice_join_queue_max: Duration::ZERO,
             voice_startup_queue_max: Duration::ZERO,
+            voice_trace: Vec::new(),
         };
         for _ in 0..2000 {
             if sim.w.connected && sim.w.slots.len() == SCREEN_SLOTS {
@@ -484,6 +488,7 @@ impl Sim {
         }
         if self.voice && self.elapsed().as_millis().is_multiple_of(10) {
             let queued = self.down.busy.saturating_duration_since(now);
+            self.voice_trace.push((now, queued));
             if self.elapsed() >= Duration::from_secs(15) {
                 self.voice_queue.push(queued);
             } else if self.elapsed() < JOIN {
@@ -619,6 +624,31 @@ mod tests {
             .collect()
     }
 
+    /// Voice queue at least this long hurts a call: about what a jitter buffer absorbs.
+    const HURT: Duration = Duration::from_millis(50);
+
+    /// How long voice met at least `HURT` of queue in `[from, to)`, and the most it met.
+    fn voice_hurt(sim: &Sim, from: Instant, to: Instant) -> (Duration, Duration) {
+        let samples = || sim.voice_trace.iter().filter(|(at, _)| *at >= from && *at < to).map(|(_, q)| *q);
+        (samples().filter(|q| *q >= HURT).count() as u32 * 10 * MS, samples().max().unwrap_or_default())
+    }
+
+    /// Voice around each resume of slot 0 after its first pause: from the resume to the next
+    /// pause, at least its ramp and a little more.
+    fn retries_voice(sim: &Sim) -> Vec<(Duration, Duration, Duration)> {
+        let changes: Vec<_> = sim.changes.iter().filter(|(_, s, _)| *s == 0).collect();
+        changes
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, _, c))| *c == Change::Resume)
+            .map(|(n, (at, _, _))| {
+                let next = changes.get(n + 1).map_or(sim.now, |(t, _, _)| *t);
+                let (hurt, max) = voice_hurt(sim, *at, next.max(*at + RAMP + 2 * SECOND).min(sim.now));
+                (*at - sim.start, hurt, max)
+            })
+            .collect()
+    }
+
     fn resumes(sim: &Sim, slot: usize) -> usize {
         sim.changes.iter().filter(|(_, s, c)| *s == slot && *c == Change::Resume).count()
     }
@@ -743,12 +773,15 @@ mod tests {
     #[test]
     fn keyframes_overflowing_admission_pause_a_3_mbps_viewer_and_its_retries_back_off() {
         let mut sim = Sim::new(Some(3_000_000));
+        sim.voice = true;
         let t = text(&mut sim);
         // Failures count once the slot's ramp is over.
         sim.run(RAMP);
         keyframes(&mut sim, t);
         sim.run(140 * SECOND);
         let context = summary(&sim);
+        let voice = retries_voice(&sim);
+        println!("3 Mbps text retries voice (at, hurt, max): {voice:?}");
         let c = sim.w.egress.counters;
         assert!(c.rejected > 0 && c.failed_keyframes >= 2, "{context}");
         let paused = pauses(&sim, 0);
@@ -771,6 +804,9 @@ mod tests {
             assert!(gap >= backoff && gap <= backoff + SECOND, "retry {n} after {gap:?}: {context}");
             assert!(paused[n + 1] - *at <= RAMP + 2 * SECOND, "retry {n} pauses again: {context}");
         }
+        // Each retry starts a step above what the link carried, not at the keyframe's whole
+        // room: it never queues voice on the link for long.
+        assert!(voice.iter().all(|(_, hurt, _)| hurt.is_zero()), "{voice:?}: {context}");
     }
 
     #[test]
@@ -875,7 +911,12 @@ mod tests {
                             .map(|(_, _, _, payload)| payload.len())
                             .sum();
                         let mbps = bytes as f64 * 8.0 / 30.0 / 1e6;
-                        println!("downlink p99={p99:?} mbps={mbps:.3} {context}");
+                        println!(
+                            "downlink join={:?} hurt={:?} startup={:?} p99={p99:?} mbps={mbps:.3} {context}",
+                            sim.voice_join_queue_max,
+                            voice_hurt(&sim, sim.start, sim.start + JOIN).0,
+                            sim.voice_startup_queue_max
+                        );
                         // Keep the original 1 ms case's 10 ms bounds. For the added
                         // coarse-clock cases, steady traffic allows one wake interval
                         // plus a fixed 2 ms wire-packet margin; startup probes span two
@@ -885,16 +926,20 @@ mod tests {
                         let steady_limit = (10 * MS).max(interval + 2 * MS);
                         let startup_limit = (10 * MS).max(2 * interval + 2 * MS);
                         // Until the estimator backs off from the optimistic start, voice can
-                        // meet the bottleneck's own queue, but only within `JOIN`.
+                        // meet the bottleneck's own queue, but only within `JOIN`, and for
+                        // less than a second of it. Retries no longer start there (`RETRY_STEP`),
+                        // so this is the join's alone; it starts as #190 made it.
                         let join_limit = sim.down.queue + 2 * MS;
+                        let join_hurt = voice_hurt(&sim, sim.start, sim.start + JOIN).0;
                         if !pauses(&sim, 0).is_empty()
                             || mbps < 2.7
                             || p99 > steady_limit
                             || sim.voice_join_queue_max > join_limit
+                            || join_hurt >= SECOND
                             || sim.voice_startup_queue_max > startup_limit
                         {
                             failures.push(format!(
-                                "join={:?} startup={:?} p99={p99:?} mbps={mbps} {context}",
+                                "join={:?} hurt={join_hurt:?} startup={:?} p99={p99:?} mbps={mbps} {context}",
                                 sim.voice_join_queue_max, sim.voice_startup_queue_max
                             ));
                         }
@@ -1508,9 +1553,18 @@ mod tests {
     #[test]
     fn a_slow_viewer_pauses_cleanly_and_recovers_once_its_link_improves() {
         let mut sim = Sim::new(Some(2_000_000));
+        sim.voice = true;
         sim.join("game", 8_000_000, 60, 200_000, 12_000_000);
-        sim.run(40 * SECOND);
+        sim.run(70 * SECOND);
         let context = summary(&sim);
+        let voice = retries_voice(&sim);
+        println!(
+            "2 Mbps game join voice {:?} retries voice (at, hurt, max): {voice:?}",
+            voice_hurt(&sim, sim.start, sim.start + JOIN),
+        );
+        // Only the join's start overruns the link: the retries step up from what it carried.
+        assert!(voice.len() >= 2, "{context}");
+        assert!(voice_hurt(&sim, sim.start + JOIN, sim.now).0.is_zero(), "{voice:?}: {context}");
         let paused = pauses(&sim, 0);
         assert!(!paused.is_empty() && paused[0] <= RAMP + SECOND, "paused after its ramp: {context}");
         // Cleanly: nothing of the slot is sent between a pause and the next resume.
@@ -1533,6 +1587,103 @@ mod tests {
         let improved = sim.now;
         sim.run(150 * SECOND);
         assert_game_recovery(&mut sim, improved, "2 Mbps, then 50 Mbps");
+    }
+
+    #[test]
+    fn a_keyframe_dominated_share_on_a_slow_link_spares_voice_after_its_join() {
+        for rate in [2_000_000, 3_000_000] {
+            // A text share: 500 kb/s with 300 KB keyframes, so its start is about 7.5 Mbps.
+            let mut sim = Sim::new(Some(rate));
+            sim.voice = true;
+            sim.join("text", 500_000, 5, 300_000, 8_000_000);
+            sim.run(300 * SECOND);
+            let context = format!("rate={rate}: {}", summary(&sim));
+            let voice = retries_voice(&sim);
+            println!(
+                "{rate} text join voice {:?} retries voice (at, hurt, max): {voice:?}",
+                voice_hurt(&sim, sim.start, sim.start + JOIN),
+            );
+            // It keeps trying, backing off, and none of its retries admits a keyframe the link
+            // cannot carry: past the join, voice never meets a long queue.
+            assert_eq!(sim.paused(0), Some(ScreenPauseReason::Bandwidth), "{context}");
+            assert!(voice.len() >= 4, "{context}");
+            assert!(voice_hurt(&sim, sim.start + JOIN, sim.now).0.is_zero(), "{voice:?}: {context}");
+            // A link that recovers gets the share back by itself.
+            sim.down.rate = Some(50_000_000);
+            let improved = sim.now;
+            sim.run(180 * SECOND);
+            let context = format!("rate={rate}, then 50 Mbps: {}", summary(&sim));
+            assert_eq!(sim.paused(0), None, "{context}");
+            let resumed = sim.changes.iter().rev().find(|(_, s, c)| *s == 0 && *c == Change::Resume).unwrap().0;
+            println!("{rate} text recovered after {:?}", resumed.saturating_duration_since(improved));
+            assert!(resumed.saturating_duration_since(improved) <= 150 * SECOND, "{context}");
+        }
+    }
+
+    #[test]
+    fn a_remembered_estimate_never_starts_above_the_shares_ingress_and_a_pause_forgets_it() {
+        let mut sim = Sim::new(Some(2_000_000));
+        sim.w.remembered = Some(100_000_000);
+        sim.join("game", 8_000_000, 60, 200_000, 12_000_000);
+        assert_eq!(sim.w.egress.estimate(), egress::ingress_ceiling(12_000_000), "{}", summary(&sim));
+        while resumes(&sim, 0) == 0 {
+            sim.tick();
+        }
+        let context = summary(&sim);
+        assert_eq!(pauses(&sim, 0).len(), 1, "{context}");
+        assert_eq!((sim.w.proven, sim.w.remembered), (None, None), "{context}");
+        // Its retry steps up from what the link carried, not from the forgotten estimate.
+        let step = ((RETRY_STEP * sim.w.step as f64) as u64).max(INITIAL_ESTIMATE);
+        assert!(step < 4_000_000, "{context}");
+        assert_eq!(sim.w.egress.estimate(), step, "{context}");
+    }
+
+    #[test]
+    fn a_static_share_proves_only_what_its_viewer_carried() {
+        // An optimistic start for 300 KB keyframes, which a 500 kb/s share sends only on request:
+        // str0m keeps the start, untested, so it is no measure of the link.
+        let mut sim = Sim::new(Some(200_000_000));
+        sim.join("text", 500_000, 5, 300_000, 8_000_000);
+        sim.run(30 * SECOND);
+        let context = summary(&sim);
+        assert!(sim.changes.is_empty(), "{context}");
+        let sent = sim.bytes(sim.now - RAMP, sim.now, |k| !matches!(k, Kind::Control));
+        let carried = sent as f64 * 8.0 / RAMP.as_secs_f64();
+        let proven = sim.w.proven.expect("media flowed past its ramp");
+        assert!(proven < sim.w.egress.estimate(), "{proven}: {context}");
+        assert!(proven as f64 <= 1.5 * carried * 1.1, "{proven} for {carried} bps carried: {context}");
+    }
+
+    #[test]
+    fn try_again_waits_for_the_spacing_since_the_last_start_and_adds_no_failed_retry() {
+        let mut sim = Sim::new(Some(2_000_000));
+        sim.join("game", 8_000_000, 60, 200_000, 12_000_000);
+        while pauses(&sim, 0).is_empty() {
+            sim.tick();
+        }
+        let joined = sim.start;
+        // Paused after its ramp, under `RETRY_FIRST` after the optimistic start.
+        assert!(sim.now - joined < RETRY_FIRST, "{}", summary(&sim));
+        let rates = HashMap::new();
+        assert!(!ask_retry(&mut sim.w, 0, &rates, sim.now));
+        assert_eq!(sim.paused(0), Some(ScreenPauseReason::Bandwidth));
+        sim.run(RETRY_FIRST);
+        let context = summary(&sim);
+        let resumed: Vec<_> = sim
+            .changes
+            .iter()
+            .filter(|(_, s, c)| *s == 0 && *c == Change::Resume)
+            .map(|(at, ..)| *at - joined)
+            .collect();
+        assert_eq!(resumed.len(), 1, "{context}");
+        assert!(resumed[0] >= RETRY_FIRST && resumed[0] <= RETRY_FIRST + ALLOCATION_TICK, "{context}");
+        assert_eq!(sim.w.retries, 0, "{context}");
+        // Right after it, another one waits again.
+        let at = sim.now;
+        while sim.paused(0).is_none() {
+            sim.tick();
+        }
+        assert!(!ask_retry(&mut sim.w, 0, &rates, sim.now) || sim.now - at >= RETRY_FIRST, "{}", summary(&sim));
     }
 
     /// Two viewers of the same share on their own links, behind one publisher: `b`'s share

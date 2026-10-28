@@ -258,12 +258,20 @@ pub fn start_estimate(rate: ShareRate, cap: u64) -> u64 {
     if rate.average <= 0.0 {
         return INITIAL_ESTIMATE;
     }
-    let room = |average: f64, keyframe: usize| average.max(keyframe as f64 * 8.0 / DEADLINE.as_secs_f64()) / PLAN;
-    let frame = ingress::FRAME_BYTES + ingress::FRAME_PACKETS * ORIGINAL_OVERHEAD;
     let start = room(RESUME_HEADROOM * rate.average, rate.largest_keyframe);
-    // As much as the share's ingress lets through: its byte bucket and its frame limit.
-    let ceiling = room(RESUME_HEADROOM * ingress::BYTE_HEADROOM * cap as f64, frame);
-    start.min(ceiling).max(INITIAL_ESTIMATE as f64) as u64
+    start.min(ingress_ceiling(cap) as f64).max(INITIAL_ESTIMATE as f64) as u64
+}
+
+/// The most any start for a share of this cap needs: room for as much as its ingress lets
+/// through, its byte bucket and its frame limit.
+pub fn ingress_ceiling(cap: u64) -> u64 {
+    let frame = ingress::FRAME_BYTES + ingress::FRAME_PACKETS * ORIGINAL_OVERHEAD;
+    room(RESUME_HEADROOM * ingress::BYTE_HEADROOM * cap as f64, frame) as u64
+}
+
+/// The estimate whose `PLAN` carries `average` with a `keyframe` within the deadline.
+fn room(average: f64, keyframe: usize) -> f64 {
+    average.max(keyframe as f64 * 8.0 / DEADLINE.as_secs_f64()) / PLAN
 }
 
 /// What the allocator decided for a slot.
