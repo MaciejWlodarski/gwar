@@ -6,6 +6,7 @@
  * (`SessionState.shares`), not this.
  */
 import { create } from "zustand";
+import type { ScreenPauseReason } from "../proto/ScreenPauseReason";
 import type { ScreenSurface } from "../proto/ScreenSurface";
 import { SCREEN_SLOTS } from "../voice/screen";
 import { resolveQuality, defaultQuality, sameSpec, type ScreenSpec } from "../voice/screen-quality";
@@ -37,12 +38,14 @@ export interface OwnShare {
 /**
  * `requesting` until the server answers this watch's own `screen.watch`. `id` tells a watch
  * from an earlier one of the same share whose requests and releases may still be in flight.
+ * `paused`: the server stopped sending it for now (`screen.paused`), until `screen.resumed`.
  */
 export interface Watch {
   share: string;
   id: number;
   slot: number | null;
   status: "requesting" | "watching";
+  paused?: ScreenPauseReason;
 }
 
 export type TransportPhase = "none" | "connecting" | "connected" | "failed";
@@ -84,6 +87,8 @@ export type ScreenAction =
   | { type: "granted"; run: number; id: number; slot: number }
   | { type: "slot"; run: number; slot: number; share: string | null }
   | { type: "unwatch"; share: string }
+  | { type: "paused"; share: string; reason: ScreenPauseReason }
+  | { type: "resumed"; share: string }
 
   | { type: "stage"; share: string }
   | { type: "chat"; hidden: boolean }
@@ -153,7 +158,7 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       if (run < state.transport.run) return state;
       if (run > state.transport.run) {
         // A new run: nothing of the old one's slots carries over; watches wait for new slots.
-        return { ...state, transport: { run, phase }, slots: emptySlots(), streams: emptySlots(), watches: state.watches.map(w => ({ ...w, slot: null, status: "requesting" as const })) };
+        return { ...state, transport: { run, phase }, slots: emptySlots(), streams: emptySlots(), watches: state.watches.map(w => ({ share: w.share, id: w.id, slot: null, status: "requesting" as const })) };
       }
       if (phase === "failed") {
         // The server ends every watch of a transport that is gone.
@@ -179,7 +184,7 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       if (!watch) return state;
       const slots = state.slots.slice();
       slots[slot] = watch.share;
-      return { ...state, slots, watches: state.watches.map(w => (w === watch ? { ...w, slot, status: "watching" } : w)) };
+      return { ...state, slots, watches: state.watches.map(w => (w === watch ? { share: w.share, id: w.id, slot, status: "watching" } : w)) };
     }
     case "slot": {
       const { run, slot, share } = action;
@@ -195,6 +200,14 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
     }
     case "unwatch":
       return withoutWatch(state, action.share);
+    case "paused":
+    case "resumed": {
+      // Only a granted watch: a pause of an earlier grant of the share cannot reach a new one.
+      const paused = action.type === "paused" ? action.reason : undefined;
+      const watch = state.watches.find(w => w.share === action.share && w.status === "watching");
+      if (!watch || watch.paused === paused) return state;
+      return { ...state, watches: state.watches.map(w => (w === watch ? { share: w.share, id: w.id, slot: w.slot, status: w.status, ...(paused ? { paused } : {}) } : w)) };
+    }
     case "stage":
       return state.watches.some(w => w.share === action.share) ? { ...state, stage: action.share } : state;
     case "chat":

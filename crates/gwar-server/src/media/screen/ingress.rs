@@ -17,7 +17,7 @@ pub const FRAME_SPAN: Duration = Duration::from_secs(2);
 /// Packets per second a share may send, and its packet burst (`FRAME_PACKETS`).
 const PACKET_RATE: f64 = 2_000.0;
 /// The byte bucket's rate is this times the share's cap.
-const BYTE_HEADROOM: f64 = 1.25;
+pub(super) const BYTE_HEADROOM: f64 = 1.25;
 /// Overruns that stop a share, within `OVERRUN_WINDOW`.
 const OVERRUNS: usize = 3;
 const OVERRUN_WINDOW: Duration = Duration::from_secs(10);

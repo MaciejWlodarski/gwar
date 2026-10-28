@@ -370,6 +370,7 @@ impl Core {
         let lease = Lease::new();
         let s = self.sessions.get_mut(&session).expect("checked above");
         s.watch_run = offer.run;
+        let since = s.since;
         s.watch = Some(Watch {
             run: offer.run,
             sdp: offer.sdp.clone(),
@@ -384,6 +385,7 @@ impl Core {
         let (reply, rx) = oneshot::channel();
         permit.send(ScreenCmd::Watch {
             session,
+            connection: since,
             run: offer.run,
             lease,
             slots: SCREEN_SLOTS,

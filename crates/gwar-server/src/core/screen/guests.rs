@@ -483,6 +483,7 @@ impl Core {
         };
         let g = self.guests.get_mut(&guest).expect("found above");
         let lease = g.lease.clone();
+        let since = g.since;
         g.watch = Some(Watch {
             run: GUEST_RUN,
             sdp: sdp.clone(),
@@ -497,6 +498,7 @@ impl Core {
         let (reply, rx) = oneshot::channel();
         permit.send(ScreenCmd::Watch {
             session: guest,
+            connection: since,
             run: GUEST_RUN,
             lease,
             slots: GUEST_SLOTS,

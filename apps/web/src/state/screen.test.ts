@@ -54,6 +54,18 @@ describe("watching", () => {
     expect(s.slots).toEqual([null, null, "A", null]);
   });
 
+  it("holds a granted watch's pause until it resumes, and forgets it with the grant", () => {
+    let s = run(connected(), { type: "watch", share: "A", id: 1 });
+    // Not granted yet: an earlier grant's pause cannot reach it.
+    expect(run(s, { type: "paused", share: "A", reason: "bandwidth" }).watches[0]?.paused).toBeUndefined();
+    s = run(s, { type: "granted", run: 7, id: 1, slot: 0 }, { type: "paused", share: "A", reason: "bandwidth" });
+    expect(s.watches[0]).toEqual({ share: "A", id: 1, slot: 0, status: "watching", paused: "bandwidth" });
+    expect(run(s, { type: "paused", share: "A", reason: "budget" }).watches[0]?.paused).toBe("budget");
+    expect(run(s, { type: "resumed", share: "A" }).watches[0]).toEqual({ share: "A", id: 1, slot: 0, status: "watching" });
+    // A new transport run asks for new slots: no pause carries over.
+    expect(run(s, { type: "transport", run: 8, phase: "connecting" }).watches[0]).toEqual({ share: "A", id: 1, slot: null, status: "requesting" });
+  });
+
   it("ignores answers of other runs", () => {
     const s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "granted", run: 8, id: 1, slot: 1 });
     expect(slotOf(s, "A")).toBeNull();

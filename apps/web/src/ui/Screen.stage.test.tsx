@@ -201,3 +201,64 @@ it.each(["silent", "receive time", "presentation time", "counter reset"] as cons
   expect(video("A")).toBe(active);
   expect(video("A").closest<HTMLElement>("[data-screen-video]")?.dataset.ready).toBe("true");
 });
+
+it("waits out a pause before a silent grant's first frame, however long, and 35 s more after it", async () => {
+  const failed = vi.spyOn(screen, "frameFailed");
+  const { transport, watches } = useScreen.getState();
+  // Join congestion: B pauses before its first frame decodes, and stays paused long after 35 s.
+  await advance(11_000);
+  await act(async () => { screen.handleEvent({ ev: "screen.paused", d: { share: "B", reason: "bandwidth" } }); });
+  await advance(24_000);
+  // A still expires on its own clock.
+  expect(failed.mock.calls).toEqual([["A", transport.run, watches[0]!.id]]);
+  await advance(120_000);
+  expect(failed).toHaveBeenCalledTimes(1);
+  expect(useScreen.getState().watches.map(w => w.share)).toEqual(["B"]);
+  // Once resumed, its first frame has the whole wait again; then a silent share expires.
+  await act(async () => { screen.handleEvent({ ev: "screen.resumed", d: { share: "B" } }); });
+  await advance(34_999);
+  expect(failed).toHaveBeenCalledTimes(1);
+  await advance(1);
+  expect(failed).toHaveBeenLastCalledWith("B", transport.run, watches[1]!.id);
+  expect(useScreen.getState().watches).toEqual([]);
+});
+
+it("keeps a share whose first frame arrives after its pause ends", async () => {
+  const failed = vi.spyOn(screen, "frameFailed");
+  const { transport, watches } = useScreen.getState();
+  const b = watches[1]!;
+  await advance(11_000);
+  await act(async () => { screen.handleEvent({ ev: "screen.paused", d: { share: "B", reason: "bandwidth" } }); });
+  await advance(60_000);
+  await act(async () => { screen.handleEvent({ ev: "screen.resumed", d: { share: "B" } }); });
+  await advance(2_000);
+  screen.frameReceived("B", transport.run, b.id);
+  await advance(120_000);
+  expect(failed.mock.calls.map(([share]) => share)).toEqual(["A"]);
+  expect(useScreen.getState().watches.map(w => w.share)).toEqual(["B"]);
+});
+
+it("shows why the server holds a share back instead of its last resolution at 0 fps, and retries", async () => {
+  // B, watched last, is on the stage; A is a card.
+  expect(useScreen.getState().stage).toBe("B");
+  await act(async () => { screen.handleEvent({ ev: "screen.paused", d: { share: "B", reason: "bandwidth" } }); });
+  const stage = container.querySelector<HTMLElement>('[data-screen-paused="bandwidth"]')!;
+  expect(stage.textContent).toContain("Your connection is too slow for this share right now");
+  expect(container.querySelector('[data-testid="screen-quality"]')?.textContent).toBe("Paused");
+  request.mockClear();
+  const retry = [...stage.querySelectorAll("button")].find(b => b.textContent?.includes("Try again"))!;
+  await act(async () => retry.click());
+  expect(request).toHaveBeenCalledWith("screen.watch", { share: "B" });
+  expect(retry.disabled).toBe(true);
+  await advance(5000);
+  expect(retry.disabled).toBe(false);
+  // A card says it briefly; a budget pause offers no retry.
+  await act(async () => { screen.handleEvent({ ev: "screen.paused", d: { share: "A", reason: "budget" } }); });
+  const card = container.querySelector<HTMLElement>('[data-screen-paused="budget"]')!;
+  expect(card.textContent).toBe("Paused");
+  await act(async () => {
+    screen.handleEvent({ ev: "screen.resumed", d: { share: "B" } });
+    screen.handleEvent({ ev: "screen.resumed", d: { share: "A" } });
+  });
+  expect(container.querySelector("[data-screen-paused]")).toBeNull();
+});
