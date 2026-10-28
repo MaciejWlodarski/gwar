@@ -1,6 +1,130 @@
 # Chromium startup adaptation validation
 
-## Busy H.264 ramp (27 October 2026)
+## Busy H.264 ramp (28 October 2026)
+
+The sender now reserves `max(200 kb/s, 10 % of availableOutgoingBitrate)` rather
+than always reserving 30 %. The spec ceiling and 250 kb/s probing floor still apply.
+All sender/guard/probe budgets and the harness's allocation-probe counter use the
+same helper. A smooth sender still writes the full spec cap once that budget covers
+it, even when the last upward step is inside the normal 10 % dead band.
+
+The same PR adds an optimistic GCC start in the publisher's remote answer:
+`x-google-start-bitrate` on every H.264, AV1 and VP9 fmtp, always using
+`min(spec cap, 4 Mb/s)` (with the WebKitGTK compatibility exception below).
+Four Mb/s covers the default 1080p30 budget without immediately assuming the largest
+12 Mb/s spec is affordable. This initializes GCC; it sets no minimum rate.
+No uplink estimate is stored or reused between publishes. See "Optimistic sender start" and
+"Voice headroom" in docs/screen-share.md for the rule and its limits.
+
+### Local comparison
+
+28 October, macOS arm64, Playwright Chromium 153.0.8010.12 and the existing real-tab
+`busy60` source at 1920×1080/60, Game spec (8 Mb/s ceiling), sixty seconds per share,
+three fresh device contexts per arm. Baseline is an independent bundle of exact
+`ce7cb503e6743226c3ff8f786e42eac800045900`; reserve-only and combined bundles are
+separate outputs. Every arm uses the same locally built, unchanged server, with
+loopback addresses and `--no-connect`. Arm blocks are serial, not a randomized trial;
+this is a shared host, and CPU adaptation occurred. Times are median [min–max],
+with roughly 0.5 s timeline resolution.
+
+| Busy H.264 arm (3 shares each) | Time to the 8 Mb/s cap | First configured/observed GCC estimate |
+| --- | --- | --- |
+| Main: 70 %, browser default start | 51.0 s [40.8–52.9] | Not sampled before startup probing; first normal samples 1.77–3.49 Mb/s |
+| Reserve only, browser default start | 9.1 s [8.6–10.8] | First normal samples 1.78–1.85 Mb/s |
+| Reserve + default 4 Mb/s start | 8.7 s [8.7–12.1] | Exactly 4.00 Mb/s in all three, 76–114 ms after remote answer |
+| Rejected remembered-start prototype (6.4 Mb/s start) | 17.7 s [14.7–24.7] | Exactly 6.40 Mb/s in all three, 98–132 ms after remote answer |
+
+Time-to-cap is the first observed full spec-cap write supported by that arm's
+headroom budget. The initial unconstrained spec-cap write and temporary allocation
+lifts do not count. All twelve shares reached the cap and made zero allocation probes.
+The reserve removes most of the delay; the extra default-start median gain is below
+one timeline sample and is not evidence of a consistent further time-to-cap win.
+The optimistic shares first reached native source/encoder/viewer dimensions at
+1.1–3.5 s, versus 8.6–10.8 s with reserve alone. All three optimistic shares later
+adapted to 1440×810 for CPU; settled payload was 6.66–8.01 Mb/s. Reaching the cap
+sooner does not guarantee sustained native size on a CPU-limited encoder.
+
+The rejected remembered-start measurement is retained as a negative result. One of its three
+shares failed the unchanged native-size diagnostic: it ended at 960×540 with
+`bandwidth` limitation at the full 8 Mb/s cap. The other two had CPU-limited samples.
+Round-1 review also showed why a stable candidate-pair estimate was unsuitable as
+a future start hint: it could come from a CPU-limited, hidden or frame-stalled sender,
+span selected-pair changes, include a lift between polls or a rejected stats poll,
+and lacked expiry and network scope. Its warm-up began at negotiation, not ICE
+connection. The owner removed the entire remembered-start feature rather than
+expand its suitability rules. It never shipped, so no key migration or cleanup is
+needed. The default-start policy has not been measured on the owner's 1440p60 stream.
+
+The harness now samples the first positive selected-pair estimate every 20 ms after
+the remote answer, before watch negotiation and startup probes hide it. It logs the
+configured start, first estimate and `capAt` in `summary.json`.
+
+### Back-off, WebKit and voice
+
+A falling estimate now restarts the stale-probe wait after a 10 % move in either
+direction. It must settle again for ten seconds before qualifying for a lift.
+Regression tests retain queued-lift expiry, generation fencing, retiring restorations
+and the independent ten-second restore deadline, including smooth ceiling writes
+queued behind a restore.
+
+After removing the remembered start, a fresh forty-second H.264 busy run with a
+1.5 Mb/s CDP uplink observed exactly the configured 4 Mb/s first estimate, 189 ms
+after the answer. By 1.08 s it was 1.43 Mb/s, before the first ordinary headroom
+poll. Settled payload was 1.29 Mb/s with about 60 encoded/decoded fps at 640×360.
+The run passed the unchanged shaped-link assertions with zero allocation probes
+and zero capture-guard pulses. The default start and existing probe/restore
+machinery did not hold up GCC's back-off. This is one local congestion-response
+check, not a loss/delay matrix or a voice gate.
+
+A native WKWebView fixture on macOS 27.0 negotiated local H.264 video with the exact
+SDP helper: without a hint the first estimate was 300 kb/s; with 4 Mb/s it was exactly
+4 Mb/s. All three arms (no hint, 4 Mb/s, 8 Mb/s) connected and decoded 84–89 frames
+over the observation interval. The 8 Mb/s arm's first observed estimate was 5.71 Mb/s,
+so that observation is not a claim of exact 8 Mb/s initialization. The system
+WKWebView honors the 4 Mb/s parameter and accepts the higher hint without breaking
+video. This checks the desktop app's engine, not a full packaged-app screen-picker run.
+The same native fixture also decoded VP9 in all three arms: the first estimates
+were 300 kb/s without a hint, 4.001 Mb/s with 4 Mb/s, and exactly 8 Mb/s with 8 Mb/s.
+
+The first two CI attempts failed the unchanged screen suite: Linux WebKitGTK
+negotiated VP9 with `x-google-start-bitrate=4000` but encoded zero frames. A local
+fixed-screen candidate also timed out on the WebKit → Chromium flow. Pinned main's
+local suite reached that flow but later failed a separate H.264 recovery assertion,
+so it does not reproduce the exact new CI failure. The sender now leaves WebKitGTK's
+answer unchanged as a compatibility exception; Chromium on Linux and native macOS
+WKWebView still get every supported video codec's start hint. The GTK exception is
+covered by unit tests and keeps its browser-default GCC start and the reserve rule.
+
+Voice latency, jitter, loss, concealment and mouth-to-ear percentiles were not
+measured in this browser ramp harness. Its shaper and synthetic media can demonstrate
+video back-off, not an enforced capacity reservation between independent peer
+connections. No production endpoint, VM or TeamSpeak server was contacted. The
+200 kb/s reserve is a budget choice for roughly 64 kb/s Opus plus RTCP/repairs;
+below a 450 kb/s estimate the existing video floor can consume part or all of it.
+
+Evidence (raw JSONL, summaries, frozen baseline source, bundles, scripts and logs)
+is retained locally in `/tmp/gwar-reserve-evidence`. The owner's compressed browser
+dump was parsed only as JSON with `python3 -I /tmp/gwar-reserve-evidence/dump-metrics.py`,
+a script outside the dump directory. It corroborates a first video estimate of
+1.632 Mb/s, 996p at about 12 s and 1288p at about 31 s; it is not a local replay or
+a measurement of the new sender on the owner's path.
+The history-removal checks and fresh default-start back-off run are retained in
+`/tmp/gwar189-round2`.
+
+Reproduction (after installing the pinned web dependencies and generated WASM):
+
+```sh
+CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=/tmp/gwar-reserve-target cargo build --locked --offline -p gwar-server -p gwar-connect
+# Build exact ce7cb503 into a separate archive/bundle for the baseline; keep each arm's output.
+NODE_ENV=development pnpm --filter web exec vite build --mode e2e --outDir /tmp/reserve-dist
+GWAR_SERVER_BIN=/tmp/gwar-reserve-target/debug/gwar-server E2E_STARTUP_DIST=/tmp/reserve-dist E2E_STARTUP_CODECS=h264 E2E_STARTUP_SOURCES=busy60 E2E_STARTUP_REPEATS=3 E2E_STARTUP_SECONDS=60 E2E_STARTUP_RESULTS=/tmp/reserve-ramp pnpm --filter web e2e:screen-startup
+# Default-start back-off: one repeat, 40 s, E2E_STARTUP_UPLINK=1500000.
+```
+
+### Historical 70 % ramp diagnosis (27 October 2026)
+
+The following measurements describe PR #186 and the previous 70 % policy. They
+explain the old bottleneck; the reserve and optimistic start above supersede that policy.
 
 The replay above left three H.264 busy shares failing on size: `40225445809` (share 1),
 `40315496650` (share 0) and the first attempt of `40415803712` (share 1). Each was limited
@@ -73,11 +197,12 @@ no allocation probe. The change does not shorten the ramp. In the run that held 
 it would have written 8 Mb/s at 46 s. Whether that lowers QP enough for Chromium to
 upscale sooner is not established.
 
-**Measured for the owner, not changed: an 85 % share.** The same local busy H.264 with
+**Historical alternative, now superseded: an 85 % share.** The same local busy H.264 with
 `UPLINK_SHARE = 0.85` reached the 8 Mb/s cap after 10.6–10.7 s (3 runs), against
 24.8–28.8 s with 70 %. Steady 1080p60 came at 10.7–11.2 s, and the settled payload was
 8.0 Mb/s. The harness's allocation-probe count assumes 70 % and miscounts that arm. Its
-effect on voice under a congested uplink was not measured.
+effect on voice under a congested uplink was not measured. The reserve rule replaces
+this pending startup-share idea; there is no separate 85 % startup policy.
 
 **Verdict.** The slow ramp is a real property of the product, not a CI artefact. It is
 the documented headroom trade-off (docs/screen-share.md, "Design trade-off"), and it

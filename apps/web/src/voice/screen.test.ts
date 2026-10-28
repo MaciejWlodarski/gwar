@@ -9,15 +9,27 @@ import { captureScreen, DEPENDENCY_DESCRIPTOR, headroomBitrate, MIN_BITRATE, pre
 
 import { deriveSpec, legacySpec, type ScreenSpec } from "./screen-quality";
 import type { ScreenPreset } from "../proto/ScreenPreset";
+import { uplinkVideoBudget } from "./screen-headroom";
 const TEST_SPECS = Object.fromEntries((["text", "smooth", "game", "saver"] as const).map(p => [p, { ...deriveSpec(legacySpec(p)), ...legacySpec(p) }])) as Record<ScreenPreset, ScreenSpec & ReturnType<typeof deriveSpec>>;
 const codec = (mimeType: string, sdpFmtpLine?: string) => ({ mimeType, clockRate: 90000, ...(sdpFmtpLine ? { sdpFmtpLine } : {}) }) as RTCRtpCodec;
 
 describe("voice headroom", () => {
-  it("leaves 30 % of the uplink estimate, never above the cap", () => {
-    expect(headroomBitrate(4_000_000, undefined)).toBe(4_000_000);
+  it("reserves 200 kb/s or 10 % of the estimate, never above the spec cap", () => {
     expect(headroomBitrate(4_000_000, 10_000_000)).toBe(4_000_000);
-    expect(headroomBitrate(4_000_000, 2_000_000)).toBe(1_400_000);
+    expect(headroomBitrate(4_000_000, 3_000_000)).toBe(2_700_000);
+    expect(headroomBitrate(4_000_000, 2_000_000)).toBe(1_800_000);
+    expect(headroomBitrate(4_000_000, 1_000_000)).toBe(800_000);
+    expect(headroomBitrate(4_000_000, 900_000)).toBe(700_000);
+    expect(headroomBitrate(4_000_000, 1_000_000.5)).toBe(800_000);
+  });
+  it("keeps the probing floor even when the uplink cannot cover the reserve", () => {
+    expect(headroomBitrate(4_000_000, 450_000)).toBe(MIN_BITRATE);
+    expect(headroomBitrate(4_000_000, 300_000)).toBe(MIN_BITRATE);
     expect(headroomBitrate(4_000_000, 100_000)).toBe(MIN_BITRATE);
+    expect(headroomBitrate(100_000, 300_000)).toBe(100_000);
+  });
+  it.each([undefined, null, 0, -1, NaN, Infinity, -Infinity])("keeps the spec cap without a valid estimate: %s", available => {
+    expect(headroomBitrate(4_000_000, available)).toBe(4_000_000);
   });
 });
 
@@ -144,6 +156,23 @@ describe.each(["publisher", "watch"] as const)("%s connection budget", kind => {
 });
 
 describe("publish transport", () => {
+  it("uses the latest spec for the answer's start hint and backs off on the first low estimate", async () => {
+    let answer!: (sdp: string) => void;
+    const publisher = new ScreenPublisher({ track: { applyConstraints: async () => {} } as unknown as MediaStreamTrack,
+      quality: TEST_SPECS.game, iceServers: [], offer: () => new Promise(resolve => { answer = resolve; }), state: () => {} });
+    const starting = publisher.start();
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    await publisher.setSpec(TEST_SPECS.saver);
+    answer("v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\na=fmtp:96 packetization-mode=1\r\n");
+    await starting;
+    const pc = Peer.all[0]!;
+    expect(pc.setRemoteDescription).toHaveBeenCalledWith({ type: "answer", sdp: expect.stringContaining("x-google-start-bitrate=1500") });
+    pc.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 600_000 });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(publisher.bitrate).toBe(400_000);
+    expect(pc.sendParams.at(-1)!.encodings[0]).not.toHaveProperty("minBitrate");
+    publisher.close();
+  });
   it("detects a silently stopped capture in the existing poll, even with pending stats", async () => {
     const track = { readyState: "live" } as MediaStreamTrack, ended = vi.fn();
     const publisher = new ScreenPublisher({ track, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {}, ended });
@@ -194,24 +223,24 @@ describe("publish transport", () => {
     pc.stats.set("T", { type: "transport", selectedCandidatePairId: "P" });
     pc.stats.set("P", { type: "candidate-pair", id: "P", availableOutgoingBitrate: 3_000_000 });
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(publisher.bitrate).toBe(2_100_000);
+    expect(publisher.bitrate).toBe(2_700_000);
 
     // A preset change needs no renegotiation.
     await publisher.setSpec(TEST_SPECS.text);
     expect(track.contentHint).toBe("detail");
     expect(track.applyConstraints).toHaveBeenCalledWith({ width: { max: 1920 }, height: { max: 1080 }, frameRate: { max: 15 } });
     expect(pc.sendParams.at(-1)).toMatchObject({ degradationPreference: "maintain-resolution", encodings: [{ maxFramerate: 15 }] });
-    expect(publisher.bitrate).toBe(2_100_000);
+    expect(publisher.bitrate).toBe(2_500_000);
     expect(pc.createOffer).toHaveBeenCalledTimes(1);
     publisher.close();
     expect(pc.close).toHaveBeenCalled();
   });
 
   it.each([
-    // Game's 8 Mb/s cap: down to 6.3, up to 7.28 (91 %), then 7.56 and 70 % of 12 Mb/s, past the cap.
-    ["smooth", TEST_SPECS.game, [9_000_000, 10_400_000, 10_800_000, 12_000_000], [6_300_000, 7_280_000, 7_280_000, 8_000_000]],
+    // Game's 8 Mb/s cap: down to 6.3, up to 7.29, then 7.56 and a budget above the cap.
+    ["smooth", TEST_SPECS.game, [7_000_000, 8_100_000, 8_400_000, 9_000_000], [6_300_000, 7_290_000, 7_290_000, 8_000_000]],
     // Text's 2.5 Mb/s cap: sharp keeps the 10 % rule up to the cap as well.
-    ["sharp", TEST_SPECS.text, [2_800_000, 3_250_000, 3_350_000, 4_000_000], [1_959_999, 2_275_000, 2_275_000, 2_275_000]],
+    ["sharp", TEST_SPECS.text, [2_200_000, 2_550_000, 2_650_000, 2_800_000], [1_980_000, 2_295_000, 2_295_000, 2_295_000]],
   ] as const)("a %s share skips small cap moves; smooth still takes the last one up to the spec's cap", async (_, quality, estimates, caps) => {
     const publisher = new ScreenPublisher({ track: { applyConstraints: async () => {} } as unknown as MediaStreamTrack, quality, iceServers: [], offer: async () => "answer", state: () => {} });
     await publisher.start();
@@ -221,7 +250,7 @@ describe("publish transport", () => {
       await vi.advanceTimersByTimeAsync(2_000);
       seen.push(publisher.bitrate);
     }
-    // The last two moves are under 10 % (4 % below the cap, 10 % short of it): only smooth writes the cap.
+    // The last two moves are under 10 %: only smooth writes the cap.
     expect(seen).toEqual(caps);
     const writes = pc.sendParams.length;
     await vi.advanceTimersByTimeAsync(4_000);
@@ -240,7 +269,7 @@ describe("publish transport", () => {
     await vi.advanceTimersByTimeAsync(2000);
     expect(publisher.bitrate).toBe(4_000_000);
     await vi.advanceTimersByTimeAsync(2000);
-    expect(publisher.bitrate).toBe(1_400_000);
+    expect(publisher.bitrate).toBe(1_800_000);
     publisher.close();
   });
 
@@ -684,7 +713,7 @@ describe("publisher capture guard", () => {
     const publisher = make(); await publisher.start();
     const pc = Peer.all[0]!; healthy(pc);
     await vi.advanceTimersByTimeAsync(10_000);
-    expect(last()).toMatchObject({ degradationPreference: "maintain-resolution", encodings: [{ maxBitrate: 3_500_000 }] });
+    expect(last()).toMatchObject({ degradationPreference: "maintain-resolution", encodings: [{ maxBitrate: 4_500_000 }] });
     await vi.advanceTimersByTimeAsync(1000);
     expect(last().degradationPreference).toBe("maintain-framerate");
     await vi.advanceTimersByTimeAsync(18_999);
@@ -831,7 +860,8 @@ describe("stale estimate probe", () => {
     // Native size already: a stale estimate costs this share nothing.
     { undersized: false },
     // An estimate that already covers the cap under the headroom rule.
-    { available: 12_000_000 },
+    { available: 9_000_000 },
+    { available: 300_000, cap: MIN_BITRATE },
     { available: 0 }, { available: NaN }, { cap: NaN },
   ])("leaves alone what a probe cannot help: %j", change => {
     expect(feed(new StaleEstimateProbe(), 0, 60_000, changed(change as Partial<Sample>))).toEqual([]);
@@ -864,6 +894,12 @@ describe("stale estimate probe", () => {
   it("waits while the estimate still grows on its own", () => {
     expect(feed(new StaleEstimateProbe(), 0, 30_000, now => ({ ...sample(now), available: 1_000_000 * 1.12 ** (now / 2000) }))).toEqual([]);
   });
+  it("does not fight back-off from an optimistic start, then probes only after ten stable seconds", () => {
+    const probe = new StaleEstimateProbe();
+    expect(feed(probe, 0, 30_000, now => ({ ...sample(now), available: 4_000_000 * 0.95 ** (now / 2000) }))).toEqual([]);
+    expect(feed(probe, 32_000, 40_000, changed({ available: 500_000 }))).toEqual([]);
+    expect(feed(probe, 42_000, 44_000, changed({ available: 500_000 }))).toEqual([42_000]);
+  });
   it("needs continuous observations", () => {
     const probe = new StaleEstimateProbe();
     expect(feed(probe, 0, 10_000)).toEqual([]);
@@ -880,7 +916,7 @@ describe("publisher stale estimate probe", () => {
       ["pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: available, timestamp: performance.timeOrigin + performance.now() }],
       ["codec", { type: "codec", mimeType }],
       ["out", { type: "outbound-rtp", kind: "video", id: "out", encoderImplementation: "OpenH264", codecId: "codec", framesEncoded: timestamp / 50, timestamp, bytesSent: timestamp * 8,
-        frameWidth: 480, frameHeight: 270, framesPerSecond: 20, targetBitrate: 630_000, qualityLimitationReason: "bandwidth", ...out(timestamp) }],
+        frameWidth: 480, frameHeight: 270, framesPerSecond: 20, targetBitrate: 700_000, qualityLimitationReason: "bandwidth", ...out(timestamp) }],
     ]);
   });
   const make = (quality = TEST_SPECS.game) => new ScreenPublisher({ track: { applyConstraints: vi.fn(async () => {}) } as unknown as MediaStreamTrack, quality, iceServers: [], offer: async () => "answer", state: () => {} });
@@ -898,13 +934,13 @@ describe("publisher stale estimate probe", () => {
     const publisher = make(); await publisher.start();
     const pc = Peer.all[0]!; stale(pc);
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(publisher.bitrate).toBe(630_000);
+    expect(publisher.bitrate).toBe(700_000);
     const before = pc.sendParams.length;
     // The first stalled poll (4 s) needs a byte delta; ten seconds later the probe lifts the cap.
     await vi.advanceTimersByTimeAsync(12_000);
     expect(caps(pc, before)).toEqual([8_000_000]);
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(caps(pc, before)).toEqual([8_000_000, 630_000]);
+    expect(caps(pc, before)).toEqual([8_000_000, 700_000]);
     // The degradation preference never changes for a probe.
     expect(pc.sendParams.every(p => p.degradationPreference === "maintain-framerate")).toBe(true);
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
@@ -917,7 +953,7 @@ describe("publisher stale estimate probe", () => {
     expect(publisher.bitrate).toBe(8_000_000);
     stale(pc, 5_000_000);
     await vi.advanceTimersByTimeAsync(2_000);
-    expect(publisher.bitrate).toBe(3_500_000);
+    expect(publisher.bitrate).toBe(4_500_000);
     publisher.close();
   });
 
@@ -926,15 +962,16 @@ describe("publisher stale estimate probe", () => {
     const pc = Peer.all[0]!; stale(pc, 900_000);
     const { writes, sender, plain } = record(pc);
     await vi.advanceTimersByTimeAsync(11_000);
-    // A 10 % lower estimate makes the 12 s poll write a new cap; that write hangs until 16 s.
+    // An 8.9 % lower estimate cuts the reserve budget by >10 %, but is still stale-probe eligible.
+    // The 12 s cap write hangs until 16 s, so the queued lift expires behind it.
     let release!: () => void;
     sender.setParameters.mockImplementationOnce(async (p: RTCRtpSendParameters) => { writes.push({ at: performance.now(), cap: p.encodings[0]!.maxBitrate }); await new Promise<void>(r => { release = r; }); pc.sendParams.push(p); });
-    stale(pc, 800_000);
+    stale(pc, 820_000);
     await vi.advanceTimersByTimeAsync(5_000);
     sender.setParameters.mockImplementation(plain);
     release(); await vi.advanceTimersByTimeAsync(0);
-    expect(writes.filter(w => w.at >= 12_000).map(w => w.cap)).toEqual([560_000, 560_000]);
-    expect(publisher.bitrate).toBe(560_000);
+    expect(writes.filter(w => w.at >= 12_000).map(w => w.cap)).toEqual([620_000, 620_000]);
+    expect(publisher.bitrate).toBe(620_000);
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -950,7 +987,7 @@ describe("publisher stale estimate probe", () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     reject(new Error("late transaction")); await vi.advanceTimersByTimeAsync(0);
     expect(writes.filter(w => w.at > 14_000 && w.cap === 8_000_000)).toEqual([]);
-    expect(publisher.bitrate).toBe(630_000);
+    expect(publisher.bitrate).toBe(700_000);
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -965,7 +1002,7 @@ describe("publisher stale estimate probe", () => {
     for (let i = 0; i < 4; i++) sender.setParameters.mockRejectedValueOnce(new Error("transient"));
     pc.getStats.mockImplementation(() => new Promise(() => {}));
     await vi.advanceTimersByTimeAsync(60_000);
-    expect(publisher.bitrate).toBe(630_000);
+    expect(publisher.bitrate).toBe(700_000);
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
   });
 
@@ -1178,7 +1215,7 @@ describe("publisher stale estimate probe", () => {
     await vi.advanceTimersByTimeAsync(1_500); // rejected at 14 s, retried at 15 s
     expect(caps(old).at(-1)).toBe(8_000_000);
     await vi.advanceTimersByTimeAsync(2_000); // written at 17 s
-    expect(caps(old).at(-1)).toBe(630_000);
+    expect(caps(old).at(-1)).toBe(700_000);
     await vi.advanceTimersByTimeAsync(20_000);
     expect(old.close).not.toHaveBeenCalled();
     answer("answer"); await recovering;
@@ -1263,7 +1300,7 @@ describe("publisher stale estimate probe", () => {
     // The server answers the replacement 20 seconds later; the old sender stays open until then.
     await vi.advanceTimersByTimeAsync(20_000);
     expect(old.close).not.toHaveBeenCalled();
-    expect(caps(old).at(-1)).toBe(630_000);
+    expect(caps(old).at(-1)).toBe(700_000);
     expect(state).not.toHaveBeenCalledWith("failed");
     answer("answer"); await recovering;
     expect(old.close).toHaveBeenCalled();
@@ -1283,8 +1320,8 @@ describe("publisher stale estimate probe", () => {
     const changing = publisher.setSpec(TEST_SPECS.saver);
     await vi.advanceTimersByTimeAsync(8_000); // 23.5 s, before the 24-second deadline
     release(); await changing;
-    expect(publisher.bitrate).toBe(630_000);
-    expect(caps(pc).at(-1)).toBe(630_000);
+    expect(publisher.bitrate).toBe(700_000);
+    expect(caps(pc).at(-1)).toBe(700_000);
     await vi.advanceTimersByTimeAsync(10_000);
     expect(state).not.toHaveBeenCalledWith("failed");
     expect(pc.close).not.toHaveBeenCalled();
@@ -1303,7 +1340,7 @@ describe("publisher stale estimate probe", () => {
     await vi.advanceTimersByTimeAsync(8_500); // restores fail at 15, 16, 18 and 22 s; the next retry is at 30 s
     sender.setParameters.mockImplementation(plain);
     await publisher.setSpec(TEST_SPECS.saver);
-    expect(publisher.bitrate).toBe(630_000);
+    expect(publisher.bitrate).toBe(700_000);
     const count = writes.length;
     await vi.advanceTimersByTimeAsync(10_000);
     // The 24-second deadline passes quietly and the 30-second retry never runs.
@@ -1316,17 +1353,17 @@ describe("publisher stale estimate probe", () => {
     const state = vi.fn();
     const publisher = new ScreenPublisher({ track: { applyConstraints: vi.fn(async () => {}) } as unknown as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state });
     await publisher.start();
-    const pc = Peer.all[0]!; stale(pc, 10_800_000); pc.connectionState = "connected";
+    const pc = Peer.all[0]!; stale(pc, 8_400_000); pc.connectionState = "connected";
     const { sender, plain } = record(pc);
     await vi.advanceTimersByTimeAsync(14_000);
     expect(publisher.bitrate).toBe(8_000_000);
     let release!: () => void;
     sender.setParameters.mockImplementationOnce(async (p: RTCRtpSendParameters) => { await new Promise<void>(r => { release = r; }); await plain(p); });
     await vi.advanceTimersByTimeAsync(1_500);
-    stale(pc, 12_000_000);
+    stale(pc, 9_000_000);
     await vi.advanceTimersByTimeAsync(500); // 16 s: the 8 Mb/s spec cap is only 5.8 % above the pending 7.56 Mb/s restore
     release(); await vi.advanceTimersByTimeAsync(0);
-    expect(caps(pc).slice(-2)).toEqual([7_559_999, 8_000_000]);
+    expect(caps(pc).slice(-2)).toEqual([7_560_000, 8_000_000]);
     await vi.advanceTimersByTimeAsync(10_000);
     expect(state).not.toHaveBeenCalledWith("failed");
     publisher.close(); expect(vi.getTimerCount()).toBe(0);
@@ -1375,7 +1412,7 @@ describe("publisher stale estimate probe", () => {
     await vi.advanceTimersByTimeAsync(13_000);
     stale(pc, 900_000, now => ({ id: "replacement", bytesSent: (now - 13_000) * 8, framesEncoded: (now - 13_000) / 50 }));
     await vi.advanceTimersByTimeAsync(3_000);
-    expect(publisher.bitrate).toBe(630_000);
+    expect(publisher.bitrate).toBe(700_000);
     expect(caps(pc, started)).not.toContain(8_000_000);
     publisher.close();
   });
@@ -1385,7 +1422,7 @@ describe("publisher stale estimate probe", () => {
     const pc = Peer.all[0]!; stale(pc);
     const started = pc.sendParams.length;
     await vi.advanceTimersByTimeAsync(30_000);
-    expect(caps(pc, started)).toEqual([630_000]);
+    expect(caps(pc, started)).toEqual([700_000]);
     publisher.close();
   });
 
@@ -1413,7 +1450,7 @@ describe("stuck capture guard", () => {
     expect(feed(new StuckCaptureGuard(), 0, 150_000)).toEqual([6000, 28000]);
   });
   it.each([
-    { limitation: "cpu" }, { available: 1_500_000 }, { targetBitrate: 300_000 }, { available: 0 }, { available: NaN }, { available: Infinity }, { targetBitrate: NaN }, { bitrate: NaN }, { fps: 0 },
+    { limitation: "cpu" }, { available: 1_200_000 }, { targetBitrate: 300_000 }, { available: 0 }, { available: NaN }, { available: Infinity }, { targetBitrate: NaN }, { bitrate: NaN }, { fps: 0 },
     { width: 1920, height: 1080, sourceWidth: 1920, sourceHeight: 1080 },
     { width: 640, height: 360, sourceWidth: 640, sourceHeight: 360, targetWidth: 640, targetHeight: 360 },
   ])("ignores cpu, congestion, missing stats, stopped or naturally small sources: %j", change => {
@@ -2164,7 +2201,7 @@ describe("asymmetric sequence invariants", () => {
           const step = Math.min(liveSpec.width * liveSpec.height, Math.max(output * 4, 1280 * 720));
           const bpp = Math.max(0.04, 80_000 / (output * cadence));
           const healthy = output > 0 && output < liveSpec.width * liveSpec.height && sample.limitation !== "cpu" &&
-            Math.min(sample.available * 0.7, sample.targetBitrate) >= step * cadence * bpp * 1.5;
+            Math.min(uplinkVideoBudget(sample.available), sample.targetBitrate) >= step * cadence * bpp * 1.5;
           if (!healthy || healthyGuard !== guard || now - lastObservation > 4500) healthyAt = null;
           if (healthy) healthyAt ??= now;
           if (healthyAt !== null) check(now - healthyAt <= 3_600_000, "J5: bounded healthy liveness");
@@ -2510,7 +2547,7 @@ describe("automatic mode on confirmed source switches", () => {
     expect(f.state.guard).not.toBe(original);
     expect(f.state.quality).toEqual({ mode: "smooth", height: 1440, fps: 60 });
     expect(f.track.contentHint).toBe("motion");
-    expect(f.pc.sendParams.at(-1)).toMatchObject({ degradationPreference: "maintain-framerate", encodings: [{ maxBitrate: 9_100_000, maxFramerate: 60 }] });
+    expect(f.pc.sendParams.at(-1)).toMatchObject({ degradationPreference: "maintain-framerate", encodings: [{ maxBitrate: 12_000_000, maxFramerate: 60 }] });
     const switched = f.state.guard;
     await f.publisher.setSpec({ mode: "sharp", height: 1440, fps: 60 }, true); // A stale UI mode on a size/fps-only edit.
     expect(f.state.guard).toBe(switched);

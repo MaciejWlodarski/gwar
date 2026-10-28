@@ -26,6 +26,7 @@ import { chromium } from "playwright";
 import { stopProcesses } from "./processes.mjs";
 import { canvasCapture, readBarcode, stampBarcode } from "./screen-source.mjs";
 import { allocationProbes, judgeSettled, probeBound } from "./screen-startup-judge.mjs";
+import { uplinkVideoBudget } from "../src/voice/screen-headroom.ts";
 
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(webRoot, "../..");
@@ -69,8 +70,30 @@ function devicePatch({ frequency, sources }, stamp, read, capture) {
   window.__readBarcode = read;
   // Every peer connection, for the RTP diagnostics a failure prints.
   window.__pcs = [];
+  window.__screenStarts = new Map();
   window.RTCPeerConnection = new Proxy(window.RTCPeerConnection, {
-    construct(target, args) { const pc = new target(...args); window.__pcs.push(pc); return pc; },
+    construct(target, args) {
+      const pc = new target(...args); window.__pcs.push(pc);
+      const remote = pc.setRemoteDescription.bind(pc);
+      pc.setRemoteDescription = async description => {
+        await remote(description);
+        if (!pc.getSenders().some(s => s.track?.kind === "video")) return;
+        const configured = Number(/x-google-start-bitrate=(\d+)/.exec(description.sdp)?.[1]) * 1000;
+        const start = { configured: Number.isFinite(configured) ? configured : null }, at = performance.now();
+        window.__screenStarts.set(pc, start);
+        // Observe the initial estimate before watch negotiation and startup probes hide it.
+        const read = async () => {
+          if (pc.connectionState === "closed") return;
+          const stats = [...(await pc.getStats()).values()];
+          const selected = stats.find(s => s.type === "transport")?.selectedCandidatePairId;
+          const pair = stats.find(s => s.type === "candidate-pair" && (selected ? s.id === selected : s.nominated && s.state === "succeeded"));
+          if (pair?.availableOutgoingBitrate > 0) { start.available = pair.availableOutgoingBitrate; start.afterMs = performance.now() - at; }
+          else if (performance.now() - at < 5000) setTimeout(() => void read().catch(() => {}), 20);
+        };
+        void read().catch(() => {});
+      };
+      return pc;
+    },
   });
   const media = navigator.mediaDevices;
   media.getUserMedia = async () => {
@@ -282,7 +305,7 @@ try {
               if (!out) continue;
               const transport = report.get(out.transportId), pair = report.get(transport?.selectedCandidatePairId);
               const sender = pc.getSenders().find(s => s.track?.kind === "video");
-              return { out, source: report.get(out.mediaSourceId), pair, codec: report.get(out.codecId)?.mimeType, params: sender.getParameters(), track: sender.track.getSettings() };
+              return { out, source: report.get(out.mediaSourceId), pair, codec: report.get(out.codecId)?.mimeType, params: sender.getParameters(), track: sender.track.getSettings(), start: window.__screenStarts.get(pc) };
             }
             return {};
           });
@@ -319,7 +342,13 @@ try {
           const firstTarget = rows.find(full);
           const steadyFps = rows.find((r, i) => r.elapsed <= seconds - 5 && rows.slice(i).every(s => s.out?.framesPerSecond >= expectedFps * 0.85));
           const firstFiveFps = median(rows.filter(r => r.elapsed <= 5 && r.out?.framesPerSecond !== undefined).map(r => r.out.framesPerSecond));
+          const ceiling = Math.max(...rows.map(r => r.params?.encodings?.[0]?.maxBitrate ?? 0));
+          // Exclude the initial spec-cap write before the first estimate. A real ceiling write
+          // must also fit the uplink budget; a temporary allocation lift is not time-to-cap.
+          const capAt = rows.find(r => r.params?.encodings?.[0]?.maxBitrate === ceiling && uplinkVideoBudget(r.pair?.availableOutgoingBitrate ?? NaN) >= ceiling)?.elapsed ?? null;
           const result = { name, preset, uplink, sourceFps: +cadence.toFixed(1), captureFps: median(settled.map(r => r.source?.framesPerSecond ?? 0)), output: `${last.out.frameWidth}x${last.out.frameHeight}`, source: `${last.source?.width}x${last.source?.height}`, viewer: `${last.viewer?.width}x${last.viewer?.height}`, fps: median(settled.map(r => r.out.framesPerSecond)), decodeFps: +decodeFps.toFixed(1), payloadMbps: +(payload / 1e6).toFixed(3), availableMbps: +(median(settled.map(r => r.pair.availableOutgoingBitrate)) / 1e6).toFixed(3), stableAt: stable?.elapsed ?? null, stableDimensionsAt: stableDimensions?.elapsed ?? null, firstTargetAt: firstTarget?.elapsed ?? null, steadyFpsAt: steadyFps?.elapsed ?? null, firstFiveFps, pulses: rows.filter((r,i) => r.elapsed > 4 && r.params.degradationPreference === "maintain-resolution" && rows[i-1]?.params.degradationPreference === "maintain-framerate").length,
+            configuredStartMbps: last.start?.configured ? last.start.configured / 1e6 : null, firstEstimateMbps: last.start?.available ? last.start.available / 1e6 : null,
+            capAt,
             encoder: last.out.encoderImplementation, limitation: last.out.qualityLimitationReason, probes: allocationProbes(rows),
             encodedFps: +((last.out.framesEncoded - first.out.framesEncoded) / dt).toFixed(1),
             encodeMsPerFrame: +((last.out.totalEncodeTime - first.out.totalEncodeTime) * 1000 / Math.max(1, last.out.framesEncoded - first.out.framesEncoded)).toFixed(1) };

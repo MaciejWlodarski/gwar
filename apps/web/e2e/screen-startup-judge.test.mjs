@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { allocationProbes, cpuLimitedRows, encoderLoad, judgeSettled, probeBound } from "./screen-startup-judge.mjs";
+import { uplinkVideoBudget } from "../src/voice/screen-headroom.ts";
 
 const full = r => r.out?.frameWidth === 1920 && r.out?.frameHeight === 1080 && r.source?.width === 1920 && r.source?.height === 1080 && r.viewer?.width === 1920 && r.viewer?.height === 1080;
 
@@ -121,14 +122,14 @@ test("the viewer must decode the encoded size", () => {
 });
 
 test("allocation probes are counted apart from the headroom cap", () => {
-  // Headroom follows 70 % of the estimate and returns to the ceiling only once the estimate covers it.
-  const ramp = run({ at: t => ({ cap: t < 5 ? 8_000_000 : Math.min(8_000_000, 0.7 * t * 400_000), available: t * 400_000 }) });
+  // Both reserve branches, then the smooth ceiling write below the old 8 / 0.7 threshold.
+  const ramp = run({ at: t => ({ cap: t < 5 ? 8_000_000 : Math.min(8_000_000, uplinkVideoBudget(t * 400_000)), available: t * 400_000 }) });
   assert.equal(allocationProbes(ramp), 0);
-  // A lift writes the ceiling while 70 % of the estimate is below it.
-  const lifted = run({ available: 900_000, at: t => ({ cap: t < 1 || t === 20 || t === 40 ? 8_000_000 : 630_000 }) });
+  // A lift writes the ceiling while the reserve budget is below it.
+  const lifted = run({ available: 900_000, at: t => ({ cap: t < 1 || t === 20 || t === 40 ? 8_000_000 : 700_000 }) });
   assert.equal(allocationProbes(lifted), 2);
   // The start write is not a probe.
-  assert.equal(allocationProbes(run({ available: 900_000, at: t => ({ cap: t < 1 ? 8_000_000 : 630_000 }) })), 0);
+  assert.equal(allocationProbes(run({ available: 900_000, at: t => ({ cap: t < 1 ? 8_000_000 : 700_000 }) })), 0);
 });
 
 test("the probe bound follows the stale-estimate backoff", () => {
