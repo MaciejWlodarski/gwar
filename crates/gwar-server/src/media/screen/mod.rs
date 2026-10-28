@@ -106,10 +106,11 @@ const ALLOCATION_TICK: Duration = Duration::from_millis(100);
 /// failed, up to `RETRY_MAX`. The continuous-fit resume may come first.
 const RETRY_FIRST: Duration = Duration::from_secs(15);
 const RETRY_MAX: Duration = Duration::from_secs(120);
-/// Media flowing this long after a retry clears the viewer's failed retries.
+/// Media flowing this long without a break, with no slot paused for bandwidth, clears the
+/// viewer's failed retries.
 const RETRY_RESET: Duration = Duration::from_secs(60);
-/// A session's last proven estimate outlives its watch transport this long, at most
-/// `REMEMBERED` sessions.
+/// A connection's last proven estimate outlives its watch transport this long, at most
+/// `REMEMBERED` connections.
 const REMEMBER_FOR: Duration = Duration::from_secs(600);
 const REMEMBERED: usize = 4096;
 /// Pause and resume lines at info level: one per viewer this often, the rest counted.
@@ -390,6 +391,9 @@ pub enum ScreenCmd {
     /// member, [`GUEST_SLOTS`] for a TeamSpeak guest (whose id comes from the same space).
     Watch {
         session: SessionId,
+        /// The session's connection (the core's `since`): unique for the server's lifetime,
+        /// unlike a session id, which a later member or guest can get again.
+        connection: u64,
         run: u64,
         lease: Arc<Lease>,
         slots: usize,
@@ -674,14 +678,16 @@ struct Watcher {
     /// The last estimate this transport's link carried media at, and the one the session's
     /// previous transport left; an optimistic start takes the higher with the share's need.
     proven: Option<u64>,
+    /// The session's connection, which keys what its next transport remembers.
+    connection: u64,
     remembered: Option<u64>,
     /// The server-wide budget: no optimistic start goes above it.
     ceiling: u64,
     /// The next optimistic retry of a fully paused viewer, the retries that failed since media
-    /// last kept flowing, and the last one.
+    /// last kept flowing, and since when it has flowed with no slot paused for bandwidth.
     retry_at: Option<Instant>,
     retries: u32,
-    retried: Option<Instant>,
+    healthy_since: Option<Instant>,
     /// The last info-level pause or resume line, and the lines left out since.
     logged: Option<Instant>,
     unlogged: u32,
@@ -809,8 +815,8 @@ struct Sfu {
     decode_reports: HashMap<(SessionId, String), Instant>,
     /// The allocation tick's rates, also used by cold-viewer keyframe admission.
     rates: HashMap<String, ShareRate>,
-    /// Each session's last proven watch estimate, from its previous transport, and when.
-    remembered: HashMap<SessionId, (u64, Instant)>,
+    /// Each connection's last proven watch estimate, from its previous transport, and when.
+    remembered: HashMap<u64, (u64, Instant)>,
     publishers: HashMap<String, Publisher>,
     watchers: HashMap<SessionId, Watcher>,
     next_id: u64,
@@ -961,7 +967,7 @@ impl Sfu {
                 }
             }
             ScreenCmd::EndPublish { share } => self.end_publish(&share),
-            ScreenCmd::Watch { session, run, lease, slots, sdp, browser, h264, av1, reply } => {
+            ScreenCmd::Watch { session, connection, run, lease, slots, sdp, browser, h264, av1, reply } => {
                 if reply.is_closed() || !lease.alive() {
                     return;
                 }
@@ -974,9 +980,10 @@ impl Sfu {
                 let caps = Caps { browser, h264: &h264, av1 };
                 match watcher(id, session, run, lease, slots, &sdp, caps, self.advertise, now) {
                     Ok((mut watcher, answer)) => {
+                        watcher.connection = connection;
                         watcher.remembered = self
                             .remembered
-                            .get(&session)
+                            .get(&connection)
                             .filter(|(_, at)| now.saturating_duration_since(*at) < REMEMBER_FOR)
                             .map(|(estimate, _)| *estimate);
                         watcher.ceiling = self.shared.budget_bps.load(Ordering::Relaxed);
@@ -2137,22 +2144,22 @@ impl Sfu {
             w.rtc.disconnect();
             self.owners.forget(Owner::Watch(w.id));
             if let Some(estimate) = w.proven {
-                self.remember(session, estimate, now);
+                self.remember(w.connection, estimate, now);
             }
         }
     }
 
-    /// Keeps a session's last proven estimate for its next watch transport; bounded in time
+    /// Keeps a connection's last proven estimate for its next watch transport; bounded in time
     /// and count, the oldest going first.
-    fn remember(&mut self, session: SessionId, estimate: u64, now: Instant) {
+    fn remember(&mut self, connection: u64, estimate: u64, now: Instant) {
         self.remembered.retain(|_, (_, at)| now.saturating_duration_since(*at) < REMEMBER_FOR);
         if self.remembered.len() >= REMEMBERED
-            && !self.remembered.contains_key(&session)
-            && let Some(oldest) = self.remembered.iter().min_by_key(|(_, (_, at))| *at).map(|(s, _)| *s)
+            && !self.remembered.contains_key(&connection)
+            && let Some(oldest) = self.remembered.iter().min_by_key(|(_, (_, at))| *at).map(|(c, _)| *c)
         {
             self.remembered.remove(&oldest);
         }
-        self.remembered.insert(session, (estimate, now));
+        self.remembered.insert(connection, (estimate, now));
     }
 }
 
@@ -2417,8 +2424,10 @@ fn allocate(
         }
         apply(w, slot, change);
         if change == Change::Pause(ScreenPauseReason::Bandwidth) {
-            // The link did not carry it: nothing about this estimate is proven any more.
+            // The link did not carry it: nothing about this estimate is proven any more, and
+            // a later resume starts the clock that clears failed retries over.
             w.proven = None;
+            w.healthy_since = None;
         }
         return Some((slot, change));
     }
@@ -2427,9 +2436,10 @@ fn allocate(
             w.restarted = None;
         }
         w.retry_at = None;
-        if w.retried.is_some_and(|at| now.saturating_duration_since(at) >= RETRY_RESET) {
+        if !w.egress.healthy() {
+            w.healthy_since = None;
+        } else if now.saturating_duration_since(*w.healthy_since.get_or_insert(now)) >= RETRY_RESET {
             w.retries = 0;
-            w.retried = None;
         }
         return None;
     }
@@ -2438,6 +2448,7 @@ fn allocate(
     // A link that still cannot carry it backs off on its own feedback and pauses again within
     // seconds; the continuous-fit resume can still come first. Existing socket credit is
     // never minted, and a continuous-fit timer in progress finishes first.
+    w.healthy_since = None;
     let backoff = RETRY_FIRST.saturating_mul(1 << w.retries.min(8)).min(RETRY_MAX);
     let at = *w.retry_at.get_or_insert(now + backoff);
     if now < at || w.egress.fitting() || !probe_ready {
@@ -2479,7 +2490,7 @@ fn retry(w: &mut Watcher, slot: usize, rates: &HashMap<String, ShareRate>, now: 
     start_optimistic(w, slot, rates, now);
     w.restarted = Some(now);
     w.retry_at = None;
-    w.retried = Some(now);
+    w.healthy_since = None;
 }
 
 /// Keep queue admission and transport pacing on the same estimate.
@@ -3038,11 +3049,12 @@ fn watcher(
         desired: None,
         restarted: None,
         proven: None,
+        connection: 0,
         remembered: None,
         ceiling: u64::MAX,
         retry_at: None,
         retries: 0,
-        retried: None,
+        healthy_since: None,
         logged: None,
         unlogged: 0,
         deadline: now,
@@ -3147,21 +3159,27 @@ pub(crate) mod tests {
         repairs: usize,
     }
 
+    /// A viewer's client and its offer of a watch transport.
+    fn viewer_offer(now: Instant) -> (Rtc, SdpOffer, str0m::change::SdpPendingOffer) {
+        let mut client = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp9(true).build(now);
+        client.add_local_candidate(Candidate::host(addr(5000), "udp").unwrap());
+        // str0m's random mids can collide within one offer: redraw.
+        loop {
+            let mut api = client.sdp_api();
+            let mids: HashSet<Mid> = (0..SCREEN_SLOTS)
+                .map(|_| api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None))
+                .collect();
+            if mids.len() == SCREEN_SLOTS {
+                let (offer, pending) = api.apply().unwrap();
+                return (client, offer, pending);
+            }
+        }
+    }
+
     impl Pair {
         fn new() -> Self {
             let now = Instant::now();
-            let mut client = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp9(true).build(now);
-            client.add_local_candidate(Candidate::host(addr(5000), "udp").unwrap());
-            // str0m's random mids can collide within one offer: redraw.
-            let (offer, pending) = loop {
-                let mut api = client.sdp_api();
-                let mids: HashSet<Mid> = (0..SCREEN_SLOTS)
-                    .map(|_| api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None))
-                    .collect();
-                if mids.len() == SCREEN_SLOTS {
-                    break api.apply().unwrap();
-                }
-            };
+            let (mut client, offer, pending) = viewer_offer(now);
             let (w, answer) = watcher(
                 1,
                 7,
@@ -3394,11 +3412,72 @@ pub(crate) mod tests {
         sfu.remember(1, 9_000_000, now);
         sfu.remember(2, 9_000_000, now + REMEMBER_FOR);
         assert!(!sfu.remembered.contains_key(&1), "expired");
-        for session in 3..3 + REMEMBERED as SessionId {
-            sfu.remember(session, 9_000_000, now + REMEMBER_FOR + Duration::from_millis(session.into()));
+        for connection in 3..3 + REMEMBERED as u64 {
+            sfu.remember(connection, 9_000_000, now + REMEMBER_FOR + Duration::from_millis(connection));
         }
         assert_eq!(sfu.remembered.len(), REMEMBERED);
         assert!(!sfu.remembered.contains_key(&2), "the oldest goes first");
+    }
+
+    #[test]
+    fn only_a_minute_of_unbroken_flow_clears_failed_retries() {
+        let mut pair = Pair::new();
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
+        assign(&mut pair.w, 0, WatchGrant::new(origin), 1, pair.now);
+        let tick = |pair: &mut Pair, duration: Duration| {
+            for _ in 0..duration.as_millis() / ALLOCATION_TICK.as_millis() {
+                pair.now += ALLOCATION_TICK;
+                assert_eq!(allocate(&mut pair.w, pair.now, &HashMap::new(), false), None);
+            }
+        };
+        tick(&mut pair, Duration::from_secs(1));
+        // Three retries failed, then the link paused for long; a resume says nothing yet.
+        pair.w.retries = 3;
+        // As `allocate` does with each bandwidth pause it makes.
+        apply(&mut pair.w, 0, Change::Pause(ScreenPauseReason::Bandwidth));
+        pair.w.healthy_since = None;
+        pair.now += Duration::from_secs(600);
+        apply(&mut pair.w, 0, Change::Resume);
+        tick(&mut pair, RETRY_RESET - ALLOCATION_TICK);
+        assert_eq!(pair.w.retries, 3);
+        // A pause breaks the minute; flow after it counts from its resume.
+        apply(&mut pair.w, 0, Change::Pause(ScreenPauseReason::Bandwidth));
+        tick(&mut pair, ALLOCATION_TICK);
+        apply(&mut pair.w, 0, Change::Resume);
+        tick(&mut pair, RETRY_RESET);
+        assert_eq!(pair.w.retries, 3);
+        tick(&mut pair, ALLOCATION_TICK);
+        assert_eq!(pair.w.retries, 0);
+    }
+
+    #[tokio::test]
+    async fn a_remembered_estimate_follows_its_connection_not_a_recycled_session_id() {
+        let (mut sfu, _, _, _) = recovery_fixture(&[]).await;
+        fn watch(sfu: &mut Sfu, connection: u64, run: u64) -> &mut Watcher {
+            let (_client, offer, _) = viewer_offer(Instant::now());
+            let (reply, mut rx) = oneshot::channel();
+            sfu.command(ScreenCmd::Watch {
+                session: 7,
+                connection,
+                run,
+                lease: Lease::new(),
+                slots: SCREEN_SLOTS,
+                sdp: offer.to_sdp_string(),
+                browser: false,
+                h264: Vec::new(),
+                av1: None,
+                reply,
+            });
+            assert!(rx.try_recv().unwrap().is_ok(), "the watch is accepted");
+            sfu.watchers.get_mut(&7).unwrap()
+        }
+        // The connection's first transport carried 30 Mbps; its replacement starts from there.
+        watch(&mut sfu, 100, 1).proven = Some(30_000_000);
+        assert_eq!(watch(&mut sfu, 100, 2).remembered, Some(30_000_000));
+        // It disconnects, and another member or guest gets session id 7 again.
+        sfu.end_watch(7, Instant::now());
+        assert_eq!(watch(&mut sfu, 101, 1).remembered, None);
+        assert_eq!(sfu.remembered.get(&100).map(|(estimate, _)| *estimate), Some(30_000_000));
     }
 
     #[test]

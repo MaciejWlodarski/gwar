@@ -99,7 +99,8 @@ export class ScreenController {
   /** A receiver that carried a share can still hold its last decoded frame. */
   private readonly usedSlots = new Set<number>();
   /** Owned by the grant, not by a stage/thumbnail video that can remount. */
-  private readonly firstFrameTimers = new Map<number, { run: number; timer: ReturnType<typeof setTimeout> }>();
+  /** Each granted watch still waiting for its first frame; no timer while the server pauses it. */
+  private readonly firstFrameTimers = new Map<number, { run: number; timer: ReturnType<typeof setTimeout> | null }>();
   private attempts = 0;
   private watchIds = 0;
   /** Each share's watch requests, one at a time. */
@@ -434,8 +435,24 @@ export class ScreenController {
 
   private clearFirstFrame(id: number): void {
     const pending = this.firstFrameTimers.get(id);
-    if (pending) clearTimeout(pending.timer);
+    if (pending?.timer) clearTimeout(pending.timer);
     this.firstFrameTimers.delete(id);
+  }
+
+  /**
+   * A paused share sends nothing, so its first frame cannot be late: the wait stops while the
+   * server holds it back and starts over when it resumes, however long the pause.
+   */
+  private holdFirstFrame(share: string, paused: boolean): void {
+    const watch = useScreen.getState().watches.find(w => w.share === share && w.status === "watching");
+    const pending = watch && this.firstFrameTimers.get(watch.id);
+    if (!watch || !pending) return;
+    if (paused) {
+      if (pending.timer) clearTimeout(pending.timer);
+      this.firstFrameTimers.set(watch.id, { ...pending, timer: null });
+    } else if (!pending.timer && pending.run === useScreen.getState().transport.run) {
+      this.expectFirstFrame(share, pending.run, watch.id);
+    }
   }
 
   /** A warm receiver can need a keyframe for its newly initialized media player. */
@@ -564,7 +581,7 @@ export class ScreenController {
    * also cancels its connection timeout, so nothing else would ever settle that wait.
    */
   private dropTransport(): void {
-    for (const { timer } of this.firstFrameTimers.values()) clearTimeout(timer);
+    for (const { timer } of this.firstFrameTimers.values()) if (timer) clearTimeout(timer);
     this.firstFrameTimers.clear();
     this.transport?.close();
     this.usedSlots.clear();
@@ -599,9 +616,11 @@ export class ScreenController {
         return;
       case "screen.paused":
         dispatch({ type: "paused", share: event.d.share, reason: event.d.reason });
+        this.holdFirstFrame(event.d.share, true);
         return;
       case "screen.resumed":
         dispatch({ type: "resumed", share: event.d.share });
+        this.holdFirstFrame(event.d.share, false);
         return;
       case "screen.viewers":
         dispatch({ type: "viewers", share: event.d.share, members: event.d.members, guests: event.d.guests });

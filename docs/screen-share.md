@@ -1918,10 +1918,12 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
 - **Proven estimates.** The last TWCC estimate a transport reported while a
   slot carried media past its ramp, with none paused for bandwidth, is its
   proven estimate; a bandwidth pause forgets it. When the transport ends, the
-  server keeps it in memory for the session for 10 minutes (at most 4096
-  sessions, the oldest dropped first), and the session's next watch transport
-  starts from the higher of it and the share's start estimate. Clients report
-  no estimate of their own.
+  server keeps it in memory for 10 minutes (at most 4096, the oldest dropped
+  first), keyed by the session's connection rather than its session id, and
+  that connection's next watch transport (a new `run`) starts from the higher
+  of it and the share's start estimate. A new connection starts without it,
+  whether a reconnect or another member or guest given a recycled session id
+  (they wrap at 65,535). Clients report no estimate of their own.
 - **Ramp.** A slot that starts carrying a share is not paused for its first
   10 s; failed keyframes and averages start counting after that. Even an
   optimistic start usually backs off once, on a coarse scheduler cadence's
@@ -1954,19 +1956,27 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   loss feedback can cut it tenfold, and at 0.1–1 Mbps the extras reserve
   (64 KB at a tenth of the estimate) lets the probing target rise 1.5× only
   every 5–30 s. Waiting for probing to reach the resume threshold could take
-  minutes; production never got there (below). So 15 s after such a viewer's
-  pause, doubling with each retry that failed up to 120 s, the SFU resumes its
-  most important bandwidth-paused slot from an optimistic start, once the
-  reserve is ready. A link that still cannot carry it backs off and pauses
-  again on the rules above; one that can keeps it. Media flowing 60 s after a
-  retry forgets the failed ones. The continuous-fit resume still applies, and
-  may come first.
+  minutes; production never got there (below). So such a viewer's most
+  important bandwidth-paused slot resumes from an optimistic start
+  `15 s × 2^n` after the viewer became fully paused, at most 120 s, where `n`
+  counts its earlier retries: 15, 30, 60, then 120 s. A due retry waits for
+  the reserve to be ready and for no continuous-fit timer to be running. A
+  link that still cannot carry it backs off and pauses again on the rules
+  above; one that can keeps it. The count goes back to zero only after 60 s
+  of unbroken flow: some slot carrying media and none paused for bandwidth.
+  Any bandwidth pause, or a retry, restarts that minute, so a resume after a
+  long pause does not forget earlier failures. The continuous-fit resume
+  still applies, and may come first.
 - The viewer sees "Your connection is too slow for this share right now"
   over the last frame of a paused share, with a Try again button (one ask per
   5 s, and throttled as above), or that the server is making room for a
   budget pause; a card shows "Paused", and so does the quality badge instead
-  of the last resolution at 0 fps. Try again on a fully paused viewer is a
-  retry from an optimistic start.
+  of the last resolution at 0 fps. Try again on a fully paused viewer
+  retries that share from an optimistic start at once; it does not add to
+  `n`. While the server pauses a share, the client's 35 s wait for a
+  granted share's first frame stops, and starts over in full on
+  `screen.resumed`, so a watch paused before its first frame decodes is not
+  dropped while its link may still improve.
 - **Logs.** Each pause and resume is logged at info level, at most one line
   per viewer every 10 s (with the count of lines left out): the reason, its
   trigger (`average`, `keyframes`, `extras`, `priority` or `budget`), the
@@ -2962,7 +2972,9 @@ from native capture is PR 10.
     also for VP9, older servers, or a reused player without frame callbacks.
     The controller owns this deadline per run/watch ID: switching the stage or
     remounting a video cannot restart it. Only that grant's first frame, unwatch, server
-    release/stop, or transport retirement clears it. Rapid
+    release/stop, or transport retirement clears it. A server pause
+    (`screen.paused`) suspends it, since a paused share sends nothing, and
+    `screen.resumed` starts a full 35 s again for the same run. Rapid
     sole-watch reuse can hit the existing offer rate limit and its bounded retry
     delay.
   - No sound in the first release; phase 2 adds a volume slider and mute per

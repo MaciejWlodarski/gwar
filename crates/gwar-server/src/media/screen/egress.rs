@@ -457,6 +457,12 @@ impl Egress {
     }
 
     /// Any slot other than `lane` carries media.
+    /// Some slot carries media and none is paused for bandwidth.
+    pub fn healthy(&self) -> bool {
+        self.lanes.iter().any(|l| l.active())
+            && self.lanes.iter().all(|l| l.paused != Some(ScreenPauseReason::Bandwidth))
+    }
+
     pub fn others_active(&self, lane: usize) -> bool {
         self.lanes.iter().enumerate().any(|(i, l)| i != lane && l.active())
     }
