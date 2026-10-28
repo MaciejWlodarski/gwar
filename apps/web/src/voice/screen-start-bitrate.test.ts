@@ -83,12 +83,12 @@ describe("screen answer start hint", () => {
     expect(withScreenStartBitrate(answer, 4_000_000, userAgent, "MacIntel")).toContain("x-google-start-bitrate=4000");
   });
   it.each([
-    ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 Version/60.5 Safari/605.1.15", false],
-    ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153.0.0.0 Safari/537.36", true],
-    ["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15", true],
-  ])("keeps WebKitGTK's answer compatible while enabling Chromium and native WKWebView: %s", (userAgent, enabled) => {
+    ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 Version/60.5 Safari/605.1.15", false, "Linux x86_64"],
+    ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153.0.0.0 Safari/537.36", true, "Linux x86_64"],
+    ["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15", true, "MacIntel"],
+  ])("keeps WebKitGTK's answer compatible while enabling Chromium and native WKWebView: %s", (userAgent, enabled, platform) => {
     const answer = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP9/90000\r\na=fmtp:96 profile-id=0\r\n";
-    const result = withScreenStartBitrate(answer, 4_000_000, userAgent);
+    const result = withScreenStartBitrate(answer, 4_000_000, userAgent, platform);
     if (enabled) expect(result).toContain("profile-id=0;x-google-start-bitrate=4000");
     else expect(result).toBe(answer);
   });
