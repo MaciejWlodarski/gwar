@@ -33,7 +33,7 @@ useSession.setState({ ...initialState, kind: "gwar", phase: "online", rtt: conge
   me: { session: 1, uid: "local-fixture" }, permissions: ["speak", "screen_share"],
   server: { name: "Gwar", welcome: "", version: "local", default_channel: 1, max_clients: 10, upload_limit: 0, file_access: "link", teamspeak: false, screen_guest_links: false, server_chat: { encrypted: false, history: false } },
   clients: { 1: { id: 1, uid: "local-fixture", nickname: "Maciej", channel: 1, groups: [], platform: "web", muted: false, deafened: false, away: null, talking: false, voice: true, voice_binding: null } },
-  channels: { 1: { id: 1, parent: null, name: "Rozmowy", topic: "", position: 0, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false } },
+  channels: { 1: { id: 1, parent: null, name: query.has("long") ? "Bardzo długa nazwa kanału ".repeat(8) : "Rozmowy", topic: "", position: 0, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false } },
 });
 useScreen.setState({ ...initialScreen, own: mode === "screen" ? { phase: "live", attempt: 1, share: "local", stream: null, surface: "screen", spec: { height: 1080, fps: 30, mode: "sharp" }, viewers: 2, guests: 0, guestLink: false, preview: false } : null });
 controller.screen.ownStats = async () => ({ width: 1920, height: 1080, fps: 30, bitrate: congested ? 900_000 : 4_000_000, limitation: congested ? "bandwidth" : "none", codec: "H264", encoder: "VideoToolbox", hardware: true });

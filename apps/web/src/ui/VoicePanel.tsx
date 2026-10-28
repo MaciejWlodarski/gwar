@@ -279,7 +279,7 @@ export function VoicePill() {
     >
       <div className="min-w-0">
         <Tooltip label={t("voice.pillOpen")}>
-          <button onClick={showVoiceChannel} className="t min-w-0 cursor-pointer rounded-md px-1.5 py-0.5 text-left leading-tight hover:bg-hover md:max-w-64">
+          <button onClick={showVoiceChannel} className="t min-w-0 max-w-full cursor-pointer rounded-md px-1.5 py-0.5 text-left leading-tight hover:bg-hover md:max-w-64">
             <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium">
               <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone, status.tone === "warn" && "animate-pulse")} />
               <span className={cn("truncate", tone)}>{status.text}</span>

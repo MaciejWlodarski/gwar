@@ -45,6 +45,12 @@ try {
         await target.screenshot({ path: path.join(output, `${view}-${state}-help-pl-${device}.png`) });
       }
     }
+    // The pill's extra warning wrapper must preserve truncation for real long names.
+    for (const state of ["normal", "congested"]) {
+      await page.goto(`${base}/e2e/uplink.html?view=pill&state=${state}&long=1`);
+      await page.getByRole("region", { name: "Połączenie głosowe" }).waitFor();
+      assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `long pill/${state}/${device} overflows`);
+    }
     assert.deepEqual(errors, []);
     await context.close();
   }
