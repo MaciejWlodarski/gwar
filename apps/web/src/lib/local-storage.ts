@@ -1,6 +1,6 @@
 /**
- * The settings (`gwar.settings`, zustand `persist`): preferences and bookmarks, the only thing the app
- * keeps in localStorage (docs/data-migrations.md). They carry their own version (zustand's `version`),
+ * The settings (`gwar.settings`, zustand `persist`): preferences and bookmarks in localStorage
+ * (docs/data-migrations.md). They carry their own version (zustand's `version`),
  * upgraded as they are read (`migrate`). Settings of a newer version are neither read nor written:
  * every write first reads the stored version again, and the `storage` event tells open tabs at once.
  *

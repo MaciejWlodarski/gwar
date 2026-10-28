@@ -14,14 +14,13 @@ import type { ScreenRecovery } from "../proto/ScreenRecovery";
 import type { IceServer } from "../proto/IceServer";
 import { deriveSpec, resolveQuality, type ScreenSpec, type ResolvedSpec } from "./screen-quality";
 import type { ScreenSurface } from "../proto/ScreenSurface";
+import { uplinkVideoBudget } from "./screen-headroom";
+import { screenStartBitrate, ScreenUplinkHistory, withScreenStartBitrate } from "./screen-start-bitrate";
+export { MIN_BITRATE } from "./screen-headroom";
 
 /** Receive slots of a watch transport (`gwar_proto::SCREEN_SLOTS`). */
 export const SCREEN_SLOTS = 4;
 
-/** The share of the uplink estimate video may use; the rest stays for voice and repairs. */
-export const UPLINK_SHARE = 0.7;
-/** Below this the headroom rule stops lowering the cap: an estimate that low recovers by probing. */
-export const MIN_BITRATE = 250_000;
 const HEADROOM_INTERVAL_MS = 2_000;
 /** A lift's cap must be back this long after the lift (writes rejected or stuck in the queue), or the transport ends. */
 const RESTORE_DEADLINE_MS = 10_000;
@@ -39,7 +38,7 @@ function surfaceFromSettings(settings?: MediaTrackSettings): ScreenSurface {
 /** The video bitrate cap under the sharer's own uplink estimate (docs/screen-share.md, "Voice headroom"). */
 export function headroomBitrate(cap: number, available: number | null | undefined): number {
   if (!available || !Number.isFinite(available) || available <= 0) return cap;
-  return Math.min(cap, Math.max(MIN_BITRATE, Math.floor(UPLINK_SHARE * available)));
+  return Math.min(cap, uplinkVideoBudget(available));
 }
 
 interface EncoderQuality {
@@ -132,7 +131,7 @@ export class StuckCaptureGuard {
     const outputPixels = sample.width * sample.height;
     const continuous = this.last !== null && now - this.last <= HEADROOM_INTERVAL_MS * 2.25;
     const cadence = Math.max(15, sample.fps);
-    const budget = Math.min(sample.available * UPLINK_SHARE, sample.targetBitrate);
+    const budget = Math.min(uplinkVideoBudget(sample.available), sample.targetBitrate);
     const currentPixels = outputPixels || sample.sourceWidth * sample.sourceHeight;
     // Price the next step, never the full retained ceiling: a stale 1080p
     // observation must not lock out an affordable 720p recovery indefinitely.
@@ -187,7 +186,7 @@ export class StuckCaptureGuard {
     const bpp = useQp ? 0.04 : Math.max(0.04, currentPixels > 0 ? sample.bitrate / (currentPixels * cadence) : Infinity);
     const needed = largerPixels * cadence * bpp * 1.5;
     const healthy = !this.outcome && sample.limitation !== "cpu" && sample.fps > 0 && pixels > 0 &&
-      Number.isFinite(needed) && Number.isFinite(sample.available) && Number.isFinite(sample.targetBitrate) && Math.min(sample.available * UPLINK_SHARE, sample.targetBitrate) >= needed;
+      Number.isFinite(needed) && Number.isFinite(sample.available) && Number.isFinite(sample.targetBitrate) && budget >= needed;
     if (!healthy || !(small(sample.width, sample.height) || small(sample.sourceWidth, sample.sourceHeight))) {
       this.since = null;
     } else {
@@ -249,11 +248,10 @@ export class StaleEstimateProbe {
     // The encoder sends a smaller size for want of bitrate, the estimate holds back the cap, and
     // the share sends well under the estimate (application-limited, where Chromium's allocation
     // probe applies).
-    const stalled = valid && sample.undersized && sample.limitation === "bandwidth" && UPLINK_SHARE * available < cap && bitrate < available * 0.5;
+    const stalled = valid && sample.undersized && sample.limitation === "bandwidth" && uplinkVideoBudget(available) < cap && bitrate < available * 0.5;
     if (!stalled) { this.since = null; return false; }
-    // An estimate still growing on its own needs no probe.
-    if (!continuous || this.since === null || available > this.base * 1.1) { this.since = now; this.base = available; return false; }
-    this.base = Math.min(this.base, available);
+    // Growth needs no probe; a fall may be GCC backing off an optimistic start.
+    if (!continuous || this.since === null || available > this.base * 1.1 || available < this.base * 0.9) { this.since = now; this.base = available; return false; }
     if (now - this.since < this.wait) return false;
     this.since = now; this.base = available; this.probedFrom = available;
     this.wait = Math.min(300_000, this.wait * 2);
@@ -606,8 +604,8 @@ export interface PublishParams {
 
 /**
  * One share's publish transport: a `sendonly` video m-line with RTX, closed with the share.
- * The bitrate is the resolved spec's cap, lowered to `UPLINK_SHARE` of the transport's own outgoing
- * estimate when that is lower; video is marked low priority so voice keeps the default.
+ * The bitrate is the resolved spec's cap, lowered to the transport's outgoing estimate minus
+ * the voice/repair reserve when that is lower; video is low priority so voice keeps the default.
  */
 export class ScreenPublisher {
   private pc: RTCPeerConnection | null = null;
@@ -646,6 +644,7 @@ export class ScreenPublisher {
   private readonly superseded = new Set<RTCPeerConnection>();
   /** The latest uplink estimate, for the cap a probe restores. */
   private available: number | undefined;
+  private uplinkHistory = new ScreenUplinkHistory(performance.now());
   private run = 0;
   private revision = 0;
   private parameters: Promise<void> = Promise.resolve();
@@ -702,7 +701,8 @@ export class ScreenPublisher {
     if (!ssrcs) throw new Error("the publish offer has no video stream with RTX");
     const answer = await this.params.offer({ ...ssrcs, sdp });
     if (this.closed || this.pc !== pc) return;
-    await pc.setRemoteDescription({ type: "answer", sdp: answer });
+    // Resolve the latest spec after signalling, including edits made while the answer was pending.
+    await pc.setRemoteDescription({ type: "answer", sdp: withScreenStartBitrate(answer, screenStartBitrate(this.spec().maxBitrate)) });
     if (this.closed || this.pc !== pc) return;
     this.stopWatching = watchState(pc, s => this.params.state(s), () => this.pc === pc);
     // The latest quality: `setSpec` may have run while this negotiated.
@@ -710,6 +710,7 @@ export class ScreenPublisher {
     await this.applyParameters(this.spec().maxBitrate);
     if (this.closed || this.pc !== pc) return;
     this.negotiated = true;
+    this.uplinkHistory = new ScreenUplinkHistory(performance.now());
   }
 
   /** Changes quality while sharing, with no renegotiation. */
@@ -803,6 +804,8 @@ export class ScreenPublisher {
       codec = out?.codecId ? stats.get(out.codecId)?.mimeType as string | undefined : undefined;
     } catch { return; }
     this.watchAv1(out, codec);
+    // Fresh estimates from this transport only; allocation lifts cannot train the next start.
+    this.uplinkHistory.observe(performance.now(), pc.connectionState !== "connected" || this.probeTimer || this.restoring ? undefined : guardAvailable);
     const spec = this.spec();
     const target = headroomBitrate(spec.maxBitrate, available);
     const previous = this.adaptationSent;

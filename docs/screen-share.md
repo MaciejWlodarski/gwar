@@ -462,8 +462,8 @@ An interrupted attempt still consumes its allowance.
 For a resolved `maintain-framerate` spec, the guard can reset Chromium's pending
 capture adaptation with a one-second `maintain-resolution` pulse, then restore the
 current spec using fresh sender parameters. It requires six continuous seconds of
-undersize, no CPU limitation, and both the encoder target and 70% of a fresh outgoing
-estimate above `larger pixels × max(15, source fps) × bpp × 1.5` bits/s. The target,
+undersize, no CPU limitation, and both the encoder target and the fresh outgoing
+estimate after the voice/repair reserve above `larger pixels × max(15, source fps) × bpp × 1.5` bits/s. The target,
 cadence and cap come from the live resolved spec, including effective codec-recovery
 limits. The retained settings target cannot exclude attempts toward that spec (L1).
 Any positive output below the spec is eligible. The larger step is capped at the
@@ -555,19 +555,19 @@ above its estimate at startup, every few seconds for screen content (the sharp m
 application-limited. A smooth share of sparse content gets none of these: when a
 briefly busy uplink holds the startup probe to about 1 Mb/s, the estimate never moves
 again, the encoder target stays below what a larger size needs, and the share stays
-at 480×270 even after the uplink frees. The 70 % headroom cap keeps the allocation
+at 480×270 even after the uplink frees. The headroom cap keeps the allocation
 below the estimate, so allocation probes never fire either. CI run `40370486469`
 showed exactly this (1.14 Mb/s for the whole minute on loopback), and locally a
 1 Mb/s uplink for the first 8 s left four of six fresh shares at 480×270.
 
 `StaleEstimateProbe` runs for smooth shares only (the sharp mode already gets
 Chromium's periodic probes). It watches for an encoder that is smaller than the capture
-target, limited by `bandwidth`, under a cap that 70 % of the estimate holds back,
+target, limited by `bandwidth`, under a cap that the reserve budget holds back,
 while sending less than half the estimate. The sending rate comes only from deltas of
 the same outbound stream, encoder and codec, with bytes, frames and timestamps all
 advancing; a missing or reset counter, a replaced outbound stream or an encoder or
 codec change (such as the AV1 → H.264 retirement) restarts the wait. After ten seconds
-without the estimate growing more than 10 %, the publisher lifts `maxBitrate` to the
+without the estimate moving more than 10 % in either direction, the publisher lifts `maxBitrate` to the
 spec's cap for one second: Chromium probes (up to twice its estimate, further while
 probes succeed), then the headroom cap returns at the latest estimate. The degradation
 preference does not change. A lift carries its own deadline and generation, so a lift
@@ -609,23 +609,51 @@ codec and VP9 only its recovery fallback, so the CI step asserts H.264 and recor
 VP9's resolution; a VP9 share must still keep its capture and encode cadence, and the
 viewer must decode its smaller output.
 
-*Design trade-off: headroom slows the ramp of dense content.* A share that fills its
-cap sends about 70 % of the estimate, and GCC may raise its estimate only to 1.5× the
-acknowledged rate: across 162 CI busy H.264 shares the estimate sat at 1.58× the
-transport's send rate (median of each share's median; 1.57–1.62 for the middle 80 %).
-Each cap write therefore lets the estimate grow by about 12 %. The cap may move every
-2 s poll when the target changes by more than 10 %, but in the measured runs it moved
-about every second poll (4 s), so a busy share gained about 3 % per second instead of
-GCC's 8 %. Locally, busy H.264
-needs 23–28 s for the estimate to reach the 11.4 Mb/s at which the 8 Mb/s cap stops
-binding (median 24.8 s), against about 12 s without the headroom rule. Writing the
-cap more often did not help in these runs: after almost every `maxBitrate` write
-Chromium set the encoder target to exactly 1/1.2 of the new cap for about a second
-(944 of 949 upward writes in CI, 112 of 112 locally), which cancels the gain. On the runner OpenH264 meanwhile adapts down
-at 1440×810 or 960×540 (docs/screen-startup-validation.md, "Busy H.264 ramp"), and it
-can take until the estimate passes about 12 Mb/s (up to 60 s) to return to 1080p. The
-probe cannot help: the stream is not application-limited, so Chromium does not probe.
-The 30 % is kept deliberately for voice and repairs on a congested uplink.
+*Design trade-off: headroom slows the ramp of dense content.* The old 70 % share
+limited GCC's own growth: GCC raises its estimate only to about 1.5× acknowledged
+traffic. Across 162 historical CI busy H.264 shares the estimate was 1.58× the
+transport's send rate (median of each share's median). Cap writes then bought only
+about 12 % more estimate, often four seconds apart. Writing smaller moves more often
+did not help: Chromium temporarily reduced the encoder target after almost every write.
+The owner's 28 October 1440p60 dump started at 1.6 Mb/s and took about 75 s to reach
+the 12 Mb/s cap, on a path reported as loss-free with 30–45 ms RTT.
+
+The sender now subtracts `max(200 kb/s, 10 % of available)` instead ("Voice headroom"
+below). Above 2 Mb/s it can use 90 % of the estimate, allowing GCC to grow without
+the old 70 % feedback bottleneck. Below that it leaves a fixed 200 kb/s, down to the
+existing 250 kb/s video floor. This replaces the pending proposal to raise only the
+startup share to 85 %; there is one reserve rule throughout the publish lifecycle.
+The normal two-second poll and 10 % write dead band remain, including the smooth-mode
+exception that writes the full spec cap once the reserve budget covers it. The probe
+still handles sparse, stale estimates; dense content normally needs no allocation lift.
+Local before/after timings and the remaining voice-measurement limits are recorded in
+docs/screen-startup-validation.md, "Busy H.264 ramp".
+
+**Optimistic sender start.** Before applying a publish transport's remote answer,
+the web sender adds `x-google-start-bitrate=<kbps>` to every H.264, AV1 and VP9
+payload's fmtp, creating a line when absent and preserving codec parameters and RTX.
+This is an initial GCC estimate, not `x-google-min-bitrate`: loss/delay response and
+the ordinary headroom cap can reduce it immediately. Watch and voice answers are unchanged.
+The latest resolved spec (including an edit during signalling) bounds the hint.
+
+With no history it starts at `min(spec cap, 4 Mb/s)`. Four Mb/s covers the default
+1080p30 budget and avoids climbing from Chromium's roughly 300 kb/s default, while
+limiting the initial overshoot compared with always starting at the 12 Mb/s ceiling.
+With history it starts at `min(spec cap, max(1 Mb/s, 0.8 × remembered uplink))`.
+The 20 % discount allows some variation between shares; the hint can still be wrong
+after a network change, so it never imposes a minimum rate.
+
+`gwar.screen-uplink.v1` in localStorage is one JSON number in bits/s, local to the
+device/browser profile and origin. It is a disposable hint with no migration; malformed
+values, blocked reads and failed writes do not prevent sharing. Once a transport has
+run twenty seconds, fresh samples from its last ten seconds may update the value:
+the median, only when the maximum is within 25 % of the minimum. Missing samples,
+gaps over 4.5 s and allocation probes discard the window. A replacement transport
+starts a new twenty-second history, and existing transport/generation checks reject
+late stats. A falling estimate also resets the stale-probe wait after a 10 % move,
+so an optimistic overshoot cannot accumulate a probe while GCC backs off. Probe
+generation fencing, retiring restores and the independent ten-second restore deadline
+remain in force.
 
 `pnpm --filter web e2e:screen-startup` checks repeated fresh real-tab publishes
 with a sparse 20 fps barcode and busy 1080p60 content, using VP9 and H.264. It
@@ -658,7 +686,7 @@ like this (`e2e/screen-startup-judge.mjs`, with unit tests in the web job):
   sample was CPU-limited.
 - A share with a CPU-limited sample must have reached native size at some point.
 The harness also counts allocation probes (the cap written back up to the spec's
-ceiling while 70 % of the estimate is below it): none on an open uplink, and no more
+ceiling while the reserve budget is below it): none on an open uplink, and no more
 than the backoff allows after a release or on a shaped link.
 `E2E_STARTUP_PRESET` can check Text, Smooth and Saver directly. The Ubuntu
 `browser-screen-startup` job is diagnostic and excluded from `ci-ok` until its repeatability is established.
@@ -848,9 +876,16 @@ datagrams reach the screen task without slowing voice down.
   with separate congestion controllers. Browser GCC is delay-based and backs
   off when the queue grows, which also protects audio. On top of that:
   - the video `maxBitrate` is the resolved spec cap, never more;
-  - the sharer lowers it to `0.7 × availableOutgoingBitrate` of the publish
-    transport (from `getStats` `candidate-pair`) when that is lower, leaving
-    30 % for voice and retransmissions;
+  - the sharer applies `min(spec cap, max(250 kb/s, available − max(200 kb/s,
+    0.1 × available)))`, rounded down to bits/s, using the publish transport's
+    `availableOutgoingBitrate` (from `getStats` `candidate-pair`);
+    200 kb/s covers roughly 64 kb/s Opus plus RTCP and repairs without reserving
+    multiple Mb/s on a fast link. Above 2 Mb/s, 10 % leaves a growing repair margin;
+  - the 250 kb/s probing floor takes precedence below a 450 kb/s estimate. It can
+    leave less than 200 kb/s, or even exceed the estimate; voice capacity is not
+    guaranteed there. Missing/invalid estimates retain the spec cap, and GCC remains
+    responsible for congestion response. This is a per-transport estimate, not a
+    measurement of the whole uplink or an enforceable reservation between connections;
   - video encodings get `priority: "low"` and `networkPriority: "low"`, and
     voice keeps the default. This is a DSCP hint that most paths ignore.
 - **On a viewer's downlink** the SFU's per-viewer allocation (below) never
@@ -2904,7 +2939,7 @@ badge, stage). Decisions taken while building it, where this design left room:
   watched there even if the server's refusal were missing.
 - **Default mode without a surface.** Browsers that do not report
   `displaySurface` (and canvas tracks) get Smoothness at 1080p30, as screens do.
-- **Uplink headroom floor.** The `0.7 × availableOutgoingBitrate` rule never
+- **Uplink headroom floor.** The voice/repair reserve rule never
   lowers the cap below 250 kbps: an estimate that low recovers by probing, and a
   cap under it would starve the probe. It is re-read every 2 s and applied when
   it moves by more than 10 %, or, for a smooth share, when it reaches the spec's cap:

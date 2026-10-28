@@ -5,6 +5,8 @@
  * viewer's slot stats.
  */
 
+import { uplinkVideoBudget } from "../src/voice/screen-headroom.ts";
+
 const median = xs => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
 
 /** Encode-time share of wall time that counts as a saturated encoder (one frame at a time). */
@@ -50,13 +52,13 @@ export function cpuLimitedRows(rows) {
 
 /**
  * Allocation probes: the cap rose to the spec's ceiling (the highest cap written, the publish's
- * own) while 70 % of the estimate was below it, which the headroom rule alone never does.
+ * own) while the reserve budget was below it, which the headroom rule alone never does.
  */
 export function allocationProbes(rows) {
   const cap = row => row.params?.encodings?.[0]?.maxBitrate ?? NaN;
   const ceiling = Math.max(...rows.map(cap).filter(Number.isFinite));
   return rows.filter((row, i) => {
-    return row.elapsed > 4 && cap(row) >= ceiling && i > 0 && cap(rows[i - 1]) < ceiling && 0.7 * (row.pair?.availableOutgoingBitrate ?? Infinity) < ceiling;
+    return row.elapsed > 4 && cap(row) >= ceiling && i > 0 && cap(rows[i - 1]) < ceiling && uplinkVideoBudget(row.pair?.availableOutgoingBitrate ?? Infinity) < ceiling;
   }).length;
 }
 
