@@ -1,4 +1,209 @@
-# Chromium startup adaptation validation
+# Screen startup adaptation validation
+
+## WebKitGTK and WPE start-hint investigation (October 2026)
+
+### Scope and engine identity
+
+This investigates the WebKit sender in `browser-screen`, not the Chromium-only
+`browser-screen-startup` benchmark. The required job runs
+`apps/web/e2e/screen.mjs` twice: normal screen sharing and the fixed 1080p60 H.264
+gate. The WebKit publisher uses a stamped 640×400/20 fps canvas and forces VP9;
+Chromium verifies its decoded pixels through the loopback SFU. The final watch-link
+suite uses a test-hook bridge, without a TeamSpeak server.
+
+The control is main `accd0a063fe9011e8e796df755623de7a2aa5b89`, whose
+[screen job passed](https://github.com/MaciejWlodarski/gwar/actions/runs/40701684194/job/122864737261).
+The research dispatch reuses that run's unchanged native/WASM artifacts. Server
+addresses and media endpoints are loopback, with `--no-connect`. The separate
+peer-to-peer fixture resolves both peers' mDNS candidates to the runner's own
+private IPv4 address, with no STUN/TURN servers. Browser routing blocks
+non-loopback HTTP requests. No production or TeamSpeak endpoint is used.
+
+The runner was Ubuntu 24.04 x86_64, Playwright 1.63.0, WebKit r2359 (automation
+version 26.6), **WPE WebKit API version 2.55.0**, and **GStreamer 1.24.2**. The WPE
+version comes from the bundled library's `webkit_get_*_version` functions; GStreamer
+also prints its runtime version in `GST_INIT` logs. These are not measurements of a
+distro GTK release or of packaged Tauri display capture.
+
+### Root cause
+
+The CI bundle contains `minibrowser-wpe/lib/libWPEWebKit-2.0.so.1`, not a distro
+WebKitGTK package. It uses **libwebrtc with WebKit's GStreamer encoder factory**, not
+GstWebRTC's `webrtcbin`. Its factory delegates VP9 to libwebrtc's software encoder.
+The premise that an unknown fmtp field breaks GstWebRTC's SDP parser does not
+explain this build.
+
+The pinned source gives the failing path:
+
+1. [Playwright's r2359 roll](https://github.com/microsoft/playwright/pull/42493)
+   identifies build `e32b4c0e4cb8e61824ad6615b7c402e3b9597642`. The build repository
+   was not publicly retrievable. The encoder source trace below uses WebKit's
+   last encoder-factory change before that roll, `dc36ab85` (27 August); its
+   VP9-selection log at line 289 and H.264-creation log at line 104 match the
+   runtime logs. The older `UPSTREAM_CONFIG.sh` in Playwright's v1.63.0 tag is
+   not treated as the exact shipped engine revision.
+2. [`LibWebRTCProviderGStreamer::createEncoderFactory`](https://github.com/WebKit/WebKit/blob/dc36ab851de9ea91289369eb4721cf1292577d1a/Source/WebCore/platform/mediastream/libwebrtc/gstreamer/LibWebRTCProviderGStreamer.cpp#L48)
+   installs `GStreamerVideoEncoderFactory`.
+3. [The factory's VP9 branches](https://github.com/WebKit/WebKit/blob/dc36ab851de9ea91289369eb4721cf1292577d1a/Source/WebCore/platform/mediastream/libwebrtc/gstreamer/GStreamerVideoEncoderFactory.cpp#L283)
+   compare the complete `SdpVideoFormat` with `VP9Profile0()` or `VP9Profile2()`.
+   If neither matches, only VP8/H.264 are handled before returning `nullptr`.
+4. [`SdpVideoFormat::operator==`](https://github.com/WebKit/WebKit/blob/dc36ab851de9ea91289369eb4721cf1292577d1a/Source/ThirdParty/libwebrtc/Source/webrtc/api/video_codecs/sdp_video_format.cc#L214)
+   compares every fmtp parameter. `profile-id=0;x-google-start-bitrate=4000`
+   therefore fails against the canonical `profile-id=0` format. An unrelated
+   extra key has the same effect. The H.264/VP8 factory branches instead select
+   by codec name, so unrelated fmtp parameters do not prevent encoder creation.
+
+Playwright's public v1.63.0 bootstrap patch does not alter the encoder factory. This is an engine
+encoder-selection defect, after SDP acceptance. Fixing the profile-aware comparison
+belongs in WebKit; this investigation does not patch or rebuild the engine.
+
+### Measured cases and alternatives
+
+[Application reproduction, run 40782478906](https://github.com/MaciejWlodarski/gwar/actions/runs/40782478906):
+with the GTK gate temporarily disabled, `ws-canvas` reached `signalingState: stable`
+and `connectionState: connected`. Its `setRemoteDescription` promise fulfilled;
+the publisher still had **0 encoded frames, 0 RTP packets and 0 bytes after the
+watch timed out**, despite 15 PLIs. The negotiated video portion was:
+
+```sdp
+m=video 35795 UDP/TLS/RTP/SAVPF 98 99
+a=rtpmap:98 VP9/90000
+a=fmtp:98 profile-id=0;x-google-start-bitrate=4000
+a=rtpmap:99 rtx/90000
+a=fmtp:99 apt=98
+```
+
+The unchanged main control decoded 640×400 at 19 fps; the two normal/fixed passes
+observed their first watched frame after 319/311 ms. Those times start at watch,
+not publish, and are not compared with negotiation-relative startup times below.
+
+[Connected matrix, run 40783733114](https://github.com/MaciejWlodarski/gwar/actions/runs/40783733114):
+a fresh WPE publisher and Chromium receiver per case, a changing 1280×720/30 fps
+canvas, a 4 Mb/s encoding ceiling, scale 1 and `maintain-framerate`. Each case
+observes 12 s after applying the remote answer. Both peers must connect, and the
+baseline must encode; an ICE failure fails the diagnostic. Sampling is roughly
+100 ms for the first 3 s, then 250 ms. These are one-shot exploratory cases.
+
+| VP9 case | `setRemoteDescription` / ICE | First GCC estimate | Encoded / decoded frames at 12 s | First native encoded size |
+| --- | --- | --- | --- | --- |
+| Original answer (current gate) | success / connected | 0.30 Mb/s | 303 / 303 | 8.32 s |
+| Answer `x-google-start-bitrate=4000` | success / connected | 4.00 Mb/s | 0 / 0 | never |
+| Answer unrelated `x-gwar-diagnostic=4000` | success / connected | 0.30 Mb/s | 0 / 0 | never |
+| Start hint with a space after the semicolon | success / connected | 4.00 Mb/s | 0 / 0 | never |
+| Start hint in the offer only | success / connected | 0.30 Mb/s | 295 / 295 | 8.44 s |
+| Start hint in both offer and answer | success / connected | 4.00 Mb/s | 0 / 0 | never |
+| Answer `b=AS:4000` and `b=TIAS:4000000` | success / connected | 0.30 Mb/s | 296 / 296 | not reached |
+| Extra early `setParameters` with maxBitrate 4 Mb/s and scale 1 | success / connected | 0.30 Mb/s | 296 / 295 | 6.40 s |
+
+The hint is parsed well enough to initialize GCC to exactly 4 Mb/s before encoding
+fails. The unrelated key fails without changing GCC. Successful VP9 cases log
+`GStreamerVideoEncoderFactory.cpp:289:Create: Using VP9 P0 encoder from LibWebRTC.`;
+the extra-fmtp cases never reach that branch. The combined source and runtime
+evidence identifies encoder selection, rather than SDP syntax, line formatting,
+GStreamer caps negotiation or an unavailable VP9 plugin.
+
+Chromium removes the offer-only extension from its answer, so that case is a
+working default start, not a fast-start workaround. Putting it back in the answer
+breaks encoding again. The early-parameters arm still starts GCC at 300 kb/s;
+its one faster native-size observation does not establish a repeatable gain.
+The baseline already has those same encoding values in `addTransceiver`.
+[`maxBitrate` and `scaleResolutionDownBy`](https://www.w3.org/TR/webrtc/#dom-rtcrtpencodingparameters)
+are encoding limits, not an initial congestion estimate.
+The pinned [libwebrtc bandwidth handling](https://github.com/WebKit/WebKit/blob/dc36ab851de9ea91289369eb4721cf1292577d1a/Source/ThirdParty/libwebrtc/Source/webrtc/media/engine/webrtc_video_engine.cc#L1369)
+also treats `b=AS` as a maximum. No standard WebRTC API exposes GStreamer's encoder
+properties; moreover, this VP9 path uses libwebrtc's encoder rather than `vp9enc`.
+
+H.264 accepts the same answer hint: the exploratory baseline encoded/decoded
+295 frames but never reached 1280×720 in 12 s; the hinted case encoded/decoded
+311 frames and first reached native size at 0.147 s, with a 4 Mb/s initial GCC
+estimate instead of 300 kb/s. That case used baseline profile `42001f`. It later
+downscaled, so it is evidence of startup improvement, not sustained native quality.
+
+[Preferred-profile confirmation, run 40784517211](https://github.com/MaciejWlodarski/gwar/actions/runs/40784517211)
+uses the same source, ceiling and sampling, with Gwar's preferred H.264 Constrained
+Baseline (`42e01f`, packetization mode 1). Three alternating baseline/hint pairs
+use fresh browser processes, 12 s per share. All six connect and decode frames.
+
+| H.264 startup measure | Current GTK gate (3 shares) | H.264-only hint (3 shares) |
+| --- | --- | --- |
+| First positive GCC estimate | 0.30 Mb/s in every share | 4.00 Mb/s in every share |
+| First observed encoded dimensions | 452×254 in every share | 1280×720 in every share |
+| First encoded frame, median [range] | 0.219 s [0.218–0.234] | 0.119 s [0.116–0.130] |
+| First native encoded size | 1.282 s once; not reached in 12 s twice | 0.119 s median [0.116–0.130] |
+| First decoded frame, median [range] | 0.323 s [0.322–0.339] | 0.119 s [0.116–0.130] |
+| Payload over the first second, median [range] | 2.24 Mb/s [2.04–2.42] | 2.34 Mb/s [2.30–2.50] |
+| Encoded / decoded frames after 12 s | 306–310 / 305–310 | 306–311 / 306–311 |
+
+First-second payload is the delta of RTP bytes over the observed 0–1 s samples;
+it includes startup and is not the GCC estimate or an encoder-target setting.
+Its gain is small and not uniform across pairs. The clear improvement is native
+initial resolution and the initial congestion estimate. This busy synthetic source
+later caused downscaling in the hinted shares too; sustained native quality and
+voice performance are not established by this test.
+
+The same run passes the unchanged normal `e2e:screen` suite: GTK's VP9 has its
+original fmtp, encodes 144 frames before the initial codec check and Chromium
+decodes 11 at 640×400. A separate targeted application/SFU check publishes GTK
+H.264 with `profile-level-id=42e033;x-google-start-bitrate=4000`, encodes 128
+frames at the codec check and Chromium decodes 4 at 640×400. The original fixture's
+640×400 source is used for that transport check; the startup table comes from the
+1280×720 peer-to-peer fixture. The ordinary fixed-canvas gate remains unchanged
+and runs in final PR CI.
+
+### Decision and reproduction
+
+The implementation narrows the existing GTK/WPE exception to codec selection:
+only H.264 receives the start hint on Linux WebKit. VP9 and AV1 fmtp are left
+unchanged; macOS WKWebView and Chromium/WebView2 retain the previous path. This
+needs no encoder-property access, codec switch, extra negotiation or new timer.
+The resolved spec still bounds the hint and congestion control can back off.
+This does not enable the deferred Linux desktop screen-sharing feature.
+
+VP9 has no verified safe fast-start workaround here. A profile-aware factory
+comparison in WebKit, followed by a rebuilt-engine test, is the upstream fix to
+investigate. It is outside this frontend change.
+
+Retained `webkit-research` artifacts (30-day retention, expiring 27 November 2026):
+
+- [Connected application failure](https://github.com/MaciejWlodarski/gwar/actions/runs/40782478906/artifacts/12858116590):
+  `app/ws-canvas.json` contains full SDP, signaling results and RTP counters;
+  `app.log`, `app-gstreamer.log` and pipeline DOT files retain runtime diagnostics.
+- [Connected alternative matrix](https://github.com/MaciejWlodarski/gwar/actions/runs/40783733114/artifacts/12857934493):
+  per-case `result.json` has original/applied SDP, `setParameters` results and
+  complete RTP timelines; `gstreamer.log`, `versions.txt` and `pw_run.sh` bind
+  runtime behavior and versions.
+- [H.264 confirmation and application controls](https://github.com/MaciejWlodarski/gwar/actions/runs/40784517211/artifacts/12858747431):
+  six H.264 timelines, normal application traces/logs, and `app-h264/` evidence.
+
+The corrected exploratory harness/workflow is frozen at
+`33fa6fad81e6df76f5023780be62810262db03e4` (run 40783733114); the confirmation harness and candidate helper are
+frozen at `87b6a17e8658f13ccd9e990bcf77b2f86e5eedc3`. Their source copies also
+ship in the artifacts. To inspect the evidence:
+
+```sh
+gh run download 40782478906 -R MaciejWlodarski/gwar -n webkit-research -D /tmp/gtk-application-failure
+gh run download 40783733114 -R MaciejWlodarski/gwar -n webkit-research -D /tmp/gtk-alternatives
+gh run download 40784517211 -R MaciejWlodarski/gwar -n webkit-research -D /tmp/gtk-h264-confirmation
+```
+
+To rerun on Linux with the pinned browser/system dependencies, retrieve
+`apps/web/e2e/webkit-research.mjs` from the corresponding research commit into
+that same repo-relative path and run it with Node 22.23.3
+(`node --experimental-strip-types apps/web/e2e/webkit-research.mjs`). The
+confirmation commit uses `E2E_RESEARCH_CONFIRM=1` for three H.264 pairs. Its
+frozen temporary `ci.yml` documents browser setup and exact debug environments:
+`GST_DEBUG=3,GST_INIT:5,webrtc*:5,rtp*:4,webkit*:5,vpx*:5,vp9*:5`,
+`GST_DEBUG_FILE` and `GST_DEBUG_DUMP_DOT_DIR`. All process cleanup uses owned
+process handles; the fixture uses no external signaling or media server.
+
+Temporary workflow dispatch, runtime debug environments, SDP interception,
+app-only shortcuts and the exploratory fixture are removed from the final PR.
+The original screen suite's assertions and CI job selection remain unchanged.
+Two setup attempts failed before measurement (package inventory and library
+loader path). Run 40782478906's separate peer-to-peer matrix had unresolved mDNS
+ICE candidates even in its baseline; those matrix numbers are discarded. Its
+application/SFU reproduction above is valid and connected. All corrected matrix
+arms explicitly require connectivity before drawing conclusions.
 
 ## Busy H.264 ramp (28 October 2026)
 
@@ -90,10 +295,11 @@ The first two CI attempts failed the unchanged screen suite: Linux WebKitGTK
 negotiated VP9 with `x-google-start-bitrate=4000` but encoded zero frames. A local
 fixed-screen candidate also timed out on the WebKit → Chromium flow. Pinned main's
 local suite reached that flow but later failed a separate H.264 recovery assertion,
-so it does not reproduce the exact new CI failure. The sender now leaves WebKitGTK's
+so it does not reproduce the exact new CI failure. PR #189 initially left WebKitGTK's
 answer unchanged as a compatibility exception; Chromium on Linux and native macOS
-WKWebView still get every supported video codec's start hint. The GTK exception is
-covered by unit tests and keeps its browser-default GCC start and the reserve rule.
+WKWebView still received every supported video codec's start hint. The investigation
+above narrows that exception to allow H.264 hints while keeping GTK's VP9/AV1
+parameters unchanged. The reserve rule is unchanged.
 
 Voice latency, jitter, loss, concealment and mouth-to-ear percentiles were not
 measured in this browser ramp harness. Its shaper and synthetic media can demonstrate

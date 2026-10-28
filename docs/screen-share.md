@@ -635,11 +635,19 @@ payload's fmtp, creating a line when absent and preserving codec parameters and 
 This is an initial GCC estimate, not `x-google-min-bitrate`: loss/delay response and
 the ordinary headroom cap can reduce it immediately. Watch and voice answers are unchanged.
 The latest resolved spec (including an edit during signalling) bounds the hint.
-WebKitGTK on Linux keeps its original answer and browser-default start: two CI
-attempts with the extension negotiated VP9 but encoded zero frames. The compatibility
-exception does not apply to Chromium on Linux or native macOS WKWebView, which
-decoded H.264 and VP9 with the hint in local controls. The Linux desktop app does not
-support screen sharing; GTK is still used by the browser regression suite.
+WebKitGTK/WPE on Linux gets the hint on H.264 only. Its libwebrtc encoder factory
+compares VP9's complete fmtp map with the canonical profile; an extra key makes it
+return no encoder even though SDP and ICE succeed. VP9 and AV1 answers therefore
+retain their original parameters and browser-default start on GTK/WPE. H.264's
+factory accepts the extra key and its fast start is validated in Linux CI. See
+[the GTK/WPE investigation](screen-startup-validation.md#webkitgtk-and-wpe-start-hint-investigation-october-2026)
+for SDP, runtime versions, source trace, failed alternatives and startup measurements.
+This applies to libwebrtc builds (Playwright WPE, and GTK/WPE releases after the
+GstWebRTC backend was removed in July 2026). Older distro builds on GstWebRTC pass the
+hint through as a caps field that rate control ignores; that path is untested.
+Chromium on Linux, native macOS WKWebView and Windows WebView2 keep the existing
+all-supported-codec hint path. This changes the browser transport's startup; the
+Linux desktop app's screen-sharing deferral is unchanged.
 
 It always starts at `min(spec cap, 4 Mb/s)`. Four Mb/s covers the default
 1080p30 budget and avoids climbing from Chromium's roughly 300 kb/s default, while
