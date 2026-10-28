@@ -2933,6 +2933,54 @@ from native capture is PR 10.
 
 ## 6. Interface
 
+### Upload congestion warning
+
+The sharing quality chip and the voice panel/pill show **Upload congested · N ms**
+when the client's RTT rises persistently above its recent healthy floor. Tap/click
+or keyboard-activate the warning to read the explanation and suggested actions.
+The same copy is available in English and Polish; downloads may remain unaffected.
+
+`voice/uplink-congestion.ts` contains the pure, session-local detector. It keeps a
+60-second minimum RTT, flags a rise above `max(baseline + 150 ms, 2 × baseline)`
+for at least four seconds, and clears after five continuous seconds below
+`baseline + 75 ms`. The healthy baseline freezes during a suspected/confirmed
+rise, so a long queue does not clear itself after a minute. A replacement peer or
+selected ICE path starts a new baseline. Missing evidence expires after 12 seconds;
+short gaps neither prove congestion nor recovery. No settings or network history
+are persisted, and no bitrate/adaptation controls change.
+
+Browser voice polls its peer once a second, including when not sharing or muted.
+The publisher uses its existing two-second headroom poll. Fresh selected
+`candidate-pair.currentRoundTripTime` is preferred; linked
+`remote-inbound-rtp.roundTripTime` from our own sender is the fallback. Repeated
+ICE response/RTCP measurement counters do not advance the detector. The selected
+pair's `availableOutgoingBitrate` is retained as context, but is not required:
+voice-only calls and some browsers do not expose a GCC estimate.
+
+Desktop voice is native Rust, with no media RTT exposed over IPC today. Voice-only
+native calls therefore use the existing 10-second Gwar server ping, with a
+25-second evidence expiry. Entry/recovery can take another ping interval. This
+fallback measures the signalling path, not media RTT. TeamSpeak connections do
+not use it. Desktop screen publishing still uses WebRTC measurements.
+
+This is a queueing-delay heuristic, not proof of direction or which process is
+uploading: server load, a route change, or downlink congestion can also raise RTT.
+A call that connects while already congested has no known healthy floor and may
+not warn until a lower RTT has been observed. The help text says something on
+the device/network **may** be uploading, and suggests pausing sync/backups/another
+call or enabling router SQM/QoS.
+
+For owner UI approval, run `node apps/web/e2e/uplink.mjs`. The isolated Vite fixture
+renders the real sharing bar, voice panel and pill using mocked WebRTC reports,
+blocks all non-loopback browser requests, and checks for horizontal overflow at
+1440, 768 and 390 px. Polish normal/congested/help PNGs go to
+`~/dev/projects/gwar-mockups/uplink-congestion/` (override with
+`GWAR_UPLINK_SCREENSHOTS`). It never connects to a voice or TeamSpeak server.
+The fixture is not a production build entry. **Owner UI approval is required
+before merge.**
+
+### Existing screen controls
+
 - **Starting.**
   - A "Share screen" button in the voice panel (`ui/VoicePanel.tsx`), next to
     mute and deafen. It is disabled with a tooltip when missing permission,

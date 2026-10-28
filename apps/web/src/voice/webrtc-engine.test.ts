@@ -25,6 +25,7 @@ class Peer {
   connectionState = "new";
   ontrack = null;
   onconnectionstatechange: (() => void) | null = null;
+  getStats = vi.fn<() => Promise<RTCStatsReport>>(async () => new Map() as unknown as RTCStatsReport);
   close = vi.fn();
   createOffer = vi.fn(async () => ({ type: "offer" as const, sdp: "v=0\r\na=ssrc:123 cname:mic\r\n" }));
   setLocalDescription = vi.fn(async (description: RTCSessionDescriptionInit) => { this.localDescription = description; });
@@ -417,5 +418,51 @@ describe("browser noise suppression", () => {
     await flush();
     expect(model.close).toHaveBeenCalledOnce();
     expect(getUserMedia).toHaveBeenCalledOnce();
+  });
+});
+
+
+describe("browser uplink health", () => {
+  it("collects voice-only RTT and ignores a retired peer's pending stats", async () => {
+    vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+    const changes = vi.fn();
+    engine.on("uplink", changes);
+    await engine.start(params());
+    const pc = Peer.all[0]!;
+    pc.connect();
+    let ms = 20, n = 0;
+    pc.getStats.mockImplementation(async () => new Map([["pair", { id: "pair", type: "candidate-pair", nominated: true, state: "succeeded", currentRoundTripTime: ms / 1000, responsesReceived: ++n }]]) as unknown as RTCStatsReport);
+    await vi.advanceTimersByTimeAsync(1000);
+    ms = 480;
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(changes).toHaveBeenLastCalledWith(expect.objectContaining({ congested: true, rttMs: 480 }));
+    const pending = deferred<RTCStatsReport>();
+    pc.getStats.mockReturnValueOnce(pending.promise);
+    await vi.advanceTimersByTimeAsync(1000);
+    await engine.stop();
+    expect(changes).toHaveBeenLastCalledWith(null);
+    await engine.start(params());
+    changes.mockClear();
+    pending.resolve(new Map() as unknown as RTCStatsReport);
+    await flush();
+    expect(changes).not.toHaveBeenCalled();
+  });
+
+  it("expires a warning while getStats is stuck without issuing parallel polls", async () => {
+    vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+    const changes = vi.fn();
+    engine.on("uplink", changes);
+    await engine.start(params());
+    const pc = Peer.all[0]!;
+    pc.connect();
+    let n = 0;
+    pc.getStats.mockImplementation(async () => new Map([["pair", { id: "pair", type: "candidate-pair", nominated: true, state: "succeeded", currentRoundTripTime: ++n === 1 ? .02 : .48, responsesReceived: n }]]) as unknown as RTCStatsReport);
+    await vi.advanceTimersByTimeAsync(6000);
+    expect(changes).toHaveBeenLastCalledWith(expect.objectContaining({ congested: true }));
+    pc.getStats.mockImplementation(() => new Promise(() => {}));
+    const before = pc.getStats.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(14000);
+    expect(pc.getStats.mock.calls.length - before).toBe(1);
+    expect(changes).toHaveBeenLastCalledWith(null);
   });
 });

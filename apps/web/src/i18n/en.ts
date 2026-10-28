@@ -453,6 +453,8 @@ export const en = {
   "screen.watching.other": "{count} watching",
   "screen.starting": "Starting…",
   "screen.preview": "Preview",
+  "voice.uploadCongested": "Upload congested · {ms} ms",
+  "voice.uploadCongestedHint": "Something on this device or network may be uploading a lot (cloud sync, backups, another call). Video and voice are delayed. Pause the upload, or enable SQM/QoS on the router. Downloads can still work normally.",
   "screen.limitedCpu": "Limited by CPU",
   "screen.limitedBandwidth": "Limited by connection",
   "screen.encoder": "Encoder: {name} ({kind})",

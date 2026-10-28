@@ -2817,3 +2817,25 @@ describe("AV1", () => {
     transport.close();
   });
 });
+
+
+it("reports publish congestion from the existing poll, clears on close and ignores late stats", async () => {
+  vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+  const uplink = vi.fn();
+  const publisher = new ScreenPublisher({ track: {} as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: vi.fn(), uplink });
+  await publisher.start();
+  const pc = Peer.all[0]!;
+  pc.connectionState = "connected";
+  let n = 0;
+  pc.getStats.mockImplementation(async () => new Map([["pair", { id: "pair", type: "candidate-pair", nominated: true, state: "succeeded", currentRoundTripTime: ++n === 1 ? .02 : .48, responsesReceived: n }]]));
+  await vi.advanceTimersByTimeAsync(8000);
+  expect(uplink).toHaveBeenLastCalledWith(expect.objectContaining({ congested: true, rttMs: 480 }));
+  let finish!: (report: Map<string, Record<string, unknown>>) => void;
+  pc.getStats.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  await vi.advanceTimersByTimeAsync(2000);
+  publisher.close();
+  expect(uplink).toHaveBeenLastCalledWith(null);
+  uplink.mockClear(); finish(new Map());
+  await vi.advanceTimersByTimeAsync(0);
+  expect(uplink).not.toHaveBeenCalled();
+});

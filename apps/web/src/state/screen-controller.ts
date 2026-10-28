@@ -1,3 +1,4 @@
+import { useUplink } from "./uplink";
 /**
  * Glue between the server's screen protocol (`screen.*`), the media layer (`voice/screen.ts`)
  * and the screen store (`state/screen.ts`). Plaintext channels only: in an encrypted channel
@@ -255,6 +256,7 @@ export class ScreenController {
     const hardwareAv1 = await av1;
     if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
     const publisher = new ScreenPublisher({
+      uplink: screen => { if (current() && this.publisher === publisher) useUplink.setState({ screen }); },
       track, quality: latest(), legacy: !screenSpec, av1: hardwareAv1, automaticMode: useSettings.getState().screenMode === null, iceServers: s.iceServers,
       ended: () => { if (this.publisher === publisher) void this.stopShare(); },
       surfaceChanged: (surface, spec) => {
@@ -287,6 +289,7 @@ export class ScreenController {
 
   /** Ends my share here: the transport closes and the capture stops. */
   private endOwn(): void {
+    useUplink.setState({ screen: null });
     const own = useScreen.getState().own;
     this.publisher?.close();
     this.publisher = null;

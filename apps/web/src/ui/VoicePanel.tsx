@@ -1,3 +1,5 @@
+import { useUploadCongestion } from "../state/uplink";
+import { UploadWarning } from "./UploadWarning";
 import { Headphones, HeadphoneOff, Mic, MicOff, MonitorUp, PhoneOff, SignalHigh, SignalLow, SignalMedium } from "lucide-react";
 import type { ReactNode } from "react";
 import { useT } from "../i18n";
@@ -165,6 +167,7 @@ export function VoicePanel() {
   const canSpeak = useChannelPermission(me?.channel ?? null, "speak");
   const member = useSession((s) => (s.me ? s.members[s.me.uid] : undefined));
   const { status, tone } = useVoiceStatus();
+  const congestion = useUploadCongestion();
 
   if (me && me.channel === null) {
     return (
@@ -211,7 +214,7 @@ export function VoicePanel() {
             ) : (
               <span className={cn("truncate", tone)}>{status.text}</span>
             )}
-            {status.tone === "ok" && <RoundTrip />}
+            {status.tone === "ok" && !congestion && <RoundTrip />}
           </div>
         </div>
         {unavailable && phase === "online" && (
@@ -221,6 +224,7 @@ export function VoicePanel() {
         )}
         <LeaveButton />
       </div>
+      {congestion && voiceState === "connected" && <UploadWarning status={congestion} />}
       {micError && (
         <div role="alert" className="rounded-md bg-danger-soft px-2 py-1.5 text-xs text-danger">
           {describeVoiceError(micError)}
@@ -260,6 +264,7 @@ export function VoicePill() {
   const t = useT();
   const shown = useVoicePill();
   const { status, tone } = useVoiceStatus();
+  const congestion = useUploadCongestion();
   const channelName = useSession((s) => {
     const channel = myChannelId(s);
     return channel === null ? undefined : s.channels[channel]?.name;
@@ -272,23 +277,26 @@ export function VoicePill() {
       aria-label={t("voice.pill")}
       className="absolute bottom-3 left-1/2 z-10 flex w-max max-w-[calc(100%-1.5rem)] -translate-x-1/2 items-center gap-2 rounded-[14px] border border-line-strong bg-raised p-1.5 pl-2 shadow-pop"
     >
-      <Tooltip label={t("voice.pillOpen")}>
-        <button onClick={showVoiceChannel} className="t min-w-0 cursor-pointer rounded-md px-1.5 py-0.5 text-left leading-tight hover:bg-hover md:max-w-64">
-          <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium">
-            <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone, status.tone === "warn" && "animate-pulse")} />
-            <span className={cn("truncate", tone)}>{status.text}</span>
-            {sharing && (
-              <span className="flex shrink-0 items-center text-accent" title={t("screen.liveSelf")}>
-                <MonitorUp aria-hidden className="size-3.5" />
-                <span className="sr-only">{t("screen.liveSelf")}</span>
-              </span>
-            )}
-          </span>
-          <span className="block truncate text-xs text-muted">
-            #{channelName} · {serverName}
-          </span>
-        </button>
-      </Tooltip>
+      <div className="min-w-0">
+        <Tooltip label={t("voice.pillOpen")}>
+          <button onClick={showVoiceChannel} className="t min-w-0 cursor-pointer rounded-md px-1.5 py-0.5 text-left leading-tight hover:bg-hover md:max-w-64">
+            <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium">
+              <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone, status.tone === "warn" && "animate-pulse")} />
+              <span className={cn("truncate", tone)}>{status.text}</span>
+              {sharing && (
+                <span className="flex shrink-0 items-center text-accent" title={t("screen.liveSelf")}>
+                  <MonitorUp aria-hidden className="size-3.5" />
+                  <span className="sr-only">{t("screen.liveSelf")}</span>
+                </span>
+              )}
+            </span>
+            <span className="block truncate text-xs text-muted">
+              #{channelName} · {serverName}
+            </span>
+          </button>
+        </Tooltip>
+        {congestion && status.tone === "ok" && <UploadWarning status={congestion} />}
+      </div>
       <div className="flex shrink-0 items-center gap-1">
         <MicButton size="md" />
         <DeafenButton size="md" />

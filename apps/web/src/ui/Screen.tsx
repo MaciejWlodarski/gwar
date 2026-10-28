@@ -2,6 +2,8 @@
  * Screen-sharing interface (docs/screen-share.md, "Interface"): the Share button, the preset
  * menu, the sharing bar, LIVE badges and the stage.
  */
+import { useUploadCongestion } from "../state/uplink";
+import { UploadWarning } from "./UploadWarning";
 import { Maximize, MessageSquare, MessageSquareOff, Minimize, MonitorOff, MonitorUp, PictureInPicture2, RotateCw, ScreenShareOff, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
@@ -178,7 +180,7 @@ export function SharingBar() {
           </Button>
         </span>
       )}
-      <span className="ml-auto flex items-center gap-2">
+      <span className="ml-auto flex max-w-full flex-wrap items-center justify-end gap-2">
         <span className="text-xs">{`${own.spec.height}p${own.spec.fps} · ${t(`screen.mode.${own.spec.mode}`)}`}</span>
         <QualityControls spec={own.spec} bar />
         <Button size="sm" variant="secondary" aria-pressed={own.preview} className={cn("border-white/40 text-white hover:bg-white/15", own.preview && "bg-white/20")}
@@ -201,6 +203,7 @@ export function SharingBar() {
 function SenderStats() {
   const t = useT();
   const [stats, setStats] = useState<PublishStats | null>(null);
+  const congestion = useUploadCongestion();
   useEffect(() => {
     let live = true;
     const poll = () => void controller.screen.ownStats().then(s => { if (live) setStats(s); });
@@ -208,20 +211,20 @@ function SenderStats() {
     const timer = setInterval(poll, 2000);
     return () => { live = false; clearInterval(timer); };
   }, []);
-  if (!stats || !stats.height) return null;
+  if (!stats || !stats.height) return congestion ? <UploadWarning status={congestion} sharing /> : null;
   const mbps = (stats.bitrate / 1e6).toFixed(1);
   const encoder = stats.encoder
     ? t("screen.encoder", { name: stats.encoder, kind: t(stats.hardware === true ? "screen.encoderHardware" : stats.hardware === false ? "screen.encoderSoftware" : "screen.encoderUnknown") })
     : undefined;
   return (
-    <span data-testid="screen-sender-stats" title={encoder} className="flex items-center gap-1.5 text-xs text-white/85 tabular-nums">
+    <div data-testid="screen-sender-stats" title={encoder} className="flex min-w-0 flex-wrap items-center gap-1.5 text-xs text-white/85 tabular-nums">
       {`${stats.height}p · ${stats.fps} fps · ${mbps} Mb/s${stats.codec ? ` · ${stats.codec}` : ""}`}
-      {stats.limitation === "cpu" || stats.limitation === "bandwidth" ? (
+      {congestion ? <UploadWarning status={congestion} sharing /> : stats.limitation === "cpu" || stats.limitation === "bandwidth" ? (
         <span className="rounded bg-white/20 px-1.5 leading-5 font-medium text-white">
           {t(stats.limitation === "cpu" ? "screen.limitedCpu" : "screen.limitedBandwidth")}
         </span>
       ) : null}
-    </span>
+    </div>
   );
 }
 

@@ -455,6 +455,8 @@ export const pl: Record<Key, string> = {
   "screen.watching.other": "{count} osoby oglądają",
   "screen.starting": "Uruchamianie…",
   "screen.preview": "Podgląd",
+  "voice.uploadCongested": "Łącze wysyłania zapchane · {ms} ms",
+  "voice.uploadCongestedHint": "Coś na tym urządzeniu lub w tej sieci może intensywnie wysyłać dane (synchronizacja w chmurze, kopia zapasowa, inna rozmowa). Obraz i głos docierają z opóźnieniem. Wstrzymaj wysyłanie lub włącz SQM/QoS na routerze. Pobieranie może nadal działać normalnie.",
   "screen.limitedCpu": "Ograniczone przez procesor",
   "screen.limitedBandwidth": "Ograniczone przez łącze",
   "screen.encoder": "Enkoder: {name} ({kind})",

@@ -1,3 +1,5 @@
+import { UplinkCongestion } from "../voice/uplink-congestion";
+import { useUplink } from "./uplink";
 import { claimAll, claimableIdentities, offerClaims } from "./ts-claim";
 import { permissionsOf } from "../lib/permissions";
 import type { ChannelOverride } from "../proto/ChannelOverride";
@@ -218,6 +220,11 @@ class Controller {
   private voiceRetry: ReturnType<typeof setTimeout> | null = null;
   private voiceRetries = 0;
   private voiceRun = 0;
+  // Native voice has no WebRTC stats IPC. Its existing 10 s server ping is a
+  // slower, direction-agnostic fallback; it never borrows the screen baseline.
+  private nativeUplink = new UplinkCongestion(25_000);
+  private nativeUplinkExpiry: ReturnType<typeof setTimeout> | null = null;
+
   private initialised = false;
   private loadingOlder = false;
   /** Password channels I have entered during this session: their chat is readable. */
@@ -238,6 +245,13 @@ class Controller {
     this.engine = createVoiceEngine();
   }
 
+  private resetNativeUplink(): void {
+    this.nativeUplink.reset();
+    if (this.nativeUplinkExpiry) clearTimeout(this.nativeUplinkExpiry);
+    this.nativeUplinkExpiry = null;
+    useUplink.setState({ voice: null });
+  }
+
   /** Swap in another engine (desktop) before the first connect. */
   useEngine(engine: VoiceEngine): void {
     this.engine = engine;
@@ -255,7 +269,9 @@ class Controller {
     this.screen.init();
     const e = this.engine;
     e.on("level", (level) => useVoice.getState().set({ level }));
+    e.on("uplink", voice => useUplink.setState({ voice }));
     e.on("state", (state) => {
+      if (state !== "connected") this.resetNativeUplink();
       useVoice.getState().set({ state });
       if (state === "failed") this.scheduleVoiceRetry();
       if (state === "connected") this.voiceRetries = 0;
@@ -586,11 +602,19 @@ class Controller {
   private wire(conn: Link, params: ConnectParams): void {
     const session = useSession.getState();
     session.setRtt(null);
+    this.resetNativeUplink();
     conn.onRtt?.((ms) => {
-      if (this.conn === conn) session.setRtt(Math.round(ms));
+      if (this.conn !== conn) return;
+      session.setRtt(Math.round(ms));
+      if (isDesktop() && useSession.getState().kind === "gwar" && useSession.getState().phase === "online" && useVoice.getState().state === "connected") {
+        useUplink.setState({ voice: this.nativeUplink.observe(performance.now(), { path: "native-server-ping", rttMs: ms }) });
+        if (this.nativeUplinkExpiry) clearTimeout(this.nativeUplinkExpiry);
+        this.nativeUplinkExpiry = setTimeout(() => this.resetNativeUplink(), 25_000);
+      }
     });
     conn.onWelcome((welcome, resync) => {
       if (this.conn !== conn) return;
+      this.resetNativeUplink();
       // A new session: shares and watches of the one before ended with it.
       this.screen.reset();
       this.entered.clear();
@@ -764,6 +788,7 @@ class Controller {
   }
 
   private async teardown(): Promise<void> {
+    this.resetNativeUplink();
     // Approvals and prompts of the manager list belong to one connection to one server.
     this.grantedByMe.clear(); this.askedManagers.clear(); this.lastRenewal = 0;
     // A newer connect may finish its own teardown and start while this one

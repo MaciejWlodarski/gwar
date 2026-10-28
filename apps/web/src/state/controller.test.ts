@@ -40,6 +40,9 @@ class FakeLink implements Link {
   private eventHandlers: Array<(e: Event) => void> = [];
   private statusHandlers: Array<(s: ConnectionStatus) => void> = [];
   failing = new Set<string>();
+  private rttHandlers: Array<(ms: number) => void> = [];
+  onRtt(h: (ms: number) => void) { this.rttHandlers.push(h); return () => {}; }
+  rtt(ms: number) { for (const h of this.rttHandlers) h(ms); }
 
   onStatus(h: (s: ConnectionStatus) => void) {
     this.statusHandlers.push(h);
@@ -1458,5 +1461,32 @@ describe("accepting a changed server key", () => {
       await expect(serverPins.commit(endpoint, third)).rejects.toBeInstanceOf(ServerIdentityChanged);
       expect(connect).toHaveBeenCalledWith(expect.objectContaining({ inviteServerKey: accepted, replaceServerKey: old }), { remember: false });
     } finally { get.mockRestore(); update.mockRestore(); connect.mockRestore(); }
+  });
+});
+
+
+describe("native voice uplink fallback", () => {
+  it("uses the existing ping without a share and expires/reset its warning", async () => {
+    vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+    const { useUplink } = await import("./uplink");
+    connectFake();
+    await vi.advanceTimersByTimeAsync(10);
+    const win: { __TAURI_INTERNALS__?: object; location: object } = { __TAURI_INTERNALS__: {}, location: { protocol: "http:", hostname: "localhost", port: "5173" } };
+    vi.stubGlobal("window", win);
+    try {
+      stores.useVoice.setState({ state: "connected" });
+      link.rtt(20);
+      await vi.advanceTimersByTimeAsync(10000); link.rtt(480);
+      expect(useUplink.getState().voice?.congested).toBe(false);
+      await vi.advanceTimersByTimeAsync(10000); link.rtt(480);
+      expect(useUplink.getState().voice).toMatchObject({ congested: true, rttMs: 480 });
+      await vi.advanceTimersByTimeAsync(25000);
+      expect(useUplink.getState().voice).toBeNull();
+      link.rtt(480);
+      expect(useUplink.getState().voice?.congested).toBe(false);
+      await controller.disconnect(true);
+      link.rtt(900);
+      expect(useUplink.getState().voice).toBeNull();
+    } finally { delete win.__TAURI_INTERNALS__; }
   });
 });
