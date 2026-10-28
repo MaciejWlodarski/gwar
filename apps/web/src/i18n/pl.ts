@@ -155,6 +155,7 @@ export const pl: Record<Key, string> = {
   "report.privacyAccount": "Wysyłane prywatnie do zespołu Gwar (Gwar Connect) z Twoim kontem @{handle}, nie publikujemy tego.",
   "report.send": "Wyślij zgłoszenie",
   "report.sent": "Dziękujemy! Zgłoszenie #{id} zostało wysłane.",
+  "report.failed": "Zgłoszenie błędu nie zostało wysłane: {error}",
   "settings.audio": "Dźwięk",
   "settings.appearance": "Wygląd",
   "settings.identity": "Tożsamość",

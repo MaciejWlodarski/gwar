@@ -1,22 +1,17 @@
 import { Bug, ImagePlus, X } from "lucide-react";
 import { useEffect, useRef, useState, type ClipboardEvent, type DragEvent } from "react";
 import { useT } from "../i18n";
-import { connectApi } from "../connect/api";
-import { encodeBase64Url } from "../net/base64url";
-import { loadConnectRecord } from "../net/identity";
 import { fitDiagnostics, fitScreenshot } from "../lib/diagnostics";
 import { useAccount } from "../state/account";
-import { controller, describeRequestError } from "../state/controller";
-import { useUi } from "../state/stores";
+import { controller } from "../state/controller";
 import { cn } from "../lib/cn";
 import { leavePage, useEscapeBack } from "./hooks";
 import { Button, Field, panelCard, Switch, Textarea, Tooltip } from "./kit";
 import { useVoicePill } from "./nav";
+import { clearReportDraft, newShotId, sendReport, useReportDraft } from "./report-draft";
 import { VoicePill } from "./VoicePanel";
 
 const MAX_SHOTS = 5;
-
-interface Shot { id: number; blob: Blob; url: string }
 
 /** "Alpha", at the bottom of the global rail. */
 export function AlphaBadge() {
@@ -34,43 +29,34 @@ export function AlphaBadge() {
 export function BugReportSection({ card }: { card?: boolean }) {
   const t = useT();
   const pill = useVoicePill();
-  const toast = useUi((s) => s.toast);
   const account = useAccount((s) => s.account);
-  const [text, setText] = useState("");
-  const [withDiagnostics, setWithDiagnostics] = useState(true);
+  const { text, withDiagnostics, shots, busy, error } = useReportDraft();
+  const draft = useReportDraft.setState;
   const [diagnostics, setDiagnostics] = useState<Record<string, unknown> | null>(null);
   const [showDiagnostics, setShowDiagnostics] = useState(false);
-  const [shots, setShots] = useState<Shot[]>([]);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const nextId = useRef(0);
   const file = useRef<HTMLInputElement>(null);
 
   useEscapeBack();
   useEffect(() => { void controller.reportDiagnostics().then((d) => setDiagnostics(fitDiagnostics(d))); }, []);
-  // Preview URLs are released with the page.
-  const shotsRef = useRef<Shot[]>([]);
-  useEffect(() => { shotsRef.current = shots; }, [shots]);
-  useEffect(() => () => { for (const s of shotsRef.current) URL.revokeObjectURL(s.url); }, []);
 
   const add = async (files: Iterable<Blob>) => {
-    setError(null);
+    draft({ error: null });
     let room = MAX_SHOTS - shots.length;
     for (const f of files) {
       if (!f.type.startsWith("image/")) continue;
-      if (room <= 0) { setError(t("report.tooManyShots", { max: MAX_SHOTS })); return; }
+      if (room <= 0) { draft({ error: t("report.tooManyShots", { max: MAX_SHOTS }) }); return; }
       try {
         const blob = await fitScreenshot(f);
-        const shot = { id: nextId.current++, blob, url: URL.createObjectURL(blob) };
+        const shot = { id: newShotId(), blob, url: URL.createObjectURL(blob) };
         room--;
-        setShots((list) => [...list, shot]);
-      } catch { setError(t("report.badShot")); }
+        draft((d) => ({ shots: [...d.shots, shot] }));
+      } catch { draft({ error: t("report.badShot") }); }
     }
   };
-  const remove = (id: number) => setShots((list) => list.filter((s) => {
+  const remove = (id: number) => draft((d) => ({ shots: d.shots.filter((s) => {
     if (s.id === id) URL.revokeObjectURL(s.url);
     return s.id !== id;
-  }));
+  }) }));
   const onPaste = (e: ClipboardEvent) => {
     const images = [...e.clipboardData.files].filter((f) => f.type.startsWith("image/"));
     if (images.length) { e.preventDefault(); void add(images); }
@@ -80,19 +66,9 @@ export function BugReportSection({ card }: { card?: boolean }) {
     void add(e.dataTransfer.files);
   };
 
-  const send = async () => {
-    if (!text.trim() || busy) return;
-    setBusy(true); setError(null);
-    try {
-      const images = await Promise.all(shots.map(async (s) => ({ mime: s.blob.type, data: encodeBase64Url(new Uint8Array(await s.blob.arrayBuffer())) })));
-      const record = await loadConnectRecord().catch(() => undefined);
-      const id = await connectApi.report({ text: text.trim(), diagnostics: withDiagnostics && diagnostics ? diagnostics : { app: { omitted: true } }, images }, record?.token);
-      toast("success", t("report.sent", { id }));
-      if (useUi.getState().section === "bugReport") leavePage();
-    } catch (err) {
-      setError(describeRequestError(err));
-      setBusy(false);
-    }
+  const cancel = () => {
+    clearReportDraft();
+    leavePage();
   };
 
   return (
@@ -105,7 +81,7 @@ export function BugReportSection({ card }: { card?: boolean }) {
         <div className="mx-auto flex w-full max-w-2xl flex-col gap-3 p-4 md:p-8" onPaste={onPaste} onDragOver={(e) => e.preventDefault()} onDrop={onDrop}>
           <p className="text-sm text-muted">{t("report.description")}</p>
           <Field label={t("report.what")}>
-            {(id) => <Textarea id={id} value={text} onChange={(e) => setText(e.target.value)} rows={5} maxLength={10_000} placeholder={t("report.placeholder")} autoFocus data-entry />}
+            {(id) => <Textarea id={id} value={text} onChange={(e) => draft({ text: e.target.value })} rows={5} maxLength={10_000} placeholder={t("report.placeholder")} autoFocus data-entry />}
           </Field>
           <div className="flex flex-col gap-2">
             <div className="flex flex-wrap items-center gap-2">
@@ -128,7 +104,7 @@ export function BugReportSection({ card }: { card?: boolean }) {
             </div>
             <p className="text-xs text-subtle">{t("report.shotHint")}</p>
           </div>
-          <Switch checked={withDiagnostics} onCheckedChange={setWithDiagnostics} label={t("report.diagnostics")} description={t("report.diagnosticsHint")} />
+          <Switch checked={withDiagnostics} onCheckedChange={(on) => draft({ withDiagnostics: on })} label={t("report.diagnostics")} description={t("report.diagnosticsHint")} />
           {withDiagnostics && (
             <div>
               <button type="button" className="cursor-pointer text-xs text-accent underline underline-offset-2" onClick={() => setShowDiagnostics((v) => !v)}>
@@ -144,8 +120,8 @@ export function BugReportSection({ card }: { card?: boolean }) {
           <p className="text-xs text-subtle">{account ? t("report.privacyAccount", { handle: account.handle }) : t("report.privacy")}</p>
           {error && <p role="alert" className="text-sm text-danger">{error}</p>}
           <div className="flex justify-end gap-2 pt-1">
-            <Button onClick={leavePage}>{t("common.cancel")}</Button>
-            <Button variant="primary" busy={busy} disabled={!text.trim()} onClick={() => void send()}>{t("report.send")}</Button>
+            <Button onClick={cancel}>{t("common.cancel")}</Button>
+            <Button variant="primary" busy={busy} disabled={!text.trim()} onClick={() => void sendReport(diagnostics)}>{t("report.send")}</Button>
           </div>
         </div>
       </div>

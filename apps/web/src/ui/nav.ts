@@ -82,6 +82,19 @@ const baseOf = (v: NavView, connected: boolean): NavView => {
   return v;
 };
 
+/** The same place: the fields that tell it apart (the pane of the server view, the tab a settings page shows). */
+const samePlace = (a: NavView, b: NavView): boolean =>
+  a.section === b.section &&
+  (a.section !== "servers" || a.pane === b.pane) &&
+  (a.section !== "settings" || (a.settingsDrill === b.settingsDrill && (!a.settingsDrill || a.settingsTab === b.settingsTab))) &&
+  (!isPage(a.section) || a.back === b.back);
+
+/** Whether `view` is one of the views `from` goes back to: a way back taken without an in-app way back. */
+function behind(view: NavView, from: NavView, connected: boolean): boolean {
+  for (let at = from, back = stepBack(at, connected); back !== at; at = back, back = stepBack(at, connected)) if (samePlace(back, view)) return true;
+  return false;
+}
+
 const KEY = "gwarNav";
 const SECTIONS: readonly Section[] = ["home", "servers", "settings", "bugReport"];
 const TOP: readonly Section[] = ["home", "servers"];
@@ -135,6 +148,8 @@ const isConnected = () => ["online", "reconnecting"].includes(useSession.getStat
  */
 function restore(view: NavView): void {
   const ui = useUi.getState();
+  // A dialog belongs to the view it was opened over: one Back leaves both.
+  if (!samePlace(navView(ui), view) && ui.dialog.kind !== "none") ui.closeDialog();
   const apply = () => useUi.setState({ ...navView(view), moreOpen: false });
   if (isPage(ui.section) && !isPage(view.section)) return exitPage(apply);
   const moved = isPage(view.section) ? view.section !== ui.section : view.section === "servers" && ui.section === "servers" && view.pane !== ui.pane;
@@ -148,9 +163,13 @@ function restore(view: NavView): void {
  * entry of its own, holding its view, so the system's back takes the steps one at a time. The rules:
  * - popstate never navigates: a browser's back or forward applies the view of the entry it lands on, checked field by
  *   field (else the base view); the popstate of our own `history.back()` applies nothing, the app already shows the
- *   view it went back to, and only rewrites the entry it landed on to hold it;
- * - only an in-app way back (`backInApp`: a back button, Esc out of a page, a tab back to a section's top) goes back
- *   in history, one entry, and only from an entry this page load pushed: so it lands on this load's own entries or base;
+ *   view it went back to, and only rewrites the entry it landed on to hold it (after the event, as is any step back
+ *   still to take from there);
+ * - only a way back goes back in history, one entry at a time, and only from an entry this page load pushed: so it
+ *   lands on this load's own entries or base. A way back is an in-app one (`backInApp`: a back button, Esc out of a
+ *   page, a tab back to a section's top), or any change to a view the current entry goes back to (writing to someone
+ *   from the members, a notification opening a conversation, the voice pill). Where that view is more than one entry
+ *   down, or another way back came meanwhile, the next step back follows once the last one has landed;
  * - every other change pushes the steps it adds or rewrites the current entry;
  * - a load (a reload) shows the page its entry holds, under an id of its own. Its entries are not this load's, so an
  *   in-app way back from there rewrites the entry rather than going back: the next Back shows that page once more.
@@ -161,11 +180,21 @@ let mobile = false;
 let pushed = new Set<string>();
 /** Our own `history.back()`, until its popstate comes. */
 let pending = false;
+/** An in-app way back came while `pending`: it is taken once that one lands. */
+let queuedBack = false;
 /** An in-app way back is being applied: a sync it causes (an effect of a `flushSync`) may take the step. */
 let goingBack = false;
 
-function sync(mayGoBack: boolean): void {
-  if (!mobile || pending) return;
+/**
+ * Brings the history in line with the view. `mayGoBack`: an in-app way back; `steps`: the view changed in the app, so
+ * a change to a view the entry goes back to is a way back too (not on a resize, which only shows the same view anew).
+ */
+function sync(mayGoBack: boolean, steps = false): void {
+  if (!mobile) return;
+  if (pending) {
+    queuedBack ||= mayGoBack || goingBack;
+    return;
+  }
   mayGoBack ||= goingBack;
   const connected = isConnected();
   const view = navView(useUi.getState());
@@ -173,7 +202,7 @@ function sync(mayGoBack: boolean): void {
   const at = readView(window.history.state);
   const atDepth = at ? backDepth(at, connected) : 0;
   const id = entryId(window.history.state);
-  if (mayGoBack && depth < atDepth && id !== null && pushed.has(id)) {
+  if (depth < atDepth && id !== null && pushed.has(id) && (mayGoBack || (steps && behind(view, at!, connected)))) {
     pending = true;
     window.history.back();
     return;
@@ -200,9 +229,13 @@ setBackHandler((apply) => {
 
 function onPop(e: PopStateEvent): void {
   if (pending) {
-    // Where our own step back landed: it now holds the view the app went back to.
+    // Where our own step back landed: it now holds the view the app went back to, unless a step back is still to
+    // take. That one goes after this popstate, which never navigates.
     pending = false;
-    return sync(false);
+    const again = queuedBack;
+    queuedBack = false;
+    setTimeout(() => sync(again, true));
+    return;
   }
   restore(readView(e.state) ?? baseOf(navView(useUi.getState()), isConnected()));
   sync(false);
@@ -212,6 +245,7 @@ function onPop(e: PopStateEvent): void {
 function start(): void {
   pushed = new Set();
   pending = false;
+  queuedBack = false;
   const stored = readView(window.history.state);
   if (stored && isMobileNow()) useUi.setState({ ...navView(stored), moreOpen: false });
   write(false, navView(useUi.getState()));
@@ -238,7 +272,20 @@ export function useBackHistory(isMobile: boolean): void {
     mobile = isMobile;
     sync(false);
   }, [isMobile]);
-  useEffect(() => sync(false), [view, connected]);
+  useEffect(() => sync(false, true), [view, connected]);
+}
+
+/**
+ * A connection opens on its server's chat (phones: on its channel list), the same server again too: not on the pane
+ * the last session was left on, or the one a reload brought back. The overview is a place to go, not a landing page.
+ */
+export function useConnectLanding(): void {
+  const phase = useSession((s) => s.phase);
+  useEffect(() => {
+    if (phase !== "connecting") return;
+    useUi.getState().showChat();
+    useUi.getState().setPane("list");
+  }, [phase]);
 }
 
 /** Whether a saved server is the one this session is on, and opening one (connecting unless it is). */

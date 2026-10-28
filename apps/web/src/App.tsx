@@ -18,7 +18,7 @@ import { useMembersPanel } from "./ui/members";
 import { Home } from "./ui/Home";
 import { Overview } from "./ui/Overview";
 import { MoreSheet, TabBar } from "./ui/MobileNav";
-import { paneBack, useBackHistory, useServerUnread } from "./ui/nav";
+import { paneBack, useBackHistory, useConnectLanding, useServerUnread } from "./ui/nav";
 import { SectionRail } from "./ui/SectionRail";
 import { ServerRail } from "./ui/ServerRail";
 import { SettingsSection } from "./ui/Settings";
@@ -33,7 +33,6 @@ export function App() {
   const phase = useSession((s) => s.phase);
   const serverName = useSession((s) => s.server?.name);
   const unread = useServerUnread();
-  const address = useSession((s) => s.address);
   const section = useUi((s) => s.section);
   const covered = section !== "servers";
   // With a share on stage the stage wins; the overview waits until it closes.
@@ -55,11 +54,7 @@ export function App() {
     document.title = `${unread > 0 ? `(${unread}) ` : ""}${showApp && serverName ? `${serverName} · ` : ""}Gwar`;
   }, [unread, serverName, showApp]);
 
-  // Another server opens on its chat (phones: on its channel list); the overview is a place to go, not a landing page.
-  useEffect(() => {
-    useUi.getState().showChat();
-    useUi.getState().setPane("list");
-  }, [address]);
+  useConnectLanding();
 
   useEffect(() => {
     if (!isMobile) useUi.getState().setMore(false);
