@@ -10,7 +10,6 @@ import { captureScreen, DEPENDENCY_DESCRIPTOR, headroomBitrate, MIN_BITRATE, pre
 import { deriveSpec, legacySpec, type ScreenSpec } from "./screen-quality";
 import type { ScreenPreset } from "../proto/ScreenPreset";
 import { uplinkVideoBudget } from "./screen-headroom";
-import { SCREEN_UPLINK_KEY } from "./screen-start-bitrate";
 const TEST_SPECS = Object.fromEntries((["text", "smooth", "game", "saver"] as const).map(p => [p, { ...deriveSpec(legacySpec(p)), ...legacySpec(p) }])) as Record<ScreenPreset, ScreenSpec & ReturnType<typeof deriveSpec>>;
 const codec = (mimeType: string, sdpFmtpLine?: string) => ({ mimeType, clockRate: 90000, ...(sdpFmtpLine ? { sdpFmtpLine } : {}) }) as RTCRtpCodec;
 
@@ -930,24 +929,6 @@ describe("publisher stale estimate probe", () => {
     sender.setParameters.mockImplementation(plain);
     return { writes, sender, plain };
   };
-
-  it("remembers only this transport's stable estimate and uses it on the next publish", async () => {
-    const data = new Map<string, string>();
-    vi.stubGlobal("localStorage", { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => data.set(key, value) });
-    const publisher = make(); await publisher.start();
-    const pc = Peer.all[0]!; pc.connectionState = "connected";
-    stale(pc, 8_000_000, now => ({ bytesSent: now * 800 }));
-    await vi.advanceTimersByTimeAsync(18_000);
-    expect(data.has(SCREEN_UPLINK_KEY)).toBe(false);
-    await vi.advanceTimersByTimeAsync(4_000);
-    expect(data.get(SCREEN_UPLINK_KEY)).toBe("8000000");
-    publisher.close();
-    const next = new ScreenPublisher({ track: {} as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [],
-      offer: async () => "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 H264/90000\r\n", state: () => {} });
-    await next.start();
-    expect(Peer.all[1]!.setRemoteDescription).toHaveBeenCalledWith({ type: "answer", sdp: expect.stringContaining("x-google-start-bitrate=6400") });
-    next.close();
-  });
 
   it("lifts the cap past a stale estimate for one second, then restores the headroom cap", async () => {
     const publisher = make(); await publisher.start();

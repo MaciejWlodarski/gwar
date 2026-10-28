@@ -14,7 +14,6 @@
  * every other interval keeps the strict size and cadence rules (screen-startup-judge.mjs).
  * E2E_STARTUP_PRESET=text|smooth|saver checks the other presets (default game).
  * E2E_STARTUP_DIST may select an independently built main bundle for before/after evidence.
- * E2E_STARTUP_REMEMBERED_UPLINK seeds this device's disposable uplink hint (bits/s).
  */
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -27,7 +26,6 @@ import { chromium } from "playwright";
 import { stopProcesses } from "./processes.mjs";
 import { canvasCapture, readBarcode, stampBarcode } from "./screen-source.mjs";
 import { allocationProbes, judgeSettled, probeBound } from "./screen-startup-judge.mjs";
-import { SCREEN_UPLINK_KEY } from "../src/voice/screen-start-bitrate.ts";
 import { uplinkVideoBudget } from "../src/voice/screen-headroom.ts";
 
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -143,7 +141,6 @@ async function device(browser, web, server, name, { frequency = 440 } = {}) {
   page.on("pageerror", e => page.errors.push(String(e)));
   page.on("console", m => { if (m.type() === "warning" || m.type() === "error") page.errors.push(m.text()); });
   await page.goto(web);
-  if (process.env.E2E_STARTUP_REMEMBERED_UPLINK) await page.evaluate(({ key, value }) => localStorage.setItem(key, value), { key: SCREEN_UPLINK_KEY, value: process.env.E2E_STARTUP_REMEMBERED_UPLINK });
   await page.getByLabel("Server address").fill(server);
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   await page.getByRole("tab", { name: "Identity", exact: true }).click();
@@ -349,10 +346,8 @@ try {
           // Exclude the initial spec-cap write before the first estimate. A real ceiling write
           // must also fit the uplink budget; a temporary allocation lift is not time-to-cap.
           const capAt = rows.find(r => r.params?.encodings?.[0]?.maxBitrate === ceiling && uplinkVideoBudget(r.pair?.availableOutgoingBitrate ?? NaN) >= ceiling)?.elapsed ?? null;
-          const remembered = await sharer.evaluate(key => JSON.parse(localStorage.getItem(key) ?? "null"), SCREEN_UPLINK_KEY);
           const result = { name, preset, uplink, sourceFps: +cadence.toFixed(1), captureFps: median(settled.map(r => r.source?.framesPerSecond ?? 0)), output: `${last.out.frameWidth}x${last.out.frameHeight}`, source: `${last.source?.width}x${last.source?.height}`, viewer: `${last.viewer?.width}x${last.viewer?.height}`, fps: median(settled.map(r => r.out.framesPerSecond)), decodeFps: +decodeFps.toFixed(1), payloadMbps: +(payload / 1e6).toFixed(3), availableMbps: +(median(settled.map(r => r.pair.availableOutgoingBitrate)) / 1e6).toFixed(3), stableAt: stable?.elapsed ?? null, stableDimensionsAt: stableDimensions?.elapsed ?? null, firstTargetAt: firstTarget?.elapsed ?? null, steadyFpsAt: steadyFps?.elapsed ?? null, firstFiveFps, pulses: rows.filter((r,i) => r.elapsed > 4 && r.params.degradationPreference === "maintain-resolution" && rows[i-1]?.params.degradationPreference === "maintain-framerate").length,
             configuredStartMbps: last.start?.configured ? last.start.configured / 1e6 : null, firstEstimateMbps: last.start?.available ? last.start.available / 1e6 : null,
-            rememberedUplinkMbps: typeof remembered === "number" ? remembered / 1e6 : null,
             capAt,
             encoder: last.out.encoderImplementation, limitation: last.out.qualityLimitationReason, probes: allocationProbes(rows),
             encodedFps: +((last.out.framesEncoded - first.out.framesEncoded) / dt).toFixed(1),

@@ -9,15 +9,11 @@ same helper. A smooth sender still writes the full spec cap once that budget cov
 it, even when the last upward step is inside the normal 10 % dead band.
 
 The same PR adds an optimistic GCC start in the publisher's remote answer:
-`x-google-start-bitrate` on every H.264, AV1 and VP9 fmtp. No history means
-`min(spec cap, 4 Mb/s)`; otherwise `min(spec cap, max(1 Mb/s, 0.8 × remembered))`.
+`x-google-start-bitrate` on every H.264, AV1 and VP9 fmtp, always using
+`min(spec cap, 4 Mb/s)` (with the WebKitGTK compatibility exception below).
 Four Mb/s covers the default 1080p30 budget without immediately assuming the largest
 12 Mb/s spec is affordable. This initializes GCC; it sets no minimum rate.
-The per-device/profile localStorage key `gwar.screen-uplink.v1` holds a JSON number
-in bits/s. After twenty seconds on one transport, the median of a continuous
-ten-second tail is saved only if the maximum is within 25 % of the minimum. Gaps,
-invalid stats, allocation probes and a new transport restart that evidence window.
-Storage is optional and needs no migration. See "Optimistic sender start" and
+No uplink estimate is stored or reused between publishes. See "Optimistic sender start" and
 "Voice headroom" in docs/screen-share.md for the rule and its limits.
 
 ### Local comparison
@@ -36,7 +32,7 @@ with roughly 0.5 s timeline resolution.
 | Main: 70 %, browser default start | 51.0 s [40.8–52.9] | Not sampled before startup probing; first normal samples 1.77–3.49 Mb/s |
 | Reserve only, browser default start | 9.1 s [8.6–10.8] | First normal samples 1.78–1.85 Mb/s |
 | Reserve + default 4 Mb/s start | 8.7 s [8.7–12.1] | Exactly 4.00 Mb/s in all three, 76–114 ms after remote answer |
-| Reserve + seeded 8 Mb/s history (6.4 Mb/s start) | 17.7 s [14.7–24.7] | Exactly 6.40 Mb/s in all three, 98–132 ms after remote answer |
+| Rejected remembered-start prototype (6.4 Mb/s start) | 17.7 s [14.7–24.7] | Exactly 6.40 Mb/s in all three, 98–132 ms after remote answer |
 
 Time-to-cap is the first observed full spec-cap write supported by that arm's
 headroom budget. The initial unconstrained spec-cap write and temporary allocation
@@ -48,19 +44,20 @@ The optimistic shares first reached native source/encoder/viewer dimensions at
 adapted to 1440×810 for CPU; settled payload was 6.66–8.01 Mb/s. Reaching the cap
 sooner does not guarantee sustained native size on a CPU-limited encoder.
 
-The remembered-start block is retained despite being slower. One of its three
+The rejected remembered-start measurement is retained as a negative result. One of its three
 shares failed the unchanged native-size diagnostic: it ended at 960×540 with
 `bandwidth` limitation at the full 8 Mb/s cap. The other two had CPU-limited samples.
-All three saved a stable tail of about 13.0–13.2 Mb/s, replacing the seeded history.
-The data verify initialization and persistence, but do not establish that raising
-the start above 4 Mb/s improves time-to-cap on this host. The new policy has not
-been measured on the owner's 1440p60 stream; this remains a performance risk.
+Round-1 review also showed why a stable candidate-pair estimate was unsuitable as
+a future start hint: it could come from a CPU-limited, hidden or frame-stalled sender,
+span selected-pair changes, include a lift between polls or a rejected stats poll,
+and lacked expiry and network scope. Its warm-up began at negotiation, not ICE
+connection. The owner removed the entire remembered-start feature rather than
+expand its suitability rules. It never shipped, so no key migration or cleanup is
+needed. The default-start policy has not been measured on the owner's 1440p60 stream.
 
 The harness now samples the first positive selected-pair estimate every 20 ms after
 the remote answer, before watch negotiation and startup probes hide it. It logs the
-configured start, first estimate, `capAt` and saved uplink in `summary.json`.
-`E2E_STARTUP_REMEMBERED_UPLINK=8000000` seeds an 8 Mb/s remembered uplink to exercise
-the 6.4 Mb/s remembered start independently of a previous run's outcome.
+configured start, first estimate and `capAt` in `summary.json`.
 
 ### Back-off, WebKit and voice
 
@@ -70,14 +67,14 @@ Regression tests retain queued-lift expiry, generation fencing, retiring restora
 and the independent ten-second restore deadline, including smooth ceiling writes
 queued behind a restore.
 
-In a forty-second H.264 busy run with a 1.5 Mb/s CDP uplink and seeded 12 Mb/s
-history, the hint was clamped to the 8 Mb/s spec and the first estimate was exactly
-8 Mb/s (183 ms after the answer). By the first normal sample at 0.77 s it was
-1.44 Mb/s. The settled payload was 1.17 Mb/s, encoding/decoding about 60 fps at
-640×360. The run passed the unchanged shaped-link assertions, issued zero allocation
-probes, and saved a new 1.58 Mb/s stable uplink. GCC backed off before the first
-ordinary headroom poll; the start hint and probe/restore machinery did not hold it up.
-This is one local congestion-response check, not a loss/delay matrix or a voice gate.
+After removing the remembered start, a fresh forty-second H.264 busy run with a
+1.5 Mb/s CDP uplink observed exactly the configured 4 Mb/s first estimate, 189 ms
+after the answer. By 1.08 s it was 1.43 Mb/s, before the first ordinary headroom
+poll. Settled payload was 1.29 Mb/s with about 60 encoded/decoded fps at 640×360.
+The run passed the unchanged shaped-link assertions with zero allocation probes
+and zero capture-guard pulses. The default start and existing probe/restore
+machinery did not hold up GCC's back-off. This is one local congestion-response
+check, not a loss/delay matrix or a voice gate.
 
 A native WKWebView fixture on macOS 27.0 negotiated local H.264 video with the exact
 SDP helper: without a hint the first estimate was 300 kb/s; with 4 Mb/s it was exactly
@@ -111,6 +108,8 @@ dump was parsed only as JSON with `python3 -I /tmp/gwar-reserve-evidence/dump-me
 a script outside the dump directory. It corroborates a first video estimate of
 1.632 Mb/s, 996p at about 12 s and 1288p at about 31 s; it is not a local replay or
 a measurement of the new sender on the owner's path.
+The history-removal checks and fresh default-start back-off run are retained in
+`/tmp/gwar189-round2`.
 
 Reproduction (after installing the pinned web dependencies and generated WASM):
 
@@ -119,8 +118,7 @@ CARGO_BUILD_JOBS=4 CARGO_TARGET_DIR=/tmp/gwar-reserve-target cargo build --locke
 # Build exact ce7cb503 into a separate archive/bundle for the baseline; keep each arm's output.
 NODE_ENV=development pnpm --filter web exec vite build --mode e2e --outDir /tmp/reserve-dist
 GWAR_SERVER_BIN=/tmp/gwar-reserve-target/debug/gwar-server E2E_STARTUP_DIST=/tmp/reserve-dist E2E_STARTUP_CODECS=h264 E2E_STARTUP_SOURCES=busy60 E2E_STARTUP_REPEATS=3 E2E_STARTUP_SECONDS=60 E2E_STARTUP_RESULTS=/tmp/reserve-ramp pnpm --filter web e2e:screen-startup
-# Add E2E_STARTUP_REMEMBERED_UPLINK=8000000 for the remembered arm.
-# Back-off: one repeat, 40 s, E2E_STARTUP_UPLINK=1500000 and E2E_STARTUP_REMEMBERED_UPLINK=12000000.
+# Default-start back-off: one repeat, 40 s, E2E_STARTUP_UPLINK=1500000.
 ```
 
 ### Historical 70 % ramp diagnosis (27 October 2026)

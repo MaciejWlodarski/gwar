@@ -15,7 +15,7 @@ import type { IceServer } from "../proto/IceServer";
 import { deriveSpec, resolveQuality, type ScreenSpec, type ResolvedSpec } from "./screen-quality";
 import type { ScreenSurface } from "../proto/ScreenSurface";
 import { uplinkVideoBudget } from "./screen-headroom";
-import { screenStartBitrate, ScreenUplinkHistory, withScreenStartBitrate } from "./screen-start-bitrate";
+import { screenStartBitrate, withScreenStartBitrate } from "./screen-start-bitrate";
 export { MIN_BITRATE } from "./screen-headroom";
 
 /** Receive slots of a watch transport (`gwar_proto::SCREEN_SLOTS`). */
@@ -644,7 +644,6 @@ export class ScreenPublisher {
   private readonly superseded = new Set<RTCPeerConnection>();
   /** The latest uplink estimate, for the cap a probe restores. */
   private available: number | undefined;
-  private uplinkHistory = new ScreenUplinkHistory(performance.now());
   private run = 0;
   private revision = 0;
   private parameters: Promise<void> = Promise.resolve();
@@ -710,7 +709,6 @@ export class ScreenPublisher {
     await this.applyParameters(this.spec().maxBitrate);
     if (this.closed || this.pc !== pc) return;
     this.negotiated = true;
-    this.uplinkHistory = new ScreenUplinkHistory(performance.now());
   }
 
   /** Changes quality while sharing, with no renegotiation. */
@@ -804,8 +802,6 @@ export class ScreenPublisher {
       codec = out?.codecId ? stats.get(out.codecId)?.mimeType as string | undefined : undefined;
     } catch { return; }
     this.watchAv1(out, codec);
-    // Fresh estimates from this transport only; allocation lifts cannot train the next start.
-    this.uplinkHistory.observe(performance.now(), pc.connectionState !== "connected" || this.probeTimer || this.restoring ? undefined : guardAvailable);
     const spec = this.spec();
     const target = headroomBitrate(spec.maxBitrate, available);
     const previous = this.adaptationSent;

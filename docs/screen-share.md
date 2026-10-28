@@ -641,21 +641,18 @@ exception does not apply to Chromium on Linux or native macOS WKWebView, which
 decoded H.264 and VP9 with the hint in local controls. The Linux desktop app does not
 support screen sharing; GTK is still used by the browser regression suite.
 
-With no history it starts at `min(spec cap, 4 Mb/s)`. Four Mb/s covers the default
+It always starts at `min(spec cap, 4 Mb/s)`. Four Mb/s covers the default
 1080p30 budget and avoids climbing from Chromium's roughly 300 kb/s default, while
 limiting the initial overshoot compared with always starting at the 12 Mb/s ceiling.
-With history it starts at `min(spec cap, max(1 Mb/s, 0.8 × remembered uplink))`.
-The 20 % discount allows some variation between shares; the hint can still be wrong
-after a network change, so it never imposes a minimum rate.
+No uplink estimate is persisted or reused between publishes. A remembered-start
+prototype was rejected: its busy H.264 median was slower (17.7 s to cap versus
+8.7 s with the default start), and a stable transport estimate did not establish
+healthy, advancing video on a visible page. It also lacked selected-path/network
+scope and expiry, could include probe lifts or failed stats polls, and counted
+warm-up from negotiation rather than ICE connection. That prototype was never
+released; no storage migration or cleanup is needed.
 
-`gwar.screen-uplink.v1` in localStorage is one JSON number in bits/s, local to the
-device/browser profile and origin. It is a disposable hint with no migration; malformed
-values, blocked reads and failed writes do not prevent sharing. Once a transport has
-run twenty seconds, fresh samples from its last ten seconds may update the value:
-the median, only when the maximum is within 25 % of the minimum. Missing samples,
-gaps over 4.5 s and allocation probes discard the window. A replacement transport
-starts a new twenty-second history, and existing transport/generation checks reject
-late stats. A falling estimate also resets the stale-probe wait after a 10 % move,
+A falling estimate resets the stale-probe wait after a 10 % move,
 so an optimistic overshoot cannot accumulate a probe while GCC backs off. Probe
 generation fencing, retiring restores and the independent ten-second restore deadline
 remain in force.
