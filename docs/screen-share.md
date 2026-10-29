@@ -620,8 +620,12 @@ the 12 Mb/s cap, on a path reported as loss-free with 30–45 ms RTT.
 
 The sender now subtracts `max(200 kb/s, 10 % of available)` instead ("Voice headroom"
 below). Above 2 Mb/s it can use 90 % of the estimate, allowing GCC to grow without
-the old 70 % feedback bottleneck. Below that it leaves a fixed 200 kb/s, down to the
-existing 250 kb/s video floor. This replaces the pending proposal to raise only the
+the old 70 % feedback bottleneck. Below that it leaves a fixed 200 kb/s, but never more
+than 30 % of the estimate, down to the existing 250 kb/s video floor. Without that
+bound a fixed 200 kb/s held video under 2/3 of an estimate below 600 kb/s, where
+1.5× its throughput can no longer raise the estimate: after a foreign bulk upload on
+a 10 Mb/s uplink the estimate stayed at 0.45 Mb/s and the share at the floor for
+the 30 s measured ([latency-congested-uplink.md](latency-congested-uplink.md)). This replaces the pending proposal to raise only the
 startup share to 85 %; there is one reserve rule throughout the publish lifecycle.
 The normal two-second poll and 10 % write dead band remain, including the smooth-mode
 exception that writes the full spec cap once the reserve budget covers it. The probe
@@ -977,12 +981,17 @@ datagrams reach the screen task without slowing voice down.
   with separate congestion controllers. Browser GCC is delay-based and backs
   off when the queue grows, which also protects audio. On top of that:
   - the video `maxBitrate` is the resolved spec cap, never more;
-  - the sharer applies `min(spec cap, max(250 kb/s, available − max(200 kb/s,
-    0.1 × available)))`, rounded down to bits/s, using the publish transport's
-    `availableOutgoingBitrate` (from `getStats` `candidate-pair`);
+  - the sharer applies `min(spec cap, max(250 kb/s, available − min(max(200 kb/s,
+    0.1 × available), 0.3 × available)))`, rounded down to bits/s, using the publish
+    transport's `availableOutgoingBitrate` (from `getStats` `candidate-pair`);
     200 kb/s covers roughly 64 kb/s Opus plus RTCP and repairs without reserving
-    multiple Mb/s on a fast link. Above 2 Mb/s, 10 % leaves a growing repair margin;
-  - the 250 kb/s probing floor takes precedence below a 450 kb/s estimate. It can
+    multiple Mb/s on a fast link. Above 2 Mb/s, 10 % leaves a growing repair margin.
+    Below 667 kb/s the reserve is 30 %: video under 2/3 of the estimate would stop
+    GCC's growth (it raises the estimate to at most 1.5× measured throughput). The
+    margin is thin, as with the old 0.7× rule: video at 0.7× the estimate leaves
+    1.05× headroom, so a static screen that encodes below ~95 % of its target does
+    not raise the estimate;
+  - the 250 kb/s probing floor takes precedence below a 357 kb/s estimate. It can
     leave less than 200 kb/s, or even exceed the estimate; voice capacity is not
     guaranteed there. Missing/invalid estimates retain the spec cap, and GCC remains
     responsible for congestion response. This is a per-transport estimate, not a

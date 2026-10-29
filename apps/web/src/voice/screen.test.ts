@@ -22,8 +22,19 @@ describe("voice headroom", () => {
     expect(headroomBitrate(4_000_000, 900_000)).toBe(700_000);
     expect(headroomBitrate(4_000_000, 1_000_000.5)).toBe(800_000);
   });
+  it("reserves at most 30 % of a low estimate, so GCC's 1.5x-throughput limit can still grow it", () => {
+    expect(headroomBitrate(4_000_000, 600_000)).toBe(420_000);
+    expect(headroomBitrate(4_000_000, 450_000)).toBe(315_000);
+    // Measured trap (docs/latency-congested-uplink.md): a 450 kb/s estimate after a bulk upload
+    // held video at the 250 kb/s floor, and 1.5x that throughput never reached the estimate.
+    for (let available = 100_000; available <= 20_000_000; available += 50_000) {
+      const video = uplinkVideoBudget(available);
+      expect(Math.max(video, 0.7 * available) - video).toBeLessThanOrEqual(1);
+      expect(1.5 * video).toBeGreaterThan(available);
+    }
+  });
   it("keeps the probing floor even when the uplink cannot cover the reserve", () => {
-    expect(headroomBitrate(4_000_000, 450_000)).toBe(MIN_BITRATE);
+    expect(headroomBitrate(4_000_000, 350_000)).toBe(MIN_BITRATE);
     expect(headroomBitrate(4_000_000, 300_000)).toBe(MIN_BITRATE);
     expect(headroomBitrate(4_000_000, 100_000)).toBe(MIN_BITRATE);
     expect(headroomBitrate(100_000, 300_000)).toBe(100_000);
@@ -169,7 +180,8 @@ describe("publish transport", () => {
     expect(pc.setRemoteDescription).toHaveBeenCalledWith({ type: "answer", sdp: expect.stringContaining("x-google-start-bitrate=1500") });
     pc.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 600_000 });
     await vi.advanceTimersByTimeAsync(2000);
-    expect(publisher.bitrate).toBe(400_000);
+    // 30 % of a low estimate is reserved, never the full 200 kb/s.
+    expect(publisher.bitrate).toBe(420_000);
     expect(pc.sendParams.at(-1)!.encodings[0]).not.toHaveProperty("minBitrate");
     publisher.close();
   });

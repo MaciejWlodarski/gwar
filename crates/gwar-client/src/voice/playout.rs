@@ -164,7 +164,8 @@ impl Slot {
         Ok(Self {
             buffer: JitterBuffer::new(),
             decoder: Decoder::new(SampleRate::Hz48000, Channels::Mono)?,
-            decoded: vec![0.0; 5760 + 2 * MAX_LAG],
+            // A frame and a packet decoded after it (decode-ahead, a backlog cut).
+            decoded: vec![0.0; 2 * 5760],
             position: 0,
             end: 0,
             generation: None,
@@ -258,6 +259,35 @@ impl Slot {
                         n -= removed;
                         let skip = if !onset && quiet { skip.min(QUIET_SKIP).min(n) } else { 0 };
                         self.buffer.shrunk(now, removed + skip);
+                        // A due backlog cut drops the quiet packets after a quiet frame, and
+                        // the first loud one plays after this frame: speech stays, and the
+                        // rest waits for the next quiet frame. Once it has waited
+                        // `BACKLOG_WAIT` the rest goes at once. Either way the decoder runs
+                        // through the cut audio, so the next packet continues its state
+                        // rather than the dropped stream's.
+                        let cut = self.buffer.cut_backlog(now);
+                        if !cut.is_empty() {
+                            let mut discard = [0.0; 5760];
+                            for data in cut {
+                                let input = Packet::try_from(data.as_slice()).ok();
+                                let output = MutSignals::try_from(&mut discard[..])?;
+                                self.decoder.decode_float(input, output, false).unwrap_or(0);
+                            }
+                        } else if quiet {
+                            while self.buffer.backlog_room() {
+                                let Playout::Packet { data, .. } = self.buffer.pop_for(now, 0) else { break };
+                                let input = Packet::try_from(data.as_slice()).ok();
+                                let output = MutSignals::try_from(&mut self.decoded[n..n + 5760])?;
+                                let next = self.decoder.decode_float(input, output, false).unwrap_or(0);
+                                let level = level_db(&self.decoded[n..n + next]);
+                                if next == 0 || level >= -42.0 {
+                                    self.previous_level = level;
+                                    n += next;
+                                    break;
+                                }
+                                self.buffer.dropped(now, next);
+                            }
+                        }
                         (n, skip, fade)
                     }
                     Playout::Conceal(samples) => {
@@ -464,7 +494,8 @@ mod tests {
             slot.buffer.push(0, 960, first.clone());
             let onset = encode(&encoder, true);
             let onset_ts = if plc { 1920 } else { 960 };
-            for i in 0..8 {
+            // Less than the jitter buffer's `BACKLOG_TRIM` surplus: a shrink proposal, not a cut.
+            for i in 0..5 {
                 slot.buffer.push(onset_ts + i * 960, 960, onset.clone());
             }
             let mut initial = [0.0; 960];
@@ -487,12 +518,123 @@ mod tests {
         }
     }
 
+    /// 10 s of a voice that `speaks(i)` in 20 ms frame `i` (a harmonic, else silence), encoded
+    /// in order, and each frame as a decoder of the whole stream plays it.
+    fn voice(speaks: impl Fn(usize) -> bool) -> (Vec<Vec<u8>>, Vec<Vec<f32>>) {
+        let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+        let mut reference = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
+        let pcm = harmonic(150.0, 0.02, 0.3, 520 * 960);
+        let frames: Vec<_> = pcm
+            .chunks(960)
+            .enumerate()
+            .map(|(i, frame)| {
+                let frame = if speaks(i) { frame.to_vec() } else { vec![0.0; 960] };
+                let mut data = vec![0; 1275];
+                let n = encoder.encode_float(&frame, &mut data).unwrap();
+                data.truncate(n);
+                data
+            })
+            .collect();
+        let decoded = frames.iter().map(|data| decode(&mut reference, Some(data))).collect();
+        (frames, decoded)
+    }
+
+    /// One 20 ms refill of `samples` after 300 ms of `frames` arrived at once at `start` and then
+    /// one per refill. Returns the output, the frames taken from the queue (played, dropped or
+    /// cut) and the samples cut.
+    fn backlog_refill(
+        slot: &mut Slot,
+        frames: &[Vec<u8>],
+        start: Instant,
+        refill: u64,
+        samples: usize,
+    ) -> (Vec<f32>, std::ops::Range<u64>, u64) {
+        use super::super::jitter::Clock;
+        let now = start + Duration::from_millis(refill * 20);
+        if refill == 0 {
+            for i in 0..15 {
+                slot.buffer.push_at(i * 960, 960, frames[i as usize].clone(), start, Clock::Rtp);
+            }
+        }
+        let i = refill + 15;
+        slot.buffer.push_at(i * 960, 960, frames[i as usize].clone(), now, Clock::Rtp);
+        let (head, shrunk) = (slot.buffer.head().unwrap() / 960, slot.buffer.shrink_samples);
+        let mut out = vec![0.0; samples];
+        slot.mix_into(&mut out, 1.0, now).unwrap();
+        (out, head..slot.buffer.head().unwrap() / 960, slot.buffer.shrink_samples - shrunk)
+    }
+
+    #[test]
+    fn a_backlog_cut_drops_only_quiet_packets_until_its_cap() {
+        // 300 ms of backlog; the window proves the surplus at 5 s (refill 250), and the cut may
+        // go ahead regardless 2 s later. In speech with 120 ms pauses the quiet packets cover
+        // the cut before then; with single quiet frames between words nothing goes until then.
+        for pauses in [true, false] {
+            let speaks = |i: usize| if pauses { i % 16 < 10 } else { i % 10 >= 2 };
+            let (frames, decoded) = voice(speaks);
+            let quiet = |i: u64| level_db(&decoded[i as usize]) < -42.0;
+            let mut slot = Slot::new().unwrap();
+            let start = Instant::now();
+            let (mut dropped, mut done) = (0, None);
+            for refill in 0..500 {
+                let (_, taken, shrunk) = backlog_refill(&mut slot, &frames, start, refill, 960);
+                if shrunk >= 960 && refill < 350 {
+                    // The dropped packets follow the frames played; the first loud one after
+                    // them, if taken, plays next.
+                    let k = shrunk / 960;
+                    let last = taken.end - u64::from(!quiet(taken.end - 1));
+                    assert!(
+                        (last - k..last).all(quiet),
+                        "pauses {pauses}: refill {refill} dropped speech in {taken:?} ({k} dropped)"
+                    );
+                    dropped += k;
+                }
+                if done.is_none() && slot.buffer.depth().1 <= 960 * 5 {
+                    done = Some(refill);
+                }
+            }
+            let done = done.expect("no backlog cut");
+            if pauses {
+                assert!((250..350).contains(&done), "cut by refill {done}");
+                assert!(dropped >= 10, "{dropped} quiet packets dropped");
+            } else {
+                // Without a pause the cut waits its 2 s cap, then goes ahead.
+                assert_eq!(dropped, 0);
+                assert!((350..=360).contains(&done), "forced cut at refill {done}");
+            }
+            // About 40 ms of the surplus stays, beyond the refill and the jitter target.
+            assert!(slot.buffer.depth().1 <= 960 * 5, "{} samples kept", slot.buffer.depth().1);
+            assert_eq!(slot.buffer.concealments, 0);
+        }
+    }
+
+    #[test]
+    fn the_decoder_runs_through_a_forced_backlog_cut() {
+        // In steady speech the cut goes ahead at its cap. The next packet fades in, then plays
+        // as a decoder that decoded every packet plays it, not as one that skipped the cut.
+        let (frames, decoded) = voice(|_| true);
+        let mut slot = Slot::new().unwrap();
+        let start = Instant::now();
+        let mut refill = 0;
+        while backlog_refill(&mut slot, &frames, start, refill, 960).2 < 960 * 5 {
+            refill += 1;
+            assert!(refill < 400, "no backlog cut");
+        }
+        let staged = slot.staged_samples();
+        let (out, taken, _) = backlog_refill(&mut slot, &frames, start, refill + 1, staged + 960);
+        let expected = &decoded[taken.start as usize];
+        let error = out[staged + FADE..].iter().zip(&expected[FADE..]).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(error < 1e-6, "{error} from the continuous decoder after the cut");
+        assert!(level_db(expected) > -30.0);
+    }
+
     #[test]
     fn quiet_candidate_is_shrunk_and_boundary_fades_for_120_samples() {
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
         let mut slot = Slot::new().unwrap();
         let now = Instant::now();
-        for i in 0..8 {
+        // Less than the jitter buffer's `BACKLOG_TRIM` surplus: a shrink proposal, not a cut.
+        for i in 0..6 {
             slot.buffer.push(i * 960, 960, encode(&encoder, false));
         }
         slot.mix_into(&mut [0.0; 960], 1.0, now).unwrap();

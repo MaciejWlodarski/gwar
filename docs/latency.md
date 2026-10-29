@@ -198,6 +198,21 @@ and accept decimals (0 through 24 hours); percentages require `%` (0 through
   would wait longer is dropped (`queue_dropped`, also counted in `dropped`).
   `queue_max_ms` records the longest wait.
 
+- `bulk=10s-30s` (needs `rate`): a foreign bulk TCP upload through the same
+  bottleneck from 10 to 30 seconds on the measurement clock, or `bulk=manual`,
+  switched by `Relay::set_bulk` (the web fixture's `bulk on|off` command).
+  It is simulated, never sent: a greedy CUBIC sender (RFC 8312, the macOS and
+  Linux default) whose 1500-byte segments occupy the link and the drop-tail
+  queue like relayed datagrams. An ACK returns `bulk_rtt` (default 20 ms) after
+  a segment leaves the link; a drop is noticed one smoothed round trip later
+  and reduces the window at most once per round trip. Each start is a new
+  connection in slow start. Real TCP cannot be squeezed through a user-space
+  relay's drop-tail queue; this keeps the bloat deterministic and needs no sudo.
+  `up_link`/`down_link` in the report give its counters and goodput per
+  episode, and every bottleneck's `queue_timeline`: relayed datagrams' queue
+  residence (mean, max, drops) per 250 ms. See
+  [latency-congested-uplink.md](latency-congested-uplink.md).
+
 Loss is applied first, then the bottleneck, delay/jitter, the optional reorder hold, the stall,
 and finally order preservation. The relay treats every UDP datagram alike,
 including ICE/DTLS/RTCP; it never decrypts media. Severe impairments during
@@ -1384,7 +1399,15 @@ Variants are `name:key=value,...` (`--set` for all of them): `path=browser`
 `seed=42;down:jitter=10ms`, `loss` `seed=42;down:loss=2%`, as in the native gate);
 `mic=webaudio|track`; and two experiments that change nothing in the app,
 `ptime=MS` (adds `a=ptime` to the sender's answer) and `jbt=MS` (sets the
-receiver's `jitterBufferTarget`). `--runs` (per variant, default 4), `--markers`
+receiver's `jitterBufferTarget`). For a congested sender uplink, `net=up10` or
+`net=up20` is a 10 or 20 Mb/s bottleneck with a 400 ms drop-tail buffer and a 20 ms
+base round trip; `bulk=10-30` runs a foreign bulk upload through it from 10 s to 30 s
+after the first marker; `screen=on` adds a screen share from the voice sender, watched
+by the receiver (a third page each beside a native peer), with `codec=`, `quality=` and
+`settle=`; `web=DIR` and `fixture=PATH` serve another e2e build or run another fixture
+build for before/after pairs. Those runs sample both transports every 500 ms and add
+phase, recovery and queue figures (`congestion` in `run.json` and `summary.json`); see
+[latency-congested-uplink.md](latency-congested-uplink.md). `--runs` (per variant, default 4), `--markers`
 (60) and `--warmup-ms` (5000) work as in the native runner; variants alternate
 supplied and reversed order. A run takes 15–35 s; each keeps `run.json` (every
 marker and onset, stats, host load, relay counters) and `latency.csv` under
