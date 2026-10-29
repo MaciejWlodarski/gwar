@@ -5,15 +5,16 @@ export function screenStartBitrate(cap: number): number {
 
 /** Chromium reads the start hint from its remote answer; leave audio, RTX and other fmtp intact. */
 export function withScreenStartBitrate(sdp: string, bitrate: number, userAgent = globalThis.navigator?.userAgent ?? "", platform = globalThis.navigator?.platform ?? ""): string {
-  // WebKitGTK's GStreamer VP9 sender can negotiate this extra fmtp but encode zero frames.
-  // Native macOS WKWebView uses libwebrtc and accepts it. Linux desktop sharing is unsupported,
-  // but keep GTK's browser/test transport usable with its original answer and GCC start.
-  if (/Linux/i.test(`${userAgent} ${platform}`) && /AppleWebKit/i.test(userAgent) && !/Chrom(?:e|ium)/i.test(userAgent)) return sdp;
+  // GTK/WPE's libwebrtc encoder factory matches VP9's entire fmtp map: an extra key
+  // prevents encoder creation. Its H.264 branch accepts the hint. Keep other GTK
+  // codecs unchanged; native macOS WKWebView and Chromium retain all supported hints.
+  const gtk = /Linux/i.test(`${userAgent} ${platform}`) && /AppleWebKit/i.test(userAgent) && !/Chrom(?:e|ium)/i.test(userAgent);
   const newline = sdp.includes("\r\n") ? "\r\n" : "\n";
   const hint = `x-google-start-bitrate=${Math.max(1, Math.floor(bitrate / 1000))}`;
   return sdp.split(/(?=^m=)/m).map(section => {
     if (!/^m=video /m.test(section)) return section;
-    const codecs = new Set([...section.matchAll(/^a=rtpmap:(\d+) (?:H264|AV1|VP9)\/90000\r?$/gmi)].map(m => m[1]!));
+    const codecs = new Set([...section.matchAll(/^a=rtpmap:(\d+) (H264|AV1|VP9)\/90000\r?$/gmi)]
+      .filter(m => !gtk || m[2]!.toUpperCase() === "H264").map(m => m[1]!));
     const fmtp = new Set([...section.matchAll(/^a=fmtp:(\d+) /gm)].map(m => m[1]!));
     return section.split(/\r?\n/).flatMap(line => {
       const match = /^a=fmtp:(\d+) (.*)$/i.exec(line);
