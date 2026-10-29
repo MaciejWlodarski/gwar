@@ -8,8 +8,8 @@ use std::{
 #[derive(Debug, PartialEq)]
 pub enum Playout {
     /// Decode before spending this budget, possibly across contiguous packets.
-    /// The decoder requires quiet PCM or an overlap that correlates above `correlation`;
-    /// commit a removed period via `accelerated`, quiet PCM via `shrunk`.
+    /// The decoder requires inaudible PCM or an overlap that correlates above `correlation`;
+    /// commit a removed period via `accelerated`, inaudible PCM via `shrunk`.
     Packet {
         data: Vec<u8>,
         skip: usize,
@@ -344,7 +344,7 @@ const ALIKE_POINTS: usize = 64; // Consumption points per packet that `alike` ac
 const FORCE_SHRINK: Duration = Duration::from_secs(2);
 const SHRINK_STEP: u64 = 720; // Allow one low-pitched period (15 ms); the decoder commits the actual cut.
 // Debited low-water evidence supports bounded recovery: at most 10 ms/s in
-// quiet PCM (5 ms cuts), or 30 ms/s for a correlated 15 ms period.
+// inaudible PCM (5 ms cuts), or 30 ms/s for a correlated 15 ms period.
 const SHRINK_INTERVAL: Duration = Duration::from_millis(500);
 const TRIM_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(1);
 // A declined proposal (noise, onset) costs a pitch search; retry at most 5 times a second.
@@ -352,7 +352,7 @@ const SHRINK_RETRY: Duration = Duration::from_millis(200);
 // A surplus this large (100 ms), proven for `backlog_evidence`, is cut: the gentle shrink would
 // take seconds to minutes. The cut leaves `BACKLOG_KEEP` (40 ms) of it to the gentle shrink, a
 // cushion against local stalls the arrival rule cannot see. It never drops speech: it drops
-// quiet packets after quiet frames, and accelerates the rest as libwebrtc's NetEq does
+// inaudible packets after inaudible frames, and accelerates the rest as libwebrtc's NetEq does
 // (playout.rs `accelerate`), removing one pitch period at a time from audio that correlates
 // above `BACKLOG_CORRELATION` (NetEq's `kCorrelationThreshold`). Each period removed costs
 // `BACKLOG_PACE` times its length of playout, so speech plays at most 1.2 times as fast.
@@ -360,11 +360,11 @@ const SHRINK_RETRY: Duration = Duration::from_millis(200);
 // After `BACKLOG_WAIT` the cut takes a period that correlates above `RELAXED_CORRELATION`
 // (NetEq's fast-mode threshold), from the whole 2.5--15 ms range, so a voice still loses only
 // whole periods. Audio without a period (noise, unvoiced or whispered speech, most music) is
-// never spliced: its backlog drains in quiet packets and frames (below -42 dB, also those decoded
-// ahead with speech), and otherwise stays as it is (it does not grow; `MAX_QUEUED` caps any
-// queue). NetEq accepts any lag only when an energy VAD finds no active speech; here quiet audio
-// is dropped or skipped by its level instead. A cut
-// that removes nothing for `BACKLOG_STUCK` gives up and restarts the window, which gives the
+// never spliced: its backlog drains in inaudible packets and frames (playout.rs `inaudible`, also
+// those decoded ahead with speech) and in the pauses a sender's gate sends as no packets, and
+// otherwise stays as it is (it does not grow; `MAX_QUEUED` caps any queue). NetEq accepts any lag
+// only when an energy VAD finds no active speech; here only inaudible audio goes without a
+// period, as soft speech has the level of a background. A cut that removes nothing for `BACKLOG_STUCK` gives up and restarts the window, which gives the
 // gentle shrink its turn.
 //
 // The evidence starts at one window and doubles (up to `MAX_BACKLOG_EVIDENCE`) whenever playout
@@ -964,16 +964,16 @@ impl JitterBuffer {
     }
 
     /// Whether a due cut (`update_backlog`) can take the next packet, which is queued in order.
-    /// After a quiet frame the decoder takes it with `pop_for(now, 0)` and, if it decodes quiet
-    /// too, drops it (`dropped`); a loud one plays after the frame, as decode-ahead does. A cut
-    /// so removes only silence, and the decoder runs through all of it.
+    /// After an inaudible frame the decoder takes it with `pop_for(now, 0)` and, if it decodes
+    /// inaudible too, drops it (`dropped`); an audible one plays after the frame, as decode-ahead
+    /// does. A cut so removes only silence, and the decoder runs through all of it.
     pub(crate) fn backlog_room(&self) -> bool {
         self.backlog_due.is_some()
             && self.recovering.is_none()
             && self.next.and_then(|next| self.packets.get(&next)).is_some_and(|p| p.samples <= self.backlog_excess())
     }
 
-    /// Commit a quiet packet a due cut dropped (`backlog_room`): debited like `shrunk`.
+    /// Commit an inaudible packet a due cut dropped (`backlog_room`): debited like `shrunk`.
     pub(crate) fn dropped(&mut self, now: Instant, samples: usize) {
         self.shrunk(now, samples);
     }

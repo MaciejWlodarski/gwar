@@ -112,11 +112,14 @@ pub(super) struct Slot {
     fade_from: f32,
     fade_left: usize,
     previous_level: f32,
-    /// Test-only: samples output so far, and every edit of the decoded stream.
+    /// Test-only: samples output so far, every edit of the decoded stream, and every packet
+    /// decoded (played or dropped), in order.
     #[cfg(test)]
     played: u64,
     #[cfg(test)]
     edits: Vec<Edit>,
+    #[cfg(test)]
+    taken: Vec<Vec<u8>>,
 }
 
 /// Test-only: `removed` samples of the decoded stream are missing from the output from sample
@@ -131,7 +134,14 @@ struct Edit {
 }
 
 const FADE: usize = 120; // 2.5 ms at a latency correction boundary.
-const QUIET_SKIP: usize = 240; // Unmatched cuts only in quiet audio, 5 ms at a time.
+const QUIET_SKIP: usize = 240; // Unmatched cuts only in inaudible audio, 5 ms at a time.
+// Audio without a matched period goes only where it is inaudible, not merely quiet: below both
+// -70 dB RMS and a -60 dB peak (0.001), so a transient fails. The test voice speaks at about
+// -17 dB RMS; 46 dB down (gain 0.005) it decodes at -64.5 dB RMS with -57 dB peaks, still a
+// voice, and 55 dB down it would be about 5 dB SPL at a normal listening level. Digital silence
+// decodes at -112 dB RMS with -90 dB peaks, and the second frame after a word at about -70 dB.
+const INAUDIBLE_RMS: f32 = -70.0;
+const INAUDIBLE_PEAK: f32 = 0.001;
 const MIN_LAG: usize = 120; // Search 2.5--15 ms pitch periods at 48 kHz.
 const MAX_LAG: usize = 720;
 const SPLICE_EVERY: usize = 480; // At most one splice per 10 ms, as NetEq's ticks.
@@ -235,6 +245,11 @@ fn centered_correlation((a, b): (&[f32], &[f32]), (a_sum, aa): (f64, f64), (b_su
     Some(ab / (a_energy * b_energy).sqrt())
 }
 
+/// Whether `pcm` holds nothing anyone could hear (`INAUDIBLE_RMS`, `INAUDIBLE_PEAK`).
+fn inaudible(pcm: &[f32]) -> bool {
+    !pcm.is_empty() && level_db(pcm) < INAUDIBLE_RMS && pcm.iter().all(|sample| sample.abs() < INAUDIBLE_PEAK)
+}
+
 /// The sum and the energy of `pcm`.
 fn sums(pcm: &[f32]) -> (f64, f64) {
     pcm.iter().fold((0.0, 0.0), |(sum, energy), &x| (sum + f64::from(x), energy + f64::from(x) * f64::from(x)))
@@ -272,6 +287,8 @@ impl Slot {
             played: 0,
             #[cfg(test)]
             edits: Vec::new(),
+            #[cfg(test)]
+            taken: Vec::new(),
         })
     }
 
@@ -326,12 +343,14 @@ impl Slot {
             if self.position == self.end {
                 let (n, skip, fade) = match self.buffer.pop_for(now, demand - written) {
                     Playout::Packet { data, skip, quiet_only: _, fade, correlation } => {
+                        #[cfg(test)]
+                        self.taken.push(data.clone());
                         let input = Packet::try_from(data.as_slice()).ok();
                         let output = MutSignals::try_from(&mut self.decoded[..5760])?;
                         let mut n = self.decoder.decode_float(input, output, false).unwrap_or(0);
                         let level = level_db(&self.decoded[..n]);
-                        let quiet = n > 0 && level < -42.0;
-                        // A due backlog cut also takes the first quiet frame it decodes ahead
+                        let quiet = n > 0 && inaudible(&self.decoded[..n]);
+                        // A due backlog cut also takes the first inaudible frame it decodes ahead
                         // (`ahead`), at its pace: a block of speech used to carry it past the cut.
                         let backlog = skip > 0 && correlation < SHRINK_CORRELATION;
                         let mut ahead = None;
@@ -343,13 +362,16 @@ impl Slot {
                             // replaying history. A gap/recovery stops lookahead unchanged.
                             while n < STRETCH_BLOCK {
                                 let Playout::Packet { data, .. } = self.buffer.pop_for(now, 0) else { break };
+                                #[cfg(test)]
+                                self.taken.push(data.clone());
                                 let input = Packet::try_from(data.as_slice()).ok();
                                 let output = MutSignals::try_from(&mut self.decoded[n..n + 5760])?;
                                 let next = self.decoder.decode_float(input, output, false).unwrap_or(0);
                                 let level = level_db(&self.decoded[n..n + next]);
-                                onset |= next == 0 || (level >= -42.0 && level > self.previous_level + 6.0);
+                                let silent = inaudible(&self.decoded[n..n + next]);
+                                onset |= next == 0 || (!silent && level > self.previous_level + 6.0);
                                 self.previous_level = level;
-                                if backlog && !onset && level < -42.0 {
+                                if backlog && !onset && silent {
                                     ahead = Some((n, next));
                                 }
                                 n += next;
@@ -383,7 +405,7 @@ impl Slot {
                             at += SPLICE_EVERY.max(period);
                         }
                         self.buffer.accelerated(now, removed);
-                        // A quiet frame decoded ahead goes from its start, up to the cut's credit,
+                        // An inaudible frame decoded ahead goes from its start, up to the cut's credit,
                         // and is paced as periods are; the rest of the frame fades in.
                         if let Some((start, len)) = ahead {
                             let cut = skip.min(len.saturating_sub(FADE));
@@ -407,17 +429,20 @@ impl Slot {
                         if skip > 0 {
                             self.edits.push(Edit { at: self.played, removed: skip, modified: FADE, correlation: None });
                         }
-                        // A due backlog cut drops the quiet packets after a quiet frame, and
-                        // the first loud one plays after this frame: speech stays. The decoder
-                        // runs through the dropped audio, so the next packet continues its state.
+                        // A due backlog cut drops the inaudible packets after an inaudible frame,
+                        // and the first audible one plays after this frame: speech stays, however
+                        // soft. The decoder runs through the dropped audio, so the next packet
+                        // continues its state.
                         if quiet {
                             while self.buffer.backlog_room() {
                                 let Playout::Packet { data, .. } = self.buffer.pop_for(now, 0) else { break };
+                                #[cfg(test)]
+                                self.taken.push(data.clone());
                                 let input = Packet::try_from(data.as_slice()).ok();
                                 let output = MutSignals::try_from(&mut self.decoded[n..n + 5760])?;
                                 let next = self.decoder.decode_float(input, output, false).unwrap_or(0);
                                 let level = level_db(&self.decoded[n..n + next]);
-                                if next == 0 || level >= -42.0 {
+                                if next == 0 || !inaudible(&self.decoded[n..n + next]) {
                                     self.previous_level = level;
                                     n += next;
                                     break;
@@ -478,7 +503,7 @@ impl Slot {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{super::jitter::Clock, *};
     use audiopus::{Application, coder::Encoder};
 
     #[test]
@@ -693,25 +718,24 @@ mod tests {
     }
 
     /// One 20 ms refill of `samples` after `backlog` of `frames` arrived at once at `start` and
-    /// then one per refill. Returns the output, the frames taken from the queue (played or
-    /// dropped) and the samples removed.
+    /// then one per refill, on `clock`. Returns the output, the frames taken from the queue
+    /// (played or dropped) and the samples removed.
     fn backlog_refill(
         slot: &mut Slot,
-        frames: &[Vec<u8>],
+        (frames, clock): (&[Vec<u8>], Clock),
         backlog: u64,
         start: Instant,
         refill: u64,
         samples: usize,
     ) -> (Vec<f32>, std::ops::Range<u64>, u64) {
-        use super::super::jitter::Clock;
         let now = start + Duration::from_millis(refill * 20);
         if refill == 0 {
             for i in 0..backlog {
-                slot.buffer.push_at(i * 960, 960, frames[i as usize].clone(), start, Clock::Rtp);
+                slot.buffer.push_at(i * 960, 960, frames[i as usize].clone(), start, clock);
             }
         }
         let i = refill + backlog;
-        slot.buffer.push_at(i * 960, 960, frames[i as usize].clone(), now, Clock::Rtp);
+        slot.buffer.push_at(i * 960, 960, frames[i as usize].clone(), now, clock);
         let (head, shrunk) = (slot.buffer.head().unwrap() / 960, slot.buffer.shrink_samples);
         let mut out = vec![0.0; samples];
         slot.mix_into(&mut out, 1.0, now).unwrap();
@@ -719,9 +743,9 @@ mod tests {
     }
 
     /// What `drain` measured: the first refill that removed audio and the first after it with
-    /// at most 100 ms queued (the window proves the surplus at refill 250); speech (packets that
-    /// decode at -42 dB or louder) and quiet packets dropped whole, and the rest removed (pitch
-    /// periods and 5 ms quiet skips), in samples; the largest sample-to-sample step of the
+    /// at most 100 ms queued (the window proves the surplus at refill 250); audible and
+    /// inaudible packets (`inaudible`) dropped whole, and the rest removed (pitch periods and
+    /// 5 ms inaudible skips), in samples; the largest sample-to-sample step of the
     /// output against the reference's; the largest share of any second of output that was
     /// removed by less than a packet (how much faster than real time speech played); and every
     /// period removed, with the refill that removed it and its correlation.
@@ -745,9 +769,21 @@ mod tests {
     /// runs through everything dropped. Nothing but pitch periods goes from a frame the voice
     /// speaks in, however softly.
     fn drain(pitch: f32, noise_level: f32, fan: f32, gain: impl Fn(usize) -> f32, backlog: u64) -> Drain {
+        drain_on(Clock::Rtp, pitch, noise_level, fan, gain, backlog)
+    }
+
+    /// `drain` on `clock`.
+    fn drain_on(
+        clock: Clock,
+        pitch: f32,
+        noise_level: f32,
+        fan: f32,
+        gain: impl Fn(usize) -> f32,
+        backlog: u64,
+    ) -> Drain {
         let (frames, decoded) = voice(pitch, noise_level, fan, &gain);
         let content: Vec<f32> = decoded.concat();
-        let quiet = |i: u64| level_db(&decoded[i as usize]) < -42.0;
+        let quiet = |i: u64| inaudible(&decoded[i as usize]);
         let mut slot = Slot::new().unwrap();
         let start = Instant::now();
         let (mut first, mut done) = (None, None);
@@ -767,7 +803,7 @@ mod tests {
         let mut removals = Vec::new();
         for refill in 0..500 {
             let edits = slot.edits.len();
-            let (out, taken, shrunk) = backlog_refill(&mut slot, &frames, backlog, start, refill, 960);
+            let (out, taken, shrunk) = backlog_refill(&mut slot, (&frames, clock), backlog, start, refill, 960);
             drain
                 .periods
                 .extend(slot.edits[edits..].iter().filter_map(|e| e.correlation.map(|c| (refill, e.removed, c))));
@@ -904,17 +940,16 @@ mod tests {
     }
 
     #[test]
-    fn quiet_gaps_decoded_ahead_drain_and_words_stay_whole() {
-        // Review of #201: in noise in words with 40 ms gaps the quiet frame of each gap (below
-        // -42 dB) sat inside a block decoded ahead with speech, which nothing searched for
-        // quiet: its 430 ms backlog stayed for good (main dropped 380 ms of it, words included).
-        // It now goes, paced, from frames the fixture marks silent only (`drain`). Over a fan
-        // the gaps never decode below -42 dB, and a level alone cannot tell them from soft
-        // speech (`soft_words_lose_nothing_but_whole_periods`): without a period, that backlog
-        // stays, bounded, as with steady noise. Noise suppression removes the fan.
+    fn audible_gaps_keep_a_backlog_without_periods_and_words_stay_whole() {
+        // Review of #201: noise in words with 40 ms gaps kept its 430 ms backlog (main dropped
+        // 380 ms of it, words included). Its gaps decode at about -40 dB, then about -70 dB:
+        // a level that soft speech has too (`quiet_talkers_lose_nothing_but_whole_periods`),
+        // so with no period to remove the backlog stays, bounded, as with steady noise. A voice
+        // over a fan drains in its periods. Noise suppression removes noise and fan; a sender's
+        // gate sends longer pauses as no packets (`gated_pauses_drain_by_their_missing_packets`).
         let gaps = |i| f32::from(u8::from(i % 10 >= 2));
         for (name, pitch, noise_level, fan, drains) in [
-            ("noise in words", 0.0, 0.3, 0.0, true),
+            ("noise in words", 0.0, 0.3, 0.0, false),
             ("voice over a fan", 150.0, 0.0, 0.03, true),
             ("noise in words over a fan", 0.0, 0.3, 0.03, false),
         ] {
@@ -943,8 +978,8 @@ mod tests {
     fn soft_words_lose_nothing_but_whole_periods() {
         // Review of #201: a voice 20 dB softer for a second (about -34 dB) set the background
         // floor of a relative level rule itself and lost cuts of 720 and 192 samples of a
-        // 320-sample period. Its level proves nothing: only quiet audio (below -42 dB) goes but
-        // in periods.
+        // 320-sample period. Its level proves nothing: only inaudible audio (`inaudible`) goes
+        // but in periods.
         let drain = drain(150.0, 0.0, 0.0, |i| if i % 150 < 100 { 1.0 } else { 0.1 }, 22);
         assert_eq!(drain.speech_dropped, 0, "{drain:?}");
         assert!(drain.done.is_some(), "{drain:?}");
@@ -955,7 +990,6 @@ mod tests {
 
     #[test]
     fn soft_speech_after_a_long_pause_loses_nothing_but_whole_periods() {
-        use super::super::jitter::Clock;
         // Review of #201: loud speech (-4.5 dB), a minute of silence, then speech at -37 dB with
         // a backlog, in both clocks: what the slot had heard a minute ago called the soft speech
         // background and cut 147 ms of it here (Rtp). A fresh slot removed none; nothing is kept
@@ -999,10 +1033,109 @@ mod tests {
         }
     }
 
+    #[test]
+    fn quiet_talkers_lose_nothing_but_whole_periods() {
+        // Review of #201: below -42 dB is not silence. A talker at gain 0.02 (about -51 dB RMS,
+        // -44 dB peaks) lost 720-sample cuts at soft onsets and offsets of a 320-sample period,
+        // and one quiet all along lost 385 ms, 19 packets whole. Now only inaudible audio goes
+        // without a period (`inaudible`); at 0.005 (about -65 dB RMS, -57 dB peaks) a voice is
+        // still a voice. `drain` checks that no other edit touches a frame the talker speaks in.
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for gain in [0.02, 0.005] {
+                let continuous = |_: usize| gain;
+                let words = |i: usize| if i % 16 < 10 { gain } else { 0.0 };
+                let soft_edges = |i: usize| match i % 16 {
+                    0 | 9 => gain,
+                    1..9 => 1.0,
+                    _ => 0.0,
+                };
+                let shapes: [(&str, &dyn Fn(usize) -> f32); 3] =
+                    [("continuous", &continuous), ("words", &words), ("loud words, soft edges", &soft_edges)];
+                for (name, shape) in shapes {
+                    let drain = drain_on(clock, 150.0, 0.0, 0.0, shape, 22);
+                    eprintln!("{clock:?} {gain} {name}: {drain:?}");
+                    assert_eq!(drain.speech_dropped, 0, "{clock:?} {gain} {name}: {drain:?}");
+                    for &(refill, removed, correlation) in &drain.periods {
+                        assert!(
+                            whole_periods(removed, 150.0) && correlation >= 0.5,
+                            "{clock:?} {gain} {name}: {refill} {removed} {correlation}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn gated_pauses_drain_by_their_missing_packets() {
+        // A sender's gate stops sending 300 ms (`HANGOVER`) after its voice: a pause arrives as
+        // no packets (and a new spurt on the RTP clock), its hangover as room noise, or
+        // near-digital silence with noise suppression on. Words of 200 ms with pauses of 500 or
+        // 800 ms after a 440 ms backlog: the first missing stretch takes it, without any level
+        // rule (the room noise is audible, -55 dB RMS, and nothing is cut), and no word is lost.
+        // A pause whose missing stretch is shorter than the backlog less the hangover (400 ms
+        // here) still loses the end of the word before it to the jitter buffer's new spurt
+        // (RTP) or stall recovery (sequence), as before #201.
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for (pause, room) in [(25, 0.0031), (40, 0.0031), (25, 0.0)] {
+                let cycle = 10 + pause;
+                let speaks = |i: usize| i % cycle < 10;
+                let sent = |i: usize| i % cycle < 25;
+                let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+                let pcm = harmonic(150.0, 0.02, 0.3, 600 * 960);
+                let room = noise(9, room, pcm.len());
+                // The sender encodes only what it sends; on the sequence clock every packet
+                // follows the last one sent.
+                let (mut packets, mut count) = (Vec::new(), 0);
+                for i in (0..600).filter(|&i| sent(i)) {
+                    let gain = f32::from(u8::from(speaks(i)));
+                    let frame: Vec<f32> = (i * 960..(i + 1) * 960).map(|k| pcm[k] * gain + room[k]).collect();
+                    let mut data = vec![0; 1275];
+                    let n = encoder.encode_float(&frame, &mut data).unwrap();
+                    data.truncate(n);
+                    let ts = if clock == Clock::Rtp { i } else { count };
+                    packets.push((i, ts as u64 * 960, data));
+                    count += 1;
+                }
+                let mut slot = Slot::new().unwrap();
+                let start = Instant::now();
+                let backlog = 22;
+                let mut queued = Vec::new();
+                let mut next = packets.iter().peekable();
+                for refill in 0..578 {
+                    let now = start + Duration::from_millis(refill as u64 * 20);
+                    while let Some((_, ts, data)) = next.next_if(|p| p.0 < (refill + backlog).max(backlog)) {
+                        slot.buffer.push_at(*ts, 960, data.clone(), if refill == 0 { start } else { now }, clock);
+                    }
+                    slot.mix_into(&mut [0.0; 960], 1.0, now).unwrap();
+                    queued.push(slot.buffer.depth().1);
+                }
+                // Every word packet sent was decoded: the buffer discarded none of them.
+                let mut taken = slot.taken.iter().peekable();
+                let lost: Vec<usize> = packets
+                    .iter()
+                    .filter(|(i, _, data)| taken.next_if(|t| *t == data).is_none() && *i < 550)
+                    .map(|p| p.0)
+                    .collect();
+                let words_lost = lost.iter().filter(|&&i| speaks(i)).count();
+                let late = queued[100..].iter().max().unwrap();
+                let done = queued.iter().position(|&q| q <= 2 * 960).unwrap();
+                eprintln!(
+                    "{clock:?} pause {pause} room {}: lost {} (words {words_lost}) done {done} late {late} edits {:?}",
+                    room.iter().fold(0f32, |m, s| m.max(s.abs())),
+                    lost.len(),
+                    slot.edits.iter().map(|e| (e.removed, e.correlation.is_some())).collect::<Vec<_>>()
+                );
+                assert_eq!(words_lost, 0, "{clock:?} {pause}: {lost:?}");
+                assert!(done <= cycle - backlog + 1 && *late <= 2 * 960, "{clock:?} {pause}: {done} {late}");
+                assert!(slot.edits.is_empty(), "{clock:?} {pause}: {:?}", slot.edits);
+            }
+        }
+    }
+
     /// Plays 10 s of `pcm` in `frame`-sample packets, 20 ms of them per refill after `backlog`
     /// refills' worth arrived at once, with the packets `lost(i)` never arriving.
     fn play_backlog(pcm: &[f32], frame: usize, backlog: usize, lost: impl Fn(usize) -> bool) -> Slot {
-        use super::super::jitter::Clock;
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
         let mut slot = Slot::new().unwrap();
         let start = Instant::now();
@@ -1147,7 +1280,6 @@ mod tests {
 
     #[test]
     fn small_arrival_jitter_never_trims_refill_margin_into_starvation() {
-        use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {
             for callback in [240, 480, 960] {
                 for phase in [-96, 0, 96] {
@@ -1288,7 +1420,6 @@ mod tests {
         delay: u64,
         late: impl Fn(u64) -> u64,
     ) -> (u64, u64) {
-        use super::super::jitter::Clock;
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
         let mut slot = Slot::new().unwrap();
         slot.buffer.reserve_only = reserve_only;
@@ -1338,7 +1469,6 @@ mod tests {
         // it for these refills, and the jitter reserve for mixed packet durations
         // (`JitterBuffer::refresh_surplus`). With neither, the four gave 4, 2, 9 and 2
         // concealments.
-        use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {
             // 10 ms packets, callbacks cycling 10/20/5 ms, 35 ms late every 4.8 s.
             let (varying_callbacks, _) = periodic_delay(clock, &[480], &[480, 960, 240], 4800 * 48, 35 * 48, |_| 0);
@@ -1370,7 +1500,6 @@ mod tests {
         // none of either. A refill 0.5 ms early, just before the burst, still has 360 samples
         // (7.5 ms) over its demand and the safety margin at the 50 ms start, and that is all the
         // arrival rule may cut.
-        use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {
             let late = |k| if k % 100 == 98 { 216 } else { 240 };
             let (concealments, cut) = periodic_delay(clock, &[480], &[480], 1100 * 48, 35 * 48, late);
@@ -1398,7 +1527,6 @@ mod tests {
         // than the late ones: further back than the previous observation. Counting only the
         // arrivals since then gave 5 concealments and 2,760 samples of cuts; the reserve rule
         // alone gives 0 and 480.
-        use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {
             let (concealments, cut) = periodic_delay(clock, &[480], &[480], 1100 * 48, 35 * 48, late_then_catch_up);
             let (_, reserve_cut) =
@@ -1417,7 +1545,6 @@ mod tests {
     /// `cargo test --release -p gwar-client --lib drain_grid -- --ignored --nocapture`.
     #[test]
     fn a_delayed_refill_over_short_packets_is_not_an_overflow() {
-        use super::super::jitter::Clock;
         // 64 packets of 2.5 or 5 ms are only 160 or 320 ms of audio, which a refill serviced late
         // with speaker headroom can queue legitimately. A 64-packet cap trimmed that to the
         // target and dropped what the catch-up refill needed: 1,920 and 3,840 samples cut, and
@@ -1436,7 +1563,6 @@ mod tests {
     #[test]
     #[ignore = "slow; run on demand"]
     fn drain_grid_never_conceals_more_than_the_reserve_rule() {
-        use super::super::jitter::Clock;
         let durations: [&[u64]; 4] = [&[480], &[960], &[240], &[1920, 120, 480, 240, 1920]];
         let callbacks: [&[usize]; 6] = [&[480], &[384], &[480, 960, 240], &[960], &[240], &[441]];
         let timings = ["exact", "early", "random", "catch-up"];
@@ -1536,7 +1662,6 @@ mod tests {
     }
 
     fn recurring_loss_and_jitter(clock: super::super::jitter::Clock) {
-        use super::super::jitter::Clock;
         for frame in [480u64, 960] {
             // Exercise genuine sparse jitter first, then the same clock and
             // packet duration with a 100 ms burst backlog and one loss/s.
@@ -1592,7 +1717,6 @@ mod tests {
 
     #[test]
     fn a_small_residual_drains_through_frequent_loss_of_voice() {
-        use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {
             for excess in [480u64, 960] {
                 let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
@@ -1651,7 +1775,6 @@ mod tests {
         // TS packet counters step one stride per packet whatever its duration, so depth must
         // come from the packets' own durations: a sequence stream may not drain more or less
         // than the same stream with RTP timestamps.
-        use super::super::jitter::Clock;
         for (pattern, delay) in [(&[1920u64, 120, 480, 240, 1920][..], 960u64), (&[960, 480][..], 0)] {
             let mut results = Vec::new();
             for clock in [Clock::Sequence, Clock::Rtp] {
@@ -1693,7 +1816,6 @@ mod tests {
 
     #[test]
     fn fractional_staged_surplus_converges_with_bounded_periodic_corrections() {
-        use super::super::jitter::Clock;
         for clock in [Clock::Rtp, Clock::Sequence] {
             for excess in [240, 480, 720, 912] {
                 for callback in [240, 480, 960] {
