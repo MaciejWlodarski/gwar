@@ -104,27 +104,19 @@ function useVoiceStatus() {
   const encryption = useVoice((s) => s.encryption);
   const reconnecting = useVoice((s) => s.reconnecting);
   const phase = useSession((s) => s.phase);
-  // Encrypted channels never show an alarm, even when the engine refused them.
-  const encryptedChannel = useSession((s) => {
-    const channel = myChannelId(s);
-    return channel !== null && !!s.channels[channel]?.encrypted;
-  });
-  // Encrypted calls: "Securing voice…" until a sending key is active, in the
-  // muted style; a stopped engine is "Voice unavailable" with Retry, no alarm.
+  const failure = useVoice((s) => s.failure);
   const status: { tone: "ok" | "warn" | "danger" | "muted"; text: string } =
-    phase === "reconnecting" || reconnecting
-      ? { tone: "warn", text: t("voice.reconnecting") }
-      : encryption === "failed"
-        ? { tone: "muted", text: t("voice.failed") }
+    failure
+      ? { tone: "danger", text: t("voice.failed") }
+      : phase === "reconnecting" || reconnecting
+        ? { tone: "warn", text: t("voice.reconnecting") }
         : encryption === "securing" && voiceState !== "failed"
           ? { tone: "muted", text: t("voice.securing") }
           : voiceState === "idle" && phase === "online"
             ? { tone: "muted", text: t("voice.notIn") }
             : voiceState === "connected"
               ? { tone: "ok", text: t("voice.connected") }
-              : voiceState === "failed"
-                ? { tone: encryption || encryptedChannel ? "muted" : "danger", text: t("voice.failed") }
-                : { tone: "warn", text: t("voice.connecting") };
+              : { tone: "warn", text: t("voice.connecting") };
   const quality = useConnectionQuality()?.quality;
   const tone = cn(
     status.tone === "ok" && qualityTone[quality ?? "good"],
@@ -151,6 +143,7 @@ function LeaveButton() {
 export function VoicePanel() {
   const t = useT();
   const [showReason, setShowReason] = useState(false);
+  const retrying = useVoice((s) => s.reconnecting);
   const failure = useVoice((s) => s.failure);
   const voiceState = useVoice((s) => s.state);
   const encryption = useVoice((s) => s.encryption);
@@ -161,8 +154,9 @@ export function VoicePanel() {
   const canSpeak = useChannelPermission(me?.channel ?? null, "speak");
   const member = useSession((s) => (s.me ? s.members[s.me.uid] : undefined));
   const { status, tone } = useVoiceStatus();
+  const recovering = !failure && (retrying || phase === "reconnecting");
 
-  if (me && me.channel === null && !failure) {
+  if (me && me.channel === null && !failure && !recovering) {
     return (
       <div className="m-2 mt-1 rounded-xl bg-raised p-2">
         <SelfRow
@@ -197,7 +191,7 @@ export function VoicePanel() {
             <span className="truncate text-sm font-semibold">{me?.nickname}</span>
             {me && <ConnectBadge member={member} name={me.nickname} />}
           </div>
-          {!failure && <div className="flex min-w-0 items-center gap-1.5 text-xs" title={status.text}>
+          {!failure && !recovering && <div data-testid="voice-status" className="flex min-w-0 items-center gap-1.5 text-xs" title={status.text}>
             <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone, status.tone === "warn" && "animate-pulse")} />
             {status.tone === "ok" && channelName ? (
               <>
@@ -210,21 +204,21 @@ export function VoicePanel() {
             {status.tone === "ok" && <ConnectionIndicator variant="panel" />}
           </div>}
         </div>
-        {unavailable && !failure && phase === "online" && (
+        {unavailable && !failure && !recovering && phase === "online" && (
           <Button size="sm" variant="secondary" onClick={() => controller.retryVoice()}>
             {t(voiceState === "idle" ? "tree.joinVoice" : "voice.retry")}
           </Button>
         )}
         {me?.channel != null && <LeaveButton />}
       </div>
-      {failure && <div className="flex items-center gap-1.5 px-1 text-xs">
+      {(failure || recovering) && <div data-testid="voice-status" className="flex items-center gap-1.5 px-1 text-xs">
         <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone)} />
         <span className={tone}>{status.text}</span>
         <div className="ml-auto flex shrink-0 items-center gap-1.5">
-          <button onClick={() => setShowReason(true)} className="t cursor-pointer text-muted underline underline-offset-2 hover:text-fg">{t("voice.why")}</button>
+          {failure && <button onClick={() => setShowReason(true)} className="t cursor-pointer text-muted underline underline-offset-2 hover:text-fg">{t("voice.why")}</button>}
           {phase === "online" && <>
-            <span aria-hidden className="text-subtle">·</span>
-            <button onClick={() => controller.retryVoice()} className="t cursor-pointer font-medium text-fg hover:underline">{t("voice.retry")}</button>
+            {failure && <span aria-hidden className="text-subtle">·</span>}
+            <button onClick={() => controller.retryVoice()} className={cn("t cursor-pointer hover:underline", failure ? "font-medium text-fg" : "text-muted hover:text-fg")}>{t("voice.retry")}</button>
           </>}
         </div>
       </div>}

@@ -35,7 +35,7 @@ const measure = () => {
 document.documentElement.dataset.theme = theme;
 useSettings.setState({ language: "pl", theme });
 useUi.setState({ section: mode === "pill" ? "home" : "servers" });
-useVoice.setState({ state: "connected", encryption: null, micError: null });
+useVoice.setState({ state: "connected", reconnecting: false, failure: null, encryption: null, micError: null });
 useSession.setState({ ...initialState, kind: "gwar", phase: "online", rtt: congested ? 480 : 20,
   owner: { uid: "local-fixture" } as never,
   me: { session: 1, uid: "local-fixture" }, permissions: ["speak", "screen_share"],

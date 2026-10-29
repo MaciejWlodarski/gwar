@@ -23,7 +23,7 @@ beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   resetCongestionEpisodes();
   useSettings.setState({ language: "pl" });
-  useVoice.setState({ state: "connected", encryption: null, micError: null });
+  useVoice.setState({ state: "connected", reconnecting: false, failure: null, encryption: null, micError: null });
   useUi.setState({ section: "home", toasts: [] });
   useSession.setState({ ...initialState, kind: "gwar", phase: "online", rtt: 20, me: { session: 1, uid: "me" },
     clients: { 1: { id: 1, uid: "me", nickname: "Maciej", channel: 1, groups: [], platform: "web", muted: false, deafened: false, away: null, talking: false, voice: true, voice_binding: null } },
@@ -167,6 +167,80 @@ it("shows voice congestion in the sharing bar even before encoder stats arrive",
   useUplink.setState({ voice: bloated });
   await render(<SharingBar />);
   expect(indicator()?.textContent).toBe("Wysyłanie nie nadąża");
+});
+
+it.each([
+  { state: "failed" as const },
+  { state: "starting" as const },
+  { state: "idle" as const },
+  { reconnecting: true },
+  { failure: "Permanent refusal" },
+])("drops voice feedback and its episode immediately on %j, ignoring late stats", async transition => {
+  useScreen.setState({ ...initialScreen });
+  await render(<><VoicePanel /><VoicePill /><Toaster /></>);
+  await set({ voice: bloated });
+  const episode = useUplink.getState().notice!.episode;
+  expect(indicator()).not.toBeNull();
+  await act(async () => useVoice.setState(transition));
+  expect(useUplink.getState().voice).toBeNull();
+  expect(notice()).toBeNull();
+  expect(indicator()).toBeNull();
+  await set({ voice: bloated }); // A late callback from the retired call.
+  expect(useUplink.getState().voice).toBeNull();
+  await act(async () => useVoice.setState({ state: "connected", reconnecting: false, failure: null }));
+  expect(notice()).toBeNull();
+  await set({ voice: healthy });
+  expect(notice()).toBeNull();
+  await set({ voice: bloated });
+  expect(useUplink.getState().notice!.episode).toBeGreaterThan(episode);
+});
+
+it("keeps screen congestion on the share while the server reconnects, without voice claims", async () => {
+  await render(<><VoicePanel /><SharingBar /><Toaster /><ConnectionDetails /></>);
+  await set({ voice: bloated, screen: bloated });
+  await act(async () => useSession.setState({ phase: "reconnecting" }));
+  expect(useUplink.getState().voice).toBeNull();
+  expect(notice()).toBeNull();
+  expect(container.querySelectorAll('[data-testid="connection-quality"]')).toHaveLength(1);
+  expect(indicator()?.textContent).toBe("Wysyłanie nie nadąża");
+  await act(async () => indicator()!.click());
+  const details = document.querySelector('[data-testid="connection-details"]')!;
+  expect(details.textContent).toContain("wysyłaniem udostępnianego ekranu");
+  expect(details.textContent).not.toContain("słyszą");
+  expect(details.textContent).not.toContain("głos");
+  await act(async () => useSession.setState({ phase: "online" }));
+  expect(notice()).toBeNull(); // The previous share verdict cannot re-pop a voice notice.
+});
+
+it("shows one quiet retry during recovery and reserves the red explanation row for permanent refusals", async () => {
+  useScreen.setState({ ...initialScreen });
+  await act(async () => {
+    useVoice.setState({ state: "failed", reconnecting: true, failure: null });
+    useUi.getState().toast("error", "Utracono połączenie głosowe. Spróbujemy ponownie.", { key: "voice-closed", sticky: true });
+  });
+  await render(<><VoicePanel /><Toaster /></>);
+  const status = () => container.querySelector('[data-testid="voice-status"]')!;
+  const retries = () => [...container.querySelectorAll<HTMLButtonElement>("button")].filter(b => b.textContent === "Ponów");
+  expect(status().textContent).toContain("Łączenie ponownie…");
+  expect(status().querySelector(".text-warn")).not.toBeNull();
+  expect(status().querySelector(".text-danger")).toBeNull();
+  expect(container.textContent).not.toContain("Dlaczego?");
+  expect(retries()).toHaveLength(1);
+  expect(retries()[0]!.className).toContain("text-muted");
+  const toast = container.querySelector('[data-testid="toast"]')!;
+  expect(toast.querySelector("details")).toBeNull();
+  expect(toast.textContent).not.toContain("Ponów");
+  const retry = vi.spyOn(controller, "retryVoice").mockImplementation(() => {});
+  await act(async () => retries()[0]!.click());
+  expect(retry).toHaveBeenCalledOnce();
+  await act(async () => {
+    useVoice.setState({ state: "failed", reconnecting: false, failure: "Permanent refusal", encryption: "failed" });
+    useUi.getState().dismissToast("voice-closed");
+  });
+  expect(status().textContent).toContain("Głos niedostępny");
+  expect(status().querySelector(".text-danger")).not.toBeNull();
+  expect(container.textContent).toContain("Dlaczego?");
+  expect(retries()).toHaveLength(1);
 });
 
 it("opens plain-language details from the indicator, with the numbers and router advice folded away", async () => {

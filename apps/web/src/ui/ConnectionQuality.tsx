@@ -8,7 +8,7 @@ import { useLanguage, useT, type Key } from "../i18n";
 import { cn } from "../lib/cn";
 import type { Language } from "../state/settings";
 import { closeConnectionDetails, dismissCongestionNotice, openConnectionDetails, useUplink, type ConnectionQuality, type Quality } from "../state/uplink";
-import { qualityTone, useConnectionQuality } from "./hooks";
+import { qualityTone, useConnectionQuality, useVoiceConnectionActive } from "./hooks";
 import { Dialog, Tooltip } from "./kit";
 
 const ICONS = { good: SignalHigh, fair: SignalMedium, poor: SignalLow };
@@ -56,7 +56,8 @@ function qualityLabel(q: ConnectionQuality): Key {
 export function ConnectionIndicator({ variant }: { variant: "panel" | "pill" | "bar" }) {
   const t = useT();
   const q = useConnectionQuality();
-  if (!q || (variant !== "panel" && q.quality === "good")) return null;
+  const voiceConnected = useVoiceConnectionActive();
+  if ((variant !== "bar" && !voiceConnected) || !q || (variant !== "panel" && q.quality === "good")) return null;
   const label = t(qualityLabel(q));
   const open = t("voice.quality.open", { quality: label, ms: millis(q.rttMs) });
   return (
@@ -94,6 +95,7 @@ export function CongestionNotice() {
   const t = useT();
   const lang = useLanguage();
   const notice = useUplink(s => s.notice);
+  const voiceConnected = useVoiceConnectionActive();
   // Held per episode: a notice closed while hovered or touched never fires its pointerleave, and
   // the next episode must still collapse on its own.
   const [heldEpisode, setHeldEpisode] = useState<number | null>(null);
@@ -103,7 +105,7 @@ export function CongestionNotice() {
     const timer = setTimeout(dismissCongestionNotice, NOTICE_MS);
     return () => clearTimeout(timer);
   }, [notice, held]);
-  if (!notice) return null;
+  if (!voiceConnected || !notice) return null;
   return (
     <div
       role="status"
@@ -139,11 +141,12 @@ export function ConnectionDetails() {
   const lang = useLanguage();
   const open = useUplink(s => s.details);
   const q = useConnectionQuality();
+  const voiceConnected = useVoiceConnectionActive();
   const congestion = q?.congestion;
   const [explain, fix] = !q ? [t("voice.quality.none"), null]
-    : congestion ? [t("voice.quality.uploadExplain", { delay: seconds(lang, congestion.rttMs - congestion.baselineMs) }), t("voice.quality.uploadFix")]
-      : q.quality === "good" ? [t("voice.quality.goodExplain"), null]
-        : [t("voice.quality.slowExplain"), t("voice.quality.slowFix")];
+    : congestion ? [t(voiceConnected ? "voice.quality.uploadExplain" : "screen.quality.uploadExplain", { delay: seconds(lang, congestion.rttMs - congestion.baselineMs) }), t("voice.quality.uploadFix")]
+      : q.quality === "good" ? [t(voiceConnected ? "voice.quality.goodExplain" : "screen.quality.goodExplain"), null]
+        : [t(voiceConnected ? "voice.quality.slowExplain" : "screen.quality.slowExplain"), t("voice.quality.slowFix")];
   const number = (n: number, digits = 0) => new Intl.NumberFormat(lang, { maximumFractionDigits: digits }).format(n);
   return (
     <Dialog open={open} onOpenChange={o => { if (!o) closeConnectionDetails(); }} title={t("voice.quality.title")} width="max-w-sm" onCloseAutoFocus={restoreFocus}>
@@ -177,7 +180,7 @@ export function ConnectionDetails() {
                 <dd className="text-right">{number(q.availableOutgoingBitrate / 1e6, 1)} Mb/s</dd>
               </>}
             </dl>
-            {congestion && <p className="pb-1.5 text-xs text-muted">{t("voice.quality.uploadTech")}</p>}
+            {congestion && <p className="pb-1.5 text-xs text-muted">{t(voiceConnected ? "voice.quality.uploadTech" : "screen.quality.uploadTech")}</p>}
           </details>
         )}
       </div>

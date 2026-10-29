@@ -3296,10 +3296,12 @@ Like Discord's coloured "Voice Connected", Gwar shows connection quality as a
 signal-bar indicator rather than banners (`ui/ConnectionQuality.tsx`,
 `state/uplink.ts`):
 
-- **Indicator.** The voice panel always shows bars and the round trip in ms
-  once there is a measurement (as the round trip always was); its status dot,
+- **Indicator.** While voice is connected, the voice panel shows bars and the round trip in ms
+  once there is a measurement; its status dot,
   and the pill's dot and "Voice connected", take the same colour. The pill adds
   the bars, and the sharing bar a chip, only while the connection is not good.
+  Losing voice hides its indicators immediately. Screen congestion stays on
+  the sharing bar while voice is down, with screen-specific details.
 - **Colour, from measurements only.** The round trip is the worst fresh media
   RTT of the voice and screen transports, or the server ping without media.
   Good below 150 ms, fair from 150 ms, poor from 300 ms round trip, about
@@ -3313,7 +3315,7 @@ signal-bar indicator rather than banners (`ui/ConnectionQuality.tsx`,
   the shown level for 4 s without a break (so poor → good via a moment of fair
   turns good 4 s after it settles), so a round trip at a threshold does not
   flicker. Every view shows the same held colour.
-- **Brief message.** When a congestion verdict starts, one plain-language
+- **Brief message.** When a voice congestion verdict starts during a connected call, one plain-language
   message appears in the toast stack ("Your internet can't keep up with
   uploading — others hear you about 0.5 s late", the delay being RTT minus the
   floor at that moment) with a Details link and a close button. It collapses
@@ -3321,6 +3323,13 @@ signal-bar indicator rather than banners (`ui/ConnectionQuality.tsx`,
   A verdict that returns within two minutes of the last one ending is the same
   episode and shows nothing. On phones the message sits at the top, clear of
   the call controls and the tab bar.
+  Voice loss clears the notice, voice measurement and episode. Late stats while
+  disconnected are discarded; reconnecting waits for fresh measurements,
+  including a fresh ping for native voice. A share alone never raises a voice notice.
+- **Voice recovery.** Automatic retries show an amber "Reconnecting…" row and
+  one quiet retry-now action in the panel. The single keyed toast has no action
+  or details expander. Only permanent refusals show the red "Voice unavailable"
+  row with Why and Retry; they have no duplicate toast.
 - **Details.** Clicking the indicator (or Details) opens a dialog: what the
   connection is like and what to do in plain words (pause uploads, backups,
   cloud sync or another call on this device or network), and, folded under

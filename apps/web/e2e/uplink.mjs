@@ -89,34 +89,45 @@ try {
         await page.close();
       }
     }
-    // Both branches' notices share a stack and stay clear of the measured voice panel.
+    // A temporary loss has one retry-now action in the panel, no voice claims.
     const combined = await open("view=voice&state=congested");
     await combined.getByTestId("congestion-notice").waitFor();
     await combined.evaluate(async () => {
-      const { useUi } = await import("/src/state/stores.ts");
-      useUi.getState().toast("error", "Utracono połączenie głosowe. Spróbujemy ponownie.", {
-        key: "voice-closed", sticky: true, details: "Połączenie z serwerem zostało przerwane.",
-        action: { label: "Ponów", run() {} },
-      });
+      const { useUi, useVoice } = await import("/src/state/stores.ts");
+      const { tNow } = await import("/src/i18n/index.ts");
+      useVoice.setState({ state: "failed", reconnecting: true, failure: null });
+      useUi.getState().toast("error", tNow("voice.closed"), { key: "voice-closed", sticky: true });
     });
     const panel = combined.locator("aside");
-    assert.equal(await panel.getByTestId("connection-quality").getAttribute("data-quality"), "poor");
-    const congestion = await combined.getByTestId("congestion-notice").boundingBox();
-    const sessionNotice = await combined.getByTestId("toast").boundingBox();
-    const panelBox = await panel.boundingBox();
-    assert(congestion && sessionNotice && panelBox);
-    assert(congestion.y + congestion.height <= sessionNotice.y, `${device}: notices overlap`);
+    assert.equal(await combined.getByTestId("congestion-notice").count(), 0);
+    assert.equal(await combined.getByTestId("connection-quality").count(), 0);
+    const toast = combined.getByTestId("toast");
+    assert.equal(await toast.locator("details").count(), 0);
+    assert.equal(await combined.getByRole("button", { name: "Ponów", exact: true }).count(), 1);
+    const status = panel.getByTestId("voice-status");
+    assert.match(await status.innerText(), /Łączenie ponownie…/);
+    assert(await status.getByText("Łączenie ponownie…", { exact: true }).evaluate(node => node.scrollWidth <= node.clientWidth), `${device}: reconnecting status truncates`);
+    const recoveryText = await status.getByText("Łączenie ponownie…", { exact: true }).boundingBox();
+    const recoveryRetry = await panel.getByRole("button", { name: "Ponów", exact: true }).boundingBox();
+    assert(recoveryText && recoveryRetry && Math.abs(recoveryText.y - recoveryRetry.y) < 1 && recoveryText.x + recoveryText.width <= recoveryRetry.x, `${device}: reconnecting row wraps or overlaps`);
+    assert.equal(await status.locator(".text-danger").count(), 0);
+    assert.equal(await panel.getByRole("button", { name: "Dlaczego?", exact: true }).count(), 0);
     if (width < 768) {
+      const notice = await toast.boundingBox();
       const controls = await panel.getByRole("button", { name: /Wycisz mikrofon/ }).boundingBox();
-      assert(controls && sessionNotice.y + sessionNotice.height <= controls.y, `${device}: notice covers call controls`);
+      assert(notice && controls && notice.y + notice.height <= controls.y, `${device}: notice covers call controls`);
     }
-    await shot(combined, "voice-congested-session-notice");
+    await shot(combined, "voice-reconnecting");
+    // Permanent refusals have the red explanation row and no retrying toast.
     await combined.evaluate(async () => {
-      const { useVoice } = await import("/src/state/stores.ts");
-      const { useUplink } = await import("/src/state/uplink.ts");
-      useVoice.setState({ state: "failed", failure: "Połączenie głosowe jest niedostępne. Ponów, aby spróbować ponownie." });
-      useUplink.setState({ screen: useUplink.getState().voice, voice: null });
+      const { useVoice, useUi } = await import("/src/state/stores.ts");
+      useVoice.setState({ state: "failed", reconnecting: false, failure: "Połączenie głosowe jest niedostępne. Ponów, aby spróbować ponownie." });
+      useUi.getState().dismissToast("voice-closed");
     });
+    assert.equal(await combined.getByTestId("congestion-notice").count(), 0);
+    assert.equal(await combined.getByTestId("connection-quality").count(), 0);
+    assert.equal(await combined.getByTestId("toast").count(), 0);
+    assert.equal(await combined.getByRole("button", { name: "Ponów", exact: true }).count(), 1);
     const labels = [panel.getByText("Głos niedostępny", { exact: true }), panel.getByRole("button", { name: "Dlaczego?", exact: true }), panel.getByRole("button", { name: "Ponów", exact: true })];
     const boxes = await Promise.all(labels.map(label => label.boundingBox()));
     for (let i = 0; i < boxes.length; i++) {
@@ -128,6 +139,23 @@ try {
     await combined.getByRole("dialog", { name: "Głos niedostępny" }).waitFor();
     await combined.keyboard.press("Escape");
     await combined.close();
+    // Screen congestion remains local to the share when voice is down.
+    const screenOnly = await open("view=screen&state=congested");
+    await screenOnly.getByTestId("screen-sender-stats").waitFor();
+    await screenOnly.evaluate(async () => {
+      const { useVoice } = await import("/src/state/stores.ts");
+      useVoice.setState({ state: "failed", reconnecting: true, failure: null });
+    });
+    assert.equal(await screenOnly.getByTestId("congestion-notice").count(), 0);
+    assert.equal(await screenOnly.locator("aside").getByTestId("connection-quality").count(), 0);
+    const shareIndicator = screenOnly.getByRole("status", { name: "Udostępniasz ekran" }).getByTestId("connection-quality");
+    assert.equal(await shareIndicator.getAttribute("data-quality"), "poor");
+    await shot(screenOnly, "screen-voice-reconnecting");
+    await shareIndicator.click();
+    const screenDetails = screenOnly.getByRole("dialog", { name: "Jakość połączenia" });
+    assert.match(await screenDetails.innerText(), /wysyłaniem udostępnianego ekranu/);
+    assert.doesNotMatch(await screenDetails.innerText(), /słyszą Cię/);
+    await screenOnly.close();
     // The pill's indicator must preserve truncation for real long names.
     for (const state of ["normal", "congested"]) {
       const page = await open(`view=pill&state=${state}&long=1`);

@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { useSession } from "./stores";
+import { useSession, useVoice } from "./stores";
 import type { UplinkStatus } from "../voice/uplink-congestion";
 
 /**
@@ -18,6 +18,9 @@ interface Uplink {
 }
 
 export const useUplink = create<Uplink>(() => ({ voice: null, screen: null, notice: null, details: false, shown: null }));
+
+export const voiceConnectionActive = (voice = useVoice.getState(), phase = useSession.getState().phase): boolean =>
+  voice.state === "connected" && !voice.reconnecting && !voice.failure && phase === "online";
 
 const congestion = (s: Uplink) => s.screen?.congested ? s.screen : s.voice?.congested ? s.voice : null;
 
@@ -105,7 +108,11 @@ function noteQuality(): void {
   if (shown !== useUplink.getState().shown) useUplink.setState({ shown });
   if (shown && live && shown !== live) improveTimer = setTimeout(noteQuality, betterSince[shown]! + QUALITY_IMPROVE_MS - now);
 }
-useUplink.subscribe((s, prev) => { if (s.voice !== prev.voice || s.screen !== prev.screen) noteQuality(); });
+useUplink.subscribe((s, prev) => {
+  // A late stats callback from the previous call cannot seed the next call.
+  if (s.voice && !voiceConnectionActive()) { useUplink.setState({ voice: null }); return; }
+  if (s.voice !== prev.voice || s.screen !== prev.screen) noteQuality();
+});
 useSession.subscribe((s, prev) => { if (s.rtt !== prev.rtt) noteQuality(); });
 
 /** A verdict that returns this soon after the last one ended continues that episode: no new message. */
@@ -113,8 +120,11 @@ export const EPISODE_MERGE_MS = 120_000;
 let episode = 0;
 let active = false;
 let endedAt = -Infinity;
-useUplink.subscribe(s => {
-  const status = congestion(s);
+useUplink.subscribe(() => {
+  const s = useUplink.getState();
+  // The notice says others hear me late. A share alone cannot make that claim,
+  // and resuming voice must wait for a measurement from the new call.
+  const status = voiceConnectionActive() && s.voice?.congested ? s.voice : null;
   if (!!status === active) return;
   active = !!status;
   const now = Date.now();
@@ -124,6 +134,17 @@ useUplink.subscribe(s => {
   episode++;
   useUplink.setState({ notice: { episode, delayMs: Math.max(0, status.rttMs - status.baselineMs) } });
 });
+
+function voiceConnectionChanged(): void {
+  if (voiceConnectionActive()) return;
+  active = false;
+  endedAt = -Infinity;
+  useUplink.setState({ voice: null, notice: null, details: false });
+}
+useVoice.subscribe((s, prev) => {
+  if (s.state !== prev.state || s.reconnecting !== prev.reconnecting || s.failure !== prev.failure) voiceConnectionChanged();
+});
+useSession.subscribe((s, prev) => { if (s.phase !== prev.phase) voiceConnectionChanged(); });
 
 export const dismissCongestionNotice = () => useUplink.setState({ notice: null });
 export const openConnectionDetails = () => useUplink.setState({ details: true, notice: null });

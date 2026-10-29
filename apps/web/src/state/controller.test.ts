@@ -973,10 +973,12 @@ describe("staying on the server without voice", () => {
       await vi.advanceTimersByTimeAsync(60_000);
       const notices = stores.useUi.getState().toasts.filter(t => t.key === "voice-closed");
       expect(notices).toHaveLength(1);
-      expect(notices[0]).toMatchObject({ kind: "error", text: "The voice connection was closed. Reconnecting…", sticky: true, action: { label: "Retry" } });
+      expect(notices[0]).toMatchObject({ kind: "error", text: "The voice connection was closed. Reconnecting…", sticky: true });
+      expect(notices[0]!.action).toBeUndefined();
+      expect(notices[0]!.details).toBeUndefined();
       expect(engine.start).toHaveBeenCalledTimes(6);
       engine.start.mockImplementation(async () => engine.emitState("connected"));
-      notices[0]!.action!.run();
+      controller.retryVoice(); // The panel owns retry-now while recovery is automatic.
       await vi.advanceTimersByTimeAsync(10);
       expect(engine.start).toHaveBeenCalledTimes(7);
       expect(stores.useUi.getState().toasts.some(t => t.key === "voice-closed")).toBe(false);
@@ -2270,7 +2272,7 @@ describe("server ping seed for WebRTC floors", () => {
 describe("native voice uplink fallback", () => {
   const voiceState = (state: string) => engineHandlers.get("state")!(state);
 
-  it("learns from pings before the call, shows only while connected, and expires without losing the floor", async () => {
+  it("waits for a fresh connected ping, resets across calls, and expires without losing the floor", async () => {
     vi.spyOn(performance, "now").mockImplementation(() => Date.now());
     const { useUplink } = await import("./uplink");
     connectFake();
@@ -2286,10 +2288,15 @@ describe("native voice uplink fallback", () => {
       await ping(480);
       expect(useUplink.getState().voice).toBeNull();
       voiceState("connected");
+      expect(useUplink.getState().voice).toBeNull();
+      await ping(480);
       expect(useUplink.getState().voice).toMatchObject({ congested: true, rttMs: 480, baselineMs: 20 });
       voiceState("starting");
       expect(useUplink.getState().voice).toBeNull();
       voiceState("connected");
+      expect(useUplink.getState().voice).toBeNull();
+      link.rtt(20);
+      await ping(480); await ping(480); await ping(480);
       expect(useUplink.getState().voice?.congested).toBe(true);
       await vi.advanceTimersByTimeAsync(25000);
       expect(useUplink.getState().voice).toBeNull();

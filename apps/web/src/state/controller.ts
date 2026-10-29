@@ -1,5 +1,5 @@
 import { noteServerPing, PING_UPLINK, resetServerPing, UplinkCongestion, type UplinkStatus } from "../voice/uplink-congestion";
-import { useUplink } from "./uplink";
+import { useUplink, voiceConnectionActive } from "./uplink";
 import { claimAll, claimableIdentities, offerClaims } from "./ts-claim";
 import { permissionsOf } from "../lib/permissions";
 import type { ChannelOverride } from "../proto/ChannelOverride";
@@ -269,9 +269,9 @@ class Controller {
     this.engine = createVoiceEngine();
   }
 
-  private resetNativeUplink(): void {
+  private resetNativeUplink(resetPing = true): void {
     this.nativeUplink.reset();
-    resetServerPing();
+    if (resetPing) resetServerPing();
     this.setNativeUplink(null);
   }
 
@@ -284,7 +284,7 @@ class Controller {
   }
 
   private showNativeUplink(): void {
-    if (isDesktop()) useUplink.setState({ voice: useVoice.getState().state === "connected" ? this.nativeUplinkStatus : null });
+    if (isDesktop()) useUplink.setState({ voice: voiceConnectionActive() ? this.nativeUplinkStatus : null });
   }
 
   /** Swap in another engine (desktop) before the first connect. */
@@ -310,14 +310,15 @@ class Controller {
       if (!this.voiceRetryAllowed) {
         useVoice.getState().set({ state: "failed" });
         useUplink.setState({ voice: null });
-        this.showNativeUplink();
+        this.resetNativeUplink(false);
         return;
       }
       useVoice.getState().set({ state });
-      if (state !== "connected") useUplink.setState({ voice: null });
-      this.showNativeUplink();
+      if (state !== "connected") this.resetNativeUplink(false);
       if (state === "failed") this.scheduleVoiceRetry();
       if (state === "connected") {
+        // Wait for a fresh ping; the cached verdict belongs to the previous call.
+        this.setNativeUplink(null);
         this.voiceRetries = 0;
         this.voiceErrorShown = false;
         if (this.voiceRetry) clearTimeout(this.voiceRetry);
@@ -1238,7 +1239,8 @@ class Controller {
     this.voiceRetry = null;
     this.voiceRetries = 0;
     this.voiceErrorShown = false;
-    useVoice.getState().set({ reconnecting: false, ...(this.voiceRetryAllowed ? { failure: null } : {}) });
+    useVoice.getState().set({ state: this.voiceRetryAllowed ? "idle" : "failed", reconnecting: false, ...(this.voiceRetryAllowed ? { failure: null } : {}) });
+    this.resetNativeUplink(false);
     // Leaving, moving or losing the session discards the call's pin and state.
     this.endVoiceCall();
     await this.engine.stop();
@@ -1347,6 +1349,7 @@ class Controller {
     // A late transport-close event cannot erase a permanent refusal awaiting manual Retry.
     if (retry && !this.voiceRetryAllowed) return;
     useVoice.getState().set({ state: "failed", failure: retry ? null : message });
+    this.resetNativeUplink(false);
     if (retry) this.scheduleVoiceRetry();
     else {
       this.pendingVoiceEntry = null;
@@ -1360,7 +1363,7 @@ class Controller {
     }
     if (this.voiceErrorShown) return;
     this.voiceErrorShown = true;
-    useUi.getState().toast("error", message, { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
+    useUi.getState().toast("error", message, { key: "voice-closed", sticky: true });
   }
 
   async retryMic(): Promise<void> {

@@ -14,7 +14,7 @@ import { sealedThread } from "../lib/chat";
 import type { Roster } from "../mls/types";
 import type { SealedKey } from "../state/sealed";
 import type { StoredThreadKey } from "../state/types";
-import { connectionQuality, QUALITY_RANK, useUplink, type ConnectionQuality, type Quality } from "../state/uplink";
+import { connectionQuality, QUALITY_RANK, useUplink, voiceConnectionActive, type ConnectionQuality, type Quality } from "../state/uplink";
 
 const subscribeRoster = (listener: () => void) => controller.onRoster(listener);
 /** Who can read an encrypted thread, once this device has secured it. */
@@ -291,6 +291,11 @@ export const qualityTone: Record<Quality, string> = { good: "text-ok", fair: "te
  * What the connection is like now (`connectionQuality`); null before the first measurement. The
  * colour is the shared held one (`QUALITY_IMPROVE_MS`): never better than the measurement.
  */
+export function useVoiceConnectionActive(): boolean {
+  const phase = useSession(s => s.phase);
+  return useVoice(s => voiceConnectionActive(s, phase));
+}
+
 export function useConnectionQuality(): ConnectionQuality | null {
   const rtt = useSession(s => s.rtt);
   const voice = useUplink(s => s.voice);
