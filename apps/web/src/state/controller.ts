@@ -1220,6 +1220,8 @@ class Controller {
   }
 
   private voiceFailure(message: string, retry = true): void {
+    // A late transport-close event cannot erase a permanent refusal awaiting manual Retry.
+    if (retry && !this.voiceRetryAllowed) return;
     useVoice.getState().set({ state: "failed", failure: retry ? null : message });
     if (retry) this.scheduleVoiceRetry();
     else {

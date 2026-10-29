@@ -443,6 +443,9 @@ describe("session resilience", () => {
     engine.start.mockRejectedValue(new VoiceError(kind, "permanent refusal"));
     connectFake({ channel: 1 }); await vi.advanceTimersByTimeAsync(0);
     expect(stores.useVoice.getState()).toMatchObject({ state: "failed", reconnecting: false, failure: expect.any(String) });
+    const reason = stores.useVoice.getState().failure;
+    link.emit({ ev: "voice.closed", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, reason: "transport_failed" } });
+    expect(stores.useVoice.getState()).toMatchObject({ reconnecting: false, failure: reason });
     await vi.advanceTimersByTimeAsync(120_000); expect(engine.start).toHaveBeenCalledOnce();
     engine.start.mockResolvedValue(undefined); controller.retryVoice(); await vi.advanceTimersByTimeAsync(0);
     expect(engine.start).toHaveBeenCalledTimes(2);
