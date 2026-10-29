@@ -40,7 +40,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
   const lastKind = useSettings((s) => s.lastKind);
   const desktop = isDesktop();
   const bookmarks = useBookmarks();
-  const { busy, error, needPassword, serverName, invite } = useConnectUi();
+  const { busy, error, needPassword, serverName, invite, otherTab } = useConnectUi();
   const closeReason = useSession((s) => s.closeReason);
   const openSettings = useUi((s) => s.openSettings);
   const account = useAccount((s) => s.account);
@@ -212,6 +212,13 @@ export function ConnectScreen({ card }: { card?: boolean }) {
             {insecureLan && <p role="alert" className="text-sm text-danger">{t("security.insecureWarning")}</p>}
           </div>}
           <Switch checked={remember} onCheckedChange={setRemember} label={t("connect.remember")} />
+
+          {otherTab && (
+            <div role="status" className="flex flex-col gap-3 rounded-lg border border-line bg-raised px-3 py-3 text-sm">
+              <p className="text-muted">{t("connect.otherTab")}</p>
+              <Button variant="secondary" onClick={() => void controller.connectInteractive(otherTab, { remember: false })}>{t("connect.here")}</Button>
+            </div>
+          )}
 
           {error && (
             <div role="alert" className="flex gap-2 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">

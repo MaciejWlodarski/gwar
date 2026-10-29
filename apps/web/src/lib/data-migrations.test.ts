@@ -421,6 +421,29 @@ describe("the settings (localStorage)", () => {
     LOCAL_FIXTURES[version]!.check(useSettings.getState());
     if (version < 3) expect(useSettings.getState()).toMatchObject({ selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null });
   });
+  it.each([
+    { name: 42 }, { password: {} }, { identity: 3 }, { insecureLan: "true" },
+    { name: undefined }, { address: "" }, { kind: "unknown" },
+  ])("refuses malformed automatic connection fields on hydration: %j", async patch => {
+    const resume = { address: "a.example", kind: "gwar", name: "A", ...patch };
+    const { useSettings } = await page(memory({ [SETTINGS_KEY]: JSON.stringify({ version: SETTINGS_VERSION, state: { resumeConnection: resume } }) }));
+    expect(useSettings.getState().resumeConnection).toBeNull();
+  });
+
+  it("whitelists stored resume data and clears both intents when removing the matching bookmark", async () => {
+    const { useSettings } = await page(memory({ [SETTINGS_KEY]: JSON.stringify({ version: SETTINGS_VERSION, state: {
+      resumeConnection: { address: "a.example", kind: "gwar", name: "A", password: "secret", identity: "ts-id", insecureLan: true, invite: "never-use" },
+      updateVoiceResume: { address: "a.example", kind: "gwar", version: "1.0", expiresAt: 1000, channel: 2 },
+    } }) }));
+    expect(useSettings.getState().resumeConnection).not.toHaveProperty("invite");
+    const s = () => useSettings.getState();
+    s().saveBookmark({ id: "other", address: "other.example", kind: "gwar", name: "Other" });
+    s().removeBookmark("other"); expect(s().resumeConnection).not.toBeNull();
+    s().saveBookmark({ id: "a", address: "wss://a.example/ws", kind: "gwar", name: "A" });
+    s().removeBookmark("a");
+    expect(s()).toMatchObject({ resumeConnection: null, updateVoiceResume: null });
+  });
+
   it("of a newer version, or unreadable, are neither read nor written", async () => {
     for (const stored of [JSON.stringify({ state: { theme: "light" }, version: SETTINGS_VERSION + 1 }), "garbage"]) {
       const storage = memory({ [SETTINGS_KEY]: stored });

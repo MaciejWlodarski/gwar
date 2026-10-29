@@ -96,14 +96,22 @@ export class Engine {
     this.agent?.free(); this.agent = undefined; this.storage.close();
   }
 }
+/** An automatic startup must never evict a tab that acquired the device meanwhile. */
+export class DeviceAlreadyInUse extends Error {}
+
 /** A lock is held until release, including during automatic network reconnects. */
-export async function acquireDeviceLock(device: string, locks: LockManager, signal?: AbortSignal): Promise<() => Promise<void>> {
+export async function acquireDeviceLock(device: string, locks: LockManager, signal?: AbortSignal, ifAvailable = false): Promise<() => Promise<void>> {
   let release!: () => void;
   let acquired!: () => void;
   let fail!: (error: unknown) => void;
   const ready = new Promise<void>((resolve, reject) => { acquired = resolve; fail = reject; });
   const held = new Promise<void>(resolve => { release = resolve; });
-  const finished = locks.request(`gwar-mls:${device}`, { mode: "exclusive", signal }, async () => { acquired(); await held; });
+  // Web Locks forbids combining ifAvailable with signal. The non-blocking callback checks cancellation itself.
+  const finished = locks.request(`gwar-mls:${device}`, { mode: "exclusive", ...(ifAvailable ? { ifAvailable: true } : { signal }) }, async lock => {
+    if (signal?.aborted) { fail(signal.reason); return; }
+    if (ifAvailable && !lock) { fail(new DeviceAlreadyInUse()); return; }
+    acquired(); await held;
+  });
   void finished.catch(fail);
   await ready;
   return async () => { release(); await finished; };

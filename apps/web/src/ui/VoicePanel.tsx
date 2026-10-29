@@ -159,6 +159,7 @@ function LeaveButton() {
 
 export function VoicePanel() {
   const t = useT();
+  const failure = useVoice((s) => s.failure);
   const voiceState = useVoice((s) => s.state);
   const encryption = useVoice((s) => s.encryption);
   const micError = useVoice((s) => s.micError);
@@ -224,6 +225,7 @@ export function VoicePanel() {
         )}
         <LeaveButton />
       </div>
+      {failure && <p role="alert" className="px-1 text-xs text-muted">{failure}</p>}
       {micError && (
         <div role="alert" className="rounded-md bg-danger-soft px-2 py-1.5 text-xs text-danger">
           {describeVoiceError(micError)}

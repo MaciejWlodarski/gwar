@@ -22,15 +22,20 @@ await context.route("**/*", route => {
   const url = new URL(route.request().url());
   return ["127.0.0.1", "localhost", "[::1]"].includes(url.hostname) || ["blob:", "data:"].includes(url.protocol) ? route.continue() : route.abort();
 });
-const page = await context.newPage();
+let websocketMode = "pass";
+await context.routeWebSocket(server, socket => {
+  if (websocketMode === "fail") socket.close();
+  else if (websocketMode === "pass") socket.connectToServer();
+});
+let page = await context.newPage();
 page.on("pageerror", error => console.error("Browser error:", error.message));
 page.on("console", message => { if (message.type() === "error") console.error("Browser console:", message.text()); });
 const modules = { controller: "/src/state/controller.ts", stores: "/src/state/stores.ts", settings: "/src/state/settings.ts" };
 const widths = [["desktop", 1440, 900], ["tablet", 834, 1112], ["mobile", 390, 844]];
-const snap = async name => {
-  await page.evaluate(() => document.fonts.ready);
+const snap = async (name, target = page) => {
+  await target.evaluate(() => document.fonts.ready);
   const file = path.join(shots, `${name}-pl.png`);
-  await page.screenshot({ path: file, animations: "disabled" }); files.push(file);
+  await target.screenshot({ path: file, animations: "disabled" }); files.push(file);
 };
 try {
   await page.addInitScript(() => {
@@ -78,6 +83,27 @@ try {
     await page.getByRole("button", { name: "Anuluj", exact: true }).click();
   }
 
+  // A second tab must remain on the form while this tab is in a real call.
+  const caller = page;
+  const newcomer = await context.newPage();
+  await newcomer.goto(web);
+  await newcomer.getByRole("button", { name: "Połącz tutaj", exact: true }).waitFor();
+  assert.equal(await caller.evaluate(async modules => (await window.__gwarE2eImport(modules.stores)).useVoice.getState().state, modules), "connected");
+  for (const [size, width, height] of widths) {
+    await newcomer.setViewportSize({ width, height });
+    await snap(`other-tab-${size}`, newcomer);
+  }
+  await newcomer.getByRole("button", { name: "Połącz tutaj", exact: true }).click();
+  await newcomer.waitForFunction(async modules => {
+    const { useSession } = await window.__gwarE2eImport(modules.stores);
+    return useSession.getState().phase === "online" && useSession.getState().me !== null;
+  }, modules);
+  await caller.waitForFunction(async modules => {
+    const { useSession } = await window.__gwarE2eImport(modules.stores);
+    return useSession.getState().phase === "idle" && useSession.getState().closeReason?.reason?.kind === "replaced";
+  }, modules);
+  await caller.close(); page = newcomer;
+
   // Reload restores the server, persisted controls, and no voice participation.
   await page.reload({ waitUntil: "networkidle" });
   console.log("After reload:", await page.evaluate(async modules => {
@@ -96,8 +122,23 @@ try {
     return { muted: v.muted, deafened: v.deafened, state: v.state, channel: s.me ? s.clients[s.me.session].channel : "missing session" };
   }, modules), { muted: true, deafened: true, state: "idle", channel: null });
 
+  // A real failed WebSocket remains cancellable and the online event skips its backoff.
+  websocketMode = "fail";
+  await page.reload({ waitUntil: "networkidle" });
+  await page.waitForFunction(async modules => (await window.__gwarE2eImport(modules.stores)).useConnectUi.getState().startupRetry, modules);
+  for (const [size, width, height] of widths) {
+    await page.setViewportSize({ width, height });
+    await snap(`offline-retry-${size}`);
+  }
+  websocketMode = "pass";
+  await page.evaluate(() => window.dispatchEvent(new Event("online")));
+  await page.waitForFunction(async modules => {
+    const { useSession, useConnectUi } = await window.__gwarE2eImport(modules.stores);
+    return useSession.getState().phase === "online" && useSession.getState().me !== null && !useConnectUi.getState().restoring;
+  }, modules);
+
   // Hold the local WebSocket handshake to capture the actual startup Connecting UI.
-  await page.routeWebSocket(server, () => {});
+  websocketMode = "hold";
   await page.reload();
   await page.getByRole("heading", { name: "Łączenie…", exact: true }).waitFor();
   for (const [size, width, height] of widths) {
@@ -112,7 +153,7 @@ try {
   }, modules);
   assert.equal(await page.evaluate(async modules => (await window.__gwarE2eImport(modules.settings)).useSettings.getState().resumeConnection, modules), null);
   writeFileSync(path.join(shots, "screenshots.txt"), `${files.join("\n")}\n`);
-  console.log("Local reload, privacy settings, voice exclusion, switch cancellation and explicit-disconnect checks passed.");
+  console.log("Local reload, multi-tab protection/takeover, offline recovery, privacy settings, voice exclusion, switch cancellation and explicit-disconnect checks passed.");
   console.log(`${files.length} Polish screenshots: ${shots}`);
 } finally {
   await context.close(); await browser.close();

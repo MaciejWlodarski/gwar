@@ -30,6 +30,25 @@ export interface UpdateVoiceResume {
   password?: string;
 }
 
+export function validSavedConnection(value: unknown): SavedConnection | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.address !== "string" || !v.address.trim() || (v.kind !== "gwar" && v.kind !== "teamspeak") || typeof v.name !== "string" ||
+      (v.password !== undefined && typeof v.password !== "string") || (v.identity !== undefined && typeof v.identity !== "string") ||
+      (v.insecureLan !== undefined && typeof v.insecureLan !== "boolean")) return null;
+  return { address: v.address, kind: v.kind, name: v.name, password: v.password, identity: v.identity, insecureLan: v.insecureLan };
+}
+
+function validUpdateVoiceResume(value: unknown): UpdateVoiceResume | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  if (!validSavedConnection({ ...v, name: "" }) || typeof v.version !== "string" ||
+      typeof v.expiresAt !== "number" || !Number.isFinite(v.expiresAt) ||
+      typeof v.channel !== "number" || !Number.isSafeInteger(v.channel) || v.channel < 0) return null;
+  return { address: v.address as string, kind: v.kind as ServerKind, version: v.version,
+    expiresAt: v.expiresAt, channel: v.channel, password: v.password as string | undefined };
+}
+
 export interface Bookmark {
   id: string;
   /** Display name; defaults to the address label. */
@@ -455,7 +474,10 @@ export const useSettings = create<SettingsState>()(
       removeBookmark: (id) =>
         set((s) => {
           const now = Date.now();
+          const removed = s.bookmarks.find(b => b.id === id);
+          const forget = removed && s.resumeConnection && serverKey(removed) === serverKey(s.resumeConnection);
           return {
+            ...(forget ? { resumeConnection: null, updateVoiceResume: null } : {}),
             bookmarks: s.bookmarks.filter((b) => b.id !== id),
             serverGroups: s.serverGroups.map((g) => (g.servers.includes(id) ? { ...g, servers: g.servers.filter((m) => m !== id) } : g)),
             removedBookmarks: { ...pruneRemoved(s.removedBookmarks, now), [id]: removal(s.bookmarks.find((b) => b.id === id), s.bookmarkAccount) },
@@ -522,11 +544,8 @@ export const useSettings = create<SettingsState>()(
           serverGroups: validGroups(p.serverGroups),
           selfMuted: p.selfMuted === true,
           selfDeafened: p.selfDeafened === true,
-          resumeConnection: p.resumeConnection && typeof p.resumeConnection.address === "string" &&
-            (p.resumeConnection.kind === "gwar" || p.resumeConnection.kind === "teamspeak") ? p.resumeConnection : null,
-          updateVoiceResume: p.updateVoiceResume && Number.isSafeInteger(p.updateVoiceResume.channel) &&
-            typeof p.updateVoiceResume.address === "string" && (p.updateVoiceResume.kind === "gwar" || p.updateVoiceResume.kind === "teamspeak") &&
-            typeof p.updateVoiceResume.version === "string" && Number.isFinite(p.updateVoiceResume.expiresAt) ? p.updateVoiceResume : null,
+          resumeConnection: validSavedConnection(p.resumeConnection),
+          updateVoiceResume: validUpdateVoiceResume(p.updateVoiceResume),
         };
       },
     },

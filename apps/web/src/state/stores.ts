@@ -75,6 +75,7 @@ interface VoiceStore {
   level: number;
   state: VoiceState;
   reconnecting: boolean;
+  failure: string | null;
   micError: VoiceError | null;
   pttActive: boolean;
   devices: DeviceList;
@@ -89,6 +90,7 @@ export const useVoice = create<VoiceStore>()((set) => ({
   level: 0,
   state: "idle",
   reconnecting: false,
+  failure: null,
   micError: null,
   pttActive: false,
   devices: { inputs: [], outputs: [] },
@@ -304,6 +306,9 @@ export const useOutbox = create<OutboxStore>()((set, get) => ({
 // ------------------------------------------------------------ connect screen
 
 interface ConnectUi {
+  startupRetry: boolean;
+  /** The saved server is held by another tab; connecting here is an explicit takeover. */
+  otherTab: import("./settings").SavedConnection | null;
   restoring: boolean;
   busy: boolean;
   error: string | null;
@@ -318,6 +323,8 @@ interface ConnectUi {
 export const useConnectUi = create<ConnectUi>()((set) => ({
   busy: false,
   restoring: false,
+  startupRetry: false,
+  otherTab: null,
   error: null,
   needPassword: false,
   serverName: null,

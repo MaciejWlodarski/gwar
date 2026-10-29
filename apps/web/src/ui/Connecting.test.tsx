@@ -5,7 +5,7 @@ import { expect, it, vi } from "vitest";
 import { useSettings } from "../state/settings";
 import { Connecting } from "./Connecting";
 import { Sidebar } from "./Sidebar";
-import { useSession } from "../state/stores";
+import { useConnectUi, useSession } from "../state/stores";
 
 const disconnect = vi.hoisted(() => vi.fn(async () => {}));
 vi.mock("../state/controller", () => ({ controller: { disconnect } }));
@@ -39,5 +39,18 @@ it("keeps voice and empty-channel notices out of the connecting server shell", a
     expect(host.textContent).not.toContain("Connecting voice");
   } finally {
     await act(async () => root.unmount()); host.remove(); vi.unstubAllGlobals();
+  }
+});
+
+it("keeps Connecting and Cancel while explaining an offline retry", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  useSettings.setState({ language: "pl" }); useConnectUi.setState({ startupRetry: true });
+  const host = document.createElement("div"); document.body.appendChild(host); const root = createRoot(host);
+  try {
+    await act(async () => root.render(<Connecting />));
+    expect(host.textContent).toContain("Brak połączenia. Próbujemy ponownie…");
+    expect(host.querySelector("button")?.textContent).toBe("Anuluj");
+  } finally {
+    await act(async () => root.unmount()); host.remove(); useConnectUi.setState({ startupRetry: false }); vi.unstubAllGlobals();
   }
 });

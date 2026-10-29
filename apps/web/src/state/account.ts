@@ -376,6 +376,7 @@ export const accountActions = {
 
   /** Back to an unrelated local identity, or a fresh one after root migration. */
   async signOut(): Promise<void> {
+    controller.clearSessionResume();
     const record = await loadConnectRecord();
     const synced = !!record && (await flushBookmarks(record.accountKey));
     const flushed = useSettings.getState().bookmarkEdits;

@@ -17,7 +17,7 @@ it("keeps Home underneath a switch confirmation, and opens an active reconnect w
   function Fixture() { open = useBookmarkOpener().open; return null; }
   const host = document.createElement("div"); document.body.appendChild(host);
   const root = createRoot(host);
-  const target = (address: string): Bookmark => ({ id: address, kind: "gwar", address, name: address });
+  const target = (address: string): Bookmark => ({ id: address, kind: "gwar", address, name: address, updatedAt: 1 });
   try {
     await act(async () => root.render(<Fixture />));
     await act(async () => open(target("other.example")));

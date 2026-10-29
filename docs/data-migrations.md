@@ -277,7 +277,17 @@ The session stays on the device and contains the address, server kind, display n
 server password (plain text, like bookmarks), TeamSpeak identity and LAN choice;
 it never contains invite codes or cold-start voice entry. Update-only voice entry
 is consumed once, expires after five minutes, and names the target server and app version.
-Installation or relaunch failure clears that intent.
+Installation or relaunch failure clears that intent. Switching/importing an identity,
+signing out, or removing the matching bookmark clears both resume records. Hydration
+validates every reconnect field and reads only the whitelisted connection parameters.
+Automatic startup checks device ownership and never takes over another tab; the
+connect form offers an explicit "Connect here" action instead. An unreachable server
+gets at most three startup attempts, with 2 s and 5 s waits that an online event can
+skip. Cancel and identity changes retire the attempt and its timer.
+
+A TeamSpeak cold start keeps default-channel presence muted and deafened on the
+server until the user chooses "Join voice". This temporary presence state does not
+change their saved self-mute/deafen preferences.
 
 ### Desktop files
 
