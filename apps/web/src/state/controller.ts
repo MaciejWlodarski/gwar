@@ -1212,13 +1212,14 @@ class Controller {
   async leaveVoice(): Promise<void> {
     this.joinAttempt++; // a pending encrypted join gives up
     if (!this.canLeaveVoice) return;
+    const rejoining = this.rejoin !== null;
+    this.rejoin = null;
+    void this.screen.stopShare(); // also cancels a republish before screen.start answers
     if (useSession.getState().phase === "reconnecting") {
-      this.rejoin = null;
-      await this.screen.stopShare();
       await this.stopVoice();
       return;
     }
-    if (myChannelId(useSession.getState()) === null) return;
+    if (myChannelId(useSession.getState()) === null && !rejoining) return;
     const ok = await this.attempt(this.connection.request("channel.leave", {}));
     // The server's client.updated follows; do not wait for it to release the microphone.
     if (ok) { await this.stopVoice(); useUi.getState().dismissToast("voice-closed"); }
@@ -1226,10 +1227,23 @@ class Controller {
 
   private async rejoinVoice(channel: number): Promise<void> {
     if (!this.voiceRetryAllowed) { this.voiceRetryChannel = channel; return; }
+    const bound = this.bind(), intent = this.joinAttempt;
     const s = useSession.getState();
     const info = s.channels[channel], password = this.channelPasswords.get(channel);
-    if (!info || (info.has_password && !password && !s.permissions.includes("bypass_password"))) return;
-    await this.attempt(this.moveChannel(channel, password, false));
+    if (!info || (info.has_password && !password && !s.permissions.includes("bypass_password"))) {
+      if (this.rejoin === channel) this.rejoin = null;
+      return;
+    }
+    const refused = () => {
+      if (bound.current() && useSession.getState().phase === "online" && this.joinAttempt === intent + 1 && this.rejoin === channel) this.rejoin = null;
+    };
+    try {
+      await this.moveChannel(channel, password, false, refused);
+    } catch (e) {
+      if (!bound.current()) return;
+      if (e instanceof RequestError) refused();
+      useUi.getState().toast("error", describeRequestError(e));
+    }
   }
 
   /** Server presence alone never grants permission to open the microphone. */
@@ -1264,6 +1278,7 @@ class Controller {
     this.voiceAutoStart = true;
     this.voiceRetryAllowed = true;
     await this.startVoice();
+
   }
 
   /** Hostname (no brackets) of the server we are connected to; the native engine sends media there. */
@@ -1468,10 +1483,11 @@ class Controller {
    * server, a reconnect): it then changes nothing, a refusal included.
    */
   async joinChannel(channel: number, password?: string): Promise<boolean> {
+    this.rejoin = null; // explicit voice actions supersede automatic rejoin intent
     return this.moveChannel(channel, password, true);
   }
 
-  private async moveChannel(channel: number, password: string | undefined, explicit: boolean): Promise<boolean> {
+  private async moveChannel(channel: number, password: string | undefined, explicit: boolean, refused?: () => void): Promise<boolean> {
     // Joining state, entered channels and typed passwords belong to the session that asked.
     const bound = this.bind();
     const settle = () => { if (bound.current() && useUi.getState().joining === channel) useUi.getState().setJoining(null); };
@@ -1482,6 +1498,7 @@ class Controller {
       // A newer join, move or connection makes this one obsolete.
       if (!bound.current() || attempt !== this.joinAttempt) return bound.current();
       if (refusal) {
+        refused?.();
         if (useVoice.getState().failure) {
           this.voiceFailure(refusal, false);
           this.voiceRetryChannel = channel;
@@ -1496,7 +1513,7 @@ class Controller {
         const ready = await runtime.prepareChannel(channel);
         settle();
         if (!bound.current() || attempt !== this.joinAttempt) return bound.current();
-        if (!ready) { useUi.getState().toast("info", tNow("voice.channelSecuring")); return true; }
+        if (!ready) { refused?.(); useUi.getState().toast("info", tNow("voice.channelSecuring")); return true; }
       }
     } else this.joinAttempt++;
     // Silent sessions authorize the chosen channel only after the server places us there.
@@ -1544,6 +1561,7 @@ class Controller {
   /** Join voice with UI affordances: shows the channel's chat and asks for the password of locked channels. */
   async joinChannelInteractive(channel: number): Promise<void> {
     if (!useSession.getState().channels[channel]) return;
+    this.rejoin = null;
     this.selectChannel(channel); // opens the password dialog for locked channels
     // Already there, unless a move elsewhere is still in flight (then this is a move back).
     const pending = useUi.getState().joining;

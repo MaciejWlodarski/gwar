@@ -3396,15 +3396,19 @@ A reconnect retires transports, while keeping the captured stream and its qualit
 preview and currently active TeamSpeak-link choice. Revoking a link clears that
 choice permanently for the retained capture, including moderator revocation.
 Welcome and voice rejoin provide the new participation for republishing. Encoder
-fallback decisions (failed codecs, retired AV1 and an unsafe start-bitrate hint)
+fallback decisions (failed codecs, retired AV1, an unsafe start-bitrate hint, and
+the active recovery codec/rendition)
 survive only for this same capture; a new picker starts with fresh decisions.
 No bitrate estimate or transport state is carried into a new session.
 
-Repeated blips before voice rejoin retain the original channel. Leave during
-reconnect cancels both voice rejoin and the retained screen. Browser Stop sharing
+Repeated blips before voice rejoin retain the original channel. Every explicit
+Leave cancels voice rejoin and stops capture, including online republishing before
+the new share ID exists. Manual voice actions supersede saved rejoin intent;
+definitive admission refusal clears it, while a lost connection preserves it.
+Browser Stop sharing
 is a quiet user stop even during recovery. A picker still open at the interruption
-and an unconfirmed quality dialog are retained; confirmation while offline queues
-publication after resync. Unconfirmed choices still require confirmation. A changed
+and an unconfirmed quality dialog are retained; confirmation while offline or
+waiting for the new voice binding queues publication. Unconfirmed choices still require confirmation. A changed
 or encrypted channel refuses publication and explains that sharing stopped.
 
 Viewers retain their selected stage and watch order. A `left` stop waits for the
@@ -3412,7 +3416,8 @@ client update sequence: `remove()` sends a final move update before `client.left
 so a bounded 150 ms settle window lets that ordered sequence drain. The same sharer
 session still present means a voluntary move/leave, and the watch closes promptly
 with the normal ended notice. A removed session may return within 45 seconds. Match the original share ID first, then a
-unique user/channel capture; Client exposes no device identity. A healthy viewer
+unique user/channel capture, excluding shares already running on other sessions
+when recovery began; Client exposes no device identity. A healthy viewer
 whose return window expires receives an informational ended notice. Watch-transport
 failure instead uses bounded recovery/backoff and a connection error on exhaustion.
 Client identity is refreshed after a rewatch. Explicit Stop, moderation, lost
@@ -3439,15 +3444,19 @@ Picker refusal detection is intentionally limited to evidence in browser errors:
 Guidance names Gwar in the desktop shell and the detected browser on the web.
 macOS names System Settings → Privacy & Security → Screen Recording; Windows
 names Settings → Privacy & security; other systems get generic privacy guidance.
-Only macOS desktop offers **Open settings**. Windows WebView2 picker/policy refusals
+All banners occupy one compact row, like the Connect expiry bar. Small screens
+use **Sharing stopped** and a compact sharing action. Permission and ambiguous
+refusal banners offer **How to fix**, opening a small dialog with the details.
+Only the macOS desktop permission dialog offers **Open settings**. Windows WebView2 picker/policy refusals
 cannot be fixed by the OS privacy shortcut, so that button is hidden there. Raw
 error text remains in diagnostics rather than the UI.
 
 Set `E2E_SCREEN_RECONNECT_ONLY=1` for the focused cross-engine regression (the
 complete default matrix also runs it). The suite closes real local session WebSockets, checks same-stream
 republishing and decoded barcode frames, and asserts that a voluntary sharer move
-closes its watches. `E2E_SCREEN_SCREENSHOTS` saves Polish desktop/mobile recovery,
-permission and ambiguous-refusal screenshots from the running local app. Shell
+closes its watches. `E2E_SCREEN_SCREENSHOTS` saves Polish dark-theme banners and
+help dialogs at 1440, 768, 390 and 360 pixels and measures single-row layout,
+overflow and close-button alignment in the running local app. Shell
 and alternate-OS variants use explicit browser platform markers, without changing
 OS permissions or launching the installed desktop app.
 

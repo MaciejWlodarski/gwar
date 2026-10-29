@@ -78,26 +78,41 @@ export function ShareButton() {
 
 /** A stopped share or OS refusal needs an action that does not expire. */
 export function ScreenNotice() {
-  const t = useT();
   const notice = useScreen(s => s.notice);
+  return notice ? <ScreenNoticeContent key={notice} notice={notice} /> : null;
+}
+
+function ScreenNoticeContent({ notice }: { notice: "reconnect" | "permission" | "permissionHint" }) {
+  const t = useT();
+  const [help, setHelp] = useState(false);
   const own = useScreen(s => s.own);
   const phase = useSession(s => s.phase);
   const channel = useSession(myChannelId);
-  if (!notice) return null;
+  const title = notice === "permissionHint" ? "screen.permissionHintTitle" : "screen.permissionTitle";
   return (
-    <div role={notice === "permissionHint" ? "status" : "alert"} data-testid="screen-notice" className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-line-strong bg-surface px-4 py-3 text-sm text-fg">
-      <MonitorOff aria-hidden className={cn("size-4 shrink-0", notice === "permissionHint" ? "text-muted" : "text-danger")} />
-      <p className="min-w-0 flex-1 basis-64">{notice === "reconnect" ? t("screen.reconnectStopped") : t(notice === "permissionHint" ? "screen.permissionHint" : "screen.permission", {
-        app: captureApp(isDesktop(), navigator.userAgent) ?? t("screen.browser"), settings: t(`screen.permissionPlace.${captureOs(navigator.userAgent)}`),
-      })}</p>
-      {notice !== "reconnect" && canOpenScreenRecordingSettings() && (
-        <Button className="min-h-11" onClick={() => void openScreenRecordingSettings().catch((e: unknown) => console.warn("[screen] privacy settings:", e))}>{t("screen.openSettings")}</Button>
-      )}
-      {notice === "reconnect" && (
-        <Button className="min-h-11" variant="primary" disabled={phase !== "online" || !!own || channel === null} onClick={() => controller.screen.beginShare()}>{t("screen.shareAgain")}</Button>
-      )}
-      <IconButton label={t("common.close")} onClick={() => useScreen.getState().dispatch({ type: "notice", notice: null })}><X className="size-4" /></IconButton>
-    </div>
+    <>
+      <div role={notice === "permissionHint" ? "status" : "alert"} data-testid="screen-notice" className="flex shrink-0 items-center gap-2 border-b border-line-strong bg-surface px-2 py-1.5 text-xs text-fg sm:px-4 md:text-sm">
+        <MonitorOff aria-hidden className={cn("hidden size-4 shrink-0 sm:block", notice === "permissionHint" ? "text-muted" : "text-danger")} />
+        <p data-testid="screen-notice-text" className="min-w-0 flex-1 whitespace-nowrap">
+          {notice === "reconnect" ? <><span className="md:hidden">{t("screen.reconnectStoppedShort")}</span><span className="hidden md:inline">{t("screen.reconnectStopped")}</span></> : t(title)}
+        </p>
+        {notice === "reconnect" ? (
+          <Button size="sm" className="h-7 whitespace-nowrap px-2 text-xs" variant="primary" aria-label={t("screen.shareAgain")} disabled={phase !== "online" || !!own || channel === null} onClick={() => controller.screen.beginShare()}>
+            <span className="min-[380px]:hidden">{t("screen.shareAgainShort")}</span><span className="hidden min-[380px]:inline">{t("screen.shareAgain")}</span>
+          </Button>
+        ) : (
+          <Button size="sm" className="h-7 whitespace-nowrap px-2 text-xs" onClick={() => setHelp(true)}>{t(notice === "permissionHint" ? "screen.permissionHintFix" : "screen.permissionFix")}</Button>
+        )}
+        <IconButton label={t("common.close")} size="sm" tooltip={false} onClick={() => useScreen.getState().dispatch({ type: "notice", notice: null })}><X className="size-4" /></IconButton>
+      </div>
+      {notice !== "reconnect" && <Dialog open={help} onOpenChange={setHelp} title={t(notice === "permissionHint" ? "screen.permissionHintFix" : "screen.permissionFix")} footer={
+        canOpenScreenRecordingSettings() ? <Button onClick={() => void openScreenRecordingSettings().catch((e: unknown) => console.warn("[screen] privacy settings:", e))}>{t("screen.openSettings")}</Button> : undefined
+      }>
+        <p className="text-sm leading-relaxed text-pretty text-muted">{t(notice === "permissionHint" ? "screen.permissionHint" : "screen.permission", {
+          app: captureApp(isDesktop(), navigator.userAgent) ?? t("screen.browser"), settings: t(`screen.permissionPlace.${captureOs(navigator.userAgent)}`),
+        })}</p>
+      </Dialog>}
+    </>
   );
 }
 

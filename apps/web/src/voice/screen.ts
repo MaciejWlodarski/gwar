@@ -594,6 +594,7 @@ export interface EncoderFallbacks {
   brokenCodecs: SendCodec[];
   codecFellBack: boolean;
   av1Retired: boolean;
+  recovery: ScreenRecovery | null;
 }
 
 export interface PublishParams {
@@ -691,6 +692,7 @@ export class ScreenPublisher {
       this.startHintUnsafe = params.fallbacks.startHintUnsafe;
       this.codecFellBack = params.fallbacks.codecFellBack;
       this.av1Retired = params.fallbacks.av1Retired;
+      this.recovery = params.fallbacks.recovery ? { ...params.fallbacks.recovery } : null;
       for (const codec of params.fallbacks.brokenCodecs) this.brokenCodecs.add(codec);
     }
     const spec = this.spec();
@@ -699,7 +701,7 @@ export class ScreenPublisher {
   }
 
   fallbacks(): EncoderFallbacks {
-    return { startHintUnsafe: this.startHintUnsafe, brokenCodecs: [...this.brokenCodecs], codecFellBack: this.codecFellBack, av1Retired: this.av1Retired };
+    return { startHintUnsafe: this.startHintUnsafe, brokenCodecs: [...this.brokenCodecs], codecFellBack: this.codecFellBack, av1Retired: this.av1Retired, recovery: this.recovery ? { ...this.recovery } : null };
   }
 
   async start(): Promise<void> {

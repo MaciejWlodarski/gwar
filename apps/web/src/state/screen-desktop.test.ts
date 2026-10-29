@@ -125,7 +125,7 @@ describe("the desktop app", () => {
     screen.suspend();
     await vi.advanceTimersByTimeAsync(45_000);
     expect(useScreen.getState().notice).toBe("reconnect");
-    expect(notify).toHaveBeenCalledExactlyOnceWith({ title: "Gwar", body: "Your screen share stopped after the connection was lost.", tag: "screen-reconnect" });
+    expect(notify).toHaveBeenCalledExactlyOnceWith({ title: "Gwar", body: "Screen sharing stopped after the connection was lost.", tag: "screen-reconnect" });
     expect(track.stop).toHaveBeenCalledOnce();
     screen.reset();
     vi.useRealTimers();

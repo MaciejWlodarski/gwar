@@ -65,9 +65,9 @@ describe("persistent screen guidance", () => {
     useSettings.setState({ language: "pl" });
     useScreen.setState({ notice: "reconnect" });
     await act(async () => root.render(<TooltipProvider><ScreenNotice /></TooltipProvider>));
-    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Twoje udostępnianie zatrzymało się po utracie połączenia");
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Udostępnianie ekranu przerwało się po utracie połączenia.");
     const restart = vi.spyOn(controller.screen, "beginShare").mockImplementation(() => {});
-    const button = [...container.querySelectorAll("button")].find(b => b.textContent === "Udostępnij ponownie")!;
+    const button = container.querySelector<HTMLButtonElement>('[aria-label="Udostępnij ponownie"]')!;
     await act(async () => button.click());
     expect(restart).toHaveBeenCalledOnce();
     expect(container.querySelector('[role="alert"]')).not.toBeNull();
@@ -78,7 +78,7 @@ describe("persistent screen guidance", () => {
     useSession.setState({ phase: "online", me: null, clients: {} });
     useSettings.setState({ language: "en" }); useScreen.setState({ notice: "reconnect" });
     await act(async () => root.render(<TooltipProvider><ScreenNotice /></TooltipProvider>));
-    const restart = [...container.querySelectorAll("button")].find(b => b.textContent === "Share again")!;
+    const restart = container.querySelector<HTMLButtonElement>('[aria-label="Share again"]')!;
     expect(restart.disabled).toBe(true);
     controller.screen.beginShare();
     expect(getDisplayMedia).not.toHaveBeenCalled();
@@ -89,8 +89,12 @@ describe("persistent screen guidance", () => {
     const agent = vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Windows NT 10.0 Chrome/153");
     useSettings.setState({ language: "pl" }); useScreen.setState({ notice: "permission" });
     await act(async () => root.render(<TooltipProvider><ScreenNotice /></TooltipProvider>));
-    expect(container.textContent).toContain("dla Gwar w Ustawieniach → Prywatność i zabezpieczenia");
-    expect(container.textContent).not.toContain("Otwórz ustawienia");
+    expect(container.textContent).toContain("Brak zgody na nagrywanie ekranu");
+    expect(container.textContent).not.toContain("Ustawieniach");
+    await act(async () => [...container.querySelectorAll("button")].find(b => b.textContent === "Jak włączyć")!.click());
+    const dialog = document.querySelector('[role="dialog"]')!;
+    expect(dialog.textContent).toContain("dla Gwar w Ustawieniach → Prywatność i zabezpieczenia");
+    expect(dialog.textContent).not.toContain("Otwórz ustawienia");
     agent.mockRestore();
   });
 
@@ -99,7 +103,9 @@ describe("persistent screen guidance", () => {
     useSettings.setState({ language: "en" }); useScreen.setState({ notice: "permissionHint" });
     await act(async () => root.render(<TooltipProvider><ScreenNotice /></TooltipProvider>));
     expect(container.querySelector('[role="alert"]')).toBeNull();
-    expect(container.querySelector('[role="status"]')?.textContent).toContain("permission for Firefox in your system or browser privacy settings");
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("Couldn't share your screen");
+    await act(async () => [...container.querySelectorAll("button")].find(b => b.textContent === "How to fix")!.click());
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain("If you cancelled the picker, ignore this; otherwise allow screen recording for Firefox in your system or browser privacy settings.");
     agent.mockRestore();
   });
 
@@ -109,11 +115,15 @@ describe("persistent screen guidance", () => {
     useSettings.setState({ language: "pl" });
     useScreen.setState({ notice: "permission" });
     await act(async () => root.render(<TooltipProvider><ScreenNotice /></TooltipProvider>));
-    expect(container.textContent).toContain("Zezwól na nagrywanie ekranu dla Gwar");
-    expect(container.textContent).toContain("Otwórz ustawienia");
+    expect(container.textContent).toContain("Brak zgody na nagrywanie ekranu");
+    expect(container.textContent).not.toContain("Otwórz ustawienia");
+    await act(async () => [...container.querySelectorAll("button")].find(b => b.textContent === "Jak włączyć")!.click());
+    const dialog = document.querySelector('[role="dialog"]')!;
+    expect(dialog.textContent).toContain("Zezwól na nagrywanie ekranu dla Gwar");
+    expect(dialog.textContent).toContain("Prywatność i ochrona → Nagrywanie ekranu");
     expect(container.textContent).not.toContain("Permission denied by system");
     const settings = vi.spyOn(platform, "openScreenRecordingSettings").mockResolvedValue();
-    await act(async () => [...container.querySelectorAll("button")].find(b => b.textContent === "Otwórz ustawienia")!.click());
+    await act(async () => [...dialog.querySelectorAll("button")].find(b => b.textContent === "Otwórz ustawienia")!.click());
     expect(settings).toHaveBeenCalledOnce();
     settings.mockRestore();
     userAgent.mockRestore();

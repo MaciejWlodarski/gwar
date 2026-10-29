@@ -410,19 +410,53 @@ async function reconnectAndScreenshots(cs, cv, viewers, chromiumTab) {
     await cs.evaluate(async () => {
       const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
       useSettings.getState().setLanguage("pl");
+      useSettings.getState().setTheme("dark");
+      Object.defineProperty(navigator, "userAgent", { configurable: true, value: "Macintosh Chrome/153" });
     });
     const directory = process.env.E2E_SCREEN_SCREENSHOTS;
     mkdirSync(directory, { recursive: true });
     const screenshots = [];
-    const captureNotice = async kind => {
-      for (const [name, width, height] of [["desktop", 1440, 900], ["mobile", 390, 844]]) {
+    const layouts = [];
+    const captureNotice = async (kind, help) => {
+      for (const [name, width, height] of [["desktop", 1440, 900], ["tablet", 768, 1024], ["mobile", 390, 844], ["mobile-360", 360, 844]]) {
         await cs.setViewportSize({ width, height });
-        await cs.getByTestId("screen-notice").waitFor();
-        const bounds = await cs.getByTestId("screen-notice").boundingBox();
-        assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width, "notice fits the viewport");
+        const banner = cs.getByTestId("screen-notice");
+        await banner.waitFor();
+        const layout = await banner.evaluate(el => {
+          const bounds = el.getBoundingClientRect(), style = getComputedStyle(el);
+          const text = el.querySelector("p"), close = el.lastElementChild.getBoundingClientRect();
+          const children = [...el.children].filter(child => getComputedStyle(child).display !== "none").map(child => {
+            const box = child.getBoundingClientRect();
+            return { left: box.left, right: box.right, top: box.top, bottom: box.bottom, overflow: child.scrollWidth - child.clientWidth };
+          });
+          return { theme: document.documentElement.dataset.theme, left: bounds.left, right: bounds.right, height: bounds.height,
+            textHeight: text.getBoundingClientRect().height, lineHeight: parseFloat(getComputedStyle(text).lineHeight),
+            closeRight: close.right, paddingRight: parseFloat(style.paddingRight), children };
+        });
+        assert.equal(layout.theme, "dark");
+        assert.ok(layout.left >= 0 && layout.right <= width, "notice fits the viewport");
+        assert.ok(layout.height <= 46 && layout.textHeight <= layout.lineHeight + 1, "banner stays one compact row");
+        assert.ok(Math.abs(layout.closeRight - (layout.right - layout.paddingRight)) <= 1, "close stays at the right edge");
+        assert.ok(layout.children.every(c => c.overflow <= 1 && c.left >= layout.left && c.right <= layout.right), "no banner text wraps, truncates or overlaps actions");
+        for (let n = 1; n < layout.children.length; n++) assert.ok(layout.children[n].left >= layout.children[n - 1].right, "banner controls do not overlap");
+        layouts.push({ kind, width, ...layout });
         const file = path.join(directory, `${kind}-pl-${name}.png`);
-        await cs.screenshot({ path: file });
-        screenshots.push(file);
+        await cs.screenshot({ path: file }); screenshots.push(file);
+        if (help) {
+          await banner.getByRole("button", { name: /Jak (włączyć|naprawić)/ }).click();
+          const dialog = cs.getByRole("dialog"); await dialog.waitFor();
+          await dialog.evaluate(async el => { await Promise.all(el.getAnimations({ subtree: true }).map(animation => animation.finished)); });
+          assert.equal(await dialog.evaluate(el => getComputedStyle(el).opacity), "1", "help dialog finished opening");
+          assert.ok((await dialog.innerText()).includes(help.text), "help names the correct app and privacy settings");
+          assert.equal(await dialog.getByRole("button", { name: "Otwórz ustawienia", exact: true }).count(), help.shortcut ? 1 : 0);
+          const bounds = await dialog.boundingBox();
+          assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width && bounds.y >= 0 && bounds.y + bounds.height <= height, "help dialog fits the viewport");
+          assert.equal(await dialog.evaluate(el => el.scrollWidth > el.clientWidth), false, "dialog has no horizontal overflow");
+          const dialogFile = path.join(directory, `${kind}-dialog-pl-${name}.png`);
+          await cs.screenshot({ path: dialogFile, animations: "disabled" }); screenshots.push(dialogFile);
+          await dialog.getByRole("button", { name: "Zamknij", exact: true }).click();
+          await dialog.waitFor({ state: "detached" });
+        }
       }
     };
     await cs.getByRole("button", { name: "Udostępnij ponownie", exact: true }).waitFor();
@@ -432,8 +466,8 @@ async function reconnectAndScreenshots(cs, cv, viewers, chromiumTab) {
       navigator.mediaDevices.getDisplayMedia = async () => { throw new DOMException("Permission denied by system", "NotAllowedError"); };
     });
     await session(cs, (_, __, controller) => controller.screen.beginShare());
-    await cs.getByText(/Zezwól na nagrywanie ekranu dla/).waitFor();
-    await captureNotice("permission");
+    await cs.getByText("Brak zgody na nagrywanie ekranu", { exact: true }).waitFor();
+    await captureNotice("permission", { text: "dla Google Chrome w Ustawieniach systemowych → Prywatność i ochrona → Nagrywanie ekranu", shortcut: false });
     // The same running web UI, with only the desktop platform marker enabled, shows
     // the Gwar name and settings action. No desktop app or OS settings are launched.
     await cs.evaluate(async () => {
@@ -446,8 +480,7 @@ async function reconnectAndScreenshots(cs, cv, viewers, chromiumTab) {
       const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts");
       useScreen.setState({ notice: "permission" });
     });
-    await cs.getByRole("button", { name: "Otwórz ustawienia", exact: true }).waitFor();
-    await captureNotice("permission-desktop-shell");
+    await captureNotice("permission-desktop-shell", { text: "dla Gwar w Ustawieniach systemowych → Prywatność i ochrona → Nagrywanie ekranu", shortcut: true });
     // Windows WebView2 gets the right OS text but no unhelpful settings shortcut.
     await cs.evaluate(async () => {
       Object.defineProperty(navigator, "userAgent", { configurable: true, value: "Windows NT 10.0 Chrome/153" });
@@ -458,7 +491,7 @@ async function reconnectAndScreenshots(cs, cv, viewers, chromiumTab) {
       const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts"); useScreen.setState({ notice: "permission" });
     });
     assert.equal(await cs.getByRole("button", { name: "Otwórz ustawienia", exact: true }).count(), 0);
-    await captureNotice("permission-windows-shell");
+    await captureNotice("permission-windows-shell", { text: "dla Gwar w Ustawieniach → Prywatność i zabezpieczenia", shortcut: false });
     await cs.evaluate(async () => {
       delete window.__TAURI_INTERNALS__;
       Object.defineProperty(navigator, "userAgent", { configurable: true, value: "Firefox/153 Linux" });
@@ -468,16 +501,18 @@ async function reconnectAndScreenshots(cs, cv, viewers, chromiumTab) {
     await cs.evaluate(async () => {
       const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts"); useScreen.setState({ notice: "permissionHint" });
     });
-    await captureNotice("permission-ambiguous-browser");
+    await captureNotice("permission-ambiguous-browser", { text: "Jeśli anulowałeś wybór, zignoruj tę wskazówkę; w przeciwnym razie zezwól na nagrywanie ekranu dla Firefox w ustawieniach prywatności systemu lub przeglądarki.", shortcut: false });
     await cs.evaluate(() => { delete navigator.userAgent; });
     writeFileSync(path.join(directory, "screenshots.txt"), [
       "Real running Polish web app against a local loopback-only server.",
-      "Desktop 1440x900 and mobile 390x844 CSS pixels; no production or installed desktop app.",
+      "Default graphite/cyan dark theme; Polish; desktop 1440x900, tablet 768x1024, mobile 390x844 and 360x844 CSS pixels.",
+      "Each banner was measured as one compact row, with no overflow/overlap and the close button at the right edge; permission help dialogs fit every viewport.",
       "Reconnect notice: actual capture ended during recovery; still present after 6.5 seconds.",
       "Permission notice: getDisplayMedia rejects with an OS-denied NotAllowedError.",
       "permission-desktop-shell and permission-windows-shell: browser-rendered platform/UA markers only; no native app or settings launched.",
       "permission-ambiguous-browser: neutral Firefox/Linux guidance for an indistinguishable picker/platform refusal.",
       ...screenshots,
+      ...layouts.map(layout => JSON.stringify(layout)),
     ].join("\n") + "\n");
     cs.errors = cs.errors.filter(e => !e.includes("[screen] capture:"));
   }

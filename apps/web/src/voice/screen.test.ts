@@ -489,6 +489,23 @@ it("keeps the original publisher alive until its replacement is accepted and ret
   publisher.close();
 });
 
+it("retains the active recovery codec and rendition when republishing the same capture", async () => {
+  vi.stubGlobal("RTCRtpSender", { getCapabilities: () => ({ codecs: [codec("video/H264", "packetization-mode=1;profile-level-id=42e01f"), codec("video/VP9", "profile-id=0"), codec("video/rtx")] }) });
+  const track = { applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }) } as unknown as MediaStreamTrack;
+  const params = { track, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} };
+  const first = new ScreenPublisher(params); await first.start();
+  await first.recover({ share: "old", codec: "vp9", width: 1280, height: 720, fps: 30 });
+  const fallbacks = first.fallbacks(); first.close();
+  const restored = new ScreenPublisher({ ...params, fallbacks }); await restored.start();
+  const peer = Peer.all.at(-1)!;
+  expect(peer.transceivers[0]!.setCodecPreferences.mock.calls[0]![0].map((c: RTCRtpCodec) => c.mimeType)).toEqual(["video/VP9", "video/rtx"]);
+  expect(track.applyConstraints).toHaveBeenLastCalledWith({ width: { max: 1280 }, height: { max: 720 }, frameRate: { max: 30 } });
+  expect(peer.sendParams.at(-1)?.encodings[0]).toMatchObject({ maxFramerate: 30, scaleResolutionDownBy: 1.5 });
+  restored.close();
+  const fresh = new ScreenPublisher(params); await fresh.start();
+  expect(Peer.all.at(-1)!.transceivers[0]!.setCodecPreferences.mock.calls[0]![0][0].mimeType).toBe("video/H264"); fresh.close();
+});
+
 
 describe("publisher capture guard", () => {
   const make = (offer: () => Promise<string> = async () => "answer") => new ScreenPublisher({

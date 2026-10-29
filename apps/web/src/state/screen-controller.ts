@@ -135,7 +135,7 @@ export class ScreenController {
   private ownDeadline: ReturnType<typeof setTimeout> | null = null;
   private watchRetry: ReturnType<typeof setTimeout> | null = null;
   private watchRecoveries = 0;
-  private readonly targets = new Map<number, { uid: string; channel: number; client: number }>();
+  private readonly targets = new Map<number, { uid: string; channel: number; client: number; otherShares: Set<string> }>();
   private readonly waiting = new Map<number, ReturnType<typeof setTimeout>>();
 
   constructor(
@@ -265,7 +265,9 @@ export class ScreenController {
     const conn = this.link();
     const track = own?.stream?.getVideoTracks()[0];
     if (!own || (own.phase !== "choosing" && own.phase !== "reconnecting") || !track) return;
-    if (this.suspended) {
+    const s = useSession.getState();
+    const me = s.me ? s.clients[s.me.session] : undefined;
+    if (this.suspended || (this.retainedCapture && (!me?.voice_binding || me.channel === null))) {
       if (own.phase === "choosing") {
         this.recoveringAttempt = own.attempt;
         this.ownDeadline ??= setTimeout(() => this.recoveryFailed(), 45_000);
@@ -280,8 +282,6 @@ export class ScreenController {
     const guestLink = own.guestLink && this.guestLinkPossible();
     const generation = this.generation;
     const current = () => this.generation === generation && useScreen.getState().own?.attempt === attempt && this.link() === conn;
-    const s = useSession.getState();
-    const me = s.me ? s.clients[s.me.session] : undefined;
     const binding = me?.voice_binding;
     if (!conn || !me || me.channel === null || !binding) { if (!recovering) this.endOwn(); return; }
     if (this.ownChannel !== null && me.channel !== this.ownChannel) { this.recoveryFailed(); return; }
@@ -433,7 +433,7 @@ export class ScreenController {
     if (useScreen.getState().watches.length === 0) this.watchRecoveries = 0;
     const id = ++this.watchIds;
     const uid = s.clients[info.client]?.uid;
-    if (uid) this.targets.set(id, { uid, channel: info.channel, client: info.client });
+    if (uid) this.targets.set(id, { uid, channel: info.channel, client: info.client, otherShares: new Set() });
     const generation = this.generation;
     dispatch({ type: "watch", share, id });
     if (this.suspended) { this.waitForWatch(id); return; }
@@ -883,6 +883,13 @@ export class ScreenController {
 
   private waitForWatch(id: number): void {
     if (this.waiting.has(id)) return;
+    const target = this.targets.get(id);
+    if (target) {
+      target.otherShares.clear();
+      for (const share of Object.values(useSession.getState().shares)) {
+        if (share.client !== target.client) target.otherShares.add(share.share);
+      }
+    }
     this.waiting.set(id, setTimeout(() => {
       const watch = useScreen.getState().watches.find(w => w.id === id);
       this.forgetWatch(id);
@@ -904,6 +911,7 @@ export class ScreenController {
       const target = this.targets.get(watch.id);
       const candidates = target ? Object.values(session.shares).filter(s =>
         s.channel === target.channel && session.clients[s.client]?.uid === target.uid
+        && !target.otherShares.has(s.share)
         && !useScreen.getState().watches.some(w => w.id !== watch.id && w.share === s.share)) : [];
       // Client exposes no device identity: do not guess between several returning captures.
       const info = session.shares[watch.share] ?? (candidates.length === 1 ? candidates[0] : undefined);

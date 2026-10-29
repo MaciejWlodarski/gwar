@@ -1034,6 +1034,51 @@ describe("staying on the server without voice", () => {
     expect(link.sent("channel.join").map(r => r.d)).toEqual([{ channel: 2, password: null }, { channel: 2, password: null }]);
   });
 
+  it("Leave stops retained capture during online republishing before screen.start answers", async () => {
+    connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
+    const { useScreen } = await import("./screen");
+    const source = { readyState: "live", stop: vi.fn(), applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }) };
+    useScreen.setState({ own: { phase: "live", attempt: 7, share: "old", stream: { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream,
+      surface: "screen", spec: { mode: "smooth", height: 1080, fps: 30 }, viewers: 0, guests: 0, guestLink: false, preview: false } });
+    let started!: (value: { share: string }) => void;
+    const request = link.request.bind(link);
+    vi.spyOn(link, "request").mockImplementation((op, d) => op === "screen.start" ? new Promise(resolve => { started = resolve as never; }) : request(op, d));
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    link.welcomeNow(welcome({ session: 9, uid: "u1", channels: [chan(1), chan(2)], clients: [client(9, 2, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(useScreen.getState().own).toMatchObject({ phase: "starting", share: null });
+    await controller.leaveVoice();
+    expect(source.stop).toHaveBeenCalledOnce();
+    expect(useScreen.getState().own).toBeNull();
+    link.emit({ ev: "client.updated", d: client(9, null, { uid: "u1" }) });
+    started({ share: "late" }); await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("screen.stop").at(-1)?.d).toEqual({ share: "late" });
+    expect(link.sent("screen.publish.offer")).toHaveLength(0);
+    expect(stores.useUi.getState().toasts).toEqual([]);
+  });
+
+  it.each(["refused", "manual"])("supersedes automatic rejoin intent when %s", async action => {
+    connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
+    const { RequestError } = await import("../net/connection");
+    const request = link.request.bind(link);
+    vi.spyOn(link, "request").mockImplementation(async (op, d) => {
+      const result = await request(op, d);
+      if (action === "refused" && op === "channel.join" && (d as { channel: number }).channel === 2) throw new RequestError("forbidden", "refused");
+      return result;
+    });
+    const resync = (id: number) => link.welcomeNow(welcome({ session: id, uid: "u1", channels: [chan(1), chan(2)], clients: [client(id, null, { uid: "u1" })] }), true);
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 }); resync(9);
+    await vi.advanceTimersByTimeAsync(10);
+    if (action === "manual") {
+      await controller.joinChannel(1);
+      link.emit({ ev: "client.updated", d: client(9, 1, { uid: "u1" }) });
+    }
+    const before = link.sent("channel.join").length;
+    link.status_({ state: "reconnecting", attempt: 2, retryAt: 0 }); resync(10);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join").slice(before).map(r => r.d)).toEqual(action === "manual" ? [{ channel: 1, password: null }] : []);
+  });
+
   it("does not offer leaving on TeamSpeak servers", async () => {
     connectFake({ channel: 1, kind: "teamspeak" });
     await controller.leaveVoice();
