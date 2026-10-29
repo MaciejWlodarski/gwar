@@ -130,6 +130,7 @@ export class ScreenController {
     if (this.initialised) return;
     this.initialised = true;
     if (isDesktop()) void loadDesktopCapture();
+    useScreen.subscribe((s) => { if (s.own?.phase === "live") useUi.getState().dismissToast("screen-stopped"); });
     useSession.subscribe((s, prev) => {
       if (myChannelId(s) !== myChannelId(prev) && useScreen.getState().own) this.endOwn();
     });
@@ -271,12 +272,12 @@ export class ScreenController {
       state: state => {
         if (state !== "failed" || this.publisher !== publisher) return;
         void this.stopShare();
-        useUi.getState().toast("error", tNow("screen.stopped.transport"));
+        this.stoppedNotice(tNow("screen.stopped.transport"));
       },
       encodeFailed: () => {
         if (this.publisher !== publisher) return;
         void this.stopShare();
-        useUi.getState().toast("error", tNow("screen.stopped.encoder"));
+        this.stoppedNotice(tNow("screen.stopped.encoder"));
       },
     });
     this.publisher = publisher;
@@ -612,6 +613,13 @@ export class ScreenController {
     retire?.();
   }
 
+  /** Presentation only; reconnect recovery is handled independently. */
+  private stoppedNotice(text: string, kind: "error" | "info" = "error"): void {
+    useUi.getState().toast(kind, text, {
+      key: "screen-stopped", sticky: true,
+      action: { label: tNow("screen.shareAgain"), run: () => this.beginShare() },
+    });
+  }
   // ------------------------------------------------------------------- events
 
   handleEvent(event: Event): void {
@@ -622,7 +630,7 @@ export class ScreenController {
           if (this.publisher !== publisher || useScreen.getState().own?.share !== event.d.share) return;
           console.warn("Screen recovery:", e);
           void this.stopShare();
-          useUi.getState().toast("error", tNow("screen.stopped.transport"));
+          this.stoppedNotice(tNow("screen.stopped.transport"));
         });
         return;
       }
@@ -672,7 +680,7 @@ export class ScreenController {
         if (own?.share === share) {
           this.endOwn();
           const text = this.ownStopText(reason, by);
-          if (text) useUi.getState().toast(reason === "moderator" ? "info" : "error", text);
+          if (text) this.stoppedNotice(text, reason === "moderator" ? "info" : "error");
           return;
         }
         // Only a share I watched, here or until its slot was just freed.

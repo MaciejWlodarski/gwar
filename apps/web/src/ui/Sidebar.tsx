@@ -1,5 +1,5 @@
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
-import { ChevronDown, Copy, Fingerprint, KeyRound, LayoutDashboard, LogOut, Plus, Pencil, Settings2, Ticket, UserPlus } from "lucide-react";
+import { ChevronDown, ChevronRight, Copy, Fingerprint, KeyRound, LayoutDashboard, LogOut, Plus, Pencil, Settings2, Ticket, UserPlus } from "lucide-react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { controller } from "../state/controller";
@@ -56,7 +56,7 @@ function ServerHeader() {
             <span
               className={cn("block truncate text-[11px] leading-tight", phase === "reconnecting" ? "text-warn" : "text-subtle")}
             >
-              {phase === "reconnecting" ? t("server.reconnecting") : address}
+              {phase === "reconnecting" ? t("server.reconnecting") : t("server.connected")}
             </span>
           </span>
           <ChevronDown className="size-4 shrink-0 text-muted transition-transform duration-150 group-data-[state=open]:rotate-180" />
@@ -85,23 +85,28 @@ function ServerHeader() {
             </Dropdown.Item>
           )}
           {(canManage || canCreate || canInvite) && <Dropdown.Separator className={menuSeparator} />}
-          {canToken && (
-            <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "createToken" })}>
-              <Ticket className="size-4" /> {t("server.createToken")}
-            </Dropdown.Item>
-          )}
-          <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "redeem" })}>
-            <KeyRound className="size-4" /> {t("server.redeem")}
-          </Dropdown.Item>
-          <Dropdown.Separator className={menuSeparator} />
-          <Dropdown.Item className={menuItem} onSelect={() => void copyAddress()}>
-            <Copy className="size-4" /> {t("server.copyAddress")}
-          </Dropdown.Item>
-          {serverKey && (
-            <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "serverKey" })}>
-              <Fingerprint className="size-4" /> {t("server.key")}
-            </Dropdown.Item>
-          )}
+          <Dropdown.Sub>
+            <Dropdown.SubTrigger className={menuItem}><Settings2 className="size-4" /> {t("common.advanced")}<ChevronRight className="ml-auto size-4" /></Dropdown.SubTrigger>
+            <Dropdown.Portal><Dropdown.SubContent sideOffset={4} className={cn(menuContent, "w-64")}>
+                {canToken && (
+                  <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "createToken" })}>
+                    <Ticket className="size-4" /> {t("server.createToken")}
+                  </Dropdown.Item>
+                )}
+                <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "redeem" })}>
+                  <KeyRound className="size-4" /> {t("server.redeem")}
+                </Dropdown.Item>
+                <Dropdown.Separator className={menuSeparator} />
+                <Dropdown.Item className={menuItem} onSelect={() => void copyAddress()}>
+                  <Copy className="size-4" /> {t("server.copyAddress")}
+                </Dropdown.Item>
+                {serverKey && (
+                  <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "serverKey" })}>
+                    <Fingerprint className="size-4" /> {t("server.key")}
+                  </Dropdown.Item>
+                )}
+            </Dropdown.SubContent></Dropdown.Portal>
+          </Dropdown.Sub>
           <Dropdown.Separator className={menuSeparator} />
           <Dropdown.Item className={cn(menuItem, menuItemDanger)} onSelect={() => void controller.disconnect()}>
             <LogOut className="size-4" /> {t("server.disconnect")}

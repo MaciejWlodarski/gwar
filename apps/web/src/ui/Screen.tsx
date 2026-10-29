@@ -179,7 +179,6 @@ export function SharingBar() {
         </span>
       )}
       <span className="ml-auto flex items-center gap-2">
-        <span className="text-xs">{`${own.spec.height}p${own.spec.fps} · ${t(`screen.mode.${own.spec.mode}`)}`}</span>
         <QualityControls spec={own.spec} bar />
         <Button size="sm" variant="secondary" aria-pressed={own.preview} className={cn("border-white/40 text-white hover:bg-white/15", own.preview && "bg-white/20")}
           onClick={() => controller.screen.setPreview(!own.preview)}>
@@ -214,14 +213,16 @@ function SenderStats() {
     ? t("screen.encoder", { name: stats.encoder, kind: t(stats.hardware === true ? "screen.encoderHardware" : stats.hardware === false ? "screen.encoderSoftware" : "screen.encoderUnknown") })
     : undefined;
   return (
-    <span data-testid="screen-sender-stats" title={encoder} className="flex items-center gap-1.5 text-xs text-white/85 tabular-nums">
-      {`${stats.height}p · ${stats.fps} fps · ${mbps} Mb/s${stats.codec ? ` · ${stats.codec}` : ""}`}
-      {stats.limitation === "cpu" || stats.limitation === "bandwidth" ? (
-        <span className="rounded bg-white/20 px-1.5 leading-5 font-medium text-white">
-          {t(stats.limitation === "cpu" ? "screen.limitedCpu" : "screen.limitedBandwidth")}
-        </span>
-      ) : null}
-    </span>
+    <details data-testid="screen-sender-stats" className="relative text-xs text-white">
+      <summary className="cursor-pointer rounded border border-white/40 px-2 py-1 font-medium">
+        {t(stats.limitation === "cpu" ? "screen.limitedCpu" : stats.limitation === "bandwidth" ? "screen.limitedBandwidth" : "screen.qualityGood")}
+      </summary>
+      <div className="absolute top-full left-0 z-50 mt-1 w-64 rounded-lg border border-line-strong bg-raised p-3 text-fg shadow-pop">
+        <p className="mb-1 font-medium">{t("common.details")}</p>
+        <p className="tabular-nums">{`${stats.height}p · ${stats.fps} fps · ${mbps} Mb/s${stats.codec ? ` · ${stats.codec}` : ""}`}</p>
+        {encoder && <p className="mt-1 text-muted">{encoder}</p>}
+      </div>
+    </details>
   );
 }
 

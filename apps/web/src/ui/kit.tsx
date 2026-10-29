@@ -438,6 +438,7 @@ export function Dialog({
   description,
   children,
   footer,
+  onCloseAutoFocus,
   width = "max-w-md",
 }: {
   open: boolean;
@@ -446,6 +447,7 @@ export function Dialog({
   description?: string;
   children: ReactNode;
   footer?: ReactNode;
+  onCloseAutoFocus?: (event: Event) => void;
   width?: string;
 }) {
   const t = useT();
@@ -454,6 +456,7 @@ export function Dialog({
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="anim-fade fixed inset-0 z-50 bg-black/55 backdrop-blur-[2px]" />
         <DialogPrimitive.Content
+          onCloseAutoFocus={onCloseAutoFocus}
           className={cn(
             "anim-pop fixed top-1/2 left-1/2 z-50 flex max-h-[min(90dvh,720px)] w-[calc(100vw-24px)] -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-line-strong bg-surface shadow-pop outline-none",
             width,

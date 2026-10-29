@@ -51,10 +51,11 @@ export function initDesktop(): (() => void) | undefined {
     try {
       await api.invoke("set_global_shortcut", { action, accelerator });
       registered[action] = accelerator;
+      useUi.getState().dismissToast(`shortcut-${action}`);
     } catch (e) {
       registered[action] = null;
       console.warn(`[desktop] shortcut ${action} ${accelerator}:`, e);
-      if (accelerator) useUi.getState().toast("error", tNow("audio.shortcutFailed", { key: accelerator }));
+      if (accelerator) useUi.getState().toast("error", tNow("audio.shortcutFailed", { key: accelerator }), { key: `shortcut-${action}`, sticky: true, action: { label: tNow("settings.audio"), run: () => useUi.getState().openSettings("audio") } });
     }
   };
 

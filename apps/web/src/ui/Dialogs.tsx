@@ -434,7 +434,7 @@ function ChannelDialog(props: { mode: "create"; parent: number | null } | { mode
       }
       close();
     } catch (err) {
-      setError(describeRequestError(err));
+      setError(describeRequestError(err, "err.channel.save"));
       setBusy(false);
     }
   };
