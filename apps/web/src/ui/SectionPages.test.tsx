@@ -219,13 +219,19 @@ describe("the voice pill", () => {
   });
 });
 
-it("shows permanent voice refusal with its reason and manual Retry, without a reconnecting label", async () => {
+it("keeps permanent refusal compact, with an on-demand reason and manual Retry", async () => {
   online();
   useVoice.setState({ state: "failed", reconnecting: false, failure: "Update your browser to join encrypted voice." });
   await render(<VoicePanel />);
   expect(container.textContent).toContain("Voice unavailable");
-  expect(container.textContent).toContain("Update your browser to join encrypted voice.");
+  expect(container.textContent).not.toContain("Update your browser to join encrypted voice.");
   expect(container.textContent).not.toContain("Reconnecting voice");
+  const why = [...container.querySelectorAll("button")].find(button => button.textContent === "Why?");
+  await click(why!);
+  const dialog = document.querySelector('[role="dialog"]')!;
+  expect(dialog.textContent).toContain("Update your browser to join encrypted voice.");
+  await click(dialog.querySelector('button[aria-label="Close"]')!);
+  expect(document.querySelector('[role="dialog"]')).toBeNull();
   const retry = [...container.querySelectorAll("button")].find(button => button.textContent === "Retry");
   await click(retry!); expect(mock.retryVoice).toHaveBeenCalledOnce();
 });

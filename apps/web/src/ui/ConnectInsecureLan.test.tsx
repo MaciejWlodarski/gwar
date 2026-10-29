@@ -49,13 +49,19 @@ it('uses only the new address own saved plaintext setting', async () => {
   await submit(); expect(choice()).toMatchObject({ address: 'b.lan', insecureLan: false });
 });
 
-it('shows a natural Polish other-tab note and connects only after Połącz tutaj is clicked', async () => {
+it('replaces the Polish form with one deliberate takeover action and a quiet way back', async () => {
   const saved = { address: 'a.lan', kind: 'gwar' as const, name: 'A', password: 'saved-password' };
   useSettings.setState({ language: 'pl' }); useConnectUi.setState({ otherTab: saved });
   await show();
-  expect(div.textContent).toContain('Gwar jest otwarty w innej karcie.');
-  expect(div.querySelector('form')).not.toBeNull(); expect(mock.connect).not.toHaveBeenCalled();
-  const button = [...div.querySelectorAll('button')].find(b => b.textContent === 'Połącz tutaj');
+  expect(div.textContent).toContain('Gwar jest otwarty w innej karcie');
+  expect(div.querySelector('form')).toBeNull(); expect(mock.connect).not.toHaveBeenCalled();
+  expect([...div.querySelectorAll('button')].map(b => b.textContent)).toEqual(['Użyj tutaj', 'Wróć do formularza']);
+  const button = [...div.querySelectorAll('button')].find(b => b.textContent === 'Użyj tutaj');
   await act(async () => button!.click());
   expect(mock.connect).toHaveBeenCalledWith(saved, { remember: false });
+  mock.connect.mockClear();
+  await act(async () => [...div.querySelectorAll('button')].find(b => b.textContent === 'Wróć do formularza')!.click());
+  expect(div.querySelector('form')).not.toBeNull();
+  expect(useConnectUi.getState().otherTab).toBeNull();
+  expect(mock.connect).not.toHaveBeenCalled();
 });

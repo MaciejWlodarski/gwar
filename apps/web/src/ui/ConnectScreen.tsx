@@ -116,6 +116,14 @@ export function ConnectScreen({ card }: { card?: boolean }) {
 
   const notice = closeNotice(closeReason, t);
 
+  if (otherTab) return (
+    <main className={cn("flex min-w-0 flex-1 flex-col items-center justify-center gap-4 bg-surface px-4 text-center", card && panelCard)}>
+      <h1 role="status" className="text-sm font-medium whitespace-nowrap">{t("connect.otherTab")}</h1>
+      <Button variant="primary" busy={busy} onClick={() => void controller.connectInteractive(otherTab, { remember: false })}>{t("connect.here")}</Button>
+      <button className="t cursor-pointer text-xs text-muted hover:text-fg" onClick={() => useConnectUi.getState().set({ otherTab: null })}>{t("connect.backToForm")}</button>
+    </main>
+  );
+
   return (
     <main className={cn("relative flex min-w-0 flex-1 flex-col items-center overflow-y-auto bg-surface", card && panelCard)}>
       <div className="flex w-full flex-1 flex-col items-center justify-center gap-6 px-4 py-8">
@@ -213,13 +221,6 @@ export function ConnectScreen({ card }: { card?: boolean }) {
             {insecureLan && <p role="alert" className="text-sm text-danger">{t("security.insecureWarning")}</p>}
           </div>}
           <Switch checked={remember} onCheckedChange={setRemember} label={t("connect.remember")} />
-
-          {otherTab && (
-            <div role="status" className="flex flex-col gap-3 rounded-lg border border-line bg-raised px-3 py-3 text-sm">
-              <p className="text-muted">{t("connect.otherTab")}</p>
-              <Button variant="secondary" onClick={() => void controller.connectInteractive(otherTab, { remember: false })}>{t("connect.here")}</Button>
-            </div>
-          )}
 
           {error && (
             <div role="alert" className="flex gap-2 rounded-lg bg-danger-soft px-3 py-2 text-sm text-danger">

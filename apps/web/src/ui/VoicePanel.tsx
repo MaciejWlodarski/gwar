@@ -1,5 +1,5 @@
 import { Headphones, HeadphoneOff, Mic, MicOff, MonitorUp, PhoneOff, SignalHigh, SignalLow, SignalMedium } from "lucide-react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { controller, describeVoiceError } from "../state/controller";
@@ -9,7 +9,7 @@ import { useSettings } from "../state/settings";
 import { myChannelId } from "../state/reducer";
 import { useSession, useVoice } from "../state/stores";
 import { useChannelPermission, useMe, keyLabel, modKey } from "./hooks";
-import { Button, IconButton, TalkingAvatar, Tooltip } from "./kit";
+import { Button, Dialog, IconButton, TalkingAvatar, Tooltip } from "./kit";
 import { showVoiceChannel, useVoicePill } from "./nav";
 import { ConnectBadge } from "./badges";
 import { ShareButton } from "./Screen";
@@ -159,6 +159,7 @@ function LeaveButton() {
 
 export function VoicePanel() {
   const t = useT();
+  const [showReason, setShowReason] = useState(false);
   const failure = useVoice((s) => s.failure);
   const voiceState = useVoice((s) => s.state);
   const encryption = useVoice((s) => s.encryption);
@@ -205,7 +206,7 @@ export function VoicePanel() {
             <span className="truncate text-sm font-semibold">{me?.nickname}</span>
             {me && <ConnectBadge member={member} name={me.nickname} />}
           </div>
-          <div className="flex min-w-0 items-center gap-1.5 text-xs" title={status.text}>
+          {!failure && <div className="flex min-w-0 items-center gap-1.5 text-xs" title={status.text}>
             <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone, status.tone === "warn" && "animate-pulse")} />
             {status.tone === "ok" && channelName ? (
               <>
@@ -216,7 +217,7 @@ export function VoicePanel() {
               <span className={cn("truncate", tone)}>{status.text}</span>
             )}
             {status.tone === "ok" && <RoundTrip />}
-          </div>
+          </div>}
         </div>
         {unavailable && phase === "online" && (
           <Button size="sm" variant="secondary" onClick={() => controller.retryVoice()}>
@@ -225,7 +226,12 @@ export function VoicePanel() {
         )}
         <LeaveButton />
       </div>
-      {failure && <p role="alert" className="px-1 text-xs text-muted">{failure}</p>}
+      {failure && <div className="flex items-center gap-1.5 px-1 text-xs">
+        <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone)} />
+        <span className={tone}>{status.text}</span>
+        <button onClick={() => setShowReason(true)} className="t ml-auto cursor-pointer text-muted underline underline-offset-2 hover:text-fg">{t("voice.why")}</button>
+      </div>}
+      <Dialog open={showReason && !!failure} onOpenChange={setShowReason} title={t("voice.failed")} description={failure ?? undefined}>{null}</Dialog>
       {micError && (
         <div role="alert" className="rounded-md bg-danger-soft px-2 py-1.5 text-xs text-danger">
           {describeVoiceError(micError)}

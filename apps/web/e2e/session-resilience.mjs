@@ -31,7 +31,7 @@ let page = await context.newPage();
 page.on("pageerror", error => console.error("Browser error:", error.message));
 page.on("console", message => { if (message.type() === "error") console.error("Browser console:", message.text()); });
 const modules = { controller: "/src/state/controller.ts", stores: "/src/state/stores.ts", settings: "/src/state/settings.ts" };
-const widths = [["desktop", 1440, 900], ["tablet", 834, 1112], ["mobile", 390, 844]];
+const widths = [["desktop", 1440, 900], ["tablet", 834, 1112], ["mobile", 390, 844], ["mobile-360", 360, 800]];
 const snap = async (name, target = page) => {
   await target.evaluate(() => document.fonts.ready);
   const file = path.join(shots, `${name}-pl.png`);
@@ -83,17 +83,19 @@ try {
     await page.getByRole("button", { name: "Anuluj", exact: true }).click();
   }
 
-  // A second tab must remain on the form while this tab is in a real call.
+  // A second tab offers one deliberate takeover action while this tab is in a real call.
   const caller = page;
   const newcomer = await context.newPage();
   await newcomer.goto(web);
-  await newcomer.getByRole("button", { name: "Połącz tutaj", exact: true }).waitFor();
+  await newcomer.getByRole("button", { name: "Użyj tutaj", exact: true }).waitFor();
+  assert.equal(await newcomer.locator("form").count(), 0, "the takeover state replaces the form");
+  assert.equal(await newcomer.getByRole("button", { name: "Połącz", exact: true }).count(), 0, "no duplicate connect action");
   assert.equal(await caller.evaluate(async modules => (await window.__gwarE2eImport(modules.stores)).useVoice.getState().state, modules), "connected");
   for (const [size, width, height] of widths) {
     await newcomer.setViewportSize({ width, height });
     await snap(`other-tab-${size}`, newcomer);
   }
-  await newcomer.getByRole("button", { name: "Połącz tutaj", exact: true }).click();
+  await newcomer.getByRole("button", { name: "Użyj tutaj", exact: true }).click();
   await newcomer.waitForFunction(async modules => {
     const { useSession } = await window.__gwarE2eImport(modules.stores);
     return useSession.getState().phase === "online" && useSession.getState().me !== null;
@@ -152,6 +154,38 @@ try {
     return useSession.getState().phase === "idle" && !useConnectUi.getState().restoring;
   }, modules);
   assert.equal(await page.evaluate(async modules => (await window.__gwarE2eImport(modules.settings)).useSettings.getState().resumeConnection, modules), null);
+
+  // Exercise the real permanent-refusal UI with a controlled capability/snapshot fixture.
+  websocketMode = "pass";
+  await page.evaluate(async ({ modules, server, channel }) => {
+    const { controller } = await window.__gwarE2eImport(modules.controller);
+    assertConnected(await controller.connectInteractive({ address: server }, { remember: false }));
+    await controller.joinChannel(channel);
+    function assertConnected(ok) { if (!ok) throw new Error("Local reconnect failed"); }
+  }, { modules, server, channel });
+  await page.waitForFunction(async modules => (await window.__gwarE2eImport(modules.stores)).useVoice.getState().state === "connected", modules);
+  await page.evaluate(async modules => {
+    const { controller } = await window.__gwarE2eImport(modules.controller);
+    const { useSession } = await window.__gwarE2eImport(modules.stores);
+    const s = useSession.getState(), channel = s.clients[s.me.session].channel;
+    controller.voice.capabilities.encryptedVoice = async () => false;
+    useSession.setState({ channels: { ...s.channels, [channel]: { ...s.channels[channel], encrypted: true } } });
+    controller.retryVoice();
+  }, modules);
+  await page.waitForFunction(async modules => !!(await window.__gwarE2eImport(modules.stores)).useVoice.getState().failure, modules);
+  assert.equal(await page.evaluate(async modules => (await window.__gwarE2eImport(modules.stores)).useUi.getState().toasts.length, modules), 0, "permanent refusal has no toast");
+  for (const [size, width, height] of widths) {
+    await page.setViewportSize({ width, height });
+    await page.evaluate(async modules => (await window.__gwarE2eImport(modules.stores)).useUi.getState().landOnServer(), modules);
+    const status = page.getByText("Głos niedostępny", { exact: true });
+    assert.equal(await status.count(), 1, "one compact unavailable status");
+    assert(await status.evaluate(el => el.scrollWidth <= el.clientWidth), "the complete status fits");
+    await snap(`voice-unavailable-${size}`);
+    await page.getByRole("button", { name: "Dlaczego?", exact: true }).click();
+    await page.getByRole("dialog").waitFor();
+    await snap(`voice-unavailable-reason-${size}`);
+    await page.getByRole("button", { name: "Zamknij", exact: true }).click();
+  }
   writeFileSync(path.join(shots, "screenshots.txt"), `${files.join("\n")}\n`);
   console.log("Local reload, multi-tab protection/takeover, offline recovery, privacy settings, voice exclusion, switch cancellation and explicit-disconnect checks passed.");
   console.log(`${files.length} Polish screenshots: ${shots}`);

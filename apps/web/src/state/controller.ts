@@ -63,7 +63,7 @@ import { ScreenController } from "./screen-controller";
 import { microphoneSsrc } from "../voice/sdp";
 import { VoiceError, type VoiceEngine } from "../voice/engine";
 import { channelThreadKey, latestMessageId, myChannelId, sortedChannels, storedKey } from "./reducer";
-import { inAccount, newId, useSettings, type Bookmark, type ServerKind } from "./settings";
+import { inAccount, newId, useSettings, type Bookmark, type ServerKind, type UpdateVoiceResume } from "./settings";
 import { sameServer } from "../lib/server-key";
 import { useConnectUi, useOutbox, useSession, useUi, useVoice, type FailedSend } from "./stores";
 import type { ThreadKey } from "./types";
@@ -235,6 +235,7 @@ class Controller {
   private persistRequested = false;
   private coldStartParams: ConnectParams | null = null;
   private voiceAutoStart = true;
+  private pendingVoiceEntry: { conn: Link; channel: number; intent?: UpdateVoiceResume } | null = null;
   private voiceRun = 0;
   private initialised = false;
   private loadingOlder = false;
@@ -314,6 +315,8 @@ class Controller {
     useSettings.subscribe((s, prev) => {
       if (prev.resumeConnection && !s.resumeConnection) {
         this.rememberResume = false;
+        this.pendingVoiceEntry = null;
+        useConnectUi.getState().set({ otherTab: null });
         const wasRestoring = this.startup !== null;
         this.cancelStartup();
         if (wasRestoring && !this.conn?.isOnline) void this.disconnect(true);
@@ -365,13 +368,13 @@ class Controller {
       }
       if (before === null && now !== null) {
         this.voiceRetries = 0;
-        void this.startVoice();
+        void this.followVoicePresence();
       } else if (before !== now) {
         const conn = this.conn;
         const stopped = this.stopVoice();
         const run = this.voiceRun;
         void stopped.then(() => {
-          if (run === this.voiceRun && this.conn === conn && now !== null && myChannelId(useSession.getState()) === now) return this.startVoice();
+          if (run === this.voiceRun && this.conn === conn && now !== null && myChannelId(useSession.getState()) === now) return this.followVoicePresence();
         });
       }
     });
@@ -673,6 +676,7 @@ class Controller {
   /** Identity boundaries must not carry server passwords or voice intent to another person. */
   clearSessionResume(): void {
     this.rememberResume = false;
+    this.pendingVoiceEntry = null;
     this.cancelStartup();
     useSettings.getState().setResumeConnection(null);
     useSettings.getState().setUpdateVoiceResume(null);
@@ -700,7 +704,8 @@ class Controller {
     const resume = update && sameServer(saved, update) && update.version === CLIENT_VERSION && update.expiresAt > Date.now() ? update : null;
     const startup: StartupRestore = { params: saved, cancelled: false, wake: null };
     this.startup = startup;
-    this.coldStartParams = resume ? null : saved;
+    // Even an update restart first lands silently, often in TeamSpeak's default channel.
+    this.coldStartParams = saved;
     const ui = useConnectUi.getState();
     ui.set({ restoring: true, otherTab: null });
     try {
@@ -721,7 +726,9 @@ class Controller {
         if (ok) {
           if (resume && resume.expiresAt > Date.now() && useSettings.getState().resumeConnection?.address === saved.address) {
             if (resume.password) this.channelPasswords.set(resume.channel, resume.password);
-            if (myChannelId(useSession.getState()) !== resume.channel) await this.rejoinVoice(resume.channel);
+            this.pendingVoiceEntry = this.conn ? { conn: this.conn, channel: resume.channel, intent: resume } : null;
+            if (myChannelId(useSession.getState()) === resume.channel) await this.followVoicePresence();
+            else await this.rejoinVoice(resume.channel);
           }
           return;
         }
@@ -953,6 +960,7 @@ class Controller {
   }
 
   private async teardown(): Promise<void> {
+    this.pendingVoiceEntry = null;
     // Approvals and prompts of the manager list belong to one connection to one server.
     this.grantedByMe.clear(); this.askedManagers.clear(); this.lastRenewal = 0;
     // A newer connect may finish its own teardown and start while this one
@@ -1069,9 +1077,7 @@ class Controller {
   private async startVoice(): Promise<void> {
     const conn = this.conn;
     // Nothing to do (and no microphone prompt) while I am only on the server.
-    if (!conn || myChannelId(useSession.getState()) === null) return;
-    const wasSilent = !this.voiceAutoStart;
-    this.voiceAutoStart = true;
+    if (!conn || !this.voiceAutoStart || myChannelId(useSession.getState()) === null) return;
     const state = useSession.getState();
     const channel = myChannelId(state)!;
     const encrypted = !!state.channels[channel]?.encrypted;
@@ -1085,7 +1091,6 @@ class Controller {
       return this.voiceRun === run && this.conn === conn && s.phase === "online" && myChannelId(s) === channel && (state.kind !== "gwar" || (b?.call === participation?.call && b?.participation === participation?.participation));
     };
     useVoice.getState().set({ state: "starting", failure: null });
-    if (wasSilent) { await this.pushMuteState(); if (!current()) return; }
     let keys: VoiceCall | undefined;
     let group: string | null = null;
     if (encrypted) {
@@ -1185,7 +1190,40 @@ class Controller {
     const s = useSession.getState();
     const info = s.channels[channel], password = this.channelPasswords.get(channel);
     if (!info || (info.has_password && !password && !s.permissions.includes("bypass_password"))) return;
-    await this.attempt(this.joinChannel(channel, password));
+    await this.attempt(this.moveChannel(channel, password, false));
+  }
+
+  /** Server presence alone never grants permission to open the microphone. */
+  private async followVoicePresence(): Promise<void> {
+    const pending = this.pendingVoiceEntry;
+    if (pending) {
+      const saved = useSettings.getState().resumeConnection;
+      if (pending.conn !== this.conn || (pending.intent && (pending.intent.expiresAt <= Date.now() || !saved || !sameServer(saved, pending.intent)))) {
+        this.pendingVoiceEntry = null;
+      } else if (myChannelId(useSession.getState()) === pending.channel) {
+        this.pendingVoiceEntry = null;
+        await this.enableVoice(pending.intent);
+        return;
+      }
+    }
+    await this.startVoice();
+  }
+
+  /** Explicit voice entry, or an update intent validated at its target channel. */
+  private async enableVoice(intent?: UpdateVoiceResume): Promise<void> {
+    const conn = this.conn;
+    if (!conn?.isOnline) return;
+    const epoch = useSession.getState().epoch;
+    const wasSilent = !this.voiceAutoStart;
+    if (wasSilent) await this.pushMuteState(true);
+    const s = useSession.getState(), saved = useSettings.getState().resumeConnection;
+    if (this.conn !== conn || s.epoch !== epoch || s.phase !== "online") return;
+    if (intent && (intent.expiresAt <= Date.now() || myChannelId(s) !== intent.channel || !saved || !sameServer(saved, intent))) {
+      if (wasSilent) await this.pushMuteState();
+      return;
+    }
+    this.voiceAutoStart = true;
+    await this.startVoice();
   }
 
   /** Hostname (no brackets) of the server we are connected to; the native engine sends media there. */
@@ -1200,7 +1238,7 @@ class Controller {
 
   private scheduleVoiceRetry(): void {
     const conn = this.conn, channel = myChannelId(useSession.getState());
-    if (!this.voiceRetryAllowed || this.voiceRetry || !conn?.isOnline || channel === null) return;
+    if (!this.voiceAutoStart || !this.voiceRetryAllowed || this.voiceRetry || !conn?.isOnline || channel === null) return;
     this.voiceRetries = Math.min(this.voiceRetries + 1, 5);
     useVoice.getState().set({ reconnecting: true });
     this.voiceRetry = setTimeout(() => {
@@ -1210,10 +1248,11 @@ class Controller {
   }
 
   retryVoice(): void {
+    this.pendingVoiceEntry = null;
     this.voiceRetryAllowed = true;
     if (this.voiceRetry) clearTimeout(this.voiceRetry);
     this.voiceRetry = null;
-    if (this.conn?.isOnline) void this.startVoice();
+    void this.enableVoice();
   }
 
   private retryableVoiceError(error: unknown): boolean {
@@ -1230,6 +1269,7 @@ class Controller {
       if (this.voiceRetry) clearTimeout(this.voiceRetry);
       this.voiceRetry = null;
       useVoice.getState().set({ reconnecting: false });
+      return; // The panel owns permanent refusals; a toast would repeat its explanation.
     }
     if (this.voiceErrorShown) return;
     this.voiceErrorShown = true;
@@ -1240,9 +1280,9 @@ class Controller {
     await this.engine.retryMic();
   }
 
-  private async pushMuteState(): Promise<void> {
+  private async pushMuteState(enterVoice = false): Promise<void> {
     const v = useVoice.getState();
-    const silent = useSession.getState().kind === "teamspeak" && !this.voiceAutoStart;
+    const silent = useSession.getState().kind === "teamspeak" && !this.voiceAutoStart && !enterVoice;
     try {
       await this.conn?.request("client.update", { muted: silent || v.muted, deafened: silent || v.deafened });
     } catch (e) {
@@ -1369,6 +1409,10 @@ class Controller {
    * server, a reconnect): it then changes nothing, a refusal included.
    */
   async joinChannel(channel: number, password?: string): Promise<boolean> {
+    return this.moveChannel(channel, password, true);
+  }
+
+  private async moveChannel(channel: number, password: string | undefined, explicit: boolean): Promise<boolean> {
     // Joining state, entered channels and typed passwords belong to the session that asked.
     const bound = this.bind();
     const settle = () => { if (bound.current() && useUi.getState().joining === channel) useUi.getState().setJoining(null); };
@@ -1390,10 +1434,14 @@ class Controller {
         if (!ready) { useUi.getState().toast("info", tNow("voice.channelSecuring")); return true; }
       }
     } else this.joinAttempt++;
+    // Silent sessions authorize the chosen channel only after the server places us there.
+    const entry = explicit && !this.voiceAutoStart ? { conn: bound.conn, channel } : null;
+    if (explicit) this.pendingVoiceEntry = entry;
     useUi.getState().setJoining(channel);
     try {
       await bound.conn.request("channel.join", { channel, password: password ?? null });
     } catch (e) {
+      if (entry && this.pendingVoiceEntry === entry) this.pendingVoiceEntry = null;
       if (!bound.current()) return false;
       throw e;
     } finally {
@@ -1402,6 +1450,7 @@ class Controller {
     if (!bound.current()) return false;
     this.entered.add(channel);
     if (password) this.channelPasswords.set(channel, password);
+    if (entry && this.pendingVoiceEntry === entry && myChannelId(useSession.getState()) === channel) await this.followVoicePresence();
     return true;
   }
 

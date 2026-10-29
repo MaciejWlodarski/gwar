@@ -87,7 +87,7 @@ class FakeLink implements Link {
 function fakeEngine() {
   const engine = {
     capabilities: { outputDeviceSelection: false, encryptedVoice: async () => true },
-    start: vi.fn(async () => {}),
+    start: vi.fn(async (_options: Parameters<VoiceEngine["start"]>[0]) => {}),
     stop: vi.fn(async () => {}),
     retryMic: vi.fn(async () => {}),
     setMuted: vi.fn(),
@@ -268,6 +268,41 @@ describe("session resilience", () => {
     connect.mockRestore();
   });
 
+  it("keeps a restored TeamSpeak session silent across server moves and presence changes until explicit voice entry", async () => {
+    settings.useSettings.setState({ resumeConnection: { ...saved, kind: "teamspeak" } });
+    const connect = vi.spyOn(controller, "connectInteractive").mockImplementation(async params => { connectFake({ kind: "teamspeak", channel: 1, params }); return true; });
+    try {
+      await controller.restoreSession();
+      link.emit({ ev: "client.updated", d: client(1, 2) });
+      await vi.advanceTimersByTimeAsync(0);
+      link.emit({ ev: "client.updated", d: client(1, 2, { nickname: "new name" }) });
+      controller.setMuted(false); controller.setDeafened(false);
+      link.welcomeNow(welcome({ session: 1, uid: "u1", channels: [chan(1), chan(2)], clients: [client(1, 1)] }), true);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(engine.start).not.toHaveBeenCalled();
+      expect(stores.useVoice.getState().state).toBe("idle");
+      expect(link.sent("client.update").every(request => (request.d as { muted: boolean; deafened: boolean }).muted && (request.d as { deafened: boolean }).deafened)).toBe(true);
+      await controller.joinChannelInteractive(2);
+      link.emit({ ev: "client.updated", d: client(1, 2) });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(engine.start).toHaveBeenCalledOnce();
+      expect(link.sent("client.update").at(-1)?.d).toEqual({ muted: false, deafened: false });
+    } finally { connect.mockRestore(); }
+  });
+
+  it("a refused explicit join does not authorize capture on a later server move", async () => {
+    settings.useSettings.setState({ resumeConnection: { ...saved, kind: "teamspeak" } });
+    const connect = vi.spyOn(controller, "connectInteractive").mockImplementation(async params => { connectFake({ kind: "teamspeak", channel: 1, params }); return true; });
+    try {
+      await controller.restoreSession(); link.failing.add("channel.join");
+      await expect(controller.joinChannel(2)).rejects.toThrow("boom");
+      link.emit({ ev: "client.updated", d: client(1, 2) });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(engine.start).not.toHaveBeenCalled();
+      expect(link.sent("client.update").at(-1)?.d).toEqual({ muted: true, deafened: true });
+    } finally { connect.mockRestore(); }
+  });
+
   it("an explicit disconnect clears startup and update intent", async () => {
     settings.useSettings.setState({ resumeConnection: saved, updateVoiceResume: { address: "test", kind: "gwar", version: __APP_VERSION__, channel: 1, expiresAt: Date.now() + 1000 } });
     await controller.disconnect();
@@ -311,6 +346,15 @@ describe("session resilience", () => {
     expect(settings.useSettings.getState()).toMatchObject({ resumeConnection: null, updateVoiceResume: null });
   });
 
+  it("removing the restoration bookmark discards the other-tab takeover credentials too", () => {
+    settings.useSettings.getState().saveBookmark({ id: "current", ...saved });
+    settings.useSettings.setState({ resumeConnection: saved });
+    stores.useConnectUi.setState({ otherTab: saved });
+    settings.useSettings.getState().removeBookmark("current");
+    expect(stores.useConnectUi.getState().otherTab).toBeNull();
+    expect(settings.useSettings.getState().resumeConnection).toBeNull();
+  });
+
   it("an invite takes precedence over restoring the previous server", async () => {
     settings.useSettings.setState({ resumeConnection: saved });
     stores.useConnectUi.setState({ invite: { address: "other", code: "invite" } as never });
@@ -347,6 +391,53 @@ describe("session resilience", () => {
     if (variant === "valid") expect(link.sent("channel.join")[0]!.d).toEqual({ channel: 2, password: "channel-secret" });
     expect(settings.useSettings.getState().updateVoiceResume).toBeNull();
     connect.mockRestore();
+  });
+
+  it.each(["valid", "expires during connect", "expires during move", "wrong channel", "cancelled"])("restores TeamSpeak silently and authorizes update capture only at its unexpired target: %s", async variant => {
+    settings.useSettings.setState({ resumeConnection: { ...saved, kind: "teamspeak" }, updateVoiceResume: {
+      address: "test", kind: "teamspeak", channel: 2, version: __APP_VERSION__, expiresAt: Date.now() + 1000,
+    } });
+    const connect = vi.spyOn(controller, "connectInteractive").mockImplementation(async params => {
+      if (variant === "expires during connect") vi.setSystemTime(Date.now() + 2000);
+      connectFake({ kind: "teamspeak", channel: 1, params });
+      expect(engine.start).not.toHaveBeenCalled();
+      expect(link.sent("client.update").at(-1)?.d).toEqual({ muted: true, deafened: true });
+      return true;
+    });
+    try {
+      await controller.restoreSession();
+      expect(engine.start).not.toHaveBeenCalled();
+      expect(link.sent("channel.join")).toHaveLength(variant === "expires during connect" ? 0 : 1);
+      if (variant === "expires during move") vi.setSystemTime(Date.now() + 2000);
+      if (variant === "cancelled") controller.clearSessionResume();
+      link.emit({ ev: "client.updated", d: client(1, variant === "wrong channel" ? 3 : 2) });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(engine.start).toHaveBeenCalledTimes(variant === "valid" ? 1 : 0);
+      if (variant === "valid") {
+        expect(engine.start.mock.calls[0]?.[0]).toMatchObject({ binding: { channel: 2 } });
+        expect(link.sent("client.update").at(-1)?.d).toEqual({ muted: false, deafened: false });
+      } else expect(link.sent("client.update").at(-1)?.d).toEqual({ muted: true, deafened: true });
+    } finally { connect.mockRestore(); }
+  });
+
+  it.each([false, true])("revalidates an update already at its target after publishing presence (expired: %s)", async expired => {
+    settings.useSettings.setState({ resumeConnection: { ...saved, kind: "teamspeak" }, updateVoiceResume: {
+      address: "test", kind: "teamspeak", channel: 1, version: __APP_VERSION__, expiresAt: Date.now() + 1000,
+    } });
+    const original = link.request.bind(link);
+    const request = vi.spyOn(link, "request");
+    request.mockImplementation(async (op, data) => {
+      const result = await original(op, data);
+      if (expired && op === "client.update" && !(data as { muted: boolean }).muted) vi.setSystemTime(Date.now() + 2000);
+      return result;
+    });
+    const connect = vi.spyOn(controller, "connectInteractive").mockImplementation(async params => { connectFake({ kind: "teamspeak", channel: 1, params }); return true; });
+    try {
+      await controller.restoreSession();
+      expect(engine.start).toHaveBeenCalledTimes(expired ? 0 : 1);
+      expect(link.sent("channel.join")).toHaveLength(0);
+      expect(link.sent("client.update").at(-1)?.d).toEqual({ muted: expired, deafened: expired });
+    } finally { connect.mockRestore(); request.mockRestore(); }
   });
 
   it("does not restore over another tab's device lock, and deliberate Connect here can take over", async () => {
@@ -443,6 +534,7 @@ describe("session resilience", () => {
     engine.start.mockRejectedValue(new VoiceError(kind, "permanent refusal"));
     connectFake({ channel: 1 }); await vi.advanceTimersByTimeAsync(0);
     expect(stores.useVoice.getState()).toMatchObject({ state: "failed", reconnecting: false, failure: expect.any(String) });
+    expect(stores.useUi.getState().toasts).toHaveLength(0);
     const reason = stores.useVoice.getState().failure;
     link.emit({ ev: "voice.closed", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, reason: "transport_failed" } });
     expect(stores.useVoice.getState()).toMatchObject({ reconnecting: false, failure: reason });
@@ -455,6 +547,7 @@ describe("session resilience", () => {
     engine.capabilities.encryptedVoice = async () => false;
     connectFake({ channel: 2, encrypted: [2] }); await vi.advanceTimersByTimeAsync(0);
     expect(stores.useVoice.getState()).toMatchObject({ state: "failed", reconnecting: false, failure: "Update your browser or use the desktop app to join encrypted voice." });
+    expect(stores.useUi.getState().toasts).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(120_000); expect(engine.start).not.toHaveBeenCalled();
   });
 
