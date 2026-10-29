@@ -420,6 +420,59 @@ describe("browser noise suppression", () => {
   });
 });
 
+describe("push-to-talk release delay", () => {
+  async function active() {
+    const mic = microphone();
+    getUserMedia.mockResolvedValue(mic.stream);
+    const denoiser = { track: { enabled: true }, running: true, setSource: vi.fn(), setActive: vi.fn(), setStrength: vi.fn(), close: vi.fn() };
+    startDenoise.mockResolvedValue(denoiser as unknown as DenoisePipeline);
+    engine.setInputMode("ptt");
+    await engine.start(params()); await flush();
+    engine.setPttActive(true);
+    return { mic, denoiser };
+  }
+
+  it("keeps the microphone, processed track and denoiser active for 300 ms after release", async () => {
+    const { mic, denoiser } = await active();
+    engine.setPttActive(false);
+    await vi.advanceTimersByTimeAsync(299);
+    expect(mic.track.enabled).toBe(true);
+    expect(denoiser.track.enabled).toBe(true);
+    expect(denoiser.setActive).toHaveBeenLastCalledWith(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mic.track.enabled).toBe(false);
+    expect(denoiser.track.enabled).toBe(false);
+    expect(denoiser.setActive).toHaveBeenLastCalledWith(false);
+  });
+
+  it("a new press cancels the old release, and repeated release events do not extend it", async () => {
+    const { mic } = await active();
+    engine.setPttActive(false); await vi.advanceTimersByTimeAsync(200);
+    engine.setPttActive(true); await vi.advanceTimersByTimeAsync(200);
+    expect(mic.track.enabled).toBe(true);
+    engine.setPttActive(false); await vi.advanceTimersByTimeAsync(200);
+    engine.setPttActive(false); await vi.advanceTimersByTimeAsync(100);
+    expect(mic.track.enabled).toBe(false);
+  });
+
+  it.each(["mute", "deafen", "stop"])("%s closes the gate immediately and cancels the trailing audio", async action => {
+    const { mic, denoiser } = await active();
+    engine.setPttActive(false);
+    if (action === "mute") engine.setMuted(true);
+    if (action === "deafen") engine.setDeafened(true);
+    if (action === "stop") await engine.stop();
+    if (action === "stop") expect(mic.track.stop).toHaveBeenCalled();
+    else {
+      expect(mic.track.enabled).toBe(false);
+      expect(denoiser.setActive).toHaveBeenLastCalledWith(false);
+      engine.setMuted(false); engine.setDeafened(false);
+      expect(mic.track.enabled).toBe(false);
+    }
+    await vi.advanceTimersByTimeAsync(500);
+    if (action !== "stop") expect(mic.track.enabled).toBe(false);
+  });
+});
+
 describe("browser devices follow the system", () => {
   type Device = { kind: MediaDeviceKind; deviceId: string; groupId: string; label: string };
   const mic = (deviceId: string, groupId: string, label: string): Device => ({ kind: "audioinput", deviceId, groupId, label });

@@ -271,7 +271,9 @@ try {
     await page.getByRole("main", { name: "Ustawienia" }).waitFor();
     await page.reload();
     if (width === "mobile") await page.getByRole("navigation", { name: "Sekcje" }).getByRole("button", { name: "Serwery", exact: true }).click();
-    await page.getByLabel("Adres serwera").waitFor();
+    await page.getByRole("button", { name: "Menu serwera", exact: true }).waitFor();
+    assert.equal(await page.evaluate(async () => (await (await import("/src/state/controller.ts")).controller.getIdentity()).nickname), "Ola");
+    assert.equal(await page.evaluate(async () => (await import("/src/state/stores.ts")).useVoice.getState().state), "idle");
     assert.equal(await page.getByTestId("identity-banner").count(), 0);
     assert.equal(await page.getByRole("heading", { name: "Jak mają Cię widzieć inni?" }).count(), 0);
     await context.close();

@@ -63,7 +63,7 @@ import { ScreenController } from "./screen-controller";
 import { microphoneSsrc } from "../voice/sdp";
 import { VoiceError, type VoiceEngine } from "../voice/engine";
 import { channelThreadKey, latestMessageId, myChannelId, sortedChannels, storedKey } from "./reducer";
-import { inAccount, newId, useSettings, type Bookmark, type ServerKind } from "./settings";
+import { inAccount, newId, useSettings, type Bookmark, type ServerKind, type UpdateVoiceResume } from "./settings";
 import { sameServer } from "../lib/server-key";
 import { useConnectUi, useOutbox, useSession, useUi, useVoice, type FailedSend } from "./stores";
 import type { ThreadKey } from "./types";
@@ -189,8 +189,16 @@ export function describeVoiceError(e: VoiceError): string {
   return tNow(`err.voice.${e.kind}` as Key);
 }
 
+class OtherTabActive extends Error {}
+
 class SessionMoved extends Error {
   constructor() { super(tNow("close.replaced")); }
+}
+
+interface StartupRestore {
+  params: ConnectParams;
+  cancelled: boolean;
+  wake: (() => void) | null;
 }
 
 class Controller {
@@ -218,6 +226,17 @@ class Controller {
   private identityLoading: Promise<Identity> | null = null;
   private voiceRetry: ReturnType<typeof setTimeout> | null = null;
   private voiceRetries = 0;
+  private voiceErrorShown = false;
+  private voiceRetryAllowed = true;
+  private startup: StartupRestore | null = null;
+  private lastConnectFailure: unknown;
+  private rememberResume = true;
+  private restored = false;
+  private connectAttempt = 0;
+  private persistRequested = false;
+  private coldStartParams: ConnectParams | null = null;
+  private voiceAutoStart = true;
+  private pendingVoiceEntry: { conn: Link; channel: number; intent?: UpdateVoiceResume } | null = null;
   private voiceRetryChannel: number | null = null;
   private voiceRun = 0;
   private initialised = false;
@@ -258,10 +277,16 @@ class Controller {
     const e = this.engine;
     e.on("level", (level) => useVoice.getState().set({ level }));
     e.on("state", (state) => {
+      // Transport teardown/recovery cannot dismiss a refusal awaiting explicit voice entry.
+      if (!this.voiceRetryAllowed) { useVoice.getState().set({ state: "failed" }); return; }
       useVoice.getState().set({ state });
       if (state === "failed") this.scheduleVoiceRetry();
       if (state === "connected") {
         this.voiceRetries = 0;
+        this.voiceErrorShown = false;
+        if (this.voiceRetry) clearTimeout(this.voiceRetry);
+        this.voiceRetry = null;
+        useVoice.getState().set({ reconnecting: false, failure: null });
         this.voiceRetryChannel = null;
         useUi.getState().dismissToast("voice-closed");
       }
@@ -294,8 +319,18 @@ class Controller {
       echoCancellation: first.echoCancellation,
       autoGainControl: first.autoGainControl,
     });
+    e.setMuted(useVoice.getState().muted);
+    e.setDeafened(useVoice.getState().deafened);
     applyAudio();
     useSettings.subscribe((s, prev) => {
+      if (prev.resumeConnection && !s.resumeConnection) {
+        this.rememberResume = false;
+        this.pendingVoiceEntry = null;
+        useConnectUi.getState().set({ otherTab: null });
+        const wasRestoring = this.startup !== null;
+        this.cancelStartup();
+        if (wasRestoring && !this.conn?.isOnline) void this.disconnect(true);
+      }
       const a = s.audio;
       const p = prev.audio;
       if (a.inputMode !== p.inputMode) e.setInputMode(a.inputMode);
@@ -343,13 +378,13 @@ class Controller {
       }
       if (before === null && now !== null) {
         this.voiceRetries = 0;
-        void this.startVoice();
+        void this.followVoicePresence();
       } else if (before !== now) {
         const conn = this.conn;
         const stopped = this.stopVoice();
         const run = this.voiceRun;
         void stopped.then(() => {
-          if (run === this.voiceRun && this.conn === conn && now !== null && myChannelId(useSession.getState()) === now) return this.startVoice();
+          if (run === this.voiceRun && this.conn === conn && now !== null && myChannelId(useSession.getState()) === now) return this.followVoicePresence();
         });
       }
     });
@@ -401,14 +436,21 @@ class Controller {
     document.addEventListener("visibilitychange", syncFocus);
     syncFocus();
 
-    window.addEventListener("online", () => this.conn?.retryNow());
+    window.addEventListener("online", () => {
+      this.conn?.retryNow();
+      this.startup?.wake?.();
+    });
   }
 
   // -------------------------------------------------------------- connecting
 
   async connect(params: ConnectParams): Promise<void> {
+    if (this.startup && this.startup.params !== params) this.cancelStartup();
     this.init();
+    const attempt = this.connectAttempt + 1;
     await this.disconnect(true);
+    const check = () => { if (attempt !== this.connectAttempt) throw new ConnectionLostError(); };
+    check();
     const kind: ServerKind = params.kind ?? "gwar";
     const session = useSession.getState();
     let conn: Link;
@@ -419,6 +461,7 @@ class Controller {
       // Offers the official client's identities the first time; never fails or blocks the connection.
       // Imported on demand because it reaches back into the account state, which imports this module.
       await (await import("./ts-setup")).prepareTeamspeak();
+      check();
       session.dispatch({ type: "reset" });
       session.dispatch({ type: "phase", phase: "connecting" });
       session.setClose(null);
@@ -445,6 +488,7 @@ class Controller {
       try {
         identity = await this.getIdentity();
       } catch (e) {
+        check();
         session.dispatch({ type: "phase", phase: "idle" });
         throw new ConnectFailure(identityFailure(e), e instanceof Error ? e.message : String(e));
       }
@@ -465,7 +509,9 @@ class Controller {
         client: { name: "gwar-web", version: CLIENT_VERSION, platform: platform() },
       });
     }
+    check();
     this.conn = conn;
+    this.rememberResume = true;
     this.connections++;
     // A later reconnect with these never replaces a pin: the acceptance was for this connection.
     this.connectionParams = { ...params, replaceServerKey: undefined };
@@ -478,12 +524,14 @@ class Controller {
           try {
             await messageStorage.loadRevocations();
             const { MlsRuntime, DeviceTakenOver } = await import("../mls/runtime");
+            const { DeviceAlreadyInUse } = await import("../mls/engine");
             if (abort.signal.aborted || this.conn !== conn) throw new ConnectionLostError();
             runtime = await MlsRuntime.connect({ identity: conn.identity,
               seed: identitySeed(conn.identity), link: conn,
               revocations: messageStorage.currentRevocations, signal: abort.signal,
               onError: error => console.warn("Conversation synchronization:", error),
               onTakeover: () => void this.sessionMoved(conn),
+              takeover: this.startup?.params !== params,
               inviteOwner: params.inviteOwner,
               archive: archiveOptions(conn.identity),
               // docs/e2e-build.md, section 6, 6b: a changed owner record is not this server any more.
@@ -501,11 +549,14 @@ class Controller {
                   onConfirm: () => { void notice.accept().catch((error) => console.warn("Owner change:", error)); },
                 });
               },
-            }).catch((error: unknown) => { throw error instanceof DeviceTakenOver ? new SessionMoved() : error; });
+            }).catch((error: unknown) => {
+              if (error instanceof DeviceAlreadyInUse) throw new OtherTabActive();
+              throw error instanceof DeviceTakenOver ? new SessionMoved() : error;
+            });
           } catch (error) {
             // Voice and channels do not depend on MLS: if it cannot start before
             // connecting, encrypted conversations stay "securing" for this session.
-            if (error instanceof SessionMoved || abort.signal.aborted || this.conn !== conn || conn.status.state !== "idle") throw error;
+            if (error instanceof OtherTabActive || error instanceof SessionMoved || abort.signal.aborted || this.conn !== conn || conn.status.state !== "idle") throw error;
             console.warn("Conversation encryption unavailable:", error);
             await conn.connect(); return;
           }
@@ -526,11 +577,13 @@ class Controller {
         this.sealedReady = start();
         await this.sealedReady;
       } else await conn.connect();
+      check();
     } catch (e) {
-      if (this.conn !== conn) throw e;
+      if (attempt !== this.connectAttempt) throw e;
       this.runtimeAbort?.abort(); this.runtimeAbort = null;
       this.conn = null;
       session.dispatch({ type: "reset" });
+      if (e instanceof OtherTabActive) throw e;
       if (e instanceof SessionMoved) { session.setClose({ kind: "server", reason: { kind: "replaced" } }); throw e; }
       const err = e instanceof ConnectError ? e : new ConnectError("unreachable", String(e));
       throw new ConnectFailure(err.kind, err.message, err.serverName, err.ban, err.identityChange);
@@ -542,6 +595,26 @@ class Controller {
    * and remembers the server as a bookmark on success. Returns true on success.
    */
   async connectInteractive(params: ConnectParams, opts: { remember: boolean }): Promise<boolean> {
+    const state = useSession.getState();
+    const inVoice = myChannelId(state) !== null && this.voiceAutoStart && useVoice.getState().state !== "idle";
+    if ((inVoice || useScreen.getState().own !== null) &&
+        !sameServer(params, { kind: state.kind, address: state.address, insecureLan: params.insecureLan })) {
+      const source = this.conn;
+      const target = useSettings.getState().bookmarks.find(b => sameServer(b, params))?.name || params.address;
+      useUi.getState().openDialog({ kind: "confirm", title: tNow("server.switchTitle"),
+        body: tNow("server.switchBody", { from: state.server?.name || state.address, to: target }),
+        confirmLabel: tNow("server.switchConfirm"),
+        onConfirm: () => {
+          if (this.conn === source) void this.connectConfirmed(params, opts);
+          else void this.connectInteractive(params, opts);
+        },
+      });
+      return false;
+    }
+    return this.connectConfirmed(params, opts);
+  }
+
+  private async connectConfirmed(params: ConnectParams, opts: { remember: boolean }): Promise<boolean> {
     useUi.getState().landOnServer();
     if (!useSettings.getState().onboarding?.completed) {
       const { useAccount } = await import("./account");
@@ -551,10 +624,18 @@ class Controller {
       }
     }
     const ui = useConnectUi.getState();
-    ui.set({ busy: true, error: null });
+    ui.set({ busy: true, error: null, otherTab: null });
+    this.lastConnectFailure = undefined;
+    const attempt = this.connectAttempt + 1;
     try {
       await this.connect(params);
     } catch (e) {
+      if (attempt !== this.connectAttempt) return false;
+      this.lastConnectFailure = e;
+      if (e instanceof OtherTabActive) {
+        ui.set({ busy: false, error: null, otherTab: useSettings.getState().resumeConnection });
+        return false;
+      }
       if (e instanceof ConnectFailure) {
         if (e.identityChange) this.confirmServerChange(e.identityChange, params, opts);
         // With an invite the server says "wrong password" when the invite is no good (and there is a password).
@@ -570,6 +651,7 @@ class Controller {
       }
       return false;
     }
+    if (attempt !== this.connectAttempt) return false;
     ui.set({ busy: false, error: null, needPassword: false, serverName: null, invite: null });
     const settings = useSettings.getState();
     const kind: ServerKind = params.kind ?? "gwar";
@@ -591,6 +673,108 @@ class Controller {
     return true;
   }
 
+  private rememberConnection(params: ConnectParams, name: string): void {
+    if (!this.rememberResume) return;
+    const settings = useSettings.getState();
+    settings.setResumeConnection({ address: params.address, kind: params.kind ?? "gwar", name: name || params.address,
+      password: params.password, identity: params.identity, insecureLan: params.insecureLan });
+    settings.setLast(params.address, params.kind ?? "gwar");
+    if (!this.persistRequested) {
+      this.persistRequested = true;
+      // Storage persistence is best effort; neither refusal nor a missing API affects connecting.
+      try { void navigator.storage?.persist?.().catch(() => {}); } catch { /* unavailable in this webview */ }
+    }
+  }
+
+  private cancelStartup(): void {
+    const startup = this.startup;
+    this.startup = null;
+    if (startup) { startup.cancelled = true; startup.wake?.(); }
+    this.coldStartParams = null;
+    useConnectUi.getState().set({ restoring: false, startupRetry: false });
+  }
+
+  /** Identity boundaries must not carry server passwords or voice intent to another person. */
+  clearSessionResume(): void {
+    this.rememberResume = false;
+    this.pendingVoiceEntry = null;
+    this.cancelStartup();
+    useSettings.getState().setResumeConnection(null);
+    useSettings.getState().setUpdateVoiceResume(null);
+    useConnectUi.getState().set({ otherTab: null });
+  }
+
+  private waitForStartupRetry(startup: StartupRestore, delay: number): Promise<void> {
+    return new Promise(resolve => {
+      const done = () => { clearTimeout(timer); startup.wake = null; resolve(); };
+      const timer = setTimeout(done, delay);
+      startup.wake = done;
+      if (startup.cancelled) done();
+    });
+  }
+
+  /** Once per page. Passive restoration never asks another tab to yield its device. */
+  async restoreSession(): Promise<void> {
+    if (this.restored) return;
+    this.restored = true;
+    const settings = useSettings.getState();
+    const saved = settings.resumeConnection;
+    const update = settings.updateVoiceResume;
+    settings.setUpdateVoiceResume(null);
+    if (!saved || useConnectUi.getState().invite || this.conn || useConnectUi.getState().busy) return;
+    const resume = update && sameServer(saved, update) && update.version === CLIENT_VERSION && update.expiresAt > Date.now() ? update : null;
+    const startup: StartupRestore = { params: saved, cancelled: false, wake: null };
+    this.startup = startup;
+    // Even an update restart first lands silently, often in TeamSpeak's default channel.
+    this.coldStartParams = saved;
+    const ui = useConnectUi.getState();
+    ui.set({ restoring: true, otherTab: null });
+    try {
+      const identity = await this.getIdentity();
+      for (let attempt = 0; attempt < 3 && !startup.cancelled; attempt++) {
+        // Query before every retry too: a tab may have connected while this one was offline.
+        const locks = globalThis.navigator?.locks;
+        if (typeof locks?.query === "function") {
+          let occupied = true;
+          try { occupied = (await locks.query()).held?.some(lock => lock.name === `gwar-mls:${identity.publicKey}`) ?? false; }
+          catch { /* An unreadable ownership snapshot cannot authorize a passive takeover. */ }
+          if (startup.cancelled) return;
+          if (occupied) { ui.set({ otherTab: saved, error: null }); return; }
+        }
+        if (startup.cancelled) return;
+        const ok = await this.connectInteractive(saved, { remember: false });
+        if (startup.cancelled) return;
+        if (ok) {
+          if (resume && resume.expiresAt > Date.now() && useSettings.getState().resumeConnection?.address === saved.address) {
+            if (resume.password) this.channelPasswords.set(resume.channel, resume.password);
+            this.pendingVoiceEntry = this.conn ? { conn: this.conn, channel: resume.channel, intent: resume } : null;
+            if (myChannelId(useSession.getState()) === resume.channel) await this.followVoicePresence();
+            else await this.rejoinVoice(resume.channel);
+          }
+          return;
+        }
+        if (!(this.lastConnectFailure instanceof ConnectFailure) || this.lastConnectFailure.kind !== "unreachable" || attempt === 2) return;
+        ui.set({ startupRetry: true });
+        await this.waitForStartupRetry(startup, attempt === 0 ? 2000 : 5000);
+        if (!startup.cancelled) ui.set({ startupRetry: false });
+      }
+    } catch (error) {
+      if (!startup.cancelled) ui.set({ busy: false, error: describeConnectFailure(new ConnectFailure(identityFailure(error), error instanceof Error ? error.message : String(error))) });
+    } finally {
+      if (this.startup === startup) this.cancelStartup();
+    }
+  }
+
+  /** Written before installation (Windows may exit inside install), rolled back on failure. */
+  prepareUpdateRestart(version: string): () => void {
+    const channel = myChannelId(useSession.getState());
+    const { address, kind } = useSession.getState();
+    useSettings.getState().setUpdateVoiceResume(this.conn?.isOnline && this.voiceAutoStart && channel !== null ? {
+      address, kind, version, channel, password: this.channelPasswords.get(channel), expiresAt: Date.now() + 5 * 60_000,
+    } : null);
+    return () => useSettings.getState().setUpdateVoiceResume(null);
+  }
+
   private confirmServerChange(change: ServerIdentityChanged, params: ConnectParams, opts: { remember: boolean }): void {
     useUi.getState().openDialog({
       kind: "confirm", title: tNow("security.changedTitle"),
@@ -608,12 +792,14 @@ class Controller {
 
   private wire(conn: Link, params: ConnectParams): void {
     const session = useSession.getState();
+    this.voiceAutoStart = params !== this.coldStartParams || params == null;
     session.setRtt(null);
     conn.onRtt?.((ms) => {
       if (this.conn === conn) session.setRtt(Math.round(ms));
     });
     conn.onWelcome((welcome, resync) => {
       if (this.conn !== conn) return;
+      if (params) this.rememberConnection(params, welcome.server.name);
       // A new session: shares and watches of the one before ended with it.
       this.screen.reset();
       this.entered.clear();
@@ -635,11 +821,11 @@ class Controller {
       if (!resync && useSession.getState().kind === "gwar" && conn.serverKey) void offerClaims(conn, conn.serverKey, welcome.uid);
       const myCh = myChannelId(useSession.getState());
       const v = useVoice.getState();
-      if (v.muted || v.deafened) void this.pushMuteState();
+      if (v.muted || v.deafened || !this.voiceAutoStart) void this.pushMuteState();
       if (myCh !== null) {
         // TeamSpeak servers always have me in a channel; Gwar servers start me outside voice.
         this.entered.add(myCh);
-        void this.startVoice();
+        if (this.voiceAutoStart) void this.startVoice();
         // A returning TeamSpeak client lands in the default channel: go back, like TeamSpeak's own client.
         if (resync && this.rejoin !== null && this.rejoin !== myCh) void this.rejoinVoice(this.rejoin);
       } else if (resync && this.rejoin !== null) {
@@ -717,10 +903,10 @@ class Controller {
         if (event.d.reason === "channel_deleted" || this.voiceRetryChannel === null || !useSession.getState().channels[this.voiceRetryChannel]) {
           this.voiceChannelRemoved();
           void this.stopVoice();
-        } else {
-          useUi.getState().toast("info", tNow(event.d.reason === "transport_failed" ? "voice.closed" : "voice.disconnected"), { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
-          if (event.d.reason === "transport_failed") this.scheduleVoiceRetry(1000);
-          else void this.stopVoice();
+        } else if (event.d.reason === "transport_failed") this.voiceFailure(tNow("voice.closed"));
+        else {
+          useUi.getState().toast("info", tNow("voice.disconnected"), { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
+          void this.stopVoice();
         }
       }
       if (event.ev === "channel.deleted" || event.ev === "channel.hidden") {
@@ -753,7 +939,7 @@ class Controller {
           session.setRtt(null);
           this.nativeFiles(null);
           // A new session starts outside voice: remember where to go back to.
-          this.rejoin ??= myChannelId(useSession.getState());
+          if (this.voiceAutoStart) this.rejoin ??= myChannelId(useSession.getState());
           session.dispatch({ type: "phase", phase: "reconnecting" });
           this.screen.reset();
           void this.stopVoice();
@@ -779,11 +965,17 @@ class Controller {
   }
 
   async disconnect(silent = false): Promise<void> {
+    const attempt = ++this.connectAttempt;
+    this.connections++;
+    if (!silent) {
+      this.clearSessionResume();
+      useConnectUi.getState().set({ restoring: false, busy: false });
+    }
     const conn = this.conn;
     this.conn = null;
     conn?.close();
     await this.teardown();
-    if (!silent) useSession.getState().setClose({ kind: "user" });
+    if (!silent && attempt === this.connectAttempt) useSession.getState().setClose({ kind: "user" });
   }
 
   /** Every welcome (a resync too) starts a new native file session; file work of an older one is refused. */
@@ -794,6 +986,7 @@ class Controller {
   }
 
   private async teardown(): Promise<void> {
+    this.pendingVoiceEntry = null;
     // Approvals and prompts of the manager list belong to one connection to one server.
     this.grantedByMe.clear(); this.askedManagers.clear(); this.lastRenewal = 0;
     // A newer connect may finish its own teardown and start while this one
@@ -801,6 +994,12 @@ class Controller {
     const generation = this.connections;
     // Media and the call's keys stop first, synchronously: never after the
     // device lease is released by the runtime's close below.
+    if (this.voiceRetry) clearTimeout(this.voiceRetry);
+    this.voiceRetry = null;
+    this.voiceRetries = 0;
+    this.voiceErrorShown = false;
+    this.voiceRetryAllowed = true;
+    useVoice.getState().set({ reconnecting: false, failure: null });
     this.voiceRun++;
     this.endVoiceCall();
     this.screen.reset();
@@ -815,8 +1014,6 @@ class Controller {
     if (this.connections !== generation) return;
     await this.nativeFiles(null);
     if (this.connections !== generation) return;
-    if (this.voiceRetry) clearTimeout(this.voiceRetry);
-    this.voiceRetry = null;
     if (this.readTimer) clearTimeout(this.readTimer);
     this.readTimer = null;
     this.rejoin = null;
@@ -910,7 +1107,7 @@ class Controller {
   private async startVoice(): Promise<void> {
     const conn = this.conn;
     // Nothing to do (and no microphone prompt) while I am only on the server.
-    if (!conn || myChannelId(useSession.getState()) === null) return;
+    if (!conn || !this.voiceAutoStart || !this.voiceRetryAllowed || myChannelId(useSession.getState()) === null) return;
     const state = useSession.getState();
     const channel = myChannelId(state)!;
     const encrypted = !!state.channels[channel]?.encrypted;
@@ -923,18 +1120,24 @@ class Controller {
       const s = useSession.getState(); const b = s.me === null ? null : s.clients[s.me.session]?.voice_binding;
       return this.voiceRun === run && this.conn === conn && s.phase === "online" && myChannelId(s) === channel && (state.kind !== "gwar" || (b?.call === participation?.call && b?.participation === participation?.participation));
     };
+    useVoice.getState().set({ state: "starting", failure: null });
     let keys: VoiceCall | undefined;
     let group: string | null = null;
     if (encrypted) {
       // There is never a plaintext fallback in an encrypted channel.
-      const refusal = state.kind === "gwar" && participation ? await this.encryptedVoiceRefusal() : tNow("voice.encryptedUnsupported");
+      let refusal: string | null;
+      try { refusal = state.kind === "gwar" && participation ? await this.encryptedVoiceRefusal() : tNow("voice.encryptedUnsupported"); }
+      catch (error) {
+        if (current()) this.voiceFailure(error instanceof VoiceError ? describeVoiceError(error) : describeRequestError(error), this.retryableVoiceError(error));
+        return;
+      }
       if (!current()) return;
       if (refusal) {
         this.endVoiceCall(); await this.engine.stop();
         if (!current()) return;
-        // "Voice unavailable" with Retry: a transient probe failure can be retried.
+        // Unsupported encryption needs an explicit Retry after the environment changes.
         useVoice.getState().set({ state: "failed" });
-        useUi.getState().toast("info", refusal); return;
+        this.voiceFailure(refusal, false); return;
       }
       try {
         keys = await this.encryptedCall(conn, channel, participation!, own.id, current);
@@ -952,7 +1155,7 @@ class Controller {
       } catch (e) {
         if (!current()) return;
         useVoice.getState().set({ state: "failed" });
-        useUi.getState().toast("error", e instanceof VoiceError ? describeVoiceError(e) : describeRequestError(e));
+        this.voiceFailure(e instanceof VoiceError ? describeVoiceError(e) : describeRequestError(e), this.retryableVoiceError(e));
         return;
       }
       if (!current()) return;
@@ -977,7 +1180,7 @@ class Controller {
     } catch (e) {
       if (!current()) return;
       const msg = e instanceof VoiceError ? describeVoiceError(e) : describeRequestError(e);
-      useUi.getState().toast("error", msg);
+      this.voiceFailure(msg, this.retryableVoiceError(e));
     }
   }
 
@@ -989,11 +1192,13 @@ class Controller {
     if (this.voiceRetry) clearTimeout(this.voiceRetry);
     this.voiceRetry = null;
     this.voiceRetries = 0;
+    this.voiceErrorShown = false;
+    useVoice.getState().set({ reconnecting: false, ...(this.voiceRetryAllowed ? { failure: null } : {}) });
     // Leaving, moving or losing the session discards the call's pin and state.
     this.endVoiceCall();
     await this.engine.stop();
     if (run !== this.voiceRun) return;
-    useVoice.getState().set({ state: "idle", level: 0, pttActive: false, micError: null });
+    useVoice.getState().set({ state: this.voiceRetryAllowed ? "idle" : "failed", level: 0, pttActive: false, micError: null });
   }
 
   /** Whether I can leave voice without leaving the server (not on TeamSpeak). */
@@ -1011,10 +1216,45 @@ class Controller {
   }
 
   private async rejoinVoice(channel: number): Promise<void> {
+    if (!this.voiceRetryAllowed) { this.voiceRetryChannel = channel; return; }
     const s = useSession.getState();
     const info = s.channels[channel], password = this.channelPasswords.get(channel);
     if (!info || (info.has_password && !password && !s.permissions.includes("bypass_password"))) return;
-    await this.attempt(this.joinChannel(channel, password));
+    await this.attempt(this.moveChannel(channel, password, false));
+  }
+
+  /** Server presence alone never grants permission to open the microphone. */
+  private async followVoicePresence(): Promise<void> {
+    const pending = this.pendingVoiceEntry;
+    if (pending) {
+      const saved = useSettings.getState().resumeConnection;
+      if (pending.conn !== this.conn || (pending.intent && (pending.intent.expiresAt <= Date.now() || !saved || !sameServer(saved, pending.intent)))) {
+        this.pendingVoiceEntry = null;
+      } else if (myChannelId(useSession.getState()) === pending.channel) {
+        this.pendingVoiceEntry = null;
+        await this.enableVoice(pending.intent);
+        return;
+      }
+    }
+    await this.startVoice();
+  }
+
+  /** Explicit voice entry, or an update intent validated at its target channel. */
+  private async enableVoice(intent?: UpdateVoiceResume): Promise<void> {
+    const conn = this.conn;
+    if (!conn?.isOnline) return;
+    const epoch = useSession.getState().epoch;
+    const wasSilent = !this.voiceAutoStart;
+    if (wasSilent) await this.pushMuteState(true);
+    const s = useSession.getState(), saved = useSettings.getState().resumeConnection;
+    if (this.conn !== conn || s.epoch !== epoch || s.phase !== "online") return;
+    if (intent && (intent.expiresAt <= Date.now() || myChannelId(s) !== intent.channel || !saved || !sameServer(saved, intent))) {
+      if (wasSilent) await this.pushMuteState();
+      return;
+    }
+    this.voiceAutoStart = true;
+    this.voiceRetryAllowed = true;
+    await this.startVoice();
   }
 
   /** Hostname (no brackets) of the server we are connected to; the native engine sends media there. */
@@ -1027,17 +1267,15 @@ class Controller {
     return parsed.ok ? new URL(parsed.value.url).hostname.replace(/^\[|\]$/g, "") : undefined;
   }
 
-  private scheduleVoiceRetry(delay = 3000): void {
-    if (this.voiceRetry || !this.conn?.isOnline) return;
-    if (this.voiceRetries >= 5) {
-      useUi.getState().toast("error", tNow("voice.reconnectFailed"), { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
-      return;
-    }
-    this.voiceRetries++;
+  private scheduleVoiceRetry(): void {
+    const conn = this.conn, channel = myChannelId(useSession.getState());
+    if (!this.voiceAutoStart || !this.voiceRetryAllowed || this.voiceRetry || !conn?.isOnline || channel === null) return;
+    this.voiceRetries = Math.min(this.voiceRetries + 1, 5);
+    useVoice.getState().set({ reconnecting: true });
     this.voiceRetry = setTimeout(() => {
       this.voiceRetry = null;
-      if (this.conn?.isOnline && myChannelId(useSession.getState()) !== null) void this.startVoice();
-    }, delay * Math.min(this.voiceRetries, 4));
+      if (this.conn === conn && conn.isOnline && myChannelId(useSession.getState()) === channel) void this.startVoice();
+    }, Math.min(15_000, 3000 * this.voiceRetries));
   }
 
   private voiceChannelRemoved(): void {
@@ -1046,22 +1284,49 @@ class Controller {
   }
 
   retryVoice(): void {
-    this.voiceRetries = 0;
+    this.pendingVoiceEntry = null;
+    if (this.voiceRetry) clearTimeout(this.voiceRetry);
+    this.voiceRetry = null;
     if (!this.conn?.isOnline) return;
     const channel = this.voiceRetryChannel;
     if (channel !== null && !useSession.getState().channels[channel]) this.voiceChannelRemoved();
-    else if (channel !== null && myChannelId(useSession.getState()) === null) void this.joinChannelInteractive(channel);
-    else void this.startVoice();
+    else if (channel !== null && myChannelId(useSession.getState()) !== channel) void this.joinChannelInteractive(channel);
+    else void this.enableVoice();
+  }
+
+  private retryableVoiceError(error: unknown): boolean {
+    return !(error instanceof VoiceError && (error.kind === "unsupported" || error.kind === "insecure"));
+  }
+
+  private voiceFailure(message: string, retry = true): void {
+    // A late transport-close event cannot erase a permanent refusal awaiting manual Retry.
+    if (retry && !this.voiceRetryAllowed) return;
+    useVoice.getState().set({ state: "failed", failure: retry ? null : message });
+    if (retry) this.scheduleVoiceRetry();
+    else {
+      this.pendingVoiceEntry = null;
+      this.voiceRetryAllowed = false;
+      this.voiceRetryChannel = myChannelId(useSession.getState());
+      if (this.voiceRetry) clearTimeout(this.voiceRetry);
+      this.voiceRetry = null;
+      useVoice.getState().set({ reconnecting: false });
+      useUi.getState().dismissToast("voice-closed");
+      return; // The panel owns permanent refusals; a toast would repeat its explanation.
+    }
+    if (this.voiceErrorShown) return;
+    this.voiceErrorShown = true;
+    useUi.getState().toast("error", message, { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
   }
 
   async retryMic(): Promise<void> {
     await this.engine.retryMic();
   }
 
-  private async pushMuteState(): Promise<void> {
-    const { muted, deafened } = useVoice.getState();
+  private async pushMuteState(enterVoice = false): Promise<void> {
+    const v = useVoice.getState();
+    const silent = useSession.getState().kind === "teamspeak" && !this.voiceAutoStart && !enterVoice;
     try {
-      await this.conn?.request("client.update", { muted, deafened });
+      await this.conn?.request("client.update", { muted: silent || v.muted, deafened: silent || v.deafened });
     } catch (e) {
       useUi.getState().toast("error", describeRequestError(e));
     }
@@ -1071,10 +1336,11 @@ class Controller {
     const v = useVoice.getState();
     // Unmuting while deafened also undeafens (like most voice apps).
     const deafened = muted ? v.deafened : false;
-    v.set({ muted, deafened });
     this.engine.setMuted(muted);
     this.engine.setDeafened(deafened);
+    v.set({ muted, deafened });
     void this.pushMuteState();
+    this.saveSelfVoice(muted, deafened);
   }
 
   toggleMute(): void {
@@ -1083,9 +1349,16 @@ class Controller {
   }
 
   setDeafened(deafened: boolean): void {
-    useVoice.getState().set({ deafened });
     this.engine.setDeafened(deafened);
+    useVoice.getState().set({ deafened });
     void this.pushMuteState();
+    this.saveSelfVoice(useVoice.getState().muted, deafened);
+  }
+
+  /** Storage is best effort; a full disk must never prevent live privacy controls. */
+  private saveSelfVoice(muted: boolean, deafened: boolean): void {
+    try { useSettings.getState().setSelfVoice(muted, deafened); }
+    catch (error) { console.warn("Could not save voice preferences:", error); }
   }
 
   toggleDeafen(): void {
@@ -1126,6 +1399,7 @@ class Controller {
    * Gwar Connect one; disconnects because the open session belongs to the old key.
    */
   async switchIdentity(identity: Identity | null): Promise<void> {
+    this.clearSessionResume();
     await this.disconnect(true);
     this.adopt(identity, true);
   }
@@ -1156,6 +1430,7 @@ class Controller {
   /** Replaces the browser identity; disconnects because the old session belongs to the old key. */
   async importIdentity(text: string): Promise<void> {
     const identity = await importIdentity(text);
+    this.clearSessionResume();
     await this.disconnect(true);
     this.adopt(identity, true);
   }
@@ -1184,6 +1459,10 @@ class Controller {
    * server, a reconnect): it then changes nothing, a refusal included.
    */
   async joinChannel(channel: number, password?: string): Promise<boolean> {
+    return this.moveChannel(channel, password, true);
+  }
+
+  private async moveChannel(channel: number, password: string | undefined, explicit: boolean): Promise<boolean> {
     // Joining state, entered channels and typed passwords belong to the session that asked.
     const bound = this.bind();
     const settle = () => { if (bound.current() && useUi.getState().joining === channel) useUi.getState().setJoining(null); };
@@ -1193,7 +1472,13 @@ class Controller {
       const refusal = await this.encryptedVoiceRefusal();
       // A newer join, move or connection makes this one obsolete.
       if (!bound.current() || attempt !== this.joinAttempt) return bound.current();
-      if (refusal) { useUi.getState().toast("info", refusal); return true; }
+      if (refusal) {
+        if (useVoice.getState().failure) {
+          this.voiceFailure(refusal, false);
+          this.voiceRetryChannel = channel;
+        } else useUi.getState().toast("info", refusal);
+        return true;
+      }
       // The server admits only devices already in the channel's group: join it first (a new
       // channel's group is otherwise joined in the background, after a random wait).
       const runtime = this.runtime;
@@ -1205,10 +1490,14 @@ class Controller {
         if (!ready) { useUi.getState().toast("info", tNow("voice.channelSecuring")); return true; }
       }
     } else this.joinAttempt++;
+    // Silent sessions authorize the chosen channel only after the server places us there.
+    const entry = explicit && (!this.voiceAutoStart || !this.voiceRetryAllowed) ? { conn: bound.conn, channel } : null;
+    if (explicit) this.pendingVoiceEntry = entry;
     useUi.getState().setJoining(channel);
     try {
       await bound.conn.request("channel.join", { channel, password: password ?? null });
     } catch (e) {
+      if (entry && this.pendingVoiceEntry === entry) this.pendingVoiceEntry = null;
       if (!bound.current()) return false;
       throw e;
     } finally {
@@ -1217,6 +1506,7 @@ class Controller {
     if (!bound.current()) return false;
     this.entered.add(channel);
     if (password) this.channelPasswords.set(channel, password);
+    if (entry && this.pendingVoiceEntry === entry && myChannelId(useSession.getState()) === channel) await this.followVoicePresence();
     return true;
   }
 
@@ -1250,6 +1540,10 @@ class Controller {
     const pending = useUi.getState().joining;
     if ((myChannelId(useSession.getState()) === channel && (pending === null || pending === channel)) || this.isLockedForMe(channel)) {
       this.joinAttempt++; // staying where I am supersedes a pending encrypted join
+      if ((!this.voiceAutoStart || !this.voiceRetryAllowed) && myChannelId(useSession.getState()) === channel) {
+        this.voiceRetryChannel = channel;
+        this.retryVoice();
+      }
       return;
     }
     // Without a typed password first: only the server knows whether I may skip it (a TeamSpeak

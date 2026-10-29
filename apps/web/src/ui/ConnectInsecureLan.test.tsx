@@ -28,7 +28,7 @@ beforeEach(() => {
   vi.stubGlobal('IS_REACT_ACT_ENVIRONMENT', true); mock.connect.mockReset(); mock.inputs.clear();
   useAccount.setState({ loaded: true, account: null });
   useSettings.setState({ onboarding: { completed: true, firstUsedAt: 1, nudgeDismissed: false, roleReceived: false }, language: 'en', lastAddress: 'a.lan', lastKind: 'gwar', bookmarks: [{ id: 'a', name: 'A', address: 'a.lan', kind: 'gwar', updatedAt: 1, insecureLan: true }] });
-  useConnectUi.setState({ busy: false, error: null, needPassword: false, invite: null });
+  useConnectUi.setState({ busy: false, restoring: false, startupRetry: false, otherTab: null, error: null, needPassword: false, invite: null });
   div = document.createElement('div'); document.body.appendChild(div); root = createRoot(div);
 });
 afterEach(async () => { await act(async () => root.unmount()); div.remove(); vi.unstubAllGlobals(); });
@@ -49,6 +49,23 @@ it('uses only the new address own saved plaintext setting', async () => {
   await change('a.lan', 'b.lan'); await submit(); expect(choice()).toMatchObject({ address: 'b.lan', insecureLan: true });
   await act(async () => useSettings.getState().saveBookmark({ id: 'b', name: 'B', address: 'b.lan', kind: 'gwar', insecureLan: false }));
   await submit(); expect(choice()).toMatchObject({ address: 'b.lan', insecureLan: false });
+});
+
+it('replaces the Polish form with one deliberate takeover action and a quiet way back', async () => {
+  const saved = { address: 'a.lan', kind: 'gwar' as const, name: 'A', password: 'saved-password' };
+  useSettings.setState({ language: 'pl' }); useConnectUi.setState({ otherTab: saved });
+  await show();
+  expect(div.textContent).toContain('Gwar jest otwarty w innej karcie');
+  expect(div.querySelector('form')).toBeNull(); expect(mock.connect).not.toHaveBeenCalled();
+  expect([...div.querySelectorAll('button')].map(b => b.textContent)).toEqual(['Użyj tutaj', 'Wróć do formularza']);
+  const button = [...div.querySelectorAll('button')].find(b => b.textContent === 'Użyj tutaj');
+  await act(async () => button!.click());
+  expect(mock.connect).toHaveBeenCalledWith(saved, { remember: false });
+  mock.connect.mockClear();
+  await act(async () => [...div.querySelectorAll('button')].find(b => b.textContent === 'Wróć do formularza')!.click());
+  expect(div.querySelector('form')).not.toBeNull();
+  expect(useConnectUi.getState().otherTab).toBeNull();
+  expect(mock.connect).not.toHaveBeenCalled();
 });
 
 it('keeps TeamSpeak reachable behind Advanced and the public option always secure', async () => {

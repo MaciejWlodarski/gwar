@@ -41,9 +41,10 @@ export function ConnectScreen({ card }: { card?: boolean }) {
   const lastKind = useSettings((s) => s.lastKind);
   const desktop = isDesktop();
   const bookmarks = useBookmarks();
-  const { busy, error, needPassword, serverName, invite } = useConnectUi();
+  const { busy, error, needPassword, serverName, invite, otherTab } = useConnectUi();
   const closeReason = useSession((s) => s.closeReason);
   const openSettings = useUi((s) => s.openSettings);
+  const dialogOpen = useUi((s) => s.dialog.kind !== "none");
   const account = useAccount((s) => s.account);
   const loaded = useAccount((s) => s.loaded);
   const onboarding = useSettings((s) => s.onboarding);
@@ -121,6 +122,14 @@ export function ConnectScreen({ card }: { card?: boolean }) {
   if (!loaded) return <main aria-busy="true" className="flex flex-1 items-center justify-center bg-surface text-sm text-muted">{t("common.loading")}</main>;
   if (onboarding && !onboarding.completed && !account) return <FirstRun card={card} />;
 
+  if (otherTab) return (
+    <main className={cn("flex min-w-0 flex-1 flex-col items-center justify-center gap-4 bg-surface px-4 text-center", card && panelCard)}>
+      <h1 role="status" className="text-sm font-medium whitespace-nowrap">{t("connect.otherTab")}</h1>
+      <Button variant="primary" busy={busy} onClick={() => void controller.connectInteractive(otherTab, { remember: false })}>{t("connect.here")}</Button>
+      <button className="t cursor-pointer text-xs text-muted hover:text-fg" onClick={() => useConnectUi.getState().set({ otherTab: null })}>{t("connect.backToForm")}</button>
+    </main>
+  );
+
   return (
     <main className={cn("relative flex min-w-0 flex-1 flex-col items-center overflow-y-auto bg-surface", card && panelCard)}>
       <div className="flex w-full flex-1 flex-col items-center justify-center gap-6 px-4 py-8">
@@ -172,7 +181,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
                 autoCorrect="off"
                 spellCheck={false}
                 required
-                autoFocus={!address}
+                autoFocus={!address && !dialogOpen}
               />
             )}
           </Field>
@@ -191,7 +200,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
                   // A shared server password; "Remember" stores it, not the browser.
                   name="server-password"
                   autoComplete="off"
-                  autoFocus={needPassword}
+                  autoFocus={needPassword && !dialogOpen}
                   required={needPassword}
                 />
               )}

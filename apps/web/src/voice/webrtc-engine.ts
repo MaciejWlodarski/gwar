@@ -91,6 +91,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private deafened = false;
   private mode: InputMode = "vad";
   private ptt = false;
+  private pttRelease: ReturnType<typeof setTimeout> | null = null;
   private masterVolume = 1;
   private inputDeviceId: string | null = null;
   private outputDeviceId: string | null = null;
@@ -261,6 +262,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
   async stop(): Promise<void> {
     this.runId++;
+    this.cancelPttRelease();
+    this.ptt = false;
     this.teardownPeer();
     this.closeMic();
     this.closeDenoise();
@@ -758,24 +761,45 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   // ----------------------------------------------------------------- setters
 
   setMuted(muted: boolean): void {
+    if (muted) this.cancelPttRelease();
     this.muted = muted;
     this.applyTrackEnabled();
   }
 
   setDeafened(deafened: boolean): void {
+    if (deafened) this.cancelPttRelease();
     this.deafened = deafened;
     this.applyTrackEnabled();
     this.applyMasterGain();
   }
 
   setInputMode(mode: InputMode): void {
+    this.cancelPttRelease();
     this.mode = mode;
     this.applyTrackEnabled();
   }
 
   setPttActive(active: boolean): void {
-    this.ptt = active;
-    this.applyTrackEnabled();
+    if (active) {
+      if (this.pttRelease) clearTimeout(this.pttRelease);
+      this.pttRelease = null;
+      this.ptt = true;
+      this.applyTrackEnabled();
+    } else if (this.ptt && !this.pttRelease) {
+      // Match native's 300 ms hangover, including the denoiser's buffered word ending.
+      this.pttRelease = setTimeout(() => {
+        this.pttRelease = null;
+        this.ptt = false;
+        this.applyTrackEnabled();
+      }, 300);
+    }
+  }
+
+  private cancelPttRelease(): void {
+    if (!this.pttRelease) return;
+    clearTimeout(this.pttRelease);
+    this.pttRelease = null;
+    this.ptt = false;
   }
 
   async setInputDevice(deviceId: string | null): Promise<void> {

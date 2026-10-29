@@ -60,6 +60,7 @@ export class Updater {
   constructor(
     private readonly backend: UpdateBackend,
     private readonly store = useUpdate,
+    private readonly prepareRestart: (version: string) => Promise<() => void> = async () => () => {},
   ) {}
 
   get status(): UpdateStatus {
@@ -138,10 +139,13 @@ export class Updater {
     if (this.busy || now.phase !== "ready" || !this.pending) return;
     this.busy = true;
     this.set({ phase: "installing", version: now.version });
+    let cancelRestart: (() => void) | undefined;
     try {
+      cancelRestart = await this.prepareRestart(now.version);
       await this.pending.install();
       await this.backend.relaunch();
     } catch (e) {
+      cancelRestart?.();
       console.warn(`[update] installing ${now.version} failed:`, describe(e));
       this.set({ phase: "failed", version: now.version, error: describe(e) });
     } finally {
@@ -173,7 +177,7 @@ export function initUpdates(): (() => void) | undefined {
   updater ??= new Updater({
     check: async () => (await import("@tauri-apps/plugin-updater")).check({ timeout: 30_000 }),
     relaunch: async () => (await import("@tauri-apps/plugin-process")).relaunch(),
-  });
+  }, useUpdate, async version => (await import("../state/controller")).controller.prepareUpdateRestart(version));
   return updater.start();
 }
 

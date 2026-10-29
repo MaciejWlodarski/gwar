@@ -1,5 +1,5 @@
 import { Headphones, HeadphoneOff, Mic, MicOff, MonitorUp, PhoneOff, SignalHigh, SignalLow, SignalMedium } from "lucide-react";
-import type { ReactNode } from "react";
+import { useState, type ReactNode } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { controller, describeVoiceError } from "../state/controller";
@@ -9,7 +9,7 @@ import { useSettings } from "../state/settings";
 import { myChannelId } from "../state/reducer";
 import { useSession, useVoice } from "../state/stores";
 import { useChannelPermission, useMe, keyLabel, modKey } from "./hooks";
-import { Button, IconButton, TalkingAvatar, Tooltip } from "./kit";
+import { Button, Dialog, IconButton, TalkingAvatar, Tooltip } from "./kit";
 import { showVoiceChannel, useVoicePill } from "./nav";
 import { ConnectBadge } from "./badges";
 import { ShareButton } from "./Screen";
@@ -112,6 +112,7 @@ function useVoiceStatus() {
   const t = useT();
   const voiceState = useVoice((s) => s.state);
   const encryption = useVoice((s) => s.encryption);
+  const reconnecting = useVoice((s) => s.reconnecting);
   const phase = useSession((s) => s.phase);
   // Encrypted channels never show an alarm, even when the engine refused them.
   const encryptedChannel = useSession((s) => {
@@ -121,17 +122,19 @@ function useVoiceStatus() {
   // Encrypted calls: "Securing voice…" until a sending key is active, in the
   // muted style; a stopped engine is "Voice unavailable" with Retry, no alarm.
   const status: { tone: "ok" | "warn" | "danger" | "muted"; text: string } =
-    phase === "reconnecting"
+    phase === "reconnecting" || reconnecting
       ? { tone: "warn", text: t("voice.reconnecting") }
       : encryption === "failed"
         ? { tone: "muted", text: t("voice.failed") }
         : encryption === "securing" && voiceState !== "failed"
           ? { tone: "muted", text: t("voice.securing") }
-          : voiceState === "connected"
-            ? { tone: "ok", text: t("voice.connected") }
-            : voiceState === "failed"
-              ? { tone: encryption || encryptedChannel ? "muted" : "danger", text: t("voice.failed") }
-              : { tone: "warn", text: t("voice.connecting") };
+          : voiceState === "idle" && phase === "online"
+            ? { tone: "muted", text: t("voice.notIn") }
+            : voiceState === "connected"
+              ? { tone: "ok", text: t("voice.connected") }
+              : voiceState === "failed"
+                ? { tone: encryption || encryptedChannel ? "muted" : "danger", text: t("voice.failed") }
+                : { tone: "warn", text: t("voice.connecting") };
   const tone = cn(
     status.tone === "ok" && "text-ok",
     status.tone === "warn" && "text-warn",
@@ -156,6 +159,8 @@ function LeaveButton() {
 
 export function VoicePanel() {
   const t = useT();
+  const [showReason, setShowReason] = useState(false);
+  const failure = useVoice((s) => s.failure);
   const voiceState = useVoice((s) => s.state);
   const encryption = useVoice((s) => s.encryption);
   const micError = useVoice((s) => s.micError);
@@ -166,7 +171,7 @@ export function VoicePanel() {
   const member = useSession((s) => (s.me ? s.members[s.me.uid] : undefined));
   const { status, tone } = useVoiceStatus();
 
-  if (me && me.channel === null) {
+  if (me && me.channel === null && !failure) {
     return (
       <div className="m-2 mt-1 rounded-xl bg-raised p-2">
         <SelfRow
@@ -182,7 +187,7 @@ export function VoicePanel() {
     );
   }
 
-  const unavailable = voiceState === "failed" || encryption === "failed";
+  const unavailable = voiceState === "failed" || encryption === "failed" || voiceState === "idle";
   // Nobody hears me: a moderator muted or deafened me, or this channel does not let me speak.
   const silencedNote = me?.server_deafened
     ? t("voice.serverDeafened")
@@ -201,7 +206,7 @@ export function VoicePanel() {
             <span className="truncate text-sm font-semibold">{me?.nickname}</span>
             {me && <ConnectBadge member={member} name={me.nickname} />}
           </div>
-          <div className="flex min-w-0 items-center gap-1.5 text-xs" title={status.text}>
+          {!failure && <div className="flex min-w-0 items-center gap-1.5 text-xs" title={status.text}>
             <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone, status.tone === "warn" && "animate-pulse")} />
             {status.tone === "ok" && channelName ? (
               <>
@@ -212,15 +217,27 @@ export function VoicePanel() {
               <span className={cn("truncate", tone)}>{status.text}</span>
             )}
             {status.tone === "ok" && <RoundTrip />}
-          </div>
+          </div>}
         </div>
-        {unavailable && phase === "online" && (
+        {unavailable && !failure && phase === "online" && (
           <Button size="sm" variant="secondary" onClick={() => controller.retryVoice()}>
-            {t("voice.retry")}
+            {t(voiceState === "idle" ? "tree.joinVoice" : "voice.retry")}
           </Button>
         )}
-        <LeaveButton />
+        {me?.channel != null && <LeaveButton />}
       </div>
+      {failure && <div className="flex items-center gap-1.5 px-1 text-xs">
+        <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone)} />
+        <span className={tone}>{status.text}</span>
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          <button onClick={() => setShowReason(true)} className="t cursor-pointer text-muted underline underline-offset-2 hover:text-fg">{t("voice.why")}</button>
+          {phase === "online" && <>
+            <span aria-hidden className="text-subtle">·</span>
+            <button onClick={() => controller.retryVoice()} className="t cursor-pointer font-medium text-fg hover:underline">{t("voice.retry")}</button>
+          </>}
+        </div>
+      </div>}
+      <Dialog open={showReason && !!failure} onOpenChange={setShowReason} title={t("voice.failed")} description={failure ?? undefined}>{null}</Dialog>
       {micError && (
         <div role="alert" className="rounded-md bg-danger-soft px-2 py-1.5 text-xs text-danger">
           {describeVoiceError(micError)}
