@@ -524,7 +524,7 @@ async function reconnectAndScreenshots(cs, cv, viewers, chromiumTab) {
     await cs.evaluate(async () => {
       const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts"); useScreen.setState({ notice: "permissionHint" });
     });
-    await captureNotice("permission-ambiguous-browser", { text: "Jeśli anulowałeś wybór, zignoruj tę wskazówkę; w przeciwnym razie zezwól na nagrywanie ekranu dla Firefox w ustawieniach prywatności systemu lub przeglądarki.", shortcut: false });
+    await captureNotice("permission-ambiguous-browser", { text: "Jeśli wybór został anulowany, pomiń tę wskazówkę. W przeciwnym razie zezwól na nagrywanie ekranu dla Firefox w ustawieniach prywatności systemu lub przeglądarki.", shortcut: false });
     await cs.evaluate(() => { delete navigator.userAgent; });
     writeFileSync(path.join(directory, "screenshots.txt"), [
       "Real running Polish web app against a local loopback-only server.",

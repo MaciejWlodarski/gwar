@@ -448,7 +448,7 @@ export const pl: Record<Key, string> = {
   "screen.watchReconnecting": "Przywracanie podglądu…",
   "screen.reconnecting": "Przywracanie udostępniania…",
   "screen.permission": "Zezwól na nagrywanie ekranu dla {app} w {settings}.",
-  "screen.permissionHint": "Jeśli anulowałeś wybór, zignoruj tę wskazówkę; w przeciwnym razie zezwól na nagrywanie ekranu dla {app} w ustawieniach prywatności systemu lub przeglądarki.",
+  "screen.permissionHint": "Jeśli wybór został anulowany, pomiń tę wskazówkę. W przeciwnym razie zezwól na nagrywanie ekranu dla {app} w ustawieniach prywatności systemu lub przeglądarki.",
   "screen.permissionTitle": "Brak zgody na nagrywanie ekranu",
   "screen.permissionShort": "Brak dostępu do ekranu",
   "screen.permissionFix": "Jak włączyć",
