@@ -36,7 +36,7 @@ try {
       await stage.waitFor();
       assert.match(await stage.innerText(), /Twoje łącze nie nadąża/);
       // Stopped retries do not promise the picture comes back on its own; they ask for the click.
-      assert.match(await stage.innerText(), state === "stopped" ? /kliknij »Spróbuj ponownie«/ : /obraz wróci sam/);
+      assert.match(await stage.innerText(), state === "stopped" ? /kliknij »Spróbuj ponownie«/ : /Wróci sam/);
       if (device !== "mobile") assert.equal(await page.getByTestId("screen-quality").innerText(), "Wstrzymane – słabe łącze");
       const button = stage.getByRole("button");
       if (state === "deferred" || state === "retrying") {

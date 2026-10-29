@@ -245,7 +245,7 @@ it("shows why the server holds a share back instead of its last resolution at 0 
   screen.frameReceived("A", transport.run, watches[0]!.id);
   await act(async () => { screen.handleEvent({ ev: "screen.paused", d: { share: "B", reason: "bandwidth" } }); });
   let stage = container.querySelector<HTMLElement>('[data-screen-paused="bandwidth"]')!;
-  expect(stage.textContent).toContain("Paused because your connection can't keep up");
+  expect(stage.textContent).toContain("Your connection can't keep up");
   expect(container.querySelector('[data-testid="screen-quality"]')?.textContent).toBe("Paused – weak connection");
   request.mockClear();
   // B was granted 3 s ago: the server holds a Try again until 15 s after that, and the button says so.
@@ -291,7 +291,7 @@ it("shows why the server holds a share back instead of its last resolution at 0 
   });
   stage = container.querySelector<HTMLElement>('[data-screen-paused="bandwidth"]')!;
   expect(stage.dataset.waiting).toBe("true");
-  expect(stage.textContent).toContain("If your connection works better now, click “Try again”.");
+  expect(stage.textContent).toContain("Once it's better, click “Try again”.");
   expect(stage.textContent).not.toContain("comes back on its own");
   retry = [...stage.querySelectorAll("button")].find(b => b.textContent?.includes("Try again"))!;
   expect(retry.className).toContain("bg-accent");

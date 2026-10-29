@@ -439,7 +439,7 @@ function PausedOverlay({ share, reason, compact }: { share: string; reason: Scre
         <span className="rounded bg-white/15 px-1.5 text-[11px] leading-5 font-medium" title={text}>{t(reason === "bandwidth" ? "screen.pausedLink" : "screen.pausedShort")}</span>
       ) : (
         <>
-          <p className="max-w-sm text-sm text-white/90">{text}</p>
+          <p className="max-w-sm text-sm text-balance text-white/90">{text}</p>
           {reason === "bandwidth" && (
             <Button size="sm" variant={invite ? "primary" : "secondary"} disabled={due !== null}
               className={cn("tabular-nums disabled:opacity-80", !invite && "border-white/30 text-white hover:bg-white/10")}

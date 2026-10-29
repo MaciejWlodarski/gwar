@@ -2330,8 +2330,8 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   rest of the ramp costs the viewer's other traffic nothing. A keyframe that
   does not fit is refused at admission. In the simulator, a retry that fell
   short paused within 2 s of its ramp's end.
-- The viewer sees "Paused because your connection can't keep up. Voice comes
-  first: the picture comes back on its own once your connection allows." over
+- The viewer sees "Your connection can't keep up, so the picture is paused to
+  keep voice clear. It comes back on its own." over
   the last frame of a paused share, with a Try again button, or that the
   server is making room for a budget pause. A card, and the quality badge
   instead of the last resolution at 0 fps, say "Paused – weak connection"
@@ -2342,8 +2342,8 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   share on its watch transport, as the server spaces starts per transport,
   but for a climb it does not see), then "Retrying…" until the share
   resumes, offered again if nothing came 10 s after. After
-  `screen.waiting` the overlay says instead "Paused because your connection
-  can't keep up. If your connection works better now, click “Try again”."
+  `screen.waiting` the overlay says instead "Your connection can't keep up,
+  so the picture is paused. Once it's better, click “Try again”."
   and Try again is the primary button, until the next pause or resume. Try again on a fully paused viewer
   retries that share from its whole optimistic start, as a fresh watch would,
   and does not add to `n`. That is the viewer's own choice to overrun its
