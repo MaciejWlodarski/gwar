@@ -8,8 +8,9 @@
 export type SendCodec = "av1" | "h264" | "vp9";
 
 /**
- * How long a connected publish transport with a live, unmuted track may go without encoding a
- * frame. Measured first frames come within a second of connecting, CPU-bound encoders included.
+ * How long a connected publish transport with a live, unmuted track that delivers frames may go
+ * without encoding one. Measured first frames come within a second of connecting, CPU-bound
+ * encoders included.
  */
 export const FIRST_ENCODE_TIMEOUT_MS = 5_000;
 
@@ -68,4 +69,30 @@ export function encodedAnything(stats: RTCStatsReport): boolean {
     if (typeof frames === "number" ? frames > 0 : (packets ?? 0) > 0) encoded = true;
   });
   return encoded;
+}
+
+/**
+ * Frames the capture has handed to the sender so far (`media-source.frames`): the outbound
+ * stream's source, or before there is one, the source of `trackId`. Undefined where the engine
+ * reports no source frame count.
+ */
+export function sourceFrames(stats: RTCStatsReport, trackId: string | undefined): number | undefined {
+  let source: Record<string, unknown> | undefined;
+  stats.forEach(s => { if (s.type === "outbound-rtp" && (s.kind ?? s.mediaType) === "video" && s.mediaSourceId) source = stats.get(s.mediaSourceId as string); });
+  if (!source && trackId !== undefined) stats.forEach(s => { if (s.type === "media-source" && s.trackIdentifier === trackId) source = s; });
+  return source?.type === "media-source" && source.kind === "video" && typeof source.frames === "number" ? source.frames : undefined;
+}
+
+/**
+ * What one expired wait saw. `encoded`: a frame went out. `idle`: the source delivered no frame
+ * since `since` (or none at all), so there was nothing to encode: a minimized window, a stalled
+ * permission prompt or static content. `stalled`: frames came in and none was encoded, or the
+ * engine reports no source frames to tell. An unknown `since` with frames already delivered is
+ * `idle` too: the next wait measures from here.
+ */
+export function firstFrameProgress(stats: RTCStatsReport, trackId: string | undefined, since: number | undefined): { state: "encoded" | "idle" | "stalled"; frames: number | undefined } {
+  const frames = sourceFrames(stats, trackId);
+  if (encodedAnything(stats)) return { state: "encoded", frames };
+  if (frames === undefined) return { state: "stalled", frames };
+  return { state: frames > 0 && since !== undefined && frames > since ? "stalled" : "idle", frames };
 }

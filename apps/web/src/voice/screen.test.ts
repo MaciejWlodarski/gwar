@@ -2825,17 +2825,21 @@ describe("first-frame guard", () => {
     "a=rtpmap:98 VP9/90000", "a=fmtp:98 profile-id=0", "a=rtpmap:99 rtx/90000", "a=fmtp:99 apt=98", "",
   ].join("\r\n");
   const remote = (pc: Peer) => (pc.setRemoteDescription.mock.calls as unknown as [RTCSessionDescriptionInit][]).map(([d]) => d.sdp!);
-  const share = async (patch: Partial<PublishParams> = {}) => {
-    const track = { readyState: "live", muted: false, applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }), contentHint: "" };
+  /** `frames`: the capture's `media-source` frame count at connection; none where the engine reports none. */
+  const share = async (patch: Partial<PublishParams> = {}, frames?: number) => {
+    const track = { id: "screen", readyState: "live", muted: false, applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }), contentHint: "" };
     const state = vi.fn(), encodeFailed = vi.fn(), warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const publisher = new ScreenPublisher({ track: track as unknown as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => answer, state, encodeFailed, ...patch });
     await publisher.start();
     const pc = Peer.all.at(-1)!;
     pc.stats = new Map();
+    if (frames !== undefined) source(pc, frames);
     pc.connectionState = "connected"; pc.onconnectionstatechange?.();
     return { publisher, pc, track, state, encodeFailed, warn };
   };
   const encode = (pc: Peer, framesEncoded: number) => pc.stats.set("out", { type: "outbound-rtp", kind: "video", framesEncoded });
+  // Chromium lists the source before any outbound stream exists.
+  const source = (pc: Peer, frames: number) => pc.stats.set("source", { type: "media-source", kind: "video", trackIdentifier: "screen", frames });
 
   it("leaves a first frame that comes late, but within the wait, alone", async () => {
     const { publisher, pc, encodeFailed, warn } = await share();
@@ -2951,6 +2955,97 @@ describe("first-frame guard", () => {
     expect(stopped.pc.createOffer).toHaveBeenCalledTimes(1);
     expect(stopped.encodeFailed).not.toHaveBeenCalled();
     expect(stopped.warn).not.toHaveBeenCalled();
+  });
+
+  it("holds the wait while the source delivers no frame, as for a minimized window", async () => {
+    const { publisher, pc, warn } = await share({}, 0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(1);
+    expect(warn).not.toHaveBeenCalled();
+    // The window comes back: its frames reach the sender, and none is encoded.
+    source(pc, 40);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("renegotiating without the start-bitrate hint"));
+    publisher.close();
+  });
+
+  it("holds the wait for static content whose frames all came before connecting", async () => {
+    const { publisher, pc, encodeFailed, warn } = await share({}, 120);
+    encode(pc, 0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(1);
+    expect(encodeFailed).not.toHaveBeenCalled();
+    expect(warn).not.toHaveBeenCalled();
+    // A content change delivers a frame and the encoder still produces nothing.
+    source(pc, 121);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(2);
+    publisher.close();
+  });
+
+  it("acts on time when the source delivers frames and none is encoded", async () => {
+    const { publisher, pc, warn } = await share({}, 0);
+    await vi.advanceTimersByTimeAsync(1_000);
+    source(pc, 120);
+    encode(pc, 0);
+    await vi.advanceTimersByTimeAsync(4_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(2);
+    expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("(codec h264, start hint on); renegotiating without the start-bitrate hint"));
+    // Each step measures its own wait: frames keep coming, still none encoded.
+    source(pc, 300);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(3);
+    publisher.close();
+  });
+
+  it("falls back from AV1 to H.264 and never returns to AV1 within the share", async () => {
+    const av1 = [
+      "v=0", "m=video 9 UDP/TLS/RTP/SAVPF 100 101 96 97 98 99",
+      "a=rtpmap:100 AV1/90000", "a=rtpmap:101 rtx/90000", "a=fmtp:101 apt=100",
+      ...answer.split("\r\n").slice(2),
+    ].join("\r\n");
+    const { publisher, pc, encodeFailed, warn } = await share({ av1: true, offer: async () => av1 });
+    expect(remote(pc)[0]).toContain("a=fmtp:100 x-google-start-bitrate=4000");
+    await vi.advanceTimersByTimeAsync(10_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(3);
+    expect(warn).toHaveBeenLastCalledWith("Screen sender: no frame encoded 5 s after connecting (codec av1, start hint off); renegotiating with h264");
+    const h264 = remote(pc).at(-1)!;
+    expect(h264).toContain("m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n");
+    expect(h264).not.toMatch(/AV1|VP9/);
+    expect((publisher as unknown as { av1Retired: boolean }).av1Retired).toBe(true);
+    encode(pc, 1);
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(encodeFailed).not.toHaveBeenCalled();
+    // A recovery's answer that still leads with AV1 is kept to H.264, and says so.
+    await publisher.recover({ share: "s", codec: "h264", width: 1920, height: 1080, fps: 60 });
+    expect(remote(Peer.all[1]!)).toEqual([h264]);
+    expect(warn).toHaveBeenLastCalledWith("Screen sender: keeping h264; av1 encoded nothing earlier in this share");
+    publisher.close();
+  });
+
+  it("leaves a renegotiation to a server recovery that replaces its transport", async () => {
+    const { publisher, pc, encodeFailed } = await share();
+    let offered!: () => void;
+    pc.setLocalDescription.mockImplementationOnce(async d => { pc.localDescription = d; await new Promise<void>(resolve => { offered = resolve; }); });
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(pc.createOffer).toHaveBeenCalledTimes(2);
+    const recovering = publisher.recover({ share: "s", codec: "vp9", width: 1920, height: 1080, fps: 60 });
+    await vi.advanceTimersByTimeAsync(0);
+    offered();
+    await recovering;
+    // The stale transport never gets the rewritten answer; the new one starts without the hint.
+    expect(remote(pc)).toHaveLength(1);
+    const next = Peer.all[1]!;
+    expect(remote(next)).toEqual([answer]);
+    expect(encodeFailed).not.toHaveBeenCalled();
+    // The new transport gets its own wait.
+    next.stats = new Map();
+    next.connectionState = "connected"; next.onconnectionstatechange?.();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(remote(next).at(-1)).toContain("m=video 9 UDP/TLS/RTP/SAVPF 98 99\r\n");
+    publisher.close();
+    expect(vi.getTimerCount()).toBe(0);
   });
 
   it("holds the wait while the track is muted", async () => {

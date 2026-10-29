@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { answerCodecs, encodedAnything, fallbackCodec, restrictAnswer } from "./screen-first-frame";
+import { answerCodecs, encodedAnything, fallbackCodec, firstFrameProgress, restrictAnswer, sourceFrames } from "./screen-first-frame";
 
 const answer = [
   "v=0", "o=- 1 2 IN IP4 0.0.0.0", "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99", "a=mid:0",
@@ -8,7 +8,7 @@ const answer = [
   "a=rtpmap:98 VP9/90000", "a=rtcp-fb:98 nack pli", "a=fmtp:98 profile-id=0",
   "a=rtpmap:99 rtx/90000", "a=fmtp:99 apt=98", "",
 ].join("\r\n");
-const stats = (...entries: Record<string, unknown>[]) => new Map(entries.map((e, i) => [String(i), e])) as unknown as RTCStatsReport;
+const stats = (...entries: Record<string, unknown>[]) => new Map(entries.map((e, i) => [String(e.id ?? i), e])) as unknown as RTCStatsReport;
 
 describe("first-frame guard helpers", () => {
   it("reads the answer's codecs in payload order", () => {
@@ -44,5 +44,28 @@ describe("first-frame guard helpers", () => {
     expect(encodedAnything(stats({ type: "outbound-rtp", kind: "video", framesEncoded: 1 }))).toBe(true);
     expect(encodedAnything(stats({ type: "outbound-rtp", mediaType: "video", packetsSent: 2 }))).toBe(true);
     expect(encodedAnything(stats({ type: "outbound-rtp", kind: "audio", framesEncoded: 9 }))).toBe(false);
+  });
+
+  it("reads the frames the capture handed to the sender, where the engine reports them", () => {
+    const linked = stats({ id: "out", type: "outbound-rtp", kind: "video", framesEncoded: 0, mediaSourceId: "src" }, { id: "src", type: "media-source", kind: "video", trackIdentifier: "other", frames: 7 });
+    expect(sourceFrames(linked, "screen")).toBe(7);
+    // Before any outbound stream, the track's own source.
+    expect(sourceFrames(stats({ id: "a", type: "media-source", kind: "audio", trackIdentifier: "mic", frames: 9 }, { id: "v", type: "media-source", kind: "video", trackIdentifier: "screen", frames: 3 }), "screen")).toBe(3);
+    expect(sourceFrames(stats({ id: "v", type: "media-source", kind: "video", trackIdentifier: "screen", width: 1920 }), "screen")).toBeUndefined();
+    expect(sourceFrames(stats({ type: "outbound-rtp", kind: "video", framesEncoded: 0 }), "screen")).toBeUndefined();
+  });
+
+  it("calls a wait idle when the source delivered nothing in it, stalled only when frames went unencoded", () => {
+    const source = (frames: number) => ({ id: "v", type: "media-source", kind: "video", trackIdentifier: "screen", frames });
+    expect(firstFrameProgress(stats(source(50), { type: "outbound-rtp", kind: "video", framesEncoded: 2 }), "screen", 0).state).toBe("encoded");
+    expect(firstFrameProgress(stats(source(0)), "screen", 0)).toEqual({ state: "idle", frames: 0 });
+    expect(firstFrameProgress(stats(source(0)), "screen", undefined).state).toBe("idle");
+    // Static content: frames before the wait, none during it.
+    expect(firstFrameProgress(stats(source(120)), "screen", 120).state).toBe("idle");
+    // Frames already delivered with no known start: measure from here.
+    expect(firstFrameProgress(stats(source(120)), "screen", undefined)).toEqual({ state: "idle", frames: 120 });
+    expect(firstFrameProgress(stats(source(121)), "screen", 120).state).toBe("stalled");
+    // No source frame count: judged by encoded frames alone.
+    expect(firstFrameProgress(stats(), "screen", undefined)).toEqual({ state: "stalled", frames: undefined });
   });
 });

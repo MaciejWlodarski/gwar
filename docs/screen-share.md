@@ -675,6 +675,24 @@ once it sends, so a missing stream counts as no frame. An engine without
 `framesEncoded` proves progress by sent packets. A muted track (its source
 delivers nothing) or a transport that is not connected restarts the wait instead,
 and so does a failed stats read. An ended capture or a stopped share cancels it.
+
+No encoded frame is only a fault if the encoder had something to encode. A live,
+unmuted track can still deliver nothing: Windows (WGC) and macOS
+(ScreenCaptureKit) send no frames for a minimized shared window, and a macOS
+permission prompt can stall capture. So the guard also reads the capture's
+`media-source.frames` (the outbound stream's `mediaSourceId`, or before one
+exists the source with the track's `trackIdentifier`), counted from the start of
+each wait. If the source delivered no frame in the wait, the wait restarts from
+the current count. Only a source that delivered frames while nothing was encoded
+counts as a failure. This also covers static content: frames that all came
+before the transport connected do not count, and the guard waits for the next
+one. The web has no reliable way to ask display capture for a fresh frame
+(`requestFrame` exists only for canvas capture), so the guard waits instead of
+prodding the source; the window coming back or the content changing delivers the
+next frame. An engine that reports no source frame
+count (WebKitGTK's GStreamer backend) is judged by encoded frames alone, as
+above.
+
 Without a frame, the publisher takes one step per expired wait. It takes each
 step at most once per share:
 
@@ -685,7 +703,10 @@ step at most once per share:
 2. It falls back to the plan's next codec: H.264 → VP9, or VP9 → H.264, and AV1 → H.264.
    AV1 is never a fallback. The answer is restricted to that codec and its RTX.
    The failed codec stays out of the share's later answers while another codec
-   is negotiated, and a failed AV1 retires AV1 for the share.
+   is negotiated, and a failed AV1 retires AV1 for the share. When that changes
+   the codec the server's answer leads with (for example a server recovery to
+   H.264 after H.264 failed), the publisher logs `Screen sender: keeping vp9;
+   h264 encoded nothing earlier in this share`.
 3. It gives up with one `encodeFailed`. The controller stops the share and shows
    "Your screen share was stopped: this browser could not encode the video."
    Nothing rearms after that.
@@ -698,19 +719,24 @@ Both steps renegotiate in place, on the same transport. The server negotiates a
 share's publish transport once and answers a different second offer with
 `conflict` unless the SFU asked for it with `screen.recover`, so the sender does
 not open a new transport. It makes a fresh local offer (same SSRCs, ICE and DTLS)
-and applies the server's own answer again, rewritten for the step. The engine
-rebuilds its encoder for the changed codec parameters. A new offer whose video
-SSRCs changed is a failure, since the SFU drops RTP from any SSRC but the one it
-negotiated. The SFU already follows a codec change in place at the next keyframe
-(`switch_codec`, as for the AV1 → H.264 retirement). The cap is written again
-afterwards. The whole ladder ends about 15 s after connecting, well before a
-viewer's 35 s first-frame deadline.
+and applies the server's own answer again, rewritten for the step. libwebrtc
+engines rebuild their encoder for the changed codec parameters. Whether the
+GStreamer backend (WebKitGTK) rebuilds its encoder on a codec change during
+renegotiation is unverified. If it does not, the ladder there ends in the stop
+and its toast about 10 s after connecting, because GTK starts at step 2. A new
+offer whose video SSRCs changed is a failure, since the SFU drops RTP from any
+SSRC but the one it negotiated. The SFU already follows a codec change in place
+at the next keyframe (`switch_codec`, as for the AV1 → H.264 retirement). The cap
+is written again afterwards. With a source delivering frames, the whole ladder
+ends about 15 s after connecting, well before a viewer's 35 s first-frame
+deadline.
 
 *Why 5 s.* libwebrtc keeps the encoder paused (zero target rate) until the
 transport is writable, so the wait starts at connection. Capture warm-up (picker,
-constraints, `screen.start`, signalling) all comes before it. Chromium asks a
-screen source for a refresh frame when the encoder wants its first keyframe, so
-static content still gets a first frame, and a muted track holds the wait. The startup validation measured what a slow start looks like
+constraints, `screen.start`, signalling) all comes before it. A source that
+delivers no frame (a muted track, a minimized window, static content after the
+pre-connection frames) holds the wait, so the 5 s only ever measures an encoder
+that had frames to encode. The startup validation measured what a slow start looks like
 (docs/screen-startup-validation.md, "Busy H.264 ramp"). The first GCC estimate came
 76–189 ms after the answer. Busy 1080p60 shares reached native size 1.1–3.5 s
 in, frames flowing well before that, even on a CPU-limited encoder: single-threaded
