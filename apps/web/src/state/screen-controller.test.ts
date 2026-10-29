@@ -13,7 +13,7 @@ interface PublisherOptions {
   ended(): void;
   quality: ScreenSpec; legacy: boolean; automaticMode: boolean;
   surfaceChanged(surface: "screen" | "window" | "tab" | "unknown", spec: ScreenSpec): void;
-  offer(body: object): Promise<string>; state(s: string): void;
+  offer(body: object): Promise<string>; state(s: string): void; encodeFailed(): void;
 }
 
 const media = vi.hoisted(() => ({
@@ -381,6 +381,29 @@ describe("reused receive slots", () => {
     expect(failed).not.toHaveBeenCalled();
     screen.reset();
   });
+
+  it("holds the first-frame deadline while the server pauses the share and starts it over on resume", async () => {
+    const { screen, start } = setup();
+    const old = await start(false);
+    const watch = useScreen.getState().watches[0]!;
+    const failed = vi.spyOn(screen, "frameFailed");
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(20_000);
+    // Paused before its first frame: however long the pause, the wait does not run out.
+    screen.handleEvent({ ev: "screen.paused", d: { share: "B", reason: "bandwidth" } });
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(40_000);
+    expect(failed).not.toHaveBeenCalled();
+    expect(useScreen.getState().watches).toMatchObject([{ share: "B", status: "watching", paused: "bandwidth" }]);
+    // Resumed: a full 35 s wait again, not what was left of the first one.
+    screen.handleEvent({ ev: "screen.resumed", d: { share: "B" } });
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(34_999);
+    expect(failed).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(failed).toHaveBeenCalledExactlyOnceWith("B", old.params.run, watch.id);
+    screen.reset();
+  });
 });
 
 describe("watch requests (review round 1)", () => {
@@ -587,6 +610,25 @@ describe("sharing", () => {
     choosing(); await screen.confirmShare();
     publisher.params.ended(); await flush();
     expect(useScreen.getState().own?.share).toBe("M");
+    await screen.stopShare();
+  });
+
+  it("stops a share whose encoder never produced a frame, with one toast, and ignores an old publisher", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String), t = choosing();
+    await screen.confirmShare();
+    const publisher = media.publishers[0]!;
+    publisher.params.encodeFailed(); await flush();
+    expect(useScreen.getState().own).toBeNull();
+    expect(t.stop).toHaveBeenCalledTimes(1);
+    expect(publisher.close).toHaveBeenCalledTimes(1);
+    expect(calls.filter(([op]) => op === "screen.stop")).toEqual([["screen.stop", { share: "M" }]]);
+    expect(toast).toHaveBeenCalledExactlyOnceWith("error", "Your screen share was stopped: this browser could not encode the video.");
+    choosing(); await screen.confirmShare();
+    publisher.params.encodeFailed(); await flush();
+    expect(useScreen.getState().own?.share).toBe("M");
+    expect(toast).toHaveBeenCalledTimes(1);
     await screen.stopShare();
   });
 

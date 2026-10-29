@@ -9,6 +9,17 @@ describe("screen start bitrate", () => {
 });
 
 describe("screen answer start hint", () => {
+  it.each(["\r\n", "\n"])("hints only H.264 in GTK/WPE, preserving VP9, AV1, RTX and audio (%j)", newline => {
+    const answer = ["v=0", "m=audio 9 UDP/TLS/RTP/SAVPF 96", "a=rtpmap:96 opus/48000/2", "a=fmtp:96 minptime=10", "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99", "a=rtpmap:96 H264/90000", "a=fmtp:96 packetization-mode=1;profile-level-id=42e01f", "a=rtpmap:97 rtx/90000", "a=fmtp:97 apt=96", "a=rtpmap:98 VP9/90000", "a=fmtp:98 profile-id=0", "a=rtpmap:99 AV1/90000", ""].join(newline);
+    const userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/26.6 Safari/605.1.15";
+    const result = withScreenStartBitrate(answer, 1_500_000, userAgent, "Linux x86_64");
+    expect(result).toBe(answer.replace("packetization-mode=1;profile-level-id=42e01f", "packetization-mode=1;profile-level-id=42e01f;x-google-start-bitrate=1500"));
+    expect(withScreenStartBitrate(result, 1_500_000, userAgent, "Linux x86_64")).toBe(result);
+  });
+  it("creates a missing H.264 fmtp in GTK without adding one for VP9", () => {
+    const answer = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96 98\r\na=rtpmap:96 H264/90000\r\na=rtpmap:98 VP9/90000\r\n";
+    expect(withScreenStartBitrate(answer, 4_000_000, "AppleWebKit", "Linux x86_64")).toBe(answer.replace("H264/90000\r\n", "H264/90000\r\na=fmtp:96 x-google-start-bitrate=4000\r\n"));
+  });
   it("recognizes GTK's platform even when its user agent identifies as macOS Safari", () => {
     const answer = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP9/90000\r\na=fmtp:96 profile-id=0\r\n";
     const userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/18.4 Safari/605.1.15";
@@ -19,6 +30,7 @@ describe("screen answer start hint", () => {
     ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 Version/60.5 Safari/605.1.15", false, "Linux x86_64"],
     ["Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/153.0.0.0 Safari/537.36", true, "Linux x86_64"],
     ["Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15", true, "MacIntel"],
+    ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153.0.0.0 Safari/537.36 Edg/153.0.0.0", true, "Win32"],
   ])("keeps WebKitGTK's answer compatible while enabling Chromium and native WKWebView: %s", (userAgent, enabled, platform) => {
     const answer = "v=0\r\nm=video 9 UDP/TLS/RTP/SAVPF 96\r\na=rtpmap:96 VP9/90000\r\na=fmtp:96 profile-id=0\r\n";
     const result = withScreenStartBitrate(answer, 4_000_000, userAgent, platform);

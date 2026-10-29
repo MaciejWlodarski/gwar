@@ -283,6 +283,20 @@ pub struct JitterBuffer {
     last_observation: Option<Instant>,
     last_shrink: Option<Instant>,
     last_attempt: Option<Instant>,
+    /// The last starvation PLC (an empty queue, not a proven loss): no evidence for a backlog
+    /// cut can include one.
+    last_conceal: Option<Instant>,
+    /// Backlog cuts (`update_backlog`, `cut_backlog`): since when the surplus has stayed at
+    /// least `BACKLOG_TRIM`, its lowest value since then (debited like the marks), when a cut
+    /// became due, how long the evidence must be, the last cut until a starvation proves it
+    /// took needed cushion or `BACKLOG_PROBE` passes without one, and since when the evidence
+    /// has neither grown nor seen a starvation (`BACKLOG_RELAX`).
+    backlog_since: Option<Instant>,
+    backlog_low: u64,
+    backlog_due: Option<Instant>,
+    backlog_evidence: Duration,
+    backlog_cut: Option<Instant>,
+    backlog_calm: Option<Instant>,
     pub(crate) concealments: u64,
     pub(crate) late_drops: u64,
     /// Queued packets dropped, oldest first, to keep the queue within `MAX_QUEUED` and
@@ -299,6 +313,9 @@ pub struct JitterBuffer {
     /// Test-only: drain by the reserve rule alone, as before the arrival rule.
     #[cfg(test)]
     pub(crate) reserve_only: bool,
+    /// Test-only: never cut a backlog, as before backlog cuts.
+    #[cfg(test)]
+    pub(crate) no_backlog_cut: bool,
 }
 
 const FRAME: u64 = 960; // TS packet-counter stride and unknown-stream default.
@@ -326,6 +343,20 @@ const SHRINK_INTERVAL: Duration = Duration::from_millis(500);
 const TRIM_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(1);
 // A declined proposal (noise, onset) costs a pitch search; retry at most 5 times a second.
 const SHRINK_RETRY: Duration = Duration::from_millis(200);
+// A surplus this large (100 ms), proven for `backlog_evidence`, is cut: the gentle shrink would
+// take seconds to minutes. The cut leaves `BACKLOG_KEEP` (40 ms) of it to the gentle shrink, a
+// cushion against local stalls the arrival rule cannot see. It drops quiet packets only, after
+// quiet frames, and the rest at once after `BACKLOG_WAIT`. The evidence starts at one window and
+// doubles (up to `MAX_BACKLOG_EVIDENCE`) whenever playout starves within `BACKLOG_PROBE` of a
+// cut: delay that swells and recedes more rarely than the window keeps its cushion after the
+// first miss, as speaker headroom does (playout.rs). A cut without a starvation after it resets
+// the evidence, and it halves after `BACKLOG_RELAX` without growth or a starvation.
+const BACKLOG_TRIM: u64 = 4800;
+const BACKLOG_KEEP: u64 = 1920;
+const BACKLOG_WAIT: Duration = Duration::from_secs(2);
+const BACKLOG_PROBE: Duration = Duration::from_secs(10);
+const BACKLOG_RELAX: Duration = Duration::from_secs(60);
+const MAX_BACKLOG_EVIDENCE: Duration = Duration::from_secs(80);
 
 /// Whole samples from `from` to `to`, rounded down.
 fn samples_between(from: Instant, to: Instant) -> u64 {
@@ -360,6 +391,13 @@ impl JitterBuffer {
             last_observation: None,
             last_shrink: None,
             last_attempt: None,
+            last_conceal: None,
+            backlog_since: None,
+            backlog_low: 0,
+            backlog_due: None,
+            backlog_evidence: DEPTH_WINDOW,
+            backlog_cut: None,
+            backlog_calm: None,
             concealments: 0,
             late_drops: 0,
             overflow_drops: 0,
@@ -370,6 +408,8 @@ impl JitterBuffer {
             concealments_after_trim: 0,
             #[cfg(test)]
             reserve_only: false,
+            #[cfg(test)]
+            no_backlog_cut: false,
         }
     }
 
@@ -419,6 +459,15 @@ impl JitterBuffer {
                 });
             }
         }
+        // A packet resuming a held head proves the PLC before it was starvation, not the end of
+        // a spurt (the next spurt resets). A cut stays on probe until playout runs `BACKLOG_PROBE`
+        // past it without starving (`update_backlog`): this cut took a cushion playout needed.
+        if self.held > 0 {
+            if self.backlog_cut.take().is_some() {
+                self.backlog_evidence = (self.backlog_evidence * 2).min(MAX_BACKLOG_EVIDENCE);
+            }
+            self.backlog_calm = Some(now);
+        }
         self.clock = clock;
         if self.next.is_some_and(|next| ts < next) {
             self.late_drops += 1;
@@ -467,6 +516,12 @@ impl JitterBuffer {
         }
     }
 
+    /// The next packet to play.
+    #[cfg(test)]
+    pub(crate) fn head(&self) -> Option<u64> {
+        self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts))
+    }
+
     pub(crate) fn depth(&self) -> (usize, u64) {
         (self.packets.len(), self.packets.values().map(|p| p.samples).sum())
     }
@@ -499,6 +554,10 @@ impl JitterBuffer {
         self.arrivals.clear();
         self.last_shrink = None;
         self.last_attempt = None;
+        self.last_conceal = None;
+        // The evidence backoff outlives a source change: the path's delay does too.
+        self.backlog_since = None;
+        self.backlog_due = None;
         self.skipped = false;
         self.overflowed = false;
     }
@@ -526,6 +585,7 @@ impl JitterBuffer {
                 *ahead += samples as i64;
             }
             self.surplus = self.surplus.saturating_sub(samples as u64);
+            self.backlog_low = self.backlog_low.saturating_sub(samples as u64);
         }
     }
 
@@ -737,9 +797,9 @@ impl JitterBuffer {
     }
 
     /// Discard queued packets that start before `before`, oldest first, retaining at least `keep`
-    /// samples (by the queued packets' own durations). Returns whether any went; the window
-    /// restarts then.
-    fn trim(&mut self, before: u64, keep: u64, now: Instant) -> bool {
+    /// samples (by the queued packets' own durations), into `cut` if given. Returns whether any
+    /// went; the window restarts then.
+    fn trim(&mut self, before: u64, keep: u64, now: Instant, mut cut: Option<&mut Vec<Vec<u8>>>) -> bool {
         let mut depth = self.depth().1;
         let mut trimmed = false;
         while self.packets.len() > 1 {
@@ -751,6 +811,9 @@ impl JitterBuffer {
             depth -= packet.samples;
             self.shrink_samples += packet.samples;
             trimmed = true;
+            if let Some(cut) = cut.as_deref_mut() {
+                cut.push(packet.data);
+            }
         }
         if trimmed {
             self.next = self.packets.first_key_value().map(|(&ts, _)| ts);
@@ -761,6 +824,115 @@ impl JitterBuffer {
             self.above_since = None;
         }
         trimmed
+    }
+
+    /// A deep network queue that emptied gradually leaves its delay in the buffer without a
+    /// stall to recover from: a bloated uplink after a bulk upload stops arrives as a few
+    /// hundred milliseconds of audio early (docs/latency-congested-uplink.md). A surplus of
+    /// `BACKLOG_TRIM` proven for `backlog_evidence` (the window behind its first refill counts)
+    /// without a starvation makes a cut due (`cut_backlog`). A stall recovery acts instead.
+    /// A cut in progress (due, `cut_backlog`) continues while its surplus shrinks below
+    /// `BACKLOG_TRIM`: `backlog_low` follows the surplus down and bounds what is left to cut.
+    fn update_backlog(&mut self, now: Instant) {
+        #[cfg(test)]
+        if self.no_backlog_cut {
+            return;
+        }
+        // A starvation that began within the probe may resume after it (`push_at`).
+        if let Some(at) = self.backlog_cut
+            && now.saturating_duration_since(at) > BACKLOG_PROBE
+            && self.held == 0
+            && self.last_conceal.is_none_or(|conceal| conceal <= at)
+        {
+            self.backlog_evidence = DEPTH_WINDOW;
+            self.backlog_cut = None;
+        }
+        // Swells long gone (a few early ones on a Wi-Fi link, say) must not keep a later
+        // bloat for up to `MAX_BACKLOG_EVIDENCE`.
+        if self.backlog_evidence > DEPTH_WINDOW
+            && self.backlog_calm.is_some_and(|at| now.saturating_duration_since(at) >= BACKLOG_RELAX)
+        {
+            self.backlog_evidence = (self.backlog_evidence / 2).max(DEPTH_WINDOW);
+            self.backlog_calm = Some(now);
+        }
+        let starved = self.last_conceal.is_some_and(|at| now.saturating_duration_since(at) < self.backlog_evidence);
+        let cutting = self.backlog_due.is_some();
+        if self.recovering.is_some() || starved || (!cutting && self.surplus < BACKLOG_TRIM) {
+            self.backlog_since = None;
+            self.backlog_due = None;
+            return;
+        }
+        let since = match self.backlog_since {
+            Some(since) => {
+                self.backlog_low = self.backlog_low.min(self.surplus);
+                since
+            }
+            None => {
+                self.backlog_low = self.surplus;
+                *self.backlog_since.insert(now)
+            }
+        };
+        if now.saturating_duration_since(since) + DEPTH_WINDOW >= self.backlog_evidence {
+            self.backlog_due.get_or_insert(now);
+        }
+    }
+
+    /// What a due cut has left to take from the queue: all but `BACKLOG_KEEP` of the lowest
+    /// surplus the evidence saw, and never the jitter target or the next refill.
+    fn backlog_excess(&self) -> u64 {
+        let depth = self.depth().1;
+        let keep =
+            (depth + BACKLOG_KEEP).saturating_sub(self.backlog_low).max(self.target_samples() + self.last_samples);
+        depth.saturating_sub(keep)
+    }
+
+    /// Whether a due cut (`update_backlog`) can take the next packet, which is queued in order.
+    /// After a quiet frame the decoder takes it with `pop_for(now, 0)` and, if it decodes quiet
+    /// too, drops it (`dropped`); a loud one plays after the frame, as decode-ahead does. A cut
+    /// so removes only silence, and the decoder runs through all of it.
+    pub(crate) fn backlog_room(&self) -> bool {
+        self.backlog_due.is_some()
+            && self.recovering.is_none()
+            && self.next.and_then(|next| self.packets.get(&next)).is_some_and(|p| p.samples <= self.backlog_excess())
+    }
+
+    /// Commit a quiet packet a due cut dropped (`backlog_room`): debited like `shrunk`.
+    pub(crate) fn dropped(&mut self, now: Instant, samples: usize) {
+        self.shrunk(now, samples);
+        self.backlog_cut = Some(now);
+        if self.backlog_excess() < self.frame_samples() {
+            self.end_backlog_cut();
+        }
+    }
+
+    /// Finish a due cut (`update_backlog`) that has nothing left to take, or that waited
+    /// `BACKLOG_WAIT` for the quiet packets: then the oldest packets go at once, and the next
+    /// one fades in. Returns the packets cut so, oldest first, which the decoder must run
+    /// through to stay continuous.
+    pub(crate) fn cut_backlog(&mut self, now: Instant) -> Vec<Vec<u8>> {
+        let mut cut = Vec::new();
+        let Some(due) = self.backlog_due else { return cut };
+        let excess = self.backlog_excess();
+        if excess >= self.frame_samples() && now.saturating_duration_since(due) < BACKLOG_WAIT {
+            return cut;
+        }
+        if self.trim(u64::MAX, self.depth().1 - excess, now, Some(&mut cut)) {
+            self.skipped = true;
+            self.backlog_cut = Some(now);
+        }
+        self.end_backlog_cut();
+        cut
+    }
+
+    fn end_backlog_cut(&mut self) {
+        // Like `trim`, a cut restarts the window (`trim` already did if it cut).
+        if let Some(due) = self.backlog_due.take()
+            && self.backlog_cut.is_some_and(|at| at >= due)
+        {
+            self.clear_depth();
+            self.above_since = None;
+        }
+        self.backlog_since = None;
     }
 
     pub(crate) fn pop_at(&mut self, now: Instant) -> Playout {
@@ -785,12 +957,15 @@ impl JitterBuffer {
         // refill takes its demand, and the target stays behind it as the jitter reserve.
         if demand > 0 && std::mem::take(&mut self.overflowed) {
             let keep = self.target_samples() + demand as u64;
-            fade |= self.trim(u64::MAX, keep, now);
+            fade |= self.trim(u64::MAX, keep, now, None);
             // A pending stall recovery keeps its deadline (and its hold on the jitter estimate)
             // for the rest of a burst still arriving, but must not take the reserve back out.
             if let Some(recovery) = &mut self.recovering {
                 recovery.reserve = true;
             }
+        }
+        if demand > 0 {
+            self.update_backlog(now);
         }
         if let Some(recovery) = &self.recovering {
             // Only discard media that starts behind the stalled timeline's deadline. A packet
@@ -798,7 +973,7 @@ impl JitterBuffer {
             // delay that the fractional drain rarely removes before the next stall.
             let (before, target) = (recovery.before, self.target_samples());
             let keep = if recovery.reserve { target + demand as u64 } else { target.max(demand as u64) };
-            fade |= self.trim(before, keep, now);
+            fade |= self.trim(before, keep, now, None);
         }
         let Some(mut next) = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)) else {
             return Playout::Idle;
@@ -856,6 +1031,8 @@ impl JitterBuffer {
         } else {
             self.next = Some(next);
             self.held += if self.clock == Clock::Sequence { FRAME } else { self.last_samples };
+            // Starvation, unlike a hole with later packets queued (proven loss, not a dip).
+            self.last_conceal = Some(now);
             self.last_samples
         };
         self.missing = self.missing.saturating_add(samples);
@@ -1025,7 +1202,8 @@ mod tests {
     fn shrink_requires_a_full_window_after_startup_or_starvation() {
         let mut jb = JitterBuffer::new();
         let now = Instant::now();
-        for i in 0..10 {
+        // Under `BACKLOG_TRIM` of surplus: the gentle shrink, not a cut.
+        for i in 0..6 {
             jb.push_at(i * FRAME, FRAME, vec![1], now, Clock::Rtp);
         }
         for ms in (0..5000).step_by(20) {
@@ -1038,7 +1216,7 @@ mod tests {
         assert_eq!(jb.pop_for(loss, FRAME as usize), Playout::Conceal(960));
         jb.arrival = None;
         let next = jb.next.unwrap();
-        for i in 0..10 {
+        for i in 0..6 {
             jb.push_at(next + i * FRAME, FRAME, vec![1], loss, Clock::Rtp);
         }
         // The zero low-water sample stays in the entire trailing window.
@@ -1440,6 +1618,206 @@ mod tests {
         }
     }
 
+    /// A stream of `packet_ms` packets for `seconds` through a network queue of `queue(sent)` ms,
+    /// in order, without the packets `lost` picks. Returns the mean delay from send to playout
+    /// per second of playout and the concealments. Cuts commit as the decoder does: in quiet
+    /// audio 5 ms shrinks and backlog cuts at once; in `speech` (no quiet frame, no correlated
+    /// period) only forced ones.
+    fn path(
+        clock: Clock,
+        packet_ms: u64,
+        seconds: usize,
+        queue: impl Fn(f64) -> f64,
+        lost: impl Fn(usize) -> bool,
+        speech: bool,
+        cut: bool,
+    ) -> (Vec<f64>, u64) {
+        let mut jb = JitterBuffer::new();
+        jb.no_backlog_cut = !cut;
+        let (delays, concealments, _) = path_from(jb, Instant::now(), clock, packet_ms, seconds, queue, lost, speech);
+        (delays, concealments)
+    }
+
+    /// `path` from `jb` and `start`, which it returns at the end.
+    #[allow(clippy::too_many_arguments)]
+    fn path_from(
+        mut jb: JitterBuffer,
+        start: Instant,
+        clock: Clock,
+        packet_ms: u64,
+        seconds: usize,
+        queue: impl Fn(f64) -> f64,
+        lost: impl Fn(usize) -> bool,
+        speech: bool,
+    ) -> (Vec<f64>, u64, JitterBuffer) {
+        let samples = packet_ms * 48;
+        let stride = if clock == Clock::Sequence { FRAME } else { samples };
+        let mut last = 0.0_f64;
+        let arrivals: Vec<f64> = (0..(seconds as u64 + 1) * 1000 / packet_ms)
+            .map(|k| {
+                let sent = (k * packet_ms) as f64;
+                last = last.max(sent + 5.0 + queue(sent));
+                last
+            })
+            .collect();
+        let (mut index, mut play, mut now_ms) = (0, 0u64, 10.0);
+        let mut delays = vec![(0.0, 0u32); seconds];
+        let mut concealments = 0;
+        while now_ms < (seconds * 1000) as f64 {
+            while arrivals.get(index).is_some_and(|&at| at <= now_ms) {
+                let at = start + Duration::from_secs_f64(arrivals[index] / 1000.0);
+                if !lost(index) {
+                    jb.push_at(index as u64 * stride, samples, vec![1], at, clock);
+                }
+                index += 1;
+            }
+            let now = start + Duration::from_secs_f64(now_ms / 1000.0);
+            let head = jb.next.unwrap_or(0) / stride;
+            play += match jb.pop_at(now) {
+                Playout::Packet { skip, quiet_only, .. } => {
+                    let skip = if speech && quiet_only { 0 } else { skip.min(240) };
+                    jb.shrunk(now, skip);
+                    jb.cut_backlog(now);
+                    while !speech && jb.backlog_room() {
+                        let Playout::Packet { .. } = jb.pop_for(now, 0) else { break };
+                        jb.dropped(now, samples as usize);
+                    }
+                    let second = &mut delays[(now_ms / 1000.0) as usize];
+                    *second = (second.0 + now_ms - (head * packet_ms) as f64, second.1 + 1);
+                    samples - skip as u64
+                }
+                Playout::Conceal(samples) => {
+                    concealments += 1;
+                    samples as u64
+                }
+                Playout::Idle => samples,
+            };
+            now_ms = 10.0 + play as f64 / 48.0;
+        }
+        (delays.iter().map(|&(sum, n)| if n > 0 { sum / f64::from(n) } else { f64::NAN }).collect(), concealments, jb)
+    }
+
+    /// 40 s of 10 ms packets through a queue that fills to `peak_ms` from 5 s to 6 s, holds
+    /// until 15 s and empties by 15.4 s; with `lossy`, every 150th packet sent after that is
+    /// lost. Quiet audio.
+    fn bloated(clock: Clock, peak_ms: f64, lossy: bool) -> (Vec<f64>, u64) {
+        let queue = move |sent: f64| match sent {
+            t if t < 5_000.0 => 0.0,
+            t if t < 6_000.0 => peak_ms * (t - 5_000.0) / 1_000.0,
+            t if t < 15_000.0 => peak_ms,
+            t if t < 15_400.0 => peak_ms * (15_400.0 - t) / 400.0,
+            _ => 0.0,
+        };
+        path(clock, 10, 40, queue, |index| lossy && index > 1540 && index % 150 == 0, false, true)
+    }
+
+    /// Delay that swells by `peak_ms` every `period_ms` from 2 s: it rises over 300 ms, holds for
+    /// 500 ms and recedes over 400 ms (a contended Wi-Fi or cellular link, say).
+    fn swells(period_ms: f64, peak_ms: f64) -> impl Fn(f64) -> f64 {
+        move |sent: f64| match (sent - 2_000.0).rem_euclid(period_ms) {
+            _ if sent < 2_000.0 => 0.0,
+            x if x < 300.0 => peak_ms * x / 300.0,
+            x if x < 800.0 => peak_ms,
+            x if x < 1_200.0 => peak_ms * (1_200.0 - x) / 400.0,
+            _ => 0.0,
+        }
+    }
+
+    #[test]
+    fn a_deep_queue_that_empties_leaves_no_delay_behind() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let (delay, _) = bloated(clock, 400.0, false);
+            let before = delay[3];
+            assert!(before < 40.0, "{clock:?}: {before:.1} ms before");
+            // While the queue holds, playout follows it.
+            assert!(delay[12] > 380.0, "{clock:?}: {:.1} ms in the queue", delay[12]);
+            // The window proves the surplus five seconds after the queue empties; the cut then
+            // takes all but a 40 ms cushion, which the gentle shrink drains after another window
+            // (here 10 ms/s, quiet cuts). The gentle shrink alone kept over 300 ms at 40 s.
+            for (second, &ms) in delay.iter().enumerate().skip(22) {
+                let limit = before + if second < 32 { 50.0 } else { 15.0 };
+                assert!(ms <= limit, "{clock:?}: {ms:.1} ms at {second} s, {before:.1} ms before");
+            }
+            // A queue the gentle shrink can drain is left to it.
+            let (small, _) = bloated(clock, 60.0, false);
+            assert!(small[39] <= small[3] + 15.0, "{clock:?}: {:.1} ms after a 60 ms queue", small[39]);
+            // Proven loss is no starvation: a lossy stream is cut too.
+            let (lossy, _) = bloated(clock, 400.0, true);
+            for (second, &ms) in lossy.iter().enumerate().skip(22) {
+                let limit = before + if second < 32 { 50.0 } else { 15.0 };
+                assert!(ms <= limit, "{clock:?}: {ms:.1} ms at {second} s with recurring loss");
+            }
+        }
+    }
+
+    #[test]
+    fn delay_that_swells_and_recedes_keeps_its_cushion() {
+        // Without the backoff every swell rarer than the window was cut after and underran
+        // again: 3--7 times the concealment of no cuts at all, for 15--25 ms less delay.
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            for speech in [false, true] {
+                for (period, peak) in [(8_000.0, 150.0), (8_000.0, 250.0), (10_000.0, 150.0), (10_000.0, 250.0)] {
+                    let run = |cut| path(clock, 20, 120, swells(period, peak), |_| false, speech, cut).1;
+                    let (with, without) = (run(true), run(false));
+                    // The first cut after a swell can cost the next swell's PLC; then the
+                    // evidence outgrows the period.
+                    let swell = (peak / 20.0) as u64 + 2;
+                    assert!(
+                        with <= without + swell,
+                        "{clock:?} speech {speech} {period} ms / {peak} ms: {with} PLC, {without} without cuts"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_starvation_that_begins_within_the_probe_backs_off_when_it_ends_after() {
+        // 300 ms of queue that empties by 3.4 s: cuts follow one and two windows later (the
+        // first takes what the window behind it proved).
+        let bloat = |sent: f64| match sent {
+            t if t < 3_000.0 => 300.0,
+            t if t < 3_400.0 => 300.0 * (3_400.0 - t) / 400.0,
+            _ => 0.0,
+        };
+        let start = Instant::now();
+        let (_, _, jb) = path_from(JitterBuffer::new(), start, Clock::Rtp, 20, 16, bloat, |_| false, false);
+        let cut = jb.backlog_cut.expect("no backlog cut").duration_since(start).as_secs_f64() * 1000.0;
+        // Delivery stalls for 360 ms from `from` ms after the cut: playout starves before the
+        // probe ends and the late packets come after it, or all of it comes after.
+        for (from, doubled) in [(9_700.0, true), (10_400.0, false)] {
+            let resume = cut + from + 360.0;
+            let stall = move |sent: f64| {
+                let delay = bloat(sent);
+                if (cut + from..resume).contains(&(sent + delay)) { resume - sent } else { delay }
+            };
+            let (_, concealments, jb) =
+                path_from(JitterBuffer::new(), start, Clock::Rtp, 20, 30, stall, |_| false, false);
+            assert!(concealments > 0);
+            let evidence = jb.backlog_evidence;
+            // A starvation that begins 10 s after the cut proves nothing about it.
+            let expected = if doubled { 2 * DEPTH_WINDOW } else { DEPTH_WINDOW };
+            assert_eq!(evidence, expected, "stall from {from} ms after the cut");
+        }
+    }
+
+    #[test]
+    fn the_backlog_evidence_relaxes_a_minute_after_it_grew_or_playout_starved() {
+        // Swells long gone left the evidence at its maximum; a steady path follows. A stall at
+        // 50 s (a starvation) restarts the clock.
+        for (stall, expected) in [(false, 20), (true, 40)] {
+            let start = Instant::now();
+            let mut jb = JitterBuffer::new();
+            jb.backlog_evidence = MAX_BACKLOG_EVIDENCE;
+            jb.backlog_calm = Some(start);
+            let path =
+                move |sent: f64| if stall && (50_000.0..50_300.0).contains(&sent) { 50_300.0 - sent } else { 0.0 };
+            let (_, concealments, jb) = path_from(jb, start, Clock::Rtp, 20, 130, path, |_| false, false);
+            assert_eq!(concealments > 0, stall);
+            assert_eq!(jb.backlog_evidence, Duration::from_secs(expected), "stall {stall}");
+        }
+    }
+
     #[test]
     fn a_jittery_backlog_drains_when_refill_times_wander() {
         // Live refills run whenever the playback loop wakes, never on an exact grid. The arrival
@@ -1462,7 +1840,8 @@ mod tests {
         let mut jb = JitterBuffer::new();
         let now = Instant::now();
         let mut ts = 0;
-        for _ in 0..40 {
+        // Under `BACKLOG_TRIM` of surplus, which is cut without a proposal.
+        for _ in 0..10 {
             jb.push_at(ts, 480, vec![1], now, Clock::Rtp);
             ts += 480;
         }

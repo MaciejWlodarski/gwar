@@ -17,6 +17,7 @@ import { deriveSpec, resolveQuality, type ScreenSpec, type ResolvedSpec } from "
 import type { ScreenSurface } from "../proto/ScreenSurface";
 import { uplinkVideoBudget } from "./screen-headroom";
 import { screenStartBitrate, withScreenStartBitrate } from "./screen-start-bitrate";
+import { answerCodecs, codecFamily, fallbackCodec, FIRST_ENCODE_TIMEOUT_MS, firstFrameProgress, leadHinted, restrictAnswer, sourceFrames, type SendCodec } from "./screen-first-frame";
 export { MIN_BITRATE } from "./screen-headroom";
 
 /** Receive slots of a watch transport (`gwar_proto::SCREEN_SLOTS`). */
@@ -567,6 +568,9 @@ type OutboundVideo = RTCOutboundRtpStreamStats & {
   powerEfficientEncoder?: boolean;
 };
 
+/** One wait of the first-frame guard; `since` is the source's frame count when it began, if known. */
+type FirstFrameCheck = { pc: RTCPeerConnection; timer: ReturnType<typeof setTimeout> | null; since: number | undefined };
+
 /** Start after the answer is applied: allow 15 s to connect, then 5 s disconnected. */
 function watchState(pc: RTCPeerConnection, report: (state: TransportState) => void, alive: () => boolean): () => void {
   let disconnect: ReturnType<typeof setTimeout> | null = null;
@@ -602,6 +606,8 @@ export interface PublishParams {
   state(state: TransportState): void;
   /** Capture ended, including a page-initiated stop that emits no `ended` event. */
   ended?(): void;
+  /** Connected but nothing encoded, even after the first-frame guard's recovery; once per share. */
+  encodeFailed?(): void;
 }
 
 /**
@@ -658,6 +664,16 @@ export class ScreenPublisher {
   private sendCodec: RTCRtpCodec | null = null;
   private softwareAv1 = 0;
   private readonly ceiling: { width: number; height: number; known: boolean };
+  /** The current transport's answer as the server sent it (minus avoided codecs), and whether it got the start hint. */
+  private answer: { pc: RTCPeerConnection; sdp: string; hinted: boolean; ssrcs: { ssrc: number; rtx_ssrc: number } } | null = null;
+  /** The first-frame guard's wait on the current transport; kept after a frame, so a reconnect does not rearm it. */
+  private encodeCheck: FirstFrameCheck | null = null;
+  /** Within this share only (memory, never stored): a transport with the start hint encoded nothing. */
+  private startHintUnsafe = false;
+  /** Codecs that encoded nothing within this share; one codec fallback per share. */
+  private readonly brokenCodecs = new Set<SendCodec>();
+  private codecFellBack = false;
+  private encodeGaveUp = false;
   /** A page going away stops lifts and restore retries; its transport closes with it, and superseded ones now. */
   private readonly pageHide = () => { this.endProbe(); this.endSuperseded(); };
 
@@ -703,12 +719,14 @@ export class ScreenPublisher {
     const sdp = pc.localDescription?.sdp ?? "";
     const ssrcs = publishSsrcs(sdp);
     if (!ssrcs) throw new Error("the publish offer has no video stream with RTX");
-    const answer = await this.params.offer({ ...ssrcs, sdp });
+    const answer = this.avoidBroken(await this.params.offer({ ...ssrcs, sdp }));
     if (this.closed || this.pc !== pc) return;
     // Resolve the latest spec after signalling, including edits made while the answer was pending.
-    await pc.setRemoteDescription({ type: "answer", sdp: withScreenStartBitrate(answer, screenStartBitrate(this.spec().maxBitrate)) });
+    const hinted = this.startHintUnsafe ? answer : withScreenStartBitrate(answer, screenStartBitrate(this.spec().maxBitrate));
+    await pc.setRemoteDescription({ type: "answer", sdp: hinted });
     if (this.closed || this.pc !== pc) return;
-    this.stopWatching = watchState(pc, s => this.params.state(s), () => this.pc === pc);
+    this.answer = { pc, sdp: answer, hinted: leadHinted(hinted), ssrcs };
+    this.stopWatching = watchState(pc, s => { if (s === "connected") this.expectFirstFrame(pc); this.params.state(s); }, () => this.pc === pc);
     // The latest quality: `setSpec` may have run while this negotiated.
     this.refreshSurface();
     await this.applyParameters(this.spec().maxBitrate);
@@ -881,6 +899,124 @@ export class ScreenPublisher {
       console.warn("Screen encoder: AV1 fell back to software and cannot switch to H.264");
       this.params.state("failed");
     }
+  }
+
+  /** A codec that encoded nothing earlier in this share stays out of the answer while another is negotiated. */
+  private avoidBroken(answer: string): string {
+    const codecs = answerCodecs(answer), usable = codecs.find(c => !this.brokenCodecs.has(c));
+    const restricted = usable && usable !== codecs[0] ? restrictAnswer(answer, usable) : null;
+    if (!restricted) return answer;
+    console.warn(`Screen sender: keeping ${usable}; ${codecs[0]} encoded nothing earlier in this share`);
+    return restricted;
+  }
+
+  /**
+   * The first-frame guard (docs/screen-share.md, "First encoded frame"). Once per transport, when
+   * it connects: no encoded frame `FIRST_ENCODE_TIMEOUT_MS` later, with the track live and
+   * unmuted and its source delivering frames, renegotiates in place without the start hint, then
+   * with the plan's next codec.
+   */
+  private expectFirstFrame(pc: RTCPeerConnection): void {
+    if (this.encodeCheck?.pc === pc || this.encodeGaveUp || this.closed) return;
+    this.waitFirstFrame(pc);
+  }
+
+  /** A wait whose source frame count starts at `since`, or at whatever the engine reports now. */
+  private waitFirstFrame(pc: RTCPeerConnection, since?: number): void {
+    const check: FirstFrameCheck = { pc, timer: null, since };
+    check.timer = setTimeout(() => void this.checkFirstFrame(check), FIRST_ENCODE_TIMEOUT_MS);
+    this.encodeCheck = check;
+    if (since !== undefined) return;
+    void pc.getStats().then(stats => {
+      if (this.encodeCheck === check && check.since === undefined) check.since = sourceFrames(stats, this.params.track.id);
+    }, () => {});
+  }
+
+  private endFirstFrame(): void {
+    if (this.encodeCheck?.timer) clearTimeout(this.encodeCheck.timer);
+    this.encodeCheck = null;
+  }
+
+  private async checkFirstFrame(check: FirstFrameCheck): Promise<void> {
+    check.timer = null;
+    const { pc } = check, track = this.params.track;
+    const current = () => !this.closed && this.pc === pc && this.encodeCheck === check && track.readyState === "live";
+    // An ended capture stops the share through `ended`.
+    if (!current()) return;
+    // A muted track delivers nothing to encode, and a disconnected transport cannot send: wait again.
+    if (track.muted || pc.connectionState !== "connected") { this.waitFirstFrame(pc); return; }
+    let progress: ReturnType<typeof firstFrameProgress>;
+    try { progress = firstFrameProgress(await pc.getStats(), track.id, check.since); }
+    catch { if (current()) this.waitFirstFrame(pc); return; } // Missing stats prove nothing.
+    if (!current() || progress.state === "encoded") return;
+    // A source that delivered no frame in the wait (a minimized window, a stalled permission
+    // prompt, static content) gave the encoder nothing to encode: wait again from here.
+    if (progress.state === "idle") { this.waitFirstFrame(pc, progress.frames); return; }
+    await this.recoverEncoding(pc);
+  }
+
+  /** One step per call: drop the start hint, then the next codec, then give up, at most once each per share. */
+  private async recoverEncoding(pc: RTCPeerConnection): Promise<void> {
+    const answer = this.answer;
+    if (!answer || answer.pc !== pc) return;
+    const codecs = answerCodecs(answer.sdp);
+    const codec = (this.sendCodec ? codecFamily(this.sendCodec.mimeType) : codecs[0]) ?? null;
+    const what = `no frame encoded ${FIRST_ENCODE_TIMEOUT_MS / 1000} s after connecting (codec ${codec ?? "unknown"}, start hint ${answer.hinted ? "on" : "off"})`;
+    let sdp: string | null = null, step = "";
+    if (answer.hinted && !this.startHintUnsafe) {
+      this.startHintUnsafe = true;
+      sdp = answer.sdp; step = "without the start-bitrate hint";
+    } else {
+      const next = this.codecFellBack ? null : fallbackCodec(codecs, codec, this.brokenCodecs);
+      if (next) {
+        this.codecFellBack = true;
+        if (codec) this.brokenCodecs.add(codec);
+        if (codec === "av1") this.av1Retired = true;
+        // An answer restricted to one codec cannot carry an in-place switch to another.
+        this.sendCodec = null; this.softwareAv1 = 0;
+        sdp = restrictAnswer(answer.sdp, next); step = `with ${next}`;
+      }
+    }
+    if (!sdp) { this.giveUpEncoding(`${what}; no fallback left`); return; }
+    console.warn(`Screen sender: ${what}; renegotiating ${step}`);
+    try {
+      if (!await this.renegotiate(pc, answer.ssrcs, sdp)) return;
+    } catch (e) {
+      if (this.closed || this.pc !== pc) return;
+      this.giveUpEncoding(`renegotiation ${step} failed: ${e instanceof Error ? e.message : String(e)}`);
+      return;
+    }
+    this.answer = { ...answer, sdp, hinted: false };
+    this.waitFirstFrame(pc);
+  }
+
+  /**
+   * The same transport, the server's own answer: a fresh local offer (same SSRCs, ICE and DTLS),
+   * then the stored answer as rewritten. The server negotiates once per share, and the SFU follows
+   * a codec change in place. libwebrtc rebuilds its encoder for the changed codec parameters;
+   * whether WebKitGTK's older GstWebRTC backend does is unverified; there the worst case is the stop.
+   */
+  private async renegotiate(pc: RTCPeerConnection, ssrcs: { ssrc: number; rtx_ssrc: number }, sdp: string): Promise<boolean> {
+    const stale = () => this.closed || this.pc !== pc;
+    this.negotiated = false;
+    await pc.setLocalDescription(await pc.createOffer());
+    if (stale()) return false;
+    const local = publishSsrcs(pc.localDescription?.sdp ?? "");
+    if (local?.ssrc !== ssrcs.ssrc || local.rtx_ssrc !== ssrcs.rtx_ssrc) throw new Error("the new offer changed the video SSRCs");
+    await pc.setRemoteDescription({ type: "answer", sdp });
+    if (stale()) return false;
+    await this.applyParameters(this.desired || this.spec().maxBitrate);
+    if (stale()) return false;
+    this.negotiated = true;
+    return true;
+  }
+
+  private giveUpEncoding(why: string): void {
+    this.encodeGaveUp = true;
+    this.endFirstFrame();
+    console.warn(`Screen sender: ${why}; stopping the share`);
+    if (this.params.encodeFailed) this.params.encodeFailed();
+    else this.params.state("failed");
   }
 
   private sampleOutcome(): void {
@@ -1105,6 +1241,7 @@ export class ScreenPublisher {
     this.endProbe();
     this.probe = new StaleEstimateProbe();
     this.recovery = plan;
+    this.endFirstFrame();
     this.stopWatching();
     const pc = this.pc; this.pc = null; this.sender = null; this.sent = null; this.adaptationSent = null;
     if (pc) this.superseded.add(pc);
@@ -1168,6 +1305,7 @@ export class ScreenPublisher {
     this.polling = null;
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    this.endFirstFrame();
     this.stopWatching();
     const pc = this.pc;
     this.pc = null;

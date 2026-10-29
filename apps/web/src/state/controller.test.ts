@@ -556,6 +556,54 @@ describe("TeamSpeak actions", () => {
   });
 });
 
+describe("where a connection opens", () => {
+  type Quiet = { conn: Link | null; connectionParams: unknown };
+  const ui = () => stores.useUi.getState();
+  // Where the person was: a settings tab, opened over the members of a conversation.
+  const inSettings = () => {
+    stores.useUi.setState({ section: "servers", pane: "members", overview: false });
+    ui().openSettings("account");
+  };
+
+  it("one the user asks for opens the server's channel list, the same server again after a drop too", async () => {
+    connectFake();
+    stores.useUi.setState({ section: "servers", pane: "members", overview: true });
+    await controller.disconnect(true);
+    expect(session().address).toBe("test");
+    inSettings();
+    const connect = vi.spyOn(controller, "connect").mockResolvedValue();
+    await controller.connectInteractive({ address: "test" }, { remember: false });
+    expect(connect).toHaveBeenCalled();
+    expect(ui()).toMatchObject({ section: "servers", pane: "list", overview: false });
+  });
+
+  it("a quiet reconnect for a renewed certificate stays where the person is, and keeps what belongs to them", async () => {
+    const { Connection } = await import("../net/connection");
+    const identity = (cert: string) => ({ nickname: "me", publicKey: "k", device: { certificate: cert } }) as unknown as import("../net/identity").Identity;
+    const c = controller as unknown as Quiet;
+    c.conn = Object.create(Connection.prototype, { identity: { value: identity("old") }, close: { value: () => {} } }) as Link;
+    c.connectionParams = { address: "test" };
+    inSettings();
+    const replaced = (await import("./identity")).useAccountIdentity.getState().replaced;
+    const connect = vi.spyOn(controller, "connect").mockImplementation(async () => {
+      session().dispatch({ type: "phase", phase: "connecting" });
+      session().dispatch({ type: "phase", phase: "online" });
+    });
+    await controller.replaceIdentityQuietly(identity("renewed"));
+    expect(connect).toHaveBeenCalledWith({ address: "test" });
+    expect(ui()).toMatchObject({ section: "settings", settingsTab: "account", settingsDrill: true, pane: "members" });
+    expect((await import("./identity")).useAccountIdentity.getState().replaced).toBe(replaced);
+  });
+
+  it("another identity counts as a replacement: signing in or out", async () => {
+    const { useAccountIdentity } = await import("./identity");
+    const before = useAccountIdentity.getState().replaced;
+    await controller.switchIdentity({ nickname: "someone", publicKey: "k2" } as unknown as import("../net/identity").Identity);
+    await controller.switchIdentity(null);
+    expect(useAccountIdentity.getState().replaced).toBe(before + 2);
+  });
+});
+
 describe("request errors", () => {
   it("say which part of a half-done change went through", async () => {
     const { RequestError } = await import("../net/connection");

@@ -554,10 +554,11 @@ class Controller {
   }
 
   /**
-   * Connect from the UI: tracks busy/error state for the connect screen and
-   * remembers the server as a bookmark on success. Returns true on success.
+   * Connect from the UI: opens the server view (`landOnServer`), tracks busy/error state for the connect screen
+   * and remembers the server as a bookmark on success. Returns true on success.
    */
   async connectInteractive(params: ConnectParams, opts: { remember: boolean }): Promise<boolean> {
+    useUi.getState().landOnServer();
     const ui = useConnectUi.getState();
     ui.set({ busy: true, error: null });
     try {
@@ -1118,9 +1119,14 @@ class Controller {
    */
   async switchIdentity(identity: Identity | null): Promise<void> {
     await this.disconnect(true);
+    this.adopt(identity, true);
+  }
+
+  /** Makes `identity` the app's (`null`: the local one, loaded again). `another`: not the same person's renewed one. */
+  private adopt(identity: Identity | null, another: boolean): void {
     this.identityLoading = null;
     this.identity = identity;
-    useAccountIdentity.setState({ nickname: identity?.nickname ?? "" });
+    useAccountIdentity.setState((s) => ({ nickname: identity?.nickname ?? "", replaced: s.replaced + (another ? 1 : 0) }));
   }
 
   /** Nickname-only updates keep the connection; renewed credentials restart the MLS session. */
@@ -1130,9 +1136,8 @@ class Controller {
     const reconnect = changed ? this.connectionParams : null;
     const channel = myChannelId(s);
     if (reconnect) await this.disconnect(true);
-    this.identityLoading = null;
-    this.identity = identity;
-    useAccountIdentity.setState({ nickname: identity?.nickname ?? "" });
+    this.adopt(identity, false);
+    // Not `connectInteractive`: nobody asked to go anywhere, so the app stays where it is (Settings, say).
     if (reconnect) {
       await this.connect(reconnect);
       if (channel !== null) await this.rejoinVoice(channel);
@@ -1143,9 +1148,7 @@ class Controller {
   async importIdentity(text: string): Promise<void> {
     const identity = await importIdentity(text);
     await this.disconnect(true);
-    this.identityLoading = null;
-    this.identity = identity;
-    useAccountIdentity.setState({ nickname: identity?.nickname ?? "" });
+    this.adopt(identity, true);
   }
 
   // --------------------------------------------------------------- requests

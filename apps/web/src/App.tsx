@@ -34,7 +34,6 @@ export function App() {
   const phase = useSession((s) => s.phase);
   const serverName = useSession((s) => s.server?.name);
   const unread = useServerUnread();
-  const address = useSession((s) => s.address);
   const section = useUi((s) => s.section);
   const covered = section !== "servers";
   // With a share on stage the stage wins; the overview waits until it closes.
@@ -55,12 +54,6 @@ export function App() {
   useEffect(() => {
     document.title = `${unread > 0 ? `(${unread}) ` : ""}${showApp && serverName ? `${serverName} · ` : ""}Gwar`;
   }, [unread, serverName, showApp]);
-
-  // Another server opens on its chat (phones: on its channel list); the overview is a place to go, not a landing page.
-  useEffect(() => {
-    useUi.getState().showChat();
-    useUi.getState().setPane("list");
-  }, [address]);
 
   useEffect(() => {
     if (!isMobile) useUi.getState().setMore(false);
