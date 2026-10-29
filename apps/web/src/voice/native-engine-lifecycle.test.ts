@@ -267,3 +267,41 @@ describe("native encrypted runs", () => {
     await vi.waitFor(() => expect(stops()).toBe(before + 1));
   });
 });
+
+describe("native device changes", () => {
+  it("moves running voice to a chosen device without renegotiating", async () => {
+    const view = engine();
+    await view.start(params());
+    bridge.invoke.mockClear();
+    await view.setInputDevice("USB mic");
+    await view.setOutputDevice(null);
+    await view.setOutputDevice("Headphones");
+    const devices = () => bridge.invoke.mock.calls.filter(([command]) => command === "voice_set_devices");
+    await vi.waitFor(() => expect(devices()).toHaveLength(2));
+    expect(devices()).toEqual([
+      ["voice_set_devices", { input: "USB mic", output: null, owner: 1 }],
+      ["voice_set_devices", { input: "USB mic", output: "Headphones", owner: 1 }],
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    expect(bridge.invoke).not.toHaveBeenCalledWith("voice_start", expect.anything());
+  });
+
+  it("tells the user where audio moved and clears a problem that is over", async () => {
+    const view = engine();
+    const switched = vi.fn();
+    const micError = vi.fn();
+    const outputError = vi.fn();
+    view.on("deviceSwitched", switched);
+    view.on("micError", micError);
+    view.on("outputError", outputError);
+    await view.start(params());
+    micError.mockClear();
+    outputError.mockClear();
+    emit("voice://device", { owner: 1, side: "input", kind: "switched", device: "MacBook mic" });
+    emit("voice://device", { owner: 1, side: "output", kind: "recovered", device: null });
+    emit("voice://device", { owner: 0, side: "input", kind: "switched", device: "Obsolete" });
+    expect(switched).toHaveBeenCalledExactlyOnceWith({ side: "input", label: "MacBook mic" });
+    expect(outputError).toHaveBeenCalledExactlyOnceWith(null);
+    expect(micError).not.toHaveBeenCalled();
+  });
+});
