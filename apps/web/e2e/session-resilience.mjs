@@ -188,6 +188,12 @@ try {
     const status = page.getByText("Głos niedostępny", { exact: true });
     assert.equal(await status.count(), 1, "one compact unavailable status");
     assert(await status.evaluate(el => el.scrollWidth <= el.clientWidth), "the complete status fits");
+    assert(await page.getByRole("button", { name: "Dlaczego?", exact: true }).evaluate(button => {
+      const row = button.parentElement.parentElement, panel = row.parentElement;
+      const name = panel.querySelector("span.truncate.text-sm.font-semibold");
+      const retry = [...row.querySelectorAll("button")].find(el => el.textContent === "Ponów");
+      return name && name.scrollWidth <= name.clientWidth && retry && retry.getBoundingClientRect().top >= row.getBoundingClientRect().top;
+    }), "the full name fits and Retry belongs to the status row");
     await snap(`voice-unavailable-${size}`);
     await page.getByRole("button", { name: "Dlaczego?", exact: true }).click();
     await page.getByRole("dialog").waitFor();

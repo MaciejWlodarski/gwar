@@ -228,6 +228,26 @@ describe("session resilience", () => {
     expect(settings.useSettings.getState()).toMatchObject({ selfMuted: false, selfDeafened: false });
   });
 
+  it.each(["mute", "deafen"] as const)("applies live %s and server presence before a quota failure, without throwing", control => {
+    connectFake({ channel: 1 });
+    const previous = settings.useSettings.persist.getOptions().storage;
+    const error = new DOMException("Storage full", "QuotaExceededError");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const write = vi.fn(() => {
+      if (control === "mute") expect(engine.setMuted).toHaveBeenLastCalledWith(true);
+      else expect(engine.setDeafened).toHaveBeenLastCalledWith(true);
+      expect(stores.useVoice.getState()).toMatchObject({ muted: control === "mute", deafened: control === "deafen" });
+      expect(link.sent("client.update").at(-1)?.d).toEqual({ muted: control === "mute", deafened: control === "deafen" });
+      throw error;
+    });
+    settings.useSettings.persist.setOptions({ storage: { getItem: () => null, setItem: write, removeItem: () => {} } });
+    try {
+      expect(() => control === "mute" ? controller.setMuted(true) : controller.setDeafened(true)).not.toThrow();
+      expect(write).toHaveBeenCalledOnce();
+      expect(warn).toHaveBeenCalledWith("Could not save voice preferences:", error);
+    } finally { settings.useSettings.persist.setOptions({ storage: previous }); warn.mockRestore(); }
+  });
+
   it("requests persistent storage once on welcome; refusal does not break the session or reconnect", async () => {
     const persist = vi.fn(async () => { throw new Error("denied"); });
     const nav = globalThis.navigator;
@@ -546,12 +566,71 @@ describe("session resilience", () => {
     expect(engine.start).toHaveBeenCalledTimes(2);
   });
 
+  it.each(["gwar", "teamspeak"] as const)("preserves a permanent refusal through %s recovery until explicit Retry rejoins the target", async kind => {
+    const { VoiceError } = await import("../voice/engine");
+    engine.start.mockRejectedValue(new VoiceError("unsupported", "permanent refusal"));
+    connectFake({ channel: 2, kind }); await vi.advanceTimersByTimeAsync(0);
+    const reason = stores.useVoice.getState().failure;
+    expect(reason).not.toBeNull();
+    engine.stop.mockImplementationOnce(async () => { engine.emitState("idle"); });
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stores.useVoice.getState()).toMatchObject({ state: "failed", failure: reason, reconnecting: false });
+    link.welcomeNow(welcome({ session: 9, uid: "u1", channels: [chan(1), chan(2), chan(3)], clients: [client(9, kind === "teamspeak" ? 1 : null, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(engine.start).toHaveBeenCalledOnce();
+    expect(link.sent("channel.join")).toHaveLength(0);
+    expect(stores.useVoice.getState()).toMatchObject({ state: "failed", failure: reason, reconnecting: false });
+    expect(stores.useUi.getState().toasts).toHaveLength(0);
+    engine.start.mockResolvedValue(undefined); controller.retryVoice(); await vi.advanceTimersByTimeAsync(0);
+    expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 2, password: null });
+    expect(engine.start).toHaveBeenCalledOnce();
+    link.emit({ ev: "client.updated", d: client(9, 3, { uid: "u1" }) });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(engine.start).toHaveBeenCalledOnce();
+    expect(stores.useVoice.getState().failure).toBe(reason);
+    link.emit({ ev: "client.updated", d: client(9, 2, { uid: "u1" }) });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(engine.start).toHaveBeenCalledTimes(2);
+    expect(stores.useVoice.getState().failure).toBeNull();
+  });
+
+  it.each([1, 2])("only explicit channel entry resets a permanent refusal after a server move (target %s)", async target => {
+    const { VoiceError } = await import("../voice/engine");
+    engine.start.mockRejectedValue(new VoiceError("insecure", "permanent refusal"));
+    connectFake({ channel: 1 }); await vi.advanceTimersByTimeAsync(0);
+    const reason = stores.useVoice.getState().failure;
+    link.emit({ ev: "client.updated", d: client(1, 2) });
+    await vi.advanceTimersByTimeAsync(0);
+    engine.emitState("connected"); // A stale engine callback is not explicit consent to Retry.
+    expect(engine.start).toHaveBeenCalledOnce();
+    expect(stores.useVoice.getState()).toMatchObject({ state: "failed", failure: reason });
+    engine.start.mockResolvedValue(undefined);
+    await controller.joinChannelInteractive(target);
+    if (target !== 2) link.emit({ ev: "client.updated", d: client(1, target) });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(engine.start).toHaveBeenCalledTimes(2);
+    expect(stores.useVoice.getState().failure).toBeNull();
+  });
+
   it("a browser unable to encrypt stays unavailable, with a reason and no automatic retry", async () => {
     engine.capabilities.encryptedVoice = async () => false;
     connectFake({ channel: 2, encrypted: [2] }); await vi.advanceTimersByTimeAsync(0);
     expect(stores.useVoice.getState()).toMatchObject({ state: "failed", reconnecting: false, failure: "Update your browser or use the desktop app to join encrypted voice." });
     expect(stores.useUi.getState().toasts).toHaveLength(0);
     await vi.advanceTimersByTimeAsync(120_000); expect(engine.start).not.toHaveBeenCalled();
+    const reason = stores.useVoice.getState().failure;
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    await vi.advanceTimersByTimeAsync(0);
+    link.welcomeNow(welcome({ session: 9, uid: "u1", channels: [chan(2, { encrypted: true })], clients: [client(9, null, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(link.sent("channel.join")).toHaveLength(0);
+    expect(stores.useVoice.getState()).toMatchObject({ state: "failed", failure: reason });
+    controller.retryVoice(); await vi.advanceTimersByTimeAsync(0);
+    controller.retryVoice(); await vi.advanceTimersByTimeAsync(0);
+    expect(stores.useVoice.getState()).toMatchObject({ state: "failed", failure: reason, reconnecting: false });
+    expect(stores.useUi.getState().toasts).toHaveLength(0);
+    expect(engine.start).not.toHaveBeenCalled();
   });
 
   it("announces starting while the encryption capability probe is still pending", async () => {

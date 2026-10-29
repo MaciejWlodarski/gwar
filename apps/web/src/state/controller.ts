@@ -277,6 +277,8 @@ class Controller {
     const e = this.engine;
     e.on("level", (level) => useVoice.getState().set({ level }));
     e.on("state", (state) => {
+      // Transport teardown/recovery cannot dismiss a refusal awaiting explicit voice entry.
+      if (!this.voiceRetryAllowed) { useVoice.getState().set({ state: "failed" }); return; }
       useVoice.getState().set({ state });
       if (state === "failed") this.scheduleVoiceRetry();
       if (state === "connected") {
@@ -1105,7 +1107,7 @@ class Controller {
   private async startVoice(): Promise<void> {
     const conn = this.conn;
     // Nothing to do (and no microphone prompt) while I am only on the server.
-    if (!conn || !this.voiceAutoStart || myChannelId(useSession.getState()) === null) return;
+    if (!conn || !this.voiceAutoStart || !this.voiceRetryAllowed || myChannelId(useSession.getState()) === null) return;
     const state = useSession.getState();
     const channel = myChannelId(state)!;
     const encrypted = !!state.channels[channel]?.encrypted;
@@ -1191,13 +1193,12 @@ class Controller {
     this.voiceRetry = null;
     this.voiceRetries = 0;
     this.voiceErrorShown = false;
-    this.voiceRetryAllowed = true;
-    useVoice.getState().set({ reconnecting: false, failure: null });
+    useVoice.getState().set({ reconnecting: false, ...(this.voiceRetryAllowed ? { failure: null } : {}) });
     // Leaving, moving or losing the session discards the call's pin and state.
     this.endVoiceCall();
     await this.engine.stop();
     if (run !== this.voiceRun) return;
-    useVoice.getState().set({ state: "idle", level: 0, pttActive: false, micError: null });
+    useVoice.getState().set({ state: this.voiceRetryAllowed ? "idle" : "failed", level: 0, pttActive: false, micError: null });
   }
 
   /** Whether I can leave voice without leaving the server (not on TeamSpeak). */
@@ -1215,6 +1216,7 @@ class Controller {
   }
 
   private async rejoinVoice(channel: number): Promise<void> {
+    if (!this.voiceRetryAllowed) { this.voiceRetryChannel = channel; return; }
     const s = useSession.getState();
     const info = s.channels[channel], password = this.channelPasswords.get(channel);
     if (!info || (info.has_password && !password && !s.permissions.includes("bypass_password"))) return;
@@ -1251,6 +1253,7 @@ class Controller {
       return;
     }
     this.voiceAutoStart = true;
+    this.voiceRetryAllowed = true;
     await this.startVoice();
   }
 
@@ -1282,13 +1285,12 @@ class Controller {
 
   retryVoice(): void {
     this.pendingVoiceEntry = null;
-    this.voiceRetryAllowed = true;
     if (this.voiceRetry) clearTimeout(this.voiceRetry);
     this.voiceRetry = null;
     if (!this.conn?.isOnline) return;
     const channel = this.voiceRetryChannel;
     if (channel !== null && !useSession.getState().channels[channel]) this.voiceChannelRemoved();
-    else if (channel !== null && myChannelId(useSession.getState()) === null) void this.joinChannelInteractive(channel);
+    else if (channel !== null && myChannelId(useSession.getState()) !== channel) void this.joinChannelInteractive(channel);
     else void this.enableVoice();
   }
 
@@ -1303,6 +1305,7 @@ class Controller {
     if (retry) this.scheduleVoiceRetry();
     else {
       this.voiceRetryAllowed = false;
+      this.voiceRetryChannel = myChannelId(useSession.getState());
       if (this.voiceRetry) clearTimeout(this.voiceRetry);
       this.voiceRetry = null;
       useVoice.getState().set({ reconnecting: false });
@@ -1332,11 +1335,11 @@ class Controller {
     const v = useVoice.getState();
     // Unmuting while deafened also undeafens (like most voice apps).
     const deafened = muted ? v.deafened : false;
-    useSettings.getState().setSelfVoice(muted, deafened);
-    v.set({ muted, deafened });
     this.engine.setMuted(muted);
     this.engine.setDeafened(deafened);
+    v.set({ muted, deafened });
     void this.pushMuteState();
+    this.saveSelfVoice(muted, deafened);
   }
 
   toggleMute(): void {
@@ -1345,10 +1348,16 @@ class Controller {
   }
 
   setDeafened(deafened: boolean): void {
-    useSettings.getState().setSelfVoice(useVoice.getState().muted, deafened);
-    useVoice.getState().set({ deafened });
     this.engine.setDeafened(deafened);
+    useVoice.getState().set({ deafened });
     void this.pushMuteState();
+    this.saveSelfVoice(useVoice.getState().muted, deafened);
+  }
+
+  /** Storage is best effort; a full disk must never prevent live privacy controls. */
+  private saveSelfVoice(muted: boolean, deafened: boolean): void {
+    try { useSettings.getState().setSelfVoice(muted, deafened); }
+    catch (error) { console.warn("Could not save voice preferences:", error); }
   }
 
   toggleDeafen(): void {
@@ -1462,7 +1471,13 @@ class Controller {
       const refusal = await this.encryptedVoiceRefusal();
       // A newer join, move or connection makes this one obsolete.
       if (!bound.current() || attempt !== this.joinAttempt) return bound.current();
-      if (refusal) { useUi.getState().toast("info", refusal); return true; }
+      if (refusal) {
+        if (useVoice.getState().failure) {
+          this.voiceFailure(refusal, false);
+          this.voiceRetryChannel = channel;
+        } else useUi.getState().toast("info", refusal);
+        return true;
+      }
       // The server admits only devices already in the channel's group: join it first (a new
       // channel's group is otherwise joined in the background, after a random wait).
       const runtime = this.runtime;
@@ -1475,7 +1490,7 @@ class Controller {
       }
     } else this.joinAttempt++;
     // Silent sessions authorize the chosen channel only after the server places us there.
-    const entry = explicit && !this.voiceAutoStart ? { conn: bound.conn, channel } : null;
+    const entry = explicit && (!this.voiceAutoStart || !this.voiceRetryAllowed) ? { conn: bound.conn, channel } : null;
     if (explicit) this.pendingVoiceEntry = entry;
     useUi.getState().setJoining(channel);
     try {
@@ -1524,7 +1539,10 @@ class Controller {
     const pending = useUi.getState().joining;
     if ((myChannelId(useSession.getState()) === channel && (pending === null || pending === channel)) || this.isLockedForMe(channel)) {
       this.joinAttempt++; // staying where I am supersedes a pending encrypted join
-      if (!this.voiceAutoStart && myChannelId(useSession.getState()) === channel) this.retryVoice();
+      if ((!this.voiceAutoStart || !this.voiceRetryAllowed) && myChannelId(useSession.getState()) === channel) {
+        this.voiceRetryChannel = channel;
+        this.retryVoice();
+      }
       return;
     }
     // Without a typed password first: only the server knows whether I may skip it (a TeamSpeak

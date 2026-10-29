@@ -233,5 +233,18 @@ it("keeps permanent refusal compact, with an on-demand reason and manual Retry",
   await click(dialog.querySelector('button[aria-label="Close"]')!);
   expect(document.querySelector('[role="dialog"]')).toBeNull();
   const retry = [...container.querySelectorAll("button")].find(button => button.textContent === "Retry");
+  expect(retry!.parentElement!.textContent).toContain("Why?");
+  await click(retry!); expect(mock.retryVoice).toHaveBeenCalledOnce();
+});
+
+it("keeps the refusal and Retry available while network recovery leaves me outside voice", async () => {
+  online();
+  useSession.getState().dispatch({ type: "event", now: Date.now(), event: { ev: "client.updated", d: { ...useSession.getState().clients[1]!, channel: null, voice_binding: null } } });
+  useVoice.setState({ state: "failed", reconnecting: false, failure: "Unsupported voice" });
+  await render(<VoicePanel />);
+  expect(container.textContent).toContain("Voice unavailable");
+  expect(container.textContent).not.toContain("Not in voice");
+  expect(container.querySelector('button[aria-label="Leave voice"]')).toBeNull();
+  const retry = [...container.querySelectorAll("button")].find(button => button.textContent === "Retry");
   await click(retry!); expect(mock.retryVoice).toHaveBeenCalledOnce();
 });

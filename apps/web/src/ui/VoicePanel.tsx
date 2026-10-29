@@ -171,7 +171,7 @@ export function VoicePanel() {
   const member = useSession((s) => (s.me ? s.members[s.me.uid] : undefined));
   const { status, tone } = useVoiceStatus();
 
-  if (me && me.channel === null) {
+  if (me && me.channel === null && !failure) {
     return (
       <div className="m-2 mt-1 rounded-xl bg-raised p-2">
         <SelfRow
@@ -219,17 +219,23 @@ export function VoicePanel() {
             {status.tone === "ok" && <RoundTrip />}
           </div>}
         </div>
-        {unavailable && phase === "online" && (
+        {unavailable && !failure && phase === "online" && (
           <Button size="sm" variant="secondary" onClick={() => controller.retryVoice()}>
             {t(voiceState === "idle" ? "tree.joinVoice" : "voice.retry")}
           </Button>
         )}
-        <LeaveButton />
+        {me?.channel != null && <LeaveButton />}
       </div>
       {failure && <div className="flex items-center gap-1.5 px-1 text-xs">
         <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone)} />
         <span className={tone}>{status.text}</span>
-        <button onClick={() => setShowReason(true)} className="t ml-auto cursor-pointer text-muted underline underline-offset-2 hover:text-fg">{t("voice.why")}</button>
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          <button onClick={() => setShowReason(true)} className="t cursor-pointer text-muted underline underline-offset-2 hover:text-fg">{t("voice.why")}</button>
+          {phase === "online" && <>
+            <span aria-hidden className="text-subtle">·</span>
+            <button onClick={() => controller.retryVoice()} className="t cursor-pointer font-medium text-fg hover:underline">{t("voice.retry")}</button>
+          </>}
+        </div>
       </div>}
       <Dialog open={showReason && !!failure} onOpenChange={setShowReason} title={t("voice.failed")} description={failure ?? undefined}>{null}</Dialog>
       {micError && (
