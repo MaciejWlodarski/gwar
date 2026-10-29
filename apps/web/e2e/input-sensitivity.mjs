@@ -49,6 +49,10 @@ try {
   await page.addInitScript(() => {
     localStorage.setItem("gwar.settings", JSON.stringify({ version: 3, state: { language: "pl", theme: "dark", audio: { noiseSuppression: false, echoCancellation: false, autoGainControl: false } } }));
     // A real WebAudio signal feeds the real mic-test analyser; no level/store injection.
+    const query = navigator.permissions.query.bind(navigator.permissions);
+    window.microphonePermission = "granted";
+    navigator.permissions.query = options => options.name === "microphone" ? Promise.resolve({ state: window.microphonePermission }) : query(options);
+    window.testCaptures = [];
     let context, gain;
     window.setTestInputDb = db => { gain.gain.value = Math.SQRT2 * 10 ** (db / 20); };
     navigator.mediaDevices.getUserMedia = async () => {
@@ -61,15 +65,17 @@ try {
       const destination = context.createMediaStreamDestination();
       oscillator.connect(gain).connect(destination);
       oscillator.start();
-      destination.stream.getAudioTracks()[0].addEventListener("ended", () => oscillator.stop());
+      const track = destination.stream.getAudioTracks()[0], stop = track.stop.bind(track);
+      window.testCaptures.push(track);
+      track.stop = () => { if (track.readyState === "live") oscillator.stop(); stop(); };
       return destination.stream;
     };
   });
   const automatic = page.getByRole("switch", { name: /Automatycznie ustalaj czułość/ });
   const meter = page.getByRole("meter");
-  for (const [name, width, height] of [["desktop", 1440, 1000], ["tablet", 768, 1024], ["mobile", 390, 844]]) {
+  for (const [name, width, height] of [["desktop", 1440, 1000], ["tablet", 768, 1024], ["mobile", 390, 844], ["mobile-360", 360, 800]]) {
     await page.setViewportSize({ width, height });
-    // A fresh page per width avoids resizing an active mic test across a layout remount.
+    // A fresh page per width also checks automatic page-scoped preview startup.
     await page.goto(url);
     await page.waitForFunction(() => typeof window.__gwarE2eImport === "function" && document.getElementById("root").childElementCount > 0);
     await page.evaluate(async () => {
@@ -78,7 +84,6 @@ try {
       const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
       useSettings.getState().setAudio({ automaticSensitivity: true, vadThreshold: -50 });
     });
-    await page.getByRole("button", { name: "Testuj mikrofon", exact: true }).click();
     await page.waitForFunction(() => {
       const meter = document.querySelector('[role="meter"]');
       return Number(meter?.getAttribute("aria-valuenow")) > 20 && Number(meter?.getAttribute("aria-valuenow")) < 40;
@@ -96,15 +101,70 @@ try {
     const slider = page.getByRole("slider", { name: "Czułość mikrofonu", exact: true });
     await slider.scrollIntoViewIfNeeded();
     await page.waitForFunction(() => Number(document.querySelector('[role="meter"]').getAttribute("aria-valuenow")) < -60 && Number(document.querySelector('[role="meter"]').getAttribute("aria-valuenow")) > -80);
-    await page.getByText("Poniżej progu · mikrofon pozostałby cichy", { exact: true }).waitFor();
+    assert.ok(await meter.locator(".bg-warn").count());
     await shot("manual-below");
     await page.evaluate(() => window.setTestInputDb(-30));
     await page.waitForFunction(() => Number(document.querySelector('[role="meter"]').getAttribute("aria-valuenow")) > -40);
-    await page.getByText("Powyżej progu · mikrofon nadawałby", { exact: true }).waitFor();
+    assert.ok(await meter.locator(".bg-ok").count());
     await shot("manual-above");
     assert.equal(await slider.getAttribute("aria-valuenow"), "-50");
     assert.ok(Number(await meter.getAttribute("aria-valuenow")) > -40);
+    assert.equal(await slider.getAttribute("aria-valuetext"), "-50 dB");
+    assert.equal(await page.getByText(/Poniżej progu|Powyżej progu|Ustaw znacznik|−100 dB|−50 dB/).count(), 0);
+    const subtitle = page.getByText("Wyłącz, aby ustawić ręcznie.", { exact: true });
+    assert.ok(await subtitle.evaluate(el => el.getBoundingClientRect().height < parseFloat(getComputedStyle(el).lineHeight) * 1.5), `${name}: wrapped subtitle`);
+    await page.getByRole("radio", { name: "Naciśnij i mów", exact: true }).click();
+    assert.equal(await automatic.count(), 0);
+    assert.equal(await slider.count(), 0);
+    await page.waitForFunction(() => window.testCaptures.every(track => track.readyState === "ended"));
+    await shot("ptt");
   }
+  // Permission is read without capture. Only the explicit button may request access.
+  await page.evaluate(async () => {
+    window.microphonePermission = "prompt";
+    const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
+    useSettings.getState().setAudio({ inputMode: "vad" });
+  });
+  await page.getByRole("button", { name: "Włącz podgląd mikrofonu", exact: true }).waitFor();
+  assert.equal(await page.evaluate(() => window.testCaptures.filter(track => track.readyState === "live").length), 0);
+  await page.getByRole("button", { name: "Włącz podgląd mikrofonu", exact: true }).click();
+  await page.waitForFunction(() => window.testCaptures.some(track => track.readyState === "live"));
+  await page.evaluate(() => { window.microphonePermission = "granted"; });
+  const exits = ["PTT", "mute", "deafen", "handover", "settings tab", "page", "visibility", "window blur"];
+  for (const exit of exits) {
+    await page.evaluate(async exit => {
+      const { useUi, useVoice } = await window.__gwarE2eImport("/src/state/stores.ts");
+      const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
+      if (exit === "PTT") useSettings.getState().setAudio({ inputMode: "ptt" });
+      if (exit === "mute") useVoice.setState({ muted: true });
+      if (exit === "deafen") useVoice.setState({ deafened: true });
+      if (exit === "handover") useVoice.setState({ state: "starting" });
+      if (exit === "settings tab") useUi.getState().setSettingsTab("appearance");
+      if (exit === "page") useUi.getState().setSection("home");
+      if (exit === "visibility") {
+        Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
+        document.dispatchEvent(new Event("visibilitychange"));
+      }
+      if (exit === "window blur") window.dispatchEvent(new Event("blur"));
+      assertStopped();
+      function assertStopped() { if (window.testCaptures.some(track => track.readyState === "live")) throw new Error(`${exit}: capture still live`); }
+    }, exit);
+    await page.evaluate(async () => {
+      const { useUi, useVoice } = await window.__gwarE2eImport("/src/state/stores.ts");
+      const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
+      useSettings.getState().setAudio({ inputMode: "vad" });
+      useVoice.setState({ state: "idle", muted: false, deafened: false });
+      useUi.getState().openSettings("audio");
+      delete document.visibilityState;
+      window.dispatchEvent(new Event("focus"));
+    });
+    await page.waitForFunction(() => window.testCaptures.some(track => track.readyState === "live"));
+  }
+  await page.evaluate(async () => {
+    const { useUi } = await window.__gwarE2eImport("/src/state/stores.ts");
+    useUi.getState().setSection("home");
+  });
+  assert.equal(await page.evaluate(() => window.testCaptures.filter(track => track.readyState === "live").length), 0);
   // Exercise the real worklet's output through WebAudio, including hangover and PTT.
   const levels = await page.evaluate(async () => {
     const { startInputGate } = await window.__gwarE2eImport("/src/voice/input-gate.ts");
@@ -142,9 +202,10 @@ try {
     "No production services, real microphone, native app or user data were used.",
     "The meter is measured by the app from a generated 440 Hz sine: -70 dBFS below, -30 dBFS above.",
     "Automatic mode retains the default -50 dBFS gate. Manual screenshots use -50 dBFS.",
+    "Preview capture: granted permission starts on Audio settings; PTT, mute, deafen, handover, page/tab exit, visibility and window blur stop tracks synchronously. Unknown permission waits for the explicit button.",
     ...screenshots, `Real AudioWorklet output levels (dBFS): ${JSON.stringify(levels)}`, "",
   ].join("\n"));
-  console.log(JSON.stringify({ output, screenshots: screenshots.length, levels }));
+  console.log(JSON.stringify({ output, screenshots: screenshots.length, exits, levels }));
 } finally {
   await browser?.close();
   await stopProcesses(children);

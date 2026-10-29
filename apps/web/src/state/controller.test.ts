@@ -104,6 +104,7 @@ function fakeEngine() {
     setSlotOwner: vi.fn(),
     listDevices: vi.fn(async () => ({ inputs: [], outputs: [] })),
     startMicTest: vi.fn(async () => () => {}),
+    micPermission: vi.fn(async () => "granted" as const),
     on: vi.fn((event: string, listener: unknown) => { listeners.set(event, listener); return () => listeners.delete(event); }),
     emitState: (state: VoiceState) => (listeners.get("state") as (state: VoiceState) => void)(state),
   };

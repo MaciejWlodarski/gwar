@@ -325,6 +325,14 @@ applying its legacy −50 dB gate a second time. Offers without the attribute ke
 the legacy gate, and older servers can ignore the SDP attribute. Quiet manual
 thresholds need an updated server to avoid its old second gate.
 
+The Audio settings sensitivity section has a local live preview in voice-activation
+mode. During voice it reuses the call's meter. Outside voice it captures only while
+that section is open, visible and unmuted/undeafened; leaving it, switching to PTT,
+muting, hiding the tab/window or starting voice cancels capture. A call waits for
+any pending preview acquisition to release its device first. Permission is read
+without prompting: unless already granted, an explicit preview button is required
+(also on platforms where permission cannot be queried). Preview audio is never sent.
+
 ### Desktop files
 
 JSON files carry `version` (missing: 1). The loader refuses a newer version

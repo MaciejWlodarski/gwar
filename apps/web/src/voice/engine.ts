@@ -8,6 +8,7 @@ import type { Control, ControlResult, CryptoStatus } from "./sframe/state";
 import { dbToLevel } from "./input-sensitivity";
 
 export type InputMode = "vad" | "ptt";
+export type MicPermission = "granted" | "prompt" | "denied" | "unknown";
 
 export interface CaptureOptions {
   noiseSuppression: boolean;
@@ -124,8 +125,10 @@ export interface VoiceEngine {
   listDevices(): Promise<DeviceList>;
   /** Aggregate SFrame counters of the current encrypted run (never keys), or null. */
   cryptoCounters?(): Promise<Record<string, number> | null>;
-  /** Independent capture for the settings level meter. Returns a stop function. */
-  startMicTest(onLevel: (level: number) => void): Promise<() => void>;
+  /** Read-only permission check: never opens the microphone or prompts. */
+  micPermission(): Promise<MicPermission>;
+  /** Local-only capture; cancellation also retires a pending device request. */
+  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal): Promise<() => void>;
 
   on<E extends keyof VoiceEvents>(event: E, handler: (value: VoiceEvents[E]) => void): () => void;
 }

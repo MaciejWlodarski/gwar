@@ -18,7 +18,7 @@ import { clearReportDraft } from "./report-draft";
 import { SettingsSection } from "./Settings";
 
 vi.mock("../state/controller", () => ({
-  controller: { voice: { capabilities: {}, listDevices: async () => ({ inputs: [], outputs: [] }) }, getIdentity: () => new Promise(() => {}), reportDiagnostics: () => new Promise(() => {}), selectChannel: () => {} },
+  controller: { voice: { capabilities: {}, micPermission: async () => "prompt", listDevices: async () => ({ inputs: [], outputs: [] }) }, getIdentity: () => new Promise(() => {}), reportDiagnostics: () => new Promise(() => {}), selectChannel: () => {} },
   describeVoiceError: String,
   describeRequestError: String,
   identityFailure: () => null,

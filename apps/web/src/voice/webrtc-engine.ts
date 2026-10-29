@@ -3,6 +3,7 @@ import { nextMediaRun } from "./engine";
 import { inputThreshold } from "./input-sensitivity";
 import { startInputGate, type CaptureGate } from "./input-gate";
 import { advertiseInputGate } from "./sdp";
+import { MicTests } from "./mic-test";
 import { encryptedVoiceSupported, SframeWorker } from "./sframe/client";
 import { AUDIO_SLOTS } from "../net/protocol";
 import {
@@ -136,6 +137,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private runId = 0;
   private micGeneration = 0;
   private resumeBound = false;
+  private micTests = new MicTests();
 
   constructor() {
     this.capabilities = {
@@ -180,12 +182,14 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     this.cancelDenoiseLoad();
     // Closes the old gate and drops its queued audio before the new run starts.
     this.teardownPeer();
+    this.setState("starting");
+    await this.micTests.stop();
+    if (run !== this.runId) return;
     if (encrypted && !(await encryptedVoiceSupported())) {
       this.setState("failed");
       throw new VoiceError("unsupported", "Update your browser or use the desktop app to join encrypted voice.");
     }
     if (run !== this.runId) return;
-    this.setState("starting");
     this.ensureContext();
     await this.ctx?.resume().catch(() => {});
     if (run !== this.runId) return;
@@ -277,6 +281,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     this.closeMic();
     this.closeDenoise();
     this.setState("idle");
+    await this.micTests.stop();
   }
 
   private teardownPeer(): void {
@@ -689,30 +694,57 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     this.emit("level", 0);
   }
 
-  async startMicTest(onLevel: (level: number) => void): Promise<() => void> {
-    const stream = await this.getStream();
-    const ctx = new AudioContext();
-    const source = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 1024;
-    source.connect(analyser);
-    const buf = new Float32Array(new ArrayBuffer(analyser.fftSize * 4));
-    let smooth = 0;
-    const timer = setInterval(() => {
-      analyser.getFloatTimeDomainData(buf);
-      let sum = 0;
-      for (const v of buf) sum += v * v;
-      const target = rmsToLevel(Math.sqrt(sum / buf.length));
-      smooth = target > smooth ? target : smooth * 0.8 + target * 0.2;
-      onLevel(smooth < 0.01 ? 0 : smooth);
-    }, 50);
-    void this.listDevices().then((d) => this.emit("devices", d));
-    return () => {
-      clearInterval(timer);
-      stream.getTracks().forEach((t) => t.stop());
+  async micPermission(): Promise<import("./engine").MicPermission> {
+    try { return (await navigator.permissions.query({ name: "microphone" as PermissionName })).state; }
+    catch { return "unknown"; }
+  }
+
+  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal): Promise<() => void> {
+    return this.micTests.start(async aborted => {
+      if (this.state !== "idle" || this.muted || this.deafened || aborted.aborted) return () => {};
+      return this.openMicTest(onLevel, aborted);
+    }, signal);
+  }
+
+  private async openMicTest(onLevel: (level: number) => void, signal: AbortSignal): Promise<() => void> {
+    const stream = await this.getStream(() => !signal.aborted);
+    if (signal.aborted) { stream.getTracks().forEach(track => track.stop()); return () => {}; }
+    let ctx: AudioContext;
+    try { ctx = new AudioContext(); }
+    catch (error) { stream.getTracks().forEach(track => track.stop()); throw error; }
+    try {
+      void ctx.resume().catch(() => {});
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+      const buf = new Float32Array(new ArrayBuffer(analyser.fftSize * 4));
+      let smooth = 0;
+      const timer = setInterval(() => {
+        analyser.getFloatTimeDomainData(buf);
+        let sum = 0;
+        for (const v of buf) sum += v * v;
+        const target = rmsToLevel(Math.sqrt(sum / buf.length));
+        smooth = target > smooth ? target : smooth * 0.8 + target * 0.2;
+        onLevel(smooth < 0.01 ? 0 : smooth);
+      }, 50);
+      void this.listDevices().then((d) => this.emit("devices", d));
+      let stopped = false;
+      const stop = () => {
+        if (stopped) return;
+        stopped = true;
+        clearInterval(timer);
+        stream.getTracks().forEach((t) => t.stop());
+        void ctx.close();
+        onLevel(0);
+      };
+      signal.addEventListener("abort", stop, { once: true });
+      return () => { signal.removeEventListener("abort", stop); stop(); };
+    } catch (error) {
+      stream.getTracks().forEach(track => track.stop());
       void ctx.close();
-      onLevel(0);
-    };
+      throw error;
+    }
   }
 
   // ------------------------------------------------------------------ output
@@ -822,6 +854,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   setMuted(muted: boolean): void {
     if (muted) this.cancelPttRelease();
     this.muted = muted;
+    if (muted) void this.micTests.stop();
     this.applyTrackEnabled();
     if (muted) this.closeMic();
     else if (!this.deafened && this.inCall()) void this.retryMic();
@@ -830,6 +863,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   setDeafened(deafened: boolean): void {
     if (deafened) this.cancelPttRelease();
     this.deafened = deafened;
+    if (deafened) void this.micTests.stop();
     this.applyTrackEnabled();
     this.applyMasterGain();
     if (deafened) this.closeMic();

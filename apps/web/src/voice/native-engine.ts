@@ -1,4 +1,5 @@
 import { nextMediaRun } from "./engine";
+import { MicTests } from "./mic-test";
 import { dbToLevel, inputThreshold } from "./input-sensitivity";
 export { dbToLevel } from "./input-sensitivity";
 import { AUDIO_SLOTS } from "../net/protocol";
@@ -71,6 +72,9 @@ export class NativeVoiceEngine implements VoiceEngine {
   private automaticSensitivity = true;
   private threshold = inputThreshold(null);
   private micTestId = 0;
+  private micTests = new MicTests();
+  private muted = false;
+  private deafened = false;
 
   private inputDevice: string | null = null;
   private outputDevice: string | null = null;
@@ -196,6 +200,8 @@ export class NativeVoiceEngine implements VoiceEngine {
     this.params = params;
     this.clearConnectTimer();
     this.setState("starting");
+    await this.micTests.stop();
+    if (run !== this.runId) return;
     this.emit("micError", null);
     this.emit("outputError", null);
     await this.ensureListeners();
@@ -233,13 +239,15 @@ export class NativeVoiceEngine implements VoiceEngine {
   async stop(): Promise<void> {
     const stoppedRun = this.runId;
     this.runId = nextMediaRun();
+    const retired = this.runId;
     this.params = null;
     this.clearConnectTimer();
     this.stopDevicePoll();
     this.smoothed = 0;
     this.emit("level", 0);
-    this.setState("idle");
+    await this.micTests.stop();
     await this.send("voice_stop", { run: stoppedRun });
+    if (this.runId === retired) this.setState("idle");
   }
 
   async cryptoCounters(): Promise<Record<string, number> | null> {
@@ -265,10 +273,14 @@ export class NativeVoiceEngine implements VoiceEngine {
   // ----------------------------------------------------------------- setters
 
   setMuted(muted: boolean): void {
+    this.muted = muted;
+    if (muted) void this.micTests.stop();
     this.send("voice_set_muted", { muted });
   }
 
   setDeafened(deafened: boolean): void {
+    this.deafened = deafened;
+    if (deafened) void this.micTests.stop();
     this.send("voice_set_deafened", { deafened });
   }
 
@@ -370,36 +382,52 @@ export class NativeVoiceEngine implements VoiceEngine {
     this.devicePoll = null;
   }
 
-  async startMicTest(onLevel: (level: number) => void): Promise<() => void> {
+  micPermission(): Promise<import("./engine").MicPermission> {
+    return this.invoke("mic_permission");
+  }
+
+  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal): Promise<() => void> {
+    return this.micTests.start(async aborted => {
+      if (this.state !== "idle" || this.muted || this.deafened || aborted.aborted) return () => {};
+      return this.openMicTest(onLevel, aborted);
+    }, signal);
+  }
+
+  private async openMicTest(onLevel: (level: number) => void, signal: AbortSignal): Promise<() => void | Promise<void>> {
     const test = ++this.micTestId;
+    // Apply queued mute/device controls before the native preview checks its capture policy.
+    await this.queue;
     const api = await this.ensureListeners();
     const { owner } = await this.ready;
     let smooth = 0;
-    const off = await api.listen<{ owner: number; db: number }>("voice://test-level", (p) => {
-      if (p.owner !== owner || test !== this.micTestId) return;
+    const off = await api.listen<{ owner: number; test: number; db: number }>("voice://test-level", (p) => {
+      if (p.owner !== owner || p.test !== test || test !== this.micTestId || signal.aborted) return;
       const target = dbToLevel(p.db);
       smooth = target > smooth ? target : smooth * 0.8 + target * 0.2;
       onLevel(smooth < 0.01 ? 0 : smooth);
     });
     // Listener setup can finish after a newer test has already opened capture.
-    if (test !== this.micTestId) {
+    if (test !== this.micTestId || signal.aborted) {
       off();
       return () => {};
     }
+    const retire = () => { void this.invoke("mic_test_stop", { test }).catch(() => {}); };
+    signal.addEventListener("abort", retire, { once: true });
     try {
-      await this.invoke("mic_test_start", { input: this.inputDevice });
+      await this.invoke("mic_test_start", { input: this.inputDevice, test });
     } catch (e) {
       off();
+      signal.removeEventListener("abort", retire);
+      if (signal.aborted) { await this.invoke("mic_test_stop", { test }).catch(() => {}); return () => {}; }
       throw new VoiceError("mic_failed", typeof e === "string" ? e : String(e));
     }
     void this.listDevices().then((d) => this.emit("devices", d));
     return () => {
       off();
+      signal.removeEventListener("abort", retire);
       // A late result belongs to its own test, never the replacement's capture.
-      if (test !== this.micTestId) return;
-      ++this.micTestId;
-      this.send("mic_test_stop");
-      onLevel(0);
+      if (test === this.micTestId) { ++this.micTestId; onLevel(0); }
+      return this.invoke("mic_test_stop", { test }).catch(() => {});
     };
   }
 }

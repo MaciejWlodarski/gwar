@@ -47,6 +47,7 @@ class Context {
   currentTime = 0;
   destination = {};
   resume = resume;
+  close = vi.fn(async () => {});
   createGain() { return { ...node(), gain: { setTargetAtTime: vi.fn() } }; }
   createAnalyser() { return { fftSize: 1024, getFloatTimeDomainData: vi.fn() }; }
   createMediaStreamSource = mediaSource;
@@ -868,5 +869,62 @@ describe("browser devices follow the system", () => {
     await changeDevices([mic("default", "g-air", "Default - AirPods"), macbook, mic("air", "g-air", "AirPods")]);
     await engine.start(params());
     expect(first.track.stop).toHaveBeenCalled();
+  });
+});
+
+
+describe("local microphone preview", () => {
+  it("reads permission without acquiring capture and treats unsupported queries conservatively", async () => {
+    expect(await engine.micPermission()).toBe("unknown");
+    const query = vi.fn(async () => ({ state: "prompt" }));
+    Object.assign(navigator, { permissions: { query } });
+    expect(await engine.micPermission()).toBe("prompt");
+    expect(query).toHaveBeenCalledWith({ name: "microphone" });
+    expect(getUserMedia).not.toHaveBeenCalled();
+  });
+
+  it("stops active tracks synchronously on cancellation", async () => {
+    const mic = microphone(), signal = new AbortController();
+    getUserMedia.mockResolvedValue(mic.stream);
+    const stop = await engine.startMicTest(vi.fn(), signal.signal);
+    expect(Peer.all).toHaveLength(0); // Preview never creates a sender.
+    signal.abort();
+    expect(mic.track.stop).toHaveBeenCalledOnce();
+    stop();
+    expect(mic.track.stop).toHaveBeenCalledOnce();
+  });
+
+  it("drains a pending preview before opening the call's capture", async () => {
+    const pending = deferred<MediaStream>(), mic = microphone();
+    getUserMedia.mockReturnValueOnce(pending.promise);
+    const preview = engine.startMicTest(vi.fn());
+    await flush();
+    const starting = engine.start(params());
+    await flush();
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    pending.resolve(mic.stream);
+    await preview;
+    await starting;
+    expect(mic.track.stop).toHaveBeenCalledOnce();
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+    expect(mic.track.stop.mock.invocationCallOrder[0]).toBeLessThan(getUserMedia.mock.invocationCallOrder[1]!);
+    await engine.startMicTest(vi.fn());
+    expect(getUserMedia).toHaveBeenCalledTimes(2); // In-call UI uses the call meter.
+  });
+
+  it("closes capture if the preview graph fails to initialize", async () => {
+    const mic = microphone(); getUserMedia.mockResolvedValue(mic.stream);
+    mediaSource.mockImplementationOnce(() => { throw new Error("graph failed"); });
+    await expect(engine.startMicTest(vi.fn())).rejects.toThrow("graph failed");
+    expect(mic.track.stop).toHaveBeenCalledOnce();
+  });
+
+  it.each(["setMuted", "setDeafened"] as const)("retires preview and blocks new capture on %s", async method => {
+    const mic = microphone(); getUserMedia.mockResolvedValue(mic.stream);
+    await engine.startMicTest(vi.fn());
+    engine[method](true);
+    expect(mic.track.stop).toHaveBeenCalledOnce();
+    await engine.startMicTest(vi.fn());
+    expect(getUserMedia).toHaveBeenCalledOnce();
   });
 });

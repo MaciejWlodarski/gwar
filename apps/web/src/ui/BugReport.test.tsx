@@ -12,7 +12,7 @@ import { TooltipProvider } from "./kit";
 import { clearReportDraft, useReportDraft } from "./report-draft";
 
 vi.mock("../state/controller", () => ({
-  controller: { voice: { capabilities: {}, listDevices: async () => ({ inputs: [], outputs: [] }) }, reportDiagnostics: async () => ({ app: { version: "test" }, logs: [] }) },
+  controller: { voice: { capabilities: {}, micPermission: async () => "prompt", listDevices: async () => ({ inputs: [], outputs: [] }) }, reportDiagnostics: async () => ({ app: { version: "test" }, logs: [] }) },
   describeVoiceError: String,
   describeRequestError: (e: unknown) => (e instanceof Error ? e.message : String(e)),
   identityFailure: () => null,

@@ -22,6 +22,7 @@ import { AlphaBadge } from "./BugReport";
 import { SettingsPageLayout, type SettingsPage } from "./SettingsLayout";
 import { VersionLabel } from "./Version";
 import { InputSensitivity } from "./InputSensitivity";
+import { useMicPreview } from "./use-mic-preview";
 
 const DEFAULT = "__default";
 
@@ -73,9 +74,9 @@ function LevelMeter({ level, label }: { level: number; label: string }) {
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={Math.round(level * 100)}
-      className="h-2 w-full overflow-hidden rounded-full bg-active"
+      className="h-3 w-full overflow-hidden rounded-full bg-active"
     >
-      <div className="h-full rounded-full bg-linear-90 from-talk-1 via-talk-2 to-talk-3 transition-[width] duration-75" style={{ width: `${Math.round(level * 100)}%` }} />
+      <div className="h-full rounded-full bg-ok transition-[width] duration-75" style={{ width: `${Math.round(level * 100)}%` }} />
     </div>
   );
 }
@@ -133,10 +134,10 @@ function AudioTab() {
   const engineLevel = useVoice((s) => s.level);
   const voiceState = useVoice((s) => s.state);
   const [testing, setTesting] = useState(false);
-  const [testLevel, setTestLevel] = useState(0);
-  const [testError, setTestError] = useState<string | null>(null);
+  const muted = useVoice((s) => s.muted || s.deafened);
   const [capturing, setCapturing] = useState(false);
   const engine = controller.voice;
+  const preview = useMicPreview(engine);
   // Gwar's own suppression has a strength: native on the desktop, an AudioWorklet in the browser.
   const noiseStrength = audio.noiseSuppression && (
     <Field label={t("audio.noiseStrength")} hint={t("audio.noiseStrengthHint")}>
@@ -160,29 +161,6 @@ function AudioTab() {
     void engine.listDevices().then((d) => useVoice.getState().set({ devices: d }));
   }, [engine]);
 
-  // The mic test runs while `testing`; changing device or processing flags restarts it.
-  useEffect(() => {
-    if (!testing) return;
-    let cancelled = false;
-    let stop: (() => void) | undefined;
-    engine
-      .startMicTest((level) => { if (!cancelled) setTestLevel(level); })
-      .then((fn) => {
-        if (cancelled) fn();
-        else stop = fn;
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setTestError(e instanceof VoiceError ? describeVoiceError(e) : String(e));
-        setTesting(false);
-      });
-    return () => {
-      cancelled = true;
-      stop?.();
-      setTestLevel(0);
-    };
-  }, [engine, testing, audio.inputDeviceId, audio.noiseSuppression, audio.echoCancellation, audio.autoGainControl]);
-
   useEffect(() => {
     if (!capturing) return;
     const onKey = (e: KeyboardEvent) => {
@@ -199,7 +177,10 @@ function AudioTab() {
     { value: DEFAULT, label: t("audio.systemDefault") },
     ...list.map((d) => ({ value: d.id, label: d.label })),
   ];
-  const level = Math.max(testLevel, voiceState === "connected" ? engineLevel : 0);
+  const inCall = voiceState !== "idle";
+  const level = muted ? 0 : inCall ? engineLevel : preview.level;
+  const canTest = !muted && (audio.inputMode === "vad" || inCall);
+  const testActive = testing && canTest;
 
   return (
     <div>
@@ -273,6 +254,15 @@ function AudioTab() {
         )}
       </Section>
 
+      {audio.inputMode === "vad" && (
+        <Section title={t("audio.sensitivity")}>
+          <Switch checked={audio.automaticSensitivity} onCheckedChange={(automaticSensitivity) => setAudio({ automaticSensitivity })} label={t("audio.automaticSensitivity")} description={t("audio.automaticSensitivityHint")} />
+          {audio.automaticSensitivity ? <div className="flex min-h-11 items-center"><LevelMeter level={level} label={t("audio.level")} /></div> : <InputSensitivity level={level} threshold={audio.vadThreshold} onChange={(vadThreshold) => setAudio({ vadThreshold })} />}
+          {preview.needsPermission && <Button onClick={preview.request} className="self-start">{t("audio.previewEnable")}</Button>}
+          {preview.error != null && <p role="alert" className="text-sm text-danger">{describeVoiceError(preview.error instanceof VoiceError ? preview.error : new VoiceError("mic_failed", String(preview.error)))}</p>}
+        </Section>
+      )}
+
       {onDesktop && (
         <Section title={t("audio.globalShortcuts")}>
           <ShortcutField label={t("audio.muteShortcut")} value={desktop.muteShortcut} onChange={(v) => setDesktop({ muteShortcut: v })} />
@@ -282,25 +272,15 @@ function AudioTab() {
       )}
 
       <Section title={t("audio.test")}>
-        {audio.inputMode === "vad" && (
-          <Switch checked={audio.automaticSensitivity} onCheckedChange={(automaticSensitivity) => setAudio({ automaticSensitivity })} label={t("audio.automaticSensitivity")} description={t("audio.automaticSensitivityHint")} />
-        )}
         <div className="flex items-center gap-3">
           <Button onClick={() => {
-              setTestError(null);
-              setTesting(!testing);
-            }} variant={testing ? "primary" : "secondary"} className="shrink-0">
-            {testing ? t("audio.testStop") : t("audio.testStart")}
+            setTesting(!testActive);
+            if (!testActive && !inCall) preview.request();
+          }} disabled={!canTest} variant={testActive ? "primary" : "secondary"} className="shrink-0">
+            {testActive ? t("audio.testStop") : t("audio.testStart")}
           </Button>
-          {(audio.inputMode === "ptt" || audio.automaticSensitivity) && <LevelMeter level={level} label={t("audio.level")} />}
+          {testActive && <LevelMeter level={level} label={t("audio.level")} />}
         </div>
-        {audio.inputMode === "vad" && !audio.automaticSensitivity && <InputSensitivity level={level} threshold={audio.vadThreshold} onChange={(vadThreshold) => setAudio({ vadThreshold })} />}
-        {audio.inputMode === "ptt" && <p className="text-xs text-muted">{t("audio.sensitivityPtt")}</p>}
-        {testError && (
-          <p role="alert" className="text-sm text-danger">
-            {testError}
-          </p>
-        )}
       </Section>
 
       <Section title={t("audio.processing")}>
