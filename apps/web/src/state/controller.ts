@@ -264,6 +264,7 @@ class Controller {
     e.on("outputError", (error) => {
       if (error) useUi.getState().toast("error", describeVoiceError(error));
     });
+    e.on("deviceSwitched", ({ label }) => useUi.getState().toast("info", tNow("voice.deviceSwitched", { device: label })));
     e.on("devices", (devices) => useVoice.getState().set({ devices }));
     void e.listDevices().then((devices) => useVoice.getState().set({ devices }));
 

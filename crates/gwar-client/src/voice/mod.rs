@@ -7,6 +7,7 @@
 
 mod apm;
 mod denoise;
+mod follow;
 pub mod io;
 pub mod jitter;
 pub mod keys;
@@ -15,6 +16,7 @@ mod playout;
 mod priority;
 mod rtc;
 pub mod sframe;
+mod watch;
 
 use std::{
     net::{IpAddr, SocketAddr},

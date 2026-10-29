@@ -25,6 +25,14 @@ reports `securing` (`counter_exhausted`, `key_expired`) or `failed`
 (`key_conflict`, `key_queue_full`); a failure also ends the run. No status is
 an installation acknowledgement.
 
+Device events: `voice://issue {owner, side, kind, message}` reports a device
+problem (`no_device`, `permission_denied`, `failed`); `voice://device {owner,
+side, kind, device}` reports that the devices sorted themselves out: `switched`
+(audio moved to `device` without the user choosing it: a chosen device
+disappeared or came back) or `recovered` (the problem reported last is over).
+`voice_set_devices` moves running voice to the new choice at once, reopening
+only the side that changed, without renegotiating.
+
 The engine waits for bootstrap before sending commands, keeps that one token
 for its lifetime and never reclaims ownership after being superseded. Runs
 remain timestamp-seeded; owner generations are independent of run values.

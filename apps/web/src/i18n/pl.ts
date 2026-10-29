@@ -423,6 +423,7 @@ export const pl: Record<Key, string> = {
   "voice.channelSecuring": "Ten szyfrowany kanał jest jeszcze zabezpieczany na tym urządzeniu. Spróbuj za chwilę.",
   "voice.securingTimeout": "Nie udało się zabezpieczyć szyfrowanej rozmowy. Spróbuj ponownie.",
   "voice.closed": "Połączenie głosowe zostało zamknięte. Łączenie ponownie…",
+  "voice.deviceSwitched": "Przełączono na: {device}",
   "screen.share": "Udostępnij ekran",
   "screen.stop": "Zakończ udostępnianie",
   "screen.encryptedSoon": "Udostępnianie ekranu na kanałach szyfrowanych już wkrótce.",
