@@ -42,5 +42,7 @@ export async function openScreenRecordingSettings(): Promise<void> {
   await (await tauri()).invoke("open_screen_privacy_settings");
 }
 
-/** Screen privacy settings are available on the same desktop platforms as microphone settings. */
-export const canOpenScreenRecordingSettings = canOpenMicrophoneSettings;
+/** WebView2 refusal is controlled by its picker/policy; a Windows OS shortcut cannot fix it. */
+export function canOpenScreenRecordingSettings(): boolean {
+  return isDesktop() && !/iPhone|iPad/.test(navigator.userAgent) && /Macintosh|Mac OS X/.test(navigator.userAgent);
+}

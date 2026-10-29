@@ -831,10 +831,9 @@ class Controller {
         if (resync && this.rejoin !== null && this.rejoin !== myCh) void this.rejoinVoice(this.rejoin);
       } else if (resync && this.rejoin !== null) {
         const channel = this.rejoin;
-        this.rejoin = null;
         void this.rejoinVoice(channel);
       }
-      this.rejoin = null;
+      if (!resync || myCh === this.rejoin) this.rejoin = null;
       if (resync) this.screen.resume();
     });
     conn.onEvent((event) => {
@@ -894,6 +893,7 @@ class Controller {
           if (notificationAllowed(result)) alert?.();
         }).catch(() => {}).finally(() => { this.messagePending--; });
       } else session.dispatch({ type: "event", event, now: Date.now() });
+      if (event.ev === "client.updated" && event.d.id === useSession.getState().me?.session && event.d.channel === this.rejoin) this.rejoin = null;
       if (event.ev.startsWith("screen.")) this.screen.handleEvent(event);
       if (event.ev === "chat.read" && "conversation" in event.d) void this.sealed?.refreshUnread(event.d.conversation).catch(() => {});
       if (event.ev === "voice.closed" && (() => {
@@ -941,7 +941,7 @@ class Controller {
           session.setRtt(null);
           this.nativeFiles(null);
           // A new session starts outside voice: remember where to go back to.
-          if (this.voiceAutoStart) this.rejoin ??= myChannelId(useSession.getState());
+          if (this.voiceAutoStart && useSession.getState().phase !== "reconnecting") this.rejoin ??= myChannelId(useSession.getState());
           session.dispatch({ type: "phase", phase: "reconnecting" });
           this.screen.suspend();
           void this.stopVoice();
@@ -1211,7 +1211,14 @@ class Controller {
   /** Leaves voice but stays on the server (and keeps reading chat). */
   async leaveVoice(): Promise<void> {
     this.joinAttempt++; // a pending encrypted join gives up
-    if (!this.canLeaveVoice || myChannelId(useSession.getState()) === null) return;
+    if (!this.canLeaveVoice) return;
+    if (useSession.getState().phase === "reconnecting") {
+      this.rejoin = null;
+      await this.screen.stopShare();
+      await this.stopVoice();
+      return;
+    }
+    if (myChannelId(useSession.getState()) === null) return;
     const ok = await this.attempt(this.connection.request("channel.leave", {}));
     // The server's client.updated follows; do not wait for it to release the microphone.
     if (ok) { await this.stopVoice(); useUi.getState().dismissToast("voice-closed"); }

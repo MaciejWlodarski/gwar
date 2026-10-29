@@ -16,7 +16,7 @@ import { captureFailure } from "../voice/screen-permission";
 import type { Event } from "../proto/Event";
 import type { ScreenStopReason } from "../proto/ScreenStopReason";
 import { nextMediaRun } from "../voice/engine";
-import { applyCaptureSpec, captureScreen, captureSupport, probeAv1Encoder, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PublishStats, type SlotStats } from "../voice/screen";
+import { applyCaptureSpec, captureScreen, captureSupport, probeAv1Encoder, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PublishStats, type SlotStats, type EncoderFallbacks } from "../voice/screen";
 import { myChannelId } from "./reducer";
 import { useScreen, type ScreenAction } from "./screen";
 import { useSession, useUi } from "./stores";
@@ -30,6 +30,8 @@ const WATCH_UNAVAILABLE_MS = 5_000;
 const FIRST_FRAME_TIMEOUT_MS = 35_000;
 /** The server takes a Try again at most this long after the share's last start or retry for me, and holds an earlier one until then (`RETRY_FIRST`). */
 const RETRY_SPACING_MS = 15_000;
+/** remove() emits a final move update before client.left; allow that ordered sequence to settle. */
+const DEPARTURE_SETTLE_MS = 150;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -125,11 +127,15 @@ export class ScreenController {
   private initialised = false;
   private suspended = false;
   private ownChannel: number | null = null;
+  private encoderFallbacks: EncoderFallbacks | undefined;
+  private readonly leftWatches = new Set<number>();
+  private departureCheck: ReturnType<typeof setTimeout> | null = null;
   private recoveringAttempt: number | null = null;
+  private retainedCapture = false;
   private ownDeadline: ReturnType<typeof setTimeout> | null = null;
   private watchRetry: ReturnType<typeof setTimeout> | null = null;
   private watchRecoveries = 0;
-  private readonly targets = new Map<number, { uid: string; channel: number }>();
+  private readonly targets = new Map<number, { uid: string; channel: number; client: number }>();
   private readonly waiting = new Map<number, ReturnType<typeof setTimeout>>();
 
   constructor(
@@ -145,13 +151,14 @@ export class ScreenController {
     useScreen.subscribe((s) => { if (s.own?.phase === "live") useUi.getState().dismissToast("screen-stopped"); });
     useSession.subscribe((s, prev) => {
       const own = useScreen.getState().own;
-      if (own?.phase === "reconnecting") {
+      if (own && this.retainedCapture) {
         if (!this.suspended && myChannelId(s) !== null) {
-          if (myChannelId(s) === this.ownChannel) void this.confirmShare();
-          else this.recoveryFailed();
+          if (myChannelId(s) !== this.ownChannel) this.recoveryFailed();
+          else if (own.phase === "reconnecting") void this.confirmShare();
         }
       } else if (myChannelId(s) !== myChannelId(prev) && own && !this.suspended) this.endOwn();
-      if ((s.shares !== prev.shares || myChannelId(s) !== myChannelId(prev)) && !this.suspended) this.resumeWatches();
+      if (s.clients !== prev.clients) this.observeDepartures();
+      if ((s.shares !== prev.shares || s.clients !== prev.clients || myChannelId(s) !== myChannelId(prev)) && !this.suspended) this.resumeWatches();
     });
   }
 
@@ -164,6 +171,10 @@ export class ScreenController {
   beginShare(): void {
     // The button refuses these too; the controller never relies on it.
     if (useScreen.getState().own || screenSupport() !== "ok") return;
+    if (useScreen.getState().notice === "reconnect" && myChannelId(useSession.getState()) === null) return;
+    if (!this.suspended) this.ownChannel = myChannelId(useSession.getState());
+    this.encoderFallbacks = undefined;
+    this.retainedCapture = this.suspended;
     const attempt = ++this.attempts;
     let picked: Promise<MediaStream>;
     try {
@@ -181,10 +192,9 @@ export class ScreenController {
         // The browser's own "Stop sharing", or the shared window closing.
         track.addEventListener("ended", () => {
           if (useScreen.getState().own?.attempt !== attempt) return;
-          if (this.recoveringAttempt === attempt) this.recoveryFailed();
-          else void this.stopShare();
+          void this.stopShare();
         });
-        if (useScreen.getState().notice === "permission") dispatch({ type: "notice", notice: null });
+        if (["permission", "permissionHint"].includes(useScreen.getState().notice ?? "")) dispatch({ type: "notice", notice: null });
         dispatch({ type: "picked", attempt, stream, surface: surfaceOf(track) });
         dispatch({ type: "choose", spec: resolveQuality(useSettings.getState(), surfaceOf(track)) });
       },
@@ -200,7 +210,7 @@ export class ScreenController {
     // Retain browser details in diagnostics, never in translated UI copy.
     console.warn("[screen] capture:", error);
     const failure = captureFailure(error);
-    if (failure === "permission") dispatch({ type: "notice", notice: "permission" });
+    if (failure === "permission" || failure === "hint") dispatch({ type: "notice", notice: failure === "hint" ? "permissionHint" : "permission" });
     else if (failure === "failed") useUi.getState().toast("error", tNow("screen.captureFailed"));
   }
 
@@ -241,9 +251,11 @@ export class ScreenController {
 
   /** Turns my share's watch link off, or (as a moderator) someone else's; final for that share. */
   async turnOffLink(share: string): Promise<void> {
+    // Preserve my privacy choice even if the acknowledgement is lost with the session.
+    if (useScreen.getState().own?.share === share) dispatch({ type: "link", share, active: false });
     const conn = this.link();
     if (!conn) return;
-    try { await conn.request("screen.link.revoke", { share }); }
+    try { await conn.request("screen.link.revoke", { share }); dispatch({ type: "link", share, active: false }); }
     catch (e) { useUi.getState().toast("error", this.describe(e)); }
   }
 
@@ -252,7 +264,15 @@ export class ScreenController {
     const own = useScreen.getState().own;
     const conn = this.link();
     const track = own?.stream?.getVideoTracks()[0];
-    if (!own || (own.phase !== "choosing" && own.phase !== "reconnecting") || !track || this.suspended) return;
+    if (!own || (own.phase !== "choosing" && own.phase !== "reconnecting") || !track) return;
+    if (this.suspended) {
+      if (own.phase === "choosing") {
+        this.recoveringAttempt = own.attempt;
+        this.ownDeadline ??= setTimeout(() => this.recoveryFailed(), 45_000);
+        dispatch({ type: "queueShare", attempt: own.attempt });
+      }
+      return;
+    }
     const recovering = own.phase === "reconnecting";
     if (recovering && track.readyState === "ended") { this.recoveryFailed(); return; }
     const { attempt, spec, surface } = own;
@@ -264,6 +284,7 @@ export class ScreenController {
     const me = s.me ? s.clients[s.me.session] : undefined;
     const binding = me?.voice_binding;
     if (!conn || !me || me.channel === null || !binding) { if (!recovering) this.endOwn(); return; }
+    if (this.ownChannel !== null && me.channel !== this.ownChannel) { this.recoveryFailed(); return; }
     // Never a share in the clear in an encrypted channel (docs/screen-share.md, "First release").
     if (s.channels[me.channel]?.encrypted) {
       if (recovering) this.recoveryFailed();
@@ -301,7 +322,7 @@ export class ScreenController {
     const hardwareAv1 = await av1;
     if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
     const publisher = new ScreenPublisher({
-      track, quality: latest(), legacy: !screenSpec, av1: hardwareAv1, automaticMode: useSettings.getState().screenMode === null, iceServers: s.iceServers,
+      track, fallbacks: this.encoderFallbacks, quality: latest(), legacy: !screenSpec, av1: hardwareAv1, automaticMode: useSettings.getState().screenMode === null, iceServers: s.iceServers,
       ended: () => { if (this.publisher === publisher) { if (this.recoveringAttempt === attempt) this.recoveryFailed(); else void this.stopShare(); } },
       surfaceChanged: (surface, spec) => {
         if (current()) dispatch({ type: "surface", attempt, surface, spec });
@@ -356,6 +377,8 @@ export class ScreenController {
     this.ownDeadline = null;
     this.recoveringAttempt = null;
     this.ownChannel = null;
+    this.encoderFallbacks = undefined;
+    this.retainedCapture = false;
     if (!own) return;
     stopStream(own.stream);
     dispatch({ type: "ownEnded", attempt: own.attempt });
@@ -410,7 +433,7 @@ export class ScreenController {
     if (useScreen.getState().watches.length === 0) this.watchRecoveries = 0;
     const id = ++this.watchIds;
     const uid = s.clients[info.client]?.uid;
-    if (uid) this.targets.set(id, { uid, channel: info.channel });
+    if (uid) this.targets.set(id, { uid, channel: info.channel, client: info.client });
     const generation = this.generation;
     dispatch({ type: "watch", share, id });
     if (this.suspended) { this.waitForWatch(id); return; }
@@ -721,6 +744,7 @@ export class ScreenController {
         if (useScreen.getState().own?.share === event.d.share) {
           dispatch({ type: "notice", notice: null });
           this.recoveringAttempt = null;
+          this.retainedCapture = false;
           if (this.ownDeadline) clearTimeout(this.ownDeadline);
           this.ownDeadline = null;
         }
@@ -779,6 +803,8 @@ export class ScreenController {
         if (watched && (reason === "left" || reason === "transport")) {
           this.clearFirstFrame(watched.id);
           dispatch({ type: "watchWaiting", share });
+          const target = this.targets.get(watched.id);
+          if (reason === "left" && target && useSession.getState().clients[target.client]?.uid === target.uid) this.leftWatches.add(watched.id);
           this.waitForWatch(watched.id);
           return;
         }
@@ -815,24 +841,28 @@ export class ScreenController {
     if (this.suspended) return;
     this.suspended = true;
     this.closeStoppingPublishers();
+    if (this.departureCheck) clearTimeout(this.departureCheck);
+    this.departureCheck = null;
     this.generation++;
     this.chains.clear();
     this.released.clear();
     if (this.watchRetry) clearTimeout(this.watchRetry);
     this.watchRetry = null;
     const own = useScreen.getState().own;
+    this.retainedCapture = own !== null;
+    if (own?.phase !== "reconnecting") this.ownChannel = myChannelId(useSession.getState()) ?? this.ownChannel;
     if (own && (own.phase === "starting" || own.phase === "live" || own.phase === "reconnecting")) {
-      this.ownChannel = myChannelId(useSession.getState());
       this.recoveringAttempt = own.attempt;
       const publisher = this.publisher;
       this.publisher = null;
+      if (publisher) this.encoderFallbacks = publisher.fallbacks();
       publisher?.close();
       this.ownDeadline ??= setTimeout(() => this.recoveryFailed(), 45_000);
-    } else this.endOwn();
+    }
     for (const watch of useScreen.getState().watches) this.waitForWatch(watch.id);
     this.dropTransport();
     dispatch({ type: "suspend" });
-    if (own?.stream?.getVideoTracks()[0]?.readyState === "ended") this.recoveryFailed();
+    if (own?.stream?.getVideoTracks()[0]?.readyState === "ended") void this.stopShare();
   }
 
   /** Called after Welcome rebuilt session state; voice's rejoin supplies the new publish binding. */
@@ -846,6 +876,8 @@ export class ScreenController {
     const timer = this.waiting.get(id);
     if (timer) clearTimeout(timer);
     this.waiting.delete(id);
+    this.leftWatches.delete(id);
+    if (this.leftWatches.size === 0 && this.departureCheck) { clearTimeout(this.departureCheck); this.departureCheck = null; }
     this.targets.delete(id);
   }
 
@@ -856,7 +888,8 @@ export class ScreenController {
       this.forgetWatch(id);
       if (watch) {
         dispatch({ type: "unwatch", share: watch.share });
-        useUi.getState().toast("error", tNow("screen.watchFailed"));
+        const connected = !this.suspended && useScreen.getState().transport.phase === "connected";
+        useUi.getState().toast(connected ? "info" : "error", tNow(connected ? "screen.ended" : "screen.watchFailed"));
       }
     }, 45_000));
   }
@@ -867,7 +900,7 @@ export class ScreenController {
     if (!conn) return;
     const session = useSession.getState();
     for (const watch of useScreen.getState().watches) {
-      if (!this.waiting.has(watch.id)) continue;
+      if (!this.waiting.has(watch.id) || this.leftWatches.has(watch.id)) continue;
       const target = this.targets.get(watch.id);
       const candidates = target ? Object.values(session.shares).filter(s =>
         s.channel === target.channel && session.clients[s.client]?.uid === target.uid
@@ -879,9 +912,42 @@ export class ScreenController {
       if (session.channels[info.channel]?.has_password && !session.permissions.includes("bypass_password") && myChannelId(session) !== info.channel) continue;
       clearTimeout(this.waiting.get(watch.id));
       this.waiting.delete(watch.id);
+      if (target) this.targets.set(watch.id, { ...target, client: info.client });
       dispatch({ type: "watchReplaced", id: watch.id, share: info.share });
       const generation = this.generation;
       void this.serial(info.share, () => this.startWatch(conn, info.share, watch.id, generation));
+    }
+  }
+
+  private observeDepartures(): void {
+    const session = useSession.getState();
+    for (const id of this.leftWatches) {
+      const target = this.targets.get(id);
+      if (!target || session.clients[target.client]?.uid !== target.uid) this.leftWatches.delete(id);
+    }
+    if (!this.leftWatches.size) {
+      if (this.departureCheck) clearTimeout(this.departureCheck);
+      this.departureCheck = null;
+    } else if (!this.departureCheck) {
+      this.departureCheck = setTimeout(() => {
+        this.departureCheck = null;
+        this.settleDepartures();
+        this.resumeWatches();
+      }, DEPARTURE_SETTLE_MS);
+    }
+  }
+
+  /** `left` precedes client.updated (a move/leave) or client.left (a dropped session). */
+  private settleDepartures(): void {
+    const session = useSession.getState();
+    for (const id of this.leftWatches) {
+      this.leftWatches.delete(id);
+      const target = this.targets.get(id);
+      const watch = useScreen.getState().watches.find(w => w.id === id);
+      if (!target || !watch || session.clients[target.client]?.uid !== target.uid) continue;
+      this.forgetWatch(id);
+      dispatch({ type: "unwatch", share: watch.share });
+      useUi.getState().toast("info", tNow("screen.ended"));
     }
   }
 
@@ -893,11 +959,14 @@ export class ScreenController {
   /** The session ended or is being replaced: everything of it stops here; the server ended it too. */
   reset(): void {
     this.closeStoppingPublishers();
+    if (this.departureCheck) clearTimeout(this.departureCheck);
+    this.departureCheck = null;
     this.suspended = false;
     if (this.watchRetry) clearTimeout(this.watchRetry);
     this.watchRetry = null;
     for (const id of this.waiting.keys()) this.forgetWatch(id);
     this.targets.clear();
+    this.leftWatches.clear();
     this.watchRecoveries = 0;
     this.endOwn();
     this.attempts++;

@@ -75,7 +75,7 @@ describe("the desktop app", () => {
     }
   });
 
-  it("cancelling a picker stays silent, however long it took", async () => {
+  it("explicit picker cancellation stays silent, however long it took", async () => {
     shell.invoke.mockResolvedValue("ok");
     const screen = new ScreenController(() => null, String);
     screen.init();
@@ -83,7 +83,7 @@ describe("the desktop app", () => {
     // A refusal before any picker and the user closing it raise the same error; timing tells nothing.
     for (let i = 0; i < 2; i++) {
       toast.mockReset();
-      getDisplayMedia.mockImplementationOnce(async () => { throw new DOMException("The request is not allowed", "NotAllowedError"); });
+      getDisplayMedia.mockImplementationOnce(async () => { throw new DOMException("User cancelled the picker", "NotAllowedError"); });
       screen.beginShare();
       await flush();
       expect(toast).not.toHaveBeenCalled();
@@ -100,16 +100,35 @@ describe("the desktop app", () => {
     expect(toast).not.toHaveBeenCalled();
   });
 
-  it("also notifies the desktop sharer when retained capture ends", () => {
-    const track = { readyState: "ended", stop: vi.fn() };
+  it("does not notify when the browser Stop sharing ends retained capture", async () => {
+    useDesktopCapture.setState({ capture: "ok" });
+    const source = Object.assign(new EventTarget(), { readyState: "live", stop: vi.fn(), getSettings: () => ({}) });
+    const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
+    getDisplayMedia.mockImplementationOnce(async () => stream);
+    const screen = new ScreenController(() => null, String);
+    screen.beginShare(); await flush();
+    useScreen.setState({ own: { ...useScreen.getState().own!, phase: "live", share: "M" } });
+    screen.suspend(); source.readyState = "ended"; source.dispatchEvent(new Event("ended")); await flush();
+    screen.resume();
+    expect(useScreen.getState().own).toBeNull();
+    expect(useScreen.getState().notice).toBeNull();
+    expect(notify).not.toHaveBeenCalled();
+    screen.reset();
+  });
+
+  it("also notifies the desktop sharer when republishing times out", async () => {
+    vi.useFakeTimers();
+    const track = { readyState: "live", stop: vi.fn() };
     useScreen.setState({ own: { phase: "live", attempt: 1, share: "M", stream: { getVideoTracks: () => [track], getTracks: () => [track] } as unknown as MediaStream,
       surface: "window", spec: legacySpec("text"), viewers: 0, guests: 0, guestLink: false, preview: false } });
     const screen = new ScreenController(() => null, String);
     screen.suspend();
+    await vi.advanceTimersByTimeAsync(45_000);
     expect(useScreen.getState().notice).toBe("reconnect");
-    expect(notify).toHaveBeenCalledExactlyOnceWith({ title: "Gwar", body: "Your screen share stopped after the connection was lost — share again.", tag: "screen-reconnect" });
+    expect(notify).toHaveBeenCalledExactlyOnceWith({ title: "Gwar", body: "Your screen share stopped after the connection was lost.", tag: "screen-reconnect" });
     expect(track.stop).toHaveBeenCalledOnce();
     screen.reset();
+    vi.useRealTimers();
   });
 
 });

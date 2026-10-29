@@ -18,6 +18,7 @@
  * stop; and the Share button refusing in an encrypted channel.
  *
  *   E2E_BROWSERS=chromium,webkit   engines to use (default: both); with one, it plays every role
+ *   E2E_SCREEN_RECONNECT_ONLY=1 focus on session recovery and screenshot capture
  *   E2E_SCREEN_CANVAS=1          fixed 1080p60 canvas instead of adaptive tab capture
  *   E2E_SCREEN_REQUIRE_H264=1    fail if the main sharer exposes no H.264 encoder
  *
@@ -353,6 +354,136 @@ async function codecFlow(publisher, viewer, share, expectedCodecs, size = null) 
   checks.push({ check: "codec flow through SFU", share, viewer: viewer.deviceName, sent, received });
 }
 
+/** Focused session/capture regression, also used by the complete media matrix. */
+async function reconnectAndScreenshots(cs, cv, viewers, chromiumTab) {
+  let csShare = await ownShare(cs);
+  // Restore cv's watch (released earlier by the slot-limit check) before interrupting anything.
+  await watch(cv, "cs-tab");
+  await sees(cv, csShare, 1, "viewer is watching before the session interruption");
+
+  // A short session interruption keeps the browser capture alive, republishes with the new
+  // voice binding, and restores watches by identity even though the share ID changes.
+  await session(cs, (_, screen) => { window.__captureBeforeReconnect = screen.own.stream; });
+  const beforeReconnect = csShare;
+  await session(cs, (_, __, controller) => controller.connection.socket.close(4000, "local reconnect test"));
+  await waitFor(async () => {
+    const id = await ownShare(cs);
+    if (!id || id === beforeReconnect) return false;
+    csShare = id;
+    return true;
+  }, "the captured screen republishes after the session resync", 45_000);
+  assert.equal(await session(cs, (_, screen) => screen.own.stream === window.__captureBeforeReconnect && screen.own.stream.getVideoTracks()[0].readyState === "live"), true, "the exact same capture survives");
+  for (const viewer of viewers) {
+    await waitFor(() => session(viewer, (_, screen, __, id) => screen.watches.some(w => w.share === id && w.status === "watching"), csShare), "viewer automatically rewatches the returning share", 45_000);
+    await sees(viewer, csShare, 1, "session reconnect restores screen frames without another picker or LIVE click");
+  }
+  // The viewer's own session also resumes every watch and preserves the selected stage.
+  const watchedBefore = await session(cv, (_, screen) => screen.watches.filter(w => w.status === "watching").map(w => w.share));
+  const stageBefore = await session(cv, (_, screen) => screen.stage);
+  await session(cv, (_, __, controller) => controller.connection.socket.close(4000, "local viewer reconnect test"));
+  await waitFor(() => session(cv, (_, screen, __, expected) => screen.stage === expected.stage && expected.watches.every(id => screen.watches.some(w => w.share === id && w.status === "watching")), { stage: stageBefore, watches: watchedBefore }), "viewer session restores watches and focus", 45_000);
+  await sees(cv, csShare, 1, "viewer session reconnect restores decoded frames");
+  checks.push({ check: "session reconnect retains capture, republishes, and resumes viewer watches", ok: true });
+
+  // A page stopping capture emits no `ended` event. The existing publisher poll
+  // must end the share and free every viewer's slot through the normal path.
+  await cs.evaluate(() => {
+    const sender = window.__pcs.filter(pc => pc.connectionState !== "closed")
+      .flatMap(pc => pc.getSenders()).find(s => s.track?.kind === "video" && s.track.readyState === "live");
+    if (!sender?.track) throw new Error("no live screen capture to stop");
+    sender.track.stop();
+  });
+  await waitFor(async () => (await ownShare(cs)) === null, "silent track stop ends the share", 10_000);
+  for (const viewer of viewers) {
+    await waitFor(async () => !(await session(viewer, (_, screen, __, share) => screen.watches.some(w => w.share === share) || screen.slots.includes(share), csShare)), "silent track stop releases viewer slots", 10_000);
+  }
+  checks.push({ check: "page-initiated track.stop ends the share and releases watch slots", ok: true });
+
+  if (process.env.E2E_SCREEN_SCREENSHOTS) {
+    await cs.bringToFront();
+    await share(cs, chromiumTab ? "Sharing a browser tab" : "Sharing your screen");
+    await session(cs, (_, screen, controller) => {
+      controller.screen.suspend();
+      screen.own.stream.getVideoTracks()[0].stop();
+      controller.screen.resume();
+    });
+    await cs.evaluate(async () => {
+      const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
+      useSettings.getState().setLanguage("pl");
+    });
+    const directory = process.env.E2E_SCREEN_SCREENSHOTS;
+    mkdirSync(directory, { recursive: true });
+    const screenshots = [];
+    const captureNotice = async kind => {
+      for (const [name, width, height] of [["desktop", 1440, 900], ["mobile", 390, 844]]) {
+        await cs.setViewportSize({ width, height });
+        await cs.getByTestId("screen-notice").waitFor();
+        const bounds = await cs.getByTestId("screen-notice").boundingBox();
+        assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width, "notice fits the viewport");
+        const file = path.join(directory, `${kind}-pl-${name}.png`);
+        await cs.screenshot({ path: file });
+        screenshots.push(file);
+      }
+    };
+    await cs.getByRole("button", { name: "Udostępnij ponownie", exact: true }).waitFor();
+    await sleep(6_500);
+    await captureNotice("reconnect-stopped");
+    await cs.evaluate(() => {
+      navigator.mediaDevices.getDisplayMedia = async () => { throw new DOMException("Permission denied by system", "NotAllowedError"); };
+    });
+    await session(cs, (_, __, controller) => controller.screen.beginShare());
+    await cs.getByText(/Zezwól na nagrywanie ekranu dla/).waitFor();
+    await captureNotice("permission");
+    // The same running web UI, with only the desktop platform marker enabled, shows
+    // the Gwar name and settings action. No desktop app or OS settings are launched.
+    await cs.evaluate(async () => {
+      window.__TAURI_INTERNALS__ = {};
+      const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts");
+      useScreen.setState({ notice: null });
+    });
+    await cs.getByTestId("screen-notice").waitFor({ state: "detached" });
+    await cs.evaluate(async () => {
+      const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts");
+      useScreen.setState({ notice: "permission" });
+    });
+    await cs.getByRole("button", { name: "Otwórz ustawienia", exact: true }).waitFor();
+    await captureNotice("permission-desktop-shell");
+    // Windows WebView2 gets the right OS text but no unhelpful settings shortcut.
+    await cs.evaluate(async () => {
+      Object.defineProperty(navigator, "userAgent", { configurable: true, value: "Windows NT 10.0 Chrome/153" });
+      const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts"); useScreen.setState({ notice: null });
+    });
+    await cs.getByTestId("screen-notice").waitFor({ state: "detached" });
+    await cs.evaluate(async () => {
+      const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts"); useScreen.setState({ notice: "permission" });
+    });
+    assert.equal(await cs.getByRole("button", { name: "Otwórz ustawienia", exact: true }).count(), 0);
+    await captureNotice("permission-windows-shell");
+    await cs.evaluate(async () => {
+      delete window.__TAURI_INTERNALS__;
+      Object.defineProperty(navigator, "userAgent", { configurable: true, value: "Firefox/153 Linux" });
+      const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts"); useScreen.setState({ notice: null });
+    });
+    await cs.getByTestId("screen-notice").waitFor({ state: "detached" });
+    await cs.evaluate(async () => {
+      const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts"); useScreen.setState({ notice: "permissionHint" });
+    });
+    await captureNotice("permission-ambiguous-browser");
+    await cs.evaluate(() => { delete navigator.userAgent; });
+    writeFileSync(path.join(directory, "screenshots.txt"), [
+      "Real running Polish web app against a local loopback-only server.",
+      "Desktop 1440x900 and mobile 390x844 CSS pixels; no production or installed desktop app.",
+      "Reconnect notice: actual capture ended during recovery; still present after 6.5 seconds.",
+      "Permission notice: getDisplayMedia rejects with an OS-denied NotAllowedError.",
+      "permission-desktop-shell and permission-windows-shell: browser-rendered platform/UA markers only; no native app or settings launched.",
+      "permission-ambiguous-browser: neutral Firefox/Linux guidance for an indistinguishable picker/platform refusal.",
+      ...screenshots,
+    ].join("\n") + "\n");
+    cs.errors = cs.errors.filter(e => !e.includes("[screen] capture:"));
+  }
+
+}
+
 async function run(browsers, web, server, token) {
   const engine = name => browsers[engines.includes(name) ? name : engines[0]];
   const chromiumTab = engines.includes("chromium") && !fixedCanvas;
@@ -470,6 +601,11 @@ async function run(browsers, web, server, token) {
   await sees(wv, wsShare, 2, "stage switch keeps the thumbnail's player rendering");
   assert.ok(await wv.evaluate(() => [...window.__stageVideos].every(([share, video]) => document.querySelector(`video[data-share="${share}"]`) === video)), "a focus change preserves both attached media players");
   assert.deepEqual(await session(wv, (_, screen) => ({ transport: screen.transport, watches: screen.watches })), beforeFocus, "a focus change keeps the transport and watches");
+
+  if (process.env.E2E_SCREEN_RECONNECT_ONLY === "1") {
+    await reconnectAndScreenshots(cs, cv, [cv, wv], chromiumTab);
+    return opened.flatMap(p => errors(p).map(e => `${p.deviceName}: ${e}`));
+  }
 
   // Start → stop → start while watching two other shares: the watch transport is untouched.
   const c3 = await device(engine("chromium"), web, server, "c3-restart", { frequency: 700, canvasId: [3, 6], sendCodec: "vp9" });
@@ -595,6 +731,8 @@ async function run(browsers, web, server, token) {
   // Encrypted channels refuse until encrypted shares land: the button says so, nothing is sent.
   await join(c4, channels.secret);
   await waitFor(async () => (await shareOf(cv, "c4-canvas")) === null, "leaving the channel ends the share");
+  await waitFor(() => session(cv, (_, screen, __, id) => !screen.watches.some(w => w.share === id), c4Share), "a voluntary sharer move ends the viewer watch immediately", 5_000);
+  checks.push({ check: "voluntary sharer move closes watches without a reconnect error", ok: true });
   const soon = c4.getByRole("button", { name: "Screen sharing in encrypted channels is coming soon." });
   await soon.waitFor({ timeout: 20_000 });
   assert.equal(await soon.getAttribute("aria-disabled"), "true");
@@ -677,108 +815,7 @@ async function run(browsers, web, server, token) {
     checks.push({ check: "corroborated watchdog caps H.264 then selects VP9 without stopping any watch", ok: true });
   }
 
-  // Restore cv's watch (released earlier by the slot-limit check) before interrupting anything.
-  await watch(cv, "cs-tab");
-  await sees(cv, csShare, 1, "viewer is watching before the session interruption");
-
-  // A short session interruption keeps the browser capture alive, republishes with the new
-  // voice binding, and restores watches by identity even though the share ID changes.
-  await session(cs, (_, screen) => { window.__captureBeforeReconnect = screen.own.stream; });
-  const beforeReconnect = csShare;
-  await session(cs, (_, __, controller) => controller.connection.socket.close(4000, "local reconnect test"));
-  await waitFor(async () => {
-    const id = await ownShare(cs);
-    if (!id || id === beforeReconnect) return false;
-    csShare = id;
-    return true;
-  }, "the captured screen republishes after the session resync", 45_000);
-  assert.equal(await session(cs, (_, screen) => screen.own.stream === window.__captureBeforeReconnect && screen.own.stream.getVideoTracks()[0].readyState === "live"), true, "the exact same capture survives");
-  for (const viewer of [cv, wv, c3]) {
-    await waitFor(() => session(viewer, (_, screen, __, id) => screen.watches.some(w => w.share === id && w.status === "watching"), csShare), "viewer automatically rewatches the returning share", 45_000);
-    await sees(viewer, csShare, 1, "session reconnect restores screen frames without another picker or LIVE click");
-  }
-  // The viewer's own session also resumes every watch and preserves the selected stage.
-  const watchedBefore = await session(cv, (_, screen) => screen.watches.filter(w => w.status === "watching").map(w => w.share));
-  const stageBefore = await session(cv, (_, screen) => screen.stage);
-  await session(cv, (_, __, controller) => controller.connection.socket.close(4000, "local viewer reconnect test"));
-  await waitFor(() => session(cv, (_, screen, __, expected) => screen.stage === expected.stage && expected.watches.every(id => screen.watches.some(w => w.share === id && w.status === "watching")), { stage: stageBefore, watches: watchedBefore }), "viewer session restores watches and focus", 45_000);
-  await sees(cv, csShare, 1, "viewer session reconnect restores decoded frames");
-  checks.push({ check: "session reconnect retains capture, republishes, and resumes viewer watches", ok: true });
-
-  // A page stopping capture emits no `ended` event. The existing publisher poll
-  // must end the share and free every viewer's slot through the normal path.
-  await cs.evaluate(() => {
-    const sender = window.__pcs.filter(pc => pc.connectionState !== "closed")
-      .flatMap(pc => pc.getSenders()).find(s => s.track?.kind === "video" && s.track.readyState === "live");
-    if (!sender?.track) throw new Error("no live screen capture to stop");
-    sender.track.stop();
-  });
-  await waitFor(async () => (await ownShare(cs)) === null, "silent track stop ends the share", 10_000);
-  for (const viewer of [cv, wv, c3]) {
-    await waitFor(async () => !(await session(viewer, (_, screen, __, share) => screen.watches.some(w => w.share === share) || screen.slots.includes(share), csShare)), "silent track stop releases viewer slots", 10_000);
-  }
-  checks.push({ check: "page-initiated track.stop ends the share and releases watch slots", ok: true });
-
-  if (process.env.E2E_SCREEN_SCREENSHOTS) {
-    await cs.bringToFront();
-    await share(cs, chromiumTab ? "Sharing a browser tab" : "Sharing your screen");
-    await session(cs, (_, screen, controller) => {
-      controller.screen.suspend();
-      screen.own.stream.getVideoTracks()[0].stop();
-      controller.screen.resume();
-    });
-    await cs.evaluate(async () => {
-      const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
-      useSettings.getState().setLanguage("pl");
-    });
-    const directory = process.env.E2E_SCREEN_SCREENSHOTS;
-    mkdirSync(directory, { recursive: true });
-    const screenshots = [];
-    const captureNotice = async kind => {
-      for (const [name, width, height] of [["desktop", 1440, 900], ["mobile", 390, 844]]) {
-        await cs.setViewportSize({ width, height });
-        await cs.getByTestId("screen-notice").waitFor();
-        const bounds = await cs.getByTestId("screen-notice").boundingBox();
-        assert.ok(bounds && bounds.x >= 0 && bounds.x + bounds.width <= width, "notice fits the viewport");
-        const file = path.join(directory, `${kind}-pl-${name}.png`);
-        await cs.screenshot({ path: file });
-        screenshots.push(file);
-      }
-    };
-    await cs.getByRole("button", { name: "Udostępnij ponownie", exact: true }).waitFor();
-    await sleep(6_500);
-    await captureNotice("reconnect-stopped");
-    await cs.evaluate(() => {
-      navigator.mediaDevices.getDisplayMedia = async () => { throw new DOMException("Permission denied by system", "NotAllowedError"); };
-    });
-    await session(cs, (_, __, controller) => controller.screen.beginShare());
-    await cs.getByText(/Zezwól na nagrywanie ekranu dla/).waitFor();
-    await captureNotice("permission");
-    // The same running web UI, with only the desktop platform marker enabled, shows
-    // the Gwar name and settings action. No desktop app or OS settings are launched.
-    await cs.evaluate(async () => {
-      window.__TAURI_INTERNALS__ = {};
-      const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts");
-      useScreen.setState({ notice: null });
-    });
-    await cs.getByTestId("screen-notice").waitFor({ state: "detached" });
-    await cs.evaluate(async () => {
-      const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts");
-      useScreen.setState({ notice: "permission" });
-    });
-    await cs.getByRole("button", { name: "Otwórz ustawienia", exact: true }).waitFor();
-    await captureNotice("permission-desktop-shell");
-    await cs.evaluate(() => { delete window.__TAURI_INTERNALS__; });
-    writeFileSync(path.join(directory, "screenshots.txt"), [
-      "Real running Polish web app against a local loopback-only server.",
-      "Desktop 1440x900 and mobile 390x844 CSS pixels; no production or installed desktop app.",
-      "Reconnect notice: actual capture ended during recovery; still present after 6.5 seconds.",
-      "Permission notice: getDisplayMedia rejects with an OS-denied NotAllowedError.",
-      "permission-desktop-shell: browser-rendered desktop platform marker only; no native app or settings launched.",
-      ...screenshots,
-    ].join("\n") + "\n");
-    cs.errors = cs.errors.filter(e => !e.includes("[screen] capture:"));
-  }
+  await reconnectAndScreenshots(cs, cv, [cv, wv, c3], chromiumTab);
 
   const problems = opened.flatMap(p => errors(p).map(e => `${p.deviceName}: ${e}`));
   return problems;

@@ -2912,6 +2912,25 @@ describe("first-frame guard", () => {
     publisher.close();
   });
 
+  it("keeps failed codecs and the dropped hint across a new publisher for the same capture", async () => {
+    const first = await share();
+    await vi.advanceTimersByTimeAsync(10_000); encode(first.pc, 1);
+    const learned = first.publisher.fallbacks();
+    expect(learned).toMatchObject({ startHintUnsafe: true, brokenCodecs: ["h264"], codecFellBack: true });
+    first.publisher.close();
+    const restored = await share({ track: first.track as unknown as MediaStreamTrack, fallbacks: learned });
+    expect(remote(restored.pc)[0]).toMatch(/VP9/);
+    expect(remote(restored.pc)[0]).not.toMatch(/H264|x-google-start-bitrate/);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(restored.encodeFailed).toHaveBeenCalledOnce();
+    expect(restored.pc.createOffer).toHaveBeenCalledTimes(1);
+    restored.publisher.close();
+    const fresh = await share();
+    expect(remote(fresh.pc)[0]).toMatch(/H264/);
+    expect(remote(fresh.pc)[0]).toContain("x-google-start-bitrate=4000");
+    fresh.publisher.close();
+  });
+
   it("goes to the codec fallback first where the sent codec got no start hint", async () => {
     vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", platform: "Linux x86_64" });
     // GTK/WPE hints H.264 only: a VP9-led answer sends VP9 without it.

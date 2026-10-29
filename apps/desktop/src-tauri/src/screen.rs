@@ -101,8 +101,6 @@ pub fn open_screen_privacy_settings(window: tauri::WebviewWindow) -> Result<(), 
     }
     let url = if cfg!(target_os = "macos") {
         "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
-    } else if cfg!(target_os = "windows") {
-        "ms-settings:privacy-graphicscaptureprogrammatic"
     } else {
         return Err("this system has no screen recording privacy settings".into());
     };

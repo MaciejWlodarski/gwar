@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { captureApp, captureFailure } from "./screen-permission";
+import { captureApp, captureFailure, captureOs } from "./screen-permission";
 
 describe("screen capture errors", () => {
-  it.each(["Permission denied", "The request is not allowed", "User cancelled the picker"])("keeps cancellation silent: %s", message => {
-    expect(captureFailure(new DOMException(message, "NotAllowedError"))).toBe("cancelled");
+  it.each(["Permission denied", "User cancelled the picker"])("keeps cancellation silent: %s", message => {
+    expect(captureFailure(new DOMException(message, "NotAllowedError"), "Chrome/153")).toBe("cancelled");
   });
   it.each(["Permission denied by system", "Permission denied by policy", "Screen recording denied"])("identifies OS refusal: %s", message => {
     expect(captureFailure(new DOMException(message, "NotAllowedError"))).toBe("permission");
@@ -12,6 +12,16 @@ describe("screen capture errors", () => {
     expect(captureFailure(new DOMException("cancelled", "AbortError"))).toBe("cancelled");
     expect(captureFailure(new Error("raw browser details"))).toBe("failed");
     expect(captureFailure(new DOMException("Permission denied by system", "NotReadableError"))).toBe("permission");
+  });
+  it.each(["Version/26 Safari/605", "Firefox/153", "unknown"])("uses a neutral hint for ambiguous user-agent/platform refusal: %s", agent => {
+    expect(captureFailure(new DOMException("The request is not allowed by the user agent or the platform in the current context.", "NotAllowedError"), agent)).toBe("hint");
+    expect(captureFailure(new DOMException("The request is not allowed", "NotAllowedError"), agent)).toBe("hint");
+    expect(captureFailure(new DOMException("User cancelled the picker", "NotAllowedError"), agent)).toBe("cancelled");
+  });
+  it("selects guidance for the actual OS", () => {
+    expect(captureOs("Macintosh; Intel Mac OS X 10_15_7")).toBe("macos");
+    expect(captureOs("Windows NT 10.0")).toBe("windows");
+    expect(captureOs("Linux")).toBe("other");
   });
   it("names only known browsers or Gwar", () => {
     expect(captureApp(true, "anything")).toBe("Gwar");

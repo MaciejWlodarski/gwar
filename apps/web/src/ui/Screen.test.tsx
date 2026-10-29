@@ -61,7 +61,7 @@ async function desktop(capture: DesktopCapture | null) {
 
 describe("persistent screen guidance", () => {
   it("keeps a localized recovery notice until the user acts", async () => {
-    useSession.setState({ phase: "online" });
+    useSession.setState({ phase: "online", me: { session: 1, uid: "u1" }, clients: { 1: client(1) } });
     useSettings.setState({ language: "pl" });
     useScreen.setState({ notice: "reconnect" });
     await act(async () => root.render(<TooltipProvider><ScreenNotice /></TooltipProvider>));
@@ -72,6 +72,35 @@ describe("persistent screen guidance", () => {
     expect(restart).toHaveBeenCalledOnce();
     expect(container.querySelector('[role="alert"]')).not.toBeNull();
     restart.mockRestore();
+  });
+
+  it("disables recovery sharing outside voice, without opening a picker", async () => {
+    useSession.setState({ phase: "online", me: null, clients: {} });
+    useSettings.setState({ language: "en" }); useScreen.setState({ notice: "reconnect" });
+    await act(async () => root.render(<TooltipProvider><ScreenNotice /></TooltipProvider>));
+    const restart = [...container.querySelectorAll("button")].find(b => b.textContent === "Share again")!;
+    expect(restart.disabled).toBe(true);
+    controller.screen.beginShare();
+    expect(getDisplayMedia).not.toHaveBeenCalled();
+  });
+
+  it("uses Windows guidance for Gwar and hides its unhelpful OS shortcut", async () => {
+    await desktop("ok");
+    const agent = vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Windows NT 10.0 Chrome/153");
+    useSettings.setState({ language: "pl" }); useScreen.setState({ notice: "permission" });
+    await act(async () => root.render(<TooltipProvider><ScreenNotice /></TooltipProvider>));
+    expect(container.textContent).toContain("dla Gwar w Ustawieniach → Prywatność i zabezpieczenia");
+    expect(container.textContent).not.toContain("Otwórz ustawienia");
+    agent.mockRestore();
+  });
+
+  it("shows ambiguous refusal as a neutral hint and names the browser", async () => {
+    const agent = vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Firefox/153 Linux");
+    useSettings.setState({ language: "en" }); useScreen.setState({ notice: "permissionHint" });
+    await act(async () => root.render(<TooltipProvider><ScreenNotice /></TooltipProvider>));
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("permission for Firefox in your system or browser privacy settings");
+    agent.mockRestore();
   });
 
   it("offers desktop screen settings and never displays raw browser errors", async () => {

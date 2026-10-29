@@ -996,6 +996,44 @@ describe("staying on the server without voice", () => {
     expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 2, password: null });
   });
 
+  it.each([false, true])("Leave cancels pending voice and screen rejoin during reconnect (after Welcome = %s)", async welcomed => {
+    connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
+    const { useScreen } = await import("./screen");
+    const source = { readyState: "live", stop: vi.fn() };
+    useScreen.setState({ own: { phase: "live", attempt: 7, share: "retained", stream: { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream,
+      surface: "screen", spec: { mode: "smooth", height: 1080, fps: 30 }, viewers: 0, guests: 0, guestLink: false, preview: false } });
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    if (welcomed) {
+      link.welcomeNow(welcome({ session: 9, uid: "u1", channels: [chan(1), chan(2)], clients: [client(9, null, { uid: "u1" })] }), true);
+      await vi.advanceTimersByTimeAsync(10);
+      link.status_({ state: "reconnecting", attempt: 2, retryAt: 0 });
+    }
+    const stop = vi.spyOn(controller.screen, "stopShare");
+    await controller.leaveVoice();
+    expect(stop).toHaveBeenCalledOnce();
+    expect(source.stop).toHaveBeenCalledOnce();
+    expect(useScreen.getState().own).toBeNull();
+    const joins = link.sent("channel.join").length;
+    link.status_({ state: "reconnecting", attempt: 3, retryAt: 0 });
+    link.welcomeNow(welcome({ session: 10, uid: "u1", channels: [chan(1), chan(2)], clients: [client(10, null, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join")).toHaveLength(joins);
+    expect(link.sent("channel.leave")).toHaveLength(0);
+    expect(stores.useUi.getState().toasts).toEqual([]);
+    stop.mockRestore();
+  });
+
+  it("keeps a pending voice rejoin across a second blip before its channel update", async () => {
+    connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    link.welcomeNow(welcome({ session: 9, uid: "u1", channels: [chan(1), chan(2)], clients: [client(9, null, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(10);
+    link.status_({ state: "reconnecting", attempt: 2, retryAt: 0 });
+    link.welcomeNow(welcome({ session: 10, uid: "u1", channels: [chan(1), chan(2)], clients: [client(10, null, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join").map(r => r.d)).toEqual([{ channel: 2, password: null }, { channel: 2, password: null }]);
+  });
+
   it("does not offer leaving on TeamSpeak servers", async () => {
     connectFake({ channel: 1, kind: "teamspeak" });
     await controller.leaveVoice();

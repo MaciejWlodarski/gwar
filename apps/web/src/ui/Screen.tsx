@@ -7,14 +7,14 @@ import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as Rea
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { cn } from "../lib/cn";
 import { canOpenScreenRecordingSettings, isDesktop, openScreenRecordingSettings } from "../platform";
-import { captureApp } from "../voice/screen-permission";
+import { captureApp, captureOs } from "../voice/screen-permission";
 import { canActOn } from "../lib/permissions";
 import type { Client } from "../proto/Client";
 import type { ScreenPauseReason } from "../proto/ScreenPauseReason";
 import type { ScreenShare } from "../proto/ScreenShare";
 import { controller } from "../state/controller";
 import { guestLinkPossible, useCanWatch, useScreenSupport } from "../state/screen-controller";
-import { shareOf } from "../state/reducer";
+import { myChannelId, shareOf } from "../state/reducer";
 import { slotOf, useScreen } from "../state/screen";
 import { useSession, useUi } from "../state/stores";
 import { type PublishStats } from "../voice/screen";
@@ -82,16 +82,19 @@ export function ScreenNotice() {
   const notice = useScreen(s => s.notice);
   const own = useScreen(s => s.own);
   const phase = useSession(s => s.phase);
+  const channel = useSession(myChannelId);
   if (!notice) return null;
   return (
-    <div role="alert" data-testid="screen-notice" className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-line-strong bg-surface px-4 py-3 text-sm text-fg">
-      <MonitorOff aria-hidden className="size-4 shrink-0 text-danger" />
-      <p className="min-w-0 flex-1 basis-64">{notice === "reconnect" ? t("screen.reconnectStopped") : t("screen.permission", { app: captureApp(isDesktop(), navigator.userAgent) ?? t("screen.browser") })}</p>
-      {notice === "permission" && canOpenScreenRecordingSettings() && (
+    <div role={notice === "permissionHint" ? "status" : "alert"} data-testid="screen-notice" className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-line-strong bg-surface px-4 py-3 text-sm text-fg">
+      <MonitorOff aria-hidden className={cn("size-4 shrink-0", notice === "permissionHint" ? "text-muted" : "text-danger")} />
+      <p className="min-w-0 flex-1 basis-64">{notice === "reconnect" ? t("screen.reconnectStopped") : t(notice === "permissionHint" ? "screen.permissionHint" : "screen.permission", {
+        app: captureApp(isDesktop(), navigator.userAgent) ?? t("screen.browser"), settings: t(`screen.permissionPlace.${captureOs(navigator.userAgent)}`),
+      })}</p>
+      {notice !== "reconnect" && canOpenScreenRecordingSettings() && (
         <Button className="min-h-11" onClick={() => void openScreenRecordingSettings().catch((e: unknown) => console.warn("[screen] privacy settings:", e))}>{t("screen.openSettings")}</Button>
       )}
       {notice === "reconnect" && (
-        <Button className="min-h-11" variant="primary" disabled={phase !== "online" || !!own} onClick={() => controller.screen.beginShare()}>{t("screen.shareAgain")}</Button>
+        <Button className="min-h-11" variant="primary" disabled={phase !== "online" || !!own || channel === null} onClick={() => controller.screen.beginShare()}>{t("screen.shareAgain")}</Button>
       )}
       <IconButton label={t("common.close")} onClick={() => useScreen.getState().dispatch({ type: "notice", notice: null })}><X className="size-4" /></IconButton>
     </div>

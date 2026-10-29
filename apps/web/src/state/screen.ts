@@ -55,7 +55,7 @@ export type TransportPhase = "none" | "connecting" | "connected" | "failed";
 
 export interface ScreenState {
   own: OwnShare | null;
-  notice: "reconnect" | "permission" | null;
+  notice: "reconnect" | "permission" | "permissionHint" | null;
   /** The session's watch transport and its run (`screen.watch.offer`). */
   transport: { phase: TransportPhase; run: number };
   /** Shares I watch, in watch order (their bandwidth priority after the stage). */
@@ -77,6 +77,7 @@ export type ScreenAction =
   | { type: "picked"; attempt: number; stream: MediaStream; surface: ScreenSurface }
   | { type: "choose"; spec: ScreenSpec }
   | { type: "surface"; attempt: number; surface: ScreenSurface; spec: ScreenSpec }
+  | { type: "queueShare"; attempt: number }
   | { type: "starting"; attempt: number }
   | { type: "started"; attempt: number; share: string }
   | { type: "live"; share: string }
@@ -143,6 +144,8 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       if (sameSpec(own.spec, action.spec)) return state;
       return { ...state, own: { ...own, spec: { ...action.spec } } };
     }
+    case "queueShare":
+      return setOwn(state, action.attempt, ["choosing"], { phase: "reconnecting" });
     case "starting":
       return setOwn(state, action.attempt, ["choosing", "reconnecting"], { phase: "starting" });
     case "surface":
@@ -157,7 +160,8 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       return state.own?.phase === "choosing" ? { ...state, own: { ...state.own, guestLink: action.on } } : state;
     case "link": {
       const { [action.share]: _, ...rest } = state.links;
-      return { ...state, links: action.active ? { ...rest, [action.share]: true } : rest };
+      return { ...state, links: action.active ? { ...rest, [action.share]: true } : rest,
+        own: !action.active && state.own?.share === action.share ? { ...state.own, guestLink: false } : state.own };
     }
     case "preview":
       return state.own ? { ...state, own: { ...state.own, preview: action.on } } : state;
@@ -167,7 +171,8 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       return { ...state, notice: action.notice };
     case "suspend":
       return { ...state, links: {}, own: state.own && ["starting", "live", "reconnecting"].includes(state.own.phase)
-        ? { ...state.own, phase: "reconnecting", share: null, viewers: 0, guests: 0 } : state.own,
+        ? { ...state.own, phase: "reconnecting", share: null, viewers: 0, guests: 0,
+          guestLink: state.own.phase === "reconnecting" ? state.own.guestLink : state.own.guestLink && !!state.own.share && !!state.links[state.own.share] } : state.own,
       transport: { ...state.transport, phase: "none" }, slots: emptySlots(), streams: emptySlots(),
       watches: state.watches.map(w => ({ share: w.share, id: w.id, slot: null, status: "requesting" })) };
     case "watchWaiting":
