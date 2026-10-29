@@ -158,15 +158,27 @@ correlated period), which here averaged ~4 ms/s: ~100 s to drain.
 The low-water window already proves how much of the queue is surplus: a full 5 s window in
 which the queue never dipped below target + surplus. Now a surplus of 100 ms (`BACKLOG_TRIM`)
 or more makes a cut due once it has held for the evidence time without a starvation (PLC on an
-empty queue) in it. The cut waits for a quiet frame (decoded level below −42 dB, the gentle
-shrink's threshold), at most 2 s, then goes ahead anyway. It drops the oldest packets, keeping
-40 ms (`BACKLOG_KEEP`) of the lowest surplus the evidence saw for the gentle shrink, a cushion
-against local stalls the arrival rule cannot see. The decoder runs through the dropped packets,
-so its state stays continuous, and the next packet fades in.
+empty queue) in it. The cut takes all but 40 ms (`BACKLOG_KEEP`) of the lowest surplus the
+evidence saw, which it leaves to the gentle shrink, a cushion against local stalls the arrival
+rule cannot see.
+
+The cut removes silence only, as long as it can. After a quiet frame (decoded level below
+−42 dB, the gentle shrink's threshold) the decoder takes the next queued packets one at a time
+and decodes each. A quiet one is dropped; the first loud one plays right after the quiet frame,
+as decode-ahead does, and the rest of the cut waits for the next quiet frame. Speech has pauses,
+so the cut proceeds in silent chunks. Once the cut has been due for 2 s, whatever is left goes at
+once: the oldest packets are dropped and the next one fades in, so continuous speech is cut
+there. Either way the decoder runs through every dropped packet, so its state stays continuous.
+A cut under way goes on while its surplus falls below 100 ms, bounded by the lowest surplus
+since its evidence began. The previous version dropped everything once one frame was quiet. A
+single quiet frame between words then let it drop the start of the next word: ~160 ms of speech
+in its unit test.
 
 The evidence time starts at one window (5 s), so after a bloat the cut is due one window after
 the queue empties. A starvation within 10 s of a cut doubles it, up to 80 s; a cut without one
-resets it to 5 s. This is the backoff speaker headroom uses ([latency.md](latency.md)). Without
+resets it to 5 s. This is the backoff speaker headroom uses ([latency.md](latency.md)). A cut
+counts as clean only once playout has run 10 s past it without starving, so a starvation that
+begins within the 10 s counts even when its late packet arrives after them. Without
 it, delay that swells and recedes more rarely than the window (a contended Wi-Fi or cellular
 link, say) was cut after every swell, and the next swell underran each time: 3–7 times the
 concealment of no cut, for 15–25 ms less delay. A starvation counts only once a late packet
@@ -174,6 +186,12 @@ resumes the held timeline, so the end of a talk spurt is no evidence. Proven los
 later packets queued) is no starvation either, so a lossy stream is cut too. An earlier version
 that cut whenever the window held no PLC at all showed idle-path underruns on a busy host; a
 loaded host's late refills are starvation, so they still veto the cut.
+
+The evidence also halves after 60 s without a starvation or growth, down to 5 s. Without that, a
+few early swells (on a Wi-Fi link, say) could raise it to 80 s, and a real bloat afterwards held
+~430 ms for ~80 s. The price is under swells that go on: the evidence relaxes each minute, and
+one more cut underruns before it grows again. In the table below that costs 6 s / 250 ms swells
+4 PLC frames over 120 s (17 without the halving); the other rows are unchanged.
 
 The cut covers only jitter that the evidence saw. A delay spike of more than 40 ms that comes
 after a cut and less often than the evidence time underruns once; the evidence time then
@@ -187,11 +205,13 @@ the cut) and within 15 ms after 17 s, with or without a loss every 1.5 s. Small 
 (60 ms) are still drained gently. `delay_that_swells_and_recedes_keeps_its_cushion` plays 120 s
 of 20 ms packets through swells (up over 300 ms, held 500 ms, down over 400 ms) every 8 and
 10 s, 150 and 250 ms high, in quiet audio and in speech that never has a quiet frame. It allows
-at most one swell's PLC more than with no cut. In quiet audio (RTP, 20 ms packets, 120 s):
+at most one swell's PLC more than with no cut. In quiet audio (RTP, 20 ms packets, 120 s; with a
+packet in 100 lost, which conceals 60 frames by itself, the PLC no cut / with backoff is 73 / 77,
+78 / 80, 83 / 86, 92 / 94, 102 / 108 and 109 / 121):
 
 | swell period / height | PLC, no cut | PLC, cut every time (5 s evidence) | PLC, with backoff | mean delay ms, no cut / backoff |
 |---|---|---|---|---|
-| 6 s / 250 ms | 13 | 89 | 17 | 270 / 269 |
+| 6 s / 250 ms | 13 | 89 | 21 | 270 / 269 |
 | 8 s / 150 ms | 18 | 50 | 20 | 161 / 160 |
 | 8 s / 250 ms | 23 | 69 | 26 | 260 / 260 |
 | 10 s / 250 ms | 32 | 57 | 34 | 256 / 254 |
@@ -200,6 +220,16 @@ at most one swell's PLC more than with no cut. In quiet audio (RTP, 20 ms packet
 
 Swells 25 s apart are rarer than the probe: every cut is clean, and each swell costs a few more
 PLC frames in exchange for ~70 ms less delay between them.
+
+`a_backlog_cut_drops_only_quiet_packets_until_its_cap` (playout.rs) cuts 300 ms of backlog in
+encoded speech. With 120 ms pauses every 320 ms the quiet packets cover the cut ~0.5 s after the
+window proves the surplus, and no dropped packet decodes at −42 dB or louder. With one quiet
+frame between words nothing is dropped until the 2 s cap.
+`the_decoder_runs_through_a_forced_backlog_cut` checks that the packet after a forced cut, past
+its fade, is what a decoder of the whole stream plays.
+`a_starvation_that_begins_within_the_probe_backs_off_when_it_ends_after` and
+`the_backlog_evidence_relaxes_a_minute_after_it_grew_or_playout_starved` hold the probe's edge
+and the halving.
 
 Before/after (browser → native, up10, 3 runs each, 240 markers). These are 3 runs per variant
 on a host shared with other agents' builds (load 2–9), so differences of a few milliseconds are
@@ -220,14 +250,31 @@ surplus and holds no PLC); "after" is the final rule, measured separately:
 | first fix | 492 | 487 | 136 | 122 | 99 | 89 | 89 |
 | after | 489 | 480 | 145 | 136 | 112 | 91 | 88 |
 
-The cut lands about one window (5 s) after the queue empties; the final rule then waits up to 2 s
-for a pause in the markers' speech, which moves recovery from 16 to ~21 s. The remaining 40 ms
-drains to the idle level by +20..+25 s. "after" p95 still includes the 5 s before the cut. The
-cost is one jump: the ~360 ms skipped are discarded audio, which here took 2 post-upload markers
-with it in every run. Idle voice showed no underruns and no extra concealment in these runs, a
-statement about the jitter these runs' windows saw: a delay spike rarer than the evidence time
-can still underrun after a cut, as above. The lost markers during the upload are the bulk flow's
+The cut lands about one window (5 s) after the queue empties. The harness never has a quiet
+frame: between markers it sends a 400 Hz carrier at −25 dBFS. So the cut there always waits its
+2 s cap and then drops what is left at once, which moves recovery from 16 to ~21 s; the
+quiet-only cut is held by the unit tests above. The remaining 40 ms drains to the idle level by
++20..+25 s. "after" p95 still includes the 5 s before the cut. The cost is one jump: the ~360 ms
+skipped are discarded audio, which here took 1–2 post-upload markers with it in every run. Idle
+voice showed no underruns and no extra concealment in these runs, a statement about the jitter
+these runs' windows saw: a delay spike rarer than the evidence time can still underrun after a
+cut, as above. The lost markers during the upload are the bulk flow's
 queue drops, as before.
+
+The quiet-only cut was re-measured the same way, interleaved with the build before it (the cut
+of one quiet frame) in two A/B sessions of 3 + 3 runs, plus 3 runs of the new build alone and one
+pair with logging (load 1–6). On this harness both builds run the same code, as above, so any
+difference is run-to-run variance; the level the buffer carries through the upload varies with
+how playout starves as the queue fills:
+
+| build | runs | recovery (last marker above 105 ms), median and range | after p50 | +5..+10 / +10..+15 / +15..+20 / +20..+25 s, second session |
+|---|---|---|---|---|
+| cut after one quiet frame | 7 | 20.0 s (16.2–23.2 s) | 125 | 154 / 141 / 117 / 97 |
+| quiet packets only | 10 | 21.5 s (16.7–29.7 s) | 132 | 147 / 135 / 111 / 93 |
+
+The harness's own recovery figure (relative to each run's `pre` p95) counted 2 of the 10 runs of
+the new build as not recovered within 30 s. One drained slowly and fell below its bound (99 ms)
+only at +28.2 s; the other had settled at ~91 ms by +25 s, but one marker at +29.7 s took 111 ms.
 
 ## Fix 2: the screen budget never reserves more than 30 % of the estimate
 
