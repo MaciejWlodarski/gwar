@@ -269,6 +269,11 @@ pub struct JitterBuffer {
     last_samples: u64,
     held: u64,
     recovering: Option<Recovery>,
+    /// The first packet after an arrival gap that found audio still queued (`STALE`): the queue
+    /// before it is the previous spurt's tail, which plays out, all but its inaudible packets
+    /// (`backlog_room`); on the RTP clock playout then moves on to it without concealing the
+    /// pause.
+    resume: Option<u64>,
     clock: Clock,
     arrival: Option<(u64, Instant, u64)>,
     jitter: f64,
@@ -327,6 +332,12 @@ pub struct JitterBuffer {
 const FRAME: u64 = 960; // TS packet-counter stride and unknown-stream default.
 const MAX_CONCEAL: u64 = 4800; // 100 ms of audio, independent of packet duration.
 const STALL: Duration = Duration::from_millis(100);
+// A spurt or stall boundary keeps the audio still queued for a shorter arrival gap than this, and
+// discards it after a longer one. Playout empties any queue (`MAX_QUEUED` caps it at 1 s) within
+// 1 s, so audio left after a longer gap is audio the output stopped taking: at least a second
+// late, worse than the gap.
+const STALE: Duration = Duration::from_secs(1);
+const _: () = assert!(STALE.as_millis() as u64 * 48 == MAX_QUEUED);
 // Queued audio beyond any legitimate need: the 160 ms target, plus a refill and speaker headroom
 // (the speaker ring holds 500 ms), with margin.
 const MAX_QUEUED: u64 = 48_000;
@@ -410,6 +421,7 @@ impl JitterBuffer {
             last_samples: FRAME,
             held: 0,
             recovering: None,
+            resume: None,
             clock: Clock::Rtp,
             arrival: None,
             jitter: 0.0,
@@ -458,8 +470,12 @@ impl JitterBuffer {
         if self.clock != clock {
             self.reset();
         }
+        let mut resumed = false;
         if let Some((last_ts, at, last_samples)) = self.arrival {
             let elapsed = now.saturating_duration_since(at);
+            // Audio still queued after an arrival gap played on time and is speech, not delay the
+            // gap added: it stays (`resume`), unless the gap makes it stale.
+            let tail = elapsed >= STALL && elapsed < STALE && !self.packets.is_empty() && ts > last_ts;
             // A real RTP pause advances media time with wall time. Delayed delivery
             // resumes with contiguous timestamps, even after a long arrival gap.
             let media_gap = ts.saturating_sub(last_ts.saturating_add(last_samples));
@@ -468,7 +484,18 @@ impl JitterBuffer {
                 && media_gap >= 4800
                 && media_gap.abs_diff((elapsed.as_secs_f64() * 48_000.0) as u64) <= 4800
             {
-                self.reset();
+                // A new spurt: what the arrivals and the queue said about the delay is void.
+                if tail {
+                    self.restart();
+                    self.resume = Some(ts);
+                } else {
+                    self.reset();
+                }
+            } else if tail {
+                // A stall that playout never starved in added no delay: nothing is late. The
+                // arrival gap is no jitter either.
+                self.resume = Some(ts);
+                resumed = true;
             } else if clock == Clock::Sequence
                 && elapsed >= Duration::from_secs(2)
                 && ts > last_ts
@@ -519,7 +546,7 @@ impl JitterBuffer {
                     Clock::Sequence => (ts - last_ts) as f64 / FRAME as f64 * last_samples as f64,
                 };
                 // Fast attack, two-second release. Ignore reordered packets for the estimator.
-                if self.recovering.is_none() {
+                if self.recovering.is_none() && !resumed {
                     self.jitter = (self.jitter * (-elapsed / 2.0).exp())
                         .max((elapsed * 48_000.0 - expected).abs())
                         .min(MAX_TARGET as f64);
@@ -579,6 +606,14 @@ impl JitterBuffer {
         self.missing = 0;
         self.last_samples = FRAME;
         self.held = 0;
+        self.resume = None;
+        self.skipped = false;
+        self.overflowed = false;
+        self.restart();
+    }
+
+    /// Forget what the arrivals and the queue said about the delay, but keep the queue.
+    fn restart(&mut self) {
         self.recovering = None;
         self.arrival = None;
         self.jitter = 0.0;
@@ -592,8 +627,6 @@ impl JitterBuffer {
         self.backlog_since = None;
         self.backlog_due = None;
         self.backlog_paced = None;
-        self.skipped = false;
-        self.overflowed = false;
     }
 
     pub fn pop(&mut self) -> Playout {
@@ -963,17 +996,21 @@ impl JitterBuffer {
         depth.saturating_sub(keep)
     }
 
-    /// Whether a due cut (`update_backlog`) can take the next packet, which is queued in order.
-    /// After an inaudible frame the decoder takes it with `pop_for(now, 0)` and, if it decodes
-    /// inaudible too, drops it (`dropped`); an audible one plays after the frame, as decode-ahead
-    /// does. A cut so removes only silence, and the decoder runs through all of it.
+    /// Whether a due cut (`update_backlog`), or a spurt's tail (`resume`), can take the next
+    /// packet, which is queued in order. After an inaudible frame the decoder takes it with
+    /// `pop_for(now, 0)` and, if it decodes inaudible too, drops it (`dropped`); an audible one
+    /// plays after the frame, as decode-ahead does. A cut so removes only silence, and the
+    /// decoder runs through all of it.
     pub(crate) fn backlog_room(&self) -> bool {
-        self.backlog_due.is_some()
-            && self.recovering.is_none()
-            && self.next.and_then(|next| self.packets.get(&next)).is_some_and(|p| p.samples <= self.backlog_excess())
+        let Some((next, packet)) = self.next.and_then(|next| Some((next, self.packets.get(&next)?))) else {
+            return false;
+        };
+        // A spurt's tail drops its silence freely, as the reset before it dropped the whole tail.
+        self.resume.is_some_and(|resume| next < resume)
+            || self.backlog_due.is_some() && self.recovering.is_none() && packet.samples <= self.backlog_excess()
     }
 
-    /// Commit an inaudible packet a due cut dropped (`backlog_room`): debited like `shrunk`.
+    /// Commit an inaudible packet `backlog_room` let the decoder drop: debited like `shrunk`.
     pub(crate) fn dropped(&mut self, now: Instant, samples: usize) {
         self.shrunk(now, samples);
     }
@@ -1047,7 +1084,9 @@ impl JitterBuffer {
         if let Some((&ts, _)) = self.packets.first_key_value() {
             // Head-hold PLC is credit for a gap subsequently proven lost. A packet
             // at the held head was merely late and may still buy a frame of depth.
-            let covered = if self.missing >= MAX_CONCEAL { ts - next } else { (ts - next).min(self.held) };
+            // Past a spurt's tail (all played, or lost) the next spurt follows without the pause.
+            let tail_done = self.resume.is_some_and(|resume| ts >= resume);
+            let covered = if self.missing >= MAX_CONCEAL || tail_done { ts - next } else { (ts - next).min(self.held) };
             next += covered;
             self.held = self.held.saturating_sub(covered);
             self.next = Some(next);
@@ -1055,6 +1094,9 @@ impl JitterBuffer {
         let available = self.depth().1.saturating_sub(demand as u64 + SAFETY);
         let held = self.above_since.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
         if let Some(packet) = self.packets.remove(&next) {
+            if self.resume.is_some_and(|resume| next >= resume) {
+                self.resume = None;
+            }
             self.next = Some(next.saturating_add(packet.step));
             if self.recovering.as_ref().is_some_and(|r| next.saturating_add(packet.step) >= r.before) {
                 self.recovering = None;
@@ -1345,6 +1387,79 @@ mod tests {
             let ts = if clock == Clock::Rtp { 48_000 } else { FRAME };
             jb.push_at(ts, FRAME, vec![2], now + Duration::from_secs(1), clock);
             assert_eq!(jb.pop(), packet(2));
+        }
+    }
+
+    /// 440 ms queued at once (keys 0..22), then a refill of 20 ms every 20 ms from `stop` on
+    /// unless `stopped`, and from `resume` ms on the next spurt (keys from 100) one per 20 ms
+    /// for 800 ms: on the RTP clock its timestamps jump by the pause, on the sequence clock they
+    /// follow on. Returns what each refill played (`None`: concealed) and the queued audio.
+    fn boundary(clock: Clock, resume: u64, stopped: std::ops::Range<u64>) -> (Vec<Option<u8>>, Vec<u64>) {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut jb = JitterBuffer::new();
+        for i in 0..22 {
+            jb.push_at(i * FRAME, FRAME, vec![i as u8], at(0), clock);
+        }
+        let first = 22 * FRAME + if clock == Clock::Rtp { resume * 48 } else { 0 };
+        let (mut played, mut queued) = (Vec::new(), Vec::new());
+        for ms in (0..resume + 800).step_by(20) {
+            if ms >= resume {
+                let j = (ms - resume) / 20;
+                jb.push_at(first + j * FRAME, FRAME, vec![100 + j as u8], at(ms), clock);
+            }
+            if stopped.contains(&ms) {
+                continue;
+            }
+            played.push(match jb.pop_for(at(ms), FRAME as usize) {
+                Playout::Packet { data, .. } => Some(data[0]),
+                _ => None,
+            });
+            queued.push(jb.depth().1);
+        }
+        (played, queued)
+    }
+
+    #[test]
+    fn a_spurt_or_stall_boundary_plays_the_queued_tail_unless_it_is_stale() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            // A gated pause of 400 ms after a 440 ms backlog: the next spurt arrives 100 ms
+            // after the last packet, with 340 ms of the previous one still queued. A new spurt
+            // (RTP) or a stall recovery (sequence) discarded it, the end of a word with it; now
+            // all of it plays, and the next spurt follows without a concealment.
+            let (played, _) = boundary(clock, 100, 0..0);
+            let expected: Vec<_> = (0..22).chain(100..100 + 18).map(Some).collect();
+            assert_eq!(played[..40], expected[..], "{clock:?}");
+            // Output stopped 100 ms in and arrivals with it: after 1.2 s without either, the
+            // 17 packets still queued are over a second late (`STALE`) and go, as before; at
+            // most the last of them plays, then the new spurt at its target.
+            let (played, queued) = boundary(clock, 1300, 100..1300);
+            let after: Vec<_> = played[5..].iter().map(|p| p.unwrap()).collect();
+            assert!(after.iter().filter(|&&k| k < 100).count() <= 1, "{clock:?}: {after:?}");
+            assert!(after.windows(2).all(|w| w[0] < 100 || w[1] == w[0] + 1), "{clock:?}: {after:?}");
+            assert!(queued[5..].iter().all(|&q| q <= 2 * FRAME), "{clock:?}: {queued:?}");
+        }
+    }
+
+    #[test]
+    fn a_long_stall_after_a_backlog_still_resyncs_to_the_target() {
+        // Delivery stalls for 2 s after a 440 ms backlog while playout goes on: the queue runs
+        // dry, so its audio is late by the stall, and the burst trims to the target as before.
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let start = Instant::now();
+            let at = |ms: u64| start + Duration::from_millis(ms);
+            let mut jb = JitterBuffer::new();
+            for i in 0..22 {
+                jb.push_at(i * FRAME, FRAME, vec![i as u8], at(0), clock);
+            }
+            for ms in (0..2000).step_by(20) {
+                jb.pop_for(at(ms), FRAME as usize);
+            }
+            for i in 22..122 {
+                jb.push_at(i * FRAME, FRAME, vec![i as u8], at(2000), clock);
+            }
+            assert!(matches!(jb.pop_for(at(2000), FRAME as usize), Playout::Packet { fade: true, .. }), "{clock:?}");
+            assert!(jb.depth().1 <= jb.target_samples() + FRAME, "{clock:?}: {}", jb.depth().1);
         }
     }
 
