@@ -348,12 +348,12 @@ after:
 | 150 Hz, 40 ms gaps every 200 ms, 300 ms | 2.0 s, 200 ms | 0.90 s, 0 ms, 219 ms |
 | 150 Hz continuous, 300 ms | 2.0 s, 200 ms | 0.68 s, 0 ms, 213 ms |
 | 150 Hz continuous, 430 ms | 2.0 s, 340 ms | 1.38 s, 0 ms, 353 ms |
-| 100 Hz continuous, 430 ms | 2.0 s, 320 ms | 1.44 s, 0 ms, 360 ms |
-| 250 Hz continuous, 430 ms | 2.0 s, 360 ms | 1.26 s, 0 ms, 360 ms |
+| 100 Hz continuous, 430 ms | 2.0 s, 320 ms | 1.44 s, 0 ms, 350 ms |
+| 250 Hz continuous, 430 ms | 2.0 s, 360 ms | 1.20 s, 0 ms, 364 ms |
 | 150 Hz, 40 ms gaps, 430 ms | 2.0 s, 340 ms | 1.68 s, 0 ms, 359 ms |
-| noisy 100 Hz voice (periods at 0.81–0.85), 430 ms | 2.0 s, 380 ms | 3.48 s (2 s wait), 0 ms, 351 ms |
-| noisy 150 Hz voice (periods at 0.78–0.87), 430 ms | 2.0 s, 380 ms | 3.78 s (2 s wait), 0 ms, 353 ms |
-| loud noise, 430 ms | 2.0 s, 380 ms | 3.72 s (2 s wait), 0 ms, 360 ms |
+| noisy 100 Hz voice (periods at 0.81–0.87), 430 ms | 2.0 s, 380 ms | 3.48 s (2 s wait), 0 ms, 352 ms |
+| noisy 150 Hz voice (periods at 0.79–0.87), 430 ms | 2.0 s, 380 ms | 3.66 s (2 s wait), 0 ms, 353 ms |
+| loud noise, 430 ms | 2.0 s, 380 ms | 3.96 s (2 s wait), 0 ms, 352 ms |
 
 In every case the largest sample-to-sample step during the drain is at most the reference's, and
 no second of output had more than 24 % of its length removed. The old cut's output left the
@@ -376,6 +376,16 @@ Unit tests:
   the cut became due.
 - `a_cut_that_never_splices_gives_up_and_proves_the_surplus_again` holds the 10 s give-up and the
   new window after it.
+- `a_search_that_finds_no_valid_lag_never_splices` plays a 200 Hz voice whose harmonics sit in
+  the low-pass's nulls (formants at 2 and 4 kHz). The first version took a filter's startup for
+  signal, found no valid lag and then removed the shortest, half a period. The search now
+  averages real samples only and splices nothing without a valid lag.
+- `splices_stay_within_a_block_they_shortened` and
+  `a_splice_in_a_ten_ms_block_before_a_gap_stays_within_it` play a 400 Hz voice whose splices
+  shorten a block past the next splice point; the first version panicked there.
+- `small_arrival_jitter_never_trims_refill_margin_into_starvation` keeps its tone that resets
+  phase every packet: acceleration now removes none of its 10 ms surplus in 60 s (before, e.g.,
+  331 samples), with no starvation either way. A phase-continuous voice still converges (~320).
 
 NetEq's preemptive expand (stretching when the buffer runs low) is not ported. Gwar's buffer
 starts at its target and recovers starvation with PLC, and the stall recovery and the evidence

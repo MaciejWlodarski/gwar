@@ -169,14 +169,15 @@ fn accelerate(pcm: &mut [f32], budget: usize, threshold: f64) -> (usize, f64) {
     if longest < MIN_LAG || (longest < MAX_LAG && threshold < PARTIAL_RANGE) {
         return (0, 0.0);
     }
-    let window = PICK_WINDOW.min(pcm.len() - longest);
+    let window = PICK_WINDOW.min(pcm.len() - longest - (SMOOTH - 1));
     // Pick the lag below 2 kHz, as NetEq does at 4 kHz, so that broadband noise does not move the
-    // peak.
+    // peak. Every average is over `SMOOTH` real samples: a filter's startup is no signal.
     let mut smooth = [0.0_f32; MAX_LAG + PICK_WINDOW];
-    let mut sum = 0.0;
+    let mut sum: f32 = pcm[..SMOOTH - 1].iter().sum();
     for i in 0..longest + window {
-        sum += pcm[i] - if i >= SMOOTH { pcm[i - SMOOTH] } else { 0.0 };
+        sum += pcm[i + SMOOTH - 1];
         smooth[i] = sum / SMOOTH as f32;
+        sum -= pcm[i];
     }
     // Each lag correlates one fixed window with the window `lag` later, as NetEq's
     // autocorrelation does over 12.5 ms: one period of a low voice alone is too noisy a guide.
@@ -195,7 +196,11 @@ fn accelerate(pcm: &mut [f32], budget: usize, threshold: f64) -> (usize, f64) {
             best = best.max(score);
         }
     }
-    // The shortest correlation peak near the best: a peak, not the rising edge of one.
+    // The shortest correlation peak near the best: a peak, not the rising edge of one. No lag
+    // that correlates at all is no period.
+    if !best.is_finite() {
+        return (0, 0.0);
+    }
     let peak = |lag: usize| {
         let score = scores[lag];
         score >= best - NEAR_BEST && score >= scores[lag - 1] && (lag == longest || score >= scores[lag + 1])
@@ -355,8 +360,9 @@ impl Slot {
                         // nothing once is not searched again.
                         let (mut removed, mut at) = (0, 0);
                         while !onset && !quiet && !fade && removed < skip {
-                            let (period, _correlation) =
-                                accelerate(&mut self.decoded[at..n], skip - removed, correlation);
+                            // Splices shorten the block while the next point moves on.
+                            let Some(block) = self.decoded.get_mut(at..n) else { break };
+                            let (period, _correlation) = accelerate(block, skip - removed, correlation);
                             if period == 0 {
                                 break;
                             }
@@ -844,6 +850,92 @@ mod tests {
         }
     }
 
+    /// Plays 10 s of `pcm` in `frame`-sample packets, 20 ms of them per refill after `backlog`
+    /// refills' worth arrived at once, with the packets `lost(i)` never arriving.
+    fn play_backlog(pcm: &[f32], frame: usize, backlog: usize, lost: impl Fn(usize) -> bool) -> Slot {
+        use super::super::jitter::Clock;
+        let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+        let mut slot = Slot::new().unwrap();
+        let start = Instant::now();
+        let per_refill = 960 / frame;
+        for refill in 0..500 {
+            let now = start + Duration::from_millis(refill as u64 * 20);
+            let first = if refill == 0 { 0 } else { (backlog + refill) * per_refill };
+            for i in (first..(backlog + refill + 1) * per_refill).filter(|&i| !lost(i)) {
+                let mut data = vec![0; 1275];
+                let n = encoder.encode_float(&pcm[i * frame..(i + 1) * frame], &mut data).unwrap();
+                data.truncate(n);
+                slot.buffer.push_at((i * frame) as u64, frame as u64, data, now, Clock::Rtp);
+            }
+            slot.mix_into(&mut [0.0; 960], 1.0, now).unwrap();
+        }
+        slot
+    }
+
+    #[test]
+    fn splices_stay_within_a_block_they_shortened() {
+        // Review of #201: the next splice point moves on by at least 10 ms while each splice
+        // shortens the block, so five 120-sample periods of a 400 Hz voice left a 2880-sample
+        // block 2280 long with the next search at 2400.
+        let drain = drain(400.0, 0.0, |_| true, 20);
+        assert_eq!(drain.speech_dropped, 0, "{drain:?}");
+        for &(refill, removed, correlation) in &drain.periods {
+            assert!(
+                whole_periods(removed, 400.0) && correlation >= 0.5,
+                "refill {refill}: {removed} at {correlation:.3}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_splice_in_a_ten_ms_block_before_a_gap_stays_within_it() {
+        // Review of #201: a 10 ms packet before a lost one is a whole block, shorter than the
+        // step to the next splice point. Every third packet is lost: no block holds more than
+        // two.
+        let pcm = harmonic(400.0, 0.02, 0.3, 1100 * 480);
+        let slot = play_backlog(&pcm, 480, 22, |i| i % 3 == 2);
+        let periods: Vec<_> = slot.edits.iter().filter(|e| e.correlation.is_some()).collect();
+        assert!(!periods.is_empty());
+        for edit in periods {
+            assert!(whole_periods(edit.removed, 400.0) && edit.correlation >= Some(0.5), "{edit:?}");
+        }
+    }
+
+    /// A 200 Hz voice with its harmonics shaped by formants at 2 and 4 kHz, where the lag
+    /// search's low-pass has its nulls: below 2 kHz it is all but silent.
+    fn formant_voice(n: usize) -> Vec<f32> {
+        let formant = |f: f32, centre: f32| 1.0 / (1.0 + ((f - centre) / 50.0).powi(2));
+        (0..n)
+            .map(|i| {
+                let phase = std::f32::consts::TAU * 200.0 * i as f32 / 48_000.0;
+                (1..=22)
+                    .map(|k| {
+                        let f = 200.0 * k as f32;
+                        0.1 * (formant(f, 2000.0) + 0.5 * formant(f, 4000.0)) * (k as f32 * phase).sin()
+                    })
+                    .sum()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_search_that_finds_no_valid_lag_never_splices() {
+        use super::super::jitter::ANY_CORRELATION;
+        // Review of #201: when no lag passed the energy check, every score stayed -inf, the
+        // shortest lag counted as a peak and was removed: half a period of this voice. Its
+        // low-passed start held only the filter's startup, which no later window matched.
+        let pcm = formant_voice(550 * 960);
+        for start in (0..9600).step_by(97) {
+            let mut block = pcm[start..start + 2880].to_vec();
+            let (removed, correlation) = accelerate(&mut block, MAX_LAG, ANY_CORRELATION);
+            assert!(removed == 0 || whole_periods(removed, 200.0), "at {start}: {removed} at {correlation:.3}");
+        }
+        let slot = play_backlog(&pcm, 960, 22, |_| false);
+        for edit in slot.edits.iter().filter(|e| e.correlation.is_some()) {
+            assert!(whole_periods(edit.removed, 200.0) && edit.correlation >= Some(0.5), "{edit:?}");
+        }
+    }
+
     #[test]
     fn quiet_candidate_is_shrunk_and_boundary_fades_for_120_samples() {
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
@@ -911,7 +1003,7 @@ mod tests {
         for clock in [Clock::Rtp, Clock::Sequence] {
             for callback in [240, 480, 960] {
                 for phase in [-96, 0, 96] {
-                    for excess in [0, 480] {
+                    for (excess, continuous) in [(0, false), (480, false), (0, true), (480, true)] {
                         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
                         let mut slot = Slot::new().unwrap();
                         let now = Instant::now();
@@ -928,12 +1020,16 @@ mod tests {
                                 if arrival > tick {
                                     break;
                                 }
-                                // A phase-continuous voice: a tone reset every packet has no
-                                // period across the reset, which acceleration rightly rejects.
-                                let phase = (packet * 960) as f32 * std::f32::consts::TAU * 150.0 / 48_000.0;
-                                let mut data = vec![0; 1275];
-                                let n = encoder.encode_float(&harmonic(150.0, 0.0, phase, 960), &mut data).unwrap();
-                                data.truncate(n);
+                                // A tone reset every packet, or a phase-continuous voice.
+                                let data = if continuous {
+                                    let phase = (packet * 960) as f32 * std::f32::consts::TAU * 150.0 / 48_000.0;
+                                    let mut data = vec![0; 1275];
+                                    let n = encoder.encode_float(&harmonic(150.0, 0.0, phase, 960), &mut data).unwrap();
+                                    data.truncate(n);
+                                    data
+                                } else {
+                                    encode(&encoder, true)
+                                };
                                 slot.buffer.push_at(
                                     packet * 960,
                                     960,
@@ -948,13 +1044,20 @@ mod tests {
                                 at_twenty_seconds = slot.buffer.shrink_samples;
                             }
                         }
-                        let label = format!("{clock:?}, callback={callback}, phase={phase}, excess={excess}");
+                        let label = format!(
+                            "{clock:?}, callback={callback}, phase={phase}, excess={excess}, continuous={continuous}"
+                        );
                         assert_eq!(slot.buffer.concealments, 0, "{label}, shrunk={}", slot.buffer.shrink_samples);
                         assert_eq!(slot.buffer.concealments_after_trim, 0, "{label}");
                         if excess == 0 {
                             assert_eq!(slot.buffer.shrink_samples, 0, "{label}: tail is refill margin");
                         } else {
-                            assert!(at_twenty_seconds > 0, "{label}: persistent surplus did not converge");
+                            // A tone reset every packet has no period across the reset, which
+                            // acceleration rejects: its surplus stays, as refill margin.
+                            assert!(
+                                !continuous || at_twenty_seconds > 0,
+                                "{label}: persistent surplus did not converge"
+                            );
                             assert!(slot.buffer.shrink_samples <= excess as u64, "{label}");
                         }
                     }
