@@ -1,15 +1,17 @@
 import { ShieldAlert, X } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useLanguage, useT, countKey } from "../i18n";
 import { certificateWarning } from "../connect/expiry";
 import { MEMBER_GROUP } from "../lib/permissions";
 import { useIsMobile } from "../lib/media";
 import { identityNudgeDue } from "../lib/onboarding";
+import { isDesktop } from "../platform";
 import { accountActions, useAccount } from "../state/account";
 import { exportIdentityBackup } from "../state/identity-backup";
 import { useSettings } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { PasswordDialog } from "./AccountSettings";
+import { focusPage } from "./hooks";
 import { Button, Dialog } from "./kit";
 
 function useNoticeTime() {
@@ -35,6 +37,7 @@ function IdentityNoticesContent() {
   const t = useT();
   const language = useLanguage();
   const mobile = useIsMobile();
+  const desktop = isDesktop();
   const { account, certChecked, loaded } = useAccount();
   const now = useNoticeTime();
   const onboarding = useSettings((s) => s.onboarding);
@@ -43,6 +46,8 @@ function IdentityNoticesContent() {
   const [renewing, setRenewing] = useState(false);
   const [identityDialog, setIdentityDialog] = useState<"choices" | "backup" | null>(null);
   const [exporting, setExporting] = useState(false);
+  const trigger = useRef<HTMLButtonElement>(null);
+  const handingOff = useRef(false);
   useEffect(() => {
     if (hasRole && onboarding && !onboarding.roleReceived) useSettings.getState().setOnboarding({ roleReceived: true });
   }, [hasRole, onboarding]);
@@ -54,7 +59,17 @@ function IdentityNoticesContent() {
     catch { useUi.getState().toast("error", t("identity.exportFailed")); }
     finally { setExporting(false); }
   };
+  const openIdentityDialog = (step: "choices" | "backup") => {
+    handingOff.current = false;
+    setIdentityDialog(step);
+  };
+  const restoreFocus = (event: Event) => {
+    event.preventDefault();
+    if (!handingOff.current && trigger.current) trigger.current.focus();
+    else focusPage();
+  };
   const createAccount = () => {
+    handingOff.current = true;
     setIdentityDialog(null);
     useUi.setState({ accountEntry: "create" });
     openSettings("account");
@@ -72,22 +87,22 @@ function IdentityNoticesContent() {
       {nudge && (
         <div data-testid="identity-banner" role="status" className={mobile ? "flex shrink-0 items-center gap-1.5 border-b border-line bg-raised px-2 py-3 text-sm" : "flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-line bg-raised px-4 py-3 text-sm"}>
           <ShieldAlert className="size-4 shrink-0 text-warn" />
-          <p className={mobile ? "min-w-0 flex-1 text-[13px] whitespace-nowrap" : "min-w-0 flex-1 basis-56"}>{t(mobile ? "identity.protectTitle" : "identity.keepIdentity")}</p>
+          <p className={mobile ? "min-w-0 flex-1 text-[13px] whitespace-nowrap" : "min-w-0 flex-1 basis-56"}>{t(mobile ? "identity.protectTitle" : desktop ? "identity.keepIdentityDesktop" : "identity.keepIdentity")}</p>
           {mobile ? <>
-            <Button size="sm" className="px-2!" onClick={() => setIdentityDialog("choices")}>{t("identity.protect")}</Button>
+            <Button ref={trigger} size="sm" className="px-2!" onClick={() => openIdentityDialog("choices")}>{t("identity.protect")}</Button>
             {dismissReminder}
           </> : <div className="flex shrink-0 items-center gap-2">
             <Button size="sm" onClick={createAccount}>{t("identity.createAccount")}</Button>
-            <Button size="sm" onClick={() => setIdentityDialog("backup")}>{t("identity.exportBackup")}</Button>
+            <Button ref={trigger} size="sm" onClick={() => openIdentityDialog("backup")}>{t("identity.exportBackup")}</Button>
             {dismissReminder}
           </div>}
         </div>
       )}
       {renewing && account && <PasswordDialog title={t("account.signInAgain")} body={t("account.renewBody")} confirmLabel={t("account.signInAgain")}
         onClose={() => setRenewing(false)} onSubmit={async (password) => { await accountActions.renew(password); }} />}
-      {identityDialog && <Dialog open onOpenChange={(open) => { if (!open && !exporting) setIdentityDialog(null); }}
+      {identityDialog && <Dialog open onOpenChange={(open) => { if (!open && !exporting) setIdentityDialog(null); }} onCloseAutoFocus={restoreFocus}
         title={t(identityDialog === "choices" ? "identity.protectTitle" : "identity.exportBackup")}
-        description={t(identityDialog === "choices" ? "identity.lossWarning" : "identity.backupSecret")} width="max-w-sm"
+        description={t(identityDialog === "choices" ? desktop ? "identity.lossWarningDesktop" : "identity.lossWarning" : "identity.backupSecret")} width="max-w-sm"
         footer={identityDialog === "backup" && <>
           <Button disabled={exporting} onClick={() => setIdentityDialog(null)}>{t("common.cancel")}</Button>
           <Button variant="primary" busy={exporting} onClick={() => void backup()}>{t("common.save")}</Button>

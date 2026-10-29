@@ -2,6 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as platform from "../platform";
 import { useAccount, accountActions } from "../state/account";
 import { exportIdentityBackup } from "../state/identity-backup";
 import { useSettings } from "../state/settings";
@@ -31,6 +32,49 @@ async function onPhone() {
   await act(async () => root.render(<IdentityNotices key="phone" />));
 }
 describe("persistent identity notices", () => {
+  it("returns keyboard focus to Protect after Escape and backup cancellation", async () => {
+    await onPhone();
+    await act(async () => useSettings.getState().setOnboarding({ roleReceived: true }));
+    const trigger = button("Zabezpiecz");
+    await act(async () => { trigger.focus(); trigger.click(); });
+    await act(async () => document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(document.activeElement).toBe(trigger);
+    await act(async () => trigger.click());
+    await act(async () => button("Zapisz kopię").click());
+    await act(async () => button("Anuluj").click());
+    await act(async () => vi.advanceTimersByTimeAsync(1));
+    expect(document.activeElement).toBe(trigger);
+  });
+  it("focuses a page control after a saved backup removes the banner, skipping hidden file inputs", async () => {
+    const main = document.createElement("main"), file = document.createElement("input"), composer = document.createElement("textarea");
+    file.type = "file"; file.hidden = true; main.append(file, composer); document.body.appendChild(main);
+    // happy-dom has no layout; model the visible page and composer only.
+    for (const element of [main, composer]) vi.spyOn(element, "getClientRects").mockReturnValue({ length: 1 } as DOMRectList);
+    vi.spyOn(file, "getClientRects").mockReturnValue({ length: 0 } as DOMRectList);
+    try {
+      vi.mocked(exportIdentityBackup).mockImplementation(async () => { useSettings.getState().setOnboarding({ nudgeDismissed: true }); });
+      await act(async () => useSettings.getState().setOnboarding({ roleReceived: true }));
+      await act(async () => button("Zapisz kopię").click());
+      await act(async () => button("Zapisz").click());
+      await act(async () => vi.advanceTimersByTimeAsync(1));
+      expect(container.querySelector('[data-testid="identity-banner"]')).toBeNull();
+      expect(document.activeElement).toBe(composer);
+    } finally { main.remove(); }
+  });
+  it.each([
+    { language: "pl" as const, desktop: false, banner: "Zabezpiecz swoją tożsamość — bez kopii stracisz nazwę i role po wyczyszczeniu danych przeglądarki.", loss: "Jeśli wyczyścisz dane przeglądarki, stracisz swoją nazwę i role." },
+    { language: "pl" as const, desktop: true, banner: "Zabezpiecz swoją tożsamość — bez kopii stracisz nazwę i role po usunięciu danych Gwar.", loss: "Jeśli usuniesz dane Gwar z tego komputera, stracisz swoją nazwę i role." },
+    { language: "en" as const, desktop: false, banner: "Protect your identity — without a backup, clearing browser data will erase your name and roles.", loss: "If you clear browser data, you’ll lose your name and roles." },
+    { language: "en" as const, desktop: true, banner: "Protect your identity — without a backup, removing Gwar’s data will erase your name and roles.", loss: "If you remove Gwar’s data from this computer, you’ll lose your name and roles." },
+  ])("uses $language identity wording for desktop=$desktop", async ({ language, desktop, banner, loss }) => {
+    vi.spyOn(platform, "isDesktop").mockReturnValue(desktop);
+    await act(async () => { useSettings.setState({ language }); useSettings.getState().setOnboarding({ roleReceived: true }); });
+    expect(container.querySelector('[data-testid="identity-banner"] p')?.textContent).toBe(banner);
+    await onPhone();
+    await act(async () => button(language === "pl" ? "Zabezpiecz" : "Protect").click());
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain(loss);
+  });
   it("opens mobile protection choices without exporting, then reaches the private-key confirmation", async () => {
     await onPhone();
     await act(async () => useSettings.getState().setOnboarding({ roleReceived: true }));

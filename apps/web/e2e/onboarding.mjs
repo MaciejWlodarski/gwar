@@ -17,6 +17,7 @@ const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const repo = path.resolve(webRoot, "../..");
 const children = [];
 const shots = process.env.E2E_SCREENSHOTS;
+const captureOnly = process.env.E2E_CAPTURE_ONLY?.split(",");
 const captured = [];
 let browser;
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -41,10 +42,25 @@ async function until(check, label) {
   throw new Error(`Timed out: ${label}\n${children.map(c => c.output).join("\n")}`);
 }
 async function capture(page, name, width) {
-  if (!shots) return;
+  const file = `${name}-pl-${width}.png`;
+  if (!shots || (captureOnly && !captureOnly.includes(file))) return;
   await page.evaluate(() => document.fonts.ready);
-  await page.screenshot({ path: path.join(shots, `${name}-pl-${width}.png`), animations: "disabled" });
-  captured.push(`${name}-pl-${width}.png`);
+  await page.screenshot({ path: path.join(shots, file), animations: "disabled" });
+  captured.push(file);
+}
+async function assertFocused(page, control) {
+  const element = await control.elementHandle();
+  try { await page.waitForFunction(el => document.activeElement === el, element, { timeout: 3000 }); }
+  finally { await element?.dispose(); }
+}
+async function markDesktop(page, desktop) {
+  await page.evaluate(async desktop => {
+    // Display-only Tauri variant: no native app, bridge calls or user data.
+    if (desktop) window.__TAURI_INTERNALS__ = {};
+    else delete window.__TAURI_INTERNALS__;
+    const { useSettings } = await import("/src/state/settings.ts");
+    useSettings.setState({ onboarding: { ...useSettings.getState().onboarding } });
+  }, desktop);
 }
 async function bannerStyle(page, id) {
   return page.getByTestId(id).evaluate(banner => {
@@ -70,10 +86,13 @@ async function mobileBanners(page, id, name) {
     }
     await capture(page, name, width === 390 ? "mobile" : "mobile-360");
     if (id === "identity-banner") {
-      await page.getByRole("button", { name: "Zabezpiecz", exact: true }).click();
+      const protect = page.getByRole("button", { name: "Zabezpiecz", exact: true });
+      await protect.focus();
+      await page.keyboard.press("Enter");
       await page.getByRole("dialog").getByRole("button", { name: "Załóż konto Gwar Connect", exact: true }).waitFor();
       await capture(page, "identity-protect", width === 390 ? "mobile" : "mobile-360");
-      await page.getByRole("dialog").getByRole("button", { name: "Zamknij", exact: true }).click();
+      await page.keyboard.press("Escape");
+      await assertFocused(page, protect);
       assert.ok(await page.getByTestId(id).isVisible(), "closing choices keeps the reminder");
     }
   }
@@ -164,13 +183,23 @@ try {
     if (width === "mobile") await mobileBanners(page, "identity-banner", "identity-banner");
     else {
       await capture(page, "identity-banner", width);
+      await markDesktop(page, true);
+      await page.getByTestId("identity-banner").getByText(/po usunięciu danych Gwar/).waitFor();
+      assertOneRow(await bannerStyle(page, "identity-banner"), "Tauri identity reminder");
+      await capture(page, "identity-banner-tauri", width);
+      await markDesktop(page, false);
       // Open the mobile choices, then resize: the same Dialog must work on desktop too.
       await page.setViewportSize({ width: 390, height: 844 });
       await page.getByRole("button", { name: "Zabezpiecz", exact: true }).click();
       await page.setViewportSize({ width: 1280, height: 900 });
       await page.getByRole("dialog").getByRole("button", { name: "Załóż konto Gwar Connect", exact: true }).waitFor();
       await capture(page, "identity-protect", width);
+      await markDesktop(page, true);
+      await page.getByRole("dialog").getByText(/Jeśli usuniesz dane Gwar z tego komputera/).waitFor();
+      await capture(page, "identity-protect-tauri", width);
+      await markDesktop(page, false);
       await page.getByRole("dialog").getByRole("button", { name: "Zamknij", exact: true }).click();
+      await assertFocused(page, page.getByTestId("identity-banner").getByRole("button", { name: "Zapisz kopię", exact: true }));
     }
     if (width === "mobile") await page.getByRole("button", { name: "Zabezpiecz", exact: true }).click();
     await page.getByRole("button", { name: "Zapisz kopię", exact: true }).click();
@@ -178,12 +207,25 @@ try {
     await capture(page, "identity-backup-confirm", width);
     await page.getByRole("button", { name: "Anuluj", exact: true }).click();
     assert.ok(await page.getByTestId("identity-banner").isVisible(), "cancelled confirmation keeps the reminder");
+    await assertFocused(page, page.getByTestId("identity-banner").getByRole("button", { name: width === "mobile" ? "Zabezpiecz" : "Zapisz kopię", exact: true }));
+    if (width === "mobile") {
+      await page.getByRole("button", { name: "Zabezpiecz", exact: true }).focus();
+      await page.keyboard.press("Enter");
+      await page.getByRole("dialog").getByRole("button", { name: "Załóż konto Gwar Connect", exact: true }).focus();
+      await page.keyboard.press("Enter");
+      await page.getByRole("main", { name: "Ustawienia" }).waitFor();
+      await page.locator('main form[aria-label="Załóż konto"]').waitFor();
+      // Mobile Settings owns its entry focus (the page's Back control).
+      await page.waitForFunction(() => document.querySelector('main[aria-label="Ustawienia"]')?.contains(document.activeElement), null, { timeout: 3000 });
+      await page.getByRole("navigation", { name: "Sekcje" }).getByRole("button", { name: "Serwery", exact: true }).click();
+    }
     if (width === "mobile") await page.getByRole("button", { name: "Zabezpiecz", exact: true }).click();
     await page.getByRole("button", { name: "Zapisz kopię", exact: true }).click();
     const download = page.waitForEvent("download");
     await page.getByRole("dialog").getByRole("button", { name: "Zapisz", exact: true }).click();
     assert.match((await download).suggestedFilename(), /gwar-identity-backup/);
     await page.getByTestId("identity-banner").waitFor({ state: "detached" });
+    await page.waitForFunction(() => document.activeElement !== document.body && document.activeElement?.isConnected && !document.activeElement.closest('[role="dialog"]'), null, { timeout: 3000 });
     // Session-expiry states are seeded; no real user account or certificate is used.
     const fakeAccount = { handle: "ola", accountKey: "review-account", deviceKey: "review-device", deviceName: "Browser", expiresAt: Date.now() + 5 * 86_400_000 };
     await state(page, { account: { account: fakeAccount, certChecked: true } });
@@ -240,6 +282,8 @@ try {
     "Identity reminder and backup confirmation desktop captures are 1280x900; the reminder matches expiry height, icon treatment and buttons at that width.",
     "Identity and expiry mobile banners are one row at 360 and 390 px in both locales. Polish screenshots include both widths and the protection choices dialog.",
     "The desktop protection dialog is opened on mobile and resized to desktop to verify the same dialog across widths.",
+    "Tauri variants mark only the platform flag in the throwaway web context; no native app, bridge commands or desktop user data are used.",
+    "Keyboard assertions cover Escape, backup cancel, removed-banner fallback and the Connect account-form handoff.",
     "Captured with apps/web/e2e/onboarding.mjs. Only throwaway loopback services and browser contexts.",
     "First run and connection are real flows. Role receipt and before/after expiry are seeded UI states.",
     "The sticky toast uses the generic production component with a seeded audio error and working Settings action.",
