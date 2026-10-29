@@ -2088,6 +2088,10 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   15 s spacing), and the slot keeps its media. It counts like a fresh retry:
   one that the link then pushes back on fails at its pause as above. An
   estimator that grew on its own is not touched; one that fell has its answer.
+  A climb never reaches the start of the last retry that failed, until media
+  has flowed `RETRY_RESET` again: otherwise a frozen estimator on a link just
+  below the share would overshoot the same step after every carried retry and
+  pause the viewer every 45–85 s.
 
   This keeps the ladder climbing even if the estimator never grows on its
   own, as on 2026-10-28: an inconclusive retry is followed by one that admits

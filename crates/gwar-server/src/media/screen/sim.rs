@@ -1672,6 +1672,7 @@ mod tests {
         estimate: u64,
         retries: u32,
         untested: Option<u64>,
+        failed: Option<u64>,
     }
 
     /// Runs `time`, recording each bandwidth pause of slot 0.
@@ -1690,6 +1691,7 @@ mod tests {
                     estimate: sim.w.egress.estimate(),
                     retries: sim.w.retries,
                     untested: sim.w.untested,
+                    failed: sim.w.failed,
                 });
             }
         }
@@ -1823,13 +1825,24 @@ mod tests {
     #[test]
     fn a_climb_on_a_still_slow_link_keeps_voice_clean() {
         // A frozen estimator on a link too slow for the share: its retries climb in place as
-        // long as the link carries them, and stop at the first step it pushes back on.
+        // long as the link carries them, and stop at the first step it pushes back on. A
+        // later carried retry climbs no higher than that step, so the viewer is not paused
+        // at the same overshoot after every retry.
         for rate in [4_000_000, 5_000_000, 6_000_000, 7_000_000] {
             let mut sim = Sim::new(Some(rate));
             sim.voice = true;
             sim.join("game", 8_000_000, 60, 20_000, 12_000_000);
             sim.w.frozen = Some(sim.w.egress.estimate());
-            sim.run(240 * SECOND);
+            let mut judged = Vec::new();
+            run_judged(&mut sim, 240 * SECOND, &mut judged);
+            for &(at, to) in &sim.climbs {
+                let at = at - sim.start;
+                if let Some(last) = judged.iter().rev().find(|j| j.at < at)
+                    && let Some(failed) = last.failed
+                {
+                    assert!(to < failed, "rate={rate} climb at {at:?} to {to} reached {failed} that failed: {judged:#?}");
+                }
+            }
             let context = format!("rate={rate}: {}", summary(&sim));
             let voice = retries_voice(&sim);
             let climbs: Vec<_> = sim.climbs.iter().map(|(at, to)| (*at - sim.start, *to)).collect();

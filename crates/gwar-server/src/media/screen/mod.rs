@@ -729,6 +729,10 @@ struct Watcher {
     /// `RETRY_FIRST` after it started, at least `RETRY_STEP` above it and with room for its
     /// share's keyframe.
     untested: Option<u64>,
+    /// The start of the last retry the link pushed back on, until media flows `RETRY_RESET`
+    /// again: a climb in place never reaches it, or a frozen estimator would overshoot the
+    /// same step after every carried retry.
+    failed: Option<u64>,
     /// The last optimistic start or retry, which spaces the viewer's own Try again, and a Try
     /// again waiting for that spacing.
     started: Option<Instant>,
@@ -2528,6 +2532,7 @@ fn allocate(
             w.retries = 0;
             w.attempt = None;
             w.untested = None;
+            w.failed = None;
         }
         return None;
     }
@@ -2580,6 +2585,9 @@ fn judge(w: &mut Watcher) {
         Some(a) if shown >= a.start => {
             w.retries = 0;
             w.step = carried_step(sent, a.start);
+            if w.failed.is_some_and(|f| a.start >= f) {
+                w.failed = None;
+            }
         }
         Some(a) if w.egress.estimate() >= a.start && RETRY_STEP * (sent as f64) < a.start as f64 => {
             if a.start < top(w, a.slot) {
@@ -2589,7 +2597,10 @@ fn judge(w: &mut Watcher) {
                 w.untested = Some(a.start);
             }
         }
-        Some(a) => w.step = sent.min((a.start as f64 / RETRY_STEP) as u64),
+        Some(a) => {
+            w.step = sent.min((a.start as f64 / RETRY_STEP) as u64);
+            w.failed = Some(a.start);
+        }
         None => w.step = sent,
     }
 }
@@ -2628,7 +2639,7 @@ fn climb(w: &mut Watcher, lanes: &[ShareRate], rates: &HashMap<String, ShareRate
         return false;
     }
     let target = start_target(w, a.slot).min((RETRY_STEP * carried_step(sent(w), a.start) as f64) as u64);
-    if target <= a.start {
+    if target <= a.start || w.failed.is_some_and(|f| target >= f) {
         return false;
     }
     w.step = carried_step(sent(w), a.start);
@@ -3297,6 +3308,7 @@ fn watcher(
         step: 0,
         attempt: None,
         untested: None,
+        failed: None,
         started: None,
         asked: None,
         carried: VecDeque::new(),
