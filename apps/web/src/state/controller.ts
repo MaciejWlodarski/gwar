@@ -254,7 +254,7 @@ class Controller {
   /** The voice channel I was in when the connection dropped; rejoined after the resync. */
   private rejoin: number | null = null;
   /** Screen sharing and watching (docs/screen-share.md). */
-  readonly screen = new ScreenController(() => this.conn, describeRequestError);
+  readonly screen = new ScreenController(() => this.conn, describeRequestError, () => this.voiceAutoStart && this.voiceRetryAllowed);
 
   constructor() {
     this.engine = createVoiceEngine();
@@ -1281,6 +1281,7 @@ class Controller {
     this.voiceAutoStart = true;
     this.voiceRetryAllowed = true;
     await this.startVoice();
+    if (useScreen.getState().own?.phase === "reconnecting") void this.screen.confirmShare();
   }
 
   /** Hostname (no brackets) of the server we are connected to; the native engine sends media there. */

@@ -3412,6 +3412,10 @@ Repeated blips before voice rejoin retain the original channel. Every explicit
 Leave cancels voice rejoin and stops capture, including online republishing before
 the new share ID exists. Manual voice actions supersede saved rejoin intent;
 definitive admission refusal clears it, while a lost connection preserves it.
+Retained capture republishes only when voice is authorized and no permanent voice
+refusal is latched. Restored plaintext presence alone cannot clear that refusal.
+Explicit voice entry or Retry can resume capture within the original recovery
+deadline; otherwise the deadline stops capture and shows the persistent restart notice.
 Explicit Stop and Leave remain quiet. A capture track ending during recovery
 (for example, its window closing) instead shows the persistent restart notice;
 browser track termination does not distinguish that cause from browser Stop sharing.

@@ -144,6 +144,7 @@ export class ScreenController {
   constructor(
     private readonly link: () => Link | null,
     private readonly describe: (e: unknown) => string,
+    private readonly canResumeVoice: () => boolean = () => true,
   ) {}
 
   /** Ends my share locally when I leave or change my voice channel; the server ends it too (`left`). */
@@ -301,7 +302,8 @@ export class ScreenController {
     if (this.lostPublisherShare) return;
     const s = useSession.getState();
     const me = s.me ? s.clients[s.me.session] : undefined;
-    if (this.suspended || (this.retainedCapture && (!me?.voice_binding || me.channel === null))) {
+    // Restored presence does not clear a permanent voice refusal or authorize silent sessions.
+    if (this.suspended || (this.retainedCapture && (!me?.voice_binding || me.channel === null || !this.canResumeVoice()))) {
       if (own.phase === "choosing") {
         this.recoveringAttempt = own.attempt;
         this.ownDeadline ??= setTimeout(() => this.recoveryFailed(), 45_000);
