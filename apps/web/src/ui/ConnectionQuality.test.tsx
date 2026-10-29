@@ -76,7 +76,7 @@ it("shows the panel indicator always, coloured by quality, and the voice status 
 });
 
 it("adds the indicator to the pill only while the connection is not good", async () => {
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
   useScreen.setState({ ...initialScreen });
   useUi.setState({ section: "home" });
   await render(<VoicePill />);
@@ -95,7 +95,7 @@ it("adds the indicator to the pill only while the connection is not good", async
 });
 
 it("steps down to the worst recent quality within 4 s, however often the measurement changes", async () => {
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
   useScreen.setState({ ...initialScreen });
   useUi.setState({ section: "home" });
   await render(<><VoicePill /><VoicePanel /></>);
@@ -111,8 +111,32 @@ it("steps down to the worst recent quality within 4 s, however often the measure
   expect(quality()).toEqual(["fair", "fair"]);
 });
 
+it("turns good 4 s after the connection settles, even through a moment of fair", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+  useScreen.setState({ ...initialScreen });
+  await render(<VoicePanel />);
+  await set({ voice: { ...healthy, rttMs: 400 } });
+  await set({ voice: { ...healthy, rttMs: 200 } });
+  await act(async () => vi.advanceTimersByTime(100));
+  await set({ voice: healthy });
+  await act(async () => vi.advanceTimersByTime(QUALITY_IMPROVE_MS - 101));
+  expect(indicator()?.dataset.quality).toBe("poor");
+  await act(async () => vi.advanceTimersByTime(1));
+  // Better than poor for 4 s, and better than fair only for 3.9 s.
+  expect(indicator()?.dataset.quality).toBe("fair");
+  await act(async () => vi.advanceTimersByTime(100));
+  expect(indicator()?.dataset.quality).toBe("good");
+  // Worse while an improvement is pending shows at once and cancels it.
+  await set({ voice: { ...healthy, rttMs: 400 } });
+  await set({ voice: healthy });
+  await act(async () => vi.advanceTimersByTime(2000));
+  await set({ voice: { ...healthy, rttMs: 400 } });
+  await act(async () => vi.advanceTimersByTime(QUALITY_IMPROVE_MS));
+  expect(indicator()?.dataset.quality).toBe("poor");
+});
+
 it("drops the held colour with the measurement, and shows the next one as it is", async () => {
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
   useScreen.setState({ ...initialScreen });
   await render(<VoicePanel />);
   await set({ voice: bloated });
@@ -124,7 +148,7 @@ it("drops the held colour with the measurement, and shows the next one as it is"
 });
 
 it("replaces the generic sender reason in the sharing bar while congested, then restores it", async () => {
-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
   await render(<SharingBar />);
   expect(container.textContent).toContain("Ograniczone przez łącze");
   expect(indicator()).toBeNull();

@@ -3226,9 +3226,10 @@ signal-bar indicator rather than banners (`ui/ConnectionQuality.tsx`,
   3 % and poor from 10 %. A congestion verdict makes it at least fair, and poor
   when the queue adds 250 ms or more. No detector timer turns it green: if the
   detector adopts a new floor, a 480 ms round trip is still red. A worse colour
-  shows at once; a better one once the connection has stayed better for 4 s,
-  stepping down to the worst quality seen meanwhile, so a round trip at a
-  threshold does not flicker. Every view shows the same held colour.
+  shows at once; a better one only once the connection has stayed better than
+  the shown level for 4 s without a break (so poor → good via a moment of fair
+  turns good 4 s after it settles), so a round trip at a threshold does not
+  flicker. Every view shows the same held colour.
 - **Brief message.** When a congestion verdict starts, one plain-language
   message appears in the toast stack ("Your internet can't keep up with
   uploading — others hear you about 0.5 s late", the delay being RTT minus the

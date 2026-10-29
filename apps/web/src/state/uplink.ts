@@ -68,15 +68,16 @@ export function connectionQuality(serverRttMs: number | null, voice: UplinkStatu
 }
 
 /**
- * A worse colour shows at once; a better one only once the connection has stayed better for this
- * long, so a round trip at a threshold does not flicker the colour or the pill's indicator. One
+ * A worse colour shows at once; a better one only once the connection has stayed better than it for
+ * this long, so a round trip at a threshold does not flicker the colour or the pill's indicator. One
  * held colour for every view, so the pill and the panel never disagree.
  */
 export const QUALITY_IMPROVE_MS = 4_000;
-const RANK: Record<Quality, number> = { good: 0, fair: 1, poor: 2 };
+export const QUALITY_RANK: Record<Quality, number> = { good: 0, fair: 1, poor: 2 };
+const LEVELS: Quality[] = ["good", "fair", "poor"];
 let improveTimer: ReturnType<typeof setTimeout> | null = null;
-/** The worst quality seen since the improvement began: where the held colour steps down to. */
-let improvingTo: Quality | null = null;
+/** Since when the connection has been better than each level without a break. */
+const betterSince: Partial<Record<Quality, number>> = {};
 
 const liveQuality = (): Quality | null => {
   const { voice, screen } = useUplink.getState();
@@ -84,22 +85,25 @@ const liveQuality = (): Quality | null => {
 };
 
 function noteQuality(): void {
+  if (improveTimer) clearTimeout(improveTimer);
+  improveTimer = null;
   const live = liveQuality();
-  const shown = useUplink.getState().shown;
-  if (!live || !shown || RANK[live] >= RANK[shown]) {
-    // No measurement, the same, or worse: honest at once.
-    if (improveTimer) clearTimeout(improveTimer);
-    improveTimer = null; improvingTo = null;
-    if (live !== shown) useUplink.setState({ shown: live });
-    return;
+  const now = Date.now();
+  for (const q of LEVELS) {
+    if (live && QUALITY_RANK[live] < QUALITY_RANK[q]) betterSince[q] ??= now;
+    else delete betterSince[q];
   }
-  if (!improvingTo || RANK[live] > RANK[improvingTo]) improvingTo = live;
-  improveTimer ??= setTimeout(() => {
-    const to = improvingTo;
-    improveTimer = null; improvingTo = null;
-    useUplink.setState({ shown: to });
-    noteQuality();
-  }, QUALITY_IMPROVE_MS);
+  let shown = useUplink.getState().shown;
+  // No measurement, the same, or worse: honest at once. Better: step down past every level the
+  // connection has stayed better than for the whole hold.
+  if (!live || !shown || QUALITY_RANK[live] >= QUALITY_RANK[shown]) shown = live;
+  else {
+    let q: Quality = shown;
+    while (q !== live && (betterSince[q] ?? Infinity) <= now - QUALITY_IMPROVE_MS) q = LEVELS[QUALITY_RANK[q] - 1] ?? live;
+    shown = q;
+  }
+  if (shown !== useUplink.getState().shown) useUplink.setState({ shown });
+  if (shown && live && shown !== live) improveTimer = setTimeout(noteQuality, betterSince[shown]! + QUALITY_IMPROVE_MS - now);
 }
 useUplink.subscribe((s, prev) => { if (s.voice !== prev.voice || s.screen !== prev.screen) noteQuality(); });
 useSession.subscribe((s, prev) => { if (s.rtt !== prev.rtt) noteQuality(); });
@@ -129,6 +133,7 @@ export const closeConnectionDetails = () => useUplink.setState({ details: false 
 export function resetCongestionEpisodes(): void {
   active = false; endedAt = -Infinity;
   if (improveTimer) clearTimeout(improveTimer);
-  improveTimer = null; improvingTo = null;
+  improveTimer = null;
+  for (const q of LEVELS) delete betterSince[q];
   useUplink.setState({ voice: null, screen: null, notice: null, details: false, shown: null });
 }
