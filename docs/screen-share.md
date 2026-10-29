@@ -3390,6 +3390,50 @@ from native capture is PR 10.
 
 Polish and English strings are added together, as for every UI change.
 
+### Session interruptions and capture permission
+
+A session reconnect retires publish/watch transports, but keeps an already
+confirmed capture stream and its quality, preview and TeamSpeak-link choice.
+After Welcome and voice rejoin supply the new participation, the client starts a
+new share with that same stream. No second picker or quality confirmation is
+needed. Explicit Stop, leaving/changing the channel, switching servers and
+terminal session teardown still stop capture. Pending results are fenced by the
+session generation; an old publish cannot replace the returning one.
+
+Viewers retain their selected stage and watch order. Watches resume from Welcome
+or a later `screen.started`, matching the original share ID first, then the
+sharer's user identity and channel when reconnect gave the share a new ID and
+there is exactly one matching capture. The
+protocol does not identify a device on `Client`, or distinguish a disconnect from
+leaving voice (`left`), so that return window is bounded to 45 seconds. Explicit
+stop, moderation, lost access and incompatible codecs end the watch normally.
+Password-channel watches wait for voice rejoin to restore admission. Manual
+unwatch and terminal reset cancel pending recovery. Explicit Stop stops capture and the local UI immediately,
+but keeps the publisher's DTLS connection until the stop request settles, so its
+transport close cannot overtake the user's stop reason. Reset retires pending peers.
+
+An ended capture, failed republish or a 45-second recovery deadline stops capture
+and leaves a persistent, dismissible notice with **Share again**. Desktop also
+uses the existing system notification path when notifications are permitted.
+While capture is retained, the sharing bar says that it is reconnecting.
+
+Closing the picker (`AbortError`, or a cancel-like `NotAllowedError`) is silent.
+Browser errors mentioning system/policy denial or screen-recording permission
+show persistent, localized OS guidance with a known browser/app name. Browsers
+which use indistinguishable `NotAllowedError` messages cannot reliably expose the
+OS distinction. Other capture failures use generic localized text; raw error
+messages remain in console/bug-report diagnostics. Desktop offers **Open
+settings**, using the macOS Screen Recording page or the Windows
+[graphics capture privacy URI](https://learn.microsoft.com/en-us/windows/apps/develop/launch/launch-settings#privacy).
+No notification permission prompt is opened during recovery.
+
+The browser screen suite closes real local session WebSockets during sharing and
+watching, verifies capture object identity after resync, and checks decoded
+barcode frames after automatic rewatch. Set `E2E_SCREEN_SCREENSHOTS` to a directory
+to capture the Polish recovery and permission notices at desktop/mobile widths.
+These captures use the running app and local server; the permission refusal is
+injected through `getDisplayMedia` so no OS permission is changed.
+
 ### Web client as built (PR 4)
 
 Code: `apps/web/src/voice/screen.ts` (capture, presets, publish and watch
@@ -3431,9 +3475,10 @@ badge, stage). Decisions taken while building it, where this design left room:
 - **Watch transport.** One per session, negotiated on the first watch.
   `screen.watch` is asked again for up to 5 s while the server answers
   `unavailable`, because the browser can see the transport connect before the
-  screen task reports it. A transport that fails ends every watch, as the
-  server does, with one notice; the user opens the shares again, and the next
-  watch negotiates a new run.
+  screen task reports it. A failed watch transport keeps viewing intent and the
+  selected stage, and negotiates a fresh run after 1, 2, then 4 seconds. Only
+  exhausted recovery shows an error. A decoded frame resets that failure budget.
+  Requests and callbacks from retired runs cannot release or revive new grants.
 - **Watch requests.** Each watch has its own id, and the requests of one share
   run one at a time: a watch, its release and the next watch of the same share
   reach the server in order, so an earlier watch's assignment or release is

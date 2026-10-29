@@ -15,7 +15,7 @@ import { resolveQuality, defaultQuality, sameSpec, type ScreenSpec } from "../vo
  * My share: `picking` while the browser's picker is open, `choosing` in the quality menu,
  * `starting` from `screen.start` until the server announces it, then `live`.
  */
-export type OwnPhase = "picking" | "choosing" | "starting" | "live";
+export type OwnPhase = "picking" | "choosing" | "starting" | "live" | "reconnecting";
 
 export interface OwnShare {
   phase: OwnPhase;
@@ -55,6 +55,7 @@ export type TransportPhase = "none" | "connecting" | "connected" | "failed";
 
 export interface ScreenState {
   own: OwnShare | null;
+  notice: "reconnect" | "permission" | null;
   /** The session's watch transport and its run (`screen.watch.offer`). */
   transport: { phase: TransportPhase; run: number };
   /** Shares I watch, in watch order (their bandwidth priority after the stage). */
@@ -84,6 +85,10 @@ export type ScreenAction =
   | { type: "link"; share: string; active: boolean }
   | { type: "preview"; on: boolean }
   | { type: "ownEnded"; attempt: number }
+  | { type: "notice"; notice: ScreenState["notice"] }
+  | { type: "suspend" }
+  | { type: "watchWaiting"; share: string }
+  | { type: "watchReplaced"; id: number; share: string }
   | { type: "transport"; run: number; phase: TransportPhase }
   | { type: "stream"; run: number; slot: number; stream: MediaStream }
   | { type: "watch"; share: string; id: number }
@@ -102,6 +107,7 @@ const emptySlots = <T>(): Array<T | null> => Array.from({ length: SCREEN_SLOTS }
 
 export const initialScreen: ScreenState = {
   own: null,
+  notice: null,
   transport: { phase: "none", run: 0 },
   watches: [],
   slots: emptySlots(),
@@ -138,7 +144,7 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       return { ...state, own: { ...own, spec: { ...action.spec } } };
     }
     case "starting":
-      return setOwn(state, action.attempt, ["choosing"], { phase: "starting" });
+      return setOwn(state, action.attempt, ["choosing", "reconnecting"], { phase: "starting" });
     case "surface":
       return setOwn(state, action.attempt, ["starting", "live"], { surface: action.surface, spec: { ...action.spec } });
     case "started":
@@ -157,6 +163,22 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       return state.own ? { ...state, own: { ...state.own, preview: action.on } } : state;
     case "ownEnded":
       return state.own?.attempt === action.attempt ? { ...state, own: null } : state;
+    case "notice":
+      return { ...state, notice: action.notice };
+    case "suspend":
+      return { ...state, links: {}, own: state.own && ["starting", "live", "reconnecting"].includes(state.own.phase)
+        ? { ...state.own, phase: "reconnecting", share: null, viewers: 0, guests: 0 } : state.own,
+      transport: { ...state.transport, phase: "none" }, slots: emptySlots(), streams: emptySlots(),
+      watches: state.watches.map(w => ({ share: w.share, id: w.id, slot: null, status: "requesting" })) };
+    case "watchWaiting":
+      return { ...state, slots: state.slots.map(s => s === action.share ? null : s),
+        watches: state.watches.map(w => w.share === action.share ? { share: w.share, id: w.id, slot: null, status: "requesting" } : w) };
+    case "watchReplaced": {
+      const watch = state.watches.find(w => w.id === action.id);
+      if (!watch) return state;
+      return { ...state, stage: state.stage === watch.share ? action.share : state.stage,
+        watches: state.watches.map(w => w === watch ? { share: action.share, id: w.id, slot: null, status: "requesting" } : w) };
+    }
     case "transport": {
       const { run, phase } = action;
       if (run < state.transport.run) return state;
@@ -165,8 +187,8 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
         return { ...state, transport: { run, phase }, slots: emptySlots(), streams: emptySlots(), watches: state.watches.map(w => ({ share: w.share, id: w.id, slot: null, status: "requesting" as const })) };
       }
       if (phase === "failed") {
-        // The server ends every watch of a transport that is gone.
-        return { ...state, transport: { run, phase }, watches: [], stage: null, slots: emptySlots(), streams: emptySlots() };
+        // Keep viewing intent while a replacement transport is negotiated.
+        return { ...state, transport: { run, phase }, watches: state.watches.map(w => ({ share: w.share, id: w.id, slot: null, status: "requesting" })), slots: emptySlots(), streams: emptySlots() };
       }
       return { ...state, transport: { run, phase } };
     }

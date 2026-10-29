@@ -36,3 +36,11 @@ export function canOpenMicrophoneSettings(): boolean {
 export async function openMicrophoneSettings(): Promise<void> {
   await (await tauri()).invoke("open_mic_privacy_settings");
 }
+
+/** Opens the screen recording privacy page in the desktop app. */
+export async function openScreenRecordingSettings(): Promise<void> {
+  await (await tauri()).invoke("open_screen_privacy_settings");
+}
+
+/** Screen privacy settings are available on the same desktop platforms as microphone settings. */
+export const canOpenScreenRecordingSettings = canOpenMicrophoneSettings;

@@ -800,8 +800,9 @@ class Controller {
     conn.onWelcome((welcome, resync) => {
       if (this.conn !== conn) return;
       if (params) this.rememberConnection(params, welcome.server.name);
-      // A new session: shares and watches of the one before ended with it.
-      this.screen.reset();
+      // A resync retires transports while capture and viewing intent survive.
+      if (resync) this.screen.suspend();
+      else this.screen.reset();
       this.entered.clear();
       // Joins asked before this Welcome can no longer settle (their session ended): drop their spinner
       // before any rejoin below shows its own.
@@ -834,6 +835,7 @@ class Controller {
         void this.rejoinVoice(channel);
       }
       this.rejoin = null;
+      if (resync) this.screen.resume();
     });
     conn.onEvent((event) => {
       if (this.conn !== conn) return;
@@ -941,7 +943,7 @@ class Controller {
           // A new session starts outside voice: remember where to go back to.
           if (this.voiceAutoStart) this.rejoin ??= myChannelId(useSession.getState());
           session.dispatch({ type: "phase", phase: "reconnecting" });
-          this.screen.reset();
+          this.screen.suspend();
           void this.stopVoice();
           break;
         case "closed":

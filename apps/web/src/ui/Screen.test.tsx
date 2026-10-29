@@ -12,7 +12,8 @@ import { useDesktopCapture, type DesktopCapture } from "../state/screen-controll
 import { useSettings } from "../state/settings";
 import { useSession } from "../state/stores";
 import { TooltipProvider } from "./kit";
-import { LiveBadge, ShareButton, ShareVideo, SharingBar } from "./Screen";
+import * as platform from "../platform";
+import { LiveBadge, ScreenNotice, ShareButton, ShareVideo, SharingBar } from "./Screen";
 
 const channel = (id: number, extra: Partial<Channel> = {}): Channel => ({
   id, parent: null, name: `c${id}`, topic: "", position: id, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false, ...extra,
@@ -57,6 +58,38 @@ async function desktop(capture: DesktopCapture | null) {
   (window as { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
   await act(async () => useDesktopCapture.setState({ capture }));
 }
+
+describe("persistent screen guidance", () => {
+  it("keeps a localized recovery notice until the user acts", async () => {
+    useSession.setState({ phase: "online" });
+    useSettings.setState({ language: "pl" });
+    useScreen.setState({ notice: "reconnect" });
+    await act(async () => root.render(<TooltipProvider><ScreenNotice /></TooltipProvider>));
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Twoje udostępnianie zatrzymało się po utracie połączenia");
+    const restart = vi.spyOn(controller.screen, "beginShare").mockImplementation(() => {});
+    const button = [...container.querySelectorAll("button")].find(b => b.textContent === "Udostępnij ponownie")!;
+    await act(async () => button.click());
+    expect(restart).toHaveBeenCalledOnce();
+    expect(container.querySelector('[role="alert"]')).not.toBeNull();
+    restart.mockRestore();
+  });
+
+  it("offers desktop screen settings and never displays raw browser errors", async () => {
+    await desktop("ok");
+    const userAgent = vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Macintosh");
+    useSettings.setState({ language: "pl" });
+    useScreen.setState({ notice: "permission" });
+    await act(async () => root.render(<TooltipProvider><ScreenNotice /></TooltipProvider>));
+    expect(container.textContent).toContain("Zezwól na nagrywanie ekranu dla Gwar");
+    expect(container.textContent).toContain("Otwórz ustawienia");
+    expect(container.textContent).not.toContain("Permission denied by system");
+    const settings = vi.spyOn(platform, "openScreenRecordingSettings").mockResolvedValue();
+    await act(async () => [...container.querySelectorAll("button")].find(b => b.textContent === "Otwórz ustawienia")!.click());
+    expect(settings).toHaveBeenCalledOnce();
+    settings.mockRestore();
+    userAgent.mockRestore();
+  });
+});
 
 describe("the Share button and LIVE badge", () => {
   it("in the browser: shares, and the badge opens the share", async () => {

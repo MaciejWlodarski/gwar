@@ -93,6 +93,22 @@ fn webkit_bundle_version() -> Option<String> {
     None
 }
 
+/// Opens only the OS screen-recording privacy page, from the main app window.
+#[tauri::command]
+pub fn open_screen_privacy_settings(window: tauri::WebviewWindow) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("screen commands require the main window".into());
+    }
+    let url = if cfg!(target_os = "macos") {
+        "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"
+    } else if cfg!(target_os = "windows") {
+        "ms-settings:privacy-graphicscaptureprogrammatic"
+    } else {
+        return Err("this system has no screen recording privacy settings".into());
+    };
+    open::that(url).map_err(|e| format!("cannot open {url}: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
