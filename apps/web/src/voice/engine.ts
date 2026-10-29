@@ -5,6 +5,7 @@
  */
 import type { IceServer } from "../proto/IceServer";
 import type { Control, ControlResult, CryptoStatus } from "./sframe/state";
+import { dbToLevel } from "./input-sensitivity";
 
 export type InputMode = "vad" | "ptt";
 
@@ -106,6 +107,8 @@ export interface VoiceEngine {
   setMuted(muted: boolean): void;
   setDeafened(deafened: boolean): void;
   setInputMode(mode: InputMode): void;
+  /** null: automatic (the default -50 dB gate); otherwise a threshold in dBFS. */
+  setInputSensitivity(threshold: number | null): void;
   /** Push-to-talk key state; only matters in `ptt` mode. */
   setPttActive(active: boolean): void;
   setInputDevice(deviceId: string | null): Promise<void>;
@@ -127,9 +130,9 @@ export interface VoiceEngine {
   on<E extends keyof VoiceEvents>(event: E, handler: (value: VoiceEvents[E]) => void): () => void;
 }
 
-/** Maps an RMS amplitude (0..1) to a display level (0..1) over a 60 dB range. */
+/** Maps an RMS amplitude (0..1) to the sensitivity meter's -100..0 dB scale. */
 export function rmsToLevel(rms: number): number {
   if (rms <= 0) return 0;
   const db = 20 * Math.log10(rms);
-  return Math.min(1, Math.max(0, (db + 60) / 60));
+  return dbToLevel(db);
 }

@@ -878,7 +878,9 @@ pub fn voice_set_input_mode(
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     inner.prefs.mode = match mode {
-        Mode::Vad => InputMode::VoiceActivity { threshold_db: threshold_db.unwrap_or(DEFAULT_THRESHOLD_DB) },
+        Mode::Vad => InputMode::VoiceActivity {
+            threshold_db: gwar_client::voice::input_threshold(threshold_db.unwrap_or(DEFAULT_THRESHOLD_DB)),
+        },
         Mode::Ptt => InputMode::PushToTalk,
     };
     if let Some(h) = &inner.handle {

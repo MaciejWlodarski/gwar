@@ -1,4 +1,6 @@
 import { nextMediaRun } from "./engine";
+import { dbToLevel, inputThreshold } from "./input-sensitivity";
+export { dbToLevel } from "./input-sensitivity";
 import { AUDIO_SLOTS } from "../net/protocol";
 import { tauri, type TauriBridge, type Unlisten } from "../platform";
 import {
@@ -38,11 +40,6 @@ export function micErrorKind(kind: IssuePayload["kind"]): "no_mic" | "mic_denied
   return kind === "no_device" ? "no_mic" : kind === "permission_denied" ? "mic_denied" : "mic_failed";
 }
 
-/** dBFS (RMS) -> 0..1 over a 60 dB range, same shaping as the browser meter. */
-export function dbToLevel(db: number): number {
-  return Math.min(1, Math.max(0, (db + 60) / 60));
-}
-
 type StartParams = Parameters<VoiceEngine["start"]>[0];
 
 /**
@@ -70,6 +67,8 @@ export class NativeVoiceEngine implements VoiceEngine {
   private devicePoll: ReturnType<typeof setInterval> | null = null;
   private lastDevices = "";
   private smoothed = 0;
+  private inputMode: InputMode = "vad";
+  private threshold = inputThreshold(null);
   private micTestId = 0;
 
   private inputDevice: string | null = null;
@@ -273,7 +272,13 @@ export class NativeVoiceEngine implements VoiceEngine {
   }
 
   setInputMode(mode: InputMode): void {
-    this.send("voice_set_input_mode", { mode });
+    this.inputMode = mode;
+    this.send("voice_set_input_mode", { mode, thresholdDb: this.threshold });
+  }
+
+  setInputSensitivity(threshold: number | null): void {
+    this.threshold = inputThreshold(threshold);
+    this.setInputMode(this.inputMode);
   }
 
   setPttActive(active: boolean): void {

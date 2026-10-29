@@ -140,6 +140,8 @@ struct Peer {
     connected: bool,
     origin: Arc<AudioOrigin>,
     admission: RtpAdmission,
+    /// Client gates before encoding; only digital silence is filtered here.
+    client_gate: bool,
     rtcp_reports: u64,
     #[cfg(feature = "test-hooks")]
     hold_next: Option<tokio::sync::oneshot::Sender<AudioPacket>>,
@@ -230,13 +232,22 @@ impl Peer {
 }
 
 /// Speech decision for one frame from header extensions alone.
-fn is_speech(data: &ExtensionValues) -> bool {
+fn is_speech(data: &ExtensionValues, client_gate: bool) -> bool {
+    if client_gate {
+        // A browser still sends encoded silence/DTX when its worklet closes.
+        // Do not impose a second threshold on quiet speech or push-to-talk.
+        return data.audio_level.map_or_else(|| data.voice_activity.unwrap_or(true), |level| level > -127);
+    }
     match (data.voice_activity, data.audio_level) {
         (vad, Some(level)) => level >= SPEECH_LEVEL || (vad == Some(true) && level >= SPEECH_LEVEL - 10),
         (Some(vad), None) => vad,
         // Without the extension we cannot tell; forward everything.
         (None, None) => true,
     }
+}
+
+fn has_client_gate(sdp: &str) -> bool {
+    sdp.lines().any(|line| line == "a=x-gwar-input-gate:1")
 }
 
 pub struct WebRtcConfig {
@@ -442,6 +453,7 @@ fn accept(
         connected: false,
         origin,
         admission,
+        client_gate: has_client_gate(sdp),
         rtcp_reports: 0,
         #[cfg(feature = "test-hooks")]
         hold_next: None,
@@ -559,7 +571,7 @@ fn ingest(
         }
         return None;
     }
-    if is_speech(&data.header.ext_vals) {
+    if is_speech(&data.header.ext_vals, peer.client_gate) {
         peer.last_voice = now;
         if !peer.talking {
             peer.talking = true;
@@ -586,6 +598,35 @@ fn ingest(
 #[cfg(test)]
 mod clock_tests {
     use super::*;
+
+    #[test]
+    fn optional_sdp_gate_is_accepted_and_legacy_offers_stay_legacy() {
+        let legacy = include_str!("../../../../apps/web/src/voice/native-offer.fixture.sdp");
+        let legacy = legacy.replace("\r\n", "\n");
+        let gated = legacy.replacen("\nm=", "\na=x-gwar-input-gate:1\nm=", 1);
+        assert!(!has_client_gate(&legacy));
+        assert!(has_client_gate(&gated));
+        assert!(!has_client_gate(&gated.replace("input-gate:1", "input-gate:2")));
+        // The same parser used by older servers accepts an unknown SDP attribute.
+        assert!(SdpOffer::from_sdp_string(&gated).is_ok());
+    }
+
+    #[test]
+    fn client_gate_keeps_quiet_voice_and_ptt_while_legacy_offers_keep_the_old_threshold() {
+        for (level, vad, legacy, gated) in [
+            (-40, Some(false), true, true),
+            (-55, Some(true), true, true),
+            (-75, Some(true), false, true),
+            (-100, Some(false), false, true),
+            (-127, Some(true), false, false),
+        ] {
+            let data = ExtensionValues { audio_level: Some(level), voice_activity: vad, ..Default::default() };
+            assert_eq!(is_speech(&data, false), legacy);
+            assert_eq!(is_speech(&data, true), gated);
+        }
+        assert!(is_speech(&ExtensionValues::default(), false));
+        assert!(is_speech(&ExtensionValues::default(), true));
+    }
 
     fn slot(now: Instant) -> Slot {
         Slot {

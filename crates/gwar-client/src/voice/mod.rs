@@ -8,6 +8,8 @@
 mod apm;
 mod denoise;
 mod follow;
+mod gate;
+pub use gate::input_threshold;
 pub mod io;
 pub mod jitter;
 pub mod keys;
@@ -240,7 +242,7 @@ impl VoiceHandle {
     pub fn set_input_mode(&self, mode: InputMode) {
         match mode {
             InputMode::VoiceActivity { threshold_db } => {
-                set_f(&self.controls.vad_threshold, threshold_db);
+                set_f(&self.controls.vad_threshold, input_threshold(threshold_db));
                 self.controls.push_to_talk.store(false, Ordering::Relaxed);
             }
             InputMode::PushToTalk => self.controls.push_to_talk.store(true, Ordering::Relaxed),
@@ -538,10 +540,9 @@ fn route_ip(server: IpAddr) -> Option<IpAddr> {
 
 fn level_db(frame: &[f32]) -> f32 {
     let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
-    20.0 * rms.max(1e-5).log10()
+    (20.0 * rms.log10()).max(-127.0)
 }
 
-const HANGOVER: Duration = Duration::from_millis(300);
 /// Packets per pipeline pass; eight slots of 10 ms audio deliver about eight per pass.
 const RECEIVE_BATCH: usize = 256;
 
@@ -628,7 +629,7 @@ fn pipeline<const CAPTURE: usize>(
     let mut next_position = None;
     let mut mix = vec![0f32; FRAME];
     let mut packet = vec![0u8; 1275];
-    let mut last_voice = Instant::now() - HANGOVER;
+    let mut gate = gate::InputGate::default();
     let mut speaker_buffer = SpeakerBuffer::new(Instant::now());
 
     while !controls.stop.load(Ordering::Relaxed) {
@@ -659,15 +660,8 @@ fn pipeline<const CAPTURE: usize>(
             let frame = &capture.samples;
             set_f(&controls.input_level, db);
             let blocked = controls.muted.load(Ordering::Relaxed) || controls.deafened.load(Ordering::Relaxed);
-            let wants = if controls.push_to_talk.load(Ordering::Relaxed) {
-                controls.ptt.load(Ordering::Relaxed)
-            } else {
-                db >= f(&controls.vad_threshold)
-            };
-            if wants && !blocked {
-                last_voice = Instant::now();
-            }
-            let send = !blocked && last_voice.elapsed() < HANGOVER;
+            let ptt = controls.push_to_talk.load(Ordering::Relaxed).then(|| controls.ptt.load(Ordering::Relaxed));
+            let send = gate.allows(Instant::now(), db, f(&controls.vad_threshold), ptt, blocked);
             controls.transmitting.store(send, Ordering::Relaxed);
             if send {
                 let n = encoder.encode_float(frame, &mut packet[..])?;

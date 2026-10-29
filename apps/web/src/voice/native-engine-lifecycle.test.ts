@@ -75,6 +75,23 @@ afterEach(async () => {
 });
 
 describe("native web-view ownership", () => {
+  it("applies manual sensitivity live, preserves it across PTT, and restores the automatic default", async () => {
+    const view = engine();
+    view.setInputSensitivity(-72);
+    view.setInputMode("ptt");
+    view.setInputMode("vad");
+    await view.stop(); // Drain controls without opening native audio.
+    expect(bridge.invoke.mock.calls.filter(([command]) => command === "voice_set_input_mode").map(([, args]) => args)).toEqual([
+      { owner: 1, mode: "vad", thresholdDb: -72 },
+      { owner: 1, mode: "ptt", thresholdDb: -72 },
+      { owner: 1, mode: "vad", thresholdDb: -72 },
+    ]);
+    view.setInputSensitivity(null);
+    await view.stop();
+    expect(bridge.invoke).toHaveBeenCalledWith("voice_set_input_mode", { owner: 1, mode: "vad", thresholdDb: -50 });
+    expect(bridge.invoke).not.toHaveBeenCalledWith("voice_start", expect.anything());
+  });
+
   it("bootstraps on construction and retires a previous timestamp-sized run before the first stop", async () => {
     const view = engine();
     await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_bootstrap"));
@@ -160,7 +177,7 @@ describe("native microphone test replacement", () => {
     const stopCurrent = await view.startMicTest(currentLevel);
     emit("voice://test-level", { owner: 1, db: -30 });
     expect(oldLevel).not.toHaveBeenCalled();
-    expect(currentLevel).toHaveBeenCalledWith(0.5);
+    expect(currentLevel).toHaveBeenCalledWith(0.7);
     opening.resolve();
     const stopOld = await oldTest;
     stopOld();
@@ -168,7 +185,7 @@ describe("native microphone test replacement", () => {
     expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_stop")).toHaveLength(0);
     emit("voice://test-level", { owner: 1, db: -30 });
     expect(oldLevel).not.toHaveBeenCalled();
-    expect(currentLevel).toHaveBeenCalledWith(0.5);
+    expect(currentLevel).toHaveBeenCalledWith(0.7);
     stopCurrent();
     await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1 }));
   });

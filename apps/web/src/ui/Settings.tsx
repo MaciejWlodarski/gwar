@@ -21,6 +21,7 @@ import { Button, Field, Input, Section, Segmented, Select, Slider, Switch } from
 import { AlphaBadge } from "./BugReport";
 import { SettingsPageLayout, type SettingsPage } from "./SettingsLayout";
 import { VersionLabel } from "./Version";
+import { InputSensitivity } from "./InputSensitivity";
 
 const DEFAULT = "__default";
 
@@ -281,6 +282,9 @@ function AudioTab() {
       )}
 
       <Section title={t("audio.test")}>
+        {audio.inputMode === "vad" && (
+          <Switch checked={audio.automaticSensitivity} onCheckedChange={(automaticSensitivity) => setAudio({ automaticSensitivity })} label={t("audio.automaticSensitivity")} description={t("audio.automaticSensitivityHint")} />
+        )}
         <div className="flex items-center gap-3">
           <Button onClick={() => {
               setTestError(null);
@@ -288,8 +292,10 @@ function AudioTab() {
             }} variant={testing ? "primary" : "secondary"} className="shrink-0">
             {testing ? t("audio.testStop") : t("audio.testStart")}
           </Button>
-          <LevelMeter level={level} label={t("audio.level")} />
+          {(audio.inputMode === "ptt" || audio.automaticSensitivity) && <LevelMeter level={level} label={t("audio.level")} />}
         </div>
+        {audio.inputMode === "vad" && !audio.automaticSensitivity && <InputSensitivity level={level} threshold={audio.vadThreshold} onChange={(vadThreshold) => setAudio({ vadThreshold })} />}
+        {audio.inputMode === "ptt" && <p className="text-xs text-muted">{t("audio.sensitivityPtt")}</p>}
         {testError && (
           <p role="alert" className="text-sm text-danger">
             {testError}

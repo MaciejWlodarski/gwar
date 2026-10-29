@@ -1,5 +1,8 @@
 import { startDenoise, type DenoisePipeline } from "./denoise";
 import { nextMediaRun } from "./engine";
+import { inputThreshold } from "./input-sensitivity";
+import { startInputGate, type CaptureGate } from "./input-gate";
+import { advertiseInputGate } from "./sdp";
 import { encryptedVoiceSupported, SframeWorker } from "./sframe/client";
 import { AUDIO_SLOTS } from "../net/protocol";
 import {
@@ -74,6 +77,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private sframe: SframeWorker | null = null;
   private micSender: RTCRtpSender | null = null;
   private stream: MediaStream | null = null;
+  /** Granted capture waiting for its gate module; mute/stop must release it too. */
+  private openingStream: MediaStream | null = null;
   private ctx: SinkAudioContext | null = null;
   private master: GainNode | null = null;
   private streamDest: MediaStreamAudioDestinationNode | null = null;
@@ -92,6 +97,9 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private mode: InputMode = "vad";
   private ptt = false;
   private pttRelease: ReturnType<typeof setTimeout> | null = null;
+  private threshold = inputThreshold(null);
+  private automaticSensitivity = true;
+  private inputGate: CaptureGate | null = null;
   private masterVolume = 1;
   private inputDeviceId: string | null = null;
   private outputDeviceId: string | null = null;
@@ -109,6 +117,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private followRetries = 0;
   /** The capture a switch replaces, still possibly sent until the replacement lands. */
   private handover: MediaStream | null = null;
+  private handoverGate: CaptureGate | null = null;
   private capture: CaptureOptions = { noiseSuppression: true, noiseStrength: 100, echoCancellation: true, autoGainControl: true };
   /**
    * Gwar's own noise suppression (./denoise) once it is loaded; the browser's until then, and for
@@ -240,7 +249,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       if (run !== this.runId) return;
       await pc.setLocalDescription(localOffer);
       if (run !== this.runId) return;
-      const answer = await offer(pc.localDescription?.sdp ?? "", mediaRun);
+      const answer = await offer(advertiseInputGate(pc.localDescription?.sdp ?? ""), mediaRun);
       if (run !== this.runId) return;
       await pc.setRemoteDescription({ type: "answer", sdp: answer });
       if (run !== this.runId) return;
@@ -286,6 +295,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     // The capture a switch was replacing is not sent by a later peer.
     this.handover?.getTracks().forEach((t) => t.stop());
     this.handover = null;
+    this.handoverGate?.close();
+    this.handoverGate = null;
     if (pc) {
       pc.ontrack = null;
       pc.onconnectionstatechange = null;
@@ -322,12 +333,16 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   }
 
   /**
-   * Captures the microphone. `swap` keeps the current one until the new one is sent (a device
-   * change, not the user's), and keeps it when the new one fails while it still works.
+   * Captures the microphone. `swap` keeps the current one until the gated replacement is sent,
+   * and keeps it when the new capture or gate fails while it still works.
    */
   private async openMic({ swap = false } = {}): Promise<MediaStream | null> {
-    if (swap) this.micGeneration++;
-    else this.closeMic();
+    if (swap) {
+      this.micGeneration++;
+      this.openingStream?.getTracks().forEach(track => track.stop());
+      this.openingStream = null;
+    } else this.closeMic();
+    if (this.muted || this.deafened) return null;
     const generation = this.micGeneration;
     const run = this.runId;
     const current = () => generation === this.micGeneration && run === this.runId;
@@ -337,8 +352,31 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         stream.getTracks().forEach((track) => track.stop());
         return null;
       }
+      // Never attach raw capture while the gate module is loading.
+      stream.getAudioTracks().forEach(track => { track.enabled = false; });
+      this.openingStream = stream;
+      const release = () => {
+        if (this.openingStream !== stream) return;
+        this.openingStream = null;
+        stream.getTracks().forEach(track => track.stop());
+      };
+      let gate: CaptureGate;
+      try {
+        gate = await startInputGate(this.ensureContext(), stream);
+      } catch (error) {
+        release();
+        throw error;
+      }
+      if (!current() || this.muted || this.deafened) {
+        gate.close();
+        release();
+        return null;
+      }
       const previous = this.stream;
+      const previousGate = this.inputGate;
       this.stopMeter();
+      this.inputGate = gate;
+      this.openingStream = null;
       this.stream = stream;
       this.micMissing = false;
       this.denoise?.setSource(stream);
@@ -356,8 +394,13 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         // Sent before the previous capture stops, so the call hears no gap beyond the switch;
         // until then mute and push-to-talk gate it too, and a stop ends it.
         this.handover = previous;
+        this.handoverGate = previousGate;
         await this.updateSentTrack();
         if (this.handover === previous) this.handover = null;
+        if (this.handoverGate === previousGate) {
+          this.handoverGate = null;
+          previousGate?.close();
+        }
         previous?.getTracks().forEach((t) => t.stop());
         this.followRetries = 0;
       }
@@ -379,6 +422,12 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   }
 
   private releaseMic(): void {
+    this.inputGate?.close();
+    this.inputGate = null;
+    this.openingStream?.getTracks().forEach(track => track.stop());
+    this.openingStream = null;
+    this.handoverGate?.close();
+    this.handoverGate = null;
     this.stopMeter();
     this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null;
@@ -507,9 +556,14 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private applyTrackEnabled(): void {
     const track = this.stream?.getAudioTracks()[0];
     if (!track) return;
-    const enabled = !this.muted && !this.deafened && (this.mode === "vad" || this.ptt);
+    const blocked = this.muted || this.deafened;
+    // Keep capture running below the VAD threshold so it can open the gate again.
+    const enabled = !blocked && (this.mode === "vad" || this.ptt);
     track.enabled = enabled;
     this.handover?.getAudioTracks().forEach((t) => { t.enabled = enabled; });
+    const controls = { threshold: this.threshold, ptt: this.mode === "ptt" ? this.ptt : null, blocked, automatic: this.automaticSensitivity };
+    this.inputGate?.configure(controls);
+    this.handoverGate?.configure(controls);
     if (this.denoise) {
       this.denoise.track.enabled = enabled;
       this.denoise.setActive(enabled);
@@ -521,7 +575,9 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   /** The microphone as sent: through the model while it runs, else as captured. */
   private sentTrack(): MediaStreamTrack | null {
     const captured = this.stream?.getAudioTracks()[0] ?? null;
-    return captured && this.denoise?.running ? this.denoise.track : captured;
+    if (!captured || !this.inputGate) return null;
+    this.inputGate.setAudio(this.denoise?.running ? this.denoise.track : captured);
+    return this.inputGate.track;
   }
 
   /** Sends `sentTrack()`, after any replacement still in progress, as it is when that is done. */
@@ -764,6 +820,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     if (muted) this.cancelPttRelease();
     this.muted = muted;
     this.applyTrackEnabled();
+    if (muted) this.closeMic();
+    else if (!this.deafened && this.inCall()) void this.retryMic();
   }
 
   setDeafened(deafened: boolean): void {
@@ -771,11 +829,19 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     this.deafened = deafened;
     this.applyTrackEnabled();
     this.applyMasterGain();
+    if (deafened) this.closeMic();
+    else if (!this.muted && this.inCall()) void this.retryMic();
   }
 
   setInputMode(mode: InputMode): void {
     this.cancelPttRelease();
     this.mode = mode;
+    this.applyTrackEnabled();
+  }
+
+  setInputSensitivity(threshold: number | null): void {
+    this.automaticSensitivity = threshold === null;
+    this.threshold = inputThreshold(threshold);
     this.applyTrackEnabled();
   }
 

@@ -5,6 +5,11 @@ import { WebRtcVoiceEngine } from "./webrtc-engine";
 
 const startDenoise = vi.hoisted(() => vi.fn<(events: DenoiseEvents, signal: AbortSignal) => Promise<DenoisePipeline>>());
 vi.mock("./denoise", () => ({ startDenoise }));
+const startInputGate = vi.hoisted(() => vi.fn());
+vi.mock("./input-gate", () => ({ startInputGate }));
+const gates: Array<{ track: MediaStreamTrack; setAudio: ReturnType<typeof vi.fn>; configure: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn> }> = [];
+const gate = () => gates.at(-1)!;
+
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -57,6 +62,13 @@ const flush = () => vi.advanceTimersByTimeAsync(0);
 beforeEach(() => {
   vi.useFakeTimers();
   Peer.all = [];
+  gates.length = 0;
+  startInputGate.mockReset().mockImplementation(async () => {
+    const track = microphone().track as unknown as MediaStreamTrack;
+    const created = { track, setAudio: vi.fn(), configure: vi.fn(), close: vi.fn(() => { track.enabled = false; track.stop(); }) };
+    gates.push(created);
+    return created;
+  });
   resume.mockReset().mockResolvedValue(undefined);
   mediaSource.mockClear();
   getUserMedia.mockReset().mockImplementation(async () => microphone().stream);
@@ -121,6 +133,54 @@ describe("browser voice run ownership", () => {
 });
 
 describe("browser microphone acquisition ownership", () => {
+  it("never acquires capture while muted or deafened, including retries and sensitivity changes", async () => {
+    engine.setMuted(true);
+    engine.setInputSensitivity(-100);
+    await engine.start(params());
+    await engine.retryMic();
+    expect(getUserMedia).not.toHaveBeenCalled();
+    engine.setDeafened(true);
+    engine.setMuted(false);
+    await engine.retryMic();
+    expect(getUserMedia).not.toHaveBeenCalled();
+    engine.setDeafened(false);
+    await flush();
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    const current = gate();
+    engine.setMuted(true);
+    expect(current.configure).toHaveBeenLastCalledWith({ threshold: -100, ptt: null, blocked: true, automatic: false });
+    expect(current.close).toHaveBeenCalledOnce();
+  });
+
+  it("never falls back to sending raw capture when the gate fails to load", async () => {
+    const mic = microphone();
+    getUserMedia.mockResolvedValueOnce(mic.stream);
+    startInputGate.mockRejectedValueOnce(new Error("worklet failed"));
+    const errors = vi.fn();
+    engine.on("micError", errors);
+    await engine.start(params());
+    expect(mic.track.stop).toHaveBeenCalledOnce();
+    expect(errors).toHaveBeenCalledWith(expect.objectContaining({ kind: "mic_failed" }));
+    expect(Peer.all[0]!.addTransceiver.mock.results[0]!.value.sender.replaceTrack).not.toHaveBeenCalled();
+  });
+
+  it("closes a gate that finishes loading after mute without publishing its capture", async () => {
+    const pending = deferred<Awaited<ReturnType<typeof startInputGate>>>();
+    const stale = { track: microphone().track, close: vi.fn(), configure: vi.fn(), setAudio: vi.fn() };
+    const mic = microphone();
+    getUserMedia.mockResolvedValueOnce(mic.stream);
+    startInputGate.mockReturnValueOnce(pending.promise);
+    const starting = engine.start(params());
+    await flush();
+    engine.setMuted(true);
+    expect(mic.track.stop).toHaveBeenCalledOnce();
+    pending.resolve(stale);
+    await starting;
+    expect(stale.close).toHaveBeenCalledOnce();
+    expect(mic.track.stop).toHaveBeenCalledOnce();
+    expect(stale.configure).not.toHaveBeenCalled();
+  });
+
   it("stops every track granted after voice stopped without installing a meter", async () => {
     const capture = deferred<MediaStream>();
     const mic = microphone();
@@ -224,23 +284,27 @@ describe("browser noise suppression", () => {
     await engine.start(params());
     expect(constraints(0).noiseSuppression).toBe(true);
     const first = (await captured(0)).getAudioTracks()[0];
-    expect(sender().replaceTrack).toHaveBeenLastCalledWith(first);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(first);
     const model = pipeline();
     load.resolve(model as DenoisePipeline);
     await flush();
     expect(constraints(1).noiseSuppression).toBe(false);
     expect(model.setSource).toHaveBeenCalledExactlyOnceWith(await captured(1));
     expect(model.setStrength).toHaveBeenCalledWith(100);
-    expect(sender().replaceTrack).toHaveBeenLastCalledWith(model.track);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(model.track);
   });
 
   it("sends the microphone as captured until the capture context runs", async () => {
     const { model, events } = await loaded(pipeline(false));
-    expect(sender().replaceTrack).toHaveBeenLastCalledWith((await captured(1)).getAudioTracks()[0]);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith((await captured(1)).getAudioTracks()[0]);
     model.running = true;
     events().changed();
     await flush();
-    expect(sender().replaceTrack).toHaveBeenLastCalledWith(model.track);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(model.track);
   });
 
   it("idles the model while the microphone is not sent", async () => {
@@ -249,6 +313,7 @@ describe("browser noise suppression", () => {
     expect(model.setActive).toHaveBeenLastCalledWith(false);
     expect(model.track.enabled).toBe(false);
     engine.setMuted(false);
+    await flush();
     expect(model.setActive).toHaveBeenLastCalledWith(true);
     expect(model.track.enabled).toBe(true);
   });
@@ -259,7 +324,8 @@ describe("browser noise suppression", () => {
     await flush();
     expect(model.close).toHaveBeenCalledOnce();
     expect(constraints(2).noiseSuppression).toBe(true);
-    expect(sender().replaceTrack).toHaveBeenLastCalledWith((await captured(2)).getAudioTracks()[0]);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith((await captured(2)).getAudioTracks()[0]);
     await engine.stop();
     await engine.start(params());
     await flush();
@@ -284,7 +350,8 @@ describe("browser noise suppression", () => {
     await engine.setCaptureOptions({ ...options, noiseSuppression: false });
     expect(model.close).toHaveBeenCalledOnce();
     expect(constraints(2).noiseSuppression).toBe(false);
-    expect(sender().replaceTrack).toHaveBeenLastCalledWith((await captured(2)).getAudioTracks()[0]);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith((await captured(2)).getAudioTracks()[0]);
   });
 
   it("cancels a load when its call ends, and the next call loads and uses its own", async () => {
@@ -347,14 +414,16 @@ describe("browser noise suppression", () => {
     const starting = engine.start(params());
     await flush();
     const first = (await captured(0)).getAudioTracks()[0]!;
-    expect(sender().replaceTrack).toHaveBeenLastCalledWith(first);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(first);
     const model = pipeline();
     load.resolve(model as DenoisePipeline);
     await flush();
     expect(first.stop).toHaveBeenCalled();
     attached.resolve();
     await starting;
-    expect(sender().replaceTrack).toHaveBeenLastCalledWith(model.track);
+    expect(sender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(model.track);
   });
 
   it("sends what fits the capture context's state once replacements in progress are done", async () => {
@@ -373,7 +442,8 @@ describe("browser noise suppression", () => {
     });
     const { model, events } = await loaded(pipeline(false));
     const raw = (await captured(1)).getAudioTracks()[0]!;
-    expect(peerSender.track).toBe(raw);
+    expect(peerSender.track).toBe(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(raw);
     // Running: the model's track is on its way when Safari interrupts the context again.
     hold = true;
     model.running = true;
@@ -384,7 +454,8 @@ describe("browser noise suppression", () => {
     await flush();
     replaced.resolve();
     await flush();
-    expect(peerSender.track).toBe(raw);
+    expect(peerSender.track).toBe(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(raw);
   });
 
   it("does not hold the next call behind a replacement its closed peer left unsettled", async () => {
@@ -515,7 +586,7 @@ describe("browser devices follow the system", () => {
 
   const micSender = () => (Peer.all[0]!.addTransceiver.mock.results[0]!.value as { sender: { replaceTrack: ReturnType<typeof vi.fn> } }).sender;
 
-  it("moves a default microphone to the new system default without renegotiating, keeping mute", async () => {
+  it("follows a changed default on unmute without acquiring capture while muted", async () => {
     const first = capture({ deviceId: "default", groupId: "g-mac" });
     const airpods = capture({ deviceId: "default", groupId: "g-air" });
     getUserMedia.mockResolvedValueOnce(first.stream).mockResolvedValueOnce(airpods.stream);
@@ -529,11 +600,15 @@ describe("browser devices follow the system", () => {
     expect(getUserMedia).toHaveBeenCalledOnce();
 
     await changeDevices([mic("default", "g-air", "Default - AirPods"), macbook, mic("air", "g-air", "AirPods")]);
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    engine.setMuted(false);
+    await flush();
     expect(getUserMedia).toHaveBeenCalledTimes(2);
     expect(getUserMedia.mock.calls[1]).toEqual([{ audio: expect.not.objectContaining({ deviceId: expect.anything() }) }]);
-    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(airpods.track);
+    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(airpods.track);
     expect(first.track.stop).toHaveBeenCalledOnce();
-    expect(airpods.track.enabled).toBe(false);
+    expect(airpods.track.enabled).toBe(true);
     expect(Peer.all).toHaveLength(1);
     expect(Peer.all[0]!.createOffer).toHaveBeenCalledOnce();
     expect(switched).not.toHaveBeenCalled();
@@ -560,13 +635,15 @@ describe("browser devices follow the system", () => {
     devices = devices.filter((d) => d !== usb);
     chosen.end();
     await flush();
-    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(fallback.track);
+    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(fallback.track);
     expect(switched).toHaveBeenLastCalledWith({ side: "input", label: "MacBook mic" });
     expect(errors.mock.calls.every(([error]) => error === null)).toBe(true);
 
     await changeDevices([...devices, usb]);
     expect(getUserMedia.mock.calls[3]).toEqual([{ audio: expect.objectContaining({ deviceId: { exact: "usb" } }) }]);
-    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(back.track);
+    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(back.track);
     expect(fallback.track.stop).toHaveBeenCalledOnce();
     expect(switched).toHaveBeenLastCalledWith({ side: "input", label: "USB mic" });
     expect(switched).toHaveBeenCalledTimes(2);
@@ -591,7 +668,8 @@ describe("browser devices follow the system", () => {
 
     await changeDevices([...devices, mic("default", "g-usb", "Default - USB mic"), usb]);
     expect(errors).toHaveBeenLastCalledWith(null);
-    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(plugged.track);
+    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(plugged.track);
   });
 
   it("keeps the working microphone when the new default cannot be opened", async () => {
@@ -650,12 +728,14 @@ describe("browser devices follow the system", () => {
     Peer.all[0]!.connect();
 
     await changeDevices([mic("default", "g-air", "Default - AirPods"), macbook, mic("air", "g-air", "AirPods")]);
-    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(airpods.track);
+    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(airpods.track);
     expect(fallback.track.stop).toHaveBeenCalledOnce();
     expect(switched).not.toHaveBeenCalled();
 
     await changeDevices([...devices, usb]);
-    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(back.track);
+    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(back.track);
     expect(switched).toHaveBeenCalledExactlyOnceWith({ side: "input", label: "USB mic" });
   });
 
@@ -667,8 +747,15 @@ describe("browser devices follow the system", () => {
     Peer.all[0]!.connect();
     micSender().replaceTrack.mockImplementationOnce(() => new Promise<void>(() => {}));
     await changeDevices([mic("default", "g-air", "Default - AirPods"), macbook, mic("air", "g-air", "AirPods")]);
-    // The old capture may still be what the peer sends: mute reaches it too.
+    // The old gate may still be what the peer sends: mute reaches both outputs.
+    const retiringGate = gates[0]!, replacementGate = gate();
+    engine.setInputSensitivity(-72);
+    expect(retiringGate.configure).toHaveBeenLastCalledWith(expect.objectContaining({ threshold: -72 }));
     engine.setMuted(true);
+    expect(retiringGate.track.enabled).toBe(false);
+    expect(replacementGate.track.enabled).toBe(false);
+    expect(retiringGate.close).toHaveBeenCalledOnce();
+    expect(replacementGate.close).toHaveBeenCalledOnce();
     expect(next.track.enabled).toBe(false);
     expect(first.track.enabled).toBe(false);
     await engine.stop();
@@ -679,11 +766,13 @@ describe("browser devices follow the system", () => {
     const second = capture({ deviceId: "default", groupId: "g-mac" });
     const moved = capture({ deviceId: "default", groupId: "g-usb" });
     getUserMedia.mockResolvedValueOnce(second.stream).mockResolvedValueOnce(moved.stream);
+    engine.setMuted(false);
     await engine.start(params());
     Peer.all[1]!.connect();
     await changeDevices([mic("default", "g-usb", "Default - USB mic"), macbook, usb]);
     const sender = (Peer.all[1]!.addTransceiver.mock.results[0]!.value as { sender: { replaceTrack: ReturnType<typeof vi.fn> } }).sender;
-    expect(sender.replaceTrack).toHaveBeenLastCalledWith(moved.track);
+    expect(sender.replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(moved.track);
   });
 
   it("tries a failed switch again while the working microphone stays", async () => {
@@ -698,7 +787,8 @@ describe("browser devices follow the system", () => {
     await changeDevices([mic("default", "g-usb", "Default - USB mic"), macbook, usb]);
     expect(first.track.stop).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1000);
-    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(later.track);
+    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().setAudio).toHaveBeenLastCalledWith(later.track);
     expect(first.track.stop).toHaveBeenCalledOnce();
   });
 

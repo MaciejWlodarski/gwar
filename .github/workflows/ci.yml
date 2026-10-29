@@ -322,6 +322,9 @@ jobs:
         run: pnpm --filter web e2e:denoise
         env:
           E2E_BROWSERS: chromium,webkit,firefox
+      - name: Input sensitivity, audio-thread gate and responsive settings
+        timeout-minutes: 5
+        run: pnpm --filter web e2e:input-sensitivity
 
   desktop:
     needs: [changes, mls-wasm]

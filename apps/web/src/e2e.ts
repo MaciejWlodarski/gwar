@@ -15,6 +15,7 @@ const modules: Record<string, () => Promise<unknown>> = {
   "/src/state/stores.ts": () => import("./state/stores.ts"),
   "/src/voice/denoise/index.ts": () => import("./voice/denoise/index.ts"),
   "/src/voice/native-engine.ts": () => import("./voice/native-engine.ts"),
+  "/src/voice/input-gate.ts": () => import("./voice/input-gate.ts"),
 };
 Object.defineProperty(window, "__gwarE2eImport", { value: (name: string) => {
   const load = modules[name];

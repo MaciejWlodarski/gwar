@@ -307,6 +307,7 @@ class Controller {
     const applyAudio = (s = useSettings.getState()) => {
       const a = s.audio;
       e.setInputMode(a.inputMode);
+      e.setInputSensitivity(a.automaticSensitivity ? null : a.vadThreshold);
       e.setMasterVolume(a.masterVolume);
       void e.setOutputDevice(a.outputDeviceId);
       for (const [uid, v] of Object.entries(s.userVolumes)) e.setUserVolume(uid, v);
@@ -335,6 +336,7 @@ class Controller {
       const a = s.audio;
       const p = prev.audio;
       if (a.inputMode !== p.inputMode) e.setInputMode(a.inputMode);
+      if (a.automaticSensitivity !== p.automaticSensitivity || a.vadThreshold !== p.vadThreshold) e.setInputSensitivity(a.automaticSensitivity ? null : a.vadThreshold);
       if (a.masterVolume !== p.masterVolume) e.setMasterVolume(a.masterVolume);
       if (a.outputDeviceId !== p.outputDeviceId) void e.setOutputDevice(a.outputDeviceId);
       if (a.inputDeviceId !== p.inputDeviceId) void e.setInputDevice(a.inputDeviceId);

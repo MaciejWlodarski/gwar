@@ -94,6 +94,7 @@ function fakeEngine() {
     setMuted: vi.fn(),
     setDeafened: vi.fn(),
     setInputMode: vi.fn(),
+    setInputSensitivity: vi.fn(),
     setPttActive: vi.fn(),
     setInputDevice: vi.fn(async () => {}),
     setOutputDevice: vi.fn(async () => {}),

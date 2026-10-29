@@ -99,6 +99,26 @@ describe("microphone test replacement", () => {
 });
 
 describe("capture processing", () => {
+  it("defaults to automatic sensitivity and offers an accessible live manual threshold", async () => {
+    await act(async () => { useUi.getState().openSettings("audio"); root.render(<TooltipProvider><SettingsSection /></TooltipProvider>); });
+    expect(document.querySelector('[role="slider"][aria-label="Input sensitivity"]')).toBeNull();
+    const automatic = () => [...document.querySelectorAll<HTMLElement>('[role="switch"]')].find(e => e.closest("div")?.textContent?.includes("Automatically determine input sensitivity"))!;
+    expect(automatic().getAttribute("aria-checked")).toBe("true");
+    await act(async () => automatic().click());
+    const slider = document.querySelector<HTMLElement>('[role="slider"][aria-label="Input sensitivity"]')!;
+    expect(slider.getAttribute("aria-valuenow")).toBe("-50");
+    await act(async () => slider.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true })));
+    expect(useSettings.getState().audio.vadThreshold).toBe(-51);
+    await act(async () => useVoice.setState({ state: "connected", level: 0.6 }));
+    expect(meter().getAttribute("aria-valuenow")).toBe("-40");
+    expect(container.textContent).toContain("Above threshold");
+    await act(async () => useVoice.setState({ level: 0.2 }));
+    expect(container.textContent).toContain("Below threshold");
+    await act(async () => useSettings.getState().setAudio({ inputMode: "ptt" }));
+    expect(container.textContent).toContain("Push-to-talk ignores input sensitivity");
+    expect(document.querySelector('[role="slider"][aria-label="Input sensitivity"]')).toBeNull();
+  });
+
   it("offers noise suppression's strength beside echo cancellation", async () => {
     await act(async () => { useUi.getState().openSettings("audio"); root.render(<TooltipProvider><SettingsSection /></TooltipProvider>); });
     const strength = document.querySelector<HTMLElement>('[role="slider"][aria-label="Noise suppression strength"]')!;
