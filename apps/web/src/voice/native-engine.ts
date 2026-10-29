@@ -18,6 +18,14 @@ type Handler = (value: never) => void;
 const CONNECT_TIMEOUT_MS = 15_000;
 const DEVICE_POLL_MS = 4_000;
 
+/** `voice://device`: the Rust engine sorted a device out by itself. */
+interface DevicePayload {
+  owner: number;
+  side: "input" | "output";
+  kind: "switched" | "recovered";
+  device: string | null;
+}
+
 /** `voice://issue`: a device problem reported by the Rust engine. */
 interface IssuePayload {
   owner: number;
@@ -61,7 +69,6 @@ export class NativeVoiceEngine implements VoiceEngine {
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private devicePoll: ReturnType<typeof setInterval> | null = null;
   private lastDevices = "";
-  private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private smoothed = 0;
   private micTestId = 0;
 
@@ -146,6 +153,11 @@ export class NativeVoiceEngine implements VoiceEngine {
             this.emit("outputError", new VoiceError("output_failed", p.message));
           }
         }),
+        await api.listen<DevicePayload>("voice://device", (p) => {
+          if (p.owner !== owner) return;
+          if (p.kind === "recovered") this.emit(p.side === "input" ? "micError" : "outputError", null);
+          else if (p.device) this.emit("deviceSwitched", { side: p.side, label: p.device });
+        }),
       );
     })();
     await this.listening;
@@ -223,8 +235,6 @@ export class NativeVoiceEngine implements VoiceEngine {
     this.runId = nextMediaRun();
     this.params = null;
     this.clearConnectTimer();
-    if (this.restartTimer) clearTimeout(this.restartTimer);
-    this.restartTimer = null;
     this.stopDevicePoll();
     this.smoothed = 0;
     this.emit("level", 0);
@@ -252,16 +262,6 @@ export class NativeVoiceEngine implements VoiceEngine {
     }
   }
 
-  /** Device changes apply on the next start; restart now if a session is live. */
-  private scheduleRestart(): void {
-    if (!this.params || this.state === "idle") return;
-    if (this.restartTimer) clearTimeout(this.restartTimer);
-    this.restartTimer = setTimeout(() => {
-      this.restartTimer = null;
-      void this.restart();
-    }, 200);
-  }
-
   // ----------------------------------------------------------------- setters
 
   setMuted(muted: boolean): void {
@@ -280,18 +280,17 @@ export class NativeVoiceEngine implements VoiceEngine {
     this.send("voice_set_ptt", { active });
   }
 
+  // Running voice moves to the new device natively, without renegotiating.
   async setInputDevice(deviceId: string | null): Promise<void> {
     if (this.inputDevice === deviceId) return;
     this.inputDevice = deviceId;
     this.send("voice_set_devices", { input: this.inputDevice, output: this.outputDevice });
-    this.scheduleRestart();
   }
 
   async setOutputDevice(deviceId: string | null): Promise<void> {
     if (this.outputDevice === deviceId) return;
     this.outputDevice = deviceId;
     this.send("voice_set_devices", { input: this.inputDevice, output: this.outputDevice });
-    this.scheduleRestart();
   }
 
   async setCaptureOptions(options: CaptureOptions): Promise<void> {

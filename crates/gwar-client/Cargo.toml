@@ -59,6 +59,8 @@ tokio = { workspace = true, features = ["test-util"] }
 block2 = "0.6"
 objc2 = "0.6"
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat"] }
+# Default-device and device-list notifications (already in the graph through cpal).
+objc2-core-audio = { version = "0.3", default-features = false, features = ["std", "AudioHardware"] }
 # Pipeline thread scheduling: thin bindings already in the dependency graph.
 libc = "0.2"
 mach2 = "0.6"

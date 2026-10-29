@@ -427,6 +427,7 @@ export const en = {
   "voice.channelSecuring": "This encrypted channel is still being secured on this device. Try again in a moment.",
   "voice.securingTimeout": "Encrypted voice could not be secured. Try again.",
   "voice.closed": "The voice connection was closed. Reconnecting…",
+  "voice.deviceSwitched": "Switched to: {device}",
   "screen.share": "Share screen",
   "screen.stop": "Stop sharing",
   "screen.encryptedSoon": "Screen sharing in encrypted channels is coming soon.",

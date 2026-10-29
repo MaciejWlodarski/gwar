@@ -71,6 +71,8 @@ export interface VoiceEvents {
   devices: DeviceList;
   /** Playback problem (desktop only); `null` clears it. */
   outputError: VoiceError | null;
+  /** Audio moved to another device by itself: the chosen one disappeared or came back. */
+  deviceSwitched: { side: "input" | "output"; label: string };
 }
 
 export interface VoiceEngine {
