@@ -355,16 +355,16 @@ const SHRINK_RETRY: Duration = Duration::from_millis(200);
 // quiet packets after quiet frames, and accelerates the rest as libwebrtc's NetEq does
 // (playout.rs `accelerate`), removing one pitch period at a time from audio that correlates
 // above `BACKLOG_CORRELATION` (NetEq's `kCorrelationThreshold`). Each period removed costs
-// `BACKLOG_PACE` times its length of playout, so speech plays at most 1.25 times as fast.
+// `BACKLOG_PACE` times its length of playout, so speech plays at most 1.2 times as fast.
 //
-// After `BACKLOG_WAIT` the cut takes the best-correlating lag whatever its correlation
-// (`ANY_CORRELATION`). The lag still comes from the whole 2.5--15 ms range, so a voice whose
-// period correlates at 0.5 or more (NetEq's fast-mode threshold) still loses only whole periods.
-// Only audio in which no lag correlates that well (noise, unvoiced or whispered audio) loses
-// lags that are not a period, each crossfaded over its whole length. This is not NetEq's rule:
-// NetEq accepts any lag only when an energy VAD finds no active speech; here quiet audio is
-// dropped or skipped by its level instead. A cut that removes nothing for `BACKLOG_STUCK` gives
-// up and restarts the window, which gives the gentle shrink its turn.
+// After `BACKLOG_WAIT` the cut takes a period that correlates above `RELAXED_CORRELATION`
+// (NetEq's fast-mode threshold), from the whole 2.5--15 ms range, so a voice still loses only
+// whole periods. Audio without a period (noise, unvoiced or whispered speech, most music) is
+// never spliced: its backlog drains only in quiet packets and frames, and otherwise stays as it
+// is (it does not grow; `MAX_QUEUED` caps any queue). NetEq accepts any lag only when an energy
+// VAD finds no active speech; here quiet audio is dropped or skipped by its level instead. A cut
+// that removes nothing for `BACKLOG_STUCK` gives up and restarts the window, which gives the
+// gentle shrink its turn.
 //
 // The evidence starts at one window and doubles (up to `MAX_BACKLOG_EVIDENCE`) whenever playout
 // starves within `BACKLOG_PROBE` of a cut: delay that swells and recedes more rarely than the
@@ -374,9 +374,9 @@ const SHRINK_RETRY: Duration = Duration::from_millis(200);
 const BACKLOG_TRIM: u64 = 4800;
 const BACKLOG_KEEP: u64 = 1920;
 pub(crate) const BACKLOG_CORRELATION: f64 = 0.9;
-const BACKLOG_PACE: u64 = 4;
+const BACKLOG_PACE: u64 = 5;
 const BACKLOG_WAIT: Duration = Duration::from_secs(2);
-pub(crate) const ANY_CORRELATION: f64 = -1.0;
+pub(crate) const RELAXED_CORRELATION: f64 = 0.5;
 const BACKLOG_STUCK: Duration = Duration::from_secs(10);
 // The gentle shrink accelerates only near-identical periods: it runs whatever the queue holds.
 pub(crate) const SHRINK_CORRELATION: f64 = 0.98;
@@ -1062,8 +1062,8 @@ impl JitterBuffer {
             self.missing = 0;
             self.held = 0;
             // A due backlog cut accelerates whenever its pace allows (`backlog_budget`); it starts
-            // with NetEq's correlation threshold and takes the best lag whatever its correlation
-            // after `BACKLOG_WAIT` (`ANY_CORRELATION`).
+            // with NetEq's correlation threshold and relaxes to its fast mode's after
+            // `BACKLOG_WAIT` (`RELAXED_CORRELATION`).
             let backlog = if demand > 0 && self.recovering.is_none() { self.backlog_budget(now) } else { 0 };
             let backlog = backlog.min(available);
             if backlog >= MIN_PERIOD {
@@ -1073,7 +1073,7 @@ impl JitterBuffer {
                     skip: backlog as usize,
                     quiet_only: held < FORCE_SHRINK,
                     fade,
-                    correlation: if waited { ANY_CORRELATION } else { BACKLOG_CORRELATION },
+                    correlation: if waited { RELAXED_CORRELATION } else { BACKLOG_CORRELATION },
                 };
             }
             let shrink = demand > 0
@@ -1758,7 +1758,7 @@ mod tests {
                     let skip = if !speech {
                         jb.shrunk(now, skip.min(240));
                         skip.min(240)
-                    } else if correlation == ANY_CORRELATION && skip >= 320 {
+                    } else if correlation == RELAXED_CORRELATION && skip >= 320 {
                         jb.accelerated(now, 320);
                         320
                     } else {
@@ -1890,10 +1890,11 @@ mod tests {
     }
 
     #[test]
-    fn a_due_cut_paces_its_periods_and_waits_before_taking_any() {
+    fn a_due_cut_paces_its_periods_and_waits_before_relaxing() {
         // 400 ms of 20 ms packets queued at once, then one per refill: the window proves the
         // surplus at 5 s. The decoder removes whole 150 Hz periods (320 samples) within each
-        // budget, from a voice that correlates (NetEq's threshold) or not (only any will do).
+        // budget, from a voice that correlates above NetEq's threshold or only above its fast
+        // mode's.
         for correlated in [true, false] {
             let start = Instant::now();
             let mut jb = JitterBuffer::new();
@@ -1908,12 +1909,12 @@ mod tests {
                 let mut periods = 0;
                 if correlation < SHRINK_CORRELATION {
                     proposed.get_or_insert(k);
-                    if correlation == ANY_CORRELATION {
+                    if correlation == RELAXED_CORRELATION {
                         relaxed.get_or_insert(k);
                     } else {
                         assert_eq!(correlation, BACKLOG_CORRELATION);
                     }
-                    if correlated || correlation == ANY_CORRELATION {
+                    if correlated || correlation == RELAXED_CORRELATION {
                         periods = skip as u64 / 320 * 320;
                         jb.accelerated(now, periods as usize);
                     }
@@ -1925,12 +1926,12 @@ mod tests {
             if correlated {
                 assert_eq!(relaxed, None);
             } else {
-                assert_eq!(relaxed, Some(proposed + 100), "any correlation after `BACKLOG_WAIT`");
+                assert_eq!(relaxed, Some(proposed + 100), "the relaxed rule after `BACKLOG_WAIT`");
                 assert!(removed[..relaxed.unwrap() as usize].iter().all(|&r| r == 0));
             }
-            // At most a quarter of any second's output, beyond the first long period of credit.
+            // At most a fifth of any second's output, beyond the first long period of credit.
             let peak = removed.windows(50).map(|w| w.iter().sum::<u64>()).max().unwrap();
-            assert!(peak <= 12_000 + SHRINK_STEP, "correlated {correlated}: {peak} samples in a second");
+            assert!(peak <= 9_600 + SHRINK_STEP, "correlated {correlated}: {peak} samples in a second");
             // All but `BACKLOG_KEEP` of the 360 ms surplus, a packet at most, went that way.
             let total = removed.iter().sum::<u64>();
             assert!((360 * 48 - BACKLOG_KEEP - FRAME..=360 * 48).contains(&total), "{total}");
