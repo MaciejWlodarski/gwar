@@ -42,14 +42,20 @@ const RECOVER_MS = 5_000;
 interface Point { at: number; ms: number }
 const lowest = (points: Point[]) => Math.min(...points.map(p => p.ms));
 
-/** The session's Gwar server pings. The SFU shares the server's host, so the lowest bounds a new peer's floor. */
-export interface ServerPing { floorMs: number; latestMs: number }
+/**
+ * The session's Gwar server pings. The SFU shares the server's host, so the lowest bounds a new peer's floor.
+ * `elevated` counts the last three pings at least 75 ms above it: one stalled pong (busy JS thread) is not enough.
+ */
+export interface ServerPing { floorMs: number; latestMs: number; elevated: number }
 let serverPing: ServerPing | null = null;
+let lastPings: number[] = [];
 export function noteServerPing(ms: number): void {
   if (!Number.isFinite(ms) || ms <= 0) return;
-  serverPing = { floorMs: Math.min(serverPing?.floorMs ?? Infinity, ms), latestMs: ms };
+  const floorMs = Math.min(serverPing?.floorMs ?? Infinity, ms);
+  lastPings = [...lastPings.slice(-2), ms];
+  serverPing = { floorMs, latestMs: ms, elevated: lastPings.filter(p => p >= floorMs + 75).length };
 }
-export function resetServerPing(): void { serverPing = null; }
+export function resetServerPing(): void { serverPing = null; lastPings = []; }
 export const currentServerPing = (): ServerPing | null => serverPing;
 
 export class UplinkCongestion {
@@ -73,7 +79,7 @@ export class UplinkCongestion {
   /**
    * Server pings from another path to the same host. The floor seeds an empty floor and then ages like any
    * healthy sample. Until a media sample confirms it, the media path may simply be longer (a distant TURN
-   * relay), so warning also needs the latest server ping to be elevated.
+   * relay), so warning also needs two of the last three server pings to be elevated.
    */
   hint(ping: ServerPing | null): void { this.hintPing = ping; }
 
@@ -142,7 +148,7 @@ export class UplinkCongestion {
    */
   private entered(now: number, baselineMs: number): boolean {
     const { holdMs, minSamples } = this.timing;
-    if (this.hinted && !(this.hintPing && this.hintPing.latestMs >= this.hintPing.floorMs + 75)) return false;
+    if (this.hinted && !(this.hintPing && this.hintPing.elevated >= 2)) return false;
     const segment = this.recent.filter(p => p.at >= this.segmentAt);
     // Fresh samples only reach here, so the intervals are the source's real update cadence.
     const intervals = segment.slice(-minSamples - 1).map((p, i, a) => i ? p.at - a[i - 1]!.at : 0);
@@ -200,9 +206,12 @@ export class RtcUplinkObserver {
     report?.forEach(s => {
       if (s.type === "candidate-pair" && (selected ? s.id === selected : s.nominated && s.state === "succeeded")) pair = s;
     });
-    if (pair && Number.isFinite(pair.currentRoundTripTime) && pair.currentRoundTripTime! > 0) {
+    // A pair's timestamp changes on every getStats, so it cannot tell a new measurement: without a
+    // counter the pair is skipped for RTCP, whose report timestamp is when the report arrived.
+    const pairCounter = pair?.responsesReceived ?? pair?.totalRoundTripTime;
+    if (pair && pairCounter !== undefined && Number.isFinite(pair.currentRoundTripTime) && pair.currentRoundTripTime! > 0) {
       const path = `ice:${pair.id}`;
-      if (fresh(path, pair.responsesReceived ?? pair.timestamp)) sample = {
+      if (fresh(path, pairCounter)) sample = {
         path, rttMs: pair.currentRoundTripTime! * 1000, availableOutgoingBitrate: pair.availableOutgoingBitrate,
       };
     } else {
@@ -213,7 +222,7 @@ export class RtcUplinkObserver {
         const transport = local.transportId ? report.get(local.transportId) : undefined;
         if (selected && transport?.selectedCandidatePairId !== selected) return;
         const path = `rtcp:${selected ?? ""}:${s.id}`;
-        if (fresh(path, s.roundTripTimeMeasurements ?? s.timestamp)) sample = { path, rttMs: s.roundTripTime * 1000, availableOutgoingBitrate: pair?.availableOutgoingBitrate };
+        if (fresh(path, s.roundTripTimeMeasurements ?? s.totalRoundTripTime ?? s.timestamp)) sample = { path, rttMs: s.roundTripTime * 1000, availableOutgoingBitrate: pair?.availableOutgoingBitrate };
       });
     }
     this.detector.hint(serverPing);

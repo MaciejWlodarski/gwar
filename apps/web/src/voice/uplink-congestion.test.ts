@@ -321,7 +321,7 @@ describe("WebRTC RTT evidence", () => {
   it("bounds a new peer's floor by the session's lowest server ping", () => {
     for (const ms of [40, 22, 30]) noteServerPing(ms);
     // The call starts while already congested, which raises the server ping too.
-    noteServerPing(480);
+    noteServerPing(480); noteServerPing(470);
     const d = new RtcUplinkObserver();
     d.observe(0, report(transport, pair(480, 1)));
     for (let n = 2; n <= 5; n++) d.observe((n - 1) * 1000, report(transport, pair(480, n)));
@@ -349,8 +349,36 @@ describe("WebRTC RTT evidence", () => {
     noteServerPing(20); noteServerPing(25);
     const d = new RtcUplinkObserver();
     for (let n = 1; n <= 10; n++) expect(d.observe((n - 1) * 1000, report(transport, pair(480, n)))?.congested).toBe(false);
+    // One stalled pong is not enough; two of the last three are.
     noteServerPing(100);
-    expect(d.observe(10_000, report(transport, pair(480, 11)))).toMatchObject({ congested: true, baselineMs: 20 });
+    expect(d.observe(10_000, report(transport, pair(480, 11)))?.congested).toBe(false);
+    noteServerPing(60); noteServerPing(300);
+    expect(d.observe(11_000, report(transport, pair(480, 12)))).toMatchObject({ congested: true, baselineMs: 20 });
+  });
+
+  it("does not latch a relay path on one stalled server pong", () => {
+    noteServerPing(20); noteServerPing(22);
+    const d = new RtcUplinkObserver();
+    for (let n = 1; n <= 120; n++) {
+      if (n === 10) noteServerPing(120);
+      if (n === 20) noteServerPing(21);
+      expect(d.observe((n - 1) * 1000, report(transport, pair(200 + (n % 3) * 5, n)))?.congested, `at ${n}`).toBe(false);
+    }
+  });
+
+  it("takes a fresh pair sample only from a measurement counter, never from the timestamp alone", () => {
+    const d = new RtcUplinkObserver();
+    const bare = (ms: number, at: number) => ({ id: "selected", type: "candidate-pair", currentRoundTripTime: ms / 1000, timestamp: at });
+    // One 600 ms measurement repeated over five polls is one sample, not five.
+    const updates = [20, 20, 20, 20, 600, 20, 20, 20];
+    updates.forEach((ms, i) => {
+      for (let poll = 0; poll < 5; poll++) {
+        const at = i * 5000 + poll * 1000;
+        expect(d.observe(at, report(transport, { ...bare(ms, at), totalRoundTripTime: i + ms / 1000 }))?.congested).toBe(false);
+      }
+    });
+    // Without any counter the pair is not used at all.
+    expect(new RtcUplinkObserver().observe(0, report(transport, bare(20, 0)))).toBeNull();
   });
 
   it("drops the server-ping gate once a media sample confirms the floor", () => {

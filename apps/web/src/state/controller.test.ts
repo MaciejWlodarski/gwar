@@ -1472,12 +1472,12 @@ describe("server ping seed for WebRTC floors", () => {
     connectFake();
     expect(currentServerPing()).toBeNull();
     for (const ms of [40, 25, 0, 60]) link.rtt(ms);
-    expect(currentServerPing()).toEqual({ floorMs: 25, latestMs: 60 });
+    expect(currentServerPing()).toEqual({ floorMs: 25, latestMs: 60, elevated: 0 });
     // A resync is a new session, possibly over another path.
     link.welcomeNow(welcome(), true);
     expect(currentServerPing()).toBeNull();
     link.rtt(30);
-    expect(currentServerPing()).toEqual({ floorMs: 30, latestMs: 30 });
+    expect(currentServerPing()).toEqual({ floorMs: 30, latestMs: 30, elevated: 0 });
     await controller.disconnect(true);
     expect(currentServerPing()).toBeNull();
     // A closed connection's late pong is ignored.

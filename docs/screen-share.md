@@ -2975,8 +2975,9 @@ The same copy is available in English and Polish; downloads may remain unaffecte
   floor (the SFU shares the server's host), so a call that starts while already
   congested can still warn. The seed ages like any healthy sample. Until a media
   sample near it confirms it, the media path may simply be longer than the
-  signalling path (a distant TURN relay), so warning also needs the latest server
-  ping to be at least the server floor + 75 ms; a long but healthy relay path is
+  signalling path (a distant TURN relay), so warning also needs two of the last
+  three server pings to be at least the server floor + 75 ms (one pong delayed by
+  a busy JS thread is not enough); a long but healthy relay path is
   adopted by the flat-level rebase instead. Only Gwar connections feed it; a
   welcome (including a resync) and teardown reset it.
 
