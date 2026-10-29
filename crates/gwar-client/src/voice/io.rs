@@ -223,10 +223,16 @@ impl Resampler {
 }
 
 /// Opens streams on real (or, in tests, fake) devices; a stream stops when dropped.
+///
+/// A new stream stays silent until activated, so it can open beside the one it replaces: the
+/// old stream keeps playing until the new one works, and keeps playing when it does not.
 pub(crate) trait Backend {
     type Stream;
     fn offer(&self, side: Side) -> Offer;
-    fn open(&mut self, side: Side, route: &Route, trouble: TroubleFn) -> Result<Self::Stream>;
+    /// Opens stream number `id` of `side`, inactive.
+    fn open(&mut self, side: Side, route: &Route, id: u64, trouble: TroubleFn) -> Result<Self::Stream>;
+    /// Makes stream `id` the one that feeds the engine (capture) or plays it (output).
+    fn activate(&mut self, side: Side, id: u64);
     /// The operating system moves an open default stream to a new default by itself.
     fn reroutes(&self, side: Side) -> bool;
 }
@@ -253,12 +259,22 @@ fn failure(side: Side, denied: bool, message: String) -> DeviceIssue {
     }
 }
 
+/// Why a side moves: the user's own choice closes the old stream first (the same device may
+/// not open twice); a move by itself keeps the old stream until the new one works.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Move {
+    User,
+    Auto,
+}
+
 struct Lane<S> {
     side: Side,
     follow: Follow,
     stream: Option<S>,
-    /// Numbers the side's streams, so trouble from a closed one is ignored.
+    /// The open stream's number, so trouble from a closed one is ignored.
     generation: u64,
+    /// The last number given to a stream.
+    issued: u64,
 }
 
 /// Keeps each side on the device it belongs on. Runs on the device thread.
@@ -285,6 +301,7 @@ impl<B: Backend> Router<B> {
             follow: Follow::new(wanted[i].take(), backend.reroutes(SIDES[i])),
             stream: None,
             generation: 0,
+            issued: 0,
         });
         Self { backend, lanes, events, sink, settle_at: None, poll_at: None }
     }
@@ -298,13 +315,13 @@ impl<B: Backend> Router<B> {
     /// Opens both sides; problems are reported before this returns.
     pub(crate) fn start(&mut self, now: Instant) {
         for index in 0..2 {
-            self.reconcile(index, now);
+            self.reconcile(index, now, Move::User);
         }
         self.schedule(now);
     }
 
     /// Puts one side on the device it belongs on now, or reports why it cannot be.
-    fn reconcile(&mut self, index: usize, now: Instant) {
+    fn reconcile(&mut self, index: usize, now: Instant, why: Move) {
         let side = self.lanes[index].side;
         let offer = self.backend.offer(side);
         let plan = self.lanes[index].follow.plan(&offer, now);
@@ -321,18 +338,23 @@ impl<B: Backend> Router<B> {
             }
             Plan::Open(route) => {
                 let lane = &mut self.lanes[index];
-                // One stream feeds the engine at a time: close the old one first.
-                lane.stream = None;
-                lane.generation += 1;
-                let (events, stream) = (self.events.clone(), lane.generation);
+                if why == Move::User {
+                    lane.stream = None;
+                    lane.follow.closed();
+                }
+                lane.issued += 1;
+                let (events, id) = (self.events.clone(), lane.issued);
                 let trouble: TroubleFn = Arc::new(move |trouble| {
-                    let _ = events.send(Event::Trouble { side, stream, trouble });
+                    let _ = events.send(Event::Trouble { side, stream: id, trouble });
                 });
-                match self.backend.open(side, &route, trouble) {
+                match self.backend.open(side, &route, id, trouble) {
                     Ok(opened) => {
                         tracing::info!("audio {side:?} opened on {route:?}");
+                        self.backend.activate(side, id);
+                        // The old stream closes once the new one plays.
                         lane.stream = Some(opened);
-                        let Opened { switched, recovered } = lane.follow.opened(route, now);
+                        lane.generation = id;
+                        let Opened { switched, recovered } = lane.follow.opened(route, &offer, now);
                         if recovered {
                             self.report(DeviceIssue::Recovered(side));
                         }
@@ -343,8 +365,18 @@ impl<B: Backend> Router<B> {
                     Err(e) => {
                         tracing::warn!("audio {side:?} unavailable on {route:?}: {e:#}");
                         let denied = side == Side::Input && permission::is_denied(&e);
-                        if lane.follow.failed(&offer, now, denied) {
-                            self.report(failure(side, denied, format!("{e:#}")));
+                        if let (Route::Named(name), false) = (&route, denied) {
+                            // The default stands in: a stream still running stays, else it opens now.
+                            lane.follow.bench(name, now);
+                            self.reconcile(index, now, why);
+                        } else if why == Move::Auto && lane.stream.is_some() && !denied {
+                            // The stream it would replace still plays: keep it, try again later.
+                            lane.follow.stayed(&offer, now);
+                        } else {
+                            lane.stream = None;
+                            if lane.follow.failed(&offer, now, denied) {
+                                self.report(failure(side, denied, format!("{e:#}")));
+                            }
                         }
                     }
                 }
@@ -359,7 +391,7 @@ impl<B: Backend> Router<B> {
             Event::Want { input, output } => {
                 for (index, wanted) in [input, output].into_iter().enumerate() {
                     if self.lanes[index].follow.want(wanted) {
-                        self.reconcile(index, now);
+                        self.reconcile(index, now, Move::User);
                     }
                 }
             }
@@ -368,22 +400,25 @@ impl<B: Backend> Router<B> {
             }
             Event::Trouble { side, stream, trouble } => {
                 let index = lane_index(side);
-                let lane = &mut self.lanes[index];
+                let lane = &self.lanes[index];
                 if lane.generation != stream || lane.stream.is_none() {
                     return true;
                 }
                 match trouble {
                     // Only the default's name changes.
-                    Trouble::Rerouted => self.reconcile(index, now),
+                    Trouble::Rerouted => self.reconcile(index, now, Move::Auto),
                     Trouble::Lost(message) => {
                         tracing::warn!("audio {side:?} stream lost: {message}");
+                        let offer = self.backend.offer(side);
+                        let lane = &mut self.lanes[index];
                         lane.stream = None;
-                        if lane.follow.lost(now) {
+                        if lane.follow.lost(&offer, now) {
                             self.report(failure(side, false, message));
                         }
-                        self.reconcile(index, now);
+                        self.reconcile(index, now, Move::Auto);
                     }
                     Trouble::Denied(message) => {
+                        let lane = &mut self.lanes[index];
                         lane.stream = None;
                         if lane.follow.denied() {
                             self.report(failure(side, true, message));
@@ -408,7 +443,7 @@ impl<B: Backend> Router<B> {
         if self.settle_at.is_some_and(|at| now >= at) {
             self.settle_at = None;
             for index in 0..2 {
-                self.reconcile(index, now);
+                self.reconcile(index, now, Move::Auto);
             }
         }
         if self.poll_at.is_some_and(|at| now >= at) {
@@ -420,7 +455,7 @@ impl<B: Backend> Router<B> {
                 if self.lanes[index].follow.settle(now) {
                     self.report(DeviceIssue::Recovered(self.lanes[index].side));
                 }
-                self.reconcile(index, now);
+                self.reconcile(index, now, Move::Auto);
             }
         }
         self.schedule(now);
@@ -437,6 +472,18 @@ impl<B: Backend> Router<B> {
     /// Serves events until [`Event::Stop`]; the streams close when the router drops.
     pub(crate) fn run(&mut self, inbox: &std_mpsc::Receiver<Event>) {
         loop {
+            // Queued events first: a Stop wins over a poll that is due, so leaving a call
+            // never opens a device.
+            match inbox.try_recv() {
+                Ok(event) => {
+                    if !self.handle(event, Instant::now()) {
+                        return;
+                    }
+                    continue;
+                }
+                Err(std_mpsc::TryRecvError::Disconnected) => return,
+                Err(std_mpsc::TryRecvError::Empty) => {}
+            }
             let now = Instant::now();
             let event = match self.deadline() {
                 Some(at) if at <= now => {
@@ -444,23 +491,18 @@ impl<B: Backend> Router<B> {
                     continue;
                 }
                 Some(at) => match inbox.recv_timeout(at - now) {
-                    Ok(event) => Some(event),
-                    Err(std_mpsc::RecvTimeoutError::Timeout) => None,
+                    Ok(event) => event,
+                    // Due now: the loop checks the mailbox once more, then ticks.
+                    Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(std_mpsc::RecvTimeoutError::Disconnected) => return,
                 },
                 None => match inbox.recv() {
-                    Ok(event) => Some(event),
+                    Ok(event) => event,
                     Err(_) => return,
                 },
             };
-            let now = Instant::now();
-            match event {
-                Some(event) => {
-                    if !self.handle(event, now) {
-                        return;
-                    }
-                }
-                None => self.tick(now),
+            if !self.handle(event, Instant::now()) {
+                return;
             }
         }
     }
@@ -506,18 +548,37 @@ fn on_error(trouble: TroubleFn) -> impl FnMut(cpal::Error) + Send + 'static {
     }
 }
 
+/// Which stream of a side feeds the engine; the others stay silent.
+type Active = Arc<AtomicU64>;
+
 struct Cpal {
     host: cpal::Host,
     mic: Arc<Mutex<MicFeed>>,
     speaker: Arc<Mutex<Consumer<f32>>>,
     timing: Arc<OutputTiming>,
+    active: [Active; 2],
+    /// The last offers read, standing in when enumeration fails.
+    offers: [std::cell::RefCell<Offer>; 2],
+}
+
+/// Runs a cpal call that may panic (wasapi's `description()` expects its property store),
+/// so a misbehaving driver cannot take the device thread down.
+fn guarded<T>(what: &str, call: impl FnOnce() -> T) -> Result<T> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)).map_err(|panic| {
+        let message = panic
+            .downcast_ref::<&str>()
+            .map(|m| (*m).to_owned())
+            .or_else(|| panic.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        anyhow!("{what} panicked: {message}")
+    })
 }
 
 impl Backend for Cpal {
     type Stream = cpal::Stream;
 
     fn offer(&self, side: Side) -> Offer {
-        match side {
+        let read = || match side {
             Side::Input => Offer {
                 default: self.host.default_input_device().as_ref().and_then(device_name),
                 names: names(self.host.input_devices()),
@@ -526,14 +587,27 @@ impl Backend for Cpal {
                 default: self.host.default_output_device().as_ref().and_then(device_name),
                 names: names(self.host.output_devices()),
             },
+        };
+        let last = &self.offers[lane_index(side)];
+        match guarded("audio device enumeration", read) {
+            Ok(offer) => *last.borrow_mut() = offer,
+            Err(e) => tracing::warn!("{e:#}"),
         }
+        last.borrow().clone()
     }
 
-    fn open(&mut self, side: Side, route: &Route, trouble: TroubleFn) -> Result<cpal::Stream> {
-        match side {
-            Side::Input => open_input(&self.host, route, self.mic.clone(), self.timing.clone(), trouble),
-            Side::Output => open_output(&self.host, route, self.speaker.clone(), self.timing.clone(), trouble),
-        }
+    fn open(&mut self, side: Side, route: &Route, id: u64, trouble: TroubleFn) -> Result<cpal::Stream> {
+        let active = self.active[lane_index(side)].clone();
+        guarded("opening an audio device", || match side {
+            Side::Input => open_input(&self.host, route, self.mic.clone(), self.timing.clone(), (active, id), trouble),
+            Side::Output => {
+                open_output(&self.host, route, self.speaker.clone(), self.timing.clone(), (active, id), trouble)
+            }
+        })?
+    }
+
+    fn activate(&mut self, side: Side, id: u64) {
+        self.active[lane_index(side)].store(id, Ordering::Release);
     }
 
     fn reroutes(&self, side: Side) -> bool {
@@ -547,6 +621,7 @@ fn open_input(
     route: &Route,
     feed: Arc<Mutex<MicFeed>>,
     timing: Arc<OutputTiming>,
+    (active, id): (Active, u64),
     trouble: TroubleFn,
 ) -> Result<cpal::Stream> {
     if permission::ensure_microphone_access() == MicPermission::Denied {
@@ -567,6 +642,9 @@ fn open_input(
     let stream = device.build_input_stream(
         config.config(),
         move |data: &[f32], _| {
+            if active.load(Ordering::Acquire) != id {
+                return;
+            }
             let Some(mut feed) = try_lock(&feed) else { return };
             let feed = &mut *feed;
             mono.clear();
@@ -601,6 +679,7 @@ fn open_output(
     route: &Route,
     speaker: Arc<Mutex<Consumer<f32>>>,
     timing: Arc<OutputTiming>,
+    (active, id): (Active, u64),
     trouble: TroubleFn,
 ) -> Result<cpal::Stream> {
     let device = match route {
@@ -618,6 +697,11 @@ fn open_output(
         config.config(),
         move |data: &mut [f32], _| {
             let frames = data.len() / channels;
+            // A stream opened beside the playing one stays silent until it takes over.
+            if active.load(Ordering::Acquire) != id {
+                data.fill(0.0);
+                return;
+            }
             if let Some(mut speaker_rx) = try_lock(&speaker) {
                 while pending.len() < frames {
                     let Ok(sample) = speaker_rx.pop() else { break };
@@ -658,15 +742,26 @@ impl AudioIo for DeviceIo {
                 mic: Arc::new(Mutex::new(MicFeed { tx: mic_tx, position: 0, last: None })),
                 speaker: Arc::new(Mutex::new(speaker_rx)),
                 timing,
+                active: Default::default(),
+                offers: Default::default(),
             };
             let changed = events.clone();
             let _watch = watch::start(move || {
                 let _ = changed.send(Event::Changed);
             });
+            let sink = on_issue.clone();
             let mut router = Router::new(backend, input, speakers, events, on_issue);
-            router.start(Instant::now());
-            let _ = ready_tx.send(());
-            router.run(&inbox);
+            let served = guarded("the audio device thread", || {
+                router.start(Instant::now());
+                let _ = ready_tx.send(());
+                router.run(&inbox);
+            });
+            if let (Err(e), Some(sink)) = (served, sink) {
+                // Without this thread the devices are gone; say so instead of falling silent.
+                tracing::error!("{e:#}");
+                sink(DeviceIssue::Input(format!("{e:#}")));
+                sink(DeviceIssue::Output(format!("{e:#}")));
+            }
         })?;
         ready_rx.recv().map_err(|_| anyhow!("audio thread died"))?;
         Ok(AudioPorts { mic, speaker, output, _guard: Box::new(stop) })
@@ -733,7 +828,7 @@ mod router_tests {
 
     use anyhow::{Result, bail};
 
-    use super::{Backend, DeviceIssue, Event, POLL, Router, SETTLE, Side, Trouble, TroubleFn, lane_index};
+    use super::{Backend, DeviceIssue, Event, POLL, Router, SETTLE, Side, Trouble, TroubleFn, guarded, lane_index};
     use crate::voice::follow::{Offer, Route};
 
     /// Devices as the test describes them; what was opened, and how many streams are open.
@@ -743,6 +838,8 @@ mod router_tests {
         busy: Vec<String>,
         opened: Vec<(Side, Route)>,
         open_streams: Arc<AtomicUsize>,
+        /// The stream each side plays, by number.
+        active: [u64; 2],
         rerouting_output: bool,
     }
 
@@ -758,7 +855,7 @@ mod router_tests {
         fn offer(&self, side: Side) -> Offer {
             self.offers[lane_index(side)].clone()
         }
-        fn open(&mut self, side: Side, route: &Route, _trouble: TroubleFn) -> Result<Stream> {
+        fn open(&mut self, side: Side, route: &Route, _id: u64, _trouble: TroubleFn) -> Result<Stream> {
             let (Route::Named(name) | Route::Default(Some(name))) = route else { bail!("nothing to open") };
             if self.busy.contains(name) {
                 bail!("{name} is busy");
@@ -766,6 +863,9 @@ mod router_tests {
             self.opened.push((side, route.clone()));
             self.open_streams.fetch_add(1, Ordering::Relaxed);
             Ok(Stream(self.open_streams.clone()))
+        }
+        fn activate(&mut self, side: Side, id: u64) {
+            self.active[lane_index(side)] = id;
         }
         fn reroutes(&self, side: Side) -> bool {
             self.rerouting_output && side == Side::Output
@@ -899,11 +999,12 @@ mod router_tests {
     fn trouble_from_a_replaced_stream_is_ignored() {
         let now = Instant::now();
         let mut s = Setup::new(laptop(), None, None);
+        s.fake().offers[0] = offer(Some("MacBook mic"), &["MacBook mic", "USB mic"]);
         s.router.start(now);
         s.opened();
         let old = s.router.lanes[0].generation;
-        s.router.handle(Event::Want { input: Some("MacBook mic".into()), output: None }, now);
-        assert_eq!(s.opened(), [(Side::Input, Route::Named("MacBook mic".into()))]);
+        s.router.handle(Event::Want { input: Some("USB mic".into()), output: None }, now);
+        assert_eq!(s.opened(), [(Side::Input, Route::Named("USB mic".into()))]);
         s.router.handle(
             Event::Trouble { side: Side::Input, stream: old, trouble: Trouble::Lost("late".into()) },
             now + Duration::from_secs(10),
@@ -986,5 +1087,112 @@ mod router_tests {
         let open = s.fake().open_streams.clone();
         drop(s);
         assert_eq!(open.load(Ordering::Relaxed), 0);
+    }
+
+    fn headset_offer(with_headset: bool) -> Offer {
+        let names: &[&str] = if with_headset { &["MacBook mic", "Headset"] } else { &["MacBook mic"] };
+        offer(Some("MacBook mic"), names)
+    }
+
+    #[test]
+    fn a_returning_headset_that_does_not_open_yet_leaves_the_fallback_playing() {
+        let now = Instant::now();
+        let mut fake = laptop();
+        fake.offers[0] = headset_offer(false);
+        let mut s = Setup::new(fake, Some("Headset"), None);
+        s.router.start(now);
+        assert_eq!(s.opened()[0], (Side::Input, default("MacBook mic")));
+        let fallback = s.fake().active[0];
+
+        // Plugged back in, but still negotiating its Bluetooth profile.
+        s.fake().offers[0] = headset_offer(true);
+        s.fake().busy = vec!["Headset".into()];
+        s.router.tick(now + POLL);
+        assert!(s.opened().is_empty());
+        assert_eq!(s.fake().active[0], fallback, "the fallback still plays");
+        assert_eq!(s.fake().open_streams.load(Ordering::Relaxed), 2);
+        assert!(s.issues().is_empty(), "not an error");
+
+        s.fake().busy.clear();
+        let retry = s.router.deadline().expect("tries again");
+        s.router.tick(retry);
+        s.router.tick(retry + POLL);
+        assert_eq!(s.opened(), [(Side::Input, Route::Named("Headset".into()))]);
+        assert_ne!(s.fake().active[0], fallback);
+        assert_eq!(s.fake().open_streams.load(Ordering::Relaxed), 2, "the fallback closed after the switch");
+        assert_eq!(s.issues(), [DeviceIssue::Switched(Side::Input, "Headset".into())]);
+    }
+
+    #[test]
+    fn a_chosen_headset_that_does_not_open_lets_the_default_stand_in() {
+        let now = Instant::now();
+        let mut fake = laptop();
+        fake.offers[0] = headset_offer(true);
+        fake.busy = vec!["Headset".into()];
+        let mut s = Setup::new(fake, None, None);
+        s.router.start(now);
+        s.opened();
+        s.router.handle(Event::Want { input: Some("Headset".into()), output: None }, now);
+        assert_eq!(s.opened(), [(Side::Input, default("MacBook mic"))]);
+        assert_eq!(s.issues(), [DeviceIssue::Switched(Side::Input, "MacBook mic".into())], "a notice, not a dead mic");
+        assert_eq!(s.fake().open_streams.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn a_new_default_that_does_not_open_leaves_the_working_stream() {
+        let now = Instant::now();
+        let mut s = Setup::new(laptop(), None, None);
+        s.router.start(now);
+        s.opened();
+        let playing = s.fake().active[0];
+        s.fake().offers[0] = offer(Some("USB mic"), &["MacBook mic", "USB mic"]);
+        s.fake().busy = vec!["USB mic".into()];
+        s.router.handle(Event::Changed, now);
+        s.router.tick(now + SETTLE);
+        assert_eq!(s.fake().active[0], playing);
+        assert_eq!(s.fake().open_streams.load(Ordering::Relaxed), 2);
+        assert!(s.issues().is_empty());
+        s.fake().busy.clear();
+        let retry = s.router.deadline().expect("tries again");
+        s.router.tick(retry);
+        s.router.tick(retry + POLL);
+        assert_eq!(s.opened(), [(Side::Input, default("USB mic"))]);
+        assert!(s.issues().is_empty());
+    }
+
+    #[test]
+    fn a_default_change_right_after_opening_is_not_reported_as_a_broken_device() {
+        // Windows: the default stream is invalidated by the change, here 300 ms after it opened.
+        let now = Instant::now();
+        let mut s = Setup::new(laptop(), None, None);
+        s.router.start(now);
+        s.opened();
+        s.fake().offers[1] = offer(Some("Headphones"), &["Speakers", "Headphones"]);
+        s.lost(Side::Output, now + Duration::from_millis(300));
+        assert_eq!(s.opened(), [(Side::Output, default("Headphones"))], "reopened at once");
+        assert!(s.issues().is_empty());
+    }
+
+    #[test]
+    fn a_stop_queued_behind_a_due_poll_wins() {
+        let start = Instant::now() - POLL * 3;
+        let mut fake = laptop();
+        fake.offers[0] = Offer::default();
+        let mut s = Setup::new(fake, None, None);
+        s.router.start(start);
+        s.opened();
+        assert!(s.router.deadline().is_some_and(|at| at < Instant::now()), "a poll is due");
+        s.fake().offers[0] = offer(Some("USB mic"), &["USB mic"]);
+        let (events, inbox) = mpsc::channel();
+        events.send(Event::Stop).unwrap();
+        s.router.run(&inbox);
+        assert!(s.opened().is_empty(), "left the call without opening the microphone");
+    }
+
+    #[test]
+    fn a_panicking_driver_call_becomes_an_error() {
+        let error = guarded("enumeration", || -> u32 { panic!("could not open property store") }).unwrap_err();
+        assert!(format!("{error:#}").contains("could not open property store"), "{error:#}");
+        assert_eq!(guarded("enumeration", || 7).unwrap(), 7);
     }
 }

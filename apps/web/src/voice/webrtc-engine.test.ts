@@ -571,5 +571,38 @@ describe("browser devices follow the system", () => {
     await changeDevices([...devices, headphones]);
     expect(setSinkId).toHaveBeenLastCalledWith("hp");
     expect(switched).toHaveBeenLastCalledWith({ side: "output", label: "Headphones" });
+
+    // Outside a call the output still follows, without a notice.
+    await engine.stop();
+    switched.mockClear();
+    await changeDevices(devices.filter((d) => d !== headphones));
+    expect(setSinkId).toHaveBeenLastCalledWith("");
+    expect(switched).not.toHaveBeenCalled();
+  });
+
+  it("follows the system default while a chosen microphone is away", async () => {
+    await engine.setInputDevice("usb");
+    const fallback = capture({ deviceId: "mac", groupId: "g-mac" });
+    const airpods = capture({ deviceId: "air", groupId: "g-air" });
+    const back = capture({ deviceId: "usb", groupId: "g-usb" });
+    getUserMedia
+      .mockRejectedValueOnce(new DOMException("gone", "OverconstrainedError"))
+      .mockResolvedValueOnce(fallback.stream)
+      .mockRejectedValueOnce(new DOMException("gone", "OverconstrainedError"))
+      .mockResolvedValueOnce(airpods.stream)
+      .mockResolvedValueOnce(back.stream);
+    const switched = vi.fn();
+    engine.on("deviceSwitched", switched);
+    await engine.start(params());
+    Peer.all[0]!.connect();
+
+    await changeDevices([mic("default", "g-air", "Default - AirPods"), macbook, mic("air", "g-air", "AirPods")]);
+    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(airpods.track);
+    expect(fallback.track.stop).toHaveBeenCalledOnce();
+    expect(switched).not.toHaveBeenCalled();
+
+    await changeDevices([...devices, usb]);
+    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(back.track);
+    expect(switched).toHaveBeenCalledExactlyOnceWith({ side: "input", label: "USB mic" });
   });
 });

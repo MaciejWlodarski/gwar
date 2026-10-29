@@ -416,8 +416,12 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     const wanted = this.inputDeviceId;
     if (wanted) {
       const present = inputs.some((d) => d.deviceId === wanted);
-      if (present !== (settings.deviceId === wanted)) await this.swapMic(stream);
-      return;
+      if (present !== (settings.deviceId === wanted)) {
+        await this.swapMic(stream);
+        return;
+      }
+      if (present) return;
+      // On the default while the chosen device is away: follow it like "System default".
     }
     const target = defaultDevice(all, "audioinput");
     if (!target) return; // the track's own "ended" reports a removal
@@ -456,8 +460,9 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     const target = chosen ? wanted : null;
     if (target === this.routedOutputId) return;
     this.routeOutput(target);
+    // Outside a call nothing plays: the move is not worth a word.
     const label = (chosen ?? defaultDevice(all, "audiooutput"))?.label;
-    if (label) this.emit("deviceSwitched", { side: "output", label });
+    if (label && this.inCall()) this.emit("deviceSwitched", { side: "output", label });
   }
 
   private applyTrackEnabled(): void {
