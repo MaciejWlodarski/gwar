@@ -40,13 +40,19 @@ plus the port), run with [sonos/tract](https://github.com/sonos/tract) (MIT OR
 Apache-2.0). The desktop app embeds the model; the web app serves it, with the
 runtime built as WebAssembly, and downloads it when suppression is first on.
 
-## Echo cancellation and gain control
+## Echo cancellation, gain control and time stretching
 
 The desktop app's echo cancellation and automatic gain control are WebRTC's audio
 processing (AEC3, AGC2), through
 [dignifiedquire/sonora](https://github.com/dignifiedquire/sonora) 0.2.0, its port
 to Rust, under the BSD-3-Clause license below. Browsers run their own copy of the
 same processing for the web app.
+
+The native client's jitter-buffer acceleration (`accelerate` in
+`crates/gwar-client/src/voice/playout.rs`) is derived from WebRTC NetEq's
+accelerate (`modules/audio_coding/neteq/accelerate.cc` and `time_stretch.cc`),
+reimplemented in Rust, under the same license; the first copyright line below
+applies to it.
 
 ```text
 Copyright (c) 2011, The WebRTC Project Authors. All rights reserved.

@@ -8,13 +8,16 @@ use std::{
 #[derive(Debug, PartialEq)]
 pub enum Playout {
     /// Decode before spending this budget, possibly across contiguous packets.
-    /// The decoder requires quiet PCM or a correlated overlap; commit via `shrunk`.
+    /// The decoder requires inaudible PCM or an overlap that correlates above `correlation`;
+    /// commit a removed period via `accelerated`, inaudible PCM via `shrunk`.
     Packet {
         data: Vec<u8>,
         skip: usize,
         // Legacy age hint; it cannot authorize an uncorrelated speech cut.
         quiet_only: bool,
         fade: bool,
+        /// The normalized correlation a removed pitch period must exceed.
+        correlation: f64,
     },
     /// PLC duration in 48 kHz samples.
     Conceal(usize),
@@ -286,17 +289,20 @@ pub struct JitterBuffer {
     /// The last starvation PLC (an empty queue, not a proven loss): no evidence for a backlog
     /// cut can include one.
     last_conceal: Option<Instant>,
-    /// Backlog cuts (`update_backlog`, `cut_backlog`): since when the surplus has stayed at
-    /// least `BACKLOG_TRIM`, its lowest value since then (debited like the marks), when a cut
-    /// became due, how long the evidence must be, the last cut until a starvation proves it
-    /// took needed cushion or `BACKLOG_PROBE` passes without one, and since when the evidence
-    /// has neither grown nor seen a starvation (`BACKLOG_RELAX`).
+    /// Backlog cuts (`update_backlog`, `backlog_budget`, `backlog_room`): since when the surplus
+    /// has stayed at least `BACKLOG_TRIM`, its lowest value since then (debited like the marks),
+    /// when a cut became due, how long the evidence must be, the last cut until a starvation
+    /// proves it took needed cushion or `BACKLOG_PROBE` passes without one, and since when the
+    /// evidence has neither grown nor seen a starvation (`BACKLOG_RELAX`).
     backlog_since: Option<Instant>,
     backlog_low: u64,
     backlog_due: Option<Instant>,
     backlog_evidence: Duration,
     backlog_cut: Option<Instant>,
     backlog_calm: Option<Instant>,
+    /// While a cut is due, when its pace (`backlog_budget`) had no credit; each period
+    /// removed moves it `BACKLOG_PACE` times its length ahead.
+    backlog_paced: Option<Instant>,
     pub(crate) concealments: u64,
     pub(crate) late_drops: u64,
     /// Queued packets dropped, oldest first, to keep the queue within `MAX_QUEUED` and
@@ -338,22 +344,44 @@ const ALIKE_POINTS: usize = 64; // Consumption points per packet that `alike` ac
 const FORCE_SHRINK: Duration = Duration::from_secs(2);
 const SHRINK_STEP: u64 = 720; // Allow one low-pitched period (15 ms); the decoder commits the actual cut.
 // Debited low-water evidence supports bounded recovery: at most 10 ms/s in
-// quiet PCM (5 ms cuts), or 30 ms/s for a correlated 15 ms period.
+// inaudible PCM (5 ms cuts), or 30 ms/s for a correlated 15 ms period.
 const SHRINK_INTERVAL: Duration = Duration::from_millis(500);
 const TRIM_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(1);
 // A declined proposal (noise, onset) costs a pitch search; retry at most 5 times a second.
 const SHRINK_RETRY: Duration = Duration::from_millis(200);
 // A surplus this large (100 ms), proven for `backlog_evidence`, is cut: the gentle shrink would
 // take seconds to minutes. The cut leaves `BACKLOG_KEEP` (40 ms) of it to the gentle shrink, a
-// cushion against local stalls the arrival rule cannot see. It drops quiet packets only, after
-// quiet frames, and the rest at once after `BACKLOG_WAIT`. The evidence starts at one window and
-// doubles (up to `MAX_BACKLOG_EVIDENCE`) whenever playout starves within `BACKLOG_PROBE` of a
-// cut: delay that swells and recedes more rarely than the window keeps its cushion after the
-// first miss, as speaker headroom does (playout.rs). A cut without a starvation after it resets
-// the evidence, and it halves after `BACKLOG_RELAX` without growth or a starvation.
+// cushion against local stalls the arrival rule cannot see. It never drops speech: it drops
+// inaudible packets after inaudible frames, and accelerates the rest as libwebrtc's NetEq does
+// (playout.rs `accelerate`), removing one pitch period at a time from audio that correlates
+// above `BACKLOG_CORRELATION` (NetEq's `kCorrelationThreshold`). Each period removed costs
+// `BACKLOG_PACE` times its length of playout, so speech plays at most 1.2 times as fast.
+//
+// After `BACKLOG_WAIT` the cut takes a period that correlates above `RELAXED_CORRELATION`
+// (NetEq's fast-mode threshold), from the whole 2.5--15 ms range, so a voice still loses only
+// whole periods. Audio without a period (noise, unvoiced or whispered speech, most music) is
+// never spliced: its backlog drains in inaudible packets and frames (playout.rs `inaudible`, also
+// those decoded ahead with speech) and in the pauses a sender's gate sends as no packets, and
+// otherwise stays as it is (it does not grow; `MAX_QUEUED` caps any queue). NetEq accepts any lag
+// only when an energy VAD finds no active speech; here only inaudible audio goes without a
+// period, as soft speech has the level of a background. A cut that removes nothing for `BACKLOG_STUCK` gives up and restarts the window, which gives the
+// gentle shrink its turn.
+//
+// The evidence starts at one window and doubles (up to `MAX_BACKLOG_EVIDENCE`) whenever playout
+// starves within `BACKLOG_PROBE` of a cut: delay that swells and recedes more rarely than the
+// window keeps its cushion after the first miss, as speaker headroom does (playout.rs). A cut
+// without a starvation after it resets the evidence, and it halves after `BACKLOG_RELAX`
+// without growth or a starvation.
 const BACKLOG_TRIM: u64 = 4800;
 const BACKLOG_KEEP: u64 = 1920;
+pub(crate) const BACKLOG_CORRELATION: f64 = 0.9;
+const BACKLOG_PACE: u64 = 5;
 const BACKLOG_WAIT: Duration = Duration::from_secs(2);
+pub(crate) const RELAXED_CORRELATION: f64 = 0.5;
+const BACKLOG_STUCK: Duration = Duration::from_secs(10);
+// The gentle shrink accelerates only near-identical periods: it runs whatever the queue holds.
+pub(crate) const SHRINK_CORRELATION: f64 = 0.98;
+const MIN_PERIOD: u64 = 120; // 2.5 ms, the shortest period playout removes.
 const BACKLOG_PROBE: Duration = Duration::from_secs(10);
 const BACKLOG_RELAX: Duration = Duration::from_secs(60);
 const MAX_BACKLOG_EVIDENCE: Duration = Duration::from_secs(80);
@@ -361,6 +389,10 @@ const MAX_BACKLOG_EVIDENCE: Duration = Duration::from_secs(80);
 /// Whole samples from `from` to `to`, rounded down.
 fn samples_between(from: Instant, to: Instant) -> u64 {
     (to.saturating_duration_since(from).as_nanos() * 48 / 1_000_000) as u64
+}
+
+fn samples_duration(samples: u64) -> Duration {
+    Duration::from_nanos(samples * 1_000_000 / 48)
 }
 
 impl Default for JitterBuffer {
@@ -398,6 +430,7 @@ impl JitterBuffer {
             backlog_evidence: DEPTH_WINDOW,
             backlog_cut: None,
             backlog_calm: None,
+            backlog_paced: None,
             concealments: 0,
             late_drops: 0,
             overflow_drops: 0,
@@ -558,6 +591,7 @@ impl JitterBuffer {
         // The evidence backoff outlives a source change: the path's delay does too.
         self.backlog_since = None;
         self.backlog_due = None;
+        self.backlog_paced = None;
         self.skipped = false;
         self.overflowed = false;
     }
@@ -566,8 +600,25 @@ impl JitterBuffer {
         self.pop_at(Instant::now())
     }
 
+    /// Commit a pitch period removed from decoded audio (`Playout::Packet`'s `correlation`).
+    /// A due backlog cut charges its pace for it (`backlog_budget`).
+    pub(crate) fn accelerated(&mut self, now: Instant, samples: usize) {
+        if let Some(paced) = &mut self.backlog_paced {
+            *paced += samples_duration(samples as u64 * BACKLOG_PACE);
+        }
+        self.shrunk(now, samples);
+    }
+
     /// Commit only the samples actually removed after checking the decoded signal.
     pub(crate) fn shrunk(&mut self, now: Instant, samples: usize) {
+        self.debit(now, samples);
+        if samples > 0 && self.backlog_due.is_some() {
+            self.backlog_cut = Some(now);
+            self.settle_backlog();
+        }
+    }
+
+    fn debit(&mut self, now: Instant, samples: usize) {
         if samples > 0 {
             self.shrink_samples += samples as u64;
             self.trim_events += 1;
@@ -797,9 +848,9 @@ impl JitterBuffer {
     }
 
     /// Discard queued packets that start before `before`, oldest first, retaining at least `keep`
-    /// samples (by the queued packets' own durations), into `cut` if given. Returns whether any
-    /// went; the window restarts then.
-    fn trim(&mut self, before: u64, keep: u64, now: Instant, mut cut: Option<&mut Vec<Vec<u8>>>) -> bool {
+    /// samples (by the queued packets' own durations). Returns whether any went; the window
+    /// restarts then.
+    fn trim(&mut self, before: u64, keep: u64, now: Instant) -> bool {
         let mut depth = self.depth().1;
         let mut trimmed = false;
         while self.packets.len() > 1 {
@@ -811,9 +862,6 @@ impl JitterBuffer {
             depth -= packet.samples;
             self.shrink_samples += packet.samples;
             trimmed = true;
-            if let Some(cut) = cut.as_deref_mut() {
-                cut.push(packet.data);
-            }
         }
         if trimmed {
             self.next = self.packets.first_key_value().map(|(&ts, _)| ts);
@@ -830,8 +878,8 @@ impl JitterBuffer {
     /// stall to recover from: a bloated uplink after a bulk upload stops arrives as a few
     /// hundred milliseconds of audio early (docs/latency-congested-uplink.md). A surplus of
     /// `BACKLOG_TRIM` proven for `backlog_evidence` (the window behind its first refill counts)
-    /// without a starvation makes a cut due (`cut_backlog`). A stall recovery acts instead.
-    /// A cut in progress (due, `cut_backlog`) continues while its surplus shrinks below
+    /// without a starvation makes a cut due (`backlog_budget`, `backlog_room`). A stall recovery
+    /// acts instead. A cut in progress (due) continues while its surplus shrinks below
     /// `BACKLOG_TRIM`: `backlog_low` follows the surplus down and bounds what is left to cut.
     fn update_backlog(&mut self, now: Instant) {
         #[cfg(test)]
@@ -860,6 +908,7 @@ impl JitterBuffer {
         if self.recovering.is_some() || starved || (!cutting && self.surplus < BACKLOG_TRIM) {
             self.backlog_since = None;
             self.backlog_due = None;
+            self.backlog_paced = None;
             return;
         }
         let since = match self.backlog_since {
@@ -872,9 +921,37 @@ impl JitterBuffer {
                 *self.backlog_since.insert(now)
             }
         };
-        if now.saturating_duration_since(since) + DEPTH_WINDOW >= self.backlog_evidence {
-            self.backlog_due.get_or_insert(now);
+        if now.saturating_duration_since(since) + DEPTH_WINDOW >= self.backlog_evidence && !cutting {
+            self.backlog_due = Some(now);
+            // The pace starts with one whole long period of credit.
+            self.backlog_paced = Some(now.checked_sub(Self::full_pace()).unwrap_or(now));
         }
+        // Audio that never splices (onsets, decays, fades all along) must not hold the cut, and
+        // the gentle shrink behind it, for good: the window has to prove the surplus again.
+        if let Some(due) = self.backlog_due {
+            let progress = self.backlog_cut.filter(|&at| at >= due).unwrap_or(due);
+            if now.saturating_duration_since(progress) >= BACKLOG_STUCK {
+                self.end_backlog_cut();
+                self.clear_depth();
+                self.above_since = None;
+                return;
+            }
+        }
+        self.settle_backlog();
+    }
+
+    fn full_pace() -> Duration {
+        samples_duration(SHRINK_STEP * BACKLOG_PACE)
+    }
+
+    /// What a due cut may accelerate now: its pace's credit, at most one long period, and never
+    /// more than it has left to take.
+    fn backlog_budget(&mut self, now: Instant) -> u64 {
+        let Some(paced) = &mut self.backlog_paced else { return 0 };
+        if let Some(earliest) = now.checked_sub(Self::full_pace()) {
+            *paced = (*paced).max(earliest);
+        }
+        (samples_between(*paced, now) / BACKLOG_PACE).min(self.backlog_excess())
     }
 
     /// What a due cut has left to take from the queue: all but `BACKLOG_KEEP` of the lowest
@@ -887,45 +964,29 @@ impl JitterBuffer {
     }
 
     /// Whether a due cut (`update_backlog`) can take the next packet, which is queued in order.
-    /// After a quiet frame the decoder takes it with `pop_for(now, 0)` and, if it decodes quiet
-    /// too, drops it (`dropped`); a loud one plays after the frame, as decode-ahead does. A cut
-    /// so removes only silence, and the decoder runs through all of it.
+    /// After an inaudible frame the decoder takes it with `pop_for(now, 0)` and, if it decodes
+    /// inaudible too, drops it (`dropped`); an audible one plays after the frame, as decode-ahead
+    /// does. A cut so removes only silence, and the decoder runs through all of it.
     pub(crate) fn backlog_room(&self) -> bool {
         self.backlog_due.is_some()
             && self.recovering.is_none()
             && self.next.and_then(|next| self.packets.get(&next)).is_some_and(|p| p.samples <= self.backlog_excess())
     }
 
-    /// Commit a quiet packet a due cut dropped (`backlog_room`): debited like `shrunk`.
+    /// Commit an inaudible packet a due cut dropped (`backlog_room`): debited like `shrunk`.
     pub(crate) fn dropped(&mut self, now: Instant, samples: usize) {
         self.shrunk(now, samples);
-        self.backlog_cut = Some(now);
-        if self.backlog_excess() < self.frame_samples() {
+    }
+
+    /// Finish a due cut (`update_backlog`) that has less than a packet left to take.
+    fn settle_backlog(&mut self) {
+        if self.backlog_due.is_some() && self.backlog_excess() < self.frame_samples() {
             self.end_backlog_cut();
         }
     }
 
-    /// Finish a due cut (`update_backlog`) that has nothing left to take, or that waited
-    /// `BACKLOG_WAIT` for the quiet packets: then the oldest packets go at once, and the next
-    /// one fades in. Returns the packets cut so, oldest first, which the decoder must run
-    /// through to stay continuous.
-    pub(crate) fn cut_backlog(&mut self, now: Instant) -> Vec<Vec<u8>> {
-        let mut cut = Vec::new();
-        let Some(due) = self.backlog_due else { return cut };
-        let excess = self.backlog_excess();
-        if excess >= self.frame_samples() && now.saturating_duration_since(due) < BACKLOG_WAIT {
-            return cut;
-        }
-        if self.trim(u64::MAX, self.depth().1 - excess, now, Some(&mut cut)) {
-            self.skipped = true;
-            self.backlog_cut = Some(now);
-        }
-        self.end_backlog_cut();
-        cut
-    }
-
     fn end_backlog_cut(&mut self) {
-        // Like `trim`, a cut restarts the window (`trim` already did if it cut).
+        // Like `trim`, a cut restarts the window.
         if let Some(due) = self.backlog_due.take()
             && self.backlog_cut.is_some_and(|at| at >= due)
         {
@@ -933,6 +994,7 @@ impl JitterBuffer {
             self.above_since = None;
         }
         self.backlog_since = None;
+        self.backlog_paced = None;
     }
 
     pub(crate) fn pop_at(&mut self, now: Instant) -> Playout {
@@ -957,7 +1019,7 @@ impl JitterBuffer {
         // refill takes its demand, and the target stays behind it as the jitter reserve.
         if demand > 0 && std::mem::take(&mut self.overflowed) {
             let keep = self.target_samples() + demand as u64;
-            fade |= self.trim(u64::MAX, keep, now, None);
+            fade |= self.trim(u64::MAX, keep, now);
             // A pending stall recovery keeps its deadline (and its hold on the jitter estimate)
             // for the rest of a burst still arriving, but must not take the reserve back out.
             if let Some(recovery) = &mut self.recovering {
@@ -973,7 +1035,7 @@ impl JitterBuffer {
             // delay that the fractional drain rarely removes before the next stall.
             let (before, target) = (recovery.before, self.target_samples());
             let keep = if recovery.reserve { target + demand as u64 } else { target.max(demand as u64) };
-            fade |= self.trim(before, keep, now, None);
+            fade |= self.trim(before, keep, now);
         }
         let Some(mut next) = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)) else {
             return Playout::Idle;
@@ -1000,6 +1062,21 @@ impl JitterBuffer {
             self.last_samples = packet.samples;
             self.missing = 0;
             self.held = 0;
+            // A due backlog cut accelerates whenever its pace allows (`backlog_budget`); it starts
+            // with NetEq's correlation threshold and relaxes to its fast mode's after
+            // `BACKLOG_WAIT` (`RELAXED_CORRELATION`).
+            let backlog = if demand > 0 && self.recovering.is_none() { self.backlog_budget(now) } else { 0 };
+            let backlog = backlog.min(available);
+            if backlog >= MIN_PERIOD {
+                let waited = self.backlog_due.is_some_and(|due| now.saturating_duration_since(due) >= BACKLOG_WAIT);
+                return Playout::Packet {
+                    data: packet.data,
+                    skip: backlog as usize,
+                    quiet_only: held < FORCE_SHRINK,
+                    fade,
+                    correlation: if waited { RELAXED_CORRELATION } else { BACKLOG_CORRELATION },
+                };
+            }
             let shrink = demand > 0
                 && self.surplus >= SAFETY
                 && held >= QUIET_SHRINK
@@ -1013,6 +1090,7 @@ impl JitterBuffer {
                 skip: if shrink { SHRINK_STEP.min(self.surplus).min(available) as usize } else { 0 },
                 quiet_only: held < FORCE_SHRINK,
                 fade,
+                correlation: SHRINK_CORRELATION,
             };
         }
         // Stop generating audio, but retain the timeline until an explicit source
@@ -1054,17 +1132,18 @@ mod tests {
     use super::*;
 
     fn packet(n: u8) -> Playout {
-        Playout::Packet { data: vec![n], skip: 0, quiet_only: true, fade: false }
+        Playout::Packet { data: vec![n], skip: 0, quiet_only: true, fade: false, correlation: SHRINK_CORRELATION }
     }
 
     fn pop_at(jb: &mut JitterBuffer, now: Instant, quiet: bool) -> Playout {
         let mut result = jb.pop_at(now);
-        if let Playout::Packet { skip, quiet_only, .. } = &mut result {
+        if let Playout::Packet { skip, quiet_only, correlation, .. } = &mut result {
             if *quiet_only && !quiet {
                 *skip = 0;
             }
             jb.shrunk(now, *skip);
             *quiet_only = true;
+            *correlation = SHRINK_CORRELATION;
         }
         result
     }
@@ -1621,8 +1700,8 @@ mod tests {
     /// A stream of `packet_ms` packets for `seconds` through a network queue of `queue(sent)` ms,
     /// in order, without the packets `lost` picks. Returns the mean delay from send to playout
     /// per second of playout and the concealments. Cuts commit as the decoder does: in quiet
-    /// audio 5 ms shrinks and backlog cuts at once; in `speech` (no quiet frame, no correlated
-    /// period) only forced ones.
+    /// audio 5 ms shrinks and quiet packets of backlog; in `speech` (no quiet frame, no
+    /// correlated period) only forced shrinks and a backlog cut's periods once it has waited.
     fn path(
         clock: Clock,
         packet_ms: u64,
@@ -1674,10 +1753,20 @@ mod tests {
             let now = start + Duration::from_secs_f64(now_ms / 1000.0);
             let head = jb.next.unwrap_or(0) / stride;
             play += match jb.pop_at(now) {
-                Playout::Packet { skip, quiet_only, .. } => {
-                    let skip = if speech && quiet_only { 0 } else { skip.min(240) };
-                    jb.shrunk(now, skip);
-                    jb.cut_backlog(now);
+                Playout::Packet { skip, quiet_only, correlation, .. } => {
+                    // Speech has no period that correlates, so only a backlog cut that has
+                    // waited removes one (of a 150 Hz voice).
+                    let skip = if !speech {
+                        jb.shrunk(now, skip.min(240));
+                        skip.min(240)
+                    } else if correlation == RELAXED_CORRELATION && skip >= 320 {
+                        jb.accelerated(now, 320);
+                        320
+                    } else {
+                        let skip = if quiet_only { 0 } else { skip.min(240) };
+                        jb.shrunk(now, skip);
+                        skip
+                    };
                     while !speech && jb.backlog_room() {
                         let Playout::Packet { .. } = jb.pop_for(now, 0) else { break };
                         jb.dropped(now, samples as usize);
@@ -1799,6 +1888,85 @@ mod tests {
             let expected = if doubled { 2 * DEPTH_WINDOW } else { DEPTH_WINDOW };
             assert_eq!(evidence, expected, "stall from {from} ms after the cut");
         }
+    }
+
+    #[test]
+    fn a_due_cut_paces_its_periods_and_waits_before_relaxing() {
+        // 400 ms of 20 ms packets queued at once, then one per refill: the window proves the
+        // surplus at 5 s. The decoder removes whole 150 Hz periods (320 samples) within each
+        // budget, from a voice that correlates above NetEq's threshold or only above its fast
+        // mode's.
+        for correlated in [true, false] {
+            let start = Instant::now();
+            let mut jb = JitterBuffer::new();
+            for i in 0..20 {
+                jb.push_at(i * FRAME, FRAME, vec![1], start, Clock::Rtp);
+            }
+            let (mut proposed, mut relaxed, mut removed) = (None, None, Vec::new());
+            for k in 0..500u64 {
+                let now = start + Duration::from_millis(20 * k);
+                jb.push_at((k + 20) * FRAME, FRAME, vec![1], now, Clock::Rtp);
+                let Playout::Packet { skip, correlation, .. } = jb.pop_at(now) else { panic!("starved at {k}") };
+                let mut periods = 0;
+                if correlation < SHRINK_CORRELATION {
+                    proposed.get_or_insert(k);
+                    if correlation == RELAXED_CORRELATION {
+                        relaxed.get_or_insert(k);
+                    } else {
+                        assert_eq!(correlation, BACKLOG_CORRELATION);
+                    }
+                    if correlated || correlation == RELAXED_CORRELATION {
+                        periods = skip as u64 / 320 * 320;
+                        jb.accelerated(now, periods as usize);
+                    }
+                }
+                removed.push(periods);
+            }
+            let proposed = proposed.expect("no backlog cut");
+            assert!((245..=255).contains(&proposed), "correlated {correlated}: cut due at {proposed}");
+            if correlated {
+                assert_eq!(relaxed, None);
+            } else {
+                assert_eq!(relaxed, Some(proposed + 100), "the relaxed rule after `BACKLOG_WAIT`");
+                assert!(removed[..relaxed.unwrap() as usize].iter().all(|&r| r == 0));
+            }
+            // At most a fifth of any second's output, beyond the first long period of credit.
+            let peak = removed.windows(50).map(|w| w.iter().sum::<u64>()).max().unwrap();
+            assert!(peak <= 9_600 + SHRINK_STEP, "correlated {correlated}: {peak} samples in a second");
+            // All but `BACKLOG_KEEP` of the 360 ms surplus, a packet at most, went that way.
+            let total = removed.iter().sum::<u64>();
+            assert!((360 * 48 - BACKLOG_KEEP - FRAME..=360 * 48).contains(&total), "{total}");
+            assert_eq!(jb.backlog_due, None);
+            assert_eq!(jb.concealments, 0);
+        }
+    }
+
+    #[test]
+    fn a_cut_that_never_splices_gives_up_and_proves_the_surplus_again() {
+        // Review of #201: audio that never splices (onsets or decays all along) kept a cut due,
+        // and the gentle shrink behind it, for good. 400 ms of backlog as above; the decoder
+        // removes nothing.
+        let start = Instant::now();
+        let mut jb = JitterBuffer::new();
+        for i in 0..20 {
+            jb.push_at(i * FRAME, FRAME, vec![1], start, Clock::Rtp);
+        }
+        let mut proposed = Vec::new();
+        for k in 0..1500u64 {
+            let now = start + Duration::from_millis(20 * k);
+            jb.push_at((k + 20) * FRAME, FRAME, vec![1], now, Clock::Rtp);
+            let Playout::Packet { correlation, .. } = jb.pop_at(now) else { panic!("starved at {k}") };
+            if correlation < SHRINK_CORRELATION {
+                proposed.push(k);
+            }
+        }
+        let first = proposed[0];
+        assert!((245..=255).contains(&first), "{first}");
+        // Proposed on every refill for `BACKLOG_STUCK`, then not until a new window proves it.
+        let gap = proposed.windows(2).find(|w| w[1] > w[0] + 1).expect("the cut never gave up");
+        assert_eq!(gap[0], first + 499, "{gap:?}");
+        assert!((gap[1] - gap[0]).abs_diff(250) <= 2, "{gap:?}");
+        assert_eq!(jb.concealments, 0);
     }
 
     #[test]
