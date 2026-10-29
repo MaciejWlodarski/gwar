@@ -412,28 +412,43 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef, compact 
   );
 }
 
+/** A Try again the server has not answered this long after it was due is offered again. */
+const RETRY_ANSWER_MS = 10_000;
+
 /** Over the last frame, while the server holds a watched share back for my connection or its budget. */
 function PausedOverlay({ share, reason, compact }: { share: string; reason: ScreenPauseReason; compact?: boolean }) {
   const t = useT();
-  const [asked, setAsked] = useState(false);
+  // When the server carries out my Try again (it holds one asked too soon), and a clock to count down to it.
+  const [due, setDue] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (!asked) return;
-    // The server answers through its keyframe throttle; one ask per few seconds is plenty.
-    const timer = setTimeout(() => setAsked(false), 5000);
-    return () => clearTimeout(timer);
-  }, [asked]);
+    if (due === null) return;
+    const tick = setInterval(() => setNow(Date.now()), 250);
+    // Resuming unmounts this; without an answer (it resumed and paused again unseen, or the server had nothing to retry), offer it again.
+    const expire = setTimeout(() => setDue(null), Math.max(0, due - Date.now()) + RETRY_ANSWER_MS);
+    return () => { clearInterval(tick); clearTimeout(expire); };
+  }, [due]);
   const text = t(reason === "bandwidth" ? "screen.pausedBandwidth" : "screen.pausedBudget");
+  const left = due === null ? 0 : Math.ceil((due - now) / 1000);
   return (
     <div data-screen-paused={reason} role="status" className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/75 p-3 text-center text-white">
       {compact ? (
-        <span className="rounded bg-white/15 px-1.5 text-[11px] leading-5 font-medium" title={text}>{t("screen.pausedShort")}</span>
+        <span className="rounded bg-white/15 px-1.5 text-[11px] leading-5 font-medium" title={text}>{t(reason === "bandwidth" ? "screen.pausedLink" : "screen.pausedShort")}</span>
       ) : (
         <>
           <p className="max-w-sm text-sm text-white/90">{text}</p>
           {reason === "bandwidth" && (
-            <Button size="sm" variant="secondary" disabled={asked} className="border-white/30 text-white hover:bg-white/10"
-              onClick={e => { e.stopPropagation(); setAsked(true); controller.screen.retry(share); }}>
-              <RotateCw className="size-4" /> {t("screen.retry")}
+            <Button size="sm" variant="secondary" disabled={due !== null} className="border-white/30 text-white tabular-nums hover:bg-white/10 disabled:opacity-80"
+              onClick={e => {
+                e.stopPropagation();
+                const wait = controller.screen.retry(share);
+                if (wait === null) return;
+                setNow(Date.now());
+                setDue(Date.now() + wait);
+              }}>
+              {due !== null && left > 0 ? t("screen.retryIn", { seconds: left }) : (
+                <><RotateCw className={cn("size-4", due !== null && "animate-spin")} /> {t(due === null ? "screen.retry" : "screen.retrying")}</>
+              )}
             </Button>
           )}
         </>
@@ -460,7 +475,7 @@ function useMayStop(share: ScreenShare | undefined, client: Client | undefined):
 
 function QualityBadge({ share }: { share: string }) {
   const t = useT();
-  const paused = useScreen(s => s.watches.some(w => w.share === share && w.paused));
+  const paused = useScreen(s => s.watches.find(w => w.share === share)?.paused);
   const [label, setLabel] = useState("");
   useEffect(() => {
     let live = true;
@@ -472,7 +487,8 @@ function QualityBadge({ share }: { share: string }) {
     return () => { live = false; clearInterval(timer); };
   }, [share]);
   // A paused slot's last resolution at 0 fps would read as a frozen stream.
-  if (paused) return <span data-testid="screen-quality" className="rounded bg-white/10 px-1.5 text-[11px] leading-5 text-white/80">{t("screen.pausedShort")}</span>;
+  // On a phone the overlay below already says why; the title keeps the room.
+  if (paused) return <span data-testid="screen-quality" className="shrink-0 rounded bg-white/10 px-1.5 text-[11px] leading-5 whitespace-nowrap text-white/80 max-sm:hidden">{t(paused === "bandwidth" ? "screen.pausedLink" : "screen.pausedShort")}</span>;
   if (!label) return null;
   return <span data-testid="screen-quality" className="rounded bg-white/10 px-1.5 text-[11px] leading-5 text-white/80 tabular-nums">{label}</span>;
 }
@@ -563,7 +579,7 @@ export function Stage({ card }: { card?: boolean }) {
             {chatHidden ? <MessageSquare className="size-[18px]" /> : <MessageSquareOff className="size-[18px]" />}
           </IconButton>
           <Button size="sm" variant="secondary" className="border-white/30 text-white hover:bg-white/10" onClick={() => void controller.screen.unwatch(stage)}>
-            <X className="size-4" /> {t("screen.stopWatching")}
+            <X className="size-4" /> <span className="max-sm:sr-only">{t("screen.stopWatching")}</span>
           </Button>
         </span>
       </header>

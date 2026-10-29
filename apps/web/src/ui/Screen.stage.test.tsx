@@ -239,19 +239,41 @@ it("keeps a share whose first frame arrives after its pause ends", async () => {
 });
 
 it("shows why the server holds a share back instead of its last resolution at 0 fps, and retries", async () => {
-  // B, watched last, is on the stage; A is a card.
+  // B, watched last, is on the stage; A is a card, whose first frame came.
   expect(useScreen.getState().stage).toBe("B");
+  const { transport, watches } = useScreen.getState();
+  screen.frameReceived("A", transport.run, watches[0]!.id);
   await act(async () => { screen.handleEvent({ ev: "screen.paused", d: { share: "B", reason: "bandwidth" } }); });
-  const stage = container.querySelector<HTMLElement>('[data-screen-paused="bandwidth"]')!;
-  expect(stage.textContent).toContain("Your connection is too slow for this share right now");
-  expect(container.querySelector('[data-testid="screen-quality"]')?.textContent).toBe("Paused");
+  let stage = container.querySelector<HTMLElement>('[data-screen-paused="bandwidth"]')!;
+  expect(stage.textContent).toContain("Paused because your connection can't keep up");
+  expect(container.querySelector('[data-testid="screen-quality"]')?.textContent).toBe("Limited by your connection");
   request.mockClear();
-  const retry = [...stage.querySelectorAll("button")].find(b => b.textContent?.includes("Try again"))!;
+  // B was granted 3 s ago: the server holds a Try again until 15 s after that, and the button says so.
+  await advance(3000);
+  let retry = [...stage.querySelectorAll("button")].find(b => b.textContent?.includes("Try again"))!;
   await act(async () => retry.click());
   expect(request).toHaveBeenCalledWith("screen.watch", { share: "B" });
   expect(retry.disabled).toBe(true);
+  expect(retry.textContent).toBe("Retrying in 12 s");
   await advance(5000);
+  expect(retry.textContent).toBe("Retrying in 7 s");
+  await advance(7000);
+  expect(retry.textContent?.trim()).toBe("Retrying…");
+  expect(retry.disabled).toBe(true);
+  // Unanswered (the server had nothing to retry), it is offered again.
+  await advance(10_000);
   expect(retry.disabled).toBe(false);
+  expect(retry.textContent?.trim()).toBe("Try again");
+  // It resumed, then paused again well after: the next Try again goes at once.
+  await act(async () => { screen.handleEvent({ ev: "screen.resumed", d: { share: "B" } }); });
+  await advance(20_000);
+  await act(async () => { screen.handleEvent({ ev: "screen.paused", d: { share: "B", reason: "bandwidth" } }); });
+  stage = container.querySelector<HTMLElement>('[data-screen-paused="bandwidth"]')!;
+  retry = [...stage.querySelectorAll("button")].find(b => b.textContent?.includes("Try again"))!;
+  request.mockClear();
+  await act(async () => retry.click());
+  expect(request).toHaveBeenCalledExactlyOnceWith("screen.watch", { share: "B" });
+  expect(retry.textContent?.trim()).toBe("Retrying…");
   // A card says it briefly; a budget pause offers no retry.
   await act(async () => { screen.handleEvent({ ev: "screen.paused", d: { share: "A", reason: "budget" } }); });
   const card = container.querySelector<HTMLElement>('[data-screen-paused="budget"]')!;

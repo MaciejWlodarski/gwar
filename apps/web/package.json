@@ -24,6 +24,7 @@
     "e2e:denoise": "node e2e/denoise.mjs",
     "e2e:screen": "node e2e/screen.mjs",
     "e2e:screen-startup": "node e2e/screen-startup.mjs",
+    "e2e:screen-paused": "node e2e/screen-paused.mjs",
     "e2e:watch": "node e2e/watch.mjs",
     "e2e:dm": "node --test e2e/processes.test.mjs && node e2e/dm.mjs",
     "test:latency": "node --test e2e/latency-markers.test.mjs",

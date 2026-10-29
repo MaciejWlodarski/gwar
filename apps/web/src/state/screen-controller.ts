@@ -26,6 +26,8 @@ export type ShareAvailability = Exclude<ScreenSupport, "ok"> | "ok" | "teamspeak
 const WATCH_UNAVAILABLE_MS = 5_000;
 /** A watch's first frame must arrive within this long after its grant, across stage changes. */
 const FIRST_FRAME_TIMEOUT_MS = 35_000;
+/** The server takes a Try again at most this long after the share's last start or retry for me, and holds an earlier one until then (`RETRY_FIRST`). */
+const RETRY_SPACING_MS = 15_000;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -111,6 +113,8 @@ export class ScreenController {
   private generation = 0;
   /** Watches whose slot the server freed, until `screen.stopped` says why. */
   private readonly released = new Map<string, { onStage: boolean }>();
+  /** When each watched share last started for me (granted or resumed), which spaces my Try again. */
+  private readonly starts = new Map<string, number>();
   private initialised = false;
 
   constructor(
@@ -370,6 +374,7 @@ export class ScreenController {
         return;
       }
       this.expectFirstFrame(share, run, id);
+      this.starts.set(share, Date.now());
       dispatch({ type: "granted", run, id, slot });
       if (useScreen.getState().stage === share) void conn.request("screen.focus", { share }).catch(() => {});
     } catch (e) {
@@ -420,6 +425,7 @@ export class ScreenController {
     const watch = useScreen.getState().watches.find(w => w.share === share);
     if (!watch) return;
     this.clearFirstFrame(watch.id);
+    this.starts.delete(share);
     dispatch({ type: "unwatch", share });
     const next = useScreen.getState().stage;
     if (next && conn) void conn.request("screen.focus", { share: next }).catch(() => {});
@@ -484,12 +490,18 @@ export class ScreenController {
 
   /**
    * Asks the server to try a share paused for my bandwidth again: `screen.watch` of a share I
-   * already watch. The server resumes it from a fresh start, through its keyframe throttle.
+   * already watch. The server resumes it from a fresh start, through its keyframe throttle, but
+   * not within `RETRY_SPACING_MS` of the share's last start or retry: it holds an earlier ask
+   * until then. Returns how long that is as far as I can tell (a retry of its own that never
+   * resumed is not seen here), or null if nothing was asked.
    */
-  retry(share: string): void {
+  retry(share: string): number | null {
     const watch = useScreen.getState().watches.find(w => w.share === share);
-    if (watch?.status !== "watching" || watch.paused !== "bandwidth") return;
-    void this.link()?.request("screen.watch", { share }).catch(() => {});
+    const conn = this.link();
+    if (watch?.status !== "watching" || watch.paused !== "bandwidth" || !conn) return null;
+    void conn.request("screen.watch", { share }).catch(() => {});
+    const started = this.starts.get(share);
+    return started === undefined ? 0 : Math.max(0, started + RETRY_SPACING_MS - Date.now());
   }
 
   /** Puts a watched share on the stage: it gets the first claim on my bandwidth. */
@@ -624,6 +636,7 @@ export class ScreenController {
         this.holdFirstFrame(event.d.share, true);
         return;
       case "screen.resumed":
+        if (useScreen.getState().watches.some(w => w.share === event.d.share && w.status === "watching")) this.starts.set(event.d.share, Date.now());
         dispatch({ type: "resumed", share: event.d.share });
         this.holdFirstFrame(event.d.share, false);
         return;
@@ -698,6 +711,7 @@ export class ScreenController {
     this.generation++;
     this.chains.clear();
     this.released.clear();
+    this.starts.clear();
     this.dropTransport();
     dispatch({ type: "reset" });
   }
