@@ -142,6 +142,8 @@ struct Peer {
     admission: RtpAdmission,
     /// Client gates before encoding; only digital silence is filtered here.
     client_gate: bool,
+    /// Native clients distinguish automatic speech from its hangover in the VAD bit.
+    native_vad: bool,
     rtcp_reports: u64,
     #[cfg(feature = "test-hooks")]
     hold_next: Option<tokio::sync::oneshot::Sender<AudioPacket>>,
@@ -232,8 +234,11 @@ impl Peer {
 }
 
 /// Speech decision for one frame from header extensions alone.
-fn is_speech(data: &ExtensionValues, client_gate: bool) -> bool {
+fn is_speech(data: &ExtensionValues, client_gate: bool, native_vad: bool) -> bool {
     if client_gate {
+        if native_vad && let Some(speech) = data.voice_activity {
+            return speech;
+        }
         // A browser still sends encoded silence/DTX when its worklet closes.
         // Do not impose a second threshold on quiet speech or push-to-talk.
         return data.audio_level.map_or_else(|| data.voice_activity.unwrap_or(true), |level| level > -127);
@@ -248,6 +253,10 @@ fn is_speech(data: &ExtensionValues, client_gate: bool) -> bool {
 
 fn has_client_gate(sdp: &str) -> bool {
     sdp.lines().any(|line| line == "a=x-gwar-input-gate:1")
+}
+
+fn has_native_vad(sdp: &str) -> bool {
+    sdp.lines().any(|line| line == "a=x-gwar-native-vad:1")
 }
 
 pub struct WebRtcConfig {
@@ -454,6 +463,7 @@ fn accept(
         origin,
         admission,
         client_gate: has_client_gate(sdp),
+        native_vad: has_native_vad(sdp),
         rtcp_reports: 0,
         #[cfg(feature = "test-hooks")]
         hold_next: None,
@@ -571,7 +581,7 @@ fn ingest(
         }
         return None;
     }
-    if is_speech(&data.header.ext_vals, peer.client_gate) {
+    if is_speech(&data.header.ext_vals, peer.client_gate, peer.native_vad) {
         peer.last_voice = now;
         if !peer.talking {
             peer.talking = true;
@@ -609,6 +619,11 @@ mod clock_tests {
         assert!(!has_client_gate(&gated.replace("input-gate:1", "input-gate:2")));
         // The same parser used by older servers accepts an unknown SDP attribute.
         assert!(SdpOffer::from_sdp_string(&gated).is_ok());
+        let native = gated.replacen("\nm=", "\na=x-gwar-native-vad:1\nm=", 1);
+        assert!(has_native_vad(&native));
+        assert!(!has_native_vad(&gated));
+        assert!(!has_native_vad(&legacy));
+        assert!(SdpOffer::from_sdp_string(&native).is_ok());
     }
 
     #[test]
@@ -621,11 +636,21 @@ mod clock_tests {
             (-127, Some(true), false, false),
         ] {
             let data = ExtensionValues { audio_level: Some(level), voice_activity: vad, ..Default::default() };
-            assert_eq!(is_speech(&data, false), legacy);
-            assert_eq!(is_speech(&data, true), gated);
+            assert_eq!(is_speech(&data, false, false), legacy);
+            assert_eq!(is_speech(&data, true, false), gated);
         }
-        assert!(is_speech(&ExtensionValues::default(), false));
-        assert!(is_speech(&ExtensionValues::default(), true));
+        assert!(is_speech(&ExtensionValues::default(), false, false));
+        assert!(is_speech(&ExtensionValues::default(), true, false));
+    }
+
+    #[test]
+    fn native_automatic_suppressed_noise_does_not_open_or_refresh_speech() {
+        let mut data = ExtensionValues { audio_level: Some(-80), voice_activity: Some(false), ..Default::default() };
+        assert!(!is_speech(&data, true, true)); // Automatic: raw -45, processed -80.
+        assert!(is_speech(&data, true, false)); // Browser VAD bits are not authoritative.
+        data.voice_activity = Some(true); // Manual -50 or PTT, same processed level.
+        assert!(is_speech(&data, true, true));
+        assert!(!is_speech(&data, false, true)); // Without client-gate opt-in, keep legacy rules.
     }
 
     fn slot(now: Instant) -> Slot {

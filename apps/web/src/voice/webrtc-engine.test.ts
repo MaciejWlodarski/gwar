@@ -775,6 +775,39 @@ describe("browser devices follow the system", () => {
     expect(gate().setAudio).toHaveBeenLastCalledWith(moved.track);
   });
 
+  it("closes the retiring output before retargeting a shared denoiser during a delayed replacement", async () => {
+    const first = capture({ deviceId: "default", groupId: "g-mac" });
+    const next = capture({ deviceId: "default", groupId: "g-air" });
+    const model = { track: microphone().track, running: true, setSource: vi.fn(), setActive: vi.fn(), setStrength: vi.fn(), close: vi.fn() };
+    startDenoise.mockResolvedValueOnce(model as unknown as DenoisePipeline);
+    getUserMedia.mockResolvedValueOnce(microphone().stream).mockResolvedValueOnce(first.stream).mockResolvedValueOnce(next.stream);
+    engine.setInputSensitivity(-50);
+    await engine.start(params());
+    await flush();
+    Peer.all[0]!.connect();
+    const retiring = gate();
+    expect(retiring.setAudio).toHaveBeenLastCalledWith(model.track);
+    const replacement = deferred<void>();
+    micSender().replaceTrack.mockImplementationOnce(() => replacement.promise);
+    model.setSource.mockImplementation(() => {
+      // Even if the old detector is above -50 dB and the new mic is below it,
+      // the shared denoiser cannot feed new audio through the retiring output.
+      expect(retiring.close).toHaveBeenCalledOnce();
+      expect(retiring.track.enabled).toBe(false);
+    });
+    await changeDevices([mic("default", "g-air", "Default - AirPods"), macbook, mic("air", "g-air", "AirPods")]);
+    expect(model.setSource).toHaveBeenLastCalledWith(next.stream);
+    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(gate().track);
+    expect(gate().configure).toHaveBeenLastCalledWith(expect.objectContaining({ threshold: -50, automatic: false }));
+    expect(first.track.stop).not.toHaveBeenCalled(); // Replacement is still pending.
+    engine.setInputSensitivity(-40);
+    expect(retiring.track.enabled).toBe(false);
+    replacement.resolve();
+    await flush();
+    expect(first.track.stop).toHaveBeenCalledOnce();
+    expect(retiring.close).toHaveBeenCalledOnce();
+  });
+
   it("tries a failed switch again while the working microphone stays", async () => {
     const first = capture({ deviceId: "default", groupId: "g-mac" });
     const later = capture({ deviceId: "default", groupId: "g-usb" });

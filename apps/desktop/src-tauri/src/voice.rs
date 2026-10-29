@@ -119,7 +119,7 @@ impl Default for Voice {
                 prefs: Prefs {
                     input: None,
                     output: None,
-                    mode: InputMode::VoiceActivity { threshold_db: DEFAULT_THRESHOLD_DB },
+                    mode: InputMode::Automatic,
                     muted: false,
                     deafened: false,
                     ptt: false,
@@ -878,6 +878,7 @@ pub fn voice_set_input_mode(
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     inner.prefs.mode = match mode {
+        Mode::Vad if threshold_db.is_none() => InputMode::Automatic,
         Mode::Vad => InputMode::VoiceActivity {
             threshold_db: gwar_client::voice::input_threshold(threshold_db.unwrap_or(DEFAULT_THRESHOLD_DB)),
         },

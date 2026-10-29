@@ -75,7 +75,7 @@ where
     };
     // Unknown SDP attributes are ignored by older servers. Updated servers avoid
     // applying their fixed gate a second time to quiet speech or push-to-talk.
-    let sdp = offer.to_sdp_string().replacen("\r\nm=", "\r\na=x-gwar-input-gate:1\r\nm=", 1);
+    let sdp = offer.to_sdp_string().replacen("\r\nm=", "\r\na=x-gwar-input-gate:1\r\na=x-gwar-native-vad:1\r\nm=", 1);
     let answer = signal(sdp).await?;
     rtc.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer)?)?;
     for mid in &slots {

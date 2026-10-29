@@ -68,6 +68,7 @@ export class NativeVoiceEngine implements VoiceEngine {
   private lastDevices = "";
   private smoothed = 0;
   private inputMode: InputMode = "vad";
+  private automaticSensitivity = true;
   private threshold = inputThreshold(null);
   private micTestId = 0;
 
@@ -273,10 +274,11 @@ export class NativeVoiceEngine implements VoiceEngine {
 
   setInputMode(mode: InputMode): void {
     this.inputMode = mode;
-    this.send("voice_set_input_mode", { mode, thresholdDb: this.threshold });
+    this.send("voice_set_input_mode", { mode, thresholdDb: this.automaticSensitivity ? null : this.threshold });
   }
 
   setInputSensitivity(threshold: number | null): void {
+    this.automaticSensitivity = threshold === null;
     this.threshold = inputThreshold(threshold);
     this.setInputMode(this.inputMode);
   }

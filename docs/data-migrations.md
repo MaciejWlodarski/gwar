@@ -303,8 +303,13 @@ change their saved self-mute/deafen preferences.
 
 Settings version 5 adds `audio.automaticSensitivity` (default `true`) and
 `audio.vadThreshold` (default −50 dBFS). Both browser and desktop keep the previous
-voice gate by default. Turning automatic sensitivity off uses the saved manual
-threshold; switching it back on keeps that manual value for next time. Migration
+voice gate by default. Native automatic mode on Gwar also retains the legacy processed-audio
+criterion (RFC 6464 level at least −60 dBov) in its VAD bit. The optional native
+SDP marker `a=x-gwar-native-vad:1` makes that bit authoritative at the SFU, which
+keeps its 400 ms timeout; manual sensitivity and PTT mark speech regardless of
+processed level. Direct TeamSpeak retains its raw gate. Turning
+automatic sensitivity off uses the saved manual threshold; switching it back on
+keeps that manual value for next time. Migration
 preserves devices, input mode, processing and unrelated preferences. Reads and
 updates validate the new fields: thresholds are finite numbers clamped to
 −100…0 dBFS (invalid values use −50), and invalid automatic flags use `true`.

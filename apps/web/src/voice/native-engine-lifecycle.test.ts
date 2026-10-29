@@ -88,7 +88,10 @@ describe("native web-view ownership", () => {
     ]);
     view.setInputSensitivity(null);
     await view.stop();
-    expect(bridge.invoke).toHaveBeenCalledWith("voice_set_input_mode", { owner: 1, mode: "vad", thresholdDb: -50 });
+    expect(bridge.invoke).toHaveBeenCalledWith("voice_set_input_mode", { owner: 1, mode: "vad", thresholdDb: null });
+    view.setInputSensitivity(-50);
+    await view.stop();
+    expect(bridge.invoke.mock.calls.filter(([command]) => command === "voice_set_input_mode").at(-1)?.[1]).toEqual({ owner: 1, mode: "vad", thresholdDb: -50 });
     expect(bridge.invoke).not.toHaveBeenCalledWith("voice_start", expect.anything());
   });
 

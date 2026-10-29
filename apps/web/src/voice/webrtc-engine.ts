@@ -379,6 +379,9 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       this.openingStream = null;
       this.stream = stream;
       this.micMissing = false;
+      // Retargeting the shared denoiser also changes audio carried by the old
+      // gate. Close that output before its detector and audio can disagree.
+      if (this.denoise) previousGate?.close();
       this.denoise?.setSource(stream);
       this.startMeter(stream);
       this.emit("micError", null);
@@ -394,7 +397,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         // Sent before the previous capture stops, so the call hears no gap beyond the switch;
         // until then mute and push-to-talk gate it too, and a stop ends it.
         this.handover = previous;
-        this.handoverGate = previousGate;
+        this.handoverGate = this.denoise ? null : previousGate;
         await this.updateSentTrack();
         if (this.handover === previous) this.handover = null;
         if (this.handoverGate === previousGate) {

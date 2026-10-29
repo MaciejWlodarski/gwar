@@ -51,10 +51,22 @@ const TS_FRAME: usize = 960; // Direct TeamSpeak retains its 20 ms packet clock.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputMode {
+    /// Preserve the default raw gate and legacy processed-audio speech check.
+    Automatic,
     /// Transmit while the input level exceeds `threshold_db` (dBFS).
     VoiceActivity { threshold_db: f32 },
     /// Transmit while [`VoiceHandle::set_ptt`] is held.
     PushToTalk,
+}
+
+const INPUT_AUTOMATIC: u8 = 0;
+const INPUT_MANUAL: u8 = 1;
+const INPUT_PTT: u8 = 2;
+
+fn speech_activity(mode: u8, processed_level: i8) -> bool {
+    // Native RTP has always marked speech, giving the legacy SFU a -60 dBov
+    // processed cutoff. Only manual sensitivity and PTT override that choice.
+    mode != INPUT_AUTOMATIC || processed_level >= -60
 }
 
 /// Lock-free controls shared between the UI and the pipeline thread.
@@ -63,7 +75,8 @@ pub struct Controls {
     deafened: AtomicBool,
     ptt: AtomicBool,
     vad_threshold: AtomicU32,
-    push_to_talk: AtomicBool,
+    /// One atomic selects automatic, manual or PTT; automatic never reads a changing manual threshold.
+    input_mode: AtomicU8,
     /// [`NoiseSuppression`], in percent.
     noise_suppression: AtomicU8,
     echo_cancellation: AtomicBool,
@@ -91,7 +104,7 @@ impl Default for Controls {
             deafened: AtomicBool::new(false),
             ptt: AtomicBool::new(false),
             vad_threshold: AtomicU32::new((-50.0f32).to_bits()),
-            push_to_talk: AtomicBool::new(false),
+            input_mode: AtomicU8::new(INPUT_AUTOMATIC),
             noise_suppression: AtomicU8::new(NoiseSuppression::default().as_percent()),
             echo_cancellation: AtomicBool::new(true),
             auto_gain: AtomicBool::new(true),
@@ -240,13 +253,15 @@ impl VoiceHandle {
         self.controls.ptt.store(down, Ordering::Relaxed);
     }
     pub fn set_input_mode(&self, mode: InputMode) {
-        match mode {
+        let mode = match mode {
+            InputMode::Automatic => INPUT_AUTOMATIC,
             InputMode::VoiceActivity { threshold_db } => {
                 set_f(&self.controls.vad_threshold, input_threshold(threshold_db));
-                self.controls.push_to_talk.store(false, Ordering::Relaxed);
+                INPUT_MANUAL
             }
-            InputMode::PushToTalk => self.controls.push_to_talk.store(true, Ordering::Relaxed),
-        }
+            InputMode::PushToTalk => INPUT_PTT,
+        };
+        self.controls.input_mode.store(mode, Ordering::Release);
     }
     /// Per-slot volume, 0.0–2.0. The app maps slots to users via `voice.slot`.
     pub fn set_slot_gain(&self, slot: usize, gain: f32) {
@@ -660,8 +675,10 @@ fn pipeline<const CAPTURE: usize>(
             let frame = &capture.samples;
             set_f(&controls.input_level, db);
             let blocked = controls.muted.load(Ordering::Relaxed) || controls.deafened.load(Ordering::Relaxed);
-            let ptt = controls.push_to_talk.load(Ordering::Relaxed).then(|| controls.ptt.load(Ordering::Relaxed));
-            let send = gate.allows(Instant::now(), db, f(&controls.vad_threshold), ptt, blocked);
+            let mode = controls.input_mode.load(Ordering::Acquire);
+            let ptt = (mode == INPUT_PTT).then(|| controls.ptt.load(Ordering::Relaxed));
+            let threshold = if mode == INPUT_AUTOMATIC { -50.0 } else { f(&controls.vad_threshold) };
+            let send = gate.allows(Instant::now(), db, threshold, ptt, blocked);
             controls.transmitting.store(send, Ordering::Relaxed);
             if send {
                 let n = encoder.encode_float(frame, &mut packet[..])?;
@@ -670,15 +687,15 @@ fn pipeline<const CAPTURE: usize>(
                 }
                 // RFC 6464: the level of the audio actually sent. Suppressed noise reads as
                 // silence, so it cannot hold a receive slot at the server.
-                let level = (-level_db(frame).clamp(-127.0, 0.0)).round() as i8;
+                let level = -((-level_db(frame).clamp(-127.0, 0.0)).round() as i8);
                 // Tell the server's speech gate the truth about voice activity.
                 if out
                     .try_send(Outgoing {
                         captured_at: capture.captured_at,
                         capture_position,
                         opus: packet[..n].to_vec(),
-                        level: -level,
-                        speech: true,
+                        level,
+                        speech: speech_activity(mode, level),
                     })
                     .is_ok()
                 {
@@ -754,6 +771,20 @@ pub use gwar_proto::opus::packet_samples as opus_samples;
 #[cfg(test)]
 mod codec_tests {
     use super::*;
+
+    #[test]
+    fn automatic_preserves_the_processed_speech_decision_for_suppressed_noise() {
+        let now = Instant::now();
+        let mut gate = gate::InputGate::default();
+        // The old native raw gate sent these frames, but the SFU rejected them.
+        assert!(gate.allows(now, -45.0, -50.0, None, false));
+        assert!(!speech_activity(INPUT_AUTOMATIC, -80));
+        assert!(speech_activity(INPUT_MANUAL, -80));
+        assert!(speech_activity(INPUT_PTT, -80));
+        assert!(!speech_activity(INPUT_AUTOMATIC, -61));
+        assert!(speech_activity(INPUT_AUTOMATIC, -60));
+        assert!(speech_activity(INPUT_AUTOMATIC, -50));
+    }
     use audiopus::{Bandwidth, MutSignals, coder::Decoder, packet::Packet};
 
     #[test]
@@ -895,7 +926,7 @@ mod codec_tests {
         for gate in 0..3 {
             let controls = Arc::new(Controls::default());
             controls.muted.store(gate == 0, Ordering::Relaxed);
-            controls.push_to_talk.store(gate == 1, Ordering::Relaxed);
+            controls.input_mode.store(if gate == 1 { INPUT_PTT } else { INPUT_MANUAL }, Ordering::Relaxed);
             // The samples are constant: the canceller's high-pass filter would take them to nothing.
             controls.echo_cancellation.store(false, Ordering::Relaxed);
             let (mut tx, mic) = rtrb::RingBuffer::new(FRAME * 16);
