@@ -6,6 +6,7 @@
 //! move samples through lock-free rings (see [`io`]).
 
 mod apm;
+pub mod cues;
 mod denoise;
 pub mod io;
 pub mod jitter;
@@ -19,7 +20,7 @@ pub mod sframe;
 use std::{
     net::{IpAddr, SocketAddr},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
     },
     thread,
@@ -53,7 +54,7 @@ pub enum InputMode {
     PushToTalk,
 }
 
-/// Lock-free controls shared between the UI and the pipeline thread.
+/// Shared voice controls: atomics for voice and a bounded, try-locked handoff for local cues.
 pub struct Controls {
     muted: AtomicBool,
     deafened: AtomicBool,
@@ -70,6 +71,8 @@ pub struct Controls {
     input_level: AtomicU32,
     transmitting: AtomicBool,
     stop: AtomicBool,
+    /// At most two fresh local cues; the pipeline never blocks on this lock.
+    cue: Mutex<Vec<(Vec<f32>, Instant, bool)>>,
 }
 
 fn f(v: &AtomicU32) -> f32 {
@@ -96,6 +99,7 @@ impl Default for Controls {
             input_level: AtomicU32::new((-100.0f32).to_bits()),
             transmitting: AtomicBool::new(false),
             stop: AtomicBool::new(false),
+            cue: Mutex::new(Vec::with_capacity(2)),
         }
     }
 }
@@ -218,6 +222,18 @@ pub struct VoiceHandle {
 }
 
 impl VoiceHandle {
+    /// Local-only playout, mixed after voice gain/deafen and before the AEC render reference.
+    pub fn play_cue(&self, samples: Vec<f32>, while_deafened: bool) {
+        if samples.len() > 14_400 {
+            return;
+        }
+        let mut pending = self.controls.cue.lock().unwrap_or_else(|e| e.into_inner());
+        if pending.len() == 2 {
+            pending.remove(0);
+        }
+        pending.push((samples, Instant::now(), while_deafened));
+        self.output.wake();
+    }
     /// The key channel of an encrypted run; `None` in plaintext and TeamSpeak.
     pub fn keys(&self) -> Option<&keys::KeyChannel> {
         self.keys.as_ref()
@@ -628,6 +644,7 @@ fn pipeline<const CAPTURE: usize>(
     let mut packet = vec![0u8; 1275];
     let mut last_voice = Instant::now() - HANGOVER;
     let mut speaker_buffer = SpeakerBuffer::new(Instant::now());
+    let mut cues: Vec<(std::vec::IntoIter<f32>, bool)> = Vec::with_capacity(2);
 
     while !controls.stop.load(Ordering::Relaxed) {
         // ---- capture
@@ -713,6 +730,18 @@ fn pipeline<const CAPTURE: usize>(
         let level = speaker.buffer().capacity() - speaker.slots();
         let mut needed = target.saturating_sub(level);
         let deafened = controls.deafened.load(Ordering::Relaxed);
+        if let Ok(mut pending) = controls.cue.try_lock() {
+            for (samples, at, allowed) in pending.drain(..) {
+                if at.elapsed() >= Duration::from_millis(300) || (deafened && !allowed) {
+                    continue;
+                }
+                if cues.len() == 2 {
+                    cues.remove(0);
+                }
+                cues.push((samples.into_iter(), allowed));
+            }
+        }
+        cues.retain(|(pcm, allowed)| pcm.len() > 0 && (!deafened || *allowed));
         while needed > 0 {
             let take = needed.min(FRAME);
             mix[..take].fill(0.0);
@@ -723,7 +752,8 @@ fn pipeline<const CAPTURE: usize>(
             let master = if deafened { 0.0 } else { f(&controls.master) };
             output.playing.store(slots.iter().any(Slot::playing), Ordering::Relaxed);
             for s in &mut mix[..take] {
-                *s = (*s * master).clamp(-1.0, 1.0);
+                let cue: f32 = cues.iter_mut().map(|(pcm, _)| pcm.next().unwrap_or(0.0)).sum();
+                *s = (*s * master + cue).clamp(-1.0, 1.0);
             }
             processing.render(&mix[..take]);
             for &s in &mix[..take] {
@@ -759,6 +789,38 @@ pub use gwar_proto::opus::packet_samples as opus_samples;
 mod codec_tests {
     use super::*;
     use audiopus::{Bandwidth, MutSignals, coder::Decoder, packet::Packet};
+
+    #[test]
+    fn local_cue_plays_with_voice_gain_zero_and_deafen_without_entering_capture() {
+        let controls = Arc::new(Controls::default());
+        controls.deafened.store(true, Ordering::Relaxed);
+        set_f(&controls.master, 0.0);
+        let expected = cues::render("deafen", 0.6).unwrap();
+        controls.cue.lock().unwrap().push((expected.clone(), Instant::now(), true));
+        let (_capture, mic) = rtrb::RingBuffer::new(FRAME);
+        let (speaker, mut heard) = rtrb::RingBuffer::new(FRAME * 4);
+        let timing = Arc::new(OutputTiming::default());
+        let (out, mut outgoing) = mpsc::channel(1);
+        let (_incoming, input) = std::sync::mpsc::sync_channel(1);
+        let c = controls.clone();
+        let t = timing.clone();
+        let worker = thread::spawn(move || pipeline::<FRAME>(c, Arc::default(), mic, speaker, t, out, input));
+        let mut played = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while played.len() < expected.len() && Instant::now() < deadline {
+            while let Ok(sample) = heard.pop() {
+                played.push(sample);
+            }
+            timing.wake();
+            thread::sleep(Duration::from_millis(1));
+        }
+        controls.stop.store(true, Ordering::Relaxed);
+        timing.wake();
+        worker.join().unwrap().unwrap();
+        assert!(played.len() >= expected.len(), "pipeline did not play the cue");
+        assert_eq!(&played[..expected.len()], expected.as_slice());
+        assert!(outgoing.try_recv().is_err(), "local cue entered the outgoing microphone path");
+    }
 
     #[test]
     fn encoded_sender_bounds_count_unexpected_duration_without_dropping_it() {

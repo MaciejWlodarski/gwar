@@ -148,6 +148,10 @@ const RECORD_FIXTURES: Record<keyof typeof RECORDS, Record<number, { stored: Rec
 };
 /** The settings (localStorage) per version, and a check of the settings store after loading them. */
 const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: string; bookmarks: unknown[] }): void }> = {
+  3: {
+    stored: { state: { theme: "dark", bookmarks: [], sounds: { enabled: false, volume: 0.25, events: { mute: false } } }, version: 3 },
+    check: state => { expect(state).toMatchObject({ sounds: { enabled: false, volume: 0.25, events: { mute: false, peerJoin: true } } }); },
+  },
   2: {
     stored: { state: { theme: "dark", bookmarks: [], screenMode: "sharp", screenHeight: 1440, screenFps: 60 }, version: 2 },
     check: state => { expect(state).toMatchObject({ theme: "dark", screenMode: "sharp", screenHeight: 1440, screenFps: 60 }); },
@@ -404,6 +408,7 @@ describe("the settings (localStorage)", () => {
     const { useSettings, localStorageError } = await page(memory({ [SETTINGS_KEY]: JSON.stringify(LOCAL_FIXTURES[version]!.stored) }));
     expect(localStorageError()).toBeUndefined();
     LOCAL_FIXTURES[version]!.check(useSettings.getState());
+    if (version < 3) expect(useSettings.getState().sounds).toEqual((await import("../sound/catalog")).defaultSounds);
   });
   it("of a newer version, or unreadable, are neither read nor written", async () => {
     for (const stored of [JSON.stringify({ state: { theme: "light" }, version: SETTINGS_VERSION + 1 }), "garbage"]) {

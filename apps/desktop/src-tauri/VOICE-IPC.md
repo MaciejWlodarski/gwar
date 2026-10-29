@@ -15,6 +15,7 @@ checks the injected calling webview window and rejects any label other than
 | `voice_crypto_counters {owner, run}` → counters or null | Aggregate SFrame counters of the current encrypted run; never key material. |
 | `voice_answer {owner, run, sdp?, error?}` | Current owner and matching pending run only. |
 | `voice_stop {owner, run}` | Current owner only; retires this or older runs, including starts still pending in DNS or device opening. |
+| `voice_play_cue {owner, cue, volume}` | Current owner and main window only. Accepts only the built-in score names and a clamped 0..1 volume. During voice, mixes local PCM into the selected output before the AEC render reference, independent of voice volume. Outside voice, opens output only (never the microphone). Deafen permits only mute/unmute/deafen/undeafen confirmations. |
 | `voice_set_muted`, `voice_set_deafened`, `voice_set_ptt`, `voice_set_input_mode`, `voice_set_master_gain`, `voice_set_slot_gain`, `voice_set_devices` | Require `owner` alongside their existing arguments. Reject previous-view controls under the voice lock. |
 | `mic_test_start {owner, input?}`, `mic_test_stop {owner}` | Current owner only. Bootstrap also cancels a pending test and closes its capture. |
 | `audio_devices`, `open_mic_privacy_settings` | No ownership token: enumeration or a fixed OS settings URI. |

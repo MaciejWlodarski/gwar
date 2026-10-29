@@ -263,6 +263,12 @@ sharp 1080p15, smooth → smooth 1080p30, game → smooth 1080p60, saver → smo
 old value. Browser and desktop webviews use the same store; the base version had
 no separately persisted screen choice. See [Quality settings](screen-share.md#quality-settings).
 
+Settings version 3 adds `sounds`: a master switch, independent 0..1 volume
+(default 0.6), and enabled-by-default switches for all 14 cues. Versions 1 and 2
+keep every existing preference and gain the defaults automatically. Partial sound
+preferences preserve explicit off switches; missing events default on. The settings
+remain device-local, including in the desktop webview, and are not synced to Connect.
+
 `serverGroups` (the server column's groups) came without a version bump: it is a
 new key, not a change of shape. Missing or malformed, it reads as no groups
 (`validGroups`), and an older client keeps it untouched. Ids of removed

@@ -8,7 +8,8 @@ import type { Welcome } from "../proto/Welcome";
 import type { ConnectionStatus, Link } from "../net/connection";
 import type { EventName, Op } from "../net/protocol";
 import { welcome } from "../net/testing";
-import type { VoiceEngine } from "../voice/engine";
+import type { VoiceEngine, VoiceEvents, VoiceState } from "../voice/engine";
+import { defaultSounds } from "../sound/catalog";
 
 // Native file commands, recording where uploads would go (only the desktop upload test turns the app native).
 const native = vi.hoisted(() => ({ origin: null as string | null, session: null as string | null, sent: [] as Array<{ origin: string | null; bytes: Uint8Array }>, attachment: {} }));
@@ -82,7 +83,10 @@ class FakeLink implements Link {
 }
 
 function fakeEngine() {
+  const handlers = new Map<string, Set<(value: never) => void>>();
   const engine = {
+    playSound: vi.fn(),
+    emitState: (state: VoiceState) => { for (const handler of handlers.get("state") ?? []) handler(state as never); },
     capabilities: { outputDeviceSelection: false, encryptedVoice: async () => true },
     start: vi.fn(async () => {}),
     stop: vi.fn(async () => {}),
@@ -99,7 +103,11 @@ function fakeEngine() {
     setSlotOwner: vi.fn(),
     listDevices: vi.fn(async () => ({ inputs: [], outputs: [] })),
     startMicTest: vi.fn(async () => () => {}),
-    on: vi.fn(() => () => {}),
+    on: vi.fn(<E extends keyof VoiceEvents>(event: E, handler: (value: VoiceEvents[E]) => void) => {
+      const listeners = handlers.get(event) ?? new Set();
+      handlers.set(event, listeners); listeners.add(handler as (value: never) => void);
+      return () => { listeners.delete(handler as (value: never) => void); };
+    }),
   };
   return engine satisfies VoiceEngine;
 }
@@ -180,6 +188,8 @@ beforeAll(async () => {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
+  controller.sounds.reset();
+  settings.useSettings.setState({ sounds: defaultSounds });
   engine.capabilities.encryptedVoice = async () => true;
   link = new FakeLink();
   session().dispatch({ type: "reset" });
@@ -190,6 +200,43 @@ beforeEach(() => {
 afterEach(async () => {
   vi.useRealTimers();
   await controller.disconnect(true);
+});
+
+describe("sound cue wiring", () => {
+  it("confirms connected voice and leaving, but never a mere server welcome", async () => {
+    connectFake({ channel: 2 });
+    expect(engine.playSound).not.toHaveBeenCalled();
+    engine.emitState("connected");
+    expect(engine.playSound).toHaveBeenLastCalledWith("selfJoin", 0.6);
+    await vi.advanceTimersByTimeAsync(1000);
+    await controller.leaveVoice();
+    expect(engine.playSound).toHaveBeenLastCalledWith("selfLeave", 0.6);
+    link.emit({ ev: "client.updated", d: client(1, null) });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(engine.playSound.mock.calls.map(([cue]) => cue)).toEqual(["selfJoin", "selfLeave"]);
+  });
+
+  it("reports a media loss once and confirms its recovery", async () => {
+    connectFake({ channel: 2 }); engine.emitState("connected");
+    await vi.advanceTimersByTimeAsync(1000);
+    engine.emitState("failed"); engine.emitState("failed");
+    await vi.advanceTimersByTimeAsync(1000);
+    engine.emitState("connected");
+    expect(engine.playSound.mock.calls.map(([cue]) => cue)).toEqual(["selfJoin", "connectionLost", "reconnected"]);
+  });
+
+  it("confirms mute and deafen changes, including control cues while deafened", async () => {
+    controller.setDeafened(true);
+    await vi.advanceTimersByTimeAsync(150);
+    controller.setMuted(true);
+    await vi.advanceTimersByTimeAsync(150);
+    controller.setMuted(false); // also undeafens, with one confirmation
+    await vi.advanceTimersByTimeAsync(150);
+    controller.setDeafened(true);
+    await vi.advanceTimersByTimeAsync(150);
+    controller.setDeafened(false);
+    expect(engine.playSound.mock.calls.map(([cue]) => cue)).toEqual(["deafen", "mute", "unmute", "deafen", "undeafen"]);
+  });
 });
 
 describe("staying on the server without voice", () => {

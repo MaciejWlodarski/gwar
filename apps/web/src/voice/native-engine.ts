@@ -12,6 +12,7 @@ import {
   type VoiceState,
 } from "./engine";
 import type { ControlResult, CryptoStatus } from "./sframe/state";
+import type { SoundCue } from "../sound/catalog";
 
 type Handler = (value: never) => void;
 
@@ -79,6 +80,11 @@ export class NativeVoiceEngine implements VoiceEngine {
 
   // ---------------------------------------------------------------- events
 
+  playSound(cue: SoundCue, volume: number): void {
+    // Preserve ordering with mute/deafen and stop, including outside a call.
+    void this.send("voice_play_cue", { cue, volume }, performance.now() + 300);
+  }
+
   on<E extends keyof VoiceEvents>(event: E, handler: (value: VoiceEvents[E]) => void): () => void {
     let set = this.handlers.get(event);
     if (!set) this.handlers.set(event, (set = new Set()));
@@ -104,9 +110,12 @@ export class NativeVoiceEngine implements VoiceEngine {
   }
 
   /** Commands run in issue order after the one-time ownership bootstrap. */
-  private send(command: string, args?: Record<string, unknown>): Promise<void> {
+  private send(command: string, args?: Record<string, unknown>, freshUntil = Infinity): Promise<void> {
     this.queue = this.queue
-      .then(() => this.invoke(command, args))
+      .then(async () => {
+        await this.ready;
+        if (performance.now() <= freshUntil) await this.invoke(command, args);
+      })
       .catch((e: unknown) => console.warn(`[native voice] ${command} failed:`, e));
     return this.queue;
   }

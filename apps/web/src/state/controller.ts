@@ -1,3 +1,5 @@
+import { SoundDispatcher } from "../sound/dispatcher";
+import type { SoundCue } from "../sound/catalog";
 import { claimAll, claimableIdentities, offerClaims } from "./ts-claim";
 import { permissionsOf } from "../lib/permissions";
 import type { ChannelOverride } from "../proto/ChannelOverride";
@@ -231,8 +233,10 @@ class Controller {
   private readTimer: ReturnType<typeof setTimeout> | null = null;
   /** The voice channel I was in when the connection dropped; rejoined after the resync. */
   private rejoin: number | null = null;
+  readonly sounds = new SoundDispatcher(() => useSettings.getState().sounds, () => useVoice.getState().deafened,
+    (cue, volume) => this.engine.playSound?.(cue, volume));
   /** Screen sharing and watching (docs/screen-share.md). */
-  readonly screen = new ScreenController(() => this.conn, describeRequestError);
+  readonly screen = new ScreenController(() => this.conn, describeRequestError, () => this.sounds.cue("shareStopped"));
 
   constructor() {
     this.engine = createVoiceEngine();
@@ -254,11 +258,16 @@ class Controller {
     this.initialised = true;
     this.screen.init();
     const e = this.engine;
+    e.setMuted(useVoice.getState().muted);
+    e.setDeafened(useVoice.getState().deafened);
+    const unlock = () => e.unlockSounds?.();
+    for (const name of ["pointerdown", "keydown"]) window.addEventListener(name, unlock, { capture: true, passive: true });
+    useSession.subscribe((s, before) => this.sounds.session(s, before));
     e.on("level", (level) => useVoice.getState().set({ level }));
     e.on("state", (state) => {
       useVoice.getState().set({ state });
-      if (state === "failed") this.scheduleVoiceRetry();
-      if (state === "connected") this.voiceRetries = 0;
+      if (state === "failed") { this.sounds.lost(); this.scheduleVoiceRetry(); }
+      if (state === "connected") { this.sounds.connected(myChannelId(useSession.getState())); this.voiceRetries = 0; }
     });
     e.on("micError", (micError) => useVoice.getState().set({ micError }));
     e.on("outputError", (error) => {
@@ -338,7 +347,9 @@ class Controller {
         const stopped = this.stopVoice();
         const run = this.voiceRun;
         void stopped.then(() => {
-          if (run === this.voiceRun && this.conn === conn && now !== null && myChannelId(useSession.getState()) === now) return this.startVoice();
+          if (run !== this.voiceRun || this.conn !== conn) return;
+          if (now === null) this.sounds.left();
+          else if (myChannelId(useSession.getState()) === now) return this.startVoice();
         });
       }
     });
@@ -692,6 +703,7 @@ class Controller {
         return b && b.call === event.d.call && b.participation === event.d.participation && b.run === event.d.run;
       })()) {
         useUi.getState().toast("info", tNow("voice.closed"));
+        this.sounds.lost();
         if (event.d.reason === "transport_failed") this.scheduleVoiceRetry(1000);
         else void this.stopVoice();
       }
@@ -726,14 +738,30 @@ class Controller {
           // A new session starts outside voice: remember where to go back to.
           this.rejoin ??= myChannelId(useSession.getState());
           session.dispatch({ type: "phase", phase: "reconnecting" });
-          this.screen.reset();
-          void this.stopVoice();
+          {
+            const sharing = !!useScreen.getState().own?.share;
+            const lost = this.sounds.lost(true);
+            const at = performance.now();
+            this.screen.reset();
+            void this.stopVoice().then(() => {
+              if (this.conn !== conn || performance.now() - at >= 300) return;
+              if (lost && this.sounds.awaitingRecovery) this.sounds.cue("connectionLost");
+              if (sharing) this.sounds.cue("shareStopped");
+            });
+          }
           break;
         case "closed":
           if (this.conn !== conn) break;
           if (status.reason.kind !== "user") {
             session.setClose(status.reason);
-            void this.teardown();
+            const sharing = !!useScreen.getState().own?.share;
+            const lost = this.sounds.lost(true);
+            void this.teardown().then(() => {
+              if (this.conn !== null) return;
+              if (lost) this.sounds.cue("connectionLost");
+              this.sounds.reset();
+              if (sharing) this.sounds.cue("shareStopped");
+            });
           }
           break;
         case "idle":
@@ -754,6 +782,8 @@ class Controller {
     this.conn = null;
     conn?.close();
     await this.teardown();
+    if (this.conn !== null) return;
+    this.sounds.left();
     if (!silent) useSession.getState().setClose({ kind: "user" });
   }
 
@@ -974,7 +1004,7 @@ class Controller {
     if (!this.canLeaveVoice || myChannelId(useSession.getState()) === null) return;
     const ok = await this.attempt(this.connection.request("channel.leave", {}));
     // The server's client.updated follows; do not wait for it to release the microphone.
-    if (ok) await this.stopVoice();
+    if (ok) { await this.stopVoice(); this.sounds.left(); }
   }
 
   private async rejoinVoice(channel: number): Promise<void> {
@@ -1029,6 +1059,7 @@ class Controller {
     v.set({ muted, deafened });
     this.engine.setMuted(muted);
     this.engine.setDeafened(deafened);
+    if (v.muted !== muted || v.deafened !== deafened) this.sounds.cue(muted ? "mute" : "unmute");
     void this.pushMuteState();
   }
 
@@ -1038,8 +1069,10 @@ class Controller {
   }
 
   setDeafened(deafened: boolean): void {
+    const before = useVoice.getState().deafened;
     useVoice.getState().set({ deafened });
     this.engine.setDeafened(deafened);
+    if (before !== deafened) this.sounds.cue(deafened ? "deafen" : "undeafen");
     void this.pushMuteState();
   }
 
@@ -1903,6 +1936,8 @@ class Controller {
     return run;
   }
 
+  previewSound(cue: SoundCue): void { this.sounds.cue(cue, true); }
+
   // ----------------------------------------------------------- notifications
 
   /**
@@ -1913,7 +1948,9 @@ class Controller {
   private notificationFor(msg: ChatMessage): (() => void) | null {
     const s = useSession.getState();
     const reason = notifyReason(msg, { meUid: s.me?.uid, focused: s.focused, settings: useSettings.getState().notifications });
-    if (!reason) return null;
+    // Sound preferences are independent of system-notification permission.
+    const sound = () => this.sounds.message(msg, s);
+    if (!reason) return sound;
     // A system notification is no place for formatting that reorders the text around it.
     const authorName = displayText(memberName(s.members, msg.author_uid, msg.author_name));
     const target = typeof msg.target === "object" && "channel" in msg.target ? s.channels[msg.target.channel]?.name : undefined;
@@ -1925,6 +1962,7 @@ class Controller {
           ? tNow("notify.channel", { name: authorName, channel })
           : tNow("notify.server", { name: authorName, server: displayText(s.server?.name ?? "") });
     return () => {
+      sound();
       notify({
         title: msg.author_uid.startsWith("ts:") ? `${title} · ${tNow("chat.teamSpeakNotification")}` : title,
         body: displayText(notificationBody(msg), true),

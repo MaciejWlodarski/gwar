@@ -1,3 +1,4 @@
+import { renderCue, SOUND_RATE, CONTROL_CUES, type SoundCue } from "../sound/catalog";
 import { startDenoise, type DenoisePipeline } from "./denoise";
 import { nextMediaRun } from "./engine";
 import { encryptedVoiceSupported, SframeWorker } from "./sframe/client";
@@ -53,6 +54,9 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private stream: MediaStream | null = null;
   private ctx: SinkAudioContext | null = null;
   private master: GainNode | null = null;
+  private output: GainNode | null = null;
+  private cues = new Map<AudioBufferSourceNode, SoundCue>();
+  private cueRequest = 0;
   private streamDest: MediaStreamAudioDestinationNode | null = null;
   private sinkElement: SinkAudioElement | null = null;
   private analyser: AnalyserNode | null = null;
@@ -102,6 +106,39 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         void this.listDevices().then((d) => this.emit("devices", d));
       });
     }
+  }
+
+  unlockSounds(): void {
+    const ctx = this.ensureContext();
+    void ctx.resume().catch(() => {});
+    void this.sinkElement?.play().catch(() => {});
+  }
+
+  playSound(cue: SoundCue, volume: number): void {
+    if (this.deafened && !CONTROL_CUES.has(cue)) return;
+    const ctx = this.ensureContext();
+    const request = ++this.cueRequest, at = performance.now();
+    if (ctx.state !== "running") {
+      // A first gesture can still be resuming the context. Outside a gesture, discard
+      // blocked sounds; never replay old notifications on focus return.
+      if (navigator.userActivation?.isActive) void ctx.resume().then(() => {
+        if (ctx.state === "running" && request === this.cueRequest && performance.now() - at < 300) this.playSound(cue, volume);
+      }).catch(() => {});
+      return;
+    }
+    if (this.cues.size >= 2) {
+      const oldest = this.cues.keys().next().value!;
+      oldest.stop(); this.cues.delete(oldest);
+    }
+    const source = ctx.createBufferSource();
+    const pcm = renderCue(cue, volume);
+    const buffer = ctx.createBuffer(1, pcm.length, SOUND_RATE);
+    buffer.copyToChannel(pcm, 0);
+    source.buffer = buffer;
+    source.connect(this.output!);
+    source.onended = () => { source.disconnect(); this.cues.delete(source); };
+    this.cues.set(source, cue);
+    source.start();
   }
 
   // ---------------------------------------------------------------- events
@@ -485,6 +522,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     const ctx: SinkAudioContext = new AudioContext({ latencyHint: "interactive" });
     this.ctx = ctx;
     this.master = ctx.createGain();
+    this.output = ctx.createGain();
+    this.master.connect(this.output);
     this.applyMasterGain();
     this.routeOutput();
     if (!this.resumeBound) {
@@ -504,10 +543,10 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     this.master.gain.setTargetAtTime(target, this.ctx.currentTime, 0.015);
   }
 
-  /** Connects master -> device. Uses AudioContext.setSinkId when available, else an <audio> element. */
+  /** Connects the shared voice/cue bus to the device, with a media-element sink fallback. */
   private routeOutput(): void {
     const ctx = this.ctx;
-    const master = this.master;
+    const master = this.output;
     if (!ctx || !master) return;
     master.disconnect();
     const id = this.outputDeviceId;
@@ -578,6 +617,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
   setDeafened(deafened: boolean): void {
     this.deafened = deafened;
+    if (deafened) for (const [source, cue] of this.cues) if (!CONTROL_CUES.has(cue)) { source.stop(); this.cues.delete(source); }
     this.applyTrackEnabled();
     this.applyMasterGain();
   }

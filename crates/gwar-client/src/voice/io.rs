@@ -225,6 +225,7 @@ fn open_output(
     mut speaker_rx: Consumer<f32>,
     timing: Arc<OutputTiming>,
     on_issue: Option<IssueSink>,
+    silence: Vec<Arc<AtomicBool>>,
 ) -> Result<cpal::Stream> {
     let device = match name.and_then(|n| find(host.output_devices(), n)) {
         Some(device) => device,
@@ -244,8 +245,9 @@ fn open_output(
                 to_device.process(&[sample], |s| pending.push(s));
             }
             let take = pending.len().min(frames);
+            let silent = silence.iter().any(|s| s.load(Ordering::Relaxed));
             for (i, frame) in data.chunks_mut(channels).enumerate() {
-                frame.fill(if i < take { pending[i] } else { 0.0 });
+                frame.fill(if !silent && i < take { pending[i] } else { 0.0 });
             }
             pending.drain(..take);
             timing.report(
@@ -265,6 +267,44 @@ fn open_output(
     Ok(stream)
 }
 
+/// Outside a call, play a short cue on the chosen output without ever opening the microphone.
+/// The counter bounds this to two workers/streams; bursts are dropped, never queued.
+pub fn play_cue(output: Option<String>, samples: Vec<f32>, busy: Arc<AtomicUsize>, silence: Vec<Arc<AtomicBool>>) {
+    if busy.fetch_add(1, Ordering::AcqRel) >= 2 {
+        busy.fetch_sub(1, Ordering::Release);
+        return;
+    }
+    let release = busy.clone();
+    let result = thread::Builder::new().name("gwar-cue-output".into()).spawn(move || {
+        struct Release(Arc<AtomicUsize>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Release);
+            }
+        }
+        let _release = Release(release);
+        let (mut tx, rx) = RingBuffer::new(samples.len().max(1));
+        for sample in samples {
+            let _ = tx.push(sample);
+        }
+        let timing = Arc::new(OutputTiming::default());
+        match open_output(&cpal::default_host(), output.as_deref(), rx, timing, None, silence) {
+            Ok(_stream) => {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while tx.slots() < tx.buffer().capacity() && Instant::now() < deadline {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                // The last callback still has to reach the device.
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) => tracing::debug!("sound cue output unavailable: {e:#}"),
+        }
+    });
+    if result.is_err() {
+        busy.fetch_sub(1, Ordering::Release);
+    }
+}
+
 impl AudioIo for DeviceIo {
     fn open(self: Box<Self>) -> Result<AudioPorts> {
         let (mic_tx, mic) = RingBuffer::<CaptureSample>::new(RATE as usize); // 1 s
@@ -282,7 +322,8 @@ impl AudioIo for DeviceIo {
                 }
             };
             let input = open_input(&host, self.input.as_deref(), mic_tx, timing.clone(), self.on_issue.clone());
-            let output = open_output(&host, self.output.as_deref(), speaker_rx, timing, self.on_issue.clone());
+            let output =
+                open_output(&host, self.output.as_deref(), speaker_rx, timing, self.on_issue.clone(), Vec::new());
             if let (Err(i), Err(o)) = (&input, &output) {
                 // A denied microphone stays recognisable for the caller (see `permission::is_denied`).
                 let error = if permission::is_denied(i) {

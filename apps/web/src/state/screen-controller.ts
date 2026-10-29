@@ -116,6 +116,7 @@ export class ScreenController {
   constructor(
     private readonly link: () => Link | null,
     private readonly describe: (e: unknown) => string,
+    private readonly unexpectedStop: () => void = () => {},
   ) {}
 
   /** Ends my share locally when I leave or change my voice channel; the server ends it too (`left`). */
@@ -152,7 +153,7 @@ export class ScreenController {
         const track = stream.getVideoTracks()[0];
         if (!track || own?.attempt !== attempt || own.phase !== "picking") { stopStream(stream); return; }
         // The browser's own "Stop sharing", or the shared window closing.
-        track.addEventListener("ended", () => { if (useScreen.getState().own?.attempt === attempt) void this.stopShare(); });
+        track.addEventListener("ended", () => { if (useScreen.getState().own?.attempt === attempt) void this.stopShare(true); });
         dispatch({ type: "picked", attempt, stream, surface: surfaceOf(track) });
         dispatch({ type: "choose", spec: resolveQuality(useSettings.getState(), surfaceOf(track)) });
       },
@@ -256,19 +257,19 @@ export class ScreenController {
     if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
     const publisher = new ScreenPublisher({
       track, quality: latest(), legacy: !screenSpec, av1: hardwareAv1, automaticMode: useSettings.getState().screenMode === null, iceServers: s.iceServers,
-      ended: () => { if (this.publisher === publisher) void this.stopShare(); },
+      ended: () => { if (this.publisher === publisher) void this.stopShare(true); },
       surfaceChanged: (surface, spec) => {
         if (current()) dispatch({ type: "surface", attempt, surface, spec });
       },
       offer: async body => (await conn.request("screen.publish.offer", { share, ...body }, { timeoutMs: 35_000 })).sdp,
       state: state => {
         if (state !== "failed" || this.publisher !== publisher) return;
-        void this.stopShare();
+        void this.stopShare(true);
         useUi.getState().toast("error", tNow("screen.stopped.transport"));
       },
       encodeFailed: () => {
         if (this.publisher !== publisher) return;
-        void this.stopShare();
+        void this.stopShare(true);
         useUi.getState().toast("error", tNow("screen.stopped.encoder"));
       },
     });
@@ -277,14 +278,15 @@ export class ScreenController {
       await publisher.start();
     } catch (e) {
       if (this.publisher !== publisher) return;
-      void this.stopShare();
+      void this.stopShare(true);
       useUi.getState().toast("error", this.describe(e));
     }
   }
 
   /** Stops my share (or closes the quality menu): locally at once, then on the server. */
-  async stopShare(): Promise<void> {
+  async stopShare(unexpected = false): Promise<void> {
     const own = useScreen.getState().own;
+    if (unexpected && own?.share) this.unexpectedStop();
     const conn = this.link();
     this.endOwn();
     if (own?.share && conn) await conn.request("screen.stop", { share: own.share }).catch(() => {});
@@ -606,7 +608,7 @@ export class ScreenController {
         if (publisher && useScreen.getState().own?.share === event.d.share) void publisher.recover(event.d).catch((e: unknown) => {
           if (this.publisher !== publisher || useScreen.getState().own?.share !== event.d.share) return;
           console.warn("Screen recovery:", e);
-          void this.stopShare();
+          void this.stopShare(true);
           useUi.getState().toast("error", tNow("screen.stopped.transport"));
         });
         return;
@@ -651,6 +653,7 @@ export class ScreenController {
         if (reason !== "access" && reason !== "codec") dispatch({ type: "link", share, active: false });
         const own = useScreen.getState().own;
         if (own?.share === share) {
+          if (reason !== "left") this.unexpectedStop();
           this.endOwn();
           const text = this.ownStopText(reason, by);
           if (text) useUi.getState().toast(reason === "moderator" ? "info" : "error", text);

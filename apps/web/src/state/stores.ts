@@ -111,7 +111,7 @@ export type Section = "home" | "servers" | "settings" | "bugReport";
 /** Phones show one page of the server section at a time (see `pane`). */
 export type ServerPane = "list" | "chat" | "members";
 
-export type SettingsTab = "audio" | "notifications" | "appearance" | "identity" | "account" | "language";
+export type SettingsTab = "audio" | "notifications" | "sounds" | "appearance" | "identity" | "account" | "language";
 /** The settings tabs the rail's account avatar stands for; the gear stands for the rest. */
 export const profileTabs: readonly SettingsTab[] = ["identity", "account"];
 export type ServerSettingsTab = "overview" | "roles" | "members" | "ownership" | "cleanup" | "bans" | "invites";

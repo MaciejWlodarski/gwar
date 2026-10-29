@@ -616,11 +616,13 @@ describe("sharing", () => {
   it("stops a share whose encoder never produced a frame, with one toast, and ignores an old publisher", async () => {
     useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
     const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
-    const screen = new ScreenController(() => link, String), t = choosing();
+    const unexpected = vi.fn();
+    const screen = new ScreenController(() => link, String, unexpected), t = choosing();
     await screen.confirmShare();
     const publisher = media.publishers[0]!;
     publisher.params.encodeFailed(); await flush();
     expect(useScreen.getState().own).toBeNull();
+    expect(unexpected).toHaveBeenCalledOnce();
     expect(t.stop).toHaveBeenCalledTimes(1);
     expect(publisher.close).toHaveBeenCalledTimes(1);
     expect(calls.filter(([op]) => op === "screen.stop")).toEqual([["screen.stop", { share: "M" }]]);
@@ -630,6 +632,7 @@ describe("sharing", () => {
     expect(useScreen.getState().own?.share).toBe("M");
     expect(toast).toHaveBeenCalledTimes(1);
     await screen.stopShare();
+    expect(unexpected).toHaveBeenCalledOnce();
   });
 
   it.each(["modern", "legacy", "unsupported"])("sends all quality choices safely to a %s server", async server => {

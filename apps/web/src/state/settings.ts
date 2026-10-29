@@ -1,3 +1,4 @@
+import { defaultSounds, readSounds, type SoundCue, type SoundSettings } from "../sound/catalog";
 import { defaultQuality, migrateQuality, type QualitySettings } from "../voice/screen-quality";
 import { serverKey } from "../lib/server-key";
 import { useMemo } from "react";
@@ -262,6 +263,7 @@ export interface SettingsState extends QualitySettings {
   audio: AudioSettings;
   desktop: DesktopSettings;
   notifications: NotificationSettings;
+  sounds: SoundSettings;
   /** Per-user playback volume 0..2 keyed by uid. */
   userVolumes: Record<string, number>;
   bookmarks: Bookmark[];
@@ -292,6 +294,8 @@ export interface SettingsState extends QualitySettings {
   setAudio(patch: Partial<AudioSettings>): void;
   setDesktop(patch: Partial<DesktopSettings>): void;
   setNotifications(patch: Partial<NotificationSettings>): void;
+  setSounds(patch: Partial<Omit<SoundSettings, "events">>): void;
+  setSoundEvent(cue: SoundCue, enabled: boolean): void;
   setUserVolume(uid: string, volume: number): void;
   saveBookmark(bookmark: BookmarkInput): void;
   removeBookmark(id: string): void;
@@ -350,6 +354,7 @@ export const useSettings = create<SettingsState>()(
       audio: defaultAudio,
       desktop: defaultDesktop,
       notifications: defaultNotifications,
+      sounds: defaultSounds,
       userVolumes: {},
       bookmarks: [],
       removedBookmarks: {},
@@ -369,6 +374,8 @@ export const useSettings = create<SettingsState>()(
       setMembersOpen: (membersOpen) => set({ membersOpen }),
       setAudio: (patch) => set((s) => ({ audio: { ...s.audio, ...patch } })),
       setDesktop: (patch) => set((s) => ({ desktop: { ...s.desktop, ...patch } })),
+      setSounds: (patch) => set((s) => ({ sounds: readSounds({ ...s.sounds, ...patch }) })),
+      setSoundEvent: (cue, enabled) => set((s) => ({ sounds: { ...s.sounds, events: { ...s.sounds.events, [cue]: enabled } } })),
       setNotifications: (patch) => set((s) => ({ notifications: { ...s.notifications, ...patch } })),
       setUserVolume: (uid, volume) =>
         set((s) => {
@@ -478,11 +485,16 @@ export const useSettings = create<SettingsState>()(
       version: SETTINGS_VERSION,
       // zustand's default storage (`window.localStorage`), guarded.
       storage: createJSONStorage(() => guardedLocalStorage(window.localStorage)),
-      migrate: (persisted) => migrateQuality((persisted ?? {}) as Record<string, unknown>),
+      migrate: (persisted, version) => {
+        const p = migrateQuality((persisted ?? {}) as Record<string, unknown>);
+        // v3 adds device-local sound preferences; existing settings are kept whole.
+        return version < 3 ? { ...p, sounds: readSounds(p.sounds) } : p;
+      },
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
         return { ...current, ...p, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
+          sounds: readSounds(p.sounds),
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,
           serverGroups: validGroups(p.serverGroups),
