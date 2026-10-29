@@ -269,6 +269,11 @@ pub fn ingress_ceiling(cap: u64) -> u64 {
     room(RESUME_HEADROOM * ingress::BYTE_HEADROOM * cap as f64, frame) as u64
 }
 
+/// The estimate whose `PLAN` carries a `keyframe` within the deadline, and nothing else.
+pub fn keyframe_room(keyframe: usize) -> u64 {
+    room(0.0, keyframe) as u64
+}
+
 /// The estimate whose `PLAN` carries `average` with a `keyframe` within the deadline.
 fn room(average: f64, keyframe: usize) -> f64 {
     average.max(keyframe as f64 * 8.0 / DEADLINE.as_secs_f64()) / PLAN

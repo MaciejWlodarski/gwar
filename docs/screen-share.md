@@ -1959,7 +1959,7 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   its voice met at most 68 ms of queue, 50 ms or more for at most 540 ms (one
   run; the others stayed under 50 ms), and nothing afterwards
   (`full_voice_headroom_matrix`, which bounds it to the bottleneck's queue
-  for under a second). Retries no longer start there ("Retry"). Room
+  for under a second). Automatic retries start lower ("Retry"). Room
   for the keyframe within half the deadline doubled the overshoot; over 384
   seeded runs it paused a lossy 5 Mbps viewer's 3 Mbps share 20 times, against
   never with the deadline, and 4–5 times from a cold start.
@@ -1973,11 +1973,15 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   it. Refreshed every allocation tick while a slot carries media past its
   ramp, with none paused for bandwidth, that is the transport's proven
   estimate. A bandwidth pause forgets it, and the estimate the previous
-  transport left. When the transport ends, the server keeps its proven estimate
+  transport left, unless the pause only handed the room to a more important
+  share (trigger `priority`), which says nothing about the link. When the
+  transport ends, the server keeps its proven estimate
   in memory for 10 minutes (at most 4096, the oldest dropped first), keyed by
   the session's connection rather than its session id. A transport that was
   paused for bandwidth and proved nothing after the pause removes the
-  connection's entry instead. A transport that never carried anything leaves
+  connection's entry instead. One that ended within the ramp of a start from
+  the remembered estimate keeps no more than its own estimate then, which TWCC
+  may already have lowered. A transport that never started anything leaves
   it. That connection's next watch transport (a new `run`) starts from the
   higher of it, at most the share's ingress ceiling, and the share's start
   estimate. A new connection starts without it,
@@ -2022,39 +2026,77 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   continuous-fit timer to be running.
 
   A retry restarts the estimator, with a fresh 10 s ramp, at
-  `min(start, max(1.5 × shown, 2.5 Mbps))`. Here `shown` is what the link
-  showed it carries at the viewer's last bandwidth pause (as for proven
-  estimates), `start` is the optimistic start above, and 2.5 Mbps is where
-  every fresh watch transport starts. Retrying from the whole start, as
+  `min(start, max(1.5 × sent, 2.5 Mbps))`. Here `sent` is what the transport
+  sent (media, repairs and probes) over the 10 s before the viewer's last
+  bandwidth pause, `start` is the optimistic start above, and 2.5 Mbps is
+  where every fresh watch transport starts. The retry's release `B` is then
+  at most 1.2 times what the link delivered. Retrying from the whole start, as
   #190 first did, flooded a permanently slow viewer's downlink every
   2 minutes at most, for good. A 2 Mbps viewer of an 8 Mbps share starts at
   12 Mbps, and in the simulator, voice on that link met 50 ms or more of
-  queue for 380–600 ms around each retry, up to the full 100 ms. A 500 kb/s
-  text share with 300 KB keyframes starts at 7.5 Mbps, whose admission takes
-  the keyframe in whole, and a 2–3 Mbps viewer's voice met the full queue for
-  300–400 ms at every retry. A step above what the link carried overruns a
-  still-slow link by at most half its rate (above 2.5 Mbps) until TWCC backs
-  off. The
-  keyframe that does not fit is refused at admission rather than sent. The
-  same retries now keep voice under 16 ms of queue
-  (`a_slow_viewer_pauses_cleanly_and_recovers_once_its_link_improves`,
-  `a_keyframe_dominated_share_on_a_slow_link_spares_voice_after_its_join`,
-  `keyframes_overflowing_admission_pause_a_3_mbps_viewer_and_its_retries_back_off`).
+  queue for 380–600 ms around each retry, up to the full 100 ms. A step of
+  1.5 times the estimate instead (#194's first version) still put a 6 Mbps
+  viewer's voice at 50 ms or more for 300–370 ms per retry: TWCC's estimate
+  sat about 13% above that link, and the step over it was 1.7 times the
+  link. The keyframe that does not fit is refused at admission rather than
+  sent.
 
-  A link that recovered grows from the step on its own TWCC feedback within
-  the ramp. In the simulator a 2 Mbps viewer whose link went to 50 Mbps kept
-  its 8 Mbps share from the retry running when the link improved, and the
-  text share came back 12–15 s after the link improved. Should the estimate
-  not grow by itself, the next pause shows how far the link carried the retry. A retry whose `shown` reached its
-  start was carried in full: it is no failure, `n` goes back to zero, and the
-  next retry comes 15 s later, 1.5 times higher. A retry that fell short
-  counts as failed, and the next one starts from what the link carried.
+  The next bandwidth pause judges the retry. `shown` is what the link showed
+  it carries (as for proven estimates: the estimate, at most 1.5 × `sent`).
+  - **Carried in full**: `shown` reached the retry's actual start. It is no
+    failure: `n` goes back to zero, and the next retry comes 15 s later, 1.5 ×
+    `sent` higher.
+  - **Inconclusive**: the estimate held at the start, but so little was sent
+    that 1.5 × `sent` would not even reach the start again. The share did not
+    fit the SFU's own admission at that estimate (a 250 KB keyframe needs
+    6.25 Mbps), or it was quiet: the link was not tested. It does not count,
+    `sent` is not stepped from, and the next retry comes 15 s after this one
+    started, at least 1.5 times its start and with room for the share's
+    largest keyframe within the deadline (`K × 8 / 400 ms / 0.8`). That one
+    sends what this one could not. An inconclusive retry that already started
+    at the share's whole start has nowhere higher to go and counts as failed.
+  - **Failed** otherwise: the estimate fell below the start, so the link
+    pushed back, or the link carried less than the start. It counts, and the
+    next retry steps up from `sent` but no higher than this one's start.
+
+  This keeps the ladder climbing even if the estimator never grows on its
+  own, as on 2026-10-28: an inconclusive retry is followed by one that admits
+  the keyframe, and each retry carried in full by one a step higher. In the
+  simulator, with TWCC estimates above each restart's ignored once the link
+  went from 2 to 50 Mbps, an 8 Mbps share with 250 KB keyframes came back
+  86 s after the repair (after 40 s at 2 Mbps) and 159 s after it (after
+  300 s at 2 Mbps, with the pending retry 98 s away)
+  (`a_keyframe_dominated_share_recovers_even_if_its_estimator_never_grows`).
+  Before inconclusive retries, each retry the keyframe could not enter
+  counted as failed and set the step to what its probes carried: after five
+  retries on 4–5 Mbps links, 81–83 kbps, with the backoff at 120 s.
+
+  The cost falls on a link that carries a retry from 2.5 Mbps but not the
+  share's keyframe. On a 3 Mbps link, a 500 kb/s text share with 300 KB
+  keyframes alternates: a retry from 2.5 Mbps (inconclusive, voice under
+  10 ms of queue), then one at the keyframe's room, 7.5 Mbps, whose keyframe
+  meets the link: voice met 50 ms or more of queue for 370 ms of it, up to
+  the full 100 ms. Those fail and back off, so that is once per 30 s, 60 s,
+  then 120 s, plus 15 s. With 204 KB keyframes it was 30–50 ms at up to
+  55 ms. At 2 Mbps the link pushes back on every retry from 2.5 Mbps, and
+  voice stayed under 16 ms of queue throughout; so did it on 4–7 Mbps links
+  with an 8 Mbps share (`a_slow_viewer_pauses_cleanly_and_recovers_once_its_link_improves`,
+  `a_keyframe_dominated_share_on_a_slow_link_bounds_voice_after_its_join`,
+  `keyframes_overflowing_admission_pause_a_3_mbps_viewer_and_its_retries_back_off`,
+  `a_retry_the_link_carried_in_full_steps_up_without_backing_off`).
+
+  A link that recovered usually grows from the step on its own TWCC feedback
+  within the ramp. In the simulator a 2 Mbps viewer whose link went to
+  50 Mbps kept its 8 Mbps share from the retry running when the link
+  improved, and the text share came back within 15 s of the link improving.
   Retries never stop: past 120 s each one costs a still-slow link no more
-  than this step. The count also goes back to zero after 60 s of unbroken
-  flow: some slot carrying media and none paused for bandwidth. Any
-  bandwidth pause, or a retry, restarts that minute, so a resume after a long
-  pause does not forget earlier failures. The continuous-fit resume still
-  applies, and may come first.
+  than its step, or the keyframe as above. The count also goes back to zero
+  after 60 s of unbroken flow: some slot carrying media and none paused for
+  bandwidth. Any bandwidth pause, or a retry, restarts that minute, so a
+  resume after a long pause does not forget earlier failures. The
+  continuous-fit resume still applies, and may come first. A pause that
+  hands the room to a more important share (trigger `priority`) judges no
+  retry and keeps the step.
 
   A retry's ramp is kept, not cut short on a falling estimate. Once TWCC has
   backed off, the SFU releases no more than `B` below the new estimate, so the
@@ -2098,9 +2140,11 @@ emit 204 KB keyframes every 2 s:
   is paused, no packet is dropped, and each keyframe leaves the SFU within
   `K ÷ B` plus 30 ms.
 - **Admission overflow.** A 3 Mbps viewer: the keyframes fail at admission,
-  the viewer is paused within two keyframes, and its retries back off (15,
-  30, 60 s), each paused again within its ramp, with voice on the link never
-  meeting 50 ms of queue.
+  the viewer is paused within two keyframes, and each retry from 2.5 Mbps
+  (15 s, then 30 s after a failure) is followed 15 s after its start by one
+  with room for the keyframe. Each pauses again within its ramp. Voice on the
+  link never meets 50 ms of queue on the first kind, and for under 500 ms on
+  the second.
 - **Deadline expiry.** A 6 Mbps viewer whose stage share takes 3 Mbps: the
   204 KB keyframe fits the 240 KB admission bound but gets only about
   1.8 Mbps, so it expires at the deadline. The average trigger stays below
@@ -2162,7 +2206,9 @@ viewer's estimate fell to 145 kbps. It now starts optimistically, without a
 single drop
 (`an_optimistic_start_gives_a_fast_viewer_the_whole_share_at_once`); a
 paused viewer recovers by retry
-(`a_slow_viewer_pauses_cleanly_and_recovers_once_its_link_improves`); a slow
+(`a_slow_viewer_pauses_cleanly_and_recovers_once_its_link_improves`), even
+if its estimator never grows on its own
+(`a_keyframe_dominated_share_recovers_even_if_its_estimator_never_grows`); a slow
 viewer's pauses and keyframe requests leave a fast viewer of the same share
 untouched (`viewers_on_different_links_do_not_affect_each_other`). Why the
 production estimate did not grow during the first 12 s, as it does in the
