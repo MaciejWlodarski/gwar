@@ -88,6 +88,7 @@ export type ScreenAction =
   | { type: "ownEnded"; attempt: number }
   | { type: "notice"; notice: ScreenState["notice"] }
   | { type: "suspend" }
+  | { type: "recoverOwn" }
   | { type: "watchWaiting"; share: string }
   | { type: "watchReplaced"; id: number; share: string }
   | { type: "transport"; run: number; phase: TransportPhase }
@@ -157,7 +158,7 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
     case "viewers":
       return state.own?.share === action.share ? { ...state, own: { ...state.own, viewers: action.members, guests: action.guests } } : state;
     case "guestLink":
-      return state.own?.phase === "choosing" ? { ...state, own: { ...state.own, guestLink: action.on } } : state;
+      return state.own && (state.own.phase === "choosing" || (state.own.phase === "reconnecting" && !action.on)) ? { ...state, own: { ...state.own, guestLink: action.on } } : state;
     case "link": {
       const { [action.share]: _, ...rest } = state.links;
       return { ...state, links: action.active ? { ...rest, [action.share]: true } : rest,
@@ -169,10 +170,12 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       return state.own?.attempt === action.attempt ? { ...state, own: null } : state;
     case "notice":
       return { ...state, notice: action.notice };
-    case "suspend":
-      return { ...state, links: {}, own: state.own && ["starting", "live", "reconnecting"].includes(state.own.phase)
+    case "recoverOwn":
+      return { ...state, own: state.own && ["starting", "live", "reconnecting"].includes(state.own.phase)
         ? { ...state.own, phase: "reconnecting", share: null, viewers: 0, guests: 0,
-          guestLink: state.own.phase === "reconnecting" ? state.own.guestLink : state.own.guestLink && !!state.own.share && !!state.links[state.own.share] } : state.own,
+          guestLink: state.own.phase === "reconnecting" ? state.own.guestLink : state.own.guestLink && !!state.own.share && !!state.links[state.own.share] } : state.own };
+    case "suspend":
+      return { ...reduceScreen(state, { type: "recoverOwn" }), links: {},
       transport: { ...state.transport, phase: "none" }, slots: emptySlots(), streams: emptySlots(),
       watches: state.watches.map(w => ({ share: w.share, id: w.id, slot: null, status: "requesting" })) };
     case "watchWaiting":

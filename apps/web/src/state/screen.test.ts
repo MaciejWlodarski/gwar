@@ -6,6 +6,14 @@ const run = (state: ScreenState, ...actions: ScreenAction[]) => actions.reduce(r
 const connected = (r = 7) => run(initialScreen, { type: "transport", run: r, phase: "connecting" }, { type: "transport", run: r, phase: "connected" });
 
 describe("own share", () => {
+  it("retains active watches and the enabled link choice when only publishing needs recovery", () => {
+    const s = run(connected(), { type: "watch", share: "other", id: 1 }, { type: "granted", run: 7, id: 1, slot: 0 },
+      { type: "pick", attempt: 1 }, { type: "picked", attempt: 1, stream, surface: "window" },
+      { type: "starting", attempt: 1 }, { type: "started", attempt: 1, share: "mine" }, { type: "link", share: "mine", active: true }, { type: "live", share: "mine" });
+    const recovering = run(s, { type: "recoverOwn" });
+    expect(recovering.own).toMatchObject({ phase: "reconnecting", stream, share: null, guestLink: true });
+    expect(recovering.watches).toBe(s.watches); expect(recovering.transport).toBe(s.transport); expect(recovering.streams).toBe(s.streams); expect(recovering.stage).toBe("other");
+  });
   it("goes picker → preset menu → starting → live, and ends", () => {
     let s = run(initialScreen, { type: "pick", attempt: 1 });
     expect(s.own?.phase).toBe("picking");

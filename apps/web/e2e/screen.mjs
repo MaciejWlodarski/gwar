@@ -361,6 +361,25 @@ async function reconnectAndScreenshots(cs, cv, viewers, chromiumTab) {
   await watch(cv, "cs-tab");
   await sees(cv, csShare, 1, "viewer is watching before the session interruption");
 
+  // Media can fail before signalling notices an outage. Retire only the failed publisher;
+  // the same capture republishes once the server releases its old share.
+  const beforeMediaLoss = csShare;
+  await session(cs, (_, screen, controller) => {
+    window.__captureBeforeMediaLoss = screen.own.stream;
+    controller.screen.publisher.params.state("failed");
+  });
+  await waitFor(async () => {
+    const id = await ownShare(cs);
+    if (!id || id === beforeMediaLoss) return false;
+    csShare = id; return true;
+  }, "media-first loss republishes the retained capture", 45_000);
+  assert.equal(await session(cs, (_, screen) => screen.own.stream === window.__captureBeforeMediaLoss && screen.own.stream.getVideoTracks()[0].readyState === "live"), true);
+  for (const viewer of viewers) {
+    await waitFor(() => session(viewer, (_, screen, __, id) => screen.watches.some(w => w.share === id && w.status === "watching"), csShare), "viewer resumes after publisher media loss", 45_000);
+    await sees(viewer, csShare, 1, "media-first recovery restores screen frames");
+  }
+  checks.push({ check: "media-first loss retains capture and resumes viewer watches", ok: true });
+
   // A short session interruption keeps the browser capture alive, republishes with the new
   // voice binding, and restores watches by identity even though the share ID changes.
   await session(cs, (_, screen) => { window.__captureBeforeReconnect = screen.own.stream; });
@@ -404,7 +423,8 @@ async function reconnectAndScreenshots(cs, cv, viewers, chromiumTab) {
     await share(cs, chromiumTab ? "Sharing a browser tab" : "Sharing your screen");
     await session(cs, (_, screen, controller) => {
       controller.screen.suspend();
-      screen.own.stream.getVideoTracks()[0].stop();
+      const track = screen.own.stream.getVideoTracks()[0];
+      track.stop(); track.dispatchEvent(new Event("ended"));
       controller.screen.resume();
     });
     await cs.evaluate(async () => {
@@ -431,11 +451,14 @@ async function reconnectAndScreenshots(cs, cv, viewers, chromiumTab) {
           });
           return { theme: document.documentElement.dataset.theme, left: bounds.left, right: bounds.right, height: bounds.height,
             textHeight: text.getBoundingClientRect().height, lineHeight: parseFloat(getComputedStyle(text).lineHeight),
-            closeRight: close.right, paddingRight: parseFloat(style.paddingRight), children };
+            closeRight: close.right, paddingRight: parseFloat(style.paddingRight), paddingY: parseFloat(style.paddingTop),
+            iconWidth: el.querySelector("svg").getBoundingClientRect().width, buttonHeight: el.querySelector("button").getBoundingClientRect().height, children };
         });
         assert.equal(layout.theme, "dark");
         assert.ok(layout.left >= 0 && layout.right <= width, "notice fits the viewport");
-        assert.ok(layout.height <= 46 && layout.textHeight <= layout.lineHeight + 1, "banner stays one compact row");
+        assert.equal(layout.height, 57, "banner uses the approved identity/expiry height");
+        assert.equal(layout.paddingY, 12); assert.equal(layout.iconWidth, 16); assert.equal(layout.buttonHeight, 32);
+        assert.ok(layout.textHeight <= layout.lineHeight + 1, "banner stays one row");
         assert.ok(Math.abs(layout.closeRight - (layout.right - layout.paddingRight)) <= 1, "close stays at the right edge");
         assert.ok(layout.children.every(c => c.overflow <= 1 && c.left >= layout.left && c.right <= layout.right), "no banner text wraps, truncates or overlaps actions");
         for (let n = 1; n < layout.children.length; n++) assert.ok(layout.children[n].left >= layout.children[n - 1].right, "banner controls do not overlap");
@@ -466,7 +489,7 @@ async function reconnectAndScreenshots(cs, cv, viewers, chromiumTab) {
       navigator.mediaDevices.getDisplayMedia = async () => { throw new DOMException("Permission denied by system", "NotAllowedError"); };
     });
     await session(cs, (_, __, controller) => controller.screen.beginShare());
-    await cs.getByText("Brak zgody na nagrywanie ekranu", { exact: true }).waitFor();
+    await cs.getByTestId("screen-notice").getByRole("button", { name: "Jak włączyć", exact: true }).waitFor();
     await captureNotice("permission", { text: "dla Google Chrome w Ustawieniach systemowych → Prywatność i ochrona → Nagrywanie ekranu", shortcut: false });
     // The same running web UI, with only the desktop platform marker enabled, shows
     // the Gwar name and settings action. No desktop app or OS settings are launched.
@@ -506,7 +529,7 @@ async function reconnectAndScreenshots(cs, cv, viewers, chromiumTab) {
     writeFileSync(path.join(directory, "screenshots.txt"), [
       "Real running Polish web app against a local loopback-only server.",
       "Default graphite/cyan dark theme; Polish; desktop 1440x900, tablet 768x1024, mobile 390x844 and 360x844 CSS pixels.",
-      "Each banner was measured as one compact row, with no overflow/overlap and the close button at the right edge; permission help dialogs fit every viewport.",
+      "Each banner uses the shared 57-pixel identity/expiry shell: 12-pixel vertical padding, visible 16-pixel icon, 32-pixel controls, one row, no overflow/overlap, and the close button at the right edge.",
       "Reconnect notice: actual capture ended during recovery; still present after 6.5 seconds.",
       "Permission notice: getDisplayMedia rejects with an OS-denied NotAllowedError.",
       "permission-desktop-shell and permission-windows-shell: browser-rendered platform/UA markers only; no native app or settings launched.",

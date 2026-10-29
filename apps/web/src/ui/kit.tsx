@@ -9,6 +9,7 @@ import {
   useId,
   useState,
   type ButtonHTMLAttributes,
+  type HTMLAttributes,
   type InputHTMLAttributes,
   type ReactElement,
   type ReactNode,
@@ -18,6 +19,11 @@ import { avatarColors, initials } from "../lib/color";
 import { cn } from "../lib/cn";
 import { useT } from "../i18n";
 import { useMemberAvatar } from "./ts-images";
+
+/** Shared shell for the identity, expiry and screen notices above the app. */
+export function TopBanner({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
+  return <div className={cn("flex shrink-0 items-center gap-1.5 border-b border-line bg-raised px-2 py-3 text-sm min-[800px]:gap-3 min-[800px]:px-4", className)} {...props} />;
+}
 
 /** Small radio-style toggle. Options may be disabled (with a tooltip-style title). */
 export function Segmented<T extends string>({

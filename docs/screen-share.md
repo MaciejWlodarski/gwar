@@ -3401,12 +3401,21 @@ the active recovery codec/rendition)
 survive only for this same capture; a new picker starts with fresh decisions.
 No bitrate estimate or transport state is carried into a new session.
 
+A failed publisher enters the same capture-retaining recovery even if signalling
+still reports online. Media may detect loss after five seconds while signalling
+takes 10–20 seconds. Only the publisher retires; healthy watches stay connected.
+Republishing waits for the server to retire the failed share or for session resync,
+and the 45-second deadline starts at the first media failure, without extension
+when signalling catches up. Moderation and explicit Stop cancel this recovery.
+
 Repeated blips before voice rejoin retain the original channel. Every explicit
 Leave cancels voice rejoin and stops capture, including online republishing before
 the new share ID exists. Manual voice actions supersede saved rejoin intent;
 definitive admission refusal clears it, while a lost connection preserves it.
-Browser Stop sharing
-is a quiet user stop even during recovery. A picker still open at the interruption
+Explicit Stop and Leave remain quiet. A capture track ending during recovery
+(for example, its window closing) instead shows the persistent restart notice;
+browser track termination does not distinguish that cause from browser Stop sharing.
+A picker still open at the interruption
 and an unconfirmed quality dialog are retained; confirmation while offline or
 waiting for the new voice binding queues publication. Unconfirmed choices still require confirmation. A changed
 or encrypted channel refuses publication and explains that sharing stopped.
@@ -3422,14 +3431,17 @@ whose return window expires receives an informational ended notice. Watch-transp
 failure instead uses bounded recovery/backoff and a connection error on exhaustion.
 Client identity is refreshed after a rewatch. Explicit Stop, moderation, lost
 access and incompatible codecs end watches normally. Password-channel watches
-wait for voice admission. Manual unwatch and reset cancel recovery.
+use effective channel permissions, including role/user and inherited overrides:
+outside-voice viewers with password bypass resume too; others wait for voice admission.
+Manual unwatch and reset cancel recovery.
 
 Capture and UI stop immediately on explicit Stop, while DTLS remains until its
 stop request settles so transport teardown cannot overtake the user's stop reason.
 Reset retires pending peers. Failed republishing or the 45-second recovery deadline
 leaves a persistent **Share again** notice and uses existing permitted desktop
 notifications. That action is disabled outside voice. No notification permission
-prompt opens during recovery.
+prompt opens during recovery. Installing a recovery or permission banner dismisses
+the superseded sticky screen-stopped toast.
 
 Picker refusal detection is intentionally limited to evidence in browser errors:
 
@@ -3444,7 +3456,9 @@ Picker refusal detection is intentionally limited to evidence in browser errors:
 Guidance names Gwar in the desktop shell and the detected browser on the web.
 macOS names System Settings → Privacy & Security → Screen Recording; Windows
 names Settings → Privacy & security; other systems get generic privacy guidance.
-All banners occupy one compact row, like the Connect expiry bar. Small screens
+Identity, expiry and screen banners share the same shell: 57 pixels tall, 12-pixel
+vertical padding, a visible icon at every width, and 32-pixel controls. Each stays
+on one row. Small screens
 use **Sharing stopped** and a compact sharing action. Permission and ambiguous
 refusal banners offer **How to fix**, opening a small dialog with the details.
 Only the macOS desktop permission dialog offers **Open settings**. Windows WebView2 picker/policy refusals

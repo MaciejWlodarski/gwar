@@ -100,7 +100,7 @@ describe("the desktop app", () => {
     expect(toast).not.toHaveBeenCalled();
   });
 
-  it("does not notify when the browser Stop sharing ends retained capture", async () => {
+  it.each([false, true])("notifies on lost retained capture unless explicitly stopped (Stop=%s)", async explicit => {
     useDesktopCapture.setState({ capture: "ok" });
     const source = Object.assign(new EventTarget(), { readyState: "live", stop: vi.fn(), getSettings: () => ({}) });
     const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
@@ -108,11 +108,13 @@ describe("the desktop app", () => {
     const screen = new ScreenController(() => null, String);
     screen.beginShare(); await flush();
     useScreen.setState({ own: { ...useScreen.getState().own!, phase: "live", share: "M" } });
-    screen.suspend(); source.readyState = "ended"; source.dispatchEvent(new Event("ended")); await flush();
+    screen.suspend();
+    if (explicit) await screen.stopShare();
+    source.readyState = "ended"; source.dispatchEvent(new Event("ended")); await flush();
     screen.resume();
     expect(useScreen.getState().own).toBeNull();
-    expect(useScreen.getState().notice).toBeNull();
-    expect(notify).not.toHaveBeenCalled();
+    expect(useScreen.getState().notice).toBe(explicit ? null : "reconnect");
+    expect(notify).toHaveBeenCalledTimes(explicit ? 0 : 1);
     screen.reset();
   });
 

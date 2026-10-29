@@ -20,7 +20,7 @@ import { useSession, useUi } from "../state/stores";
 import { type PublishStats } from "../voice/screen";
 import { HEIGHTS, FRAME_RATES, type ScreenSpec } from "../voice/screen-quality";
 import { useChannelPermission, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
-import { BackButton, Button, Dialog, IconButton, panelCard, TalkingAvatar, Tooltip } from "./kit";
+import { BackButton, Button, Dialog, IconButton, panelCard, TalkingAvatar, Tooltip, TopBanner } from "./kit";
 import { paneBack } from "./nav";
 
 // -------------------------------------------------------------------- start
@@ -91,20 +91,21 @@ function ScreenNoticeContent({ notice }: { notice: "reconnect" | "permission" | 
   const title = notice === "permissionHint" ? "screen.permissionHintTitle" : "screen.permissionTitle";
   return (
     <>
-      <div role={notice === "permissionHint" ? "status" : "alert"} data-testid="screen-notice" className="flex shrink-0 items-center gap-2 border-b border-line-strong bg-surface px-2 py-1.5 text-xs text-fg sm:px-4 md:text-sm">
-        <MonitorOff aria-hidden className={cn("hidden size-4 shrink-0 sm:block", notice === "permissionHint" ? "text-muted" : "text-danger")} />
-        <p data-testid="screen-notice-text" className="min-w-0 flex-1 whitespace-nowrap">
-          {notice === "reconnect" ? <><span className="md:hidden">{t("screen.reconnectStoppedShort")}</span><span className="hidden md:inline">{t("screen.reconnectStopped")}</span></> : t(title)}
+      <TopBanner role={notice === "permissionHint" ? "status" : "alert"} data-testid="screen-notice" className="text-fg">
+        <MonitorOff aria-hidden className={cn("size-4 shrink-0", notice === "permissionHint" ? "text-muted" : "text-danger")} />
+        <p data-testid="screen-notice-text" className="min-w-0 flex-1 text-[13px] whitespace-nowrap min-[800px]:text-sm">
+          <span className="min-[800px]:hidden">{t(notice === "reconnect" ? "screen.reconnectStoppedShort" : notice === "permissionHint" ? "screen.permissionHintShort" : "screen.permissionShort")}</span>
+          <span className="hidden min-[800px]:inline">{t(notice === "reconnect" ? "screen.reconnectStopped" : title)}</span>
         </p>
         {notice === "reconnect" ? (
-          <Button size="sm" className="h-7 whitespace-nowrap px-2 text-xs" variant="primary" aria-label={t("screen.shareAgain")} disabled={phase !== "online" || !!own || channel === null} onClick={() => controller.screen.beginShare()}>
-            <span className="min-[380px]:hidden">{t("screen.shareAgainShort")}</span><span className="hidden min-[380px]:inline">{t("screen.shareAgain")}</span>
+          <Button size="sm" className="whitespace-nowrap max-[799px]:px-2!" variant="primary" aria-label={t("screen.shareAgain")} disabled={phase !== "online" || !!own || channel === null} onClick={() => controller.screen.beginShare()}>
+            <span className="min-[800px]:hidden">{t("screen.shareAgainShort")}</span><span className="hidden min-[800px]:inline">{t("screen.shareAgain")}</span>
           </Button>
         ) : (
-          <Button size="sm" className="h-7 whitespace-nowrap px-2 text-xs" onClick={() => setHelp(true)}>{t(notice === "permissionHint" ? "screen.permissionHintFix" : "screen.permissionFix")}</Button>
+          <Button size="sm" className="whitespace-nowrap max-[799px]:px-2!" onClick={() => setHelp(true)}>{t(notice === "permissionHint" ? "screen.permissionHintFix" : "screen.permissionFix")}</Button>
         )}
-        <IconButton label={t("common.close")} size="sm" tooltip={false} onClick={() => useScreen.getState().dispatch({ type: "notice", notice: null })}><X className="size-4" /></IconButton>
-      </div>
+        <IconButton label={t("common.close")} tooltip={false} onClick={() => useScreen.getState().dispatch({ type: "notice", notice: null })}><X className="size-4" /></IconButton>
+      </TopBanner>
       {notice !== "reconnect" && <Dialog open={help} onOpenChange={setHelp} title={t(notice === "permissionHint" ? "screen.permissionHintFix" : "screen.permissionFix")} footer={
         canOpenScreenRecordingSettings() ? <Button onClick={() => void openScreenRecordingSettings().catch((e: unknown) => console.warn("[screen] privacy settings:", e))}>{t("screen.openSettings")}</Button> : undefined
       }>
