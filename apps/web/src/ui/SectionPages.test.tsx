@@ -7,7 +7,7 @@ import type { Channel } from "../proto/Channel";
 import type { Client } from "../proto/Client";
 import { initialState } from "../state/reducer";
 import { useSettings } from "../state/settings";
-import { useSession, useUi, type Section } from "../state/stores";
+import { useSession, useUi, useVoice, type Section } from "../state/stores";
 import { TooltipProvider } from "./kit";
 import { SectionRail } from "./SectionRail";
 import { SettingsSection } from "./Settings";
@@ -55,6 +55,7 @@ let root: Root, container: HTMLDivElement;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   mock.selectChannel.mockClear();
+  useVoice.setState({ state: "starting", reconnecting: false });
   useSettings.setState({ language: "en" });
   useUi.setState({ section: "servers", back: "servers", settingsTab: "audio", gearTab: "audio", overview: false, collapsed: {}, pane: "list", moreOpen: false, settingsDrill: false, dialog: { kind: "none" } });
   useSession.setState({ ...initialState, phase: "idle" });
@@ -193,7 +194,14 @@ describe("the voice pill", () => {
     await show("home");
     expect(pill()!.textContent).toContain("Connecting voice…");
     await act(async () => useSession.setState({ phase: "reconnecting" }));
-    expect(pill()!.textContent).toContain("Reconnecting…");
+    expect(pill()!.textContent).toContain("Reconnecting voice…");
+    await act(async () => {
+      useSession.setState({ phase: "online" });
+      useVoice.setState({ state: "failed", reconnecting: true });
+    });
+    expect(pill()!.textContent).toContain("Reconnecting voice…");
+    expect(pill()!.textContent).not.toContain("Voice unavailable");
+    await act(async () => useVoice.setState({ state: "starting", reconnecting: false }));
   });
 
   it("leads back to the voice channel in the server view, unfolded", async () => {

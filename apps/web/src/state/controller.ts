@@ -217,6 +217,12 @@ class Controller {
   private identityLoading: Promise<Identity> | null = null;
   private voiceRetry: ReturnType<typeof setTimeout> | null = null;
   private voiceRetries = 0;
+  private voiceErrorShown = false;
+  private restored = false;
+  private connectAttempt = 0;
+  private persistRequested = false;
+  private coldStartParams: ConnectParams | null = null;
+  private voiceAutoStart = true;
   private voiceRun = 0;
   private initialised = false;
   private loadingOlder = false;
@@ -258,7 +264,13 @@ class Controller {
     e.on("state", (state) => {
       useVoice.getState().set({ state });
       if (state === "failed") this.scheduleVoiceRetry();
-      if (state === "connected") this.voiceRetries = 0;
+      if (state === "connected") {
+        this.voiceRetries = 0;
+        this.voiceErrorShown = false;
+        if (this.voiceRetry) clearTimeout(this.voiceRetry);
+        this.voiceRetry = null;
+        useVoice.getState().set({ reconnecting: false });
+      }
     });
     e.on("micError", (micError) => useVoice.getState().set({ micError }));
     e.on("outputError", (error) => {
@@ -283,6 +295,8 @@ class Controller {
       echoCancellation: first.echoCancellation,
       autoGainControl: first.autoGainControl,
     });
+    e.setMuted(useVoice.getState().muted);
+    e.setDeafened(useVoice.getState().deafened);
     applyAudio();
     useSettings.subscribe((s, prev) => {
       const a = s.audio;
@@ -397,7 +411,10 @@ class Controller {
 
   async connect(params: ConnectParams): Promise<void> {
     this.init();
+    const attempt = this.connectAttempt + 1;
     await this.disconnect(true);
+    const check = () => { if (attempt !== this.connectAttempt) throw new ConnectionLostError(); };
+    check();
     const kind: ServerKind = params.kind ?? "gwar";
     const session = useSession.getState();
     let conn: Link;
@@ -408,6 +425,7 @@ class Controller {
       // Offers the official client's identities the first time; never fails or blocks the connection.
       // Imported on demand because it reaches back into the account state, which imports this module.
       await (await import("./ts-setup")).prepareTeamspeak();
+      check();
       session.dispatch({ type: "reset" });
       session.dispatch({ type: "phase", phase: "connecting" });
       session.setClose(null);
@@ -434,6 +452,7 @@ class Controller {
       try {
         identity = await this.getIdentity();
       } catch (e) {
+        check();
         session.dispatch({ type: "phase", phase: "idle" });
         throw new ConnectFailure(identityFailure(e), e instanceof Error ? e.message : String(e));
       }
@@ -450,6 +469,7 @@ class Controller {
         client: { name: "gwar-web", version: CLIENT_VERSION, platform: platform() },
       });
     }
+    check();
     this.conn = conn;
     this.connections++;
     // A later reconnect with these never replaces a pin: the acceptance was for this connection.
@@ -511,8 +531,9 @@ class Controller {
         this.sealedReady = start();
         await this.sealedReady;
       } else await conn.connect();
+      check();
     } catch (e) {
-      if (this.conn !== conn) throw e;
+      if (attempt !== this.connectAttempt) throw e;
       this.runtimeAbort?.abort(); this.runtimeAbort = null;
       this.conn = null;
       session.dispatch({ type: "reset" });
@@ -527,12 +548,33 @@ class Controller {
    * and remembers the server as a bookmark on success. Returns true on success.
    */
   async connectInteractive(params: ConnectParams, opts: { remember: boolean }): Promise<boolean> {
+    const state = useSession.getState();
+    if ((myChannelId(state) !== null || useScreen.getState().own !== null) &&
+        !sameServer(params, { kind: state.kind, address: state.address, insecureLan: params.insecureLan })) {
+      const source = this.conn;
+      const target = useSettings.getState().bookmarks.find(b => sameServer(b, params))?.name || params.address;
+      useUi.getState().openDialog({ kind: "confirm", title: tNow("server.switchTitle"),
+        body: tNow("server.switchBody", { from: state.server?.name || state.address, to: target }),
+        confirmLabel: tNow("server.switchConfirm"),
+        onConfirm: () => {
+          if (this.conn === source) void this.connectConfirmed(params, opts);
+          else void this.connectInteractive(params, opts);
+        },
+      });
+      return false;
+    }
+    return this.connectConfirmed(params, opts);
+  }
+
+  private async connectConfirmed(params: ConnectParams, opts: { remember: boolean }): Promise<boolean> {
     useUi.getState().landOnServer();
     const ui = useConnectUi.getState();
     ui.set({ busy: true, error: null });
+    const attempt = this.connectAttempt + 1;
     try {
       await this.connect(params);
     } catch (e) {
+      if (attempt !== this.connectAttempt) return false;
       if (e instanceof ConnectFailure) {
         if (e.identityChange) this.confirmServerChange(e.identityChange, params, opts);
         // With an invite the server says "wrong password" when the invite is no good (and there is a password).
@@ -548,6 +590,7 @@ class Controller {
       }
       return false;
     }
+    if (attempt !== this.connectAttempt) return false;
     ui.set({ busy: false, error: null, needPassword: false, serverName: null, invite: null });
     const settings = useSettings.getState();
     const kind: ServerKind = params.kind ?? "gwar";
@@ -569,6 +612,52 @@ class Controller {
     return true;
   }
 
+  private rememberConnection(params: ConnectParams, name: string): void {
+    const settings = useSettings.getState();
+    settings.setResumeConnection({ address: params.address, kind: params.kind ?? "gwar", name: name || params.address,
+      password: params.password, identity: params.identity, insecureLan: params.insecureLan });
+    settings.setLast(params.address, params.kind ?? "gwar");
+    if (!this.persistRequested) {
+      this.persistRequested = true;
+      // Storage persistence is best effort; neither refusal nor a missing API affects connecting.
+      try { void navigator.storage?.persist?.().catch(() => {}); } catch { /* unavailable in this webview */ }
+    }
+  }
+
+  /** Once per page, before its first paint. Invites always take precedence. */
+  async restoreSession(): Promise<void> {
+    if (this.restored) return;
+    this.restored = true;
+    const settings = useSettings.getState();
+    const saved = settings.resumeConnection;
+    const update = settings.updateVoiceResume;
+    settings.setUpdateVoiceResume(null); // consume even an expired/failed update intent
+    if (!saved || useConnectUi.getState().invite || this.conn || useConnectUi.getState().busy) return;
+    const resume = update && sameServer(saved, update) && update.version === CLIENT_VERSION && update.expiresAt > Date.now() ? update : null;
+    this.coldStartParams = resume ? null : saved;
+    useConnectUi.getState().set({ restoring: true });
+    try {
+      const ok = await this.connectInteractive(saved, { remember: false });
+      if (ok && resume && useSettings.getState().resumeConnection?.address === saved.address) {
+        if (resume.password) this.channelPasswords.set(resume.channel, resume.password);
+        if (myChannelId(useSession.getState()) !== resume.channel) await this.rejoinVoice(resume.channel);
+      }
+    } finally {
+      this.coldStartParams = null;
+      useConnectUi.getState().set({ restoring: false });
+    }
+  }
+
+  /** Written before installation (Windows may exit inside install), rolled back on failure. */
+  prepareUpdateRestart(version: string): () => void {
+    const channel = myChannelId(useSession.getState());
+    const { address, kind } = useSession.getState();
+    useSettings.getState().setUpdateVoiceResume(this.conn?.isOnline && this.voiceAutoStart && channel !== null ? {
+      address, kind, version, channel, password: this.channelPasswords.get(channel), expiresAt: Date.now() + 5 * 60_000,
+    } : null);
+    return () => useSettings.getState().setUpdateVoiceResume(null);
+  }
+
   private confirmServerChange(change: ServerIdentityChanged, params: ConnectParams, opts: { remember: boolean }): void {
     useUi.getState().openDialog({
       kind: "confirm", title: tNow("security.changedTitle"),
@@ -586,12 +675,14 @@ class Controller {
 
   private wire(conn: Link, params: ConnectParams): void {
     const session = useSession.getState();
+    this.voiceAutoStart = params !== this.coldStartParams || params == null;
     session.setRtt(null);
     conn.onRtt?.((ms) => {
       if (this.conn === conn) session.setRtt(Math.round(ms));
     });
     conn.onWelcome((welcome, resync) => {
       if (this.conn !== conn) return;
+      if (params) this.rememberConnection(params, welcome.server.name);
       // A new session: shares and watches of the one before ended with it.
       this.screen.reset();
       this.entered.clear();
@@ -617,7 +708,7 @@ class Controller {
       if (myCh !== null) {
         // TeamSpeak servers always have me in a channel; Gwar servers start me outside voice.
         this.entered.add(myCh);
-        void this.startVoice();
+        if (this.voiceAutoStart) void this.startVoice();
         // A returning TeamSpeak client lands in the default channel: go back, like TeamSpeak's own client.
         if (resync && this.rejoin !== null && this.rejoin !== myCh) void this.rejoinVoice(this.rejoin);
       } else if (resync && this.rejoin !== null) {
@@ -691,9 +782,11 @@ class Controller {
         const b = state.me === null ? null : state.clients[state.me.session]?.voice_binding;
         return b && b.call === event.d.call && b.participation === event.d.participation && b.run === event.d.run;
       })()) {
-        useUi.getState().toast("info", tNow("voice.closed"));
-        if (event.d.reason === "transport_failed") this.scheduleVoiceRetry(1000);
-        else void this.stopVoice();
+        if (event.d.reason === "transport_failed") this.voiceFailure(tNow("voice.closed"));
+        else {
+          useUi.getState().toast("info", tNow("voice.closed"));
+          void this.stopVoice();
+        }
       }
       if (event.ev === "channel.deleted" || event.ev === "channel.hidden") {
         const ui = useUi.getState(), ch = event.d.channel, state = useSession.getState();
@@ -724,7 +817,7 @@ class Controller {
           session.setRtt(null);
           this.nativeFiles(null);
           // A new session starts outside voice: remember where to go back to.
-          this.rejoin ??= myChannelId(useSession.getState());
+          if (this.voiceAutoStart) this.rejoin ??= myChannelId(useSession.getState());
           session.dispatch({ type: "phase", phase: "reconnecting" });
           this.screen.reset();
           void this.stopVoice();
@@ -750,11 +843,18 @@ class Controller {
   }
 
   async disconnect(silent = false): Promise<void> {
+    const attempt = ++this.connectAttempt;
+    this.connections++;
+    if (!silent) {
+      useSettings.getState().setResumeConnection(null);
+      useSettings.getState().setUpdateVoiceResume(null);
+      useConnectUi.getState().set({ restoring: false, busy: false });
+    }
     const conn = this.conn;
     this.conn = null;
     conn?.close();
     await this.teardown();
-    if (!silent) useSession.getState().setClose({ kind: "user" });
+    if (!silent && attempt === this.connectAttempt) useSession.getState().setClose({ kind: "user" });
   }
 
   /** Every welcome (a resync too) starts a new native file session; file work of an older one is refused. */
@@ -772,6 +872,11 @@ class Controller {
     const generation = this.connections;
     // Media and the call's keys stop first, synchronously: never after the
     // device lease is released by the runtime's close below.
+    if (this.voiceRetry) clearTimeout(this.voiceRetry);
+    this.voiceRetry = null;
+    this.voiceRetries = 0;
+    this.voiceErrorShown = false;
+    useVoice.getState().set({ reconnecting: false });
     this.voiceRun++;
     this.endVoiceCall();
     this.screen.reset();
@@ -786,8 +891,6 @@ class Controller {
     if (this.connections !== generation) return;
     await this.nativeFiles(null);
     if (this.connections !== generation) return;
-    if (this.voiceRetry) clearTimeout(this.voiceRetry);
-    this.voiceRetry = null;
     if (this.readTimer) clearTimeout(this.readTimer);
     this.readTimer = null;
     this.rejoin = null;
@@ -878,6 +981,7 @@ class Controller {
     const conn = this.conn;
     // Nothing to do (and no microphone prompt) while I am only on the server.
     if (!conn || myChannelId(useSession.getState()) === null) return;
+    this.voiceAutoStart = true;
     const state = useSession.getState();
     const channel = myChannelId(state)!;
     const encrypted = !!state.channels[channel]?.encrypted;
@@ -901,7 +1005,7 @@ class Controller {
         if (!current()) return;
         // "Voice unavailable" with Retry: a transient probe failure can be retried.
         useVoice.getState().set({ state: "failed" });
-        useUi.getState().toast("info", refusal); return;
+        this.voiceFailure(refusal); return;
       }
       try {
         keys = await this.encryptedCall(conn, channel, participation!, own.id, current);
@@ -919,7 +1023,7 @@ class Controller {
       } catch (e) {
         if (!current()) return;
         useVoice.getState().set({ state: "failed" });
-        useUi.getState().toast("error", e instanceof VoiceError ? describeVoiceError(e) : describeRequestError(e));
+        this.voiceFailure(e instanceof VoiceError ? describeVoiceError(e) : describeRequestError(e));
         return;
       }
       if (!current()) return;
@@ -944,7 +1048,7 @@ class Controller {
     } catch (e) {
       if (!current()) return;
       const msg = e instanceof VoiceError ? describeVoiceError(e) : describeRequestError(e);
-      useUi.getState().toast("error", msg);
+      this.voiceFailure(msg);
     }
   }
 
@@ -956,6 +1060,8 @@ class Controller {
     if (this.voiceRetry) clearTimeout(this.voiceRetry);
     this.voiceRetry = null;
     this.voiceRetries = 0;
+    this.voiceErrorShown = false;
+    useVoice.getState().set({ reconnecting: false });
     // Leaving, moving or losing the session discards the call's pin and state.
     this.endVoiceCall();
     await this.engine.stop();
@@ -994,19 +1100,28 @@ class Controller {
     return parsed.ok ? new URL(parsed.value.url).hostname.replace(/^\[|\]$/g, "") : undefined;
   }
 
-  private scheduleVoiceRetry(delay = 3000): void {
-    if (this.voiceRetry || !this.conn?.isOnline) return;
-    if (this.voiceRetries >= 5) return;
-    this.voiceRetries++;
+  private scheduleVoiceRetry(): void {
+    const conn = this.conn, channel = myChannelId(useSession.getState());
+    if (this.voiceRetry || !conn?.isOnline || channel === null) return;
+    this.voiceRetries = Math.min(this.voiceRetries + 1, 5);
+    useVoice.getState().set({ reconnecting: true });
     this.voiceRetry = setTimeout(() => {
       this.voiceRetry = null;
-      if (this.conn?.isOnline && myChannelId(useSession.getState()) !== null) void this.startVoice();
-    }, delay * Math.min(this.voiceRetries, 4));
+      if (this.conn === conn && conn.isOnline && myChannelId(useSession.getState()) === channel) void this.startVoice();
+    }, Math.min(15_000, 3000 * this.voiceRetries));
   }
 
   retryVoice(): void {
-    this.voiceRetries = 0;
+    if (this.voiceRetry) clearTimeout(this.voiceRetry);
+    this.voiceRetry = null;
     if (this.conn?.isOnline) void this.startVoice();
+  }
+
+  private voiceFailure(message: string): void {
+    this.scheduleVoiceRetry();
+    if (this.voiceErrorShown) return;
+    this.voiceErrorShown = true;
+    useUi.getState().toast("error", message);
   }
 
   async retryMic(): Promise<void> {
@@ -1026,6 +1141,7 @@ class Controller {
     const v = useVoice.getState();
     // Unmuting while deafened also undeafens (like most voice apps).
     const deafened = muted ? v.deafened : false;
+    useSettings.getState().setSelfVoice(muted, deafened);
     v.set({ muted, deafened });
     this.engine.setMuted(muted);
     this.engine.setDeafened(deafened);
@@ -1038,6 +1154,7 @@ class Controller {
   }
 
   setDeafened(deafened: boolean): void {
+    useSettings.getState().setSelfVoice(useVoice.getState().muted, deafened);
     useVoice.getState().set({ deafened });
     this.engine.setDeafened(deafened);
     void this.pushMuteState();

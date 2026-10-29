@@ -3,6 +3,7 @@ import { ChevronDown, Copy, Fingerprint, KeyRound, LayoutDashboard, LogOut, Plus
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { controller } from "../state/controller";
+import { useSettings } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { ChannelTree } from "./ChannelTree";
 import { usePermission } from "./hooks";
@@ -13,6 +14,7 @@ import { VoicePanel } from "./VoicePanel";
 function ServerHeader() {
   const t = useT();
   const server = useSession((s) => s.server);
+  const saved = useSettings((s) => s.resumeConnection);
   const uid = useSession((s) => s.me?.uid);
   const address = useSession((s) => s.address);
   const phase = useSession((s) => s.phase);
@@ -50,13 +52,13 @@ function ServerHeader() {
           <span className="min-w-0 flex-1">
             <span className="flex items-center gap-1.5">
               {kind === "teamspeak" && <TsIcon token={server?.icon} />}
-              <span className="truncate text-[15px] font-semibold leading-tight">{server?.name}</span>
+              <span className="truncate text-[15px] font-semibold leading-tight">{server?.name || (saved?.address === address ? saved.name : address)}</span>
               {kind === "teamspeak" && <TeamSpeakBadge />}
             </span>
             <span
               className={cn("block truncate text-[11px] leading-tight", phase === "reconnecting" ? "text-warn" : "text-subtle")}
             >
-              {phase === "reconnecting" ? t("server.reconnecting") : address}
+              {phase === "connecting" ? t("connect.connecting") : phase === "reconnecting" ? t("server.reconnecting") : address}
             </span>
           </span>
           <ChevronDown className="size-4 shrink-0 text-muted transition-transform duration-150 group-data-[state=open]:rotate-180" />
@@ -135,16 +137,15 @@ function OverviewRow() {
 }
 
 /** The server's channels and my voice panel: a column of the server view, or (`fill`) a phone's page. */
-export function Sidebar({ card, fill }: { card?: boolean; fill?: boolean }) {
+export function Sidebar({ card, fill, connecting = false }: { card?: boolean; fill?: boolean; connecting?: boolean }) {
   const phase = useSession((s) => s.phase);
   return (
     <aside className={cn("flex h-full flex-col bg-side", fill ? "min-w-0 flex-1" : "w-[280px] shrink-0", card && panelCard)}>
       <ServerHeader />
       <div className={cn("min-h-0 flex-1 overflow-y-auto transition-opacity duration-150", phase === "reconnecting" && "opacity-50")}>
-        <OverviewRow />
-        <ChannelTree />
+        {!connecting && <><OverviewRow /><ChannelTree /></>}
       </div>
-      <VoicePanel />
+      {!connecting && <VoicePanel />}
     </aside>
   );
 }

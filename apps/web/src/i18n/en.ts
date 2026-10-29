@@ -266,6 +266,9 @@ export const en = {
   "security.insecureWarning": "This connection can be impersonated or taken over. Traffic is not encrypted.",
 
   "server.menu": "Server menu",
+  "server.switchTitle": "Open another server?",
+  "server.switchBody": "Leave the voice call on {from} to open {to}?",
+  "server.switchConfirm": "Leave and open",
   "server.reconnecting": "Reconnecting…",
   "server.settings": "Server settings",
   "server.createChannel": "Create channel",
@@ -404,7 +407,7 @@ export const en = {
   "voice.undeafen": "Undeafen",
   "voice.connected": "Voice connected",
   "voice.connecting": "Connecting voice…",
-  "voice.reconnecting": "Reconnecting…",
+  "voice.reconnecting": "Reconnecting voice…",
   "voice.failed": "Voice unavailable",
   "voice.retry": "Retry",
   "voice.retryMic": "Try again",

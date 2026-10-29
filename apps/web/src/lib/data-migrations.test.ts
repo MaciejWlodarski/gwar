@@ -148,6 +148,12 @@ const RECORD_FIXTURES: Record<keyof typeof RECORDS, Record<number, { stored: Rec
 };
 /** The settings (localStorage) per version, and a check of the settings store after loading them. */
 const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: string; bookmarks: unknown[] }): void }> = {
+  3: {
+    stored: { state: { theme: "dark", bookmarks: [], selfMuted: true, selfDeafened: true,
+      resumeConnection: { address: "a.example", kind: "gwar", name: "A" } }, version: 3 },
+    check: state => { expect(state).toMatchObject({ selfMuted: true, selfDeafened: true,
+      resumeConnection: { address: "a.example", kind: "gwar", name: "A" }, updateVoiceResume: null }); },
+  },
   2: {
     stored: { state: { theme: "dark", bookmarks: [], screenMode: "sharp", screenHeight: 1440, screenFps: 60 }, version: 2 },
     check: state => { expect(state).toMatchObject({ theme: "dark", screenMode: "sharp", screenHeight: 1440, screenFps: 60 }); },
@@ -400,10 +406,20 @@ describe("the settings (localStorage)", () => {
   }
   afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
 
+  it("restores saved mute and deafen before the voice store is created", async () => {
+    const storage = memory({});
+    const first = await page(storage);
+    first.useSettings.getState().setSelfVoice(true, true);
+    await page(storage);
+    const { useVoice } = await import("../state/stores");
+    expect(useVoice.getState()).toMatchObject({ muted: true, deafened: true });
+  });
+
   it.each(versions(SETTINGS_VERSION))("version %i loads at the current one", async (version) => {
     const { useSettings, localStorageError } = await page(memory({ [SETTINGS_KEY]: JSON.stringify(LOCAL_FIXTURES[version]!.stored) }));
     expect(localStorageError()).toBeUndefined();
     LOCAL_FIXTURES[version]!.check(useSettings.getState());
+    if (version < 3) expect(useSettings.getState()).toMatchObject({ selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null });
   });
   it("of a newer version, or unreadable, are neither read nor written", async () => {
     for (const stored of [JSON.stringify({ state: { theme: "light" }, version: SETTINGS_VERSION + 1 }), "garbage"]) {

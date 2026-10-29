@@ -6,7 +6,7 @@ import type { ChatTarget } from "../proto/ChatTarget";
 import type { CloseReason } from "../net/connection";
 import type { InviteTarget } from "../net/invite";
 import type { DeviceList, VoiceError, VoiceState } from "../voice/engine";
-import type { ServerKind } from "./settings";
+import { useSettings, type ServerKind } from "./settings";
 import { initialState, reduce, type Action, type SealedThreadKey } from "./reducer";
 import type { SessionState } from "./types";
 
@@ -74,6 +74,7 @@ interface VoiceStore {
   deafened: boolean;
   level: number;
   state: VoiceState;
+  reconnecting: boolean;
   micError: VoiceError | null;
   pttActive: boolean;
   devices: DeviceList;
@@ -83,10 +84,11 @@ interface VoiceStore {
 export const useVoice = create<VoiceStore>()((set) => ({
   encryption: null,
   hearers: null,
-  muted: false,
-  deafened: false,
+  muted: useSettings.getState().selfMuted,
+  deafened: useSettings.getState().selfDeafened,
   level: 0,
   state: "idle",
+  reconnecting: false,
   micError: null,
   pttActive: false,
   devices: { inputs: [], outputs: [] },
@@ -302,6 +304,7 @@ export const useOutbox = create<OutboxStore>()((set, get) => ({
 // ------------------------------------------------------------ connect screen
 
 interface ConnectUi {
+  restoring: boolean;
   busy: boolean;
   error: string | null;
   /** The server asked for a password we do not have (or got wrong). */
@@ -314,6 +317,7 @@ interface ConnectUi {
 
 export const useConnectUi = create<ConnectUi>()((set) => ({
   busy: false,
+  restoring: false,
   error: null,
   needPassword: false,
   serverName: null,

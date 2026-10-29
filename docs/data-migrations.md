@@ -269,6 +269,16 @@ new key, not a change of shape. Missing or malformed, it reads as no groups
 bookmarks in a group are ignored when shown. Groups stay on the device; Gwar
 Connect does not sync them.
 
+Settings version 3 adds `selfMuted` and `selfDeafened` (both default to false),
+`resumeConnection` (default null), and `updateVoiceResume` (default null).
+Older settings keep their bookmarks, identities and preferences; the next successful
+connection establishes the session to restore. Explicit Disconnect clears it.
+The session stays on the device and contains the address, server kind, display name,
+server password (plain text, like bookmarks), TeamSpeak identity and LAN choice;
+it never contains invite codes or cold-start voice entry. Update-only voice entry
+is consumed once, expires after five minutes, and names the target server and app version.
+Installation or relaunch failure clears that intent.
+
 ### Desktop files
 
 JSON files carry `version` (missing: 1). The loader refuses a newer version

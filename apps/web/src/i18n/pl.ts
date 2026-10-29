@@ -268,6 +268,9 @@ export const pl: Record<Key, string> = {
   "security.insecureWarning": "To połączenie nie jest szyfrowane: każdy w sieci może podszyć się pod serwer lub przejąć Twoją sesję",
 
   "server.menu": "Menu serwera",
+  "server.switchTitle": "Otworzyć inny serwer?",
+  "server.switchBody": "Opuścić rozmowę na serwerze {from}, aby otworzyć {to}?",
+  "server.switchConfirm": "Opuść i otwórz",
   "server.reconnecting": "Łączenie ponownie…",
   "server.settings": "Ustawienia serwera",
   "server.createChannel": "Utwórz kanał",
@@ -406,7 +409,7 @@ export const pl: Record<Key, string> = {
   "voice.undeafen": "Włącz dźwięk",
   "voice.connected": "Głos połączony",
   "voice.connecting": "Łączenie głosu…",
-  "voice.reconnecting": "Łączenie ponownie…",
+  "voice.reconnecting": "Przywracanie rozmowy…",
   "voice.failed": "Głos niedostępny",
   "voice.retry": "Ponów",
   "voice.retryMic": "Spróbuj ponownie",

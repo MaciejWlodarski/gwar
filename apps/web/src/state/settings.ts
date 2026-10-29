@@ -12,6 +12,24 @@ export type Language = "pl" | "en";
 /** `gwar`: a gwar/1 server (WebSocket + WebRTC). `teamspeak`: a TeamSpeak 3/6 server (desktop app only). */
 export type ServerKind = "gwar" | "teamspeak";
 
+/** Local session intent; no invite codes or automatic cold-start voice entry. */
+export interface SavedConnection {
+  address: string;
+  kind: ServerKind;
+  name: string;
+  password?: string;
+  identity?: string;
+  insecureLan?: boolean;
+}
+export interface UpdateVoiceResume {
+  address: string;
+  kind: ServerKind;
+  version: string;
+  expiresAt: number;
+  channel: number;
+  password?: string;
+}
+
 export interface Bookmark {
   id: string;
   /** Display name; defaults to the address label. */
@@ -273,6 +291,14 @@ export interface SettingsState extends QualitySettings {
   bookmarkEdits: number;
   lastAddress: string;
   lastKind: ServerKind;
+  selfMuted: boolean;
+  selfDeafened: boolean;
+  /** Null after an explicit Disconnect. This device only; never synced to the vault. */
+  resumeConnection: SavedConnection | null;
+  updateVoiceResume: UpdateVoiceResume | null;
+  setSelfVoice(muted: boolean, deafened: boolean): void;
+  setResumeConnection(connection: SavedConnection | null): void;
+  setUpdateVoiceResume(resume: UpdateVoiceResume | null): void;
   /** This device was already offered the identities of the official TeamSpeak client (asked only once). */
   tsDetectAsked: boolean;
   /** Per server key: the TeamSpeak claim was offered there (docs/teamspeak-import.md, "Claim"), asked only once. */
@@ -357,6 +383,13 @@ export const useSettings = create<SettingsState>()(
       bookmarkEdits: 0,
       lastAddress: "",
       lastKind: "gwar",
+      selfMuted: false,
+      selfDeafened: false,
+      resumeConnection: null,
+      updateVoiceResume: null,
+      setSelfVoice: (selfMuted, selfDeafened) => set({ selfMuted, selfDeafened }),
+      setResumeConnection: (resumeConnection) => set({ resumeConnection }),
+      setUpdateVoiceResume: (updateVoiceResume) => set({ updateVoiceResume }),
       tsDetectAsked: false,
       tsClaimAsked: {},
       channelEncryption: {},
@@ -478,7 +511,8 @@ export const useSettings = create<SettingsState>()(
       version: SETTINGS_VERSION,
       // zustand's default storage (`window.localStorage`), guarded.
       storage: createJSONStorage(() => guardedLocalStorage(window.localStorage)),
-      migrate: (persisted) => migrateQuality((persisted ?? {}) as Record<string, unknown>),
+      migrate: (persisted) => ({ selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null,
+        ...migrateQuality((persisted ?? {}) as Record<string, unknown>) }),
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
         return { ...current, ...p, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
@@ -486,6 +520,13 @@ export const useSettings = create<SettingsState>()(
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,
           serverGroups: validGroups(p.serverGroups),
+          selfMuted: p.selfMuted === true,
+          selfDeafened: p.selfDeafened === true,
+          resumeConnection: p.resumeConnection && typeof p.resumeConnection.address === "string" &&
+            (p.resumeConnection.kind === "gwar" || p.resumeConnection.kind === "teamspeak") ? p.resumeConnection : null,
+          updateVoiceResume: p.updateVoiceResume && Number.isSafeInteger(p.updateVoiceResume.channel) &&
+            typeof p.updateVoiceResume.address === "string" && (p.updateVoiceResume.kind === "gwar" || p.updateVoiceResume.kind === "teamspeak") &&
+            typeof p.updateVoiceResume.version === "string" && Number.isFinite(p.updateVoiceResume.expiresAt) ? p.updateVoiceResume : null,
         };
       },
     },

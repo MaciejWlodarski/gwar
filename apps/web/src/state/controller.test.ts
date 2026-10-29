@@ -31,6 +31,7 @@ type Stores = typeof import("./stores");
 let controller: Ctl;
 let stores: Stores;
 let settings: typeof import("./settings");
+let engineState: (state: import("../voice/engine").VoiceState) => void;
 
 class FakeLink implements Link {
   status: ConnectionStatus = { state: "online" };
@@ -99,7 +100,7 @@ function fakeEngine() {
     setSlotOwner: vi.fn(),
     listDevices: vi.fn(async () => ({ inputs: [], outputs: [] })),
     startMicTest: vi.fn(async () => () => {}),
-    on: vi.fn(() => () => {}),
+    on: vi.fn((_event: string, _handler: unknown) => () => {}),
   };
   return engine satisfies VoiceEngine;
 }
@@ -139,10 +140,10 @@ let link: FakeLink;
 const session = () => stores.useSession.getState();
 
 /** Connects a fake link; Gwar servers start users outside voice. */
-function connectFake(opts: { channel?: number | null; kind?: "gwar" | "teamspeak"; resync?: boolean; encrypted?: number[]; serverChat?: boolean; permissions?: Permission[] } = {}) {
+function connectFake(opts: { channel?: number | null; kind?: "gwar" | "teamspeak"; resync?: boolean; encrypted?: number[]; serverChat?: boolean; permissions?: Permission[]; params?: import("./controller").ConnectParams } = {}) {
   const c = controller as unknown as { conn: Link | null; wire(l: Link): void };
   c.conn = link;
-  c.wire(link);
+  (c.wire as (l: Link, p?: import("./controller").ConnectParams) => void)(link, opts.params);
   session().setAddress("test", opts.kind ?? "gwar");
   link.welcomeNow(
     welcome({
@@ -175,6 +176,7 @@ beforeAll(async () => {
   engine = fakeEngine();
   controller.useEngine(engine);
   controller.init();
+  engineState = engine.on.mock.calls.find(call => call[0] === "state")![1] as typeof engineState;
 });
 
 beforeEach(() => {
@@ -184,13 +186,212 @@ beforeEach(() => {
   link = new FakeLink();
   session().dispatch({ type: "reset" });
   stores.useUi.setState({ dialog: { kind: "none" }, joining: null, toasts: [] });
-  stores.useVoice.setState({ muted: false, deafened: false, micError: null, state: "idle" });
+  stores.useVoice.setState({ muted: false, deafened: false, micError: null, state: "idle", reconnecting: false });
+  settings.useSettings.setState({ selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null, language: "en" });
+  stores.useConnectUi.setState({ restoring: false, busy: false, error: null, invite: null });
+  (controller as unknown as { restored: boolean; persistRequested: boolean }).restored = false;
+  (controller as unknown as { persistRequested: boolean }).persistRequested = false;
+  (controller as unknown as { voiceAutoStart: boolean }).voiceAutoStart = true;
+  engine.start.mockReset().mockResolvedValue(undefined);
 });
 
 afterEach(async () => {
   vi.useRealTimers();
   await controller.disconnect(true);
 });
+
+describe("session resilience", () => {
+  const saved = { address: "test", kind: "gwar" as const, name: "Friends", password: "secret", insecureLan: true };
+
+  it("persists self mute and deafen, and applies both before starting the microphone", async () => {
+    controller.setMuted(true);
+    controller.setDeafened(true);
+    expect(settings.useSettings.getState()).toMatchObject({ selfMuted: true, selfDeafened: true });
+    engine.start.mockImplementationOnce(async () => {
+      expect(engine.setMuted).toHaveBeenLastCalledWith(true);
+      expect(engine.setDeafened).toHaveBeenLastCalledWith(true);
+    });
+    connectFake({ channel: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(engine.start).toHaveBeenCalledOnce();
+    controller.setMuted(false);
+    expect(settings.useSettings.getState()).toMatchObject({ selfMuted: false, selfDeafened: false });
+  });
+
+  it("requests persistent storage once on welcome; refusal does not break the session or reconnect", async () => {
+    const persist = vi.fn(async () => { throw new Error("denied"); });
+    const nav = globalThis.navigator;
+    vi.stubGlobal("navigator", { storage: { persist } });
+    const c = controller as unknown as { conn: Link; wire(l: Link, p: typeof saved): void };
+    c.conn = link; c.wire(link, saved);
+    const w = welcome({ session: 1, uid: "u1", channels: [chan(1)], clients: [client(1, null)] });
+    link.welcomeNow(w);
+    link.welcomeNow(w, true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(persist).toHaveBeenCalledOnce();
+    expect(settings.useSettings.getState().resumeConnection).toMatchObject({ ...saved, name: "Test" });
+    expect(session().phase).toBe("online");
+    vi.stubGlobal("navigator", nav);
+  });
+
+  it("restores once after startup without joining voice", async () => {
+    settings.useSettings.setState({ resumeConnection: saved });
+    const connect = vi.spyOn(controller, "connectInteractive").mockImplementation(async params => {
+      expect(params).not.toHaveProperty("channel");
+      connectFake(); return true;
+    });
+    await controller.restoreSession(); await controller.restoreSession();
+    expect(connect).toHaveBeenCalledExactlyOnceWith(saved, { remember: false });
+    expect(engine.start).not.toHaveBeenCalled();
+    expect(stores.useConnectUi.getState().restoring).toBe(false);
+    connect.mockRestore();
+  });
+
+  it("a cold TeamSpeak restoration does not open capture in its default channel", async () => {
+    settings.useSettings.setState({ resumeConnection: { ...saved, kind: "teamspeak" } });
+    const connect = vi.spyOn(controller, "connectInteractive").mockImplementation(async params => { connectFake({ kind: "teamspeak", channel: 1, params }); return true; });
+    await controller.restoreSession();
+    expect(engine.start).not.toHaveBeenCalled();
+    connect.mockRestore();
+  });
+
+  it("an explicit disconnect clears startup and update intent", async () => {
+    settings.useSettings.setState({ resumeConnection: saved, updateVoiceResume: { address: "test", kind: "gwar", version: __APP_VERSION__, channel: 1, expiresAt: Date.now() + 1000 } });
+    await controller.disconnect();
+    const connect = vi.spyOn(controller, "connectInteractive");
+    await controller.restoreSession();
+    expect(connect).not.toHaveBeenCalled();
+    expect(settings.useSettings.getState()).toMatchObject({ resumeConnection: null, updateVoiceResume: null });
+    connect.mockRestore();
+  });
+
+  it("records update rejoin only while in voice and can cancel it after an installation failure", () => {
+    connectFake({ channel: 2 });
+    const cancel = controller.prepareUpdateRestart("0.2.0");
+    expect(settings.useSettings.getState().updateVoiceResume).toEqual({ address: "test", kind: "gwar", version: "0.2.0", channel: 2, password: undefined, expiresAt: Date.now() + 300_000 });
+    cancel();
+    expect(settings.useSettings.getState().updateVoiceResume).toBeNull();
+    connectFake(); controller.prepareUpdateRestart("0.2.0");
+    expect(settings.useSettings.getState().updateVoiceResume).toBeNull();
+  });
+
+  it("cancelling while the identity loads prevents a late connection", async () => {
+    let resolve!: (identity: import("../net/identity").Identity) => void;
+    const identity = vi.spyOn(controller, "getIdentity").mockImplementation(() => new Promise(yes => { resolve = yes; }));
+    const connecting = controller.connect({ address: "ws://localhost:18979/ws" });
+    // Let disconnect/teardown finish so the identity request is in progress.
+    await vi.advanceTimersByTimeAsync(0);
+    await controller.disconnect();
+    resolve({ nickname: "me" } as import("../net/identity").Identity);
+    await expect(connecting).rejects.toThrow();
+    expect(session().phase).toBe("idle");
+    expect(settings.useSettings.getState().resumeConnection).toBeNull();
+    identity.mockRestore();
+  });
+
+  it("an invite takes precedence over restoring the previous server", async () => {
+    settings.useSettings.setState({ resumeConnection: saved });
+    stores.useConnectUi.setState({ invite: { address: "other", code: "invite" } as never });
+    const connect = vi.spyOn(controller, "connectInteractive");
+    await controller.restoreSession();
+    expect(connect).not.toHaveBeenCalled(); connect.mockRestore();
+  });
+
+  it("returns to the form after one failed restoration, without scheduled retries", async () => {
+    settings.useSettings.setState({ resumeConnection: saved });
+    const connect = vi.spyOn(controller, "connect").mockImplementation(async () => {
+      // The real connect invalidates earlier attempts via disconnect before it starts.
+      await controller.disconnect(true);
+      throw new Error("Cannot reach Friends");
+    });
+    await controller.restoreSession();
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(connect).toHaveBeenCalledOnce();
+    expect(stores.useConnectUi.getState()).toMatchObject({ restoring: false, busy: false, error: "Cannot reach Friends" });
+    expect(session().phase).toBe("idle");
+    connect.mockRestore();
+  });
+
+  it.each(["valid", "expired", "other version", "other server"])("consumes an update voice intent once: %s", async variant => {
+    settings.useSettings.setState({ resumeConnection: saved, updateVoiceResume: {
+      address: variant === "other server" ? "other.example" : "test", kind: "gwar", channel: 2, password: "channel-secret", version: variant === "other version" ? "old" : __APP_VERSION__, expiresAt: Date.now() + (variant === "expired" ? -1 : 1000),
+    } });
+    const connect = vi.spyOn(controller, "connectInteractive").mockImplementation(async () => { connectFake(); return true; });
+    await controller.restoreSession();
+    expect(link.sent("channel.join")).toHaveLength(variant === "valid" ? 1 : 0);
+    if (variant === "valid") expect(link.sent("channel.join")[0]!.d).toEqual({ channel: 2, password: "channel-secret" });
+    expect(settings.useSettings.getState().updateVoiceResume).toBeNull();
+    connect.mockRestore();
+  });
+
+  it("keeps retrying beyond five failures with at most 15 seconds between attempts, with one toast", async () => {
+    const toast = vi.spyOn(stores.useUi.getState(), "toast");
+    engine.start.mockRejectedValue(new Error("offline"));
+    connectFake({ channel: 1 });
+    await vi.advanceTimersByTimeAsync(0);
+    for (let i = 0; i < 12; i++) {
+      const before = engine.start.mock.calls.length;
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(engine.start.mock.calls.length).toBeGreaterThan(before);
+    }
+    expect(stores.useVoice.getState().reconnecting).toBe(true);
+    expect(toast.mock.calls.filter(call => call[0] === "error")).toHaveLength(1);
+    engineState("connected");
+    expect(stores.useVoice.getState().reconnecting).toBe(false);
+    const starts = engine.start.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(engine.start).toHaveBeenCalledTimes(starts);
+    engineState("failed");
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(toast.mock.calls.filter(call => call[0] === "error")).toHaveLength(2);
+    toast.mockRestore();
+  });
+
+  it.each(["leave", "disconnect", "server lost"])("cancels voice retries when %s", async action => {
+    engine.start.mockRejectedValue(new Error("offline"));
+    connectFake({ channel: 1 }); await vi.advanceTimersByTimeAsync(0);
+    if (action === "leave") link.emit({ ev: "client.updated", d: client(1, null) });
+    if (action === "disconnect") await controller.disconnect();
+    if (action === "server lost") { link.isOnline = false; link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 }); }
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(engine.start).toHaveBeenCalledOnce();
+  });
+
+  it("manual voice Retry replaces the pending retry instead of starting two", async () => {
+    engine.start.mockRejectedValueOnce(new Error("offline"));
+    connectFake({ channel: 1 }); await vi.advanceTimersByTimeAsync(0);
+    controller.retryVoice(); await vi.advanceTimersByTimeAsync(60_000);
+    expect(engine.start).toHaveBeenCalledTimes(2);
+  });
+
+  it("asks before switching away from a voice call; cancel leaves the call intact", async () => {
+    connectFake({ channel: 1 }); await vi.advanceTimersByTimeAsync(0);
+    const connect = vi.spyOn(controller, "connect").mockResolvedValue();
+    await controller.connectInteractive({ address: "other.example" }, { remember: false });
+    expect(connect).not.toHaveBeenCalled();
+    const dialog = stores.useUi.getState().dialog;
+    expect(dialog).toMatchObject({ kind: "confirm", body: expect.stringContaining("other.example") });
+    stores.useUi.getState().closeDialog();
+    expect(engine.stop).not.toHaveBeenCalled();
+    await controller.connectInteractive({ address: "other.example" }, { remember: false });
+    const confirmed = stores.useUi.getState().dialog;
+    if (confirmed.kind === "confirm") confirmed.onConfirm();
+    expect(connect).toHaveBeenCalledWith({ address: "other.example" });
+    connect.mockRestore();
+  });
+
+  it("also guards screen sharing without voice", async () => {
+    connectFake();
+    const { useScreen } = await import("./screen");
+    useScreen.setState({ own: { phase: "live" } as never });
+    const connect = vi.spyOn(controller, "connect").mockResolvedValue();
+    await controller.connectInteractive({ address: "other.example" }, { remember: false });
+    expect(connect).not.toHaveBeenCalled();
+    expect(stores.useUi.getState().dialog.kind).toBe("confirm");
+    useScreen.setState({ own: null }); connect.mockRestore();
+  });
+});
+
 
 describe("staying on the server without voice", () => {
   it("does not start voice (or ask for the microphone) after connecting", async () => {

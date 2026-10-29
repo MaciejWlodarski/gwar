@@ -112,6 +112,7 @@ function useVoiceStatus() {
   const t = useT();
   const voiceState = useVoice((s) => s.state);
   const encryption = useVoice((s) => s.encryption);
+  const reconnecting = useVoice((s) => s.reconnecting);
   const phase = useSession((s) => s.phase);
   // Encrypted channels never show an alarm, even when the engine refused them.
   const encryptedChannel = useSession((s) => {
@@ -121,17 +122,19 @@ function useVoiceStatus() {
   // Encrypted calls: "Securing voice…" until a sending key is active, in the
   // muted style; a stopped engine is "Voice unavailable" with Retry, no alarm.
   const status: { tone: "ok" | "warn" | "danger" | "muted"; text: string } =
-    phase === "reconnecting"
+    phase === "reconnecting" || reconnecting
       ? { tone: "warn", text: t("voice.reconnecting") }
       : encryption === "failed"
         ? { tone: "muted", text: t("voice.failed") }
         : encryption === "securing" && voiceState !== "failed"
           ? { tone: "muted", text: t("voice.securing") }
-          : voiceState === "connected"
-            ? { tone: "ok", text: t("voice.connected") }
-            : voiceState === "failed"
-              ? { tone: encryption || encryptedChannel ? "muted" : "danger", text: t("voice.failed") }
-              : { tone: "warn", text: t("voice.connecting") };
+          : voiceState === "idle" && phase === "online"
+            ? { tone: "muted", text: t("voice.notIn") }
+            : voiceState === "connected"
+              ? { tone: "ok", text: t("voice.connected") }
+              : voiceState === "failed"
+                ? { tone: encryption || encryptedChannel ? "muted" : "danger", text: t("voice.failed") }
+                : { tone: "warn", text: t("voice.connecting") };
   const tone = cn(
     status.tone === "ok" && "text-ok",
     status.tone === "warn" && "text-warn",
@@ -182,7 +185,7 @@ export function VoicePanel() {
     );
   }
 
-  const unavailable = voiceState === "failed" || encryption === "failed";
+  const unavailable = voiceState === "failed" || encryption === "failed" || voiceState === "idle";
   // Nobody hears me: a moderator muted or deafened me, or this channel does not let me speak.
   const silencedNote = me?.server_deafened
     ? t("voice.serverDeafened")
@@ -216,7 +219,7 @@ export function VoicePanel() {
         </div>
         {unavailable && phase === "online" && (
           <Button size="sm" variant="secondary" onClick={() => controller.retryVoice()}>
-            {t("voice.retry")}
+            {t(voiceState === "idle" ? "tree.joinVoice" : "voice.retry")}
           </Button>
         )}
         <LeaveButton />
