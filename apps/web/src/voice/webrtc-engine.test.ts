@@ -664,4 +664,33 @@ describe("browser devices follow the system", () => {
     await changeDevices([...devices, headphones]);
     expect(setSinkId).toHaveBeenLastCalledWith("hp");
   });
+
+  it("ignores the late rejection of an older output route", async () => {
+    const headphones = speaker("hp", "g-hp", "Headphones");
+    devices = [...devices, headphones];
+    let reject!: (e: unknown) => void;
+    const setSinkId = vi.fn((_id: string) => Promise.resolve());
+    setSinkId.mockImplementationOnce(() => new Promise<void>((_, no) => { reject = no; }));
+    vi.stubGlobal("AudioContext", class extends Context { setSinkId = setSinkId; });
+    getUserMedia.mockResolvedValue(capture({ deviceId: "default", groupId: "g-mac" }).stream);
+    await engine.setOutputDevice("hp");
+    await engine.start(params());
+    await engine.setOutputDevice(null);
+    await engine.setOutputDevice("hp");
+    reject(new DOMException("gone", "NotFoundError"));
+    await flush();
+    expect(setSinkId).toHaveBeenLastCalledWith("hp");
+  });
+
+  it("stops the capture a switch was replacing when the call reconnects", async () => {
+    const first = capture({ deviceId: "default", groupId: "g-mac" });
+    const next = capture({ deviceId: "default", groupId: "g-air" });
+    getUserMedia.mockResolvedValueOnce(first.stream).mockResolvedValueOnce(next.stream).mockResolvedValue(capture({ deviceId: "default", groupId: "g-air" }).stream);
+    await engine.start(params());
+    Peer.all[0]!.connect();
+    micSender().replaceTrack.mockImplementationOnce(() => new Promise<void>(() => {}));
+    await changeDevices([mic("default", "g-air", "Default - AirPods"), macbook, mic("air", "g-air", "AirPods")]);
+    await engine.start(params());
+    expect(first.track.stop).toHaveBeenCalled();
+  });
 });

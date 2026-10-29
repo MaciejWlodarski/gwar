@@ -96,6 +96,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private outputDeviceId: string | null = null;
   /** The output actually routed to: the chosen one, or the default while it is away. */
   private routedOutputId: string | null = null;
+  /** Each routing attempt's token: a late rejection of an older one changes nothing. */
+  private routeAttempt = 0;
   /** The microphone was lost or never found: one appearing is opened at once. */
   private micMissing = false;
   private followTimer: ReturnType<typeof setTimeout> | null = null;
@@ -278,6 +280,9 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     if (this.followRetryTimer) clearTimeout(this.followRetryTimer);
     this.followRetryTimer = null;
     this.followRetries = 0;
+    // The capture a switch was replacing is not sent by a later peer.
+    this.handover?.getTracks().forEach((t) => t.stop());
+    this.handover = null;
     if (pc) {
       pc.ontrack = null;
       pc.onconnectionstatechange = null;
@@ -681,12 +686,13 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     if (!ctx || !master) return;
     master.disconnect();
     this.routedOutputId = id;
+    const attempt = ++this.routeAttempt;
     const ctxSink = typeof ctx.setSinkId === "function";
     const elementSink = typeof HTMLMediaElement !== "undefined" && "setSinkId" in HTMLMediaElement.prototype;
     // A device that cannot be routed to plays on the default and counts as not routed, so its
     // return routes it again.
     const unrouted = () => {
-      if (this.routedOutputId !== id || !id) return;
+      if (attempt !== this.routeAttempt || !id) return;
       this.routedOutputId = null;
       master.disconnect();
       master.connect(ctx.destination);
