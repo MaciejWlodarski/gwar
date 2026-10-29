@@ -8,7 +8,7 @@ import { cn } from "../lib/cn";
 import { leavePage, useEscapeBack } from "./hooks";
 import { Button, Field, panelCard, Switch, Textarea, Tooltip } from "./kit";
 import { useVoicePill } from "./nav";
-import { clearReportDraft, newShotId, sendReport, useReportDraft } from "./report-draft";
+import { clearReportDraft, newShotId, reportDraftId, sendReport, useReportDraft } from "./report-draft";
 import { VoicePill } from "./VoicePanel";
 
 const MAX_SHOTS = 5;
@@ -41,8 +41,11 @@ export function BugReportSection({ card }: { card?: boolean }) {
 
   // While a send is going the draft stays as sent: what it sends is what is dropped once it went through.
   const sending = () => useReportDraft.getState().busy;
+  // A screenshot still being fitted when the draft is dropped (Cancel, another identity) is not the next draft's.
   const add = async (files: Iterable<Blob>) => {
     if (sending()) return;
+    const owner = reportDraftId();
+    const stale = () => sending() || reportDraftId() !== owner;
     draft({ error: null });
     let room = MAX_SHOTS - shots.length;
     for (const f of files) {
@@ -50,11 +53,14 @@ export function BugReportSection({ card }: { card?: boolean }) {
       if (room <= 0) { draft({ error: t("report.tooManyShots", { max: MAX_SHOTS }) }); return; }
       try {
         const blob = await fitScreenshot(f);
-        if (sending()) return;
+        if (stale()) return;
         const shot = { id: newShotId(), blob, url: URL.createObjectURL(blob) };
         room--;
         draft((d) => ({ shots: [...d.shots, shot] }));
-      } catch { draft({ error: t("report.badShot") }); }
+      } catch {
+        if (stale()) return;
+        draft({ error: t("report.badShot") });
+      }
     }
   };
   const remove = (id: number) => !busy && draft((d) => ({ shots: d.shots.filter((s) => {

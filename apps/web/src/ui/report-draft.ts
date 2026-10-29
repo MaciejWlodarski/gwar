@@ -34,6 +34,9 @@ export const newShotId = () => nextShot++;
 /** Which draft this is: a send's result belongs to the draft it was sent from, not to one written after it. */
 let draft = 0;
 
+/** The current draft's identity, for work that resumes after an await (a send, a screenshot being fitted). */
+export const reportDraftId = () => draft;
+
 /** Drops the draft and its screenshots' preview URLs. */
 export function clearReportDraft(): void {
   draft++;

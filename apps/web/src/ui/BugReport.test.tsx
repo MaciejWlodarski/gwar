@@ -18,6 +18,12 @@ vi.mock("../state/controller", () => ({
   identityFailure: () => null,
   bookmarkParams: () => ({}),
 }));
+/** Screenshots are fitted when the test resolves them. */
+const fitting = vi.hoisted(() => ({ pending: [] as Array<(b: Blob) => void> }));
+vi.mock("../lib/diagnostics", async (original) => ({
+  ...(await original<typeof import("../lib/diagnostics")>()),
+  fitScreenshot: () => new Promise<Blob>((ok) => void fitting.pending.push(ok)),
+}));
 vi.mock("../net/identity", async (original) => ({ ...(await original<typeof import("../net/identity")>()), loadConnectRecord: async () => undefined }));
 
 let root: Root, container: HTMLDivElement;
@@ -120,6 +126,21 @@ describe("the bug report draft", () => {
     expect(container.querySelector("img")).toBeNull();
     expect(revoke).toHaveBeenCalledWith("blob:shot");
     expect(useReportDraft.getState()).toMatchObject({ text: "", shots: [], withDiagnostics: true, busy: false });
+  });
+
+  it("a screenshot still being fitted when another identity takes over is not added to the next draft", async () => {
+    vi.spyOn(URL, "revokeObjectURL").mockImplementation(() => {});
+    const create = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:late");
+    fitting.pending = [];
+    await render();
+    const input = container.querySelector<HTMLInputElement>('input[type="file"]')!;
+    Object.defineProperty(input, "files", { configurable: true, value: [new File(["x"], "a.png", { type: "image/png" })] });
+    await act(async () => input.dispatchEvent(new Event("change", { bubbles: true })));
+    expect(fitting.pending).toHaveLength(1);
+    await act(async () => useAccountIdentity.setState((s) => ({ replaced: s.replaced + 1 })));
+    await act(async () => fitting.pending[0]!(new Blob(["x"], { type: "image/png" })));
+    expect(useReportDraft.getState().shots).toEqual([]);
+    expect(create).not.toHaveBeenCalled();
   });
 
   it("holds still while it is being sent: no edits, no Cancel", async () => {
