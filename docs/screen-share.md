@@ -3390,6 +3390,94 @@ from native capture is PR 10.
 
 Polish and English strings are added together, as for every UI change.
 
+### Session interruptions and capture permission
+
+A reconnect retires transports, while keeping the captured stream and its quality,
+preview and currently active TeamSpeak-link choice. Revoking a link clears that
+choice permanently for the retained capture, including moderator revocation.
+Welcome and voice rejoin provide the new participation for republishing. Encoder
+fallback decisions (failed codecs, retired AV1, an unsafe start-bitrate hint, and
+the active recovery codec/rendition)
+survive only for this same capture; a new picker starts with fresh decisions.
+No bitrate estimate or transport state is carried into a new session.
+
+A failed publisher enters the same capture-retaining recovery even if signalling
+still reports online. Media may detect loss after five seconds while signalling
+takes 10–20 seconds. Only the publisher retires; healthy watches stay connected.
+Republishing waits for the server to retire the failed share or for session resync,
+and the 45-second deadline starts at the first media failure, without extension
+when signalling catches up. Moderation and explicit Stop cancel this recovery.
+
+Repeated blips before voice rejoin retain the original channel. Every explicit
+Leave cancels voice rejoin and stops capture, including online republishing before
+the new share ID exists. Manual voice actions supersede saved rejoin intent;
+definitive admission refusal clears it, while a lost connection preserves it.
+Retained capture republishes only when voice is authorized and no permanent voice
+refusal is latched. Restored plaintext presence alone cannot clear that refusal.
+Explicit voice entry or Retry can resume capture within the original recovery
+deadline; otherwise the deadline stops capture and shows the persistent restart notice.
+Explicit Stop and Leave remain quiet. A capture track ending during recovery
+(for example, its window closing) instead shows the persistent restart notice;
+browser track termination does not distinguish that cause from browser Stop sharing.
+A picker still open at the interruption
+and an unconfirmed quality dialog are retained; confirmation while offline or
+waiting for the new voice binding queues publication. Unconfirmed choices still require confirmation. A changed
+or encrypted channel refuses publication and explains that sharing stopped.
+
+Viewers retain their selected stage and watch order. A `left` stop waits for the
+client update sequence: `remove()` sends a final move update before `client.left`,
+so a bounded 150 ms settle window lets that ordered sequence drain. The same sharer
+session still present means a voluntary move/leave, and the watch closes promptly
+with the normal ended notice. A removed session may return within 45 seconds. Match the original share ID first, then a
+unique user/channel capture, excluding shares already running on other sessions
+when recovery began; Client exposes no device identity. A healthy viewer
+whose return window expires receives an informational ended notice. Watch-transport
+failure instead uses bounded recovery/backoff and a connection error on exhaustion.
+Client identity is refreshed after a rewatch. Explicit Stop, moderation, lost
+access and incompatible codecs end watches normally. Password-channel watches
+use effective channel permissions, including role/user and inherited overrides:
+outside-voice viewers with password bypass resume too; others wait for voice admission.
+Manual unwatch and reset cancel recovery.
+
+Capture and UI stop immediately on explicit Stop, while DTLS remains until its
+stop request settles so transport teardown cannot overtake the user's stop reason.
+Reset retires pending peers. Failed republishing or the 45-second recovery deadline
+leaves a persistent **Share again** notice and uses existing permitted desktop
+notifications. That action is disabled outside voice. No notification permission
+prompt opens during recovery. Installing a recovery or permission banner dismisses
+the superseded sticky screen-stopped toast.
+
+Picker refusal detection is intentionally limited to evidence in browser errors:
+
+| Report | Handling |
+| --- | --- |
+| `AbortError`, explicit cancel/dismiss wording | Silent cancellation |
+| Chromium/Edge `NotAllowedError` with exactly `Permission denied` | Silent picker cancellation |
+| Explicit system/policy/screen-recording refusal | Persistent permission guidance |
+| WebKit/Firefox `NotAllowedError`, including “user agent or the platform”, or other ambiguous refusal | Neutral, non-error hint; user cancellation and platform denial cannot reliably be separated |
+| Other failure | Generic localized error |
+
+Guidance names Gwar in the desktop shell and the detected browser on the web.
+macOS names System Settings → Privacy & Security → Screen Recording; Windows
+names Settings → Privacy & security; other systems get generic privacy guidance.
+Identity, expiry and screen banners share the same shell: 57 pixels tall, 12-pixel
+vertical padding, a visible icon at every width, and 32-pixel controls. Each stays
+on one row. Small screens
+use **Sharing stopped** and a compact sharing action. Permission and ambiguous
+refusal banners offer **How to fix**, opening a small dialog with the details.
+Only the macOS desktop permission dialog offers **Open settings**. Windows WebView2 picker/policy refusals
+cannot be fixed by the OS privacy shortcut, so that button is hidden there. Raw
+error text remains in diagnostics rather than the UI.
+
+Set `E2E_SCREEN_RECONNECT_ONLY=1` for the focused cross-engine regression (the
+complete default matrix also runs it). The suite closes real local session WebSockets, checks same-stream
+republishing and decoded barcode frames, and asserts that a voluntary sharer move
+closes its watches. `E2E_SCREEN_SCREENSHOTS` saves Polish dark-theme banners and
+help dialogs at 1440, 768, 390 and 360 pixels and measures single-row layout,
+overflow and close-button alignment in the running local app. Shell
+and alternate-OS variants use explicit browser platform markers, without changing
+OS permissions or launching the installed desktop app.
+
 ### Web client as built (PR 4)
 
 Code: `apps/web/src/voice/screen.ts` (capture, presets, publish and watch
@@ -3431,9 +3519,10 @@ badge, stage). Decisions taken while building it, where this design left room:
 - **Watch transport.** One per session, negotiated on the first watch.
   `screen.watch` is asked again for up to 5 s while the server answers
   `unavailable`, because the browser can see the transport connect before the
-  screen task reports it. A transport that fails ends every watch, as the
-  server does, with one notice; the user opens the shares again, and the next
-  watch negotiates a new run.
+  screen task reports it. A failed watch transport keeps viewing intent and the
+  selected stage, and negotiates a fresh run after 1, 2, then 4 seconds. Only
+  exhausted recovery shows an error. A decoded frame resets that failure budget.
+  Requests and callbacks from retired runs cannot release or revive new grants.
 - **Watch requests.** Each watch has its own id, and the requests of one share
   run one at a time: a watch, its release and the next watch of the same share
   reach the server in order, so an earlier watch's assignment or release is
@@ -3506,12 +3595,9 @@ screen worker; it arrives with PR 7's encrypted shares.
 - **macOS** runs WebKit's own picker path (§1). WKWebView has no
   `CaptureController` (PR 1), so sharing a window may bring it in front of
   Gwar; the call works without it.
-- **A refusal is never silent.** WebKit and Chromium answer both a closed
-  picker and a refusal before any picker (a WebKit that denies, a missing
-  user gesture, a platform policy) with `NotAllowedError`, and nothing,
-  timing included, tells them apart (a busy renderer delays a refusal; a
-  quick Escape looks like one). Every `NotAllowedError` therefore shows the
-  neutral notice "Screen sharing was cancelled or denied (…)".
+- **Picker refusal.** Current cancellation, platform-denial and ambiguous-error handling
+  is described in [Session interruptions and capture permission](#session-interruptions-and-capture-permission).
+
 - **Info.plist: `NSScreenCaptureUsageDescription`; entitlements: none.**
   - Two consent paths exist on macOS. `SCContentSharingPicker`, which
     WebKit uses on 14+, is consent by itself: the person picks a window or

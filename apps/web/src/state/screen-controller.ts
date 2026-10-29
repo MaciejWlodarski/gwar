@@ -11,10 +11,13 @@ import { create } from "zustand";
 import { tNow } from "../i18n";
 import { RequestError, type Link } from "../net/connection";
 import { isDesktop, tauri } from "../platform";
+import { notify } from "../platform/notify";
+import { captureFailure } from "../voice/screen-permission";
+import { channelPermissions } from "../lib/channel-permissions";
 import type { Event } from "../proto/Event";
 import type { ScreenStopReason } from "../proto/ScreenStopReason";
 import { nextMediaRun } from "../voice/engine";
-import { applyCaptureSpec, captureScreen, captureSupport, probeAv1Encoder, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PublishStats, type SlotStats } from "../voice/screen";
+import { applyCaptureSpec, captureScreen, captureSupport, probeAv1Encoder, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PublishStats, type SlotStats, type EncoderFallbacks } from "../voice/screen";
 import { myChannelId } from "./reducer";
 import { useScreen, type ScreenAction } from "./screen";
 import { useSession, useUi } from "./stores";
@@ -28,6 +31,8 @@ const WATCH_UNAVAILABLE_MS = 5_000;
 const FIRST_FRAME_TIMEOUT_MS = 35_000;
 /** The server takes a Try again at most this long after the share's last start or retry for me, and holds an earlier one until then (`RETRY_FIRST`). */
 const RETRY_SPACING_MS = 15_000;
+/** remove() emits a final move update before client.left; allow that ordered sequence to settle. */
+const DEPARTURE_SETTLE_MS = 150;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -96,6 +101,8 @@ function stopStream(stream: MediaStream | null | undefined): void {
 
 export class ScreenController {
   private publisher: ScreenPublisher | null = null;
+  /** Capture is already stopped; these peers await the explicit stop acknowledgement. */
+  private readonly stoppingPublishers = new Set<ScreenPublisher>();
   private transport: ScreenWatchTransport | null = null;
   private transportReady: Promise<number> | null = null;
   /** A receiver that carried a share can still hold its last decoded frame. */
@@ -119,10 +126,25 @@ export class ScreenController {
    */
   private lastStart: number | null = null;
   private initialised = false;
+  private suspended = false;
+  private ownChannel: number | null = null;
+  private encoderFallbacks: EncoderFallbacks | undefined;
+  private readonly leftWatches = new Set<number>();
+  private departureCheck: ReturnType<typeof setTimeout> | null = null;
+  private recoveringAttempt: number | null = null;
+  private retainedCapture = false;
+  /** A failed publisher must be retired by the server before starting another share. */
+  private lostPublisherShare: string | null = null;
+  private ownDeadline: ReturnType<typeof setTimeout> | null = null;
+  private watchRetry: ReturnType<typeof setTimeout> | null = null;
+  private watchRecoveries = 0;
+  private readonly targets = new Map<number, { uid: string; channel: number; client: number; otherShares: Set<string> }>();
+  private readonly waiting = new Map<number, ReturnType<typeof setTimeout>>();
 
   constructor(
     private readonly link: () => Link | null,
     private readonly describe: (e: unknown) => string,
+    private readonly canResumeVoice: () => boolean = () => true,
   ) {}
 
   /** Ends my share locally when I leave or change my voice channel; the server ends it too (`left`). */
@@ -132,7 +154,15 @@ export class ScreenController {
     if (isDesktop()) void loadDesktopCapture();
     useScreen.subscribe((s) => { if (s.own?.phase === "live") useUi.getState().dismissToast("screen-stopped"); });
     useSession.subscribe((s, prev) => {
-      if (myChannelId(s) !== myChannelId(prev) && useScreen.getState().own) this.endOwn();
+      const own = useScreen.getState().own;
+      if (own && this.retainedCapture) {
+        if (!this.suspended && myChannelId(s) !== null) {
+          if (myChannelId(s) !== this.ownChannel) this.recoveryFailed();
+          else if (own.phase === "reconnecting") void this.confirmShare();
+        }
+      } else if (myChannelId(s) !== myChannelId(prev) && own && !this.suspended) this.endOwn();
+      if (s.clients !== prev.clients) this.observeDepartures();
+      if ((s.shares !== prev.shares || s.clients !== prev.clients || s.channels !== prev.channels || s.groups !== prev.groups || s.owner !== prev.owner || myChannelId(s) !== myChannelId(prev)) && !this.suspended) this.resumeWatches();
     });
   }
 
@@ -145,12 +175,16 @@ export class ScreenController {
   beginShare(): void {
     // The button refuses these too; the controller never relies on it.
     if (useScreen.getState().own || screenSupport() !== "ok") return;
+    if (useScreen.getState().notice === "reconnect" && myChannelId(useSession.getState()) === null) return;
+    if (!this.suspended) this.ownChannel = myChannelId(useSession.getState());
+    this.encoderFallbacks = undefined;
+    this.retainedCapture = this.suspended;
     const attempt = ++this.attempts;
     let picked: Promise<MediaStream>;
     try {
       picked = captureScreen(resolveQuality(useSettings.getState(), "unknown"));
     } catch (e) {
-      useUi.getState().toast("error", tNow("screen.captureFailed", { reason: e instanceof Error ? e.message : String(e) }));
+      this.captureError(e);
       return;
     }
     dispatch({ type: "pick", attempt });
@@ -160,24 +194,64 @@ export class ScreenController {
         const track = stream.getVideoTracks()[0];
         if (!track || own?.attempt !== attempt || own.phase !== "picking") { stopStream(stream); return; }
         // The browser's own "Stop sharing", or the shared window closing.
-        track.addEventListener("ended", () => { if (useScreen.getState().own?.attempt === attempt) void this.stopShare(); });
+        track.addEventListener("ended", () => {
+          if (useScreen.getState().own?.attempt !== attempt) return;
+          if (this.suspended || this.retainedCapture || this.recoveringAttempt === attempt) this.recoveryFailed();
+          else void this.stopShare();
+        });
+        if (["permission", "permissionHint"].includes(useScreen.getState().notice ?? "")) dispatch({ type: "notice", notice: null });
         dispatch({ type: "picked", attempt, stream, surface: surfaceOf(track) });
         dispatch({ type: "choose", spec: resolveQuality(useSettings.getState(), surfaceOf(track)) });
       },
       (e: unknown) => {
+        if (useScreen.getState().own?.attempt !== attempt) return;
         dispatch({ type: "ownEnded", attempt });
-        const name = e instanceof DOMException ? e.name : "";
-        const reason = e instanceof Error ? e.message : String(e);
-        // WebKit and Chromium answer a closed picker and a refusal before any picker with the same
-        // `NotAllowedError`, and nothing tells them apart: say so neutrally, never stay silent.
-        if (name === "NotAllowedError") {
-          useUi.getState().toast("info", tNow("screen.pickerDeclined", { reason }));
-          return;
-        }
-        if (name === "AbortError") return;
-        useUi.getState().toast("error", tNow("screen.captureFailed", { reason }));
+        this.captureError(e);
       },
     );
+  }
+
+  private captureError(error: unknown): void {
+    // Retain browser details in diagnostics, never in translated UI copy.
+    console.warn("[screen] capture:", error);
+    const failure = captureFailure(error);
+    if (failure === "permission" || failure === "hint") this.showNotice(failure === "hint" ? "permissionHint" : "permission");
+    else if (failure === "failed") useUi.getState().toast("error", tNow("screen.captureFailed"));
+  }
+
+  private recoveryFailed(): void {
+    if (!useScreen.getState().own) return;
+    void this.stopShare();
+    this.showNotice("reconnect");
+    if (isDesktop()) notify({ title: "Gwar", body: tNow("screen.reconnectStopped"), tag: "screen-reconnect" });
+  }
+
+  private showNotice(notice: "reconnect" | "permission" | "permissionHint"): void {
+    useUi.getState().dismissToast("screen-stopped");
+    dispatch({ type: "notice", notice });
+  }
+
+  /** Keep capture and the original deadline when media notices a blip before signalling. */
+  private recoverPublisher(): void {
+    const own = useScreen.getState().own;
+    if (!own) return;
+    this.lostPublisherShare = own.share;
+    this.retainPublisher();
+    dispatch({ type: "recoverOwn" });
+    if (own.stream?.getVideoTracks()[0]?.readyState === "ended") this.recoveryFailed();
+  }
+
+  private retainPublisher(): void {
+    const own = useScreen.getState().own;
+    if (!own) return;
+    this.retainedCapture = true;
+    if (own.phase !== "reconnecting") this.ownChannel = myChannelId(useSession.getState()) ?? this.ownChannel;
+    this.recoveringAttempt = own.attempt;
+    const publisher = this.publisher;
+    this.publisher = null;
+    if (publisher) this.encoderFallbacks = publisher.fallbacks();
+    publisher?.close();
+    this.ownDeadline ??= setTimeout(() => this.recoveryFailed(), 45_000);
   }
 
   /** Saves only the changed controls; a surface-derived mode stays automatic until clicked. */
@@ -210,9 +284,12 @@ export class ScreenController {
 
   /** Turns my share's watch link off, or (as a moderator) someone else's; final for that share. */
   async turnOffLink(share: string): Promise<void> {
+    // Preserve my privacy choice even if the acknowledgement is lost with the session.
+    if (this.lostPublisherShare === share) dispatch({ type: "guestLink", on: false });
+    if (useScreen.getState().own?.share === share) dispatch({ type: "link", share, active: false });
     const conn = this.link();
     if (!conn) return;
-    try { await conn.request("screen.link.revoke", { share }); }
+    try { await conn.request("screen.link.revoke", { share }); dispatch({ type: "link", share, active: false }); }
     catch (e) { useUi.getState().toast("error", this.describe(e)); }
   }
 
@@ -221,17 +298,35 @@ export class ScreenController {
     const own = useScreen.getState().own;
     const conn = this.link();
     const track = own?.stream?.getVideoTracks()[0];
-    if (!own || own.phase !== "choosing" || !track) return;
+    if (!own || (own.phase !== "choosing" && own.phase !== "reconnecting") || !track) return;
+    if (this.lostPublisherShare) return;
+    const s = useSession.getState();
+    const me = s.me ? s.clients[s.me.session] : undefined;
+    // Restored presence does not clear a permanent voice refusal or authorize silent sessions.
+    if (this.suspended || (this.retainedCapture && (!me?.voice_binding || me.channel === null || !this.canResumeVoice()))) {
+      if (own.phase === "choosing") {
+        this.recoveringAttempt = own.attempt;
+        this.ownDeadline ??= setTimeout(() => this.recoveryFailed(), 45_000);
+        dispatch({ type: "queueShare", attempt: own.attempt });
+      }
+      return;
+    }
+    const recovering = own.phase === "reconnecting";
+    if (recovering && track.readyState === "ended") { this.recoveryFailed(); return; }
     const { attempt, spec, surface } = own;
     // Only what the sharer saw and confirmed: the notice and the checkbox were in the quality menu.
     const guestLink = own.guestLink && this.guestLinkPossible();
-    const current = () => useScreen.getState().own?.attempt === attempt && this.link() === conn;
-    const s = useSession.getState();
-    const me = s.me ? s.clients[s.me.session] : undefined;
+    const generation = this.generation;
+    const current = () => this.generation === generation && useScreen.getState().own?.attempt === attempt && this.link() === conn;
     const binding = me?.voice_binding;
-    if (!conn || !me || me.channel === null || !binding) { this.endOwn(); return; }
+    if (!conn || !me || me.channel === null || !binding) { if (!recovering) this.endOwn(); return; }
+    if (this.ownChannel !== null && me.channel !== this.ownChannel) { this.recoveryFailed(); return; }
     // Never a share in the clear in an encrypted channel (docs/screen-share.md, "First release").
-    if (s.channels[me.channel]?.encrypted) { this.endOwn(); useUi.getState().toast("info", tNow("screen.encryptedSoon")); return; }
+    if (s.channels[me.channel]?.encrypted) {
+      if (recovering) this.recoveryFailed();
+      else { this.endOwn(); useUi.getState().toast("info", tNow("screen.encryptedSoon")); }
+      return;
+    }
     dispatch({ type: "starting", attempt });
     let share: string;
     let screenSpec: boolean;
@@ -246,8 +341,8 @@ export class ScreenController {
       share = (await conn.request("screen.start", { call: binding.call, participation: binding.participation, preset: legacyPreset(spec), ...(screenSpec ? { spec } : {}), surface, guest_link: guestLink })).share;
     } catch (e) {
       if (!current()) return;
-      this.endOwn();
-      useUi.getState().toast("error", this.startError(e));
+      if (recovering) this.recoveryFailed();
+      else { this.endOwn(); useUi.getState().toast("error", this.startError(e)); }
       return;
     }
     if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
@@ -263,21 +358,20 @@ export class ScreenController {
     const hardwareAv1 = await av1;
     if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
     const publisher = new ScreenPublisher({
-      track, quality: latest(), legacy: !screenSpec, av1: hardwareAv1, automaticMode: useSettings.getState().screenMode === null, iceServers: s.iceServers,
-      ended: () => { if (this.publisher === publisher) void this.stopShare(); },
+      track, fallbacks: this.encoderFallbacks, quality: latest(), legacy: !screenSpec, av1: hardwareAv1, automaticMode: useSettings.getState().screenMode === null, iceServers: s.iceServers,
+      ended: () => { if (this.publisher === publisher) { if (this.recoveringAttempt === attempt) this.recoveryFailed(); else void this.stopShare(); } },
       surfaceChanged: (surface, spec) => {
         if (current()) dispatch({ type: "surface", attempt, surface, spec });
       },
       offer: async body => (await conn.request("screen.publish.offer", { share, ...body }, { timeoutMs: 35_000 })).sdp,
       state: state => {
         if (state !== "failed" || this.publisher !== publisher) return;
-        void this.stopShare();
-        this.stoppedNotice(tNow("screen.stopped.transport"));
+        this.recoverPublisher();
       },
       encodeFailed: () => {
         if (this.publisher !== publisher) return;
-        void this.stopShare();
-        this.stoppedNotice(tNow("screen.stopped.encoder"));
+        if (this.recoveringAttempt === attempt) this.recoveryFailed();
+        else { void this.stopShare(); this.stoppedNotice(tNow("screen.stopped.encoder")); }
       },
     });
     this.publisher = publisher;
@@ -285,8 +379,8 @@ export class ScreenController {
       await publisher.start();
     } catch (e) {
       if (this.publisher !== publisher) return;
-      void this.stopShare();
-      useUi.getState().toast("error", this.describe(e));
+      console.warn("[screen] publish:", e);
+      this.recoverPublisher();
     }
   }
 
@@ -294,15 +388,33 @@ export class ScreenController {
   async stopShare(): Promise<void> {
     const own = useScreen.getState().own;
     const conn = this.link();
+    // Capture and UI stop now. Keep DTLS until the explicit stop settles: closing it
+    // earlier can overtake even an already sent WebSocket request at the server.
+    const publisher = this.publisher;
+    this.publisher = null;
+    if (publisher) this.stoppingPublishers.add(publisher);
+    const share = own?.share ?? this.lostPublisherShare;
+    const stopped = share && conn ? conn.request("screen.stop", { share }).catch(() => {}) : null;
     this.endOwn();
-    if (own?.share && conn) await conn.request("screen.stop", { share: own.share }).catch(() => {});
+    try { await stopped; }
+    finally {
+      if (publisher && this.stoppingPublishers.delete(publisher)) publisher.close();
+    }
   }
 
   /** Ends my share here: the transport closes and the capture stops. */
   private endOwn(): void {
     const own = useScreen.getState().own;
-    this.publisher?.close();
+    const publisher = this.publisher;
     this.publisher = null;
+    publisher?.close();
+    if (this.ownDeadline) clearTimeout(this.ownDeadline);
+    this.ownDeadline = null;
+    this.recoveringAttempt = null;
+    this.ownChannel = null;
+    this.encoderFallbacks = undefined;
+    this.retainedCapture = false;
+    this.lostPublisherShare = null;
     if (!own) return;
     stopStream(own.stream);
     dispatch({ type: "ownEnded", attempt: own.attempt });
@@ -326,7 +438,8 @@ export class ScreenController {
       if (e.code === "busy") return tNow("screen.channelFull");
       if (e.code === "conflict") return tNow("screen.alreadySharing");
     }
-    return this.describe(e);
+    console.warn("[screen] start:", e);
+    return tNow("screen.publishFailed");
   }
 
   // ----------------------------------------------------------------- watching
@@ -346,26 +459,36 @@ export class ScreenController {
     if (!conn || !info || !canWatch()) return;
     if (info.client === s.me?.session) return;
     if (s.channels[info.channel]?.encrypted) { useUi.getState().toast("info", tNow("screen.encryptedSoon")); return; }
+    if (this.released.has(share)) {
+      this.released.delete(share);
+      const previous = useScreen.getState().watches.find(w => w.share === share);
+      if (previous) this.forgetWatch(previous.id);
+      dispatch({ type: "unwatch", share });
+    }
     if (useScreen.getState().watches.some(w => w.share === share)) { this.focus(share); return; }
+    if (useScreen.getState().watches.length === 0) this.watchRecoveries = 0;
     const id = ++this.watchIds;
+    const uid = s.clients[info.client]?.uid;
+    if (uid) this.targets.set(id, { uid, channel: info.channel, client: info.client, otherShares: new Set() });
     const generation = this.generation;
     dispatch({ type: "watch", share, id });
+    if (this.suspended) { this.waitForWatch(id); return; }
     await this.serial(share, () => this.startWatch(conn, share, id, generation));
   }
 
   private async startWatch(conn: Link, share: string, id: number, generation: number): Promise<void> {
-    const alive = () => this.generation === generation && this.link() === conn && useScreen.getState().watches.some(w => w.id === id);
+    const alive = () => this.generation === generation && this.link() === conn && useScreen.getState().watches.some(w => w.id === id && w.share === share);
     let run: number | undefined;
     try {
       if (!alive()) return;
       run = await this.ensureTransport(conn);
-      const current = () => alive() && useScreen.getState().transport.run === run;
+      const current = () => alive() && useScreen.getState().transport.run === run && useScreen.getState().transport.phase === "connected";
       if (!current()) return;
       const slot = await this.requestWatch(conn, share, current);
       if (slot === null) return;
       // A retired run has already lost all its grants. Releasing by share there could
       // instead release a watch that has since moved to the replacement transport.
-      if (useScreen.getState().transport.run !== run) return;
+      if (useScreen.getState().transport.run !== run || useScreen.getState().transport.phase === "failed") return;
       const reused = this.usedSlots.has(slot);
       this.usedSlots.add(slot);
       if (!current()) { await conn.request("screen.unwatch", { share }).catch(() => {}); return; }
@@ -382,8 +505,9 @@ export class ScreenController {
       dispatch({ type: "granted", run, id, slot });
       if (useScreen.getState().stage === share) void conn.request("screen.focus", { share }).catch(() => {});
     } catch (e) {
-      if (!alive() || (run !== undefined && useScreen.getState().transport.run !== run)) return;
+      if (!alive() || useScreen.getState().transport.phase === "failed" || (run !== undefined && useScreen.getState().transport.run !== run)) return;
       const text = this.watchError(e);
+      this.forgetWatch(id);
       this.clearFirstFrame(id);
       dispatch({ type: "unwatch", share });
       useUi.getState().toast("error", text);
@@ -421,13 +545,15 @@ export class ScreenController {
       if (e.code === "forbidden") return tNow("screen.joinToWatch");
       if (e.code === "not_found") return tNow("screen.ended");
     }
-    return this.describe(e);
+    console.warn("[screen] watch:", e);
+    return tNow("screen.watchFailed");
   }
 
   async unwatch(share: string): Promise<void> {
     const conn = this.link();
     const watch = useScreen.getState().watches.find(w => w.share === share);
     if (!watch) return;
+    this.forgetWatch(watch.id);
     this.clearFirstFrame(watch.id);
     dispatch({ type: "unwatch", share });
     const next = useScreen.getState().stage;
@@ -481,6 +607,7 @@ export class ScreenController {
     const screen = useScreen.getState();
     if (screen.transport.run !== run || !screen.watches.some(w => w.id === id && w.share === share && w.status === "watching")) return;
     if (this.firstFrameTimers.get(id)?.run === run) this.clearFirstFrame(id);
+    this.watchRecoveries = 0;
   }
 
   /** A connected receiver can stay silent without tripping the H.264 decode watchdog. */
@@ -535,14 +662,23 @@ export class ScreenController {
     let settle!: { resolve: (run: number) => void; reject: (e: unknown) => void };
     const ready = new Promise<number>((resolve, reject) => { settle = { resolve, reject }; });
     ready.catch(() => {});
-    // Every watch ends with the transport (the server ends them too). Their requests return
-    // quietly, so the failure is said here, once, if anything was being watched.
     const fail = (e: unknown) => {
-      const lost = useScreen.getState().watches.length > 0;
+      if (this.transport !== transport) return;
+      const watches = useScreen.getState().watches;
       dispatch({ type: "transport", run, phase: "failed" });
       this.dropTransport();
       settle.reject(e);
-      if (lost) useUi.getState().toast("error", tNow("screen.watchFailed"));
+      if (!watches.length || this.suspended) return;
+      if (this.watchRecoveries >= 3) {
+        for (const watch of watches) { this.forgetWatch(watch.id); dispatch({ type: "unwatch", share: watch.share }); }
+        useUi.getState().toast("error", tNow("screen.watchFailed"));
+        return;
+      }
+      for (const watch of watches) this.waitForWatch(watch.id);
+      this.watchRetry = setTimeout(() => {
+        this.watchRetry = null;
+        this.resumeWatches();
+      }, 1_000 * 2 ** this.watchRecoveries++);
     };
     let screenH264 = false;
     const transport: ScreenWatchTransport = new ScreenWatchTransport({
@@ -629,8 +765,7 @@ export class ScreenController {
         if (publisher && useScreen.getState().own?.share === event.d.share) void publisher.recover(event.d).catch((e: unknown) => {
           if (this.publisher !== publisher || useScreen.getState().own?.share !== event.d.share) return;
           console.warn("Screen recovery:", e);
-          void this.stopShare();
-          this.stoppedNotice(tNow("screen.stopped.transport"));
+          this.recoverPublisher();
         });
         return;
       }
@@ -641,6 +776,14 @@ export class ScreenController {
       }
       case "screen.started":
         dispatch({ type: "live", share: event.d.share });
+        if (useScreen.getState().own?.share === event.d.share) {
+          dispatch({ type: "notice", notice: null });
+          this.recoveringAttempt = null;
+          this.retainedCapture = false;
+          if (this.ownDeadline) clearTimeout(this.ownDeadline);
+          this.ownDeadline = null;
+        }
+        this.resumeWatches();
         return;
       case "screen.paused":
         dispatch({ type: "paused", share: event.d.share, reason: event.d.reason });
@@ -658,6 +801,7 @@ export class ScreenController {
         dispatch({ type: "viewers", share: event.d.share, members: event.d.members, guests: event.d.guests });
         return;
       case "screen.link":
+        if (event.d.share === this.lostPublisherShare && !event.d.active) dispatch({ type: "guestLink", on: false });
         dispatch({ type: "link", share: event.d.share, active: event.d.active });
         return;
       case "screen.slot": {
@@ -668,6 +812,8 @@ export class ScreenController {
         if (ended) {
           this.clearFirstFrame(ended.id);
           this.released.set(ended.share, { onStage: screen.stage === ended.share });
+          // Keep the stage until the following stop event distinguishes departure from revocation.
+          dispatch({ type: "watchWaiting", share: ended.share });
         }
         if (this.transport?.run === run) this.transport.clearSlot(slot);
         dispatch({ type: "slot", run, slot, share });
@@ -675,9 +821,17 @@ export class ScreenController {
       }
       case "screen.stopped": {
         const { share, reason, by } = event.d;
+        if (reason === "transport" && useScreen.getState().own?.share === share) this.recoverPublisher();
         if (reason !== "access" && reason !== "codec") dispatch({ type: "link", share, active: false });
+        if (share === this.lostPublisherShare) {
+          this.lostPublisherShare = null;
+          if (reason === "transport") { if (!this.suspended) void this.confirmShare(); }
+          else { this.endOwn(); const text = this.ownStopText(reason, by); if (text) this.stoppedNotice(text, reason === "moderator" ? "info" : "error"); }
+          return;
+        }
         const own = useScreen.getState().own;
         if (own?.share === share) {
+          if (this.recoveringAttempt === own.attempt) { this.recoveryFailed(); return; }
           this.endOwn();
           const text = this.ownStopText(reason, by);
           if (text) this.stoppedNotice(text, reason === "moderator" ? "info" : "error");
@@ -689,8 +843,17 @@ export class ScreenController {
         this.released.delete(share);
         const watched = screen.watches.find(w => w.share === share);
         if (!watched && !released) return;
+        if (watched && (reason === "left" || reason === "transport")) {
+          this.clearFirstFrame(watched.id);
+          dispatch({ type: "watchWaiting", share });
+          const target = this.targets.get(watched.id);
+          if (reason === "left" && target && useSession.getState().clients[target.client]?.uid === target.uid) this.leftWatches.add(watched.id);
+          this.waitForWatch(watched.id);
+          return;
+        }
         const onStage = watched ? screen.stage === share : released!.onStage;
         if (watched) {
+          this.forgetWatch(watched.id);
           this.clearFirstFrame(watched.id);
           dispatch({ type: "unwatch", share });
         }
@@ -716,8 +879,144 @@ export class ScreenController {
     }
   }
 
+  /** Retire session transports while retaining the user's capture and viewing intent. */
+  suspend(): void {
+    if (this.suspended) return;
+    this.suspended = true;
+    this.closeStoppingPublishers();
+    if (this.departureCheck) clearTimeout(this.departureCheck);
+    this.departureCheck = null;
+    this.generation++;
+    this.chains.clear();
+    this.released.clear();
+    if (this.watchRetry) clearTimeout(this.watchRetry);
+    this.watchRetry = null;
+    const own = useScreen.getState().own;
+    this.retainedCapture = own !== null;
+    if (own?.phase !== "reconnecting") this.ownChannel = myChannelId(useSession.getState()) ?? this.ownChannel;
+    if (own && (own.phase === "starting" || own.phase === "live" || own.phase === "reconnecting")) {
+      this.retainPublisher();
+    }
+    for (const watch of useScreen.getState().watches) this.waitForWatch(watch.id);
+    this.dropTransport();
+    dispatch({ type: "suspend" });
+    if (own?.stream?.getVideoTracks()[0]?.readyState === "ended") this.recoveryFailed();
+  }
+
+  /** Called after Welcome rebuilt session state; voice's rejoin supplies the new publish binding. */
+  resume(): void {
+    this.suspended = false;
+    this.lostPublisherShare = null;
+    if (useScreen.getState().own?.phase === "reconnecting" && myChannelId(useSession.getState()) === this.ownChannel) void this.confirmShare();
+    this.resumeWatches();
+  }
+
+  private forgetWatch(id: number): void {
+    const timer = this.waiting.get(id);
+    if (timer) clearTimeout(timer);
+    this.waiting.delete(id);
+    this.leftWatches.delete(id);
+    if (this.leftWatches.size === 0 && this.departureCheck) { clearTimeout(this.departureCheck); this.departureCheck = null; }
+    this.targets.delete(id);
+  }
+
+  private waitForWatch(id: number): void {
+    if (this.waiting.has(id)) return;
+    const target = this.targets.get(id);
+    if (target) {
+      target.otherShares.clear();
+      for (const share of Object.values(useSession.getState().shares)) {
+        if (share.client !== target.client) target.otherShares.add(share.share);
+      }
+    }
+    this.waiting.set(id, setTimeout(() => {
+      const watch = useScreen.getState().watches.find(w => w.id === id);
+      this.forgetWatch(id);
+      if (watch) {
+        dispatch({ type: "unwatch", share: watch.share });
+        const connected = !this.suspended && useScreen.getState().transport.phase === "connected";
+        useUi.getState().toast(connected ? "info" : "error", tNow(connected ? "screen.ended" : "screen.watchFailed"));
+      }
+    }, 45_000));
+  }
+
+  private resumeWatches(): void {
+    if (this.suspended || this.watchRetry) return;
+    const conn = this.link();
+    if (!conn) return;
+    const session = useSession.getState();
+    for (const watch of useScreen.getState().watches) {
+      if (!this.waiting.has(watch.id) || this.leftWatches.has(watch.id)) continue;
+      const target = this.targets.get(watch.id);
+      const candidates = target ? Object.values(session.shares).filter(s =>
+        s.channel === target.channel && session.clients[s.client]?.uid === target.uid
+        && !target.otherShares.has(s.share)
+        && !useScreen.getState().watches.some(w => w.id !== watch.id && w.share === s.share)) : [];
+      // Client exposes no device identity: do not guess between several returning captures.
+      const info = session.shares[watch.share] ?? (candidates.length === 1 ? candidates[0] : undefined);
+      if (!info) continue;
+      // A password channel is watchable again only after voice rejoin restores admission.
+      const me = session.me ? session.clients[session.me.session] : undefined;
+      const bypass = me && session.me && channelPermissions({ uid: session.me.uid, groups: me.groups, owner: session.owner?.uid === session.me.uid }, info.channel, session.channels, session.groups).includes("bypass_password");
+      if (session.channels[info.channel]?.has_password && !bypass && myChannelId(session) !== info.channel) continue;
+      clearTimeout(this.waiting.get(watch.id));
+      this.waiting.delete(watch.id);
+      if (target) this.targets.set(watch.id, { ...target, client: info.client });
+      dispatch({ type: "watchReplaced", id: watch.id, share: info.share });
+      const generation = this.generation;
+      void this.serial(info.share, () => this.startWatch(conn, info.share, watch.id, generation));
+    }
+  }
+
+  private observeDepartures(): void {
+    const session = useSession.getState();
+    for (const id of this.leftWatches) {
+      const target = this.targets.get(id);
+      if (!target || session.clients[target.client]?.uid !== target.uid) this.leftWatches.delete(id);
+    }
+    if (!this.leftWatches.size) {
+      if (this.departureCheck) clearTimeout(this.departureCheck);
+      this.departureCheck = null;
+    } else if (!this.departureCheck) {
+      this.departureCheck = setTimeout(() => {
+        this.departureCheck = null;
+        this.settleDepartures();
+        this.resumeWatches();
+      }, DEPARTURE_SETTLE_MS);
+    }
+  }
+
+  /** `left` precedes client.updated (a move/leave) or client.left (a dropped session). */
+  private settleDepartures(): void {
+    const session = useSession.getState();
+    for (const id of this.leftWatches) {
+      this.leftWatches.delete(id);
+      const target = this.targets.get(id);
+      const watch = useScreen.getState().watches.find(w => w.id === id);
+      if (!target || !watch || session.clients[target.client]?.uid !== target.uid) continue;
+      this.forgetWatch(id);
+      dispatch({ type: "unwatch", share: watch.share });
+      useUi.getState().toast("info", tNow("screen.ended"));
+    }
+  }
+
+  private closeStoppingPublishers(): void {
+    for (const publisher of this.stoppingPublishers) publisher.close();
+    this.stoppingPublishers.clear();
+  }
+
   /** The session ended or is being replaced: everything of it stops here; the server ended it too. */
   reset(): void {
+    this.closeStoppingPublishers();
+    if (this.departureCheck) clearTimeout(this.departureCheck);
+    this.departureCheck = null;
+    this.suspended = false;
+    if (this.watchRetry) clearTimeout(this.watchRetry);
+    this.watchRetry = null;
+    for (const id of this.waiting.keys()) this.forgetWatch(id);
+    this.targets.clear();
+    this.leftWatches.clear();
+    this.watchRecoveries = 0;
     this.endOwn();
     this.attempts++;
     // Requests of the old session settle on their own (their transport is retired below, their

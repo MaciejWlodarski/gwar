@@ -6,6 +6,14 @@ const run = (state: ScreenState, ...actions: ScreenAction[]) => actions.reduce(r
 const connected = (r = 7) => run(initialScreen, { type: "transport", run: r, phase: "connecting" }, { type: "transport", run: r, phase: "connected" });
 
 describe("own share", () => {
+  it("retains active watches and the enabled link choice when only publishing needs recovery", () => {
+    const s = run(connected(), { type: "watch", share: "other", id: 1 }, { type: "granted", run: 7, id: 1, slot: 0 },
+      { type: "pick", attempt: 1 }, { type: "picked", attempt: 1, stream, surface: "window" },
+      { type: "starting", attempt: 1 }, { type: "started", attempt: 1, share: "mine" }, { type: "link", share: "mine", active: true }, { type: "live", share: "mine" });
+    const recovering = run(s, { type: "recoverOwn" });
+    expect(recovering.own).toMatchObject({ phase: "reconnecting", stream, share: null, guestLink: true });
+    expect(recovering.watches).toBe(s.watches); expect(recovering.transport).toBe(s.transport); expect(recovering.streams).toBe(s.streams); expect(recovering.stage).toBe("other");
+  });
   it("goes picker → preset menu → starting → live, and ends", () => {
     let s = run(initialScreen, { type: "pick", attempt: 1 });
     expect(s.own?.phase).toBe("picking");
@@ -104,7 +112,7 @@ describe("watching", () => {
     expect(run(s, { type: "stage", share: "C" }).stage).toBe("A");
   });
 
-  it("a new run waits for new answers; a failed transport ends every watch", () => {
+  it("a new run waits for new answers; a failed transport retains viewing intent", () => {
     let s = run(connected(), { type: "watch", share: "A", id: 1 }, { type: "granted", run: 7, id: 1, slot: 0 }, { type: "stream", run: 7, slot: 0, stream });
     const renewed = run(s, { type: "transport", run: 9, phase: "connecting" });
     expect(renewed.watches).toEqual([{ share: "A", id: 1, slot: null, status: "requesting" }]);
@@ -112,7 +120,7 @@ describe("watching", () => {
     // An older run's report changes nothing.
     expect(run(renewed, { type: "transport", run: 7, phase: "failed" }).watches).toHaveLength(1);
     s = run(s, { type: "transport", run: 7, phase: "failed" });
-    expect(s).toMatchObject({ watches: [], stage: null, transport: { run: 7, phase: "failed" } });
+    expect(s).toMatchObject({ watches: [{ share: "A", status: "requesting", slot: null }], stage: "A", transport: { run: 7, phase: "failed" } });
   });
 
   it("watching is independent of my own share, which start → stop → start leaves alone", () => {
