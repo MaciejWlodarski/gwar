@@ -372,7 +372,7 @@ describe("staying on the server without voice", () => {
     expect(engine.start).not.toHaveBeenCalled();
   });
 
-  it.each(["channel_restarted", "epoch_exhausted", "stream_limit", "state_limit", "channel_deleted"] as const)("says voice disconnected without claiming to retry after %s", async (reason) => {
+  it.each(["channel_restarted", "epoch_exhausted", "stream_limit", "state_limit"] as const)("says voice disconnected without claiming to retry after %s", async (reason) => {
     connectFake({ channel: 1 });
     await vi.advanceTimersByTimeAsync(10);
     engine.start.mockClear();
@@ -405,6 +405,38 @@ describe("staying on the server without voice", () => {
       expect(engine.start).toHaveBeenCalledTimes(6);
       expect(stores.useUi.getState().toasts.some(t => t.key === "voice-closed")).toBe(false);
     } finally { engine.start.mockImplementation(async () => {}); }
+  });
+
+  it("S1 rejoins the closed channel on Retry and removes Retry when that channel is removed", async () => {
+    const close = (reason: "channel_restarted" | "stream_limit" | "channel_deleted") => link.emit({ ev: "voice.closed", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, reason } });
+    const notice = () => stores.useUi.getState().toasts.find(t => t.key === "voice-closed")!;
+    connectFake({ channel: 1 });
+    await vi.advanceTimersByTimeAsync(10);
+    engine.start.mockClear();
+    close("channel_restarted");
+    // The real server follows voice.closed with a move outside voice.
+    link.emit({ ev: "client.updated", d: client(1, null) });
+    await vi.advanceTimersByTimeAsync(10);
+    notice().action!.run();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 1, password: null });
+    expect(engine.start).not.toHaveBeenCalled();
+    link.emit({ ev: "client.updated", d: client(1, 1) });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(engine.start).toHaveBeenCalledOnce();
+    engine.emitState("connected");
+    close("stream_limit");
+    link.emit({ ev: "client.updated", d: client(1, null) });
+    link.emit({ ev: "channel.deleted", d: { channel: 1 } });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(notice().text).toBe("The voice channel was removed. Join another channel to talk.");
+    expect(notice().action).toBeUndefined();
+    link.emit({ ev: "client.updated", d: client(1, 2) });
+    await vi.advanceTimersByTimeAsync(10);
+    // The reason alone suffices, even before channel.deleted reaches this device.
+    close("channel_deleted");
+    expect(notice().text).toBe("The voice channel was removed. Join another channel to talk.");
+    expect(notice().action).toBeUndefined();
   });
 
   it("goes back into the voice channel after a reconnect", async () => {
@@ -1418,6 +1450,52 @@ it("a teardown that resumes after a newer connect leaves that connection alone",
   expect(c.conn).toBe(newer);
   expect(session().me).not.toBeNull();
   c.conn = link;
+});
+
+it("S2 terminal teardown clears session notices but a stale teardown preserves a newer session notice", async () => {
+  connectFake({ channel: 1 });
+  await vi.advanceTimersByTimeAsync(10);
+  const ui = stores.useUi.getState();
+  link.emit({ ev: "voice.closed", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, reason: "transport_failed" } });
+  for (const key of ["voice-output", "screen-stopped", "identity-load"]) ui.toast("error", key, { key, sticky: true });
+  link.isOnline = false;
+  link.status_({ state: "closed", reason: { kind: "server", reason: { kind: "replaced" } } });
+  await vi.advanceTimersByTimeAsync(10);
+  expect(session().me).toBeNull();
+  expect(stores.useUi.getState().toasts.filter(t => ["voice-closed", "voice-output", "screen-stopped"].includes(t.key ?? ""))).toEqual([]);
+  expect(stores.useUi.getState().toasts.some(t => t.key === "identity-load")).toBe(true);
+
+  link = new FakeLink(); connectFake();
+  const c = controller as unknown as { connections: number; runtime: unknown; teardown(): Promise<void> };
+  let finish!: () => void;
+  c.runtime = { close: () => new Promise<void>(resolve => { finish = resolve; }) };
+  const stale = c.teardown();
+  link = new FakeLink(); connectFake(); c.connections++;
+  ui.toast("info", "New session is reconnecting", { key: "voice-closed", sticky: true });
+  finish(); await stale;
+  expect(stores.useUi.getState().toasts.find(t => t.key === "voice-closed")?.text).toBe("New session is reconnecting");
+});
+
+it("S3 clears the identity-load notice only after a successful active load or adoption", async () => {
+  const identities = await import("../net/identity");
+  const identity = { nickname: "Recovered", publicKey: "key" } as import("../net/identity").Identity;
+  await controller.switchIdentity(null);
+  const load = vi.spyOn(identities, "loadActiveIdentity").mockRejectedValueOnce(new Error("Storage unavailable")).mockResolvedValueOnce(identity);
+  const warn = () => stores.useUi.getState().toast("error", "Identity unavailable", { key: "identity-load", sticky: true });
+  const warned = () => stores.useUi.getState().toasts.some(t => t.key === "identity-load");
+  try {
+    warn();
+    await expect(controller.getIdentity()).rejects.toThrow("Storage unavailable");
+    expect(warned()).toBe(true);
+    await controller.getIdentity();
+    expect(warned()).toBe(false);
+    warn();
+    await controller.switchIdentity(null);
+    expect(warned()).toBe(true);
+    // Connect sign-in/recovery adopts the validated device identity through this path.
+    await controller.switchIdentity(identity);
+    expect(warned()).toBe(false);
+  } finally { await controller.switchIdentity(null); load.mockRestore(); }
 });
 
 it("a teardown still cleans up when a failed connect clears the connection meanwhile", async () => {

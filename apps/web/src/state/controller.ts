@@ -218,6 +218,7 @@ class Controller {
   private identityLoading: Promise<Identity> | null = null;
   private voiceRetry: ReturnType<typeof setTimeout> | null = null;
   private voiceRetries = 0;
+  private voiceRetryChannel: number | null = null;
   private voiceRun = 0;
   private initialised = false;
   private loadingOlder = false;
@@ -261,6 +262,7 @@ class Controller {
       if (state === "failed") this.scheduleVoiceRetry();
       if (state === "connected") {
         this.voiceRetries = 0;
+        this.voiceRetryChannel = null;
         useUi.getState().dismissToast("voice-closed");
       }
     });
@@ -710,12 +712,19 @@ class Controller {
         const b = state.me === null ? null : state.clients[state.me.session]?.voice_binding;
         return b && b.call === event.d.call && b.participation === event.d.participation && b.run === event.d.run;
       })()) {
-        useUi.getState().toast("info", tNow(event.d.reason === "transport_failed" ? "voice.closed" : "voice.disconnected"), { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
-        if (event.d.reason === "transport_failed") this.scheduleVoiceRetry(1000);
-        else void this.stopVoice();
+        this.voiceRetryChannel = myChannelId(useSession.getState());
+        if (event.d.reason === "channel_deleted" || this.voiceRetryChannel === null || !useSession.getState().channels[this.voiceRetryChannel]) {
+          this.voiceChannelRemoved();
+          void this.stopVoice();
+        } else {
+          useUi.getState().toast("info", tNow(event.d.reason === "transport_failed" ? "voice.closed" : "voice.disconnected"), { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
+          if (event.d.reason === "transport_failed") this.scheduleVoiceRetry(1000);
+          else void this.stopVoice();
+        }
       }
       if (event.ev === "channel.deleted" || event.ev === "channel.hidden") {
         const ui = useUi.getState(), ch = event.d.channel, state = useSession.getState();
+        if (this.voiceRetryChannel === ch) this.voiceChannelRemoved();
         if (ui.dialog.kind === "channelEdit" && ui.dialog.mode === "edit" && ui.dialog.channel === ch) ui.closeDialog();
         // An image from a channel that is gone (its messages were dropped) is no longer shown.
         if (ui.dialog.kind === "lightbox" && !ui.dialog.attachment.sealed) {
@@ -773,9 +782,6 @@ class Controller {
     this.conn = null;
     conn?.close();
     await this.teardown();
-    useUi.getState().dismissToast("voice-closed");
-    useUi.getState().dismissToast("voice-output");
-    useUi.getState().dismissToast("screen-stopped");
     if (!silent) useSession.getState().setClose({ kind: "user" });
   }
 
@@ -821,6 +827,10 @@ class Controller {
     await this.engine.stop();
     if (this.connections !== generation) return;
     this.conn = null;
+    this.voiceRetryChannel = null;
+    useUi.getState().dismissToast("voice-closed");
+    useUi.getState().dismissToast("voice-output");
+    useUi.getState().dismissToast("screen-stopped");
     useUi.getState().setJoining(null);
     useUi.getState().setEditing(null);
     // Dialogs about the session that just ended (server settings, a ban, a picture ...) would sit over the connect screen.
@@ -1029,9 +1039,18 @@ class Controller {
     }, delay * Math.min(this.voiceRetries, 4));
   }
 
+  private voiceChannelRemoved(): void {
+    this.voiceRetryChannel = null;
+    useUi.getState().toast("info", tNow("voice.channelRemoved"), { key: "voice-closed", sticky: true });
+  }
+
   retryVoice(): void {
     this.voiceRetries = 0;
-    if (this.conn?.isOnline) void this.startVoice();
+    if (!this.conn?.isOnline) return;
+    const channel = this.voiceRetryChannel;
+    if (channel !== null && !useSession.getState().channels[channel]) this.voiceChannelRemoved();
+    else if (channel !== null && myChannelId(useSession.getState()) === null) void this.joinChannelInteractive(channel);
+    else void this.startVoice();
   }
 
   async retryMic(): Promise<void> {
@@ -1097,6 +1116,7 @@ class Controller {
       if (!this.identity) return this.getIdentity();
     }
     useAccountIdentity.setState({ nickname: this.identity.nickname });
+    useUi.getState().dismissToast("identity-load");
     return this.identity;
   }
 
@@ -1113,6 +1133,7 @@ class Controller {
   private adopt(identity: Identity | null, another: boolean): void {
     this.identityLoading = null;
     this.identity = identity;
+    if (identity) useUi.getState().dismissToast("identity-load");
     useAccountIdentity.setState((s) => ({ nickname: identity?.nickname ?? "", replaced: s.replaced + (another ? 1 : 0) }));
   }
 

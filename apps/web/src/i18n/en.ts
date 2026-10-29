@@ -1119,6 +1119,7 @@ export const en = {
   "err.channel.save": "Couldn’t save the channel. Check its settings and try again.",
   "common.loading": "Loading…",
   "screen.shareAgain": "Share again",
+  "voice.channelRemoved": "The voice channel was removed. Join another channel to talk.",
   "voice.disconnected": "Voice disconnected.",
   "voice.reconnectFailed": "Couldn’t reconnect voice.",
   "identity.backupSecret": "The backup contains your private key, so keep this file secret.",

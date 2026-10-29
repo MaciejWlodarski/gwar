@@ -1121,6 +1121,7 @@ export const pl: Record<Key, string> = {
   "err.channel.save": "Nie udało się zapisać kanału. Sprawdź jego ustawienia i spróbuj ponownie.",
   "common.loading": "Wczytywanie…",
   "screen.shareAgain": "Udostępnij ponownie",
+  "voice.channelRemoved": "Kanał głosowy został usunięty. Dołącz do innego kanału, aby rozmawiać.",
   "voice.disconnected": "Głos został rozłączony.",
   "voice.reconnectFailed": "Nie udało się ponownie połączyć głosu.",
   "identity.backupSecret": "Kopia zawiera Twój klucz prywatny, więc zachowaj ten plik w tajemnicy.",
