@@ -1106,9 +1106,9 @@ export const pl: Record<Key, string> = {
   "onboarding.continue": "Dalej",
   "onboarding.skip": "Na razie pomiń",
   "connect.publicServer": "Dołącz do publicznego serwera (gwar.app)",
-  "identity.keepIdentity": "Jeśli wyczyścisz dane przeglądarki, stracisz swoją nazwę i role. Załóż konto Gwar Connect albo zapisz kopię.",
+  "identity.keepIdentity": "Zabezpiecz swoją tożsamość — bez kopii stracisz nazwę i role po wyczyszczeniu danych przeglądarki.",
   "identity.createAccount": "Załóż konto",
-  "identity.exportBackup": "Eksportuj kopię",
+  "identity.exportBackup": "Zapisz kopię",
   "identity.exportFailed": "Nie udało się wyeksportować kopii. Spróbuj ponownie.",
   "account.signInAgain": "Zaloguj ponownie",
   "account.signInExpired": "Wpisz ponownie hasło na tym urządzeniu, aby łączyć się z serwerami. Twoja nazwa i role są bezpieczne.",
@@ -1124,5 +1124,5 @@ export const pl: Record<Key, string> = {
   "voice.channelRemoved": "Kanał głosowy został usunięty. Dołącz do innego kanału, aby rozmawiać.",
   "voice.disconnected": "Głos został rozłączony.",
   "voice.reconnectFailed": "Nie udało się ponownie połączyć głosu.",
-  "identity.backupSecret": "Kopia zawiera Twój klucz prywatny, więc zachowaj ten plik w tajemnicy.",
+  "identity.backupSecret": "Plik zawiera Twój klucz prywatny. Nie udostępniaj go nikomu — kto go ma, może podszyć się pod Ciebie.",
 };

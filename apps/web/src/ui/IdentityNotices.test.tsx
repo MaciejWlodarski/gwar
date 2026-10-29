@@ -28,8 +28,8 @@ describe("persistent identity notices", () => {
   it("shows the reminder on role receipt and remembers dismissal", async () => {
     await act(async () => useSession.setState({ me: { uid: "me", session: 1 }, members: { me: { uid: "me", nickname: "Alex", tag: "alex", groups: [1, 2], last_seen: 1 } } }));
     expect(container.querySelector('[data-testid="identity-banner"]')).not.toBeNull();
-    expect(container.textContent).toContain("stracisz swoją nazwę i role");
-    expect(container.textContent).toContain("klucz prywatny");
+    expect(container.textContent).toContain("bez kopii stracisz nazwę i role");
+    expect(container.textContent).not.toContain("klucz prywatny");
     await act(async () => (container.querySelector('[aria-label="Zamknij"]') as HTMLButtonElement).click());
     expect(useSettings.getState().onboarding?.nudgeDismissed).toBe(true);
     expect(container.textContent).toBe("");
@@ -40,14 +40,56 @@ describe("persistent identity notices", () => {
     await act(async () => useSession.setState({ me: { uid: "me", session: 1 }, members: { me: { uid: "me", nickname: "Alex", tag: "alex", groups: [2], last_seen: 1 } } }));
     expect(container.textContent).toBe("");
   });
-  it("offers account creation and backup; signed-in accounts hide the reminder", async () => {
+  it("offers account creation; signed-in accounts hide the reminder", async () => {
     await act(async () => useSettings.getState().setOnboarding({ roleReceived: true }));
     await act(async () => button("Załóż konto").click());
     expect(useUi.getState()).toMatchObject({ section: "settings", settingsTab: "account", accountEntry: "create" });
-    await act(async () => button("Eksportuj kopię").click());
-    expect(exportIdentityBackup).toHaveBeenCalledOnce();
     await act(async () => useAccount.setState({ account: { ...account, expiresAt: Date.now() + 90 * day } }));
     expect(container.textContent).toBe("");
+  });
+  it("shows the private-key warning only in the save confirmation; cancelling keeps the reminder", async () => {
+    await act(async () => useSettings.getState().setOnboarding({ roleReceived: true }));
+    expect(container.textContent).not.toContain("klucz prywatny");
+    await act(async () => button("Zapisz kopię").click());
+    const dialog = document.querySelector('[role="dialog"]');
+    expect(dialog?.textContent).toContain("Plik zawiera Twój klucz prywatny. Nie udostępniaj go nikomu — kto go ma, może podszyć się pod Ciebie.");
+    expect(exportIdentityBackup).not.toHaveBeenCalled();
+    await act(async () => button("Anuluj").click());
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(exportIdentityBackup).not.toHaveBeenCalled();
+    expect(useSettings.getState().onboarding?.nudgeDismissed).toBe(false);
+    expect(container.querySelector('[data-testid="identity-banner"]')).not.toBeNull();
+  });
+  it("waits for the confirmed backup save before dismissing the reminder", async () => {
+    let finish!: () => void;
+    vi.mocked(exportIdentityBackup).mockImplementation(() => new Promise<void>(resolve => { finish = () => { useSettings.getState().setOnboarding({ nudgeDismissed: true }); resolve(); }; }));
+    await act(async () => useSettings.getState().setOnboarding({ roleReceived: true }));
+    await act(async () => button("Zapisz kopię").click());
+    await act(async () => button("Zapisz").click());
+    expect(exportIdentityBackup).toHaveBeenCalledOnce();
+    expect(button("Zapisz").disabled).toBe(true);
+    expect(useSettings.getState().onboarding?.nudgeDismissed).toBe(false);
+    await act(async () => finish());
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(container.querySelector('[data-testid="identity-banner"]')).toBeNull();
+  });
+  it("keeps the reminder after a cancelled platform save or failed export", async () => {
+    await act(async () => useSettings.getState().setOnboarding({ roleReceived: true }));
+    // A cancelled platform save resolves without setting nudgeDismissed.
+    vi.mocked(exportIdentityBackup).mockResolvedValueOnce();
+    await act(async () => button("Zapisz kopię").click());
+    await act(async () => button("Zapisz").click());
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(useSettings.getState().onboarding?.nudgeDismissed).toBe(false);
+    expect(container.querySelector('[data-testid="identity-banner"]')).not.toBeNull();
+    vi.mocked(exportIdentityBackup).mockRejectedValueOnce(new Error("Disk unavailable"));
+    await act(async () => button("Zapisz kopię").click());
+    await act(async () => button("Zapisz").click());
+    expect(document.querySelector('[role="dialog"]')).not.toBeNull();
+    expect(button("Zapisz").disabled).toBe(false);
+    expect(useSettings.getState().onboarding?.nudgeDismissed).toBe(false);
+    expect(container.querySelector('[data-testid="identity-banner"]')).not.toBeNull();
+    expect(useUi.getState().toasts.some(t => t.text === "Nie udało się wyeksportować kopii. Spróbuj ponownie.")).toBe(true);
   });
   it("waits for the startup certificate check, persists, reaches expiry and opens the password dialog", async () => {
     await act(async () => useAccount.setState({ account: { ...account, expiresAt: Date.now() + 5 * day }, certChecked: false }));

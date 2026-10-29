@@ -1104,9 +1104,9 @@ export const en = {
   "onboarding.continue": "Continue",
   "onboarding.skip": "Skip for now",
   "connect.publicServer": "Join the public server (gwar.app)",
-  "identity.keepIdentity": "If you clear browser data, you’ll lose your name and roles. Create a Gwar Connect account or save a backup.",
+  "identity.keepIdentity": "Protect your identity — without a backup, clearing browser data will erase your name and roles.",
   "identity.createAccount": "Create an account",
-  "identity.exportBackup": "Export a backup",
+  "identity.exportBackup": "Save a backup",
   "identity.exportFailed": "Couldn’t export your backup. Please try again.",
   "account.signInAgain": "Sign in again",
   "account.signInExpired": "Enter your password again on this device to connect to servers. Your name and roles are safe.",
@@ -1122,7 +1122,7 @@ export const en = {
   "voice.channelRemoved": "The voice channel was removed. Join another channel to talk.",
   "voice.disconnected": "Voice disconnected.",
   "voice.reconnectFailed": "Couldn’t reconnect voice.",
-  "identity.backupSecret": "The backup contains your private key, so keep this file secret.",
+  "identity.backupSecret": "This file contains your private key. Keep it secret — anyone with it can impersonate you.",
 } as const;
 
 export type Key = keyof typeof en;

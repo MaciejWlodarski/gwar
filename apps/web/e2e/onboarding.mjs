@@ -122,16 +122,38 @@ try {
       useSession.setState({ members: { ...s.members, [me.uid]: { ...me, groups: [1, 2] } } });
     });
     await page.getByTestId("identity-banner").waitFor();
-    await page.getByTestId("identity-banner").getByText(/klucz prywatny/).waitFor();
+    // The reminder must fit one desktop line at 1280 px, like the expiry notice.
+    if (width === "desktop") await page.setViewportSize({ width: 1280, height: 900 });
+    await page.evaluate(() => document.fonts.ready);
+    const reminderStyle = await page.getByTestId("identity-banner").evaluate(banner => {
+      const text = banner.querySelector("p"), icon = banner.querySelector("svg");
+      return { height: banner.getBoundingClientRect().height, textHeight: text.getBoundingClientRect().height, lineHeight: parseFloat(getComputedStyle(text).lineHeight), iconSize: icon.getBoundingClientRect().width, iconColor: getComputedStyle(icon).color, buttonHeight: banner.querySelector("button").getBoundingClientRect().height };
+    });
+    if (width === "desktop") assert.equal(reminderStyle.textHeight, reminderStyle.lineHeight, "reminder text fits one line at 1280 px");
+    assert.equal(await page.getByTestId("identity-banner").getByText(/klucz prywatny/).count(), 0);
+    assert.ok(await page.getByTestId("identity-banner").evaluate(banner => banner.scrollWidth <= banner.clientWidth), "compact reminder fits the viewport");
     await capture(page, "identity-banner", width);
+    await page.getByRole("button", { name: "Zapisz kopię", exact: true }).click();
+    await page.getByRole("dialog").getByText(/Plik zawiera Twój klucz prywatny/).waitFor();
+    await capture(page, "identity-backup-confirm", width);
+    await page.getByRole("button", { name: "Anuluj", exact: true }).click();
+    assert.ok(await page.getByTestId("identity-banner").isVisible(), "cancelled confirmation keeps the reminder");
+    await page.getByRole("button", { name: "Zapisz kopię", exact: true }).click();
     const download = page.waitForEvent("download");
-    await page.getByRole("button", { name: "Eksportuj kopię", exact: true }).click();
+    await page.getByRole("dialog").getByRole("button", { name: "Zapisz", exact: true }).click();
     assert.match((await download).suggestedFilename(), /gwar-identity-backup/);
     await page.getByTestId("identity-banner").waitFor({ state: "detached" });
     // Session-expiry states are seeded; no real user account or certificate is used.
     const fakeAccount = { handle: "ola", accountKey: "review-account", deviceKey: "review-device", deviceName: "Browser", expiresAt: Date.now() + 5 * 86_400_000 };
     await state(page, { account: { account: fakeAccount, certChecked: true } });
     await page.getByTestId("expiry-banner").getByText(/Za 5 dni/).waitFor();
+    const expiryStyle = await page.getByTestId("expiry-banner").evaluate(banner => {
+      const icon = banner.querySelector("svg");
+      return { height: banner.getBoundingClientRect().height, iconSize: icon.getBoundingClientRect().width, iconColor: getComputedStyle(icon).color, buttonHeight: banner.querySelector("button").getBoundingClientRect().height };
+    });
+    if (width === "desktop") assert.equal(reminderStyle.height, expiryStyle.height, "reminder and expiry banners have the same desktop height");
+    for (const key of ["iconSize", "iconColor", "buttonHeight"]) assert.equal(reminderStyle[key], expiryStyle[key], `reminder matches expiry ${key}`);
+    if (width === "desktop") await page.setViewportSize(viewport);
     await capture(page, "expiry-before", width);
     await page.getByRole("button", { name: "Zaloguj ponownie", exact: true }).click();
     await page.getByRole("dialog").getByLabel("Hasło", { exact: true }).waitFor();
@@ -175,11 +197,13 @@ try {
   }
   if (shots) writeFileSync(path.join(shots, "screenshots.txt"), [
     "Real running web app, Polish, Chromium, graphite/cyan. Desktop 1440x900; mobile 390x844.",
+    "Identity reminder and backup confirmation desktop captures are 1280x900; the reminder matches expiry height, icon treatment and buttons at that width.",
     "Captured with apps/web/e2e/onboarding.mjs. Only throwaway loopback services and browser contexts.",
     "First run and connection are real flows. Role receipt and before/after expiry are seeded UI states.",
     "The sticky toast uses the generic production component with a seeded audio error and working Settings action.",
     "Voice notices use the production localized strings and keyed toast component with seeded disconnected, reconnecting and exhausted states.",
-    "The harness verifies the private-key warning and that a mobile toast stays above the user panel and tab bar.",
+    "The private-key warning appears only in the backup confirmation. Cancelling keeps the reminder; confirming produces a real backup download.",
+    "The harness also verifies that a mobile toast stays above the user panel and tab bar.",
     "No production connections or desktop user data. Public-server button intercepted before connection.",
     ...captured,
   ].join("\n") + "\n");
