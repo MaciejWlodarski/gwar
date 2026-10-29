@@ -30,18 +30,21 @@ try {
     const page = await context.newPage();
     const errors = [];
     page.on("pageerror", e => errors.push(e.message));
-    for (const state of ["paused", "deferred", "retrying"]) {
-      await page.goto(`${base}/e2e/screen-paused.html?retry=${state === "deferred" ? "deferred" : "now"}`);
+    for (const state of ["paused", "deferred", "retrying", "stopped"]) {
+      await page.goto(`${base}/e2e/screen-paused.html?retry=${state === "deferred" ? "deferred" : "now"}${state === "stopped" ? "&waiting" : ""}`);
       const stage = page.locator('[data-screen-paused="bandwidth"]').first();
       await stage.waitFor();
       assert.match(await stage.innerText(), /Twoje łącze nie nadąża/);
-      if (device !== "mobile") assert.equal(await page.getByTestId("screen-quality").innerText(), "Ograniczone przez Twoje łącze");
+      // Stopped retries do not promise the picture comes back on its own; they ask for the click.
+      assert.match(await stage.innerText(), state === "stopped" ? /kliknij »Spróbuj ponownie«/ : /obraz wróci sam/);
+      if (device !== "mobile") assert.equal(await page.getByTestId("screen-quality").innerText(), "Wstrzymane – słabe łącze");
       const button = stage.getByRole("button");
-      if (state !== "paused") {
+      if (state === "deferred" || state === "retrying") {
         await button.click();
         assert.equal(await button.isDisabled(), true);
-        assert.match(await button.innerText(), state === "deferred" ? /^Ponowię za 1[12] s$/ : /Ponawiam…/);
+        assert.match(await button.innerText(), state === "deferred" ? /^Ponowna próba za 1[12] s$/ : /Ponawianie…/);
       } else assert.match(await button.innerText(), /Spróbuj ponownie/);
+      assert.equal((await button.getAttribute("class")).includes("bg-accent"), state === "stopped");
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false, `${state}/${device} overflows`);
       const file = path.join(output, `stage-${state}-pl-${device}.png`);
       await page.screenshot({ path: file });

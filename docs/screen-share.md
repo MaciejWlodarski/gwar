@@ -2164,12 +2164,21 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   a lower one failing says the link is slow all the more.) They start again
   when the link shows it changed: the estimate, lifted by probes, held 1.25
   times above that highest failed start for 10 s, or the viewer's DTLS and
-  RTCP arrive from a new address (a new ICE path, as after a network switch).
+  RTCP arrive from an address not seen before on this transport (a new ICE
+  path, as after a network switch; the last four addresses are kept, so a
+  path flipping between two it already used is no change). A new path
+  resumes them at most once per backoff step (`RETRY_BACKOFF` at the current
+  `n`), so a path that keeps changing retries no faster than the backoff
+  would; while retries are not stopped, a new path brings nothing forward.
   The next retry then comes as soon as the spacing since the last start
-  allows, and one more such failure stops them again. The continuous-fit
+  allows, and the next failure, from whatever start, stops them again at
+  the higher of the old level and its start. The continuous-fit
   resume keeps working while they are stopped, and so does Try again; a
   retry the link carries in full, or a minute of unbroken flow, clears the
-  strikes. A new watch transport (a reconnect) starts with none.
+  strikes. A new watch transport (a reconnect) starts with none. Each
+  bandwidth pause while retries are stopped is followed by
+  `screen.waiting {share}` to that viewer, so its client stops promising
+  that the picture comes back on its own.
 
   A retry restarts the estimator, with a fresh 10 s ramp, at
   `min(start, max(1.5 × sent, 2.5 Mbps))`. Here `sent` is what the transport
@@ -2323,14 +2332,17 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   first: the picture comes back on its own once your connection allows." over
   the last frame of a paused share, with a Try again button, or that the
   server is making room for a budget pause. A card, and the quality badge
-  instead of the last resolution at 0 fps, say "Limited by your connection"
+  instead of the last resolution at 0 fps, say "Paused – weak connection"
   for a bandwidth pause ("Paused" for a budget one; the badge is left out on
   a phone, where the overlay says it). Try again shows when the server will
   carry it out: "Retrying in 12 s" counting down while the server holds it
-  (the client counts 15 s from the share's grant or last `screen.resumed`,
-  which is when the server last started it, but for a climb it does not
-  see), then "Retrying…" until the share resumes, offered again if nothing
-  came 10 s after. Try again on a fully paused viewer
+  (the client counts 15 s from the last grant or `screen.resumed` of any
+  share on its watch transport, as the server spaces starts per transport,
+  but for a climb it does not see), then "Retrying…" until the share
+  resumes, offered again if nothing came 10 s after. After
+  `screen.waiting` the overlay says instead "Paused because your connection
+  can't keep up. If your connection works better now, click “Try again”."
+  and Try again is the primary button, until the next pause or resume. Try again on a fully paused viewer
   retries that share from its whole optimistic start, as a fresh watch would,
   and does not add to `n`. That is the viewer's own choice to overrun its
   link once. The server takes it at most once per 15 s after the viewer's
@@ -2882,7 +2894,11 @@ Events:
 - `screen.stopped {share, reason: stopped|moderator|left|limit|transport|budget|access|codec}`;
 - `screen.slot {run, slot, share | null}`, like `voice.slot`, tagged with the
   watch transport's `run`;
-- `screen.paused {share, reason: bandwidth}` and `screen.resumed {share}`.
+- `screen.paused {share, reason: bandwidth}` and `screen.resumed {share}`;
+- `screen.waiting {share}`, right after a bandwidth `screen.paused` once
+  automatic retries stopped. It is a separate event, not a field of
+  `screen.paused`, because clients validate events strictly and drop unknown
+  ones: an older client simply keeps its old wording.
 
 `Welcome` carries `shares: [{share, client, channel, preset, surface}]` for
 every channel the session can see, and `screen.started` /

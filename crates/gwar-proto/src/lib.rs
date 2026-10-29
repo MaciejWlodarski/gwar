@@ -790,6 +790,12 @@ wire! {
         ScreenRecover(ScreenRecovery),
         #[serde(rename = "screen.resumed")]
         ScreenResumed { share: String },
+        /// To a viewer, right after `screen.paused` for bandwidth: the server stopped retrying
+        /// `share` on its own. It resumes once the viewer's link shows it changed, or when the
+        /// viewer watches the share again (Try again). `screen.paused` or `screen.resumed`
+        /// supersede it. Clients that do not know it drop it.
+        #[serde(rename = "screen.waiting")]
+        ScreenWaiting { share: String },
         /// To admins (`manage_server`): the month's outbound transfer reached `percent` (80 or
         /// 100) of `limit` bytes.
         #[serde(rename = "server.egress_warning")]

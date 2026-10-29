@@ -2055,6 +2055,93 @@ mod tests {
     }
 
     #[test]
+    fn stopped_retries_resume_on_a_new_path_at_most_once_per_backoff_step() {
+        let mut sim = Sim::new(Some(2_000_000));
+        let (w, now) = (&mut sim.w, sim.now);
+        w.egress.set_estimate(1_000_000, now);
+        (w.struck, w.retries) = (Some((2_000_000, RETRY_STRIKES)), 3);
+        saw_path(w, addr(5000));
+        assert!(!w.moved, "the first address is no move");
+        saw_path(w, addr(5001));
+        assert!(std::mem::take(&mut w.moved));
+        // Flipping between addresses the transport already used is no new path.
+        saw_path(w, addr(5000));
+        saw_path(w, addr(5001));
+        assert!(!w.moved);
+        assert_eq!(resume_on_change(w, false, now), None);
+        assert!(stopped(w));
+        assert_eq!(resume_on_change(w, true, now), Some("path"));
+        assert!(!stopped(w));
+        // The retry it allows fails from a lower start: stopped again at once.
+        strike(w, 500_000);
+        assert_eq!(w.struck, Some((2_000_000, RETRY_STRIKES)));
+        // Another new path within the backoff step does not resume them; one after it does.
+        let backoff = RETRY_BACKOFF[3];
+        assert_eq!(resume_on_change(w, true, now + backoff - SECOND), None);
+        assert!(stopped(w));
+        assert_eq!(resume_on_change(w, true, now + backoff), Some("path"));
+        // And one failing from a new height stops them there.
+        strike(w, 4_000_000);
+        assert_eq!(w.struck, Some((4_000_000, RETRY_STRIKES)));
+    }
+
+    #[test]
+    fn stopped_retries_resume_once_the_estimate_held_above_the_failed_start_for_the_ramp() {
+        let mut sim = Sim::new(Some(2_000_000));
+        let (w, now) = (&mut sim.w, sim.now);
+        w.struck = Some((2_000_000, RETRY_STRIKES));
+        // Below `RETRY_LEVEL` times the failed start: never.
+        w.egress.set_estimate(2_400_000, now);
+        assert_eq!(resume_on_change(w, false, now), None);
+        assert_eq!(resume_on_change(w, false, now + 2 * RAMP), None);
+        let above = now + 2 * RAMP;
+        w.egress.set_estimate(2_500_000, above);
+        assert_eq!(resume_on_change(w, false, above), None);
+        assert_eq!(resume_on_change(w, false, above + RAMP - SECOND), None);
+        // A dip below starts the clock over.
+        w.egress.set_estimate(2_000_000, above + RAMP - SECOND);
+        assert_eq!(resume_on_change(w, false, above + RAMP - SECOND), None);
+        let again = above + RAMP;
+        w.egress.set_estimate(2_500_000, again);
+        assert_eq!(resume_on_change(w, false, again), None);
+        assert_eq!(resume_on_change(w, false, again + RAMP - MS), None);
+        assert!(stopped(w));
+        assert_eq!(resume_on_change(w, false, again + RAMP), Some("estimate"));
+        assert!(!stopped(w));
+        // The next failure, from any start, stops them again.
+        strike(w, 1_000_000);
+        assert_eq!(w.struck, Some((2_000_000, RETRY_STRIKES)));
+    }
+
+    #[test]
+    fn a_new_path_retries_a_stopped_viewer_no_sooner_than_the_spacing_since_its_last_start() {
+        let mut sim = Sim::new(Some(2_000_000));
+        sim.join("game", 8_000_000, 60, 200_000, 12_000_000);
+        while pauses(&sim, 0).is_empty() {
+            sim.tick();
+        }
+        let (paused, started) = (sim.now, sim.w.started.expect("the share started"));
+        assert!(paused - started < RETRY_FIRST, "{}", summary(&sim));
+        sim.w.struck = Some((2 * sim.w.egress.estimate().max(INITIAL_ESTIMATE), RETRY_STRIKES));
+        saw_path(&mut sim.w, addr(5000));
+        saw_path(&mut sim.w, addr(5001));
+        sim.run(RETRY_FIRST);
+        let context = summary(&sim);
+        let resumed = resumes_since(&sim, paused);
+        assert_eq!(resumed.len(), 1, "{resumed:?}: {context}");
+        let at = sim.start + resumed[0];
+        assert!(at >= started + RETRY_FIRST && at <= started + RETRY_FIRST + SECOND, "{resumed:?}: {context}");
+        // The link has not changed: the retry fails and they stop again.
+        let end = sim.now + 2 * MINUTE;
+        while !stopped(&sim.w) && sim.now < end {
+            sim.tick();
+        }
+        let context = summary(&sim);
+        assert!(stopped(&sim.w), "struck {:?}: {context}", sim.w.struck);
+        assert!(resumes_since(&sim, paused).len() <= 2, "{context}");
+    }
+
+    #[test]
     fn a_link_that_degrades_pauses_and_stops_retrying() {
         for (name, rate, bitrate, fps, keyframe) in
             [("game", 3_000_000, 8_000_000, 60, 200_000), ("text", 3_000_000, 500_000, 5, 300_000)]

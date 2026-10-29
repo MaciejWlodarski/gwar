@@ -354,6 +354,9 @@ pub enum ScreenSignal {
         run: u64,
         grant: Arc<WatchGrant>,
         reason: ScreenPauseReason,
+        /// The viewer's automatic retries have stopped: it resumes on a change of its link, the
+        /// continuous-fit resume or its own Try again (`screen.waiting`).
+        waiting: bool,
     },
     Incompatible {
         session: SessionId,
@@ -754,10 +757,15 @@ struct Watcher {
     /// `RETRY_LEVEL` above it while they are stopped.
     struck: Option<(u64, u32)>,
     above_since: Option<Instant>,
-    /// The address the viewer's last DTLS or RTCP came from, and whether it moved since the
-    /// allocation last looked: a new path may carry what the old one could not.
-    path: Option<SocketAddr>,
+    /// The addresses the viewer's DTLS and RTCP came from on this transport (at most
+    /// `ADDRESSES_PER_TRANSPORT`, the oldest dropped first), whether one not seen before came
+    /// since the allocation last looked (a new path may carry what the old one could not), and
+    /// when retries last resumed for one: at most once per backoff step.
+    paths: VecDeque<SocketAddr>,
     moved: bool,
+    path_resumed: Option<Instant>,
+    /// Retries resumed on evidence of a change: the next failure stops them again.
+    last_chance: bool,
     /// The last optimistic start or retry, which spaces the viewer's own Try again, and a Try
     /// again waiting for that spacing.
     started: Option<Instant>,
@@ -1398,11 +1406,7 @@ impl Sfu {
                     return;
                 }
                 if !matches!(datagram.contents.first(), Some(0..=3)) {
-                    if w.path.is_some_and(|path| path != datagram.source) {
-                        debug!(session, "screen watch path moved");
-                        w.moved = true;
-                    }
-                    w.path = Some(datagram.source);
+                    saw_path(w, datagram.source);
                 }
                 // Revoked slots are wiped before a NACK can reach their RTX caches.
                 sweep(w);
@@ -1668,7 +1672,8 @@ impl Sfu {
             Change::Pause(reason) => {
                 let (estimate, counters) = (w.egress.estimate(), w.egress.counters);
                 debug!(session, share, ?reason, estimate, ?counters, "screen slot paused");
-                self.signal(ScreenSignal::Paused { session, run, grant, reason });
+                let waiting = reason == ScreenPauseReason::Bandwidth && stopped(w);
+                self.signal(ScreenSignal::Paused { session, run, grant, reason, waiting });
             }
             Change::Resume => {
                 debug!(session, share, "screen slot resumed");
@@ -2568,6 +2573,7 @@ fn allocate(
             w.untested = None;
             w.failed = None;
             w.struck = None;
+            w.last_chance = false;
         }
         return None;
     }
@@ -2578,28 +2584,10 @@ fn allocate(
     // is never minted, and a continuous-fit timer in progress finishes first.
     w.healthy_since = None;
     // Retrying the same start again tells nothing new and may cost voice on the link each time:
-    // stopped, a retry needs the link to show it changed.
-    let changed = if let Some((level, strikes)) = w.struck
-        && strikes >= RETRY_STRIKES
-    {
-        let above = w.egress.estimate() as f64 >= RETRY_LEVEL * level as f64;
-        let shown = above && now.saturating_duration_since(*w.above_since.get_or_insert(now)) >= egress::RAMP;
-        if !above {
-            w.above_since = None;
-        }
-        let reason = match (moved, shown) {
-            (true, _) => "path",
-            (false, true) => "estimate",
-            (false, false) => return None,
-        };
-        info!(session = w.session, reason, level, estimate = w.egress.estimate(), "screen watch retries resume");
-        w.struck = Some((level, RETRY_STRIKES - 1));
-        w.above_since = None;
-        true
-    } else {
-        moved
-    };
-    if changed {
+    // stopped, a retry needs the link to show it changed. Not stopped, a new path does not
+    // bring the backoff's next retry forward.
+    if stopped(w) {
+        resume_on_change(w, moved, now)?;
         w.retry_at = Some(w.started.map_or(now, |at| now.max(at + RETRY_FIRST)));
     }
     // An inconclusive retry sent next to nothing: the next one, which sends what it could not,
@@ -2645,6 +2633,7 @@ fn judge(w: &mut Watcher) {
         Some(a) if shown >= a.start => {
             w.retries = 0;
             w.struck = None;
+            w.last_chance = false;
             w.step = carried_step(sent, a.start);
             if w.failed.is_some_and(|f| a.start >= f) {
                 w.failed = None;
@@ -2676,6 +2665,8 @@ fn judge(w: &mut Watcher) {
 /// otherwise the first at this new height.
 fn strike(w: &mut Watcher, start: u64) {
     let (level, strikes) = match w.struck {
+        // Resumed on evidence of a change, which this failure disproved, at whatever start.
+        Some((level, _)) if std::mem::take(&mut w.last_chance) => (level.max(start), RETRY_STRIKES),
         Some((level, strikes)) if start as f64 <= RETRY_LEVEL * level as f64 => (level.max(start), strikes + 1),
         _ => (start, 1),
     };
@@ -2683,6 +2674,56 @@ fn strike(w: &mut Watcher, start: u64) {
     if strikes == RETRY_STRIKES {
         info!(session = w.session, start, strikes, "screen watch retries stop until the link changes");
     }
+}
+
+/// Automatic retries have stopped (`RETRY_STRIKES`).
+fn stopped(w: &Watcher) -> bool {
+    w.struck.is_some_and(|(_, strikes)| strikes >= RETRY_STRIKES)
+}
+
+/// Stopped retries resume once the link shows it changed: its estimate held `RETRY_LEVEL` above
+/// the highest failed start for `RAMP`, or the viewer came from an address not seen before on
+/// this transport (`moved`), at most once per backoff step, so a path flapping between new
+/// addresses cannot retry faster than the backoff would. The reason, if they resume; the
+/// next failure then stops them again.
+fn resume_on_change(w: &mut Watcher, moved: bool, now: Instant) -> Option<&'static str> {
+    let (level, _) = w.struck?;
+    let above = w.egress.estimate() as f64 >= RETRY_LEVEL * level as f64;
+    if !above {
+        w.above_since = None;
+    }
+    let shown = above && now.saturating_duration_since(*w.above_since.get_or_insert(now)) >= egress::RAMP;
+    let backoff = RETRY_BACKOFF[(w.retries as usize).min(RETRY_BACKOFF.len() - 1)];
+    let path = moved && w.path_resumed.is_none_or(|at| now.saturating_duration_since(at) >= backoff);
+    let reason = if shown {
+        "estimate"
+    } else if path {
+        w.path_resumed = Some(now);
+        "path"
+    } else {
+        return None;
+    };
+    info!(session = w.session, reason, level, estimate = w.egress.estimate(), "screen watch retries resume");
+    w.struck = Some((level, RETRY_STRIKES - 1));
+    w.above_since = None;
+    w.last_chance = true;
+    Some(reason)
+}
+
+/// The viewer's DTLS or RTCP came from `source`: an address not seen before on this transport
+/// is a new path. A path flipping between addresses it already used is not.
+fn saw_path(w: &mut Watcher, source: SocketAddr) {
+    if w.paths.contains(&source) {
+        return;
+    }
+    if !w.paths.is_empty() {
+        debug!(session = w.session, "screen watch path moved");
+        w.moved = true;
+    }
+    if w.paths.len() >= ADDRESSES_PER_TRANSPORT {
+        w.paths.pop_front();
+    }
+    w.paths.push_back(source);
 }
 
 /// Where the next retry steps up from after the link carried one that started at `start`:
@@ -3391,8 +3432,10 @@ fn watcher(
         failed: None,
         struck: None,
         above_since: None,
-        path: None,
+        paths: VecDeque::new(),
         moved: false,
+        path_resumed: None,
+        last_chance: false,
         started: None,
         asked: None,
         carried: VecDeque::new(),

@@ -246,7 +246,7 @@ it("shows why the server holds a share back instead of its last resolution at 0 
   await act(async () => { screen.handleEvent({ ev: "screen.paused", d: { share: "B", reason: "bandwidth" } }); });
   let stage = container.querySelector<HTMLElement>('[data-screen-paused="bandwidth"]')!;
   expect(stage.textContent).toContain("Paused because your connection can't keep up");
-  expect(container.querySelector('[data-testid="screen-quality"]')?.textContent).toBe("Limited by your connection");
+  expect(container.querySelector('[data-testid="screen-quality"]')?.textContent).toBe("Paused – weak connection");
   request.mockClear();
   // B was granted 3 s ago: the server holds a Try again until 15 s after that, and the button says so.
   await advance(3000);
@@ -283,4 +283,33 @@ it("shows why the server holds a share back instead of its last resolution at 0 
     screen.handleEvent({ ev: "screen.resumed", d: { share: "A" } });
   });
   expect(container.querySelector("[data-screen-paused]")).toBeNull();
+  // The server stopped retrying B on its own: the overlay asks for the click and offers it first.
+  await advance(20_000);
+  await act(async () => {
+    screen.handleEvent({ ev: "screen.paused", d: { share: "B", reason: "bandwidth" } });
+    screen.handleEvent({ ev: "screen.waiting", d: { share: "B" } });
+  });
+  stage = container.querySelector<HTMLElement>('[data-screen-paused="bandwidth"]')!;
+  expect(stage.dataset.waiting).toBe("true");
+  expect(stage.textContent).toContain("If your connection works better now, click “Try again”.");
+  expect(stage.textContent).not.toContain("comes back on its own");
+  retry = [...stage.querySelectorAll("button")].find(b => b.textContent?.includes("Try again"))!;
+  expect(retry.className).toContain("bg-accent");
+  // The spacing runs from the last start on my transport, whichever share: A resumed 2 s ago.
+  await act(async () => {
+    screen.handleEvent({ ev: "screen.paused", d: { share: "A", reason: "budget" } });
+    screen.handleEvent({ ev: "screen.resumed", d: { share: "A" } });
+  });
+  await advance(2000);
+  await act(async () => retry.click());
+  expect(retry.textContent).toBe("Retrying in 13 s");
+  expect(retry.className).not.toContain("bg-accent");
+  // Paused again after it, without the server saying it stopped: back to the plain words.
+  await act(async () => {
+    screen.handleEvent({ ev: "screen.resumed", d: { share: "B" } });
+    screen.handleEvent({ ev: "screen.paused", d: { share: "B", reason: "bandwidth" } });
+  });
+  stage = container.querySelector<HTMLElement>('[data-screen-paused="bandwidth"]')!;
+  expect(stage.dataset.waiting).toBeUndefined();
+  expect(stage.textContent).toContain("comes back on its own");
 });

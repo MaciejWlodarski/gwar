@@ -418,6 +418,8 @@ const RETRY_ANSWER_MS = 10_000;
 /** Over the last frame, while the server holds a watched share back for my connection or its budget. */
 function PausedOverlay({ share, reason, compact }: { share: string; reason: ScreenPauseReason; compact?: boolean }) {
   const t = useT();
+  // The server stopped retrying on its own: only Try again brings the picture back now.
+  const waiting = useScreen(s => s.watches.find(w => w.share === share)?.waiting) && reason === "bandwidth";
   // When the server carries out my Try again (it holds one asked too soon), and a clock to count down to it.
   const [due, setDue] = useState<number | null>(null);
   const [now, setNow] = useState(() => Date.now());
@@ -428,17 +430,19 @@ function PausedOverlay({ share, reason, compact }: { share: string; reason: Scre
     const expire = setTimeout(() => setDue(null), Math.max(0, due - Date.now()) + RETRY_ANSWER_MS);
     return () => { clearInterval(tick); clearTimeout(expire); };
   }, [due]);
-  const text = t(reason === "bandwidth" ? "screen.pausedBandwidth" : "screen.pausedBudget");
+  const text = t(waiting ? "screen.pausedWaiting" : reason === "bandwidth" ? "screen.pausedBandwidth" : "screen.pausedBudget");
+  const invite = waiting && due === null;
   const left = due === null ? 0 : Math.ceil((due - now) / 1000);
   return (
-    <div data-screen-paused={reason} role="status" className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/75 p-3 text-center text-white">
+    <div data-screen-paused={reason} data-waiting={waiting || undefined} role="status" className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/75 p-3 text-center text-white">
       {compact ? (
         <span className="rounded bg-white/15 px-1.5 text-[11px] leading-5 font-medium" title={text}>{t(reason === "bandwidth" ? "screen.pausedLink" : "screen.pausedShort")}</span>
       ) : (
         <>
           <p className="max-w-sm text-sm text-white/90">{text}</p>
           {reason === "bandwidth" && (
-            <Button size="sm" variant="secondary" disabled={due !== null} className="border-white/30 text-white tabular-nums hover:bg-white/10 disabled:opacity-80"
+            <Button size="sm" variant={invite ? "primary" : "secondary"} disabled={due !== null}
+              className={cn("tabular-nums disabled:opacity-80", !invite && "border-white/30 text-white hover:bg-white/10")}
               onClick={e => {
                 e.stopPropagation();
                 const wait = controller.screen.retry(share);

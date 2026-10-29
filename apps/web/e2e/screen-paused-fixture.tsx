@@ -12,6 +12,8 @@ import "../src/index.css";
 const query = new URLSearchParams(location.search);
 // What the server would make of a Try again now: held for 12 s more, or carried out at once.
 const wait = query.get("retry") === "deferred" ? 12_000 : 0;
+// The server stopped retrying B on its own (`screen.waiting`).
+const waiting = query.has("waiting") ? { waiting: true as const } : {};
 const client = (id: number, nickname: string) => ({ id, uid: `local-${id}`, nickname, channel: 1, groups: [], platform: "web", muted: false, deafened: false, away: null, talking: false, voice: true, voice_binding: null });
 useSettings.setState({ language: "pl", theme: "dark" });
 useUi.setState({ section: "servers" });
@@ -27,7 +29,7 @@ useSession.setState({ ...initialState, kind: "gwar", phase: "online", rtt: 20,
 });
 useScreen.setState({ ...initialScreen, transport: { phase: "connected", run: 1 }, stage: "B", slots: ["B", "A", null, null],
   watches: [
-    { share: "B", id: 1, slot: 0, status: "watching", paused: "bandwidth" },
+    { share: "B", id: 1, slot: 0, status: "watching", paused: "bandwidth", ...waiting },
     { share: "A", id: 2, slot: 1, status: "watching", paused: "bandwidth" },
   ],
 });
