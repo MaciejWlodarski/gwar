@@ -300,9 +300,12 @@ describe("session resilience", () => {
       await vi.advanceTimersByTimeAsync(0);
       link.emit({ ev: "client.updated", d: client(1, 2, { nickname: "new name" }) });
       controller.setMuted(false); controller.setDeafened(false);
+      link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
       link.welcomeNow(welcome({ session: 1, uid: "u1", channels: [chan(1), chan(2)], clients: [client(1, 1)] }), true);
       await vi.advanceTimersByTimeAsync(0);
       expect(engine.start).not.toHaveBeenCalled();
+      expect(link.sent("channel.join")).toHaveLength(0);
+      expect(link.sent("screen.start")).toHaveLength(0);
       expect(stores.useVoice.getState().state).toBe("idle");
       expect(link.sent("client.update").every(request => (request.d as { muted: boolean; deafened: boolean }).muted && (request.d as { deafened: boolean }).deafened)).toBe(true);
       await controller.joinChannelInteractive(2);
@@ -996,8 +999,13 @@ describe("staying on the server without voice", () => {
     expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 2, password: null });
   });
 
-  it("rejoins a sharer's password channel through its override and republishes the retained capture", async () => {
+  it.each([false, true])("rejoins a sharer's password channel through its override and republishes the retained capture (voice needs retry = %s)", async retry => {
     connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
+    engine.start.mockClear();
+    if (retry) {
+      const { VoiceError } = await import("../voice/engine");
+      engine.start.mockRejectedValueOnce(new VoiceError("negotiation", "temporary loss"));
+    }
     const { useScreen } = await import("./screen");
     const source = { readyState: "live", stop: vi.fn(), applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }) };
     const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
@@ -1019,7 +1027,14 @@ describe("staying on the server without voice", () => {
     link.emit({ ev: "client.updated", d: client(9, 2, { uid: "u1", voice_binding: binding }) });
     await vi.advanceTimersByTimeAsync(10);
     expect(link.sent("screen.start").at(-1)?.d).toMatchObject({ call: binding.call, participation: binding.participation });
+    expect(engine.start).toHaveBeenCalledOnce();
     expect(useScreen.getState().own?.stream).toBe(stream); expect(source.stop).not.toHaveBeenCalled();
+    if (retry) {
+      expect(stores.useVoice.getState().reconnecting).toBe(true);
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(engine.start).toHaveBeenCalledTimes(2);
+      expect(useScreen.getState().own?.stream).toBe(stream); expect(source.stop).not.toHaveBeenCalled();
+    }
     await controller.screen.stopShare(); started({ share: "late" }); await vi.advanceTimersByTimeAsync(10);
   });
 

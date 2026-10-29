@@ -1281,7 +1281,6 @@ class Controller {
     this.voiceAutoStart = true;
     this.voiceRetryAllowed = true;
     await this.startVoice();
-
   }
 
   /** Hostname (no brackets) of the server we are connected to; the native engine sends media there. */
