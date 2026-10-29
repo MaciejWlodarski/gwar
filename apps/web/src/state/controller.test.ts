@@ -996,6 +996,33 @@ describe("staying on the server without voice", () => {
     expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 2, password: null });
   });
 
+  it("rejoins a sharer's password channel through its override and republishes the retained capture", async () => {
+    connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
+    const { useScreen } = await import("./screen");
+    const source = { readyState: "live", stop: vi.fn(), applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }) };
+    const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
+    useScreen.setState({ own: { phase: "live", attempt: 7, share: "old", stream, surface: "screen", spec: { mode: "smooth", height: 1080, fps: 30 }, viewers: 0, guests: 0, guestLink: false, preview: false } });
+    let started!: (value: { share: string }) => void;
+    const request = link.request.bind(link);
+    vi.spyOn(link, "request").mockImplementation((op, d) => {
+      if (op !== "screen.start") return request(op, d);
+      link.requests.push({ op, d });
+      return new Promise(resolve => { started = resolve as never; });
+    });
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    link.welcomeNow(welcome({ session: 9, uid: "u1", permissions: [],
+      channels: [chan(1), chan(2, { has_password: true, overrides: [{ user: "u1", allow: ["bypass_password"], deny: [] }] })],
+      clients: [client(9, null, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 2, password: null });
+    const binding = { call: "new-call", participation: "new-participation", run: 2 };
+    link.emit({ ev: "client.updated", d: client(9, 2, { uid: "u1", voice_binding: binding }) });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("screen.start").at(-1)?.d).toMatchObject({ call: binding.call, participation: binding.participation });
+    expect(useScreen.getState().own?.stream).toBe(stream); expect(source.stop).not.toHaveBeenCalled();
+    await controller.screen.stopShare(); started({ share: "late" }); await vi.advanceTimersByTimeAsync(10);
+  });
+
   it.each([false, true])("Leave cancels pending voice and screen rejoin during reconnect (after Welcome = %s)", async welcomed => {
     connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
     const { useScreen } = await import("./screen");

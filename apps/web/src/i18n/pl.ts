@@ -450,7 +450,7 @@ export const pl: Record<Key, string> = {
   "screen.permission": "Zezwól na nagrywanie ekranu dla {app} w {settings}.",
   "screen.permissionHint": "Jeśli anulowałeś wybór, zignoruj tę wskazówkę; w przeciwnym razie zezwól na nagrywanie ekranu dla {app} w ustawieniach prywatności systemu lub przeglądarki.",
   "screen.permissionTitle": "Brak zgody na nagrywanie ekranu",
-  "screen.permissionShort": "Brak zgody na ekran",
+  "screen.permissionShort": "Brak dostępu do ekranu",
   "screen.permissionFix": "Jak włączyć",
   "screen.permissionHintTitle": "Nie udało się udostępnić ekranu",
   "screen.permissionHintShort": "Nie udało się udostępnić",

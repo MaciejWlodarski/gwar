@@ -448,7 +448,7 @@ export const en = {
   "screen.permission": "Allow screen recording for {app} in {settings}.",
   "screen.permissionHint": "If you cancelled the picker, ignore this; otherwise allow screen recording for {app} in your system or browser privacy settings.",
   "screen.permissionTitle": "Screen recording isn't allowed",
-  "screen.permissionShort": "Screen recording blocked",
+  "screen.permissionShort": "No screen access",
   "screen.permissionFix": "How to fix",
   "screen.permissionHintTitle": "Couldn't share your screen",
   "screen.permissionHintShort": "Couldn't share screen",

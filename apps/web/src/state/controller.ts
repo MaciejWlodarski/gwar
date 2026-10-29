@@ -1,5 +1,6 @@
 import { claimAll, claimableIdentities, offerClaims } from "./ts-claim";
 import { permissionsOf } from "../lib/permissions";
+import { channelPermissions } from "../lib/channel-permissions";
 import type { ChannelOverride } from "../proto/ChannelOverride";
 import { attachment as attachmentSchema } from "../net/schema";
 import { SealedConversations, type SealedKey } from "./sealed";
@@ -1230,7 +1231,9 @@ class Controller {
     const bound = this.bind(), intent = this.joinAttempt;
     const s = useSession.getState();
     const info = s.channels[channel], password = this.channelPasswords.get(channel);
-    if (!info || (info.has_password && !password && !s.permissions.includes("bypass_password"))) {
+    const me = s.me ? s.clients[s.me.session] : undefined;
+    const bypass = s.kind === "gwar" ? me && s.me && channelPermissions({ uid: s.me.uid, groups: me.groups, owner: s.owner?.uid === s.me.uid }, channel, s.channels, s.groups).includes("bypass_password") : s.permissions.includes("bypass_password");
+    if (!info || (info.has_password && !password && !bypass)) {
       if (this.rejoin === channel) this.rejoin = null;
       return;
     }
