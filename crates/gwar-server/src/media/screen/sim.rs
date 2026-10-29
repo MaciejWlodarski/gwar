@@ -1840,7 +1840,10 @@ mod tests {
                 if let Some(last) = judged.iter().rev().find(|j| j.at < at)
                     && let Some(failed) = last.failed
                 {
-                    assert!(to < failed, "rate={rate} climb at {at:?} to {to} reached {failed} that failed: {judged:#?}");
+                    assert!(
+                        to < failed,
+                        "rate={rate} climb at {at:?} to {to} reached {failed} that failed: {judged:#?}"
+                    );
                 }
             }
             let context = format!("rate={rate}: {}", summary(&sim));
