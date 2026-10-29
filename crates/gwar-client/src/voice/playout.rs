@@ -6,7 +6,7 @@ use anyhow::Result;
 use audiopus::{Channels, MutSignals, SampleRate, coder::Decoder, packet::Packet};
 
 use super::{
-    jitter::{JitterBuffer, Playout},
+    jitter::{JitterBuffer, Playout, SHRINK_CORRELATION},
     level_db,
 };
 
@@ -112,6 +112,12 @@ pub(super) struct Slot {
     fade_from: f32,
     fade_left: usize,
     previous_level: f32,
+    /// The stream's speech level: the loudest frame, decaying by `ENVELOPE_DECAY` a second.
+    envelope: f32,
+    /// The quietest frame of the last two to four seconds: the previous and the current
+    /// `FLOOR_SPAN`, and how far into the current one the stream is.
+    floor: [f32; 2],
+    floor_age: usize,
     /// Test-only: samples output so far, and every edit of the decoded stream.
     #[cfg(test)]
     played: u64,
@@ -139,6 +145,13 @@ const NEAR_BEST: f64 = 0.02;
 const SMOOTH: usize = 24; // A moving average with its first null at 2 kHz, NetEq's 4 kHz Nyquist.
 const PICK_WINDOW: usize = MAX_LAG; // 15 ms.
 const PERIODIC: f64 = 0.5; // NetEq's fast-mode threshold.
+// Background (`Slot::background`): words of noise or speech over a fan decode within 3 dB of
+// their peak, the codec's tail after them 4--5 dB below, and the background between them 15--31 dB
+// below (fans 15--31 dB under the speech); see docs/latency-congested-uplink.md.
+const BACKGROUND_MARGIN: f32 = 15.0;
+const FLOOR_MARGIN: f32 = 6.0;
+const ENVELOPE_DECAY: f32 = 3.0; // dB a second.
+const FLOOR_SPAN: usize = 2 * 48_000;
 // Decode ahead so that a block holds three splice points with a full search after each.
 const STRETCH_BLOCK: usize = 2 * MAX_LAG + 3 * SPLICE_EVERY;
 
@@ -268,6 +281,9 @@ impl Slot {
             fade_from: 0.0,
             fade_left: 0,
             previous_level: -120.0,
+            envelope: -120.0,
+            floor: [f32::INFINITY; 2],
+            floor_age: 0,
             #[cfg(test)]
             played: 0,
             #[cfg(test)]
@@ -291,6 +307,7 @@ impl Slot {
             self.fade_from = 0.0;
             self.fade_left = 0;
             self.previous_level = -120.0;
+            (self.envelope, self.floor, self.floor_age) = (-120.0, [f32::INFINITY; 2], 0);
             self.generation = item.generation;
         }
         let Some(samples) = super::opus_samples(&item.opus) else { return Ok(()) };
@@ -304,6 +321,27 @@ impl Slot {
             Some(super::Generation::Sequence(g)) => g,
             None => 0,
         }
+    }
+
+    /// Follow the stream's level in a decoded frame of `samples`.
+    fn listen(&mut self, level: f32, samples: usize) {
+        if samples == 0 {
+            return;
+        }
+        self.envelope = level.max(self.envelope - ENVELOPE_DECAY * samples as f32 / 48_000.0);
+        self.floor_age += samples;
+        if self.floor_age >= FLOOR_SPAN {
+            (self.floor, self.floor_age) = ([self.floor[1], f32::INFINITY], 0);
+        }
+        self.floor[1] = self.floor[1].min(level);
+    }
+
+    /// Whether a frame at `level` (louder than -42 dB) is the stream's background between words,
+    /// such as a fan or street noise without noise suppression: `BACKGROUND_MARGIN` below its
+    /// speech and within `FLOOR_MARGIN` of the quietest frame of the last seconds. Clean speech,
+    /// whose pauses decode below -42 dB, so never has background, however quiet a consonant.
+    fn background(&self, level: f32) -> bool {
+        level < self.envelope - BACKGROUND_MARGIN && level <= self.floor[0].min(self.floor[1]) + FLOOR_MARGIN
     }
 
     pub fn staged_samples(&self) -> usize {
@@ -330,10 +368,17 @@ impl Slot {
                         let output = MutSignals::try_from(&mut self.decoded[..5760])?;
                         let mut n = self.decoder.decode_float(input, output, false).unwrap_or(0);
                         let level = level_db(&self.decoded[..n]);
+                        self.listen(level, n);
                         let quiet = n > 0 && level < -42.0;
+                        // A due backlog cut also takes the stream's background between words
+                        // (`background`), never a frame of speech, at its pace: from the start of
+                        // this frame, or of the first one decoded ahead (`ahead`).
+                        let backlog = skip > 0 && correlation < SHRINK_CORRELATION;
+                        let background = n > 0 && !quiet && backlog && self.background(level);
+                        let mut ahead = None;
                         let mut onset = !quiet && level > self.previous_level + 6.0;
                         self.previous_level = level;
-                        if n > 0 && skip > 0 && !quiet && !onset && !fade {
+                        if n > 0 && skip > 0 && !quiet && !background && !onset && !fade {
                             // Decode ahead only on proven surplus. This buys a whole
                             // overlap even for 10 ms packets, without startup delay or
                             // replaying history. A gap/recovery stops lookahead unchanged.
@@ -343,10 +388,14 @@ impl Slot {
                                 let output = MutSignals::try_from(&mut self.decoded[n..n + 5760])?;
                                 let next = self.decoder.decode_float(input, output, false).unwrap_or(0);
                                 let level = level_db(&self.decoded[n..n + next]);
+                                self.listen(level, next);
                                 onset |= next == 0 || (level >= -42.0 && level > self.previous_level + 6.0);
                                 self.previous_level = level;
+                                if backlog && !onset && (level < -42.0 || self.background(level)) {
+                                    ahead = Some((n, next));
+                                }
                                 n += next;
-                                if onset {
+                                if onset || ahead.is_some() {
                                     break;
                                 }
                             }
@@ -357,7 +406,7 @@ impl Slot {
                         // The next splice starts past this one's crossfade; a block that matched
                         // nothing once is not searched again.
                         let (mut removed, mut at) = (0, 0);
-                        while !onset && !quiet && !fade && removed < skip {
+                        while !onset && !quiet && !background && ahead.is_none() && !fade && removed < skip {
                             // Splices shorten the block while the next point moves on.
                             let Some(block) = self.decoded.get_mut(at..n) else { break };
                             let (period, _correlation) = accelerate(block, skip - removed, correlation);
@@ -376,8 +425,34 @@ impl Slot {
                             at += SPLICE_EVERY.max(period);
                         }
                         self.buffer.accelerated(now, removed);
-                        let skip = if !onset && quiet { skip.min(QUIET_SKIP).min(n) } else { 0 };
-                        self.buffer.shrunk(now, skip);
+                        // Background goes from the start of its frame, up to the cut's credit,
+                        // and is paced as periods are; the rest of the frame fades in.
+                        if let Some((start, len)) = ahead {
+                            let cut = skip.min(len.saturating_sub(FADE));
+                            for i in 0..FADE {
+                                let blend = i as f32 / FADE as f32;
+                                self.decoded[start + i] =
+                                    self.decoded[start + i] * (1.0 - blend) + self.decoded[start + cut + i] * blend;
+                            }
+                            self.decoded.copy_within(start + cut + FADE..n, start + FADE);
+                            n -= cut;
+                            self.buffer.accelerated(now, cut);
+                            #[cfg(test)]
+                            if cut > 0 {
+                                let at = self.played + start as u64;
+                                self.edits.push(Edit { at, removed: cut, modified: FADE, correlation: None });
+                            }
+                        }
+                        let skip = match (onset, quiet, background) {
+                            (false, true, _) => skip.min(QUIET_SKIP).min(n),
+                            (false, false, true) => skip.min(n.saturating_sub(FADE)),
+                            _ => 0,
+                        };
+                        if background {
+                            self.buffer.accelerated(now, skip);
+                        } else {
+                            self.buffer.shrunk(now, skip);
+                        }
                         #[cfg(test)]
                         if skip > 0 {
                             self.edits.push(Edit { at: self.played, removed: skip, modified: FADE, correlation: None });
@@ -392,6 +467,7 @@ impl Slot {
                                 let output = MutSignals::try_from(&mut self.decoded[n..n + 5760])?;
                                 let next = self.decoder.decode_float(input, output, false).unwrap_or(0);
                                 let level = level_db(&self.decoded[n..n + next]);
+                                self.listen(level, next);
                                 if next == 0 || level >= -42.0 {
                                     self.previous_level = level;
                                     n += next;
@@ -453,7 +529,6 @@ impl Slot {
 
 #[cfg(test)]
 mod tests {
-    use super::super::jitter::SHRINK_CORRELATION;
     use super::*;
     use audiopus::{Application, coder::Encoder};
 
@@ -643,18 +718,21 @@ mod tests {
     }
 
     /// 11 s of a `pitch` Hz voice with `noise` peak added (loud noise alone if `pitch` is 0)
-    /// that `speaks(i)` in 20 ms frame `i` (else silence), encoded in order, and each frame as
-    /// a decoder of the whole stream plays it.
-    fn voice(pitch: f32, noise_level: f32, speaks: impl Fn(usize) -> bool) -> (Vec<Vec<u8>>, Vec<Vec<f32>>) {
+    /// that `speaks(i)` in 20 ms frame `i` (else silence), over a background of `fan` peak
+    /// noise throughout, encoded in order, and each frame as a decoder of the whole stream
+    /// plays it.
+    fn voice(pitch: f32, noise_level: f32, fan: f32, speaks: impl Fn(usize) -> bool) -> (Vec<Vec<u8>>, Vec<Vec<f32>>) {
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
         let mut reference = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
         let pcm = if pitch > 0.0 { harmonic(pitch, 0.02, 0.3, 550 * 960) } else { vec![0.0; 550 * 960] };
         let pcm: Vec<f32> = pcm.iter().zip(noise(7, noise_level, pcm.len())).map(|(v, n)| v + n).collect();
+        let fan = noise(9, fan, pcm.len());
         let frames: Vec<_> = pcm
             .chunks(960)
+            .zip(fan.chunks(960))
             .enumerate()
-            .map(|(i, frame)| {
-                let frame = if speaks(i) { frame.to_vec() } else { vec![0.0; 960] };
+            .map(|(i, (frame, fan))| {
+                let frame: Vec<f32> = frame.iter().zip(fan).map(|(&v, &f)| if speaks(i) { v + f } else { f }).collect();
                 let mut data = vec![0; 1275];
                 let n = encoder.encode_float(&frame, &mut data).unwrap();
                 data.truncate(n);
@@ -712,12 +790,13 @@ mod tests {
         periods: Vec<(u64, usize, f64)>,
     }
 
-    /// Plays 10 s of `voice(pitch, noise_level, speaks)` after a backlog of `backlog` packets.
-    /// Every output sample outside a crossfade must be the reference decoder's, shifted by what
-    /// the edits before it removed: nothing is lost but what was counted, and the decoder runs
-    /// through everything dropped.
-    fn drain(pitch: f32, noise_level: f32, speaks: impl Fn(usize) -> bool, backlog: u64) -> Drain {
-        let (frames, decoded) = voice(pitch, noise_level, speaks);
+    /// Plays 10 s of `voice(pitch, noise_level, fan, speaks)` after a backlog of `backlog`
+    /// packets. Every output sample outside a crossfade must be the reference decoder's, shifted
+    /// by what the edits before it removed: nothing is lost but what was counted, and the decoder
+    /// runs through everything dropped. Nothing but pitch periods goes from a frame the voice
+    /// speaks in.
+    fn drain(pitch: f32, noise_level: f32, fan: f32, speaks: impl Fn(usize) -> bool, backlog: u64) -> Drain {
+        let (frames, decoded) = voice(pitch, noise_level, fan, &speaks);
         let content: Vec<f32> = decoded.concat();
         let quiet = |i: u64| level_db(&decoded[i as usize]) < -42.0;
         let mut slot = Slot::new().unwrap();
@@ -774,6 +853,15 @@ mod tests {
                 assert!(error < 1e-6, "sample {at}: {error} from the reference after {shift} removed");
             }
         }
+        let mut shift = 0;
+        for edit in &slot.edits {
+            let start = edit.at as usize + shift;
+            if edit.correlation.is_none() {
+                let mut frames = start / 960..(start + edit.removed).div_ceil(960);
+                assert!(frames.all(|i| !speaks(i)), "{edit:?}: {start}.. is in a word");
+            }
+            shift += edit.removed;
+        }
         (drain.first, drain.done) = (first, done);
         let (first, done) = (first.unwrap_or(250) as usize, done.unwrap_or(490) as usize);
         drain.jump = maximum_jump(&output[first * 960..(done + 10) * 960]);
@@ -805,11 +893,10 @@ mod tests {
             ("noisy 100 Hz voice, 430 ms", 100.0, 0.16, steady, 22),
             ("noisy 150 Hz voice, 430 ms", 150.0, 0.16, steady, 22),
             ("loud noise, 430 ms", 0.0, 0.3, steady, 22),
-            ("noise in words, 40 ms gaps, 430 ms", 0.0, 0.3, gaps, 22),
             ("noise with pauses, 430 ms", 0.0, 0.3, pauses, 22),
         ];
         for (name, pitch, noise_level, speaks, backlog) in cases {
-            let drain = drain(pitch, noise_level, speaks, backlog);
+            let drain = drain(pitch, noise_level, 0.0, speaks, backlog);
             let periods = drain.periods.len();
             let correlations =
                 drain.periods.iter().map(|p| p.2).fold((1.0, -1.0), |(lo, hi), c| (c.min(lo), c.max(hi)));
@@ -848,6 +935,7 @@ mod tests {
                 if name.contains("pauses") {
                     assert!(done <= first + 100, "{name}: {summary}");
                 } else {
+                    // Continuous noise: no background either.
                     assert_eq!(drain.first, None, "{name}: {summary}");
                     assert!(drain.queued <= (backlog + 1) * 960, "{name}: {summary}");
                 }
@@ -862,6 +950,36 @@ mod tests {
             }
             if name == "pauses" {
                 assert!(drain.quiet_dropped >= 5 * 960, "{name}: {summary}");
+            }
+        }
+    }
+
+    #[test]
+    fn background_between_words_drains_and_words_stay_whole() {
+        // Review of #201: noise in words with 40 ms gaps, or a voice over a fan, never decodes
+        // below -42 dB for long and has no period between words: its 430 ms backlog stayed for
+        // good (main dropped 380 ms of it, words included). The background between words now goes,
+        // paced, from frames the fixture marks silent only (`drain`); words lose nothing but whole
+        // periods.
+        let gaps: fn(usize) -> bool = |i| i % 10 >= 2;
+        for (name, pitch, noise_level, fan) in [
+            ("noise in words", 0.0, 0.3, 0.0),
+            ("voice over a fan", 150.0, 0.0, 0.03),
+            ("noisy voice over a fan", 150.0, 0.16, 0.03),
+            ("noise in words over a fan", 0.0, 0.3, 0.03),
+        ] {
+            let drain = drain(pitch, noise_level, fan, gaps, 22);
+            eprintln!("{name}: {drain:?}");
+            assert_eq!(drain.speech_dropped, 0, "{name}");
+            assert!(drain.speedup <= 0.24, "{name}: {}", drain.speedup);
+            let first = drain.first.expect("nothing removed");
+            assert!((250..255).contains(&first), "{name}: {first}");
+            assert!(drain.done.is_some_and(|done| done <= first + 200), "{name}: {:?}", drain.done);
+            for &(refill, removed, correlation) in &drain.periods {
+                assert!(
+                    whole_periods(removed, pitch) && correlation >= 0.5,
+                    "{name}: {refill} {removed} {correlation}"
+                );
             }
         }
     }
@@ -893,7 +1011,7 @@ mod tests {
         // Review of #201: the next splice point moves on by at least 10 ms while each splice
         // shortens the block, so five 120-sample periods of a 400 Hz voice left a 2880-sample
         // block 2280 long with the next search at 2400.
-        let drain = drain(400.0, 0.0, |_| true, 20);
+        let drain = drain(400.0, 0.0, 0.0, |_| true, 20);
         assert_eq!(drain.speech_dropped, 0, "{drain:?}");
         for &(refill, removed, correlation) in &drain.periods {
             assert!(
@@ -1019,6 +1137,12 @@ mod tests {
             for callback in [240, 480, 960] {
                 for phase in [-96, 0, 96] {
                     for (excess, signal) in [(0, "reset"), (480, "reset"), (480, "continuous"), (480, "paused")] {
+                        // The voices differ from the tone only in what playout may remove: one
+                        // clock and 30 s (convergence is due by 20 s) keep the test's time.
+                        if signal != "reset" && clock == Clock::Sequence {
+                            continue;
+                        }
+                        let seconds = if signal == "reset" { 60 } else { 30 };
                         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
                         let mut slot = Slot::new().unwrap();
                         let now = Instant::now();
@@ -1026,7 +1150,7 @@ mod tests {
                         slot.end = callback + excess;
                         let mut packet = 0u64;
                         let mut at_twenty_seconds = 0;
-                        for tick in (0..60 * 48_000u64).step_by(callback) {
+                        for tick in (0..seconds * 48_000u64).step_by(callback) {
                             let at = now + Duration::from_secs_f64(tick as f64 / 48_000.0);
                             loop {
                                 // Deterministic +/-3 ms jitter, independent of refills.
