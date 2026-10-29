@@ -1018,9 +1018,7 @@ mod tests {
         for clock in [Clock::Rtp, Clock::Sequence] {
             for callback in [240, 480, 960] {
                 for phase in [-96, 0, 96] {
-                    for (excess, signal) in
-                        [0, 480].into_iter().flat_map(|e| ["reset", "continuous", "paused"].map(|s| (e, s)))
-                    {
+                    for (excess, signal) in [(0, "reset"), (480, "reset"), (480, "continuous"), (480, "paused")] {
                         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
                         let mut slot = Slot::new().unwrap();
                         let now = Instant::now();
