@@ -494,7 +494,9 @@ impl Core {
         run: u64,
         grant: &Arc<WatchGrant>,
         reason: Option<ScreenPauseReason>,
+        waiting: bool,
     ) {
+        // A guest's watch page has its own words for a pause.
         if self.guests.contains_key(&session) {
             self.guest_paused(session, run, grant, reason);
             return;
@@ -507,10 +509,15 @@ impl Core {
         }
         let share = grant.share.clone();
         let event = match reason {
-            Some(reason) => Event::ScreenPaused { share, reason },
-            None => Event::ScreenResumed { share },
+            Some(reason) => Event::ScreenPaused { share: share.clone(), reason },
+            None => Event::ScreenResumed { share: share.clone() },
         };
         self.send_event(session, event);
+        // A separate event: older clients validate `screen.paused` exactly and would drop a pause
+        // with a field they do not know, while they skip an event they do not know.
+        if waiting && reason.is_some() {
+            self.send_event(session, Event::ScreenWaiting { share });
+        }
     }
 
     /// Ends every watch of `session` (its transport is replaced or gone), telling it per slot

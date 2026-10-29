@@ -26,7 +26,7 @@ try {
     await new Promise(r => setTimeout(r, 100));
   }
   browser = await chromium.launch({ headless: true });
-  for (const [device, width, height] of [["desktop", 1440, 900], ["tablet", 768, 1024], ["mobile", 390, 844]]) {
+  for (const [device, width, height] of [["desktop", 1440, 900], ["tablet", 768, 1024], ["mobile", 390, 844], ["mobile-360", 360, 800]]) {
     const context = await browser.newContext({ viewport: { width, height }, deviceScaleFactor: 2 });
     await context.route("**/*", route => ["127.0.0.1", "localhost"].includes(new URL(route.request().url()).hostname) ? route.continue() : route.abort());
     const errors = [];
@@ -36,6 +36,7 @@ try {
       await page.clock.install();
       await page.goto(`${base}/e2e/uplink.html?${query}`);
       await page.locator("main").waitFor();
+      await page.evaluate(() => document.fonts.ready);
       return page;
     };
     const shot = async (page, name) => {
@@ -88,6 +89,45 @@ try {
         await page.close();
       }
     }
+    // Both branches' notices share a stack and stay clear of the measured voice panel.
+    const combined = await open("view=voice&state=congested");
+    await combined.getByTestId("congestion-notice").waitFor();
+    await combined.evaluate(async () => {
+      const { useUi } = await import("/src/state/stores.ts");
+      useUi.getState().toast("error", "Utracono połączenie głosowe. Spróbujemy ponownie.", {
+        key: "voice-closed", sticky: true, details: "Połączenie z serwerem zostało przerwane.",
+        action: { label: "Ponów", run() {} },
+      });
+    });
+    const panel = combined.locator("aside");
+    assert.equal(await panel.getByTestId("connection-quality").getAttribute("data-quality"), "poor");
+    const congestion = await combined.getByTestId("congestion-notice").boundingBox();
+    const sessionNotice = await combined.getByTestId("toast").boundingBox();
+    const panelBox = await panel.boundingBox();
+    assert(congestion && sessionNotice && panelBox);
+    assert(congestion.y + congestion.height <= sessionNotice.y, `${device}: notices overlap`);
+    if (width < 768) {
+      const controls = await panel.getByRole("button", { name: /Wycisz mikrofon/ }).boundingBox();
+      assert(controls && sessionNotice.y + sessionNotice.height <= controls.y, `${device}: notice covers call controls`);
+    }
+    await shot(combined, "voice-congested-session-notice");
+    await combined.evaluate(async () => {
+      const { useVoice } = await import("/src/state/stores.ts");
+      const { useUplink } = await import("/src/state/uplink.ts");
+      useVoice.setState({ state: "failed", failure: "Połączenie głosowe jest niedostępne. Ponów, aby spróbować ponownie." });
+      useUplink.setState({ screen: useUplink.getState().voice, voice: null });
+    });
+    const labels = [panel.getByText("Głos niedostępny", { exact: true }), panel.getByRole("button", { name: "Dlaczego?", exact: true }), panel.getByRole("button", { name: "Ponów", exact: true })];
+    const boxes = await Promise.all(labels.map(label => label.boundingBox()));
+    for (let i = 0; i < boxes.length; i++) {
+      assert(boxes[i] && Math.abs(boxes[i].y - boxes[0].y) < 1, `${device}: unavailable status wraps`);
+      if (i) assert(boxes[i - 1].x + boxes[i - 1].width <= boxes[i].x, `${device}: unavailable status overlaps`);
+    }
+    await shot(combined, "voice-unavailable-notices");
+    await panel.getByRole("button", { name: "Dlaczego?", exact: true }).click();
+    await combined.getByRole("dialog", { name: "Głos niedostępny" }).waitFor();
+    await combined.keyboard.press("Escape");
+    await combined.close();
     // The pill's indicator must preserve truncation for real long names.
     for (const state of ["normal", "congested"]) {
       const page = await open(`view=pill&state=${state}&long=1`);

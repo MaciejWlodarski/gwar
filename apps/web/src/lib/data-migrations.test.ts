@@ -148,6 +148,18 @@ const RECORD_FIXTURES: Record<keyof typeof RECORDS, Record<number, { stored: Rec
 };
 /** The settings (localStorage) per version, and a check of the settings store after loading them. */
 const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: string; bookmarks: unknown[] }): void }> = {
+  4: {
+    stored: { state: { theme: "dark", bookmarks: [], selfMuted: true, selfDeafened: true,
+      resumeConnection: { address: "a.example", kind: "gwar", name: "A" },
+      onboarding: { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true } }, version: 4 },
+    check: state => { expect(state).toMatchObject({ selfMuted: true, selfDeafened: true,
+      resumeConnection: { address: "a.example", kind: "gwar", name: "A" }, updateVoiceResume: null,
+      onboarding: { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true } }); },
+  },
+  3: {
+    stored: { state: { theme: "dark", bookmarks: [], onboarding: { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true } }, version: 3 },
+    check: state => expect(state).toMatchObject({ theme: "dark", onboarding: { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true }, selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null }),
+  },
   2: {
     stored: { state: { theme: "dark", bookmarks: [], screenMode: "sharp", screenHeight: 1440, screenFps: 60 }, version: 2 },
     check: state => { expect(state).toMatchObject({ theme: "dark", screenMode: "sharp", screenHeight: 1440, screenFps: 60 }); },
@@ -400,11 +412,44 @@ describe("the settings (localStorage)", () => {
   }
   afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
 
+  it("restores saved mute and deafen before the voice store is created", async () => {
+    const storage = memory({});
+    const first = await page(storage);
+    first.useSettings.getState().setSelfVoice(true, true);
+    await page(storage);
+    const { useVoice } = await import("../state/stores");
+    expect(useVoice.getState()).toMatchObject({ muted: true, deafened: true });
+  });
+
   it.each(versions(SETTINGS_VERSION))("version %i loads at the current one", async (version) => {
     const { useSettings, localStorageError } = await page(memory({ [SETTINGS_KEY]: JSON.stringify(LOCAL_FIXTURES[version]!.stored) }));
     expect(localStorageError()).toBeUndefined();
     LOCAL_FIXTURES[version]!.check(useSettings.getState());
+    if (version < 3) expect(useSettings.getState()).toMatchObject({ selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null });
   });
+  it.each([
+    { name: 42 }, { password: {} }, { identity: 3 }, { insecureLan: "true" },
+    { name: undefined }, { address: "" }, { kind: "unknown" },
+  ])("refuses malformed automatic connection fields on hydration: %j", async patch => {
+    const resume = { address: "a.example", kind: "gwar", name: "A", ...patch };
+    const { useSettings } = await page(memory({ [SETTINGS_KEY]: JSON.stringify({ version: SETTINGS_VERSION, state: { resumeConnection: resume } }) }));
+    expect(useSettings.getState().resumeConnection).toBeNull();
+  });
+
+  it("whitelists stored resume data and clears both intents when removing the matching bookmark", async () => {
+    const { useSettings } = await page(memory({ [SETTINGS_KEY]: JSON.stringify({ version: SETTINGS_VERSION, state: {
+      resumeConnection: { address: "a.example", kind: "gwar", name: "A", password: "secret", identity: "ts-id", insecureLan: true, invite: "never-use" },
+      updateVoiceResume: { address: "a.example", kind: "gwar", version: "1.0", expiresAt: 1000, channel: 2 },
+    } }) }));
+    expect(useSettings.getState().resumeConnection).not.toHaveProperty("invite");
+    const s = () => useSettings.getState();
+    s().saveBookmark({ id: "other", address: "other.example", kind: "gwar", name: "Other" });
+    s().removeBookmark("other"); expect(s().resumeConnection).not.toBeNull();
+    s().saveBookmark({ id: "a", address: "wss://a.example/ws", kind: "gwar", name: "A" });
+    s().removeBookmark("a");
+    expect(s()).toMatchObject({ resumeConnection: null, updateVoiceResume: null });
+  });
+
   it("of a newer version, or unreadable, are neither read nor written", async () => {
     for (const stored of [JSON.stringify({ state: { theme: "light" }, version: SETTINGS_VERSION + 1 }), "garbage"]) {
       const storage = memory({ [SETTINGS_KEY]: stored });

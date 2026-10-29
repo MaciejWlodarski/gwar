@@ -651,6 +651,7 @@ jobs:
       - name: Smoke test in the browser
         timeout-minutes: 10
         run: |
+          pnpm --filter web e2e:onboarding
           pnpm --filter web e2e
 
   # Encrypted voice through the SFU with SFrame, in Chromium and WebKit.

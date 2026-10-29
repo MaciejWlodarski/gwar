@@ -102,11 +102,27 @@ const ADDRESSES_PER_TRANSPORT: usize = 4;
 /// Allocation (pauses, resumes, probing targets) and the budget check run this often.
 const ALLOCATION_TICK: Duration = Duration::from_millis(100);
 /// A viewer whose every slot is paused, at least one for bandwidth, retries its most important
-/// one this long after the pause, doubling with each retry that failed, up to `RETRY_MAX`; a
-/// retry that was inconclusive is followed this long after it started. The continuous-fit
-/// resume may come first. A viewer's own Try again waits as long after its last start or retry.
+/// one this long after the pause; a retry that was inconclusive is followed this long after it
+/// started. The continuous-fit resume may come first. A viewer's own Try again waits as long
+/// after its last start or retry.
 const RETRY_FIRST: Duration = Duration::from_secs(15);
-const RETRY_MAX: Duration = Duration::from_secs(120);
+/// After `n` retries that failed since media last kept flowing, the next one comes
+/// `RETRY_BACKOFF[n]` after the pause (the last entry from then on): two quick ones for a dip
+/// that passes, then 2.5, 5, 10 and 20 minutes for a link that stays slow.
+const RETRY_BACKOFF: [Duration; 6] = [
+    RETRY_FIRST,
+    Duration::from_secs(30),
+    Duration::from_secs(150),
+    Duration::from_secs(300),
+    Duration::from_secs(600),
+    Duration::from_secs(1200),
+];
+/// This many automatic retries in a row that failed, none starting more than `RETRY_LEVEL` above
+/// the highest before it, stop automatic retries until the link shows it changed: its estimate
+/// held `RETRY_LEVEL` above that highest start for `RAMP`, or the viewer's address moved. One
+/// more such failure then stops them again. Try again still works.
+const RETRY_STRIKES: u32 = 3;
+const RETRY_LEVEL: f64 = 1.25;
 /// Media flowing this long without a break, with no slot paused for bandwidth, clears the
 /// viewer's failed retries.
 const RETRY_RESET: Duration = Duration::from_secs(60);
@@ -338,6 +354,9 @@ pub enum ScreenSignal {
         run: u64,
         grant: Arc<WatchGrant>,
         reason: ScreenPauseReason,
+        /// The viewer's automatic retries have stopped: it resumes on a change of its link, the
+        /// continuous-fit resume or its own Try again (`screen.waiting`).
+        waiting: bool,
     },
     Incompatible {
         session: SessionId,
@@ -733,6 +752,20 @@ struct Watcher {
     /// again: a climb in place never reaches it, or a frozen estimator would overshoot the
     /// same step after every carried retry.
     failed: Option<u64>,
+    /// The highest start of the automatic retries that failed in a row, and how many they are
+    /// (`RETRY_STRIKES` stop automatic retries), and since when the estimate has been
+    /// `RETRY_LEVEL` above it while they are stopped.
+    struck: Option<(u64, u32)>,
+    above_since: Option<Instant>,
+    /// The addresses the viewer's DTLS and RTCP came from on this transport (at most
+    /// `ADDRESSES_PER_TRANSPORT`, the oldest dropped first), whether one not seen before came
+    /// since the allocation last looked (a new path may carry what the old one could not), and
+    /// when retries last resumed for one: at most once per backoff step.
+    paths: VecDeque<SocketAddr>,
+    moved: bool,
+    path_resumed: Option<Instant>,
+    /// Retries resumed on evidence of a change: the next failure stops them again.
+    last_chance: bool,
     /// The last optimistic start or retry, which spaces the viewer's own Try again, and a Try
     /// again waiting for that spacing.
     started: Option<Instant>,
@@ -1372,6 +1405,9 @@ impl Sfu {
                 if is_rtp(&datagram.contents) || !w.rtc.accepts(&input) {
                     return;
                 }
+                if !matches!(datagram.contents.first(), Some(0..=3)) {
+                    saw_path(w, datagram.source);
+                }
                 // Revoked slots are wiped before a NACK can reach their RTX caches.
                 sweep(w);
                 if let Err(e) = w.rtc.handle_input(input) {
@@ -1636,7 +1672,8 @@ impl Sfu {
             Change::Pause(reason) => {
                 let (estimate, counters) = (w.egress.estimate(), w.egress.counters);
                 debug!(session, share, ?reason, estimate, ?counters, "screen slot paused");
-                self.signal(ScreenSignal::Paused { session, run, grant, reason });
+                let waiting = reason == ScreenPauseReason::Bandwidth && stopped(w);
+                self.signal(ScreenSignal::Paused { session, run, grant, reason, waiting });
             }
             Change::Resume => {
                 debug!(session, share, "screen slot resumed");
@@ -2521,11 +2558,13 @@ fn allocate(
         try_again(w, slot, rates, now);
         return Some((slot, Change::Resume));
     }
+    let moved = std::mem::take(&mut w.moved);
     if !stalled {
         if !recovering {
             w.restarted = None;
         }
         w.retry_at = None;
+        w.above_since = None;
         if !w.egress.healthy() {
             w.healthy_since = None;
         } else if now.saturating_duration_since(*w.healthy_since.get_or_insert(now)) >= RETRY_RESET {
@@ -2533,6 +2572,8 @@ fn allocate(
             w.attempt = None;
             w.untested = None;
             w.failed = None;
+            w.struck = None;
+            w.last_chance = false;
         }
         return None;
     }
@@ -2542,11 +2583,18 @@ fn allocate(
     // and pauses again; the continuous-fit resume can still come first. Existing socket credit
     // is never minted, and a continuous-fit timer in progress finishes first.
     w.healthy_since = None;
+    // Retrying the same start again tells nothing new and may cost voice on the link each time:
+    // stopped, a retry needs the link to show it changed. Not stopped, a new path does not
+    // bring the backoff's next retry forward.
+    if stopped(w) {
+        resume_on_change(w, moved, now)?;
+        w.retry_at = Some(w.started.map_or(now, |at| now.max(at + RETRY_FIRST)));
+    }
     // An inconclusive retry sent next to nothing: the next one, which sends what it could not,
     // only keeps the spacing between starts.
     let at = *w.retry_at.get_or_insert(match (w.untested, w.started) {
         (Some(_), Some(started)) => started + RETRY_FIRST,
-        _ => now + RETRY_FIRST.saturating_mul(1 << w.retries.min(8)).min(RETRY_MAX),
+        _ => now + RETRY_BACKOFF[(w.retries as usize).min(RETRY_BACKOFF.len() - 1)],
     });
     if now < at || w.egress.fitting() || !probe_ready {
         return None;
@@ -2584,25 +2632,101 @@ fn judge(w: &mut Watcher) {
     match attempt {
         Some(a) if shown >= a.start => {
             w.retries = 0;
+            w.struck = None;
+            w.last_chance = false;
             w.step = carried_step(sent, a.start);
             if w.failed.is_some_and(|f| a.start >= f) {
                 w.failed = None;
             }
         }
-        Some(a) if w.egress.estimate() >= a.start && RETRY_STEP * (sent as f64) < a.start as f64 => {
-            if a.start < top(w, a.slot) {
-                if a.counted {
-                    w.retries = w.retries.saturating_sub(1);
-                }
-                w.untested = Some(a.start);
+        // One that already started at the share's whole start falls through to failed.
+        Some(a)
+            if w.egress.estimate() >= a.start
+                && RETRY_STEP * (sent as f64) < a.start as f64
+                && a.start < top(w, a.slot) =>
+        {
+            if a.counted {
+                w.retries = w.retries.saturating_sub(1);
             }
+            w.untested = Some(a.start);
         }
         Some(a) => {
             w.step = sent.min((a.start as f64 / RETRY_STEP) as u64);
             w.failed = Some(a.start);
+            if a.counted {
+                strike(w, a.start);
+            }
         }
-        None => w.step = sent,
+        // What the transport sent before a pause that ended no retry can predate a link that
+        // just got slower; the estimate TWCC lowered to says what it carries now.
+        None => w.step = sent.min(w.egress.estimate()),
     }
+}
+
+/// An automatic retry from `start` failed: another strike if no higher than about the highest
+/// start that already failed in a row (a lower one failing says the link is slow all the more),
+/// otherwise the first at this new height.
+fn strike(w: &mut Watcher, start: u64) {
+    let (level, strikes) = match w.struck {
+        // Resumed on evidence of a change, which this failure disproved, at whatever start.
+        Some((level, _)) if std::mem::take(&mut w.last_chance) => (level.max(start), RETRY_STRIKES),
+        Some((level, strikes)) if start as f64 <= RETRY_LEVEL * level as f64 => (level.max(start), strikes + 1),
+        _ => (start, 1),
+    };
+    w.struck = Some((level, strikes));
+    if strikes == RETRY_STRIKES {
+        info!(session = w.session, start, strikes, "screen watch retries stop until the link changes");
+    }
+}
+
+/// Automatic retries have stopped (`RETRY_STRIKES`).
+fn stopped(w: &Watcher) -> bool {
+    w.struck.is_some_and(|(_, strikes)| strikes >= RETRY_STRIKES)
+}
+
+/// Stopped retries resume once the link shows it changed: its estimate held `RETRY_LEVEL` above
+/// the highest failed start for `RAMP`, or the viewer came from an address not seen before on
+/// this transport (`moved`), at most once per backoff step, so a path flapping between new
+/// addresses cannot retry faster than the backoff would. The reason, if they resume; the
+/// next failure then stops them again.
+fn resume_on_change(w: &mut Watcher, moved: bool, now: Instant) -> Option<&'static str> {
+    let (level, _) = w.struck?;
+    let above = w.egress.estimate() as f64 >= RETRY_LEVEL * level as f64;
+    if !above {
+        w.above_since = None;
+    }
+    let shown = above && now.saturating_duration_since(*w.above_since.get_or_insert(now)) >= egress::RAMP;
+    let backoff = RETRY_BACKOFF[(w.retries as usize).min(RETRY_BACKOFF.len() - 1)];
+    let path = moved && w.path_resumed.is_none_or(|at| now.saturating_duration_since(at) >= backoff);
+    let reason = if shown {
+        "estimate"
+    } else if path {
+        w.path_resumed = Some(now);
+        "path"
+    } else {
+        return None;
+    };
+    info!(session = w.session, reason, level, estimate = w.egress.estimate(), "screen watch retries resume");
+    w.struck = Some((level, RETRY_STRIKES - 1));
+    w.above_since = None;
+    w.last_chance = true;
+    Some(reason)
+}
+
+/// The viewer's DTLS or RTCP came from `source`: an address not seen before on this transport
+/// is a new path. A path flipping between addresses it already used is not.
+fn saw_path(w: &mut Watcher, source: SocketAddr) {
+    if w.paths.contains(&source) {
+        return;
+    }
+    if !w.paths.is_empty() {
+        debug!(session = w.session, "screen watch path moved");
+        w.moved = true;
+    }
+    if w.paths.len() >= ADDRESSES_PER_TRANSPORT {
+        w.paths.pop_front();
+    }
+    w.paths.push_back(source);
 }
 
 /// Where the next retry steps up from after the link carried one that started at `start`:
@@ -2643,7 +2767,10 @@ fn climb(w: &mut Watcher, lanes: &[ShareRate], rates: &HashMap<String, ShareRate
         return false;
     }
     w.step = carried_step(sent(w), a.start);
+    // Carried in full, as a carried retry is: the strikes go, the cap at `failed` stays.
     w.retries = 1;
+    w.struck = None;
+    w.last_chance = false;
     start_at(w, target, rates, now);
     w.restarted = Some(now);
     w.attempt = Some(Attempt { start: w.egress.estimate(), ..a });
@@ -3309,6 +3436,12 @@ fn watcher(
         attempt: None,
         untested: None,
         failed: None,
+        struck: None,
+        above_since: None,
+        paths: VecDeque::new(),
+        moved: false,
+        path_resumed: None,
+        last_chance: false,
         started: None,
         asked: None,
         carried: VecDeque::new(),
@@ -3788,7 +3921,10 @@ pub(crate) mod tests {
         assert!(pair.w.egress.estimate() < 1_000_000, "the actual pending BWE event was drained");
         assert!(pair.w.slots[0].written <= 2, "release uses the reduced estimate");
         assert_eq!(pair.w.egress.counters.originals_dropped, 0);
-        assert!(pair.w.egress.queued() > 0, "the rest stays owned by the deadline queue");
+        // At 100 kbps the rest of the keyframe would leave seconds past its deadline: it goes
+        // at once, as a failed keyframe, rather than overrunning the link until then.
+        assert_eq!(pair.w.egress.queued(), 0, "the late keyframe is dropped");
+        assert_eq!(pair.w.egress.counters.failed_keyframes, 1);
     }
 
     #[tokio::test]

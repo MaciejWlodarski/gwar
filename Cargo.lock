@@ -2836,6 +2836,7 @@ dependencies = [
  "mach2 0.6.0",
  "objc2",
  "objc2-av-foundation",
+ "objc2-core-audio",
  "openmls",
  "openmls_rust_crypto",
  "rand 0.9.5",

@@ -170,7 +170,7 @@ export const events: { [K in EventName]: Rule<EventData<K>> } = {
   "screen.slot": shape({ run: int(Number.MAX_SAFE_INTEGER, 1), slot: int(3), share: nullable(shareId) }),
   "screen.keyframe": shape({ share: shareId, run: int(Number.MAX_SAFE_INTEGER, 1), slot: int(3), generation: int(65535) }),
   "screen.recover": shape({ share: shareId, codec: literal(["h264", "vp9"]), width: int(SCREEN_RECOVERY_MAX_DIMENSION, 1), height: int(SCREEN_RECOVERY_MAX_DIMENSION, 1), fps: int(60, 1) }),
-  "screen.paused": shape({ share: shareId, reason: literal<ScreenPauseReason>(["bandwidth", "budget"]) }), "screen.resumed": shape({ share: shareId }),
+  "screen.paused": shape({ share: shareId, reason: literal<ScreenPauseReason>(["bandwidth", "budget"]) }), "screen.resumed": shape({ share: shareId }), "screen.waiting": shape({ share: shareId }),
   "server.egress_warning": shape({ month, percent: int(100), total: int(Number.MAX_SAFE_INTEGER), limit: int(Number.MAX_SAFE_INTEGER) }),
   "voice.epoch.ack": shape({call:fixed(16),group:fixed(32),epoch:id,device:fixed(32)}),
   "voice.epoch.request": shape({call:fixed(16),group:fixed(32),epoch:id}),

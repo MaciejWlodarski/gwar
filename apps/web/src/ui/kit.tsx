@@ -438,8 +438,8 @@ export function Dialog({
   description,
   children,
   footer,
-  width = "max-w-md",
   onCloseAutoFocus,
+  width = "max-w-md",
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -447,9 +447,8 @@ export function Dialog({
   description?: string;
   children: ReactNode;
   footer?: ReactNode;
-  width?: string;
-  /** Without a trigger, focus returns nowhere: a dialog opened from elsewhere can restore it here. */
   onCloseAutoFocus?: (event: Event) => void;
+  width?: string;
 }) {
   const t = useT();
   return (

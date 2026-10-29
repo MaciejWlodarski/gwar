@@ -7,13 +7,16 @@ import type { Channel } from "../proto/Channel";
 import type { Client } from "../proto/Client";
 import { initialState } from "../state/reducer";
 import { useSettings } from "../state/settings";
-import { useSession, useUi, type Section } from "../state/stores";
+import { useSession, useUi, useVoice, type Section } from "../state/stores";
 import { TooltipProvider } from "./kit";
 import { SectionRail } from "./SectionRail";
 import { SettingsSection } from "./Settings";
-import { VoicePill } from "./VoicePanel";
+import { VoicePanel, VoicePill } from "./VoicePanel";
 
-const mock = vi.hoisted(() => ({ selectChannel: vi.fn(), leaveVoice: vi.fn(async () => {}), toggleMute: vi.fn(), toggleDeafen: vi.fn() }));
+// The local fixtures must never ask the public account service for profile/key data.
+vi.mock("../lib/official", async get => ({ ...await get<typeof import("../lib/official")>(), CONNECT_URL: "http://127.0.0.1:18980" }));
+
+const mock = vi.hoisted(() => ({ selectChannel: vi.fn(), leaveVoice: vi.fn(async () => {}), toggleMute: vi.fn(), toggleDeafen: vi.fn(), retryVoice: vi.fn() }));
 vi.mock("../state/controller", async () => {
   const { useSession } = await import("../state/stores");
   return {
@@ -55,6 +58,7 @@ let root: Root, container: HTMLDivElement;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   mock.selectChannel.mockClear();
+  useVoice.setState({ state: "starting", reconnecting: false, failure: null });
   useSettings.setState({ language: "en" });
   useUi.setState({ section: "servers", back: "servers", settingsTab: "audio", gearTab: "audio", overview: false, collapsed: {}, pane: "list", moreOpen: false, settingsDrill: false, dialog: { kind: "none" } });
   useSession.setState({ ...initialState, phase: "idle" });
@@ -193,7 +197,14 @@ describe("the voice pill", () => {
     await show("home");
     expect(pill()!.textContent).toContain("Connecting voice…");
     await act(async () => useSession.setState({ phase: "reconnecting" }));
-    expect(pill()!.textContent).toContain("Reconnecting…");
+    expect(pill()!.textContent).toContain("Reconnecting voice…");
+    await act(async () => {
+      useSession.setState({ phase: "online" });
+      useVoice.setState({ state: "failed", reconnecting: true });
+    });
+    expect(pill()!.textContent).toContain("Reconnecting voice…");
+    expect(pill()!.textContent).not.toContain("Voice unavailable");
+    await act(async () => useVoice.setState({ state: "starting", reconnecting: false }));
   });
 
   it("leads back to the voice channel in the server view, unfolded", async () => {
@@ -206,4 +217,34 @@ describe("the voice pill", () => {
     expect(useSession.getState().viewChannel).toBe(2);
     expect(pill()).toBeNull();
   });
+});
+
+it("keeps permanent refusal compact, with an on-demand reason and manual Retry", async () => {
+  online();
+  useVoice.setState({ state: "failed", reconnecting: false, failure: "Update your browser to join encrypted voice." });
+  await render(<VoicePanel />);
+  expect(container.textContent).toContain("Voice unavailable");
+  expect(container.textContent).not.toContain("Update your browser to join encrypted voice.");
+  expect(container.textContent).not.toContain("Reconnecting voice");
+  const why = [...container.querySelectorAll("button")].find(button => button.textContent === "Why?");
+  await click(why!);
+  const dialog = document.querySelector('[role="dialog"]')!;
+  expect(dialog.textContent).toContain("Update your browser to join encrypted voice.");
+  await click(dialog.querySelector('button[aria-label="Close"]')!);
+  expect(document.querySelector('[role="dialog"]')).toBeNull();
+  const retry = [...container.querySelectorAll("button")].find(button => button.textContent === "Retry");
+  expect(retry!.parentElement!.textContent).toContain("Why?");
+  await click(retry!); expect(mock.retryVoice).toHaveBeenCalledOnce();
+});
+
+it("keeps the refusal and Retry available while network recovery leaves me outside voice", async () => {
+  online();
+  useSession.getState().dispatch({ type: "event", now: Date.now(), event: { ev: "client.updated", d: { ...useSession.getState().clients[1]!, channel: null, voice_binding: null } } });
+  useVoice.setState({ state: "failed", reconnecting: false, failure: "Unsupported voice" });
+  await render(<VoicePanel />);
+  expect(container.textContent).toContain("Voice unavailable");
+  expect(container.textContent).not.toContain("Not in voice");
+  expect(container.querySelector('button[aria-label="Leave voice"]')).toBeNull();
+  const retry = [...container.querySelectorAll("button")].find(button => button.textContent === "Retry");
+  await click(retry!); expect(mock.retryVoice).toHaveBeenCalledOnce();
 });

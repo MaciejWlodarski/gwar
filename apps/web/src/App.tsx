@@ -5,9 +5,10 @@ import { useIsMobile } from "./lib/media";
 import { initDesktop } from "./platform/desktop";
 import { initUpdates } from "./platform/updater";
 import { controller } from "./state/controller";
-import { useSession, useUi, type ServerPane } from "./state/stores";
+import { useConnectUi, useSession, useUi, type ServerPane } from "./state/stores";
 import { BugReportSection } from "./ui/BugReport";
 import { ChatArea } from "./ui/Chat";
+import { Connecting } from "./ui/Connecting";
 import { ConnectionWarning } from "./ui/ConnectionWarning";
 import { ConnectScreen } from "./ui/ConnectScreen";
 import { Dialogs } from "./ui/Dialogs";
@@ -25,6 +26,7 @@ import { SettingsSection } from "./ui/Settings";
 import { SharePresetDialog, SharingBar, Stage } from "./ui/Screen";
 import { useScreen } from "./state/screen";
 import { Sidebar } from "./ui/Sidebar";
+import { IdentityNotices } from "./ui/IdentityNotices";
 import { Toaster } from "./ui/Toaster";
 import { ConnectionDetails } from "./ui/ConnectionQuality";
 
@@ -40,14 +42,16 @@ export function App() {
   const overview = useUi((s) => s.overview);
   const pane = useUi((s) => s.pane);
   const members = useMembersPanel();
-  const showApp = phase === "online" || phase === "reconnecting";
+  const restoring = useConnectUi((s) => s.restoring);
+  const connecting = restoring;
+  const showApp = connecting || phase === "online" || phase === "reconnecting";
   const stageOpen = useScreen((s) => s.stage !== null);
   const chatHidden = useScreen((s) => s.chatHidden);
 
   useTheme();
   useShortcuts();
   useEffect(() => controller.init(), []);
-  useEffect(() => void accountActions.load(), []);
+  useEffect(() => { void accountActions.load().then(() => controller.restoreSession()); }, []);
   useEffect(() => initDesktop(), []);
   useEffect(() => initUpdates(), []);
 
@@ -69,6 +73,7 @@ export function App() {
     <TooltipProvider>
       <div className="flex h-dvh w-full flex-col overflow-hidden bg-rail">
         <ConnectionWarning phase={phase} insecure={insecureConnection} />
+        <IdentityNotices />
         {showApp && <SharingBar />}
         <div className="flex min-h-0 w-full flex-1 overflow-hidden">
           {!isMobile && <SectionRail />}
@@ -79,9 +84,9 @@ export function App() {
               {(!isMobile || !showApp) && <ServerRail card={!isMobile} />}
               {showApp ? (
                 <div className={cn("relative flex min-w-0 flex-1", !isMobile && "gap-2")}>
-                  {!isMobile && <Sidebar card />}
+                  {!isMobile && <Sidebar card connecting={connecting} />}
                   <div inert={!paneShown("chat")} className={cn("flex min-w-0 flex-1", !isMobile && "gap-2", !paneShown("chat") && "invisible")}>
-                    {stageOpen ? (
+                    {connecting ? <Connecting card={!isMobile} /> : stageOpen ? (
                       <>
                         {/* Watching: the stage is the main content, the chat collapsible beside it. */}
                         <Stage card={!isMobile} />
@@ -108,7 +113,7 @@ export function App() {
                   {isMobile && pane === "list" && (
                     <div className="absolute inset-0 flex">
                       <ServerRail />
-                      <Sidebar fill />
+                      {connecting ? <Connecting /> : <Sidebar fill />}
                     </div>
                   )}
                   {isMobile && pane === "members" && (

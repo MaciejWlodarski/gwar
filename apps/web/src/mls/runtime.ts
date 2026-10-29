@@ -57,6 +57,8 @@ export interface RuntimeOptions {
   /** Another tab of this device asked for the session while this runtime holds
    * the lock; the caller closes it. Without it, a second tab waits for the lock. */
   onTakeover?: () => void;
+  /** False for passive startup: claim only a free device and never ask another tab to leave. */
+  takeover?: boolean;
   /** Fetches public groups' ratchet trees over HTTP; the global fetch by default. */
   fetch?: typeof fetch;
   /** The owner an invite link named (`owner={uid}`), checked on first contact. */
@@ -192,10 +194,10 @@ export class MlsRuntime {
         if (holding) options.onTakeover!();
         else waiting.abort(new DeviceTakenOver());
       };
-      takeover.postMessage(mine);
+      if (options.takeover !== false) takeover.postMessage(mine);
     }
     let release: () => Promise<void>;
-    try { release = await acquireDeviceLock(options.identity.publicKey, locks, waiting.signal); }
+    try { release = await acquireDeviceLock(options.identity.publicKey, locks, waiting.signal, options.takeover === false); }
     catch (error) { takeover?.close(); throw waiting.signal.reason instanceof DeviceTakenOver ? waiting.signal.reason : error; }
     finally { options.signal?.removeEventListener("abort", abortWaiting); }
     holding = true;

@@ -624,7 +624,7 @@ describe("sharing", () => {
     expect(t.stop).toHaveBeenCalledTimes(1);
     expect(publisher.close).toHaveBeenCalledTimes(1);
     expect(calls.filter(([op]) => op === "screen.stop")).toEqual([["screen.stop", { share: "M" }]]);
-    expect(toast).toHaveBeenCalledExactlyOnceWith("error", "Your screen share was stopped: this browser could not encode the video.");
+    expect(toast).toHaveBeenCalledExactlyOnceWith("error", "Your screen share was stopped: this browser could not encode the video.", expect.objectContaining({ key: "screen-stopped", sticky: true, action: { label: "Share again", run: expect.any(Function) } }));
     choosing(); await screen.confirmShare();
     publisher.params.encodeFailed(); await flush();
     expect(useScreen.getState().own?.share).toBe("M");
@@ -778,6 +778,9 @@ describe("sharing", () => {
     expect(useScreen.getState().own).toBeNull();
     expect(t.stop).toHaveBeenCalled();
     expect(media.publishers[0]!.close).toHaveBeenCalled();
-    expect(toast).toHaveBeenCalledWith("info", "Mod stopped your screen share.");
+    const begin = vi.spyOn(screen, "beginShare").mockImplementation(() => {});
+    toast.mock.calls.at(-1)![2].action.run();
+    expect(begin).toHaveBeenCalledOnce();
+    expect(toast).toHaveBeenCalledWith("info", "Mod stopped your screen share.", expect.objectContaining({ sticky: true, key: "screen-stopped" }));
   });
 });

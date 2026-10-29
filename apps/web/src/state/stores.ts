@@ -6,7 +6,7 @@ import type { ChatTarget } from "../proto/ChatTarget";
 import type { CloseReason } from "../net/connection";
 import type { InviteTarget } from "../net/invite";
 import type { DeviceList, VoiceError, VoiceState } from "../voice/engine";
-import type { ServerKind } from "./settings";
+import { useSettings, type ServerKind } from "./settings";
 import { initialState, reduce, type Action, type SealedThreadKey } from "./reducer";
 import type { SessionState } from "./types";
 
@@ -74,6 +74,8 @@ interface VoiceStore {
   deafened: boolean;
   level: number;
   state: VoiceState;
+  reconnecting: boolean;
+  failure: string | null;
   micError: VoiceError | null;
   pttActive: boolean;
   devices: DeviceList;
@@ -83,10 +85,12 @@ interface VoiceStore {
 export const useVoice = create<VoiceStore>()((set) => ({
   encryption: null,
   hearers: null,
-  muted: false,
-  deafened: false,
+  muted: useSettings.getState().selfMuted,
+  deafened: useSettings.getState().selfDeafened,
   level: 0,
   state: "idle",
+  reconnecting: false,
+  failure: null,
   micError: null,
   pttActive: false,
   devices: { inputs: [], outputs: [] },
@@ -96,7 +100,14 @@ export const useVoice = create<VoiceStore>()((set) => ({
 // ----------------------------------------------------------------------- ui
 
 export type ToastKind = "error" | "info" | "success";
-export interface Toast {
+export interface ToastOptions {
+  /** Replaces/resolves a notice about the same state without matching translated text. */
+  key?: string;
+  sticky?: boolean;
+  action?: { label: string; run: () => void };
+  details?: string;
+}
+export interface Toast extends ToastOptions {
   id: number;
   kind: ToastKind;
   text: string;
@@ -173,6 +184,7 @@ interface UiStore {
   /** Where Esc (or Cancel) on the settings and bug report pages goes back to: the section before them. */
   back: Section;
   /** The settings page's open tab. */
+  accountEntry: "signin" | "create" | "recover";
   settingsTab: SettingsTab;
   /** The tab the gear opens: the last one open that is not a profile tab. */
   gearTab: SettingsTab;
@@ -195,8 +207,8 @@ interface UiStore {
    */
   landOnServer(): void;
   setEditing(message: number | null): void;
-  toast(kind: ToastKind, text: string): void;
-  dismissToast(id: number): void;
+  toast(kind: ToastKind, text: string, options?: ToastOptions): void;
+  dismissToast(id: number | string): void;
   openDialog(dialog: DialogState): void;
   closeDialog(): void;
   setPane(pane: ServerPane): void;
@@ -222,6 +234,7 @@ export const useUi = create<UiStore>()((set) => ({
   editing: null,
   section: "servers",
   back: "servers",
+  accountEntry: "signin",
   settingsTab: "audio",
   gearTab: "audio",
   settingsDrill: false,
@@ -236,12 +249,17 @@ export const useUi = create<UiStore>()((set) => ({
   showChat: () => set({ section: "servers", overview: false, pane: "chat" }),
   landOnServer: () => set({ section: "servers", overview: false, pane: "list" }),
   setEditing: (editing) => set({ editing }),
-  toast: (kind, text) => {
-    const id = toastId++;
-    set((s) => (s.toasts.some((t) => t.text === text) ? s : { toasts: [...s.toasts.slice(-3), { id, kind, text }] }));
-    setTimeout(() => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })), kind === "error" ? 6000 : 3500);
+  toast: (kind, text, options = {}) => {
+    set((s) => {
+      if (!options.key && s.toasts.some((t) => t.text === text)) return s;
+      const kept = options.key ? s.toasts.filter((t) => t.key !== options.key) : s.toasts;
+      const next = [...kept, { id: toastId++, kind, text, ...options }];
+      // Transient traffic must never silently evict a sticky state error.
+      const transient = next.filter((t) => !t.sticky).slice(-4);
+      return { toasts: next.filter((t) => t.sticky || transient.includes(t)) };
+    });
   },
-  dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => t.id !== id) })),
+  dismissToast: (id) => set((s) => ({ toasts: s.toasts.filter((t) => typeof id === "string" ? t.key !== id : t.id !== id) })),
   openDialog: (dialog) =>
     set((s) => {
       if (s.dialog.kind === "tsFirstRun") s.dialog.resolve(null);
@@ -302,6 +320,10 @@ export const useOutbox = create<OutboxStore>()((set, get) => ({
 // ------------------------------------------------------------ connect screen
 
 interface ConnectUi {
+  startupRetry: boolean;
+  /** The saved server is held by another tab; connecting here is an explicit takeover. */
+  otherTab: import("./settings").SavedConnection | null;
+  restoring: boolean;
   busy: boolean;
   error: string | null;
   /** The server asked for a password we do not have (or got wrong). */
@@ -314,6 +336,9 @@ interface ConnectUi {
 
 export const useConnectUi = create<ConnectUi>()((set) => ({
   busy: false,
+  restoring: false,
+  startupRetry: false,
+  otherTab: null,
   error: null,
   needPassword: false,
   serverName: null,

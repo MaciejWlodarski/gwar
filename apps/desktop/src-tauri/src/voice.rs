@@ -14,6 +14,8 @@
 //! - `voice://level`   `{owner, db, transmitting}`    ~20 Hz while the window is visible
 //! - `voice://issue`   `{owner, side, kind, message}` device problems (`input`/`output`)
 //!   with `kind` = `no_device` | `permission_denied` (input only) | `failed`
+//! - `voice://device`  `{owner, side, kind, device}` the devices sorted themselves out:
+//!   `switched` (audio moved to `device` by itself) | `recovered` (a reported problem is over)
 //! - `voice://test-level {owner, db}`                 microphone test in settings
 //! - `voice://crypto`  `{owner, run, binding, state, reason}` encrypted-run status
 //!   (`securing` | `failed`); never an installation acknowledgement
@@ -35,7 +37,7 @@ use std::{
 
 use gwar_client::voice::{
     InputMode, LinkState, NoiseSuppression, VoiceHandle,
-    io::{AudioIo, AudioPorts, DeviceIo, DeviceIssue, IssueSink},
+    io::{AudioIo, AudioPorts, DeviceControl, DeviceIo, DeviceIssue, IssueSink, Side},
     keys::EncryptedStart,
     permission,
     sframe::{Binding, ControlReply, Counters, CryptoStatus},
@@ -92,6 +94,8 @@ struct Inner {
     mic_test: Option<Arc<NativeRun>>,
     prefs: Prefs,
     handle: Option<VoiceHandle>,
+    /// Moves the running engine's devices (`voice_set_devices`) without renegotiating.
+    devices: Option<DeviceControl>,
     pending_answer: Option<(u64, oneshot::Sender<Result<String, String>>)>,
     cancelled_through: u64,
     ts_sink: Option<VoiceSinkLease>,
@@ -127,6 +131,7 @@ impl Default for Voice {
                     slot_gain: [1.0; AUDIO_SLOTS],
                 },
                 handle: None,
+                devices: None,
                 pending_answer: None,
                 cancelled_through: 0,
                 ts_sink: None,
@@ -301,6 +306,21 @@ struct IssuePayload {
     message: String,
 }
 
+#[derive(Clone, Serialize)]
+struct DevicePayload {
+    owner: u64,
+    side: &'static str,
+    kind: &'static str,
+    device: Option<String>,
+}
+
+fn side_name(side: Side) -> &'static str {
+    match side {
+        Side::Input => "input",
+        Side::Output => "output",
+    }
+}
+
 fn issue_sink(app: &AppHandle, owner: u64) -> IssueSink {
     let app = app.clone();
     Arc::new(move |issue| {
@@ -308,6 +328,17 @@ fn issue_sink(app: &AppHandle, owner: u64) -> IssueSink {
         let (side, message) = match issue {
             DeviceIssue::Input(m) | DeviceIssue::InputDenied(m) => ("input", m),
             DeviceIssue::Output(m) => ("output", m),
+            DeviceIssue::Switched(side, device) => {
+                tracing::info!("audio {side:?} switched to {device}");
+                let payload = DevicePayload { owner, side: side_name(side), kind: "switched", device: Some(device) };
+                let _ = app.emit("voice://device", payload);
+                return;
+            }
+            DeviceIssue::Recovered(side) => {
+                let payload = DevicePayload { owner, side: side_name(side), kind: "recovered", device: None };
+                let _ = app.emit("voice://device", payload);
+                return;
+            }
         };
         let kind = if denied {
             "permission_denied"
@@ -346,7 +377,13 @@ impl AudioIo for FallbackIo {
     }
 }
 
-fn make_io(voice: &Voice, input: Option<String>, output: Option<String>, sink: IssueSink) -> Box<dyn AudioIo> {
+/// The devices to open, and a control that moves them while voice runs (real devices only).
+fn make_io(
+    voice: &Voice,
+    input: Option<String>,
+    output: Option<String>,
+    sink: IssueSink,
+) -> (Box<dyn AudioIo>, Option<DeviceControl>) {
     if cfg!(debug_assertions) && std::env::var("GWAR_FAKE_AUDIO").is_ok_and(|v| v == "fail") {
         // Exercises the "no devices at all" path: report problems, keep listening/chatting.
         struct Failing;
@@ -355,13 +392,15 @@ fn make_io(voice: &Voice, input: Option<String>, output: Option<String>, sink: I
                 anyhow::bail!("simulated: no audio hardware")
             }
         }
-        return Box::new(FallbackIo { primary: Box::new(Failing), sink });
+        return (Box::new(FallbackIo { primary: Box::new(Failing), sink }), None);
     }
     if fake_audio::enabled() {
         tracing::info!("using FAKE audio devices (tone={})", fake_audio::tone());
-        return Box::new(FakeIo { tone: fake_audio::tone(), heard: voice.heard.clone() });
+        return (Box::new(FakeIo { tone: fake_audio::tone(), heard: voice.heard.clone() }), None);
     }
-    Box::new(FallbackIo { primary: Box::new(DeviceIo::new(input, output).with_issue_sink(sink.clone())), sink })
+    let devices = DeviceIo::new(input, output).with_issue_sink(sink.clone());
+    let control = devices.control();
+    (Box::new(FallbackIo { primary: Box::new(devices), sink }), Some(control))
 }
 
 async fn resolve(host: &str) -> Result<IpAddr, String> {
@@ -390,6 +429,7 @@ fn clear_run(voice: &Voice, inner: &mut Inner) {
     }
     voice.run.store(0, Ordering::SeqCst);
     inner.handle = None;
+    inner.devices = None;
     inner.pending_answer = None;
     inner.ts_sink = None;
 }
@@ -541,8 +581,8 @@ pub async fn voice_start(
         let inner = voice.lock();
         (inner.prefs.input.clone(), inner.prefs.output.clone())
     };
-    let io: Box<dyn AudioIo> =
-        Box::new(RunIo { run: startup.clone(), io: make_io(&voice, input, output, issue_sink(&app, owner)) });
+    let (io, control) = make_io(&voice, input, output, issue_sink(&app, owner));
+    let io: Box<dyn AudioIo> = Box::new(RunIo { run: startup.clone(), io });
 
     let handle = startup
         .until_retired(async {
@@ -574,6 +614,11 @@ pub async fn voice_start(
             tauri::async_runtime::spawn(forward_crypto(app.clone(), owner, run, events));
         }
         inner.handle = Some(handle);
+        // A choice made while the devices opened applies now.
+        if let Some(control) = &control {
+            control.set_devices(inner.prefs.input.clone(), inner.prefs.output.clone());
+        }
+        inner.devices = control;
     }
     tauri::async_runtime::spawn(monitor(app, owner, run));
     Ok(())
@@ -904,8 +949,8 @@ pub fn voice_set_slot_gain(
     Ok(())
 }
 
-/// Chooses devices by name (`null` = system default). Takes effect the next
-/// time voice starts; the UI restarts voice when it changes while connected.
+/// Chooses devices by name (`null` = system default). Running voice moves to
+/// them at once, reopening only the side that changed; no renegotiation.
 #[tauri::command]
 pub fn voice_set_devices(
     window: WebviewWindow,
@@ -917,6 +962,9 @@ pub fn voice_set_devices(
     check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
+    if let Some(devices) = &inner.devices {
+        devices.set_devices(input.clone(), output.clone());
+    }
     inner.prefs.input = input;
     inner.prefs.output = output;
     Ok(())
@@ -974,7 +1022,7 @@ pub async fn mic_test_start(
         inner.mic_test = Some(test.clone());
         test
     };
-    let io = Box::new(RunIo { run: test.clone(), io: make_io(&voice, input, None, issue_sink(&app, owner)) });
+    let io = Box::new(RunIo { run: test.clone(), io: make_io(&voice, input, None, issue_sink(&app, owner)).0 });
     let ports = test
         .until_retired(async {
             tokio::task::spawn_blocking(move || io.open())

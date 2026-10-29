@@ -1,3 +1,4 @@
+import { readOnboarding, type Onboarding } from "../lib/onboarding";
 import { defaultQuality, migrateQuality, type QualitySettings } from "../voice/screen-quality";
 import { serverKey } from "../lib/server-key";
 import { useMemo } from "react";
@@ -11,6 +12,43 @@ export type Language = "pl" | "en";
 
 /** `gwar`: a gwar/1 server (WebSocket + WebRTC). `teamspeak`: a TeamSpeak 3/6 server (desktop app only). */
 export type ServerKind = "gwar" | "teamspeak";
+
+/** Local session intent; no invite codes or automatic cold-start voice entry. */
+export interface SavedConnection {
+  address: string;
+  kind: ServerKind;
+  name: string;
+  password?: string;
+  identity?: string;
+  insecureLan?: boolean;
+}
+export interface UpdateVoiceResume {
+  address: string;
+  kind: ServerKind;
+  version: string;
+  expiresAt: number;
+  channel: number;
+  password?: string;
+}
+
+export function validSavedConnection(value: unknown): SavedConnection | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.address !== "string" || !v.address.trim() || (v.kind !== "gwar" && v.kind !== "teamspeak") || typeof v.name !== "string" ||
+      (v.password !== undefined && typeof v.password !== "string") || (v.identity !== undefined && typeof v.identity !== "string") ||
+      (v.insecureLan !== undefined && typeof v.insecureLan !== "boolean")) return null;
+  return { address: v.address, kind: v.kind, name: v.name, password: v.password, identity: v.identity, insecureLan: v.insecureLan };
+}
+
+function validUpdateVoiceResume(value: unknown): UpdateVoiceResume | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  if (!validSavedConnection({ ...v, name: "" }) || typeof v.version !== "string" ||
+      typeof v.expiresAt !== "number" || !Number.isFinite(v.expiresAt) ||
+      typeof v.channel !== "number" || !Number.isSafeInteger(v.channel) || v.channel < 0) return null;
+  return { address: v.address as string, kind: v.kind as ServerKind, version: v.version,
+    expiresAt: v.expiresAt, channel: v.channel, password: v.password as string | undefined };
+}
 
 export interface Bookmark {
   id: string;
@@ -254,6 +292,8 @@ export interface NotificationSettings {
 }
 
 export interface SettingsState extends QualitySettings {
+  onboarding: Onboarding | null;
+  setOnboarding(patch: Partial<Onboarding>): void;
   theme: Theme;
   language: Language;
   compact: boolean;
@@ -273,6 +313,14 @@ export interface SettingsState extends QualitySettings {
   bookmarkEdits: number;
   lastAddress: string;
   lastKind: ServerKind;
+  selfMuted: boolean;
+  selfDeafened: boolean;
+  /** Null after an explicit Disconnect. This device only; never synced to the vault. */
+  resumeConnection: SavedConnection | null;
+  updateVoiceResume: UpdateVoiceResume | null;
+  setSelfVoice(muted: boolean, deafened: boolean): void;
+  setResumeConnection(connection: SavedConnection | null): void;
+  setUpdateVoiceResume(resume: UpdateVoiceResume | null): void;
   /** This device was already offered the identities of the official TeamSpeak client (asked only once). */
   tsDetectAsked: boolean;
   /** Per server key: the TeamSpeak claim was offered there (docs/teamspeak-import.md, "Claim"), asked only once. */
@@ -343,6 +391,8 @@ export const useSettings = create<SettingsState>()(
     (set) => ({
       ...defaultQuality,
       setScreenQuality: (patch) => set(patch),
+      onboarding: null,
+      setOnboarding: (patch) => set((s) => ({ onboarding: { completed: false, firstUsedAt: Date.now(), nudgeDismissed: false, roleReceived: false, ...s.onboarding, ...patch } })),
       theme: "system",
       language: detectLanguage(),
       compact: false,
@@ -357,6 +407,13 @@ export const useSettings = create<SettingsState>()(
       bookmarkEdits: 0,
       lastAddress: "",
       lastKind: "gwar",
+      selfMuted: false,
+      selfDeafened: false,
+      resumeConnection: null,
+      updateVoiceResume: null,
+      setSelfVoice: (selfMuted, selfDeafened) => set({ selfMuted, selfDeafened }),
+      setResumeConnection: (resumeConnection) => set({ resumeConnection }),
+      setUpdateVoiceResume: (updateVoiceResume) => set({ updateVoiceResume }),
       tsDetectAsked: false,
       tsClaimAsked: {},
       channelEncryption: {},
@@ -422,7 +479,10 @@ export const useSettings = create<SettingsState>()(
       removeBookmark: (id) =>
         set((s) => {
           const now = Date.now();
+          const removed = s.bookmarks.find(b => b.id === id);
+          const forget = removed && s.resumeConnection && serverKey(removed) === serverKey(s.resumeConnection);
           return {
+            ...(forget ? { resumeConnection: null, updateVoiceResume: null } : {}),
             bookmarks: s.bookmarks.filter((b) => b.id !== id),
             serverGroups: s.serverGroups.map((g) => (g.servers.includes(id) ? { ...g, servers: g.servers.filter((m) => m !== id) } : g)),
             removedBookmarks: { ...pruneRemoved(s.removedBookmarks, now), [id]: removal(s.bookmarks.find((b) => b.id === id), s.bookmarkAccount) },
@@ -478,14 +538,19 @@ export const useSettings = create<SettingsState>()(
       version: SETTINGS_VERSION,
       // zustand's default storage (`window.localStorage`), guarded.
       storage: createJSONStorage(() => guardedLocalStorage(window.localStorage)),
-      migrate: (persisted) => migrateQuality((persisted ?? {}) as Record<string, unknown>),
+      migrate: (persisted) => ({ selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null,
+        ...migrateQuality((persisted ?? {}) as Record<string, unknown>), onboarding: readOnboarding((persisted as Partial<SettingsState> | null)?.onboarding) }),
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
-        return { ...current, ...p, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
+        return { ...current, ...p, onboarding: readOnboarding(p.onboarding), audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,
           serverGroups: validGroups(p.serverGroups),
+          selfMuted: p.selfMuted === true,
+          selfDeafened: p.selfDeafened === true,
+          resumeConnection: validSavedConnection(p.resumeConnection),
+          updateVoiceResume: validUpdateVoiceResume(p.updateVoiceResume),
         };
       },
     },

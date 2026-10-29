@@ -777,8 +777,8 @@ impl Core {
             }
             CoreMsg::Guest(msg) => self.guest_msg(msg),
             CoreMsg::ResumeGuests => self.resume_guests(),
-            CoreMsg::Screen(ScreenSignal::Paused { session, run, grant, reason }) => {
-                self.screen_paused(session, run, &grant, Some(reason))
+            CoreMsg::Screen(ScreenSignal::Paused { session, run, grant, reason, waiting }) => {
+                self.screen_paused(session, run, &grant, Some(reason), waiting)
             }
             CoreMsg::Screen(ScreenSignal::Keyframe { session, run, slot, generation, grant }) => {
                 self.screen_decode_keyframe(session, run, slot, generation, &grant)
@@ -788,7 +788,7 @@ impl Core {
                 self.screen_incompatible(session, run, &grant);
             }
             CoreMsg::Screen(ScreenSignal::Resumed { session, run, grant }) => {
-                self.screen_paused(session, run, &grant, None)
+                self.screen_paused(session, run, &grant, None, false)
             }
             CoreMsg::Egress(reading) => {
                 let shared = egress::screen_bytes(&self.screen_shared);
