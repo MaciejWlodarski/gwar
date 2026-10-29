@@ -663,6 +663,17 @@ impl Slot {
     }
 }
 
+/// A retry of a fully paused viewer (or a climb from one), until it is judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Attempt {
+    /// The slot it resumed, whose share's whole start bounds it.
+    slot: usize,
+    /// The estimate it actually started at.
+    start: u64,
+    /// It counts towards `retries` (a Try again does not).
+    counted: bool,
+}
+
 struct Watcher {
     id: u64,
     session: SessionId,
@@ -712,9 +723,8 @@ struct Watcher {
     /// What the transport sent over the `RAMP` before the last bandwidth pause that measured the
     /// link: the next automatic retry steps up from it (`RETRY_STEP`).
     step: u64,
-    /// The estimate the retry in progress started at, and whether it counts towards `retries`
-    /// (a Try again does not), until its next bandwidth pause tells whether the link carried it.
-    attempt: Option<(u64, bool)>,
+    /// The retry in progress, until its next bandwidth pause tells whether the link carried it.
+    attempt: Option<Attempt>,
     /// The start of the last retry, which was inconclusive: the next automatic one comes
     /// `RETRY_FIRST` after it started, at least `RETRY_STEP` above it and with room for its
     /// share's keyframe.
@@ -2490,10 +2500,13 @@ fn allocate(
             w.healthy_since = None;
             // Handing room to a more important share disproves nothing about the link.
             if w.egress.trigger != "priority" {
-                judge(w, slot);
+                judge(w);
             }
         }
         return Some((slot, change));
+    }
+    if climb(w, &lanes, rates, now) {
+        return None;
     }
     // The viewer's own Try again, held back by the spacing since its last start.
     if w.started.is_none_or(|at| now.saturating_duration_since(at) >= RETRY_FIRST)
@@ -2537,7 +2550,7 @@ fn allocate(
     w.retries = w.retries.saturating_add(1);
     let mut step = ((RETRY_STEP * w.step as f64) as u64).max(INITIAL_ESTIMATE);
     if let Some(untested) = w.untested {
-        step = step.max((RETRY_STEP * untested as f64) as u64).max(egress::keyframe_room(lanes[slot].largest_keyframe));
+        step = step.max((RETRY_STEP * untested as f64) as u64).max(egress::keyframe_room(lanes[slot]));
     }
     let target = start_target(w, slot).min(step);
     retry(w, slot, target, true, rates, now);
@@ -2557,29 +2570,74 @@ fn allocate(
 /// - **failed** otherwise: the estimate fell below the start, so the link pushed back, or the
 ///   link carried less than the start. It stays counted, and the next retry goes no higher
 ///   than this one's start.
-fn judge(w: &mut Watcher, slot: usize) {
+fn judge(w: &mut Watcher) {
     let (sent, shown) = (sent(w), shown(w));
     w.proven = None;
     w.remembered = None;
     let attempt = w.attempt.take();
     w.untested = None;
     match attempt {
-        Some((start, _)) if shown >= start => {
+        Some(a) if shown >= a.start => {
             w.retries = 0;
-            w.step = sent;
+            w.step = carried_step(sent, a.start);
         }
-        Some((start, counted)) if w.egress.estimate() >= start && RETRY_STEP * (sent as f64) < start as f64 => {
-            let top = w.slots[slot].grant.as_ref().map_or(0, |g| g.origin.start_estimate().min(w.ceiling));
-            if start < top {
-                if counted {
+        Some(a) if w.egress.estimate() >= a.start && RETRY_STEP * (sent as f64) < a.start as f64 => {
+            if a.start < top(w, a.slot) {
+                if a.counted {
                     w.retries = w.retries.saturating_sub(1);
                 }
-                w.untested = Some(start);
+                w.untested = Some(a.start);
             }
         }
-        Some((start, _)) => w.step = sent.min((start as f64 / RETRY_STEP) as u64),
+        Some(a) => w.step = sent.min((a.start as f64 / RETRY_STEP) as u64),
         None => w.step = sent,
     }
+}
+
+/// Where the next retry steps up from after the link carried one that started at `start`:
+/// what the transport sent, but at least the release of `PLAN` of the start, which the link
+/// carried. The SFU's own admission can hold what a throttled share sends to about 0.7 of the
+/// start, and a step from that alone barely climbs (1.05 times the start).
+fn carried_step(sent: u64, start: u64) -> u64 {
+    sent.max((egress::PLAN * start as f64) as u64)
+}
+
+/// The share's whole start on `slot`, within the server-wide budget: no retry goes higher.
+fn top(w: &Watcher, slot: usize) -> u64 {
+    w.slots[slot].grant.as_ref().map_or(0, |g| g.origin.start_estimate().min(w.ceiling))
+}
+
+/// An automatic retry the link is carrying in full past its ramp, while what its viewer watches
+/// still does not fit, steps up in place, by as much as a retry after it would: the release at
+/// `PLAN` of the next start is at most 1.2 times the one the link carried. Without it, a
+/// frozen estimator (one that never grows on its own) climbs one step per pause and retry.
+/// It only applies while the estimate holds at the retry's start: an estimator that grew on
+/// its own needs no help, one that fell has its answer. True if it stepped.
+fn climb(w: &mut Watcher, lanes: &[ShareRate], rates: &HashMap<String, ShareRate>, now: Instant) -> bool {
+    let Some(a) = w.attempt.filter(|a| a.counted) else { return false };
+    let start = w.egress.estimate();
+    if start != a.start
+        || w.egress.paused(a.slot).is_some()
+        || w.started.is_none_or(|at| now.saturating_duration_since(at) < egress::RAMP)
+        || shown(w) < a.start
+    {
+        return false;
+    }
+    let need: f64 = w.egress.priority().iter().map(|&l| lanes.get(l).map_or(0.0, |r| r.average)).sum();
+    if need <= w.egress.plan() {
+        return false;
+    }
+    let target = start_target(w, a.slot).min((RETRY_STEP * carried_step(sent(w), a.start) as f64) as u64);
+    if target <= a.start {
+        return false;
+    }
+    w.step = carried_step(sent(w), a.start);
+    w.retries = 1;
+    start_at(w, target, rates, now);
+    w.restarted = Some(now);
+    w.attempt = Some(Attempt { start: w.egress.estimate(), ..a });
+    debug!(session = w.session, from = a.start, to = w.egress.estimate(), "screen watch retry climbs");
+    true
 }
 
 /// The estimate an optimistic start of `slot` uses: what its share needs, or the viewer's
@@ -2637,7 +2695,7 @@ fn retry(w: &mut Watcher, slot: usize, target: u64, counted: bool, rates: &HashM
     w.retry_at = None;
     w.healthy_since = None;
     // What it actually starts at: never below the estimate it found.
-    w.attempt = Some((w.egress.estimate(), counted));
+    w.attempt = Some(Attempt { slot, start: w.egress.estimate(), counted });
 }
 
 /// The viewer's Try again on `slot`, if paused for bandwidth: now, or, within `RETRY_FIRST` of
@@ -3574,7 +3632,12 @@ pub(crate) mod tests {
     fn a_watch_with_nothing_else_flowing_starts_from_its_share_or_the_sessions_higher_estimate() {
         let measured = |cap| {
             let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, cap);
-            origin.measured(ShareRate { average: 8_000_000.0, last_keyframe: 200_000, largest_keyframe: 200_000 });
+            origin.measured(ShareRate {
+                average: 8_000_000.0,
+                last_keyframe: 200_000,
+                largest_keyframe: 200_000,
+                largest_delta: 17_000,
+            });
             origin
         };
         let mut pair = Pair::new();

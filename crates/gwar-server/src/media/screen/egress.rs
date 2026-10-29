@@ -143,6 +143,9 @@ pub struct ShareRate {
     pub last_keyframe: usize,
     /// The largest keyframe of the last 30 s, bytes.
     pub largest_keyframe: usize,
+    /// The largest whole frame other than a keyframe over the last `AVERAGE_WINDOW`, bytes:
+    /// what may be queued beside a keyframe when it is admitted.
+    pub largest_delta: usize,
 }
 
 /// Measures one share's rate and keyframe sizes from the packets its ingress forwarded.
@@ -156,6 +159,8 @@ pub struct ShareMeter {
     frame: Option<(u32, usize, bool)>,
     keyframes: VecDeque<(Instant, usize)>,
     last_keyframe: usize,
+    /// Whole delta frames over the last `AVERAGE_WINDOW`, each smaller than every one before it.
+    deltas: VecDeque<(Instant, usize)>,
 }
 
 impl ShareMeter {
@@ -171,9 +176,18 @@ impl ShareMeter {
         match &mut self.frame {
             Some((current, bytes, _)) if *current == timestamp => *bytes += size,
             _ if newest => {
-                if let Some((_, bytes, true)) = self.frame.take() {
-                    self.last_keyframe = bytes;
-                    self.keyframes.push_back((now, bytes));
+                match self.frame.take() {
+                    Some((_, bytes, true)) => {
+                        self.last_keyframe = bytes;
+                        self.keyframes.push_back((now, bytes));
+                    }
+                    Some((_, bytes, false)) => {
+                        while self.deltas.back().is_some_and(|(_, size)| *size <= bytes) {
+                            self.deltas.pop_back();
+                        }
+                        self.deltas.push_back((now, bytes));
+                    }
+                    None => {}
                 }
                 self.frame = Some((timestamp, size, keyframe));
             }
@@ -193,6 +207,9 @@ impl ShareMeter {
         while self.keyframes.front().is_some_and(|(at, _)| now.saturating_duration_since(*at) > KEYFRAME_MEMORY) {
             self.keyframes.pop_front();
         }
+        while self.deltas.front().is_some_and(|(at, _)| now.saturating_duration_since(*at) > AVERAGE_WINDOW) {
+            self.deltas.pop_front();
+        }
     }
 
     pub fn rate(&mut self, now: Instant) -> ShareRate {
@@ -207,6 +224,7 @@ impl ShareMeter {
             average: self.bytes as f64 * 8.0 / AVERAGE_WINDOW.as_secs_f64(),
             last_keyframe,
             largest_keyframe: self.keyframes.iter().map(|(_, size)| *size).max().unwrap_or(0).max(last_keyframe),
+            largest_delta: self.deltas.front().map_or(0, |(_, size)| *size),
         }
     }
 }
@@ -243,14 +261,16 @@ impl Lane {
 
 /// The estimate a viewer joining a share starts from: room at `PLAN` for its 2 s average with
 /// resume headroom, and for its largest recent keyframe within the deadline (the bound
-/// `keyframe_fits` uses). Never above what the share's ingress lets through, never below
-/// `INITIAL_ESTIMATE`.
+/// `keyframe_fits` uses) with its largest recent delta frame queued beside it. Never above what
+/// the share's ingress lets through, never below `INITIAL_ESTIMATE`.
 ///
 /// A share that sent nothing yet has no rate to start from: its cap is an admission ceiling,
 /// not the encoder's rate, and starting there overshoots a slow link for nothing. Simulated
 /// on a lossy 5 Mbps link with voice, a 3 Mbps share then paused about twice as often as from a
 /// cold start (over 384 seeded runs), against never for a measured one. Room for a keyframe
-/// within half the deadline overshot the same way: 20 pauses in 384.
+/// within half the deadline overshot the same way: 20 pauses in 384, and so did room for the
+/// keyframe next to the whole average: 0.4 s of a 3 Mbps share's deltas, where one frame is
+/// queued beside it.
 ///
 /// It only moves the pacing ceiling and the admission bound: the SFU still forwards no more
 /// than the share sends, and probes stay within the extras reserve.
@@ -258,7 +278,7 @@ pub fn start_estimate(rate: ShareRate, cap: u64) -> u64 {
     if rate.average <= 0.0 {
         return INITIAL_ESTIMATE;
     }
-    let start = room(RESUME_HEADROOM * rate.average, rate.largest_keyframe);
+    let start = (RESUME_HEADROOM * rate.average / PLAN).max(keyframe_room(rate) as f64);
     start.min(ingress_ceiling(cap) as f64).max(INITIAL_ESTIMATE as f64) as u64
 }
 
@@ -266,17 +286,20 @@ pub fn start_estimate(rate: ShareRate, cap: u64) -> u64 {
 /// through, its byte bucket and its frame limit.
 pub fn ingress_ceiling(cap: u64) -> u64 {
     let frame = ingress::FRAME_BYTES + ingress::FRAME_PACKETS * ORIGINAL_OVERHEAD;
-    room(RESUME_HEADROOM * ingress::BYTE_HEADROOM * cap as f64, frame) as u64
+    ((RESUME_HEADROOM * ingress::BYTE_HEADROOM * cap as f64).max(within_deadline(frame)) / PLAN) as u64
 }
 
-/// The estimate whose `PLAN` carries a `keyframe` within the deadline, and nothing else.
-pub fn keyframe_room(keyframe: usize) -> u64 {
-    room(0.0, keyframe) as u64
+/// The estimate whose `PLAN` carries the share's largest keyframe within the deadline, with its
+/// largest delta frame queued beside it: at exactly the keyframe's own room, one queued delta
+/// refuses its last packets at admission. Measured sizes are already on the wire (`ShareMeter`
+/// counts `ORIGINAL_OVERHEAD` per packet).
+pub fn keyframe_room(rate: ShareRate) -> u64 {
+    (within_deadline(rate.largest_keyframe + rate.largest_delta) / PLAN) as u64
 }
 
-/// The estimate whose `PLAN` carries `average` with a `keyframe` within the deadline.
-fn room(average: f64, keyframe: usize) -> f64 {
-    average.max(keyframe as f64 * 8.0 / DEADLINE.as_secs_f64()) / PLAN
+/// The rate that releases `bytes` within the deadline, bits per second.
+fn within_deadline(bytes: usize) -> f64 {
+    bytes as f64 * 8.0 / DEADLINE.as_secs_f64()
 }
 
 /// What the allocator decided for a slot.
@@ -860,8 +883,9 @@ impl Egress {
         for lane in all {
             let rate = rates.get(lane).copied().unwrap_or_default();
             let paused = self.lanes[lane].paused;
+            // A paused slot resumes from a keyframe, admitted beside a delta frame.
             let need = if paused.is_some() {
-                (RESUME_HEADROOM * rate.average).max(rate.last_keyframe as f64 * 8.0 / DEADLINE.as_secs_f64())
+                (RESUME_HEADROOM * rate.average).max(within_deadline(rate.last_keyframe + rate.largest_delta))
             } else {
                 rate.average
             };
@@ -979,8 +1003,12 @@ mod tests {
 
     #[test]
     fn a_start_covers_the_measured_share_and_its_keyframe_within_what_ingress_passes() {
-        let rate =
-            |average: f64, keyframe: usize| ShareRate { average, last_keyframe: keyframe, largest_keyframe: keyframe };
+        let rate = |average: f64, keyframe: usize| ShareRate {
+            average,
+            last_keyframe: keyframe,
+            largest_keyframe: keyframe,
+            largest_delta: 0,
+        };
         // Nothing measured yet: the cap is no measure of the encoder's rate.
         assert_eq!(start_estimate(ShareRate::default(), 12_000_000), INITIAL_ESTIMATE);
         // The 2026-10-28 share: about 9 Mbps with 250 KB keyframes.
@@ -989,8 +1017,14 @@ mod tests {
         let mut e = Egress::new(Instant::now());
         e.set_estimate(start, Instant::now());
         assert!(e.admission_bound() >= 2 * 250_000, "room for the keyframe and what follows it");
-        // A text share with a large keyframe: the keyframe within the deadline decides.
-        assert_eq!(start_estimate(rate(500_000.0, 200_000), 8_000_000), (200_000.0 * 8.0 / 0.4 / PLAN) as u64);
+        // A text share with a large keyframe: the keyframe within the deadline decides, with a
+        // delta frame queued beside it.
+        let text = ShareRate { largest_delta: 13_000, ..rate(500_000.0, 200_000) };
+        let start = start_estimate(text, 8_000_000);
+        assert_eq!(start, (213_000.0 * 8.0 / 0.4 / PLAN) as u64);
+        assert_eq!(start, keyframe_room(text));
+        e.set_estimate(start, Instant::now());
+        assert!(e.admission_bound() >= 213_000, "room for the keyframe and the delta beside it");
         // A small share: never below the transport's initial estimate.
         assert_eq!(start_estimate(rate(100_000.0, 10_000), 8_000_000), INITIAL_ESTIMATE);
         // Never above what the share's ingress lets through, whatever the meter says.
@@ -1188,7 +1222,12 @@ mod tests {
     fn two_failed_keyframes_pause_and_a_slot_resumes_only_with_room_for_its_keyframe() {
         let mut now = Instant::now();
         let mut e = egress(3_000_000, 1, now);
-        let rates = [ShareRate { average: 400_000.0, last_keyframe: 204 * 1024, largest_keyframe: 204 * 1024 }];
+        let rates = [ShareRate {
+            average: 400_000.0,
+            last_keyframe: 204 * 1024,
+            largest_keyframe: 204 * 1024,
+            largest_delta: 0,
+        }];
         for frame in [1, 2] {
             for n in 0..170 {
                 if !e.admit(0, packet(n, frame, n == 0, 1200, now), now).is_empty() {
@@ -1218,7 +1257,8 @@ mod tests {
     fn a_restarted_estimator_renews_the_resumed_lanes_ramp_but_not_its_deadlines() {
         let start = Instant::now();
         let mut e = egress(20_000_000, 1, start);
-        let rates = [ShareRate { average: 8_000_000.0, last_keyframe: 200_000, largest_keyframe: 200_000 }];
+        let rates =
+            [ShareRate { average: 8_000_000.0, last_keyframe: 200_000, largest_keyframe: 200_000, largest_delta: 0 }];
         e.pause(0, ScreenPauseReason::Bandwidth);
         let resumed = start + Duration::from_secs(57);
         e.resume(0);
@@ -1255,7 +1295,8 @@ mod tests {
     fn a_bandwidth_pause_resumes_at_ten_seconds_of_continuous_room() {
         let now = Instant::now();
         let mut e = egress(3_000_000, 1, now);
-        let rates = [ShareRate { average: 4_000_000.0, last_keyframe: 200_000, largest_keyframe: 200_000 }];
+        let rates =
+            [ShareRate { average: 4_000_000.0, last_keyframe: 200_000, largest_keyframe: 200_000, largest_delta: 0 }];
         e.pause(0, ScreenPauseReason::Bandwidth);
         assert_eq!(e.allocate(now, &rates, true), None);
         let clear = now + Duration::from_secs(3);
@@ -1288,7 +1329,12 @@ mod tests {
         e.add_lane();
         e.assign(0, 1, now);
         // 8 Mbps with 200 KB keyframes on the initial 2.5 Mbps: over B and over admission.
-        let rates = [ShareRate { average: 8_000_000.0, last_keyframe: 200 * 1024, largest_keyframe: 200 * 1024 }];
+        let rates = [ShareRate {
+            average: 8_000_000.0,
+            last_keyframe: 200 * 1024,
+            largest_keyframe: 200 * 1024,
+            largest_delta: 0,
+        }];
         let start = now;
         for frame in 1..=5 {
             for n in 0..170 {
@@ -1377,6 +1423,28 @@ mod tests {
             100 * (1000 + ORIGINAL_OVERHEAD),
             "the last one stays"
         );
+    }
+
+    #[test]
+    fn share_meters_measure_the_largest_recent_delta_frame() {
+        let now = Instant::now();
+        let mut meter = ShareMeter::default();
+        let mut source = 0;
+        let mut frame = |meter: &mut ShareMeter, timestamp: u32, packets: usize, key: bool, at: Instant| {
+            for n in 0..packets {
+                meter.record(source, timestamp, 1000, key && n == 0, at);
+                source += 1;
+            }
+        };
+        frame(&mut meter, 1, 100, true, now);
+        frame(&mut meter, 2, 5, false, now + 100 * MS);
+        frame(&mut meter, 3, 3, false, now + 200 * MS);
+        // A frame counts once it is whole; keyframes are not deltas.
+        assert_eq!(meter.rate(now + 200 * MS).largest_delta, 5 * (1000 + ORIGINAL_OVERHEAD));
+        frame(&mut meter, 4, 1, false, now + Duration::from_secs(2));
+        // Each is whole once the next frame starts: the 5-packet one at 200 ms aged out of the
+        // window, the 3-packet one at 2 s is still in it.
+        assert_eq!(meter.rate(now + Duration::from_millis(2250)).largest_delta, 3 * (1000 + ORIGINAL_OVERHEAD));
     }
 
     #[test]
