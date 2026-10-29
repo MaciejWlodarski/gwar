@@ -220,55 +220,53 @@ export const accountActions = {
 
   /** Reads the stored sign-in (call once at startup). */
   async load(): Promise<void> {
-    // Record this before getIdentity creates a fallback. Reloading an unfinished
-    // first run must not mistake that fallback for an existing user's identity.
-    if (!useSettings.getState().onboarding) {
-      try {
-        const [identity, account] = await Promise.all([indexedDbIdentityStore.load(), loadConnectRecord()]);
-        useSettings.getState().setOnboarding({ completed: !!identity || !!account });
-      } catch (e) {
-        // An unavailable store is not an empty store. Keep it intact and offer recovery.
-        useUi.getState().toast("error", tNow(`err.connect.${identityFailure(e)}`), {
-          key: "identity-load", sticky: true,
-          action: { label: tNow("settings.identity"), run: () => useUi.getState().openSettings("identity") },
-        });
-        useAccount.setState({ loaded: true });
-        return;
-      }
-    }
-    await controller.getIdentity().catch((e: unknown) => {
-      console.warn("identity load skipped", e);
-      // A stored identity or sign-in this version cannot read: say so now, not only on connecting.
-      const failure = identityFailure(e);
-      if (failure === "identity_unreadable" || failure === "storage_newer") useUi.getState().toast("error", tNow(`err.connect.${failure}`), {
+    const report = (error: unknown) => {
+      console.warn("identity load skipped", error);
+      useUi.getState().toast("error", tNow(`err.connect.${identityFailure(error)}`), {
         key: "identity-load", sticky: true,
         action: { label: tNow("settings.identity"), run: () => useUi.getState().openSettings("identity") },
       });
-    });
-    const record = await loadConnectRecord();
-    useAccount.setState({ account: record ? summarize(record) : null, loaded: true, certChecked: !record?.token });
-    useSettings.getState().setBookmarkAccount(record?.accountKey ?? null);
-    if (record) {
-      refreshProfile(connectApi, record)
-        .then(async (nickname) => {
-          if (!nickname) return;
-          const latest = await loadConnectRecord();
-          // Do not apply a delayed refresh to another account or over a local edit.
-          if (!latest || latest.accountKey !== record.accountKey || latest.nickname !== record.nickname) return;
-          const next = { ...latest, nickname };
-          await indexedDbConnectStore.save(next);
-          await applyRecord(next);
-        })
-        .catch((e: unknown) => console.warn("account profile refresh skipped", e));
-    }
-    if (record) syncBookmarks();
-    if (record?.token) checkCertificate(record);
-    // Pick up an identity another desktop put in the vault. Never waited for: starting must not depend on the network.
-    const ts = tsBridge();
-    if (record && ts) {
-      refreshFromVault(connectApi, record, ts)
-        .then((outcome) => outcome === "applied" && bumpTs())
-        .catch((e: unknown) => console.warn("TeamSpeak identity refresh skipped", e));
+    };
+    try {
+      // Read Connect independently: a damaged local backup must not hide a valid login.
+      const record = await loadConnectRecord();
+      // Save this preference before getIdentity can create a fallback, including on reload.
+      if (!useSettings.getState().onboarding) {
+        try {
+          const identity = record ? undefined : await indexedDbIdentityStore.load();
+          useSettings.getState().setOnboarding({ completed: !!identity || !!record });
+        } catch (error) { report(error); }
+      }
+      await controller.getIdentity().catch(report);
+      useAccount.setState({ account: record ? summarize(record) : null, certChecked: !record?.token });
+      useSettings.getState().setBookmarkAccount(record?.accountKey ?? null);
+      if (record) {
+        refreshProfile(connectApi, record)
+          .then(async (nickname) => {
+            if (!nickname) return;
+            const latest = await loadConnectRecord();
+            // Do not apply a delayed refresh to another account or over a local edit.
+            if (!latest || latest.accountKey !== record.accountKey || latest.nickname !== record.nickname) return;
+            const next = { ...latest, nickname };
+            await indexedDbConnectStore.save(next);
+            await applyRecord(next);
+          })
+          .catch((e: unknown) => console.warn("account profile refresh skipped", e));
+      }
+      if (record) syncBookmarks();
+      if (record?.token) checkCertificate(record);
+      // Pick up an identity another desktop put in the vault. Never waited for: starting must not depend on the network.
+      const ts = tsBridge();
+      if (record && ts) {
+        refreshFromVault(connectApi, record, ts)
+          .then((outcome) => outcome === "applied" && bumpTs())
+          .catch((e: unknown) => console.warn("TeamSpeak identity refresh skipped", e));
+      }
+    } catch (error) {
+      report(error);
+    } finally {
+      // Newer/unreadable data is an actionable error, never a permanent loading screen.
+      useAccount.setState({ loaded: true });
     }
   },
 

@@ -28,6 +28,8 @@ describe("persistent identity notices", () => {
   it("shows the reminder on role receipt and remembers dismissal", async () => {
     await act(async () => useSession.setState({ me: { uid: "me", session: 1 }, members: { me: { uid: "me", nickname: "Alex", tag: "alex", groups: [1, 2], last_seen: 1 } } }));
     expect(container.querySelector('[data-testid="identity-banner"]')).not.toBeNull();
+    expect(container.textContent).toContain("stracisz swoją nazwę i role");
+    expect(container.textContent).toContain("klucz prywatny");
     await act(async () => (container.querySelector('[aria-label="Zamknij"]') as HTMLButtonElement).click());
     expect(useSettings.getState().onboarding?.nudgeDismissed).toBe(true);
     expect(container.textContent).toBe("");

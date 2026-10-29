@@ -2,6 +2,7 @@ import { ShieldAlert, ShieldCheck, X } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useLanguage, useT, countKey } from "../i18n";
 import { certificateWarning } from "../connect/expiry";
+import { MEMBER_GROUP } from "../lib/permissions";
 import { identityNudgeDue } from "../lib/onboarding";
 import { accountActions, useAccount } from "../state/account";
 import { exportIdentityBackup } from "../state/identity-backup";
@@ -35,7 +36,7 @@ function IdentityNoticesContent() {
   const { account, certChecked, loaded } = useAccount();
   const now = useNoticeTime();
   const onboarding = useSettings((s) => s.onboarding);
-  const hasRole = useSession((s) => s.kind === "gwar" && !!s.me && !!s.members[s.me.uid]?.groups.some((id) => id !== 2));
+  const hasRole = useSession((s) => s.kind === "gwar" && !!s.me && !!s.members[s.me.uid]?.groups.some((id) => id !== MEMBER_GROUP));
   const openSettings = useUi((s) => s.openSettings);
   const [renewing, setRenewing] = useState(false);
   const [exporting, setExporting] = useState(false);
@@ -63,10 +64,13 @@ function IdentityNoticesContent() {
         <div data-testid="identity-banner" role="status" className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-line bg-raised px-4 py-3 text-sm">
           <ShieldCheck className="size-4 shrink-0 text-accent" />
           <p className="min-w-0 flex-1 basis-72">{t("identity.keepIdentity")}</p>
-          <div className="flex flex-wrap items-center gap-2">
-            <Button size="sm" onClick={() => { useUi.setState({ accountEntry: "create" }); openSettings("account"); }}>{t("identity.createAccount")}</Button>
-            <Button size="sm" busy={exporting} onClick={() => void backup()}>{t("identity.exportBackup")}</Button>
-            <button type="button" aria-label={t("common.close")} onClick={() => useSettings.getState().setOnboarding({ nudgeDismissed: true })} className="flex size-8 cursor-pointer items-center justify-center rounded text-muted hover:bg-hover hover:text-fg"><X className="size-4" /></button>
+          <div className="flex max-w-sm flex-col gap-1.5">
+            <div className="flex flex-wrap items-center gap-2">
+              <Button size="sm" onClick={() => { useUi.setState({ accountEntry: "create" }); openSettings("account"); }}>{t("identity.createAccount")}</Button>
+              <Button size="sm" busy={exporting} onClick={() => void backup()}>{t("identity.exportBackup")}</Button>
+              <button type="button" aria-label={t("common.close")} onClick={() => useSettings.getState().setOnboarding({ nudgeDismissed: true })} className="flex size-8 cursor-pointer items-center justify-center rounded text-muted hover:bg-hover hover:text-fg"><X className="size-4" /></button>
+            </div>
+            <p className="text-xs text-muted">{t("identity.backupSecret")}</p>
           </div>
         </div>
       )}

@@ -52,6 +52,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
   const [password, setPassword] = useState("");
   const savedInsecureLan = bookmarks.find((b) => sameServer(b, { kind, address, insecureLan: b.insecureLan }))?.insecureLan ?? false;
   const [insecureLan, setInsecureLan] = useState(savedInsecureLan);
+  const [advancedInitiallyOpen] = useState(kind === "teamspeak" || savedInsecureLan);
   // Another address (or its bookmark changing) brings back that bookmark's choice.
   const [insecureFor, setInsecureFor] = useState({ address, bookmarks });
   if (insecureFor.address !== address || insecureFor.bookmarks !== bookmarks) {
@@ -118,7 +119,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
   const submit = (event: FormEvent) => { event.preventDefault(); connect(); };
   const notice = closeNotice(closeReason, t);
   if (!loaded) return <main aria-busy="true" className="flex flex-1 items-center justify-center bg-surface text-sm text-muted">{t("common.loading")}</main>;
-  if (onboarding && !onboarding.completed && !account) return <FirstRun />;
+  if (onboarding && !onboarding.completed && !account) return <FirstRun card={card} />;
 
   return (
     <main className={cn("relative flex min-w-0 flex-1 flex-col items-center overflow-y-auto bg-surface", card && panelCard)}>
@@ -199,7 +200,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
 
           {pickIdentity && <IdentityPicker list={tsList} value={identity} onChange={setIdentity} />}
 
-          <details className="rounded-lg border border-line px-3 py-2" open={kind === "teamspeak" || insecureLan || undefined}>
+          <details className="rounded-lg border border-line px-3 py-2" open={advancedInitiallyOpen || undefined}>
             <summary className="cursor-pointer text-sm text-muted">{t("common.advanced")}</summary>
             <div className="mt-3 flex flex-col gap-3">
               <div className="flex flex-col gap-1.5">

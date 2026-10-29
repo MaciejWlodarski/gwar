@@ -1106,7 +1106,7 @@ export const pl: Record<Key, string> = {
   "onboarding.continue": "Dalej",
   "onboarding.skip": "Na razie pomiń",
   "connect.publicServer": "Dołącz do publicznego serwera (gwar.app)",
-  "identity.keepIdentity": "Zachowaj swoją tożsamość — załóż konto Gwar Connect albo wyeksportuj kopię zapasową.",
+  "identity.keepIdentity": "Jeśli wyczyścisz dane przeglądarki, stracisz swoją nazwę i role. Załóż konto Gwar Connect albo zapisz kopię.",
   "identity.createAccount": "Załóż konto",
   "identity.exportBackup": "Eksportuj kopię",
   "identity.exportFailed": "Nie udało się wyeksportować kopii. Spróbuj ponownie.",
@@ -1121,4 +1121,7 @@ export const pl: Record<Key, string> = {
   "err.channel.save": "Nie udało się zapisać kanału. Sprawdź jego ustawienia i spróbuj ponownie.",
   "common.loading": "Wczytywanie…",
   "screen.shareAgain": "Udostępnij ponownie",
+  "voice.disconnected": "Głos został rozłączony.",
+  "voice.reconnectFailed": "Nie udało się ponownie połączyć głosu.",
+  "identity.backupSecret": "Kopia zawiera Twój klucz prywatny, więc zachowaj ten plik w tajemnicy.",
 };

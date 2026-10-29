@@ -14,6 +14,7 @@
  *   E2E_BROWSERS=chromium,webkit   engine of every page (default: chromium; CI runs Chromium,
  *                                  since Linux WebKit paints remote video unreliably, see screen.mjs)
  */
+import { chooseFirstRunName } from "./first-run.mjs";
 import { stopProcesses } from "./processes.mjs";
 import { canvasCapture, readBarcode, stampBarcode } from "./screen-source.mjs";
 import assert from "node:assert/strict";
@@ -192,6 +193,7 @@ async function device(browser, web, server, name, frequency, native) {
       controller.useEngine(new NativeVoiceEngine(window.__nativeBridge));
     });
   }
+  await chooseFirstRunName(page, name);
   await page.getByLabel("Server address").fill(server);
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   await page.getByRole("tab", { name: "Identity", exact: true }).click();

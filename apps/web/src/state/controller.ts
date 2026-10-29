@@ -540,6 +540,13 @@ class Controller {
    */
   async connectInteractive(params: ConnectParams, opts: { remember: boolean }): Promise<boolean> {
     useUi.getState().landOnServer();
+    if (!useSettings.getState().onboarding?.completed) {
+      const { useAccount } = await import("./account");
+      if (!useAccount.getState().account) {
+        useUi.getState().closeDialog();
+        return false;
+      }
+    }
     const ui = useConnectUi.getState();
     ui.set({ busy: true, error: null });
     try {
@@ -703,7 +710,7 @@ class Controller {
         const b = state.me === null ? null : state.clients[state.me.session]?.voice_binding;
         return b && b.call === event.d.call && b.participation === event.d.participation && b.run === event.d.run;
       })()) {
-        useUi.getState().toast("info", tNow("voice.closed"), { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
+        useUi.getState().toast("info", tNow(event.d.reason === "transport_failed" ? "voice.closed" : "voice.disconnected"), { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
         if (event.d.reason === "transport_failed") this.scheduleVoiceRetry(1000);
         else void this.stopVoice();
       }
@@ -1011,7 +1018,10 @@ class Controller {
 
   private scheduleVoiceRetry(delay = 3000): void {
     if (this.voiceRetry || !this.conn?.isOnline) return;
-    if (this.voiceRetries >= 5) return;
+    if (this.voiceRetries >= 5) {
+      useUi.getState().toast("error", tNow("voice.reconnectFailed"), { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
+      return;
+    }
     this.voiceRetries++;
     this.voiceRetry = setTimeout(() => {
       this.voiceRetry = null;

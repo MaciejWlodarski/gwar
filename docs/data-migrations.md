@@ -271,8 +271,9 @@ before generating any fallback identity: existing users skip the name step; new
 users get an empty name field. The initialized preference is saved before identity
 creation, so reloading an unfinished first run still asks for a name. Missing or
 malformed onboarding preferences follow the same initialization. No identity,
-Connect record, key or trust format changes. Dismissing the reminder or exporting
-an identity backup suppresses it on this device. Signing in hides it while signed in.
+Connect record, key or trust format changes. Dismissing the reminder or successfully saving
+an identity backup suppresses it on this device; cancelling the desktop save dialog
+keeps the reminder. Signing in hides it while signed in.
 
 `serverGroups` (the server column's groups) came without a version bump: it is a
 new key, not a change of shape. Missing or malformed, it reads as no groups

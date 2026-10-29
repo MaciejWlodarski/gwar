@@ -482,6 +482,8 @@ function IdentityTab() {
     if (!f) return;
     try {
       await controller.importIdentity(await f.text());
+      useSettings.getState().setOnboarding({ completed: true });
+      useUi.getState().dismissToast("identity-load");
       setVersion((v) => v + 1);
       toast("success", t("identity.imported"));
     } catch {

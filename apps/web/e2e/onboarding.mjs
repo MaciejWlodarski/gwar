@@ -80,12 +80,19 @@ try {
     await page.goto(base);
     await page.getByRole("heading", { name: "Jak mają Cię widzieć inni?" }).waitFor();
     assert.equal(await page.getByLabel("Twoja nazwa").inputValue(), "");
+    assert.equal(await page.getByRole("button", { name: "Dodaj serwer", exact: true }).count(), 0);
+    const gated = await page.evaluate(async endpoint => {
+      const { controller } = await import("/src/state/controller.ts");
+      return controller.connectInteractive({ address: `ws://${endpoint}/ws` }, { remember: false });
+    }, endpoint);
+    assert.equal(gated, false, "other connect entry points must show the name step first");
     await capture(page, "first-run", width);
     await page.reload();
     await page.getByRole("heading", { name: "Jak mają Cię widzieć inni?" }).waitFor();
     await page.getByLabel("Twoja nazwa").fill("Ola");
     await page.getByRole("button", { name: "Dalej", exact: true }).click();
     await page.getByLabel("Adres serwera").waitFor();
+    await page.getByRole("button", { name: "Dodaj serwer", exact: true }).waitFor();
     assert.equal(await page.getByRole("radiogroup").isVisible(), false);
     await capture(page, "connect-collapsed", width);
     await page.getByText("Zaawansowane", { exact: true }).click();
@@ -115,6 +122,7 @@ try {
       useSession.setState({ members: { ...s.members, [me.uid]: { ...me, groups: [1, 2] } } });
     });
     await page.getByTestId("identity-banner").waitFor();
+    await page.getByTestId("identity-banner").getByText(/klucz prywatny/).waitFor();
     await capture(page, "identity-banner", width);
     const download = page.waitForEvent("download");
     await page.getByRole("button", { name: "Eksportuj kopię", exact: true }).click();
@@ -132,6 +140,16 @@ try {
     await page.getByTestId("expiry-banner").getByText(/Wpisz ponownie hasło/).waitFor();
     await capture(page, "expiry-after", width);
     await state(page, { account: { account: null } });
+    for (const [name, key, kind] of [["voice-disconnected", "voice.disconnected", "info"], ["voice-reconnecting", "voice.closed", "info"], ["voice-reconnect-failed", "voice.reconnectFailed", "error"]]) {
+      await page.evaluate(async ({ key, kind }) => {
+        const { useUi } = await import("/src/state/stores.ts");
+        const { tNow } = await import("/src/i18n/index.ts");
+        const { controller } = await import("/src/state/controller.ts");
+        useUi.getState().toast(kind, tNow(key), { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => controller.retryVoice() } });
+      }, { key, kind });
+      await capture(page, name, width);
+    }
+    await page.evaluate(async () => (await import("/src/state/stores.ts")).useUi.getState().dismissToast("voice-closed"));
     await page.evaluate(async () => {
       const { useUi } = await import("/src/state/stores.ts");
       useUi.getState().toast("error", "Nie słychać rozmowy. Sprawdź ustawienia dźwięku.", { key: "review-sticky", sticky: true, action: { label: "Ustawienia dźwięku", run: () => useUi.getState().openSettings("audio") } });
@@ -139,6 +157,11 @@ try {
     await page.getByTestId("toast").waitFor();
     await page.waitForTimeout(6500);
     assert.ok(await page.getByTestId("toast").isVisible());
+    if (width === "mobile") {
+      const toast = await page.getByTestId("toast").boundingBox();
+      const panel = await page.getByText("Poza kanałem głosowym", { exact: true }).locator("xpath=ancestor::div[contains(@class, 'rounded-xl')][1]").boundingBox();
+      assert.ok(toast && panel && toast.y + toast.height <= panel.y, "sticky toast stays above the user panel and tab bar");
+    }
     await capture(page, "sticky-toast", width);
     await page.getByRole("button", { name: "Ustawienia dźwięku", exact: true }).click();
     await page.getByRole("main", { name: "Ustawienia" }).waitFor();
@@ -155,6 +178,8 @@ try {
     "Captured with apps/web/e2e/onboarding.mjs. Only throwaway loopback services and browser contexts.",
     "First run and connection are real flows. Role receipt and before/after expiry are seeded UI states.",
     "The sticky toast uses the generic production component with a seeded audio error and working Settings action.",
+    "Voice notices use the production localized strings and keyed toast component with seeded disconnected, reconnecting and exhausted states.",
+    "The harness verifies the private-key warning and that a mobile toast stays above the user panel and tab bar.",
     "No production connections or desktop user data. Public-server button intercepted before connection.",
     ...captured,
   ].join("\n") + "\n");

@@ -8,7 +8,7 @@ import type { Welcome } from "../proto/Welcome";
 import type { ConnectionStatus, Link } from "../net/connection";
 import type { EventName, Op } from "../net/protocol";
 import { welcome } from "../net/testing";
-import type { VoiceEngine } from "../voice/engine";
+import type { VoiceEngine, VoiceState } from "../voice/engine";
 
 // Native file commands, recording where uploads would go (only the desktop upload test turns the app native).
 const native = vi.hoisted(() => ({ origin: null as string | null, session: null as string | null, sent: [] as Array<{ origin: string | null; bytes: Uint8Array }>, attachment: {} }));
@@ -82,6 +82,7 @@ class FakeLink implements Link {
 }
 
 function fakeEngine() {
+  const listeners = new Map<string, unknown>();
   const engine = {
     capabilities: { outputDeviceSelection: false, encryptedVoice: async () => true },
     start: vi.fn(async () => {}),
@@ -99,7 +100,8 @@ function fakeEngine() {
     setSlotOwner: vi.fn(),
     listDevices: vi.fn(async () => ({ inputs: [], outputs: [] })),
     startMicTest: vi.fn(async () => () => {}),
-    on: vi.fn(() => () => {}),
+    on: vi.fn((event: string, listener: unknown) => { listeners.set(event, listener); return () => listeners.delete(event); }),
+    emitState: (state: VoiceState) => (listeners.get("state") as (state: VoiceState) => void)(state),
   };
   return engine satisfies VoiceEngine;
 }
@@ -180,6 +182,7 @@ beforeAll(async () => {
 beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
+  settings.useSettings.setState({ onboarding: { completed: true, firstUsedAt: 1, nudgeDismissed: false, roleReceived: false } });
   engine.capabilities.encryptedVoice = async () => true;
   link = new FakeLink();
   session().dispatch({ type: "reset" });
@@ -367,6 +370,41 @@ describe("staying on the server without voice", () => {
     link.emit({ ev: "voice.closed", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, reason: "transport_failed" } });
     await vi.advanceTimersByTimeAsync(30_000);
     expect(engine.start).not.toHaveBeenCalled();
+  });
+
+  it.each(["channel_restarted", "epoch_exhausted", "stream_limit", "state_limit", "channel_deleted"] as const)("says voice disconnected without claiming to retry after %s", async (reason) => {
+    connectFake({ channel: 1 });
+    await vi.advanceTimersByTimeAsync(10);
+    engine.start.mockClear();
+    link.emit({ ev: "voice.closed", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, reason } });
+    await vi.advanceTimersByTimeAsync(30_000);
+    const notice = stores.useUi.getState().toasts.find(t => t.key === "voice-closed")!;
+    expect(notice).toMatchObject({ text: "Voice disconnected.", sticky: true, action: { label: "Retry" } });
+    expect(engine.start).not.toHaveBeenCalled();
+    notice.action!.run();
+    await vi.advanceTimersByTimeAsync(10);
+    expect(engine.start).toHaveBeenCalledOnce();
+  });
+
+  it("replaces Reconnecting with a keyed failure after retries run out, and clears it on recovery", async () => {
+    connectFake({ channel: 1 });
+    await vi.advanceTimersByTimeAsync(10);
+    engine.start.mockClear();
+    engine.start.mockImplementation(async () => engine.emitState("failed"));
+    try {
+      link.emit({ ev: "voice.closed", d: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1, reason: "transport_failed" } });
+      expect(stores.useUi.getState().toasts.find(t => t.key === "voice-closed")?.text).toContain("Reconnecting");
+      await vi.advanceTimersByTimeAsync(60_000);
+      const notices = stores.useUi.getState().toasts.filter(t => t.key === "voice-closed");
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toMatchObject({ kind: "error", text: "Couldn’t reconnect voice.", sticky: true, action: { label: "Retry" } });
+      expect(engine.start).toHaveBeenCalledTimes(5);
+      engine.start.mockImplementation(async () => engine.emitState("connected"));
+      notices[0]!.action!.run();
+      await vi.advanceTimersByTimeAsync(10);
+      expect(engine.start).toHaveBeenCalledTimes(6);
+      expect(stores.useUi.getState().toasts.some(t => t.key === "voice-closed")).toBe(false);
+    } finally { engine.start.mockImplementation(async () => {}); }
   });
 
   it("goes back into the voice channel after a reconnect", async () => {
@@ -568,6 +606,19 @@ describe("where a connection opens", () => {
     stores.useUi.setState({ section: "servers", pane: "members", overview: false });
     ui().openSettings("account");
   };
+
+  it.each([false, true])("gates all interactive entry points before naming (startup still loading: %s)", async loading => {
+    const { useAccount } = await import("./account");
+    useAccount.setState({ loaded: !loading, account: null });
+    settings.useSettings.setState({ onboarding: loading ? null : { completed: false, firstUsedAt: 1, nudgeDismissed: false, roleReceived: false } });
+    ui().openDialog({ kind: "addServer" });
+    const connect = vi.spyOn(controller, "connect").mockResolvedValue();
+    try {
+      expect(await controller.connectInteractive({ address: "test" }, { remember: false })).toBe(false);
+      expect(connect).not.toHaveBeenCalled();
+      expect(ui()).toMatchObject({ section: "servers", dialog: { kind: "none" } });
+    } finally { connect.mockRestore(); }
+  });
 
   it("one the user asks for opens the server's channel list, the same server again after a drop too", async () => {
     connectFake();

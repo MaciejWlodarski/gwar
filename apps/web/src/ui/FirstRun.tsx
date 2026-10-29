@@ -1,13 +1,14 @@
 import { useState, type FormEvent } from "react";
+import { cn } from "../lib/cn";
 import { useT } from "../i18n";
 import { describeAccountError } from "../connect/errors";
 import { validNickname } from "../net/nickname";
 import { accountActions } from "../state/account";
 import { useSettings } from "../state/settings";
 import { Wordmark } from "./Brand";
-import { Button, Field, Input } from "./kit";
+import { Button, Field, Input, panelCard } from "./kit";
 
-export function FirstRun() {
+export function FirstRun({ card }: { card?: boolean }) {
   const t = useT();
   const [name, setName] = useState("");
   const [busy, setBusy] = useState(false);
@@ -25,7 +26,7 @@ export function FirstRun() {
   };
   const submit = (event: FormEvent) => { event.preventDefault(); void complete(); };
   return (
-    <main className="flex min-w-0 flex-1 items-center justify-center overflow-y-auto bg-surface px-4 py-8">
+    <main className={cn("flex min-w-0 flex-1 items-center justify-center overflow-y-auto bg-surface px-4 py-8", card && panelCard)}>
       <form onSubmit={submit} className="flex w-full max-w-sm flex-col gap-4 rounded-2xl border border-line bg-side p-6">
         <Wordmark className="mb-2 h-10 w-auto self-center text-fg" />
         <h1 className="text-xl font-semibold tracking-tight">{t("onboarding.title")}</h1>

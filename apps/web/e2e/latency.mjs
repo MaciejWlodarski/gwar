@@ -27,6 +27,7 @@
  * run (run.json, latency.csv, logs) and summary.json. A run fails, and is kept, if more than
  * 5% of its markers are lost; nothing is retried or excluded.
  */
+import { chooseFirstRunName } from "./first-run.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -369,6 +370,7 @@ async function device(browser, web, url, role, config, sharing = false) {
   page.on("pageerror", e => page.errors.push(String(e)));
   page.on("console", m => { if (m.type() === "warning" || m.type() === "error") page.errors.push(m.text()); });
   await page.goto(web);
+  await chooseFirstRunName(page, role);
   await page.getByLabel("Server address").fill(url);
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   await page.getByRole("tab", { name: "Identity", exact: true }).click();

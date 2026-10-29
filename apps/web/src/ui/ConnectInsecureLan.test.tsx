@@ -59,6 +59,23 @@ it('keeps TeamSpeak reachable behind Advanced and the public option always secur
   expect(disclosure.querySelector('[role="radio"]')?.textContent).toBe('Gwar server');
   await act(async () => (Array.from(div.querySelectorAll('button')).find(b => b.textContent === 'Join the public server (gwar.app)')!).click());
   expect(choice()).toMatchObject({ kind: 'gwar', address: 'gwar.app', insecureLan: false });
+  await act(async () => disclosure.querySelector('summary')!.click());
   await act(async () => (Array.from(disclosure.querySelectorAll<HTMLButtonElement>('[role="radio"]')).find(b => b.textContent === 'TeamSpeak server')!).click());
   expect(disclosure.open).toBe(true);
+});
+
+it('leaves Advanced open when switching back from TeamSpeak or turning off insecure LAN', async () => {
+  await show();
+  const disclosure = div.querySelector('details')!;
+  expect(disclosure.open).toBe(true);
+  const radio = (name: string) => Array.from(disclosure.querySelectorAll<HTMLButtonElement>('[role="radio"]')).find(b => b.textContent === name)!;
+  await act(async () => radio('TeamSpeak server').click());
+  await act(async () => radio('Gwar server').click());
+  expect(disclosure.open).toBe(true);
+  const toggle = disclosure.querySelector<HTMLButtonElement>('[role="switch"]')!;
+  await act(async () => toggle.click());
+  expect(disclosure.open).toBe(true);
+  await act(async () => disclosure.querySelector('summary')!.click());
+  await act(async () => useConnectUi.setState({ error: 'A failed connection does not reopen this section.' }));
+  expect(disclosure.open).toBe(false);
 });
