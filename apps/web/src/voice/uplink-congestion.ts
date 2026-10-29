@@ -179,6 +179,11 @@ export class UplinkCongestion {
     this.lowSince = null; this.status = null;
   }
 
+  /** A transport outage ends the evidence run, but does not make a bloated RTT a healthy floor. */
+  suspend(): void {
+    this.recent = []; this.last = null; this.clearVerdict();
+  }
+
   reset(): void {
     this.floor = []; this.recent = []; this.healthyAt = 0; this.hinted = false;
     this.path = null; this.last = null; this.clearVerdict();
@@ -190,16 +195,26 @@ export class RtcUplinkObserver {
   private detector = new UplinkCongestion(RTC_UPLINK);
   private evidence = new Map<string, number>();
   private loss: number | null = null;
+  private latestTimestamp = -Infinity;
+  private freshAfter: number | null = null;
+
+  /** Keep measurement watermarks so the same peer cannot replay pre-outage stats. */
+  suspend(): void {
+    this.detector.suspend(); this.loss = null; this.freshAfter = this.latestTimestamp;
+  }
 
   observe(now: number, report: RTCStatsReport | null): UplinkStatus | null {
     let selected: string | undefined;
     report?.forEach(s => { if (s.type === "transport" && s.selectedCandidatePairId) selected = s.selectedCandidatePairId; });
     let sample: UplinkSample | null = null;
-    const fresh = (key: string, counter: number) => {
+    const fresh = (key: string, counter: number, timestamp: number) => {
       const previous = this.evidence.get(key);
       if (!Number.isFinite(counter) || (previous !== undefined && counter <= previous)) return false;
+      if (this.freshAfter !== null && (!Number.isFinite(timestamp) || timestamp <= this.freshAfter)) return false;
       if (this.evidence.size >= 32 && !this.evidence.has(key)) this.evidence.delete(this.evidence.keys().next().value!);
       this.evidence.set(key, counter);
+      if (Number.isFinite(timestamp)) this.latestTimestamp = Math.max(this.latestTimestamp, timestamp);
+      if (this.freshAfter !== null) this.freshAfter = this.latestTimestamp;
       return true;
     };
     let pair: RTCIceCandidatePairStats | undefined;
@@ -211,7 +226,7 @@ export class RtcUplinkObserver {
     const pairCounter = pair?.responsesReceived ?? pair?.totalRoundTripTime;
     if (pair && pairCounter !== undefined && Number.isFinite(pair.currentRoundTripTime) && pair.currentRoundTripTime! > 0) {
       const path = `ice:${pair.id}`;
-      if (fresh(path, pairCounter)) sample = {
+      if (fresh(path, pairCounter, pair.timestamp)) sample = {
         path, rttMs: pair.currentRoundTripTime! * 1000, availableOutgoingBitrate: pair.availableOutgoingBitrate,
       };
     } else {
@@ -222,7 +237,7 @@ export class RtcUplinkObserver {
         const transport = local.transportId ? report.get(local.transportId) : undefined;
         if (selected && transport?.selectedCandidatePairId !== selected) return;
         const path = `rtcp:${selected ?? ""}:${s.id}`;
-        if (fresh(path, s.roundTripTimeMeasurements ?? s.totalRoundTripTime ?? s.timestamp)) sample = { path, rttMs: s.roundTripTime * 1000, availableOutgoingBitrate: pair?.availableOutgoingBitrate };
+        if (fresh(path, s.roundTripTimeMeasurements ?? s.totalRoundTripTime ?? s.timestamp, s.timestamp)) sample = { path, rttMs: s.roundTripTime * 1000, availableOutgoingBitrate: pair?.availableOutgoingBitrate };
       });
     }
     this.detector.hint(serverPing);

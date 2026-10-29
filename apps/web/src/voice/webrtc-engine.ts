@@ -199,17 +199,19 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       this.pc = pc;
       const uplink = new RtcUplinkObserver();
       let polling = false;
+      let uplinkGeneration = 0, uplinkConnected = false;
       const pollUplink = async () => {
         if (this.pc !== pc) return;
         if (pc.connectionState !== "connected") { this.emit("uplink", null); return; }
         if (polling) { this.emit("uplink", uplink.observe(performance.now(), null)); return; }
+        const generation = uplinkGeneration;
         polling = true;
         try {
           const report = await pc.getStats();
-          if (this.pc === pc) this.emit("uplink", pc.connectionState === "connected" ? uplink.observe(performance.now(), report) : null);
+          if (this.pc === pc && generation === uplinkGeneration) this.emit("uplink", pc.connectionState === "connected" ? uplink.observe(performance.now(), report) : null);
         } catch {
-          if (this.pc === pc) this.emit("uplink", pc.connectionState === "connected" ? uplink.observe(performance.now(), null) : null);
-        } finally { polling = false; }
+          if (this.pc === pc && generation === uplinkGeneration) this.emit("uplink", pc.connectionState === "connected" ? uplink.observe(performance.now(), null) : null);
+        } finally { if (generation === uplinkGeneration) polling = false; }
       };
       this.uplinkTimer = setInterval(() => void pollUplink(), 1_000);
       // One dedicated worker per encrypted run; it starts closed.
@@ -243,6 +245,11 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       };
       pc.onconnectionstatechange = () => {
         if (this.pc !== pc) return;
+        if (uplinkConnected && pc.connectionState !== "connected") {
+          uplinkGeneration++; polling = false; uplink.suspend();
+          this.emit("uplink", null);
+        }
+        uplinkConnected = pc.connectionState === "connected";
         if (pc.connectionState === "connected") this.setState("connected");
         else if (pc.connectionState === "failed" || pc.connectionState === "closed") this.setState("failed");
         else if (pc.connectionState === "disconnected") {
