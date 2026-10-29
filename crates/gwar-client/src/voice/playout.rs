@@ -112,64 +112,124 @@ pub(super) struct Slot {
     fade_from: f32,
     fade_left: usize,
     previous_level: f32,
+    /// Test-only: samples output so far, and every edit of the decoded stream.
+    #[cfg(test)]
+    played: u64,
+    #[cfg(test)]
+    edits: Vec<Edit>,
+}
+
+/// Test-only: `removed` samples of the decoded stream are missing from the output from sample
+/// `at` on, and the `modified` samples there are a crossfade; `correlation` is a period's.
+#[cfg(test)]
+#[derive(Debug)]
+struct Edit {
+    at: u64,
+    removed: usize,
+    modified: usize,
+    correlation: Option<f64>,
 }
 
 const FADE: usize = 120; // 2.5 ms at a latency correction boundary.
 const QUIET_SKIP: usize = 240; // Unmatched cuts only in quiet audio, 5 ms at a time.
 const MIN_LAG: usize = 120; // Search 2.5--15 ms pitch periods at 48 kHz.
 const MAX_LAG: usize = 720;
-const SPLICE_EVERY: usize = 480;
+const SPLICE_EVERY: usize = 480; // At most one splice per 10 ms, as NetEq's ticks.
+const NEAR_BEST: f64 = 0.02;
+const SMOOTH: usize = 24; // A moving average with its first null at 2 kHz, NetEq's 4 kHz Nyquist.
+const PICK_WINDOW: usize = MAX_LAG; // 15 ms.
+const PERIODIC: f64 = 0.5; // NetEq's fast-mode threshold.
+const PARTIAL_RANGE: f64 = 0.9; // NetEq's threshold.
+// Decode ahead so that a block holds three splice points with a full search after each.
+const STRETCH_BLOCK: usize = 2 * MAX_LAG + 3 * SPLICE_EVERY;
 
-/// Remove one period, retaining the phase at both ends of the overlap. Search
-/// only the budget we can actually spend; a sub-period cut is not a substitute.
+/// Remove one period, retaining the phase at both ends of the overlap, and return its length
+/// and correlation. A sub-period cut is not a substitute: the period comes from every lag
+/// `pcm` holds two windows of, and it stays if it exceeds `budget` (the caller waits for more).
 ///
 /// This is libwebrtc NetEq's accelerate (modules/audio_coding/neteq/accelerate.cc and
-/// time_stretch.cc, BSD-licensed), reimplemented in floating point: the lag that best
-/// correlates two adjacent windows of its own length, 2.5--15 ms, crossfaded over one
-/// whole period so no splice clicks. NetEq searches a 4 kHz downsampled autocorrelation and
-/// splices 15 ms in; this searches every lag at full rate from the start of the decoded
-/// audio, which follows the previous frame continuously. A period whose two windows do not
-/// correlate above `threshold`, or whose energies differ by more than 25 %, stays.
-fn accelerate(pcm: &mut [f32], budget: usize, threshold: f64) -> usize {
-    let mut best = 0;
-    let mut correlation = threshold;
-    let longest = MAX_LAG.min(budget).min(pcm.len() / 2);
-    if longest < MIN_LAG {
-        return 0;
+/// time_stretch.cc, BSD-licensed; see THIRD_PARTY_NOTICES.md), reimplemented in floating
+/// point: the lag at which the audio best repeats, removed by crossfading one period into the
+/// next over its whole length, so no splice clicks. Like NetEq it picks the lag below 2 kHz,
+/// over a fixed window rather than one period, and judges the splice at full band. NetEq
+/// downsamples to 4 kHz and splices 15 ms into a 30 ms buffer; this low-passes and searches
+/// every lag at full rate from the start of `pcm`, which follows the audio played before it
+/// continuously. Of correlation peaks within `NEAR_BEST` of the best it takes the shortest: a
+/// periodic voice's period rather than a multiple. The period goes only if it correlates above
+/// `threshold`, and above `PERIODIC` whenever the audio has a period at all. Windows whose
+/// energies differ by more than 25 % (an onset or a decay) or that hold silence or DC never
+/// splice.
+///
+/// Less than 30 ms cannot hold every lag of 2.5--15 ms. A shorter buffer is searched over the
+/// lags it holds only for `threshold` of at least `PARTIAL_RANGE`: a lag that is not a voice's
+/// period does not correlate that well. A looser rule needs the whole range, or a voice's
+/// sub-period lag could pass it.
+fn accelerate(pcm: &mut [f32], budget: usize, threshold: f64) -> (usize, f64) {
+    let longest = MAX_LAG.min(pcm.len() / 2);
+    if longest < MIN_LAG || (longest < MAX_LAG && threshold < PARTIAL_RANGE) {
+        return (0, 0.0);
     }
-    // The windows' sums and energies follow the lag in O(1): `a` (pcm[..lag]) gains a sample,
-    // `b` (pcm[lag..2 lag]) moves its start by one and its end by two.
-    let (mut a_sum, mut aa) = sums(&pcm[..MIN_LAG]);
-    let (mut b_sum, mut bb) = sums(&pcm[MIN_LAG..2 * MIN_LAG]);
+    let window = PICK_WINDOW.min(pcm.len() - longest);
+    // Pick the lag below 2 kHz, as NetEq does at 4 kHz, so that broadband noise does not move the
+    // peak.
+    let mut smooth = [0.0_f32; MAX_LAG + PICK_WINDOW];
+    let mut sum = 0.0;
+    for i in 0..longest + window {
+        sum += pcm[i] - if i >= SMOOTH { pcm[i - SMOOTH] } else { 0.0 };
+        smooth[i] = sum / SMOOTH as f32;
+    }
+    // Each lag correlates one fixed window with the window `lag` later, as NetEq's
+    // autocorrelation does over 12.5 ms: one period of a low voice alone is too noisy a guide.
+    let mut scores = [f64::NEG_INFINITY; MAX_LAG + 1];
+    let mut best = f64::NEG_INFINITY;
+    let (a_sums, b) = (sums(&smooth[..window]), &smooth[MIN_LAG..MIN_LAG + window]);
+    let (mut b_sum, mut bb) = sums(b);
     for lag in MIN_LAG..=longest {
         if lag > MIN_LAG {
-            let moved = f64::from(pcm[lag - 1]);
-            let (gained_sum, gained) = sums(&pcm[2 * lag - 2..2 * lag]);
-            (a_sum, aa) = (a_sum + moved, aa + moved * moved);
-            (b_sum, bb) = (b_sum - moved + gained_sum, bb - moved * moved + gained);
+            let (gone, gained) = (f64::from(smooth[lag - 1]), f64::from(smooth[lag + window - 1]));
+            (b_sum, bb) = (b_sum - gone + gained, bb - gone * gone + gained * gained);
         }
-        // Center the windows: DC and silence must not masquerade as periodic speech.
-        let count = lag as f64;
-        let a_energy = aa - a_sum * a_sum / count;
-        let b_energy = bb - b_sum * b_sum / count;
-        if a_energy < count * 1e-6 || b_energy < count * 1e-6 || !(0.8..=1.25).contains(&(a_energy / b_energy)) {
-            continue;
-        }
-        let ab = dot(&pcm[..lag], &pcm[lag..2 * lag]) - a_sum * b_sum / count;
-        let score = ab / (a_energy * b_energy).sqrt();
-        if score > correlation {
-            correlation = score;
-            best = lag;
+        let windows = (&smooth[..window], &smooth[lag..lag + window]);
+        if let Some(score) = centered_correlation(windows, a_sums, (b_sum, bb)) {
+            scores[lag] = score;
+            best = best.max(score);
         }
     }
-    if best > 0 {
-        for i in 0..best {
-            let blend = i as f32 / (best - 1) as f32;
-            pcm[i] = pcm[i] * (1.0 - blend) + pcm[i + best] * blend;
-        }
-        pcm.copy_within(2 * best.., best);
+    // The shortest correlation peak near the best: a peak, not the rising edge of one.
+    let peak = |lag: usize| {
+        let score = scores[lag];
+        score >= best - NEAR_BEST && score >= scores[lag - 1] && (lag == longest || score >= scores[lag + 1])
+    };
+    let Some(period) = (MIN_LAG..=longest).find(|&lag| peak(lag)) else { return (0, 0.0) };
+    // Audio with a period (NetEq's fast-mode threshold below 2 kHz) never splices off it, whatever
+    // the caller accepts: only aperiodic audio may lose a lag that correlates worse.
+    let threshold = if best >= PERIODIC { threshold.max(PERIODIC) } else { threshold };
+    // The splice itself is judged at full band, as NetEq's `best_correlation` is.
+    let (first, second) = (&pcm[..period], &pcm[period..2 * period]);
+    let Some(correlation) = centered_correlation((first, second), sums(first), sums(second)) else { return (0, 0.0) };
+    if correlation <= threshold || period > budget {
+        return (0, correlation);
     }
-    best
+    for i in 0..period {
+        let blend = i as f32 / (period - 1) as f32;
+        pcm[i] = pcm[i] * (1.0 - blend) + pcm[i + period] * blend;
+    }
+    pcm.copy_within(2 * period.., period);
+    (period, correlation)
+}
+
+/// The correlation of two windows of the same length, given their sums and energies, both
+/// centered: none if either holds silence or DC, or if their energies differ by more than 25 %.
+fn centered_correlation((a, b): (&[f32], &[f32]), (a_sum, aa): (f64, f64), (b_sum, bb): (f64, f64)) -> Option<f64> {
+    // Center the windows: DC and silence must not masquerade as periodic speech.
+    let count = a.len() as f64;
+    let a_energy = aa - a_sum * a_sum / count;
+    let b_energy = bb - b_sum * b_sum / count;
+    if a_energy < count * 1e-6 || b_energy < count * 1e-6 || !(0.8..=1.25).contains(&(a_energy / b_energy)) {
+        return None;
+    }
+    let ab = dot(a, b) - a_sum * b_sum / count;
+    Some(ab / (a_energy * b_energy).sqrt())
 }
 
 /// The sum and the energy of `pcm`.
@@ -196,7 +256,7 @@ impl Slot {
         Ok(Self {
             buffer: JitterBuffer::new(),
             decoder: Decoder::new(SampleRate::Hz48000, Channels::Mono)?,
-            // A frame and a packet decoded after it (decode-ahead, a backlog cut).
+            // A frame and the packets decoded after it (decode-ahead, a backlog cut).
             decoded: vec![0.0; 2 * 5760],
             position: 0,
             end: 0,
@@ -205,6 +265,10 @@ impl Slot {
             fade_from: 0.0,
             fade_left: 0,
             previous_level: -120.0,
+            #[cfg(test)]
+            played: 0,
+            #[cfg(test)]
+            edits: Vec::new(),
         })
     }
 
@@ -270,7 +334,7 @@ impl Slot {
                             // Decode ahead only on proven surplus. This buys a whole
                             // overlap even for 10 ms packets, without startup delay or
                             // replaying history. A gap/recovery stops lookahead unchanged.
-                            while n < 2 * skip.min(MAX_LAG) {
+                            while n < STRETCH_BLOCK {
                                 let Playout::Packet { data, .. } = self.buffer.pop_for(now, 0) else { break };
                                 let input = Packet::try_from(data.as_slice()).ok();
                                 let output = MutSignals::try_from(&mut self.decoded[n..n + 5760])?;
@@ -286,18 +350,34 @@ impl Slot {
                         }
                         // Speech only ever loses whole pitch periods, as the jitter buffer's
                         // `correlation` allows: the gentle shrink's near-identical ones, or a due
-                        // backlog cut's (NetEq's threshold, any after it has waited).
-                        // At most one period every `SPLICE_EVERY`, as NetEq's 10 ms ticks.
+                        // backlog cut's (`jitter::BACKLOG_CORRELATION`, then its relaxed rule).
+                        // The next splice starts past this one's crossfade; a block that matched
+                        // nothing once is not searched again.
                         let (mut removed, mut at) = (0, 0);
-                        while !onset && !quiet && !fade && at < n && removed < skip {
-                            let period = accelerate(&mut self.decoded[at..n], skip - removed, correlation);
+                        while !onset && !quiet && !fade && removed < skip {
+                            let (period, _correlation) =
+                                accelerate(&mut self.decoded[at..n], skip - removed, correlation);
+                            if period == 0 {
+                                break;
+                            }
+                            #[cfg(test)]
+                            self.edits.push(Edit {
+                                at: self.played + at as u64,
+                                removed: period,
+                                modified: period,
+                                correlation: Some(_correlation),
+                            });
                             n -= period;
                             removed += period;
-                            at += SPLICE_EVERY;
+                            at += SPLICE_EVERY.max(period);
                         }
                         self.buffer.accelerated(now, removed);
                         let skip = if !onset && quiet { skip.min(QUIET_SKIP).min(n) } else { 0 };
                         self.buffer.shrunk(now, skip);
+                        #[cfg(test)]
+                        if skip > 0 {
+                            self.edits.push(Edit { at: self.played, removed: skip, modified: FADE, correlation: None });
+                        }
                         // A due backlog cut drops the quiet packets after a quiet frame, and
                         // the first loud one plays after this frame: speech stays. The decoder
                         // runs through the dropped audio, so the next packet continues its state.
@@ -314,6 +394,13 @@ impl Slot {
                                     break;
                                 }
                                 self.buffer.dropped(now, next);
+                                #[cfg(test)]
+                                self.edits.push(Edit {
+                                    at: self.played + (n - skip) as u64,
+                                    removed: next,
+                                    modified: 0,
+                                    correlation: None,
+                                });
                             }
                         }
                         (n, skip, fade)
@@ -351,6 +438,10 @@ impl Slot {
             }
             self.position += take;
             written += take;
+            #[cfg(test)]
+            {
+                self.played += take as u64;
+            }
         }
         Ok(())
     }
@@ -547,13 +638,14 @@ mod tests {
         }
     }
 
-    /// 11 s of a `pitch` Hz voice (loud noise if 0) that `speaks(i)` in 20 ms frame `i` (a
-    /// harmonic, else silence), encoded in order, and each frame as a decoder of the whole
-    /// stream plays it.
-    fn voice(pitch: f32, speaks: impl Fn(usize) -> bool) -> (Vec<Vec<u8>>, Vec<Vec<f32>>) {
+    /// 11 s of a `pitch` Hz voice with `noise` peak added (loud noise alone if `pitch` is 0)
+    /// that `speaks(i)` in 20 ms frame `i` (else silence), encoded in order, and each frame as
+    /// a decoder of the whole stream plays it.
+    fn voice(pitch: f32, noise_level: f32, speaks: impl Fn(usize) -> bool) -> (Vec<Vec<u8>>, Vec<Vec<f32>>) {
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
         let mut reference = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
-        let pcm = if pitch > 0.0 { harmonic(pitch, 0.02, 0.3, 550 * 960) } else { noise(7, 0.3, 550 * 960) };
+        let pcm = if pitch > 0.0 { harmonic(pitch, 0.02, 0.3, 550 * 960) } else { vec![0.0; 550 * 960] };
+        let pcm: Vec<f32> = pcm.iter().zip(noise(7, noise_level, pcm.len())).map(|(v, n)| v + n).collect();
         let frames: Vec<_> = pcm
             .chunks(960)
             .enumerate()
@@ -596,11 +688,12 @@ mod tests {
     }
 
     /// What `drain` measured: the first refill that removed audio and the first after it with
-    /// at most 100 ms queued (the window proves the surplus at refill 250); speech (packets that decode at -42 dB or louder) and quiet packets
-    /// dropped whole, and the rest removed (pitch periods and 5 ms quiet skips), in samples; the
-    /// largest sample-to-sample step of the output against the reference's; and the largest
-    /// share of any second of output that was removed by less than a packet (how much faster
-    /// than real time speech played).
+    /// at most 100 ms queued (the window proves the surplus at refill 250); speech (packets that
+    /// decode at -42 dB or louder) and quiet packets dropped whole, and the rest removed (pitch
+    /// periods and 5 ms quiet skips), in samples; the largest sample-to-sample step of the
+    /// output against the reference's; the largest share of any second of output that was
+    /// removed by less than a packet (how much faster than real time speech played); and every
+    /// period removed, with the refill that removed it and its correlation.
     #[derive(Debug)]
     struct Drain {
         first: u64,
@@ -611,19 +704,20 @@ mod tests {
         jump: f32,
         reference_jump: f32,
         speedup: f64,
+        periods: Vec<(u64, usize, f64)>,
     }
 
-    /// Plays 10 s of `voice(pitch, speaks)` after a backlog of `backlog` packets. Every refill
-    /// that neither removed audio nor follows one must play the reference decoder's audio,
-    /// shifted by what was removed: nothing is lost but what was counted, and the decoder runs
+    /// Plays 10 s of `voice(pitch, noise_level, speaks)` after a backlog of `backlog` packets.
+    /// Every output sample outside a crossfade must be the reference decoder's, shifted by what
+    /// the edits before it removed: nothing is lost but what was counted, and the decoder runs
     /// through everything dropped.
-    fn drain(pitch: f32, speaks: impl Fn(usize) -> bool, backlog: u64) -> Drain {
-        let (frames, decoded) = voice(pitch, speaks);
+    fn drain(pitch: f32, noise_level: f32, speaks: impl Fn(usize) -> bool, backlog: u64) -> Drain {
+        let (frames, decoded) = voice(pitch, noise_level, speaks);
         let content: Vec<f32> = decoded.concat();
         let quiet = |i: u64| level_db(&decoded[i as usize]) < -42.0;
         let mut slot = Slot::new().unwrap();
         let start = Instant::now();
-        let (mut first, mut done, mut removed, mut previous) = (None, None, 0, 0);
+        let (mut first, mut done) = (None, None);
         let mut drain = Drain {
             first: 0,
             done: 0,
@@ -633,16 +727,16 @@ mod tests {
             jump: 0.0,
             reference_jump: decoded.iter().map(|f| maximum_jump(f)).fold(0.0, f32::max),
             speedup: 0.0,
+            periods: Vec::new(),
         };
         let mut output = Vec::new();
         let mut removals = Vec::new();
         for refill in 0..500 {
+            let edits = slot.edits.len();
             let (out, taken, shrunk) = backlog_refill(&mut slot, &frames, backlog, start, refill, 960);
-            if shrunk == 0 && previous == 0 {
-                let at = (refill * 960 + removed) as usize;
-                let error = out.iter().zip(&content[at..]).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
-                assert!(error < 1e-6, "refill {refill}: {error} from the reference after {removed} removed");
-            }
+            drain
+                .periods
+                .extend(slot.edits[edits..].iter().filter_map(|e| e.correlation.map(|c| (refill, e.removed, c))));
             // Dropped packets follow the frames played; the first loud one after them, if
             // taken, plays next. A period or quiet skip is less than a packet.
             let k = shrunk / 960;
@@ -651,8 +745,6 @@ mod tests {
                 *(if quiet(i) { &mut drain.quiet_dropped } else { &mut drain.speech_dropped }) += 960;
             }
             drain.stretched += shrunk % 960;
-            removed += shrunk;
-            previous = shrunk;
             output.extend(out);
             removals.push(shrunk % 960);
             if shrunk > 0 {
@@ -660,6 +752,17 @@ mod tests {
             }
             if first.is_some() && done.is_none() && slot.buffer.depth().1 <= 960 * 5 {
                 done = Some(refill);
+            }
+        }
+        let (mut shift, mut crossfade, mut edits) = (0, 0..0, slot.edits.iter().peekable());
+        for (at, &sample) in output.iter().enumerate() {
+            while let Some(edit) = edits.next_if(|e| e.at <= at as u64) {
+                shift += edit.removed;
+                crossfade = edit.at as usize..edit.at as usize + edit.modified;
+            }
+            if !crossfade.contains(&at) {
+                let error = (sample - content[at + shift]).abs();
+                assert!(error < 1e-6, "sample {at}: {error} from the reference after {shift} removed");
             }
         }
         let (first, done) = (first.expect("nothing removed"), done.expect("backlog not drained"));
@@ -676,37 +779,67 @@ mod tests {
         // 320 ms the quiet packets cover most of the cut; with short gaps between words, or none,
         // speech plays up to 1.25 times as fast, a pitch period at a time. Before, a cut that
         // found no quiet packets within 2 s dropped what was left at once: 200--380 ms of speech
-        // (or noise) in every case but the pauses (docs/latency-congested-uplink.md).
+        // (or noise) in every case but the pauses (docs/latency-congested-uplink.md). A noisy
+        // voice (periods correlating at 0.6--0.85) waits the 2 s, then still loses only whole
+        // periods (review of #201).
         let pauses: fn(usize) -> bool = |i| i % 16 < 10;
         let gaps: fn(usize) -> bool = |i| i % 10 >= 2;
         let steady: fn(usize) -> bool = |_| true;
         let cases = [
-            ("pauses", 150.0, pauses, 15),
-            ("word gaps", 150.0, gaps, 15),
-            ("continuous", 150.0, steady, 15),
-            ("continuous, 430 ms", 150.0, steady, 22),
-            ("continuous 100 Hz, 430 ms", 100.0, steady, 22),
-            ("continuous 250 Hz, 430 ms", 250.0, steady, 22),
-            ("word gaps, 430 ms", 150.0, gaps, 22),
-            ("loud noise, 430 ms", 0.0, steady, 22),
+            ("pauses", 150.0, 0.0, pauses, 15),
+            ("word gaps", 150.0, 0.0, gaps, 15),
+            ("continuous", 150.0, 0.0, steady, 15),
+            ("continuous, 430 ms", 150.0, 0.0, steady, 22),
+            ("continuous 100 Hz, 430 ms", 100.0, 0.0, steady, 22),
+            ("continuous 250 Hz, 430 ms", 250.0, 0.0, steady, 22),
+            ("word gaps, 430 ms", 150.0, 0.0, gaps, 22),
+            ("noisy 100 Hz voice, 430 ms", 100.0, 0.16, steady, 22),
+            ("noisy 150 Hz voice, 430 ms", 150.0, 0.16, steady, 22),
+            ("loud noise, 430 ms", 0.0, 0.3, steady, 22),
         ];
-        for (name, pitch, speaks, backlog) in cases {
-            let drain = drain(pitch, speaks, backlog);
-            eprintln!("{name}: {drain:?}");
-            assert_eq!(drain.speech_dropped, 0, "{name}: {drain:?}");
+        for (name, pitch, noise_level, speaks, backlog) in cases {
+            let drain = drain(pitch, noise_level, speaks, backlog);
+            let periods = drain.periods.len();
+            let correlations =
+                drain.periods.iter().map(|p| p.2).fold((1.0, -1.0), |(lo, hi), c| (c.min(lo), c.max(hi)));
+            let summary = format!(
+                "first {} done {} speech {} quiet {} stretched {} jump {:.4}/{:.4} speedup {:.3} periods {periods} \
+                 correlation {:.2}..{:.2}",
+                drain.first,
+                drain.done,
+                drain.speech_dropped,
+                drain.quiet_dropped,
+                drain.stretched,
+                drain.jump,
+                drain.reference_jump,
+                drain.speedup,
+                correlations.0,
+                correlations.1
+            );
+            eprintln!("{name}: {summary}");
+            assert_eq!(drain.speech_dropped, 0, "{name}: {summary}");
+            assert!(drain.jump <= drain.reference_jump * 1.05, "{name}: {summary}");
+            assert!(drain.speedup <= 0.27, "{name}: {summary}");
             if pitch > 0.0 {
-                // Within 2 s of the window, when the old cut went ahead at its cap.
-                assert!((250..255).contains(&drain.first), "{name}: {drain:?}");
-                assert!(drain.done <= 350, "{name}: {drain:?}");
-            } else {
-                // Noise has no period: it waits `BACKLOG_WAIT`, then crossfades periods anyway.
-                assert!((345..=355).contains(&drain.first), "{name}: {drain:?}");
-                assert!(drain.done <= drain.first + 80, "{name}: {drain:?}");
+                // A voice only ever loses whole periods, at NetEq's fast-mode threshold or above.
+                for &(refill, removed, correlation) in &drain.periods {
+                    assert!(
+                        whole_periods(removed, pitch) && correlation >= 0.5,
+                        "{name}: refill {refill} removed {removed} at {correlation:.3}"
+                    );
+                }
             }
-            assert!(drain.jump <= drain.reference_jump * 1.05, "{name}: {drain:?}");
-            assert!(drain.speedup <= 0.27, "{name}: {drain:?}");
+            if noise_level == 0.0 {
+                // Within 2 s of the window, when the old cut went ahead at its cap.
+                assert!((250..255).contains(&drain.first), "{name}: {summary}");
+                assert!(drain.done <= 350, "{name}: {summary}");
+            } else {
+                // No period above NetEq's threshold: the cut waits `BACKLOG_WAIT`.
+                assert!((345..=355).contains(&drain.first), "{name}: {summary}");
+                assert!(drain.done <= drain.first + 100, "{name}: {summary}");
+            }
             if name == "pauses" {
-                assert!(drain.quiet_dropped >= 5 * 960, "{name}: {drain:?}");
+                assert!(drain.quiet_dropped >= 5 * 960, "{name}: {summary}");
             }
         }
     }
@@ -795,10 +928,16 @@ mod tests {
                                 if arrival > tick {
                                     break;
                                 }
+                                // A phase-continuous voice: a tone reset every packet has no
+                                // period across the reset, which acceleration rightly rejects.
+                                let phase = (packet * 960) as f32 * std::f32::consts::TAU * 150.0 / 48_000.0;
+                                let mut data = vec![0; 1275];
+                                let n = encoder.encode_float(&harmonic(150.0, 0.0, phase, 960), &mut data).unwrap();
+                                data.truncate(n);
                                 slot.buffer.push_at(
                                     packet * 960,
                                     960,
-                                    encode(&encoder, true),
+                                    data,
                                     now + Duration::from_secs_f64(arrival as f64 / 48_000.0),
                                     clock,
                                 );
@@ -1492,7 +1631,7 @@ mod tests {
                     let input = harmonic(pitch, vibrato, phase, 2161);
                     let original = &input[1..];
                     let mut actual = original.to_vec();
-                    let removed = accelerate(&mut actual, MAX_LAG, SHRINK_CORRELATION);
+                    let removed = accelerate(&mut actual, MAX_LAG, SHRINK_CORRELATION).0;
                     assert!((MIN_LAG..=MAX_LAG).contains(&removed), "pitch={pitch}");
                     actual.truncate(original.len() - removed);
                     assert_eq!(actual.len() + removed, original.len());
@@ -1533,13 +1672,13 @@ mod tests {
             .collect();
         for original in [noise, vec![0.0; 2160], vec![0.2; 2160]] {
             let mut pcm = original.clone();
-            assert_eq!(accelerate(&mut pcm, MAX_LAG, SHRINK_CORRELATION), 0);
+            assert_eq!(accelerate(&mut pcm, MAX_LAG, SHRINK_CORRELATION).0, 0);
             assert_eq!(pcm, original);
         }
         let original = harmonic(100.0, 0.02, 0.5, 2160);
         for (length, budget) in [(2160, 119), (2160, 240), (480, MAX_LAG)] {
             let mut pcm = original[..length].to_vec();
-            assert_eq!(accelerate(&mut pcm, budget, SHRINK_CORRELATION), 0);
+            assert_eq!(accelerate(&mut pcm, budget, SHRINK_CORRELATION).0, 0);
             assert_eq!(pcm, original[..length]);
         }
     }
@@ -1549,7 +1688,7 @@ mod tests {
         let original = harmonic(200.0, 0.0, 0.5, 2160);
         for budget in 0..=800 {
             let mut pcm = original.clone();
-            let removed = accelerate(&mut pcm, budget, SHRINK_CORRELATION);
+            let removed = accelerate(&mut pcm, budget, SHRINK_CORRELATION).0;
             assert!(removed <= budget.min(MAX_LAG));
             if removed == 0 {
                 assert_eq!(pcm, original);
@@ -1580,54 +1719,94 @@ mod tests {
         dot(a, b) / (dot(a, a) * dot(b, b)).sqrt()
     }
 
+    /// 45 ms of a `pitch` Hz voice with 3 % vibrato and noise at `noise_level` peak.
+    fn rough_voice(pitch: f32, noise_level: f32, seed: u32) -> Vec<f32> {
+        let voice = harmonic(pitch, 0.03, 0.3, 2160);
+        voice.iter().zip(noise(seed, noise_level, 2160)).map(|(v, n)| v + n).collect()
+    }
+
+    /// Whether `removed` is a whole number of `pitch` Hz periods, within 5 %.
+    fn whole_periods(removed: usize, pitch: f32) -> bool {
+        let periods = removed as f64 / (48_000.0 / f64::from(pitch));
+        periods >= 0.95 && (periods - periods.round()).abs() <= 0.05 * periods.round()
+    }
+
     #[test]
     fn backlog_acceleration_takes_periods_neteq_accepts_without_clicks() {
         use super::super::jitter::BACKLOG_CORRELATION;
-        // A rougher voice than `harmonic` alone: 6 % vibrato and noise 12 dB down, so adjacent
-        // periods correlate between NetEq's threshold and the gentle shrink's.
+        // Noise 12 dB down: adjacent periods correlate between NetEq's threshold and the gentle
+        // shrink's.
         for pitch in [100.0, 150.0, 220.0] {
-            let rough = |seed| {
-                let voice = harmonic(pitch, 0.06, 0.3, 2160);
-                voice.iter().zip(noise(seed, 0.07, 2160)).map(|(v, n)| v + n).collect::<Vec<f32>>()
-            };
-            let input = rough(3);
-            let period = 48_000.0 / pitch;
+            let input = rough_voice(pitch, 0.07, 3);
             let mut strict = input.clone();
-            assert_eq!(accelerate(&mut strict, MAX_LAG, SHRINK_CORRELATION), 0, "pitch={pitch}");
+            assert_eq!(accelerate(&mut strict, MAX_LAG, SHRINK_CORRELATION).0, 0, "pitch={pitch}");
             let mut actual = input.clone();
-            let removed = accelerate(&mut actual, MAX_LAG, BACKLOG_CORRELATION);
-            let periods = removed as f64 / f64::from(period);
-            assert!((periods - periods.round()).abs() < 0.05 && periods >= 0.95, "pitch={pitch}: {removed}");
+            let (removed, correlation) = accelerate(&mut actual, MAX_LAG, BACKLOG_CORRELATION);
+            assert!(whole_periods(removed, pitch), "pitch={pitch}: {removed} at {correlation:.3}");
             actual.truncate(input.len() - removed);
             // The splice is continuous at both ends and keeps the rest unchanged.
             assert_eq!(actual[0], input[0]);
             assert_eq!(&actual[removed..], &input[2 * removed..]);
             assert!(maximum_jump(&actual) <= maximum_jump(&input) * 1.05, "pitch={pitch}");
             // The voice stays as periodic as it was.
-            let lag = period.round() as usize;
+            let lag = (48_000.0 / pitch).round() as usize;
             let (before, after) = (periodicity(&input, lag), periodicity(&actual, lag));
             assert!(after >= before - 0.02, "pitch={pitch}: periodicity {before:.3} -> {after:.3}");
         }
     }
 
     #[test]
-    fn the_passive_rule_splices_uncorrelated_audio_without_clicks() {
-        use super::super::jitter::BACKLOG_CORRELATION;
-        // Loud noise has no period NetEq's threshold accepts; any correlation (NetEq's rule for
-        // passive speech) still removes a whole crossfaded one.
+    fn the_relaxed_rule_still_removes_only_whole_periods_of_a_voice() {
+        use super::super::jitter::{ANY_CORRELATION, BACKLOG_CORRELATION};
+        // Review of #201: the relaxed rule searched only lags within the budget, so a budget
+        // shorter than the period took a sub-period lag (141 samples of a 150 Hz voice at 0.80,
+        // periodicity 0.995 -> 0.948). Noisy voices whose periods correlate at 0.6--0.85: below
+        // NetEq's threshold, above its fast mode's.
+        for pitch in [80.0, 100.0, 150.0, 220.0] {
+            for seed in 1..=4 {
+                let input = rough_voice(pitch, 0.16, seed);
+                let mut pcm = input.clone();
+                let (removed, correlation) = accelerate(&mut pcm, MAX_LAG, BACKLOG_CORRELATION);
+                assert_eq!(removed, 0, "pitch={pitch} seed={seed}: {correlation:.3}");
+                assert!((0.6..0.9).contains(&correlation), "pitch={pitch} seed={seed}: {correlation:.3}");
+                for budget in [MIN_LAG, 240, 360, 480, 600, MAX_LAG] {
+                    let mut pcm = input.clone();
+                    let (removed, correlation) = accelerate(&mut pcm, budget, ANY_CORRELATION);
+                    let label = format!("pitch={pitch} seed={seed} budget={budget}: {removed} at {correlation:.3}");
+                    if removed == 0 {
+                        // Only a period beyond the budget waits.
+                        assert!(budget < 2 * (48_000.0 / pitch) as usize, "{label}");
+                        assert_eq!(pcm, input, "{label}");
+                        continue;
+                    }
+                    assert!(removed <= budget && whole_periods(removed, pitch), "{label}");
+                    assert!(correlation >= 0.5, "{label}");
+                    pcm.truncate(input.len() - removed);
+                    assert!(maximum_jump(&pcm) <= maximum_jump(&input) * 1.05, "{label}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_relaxed_rule_splices_aperiodic_audio_without_clicks() {
+        use super::super::jitter::{ANY_CORRELATION, BACKLOG_CORRELATION};
+        // Loud noise has no period: after `BACKLOG_WAIT` its best lag goes anyway, crossfaded over
+        // its whole length.
         let input = noise(11, 0.3, 2160);
         let mut actual = input.clone();
-        assert_eq!(accelerate(&mut actual, MAX_LAG, BACKLOG_CORRELATION), 0);
+        assert_eq!(accelerate(&mut actual, MAX_LAG, BACKLOG_CORRELATION).0, 0);
         assert_eq!(actual, input);
-        let removed = accelerate(&mut actual, MAX_LAG, 0.0);
+        let (removed, correlation) = accelerate(&mut actual, MAX_LAG, ANY_CORRELATION);
         assert!((MIN_LAG..=MAX_LAG).contains(&removed), "{removed}");
+        assert!(correlation < 0.5, "{correlation}");
         actual.truncate(input.len() - removed);
         assert_eq!(&actual[removed..], &input[2 * removed..]);
         assert!(maximum_jump(&actual) <= maximum_jump(&input), "{}", maximum_jump(&actual));
-        // Silence and DC still never splice.
-        for original in [vec![0.0; 2160], vec![0.2; 2160]] {
+        // Silence, DC and less than 30 ms never splice.
+        for original in [vec![0.0; 2160], vec![0.2; 2160], input[..2 * MAX_LAG - 1].to_vec()] {
             let mut pcm = original.clone();
-            assert_eq!(accelerate(&mut pcm, MAX_LAG, 0.0), 0);
+            assert_eq!(accelerate(&mut pcm, MAX_LAG, ANY_CORRELATION).0, 0);
             assert_eq!(pcm, original);
         }
     }

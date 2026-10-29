@@ -355,18 +355,29 @@ const SHRINK_RETRY: Duration = Duration::from_millis(200);
 // quiet packets after quiet frames, and accelerates the rest as libwebrtc's NetEq does
 // (playout.rs `accelerate`), removing one pitch period at a time from audio that correlates
 // above `BACKLOG_CORRELATION` (NetEq's `kCorrelationThreshold`). Each period removed costs
-// `BACKLOG_PACE` times its length of playout, so speech plays at most 1.25 times as fast. After
-// `BACKLOG_WAIT` any correlation will do, as for NetEq's passive speech: a whole period still
-// crossfades, so loud noise or unvoiced audio drains too. The evidence starts at one window and
-// doubles (up to `MAX_BACKLOG_EVIDENCE`) whenever playout starves within `BACKLOG_PROBE` of a
-// cut: delay that swells and recedes more rarely than the window keeps its cushion after the
-// first miss, as speaker headroom does (playout.rs). A cut without a starvation after it resets
-// the evidence, and it halves after `BACKLOG_RELAX` without growth or a starvation.
+// `BACKLOG_PACE` times its length of playout, so speech plays at most 1.25 times as fast.
+//
+// After `BACKLOG_WAIT` the cut takes the best-correlating lag whatever its correlation
+// (`ANY_CORRELATION`). The lag still comes from the whole 2.5--15 ms range, so a voice whose
+// period correlates at 0.5 or more (NetEq's fast-mode threshold) still loses only whole periods.
+// Only audio in which no lag correlates that well (noise, unvoiced or whispered audio) loses
+// lags that are not a period, each crossfaded over its whole length. This is not NetEq's rule:
+// NetEq accepts any lag only when an energy VAD finds no active speech; here quiet audio is
+// dropped or skipped by its level instead. A cut that removes nothing for `BACKLOG_STUCK` gives
+// up and restarts the window, which gives the gentle shrink its turn.
+//
+// The evidence starts at one window and doubles (up to `MAX_BACKLOG_EVIDENCE`) whenever playout
+// starves within `BACKLOG_PROBE` of a cut: delay that swells and recedes more rarely than the
+// window keeps its cushion after the first miss, as speaker headroom does (playout.rs). A cut
+// without a starvation after it resets the evidence, and it halves after `BACKLOG_RELAX`
+// without growth or a starvation.
 const BACKLOG_TRIM: u64 = 4800;
 const BACKLOG_KEEP: u64 = 1920;
 pub(crate) const BACKLOG_CORRELATION: f64 = 0.9;
 const BACKLOG_PACE: u64 = 4;
 const BACKLOG_WAIT: Duration = Duration::from_secs(2);
+pub(crate) const ANY_CORRELATION: f64 = -1.0;
+const BACKLOG_STUCK: Duration = Duration::from_secs(10);
 // The gentle shrink accelerates only near-identical periods: it runs whatever the queue holds.
 pub(crate) const SHRINK_CORRELATION: f64 = 0.98;
 const MIN_PERIOD: u64 = 120; // 2.5 ms, the shortest period playout removes.
@@ -914,6 +925,17 @@ impl JitterBuffer {
             // The pace starts with one whole long period of credit.
             self.backlog_paced = Some(now.checked_sub(Self::full_pace()).unwrap_or(now));
         }
+        // Audio that never splices (onsets, decays, fades all along) must not hold the cut, and
+        // the gentle shrink behind it, for good: the window has to prove the surplus again.
+        if let Some(due) = self.backlog_due {
+            let progress = self.backlog_cut.filter(|&at| at >= due).unwrap_or(due);
+            if now.saturating_duration_since(progress) >= BACKLOG_STUCK {
+                self.end_backlog_cut();
+                self.clear_depth();
+                self.above_since = None;
+                return;
+            }
+        }
         self.settle_backlog();
     }
 
@@ -1040,7 +1062,8 @@ impl JitterBuffer {
             self.missing = 0;
             self.held = 0;
             // A due backlog cut accelerates whenever its pace allows (`backlog_budget`); it starts
-            // with NetEq's correlation threshold and accepts any after `BACKLOG_WAIT`.
+            // with NetEq's correlation threshold and takes the best lag whatever its correlation
+            // after `BACKLOG_WAIT` (`ANY_CORRELATION`).
             let backlog = if demand > 0 && self.recovering.is_none() { self.backlog_budget(now) } else { 0 };
             let backlog = backlog.min(available);
             if backlog >= MIN_PERIOD {
@@ -1050,7 +1073,7 @@ impl JitterBuffer {
                     skip: backlog as usize,
                     quiet_only: held < FORCE_SHRINK,
                     fade,
-                    correlation: if waited { 0.0 } else { BACKLOG_CORRELATION },
+                    correlation: if waited { ANY_CORRELATION } else { BACKLOG_CORRELATION },
                 };
             }
             let shrink = demand > 0
@@ -1735,7 +1758,7 @@ mod tests {
                     let skip = if !speech {
                         jb.shrunk(now, skip.min(240));
                         skip.min(240)
-                    } else if correlation <= 0.0 && skip >= 320 {
+                    } else if correlation == ANY_CORRELATION && skip >= 320 {
                         jb.accelerated(now, 320);
                         320
                     } else {
@@ -1885,12 +1908,12 @@ mod tests {
                 let mut periods = 0;
                 if correlation < SHRINK_CORRELATION {
                     proposed.get_or_insert(k);
-                    if correlation == 0.0 {
+                    if correlation == ANY_CORRELATION {
                         relaxed.get_or_insert(k);
                     } else {
                         assert_eq!(correlation, BACKLOG_CORRELATION);
                     }
-                    if correlated || correlation == 0.0 {
+                    if correlated || correlation == ANY_CORRELATION {
                         periods = skip as u64 / 320 * 320;
                         jb.accelerated(now, periods as usize);
                     }
@@ -1914,6 +1937,34 @@ mod tests {
             assert_eq!(jb.backlog_due, None);
             assert_eq!(jb.concealments, 0);
         }
+    }
+
+    #[test]
+    fn a_cut_that_never_splices_gives_up_and_proves_the_surplus_again() {
+        // Review of #201: audio that never splices (onsets or decays all along) kept a cut due,
+        // and the gentle shrink behind it, for good. 400 ms of backlog as above; the decoder
+        // removes nothing.
+        let start = Instant::now();
+        let mut jb = JitterBuffer::new();
+        for i in 0..20 {
+            jb.push_at(i * FRAME, FRAME, vec![1], start, Clock::Rtp);
+        }
+        let mut proposed = Vec::new();
+        for k in 0..1500u64 {
+            let now = start + Duration::from_millis(20 * k);
+            jb.push_at((k + 20) * FRAME, FRAME, vec![1], now, Clock::Rtp);
+            let Playout::Packet { correlation, .. } = jb.pop_at(now) else { panic!("starved at {k}") };
+            if correlation < SHRINK_CORRELATION {
+                proposed.push(k);
+            }
+        }
+        let first = proposed[0];
+        assert!((245..=255).contains(&first), "{first}");
+        // Proposed on every refill for `BACKLOG_STUCK`, then not until a new window proves it.
+        let gap = proposed.windows(2).find(|w| w[1] > w[0] + 1).expect("the cut never gave up");
+        assert_eq!(gap[0], first + 499, "{gap:?}");
+        assert!((gap[1] - gap[0]).abs_diff(250) <= 2, "{gap:?}");
+        assert_eq!(jb.concealments, 0);
     }
 
     #[test]
