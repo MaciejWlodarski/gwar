@@ -2639,13 +2639,16 @@ fn judge(w: &mut Watcher) {
                 w.failed = None;
             }
         }
-        Some(a) if w.egress.estimate() >= a.start && RETRY_STEP * (sent as f64) < a.start as f64 => {
-            if a.start < top(w, a.slot) {
-                if a.counted {
-                    w.retries = w.retries.saturating_sub(1);
-                }
-                w.untested = Some(a.start);
+        // One that already started at the share's whole start falls through to failed.
+        Some(a)
+            if w.egress.estimate() >= a.start
+                && RETRY_STEP * (sent as f64) < a.start as f64
+                && a.start < top(w, a.slot) =>
+        {
+            if a.counted {
+                w.retries = w.retries.saturating_sub(1);
             }
+            w.untested = Some(a.start);
         }
         Some(a) => {
             w.step = sent.min((a.start as f64 / RETRY_STEP) as u64);
@@ -2764,7 +2767,10 @@ fn climb(w: &mut Watcher, lanes: &[ShareRate], rates: &HashMap<String, ShareRate
         return false;
     }
     w.step = carried_step(sent(w), a.start);
+    // Carried in full, as a carried retry is: the strikes go, the cap at `failed` stays.
     w.retries = 1;
+    w.struck = None;
+    w.last_chance = false;
     start_at(w, target, rates, now);
     w.restarted = Some(now);
     w.attempt = Some(Attempt { start: w.egress.estimate(), ..a });

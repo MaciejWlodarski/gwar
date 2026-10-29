@@ -2114,6 +2114,43 @@ mod tests {
     }
 
     #[test]
+    fn a_retry_from_the_shares_whole_start_that_carried_next_to_nothing_strikes() {
+        let mut sim = Sim::new(None);
+        sim.join("game", 8_000_000, 60, 200_000, 12_000_000);
+        sim.run(2 * RAMP);
+        let w = &mut sim.w;
+        let start = top(w, 0);
+        // The estimate held at the start, but the link was not shown to carry it: with no
+        // higher start to test it from, it failed.
+        w.egress.set_estimate(start, sim.now);
+        for _ in 0..RETRY_STRIKES {
+            w.carried.clear();
+            w.attempt = Some(Attempt { slot: 0, start, counted: true });
+            judge(w);
+            assert_eq!(w.failed, Some(start));
+        }
+        assert!(stopped(w), "struck {:?}", w.struck);
+    }
+
+    #[test]
+    fn a_retry_that_climbs_in_place_clears_the_strikes_but_keeps_the_failed_cap() {
+        let mut sim = Sim::new(None);
+        sim.join("game", 8_000_000, 60, 200_000, 12_000_000);
+        sim.run(2 * RAMP);
+        let (w, now) = (&mut sim.w, sim.now);
+        let start = 1_000_000;
+        w.egress.set_estimate(start, now);
+        // The link carried the retry's start in full over its ramp; the share needs more.
+        w.carried = VecDeque::from([(now - RAMP, 0), (now, start * RAMP.as_secs() / 8)]);
+        w.started = Some(now - RAMP);
+        w.attempt = Some(Attempt { slot: 0, start, counted: true });
+        (w.struck, w.last_chance, w.failed) = (Some((2_000_000, RETRY_STRIKES - 1)), true, Some(4_000_000));
+        let lanes = [ShareRate { average: 8_000_000.0, ..ShareRate::default() }; SCREEN_SLOTS];
+        assert!(climb(w, &lanes, &HashMap::new(), now));
+        assert_eq!((w.struck, w.last_chance, w.failed), (None, false, Some(4_000_000)));
+    }
+
+    #[test]
     fn a_new_path_retries_a_stopped_viewer_no_sooner_than_the_spacing_since_its_last_start() {
         let mut sim = Sim::new(Some(2_000_000));
         sim.join("game", 8_000_000, 60, 200_000, 12_000_000);

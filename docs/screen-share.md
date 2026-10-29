@@ -2238,8 +2238,10 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   with a fresh ramp, and goes on as the retry in progress. The step is the
   one a retry after a carried pause would take, so the release grows by
   1.2 times per 10 s instead of per 30 s (its ramp and 5 s over `B`, then the
-  15 s spacing), and the slot keeps its media. It counts like a fresh retry:
-  one that the link then pushes back on fails at its pause as above. An
+  15 s spacing), and the slot keeps its media. The step it climbs from was
+  carried in full, so, like a carried retry, it clears the strikes. It counts
+  like a fresh retry: one that the link then pushes back on fails at its
+  pause as above. An
   estimator that grew on its own is not touched; one that fell has its answer.
   A climb never reaches the start of the last retry that failed, until media
   has flowed `RETRY_RESET` again: otherwise a frozen estimator on a link just
