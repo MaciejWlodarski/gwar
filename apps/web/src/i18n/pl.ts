@@ -489,6 +489,7 @@ export const pl: Record<Key, string> = {
   "screen.stopped.moderator": "{name} zatrzymuje Twoje udostępnianie ekranu.",
   "screen.stopped.limit": "Twoje udostępnianie zatrzymano: wysyłało więcej, niż pozwala serwer.",
   "screen.stopped.transport": "Nie udało się połączyć udostępniania ekranu.",
+  "screen.stopped.encoder": "Twoje udostępnianie zatrzymano: ta przeglądarka nie mogła zakodować obrazu.",
   "screen.stopped.budget": "Twoje udostępnianie zatrzymano: serwer nie ma już miejsca na udostępnienia.",
   "screen.cantDecode": "Twoja przeglądarka nie potrafi odkodować tego udostępnienia. Poproś udostępniającego o użycie zgodnej przeglądarki lub kodeka.",
   "screen.stopped.access": "Twoje udostępnianie zatrzymano: nie możesz już udostępniać na tym kanale.",

@@ -665,6 +665,97 @@ so an optimistic overshoot cannot accumulate a probe while GCC backs off. Probe
 generation fencing, retiring restores and the independent ten-second restore deadline
 remain in force.
 
+**First encoded frame.** A publish transport can connect (SDP and ICE both fine)
+while the engine never creates a video encoder, so `outbound-rtp.framesEncoded`
+stays 0. Known causes: GTK/WPE's VP9 encoder factory refusing an fmtp with
+extra keys (the start hint above; since #193 VP9 on GTK/WPE no longer gets it), a missing GStreamer encoder plugin such as
+x264 on older GstWebRTC builds, and any unknown platform quirk with
+`x-google-start-bitrate`. Nothing else
+notices it: the SFU's `try_recover` needs a viewer's last stream, which never
+exists without RTP; viewers wait `FIRST_FRAME_TIMEOUT_MS` (35 s) for
+`screen.watchFailed`; and the sharer keeps "sharing" nothing.
+
+The web publisher (`apps/web/src/voice/screen.ts`, `screen-first-frame.ts`)
+therefore waits `FIRST_ENCODE_TIMEOUT_MS` (5 s) from the transport's first
+`connected` state. That is once per transport: a reconnect does not restart the
+wait, and once a frame is seen the guard stays quiet for that transport. When the
+wait ends, it checks for any encoded frame. Chromium lists an outbound stream only
+once it sends, so a missing stream counts as no frame. An engine without
+`framesEncoded` proves progress by sent packets. A muted track (its source
+delivers nothing) or a transport that is not connected restarts the wait instead,
+and so does a failed stats read. An ended capture or a stopped share cancels it.
+
+No encoded frame is only a fault if the encoder had something to encode. A live,
+unmuted track can still deliver nothing: Windows (WGC) and macOS
+(ScreenCaptureKit) send no frames for a minimized shared window, and a macOS
+permission prompt can stall capture. So the guard also reads the capture's
+`media-source.frames` (the outbound stream's `mediaSourceId`, or before one
+exists the source with the track's `trackIdentifier`), counted from the start of
+each wait. If the source delivered no frame in the wait, the wait restarts from
+the current count. Only a source that delivered frames while nothing was encoded
+counts as a failure. This also covers static content: frames that all came
+before the transport connected do not count, and the guard waits for the next
+one. The web has no reliable way to ask display capture for a fresh frame
+(`requestFrame` exists only for canvas capture), so the guard waits instead of
+prodding the source; the window coming back or the content changing delivers the
+next frame. An engine that reports no source frame
+count is judged by encoded frames alone, as above.
+
+Without a frame, the publisher takes one step per expired wait. It takes each
+step at most once per share:
+
+1. If the answer got the start hint, it renegotiates without it. The publisher
+   remembers within the share (in memory, never stored) that the hint is unsafe,
+   so later transports of the share, including a server `screen.recover`, start
+   without it.
+2. It falls back to the plan's next codec: H.264 → VP9, or VP9 → H.264, and AV1 → H.264.
+   AV1 is never a fallback. The answer is restricted to that codec and its RTX.
+   The failed codec stays out of the share's later answers while another codec
+   is negotiated, and a failed AV1 retires AV1 for the share. When that changes
+   the codec the server's answer leads with (for example a server recovery to
+   H.264 after H.264 failed), the publisher logs `Screen sender: keeping vp9;
+   h264 encoded nothing earlier in this share`.
+3. It gives up with one `encodeFailed`. The controller stops the share and shows
+   "Your screen share was stopped: this browser could not encode the video."
+   Nothing rearms after that.
+
+An answer without the start hint (GTK/WPE answers that lead with VP9 or AV1)
+starts at step 2. Every step logs a
+`Screen sender: no frame encoded 5 s after connecting (codec …, start hint
+on|off); …` warning, which bug reports carry.
+
+Both steps renegotiate in place, on the same transport. The server negotiates a
+share's publish transport once and answers a different second offer with
+`conflict` unless the SFU asked for it with `screen.recover`, so the sender does
+not open a new transport. It makes a fresh local offer (same SSRCs, ICE and DTLS)
+and applies the server's own answer again, rewritten for the step. libwebrtc
+engines rebuild their encoder for the changed codec parameters. Whether
+WebKitGTK's older GstWebRTC backend rebuilds its encoder on a codec change during
+renegotiation is unverified. If it does not, the ladder there ends in the stop
+and its toast 10–15 s after connecting. A new
+offer whose video SSRCs changed is a failure, since the SFU drops RTP from any
+SSRC but the one it negotiated. The SFU already follows a codec change in place
+at the next keyframe (`switch_codec`, as for the AV1 → H.264 retirement). The cap
+is written again afterwards. With a source delivering frames, the whole ladder
+ends about 15 s after connecting, well before a viewer's 35 s first-frame
+deadline.
+
+*Why 5 s.* libwebrtc keeps the encoder paused (zero target rate) until the
+transport is writable, so the wait starts at connection. Capture warm-up (picker,
+constraints, `screen.start`, signalling) all comes before it. A source that
+delivers no frame (a muted track, a minimized window, static content after the
+pre-connection frames) holds the wait, so the 5 s only ever measures an encoder
+that had frames to encode. The startup validation measured what a slow start looks like
+(docs/screen-startup-validation.md, "Busy H.264 ramp"). The first GCC estimate came
+76–189 ms after the answer. Busy 1080p60 shares reached native size 1.1–3.5 s
+in, frames flowing well before that, even on a CPU-limited encoder: single-threaded
+OpenH264 needs 12–20 ms per busy 1080p frame and still encodes 46–50 fps on the
+4-vCPU runner. A first frame therefore arrives within about a second even when
+the encoder is CPU-bound. Five seconds covers a hardware encoder's setup and its
+fallback to software several times over, and leaves room for a slow first
+keyframe at 15 fps. It is short enough that the whole ladder ends before viewers
+give up.
+
 `pnpm --filter web e2e:screen-startup` checks repeated fresh real-tab publishes
 with a sparse 20 fps barcode and busy 1080p60 content, using VP9 and H.264. It
 checks rendered and captured cadence, outbound resolution and viewer decoding

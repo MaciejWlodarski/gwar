@@ -715,6 +715,9 @@ try {
   }
   if (engines.includes("webkit")) browsers.webkit = await webkit.launch({ headless: true });
   warnings = await run(browsers, web, ws, token);
+  // CI's encoders all work, so any first-frame guard step is a regression (docs/screen-share.md, "First encoded frame").
+  const guard = warnings.filter(w => /: Screen sender: (?:no frame encoded|keeping )/.test(w));
+  assert.deepEqual(guard, [], "the publisher's first-frame guard acted on a working encoder");
 } catch (error) {
   failure = error;
   for (const child of children) {

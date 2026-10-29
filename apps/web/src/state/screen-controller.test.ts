@@ -13,7 +13,7 @@ interface PublisherOptions {
   ended(): void;
   quality: ScreenSpec; legacy: boolean; automaticMode: boolean;
   surfaceChanged(surface: "screen" | "window" | "tab" | "unknown", spec: ScreenSpec): void;
-  offer(body: object): Promise<string>; state(s: string): void;
+  offer(body: object): Promise<string>; state(s: string): void; encodeFailed(): void;
 }
 
 const media = vi.hoisted(() => ({
@@ -587,6 +587,25 @@ describe("sharing", () => {
     choosing(); await screen.confirmShare();
     publisher.params.ended(); await flush();
     expect(useScreen.getState().own?.share).toBe("M");
+    await screen.stopShare();
+  });
+
+  it("stops a share whose encoder never produced a frame, with one toast, and ignores an old publisher", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String), t = choosing();
+    await screen.confirmShare();
+    const publisher = media.publishers[0]!;
+    publisher.params.encodeFailed(); await flush();
+    expect(useScreen.getState().own).toBeNull();
+    expect(t.stop).toHaveBeenCalledTimes(1);
+    expect(publisher.close).toHaveBeenCalledTimes(1);
+    expect(calls.filter(([op]) => op === "screen.stop")).toEqual([["screen.stop", { share: "M" }]]);
+    expect(toast).toHaveBeenCalledExactlyOnceWith("error", "Your screen share was stopped: this browser could not encode the video.");
+    choosing(); await screen.confirmShare();
+    publisher.params.encodeFailed(); await flush();
+    expect(useScreen.getState().own?.share).toBe("M");
+    expect(toast).toHaveBeenCalledTimes(1);
     await screen.stopShare();
   });
 

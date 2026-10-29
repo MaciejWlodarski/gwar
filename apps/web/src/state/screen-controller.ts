@@ -266,6 +266,11 @@ export class ScreenController {
         void this.stopShare();
         useUi.getState().toast("error", tNow("screen.stopped.transport"));
       },
+      encodeFailed: () => {
+        if (this.publisher !== publisher) return;
+        void this.stopShare();
+        useUi.getState().toast("error", tNow("screen.stopped.encoder"));
+      },
     });
     this.publisher = publisher;
     try {

@@ -300,6 +300,9 @@ answer unchanged as a compatibility exception; Chromium on Linux and native macO
 WKWebView still received every supported video codec's start hint. The investigation
 above narrows that exception to allow H.264 hints while keeping GTK's VP9/AV1
 parameters unchanged. The reserve rule is unchanged.
+A sender that still encodes nothing 5 s after connecting now renegotiates without
+the hint, then with the next codec, then stops the share (docs/screen-share.md,
+"First encoded frame").
 
 Voice latency, jitter, loss, concealment and mouth-to-ear percentiles were not
 measured in this browser ramp harness. Its shaper and synthetic media can demonstrate
