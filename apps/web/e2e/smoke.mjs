@@ -353,6 +353,7 @@ async function storePin(page, endpoint, pin) {
 
 async function serverFingerprint(page) {
   await page.getByRole("button", { name: /^(Server menu|Menu serwera)$/ }).click();
+  await page.getByRole("menuitem", { name: /^(Advanced|Zaawansowane)$/ }).hover();
   await page.getByRole("menuitem", { name: /^(Server key|Klucz serwera)$/ }).click();
   const key = page.getByTestId("server-fingerprint");
   const text = await key.innerText();
@@ -413,6 +414,10 @@ async function main() {
     await ctx.route("**/*", route => {
       const host = new URL(route.request().url()).hostname;
       return ["127.0.0.1", "localhost", "[::1]"].includes(host) ? route.continue() : route.abort();
+    });
+    await ctx.addInitScript(() => {
+      const key = "gwar.settings";
+      if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify({ version: 3, state: { onboarding: { completed: true, firstUsedAt: Date.now(), nudgeDismissed: true, roleReceived: false } } }));
     });
     await ctx.addInitScript(spy);
     return ctx;
@@ -562,6 +567,7 @@ async function main() {
   console.log("admin");
   await check("alice redeems the admin token", async () => {
     await a.getByRole("button", { name: "Server menu" }).click();
+    await a.getByRole("menuitem", { name: "Advanced", exact: true }).hover();
     await a.getByRole("menuitem", { name: "Redeem token" }).click();
     await a.getByLabel("Token", { exact: true }).fill(token);
     await a.getByRole("button", { name: "Redeem" }).click();

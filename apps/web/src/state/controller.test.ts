@@ -192,6 +192,14 @@ afterEach(async () => {
   await controller.disconnect(true);
 });
 
+it("refuses an expired device locally before opening a server connection", async () => {
+  const get = vi.spyOn(controller, "getIdentity").mockResolvedValue({ nickname: "Alex", publicKey: "key", device: { expires_at: 1 } } as unknown as import("../net/identity").Identity);
+  try {
+    await expect(controller.connect({ address: "ws://127.0.0.1:8799/ws" })).rejects.toMatchObject({ kind: "certificate_expired" });
+    expect(session().phase).toBe("idle");
+  } finally { get.mockRestore(); }
+});
+
 describe("staying on the server without voice", () => {
   it("does not start voice (or ask for the microphone) after connecting", async () => {
     connectFake();
@@ -601,6 +609,13 @@ describe("where a connection opens", () => {
 });
 
 describe("request errors", () => {
+  it("names a failed channel save and keeps raw bad-request diagnostics out of the main message", async () => {
+    const { RequestError } = await import("../net/connection");
+    const { describeRequestError } = await import("./controller");
+    const error = new RequestError("bad_request", "channel_id: malformed integer");
+    expect(describeRequestError(error, "err.channel.save")).toBe("Couldn’t save the channel. Check its settings and try again.");
+    expect(describeRequestError(error)).not.toContain("channel_id");
+  });
   it("say which part of a half-done change went through", async () => {
     const { RequestError } = await import("../net/connection");
     const { describeRequestError } = await import("./controller");

@@ -1,3 +1,4 @@
+import { exportIdentityBackup } from "../state/identity-backup";
 import { Bell, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, Settings as SettingsIcon, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { tNow, useT } from "../i18n";
@@ -473,14 +474,8 @@ function IdentityTab() {
   };
 
   const exportIdentity = async () => {
-    const id = await controller.getIdentity();
-    const blob = new Blob([JSON.stringify(id.exportBackup(), null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `voice-identity-${uid.slice(0, 8)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    try { await exportIdentityBackup(); }
+    catch { toast("error", t("identity.exportFailed")); }
   };
 
   const importIdentity = async (f: File | undefined) => {

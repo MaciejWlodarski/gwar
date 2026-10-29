@@ -15,6 +15,7 @@ import { Wordmark } from "./Brand";
 import { resolveIdentity } from "../connect/ts-list";
 import { useTsIdentities } from "./hooks";
 import { sameServer } from "../lib/server-key";
+import { FirstRun } from "./FirstRun";
 import { IdentityPicker } from "./IdentityPicker";
 
 /**
@@ -44,6 +45,8 @@ export function ConnectScreen({ card }: { card?: boolean }) {
   const closeReason = useSession((s) => s.closeReason);
   const openSettings = useUi((s) => s.openSettings);
   const account = useAccount((s) => s.account);
+  const loaded = useAccount((s) => s.loaded);
+  const onboarding = useSettings((s) => s.onboarding);
   const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "gwar");
   const [address, setAddress] = useState(invite?.server ? addressLabel(invite.server, pageContextFromLocation()) : lastAddress);
   const [password, setPassword] = useState("");
@@ -95,32 +98,34 @@ export function ConnectScreen({ card }: { card?: boolean }) {
     setAddress(value);
   };
 
-  const submit = (e: FormEvent) => {
-    e.preventDefault();
+  const connect = (publicServer = false) => {
     if (busy) return;
     void controller.connectInteractive(
       {
-        kind,
-        address,
-        password,
-        invite: kind === "gwar" ? invite?.code : undefined,
-        inviteServerKey: kind === "gwar" ? invite?.serverKey : undefined,
-        inviteOwner: kind === "gwar" ? invite?.owner : undefined,
-        insecureLan: desktop && kind === "gwar" && insecureLan,
-        identity: pickIdentity ? (resolveIdentity(tsList, identity) ?? undefined) : undefined,
+        kind: publicServer ? "gwar" : kind,
+        address: publicServer ? "gwar.app" : address,
+        password: publicServer ? "" : password,
+        invite: !publicServer && kind === "gwar" ? invite?.code : undefined,
+        inviteServerKey: !publicServer && kind === "gwar" ? invite?.serverKey : undefined,
+        inviteOwner: !publicServer && kind === "gwar" ? invite?.owner : undefined,
+        insecureLan: !publicServer && desktop && kind === "gwar" && insecureLan,
+        identity: !publicServer && pickIdentity ? (resolveIdentity(tsList, identity) ?? undefined) : undefined,
       },
       { remember },
     );
   };
 
+  const submit = (event: FormEvent) => { event.preventDefault(); connect(); };
   const notice = closeNotice(closeReason, t);
+  if (!loaded) return <main aria-busy="true" className="flex flex-1 items-center justify-center bg-surface text-sm text-muted">{t("common.loading")}</main>;
+  if (onboarding && !onboarding.completed && !account) return <FirstRun />;
 
   return (
     <main className={cn("relative flex min-w-0 flex-1 flex-col items-center overflow-y-auto bg-surface", card && panelCard)}>
       <div className="flex w-full flex-1 flex-col items-center justify-center gap-6 px-4 py-8">
         <form
           onSubmit={submit}
-          className="anim-pop flex w-full max-w-sm flex-col gap-4 rounded-2xl border border-line bg-side p-6 shadow-pop"
+          className="anim-pop flex w-full max-w-sm flex-col gap-4 rounded-2xl border border-line bg-side p-6"
         >
           <div className="flex flex-col items-center gap-2 pb-1 text-center">
             <Wordmark className="mb-2 h-10 w-auto text-fg" />
@@ -150,19 +155,6 @@ export function ConnectScreen({ card }: { card?: boolean }) {
               <span>{notice}</span>
             </div>
           )}
-
-          <div className="flex flex-col gap-1.5">
-            <Segmented<ServerKind>
-              label={t("connect.kind")}
-              value={kind}
-              onChange={setKind}
-              options={[
-                { value: "gwar", label: t("connect.kindVc") },
-                { value: "teamspeak", label: t("connect.kindTs"), disabled: !desktop, title: desktop ? undefined : t("connect.tsWebOnly") },
-              ]}
-            />
-            {!desktop && <p className="text-xs text-subtle">{t("connect.tsWebOnly")}</p>}
-          </div>
 
           <Field label={t("connect.address")} hint={kind === "teamspeak" ? t("connect.tsAddressHint") : t("connect.addressHint")}>
             {(id) => (
@@ -207,10 +199,28 @@ export function ConnectScreen({ card }: { card?: boolean }) {
 
           {pickIdentity && <IdentityPicker list={tsList} value={identity} onChange={setIdentity} />}
 
-          {desktop && kind === "gwar" && <div className="flex flex-col gap-2">
-            <Switch checked={insecureLan} onCheckedChange={setInsecureLan} label={t("security.insecureLan")} />
-            {insecureLan && <p role="alert" className="text-sm text-danger">{t("security.insecureWarning")}</p>}
-          </div>}
+          <details className="rounded-lg border border-line px-3 py-2" open={kind === "teamspeak" || insecureLan || undefined}>
+            <summary className="cursor-pointer text-sm text-muted">{t("common.advanced")}</summary>
+            <div className="mt-3 flex flex-col gap-3">
+              <div className="flex flex-col gap-1.5">
+                <Segmented<ServerKind>
+                  label={t("connect.kind")}
+                  value={kind}
+                  onChange={setKind}
+                  options={[
+                    { value: "gwar", label: t("connect.kindVc") },
+                    { value: "teamspeak", label: t("connect.kindTs"), disabled: !desktop, title: desktop ? undefined : t("connect.tsWebOnly") },
+                  ]}
+                />
+                {!desktop && <p className="text-xs text-subtle">{t("connect.tsWebOnly")}</p>}
+              </div>
+
+              {desktop && kind === "gwar" && <div className="flex flex-col gap-2">
+                <Switch checked={insecureLan} onCheckedChange={setInsecureLan} label={t("security.insecureLan")} />
+                {insecureLan && <p role="alert" className="text-sm text-danger">{t("security.insecureWarning")}</p>}
+              </div>}
+            </div>
+          </details>
           <Switch checked={remember} onCheckedChange={setRemember} label={t("connect.remember")} />
 
           {error && (
@@ -223,11 +233,12 @@ export function ConnectScreen({ card }: { card?: boolean }) {
           <Button type="submit" variant="primary" busy={busy} className="w-full">
             {busy ? t("connect.connecting") : t("connect.submit")}
           </Button>
+          {!invite && <Button type="button" disabled={busy} onClick={() => connect(true)} className="h-auto min-h-11 w-full py-2 whitespace-normal text-center">{t("connect.publicServer")}</Button>}
         </form>
 
         <button
           type="button"
-          onClick={() => openSettings("account")}
+          onClick={() => { useUi.setState({ accountEntry: "signin" }); openSettings("account"); }}
           className="t -mt-2 flex w-full max-w-sm cursor-pointer items-center gap-3 rounded-lg border border-line px-3 py-2 text-left hover:bg-hover"
         >
           <CloudCog className="size-4 shrink-0 text-muted" />

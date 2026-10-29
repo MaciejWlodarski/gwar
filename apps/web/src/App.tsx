@@ -25,6 +25,7 @@ import { SettingsSection } from "./ui/Settings";
 import { SharePresetDialog, SharingBar, Stage } from "./ui/Screen";
 import { useScreen } from "./state/screen";
 import { Sidebar } from "./ui/Sidebar";
+import { IdentityNotices } from "./ui/IdentityNotices";
 import { Toaster } from "./ui/Toaster";
 
 export function App() {
@@ -68,6 +69,7 @@ export function App() {
     <TooltipProvider>
       <div className="flex h-dvh w-full flex-col overflow-hidden bg-rail">
         <ConnectionWarning phase={phase} insecure={insecureConnection} />
+        <IdentityNotices />
         {showApp && <SharingBar />}
         <div className="flex min-h-0 w-full flex-1 overflow-hidden">
           {!isMobile && <SectionRail />}

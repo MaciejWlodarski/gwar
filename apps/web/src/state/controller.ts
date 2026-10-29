@@ -144,12 +144,13 @@ function platform(): "web" | "desktop" {
 }
 
 /** Human-readable text for a failed request. */
-export function describeRequestError(e: unknown): string {
+export function describeRequestError(e: unknown, action?: Key): string {
   if (e instanceof RequestError) {
     const key = `err.req.${e.code}` as Key;
-    const base = tNow(key);
-    // These say more than the code: what was malformed, what clashed, which part went through.
-    return e.code === "bad_request" || e.code === "conflict" || e.code === "partial" ? `${base} (${e.message})` : base;
+    const base = tNow(e.code === "bad_request" ? action ?? key : key);
+    if (e.code === "bad_request") return base;
+    // Conflict/partial replies explain which part of the operation went through.
+    return e.code === "conflict" || e.code === "partial" ? `${base} (${e.message})` : base;
   }
   if (e instanceof RequestTimeoutError) return tNow("err.req.timeout");
   if (e instanceof ConnectionLostError) return tNow("err.req.lost");
@@ -258,11 +259,18 @@ class Controller {
     e.on("state", (state) => {
       useVoice.getState().set({ state });
       if (state === "failed") this.scheduleVoiceRetry();
-      if (state === "connected") this.voiceRetries = 0;
+      if (state === "connected") {
+        this.voiceRetries = 0;
+        useUi.getState().dismissToast("voice-closed");
+      }
     });
     e.on("micError", (micError) => useVoice.getState().set({ micError }));
     e.on("outputError", (error) => {
-      if (error) useUi.getState().toast("error", describeVoiceError(error));
+      if (error) useUi.getState().toast("error", describeVoiceError(error), {
+        key: "voice-output", sticky: true,
+        action: { label: tNow("settings.audio"), run: () => useUi.getState().openSettings("audio") },
+      });
+      else useUi.getState().dismissToast("voice-output");
     });
     e.on("devices", (devices) => useVoice.getState().set({ devices }));
     void e.listDevices().then((devices) => useVoice.getState().set({ devices }));
@@ -438,6 +446,10 @@ class Controller {
         throw new ConnectFailure(identityFailure(e), e instanceof Error ? e.message : String(e));
       }
 
+      if (identity.device && identity.device.expires_at <= Date.now()) {
+        session.dispatch({ type: "phase", phase: "idle" });
+        throw new ConnectFailure("certificate_expired", tNow("account.signInExpired"));
+      }
       conn = new Connection({
         url: parsed.value.url,
         identity,
@@ -691,7 +703,7 @@ class Controller {
         const b = state.me === null ? null : state.clients[state.me.session]?.voice_binding;
         return b && b.call === event.d.call && b.participation === event.d.participation && b.run === event.d.run;
       })()) {
-        useUi.getState().toast("info", tNow("voice.closed"));
+        useUi.getState().toast("info", tNow("voice.closed"), { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
         if (event.d.reason === "transport_failed") this.scheduleVoiceRetry(1000);
         else void this.stopVoice();
       }
@@ -754,6 +766,9 @@ class Controller {
     this.conn = null;
     conn?.close();
     await this.teardown();
+    useUi.getState().dismissToast("voice-closed");
+    useUi.getState().dismissToast("voice-output");
+    useUi.getState().dismissToast("screen-stopped");
     if (!silent) useSession.getState().setClose({ kind: "user" });
   }
 
@@ -974,7 +989,7 @@ class Controller {
     if (!this.canLeaveVoice || myChannelId(useSession.getState()) === null) return;
     const ok = await this.attempt(this.connection.request("channel.leave", {}));
     // The server's client.updated follows; do not wait for it to release the microphone.
-    if (ok) await this.stopVoice();
+    if (ok) { await this.stopVoice(); useUi.getState().dismissToast("voice-closed"); }
   }
 
   private async rejoinVoice(channel: number): Promise<void> {

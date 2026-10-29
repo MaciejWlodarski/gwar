@@ -1,3 +1,4 @@
+import { readOnboarding, type Onboarding } from "../lib/onboarding";
 import { defaultQuality, migrateQuality, type QualitySettings } from "../voice/screen-quality";
 import { serverKey } from "../lib/server-key";
 import { useMemo } from "react";
@@ -254,6 +255,8 @@ export interface NotificationSettings {
 }
 
 export interface SettingsState extends QualitySettings {
+  onboarding: Onboarding | null;
+  setOnboarding(patch: Partial<Onboarding>): void;
   theme: Theme;
   language: Language;
   compact: boolean;
@@ -343,6 +346,8 @@ export const useSettings = create<SettingsState>()(
     (set) => ({
       ...defaultQuality,
       setScreenQuality: (patch) => set(patch),
+      onboarding: null,
+      setOnboarding: (patch) => set((s) => ({ onboarding: { completed: false, firstUsedAt: Date.now(), nudgeDismissed: false, roleReceived: false, ...s.onboarding, ...patch } })),
       theme: "system",
       language: detectLanguage(),
       compact: false,
@@ -478,10 +483,10 @@ export const useSettings = create<SettingsState>()(
       version: SETTINGS_VERSION,
       // zustand's default storage (`window.localStorage`), guarded.
       storage: createJSONStorage(() => guardedLocalStorage(window.localStorage)),
-      migrate: (persisted) => migrateQuality((persisted ?? {}) as Record<string, unknown>),
+      migrate: (persisted) => ({ ...migrateQuality((persisted ?? {}) as Record<string, unknown>), onboarding: readOnboarding((persisted as Partial<SettingsState> | null)?.onboarding) }),
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
-        return { ...current, ...p, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
+        return { ...current, ...p, onboarding: readOnboarding(p.onboarding), audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,

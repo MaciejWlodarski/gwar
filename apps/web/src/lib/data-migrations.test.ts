@@ -148,6 +148,10 @@ const RECORD_FIXTURES: Record<keyof typeof RECORDS, Record<number, { stored: Rec
 };
 /** The settings (localStorage) per version, and a check of the settings store after loading them. */
 const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: string; bookmarks: unknown[] }): void }> = {
+  3: {
+    stored: { state: { theme: "dark", bookmarks: [], onboarding: { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true } }, version: 3 },
+    check: state => expect(state).toMatchObject({ theme: "dark", onboarding: { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true } }),
+  },
   2: {
     stored: { state: { theme: "dark", bookmarks: [], screenMode: "sharp", screenHeight: 1440, screenFps: 60 }, version: 2 },
     check: state => { expect(state).toMatchObject({ theme: "dark", screenMode: "sharp", screenHeight: 1440, screenFps: 60 }); },

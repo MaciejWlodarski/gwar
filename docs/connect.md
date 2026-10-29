@@ -162,6 +162,18 @@ All signatures are Ed25519 over the UTF-8 text, fields separated by `\n`:
   five-minute clock allowance without loosening historical or revocation checks.
 - **Revocation**, by the account key: `gwar revoke v1\n{account_key}\n{device_key}\n{revoked_at}`.
 
+### Device sign-in reminder
+
+The shared web/desktop UI shows a persistent banner from 14 days before expiry,
+after the startup check for a previously saved renewal finishes. It says how many
+days remain before this device needs the password again. The action opens a
+password dialog directly, without making the person find account settings. At
+expiry the banner explains that entering the password restores server access;
+a first connection with an already expired certificate is refused locally.
+Successful renewal updates the identity and removes the banner. Time passing,
+returning to the window and account changes update the notice. No password or
+renewal capability is kept by this UI change.
+
 ### Session and credential challenges
 
 `service_key` is the Ed25519 public key returned by the configured service's
