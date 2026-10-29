@@ -803,6 +803,8 @@ class Controller {
 
   private async teardown(): Promise<void> {
     this.resetNativeUplink();
+    // The details describe this connection; after it ends they would show stale or empty numbers.
+    useUplink.setState({ details: false });
     // Approvals and prompts of the manager list belong to one connection to one server.
     this.grantedByMe.clear(); this.askedManagers.clear(); this.lastRenewal = 0;
     // A newer connect may finish its own teardown and start while this one

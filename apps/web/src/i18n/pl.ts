@@ -415,7 +415,7 @@ export const pl: Record<Key, string> = {
   "voice.pill": "Połączenie głosowe",
   "voice.pillOpen": "Przejdź do kanału głosowego",
   "voice.quality.good": "Dobre połączenie",
-  "voice.quality.fair": "Słabsze połączenie",
+  "voice.quality.fair": "Średnie połączenie",
   "voice.quality.poor": "Słabe połączenie",
   "voice.quality.upload": "Wysyłanie nie nadąża",
   "voice.quality.open": "{quality} · {ms} ms. Pokaż szczegóły",

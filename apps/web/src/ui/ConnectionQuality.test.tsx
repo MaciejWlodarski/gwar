@@ -9,6 +9,7 @@ import { useSettings } from "../state/settings";
 import { useSession, useUi, useVoice } from "../state/stores";
 import { connectionQuality, EPISODE_MERGE_MS, resetCongestionEpisodes, useUplink } from "../state/uplink";
 import { ConnectionDetails, NOTICE_MS } from "./ConnectionQuality";
+import { QUALITY_IMPROVE_MS } from "./hooks";
 import { SharingBar } from "./Screen";
 import { Toaster } from "./Toaster";
 import { VoicePanel, VoicePill } from "./VoicePanel";
@@ -46,10 +47,13 @@ describe("connectionQuality", () => {
   it("colours from what is measured now, never from the detector's floor", () => {
     expect(connectionQuality(null, null, null)).toBeNull();
     expect(connectionQuality(40, null, null)?.quality).toBe("good");
-    expect(connectionQuality(120, null, null)?.quality).toBe("fair");
-    expect(connectionQuality(250, null, null)?.quality).toBe("poor");
+    // A far server alone is not flagged: a conversation stays natural up to ~150 ms one way.
+    expect(connectionQuality(120, null, null)?.quality).toBe("good");
+    expect(connectionQuality(150, null, null)?.quality).toBe("fair");
+    expect(connectionQuality(250, null, null)?.quality).toBe("fair");
+    expect(connectionQuality(300, null, null)?.quality).toBe("poor");
     // Media RTT is fresher than the server ping; the worse transport counts.
-    expect(connectionQuality(20, healthy, { ...healthy, rttMs: 230 })).toMatchObject({ quality: "poor", rttMs: 230 });
+    expect(connectionQuality(20, healthy, { ...healthy, rttMs: 330 })).toMatchObject({ quality: "poor", rttMs: 330 });
     // A floor the detector adopted (no verdict) still shows a bloated RTT as poor.
     expect(connectionQuality(480, { ...bloated, congested: false, baselineMs: 470 }, null)?.quality).toBe("poor");
     // A detected queue is never good, even below the RTT thresholds.
@@ -73,6 +77,7 @@ it("shows the panel indicator always, coloured by quality, and the voice status 
 });
 
 it("adds the indicator to the pill only while the connection is not good", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   useScreen.setState({ ...initialScreen });
   useUi.setState({ section: "home" });
   await render(<VoicePill />);
@@ -80,10 +85,18 @@ it("adds the indicator to the pill only while the connection is not good", async
   await set({ voice: bloated });
   expect(indicator()?.dataset.quality).toBe("poor");
   await set({ voice: healthy });
+  // A better colour waits until it has held, so a threshold does not make the pill flicker.
+  expect(indicator()?.dataset.quality).toBe("poor");
+  await set({ voice: bloated });
+  await set({ voice: healthy });
+  await act(async () => vi.advanceTimersByTime(QUALITY_IMPROVE_MS - 1));
+  expect(indicator()?.dataset.quality).toBe("poor");
+  await act(async () => vi.advanceTimersByTime(1));
   expect(indicator()).toBeNull();
 });
 
 it("replaces the generic sender reason in the sharing bar while congested, then restores it", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   await render(<SharingBar />);
   expect(container.textContent).toContain("Ograniczone przez łącze");
   expect(indicator()).toBeNull();
@@ -92,6 +105,7 @@ it("replaces the generic sender reason in the sharing bar while congested, then 
   expect(indicator()?.getAttribute("aria-live")).toBe("off");
   expect(container.textContent).not.toContain("Ograniczone przez łącze");
   await set({ screen: healthy });
+  await act(async () => vi.advanceTimersByTime(QUALITY_IMPROVE_MS));
   expect(container.textContent).toContain("Ograniczone przez łącze");
   expect(indicator()).toBeNull();
 });
@@ -169,6 +183,22 @@ describe("the congestion notice", () => {
     await set({ voice: bloated });
     expect(notice()).not.toBeNull();
     await set({ voice: healthy });
+    expect(notice()).toBeNull();
+  });
+
+  it("still collapses in the next episode after one was closed while hovered", async () => {
+    await render(<Toaster />);
+    await set({ voice: bloated });
+    // A touch or hover, then a close: the removed notice never gets its pointerleave.
+    await act(async () => notice()!.dispatchEvent(new Event("pointerover", { bubbles: true })));
+    await act(async () => notice()!.dispatchEvent(new Event("focusin", { bubbles: true })));
+    await act(async () => notice()!.querySelector<HTMLButtonElement>('button[aria-label="Zamknij"]')!.click());
+    expect(notice()).toBeNull();
+    await set({ voice: null });
+    await act(async () => vi.advanceTimersByTime(EPISODE_MERGE_MS));
+    await set({ voice: bloated });
+    expect(notice()).not.toBeNull();
+    await act(async () => vi.advanceTimersByTime(NOTICE_MS));
     expect(notice()).toBeNull();
   });
 

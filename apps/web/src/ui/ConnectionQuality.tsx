@@ -94,7 +94,10 @@ export function CongestionNotice() {
   const t = useT();
   const lang = useLanguage();
   const notice = useUplink(s => s.notice);
-  const [held, setHeld] = useState(false);
+  // Held per episode: a notice closed while hovered or touched never fires its pointerleave, and
+  // the next episode must still collapse on its own.
+  const [heldEpisode, setHeldEpisode] = useState<number | null>(null);
+  const held = !!notice && heldEpisode === notice.episode;
   useEffect(() => {
     if (!notice || held) return;
     const timer = setTimeout(dismissCongestionNotice, NOTICE_MS);
@@ -105,10 +108,10 @@ export function CongestionNotice() {
     <div
       role="status"
       data-testid="congestion-notice"
-      onPointerEnter={() => setHeld(true)}
-      onPointerLeave={() => setHeld(false)}
-      onFocus={() => setHeld(true)}
-      onBlur={() => setHeld(false)}
+      onPointerEnter={() => setHeldEpisode(notice.episode)}
+      onPointerLeave={() => setHeldEpisode(null)}
+      onFocus={() => setHeldEpisode(notice.episode)}
+      onBlur={() => setHeldEpisode(null)}
       className="anim-toast pointer-events-auto flex w-full max-w-sm items-start gap-2.5 rounded-lg border border-line-strong bg-raised py-2.5 pr-2 pl-3 text-sm shadow-pop"
     >
       <TriangleAlert aria-hidden className="mt-0.5 size-4 shrink-0 text-warn" />

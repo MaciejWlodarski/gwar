@@ -35,8 +35,11 @@ export interface ConnectionQuality {
   availableOutgoingBitrate: number | null;
 }
 
-/** The thresholds the round-trip signal bars always used; loss in percent of what we send. */
-const RTT_FAIR = 100, RTT_POOR = 200, LOSS_FAIR = 3, LOSS_POOR = 10;
+/**
+ * Round trip: a conversation stays natural up to ~150 ms one way (ITU-T G.114), so a far server
+ * at 120 ms is not "fair"; loss in percent of what we send.
+ */
+const RTT_FAIR = 150, RTT_POOR = 300, LOSS_FAIR = 3, LOSS_POOR = 10;
 /** Queueing delay others notice as a lag in conversation. */
 const ADDED_POOR = 250;
 
