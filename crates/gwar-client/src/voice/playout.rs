@@ -258,6 +258,18 @@ impl Slot {
                         n -= removed;
                         let skip = if !onset && quiet { skip.min(QUIET_SKIP).min(n) } else { 0 };
                         self.buffer.shrunk(now, removed + skip);
+                        // A due backlog cut waits for a quiet frame (or `BACKLOG_WAIT`); the
+                        // decoder runs through the cut audio, so the next packet continues
+                        // its state rather than the dropped stream's.
+                        let cut = self.buffer.cut_backlog(now, quiet);
+                        if !cut.is_empty() {
+                            let mut discard = [0.0; 5760];
+                            for data in cut {
+                                let input = Packet::try_from(data.as_slice()).ok();
+                                let output = MutSignals::try_from(&mut discard[..])?;
+                                self.decoder.decode_float(input, output, false).unwrap_or(0);
+                            }
+                        }
                         (n, skip, fade)
                     }
                     Playout::Conceal(samples) => {
@@ -485,6 +497,47 @@ mod tests {
             slot.mix_into(&mut actual, 1.0, now + Duration::from_millis(delay)).unwrap();
             assert_eq!(actual.as_slice(), expected);
             assert_eq!(slot.buffer.shrink_samples, 0);
+        }
+    }
+
+    #[test]
+    fn a_backlog_cut_waits_for_a_quiet_frame_within_its_cap() {
+        use super::super::jitter::Clock;
+        // 300 ms of backlog in steady speech; with `quiet` a pause of three frames starts at
+        // 5.6 s, after the window has proven the surplus (5 s) and before the 2 s cap.
+        for quiet in [Some(280), None] {
+            let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+            let mut slot = Slot::new().unwrap();
+            let start = Instant::now();
+            let frame = |i: u64| encode(&encoder, quiet.is_none_or(|q| !(q..q + 3).contains(&i)));
+            for i in 0..15 {
+                slot.buffer.push_at(i * 960, 960, frame(i), start, Clock::Rtp);
+            }
+            let mut cut = None;
+            for refill in 0..500u64 {
+                let now = start + Duration::from_millis(refill * 20);
+                let i = refill + 15;
+                slot.buffer.push_at(i * 960, 960, frame(i), now, Clock::Rtp);
+                let before = slot.buffer.depth().1;
+                slot.mix_into(&mut [0.0; 960], 1.0, now).unwrap();
+                if slot.buffer.depth().1 + 960 * 5 < before {
+                    let level = level_db(&slot.decoded[..slot.end]);
+                    cut = Some((refill, level));
+                    break;
+                }
+            }
+            let (refill, level) = cut.expect("no backlog cut");
+            match quiet {
+                Some(q) => {
+                    assert!((q..q + 3).contains(&refill), "cut at refill {refill}, quiet from {q}");
+                    assert!(level < -42.0, "cut after a {level:.1} dB frame");
+                }
+                // Without a quiet frame the cut waits its 2 s cap, then goes ahead.
+                None => assert!((350..=360).contains(&refill), "forced cut at refill {refill}"),
+            }
+            // About 40 ms of the surplus stays, beyond the refill and the jitter target.
+            assert!(slot.buffer.depth().1 <= 960 * 5, "{} samples kept", slot.buffer.depth().1);
+            assert_eq!(slot.buffer.concealments, 0);
         }
     }
 
