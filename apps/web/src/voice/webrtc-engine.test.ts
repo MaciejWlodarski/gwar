@@ -912,6 +912,26 @@ describe("local microphone preview", () => {
     expect(getUserMedia).toHaveBeenCalledTimes(2); // In-call UI uses the call meter.
   });
 
+  it("serializes replacement capture behind a pending acquisition and skips cancelled queued starts", async () => {
+    const pending = deferred<MediaStream>(), mic = microphone(), cancelled = new AbortController();
+    getUserMedia.mockReturnValueOnce(pending.promise);
+    const old = engine.startMicTest(vi.fn());
+    await flush();
+    const obsolete = engine.startMicTest(vi.fn(), cancelled.signal);
+    await flush();
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    cancelled.abort();
+    const replacement = engine.startMicTest(vi.fn());
+    await flush();
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    pending.resolve(mic.stream);
+    await old; await obsolete;
+    const stop = await replacement;
+    expect(getUserMedia).toHaveBeenCalledTimes(2);
+    expect(mic.track.stop.mock.invocationCallOrder[0]).toBeLessThan(getUserMedia.mock.invocationCallOrder[1]!);
+    stop();
+  });
+
   it("closes capture if the preview graph fails to initialize", async () => {
     const mic = microphone(); getUserMedia.mockResolvedValue(mic.stream);
     mediaSource.mockImplementationOnce(() => { throw new Error("graph failed"); });
@@ -926,5 +946,54 @@ describe("local microphone preview", () => {
     expect(mic.track.stop).toHaveBeenCalledOnce();
     await engine.startMicTest(vi.fn());
     expect(getUserMedia).toHaveBeenCalledOnce();
+  });
+});
+
+
+describe("live server input gate control", () => {
+  it("only bypasses legacy automatic detection after the matching mode acknowledgement", async () => {
+    const inputGate = vi.fn(async (_client: boolean, _run: number) => {});
+    await engine.start({ ...params(vi.fn(async () => "a=x-gwar-input-gate:2\r\n")), inputGate });
+    await flush();
+    expect(inputGate).toHaveBeenLastCalledWith(false, expect.any(Number));
+    const run = inputGate.mock.calls[0]![1];
+    const ack = deferred<void>(); inputGate.mockReturnValueOnce(ack.promise);
+    engine.setInputSensitivity(-80);
+    await flush();
+    expect(inputGate).toHaveBeenLastCalledWith(true, run);
+    expect(gate().configure).toHaveBeenLastCalledWith(expect.objectContaining({ blocked: true }));
+    ack.resolve(); await flush();
+    expect(gate().configure).toHaveBeenLastCalledWith(expect.objectContaining({ automatic: false, blocked: false }));
+    engine.setInputSensitivity(null); await flush();
+    expect(inputGate).toHaveBeenLastCalledWith(false, run);
+    expect(gate().configure).toHaveBeenLastCalledWith(expect.objectContaining({ automatic: true, blocked: false }));
+    engine.setInputMode("ptt"); await flush();
+    expect(inputGate).toHaveBeenLastCalledWith(true, run);
+    engine.setInputMode("vad"); await flush();
+    expect(inputGate).toHaveBeenLastCalledWith(false, run);
+  });
+
+  it("keeps rapid mode changes closed until the newest acknowledgement and ignores retired runs", async () => {
+    const inputGate = vi.fn(async (_client: boolean, _run: number) => {});
+    await engine.start({ ...params(vi.fn(async () => "a=x-gwar-input-gate:2\r\n")), inputGate });
+    await flush();
+    const ack = deferred<void>(); inputGate.mockReturnValueOnce(ack.promise);
+    engine.setInputSensitivity(-80); await flush();
+    engine.setInputSensitivity(null);
+    engine.setInputSensitivity(-80);
+    expect(gate().configure).toHaveBeenLastCalledWith(expect.objectContaining({ blocked: true }));
+    const latest = deferred<void>(); inputGate.mockReturnValueOnce(latest.promise);
+    ack.resolve(); await flush();
+    expect(gate().configure).toHaveBeenLastCalledWith(expect.objectContaining({ blocked: true }));
+    await engine.stop();
+    latest.resolve(); await flush();
+    expect(Peer.all[0]!.close).toHaveBeenCalled();
+  });
+
+  it("uses the legacy server gate without sending an unknown request to older servers", async () => {
+    const inputGate = vi.fn(async () => {});
+    await engine.start({ ...params(), inputGate });
+    engine.setInputSensitivity(-80); await flush();
+    expect(inputGate).not.toHaveBeenCalled();
   });
 });

@@ -1172,6 +1172,11 @@ class Controller {
       await this.engine.start({
         iceServers, mode: encrypted ? "encrypted" : "plaintext", binding, keys,
         serverHost: this.serverHost(),
+        inputGate: async (client_gate, run) => {
+          if (!current()) throw new Error("Stale voice participation");
+          await conn.request("voice.input_gate", { binding: { call: participation!.call, participation: participation!.participation, run }, client_gate });
+          if (!current()) throw new Error("Stale voice participation");
+        },
         // On TeamSpeak servers the native engine sends frames over the TS connection and never asks for an offer.
         offer: async (sdp, run) => {
           if (!current()) throw new Error("Stale voice participation");

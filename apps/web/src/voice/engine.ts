@@ -92,6 +92,8 @@ export interface VoiceEngine {
    */
   start(params: {
     offer: OfferFn;
+    /** Optional server capability: change this run's input gate and await application. */
+    inputGate?: (clientGate: boolean, run: number) => Promise<void>;
     mode: "plaintext" | "encrypted";
     binding: VoiceStartBinding;
     /** Required in encrypted mode; there is never a plaintext fallback. */
@@ -108,7 +110,7 @@ export interface VoiceEngine {
   setMuted(muted: boolean): void;
   setDeafened(deafened: boolean): void;
   setInputMode(mode: InputMode): void;
-  /** null: automatic (the default -50 dB gate); otherwise a threshold in dBFS. */
+  /** null: the legacy automatic decision; otherwise a threshold in dBFS. */
   setInputSensitivity(threshold: number | null): void;
   /** Push-to-talk key state; only matters in `ptt` mode. */
   setPttActive(active: boolean): void;

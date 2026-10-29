@@ -314,16 +314,23 @@ preserves devices, input mode, processing and unrelated preferences. Reads and
 updates validate the new fields: thresholds are finite numbers clamped to
 −100…0 dBFS (invalid values use −50), and invalid automatic flags use `true`.
 
-The browser gate runs on the audio thread, before encoding, with a 300 ms voice
-tail. Automatic mode measures the processed audio, where the legacy browser
-gate ran on the server, so gain can lift a quiet voice and suppressed noise stays
-quiet. Manual mode measures capture before Gwar's suppression, matching the
-microphone test and native sensitivity meter. PTT bypasses the threshold and stops on release; mute/deafen override both
-modes. New browser and desktop offers include the optional SDP attribute
-`a=x-gwar-input-gate:1`. The server then filters digital silence rather than
-applying its legacy −50 dB gate a second time. Offers without the attribute keep
-the legacy gate, and older servers can ignore the SDP attribute. Quiet manual
-thresholds need an updated server to avoid its old second gate.
+The manual browser gate runs on the audio thread before encoding, with a 300 ms
+voice tail, and measures capture before Gwar suppression on the meter's dB scale.
+Automatic mode leaves the exact legacy decision on the server: RFC 6464 level at
+least -50 dBov, or -60 dBov with the browser's voice-activity bit, and the original
+400 ms tail. The browser worklet cannot infer that bit from PCM, so it passes
+automatic audio through. PTT bypasses the gate; mute/deafen override both modes.
+
+Browser offers use the optional SDP attribute `a=x-gwar-input-gate:2`. An updated
+server echoes it and supports `voice.input_gate {binding, client_gate}`: only the
+matching call/participation/run can change the gate, and the reply waits until
+media applies it. Manual/PTT enable client gating (the server filters digital
+silence); automatic restores the legacy rule and discards manual's speech tail.
+The browser closes its output until the newest mode change is acknowledged.
+Older servers ignore the attribute, keep their legacy gate, and receive no new
+control requests. Quiet manual thresholds then need a server upgrade. Native
+offers retain `a=x-gwar-input-gate:1` and the native VAD marker described above;
+offers without either attribute retain the legacy decision.
 
 The Audio settings sensitivity section has a local live preview in voice-activation
 mode. During voice it reuses the call's meter. Outside voice it captures only while

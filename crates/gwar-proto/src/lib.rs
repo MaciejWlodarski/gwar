@@ -265,6 +265,9 @@ wire! {
         ManagersUpdate { anchor: String, list: String },
         #[serde(rename = "voice.offer")]
         VoiceOffer(VoiceOffer),
+        /// Live sensitivity choice, acknowledged after the matching media run applies it.
+        #[serde(rename = "voice.input_gate")]
+        VoiceInputGate { binding: VoiceTransportBinding, client_gate: bool },
         #[serde(rename = "voice.state")]
         VoiceState {},
         #[serde(rename = "voice.epoch.ack")]

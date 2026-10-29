@@ -64,6 +64,12 @@ pub enum MediaCmd {
         out: OutboundTx,
         reply: tokio::sync::oneshot::Sender<Result<String, &'static str>>,
     },
+    InputGate {
+        session: SessionId,
+        binding: VoiceTransportBinding,
+        client_gate: bool,
+        reply: tokio::sync::oneshot::Sender<Result<(), &'static str>>,
+    },
     Remove {
         session: SessionId,
     },
@@ -135,18 +141,45 @@ struct Peer {
     out: OutboundTx,
     mic: Option<Mid>,
     slots: Vec<Slot>,
-    talking: bool,
-    last_voice: Instant,
+    speech: SpeechGate,
     connected: bool,
     origin: Arc<AudioOrigin>,
     admission: RtpAdmission,
-    /// Client gates before encoding; only digital silence is filtered here.
-    client_gate: bool,
-    /// Native clients distinguish automatic speech from its hangover in the VAD bit.
-    native_vad: bool,
+    dynamic_gate: bool,
     rtcp_reports: u64,
     #[cfg(feature = "test-hooks")]
     hold_next: Option<tokio::sync::oneshot::Sender<AudioPacket>>,
+}
+
+struct SpeechGate {
+    client_gate: bool,
+    native_vad: bool,
+    talking: bool,
+    last_voice: Instant,
+}
+impl SpeechGate {
+    fn observe(&mut self, data: &ExtensionValues, now: Instant) {
+        if is_speech(data, self.client_gate, self.native_vad) {
+            self.last_voice = now;
+            self.talking = true;
+        }
+    }
+    fn expire(&mut self, now: Instant) -> bool {
+        if self.talking && now.duration_since(self.last_voice) > HANGOVER {
+            self.talking = false;
+            return true;
+        }
+        false
+    }
+    fn set_client_gate(&mut self, enabled: bool) -> bool {
+        if self.client_gate == enabled {
+            return false;
+        }
+        self.client_gate = enabled;
+        let ended = self.talking;
+        self.talking = false;
+        ended
+    }
 }
 
 impl Peer {
@@ -255,6 +288,10 @@ fn has_client_gate(sdp: &str) -> bool {
     sdp.lines().any(|line| line == "a=x-gwar-input-gate:1")
 }
 
+fn has_gate_control(sdp: &str) -> bool {
+    sdp.lines().any(|line| line == "a=x-gwar-input-gate:2")
+}
+
 fn has_native_vad(sdp: &str) -> bool {
     sdp.lines().any(|line| line == "a=x-gwar-native-vad:1")
 }
@@ -309,8 +346,7 @@ pub async fn run(
 
         let now = Instant::now();
         for peer in peers.values_mut() {
-            if peer.talking && now.duration_since(peer.last_voice) > HANGOVER {
-                peer.talking = false;
+            if peer.speech.expire(now) {
                 core.talking_bound(peer.session, false, &peer.binding);
                 // Other transports (TeamSpeak) end the talk state explicitly.
                 let mut end = AudioPacket::end_of_speech(peer.origin.clone(), None);
@@ -344,6 +380,22 @@ pub async fn run(
                         rtcp_reports: peer.rtcp_reports,
                     });
                     let _ = reply.send(snapshot);
+                }
+                Some(MediaCmd::InputGate { session, binding, client_gate, reply }) => {
+                    let result = match peers.get_mut(&session) {
+                        Some(peer) if peer.binding == binding && peer.dynamic_gate => {
+                            if peer.speech.set_client_gate(client_gate) {
+                                core.talking_bound(session, false, &binding);
+                                let mut end = AudioPacket::end_of_speech(peer.origin.clone(), None);
+                                end.egress = uplinks.route(session);
+                                uplinks.uplink(&routing.load(), &end);
+                                sinks.fan_out(&routing.load(), &end);
+                            }
+                            Ok(())
+                        }
+                        _ => Err("stale or unsupported input gate control"),
+                    };
+                    let _ = reply.send(result);
                 }
                 Some(MediaCmd::Remove { session }) => close_peer(&mut peers, session, &core, None),
                 Some(MediaCmd::Forward(packet)) => {
@@ -457,18 +509,24 @@ fn accept(
         out,
         mic: Some(mic),
         slots: Vec::with_capacity(AUDIO_SLOTS),
-        talking: false,
-        last_voice: Instant::now(),
+        speech: SpeechGate {
+            client_gate: has_client_gate(sdp),
+            native_vad: has_native_vad(sdp),
+            talking: false,
+            last_voice: Instant::now(),
+        },
         connected: false,
         origin,
         admission,
-        client_gate: has_client_gate(sdp),
-        native_vad: has_native_vad(sdp),
+        dynamic_gate: has_gate_control(sdp),
         rtcp_reports: 0,
         #[cfg(feature = "test-hooks")]
         hold_next: None,
     };
-    Ok((peer, answer.to_sdp_string()))
+    let answer = answer.to_sdp_string();
+    let answer =
+        if has_gate_control(sdp) { answer.replacen("\nm=", "\na=x-gwar-input-gate:2\r\nm=", 1) } else { answer };
+    Ok((peer, answer))
 }
 
 fn close_peer(peers: &mut HashMap<SessionId, Peer>, session: SessionId, core: &CoreHandle, reason: Option<&str>) {
@@ -575,20 +633,18 @@ fn ingest(
     )?;
     let now = Instant::now();
     if !routing.load().can_speak(peer.session) {
-        if peer.talking {
-            peer.talking = false;
+        if peer.speech.talking {
+            peer.speech.talking = false;
             core.talking_bound(peer.session, false, &peer.binding);
         }
         return None;
     }
-    if is_speech(&data.header.ext_vals, peer.client_gate, peer.native_vad) {
-        peer.last_voice = now;
-        if !peer.talking {
-            peer.talking = true;
-            core.talking_bound(peer.session, true, &peer.binding);
-        }
+    let was_talking = peer.speech.talking;
+    peer.speech.observe(&data.header.ext_vals, now);
+    if !was_talking && peer.speech.talking {
+        core.talking_bound(peer.session, true, &peer.binding);
     }
-    if !peer.talking {
+    if !peer.speech.talking {
         return None;
     }
     Some(AudioPacket {
@@ -608,6 +664,35 @@ fn ingest(
 #[cfg(test)]
 mod clock_tests {
     use super::*;
+
+    #[test]
+    fn automatic_keeps_legacy_vad_and_400_ms_tail_through_live_mode_changes() {
+        let start = Instant::now();
+        let mut gate = SpeechGate { client_gate: false, native_vad: false, talking: false, last_voice: start };
+        let speech = ExtensionValues { audio_level: Some(-55), voice_activity: Some(true), ..Default::default() };
+        let noise = ExtensionValues { audio_level: Some(-55), voice_activity: Some(false), ..Default::default() };
+        gate.observe(&noise, start);
+        assert!(!gate.talking);
+        gate.observe(&speech, start);
+        assert!(gate.talking);
+        gate.observe(&noise, start + Duration::from_millis(399));
+        assert!(!gate.expire(start + Duration::from_millis(400)));
+        assert!(gate.talking);
+        assert!(gate.expire(start + Duration::from_millis(401)));
+        let quiet = ExtensionValues { audio_level: Some(-80), voice_activity: Some(false), ..Default::default() };
+        gate.set_client_gate(true); // Manual or PTT: only digital silence is filtered.
+        gate.observe(&quiet, start + Duration::from_millis(410));
+        assert!(gate.talking);
+        assert!(gate.set_client_gate(false)); // Automatic must discard manual's speech tail.
+        gate.observe(&quiet, start + Duration::from_millis(420));
+        assert!(!gate.talking);
+        gate.observe(&speech, start + Duration::from_millis(430));
+        assert!(gate.talking);
+        assert!(!gate.expire(start + Duration::from_millis(830)));
+        assert!(gate.expire(start + Duration::from_millis(831)));
+        assert!(has_gate_control("v=0\r\na=x-gwar-input-gate:2\r\n"));
+        assert!(!has_client_gate("v=0\r\na=x-gwar-input-gate:2\r\n"));
+    }
 
     #[test]
     fn optional_sdp_gate_is_accepted_and_legacy_offers_stay_legacy() {

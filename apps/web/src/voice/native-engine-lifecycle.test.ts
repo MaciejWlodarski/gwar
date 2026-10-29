@@ -222,19 +222,24 @@ describe("native microphone test replacement", () => {
     const currentLevel = vi.fn();
     const oldTest = view.startMicTest(oldLevel);
     await entered.promise;
-    const stopCurrent = await view.startMicTest(currentLevel);
-    emit("voice://test-level", { owner: 1, test: 2, db: -30 });
+    const replacement = view.startMicTest(currentLevel);
+    expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_start")).toHaveLength(1);
+    opening.resolve();
+    const stopCurrent = await replacement;
+    const test = bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_start").at(-1)![1]!.test;
+    expect(oldLevel).toHaveBeenLastCalledWith(0);
+    oldLevel.mockClear();
+    emit("voice://test-level", { owner: 1, test, db: -30 });
     expect(oldLevel).not.toHaveBeenCalled();
     expect(currentLevel).toHaveBeenCalledWith(0.7);
-    opening.resolve();
     const stopOld = await oldTest;
     stopOld();
     expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_stop").every(([, args]) => args?.test === 1)).toBe(true);
-    emit("voice://test-level", { owner: 1, test: 2, db: -30 });
+    emit("voice://test-level", { owner: 1, test, db: -30 });
     expect(oldLevel).not.toHaveBeenCalled();
     expect(currentLevel).toHaveBeenCalledWith(0.7);
     stopCurrent();
-    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1, test: 2 }));
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1, test }));
   });
 
   it("does not start an obsolete test whose event listener setup finishes after the replacement", async () => {
@@ -253,8 +258,9 @@ describe("native microphone test replacement", () => {
     const view = engine();
     const oldTest = view.startMicTest(vi.fn());
     await entered.promise;
-    const stopCurrent = await view.startMicTest(vi.fn());
+    const replacement = view.startMicTest(vi.fn());
     listening.resolve();
+    const stopCurrent = await replacement;
     const stopOld = await oldTest;
     stopOld();
     expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_start")).toHaveLength(1);

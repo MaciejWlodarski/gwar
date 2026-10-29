@@ -47,7 +47,7 @@ try {
   const errors = [];
   page.on("pageerror", error => errors.push(String(error)));
   await page.addInitScript(() => {
-    localStorage.setItem("gwar.settings", JSON.stringify({ version: 3, state: { language: "pl", theme: "dark", audio: { noiseSuppression: false, echoCancellation: false, autoGainControl: false } } }));
+    localStorage.setItem("gwar.settings", JSON.stringify({ version: 5, state: { language: "pl", theme: "dark", onboarding: { completed: true, firstUsedAt: Date.now(), nudgeDismissed: true, roleReceived: false }, audio: { noiseSuppression: false, echoCancellation: false, autoGainControl: false } } }));
     // A real WebAudio signal feeds the real mic-test analyser; no level/store injection.
     const query = navigator.permissions.query.bind(navigator.permissions);
     window.microphonePermission = "granted";
@@ -116,6 +116,7 @@ try {
     await page.getByRole("radio", { name: "Naciśnij i mów", exact: true }).click();
     assert.equal(await automatic.count(), 0);
     assert.equal(await slider.count(), 0);
+    assert.equal(await page.getByRole("button", { name: "Testuj mikrofon", exact: true }).count(), 0);
     await page.waitForFunction(() => window.testCaptures.every(track => track.readyState === "ended"));
     await shot("ptt");
   }
@@ -191,17 +192,21 @@ try {
     gate.configure({ ...controls, ptt: true }); await wait(150); const ptt = db();
     gate.configure({ ...controls, ptt: false }); await wait(150); const released = db();
     gate.configure({ ...controls, ptt: true, blocked: true }); await wait(150); const muted = db();
+    gate.configure({ ...controls, automatic: true }); input(-55); await wait(150); const automatic = db();
+    gate.configure({ ...controls, automatic: false }); await wait(450); const manual = db();
+    gate.configure({ ...controls, automatic: true }); await wait(150); const automaticAgain = db();
     gate.close(); oscillator.stop(); await ctx.close();
-    return { below, above, tail, closed, ptt, released, muted };
+    return { below, above, tail, closed, ptt, released, muted, automatic, manual, automaticAgain };
   });
   assert.ok(levels.below < -110 && levels.closed < -110 && levels.released < -110 && levels.muted < -110, JSON.stringify(levels));
   assert.ok(levels.above > -35 && levels.tail > -75 && levels.ptt > -75, JSON.stringify(levels));
+  assert.ok(levels.automatic > -60 && levels.manual < -110 && levels.automaticAgain > -60, JSON.stringify(levels));
   assert.deepEqual(errors, []);
   writeFileSync(path.join(output, "screenshots.txt"), [
     `Captured ${new Date().toISOString()} from the built local web app (${url}).`,
     "No production services, real microphone, native app or user data were used.",
     "The meter is measured by the app from a generated 440 Hz sine: -70 dBFS below, -30 dBFS above.",
-    "Automatic mode retains the default -50 dBFS gate. Manual screenshots use -50 dBFS.",
+    "Automatic retains the legacy server decision (-50 dBov, or -60 with voice activity, with a 400 ms tail). Manual screenshots use -50 dBFS.",
     "Preview capture: granted permission starts on Audio settings; PTT, mute, deafen, handover, page/tab exit, visibility and window blur stop tracks synchronously. Unknown permission waits for the explicit button.",
     ...screenshots, `Real AudioWorklet output levels (dBFS): ${JSON.stringify(levels)}`, "",
   ].join("\n"));

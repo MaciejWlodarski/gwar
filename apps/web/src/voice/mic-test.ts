@@ -6,7 +6,7 @@ export class MicTests {
   private runs = new Set<Run>();
 
   start(open: (signal: AbortSignal) => Promise<Stop>, signal?: AbortSignal): Promise<() => void> {
-    void this.stop();
+    const retired = this.stop();
     const controller = new AbortController();
     let stop: Stop | null = null;
     let cleanup: Promise<void> | null = null;
@@ -21,7 +21,7 @@ export class MicTests {
       });
       return cleanup;
     };
-    const ready = Promise.resolve().then(() => controller.signal.aborted ? () => {} : open(controller.signal)).then(fn => {
+    const ready = retired.then(() => controller.signal.aborted ? () => {} : open(controller.signal)).then(fn => {
       stop = fn;
       if (controller.signal.aborted) void close();
     }).catch(error => {

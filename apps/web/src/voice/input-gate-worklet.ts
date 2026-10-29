@@ -12,22 +12,24 @@ class InputGateProcessor extends AudioWorkletProcessor {
 
   constructor() {
     super();
-    this.port.onmessage = (event: MessageEvent<GateControls>) => { this.controls = event.data; };
+    this.port.onmessage = (event: MessageEvent<GateControls>) => {
+      if (this.controls.automatic !== event.data.automatic || (this.controls.ptt === null) !== (event.data.ptt === null)) this.gate = new InputGate();
+      this.controls = event.data;
+    };
   }
 
   process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
-    // Manual sensitivity measures capture as the settings meter does. Automatic
-    // detection keeps the legacy web gate's position AFTER gain and suppression:
-    // gain can lift a quiet voice, and suppressed noise must not keep it open.
+    // Automatic stays on the server: only RTP has the browser's voice-activity
+    // bit and quantized processed level needed for its exact legacy decision.
     const audio = inputs[1]?.[0];
-    const measured = this.controls.automatic ? audio : inputs[0]?.[0];
+    const measured = inputs[0]?.[0];
     const output = outputs[0]?.[0];
     if (!output) return true;
     let power = 0;
     if (measured) for (const sample of measured) power += sample * sample;
     const db = measured?.length ? 10 * Math.log10(power / measured.length) : -Infinity;
     const { threshold, ptt, blocked } = this.controls;
-    const send = this.gate.allows(db, currentTime * 1000, threshold, ptt, blocked);
+    const send = this.controls.automatic && ptt === null ? !blocked : this.gate.allows(db, currentTime * 1000, threshold, ptt, blocked);
     output.fill(0);
     if (send && audio) output.set(audio);
     return true;

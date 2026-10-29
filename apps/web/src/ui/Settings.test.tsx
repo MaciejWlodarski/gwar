@@ -48,15 +48,14 @@ const automatic = () => [...container.querySelectorAll<HTMLElement>('[role="swit
 it("has its own compact section after Input mode, with a live meter before any mic-test click", async () => {
   await mount();
   expect(voice.startMicTest).toHaveBeenCalledOnce();
-  expect(button("Test microphone")).toBeDefined();
+  expect(button("Test microphone")).toBeUndefined();
   const headings = [...container.querySelectorAll("h3")].map(h => h.textContent);
-  expect(headings.slice(0, 4)).toEqual(["Devices", "Input mode", "Input sensitivity", "Microphone test"]);
+  expect(headings.slice(0, 4)).toEqual(["Devices", "Input mode", "Input sensitivity", "Processing"]);
   expect(container.textContent).toContain("Turn off to set it yourself.");
   expect(automatic().getAttribute("aria-checked")).toBe("true");
   await act(async () => voice.startMicTest.mock.calls[0]![0](0.6));
   expect(meter().getAttribute("aria-valuenow")).toBe("60");
-  await act(async () => button("Test microphone").click());
-  expect(voice.startMicTest).toHaveBeenCalledOnce(); // Test and sensitivity share capture.
+  expect(container.querySelectorAll('[role="meter"]')).toHaveLength(1);
 });
 
 it("keeps the manual slider keyboard-accessible without visible values or help prose", async () => {
@@ -82,7 +81,6 @@ it.each(["prompt", "denied", "unknown"] as const)("never prompts automatically w
 it.each(["starting", "connected", "failed"] as const)("reuses call audio while voice is %s", async state => {
   useVoice.setState({ state, level: 0.6 });
   await mount();
-  await act(async () => button("Test microphone").click());
   expect(voice.startMicTest).not.toHaveBeenCalled();
   expect(voice.micPermission).not.toHaveBeenCalled();
   expect(meter().getAttribute("aria-valuenow")).toBe("60");

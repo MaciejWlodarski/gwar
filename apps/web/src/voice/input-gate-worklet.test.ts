@@ -33,13 +33,20 @@ it("gates actual audio on the audio thread, independently of main-thread timers"
   gate.port.onmessage({ data: { threshold: -100, ptt: true, blocked: true } });
   expect(frame(0, 340)).toBe(0);
 
-  // Automatic mode measures processed audio, as the legacy server did: a voice
-  // lifted by gain passes even if its capture was quiet; suppressed noise closes.
+  // Automatic must leave even -55 dB speech and its entire tail for the legacy
+  // RTP decision. The worklet cannot see the browser's voice-activity bit.
   gate.port.onmessage({ data: { threshold: -50, ptt: null, blocked: false, automatic: true } });
-  expect(frame(-80, 350)).toBeCloseTo(0.2);
-  vi.stubGlobal("currentTime", 0.7);
+  vi.stubGlobal("currentTime", 0.35);
+  gate.process([[new Float32Array(128).fill(1e-4)], [new Float32Array(128).fill(10 ** (-55 / 20))]], [[output]]);
+  expect(output[0]).toBeCloseTo(10 ** (-55 / 20));
+  vi.stubGlobal("currentTime", 0.751);
   gate.process([[new Float32Array(128).fill(0.2)], [new Float32Array(128).fill(1e-4)]], [[output]]);
-  expect(output[0]).toBe(0);
+  expect(output[0]).toBeCloseTo(1e-4); // The server, with its 400 ms tail, decides.
   gate.port.onmessage({ data: { threshold: -50, ptt: null, blocked: false, automatic: false } });
-  expect(frame(-80, 710)).toBe(0);
+  expect(frame(-80, 760)).toBe(0);
+  expect(frame(-30, 770)).toBeCloseTo(0.2);
+  gate.port.onmessage({ data: { threshold: -50, ptt: null, blocked: false, automatic: true } });
+  expect(frame(-80, 780)).toBeCloseTo(0.2);
+  gate.port.onmessage({ data: { threshold: -50, ptt: null, blocked: true, automatic: true } });
+  expect(frame(-30, 790)).toBe(0);
 });

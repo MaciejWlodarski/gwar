@@ -394,14 +394,19 @@ async function main() {
         return ws;
       },
     });
-    // Counts microphone requests: nothing may ask before the user joins voice.
+    // Before voice, capture is allowed only for the local Audio settings preview.
     window.__gum = 0;
+    window.__unexpectedPreview = 0;
+    window.__micStreams = [];
     const media = navigator.mediaDevices;
     if (media?.getUserMedia) {
       const nativeGum = media.getUserMedia.bind(media);
-      media.getUserMedia = (...args) => {
+      media.getUserMedia = async (...args) => {
         window.__gum++;
-        return nativeGum(...args);
+        if (![...document.querySelectorAll("h3")].some(h => h.textContent === "Input sensitivity")) window.__unexpectedPreview++;
+        const stream = await nativeGum(...args);
+        window.__micStreams.push(stream);
+        return stream;
       };
     }
     const pcs = (window.__pcs = []);
@@ -451,7 +456,8 @@ async function main() {
     await connect(a, "Alice");
     await shot(a, "03-desktop-not-in-voice-dark");
     if ((await a.getByRole("button", { name: /Mute microphone/ }).count()) !== 0) throw new Error("mic button shown outside voice");
-    if ((await a.evaluate(() => window.__gum)) !== 0) throw new Error("the microphone was requested before joining voice");
+    if ((await a.evaluate(() => window.__unexpectedPreview)) !== 0) throw new Error("microphone requested outside the authorized Audio preview before joining voice");
+    await waitFor(() => a.evaluate(() => window.__micStreams.every(stream => stream.getTracks().every(track => track.readyState === "ended"))), "settings preview capture released before connecting", 5000);
     if ((await a.evaluate(() => window.__pcs.length)) !== 0) throw new Error("a peer connection exists before joining voice");
   });
   await check("verified server fingerprint is visible and pinned after first connection", async () => {

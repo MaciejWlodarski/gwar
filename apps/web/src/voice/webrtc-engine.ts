@@ -2,7 +2,7 @@ import { startDenoise, type DenoisePipeline } from "./denoise";
 import { nextMediaRun } from "./engine";
 import { inputThreshold } from "./input-sensitivity";
 import { startInputGate, type CaptureGate } from "./input-gate";
-import { advertiseInputGate } from "./sdp";
+import { advertiseInputGate, hasInputGateControl } from "./sdp";
 import { MicTests } from "./mic-test";
 import { encryptedVoiceSupported, SframeWorker } from "./sframe/client";
 import { AUDIO_SLOTS } from "../net/protocol";
@@ -138,6 +138,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private micGeneration = 0;
   private resumeBound = false;
   private micTests = new MicTests();
+  private gateControl: { desired: boolean | null; serial: number; ready: boolean; queue: Promise<void>; apply(clientGate: boolean): Promise<void> } | null = null;
 
   constructor() {
     this.capabilities = {
@@ -172,7 +173,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
   // ------------------------------------------------------------- lifecycle
 
-  async start({ offer, iceServers, mode, binding, keys }: Parameters<VoiceEngine["start"]>[0]): Promise<void> {
+  async start({ offer, inputGate, iceServers, mode, binding, keys }: Parameters<VoiceEngine["start"]>[0]): Promise<void> {
     const encrypted = mode === "encrypted";
     const { server_key, call, participation, group } = binding;
     if (encrypted && (!keys || !server_key || !call || !participation || !group)) throw new VoiceError("unsupported", "encrypted voice needs its call binding and keys");
@@ -257,6 +258,9 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       if (run !== this.runId) return;
       await pc.setRemoteDescription({ type: "answer", sdp: answer });
       if (run !== this.runId) return;
+      if (inputGate && hasInputGateControl(answer)) {
+        this.gateControl = { desired: null, serial: 0, ready: false, queue: Promise.resolve(), apply: clientGate => inputGate(clientGate, mediaRun) };
+      }
       // Controls only after the server bound this run: acks name it.
       // Closing the call controller stops this run's media synchronously.
       if (sframe) keys!.attach({ run: mediaRun, control: body => sframe.control(body), close: () => { if (this.sframe === sframe) { this.runId++; this.teardownPeer(); this.setState("idle"); } } });
@@ -285,6 +289,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   }
 
   private teardownPeer(): void {
+    this.gateControl = null;
     // Invalidate the run's keys first, then the transport.
     this.sframe?.stop();
     this.sframe = null;
@@ -569,7 +574,27 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     const enabled = !blocked && (this.mode === "vad" || this.ptt);
     track.enabled = enabled;
     this.handover?.getAudioTracks().forEach((t) => { t.enabled = enabled; });
-    const controls = { threshold: this.threshold, ptt: this.mode === "ptt" ? this.ptt : null, blocked, automatic: this.automaticSensitivity };
+    const control = this.gateControl;
+    const desired = this.mode === "ptt" || !this.automaticSensitivity;
+    if (control && control.desired !== desired) {
+      control.desired = desired;
+      control.ready = false;
+      const serial = ++control.serial;
+      control.queue = control.queue.then(async () => {
+        if (this.gateControl !== control || control.serial !== serial) return;
+        await control.apply(desired);
+        if (this.gateControl === control && control.serial === serial) {
+          control.ready = true;
+          this.applyTrackEnabled();
+        }
+      }).catch(error => {
+        if (this.gateControl !== control) return;
+        console.warn("[voice] input gate control failed:", error);
+        this.teardownPeer();
+        this.setState("failed");
+      });
+    }
+    const controls = { threshold: this.threshold, ptt: this.mode === "ptt" ? this.ptt : null, blocked: blocked || (control !== null && !control.ready), automatic: this.automaticSensitivity };
     this.inputGate?.configure(controls);
     this.handoverGate?.configure(controls);
     if (this.denoise) {

@@ -133,7 +133,6 @@ function AudioTab() {
   const devices = useVoice((s) => s.devices);
   const engineLevel = useVoice((s) => s.level);
   const voiceState = useVoice((s) => s.state);
-  const [testing, setTesting] = useState(false);
   const muted = useVoice((s) => s.muted || s.deafened);
   const [capturing, setCapturing] = useState(false);
   const engine = controller.voice;
@@ -179,8 +178,6 @@ function AudioTab() {
   ];
   const inCall = voiceState !== "idle";
   const level = muted ? 0 : inCall ? engineLevel : preview.level;
-  const canTest = !muted && (audio.inputMode === "vad" || inCall);
-  const testActive = testing && canTest;
 
   return (
     <div>
@@ -270,18 +267,6 @@ function AudioTab() {
           <p className="text-xs text-subtle">{t("audio.shortcutHint")}</p>
         </Section>
       )}
-
-      <Section title={t("audio.test")}>
-        <div className="flex items-center gap-3">
-          <Button onClick={() => {
-            setTesting(!testActive);
-            if (!testActive && !inCall) preview.request();
-          }} disabled={!canTest} variant={testActive ? "primary" : "secondary"} className="shrink-0">
-            {testActive ? t("audio.testStop") : t("audio.testStart")}
-          </Button>
-          {testActive && <LevelMeter level={level} label={t("audio.level")} />}
-        </div>
-      </Section>
 
       <Section title={t("audio.processing")}>
         <Switch

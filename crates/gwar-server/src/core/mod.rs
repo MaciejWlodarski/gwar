@@ -1903,6 +1903,9 @@ impl Core {
             Request::TokenCreate { group } => self.token_create(session, group),
             Request::TokenRedeem { token } => self.token_redeem(session, &token),
             Request::VoiceOffer(offer) => return self.voice_offer(session, id, offer),
+            Request::VoiceInputGate { binding, client_gate } => {
+                return self.voice_input_gate(session, id, binding, client_gate);
+            }
             Request::VoiceState {} => Ok(Response::VoiceState { voice: self.voice_state(session) }),
             Request::VoiceEpochAck(r) => self.voice_epoch(session, r, false),
             Request::VoiceEpochRepeat(r) => self.voice_epoch(session, r, true),

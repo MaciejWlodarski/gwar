@@ -14,7 +14,7 @@ describe("microphoneSsrc", () => {
   it("adds the optional client gate as a session attribute without changing microphone identity", () => {
     for (const offer of [native, browser]) {
       const gated = advertiseInputGate(offer);
-      expect(gated).toContain("a=x-gwar-input-gate:1\r\nm=audio");
+      expect(gated).toContain("a=x-gwar-input-gate:2\r\nm=audio");
       expect(microphoneSsrc(gated)).toBe(microphoneSsrc(offer));
     }
   });
