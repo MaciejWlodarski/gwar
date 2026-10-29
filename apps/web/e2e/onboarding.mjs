@@ -46,6 +46,38 @@ async function capture(page, name, width) {
   await page.screenshot({ path: path.join(shots, `${name}-pl-${width}.png`), animations: "disabled" });
   captured.push(`${name}-pl-${width}.png`);
 }
+async function bannerStyle(page, id) {
+  return page.getByTestId(id).evaluate(banner => {
+    const text = banner.querySelector("p"), icon = banner.querySelector("svg"), buttons = [...banner.querySelectorAll("button")];
+    const bounds = banner.getBoundingClientRect(), last = buttons.at(-1).getBoundingClientRect();
+    const centers = [icon, text, ...buttons].map(el => { const b = el.getBoundingClientRect(); return b.y + b.height / 2; });
+    return { height: bounds.height, textHeight: text.getBoundingClientRect().height, lineHeight: parseFloat(getComputedStyle(text).lineHeight), iconSize: icon.getBoundingClientRect().width, iconColor: getComputedStyle(icon).color, buttonHeight: buttons[0].getBoundingClientRect().height, fits: banner.scrollWidth <= banner.clientWidth && text.scrollWidth <= text.clientWidth, centerSpread: Math.max(...centers) - Math.min(...centers), rightGap: bounds.right - last.right, paddingRight: parseFloat(getComputedStyle(banner).paddingRight) };
+  });
+}
+function assertOneRow(style, label) {
+  assert.equal(style.height, 57, `${label}: single-line banner height`);
+  assert.ok(Math.abs(style.textHeight - style.lineHeight) < 1, `${label}: one text line`);
+  assert.ok(style.fits, `${label}: text fits without clipping or overflow`);
+  assert.ok(style.centerSpread < 1, `${label}: icon, text and controls align`);
+  assert.equal(style.rightGap, style.paddingRight, `${label}: last control sits at the right edge`);
+}
+async function mobileBanners(page, id, name) {
+  for (const width of [360, 390]) {
+    await page.setViewportSize({ width, height: 844 });
+    for (const language of ["en", "pl"]) {
+      await state(page, { settings: { language } });
+      assertOneRow(await bannerStyle(page, id), `${id} ${language} ${width}px`);
+    }
+    await capture(page, name, width === 390 ? "mobile" : "mobile-360");
+    if (id === "identity-banner") {
+      await page.getByRole("button", { name: "Zabezpiecz", exact: true }).click();
+      await page.getByRole("dialog").getByRole("button", { name: "Załóż konto Gwar Connect", exact: true }).waitFor();
+      await capture(page, "identity-protect", width === 390 ? "mobile" : "mobile-360");
+      await page.getByRole("dialog").getByRole("button", { name: "Zamknij", exact: true }).click();
+      assert.ok(await page.getByTestId(id).isVisible(), "closing choices keeps the reminder");
+    }
+  }
+}
 async function state(page, values) {
   await page.evaluate(async values => {
     const { useSettings } = await import("/src/state/settings.ts");
@@ -125,19 +157,28 @@ try {
     // The reminder must fit one desktop line at 1280 px, like the expiry notice.
     if (width === "desktop") await page.setViewportSize({ width: 1280, height: 900 });
     await page.evaluate(() => document.fonts.ready);
-    const reminderStyle = await page.getByTestId("identity-banner").evaluate(banner => {
-      const text = banner.querySelector("p"), icon = banner.querySelector("svg");
-      return { height: banner.getBoundingClientRect().height, textHeight: text.getBoundingClientRect().height, lineHeight: parseFloat(getComputedStyle(text).lineHeight), iconSize: icon.getBoundingClientRect().width, iconColor: getComputedStyle(icon).color, buttonHeight: banner.querySelector("button").getBoundingClientRect().height };
-    });
-    if (width === "desktop") assert.equal(reminderStyle.textHeight, reminderStyle.lineHeight, "reminder text fits one line at 1280 px");
+    const reminderStyle = await bannerStyle(page, "identity-banner");
+    assertOneRow(reminderStyle, `identity reminder ${width}`);
     assert.equal(await page.getByTestId("identity-banner").getByText(/klucz prywatny/).count(), 0);
     assert.ok(await page.getByTestId("identity-banner").evaluate(banner => banner.scrollWidth <= banner.clientWidth), "compact reminder fits the viewport");
-    await capture(page, "identity-banner", width);
+    if (width === "mobile") await mobileBanners(page, "identity-banner", "identity-banner");
+    else {
+      await capture(page, "identity-banner", width);
+      // Open the mobile choices, then resize: the same Dialog must work on desktop too.
+      await page.setViewportSize({ width: 390, height: 844 });
+      await page.getByRole("button", { name: "Zabezpiecz", exact: true }).click();
+      await page.setViewportSize({ width: 1280, height: 900 });
+      await page.getByRole("dialog").getByRole("button", { name: "Załóż konto Gwar Connect", exact: true }).waitFor();
+      await capture(page, "identity-protect", width);
+      await page.getByRole("dialog").getByRole("button", { name: "Zamknij", exact: true }).click();
+    }
+    if (width === "mobile") await page.getByRole("button", { name: "Zabezpiecz", exact: true }).click();
     await page.getByRole("button", { name: "Zapisz kopię", exact: true }).click();
     await page.getByRole("dialog").getByText(/Plik zawiera Twój klucz prywatny/).waitFor();
     await capture(page, "identity-backup-confirm", width);
     await page.getByRole("button", { name: "Anuluj", exact: true }).click();
     assert.ok(await page.getByTestId("identity-banner").isVisible(), "cancelled confirmation keeps the reminder");
+    if (width === "mobile") await page.getByRole("button", { name: "Zabezpiecz", exact: true }).click();
     await page.getByRole("button", { name: "Zapisz kopię", exact: true }).click();
     const download = page.waitForEvent("download");
     await page.getByRole("dialog").getByRole("button", { name: "Zapisz", exact: true }).click();
@@ -146,21 +187,20 @@ try {
     // Session-expiry states are seeded; no real user account or certificate is used.
     const fakeAccount = { handle: "ola", accountKey: "review-account", deviceKey: "review-device", deviceName: "Browser", expiresAt: Date.now() + 5 * 86_400_000 };
     await state(page, { account: { account: fakeAccount, certChecked: true } });
-    await page.getByTestId("expiry-banner").getByText(/Za 5 dni/).waitFor();
-    const expiryStyle = await page.getByTestId("expiry-banner").evaluate(banner => {
-      const icon = banner.querySelector("svg");
-      return { height: banner.getBoundingClientRect().height, iconSize: icon.getBoundingClientRect().width, iconColor: getComputedStyle(icon).color, buttonHeight: banner.querySelector("button").getBoundingClientRect().height };
-    });
-    if (width === "desktop") assert.equal(reminderStyle.height, expiryStyle.height, "reminder and expiry banners have the same desktop height");
+    await page.getByTestId("expiry-banner").getByText(width === "mobile" ? /Zaloguj się w ciągu 5 dni/ : /Za 5 dni/).waitFor();
+    const expiryStyle = await bannerStyle(page, "expiry-banner");
+    assertOneRow(expiryStyle, `expiry warning ${width}`);
     for (const key of ["iconSize", "iconColor", "buttonHeight"]) assert.equal(reminderStyle[key], expiryStyle[key], `reminder matches expiry ${key}`);
     if (width === "desktop") await page.setViewportSize(viewport);
-    await capture(page, "expiry-before", width);
-    await page.getByRole("button", { name: "Zaloguj ponownie", exact: true }).click();
+    if (width === "mobile") await mobileBanners(page, "expiry-banner", "expiry-before");
+    else await capture(page, "expiry-before", width);
+    await page.getByRole("button", { name: width === "mobile" ? "Zaloguj" : "Zaloguj ponownie", exact: true }).click();
     await page.getByRole("dialog").getByLabel("Hasło", { exact: true }).waitFor();
     await page.getByRole("button", { name: "Anuluj", exact: true }).click();
     await state(page, { account: { account: { ...fakeAccount, expiresAt: 1 } } });
-    await page.getByTestId("expiry-banner").getByText(/Wpisz ponownie hasło/).waitFor();
-    await capture(page, "expiry-after", width);
+    await page.getByTestId("expiry-banner").getByText(width === "mobile" ? /Logowanie wygasło/ : /Wpisz ponownie hasło/).waitFor();
+    if (width === "mobile") await mobileBanners(page, "expiry-banner", "expiry-after");
+    else await capture(page, "expiry-after", width);
     await state(page, { account: { account: null } });
     for (const [name, key, kind] of [["voice-disconnected", "voice.disconnected", "info"], ["voice-reconnecting", "voice.closed", "info"], ["voice-reconnect-failed", "voice.reconnectFailed", "error"]]) {
       await page.evaluate(async ({ key, kind }) => {
@@ -198,6 +238,8 @@ try {
   if (shots) writeFileSync(path.join(shots, "screenshots.txt"), [
     "Real running web app, Polish, Chromium, graphite/cyan. Desktop 1440x900; mobile 390x844.",
     "Identity reminder and backup confirmation desktop captures are 1280x900; the reminder matches expiry height, icon treatment and buttons at that width.",
+    "Identity and expiry mobile banners are one row at 360 and 390 px in both locales. Polish screenshots include both widths and the protection choices dialog.",
+    "The desktop protection dialog is opened on mobile and resized to desktop to verify the same dialog across widths.",
     "Captured with apps/web/e2e/onboarding.mjs. Only throwaway loopback services and browser contexts.",
     "First run and connection are real flows. Role receipt and before/after expiry are seeded UI states.",
     "The sticky toast uses the generic production component with a seeded audio error and working Settings action.",

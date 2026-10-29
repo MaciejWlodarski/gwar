@@ -18,13 +18,59 @@ beforeEach(async () => {
   useSettings.setState({ language: "pl", onboarding: { completed: true, firstUsedAt: Date.now(), nudgeDismissed: false, roleReceived: false } });
   useAccount.setState({ loaded: true, certChecked: true, account: null });
   useSession.setState({ kind: "gwar", me: null, members: {} });
+  useUi.setState({ toasts: [] });
+  vi.stubGlobal("matchMedia", () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
   vi.mocked(exportIdentityBackup).mockReset();
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   await act(async () => root.render(<IdentityNotices />));
 });
 afterEach(async () => { await act(async () => root.unmount()); container.remove(); vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 const button = (label: string) => Array.from(document.querySelectorAll("button")).find(b => b.textContent === label)!;
+async function onPhone() {
+  vi.stubGlobal("matchMedia", () => ({ matches: true, addEventListener() {}, removeEventListener() {} }));
+  await act(async () => root.render(<IdentityNotices key="phone" />));
+}
 describe("persistent identity notices", () => {
+  it("opens mobile protection choices without exporting, then reaches the private-key confirmation", async () => {
+    await onPhone();
+    await act(async () => useSettings.getState().setOnboarding({ roleReceived: true }));
+    const banner = container.querySelector('[data-testid="identity-banner"]')!;
+    expect(banner.querySelector("p")?.textContent).toBe("Zabezpiecz swoją tożsamość");
+    expect(Array.from(banner.querySelectorAll("button"), b => b.textContent)).toEqual(["Zabezpiecz", ""]);
+    await act(async () => button("Zabezpiecz").click());
+    const choices = document.querySelector('[role="dialog"]')!;
+    expect(choices.textContent).toContain("Jeśli wyczyścisz dane przeglądarki, stracisz swoją nazwę i role.");
+    expect(button("Załóż konto Gwar Connect")).toBeDefined();
+    expect(exportIdentityBackup).not.toHaveBeenCalled();
+    await act(async () => button("Zapisz kopię").click());
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Plik zawiera Twój klucz prywatny");
+    expect(exportIdentityBackup).not.toHaveBeenCalled();
+    await act(async () => button("Anuluj").click());
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(useSettings.getState().onboarding?.nudgeDismissed).toBe(false);
+  });
+  it("opens account creation from mobile choices without dismissing the reminder", async () => {
+    await onPhone();
+    await act(async () => useSettings.getState().setOnboarding({ roleReceived: true }));
+    await act(async () => button("Zabezpiecz").click());
+    await act(async () => button("Załóż konto Gwar Connect").click());
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(useUi.getState()).toMatchObject({ section: "settings", settingsTab: "account", accountEntry: "create" });
+    expect(useSettings.getState().onboarding?.nudgeDismissed).toBe(false);
+  });
+  it("keeps mobile expiry notices short and opens the full sign-in explanation", async () => {
+    await onPhone();
+    await act(async () => useAccount.setState({ account: { ...account, expiresAt: Date.now() + 5 * day } }));
+    expect(container.querySelector('[data-testid="expiry-banner"] p')?.textContent).toBe("Zaloguj się w ciągu 5 dni");
+    await act(async () => button("Zaloguj").click());
+    expect(document.querySelector('[type="password"]')).not.toBeNull();
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain("Wpisz hasło do Gwar Connect");
+    await act(async () => button("Anuluj").click());
+    await act(async () => { vi.setSystemTime(Date.now() + 5 * day); window.dispatchEvent(new Event("focus")); });
+    expect(container.querySelector('[data-testid="expiry-banner"] p')?.textContent).toBe("Logowanie wygasło");
+    await act(async () => button("Zaloguj").click());
+    expect(document.querySelector('[type="password"]')).not.toBeNull();
+  });
   it("shows the reminder on role receipt and remembers dismissal", async () => {
     await act(async () => useSession.setState({ me: { uid: "me", session: 1 }, members: { me: { uid: "me", nickname: "Alex", tag: "alex", groups: [1, 2], last_seen: 1 } } }));
     expect(container.querySelector('[data-testid="identity-banner"]')).not.toBeNull();
