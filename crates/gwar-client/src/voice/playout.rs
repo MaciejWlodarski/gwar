@@ -464,7 +464,8 @@ mod tests {
             slot.buffer.push(0, 960, first.clone());
             let onset = encode(&encoder, true);
             let onset_ts = if plc { 1920 } else { 960 };
-            for i in 0..8 {
+            // Less than the jitter buffer's `BACKLOG_TRIM` surplus: a shrink proposal, not a cut.
+            for i in 0..5 {
                 slot.buffer.push(onset_ts + i * 960, 960, onset.clone());
             }
             let mut initial = [0.0; 960];
@@ -492,7 +493,8 @@ mod tests {
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
         let mut slot = Slot::new().unwrap();
         let now = Instant::now();
-        for i in 0..8 {
+        // Less than the jitter buffer's `BACKLOG_TRIM` surplus: a shrink proposal, not a cut.
+        for i in 0..6 {
             slot.buffer.push(i * 960, 960, encode(&encoder, false));
         }
         slot.mix_into(&mut [0.0; 960], 1.0, now).unwrap();

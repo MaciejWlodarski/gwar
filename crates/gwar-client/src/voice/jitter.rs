@@ -283,6 +283,8 @@ pub struct JitterBuffer {
     last_observation: Option<Instant>,
     last_shrink: Option<Instant>,
     last_attempt: Option<Instant>,
+    /// The last PLC: a window with one is no evidence for a backlog cut.
+    last_conceal: Option<Instant>,
     pub(crate) concealments: u64,
     pub(crate) late_drops: u64,
     /// Queued packets dropped, oldest first, to keep the queue within `MAX_QUEUED` and
@@ -326,6 +328,11 @@ const SHRINK_INTERVAL: Duration = Duration::from_millis(500);
 const TRIM_DIAGNOSTIC_WINDOW: Duration = Duration::from_secs(1);
 // A declined proposal (noise, onset) costs a pitch search; retry at most 5 times a second.
 const SHRINK_RETRY: Duration = Duration::from_millis(200);
+// A proven surplus this large (100 ms) is cut at once: the gentle shrink would take seconds
+// to minutes, and holding it buys nothing. The cut leaves `BACKLOG_KEEP` (40 ms) of it to the
+// gentle shrink, a cushion against local stalls the arrival rule cannot see.
+const BACKLOG_TRIM: u64 = 4800;
+const BACKLOG_KEEP: u64 = 1920;
 
 /// Whole samples from `from` to `to`, rounded down.
 fn samples_between(from: Instant, to: Instant) -> u64 {
@@ -360,6 +367,7 @@ impl JitterBuffer {
             last_observation: None,
             last_shrink: None,
             last_attempt: None,
+            last_conceal: None,
             concealments: 0,
             late_drops: 0,
             overflow_drops: 0,
@@ -499,6 +507,7 @@ impl JitterBuffer {
         self.arrivals.clear();
         self.last_shrink = None;
         self.last_attempt = None;
+        self.last_conceal = None;
         self.skipped = false;
         self.overflowed = false;
     }
@@ -792,6 +801,18 @@ impl JitterBuffer {
                 recovery.reserve = true;
             }
         }
+        // A deep network queue that emptied gradually leaves its delay in the buffer without a
+        // stall to recover from: a bloated uplink after a bulk upload stops arrives as a few
+        // hundred milliseconds of audio early (docs/latency-congested-uplink.md). Once a full
+        // window of refills without PLC has proven the surplus, cut most of it like an overflow.
+        // A window with PLC (a loaded host's late refills, say) leaves it to the gentle shrink:
+        // there the backlog is the cushion that keeps playout going.
+        let concealed = self.last_conceal.is_some_and(|at| now.saturating_duration_since(at) < DEPTH_WINDOW);
+        if demand > 0 && self.recovering.is_none() && self.surplus >= BACKLOG_TRIM && !concealed {
+            let keep =
+                (self.depth().1 + BACKLOG_KEEP).saturating_sub(self.surplus).max(self.target_samples() + demand as u64);
+            fade |= self.trim(u64::MAX, keep, now);
+        }
         if let Some(recovery) = &self.recovering {
             // Only discard media that starts behind the stalled timeline's deadline. A packet
             // straddling the deadline goes too: kept, it stayed as up to one packet of excess
@@ -860,6 +881,7 @@ impl JitterBuffer {
         };
         self.missing = self.missing.saturating_add(samples);
         self.concealments += 1;
+        self.last_conceal = Some(now);
         if self.last_shrink.is_some_and(|at| now.saturating_duration_since(at) <= TRIM_DIAGNOSTIC_WINDOW) {
             self.concealments_after_trim += 1;
         }
@@ -1025,7 +1047,8 @@ mod tests {
     fn shrink_requires_a_full_window_after_startup_or_starvation() {
         let mut jb = JitterBuffer::new();
         let now = Instant::now();
-        for i in 0..10 {
+        // Under `BACKLOG_TRIM` of surplus: the gentle shrink, not a cut.
+        for i in 0..6 {
             jb.push_at(i * FRAME, FRAME, vec![1], now, Clock::Rtp);
         }
         for ms in (0..5000).step_by(20) {
@@ -1038,7 +1061,7 @@ mod tests {
         assert_eq!(jb.pop_for(loss, FRAME as usize), Playout::Conceal(960));
         jb.arrival = None;
         let next = jb.next.unwrap();
-        for i in 0..10 {
+        for i in 0..6 {
             jb.push_at(next + i * FRAME, FRAME, vec![1], loss, Clock::Rtp);
         }
         // The zero low-water sample stays in the entire trailing window.
@@ -1440,6 +1463,84 @@ mod tests {
         }
     }
 
+    /// 40 s of 10 ms packets through a queue that fills to `peak_ms` from 5 s to 6 s, holds
+    /// until 15 s and empties by 15.4 s, in order; with `lossy`, every 150th packet sent after
+    /// that is lost. Returns the mean delay from send to playout per second of playout and the
+    /// concealments. Cuts commit as the decoder does in quiet audio.
+    fn bloated(clock: Clock, peak_ms: f64, lossy: bool) -> (Vec<f64>, u64) {
+        let start = Instant::now();
+        let stride = if clock == Clock::Sequence { FRAME } else { 480 };
+        let mut jb = JitterBuffer::new();
+        let queue = |sent: f64| match sent {
+            t if t < 5_000.0 => 0.0,
+            t if t < 6_000.0 => peak_ms * (t - 5_000.0) / 1_000.0,
+            t if t < 15_000.0 => peak_ms,
+            t if t < 15_400.0 => peak_ms * (15_400.0 - t) / 400.0,
+            _ => 0.0,
+        };
+        let mut last = 0.0_f64;
+        let arrivals: Vec<f64> = (0..4100u64)
+            .map(|k| {
+                last = last.max(k as f64 * 10.0 + 5.0 + queue(k as f64 * 10.0));
+                last
+            })
+            .collect();
+        let (mut index, mut play, mut now_ms) = (0, 0u64, 10.0);
+        let mut seconds = vec![(0.0, 0u32); 40];
+        let mut concealments = 0;
+        while now_ms < 40_000.0 {
+            while arrivals.get(index).is_some_and(|&at| at <= now_ms) {
+                let at = start + Duration::from_secs_f64(arrivals[index] / 1000.0);
+                if !(lossy && index > 1540 && index % 150 == 0) {
+                    jb.push_at(index as u64 * stride, 480, vec![1], at, clock);
+                }
+                index += 1;
+            }
+            let now = start + Duration::from_secs_f64(now_ms / 1000.0);
+            let head = jb.next.unwrap_or(0) / stride;
+            play += match jb.pop_at(now) {
+                Playout::Packet { skip, .. } => {
+                    let skip = skip.min(240);
+                    jb.shrunk(now, skip);
+                    let second = &mut seconds[(now_ms / 1000.0) as usize];
+                    *second = (second.0 + now_ms - head as f64 * 10.0, second.1 + 1);
+                    480 - skip as u64
+                }
+                Playout::Conceal(samples) => {
+                    concealments += 1;
+                    samples as u64
+                }
+                Playout::Idle => 480,
+            };
+            now_ms = 10.0 + play as f64 / 48.0;
+        }
+        (seconds.iter().map(|&(sum, n)| if n > 0 { sum / f64::from(n) } else { f64::NAN }).collect(), concealments)
+    }
+
+    #[test]
+    fn a_deep_queue_that_empties_leaves_no_delay_behind() {
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let (delay, _) = bloated(clock, 400.0, false);
+            let before = delay[3];
+            assert!(before < 40.0, "{clock:?}: {before:.1} ms before");
+            // While the queue holds, playout follows it.
+            assert!(delay[12] > 380.0, "{clock:?}: {:.1} ms in the queue", delay[12]);
+            // The window proves the surplus five seconds after the queue empties; the cut then
+            // takes all but a 40 ms cushion, which the gentle shrink drains after another window
+            // (here 10 ms/s, quiet cuts). The gentle shrink alone kept over 300 ms at 40 s.
+            for (second, &ms) in delay.iter().enumerate().skip(22) {
+                let limit = before + if second < 32 { 50.0 } else { 15.0 };
+                assert!(ms <= limit, "{clock:?}: {ms:.1} ms at {second} s, {before:.1} ms before");
+            }
+            // A queue the gentle shrink can drain is left to it.
+            let (small, _) = bloated(clock, 60.0, false);
+            assert!(small[39] <= small[3] + 15.0, "{clock:?}: {:.1} ms after a 60 ms queue", small[39]);
+            // So is one whose window keeps concealing: there the backlog is playout's cushion.
+            let (lossy, _) = bloated(clock, 400.0, true);
+            assert!(lossy[30] > 250.0, "{clock:?}: {:.1} ms at 30 s with recurring loss", lossy[30]);
+        }
+    }
+
     #[test]
     fn a_jittery_backlog_drains_when_refill_times_wander() {
         // Live refills run whenever the playback loop wakes, never on an exact grid. The arrival
@@ -1462,7 +1563,8 @@ mod tests {
         let mut jb = JitterBuffer::new();
         let now = Instant::now();
         let mut ts = 0;
-        for _ in 0..40 {
+        // Under `BACKLOG_TRIM` of surplus, which is cut without a proposal.
+        for _ in 0..10 {
             jb.push_at(ts, 480, vec![1], now, Clock::Rtp);
             ts += 480;
         }

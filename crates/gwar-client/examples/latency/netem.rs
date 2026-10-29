@@ -2,9 +2,13 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::Serialize;
 use std::{
-    collections::{BTreeMap, HashMap},
+    cmp::Reverse,
+    collections::{BTreeMap, BinaryHeap, HashMap},
     net::SocketAddr,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -46,6 +50,16 @@ pub struct Direction {
     rate: Option<u64>,
     /// How much sending time the bottleneck queues before it drops (drop-tail).
     queue: Duration,
+    /// A foreign bulk TCP upload through the same bottleneck (`bulk=`, see `Bulk`).
+    bulk: Option<BulkWhen>,
+    /// The bulk flow's round trip outside the bottleneck's queue.
+    bulk_rtt: Duration,
+}
+/// When the bulk flow sends: in a window of the measurement clock, or on `Relay::set_bulk`.
+#[derive(Clone, Debug, Serialize)]
+pub enum BulkWhen {
+    Window { start: Duration, end: Duration },
+    Manual,
 }
 impl Default for Direction {
     fn default() -> Self {
@@ -62,6 +76,8 @@ impl Default for Direction {
             seed: None,
             rate: None,
             queue: DEFAULT_QUEUE,
+            bulk: None,
+            bulk_rtt: Duration::from_millis(20),
         }
     }
 }
@@ -153,6 +169,18 @@ impl Spec {
                     "seed" => config.seed = Some(value.parse().context("seed must be an unsigned integer")?),
                     "rate" => config.rate = Some(rate(value)?),
                     "queue" => config.queue = duration(value)?,
+                    "bulk" => {
+                        config.bulk = Some(if value == "manual" {
+                            BulkWhen::Manual
+                        } else {
+                            let (start, end) =
+                                value.split_once('-').context("expected bulk=START-END or bulk=manual")?;
+                            let (start, end) = (duration(start)?, duration(end)?);
+                            ensure!(end > start, "bulk must end after it starts");
+                            BulkWhen::Window { start, end }
+                        })
+                    }
+                    "bulk_rtt" => config.bulk_rtt = duration(value)?,
                     _ => bail!("unknown LATENCY_NET option: {key}"),
                 }
             }
@@ -163,6 +191,9 @@ impl Spec {
             }
             ensure!(!config.keep_order || config.reorder == 0.0, "keep_order conflicts with reorder");
             ensure!(config.rate.is_some() || !keys.contains("queue"), "queue requires rate");
+            ensure!(config.rate.is_some() || config.bulk.is_none(), "bulk requires rate");
+            ensure!(config.bulk.is_some() || !keys.contains("bulk_rtt"), "bulk_rtt requires bulk");
+            ensure!(!config.bulk_rtt.is_zero(), "bulk_rtt must be positive");
             ensure!(!config.queue.is_zero(), "queue must be positive");
         }
         Ok(spec)
@@ -233,6 +264,247 @@ impl Counts {
 struct Link {
     /// When it finishes sending what it holds.
     busy: Duration,
+    bulk: Option<Bulk>,
+    /// Relayed datagrams' queue residence per `TIMELINE_BUCKET`.
+    timeline: Vec<QueueBucket>,
+}
+const TIMELINE_BUCKET: Duration = Duration::from_millis(250);
+#[derive(Clone, Default, Debug, Serialize)]
+pub struct QueueBucket {
+    start_s: f64,
+    packets: u64,
+    queue_dropped: u64,
+    max_ms: f64,
+    mean_ms: f64,
+}
+#[derive(Debug, Serialize)]
+pub struct LinkReport {
+    bulk: Option<BulkCounts>,
+    /// Empty without a `rate`.
+    queue_timeline: Vec<QueueBucket>,
+}
+impl Link {
+    fn new(config: &Direction, manual: Arc<AtomicBool>) -> Self {
+        let bulk = config.bulk.clone().map(|when| Bulk::new(when, manual, config.bulk_rtt));
+        Self { busy: Duration::ZERO, bulk, timeline: Vec::new() }
+    }
+    /// Queues `bytes` arriving at `at` behind everything before it, the bulk flow included:
+    /// when it leaves the link, or `None` if the drop-tail queue is full.
+    fn send(&mut self, at: Duration, bytes: usize, rate: u64, queue: Duration) -> Option<(Duration, Duration)> {
+        if let Some(bulk) = &mut self.bulk {
+            bulk.advance(at, &mut self.busy, rate, queue);
+        }
+        let start = at.max(self.busy);
+        let index = (at.as_nanos() / TIMELINE_BUCKET.as_nanos()) as usize;
+        while self.timeline.len() <= index {
+            let start_s = (TIMELINE_BUCKET * self.timeline.len() as u32).as_secs_f64();
+            self.timeline.push(QueueBucket { start_s, ..Default::default() });
+        }
+        let bucket = &mut self.timeline[index];
+        let Some(departure) = reserve(&mut self.busy, at, bytes, rate, queue) else {
+            bucket.queue_dropped += 1;
+            return None;
+        };
+        let wait_ms = (start - at).as_secs_f64() * 1000.0;
+        bucket.mean_ms = (bucket.mean_ms * bucket.packets as f64 + wait_ms) / (bucket.packets + 1) as f64;
+        bucket.packets += 1;
+        bucket.max_ms = bucket.max_ms.max(wait_ms);
+        Some((departure, start - at))
+    }
+    fn finish(self, now: Duration) -> LinkReport {
+        LinkReport { bulk: self.bulk.map(|bulk| bulk.finish(now)), queue_timeline: self.timeline }
+    }
+}
+/// A FIFO at `rate`: when `bytes` (payload and headers) arriving at `at` would finish sending,
+/// or `None` if they would wait longer than `queue` (drop-tail).
+fn reserve(busy: &mut Duration, at: Duration, bytes: usize, rate: u64, queue: Duration) -> Option<Duration> {
+    let start = at.max(*busy);
+    if start - at > queue {
+        return None;
+    }
+    *busy = start + Duration::from_secs_f64(bytes as f64 * 8.0 / rate as f64);
+    Some(*busy)
+}
+
+/// A full-size TCP/IPv4 segment on the wire.
+const BULK_SEGMENT: usize = 1500;
+const CUBIC_C: f64 = 0.4;
+const CUBIC_BETA: f64 = 0.7;
+const INITIAL_WINDOW: f64 = 10.0;
+/// An autotuned receive window this large never limits the links measured here.
+const MAX_WINDOW: f64 = 20_000.0;
+
+/// A foreign bulk upload: a greedy, loss-based TCP sender (CUBIC, RFC 8312, as macOS and Linux
+/// default to) that shares the bottleneck's FIFO and drop-tail queue with the relayed datagrams.
+/// It is simulated, never sent: each segment occupies the link, an ACK returns `rtt` after the
+/// segment leaves it, and a drop is noticed one smoothed round trip after it was sent (fast
+/// retransmit), reducing the window at most once per round trip. Each activation starts a new
+/// connection in slow start. Events are applied lazily, in time order, before each relayed
+/// datagram reaches the link, which is the only place the bulk flow is observable.
+struct Bulk {
+    when: BulkWhen,
+    manual: Arc<AtomicBool>,
+    rtt: Duration,
+    active: bool,
+    window: f64,
+    threshold: f64,
+    w_max: f64,
+    origin: f64,
+    k: f64,
+    epoch: Option<Duration>,
+    in_flight: usize,
+    recovery_until: Duration,
+    srtt: Duration,
+    /// (due, order, sent at, lost)
+    events: BinaryHeap<Reverse<(Duration, u64, Duration, bool)>>,
+    order: u64,
+    counts: BulkCounts,
+}
+#[derive(Clone, Default, Debug, Serialize)]
+pub struct BulkCounts {
+    sent: u64,
+    delivered: u64,
+    dropped: u64,
+    loss_events: u64,
+    max_window: f64,
+    max_srtt_ms: f64,
+    episodes: Vec<BulkEpisode>,
+}
+#[derive(Clone, Debug, Serialize)]
+pub struct BulkEpisode {
+    start_s: f64,
+    end_s: Option<f64>,
+    delivered: u64,
+    /// Delivered bits per second between `start_s` and `end_s`.
+    goodput_mbps: Option<f64>,
+}
+impl Bulk {
+    fn new(when: BulkWhen, manual: Arc<AtomicBool>, rtt: Duration) -> Self {
+        Self {
+            when,
+            manual,
+            rtt,
+            active: false,
+            window: INITIAL_WINDOW,
+            threshold: f64::INFINITY,
+            w_max: 0.0,
+            origin: 0.0,
+            k: 0.0,
+            epoch: None,
+            in_flight: 0,
+            recovery_until: Duration::ZERO,
+            srtt: rtt,
+            events: BinaryHeap::new(),
+            order: 0,
+            counts: BulkCounts::default(),
+        }
+    }
+    fn wanted(&self, at: Duration) -> bool {
+        match self.when {
+            BulkWhen::Window { start, end } => at >= start && at < end,
+            BulkWhen::Manual => self.manual.load(Ordering::Relaxed),
+        }
+    }
+    fn advance(&mut self, to: Duration, busy: &mut Duration, rate: u64, queue: Duration) {
+        while let Some(&Reverse((due, _, sent, lost))) = self.events.peek() {
+            if due > to {
+                break;
+            }
+            self.events.pop();
+            self.in_flight -= 1;
+            if lost {
+                self.lost(due);
+            } else {
+                self.acked(due, sent);
+            }
+            // A switch is only known from when it is seen; a window, at its own times.
+            if matches!(self.when, BulkWhen::Window { .. }) {
+                self.activate(due);
+            }
+            self.fill(due, busy, rate, queue);
+        }
+        self.activate(to);
+        self.fill(to, busy, rate, queue);
+    }
+    fn activate(&mut self, at: Duration) {
+        let wanted = self.wanted(at);
+        if wanted && !self.active {
+            // A new connection.
+            (self.window, self.threshold, self.w_max, self.epoch) = (INITIAL_WINDOW, f64::INFINITY, 0.0, None);
+            self.counts.episodes.push(BulkEpisode {
+                start_s: at.as_secs_f64(),
+                end_s: None,
+                delivered: 0,
+                goodput_mbps: None,
+            });
+        } else if !wanted && self.active {
+            self.close(at);
+        }
+        self.active = wanted;
+    }
+    fn close(&mut self, at: Duration) {
+        if let Some(episode) = self.counts.episodes.last_mut().filter(|e| e.end_s.is_none()) {
+            let seconds = at.as_secs_f64() - episode.start_s;
+            episode.end_s = Some(at.as_secs_f64());
+            episode.goodput_mbps =
+                (seconds > 0.0).then(|| (episode.delivered * BULK_SEGMENT as u64 * 8) as f64 / seconds / 1e6);
+        }
+    }
+    fn fill(&mut self, at: Duration, busy: &mut Duration, rate: u64, queue: Duration) {
+        while self.active && (self.in_flight as f64) < self.window.floor() {
+            self.in_flight += 1;
+            self.order += 1;
+            self.counts.sent += 1;
+            match reserve(busy, at, BULK_SEGMENT, rate, queue) {
+                Some(departure) => self.events.push(Reverse((departure + self.rtt, self.order, at, false))),
+                None => {
+                    self.counts.dropped += 1;
+                    self.events.push(Reverse((at + self.srtt, self.order, at, true)));
+                }
+            }
+        }
+    }
+    fn acked(&mut self, at: Duration, sent: Duration) {
+        self.counts.delivered += 1;
+        if let Some(episode) = self.counts.episodes.last_mut().filter(|e| e.end_s.is_none()) {
+            episode.delivered += 1;
+        }
+        self.srtt = (self.srtt * 7 + (at - sent)) / 8;
+        self.counts.max_srtt_ms = self.counts.max_srtt_ms.max(self.srtt.as_secs_f64() * 1000.0);
+        if self.window < self.threshold {
+            self.window += 1.0;
+        } else {
+            let epoch = *self.epoch.get_or_insert_with(|| {
+                self.k = if self.window < self.w_max { ((self.w_max - self.window) / CUBIC_C).cbrt() } else { 0.0 };
+                self.origin = self.w_max.max(self.window);
+                at
+            });
+            let t = (at - epoch).as_secs_f64();
+            let cubic = CUBIC_C * (t - self.k).powi(3) + self.origin;
+            let reno =
+                self.w_max * CUBIC_BETA + 3.0 * (1.0 - CUBIC_BETA) / (1.0 + CUBIC_BETA) * t / self.srtt.as_secs_f64();
+            let target = cubic.max(reno);
+            self.window += if target > self.window { (target - self.window) / self.window } else { 0.01 / self.window };
+        }
+        self.window = self.window.min(MAX_WINDOW);
+        self.counts.max_window = self.counts.max_window.max(self.window);
+    }
+    fn lost(&mut self, at: Duration) {
+        if at < self.recovery_until {
+            return;
+        }
+        self.counts.loss_events += 1;
+        // Fast convergence.
+        self.w_max = if self.window < self.w_max { self.window * (1.0 + CUBIC_BETA) / 2.0 } else { self.window };
+        self.window = (self.window * CUBIC_BETA).max(2.0);
+        self.threshold = self.window;
+        self.epoch = None;
+        self.recovery_until = at + self.srtt;
+    }
+    fn finish(mut self, now: Duration) -> BulkCounts {
+        self.close(now);
+        self.counts
+    }
 }
 struct Packet {
     due: Duration,
@@ -288,15 +560,13 @@ impl Scheduler {
         // of it have, and is dropped if that is more than `queue` away.
         let mut sent = at;
         if let Some(rate) = self.config.rate {
-            let start = at.max(link.busy);
-            if start - at > self.config.queue {
+            let Some((departure, wait)) = link.send(at, data.len() + WIRE_OVERHEAD, rate, self.config.queue) else {
                 self.counts.dropped += 1;
                 self.counts.queue_dropped += 1;
                 return Ok(());
-            }
-            link.busy = start + Duration::from_secs_f64((data.len() + WIRE_OVERHEAD) as f64 * 8.0 / rate as f64);
-            sent = link.busy;
-            self.counts.queue_max_ms = self.counts.queue_max_ms.max((start - at).as_secs_f64() * 1000.0);
+            };
+            sent = departure;
+            self.counts.queue_max_ms = self.counts.queue_max_ms.max(wait.as_secs_f64() * 1000.0);
         }
         let jitter = if self.config.jitter.is_zero() {
             0.0
@@ -392,6 +662,8 @@ pub struct Report {
     pub flow_seeds: Vec<FlowSeed>,
     pub up: Counts,
     pub down: Counts,
+    pub up_link: LinkReport,
+    pub down_link: LinkReport,
     /// Browser mode only: downlink datagrams the OS refused to send (see `bind_for_browsers`).
     pub downlink_send_errors: u64,
 }
@@ -404,6 +676,7 @@ pub struct Relay {
     runtime: Option<tokio::runtime::Runtime>,
     task: Option<JoinHandle<Result<Report>>>,
     stop: Option<oneshot::Sender<()>>,
+    bulk: Arc<AtomicBool>,
 }
 impl Relay {
     pub async fn bind() -> Result<Self> {
@@ -413,7 +686,7 @@ impl Relay {
         for socket in &voice {
             socket.set_nonblocking(true)?;
         }
-        Ok(Self { socket, voice, browsers: false, runtime: None, task: None, stop: None })
+        Ok(Self { socket, voice, browsers: false, runtime: None, task: None, stop: None, bulk: Arc::default() })
     }
     /// For browser clients (apps/web/e2e/latency.mjs): every local ICE candidate that checks the
     /// relay is its own flow, and a candidate on a host interface reaches this loopback socket
@@ -434,6 +707,11 @@ impl Relay {
     pub fn voice_address(&self, role: usize) -> Result<SocketAddr> {
         Ok(self.voice[role].local_addr()?)
     }
+    /// Starts or stops every `bulk=manual` flow.
+    #[allow(dead_code)] // examples/web_latency.rs only
+    pub fn set_bulk(&self, on: bool) {
+        self.bulk.store(on, Ordering::Relaxed);
+    }
     pub fn start(&mut self, server: SocketAddr, spec: Spec, epoch: Instant) -> Result<()> {
         let (stop, receive) = oneshot::channel();
         self.stop = Some(stop);
@@ -441,13 +719,14 @@ impl Relay {
             tokio::runtime::Builder::new_multi_thread().worker_threads(1).thread_name("netem").enable_all().build()?;
         let (socket, browsers) = (self.socket.try_clone()?, self.browsers);
         let voice = [self.voice[0].try_clone()?, self.voice[1].try_clone()?];
+        let bulk = self.bulk.clone();
         self.task = Some(runtime.spawn(async move {
             let front = Arc::new(UdpSocket::from_std(socket)?);
             let voice = [
                 Arc::new(UdpSocket::from_std(voice[0].try_clone()?)?),
                 Arc::new(UdpSocket::from_std(voice[1].try_clone()?)?),
             ];
-            relay(front, voice, server, spec, epoch, receive, browsers).await
+            relay(front, voice, server, spec, epoch, receive, browsers, bulk).await
         }));
         self.runtime = Some(runtime);
         Ok(())
@@ -490,6 +769,7 @@ async fn relay(
     epoch: Instant,
     mut stop: oneshot::Receiver<()>,
     browsers: bool,
+    bulk: Arc<AtomicBool>,
 ) -> Result<Report> {
     ensure!(server.ip().is_loopback(), "netem is loopback-only");
     ensure!(server != front.local_addr()?, "relay upstream must differ from its advertised address");
@@ -516,7 +796,7 @@ async fn relay(
         });
     }
     let mut downlink_send_errors = 0;
-    let (mut up_link, mut down_link) = (Link::default(), Link::default());
+    let (mut up_link, mut down_link) = (Link::new(&spec.up, bulk.clone()), Link::new(&spec.down, bulk));
     loop {
         // Drain due packets before polling arrivals, including the whole stall burst.
         for flow in &mut flows {
@@ -600,6 +880,8 @@ async fn relay(
         flow_seeds,
         up: Counts::default(),
         down: Counts::default(),
+        up_link: up_link.finish(epoch.elapsed()),
+        down_link: down_link.finish(epoch.elapsed()),
         downlink_send_errors,
     };
     for flow in flows {
@@ -661,6 +943,7 @@ mod tests {
     fn strict_spec_validation() {
         Spec::parse("seed=42;up:stall=270ms@12s,jitter=5ms,every=10s;down:loss=1%,reorder=0.5%").unwrap();
         Spec::parse("up:rate=10mbit,queue=50ms;down:rate=5000kbit,loss=1%").unwrap();
+        Spec::parse("up:rate=10mbit,queue=400ms,bulk=manual,bulk_rtt=30ms;down:rate=1mbit,bulk=1.5s-20s").unwrap();
         for invalid in [
             "",
             "up:",
@@ -681,6 +964,11 @@ mod tests {
             "up:rate=fast",
             "up:queue=50ms",
             "up:rate=1mbit,queue=0ms",
+            "up:bulk=manual",
+            "up:rate=1mbit,bulk=2s-1s",
+            "up:rate=1mbit,bulk=soon",
+            "up:rate=1mbit,bulk_rtt=20ms",
+            "up:rate=1mbit,bulk=manual,bulk_rtt=0ms",
         ] {
             assert!(Spec::parse(invalid).is_err(), "accepted {invalid}");
         }
@@ -807,6 +1095,73 @@ mod tests {
         dues.sort();
         assert_eq!(dues, (1..=11).map(|ms| ms * 1000 + 5000).collect::<Vec<_>>());
         assert_eq!(a.len() + b.len(), 11);
+    }
+
+    /// A 64 kb/s voice-like flow beside the bulk flow: (arrival, time to leave the link or `None` if dropped).
+    fn probe(
+        source: &str,
+        manual: &Arc<AtomicBool>,
+        until_ms: u64,
+        toggle: impl Fn(u64) -> Option<bool>,
+    ) -> (Vec<(u64, Option<f64>)>, LinkReport) {
+        let spec = Spec::parse(source).unwrap();
+        let mut link = Link::new(&spec.up, manual.clone());
+        let mut s = Scheduler::new(spec.up, 1, 0);
+        let mut waits = Vec::new();
+        for ms in (0..until_ms).step_by(20) {
+            if let Some(on) = toggle(ms) {
+                manual.store(on, Ordering::Relaxed);
+            }
+            let dropped = s.counts.queue_dropped;
+            let at = Duration::from_millis(ms);
+            s.enqueue(at, vec![0; 132], &mut link).unwrap();
+            let wait = s.queue.pop_last().map(|(_, p)| (p.due - at).as_secs_f64() * 1000.0);
+            assert_eq!(wait.is_none(), s.counts.queue_dropped > dropped);
+            waits.push((ms, wait));
+        }
+        (waits, link.finish(Duration::from_millis(until_ms)))
+    }
+    fn mean(waits: &[(u64, Option<f64>)], from: u64, to: u64) -> f64 {
+        let v: Vec<f64> = waits.iter().filter(|(t, _)| (from..to).contains(t)).filter_map(|w| w.1).collect();
+        v.iter().sum::<f64>() / v.len() as f64
+    }
+    #[test]
+    fn a_bulk_upload_fills_a_deep_drop_tail_queue_and_drains_when_it_stops() {
+        let (waits, report) =
+            probe("up:rate=10mbit,queue=400ms,bulk=2s-32s,bulk_rtt=20ms", &Arc::default(), 34_000, |_| None);
+        let bulk = report.bulk.unwrap();
+        let episode = &bulk.episodes[0];
+        assert_eq!((episode.start_s, episode.end_s), (2.0, Some(32.0)));
+        // It takes the whole link but what the probe uses, and keeps the buffer mostly full.
+        let goodput = episode.goodput_mbps.unwrap();
+        assert!((9.0..10.0).contains(&goodput), "goodput {goodput}");
+        assert!(bulk.loss_events >= 2 && bulk.dropped > 0, "{bulk:?}");
+        let loaded = mean(&waits, 10_000, 32_000);
+        assert!((200.0..=400.0).contains(&loaded), "loaded queue {loaded} ms");
+        assert!(waits.iter().any(|w| w.1.is_none()), "a full queue drops the probe too");
+        assert!(mean(&waits, 0, 2_000) < 1.0);
+        // Within the queue's 400 ms (and its last round trip) the link is idle again.
+        assert!(mean(&waits, 32_500, 34_000) < 1.0, "after {}", mean(&waits, 32_500, 34_000));
+        assert!(report.queue_timeline.iter().any(|b| b.max_ms > 300.0));
+    }
+    #[test]
+    fn a_manual_bulk_upload_follows_its_switch_and_restarts_in_slow_start() {
+        let manual = Arc::new(AtomicBool::new(false));
+        let toggle = |ms| match ms {
+            1_000 | 12_000 => Some(true),
+            8_000 | 15_000 => Some(false),
+            _ => None,
+        };
+        let (waits, report) = probe("up:rate=20mbit,queue=300ms,bulk=manual", &manual, 17_000, toggle);
+        let bulk = report.bulk.unwrap();
+        assert_eq!(
+            bulk.episodes.iter().map(|e| (e.start_s, e.end_s)).collect::<Vec<_>>(),
+            [(1.0, Some(8.0)), (12.0, Some(15.0))]
+        );
+        assert!(mean(&waits, 3_000, 8_000) > 100.0);
+        assert!(mean(&waits, 8_500, 12_000) < 1.0);
+        assert!(mean(&waits, 13_000, 15_000) > 100.0);
+        assert!(mean(&waits, 15_500, 17_000) < 1.0);
     }
 
     #[tokio::test]

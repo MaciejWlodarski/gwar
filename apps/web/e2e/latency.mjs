@@ -15,6 +15,13 @@
  *          or, Chromium only, a MediaStreamTrackGenerator fed 10 ms AudioData from the page)
  *        ptime=MS (adds a=ptime to the sender's answer: a harness experiment, not the app)
  *        jbt=MS (the receiver's RTCRtpReceiver.jitterBufferTarget: also an experiment)
+ *        screen=off|on (Chromium: the voice sender shares a busy canvas through the app's UI and
+ *          the receiver watches it, each replaced by a third page beside a native peer; stats
+ *          are sampled every 500 ms) codec=auto|h264|vp9 (the sharer's video encoders)
+ *        quality=1080p60 (smooth mode; HEIGHTpFPS) settle=MS (screen ramp before arming, 15000)
+ *        bulk=START-END (seconds after the first marker: the relay's bulk=manual uploads run;
+ *          docs/latency-congested-uplink.md) web=DIR (serve this e2e build instead)
+ *        fixture=PATH (this web_latency build instead, e.g. a native peer before a change)
  * Variants run interleaved, alternating supplied and reversed order (A B B A ...), each run
  * with a fresh server, relay and browser. Output: target/web-latency/<time>/, one directory per
  * run (run.json, latency.csv, logs) and summary.json. A run fails, and is kept, if more than
@@ -23,7 +30,7 @@
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -39,8 +46,19 @@ import {
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(webRoot, "../..");
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-const NETWORKS = { idle: null, relay: "seed=1", jitter: "seed=42;down:jitter=10ms", loss: "seed=42;down:loss=2%" };
-const DEFAULTS = { path: "browser", engine: "chromium", crypto: "plain", ns: "off", net: "idle", mic: "webaudio", ptime: null, jbt: null };
+// up10/up20: a sender uplink bottleneck with a deep drop-tail buffer (400 ms at line rate) and a
+// 20 ms base round trip, with an idle foreign bulk upload that `bulk=` switches on.
+const congested = rate => `seed=1;up:rate=${rate},queue=400ms,delay=10ms,bulk=manual,bulk_rtt=20ms;down:delay=10ms`;
+const NETWORKS = {
+  idle: null, relay: "seed=1", jitter: "seed=42;down:jitter=10ms", loss: "seed=42;down:loss=2%",
+  up10: congested("10mbit"), up20: congested("20mbit"),
+};
+const DEFAULTS = {
+  path: "browser", engine: "chromium", crypto: "plain", ns: "off", net: "idle", mic: "webaudio", ptime: null, jbt: null,
+  screen: "off", codec: "auto", quality: "1080p60", settle: "15000", bulk: null, web: null, fixture: null,
+};
+/** Stats sampling while markers play (screen or bulk runs). */
+const SAMPLE_MS = 500;
 const MINIMUM_MS = 5;
 
 function parseArgs(argv) {
@@ -89,6 +107,23 @@ function parseArgs(argv) {
     assert(c.ns === "off" || c.path !== "native-browser", "ns applies to a browser sender");
     for (const key of ["ptime", "jbt"]) if (c[key] !== null) { c[key] = Number(c[key]); assert(Number.isFinite(c[key]) && c[key] >= 0, key); }
     c.netSpec = c.net in NETWORKS ? NETWORKS[c.net] : c.net;
+    assert(["off", "on"].includes(c.screen), `screen ${c.screen}`);
+    assert(c.screen === "off" || c.engine === "chromium", "screen needs Chromium");
+    assert(["auto", "h264", "vp9"].includes(c.codec), `codec ${c.codec}`);
+    const quality = /^(720|1080|1440)p(15|30|60)$/.exec(c.quality);
+    assert(quality, `quality ${c.quality}`);
+    c.share = { height: Number(quality[1]), fps: Number(quality[2]), codec: c.codec };
+    c.settle = Number(c.settle);
+    assert(Number.isInteger(c.settle) && c.settle >= 0 && c.settle <= 60_000, "settle must be 0..60000 ms");
+    if (c.bulk !== null) {
+      const [on, off] = c.bulk.split("-").map(Number);
+      assert(Number.isFinite(on) && Number.isFinite(off) && on >= 0 && off > on, `bulk ${c.bulk}`);
+      assert(/bulk=manual/.test(c.netSpec ?? ""), "bulk needs a LATENCY_NET spec with bulk=manual (net=up10, up20)");
+      c.bulkWindow = { on, off };
+    }
+    if (c.web !== null) c.web = path.resolve(c.web);
+    if (c.fixture !== null) { c.fixture = path.resolve(c.fixture); assert(existsSync(c.fixture), `fixture=${c.fixture} does not exist`); }
+    assert(!c.bulkWindow || options.markers * PERIOD / RATE >= c.bulkWindow.off + 10, "markers must run at least 10 s past the bulk upload's end");
   }
   return options;
 }
@@ -142,15 +177,51 @@ function load() {
 // ------------------------------------------------------------------ the page
 
 /** Init script: the synthetic microphone, peer connections, the output tap and experiments. */
-function pagePatch({ role, ptime, mic, scheme }) {
+function pagePatch({ role, ptime, mic, scheme, share }) {
   const state = window.__latency = { role, pcs: [] };
   const NativePC = window.RTCPeerConnection;
   window.RTCPeerConnection = new Proxy(NativePC, { construct(target, args) {
     const pc = new target(...args);
     state.pcs.push(pc);
-    if (role === "receiver" && typeof window.MediaStreamTrackProcessor === "function") pc.addEventListener("track", e => decoded(e.track));
+    if (role === "receiver" && typeof window.MediaStreamTrackProcessor === "function") pc.addEventListener("track", e => { if (e.track.kind === "audio") decoded(e.track); });
     return pc;
   } });
+  // Voice has its own transport with audio only; screen publish and watch transports carry video.
+  const kinds = pc => pc.getTransceivers().map(t => t.receiver.track?.kind);
+  state.voicePc = () => state.pcs.filter(pc => pc.connectionState !== "closed" && kinds(pc).includes("audio") && !kinds(pc).includes("video")).at(-1) ?? null;
+  state.screenPc = () => state.pcs.filter(pc => pc.connectionState !== "closed" && kinds(pc).includes("video")).at(-1) ?? null;
+  if (share) {
+    if (share.codec !== "auto") {
+      const capabilities = RTCRtpSender.getCapabilities.bind(RTCRtpSender);
+      RTCRtpSender.getCapabilities = kind => {
+        const caps = capabilities(kind);
+        return kind === "video" && caps ? { ...caps, codecs: caps.codecs.filter(c => ["video/rtx", `video/${share.codec}`].includes(c.mimeType.toLowerCase())) } : caps;
+      };
+    }
+    // screen-startup.mjs's busy source (moving blocks across the whole frame, calibrated to fit
+    // 1080p60's 8 Mb/s cap), scaled to the share's size.
+    navigator.mediaDevices.getDisplayMedia = async () => {
+      const width = Math.round(share.height * 16 / 9), height = share.height, k = width / 1920;
+      const canvas = document.createElement("canvas");
+      [canvas.width, canvas.height] = [width, height];
+      canvas.style.cssText = "position:fixed;left:0;bottom:0;width:64px;height:36px;opacity:0.02;pointer-events:none;z-index:-1";
+      document.body.appendChild(canvas);
+      const ctx = canvas.getContext("2d");
+      let f = 0;
+      const draw = () => {
+        f++;
+        ctx.fillStyle = "#17212e"; ctx.fillRect(0, 0, width, height);
+        for (let y = 0; y < 9; y++) for (let x = 0; x < 16; x++) {
+          ctx.fillStyle = `hsl(${(x * 19 + y * 11 + f * 2) % 360} 60% ${30 + (x + y) % 25}%)`;
+          ctx.fillRect((x * 120 + Math.sin(f / 17 + y) * 18) * k, (y * 120 + Math.cos(f / 23 + x) * 12) * k, 90 * k, 84 * k);
+        }
+        ctx.fillStyle = "white"; ctx.font = `${32 * k}px sans-serif`; ctx.fillText(`frame ${f}`, 50 * k, 1040 * k);
+      };
+      draw();
+      setInterval(draw, 1000 / share.fps);
+      return canvas.captureStream(share.fps);
+    };
+  }
   // Chromium: decoded audio as remote tracks deliver it to their sinks, before the app's WebAudio
   // graph. A slot's frames are kept once one carries sound (only the sender's slot does).
   state.decoded = [];
@@ -265,7 +336,7 @@ function pagePatch({ role, ptime, mic, scheme }) {
 function pageStats() {
   return (async () => {
     const state = window.__latency;
-    const pc = state.pcs.at(-1);
+    const pc = state.voicePc();
     const report = pc ? [...(await pc.getStats()).values()] : [];
     const by = id => report.find(s => s.id === id);
     const inbound = report.filter(s => s.type === "inbound-rtp" && s.kind === "audio").sort((a, b) => (b.packetsReceived ?? 0) - (a.packetsReceived ?? 0))[0] ?? null;
@@ -289,10 +360,10 @@ function pageStats() {
   })();
 }
 
-async function device(browser, web, url, role, config) {
+async function device(browser, web, url, role, config, sharing = false) {
   const context = await browser.newContext({ locale: "en-US" });
   await context.route("**/*", route => (new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort()));
-  await context.addInitScript(pagePatch, { role, ptime: role === "sender" ? config.ptime : null, mic: config.mic, scheme: { RATE, PERIOD, MARKER, TONES } });
+  await context.addInitScript(pagePatch, { role, ptime: role === "sender" ? config.ptime : null, mic: config.mic, scheme: { RATE, PERIOD, MARKER, TONES }, share: sharing ? config.share : null });
   const page = await context.newPage();
   page.errors = [];
   page.on("pageerror", e => page.errors.push(String(e)));
@@ -337,11 +408,53 @@ async function join(page, channel) {
     return false;
   }, `${page.role} joins the channel`, 40_000);
 }
+/** Shares the page's canvas through the app's UI, smooth mode at the configured size and rate. */
+async function share(page, { height, fps }) {
+  await page.getByRole("button", { name: "Share screen", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Share your screen" });
+  await dialog.waitFor({ timeout: 20_000 });
+  await dialog.getByText(/^Sharing your (?:entire )?screen$/).waitFor();
+  await dialog.getByRole("radio", { name: "Smoothness", exact: true }).check();
+  await dialog.getByLabel("Resolution", { exact: true }).selectOption(String(height));
+  await dialog.getByLabel("Frame rate", { exact: true }).selectOption(String(fps));
+  await dialog.getByRole("button", { name: "Share", exact: true }).click();
+  await page.getByRole("status", { name: "You are sharing your screen" }).getByText(/watching$/).waitFor({ timeout: 30_000 });
+}
+
+/** Cumulative counters of the voice and screen transports, sampled every `SAMPLE_MS`. */
+function transportSample() {
+  return (async () => {
+    const state = window.__latency;
+    const read = async pc => {
+      if (!pc) return null;
+      const report = await pc.getStats();
+      const all = [...report.values()];
+      const transport = all.find(s => s.type === "transport");
+      const pair = report.get(transport?.selectedCandidatePairId) ?? all.find(s => s.type === "candidate-pair" && s.nominated && s.state === "succeeded");
+      const pick = (s, keys) => s ? Object.fromEntries(keys.filter(k => s[k] !== undefined).map(k => [k, s[k]])) : null;
+      const outbound = all.filter(s => s.type === "outbound-rtp").sort((a, b) => (b.bytesSent ?? 0) - (a.bytesSent ?? 0))[0];
+      const inbound = all.filter(s => s.type === "inbound-rtp").sort((a, b) => (b.bytesReceived ?? 0) - (a.bytesReceived ?? 0))[0];
+      const remote = outbound && all.find(s => s.type === "remote-inbound-rtp" && s.localId === outbound.id);
+      const sender = pc.getSenders().find(x => x.track?.kind === "video");
+      return {
+        pair: pick(pair, ["currentRoundTripTime", "availableOutgoingBitrate", "bytesSent", "bytesReceived"]),
+        out: pick(outbound, ["kind", "bytesSent", "headerBytesSent", "retransmittedBytesSent", "packetsSent", "framesEncoded", "framesSent", "framesPerSecond", "frameWidth", "frameHeight", "targetBitrate", "qualityLimitationReason", "nackCount", "pliCount"]),
+        outCodec: outbound ? report.get(outbound.codecId)?.mimeType ?? null : null,
+        remote: pick(remote, ["roundTripTime", "fractionLost", "packetsLost"]),
+        in: pick(inbound, ["kind", "bytesReceived", "packetsReceived", "packetsLost", "framesDecoded", "framesDropped", "framesPerSecond", "frameWidth", "frameHeight", "freezeCount", "totalFreezesDuration",
+          "jitterBufferDelay", "jitterBufferEmittedCount", "jitterBufferTargetDelay", "concealedSamples", "totalSamplesReceived", "concealmentEvents"]),
+        maxBitrate: sender?.getParameters().encodings?.[0]?.maxBitrate ?? null,
+      };
+    };
+    return { at: Date.now(), voice: await read(state.voicePc()), screen: await read(state.screenPc()) };
+  })();
+}
+
 const voiceState = page => page.evaluate(async () => {
   const { useVoice } = await window.__gwarE2eImport("/src/state/stores.ts");
   const { controller } = await window.__gwarE2eImport("/src/state/controller.ts");
   const engine = controller.engine;
-  const sent = window.__latency.pcs.at(-1)?.getSenders()[0]?.track ?? null;
+  const sent = window.__latency.voicePc()?.getSenders()[0]?.track ?? null;
   return {
     state: useVoice.getState().state, encryption: useVoice.getState().encryption,
     denoise: engine.denoise ? { running: engine.denoise.running, sent: sent === engine.denoise.track } : null,
@@ -388,7 +501,7 @@ async function measure({ config, web, binary, dir, markers, warmupMs, record, ow
   const pause = ms => wait(ms, undefined, { signal: owned.abort.signal });
   const fixture = await fixtureProcess(binary, web, dir, config.netSpec);
   const ready = await fixture.response("ready");
-  record.fixture = { url: ready.url, media: ready.media, mediaBind: ready.mediaBind };
+  record.fixture = { url: ready.url, media: ready.media, mediaBind: ready.mediaBind, relayEpochMs: ready.relayEpochMs };
   const engine = { chromium, webkit, firefox }[config.engine];
   const browser = await engine.launch({
     headless: true,
@@ -399,9 +512,16 @@ async function measure({ config, web, binary, dir, markers, warmupMs, record, ow
   record.browserVersion = browser.version();
   try {
     owned.abort.signal.throwIfAborted();
-    const sender = config.path === "native-browser" ? null : await device(browser, web, ready.url, "sender", config);
+    const sharing = config.screen === "on";
+    const sender = config.path === "native-browser" ? null : await device(browser, web, ready.url, "sender", config, sharing);
     const receiver = config.path === "browser-native" ? null : await device(browser, web, ready.url, "receiver", config);
     const pages = [sender, receiver].filter(Boolean);
+    // The screen comes from the voice sender's page, or beside a native sender from a third
+    // page whose microphone is silent; every uplink queues behind the relay's one `up` link.
+    const sharer = !sharing ? null : sender ?? await device(browser, web, ready.url, "sharer", config, true);
+    // Likewise the share is watched by the receiver's page, or beside a native receiver by a third.
+    const viewer = !sharing ? null : receiver ?? await device(browser, web, ready.url, "viewer", config);
+    const members = [...new Set([...pages, sharer, viewer].filter(Boolean))];
     let channel = await pages[0].evaluate(async () => {
       const { useSession } = await window.__gwarE2eImport("/src/state/stores.ts");
       return useSession.getState().server.default_channel;
@@ -416,9 +536,9 @@ async function measure({ config, web, binary, dir, markers, warmupMs, record, ow
         return (await controller.createChannel({ name: "latency", encrypted: true, history: false })).id;
       });
     }
-    for (const page of pages) await join(page, channel);
+    for (const page of members) await join(page, channel);
     if (config.path !== "browser") await fixture.command(config.path === "browser-native" ? "receive" : "send");
-    for (const page of pages) {
+    for (const page of members) {
       await waitFor(async () => (await voiceState(page)).state === "connected", `${page.role} voice connected`, 30_000);
       if (config.crypto === "sframe") await waitFor(async () => (await voiceState(page)).encryption === "active", `${page.role} SFrame active`, 30_000);
     }
@@ -428,7 +548,7 @@ async function measure({ config, web, binary, dir, markers, warmupMs, record, ow
       // Audio flows: a second of decoded samples from the sender.
       await waitFor(async () => ((await receiver.evaluate(pageStats)).inbound?.totalSamplesReceived ?? 0) > 48_000, "audio at the receiver", 30_000);
       if (config.jbt !== null) {
-        record.jitterBufferTarget = await receiver.evaluate(ms => window.__latency.pcs.at(-1).getReceivers().map(r => {
+        record.jitterBufferTarget = await receiver.evaluate(ms => window.__latency.voicePc().getReceivers().map(r => {
           if (!("jitterBufferTarget" in r)) return null;
           r.jitterBufferTarget = ms;
           return r.jitterBufferTarget;
@@ -441,6 +561,14 @@ async function measure({ config, web, binary, dir, markers, warmupMs, record, ow
         if (v.denoiseUnavailable) throw new Error("noise suppression is unavailable in this browser");
         return v.denoise?.running && v.denoise.sent;
       }, "the noise suppression model sends", 60_000);
+    }
+    if (sharer) {
+      const begin = Date.now();
+      await share(sharer, config.share);
+      await viewer.getByRole("button", { name: `${sharer.role} is sharing their screen. Click to watch.`, exact: true }).click();
+      await waitFor(async () => ((await viewer.evaluate(transportSample)).screen?.in?.framesDecoded ?? 0) > 0, "screen frames at the viewer", 30_000);
+      record.screenStartMs = Date.now() - begin;
+      await pause(config.settle);
     }
     record.voice = Object.fromEntries(await Promise.all(pages.map(async page => [page.role, await voiceState(page)])));
 
@@ -460,7 +588,21 @@ async function measure({ config, web, binary, dir, markers, warmupMs, record, ow
     record.load.armed = load();
     await pause(warmupMs);
     const before = Object.fromEntries(await Promise.all(pages.map(async page => [page.role, await page.evaluate(pageStats)])));
-    await pause(markers * PERIOD * 1000 / RATE + MATCH_WINDOW_MS + 500);
+    // Markers play: switch the bulk upload at its times and sample the transports.
+    const total = markers * PERIOD * 1000 / RATE + MATCH_WINDOW_MS + 500;
+    const events = config.bulkWindow ? [[config.bulkWindow.on * 1000, "on"], [config.bulkWindow.off * 1000, "off"]] : [];
+    const sampled = [...new Set([sender, sharer, receiver, viewer].filter(Boolean))];
+    const sampling = sharing || events.length > 0;
+    record.timeline = [];
+    record.bulkEvents = [];
+    const begin = Date.now();
+    while (Date.now() - begin < total) {
+      while (events.length && events[0][0] <= Date.now() - begin) record.bulkEvents.push(await fixture.command(`bulk ${events.shift()[1]}`));
+      if (sampling) record.timeline.push(Object.fromEntries(await Promise.all(sampled.map(async page => [page.role, await page.evaluate(transportSample)]))));
+      const next = Math.min(total, events[0]?.[0] ?? Infinity, (Math.floor((Date.now() - begin) / SAMPLE_MS) + 1) * SAMPLE_MS);
+      await pause(Math.max(0, next - (Date.now() - begin)));
+    }
+    if (events.length) throw new Error("the bulk upload's events did not all run");
     const after = Object.fromEntries(await Promise.all(pages.map(async page => [page.role, await page.evaluate(pageStats)])));
     record.stats = { before, after };
     record.load.end = load();
@@ -486,7 +628,7 @@ async function measure({ config, web, binary, dir, markers, warmupMs, record, ow
       const { controller } = await window.__gwarE2eImport("/src/state/controller.ts");
       return controller.voiceCounters();
     })]))) : null;
-    record.pageErrors = Object.fromEntries(pages.map(page => [page.role, page.errors.filter(e => !/favicon|Failed to load resource|Conversation synchronization/.test(e)).slice(-20)]));
+    record.pageErrors = Object.fromEntries(members.map(page => [page.role, page.errors.filter(e => !/favicon|Failed to load resource|Conversation synchronization/.test(e)).slice(-20)]));
     fixture.stdin.end("quit\n");
     return { generator, tap, sent, decoded, native: finish.native };
   } finally {
@@ -601,10 +743,105 @@ function analyze({ record, generator, tap, sent, decoded, native, dir, markers }
     latencies_ms: matching.matched.map(m => m.latency_ms), marker_captures: captures, detected_onsets: onsets,
   });
   record.derived = derive(record);
+  if (record.timeline?.length || record.bulkEvents?.length) record.congestion = congestion(record, captures, matching);
   // NetEq's delay changes between runs (its target adapts); without it, runs compare the rest.
   if (record.median_ms !== null && Number.isFinite(record.derived.jitterBufferMs)) record.derived.medianLessJitterBufferMs = record.median_ms - record.derived.jitterBufferMs;
   if (matching.rejected.length) throw new Error(`rejected ${matching.rejected.length} onsets below ${MINIMUM_MS} ms`);
   if (matching.lost.length > markers / 20) throw new Error(`lost ${matching.lost.length} of ${markers} markers; at least 95% must match`);
+}
+
+/**
+ * Phases of a congested-uplink run (docs/latency-congested-uplink.md): before the bulk upload,
+ * while it runs, and after it stops (the whole run is `pre` without one). Voice from the markers,
+ * the jitter buffer and concealment from the receiver's voice counters, the screen from the
+ * sharer's publish and the receiver's watch counters, in `SAMPLE_MS` windows. Recovery is the
+ * time from the upload's end to the last sign of it: a marker above the `pre` p95 + 10 ms, a
+ * window of jitter buffering above the `pre` mean + 10 ms, a screen window under 80% of the `pre`
+ * median rate, or a screen round trip above the `pre` median + 50 ms. A signal that never
+ * recovers reports the run's remaining time with `recovered: false`.
+ */
+const RECOVERY = { voiceMs: 10, jitterBufferMs: 10, screenRate: 0.8, rttMs: 50 };
+function congestion(record, captures, matching) {
+  const on = record.bulkEvents?.find(e => e.on)?.atMs ?? null, off = record.bulkEvents?.find(e => !e.on)?.atMs ?? null;
+  const phaseOf = t => (on === null || t < on ? "pre" : t < off ? "during" : "after");
+  const phases = ["pre", ...(on === null ? [] : ["during", "after"])];
+  const med = v => { const x = v.filter(Number.isFinite).sort((a, b) => a - b); return x.length ? quantile(x, 0.5) : null; };
+  const max = v => { const x = v.filter(Number.isFinite); return x.length ? Math.max(...x) : null; };
+  const end = Math.max(...captures.map(c => c.capture_ms)) + PERIOD * 1000 / RATE;
+  const recovery = last => (off === null ? null : last === undefined ? { ms: 0, recovered: true } : { ms: Math.max(0, last - off), recovered: last < end - 2000 });
+  // Voice: markers by capture time.
+  const marked = matching.matched.map(m => ({ t: captures[m.marker].capture_ms, ms: m.latency_ms }));
+  const lost = matching.lost.map(i => captures[i].capture_ms);
+  const voice = Object.fromEntries(phases.map(p => {
+    const l = marked.filter(m => phaseOf(m.t) === p).map(m => m.ms).sort((a, b) => a - b);
+    return [p, { n: l.length, lost: lost.filter(t => phaseOf(t) === p).length, p50_ms: quantile(l, 0.5), p95_ms: quantile(l, 0.95), p99_ms: quantile(l, 0.99), max_ms: l.at(-1) ?? null }];
+  }));
+  const after = (xs, limit) => xs.filter(x => x.t >= off && x.bad(limit)).map(x => x.t).at(-1);
+  if (off !== null && voice.pre.p95_ms !== null) {
+    const limit = voice.pre.p95_ms + RECOVERY.voiceMs;
+    voice.recovery = recovery([...marked.filter(m => m.t >= off && m.ms > limit).map(m => m.t), ...lost.filter(t => t >= off)].sort((a, b) => a - b).at(-1));
+  }
+  // Windows between consecutive samples of a page's transport.
+  const windows = (role, kind, fn) => {
+    const rows = record.timeline.map(r => r[role]).filter(r => r?.[kind]);
+    return rows.slice(1).flatMap((b, i) => {
+      const a = rows[i], dt = (b.at - a.at) / 1000;
+      if (!(dt > 0)) return [];
+      const value = fn(a[kind], b[kind], dt);
+      return value === null ? [] : [{ t: b.at, ...value }];
+    });
+  };
+  const d = (a, b, key) => (b?.[key] ?? NaN) - (a?.[key] ?? NaN);
+  const byPhase = (rows, keys) => Object.fromEntries(phases.map(p => [p, Object.fromEntries(keys.map(k => [k, med(rows.filter(r => phaseOf(r.t) === p).map(r => r[k]))]))]));
+  const jb = windows("receiver", "voice", (a, b) => {
+    const emitted = d(a.in, b.in, "jitterBufferEmittedCount"), samples = d(a.in, b.in, "totalSamplesReceived");
+    return { jitterBufferMs: emitted > 0 ? d(a.in, b.in, "jitterBufferDelay") / emitted * 1000 : NaN,
+      targetMs: emitted > 0 ? d(a.in, b.in, "jitterBufferTargetDelay") / emitted * 1000 : NaN,
+      concealedPercent: samples > 0 ? d(a.in, b.in, "concealedSamples") / samples * 100 : NaN };
+  });
+  const jitterBuffer = byPhase(jb, ["jitterBufferMs", "targetMs", "concealedPercent"]);
+  for (const p of phases) jitterBuffer[p].maxMs = max(jb.filter(r => phaseOf(r.t) === p).map(r => r.jitterBufferMs));
+  if (off !== null && jitterBuffer.pre.jitterBufferMs !== null) {
+    const limit = jitterBuffer.pre.jitterBufferMs + RECOVERY.jitterBufferMs;
+    jitterBuffer.recovery = recovery(after(jb.map(r => ({ t: r.t, bad: l => r.jitterBufferMs > l })), limit));
+    // Only the last five seconds: has the buffer come back down?
+    jitterBuffer.lastFiveSecondsMs = med(jb.filter(r => r.t >= end - 5000).map(r => r.jitterBufferMs));
+  }
+  const rttOf = x => x?.remote?.roundTripTime != null ? x.remote.roundTripTime * 1000 : x?.pair?.currentRoundTripTime != null ? x.pair.currentRoundTripTime * 1000 : NaN;
+  const voiceRole = record.timeline?.[0]?.sender ? "sender" : null;
+  const voiceRtt = voiceRole ? byPhase(windows(voiceRole, "voice", (a, b) => ({ rttMs: rttOf(b) })), ["rttMs"]) : null;
+  const sharerRole = record.timeline?.[0]?.sharer ? "sharer" : record.timeline?.some(r => r.sender?.screen) ? "sender" : null;
+  let screen = null;
+  if (sharerRole) {
+    const sent = windows(sharerRole, "screen", (a, b, dt) => b.out?.kind !== "video" ? null : {
+      mbps: (d(a.out, b.out, "bytesSent") + d(a.out, b.out, "headerBytesSent")) * 8 / dt / 1e6,
+      fps: d(a.out, b.out, "framesEncoded") / dt, height: b.out.frameHeight ?? NaN, rttMs: rttOf(b),
+      availableMbps: (b.pair?.availableOutgoingBitrate ?? NaN) / 1e6, capMbps: (b.maxBitrate ?? NaN) / 1e6,
+      bandwidthLimited: b.out.qualityLimitationReason === "bandwidth" ? 1 : 0,
+    });
+    const viewed = windows(record.timeline[0]?.viewer ? "viewer" : "receiver", "screen", (a, b, dt) => b.in?.kind !== "video" ? null : {
+      viewerFps: d(a.in, b.in, "framesDecoded") / dt, freezeMs: d(a.in, b.in, "totalFreezesDuration") * 1000,
+      viewerJitterBufferMs: d(a.in, b.in, "jitterBufferEmittedCount") > 0 ? d(a.in, b.in, "jitterBufferDelay") / d(a.in, b.in, "jitterBufferEmittedCount") * 1000 : NaN,
+    });
+    screen = byPhase(sent, ["mbps", "fps", "height", "rttMs", "availableMbps", "capMbps", "bandwidthLimited"]);
+    const view = byPhase(viewed, ["viewerFps", "viewerJitterBufferMs"]);
+    for (const p of phases) Object.assign(screen[p], view[p], { freezeMs: viewed.filter(r => phaseOf(r.t) === p).reduce((n, r) => n + (r.freezeMs || 0), 0), rttMaxMs: max(sent.filter(r => phaseOf(r.t) === p).map(r => r.rttMs)) });
+    screen.codec = record.timeline.map(r => r[sharerRole]?.screen?.outCodec).filter(Boolean).at(-1) ?? null;
+    if (off !== null && screen.pre.mbps !== null) {
+      screen.rateRecovery = recovery(after(sent.map(r => ({ t: r.t, bad: l => r.mbps < l })), screen.pre.mbps * RECOVERY.screenRate));
+      screen.rttRecovery = screen.pre.rttMs === null ? null : recovery(after(sent.map(r => ({ t: r.t, bad: l => r.rttMs > l })), screen.pre.rttMs + RECOVERY.rttMs));
+    }
+    record.screenSeries = { sent, viewed };
+  }
+  // The relay's own view of its uplink queue, in its 250 ms buckets.
+  const buckets = record.network?.up_link?.queue_timeline ?? [];
+  const epoch = record.fixture?.relayEpochMs;
+  const queue = Number.isFinite(epoch) && buckets.length ? Object.fromEntries(phases.map(p => {
+    const mine = buckets.filter(b => b.packets > 0 && phaseOf(epoch + b.start_s * 1000) === p && epoch + b.start_s * 1000 >= captures[0].capture_ms && epoch + b.start_s * 1000 < end);
+    return [p, { meanMs: med(mine.map(b => b.mean_ms)), maxMs: max(mine.map(b => b.max_ms)), drops: mine.reduce((n, b) => n + b.queue_dropped, 0) }];
+  })) : null;
+  record.jitterBufferSeries = jb;
+  return { bulk: on === null ? null : { on, off, seconds: (off - on) / 1000, counts: record.network?.up_link?.bulk ?? null }, voice, jitterBuffer, voiceRtt, screen, queue };
 }
 
 /** Window differences of the receiver's and sender's counters. */
@@ -652,6 +889,29 @@ function derive(record) {
   return result;
 }
 
+/** Medians across runs of every number in a tree; booleans count true, strings the most common. */
+function medianTree(trees) {
+  const present = trees.filter(t => t !== null && t !== undefined);
+  if (!present.length) return null;
+  if (present.every(t => typeof t === "number")) { const v = present.filter(Number.isFinite).sort((a, b) => a - b); return v.length ? quantile(v, 0.5) : null; }
+  if (present.every(t => typeof t === "boolean")) return `${present.filter(Boolean).length}/${present.length}`;
+  if (present.every(t => typeof t === "string")) return present.toSorted((a, b) => present.filter(x => x === b).length - present.filter(x => x === a).length)[0];
+  if (present.every(t => typeof t === "object" && !Array.isArray(t))) {
+    const keys = [...new Set(present.flatMap(Object.keys))];
+    return Object.fromEntries(keys.map(k => [k, medianTree(present.map(t => t[k]))]));
+  }
+  return null;
+}
+
+function congestionLine(c) {
+  if (!c) return "";
+  const f = v => (Number.isFinite(v) ? v.toFixed(0) : "-");
+  const phases = Object.keys(c.voice).filter(p => p !== "recovery");
+  return " |" + phases.map(p => ` ${p}: p50 ${f(c.voice[p].p50_ms)} p95 ${f(c.voice[p].p95_ms)} lost ${c.voice[p].lost}` +
+    (c.screen ? ` screen ${c.screen[p].mbps?.toFixed(2) ?? "-"} Mb/s rtt ${f(c.screen[p].rttMs)}` : "")).join(",") +
+    (c.voice.recovery ? ` recovery ${f(c.voice.recovery.ms)} ms` : "");
+}
+
 function summarize(runs, variants) {
   const median = values => { const v = values.filter(Number.isFinite).sort((a, b) => a - b); return v.length ? quantile(v, 0.5) : null; };
   const rows = variants.map(variant => {
@@ -671,6 +931,8 @@ function summarize(runs, variants) {
         nativeUnderruns: mine.reduce((sum, run) => sum + (run.derived?.nativeUnderruns ?? 0), 0),
       },
       load1: median(mine.map(run => run.load?.armed?.load1)),
+      // Medians across runs of each run's phases (docs/latency-congested-uplink.md).
+      congestion: medianTree(mine.map(run => run.congestion)),
     };
   });
   for (const row of rows) row.median_delta_ms = row.median_ms !== null && rows[0].median_ms !== null ? row.median_ms - rows[0].median_ms : null;
@@ -690,13 +952,26 @@ async function main() {
   const build = spawnSync("pnpm", ["exec", "vite", "build", "--mode", "e2e", "--outDir", dist], { cwd: webRoot, env: { ...process.env, NODE_ENV: "development" }, encoding: "utf8" });
   writeFileSync(path.join(out, "build.log"), `${build.stdout}${build.stderr}`);
   assert.equal(build.status, 0, "e2e web build failed; see build.log");
-  mkdirSync(path.join(dist, "__latency"));
-  writeFileSync(path.join(dist, "__latency/generator.js"), GENERATOR_WORKLET);
-  writeFileSync(path.join(dist, "__latency/tap.js"), TAP_WORKLET);
-  const web = `http://127.0.0.1:${await port()}`;
+  // `web=DIR` variants serve a copy of another e2e build (for example a before/after pair).
+  const webs = new Map();
   const viteCli = path.join(path.dirname(fileURLToPath(import.meta.resolve("vite/package.json"))), "bin/vite.js");
-  start(process.execPath, [viteCli, "preview", "--outDir", dist, "--host", "127.0.0.1", "--port", new URL(web).port, "--strictPort"], { cwd: webRoot });
-  await waitFor(async () => { try { return (await fetch(web)).ok; } catch { return false; } }, "web preview", 30_000);
+  manifest.fixtures = Object.fromEntries(options.variants.filter(v => v.config.fixture).map(v => [v.config.fixture, sha256(v.config.fixture)]));
+  for (const source of new Set([null, ...options.variants.map(v => v.config.web)])) {
+    let served = dist;
+    if (source !== null) {
+      assert(existsSync(path.join(source, "index.html")), `web=${source} is not a built app`);
+      served = path.join(scratch, `web-${webs.size}`);
+      cpSync(source, served, { recursive: true });
+      manifest.webs = { ...manifest.webs, [source]: sha256(path.join(source, "index.html")) };
+    }
+    mkdirSync(path.join(served, "__latency"), { recursive: true });
+    writeFileSync(path.join(served, "__latency/generator.js"), GENERATOR_WORKLET);
+    writeFileSync(path.join(served, "__latency/tap.js"), TAP_WORKLET);
+    const web = `http://127.0.0.1:${await port()}`;
+    start(process.execPath, [viteCli, "preview", "--outDir", served, "--host", "127.0.0.1", "--port", new URL(web).port, "--strictPort"], { cwd: webRoot });
+    await waitFor(async () => { try { return (await fetch(web)).ok; } catch { return false; } }, "web preview", 30_000);
+    webs.set(source, web);
+  }
 
   // Setup, warmup, markers, drain and collection; setup allows for 60 s waits on the model.
   const budget = 180_000 + options.warmupMs + options.markers * PERIOD * 1000 / RATE + MATCH_WINDOW_MS;
@@ -711,7 +986,7 @@ async function main() {
       manifest.order.push(path.basename(dir));
       const childCount = children.length;
       const owned = { browser: null, abort: new AbortController() };
-      const work = measure({ config: variant.config, web, binary, dir, markers: options.markers, warmupMs: options.warmupMs, record, owned });
+      const work = measure({ config: variant.config, web: webs.get(variant.config.web), binary: variant.config.fixture ?? binary, dir, markers: options.markers, warmupMs: options.warmupMs, record, owned });
       try {
         analyze({ ...(await deadline(work, budget, "run")), record, dir, markers: options.markers });
         record.passed = true;
@@ -732,7 +1007,7 @@ async function main() {
       runs.push(record);
       const d = record.derived ?? {};
       console.log(`${index} ${variant.name}: ${record.passed ? "ok" : "FAIL"} n=${record.n ?? "-"}/${options.markers} median=${record.median_ms?.toFixed(1) ?? "-"} p95=${record.p95_ms?.toFixed(1) ?? "-"} ms` +
-        ` neteq=${d.jitterBufferMs?.toFixed(1) ?? "-"} ms load=${record.load.armed?.load1.toFixed(1) ?? "-"}${record.passed ? "" : ` ${record.error.split("\n")[0]}`}`);
+        ` neteq=${d.jitterBufferMs?.toFixed(1) ?? "-"} ms load=${record.load.armed?.load1.toFixed(1) ?? "-"}${congestionLine(record.congestion)}${record.passed ? "" : ` ${record.error.split("\n")[0]}`}`);
     }
   }
   const summary = summarize(runs, options.variants);

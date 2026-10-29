@@ -96,11 +96,13 @@ WKWebView still get every supported video codec's start hint. The GTK exception 
 covered by unit tests and keeps its browser-default GCC start and the reserve rule.
 
 Voice latency, jitter, loss, concealment and mouth-to-ear percentiles were not
-measured in this browser ramp harness. Its shaper and synthetic media can demonstrate
+measured in this browser ramp harness; [latency-congested-uplink.md](latency-congested-uplink.md)
+measures them later on a congested uplink. Its shaper and synthetic media can demonstrate
 video back-off, not an enforced capacity reservation between independent peer
 connections. No production endpoint, VM or TeamSpeak server was contacted. The
 200 kb/s reserve is a budget choice for roughly 64 kb/s Opus plus RTCP/repairs;
-below a 450 kb/s estimate the existing video floor can consume part or all of it.
+it was later bounded to 30 % of an estimate below 667 kb/s, and below a 357 kb/s
+estimate the existing video floor can consume part or all of it.
 
 Evidence (raw JSONL, summaries, frozen baseline source, bundles, scripts and logs)
 is retained locally in `/tmp/gwar-reserve-evidence`. The owner's compressed browser

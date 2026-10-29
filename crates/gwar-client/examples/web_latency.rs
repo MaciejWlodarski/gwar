@@ -5,6 +5,7 @@
 //! client, browsers included (see latency/netem.rs). Commands on stdin, one JSON reply per line:
 //!   send | receive   start a native peer in the default channel, as marker sender or receiver
 //!   arm WARMUP_MS COUNT   start recording (receiver) or the markers after WARMUP_MS (sender)
+//!   bulk on | off    start or stop the relay's `bulk=manual` uploads (LATENCY_NET)
 //!   finish           stop the peer; writes OUTPUT_DIR/native-playout.f32 for a receiver
 //!   quit
 //! Times are Unix milliseconds on the system clock, which browsers' `Date.now()` also reads.
@@ -166,7 +167,7 @@ struct Peer {
 
 impl Peer {
     async fn start(url: &str, media: std::net::SocketAddr, sender: bool, clock: Clock) -> anyhow::Result<Self> {
-        let client = connect(ConnectOptions {
+        let mut client = connect(ConnectOptions {
             url: url.into(),
             nickname: if sender { "native sender" } else { "native receiver" }.into(),
             invite: None,
@@ -183,6 +184,22 @@ impl Peer {
             },
         })
         .await?;
+        // Nothing reads the peer's events; a full queue would stop the client's socket reader.
+        let (_, closed) = tokio::sync::mpsc::channel(1);
+        let mut events = std::mem::replace(&mut client.events, closed);
+        tokio::spawn(async move { while events.recv().await.is_some() {} });
+        // The server closes a connection that sends no request for 60 s (the app's heartbeat).
+        let heartbeat = client.connection.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(20));
+            every.tick().await;
+            loop {
+                every.tick().await;
+                if heartbeat.request(Request::Ping {}).await.is_err() {
+                    return;
+                }
+            }
+        });
         client.connection.join(client.welcome.server.default_channel, None).await?;
         let shared = Arc::new(Mutex::new(Shared::default()));
         let io = Box::new(MarkerIo { sender, clock, shared: shared.clone() });
@@ -343,6 +360,10 @@ async fn run(
                 let peer = peer.as_ref().context("no native peer")?;
                 peer.shared.lock().unwrap().arm = Some((warmup, count));
                 reply(json!({"event": "arm", "atMs": clock.ms(Instant::now())}))?;
+            }
+            ["bulk", state @ ("on" | "off")] => {
+                relay.as_ref().context("bulk needs LATENCY_NET")?.set_bulk(*state == "on");
+                reply(json!({"event": "bulk", "on": *state == "on", "atMs": clock.ms(Instant::now())}))?;
             }
             ["finish"] => {
                 let native = match peer.take() {
