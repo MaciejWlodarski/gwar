@@ -102,18 +102,35 @@ const ADDRESSES_PER_TRANSPORT: usize = 4;
 /// Allocation (pauses, resumes, probing targets) and the budget check run this often.
 const ALLOCATION_TICK: Duration = Duration::from_millis(100);
 /// A viewer whose every slot is paused, at least one for bandwidth, retries its most important
-/// one from an optimistic start this long after the pause, doubling with each retry that
-/// failed, up to `RETRY_MAX`. The continuous-fit resume may come first.
+/// one this long after the pause, doubling with each retry that failed, up to `RETRY_MAX`; a
+/// retry that was inconclusive is followed this long after it started. The continuous-fit
+/// resume may come first. A viewer's own Try again waits as long after its last start or retry.
 const RETRY_FIRST: Duration = Duration::from_secs(15);
 const RETRY_MAX: Duration = Duration::from_secs(120);
 /// Media flowing this long without a break, with no slot paused for bandwidth, clears the
 /// viewer's failed retries.
 const RETRY_RESET: Duration = Duration::from_secs(60);
+/// An automatic retry starts at most this far above what the transport sent before the viewer's
+/// last bandwidth pause (and at least at `INITIAL_ESTIMATE`, where any fresh watch transport
+/// starts): the reach str0m's own probes and its desired-bitrate cap allow. Its release, `PLAN`
+/// of that, is at most 1.2 times what the link delivered, so a link still too slow is overrun
+/// by at most a fifth (above that floor) until TWCC backs off, not by the share's whole start;
+/// one that recovered grows from there, and each retry it carried in full steps the next one
+/// up. After an inconclusive retry, the next one starts at least this far above it, and with
+/// room for its share's keyframe.
+const RETRY_STEP: f64 = 1.5;
+/// What a link showed it carries: its estimate, but no more than this many times the rate the
+/// transport actually sent over the last `RAMP`. str0m's AIMD stops raising an estimate at
+/// 1.5 × the observed rate and has nothing to lower it with while traffic stays under it, so
+/// above that the estimate was never tested (a static share right after an optimistic start
+/// keeps its start); up to it, its delay and loss feedback would have lowered it.
+const CARRIED_REACH: f64 = 1.5;
 /// A connection's last proven estimate outlives its watch transport this long, at most
 /// `REMEMBERED` connections.
 const REMEMBER_FOR: Duration = Duration::from_secs(600);
 const REMEMBERED: usize = 4096;
-/// Pause and resume lines at info level: one per viewer this often, the rest counted.
+/// A slot's pause and its resume are always logged at info level; a line that repeats the
+/// slot's last logged state only once per viewer this often, the rest counted.
 const LOG_EVERY: Duration = Duration::from_secs(10);
 /// Measured egress over the server-wide budget this many seconds in a row pauses watches.
 const OVER_BUDGET_SECONDS: u32 = 5;
@@ -597,6 +614,8 @@ struct Slot {
     last_av1: Option<(Instant, av1_stream::Requirements)>,
     decode_cap: Option<(u32, u32)>,
     failed_at: Option<Instant>,
+    /// The state its last info-level line logged for this assignment: paused or not.
+    logged: Option<bool>,
 }
 
 impl Slot {
@@ -623,6 +642,7 @@ impl Slot {
             last_av1: None,
             decode_cap: None,
             failed_at: None,
+            logged: None,
         }
     }
 
@@ -641,6 +661,17 @@ impl Slot {
             self.keyframe_pending.get_or_insert(now);
         }
     }
+}
+
+/// A retry of a fully paused viewer (or a climb from one), until it is judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Attempt {
+    /// The slot it resumed, whose share's whole start bounds it.
+    slot: usize,
+    /// The estimate it actually started at.
+    start: u64,
+    /// It counts towards `retries` (a Try again does not).
+    counted: bool,
 }
 
 struct Watcher {
@@ -675,23 +706,48 @@ struct Watcher {
     desired: Option<u64>,
     /// Last estimator restart; also bounds post-resume probe spacing.
     restarted: Option<Instant>,
-    /// The last estimate this transport's link carried media at, and the one the session's
-    /// previous transport left; an optimistic start takes the higher with the share's need.
+    /// What this transport's link last showed it carries (`shown`) while media flowed past its
+    /// ramp, and the one the session's previous transport left; an optimistic start takes the
+    /// higher with the share's need. A bandwidth pause forgets both.
     proven: Option<u64>,
     /// The session's connection, which keys what its next transport remembers.
     connection: u64,
     remembered: Option<u64>,
     /// The server-wide budget: no optimistic start goes above it.
     ceiling: u64,
-    /// The next optimistic retry of a fully paused viewer, the retries that failed since media
+    /// The next automatic retry of a fully paused viewer, the retries that failed since media
     /// last kept flowing, and since when it has flowed with no slot paused for bandwidth.
     retry_at: Option<Instant>,
     retries: u32,
     healthy_since: Option<Instant>,
+    /// What the transport sent over the `RAMP` before the last bandwidth pause that measured the
+    /// link: the next automatic retry steps up from it (`RETRY_STEP`).
+    step: u64,
+    /// The retry in progress, until its next bandwidth pause tells whether the link carried it.
+    attempt: Option<Attempt>,
+    /// The start of the last retry, which was inconclusive: the next automatic one comes
+    /// `RETRY_FIRST` after it started, at least `RETRY_STEP` above it and with room for its
+    /// share's keyframe.
+    untested: Option<u64>,
+    /// The start of the last retry the link pushed back on, until media flows `RETRY_RESET`
+    /// again: a climb in place never reaches it, or a frozen estimator would overshoot the
+    /// same step after every carried retry.
+    failed: Option<u64>,
+    /// The last optimistic start or retry, which spaces the viewer's own Try again, and a Try
+    /// again waiting for that spacing.
+    started: Option<Instant>,
+    asked: Option<String>,
+    /// The transport's sent bytes (originals and extras), sampled every allocation tick over
+    /// the last `RAMP`.
+    carried: VecDeque<(Instant, u64)>,
     /// The last info-level pause or resume line, and the lines left out since.
     logged: Option<Instant>,
     unlogged: u32,
     deadline: Instant,
+    /// Simulates an estimator that never grows on its own: TWCC estimates above this are
+    /// ignored, and each estimator restart moves it to the restart's estimate.
+    #[cfg(test)]
+    frozen: Option<u64>,
 }
 
 impl Watcher {
@@ -1038,13 +1094,7 @@ impl Sfu {
                 else {
                     return;
                 };
-                if w.egress.paused(slot) == Some(ScreenPauseReason::Bandwidth) {
-                    if w.egress.stalled() {
-                        // Nothing else feeds this viewer's estimate: start over optimistically.
-                        retry(w, slot, &self.rates, now);
-                    } else {
-                        apply(w, slot, Change::Resume);
-                    }
+                if ask_retry(w, slot, &self.rates, now) {
                     self.tell(session, slot, Change::Resume, now);
                 }
             }
@@ -1545,9 +1595,16 @@ impl Sfu {
         let share = &grant.share;
         let run = w.run;
         let rate = self.rates.get(share).copied().unwrap_or_default();
-        // Production incidents need these at the default level; a flapping viewer must not
-        // flood it, so one line per viewer and `LOG_EVERY`, counting the ones left out.
-        if w.logged.is_none_or(|at| now.saturating_duration_since(at) >= LOG_EVERY) {
+        // Production incidents need these at the default level, and the last line logged for a
+        // slot must say whether it is paused now: a change of that is always logged. A slot
+        // resumes at most once per 10 s (its fit timer, the retry spacing, the budget guard),
+        // so that is a few lines per viewer at most; repeats of a slot's state, one line per
+        // viewer and `LOG_EVERY`, counting the ones left out.
+        let paused = matches!(change, Change::Pause(_));
+        if w.slots[slot].logged != Some(paused)
+            || w.logged.is_none_or(|at| now.saturating_duration_since(at) >= LOG_EVERY)
+        {
+            w.slots[slot].logged = Some(paused);
             let (estimate, retries, skipped) = (w.egress.estimate(), w.retries, w.unlogged);
             let (average, keyframe) = (rate.average as u64, rate.largest_keyframe);
             match change {
@@ -2143,8 +2200,19 @@ impl Sfu {
         if let Some(mut w) = self.watchers.remove(&session) {
             w.rtc.disconnect();
             self.owners.forget(Owner::Watch(w.id));
-            if let Some(estimate) = w.proven {
-                self.remember(w.connection, estimate, now);
+            // A bandwidth pause with nothing proven after it disproved the connection's older
+            // estimate too: it goes. A transport that ended within the ramp of a start from it
+            // keeps no more than its estimate then, which TWCC may have lowered already. A
+            // transport that never started anything leaves it.
+            match (w.proven, w.remembered) {
+                (Some(estimate), _) => self.remember(w.connection, estimate, now),
+                (None, None) => {
+                    self.remembered.remove(&w.connection);
+                }
+                (None, Some(estimate)) if w.started.is_some() => {
+                    self.remember(w.connection, estimate.min(w.egress.estimate()), now);
+                }
+                (None, Some(_)) => {}
             }
         }
     }
@@ -2347,11 +2415,11 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                 }
                 RtcEvent::IceConnectionStateChange(IceConnectionState::Disconnected) => w.rtc.disconnect(),
                 RtcEvent::EgressBitrateEstimate(BweKind::Twcc { estimate, .. }) => {
-                    trace!(session = w.session, estimate = estimate.as_u64(), "screen watch estimate");
-                    set_estimate(w, estimate.as_u64(), now);
-                    if w.egress.proven(now) {
-                        w.proven = Some(estimate.as_u64());
-                    }
+                    let estimate = estimate.as_u64();
+                    trace!(session = w.session, estimate, "screen watch estimate");
+                    #[cfg(test)]
+                    let estimate = w.frozen.map_or(estimate, |cap| estimate.min(cap));
+                    set_estimate(w, estimate, now);
                 }
                 RtcEvent::MediaAdded(added) if added.kind == MediaKind::Video => {
                     if added.direction.is_sending() && w.slots.len() < w.size {
@@ -2399,6 +2467,14 @@ fn allocate(
         c.extras_dropped,
         "screen watch egress"
     );
+    let sent = c.original_bytes + c.extra_bytes;
+    w.carried.push_back((now, sent));
+    while w.carried.front().is_some_and(|(at, _)| now.saturating_duration_since(*at) > egress::RAMP) {
+        w.carried.pop_front();
+    }
+    if w.egress.proven(now) {
+        w.proven = Some(shown(w));
+    }
     let stalled = w.egress.stalled();
     let recovering = w.restarted.is_some_and(|at| now.saturating_duration_since(at) < egress::RAMP);
     w.egress.set_probe_need(&caps, &lanes);
@@ -2424,12 +2500,26 @@ fn allocate(
         }
         apply(w, slot, change);
         if change == Change::Pause(ScreenPauseReason::Bandwidth) {
-            // The link did not carry it: nothing about this estimate is proven any more, and
-            // a later resume starts the clock that clears failed retries over.
-            w.proven = None;
+            // A later resume starts the clock that clears failed retries over.
             w.healthy_since = None;
+            // Handing room to a more important share disproves nothing about the link.
+            if w.egress.trigger != "priority" {
+                judge(w);
+            }
         }
         return Some((slot, change));
+    }
+    if climb(w, &lanes, rates, now) {
+        return None;
+    }
+    // The viewer's own Try again, held back by the spacing since its last start.
+    if w.started.is_none_or(|at| now.saturating_duration_since(at) >= RETRY_FIRST)
+        && let Some(share) = w.asked.take()
+        && let Some(slot) = w.slots.iter().position(|s| s.grant.as_ref().is_some_and(|g| g.share == share && g.alive()))
+        && w.egress.paused(slot) == Some(ScreenPauseReason::Bandwidth)
+    {
+        try_again(w, slot, rates, now);
+        return Some((slot, Change::Resume));
     }
     if !stalled {
         if !recovering {
@@ -2440,57 +2530,212 @@ fn allocate(
             w.healthy_since = None;
         } else if now.saturating_duration_since(*w.healthy_since.get_or_insert(now)) >= RETRY_RESET {
             w.retries = 0;
+            w.attempt = None;
+            w.untested = None;
+            w.failed = None;
         }
         return None;
     }
     // Nothing feeds this viewer's estimate any more, and padding alone may never lift it to
-    // the share: after a backoff, try the most important share again from an optimistic start.
-    // A link that still cannot carry it backs off on its own feedback and pauses again within
-    // seconds; the continuous-fit resume can still come first. Existing socket credit is
-    // never minted, and a continuous-fit timer in progress finishes first.
+    // the share: after a backoff, try the most important share again, from a step above what
+    // the link last carried. A link that still cannot carry it backs off on its own feedback
+    // and pauses again; the continuous-fit resume can still come first. Existing socket credit
+    // is never minted, and a continuous-fit timer in progress finishes first.
     w.healthy_since = None;
-    let backoff = RETRY_FIRST.saturating_mul(1 << w.retries.min(8)).min(RETRY_MAX);
-    let at = *w.retry_at.get_or_insert(now + backoff);
+    // An inconclusive retry sent next to nothing: the next one, which sends what it could not,
+    // only keeps the spacing between starts.
+    let at = *w.retry_at.get_or_insert(match (w.untested, w.started) {
+        (Some(_), Some(started)) => started + RETRY_FIRST,
+        _ => now + RETRY_FIRST.saturating_mul(1 << w.retries.min(8)).min(RETRY_MAX),
+    });
     if now < at || w.egress.fitting() || !probe_ready {
         return None;
     }
     let slot = w.egress.first_bandwidth_paused()?;
     w.retries = w.retries.saturating_add(1);
-    retry(w, slot, rates, now);
+    let mut step = ((RETRY_STEP * w.step as f64) as u64).max(INITIAL_ESTIMATE);
+    if let Some(untested) = w.untested {
+        step = step.max((RETRY_STEP * untested as f64) as u64).max(egress::keyframe_room(lanes[slot]));
+    }
+    let target = start_target(w, slot).min(step);
+    retry(w, slot, target, true, rates, now);
     Some((slot, Change::Resume))
 }
 
+/// A bandwidth pause that measured the link: nothing about its estimate is proven any more, nor
+/// what the previous transport left. What the transport sent until it is where the next retry
+/// steps up from, and the retry in progress, if any, is judged:
+/// - **carried** in full (`shown` reached its start): no failure, `retries` goes back to zero;
+/// - **inconclusive**: the estimate held, but so little was sent that a step above it would not
+///   even reach the start again (the share did not fit the SFU's own admission at that
+///   estimate, or it was quiet), so the link was not tested. It is not counted and `step`
+///   stays; the next retry comes `RETRY_FIRST` after it started, a step above it and with room
+///   for the share's keyframe, so it sends what this one could not. One that already started
+///   at the share's whole start has nowhere higher to go: it counts as failed;
+/// - **failed** otherwise: the estimate fell below the start, so the link pushed back, or the
+///   link carried less than the start. It stays counted, and the next retry goes no higher
+///   than this one's start.
+fn judge(w: &mut Watcher) {
+    let (sent, shown) = (sent(w), shown(w));
+    w.proven = None;
+    w.remembered = None;
+    let attempt = w.attempt.take();
+    w.untested = None;
+    match attempt {
+        Some(a) if shown >= a.start => {
+            w.retries = 0;
+            w.step = carried_step(sent, a.start);
+            if w.failed.is_some_and(|f| a.start >= f) {
+                w.failed = None;
+            }
+        }
+        Some(a) if w.egress.estimate() >= a.start && RETRY_STEP * (sent as f64) < a.start as f64 => {
+            if a.start < top(w, a.slot) {
+                if a.counted {
+                    w.retries = w.retries.saturating_sub(1);
+                }
+                w.untested = Some(a.start);
+            }
+        }
+        Some(a) => {
+            w.step = sent.min((a.start as f64 / RETRY_STEP) as u64);
+            w.failed = Some(a.start);
+        }
+        None => w.step = sent,
+    }
+}
+
+/// Where the next retry steps up from after the link carried one that started at `start`:
+/// what the transport sent, but at least the release of `PLAN` of the start, which the link
+/// carried. The SFU's own admission can hold what a throttled share sends to about 0.7 of the
+/// start, and a step from that alone barely climbs (1.05 times the start).
+fn carried_step(sent: u64, start: u64) -> u64 {
+    sent.max((egress::PLAN * start as f64) as u64)
+}
+
+/// The share's whole start on `slot`, within the server-wide budget: no retry goes higher.
+fn top(w: &Watcher, slot: usize) -> u64 {
+    w.slots[slot].grant.as_ref().map_or(0, |g| g.origin.start_estimate().min(w.ceiling))
+}
+
+/// An automatic retry the link is carrying in full past its ramp, while what its viewer watches
+/// still does not fit, steps up in place, by as much as a retry after it would: the release at
+/// `PLAN` of the next start is at most 1.2 times the one the link carried. Without it, a
+/// frozen estimator (one that never grows on its own) climbs one step per pause and retry.
+/// It only applies while the estimate holds at the retry's start: an estimator that grew on
+/// its own needs no help, one that fell has its answer. True if it stepped.
+fn climb(w: &mut Watcher, lanes: &[ShareRate], rates: &HashMap<String, ShareRate>, now: Instant) -> bool {
+    let Some(a) = w.attempt.filter(|a| a.counted) else { return false };
+    let start = w.egress.estimate();
+    if start != a.start
+        || w.egress.paused(a.slot).is_some()
+        || w.started.is_none_or(|at| now.saturating_duration_since(at) < egress::RAMP)
+        || shown(w) < a.start
+    {
+        return false;
+    }
+    let need: f64 = w.egress.priority().iter().map(|&l| lanes.get(l).map_or(0.0, |r| r.average)).sum();
+    if need <= w.egress.plan() {
+        return false;
+    }
+    let target = start_target(w, a.slot).min((RETRY_STEP * carried_step(sent(w), a.start) as f64) as u64);
+    if target <= a.start || w.failed.is_some_and(|f| target >= f) {
+        return false;
+    }
+    w.step = carried_step(sent(w), a.start);
+    w.retries = 1;
+    start_at(w, target, rates, now);
+    w.restarted = Some(now);
+    w.attempt = Some(Attempt { start: w.egress.estimate(), ..a });
+    debug!(session = w.session, from = a.start, to = w.egress.estimate(), "screen watch retry climbs");
+    true
+}
+
 /// The estimate an optimistic start of `slot` uses: what its share needs, or the viewer's
-/// higher proven or remembered estimate, within the server-wide budget; never lower than the
-/// current one.
+/// higher proven or remembered estimate up to what the share's ingress can need, within the
+/// server-wide budget; never lower than the current one.
 fn start_target(w: &Watcher, slot: usize) -> u64 {
-    let need = w.slots[slot].grant.as_ref().map_or(0, |g| g.origin.start_estimate());
-    let known = w.proven.max(w.remembered).unwrap_or(0);
+    let Some(grant) = w.slots[slot].grant.as_ref() else { return w.egress.estimate() };
+    let need = grant.origin.start_estimate();
+    let known = w.proven.max(w.remembered).unwrap_or(0).min(egress::ingress_ceiling(grant.origin.cap_bps));
     need.max(known).min(w.ceiling).max(w.egress.estimate())
 }
 
-/// Starts the estimator over at `slot`'s optimistic target.
+/// What the transport sent over the last `RAMP` (originals and extras), bits per second.
+fn sent(w: &Watcher) -> u64 {
+    match (w.carried.front(), w.carried.back()) {
+        (Some((from, first)), Some((to, last))) if to > from => {
+            ((last - first) as f64 * 8.0 / to.saturating_duration_since(*from).as_secs_f64()) as u64
+        }
+        _ => 0,
+    }
+}
+
+/// What the viewer's link showed it carries: its estimate, at most `CARRIED_REACH` times what
+/// the transport sent over the last `RAMP`.
+fn shown(w: &Watcher) -> u64 {
+    w.egress.estimate().min((CARRIED_REACH * sent(w) as f64) as u64)
+}
+
+/// Starts the estimator over at `slot`'s optimistic target, if that is higher.
 fn start_optimistic(w: &mut Watcher, slot: usize, rates: &HashMap<String, ShareRate>, now: Instant) {
     let target = start_target(w, slot);
-    if target <= w.egress.estimate() {
-        return;
+    if target > w.egress.estimate() {
+        start_at(w, target, rates, now);
     }
+}
+
+/// Starts the estimator over at `target`, ramp included.
+fn start_at(w: &mut Watcher, target: u64, rates: &HashMap<String, ShareRate>, now: Instant) {
     let lanes: Vec<ShareRate> = w
         .slots
         .iter()
         .map(|s| s.grant.as_ref().and_then(|g| rates.get(&g.share)).copied().unwrap_or_default())
         .collect();
     let caps: Vec<u64> = w.slots.iter().map(|s| s.grant.as_ref().map_or(0, |g| g.origin.cap_bps)).collect();
-    restart_estimator(w, target, now, &caps, &lanes);
+    restart_estimator(w, target.max(w.egress.estimate()), now, &caps, &lanes);
+    w.started = Some(now);
 }
 
-/// Resumes a bandwidth-paused `slot` of a fully paused viewer from an optimistic start.
-fn retry(w: &mut Watcher, slot: usize, rates: &HashMap<String, ShareRate>, now: Instant) {
+/// Resumes a bandwidth-paused `slot` of a fully paused viewer from `target`, with a fresh ramp.
+/// `counted`: it adds to the failed retries until its outcome says otherwise.
+fn retry(w: &mut Watcher, slot: usize, target: u64, counted: bool, rates: &HashMap<String, ShareRate>, now: Instant) {
     apply(w, slot, Change::Resume);
-    start_optimistic(w, slot, rates, now);
+    start_at(w, target, rates, now);
     w.restarted = Some(now);
     w.retry_at = None;
     w.healthy_since = None;
+    // What it actually starts at: never below the estimate it found.
+    w.attempt = Some(Attempt { slot, start: w.egress.estimate(), counted });
+}
+
+/// The viewer's Try again on `slot`, if paused for bandwidth: now, or, within `RETRY_FIRST` of
+/// the viewer's last start or retry, on the allocation tick once that passed. True if it
+/// resumed the slot now.
+fn ask_retry(w: &mut Watcher, slot: usize, rates: &HashMap<String, ShareRate>, now: Instant) -> bool {
+    if w.egress.paused(slot) != Some(ScreenPauseReason::Bandwidth) {
+        return false;
+    }
+    if w.started.is_some_and(|at| now.saturating_duration_since(at) < RETRY_FIRST) {
+        w.asked = w.slots[slot].grant.as_ref().map(|g| g.share.clone());
+        return false;
+    }
+    try_again(w, slot, rates, now);
+    true
+}
+
+/// The viewer's Try again on a bandwidth-paused `slot`: a fully paused viewer starts it over
+/// from its share's whole start, as a fresh watch would (it does not add to the failed
+/// retries); next to media still flowing, it just resumes.
+fn try_again(w: &mut Watcher, slot: usize, rates: &HashMap<String, ShareRate>, now: Instant) {
+    w.asked = None;
+    if w.egress.stalled() {
+        let target = start_target(w, slot);
+        retry(w, slot, target, false, rates, now);
+    } else {
+        apply(w, slot, Change::Resume);
+        w.started = Some(now);
+    }
 }
 
 /// Keep queue admission and transport pacing on the same estimate.
@@ -2512,6 +2757,10 @@ fn pace(rtc: &mut Rtc, estimate: u64, probe_rate: u64) {
 }
 
 fn restart_estimator(w: &mut Watcher, estimate: u64, now: Instant, caps: &[u64], lanes: &[ShareRate]) {
+    #[cfg(test)]
+    if let Some(cap) = &mut w.frozen {
+        *cap = estimate;
+    }
     set_estimate(w, estimate, now);
     w.desired = w.egress.desired(caps, lanes);
     w.rtc.bwe().set_desired_bitrate(Bitrate::bps(w.desired.unwrap_or(0)));
@@ -2590,6 +2839,7 @@ fn assign(w: &mut Watcher, index: usize, grant: Arc<WatchGrant>, order: u64, now
 fn empty(w: &mut Watcher, index: usize) {
     let slot = &mut w.slots[index];
     slot.grant = None;
+    slot.logged = None;
     slot.segment.wait();
     slot.asked = None;
     slot.initial_in_flight = None;
@@ -3055,9 +3305,18 @@ fn watcher(
         retry_at: None,
         retries: 0,
         healthy_since: None,
+        step: 0,
+        attempt: None,
+        untested: None,
+        failed: None,
+        started: None,
+        asked: None,
+        carried: VecDeque::new(),
         logged: None,
         unlogged: 0,
         deadline: now,
+        #[cfg(test)]
+        frozen: None,
     };
     Ok((watcher, answer.to_sdp_string()))
 }
@@ -3385,7 +3644,12 @@ pub(crate) mod tests {
     fn a_watch_with_nothing_else_flowing_starts_from_its_share_or_the_sessions_higher_estimate() {
         let measured = |cap| {
             let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, cap);
-            origin.measured(ShareRate { average: 8_000_000.0, last_keyframe: 200_000, largest_keyframe: 200_000 });
+            origin.measured(ShareRate {
+                average: 8_000_000.0,
+                last_keyframe: 200_000,
+                largest_keyframe: 200_000,
+                largest_delta: 17_000,
+            });
             origin
         };
         let mut pair = Pair::new();
@@ -3478,6 +3742,21 @@ pub(crate) mod tests {
         sfu.end_watch(7, Instant::now());
         assert_eq!(watch(&mut sfu, 101, 1).remembered, None);
         assert_eq!(sfu.remembered.get(&100).map(|(estimate, _)| *estimate), Some(30_000_000));
+        // A transport of the first connection that ended paused for bandwidth disproved it.
+        let w = watch(&mut sfu, 100, 3);
+        assert_eq!(w.remembered, Some(30_000_000));
+        w.remembered = None;
+        sfu.end_watch(7, Instant::now());
+        assert!(!sfu.remembered.contains_key(&100));
+        // One that ended within the ramp of a start from it, after TWCC lowered its estimate,
+        // keeps no more than that estimate.
+        watch(&mut sfu, 100, 4).proven = Some(30_000_000);
+        let w = watch(&mut sfu, 100, 5);
+        assert_eq!(w.remembered, Some(30_000_000));
+        w.started = Some(Instant::now());
+        w.egress.set_estimate(9_000_000, Instant::now());
+        sfu.end_watch(7, Instant::now());
+        assert_eq!(sfu.remembered.get(&100).map(|(estimate, _)| *estimate), Some(9_000_000));
     }
 
     #[test]
