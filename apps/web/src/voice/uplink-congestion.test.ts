@@ -132,14 +132,13 @@ describe("uplink queueing delay", () => {
     expect(d.observe(241_000, sample(150))?.baselineMs).toBe(135);
   });
 
-  it("keeps warning about hours-long bloat for thirty minutes, then adopts it", () => {
+  it("keeps warning about hours-long jagged bloat, with no age limit on the floor", () => {
     const d = new UplinkCongestion();
     feed(d, 0, 10, () => 20);
-    for (let sec = 11; sec <= 1809; sec++) {
+    for (let sec = 11; sec <= 7200; sec++) {
       const state = d.observe(sec * 1000, sample(sec % 2 ? 400 : 670));
       if (sec >= 15) expect(state).toMatchObject({ congested: true, baselineMs: 20 });
     }
-    expect(feed(d, 1810, 1815, sec => sec % 2 ? 400 : 670)).toMatchObject({ congested: false, baselineMs: 400 });
   });
 
   it("never treats jagged WebRTC bloat as a flat route step", () => {
@@ -293,6 +292,19 @@ describe("WebRTC RTT evidence", () => {
     expect(d.observe(6000, r(480, 3))?.congested).toBe(false);
     expect(d.observe(7000, r(480, 4))).toMatchObject({ congested: true, rttMs: 480, availableOutgoingBitrate: 800_000 });
     expect(d.observe(20000, r(480, 4))).toBeNull();
+  });
+
+  it("reports the worst loss of our own outbound streams and keeps it across repeated polls", () => {
+    const d = new RtcUplinkObserver();
+    const out = (id: string) => ({ id, type: "outbound-rtp" });
+    const inbound = { id: "in", type: "inbound-rtp" };
+    const loss = (n: number, audio: number, video: number) => report(transport, pair(20, n), out("oa"), out("ov"), inbound,
+      { id: "ra", type: "remote-inbound-rtp", localId: "oa", fractionLost: audio },
+      { id: "rv", type: "remote-inbound-rtp", localId: "ov", fractionLost: video },
+      { id: "rx", type: "remote-inbound-rtp", localId: "in", fractionLost: 0.9 });
+    expect(d.observe(0, report(transport, pair(20, 1)))?.lossPct).toBeNull();
+    expect(d.observe(1000, loss(2, 0.01, 0.05))?.lossPct).toBeCloseTo(5);
+    expect(d.observe(2000, null)?.lossPct).toBeCloseTo(5);
   });
 
   it("falls back to nominated ICE, then to RTCP describing our own sender", () => {

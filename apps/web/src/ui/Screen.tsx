@@ -2,12 +2,11 @@
  * Screen-sharing interface (docs/screen-share.md, "Interface"): the Share button, the preset
  * menu, the sharing bar, LIVE badges and the stage.
  */
-import { useUploadCongestion } from "../state/uplink";
-import { UploadWarning } from "./UploadWarning";
 import { Maximize, MessageSquare, MessageSquareOff, Minimize, MonitorOff, MonitorUp, PictureInPicture2, RotateCw, ScreenShareOff, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { cn } from "../lib/cn";
+import { ConnectionIndicator } from "./ConnectionQuality";
 import { isDesktop } from "../platform";
 import { canActOn } from "../lib/permissions";
 import type { Client } from "../proto/Client";
@@ -20,7 +19,7 @@ import { slotOf, useScreen } from "../state/screen";
 import { useSession, useUi } from "../state/stores";
 import { type PublishStats } from "../voice/screen";
 import { HEIGHTS, FRAME_RATES, type ScreenSpec } from "../voice/screen-quality";
-import { useChannelPermission, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
+import { useChannelPermission, useConnectionQuality, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
 import { BackButton, Button, Dialog, IconButton, panelCard, TalkingAvatar, Tooltip } from "./kit";
 import { paneBack } from "./nav";
 
@@ -203,7 +202,7 @@ export function SharingBar() {
 function SenderStats() {
   const t = useT();
   const [stats, setStats] = useState<PublishStats | null>(null);
-  const congestion = useUploadCongestion();
+  const congested = !!useConnectionQuality()?.congestion;
   useEffect(() => {
     let live = true;
     const poll = () => void controller.screen.ownStats().then(s => { if (live) setStats(s); });
@@ -211,7 +210,7 @@ function SenderStats() {
     const timer = setInterval(poll, 2000);
     return () => { live = false; clearInterval(timer); };
   }, []);
-  if (!stats || !stats.height) return congestion ? <UploadWarning status={congestion} sharing /> : null;
+  if (!stats || !stats.height) return <ConnectionIndicator variant="bar" />;
   const mbps = (stats.bitrate / 1e6).toFixed(1);
   const encoder = stats.encoder
     ? t("screen.encoder", { name: stats.encoder, kind: t(stats.hardware === true ? "screen.encoderHardware" : stats.hardware === false ? "screen.encoderSoftware" : "screen.encoderUnknown") })
@@ -219,7 +218,9 @@ function SenderStats() {
   return (
     <div data-testid="screen-sender-stats" title={encoder} className="flex min-w-0 flex-wrap items-center gap-1.5 text-xs text-white/85 tabular-nums">
       {`${stats.height}p · ${stats.fps} fps · ${mbps} Mb/s${stats.codec ? ` · ${stats.codec}` : ""}`}
-      {congestion ? <UploadWarning status={congestion} sharing /> : stats.limitation === "cpu" || stats.limitation === "bandwidth" ? (
+      <ConnectionIndicator variant="bar" />
+      {/* Congestion is the more specific reason the encoder is held back. */}
+      {!congested && (stats.limitation === "cpu" || stats.limitation === "bandwidth") ? (
         <span className="rounded bg-white/20 px-1.5 leading-5 font-medium text-white">
           {t(stats.limitation === "cpu" ? "screen.limitedCpu" : "screen.limitedBandwidth")}
         </span>

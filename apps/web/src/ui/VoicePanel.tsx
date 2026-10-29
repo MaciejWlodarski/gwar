@@ -1,6 +1,4 @@
-import { useUploadCongestion } from "../state/uplink";
-import { UploadWarning } from "./UploadWarning";
-import { Headphones, HeadphoneOff, Mic, MicOff, MonitorUp, PhoneOff, SignalHigh, SignalLow, SignalMedium } from "lucide-react";
+import { Headphones, HeadphoneOff, Mic, MicOff, MonitorUp, PhoneOff } from "lucide-react";
 import type { ReactNode } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
@@ -10,11 +8,12 @@ import { useScreen } from "../state/screen";
 import { useSettings } from "../state/settings";
 import { myChannelId } from "../state/reducer";
 import { useSession, useVoice } from "../state/stores";
-import { useChannelPermission, useMe, keyLabel, modKey } from "./hooks";
+import { qualityTone, useChannelPermission, useConnectionQuality, useMe, keyLabel, modKey } from "./hooks";
 import { Button, IconButton, TalkingAvatar, Tooltip } from "./kit";
 import { showVoiceChannel, useVoicePill } from "./nav";
 import { ConnectBadge } from "./badges";
 import { ShareButton } from "./Screen";
+import { ConnectionIndicator } from "./ConnectionQuality";
 
 /** Mic toggle that doubles as a level meter and talking indicator. */
 export function MicButton({ size = "lg" }: { size?: "md" | "lg" | "wide" }) {
@@ -95,21 +94,10 @@ function SelfRow({ sub, subTitle }: { sub: ReactNode; subTitle?: string }) {
   );
 }
 
-/** The round trip to the server, as signal bars and ms; nothing until the first measurement. */
-function RoundTrip() {
-  const t = useT();
-  const rtt = useSession((s) => s.rtt);
-  if (rtt === null) return null;
-  const [Icon, tone] = rtt < 100 ? [SignalHigh, "text-ok"] : rtt < 200 ? [SignalMedium, "text-warn"] : [SignalLow, "text-danger"];
-  return (
-    <span className={cn("ml-auto flex shrink-0 items-center gap-0.5 tabular-nums", tone)} title={t("voice.rtt", { ms: String(rtt) })}>
-      <Icon aria-hidden className="size-3.5" />
-      {rtt < 1 ? "<1" : rtt} ms
-    </span>
-  );
-}
-
-/** How my voice connection is doing, in words and a tone (the panel's and the pill's status line). */
+/**
+ * How my voice connection is doing, in words and a tone (the panel's and the pill's status line).
+ * Connected, the tone is the connection quality, the way Discord colours "Voice Connected".
+ */
 function useVoiceStatus() {
   const t = useT();
   const voiceState = useVoice((s) => s.state);
@@ -134,8 +122,9 @@ function useVoiceStatus() {
             : voiceState === "failed"
               ? { tone: encryption || encryptedChannel ? "muted" : "danger", text: t("voice.failed") }
               : { tone: "warn", text: t("voice.connecting") };
+  const quality = useConnectionQuality()?.quality;
   const tone = cn(
-    status.tone === "ok" && "text-ok",
+    status.tone === "ok" && qualityTone[quality ?? "good"],
     status.tone === "warn" && "text-warn",
     status.tone === "danger" && "text-danger",
     status.tone === "muted" && "text-muted",
@@ -167,7 +156,6 @@ export function VoicePanel() {
   const canSpeak = useChannelPermission(me?.channel ?? null, "speak");
   const member = useSession((s) => (s.me ? s.members[s.me.uid] : undefined));
   const { status, tone } = useVoiceStatus();
-  const congestion = useUploadCongestion();
 
   if (me && me.channel === null) {
     return (
@@ -214,7 +202,7 @@ export function VoicePanel() {
             ) : (
               <span className={cn("truncate", tone)}>{status.text}</span>
             )}
-            {status.tone === "ok" && !congestion && <RoundTrip />}
+            {status.tone === "ok" && <ConnectionIndicator variant="panel" />}
           </div>
         </div>
         {unavailable && phase === "online" && (
@@ -224,7 +212,6 @@ export function VoicePanel() {
         )}
         <LeaveButton />
       </div>
-      {congestion && voiceState === "connected" && <UploadWarning status={congestion} />}
       {micError && (
         <div role="alert" className="rounded-md bg-danger-soft px-2 py-1.5 text-xs text-danger">
           {describeVoiceError(micError)}
@@ -264,7 +251,6 @@ export function VoicePill() {
   const t = useT();
   const shown = useVoicePill();
   const { status, tone } = useVoiceStatus();
-  const congestion = useUploadCongestion();
   const channelName = useSession((s) => {
     const channel = myChannelId(s);
     return channel === null ? undefined : s.channels[channel]?.name;
@@ -277,27 +263,25 @@ export function VoicePill() {
       aria-label={t("voice.pill")}
       className="absolute bottom-3 left-1/2 z-10 flex w-max max-w-[calc(100%-1.5rem)] -translate-x-1/2 items-center gap-2 rounded-[14px] border border-line-strong bg-raised p-1.5 pl-2 shadow-pop"
     >
-      <div className="min-w-0">
-        <Tooltip label={t("voice.pillOpen")}>
-          <button onClick={showVoiceChannel} className="t min-w-0 max-w-full cursor-pointer rounded-md px-1.5 py-0.5 text-left leading-tight hover:bg-hover md:max-w-64">
-            <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium">
-              <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone, status.tone === "warn" && "animate-pulse")} />
-              <span className={cn("truncate", tone)}>{status.text}</span>
-              {sharing && (
-                <span className="flex shrink-0 items-center text-accent" title={t("screen.liveSelf")}>
-                  <MonitorUp aria-hidden className="size-3.5" />
-                  <span className="sr-only">{t("screen.liveSelf")}</span>
-                </span>
-              )}
-            </span>
-            <span className="block truncate text-xs text-muted">
-              #{channelName} · {serverName}
-            </span>
-          </button>
-        </Tooltip>
-        {congestion && status.tone === "ok" && <UploadWarning status={congestion} />}
-      </div>
+      <Tooltip label={t("voice.pillOpen")}>
+        <button onClick={showVoiceChannel} className="t min-w-0 cursor-pointer rounded-md px-1.5 py-0.5 text-left leading-tight hover:bg-hover md:max-w-64">
+          <span className="flex min-w-0 items-center gap-1.5 text-xs font-medium">
+            <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone, status.tone === "warn" && "animate-pulse")} />
+            <span className={cn("truncate", tone)}>{status.text}</span>
+            {sharing && (
+              <span className="flex shrink-0 items-center text-accent" title={t("screen.liveSelf")}>
+                <MonitorUp aria-hidden className="size-3.5" />
+                <span className="sr-only">{t("screen.liveSelf")}</span>
+              </span>
+            )}
+          </span>
+          <span className="block truncate text-xs text-muted">
+            #{channelName} · {serverName}
+          </span>
+        </button>
+      </Tooltip>
       <div className="flex shrink-0 items-center gap-1">
+        {status.tone === "ok" && <ConnectionIndicator variant="pill" />}
         <MicButton size="md" />
         <DeafenButton size="md" />
         <LeaveButton />

@@ -10,6 +10,8 @@ export interface UplinkStatus {
   rttMs: number;
   baselineMs: number;
   availableOutgoingBitrate: number | null;
+  /** Fraction of our sent packets the server reported lost (0–100), when RTCP carries it. */
+  lossPct?: number | null;
 }
 
 /** Entry needs `minSamples` elevated samples covering `holdMs` within the last `windowMs`. */
@@ -35,8 +37,6 @@ export const PING_UPLINK: UplinkTiming = { windowMs: 35_000, holdMs: 15_000, min
 const FLOOR_MS = 60_000;
 /** A route step is flat in absolute terms; a queue is not, however deep it is. */
 const FLAT_MS = 30;
-/** Backups and uploads run for hours; a floor this old is no longer evidence. */
-const STALE_FLOOR_MS = 1_800_000;
 const RECOVER_MS = 5_000;
 
 interface Point { at: number; ms: number }
@@ -163,12 +163,11 @@ export class UplinkCongestion {
 
   /**
    * A route or radio change moves RTT to a new level that is flat; bloat is jagged. So adopt the
-   * last minute's minimum as the floor after `rebaseMs` away from it with p90 − p10 within 30 ms,
-   * or unconditionally after thirty minutes: a floor that old is not evidence.
+   * last minute's minimum as the floor after `rebaseMs` away from it with p90 − p10 within 30 ms.
+   * There is no age limit: backups run for hours, and the quality indicator shows the RTT itself.
    */
   private shouldRebase(now: number): boolean {
     const away = now - this.healthyAt;
-    if (away >= STALE_FLOOR_MS) return true;
     const { rebaseMs } = this.timing;
     if (away < rebaseMs || this.recent.length < 6 || now - this.recent[0]!.at < rebaseMs * 0.75) return false;
     const sorted = this.recent.map(p => p.ms).sort((a, b) => a - b);
@@ -190,6 +189,7 @@ export class UplinkCongestion {
 export class RtcUplinkObserver {
   private detector = new UplinkCongestion(RTC_UPLINK);
   private evidence = new Map<string, number>();
+  private loss: number | null = null;
 
   observe(now: number, report: RTCStatsReport | null): UplinkStatus | null {
     let selected: string | undefined;
@@ -226,6 +226,16 @@ export class RtcUplinkObserver {
       });
     }
     this.detector.hint(serverPing);
-    return this.detector.observe(now, sample);
+    const status = this.detector.observe(now, sample);
+    // Our outbound streams as the server received them; the worst one is what someone hears or sees.
+    if (report) {
+      let loss: number | null = null;
+      report.forEach(s => {
+        if (s.type !== "remote-inbound-rtp" || !Number.isFinite(s.fractionLost) || s.fractionLost < 0) return;
+        if (report.get(s.localId)?.type === "outbound-rtp") loss = Math.max(loss ?? 0, Math.min(1, s.fractionLost) * 100);
+      });
+      this.loss = loss;
+    }
+    return status && { ...status, lossPct: this.loss };
   }
 }

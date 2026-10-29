@@ -14,6 +14,7 @@ import { sealedThread } from "../lib/chat";
 import type { Roster } from "../mls/types";
 import type { SealedKey } from "../state/sealed";
 import type { StoredThreadKey } from "../state/types";
+import { connectionQuality, useUplink, type ConnectionQuality, type Quality } from "../state/uplink";
 
 const subscribeRoster = (listener: () => void) => controller.onRoster(listener);
 /** Who can read an encrypted thread, once this device has secured it. */
@@ -282,4 +283,14 @@ export function useTsIdentities(): TsListInfo | null {
     };
   }, [revision]);
   return list;
+}
+
+export const qualityTone: Record<Quality, string> = { good: "text-ok", fair: "text-warn", poor: "text-danger" };
+
+/** What the connection is like now (`connectionQuality`); null before the first measurement. */
+export function useConnectionQuality(): ConnectionQuality | null {
+  const rtt = useSession(s => s.rtt);
+  const voice = useUplink(s => s.voice);
+  const screen = useUplink(s => s.screen);
+  return useMemo(() => connectionQuality(rtt, voice, screen), [rtt, voice, screen]);
 }

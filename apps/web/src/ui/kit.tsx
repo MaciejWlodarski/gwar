@@ -439,6 +439,7 @@ export function Dialog({
   children,
   footer,
   width = "max-w-md",
+  onCloseAutoFocus,
 }: {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -447,6 +448,8 @@ export function Dialog({
   children: ReactNode;
   footer?: ReactNode;
   width?: string;
+  /** Without a trigger, focus returns nowhere: a dialog opened from elsewhere can restore it here. */
+  onCloseAutoFocus?: (event: Event) => void;
 }) {
   const t = useT();
   return (
@@ -454,6 +457,7 @@ export function Dialog({
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="anim-fade fixed inset-0 z-50 bg-black/55 backdrop-blur-[2px]" />
         <DialogPrimitive.Content
+          onCloseAutoFocus={onCloseAutoFocus}
           className={cn(
             "anim-pop fixed top-1/2 left-1/2 z-50 flex max-h-[min(90dvh,720px)] w-[calc(100vw-24px)] -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-line-strong bg-surface shadow-pop outline-none",
             width,
