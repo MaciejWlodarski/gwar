@@ -888,7 +888,10 @@ datagrams reach the screen task without slowing voice down.
     200 kb/s covers roughly 64 kb/s Opus plus RTCP and repairs without reserving
     multiple Mb/s on a fast link. Above 2 Mb/s, 10 % leaves a growing repair margin.
     Below 667 kb/s the reserve is 30 %: video under 2/3 of the estimate would stop
-    GCC's growth (it raises the estimate to at most 1.5× measured throughput);
+    GCC's growth (it raises the estimate to at most 1.5× measured throughput). The
+    margin is thin, as with the old 0.7× rule: video at 0.7× the estimate leaves
+    1.05× headroom, so a static screen that encodes below ~95 % of its target does
+    not raise the estimate;
   - the 250 kb/s probing floor takes precedence below a 357 kb/s estimate. It can
     leave less than 200 kb/s, or even exceed the estimate; voice capacity is not
     guaranteed there. Missing/invalid estimates retain the spec cap, and GCC remains
