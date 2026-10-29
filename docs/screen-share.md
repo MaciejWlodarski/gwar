@@ -3219,15 +3219,16 @@ signal-bar indicator rather than banners (`ui/ConnectionQuality.tsx`,
   the bars, and the sharing bar a chip, only while the connection is not good.
 - **Colour, from measurements only.** The round trip is the worst fresh media
   RTT of the voice and screen transports, or the server ping without media.
-  Good below 150 ms, fair from 150 ms, poor from 300 ms: a conversation stays
-  natural up to about 150 ms one way (ITU-T G.114), so a far server alone is not
-  flagged. Loss of our own outbound streams, from
+  Good below 150 ms, fair from 150 ms, poor from 300 ms round trip, about
+  150 ms each way, up to which a conversation stays natural (ITU-T G.114); a far
+  server alone is not flagged. Loss of our own outbound streams, from
   `remote-inbound-rtp.fractionLost` where RTCP carries it, makes it fair from
   3 % and poor from 10 %. A congestion verdict makes it at least fair, and poor
-  when the queue adds 250 ms or more. No timer changes the colour: if the
+  when the queue adds 250 ms or more. No detector timer turns it green: if the
   detector adopts a new floor, a 480 ms round trip is still red. A worse colour
-  shows at once; a better one only after holding for 4 s, so a round trip at a
-  threshold does not flicker.
+  shows at once; a better one once the connection has stayed better for 4 s,
+  stepping down to the worst quality seen meanwhile, so a round trip at a
+  threshold does not flicker. Every view shows the same held colour.
 - **Brief message.** When a congestion verdict starts, one plain-language
   message appears in the toast stack ("Your internet can't keep up with
   uploading — others hear you about 0.5 s late", the delay being RTT minus the
@@ -3242,7 +3243,7 @@ signal-bar indicator rather than banners (`ui/ConnectionQuality.tsx`,
   "Technical details", the round trip, the usual round trip, loss, the upload
   estimate and the router advice (SQM/QoS, bufferbloat). Without a verdict the
   dialog gives generic advice for a slow connection instead. Closing it returns
-  focus to what opened it.
+  focus to what opened it; it also closes when the connection ends.
 - **Accessibility.** The message is inserted into a polite live region, so a
   screen reader hears it once per episode; its delay is fixed when it appears.
   The sharing bar's chip is `aria-live="off"` inside the bar's status region.

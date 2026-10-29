@@ -1358,6 +1358,15 @@ it("a teardown that resumes after a newer connect leaves that connection alone",
   c.conn = link;
 });
 
+it("a teardown closes the connection details, which describe that connection", async () => {
+  connectFake();
+  const { useUplink } = await import("./uplink");
+  useUplink.setState({ details: true });
+  await (controller as unknown as { teardown(): Promise<void> }).teardown();
+  expect(useUplink.getState().details).toBe(false);
+  (controller as unknown as { conn: unknown }).conn = link;
+});
+
 it("a teardown still cleans up when a failed connect clears the connection meanwhile", async () => {
   connectFake();
   const c = controller as unknown as { conn: unknown; runtime: unknown; teardown(): Promise<void> };

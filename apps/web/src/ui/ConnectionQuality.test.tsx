@@ -7,9 +7,8 @@ import { initialState } from "../state/reducer";
 import { initialScreen, useScreen } from "../state/screen";
 import { useSettings } from "../state/settings";
 import { useSession, useUi, useVoice } from "../state/stores";
-import { connectionQuality, EPISODE_MERGE_MS, resetCongestionEpisodes, useUplink } from "../state/uplink";
+import { connectionQuality, EPISODE_MERGE_MS, QUALITY_IMPROVE_MS, resetCongestionEpisodes, useUplink } from "../state/uplink";
 import { ConnectionDetails, NOTICE_MS } from "./ConnectionQuality";
-import { QUALITY_IMPROVE_MS } from "./hooks";
 import { SharingBar } from "./Screen";
 import { Toaster } from "./Toaster";
 import { VoicePanel, VoicePill } from "./VoicePanel";
@@ -93,6 +92,35 @@ it("adds the indicator to the pill only while the connection is not good", async
   expect(indicator()?.dataset.quality).toBe("poor");
   await act(async () => vi.advanceTimersByTime(1));
   expect(indicator()).toBeNull();
+});
+
+it("steps down to the worst recent quality within 4 s, however often the measurement changes", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  useScreen.setState({ ...initialScreen });
+  useUi.setState({ section: "home" });
+  await render(<><VoicePill /><VoicePanel /></>);
+  await set({ voice: { ...healthy, rttMs: 400 } });
+  const quality = () => [...container.querySelectorAll<HTMLElement>('[data-testid="connection-quality"]')].map(e => e.dataset.quality);
+  expect(quality()).toEqual(["poor", "poor"]);
+  // A round trip at the good/fair edge: every change must not restart the hold.
+  for (let i = 0; i < 4; i++) {
+    await set({ voice: { ...healthy, rttMs: i % 2 ? 160 : 140 } });
+    await act(async () => vi.advanceTimersByTime(1000));
+  }
+  // One colour for every view: the pill and the panel agree.
+  expect(quality()).toEqual(["fair", "fair"]);
+});
+
+it("drops the held colour with the measurement, and shows the next one as it is", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  useScreen.setState({ ...initialScreen });
+  await render(<VoicePanel />);
+  await set({ voice: bloated });
+  expect(indicator()?.dataset.quality).toBe("poor");
+  await act(async () => { useSession.setState({ rtt: null }); useUplink.setState({ voice: null }); });
+  expect(indicator()).toBeNull();
+  await act(async () => useSession.setState({ rtt: 20 }));
+  expect(indicator()?.dataset.quality).toBe("good");
 });
 
 it("replaces the generic sender reason in the sharing bar while congested, then restores it", async () => {

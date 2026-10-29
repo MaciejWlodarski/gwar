@@ -286,27 +286,20 @@ export function useTsIdentities(): TsListInfo | null {
 }
 
 export const qualityTone: Record<Quality, string> = { good: "text-ok", fair: "text-warn", poor: "text-danger" };
-
-/** A worse colour shows at once; a better one only once it has held this long, so a round trip
- * hovering at a threshold does not make the colour (and the pill's indicator) flicker. */
-export const QUALITY_IMPROVE_MS = 4_000;
 const QUALITY_RANK: Record<Quality, number> = { good: 0, fair: 1, poor: 2 };
 
-/** What the connection is like now (`connectionQuality`); null before the first measurement. */
+/**
+ * What the connection is like now (`connectionQuality`); null before the first measurement. The
+ * colour is the shared held one (`QUALITY_IMPROVE_MS`): never better than the measurement.
+ */
 export function useConnectionQuality(): ConnectionQuality | null {
   const rtt = useSession(s => s.rtt);
   const voice = useUplink(s => s.voice);
   const screen = useUplink(s => s.screen);
-  const live = useMemo(() => connectionQuality(rtt, voice, screen), [rtt, voice, screen]);
-  const next = live?.quality ?? null;
-  const [shown, setShown] = useState<Quality | null>(next);
-  const worse = next !== shown && (!next || !shown || QUALITY_RANK[next] > QUALITY_RANK[shown]);
-  if (worse) setShown(next);
-  useEffect(() => {
-    if (!next || !shown || QUALITY_RANK[next] >= QUALITY_RANK[shown]) return;
-    const timer = setTimeout(() => setShown(next), QUALITY_IMPROVE_MS);
-    return () => clearTimeout(timer);
-  }, [next, shown]);
-  if (!live || !shown || QUALITY_RANK[live.quality] >= QUALITY_RANK[shown]) return live;
-  return { ...live, quality: shown };
+  const shown = useUplink(s => s.shown);
+  return useMemo(() => {
+    const live = connectionQuality(rtt, voice, screen);
+    if (!live || !shown || QUALITY_RANK[shown] <= QUALITY_RANK[live.quality]) return live;
+    return { ...live, quality: shown };
+  }, [rtt, voice, screen, shown]);
 }

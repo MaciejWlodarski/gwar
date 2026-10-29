@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { useSession } from "./stores";
 import type { UplinkStatus } from "../voice/uplink-congestion";
 
 /**
@@ -12,9 +13,11 @@ interface Uplink {
   notice: { episode: number; delayMs: number } | null;
   /** The connection details dialog. */
   details: boolean;
+  /** The colour on screen: `connectionQuality` with a better one held back (`noteQuality`). */
+  shown: Quality | null;
 }
 
-export const useUplink = create<Uplink>(() => ({ voice: null, screen: null, notice: null, details: false }));
+export const useUplink = create<Uplink>(() => ({ voice: null, screen: null, notice: null, details: false, shown: null }));
 
 const congestion = (s: Uplink) => s.screen?.congested ? s.screen : s.voice?.congested ? s.voice : null;
 
@@ -36,8 +39,8 @@ export interface ConnectionQuality {
 }
 
 /**
- * Round trip: a conversation stays natural up to ~150 ms one way (ITU-T G.114), so a far server
- * at 120 ms is not "fair"; loss in percent of what we send.
+ * Round trip: poor from 300 ms, about 150 ms each way, up to which a conversation stays natural
+ * (ITU-T G.114), so a far server alone is not flagged; loss in percent of what we send.
  */
 const RTT_FAIR = 150, RTT_POOR = 300, LOSS_FAIR = 3, LOSS_POOR = 10;
 /** Queueing delay others notice as a lag in conversation. */
@@ -64,6 +67,43 @@ export function connectionQuality(serverRttMs: number | null, voice: UplinkStatu
   };
 }
 
+/**
+ * A worse colour shows at once; a better one only once the connection has stayed better for this
+ * long, so a round trip at a threshold does not flicker the colour or the pill's indicator. One
+ * held colour for every view, so the pill and the panel never disagree.
+ */
+export const QUALITY_IMPROVE_MS = 4_000;
+const RANK: Record<Quality, number> = { good: 0, fair: 1, poor: 2 };
+let improveTimer: ReturnType<typeof setTimeout> | null = null;
+/** The worst quality seen since the improvement began: where the held colour steps down to. */
+let improvingTo: Quality | null = null;
+
+const liveQuality = (): Quality | null => {
+  const { voice, screen } = useUplink.getState();
+  return connectionQuality(useSession.getState().rtt, voice, screen)?.quality ?? null;
+};
+
+function noteQuality(): void {
+  const live = liveQuality();
+  const shown = useUplink.getState().shown;
+  if (!live || !shown || RANK[live] >= RANK[shown]) {
+    // No measurement, the same, or worse: honest at once.
+    if (improveTimer) clearTimeout(improveTimer);
+    improveTimer = null; improvingTo = null;
+    if (live !== shown) useUplink.setState({ shown: live });
+    return;
+  }
+  if (!improvingTo || RANK[live] > RANK[improvingTo]) improvingTo = live;
+  improveTimer ??= setTimeout(() => {
+    const to = improvingTo;
+    improveTimer = null; improvingTo = null;
+    useUplink.setState({ shown: to });
+    noteQuality();
+  }, QUALITY_IMPROVE_MS);
+}
+useUplink.subscribe((s, prev) => { if (s.voice !== prev.voice || s.screen !== prev.screen) noteQuality(); });
+useSession.subscribe((s, prev) => { if (s.rtt !== prev.rtt) noteQuality(); });
+
 /** A verdict that returns this soon after the last one ended continues that episode: no new message. */
 export const EPISODE_MERGE_MS = 120_000;
 let episode = 0;
@@ -88,5 +128,7 @@ export const closeConnectionDetails = () => useUplink.setState({ details: false 
 /** Tests only: forget earlier episodes. */
 export function resetCongestionEpisodes(): void {
   active = false; endedAt = -Infinity;
-  useUplink.setState({ voice: null, screen: null, notice: null, details: false });
+  if (improveTimer) clearTimeout(improveTimer);
+  improveTimer = null; improvingTo = null;
+  useUplink.setState({ voice: null, screen: null, notice: null, details: false, shown: null });
 }
