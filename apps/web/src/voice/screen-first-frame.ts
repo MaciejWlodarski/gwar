@@ -28,6 +28,15 @@ export function answerCodecs(sdp: string): SendCodec[] {
   return [...new Set(order.flatMap(pt => codecFamily(names.get(pt)) ?? []))];
 }
 
+/** Whether the answer's leading video codec, the one the engine sends, carries the start hint. */
+export function leadHinted(sdp: string): boolean {
+  const section = sdp.split(/(?=^m=)/m).find(s => /^m=video /.test(s));
+  if (!section) return false;
+  const names = new Map([...section.matchAll(/^a=rtpmap:(\d+) ([^/\s]+)\//gm)].map(m => [m[1]!, m[2]!]));
+  const lead = /^m=video \S+ \S+((?: \d+)*)/.exec(section)?.[1]?.trim().split(" ").find(pt => codecFamily(names.get(pt)));
+  return lead !== undefined && new RegExp(`^a=fmtp:${lead} .*x-google-start-bitrate=`, "m").test(section);
+}
+
 /** The answer with only `codec`'s payload types and their RTX in its video section; null without one. */
 export function restrictAnswer(sdp: string, codec: SendCodec): string | null {
   const eol = sdp.includes("\r\n") ? "\r\n" : "\n";

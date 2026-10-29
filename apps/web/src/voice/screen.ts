@@ -16,7 +16,7 @@ import { deriveSpec, resolveQuality, type ScreenSpec, type ResolvedSpec } from "
 import type { ScreenSurface } from "../proto/ScreenSurface";
 import { uplinkVideoBudget } from "./screen-headroom";
 import { screenStartBitrate, withScreenStartBitrate } from "./screen-start-bitrate";
-import { answerCodecs, codecFamily, fallbackCodec, FIRST_ENCODE_TIMEOUT_MS, firstFrameProgress, restrictAnswer, sourceFrames, type SendCodec } from "./screen-first-frame";
+import { answerCodecs, codecFamily, fallbackCodec, FIRST_ENCODE_TIMEOUT_MS, firstFrameProgress, leadHinted, restrictAnswer, sourceFrames, type SendCodec } from "./screen-first-frame";
 export { MIN_BITRATE } from "./screen-headroom";
 
 /** Receive slots of a watch transport (`gwar_proto::SCREEN_SLOTS`). */
@@ -720,7 +720,7 @@ export class ScreenPublisher {
     const hinted = this.startHintUnsafe ? answer : withScreenStartBitrate(answer, screenStartBitrate(this.spec().maxBitrate));
     await pc.setRemoteDescription({ type: "answer", sdp: hinted });
     if (this.closed || this.pc !== pc) return;
-    this.answer = { pc, sdp: answer, hinted: hinted !== answer, ssrcs };
+    this.answer = { pc, sdp: answer, hinted: leadHinted(hinted), ssrcs };
     this.stopWatching = watchState(pc, s => { if (s === "connected") this.expectFirstFrame(pc); this.params.state(s); }, () => this.pc === pc);
     // The latest quality: `setSpec` may have run while this negotiated.
     this.refreshSurface();
@@ -985,7 +985,7 @@ export class ScreenPublisher {
    * The same transport, the server's own answer: a fresh local offer (same SSRCs, ICE and DTLS),
    * then the stored answer as rewritten. The server negotiates once per share, and the SFU follows
    * a codec change in place. libwebrtc rebuilds its encoder for the changed codec parameters;
-   * whether GStreamer (WebKitGTK) does is unverified, and there the worst case is the stop.
+   * whether WebKitGTK's older GstWebRTC backend does is unverified; there the worst case is the stop.
    */
   private async renegotiate(pc: RTCPeerConnection, ssrcs: { ssrc: number; rtx_ssrc: number }, sdp: string): Promise<boolean> {
     const stale = () => this.closed || this.pc !== pc;

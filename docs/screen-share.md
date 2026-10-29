@@ -667,9 +667,10 @@ remain in force.
 
 **First encoded frame.** A publish transport can connect (SDP and ICE both fine)
 while the engine never creates a video encoder, so `outbound-rtp.framesEncoded`
-stays 0. Known causes: WebKitGTK's GStreamer VP9 factory refusing an fmtp with
+stays 0. Known causes: GTK/WPE's VP9 encoder factory refusing an fmtp with
 extra keys (the start hint above), a missing GStreamer encoder plugin such as
-x264, and any unknown platform quirk with `x-google-start-bitrate`. Nothing else
+x264 on older GstWebRTC builds, and any unknown platform quirk with
+`x-google-start-bitrate`. Nothing else
 notices it: the SFU's `try_recover` needs a viewer's last stream, which never
 exists without RTP; viewers wait `FIRST_FRAME_TIMEOUT_MS` (35 s) for
 `screen.watchFailed`; and the sharer keeps "sharing" nothing.
@@ -698,8 +699,7 @@ one. The web has no reliable way to ask display capture for a fresh frame
 (`requestFrame` exists only for canvas capture), so the guard waits instead of
 prodding the source; the window coming back or the content changing delivers the
 next frame. An engine that reports no source frame
-count (WebKitGTK's GStreamer backend) is judged by encoded frames alone, as
-above.
+count is judged by encoded frames alone, as above.
 
 Without a frame, the publisher takes one step per expired wait. It takes each
 step at most once per share:
@@ -719,7 +719,8 @@ step at most once per share:
    "Your screen share was stopped: this browser could not encode the video."
    Nothing rearms after that.
 
-Engines without a start hint (WebKitGTK) start at step 2. Every step logs a
+An answer without the start hint (GTK/WPE answers that lead with VP9 or AV1)
+starts at step 2. Every step logs a
 `Screen sender: no frame encoded 5 s after connecting (codec …, start hint
 on|off); …` warning, which bug reports carry.
 
@@ -728,10 +729,10 @@ share's publish transport once and answers a different second offer with
 `conflict` unless the SFU asked for it with `screen.recover`, so the sender does
 not open a new transport. It makes a fresh local offer (same SSRCs, ICE and DTLS)
 and applies the server's own answer again, rewritten for the step. libwebrtc
-engines rebuild their encoder for the changed codec parameters. Whether the
-GStreamer backend (WebKitGTK) rebuilds its encoder on a codec change during
+engines rebuild their encoder for the changed codec parameters. Whether
+WebKitGTK's older GstWebRTC backend rebuilds its encoder on a codec change during
 renegotiation is unverified. If it does not, the ladder there ends in the stop
-and its toast about 10 s after connecting, because GTK starts at step 2. A new
+and its toast 10–15 s after connecting. A new
 offer whose video SSRCs changed is a failure, since the SFU drops RTP from any
 SSRC but the one it negotiated. The SFU already follows a codec change in place
 at the next keyframe (`switch_codec`, as for the AV1 → H.264 retirement). The cap

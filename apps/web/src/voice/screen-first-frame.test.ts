@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { answerCodecs, encodedAnything, fallbackCodec, firstFrameProgress, restrictAnswer, sourceFrames } from "./screen-first-frame";
+import { answerCodecs, encodedAnything, fallbackCodec, firstFrameProgress, leadHinted, restrictAnswer, sourceFrames } from "./screen-first-frame";
 
 const answer = [
   "v=0", "o=- 1 2 IN IP4 0.0.0.0", "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99", "a=mid:0",
@@ -15,6 +15,14 @@ describe("first-frame guard helpers", () => {
     expect(answerCodecs(answer)).toEqual(["h264", "vp9"]);
     expect(answerCodecs(answer.replace("96 97 98 99", "98 99 96 97"))).toEqual(["vp9", "h264"]);
     expect(answerCodecs("v=0\r\n")).toEqual([]);
+  });
+
+  it("tells whether the sent codec carries the start hint", () => {
+    expect(leadHinted(answer)).toBe(false);
+    expect(leadHinted(answer.replace("profile-level-id=42e01f", "profile-level-id=42e01f;x-google-start-bitrate=4000"))).toBe(true);
+    // Only a later codec's hint: the engine sends the first one without it.
+    expect(leadHinted(answer.replace("profile-id=0", "profile-id=0;x-google-start-bitrate=4000"))).toBe(false);
+    expect(leadHinted("v=0\r\n")).toBe(false);
   });
 
   it("keeps one codec, its RTX and every other line of the answer", () => {

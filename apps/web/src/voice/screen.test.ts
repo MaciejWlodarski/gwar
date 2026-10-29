@@ -2900,14 +2900,22 @@ describe("first-frame guard", () => {
     publisher.close();
   });
 
-  it("goes to the codec fallback first where the engine got no start hint", async () => {
+  it("goes to the codec fallback first where the sent codec got no start hint", async () => {
     vi.stubGlobal("navigator", { userAgent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", platform: "Linux x86_64" });
-    const { publisher, pc, warn } = await share();
-    expect(remote(pc)).toEqual([answer]);
+    // GTK/WPE hints H.264 only: a VP9-led answer sends VP9 without it.
+    const vp9First = answer.replace("96 97 98 99", "98 99 96 97");
+    const { publisher, pc, warn } = await share({ offer: async () => vp9First });
+    expect(remote(pc)[0]).toContain("a=fmtp:96 packetization-mode=1;profile-level-id=42e01f;x-google-start-bitrate=4000");
+    expect(remote(pc)[0]).toContain("a=fmtp:98 profile-id=0\r\n");
     await vi.advanceTimersByTimeAsync(5_000);
-    expect(remote(pc).at(-1)).toContain("m=video 9 UDP/TLS/RTP/SAVPF 98 99\r\n");
-    expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("(codec h264, start hint off); renegotiating with vp9"));
+    expect(remote(pc).at(-1)).toContain("m=video 9 UDP/TLS/RTP/SAVPF 96 97\r\n");
+    expect(warn).toHaveBeenCalledExactlyOnceWith(expect.stringContaining("(codec vp9, start hint off); renegotiating with h264"));
     publisher.close();
+    // An H.264-led answer there carries the hint, so the ladder starts by dropping it.
+    const h264 = await share();
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(h264.warn).toHaveBeenLastCalledWith(expect.stringContaining("(codec h264, start hint on); renegotiating without the start-bitrate hint"));
+    h264.publisher.close();
   });
 
   it("reports one failure and stops when nothing ever encodes", async () => {
