@@ -101,7 +101,8 @@ export function sourceFrames(stats: RTCStatsReport, trackId: string | undefined)
  */
 export function firstFrameProgress(stats: RTCStatsReport, trackId: string | undefined, since: number | undefined): { state: "encoded" | "idle" | "stalled"; frames: number | undefined } {
   const frames = sourceFrames(stats, trackId);
+  // Any change counts: a rebuilt send stream restarts the counter below `since`.
   if (encodedAnything(stats)) return { state: "encoded", frames };
   if (frames === undefined) return { state: "stalled", frames };
-  return { state: frames > 0 && since !== undefined && frames > since ? "stalled" : "idle", frames };
+  return { state: frames > 0 && since !== undefined && frames !== since ? "stalled" : "idle", frames };
 }

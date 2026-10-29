@@ -668,7 +668,7 @@ remain in force.
 **First encoded frame.** A publish transport can connect (SDP and ICE both fine)
 while the engine never creates a video encoder, so `outbound-rtp.framesEncoded`
 stays 0. Known causes: GTK/WPE's VP9 encoder factory refusing an fmtp with
-extra keys (the start hint above), a missing GStreamer encoder plugin such as
+extra keys (the start hint above; since #193 VP9 on GTK/WPE no longer gets it), a missing GStreamer encoder plugin such as
 x264 on older GstWebRTC builds, and any unknown platform quirk with
 `x-google-start-bitrate`. Nothing else
 notices it: the SFU's `try_recover` needs a viewer's last stream, which never

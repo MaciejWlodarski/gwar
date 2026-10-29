@@ -73,6 +73,8 @@ describe("first-frame guard helpers", () => {
     // Frames already delivered with no known start: measure from here.
     expect(firstFrameProgress(stats(source(120)), "screen", undefined)).toEqual({ state: "idle", frames: 120 });
     expect(firstFrameProgress(stats(source(121)), "screen", 120).state).toBe("stalled");
+    // A rebuilt send stream restarts the counter: frames since then still count.
+    expect(firstFrameProgress(stats(source(3)), "screen", 150).state).toBe("stalled");
     // No source frame count: judged by encoded frames alone.
     expect(firstFrameProgress(stats(), "screen", undefined)).toEqual({ state: "stalled", frames: undefined });
   });
