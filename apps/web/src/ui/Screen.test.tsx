@@ -116,7 +116,7 @@ it("shows independent quality controls and saves an explicit click on the surfac
   useScreen.getState().dispatch({ type: "picked", attempt: 1, stream: {} as MediaStream, surface: "screen" });
   useScreen.getState().dispatch({ type: "starting", attempt: 1 });
   await act(async () => root.render(<SharingBar />));
-  expect(container.textContent).toContain("1080p30 · Płynność");
+  expect(container.textContent).toContain("Płynność");
   const modes = container.querySelectorAll<HTMLInputElement>('input[type="radio"]');
   expect(modes).toHaveLength(2);
   expect(container.textContent).toContain("Ostry tekst");
@@ -344,4 +344,23 @@ describe("watched video frames", () => {
       expect(visible(video)).toBe(true);
     } finally { received.mockRestore(); }
   });
+});
+
+it("shows a calm quality chip and keeps encoder statistics behind Details", async () => {
+  const stats = vi.spyOn(controller.screen, "ownStats").mockResolvedValue({ width: 1920, height: 1080, fps: 60, bitrate: 4200000, codec: "VP9", encoder: "libvpx", hardware: false, limitation: "none" });
+  try {
+    const { dispatch } = useScreen.getState();
+    dispatch({ type: "pick", attempt: 1 });
+    dispatch({ type: "picked", attempt: 1, stream: {} as MediaStream, surface: "screen" });
+    dispatch({ type: "starting", attempt: 1 });
+    dispatch({ type: "started", attempt: 1, share: "M" });
+    dispatch({ type: "live", share: "M" });
+    await act(async () => root.render(<SharingBar />));
+    const details = container.querySelector<HTMLDetailsElement>('[data-testid="screen-sender-stats"]')!;
+    expect(details.open).toBe(false);
+    expect(details.querySelector("summary")?.textContent).toBe("Good quality");
+    expect(details.textContent).toContain("1080p · 60 fps · 4.2 Mb/s · VP9");
+    await act(async () => details.querySelector("summary")!.click());
+    expect(details.open).toBe(true);
+  } finally { stats.mockRestore(); }
 });

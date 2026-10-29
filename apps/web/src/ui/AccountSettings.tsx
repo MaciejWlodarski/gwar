@@ -98,7 +98,8 @@ export function AccountTab() {
   const loaded = useAccount((s) => s.loaded);
   const account = useAccount((s) => s.account);
   const pending = useAccount((s) => s.pending);
-  const [mode, setMode] = useState<Mode>("signin");
+  const mode = useUi((s) => s.accountEntry);
+  const setMode = (accountEntry: Mode) => useUi.setState({ accountEntry });
   if (pending) return <RecoveryCode code={pending.recoveryCode} handle={pending.prepared.handle} />;
   if (account) return <AccountView />;
   if (!loaded) return null;
@@ -370,7 +371,7 @@ function RecoveryCode({ code, handle: prepared }: { code: string; handle: string
 
 // ------------------------------------------------------------------ signed in
 
-function PasswordDialog({
+export function PasswordDialog({
   title,
   body,
   confirmLabel,

@@ -39,8 +39,9 @@ const snap = async (name, target = page) => {
 };
 try {
   await page.addInitScript(() => {
-    if (!localStorage.getItem("gwar.settings")) localStorage.setItem("gwar.settings", JSON.stringify({ version: 3, state: {
+    if (!localStorage.getItem("gwar.settings")) localStorage.setItem("gwar.settings", JSON.stringify({ version: 4, state: {
       language: "pl", theme: "dark", audio: { noiseSuppression: false },
+      onboarding: { completed: true, firstUsedAt: Date.now(), nudgeDismissed: true, roleReceived: false },
     } }));
   });
   await page.goto(web);
@@ -107,6 +108,12 @@ try {
   await caller.close(); page = newcomer;
 
   // Reload restores the server, persisted controls, and no voice participation.
+  // A previous build had session preferences but no onboarding preference yet.
+  await page.evaluate(() => {
+    const saved = JSON.parse(localStorage.getItem("gwar.settings"));
+    delete saved.state.onboarding; saved.version = 3;
+    localStorage.setItem("gwar.settings", JSON.stringify(saved));
+  });
   await page.reload({ waitUntil: "networkidle" });
   console.log("After reload:", await page.evaluate(async modules => {
     const { useSession, useConnectUi } = await window.__gwarE2eImport(modules.stores);
@@ -123,6 +130,7 @@ try {
     const s = useSession.getState(); const v = useVoice.getState();
     return { muted: v.muted, deafened: v.deafened, state: v.state, channel: s.me ? s.clients[s.me.session].channel : "missing session" };
   }, modules), { muted: true, deafened: true, state: "idle", channel: null });
+  await page.evaluate(async modules => (await window.__gwarE2eImport(modules.settings)).useSettings.getState().setOnboarding({ nudgeDismissed: true }), modules);
 
   // A real failed WebSocket remains cancellable and the online event skips its backoff.
   websocketMode = "fail";

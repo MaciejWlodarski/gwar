@@ -28,6 +28,7 @@
  *   RUST_LOG=info,gwar_server::media::screen=debug  include SFU recovery decisions in the logs
  *   GWAR_SERVER_BIN                 server binary (default: target/debug/gwar-server)
  */
+import { chooseFirstRunName } from "./first-run.mjs";
 import { stopProcesses } from "./processes.mjs";
 import { canvasCapture, readBarcode, stampBarcode } from "./screen-source.mjs";
 import assert from "node:assert/strict";
@@ -167,6 +168,7 @@ async function device(browser, web, server, name, { canvasId = null, frequency =
   page.on("pageerror", e => page.errors.push(String(e)));
   page.on("console", m => { if (m.type() === "warning" || m.type() === "error") page.errors.push(m.text()); });
   await page.goto(web);
+  await chooseFirstRunName(page, name);
   await page.getByLabel("Server address").fill(server);
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   await page.getByRole("tab", { name: "Identity", exact: true }).click();

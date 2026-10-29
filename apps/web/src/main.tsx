@@ -36,10 +36,6 @@ const render = (problem: unknown) => root.render(
     {problem !== undefined ? <StoredDataError problem={problem} /> : CaptureCheck ? <CaptureCheck /> : <App />}
   </StrictMode>,
 );
-if (problem === undefined && !CaptureCheck) {
-  const { controller } = await import("./state/controller");
-  void controller.restoreSession();
-}
 render(problem);
 if (problem === undefined) {
   watchLocalStorage(() => {

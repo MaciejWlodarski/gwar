@@ -517,7 +517,7 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
     case "screen.viewers": case "screen.link": case "screen.slot": return state;
     // Screen pauses live in the screen store (`screen-controller.ts`); the admins' egress
     // warning comes with its interface (docs/screen-share.md).
-    case "screen.keyframe": case "screen.recover": case "screen.paused": case "screen.resumed": case "server.egress_warning": return state;
+    case "screen.keyframe": case "screen.recover": case "screen.paused": case "screen.resumed": case "screen.waiting": case "server.egress_warning": return state;
     case "challenge":
     case "disconnected":
       return state;

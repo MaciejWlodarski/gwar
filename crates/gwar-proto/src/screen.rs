@@ -371,6 +371,7 @@ mod tests {
             Event::ScreenSlot { run: 2, slot: 0, share: None },
             Event::ScreenPaused { share: "s".into(), reason: ScreenPauseReason::Bandwidth },
             Event::ScreenResumed { share: "s".into() },
+            Event::ScreenWaiting { share: "s".into() },
             Event::ServerEgressWarning { month: "2026-10".into(), percent: 80, total: 8_000_000_000_000, limit: 10 },
         ] {
             let frame = ServerFrame::Event(event);

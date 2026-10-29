@@ -9,6 +9,7 @@
  *
  * A browser without RTCRtpScriptTransform is reported as an unrun check, not a pass.
  */
+import { chooseFirstRunName } from "./first-run.mjs";
 import { stopProcesses } from "./processes.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -119,6 +120,7 @@ async function device(browser, web, server, name, frequency) {
   page.on("pageerror", e => page.errors.push(String(e)));
   page.on("console", m => { if (m.type() === "warning" || m.type() === "error") page.errors.push(m.text()); });
   await page.goto(web);
+  await chooseFirstRunName(page, name);
   await page.getByLabel("Server address").fill(server);
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   await page.getByRole("tab", { name: "Identity", exact: true }).click();

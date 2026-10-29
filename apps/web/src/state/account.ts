@@ -9,7 +9,6 @@ import * as flows from "../connect/account";
 import { changeProfileNickname, refreshProfile, syncProfileAfterUnlock } from "../connect/profile";
 import { validNickname } from "../net/nickname";
 import { deviceName } from "../connect/device-name";
-import { certificateWarning } from "../connect/expiry";
 import { changeIdentities, refreshFromVault, syncAfterUnlock, tsBridge } from "../connect/teamspeak";
 import { addEntry, cleanName, DEFAULT_NAME, type TsEntry, type TsList } from "../connect/ts-list";
 import { loadVault, vaultList } from "../connect/vault";
@@ -177,20 +176,6 @@ async function refresh(record: ConnectRecord): Promise<void> {
   await applyRecord(record);
 }
 
-/** The expiry warning toast is shown once per app start. */
-let warned = false;
-
-function warnAboutExpiry(): void {
-  const { account, certChecked } = useAccount.getState();
-  if (warned || !account) return;
-  const warning = certificateWarning(account.expiresAt, Date.now(), certChecked);
-  if (warning.level === "none") return;
-  warned = true;
-  const { toast } = useUi.getState();
-  const date = new Date(account.expiresAt).toLocaleDateString(useSettings.getState().language);
-  toast(warning.level === "expired" ? "error" : "info", tNow(warning.level === "expired" ? "account.certExpiredToast" : "account.certExpiringToast", { date }));
-}
-
 /**
  * Quietly looks for this device's previously saved renewal.
  * It never blocks or fails startup: network errors and a 401 (the session
@@ -209,7 +194,6 @@ function checkCertificate(record: ConnectRecord): void {
     .catch((e: unknown) => console.warn("certificate check skipped", e))
     .finally(() => {
       useAccount.setState({ certChecked: true });
-      warnAboutExpiry();
     });
 }
 
@@ -236,37 +220,53 @@ export const accountActions = {
 
   /** Reads the stored sign-in (call once at startup). */
   async load(): Promise<void> {
-    await controller.getIdentity().catch((e: unknown) => {
-      console.warn("identity load skipped", e);
-      // A stored identity or sign-in this version cannot read: say so now, not only on connecting.
-      const failure = identityFailure(e);
-      if (failure === "identity_unreadable" || failure === "storage_newer") useUi.getState().toast("error", tNow(`err.connect.${failure}`));
-    });
-    const record = await loadConnectRecord();
-    useAccount.setState({ account: record ? summarize(record) : null, loaded: true, certChecked: !record?.token });
-    useSettings.getState().setBookmarkAccount(record?.accountKey ?? null);
-    if (record) {
-      refreshProfile(connectApi, record)
-        .then(async (nickname) => {
-          if (!nickname) return;
-          const latest = await loadConnectRecord();
-          // Do not apply a delayed refresh to another account or over a local edit.
-          if (!latest || latest.accountKey !== record.accountKey || latest.nickname !== record.nickname) return;
-          const next = { ...latest, nickname };
-          await indexedDbConnectStore.save(next);
-          await applyRecord(next);
-        })
-        .catch((e: unknown) => console.warn("account profile refresh skipped", e));
-    }
-    if (record) syncBookmarks();
-    if (record?.token) checkCertificate(record);
-    else warnAboutExpiry();
-    // Pick up an identity another desktop put in the vault. Never waited for: starting must not depend on the network.
-    const ts = tsBridge();
-    if (record && ts) {
-      refreshFromVault(connectApi, record, ts)
-        .then((outcome) => outcome === "applied" && bumpTs())
-        .catch((e: unknown) => console.warn("TeamSpeak identity refresh skipped", e));
+    const report = (error: unknown) => {
+      console.warn("identity load skipped", error);
+      useUi.getState().toast("error", tNow(`err.connect.${identityFailure(error)}`), {
+        key: "identity-load", sticky: true,
+        action: { label: tNow("settings.identity"), run: () => useUi.getState().openSettings("identity") },
+      });
+    };
+    try {
+      // Read Connect independently: a damaged local backup must not hide a valid login.
+      const record = await loadConnectRecord();
+      // Save this preference before getIdentity can create a fallback, including on reload.
+      if (!useSettings.getState().onboarding) {
+        try {
+          const identity = record ? undefined : await indexedDbIdentityStore.load();
+          useSettings.getState().setOnboarding({ completed: !!identity || !!record });
+        } catch (error) { report(error); }
+      }
+      await controller.getIdentity().catch(report);
+      useAccount.setState({ account: record ? summarize(record) : null, certChecked: !record?.token });
+      useSettings.getState().setBookmarkAccount(record?.accountKey ?? null);
+      if (record) {
+        refreshProfile(connectApi, record)
+          .then(async (nickname) => {
+            if (!nickname) return;
+            const latest = await loadConnectRecord();
+            // Do not apply a delayed refresh to another account or over a local edit.
+            if (!latest || latest.accountKey !== record.accountKey || latest.nickname !== record.nickname) return;
+            const next = { ...latest, nickname };
+            await indexedDbConnectStore.save(next);
+            await applyRecord(next);
+          })
+          .catch((e: unknown) => console.warn("account profile refresh skipped", e));
+      }
+      if (record) syncBookmarks();
+      if (record?.token) checkCertificate(record);
+      // Pick up an identity another desktop put in the vault. Never waited for: starting must not depend on the network.
+      const ts = tsBridge();
+      if (record && ts) {
+        refreshFromVault(connectApi, record, ts)
+          .then((outcome) => outcome === "applied" && bumpTs())
+          .catch((e: unknown) => console.warn("TeamSpeak identity refresh skipped", e));
+      }
+    } catch (error) {
+      report(error);
+    } finally {
+      // Newer/unreadable data is an actionable error, never a permanent loading screen.
+      useAccount.setState({ loaded: true });
     }
   },
 
@@ -390,6 +390,7 @@ export const accountActions = {
     await tsBridge()?.setList("account", null).catch((e: unknown) => console.warn("could not drop the account's TeamSpeak identities", e));
     bumpTs();
     await controller.switchIdentity(null);
+    useUi.setState({ accountEntry: "signin" });
     useAccount.setState({ account: null });
   },
 };

@@ -148,11 +148,17 @@ const RECORD_FIXTURES: Record<keyof typeof RECORDS, Record<number, { stored: Rec
 };
 /** The settings (localStorage) per version, and a check of the settings store after loading them. */
 const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: string; bookmarks: unknown[] }): void }> = {
-  3: {
+  4: {
     stored: { state: { theme: "dark", bookmarks: [], selfMuted: true, selfDeafened: true,
-      resumeConnection: { address: "a.example", kind: "gwar", name: "A" } }, version: 3 },
+      resumeConnection: { address: "a.example", kind: "gwar", name: "A" },
+      onboarding: { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true } }, version: 4 },
     check: state => { expect(state).toMatchObject({ selfMuted: true, selfDeafened: true,
-      resumeConnection: { address: "a.example", kind: "gwar", name: "A" }, updateVoiceResume: null }); },
+      resumeConnection: { address: "a.example", kind: "gwar", name: "A" }, updateVoiceResume: null,
+      onboarding: { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true } }); },
+  },
+  3: {
+    stored: { state: { theme: "dark", bookmarks: [], onboarding: { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true } }, version: 3 },
+    check: state => expect(state).toMatchObject({ theme: "dark", onboarding: { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true }, selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null }),
   },
   2: {
     stored: { state: { theme: "dark", bookmarks: [], screenMode: "sharp", screenHeight: 1440, screenFps: 60 }, version: 2 },

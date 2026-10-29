@@ -11,6 +11,7 @@
  * E2E_AUDIO_PRE_SECONDS / POST_SECONDS and E2E_AUDIO_GAP_MS select research controls.
  * E2E_AUDIO_RESEARCH=1 retains quality checks but removes the 60 ms delay ceiling.
  */
+import { chooseFirstRunName } from "./first-run.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -182,6 +183,7 @@ async function stats(page, slot) {
 }
 
 async function connect(page, url) {
+  await chooseFirstRunName(page, "browser 700 Hz");
   await page.getByLabel("Server address").fill(url);
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   await page.getByRole("tab", { name: "Identity", exact: true }).click();

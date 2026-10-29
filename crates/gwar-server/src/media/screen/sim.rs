@@ -595,6 +595,18 @@ impl Sim {
     pub fn paused(&self, slot: usize) -> Option<ScreenPauseReason> {
         self.w.egress.paused(slot)
     }
+
+    /// The viewer's Try again on `share` (`screen.watch` of a share it already watches).
+    pub fn try_again(&mut self, share: usize) {
+        let now = self.now;
+        let rates: HashMap<String, ShareRate> =
+            self.shares.iter_mut().map(|s| (s.origin.share.clone(), s.meter.rate(now))).collect();
+        let slot = self.shares[share].slot;
+        if ask_retry(&mut self.w, slot, &rates, now) {
+            self.changes.push((now, slot, Change::Resume));
+            self.shares[share].wants_key = true;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1632,22 +1644,19 @@ mod tests {
                 "{rate} text join voice {:?} retries voice (at, hurt, max): {voice:?}",
                 voice_hurt(&sim, sim.start, sim.start + JOIN),
             );
-            // It keeps trying, backing off, and every retry pauses again within its ramp.
-            assert!(voice.len() >= 4, "{context}");
+            // It tries, backing off, until `RETRY_STRIKES` failed; every retry pauses again
+            // within its ramp.
+            assert!(voice.len() >= RETRY_STRIKES as usize, "{context}");
+            assert!(sim.w.struck.is_some_and(|(_, strikes)| strikes >= RETRY_STRIKES), "{context}");
             let changes: Vec<_> = sim.changes.iter().filter(|(_, s, _)| *s == 0).collect();
             for pair in changes.windows(2).filter(|pair| pair[0].2 == Change::Resume) {
                 assert!(pair[1].0 - pair[0].0 <= RAMP + 2 * SECOND, "{context}");
             }
-            // At 2 Mbps the link pushes back on every retry from 2.5 Mbps, and voice never
-            // meets a long queue past the join. At 3 Mbps it carries one but no keyframe: the
-            // retry after it admits the keyframe, which queues voice briefly. That is at most
-            // every other retry, and the failed ones still back off.
-            let hurt: Vec<_> = voice.iter().filter(|(_, hurt, _)| !hurt.is_zero()).collect();
-            assert!(hurt.iter().all(|(_, hurt, _)| *hurt < 500 * MS), "{voice:?}: {context}");
-            assert!(
-                if rate == 2_000_000 { hurt.is_empty() } else { 2 * hurt.len() <= voice.len() },
-                "{voice:?}: {context}"
-            );
+            // At 2 Mbps the link pushes back on every retry from 2.5 Mbps. At 3 Mbps it carries
+            // one but no keyframe: the retry after it admits the keyframe, and TWCC backs it off
+            // within about 60 ms, when the rest of the keyframe goes (it would miss its deadline).
+            // Voice never meets a long queue past the join either way.
+            assert!(voice_hurt(&sim, sim.start + JOIN, sim.now).0.is_zero(), "{voice:?}: {context}");
             // A link that recovers gets the share back by itself.
             sim.down.rate = Some(50_000_000);
             let improved = sim.now;
@@ -1700,9 +1709,17 @@ mod tests {
     /// A share on a 2 Mbps link for `slow`, then repaired to 50 Mbps with the estimator frozen
     /// (as in production on 2026-10-28: TWCC estimates above each restart are ignored, so only
     /// retries can lift it). It must come back within 180 s by itself, keep voice clean on the
-    /// way, and stay with the whole share. The bandwidth pauses after the repair, and how long
-    /// recovery took.
-    fn recovers_frozen(name: &str, bitrate: u64, fps: u32, keyframe: usize, slow: Duration) -> (Vec<Judged>, Duration) {
+    /// way, and stay with the whole share. If its automatic retries had already stopped, a
+    /// frozen estimator shows no change: it must stay paused, without a retry, until its viewer's
+    /// Try again, and come back within 180 s of that. The bandwidth pauses after the repair (or
+    /// the Try again), how long recovery took from then, and whether retries had stopped.
+    fn recovers_frozen(
+        name: &str,
+        bitrate: u64,
+        fps: u32,
+        keyframe: usize,
+        slow: Duration,
+    ) -> (Vec<Judged>, Duration, bool) {
         let mut sim = Sim::new(Some(2_000_000));
         sim.voice = true;
         sim.join(name, bitrate, fps, keyframe, 12_000_000);
@@ -1715,8 +1732,15 @@ mod tests {
         assert!(voice_hurt(&sim, sim.start + JOIN, sim.now).0.is_zero(), "{voice:?}: {context}");
         sim.down.rate = Some(50_000_000);
         sim.w.frozen = Some(sim.w.egress.estimate());
-        let improved = sim.now;
+        let mut improved = sim.now;
         let mut after = Vec::new();
+        let stopped = sim.w.struck.is_some_and(|(_, strikes)| strikes >= RETRY_STRIKES);
+        if stopped {
+            run_judged(&mut sim, 60 * SECOND, &mut after);
+            assert!(resumes_since(&sim, improved).is_empty(), "no automatic retry once stopped: {}", summary(&sim));
+            sim.try_again(0);
+            improved = sim.now;
+        }
         run_judged(&mut sim, 180 * SECOND, &mut after);
         let context = format!("{name} {keyframe} slow={slow:?}, then 50 Mbps, frozen: {}", summary(&sim));
         println!("frozen {name} {keyframe} slow={slow:?} after repair judged={after:#?}");
@@ -1741,14 +1765,19 @@ mod tests {
             .map(|(_, _, _, payload)| payload.len())
             .sum();
         assert!(bytes as f64 * 8.0 / 20.0 >= 0.9 * bitrate as f64, "{bytes} bytes: {context}");
-        (after, recovered)
+        (after, recovered, stopped)
     }
 
     #[test]
     fn a_keyframe_dominated_share_recovers_even_if_its_estimator_never_grows() {
         // An 8 Mbps share with 250 KB keyframes: their room within the deadline is 6.25 Mbps.
         for slow in [40 * SECOND, 300 * SECOND] {
-            let (after, _) = recovers_frozen("game", 8_000_000, 60, 250_000, slow);
+            let (after, _, stopped) = recovers_frozen("game", 8_000_000, 60, 250_000, slow);
+            // Three retries failed within 300 s at 2 Mbps.
+            assert_eq!(stopped, slow > RETRY_BACKOFF[1] + RETRY_BACKOFF[2], "slow={slow:?}");
+            if stopped {
+                continue;
+            }
             // The first retry on the repaired link, from 2.5 Mbps, cannot admit the keyframe: the
             // estimate holds but nothing tests it, so it neither counts nor steps from its probes.
             let first = after.first().copied().unwrap_or_else(|| panic!("slow={slow:?}"));
@@ -1816,7 +1845,7 @@ mod tests {
                 "carried rate={rate} stepped={stepped:?} judged={judged:#?} retries voice (at, hurt, max): {voice:?}"
             );
             // None of its retries overruns the link enough to queue voice for long.
-            assert!(voice.len() >= 3, "{context}");
+            assert!(voice.len() >= 2, "{context}");
             assert!(voice_hurt(&sim, sim.start + JOIN, sim.now).0.is_zero(), "{voice:?}: {context}");
             assert!(stepped.is_some() || rate != 5_000_000, "a retry carried in full: {judged:?}: {context}");
         }
@@ -1853,7 +1882,7 @@ mod tests {
             println!(
                 "frozen still slow rate={rate} climbs={climbs:?} voice after join {hurt:?} retries voice: {voice:?}"
             );
-            assert!(voice.len() >= 3, "{context}");
+            assert!(voice.len() >= 2, "{context}");
             assert!(hurt.0.is_zero(), "{climbs:?} {voice:?}: {context}");
         }
     }
@@ -1940,6 +1969,244 @@ mod tests {
             sim.tick();
         }
         assert!(!ask_retry(&mut sim.w, 0, &rates, sim.now) || sim.now - at >= RETRY_FIRST, "{}", summary(&sim));
+    }
+
+    /// Voice glitches in `[from, to)`: runs of samples that met `HURT` or more of queue, a run
+    /// ending once voice met less for a second. How many, their total time at `HURT` or more,
+    /// and the most voice met.
+    fn glitches(sim: &Sim, from: Instant, to: Instant) -> (usize, Duration, Duration) {
+        let mut count = 0;
+        let mut last: Option<Instant> = None;
+        for (at, _) in sim.voice_trace.iter().filter(|(at, q)| *at >= from && *at < to && *q >= HURT) {
+            if last.is_none_or(|l| *at - l > SECOND) {
+                count += 1;
+            }
+            last = Some(*at);
+        }
+        let (hurt, max) = voice_hurt(sim, from, to);
+        (count, hurt, max)
+    }
+
+    /// Automatic and manual resumes of slot 0 from `from` on, as offsets from the sim's start.
+    fn resumes_since(sim: &Sim, from: Instant) -> Vec<Duration> {
+        sim.changes
+            .iter()
+            .filter(|(at, s, c)| *at >= from && *s == 0 && *c == Change::Resume)
+            .map(|(at, ..)| *at - sim.start)
+            .collect()
+    }
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    #[test]
+    fn a_link_too_slow_for_a_text_shares_keyframes_stops_retrying_and_spares_voice() {
+        for (rate, keyframe) in [(3_000_000, 300_000), (3_500_000, 300_000), (3_000_000, 204_800)] {
+            let mut sim = Sim::new(Some(rate));
+            sim.voice = true;
+            sim.join("text", 500_000, 5, keyframe, 8_000_000);
+            sim.run(30 * MINUTE);
+            let context = format!("rate={rate} keyframe={keyframe}: {}", summary(&sim));
+            let glitches = glitches(&sim, sim.start + JOIN, sim.now);
+            let resumed = resumes_since(&sim, sim.start);
+            println!(
+                "slow text rate={rate} keyframe={keyframe} 30 min: voice glitches after the join {glitches:?}, \
+                 resumes {resumed:?}, retries {} struck {:?}",
+                sim.w.retries, sim.w.struck
+            );
+            // Its keyframe goes as soon as TWCC backs a retry off, and voice never meets a long
+            // queue. Until October 29 it met 50 ms or more 7-14 times, for 2.3-2.7 s in all.
+            assert_eq!(glitches.0, 0, "{glitches:?}: {context}");
+            // The retries stop within 10 minutes, after a few of them; before, 21-28 in 30 minutes.
+            assert!(sim.w.struck.is_some_and(|(_, strikes)| strikes >= RETRY_STRIKES), "{context}");
+            assert!(resumed.len() <= 8 && resumed.last().is_some_and(|at| *at < 10 * MINUTE), "{resumed:?}: {context}");
+        }
+    }
+
+    #[test]
+    fn a_link_that_improves_after_retries_stopped_gets_its_picture_back() {
+        for (name, rate, bitrate, fps, keyframe) in
+            [("text", 3_000_000, 500_000, 5, 300_000), ("game", 2_000_000, 8_000_000, 60, 200_000)]
+        {
+            let mut sim = Sim::new(Some(rate));
+            sim.voice = true;
+            sim.join(name, bitrate, fps, keyframe, 12_000_000);
+            sim.run(10 * MINUTE);
+            let slow = glitches(&sim, sim.start + JOIN, sim.now);
+            let before = format!("{:?} struck {:?}", resumes_since(&sim, sim.start), sim.w.struck);
+            let stopped = sim.w.struck.is_some_and(|(_, strikes)| strikes >= RETRY_STRIKES);
+            sim.down.rate = Some(50_000_000);
+            let improved = sim.now;
+            sim.run(5 * MINUTE);
+            let context = format!("{name} rate={rate}, then 50 Mbps: {}", summary(&sim));
+            let back = sim.changes.iter().rev().find(|(_, s, c)| *s == 0 && *c == Change::Resume).map(|c| c.0);
+            println!(
+                "improves {name} rate={rate}: slow voice {slow:?}, resumes {before}; after the repair paused={:?} \
+                 last resume {:?} after the repair, voice {:?}",
+                sim.paused(0),
+                back.map(|b| b.saturating_duration_since(improved)),
+                glitches(&sim, improved, sim.now)
+            );
+            assert!(stopped, "retries stopped before the repair: {before}: {context}");
+            assert_eq!(slow.0, 0, "{slow:?}: {context}");
+            assert_eq!(sim.paused(0), None, "{context}");
+            assert!(back.is_some_and(|at| at.saturating_duration_since(improved) <= MINUTE), "{context}");
+            assert_eq!(glitches(&sim, improved, sim.now).0, 0, "{context}");
+        }
+    }
+
+    #[test]
+    fn stopped_retries_resume_on_a_new_path_at_most_once_per_backoff_step() {
+        let mut sim = Sim::new(Some(2_000_000));
+        let (w, now) = (&mut sim.w, sim.now);
+        w.egress.set_estimate(1_000_000, now);
+        (w.struck, w.retries) = (Some((2_000_000, RETRY_STRIKES)), 3);
+        saw_path(w, addr(5000));
+        assert!(!w.moved, "the first address is no move");
+        saw_path(w, addr(5001));
+        assert!(std::mem::take(&mut w.moved));
+        // Flipping between addresses the transport already used is no new path.
+        saw_path(w, addr(5000));
+        saw_path(w, addr(5001));
+        assert!(!w.moved);
+        assert_eq!(resume_on_change(w, false, now), None);
+        assert!(stopped(w));
+        assert_eq!(resume_on_change(w, true, now), Some("path"));
+        assert!(!stopped(w));
+        // The retry it allows fails from a lower start: stopped again at once.
+        strike(w, 500_000);
+        assert_eq!(w.struck, Some((2_000_000, RETRY_STRIKES)));
+        // Another new path within the backoff step does not resume them; one after it does.
+        let backoff = RETRY_BACKOFF[3];
+        assert_eq!(resume_on_change(w, true, now + backoff - SECOND), None);
+        assert!(stopped(w));
+        assert_eq!(resume_on_change(w, true, now + backoff), Some("path"));
+        // And one failing from a new height stops them there.
+        strike(w, 4_000_000);
+        assert_eq!(w.struck, Some((4_000_000, RETRY_STRIKES)));
+    }
+
+    #[test]
+    fn stopped_retries_resume_once_the_estimate_held_above_the_failed_start_for_the_ramp() {
+        let mut sim = Sim::new(Some(2_000_000));
+        let (w, now) = (&mut sim.w, sim.now);
+        w.struck = Some((2_000_000, RETRY_STRIKES));
+        // Below `RETRY_LEVEL` times the failed start: never.
+        w.egress.set_estimate(2_400_000, now);
+        assert_eq!(resume_on_change(w, false, now), None);
+        assert_eq!(resume_on_change(w, false, now + 2 * RAMP), None);
+        let above = now + 2 * RAMP;
+        w.egress.set_estimate(2_500_000, above);
+        assert_eq!(resume_on_change(w, false, above), None);
+        assert_eq!(resume_on_change(w, false, above + RAMP - SECOND), None);
+        // A dip below starts the clock over.
+        w.egress.set_estimate(2_000_000, above + RAMP - SECOND);
+        assert_eq!(resume_on_change(w, false, above + RAMP - SECOND), None);
+        let again = above + RAMP;
+        w.egress.set_estimate(2_500_000, again);
+        assert_eq!(resume_on_change(w, false, again), None);
+        assert_eq!(resume_on_change(w, false, again + RAMP - MS), None);
+        assert!(stopped(w));
+        assert_eq!(resume_on_change(w, false, again + RAMP), Some("estimate"));
+        assert!(!stopped(w));
+        // The next failure, from any start, stops them again.
+        strike(w, 1_000_000);
+        assert_eq!(w.struck, Some((2_000_000, RETRY_STRIKES)));
+    }
+
+    #[test]
+    fn a_retry_from_the_shares_whole_start_that_carried_next_to_nothing_strikes() {
+        let mut sim = Sim::new(None);
+        sim.join("game", 8_000_000, 60, 200_000, 12_000_000);
+        sim.run(2 * RAMP);
+        let w = &mut sim.w;
+        let start = top(w, 0);
+        // The estimate held at the start, but the link was not shown to carry it: with no
+        // higher start to test it from, it failed.
+        w.egress.set_estimate(start, sim.now);
+        for _ in 0..RETRY_STRIKES {
+            w.carried.clear();
+            w.attempt = Some(Attempt { slot: 0, start, counted: true });
+            judge(w);
+            assert_eq!(w.failed, Some(start));
+        }
+        assert!(stopped(w), "struck {:?}", w.struck);
+    }
+
+    #[test]
+    fn a_retry_that_climbs_in_place_clears_the_strikes_but_keeps_the_failed_cap() {
+        let mut sim = Sim::new(None);
+        sim.join("game", 8_000_000, 60, 200_000, 12_000_000);
+        sim.run(2 * RAMP);
+        let (w, now) = (&mut sim.w, sim.now);
+        let start = 1_000_000;
+        w.egress.set_estimate(start, now);
+        // The link carried the retry's start in full over its ramp; the share needs more.
+        w.carried = VecDeque::from([(now - RAMP, 0), (now, start * RAMP.as_secs() / 8)]);
+        w.started = Some(now - RAMP);
+        w.attempt = Some(Attempt { slot: 0, start, counted: true });
+        (w.struck, w.last_chance, w.failed) = (Some((2_000_000, RETRY_STRIKES - 1)), true, Some(4_000_000));
+        let lanes = [ShareRate { average: 8_000_000.0, ..ShareRate::default() }; SCREEN_SLOTS];
+        assert!(climb(w, &lanes, &HashMap::new(), now));
+        assert_eq!((w.struck, w.last_chance, w.failed), (None, false, Some(4_000_000)));
+    }
+
+    #[test]
+    fn a_new_path_retries_a_stopped_viewer_no_sooner_than_the_spacing_since_its_last_start() {
+        let mut sim = Sim::new(Some(2_000_000));
+        sim.join("game", 8_000_000, 60, 200_000, 12_000_000);
+        while pauses(&sim, 0).is_empty() {
+            sim.tick();
+        }
+        let (paused, started) = (sim.now, sim.w.started.expect("the share started"));
+        assert!(paused - started < RETRY_FIRST, "{}", summary(&sim));
+        sim.w.struck = Some((2 * sim.w.egress.estimate().max(INITIAL_ESTIMATE), RETRY_STRIKES));
+        saw_path(&mut sim.w, addr(5000));
+        saw_path(&mut sim.w, addr(5001));
+        sim.run(RETRY_FIRST);
+        let context = summary(&sim);
+        let resumed = resumes_since(&sim, paused);
+        assert_eq!(resumed.len(), 1, "{resumed:?}: {context}");
+        let at = sim.start + resumed[0];
+        assert!(at >= started + RETRY_FIRST && at <= started + RETRY_FIRST + SECOND, "{resumed:?}: {context}");
+        // The link has not changed: the retry fails and they stop again.
+        let end = sim.now + 2 * MINUTE;
+        while !stopped(&sim.w) && sim.now < end {
+            sim.tick();
+        }
+        let context = summary(&sim);
+        assert!(stopped(&sim.w), "struck {:?}: {context}", sim.w.struck);
+        assert!(resumes_since(&sim, paused).len() <= 2, "{context}");
+    }
+
+    #[test]
+    fn a_link_that_degrades_pauses_and_stops_retrying() {
+        for (name, rate, bitrate, fps, keyframe) in
+            [("game", 3_000_000, 8_000_000, 60, 200_000), ("text", 3_000_000, 500_000, 5, 300_000)]
+        {
+            let mut sim = Sim::new(Some(50_000_000));
+            sim.voice = true;
+            sim.join(name, bitrate, fps, keyframe, 12_000_000);
+            sim.run(MINUTE);
+            assert_eq!(sim.paused(0), None, "{}", summary(&sim));
+            sim.down.rate = Some(rate);
+            let degraded = sim.now;
+            sim.run(20 * MINUTE);
+            println!(
+                "degrades {name} to {rate}: voice right after {:?}, then {:?}; resumes {:?} struck {:?}",
+                glitches(&sim, degraded, degraded + 15 * SECOND),
+                glitches(&sim, degraded + 15 * SECOND, sim.now),
+                resumes_since(&sim, degraded),
+                sim.w.struck
+            );
+            println!("degrades {name} retries voice {:?}", retries_voice(&sim));
+            let context = format!("{name} degraded to {rate}: {}", summary(&sim));
+            // Once TWCC caught up with the slower link, a retry meets 50 ms of queue only briefly,
+            // on a few of them; before, the first retry started from the healthy link's traffic
+            // and met it for 600 ms, and they never stopped.
+            let (count, hurt, max) = glitches(&sim, degraded + 15 * SECOND, sim.now);
+            assert!(count <= 2 && hurt <= 100 * MS && max < 60 * MS, "{:?}: {context}", (count, hurt, max));
+            assert!(resumes_since(&sim, degraded).len() <= 8, "{context}");
+        }
     }
 
     /// Two viewers of the same share on their own links, behind one publisher: `b`'s share

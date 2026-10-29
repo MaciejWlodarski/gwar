@@ -39,6 +39,8 @@ export interface OwnShare {
  * `requesting` until the server answers this watch's own `screen.watch`. `id` tells a watch
  * from an earlier one of the same share whose requests and releases may still be in flight.
  * `paused`: the server stopped sending it for now (`screen.paused`), until `screen.resumed`.
+ * `waiting`: paused for bandwidth, and the server stopped retrying it on its own
+ * (`screen.waiting`): only Try again, or the viewer's link showing it changed, brings it back.
  */
 export interface Watch {
   share: string;
@@ -46,6 +48,7 @@ export interface Watch {
   slot: number | null;
   status: "requesting" | "watching";
   paused?: ScreenPauseReason;
+  waiting?: true;
 }
 
 export type TransportPhase = "none" | "connecting" | "connected" | "failed";
@@ -89,6 +92,7 @@ export type ScreenAction =
   | { type: "unwatch"; share: string }
   | { type: "paused"; share: string; reason: ScreenPauseReason }
   | { type: "resumed"; share: string }
+  | { type: "waiting"; share: string }
 
   | { type: "stage"; share: string }
   | { type: "chat"; hidden: boolean }
@@ -205,8 +209,13 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       // Only a granted watch: a pause of an earlier grant of the share cannot reach a new one.
       const paused = action.type === "paused" ? action.reason : undefined;
       const watch = state.watches.find(w => w.share === action.share && w.status === "watching");
-      if (!watch || watch.paused === paused) return state;
+      if (!watch || (watch.paused === paused && !watch.waiting)) return state;
       return { ...state, watches: state.watches.map(w => (w === watch ? { share: w.share, id: w.id, slot: w.slot, status: w.status, ...(paused ? { paused } : {}) } : w)) };
+    }
+    case "waiting": {
+      const watch = state.watches.find(w => w.share === action.share && w.status === "watching");
+      if (!watch || watch.paused !== "bandwidth" || watch.waiting) return state;
+      return { ...state, watches: state.watches.map(w => (w === watch ? { ...w, waiting: true } : w)) };
     }
     case "stage":
       return state.watches.some(w => w.share === action.share) ? { ...state, stage: action.share } : state;

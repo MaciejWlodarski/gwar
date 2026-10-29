@@ -1367,7 +1367,7 @@ mod tests {
             assert!(lease.alive(), "the guest's transport survives the pause");
             assert!(core.guests[&newest].paused.is_some());
             assert!(matches!(event(&mut guests[24].1), Event::ScreenPaused { reason: ScreenPauseReason::Budget, .. }));
-            core.screen_paused(newest, GUEST_RUN, &old, None);
+            core.screen_paused(newest, GUEST_RUN, &old, None, false);
             assert!(guests[24].1.try_recv().is_err(), "a delayed SFU resume cannot undo admission pause");
             assert!(core.screen_watch(member, "S1").is_ok());
             assert!(core.guests[&next].paused.is_some());
@@ -1514,6 +1514,7 @@ mod tests {
                     run: GUEST_RUN,
                     grant: old.clone(),
                     reason: ScreenPauseReason::Bandwidth,
+                    waiting: false,
                 },
                 ScreenSignal::Resumed { session: guest, run: GUEST_RUN, grant: old.clone() },
                 ScreenSignal::Incompatible { session: guest, run: GUEST_RUN, grant: old.clone() },
@@ -1522,11 +1523,11 @@ mod tests {
                 assert!(frames.try_recv().is_err(), "a replaced assignment cannot overwrite re-admission status");
             }
             let unrelated = WatchGrant::new(core.shares["S"].origin.clone());
-            core.screen_paused(guest, GUEST_RUN, &unrelated, Some(ScreenPauseReason::Bandwidth));
+            core.screen_paused(guest, GUEST_RUN, &unrelated, Some(ScreenPauseReason::Bandwidth), false);
             assert!(frames.try_recv().is_err(), "a live grant for the same share is not the current assignment");
-            core.screen_paused(guest, GUEST_RUN, &fresh, Some(ScreenPauseReason::Bandwidth));
+            core.screen_paused(guest, GUEST_RUN, &fresh, Some(ScreenPauseReason::Bandwidth), false);
             assert!(matches!(event(&mut frames), Event::ScreenPaused { reason: ScreenPauseReason::Bandwidth, .. }));
-            core.screen_paused(guest, GUEST_RUN, &fresh, None);
+            core.screen_paused(guest, GUEST_RUN, &fresh, None, false);
             assert!(matches!(event(&mut frames), Event::ScreenResumed { .. }));
         })
         .await;
@@ -1557,6 +1558,7 @@ mod tests {
                     run: GUEST_RUN,
                     grant: old.clone(),
                     reason: ScreenPauseReason::Bandwidth,
+                    waiting: false,
                 },
                 ScreenSignal::Resumed { session: member, run: GUEST_RUN, grant: old.clone() },
                 ScreenSignal::Incompatible { session: member, run: GUEST_RUN, grant: old.clone() },
@@ -1565,12 +1567,17 @@ mod tests {
                 assert!(frames.try_recv().is_err(), "a replaced assignment cannot overwrite re-watch status");
             }
             let unrelated = WatchGrant::new(core.shares["S"].origin.clone());
-            core.screen_paused(member, GUEST_RUN, &unrelated, Some(ScreenPauseReason::Bandwidth));
+            core.screen_paused(member, GUEST_RUN, &unrelated, Some(ScreenPauseReason::Bandwidth), false);
             assert!(frames.try_recv().is_err(), "a live grant for the same share is not the current assignment");
-            core.screen_paused(member, GUEST_RUN, &fresh, Some(ScreenPauseReason::Bandwidth));
+            core.screen_paused(member, GUEST_RUN, &fresh, Some(ScreenPauseReason::Bandwidth), false);
             assert!(matches!(event(&mut frames), Event::ScreenPaused { reason: ScreenPauseReason::Bandwidth, .. }));
-            core.screen_paused(member, GUEST_RUN, &fresh, None);
+            core.screen_paused(member, GUEST_RUN, &fresh, None, false);
             assert!(matches!(event(&mut frames), Event::ScreenResumed { .. }));
+            // Retries stopped: the pause, then a separate event older clients skip.
+            core.screen_paused(member, GUEST_RUN, &fresh, Some(ScreenPauseReason::Bandwidth), true);
+            assert!(matches!(event(&mut frames), Event::ScreenPaused { reason: ScreenPauseReason::Bandwidth, .. }));
+            assert!(matches!(event(&mut frames), Event::ScreenWaiting { share } if share == "S"));
+            assert!(frames.try_recv().is_err());
         })
         .await;
     }
@@ -1586,11 +1593,11 @@ mod tests {
                 let (guest, mut frames) = admitted_guest(core, &token, true);
                 let grant = core.guests[&guest].watch.as_ref().unwrap().slots[0].as_ref().unwrap().1.clone();
                 let other = WatchGrant::new(ScreenOrigin::new(1, "another-share".into(), 1, false, false, 8_000_000));
-                core.screen_paused(guest, GUEST_RUN + 1, &grant, Some(ScreenPauseReason::Bandwidth));
-                core.screen_paused(guest, GUEST_RUN, &other, None);
+                core.screen_paused(guest, GUEST_RUN + 1, &grant, Some(ScreenPauseReason::Bandwidth), false);
+                core.screen_paused(guest, GUEST_RUN, &other, None, false);
                 assert!(frames.try_recv().is_err());
-                core.screen_paused(guest, GUEST_RUN, &grant, Some(ScreenPauseReason::Bandwidth));
-                core.screen_paused(guest, GUEST_RUN, &grant, None);
+                core.screen_paused(guest, GUEST_RUN, &grant, Some(ScreenPauseReason::Bandwidth), false);
+                core.screen_paused(guest, GUEST_RUN, &grant, None, false);
                 assert!(matches!(event(&mut frames), Event::ScreenPaused { reason: ScreenPauseReason::Bandwidth, .. }));
                 assert!(matches!(event(&mut frames), Event::ScreenResumed { .. }));
                 assert!(frames.try_recv().is_err(), "exactly two events");
@@ -1602,7 +1609,7 @@ mod tests {
                         core.send_guest_event(guest, Event::ScreenResumed { share: "S".into() });
                     }
                 }
-                core.screen_paused(guest, GUEST_RUN, &grant, Some(ScreenPauseReason::Budget));
+                core.screen_paused(guest, GUEST_RUN, &grant, Some(ScreenPauseReason::Budget), false);
                 assert!(!core.guests.contains_key(&guest));
                 assert!(!grant.alive() && !lease.alive());
                 assert_eq!(core.screen_reserved(), 8_000_000);
@@ -1629,7 +1636,7 @@ mod tests {
             assert!(matches!(event(&mut frames), Event::ScreenPaused { .. }));
             membership.end();
             core.resume_guests();
-            core.screen_paused(guest, GUEST_RUN, &grant, None);
+            core.screen_paused(guest, GUEST_RUN, &grant, None, false);
             assert!(!core.guests.contains_key(&guest));
             assert!(frames.try_recv().is_err());
             assert_eq!(core.screen_reserved(), 8_000_000);

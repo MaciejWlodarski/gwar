@@ -144,12 +144,13 @@ function platform(): "web" | "desktop" {
 }
 
 /** Human-readable text for a failed request. */
-export function describeRequestError(e: unknown): string {
+export function describeRequestError(e: unknown, action?: Key): string {
   if (e instanceof RequestError) {
     const key = `err.req.${e.code}` as Key;
-    const base = tNow(key);
-    // These say more than the code: what was malformed, what clashed, which part went through.
-    return e.code === "bad_request" || e.code === "conflict" || e.code === "partial" ? `${base} (${e.message})` : base;
+    const base = tNow(e.code === "bad_request" ? action ?? key : key);
+    if (e.code === "bad_request") return base;
+    // Conflict/partial replies explain which part of the operation went through.
+    return e.code === "conflict" || e.code === "partial" ? `${base} (${e.message})` : base;
   }
   if (e instanceof RequestTimeoutError) return tNow("err.req.timeout");
   if (e instanceof ConnectionLostError) return tNow("err.req.lost");
@@ -236,6 +237,7 @@ class Controller {
   private coldStartParams: ConnectParams | null = null;
   private voiceAutoStart = true;
   private pendingVoiceEntry: { conn: Link; channel: number; intent?: UpdateVoiceResume } | null = null;
+  private voiceRetryChannel: number | null = null;
   private voiceRun = 0;
   private initialised = false;
   private loadingOlder = false;
@@ -283,11 +285,17 @@ class Controller {
         if (this.voiceRetry) clearTimeout(this.voiceRetry);
         this.voiceRetry = null;
         useVoice.getState().set({ reconnecting: false, failure: null });
+        this.voiceRetryChannel = null;
+        useUi.getState().dismissToast("voice-closed");
       }
     });
     e.on("micError", (micError) => useVoice.getState().set({ micError }));
     e.on("outputError", (error) => {
-      if (error) useUi.getState().toast("error", describeVoiceError(error));
+      if (error) useUi.getState().toast("error", describeVoiceError(error), {
+        key: "voice-output", sticky: true,
+        action: { label: tNow("settings.audio"), run: () => useUi.getState().openSettings("audio") },
+      });
+      else useUi.getState().dismissToast("voice-output");
     });
     e.on("deviceSwitched", ({ label }) => useUi.getState().toast("info", tNow("voice.deviceSwitched", { device: label })));
     e.on("devices", (devices) => useVoice.getState().set({ devices }));
@@ -483,6 +491,10 @@ class Controller {
         throw new ConnectFailure(identityFailure(e), e instanceof Error ? e.message : String(e));
       }
 
+      if (identity.device && identity.device.expires_at <= Date.now()) {
+        session.dispatch({ type: "phase", phase: "idle" });
+        throw new ConnectFailure("certificate_expired", tNow("account.signInExpired"));
+      }
       conn = new Connection({
         url: parsed.value.url,
         identity,
@@ -602,6 +614,13 @@ class Controller {
 
   private async connectConfirmed(params: ConnectParams, opts: { remember: boolean }): Promise<boolean> {
     useUi.getState().landOnServer();
+    if (!useSettings.getState().onboarding?.completed) {
+      const { useAccount } = await import("./account");
+      if (!useAccount.getState().account) {
+        useUi.getState().closeDialog();
+        return false;
+      }
+    }
     const ui = useConnectUi.getState();
     ui.set({ busy: true, error: null, otherTab: null });
     this.lastConnectFailure = undefined;
@@ -878,14 +897,19 @@ class Controller {
         const b = state.me === null ? null : state.clients[state.me.session]?.voice_binding;
         return b && b.call === event.d.call && b.participation === event.d.participation && b.run === event.d.run;
       })()) {
-        if (event.d.reason === "transport_failed") this.voiceFailure(tNow("voice.closed"));
+        this.voiceRetryChannel = myChannelId(useSession.getState());
+        if (event.d.reason === "channel_deleted" || this.voiceRetryChannel === null || !useSession.getState().channels[this.voiceRetryChannel]) {
+          this.voiceChannelRemoved();
+          void this.stopVoice();
+        } else if (event.d.reason === "transport_failed") this.voiceFailure(tNow("voice.closed"));
         else {
-          useUi.getState().toast("info", tNow("voice.closed"));
+          useUi.getState().toast("info", tNow("voice.disconnected"), { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
           void this.stopVoice();
         }
       }
       if (event.ev === "channel.deleted" || event.ev === "channel.hidden") {
         const ui = useUi.getState(), ch = event.d.channel, state = useSession.getState();
+        if (this.voiceRetryChannel === ch) this.voiceChannelRemoved();
         if (ui.dialog.kind === "channelEdit" && ui.dialog.mode === "edit" && ui.dialog.channel === ch) ui.closeDialog();
         // An image from a channel that is gone (its messages were dropped) is no longer shown.
         if (ui.dialog.kind === "lightbox" && !ui.dialog.attachment.sealed) {
@@ -999,6 +1023,10 @@ class Controller {
     await this.engine.stop();
     if (this.connections !== generation) return;
     this.conn = null;
+    this.voiceRetryChannel = null;
+    useUi.getState().dismissToast("voice-closed");
+    useUi.getState().dismissToast("voice-output");
+    useUi.getState().dismissToast("screen-stopped");
     useUi.getState().setJoining(null);
     useUi.getState().setEditing(null);
     // Dialogs about the session that just ended (server settings, a ban, a picture ...) would sit over the connect screen.
@@ -1183,7 +1211,7 @@ class Controller {
     if (!this.canLeaveVoice || myChannelId(useSession.getState()) === null) return;
     const ok = await this.attempt(this.connection.request("channel.leave", {}));
     // The server's client.updated follows; do not wait for it to release the microphone.
-    if (ok) await this.stopVoice();
+    if (ok) { await this.stopVoice(); useUi.getState().dismissToast("voice-closed"); }
   }
 
   private async rejoinVoice(channel: number): Promise<void> {
@@ -1247,12 +1275,21 @@ class Controller {
     }, Math.min(15_000, 3000 * this.voiceRetries));
   }
 
+  private voiceChannelRemoved(): void {
+    this.voiceRetryChannel = null;
+    useUi.getState().toast("info", tNow("voice.channelRemoved"), { key: "voice-closed", sticky: true });
+  }
+
   retryVoice(): void {
     this.pendingVoiceEntry = null;
     this.voiceRetryAllowed = true;
     if (this.voiceRetry) clearTimeout(this.voiceRetry);
     this.voiceRetry = null;
-    void this.enableVoice();
+    if (!this.conn?.isOnline) return;
+    const channel = this.voiceRetryChannel;
+    if (channel !== null && !useSession.getState().channels[channel]) this.voiceChannelRemoved();
+    else if (channel !== null && myChannelId(useSession.getState()) === null) void this.joinChannelInteractive(channel);
+    else void this.enableVoice();
   }
 
   private retryableVoiceError(error: unknown): boolean {
@@ -1269,11 +1306,12 @@ class Controller {
       if (this.voiceRetry) clearTimeout(this.voiceRetry);
       this.voiceRetry = null;
       useVoice.getState().set({ reconnecting: false });
+      useUi.getState().dismissToast("voice-closed");
       return; // The panel owns permanent refusals; a toast would repeat its explanation.
     }
     if (this.voiceErrorShown) return;
     this.voiceErrorShown = true;
-    useUi.getState().toast("error", message);
+    useUi.getState().toast("error", message, { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
   }
 
   async retryMic(): Promise<void> {
@@ -1342,6 +1380,7 @@ class Controller {
       if (!this.identity) return this.getIdentity();
     }
     useAccountIdentity.setState({ nickname: this.identity.nickname });
+    useUi.getState().dismissToast("identity-load");
     return this.identity;
   }
 
@@ -1359,6 +1398,7 @@ class Controller {
   private adopt(identity: Identity | null, another: boolean): void {
     this.identityLoading = null;
     this.identity = identity;
+    if (identity) useUi.getState().dismissToast("identity-load");
     useAccountIdentity.setState((s) => ({ nickname: identity?.nickname ?? "", replaced: s.replaced + (another ? 1 : 0) }));
   }
 
