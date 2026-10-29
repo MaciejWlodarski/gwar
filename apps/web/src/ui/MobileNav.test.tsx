@@ -13,11 +13,12 @@ import { useMembersPanel } from "./members";
 import { MoreSheet, TabBar } from "./MobileNav";
 import { BugReportSection } from "./BugReport";
 import { backInApp } from "./hooks";
-import { backDepth, navView, paneBack, readView, stepBack, useBackHistory } from "./nav";
+import { backDepth, LOST_POP_MS, navView, paneBack, readView, showVoiceChannel, stepBack, useBackHistory } from "./nav";
+import { clearReportDraft } from "./report-draft";
 import { SettingsSection } from "./Settings";
 
 vi.mock("../state/controller", () => ({
-  controller: { voice: { capabilities: {}, listDevices: async () => ({ inputs: [], outputs: [] }) }, getIdentity: () => new Promise(() => {}), reportDiagnostics: () => new Promise(() => {}) },
+  controller: { voice: { capabilities: {}, listDevices: async () => ({ inputs: [], outputs: [] }) }, getIdentity: () => new Promise(() => {}), reportDiagnostics: () => new Promise(() => {}), selectChannel: () => {} },
   describeVoiceError: String,
   describeRequestError: String,
   identityFailure: () => null,
@@ -45,6 +46,7 @@ beforeEach(() => {
   useSettings.setState({ language: "en", theme: "dark" });
   useUi.setState({ section: "home", back: "servers", settingsTab: "audio", gearTab: "audio", settingsDrill: false, pane: "list", moreOpen: false, overview: false, dialog: { kind: "none" } });
   useSession.setState({ ...initialState, phase: "idle" });
+  clearReportDraft();
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
 });
 afterEach(async () => {
@@ -196,9 +198,10 @@ describe("a history entry's view", () => {
 });
 
 /**
- * Session history as a browser keeps it: a site before Gwar, then Gwar's entries. Back and Forward fire
- * popstate a moment later, as browsers do; going back past Gwar's first entry leaves the app. It notes any
- * navigation started while a popstate is being handled: there should be none.
+ * Session history as a browser keeps it: a site before Gwar, then Gwar's entries. Back and Forward traverse a
+ * moment later, as browsers do, and fire popstate as they land (each one in turn, from where the one before landed);
+ * going back past Gwar's first entry leaves the app. `dropNext` loses the next traversal's popstate (the traversal
+ * still happens). It notes any navigation started while a popstate is being handled: there should be none.
  */
 class FakeHistory {
   entries: Array<{ state: unknown; gwar: boolean }> = [{ state: null, gwar: false }, { state: null, gwar: true }];
@@ -206,6 +209,7 @@ class FakeHistory {
   left = false;
   inPopstate = false;
   navigatedInPopstate = 0;
+  dropNext = false;
   get state() {
     return this.entries[this.at]!.state;
   }
@@ -221,11 +225,14 @@ class FakeHistory {
   }
   go(delta: number) {
     if (this.inPopstate) this.navigatedInPopstate++;
-    const to = this.at + delta;
-    if (delta === 0 || to < 0 || to >= this.entries.length) return;
-    this.at = to;
-    if (!this.entries[to]!.gwar) return void (this.left = true);
+    const drop = this.dropNext;
+    this.dropNext = false;
     setTimeout(() => {
+      const to = this.at + delta;
+      if (this.left || delta === 0 || to < 0 || to >= this.entries.length) return;
+      this.at = to;
+      if (!this.entries[to]!.gwar) return void (this.left = true);
+      if (drop) return;
       this.inPopstate = true;
       window.dispatchEvent(new PopStateEvent("popstate", { state: this.state }));
       this.inPopstate = false;
@@ -421,6 +428,221 @@ describe("phone steps as browser history", () => {
     await nav(() => history.back());
     expect(ui().section).toBe("home");
     expect(document.activeElement).toBe(opener);
+  });
+
+  it("writing to someone from the members goes back to the conversation's entry: no dead Back after it", async () => {
+    online(null);
+    await render(<Shell />);
+    await nav(() => ui().showChat());
+    await nav(() => ui().setPane("members"));
+    expect(history.at).toBe(3);
+    // Not an in-app way back, yet a step back: the members' entry goes with it.
+    await nav(() => useSession.getState().dispatch({ type: "openDm", uid: "u2", name: "Ola" }));
+    expect([history.at, ui().pane]).toEqual([2, "chat"]);
+    await nav(() => paneBack("list"));
+    expect([history.at, ui().pane]).toEqual([1, "list"]);
+    await nav(() => history.back());
+    expect(history.left).toBe(true);
+  });
+
+  it("a notification opening a conversation over the members goes back the same way, and Back shows the list", async () => {
+    online(null);
+    await render(<Shell />);
+    await nav(() => ui().showChat());
+    await nav(() => ui().setPane("members"));
+    await nav(() => useSession.getState().dispatch({ type: "setActive", key: "server" }));
+    expect([history.at, ui().pane]).toEqual([2, "chat"]);
+    await nav(() => history.back());
+    expect([ui().pane, history.left]).toEqual(["list", false]);
+  });
+
+  it("the voice pill from a settings tab goes back over every entry down to the channel list, in one go", async () => {
+    online(1);
+    const go = vi.spyOn(history, "go");
+    await render(<Shell />);
+    await nav(() => ui().showChat());
+    await nav(() => ui().openSettings("audio"));
+    expect(history.at).toBe(4);
+    await nav(() => showVoiceChannel());
+    await settle();
+    expect([history.at, ui().section, ui().pane]).toEqual([1, "servers", "list"]);
+    expect(go.mock.calls.map(([delta]) => delta)).toEqual([-3]);
+    await nav(() => history.back());
+    expect(history.left).toBe(true);
+  });
+
+  it("a second way back while the first is under way is taken too: no entry is left twice", async () => {
+    online(null);
+    await render(<Shell />);
+    await nav(() => ui().showChat());
+    await nav(() => ui().setPane("members"));
+    // Two quick taps: the second comes before the first one's popstate.
+    await nav(() => {
+      paneBack("chat");
+      paneBack("list");
+    });
+    await settle();
+    expect([history.at, ui().pane]).toEqual([1, "list"]);
+    await nav(() => history.forward());
+    expect(ui().pane).toBe("chat");
+    // Not a step back to where the first one goes: a tab to Home, taken from the entry below, which then holds it.
+    await nav(() => ui().setPane("members"));
+    await nav(() => {
+      paneBack("chat");
+      backInApp(() => ui().setSection("home"));
+    });
+    await settle();
+    expect([history.at, readView(history.state)?.section]).toEqual([1, "home"]);
+  });
+
+  it("Back closes a dialog along with the view it was opened over", async () => {
+    online(null);
+    await render(<Shell />);
+    await nav(() => ui().showChat());
+    await nav(() => ui().openDialog({ kind: "channelPassword", channel: 1 }));
+    await nav(() => history.back());
+    expect([ui().pane, ui().dialog.kind]).toEqual(["list", "none"]);
+    // A dialog over the same view (an entry that holds it again) stays.
+    await nav(() => history.forward());
+    await nav(() => ui().openDialog({ kind: "channelPassword", channel: 1 }));
+    await nav(() => ui().setPane("members"));
+    await nav(() => history.back());
+    expect([ui().pane, ui().dialog.kind]).toEqual(["chat", "none"]);
+  });
+
+  it("a quiet reconnect (a renewed certificate) leaves Settings as it is: no landing, no history change", async () => {
+    online(null);
+    await render(<Shell />);
+    await nav(() => ui().showChat());
+    await nav(() => ui().setPane("members"));
+    await nav(() => ui().openSettings("account"));
+    const go = vi.spyOn(history, "go");
+    const [at, length] = [history.at, history.length];
+    // As `replaceIdentityQuietly` does it: the session drops and connects again, with nobody asking to go anywhere.
+    await nav(() => useSession.setState({ ...initialState, phase: "idle" }));
+    await nav(() => useSession.getState().dispatch({ type: "phase", phase: "connecting" }));
+    await nav(() => online(null));
+    expect(ui()).toMatchObject({ section: "settings", settingsTab: "account", settingsDrill: true, back: "servers", pane: "members" });
+    expect(go).not.toHaveBeenCalled();
+    expect([history.at, history.length]).toEqual([at, length]);
+    // Every Back is a step of its own: the list of tabs, the members, the conversation, the channel list.
+    const seen = [];
+    for (let i = 0; i < 4; i++) {
+      await nav(() => history.back());
+      seen.push(`${ui().section}/${ui().section === "settings" ? String(ui().settingsDrill) : ui().pane}`);
+    }
+    expect(seen).toEqual(["settings/false", "servers/members", "servers/chat", "servers/list"]);
+    expect(history.left).toBe(false);
+  });
+
+  it("connecting again to the same server after a drop opens its channel list, not the pane it was left on", async () => {
+    online(null);
+    useSession.setState({ address: "den.example" });
+    await render(<Shell />);
+    await nav(() => ui().showChat());
+    await nav(() => ui().setPane("members"));
+    // Dropped (the address stays), then Connect to the same address: `connectInteractive` lands first.
+    await nav(() => useSession.setState({ ...initialState, phase: "idle" }));
+    expect(useSession.getState().address).toBe("den.example");
+    await nav(() => ui().landOnServer());
+    await nav(() => useSession.getState().dispatch({ type: "phase", phase: "connecting" }));
+    await nav(() => online(null));
+    expect(ui()).toMatchObject({ section: "servers", pane: "list" });
+  });
+
+  it("a reload restores the pane its entry holds, and connecting then opens the channel list without navigating", async () => {
+    online(null);
+    await render(<Shell />);
+    await nav(() => ui().showChat());
+    await nav(() => ui().setPane("members"));
+    useSession.setState({ ...initialState, phase: "idle" });
+    await reload();
+    expect(ui().pane).toBe("members");
+    const go = vi.spyOn(history, "go");
+    const length = history.length;
+    await nav(() => ui().landOnServer());
+    await nav(() => useSession.getState().dispatch({ type: "phase", phase: "connecting" }));
+    await nav(() => online(null));
+    expect(ui()).toMatchObject({ section: "servers", pane: "list" });
+    expect(go).not.toHaveBeenCalled();
+    expect([history.length, readView(history.state)?.pane]).toEqual([length, "list"]);
+  });
+
+  it("a notification over a settings tab goes back to the conversation's entry in one go, never below where it goes", async () => {
+    online(null);
+    await render(<Shell />);
+    await nav(() => ui().showChat());
+    await nav(() => ui().setPane("members"));
+    await nav(() => ui().openSettings("audio"));
+    expect(history.at).toBe(5);
+    const go = vi.spyOn(history, "go");
+    await nav(() => useSession.getState().dispatch({ type: "setActive", key: "server" }));
+    expect([history.at, ui().section, ui().pane]).toEqual([2, "servers", "chat"]);
+    expect(go.mock.calls.map(([delta]) => delta)).toEqual([-3]);
+    // What it went back over is Forward of here.
+    await nav(() => history.forward());
+    expect(ui().pane).toBe("members");
+  });
+
+  it("a user's Back racing our way back lands one entry further, still in the app, showing that entry", async () => {
+    online(null);
+    await render(<Shell />);
+    await nav(() => ui().showChat());
+    await nav(() => ui().setPane("members"));
+    await nav(() => ui().openSettings("audio"));
+    // Before our step lands, the user's Back comes: both traverse, ours first.
+    await nav(() => {
+      useSession.getState().dispatch({ type: "setActive", key: "server" });
+      history.back();
+    });
+    await settle();
+    expect([history.at, history.left, ui().section, ui().pane]).toEqual([1, false, "servers", "list"]);
+    expect(readView(history.state)).toEqual(navView(ui()));
+    // The user's Back first, then our step: it still ends on an entry, showing what it holds.
+    await nav(() => history.forward());
+    await nav(() => ui().setPane("members"));
+    expect(history.at).toBe(3);
+    await nav(() => {
+      history.back();
+      paneBack("chat");
+    });
+    await settle();
+    expect([history.at, history.left]).toEqual([1, false]);
+    expect(navView(ui())).toEqual(readView(history.state));
+  });
+
+  it("a popstate that never comes stops being awaited after a while: the next way back goes again", async () => {
+    online(null);
+    await render(<Shell />);
+    await nav(() => ui().showChat());
+    await nav(() => ui().setPane("members"));
+    history.dropNext = true;
+    await nav(() => paneBack("chat"));
+    expect([history.at, ui().pane]).toEqual([2, "chat"]);
+    // Meanwhile a way back waits for it.
+    await nav(() => paneBack("list"));
+    expect(history.at).toBe(2);
+    await act(async () => new Promise((r) => setTimeout(r, LOST_POP_MS + 50)));
+    await settle();
+    // Given up on: the entry holds what the app shows, and the steps go on.
+    expect(readView(history.state)).toEqual(navView(ui()));
+    await nav(() => ui().showChat());
+    await nav(() => paneBack("list"));
+    expect([history.at, ui().pane, history.left]).toEqual([2, "list", false]);
+  });
+
+  it("coming back from the back/forward cache stops awaiting a popstate the page was left with", async () => {
+    online(null);
+    await render(<Shell />);
+    await nav(() => ui().showChat());
+    await nav(() => ui().setPane("members"));
+    history.dropNext = true;
+    await nav(() => paneBack("chat"));
+    await nav(() => window.dispatchEvent(Object.assign(new Event("pageshow"), { persisted: true })));
+    await nav(() => paneBack("list"));
+    expect([history.at, ui().pane]).toEqual([1, "list"]);
+    await nav(() => history.back());
+    expect(history.left).toBe(true);
   });
 
   it("focus follows the server panes on Back: the conversation's way back, then the open channel's row", async () => {

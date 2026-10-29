@@ -153,6 +153,7 @@ export const en = {
   "report.privacyAccount": "Sent privately to the Gwar team (Gwar Connect) with your account @{handle}, not published.",
   "report.send": "Send report",
   "report.sent": "Thank you! Report #{id} was sent.",
+  "report.failed": "The bug report was not sent: {error}",
   "settings.audio": "Audio",
   "settings.appearance": "Appearance",
   "settings.identity": "Identity",
