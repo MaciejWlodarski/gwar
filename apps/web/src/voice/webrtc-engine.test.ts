@@ -605,4 +605,63 @@ describe("browser devices follow the system", () => {
     expect(micSender().replaceTrack).toHaveBeenLastCalledWith(back.track);
     expect(switched).toHaveBeenCalledExactlyOnceWith({ side: "input", label: "USB mic" });
   });
+
+  it("gates and stops a replaced microphone until its replacement lands, and drops the switch with its call", async () => {
+    const first = capture({ deviceId: "default", groupId: "g-mac" });
+    const next = capture({ deviceId: "default", groupId: "g-air" });
+    getUserMedia.mockResolvedValueOnce(first.stream).mockResolvedValueOnce(next.stream);
+    await engine.start(params());
+    Peer.all[0]!.connect();
+    micSender().replaceTrack.mockImplementationOnce(() => new Promise<void>(() => {}));
+    await changeDevices([mic("default", "g-air", "Default - AirPods"), macbook, mic("air", "g-air", "AirPods")]);
+    // The old capture may still be what the peer sends: mute reaches it too.
+    engine.setMuted(true);
+    expect(next.track.enabled).toBe(false);
+    expect(first.track.enabled).toBe(false);
+    await engine.stop();
+    expect(first.track.stop).toHaveBeenCalled();
+    expect(next.track.stop).toHaveBeenCalled();
+
+    // The unsettled replacement of the closed call does not hold the next call's switches.
+    const second = capture({ deviceId: "default", groupId: "g-mac" });
+    const moved = capture({ deviceId: "default", groupId: "g-usb" });
+    getUserMedia.mockResolvedValueOnce(second.stream).mockResolvedValueOnce(moved.stream);
+    await engine.start(params());
+    Peer.all[1]!.connect();
+    await changeDevices([mic("default", "g-usb", "Default - USB mic"), macbook, usb]);
+    const sender = (Peer.all[1]!.addTransceiver.mock.results[0]!.value as { sender: { replaceTrack: ReturnType<typeof vi.fn> } }).sender;
+    expect(sender.replaceTrack).toHaveBeenLastCalledWith(moved.track);
+  });
+
+  it("tries a failed switch again while the working microphone stays", async () => {
+    const first = capture({ deviceId: "default", groupId: "g-mac" });
+    const later = capture({ deviceId: "default", groupId: "g-usb" });
+    getUserMedia
+      .mockResolvedValueOnce(first.stream)
+      .mockRejectedValueOnce(new DOMException("busy", "NotReadableError"))
+      .mockResolvedValueOnce(later.stream);
+    await engine.start(params());
+    Peer.all[0]!.connect();
+    await changeDevices([mic("default", "g-usb", "Default - USB mic"), macbook, usb]);
+    expect(first.track.stop).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(micSender().replaceTrack).toHaveBeenLastCalledWith(later.track);
+    expect(first.track.stop).toHaveBeenCalledOnce();
+  });
+
+  it("routes a remembered output that could not be routed once it is plugged in", async () => {
+    const headphones = speaker("hp", "g-hp", "Headphones");
+    const setSinkId = vi.fn(async (id: string) => {
+      if (id && !devices.some((d) => d.deviceId === id)) throw new DOMException("gone", "NotFoundError");
+    });
+    vi.stubGlobal("AudioContext", class extends Context { setSinkId = setSinkId; });
+    getUserMedia.mockResolvedValue(capture({ deviceId: "default", groupId: "g-mac" }).stream);
+    await engine.setOutputDevice("hp");
+    await engine.start(params());
+    await flush();
+    expect(setSinkId).toHaveBeenLastCalledWith("");
+
+    await changeDevices([...devices, headphones]);
+    expect(setSinkId).toHaveBeenLastCalledWith("hp");
+  });
 });

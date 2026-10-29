@@ -99,8 +99,13 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   /** The microphone was lost or never found: one appearing is opened at once. */
   private micMissing = false;
   private followTimer: ReturnType<typeof setTimeout> | null = null;
-  /** Device follow-ups, one at a time. */
+  /** Device follow-ups, one at a time; a run's chain is dropped with it. */
   private following: Promise<void> = Promise.resolve();
+  /** An automatic switch that failed is tried again with backoff while the working mic stays. */
+  private followRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private followRetries = 0;
+  /** The capture a switch replaces, still possibly sent until the replacement lands. */
+  private handover: MediaStream | null = null;
   private capture: CaptureOptions = { noiseSuppression: true, noiseStrength: 100, echoCancellation: true, autoGainControl: true };
   /**
    * Gwar's own noise suppression (./denoise) once it is loaded; the browser's until then, and for
@@ -268,6 +273,11 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     this.pc = null;
     this.micSender = null;
     this.sentTrackUpdates = Promise.resolve();
+    // A replacement a closed peer leaves unsettled must not hold the next call's device changes.
+    this.following = Promise.resolve();
+    if (this.followRetryTimer) clearTimeout(this.followRetryTimer);
+    this.followRetryTimer = null;
+    this.followRetries = 0;
     if (pc) {
       pc.ontrack = null;
       pc.onconnectionstatechange = null;
@@ -335,9 +345,13 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       // Labels become available only after permission was granted.
       void this.listDevices().then((d) => { if (current()) this.emit("devices", d); });
       if (swap) {
-        // Sent before the previous capture stops, so the call hears no gap beyond the switch.
+        // Sent before the previous capture stops, so the call hears no gap beyond the switch;
+        // until then mute and push-to-talk gate it too, and a stop ends it.
+        this.handover = previous;
         await this.updateSentTrack();
+        if (this.handover === previous) this.handover = null;
         previous?.getTracks().forEach((t) => t.stop());
+        this.followRetries = 0;
       }
       return stream;
     } catch (e) {
@@ -345,6 +359,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       const error = e instanceof VoiceError ? e : errorFromGum(e);
       if (swap && this.stream?.getAudioTracks()[0]?.readyState === "live") {
         console.warn("[voice] kept the current microphone:", error.message);
+        // A Bluetooth mic may still be negotiating its profile: try again, keeping this one.
+        this.retryFollow();
         return null;
       }
       this.releaseMic();
@@ -358,6 +374,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     this.stopMeter();
     this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null;
+    this.handover?.getTracks().forEach((t) => t.stop());
+    this.handover = null;
   }
 
   private closeMic(): void {
@@ -389,8 +407,21 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   }
 
   private queueFollow(step: () => Promise<void>): Promise<void> {
-    this.following = this.following.then(step).catch((e: unknown) => console.warn("[voice] device change failed:", e));
+    const run = this.runId;
+    this.following = this.following
+      .then(() => (run === this.runId ? step() : undefined))
+      .catch((e: unknown) => console.warn("[voice] device change failed:", e));
     return this.following;
+  }
+
+  /** 1, 2, 4, 8 s, then the next device event. */
+  private retryFollow(): void {
+    if (this.followRetryTimer || this.followRetries >= 4) return;
+    const delay = 1000 * 2 ** this.followRetries++;
+    this.followRetryTimer = setTimeout(() => {
+      this.followRetryTimer = null;
+      void this.queueFollow(() => this.followDevices());
+    }, delay);
   }
 
   /**
@@ -470,6 +501,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     if (!track) return;
     const enabled = !this.muted && !this.deafened && (this.mode === "vad" || this.ptt);
     track.enabled = enabled;
+    this.handover?.getAudioTracks().forEach((t) => { t.enabled = enabled; });
     if (this.denoise) {
       this.denoise.track.enabled = enabled;
       this.denoise.setActive(enabled);
@@ -651,10 +683,20 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     this.routedOutputId = id;
     const ctxSink = typeof ctx.setSinkId === "function";
     const elementSink = typeof HTMLMediaElement !== "undefined" && "setSinkId" in HTMLMediaElement.prototype;
+    // A device that cannot be routed to plays on the default and counts as not routed, so its
+    // return routes it again.
+    const unrouted = () => {
+      if (this.routedOutputId !== id || !id) return;
+      this.routedOutputId = null;
+      master.disconnect();
+      master.connect(ctx.destination);
+      this.sinkElement?.pause();
+      void ctx.setSinkId?.("").catch(() => {});
+    };
     if (!id || ctxSink) {
       master.connect(ctx.destination);
       this.sinkElement?.pause();
-      void ctx.setSinkId?.(id ?? "").catch(() => {});
+      void ctx.setSinkId?.(id ?? "").catch(unrouted);
       return;
     }
     if (elementSink) {
@@ -664,7 +706,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         this.sinkElement = new Audio() as SinkAudioElement;
         this.sinkElement.srcObject = this.streamDest.stream;
       }
-      void this.sinkElement.setSinkId?.(id).catch(() => {});
+      void this.sinkElement.setSinkId?.(id).catch(unrouted);
       void this.sinkElement.play().catch(() => {});
       return;
     }
@@ -733,6 +775,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   async setInputDevice(deviceId: string | null): Promise<void> {
     if (this.inputDeviceId === deviceId) return;
     this.inputDeviceId = deviceId;
+    this.followRetries = 0;
     await this.reopenMic();
   }
 
