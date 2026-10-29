@@ -112,12 +112,6 @@ pub(super) struct Slot {
     fade_from: f32,
     fade_left: usize,
     previous_level: f32,
-    /// The stream's speech level: the loudest frame, decaying by `ENVELOPE_DECAY` a second.
-    envelope: f32,
-    /// The quietest frame of the last two to four seconds: the previous and the current
-    /// `FLOOR_SPAN`, and how far into the current one the stream is.
-    floor: [f32; 2],
-    floor_age: usize,
     /// Test-only: samples output so far, and every edit of the decoded stream.
     #[cfg(test)]
     played: u64,
@@ -145,13 +139,6 @@ const NEAR_BEST: f64 = 0.02;
 const SMOOTH: usize = 24; // A moving average with its first null at 2 kHz, NetEq's 4 kHz Nyquist.
 const PICK_WINDOW: usize = MAX_LAG; // 15 ms.
 const PERIODIC: f64 = 0.5; // NetEq's fast-mode threshold.
-// Background (`Slot::background`): words of noise or speech over a fan decode within 3 dB of
-// their peak, the codec's tail after them 4--5 dB below, and the background between them 15--31 dB
-// below (fans 15--31 dB under the speech); see docs/latency-congested-uplink.md.
-const BACKGROUND_MARGIN: f32 = 15.0;
-const FLOOR_MARGIN: f32 = 6.0;
-const ENVELOPE_DECAY: f32 = 3.0; // dB a second.
-const FLOOR_SPAN: usize = 2 * 48_000;
 // Decode ahead so that a block holds three splice points with a full search after each.
 const STRETCH_BLOCK: usize = 2 * MAX_LAG + 3 * SPLICE_EVERY;
 
@@ -281,9 +268,6 @@ impl Slot {
             fade_from: 0.0,
             fade_left: 0,
             previous_level: -120.0,
-            envelope: -120.0,
-            floor: [f32::INFINITY; 2],
-            floor_age: 0,
             #[cfg(test)]
             played: 0,
             #[cfg(test)]
@@ -307,7 +291,6 @@ impl Slot {
             self.fade_from = 0.0;
             self.fade_left = 0;
             self.previous_level = -120.0;
-            (self.envelope, self.floor, self.floor_age) = (-120.0, [f32::INFINITY; 2], 0);
             self.generation = item.generation;
         }
         let Some(samples) = super::opus_samples(&item.opus) else { return Ok(()) };
@@ -321,27 +304,6 @@ impl Slot {
             Some(super::Generation::Sequence(g)) => g,
             None => 0,
         }
-    }
-
-    /// Follow the stream's level in a decoded frame of `samples`.
-    fn listen(&mut self, level: f32, samples: usize) {
-        if samples == 0 {
-            return;
-        }
-        self.envelope = level.max(self.envelope - ENVELOPE_DECAY * samples as f32 / 48_000.0);
-        self.floor_age += samples;
-        if self.floor_age >= FLOOR_SPAN {
-            (self.floor, self.floor_age) = ([self.floor[1], f32::INFINITY], 0);
-        }
-        self.floor[1] = self.floor[1].min(level);
-    }
-
-    /// Whether a frame at `level` (louder than -42 dB) is the stream's background between words,
-    /// such as a fan or street noise without noise suppression: `BACKGROUND_MARGIN` below its
-    /// speech and within `FLOOR_MARGIN` of the quietest frame of the last seconds. Clean speech,
-    /// whose pauses decode below -42 dB, so never has background, however quiet a consonant.
-    fn background(&self, level: f32) -> bool {
-        level < self.envelope - BACKGROUND_MARGIN && level <= self.floor[0].min(self.floor[1]) + FLOOR_MARGIN
     }
 
     pub fn staged_samples(&self) -> usize {
@@ -368,17 +330,14 @@ impl Slot {
                         let output = MutSignals::try_from(&mut self.decoded[..5760])?;
                         let mut n = self.decoder.decode_float(input, output, false).unwrap_or(0);
                         let level = level_db(&self.decoded[..n]);
-                        self.listen(level, n);
                         let quiet = n > 0 && level < -42.0;
-                        // A due backlog cut also takes the stream's background between words
-                        // (`background`), never a frame of speech, at its pace: from the start of
-                        // this frame, or of the first one decoded ahead (`ahead`).
+                        // A due backlog cut also takes the first quiet frame it decodes ahead
+                        // (`ahead`), at its pace: a block of speech used to carry it past the cut.
                         let backlog = skip > 0 && correlation < SHRINK_CORRELATION;
-                        let background = n > 0 && !quiet && backlog && self.background(level);
                         let mut ahead = None;
                         let mut onset = !quiet && level > self.previous_level + 6.0;
                         self.previous_level = level;
-                        if n > 0 && skip > 0 && !quiet && !background && !onset && !fade {
+                        if n > 0 && skip > 0 && !quiet && !onset && !fade {
                             // Decode ahead only on proven surplus. This buys a whole
                             // overlap even for 10 ms packets, without startup delay or
                             // replaying history. A gap/recovery stops lookahead unchanged.
@@ -388,10 +347,9 @@ impl Slot {
                                 let output = MutSignals::try_from(&mut self.decoded[n..n + 5760])?;
                                 let next = self.decoder.decode_float(input, output, false).unwrap_or(0);
                                 let level = level_db(&self.decoded[n..n + next]);
-                                self.listen(level, next);
                                 onset |= next == 0 || (level >= -42.0 && level > self.previous_level + 6.0);
                                 self.previous_level = level;
-                                if backlog && !onset && (level < -42.0 || self.background(level)) {
+                                if backlog && !onset && level < -42.0 {
                                     ahead = Some((n, next));
                                 }
                                 n += next;
@@ -406,7 +364,7 @@ impl Slot {
                         // The next splice starts past this one's crossfade; a block that matched
                         // nothing once is not searched again.
                         let (mut removed, mut at) = (0, 0);
-                        while !onset && !quiet && !background && ahead.is_none() && !fade && removed < skip {
+                        while !onset && !quiet && ahead.is_none() && !fade && removed < skip {
                             // Splices shorten the block while the next point moves on.
                             let Some(block) = self.decoded.get_mut(at..n) else { break };
                             let (period, _correlation) = accelerate(block, skip - removed, correlation);
@@ -425,7 +383,7 @@ impl Slot {
                             at += SPLICE_EVERY.max(period);
                         }
                         self.buffer.accelerated(now, removed);
-                        // Background goes from the start of its frame, up to the cut's credit,
+                        // A quiet frame decoded ahead goes from its start, up to the cut's credit,
                         // and is paced as periods are; the rest of the frame fades in.
                         if let Some((start, len)) = ahead {
                             let cut = skip.min(len.saturating_sub(FADE));
@@ -443,16 +401,8 @@ impl Slot {
                                 self.edits.push(Edit { at, removed: cut, modified: FADE, correlation: None });
                             }
                         }
-                        let skip = match (onset, quiet, background) {
-                            (false, true, _) => skip.min(QUIET_SKIP).min(n),
-                            (false, false, true) => skip.min(n.saturating_sub(FADE)),
-                            _ => 0,
-                        };
-                        if background {
-                            self.buffer.accelerated(now, skip);
-                        } else {
-                            self.buffer.shrunk(now, skip);
-                        }
+                        let skip = if !onset && quiet { skip.min(QUIET_SKIP).min(n) } else { 0 };
+                        self.buffer.shrunk(now, skip);
                         #[cfg(test)]
                         if skip > 0 {
                             self.edits.push(Edit { at: self.played, removed: skip, modified: FADE, correlation: None });
@@ -467,7 +417,6 @@ impl Slot {
                                 let output = MutSignals::try_from(&mut self.decoded[n..n + 5760])?;
                                 let next = self.decoder.decode_float(input, output, false).unwrap_or(0);
                                 let level = level_db(&self.decoded[n..n + next]);
-                                self.listen(level, next);
                                 if next == 0 || level >= -42.0 {
                                     self.previous_level = level;
                                     n += next;
@@ -718,10 +667,10 @@ mod tests {
     }
 
     /// 11 s of a `pitch` Hz voice with `noise` peak added (loud noise alone if `pitch` is 0)
-    /// that `speaks(i)` in 20 ms frame `i` (else silence), over a background of `fan` peak
-    /// noise throughout, encoded in order, and each frame as a decoder of the whole stream
+    /// that speaks at `gain(i)` in 20 ms frame `i` (0: silence), over a background of `fan`
+    /// peak noise throughout, encoded in order, and each frame as a decoder of the whole stream
     /// plays it.
-    fn voice(pitch: f32, noise_level: f32, fan: f32, speaks: impl Fn(usize) -> bool) -> (Vec<Vec<u8>>, Vec<Vec<f32>>) {
+    fn voice(pitch: f32, noise_level: f32, fan: f32, gain: impl Fn(usize) -> f32) -> (Vec<Vec<u8>>, Vec<Vec<f32>>) {
         let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
         let mut reference = Decoder::new(SampleRate::Hz48000, Channels::Mono).unwrap();
         let pcm = if pitch > 0.0 { harmonic(pitch, 0.02, 0.3, 550 * 960) } else { vec![0.0; 550 * 960] };
@@ -732,7 +681,7 @@ mod tests {
             .zip(fan.chunks(960))
             .enumerate()
             .map(|(i, (frame, fan))| {
-                let frame: Vec<f32> = frame.iter().zip(fan).map(|(&v, &f)| if speaks(i) { v + f } else { f }).collect();
+                let frame: Vec<f32> = frame.iter().zip(fan).map(|(&v, &f)| v * gain(i) + f).collect();
                 let mut data = vec![0; 1275];
                 let n = encoder.encode_float(&frame, &mut data).unwrap();
                 data.truncate(n);
@@ -790,13 +739,13 @@ mod tests {
         periods: Vec<(u64, usize, f64)>,
     }
 
-    /// Plays 10 s of `voice(pitch, noise_level, fan, speaks)` after a backlog of `backlog`
+    /// Plays 10 s of `voice(pitch, noise_level, fan, gain)` after a backlog of `backlog`
     /// packets. Every output sample outside a crossfade must be the reference decoder's, shifted
     /// by what the edits before it removed: nothing is lost but what was counted, and the decoder
     /// runs through everything dropped. Nothing but pitch periods goes from a frame the voice
-    /// speaks in.
-    fn drain(pitch: f32, noise_level: f32, fan: f32, speaks: impl Fn(usize) -> bool, backlog: u64) -> Drain {
-        let (frames, decoded) = voice(pitch, noise_level, fan, &speaks);
+    /// speaks in, however softly.
+    fn drain(pitch: f32, noise_level: f32, fan: f32, gain: impl Fn(usize) -> f32, backlog: u64) -> Drain {
+        let (frames, decoded) = voice(pitch, noise_level, fan, &gain);
         let content: Vec<f32> = decoded.concat();
         let quiet = |i: u64| level_db(&decoded[i as usize]) < -42.0;
         let mut slot = Slot::new().unwrap();
@@ -858,7 +807,7 @@ mod tests {
             let start = edit.at as usize + shift;
             if edit.correlation.is_none() {
                 let mut frames = start / 960..(start + edit.removed).div_ceil(960);
-                assert!(frames.all(|i| !speaks(i)), "{edit:?}: {start}.. is in a word");
+                assert!(frames.all(|i| gain(i) == 0.0), "{edit:?}: {start}.. is in a word");
             }
             shift += edit.removed;
         }
@@ -896,7 +845,7 @@ mod tests {
             ("noise with pauses, 430 ms", 0.0, 0.3, pauses, 22),
         ];
         for (name, pitch, noise_level, speaks, backlog) in cases {
-            let drain = drain(pitch, noise_level, 0.0, speaks, backlog);
+            let drain = drain(pitch, noise_level, 0.0, |i| f32::from(u8::from(speaks(i))), backlog);
             let periods = drain.periods.len();
             let correlations =
                 drain.periods.iter().map(|p| p.2).fold((1.0, -1.0), |(lo, hi), c| (c.min(lo), c.max(hi)));
@@ -955,31 +904,97 @@ mod tests {
     }
 
     #[test]
-    fn background_between_words_drains_and_words_stay_whole() {
-        // Review of #201: noise in words with 40 ms gaps, or a voice over a fan, never decodes
-        // below -42 dB for long and has no period between words: its 430 ms backlog stayed for
-        // good (main dropped 380 ms of it, words included). The background between words now goes,
-        // paced, from frames the fixture marks silent only (`drain`); words lose nothing but whole
-        // periods.
-        let gaps: fn(usize) -> bool = |i| i % 10 >= 2;
-        for (name, pitch, noise_level, fan) in [
-            ("noise in words", 0.0, 0.3, 0.0),
-            ("voice over a fan", 150.0, 0.0, 0.03),
-            ("noisy voice over a fan", 150.0, 0.16, 0.03),
-            ("noise in words over a fan", 0.0, 0.3, 0.03),
+    fn quiet_gaps_decoded_ahead_drain_and_words_stay_whole() {
+        // Review of #201: in noise in words with 40 ms gaps the quiet frame of each gap (below
+        // -42 dB) sat inside a block decoded ahead with speech, which nothing searched for
+        // quiet: its 430 ms backlog stayed for good (main dropped 380 ms of it, words included).
+        // It now goes, paced, from frames the fixture marks silent only (`drain`). Over a fan
+        // the gaps never decode below -42 dB, and a level alone cannot tell them from soft
+        // speech (`soft_words_lose_nothing_but_whole_periods`): without a period, that backlog
+        // stays, bounded, as with steady noise. Noise suppression removes the fan.
+        let gaps = |i| f32::from(u8::from(i % 10 >= 2));
+        for (name, pitch, noise_level, fan, drains) in [
+            ("noise in words", 0.0, 0.3, 0.0, true),
+            ("voice over a fan", 150.0, 0.0, 0.03, true),
+            ("noise in words over a fan", 0.0, 0.3, 0.03, false),
         ] {
             let drain = drain(pitch, noise_level, fan, gaps, 22);
             eprintln!("{name}: {drain:?}");
             assert_eq!(drain.speech_dropped, 0, "{name}");
             assert!(drain.speedup <= 0.24, "{name}: {}", drain.speedup);
-            let first = drain.first.expect("nothing removed");
-            assert!((250..255).contains(&first), "{name}: {first}");
-            assert!(drain.done.is_some_and(|done| done <= first + 200), "{name}: {:?}", drain.done);
             for &(refill, removed, correlation) in &drain.periods {
                 assert!(
                     whole_periods(removed, pitch) && correlation >= 0.5,
                     "{name}: {refill} {removed} {correlation}"
                 );
+            }
+            if drains {
+                let first = drain.first.expect("nothing removed");
+                assert!((250..255).contains(&first), "{name}: {first}");
+                assert!(drain.done.is_some_and(|done| done <= first + 200), "{name}: {:?}", drain.done);
+            } else {
+                assert_eq!(drain.first, None, "{name}");
+                assert!(drain.queued <= 23 * 960, "{name}: {}", drain.queued);
+            }
+        }
+    }
+
+    #[test]
+    fn soft_words_lose_nothing_but_whole_periods() {
+        // Review of #201: a voice 20 dB softer for a second (about -34 dB) set the background
+        // floor of a relative level rule itself and lost cuts of 720 and 192 samples of a
+        // 320-sample period. Its level proves nothing: only quiet audio (below -42 dB) goes but
+        // in periods.
+        let drain = drain(150.0, 0.0, 0.0, |i| if i % 150 < 100 { 1.0 } else { 0.1 }, 22);
+        assert_eq!(drain.speech_dropped, 0, "{drain:?}");
+        assert!(drain.done.is_some(), "{drain:?}");
+        for &(refill, removed, correlation) in &drain.periods {
+            assert!(whole_periods(removed, 150.0) && correlation >= 0.5, "{refill} {removed} {correlation}");
+        }
+    }
+
+    #[test]
+    fn soft_speech_after_a_long_pause_loses_nothing_but_whole_periods() {
+        use super::super::jitter::Clock;
+        // Review of #201: loud speech (-4.5 dB), a minute of silence, then speech at -37 dB with
+        // a backlog, in both clocks: what the slot had heard a minute ago called the soft speech
+        // background and cut 147 ms of it here (Rtp). A fresh slot removed none; nothing is kept
+        // across frames to judge levels by now.
+        for clock in [Clock::Rtp, Clock::Sequence] {
+            let encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip).unwrap();
+            let pcm = harmonic(150.0, 0.02, 0.3, 700 * 960);
+            let packet = |i: usize, gain: f32| {
+                let frame: Vec<f32> = pcm[i * 960..(i + 1) * 960].iter().map(|v| v * gain).collect();
+                let mut data = vec![0; 1275];
+                let n = encoder.encode_float(&frame, &mut data).unwrap();
+                data.truncate(n);
+                data
+            };
+            let mut slot = Slot::new().unwrap();
+            let start = Instant::now();
+            let at = |refill: u64| start + Duration::from_millis(refill * 20);
+            let rtp = |i: usize, refill: u64| if clock == Clock::Rtp { refill * 960 } else { i as u64 * 960 };
+            // Two seconds of loud speech, one packet per refill.
+            for i in 0..100 {
+                slot.buffer.push_at(rtp(i, i as u64), 960, packet(i, 3.0), at(i as u64), clock);
+                slot.mix_into(&mut [0.0; 960], 1.0, at(i as u64)).unwrap();
+            }
+            // A minute without packets, then 430 ms at once and one per refill for 10 s.
+            for refill in 100..3100 {
+                slot.mix_into(&mut [0.0; 960], 1.0, at(refill)).unwrap();
+            }
+            let edits = slot.edits.len();
+            for (k, refill) in (3100..3600).enumerate() {
+                let arrived = if k == 0 { 0..23 } else { k + 22..k + 23 };
+                for j in arrived {
+                    let i = 100 + j;
+                    slot.buffer.push_at(rtp(i, 3100 + j as u64), 960, packet(i, 0.07), at(refill), clock);
+                }
+                slot.mix_into(&mut [0.0; 960], 1.0, at(refill)).unwrap();
+            }
+            for edit in &slot.edits[edits..] {
+                let correlation = edit.correlation.unwrap_or(f64::NAN);
+                assert!(whole_periods(edit.removed, 150.0) && correlation >= 0.5, "{clock:?}: {edit:?}");
             }
         }
     }
@@ -1011,7 +1026,7 @@ mod tests {
         // Review of #201: the next splice point moves on by at least 10 ms while each splice
         // shortens the block, so five 120-sample periods of a 400 Hz voice left a 2880-sample
         // block 2280 long with the next search at 2400.
-        let drain = drain(400.0, 0.0, 0.0, |_| true, 20);
+        let drain = drain(400.0, 0.0, 0.0, |_| 1.0, 20);
         assert_eq!(drain.speech_dropped, 0, "{drain:?}");
         for &(refill, removed, correlation) in &drain.periods {
             assert!(

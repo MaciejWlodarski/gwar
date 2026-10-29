@@ -317,24 +317,26 @@ does (`modules/audio_coding/neteq/accelerate.cc` and `time_stretch.cc`, reimplem
   here quiet audio is handled by its level (dropped or skipped above). Silence and DC never
   splice. Without the relaxed rule, a noisy voice that never reaches 0.9 would keep its
   backlog.
-- **Sound without a period drains between its words.** A due cut takes quiet frames (below
-  −42 dB) and the stream's *background*: a frame at least `BACKGROUND_MARGIN` (15 dB) below a
-  peak-hold envelope of the stream's frame levels (decaying 3 dB/s) and within `FLOOR_MARGIN`
-  (6 dB) of the quietest frame of the last 2–4 s. Speech over a fan or street noise without
-  noise suppression never decodes below −42 dB between words; its background does. Such a frame
-  loses up to the cut's credit from its start (at most 15 ms, paced like periods, so at most a
-  fifth of any second, and never more than the surplus), and the rest fades in over 2.5 ms.
-  This holds for the frame the decoder takes and for the first quiet or background frame it
-  decodes ahead, which a block of speech used to carry past the cut. Nothing splices at 0.5 or
-  below. The margin comes from measuring encoded fixtures: words decode within 2.3 dB of the
-  envelope, the codec's tail after a word 4–5 dB below it, and background between words
-  15–31 dB below (fans 15–31 dB under the speech). A fan 15 dB under the words sits on the
-  edge and is not background: noise in words over it keeps its backlog (a voice over it still
-  drains in periods, 1.48 s); 18 dB under, it drains in 3.36 s. The floor guard keeps clean speech, whose pauses decode below −42 dB, from ever having
-  background, however quiet a consonant. Continuous sound with neither (steady noise, a hum
-  louder than −42 dB) keeps its backlog: it does not grow, `MAX_QUEUED` (1 s) caps any queue,
-  and the cut gives up after 10 s and proves the surplus again. The first version spliced such
-  audio at correlations of −0.17–0.32 after the 2 s.
+- **Sound without a period drains in its quiet frames only.** A due cut takes frames that decode
+  below −42 dB: the frame the decoder takes (5 ms, as before) and the quiet packets after it
+  (whole), and now also the first quiet frame it decodes ahead with speech, from its start up to
+  the cut's credit (at most 15 ms, paced like periods, so at most a fifth of any second, and
+  never more than the surplus), the rest fading in over 2.5 ms. A block of speech used to carry
+  that frame past the cut, so noise in words with 40 ms gaps kept its backlog. The rule is the
+  absolute −42 dB one the cut always used for quiet frames and packets, judged per frame with no
+  history. Nothing splices at 0.5 or below.
+- **Speech over a constant fan (no noise suppression) keeps its backlog when it has no period.**
+  Its gaps never decode below −42 dB, and a frame's level alone cannot tell background from soft
+  speech: a rule relative to the stream's loudest and quietest recent frames (tried in this
+  change) cut 720- and 192-sample pieces from a voice 20 dB softer for a second, and, after a
+  minute of silence, 147 ms of soft speech judged against loud speech heard before the pause.
+  The receiver has no sender evidence to add: clients send RFC 6464 levels and the V bit, but
+  the server gates on them and forwards only the slot generation, and no sender uses Opus DTX.
+  A voice over a fan still drains in whole periods; noise in words over a fan stays at its
+  backlog (440 ms in the fixture), bounded like any continuous sound without a period: it does
+  not grow, `MAX_QUEUED` (1 s) caps any queue, and the cut gives up after 10 s and proves the
+  surplus again. Noise suppression is the remedy: it takes the fan out before the encoder. The
+  first version spliced such audio at correlations of −0.17–0.32 after the 2 s.
 - **A cut that removes nothing for 10 s gives up** (`BACKLOG_STUCK`) and restarts the window, so
   audio that never splices (onsets, decays) cannot hold a cut, and the gentle shrink behind it,
   for good. A block whose first search matched nothing is not searched again.
@@ -375,23 +377,23 @@ after:
 Sound without a period, 430 ms backlog: main (forced cut), this change's first version (any lag
 after 2 s, edc18164), its second (nothing at 0.5 or below, 8aabe686), and now. The speech rows
 above are the same in the second version and now but for the gaps and pauses, which drain
-faster now (0.42 → 0.24 s, 0.90 → 0.76 s, 1.68 → 1.48 s).
+faster now, in their quiet frames decoded ahead (0.42 → 0.24 s, 0.90 → 0.76 s, 1.68 → 1.48 s).
 
 | sound | main | edc18164 | 8aabe686 | now |
 |---|---|---|---|---|
 | loud noise | 2.0 s, 380 ms dropped | 3.96 s, spliced at −0.08–0.25 | stays at 440 ms | stays at 440 ms |
-| noise in words, 40 ms gaps (gaps decode at −40 to −49 dB) | forced cut at 2 s, words dropped (not measured) | 4.22 s, spliced at −0.17–0.32 | stays at 440 ms | 3.36 s, 360 ms from gaps only |
+| noise in words, 40 ms gaps (the second frame of a gap decodes at −39 to −49 dB, mostly below −42) | forced cut at 2 s, words dropped (not measured) | 4.22 s, spliced at −0.17–0.32 | stays at 440 ms | 3.36 s, 360 ms from gaps only |
 | noise with 120 ms pauses every 320 ms | not measured | 1.70 s | 1.70 s | 1.04 s |
 | C major triad (common period 15.3 ms, beyond the range) | not measured | 3.72 s, periods at 0.73–0.81 | 3.96 s | 3.96 s |
 
-Over a fan (noise 21–22 dB under the words throughout, gaps at about −37 dB), now and with the
-background rule switched off (what 8aabe686 had):
+Over a fan (noise 21–22 dB under the words throughout, gaps at about −37 dB): the relative rule
+of 42d7acef against now (no rule; Sol round 3 rejected it, above):
 
-| sound | without background | now |
+| sound | 42d7acef (relative rule) | now |
 |---|---|---|
-| noise in words over a fan | stays at 440 ms | 3.36 s |
-| 150 Hz voice over a fan | 1.68 s (periods) | 1.48 s |
-| noisy 150 Hz voice over a fan | 3.82 s (2 s wait) | 2.62 s |
+| noise in words over a fan | 3.36 s | stays at 440 ms (accepted; noise suppression is the remedy) |
+| 150 Hz voice over a fan | 1.48 s | 1.68 s (periods) |
+| noisy 150 Hz voice over a fan | 2.62 s | 3.82 s (periods after the 2 s wait) |
 
 "Stays" holds through the 10 s measured; the cut gives up 10 s after it became due and proves
 the surplus again. Music whose lags correlate above 0.5 still drains after the 2 s.
@@ -411,11 +413,15 @@ Unit tests:
   with every budget from 2.5 to 15 ms, each removes a whole period (±5 %) at 0.5 or more, or
   nothing when the period exceeds the budget. The first version of the rule searched only within
   the budget and cut 0.44 of a 150 Hz period at 0.80.
-- `background_between_words_drains_and_words_stay_whole` drains noise in words with 40 ms gaps,
-  and a voice, a noisy voice and noise in words over a fan, within 4 s of the surplus being
-  proven, never at more than 24 % of a second, removing nothing but whole periods from frames
-  marked as words (every `drain` case checks that). It fails on 8aabe686, where noise in words
-  kept its backlog.
+- `quiet_gaps_decoded_ahead_drain_and_words_stay_whole` drains noise in words with 40 ms gaps
+  and a voice over a fan within 4 s of the surplus being proven, never at more than 24 % of a
+  second, removing nothing but whole periods from frames marked as words (every `drain` case
+  checks that); noise in words over a fan stays bounded. It fails on 8aabe686, where noise in
+  words kept its backlog.
+- `soft_words_lose_nothing_but_whole_periods` (a voice 20 dB softer for one second in three) and
+  `soft_speech_after_a_long_pause_loses_nothing_but_whole_periods` (speech at −4.5 dB, a minute
+  of silence, then speech at −37 dB with a backlog, both clocks) fail on 42d7acef, whose
+  relative rule cut 720 samples from inside soft words.
 - `aperiodic_audio_never_splices` covers noise (at the relaxed threshold and at −1), silence,
   DC and less than 30 ms.
 - `a_block_shorter_than_every_lag_never_splices` plays a 100 Hz voice with a formant on its

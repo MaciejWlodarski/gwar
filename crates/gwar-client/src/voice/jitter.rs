@@ -360,10 +360,10 @@ const SHRINK_RETRY: Duration = Duration::from_millis(200);
 // After `BACKLOG_WAIT` the cut takes a period that correlates above `RELAXED_CORRELATION`
 // (NetEq's fast-mode threshold), from the whole 2.5--15 ms range, so a voice still loses only
 // whole periods. Audio without a period (noise, unvoiced or whispered speech, most music) is
-// never spliced: its backlog drains in quiet packets and frames and in the background between
-// words (playout.rs `Slot::background`), and otherwise stays as it is (it does not grow;
-// `MAX_QUEUED` caps any queue). NetEq accepts any lag only when an energy
-// VAD finds no active speech; here quiet audio is dropped or skipped by its level instead. A cut
+// never spliced: its backlog drains in quiet packets and frames (below -42 dB, also those decoded
+// ahead with speech), and otherwise stays as it is (it does not grow; `MAX_QUEUED` caps any
+// queue). NetEq accepts any lag only when an energy VAD finds no active speech; here quiet audio
+// is dropped or skipped by its level instead. A cut
 // that removes nothing for `BACKLOG_STUCK` gives up and restarts the window, which gives the
 // gentle shrink its turn.
 //
