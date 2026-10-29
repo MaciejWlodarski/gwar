@@ -633,6 +633,26 @@ describe("session resilience", () => {
     expect(engine.start).not.toHaveBeenCalled();
   });
 
+  it("a newer permanent refusal cancels a plaintext entry whose presence update is delayed", async () => {
+    engine.capabilities.encryptedVoice = async () => false;
+    connectFake({ channel: 2, encrypted: [2, 3] }); await vi.advanceTimersByTimeAsync(0);
+    const reason = stores.useVoice.getState().failure;
+    expect(reason).not.toBeNull();
+    // The plaintext join is acknowledged, but its presence update has not arrived yet.
+    await controller.joinChannel(1);
+    await controller.joinChannel(3, "channel-secret");
+    expect(link.sent("channel.join").map(request => request.d)).toEqual([{ channel: 1, password: null }]);
+    expect(stores.useVoice.getState()).toMatchObject({ state: "failed", failure: reason });
+    link.emit({ ev: "client.updated", d: client(1, 1) });
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(engine.start).not.toHaveBeenCalled();
+    expect(stores.useVoice.getState()).toMatchObject({ state: "failed", failure: reason, reconnecting: false });
+    expect(stores.useUi.getState().toasts).toHaveLength(0);
+    await controller.joinChannelInteractive(1); await vi.advanceTimersByTimeAsync(0);
+    expect(engine.start).toHaveBeenCalledOnce();
+    expect(stores.useVoice.getState().failure).toBeNull();
+  });
+
   it("announces starting while the encryption capability probe is still pending", async () => {
     let finish!: (value: boolean) => void;
     engine.capabilities.encryptedVoice = () => new Promise(resolve => { finish = resolve; });

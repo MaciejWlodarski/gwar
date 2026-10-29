@@ -1304,6 +1304,7 @@ class Controller {
     useVoice.getState().set({ state: "failed", failure: retry ? null : message });
     if (retry) this.scheduleVoiceRetry();
     else {
+      this.pendingVoiceEntry = null;
       this.voiceRetryAllowed = false;
       this.voiceRetryChannel = myChannelId(useSession.getState());
       if (this.voiceRetry) clearTimeout(this.voiceRetry);
