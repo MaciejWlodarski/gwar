@@ -43,6 +43,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
   const { busy, error, needPassword, serverName, invite, otherTab } = useConnectUi();
   const closeReason = useSession((s) => s.closeReason);
   const openSettings = useUi((s) => s.openSettings);
+  const dialogOpen = useUi((s) => s.dialog.kind !== "none");
   const account = useAccount((s) => s.account);
   const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "gwar");
   const [address, setAddress] = useState(invite?.server ? addressLabel(invite.server, pageContextFromLocation()) : lastAddress);
@@ -179,7 +180,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
                 autoCorrect="off"
                 spellCheck={false}
                 required
-                autoFocus={!address}
+                autoFocus={!address && !dialogOpen}
               />
             )}
           </Field>
@@ -198,7 +199,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
                   // A shared server password; "Remember" stores it, not the browser.
                   name="server-password"
                   autoComplete="off"
-                  autoFocus={needPassword}
+                  autoFocus={needPassword && !dialogOpen}
                   required={needPassword}
                 />
               )}

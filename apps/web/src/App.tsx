@@ -41,7 +41,7 @@ export function App() {
   const pane = useUi((s) => s.pane);
   const members = useMembersPanel();
   const restoring = useConnectUi((s) => s.restoring);
-  const connecting = restoring || phase === "connecting";
+  const connecting = restoring;
   const showApp = connecting || phase === "online" || phase === "reconnecting";
   const stageOpen = useScreen((s) => s.stage !== null);
   const chatHidden = useScreen((s) => s.chatHidden);

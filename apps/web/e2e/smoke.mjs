@@ -298,6 +298,12 @@ async function changeServerNickname(page, nickname) {
 }
 
 async function connect(page, nickname, { mobile = false, address = CLIENT_ADDR } = {}) {
+  // A fresh manual connection starts with an explicit Disconnect; a reload alone now restores the server.
+  if (page.url().startsWith(`${WEB_URL}/`)) {
+    await page.evaluate(async () => {
+      if (window.__gwarE2eImport) await (await window.__gwarE2eImport("/src/state/controller.ts")).controller.disconnect();
+    });
+  }
   await page.goto(WEB_URL);
   await page.getByLabel("Server address").fill(address);
   await setGlobalNickname(page, nickname, { mobile });
