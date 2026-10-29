@@ -134,7 +134,7 @@ describe("native web-view ownership", () => {
     await current.start(params());
     const currentRun = activeRun;
     answer.resolve("late answer");
-    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_answer", { owner: 1, run: oldRun, sdp: "late answer" }));
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_answer", expect.objectContaining({ owner: 1, run: oldRun, error: expect.any(String) })));
     old.setPttActive(true);
     await old.stop();
     expect(activeRun).toBe(currentRun);
@@ -372,5 +372,45 @@ describe("native device changes", () => {
     expect(switched).toHaveBeenCalledExactlyOnceWith({ side: "input", label: "MacBook mic" });
     expect(outputError).toHaveBeenCalledExactlyOnceWith(null);
     expect(micError).not.toHaveBeenCalled();
+  });
+});
+
+describe("native acknowledged input mode transitions", () => {
+  it("binds automatic/manual/PTT transitions to the run and waits for the newest ack", async () => {
+    const view = engine(), ack = deferred<void>();
+    const inputGate = vi.fn(async (_enabled: boolean, _run: number) => {});
+    await view.start({ ...params(vi.fn(async () => "a=x-gwar-input-gate:2\r\n")), inputGate });
+    const run = activeRun;
+    emit("voice://offer", { owner: 1, run, sdp: "offer" });
+    await vi.waitFor(() => expect(inputGate).toHaveBeenLastCalledWith(false, run));
+    inputGate.mockReturnValueOnce(ack.promise);
+    view.setInputSensitivity(-80);
+    await vi.waitFor(() => expect(inputGate).toHaveBeenLastCalledWith(true, run));
+    expect(bridge.invoke).toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: false });
+    expect(bridge.invoke).not.toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: true });
+    view.setInputSensitivity(null);
+    ack.resolve();
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 2, ready: true }));
+    expect(bridge.invoke).not.toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: true });
+    expect(inputGate).toHaveBeenLastCalledWith(false, run);
+    view.setInputMode("ptt");
+    await vi.waitFor(() => expect(inputGate).toHaveBeenLastCalledWith(true, run));
+    view.setInputMode("vad");
+    await vi.waitFor(() => expect(inputGate).toHaveBeenLastCalledWith(false, run));
+  });
+
+  it("falls back explicitly on old servers and never opens unsupported PTT", async () => {
+    const view = engine(), support = vi.fn(), inputGate = vi.fn();
+    view.on("inputGateSupport", support);
+    view.setInputSensitivity(-80);
+    await view.start({ ...params(), inputGate });
+    const run = activeRun;
+    emit("voice://offer", { owner: 1, run, sdp: "offer" });
+    await vi.waitFor(() => expect(support).toHaveBeenLastCalledWith(false));
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_set_input_mode", { owner: 1, mode: "vad", thresholdDb: null }));
+    expect(inputGate).not.toHaveBeenCalled();
+    view.setInputMode("ptt");
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: false }));
+    expect(bridge.invoke).not.toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: true });
   });
 });

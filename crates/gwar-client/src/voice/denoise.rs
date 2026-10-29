@@ -1,6 +1,6 @@
 //! Background-noise suppression on the capture path (docs/latency.md, "Noise suppression"): every
-//! 10 ms frame goes through it before the encoder; the level meter and the voice-activity gate
-//! still measure the microphone as captured. It runs on the device, before encryption.
+//! 10 ms frame goes through it before the encoder, manual gate and live meter. Automatic
+//! activation retains its legacy capture decision. It runs on the device, before encryption.
 //!
 //! The model and its settings are `gwar-denoise`'s, shared with the web app: DeepFilterNet3's
 //! low-latency model on 48 kHz frames of exactly our 480 samples. It adds one frame (10 ms) of

@@ -302,8 +302,11 @@ server until the user chooses "Join voice". This temporary presence state does n
 change their saved self-mute/deafen preferences.
 
 Settings version 5 adds `audio.automaticSensitivity` (default `true`) and
-`audio.vadThreshold` (default −50 dBFS). Both browser and desktop keep the previous
-voice gate by default. Native automatic mode on Gwar also retains the legacy processed-audio
+`audio.vadThreshold` (default −50 dBFS). The version 4 session-resilience migration
+is preserved; versions 1–4 upgrade through it to version 5 without losing mute,
+reconnect, device or onboarding preferences. Both browser and desktop keep the
+previous automatic voice decisions by default. Native automatic mode on Gwar
+also retains the legacy processed-audio
 criterion (RFC 6464 level at least −60 dBov) in its VAD bit. The optional native
 SDP marker `a=x-gwar-native-vad:1` makes that bit authoritative at the SFU, which
 keeps its 400 ms timeout; manual sensitivity and PTT mark speech regardless of
@@ -315,7 +318,7 @@ updates validate the new fields: thresholds are finite numbers clamped to
 −100…0 dBFS (invalid values use −50), and invalid automatic flags use `true`.
 
 The manual browser gate runs on the audio thread before encoding, with a 300 ms
-voice tail, and measures capture before Gwar suppression on the meter's dB scale.
+voice tail, and measures the audio after suppression on the meter's dB scale.
 Automatic mode leaves the exact legacy decision on the server: RFC 6464 level at
 least -50 dBov, or -60 dBov with the browser's voice-activity bit, and the original
 400 ms tail. The browser worklet cannot infer that bit from PCM, so it passes
@@ -326,14 +329,13 @@ server echoes it and supports `voice.input_gate {binding, client_gate}`: only th
 matching call/participation/run can change the gate, and the reply waits until
 media applies it. Manual/PTT enable client gating (the server filters digital
 silence); automatic restores the legacy rule and discards manual's speech tail.
-The browser closes its output until the newest mode change is acknowledged.
-Older servers ignore the attribute, keep their legacy gate, and receive no new
-control requests. Quiet manual thresholds then need a server upgrade. Native
-offers retain `a=x-gwar-input-gate:1` and the native VAD marker described above;
-offers without either attribute retain the legacy decision.
+Both engines close output until the newest run-bound mode change is acknowledged.
+Native mode revisions reset the local hangover and discard old queued frames.
+Older servers ignore the attribute, keep automatic activation, and receive no new
+control requests. Both current engines advertise version 2; older native
+version-1 clients and offers without either attribute retain their prior decisions.
 
-The Audio settings sensitivity section has a local live preview in voice-activation
-mode. During voice it reuses the call's meter. Outside voice it captures only while
+Audio settings show a local live preview inside Input mode during voice activation. During voice it reuses the call's meter. Outside voice it captures only while
 that section is open, visible and unmuted/undeafened; leaving it, switching to PTT,
 muting, hiding the tab/window or starting voice cancels capture. A call waits for
 any pending preview acquisition to release its device first. Permission is read
@@ -401,3 +403,6 @@ Every kind has a test that fails when the version grows without a fixture:
   `every_older_schema_opens_at_the_current_one_with_its_rows` covers the rest.
 - **A new store:** give it a version from the start, add it to this inventory and
   to the guard test of its kind.
+
+Manual sensitivity is unavailable on older servers; settings show a short explanation
+and retain the saved threshold. Unsupported PTT stays closed and asks for a newer server.

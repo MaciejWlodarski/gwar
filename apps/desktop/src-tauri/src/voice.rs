@@ -36,7 +36,7 @@ use std::{
 };
 
 use gwar_client::voice::{
-    InputMode, LinkState, NoiseSuppression, VoiceHandle,
+    InputMode, LinkState, MicrophoneProcessor, NoiseSuppression, VoiceHandle,
     io::{AudioIo, AudioPorts, DeviceControl, DeviceIo, DeviceIssue, IssueSink, Side},
     keys::EncryptedStart,
     permission,
@@ -93,6 +93,8 @@ struct Inner {
     startup: Option<Arc<NativeRun>>,
     mic_test: Option<Arc<NativeRun>>,
     mic_test_serial: u64,
+    gate_serial: u64,
+    gate_ready: bool,
     prefs: Prefs,
     handle: Option<VoiceHandle>,
     /// Moves the running engine's devices (`voice_set_devices`) without renegotiating.
@@ -118,6 +120,8 @@ impl Default for Voice {
                 startup: None,
                 mic_test: None,
                 mic_test_serial: 0,
+                gate_serial: 0,
+                gate_ready: true,
                 prefs: Prefs {
                     input: None,
                     output: None,
@@ -472,6 +476,8 @@ fn claim_run(voice: &Voice, owner: u64, run: u64) -> Result<Arc<NativeRun>, Stri
     }
     let startup = NativeRun::new();
     inner.startup = Some(startup.clone());
+    inner.gate_serial = 0;
+    inner.gate_ready = true;
     voice.run.store(run, Ordering::SeqCst);
     Ok(startup)
 }
@@ -619,6 +625,7 @@ pub async fn voice_start(
         if let Some(events) = handle.take_crypto_events() {
             tauri::async_runtime::spawn(forward_crypto(app.clone(), owner, run, events));
         }
+        handle.set_input_gate_ready(inner.gate_ready);
         inner.handle = Some(handle);
         // A choice made while the devices opened applies now.
         if let Some(control) = &control {
@@ -902,6 +909,37 @@ pub fn voice_set_input_mode(
     Ok(())
 }
 
+/// Run-bound barrier: only the latest acknowledged mode may reopen native output.
+#[tauri::command]
+pub fn voice_set_gate_ready(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    run: u64,
+    serial: u64,
+    ready: bool,
+) -> Result<(), String> {
+    check_main_window(window.label())?;
+    set_gate_ready(&voice, owner, run, serial, ready)
+}
+
+fn set_gate_ready(voice: &Voice, owner: u64, run: u64, serial: u64, ready: bool) -> Result<(), String> {
+    let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
+    if voice.run.load(Ordering::SeqCst) != run {
+        return Err("superseded voice run".into());
+    }
+    if (ready && serial != inner.gate_serial) || (!ready && serial <= inner.gate_serial) {
+        return Err("superseded input mode".into());
+    }
+    inner.gate_serial = serial;
+    inner.gate_ready = ready;
+    if let Some(handle) = &inner.handle {
+        handle.set_input_gate_ready(ready);
+    }
+    Ok(())
+}
+
 /// The microphone's processing, as the settings choose it; `strength` is noise suppression's, in
 /// percent (see [`NoiseSuppression`]).
 #[tauri::command]
@@ -1081,17 +1119,36 @@ pub async fn mic_test_start(
         .name("gwar-mic-test".into())
         .spawn(move || {
             let AudioPorts { mut mic, speaker: _speaker, _guard, .. } = ports;
-            let mut acc = (0f32, 0usize);
+            let mut processor = MicrophoneProcessor::default();
+            let mut frame = [0.0; gwar_client::voice::FRAME];
+            let mut filled = 0;
+            let mut next = None;
+            let mut continuous = false;
             while test.check().is_ok() {
+                let (echo, gain, noise) = {
+                    let voice = app.state::<Voice>();
+                    let inner = voice.lock();
+                    (inner.prefs.echo, inner.prefs.gain, inner.prefs.noise)
+                };
+                let mut latest = None;
                 while let Ok(s) = mic.pop() {
-                    acc.0 += s.value * s.value;
-                    acc.1 += 1;
+                    if next != Some(s.position) {
+                        filled = 0;
+                        continuous = false;
+                    }
+                    frame[filled] = s.value;
+                    filled += 1;
+                    next = Some(s.position + 1);
+                    if filled == frame.len() {
+                        processor.process(&mut frame, echo, gain, noise, continuous, 0);
+                        continuous = true;
+                        let power = frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32;
+                        latest = Some(10.0 * power.max(1e-10).log10());
+                        filled = 0;
+                    }
                 }
-                if acc.1 > 0 {
-                    let rms = (acc.0 / acc.1 as f32).sqrt();
-                    let _ =
-                        app.emit("voice://test-level", TestLevel { owner, test: id, db: 20.0 * rms.max(1e-5).log10() });
-                    acc = (0.0, 0);
+                if let Some(db) = latest {
+                    let _ = app.emit("voice://test-level", TestLevel { owner, test: id, db });
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -1331,6 +1388,7 @@ mod run_tests {
         let (tx, mut answer) = oneshot::channel();
         {
             let mut inner = voice.lock();
+            handle.set_input_gate_ready(inner.gate_ready);
             inner.handle = Some(handle);
             inner.pending_answer = Some((old_run, tx));
             inner.prefs.ptt = true;
@@ -1413,6 +1471,25 @@ mod run_tests {
         for bad in ["", "01", "-1", "1.0", "18446744073709551616", " 1"] {
             assert!(resume_floor(Some(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn mode_acknowledgements_are_bound_to_the_current_owner_run_and_serial() {
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        claim_run(&voice, owner, 5).unwrap();
+        set_gate_ready(&voice, owner, 5, 1, false).unwrap();
+        assert!(!voice.lock().gate_ready);
+        set_gate_ready(&voice, owner, 5, 2, false).unwrap();
+        assert!(set_gate_ready(&voice, owner, 5, 1, true).is_err());
+        assert!(!voice.lock().gate_ready);
+        set_gate_ready(&voice, owner, 5, 2, true).unwrap();
+        assert!(voice.lock().gate_ready);
+        claim_run(&voice, owner, 6).unwrap();
+        set_gate_ready(&voice, owner, 6, 1, false).unwrap();
+        assert!(set_gate_ready(&voice, owner, 5, 2, true).is_err());
+        assert!(set_gate_ready(&voice, owner + 1, 6, 1, true).is_err());
+        assert!(!voice.lock().gate_ready);
     }
 
     #[test]

@@ -49,3 +49,10 @@ voice, the preview is scoped to a visible Audio page in voice-activation mode,
 without self-mute or deafen. Permission must already be granted for automatic
 capture; otherwise the user starts it explicitly. Preview audio is never sent.
 The engine drains pending preview acquisition/cleanup before opening call audio.
+
+`voice_set_gate_ready {owner, run, serial, ready}` closes native output before a
+mode transition. Only the active run's latest serial may reopen it, after the
+server acknowledges `voice.input_gate`. Mode revisions also discard old queued
+frames and reset the local hangover. Native SDP advertises input-gate version 2;
+automatic mode uses the legacy server criterion. Older servers keep automatic
+activation; manual sensitivity is unavailable and unsupported PTT stays closed.

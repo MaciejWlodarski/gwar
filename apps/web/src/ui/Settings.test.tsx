@@ -31,7 +31,7 @@ beforeEach(() => {
   voice.startMicTest.mockReset().mockResolvedValue(() => {});
   voice.micPermission.mockReset().mockResolvedValue("granted");
   useSettings.setState({ language: "en", audio: { ...defaultAudio } });
-  useVoice.setState({ state: "idle", level: 0, muted: false, deafened: false });
+  useVoice.setState({ state: "idle", level: 0, muted: false, deafened: false, inputGateSupport: null });
   useUi.getState().openSettings("audio");
   container = document.createElement("div"); document.body.appendChild(container);
   root = createRoot(container); mounted = true;
@@ -45,12 +45,12 @@ const meter = () => container.querySelector('[role="meter"]')!;
 const mount = () => act(async () => root.render(<TooltipProvider><SettingsSection /></TooltipProvider>));
 const automatic = () => [...container.querySelectorAll<HTMLElement>('[role="switch"]')].find(e => e.closest("div")?.textContent?.includes("Automatically determine input sensitivity"))!;
 
-it("has its own compact section after Input mode, with a live meter before any mic-test click", async () => {
+it("keeps sensitivity inside Input mode, with a live meter before any mic-test click", async () => {
   await mount();
   expect(voice.startMicTest).toHaveBeenCalledOnce();
   expect(button("Test microphone")).toBeUndefined();
   const headings = [...container.querySelectorAll("h3")].map(h => h.textContent);
-  expect(headings.slice(0, 4)).toEqual(["Devices", "Input mode", "Input sensitivity", "Processing"]);
+  expect(headings.slice(0, 3)).toEqual(["Devices", "Input mode", "Processing"]);
   expect(container.textContent).toContain("Turn off to set it yourself.");
   expect(automatic().getAttribute("aria-checked")).toBe("true");
   await act(async () => voice.startMicTest.mock.calls[0]![0](0.6));
@@ -158,4 +158,15 @@ it("keeps noise-suppression strength beside echo cancellation", async () => {
   const strength = container.querySelector<HTMLElement>('[role="slider"][aria-label="Noise suppression strength"]')!;
   await act(async () => strength.dispatchEvent(new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true })));
   expect(useSettings.getState().audio.noiseStrength).toBe(95);
+});
+
+it("explains unsupported manual sensitivity while preserving the saved choice", async () => {
+  useSettings.getState().setAudio({ automaticSensitivity: false, vadThreshold: -80 });
+  useVoice.setState({ inputGateSupport: false });
+  await mount();
+  expect(automatic().getAttribute("aria-checked")).toBe("true");
+  expect(automatic().hasAttribute("disabled")).toBe(true);
+  expect(container.textContent).toContain("Manual sensitivity needs a newer server.");
+  expect(container.querySelector('[role="slider"][aria-label="Input sensitivity"]')).toBeNull();
+  expect(useSettings.getState().audio).toMatchObject({ automaticSensitivity: false, vadThreshold: -80 });
 });

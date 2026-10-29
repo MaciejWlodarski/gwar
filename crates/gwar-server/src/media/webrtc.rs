@@ -172,9 +172,6 @@ impl SpeechGate {
         false
     }
     fn set_client_gate(&mut self, enabled: bool) -> bool {
-        if self.client_gate == enabled {
-            return false;
-        }
         self.client_gate = enabled;
         let ended = self.talking;
         self.talking = false;
@@ -692,6 +689,27 @@ mod clock_tests {
         assert!(gate.expire(start + Duration::from_millis(831)));
         assert!(has_gate_control("v=0\r\na=x-gwar-input-gate:2\r\n"));
         assert!(!has_client_gate("v=0\r\na=x-gwar-input-gate:2\r\n"));
+    }
+
+    #[test]
+    fn native_mode_transitions_drop_manual_and_automatic_speech_tails() {
+        let start = Instant::now();
+        let quiet = ExtensionValues { audio_level: Some(-80), voice_activity: Some(true), ..Default::default() };
+        let voice = ExtensionValues { audio_level: Some(-45), voice_activity: Some(true), ..Default::default() };
+        let mut gate = SpeechGate { client_gate: true, native_vad: true, talking: false, last_voice: start };
+        gate.observe(&quiet, start);
+        assert!(gate.talking);
+        assert!(gate.set_client_gate(false));
+        gate.observe(&quiet, start + Duration::from_millis(399));
+        assert!(!gate.talking, "suppressed -45/-80 noise must not inherit manual's tail");
+        gate.observe(&voice, start + Duration::from_millis(400));
+        assert!(gate.talking);
+        assert!(gate.set_client_gate(true));
+        assert!(!gate.talking, "automatic tail must not survive the manual transition");
+        gate.observe(&quiet, start + Duration::from_millis(401));
+        assert!(gate.talking);
+        assert!(gate.set_client_gate(true), "manual to PTT also clears the previous tail");
+        assert!(!gate.talking);
     }
 
     #[test]

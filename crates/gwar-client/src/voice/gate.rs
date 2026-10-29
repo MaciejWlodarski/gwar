@@ -7,9 +7,16 @@ pub fn input_threshold(db: f32) -> f32 {
 #[derive(Default)]
 pub(super) struct InputGate {
     last_voice: Option<Instant>,
+    mode: u64,
 }
 
 impl InputGate {
+    pub fn set_mode(&mut self, mode: u64) {
+        if self.mode != mode {
+            self.last_voice = None;
+            self.mode = mode;
+        }
+    }
     pub fn allows(&mut self, now: Instant, db: f32, threshold: f32, ptt: Option<bool>, blocked: bool) -> bool {
         if blocked || ptt.is_some() {
             self.last_voice = None;
@@ -50,6 +57,17 @@ mod tests {
         assert!(!gate.allows(now, -90.0, -50.0, None, false));
         assert!(!gate.allows(now, 0.0, -50.0, Some(true), true));
         assert!(!gate.allows(now, f32::NEG_INFINITY, -100.0, None, false));
+    }
+
+    #[test]
+    fn mode_changes_clear_both_directions_including_a_round_trip() {
+        let now = Instant::now();
+        let mut gate = InputGate::default();
+        for mode in [1, 4, 9, 12] {
+            gate.set_mode(mode);
+            assert!(!gate.allows(now, -80.0, -50.0, None, false));
+            assert!(gate.allows(now, -30.0, -50.0, None, false));
+        }
     }
 
     #[test]

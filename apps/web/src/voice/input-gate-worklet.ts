@@ -22,7 +22,7 @@ class InputGateProcessor extends AudioWorkletProcessor {
     // Automatic stays on the server: only RTP has the browser's voice-activity
     // bit and quantized processed level needed for its exact legacy decision.
     const audio = inputs[1]?.[0];
-    const measured = inputs[0]?.[0];
+    const measured = audio;
     const output = outputs[0]?.[0];
     if (!output) return true;
     let power = 0;

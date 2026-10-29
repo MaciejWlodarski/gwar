@@ -454,15 +454,16 @@ describe("the settings (localStorage)", () => {
     expect(s()).toMatchObject({ resumeConnection: null, updateVoiceResume: null });
   });
 
-  it.each([1, 2, 3, 4])("adds sensitivity defaults to version %s without changing voice preferences or onboarding", async version => {
+  it.each([1, 2, 3, 4])("adds sensitivity defaults to version %s without losing voice, onboarding or session preferences", async version => {
     const audio = { inputMode: "ptt", inputDeviceId: "saved-mic", noiseSuppression: false, echoCancellation: false, autoGainControl: false };
     const onboarding = { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true };
-    const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ version, state: { audio, onboarding, theme: "dark" } }) });
+    const session = { selfMuted: true, selfDeafened: true, resumeConnection: { address: "a.example", kind: "gwar", name: "A", password: "saved-password", identity: "saved-identity", insecureLan: true }, updateVoiceResume: { address: "a.example", kind: "gwar", version: "1.0", expiresAt: 123456, channel: 2, password: "channel-password" } };
+    const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ version, state: { audio, onboarding, ...session, theme: "dark" } }) });
     const { useSettings } = await page(storage);
-    expect(useSettings.getState()).toMatchObject({ theme: "dark", onboarding, audio: { ...audio, automaticSensitivity: true, vadThreshold: -50 } });
+    expect(useSettings.getState()).toMatchObject({ theme: "dark", onboarding, ...session, audio: { ...audio, automaticSensitivity: true, vadThreshold: -50 } });
     const saved = JSON.parse(storage.getItem(SETTINGS_KEY)!);
     expect(saved.version).toBe(SETTINGS_VERSION);
-    expect(saved.state.audio).toMatchObject({ ...audio, automaticSensitivity: true, vadThreshold: -50 });
+    expect(saved.state).toMatchObject({ ...session, onboarding, audio: { ...audio, automaticSensitivity: true, vadThreshold: -50 } });
   });
   it.each([
     [-200, -100], [20, 0], [null, -50], ["-70", -50], [-72, -72],

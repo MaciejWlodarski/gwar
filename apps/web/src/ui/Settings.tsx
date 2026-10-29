@@ -133,13 +133,14 @@ function AudioTab() {
   const devices = useVoice((s) => s.devices);
   const engineLevel = useVoice((s) => s.level);
   const voiceState = useVoice((s) => s.state);
+  const gateUnsupported = useVoice((s) => s.inputGateSupport === false);
   const muted = useVoice((s) => s.muted || s.deafened);
   const [capturing, setCapturing] = useState(false);
   const engine = controller.voice;
   const preview = useMicPreview(engine);
   // Gwar's own suppression has a strength: native on the desktop, an AudioWorklet in the browser.
   const noiseStrength = audio.noiseSuppression && (
-    <Field label={t("audio.noiseStrength")} hint={t("audio.noiseStrengthHint")}>
+    <Field label={t("audio.noiseStrength")}>
       {() => (
         <div className="flex items-center gap-3">
           <Slider
@@ -178,6 +179,7 @@ function AudioTab() {
   ];
   const inCall = voiceState !== "idle";
   const level = muted ? 0 : inCall ? engineLevel : preview.level;
+  const automatic = gateUnsupported || audio.automaticSensitivity;
 
   return (
     <div>
@@ -230,43 +232,27 @@ function AudioTab() {
             { value: "ptt", label: t("audio.ptt") },
           ]}
         />
-        {audio.inputMode === "ptt" ? (
-          <div className="flex flex-col gap-1">
+        <p className="text-xs text-subtle">{t(audio.inputMode === "vad" ? "audio.vadHelp" : "audio.pttModeHint")}</p>
+        <div data-input-mode-options className="grid grid-rows-[44px_44px_minmax(32px,auto)] gap-2">
+          {audio.inputMode === "vad" ? <>
+            <Switch checked={automatic} disabled={gateUnsupported} onCheckedChange={(automaticSensitivity) => setAudio({ automaticSensitivity })} label={t("audio.automaticSensitivity")} description={t(gateUnsupported ? "audio.manualUnsupported" : "audio.automaticSensitivityHint")} />
+            {automatic ? <div className="flex items-center"><LevelMeter level={level} label={t("audio.level")} /></div> : <InputSensitivity level={level} threshold={audio.vadThreshold} onChange={(vadThreshold) => setAudio({ vadThreshold })} />}
+            <div className="flex items-center">
+              {preview.needsPermission ? <Button onClick={preview.request} className="h-8 self-start text-xs">{t("audio.previewEnable")}</Button> : !automatic && !audio.noiseSuppression ? <p className="text-xs text-subtle">{t("audio.noiseSuggestion")}</p> : null}
+            </div>
+          </> : <>
             <div className="flex items-center gap-2">
-              <Button onClick={() => setCapturing(true)} className={cn("min-w-40", capturing && "border-accent text-accent")}>
+              <Button disabled={gateUnsupported} onClick={() => setCapturing(true)} className={cn("min-w-40", capturing && "border-accent text-accent")}>
                 {capturing ? t("audio.pressKey") : audio.pttKey ? keyLabel(audio.pttKey) : t("audio.setKey")}
               </Button>
-              {audio.pttKey && !capturing && (
-                <Button variant="ghost" onClick={() => setAudio({ pttKey: null })}>
-                  {t("audio.clearKey")}
-                </Button>
-              )}
+              {audio.pttKey && !capturing && <Button variant="ghost" onClick={() => setAudio({ pttKey: null })}>{t("audio.clearKey")}</Button>}
             </div>
-            <p className="text-xs text-subtle">
-              {audio.pttKey ? t(onDesktop ? "audio.pttHelpGlobal" : "audio.pttHelp") : t("audio.pttNoKey")}
-            </p>
-          </div>
-        ) : (
-          <p className="text-xs text-subtle">{t("audio.vadHelp")}</p>
-        )}
+            <p className="self-center text-xs text-subtle">{t(gateUnsupported ? "audio.pttUnsupported" : audio.pttKey ? onDesktop ? "audio.pttHelpGlobal" : "audio.pttHelp" : "audio.pttNoKey")}</p>
+            <div aria-hidden="true" />
+          </>}
+        </div>
+        {preview.error != null && <p role="alert" className="text-sm text-danger">{describeVoiceError(preview.error instanceof VoiceError ? preview.error : new VoiceError("mic_failed", String(preview.error)))}</p>}
       </Section>
-
-      {audio.inputMode === "vad" && (
-        <Section title={t("audio.sensitivity")}>
-          <Switch checked={audio.automaticSensitivity} onCheckedChange={(automaticSensitivity) => setAudio({ automaticSensitivity })} label={t("audio.automaticSensitivity")} description={t("audio.automaticSensitivityHint")} />
-          {audio.automaticSensitivity ? <div className="flex min-h-11 items-center"><LevelMeter level={level} label={t("audio.level")} /></div> : <InputSensitivity level={level} threshold={audio.vadThreshold} onChange={(vadThreshold) => setAudio({ vadThreshold })} />}
-          {preview.needsPermission && <Button onClick={preview.request} className="self-start">{t("audio.previewEnable")}</Button>}
-          {preview.error != null && <p role="alert" className="text-sm text-danger">{describeVoiceError(preview.error instanceof VoiceError ? preview.error : new VoiceError("mic_failed", String(preview.error)))}</p>}
-        </Section>
-      )}
-
-      {onDesktop && (
-        <Section title={t("audio.globalShortcuts")}>
-          <ShortcutField label={t("audio.muteShortcut")} value={desktop.muteShortcut} onChange={(v) => setDesktop({ muteShortcut: v })} />
-          <ShortcutField label={t("audio.deafenShortcut")} value={desktop.deafenShortcut} onChange={(v) => setDesktop({ deafenShortcut: v })} />
-          <p className="text-xs text-subtle">{t("audio.shortcutHint")}</p>
-        </Section>
-      )}
 
       <Section title={t("audio.processing")}>
         <Switch
@@ -289,6 +275,14 @@ function AudioTab() {
           description={t("audio.autoGainHint")}
         />
       </Section>
+
+      {onDesktop && (
+        <Section title={t("audio.globalShortcuts")}>
+          <ShortcutField label={t("audio.muteShortcut")} value={desktop.muteShortcut} onChange={(v) => setDesktop({ muteShortcut: v })} />
+          <ShortcutField label={t("audio.deafenShortcut")} value={desktop.deafenShortcut} onChange={(v) => setDesktop({ deafenShortcut: v })} />
+          <p className="text-xs text-subtle">{t("audio.shortcutHint")}</p>
+        </Section>
+      )}
     </div>
   );
 }

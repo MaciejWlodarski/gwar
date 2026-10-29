@@ -27,7 +27,8 @@ export type VoiceErrorKind =
   | "insecure" // page is not a secure context, browsers hide the microphone
   | "output_failed" // speakers could not be opened / disappeared (desktop)
   | "negotiation" // WebRTC offer/answer failed
-  | "unsupported";
+  | "unsupported"
+  | "input_mode_unsupported";
 
 export class VoiceError extends Error {
   constructor(
@@ -66,6 +67,8 @@ export interface DeviceList {
 export interface VoiceEvents {
   /** Local microphone level 0..1 (already shaped for display). */
   level: number;
+  /** null before negotiation; false means only the legacy automatic gate is available. */
+  inputGateSupport: boolean | null;
   state: VoiceState;
   /** Capture problem; `null` clears it. Does not affect listening. */
   micError: VoiceError | null;

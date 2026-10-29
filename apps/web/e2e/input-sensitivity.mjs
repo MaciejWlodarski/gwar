@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { installMicPrivacyGuard } from "./mic-privacy.mjs";
 import { stopProcesses } from "./processes.mjs";
 
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
@@ -78,6 +79,7 @@ try {
     // A fresh page per width also checks automatic page-scoped preview startup.
     await page.goto(url);
     await page.waitForFunction(() => typeof window.__gwarE2eImport === "function" && document.getElementById("root").childElementCount > 0);
+    await page.evaluate(installMicPrivacyGuard);
     await page.evaluate(async () => {
       const { useUi } = await window.__gwarE2eImport("/src/state/stores.ts");
       useUi.getState().openSettings("audio");
@@ -91,22 +93,25 @@ try {
     await automatic.scrollIntoViewIfNeeded();
     const shot = async state => {
       assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), `${name}: horizontal overflow`);
+      const lines = await page.locator("section p, section label div").evaluateAll(elements => elements.map(el => ({ text: el.textContent, lines: el.getBoundingClientRect().height / parseFloat(getComputedStyle(el).lineHeight) })));
+      assert.ok(lines.every(item => item.lines < 2.5), `${name}: sprawling text ${JSON.stringify(lines.filter(item => item.lines >= 2.5))}`);
       const file = `${name}-${state}-pl.png`;
       await page.screenshot({ path: path.join(output, file) });
       screenshots.push(`${file}: ${width}x${height}, Polish, ${state}; generated input, threshold -50 dBFS.`);
     };
     await assert.doesNotReject(() => automatic.waitFor());
-    await shot("auto-on");
+    const panelHeight = await page.locator("[data-input-mode-options]").evaluate(el => el.getBoundingClientRect().height);
+    await shot("auto-on-ns-off");
     await automatic.click();
     const slider = page.getByRole("slider", { name: "Czułość mikrofonu", exact: true });
     await slider.scrollIntoViewIfNeeded();
     await page.waitForFunction(() => Number(document.querySelector('[role="meter"]').getAttribute("aria-valuenow")) < -60 && Number(document.querySelector('[role="meter"]').getAttribute("aria-valuenow")) > -80);
     assert.ok(await meter.locator(".bg-warn").count());
-    await shot("manual-below");
+    await shot("manual-below-ns-off");
     await page.evaluate(() => window.setTestInputDb(-30));
     await page.waitForFunction(() => Number(document.querySelector('[role="meter"]').getAttribute("aria-valuenow")) > -40);
     assert.ok(await meter.locator(".bg-ok").count());
-    await shot("manual-above");
+    await shot("manual-above-ns-off");
     assert.equal(await slider.getAttribute("aria-valuenow"), "-50");
     assert.ok(Number(await meter.getAttribute("aria-valuenow")) > -40);
     assert.equal(await slider.getAttribute("aria-valuetext"), "-50 dB");
@@ -118,7 +123,23 @@ try {
     assert.equal(await slider.count(), 0);
     assert.equal(await page.getByRole("button", { name: "Testuj mikrofon", exact: true }).count(), 0);
     await page.waitForFunction(() => window.testCaptures.every(track => track.readyState === "ended"));
-    await shot("ptt");
+    assert.equal(await page.locator("[data-input-mode-options]").evaluate(el => el.getBoundingClientRect().height), panelHeight, `${name}: mode layout jump`);
+    await shot("ptt-ns-off");
+    await page.evaluate(async () => {
+      const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
+      useSettings.getState().setAudio({ inputMode: "vad", automaticSensitivity: true, noiseSuppression: true });
+    });
+    await automatic.waitFor();
+    await page.waitForFunction(() => window.testCaptures.some(track => track.readyState === "live"));
+    await page.waitForTimeout(2500);
+    await shot("auto-on-ns-on");
+    await automatic.click();
+    await shot("manual-ns-on");
+    await page.getByRole("radio", { name: "Naciśnij i mów", exact: true }).click();
+    await page.waitForFunction(() => window.testCaptures.every(track => track.readyState === "ended"));
+    assert.equal(await page.locator("[data-input-mode-options]").evaluate(el => el.getBoundingClientRect().height), panelHeight, `${name}: mode layout jump with suppression`);
+    await shot("ptt-ns-on");
+    assert.deepEqual(await page.evaluate(() => window.__micPrivacyViolations), []);
   }
   // Permission is read without capture. Only the explicit button may request access.
   await page.evaluate(async () => {
@@ -166,6 +187,8 @@ try {
     useUi.getState().setSection("home");
   });
   assert.equal(await page.evaluate(() => window.testCaptures.filter(track => track.readyState === "live").length), 0);
+  await page.waitForTimeout(0);
+  assert.deepEqual(await page.evaluate(() => window.__micPrivacyViolations), []);
   // Exercise the real worklet's output through WebAudio, including hangover and PTT.
   const levels = await page.evaluate(async () => {
     const { startInputGate } = await window.__gwarE2eImport("/src/voice/input-gate.ts");
@@ -205,6 +228,7 @@ try {
   writeFileSync(path.join(output, "screenshots.txt"), [
     `Captured ${new Date().toISOString()} from the built local web app (${url}).`,
     "No production services, real microphone, native app or user data were used.",
+    "Automatic/manual/PTT share a fixed-height control slot. Checked for horizontal overflow, three-line copy, and mode layout shifts at every width. Noise suppression on/off uses the real preview processor.",
     "The meter is measured by the app from a generated 440 Hz sine: -70 dBFS below, -30 dBFS above.",
     "Automatic retains the legacy server decision (-50 dBov, or -60 with voice activity, with a 400 ms tail). Manual screenshots use -50 dBFS.",
     "Preview capture: granted permission starts on Audio settings; PTT, mute, deafen, handover, page/tab exit, visibility and window blur stop tracks synchronously. Unknown permission waits for the explicit button.",

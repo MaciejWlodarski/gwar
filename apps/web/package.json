@@ -11,7 +11,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "e2e": "node e2e/smoke.mjs",
+    "e2e": "node --test e2e/mic-privacy.test.mjs && node e2e/smoke.mjs",
     "e2e:onboarding": "node e2e/onboarding.mjs",
     "e2e:images": "node e2e/images.mjs",
     "e2e:verification": "node e2e/verification.mjs",

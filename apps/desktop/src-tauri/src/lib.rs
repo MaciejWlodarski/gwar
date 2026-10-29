@@ -108,6 +108,7 @@ pub fn run() {
             voice::voice_set_deafened,
             voice::voice_set_ptt,
             voice::voice_set_input_mode,
+            voice::voice_set_gate_ready,
             voice::voice_set_master_gain,
             voice::voice_set_capture_options,
             voice::voice_set_slot_gain,

@@ -41,7 +41,7 @@ class Peer {
 
 const node = () => ({ connect: vi.fn(), disconnect: vi.fn() });
 const resume = vi.fn<() => Promise<void>>();
-const mediaSource = vi.fn(() => node());
+const mediaSource = vi.fn((_stream: MediaStream) => node());
 const getUserMedia = vi.fn<() => Promise<MediaStream>>();
 class Context {
   currentTime = 0;
@@ -54,8 +54,8 @@ class Context {
 }
 
 let engine: WebRtcVoiceEngine;
-const params = (offer = vi.fn(async () => "answer")): Parameters<VoiceEngine["start"]>[0] => ({
-  mode: "plaintext", iceServers: [], offer,
+const params = (offer = vi.fn(async () => "a=x-gwar-input-gate:2\r\n")): Parameters<VoiceEngine["start"]>[0] => ({
+  mode: "plaintext", iceServers: [], offer, inputGate: async () => {},
   binding: { server_key: null, session: 1, channel: 1, call: null, participation: null, group: null },
 });
 const flush = () => vi.advanceTimersByTimeAsync(0);
@@ -76,6 +76,7 @@ beforeEach(() => {
   startDenoise.mockReset().mockRejectedValue(new Error("no AudioWorklet"));
   vi.spyOn(console, "warn").mockImplementation(() => {});
   vi.stubGlobal("AudioContext", Context);
+  vi.stubGlobal("MediaStream", class { constructor(private tracks: MediaStreamTrack[]) {} getTracks() { return this.tracks; } getAudioTracks() { return this.tracks; } });
   vi.stubGlobal("RTCPeerConnection", Peer);
   vi.stubGlobal("window", { isSecureContext: true, addEventListener: vi.fn() });
   vi.stubGlobal("navigator", { mediaDevices: { getUserMedia, enumerateDevices: vi.fn(async () => []) } });
@@ -210,7 +211,8 @@ describe("browser microphone acquisition ownership", () => {
     await old;
     expect(oldMic.track.stop).toHaveBeenCalledOnce();
     expect(currentMic.track.stop).not.toHaveBeenCalled();
-    expect(mediaSource).toHaveBeenCalledExactlyOnceWith(currentMic.stream);
+    expect(mediaSource).toHaveBeenCalledTimes(1);
+    expect(mediaSource.mock.calls[0]![0].getAudioTracks()).toEqual(currentMic.stream.getAudioTracks());
     expect(Peer.all).toHaveLength(1);
     expect(Peer.all[0]!.close).not.toHaveBeenCalled();
   });
@@ -950,6 +952,21 @@ describe("local microphone preview", () => {
 });
 
 
+it("meters the gate input after suppression and retargets live when suppression changes", async () => {
+  const processed = microphone().track;
+  const model = { track: processed, running: true, setSource: vi.fn(), setActive: vi.fn(), setStrength: vi.fn(), close: vi.fn() };
+  startDenoise.mockResolvedValue(model as unknown as DenoisePipeline);
+  await engine.start(params()); await flush();
+  expect(gate().setAudio).toHaveBeenLastCalledWith(processed);
+  expect(mediaSource.mock.calls.at(-1)![0].getAudioTracks()).toEqual([processed]);
+  await engine.setCaptureOptions({ noiseSuppression: false, noiseStrength: 100, echoCancellation: true, autoGainControl: true });
+  await flush();
+  expect(model.close).toHaveBeenCalledOnce();
+  const captured = gate().setAudio.mock.calls.at(-1)![0];
+  expect(captured).not.toBe(processed);
+  expect(mediaSource.mock.calls.at(-1)![0].getAudioTracks()).toEqual([captured]);
+});
+
 describe("live server input gate control", () => {
   it("only bypasses legacy automatic detection after the matching mode acknowledgement", async () => {
     const inputGate = vi.fn(async (_client: boolean, _run: number) => {});
@@ -991,9 +1008,16 @@ describe("live server input gate control", () => {
   });
 
   it("uses the legacy server gate without sending an unknown request to older servers", async () => {
+    const support = vi.fn(); engine.on("inputGateSupport", support);
     const inputGate = vi.fn(async () => {});
-    await engine.start({ ...params(), inputGate });
+    await engine.start({ ...params(vi.fn(async () => "answer")), inputGate });
     engine.setInputSensitivity(-80); await flush();
     expect(inputGate).not.toHaveBeenCalled();
+    expect(support).toHaveBeenLastCalledWith(false);
+    expect(gate().configure).toHaveBeenLastCalledWith(expect.objectContaining({ automatic: true, blocked: false }));
+    engine.setInputMode("ptt"); engine.setPttActive(true);
+    expect(gate().configure).toHaveBeenLastCalledWith(expect.objectContaining({ blocked: true }));
+    engine.setInputMode("vad");
+    expect(gate().configure).toHaveBeenLastCalledWith(expect.objectContaining({ automatic: true, blocked: false }));
   });
 });

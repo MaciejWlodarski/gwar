@@ -128,6 +128,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   /** The model loading for a run (`runId`), cancelled when that run ends or suppression goes off. */
   private denoiseLoad: { run: number; abort: AbortController } | null = null;
   private denoiseUnavailable = false;
+  private previewDenoise: DenoisePipeline | null = null;
   /**
    * The peer's replacements of the sent track, one at a time: `sender.track` changes only once
    * one completes. One a closed peer leaves unsettled is not waited for.
@@ -138,6 +139,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private micGeneration = 0;
   private resumeBound = false;
   private micTests = new MicTests();
+  private gateSupported: boolean | null = null;
+  private meterTrack: MediaStreamTrack | null = null;
   private gateControl: { desired: boolean | null; serial: number; ready: boolean; queue: Promise<void>; apply(clientGate: boolean): Promise<void> } | null = null;
 
   constructor() {
@@ -261,6 +264,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       if (inputGate && hasInputGateControl(answer)) {
         this.gateControl = { desired: null, serial: 0, ready: false, queue: Promise.resolve(), apply: clientGate => inputGate(clientGate, mediaRun) };
       }
+      this.gateSupported = this.gateControl !== null;
+      this.emit("inputGateSupport", this.gateSupported);
       // Controls only after the server bound this run: acks name it.
       // Closing the call controller stops this run's media synchronously.
       if (sframe) keys!.attach({ run: mediaRun, control: body => sframe.control(body), close: () => { if (this.sframe === sframe) { this.runId++; this.teardownPeer(); this.setState("idle"); } } });
@@ -290,6 +295,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
   private teardownPeer(): void {
     this.gateControl = null;
+    this.gateSupported = null;
+    this.emit("inputGateSupport", null);
     // Invalidate the run's keys first, then the transport.
     this.sframe?.stop();
     this.sframe = null;
@@ -393,7 +400,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       // gate. Close that output before its detector and audio can disagree.
       if (this.denoise) previousGate?.close();
       this.denoise?.setSource(stream);
-      this.startMeter(stream);
+      this.sentTrack();
       this.emit("micError", null);
       this.applyTrackEnabled();
       const track = stream.getAudioTracks()[0];
@@ -569,7 +576,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private applyTrackEnabled(): void {
     const track = this.stream?.getAudioTracks()[0];
     if (!track) return;
-    const blocked = this.muted || this.deafened;
+    const unsupportedPtt = this.gateSupported === false && this.mode === "ptt";
+    const blocked = this.muted || this.deafened || unsupportedPtt;
     // Keep capture running below the VAD threshold so it can open the gate again.
     const enabled = !blocked && (this.mode === "vad" || this.ptt);
     track.enabled = enabled;
@@ -594,7 +602,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         this.setState("failed");
       });
     }
-    const controls = { threshold: this.threshold, ptt: this.mode === "ptt" ? this.ptt : null, blocked: blocked || (control !== null && !control.ready), automatic: this.automaticSensitivity };
+    const controls = { threshold: this.threshold, ptt: this.mode === "ptt" ? this.ptt : null, blocked: blocked || (control !== null && !control.ready), automatic: this.automaticSensitivity || this.gateSupported === false };
     this.inputGate?.configure(controls);
     this.handoverGate?.configure(controls);
     if (this.denoise) {
@@ -609,14 +617,16 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private sentTrack(): MediaStreamTrack | null {
     const captured = this.stream?.getAudioTracks()[0] ?? null;
     if (!captured || !this.inputGate) return null;
-    this.inputGate.setAudio(this.denoise?.running ? this.denoise.track : captured);
+    const processed = this.denoise?.running ? this.denoise.track : captured;
+    this.inputGate.setAudio(processed);
+    if (this.meterTrack !== processed) this.startMeter(new MediaStream([processed]));
     return this.inputGate.track;
   }
 
   /** Sends `sentTrack()`, after any replacement still in progress, as it is when that is done. */
   private updateSentTrack(): Promise<void> {
     const sender = this.micSender;
-    if (!sender) return Promise.resolve();
+    if (!sender) { this.sentTrack(); return Promise.resolve(); }
     const update = this.sentTrackUpdates.then(async () => {
       const track = this.sentTrack();
       if (this.micSender === sender && track && sender.track !== track) await sender.replaceTrack(track).catch(() => {});
@@ -691,6 +701,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   // ------------------------------------------------------------------ meter
 
   private startMeter(stream: MediaStream): void {
+    this.stopMeter();
+    this.meterTrack = stream.getAudioTracks()[0] ?? null;
     const ctx = this.ensureContext();
     this.analyser = ctx.createAnalyser();
     this.analyser.fftSize = 1024;
@@ -714,6 +726,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     this.meterTimer = null;
     this.meterSource?.disconnect();
     this.meterSource = null;
+    this.meterTrack = null;
     this.analyser = null;
     this.smoothed = 0;
     this.emit("level", 0);
@@ -739,7 +752,9 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     catch (error) { stream.getTracks().forEach(track => track.stop()); throw error; }
     try {
       void ctx.resume().catch(() => {});
-      const source = ctx.createMediaStreamSource(stream);
+      let source = ctx.createMediaStreamSource(stream);
+      let pipeline: DenoisePipeline | null = null;
+      const load = new AbortController();
       const analyser = ctx.createAnalyser();
       analyser.fftSize = 1024;
       source.connect(analyser);
@@ -755,10 +770,37 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       }, 50);
       void this.listDevices().then((d) => this.emit("devices", d));
       let stopped = false;
+      const retarget = () => {
+        if (stopped) return;
+        source.disconnect();
+        source = ctx.createMediaStreamSource(pipeline?.running ? new MediaStream([pipeline.track]) : stream);
+        source.connect(analyser);
+      };
+      if (this.capture.noiseSuppression && !this.denoiseUnavailable) {
+        void startDenoise({ changed: retarget, trouble: () => {
+          pipeline?.close();
+          if (this.previewDenoise === pipeline) this.previewDenoise = null;
+          pipeline = null;
+          if (!stopped) { void stream.getAudioTracks()[0]?.applyConstraints?.({ noiseSuppression: true }); retarget(); }
+        } }, load.signal).then(async loaded => {
+          if (stopped) { loaded.close(); return; }
+          pipeline = loaded;
+          this.previewDenoise = loaded;
+          loaded.setStrength(this.capture.noiseStrength);
+          loaded.setSource(stream);
+          loaded.setActive(true);
+          await stream.getAudioTracks()[0]?.applyConstraints?.({ noiseSuppression: false });
+          if (!stopped) retarget();
+        }).catch(() => {});
+      }
       const stop = () => {
         if (stopped) return;
         stopped = true;
         clearInterval(timer);
+        load.abort();
+        pipeline?.close();
+        if (this.previewDenoise === pipeline) this.previewDenoise = null;
+        source.disconnect();
         stream.getTracks().forEach((t) => t.stop());
         void ctx.close();
         onLevel(0);
@@ -944,6 +986,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       options.autoGainControl !== this.capture.autoGainControl;
     this.capture = options;
     this.denoise?.setStrength(options.noiseStrength);
+    this.previewDenoise?.setStrength(options.noiseStrength);
     if (!options.noiseSuppression) this.closeDenoise();
     if (changed) await this.reopenMic();
     if (this.inCall()) this.loadDenoise();

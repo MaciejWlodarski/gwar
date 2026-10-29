@@ -1,4 +1,5 @@
 import { nextMediaRun } from "./engine";
+import { hasInputGateControl } from "./sdp";
 import { MicTests } from "./mic-test";
 import { dbToLevel, inputThreshold } from "./input-sensitivity";
 export { dbToLevel } from "./input-sensitivity";
@@ -75,6 +76,10 @@ export class NativeVoiceEngine implements VoiceEngine {
   private micTests = new MicTests();
   private muted = false;
   private deafened = false;
+  private gateSupported: boolean | null = null;
+  private gateSerial = 0;
+  private gateKind = "automatic";
+  private gateQueue: Promise<void> = Promise.resolve();
 
   private inputDevice: string | null = null;
   private outputDevice: string | null = null;
@@ -120,6 +125,12 @@ export class NativeVoiceEngine implements VoiceEngine {
       .then(() => this.invoke(command, args))
       .catch((e: unknown) => console.warn(`[native voice] ${command} failed:`, e));
     return this.queue;
+  }
+
+  private sendStrict(command: string, args: Record<string, unknown>): Promise<void> {
+    const result = this.queue.then(() => this.invoke(command, args));
+    this.queue = result.catch(() => {});
+    return result;
   }
 
   private async ensureListeners(): Promise<TauriBridge> {
@@ -179,6 +190,14 @@ export class NativeVoiceEngine implements VoiceEngine {
     if (run !== this.runId || !params) return;
     try {
       const answer = await params.offer(sdp, run);
+      if (run !== this.runId || this.params !== params) return;
+      this.gateSupported = !!params.inputGate && hasInputGateControl(answer);
+      this.emit("inputGateSupport", this.gateSupported);
+      this.gateKind = this.inputMode === "ptt" ? "ptt" : this.automaticSensitivity || !this.gateSupported ? "automatic" : "manual";
+      await this.sendMode(true);
+      if (this.gateSupported) await params.inputGate!(this.gateKind !== "automatic", run);
+      if (run !== this.runId || this.params !== params) return;
+      if (!this.gateSupported && this.inputMode === "ptt") throw new VoiceError("input_mode_unsupported", "push-to-talk needs an updated server");
       this.send("voice_answer", { run, sdp: answer });
     } catch (e) {
       this.send("voice_answer", { run, error: e instanceof Error ? e.message : String(e) });
@@ -198,6 +217,10 @@ export class NativeVoiceEngine implements VoiceEngine {
     if (encrypted && (!params.keys || !server_key || !call || !participation || !group)) throw new VoiceError("unsupported", "encrypted voice needs its call binding and keys");
     const run = (this.runId = nextMediaRun());
     this.params = params;
+    this.gateSupported = null;
+    this.gateSerial = 0;
+    this.gateQueue = Promise.resolve();
+    this.emit("inputGateSupport", null);
     this.clearConnectTimer();
     this.setState("starting");
     await this.micTests.stop();
@@ -241,6 +264,8 @@ export class NativeVoiceEngine implements VoiceEngine {
     this.runId = nextMediaRun();
     const retired = this.runId;
     this.params = null;
+    this.gateSupported = null;
+    this.emit("inputGateSupport", null);
     this.clearConnectTimer();
     this.stopDevicePoll();
     this.smoothed = 0;
@@ -286,7 +311,32 @@ export class NativeVoiceEngine implements VoiceEngine {
 
   setInputMode(mode: InputMode): void {
     this.inputMode = mode;
-    this.send("voice_set_input_mode", { mode, thresholdDb: this.automaticSensitivity ? null : this.threshold });
+    const kind = mode === "ptt" ? "ptt" : this.automaticSensitivity || this.gateSupported === false ? "automatic" : "manual";
+    if (!this.params || this.gateSupported === null || kind === this.gateKind) { void this.sendMode(); return; }
+    this.gateKind = kind;
+    const run = this.runId, serial = ++this.gateSerial, params = this.params;
+    // Close before applying the local mode. A stale ack can never reopen it.
+    const closed = this.sendStrict("voice_set_gate_ready", { run, serial, ready: false });
+    const applied = this.sendMode(true);
+    this.gateQueue = this.gateQueue.then(async () => {
+      await closed; await applied;
+      if (run !== this.runId || serial !== this.gateSerial || this.params !== params) return;
+      if (this.gateSupported) await params.inputGate!(kind !== "automatic", run);
+      else if (kind === "ptt") { this.emit("micError", new VoiceError("input_mode_unsupported", "push-to-talk needs an updated server")); return; }
+      if (run === this.runId && serial === this.gateSerial && this.params === params) await this.invoke("voice_set_gate_ready", { run, serial, ready: true });
+    }).catch(error => {
+      if (run !== this.runId || this.params !== params) return;
+      console.warn("[native voice] input mode transition failed:", error);
+      this.runId = nextMediaRun();
+      this.params = null;
+      this.clearConnectTimer();
+      void this.send("voice_stop", { run });
+      this.setState("failed");
+    });
+  }
+
+  private sendMode(strict = false): Promise<void> {
+    return (strict ? this.sendStrict.bind(this) : this.send.bind(this))("voice_set_input_mode", { mode: this.inputMode, thresholdDb: this.automaticSensitivity || this.gateSupported === false ? null : this.threshold });
   }
 
   setInputSensitivity(threshold: number | null): void {

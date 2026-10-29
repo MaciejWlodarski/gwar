@@ -277,6 +277,7 @@ class Controller {
     this.screen.init();
     const e = this.engine;
     e.on("level", (level) => useVoice.getState().set({ level }));
+    e.on("inputGateSupport", (inputGateSupport) => useVoice.getState().set({ inputGateSupport }));
     e.on("state", (state) => {
       // Transport teardown/recovery cannot dismiss a refusal awaiting explicit voice entry.
       if (!this.voiceRetryAllowed) { useVoice.getState().set({ state: "failed" }); return; }
