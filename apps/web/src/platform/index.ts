@@ -36,3 +36,13 @@ export function canOpenMicrophoneSettings(): boolean {
 export async function openMicrophoneSettings(): Promise<void> {
   await (await tauri()).invoke("open_mic_privacy_settings");
 }
+
+/** Opens the screen recording privacy page in the desktop app. */
+export async function openScreenRecordingSettings(): Promise<void> {
+  await (await tauri()).invoke("open_screen_privacy_settings");
+}
+
+/** WebView2 refusal is controlled by its picker/policy; a Windows OS shortcut cannot fix it. */
+export function canOpenScreenRecordingSettings(): boolean {
+  return isDesktop() && !/iPhone|iPad/.test(navigator.userAgent) && /Macintosh|Mac OS X/.test(navigator.userAgent);
+}

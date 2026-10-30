@@ -588,7 +588,17 @@ function watchState(pc: RTCPeerConnection, report: (state: TransportState) => vo
   return () => { clearTimeout(connect); if (disconnect) clearTimeout(disconnect); };
 }
 
+/** Encoder decisions retained only while republishing the same live capture. */
+export interface EncoderFallbacks {
+  startHintUnsafe: boolean;
+  brokenCodecs: SendCodec[];
+  codecFellBack: boolean;
+  av1Retired: boolean;
+  recovery: ScreenRecovery | null;
+}
+
 export interface PublishParams {
+  fallbacks?: EncoderFallbacks;
   track: MediaStreamTrack;
   quality: ScreenSpec;
   /** The server rejected spec negotiation: retain the legacy encoder ceilings. */
@@ -678,9 +688,20 @@ export class ScreenPublisher {
     globalThis.addEventListener?.("pagehide", this.pageHide);
     this.quality = { ...params.quality };
     this.automaticMode = params.automaticMode === true;
+    if (params.fallbacks) {
+      this.startHintUnsafe = params.fallbacks.startHintUnsafe;
+      this.codecFellBack = params.fallbacks.codecFellBack;
+      this.av1Retired = params.fallbacks.av1Retired;
+      this.recovery = params.fallbacks.recovery ? { ...params.fallbacks.recovery } : null;
+      for (const codec of params.fallbacks.brokenCodecs) this.brokenCodecs.add(codec);
+    }
     const spec = this.spec();
     this.ceiling = { width: spec.width, height: spec.height, known: false };
     this.refreshSurface();
+  }
+
+  fallbacks(): EncoderFallbacks {
+    return { startHintUnsafe: this.startHintUnsafe, brokenCodecs: [...this.brokenCodecs], codecFellBack: this.codecFellBack, av1Retired: this.av1Retired, recovery: this.recovery ? { ...this.recovery } : null };
   }
 
   async start(): Promise<void> {

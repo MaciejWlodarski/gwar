@@ -12,7 +12,7 @@ import { useSettings } from "../state/settings";
 import { useSession, useUi } from "../state/stores";
 import { PasswordDialog } from "./AccountSettings";
 import { focusPage } from "./hooks";
-import { Button, Dialog } from "./kit";
+import { Button, Dialog, TopBanner } from "./kit";
 
 function useNoticeTime() {
   const [now, setNow] = useState(Date.now);
@@ -78,14 +78,14 @@ function IdentityNoticesContent() {
   return (
     <>
       {warning.level !== "none" && (
-        <div data-testid="expiry-banner" role="alert" className={mobile ? "flex shrink-0 items-center gap-2 border-b border-line bg-raised px-3 py-3 text-sm" : "flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-line bg-raised px-4 py-3 text-sm"}>
+        <TopBanner data-testid="expiry-banner" role="alert">
           <ShieldAlert className="size-4 shrink-0 text-warn" />
           <p className={mobile ? "min-w-0 flex-1 whitespace-nowrap" : "min-w-0 flex-1 basis-56"}>{warning.level === "expired" ? t(mobile ? "account.signInExpiredShort" : "account.signInExpired") : t(countKey(language, mobile ? "account.signInDaysShort" : "account.signInDays", warning.daysLeft), { count: warning.daysLeft })}</p>
           <Button size="sm" className={mobile ? "px-2!" : undefined} onClick={() => setRenewing(true)}>{t(mobile ? "account.signInShort" : "account.signInAgain")}</Button>
-        </div>
+        </TopBanner>
       )}
       {nudge && (
-        <div data-testid="identity-banner" role="status" className={mobile ? "flex shrink-0 items-center gap-1.5 border-b border-line bg-raised px-2 py-3 text-sm" : "flex shrink-0 flex-wrap items-center gap-x-3 gap-y-2 border-b border-line bg-raised px-4 py-3 text-sm"}>
+        <TopBanner data-testid="identity-banner" role="status">
           <ShieldAlert className="size-4 shrink-0 text-warn" />
           <p className={mobile ? "min-w-0 flex-1 text-[13px] whitespace-nowrap" : "min-w-0 flex-1 basis-56"}>{t(mobile ? "identity.protectTitle" : desktop ? "identity.keepIdentityDesktop" : "identity.keepIdentity")}</p>
           {mobile ? <>
@@ -96,7 +96,7 @@ function IdentityNoticesContent() {
             <Button ref={trigger} size="sm" onClick={() => openIdentityDialog("backup")}>{t("identity.exportBackup")}</Button>
             {dismissReminder}
           </div>}
-        </div>
+        </TopBanner>
       )}
       {renewing && account && <PasswordDialog title={t("account.signInAgain")} body={t("account.renewBody")} confirmLabel={t("account.signInAgain")}
         onClose={() => setRenewing(false)} onSubmit={async (password) => { await accountActions.renew(password); }} />}
