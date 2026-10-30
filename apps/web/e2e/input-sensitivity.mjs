@@ -96,7 +96,7 @@ try {
       const lines = await page.locator("section p, section label div").evaluateAll(elements => elements.map(el => ({ text: el.textContent, lines: el.getBoundingClientRect().height / parseFloat(getComputedStyle(el).lineHeight) })));
       assert.ok(lines.every(item => item.lines < 2.5), `${name}: sprawling text ${JSON.stringify(lines.filter(item => item.lines >= 2.5))}`);
       const file = `${name}-${state}-pl.png`;
-      await page.screenshot({ path: path.join(output, file) });
+      await page.screenshot({ path: path.join(output, file), animations: "disabled" });
       screenshots.push(`${file}: ${width}x${height}, Polish, ${state}; generated input, threshold -50 dBFS.`);
     };
     await assert.doesNotReject(() => automatic.waitFor());
