@@ -613,6 +613,20 @@ late, lost 3,840 samples and concealed 40 times instead of 20
 (`a_delayed_refill_over_short_packets_is_not_an_overflow`, now no cut and no
 extra PLC).
 
+A new spurt (RTP: media time jumps with wall time) or an arrival stall that finds audio still
+queued keeps it: that audio played on time, so the gap added no delay to it. Before, both
+discarded the queue: after a gated 400 ms pause behind a 440 ms backlog, the last 20 ms of the
+word went with up to 300 ms of hangover. The queue before the boundary (`resume`) now plays out, but
+its inaudible packets drop freely, as a cut drops them, and on the RTP clock the next spurt
+follows it without concealing the pause, even if its first packets swap places or another spurt
+queues behind it; the arrival estimates restart as a reset restarts them,
+and the gap is no jitter. Only an arrival gap of a second (`STALE`, `MAX_QUEUED`'s duration) or
+more still discards the queue: playout empties any queue within that, so audio left after a
+longer gap is audio the output stopped taking, over a second late, and worse than the gap. A
+stall that playout starved in still recovers as above
+(`a_spurt_or_stall_boundary_plays_the_queued_tail_unless_it_is_stale`,
+`a_long_stall_after_a_backlog_still_resyncs_to_the_target`, both clocks).
+
 A refill-stall rule that dropped the backlog at once was tried and left out.
 Refill timing alone cannot tell a paused device from late pipeline service: a
 refill serviced 110 ms late with 120 ms of speaker headroom loses no audio, yet

@@ -335,9 +335,11 @@ does (`modules/audio_coding/neteq/accelerate.cc` and `time_stretch.cc`, reimplem
 - **Pauses drain because senders gate them.** A sender sends nothing 300 ms after its voice
   stops (`HANGOVER`), so a pause longer than that arrives as missing packets, and the queue
   shrinks by each missing stretch whatever the hangover's level (room noise, or near-digital
-  silence with noise suppression on). On the RTP clock the next packet starts a new spurt; on the
-  sequence clock it is a stall recovery. Either way the backlog is gone after the first such pause,
-  with nothing cut (`gated_pauses_drain_by_their_missing_packets`).
+  silence with noise suppression on), with nothing cut. What is still queued when the next spurt
+  arrives plays out, but for its inaudible packets ([latency.md](latency.md), spurt and stall
+  boundaries); before, the new spurt (RTP) or stall recovery (sequence) discarded it, which took
+  the backlog at the first pause but also the end of a word when the missing stretch was shorter
+  than the backlog less the hangover (`gated_pauses_drain_by_their_missing_packets`).
 - **Sound without a period keeps its backlog unless it is inaudible or gated.** Noise in words
   with 40 ms gaps (gaps at about −40 dB, then about −70 dB) and speech over a constant fan (no
   noise suppression) keep their backlog (440 ms in the fixture), bounded like any continuous
@@ -351,11 +353,6 @@ does (`modules/audio_coding/neteq/accelerate.cc` and `time_stretch.cc`, reimplem
   still drains in whole periods. Noise suppression is the remedy: it takes noise and fan out
   before the encoder. The first version spliced such audio at correlations of −0.17–0.32 after
   the 2 s.
-- **Known, from before this change: a short gated pause can drop a word's end.** When the
-  missing stretch is shorter than the backlog less the hangover (a 400 ms pause after a 440 ms
-  backlog), the new spurt (RTP) or the stall recovery (sequence) discards what is still queued,
-  the last 20 ms of the word with the hangover. The jitter buffer's spurt and stall logic is
-  unchanged here; keeping the queued audio across a spurt boundary is a follow-up.
 - **A cut that removes nothing for 10 s gives up** (`BACKLOG_STUCK`) and restarts the window, so
   audio that never splices (onsets, decays) cannot hold a cut, and the gentle shrink behind it,
   for good. A block whose first search matched nothing is not searched again.
@@ -429,15 +426,17 @@ periods.
 | gain 0.005, 200 ms words, 120 ms pauses | 0 s, 200 ms cut | 0.74 s, 0 ms |
 | loud words, first and last frame at gain 0.005 | 0.30 s, 40 ms cut | 0.48 s, 0 ms |
 
-Gated pauses (200 ms words, 300 ms hangover, 440 ms backlog; both clocks alike, now): the
-backlog is gone at the first pause, and nothing is cut.
+Gated pauses (200 ms words, 300 ms hangover, 440 ms backlog; both clocks alike): the spurt
+boundary that discarded the queue against one that plays it out. Nothing is cut but inaudible
+packets.
 
-| pause, hangover | backlog gone after | words lost | hangover discarded by the spurt (RTP / sequence) |
-|---|---|---|---|
-| 500 ms, room noise at −55 dB RMS | 0.28 s | 0 | 11 / 10 packets |
-| 800 ms, room noise | 0.44 s | 0 | 0 |
-| 500 ms, digital silence (noise suppression) | 0.28 s | 0 | 11 / 10 packets |
-| 400 ms, room noise (known, above) | 0.18 s | 1 packet (20 ms) | 15 / 14 packets |
+| pause, hangover | discarded: backlog gone after, lost | played out: backlog gone after, lost |
+|---|---|---|
+| 400 ms, room noise at −55 dB RMS | 0.18 s, 16 / 15 packets (RTP / sequence), the word's last among them | 1.94 s, 0 |
+| 400 ms, digital silence (noise suppression) | 0.18 s, 16 / 15 packets, the word's last among them | 0.70 s, 0 (12 inaudible packets dropped) |
+| 500 ms, room noise | 0.28 s, 11 / 10 packets of hangover | 0.94 s, 0 |
+| 500 ms, digital silence | 0.28 s, 11 / 10 packets of hangover | 0.28 s, 0 (10 inaudible packets dropped) |
+| 800 ms, room noise | 0.44 s, 0 | 0.44 s, 0 |
 
 "Stays" holds through the 10 s measured; the cut gives up 10 s after it became due and proves
 the surplus again. Music whose lags correlate above 0.5 still drains after the 2 s.
@@ -464,9 +463,9 @@ Unit tests:
 - `quiet_talkers_lose_nothing_but_whole_periods` (150 Hz at gains 0.02 and 0.005: continuous, in
   words, and loud words with soft first and last frames, both clocks) fails on 6ebbde42, whose
   −42 dB rule cut 240 samples from the first word frame it reached and 380 ms in all.
-- `gated_pauses_drain_by_their_missing_packets` (both clocks) checks that every word packet a
-  gated sender sent is decoded, that nothing is cut, and that the backlog is gone at the first
-  500 or 800 ms pause.
+- `gated_pauses_drain_by_their_missing_packets` (both clocks) checks that every packet a gated
+  sender sent is decoded, that nothing but inaudible packets is cut (nothing at all over room
+  noise), and that the backlog is gone within five pauses of 400, 500 or 800 ms and stays gone.
 - `soft_words_lose_nothing_but_whole_periods` (a voice 20 dB softer for one second in three) and
   `soft_speech_after_a_long_pause_loses_nothing_but_whole_periods` (speech at −4.5 dB, a minute
   of silence, then speech at −37 dB with a backlog, both clocks) fail on 42d7acef, whose
