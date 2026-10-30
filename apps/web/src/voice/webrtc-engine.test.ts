@@ -1007,6 +1007,16 @@ describe("live server input gate control", () => {
     expect(Peer.all[0]!.close).toHaveBeenCalled();
   });
 
+  it("keeps output closed while server support is still unknown", async () => {
+    const answer = deferred<string>();
+    engine.setInputSensitivity(-80);
+    const starting = engine.start(params(vi.fn(() => answer.promise)));
+    await flush();
+    expect(gate().configure).toHaveBeenLastCalledWith(expect.objectContaining({ blocked: true }));
+    answer.resolve("legacy answer"); await starting;
+    expect(gate().configure).toHaveBeenLastCalledWith(expect.objectContaining({ automatic: true, blocked: false }));
+  });
+
   it("uses the legacy server gate without sending an unknown request to older servers", async () => {
     const support = vi.fn(); engine.on("inputGateSupport", support);
     const inputGate = vi.fn(async () => {});

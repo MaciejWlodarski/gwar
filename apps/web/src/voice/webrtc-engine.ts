@@ -187,6 +187,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     // Closes the old gate and drops its queued audio before the new run starts.
     this.teardownPeer();
     this.setState("starting");
+    this.applyTrackEnabled();
     await this.micTests.stop();
     if (run !== this.runId) return;
     if (encrypted && !(await encryptedVoiceSupported())) {
@@ -602,7 +603,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         this.setState("failed");
       });
     }
-    const controls = { threshold: this.threshold, ptt: this.mode === "ptt" ? this.ptt : null, blocked: blocked || (control !== null && !control.ready), automatic: this.automaticSensitivity || this.gateSupported === false };
+    const controls = { threshold: this.threshold, ptt: this.mode === "ptt" ? this.ptt : null, blocked: blocked || (this.gateSupported === null && this.inCall()) || (control !== null && !control.ready), automatic: this.automaticSensitivity || this.gateSupported === false };
     this.inputGate?.configure(controls);
     this.handoverGate?.configure(controls);
     if (this.denoise) {
