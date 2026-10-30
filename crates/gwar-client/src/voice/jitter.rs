@@ -1,7 +1,7 @@
 //! Per-slot adaptive playout, using 48 kHz RTP time or TS packet-counter time.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     time::{Duration, Instant},
 };
 
@@ -269,11 +269,11 @@ pub struct JitterBuffer {
     last_samples: u64,
     held: u64,
     recovering: Option<Recovery>,
-    /// The first packet after an arrival gap that found audio still queued (`STALE`): the queue
-    /// before it is the previous spurt's tail, which plays out, all but its inaudible packets
-    /// (`backlog_room`); on the RTP clock playout then moves on to it without concealing the
-    /// pause.
-    resume: Option<u64>,
+    /// Where audio still queued at an arrival gap ended (`STALE`), one per gap: the queue before
+    /// each is a spurt's tail, which plays out, all but its inaudible packets (`backlog_room`);
+    /// on the RTP clock playout then crosses the pause without concealing it. Any packet at or
+    /// past the end is the next spurt, however the two arrived.
+    resume: BTreeSet<u64>,
     clock: Clock,
     arrival: Option<(u64, Instant, u64)>,
     jitter: f64,
@@ -421,7 +421,7 @@ impl JitterBuffer {
             last_samples: FRAME,
             held: 0,
             recovering: None,
-            resume: None,
+            resume: BTreeSet::new(),
             clock: Clock::Rtp,
             arrival: None,
             jitter: 0.0,
@@ -476,6 +476,7 @@ impl JitterBuffer {
             // Audio still queued after an arrival gap played on time and is speech, not delay the
             // gap added: it stays (`resume`), unless the gap makes it stale.
             let tail = elapsed >= STALL && elapsed < STALE && !self.packets.is_empty() && ts > last_ts;
+            let tail_end = last_ts.saturating_add(last_samples).min(ts);
             // A real RTP pause advances media time with wall time. Delayed delivery
             // resumes with contiguous timestamps, even after a long arrival gap.
             let media_gap = ts.saturating_sub(last_ts.saturating_add(last_samples));
@@ -487,14 +488,14 @@ impl JitterBuffer {
                 // A new spurt: what the arrivals and the queue said about the delay is void.
                 if tail {
                     self.restart();
-                    self.resume = Some(ts);
+                    self.keep_tail(tail_end);
                 } else {
                     self.reset();
                 }
             } else if tail {
                 // A stall that playout never starved in added no delay: nothing is late. The
                 // arrival gap is no jitter either.
-                self.resume = Some(ts);
+                self.keep_tail(tail_end);
                 resumed = true;
             } else if clock == Clock::Sequence
                 && elapsed >= Duration::from_secs(2)
@@ -606,10 +607,18 @@ impl JitterBuffer {
         self.missing = 0;
         self.last_samples = FRAME;
         self.held = 0;
-        self.resume = None;
+        self.resume.clear();
         self.skipped = false;
         self.overflowed = false;
         self.restart();
+    }
+
+    /// Mark the end of the queued tail. Ends behind the queue's head mark nothing any more.
+    fn keep_tail(&mut self, end: u64) {
+        if let Some((&head, _)) = self.packets.first_key_value() {
+            self.resume.retain(|&kept| kept >= head);
+        }
+        self.resume.insert(end);
     }
 
     /// Forget what the arrivals and the queue said about the delay, but keep the queue.
@@ -1006,7 +1015,7 @@ impl JitterBuffer {
             return false;
         };
         // A spurt's tail drops its silence freely, as the reset before it dropped the whole tail.
-        self.resume.is_some_and(|resume| next < resume)
+        self.resume.last().is_some_and(|&end| next < end)
             || self.backlog_due.is_some() && self.recovering.is_none() && packet.samples <= self.backlog_excess()
     }
 
@@ -1085,7 +1094,7 @@ impl JitterBuffer {
             // Head-hold PLC is credit for a gap subsequently proven lost. A packet
             // at the held head was merely late and may still buy a frame of depth.
             // Past a spurt's tail (all played, or lost) the next spurt follows without the pause.
-            let tail_done = self.resume.is_some_and(|resume| ts >= resume);
+            let tail_done = self.resume.range(next..=ts).next().is_some();
             let covered = if self.missing >= MAX_CONCEAL || tail_done { ts - next } else { (ts - next).min(self.held) };
             next += covered;
             self.held = self.held.saturating_sub(covered);
@@ -1094,9 +1103,7 @@ impl JitterBuffer {
         let available = self.depth().1.saturating_sub(demand as u64 + SAFETY);
         let held = self.above_since.map_or(Duration::ZERO, |at| now.saturating_duration_since(at));
         if let Some(packet) = self.packets.remove(&next) {
-            if self.resume.is_some_and(|resume| next >= resume) {
-                self.resume = None;
-            }
+            self.resume.retain(|&end| end > next);
             self.next = Some(next.saturating_add(packet.step));
             if self.recovering.as_ref().is_some_and(|r| next.saturating_add(packet.step) >= r.before) {
                 self.recovering = None;
@@ -1439,6 +1446,56 @@ mod tests {
             assert!(after.windows(2).all(|w| w[0] < 100 || w[1] == w[0] + 1), "{clock:?}: {after:?}");
             assert!(queued[5..].iter().all(|&q| q <= 2 * FRAME), "{clock:?}: {queued:?}");
         }
+    }
+
+    /// Play 20 ms per 20 ms while `arrivals` (at ms, timestamp, label) come in after 900 ms or
+    /// less queued at once (`queued`, labels 0..): the labels played and the concealments
+    /// before the last of them.
+    fn spurts(queued: u64, arrivals: &[(u64, u64, u8)]) -> (Vec<u8>, usize) {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut jb = JitterBuffer::new();
+        for i in 0..queued {
+            jb.push_at(i * FRAME, FRAME, vec![i as u8], at(0), Clock::Rtp);
+        }
+        let mut played = Vec::new();
+        for ms in (0..2000).step_by(20) {
+            for &(_, ts, label) in arrivals.iter().filter(|a| a.0 == ms) {
+                jb.push_at(ts, FRAME, vec![label], at(ms), Clock::Rtp);
+            }
+            played.push(match jb.pop_for(at(ms), FRAME as usize) {
+                Playout::Packet { data, .. } => Some(data[0]),
+                _ => None,
+            });
+        }
+        let last = played.iter().rposition(Option::is_some).unwrap();
+        let concealed = played[..last].iter().filter(|p| p.is_none()).count();
+        (played.into_iter().flatten().collect(), concealed)
+    }
+
+    #[test]
+    fn a_second_spurt_keeps_the_boundary_of_the_first() {
+        // Two gated gaps of 100 ms behind 900 ms of audio: the second spurt arrives while the
+        // first is still queued, and playout crosses both pauses without concealing either.
+        let first = 45 * FRAME + 100 * 48;
+        let second = first + 5 * FRAME + 100 * 48;
+        let mut arrivals: Vec<_> = (0..5).map(|j| (100 + j * 20, first + j * FRAME, 100 + j as u8)).collect();
+        arrivals.extend((0..20).map(|j| (300 + j * 20, second + j * FRAME, 120 + j as u8)));
+        let (played, concealed) = spurts(45, &arrivals);
+        let expected: Vec<u8> = (0..45).chain(100..105).chain(120..140).collect();
+        assert_eq!((played, concealed), (expected, 0));
+    }
+
+    #[test]
+    fn a_reordered_spurt_start_crosses_the_boundary() {
+        // The first two packets of the next spurt swap places: the one that arrives second is
+        // past the queued tail all the same, so the pause is not concealed before it.
+        let first = 22 * FRAME + 100 * 48;
+        let mut arrivals = vec![(100, first + FRAME, 101), (100, first, 100)];
+        arrivals.extend((2..20).map(|j| (100 + j * 20, first + j * FRAME, 100 + j as u8)));
+        let (played, concealed) = spurts(22, &arrivals);
+        let expected: Vec<u8> = (0..22).chain(100..120).collect();
+        assert_eq!((played, concealed), (expected, 0));
     }
 
     #[test]

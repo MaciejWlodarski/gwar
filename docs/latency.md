@@ -618,7 +618,8 @@ queued keeps it: that audio played on time, so the gap added no delay to it. Bef
 discarded the queue: after a gated 400 ms pause behind a 440 ms backlog, the last 20 ms of the
 word went with up to 300 ms of hangover. The queue before the boundary (`resume`) now plays out, but
 its inaudible packets drop freely, as a cut drops them, and on the RTP clock the next spurt
-follows it without concealing the pause; the arrival estimates restart as a reset restarts them,
+follows it without concealing the pause, even if its first packets swap places or another spurt
+queues behind it; the arrival estimates restart as a reset restarts them,
 and the gap is no jitter. Only an arrival gap of a second (`STALE`, `MAX_QUEUED`'s duration) or
 more still discards the queue: playout empties any queue within that, so audio left after a
 longer gap is audio the output stopped taking, over a second late, and worse than the gap. A
