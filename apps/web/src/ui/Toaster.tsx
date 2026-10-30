@@ -1,6 +1,9 @@
 import { AlertCircle, CheckCircle2, Info, X } from "lucide-react";
 import { useEffect, useRef } from "react";
 import { useT } from "../i18n";
+import { cn } from "../lib/cn";
+import { useIsMobile } from "../lib/media";
+import { CongestionNotice } from "./ConnectionQuality";
 import { toastTimer } from "../lib/toast-timer";
 import { useUi, type Toast } from "../state/stores";
 
@@ -60,8 +63,12 @@ function ToastItem({ toast: x }: { toast: Toast }) {
 
 export function Toaster() {
   const toasts = useUi((s) => s.toasts);
+  const isMobile = useIsMobile();
   return (
-    <div aria-live="polite" className="pointer-events-none fixed inset-x-0 bottom-[calc(9rem+env(safe-area-inset-bottom))] z-[200] flex max-h-[70dvh] flex-col items-center gap-2 overflow-y-auto px-4 md:inset-x-auto md:right-4 md:bottom-4 md:w-[416px] md:items-end">
+    // One stack keeps the congestion notice and session notices from overlapping.
+    // Phones: keep it at the top, clear of the call controls and bottom tabs.
+    <div aria-live="polite" className={cn("pointer-events-none fixed inset-x-0 z-[200] flex max-h-[70dvh] flex-col items-center gap-2 overflow-y-auto px-4 md:inset-x-auto md:right-4 md:w-[416px] md:items-end", isMobile ? "top-3" : "bottom-4")}>
+      <CongestionNotice />
       {toasts.map((x) => <ToastItem key={x.id} toast={x} />)}
     </div>
   );

@@ -28,6 +28,7 @@ import { useScreen } from "./state/screen";
 import { Sidebar } from "./ui/Sidebar";
 import { IdentityNotices } from "./ui/IdentityNotices";
 import { Toaster } from "./ui/Toaster";
+import { ConnectionDetails } from "./ui/ConnectionQuality";
 
 export function App() {
   const isMobile = useIsMobile();
@@ -144,6 +145,7 @@ export function App() {
       {isMobile && <MoreSheet />}
       <Dialogs />
       {showApp && <SharePresetDialog />}
+      {showApp && <ConnectionDetails />}
       <Toaster />
     </TooltipProvider>
   );

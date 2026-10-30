@@ -8,8 +8,10 @@ import { ScreenController } from "./screen-controller";
 import { initialScreen, useScreen } from "./screen";
 import { useSession, useUi } from "./stores";
 import { useSettings } from "./settings";
+import { useUplink } from "./uplink";
 
 interface PublisherOptions {
+  uplink?(status: import("../voice/uplink-congestion").UplinkStatus | null): void;
   ended(): void;
   fallbacks?: import("../voice/screen").EncoderFallbacks;
   quality: ScreenSpec; legacy: boolean; automaticMode: boolean;
@@ -874,6 +876,39 @@ describe("sharing", () => {
     expect(useScreen.getState().notice).toBeNull();
     screen.reset();
     expect(track.stop).toHaveBeenCalledOnce();
+  });
+
+  it.each(["signalling", "media"])("retires %s uplink measurements while retaining capture, and fences old callbacks after republishing", async loss => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    let starts = 0;
+    const { link } = fakeLink({ "screen.start": () => ({ share: `M${++starts}` }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String), track = choosing();
+    await screen.confirmShare();
+    screen.handleEvent({ ev: "screen.started", d: share("M1", 1, 1) });
+    const stream = useScreen.getState().own!.stream;
+    const old = media.publishers[0]!;
+    const bloated = { congested: true, rttMs: 480, baselineMs: 20, availableOutgoingBitrate: null };
+    old.params.uplink!(bloated);
+    expect(useUplink.getState().screen).toBe(bloated);
+    if (loss === "signalling") screen.suspend();
+    else old.params.state("failed");
+    expect(useScreen.getState().own).toMatchObject({ phase: "reconnecting", stream });
+    expect(track.stop).not.toHaveBeenCalled();
+    expect(useUplink.getState().screen).toBeNull();
+    old.params.uplink!(bloated);
+    expect(useUplink.getState().screen).toBeNull();
+    if (loss === "signalling") screen.resume();
+    else screen.handleEvent({ ev: "screen.stopped", d: { share: "M1", reason: "transport" } });
+    await flush();
+    expect(media.publishers).toHaveLength(2);
+    expect(useScreen.getState().own?.stream).toBe(stream);
+    const fresh = { ...bloated, congested: false, rttMs: 20 };
+    media.publishers[1]!.params.uplink!(fresh);
+    old.params.uplink!(null);
+    old.params.uplink!(bloated);
+    expect(useUplink.getState().screen).toBe(fresh);
+    screen.reset();
+    expect(useUplink.getState().screen).toBeNull();
   });
 
   it("waits for voice rejoin after Welcome before republishing", async () => {

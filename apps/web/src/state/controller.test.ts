@@ -43,6 +43,9 @@ class FakeLink implements Link {
   private eventHandlers: Array<(e: Event) => void> = [];
   private statusHandlers: Array<(s: ConnectionStatus) => void> = [];
   failing = new Set<string>();
+  private rttHandlers: Array<(ms: number) => void> = [];
+  onRtt(h: (ms: number) => void) { this.rttHandlers.push(h); return () => {}; }
+  rtt(ms: number) { for (const h of this.rttHandlers) h(ms); }
 
   onStatus(h: (s: ConnectionStatus) => void) {
     this.statusHandlers.push(h);
@@ -84,6 +87,7 @@ class FakeLink implements Link {
   }
 }
 
+const engineHandlers = new Map<string, (value: unknown) => void>();
 function fakeEngine() {
   const listeners = new Map<string, unknown>();
   const engine = {
@@ -103,7 +107,11 @@ function fakeEngine() {
     setSlotOwner: vi.fn(),
     listDevices: vi.fn(async () => ({ inputs: [], outputs: [] })),
     startMicTest: vi.fn(async () => () => {}),
-    on: vi.fn((event: string, listener: unknown) => { listeners.set(event, listener); return () => listeners.delete(event); }),
+    on: vi.fn((event: string, handler: (value: never) => void) => {
+      listeners.set(event, handler);
+      engineHandlers.set(event, handler as (value: unknown) => void);
+      return () => { listeners.delete(event); engineHandlers.delete(event); };
+    }),
     emitState: (state: VoiceState) => (listeners.get("state") as (state: VoiceState) => void)(state),
   };
   return engine satisfies VoiceEngine;
@@ -616,6 +624,27 @@ describe("session resilience", () => {
     expect(stores.useVoice.getState().failure).toBeNull();
   });
 
+  it.each([false, true])("clears stale voice congestion on a refused engine callback (native %s)", async native => {
+    const { VoiceError } = await import("../voice/engine");
+    const { useUplink } = await import("./uplink");
+    engine.start.mockRejectedValue(new VoiceError("insecure", "permanent refusal"));
+    connectFake({ channel: 1 }); await vi.advanceTimersByTimeAsync(0);
+    const reason = stores.useVoice.getState().failure;
+    expect(reason).not.toBeNull();
+    const status = { congested: true, rttMs: 480, baselineMs: 20, availableOutgoingBitrate: null };
+    useUplink.setState({ voice: status, screen: null });
+    const originalWindow = window;
+    const win: { __TAURI_INTERNALS__?: object; location: object } = { location: { protocol: "http:", hostname: "localhost", port: "5173" } };
+    if (native) win.__TAURI_INTERNALS__ = {};
+    vi.stubGlobal("window", win);
+    try {
+      engine.emitState("connected");
+      expect(stores.useVoice.getState()).toMatchObject({ state: "failed", failure: reason });
+      expect(useUplink.getState().voice).toBeNull();
+      expect(useUplink.getState().notice).toBeNull();
+    } finally { vi.stubGlobal("window", originalWindow); }
+  });
+
   it("a browser unable to encrypt stays unavailable, with a reason and no automatic retry", async () => {
     engine.capabilities.encryptedVoice = async () => false;
     connectFake({ channel: 2, encrypted: [2] }); await vi.advanceTimersByTimeAsync(0);
@@ -947,10 +976,12 @@ describe("staying on the server without voice", () => {
       await vi.advanceTimersByTimeAsync(60_000);
       const notices = stores.useUi.getState().toasts.filter(t => t.key === "voice-closed");
       expect(notices).toHaveLength(1);
-      expect(notices[0]).toMatchObject({ kind: "error", text: "The voice connection was closed. Reconnecting…", sticky: true, action: { label: "Retry" } });
+      expect(notices[0]).toMatchObject({ kind: "error", text: "The voice connection was closed. Reconnecting…", sticky: true });
+      expect(notices[0]!.action).toBeUndefined();
+      expect(notices[0]!.details).toBeUndefined();
       expect(engine.start).toHaveBeenCalledTimes(6);
       engine.start.mockImplementation(async () => engine.emitState("connected"));
-      notices[0]!.action!.run();
+      controller.retryVoice(); // The panel owns retry-now while recovery is automatic.
       await vi.advanceTimersByTimeAsync(10);
       expect(engine.start).toHaveBeenCalledTimes(7);
       expect(stores.useUi.getState().toasts.some(t => t.key === "voice-closed")).toBe(false);
@@ -2171,6 +2202,15 @@ it("a teardown that resumes after a newer connect leaves that connection alone",
   c.conn = link;
 });
 
+it("a teardown closes the connection details, which describe that connection", async () => {
+  connectFake();
+  const { useUplink } = await import("./uplink");
+  useUplink.setState({ details: true });
+  await (controller as unknown as { teardown(): Promise<void> }).teardown();
+  expect(useUplink.getState().details).toBe(false);
+  (controller as unknown as { conn: unknown }).conn = link;
+});
+
 it("S2 terminal teardown clears session notices but a stale teardown preserves a newer session notice", async () => {
   connectFake({ channel: 1 });
   await vi.advanceTimersByTimeAsync(10);
@@ -2369,5 +2409,93 @@ describe("accepting a changed server key", () => {
       await expect(serverPins.commit(endpoint, third)).rejects.toBeInstanceOf(ServerIdentityChanged);
       expect(connect).toHaveBeenCalledWith(expect.objectContaining({ inviteServerKey: accepted, replaceServerKey: old }), { remember: false });
     } finally { get.mockRestore(); update.mockRestore(); connect.mockRestore(); }
+  });
+});
+
+
+describe("server ping seed for WebRTC floors", () => {
+  it("tracks the lowest and latest Gwar server ping and resets on welcome and teardown", async () => {
+    const { currentServerPing } = await import("../voice/uplink-congestion");
+    connectFake();
+    expect(currentServerPing()).toBeNull();
+    for (const ms of [40, 25, 0, 60]) link.rtt(ms);
+    expect(currentServerPing()).toEqual({ floorMs: 25, latestMs: 60, elevated: 0 });
+    // A resync is a new session, possibly over another path.
+    link.welcomeNow(welcome(), true);
+    expect(currentServerPing()).toBeNull();
+    link.rtt(30);
+    expect(currentServerPing()).toEqual({ floorMs: 30, latestMs: 30, elevated: 0 });
+    await controller.disconnect(true);
+    expect(currentServerPing()).toBeNull();
+    // A closed connection's late pong is ignored.
+    link.rtt(10);
+    expect(currentServerPing()).toBeNull();
+  });
+
+  it("ignores TeamSpeak pings: they do not reach the SFU's host", async () => {
+    const { currentServerPing } = await import("../voice/uplink-congestion");
+    connectFake({ kind: "teamspeak" });
+    link.rtt(30);
+    expect(currentServerPing()).toBeNull();
+    expect(session().rtt).toBe(30);
+  });
+});
+
+describe("native voice uplink fallback", () => {
+  const voiceState = (state: string) => engineHandlers.get("state")!(state);
+
+  it("waits for a fresh connected ping, resets across calls, and expires without losing the floor", async () => {
+    vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+    const { useUplink } = await import("./uplink");
+    connectFake();
+    await vi.advanceTimersByTimeAsync(10);
+    const win: { __TAURI_INTERNALS__?: object; location: object } = { __TAURI_INTERNALS__: {}, location: { protocol: "http:", hostname: "localhost", port: "5173" } };
+    vi.stubGlobal("window", win);
+    const ping = async (ms: number) => { await vi.advanceTimersByTimeAsync(10000); link.rtt(ms); };
+    try {
+      link.rtt(20); await ping(20);
+      // The upload saturates before the user joins voice.
+      await ping(480); await ping(480);
+      expect(useUplink.getState().voice).toBeNull();
+      await ping(480);
+      expect(useUplink.getState().voice).toBeNull();
+      voiceState("connected");
+      expect(useUplink.getState().voice).toBeNull();
+      await ping(480);
+      expect(useUplink.getState().voice).toMatchObject({ congested: true, rttMs: 480, baselineMs: 20 });
+      voiceState("starting");
+      expect(useUplink.getState().voice).toBeNull();
+      voiceState("connected");
+      expect(useUplink.getState().voice).toBeNull();
+      link.rtt(20);
+      await ping(480); await ping(480); await ping(480);
+      expect(useUplink.getState().voice?.congested).toBe(true);
+      await vi.advanceTimersByTimeAsync(25000);
+      expect(useUplink.getState().voice).toBeNull();
+      // A silent gap (two lost pings) drops the verdict, not the healthy floor.
+      await vi.advanceTimersByTimeAsync(5000); link.rtt(480);
+      expect(useUplink.getState().voice).toMatchObject({ congested: false, baselineMs: 20 });
+      await ping(480); await ping(480);
+      expect(useUplink.getState().voice?.congested).toBe(true);
+      await controller.disconnect(true);
+      link.rtt(900);
+      expect(useUplink.getState().voice).toBeNull();
+    } finally { delete win.__TAURI_INTERNALS__; voiceState("idle"); }
+  });
+
+  it("does not warn for one or two stalled pings", async () => {
+    vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+    const { useUplink } = await import("./uplink");
+    connectFake();
+    const win: { __TAURI_INTERNALS__?: object; location: object } = { __TAURI_INTERNALS__: {}, location: { protocol: "http:", hostname: "localhost", port: "5173" } };
+    vi.stubGlobal("window", win);
+    try {
+      voiceState("connected");
+      for (const ms of [20, 20, 900, 20, 600, 600, 20]) {
+        link.rtt(ms);
+        expect(useUplink.getState().voice?.congested).toBe(false);
+        await vi.advanceTimersByTimeAsync(10000);
+      }
+    } finally { delete win.__TAURI_INTERNALS__; voiceState("idle"); }
   });
 });

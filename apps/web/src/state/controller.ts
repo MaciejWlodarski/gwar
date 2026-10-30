@@ -1,3 +1,5 @@
+import { noteServerPing, PING_UPLINK, resetServerPing, UplinkCongestion, type UplinkStatus } from "../voice/uplink-congestion";
+import { useUplink, voiceConnectionActive } from "./uplink";
 import { claimAll, claimableIdentities, offerClaims } from "./ts-claim";
 import { permissionsOf } from "../lib/permissions";
 import { channelPermissions } from "../lib/channel-permissions";
@@ -240,6 +242,14 @@ class Controller {
   private pendingVoiceEntry: { conn: Link; channel: number; intent?: UpdateVoiceResume } | null = null;
   private voiceRetryChannel: number | null = null;
   private voiceRun = 0;
+  // Native voice has no WebRTC stats IPC. Its existing 10 s server ping is a
+  // slower, direction-agnostic fallback; it never borrows the screen baseline.
+  // It learns for the whole online session, so a call that starts congested
+  // still has a floor, and shows only during a connected call.
+  private nativeUplink = new UplinkCongestion(PING_UPLINK);
+  private nativeUplinkStatus: UplinkStatus | null = null;
+  private nativeUplinkExpiry: ReturnType<typeof setTimeout> | null = null;
+
   private initialised = false;
   private loadingOlder = false;
   /** Password channels I have entered during this session: their chat is readable. */
@@ -260,6 +270,24 @@ class Controller {
     this.engine = createVoiceEngine();
   }
 
+  private resetNativeUplink(resetPing = true): void {
+    this.nativeUplink.reset();
+    if (resetPing) resetServerPing();
+    this.setNativeUplink(null);
+  }
+
+  /** Expiry hides stale evidence; the detector itself keeps its floor across the gap. */
+  private setNativeUplink(status: UplinkStatus | null): void {
+    if (this.nativeUplinkExpiry) clearTimeout(this.nativeUplinkExpiry);
+    this.nativeUplinkExpiry = status ? setTimeout(() => this.setNativeUplink(null), 25_000) : null;
+    this.nativeUplinkStatus = status;
+    this.showNativeUplink();
+  }
+
+  private showNativeUplink(): void {
+    if (isDesktop()) useUplink.setState({ voice: voiceConnectionActive() ? this.nativeUplinkStatus : null });
+  }
+
   /** Swap in another engine (desktop) before the first connect. */
   useEngine(engine: VoiceEngine): void {
     this.engine = engine;
@@ -277,12 +305,21 @@ class Controller {
     this.screen.init();
     const e = this.engine;
     e.on("level", (level) => useVoice.getState().set({ level }));
+    e.on("uplink", voice => useUplink.setState({ voice }));
     e.on("state", (state) => {
       // Transport teardown/recovery cannot dismiss a refusal awaiting explicit voice entry.
-      if (!this.voiceRetryAllowed) { useVoice.getState().set({ state: "failed" }); return; }
+      if (!this.voiceRetryAllowed) {
+        useVoice.getState().set({ state: "failed" });
+        useUplink.setState({ voice: null });
+        this.resetNativeUplink(false);
+        return;
+      }
       useVoice.getState().set({ state });
+      if (state !== "connected") this.resetNativeUplink(false);
       if (state === "failed") this.scheduleVoiceRetry();
       if (state === "connected") {
+        // Wait for a fresh ping; the cached verdict belongs to the previous call.
+        this.setNativeUplink(null);
         this.voiceRetries = 0;
         this.voiceErrorShown = false;
         if (this.voiceRetry) clearTimeout(this.voiceRetry);
@@ -795,11 +832,17 @@ class Controller {
     const session = useSession.getState();
     this.voiceAutoStart = params !== this.coldStartParams || params == null;
     session.setRtt(null);
+    this.resetNativeUplink();
     conn.onRtt?.((ms) => {
-      if (this.conn === conn) session.setRtt(Math.round(ms));
+      if (this.conn !== conn) return;
+      session.setRtt(Math.round(ms));
+      if (useSession.getState().kind !== "gwar" || useSession.getState().phase !== "online") return;
+      noteServerPing(ms);
+      if (isDesktop()) this.setNativeUplink(this.nativeUplink.observe(performance.now(), { path: "native-server-ping", rttMs: ms }));
     });
     conn.onWelcome((welcome, resync) => {
       if (this.conn !== conn) return;
+      this.resetNativeUplink();
       if (params) this.rememberConnection(params, welcome.server.name);
       // A resync retires transports while capture and viewing intent survive.
       if (resync) this.screen.suspend();
@@ -989,6 +1032,9 @@ class Controller {
   }
 
   private async teardown(): Promise<void> {
+    this.resetNativeUplink();
+    // The details describe this connection; after it ends they would show stale or empty numbers.
+    useUplink.setState({ details: false });
     this.pendingVoiceEntry = null;
     // Approvals and prompts of the manager list belong to one connection to one server.
     this.grantedByMe.clear(); this.askedManagers.clear(); this.lastRenewal = 0;
@@ -1196,7 +1242,8 @@ class Controller {
     this.voiceRetry = null;
     this.voiceRetries = 0;
     this.voiceErrorShown = false;
-    useVoice.getState().set({ reconnecting: false, ...(this.voiceRetryAllowed ? { failure: null } : {}) });
+    useVoice.getState().set({ state: this.voiceRetryAllowed ? "idle" : "failed", reconnecting: false, ...(this.voiceRetryAllowed ? { failure: null } : {}) });
+    this.resetNativeUplink(false);
     // Leaving, moving or losing the session discards the call's pin and state.
     this.endVoiceCall();
     await this.engine.stop();
@@ -1329,6 +1376,7 @@ class Controller {
     // A late transport-close event cannot erase a permanent refusal awaiting manual Retry.
     if (retry && !this.voiceRetryAllowed) return;
     useVoice.getState().set({ state: "failed", failure: retry ? null : message });
+    this.resetNativeUplink(false);
     if (retry) this.scheduleVoiceRetry();
     else {
       this.pendingVoiceEntry = null;
@@ -1342,7 +1390,7 @@ class Controller {
     }
     if (this.voiceErrorShown) return;
     this.voiceErrorShown = true;
-    useUi.getState().toast("error", message, { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
+    useUi.getState().toast("error", message, { key: "voice-closed", sticky: true });
   }
 
   async retryMic(): Promise<void> {
