@@ -777,8 +777,8 @@ impl Core {
             }
             CoreMsg::Guest(msg) => self.guest_msg(msg),
             CoreMsg::ResumeGuests => self.resume_guests(),
-            CoreMsg::Screen(ScreenSignal::Paused { session, run, grant, reason }) => {
-                self.screen_paused(session, run, &grant, Some(reason))
+            CoreMsg::Screen(ScreenSignal::Paused { session, run, grant, reason, waiting }) => {
+                self.screen_paused(session, run, &grant, Some(reason), waiting)
             }
             CoreMsg::Screen(ScreenSignal::Keyframe { session, run, slot, generation, grant }) => {
                 self.screen_decode_keyframe(session, run, slot, generation, &grant)
@@ -788,7 +788,7 @@ impl Core {
                 self.screen_incompatible(session, run, &grant);
             }
             CoreMsg::Screen(ScreenSignal::Resumed { session, run, grant }) => {
-                self.screen_paused(session, run, &grant, None)
+                self.screen_paused(session, run, &grant, None, false)
             }
             CoreMsg::Egress(reading) => {
                 let shared = egress::screen_bytes(&self.screen_shared);
@@ -1903,6 +1903,9 @@ impl Core {
             Request::TokenCreate { group } => self.token_create(session, group),
             Request::TokenRedeem { token } => self.token_redeem(session, &token),
             Request::VoiceOffer(offer) => return self.voice_offer(session, id, offer),
+            Request::VoiceInputGate { binding, client_gate } => {
+                return self.voice_input_gate(session, id, binding, client_gate);
+            }
             Request::VoiceState {} => Ok(Response::VoiceState { voice: self.voice_state(session) }),
             Request::VoiceEpochAck(r) => self.voice_epoch(session, r, false),
             Request::VoiceEpochRepeat(r) => self.voice_epoch(session, r, true),

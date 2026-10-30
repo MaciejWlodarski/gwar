@@ -8,6 +8,7 @@
  *
  * A browser without RTCRtpScriptTransform is reported as an unrun check, not a pass.
  */
+import { chooseFirstRunName } from "./first-run.mjs";
 import { stopProcesses } from "./processes.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -73,6 +74,7 @@ function devicePatch(frequency) {
     oscillator.frequency.value = frequency;
     const gain = context.createGain();
     gain.gain.value = 0.3;
+    window.setInputDb = db => { gain.gain.value = Math.SQRT2 * 10 ** (db / 20); };
     const destination = context.createMediaStreamDestination();
     oscillator.connect(gain).connect(destination);
     oscillator.start();
@@ -83,8 +85,8 @@ function devicePatch(frequency) {
 }
 
 /** Energy of one frequency in the receiver's speaker output (0..1 of all energy). */
-async function tone(page, frequency) {
-  return page.evaluate(frequency => {
+async function tone(page, frequency, floor = 0.002) {
+  return page.evaluate(({ frequency, floor }) => {
     const analyser = window.__outputs.at(-1);
     if (!analyser) return 0;
     const pcm = new Float32Array(analyser.fftSize);
@@ -97,8 +99,8 @@ async function tone(page, frequency) {
       cosine += pcm[i] * Math.cos(phase);
     }
     const rms = Math.sqrt(energy / pcm.length);
-    return rms < 0.002 ? 0 : 2 * (sine * sine + cosine * cosine) / (pcm.length * energy);
-  }, frequency);
+    return rms < floor ? 0 : 2 * (sine * sine + cosine * cosine) / (pcm.length * energy);
+  }, { frequency, floor });
 }
 const hears = async (page, frequency) => (await tone(page, frequency)) > 0.05;
 
@@ -118,6 +120,7 @@ async function device(browser, web, server, name, frequency) {
   page.on("pageerror", e => page.errors.push(String(e)));
   page.on("console", m => { if (m.type() === "warning" || m.type() === "error") page.errors.push(m.text()); });
   await page.goto(web);
+  await chooseFirstRunName(page, name);
   await page.getByLabel("Server address").fill(server);
   await page.getByRole("button", { name: "Settings", exact: true }).first().click();
   await page.getByRole("tab", { name: "Identity", exact: true }).click();
@@ -237,6 +240,41 @@ async function run(engine, web, server, token) {
     await join(alice, plain); await join(carol, plain);
     await waitFor(() => hears(carol, 440), "plaintext control: carol hears alice", 20_000);
     assert.equal((await voice(alice)).encryption, null);
+
+    // Real live gate controls: keep one peer, honor quiet manual/PTT audio, then
+    // restore the exact automatic server gate without carrying manual's tail.
+    const peers = await alice.evaluate(() => window.__pcs.length);
+    await alice.evaluate(async () => {
+      window.setInputDb(-70);
+      const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
+      useSettings.getState().setAudio({ automaticSensitivity: false, vadThreshold: -80 });
+    });
+    await sleep(1200);
+    assert.ok(await tone(carol, 440, 0.00002) > 0.25, "quiet manual audio reaches the receiver after the legacy tail has expired");
+    await alice.evaluate(async () => {
+      const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
+      useSettings.getState().setAudio({ automaticSensitivity: true });
+    });
+    await sleep(1200);
+    assert.equal(await tone(carol, 440, 0.00002), 0, "automatic no longer bypasses its legacy processed-audio criterion");
+    await alice.evaluate(async () => {
+      const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
+      const { controller } = await window.__gwarE2eImport("/src/state/controller.ts");
+      useSettings.getState().setAudio({ inputMode: "ptt" });
+      controller.voice.setPttActive(true);
+    });
+    await sleep(1200);
+    assert.ok(await tone(carol, 440, 0.00002) > 0.25, "PTT bypasses the automatic gate");
+    await alice.evaluate(async () => {
+      const { useSettings } = await window.__gwarE2eImport("/src/state/settings.ts");
+      const { controller } = await window.__gwarE2eImport("/src/state/controller.ts");
+      controller.voice.setPttActive(false);
+      useSettings.getState().setAudio({ inputMode: "vad" });
+      window.setInputDb(-30);
+    });
+    await waitFor(() => hears(carol, 440), "automatic speech resumes after manual and PTT", 20_000);
+    assert.equal(await alice.evaluate(() => window.__pcs.length), peers, "mode changes do not restart voice");
+
 
     const errors = [alice, bob, carol].flatMap(p => p.errors.filter(e => !/Conversation synchronization|favicon|Failed to load resource/.test(e)).map(e => `${p.deviceName}: ${e}`));
     results.push({ engine, status: "pass", timings, errors });

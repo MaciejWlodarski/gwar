@@ -2,7 +2,7 @@
 
 Settings → Sounds (`Dźwięki` in Polish) has a master switch, an independent
 volume slider, a switch for every event, and a preview beside each switch.
-Everything defaults on, at 60% cue volume. Settings version 3 migrates earlier
+Everything defaults on, at 60% cue volume. Settings version 6 migrates earlier
 preferences automatically; see [data migrations](data-migrations.md).
 
 ## Original score
@@ -54,6 +54,8 @@ The exporter, browser player, and Rust player use the same score and envelope.
 - A peer starting a share in your voice channel sounds. Your share ending
   through capture/encoder/transport failure or a server stop sounds; stopping
   it in Gwar, cancelling the picker, and deliberately leaving voice do not.
+  A retained share recovering across a reconnect stays silent; a terminal recovery
+  failure sounds once.
 
 Activity shares one 750 ms budget, so a room filling up produces one cue.
 Control feedback has its own 100 ms budget. Self join/leave, previews, and
@@ -84,7 +86,9 @@ gets the same reference that the selected voice output plays. It does not open
 a second device or restart the call. A bounded pending list uses `try_lock` in
 the audio pipeline. Outside calls, bounded output-only workers play on the
 saved output device without opening the microphone. Starting voice, replacing the
-webview owner, or changing the output retires earlier idle cues. Cues requested
+webview owner, or changing the output retires earlier idle cues. Voice startup
+waits for retired cue outputs to close. The local microphone preview opens capture
+only, so idle cues do not compete with a silent preview output stream. Cues requested
 during startup wait for the AEC-aware mix for at most 300 ms. No cue PCM enters the
 capture/Opus/network path.
 

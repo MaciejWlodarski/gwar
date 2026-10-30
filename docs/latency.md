@@ -613,6 +613,20 @@ late, lost 3,840 samples and concealed 40 times instead of 20
 (`a_delayed_refill_over_short_packets_is_not_an_overflow`, now no cut and no
 extra PLC).
 
+A new spurt (RTP: media time jumps with wall time) or an arrival stall that finds audio still
+queued keeps it: that audio played on time, so the gap added no delay to it. Before, both
+discarded the queue: after a gated 400 ms pause behind a 440 ms backlog, the last 20 ms of the
+word went with up to 300 ms of hangover. The queue before the boundary (`resume`) now plays out, but
+its inaudible packets drop freely, as a cut drops them, and on the RTP clock the next spurt
+follows it without concealing the pause, even if its first packets swap places or another spurt
+queues behind it; the arrival estimates restart as a reset restarts them,
+and the gap is no jitter. Only an arrival gap of a second (`STALE`, `MAX_QUEUED`'s duration) or
+more still discards the queue: playout empties any queue within that, so audio left after a
+longer gap is audio the output stopped taking, over a second late, and worse than the gap. A
+stall that playout starved in still recovers as above
+(`a_spurt_or_stall_boundary_plays_the_queued_tail_unless_it_is_stale`,
+`a_long_stall_after_a_backlog_still_resyncs_to_the_target`, both clocks).
+
 A refill-stall rule that dropped the backlog at once was tried and left out.
 Refill timing alone cannot tell a paused device from late pipeline service: a
 refill serviced 110 ms late with 120 ms of speaker headroom loses no audio, yet
@@ -1111,10 +1125,9 @@ that also mixes what the speaker plays. The order is a browser's: echo
 cancellation, gain control, then noise suppression (below). The canceller is given
 the speaker's audio as the pipeline queues it, with the queue's length as the delay
 hint, and finds the rest of the echo's delay (device buffers, the room) itself. On
-the desktop, the level meter and the voice gate measure between the canceller and
-the rest: the speaker cannot open the gate, and the sensitivity setting means what
-it does with the processing off (gain control lifts a quiet room's noise: -60 dBFS
-of it comes out at about -48, above the default threshold of -50).
+the desktop, automatic activation retains its legacy pre-gain capture gate and
+processed-audio server decision. Manual sensitivity and the live meter measure
+after gain control and noise suppression, matching the audio that is encoded.
 
 Echo cancellation adds ~9 ms (about 430 samples: AEC3 splits 48 kHz into three
 bands, works in 4 ms blocks and overlaps them); gain control adds nothing. With
@@ -1153,13 +1166,12 @@ untouched.
 Both apps clean the microphone on the device, before encoding (and so before
 encryption), with the same model and settings (`crates/gwar-denoise`): the desktop
 app natively, before the encoder (`crates/gwar-client/src/voice/denoise.rs`), on
-every 10 ms frame; the web app in the browser (below). On the desktop, the level meter
-and the voice gate measure the microphone before it (and before gain control, see
-above): a strong suppressor
-also takes very quiet speech down (speech peaking near -48 dBFS lost most of its
-gated frames to it), and the sensitivity setting should keep meaning what it does.
-The RTP audio level (RFC 6464) is the cleaned audio's, so suppressed noise cannot
-hold a receive slot at the server.
+every 10 ms frame; the web app in the browser (below). Manual sensitivity and the
+live meter use the cleaned audio. The local settings preview uses these same
+processing stages and never connects its output to a speaker or transport.
+Automatic activation retains the legacy server criterion and 400 ms server tail;
+manual activation uses its selected threshold and a 300 ms local tail. PTT bypasses
+sensitivity. The RTP audio level (RFC 6464) is the cleaned audio's.
 
 One model for every kind of noise: DeepFilterNet3's low-latency model (no
 lookahead), run with tract. It adds 10 ms, one frame of overlap-add (the standard

@@ -8,6 +8,7 @@
  * transport (fresh DTLS and SSRCs), and the watch transport belongs to the session, with
  * `SCREEN_SLOTS` fixed receive-only slots the server fills (`screen.slot`).
  */
+import { RtcUplinkObserver, type UplinkStatus } from "./uplink-congestion";
 import type { Av1Capability } from "../proto/Av1Capability";
 import type { H264Capability } from "../proto/H264Capability";
 import type { ScreenRecovery } from "../proto/ScreenRecovery";
@@ -588,7 +589,18 @@ function watchState(pc: RTCPeerConnection, report: (state: TransportState) => vo
   return () => { clearTimeout(connect); if (disconnect) clearTimeout(disconnect); };
 }
 
+/** Encoder decisions retained only while republishing the same live capture. */
+export interface EncoderFallbacks {
+  startHintUnsafe: boolean;
+  brokenCodecs: SendCodec[];
+  codecFellBack: boolean;
+  av1Retired: boolean;
+  recovery: ScreenRecovery | null;
+}
+
 export interface PublishParams {
+  uplink?(status: UplinkStatus | null): void;
+  fallbacks?: EncoderFallbacks;
   track: MediaStreamTrack;
   quality: ScreenSpec;
   /** The server rejected spec negotiation: retain the legacy encoder ceilings. */
@@ -614,6 +626,7 @@ export interface PublishParams {
  * the voice/repair reserve when that is lower; video is low priority so voice keeps the default.
  */
 export class ScreenPublisher {
+  private uplink = new RtcUplinkObserver();
   private pc: RTCPeerConnection | null = null;
   private sender: RTCRtpSender | null = null;
   private negotiated = false;
@@ -678,9 +691,20 @@ export class ScreenPublisher {
     globalThis.addEventListener?.("pagehide", this.pageHide);
     this.quality = { ...params.quality };
     this.automaticMode = params.automaticMode === true;
+    if (params.fallbacks) {
+      this.startHintUnsafe = params.fallbacks.startHintUnsafe;
+      this.codecFellBack = params.fallbacks.codecFellBack;
+      this.av1Retired = params.fallbacks.av1Retired;
+      this.recovery = params.fallbacks.recovery ? { ...params.fallbacks.recovery } : null;
+      for (const codec of params.fallbacks.brokenCodecs) this.brokenCodecs.add(codec);
+    }
     const spec = this.spec();
     this.ceiling = { width: spec.width, height: spec.height, known: false };
     this.refreshSurface();
+  }
+
+  fallbacks(): EncoderFallbacks {
+    return { startHintUnsafe: this.startHintUnsafe, brokenCodecs: [...this.brokenCodecs], codecFellBack: this.codecFellBack, av1Retired: this.av1Retired, recovery: this.recovery ? { ...this.recovery } : null };
   }
 
   async start(): Promise<void> {
@@ -696,6 +720,8 @@ export class ScreenPublisher {
     if (this.closed || run !== this.run) return;
     const pc = new RTCPeerConnection(rtcConfig(iceServers));
     this.pc = pc;
+    this.uplink = new RtcUplinkObserver();
+    this.params.uplink?.(null);
     const spec = this.spec();
     const transceiver = pc.addTransceiver(track, {
       direction: "sendonly",
@@ -794,7 +820,7 @@ export class ScreenPublisher {
     }
     if (!pc || !this.negotiated) return;
     this.refreshSurface();
-    if (this.polling === pc) return;
+    if (this.polling === pc) { this.params.uplink?.(this.uplink.observe(performance.now(), null)); return; }
     this.polling = pc;
     try { await this.sampleHeadroom(pc); }
     finally { if (this.polling === pc) this.polling = null; }
@@ -809,6 +835,7 @@ export class ScreenPublisher {
     try {
       const stats = await pc.getStats();
       if (this.closed || this.pc !== pc) return;
+      this.params.uplink?.(pc.connectionState === "connected" ? this.uplink.observe(performance.now(), stats) : null);
       settings = this.refreshSurface();
       if (revision !== this.revision) return;
       stats.forEach(s => {
@@ -818,7 +845,10 @@ export class ScreenPublisher {
       available = outgoingEstimate(stats);
       guardAvailable = outgoingEstimate(stats, performance.timeOrigin + performance.now());
       codec = out?.codecId ? stats.get(out.codecId)?.mimeType as string | undefined : undefined;
-    } catch { return; }
+    } catch {
+      if (!this.closed && this.pc === pc) this.params.uplink?.(this.uplink.observe(performance.now(), null));
+      return;
+    }
     this.watchAv1(out, codec);
     const spec = this.spec();
     const target = headroomBitrate(spec.maxBitrate, available);
@@ -1286,6 +1316,7 @@ export class ScreenPublisher {
 
   close(): void {
     this.closed = true;
+    this.params.uplink?.(null);
     globalThis.removeEventListener?.("pagehide", this.pageHide);
     this.cancelPhase();
     this.endProbe();

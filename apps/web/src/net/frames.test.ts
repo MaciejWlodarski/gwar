@@ -169,6 +169,8 @@ describe("gwar/4 runtime schemas", () => {
     expect(event("screen.paused", { share: share.share, reason: "tired" })).toBeUndefined();
     expect(event("screen.resumed", { share: share.share })).toBe("event");
     expect(event("screen.resumed", {})).toBeUndefined();
+    expect(event("screen.waiting", { share: share.share })).toBe("event");
+    expect(event("screen.waiting", { share: share.share, extra: 1 })).toBeUndefined();
   });
   it("bounds the egress report, its warnings and the screen limits", () => {
     const event = (ev: string, d: unknown) => parseFrame(JSON.stringify({ ev, d }))?.kind;

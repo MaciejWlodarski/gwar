@@ -9,6 +9,7 @@ import {
   useId,
   useState,
   type ButtonHTMLAttributes,
+  type HTMLAttributes,
   type InputHTMLAttributes,
   type ReactElement,
   type ReactNode,
@@ -18,6 +19,11 @@ import { avatarColors, initials } from "../lib/color";
 import { cn } from "../lib/cn";
 import { useT } from "../i18n";
 import { useMemberAvatar } from "./ts-images";
+
+/** Shared shell for the identity, expiry and screen notices above the app. */
+export function TopBanner({ className, ...props }: HTMLAttributes<HTMLDivElement>) {
+  return <div className={cn("flex shrink-0 items-center gap-1.5 border-b border-line bg-raised px-2 py-3 text-sm min-[800px]:gap-3 min-[800px]:px-4", className)} {...props} />;
+}
 
 /** Small radio-style toggle. Options may be disabled (with a tooltip-style title). */
 export function Segmented<T extends string>({
@@ -318,20 +324,24 @@ export function Switch({
   onCheckedChange,
   label,
   description,
+  disabled,
 }: {
   checked: boolean;
   onCheckedChange: (v: boolean) => void;
   label: string;
   description?: string;
+  disabled?: boolean;
 }) {
   const id = useId();
   return (
     <div className="flex items-center justify-between gap-4 py-1">
       <label htmlFor={id} className="min-w-0 cursor-pointer">
         <div className="text-sm text-fg">{label}</div>
-        {description && <div className="text-xs text-subtle">{description}</div>}
+        {description && <div id={`${id}-hint`} className="text-xs text-subtle">{description}</div>}
       </label>
       <SwitchPrimitive.Root
+        disabled={disabled}
+        aria-describedby={description ? `${id}-hint` : undefined}
         id={id}
         checked={checked}
         onCheckedChange={onCheckedChange}
@@ -438,6 +448,7 @@ export function Dialog({
   description,
   children,
   footer,
+  onCloseAutoFocus,
   width = "max-w-md",
 }: {
   open: boolean;
@@ -446,6 +457,7 @@ export function Dialog({
   description?: string;
   children: ReactNode;
   footer?: ReactNode;
+  onCloseAutoFocus?: (event: Event) => void;
   width?: string;
 }) {
   const t = useT();
@@ -454,6 +466,7 @@ export function Dialog({
       <DialogPrimitive.Portal>
         <DialogPrimitive.Overlay className="anim-fade fixed inset-0 z-50 bg-black/55 backdrop-blur-[2px]" />
         <DialogPrimitive.Content
+          onCloseAutoFocus={onCloseAutoFocus}
           className={cn(
             "anim-pop fixed top-1/2 left-1/2 z-50 flex max-h-[min(90dvh,720px)] w-[calc(100vw-24px)] -translate-x-1/2 -translate-y-1/2 flex-col rounded-xl border border-line-strong bg-surface shadow-pop outline-none",
             width,

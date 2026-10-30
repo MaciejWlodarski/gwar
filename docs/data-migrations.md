@@ -71,7 +71,7 @@ its WebKit data directory.
 | IndexedDB `gwar-message-auth-v3` (`net/message-storage.ts`) | `checkpoints` (by `server/author/message`, index `at`): `{revision, hash, created, conversation, at, proven?, deleted?, files?, order}`; `revocations` (by `account:device`): account-signed revocations; `feeds` (by Connect URL): `{cursor, checked, available?, read?}`; `order`: one counter. | Database version 3 (`MESSAGE_STORAGE_MIGRATIONS`; version 1 never held data, the name started at 2). Not a cache: losing it loses rollback protection, so it is migrated, never emptied. |
 | IndexedDB `gwar-mls-v2-<device public key>` (`mls/storage.ts`) | The device's MLS agent: stores `openmls` (OpenMLS's own records), `groups` (`@device`, group records, `{server}/@server` owner pins, `@archive`), `epochs`, `outbox`; binary keys and values written by `crates/gwar-mls`. The runtime's jobs (`@runtime/…`, JSON) live in `outbox`. | Database version 1 (`MLS_MIGRATIONS`), which also versions the runtime's jobs. The agent's records have their own format, the `version` of `@device` (`STORE_FORMAT` in `crates/gwar-mls/src/agent/mod.rs`, currently 1): `STORE_UPGRADES` run as the agent loads and reach storage with its next write. OpenMLS's own records are keyed by its storage version, pinned by a test. **Never wiped**: an unreadable state fails to load and stays. |
 | IndexedDB `gwar-local`, store `entries` (`lib/local-state.ts`) | The device's security state, by key (the names version 1 used in localStorage): `gwar.server-pin:<endpoint>` → `{server_pk, first_seen}`, the server key first seen at an address; `gwar.channels:<server key>` → `{known, deleted, incomplete}`, channel ids seen and seen deleted; `gwar.connect.handle-pin:<Connect URL>:<handle>` → `{uid}`, the account first seen behind a handle; `gwar.connect.service-key:<Connect URL>` → Gwar Connect's service key (a cache, refetched). Values are JSON strings. | Database version 1 (`LOCAL_STATE_MIGRATIONS`; step 1 imports the localStorage entries of version 1, below). The only source of truth: read into memory before the first render, every change one transaction (below). A channel record it cannot read becomes "incomplete" (fails closed), never clean. **Never wiped.** |
-| localStorage `gwar.settings` (zustand `persist`) | Preferences, bookmarks (with server and channel passwords), removed bookmarks, the last server, per-server flags. | zustand's `version` (`SETTINGS_VERSION` in `lib/local-storage.ts`, currently 2). |
+| localStorage `gwar.settings` (zustand `persist`) | Preferences, bookmarks (with server and channel passwords), removed bookmarks, the last server, per-server flags. | zustand's `version` (`SETTINGS_VERSION` in `lib/local-storage.ts`, currently 6). |
 | localStorage `gwar-local.changed` | A ping: the name of the last `gwar-local` key this browser changed and a nonce, so other tabs read it again (no data). | Not data: missing or stale is harmless. |
 | localStorage `gwar.server-pin:*`, `gwar.channels:*`, `gwar.connect.handle-pin:*`, `gwar.connect.service-key:*` | What version 1 kept there, imported into `gwar-local` once. | **Unused** since the import; left in place for tabs and builds of version 1, and removed by a later release. |
 | Cache Storage `gwar-denoise` | The noise suppression module and model. | Cache: entries not in use are deleted. |
@@ -263,17 +263,90 @@ sharp 1080p15, smooth → smooth 1080p30, game → smooth 1080p60, saver → smo
 old value. Browser and desktop webviews use the same store; the base version had
 no separately persisted screen choice. See [Quality settings](screen-share.md#quality-settings).
 
-Settings version 3 adds `sounds`: a master switch, independent 0..1 volume
-(default 0.6), and enabled-by-default switches for all 14 cues. Versions 1 and 2
-keep every existing preference and gain the defaults automatically. Partial sound
-preferences preserve explicit off switches; missing events default on. The settings
-remain device-local, including in the desktop webview, and are not synced to Connect.
+Settings version 3 adds `onboarding`: completion of the name step, first-use time,
+identity-reminder dismissal and whether a non-default server role was received.
+Versions 1 and 2 preserve all their preferences and bookmarks and initialize this
+preference as `null`. Startup checks for an existing identity or Connect sign-in
+before generating any fallback identity: existing users skip the name step; new
+users get an empty name field. The initialized preference is saved before identity
+creation, so reloading an unfinished first run still asks for a name. Missing or
+malformed onboarding preferences follow the same initialization. No identity,
+Connect record, key or trust format changes. Dismissing the reminder or successfully saving
+an identity backup suppresses it on this device; cancelling the desktop save dialog
+keeps the reminder. Signing in hides it while signed in.
 
 `serverGroups` (the server column's groups) came without a version bump: it is a
 new key, not a change of shape. Missing or malformed, it reads as no groups
 (`validGroups`), and an older client keeps it untouched. Ids of removed
 bookmarks in a group are ignored when shown. Groups stay on the device; Gwar
 Connect does not sync them.
+
+Settings version 4 adds `selfMuted` and `selfDeafened` (both default to false),
+`resumeConnection` (default null), and `updateVoiceResume` (default null).
+Older settings keep their bookmarks, identities and preferences; the next successful
+connection establishes the session to restore. Explicit Disconnect clears it.
+The session stays on the device and contains the address, server kind, display name,
+server password (plain text, like bookmarks), TeamSpeak identity and LAN choice;
+it never contains invite codes or cold-start voice entry. Update-only voice entry
+is consumed once, expires after five minutes, and names the target server and app version.
+Installation or relaunch failure clears that intent. Switching/importing an identity,
+signing out, or removing the matching bookmark clears both resume records. Hydration
+validates every reconnect field and reads only the whitelisted connection parameters.
+Automatic startup checks device ownership and never takes over another tab; a
+compact other-tab state offers an explicit "Use here" action instead. An unreachable server
+gets at most three startup attempts, with 2 s and 5 s waits that an online event can
+skip. Cancel and identity changes retire the attempt and its timer.
+
+A TeamSpeak cold start keeps default-channel presence muted and deafened on the
+server until the user chooses "Join voice". This temporary presence state does not
+change their saved self-mute/deafen preferences.
+
+Settings version 5 adds `audio.automaticSensitivity` (default `true`) and
+`audio.vadThreshold` (default −50 dBFS). The version 4 session-resilience migration
+is preserved; versions 1–4 upgrade through it to version 5 without losing mute,
+reconnect, device or onboarding preferences. Both browser and desktop keep the
+previous automatic voice decisions by default. Native automatic mode on Gwar
+also retains the legacy processed-audio
+criterion (RFC 6464 level at least −60 dBov) in its VAD bit. The optional native
+SDP marker `a=x-gwar-native-vad:1` makes that bit authoritative at the SFU, which
+keeps its 400 ms timeout; manual sensitivity and PTT mark speech regardless of
+processed level. Direct TeamSpeak retains its raw gate. Turning
+automatic sensitivity off uses the saved manual threshold; switching it back on
+keeps that manual value for next time. Migration
+preserves devices, input mode, processing and unrelated preferences. Reads and
+updates validate the new fields: thresholds are finite numbers clamped to
+−100…0 dBFS (invalid values use −50), and invalid automatic flags use `true`.
+
+The manual browser gate runs on the audio thread before encoding, with a 300 ms
+voice tail, and measures the audio after suppression on the meter's dB scale.
+Automatic mode leaves the exact legacy decision on the server: RFC 6464 level at
+least -50 dBov, or -60 dBov with the browser's voice-activity bit, and the original
+400 ms tail. The browser worklet cannot infer that bit from PCM, so it passes
+automatic audio through. PTT bypasses the gate; mute/deafen override both modes.
+
+Browser offers use the optional SDP attribute `a=x-gwar-input-gate:2`. An updated
+server echoes it and supports `voice.input_gate {binding, client_gate}`: only the
+matching call/participation/run can change the gate, and the reply waits until
+media applies it. Manual/PTT enable client gating (the server filters digital
+silence); automatic restores the legacy rule and discards manual's speech tail.
+Both engines close output until the newest run-bound mode change is acknowledged.
+Native mode revisions reset the local hangover and discard old queued frames.
+Older servers ignore the attribute, keep automatic activation, and receive no new
+control requests. Both current engines advertise version 2; older native
+version-1 clients and offers without either attribute retain their prior decisions.
+
+Audio settings show a local live preview inside Input mode during voice activation. During voice it reuses the call's meter. Outside voice it captures only while
+that section is open, visible and unmuted/undeafened; leaving it, switching to PTT,
+muting, hiding the tab/window or starting voice cancels capture. A call waits for
+any pending preview acquisition to release its device first. Permission is read
+without prompting: unless already granted, an explicit preview button is required
+(also on platforms where permission cannot be queried). Preview audio is never sent.
+
+Settings version 6 adds `sounds`: a master switch, independent 0..1 volume
+(default 0.6), and enabled-by-default switches for all 14 cues. Versions 1 through 5
+keep every existing preference and gain the defaults automatically. Partial sound
+preferences preserve explicit off switches; missing events default on. The settings
+remain device-local, including in the desktop webview, and are not synced to Connect.
 
 ### Desktop files
 
@@ -336,3 +409,6 @@ Every kind has a test that fails when the version grows without a fixture:
   `every_older_schema_opens_at_the_current_one_with_its_rows` covers the rest.
 - **A new store:** give it a version from the start, add it to this inventory and
   to the guard test of its kind.
+
+Manual sensitivity is unavailable on older servers; settings show a short explanation
+and retain the saved threshold. Unsupported PTT stays closed and asks for a newer server.

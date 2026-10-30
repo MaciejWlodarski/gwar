@@ -8,9 +8,12 @@ import { ScreenController } from "./screen-controller";
 import { initialScreen, useScreen } from "./screen";
 import { useSession, useUi } from "./stores";
 import { useSettings } from "./settings";
+import { useUplink } from "./uplink";
 
 interface PublisherOptions {
+  uplink?(status: import("../voice/uplink-congestion").UplinkStatus | null): void;
   ended(): void;
+  fallbacks?: import("../voice/screen").EncoderFallbacks;
   quality: ScreenSpec; legacy: boolean; automaticMode: boolean;
   surfaceChanged(surface: "screen" | "window" | "tab" | "unknown", spec: ScreenSpec): void;
   offer(body: object): Promise<string>; state(s: string): void; encodeFailed(): void;
@@ -18,7 +21,7 @@ interface PublisherOptions {
 
 const media = vi.hoisted(() => ({
   transports: [] as Array<{ params: { run: number; state(s: string): void; offer(sdp: string, run: number): Promise<string> }; close: () => void }>,
-  publishers: [] as Array<{ params: PublisherOptions; close: () => void; setSpec: (spec: ScreenSpec, automaticMode: boolean) => Promise<void> }>,
+  publishers: [] as Array<{ params: PublisherOptions; fallbacks: () => import("../voice/screen").EncoderFallbacks; close: () => void; setSpec: (spec: ScreenSpec, automaticMode: boolean) => Promise<void> }>,
 }));
 vi.mock("../voice/screen", async importOriginal => {
   const actual = await importOriginal<typeof import("../voice/screen")>();
@@ -32,6 +35,7 @@ vi.mock("../voice/screen", async importOriginal => {
     async stats() { return null; }
   }
   class ScreenPublisher {
+    fallbacks = vi.fn(() => ({ startHintUnsafe: false, brokenCodecs: [], codecFellBack: false, av1Retired: false, recovery: null }));
     close = vi.fn();
     setSpec = vi.fn(async () => {});
     constructor(readonly params: PublisherOptions) { media.publishers.push(this); }
@@ -71,6 +75,15 @@ function deferred<T>() {
 }
 const flush = () => vi.advanceTimersByTimeAsync(0);
 
+const subscriptions: Array<() => void> = [];
+function initialise(screen: ScreenController): void {
+  const subscribe = useSession.subscribe;
+  const spy = vi.spyOn(useSession, "subscribe").mockImplementation(listener => {
+    const off = subscribe(listener); subscriptions.push(off); return off;
+  });
+  screen.init(); spy.mockRestore();
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   media.transports.length = 0;
@@ -86,7 +99,7 @@ beforeEach(() => {
   });
   vi.stubGlobal("RTCPeerConnection", class {});
 });
-afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); });
+afterEach(() => { for (const off of subscriptions.splice(0)) off(); vi.useRealTimers(); vi.unstubAllGlobals(); });
 
 describe("watching", () => {
   it("retries rate-limited watch offers after refill with a fresh run", async () => {
@@ -215,7 +228,11 @@ describe("reused receive slots", () => {
     const stream = {} as MediaStream;
     useScreen.getState().dispatch({ type: "stream", run: old.params.run, slot: 1, stream });
     if (how === "unwatch") await screen.unwatch("B");
-    else screen.handleEvent({ ev: "screen.slot", d: { run: old.params.run, slot: 1, share: null } });
+    else {
+      screen.handleEvent({ ev: "screen.slot", d: { run: old.params.run, slot: 1, share: null } });
+      screen.handleEvent({ ev: "screen.stopped", d: { share: "B", reason: "stopped" } });
+      toast.mockReset();
+    }
     // Keep the track for this run; only a new run can supply a new receiver.
     expect(useScreen.getState().streams[1]).toBe(stream);
     const watching = screen.watch("C");
@@ -243,7 +260,11 @@ describe("reused receive slots", () => {
     const streams = [{} as MediaStream, {} as MediaStream];
     streams.forEach((stream, slot) => useScreen.getState().dispatch({ type: "stream", run: old.params.run, slot, stream }));
     if (how === "unwatch") await screen.unwatch("B");
-    else screen.handleEvent({ ev: "screen.slot", d: { run: old.params.run, slot: 1, share: null } });
+    else {
+      screen.handleEvent({ ev: "screen.slot", d: { run: old.params.run, slot: 1, share: null } });
+      screen.handleEvent({ ev: "screen.stopped", d: { share: "B", reason: "stopped" } });
+      toast.mockReset();
+    }
     await screen.watch("C");
     expect(media.transports).toHaveLength(1);
     expect(old.close).not.toHaveBeenCalled();
@@ -293,7 +314,7 @@ describe("reused receive slots", () => {
     screen.reset();
   });
 
-  it("ends waiting watches through the existing transport failure path", async () => {
+  it("keeps waiting watches on stage through a transport failure", async () => {
     const { screen, start } = setup();
     await start(false);
     await screen.unwatch("B");
@@ -302,9 +323,9 @@ describe("reused receive slots", () => {
     media.transports[1]!.params.state("failed");
     await watching;
     await flush();
-    expect(useScreen.getState().watches).toEqual([]);
-    expect(useScreen.getState().stage).toBeNull();
-    expect(toast).toHaveBeenCalledExactlyOnceWith("error", "The connection for watching screen shares was lost.");
+    expect(useScreen.getState().watches).toMatchObject([{ share: "C", status: "requesting" }]);
+    expect(useScreen.getState().stage).toBe("C");
+    expect(toast).not.toHaveBeenCalled();
     screen.reset();
   });
 
@@ -376,7 +397,8 @@ describe("reused receive slots", () => {
     if (how === "stop") screen.handleEvent({ ev: "screen.stopped", d: { share: "B", reason: "stopped" } });
     if (how === "failure") old.params.state("failed");
     if (how === "reset") screen.reset();
-    expect(vi.getTimerCount()).toBe(0);
+    expect(vi.getTimerCount()).toBe(how === "failure" ? 2 : 0);
+    if (how === "failure") screen.reset();
     await vi.advanceTimersByTimeAsync(35_000);
     expect(failed).not.toHaveBeenCalled();
     screen.reset();
@@ -419,6 +441,9 @@ describe("watch requests (review round 1)", () => {
     media.transports[0]!.params.state("connected");
     await vi.advanceTimersByTimeAsync(300);
     media.transports[0]!.params.state("failed");
+    const stoppingA = screen.unwatch("A");
+    await vi.advanceTimersByTimeAsync(250);
+    await stoppingA;
     const watchingB = screen.watch("B");
     await flush();
     media.transports[1]!.params.state("connected");
@@ -428,10 +453,10 @@ describe("watch requests (review round 1)", () => {
     await vi.advanceTimersByTimeAsync(6_000);
     expect(calls.filter(([op, d]) => op === "screen.watch" && d.share === "A").length).toBe(asksForA);
     expect(useScreen.getState().watches).toEqual([{ share: "B", id: expect.any(Number), slot: 0, status: "watching" }]);
-    expect(toast.mock.calls).toEqual([["error", "The connection for watching screen shares was lost."]]);
+    expect(toast).not.toHaveBeenCalled();
   });
 
-  it("a slot granted to a retired watch is released", async () => {
+  it("a slot granted to a failed run cannot resurrect its retired grant", async () => {
     const answer = deferred<{ slot: number }>();
     const { link, ops } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => answer.promise });
     const screen = new ScreenController(() => link, String);
@@ -442,8 +467,9 @@ describe("watch requests (review round 1)", () => {
     media.transports[0]!.params.state("failed");
     answer.resolve({ slot: 0 });
     await watching;
-    expect(ops()).toEqual(["screen.watch.offer", "screen.watch", "screen.unwatch"]);
-    expect(useScreen.getState().watches).toEqual([]);
+    expect(ops()).toEqual(["screen.watch.offer", "screen.watch"]);
+    expect(useScreen.getState().watches).toMatchObject([{ share: "A", status: "requesting", slot: null }]);
+    screen.reset();
   });
 
   it("watch → stop → watch keeps the second watch, whatever order the first one's answers arrive in", async () => {
@@ -477,8 +503,9 @@ describe("watch requests (review round 1)", () => {
     const screen = new ScreenController(() => null, String);
     useScreen.setState({ transport: { run: 7, phase: "connected" }, watches: [{ share: "A", id: 1, slot: 0, status: "watching" }], stage: "A" });
     screen.handleEvent({ ev: "screen.slot", d: { run: 7, slot: 0, share: null } });
-    expect(useScreen.getState().watches).toEqual([]);
+    expect(useScreen.getState().watches).toMatchObject([{ share: "A", status: "requesting" }]);
     screen.handleEvent({ ev: "screen.stopped", d: { share: "A", reason: "access" } });
+    expect(useScreen.getState().watches).toEqual([]);
     expect(toast).toHaveBeenCalledWith("info", "You can no longer watch this screen share.");
     toast.mockReset();
     useScreen.setState({ watches: [{ share: "B", id: 2, slot: 1, status: "watching" }], stage: "B" });
@@ -509,10 +536,151 @@ describe("watch requests (review round 1)", () => {
         media.transports.at(-1)!.params.state("failed");
       }
       await watching;
+      for (const delay of [1_000, 2_000, 4_000]) {
+        expect(toast).not.toHaveBeenCalled();
+        await vi.advanceTimersByTimeAsync(delay);
+        if (how === "state") media.transports.at(-1)!.params.state("failed");
+        await flush();
+      }
       expect(useScreen.getState()).toMatchObject({ watches: [], stage: null });
       expect(toast).toHaveBeenCalledTimes(1);
       expect(toast).toHaveBeenCalledWith("error", "The connection for watching screen shares was lost.");
+      screen.reset();
     }
+  });
+});
+
+describe("watch recovery", () => {
+  it.each([true, false])("uses the watched channel's password override outside voice (allowed=%s)", async allowed => {
+    useSession.setState({ permissions: allowed ? [] : ["bypass_password"], channels: { ...useSession.getState().channels,
+      1: { ...ch(1), has_password: true, overrides: [{ user: "u1", allow: allowed ? ["bypass_password"] : [], deny: allowed ? [] : ["bypass_password"] }] } } });
+    const { link, calls } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => ({ slot: 0 }) });
+    const screen = new ScreenController(() => link, String); initialise(screen);
+    const watching = screen.watch("A"); await flush(); media.transports[0]!.params.state("connected"); await watching;
+    screen.suspend(); screen.resume(); await flush();
+    if (allowed) media.transports[1]!.params.state("connected");
+    await flush();
+    expect(calls.filter(([op]) => op === "screen.watch")).toHaveLength(allowed ? 2 : 1);
+    if (!allowed) {
+      useSession.setState({ channels: { ...useSession.getState().channels, 1: { ...ch(1), has_password: true, overrides: [{ user: "u1", allow: ["bypass_password"], deny: [] }] } } });
+      await flush(); media.transports[1]!.params.state("connected"); await flush();
+    }
+    expect(useScreen.getState().watches).toMatchObject([{ share: "A", status: "watching" }]);
+    expect(toast).not.toHaveBeenCalled(); screen.reset();
+  });
+  it.each(["session", "sharer"])("does not replace an interrupted capture with the same account's pre-existing share (%s)", async kind => {
+    useSession.setState({ clients: { ...useSession.getState().clients, 4: cl(4, 1, { uid: "u2", sharing: true }) }, shares: { ...useSession.getState().shares, B: share("B", 4, 1) } });
+    const { link, calls } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => ({ slot: 0 }) });
+    const screen = new ScreenController(() => link, String); initialise(screen);
+    const watching = screen.watch("A"); await flush(); media.transports[0]!.params.state("connected"); await watching;
+    if (kind === "session") screen.suspend();
+    else screen.handleEvent({ ev: "screen.stopped", d: { share: "A", reason: "left" } });
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "screen.stopped", d: { share: "A", reason: "left" } } });
+    useSession.getState().dispatch({ type: "event", now: 3, event: { ev: "client.left", d: { client: 2, reason: { kind: "timeout" } } } });
+    if (kind === "session") screen.resume();
+    await flush();
+    expect(useScreen.getState().stage).toBe("A");
+    expect(calls.filter(([op]) => op === "screen.watch").map(([, d]) => d.share)).toEqual(["A"]);
+    useSession.getState().dispatch({ type: "event", now: 4, event: { ev: "client.joined", d: cl(22, 1, { uid: "u2", sharing: true }) } });
+    useSession.getState().dispatch({ type: "event", now: 5, event: { ev: "screen.started", d: share("returned", 22, 1) } });
+    await flush(); media.transports[1]!.params.state("connected"); await flush();
+    expect(useScreen.getState().watches).toMatchObject([{ share: "returned", status: "watching" }]);
+    expect(toast).not.toHaveBeenCalled(); screen.reset();
+  });
+  it("resumes all watches after a transport drop, preserving focus, and ignores stale callbacks", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "screen.started", d: share("B", 2, 2) } });
+    const { link, calls } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": d => ({ slot: d.share === "A" ? 0 : 1 }) });
+    const screen = new ScreenController(() => link, String);
+    const watching = screen.watch("A"); await flush();
+    const old = media.transports[0]!;
+    old.params.state("connected"); await watching;
+    await screen.watch("B"); screen.focus("A");
+    old.params.state("failed");
+    expect(useScreen.getState().stage).toBe("A");
+    expect(toast).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1_000);
+    media.transports[1]!.params.state("connected"); await flush();
+    old.params.state("failed"); await flush();
+    expect(useScreen.getState().watches.map(w => w.status)).toEqual(["watching", "watching"]);
+    expect(useScreen.getState().stage).toBe("A");
+    expect(calls.filter(([op]) => op === "screen.watch")).toHaveLength(4);
+    expect(toast).not.toHaveBeenCalled();
+    screen.reset();
+  });
+
+  it.each([null, 2])("ends a voluntary sharer leave/move on the next client update (%s)", async channel => {
+    const { link } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => ({ slot: 0 }) });
+    const screen = new ScreenController(() => link, String); initialise(screen);
+    const watching = screen.watch("A"); await flush();
+    media.transports[0]!.params.state("connected"); await watching;
+    screen.handleEvent({ ev: "screen.slot", d: { run: useScreen.getState().transport.run, slot: 0, share: null } });
+    screen.handleEvent({ ev: "screen.stopped", d: { share: "A", reason: "left" } });
+    expect(useScreen.getState().stage).toBe("A");
+    useSession.getState().dispatch({ type: "event", now: 3, event: { ev: "client.updated", d: cl(2, channel, { sharing: false }) } });
+    await vi.advanceTimersByTimeAsync(150);
+    expect(useScreen.getState().stage).toBeNull();
+    expect(toast).toHaveBeenCalledExactlyOnceWith("info", "The screen share has ended.");
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(toast).toHaveBeenCalledTimes(1);
+    screen.reset();
+  });
+
+  it("reports an ended share when its return window expires on a healthy viewer transport", async () => {
+    const { link } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => ({ slot: 0 }) });
+    const screen = new ScreenController(() => link, String); initialise(screen);
+    const watching = screen.watch("A"); await flush();
+    media.transports[0]!.params.state("connected"); await watching;
+    screen.handleEvent({ ev: "screen.stopped", d: { share: "A", reason: "left" } });
+    useSession.getState().dispatch({ type: "event", now: 3, event: { ev: "client.left", d: { client: 2, reason: { kind: "timeout" } } } });
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(useScreen.getState().stage).toBeNull();
+    expect(toast).toHaveBeenCalledExactlyOnceWith("info", "The screen share has ended.");
+    screen.reset();
+  });
+
+  it("queues a watch selected during session reconnect and lets Stop cancel it", async () => {
+    const { link, calls } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => ({ slot: 0 }) });
+    const screen = new ScreenController(() => link, String);
+    screen.suspend(); await screen.watch("A");
+    expect(calls).toEqual([]);
+    expect(useScreen.getState().stage).toBe("A");
+    screen.resume(); await flush();
+    media.transports[0]!.params.state("connected"); await flush();
+    expect(useScreen.getState().watches).toMatchObject([{ share: "A", status: "watching" }]);
+    screen.suspend(); await screen.unwatch("A"); screen.resume(); await flush();
+    expect(useScreen.getState().stage).toBeNull();
+    expect(media.transports).toHaveLength(1);
+    screen.reset();
+  });
+
+  it.each(["session", "sharer"])("rewatches a returning sharer's new ID after %s reconnect", async kind => {
+    const { link } = fakeLink({ "screen.watch.offer": () => ({ sdp: "answer" }), "screen.watch": () => ({ slot: 0 }) });
+    const screen = new ScreenController(() => link, String); initialise(screen);
+    const watching = screen.watch("A"); await flush();
+    media.transports[0]!.params.state("connected"); await watching;
+    if (kind === "session") screen.suspend();
+    else {
+      screen.handleEvent({ ev: "screen.slot", d: { run: useScreen.getState().transport.run, slot: 0, share: null } });
+      screen.handleEvent({ ev: "screen.stopped", d: { share: "A", reason: "left" } });
+    }
+    useSession.getState().dispatch({ type: "event", now: 3, event: { ev: "screen.stopped", d: { share: "A", reason: "left" } } });
+    expect(useScreen.getState().stage).toBe("A");
+    // Core.remove first broadcasts its move-to-null client update, then client.left.
+    useSession.getState().dispatch({ type: "event", now: 3, event: { ev: "client.updated", d: cl(2, null, { sharing: false }) } });
+    await vi.advanceTimersByTimeAsync(40);
+    expect(useScreen.getState().stage).toBe("A");
+    useSession.getState().dispatch({ type: "event", now: 3, event: { ev: "client.left", d: { client: 2, reason: { kind: "timeout" } } } });
+    const returned = share("new", 22, 1);
+    useSession.getState().dispatch({ type: "event", now: 4, event: { ev: "client.joined", d: cl(22, 1, { uid: "u2", sharing: true }) } });
+    useSession.getState().dispatch({ type: "event", now: 5, event: { ev: "screen.started", d: returned } });
+    if (kind === "session") screen.resume();
+    screen.handleEvent({ ev: "screen.started", d: returned }); await flush();
+    media.transports[1]!.params.state("connected");
+    await flush();
+    expect(useScreen.getState().stage).toBe("new");
+    expect(useScreen.getState().watches).toMatchObject([{ share: "new", status: "watching" }]);
+    expect(toast).not.toHaveBeenCalled();
+    screen.reset();
   });
 });
 
@@ -589,11 +757,378 @@ describe("watch requests across a reset (review round 2)", () => {
 });
 
 describe("sharing", () => {
-  const track = () => ({ stop: vi.fn(), addEventListener: vi.fn(), getSettings: () => ({ displaySurface: "browser" }) });
+  const track = () => ({ readyState: "live", stop: vi.fn(), addEventListener: vi.fn(), getSettings: () => ({ displaySurface: "browser" }) });
   const choosing = (t = track()) => {
     useScreen.setState({ own: { phase: "choosing", attempt: 1, share: null, stream: { getVideoTracks: () => [t], getTracks: () => [t] } as unknown as MediaStream, surface: "tab", spec: legacySpec("text"), viewers: 0, guests: 0, guestLink: true, preview: false } });
     return t;
   };
+
+  it("retains capture when media fails 15 seconds before signalling detects the outage", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    let starts = 0;
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: `M${++starts}` }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); initialise(screen); const source = choosing();
+    await screen.confirmShare(); screen.handleEvent({ ev: "screen.started", d: share("M1", 1, 1) });
+    const stream = useScreen.getState().own!.stream;
+    const watched = useScreen.getState().watches, transport = useScreen.getState().transport;
+    const old = media.publishers[0]!; old.params.state("failed");
+    expect(useScreen.getState()).toMatchObject({ own: { phase: "reconnecting", stream }, watches: watched, transport });
+    await vi.advanceTimersByTimeAsync(15_000);
+    expect(useSession.getState().phase).toBe("online");
+    expect(source.stop).not.toHaveBeenCalled(); expect(useScreen.getState().notice).toBeNull();
+    expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(1);
+    screen.suspend();
+    useSession.getState().dispatch({ type: "event", now: 3, event: { ev: "client.updated", d: cl(1, null) } });
+    screen.resume();
+    useSession.getState().dispatch({ type: "event", now: 4, event: { ev: "client.updated", d: cl(1, 1) } }); await flush();
+    expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(2);
+    expect(useScreen.getState().own?.stream).toBe(stream); expect(source.stop).not.toHaveBeenCalled();
+    screen.handleEvent({ ev: "screen.started", d: share("M2", 1, 1) });
+    old.params.state("failed"); await vi.advanceTimersByTimeAsync(45_000);
+    expect(useScreen.getState().own?.phase).toBe("live"); expect(toast).not.toHaveBeenCalled(); screen.reset();
+  });
+
+  it.each(["transport", "moderator"] as const)("handles the server retiring failed media for %s", async reason => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); initialise(screen); const source = choosing();
+    await screen.confirmShare(); screen.handleEvent({ ev: "screen.link", d: { share: "M", active: true } });
+    media.publishers[0]!.params.state("failed");
+    expect(useScreen.getState().own?.guestLink).toBe(true);
+    await screen.confirmShare(); expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(1);
+    const revoked = screen.turnOffLink("M"); expect(useScreen.getState().own?.guestLink).toBe(false); await revoked;
+    screen.handleEvent({ ev: "screen.link", d: { share: "M", active: false } });
+    screen.setGuestLink(true); // A revoked link cannot be re-enabled during recovery.
+    screen.handleEvent({ ev: "screen.stopped", d: { share: "M", reason } }); await flush();
+    expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(reason === "transport" ? 2 : 1);
+    if (reason === "transport") {
+      expect(calls.filter(([op]) => op === "screen.start")[1]![1].guest_link).toBe(false);
+      expect(source.stop).not.toHaveBeenCalled(); expect(toast).not.toHaveBeenCalled();
+    } else expect(source.stop).toHaveBeenCalledOnce();
+    screen.reset();
+  });
+
+  it("explicit Stop during media-first recovery retires the old share quietly", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); const source = choosing(); await screen.confirmShare();
+    media.publishers[0]!.params.state("failed"); await screen.stopShare();
+    expect(calls.filter(([op]) => op === "screen.stop")).toEqual([["screen.stop", { share: "M" }]]);
+    screen.handleEvent({ ev: "screen.stopped", d: { share: "M", reason: "transport" } });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(1);
+    expect(source.stop).toHaveBeenCalledOnce(); expect(useScreen.getState().notice).toBeNull(); screen.reset();
+  });
+
+  it("retains capture and an active link when the server reports media loss first", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); vi.spyOn(screen, "guestLinkPossible").mockReturnValue(true);
+    const source = choosing(); await screen.confirmShare(); screen.handleEvent({ ev: "screen.link", d: { share: "M", active: true } });
+    screen.handleEvent({ ev: "screen.stopped", d: { share: "M", reason: "transport" } }); await flush();
+    expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(2);
+    expect(calls.filter(([op]) => op === "screen.start")[1]![1].guest_link).toBe(true);
+    expect(source.stop).not.toHaveBeenCalled(); expect(useScreen.getState().notice).toBeNull(); screen.reset();
+  });
+
+  it("bounds media-first recovery from the first failure without extending it on signalling loss", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); const source = choosing(); await screen.confirmShare();
+    media.publishers[0]!.params.state("failed"); await vi.advanceTimersByTimeAsync(15_000); screen.suspend();
+    await vi.advanceTimersByTimeAsync(29_999); expect(source.stop).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1); expect(source.stop).toHaveBeenCalledOnce();
+    expect(useScreen.getState().notice).toBe("reconnect"); screen.reset();
+  });
+
+  it.each(["permission", "permissionHint"])("replaces a sticky stopped toast with %s guidance", async notice => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); choosing(); await screen.confirmShare();
+    media.publishers[0]!.params.encodeFailed(); await flush();
+    const options = toast.mock.calls[0]![2];
+    useUi.setState({ toasts: [{ id: 1, kind: "error", text: "stopped", ...options }] });
+    vi.stubGlobal("navigator", { userAgent: "Firefox/153", mediaDevices: { getDisplayMedia: async () => { throw new DOMException(notice === "permission" ? "Permission denied by system" : "Not allowed by the user agent or the platform", "NotAllowedError"); } } });
+    options.action.run(); await flush();
+    expect(useScreen.getState().notice).toBe(notice); expect(useUi.getState().toasts).toEqual([]);
+    await vi.advanceTimersByTimeAsync(60_000); expect(useScreen.getState().notice).toBe(notice); screen.reset();
+  });
+
+  it("confirms a terminal retained-share timeout exactly once", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const unexpectedStop = vi.fn();
+    const screen = new ScreenController(() => link, String, () => true, unexpectedStop), track = choosing();
+    await screen.confirmShare();
+    screen.handleEvent({ ev: "screen.started", d: share("M", 1, 1) });
+    screen.suspend();
+    expect(unexpectedStop).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(unexpectedStop).toHaveBeenCalledOnce();
+    expect(track.stop).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(unexpectedStop).toHaveBeenCalledOnce();
+    screen.reset();
+  });
+
+  it("retains capture through repeated suspend and republishes after the new voice binding", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    let starts = 0;
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: `M${++starts}` }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const unexpectedStop = vi.fn();
+    const screen = new ScreenController(() => link, String, () => true, unexpectedStop), track = choosing();
+    await screen.confirmShare();
+    const stream = useScreen.getState().own!.stream;
+    screen.handleEvent({ ev: "screen.started", d: share("M1", 1, 1) });
+    screen.suspend(); screen.suspend();
+    expect(track.stop).not.toHaveBeenCalled();
+    expect(useScreen.getState().own).toMatchObject({ phase: "reconnecting", stream, share: null });
+    expect(media.publishers[0]!.close).toHaveBeenCalledOnce();
+    useSession.getState().dispatch({ type: "event", now: 3, event: { ev: "client.updated", d: cl(1, 1, { voice_binding: { call: "new-call", participation: "new-participation", run: 2 } }) } });
+    screen.resume(); await flush();
+    expect(calls.filter(([op]) => op === "screen.start")[1]![1]).toMatchObject({ call: "new-call", participation: "new-participation" });
+    expect(useScreen.getState().own?.stream).toBe(stream);
+    expect(media.publishers).toHaveLength(2);
+    screen.handleEvent({ ev: "screen.started", d: share("M2", 1, 1) });
+    expect(useScreen.getState().own?.phase).toBe("live");
+    expect(useScreen.getState().notice).toBeNull();
+    expect(unexpectedStop).not.toHaveBeenCalled();
+    screen.reset();
+    expect(track.stop).toHaveBeenCalledOnce();
+  });
+
+  it.each(["signalling", "media"])("retires %s uplink measurements while retaining capture, and fences old callbacks after republishing", async loss => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    let starts = 0;
+    const { link } = fakeLink({ "screen.start": () => ({ share: `M${++starts}` }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String), track = choosing();
+    await screen.confirmShare();
+    screen.handleEvent({ ev: "screen.started", d: share("M1", 1, 1) });
+    const stream = useScreen.getState().own!.stream;
+    const old = media.publishers[0]!;
+    const bloated = { congested: true, rttMs: 480, baselineMs: 20, availableOutgoingBitrate: null };
+    old.params.uplink!(bloated);
+    expect(useUplink.getState().screen).toBe(bloated);
+    if (loss === "signalling") screen.suspend();
+    else old.params.state("failed");
+    expect(useScreen.getState().own).toMatchObject({ phase: "reconnecting", stream });
+    expect(track.stop).not.toHaveBeenCalled();
+    expect(useUplink.getState().screen).toBeNull();
+    old.params.uplink!(bloated);
+    expect(useUplink.getState().screen).toBeNull();
+    if (loss === "signalling") screen.resume();
+    else screen.handleEvent({ ev: "screen.stopped", d: { share: "M1", reason: "transport" } });
+    await flush();
+    expect(media.publishers).toHaveLength(2);
+    expect(useScreen.getState().own?.stream).toBe(stream);
+    const fresh = { ...bloated, congested: false, rttMs: 20 };
+    media.publishers[1]!.params.uplink!(fresh);
+    old.params.uplink!(null);
+    old.params.uplink!(bloated);
+    expect(useUplink.getState().screen).toBe(fresh);
+    screen.reset();
+    expect(useUplink.getState().screen).toBeNull();
+  });
+
+  it("waits for voice rejoin after Welcome before republishing", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); choosing();
+    const subscribe = useSession.subscribe;
+    let unsubscribe = () => {};
+    const spy = vi.spyOn(useSession, "subscribe").mockImplementation(listener => { unsubscribe = subscribe(listener); return unsubscribe; });
+    screen.init();
+    try {
+      await screen.confirmShare(); screen.suspend();
+      useSession.getState().dispatch({ type: "event", now: 3, event: { ev: "client.updated", d: cl(1, null) } });
+      screen.resume(); await flush();
+      expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(1);
+      useSession.getState().dispatch({ type: "event", now: 4, event: { ev: "client.updated", d: cl(1, 1) } });
+      await flush();
+      expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(2);
+      expect(useScreen.getState().own?.phase).toBe("starting");
+    } finally { unsubscribe(); spy.mockRestore(); screen.reset(); }
+  });
+
+  it("retains the original channel across a second blip before voice rejoin", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); initialise(screen); choosing();
+    await screen.confirmShare(); screen.suspend();
+    useSession.getState().dispatch({ type: "event", now: 3, event: { ev: "client.updated", d: cl(1, null) } });
+    screen.resume(); screen.suspend(); screen.resume();
+    useSession.getState().dispatch({ type: "event", now: 4, event: { ev: "client.updated", d: cl(1, 1) } }); await flush();
+    expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(2);
+    expect(useScreen.getState().notice).toBeNull();
+    screen.reset();
+  });
+
+  it.each(["encrypted", "different"])("does not republish into a %s channel after resync", async change => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); initialise(screen); const track = choosing();
+    await screen.confirmShare(); screen.suspend();
+    useSession.getState().dispatch({ type: "event", now: 3, event: { ev: "client.updated", d: cl(1, null) } });
+    screen.resume();
+    if (change === "encrypted") useSession.setState({ channels: { ...useSession.getState().channels, 1: ch(1, true) } });
+    useSession.getState().dispatch({ type: "event", now: 4, event: { ev: "client.updated", d: cl(1, change === "different" ? 2 : 1) } }); await flush();
+    expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(1);
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(useScreen.getState().notice).toBe("reconnect");
+    screen.reset();
+  });
+
+  it("tells an unconfirmed sharer when resync puts them in a different channel", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link, calls } = fakeLink({});
+    const screen = new ScreenController(() => link, String); initialise(screen); const source = choosing();
+    screen.suspend();
+    useSession.getState().dispatch({ type: "event", now: 3, event: { ev: "client.updated", d: cl(1, null) } });
+    screen.resume();
+    useSession.getState().dispatch({ type: "event", now: 4, event: { ev: "client.updated", d: cl(1, 2) } });
+    expect(source.stop).toHaveBeenCalledOnce();
+    expect(useScreen.getState().notice).toBe("reconnect");
+    expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(0);
+    screen.reset();
+  });
+
+  it.each(["picker", "choosing"])("keeps a %s capture across suspend and queues its confirmation", async phase => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const picked = deferred<MediaStream>();
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia: () => picked.promise } });
+    const source = track(); const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); initialise(screen);
+    screen.beginShare();
+    if (phase === "choosing") { picked.resolve(stream); await flush(); }
+    screen.suspend();
+    if (phase === "picker") { picked.resolve(stream); await flush(); }
+    expect(useScreen.getState().own).toMatchObject({ phase: "choosing", stream });
+    expect(source.stop).not.toHaveBeenCalled();
+    if (phase === "choosing") {
+      screen.resume(); await flush();
+      expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(0);
+      screen.suspend();
+    }
+    await screen.confirmShare();
+    expect(useScreen.getState().own?.phase).toBe("reconnecting");
+    expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(0);
+    screen.resume(); await flush();
+    expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(1);
+    screen.reset();
+  });
+
+  it.each([false, true])("shows persistent guidance when the captured window ends during recovery (resumed=%s)", async resumed => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const source = Object.assign(new EventTarget(), { readyState: "live", stop: vi.fn(), getSettings: () => ({ displaySurface: "browser" }) });
+    const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia: async () => stream } });
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String);
+    screen.beginShare(); await flush(); await screen.confirmShare(); screen.suspend();
+    if (resumed) { screen.resume(); await flush(); }
+    const startsBeforeEnding = calls.filter(([op]) => op === "screen.start").length;
+    source.readyState = "ended"; source.dispatchEvent(new Event("ended")); await flush(); screen.resume();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(useScreen.getState().own).toBeNull();
+    expect(useScreen.getState().notice).toBe("reconnect");
+    expect(toast).not.toHaveBeenCalled();
+    expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(startsBeforeEnding);
+    screen.reset();
+  });
+
+  it("queues retained quality confirmation after Welcome until the new voice binding arrives", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); initialise(screen); const source = choosing();
+    screen.suspend();
+    useSession.getState().dispatch({ type: "event", now: 3, event: { ev: "client.updated", d: cl(1, null) } });
+    screen.resume(); await screen.confirmShare();
+    const spec = useScreen.getState().own!.spec;
+    expect(useScreen.getState().own).toMatchObject({ phase: "reconnecting", spec });
+    expect(source.stop).not.toHaveBeenCalled(); expect(calls).toEqual([]);
+    useSession.getState().dispatch({ type: "event", now: 4, event: { ev: "client.updated", d: cl(1, 1, { voice_binding: null }) } });
+    await flush(); expect(calls).toEqual([]);
+    useSession.getState().dispatch({ type: "event", now: 5, event: { ev: "client.updated", d: cl(1, 1) } }); await flush();
+    expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(1);
+    expect(useScreen.getState().own?.spec).toEqual(spec); screen.reset();
+  });
+
+  it("passes learned encoder fallbacks into a republish of the same capture", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); choosing(); await screen.confirmShare();
+    const learned = { startHintUnsafe: true, brokenCodecs: ["h264" as const], codecFellBack: true, av1Retired: false, recovery: { share: "M", codec: "vp9" as const, width: 1280, height: 720, fps: 30 } };
+    vi.mocked(media.publishers[0]!.fallbacks).mockReturnValue(learned);
+    screen.suspend(); screen.resume(); await flush();
+    expect(media.publishers[1]!.params.fallbacks).toEqual(learned);
+    screen.reset();
+    choosing(); await screen.confirmShare();
+    expect(media.publishers[2]!.params.fallbacks).toBeUndefined();
+    screen.reset();
+  });
+
+  it.each(["request", "capture", "timeout"])("keeps a persistent notice when recovery fails: %s", async failure => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    let fail = false;
+    const { link } = fakeLink({ "screen.start": () => { if (fail) throw new RequestError("busy", "full"); return { share: "M" }; }, "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String), track = choosing();
+    await screen.confirmShare();
+    screen.suspend();
+    fail = true;
+    if (failure === "capture") track.readyState = "ended";
+    if (failure === "timeout") await vi.advanceTimersByTimeAsync(45_000);
+    else { screen.resume(); await flush(); }
+    expect(useScreen.getState().own).toBeNull();
+    expect(track.stop).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(useScreen.getState().notice).toBe("reconnect");
+    expect(toast).not.toHaveBeenCalled();
+    screen.reset();
+  });
+
+  it("stops capture immediately but awaits explicit Stop before closing DTLS", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const order: string[] = [];
+    const acknowledgement = deferred<object>();
+    const { link } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }), "screen.stop": () => { order.push("stop request"); return acknowledgement.promise; } });
+    const screen = new ScreenController(() => link, String), track = choosing();
+    await screen.confirmShare();
+    vi.mocked(media.publishers[0]!.close).mockImplementation(() => { order.push("close publisher"); });
+    const stopping = screen.stopShare();
+    expect(track.stop).toHaveBeenCalledOnce();
+    expect(useScreen.getState().own).toBeNull();
+    expect(media.publishers[0]!.close).not.toHaveBeenCalled();
+    acknowledgement.resolve({}); await stopping;
+    expect(order).toEqual(["stop request", "close publisher"]);
+    screen.reset();
+  });
+
+  it("explicit Stop during reconnect prevents republishing and does not show a failure notice", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); choosing();
+    await screen.confirmShare();
+    screen.suspend(); await screen.stopShare(); screen.resume();
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(calls.filter(([op]) => op === "screen.start")).toHaveLength(1);
+    expect(useScreen.getState().notice).toBeNull();
+    screen.reset();
+  });
+
+  it("fences a late start response from before a reconnect", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const old = deferred<{ share: string }>();
+    let starts = 0;
+    const { link } = fakeLink({ "screen.start": () => ++starts === 1 ? old.promise : { share: "new" }, "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const screen = new ScreenController(() => link, String); choosing();
+    const starting = screen.confirmShare(); await flush();
+    screen.suspend(); screen.resume(); await flush();
+    old.resolve({ share: "old" }); await starting;
+    expect(useScreen.getState().own?.share).toBe("new");
+    expect(media.publishers).toHaveLength(1);
+    screen.reset();
+  });
 
   it("stops a silently ended capture through the normal path and ignores an old publisher", async () => {
     useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
@@ -617,7 +1152,7 @@ describe("sharing", () => {
     useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
     const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
     const unexpected = vi.fn();
-    const screen = new ScreenController(() => link, String, unexpected), t = choosing();
+    const screen = new ScreenController(() => link, String, () => true, unexpected), t = choosing();
     await screen.confirmShare();
     const publisher = media.publishers[0]!;
     publisher.params.encodeFailed(); await flush();
@@ -626,7 +1161,7 @@ describe("sharing", () => {
     expect(t.stop).toHaveBeenCalledTimes(1);
     expect(publisher.close).toHaveBeenCalledTimes(1);
     expect(calls.filter(([op]) => op === "screen.stop")).toEqual([["screen.stop", { share: "M" }]]);
-    expect(toast).toHaveBeenCalledExactlyOnceWith("error", "Your screen share was stopped: this browser could not encode the video.");
+    expect(toast).toHaveBeenCalledExactlyOnceWith("error", "Your screen share was stopped: this browser could not encode the video.", expect.objectContaining({ key: "screen-stopped", sticky: true, action: { label: "Share again", run: expect.any(Function) } }));
     choosing(); await screen.confirmShare();
     publisher.params.encodeFailed(); await flush();
     expect(useScreen.getState().own?.share).toBe("M");
@@ -742,6 +1277,35 @@ describe("sharing", () => {
       expect((await start(screen => screen.setGuestLink(false))).start.guest_link).toBe(false);
     });
 
+    it.each(["sharer", "moderator"])("does not recreate a watch link revoked by the %s", async who => {
+      teamspeak();
+      useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+      const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+      const screen = new ScreenController(() => link, String); choosing(); await screen.confirmShare();
+      screen.handleEvent({ ev: "screen.started", d: share("M", 1, 1) });
+      screen.handleEvent({ ev: "screen.link", d: { share: "M", active: true } });
+      if (who === "sharer") await screen.turnOffLink("M");
+      else screen.handleEvent({ ev: "screen.link", d: { share: "M", active: false } });
+      expect(useScreen.getState().own?.guestLink).toBe(false);
+      screen.suspend(); screen.resume(); await flush();
+      expect(calls.filter(([op]) => op === "screen.start").at(-1)![1].guest_link).toBe(false);
+      screen.reset();
+    });
+
+    it("retains my revoke choice when the connection drops before its acknowledgement", async () => {
+      teamspeak();
+      useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+      const revoked = deferred<object>();
+      const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }), "screen.link.revoke": () => revoked.promise });
+      const screen = new ScreenController(() => link, String); choosing(); await screen.confirmShare();
+      screen.handleEvent({ ev: "screen.started", d: share("M", 1, 1) });
+      screen.handleEvent({ ev: "screen.link", d: { share: "M", active: true } });
+      const revoking = screen.turnOffLink("M");
+      screen.suspend(); screen.resume(); await flush();
+      expect(calls.filter(([op]) => op === "screen.start").at(-1)![1].guest_link).toBe(false);
+      revoked.resolve({}); await revoking; screen.reset();
+    });
+
     it("never asks without a bridged channel, links for files or the server's watch links", async () => {
       for (const patch of [{ teamspeak: false }, { file_access: "members" }, { screen_guest_links: false }]) {
         useScreen.setState({ ...initialScreen });
@@ -781,6 +1345,9 @@ describe("sharing", () => {
     expect(useScreen.getState().own).toBeNull();
     expect(t.stop).toHaveBeenCalled();
     expect(media.publishers[0]!.close).toHaveBeenCalled();
-    expect(toast).toHaveBeenCalledWith("info", "Mod stopped your screen share.");
+    const begin = vi.spyOn(screen, "beginShare").mockImplementation(() => {});
+    toast.mock.calls.at(-1)![2].action.run();
+    expect(begin).toHaveBeenCalledOnce();
+    expect(toast).toHaveBeenCalledWith("info", "Mod stopped your screen share.", expect.objectContaining({ sticky: true, key: "screen-stopped" }));
   });
 });

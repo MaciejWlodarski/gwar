@@ -175,6 +175,20 @@ describe("installing", () => {
     expect(backend.relaunch).toHaveBeenCalledTimes(1);
   });
 
+  it.each(["success", "install failure", "relaunch failure"])("records voice intent before install and rolls it back on failure: %s", async outcome => {
+    const cancel = vi.fn();
+    const update = new FakeUpdate("0.1.3");
+    const prepare = vi.fn(async (version: string) => { expect(version).toBe("0.1.3"); expect(update.installed).toBe(false); return cancel; });
+    updater = new Updater(backend, store, prepare);
+    feed.push(update);
+    const checked = updater.check(); await settle(); update.complete(); await checked;
+    if (outcome === "install failure") update.installError = new Error("denied");
+    if (outcome === "relaunch failure") backend.relaunch.mockRejectedValueOnce(new Error("cannot restart"));
+    await updater.install();
+    expect(prepare).toHaveBeenCalledOnce();
+    expect(cancel).toHaveBeenCalledTimes(outcome === "success" ? 0 : 1);
+  });
+
   it("does nothing before the download is ready", async () => {
     const update = new FakeUpdate("0.1.3");
     feed.push(update);

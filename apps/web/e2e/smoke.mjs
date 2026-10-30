@@ -35,6 +35,7 @@ import path from "node:path";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { installMicPrivacyGuard } from "./mic-privacy.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(here, "..");
@@ -298,6 +299,12 @@ async function changeServerNickname(page, nickname) {
 }
 
 async function connect(page, nickname, { mobile = false, address = CLIENT_ADDR } = {}) {
+  // A fresh manual connection starts with an explicit Disconnect; a reload alone now restores the server.
+  if (page.url().startsWith(`${WEB_URL}/`)) {
+    await page.evaluate(async () => {
+      if (window.__gwarE2eImport) await (await window.__gwarE2eImport("/src/state/controller.ts")).controller.disconnect();
+    });
+  }
   await page.goto(WEB_URL);
   await page.getByLabel("Server address").fill(address);
   await setGlobalNickname(page, nickname, { mobile });
@@ -353,6 +360,7 @@ async function storePin(page, endpoint, pin) {
 
 async function serverFingerprint(page) {
   await page.getByRole("button", { name: /^(Server menu|Menu serwera)$/ }).click();
+  await page.getByRole("menuitem", { name: /^(Advanced|Zaawansowane)$/ }).hover();
   await page.getByRole("menuitem", { name: /^(Server key|Klucz serwera)$/ }).click();
   const key = page.getByTestId("server-fingerprint");
   const text = await key.innerText();
@@ -387,16 +395,6 @@ async function main() {
         return ws;
       },
     });
-    // Counts microphone requests: nothing may ask before the user joins voice.
-    window.__gum = 0;
-    const media = navigator.mediaDevices;
-    if (media?.getUserMedia) {
-      const nativeGum = media.getUserMedia.bind(media);
-      media.getUserMedia = (...args) => {
-        window.__gum++;
-        return nativeGum(...args);
-      };
-    }
     const pcs = (window.__pcs = []);
     const NativePC = window.RTCPeerConnection;
     window.RTCPeerConnection = new Proxy(NativePC, {
@@ -414,6 +412,11 @@ async function main() {
       const host = new URL(route.request().url()).hostname;
       return ["127.0.0.1", "localhost", "[::1]"].includes(host) ? route.continue() : route.abort();
     });
+    await ctx.addInitScript(() => {
+      const key = "gwar.settings";
+      if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify({ version: 3, state: { onboarding: { completed: true, firstUsedAt: Date.now(), nudgeDismissed: true, roleReceived: false } } }));
+    });
+    await ctx.addInitScript(installMicPrivacyGuard);
     await ctx.addInitScript(spy);
     return ctx;
   };
@@ -440,7 +443,8 @@ async function main() {
     await connect(a, "Alice");
     await shot(a, "03-desktop-not-in-voice-dark");
     if ((await a.getByRole("button", { name: /Mute microphone/ }).count()) !== 0) throw new Error("mic button shown outside voice");
-    if ((await a.evaluate(() => window.__gum)) !== 0) throw new Error("the microphone was requested before joining voice");
+    if ((await a.evaluate(() => window.__unexpectedPreview)) !== 0) throw new Error(JSON.stringify(await a.evaluate(() => window.__micPrivacyViolations)));
+    await waitFor(() => a.evaluate(() => window.__micStreams.every(stream => stream.getTracks().every(track => track.readyState === "ended"))), "settings preview capture released before connecting", 5000);
     if ((await a.evaluate(() => window.__pcs.length)) !== 0) throw new Error("a peer connection exists before joining voice");
   });
   await check("verified server fingerprint is visible and pinned after first connection", async () => {
@@ -562,6 +566,7 @@ async function main() {
   console.log("admin");
   await check("alice redeems the admin token", async () => {
     await a.getByRole("button", { name: "Server menu" }).click();
+    await a.getByRole("menuitem", { name: "Advanced", exact: true }).hover();
     await a.getByRole("menuitem", { name: "Redeem token" }).click();
     await a.getByLabel("Token", { exact: true }).fill(token);
     await a.getByRole("button", { name: "Redeem" }).click();
@@ -1196,7 +1201,7 @@ async function main() {
     await a.getByRole("button", { name: "Settings" }).first().click();
     await a.getByRole("tab", { name: "Audio" }).click();
     await a.getByRole("radio", { name: "Push to talk" }).click();
-    await a.getByRole("button", { name: "Set push-to-talk key" }).click();
+    await a.getByRole("button", { name: "Choose a key" }).click();
     await a.keyboard.press("KeyV");
     await a.keyboard.press("Escape");
     await a.locator("header").first().click();
@@ -2052,6 +2057,10 @@ async function main() {
     if (real.length) throw new Error(real.slice(0, 3).join(" | "));
   });
 
+  for (const page of [a, b]) {
+    const violations = await page.evaluate(() => window.__micPrivacyViolations);
+    if (violations.length) throw new Error(`microphone privacy: ${JSON.stringify(violations)}`);
+  }
   await browser.close();
 }
 

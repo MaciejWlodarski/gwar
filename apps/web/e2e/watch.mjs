@@ -19,6 +19,7 @@
  *   GWAR_SERVER_BIN      server binary with the test hooks (default: target/debug/gwar-server)
  *   E2E_WATCH_HOLD_MS    how long the guests keep watching (default: 150000)
  */
+import { chooseFirstRunName } from "./first-run.mjs";
 import { stopProcesses } from "./processes.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
@@ -157,6 +158,7 @@ async function newPage(browser, name, share) {
 async function member(browser, web, server, name) {
   const page = await newPage(browser, name, true);
   await page.goto(web);
+  await chooseFirstRunName(page, name);
   const address = page.getByLabel("Server address");
   // The same-origin /health probe also writes this field. Let it finish before fill() selects
   // and replaces the value, or its result can land between selection and text insertion.

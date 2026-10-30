@@ -1,4 +1,8 @@
 import { nextMediaRun } from "./engine";
+import { hasInputGateControl } from "./sdp";
+import { MicTests } from "./mic-test";
+import { dbToLevel, inputThreshold } from "./input-sensitivity";
+export { dbToLevel } from "./input-sensitivity";
 import { AUDIO_SLOTS } from "../net/protocol";
 import { tauri, type TauriBridge, type Unlisten } from "../platform";
 import {
@@ -19,6 +23,14 @@ type Handler = (value: never) => void;
 const CONNECT_TIMEOUT_MS = 15_000;
 const DEVICE_POLL_MS = 4_000;
 
+/** `voice://device`: the Rust engine sorted a device out by itself. */
+interface DevicePayload {
+  owner: number;
+  side: "input" | "output";
+  kind: "switched" | "recovered";
+  device: string | null;
+}
+
 /** `voice://issue`: a device problem reported by the Rust engine. */
 interface IssuePayload {
   owner: number;
@@ -29,11 +41,6 @@ interface IssuePayload {
 
 export function micErrorKind(kind: IssuePayload["kind"]): "no_mic" | "mic_denied" | "mic_failed" {
   return kind === "no_device" ? "no_mic" : kind === "permission_denied" ? "mic_denied" : "mic_failed";
-}
-
-/** dBFS (RMS) -> 0..1 over a 60 dB range, same shaping as the browser meter. */
-export function dbToLevel(db: number): number {
-  return Math.min(1, Math.max(0, (db + 60) / 60));
 }
 
 type StartParams = Parameters<VoiceEngine["start"]>[0];
@@ -62,9 +69,18 @@ export class NativeVoiceEngine implements VoiceEngine {
   private connectTimer: ReturnType<typeof setTimeout> | null = null;
   private devicePoll: ReturnType<typeof setInterval> | null = null;
   private lastDevices = "";
-  private restartTimer: ReturnType<typeof setTimeout> | null = null;
   private smoothed = 0;
+  private inputMode: InputMode = "vad";
+  private automaticSensitivity = true;
+  private threshold = inputThreshold(null);
   private micTestId = 0;
+  private micTests = new MicTests();
+  private muted = false;
+  private deafened = false;
+  private gateSupported: boolean | null = null;
+  private gateSerial = 0;
+  private gateKind = "automatic";
+  private gateQueue: Promise<void> = Promise.resolve();
 
   private inputDevice: string | null = null;
   private outputDevice: string | null = null;
@@ -120,6 +136,12 @@ export class NativeVoiceEngine implements VoiceEngine {
     return this.queue;
   }
 
+  private sendStrict(command: string, args: Record<string, unknown>): Promise<void> {
+    const result = this.queue.then(() => this.invoke(command, args));
+    this.queue = result.catch(() => {});
+    return result;
+  }
+
   private async ensureListeners(): Promise<TauriBridge> {
     const { api, owner } = await this.ready;
     this.listening ??= (async () => {
@@ -155,6 +177,11 @@ export class NativeVoiceEngine implements VoiceEngine {
             this.emit("outputError", new VoiceError("output_failed", p.message));
           }
         }),
+        await api.listen<DevicePayload>("voice://device", (p) => {
+          if (p.owner !== owner) return;
+          if (p.kind === "recovered") this.emit(p.side === "input" ? "micError" : "outputError", null);
+          else if (p.device) this.emit("deviceSwitched", { side: p.side, label: p.device });
+        }),
       );
     })();
     await this.listening;
@@ -172,6 +199,14 @@ export class NativeVoiceEngine implements VoiceEngine {
     if (run !== this.runId || !params) return;
     try {
       const answer = await params.offer(sdp, run);
+      if (run !== this.runId || this.params !== params) return;
+      this.gateSupported = !!params.inputGate && hasInputGateControl(answer);
+      this.emit("inputGateSupport", this.gateSupported);
+      this.gateKind = this.inputMode === "ptt" ? "ptt" : this.automaticSensitivity || !this.gateSupported ? "automatic" : "manual";
+      await this.sendMode(true);
+      if (this.gateSupported) await params.inputGate!(this.gateKind !== "automatic", run);
+      if (run !== this.runId || this.params !== params) return;
+      if (!this.gateSupported && this.inputMode === "ptt") throw new VoiceError("input_mode_unsupported", "push-to-talk needs an updated server");
       this.send("voice_answer", { run, sdp: answer });
     } catch (e) {
       this.send("voice_answer", { run, error: e instanceof Error ? e.message : String(e) });
@@ -191,8 +226,14 @@ export class NativeVoiceEngine implements VoiceEngine {
     if (encrypted && (!params.keys || !server_key || !call || !participation || !group)) throw new VoiceError("unsupported", "encrypted voice needs its call binding and keys");
     const run = (this.runId = nextMediaRun());
     this.params = params;
+    this.gateSupported = null;
+    this.gateSerial = 0;
+    this.gateQueue = Promise.resolve();
+    this.emit("inputGateSupport", null);
     this.clearConnectTimer();
     this.setState("starting");
+    await this.micTests.stop();
+    if (run !== this.runId) return;
     this.emit("micError", null);
     this.emit("outputError", null);
     await this.ensureListeners();
@@ -230,15 +271,17 @@ export class NativeVoiceEngine implements VoiceEngine {
   async stop(): Promise<void> {
     const stoppedRun = this.runId;
     this.runId = nextMediaRun();
+    const retired = this.runId;
     this.params = null;
+    this.gateSupported = null;
+    this.emit("inputGateSupport", null);
     this.clearConnectTimer();
-    if (this.restartTimer) clearTimeout(this.restartTimer);
-    this.restartTimer = null;
     this.stopDevicePoll();
     this.smoothed = 0;
     this.emit("level", 0);
-    this.setState("idle");
+    await this.micTests.stop();
     await this.send("voice_stop", { run: stoppedRun });
+    if (this.runId === retired) this.setState("idle");
   }
 
   async cryptoCounters(): Promise<Record<string, number> | null> {
@@ -261,46 +304,71 @@ export class NativeVoiceEngine implements VoiceEngine {
     }
   }
 
-  /** Device changes apply on the next start; restart now if a session is live. */
-  private scheduleRestart(): void {
-    if (!this.params || this.state === "idle") return;
-    if (this.restartTimer) clearTimeout(this.restartTimer);
-    this.restartTimer = setTimeout(() => {
-      this.restartTimer = null;
-      void this.restart();
-    }, 200);
-  }
-
   // ----------------------------------------------------------------- setters
 
   setMuted(muted: boolean): void {
+    this.muted = muted;
+    if (muted) void this.micTests.stop();
     this.send("voice_set_muted", { muted });
   }
 
   setDeafened(deafened: boolean): void {
+    this.deafened = deafened;
+    if (deafened) void this.micTests.stop();
     this.send("voice_set_deafened", { deafened });
   }
 
   setInputMode(mode: InputMode): void {
-    this.send("voice_set_input_mode", { mode });
+    this.inputMode = mode;
+    const kind = mode === "ptt" ? "ptt" : this.automaticSensitivity || this.gateSupported === false ? "automatic" : "manual";
+    if (!this.params || this.gateSupported === null || kind === this.gateKind) { void this.sendMode(); return; }
+    this.gateKind = kind;
+    const run = this.runId, serial = ++this.gateSerial, params = this.params;
+    // Close before applying the local mode. A stale ack can never reopen it.
+    const closed = this.sendStrict("voice_set_gate_ready", { run, serial, ready: false });
+    const applied = this.sendMode(true);
+    this.gateQueue = this.gateQueue.then(async () => {
+      await closed; await applied;
+      if (run !== this.runId || serial !== this.gateSerial || this.params !== params) return;
+      if (this.gateSupported) await params.inputGate!(kind !== "automatic", run);
+      else if (kind === "ptt") { this.emit("micError", new VoiceError("input_mode_unsupported", "push-to-talk needs an updated server")); return; }
+      if (run === this.runId && serial === this.gateSerial && this.params === params) await this.invoke("voice_set_gate_ready", { run, serial, ready: true });
+    }).catch(error => {
+      if (run !== this.runId || this.params !== params) return;
+      console.warn("[native voice] input mode transition failed:", error);
+      this.runId = nextMediaRun();
+      this.params = null;
+      this.clearConnectTimer();
+      void this.send("voice_stop", { run });
+      this.setState("failed");
+    });
+  }
+
+  private sendMode(strict = false): Promise<void> {
+    return (strict ? this.sendStrict.bind(this) : this.send.bind(this))("voice_set_input_mode", { mode: this.inputMode, thresholdDb: this.automaticSensitivity || this.gateSupported === false ? null : this.threshold });
+  }
+
+  setInputSensitivity(threshold: number | null): void {
+    this.automaticSensitivity = threshold === null;
+    this.threshold = inputThreshold(threshold);
+    this.setInputMode(this.inputMode);
   }
 
   setPttActive(active: boolean): void {
     this.send("voice_set_ptt", { active });
   }
 
+  // Running voice moves to the new device natively, without renegotiating.
   async setInputDevice(deviceId: string | null): Promise<void> {
     if (this.inputDevice === deviceId) return;
     this.inputDevice = deviceId;
     this.send("voice_set_devices", { input: this.inputDevice, output: this.outputDevice });
-    this.scheduleRestart();
   }
 
   async setOutputDevice(deviceId: string | null): Promise<void> {
     if (this.outputDevice === deviceId) return;
     this.outputDevice = deviceId;
     this.send("voice_set_devices", { input: this.inputDevice, output: this.outputDevice });
-    this.scheduleRestart();
   }
 
   async setCaptureOptions(options: CaptureOptions): Promise<void> {
@@ -373,36 +441,52 @@ export class NativeVoiceEngine implements VoiceEngine {
     this.devicePoll = null;
   }
 
-  async startMicTest(onLevel: (level: number) => void): Promise<() => void> {
+  micPermission(): Promise<import("./engine").MicPermission> {
+    return this.invoke("mic_permission");
+  }
+
+  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal): Promise<() => void> {
+    return this.micTests.start(async aborted => {
+      if (this.state !== "idle" || this.muted || this.deafened || aborted.aborted) return () => {};
+      return this.openMicTest(onLevel, aborted);
+    }, signal);
+  }
+
+  private async openMicTest(onLevel: (level: number) => void, signal: AbortSignal): Promise<() => void | Promise<void>> {
     const test = ++this.micTestId;
+    // Apply queued mute/device controls before the native preview checks its capture policy.
+    await this.queue;
     const api = await this.ensureListeners();
     const { owner } = await this.ready;
     let smooth = 0;
-    const off = await api.listen<{ owner: number; db: number }>("voice://test-level", (p) => {
-      if (p.owner !== owner || test !== this.micTestId) return;
+    const off = await api.listen<{ owner: number; test: number; db: number }>("voice://test-level", (p) => {
+      if (p.owner !== owner || p.test !== test || test !== this.micTestId || signal.aborted) return;
       const target = dbToLevel(p.db);
       smooth = target > smooth ? target : smooth * 0.8 + target * 0.2;
       onLevel(smooth < 0.01 ? 0 : smooth);
     });
     // Listener setup can finish after a newer test has already opened capture.
-    if (test !== this.micTestId) {
+    if (test !== this.micTestId || signal.aborted) {
       off();
       return () => {};
     }
+    const retire = () => { void this.invoke("mic_test_stop", { test }).catch(() => {}); };
+    signal.addEventListener("abort", retire, { once: true });
     try {
-      await this.invoke("mic_test_start", { input: this.inputDevice });
+      await this.invoke("mic_test_start", { input: this.inputDevice, test });
     } catch (e) {
       off();
+      signal.removeEventListener("abort", retire);
+      if (signal.aborted) { await this.invoke("mic_test_stop", { test }).catch(() => {}); return () => {}; }
       throw new VoiceError("mic_failed", typeof e === "string" ? e : String(e));
     }
     void this.listDevices().then((d) => this.emit("devices", d));
     return () => {
       off();
+      signal.removeEventListener("abort", retire);
       // A late result belongs to its own test, never the replacement's capture.
-      if (test !== this.micTestId) return;
-      ++this.micTestId;
-      this.send("mic_test_stop");
-      onLevel(0);
+      if (test === this.micTestId) { ++this.micTestId; onLevel(0); }
+      return this.invoke("mic_test_stop", { test }).catch(() => {});
     };
   }
 }

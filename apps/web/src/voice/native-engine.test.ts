@@ -4,10 +4,10 @@ import { isDesktop } from "../platform";
 import { dbToLevel, micErrorKind } from "./native-engine";
 
 describe("dbToLevel", () => {
-  it("maps -60 dB to 0 and 0 dB to 1", () => {
+  it("maps -100 dB to 0 and 0 dB to 1", () => {
     expect(dbToLevel(-100)).toBe(0);
-    expect(dbToLevel(-60)).toBe(0);
-    expect(dbToLevel(-30)).toBeCloseTo(0.5);
+    expect(dbToLevel(-60)).toBeCloseTo(0.4);
+    expect(dbToLevel(-30)).toBeCloseTo(0.7);
     expect(dbToLevel(0)).toBe(1);
     expect(dbToLevel(6)).toBe(1);
   });

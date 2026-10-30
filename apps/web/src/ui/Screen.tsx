@@ -6,20 +6,22 @@ import { Maximize, MessageSquare, MessageSquareOff, Minimize, MonitorOff, Monito
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { cn } from "../lib/cn";
-import { isDesktop } from "../platform";
+import { ConnectionIndicator } from "./ConnectionQuality";
+import { canOpenScreenRecordingSettings, isDesktop, openScreenRecordingSettings } from "../platform";
+import { captureApp, captureOs } from "../voice/screen-permission";
 import { canActOn } from "../lib/permissions";
 import type { Client } from "../proto/Client";
 import type { ScreenPauseReason } from "../proto/ScreenPauseReason";
 import type { ScreenShare } from "../proto/ScreenShare";
 import { controller } from "../state/controller";
 import { guestLinkPossible, useCanWatch, useScreenSupport } from "../state/screen-controller";
-import { shareOf } from "../state/reducer";
+import { myChannelId, shareOf } from "../state/reducer";
 import { slotOf, useScreen } from "../state/screen";
 import { useSession, useUi } from "../state/stores";
 import { type PublishStats } from "../voice/screen";
 import { HEIGHTS, FRAME_RATES, type ScreenSpec } from "../voice/screen-quality";
-import { useChannelPermission, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
-import { BackButton, Button, Dialog, IconButton, panelCard, TalkingAvatar, Tooltip } from "./kit";
+import { useChannelPermission, useConnectionQuality, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
+import { BackButton, Button, Dialog, IconButton, panelCard, TalkingAvatar, Tooltip, TopBanner } from "./kit";
 import { paneBack } from "./nav";
 
 // -------------------------------------------------------------------- start
@@ -72,6 +74,47 @@ export function ShareButton() {
     >
       <MonitorUp className="size-[18px]" />
     </IconButton>
+  );
+}
+
+/** A stopped share or OS refusal needs an action that does not expire. */
+export function ScreenNotice() {
+  const notice = useScreen(s => s.notice);
+  return notice ? <ScreenNoticeContent key={notice} notice={notice} /> : null;
+}
+
+function ScreenNoticeContent({ notice }: { notice: "reconnect" | "permission" | "permissionHint" }) {
+  const t = useT();
+  const [help, setHelp] = useState(false);
+  const own = useScreen(s => s.own);
+  const phase = useSession(s => s.phase);
+  const channel = useSession(myChannelId);
+  const title = notice === "permissionHint" ? "screen.permissionHintTitle" : "screen.permissionTitle";
+  return (
+    <>
+      <TopBanner role={notice === "permissionHint" ? "status" : "alert"} data-testid="screen-notice" className="text-fg">
+        <MonitorOff aria-hidden className={cn("size-4 shrink-0", notice === "permissionHint" ? "text-muted" : "text-danger")} />
+        <p data-testid="screen-notice-text" className="min-w-0 flex-1 text-[13px] whitespace-nowrap min-[800px]:text-sm">
+          <span className="min-[800px]:hidden">{t(notice === "reconnect" ? "screen.reconnectStoppedShort" : notice === "permissionHint" ? "screen.permissionHintShort" : "screen.permissionShort")}</span>
+          <span className="hidden min-[800px]:inline">{t(notice === "reconnect" ? "screen.reconnectStopped" : title)}</span>
+        </p>
+        {notice === "reconnect" ? (
+          <Button size="sm" className="whitespace-nowrap max-[799px]:px-2!" variant="primary" aria-label={t("screen.shareAgain")} disabled={phase !== "online" || !!own || channel === null} onClick={() => controller.screen.beginShare()}>
+            <span className="min-[800px]:hidden">{t("screen.shareAgainShort")}</span><span className="hidden min-[800px]:inline">{t("screen.shareAgain")}</span>
+          </Button>
+        ) : (
+          <Button size="sm" className="whitespace-nowrap max-[799px]:px-2!" onClick={() => setHelp(true)}>{t(notice === "permissionHint" ? "screen.permissionHintFix" : "screen.permissionFix")}</Button>
+        )}
+        <IconButton label={t("common.close")} tooltip={false} onClick={() => useScreen.getState().dispatch({ type: "notice", notice: null })}><X className="size-4" /></IconButton>
+      </TopBanner>
+      {notice !== "reconnect" && <Dialog open={help} onOpenChange={setHelp} title={t(notice === "permissionHint" ? "screen.permissionHintFix" : "screen.permissionFix")} footer={
+        canOpenScreenRecordingSettings() ? <Button onClick={() => void openScreenRecordingSettings().catch((e: unknown) => console.warn("[screen] privacy settings:", e))}>{t("screen.openSettings")}</Button> : undefined
+      }>
+        <p className="text-sm leading-relaxed text-pretty text-muted">{t(notice === "permissionHint" ? "screen.permissionHint" : "screen.permission", {
+          app: captureApp(isDesktop(), navigator.userAgent) ?? t("screen.browser"), settings: t(`screen.permissionPlace.${captureOs(navigator.userAgent)}`),
+        })}</p>
+      </Dialog>}
+    </>
   );
 }
 
@@ -160,8 +203,8 @@ export function SharingBar() {
   const lang = useLanguage();
   const own = useScreen(s => s.own);
   const links = useScreen(s => s.links);
-  if (!own || (own.phase !== "starting" && own.phase !== "live")) return null;
-  const watching = own.phase === "live" ? t(countKey(lang, "screen.watching", own.viewers), { count: own.viewers }) : t("screen.starting");
+  if (!own || (own.phase !== "starting" && own.phase !== "live" && own.phase !== "reconnecting")) return null;
+  const watching = own.phase === "live" ? t(countKey(lang, "screen.watching", own.viewers), { count: own.viewers }) : t(own.phase === "reconnecting" ? "screen.reconnecting" : "screen.starting");
   const linked = !!own.share && !!links[own.share];
   return (
     <div role="status" aria-label={t("screen.sharingBar")} className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 bg-danger px-3 py-1.5 text-sm text-white">
@@ -178,8 +221,7 @@ export function SharingBar() {
           </Button>
         </span>
       )}
-      <span className="ml-auto flex items-center gap-2">
-        <span className="text-xs">{`${own.spec.height}p${own.spec.fps} · ${t(`screen.mode.${own.spec.mode}`)}`}</span>
+      <span className="ml-auto flex max-w-full flex-wrap items-center justify-end gap-2">
         <QualityControls spec={own.spec} bar />
         <Button size="sm" variant="secondary" aria-pressed={own.preview} className={cn("border-white/40 text-white hover:bg-white/15", own.preview && "bg-white/20")}
           onClick={() => controller.screen.setPreview(!own.preview)}>
@@ -201,6 +243,7 @@ export function SharingBar() {
 function SenderStats() {
   const t = useT();
   const [stats, setStats] = useState<PublishStats | null>(null);
+  const congested = !!useConnectionQuality()?.congestion;
   useEffect(() => {
     let live = true;
     const poll = () => void controller.screen.ownStats().then(s => { if (live) setStats(s); });
@@ -208,20 +251,26 @@ function SenderStats() {
     const timer = setInterval(poll, 2000);
     return () => { live = false; clearInterval(timer); };
   }, []);
-  if (!stats || !stats.height) return null;
+  if (!stats || !stats.height) return <ConnectionIndicator variant="bar" />;
   const mbps = (stats.bitrate / 1e6).toFixed(1);
   const encoder = stats.encoder
     ? t("screen.encoder", { name: stats.encoder, kind: t(stats.hardware === true ? "screen.encoderHardware" : stats.hardware === false ? "screen.encoderSoftware" : "screen.encoderUnknown") })
     : undefined;
   return (
-    <span data-testid="screen-sender-stats" title={encoder} className="flex items-center gap-1.5 text-xs text-white/85 tabular-nums">
-      {`${stats.height}p · ${stats.fps} fps · ${mbps} Mb/s${stats.codec ? ` · ${stats.codec}` : ""}`}
-      {stats.limitation === "cpu" || stats.limitation === "bandwidth" ? (
-        <span className="rounded bg-white/20 px-1.5 leading-5 font-medium text-white">
-          {t(stats.limitation === "cpu" ? "screen.limitedCpu" : "screen.limitedBandwidth")}
-        </span>
-      ) : null}
-    </span>
+    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+      <ConnectionIndicator variant="bar" />
+      <details data-testid="screen-sender-stats" className="relative text-xs text-white">
+        <summary className="cursor-pointer rounded border border-white/40 px-2 py-1 font-medium">
+          {/* Congestion is the more specific reason the encoder is held back. */}
+          {t(congested ? "common.details" : stats.limitation === "cpu" ? "screen.limitedCpu" : stats.limitation === "bandwidth" ? "screen.limitedBandwidth" : "screen.qualityGood")}
+        </summary>
+        <div className="absolute top-full left-0 z-50 mt-1 w-64 rounded-lg border border-line-strong bg-raised p-3 text-fg shadow-pop">
+          <p className="mb-1 font-medium">{t("common.details")}</p>
+          <p className="tabular-nums">{`${stats.height}p · ${stats.fps} fps · ${mbps} Mb/s${stats.codec ? ` · ${stats.codec}` : ""}`}</p>
+          {encoder && <p className="mt-1 text-muted">{encoder}</p>}
+        </div>
+      </details>
+    </div>
   );
 }
 
@@ -412,28 +461,47 @@ export function ShareVideo({ share, className, onDoubleClick, videoRef, compact 
   );
 }
 
+/** A Try again the server has not answered this long after it was due is offered again. */
+const RETRY_ANSWER_MS = 10_000;
+
 /** Over the last frame, while the server holds a watched share back for my connection or its budget. */
 function PausedOverlay({ share, reason, compact }: { share: string; reason: ScreenPauseReason; compact?: boolean }) {
   const t = useT();
-  const [asked, setAsked] = useState(false);
+  // The server stopped retrying on its own: only Try again brings the picture back now.
+  const waiting = useScreen(s => s.watches.find(w => w.share === share)?.waiting) && reason === "bandwidth";
+  // When the server carries out my Try again (it holds one asked too soon), and a clock to count down to it.
+  const [due, setDue] = useState<number | null>(null);
+  const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
-    if (!asked) return;
-    // The server answers through its keyframe throttle; one ask per few seconds is plenty.
-    const timer = setTimeout(() => setAsked(false), 5000);
-    return () => clearTimeout(timer);
-  }, [asked]);
-  const text = t(reason === "bandwidth" ? "screen.pausedBandwidth" : "screen.pausedBudget");
+    if (due === null) return;
+    const tick = setInterval(() => setNow(Date.now()), 250);
+    // Resuming unmounts this; without an answer (it resumed and paused again unseen, or the server had nothing to retry), offer it again.
+    const expire = setTimeout(() => setDue(null), Math.max(0, due - Date.now()) + RETRY_ANSWER_MS);
+    return () => { clearInterval(tick); clearTimeout(expire); };
+  }, [due]);
+  const text = t(waiting ? "screen.pausedWaiting" : reason === "bandwidth" ? "screen.pausedBandwidth" : "screen.pausedBudget");
+  const invite = waiting && due === null;
+  const left = due === null ? 0 : Math.ceil((due - now) / 1000);
   return (
-    <div data-screen-paused={reason} role="status" className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/75 p-3 text-center text-white">
+    <div data-screen-paused={reason} data-waiting={waiting || undefined} role="status" className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-3 bg-black/75 p-3 text-center text-white">
       {compact ? (
-        <span className="rounded bg-white/15 px-1.5 text-[11px] leading-5 font-medium" title={text}>{t("screen.pausedShort")}</span>
+        <span className="rounded bg-white/15 px-1.5 text-[11px] leading-5 font-medium" title={text}>{t(reason === "bandwidth" ? "screen.pausedLink" : "screen.pausedShort")}</span>
       ) : (
         <>
-          <p className="max-w-sm text-sm text-white/90">{text}</p>
+          <p className="max-w-sm text-sm text-balance text-white/90">{text}</p>
           {reason === "bandwidth" && (
-            <Button size="sm" variant="secondary" disabled={asked} className="border-white/30 text-white hover:bg-white/10"
-              onClick={e => { e.stopPropagation(); setAsked(true); controller.screen.retry(share); }}>
-              <RotateCw className="size-4" /> {t("screen.retry")}
+            <Button size="sm" variant={invite ? "primary" : "secondary"} disabled={due !== null}
+              className={cn("tabular-nums disabled:opacity-80", !invite && "border-white/30 text-white hover:bg-white/10")}
+              onClick={e => {
+                e.stopPropagation();
+                const wait = controller.screen.retry(share);
+                if (wait === null) return;
+                setNow(Date.now());
+                setDue(Date.now() + wait);
+              }}>
+              {due !== null && left > 0 ? t("screen.retryIn", { seconds: left }) : (
+                <><RotateCw className={cn("size-4", due !== null && "animate-spin")} /> {t(due === null ? "screen.retry" : "screen.retrying")}</>
+              )}
             </Button>
           )}
         </>
@@ -460,7 +528,7 @@ function useMayStop(share: ScreenShare | undefined, client: Client | undefined):
 
 function QualityBadge({ share }: { share: string }) {
   const t = useT();
-  const paused = useScreen(s => s.watches.some(w => w.share === share && w.paused));
+  const paused = useScreen(s => s.watches.find(w => w.share === share)?.paused);
   const [label, setLabel] = useState("");
   useEffect(() => {
     let live = true;
@@ -472,7 +540,8 @@ function QualityBadge({ share }: { share: string }) {
     return () => { live = false; clearInterval(timer); };
   }, [share]);
   // A paused slot's last resolution at 0 fps would read as a frozen stream.
-  if (paused) return <span data-testid="screen-quality" className="rounded bg-white/10 px-1.5 text-[11px] leading-5 text-white/80">{t("screen.pausedShort")}</span>;
+  // On a phone the overlay below already says why; the title keeps the room.
+  if (paused) return <span data-testid="screen-quality" className="shrink-0 rounded bg-white/10 px-1.5 text-[11px] leading-5 whitespace-nowrap text-white/80 max-sm:hidden">{t(paused === "bandwidth" ? "screen.pausedLink" : "screen.pausedShort")}</span>;
   if (!label) return null;
   return <span data-testid="screen-quality" className="rounded bg-white/10 px-1.5 text-[11px] leading-5 text-white/80 tabular-nums">{label}</span>;
 }
@@ -536,8 +605,8 @@ export function Stage({ card }: { card?: boolean }) {
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-white/10 px-3">
         {!card && <BackButton label={t("nav.toChannels")} entry onClick={() => paneBack("list")} />}
         {client && <TalkingAvatar name={name} seed={client.uid} size={24} talking={client.talking} />}
-        <h2 className="min-w-0 truncate text-[15px] font-semibold">{t("screen.sharerTitle", { name })}</h2>
-        <span className="shrink-0 rounded bg-danger px-1 text-[10px] leading-4 font-bold tracking-wide">{t("screen.live")}</span>
+        <h2 className="min-w-0 truncate text-[15px] font-semibold">{info ? t("screen.sharerTitle", { name }) : t("screen.watchReconnecting")}</h2>
+        {info && <span className="shrink-0 rounded bg-danger px-1 text-[10px] leading-4 font-bold tracking-wide">{t("screen.live")}</span>}
         <QualityBadge share={stage} />
         <span className="ml-auto flex items-center gap-1">
           {mayStop && linked && (
@@ -563,7 +632,7 @@ export function Stage({ card }: { card?: boolean }) {
             {chatHidden ? <MessageSquare className="size-[18px]" /> : <MessageSquareOff className="size-[18px]" />}
           </IconButton>
           <Button size="sm" variant="secondary" className="border-white/30 text-white hover:bg-white/10" onClick={() => void controller.screen.unwatch(stage)}>
-            <X className="size-4" /> {t("screen.stopWatching")}
+            <X className="size-4" /> <span className="max-sm:sr-only">{t("screen.stopWatching")}</span>
           </Button>
         </span>
       </header>

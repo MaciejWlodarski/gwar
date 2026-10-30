@@ -338,8 +338,10 @@ export function useBookmarkOpener() {
   const isActive = (b: Bookmark) => phase !== "idle" && sameServer(b, { kind, address, insecureLan: b.insecureLan });
 
   const open = (b: Bookmark) => {
-    setSection("servers");
-    if (isActive(b) && phase === "online") return;
+    if (isActive(b) && (phase === "online" || phase === "reconnecting" || phase === "connecting")) {
+      setSection("servers");
+      return;
+    }
     void controller.connectInteractive(bookmarkParams(b), { remember: false });
   };
   return { isActive, open };

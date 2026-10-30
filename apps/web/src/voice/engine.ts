@@ -3,10 +3,13 @@
  * with WebRTC + WebAudio (`webrtc-engine.ts`); the Tauri desktop app uses a
  * native implementation of the same interface (`native-engine.ts`).
  */
+import type { UplinkStatus } from "./uplink-congestion";
 import type { IceServer } from "../proto/IceServer";
 import type { Control, ControlResult, CryptoStatus } from "./sframe/state";
+import { dbToLevel } from "./input-sensitivity";
 
 export type InputMode = "vad" | "ptt";
+export type MicPermission = "granted" | "prompt" | "denied" | "unknown";
 
 export interface CaptureOptions {
   noiseSuppression: boolean;
@@ -25,7 +28,8 @@ export type VoiceErrorKind =
   | "insecure" // page is not a secure context, browsers hide the microphone
   | "output_failed" // speakers could not be opened / disappeared (desktop)
   | "negotiation" // WebRTC offer/answer failed
-  | "unsupported";
+  | "unsupported"
+  | "input_mode_unsupported";
 
 export class VoiceError extends Error {
   constructor(
@@ -62,8 +66,12 @@ export interface DeviceList {
 }
 
 export interface VoiceEvents {
+  /** Fresh, session-local WebRTC uplink health (browser engine). */
+  uplink: UplinkStatus | null;
   /** Local microphone level 0..1 (already shaped for display). */
   level: number;
+  /** null before negotiation; false means only the legacy automatic gate is available. */
+  inputGateSupport: boolean | null;
   state: VoiceState;
   /** Capture problem; `null` clears it. Does not affect listening. */
   micError: VoiceError | null;
@@ -71,6 +79,8 @@ export interface VoiceEvents {
   devices: DeviceList;
   /** Playback problem (desktop only); `null` clears it. */
   outputError: VoiceError | null;
+  /** Audio moved to another device by itself: the chosen one disappeared or came back. */
+  deviceSwitched: { side: "input" | "output"; label: string };
 }
 
 export interface VoiceEngine {
@@ -92,6 +102,8 @@ export interface VoiceEngine {
    */
   start(params: {
     offer: OfferFn;
+    /** Optional server capability: change this run's input gate and await application. */
+    inputGate?: (clientGate: boolean, run: number) => Promise<void>;
     mode: "plaintext" | "encrypted";
     binding: VoiceStartBinding;
     /** Required in encrypted mode; there is never a plaintext fallback. */
@@ -108,6 +120,8 @@ export interface VoiceEngine {
   setMuted(muted: boolean): void;
   setDeafened(deafened: boolean): void;
   setInputMode(mode: InputMode): void;
+  /** null: the legacy automatic decision; otherwise a threshold in dBFS. */
+  setInputSensitivity(threshold: number | null): void;
   /** Push-to-talk key state; only matters in `ptt` mode. */
   setPttActive(active: boolean): void;
   setInputDevice(deviceId: string | null): Promise<void>;
@@ -123,15 +137,17 @@ export interface VoiceEngine {
   listDevices(): Promise<DeviceList>;
   /** Aggregate SFrame counters of the current encrypted run (never keys), or null. */
   cryptoCounters?(): Promise<Record<string, number> | null>;
-  /** Independent capture for the settings level meter. Returns a stop function. */
-  startMicTest(onLevel: (level: number) => void): Promise<() => void>;
+  /** Read-only permission check: never opens the microphone or prompts. */
+  micPermission(): Promise<MicPermission>;
+  /** Local-only capture; cancellation also retires a pending device request. */
+  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal): Promise<() => void>;
 
   on<E extends keyof VoiceEvents>(event: E, handler: (value: VoiceEvents[E]) => void): () => void;
 }
 
-/** Maps an RMS amplitude (0..1) to a display level (0..1) over a 60 dB range. */
+/** Maps an RMS amplitude (0..1) to the sensitivity meter's -100..0 dB scale. */
 export function rmsToLevel(rms: number): number {
   if (rms <= 0) return 0;
   const db = 20 * Math.log10(rms);
-  return Math.min(1, Math.max(0, (db + 60) / 60));
+  return dbToLevel(db);
 }

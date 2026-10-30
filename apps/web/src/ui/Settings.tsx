@@ -1,5 +1,6 @@
 import { SoundSettings } from "./SoundSettings";
 import { Bell, Volume2, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, Settings as SettingsIcon, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
+import { exportIdentityBackup } from "../state/identity-backup";
 import { useEffect, useRef, useState } from "react";
 import { tNow, useT } from "../i18n";
 import { cn } from "../lib/cn";
@@ -21,6 +22,8 @@ import { Button, Field, Input, Section, Segmented, Select, Slider, Switch } from
 import { AlphaBadge } from "./BugReport";
 import { SettingsPageLayout, type SettingsPage } from "./SettingsLayout";
 import { VersionLabel } from "./Version";
+import { InputSensitivity } from "./InputSensitivity";
+import { useMicPreview } from "./use-mic-preview";
 
 const DEFAULT = "__default";
 
@@ -74,9 +77,9 @@ function LevelMeter({ level, label }: { level: number; label: string }) {
       aria-valuemin={0}
       aria-valuemax={100}
       aria-valuenow={Math.round(level * 100)}
-      className="h-2 w-full overflow-hidden rounded-full bg-active"
+      className="h-3 w-full overflow-hidden rounded-full bg-active"
     >
-      <div className="h-full rounded-full bg-linear-90 from-talk-1 via-talk-2 to-talk-3 transition-[width] duration-75" style={{ width: `${Math.round(level * 100)}%` }} />
+      <div className="h-full rounded-full bg-ok transition-[width] duration-75" style={{ width: `${Math.round(level * 100)}%` }} />
     </div>
   );
 }
@@ -133,14 +136,14 @@ function AudioTab() {
   const devices = useVoice((s) => s.devices);
   const engineLevel = useVoice((s) => s.level);
   const voiceState = useVoice((s) => s.state);
-  const [testing, setTesting] = useState(false);
-  const [testLevel, setTestLevel] = useState(0);
-  const [testError, setTestError] = useState<string | null>(null);
+  const gateUnsupported = useVoice((s) => s.inputGateSupport === false);
+  const muted = useVoice((s) => s.muted || s.deafened);
   const [capturing, setCapturing] = useState(false);
   const engine = controller.voice;
+  const preview = useMicPreview(engine);
   // Gwar's own suppression has a strength: native on the desktop, an AudioWorklet in the browser.
   const noiseStrength = audio.noiseSuppression && (
-    <Field label={t("audio.noiseStrength")} hint={t("audio.noiseStrengthHint")}>
+    <Field label={t("audio.noiseStrength")}>
       {() => (
         <div className="flex items-center gap-3">
           <Slider
@@ -161,29 +164,6 @@ function AudioTab() {
     void engine.listDevices().then((d) => useVoice.getState().set({ devices: d }));
   }, [engine]);
 
-  // The mic test runs while `testing`; changing device or processing flags restarts it.
-  useEffect(() => {
-    if (!testing) return;
-    let cancelled = false;
-    let stop: (() => void) | undefined;
-    engine
-      .startMicTest((level) => { if (!cancelled) setTestLevel(level); })
-      .then((fn) => {
-        if (cancelled) fn();
-        else stop = fn;
-      })
-      .catch((e: unknown) => {
-        if (cancelled) return;
-        setTestError(e instanceof VoiceError ? describeVoiceError(e) : String(e));
-        setTesting(false);
-      });
-    return () => {
-      cancelled = true;
-      stop?.();
-      setTestLevel(0);
-    };
-  }, [engine, testing, audio.inputDeviceId, audio.noiseSuppression, audio.echoCancellation, audio.autoGainControl]);
-
   useEffect(() => {
     if (!capturing) return;
     const onKey = (e: KeyboardEvent) => {
@@ -200,7 +180,9 @@ function AudioTab() {
     { value: DEFAULT, label: t("audio.systemDefault") },
     ...list.map((d) => ({ value: d.id, label: d.label })),
   ];
-  const level = Math.max(testLevel, voiceState === "connected" ? engineLevel : 0);
+  const inCall = voiceState !== "idle";
+  const level = muted ? 0 : inCall ? engineLevel : preview.level;
+  const automatic = gateUnsupported || audio.automaticSensitivity;
 
   return (
     <div>
@@ -253,50 +235,26 @@ function AudioTab() {
             { value: "ptt", label: t("audio.ptt") },
           ]}
         />
-        {audio.inputMode === "ptt" ? (
-          <div className="flex flex-col gap-1">
+        <p className="text-xs text-subtle">{t(audio.inputMode === "vad" ? "audio.vadHelp" : "audio.pttModeHint")}</p>
+        <div data-input-mode-options className="grid grid-rows-[44px_44px_minmax(32px,auto)] gap-2">
+          {audio.inputMode === "vad" ? <>
+            <Switch checked={automatic} disabled={gateUnsupported} onCheckedChange={(automaticSensitivity) => setAudio({ automaticSensitivity })} label={t("audio.automaticSensitivity")} description={t(gateUnsupported ? "audio.manualUnsupported" : "audio.automaticSensitivityHint")} />
+            {automatic ? <div className="flex items-center"><LevelMeter level={level} label={t("audio.level")} /></div> : <InputSensitivity level={level} threshold={audio.vadThreshold} onChange={(vadThreshold) => setAudio({ vadThreshold })} />}
+            <div className="flex items-center">
+              {preview.needsPermission ? <Button onClick={preview.request} className="h-8 self-start text-xs">{t("audio.previewEnable")}</Button> : !automatic && !audio.noiseSuppression ? <p className="text-xs text-subtle">{t("audio.noiseSuggestion")}</p> : null}
+            </div>
+          </> : <>
             <div className="flex items-center gap-2">
-              <Button onClick={() => setCapturing(true)} className={cn("min-w-40", capturing && "border-accent text-accent")}>
+              <Button disabled={gateUnsupported} onClick={() => setCapturing(true)} className={cn("min-w-40", capturing && "border-accent text-accent")}>
                 {capturing ? t("audio.pressKey") : audio.pttKey ? keyLabel(audio.pttKey) : t("audio.setKey")}
               </Button>
-              {audio.pttKey && !capturing && (
-                <Button variant="ghost" onClick={() => setAudio({ pttKey: null })}>
-                  {t("audio.clearKey")}
-                </Button>
-              )}
+              {audio.pttKey && !capturing && <Button variant="ghost" onClick={() => setAudio({ pttKey: null })}>{t("audio.clearKey")}</Button>}
             </div>
-            <p className="text-xs text-subtle">
-              {audio.pttKey ? t(onDesktop ? "audio.pttHelpGlobal" : "audio.pttHelp") : t("audio.pttNoKey")}
-            </p>
-          </div>
-        ) : (
-          <p className="text-xs text-subtle">{t("audio.vadHelp")}</p>
-        )}
-      </Section>
-
-      {onDesktop && (
-        <Section title={t("audio.globalShortcuts")}>
-          <ShortcutField label={t("audio.muteShortcut")} value={desktop.muteShortcut} onChange={(v) => setDesktop({ muteShortcut: v })} />
-          <ShortcutField label={t("audio.deafenShortcut")} value={desktop.deafenShortcut} onChange={(v) => setDesktop({ deafenShortcut: v })} />
-          <p className="text-xs text-subtle">{t("audio.shortcutHint")}</p>
-        </Section>
-      )}
-
-      <Section title={t("audio.test")}>
-        <div className="flex items-center gap-3">
-          <Button onClick={() => {
-              setTestError(null);
-              setTesting(!testing);
-            }} variant={testing ? "primary" : "secondary"} className="shrink-0">
-            {testing ? t("audio.testStop") : t("audio.testStart")}
-          </Button>
-          <LevelMeter level={level} label={t("audio.level")} />
+            <p className="self-center text-xs text-subtle">{t(gateUnsupported ? "audio.pttUnsupported" : audio.pttKey ? onDesktop ? "audio.pttHelpGlobal" : "audio.pttHelp" : "audio.pttNoKey")}</p>
+            <div aria-hidden="true" />
+          </>}
         </div>
-        {testError && (
-          <p role="alert" className="text-sm text-danger">
-            {testError}
-          </p>
-        )}
+        {preview.error != null && <p role="alert" className="text-sm text-danger">{describeVoiceError(preview.error instanceof VoiceError ? preview.error : new VoiceError("mic_failed", String(preview.error)))}</p>}
       </Section>
 
       <Section title={t("audio.processing")}>
@@ -320,6 +278,14 @@ function AudioTab() {
           description={t("audio.autoGainHint")}
         />
       </Section>
+
+      {onDesktop && (
+        <Section title={t("audio.globalShortcuts")}>
+          <ShortcutField label={t("audio.muteShortcut")} value={desktop.muteShortcut} onChange={(v) => setDesktop({ muteShortcut: v })} />
+          <ShortcutField label={t("audio.deafenShortcut")} value={desktop.deafenShortcut} onChange={(v) => setDesktop({ deafenShortcut: v })} />
+          <p className="text-xs text-subtle">{t("audio.shortcutHint")}</p>
+        </Section>
+      )}
     </div>
   );
 }
@@ -476,20 +442,16 @@ function IdentityTab() {
   };
 
   const exportIdentity = async () => {
-    const id = await controller.getIdentity();
-    const blob = new Blob([JSON.stringify(id.exportBackup(), null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `voice-identity-${uid.slice(0, 8)}.json`;
-    a.click();
-    URL.revokeObjectURL(url);
+    try { await exportIdentityBackup(); }
+    catch { toast("error", t("identity.exportFailed")); }
   };
 
   const importIdentity = async (f: File | undefined) => {
     if (!f) return;
     try {
       await controller.importIdentity(await f.text());
+      useSettings.getState().setOnboarding({ completed: true });
+      useUi.getState().dismissToast("identity-load");
       setVersion((v) => v + 1);
       toast("success", t("identity.imported"));
     } catch {

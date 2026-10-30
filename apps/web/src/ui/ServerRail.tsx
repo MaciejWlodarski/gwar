@@ -4,6 +4,7 @@ import type { CSSProperties } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { useBookmarks, useServerGroups, useSettings, type Bookmark } from "../state/settings";
+import { useAccount } from "../state/account";
 import { useUi } from "../state/stores";
 import { TeamSpeakBadge } from "./badges";
 import { Avatar, Tooltip, menuContent, menuItem, menuItemDanger, menuSeparator, panelCard } from "./kit";
@@ -171,6 +172,8 @@ export function ServerRail({ card }: { card?: boolean }) {
   const groups = useServerGroups();
   const openDialog = useUi((s) => s.openDialog);
   const layout = railLayout(bookmarks, groups);
+  const named = useSettings((s) => s.onboarding?.completed === true);
+  const signedIn = useAccount((s) => s.account !== null);
 
   return (
     <nav aria-label={t("rail.label")} className={cn("flex w-16 shrink-0 flex-col items-center", card ? cn(panelCard, "bg-side py-1.5") : "h-full bg-rail py-3")}>
@@ -182,7 +185,7 @@ export function ServerRail({ card }: { card?: boolean }) {
         {layout.groups.map((g) => (
           <RailGroup key={g.group.id} group={g.group} servers={g.servers} card={card} />
         ))}
-        <Tooltip label={t("rail.add")} side="right">
+        {(named || signedIn) && <Tooltip label={t("rail.add")} side="right">
           <button
             aria-label={t("rail.add")}
             onClick={() => openDialog({ kind: "addServer" })}
@@ -190,7 +193,7 @@ export function ServerRail({ card }: { card?: boolean }) {
           >
             <Plus className="size-5" />
           </button>
-        </Tooltip>
+        </Tooltip>}
       </div>
     </nav>
   );

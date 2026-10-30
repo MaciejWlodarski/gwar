@@ -1093,7 +1093,11 @@ fn translate(request: &Request, own: u16, view: &View) -> Result<Vec<(Part, OutC
         | Request::InviteList {}
         | Request::InviteDelete { .. }
         | Request::ServerEgress {} => return Err(refused("manage this server in the TeamSpeak client")),
-        Request::VoiceOffer(_) | Request::VoiceState {} | Request::VoiceEpochAck(_) | Request::VoiceEpochRepeat(_) => {
+        Request::VoiceOffer(_)
+        | Request::VoiceInputGate { .. }
+        | Request::VoiceState {}
+        | Request::VoiceEpochAck(_)
+        | Request::VoiceEpochRepeat(_) => {
             return Err(refused("voice on TeamSpeak servers is native"));
         }
         Request::ScreenStart(_)

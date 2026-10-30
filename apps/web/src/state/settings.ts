@@ -1,4 +1,5 @@
 import { defaultSounds, readSounds, type SoundCue, type SoundSettings } from "../sound/catalog";
+import { readOnboarding, type Onboarding } from "../lib/onboarding";
 import { defaultQuality, migrateQuality, type QualitySettings } from "../voice/screen-quality";
 import { serverKey } from "../lib/server-key";
 import { useMemo } from "react";
@@ -6,12 +7,50 @@ import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { guardedLocalStorage, SETTINGS_KEY, SETTINGS_VERSION } from "../lib/local-storage";
 import type { InputMode } from "../voice/engine";
+import { DEFAULT_INPUT_DB, inputThreshold } from "../voice/input-sensitivity";
 
 export type Theme = "system" | "dark" | "light";
 export type Language = "pl" | "en";
 
 /** `gwar`: a gwar/1 server (WebSocket + WebRTC). `teamspeak`: a TeamSpeak 3/6 server (desktop app only). */
 export type ServerKind = "gwar" | "teamspeak";
+
+/** Local session intent; no invite codes or automatic cold-start voice entry. */
+export interface SavedConnection {
+  address: string;
+  kind: ServerKind;
+  name: string;
+  password?: string;
+  identity?: string;
+  insecureLan?: boolean;
+}
+export interface UpdateVoiceResume {
+  address: string;
+  kind: ServerKind;
+  version: string;
+  expiresAt: number;
+  channel: number;
+  password?: string;
+}
+
+export function validSavedConnection(value: unknown): SavedConnection | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  if (typeof v.address !== "string" || !v.address.trim() || (v.kind !== "gwar" && v.kind !== "teamspeak") || typeof v.name !== "string" ||
+      (v.password !== undefined && typeof v.password !== "string") || (v.identity !== undefined && typeof v.identity !== "string") ||
+      (v.insecureLan !== undefined && typeof v.insecureLan !== "boolean")) return null;
+  return { address: v.address, kind: v.kind, name: v.name, password: v.password, identity: v.identity, insecureLan: v.insecureLan };
+}
+
+function validUpdateVoiceResume(value: unknown): UpdateVoiceResume | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const v = value as Record<string, unknown>;
+  if (!validSavedConnection({ ...v, name: "" }) || typeof v.version !== "string" ||
+      typeof v.expiresAt !== "number" || !Number.isFinite(v.expiresAt) ||
+      typeof v.channel !== "number" || !Number.isSafeInteger(v.channel) || v.channel < 0) return null;
+  return { address: v.address as string, kind: v.kind as ServerKind, version: v.version,
+    expiresAt: v.expiresAt, channel: v.channel, password: v.password as string | undefined };
+}
 
 export interface Bookmark {
   id: string;
@@ -227,6 +266,9 @@ export interface AudioSettings {
   inputDeviceId: string | null;
   outputDeviceId: string | null;
   inputMode: InputMode;
+  /** Automatic retains the default gate; manual uses vadThreshold in dBFS. */
+  automaticSensitivity: boolean;
+  vadThreshold: number;
   /** KeyboardEvent.code of the push-to-talk key. */
   pttKey: string | null;
   noiseSuppression: boolean;
@@ -255,6 +297,8 @@ export interface NotificationSettings {
 }
 
 export interface SettingsState extends QualitySettings {
+  onboarding: Onboarding | null;
+  setOnboarding(patch: Partial<Onboarding>): void;
   theme: Theme;
   language: Language;
   compact: boolean;
@@ -275,6 +319,14 @@ export interface SettingsState extends QualitySettings {
   bookmarkEdits: number;
   lastAddress: string;
   lastKind: ServerKind;
+  selfMuted: boolean;
+  selfDeafened: boolean;
+  /** Null after an explicit Disconnect. This device only; never synced to the vault. */
+  resumeConnection: SavedConnection | null;
+  updateVoiceResume: UpdateVoiceResume | null;
+  setSelfVoice(muted: boolean, deafened: boolean): void;
+  setResumeConnection(connection: SavedConnection | null): void;
+  setUpdateVoiceResume(resume: UpdateVoiceResume | null): void;
   /** This device was already offered the identities of the official TeamSpeak client (asked only once). */
   tsDetectAsked: boolean;
   /** Per server key: the TeamSpeak claim was offered there (docs/teamspeak-import.md, "Claim"), asked only once. */
@@ -330,6 +382,8 @@ export const defaultAudio: AudioSettings = {
   inputDeviceId: null,
   outputDeviceId: null,
   inputMode: "vad",
+  automaticSensitivity: true,
+  vadThreshold: DEFAULT_INPUT_DB,
   pttKey: null,
   noiseSuppression: true,
   noiseStrength: 100,
@@ -340,6 +394,16 @@ export const defaultAudio: AudioSettings = {
 
 export const defaultNotifications: NotificationSettings = { mentions: true, privateMessages: true, allMessages: false };
 
+/** Also applied to current-version data: localStorage is not a trusted input. */
+export function validAudio(value: unknown): AudioSettings {
+  const audio = typeof value === "object" && value !== null ? value as Partial<AudioSettings> : {};
+  return {
+    ...defaultAudio, ...audio,
+    automaticSensitivity: typeof audio.automaticSensitivity === "boolean" ? audio.automaticSensitivity : true,
+    vadThreshold: inputThreshold(audio.vadThreshold),
+  };
+}
+
 export const defaultDesktop: DesktopSettings = { muteShortcut: null, deafenShortcut: null, closeToTray: true };
 
 export const useSettings = create<SettingsState>()(
@@ -347,6 +411,8 @@ export const useSettings = create<SettingsState>()(
     (set) => ({
       ...defaultQuality,
       setScreenQuality: (patch) => set(patch),
+      onboarding: null,
+      setOnboarding: (patch) => set((s) => ({ onboarding: { completed: false, firstUsedAt: Date.now(), nudgeDismissed: false, roleReceived: false, ...s.onboarding, ...patch } })),
       theme: "system",
       language: detectLanguage(),
       compact: false,
@@ -362,6 +428,13 @@ export const useSettings = create<SettingsState>()(
       bookmarkEdits: 0,
       lastAddress: "",
       lastKind: "gwar",
+      selfMuted: false,
+      selfDeafened: false,
+      resumeConnection: null,
+      updateVoiceResume: null,
+      setSelfVoice: (selfMuted, selfDeafened) => set({ selfMuted, selfDeafened }),
+      setResumeConnection: (resumeConnection) => set({ resumeConnection }),
+      setUpdateVoiceResume: (updateVoiceResume) => set({ updateVoiceResume }),
       tsDetectAsked: false,
       tsClaimAsked: {},
       channelEncryption: {},
@@ -372,7 +445,7 @@ export const useSettings = create<SettingsState>()(
       setLanguage: (language) => set({ language }),
       setCompact: (compact) => set({ compact }),
       setMembersOpen: (membersOpen) => set({ membersOpen }),
-      setAudio: (patch) => set((s) => ({ audio: { ...s.audio, ...patch } })),
+      setAudio: (patch) => set((s) => ({ audio: validAudio({ ...s.audio, ...patch }) })),
       setDesktop: (patch) => set((s) => ({ desktop: { ...s.desktop, ...patch } })),
       setSounds: (patch) => set((s) => ({ sounds: readSounds({ ...s.sounds, ...patch }) })),
       setSoundEvent: (cue, enabled) => set((s) => ({ sounds: { ...s.sounds, events: { ...s.sounds.events, [cue]: enabled } } })),
@@ -429,7 +502,10 @@ export const useSettings = create<SettingsState>()(
       removeBookmark: (id) =>
         set((s) => {
           const now = Date.now();
+          const removed = s.bookmarks.find(b => b.id === id);
+          const forget = removed && s.resumeConnection && serverKey(removed) === serverKey(s.resumeConnection);
           return {
+            ...(forget ? { resumeConnection: null, updateVoiceResume: null } : {}),
             bookmarks: s.bookmarks.filter((b) => b.id !== id),
             serverGroups: s.serverGroups.map((g) => (g.servers.includes(id) ? { ...g, servers: g.servers.filter((m) => m !== id) } : g)),
             removedBookmarks: { ...pruneRemoved(s.removedBookmarks, now), [id]: removal(s.bookmarks.find((b) => b.id === id), s.bookmarkAccount) },
@@ -486,18 +562,25 @@ export const useSettings = create<SettingsState>()(
       // zustand's default storage (`window.localStorage`), guarded.
       storage: createJSONStorage(() => guardedLocalStorage(window.localStorage)),
       migrate: (persisted, version) => {
-        const p = migrateQuality((persisted ?? {}) as Record<string, unknown>);
-        // v3 adds device-local sound preferences; existing settings are kept whole.
-        return version < 3 ? { ...p, sounds: readSounds(p.sounds) } : p;
+        let p = migrateQuality((persisted ?? {}) as Record<string, unknown>);
+        // Preserve v4's session preferences before adding v5 sensitivity.
+        if (version < 4) p = { selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null, ...p, onboarding: readOnboarding(p.onboarding) };
+        if (version < 5) p = { ...p, audio: validAudio(p.audio) };
+        // v6 adds device-local cues without discarding any earlier preferences.
+        return version < 6 ? { ...p, sounds: readSounds(p.sounds) } : p;
       },
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
-        return { ...current, ...p, audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
+        return { ...current, ...p, onboarding: readOnboarding(p.onboarding), audio: validAudio(p.audio), desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
           sounds: readSounds(p.sounds),
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,
           serverGroups: validGroups(p.serverGroups),
+          selfMuted: p.selfMuted === true,
+          selfDeafened: p.selfDeafened === true,
+          resumeConnection: validSavedConnection(p.resumeConnection),
+          updateVoiceResume: validUpdateVoiceResume(p.updateVoiceResume),
         };
       },
     },

@@ -1,5 +1,5 @@
-import { Headphones, HeadphoneOff, Mic, MicOff, MonitorUp, PhoneOff, SignalHigh, SignalLow, SignalMedium } from "lucide-react";
-import type { ReactNode } from "react";
+import { Headphones, HeadphoneOff, Mic, MicOff, MonitorUp, PhoneOff } from "lucide-react";
+import { useState, type ReactNode } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { controller, describeVoiceError } from "../state/controller";
@@ -8,11 +8,12 @@ import { useScreen } from "../state/screen";
 import { useSettings } from "../state/settings";
 import { myChannelId } from "../state/reducer";
 import { useSession, useVoice } from "../state/stores";
-import { useChannelPermission, useMe, keyLabel, modKey } from "./hooks";
-import { Button, IconButton, TalkingAvatar, Tooltip } from "./kit";
+import { qualityTone, useChannelPermission, useConnectionQuality, useMe, keyLabel, modKey } from "./hooks";
+import { Button, Dialog, IconButton, TalkingAvatar, Tooltip } from "./kit";
 import { showVoiceChannel, useVoicePill } from "./nav";
 import { ConnectBadge } from "./badges";
 import { ShareButton } from "./Screen";
+import { ConnectionIndicator } from "./ConnectionQuality";
 
 /** Mic toggle that doubles as a level meter and talking indicator. */
 export function MicButton({ size = "lg" }: { size?: "md" | "lg" | "wide" }) {
@@ -93,47 +94,32 @@ function SelfRow({ sub, subTitle }: { sub: ReactNode; subTitle?: string }) {
   );
 }
 
-/** The round trip to the server, as signal bars and ms; nothing until the first measurement. */
-function RoundTrip() {
-  const t = useT();
-  const rtt = useSession((s) => s.rtt);
-  if (rtt === null) return null;
-  const [Icon, tone] = rtt < 100 ? [SignalHigh, "text-ok"] : rtt < 200 ? [SignalMedium, "text-warn"] : [SignalLow, "text-danger"];
-  return (
-    <span className={cn("ml-auto flex shrink-0 items-center gap-0.5 tabular-nums", tone)} title={t("voice.rtt", { ms: String(rtt) })}>
-      <Icon aria-hidden className="size-3.5" />
-      {rtt < 1 ? "<1" : rtt} ms
-    </span>
-  );
-}
-
-/** How my voice connection is doing, in words and a tone (the panel's and the pill's status line). */
+/**
+ * How my voice connection is doing, in words and a tone (the panel's and the pill's status line).
+ * Connected, the tone is the connection quality, the way Discord colours "Voice Connected".
+ */
 function useVoiceStatus() {
   const t = useT();
   const voiceState = useVoice((s) => s.state);
   const encryption = useVoice((s) => s.encryption);
+  const reconnecting = useVoice((s) => s.reconnecting);
   const phase = useSession((s) => s.phase);
-  // Encrypted channels never show an alarm, even when the engine refused them.
-  const encryptedChannel = useSession((s) => {
-    const channel = myChannelId(s);
-    return channel !== null && !!s.channels[channel]?.encrypted;
-  });
-  // Encrypted calls: "Securing voice…" until a sending key is active, in the
-  // muted style; a stopped engine is "Voice unavailable" with Retry, no alarm.
+  const failure = useVoice((s) => s.failure);
   const status: { tone: "ok" | "warn" | "danger" | "muted"; text: string } =
-    phase === "reconnecting"
-      ? { tone: "warn", text: t("voice.reconnecting") }
-      : encryption === "failed"
-        ? { tone: "muted", text: t("voice.failed") }
+    failure
+      ? { tone: "danger", text: t("voice.failed") }
+      : phase === "reconnecting" || reconnecting
+        ? { tone: "warn", text: t("voice.reconnecting") }
         : encryption === "securing" && voiceState !== "failed"
           ? { tone: "muted", text: t("voice.securing") }
-          : voiceState === "connected"
-            ? { tone: "ok", text: t("voice.connected") }
-            : voiceState === "failed"
-              ? { tone: encryption || encryptedChannel ? "muted" : "danger", text: t("voice.failed") }
+          : voiceState === "idle" && phase === "online"
+            ? { tone: "muted", text: t("voice.notIn") }
+            : voiceState === "connected"
+              ? { tone: "ok", text: t("voice.connected") }
               : { tone: "warn", text: t("voice.connecting") };
+  const quality = useConnectionQuality()?.quality;
   const tone = cn(
-    status.tone === "ok" && "text-ok",
+    status.tone === "ok" && qualityTone[quality ?? "good"],
     status.tone === "warn" && "text-warn",
     status.tone === "danger" && "text-danger",
     status.tone === "muted" && "text-muted",
@@ -156,6 +142,9 @@ function LeaveButton() {
 
 export function VoicePanel() {
   const t = useT();
+  const [showReason, setShowReason] = useState(false);
+  const retrying = useVoice((s) => s.reconnecting);
+  const failure = useVoice((s) => s.failure);
   const voiceState = useVoice((s) => s.state);
   const encryption = useVoice((s) => s.encryption);
   const micError = useVoice((s) => s.micError);
@@ -165,8 +154,9 @@ export function VoicePanel() {
   const canSpeak = useChannelPermission(me?.channel ?? null, "speak");
   const member = useSession((s) => (s.me ? s.members[s.me.uid] : undefined));
   const { status, tone } = useVoiceStatus();
+  const recovering = !failure && (retrying || phase === "reconnecting");
 
-  if (me && me.channel === null) {
+  if (me && me.channel === null && !failure && !recovering) {
     return (
       <div className="m-2 mt-1 rounded-xl bg-raised p-2">
         <SelfRow
@@ -182,7 +172,7 @@ export function VoicePanel() {
     );
   }
 
-  const unavailable = voiceState === "failed" || encryption === "failed";
+  const unavailable = voiceState === "failed" || encryption === "failed" || voiceState === "idle";
   // Nobody hears me: a moderator muted or deafened me, or this channel does not let me speak.
   const silencedNote = me?.server_deafened
     ? t("voice.serverDeafened")
@@ -201,7 +191,7 @@ export function VoicePanel() {
             <span className="truncate text-sm font-semibold">{me?.nickname}</span>
             {me && <ConnectBadge member={member} name={me.nickname} />}
           </div>
-          <div className="flex min-w-0 items-center gap-1.5 text-xs" title={status.text}>
+          {!failure && !recovering && <div data-testid="voice-status" className="flex min-w-0 items-center gap-1.5 text-xs" title={status.text}>
             <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone, status.tone === "warn" && "animate-pulse")} />
             {status.tone === "ok" && channelName ? (
               <>
@@ -211,16 +201,28 @@ export function VoicePanel() {
             ) : (
               <span className={cn("truncate", tone)}>{status.text}</span>
             )}
-            {status.tone === "ok" && <RoundTrip />}
-          </div>
+            {status.tone === "ok" && <ConnectionIndicator variant="panel" />}
+          </div>}
         </div>
-        {unavailable && phase === "online" && (
+        {unavailable && !failure && !recovering && phase === "online" && (
           <Button size="sm" variant="secondary" onClick={() => controller.retryVoice()}>
-            {t("voice.retry")}
+            {t(voiceState === "idle" ? "tree.joinVoice" : "voice.retry")}
           </Button>
         )}
-        <LeaveButton />
+        {me?.channel != null && <LeaveButton />}
       </div>
+      {(failure || recovering) && <div data-testid="voice-status" className="flex items-center gap-1.5 px-1 text-xs">
+        <span aria-hidden className={cn("size-2 shrink-0 rounded-full bg-current", tone)} />
+        <span className={tone}>{status.text}</span>
+        <div className="ml-auto flex shrink-0 items-center gap-1.5">
+          {failure && <button onClick={() => setShowReason(true)} className="t cursor-pointer text-muted underline underline-offset-2 hover:text-fg">{t("voice.why")}</button>}
+          {phase === "online" && <>
+            {failure && <span aria-hidden className="text-subtle">·</span>}
+            <button onClick={() => controller.retryVoice()} className={cn("t cursor-pointer hover:underline", failure ? "font-medium text-fg" : "text-muted hover:text-fg")}>{t("voice.retry")}</button>
+          </>}
+        </div>
+      </div>}
+      <Dialog open={showReason && !!failure} onOpenChange={setShowReason} title={t("voice.failed")} description={failure ?? undefined}>{null}</Dialog>
       {micError && (
         <div role="alert" className="rounded-md bg-danger-soft px-2 py-1.5 text-xs text-danger">
           {describeVoiceError(micError)}
@@ -290,6 +292,7 @@ export function VoicePill() {
         </button>
       </Tooltip>
       <div className="flex shrink-0 items-center gap-1">
+        {status.tone === "ok" && <ConnectionIndicator variant="pill" />}
         <MicButton size="md" />
         <DeafenButton size="md" />
         <LeaveButton />

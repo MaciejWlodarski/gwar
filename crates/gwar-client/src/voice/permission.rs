@@ -18,6 +18,20 @@ pub enum MicPermission {
     Denied,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MicPermissionStatus {
+    Granted,
+    Prompt,
+    Denied,
+    Unknown,
+}
+
+/// Reads authorization without opening a device or displaying a permission prompt.
+pub fn microphone_permission() -> MicPermissionStatus {
+    imp::status()
+}
+
 /// The input device cannot be used because the OS denies microphone access.
 /// Carried inside the `anyhow` error of [`super::io::AudioIo::open`] so callers can tell it apart.
 #[derive(Debug, thiserror::Error)]
@@ -55,7 +69,20 @@ mod imp {
     use objc2::runtime::Bool;
     use objc2_av_foundation::{AVAuthorizationStatus, AVCaptureDevice, AVMediaTypeAudio};
 
-    use super::MicPermission;
+    use super::{MicPermission, MicPermissionStatus};
+
+    pub fn status() -> MicPermissionStatus {
+        // SAFETY: a read-only class method with the system's media type constant.
+        let Some(audio) = (unsafe { AVMediaTypeAudio }) else { return MicPermissionStatus::Unknown };
+        let status = unsafe { AVCaptureDevice::authorizationStatusForMediaType(audio) };
+        if status == AVAuthorizationStatus::Authorized {
+            MicPermissionStatus::Granted
+        } else if status == AVAuthorizationStatus::NotDetermined {
+            MicPermissionStatus::Prompt
+        } else {
+            MicPermissionStatus::Denied
+        }
+    }
 
     pub fn ensure() -> MicPermission {
         // SAFETY: plain class-method calls with a valid media type constant.
@@ -82,7 +109,11 @@ mod imp {
 
 #[cfg(not(target_os = "macos"))]
 mod imp {
-    use super::MicPermission;
+    use super::{MicPermission, MicPermissionStatus};
+
+    pub fn status() -> MicPermissionStatus {
+        if cfg!(target_os = "windows") { MicPermissionStatus::Unknown } else { MicPermissionStatus::Granted }
+    }
 
     pub fn ensure() -> MicPermission {
         MicPermission::Granted

@@ -1,4 +1,5 @@
 import { afterEach, expect, it, vi } from "vitest";
+import { SETTINGS_VERSION } from "../lib/local-storage";
 
 afterEach(() => vi.unstubAllGlobals());
 
@@ -163,7 +164,7 @@ it.each(["text", "smooth", "game", "saver", "auto"] as const)("migrates saved %s
   const expected = screenPreset === "auto" ? defaultQuality : { screenMode: legacySpec(screenPreset).mode, screenHeight: legacySpec(screenPreset).height, screenFps: legacySpec(screenPreset).fps };
   expect(useSettings.getState()).toMatchObject(expected);
   const saved = JSON.parse(data.get("gwar.settings")!);
-  expect(saved.version).toBe(3);
+  expect(saved.version).toBe(SETTINGS_VERSION);
   expect(saved.state.screenPreset).toBeUndefined();
   useSettings.getState().setScreenQuality({ screenHeight: 1440 });
   useSettings.getState().setScreenQuality({ screenFps: 60 });

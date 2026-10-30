@@ -32,6 +32,9 @@ use super::{
 
 /// An original packet leaves at most this long after it arrived from the publisher.
 pub const DEADLINE: Duration = Duration::from_millis(400);
+/// After the estimate fell, a keyframe that would now leave this much past its deadline at the
+/// new release rate is dropped at once instead of at its deadline.
+const LATE_BY: Duration = Duration::from_millis(40);
 /// The estimate a watch transport is created with, before it carries anything. Joining a share
 /// raises it at once to [`start_estimate`]; it is also the floor of that start.
 pub const INITIAL_ESTIMATE: u64 = 2_500_000;
@@ -351,6 +354,8 @@ pub struct Egress {
     extras: Bucket,
     probe_need: f64,
     queued: usize,
+    /// The estimate fell since the last release: queued keyframes may no longer make it.
+    lowered: bool,
     /// Whole seconds since `start` in which the extras bucket dropped something.
     dropped_seconds: VecDeque<u64>,
     start: Instant,
@@ -380,6 +385,7 @@ impl Egress {
             extras: Bucket::new(extras_rate(estimate), extras_burst(estimate), now),
             probe_need: 0.0,
             queued: 0,
+            lowered: false,
             dropped_seconds: VecDeque::new(),
             start: now,
             trigger: "",
@@ -444,7 +450,9 @@ impl Egress {
     /// A new TWCC estimate, bits per second.
     pub fn set_estimate(&mut self, estimate: u64, now: Instant) {
         self.refill(now);
-        self.estimate = estimate.max(1) as f64;
+        let estimate = estimate.max(1) as f64;
+        self.lowered |= estimate < self.estimate && self.queued > 0;
+        self.estimate = estimate;
         self.tokens = self.tokens.min(self.release_burst());
         self.originals.reconfigure(self.release_rate(), self.socket_burst(), now);
         self.extras.reconfigure(extras_rate(self.estimate), extras_burst(self.estimate), now);
@@ -738,6 +746,9 @@ impl Egress {
             }
         }
         self.refill(now);
+        if std::mem::take(&mut self.lowered) {
+            self.drop_late_keyframes(now, &mut dropped);
+        }
         let mut released = Vec::new();
         if self.queued == 0 {
             return (released, dropped);
@@ -761,6 +772,30 @@ impl Egress {
             released.push((lane, packet));
         }
         (released, dropped)
+    }
+
+    /// After the estimate fell: drops each slot whose keyframe would now leave more than
+    /// `LATE_BY` past its deadline at `B`, behind what more important slots queued. It would fail
+    /// at its deadline anyway, and until then its tail keeps the viewer's link overrun: a retry
+    /// whose keyframe its link cannot carry is backed off by TWCC within about 60 ms, but the
+    /// rest of the keyframe, released at the lowered `B`, still held voice at the bottleneck's
+    /// full queue for 370 ms.
+    fn drop_late_keyframes(&mut self, now: Instant, dropped: &mut Vec<usize>) {
+        let rate = self.release_rate().max(1.0);
+        let mut ahead = -self.tokens;
+        for lane in self.priority() {
+            let mut bytes = ahead;
+            let late = self.lanes[lane].queue.iter().any(|p| {
+                bytes += p.size() as f64;
+                p.key && now + Duration::from_secs_f64(bytes.max(0.0) / rate) > p.arrival + DEADLINE + LATE_BY
+            });
+            if late {
+                self.drop_lane(lane, true, now);
+                dropped.push(lane);
+            } else {
+                ahead = bytes;
+            }
+        }
     }
 
     /// When `due` has something to do next: a release the bucket allows, or a deadline.

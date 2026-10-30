@@ -36,7 +36,7 @@ impl Drop for LostOnDrop {
 
 // The session channels, counters, crypto and the retirement gate are independent inputs.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn start<F, Fut>(
+pub(crate) async fn start_with_controls<F, Fut>(
     signal: F,
     local_ip: IpAddr,
     mut outgoing: mpsc::Receiver<Outgoing>,
@@ -45,6 +45,7 @@ pub(crate) async fn start<F, Fut>(
     wake: Arc<OutputTiming>,
     crypto: Option<Crypto>,
     gate: RunGate,
+    controls: Arc<super::Controls>,
 ) -> Result<()>
 where
     F: FnOnce(String) -> Fut,
@@ -73,7 +74,10 @@ where
             break (mic, slots, offer, pending);
         }
     };
-    let answer = signal(offer.to_sdp_string()).await?;
+    // Unknown SDP attributes are ignored by older servers. Updated servers avoid
+    // applying their fixed gate a second time to quiet speech or push-to-talk.
+    let sdp = offer.to_sdp_string().replacen("\r\nm=", "\r\na=x-gwar-input-gate:2\r\na=x-gwar-native-vad:1\r\nm=", 1);
+    let answer = signal(sdp).await?;
     rtc.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer)?)?;
     for mid in &slots {
         let extension_id =
@@ -206,7 +210,8 @@ where
                     let Some(frame) = frame else { return };
                     // str0m buffers writes before SRTP is ready. Replaying that
                     // capture after a handshake retry creates permanent playout lag.
-                    if !rtc.is_connected() {
+                    if !rtc.is_connected() || !controls.input_gate_ready.load(std::sync::atomic::Ordering::Acquire)
+                        || frame.mode_revision != controls.input_mode.load(std::sync::atomic::Ordering::Acquire) {
                         continue;
                     }
                     if !frame.fresh_at(Instant::now(), &counters) {
@@ -254,6 +259,36 @@ where
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+async fn start<F, Fut>(
+    signal: F,
+    local_ip: IpAddr,
+    outgoing: mpsc::Receiver<Outgoing>,
+    incoming: std::sync::mpsc::SyncSender<Incoming>,
+    counters: Arc<Counters>,
+    wake: Arc<OutputTiming>,
+    crypto: Option<Crypto>,
+    gate: RunGate,
+) -> Result<()>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    start_with_controls(
+        signal,
+        local_ip,
+        outgoing,
+        incoming,
+        counters,
+        wake,
+        crypto,
+        gate,
+        Arc::new(super::Controls::default()),
+    )
+    .await
 }
 
 // Capture advances through gates and queue drops. Defend against faulty custom I/O.
@@ -347,6 +382,7 @@ mod tests {
                 capture_position: i * 480,
                 opus: vec![0xf0, 1],
                 level: -10,
+                mode_revision: 0,
                 speech: true,
             });
         }
@@ -399,6 +435,7 @@ mod tests {
                         capture_position: i * 480,
                         opus: vec![0xf0, 1],
                         level: -10,
+                        mode_revision: 0,
                         speech: true,
                     })
                     .await
@@ -453,6 +490,7 @@ mod tests {
                         capture_position: position,
                         opus: vec![0xf0, 9],
                         level: -10,
+                        mode_revision: 0,
                         speech: true,
                     })
                     .await
@@ -464,6 +502,7 @@ mod tests {
                     capture_position: 48_000,
                     opus: vec![0xf0, 2],
                     level: -10,
+                    mode_revision: 0,
                     speech: true,
                 })
                 .await
@@ -475,6 +514,7 @@ mod tests {
                     capture_position: 48_960,
                     opus: vec![0xf0, 3],
                     level: -10,
+                    mode_revision: 0,
                     speech: true,
                 })
                 .await

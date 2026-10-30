@@ -489,6 +489,23 @@ it("keeps the original publisher alive until its replacement is accepted and ret
   publisher.close();
 });
 
+it("retains the active recovery codec and rendition when republishing the same capture", async () => {
+  vi.stubGlobal("RTCRtpSender", { getCapabilities: () => ({ codecs: [codec("video/H264", "packetization-mode=1;profile-level-id=42e01f"), codec("video/VP9", "profile-id=0"), codec("video/rtx")] }) });
+  const track = { applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }) } as unknown as MediaStreamTrack;
+  const params = { track, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} };
+  const first = new ScreenPublisher(params); await first.start();
+  await first.recover({ share: "old", codec: "vp9", width: 1280, height: 720, fps: 30 });
+  const fallbacks = first.fallbacks(); first.close();
+  const restored = new ScreenPublisher({ ...params, fallbacks }); await restored.start();
+  const peer = Peer.all.at(-1)!;
+  expect(peer.transceivers[0]!.setCodecPreferences.mock.calls[0]![0].map((c: RTCRtpCodec) => c.mimeType)).toEqual(["video/VP9", "video/rtx"]);
+  expect(track.applyConstraints).toHaveBeenLastCalledWith({ width: { max: 1280 }, height: { max: 720 }, frameRate: { max: 30 } });
+  expect(peer.sendParams.at(-1)?.encodings[0]).toMatchObject({ maxFramerate: 30, scaleResolutionDownBy: 1.5 });
+  restored.close();
+  const fresh = new ScreenPublisher(params); await fresh.start();
+  expect(Peer.all.at(-1)!.transceivers[0]!.setCodecPreferences.mock.calls[0]![0][0].mimeType).toBe("video/H264"); fresh.close();
+});
+
 
 describe("publisher capture guard", () => {
   const make = (offer: () => Promise<string> = async () => "answer") => new ScreenPublisher({
@@ -2830,6 +2847,28 @@ describe("AV1", () => {
   });
 });
 
+
+it("reports publish congestion from the existing poll, clears on close and ignores late stats", async () => {
+  vi.spyOn(performance, "now").mockImplementation(() => Date.now());
+  const uplink = vi.fn();
+  const publisher = new ScreenPublisher({ track: {} as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: vi.fn(), uplink });
+  await publisher.start();
+  const pc = Peer.all[0]!;
+  pc.connectionState = "connected";
+  let n = 0;
+  pc.getStats.mockImplementation(async () => new Map([["pair", { id: "pair", type: "candidate-pair", nominated: true, state: "succeeded", currentRoundTripTime: ++n === 1 ? .02 : .48, responsesReceived: n }]]));
+  await vi.advanceTimersByTimeAsync(8000);
+  expect(uplink).toHaveBeenLastCalledWith(expect.objectContaining({ congested: true, rttMs: 480 }));
+  let finish!: (report: Map<string, Record<string, unknown>>) => void;
+  pc.getStats.mockImplementationOnce(() => new Promise(resolve => { finish = resolve; }));
+  await vi.advanceTimersByTimeAsync(2000);
+  publisher.close();
+  expect(uplink).toHaveBeenLastCalledWith(null);
+  uplink.mockClear(); finish(new Map());
+  await vi.advanceTimersByTimeAsync(0);
+  expect(uplink).not.toHaveBeenCalled();
+});
+
 describe("first-frame guard", () => {
   const answer = [
     "v=0", "m=video 9 UDP/TLS/RTP/SAVPF 96 97 98 99",
@@ -2910,6 +2949,25 @@ describe("first-frame guard", () => {
     await publisher.recover({ share: "s", codec: "h264", width: 1920, height: 1080, fps: 60 });
     expect(remote(Peer.all[1]!)).toEqual([vp9]);
     publisher.close();
+  });
+
+  it("keeps failed codecs and the dropped hint across a new publisher for the same capture", async () => {
+    const first = await share();
+    await vi.advanceTimersByTimeAsync(10_000); encode(first.pc, 1);
+    const learned = first.publisher.fallbacks();
+    expect(learned).toMatchObject({ startHintUnsafe: true, brokenCodecs: ["h264"], codecFellBack: true });
+    first.publisher.close();
+    const restored = await share({ track: first.track as unknown as MediaStreamTrack, fallbacks: learned });
+    expect(remote(restored.pc)[0]).toMatch(/VP9/);
+    expect(remote(restored.pc)[0]).not.toMatch(/H264|x-google-start-bitrate/);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(restored.encodeFailed).toHaveBeenCalledOnce();
+    expect(restored.pc.createOffer).toHaveBeenCalledTimes(1);
+    restored.publisher.close();
+    const fresh = await share();
+    expect(remote(fresh.pc)[0]).toMatch(/H264/);
+    expect(remote(fresh.pc)[0]).toContain("x-google-start-bitrate=4000");
+    fresh.publisher.close();
   });
 
   it("goes to the codec fallback first where the sent codec got no start hint", async () => {

@@ -8,6 +8,9 @@
 mod apm;
 pub mod cues;
 mod denoise;
+mod follow;
+mod gate;
+pub use gate::input_threshold;
 pub mod io;
 pub mod jitter;
 pub mod keys;
@@ -16,6 +19,7 @@ mod playout;
 mod priority;
 mod rtc;
 pub mod sframe;
+mod watch;
 
 use std::{
     net::{IpAddr, SocketAddr},
@@ -48,10 +52,57 @@ const TS_FRAME: usize = 960; // Direct TeamSpeak retains its 20 ms packet clock.
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum InputMode {
+    /// Preserve the default raw gate and legacy processed-audio speech check.
+    Automatic,
     /// Transmit while the input level exceeds `threshold_db` (dBFS).
     VoiceActivity { threshold_db: f32 },
     /// Transmit while [`VoiceHandle::set_ptt`] is held.
     PushToTalk,
+}
+
+const INPUT_AUTOMATIC: u64 = 0;
+const INPUT_MANUAL: u64 = 1;
+const INPUT_PTT: u64 = 2;
+
+fn speech_activity(mode: u64, processed_level: i8) -> bool {
+    // Native RTP has always marked speech, giving the legacy SFU a -60 dBov
+    // processed cutoff. Only manual sensitivity and PTT override that choice.
+    mode != INPUT_AUTOMATIC || processed_level >= -60
+}
+
+/// Shared microphone processing for voice and the local settings preview.
+pub struct MicrophoneProcessor {
+    processing: Processing,
+    denoiser: Denoiser,
+}
+
+impl Default for MicrophoneProcessor {
+    fn default() -> Self {
+        Self { processing: Processing::new(), denoiser: Denoiser::new() }
+    }
+}
+
+impl MicrophoneProcessor {
+    /// Processes the same stages as voice; returns the legacy pre-gain level.
+    pub fn process(
+        &mut self,
+        samples: &mut [f32],
+        echo: bool,
+        gain: bool,
+        noise: NoiseSuppression,
+        continuous: bool,
+        delay_ms: u32,
+    ) -> f32 {
+        self.processing.configure(echo, gain);
+        self.processing.cancel_echo(samples, delay_ms);
+        let raw = level_db(samples);
+        self.processing.control_gain(samples);
+        self.denoiser.process(samples, noise, continuous);
+        raw
+    }
+    fn render(&mut self, samples: &[f32]) {
+        self.processing.render(samples);
+    }
 }
 
 /// Shared voice controls: atomics for voice and a bounded, try-locked handoff for local cues.
@@ -60,7 +111,9 @@ pub struct Controls {
     deafened: AtomicBool,
     ptt: AtomicBool,
     vad_threshold: AtomicU32,
-    push_to_talk: AtomicBool,
+    /// One atomic selects automatic, manual or PTT; automatic never reads a changing manual threshold.
+    input_mode: AtomicU64,
+    input_gate_ready: AtomicBool,
     /// [`NoiseSuppression`], in percent.
     noise_suppression: AtomicU8,
     echo_cancellation: AtomicBool,
@@ -90,7 +143,8 @@ impl Default for Controls {
             deafened: AtomicBool::new(false),
             ptt: AtomicBool::new(false),
             vad_threshold: AtomicU32::new((-50.0f32).to_bits()),
-            push_to_talk: AtomicBool::new(false),
+            input_mode: AtomicU64::new(INPUT_AUTOMATIC),
+            input_gate_ready: AtomicBool::new(true),
             noise_suppression: AtomicU8::new(NoiseSuppression::default().as_percent()),
             echo_cancellation: AtomicBool::new(true),
             auto_gain: AtomicBool::new(true),
@@ -252,13 +306,24 @@ impl VoiceHandle {
         self.controls.ptt.store(down, Ordering::Relaxed);
     }
     pub fn set_input_mode(&self, mode: InputMode) {
-        match mode {
+        let mode = match mode {
+            InputMode::Automatic => INPUT_AUTOMATIC,
             InputMode::VoiceActivity { threshold_db } => {
-                set_f(&self.controls.vad_threshold, threshold_db);
-                self.controls.push_to_talk.store(false, Ordering::Relaxed);
+                set_f(&self.controls.vad_threshold, input_threshold(threshold_db));
+                INPUT_MANUAL
             }
-            InputMode::PushToTalk => self.controls.push_to_talk.store(true, Ordering::Relaxed),
-        }
+            InputMode::PushToTalk => INPUT_PTT,
+        };
+        self.controls
+            .input_mode
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |previous| {
+                (previous & 3 != mode).then_some(((previous & !3).wrapping_add(4)) | mode)
+            })
+            .ok();
+    }
+    /// Close capture and queued output until this run's server acknowledges its mode.
+    pub fn set_input_gate_ready(&self, ready: bool) {
+        self.controls.input_gate_ready.store(ready, Ordering::Release);
     }
     /// Per-slot volume, 0.0–2.0. The app maps slots to users via `voice.slot`.
     pub fn set_slot_gain(&self, slot: usize, gain: f32) {
@@ -347,6 +412,7 @@ pub(crate) struct Outgoing {
     /// RFC 6464 level, negative dBov.
     pub level: i8,
     pub speech: bool,
+    pub mode_revision: u64,
 }
 
 impl Outgoing {
@@ -446,8 +512,19 @@ where
         }
         None => (None, None, None),
     };
-    rtc::start(signal, local_ip, out_rx, in_tx, counters.clone(), ports.output.clone(), crypto, gate.clone()).await?;
     let controls = Arc::new(Controls::default());
+    rtc::start_with_controls(
+        signal,
+        local_ip,
+        out_rx,
+        in_tx,
+        counters.clone(),
+        ports.output.clone(),
+        crypto,
+        gate.clone(),
+        controls.clone(),
+    )
+    .await?;
     let AudioPorts { mic, speaker, output, _guard } = ports;
     let timing = output.clone();
     let pipeline_controls = controls.clone();
@@ -552,10 +629,9 @@ fn route_ip(server: IpAddr) -> Option<IpAddr> {
 
 fn level_db(frame: &[f32]) -> f32 {
     let rms = (frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32).sqrt();
-    20.0 * rms.max(1e-5).log10()
+    (20.0 * rms.log10()).max(-127.0)
 }
 
-const HANGOVER: Duration = Duration::from_millis(300);
 /// Packets per pipeline pass; eight slots of 10 ms audio deliver about eight per pass.
 const RECEIVE_BATCH: usize = 256;
 
@@ -637,12 +713,11 @@ fn pipeline<const CAPTURE: usize>(
     output.attach();
     let mut slots = (0..AUDIO_SLOTS).map(|_| Slot::new()).collect::<Result<Vec<_>>>()?;
     let mut capture = CaptureFrame::new(CAPTURE);
-    let mut processing = Processing::new();
-    let mut denoiser = Denoiser::new();
+    let mut processing = MicrophoneProcessor::default();
     let mut next_position = None;
     let mut mix = vec![0f32; FRAME];
     let mut packet = vec![0u8; 1275];
-    let mut last_voice = Instant::now() - HANGOVER;
+    let mut gate = gate::InputGate::default();
     let mut speaker_buffer = SpeakerBuffer::new(Instant::now());
     let mut cues: Vec<(std::vec::IntoIter<f32>, bool)> = Vec::with_capacity(2);
 
@@ -653,36 +728,36 @@ fn pipeline<const CAPTURE: usize>(
         for _ in 0..mic.slots() {
             let Ok(sample) = mic.pop() else { break };
             let Some(capture_position) = capture.push_at(sample, Instant::now(), &counters) else { continue };
-            // Echo cancellation, then gain control and noise suppression, in a browser's order. The
-            // meter and the gate measure the microphone between the canceller and the rest: the
-            // speaker cannot open the gate, and the sensitivity setting means what it does with
-            // both off (gain control lifts a quiet room's noise to about -50 dBFS, and a strong
-            // suppressor also takes very quiet speech down). The encoder, and the RTP level the
-            // server's speech gate reads, get the processed audio. Every stage runs on every
-            // frame, sent or not, so its state follows the audio.
-            processing.configure(
+            // Keep automatic's legacy raw decision. Manual sensitivity and its meter
+            // measure the processed audio that is actually encoded and transmitted.
+            let queued = speaker.buffer().capacity() - speaker.slots();
+            let db = processing.process(
+                &mut capture.samples,
                 controls.echo_cancellation.load(Ordering::Relaxed),
                 controls.auto_gain.load(Ordering::Relaxed),
+                NoiseSuppression::percent(controls.noise_suppression.load(Ordering::Relaxed)),
+                next_position == Some(capture_position),
+                (queued * 1000 / io::RATE as usize) as u32,
             );
-            let queued = speaker.buffer().capacity() - speaker.slots();
-            processing.cancel_echo(&mut capture.samples, (queued * 1000 / io::RATE as usize) as u32);
-            let db = level_db(&capture.samples);
-            processing.control_gain(&mut capture.samples);
-            let mode = NoiseSuppression::percent(controls.noise_suppression.load(Ordering::Relaxed));
-            denoiser.process(&mut capture.samples, mode, next_position == Some(capture_position));
             next_position = Some(capture_position + CAPTURE as u64);
             let frame = &capture.samples;
-            set_f(&controls.input_level, db);
-            let blocked = controls.muted.load(Ordering::Relaxed) || controls.deafened.load(Ordering::Relaxed);
-            let wants = if controls.push_to_talk.load(Ordering::Relaxed) {
-                controls.ptt.load(Ordering::Relaxed)
-            } else {
-                db >= f(&controls.vad_threshold)
-            };
-            if wants && !blocked {
-                last_voice = Instant::now();
-            }
-            let send = !blocked && last_voice.elapsed() < HANGOVER;
+            let processed_db = level_db(frame);
+            set_f(&controls.input_level, processed_db);
+            let blocked = controls.muted.load(Ordering::Relaxed)
+                || controls.deafened.load(Ordering::Relaxed)
+                || !controls.input_gate_ready.load(Ordering::Acquire);
+            let mode_revision = controls.input_mode.load(Ordering::Acquire);
+            gate.set_mode(mode_revision);
+            let mode = mode_revision & 3;
+            let ptt = (mode == INPUT_PTT).then(|| controls.ptt.load(Ordering::Relaxed));
+            let threshold = if mode == INPUT_AUTOMATIC { -50.0 } else { f(&controls.vad_threshold) };
+            let send = gate.allows(
+                Instant::now(),
+                if mode == INPUT_AUTOMATIC { db } else { processed_db },
+                threshold,
+                ptt,
+                blocked,
+            );
             controls.transmitting.store(send, Ordering::Relaxed);
             if send {
                 let n = encoder.encode_float(frame, &mut packet[..])?;
@@ -691,15 +766,16 @@ fn pipeline<const CAPTURE: usize>(
                 }
                 // RFC 6464: the level of the audio actually sent. Suppressed noise reads as
                 // silence, so it cannot hold a receive slot at the server.
-                let level = (-level_db(frame).clamp(-127.0, 0.0)).round() as i8;
+                let level = -((-level_db(frame).clamp(-127.0, 0.0)).round() as i8);
                 // Tell the server's speech gate the truth about voice activity.
                 if out
                     .try_send(Outgoing {
                         captured_at: capture.captured_at,
                         capture_position,
                         opus: packet[..n].to_vec(),
-                        level: -level,
-                        speech: true,
+                        level,
+                        speech: speech_activity(mode, level),
+                        mode_revision,
                     })
                     .is_ok()
                 {
@@ -788,6 +864,20 @@ pub use gwar_proto::opus::packet_samples as opus_samples;
 #[cfg(test)]
 mod codec_tests {
     use super::*;
+
+    #[test]
+    fn automatic_preserves_the_processed_speech_decision_for_suppressed_noise() {
+        let now = Instant::now();
+        let mut gate = gate::InputGate::default();
+        // The old native raw gate sent these frames, but the SFU rejected them.
+        assert!(gate.allows(now, -45.0, -50.0, None, false));
+        assert!(!speech_activity(INPUT_AUTOMATIC, -80));
+        assert!(speech_activity(INPUT_MANUAL, -80));
+        assert!(speech_activity(INPUT_PTT, -80));
+        assert!(!speech_activity(INPUT_AUTOMATIC, -61));
+        assert!(speech_activity(INPUT_AUTOMATIC, -60));
+        assert!(speech_activity(INPUT_AUTOMATIC, -50));
+    }
     use audiopus::{Bandwidth, MutSignals, coder::Decoder, packet::Packet};
 
     #[test]
@@ -886,6 +976,7 @@ mod codec_tests {
                     capture_position: position as u64,
                     opus: vec![1],
                     level: -10,
+                    mode_revision: 0,
                     speech: true,
                 })
                 .unwrap();
@@ -899,7 +990,14 @@ mod codec_tests {
             assert_eq!(sent, [(size * 3) as u64]);
             assert_eq!(counters.capture_stale_frames.load(Ordering::Relaxed), 2);
             // Encode can itself cross the deadline after PCM passed admission.
-            let frame = Outgoing { captured_at: resumed, capture_position: 0, opus: vec![1], level: -10, speech: true };
+            let frame = Outgoing {
+                captured_at: resumed,
+                capture_position: 0,
+                opus: vec![1],
+                level: -10,
+                mode_revision: 0,
+                speech: true,
+            };
             assert!(frame.fresh_at(resumed + io::MAX_CAPTURE_AGE, &counters));
             assert!(!frame.fresh_at(resumed + io::MAX_CAPTURE_AGE + Duration::from_nanos(1), &counters));
             assert_eq!(counters.capture_stale_frames.load(Ordering::Relaxed), 3);
@@ -961,7 +1059,7 @@ mod codec_tests {
         for gate in 0..3 {
             let controls = Arc::new(Controls::default());
             controls.muted.store(gate == 0, Ordering::Relaxed);
-            controls.push_to_talk.store(gate == 1, Ordering::Relaxed);
+            controls.input_mode.store(if gate == 1 { INPUT_PTT } else { INPUT_MANUAL }, Ordering::Relaxed);
             // The samples are constant: the canceller's high-pass filter would take them to nothing.
             controls.echo_cancellation.store(false, Ordering::Relaxed);
             let (mut tx, mic) = rtrb::RingBuffer::new(FRAME * 16);

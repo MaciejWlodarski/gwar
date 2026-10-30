@@ -31,7 +31,7 @@ try {
   });
   await context.addInitScript(() => {
     // Simulate upgrading the previous release, with preferences worth keeping.
-    if (!localStorage.getItem("gwar.settings")) localStorage.setItem("gwar.settings", JSON.stringify({ version: 2, state: { language: "pl", theme: "dark", compact: false, audio: { masterVolume: 0.8 } } }));
+    if (!localStorage.getItem("gwar.settings")) localStorage.setItem("gwar.settings", JSON.stringify({ version: 2, state: { language: "pl", theme: "dark", compact: false, onboarding: { completed: true, firstUsedAt: 1, nudgeDismissed: true, roleReceived: false }, audio: { masterVolume: 0.8 } } }));
     window.__soundStarts = 0; window.__micRequests = 0;
     const original = AudioContext.prototype.createBufferSource;
     AudioContext.prototype.createBufferSource = function (...args) {
@@ -65,7 +65,7 @@ try {
   assert.equal(await firstPreview.isDisabled(), true);
   await page.getByRole("switch", { name: "Dźwięki zdarzeń" }).click();
   const saved = await page.evaluate(() => JSON.parse(localStorage.getItem("gwar.settings")));
-  assert.equal(saved.version, 3); assert.equal(saved.state.audio.masterVolume, 0.8);
+  assert.equal(saved.version, 6); assert.equal(saved.state.audio.masterVolume, 0.8);
   assert.equal(await page.evaluate(() => window.__micRequests), 0);
   for (const [name, width, height] of [["desktop", 1440, 1000], ["tablet", 768, 1024], ["mobile", 390, 844]]) {
     await page.setViewportSize({ width, height });

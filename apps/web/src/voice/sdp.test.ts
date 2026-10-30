@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import native from "./native-offer.fixture.sdp?raw";
-import { microphoneSsrc } from "./sdp";
+import { advertiseInputGate, microphoneSsrc } from "./sdp";
 
 /** A browser-shaped offer: only the sending section announces an SSRC. */
 const browser = [
@@ -11,6 +11,13 @@ const browser = [
 ].join("\r\n");
 
 describe("microphoneSsrc", () => {
+  it("adds the optional client gate as a session attribute without changing microphone identity", () => {
+    for (const offer of [native, browser]) {
+      const gated = advertiseInputGate(offer);
+      expect(gated).toContain("a=x-gwar-input-gate:2\r\nm=audio");
+      expect(microphoneSsrc(gated)).toBe(microphoneSsrc(offer));
+    }
+  });
   it("reads the sending section of a real native (str0m) offer, whose receive sections carry SSRCs too", () => {
     expect([...native.matchAll(/^a=ssrc:(\d+) /gm)].map(m => m[1]).filter((v, i, a) => a.indexOf(v) === i).length).toBe(9);
     expect(microphoneSsrc(native)).toBe(2537854144);

@@ -1523,6 +1523,16 @@ rate and duration; the calibrated downlink gate measures the shared bottleneck.
 - **Deadline.** Each packet carries `deadline = arrival + 400 ms`. A packet
   still queued at its deadline is evicted, with every later packet of its
   frame, and the slot waits for a keyframe.
+- **A keyframe that can no longer make it goes at once.** When the estimate
+  falls, a slot whose queued keyframe would now leave more than 40 ms past
+  its deadline at the new release rate (behind what more important slots
+  queued) is dropped right away, as a failed keyframe, instead of at the
+  deadline. It would fail anyway, and until then its tail would keep the
+  viewer's link overrun. A retry whose 300 KB keyframe a 3 Mbps link cannot
+  carry was backed off by TWCC about 60 ms in (8.3 to 5.6 Mbps), but the rest
+  of the keyframe, released at the lowered `B` of 4.5 Mbps, still held voice
+  at the bottleneck's full 100 ms queue for 370 ms. Dropped at the backoff,
+  voice met at most 26 ms.
 - **Bounded admission.** A packet enters a slot's queue only if the viewer's
   queued bytes stay at or under `max(64 KB, 400 ms × release rate)`.
   Otherwise it is dropped like an eviction. The bound is checked per packet,
@@ -2136,10 +2146,39 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   (64 KB at a tenth of the estimate) lets the probing target rise 1.5× only
   every 5–30 s. Waiting for probing to reach the resume threshold could take
   minutes; production never got there (below). So such a viewer's most
-  important bandwidth-paused slot resumes `15 s × 2^n` after the viewer
-  became fully paused, at most 120 s, where `n` counts its failed retries: 15,
-  30, 60, then 120 s. A due retry waits for the reserve to be ready and for no
-  continuous-fit timer to be running.
+  important bandwidth-paused slot resumes after the viewer became fully
+  paused: 15 s after, then, by the `n` retries that failed since media last
+  kept flowing, 30 s, 2.5 min, 5 min, 10 min and from then on 20 min. Two
+  quick retries catch a dip that passes (a download ending, a Wi-Fi hiccup);
+  a link still too slow after that is most likely the viewer's steady state,
+  and each retry on it may cost its voice a blip, so the spacing then doubles
+  from 2.5 minutes. Before October 29 it was 15 s × 2^n up to 120 s, for good:
+  on a 3 Mbps link a text share's viewer was retried 21 times in 30 minutes. A
+  due retry waits for the reserve to be ready and for no continuous-fit timer
+  to be running.
+
+  **Retries stop.** Three automatic retries in a row that failed, none
+  starting more than 1.25 times above the highest before it, stop automatic
+  retries: repeating them would only ask the same link the same question. (A
+  higher start that fails is new information and counts as the first again;
+  a lower one failing says the link is slow all the more.) They start again
+  when the link shows it changed: the estimate, lifted by probes, held 1.25
+  times above that highest failed start for 10 s, or the viewer's DTLS and
+  RTCP arrive from an address not seen before on this transport (a new ICE
+  path, as after a network switch; the last four addresses are kept, so a
+  path flipping between two it already used is no change). A new path
+  resumes them at most once per backoff step (`RETRY_BACKOFF` at the current
+  `n`), so a path that keeps changing retries no faster than the backoff
+  would; while retries are not stopped, a new path brings nothing forward.
+  The next retry then comes as soon as the spacing since the last start
+  allows, and the next failure, from whatever start, stops them again at
+  the higher of the old level and its start. The continuous-fit
+  resume keeps working while they are stopped, and so does Try again; a
+  retry the link carries in full, or a minute of unbroken flow, clears the
+  strikes. A new watch transport (a reconnect) starts with none. Each
+  bandwidth pause while retries are stopped is followed by
+  `screen.waiting {share}` to that viewer, so its client stops promising
+  that the picture comes back on its own.
 
   A retry restarts the estimator, with a fresh 10 s ramp, at
   `min(start, max(1.5 × sent, 2.5 Mbps))`. Here `sent` is what the transport
@@ -2181,6 +2220,12 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   - **Failed** otherwise: the estimate fell below the start, so the link
     pushed back, or the link carried less than the start. It counts, and the
     next retry steps up from `sent` but no higher than this one's start.
+  - A bandwidth pause that ended no retry (the first after a join, or a link
+    that just got slower) steps from `sent` but at most the estimate TWCC
+    lowered to. Before, `sent` alone was the step: on a link going from
+    50 Mbps to 3 Mbps under an 8 Mbps share, the 10 s before the pause were
+    mostly the healthy link, the first retry started at 12 Mbps, and voice met
+    50 ms or more of queue for 600 ms of it.
 
   A retry is judged against its own slot's share: with several slots, the
   continuous-fit resume can bring back another one mid-ramp, and that slot's
@@ -2193,8 +2238,10 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   with a fresh ramp, and goes on as the retry in progress. The step is the
   one a retry after a carried pause would take, so the release grows by
   1.2 times per 10 s instead of per 30 s (its ramp and 5 s over `B`, then the
-  15 s spacing), and the slot keeps its media. It counts like a fresh retry:
-  one that the link then pushes back on fails at its pause as above. An
+  15 s spacing), and the slot keeps its media. The step it climbs from was
+  carried in full, so, like a carried retry, it clears the strikes. It counts
+  like a fresh retry: one that the link then pushes back on fails at its
+  pause as above. An
   estimator that grew on its own is not touched; one that fell has its answer.
   A climb never reaches the start of the last retry that failed, until media
   has flowed `RETRY_RESET` again: otherwise a frozen estimator on a link just
@@ -2237,12 +2284,23 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   share's keyframe. On a 3 Mbps link, a 500 kb/s text share with 300 KB
   keyframes alternates: a retry from 2.5 Mbps (inconclusive, voice under
   10 ms of queue), then one at the keyframe's room, 8.3 Mbps, whose keyframe
-  meets the link: voice met 50 ms or more of queue for 370 ms of it, up to
-  the full 100 ms. Those fail and back off, so that is once per 30 s, 60 s,
-  then 120 s, plus 15 s. With 204 KB keyframes it was 30–50 ms at up to
-  55 ms. At 2 Mbps the link pushes back on every retry from 2.5 Mbps, and
-  voice stayed under 16 ms of queue throughout, and under 22 ms on 4–7 Mbps
-  links with an 8 Mbps share (`a_slow_viewer_pauses_cleanly_and_recovers_once_its_link_improves`,
+  meets the link. Until October 29 voice met 50 ms or more of queue for
+  370 ms of each of those, up to the full 100 ms, about every 146 s for as
+  long as the viewer stayed: 7 times in 30 minutes, 14 with 204 KB
+  keyframes. The keyframe is now dropped when TWCC backs off ("Queues and
+  repairs"), and the retries stop; over the same 30 minutes, at 3 and
+  3.5 Mbps and with either keyframe, voice never met 50 ms of queue (at most
+  26 ms), and the viewer was retried 5–7 times, all within the first
+  10 minutes
+  (`a_link_too_slow_for_a_text_shares_keyframes_stops_retrying_and_spares_voice`).
+  An 8 Mbps game share on a link that drops from 50 to 3 Mbps still meets
+  50 ms for up to 40 ms (at most 57 ms) on a retry at its keyframe's room,
+  where the share's deltas overrun the link before TWCC backs off; that was
+  2 of its 7 retries in 20 minutes, against 5 glitches and 760 ms before
+  (`a_link_that_degrades_pauses_and_stops_retrying`). The link going slower
+  under the share costs 330 ms once, as it did. At 2 Mbps the link pushes
+  back on every retry from 2.5 Mbps, and voice stayed under 16 ms of queue
+  throughout, and under 22 ms on 4–7 Mbps links with an 8 Mbps share (`a_slow_viewer_pauses_cleanly_and_recovers_once_its_link_improves`,
   `a_keyframe_dominated_share_on_a_slow_link_bounds_voice_after_its_join`,
   `keyframes_overflowing_admission_pause_a_3_mbps_viewer_and_its_retries_back_off`,
   `a_retry_the_link_carried_in_full_steps_up_without_backing_off`).
@@ -2251,8 +2309,15 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   within the ramp. In the simulator a 2 Mbps viewer whose link went to
   50 Mbps kept its 8 Mbps share from the retry running when the link
   improved, and the text share came back within 15 s of the link improving.
-  Retries never stop: past 120 s each one costs a still-slow link no more
-  than its step, or the keyframe as above. The count also goes back to zero
+  With retries already stopped (10 minutes at 3 Mbps for the text share, at
+  2 Mbps for the game share), both came back 15 s after the link went to
+  50 Mbps (`a_link_that_improves_after_retries_stopped_gets_its_picture_back`).
+  An estimator that never grows on its own shows no change once retries
+  stopped: the frozen-estimator simulations above recover by themselves
+  after 40 s at 2 Mbps, but after 300 s, with retries stopped at about 240 s,
+  only once the viewer presses Try again (then within the same bounds), or
+  its path changes. That is the price of stopping; why the 2026-10-28
+  estimate did not grow is still unknown. The count also goes back to zero
   after 60 s of unbroken flow: some slot carrying media and none paused for
   bandwidth. Any bandwidth pause, or a retry, restarts that minute, so a
   resume after a long pause does not forget earlier failures. The
@@ -2265,11 +2330,21 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   rest of the ramp costs the viewer's other traffic nothing. A keyframe that
   does not fit is refused at admission. In the simulator, a retry that fell
   short paused within 2 s of its ramp's end.
-- The viewer sees "Your connection is too slow for this share right now"
-  over the last frame of a paused share, with a Try again button (one ask per
-  5 s, and throttled as above), or that the server is making room for a
-  budget pause; a card shows "Paused", and so does the quality badge instead
-  of the last resolution at 0 fps. Try again on a fully paused viewer
+- The viewer sees "Your connection can't keep up, so the picture is paused to
+  keep voice clear. It comes back on its own." over
+  the last frame of a paused share, with a Try again button, or that the
+  server is making room for a budget pause. A card, and the quality badge
+  instead of the last resolution at 0 fps, say "Paused – weak connection"
+  for a bandwidth pause ("Paused" for a budget one; the badge is left out on
+  a phone, where the overlay says it). Try again shows when the server will
+  carry it out: "Retrying in 12 s" counting down while the server holds it
+  (the client counts 15 s from the last grant or `screen.resumed` of any
+  share on its watch transport, as the server spaces starts per transport,
+  but for a climb it does not see), then "Retrying…" until the share
+  resumes, offered again if nothing came 10 s after. After
+  `screen.waiting` the overlay says instead "Your connection can't keep up,
+  so the picture is paused. Once it's better, click “Try again”."
+  and Try again is the primary button, until the next pause or resume. Try again on a fully paused viewer
   retries that share from its whole optimistic start, as a fresh watch would,
   and does not add to `n`. That is the viewer's own choice to overrun its
   link once. The server takes it at most once per 15 s after the viewer's
@@ -2287,6 +2362,10 @@ decides for the viewer as a whole. Averages are used only to decide pauses;
   guard), so that is a few lines per viewer at most. A line that repeats a
   slot's state is logged at most once per viewer every 10 s, with the count of
   lines left out.
+  Automatic retries stopping (`screen watch retries stop until the link
+  changes`, with the highest failed start) and starting again (`screen watch
+  retries resume`, with the reason: `estimate` or `path`) are logged at info
+  level too, once each.
 
 This is deliberately crude: no per-frame prediction, one pacer per viewer, and
 two pause triggers that are both measured. It can pause a viewer of a
@@ -2817,7 +2896,11 @@ Events:
 - `screen.stopped {share, reason: stopped|moderator|left|limit|transport|budget|access|codec}`;
 - `screen.slot {run, slot, share | null}`, like `voice.slot`, tagged with the
   watch transport's `run`;
-- `screen.paused {share, reason: bandwidth}` and `screen.resumed {share}`.
+- `screen.paused {share, reason: bandwidth}` and `screen.resumed {share}`;
+- `screen.waiting {share}`, right after a bandwidth `screen.paused` once
+  automatic retries stopped. It is a separate event, not a field of
+  `screen.paused`, because clients validate events strictly and drop unknown
+  ones: an older client simply keeps its old wording.
 
 `Welcome` carries `shares: [{share, client, channel, preset, surface}]` for
 every channel the session can see, and `screen.started` /
@@ -3207,6 +3290,145 @@ from native capture is PR 10.
 
 ## 6. Interface
 
+### Connection quality
+
+Like Discord's coloured "Voice Connected", Gwar shows connection quality as a
+signal-bar indicator rather than banners (`ui/ConnectionQuality.tsx`,
+`state/uplink.ts`):
+
+- **Indicator.** While voice is connected, the voice panel shows bars and the round trip in ms
+  once there is a measurement; its status dot,
+  and the pill's dot and "Voice connected", take the same colour. The pill adds
+  the bars, and the sharing bar a chip, only while the connection is not good.
+  Losing voice hides its indicators immediately. Screen congestion stays on
+  the sharing bar while voice is down, with screen-specific details.
+- **Colour, from measurements only.** The round trip is the worst fresh media
+  RTT of the voice and screen transports, or the server ping without media.
+  Good below 150 ms, fair from 150 ms, poor from 300 ms round trip, about
+  150 ms each way, up to which a conversation stays natural (ITU-T G.114); a far
+  server alone is not flagged. Loss of our own outbound streams, from
+  `remote-inbound-rtp.fractionLost` where RTCP carries it, makes it fair from
+  3 % and poor from 10 %. A congestion verdict makes it at least fair, and poor
+  when the queue adds 250 ms or more. No detector timer turns it green: if the
+  detector adopts a new floor, a 480 ms round trip is still red. A worse colour
+  shows at once; a better one only once the connection has stayed better than
+  the shown level for 4 s without a break (so poor → good via a moment of fair
+  turns good 4 s after it settles), so a round trip at a threshold does not
+  flicker. Every view shows the same held colour.
+- **Brief message.** When a voice congestion verdict starts during a connected call, one plain-language
+  message appears in the toast stack ("Your internet can't keep up with
+  uploading — others hear you about 0.5 s late", the delay being RTT minus the
+  floor at that moment) with a Details link and a close button. It collapses
+  after 8 s (held open while hovered or focused), or when the queue drains.
+  A verdict that returns within two minutes of the last one ending is the same
+  episode and shows nothing. On phones the message sits at the top, clear of
+  the call controls and the tab bar.
+  Voice loss clears the notice, voice measurement and episode. Late stats while
+  disconnected are discarded; reconnecting waits for fresh measurements,
+  including a fresh ping for native voice. A share alone never raises a voice notice.
+- **Voice recovery.** Automatic retries show an amber "Reconnecting…" row and
+  one quiet retry-now action in the panel. The single keyed toast has no action
+  or details expander. Only permanent refusals show the red "Voice unavailable"
+  row with Why and Retry; they have no duplicate toast.
+- **Details.** Clicking the indicator (or Details) opens a dialog: what the
+  connection is like and what to do in plain words (pause uploads, backups,
+  cloud sync or another call on this device or network), and, folded under
+  "Technical details", the round trip, the usual round trip, loss, the upload
+  estimate and the router advice (SQM/QoS, bufferbloat). Without a verdict the
+  dialog gives generic advice for a slow connection instead. Closing it returns
+  focus to what opened it; it also closes when the connection ends.
+- **Accessibility.** The message is inserted into a polite live region, so a
+  screen reader hears it once per episode; its delay is fixed when it appears.
+  The sharing bar's chip is `aria-live="off"` inside the bar's status region.
+  The indicator is a button with its quality and round trip as its label.
+
+`voice/uplink-congestion.ts` contains the pure, session-local detector:
+
+- **Floor.** The baseline is the minimum of the last minute's *healthy* samples,
+  those below `baseline + 75 ms` (the recovery line). Moderate bloat therefore
+  never creeps into it. When no healthy sample is left, the old minimum stays
+  frozen, so a standing queue does not become normal after a minute.
+- **Entry.** Bufferbloat under a bulk upload is jagged (a TCP sawtooth), so entry
+  is a fraction rule, not "every sample high". From the first elevated sample in
+  the entry window, at least 75 % of samples must stay at or above the recovery
+  line (a queue that drained in between starts over), at least half must exceed
+  `max(baseline + 150 ms, 2 × baseline)`, the latest three must all be elevated,
+  and the evidence must cover 4 s. The window is 6 s for WebRTC, but always at
+  least three update intervals of the source (the largest of its last three), so a
+  slow RTT source such as the ~5 s RTCP fallback can still warn. Only fresh
+  measurements count, and the window never spans a gap.
+- **Recovery.** Five continuous seconds below `baseline + 75 ms`.
+- **Rebase.** A route or radio change moves RTT to a new, flat level. After two
+  minutes without a healthy sample, with at least six samples covering 90 s and
+  p90 − p10 of them within 30 ms, the last minute's minimum becomes the floor and
+  the verdict clears. The tolerance is absolute: a route step is flat in
+  milliseconds, while a queue stays jagged however deep it is (a 560–640 ms queue
+  is not flat). A queue that is flat within 30 ms is still adopted after two
+  minutes; this is the cost of not blaming the upload forever after a permanent
+  RTT step on the same ICE pair. The rebase only changes the *explanation*: the
+  indicator's colour comes from the RTT itself, so it stays red.
+- **No age limit.** There is no unconditional rebase: backups and uploads run for
+  hours, and the verdict stays as long as the queue stays jagged. (An earlier
+  thirty-minute limit existed to stop a persistent banner from nagging; the brief
+  message now shows once per episode, so it has no remaining purpose.)
+- **Gaps and paths.** A gap longer than 12 s (ICE `disconnected`, a throttled
+  hidden webview, a hung `getStats`) drops the verdict but keeps the floor, so the
+  verdict returns within seconds instead of the bloated RTT becoming the new
+  normal. Only a different selected candidate pair (including after an ICE
+  restart) or a replacement peer starts a new floor.
+- **Server floor.** The session's lowest Gwar server ping seeds each new WebRTC
+  floor (the SFU shares the server's host), so a call that starts while already
+  congested can still warn. The seed ages like any healthy sample. Until a media
+  sample near it confirms it, the media path may simply be longer than the
+  signalling path (a distant TURN relay), so a verdict also needs two of the last
+  three server pings to be at least the server floor + 75 ms (one pong delayed by
+  a busy JS thread is not enough); a long but healthy relay path is
+  adopted by the flat-level rebase instead. Only Gwar connections feed it; a
+  welcome (including a resync) and teardown reset it.
+
+No settings or network history are persisted, and no bitrate/adaptation controls
+change.
+
+Browser voice polls its peer once a second, including when not sharing or muted.
+The publisher uses its existing two-second headroom poll. Fresh selected
+`candidate-pair.currentRoundTripTime` is preferred; linked
+`remote-inbound-rtp.roundTripTime` from our own sender is the fallback. Repeated
+ICE response/RTCP measurement counters do not advance the detector. The selected
+pair's `availableOutgoingBitrate` is retained as context, but is not required:
+voice-only calls and some browsers do not expose a GCC estimate.
+
+Desktop voice is native Rust, with no media RTT exposed over IPC today. Voice-only
+native calls therefore use the existing 10-second Gwar server ping, with a
+25-second evidence expiry. The ping also measures JS-thread stalls, so entry needs
+three consecutive elevated pings (a 35 s window covering at least 15 s); recovery
+can take another ping interval. With so few samples a jagged queue can look flat by
+chance, so the flat-level rebase needs four minutes away from the floor (at least
+three of them covered) instead of two. The detector learns from pings for the whole
+online session, so a call that starts congested still gets a verdict, but it is
+shown only while voice is connected. This fallback measures the signalling path,
+not media RTT, and has no loss figure. TeamSpeak connections do not use it. Desktop screen publishing still
+uses WebRTC measurements.
+
+This is a queueing-delay heuristic, not proof of direction or which process is
+uploading: server load, a route change, or downlink congestion can also raise RTT.
+A session that connects while already congested has no known healthy floor and
+may not explain the cause until a lower RTT has been observed; the indicator
+still shows the high round trip. The details say what is *usual* and what to try,
+and the technical section says Gwar infers this from rising delay.
+
+For owner UI approval, run `node apps/web/e2e/uplink.mjs`. The isolated Vite fixture
+renders the real sharing bar, voice panel, pill, toast stack and details dialog
+using mocked WebRTC reports, blocks all non-loopback browser requests, fast-forwards
+a fake clock past the message's collapse, checks focus returns to the indicator,
+and checks for horizontal overflow at 1440, 768 and 390 px. Polish PNGs (normal,
+congested with the message, collapsed, details, technical details; dark, plus light
+for desktop and phone) go to `~/dev/projects/gwar-mockups/uplink-congestion-v2/`
+with a `screenshots.txt` list (override with `GWAR_UPLINK_SCREENSHOTS`). It never
+connects to a voice or TeamSpeak server. The fixture is not a production build
+entry. **Owner UI approval is required before merge.**
+
+### Existing screen controls
+
 - **Starting.**
   - A "Share screen" button in the voice panel (`ui/VoicePanel.tsx`), next to
     mute and deafen. It is disabled with a tooltip when missing permission,
@@ -3307,6 +3529,94 @@ from native capture is PR 10.
 
 Polish and English strings are added together, as for every UI change.
 
+### Session interruptions and capture permission
+
+A reconnect retires transports, while keeping the captured stream and its quality,
+preview and currently active TeamSpeak-link choice. Revoking a link clears that
+choice permanently for the retained capture, including moderator revocation.
+Welcome and voice rejoin provide the new participation for republishing. Encoder
+fallback decisions (failed codecs, retired AV1, an unsafe start-bitrate hint, and
+the active recovery codec/rendition)
+survive only for this same capture; a new picker starts with fresh decisions.
+No bitrate estimate or transport state is carried into a new session.
+
+A failed publisher enters the same capture-retaining recovery even if signalling
+still reports online. Media may detect loss after five seconds while signalling
+takes 10–20 seconds. Only the publisher retires; healthy watches stay connected.
+Republishing waits for the server to retire the failed share or for session resync,
+and the 45-second deadline starts at the first media failure, without extension
+when signalling catches up. Moderation and explicit Stop cancel this recovery.
+
+Repeated blips before voice rejoin retain the original channel. Every explicit
+Leave cancels voice rejoin and stops capture, including online republishing before
+the new share ID exists. Manual voice actions supersede saved rejoin intent;
+definitive admission refusal clears it, while a lost connection preserves it.
+Retained capture republishes only when voice is authorized and no permanent voice
+refusal is latched. Restored plaintext presence alone cannot clear that refusal.
+Explicit voice entry or Retry can resume capture within the original recovery
+deadline; otherwise the deadline stops capture and shows the persistent restart notice.
+Explicit Stop and Leave remain quiet. A capture track ending during recovery
+(for example, its window closing) instead shows the persistent restart notice;
+browser track termination does not distinguish that cause from browser Stop sharing.
+A picker still open at the interruption
+and an unconfirmed quality dialog are retained; confirmation while offline or
+waiting for the new voice binding queues publication. Unconfirmed choices still require confirmation. A changed
+or encrypted channel refuses publication and explains that sharing stopped.
+
+Viewers retain their selected stage and watch order. A `left` stop waits for the
+client update sequence: `remove()` sends a final move update before `client.left`,
+so a bounded 150 ms settle window lets that ordered sequence drain. The same sharer
+session still present means a voluntary move/leave, and the watch closes promptly
+with the normal ended notice. A removed session may return within 45 seconds. Match the original share ID first, then a
+unique user/channel capture, excluding shares already running on other sessions
+when recovery began; Client exposes no device identity. A healthy viewer
+whose return window expires receives an informational ended notice. Watch-transport
+failure instead uses bounded recovery/backoff and a connection error on exhaustion.
+Client identity is refreshed after a rewatch. Explicit Stop, moderation, lost
+access and incompatible codecs end watches normally. Password-channel watches
+use effective channel permissions, including role/user and inherited overrides:
+outside-voice viewers with password bypass resume too; others wait for voice admission.
+Manual unwatch and reset cancel recovery.
+
+Capture and UI stop immediately on explicit Stop, while DTLS remains until its
+stop request settles so transport teardown cannot overtake the user's stop reason.
+Reset retires pending peers. Failed republishing or the 45-second recovery deadline
+leaves a persistent **Share again** notice and uses existing permitted desktop
+notifications. That action is disabled outside voice. No notification permission
+prompt opens during recovery. Installing a recovery or permission banner dismisses
+the superseded sticky screen-stopped toast.
+
+Picker refusal detection is intentionally limited to evidence in browser errors:
+
+| Report | Handling |
+| --- | --- |
+| `AbortError`, explicit cancel/dismiss wording | Silent cancellation |
+| Chromium/Edge `NotAllowedError` with exactly `Permission denied` | Silent picker cancellation |
+| Explicit system/policy/screen-recording refusal | Persistent permission guidance |
+| WebKit/Firefox `NotAllowedError`, including “user agent or the platform”, or other ambiguous refusal | Neutral, non-error hint; user cancellation and platform denial cannot reliably be separated |
+| Other failure | Generic localized error |
+
+Guidance names Gwar in the desktop shell and the detected browser on the web.
+macOS names System Settings → Privacy & Security → Screen Recording; Windows
+names Settings → Privacy & security; other systems get generic privacy guidance.
+Identity, expiry and screen banners share the same shell: 57 pixels tall, 12-pixel
+vertical padding, a visible icon at every width, and 32-pixel controls. Each stays
+on one row. Small screens
+use **Sharing stopped** and a compact sharing action. Permission and ambiguous
+refusal banners offer **How to fix**, opening a small dialog with the details.
+Only the macOS desktop permission dialog offers **Open settings**. Windows WebView2 picker/policy refusals
+cannot be fixed by the OS privacy shortcut, so that button is hidden there. Raw
+error text remains in diagnostics rather than the UI.
+
+Set `E2E_SCREEN_RECONNECT_ONLY=1` for the focused cross-engine regression (the
+complete default matrix also runs it). The suite closes real local session WebSockets, checks same-stream
+republishing and decoded barcode frames, and asserts that a voluntary sharer move
+closes its watches. `E2E_SCREEN_SCREENSHOTS` saves Polish dark-theme banners and
+help dialogs at 1440, 768, 390 and 360 pixels and measures single-row layout,
+overflow and close-button alignment in the running local app. Shell
+and alternate-OS variants use explicit browser platform markers, without changing
+OS permissions or launching the installed desktop app.
+
 ### Web client as built (PR 4)
 
 Code: `apps/web/src/voice/screen.ts` (capture, presets, publish and watch
@@ -3348,9 +3658,10 @@ badge, stage). Decisions taken while building it, where this design left room:
 - **Watch transport.** One per session, negotiated on the first watch.
   `screen.watch` is asked again for up to 5 s while the server answers
   `unavailable`, because the browser can see the transport connect before the
-  screen task reports it. A transport that fails ends every watch, as the
-  server does, with one notice; the user opens the shares again, and the next
-  watch negotiates a new run.
+  screen task reports it. A failed watch transport keeps viewing intent and the
+  selected stage, and negotiates a fresh run after 1, 2, then 4 seconds. Only
+  exhausted recovery shows an error. A decoded frame resets that failure budget.
+  Requests and callbacks from retired runs cannot release or revive new grants.
 - **Watch requests.** Each watch has its own id, and the requests of one share
   run one at a time: a watch, its release and the next watch of the same share
   reach the server in order, so an earlier watch's assignment or release is
@@ -3423,12 +3734,9 @@ screen worker; it arrives with PR 7's encrypted shares.
 - **macOS** runs WebKit's own picker path (§1). WKWebView has no
   `CaptureController` (PR 1), so sharing a window may bring it in front of
   Gwar; the call works without it.
-- **A refusal is never silent.** WebKit and Chromium answer both a closed
-  picker and a refusal before any picker (a WebKit that denies, a missing
-  user gesture, a platform policy) with `NotAllowedError`, and nothing,
-  timing included, tells them apart (a busy renderer delays a refusal; a
-  quick Escape looks like one). Every `NotAllowedError` therefore shows the
-  neutral notice "Screen sharing was cancelled or denied (…)".
+- **Picker refusal.** Current cancellation, platform-denial and ambiguous-error handling
+  is described in [Session interruptions and capture permission](#session-interruptions-and-capture-permission).
+
 - **Info.plist: `NSScreenCaptureUsageDescription`; entitlements: none.**
   - Two consent paths exist on macOS. `SCContentSharingPicker`, which
     WebKit uses on 14+, is consent by itself: the person picks a window or
