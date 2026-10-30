@@ -12,6 +12,7 @@ export function useMicPreview(engine: VoiceEngine) {
 
   useEffect(() => {
     let visible = document.visibilityState !== "hidden";
+    let focused = document.hasFocus();
     let generation = 0;
     let key = "";
     let active: AbortController | null = null;
@@ -20,7 +21,7 @@ export function useMicPreview(engine: VoiceEngine) {
       const audio = useSettings.getState().audio;
       const voice = useVoice.getState();
       const ui = useUi.getState();
-      const eligible = visible && ui.section === "settings" && ui.settingsTab === "audio" && audio.inputMode === "vad" && !voice.muted && !voice.deafened && voice.state === "idle";
+      const eligible = visible && focused && ui.section === "settings" && ui.settingsTab === "audio" && audio.inputMode === "vad" && !voice.muted && !voice.deafened && voice.state === "idle";
       const next = JSON.stringify([eligible, audio.inputDeviceId, audio.noiseSuppression, audio.echoCancellation, audio.autoGainControl]);
       if (!explicit && key === next) return;
       key = next;
@@ -51,8 +52,8 @@ export function useMicPreview(engine: VoiceEngine) {
       })();
     };
     const visibility = () => { visible = document.visibilityState !== "hidden"; refresh(); };
-    const blur = () => { visible = false; refresh(); };
-    const focus = () => { visible = document.visibilityState !== "hidden"; refresh(); };
+    const blur = () => { focused = false; refresh(); };
+    const focus = () => { focused = true; refresh(); };
     request.current = () => { if (!active || active.signal.aborted) refresh(true); };
     const unlisten = [useSettings.subscribe(() => refresh()), useVoice.subscribe(() => refresh()), useUi.subscribe(() => refresh())];
     document.addEventListener("visibilitychange", visibility);

@@ -107,6 +107,25 @@ it.each(exits)("stops local capture immediately on %s", async (_name, leave) => 
   });
 });
 
+it("does not capture when the page opens in an unfocused window", async () => {
+  const focus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
+  await mount();
+  expect(voice.startMicTest).not.toHaveBeenCalled();
+  focus.mockReturnValue(true);
+  await act(async () => window.dispatchEvent(new Event("focus")));
+  expect(voice.startMicTest).toHaveBeenCalledOnce();
+});
+
+it("stays closed when the tab returns without focus", async () => {
+  await mount();
+  await act(async () => window.dispatchEvent(new Event("blur")));
+  await act(async () => { visibility = "hidden"; document.dispatchEvent(new Event("visibilitychange")); });
+  await act(async () => { visibility = "visible"; document.dispatchEvent(new Event("visibilitychange")); });
+  expect(voice.startMicTest).toHaveBeenCalledOnce();
+  await act(async () => window.dispatchEvent(new Event("focus")));
+  expect(voice.startMicTest).toHaveBeenCalledTimes(2);
+});
+
 it("stops active capture immediately when the Audio page unmounts", async () => {
   const stop = vi.fn(); voice.startMicTest.mockResolvedValue(stop);
   await mount();
