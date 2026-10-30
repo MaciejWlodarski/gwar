@@ -53,7 +53,7 @@ export function useMicPreview(engine: VoiceEngine) {
     };
     const visibility = () => { visible = document.visibilityState !== "hidden"; refresh(); };
     const blur = () => { focused = false; refresh(); };
-    const focus = () => { focused = true; refresh(); };
+    const focus = () => { focused = true; visible = document.visibilityState !== "hidden"; refresh(); };
     request.current = () => { if (!active || active.signal.aborted) refresh(true); };
     const unlisten = [useSettings.subscribe(() => refresh()), useVoice.subscribe(() => refresh()), useUi.subscribe(() => refresh())];
     document.addEventListener("visibilitychange", visibility);
