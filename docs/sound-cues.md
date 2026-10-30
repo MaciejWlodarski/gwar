@@ -7,12 +7,24 @@ preferences automatically; see [data migrations](data-migrations.md).
 
 ## Original score
 
-`shared/sound-cues.json` describes 14 original two- or three-note cues as
-`[frequency in Hz, start in ms, duration in ms]`. They are synthesized from sine
-waves with a quiet second harmonic and a smooth attack/release envelope. There
-are no recorded samples, third-party audio, dependencies, or audio downloads.
-All cues last 150–280 ms. At the default volume the loudest sample is below
-0.048 (about -26 dBFS); at full cue volume it stays below 0.1.
+`shared/sound-cues.json` describes 14 original one- to four-note cues as
+`[frequency in Hz, start in ms, duration in ms]`. Each cue names a timbre, so the
+groups are told apart by colour and rhythm, not by pitch alone:
+
+| Group | Timbre | Character |
+| --- | --- | --- |
+| Joining and leaving voice | `voice` | Warm two-note pluck, mid range |
+| Microphone and deafen | `control` | One or two short, dry, low ticks |
+| Voice connection | `alert` | Reedy repeated pulse, then a step down or up |
+| Messages | `message` | High, inharmonic bell |
+| Screen sharing | `share` | Fast four-note run across two octaves |
+
+A timbre sets the partials (`[multiple of the frequency, amplitude]`), how fast a
+note decays, and a level that evens out loudness across the groups. Every note
+keeps a smooth attack and release. There are no recorded samples, third-party
+audio, dependencies, or audio downloads. All cues last 70–290 ms. At the default
+volume the loudest sample is below 0.048 (about -26 dBFS); at full cue volume it
+stays below 0.1.
 
 Export listening copies with the Python standard-library script:
 

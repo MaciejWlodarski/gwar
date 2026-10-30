@@ -1,14 +1,33 @@
 //! Original local notification tones, shared with the web player and WAV exporter.
+use serde::Deserialize;
 use std::{collections::BTreeMap, f64::consts::PI, sync::OnceLock};
 
-type Score = BTreeMap<String, Vec<[f64; 3]>>;
+#[derive(Deserialize)]
+struct Score {
+    timbres: BTreeMap<String, Timbre>,
+    cues: BTreeMap<String, Cue>,
+}
+
+#[derive(Deserialize)]
+struct Timbre {
+    partials: Vec<[f64; 2]>,
+    decay: f64,
+    level: f64,
+}
+
+#[derive(Deserialize)]
+struct Cue {
+    timbre: String,
+    notes: Vec<[f64; 3]>,
+}
 
 pub fn render(name: &str, volume: f32) -> Option<Vec<f32>> {
     static SCORE: OnceLock<Score> = OnceLock::new();
     let score = SCORE.get_or_init(|| {
         serde_json::from_str(include_str!("../../../../shared/sound-cues.json")).expect("built-in cue score")
     });
-    let notes = score.get(name)?;
+    let Cue { timbre, notes } = score.cues.get(name)?;
+    let timbre = score.timbres.get(timbre)?;
     let length = notes.iter().map(|[_, at, duration]| ((at + duration) * 48.0).round() as usize).max()?;
     let mut samples = vec![0.0; length];
     let gain = if volume.is_finite() { volume.clamp(0.0, 1.0) } else { 0.0 };
@@ -18,8 +37,10 @@ pub fn render(name: &str, volume: f32) -> Option<Vec<f32>> {
         for i in 0..length {
             let phase = 2.0 * PI * frequency * i as f64 / 48_000.0;
             let progress = i as f64 / length as f64;
-            let envelope = (PI * progress).sin().powi(2) * (-2.0 * progress).exp();
-            samples[start + i] += gain * (0.18 * envelope * (phase.sin() + 0.18 * (2.0 * phase).sin())) as f32;
+            let envelope = (PI * progress).sin().powi(2) * (-timbre.decay * progress).exp();
+            let tone: f64 =
+                timbre.partials.iter().map(|[multiple, amplitude]| amplitude * (multiple * phase).sin()).sum();
+            samples[start + i] += gain * (0.18 * timbre.level * envelope * tone) as f32;
         }
     }
     Some(samples)
@@ -37,8 +58,8 @@ mod tests {
     #[test]
     fn all_cues_are_short_quiet_finite_and_fade_at_both_ends() {
         let score: Score = serde_json::from_str(include_str!("../../../../shared/sound-cues.json")).unwrap();
-        assert_eq!(score.len(), 14);
-        for name in score.keys() {
+        assert_eq!(score.cues.len(), 14);
+        for name in score.cues.keys() {
             let pcm = render(name, 1.0).unwrap();
             assert!(pcm.len() < 14_400, "{name}");
             assert!(pcm.iter().all(|s| s.is_finite() && s.abs() < 0.1), "{name}");
@@ -47,5 +68,17 @@ mod tests {
             assert!(render(name, 0.0).unwrap().iter().all(|s| *s == 0.0));
         }
         assert!(render("unknown", 1.0).is_none());
+    }
+
+    #[test]
+    fn renders_the_same_tones_as_the_web_player() {
+        let peak = |name| {
+            let pcm = render(name, 1.0).unwrap();
+            (pcm.iter().fold(0.0_f32, |peak, s| peak.max(s.abs())) * 10_000.0).round() as u32
+        };
+        assert_eq!(
+            ["selfJoin", "mute", "connectionLost", "mention", "shareStarted"].map(peak),
+            [773, 728, 706, 514, 702]
+        );
     }
 }

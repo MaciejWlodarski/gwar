@@ -1,7 +1,7 @@
-import notes from "../../../../shared/sound-cues.json";
+import score from "../../../../shared/sound-cues.json";
 
-export type SoundCue = keyof typeof notes;
-export const SOUND_CUES = Object.keys(notes) as SoundCue[];
+export type SoundCue = keyof typeof score.cues;
+export const SOUND_CUES = Object.keys(score.cues) as SoundCue[];
 export const SOUND_RATE = 48_000;
 export const CONTROL_CUES = new Set<SoundCue>(["mute", "unmute", "deafen", "undeafen"]);
 
@@ -28,18 +28,20 @@ export function readSounds(value: unknown): SoundSettings {
   };
 }
 
-/** Original, softly enveloped sine plucks. Kept identical to Rust and the WAV exporter. */
+/** Original, softly enveloped plucks, one timbre per group. Kept identical to Rust and the WAV exporter. */
 export function renderCue(cue: SoundCue, volume: number): Float32Array<ArrayBuffer> {
-  const score = notes[cue];
-  const samples = new Float32Array(Math.round(Math.max(...score.map(([, at, duration]) => at! + duration!)) * SOUND_RATE / 1000));
+  const { notes, timbre } = score.cues[cue];
+  const { partials, decay, level } = score.timbres[timbre as keyof typeof score.timbres];
+  const samples = new Float32Array(Math.round(Math.max(...notes.map(([, at, duration]) => at! + duration!)) * SOUND_RATE / 1000));
   const gain = Number.isFinite(volume) ? Math.max(0, Math.min(1, volume)) : 0;
-  for (const [frequency, at, duration] of score) {
+  for (const [frequency, at, duration] of notes) {
     const start = Math.round(at! * SOUND_RATE / 1000);
     const length = Math.round(duration! * SOUND_RATE / 1000);
     for (let i = 0; i < length; i++) {
       const t = i / SOUND_RATE, phase = 2 * Math.PI * frequency! * t, progress = i / length;
-      const envelope = Math.sin(Math.PI * progress) ** 2 * Math.exp(-2 * progress);
-      samples[start + i]! += gain * 0.18 * envelope * (Math.sin(phase) + 0.18 * Math.sin(2 * phase));
+      const envelope = Math.sin(Math.PI * progress) ** 2 * Math.exp(-decay * progress);
+      const tone = partials.reduce((sum, [multiple, amplitude]) => sum + amplitude! * Math.sin(multiple! * phase), 0);
+      samples[start + i]! += gain * 0.18 * level * envelope * tone;
     }
   }
   return samples;

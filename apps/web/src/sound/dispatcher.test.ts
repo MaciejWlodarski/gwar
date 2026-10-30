@@ -4,6 +4,7 @@ import type { ChatMessage } from "../proto/ChatMessage";
 import { initialState } from "../state/reducer";
 import type { SessionState } from "../state/types";
 import { defaultSounds, readSounds, renderCue, SOUND_CUES, type SoundCue } from "./catalog";
+import score from "../../../../shared/sound-cues.json";
 import { SoundDispatcher } from "./dispatcher";
 
 const client = (id: number, channel: number | null) => ({ id, channel, uid: `u${id}` }) as Client;
@@ -117,4 +118,14 @@ it("renders short, click-free, quiet original cues and normalizes damaged prefer
     expect(renderCue(cue, 0).every(s => s === 0)).toBe(true);
   }
   expect(readSounds({ enabled: false, volume: NaN, events: { mute: false } })).toMatchObject({ enabled: false, volume: 0.6, events: { mute: false, unmute: true } });
+});
+
+it("gives each group of cues its own timbre", () => {
+  const timbres = (["selfJoin", "mute", "connectionLost", "mention", "shareStarted"] as const).map(cue => score.cues[cue].timbre);
+  expect(new Set(timbres).size).toBe(timbres.length);
+});
+
+it("renders the same tones as the native player", () => {
+  const peak = (cue: SoundCue) => Math.round(Math.max(...renderCue(cue, 1).map(Math.abs)) * 10_000);
+  expect(["selfJoin", "mute", "connectionLost", "mention", "shareStarted"].map(cue => peak(cue as SoundCue))).toEqual([773, 728, 706, 514, 702]);
 });
