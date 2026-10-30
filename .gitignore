@@ -34,3 +34,6 @@ apps/web/e2e/screenshots/input-sensitivity/
 crates/gwar-mls-wasm/pkg/
 crates/gwar-denoise-wasm/pkg/
 .build-tools/
+
+# TypeScript build info
+*.tsbuildinfo

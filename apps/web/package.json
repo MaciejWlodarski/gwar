@@ -24,6 +24,7 @@
     "e2e:input-sensitivity": "node e2e/input-sensitivity.mjs",
     "e2e:voice-switch": "node e2e/voice-switch.mjs",
     "e2e:denoise": "node e2e/denoise.mjs",
+    "e2e:uplink": "node e2e/uplink.mjs",
     "e2e:screen": "node e2e/screen.mjs",
     "e2e:screen-startup": "node e2e/screen-startup.mjs",
     "e2e:screen-paused": "node e2e/screen-paused.mjs",

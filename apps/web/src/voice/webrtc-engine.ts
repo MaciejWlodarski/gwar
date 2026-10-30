@@ -1,3 +1,4 @@
+import { RtcUplinkObserver } from "./uplink-congestion";
 import { startDenoise, type DenoisePipeline } from "./denoise";
 import { nextMediaRun } from "./engine";
 import { inputThreshold } from "./input-sensitivity";
@@ -75,6 +76,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
   private handlers = new Map<string, Set<Handler>>();
   private pc: RTCPeerConnection | null = null;
+  private uplinkTimer: ReturnType<typeof setInterval> | null = null;
   private sframe: SframeWorker | null = null;
   private micSender: RTCRtpSender | null = null;
   private stream: MediaStream | null = null;
@@ -213,6 +215,23 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         bundlePolicy: "max-bundle",
       });
       this.pc = pc;
+      const uplink = new RtcUplinkObserver();
+      let polling = false;
+      let uplinkGeneration = 0, uplinkConnected = false;
+      const pollUplink = async () => {
+        if (this.pc !== pc) return;
+        if (pc.connectionState !== "connected") { this.emit("uplink", null); return; }
+        if (polling) { this.emit("uplink", uplink.observe(performance.now(), null)); return; }
+        const generation = uplinkGeneration;
+        polling = true;
+        try {
+          const report = await pc.getStats();
+          if (this.pc === pc && generation === uplinkGeneration) this.emit("uplink", pc.connectionState === "connected" ? uplink.observe(performance.now(), report) : null);
+        } catch {
+          if (this.pc === pc && generation === uplinkGeneration) this.emit("uplink", pc.connectionState === "connected" ? uplink.observe(performance.now(), null) : null);
+        } finally { if (generation === uplinkGeneration) polling = false; }
+      };
+      this.uplinkTimer = setInterval(() => void pollUplink(), 1_000);
       // One dedicated worker per encrypted run; it starts closed.
       const sframe = encrypted ? new SframeWorker({ server_key: server_key!, session: binding.session, channel: binding.channel, call: call!, participation: participation!, run: mediaRun, group: group! }, keys!.resumeAfter(), status => {
         if (this.sframe !== sframe) return;
@@ -244,6 +263,11 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       };
       pc.onconnectionstatechange = () => {
         if (this.pc !== pc) return;
+        if (uplinkConnected && pc.connectionState !== "connected") {
+          uplinkGeneration++; polling = false; uplink.suspend();
+          this.emit("uplink", null);
+        }
+        uplinkConnected = pc.connectionState === "connected";
         if (pc.connectionState === "connected") this.setState("connected");
         else if (pc.connectionState === "failed" || pc.connectionState === "closed") this.setState("failed");
         else if (pc.connectionState === "disconnected") {
@@ -298,6 +322,9 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     this.gateControl = null;
     this.gateSupported = null;
     this.emit("inputGateSupport", null);
+    if (this.uplinkTimer) clearInterval(this.uplinkTimer);
+    this.uplinkTimer = null;
+    this.emit("uplink", null);
     // Invalidate the run's keys first, then the transport.
     this.sframe?.stop();
     this.sframe = null;

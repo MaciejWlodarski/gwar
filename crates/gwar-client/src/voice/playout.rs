@@ -1070,14 +1070,15 @@ mod tests {
     fn gated_pauses_drain_by_their_missing_packets() {
         // A sender's gate stops sending 300 ms (`HANGOVER`) after its voice: a pause arrives as
         // no packets (and a new spurt on the RTP clock), its hangover as room noise, or
-        // near-digital silence with noise suppression on. Words of 200 ms with pauses of 500 or
-        // 800 ms after a 440 ms backlog: the first missing stretch takes it, without any level
-        // rule (the room noise is audible, -55 dB RMS, and nothing is cut), and no word is lost.
-        // A pause whose missing stretch is shorter than the backlog less the hangover (400 ms
-        // here) still loses the end of the word before it to the jitter buffer's new spurt
-        // (RTP) or stall recovery (sequence), as before #201.
+        // near-digital silence with noise suppression on. Words of 200 ms with pauses of 400,
+        // 500 or 800 ms after a 440 ms backlog: the queue shrinks by each missing stretch,
+        // without any level rule (the room noise is audible, -55 dB RMS, and nothing is cut),
+        // and nothing sent is lost. A silent hangover still queued at the next spurt drops as
+        // inaudible packets. A new spurt (RTP) or stall recovery (sequence) used to discard
+        // whatever was still queued: after the 400 ms pause, the last 20 ms of the word.
         for clock in [Clock::Rtp, Clock::Sequence] {
-            for (pause, room) in [(25, 0.0031), (40, 0.0031), (25, 0.0)] {
+            for (pause, room) in [(20, 0.0031), (20, 0.0), (25, 0.0031), (40, 0.0031), (25, 0.0)] {
+                let audible = room > 0.0;
                 let cycle = 10 + pause;
                 let speaks = |i: usize| i % cycle < 10;
                 let sent = |i: usize| i % cycle < 25;
@@ -1126,9 +1127,11 @@ mod tests {
                     lost.len(),
                     slot.edits.iter().map(|e| (e.removed, e.correlation.is_some())).collect::<Vec<_>>()
                 );
-                assert_eq!(words_lost, 0, "{clock:?} {pause}: {lost:?}");
-                assert!(done <= cycle - backlog + 1 && *late <= 2 * 960, "{clock:?} {pause}: {done} {late}");
-                assert!(slot.edits.is_empty(), "{clock:?} {pause}: {:?}", slot.edits);
+                assert!(lost.is_empty() && words_lost == 0, "{clock:?} {pause}: {lost:?}");
+                // Within five pauses (each takes at least 100 ms), and for good.
+                assert!(done <= 5 * cycle && *late <= 960, "{clock:?} {pause}: {done} {late}");
+                assert!(!audible || slot.edits.is_empty(), "{clock:?} {pause}: {:?}", slot.edits);
+                assert!(slot.edits.iter().all(|e| e.removed == 960 && e.correlation.is_none()), "{clock:?} {pause}");
             }
         }
     }

@@ -6,6 +6,7 @@ import { Maximize, MessageSquare, MessageSquareOff, Minimize, MonitorOff, Monito
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { cn } from "../lib/cn";
+import { ConnectionIndicator } from "./ConnectionQuality";
 import { canOpenScreenRecordingSettings, isDesktop, openScreenRecordingSettings } from "../platform";
 import { captureApp, captureOs } from "../voice/screen-permission";
 import { canActOn } from "../lib/permissions";
@@ -19,7 +20,7 @@ import { slotOf, useScreen } from "../state/screen";
 import { useSession, useUi } from "../state/stores";
 import { type PublishStats } from "../voice/screen";
 import { HEIGHTS, FRAME_RATES, type ScreenSpec } from "../voice/screen-quality";
-import { useChannelPermission, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
+import { useChannelPermission, useConnectionQuality, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
 import { BackButton, Button, Dialog, IconButton, panelCard, TalkingAvatar, Tooltip, TopBanner } from "./kit";
 import { paneBack } from "./nav";
 
@@ -220,7 +221,7 @@ export function SharingBar() {
           </Button>
         </span>
       )}
-      <span className="ml-auto flex items-center gap-2">
+      <span className="ml-auto flex max-w-full flex-wrap items-center justify-end gap-2">
         <QualityControls spec={own.spec} bar />
         <Button size="sm" variant="secondary" aria-pressed={own.preview} className={cn("border-white/40 text-white hover:bg-white/15", own.preview && "bg-white/20")}
           onClick={() => controller.screen.setPreview(!own.preview)}>
@@ -242,6 +243,7 @@ export function SharingBar() {
 function SenderStats() {
   const t = useT();
   const [stats, setStats] = useState<PublishStats | null>(null);
+  const congested = !!useConnectionQuality()?.congestion;
   useEffect(() => {
     let live = true;
     const poll = () => void controller.screen.ownStats().then(s => { if (live) setStats(s); });
@@ -249,22 +251,26 @@ function SenderStats() {
     const timer = setInterval(poll, 2000);
     return () => { live = false; clearInterval(timer); };
   }, []);
-  if (!stats || !stats.height) return null;
+  if (!stats || !stats.height) return <ConnectionIndicator variant="bar" />;
   const mbps = (stats.bitrate / 1e6).toFixed(1);
   const encoder = stats.encoder
     ? t("screen.encoder", { name: stats.encoder, kind: t(stats.hardware === true ? "screen.encoderHardware" : stats.hardware === false ? "screen.encoderSoftware" : "screen.encoderUnknown") })
     : undefined;
   return (
-    <details data-testid="screen-sender-stats" className="relative text-xs text-white">
-      <summary className="cursor-pointer rounded border border-white/40 px-2 py-1 font-medium">
-        {t(stats.limitation === "cpu" ? "screen.limitedCpu" : stats.limitation === "bandwidth" ? "screen.limitedBandwidth" : "screen.qualityGood")}
-      </summary>
-      <div className="absolute top-full left-0 z-50 mt-1 w-64 rounded-lg border border-line-strong bg-raised p-3 text-fg shadow-pop">
-        <p className="mb-1 font-medium">{t("common.details")}</p>
-        <p className="tabular-nums">{`${stats.height}p · ${stats.fps} fps · ${mbps} Mb/s${stats.codec ? ` · ${stats.codec}` : ""}`}</p>
-        {encoder && <p className="mt-1 text-muted">{encoder}</p>}
-      </div>
-    </details>
+    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
+      <ConnectionIndicator variant="bar" />
+      <details data-testid="screen-sender-stats" className="relative text-xs text-white">
+        <summary className="cursor-pointer rounded border border-white/40 px-2 py-1 font-medium">
+          {/* Congestion is the more specific reason the encoder is held back. */}
+          {t(congested ? "common.details" : stats.limitation === "cpu" ? "screen.limitedCpu" : stats.limitation === "bandwidth" ? "screen.limitedBandwidth" : "screen.qualityGood")}
+        </summary>
+        <div className="absolute top-full left-0 z-50 mt-1 w-64 rounded-lg border border-line-strong bg-raised p-3 text-fg shadow-pop">
+          <p className="mb-1 font-medium">{t("common.details")}</p>
+          <p className="tabular-nums">{`${stats.height}p · ${stats.fps} fps · ${mbps} Mb/s${stats.codec ? ` · ${stats.codec}` : ""}`}</p>
+          {encoder && <p className="mt-1 text-muted">{encoder}</p>}
+        </div>
+      </details>
+    </div>
   );
 }
 

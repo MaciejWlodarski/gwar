@@ -3290,6 +3290,145 @@ from native capture is PR 10.
 
 ## 6. Interface
 
+### Connection quality
+
+Like Discord's coloured "Voice Connected", Gwar shows connection quality as a
+signal-bar indicator rather than banners (`ui/ConnectionQuality.tsx`,
+`state/uplink.ts`):
+
+- **Indicator.** While voice is connected, the voice panel shows bars and the round trip in ms
+  once there is a measurement; its status dot,
+  and the pill's dot and "Voice connected", take the same colour. The pill adds
+  the bars, and the sharing bar a chip, only while the connection is not good.
+  Losing voice hides its indicators immediately. Screen congestion stays on
+  the sharing bar while voice is down, with screen-specific details.
+- **Colour, from measurements only.** The round trip is the worst fresh media
+  RTT of the voice and screen transports, or the server ping without media.
+  Good below 150 ms, fair from 150 ms, poor from 300 ms round trip, about
+  150 ms each way, up to which a conversation stays natural (ITU-T G.114); a far
+  server alone is not flagged. Loss of our own outbound streams, from
+  `remote-inbound-rtp.fractionLost` where RTCP carries it, makes it fair from
+  3 % and poor from 10 %. A congestion verdict makes it at least fair, and poor
+  when the queue adds 250 ms or more. No detector timer turns it green: if the
+  detector adopts a new floor, a 480 ms round trip is still red. A worse colour
+  shows at once; a better one only once the connection has stayed better than
+  the shown level for 4 s without a break (so poor → good via a moment of fair
+  turns good 4 s after it settles), so a round trip at a threshold does not
+  flicker. Every view shows the same held colour.
+- **Brief message.** When a voice congestion verdict starts during a connected call, one plain-language
+  message appears in the toast stack ("Your internet can't keep up with
+  uploading — others hear you about 0.5 s late", the delay being RTT minus the
+  floor at that moment) with a Details link and a close button. It collapses
+  after 8 s (held open while hovered or focused), or when the queue drains.
+  A verdict that returns within two minutes of the last one ending is the same
+  episode and shows nothing. On phones the message sits at the top, clear of
+  the call controls and the tab bar.
+  Voice loss clears the notice, voice measurement and episode. Late stats while
+  disconnected are discarded; reconnecting waits for fresh measurements,
+  including a fresh ping for native voice. A share alone never raises a voice notice.
+- **Voice recovery.** Automatic retries show an amber "Reconnecting…" row and
+  one quiet retry-now action in the panel. The single keyed toast has no action
+  or details expander. Only permanent refusals show the red "Voice unavailable"
+  row with Why and Retry; they have no duplicate toast.
+- **Details.** Clicking the indicator (or Details) opens a dialog: what the
+  connection is like and what to do in plain words (pause uploads, backups,
+  cloud sync or another call on this device or network), and, folded under
+  "Technical details", the round trip, the usual round trip, loss, the upload
+  estimate and the router advice (SQM/QoS, bufferbloat). Without a verdict the
+  dialog gives generic advice for a slow connection instead. Closing it returns
+  focus to what opened it; it also closes when the connection ends.
+- **Accessibility.** The message is inserted into a polite live region, so a
+  screen reader hears it once per episode; its delay is fixed when it appears.
+  The sharing bar's chip is `aria-live="off"` inside the bar's status region.
+  The indicator is a button with its quality and round trip as its label.
+
+`voice/uplink-congestion.ts` contains the pure, session-local detector:
+
+- **Floor.** The baseline is the minimum of the last minute's *healthy* samples,
+  those below `baseline + 75 ms` (the recovery line). Moderate bloat therefore
+  never creeps into it. When no healthy sample is left, the old minimum stays
+  frozen, so a standing queue does not become normal after a minute.
+- **Entry.** Bufferbloat under a bulk upload is jagged (a TCP sawtooth), so entry
+  is a fraction rule, not "every sample high". From the first elevated sample in
+  the entry window, at least 75 % of samples must stay at or above the recovery
+  line (a queue that drained in between starts over), at least half must exceed
+  `max(baseline + 150 ms, 2 × baseline)`, the latest three must all be elevated,
+  and the evidence must cover 4 s. The window is 6 s for WebRTC, but always at
+  least three update intervals of the source (the largest of its last three), so a
+  slow RTT source such as the ~5 s RTCP fallback can still warn. Only fresh
+  measurements count, and the window never spans a gap.
+- **Recovery.** Five continuous seconds below `baseline + 75 ms`.
+- **Rebase.** A route or radio change moves RTT to a new, flat level. After two
+  minutes without a healthy sample, with at least six samples covering 90 s and
+  p90 − p10 of them within 30 ms, the last minute's minimum becomes the floor and
+  the verdict clears. The tolerance is absolute: a route step is flat in
+  milliseconds, while a queue stays jagged however deep it is (a 560–640 ms queue
+  is not flat). A queue that is flat within 30 ms is still adopted after two
+  minutes; this is the cost of not blaming the upload forever after a permanent
+  RTT step on the same ICE pair. The rebase only changes the *explanation*: the
+  indicator's colour comes from the RTT itself, so it stays red.
+- **No age limit.** There is no unconditional rebase: backups and uploads run for
+  hours, and the verdict stays as long as the queue stays jagged. (An earlier
+  thirty-minute limit existed to stop a persistent banner from nagging; the brief
+  message now shows once per episode, so it has no remaining purpose.)
+- **Gaps and paths.** A gap longer than 12 s (ICE `disconnected`, a throttled
+  hidden webview, a hung `getStats`) drops the verdict but keeps the floor, so the
+  verdict returns within seconds instead of the bloated RTT becoming the new
+  normal. Only a different selected candidate pair (including after an ICE
+  restart) or a replacement peer starts a new floor.
+- **Server floor.** The session's lowest Gwar server ping seeds each new WebRTC
+  floor (the SFU shares the server's host), so a call that starts while already
+  congested can still warn. The seed ages like any healthy sample. Until a media
+  sample near it confirms it, the media path may simply be longer than the
+  signalling path (a distant TURN relay), so a verdict also needs two of the last
+  three server pings to be at least the server floor + 75 ms (one pong delayed by
+  a busy JS thread is not enough); a long but healthy relay path is
+  adopted by the flat-level rebase instead. Only Gwar connections feed it; a
+  welcome (including a resync) and teardown reset it.
+
+No settings or network history are persisted, and no bitrate/adaptation controls
+change.
+
+Browser voice polls its peer once a second, including when not sharing or muted.
+The publisher uses its existing two-second headroom poll. Fresh selected
+`candidate-pair.currentRoundTripTime` is preferred; linked
+`remote-inbound-rtp.roundTripTime` from our own sender is the fallback. Repeated
+ICE response/RTCP measurement counters do not advance the detector. The selected
+pair's `availableOutgoingBitrate` is retained as context, but is not required:
+voice-only calls and some browsers do not expose a GCC estimate.
+
+Desktop voice is native Rust, with no media RTT exposed over IPC today. Voice-only
+native calls therefore use the existing 10-second Gwar server ping, with a
+25-second evidence expiry. The ping also measures JS-thread stalls, so entry needs
+three consecutive elevated pings (a 35 s window covering at least 15 s); recovery
+can take another ping interval. With so few samples a jagged queue can look flat by
+chance, so the flat-level rebase needs four minutes away from the floor (at least
+three of them covered) instead of two. The detector learns from pings for the whole
+online session, so a call that starts congested still gets a verdict, but it is
+shown only while voice is connected. This fallback measures the signalling path,
+not media RTT, and has no loss figure. TeamSpeak connections do not use it. Desktop screen publishing still
+uses WebRTC measurements.
+
+This is a queueing-delay heuristic, not proof of direction or which process is
+uploading: server load, a route change, or downlink congestion can also raise RTT.
+A session that connects while already congested has no known healthy floor and
+may not explain the cause until a lower RTT has been observed; the indicator
+still shows the high round trip. The details say what is *usual* and what to try,
+and the technical section says Gwar infers this from rising delay.
+
+For owner UI approval, run `node apps/web/e2e/uplink.mjs`. The isolated Vite fixture
+renders the real sharing bar, voice panel, pill, toast stack and details dialog
+using mocked WebRTC reports, blocks all non-loopback browser requests, fast-forwards
+a fake clock past the message's collapse, checks focus returns to the indicator,
+and checks for horizontal overflow at 1440, 768 and 390 px. Polish PNGs (normal,
+congested with the message, collapsed, details, technical details; dark, plus light
+for desktop and phone) go to `~/dev/projects/gwar-mockups/uplink-congestion-v2/`
+with a `screenshots.txt` list (override with `GWAR_UPLINK_SCREENSHOTS`). It never
+connects to a voice or TeamSpeak server. The fixture is not a production build
+entry. **Owner UI approval is required before merge.**
+
+### Existing screen controls
+
 - **Starting.**
   - A "Share screen" button in the voice panel (`ui/VoicePanel.tsx`), next to
     mute and deafen. It is disabled with a tooltip when missing permission,

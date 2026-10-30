@@ -3,6 +3,7 @@
  * with WebRTC + WebAudio (`webrtc-engine.ts`); the Tauri desktop app uses a
  * native implementation of the same interface (`native-engine.ts`).
  */
+import type { UplinkStatus } from "./uplink-congestion";
 import type { IceServer } from "../proto/IceServer";
 import type { Control, ControlResult, CryptoStatus } from "./sframe/state";
 import { dbToLevel } from "./input-sensitivity";
@@ -65,6 +66,8 @@ export interface DeviceList {
 }
 
 export interface VoiceEvents {
+  /** Fresh, session-local WebRTC uplink health (browser engine). */
+  uplink: UplinkStatus | null;
   /** Local microphone level 0..1 (already shaped for display). */
   level: number;
   /** null before negotiation; false means only the legacy automatic gate is available. */
