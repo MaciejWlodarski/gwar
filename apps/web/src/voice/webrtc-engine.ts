@@ -169,6 +169,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
 
   playSound(cue: SoundCue, volume: number): void {
     if (this.deafened && !CONTROL_CUES.has(cue)) return;
+    const pcm = renderCue(cue, volume);
+    if (!pcm) return;
     const ctx = this.ensureContext();
     const request = ++this.cueRequest, at = performance.now();
     if (ctx.state !== "running") {
@@ -184,7 +186,6 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       oldest.stop(); this.cues.delete(oldest);
     }
     const source = ctx.createBufferSource();
-    const pcm = renderCue(cue, volume);
     const buffer = ctx.createBuffer(1, pcm.length, SOUND_RATE);
     buffer.copyToChannel(pcm, 0);
     source.buffer = buffer;

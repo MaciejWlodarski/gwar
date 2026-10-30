@@ -56,6 +56,11 @@ describe("voice lifecycle", () => {
     tick(); d.connected(3); tick(); d.left(); d.left();
     expect(heard()).toEqual(["selfJoin", "connectionLost", "reconnected", "selfJoin", "selfLeave"]);
   });
+  it("S2 never calls a different channel a recovered connection", () => {
+    d.connected(2); tick(); d.lost(); tick(); d.connected(3); d.connected(3);
+    expect(heard()).toEqual(["selfJoin", "connectionLost", "selfJoin"]);
+    expect(d.awaitingRecovery).toBe(false);
+  });
   it("remembers recovery even when teardown defers the lost sound", () => {
     d.connected(2); tick(); expect(d.lost(true)).toBe(true); expect(d.lost()).toBe(false);
     d.connected(2);
@@ -110,12 +115,12 @@ describe("verified live messages", () => {
 
 it("renders short, click-free, quiet original cues and normalizes damaged preferences", () => {
   for (const cue of SOUND_CUES) {
-    const pcm = renderCue(cue, 1);
+    const pcm = renderCue(cue, 1)!;
     expect(pcm.length).toBeLessThan(14_400);
     expect(pcm.every(s => Number.isFinite(s) && Math.abs(s) < 0.1)).toBe(true);
     expect(Math.abs(pcm[0]!)).toBeLessThan(0.0001);
     expect(Math.abs(pcm.at(-1)!)).toBeLessThan(0.0001);
-    expect(renderCue(cue, 0).every(s => s === 0)).toBe(true);
+    expect(renderCue(cue, 0)!.every(s => s === 0)).toBe(true);
   }
   expect(readSounds({ enabled: false, volume: NaN, events: { mute: false } })).toMatchObject({ enabled: false, volume: 0.6, events: { mute: false, unmute: true } });
 });
@@ -126,6 +131,6 @@ it("gives each group of cues its own timbre", () => {
 });
 
 it("renders the same tones as the native player", () => {
-  const peak = (cue: SoundCue) => Math.round(Math.max(...renderCue(cue, 1).map(Math.abs)) * 10_000);
+  const peak = (cue: SoundCue) => Math.round(Math.max(...renderCue(cue, 1)!.map(Math.abs)) * 10_000);
   expect(["selfJoin", "mute", "connectionLost", "mention", "shareStarted"].map(cue => peak(cue as SoundCue))).toEqual([773, 728, 706, 514, 702]);
 });

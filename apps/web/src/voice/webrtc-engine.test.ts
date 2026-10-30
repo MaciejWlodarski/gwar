@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DenoiseEvents, DenoisePipeline } from "./denoise";
 import type { VoiceEngine } from "./engine";
 import { WebRtcVoiceEngine } from "./webrtc-engine";
+import score from "../../../../shared/sound-cues.json";
 
 const startDenoise = vi.hoisted(() => vi.fn<(events: DenoiseEvents, signal: AbortSignal) => Promise<DenoisePipeline>>());
 vi.mock("./denoise", () => ({ startDenoise }));
@@ -119,6 +120,16 @@ describe("cue output alongside microphone preview and voice", () => {
     expect(gate().close).toHaveBeenCalledOnce();
     expect(uplink).toHaveBeenLastCalledWith(null);
     expect(support).toHaveBeenLastCalledWith(null);
+  });
+
+  it.each(["unknown", "toString", "__proto__"])("S4 drops a cue with unavailable timbre %s without opening output or capture", name => {
+    const original = score.cues.mute.timbre;
+    score.cues.mute.timbre = name;
+    try {
+      expect(() => engine.playSound("mute", 0.6)).not.toThrow();
+      expect(cueSources).toHaveLength(0);
+      expect(getUserMedia).not.toHaveBeenCalled();
+    } finally { score.cues.mute.timbre = original; }
   });
 
   it("deafens activity cues while retaining control confirmation without capture", () => {

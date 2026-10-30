@@ -34,6 +34,8 @@ python3 scripts/export-sound-cues.py /tmp/gwar-sound-cues
 
 It writes one 48 kHz mono PCM WAV per cue and a `README.txt` explaining them.
 The exporter, browser player, and Rust player use the same score and envelope.
+Players reject an unavailable timbre without substituting another sound. The
+exporter validates every timbre before writing any files and reports an invalid score.
 
 ## When they play
 
@@ -47,6 +49,9 @@ The exporter, browser player, and Rust player use the same score and envelope.
   desktop tray actions. Unmuting while deafened produces one unmute cue.
 - A previously connected voice call losing its media or signalling connection
   sounds once; its next successful connection sounds as a recovery.
+  Recovery belongs to the original channel and ends on explicit Leave, channel
+  removal, a move, or a terminal refusal. Refusals do not sound like transport
+  failures. Automatic certificate renewal stays silent when voice returns.
 - Verified live mentions and DMs sound unless their conversation is already
   visible and focused. Own messages, history, edits, rejected messages, and
   duplicate deliveries do not sound. Sound switches are independent of system

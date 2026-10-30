@@ -29,9 +29,15 @@ export function readSounds(value: unknown): SoundSettings {
 }
 
 /** Original, softly enveloped plucks, one timbre per group. Kept identical to Rust and the WAV exporter. */
-export function renderCue(cue: SoundCue, volume: number): Float32Array<ArrayBuffer> {
-  const { notes, timbre } = score.cues[cue];
-  const { partials, decay, level } = score.timbres[timbre as keyof typeof score.timbres];
+export function renderCue(cue: SoundCue, volume: number): Float32Array<ArrayBuffer> | null {
+  if (!Object.hasOwn(score.cues, cue)) return null;
+  const spec = score.cues[cue];
+  if (!spec) return null;
+  const { notes, timbre } = spec;
+  if (!Object.hasOwn(score.timbres, timbre)) return null;
+  const voice = score.timbres[timbre as keyof typeof score.timbres];
+  if (!voice) return null;
+  const { partials, decay, level } = voice;
   const samples = new Float32Array(Math.round(Math.max(...notes.map(([, at, duration]) => at! + duration!)) * SOUND_RATE / 1000));
   const gain = Number.isFinite(volume) ? Math.max(0, Math.min(1, volume)) : 0;
   for (const [frequency, at, duration] of notes) {

@@ -15,6 +15,14 @@ if not 0 <= args.volume <= 1:
     parser.error("volume must be between 0 and 1")
 score = json.loads((Path(__file__).resolve().parent.parent / "shared/sound-cues.json").read_text())
 timbres, cues = score["timbres"], score["cues"]
+# Validate the whole score before creating any output, as the runtime rejects
+# cues whose timbre is unavailable rather than substituting a different sound.
+resolved_timbres = {}
+for cue, spec in cues.items():
+    timbre = timbres.get(spec.get("timbre"))
+    if timbre is None:
+        parser.error(f"cue {cue!r}: unknown timbre {spec.get('timbre')!r}")
+    resolved_timbres[cue] = timbre
 descriptions = dict(zip(cues, [
     "You joined voice", "You left voice or disconnected", "Someone joined your voice channel",
     "Someone left your voice channel", "Microphone muted", "Microphone unmuted", "Deafened",
@@ -26,7 +34,7 @@ lines = ["Gwar sound cues", "", "Original synthesized plucks, one timbre per gro
          f"48 kHz, mono, 16-bit PCM. Volume: {args.volume:.0%} (app default: 60%).",
          "The web and native players synthesize the same score at runtime.", ""]
 for cue, spec in cues.items():
-    notes, timbre = spec["notes"], timbres[spec["timbre"]]
+    notes, timbre = spec["notes"], resolved_timbres[cue]
     samples = [0.0] * round(max(at + duration for _, at, duration in notes) * 48)
     for frequency, at, duration in notes:
         start, length = round(at * 48), round(duration * 48)

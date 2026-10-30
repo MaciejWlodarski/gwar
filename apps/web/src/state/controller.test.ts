@@ -284,6 +284,98 @@ describe("sound cue wiring", () => {
     expect(engine.playSound.mock.calls.map(([cue]) => cue)).toEqual(["selfJoin"]);
   });
 
+  it("S1 keeps a forced move into unsupported encrypted voice silent", async () => {
+    connectFake({ channel: 1, encrypted: [2] }); engine.emitState("connected");
+    await vi.advanceTimersByTimeAsync(1000);
+    engine.capabilities.encryptedVoice = async () => false;
+    link.emit({ ev: "client.updated", d: client(1, 2) });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stores.useVoice.getState()).toMatchObject({ state: "failed", failure: "Update your browser or use the desktop app to join encrypted voice." });
+    expect(controller.sounds.awaitingRecovery).toBe(false);
+    expect(engine.playSound.mock.calls.map(([cue]) => cue)).toEqual(["selfJoin"]);
+  });
+
+  it.each([false, true])("S2 abandons recovery when explicitly leaving during signalling reconnect (Welcome received = %s)", async welcomed => {
+    connectFake({ channel: 2 }); engine.emitState("connected");
+    await vi.advanceTimersByTimeAsync(1000);
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    await vi.advanceTimersByTimeAsync(1000);
+    if (welcomed) {
+      link.welcomeNow(welcome({ session: 9, uid: "u1", channels: [chan(1), chan(2)], clients: [client(9, null, { uid: "u1" })] }), true);
+      await vi.advanceTimersByTimeAsync(1000);
+    }
+    await controller.leaveVoice();
+    expect(controller.sounds.awaitingRecovery).toBe(false);
+    link.welcomeNow(welcome({ session: 9, uid: "u1", channels: [chan(1), chan(2)], clients: [client(9, null, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(1000);
+    await controller.joinChannelInteractive(1);
+    link.emit({ ev: "client.updated", d: client(9, 1, { uid: "u1" }) });
+    await vi.advanceTimersByTimeAsync(1000);
+    engine.emitState("connected");
+    expect(engine.playSound.mock.calls.map(([cue]) => cue)).toEqual(["selfJoin", "connectionLost", "selfLeave", "selfJoin"]);
+  });
+
+  it.each(["channel.deleted", "voice.closed"] as const)("S2 retires recovery on terminal %s before joining another channel", async terminal => {
+    connectFake({ channel: 2 }); engine.emitState("connected");
+    await vi.advanceTimersByTimeAsync(1000);
+    engine.emitState("failed");
+    if (terminal === "channel.deleted") link.emit({ ev: terminal, d: { channel: 2 } });
+    else link.emit({ ev: terminal, d: { ...client(1, 2).voice_binding!, reason: "channel_deleted" } });
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(controller.sounds.awaitingRecovery).toBe(false);
+    await controller.joinChannelInteractive(1);
+    link.emit({ ev: "client.updated", d: client(1, 1) });
+    await vi.advanceTimersByTimeAsync(1000);
+    engine.emitState("connected");
+    expect(engine.playSound.mock.calls.map(([cue]) => cue)).toEqual(["selfJoin", "connectionLost", "selfJoin"]);
+  });
+
+  it("S3 keeps certificate renewal silent when voice returns to its channel", async () => {
+    const { Connection } = await import("../net/connection");
+    const identity = (cert: string) => ({ nickname: "me", publicKey: "k", device: { certificate: cert } }) as unknown as import("../net/identity").Identity;
+    connectFake({ channel: 2 }); engine.emitState("connected");
+    await vi.advanceTimersByTimeAsync(1000);
+    const c = controller as unknown as { conn: Link; connectionParams: import("./controller").ConnectParams };
+    c.conn = Object.create(Connection.prototype, { identity: { value: identity("old") }, close: { value: () => {} } }) as Link;
+    c.connectionParams = { address: "test" };
+    const connect = vi.spyOn(controller, "connect").mockImplementation(async () => { connectFake(); });
+    try {
+      await controller.replaceIdentityQuietly(identity("renewed"));
+      link.emit({ ev: "client.updated", d: client(1, 2) });
+      await vi.advanceTimersByTimeAsync(1000);
+      engine.emitState("connected");
+      expect(engine.playSound.mock.calls.map(([cue]) => cue)).toEqual(["selfJoin"]);
+    } finally { connect.mockRestore(); }
+  });
+
+  it.each([false, true])("S3 retires a failed renewal without clearing a newer participation (newer connection = %s)", async newer => {
+    const { Connection } = await import("../net/connection");
+    const identity = (cert: string) => ({ nickname: "me", publicKey: "k", device: { certificate: cert } }) as unknown as import("../net/identity").Identity;
+    connectFake({ channel: 2 }); engine.emitState("connected");
+    await vi.advanceTimersByTimeAsync(1000);
+    const c = controller as unknown as { conn: Link; connectionParams: import("./controller").ConnectParams; connectAttempt: number };
+    c.conn = Object.create(Connection.prototype, { identity: { value: identity("old") }, close: { value: () => {} } }) as Link;
+    c.connectionParams = { address: "test" };
+    let reject!: (error: Error) => void;
+    const getIdentity = vi.spyOn(controller, "getIdentity").mockImplementationOnce(() => new Promise((_resolve, no) => { reject = no; }));
+    try {
+      const renewal = controller.replaceIdentityQuietly(identity("renewed"));
+      const failed = expect(renewal).rejects.toThrow();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(getIdentity).toHaveBeenCalledOnce(); // The real connect passed its internal teardown; no socket was opened.
+      if (newer) {
+        c.connectAttempt++;
+        connectFake({ channel: 1 }); engine.emitState("connected");
+        await vi.advanceTimersByTimeAsync(1000);
+      }
+      reject(new Error("identity unavailable")); await failed;
+      expect(engine.playSound.mock.calls.map(([cue]) => cue)).toEqual(newer ? ["selfJoin", "selfJoin"] : ["selfJoin"]);
+      if (!newer) { connectFake({ channel: 1 }); await vi.advanceTimersByTimeAsync(1000); }
+      engine.emitState("connected");
+      expect(engine.playSound.mock.calls.map(([cue]) => cue)).toEqual(["selfJoin", "selfJoin"]);
+    } finally { getIdentity.mockRestore(); }
+  });
+
   it("confirms mute and deafen changes, including control cues while deafened", async () => {
     controller.setDeafened(true);
     await vi.advanceTimersByTimeAsync(150);
@@ -1514,7 +1606,7 @@ describe("where a connection opens", () => {
       session().dispatch({ type: "phase", phase: "online" });
     });
     await controller.replaceIdentityQuietly(identity("renewed"));
-    expect(connect).toHaveBeenCalledWith({ address: "test" });
+    expect(connect).toHaveBeenCalledWith({ address: "test" }, "renew");
     expect(ui()).toMatchObject({ section: "settings", settingsTab: "account", settingsDrill: true, pane: "members" });
     expect((await import("./identity")).useAccountIdentity.getState().replaced).toBe(replaced);
   });

@@ -424,10 +424,12 @@ class Controller {
       const oldBinding = prev.me ? prev.clients[prev.me.session]?.voice_binding : null;
       const newBinding = s.me ? s.clients[s.me.session]?.voice_binding : null;
       if (now !== null && now === before && oldBinding && newBinding && (oldBinding.call !== newBinding.call || oldBinding.participation !== newBinding.participation)) {
+        this.sounds.retire();
         void this.stopVoice();
         void this.conn?.request("channel.leave", {}).catch(() => {});
         return;
       }
+      if (now !== null && now !== before) this.sounds.moving(now);
       if (before === null && now !== null) {
         this.voiceRetries = 0;
         void this.followVoicePresence();
@@ -498,11 +500,11 @@ class Controller {
 
   // -------------------------------------------------------------- connecting
 
-  async connect(params: ConnectParams): Promise<void> {
+  async connect(params: ConnectParams, cueIntent: "depart" | "renew" = "depart"): Promise<void> {
     if (this.startup && this.startup.params !== params) this.cancelStartup();
     this.init();
     const attempt = this.connectAttempt + 1;
-    await this.disconnect(true);
+    await this.disconnect(true, cueIntent);
     const check = () => { if (attempt !== this.connectAttempt) throw new ConnectionLostError(); };
     check();
     const kind: ServerKind = params.kind ?? "gwar";
@@ -961,19 +963,20 @@ class Controller {
         const b = state.me === null ? null : state.clients[state.me.session]?.voice_binding;
         return b && b.call === event.d.call && b.participation === event.d.participation && b.run === event.d.run;
       })()) {
-        this.sounds.lost();
         this.voiceRetryChannel = myChannelId(useSession.getState());
         if (event.d.reason === "channel_deleted" || this.voiceRetryChannel === null || !useSession.getState().channels[this.voiceRetryChannel]) {
           this.voiceChannelRemoved();
           void this.stopVoice();
         } else if (event.d.reason === "transport_failed") this.voiceFailure(tNow("voice.closed"));
         else {
+          this.sounds.retire();
           useUi.getState().toast("info", tNow("voice.disconnected"), { key: "voice-closed", sticky: true, action: { label: tNow("voice.retry"), run: () => this.retryVoice() } });
           void this.stopVoice();
         }
       }
       if (event.ev === "channel.deleted" || event.ev === "channel.hidden") {
         const ui = useUi.getState(), ch = event.d.channel, state = useSession.getState();
+        this.sounds.retire(ch);
         if (this.voiceRetryChannel === ch) this.voiceChannelRemoved();
         if (ui.dialog.kind === "channelEdit" && ui.dialog.mode === "edit" && ui.dialog.channel === ch) ui.closeDialog();
         // An image from a channel that is gone (its messages were dropped) is no longer shown.
@@ -1042,7 +1045,8 @@ class Controller {
     useSession.getState().setClose({ kind: "server", reason: { kind: "replaced" } });
   }
 
-  async disconnect(silent = false): Promise<void> {
+  /** `silent` controls session UI; a credential renewal also preserves voice cue participation. */
+  async disconnect(silent = false, cueIntent: "depart" | "renew" = "depart"): Promise<void> {
     const attempt = ++this.connectAttempt;
     this.connections++;
     if (!silent) {
@@ -1054,7 +1058,7 @@ class Controller {
     conn?.close();
     await this.teardown();
     if (attempt !== this.connectAttempt || this.conn !== null) return;
-    this.sounds.left();
+    if (cueIntent === "depart") this.sounds.left();
     if (!silent) useSession.getState().setClose({ kind: "user" });
   }
 
@@ -1304,9 +1308,14 @@ class Controller {
     void this.screen.stopShare(); // also cancels a republish before screen.start answers
     if (useSession.getState().phase === "reconnecting") {
       await this.stopVoice();
+      this.sounds.left();
       return;
     }
-    if (myChannelId(useSession.getState()) === null && !rejoining) return;
+    if (myChannelId(useSession.getState()) === null && !rejoining) {
+      await this.stopVoice();
+      this.sounds.left();
+      return;
+    }
     const ok = await this.attempt(this.connection.request("channel.leave", {}));
     // The server's client.updated follows; do not wait for it to release the microphone.
     if (ok) { await this.stopVoice(); this.sounds.left(); useUi.getState().dismissToast("voice-closed"); }
@@ -1321,10 +1330,14 @@ class Controller {
     const bypass = s.kind === "gwar" ? me && s.me && channelPermissions({ uid: s.me.uid, groups: me.groups, owner: s.owner?.uid === s.me.uid }, channel, s.channels, s.groups).includes("bypass_password") : s.permissions.includes("bypass_password");
     if (!info || (info.has_password && !password && !bypass)) {
       if (this.rejoin === channel) this.rejoin = null;
+      this.sounds.retire(channel);
       return;
     }
     const refused = () => {
-      if (bound.current() && useSession.getState().phase === "online" && this.joinAttempt === intent + 1 && this.rejoin === channel) this.rejoin = null;
+      if (bound.current() && useSession.getState().phase === "online" && this.joinAttempt === intent + 1) {
+        if (this.rejoin === channel) this.rejoin = null;
+        this.sounds.retire(channel);
+      }
     };
     try {
       await this.moveChannel(channel, password, false, refused);
@@ -1392,6 +1405,7 @@ class Controller {
   }
 
   private voiceChannelRemoved(): void {
+    this.sounds.retire();
     this.voiceRetryChannel = null;
     useUi.getState().toast("info", tNow("voice.channelRemoved"), { key: "voice-closed", sticky: true });
   }
@@ -1414,7 +1428,8 @@ class Controller {
   private voiceFailure(message: string, retry = true): void {
     // A late transport-close event cannot erase a permanent refusal awaiting manual Retry.
     if (retry && !this.voiceRetryAllowed) return;
-    this.sounds.lost();
+    if (retry) this.sounds.lost();
+    else this.sounds.retire();
     useVoice.getState().set({ state: "failed", failure: retry ? null : message });
     this.resetNativeUplink(false);
     if (retry) this.scheduleVoiceRetry();
@@ -1536,11 +1551,16 @@ class Controller {
     const changed = this.conn instanceof Connection && JSON.stringify(this.conn.identity.device) !== JSON.stringify(identity.device);
     const reconnect = changed ? this.connectionParams : null;
     const channel = myChannelId(s);
-    if (reconnect) await this.disconnect(true);
+    if (reconnect) await this.disconnect(true, "renew");
     this.adopt(identity, false);
     // Not `connectInteractive`: nobody asked to go anywhere, so the app stays where it is (Settings, say).
     if (reconnect) {
-      await this.connect(reconnect);
+      const attempt = this.connectAttempt + 1;
+      try { await this.connect(reconnect, "renew"); }
+      catch (error) {
+        if (attempt === this.connectAttempt) this.sounds.retire();
+        throw error;
+      }
       if (channel !== null) await this.rejoinVoice(channel);
     }
   }

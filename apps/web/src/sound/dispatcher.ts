@@ -7,7 +7,7 @@ import { CONTROL_CUES as controls, type SoundCue, type SoundSettings } from "./c
 export class SoundDispatcher {
   private last = new Map<string, number>();
   private channel: number | null = null;
-  private recovering = false;
+  private recoveryChannel: number | null = null;
   private messages = new Set<string>();
 
   constructor(
@@ -33,15 +33,15 @@ export class SoundDispatcher {
 
   connected(channel: number | null): void {
     if (channel === null) return;
-    if (this.recovering) this.cue("reconnected");
+    if (this.recoveryChannel === channel) this.cue("reconnected");
     else if (this.channel !== channel) this.cue("selfJoin");
     this.channel = channel;
-    this.recovering = false;
+    this.recoveryChannel = null;
   }
 
   lost(defer = false): boolean {
-    if (this.channel === null || this.recovering) return false;
-    this.recovering = true;
+    if (this.channel === null || this.recoveryChannel !== null) return false;
+    this.recoveryChannel = this.channel;
     if (!defer) this.cue("connectionLost");
     return true;
   }
@@ -51,9 +51,19 @@ export class SoundDispatcher {
     this.reset();
   }
 
-  reset(): void { this.channel = null; this.recovering = false; this.last.clear(); this.messages.clear(); }
+  /** A new channel is a new participation, even if the old transport was recovering. */
+  moving(channel: number): void { if (this.channel !== channel) this.retire(); }
 
-  get awaitingRecovery(): boolean { return this.recovering; }
+  /** Retire voice intent without claiming either a transport loss or a deliberate departure. */
+  retire(channel = this.channel): void {
+    if (channel !== this.channel) return;
+    this.channel = null;
+    this.recoveryChannel = null;
+  }
+
+  reset(): void { this.retire(); this.last.clear(); this.messages.clear(); }
+
+  get awaitingRecovery(): boolean { return this.recoveryChannel !== null; }
 
   /** Welcome/history snapshots never sound like a burst of people joining. */
   session(next: SessionState, before: SessionState): void {
