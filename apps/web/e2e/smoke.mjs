@@ -35,6 +35,7 @@ import path from "node:path";
 import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
+import { installMicPrivacyGuard } from "./mic-privacy.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(here, "..");
@@ -394,16 +395,6 @@ async function main() {
         return ws;
       },
     });
-    // Counts microphone requests: nothing may ask before the user joins voice.
-    window.__gum = 0;
-    const media = navigator.mediaDevices;
-    if (media?.getUserMedia) {
-      const nativeGum = media.getUserMedia.bind(media);
-      media.getUserMedia = (...args) => {
-        window.__gum++;
-        return nativeGum(...args);
-      };
-    }
     const pcs = (window.__pcs = []);
     const NativePC = window.RTCPeerConnection;
     window.RTCPeerConnection = new Proxy(NativePC, {
@@ -425,6 +416,7 @@ async function main() {
       const key = "gwar.settings";
       if (!localStorage.getItem(key)) localStorage.setItem(key, JSON.stringify({ version: 3, state: { onboarding: { completed: true, firstUsedAt: Date.now(), nudgeDismissed: true, roleReceived: false } } }));
     });
+    await ctx.addInitScript(installMicPrivacyGuard);
     await ctx.addInitScript(spy);
     return ctx;
   };
@@ -451,7 +443,8 @@ async function main() {
     await connect(a, "Alice");
     await shot(a, "03-desktop-not-in-voice-dark");
     if ((await a.getByRole("button", { name: /Mute microphone/ }).count()) !== 0) throw new Error("mic button shown outside voice");
-    if ((await a.evaluate(() => window.__gum)) !== 0) throw new Error("the microphone was requested before joining voice");
+    if ((await a.evaluate(() => window.__unexpectedPreview)) !== 0) throw new Error(JSON.stringify(await a.evaluate(() => window.__micPrivacyViolations)));
+    await waitFor(() => a.evaluate(() => window.__micStreams.every(stream => stream.getTracks().every(track => track.readyState === "ended"))), "settings preview capture released before connecting", 5000);
     if ((await a.evaluate(() => window.__pcs.length)) !== 0) throw new Error("a peer connection exists before joining voice");
   });
   await check("verified server fingerprint is visible and pinned after first connection", async () => {
@@ -1208,7 +1201,7 @@ async function main() {
     await a.getByRole("button", { name: "Settings" }).first().click();
     await a.getByRole("tab", { name: "Audio" }).click();
     await a.getByRole("radio", { name: "Push to talk" }).click();
-    await a.getByRole("button", { name: "Set push-to-talk key" }).click();
+    await a.getByRole("button", { name: "Choose a key" }).click();
     await a.keyboard.press("KeyV");
     await a.keyboard.press("Escape");
     await a.locator("header").first().click();
@@ -2064,6 +2057,10 @@ async function main() {
     if (real.length) throw new Error(real.slice(0, 3).join(" | "));
   });
 
+  for (const page of [a, b]) {
+    const violations = await page.evaluate(() => window.__micPrivacyViolations);
+    if (violations.length) throw new Error(`microphone privacy: ${JSON.stringify(violations)}`);
+  }
   await browser.close();
 }
 

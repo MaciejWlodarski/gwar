@@ -16,7 +16,7 @@
 //!   with `kind` = `no_device` | `permission_denied` (input only) | `failed`
 //! - `voice://device`  `{owner, side, kind, device}` the devices sorted themselves out:
 //!   `switched` (audio moved to `device` by itself) | `recovered` (a reported problem is over)
-//! - `voice://test-level {owner, db}`                 microphone test in settings
+//! - `voice://test-level {owner, test, db}`                 microphone test in settings
 //! - `voice://crypto`  `{owner, run, binding, state, reason}` encrypted-run status
 //!   (`securing` | `failed`); never an installation acknowledgement
 //!
@@ -36,7 +36,7 @@ use std::{
 };
 
 use gwar_client::voice::{
-    InputMode, LinkState, NoiseSuppression, VoiceHandle,
+    InputMode, LinkState, MicrophoneProcessor, NoiseSuppression, VoiceHandle,
     io::{AudioIo, AudioPorts, DeviceControl, DeviceIo, DeviceIssue, IssueSink, Side},
     keys::EncryptedStart,
     permission,
@@ -92,6 +92,9 @@ struct Inner {
     owner: u64,
     startup: Option<Arc<NativeRun>>,
     mic_test: Option<Arc<NativeRun>>,
+    mic_test_serial: u64,
+    gate_serial: u64,
+    gate_ready: bool,
     prefs: Prefs,
     handle: Option<VoiceHandle>,
     /// Moves the running engine's devices (`voice_set_devices`) without renegotiating.
@@ -116,10 +119,13 @@ impl Default for Voice {
                 owner: 0,
                 startup: None,
                 mic_test: None,
+                mic_test_serial: 0,
+                gate_serial: 0,
+                gate_ready: true,
                 prefs: Prefs {
                     input: None,
                     output: None,
-                    mode: InputMode::VoiceActivity { threshold_db: DEFAULT_THRESHOLD_DB },
+                    mode: InputMode::Automatic,
                     muted: false,
                     deafened: false,
                     ptt: false,
@@ -442,6 +448,7 @@ fn bootstrap_owner(voice: &Voice) -> u64 {
     }
     inner.owner += 1;
     inner.cancelled_through = 0;
+    inner.mic_test_serial = 0;
     // A held key belongs to the old view; never carry it into a new owner.
     inner.prefs.ptt = false;
     inner.owner
@@ -464,8 +471,13 @@ fn claim_run(voice: &Voice, owner: u64, run: u64) -> Result<Arc<NativeRun>, Stri
     }
     inner.cancelled_through = inner.cancelled_through.max(voice.run.load(Ordering::SeqCst));
     clear_run(voice, &mut inner);
+    if let Some(test) = inner.mic_test.take() {
+        test.retire();
+    }
     let startup = NativeRun::new();
     inner.startup = Some(startup.clone());
+    inner.gate_serial = 0;
+    inner.gate_ready = true;
     voice.run.store(run, Ordering::SeqCst);
     Ok(startup)
 }
@@ -613,6 +625,7 @@ pub async fn voice_start(
         if let Some(events) = handle.take_crypto_events() {
             tauri::async_runtime::spawn(forward_crypto(app.clone(), owner, run, events));
         }
+        handle.set_input_gate_ready(inner.gate_ready);
         inner.handle = Some(handle);
         // A choice made while the devices opened applies now.
         if let Some(control) = &control {
@@ -824,6 +837,9 @@ pub fn voice_set_muted(window: WebviewWindow, voice: State<'_, Voice>, owner: u6
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     inner.prefs.muted = muted;
+    if muted && let Some(test) = inner.mic_test.take() {
+        test.retire();
+    }
     if let Some(h) = &inner.handle {
         h.set_muted(muted);
     }
@@ -841,6 +857,9 @@ pub fn voice_set_deafened(
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     inner.prefs.deafened = deafened;
+    if deafened && let Some(test) = inner.mic_test.take() {
+        test.retire();
+    }
     if let Some(h) = &inner.handle {
         h.set_deafened(deafened);
     }
@@ -878,11 +897,45 @@ pub fn voice_set_input_mode(
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     inner.prefs.mode = match mode {
-        Mode::Vad => InputMode::VoiceActivity { threshold_db: threshold_db.unwrap_or(DEFAULT_THRESHOLD_DB) },
+        Mode::Vad if threshold_db.is_none() => InputMode::Automatic,
+        Mode::Vad => InputMode::VoiceActivity {
+            threshold_db: gwar_client::voice::input_threshold(threshold_db.unwrap_or(DEFAULT_THRESHOLD_DB)),
+        },
         Mode::Ptt => InputMode::PushToTalk,
     };
     if let Some(h) = &inner.handle {
         h.set_input_mode(inner.prefs.mode);
+    }
+    Ok(())
+}
+
+/// Run-bound barrier: only the latest acknowledged mode may reopen native output.
+#[tauri::command]
+pub fn voice_set_gate_ready(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    run: u64,
+    serial: u64,
+    ready: bool,
+) -> Result<(), String> {
+    check_main_window(window.label())?;
+    set_gate_ready(&voice, owner, run, serial, ready)
+}
+
+fn set_gate_ready(voice: &Voice, owner: u64, run: u64, serial: u64, ready: bool) -> Result<(), String> {
+    let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
+    if voice.run.load(Ordering::SeqCst) != run {
+        return Err("superseded voice run".into());
+    }
+    if (ready && serial != inner.gate_serial) || (!ready && serial <= inner.gate_serial) {
+        return Err("superseded input mode".into());
+    }
+    inner.gate_serial = serial;
+    inner.gate_ready = ready;
+    if let Some(handle) = &inner.handle {
+        handle.set_input_gate_ready(ready);
     }
     Ok(())
 }
@@ -998,7 +1051,44 @@ pub async fn audio_devices(window: WebviewWindow) -> Result<Devices, String> {
 #[derive(Clone, Serialize)]
 struct TestLevel {
     owner: u64,
+    test: u64,
     db: f32,
+}
+
+fn claim_mic_test(voice: &Voice, owner: u64, id: u64) -> Result<Arc<NativeRun>, String> {
+    let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
+    if id <= inner.mic_test_serial {
+        return Err("superseded microphone preview".into());
+    }
+    if inner.prefs.muted || inner.prefs.deafened {
+        return Err("microphone is muted".into());
+    }
+    if voice.run.load(Ordering::SeqCst) != 0 {
+        return Err("voice already owns microphone capture".into());
+    }
+    inner.mic_test_serial = id;
+    if let Some(test) = inner.mic_test.take() {
+        test.retire();
+    }
+    let test = NativeRun::new();
+    inner.mic_test = Some(test.clone());
+    Ok(test)
+}
+
+fn retire_mic_test(voice: &Voice, owner: u64, id: Option<u64>) -> Result<(), String> {
+    let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
+    if let Some(id) = id {
+        if id < inner.mic_test_serial {
+            return Ok(());
+        }
+        inner.mic_test_serial = id;
+    }
+    if let Some(test) = inner.mic_test.take() {
+        test.retire();
+    }
+    Ok(())
 }
 
 /// Opens the microphone on its own and reports `voice://test-level` until
@@ -1009,42 +1099,56 @@ pub async fn mic_test_start(
     voice: State<'_, Voice>,
     owner: u64,
     input: Option<String>,
+    test: u64,
 ) -> Result<(), String> {
     check_main_window(window.label())?;
+    if !window.is_visible().unwrap_or(false) || !window.is_focused().unwrap_or(false) {
+        return Err("microphone preview requires a visible focused window".into());
+    }
     let app = window.app_handle().clone();
-    let test = {
-        let mut inner = voice.lock();
-        check_owner(&inner, owner)?;
-        if let Some(test) = inner.mic_test.take() {
-            test.retire();
-        }
-        let test = NativeRun::new();
-        inner.mic_test = Some(test.clone());
-        test
-    };
+    let id = test;
+    let test = claim_mic_test(&voice, owner, id)?;
     let io = Box::new(RunIo { run: test.clone(), io: make_io(&voice, input, None, issue_sink(&app, owner)).0 });
-    let ports = test
-        .until_retired(async {
-            tokio::task::spawn_blocking(move || io.open())
-                .await
-                .map_err(|e| e.to_string())?
-                .map_err(|e| format!("{e:#}"))
-        })
-        .await?;
+    // Wait for a cancelled open to finish releasing its ports before voice can acquire capture.
+    let ports = tokio::task::spawn_blocking(move || io.open())
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("{e:#}"))?;
+    test.check()?;
     thread::Builder::new()
         .name("gwar-mic-test".into())
         .spawn(move || {
             let AudioPorts { mut mic, speaker: _speaker, _guard, .. } = ports;
-            let mut acc = (0f32, 0usize);
+            let mut processor = MicrophoneProcessor::default();
+            let mut frame = [0.0; gwar_client::voice::FRAME];
+            let mut filled = 0;
+            let mut next = None;
+            let mut continuous = false;
             while test.check().is_ok() {
+                let (echo, gain, noise) = {
+                    let voice = app.state::<Voice>();
+                    let inner = voice.lock();
+                    (inner.prefs.echo, inner.prefs.gain, inner.prefs.noise)
+                };
+                let mut latest = None;
                 while let Ok(s) = mic.pop() {
-                    acc.0 += s.value * s.value;
-                    acc.1 += 1;
+                    if next != Some(s.position) {
+                        filled = 0;
+                        continuous = false;
+                    }
+                    frame[filled] = s.value;
+                    filled += 1;
+                    next = Some(s.position + 1);
+                    if filled == frame.len() {
+                        processor.process(&mut frame, echo, gain, noise, continuous, 0);
+                        continuous = true;
+                        let power = frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32;
+                        latest = Some(10.0 * power.max(1e-10).log10());
+                        filled = 0;
+                    }
                 }
-                if acc.1 > 0 {
-                    let rms = (acc.0 / acc.1 as f32).sqrt();
-                    let _ = app.emit("voice://test-level", TestLevel { owner, db: 20.0 * rms.max(1e-5).log10() });
-                    acc = (0.0, 0);
+                if let Some(db) = latest {
+                    let _ = app.emit("voice://test-level", TestLevel { owner, test: id, db });
                 }
                 thread::sleep(Duration::from_millis(50));
             }
@@ -1054,14 +1158,31 @@ pub async fn mic_test_start(
 }
 
 #[tauri::command]
-pub fn mic_test_stop(window: WebviewWindow, voice: State<'_, Voice>, owner: u64) -> Result<(), String> {
+pub fn mic_test_stop(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    test: Option<u64>,
+) -> Result<(), String> {
     check_main_window(window.label())?;
-    let mut inner = voice.lock();
-    check_owner(&inner, owner)?;
-    if let Some(test) = inner.mic_test.take() {
+    retire_mic_test(&voice, owner, test)
+}
+
+pub fn pause_mic_test(voice: &Voice) {
+    if let Some(test) = voice.lock().mic_test.take() {
         test.retire();
     }
-    Ok(())
+}
+
+#[tauri::command]
+pub fn mic_permission(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+) -> Result<permission::MicPermissionStatus, String> {
+    check_main_window(window.label())?;
+    check_owner(&voice.lock(), owner)?;
+    Ok(permission::microphone_permission())
 }
 
 // ------------------------------------------------------------ privacy settings
@@ -1088,6 +1209,37 @@ mod run_tests {
         sync::atomic::{AtomicBool, AtomicUsize},
         task::Poll,
     };
+
+    #[test]
+    fn preview_releases_its_device_on_window_pause_and_refuses_muted_capture() {
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        let test = claim_mic_test(&voice, owner, 1).unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        *test.audio.lock().unwrap() = Some(Box::new(Closed(closed.clone())));
+        pause_mic_test(&voice);
+        assert!(test.check().is_err());
+        assert!(closed.load(Ordering::SeqCst));
+        voice.lock().prefs.muted = true;
+        assert!(claim_mic_test(&voice, owner, 2).is_err());
+        voice.lock().prefs.muted = false;
+        voice.lock().prefs.deafened = true;
+        assert!(claim_mic_test(&voice, owner, 2).is_err());
+    }
+
+    #[test]
+    fn preview_cancellation_fences_a_late_start_and_never_stops_its_replacement() {
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        retire_mic_test(&voice, owner, Some(1)).unwrap();
+        assert!(claim_mic_test(&voice, owner, 1).is_err());
+        let replacement = claim_mic_test(&voice, owner, 2).unwrap();
+        retire_mic_test(&voice, owner, Some(1)).unwrap();
+        assert!(replacement.check().is_ok());
+        claim_run(&voice, owner, 100).unwrap();
+        assert!(replacement.check().is_err());
+        assert!(claim_mic_test(&voice, owner, 3).is_err());
+    }
 
     #[test]
     fn voice_commands_require_the_main_window_label() {
@@ -1236,6 +1388,7 @@ mod run_tests {
         let (tx, mut answer) = oneshot::channel();
         {
             let mut inner = voice.lock();
+            handle.set_input_gate_ready(inner.gate_ready);
             inner.handle = Some(handle);
             inner.pending_answer = Some((old_run, tx));
             inner.prefs.ptt = true;
@@ -1318,6 +1471,25 @@ mod run_tests {
         for bad in ["", "01", "-1", "1.0", "18446744073709551616", " 1"] {
             assert!(resume_floor(Some(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn mode_acknowledgements_are_bound_to_the_current_owner_run_and_serial() {
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        claim_run(&voice, owner, 5).unwrap();
+        set_gate_ready(&voice, owner, 5, 1, false).unwrap();
+        assert!(!voice.lock().gate_ready);
+        set_gate_ready(&voice, owner, 5, 2, false).unwrap();
+        assert!(set_gate_ready(&voice, owner, 5, 1, true).is_err());
+        assert!(!voice.lock().gate_ready);
+        set_gate_ready(&voice, owner, 5, 2, true).unwrap();
+        assert!(voice.lock().gate_ready);
+        claim_run(&voice, owner, 6).unwrap();
+        set_gate_ready(&voice, owner, 6, 1, false).unwrap();
+        assert!(set_gate_ready(&voice, owner, 5, 2, true).is_err());
+        assert!(set_gate_ready(&voice, owner + 1, 6, 1, true).is_err());
+        assert!(!voice.lock().gate_ready);
     }
 
     #[test]

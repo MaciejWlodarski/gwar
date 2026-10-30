@@ -56,6 +56,7 @@ beforeEach(() => {
       return claimed;
     }
     if (command === "audio_devices") return { inputs: [], outputs: [] };
+    if (command === "mic_permission") return "granted";
     if (args?.owner !== owner) throw new Error("superseded owner");
     if (command === "voice_start") {
       const run = args.run as number;
@@ -75,6 +76,26 @@ afterEach(async () => {
 });
 
 describe("native web-view ownership", () => {
+  it("applies manual sensitivity live, preserves it across PTT, and restores the automatic default", async () => {
+    const view = engine();
+    view.setInputSensitivity(-72);
+    view.setInputMode("ptt");
+    view.setInputMode("vad");
+    await view.stop(); // Drain controls without opening native audio.
+    expect(bridge.invoke.mock.calls.filter(([command]) => command === "voice_set_input_mode").map(([, args]) => args)).toEqual([
+      { owner: 1, mode: "vad", thresholdDb: -72 },
+      { owner: 1, mode: "ptt", thresholdDb: -72 },
+      { owner: 1, mode: "vad", thresholdDb: -72 },
+    ]);
+    view.setInputSensitivity(null);
+    await view.stop();
+    expect(bridge.invoke).toHaveBeenCalledWith("voice_set_input_mode", { owner: 1, mode: "vad", thresholdDb: null });
+    view.setInputSensitivity(-50);
+    await view.stop();
+    expect(bridge.invoke.mock.calls.filter(([command]) => command === "voice_set_input_mode").at(-1)?.[1]).toEqual({ owner: 1, mode: "vad", thresholdDb: -50 });
+    expect(bridge.invoke).not.toHaveBeenCalledWith("voice_start", expect.anything());
+  });
+
   it("bootstraps on construction and retires a previous timestamp-sized run before the first stop", async () => {
     const view = engine();
     await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_bootstrap"));
@@ -99,8 +120,7 @@ describe("native web-view ownership", () => {
     stopTest();
     await view.stop();
     expect(bridge.invoke).toHaveBeenCalledWith("voice_start", expect.objectContaining({ owner: 1 }));
-    expect(bridge.invoke).toHaveBeenCalledWith("mic_test_start", { owner: 1, input: null });
-    expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1 });
+    expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_start")).toHaveLength(0);
     expect(bridge.invoke.mock.calls.filter(([command]) => command !== "voice_bootstrap" && command !== "audio_devices").every(([, args]) => args?.owner === 1)).toBe(true);
   });
 
@@ -114,7 +134,7 @@ describe("native web-view ownership", () => {
     await current.start(params());
     const currentRun = activeRun;
     answer.resolve("late answer");
-    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_answer", { owner: 1, run: oldRun, sdp: "late answer" }));
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_answer", expect.objectContaining({ owner: 1, run: oldRun, error: expect.any(String) })));
     old.setPttActive(true);
     await old.stop();
     expect(activeRun).toBe(currentRun);
@@ -139,6 +159,51 @@ describe("native web-view ownership", () => {
 });
 
 describe("native microphone test replacement", () => {
+  it("reads permission without opening or requesting capture", async () => {
+    const view = engine();
+    expect(await view.micPermission()).toBe("granted");
+    expect(bridge.invoke.mock.calls.map(([command]) => command)).toEqual(["voice_bootstrap", "mic_permission"]);
+  });
+
+  it("applies queued unmute controls before acquiring preview capture", async () => {
+    const unmuted = deferred<void>(), entered = deferred<void>();
+    const invoke = bridge.invoke.getMockImplementation()!;
+    bridge.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "voice_set_muted" && args?.muted === false) { entered.resolve(); await unmuted.promise; }
+      return invoke(command, args);
+    });
+    const view = engine();
+    view.setMuted(true);
+    view.setMuted(false);
+    const preview = view.startMicTest(vi.fn());
+    await entered.promise;
+    expect(bridge.invoke.mock.calls.some(([command]) => command === "mic_test_start")).toBe(false);
+    unmuted.resolve();
+    const stop = await preview;
+    expect(bridge.invoke).toHaveBeenCalledWith("mic_test_start", { owner: 1, input: null, test: 1 });
+    stop();
+  });
+
+  it("retires and drains a pending preview before voice starts", async () => {
+    const opened = deferred<void>(), entered = deferred<void>();
+    const invoke = bridge.invoke.getMockImplementation()!;
+    bridge.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+      if (command === "mic_test_start") { entered.resolve(); await opened.promise; }
+      return invoke(command, args);
+    });
+    const view = engine();
+    const preview = view.startMicTest(vi.fn());
+    await entered.promise;
+    const starting = view.start(params());
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1, test: 1 }));
+    expect(bridge.invoke.mock.calls.some(([command]) => command === "voice_start")).toBe(false);
+    opened.resolve();
+    await preview;
+    await starting;
+    const commands = bridge.invoke.mock.calls.map(([command]) => command);
+    expect(commands.lastIndexOf("mic_test_stop")).toBeLessThan(commands.indexOf("voice_start"));
+  });
+
   it("keeps late startup cleanup and levels from stopping or updating the replacement", async () => {
     const opening = deferred<void>();
     const entered = deferred<void>();
@@ -157,20 +222,24 @@ describe("native microphone test replacement", () => {
     const currentLevel = vi.fn();
     const oldTest = view.startMicTest(oldLevel);
     await entered.promise;
-    const stopCurrent = await view.startMicTest(currentLevel);
-    emit("voice://test-level", { owner: 1, db: -30 });
-    expect(oldLevel).not.toHaveBeenCalled();
-    expect(currentLevel).toHaveBeenCalledWith(0.5);
+    const replacement = view.startMicTest(currentLevel);
+    expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_start")).toHaveLength(1);
     opening.resolve();
+    const stopCurrent = await replacement;
+    const test = bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_start").at(-1)![1]!.test;
+    expect(oldLevel).toHaveBeenLastCalledWith(0);
+    oldLevel.mockClear();
+    emit("voice://test-level", { owner: 1, test, db: -30 });
+    expect(oldLevel).not.toHaveBeenCalled();
+    expect(currentLevel).toHaveBeenCalledWith(0.7);
     const stopOld = await oldTest;
     stopOld();
-    await view.stop(); // Drain queued commands before asserting no stale mic stop was sent.
-    expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_stop")).toHaveLength(0);
-    emit("voice://test-level", { owner: 1, db: -30 });
+    expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_stop").every(([, args]) => args?.test === 1)).toBe(true);
+    emit("voice://test-level", { owner: 1, test, db: -30 });
     expect(oldLevel).not.toHaveBeenCalled();
-    expect(currentLevel).toHaveBeenCalledWith(0.5);
+    expect(currentLevel).toHaveBeenCalledWith(0.7);
     stopCurrent();
-    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1 }));
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1, test }));
   });
 
   it("does not start an obsolete test whose event listener setup finishes after the replacement", async () => {
@@ -189,15 +258,15 @@ describe("native microphone test replacement", () => {
     const view = engine();
     const oldTest = view.startMicTest(vi.fn());
     await entered.promise;
-    const stopCurrent = await view.startMicTest(vi.fn());
+    const replacement = view.startMicTest(vi.fn());
     listening.resolve();
+    const stopCurrent = await replacement;
     const stopOld = await oldTest;
     stopOld();
-    await view.stop(); // Drain queued commands before asserting no stale mic stop was sent.
     expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_start")).toHaveLength(1);
     expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_stop")).toHaveLength(0);
     stopCurrent();
-    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1 }));
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1, test: 2 }));
   });
 });
 
@@ -303,5 +372,45 @@ describe("native device changes", () => {
     expect(switched).toHaveBeenCalledExactlyOnceWith({ side: "input", label: "MacBook mic" });
     expect(outputError).toHaveBeenCalledExactlyOnceWith(null);
     expect(micError).not.toHaveBeenCalled();
+  });
+});
+
+describe("native acknowledged input mode transitions", () => {
+  it("binds automatic/manual/PTT transitions to the run and waits for the newest ack", async () => {
+    const view = engine(), ack = deferred<void>();
+    const inputGate = vi.fn(async (_enabled: boolean, _run: number) => {});
+    await view.start({ ...params(vi.fn(async () => "a=x-gwar-input-gate:2\r\n")), inputGate });
+    const run = activeRun;
+    emit("voice://offer", { owner: 1, run, sdp: "offer" });
+    await vi.waitFor(() => expect(inputGate).toHaveBeenLastCalledWith(false, run));
+    inputGate.mockReturnValueOnce(ack.promise);
+    view.setInputSensitivity(-80);
+    await vi.waitFor(() => expect(inputGate).toHaveBeenLastCalledWith(true, run));
+    expect(bridge.invoke).toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: false });
+    expect(bridge.invoke).not.toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: true });
+    view.setInputSensitivity(null);
+    ack.resolve();
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 2, ready: true }));
+    expect(bridge.invoke).not.toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: true });
+    expect(inputGate).toHaveBeenLastCalledWith(false, run);
+    view.setInputMode("ptt");
+    await vi.waitFor(() => expect(inputGate).toHaveBeenLastCalledWith(true, run));
+    view.setInputMode("vad");
+    await vi.waitFor(() => expect(inputGate).toHaveBeenLastCalledWith(false, run));
+  });
+
+  it("falls back explicitly on old servers and never opens unsupported PTT", async () => {
+    const view = engine(), support = vi.fn(), inputGate = vi.fn();
+    view.on("inputGateSupport", support);
+    view.setInputSensitivity(-80);
+    await view.start({ ...params(), inputGate });
+    const run = activeRun;
+    emit("voice://offer", { owner: 1, run, sdp: "offer" });
+    await vi.waitFor(() => expect(support).toHaveBeenLastCalledWith(false));
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_set_input_mode", { owner: 1, mode: "vad", thresholdDb: null }));
+    expect(inputGate).not.toHaveBeenCalled();
+    view.setInputMode("ptt");
+    await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: false }));
+    expect(bridge.invoke).not.toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: true });
   });
 });

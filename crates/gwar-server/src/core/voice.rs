@@ -8,7 +8,7 @@ use gwar_mls::{
 };
 use gwar_proto::{
     MlsEvent, MlsLogEntry, MlsResponse, VoiceBinding, VoiceClosedReason, VoiceEpoch, VoiceOffer, VoiceParticipation,
-    VoiceState,
+    VoiceState, VoiceTransportBinding,
 };
 use std::collections::VecDeque;
 
@@ -789,6 +789,49 @@ fn microphone_ssrc(sdp: &str) -> Option<u32> {
     (sources.len() == 1).then(|| *sources.first().unwrap()).filter(|s| *s != 0)
 }
 impl Core {
+    pub(super) fn voice_input_gate(
+        &mut self,
+        session: SessionId,
+        id: u32,
+        binding: VoiceTransportBinding,
+        client_gate: bool,
+    ) -> Option<Reply> {
+        let checked = self.voice_check(
+            session,
+            &VoiceParticipation { call: binding.call.clone(), participation: binding.participation.clone() },
+        );
+        if let Err(error) = checked {
+            return Some(Err(error));
+        }
+        if self.sessions[&session].participation.as_ref().is_none_or(|p| p.binding != VoiceBinding::from(&binding)) {
+            return Some(Err(stale()));
+        }
+        let (reply, rx) = oneshot::channel();
+        if self.media.try_send(MediaCmd::InputGate { session, binding: binding.clone(), client_gate, reply }).is_err() {
+            return Some(Err(err(ErrorCode::Unavailable, "media engine busy")));
+        }
+        let tx = self.me.upgrade()?;
+        tokio::spawn(async move {
+            let applied = tokio::time::timeout(Duration::from_secs(5), rx).await;
+            let _ = tx
+                .send(CoreMsg::Resume(Box::new(move |core| {
+                    let current = core
+                        .sessions
+                        .get(&session)
+                        .and_then(|s| s.participation.as_ref())
+                        .is_some_and(|p| p.binding == VoiceBinding::from(&binding));
+                    let result = if current && matches!(applied, Ok(Ok(Ok(())))) {
+                        Ok(Response::Empty {})
+                    } else {
+                        Err(stale())
+                    };
+                    core.reply(session, id, result);
+                })))
+                .await;
+        });
+        None
+    }
+
     pub(super) fn voice_offer(&mut self, session: SessionId, id: u32, offer: VoiceOffer) -> Option<Reply> {
         let checked = (|| {
             let channel = self.voice_check(
@@ -1790,6 +1833,33 @@ mod tests {
         let message = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
         core.handle(message);
     }
+    #[tokio::test]
+    async fn input_gate_updates_are_run_bound_and_acknowledged_only_after_media_applies_them() {
+        let (mut core, session, _frames, mut commands) = fixture();
+        let (tx, mut rx) = mpsc::channel(16);
+        core.me = tx.downgrade();
+        core.enter_channel(session, 1).unwrap();
+        let first = offer(&core, session, 1);
+        let binding = first.binding();
+        assert!(core.voice_offer(session, 10, first).is_none());
+        let MediaCmd::Offer { reply, .. } = commands.recv().await.unwrap() else { panic!() };
+        complete(&mut core, &mut rx, reply, Ok("answer".into())).await;
+        let mut stale_binding = binding.clone();
+        stale_binding.run = 2;
+        assert!(core.voice_input_gate(session, 11, stale_binding, true).unwrap().is_err());
+        assert!(commands.try_recv().is_err());
+        assert!(core.voice_input_gate(session, 12, binding.clone(), true).is_none());
+        let MediaCmd::InputGate { binding: applied, client_gate, reply, .. } = commands.recv().await.unwrap() else {
+            panic!()
+        };
+        assert_eq!(applied, binding);
+        assert!(client_gate);
+        assert!(rx.try_recv().is_err()); // No acknowledgement while the media task has not applied it.
+        reply.send(Ok(())).unwrap();
+        let resumed = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await.unwrap().unwrap();
+        core.handle(resumed);
+    }
+
     #[tokio::test]
     async fn offers_are_idempotent_and_late_completions_cannot_revive_a_retired_run() {
         let (mut core, session, _frames, mut commands) = fixture();

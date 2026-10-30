@@ -305,6 +305,7 @@ class Controller {
     this.screen.init();
     const e = this.engine;
     e.on("level", (level) => useVoice.getState().set({ level }));
+    e.on("inputGateSupport", (inputGateSupport) => useVoice.getState().set({ inputGateSupport }));
     e.on("uplink", voice => useUplink.setState({ voice }));
     e.on("state", (state) => {
       // Transport teardown/recovery cannot dismiss a refusal awaiting explicit voice entry.
@@ -344,6 +345,7 @@ class Controller {
     const applyAudio = (s = useSettings.getState()) => {
       const a = s.audio;
       e.setInputMode(a.inputMode);
+      e.setInputSensitivity(a.automaticSensitivity ? null : a.vadThreshold);
       e.setMasterVolume(a.masterVolume);
       void e.setOutputDevice(a.outputDeviceId);
       for (const [uid, v] of Object.entries(s.userVolumes)) e.setUserVolume(uid, v);
@@ -372,6 +374,7 @@ class Controller {
       const a = s.audio;
       const p = prev.audio;
       if (a.inputMode !== p.inputMode) e.setInputMode(a.inputMode);
+      if (a.automaticSensitivity !== p.automaticSensitivity || a.vadThreshold !== p.vadThreshold) e.setInputSensitivity(a.automaticSensitivity ? null : a.vadThreshold);
       if (a.masterVolume !== p.masterVolume) e.setMasterVolume(a.masterVolume);
       if (a.outputDeviceId !== p.outputDeviceId) void e.setOutputDevice(a.outputDeviceId);
       if (a.inputDeviceId !== p.inputDeviceId) void e.setInputDevice(a.inputDeviceId);
@@ -1216,6 +1219,11 @@ class Controller {
       await this.engine.start({
         iceServers, mode: encrypted ? "encrypted" : "plaintext", binding, keys,
         serverHost: this.serverHost(),
+        inputGate: async (client_gate, run) => {
+          if (!current()) throw new Error("Stale voice participation");
+          await conn.request("voice.input_gate", { binding: { call: participation!.call, participation: participation!.participation, run }, client_gate });
+          if (!current()) throw new Error("Stale voice participation");
+        },
         // On TeamSpeak servers the native engine sends frames over the TS connection and never asks for an offer.
         offer: async (sdp, run) => {
           if (!current()) throw new Error("Stale voice participation");

@@ -64,6 +64,12 @@ pub enum MediaCmd {
         out: OutboundTx,
         reply: tokio::sync::oneshot::Sender<Result<String, &'static str>>,
     },
+    InputGate {
+        session: SessionId,
+        binding: VoiceTransportBinding,
+        client_gate: bool,
+        reply: tokio::sync::oneshot::Sender<Result<(), &'static str>>,
+    },
     Remove {
         session: SessionId,
     },
@@ -135,14 +141,42 @@ struct Peer {
     out: OutboundTx,
     mic: Option<Mid>,
     slots: Vec<Slot>,
-    talking: bool,
-    last_voice: Instant,
+    speech: SpeechGate,
     connected: bool,
     origin: Arc<AudioOrigin>,
     admission: RtpAdmission,
+    dynamic_gate: bool,
     rtcp_reports: u64,
     #[cfg(feature = "test-hooks")]
     hold_next: Option<tokio::sync::oneshot::Sender<AudioPacket>>,
+}
+
+struct SpeechGate {
+    client_gate: bool,
+    native_vad: bool,
+    talking: bool,
+    last_voice: Instant,
+}
+impl SpeechGate {
+    fn observe(&mut self, data: &ExtensionValues, now: Instant) {
+        if is_speech(data, self.client_gate, self.native_vad) {
+            self.last_voice = now;
+            self.talking = true;
+        }
+    }
+    fn expire(&mut self, now: Instant) -> bool {
+        if self.talking && now.duration_since(self.last_voice) > HANGOVER {
+            self.talking = false;
+            return true;
+        }
+        false
+    }
+    fn set_client_gate(&mut self, enabled: bool) -> bool {
+        self.client_gate = enabled;
+        let ended = self.talking;
+        self.talking = false;
+        ended
+    }
 }
 
 impl Peer {
@@ -230,13 +264,33 @@ impl Peer {
 }
 
 /// Speech decision for one frame from header extensions alone.
-fn is_speech(data: &ExtensionValues) -> bool {
+fn is_speech(data: &ExtensionValues, client_gate: bool, native_vad: bool) -> bool {
+    if client_gate {
+        if native_vad && let Some(speech) = data.voice_activity {
+            return speech;
+        }
+        // A browser still sends encoded silence/DTX when its worklet closes.
+        // Do not impose a second threshold on quiet speech or push-to-talk.
+        return data.audio_level.map_or_else(|| data.voice_activity.unwrap_or(true), |level| level > -127);
+    }
     match (data.voice_activity, data.audio_level) {
         (vad, Some(level)) => level >= SPEECH_LEVEL || (vad == Some(true) && level >= SPEECH_LEVEL - 10),
         (Some(vad), None) => vad,
         // Without the extension we cannot tell; forward everything.
         (None, None) => true,
     }
+}
+
+fn has_client_gate(sdp: &str) -> bool {
+    sdp.lines().any(|line| line == "a=x-gwar-input-gate:1")
+}
+
+fn has_gate_control(sdp: &str) -> bool {
+    sdp.lines().any(|line| line == "a=x-gwar-input-gate:2")
+}
+
+fn has_native_vad(sdp: &str) -> bool {
+    sdp.lines().any(|line| line == "a=x-gwar-native-vad:1")
 }
 
 pub struct WebRtcConfig {
@@ -289,8 +343,7 @@ pub async fn run(
 
         let now = Instant::now();
         for peer in peers.values_mut() {
-            if peer.talking && now.duration_since(peer.last_voice) > HANGOVER {
-                peer.talking = false;
+            if peer.speech.expire(now) {
                 core.talking_bound(peer.session, false, &peer.binding);
                 // Other transports (TeamSpeak) end the talk state explicitly.
                 let mut end = AudioPacket::end_of_speech(peer.origin.clone(), None);
@@ -324,6 +377,22 @@ pub async fn run(
                         rtcp_reports: peer.rtcp_reports,
                     });
                     let _ = reply.send(snapshot);
+                }
+                Some(MediaCmd::InputGate { session, binding, client_gate, reply }) => {
+                    let result = match peers.get_mut(&session) {
+                        Some(peer) if peer.binding == binding && peer.dynamic_gate => {
+                            if peer.speech.set_client_gate(client_gate) {
+                                core.talking_bound(session, false, &binding);
+                                let mut end = AudioPacket::end_of_speech(peer.origin.clone(), None);
+                                end.egress = uplinks.route(session);
+                                uplinks.uplink(&routing.load(), &end);
+                                sinks.fan_out(&routing.load(), &end);
+                            }
+                            Ok(())
+                        }
+                        _ => Err("stale or unsupported input gate control"),
+                    };
+                    let _ = reply.send(result);
                 }
                 Some(MediaCmd::Remove { session }) => close_peer(&mut peers, session, &core, None),
                 Some(MediaCmd::Forward(packet)) => {
@@ -437,16 +506,24 @@ fn accept(
         out,
         mic: Some(mic),
         slots: Vec::with_capacity(AUDIO_SLOTS),
-        talking: false,
-        last_voice: Instant::now(),
+        speech: SpeechGate {
+            client_gate: has_client_gate(sdp),
+            native_vad: has_native_vad(sdp),
+            talking: false,
+            last_voice: Instant::now(),
+        },
         connected: false,
         origin,
         admission,
+        dynamic_gate: has_gate_control(sdp),
         rtcp_reports: 0,
         #[cfg(feature = "test-hooks")]
         hold_next: None,
     };
-    Ok((peer, answer.to_sdp_string()))
+    let answer = answer.to_sdp_string();
+    let answer =
+        if has_gate_control(sdp) { answer.replacen("\nm=", "\na=x-gwar-input-gate:2\r\nm=", 1) } else { answer };
+    Ok((peer, answer))
 }
 
 fn close_peer(peers: &mut HashMap<SessionId, Peer>, session: SessionId, core: &CoreHandle, reason: Option<&str>) {
@@ -553,20 +630,18 @@ fn ingest(
     )?;
     let now = Instant::now();
     if !routing.load().can_speak(peer.session) {
-        if peer.talking {
-            peer.talking = false;
+        if peer.speech.talking {
+            peer.speech.talking = false;
             core.talking_bound(peer.session, false, &peer.binding);
         }
         return None;
     }
-    if is_speech(&data.header.ext_vals) {
-        peer.last_voice = now;
-        if !peer.talking {
-            peer.talking = true;
-            core.talking_bound(peer.session, true, &peer.binding);
-        }
+    let was_talking = peer.speech.talking;
+    peer.speech.observe(&data.header.ext_vals, now);
+    if !was_talking && peer.speech.talking {
+        core.talking_bound(peer.session, true, &peer.binding);
     }
-    if !peer.talking {
+    if !peer.speech.talking {
         return None;
     }
     Some(AudioPacket {
@@ -586,6 +661,100 @@ fn ingest(
 #[cfg(test)]
 mod clock_tests {
     use super::*;
+
+    #[test]
+    fn automatic_keeps_legacy_vad_and_400_ms_tail_through_live_mode_changes() {
+        let start = Instant::now();
+        let mut gate = SpeechGate { client_gate: false, native_vad: false, talking: false, last_voice: start };
+        let speech = ExtensionValues { audio_level: Some(-55), voice_activity: Some(true), ..Default::default() };
+        let noise = ExtensionValues { audio_level: Some(-55), voice_activity: Some(false), ..Default::default() };
+        gate.observe(&noise, start);
+        assert!(!gate.talking);
+        gate.observe(&speech, start);
+        assert!(gate.talking);
+        gate.observe(&noise, start + Duration::from_millis(399));
+        assert!(!gate.expire(start + Duration::from_millis(400)));
+        assert!(gate.talking);
+        assert!(gate.expire(start + Duration::from_millis(401)));
+        let quiet = ExtensionValues { audio_level: Some(-80), voice_activity: Some(false), ..Default::default() };
+        gate.set_client_gate(true); // Manual or PTT: only digital silence is filtered.
+        gate.observe(&quiet, start + Duration::from_millis(410));
+        assert!(gate.talking);
+        assert!(gate.set_client_gate(false)); // Automatic must discard manual's speech tail.
+        gate.observe(&quiet, start + Duration::from_millis(420));
+        assert!(!gate.talking);
+        gate.observe(&speech, start + Duration::from_millis(430));
+        assert!(gate.talking);
+        assert!(!gate.expire(start + Duration::from_millis(830)));
+        assert!(gate.expire(start + Duration::from_millis(831)));
+        assert!(has_gate_control("v=0\r\na=x-gwar-input-gate:2\r\n"));
+        assert!(!has_client_gate("v=0\r\na=x-gwar-input-gate:2\r\n"));
+    }
+
+    #[test]
+    fn native_mode_transitions_drop_manual_and_automatic_speech_tails() {
+        let start = Instant::now();
+        let quiet = ExtensionValues { audio_level: Some(-80), voice_activity: Some(true), ..Default::default() };
+        let voice = ExtensionValues { audio_level: Some(-45), voice_activity: Some(true), ..Default::default() };
+        let mut gate = SpeechGate { client_gate: true, native_vad: true, talking: false, last_voice: start };
+        gate.observe(&quiet, start);
+        assert!(gate.talking);
+        assert!(gate.set_client_gate(false));
+        gate.observe(&quiet, start + Duration::from_millis(399));
+        assert!(!gate.talking, "suppressed -45/-80 noise must not inherit manual's tail");
+        gate.observe(&voice, start + Duration::from_millis(400));
+        assert!(gate.talking);
+        assert!(gate.set_client_gate(true));
+        assert!(!gate.talking, "automatic tail must not survive the manual transition");
+        gate.observe(&quiet, start + Duration::from_millis(401));
+        assert!(gate.talking);
+        assert!(gate.set_client_gate(true), "manual to PTT also clears the previous tail");
+        assert!(!gate.talking);
+    }
+
+    #[test]
+    fn optional_sdp_gate_is_accepted_and_legacy_offers_stay_legacy() {
+        let legacy = include_str!("../../../../apps/web/src/voice/native-offer.fixture.sdp");
+        let legacy = legacy.replace("\r\n", "\n");
+        let gated = legacy.replacen("\nm=", "\na=x-gwar-input-gate:1\nm=", 1);
+        assert!(!has_client_gate(&legacy));
+        assert!(has_client_gate(&gated));
+        assert!(!has_client_gate(&gated.replace("input-gate:1", "input-gate:2")));
+        // The same parser used by older servers accepts an unknown SDP attribute.
+        assert!(SdpOffer::from_sdp_string(&gated).is_ok());
+        let native = gated.replacen("\nm=", "\na=x-gwar-native-vad:1\nm=", 1);
+        assert!(has_native_vad(&native));
+        assert!(!has_native_vad(&gated));
+        assert!(!has_native_vad(&legacy));
+        assert!(SdpOffer::from_sdp_string(&native).is_ok());
+    }
+
+    #[test]
+    fn client_gate_keeps_quiet_voice_and_ptt_while_legacy_offers_keep_the_old_threshold() {
+        for (level, vad, legacy, gated) in [
+            (-40, Some(false), true, true),
+            (-55, Some(true), true, true),
+            (-75, Some(true), false, true),
+            (-100, Some(false), false, true),
+            (-127, Some(true), false, false),
+        ] {
+            let data = ExtensionValues { audio_level: Some(level), voice_activity: vad, ..Default::default() };
+            assert_eq!(is_speech(&data, false, false), legacy);
+            assert_eq!(is_speech(&data, true, false), gated);
+        }
+        assert!(is_speech(&ExtensionValues::default(), false, false));
+        assert!(is_speech(&ExtensionValues::default(), true, false));
+    }
+
+    #[test]
+    fn native_automatic_suppressed_noise_does_not_open_or_refresh_speech() {
+        let mut data = ExtensionValues { audio_level: Some(-80), voice_activity: Some(false), ..Default::default() };
+        assert!(!is_speech(&data, true, true)); // Automatic: raw -45, processed -80.
+        assert!(is_speech(&data, true, false)); // Browser VAD bits are not authoritative.
+        data.voice_activity = Some(true); // Manual -50 or PTT, same processed level.
+        assert!(is_speech(&data, true, true));
+        assert!(!is_speech(&data, false, true)); // Without client-gate opt-in, keep legacy rules.
+    }
 
     fn slot(now: Instant) -> Slot {
         Slot {

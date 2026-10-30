@@ -1125,10 +1125,9 @@ that also mixes what the speaker plays. The order is a browser's: echo
 cancellation, gain control, then noise suppression (below). The canceller is given
 the speaker's audio as the pipeline queues it, with the queue's length as the delay
 hint, and finds the rest of the echo's delay (device buffers, the room) itself. On
-the desktop, the level meter and the voice gate measure between the canceller and
-the rest: the speaker cannot open the gate, and the sensitivity setting means what
-it does with the processing off (gain control lifts a quiet room's noise: -60 dBFS
-of it comes out at about -48, above the default threshold of -50).
+the desktop, automatic activation retains its legacy pre-gain capture gate and
+processed-audio server decision. Manual sensitivity and the live meter measure
+after gain control and noise suppression, matching the audio that is encoded.
 
 Echo cancellation adds ~9 ms (about 430 samples: AEC3 splits 48 kHz into three
 bands, works in 4 ms blocks and overlaps them); gain control adds nothing. With
@@ -1167,13 +1166,12 @@ untouched.
 Both apps clean the microphone on the device, before encoding (and so before
 encryption), with the same model and settings (`crates/gwar-denoise`): the desktop
 app natively, before the encoder (`crates/gwar-client/src/voice/denoise.rs`), on
-every 10 ms frame; the web app in the browser (below). On the desktop, the level meter
-and the voice gate measure the microphone before it (and before gain control, see
-above): a strong suppressor
-also takes very quiet speech down (speech peaking near -48 dBFS lost most of its
-gated frames to it), and the sensitivity setting should keep meaning what it does.
-The RTP audio level (RFC 6464) is the cleaned audio's, so suppressed noise cannot
-hold a receive slot at the server.
+every 10 ms frame; the web app in the browser (below). Manual sensitivity and the
+live meter use the cleaned audio. The local settings preview uses these same
+processing stages and never connects its output to a speaker or transport.
+Automatic activation retains the legacy server criterion and 400 ms server tail;
+manual activation uses its selected threshold and a 300 ms local tail. PTT bypasses
+sensitivity. The RTP audio level (RFC 6464) is the cleaned audio's.
 
 One model for every kind of noise: DeepFilterNet3's low-latency model (no
 lookahead), run with tract. It adds 10 ms, one frame of overlap-add (the standard

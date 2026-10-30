@@ -27,7 +27,7 @@ vi.mock("../state/controller", async () => {
         mock.selectChannel(channel);
         useSession.getState().dispatch({ type: "selectChannel", channel });
       },
-      voice: { capabilities: {}, listDevices: async () => ({ inputs: [], outputs: [] }) },
+      voice: { capabilities: {}, micPermission: async () => "prompt", listDevices: async () => ({ inputs: [], outputs: [] }) },
       getIdentity: () => new Promise(() => {}),
     },
     describeVoiceError: String,

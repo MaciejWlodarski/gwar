@@ -84,6 +84,11 @@ pub fn run() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            if window.label() == "main"
+                && matches!(event, WindowEvent::Focused(false) | WindowEvent::CloseRequested { .. })
+            {
+                voice::pause_mic_test(&window.state::<voice::Voice>());
+            }
             if let WindowEvent::CloseRequested { api, .. } = event {
                 let to_tray = window.state::<tray::CloseToTray>().0.load(Ordering::Relaxed);
                 if to_tray && window.label() == "main" {
@@ -103,6 +108,7 @@ pub fn run() {
             voice::voice_set_deafened,
             voice::voice_set_ptt,
             voice::voice_set_input_mode,
+            voice::voice_set_gate_ready,
             voice::voice_set_master_gain,
             voice::voice_set_capture_options,
             voice::voice_set_slot_gain,
@@ -110,6 +116,7 @@ pub fn run() {
             voice::audio_devices,
             voice::mic_test_start,
             voice::mic_test_stop,
+            voice::mic_permission,
             voice::open_mic_privacy_settings,
             screen::screen_capture_support,
             screen::open_screen_privacy_settings,

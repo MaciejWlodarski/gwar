@@ -6,6 +6,7 @@ import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 import { guardedLocalStorage, SETTINGS_KEY, SETTINGS_VERSION } from "../lib/local-storage";
 import type { InputMode } from "../voice/engine";
+import { DEFAULT_INPUT_DB, inputThreshold } from "../voice/input-sensitivity";
 
 export type Theme = "system" | "dark" | "light";
 export type Language = "pl" | "en";
@@ -264,6 +265,9 @@ export interface AudioSettings {
   inputDeviceId: string | null;
   outputDeviceId: string | null;
   inputMode: InputMode;
+  /** Automatic retains the default gate; manual uses vadThreshold in dBFS. */
+  automaticSensitivity: boolean;
+  vadThreshold: number;
   /** KeyboardEvent.code of the push-to-talk key. */
   pttKey: string | null;
   noiseSuppression: boolean;
@@ -374,6 +378,8 @@ export const defaultAudio: AudioSettings = {
   inputDeviceId: null,
   outputDeviceId: null,
   inputMode: "vad",
+  automaticSensitivity: true,
+  vadThreshold: DEFAULT_INPUT_DB,
   pttKey: null,
   noiseSuppression: true,
   noiseStrength: 100,
@@ -383,6 +389,16 @@ export const defaultAudio: AudioSettings = {
 };
 
 export const defaultNotifications: NotificationSettings = { mentions: true, privateMessages: true, allMessages: false };
+
+/** Also applied to current-version data: localStorage is not a trusted input. */
+export function validAudio(value: unknown): AudioSettings {
+  const audio = typeof value === "object" && value !== null ? value as Partial<AudioSettings> : {};
+  return {
+    ...defaultAudio, ...audio,
+    automaticSensitivity: typeof audio.automaticSensitivity === "boolean" ? audio.automaticSensitivity : true,
+    vadThreshold: inputThreshold(audio.vadThreshold),
+  };
+}
 
 export const defaultDesktop: DesktopSettings = { muteShortcut: null, deafenShortcut: null, closeToTray: true };
 
@@ -424,7 +440,7 @@ export const useSettings = create<SettingsState>()(
       setLanguage: (language) => set({ language }),
       setCompact: (compact) => set({ compact }),
       setMembersOpen: (membersOpen) => set({ membersOpen }),
-      setAudio: (patch) => set((s) => ({ audio: { ...s.audio, ...patch } })),
+      setAudio: (patch) => set((s) => ({ audio: validAudio({ ...s.audio, ...patch }) })),
       setDesktop: (patch) => set((s) => ({ desktop: { ...s.desktop, ...patch } })),
       setNotifications: (patch) => set((s) => ({ notifications: { ...s.notifications, ...patch } })),
       setUserVolume: (uid, volume) =>
@@ -538,11 +554,15 @@ export const useSettings = create<SettingsState>()(
       version: SETTINGS_VERSION,
       // zustand's default storage (`window.localStorage`), guarded.
       storage: createJSONStorage(() => guardedLocalStorage(window.localStorage)),
-      migrate: (persisted) => ({ selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null,
-        ...migrateQuality((persisted ?? {}) as Record<string, unknown>), onboarding: readOnboarding((persisted as Partial<SettingsState> | null)?.onboarding) }),
+      migrate: (persisted, version) => {
+        let p = migrateQuality((persisted ?? {}) as Record<string, unknown>);
+        // Preserve v4's session preferences before adding v5 sensitivity.
+        if (version < 4) p = { selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null, ...p, onboarding: readOnboarding(p.onboarding) };
+        return version < 5 ? { ...p, audio: validAudio(p.audio) } : p;
+      },
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
-        return { ...current, ...p, onboarding: readOnboarding(p.onboarding), audio: { ...current.audio, ...(p.audio ?? {}) }, desktop: { ...current.desktop, ...(p.desktop ?? {}) },
+        return { ...current, ...p, onboarding: readOnboarding(p.onboarding), audio: validAudio(p.audio), desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,

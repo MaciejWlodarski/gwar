@@ -4,6 +4,16 @@
  * own SSRCs (the native str0m engine does, for its receiver reports); they
  * never identify the microphone.
  */
+export function advertiseInputGate(sdp: string): string {
+  // An optional SDP attribute: older servers ignore it rather than rejecting a new JSON field.
+  return sdp.replace(/^m=/m, "a=x-gwar-input-gate:2\r\nm=");
+}
+
+/** Version 2 keeps automatic gating on the server and acknowledges live mode changes. */
+export function hasInputGateControl(sdp: string): boolean {
+  return sdp.split(/\r?\n/).includes("a=x-gwar-input-gate:2");
+}
+
 export function microphoneSsrc(sdp: string): number | null {
   const sections = sdp.split(/\r?\n(?=m=)/).slice(1);
   const sending = sections.filter(s => /^a=(sendonly|sendrecv)\r?$/m.test(s));

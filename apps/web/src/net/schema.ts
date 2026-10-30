@@ -208,6 +208,7 @@ export const responses: { [K in Op]: Rule<ResponseMap[K]> } = {
   "ban.create": shape({ ban }), "ban.list": shape({ bans: array(ban, 4096) }), "ban.delete": empty,
   "invite.create": shape({ invite }), "invite.list": shape({ invites: array(invite, 4096) }), "invite.delete": empty,
   "voice.offer": shape({ ...transportFields, sdp: str(65536) }),
+  "voice.input_gate": empty,
   "voice.state": shape({voice:nullable(voiceState)}),
   "voice.epoch.ack": empty, "voice.epoch.repeat": empty,
   "screen.start": shape({ share: shareId }), "screen.stop": empty, "screen.watch": shape({ slot: int(3) }), "screen.unwatch": empty, "screen.stop_other": empty, "screen.link.revoke": empty,

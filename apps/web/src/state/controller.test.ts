@@ -98,6 +98,7 @@ function fakeEngine() {
     setMuted: vi.fn(),
     setDeafened: vi.fn(),
     setInputMode: vi.fn(),
+    setInputSensitivity: vi.fn(),
     setPttActive: vi.fn(),
     setInputDevice: vi.fn(async () => {}),
     setOutputDevice: vi.fn(async () => {}),
@@ -107,6 +108,7 @@ function fakeEngine() {
     setSlotOwner: vi.fn(),
     listDevices: vi.fn(async () => ({ inputs: [], outputs: [] })),
     startMicTest: vi.fn(async () => () => {}),
+    micPermission: vi.fn(async () => "granted" as const),
     on: vi.fn((event: string, handler: (value: never) => void) => {
       listeners.set(event, handler);
       engineHandlers.set(event, handler as (value: unknown) => void);

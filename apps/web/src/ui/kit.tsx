@@ -324,20 +324,24 @@ export function Switch({
   onCheckedChange,
   label,
   description,
+  disabled,
 }: {
   checked: boolean;
   onCheckedChange: (v: boolean) => void;
   label: string;
   description?: string;
+  disabled?: boolean;
 }) {
   const id = useId();
   return (
     <div className="flex items-center justify-between gap-4 py-1">
       <label htmlFor={id} className="min-w-0 cursor-pointer">
         <div className="text-sm text-fg">{label}</div>
-        {description && <div className="text-xs text-subtle">{description}</div>}
+        {description && <div id={`${id}-hint`} className="text-xs text-subtle">{description}</div>}
       </label>
       <SwitchPrimitive.Root
+        disabled={disabled}
+        aria-describedby={description ? `${id}-hint` : undefined}
         id={id}
         checked={checked}
         onCheckedChange={onCheckedChange}

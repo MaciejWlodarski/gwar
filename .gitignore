@@ -27,6 +27,7 @@ server-key.ed25519
 
 # Test output and OS clutter
 apps/web/e2e/screenshots/fail-*.png
+apps/web/e2e/screenshots/input-sensitivity/
 .DS_Store
 
 # Generated wasm packages and isolated local build tooling

@@ -73,6 +73,7 @@ interface VoiceStore {
   muted: boolean;
   deafened: boolean;
   level: number;
+  inputGateSupport: boolean | null;
   state: VoiceState;
   reconnecting: boolean;
   failure: string | null;
@@ -88,6 +89,7 @@ export const useVoice = create<VoiceStore>()((set) => ({
   muted: useSettings.getState().selfMuted,
   deafened: useSettings.getState().selfDeafened,
   level: 0,
+  inputGateSupport: null,
   state: "idle",
   reconnecting: false,
   failure: null,

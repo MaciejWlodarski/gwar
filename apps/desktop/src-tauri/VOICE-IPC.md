@@ -16,7 +16,8 @@ checks the injected calling webview window and rejects any label other than
 | `voice_answer {owner, run, sdp?, error?}` | Current owner and matching pending run only. |
 | `voice_stop {owner, run}` | Current owner only; retires this or older runs, including starts still pending in DNS or device opening. |
 | `voice_set_muted`, `voice_set_deafened`, `voice_set_ptt`, `voice_set_input_mode`, `voice_set_master_gain`, `voice_set_slot_gain`, `voice_set_devices` | Require `owner` alongside their existing arguments. Reject previous-view controls under the voice lock. |
-| `mic_test_start {owner, input?}`, `mic_test_stop {owner}` | Current owner only. Bootstrap also cancels a pending test and closes its capture. |
+| `mic_test_start {owner, test, input?}`, `mic_test_stop {owner, test?}` | Current owner only. A monotonically increasing test id fences cancelled starts and stale cleanup. Refuses capture while muted/deafened, in voice or in a hidden/unfocused window. Bootstrap and native focus loss/close also retire the preview. |
+| `mic_permission {owner}` → `granted` / `prompt` / `denied` / `unknown` | Current owner only. Reads OS authorization without opening a device or requesting permission. Unknown platforms require an explicit preview gesture. |
 | `audio_devices`, `open_mic_privacy_settings` | No ownership token: enumeration or a fixed OS settings URI. |
 
 All voice events include `owner`; offers, state and `voice://crypto` events
@@ -41,3 +42,17 @@ Retirement cancels the startup future and releases audio guards immediately.
 An OS device-open call already running on a blocking thread cannot be aborted;
 it checks retirement before opening and closes any obsolete ports as soon as
 that call returns. No obsolete ports reach negotiation or a retained handle.
+
+`voice://test-level {owner, test, db}` belongs only to its matching local preview.
+The Audio settings page reuses the call's level events while in voice. Outside
+voice, the preview is scoped to a visible Audio page in voice-activation mode,
+without self-mute or deafen. Permission must already be granted for automatic
+capture; otherwise the user starts it explicitly. Preview audio is never sent.
+The engine drains pending preview acquisition/cleanup before opening call audio.
+
+`voice_set_gate_ready {owner, run, serial, ready}` closes native output before a
+mode transition. Only the active run's latest serial may reopen it, after the
+server acknowledges `voice.input_gate`. Mode revisions also discard old queued
+frames and reset the local hangover. Native SDP advertises input-gate version 2;
+automatic mode uses the legacy server criterion. Older servers keep automatic
+activation; manual sensitivity is unavailable and unsupported PTT stays closed.

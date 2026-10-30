@@ -107,6 +107,7 @@ export interface ResponseMap {
   "invite.list": { invites: Invite[] };
   "invite.delete": Empty;
   "voice.offer": import("../proto/VoiceTransportBinding").VoiceTransportBinding & { sdp: string };
+  "voice.input_gate": Empty;
   "voice.state": { voice: import("../proto/VoiceState").VoiceState | null };
   "voice.epoch.ack": Empty;
   "voice.epoch.repeat": Empty;
