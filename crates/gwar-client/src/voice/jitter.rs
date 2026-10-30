@@ -613,10 +613,11 @@ impl JitterBuffer {
         self.restart();
     }
 
-    /// Mark the end of the queued tail. Ends behind the queue's head mark nothing any more.
+    /// Mark the end of the queued tail. Ends playout passed mark nothing any more; overflow and
+    /// trims move `next` with the queue, so what stays is bounded by the gaps a full queue holds.
     fn keep_tail(&mut self, end: u64) {
-        if let Some((&head, _)) = self.packets.first_key_value() {
-            self.resume.retain(|&kept| kept >= head);
+        if let Some(floor) = self.next.or_else(|| self.packets.first_key_value().map(|(&ts, _)| ts)) {
+            self.resume.retain(|&kept| kept >= floor);
         }
         self.resume.insert(end);
     }
@@ -1483,6 +1484,19 @@ mod tests {
         arrivals.extend((0..20).map(|j| (300 + j * 20, second + j * FRAME, 120 + j as u8)));
         let (played, concealed) = spurts(45, &arrivals);
         let expected: Vec<u8> = (0..45).chain(100..105).chain(120..140).collect();
+        assert_eq!((played, concealed), (expected, 0));
+    }
+
+    #[test]
+    fn a_spurt_at_the_end_of_the_tail_keeps_the_boundary_before_it() {
+        // The next spurt arrives just as playout reaches the end of the tail: its pause is not
+        // crossed yet, though no queued packet is behind the boundary any more.
+        let first = 22 * FRAME + 100 * 48;
+        let second = first + 5 * FRAME + 260 * 48;
+        let mut arrivals: Vec<_> = (0..5).map(|j| (100 + j * 20, first + j * FRAME, 100 + j as u8)).collect();
+        arrivals.extend((0..20).map(|j| (440 + j * 20, second + j * FRAME, 120 + j as u8)));
+        let (played, concealed) = spurts(22, &arrivals);
+        let expected: Vec<u8> = (0..22).chain(100..105).chain(120..140).collect();
         assert_eq!((played, concealed), (expected, 0));
     }
 
