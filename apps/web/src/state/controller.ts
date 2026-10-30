@@ -2,6 +2,7 @@ import { noteServerPing, PING_UPLINK, resetServerPing, UplinkCongestion, type Up
 import { useUplink, voiceConnectionActive } from "./uplink";
 import { claimAll, claimableIdentities, offerClaims } from "./ts-claim";
 import { permissionsOf } from "../lib/permissions";
+import { channelPermissions } from "../lib/channel-permissions";
 import type { ChannelOverride } from "../proto/ChannelOverride";
 import { attachment as attachmentSchema } from "../net/schema";
 import { SealedConversations, type SealedKey } from "./sealed";
@@ -263,7 +264,7 @@ class Controller {
   /** The voice channel I was in when the connection dropped; rejoined after the resync. */
   private rejoin: number | null = null;
   /** Screen sharing and watching (docs/screen-share.md). */
-  readonly screen = new ScreenController(() => this.conn, describeRequestError);
+  readonly screen = new ScreenController(() => this.conn, describeRequestError, () => this.voiceAutoStart && this.voiceRetryAllowed);
 
   constructor() {
     this.engine = createVoiceEngine();
@@ -843,8 +844,9 @@ class Controller {
       if (this.conn !== conn) return;
       this.resetNativeUplink();
       if (params) this.rememberConnection(params, welcome.server.name);
-      // A new session: shares and watches of the one before ended with it.
-      this.screen.reset();
+      // A resync retires transports while capture and viewing intent survive.
+      if (resync) this.screen.suspend();
+      else this.screen.reset();
       this.entered.clear();
       // Joins asked before this Welcome can no longer settle (their session ended): drop their spinner
       // before any rejoin below shows its own.
@@ -873,10 +875,10 @@ class Controller {
         if (resync && this.rejoin !== null && this.rejoin !== myCh) void this.rejoinVoice(this.rejoin);
       } else if (resync && this.rejoin !== null) {
         const channel = this.rejoin;
-        this.rejoin = null;
         void this.rejoinVoice(channel);
       }
-      this.rejoin = null;
+      if (!resync || myCh === this.rejoin) this.rejoin = null;
+      if (resync) this.screen.resume();
     });
     conn.onEvent((event) => {
       if (this.conn !== conn) return;
@@ -935,6 +937,7 @@ class Controller {
           if (notificationAllowed(result)) alert?.();
         }).catch(() => {}).finally(() => { this.messagePending--; });
       } else session.dispatch({ type: "event", event, now: Date.now() });
+      if (event.ev === "client.updated" && event.d.id === useSession.getState().me?.session && event.d.channel === this.rejoin) this.rejoin = null;
       if (event.ev.startsWith("screen.")) this.screen.handleEvent(event);
       if (event.ev === "chat.read" && "conversation" in event.d) void this.sealed?.refreshUnread(event.d.conversation).catch(() => {});
       if (event.ev === "voice.closed" && (() => {
@@ -982,9 +985,9 @@ class Controller {
           session.setRtt(null);
           this.nativeFiles(null);
           // A new session starts outside voice: remember where to go back to.
-          if (this.voiceAutoStart) this.rejoin ??= myChannelId(useSession.getState());
+          if (this.voiceAutoStart && useSession.getState().phase !== "reconnecting") this.rejoin ??= myChannelId(useSession.getState());
           session.dispatch({ type: "phase", phase: "reconnecting" });
-          this.screen.reset();
+          this.screen.suspend();
           void this.stopVoice();
           break;
         case "closed":
@@ -1256,7 +1259,15 @@ class Controller {
   /** Leaves voice but stays on the server (and keeps reading chat). */
   async leaveVoice(): Promise<void> {
     this.joinAttempt++; // a pending encrypted join gives up
-    if (!this.canLeaveVoice || myChannelId(useSession.getState()) === null) return;
+    if (!this.canLeaveVoice) return;
+    const rejoining = this.rejoin !== null;
+    this.rejoin = null;
+    void this.screen.stopShare(); // also cancels a republish before screen.start answers
+    if (useSession.getState().phase === "reconnecting") {
+      await this.stopVoice();
+      return;
+    }
+    if (myChannelId(useSession.getState()) === null && !rejoining) return;
     const ok = await this.attempt(this.connection.request("channel.leave", {}));
     // The server's client.updated follows; do not wait for it to release the microphone.
     if (ok) { await this.stopVoice(); useUi.getState().dismissToast("voice-closed"); }
@@ -1264,10 +1275,25 @@ class Controller {
 
   private async rejoinVoice(channel: number): Promise<void> {
     if (!this.voiceRetryAllowed) { this.voiceRetryChannel = channel; return; }
+    const bound = this.bind(), intent = this.joinAttempt;
     const s = useSession.getState();
     const info = s.channels[channel], password = this.channelPasswords.get(channel);
-    if (!info || (info.has_password && !password && !s.permissions.includes("bypass_password"))) return;
-    await this.attempt(this.moveChannel(channel, password, false));
+    const me = s.me ? s.clients[s.me.session] : undefined;
+    const bypass = s.kind === "gwar" ? me && s.me && channelPermissions({ uid: s.me.uid, groups: me.groups, owner: s.owner?.uid === s.me.uid }, channel, s.channels, s.groups).includes("bypass_password") : s.permissions.includes("bypass_password");
+    if (!info || (info.has_password && !password && !bypass)) {
+      if (this.rejoin === channel) this.rejoin = null;
+      return;
+    }
+    const refused = () => {
+      if (bound.current() && useSession.getState().phase === "online" && this.joinAttempt === intent + 1 && this.rejoin === channel) this.rejoin = null;
+    };
+    try {
+      await this.moveChannel(channel, password, false, refused);
+    } catch (e) {
+      if (!bound.current()) return;
+      if (e instanceof RequestError) refused();
+      useUi.getState().toast("error", describeRequestError(e));
+    }
   }
 
   /** Server presence alone never grants permission to open the microphone. */
@@ -1302,6 +1328,7 @@ class Controller {
     this.voiceAutoStart = true;
     this.voiceRetryAllowed = true;
     await this.startVoice();
+    if (useScreen.getState().own?.phase === "reconnecting") void this.screen.confirmShare();
   }
 
   /** Hostname (no brackets) of the server we are connected to; the native engine sends media there. */
@@ -1507,10 +1534,11 @@ class Controller {
    * server, a reconnect): it then changes nothing, a refusal included.
    */
   async joinChannel(channel: number, password?: string): Promise<boolean> {
+    this.rejoin = null; // explicit voice actions supersede automatic rejoin intent
     return this.moveChannel(channel, password, true);
   }
 
-  private async moveChannel(channel: number, password: string | undefined, explicit: boolean): Promise<boolean> {
+  private async moveChannel(channel: number, password: string | undefined, explicit: boolean, refused?: () => void): Promise<boolean> {
     // Joining state, entered channels and typed passwords belong to the session that asked.
     const bound = this.bind();
     const settle = () => { if (bound.current() && useUi.getState().joining === channel) useUi.getState().setJoining(null); };
@@ -1521,6 +1549,7 @@ class Controller {
       // A newer join, move or connection makes this one obsolete.
       if (!bound.current() || attempt !== this.joinAttempt) return bound.current();
       if (refusal) {
+        refused?.();
         if (useVoice.getState().failure) {
           this.voiceFailure(refusal, false);
           this.voiceRetryChannel = channel;
@@ -1535,7 +1564,7 @@ class Controller {
         const ready = await runtime.prepareChannel(channel);
         settle();
         if (!bound.current() || attempt !== this.joinAttempt) return bound.current();
-        if (!ready) { useUi.getState().toast("info", tNow("voice.channelSecuring")); return true; }
+        if (!ready) { refused?.(); useUi.getState().toast("info", tNow("voice.channelSecuring")); return true; }
       }
     } else this.joinAttempt++;
     // Silent sessions authorize the chosen channel only after the server places us there.
@@ -1583,6 +1612,7 @@ class Controller {
   /** Join voice with UI affordances: shows the channel's chat and asks for the password of locked channels. */
   async joinChannelInteractive(channel: number): Promise<void> {
     if (!useSession.getState().channels[channel]) return;
+    this.rejoin = null;
     this.selectChannel(channel); // opens the password dialog for locked channels
     // Already there, unless a move elsewhere is still in flight (then this is a move back).
     const pending = useUi.getState().joining;

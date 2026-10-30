@@ -7,20 +7,21 @@ import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as Rea
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { cn } from "../lib/cn";
 import { ConnectionIndicator } from "./ConnectionQuality";
-import { isDesktop } from "../platform";
+import { canOpenScreenRecordingSettings, isDesktop, openScreenRecordingSettings } from "../platform";
+import { captureApp, captureOs } from "../voice/screen-permission";
 import { canActOn } from "../lib/permissions";
 import type { Client } from "../proto/Client";
 import type { ScreenPauseReason } from "../proto/ScreenPauseReason";
 import type { ScreenShare } from "../proto/ScreenShare";
 import { controller } from "../state/controller";
 import { guestLinkPossible, useCanWatch, useScreenSupport } from "../state/screen-controller";
-import { shareOf } from "../state/reducer";
+import { myChannelId, shareOf } from "../state/reducer";
 import { slotOf, useScreen } from "../state/screen";
 import { useSession, useUi } from "../state/stores";
 import { type PublishStats } from "../voice/screen";
 import { HEIGHTS, FRAME_RATES, type ScreenSpec } from "../voice/screen-quality";
 import { useChannelPermission, useConnectionQuality, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
-import { BackButton, Button, Dialog, IconButton, panelCard, TalkingAvatar, Tooltip } from "./kit";
+import { BackButton, Button, Dialog, IconButton, panelCard, TalkingAvatar, Tooltip, TopBanner } from "./kit";
 import { paneBack } from "./nav";
 
 // -------------------------------------------------------------------- start
@@ -73,6 +74,47 @@ export function ShareButton() {
     >
       <MonitorUp className="size-[18px]" />
     </IconButton>
+  );
+}
+
+/** A stopped share or OS refusal needs an action that does not expire. */
+export function ScreenNotice() {
+  const notice = useScreen(s => s.notice);
+  return notice ? <ScreenNoticeContent key={notice} notice={notice} /> : null;
+}
+
+function ScreenNoticeContent({ notice }: { notice: "reconnect" | "permission" | "permissionHint" }) {
+  const t = useT();
+  const [help, setHelp] = useState(false);
+  const own = useScreen(s => s.own);
+  const phase = useSession(s => s.phase);
+  const channel = useSession(myChannelId);
+  const title = notice === "permissionHint" ? "screen.permissionHintTitle" : "screen.permissionTitle";
+  return (
+    <>
+      <TopBanner role={notice === "permissionHint" ? "status" : "alert"} data-testid="screen-notice" className="text-fg">
+        <MonitorOff aria-hidden className={cn("size-4 shrink-0", notice === "permissionHint" ? "text-muted" : "text-danger")} />
+        <p data-testid="screen-notice-text" className="min-w-0 flex-1 text-[13px] whitespace-nowrap min-[800px]:text-sm">
+          <span className="min-[800px]:hidden">{t(notice === "reconnect" ? "screen.reconnectStoppedShort" : notice === "permissionHint" ? "screen.permissionHintShort" : "screen.permissionShort")}</span>
+          <span className="hidden min-[800px]:inline">{t(notice === "reconnect" ? "screen.reconnectStopped" : title)}</span>
+        </p>
+        {notice === "reconnect" ? (
+          <Button size="sm" className="whitespace-nowrap max-[799px]:px-2!" variant="primary" aria-label={t("screen.shareAgain")} disabled={phase !== "online" || !!own || channel === null} onClick={() => controller.screen.beginShare()}>
+            <span className="min-[800px]:hidden">{t("screen.shareAgainShort")}</span><span className="hidden min-[800px]:inline">{t("screen.shareAgain")}</span>
+          </Button>
+        ) : (
+          <Button size="sm" className="whitespace-nowrap max-[799px]:px-2!" onClick={() => setHelp(true)}>{t(notice === "permissionHint" ? "screen.permissionHintFix" : "screen.permissionFix")}</Button>
+        )}
+        <IconButton label={t("common.close")} tooltip={false} onClick={() => useScreen.getState().dispatch({ type: "notice", notice: null })}><X className="size-4" /></IconButton>
+      </TopBanner>
+      {notice !== "reconnect" && <Dialog open={help} onOpenChange={setHelp} title={t(notice === "permissionHint" ? "screen.permissionHintFix" : "screen.permissionFix")} footer={
+        canOpenScreenRecordingSettings() ? <Button onClick={() => void openScreenRecordingSettings().catch((e: unknown) => console.warn("[screen] privacy settings:", e))}>{t("screen.openSettings")}</Button> : undefined
+      }>
+        <p className="text-sm leading-relaxed text-pretty text-muted">{t(notice === "permissionHint" ? "screen.permissionHint" : "screen.permission", {
+          app: captureApp(isDesktop(), navigator.userAgent) ?? t("screen.browser"), settings: t(`screen.permissionPlace.${captureOs(navigator.userAgent)}`),
+        })}</p>
+      </Dialog>}
+    </>
   );
 }
 
@@ -161,8 +203,8 @@ export function SharingBar() {
   const lang = useLanguage();
   const own = useScreen(s => s.own);
   const links = useScreen(s => s.links);
-  if (!own || (own.phase !== "starting" && own.phase !== "live")) return null;
-  const watching = own.phase === "live" ? t(countKey(lang, "screen.watching", own.viewers), { count: own.viewers }) : t("screen.starting");
+  if (!own || (own.phase !== "starting" && own.phase !== "live" && own.phase !== "reconnecting")) return null;
+  const watching = own.phase === "live" ? t(countKey(lang, "screen.watching", own.viewers), { count: own.viewers }) : t(own.phase === "reconnecting" ? "screen.reconnecting" : "screen.starting");
   const linked = !!own.share && !!links[own.share];
   return (
     <div role="status" aria-label={t("screen.sharingBar")} className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 bg-danger px-3 py-1.5 text-sm text-white">
@@ -563,8 +605,8 @@ export function Stage({ card }: { card?: boolean }) {
       <header className="flex h-12 shrink-0 items-center gap-2 border-b border-white/10 px-3">
         {!card && <BackButton label={t("nav.toChannels")} entry onClick={() => paneBack("list")} />}
         {client && <TalkingAvatar name={name} seed={client.uid} size={24} talking={client.talking} />}
-        <h2 className="min-w-0 truncate text-[15px] font-semibold">{t("screen.sharerTitle", { name })}</h2>
-        <span className="shrink-0 rounded bg-danger px-1 text-[10px] leading-4 font-bold tracking-wide">{t("screen.live")}</span>
+        <h2 className="min-w-0 truncate text-[15px] font-semibold">{info ? t("screen.sharerTitle", { name }) : t("screen.watchReconnecting")}</h2>
+        {info && <span className="shrink-0 rounded bg-danger px-1 text-[10px] leading-4 font-bold tracking-wide">{t("screen.live")}</span>}
         <QualityBadge share={stage} />
         <span className="ml-auto flex items-center gap-1">
           {mayStop && linked && (

@@ -25,9 +25,11 @@ round trip reached 0.4–0.67 s, and viewers saw lag.
   queue emptied over a few hundred milliseconds. Its audio then arrived early and sat in the
   native jitter buffer as surplus, which the gentle shrink (≤10 ms/s) drained at ~4 ms/s:
   mouth-to-ear stayed at 430–440 ms for the full 30 s measured. The buffer now cuts a surplus of
-  100 ms or more once it has been proven for 5 s, at a quiet frame, and backs off (up to 80 s
-  of evidence) if playout starves soon after a cut: after the upload, p50 128 ms instead of
-  430 ms and back to the idle level within ~21 s instead of never in 30 s.
+  100 ms or more once it has been proven for 5 s, and backs off (up to 80 s of evidence) if
+  playout starves soon after a cut: after the upload, p50 128 ms instead of 430 ms and back to
+  the idle level within ~21 s instead of never in 30 s. The cut drops inaudible packets and
+  time-compresses speech as NetEq's accelerate does, a pitch period at a time and at most
+  1.2× as fast, so it never drops speech ([below](#accelerate-instead-of-a-forced-cut)).
 - **Fixed: a screen-share estimate could get stuck after congestion.** #189's budget reserves
   200 kb/s for voice under every estimate. Below ~0.6 Mb/s that holds video under 2/3 of the
   estimate, and GCC never raises its estimate above 1.5× the throughput it measures. On a 10 Mb/s
@@ -162,17 +164,16 @@ empty queue) in it. The cut takes all but 40 ms (`BACKLOG_KEEP`) of the lowest s
 evidence saw, which it leaves to the gentle shrink, a cushion against local stalls the arrival
 rule cannot see.
 
-The cut removes silence only, as long as it can. After a quiet frame (decoded level below
-−42 dB, the gentle shrink's threshold) the decoder takes the next queued packets one at a time
-and decodes each. A quiet one is dropped; the first loud one plays right after the quiet frame,
-as decode-ahead does, and the rest of the cut waits for the next quiet frame. Speech has pauses,
-so the cut proceeds in silent chunks. Once the cut has been due for 2 s, whatever is left goes at
-once: the oldest packets are dropped and the next one fades in, so continuous speech is cut
-there. Either way the decoder runs through every dropped packet, so its state stays continuous.
-A cut under way goes on while its surplus falls below 100 ms, bounded by the lowest surplus
-since its evidence began. The previous version dropped everything once one frame was quiet. A
-single quiet frame between words then let it drop the start of the next word: ~160 ms of speech
-in its unit test.
+The cut never drops speech. After an inaudible frame (below −70 dB RMS with no sample above
+−60 dB, [below](#inaudible-not-quiet)) the decoder takes the next queued packets one at a time
+and decodes each. An inaudible one is dropped; the first audible one plays right after the
+inaudible frame, as decode-ahead does. Speech in between is accelerated (next section): whole pitch periods are removed from the
+decoded audio. The decoder runs through every packet, so its state stays continuous. A cut under
+way goes on while its surplus falls below 100 ms, bounded by the lowest surplus since its
+evidence began. An earlier version dropped everything once one frame was quiet, and a single
+quiet frame between words let it drop the start of the next word (~160 ms of speech in its unit
+test). The version after it waited 2 s for quiet packets and then dropped whatever was left at
+once, so in speech without pauses it dropped 200–360 ms of speech.
 
 The evidence time starts at one window (5 s), so after a bloat the cut is due one window after
 the queue empties. A starvation within 10 s of a cut doubles it, up to 80 s; a cut without one
@@ -221,12 +222,6 @@ packet in 100 lost, which conceals 60 frames by itself, the PLC no cut / with ba
 Swells 25 s apart are rarer than the probe: every cut is clean, and each swell costs a few more
 PLC frames in exchange for ~70 ms less delay between them.
 
-`a_backlog_cut_drops_only_quiet_packets_until_its_cap` (playout.rs) cuts 300 ms of backlog in
-encoded speech. With 120 ms pauses every 320 ms the quiet packets cover the cut ~0.5 s after the
-window proves the surplus, and no dropped packet decodes at −42 dB or louder. With one quiet
-frame between words nothing is dropped until the 2 s cap.
-`the_decoder_runs_through_a_forced_backlog_cut` checks that the packet after a forced cut, past
-its fade, is what a decoder of the whole stream plays.
 `a_starvation_that_begins_within_the_probe_backs_off_when_it_ends_after` and
 `the_backlog_evidence_relaxes_a_minute_after_it_grew_or_playout_starved` hold the probe's edge
 and the halving.
@@ -251,9 +246,11 @@ surplus and holds no PLC); "after" is the final rule, measured separately:
 | after | 489 | 480 | 145 | 136 | 112 | 91 | 88 |
 
 The cut lands about one window (5 s) after the queue empties. The harness never has a quiet
-frame: between markers it sends a 400 Hz carrier at −25 dBFS. So the cut there always waits its
-2 s cap and then drops what is left at once, which moves recovery from 16 to ~21 s; the
-quiet-only cut is held by the unit tests above. The remaining 40 ms drains to the idle level by
+frame: between markers it sends a 400 Hz carrier at −25 dBFS. So the cut there always waited its
+2 s cap and then dropped what was left at once, which moved recovery from 16 to ~21 s; the
+quiet-only cut is held by the unit tests above. (These runs predate the accelerate below and
+were not repeated. The carrier is periodic, so a cut there should now drain in about 1.3 s
+instead of waiting 2 s and jumping.) The remaining 40 ms drains to the idle level by
 +20..+25 s. "after" p95 still includes the 5 s before the cut. The cost is one jump: the ~360 ms
 skipped are discarded audio, which here took 1–2 post-upload markers with it in every run. Idle
 voice showed no underruns and no extra concealment in these runs, a statement about the jitter
@@ -275,6 +272,231 @@ how playout starves as the queue fills:
 The harness's own recovery figure (relative to each run's `pre` p95) counted 2 of the 10 runs of
 the new build as not recovered within 30 s. One drained slowly and fell below its bound (99 ms)
 only at +28.2 s; the other had settled at ~91 ms by +25 s, but one marker at +29.7 s took 111 ms.
+
+### Accelerate instead of a forced cut
+
+The forced cut dropped whole packets of speech: syllables or words, where libwebrtc's NetEq
+would have time-compressed the same audio. The cut now drains speech the way NetEq's accelerate
+does (`modules/audio_coding/neteq/accelerate.cc` and `time_stretch.cc`, reimplemented in
+`playout.rs` `accelerate`; see THIRD_PARTY_NOTICES.md):
+
+- **One pitch period at a time.** In the decoded audio it finds the lag of 2.5–15 ms at which
+  the audio best repeats, and crossfades one period into the next over its whole length. One
+  period disappears, the splice is continuous at both ends, and the voice keeps its pitch.
+- **The lag comes from the whole range, picked as NetEq picks it.** NetEq downsamples to 4 kHz
+  and correlates a fixed 12.5 ms window over every lag. Gwar low-passes to below 2 kHz (a 24-tap
+  moving average) and correlates a fixed 15 ms window, so broadband noise cannot move the peak
+  and one period of a low voice is not the only evidence. Of the correlation peaks within 0.02
+  of the best it takes the shortest: the period, not a multiple of it. The splice is then judged
+  at full band over the period itself, as NetEq's `best_correlation` is. Every lag needs 30 ms
+  of audio, so a backlog cut decodes up to 60 ms ahead, and less than 30 ms is never searched:
+  over a shorter range a fraction of a longer period can correlate well (120 samples of a 100 Hz
+  voice whose fourth harmonic sits on a formant). A period longer than the cut's credit is not
+  replaced by a shorter lag: the cut waits for the credit.
+- **NetEq's threshold.** A period goes if it correlates above 0.9 (`kCorrelationThreshold`). The
+  gentle shrink keeps its 0.98: it runs on any small surplus, while a backlog cut has proven
+  100 ms. On a queue that holds nothing to decode ahead (the surplus is less than a packet,
+  already decoded) the gentle shrink therefore removes nothing from voiced audio: that surplus
+  goes in the next pause, 5 ms per inaudible frame. `main` searched such a block over the lags it
+  held.
+- **Inconspicuous pace.** NetEq removes at most one period per 10 ms output tick and holds
+  timescale operations 50 ms apart in normal accelerate ("about 100 ms/s"). Its fast accelerate,
+  used when the delay is 4× its high limit, drops that hold, lowers the correlation threshold to
+  0.5 and removes as many periods as fit in 15 ms. Gwar paces a due cut by a credit instead: each
+  period removed costs five times its length of playout (`BACKLOG_PACE`), and at most one 15 ms
+  period of credit is held. A block gets at most one splice per 10 ms or per period, whichever is
+  longer, so a splice never starts inside the previous crossfade (`SPLICE_EVERY`). Speech so
+  plays at most 1.2× as fast, slower than NetEq's fast accelerate.
+- **Silence goes free.** Inaudible packets are still dropped whole, unpaced, and inaudible
+  frames still lose 5 ms with a fade.
+- **After `BACKLOG_WAIT` (2 s) the cut relaxes to NetEq's fast-mode threshold, 0.5**
+  (`RELAXED_CORRELATION`), still for the best lag over the whole range, so a voice loses only
+  whole periods. Nothing ever splices at 0.5 or below, whatever the caller asks: audio without a
+  period (noise, unvoiced or whispered speech) is never spliced. NetEq accepts any lag only when
+  an energy VAD finds no active speech (`SpeechDetection`, `SetParametersForPassiveSpeech`);
+  here only inaudible audio goes without a period (dropped or skipped above). Silence and DC never
+  splice. Without the relaxed rule, a noisy voice that never reaches 0.9 would keep its
+  backlog.
+- <a id="inaudible-not-quiet"></a>**Inaudible, not quiet.** Anything but a whole period goes
+  only from audio nobody could hear: a frame below −70 dB RMS with no sample above −60 dB
+  (`inaudible`), judged per frame with no history. That covers the 5 ms the gentle shrink and a
+  cut take from the frame the decoder takes, the packets a cut drops whole after it, and the
+  first such frame a cut decodes ahead with speech (from its start up to the cut's credit, at
+  most 15 ms, paced like periods, never more than the surplus, the rest fading in over 2.5 ms).
+  `main` and every earlier version of this change took anything below −42 dB RMS, which soft
+  speech is: the test voice speaks at about −17 dB RMS, and at gain 0.02 (−51 dB RMS, −44 dB
+  peaks) a due cut took 380–385 ms from it, whole packets and 5 ms pieces, 200 ms from its words with
+  pauses, and 40 ms from loud words' soft first and last frames (both clocks). The thresholds are
+  measured: at gain 0.005 (46 dB down) the voice decodes at −64.5 dB RMS with −57 dB peaks and
+  must stay, and 55 dB down it would be about 5 dB SPL at a normal listening level; digital
+  silence decodes at −112 dB RMS with −90 dB peaks, the second frame after a loud word at about
+  −70 dB. −60/−50 dB would have taken the gain-0.005 voice. The peak rule keeps a soft onset's
+  transient. Everything audible drains only in whole periods above 0.5.
+- **Pauses drain because senders gate them.** A sender sends nothing 300 ms after its voice
+  stops (`HANGOVER`), so a pause longer than that arrives as missing packets, and the queue
+  shrinks by each missing stretch whatever the hangover's level (room noise, or near-digital
+  silence with noise suppression on). On the RTP clock the next packet starts a new spurt; on the
+  sequence clock it is a stall recovery. Either way the backlog is gone after the first such pause,
+  with nothing cut (`gated_pauses_drain_by_their_missing_packets`).
+- **Sound without a period keeps its backlog unless it is inaudible or gated.** Noise in words
+  with 40 ms gaps (gaps at about −40 dB, then about −70 dB) and speech over a constant fan (no
+  noise suppression) keep their backlog (440 ms in the fixture), bounded like any continuous
+  sound without a period: it does not grow, `MAX_QUEUED` (1 s) caps any queue, and the cut gives
+  up after 10 s and proves the surplus again. A level cannot tell such gaps from soft speech. A
+  rule relative to the stream's loudest and quietest recent frames (tried in this change) cut
+  720- and 192-sample pieces from a voice 20 dB softer for a second, and, after a minute of
+  silence, 147 ms of soft speech judged against loud speech heard before the pause. The receiver
+  has no sender evidence to add: clients send RFC 6464 levels and the V bit, but the server gates
+  on them and forwards only the slot generation, and no sender uses Opus DTX. A voice over a fan
+  still drains in whole periods. Noise suppression is the remedy: it takes noise and fan out
+  before the encoder. The first version spliced such audio at correlations of −0.17–0.32 after
+  the 2 s.
+- **Known, from before this change: a short gated pause can drop a word's end.** When the
+  missing stretch is shorter than the backlog less the hangover (a 400 ms pause after a 440 ms
+  backlog), the new spurt (RTP) or the stall recovery (sequence) discards what is still queued,
+  the last 20 ms of the word with the hangover. The jitter buffer's spurt and stall logic is
+  unchanged here; keeping the queued audio across a spurt boundary is a follow-up.
+- **A cut that removes nothing for 10 s gives up** (`BACKLOG_STUCK`) and restarts the window, so
+  audio that never splices (onsets, decays) cannot hold a cut, and the gentle shrink behind it,
+  for good. A block whose first search matched nothing is not searched again.
+
+The search tracks the window's sums and energies incrementally and runs the cross-correlation in
+eight lanes. In a release build on an Apple M5 a full search takes ~55–65 µs (the first version
+of this change searched one period-long window per lag, ~50 µs; a naive search ~480 µs).
+While a cut is due a 60 ms decoded block gets at most three
+splices and one search that fails, about 0.4 % of a core per talking slot. Audio that matches
+nothing costs one search per block (~0.1 %) for at most 10 s. It runs on the pipeline thread
+that fills the speaker ring, not in the device callback, and allocates nothing: the decoded
+block is the slot's existing buffer and the search's scratch is on the stack.
+
+`a_backlog_cut_drops_quiet_packets_and_accelerates_speech` (playout.rs) plays encoded voices
+through a backlog in 20 ms refills; the window proves the surplus at 5 s. It checks:
+- No packet that is not inaudible is ever dropped.
+- Every removed period of a voice is a whole number of periods (±5 %) and correlates at 0.5 or
+  more, before and after the 2 s.
+- Every output sample outside a crossfade equals what a decoder of the whole stream played,
+  shifted by what was removed before it, so nothing else is lost and the decoder state stays
+  continuous.
+
+Time from the surplus being proven until at most 100 ms is queued, before (main at 502473de) and
+after:
+
+| voice, backlog | before: drain, speech dropped | after: drain, speech dropped, removed in periods and gaps |
+|---|---|---|
+| 150 Hz, 120 ms pauses every 320 ms, 300 ms | 0.52 s, 0 ms (240 ms quiet) | 0.30 s, 0 ms (120 ms inaudible), 128 ms |
+| 150 Hz, 40 ms gaps every 200 ms, 300 ms | 2.0 s, 200 ms | 0.90 s, 0 ms, 219 ms |
+| 150 Hz continuous, 300 ms | 2.0 s, 200 ms | 0.68 s, 0 ms, 207 ms |
+| 150 Hz continuous, 430 ms | 2.0 s, 340 ms | 1.44 s, 0 ms, 347 ms |
+| 100 Hz continuous, 430 ms | 2.0 s, 320 ms | 1.44 s, 0 ms, 350 ms |
+| 250 Hz continuous, 430 ms | 2.0 s, 360 ms | 1.38 s, 0 ms, 348 ms |
+| 150 Hz, 40 ms gaps, 430 ms | 2.0 s, 340 ms | 1.68 s, 0 ms, 359 ms |
+| noisy 100 Hz voice (periods at 0.81–0.87), 430 ms | 2.0 s, 380 ms | 3.54 s (2 s wait), 0 ms, 351 ms |
+| noisy 150 Hz voice (periods at 0.79–0.87), 430 ms | 2.0 s, 380 ms | 3.66 s (2 s wait), 0 ms, 353 ms |
+
+Sound without a period, 430 ms backlog: main (forced cut), this change's first version (any lag
+after 2 s, edc18164), its second (nothing at 0.5 or below, 8aabe686), the −42 dB rule for frames
+decoded ahead (6ebbde42), and now (inaudible only). The speech rows above are the same in the
+second version and now but for the pauses, which drain faster in their inaudible frames decoded
+ahead (0.42 → 0.30 s). The 40 ms gaps (about −40 dB, then −70 dB) went at 6ebbde42 (0.76 s,
+1.48 s) and no longer do (0.90 s, 1.68 s, as at 8aabe686).
+
+| sound | main | edc18164 | 8aabe686 | 6ebbde42 | now |
+|---|---|---|---|---|---|
+| loud noise | 2.0 s, 380 ms dropped | 3.96 s, spliced at −0.08–0.25 | stays at 440 ms | stays at 440 ms | stays at 440 ms |
+| noise in words, 40 ms gaps (the second frame of a gap decodes at −39 to −49 dB) | forced cut at 2 s, words dropped (not measured) | 4.22 s, spliced at −0.17–0.32 | stays at 440 ms | 3.36 s, 360 ms from gaps only | stays at 440 ms (accepted; noise suppression is the remedy) |
+| noise with 120 ms pauses every 320 ms | not measured | 1.70 s | 1.70 s | 1.04 s | 1.12 s |
+| C major triad (common period 15.3 ms, beyond the range) | not measured | 3.72 s, periods at 0.73–0.81 | 3.96 s | 3.96 s | 3.96 s |
+
+Over a fan (noise 21–22 dB under the words throughout, gaps at about −37 dB): the relative rule
+of 42d7acef against 6ebbde42 and now (no rule; Sol round 3 rejected it, above):
+
+| sound | 42d7acef (relative rule) | 6ebbde42 and now |
+|---|---|---|
+| noise in words over a fan | 3.36 s | stays at 440 ms (accepted; noise suppression is the remedy) |
+| 150 Hz voice over a fan | 1.48 s | 1.68 s (periods) |
+| noisy 150 Hz voice over a fan | 2.62 s | 3.82 s (periods after the 2 s wait) |
+
+Quiet talkers (150 Hz, 430 ms backlog; both clocks alike): the −42 dB rule of 6ebbde42 (and
+main) against now. "Cut" is audio removed from frames the talker speaks in other than whole
+periods.
+
+| talker | 6ebbde42 | now |
+|---|---|---|
+| gain 0.02 (−51 dB RMS), continuous | 0 s, 380–385 ms cut | 1.38 s, whole periods only |
+| gain 0.02, 200 ms words, 120 ms pauses | 0 s, 200 ms cut | 0.48 s, 0 ms |
+| loud words, first and last frame at gain 0.02 | 0.30 s, 40 ms cut | 0.48 s, 0 ms |
+| gain 0.005 (−65 dB RMS), continuous | 0 s, 385 ms cut | stays at 440 ms (no period above 0.5) |
+| gain 0.005, 200 ms words, 120 ms pauses | 0 s, 200 ms cut | 0.74 s, 0 ms |
+| loud words, first and last frame at gain 0.005 | 0.30 s, 40 ms cut | 0.48 s, 0 ms |
+
+Gated pauses (200 ms words, 300 ms hangover, 440 ms backlog; both clocks alike, now): the
+backlog is gone at the first pause, and nothing is cut.
+
+| pause, hangover | backlog gone after | words lost | hangover discarded by the spurt (RTP / sequence) |
+|---|---|---|---|
+| 500 ms, room noise at −55 dB RMS | 0.28 s | 0 | 11 / 10 packets |
+| 800 ms, room noise | 0.44 s | 0 | 0 |
+| 500 ms, digital silence (noise suppression) | 0.28 s | 0 | 11 / 10 packets |
+| 400 ms, room noise (known, above) | 0.18 s | 1 packet (20 ms) | 15 / 14 packets |
+
+"Stays" holds through the 10 s measured; the cut gives up 10 s after it became due and proves
+the surplus again. Music whose lags correlate above 0.5 still drains after the 2 s.
+
+In every case the largest sample-to-sample step during the drain is at most the reference's, no
+second of output had more than 21.1 % of its length removed (24 % with a pace of four, which
+the first version used), and nothing but whole pitch periods went from a frame the fixture
+marks as a word. The old cut's output left the reference decoder's at the forced cut.
+
+Unit tests:
+- `backlog_acceleration_takes_periods_neteq_accepts_without_clicks` holds the threshold on a
+  rougher voice (3 % vibrato, noise 12 dB down, 100–220 Hz). 0.98 rejects it; 0.9 removes whole
+  periods. The splice steps no further than the input does, and the output's correlation at the
+  pitch period stays within 0.02 of the input's.
+- `the_relaxed_rule_still_removes_only_whole_periods_of_a_voice` takes noisy voices of 80–220 Hz
+  whose periods correlate at 0.6–0.9, which NetEq's threshold rejects. Under the relaxed rule,
+  with every budget from 2.5 to 15 ms, each removes a whole period (±5 %) at 0.5 or more, or
+  nothing when the period exceeds the budget. The first version of the rule searched only within
+  the budget and cut 0.44 of a 150 Hz period at 0.80.
+- `audible_gaps_keep_a_backlog_without_periods_and_words_stay_whole`: noise in words with 40 ms
+  gaps, with and without a fan, stays bounded; a voice over a fan drains within 4 s of the
+  surplus being proven, never at more than 24 % of a second, removing nothing but whole periods
+  from frames marked as words (every `drain` case checks that).
+- `quiet_talkers_lose_nothing_but_whole_periods` (150 Hz at gains 0.02 and 0.005: continuous, in
+  words, and loud words with soft first and last frames, both clocks) fails on 6ebbde42, whose
+  −42 dB rule cut 240 samples from the first word frame it reached and 380 ms in all.
+- `gated_pauses_drain_by_their_missing_packets` (both clocks) checks that every word packet a
+  gated sender sent is decoded, that nothing is cut, and that the backlog is gone at the first
+  500 or 800 ms pause.
+- `soft_words_lose_nothing_but_whole_periods` (a voice 20 dB softer for one second in three) and
+  `soft_speech_after_a_long_pause_loses_nothing_but_whole_periods` (speech at −4.5 dB, a minute
+  of silence, then speech at −37 dB with a backlog, both clocks) fail on 42d7acef, whose
+  relative rule cut 720 samples from inside soft words.
+- `aperiodic_audio_never_splices` covers noise (at the relaxed threshold and at −1), silence,
+  DC and less than 30 ms.
+- `a_block_shorter_than_every_lag_never_splices` plays a 100 Hz voice with a formant on its
+  fourth harmonic in 5 ms packets, every third lost: no block holds 30 ms. The first version
+  searched the lags such blocks held and removed 120 samples at 0.997.
+- `a_due_cut_paces_its_periods_and_waits_before_relaxing` (jitter.rs) holds the pace (at most a
+  fifth of any second, beyond the first period of credit) and the switch exactly 2 s after the
+  cut became due.
+- `a_cut_that_never_splices_gives_up_and_proves_the_surplus_again` holds the 10 s give-up and the
+  new window after it.
+- `a_search_that_finds_no_valid_lag_never_splices` plays a 200 Hz voice whose harmonics sit in
+  the low-pass's nulls (formants at 2 and 4 kHz). The first version took a filter's startup for
+  signal, found no valid lag and then removed the shortest, half a period. The search now
+  averages real samples only and splices nothing without a valid lag.
+- `splices_stay_within_a_block_they_shortened` and
+  `a_splice_in_a_ten_ms_block_before_a_gap_stays_within_it` play a 400 Hz voice whose splices
+  shorten a block past the next splice point; the first version panicked there.
+- `small_arrival_jitter_never_trims_refill_margin_into_starvation` and
+  `fractional_staged_surplus_converges_with_bounded_periodic_corrections` hold a surplus of less
+  than a packet on a queue with nothing to decode ahead. A tone that resets phase every packet
+  and a continuous one keep it, with no starvation (main took, e.g., 331 samples of the first);
+  with a 240 ms pause every second it goes in the pauses.
+
+NetEq's preemptive expand (stretching when the buffer runs low) is not ported. Gwar's buffer
+starts at its target and recovers starvation with PLC, and the stall recovery and the evidence
+backoff decide how much cushion to keep.
 
 ## Fix 2: the screen budget never reserves more than 30 % of the estimate
 

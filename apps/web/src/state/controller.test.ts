@@ -308,9 +308,12 @@ describe("session resilience", () => {
       await vi.advanceTimersByTimeAsync(0);
       link.emit({ ev: "client.updated", d: client(1, 2, { nickname: "new name" }) });
       controller.setMuted(false); controller.setDeafened(false);
+      link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
       link.welcomeNow(welcome({ session: 1, uid: "u1", channels: [chan(1), chan(2)], clients: [client(1, 1)] }), true);
       await vi.advanceTimersByTimeAsync(0);
       expect(engine.start).not.toHaveBeenCalled();
+      expect(link.sent("channel.join")).toHaveLength(0);
+      expect(link.sent("screen.start")).toHaveLength(0);
       expect(stores.useVoice.getState().state).toBe("idle");
       expect(link.sent("client.update").every(request => (request.d as { muted: boolean; deafened: boolean }).muted && (request.d as { deafened: boolean }).deafened)).toBe(true);
       await controller.joinChannelInteractive(2);
@@ -1025,6 +1028,175 @@ describe("staying on the server without voice", () => {
     link.welcomeNow(welcome({ session: 9, uid: "u1", channels: [chan(1), chan(2)], clients: [client(9, null, { uid: "u1" })] }), true);
     await vi.advanceTimersByTimeAsync(10);
     expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 2, password: null });
+  });
+
+  it.each([false, true])("rejoins a sharer's password channel through its override and republishes the retained capture (voice needs retry = %s)", async retry => {
+    connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
+    engine.start.mockClear();
+    if (retry) {
+      const { VoiceError } = await import("../voice/engine");
+      engine.start.mockRejectedValueOnce(new VoiceError("negotiation", "temporary loss"));
+    }
+    const { useScreen } = await import("./screen");
+    const source = { readyState: "live", stop: vi.fn(), applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }) };
+    const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
+    useScreen.setState({ own: { phase: "live", attempt: 7, share: "old", stream, surface: "screen", spec: { mode: "smooth", height: 1080, fps: 30 }, viewers: 0, guests: 0, guestLink: false, preview: false } });
+    let started!: (value: { share: string }) => void;
+    const request = link.request.bind(link);
+    vi.spyOn(link, "request").mockImplementation((op, d) => {
+      if (op !== "screen.start") return request(op, d);
+      link.requests.push({ op, d });
+      return new Promise(resolve => { started = resolve as never; });
+    });
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    link.welcomeNow(welcome({ session: 9, uid: "u1", permissions: [],
+      channels: [chan(1), chan(2, { has_password: true, overrides: [{ user: "u1", allow: ["bypass_password"], deny: [] }] })],
+      clients: [client(9, null, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join").at(-1)?.d).toEqual({ channel: 2, password: null });
+    const binding = { call: "new-call", participation: "new-participation", run: 2 };
+    link.emit({ ev: "client.updated", d: client(9, 2, { uid: "u1", voice_binding: binding }) });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("screen.start").at(-1)?.d).toMatchObject({ call: binding.call, participation: binding.participation });
+    expect(engine.start).toHaveBeenCalledOnce();
+    expect(useScreen.getState().own?.stream).toBe(stream); expect(source.stop).not.toHaveBeenCalled();
+    if (retry) {
+      expect(stores.useVoice.getState().reconnecting).toBe(true);
+      await vi.advanceTimersByTimeAsync(3000);
+      expect(engine.start).toHaveBeenCalledTimes(2);
+      expect(useScreen.getState().own?.stream).toBe(stream); expect(source.stop).not.toHaveBeenCalled();
+    }
+    await controller.screen.stopShare(); started({ share: "late" }); await vi.advanceTimersByTimeAsync(10);
+  });
+
+  it.each([false, true])("bounds retained screen recovery when an encrypted voice refusal survives a restored plaintext channel (explicit Retry = %s)", async retry => {
+    engine.capabilities.encryptedVoice = async () => false;
+    connectFake({ channel: 2, encrypted: [2] }); await vi.advanceTimersByTimeAsync(0);
+    const refusal = stores.useVoice.getState().failure;
+    expect(refusal).not.toBeNull();
+    link.emit({ ev: "client.updated", d: client(1, 1) });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stores.useVoice.getState()).toMatchObject({ state: "failed", failure: refusal });
+
+    // The user shares after the server moves them to plaintext; voice is still refused.
+    const { useScreen } = await import("./screen");
+    const source = { readyState: "live", stop: vi.fn(), applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }) };
+    const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
+    useScreen.setState({ own: { phase: "live", attempt: 7, share: "old", stream, surface: "screen", spec: { mode: "smooth", height: 1080, fps: 30 }, viewers: 0, guests: 0, guestLink: false, preview: false } });
+    // Hold any unexpected republish before it can construct a real media transport.
+    const request = link.request.bind(link);
+    vi.spyOn(link, "request").mockImplementation((op, d) => {
+      if (op !== "screen.start") return request(op, d);
+      link.requests.push({ op, d }); return new Promise(() => {});
+    });
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    await vi.advanceTimersByTimeAsync(10_000);
+    link.welcomeNow(welcome({ session: 9, uid: "u1", channels: [chan(1), chan(2, { encrypted: true })], clients: [client(9, null, { uid: "u1" })] }), true);
+    link.emit({ ev: "client.updated", d: client(9, 1, { uid: "u1" }) });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(link.sent("channel.join")).toHaveLength(0);
+    expect(link.sent("screen.start")).toHaveLength(0);
+    expect(useScreen.getState().own).toMatchObject({ phase: "reconnecting", stream });
+    expect(stores.useVoice.getState()).toMatchObject({ state: "failed", failure: refusal });
+    if (retry) {
+      controller.retryVoice(); await vi.advanceTimersByTimeAsync(0);
+      expect(stores.useVoice.getState().failure).toBeNull();
+      expect(engine.start).toHaveBeenCalledOnce();
+      expect(link.sent("screen.start")).toHaveLength(1);
+      expect(link.sent("screen.start").at(-1)?.d).toMatchObject({ call: client(9, 1).voice_binding!.call, participation: client(9, 1).voice_binding!.participation });
+      expect(source.stop).not.toHaveBeenCalled();
+      await controller.screen.stopShare();
+      return;
+    }
+    await vi.advanceTimersByTimeAsync(34_999);
+    expect(source.stop).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(source.stop).toHaveBeenCalledOnce();
+    expect(useScreen.getState()).toMatchObject({ own: null, notice: "reconnect" });
+    expect(engine.start).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("Leave cancels pending voice and screen rejoin during reconnect (after Welcome = %s)", async welcomed => {
+    connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
+    const { useScreen } = await import("./screen");
+    const source = { readyState: "live", stop: vi.fn() };
+    useScreen.setState({ own: { phase: "live", attempt: 7, share: "retained", stream: { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream,
+      surface: "screen", spec: { mode: "smooth", height: 1080, fps: 30 }, viewers: 0, guests: 0, guestLink: false, preview: false } });
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    if (welcomed) {
+      link.welcomeNow(welcome({ session: 9, uid: "u1", channels: [chan(1), chan(2)], clients: [client(9, null, { uid: "u1" })] }), true);
+      await vi.advanceTimersByTimeAsync(10);
+      link.status_({ state: "reconnecting", attempt: 2, retryAt: 0 });
+    }
+    const stop = vi.spyOn(controller.screen, "stopShare");
+    await controller.leaveVoice();
+    expect(stop).toHaveBeenCalledOnce();
+    expect(source.stop).toHaveBeenCalledOnce();
+    expect(useScreen.getState().own).toBeNull();
+    const joins = link.sent("channel.join").length;
+    link.status_({ state: "reconnecting", attempt: 3, retryAt: 0 });
+    link.welcomeNow(welcome({ session: 10, uid: "u1", channels: [chan(1), chan(2)], clients: [client(10, null, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join")).toHaveLength(joins);
+    expect(link.sent("channel.leave")).toHaveLength(0);
+    expect(stores.useUi.getState().toasts).toEqual([]);
+    stop.mockRestore();
+  });
+
+  it("keeps a pending voice rejoin across a second blip before its channel update", async () => {
+    connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    link.welcomeNow(welcome({ session: 9, uid: "u1", channels: [chan(1), chan(2)], clients: [client(9, null, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(10);
+    link.status_({ state: "reconnecting", attempt: 2, retryAt: 0 });
+    link.welcomeNow(welcome({ session: 10, uid: "u1", channels: [chan(1), chan(2)], clients: [client(10, null, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join").map(r => r.d)).toEqual([{ channel: 2, password: null }, { channel: 2, password: null }]);
+  });
+
+  it("Leave stops retained capture during online republishing before screen.start answers", async () => {
+    connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
+    const { useScreen } = await import("./screen");
+    const source = { readyState: "live", stop: vi.fn(), applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }) };
+    useScreen.setState({ own: { phase: "live", attempt: 7, share: "old", stream: { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream,
+      surface: "screen", spec: { mode: "smooth", height: 1080, fps: 30 }, viewers: 0, guests: 0, guestLink: false, preview: false } });
+    let started!: (value: { share: string }) => void;
+    const request = link.request.bind(link);
+    vi.spyOn(link, "request").mockImplementation((op, d) => op === "screen.start" ? new Promise(resolve => { started = resolve as never; }) : request(op, d));
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
+    link.welcomeNow(welcome({ session: 9, uid: "u1", channels: [chan(1), chan(2)], clients: [client(9, 2, { uid: "u1" })] }), true);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(useScreen.getState().own).toMatchObject({ phase: "starting", share: null });
+    await controller.leaveVoice();
+    expect(source.stop).toHaveBeenCalledOnce();
+    expect(useScreen.getState().own).toBeNull();
+    link.emit({ ev: "client.updated", d: client(9, null, { uid: "u1" }) });
+    started({ share: "late" }); await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("screen.stop").at(-1)?.d).toEqual({ share: "late" });
+    expect(link.sent("screen.publish.offer")).toHaveLength(0);
+    expect(stores.useUi.getState().toasts).toEqual([]);
+  });
+
+  it.each(["refused", "manual"])("supersedes automatic rejoin intent when %s", async action => {
+    connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
+    const { RequestError } = await import("../net/connection");
+    const request = link.request.bind(link);
+    vi.spyOn(link, "request").mockImplementation(async (op, d) => {
+      const result = await request(op, d);
+      if (action === "refused" && op === "channel.join" && (d as { channel: number }).channel === 2) throw new RequestError("forbidden", "refused");
+      return result;
+    });
+    const resync = (id: number) => link.welcomeNow(welcome({ session: id, uid: "u1", channels: [chan(1), chan(2)], clients: [client(id, null, { uid: "u1" })] }), true);
+    link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 }); resync(9);
+    await vi.advanceTimersByTimeAsync(10);
+    if (action === "manual") {
+      await controller.joinChannel(1);
+      link.emit({ ev: "client.updated", d: client(9, 1, { uid: "u1" }) });
+    }
+    const before = link.sent("channel.join").length;
+    link.status_({ state: "reconnecting", attempt: 2, retryAt: 0 }); resync(10);
+    await vi.advanceTimersByTimeAsync(10);
+    expect(link.sent("channel.join").slice(before).map(r => r.d)).toEqual(action === "manual" ? [{ channel: 1, password: null }] : []);
   });
 
   it("does not offer leaving on TeamSpeak servers", async () => {

@@ -2,6 +2,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { initialScreen, useScreen } from "./screen";
 import { canWatch, ScreenController, screenSupport, useDesktopCapture } from "./screen-controller";
 import { useUi } from "./stores";
+import { legacySpec } from "../voice/screen-quality";
+import { notify } from "../platform/notify";
+vi.mock("../platform/notify", () => ({ notify: vi.fn() }));
 
 const shell = vi.hoisted(() => ({ invoke: vi.fn<(command: string) => Promise<unknown>>() }));
 vi.mock("../platform", () => ({
@@ -15,6 +18,7 @@ const toast = vi.fn();
 
 beforeEach(() => {
   shell.invoke.mockReset();
+  vi.mocked(notify).mockClear();
   getDisplayMedia.mockClear();
   useDesktopCapture.setState({ capture: null });
   useScreen.setState({ ...initialScreen });
@@ -71,7 +75,7 @@ describe("the desktop app", () => {
     }
   });
 
-  it("a closed or refused picker is reported neutrally, however long it took", async () => {
+  it("explicit picker cancellation stays silent, however long it took", async () => {
     shell.invoke.mockResolvedValue("ok");
     const screen = new ScreenController(() => null, String);
     screen.init();
@@ -79,11 +83,54 @@ describe("the desktop app", () => {
     // A refusal before any picker and the user closing it raise the same error; timing tells nothing.
     for (let i = 0; i < 2; i++) {
       toast.mockReset();
-      getDisplayMedia.mockImplementationOnce(async () => { throw new DOMException("The request is not allowed", "NotAllowedError"); });
+      getDisplayMedia.mockImplementationOnce(async () => { throw new DOMException("User cancelled the picker", "NotAllowedError"); });
       screen.beginShare();
       await flush();
-      expect(toast.mock.calls).toEqual([["info", "Screen sharing was cancelled or denied (The request is not allowed)"]]);
+      expect(toast).not.toHaveBeenCalled();
+      expect(useScreen.getState().notice).toBeNull();
       expect(useScreen.getState().own).toBeNull();
     }
   });
+  it("OS denial has persistent guidance and no browser error toast", async () => {
+    useDesktopCapture.setState({ capture: "ok" });
+    getDisplayMedia.mockImplementationOnce(async () => { throw new DOMException("Permission denied by system", "NotAllowedError"); });
+    new ScreenController(() => null, String).beginShare();
+    await flush();
+    expect(useScreen.getState().notice).toBe("permission");
+    expect(toast).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("notifies on lost retained capture unless explicitly stopped (Stop=%s)", async explicit => {
+    useDesktopCapture.setState({ capture: "ok" });
+    const source = Object.assign(new EventTarget(), { readyState: "live", stop: vi.fn(), getSettings: () => ({}) });
+    const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
+    getDisplayMedia.mockImplementationOnce(async () => stream);
+    const screen = new ScreenController(() => null, String);
+    screen.beginShare(); await flush();
+    useScreen.setState({ own: { ...useScreen.getState().own!, phase: "live", share: "M" } });
+    screen.suspend();
+    if (explicit) await screen.stopShare();
+    source.readyState = "ended"; source.dispatchEvent(new Event("ended")); await flush();
+    screen.resume();
+    expect(useScreen.getState().own).toBeNull();
+    expect(useScreen.getState().notice).toBe(explicit ? null : "reconnect");
+    expect(notify).toHaveBeenCalledTimes(explicit ? 0 : 1);
+    screen.reset();
+  });
+
+  it("also notifies the desktop sharer when republishing times out", async () => {
+    vi.useFakeTimers();
+    const track = { readyState: "live", stop: vi.fn() };
+    useScreen.setState({ own: { phase: "live", attempt: 1, share: "M", stream: { getVideoTracks: () => [track], getTracks: () => [track] } as unknown as MediaStream,
+      surface: "window", spec: legacySpec("text"), viewers: 0, guests: 0, guestLink: false, preview: false } });
+    const screen = new ScreenController(() => null, String);
+    screen.suspend();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(useScreen.getState().notice).toBe("reconnect");
+    expect(notify).toHaveBeenCalledExactlyOnceWith({ title: "Gwar", body: "Screen sharing stopped after the connection was lost.", tag: "screen-reconnect" });
+    expect(track.stop).toHaveBeenCalledOnce();
+    screen.reset();
+    vi.useRealTimers();
+  });
+
 });
