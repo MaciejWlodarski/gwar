@@ -58,6 +58,9 @@ pub struct OutputTiming {
     pub(crate) underruns: AtomicU64,
     pub(crate) capture_overflow_samples: AtomicU64,
     pub(crate) underrun_samples: AtomicU64,
+    /// The stereo difference for real speakers, written in step with `speaker`. Empty on
+    /// virtual devices, and when the pipeline has taken it.
+    pub(crate) side: Mutex<Option<Producer<f32>>>,
 }
 
 impl OutputTiming {
@@ -613,6 +616,7 @@ struct Cpal {
     host: cpal::Host,
     mic: Arc<Mutex<MicFeed>>,
     speaker: Arc<Mutex<Consumer<f32>>>,
+    side: Arc<Mutex<Consumer<f32>>>,
     timing: Arc<OutputTiming>,
     active: [Active; 2],
     /// The last offers read, standing in when enumeration fails.
@@ -666,6 +670,7 @@ impl Backend for Cpal {
                 &self.host,
                 route,
                 self.speaker.clone(),
+                Some(self.side.clone()),
                 self.timing.clone(),
                 (active, id),
                 trouble,
@@ -746,6 +751,7 @@ fn open_output(
     host: &cpal::Host,
     route: &Route,
     speaker: Arc<Mutex<Consumer<f32>>>,
+    side: Option<Arc<Mutex<Consumer<f32>>>>,
     timing: Arc<OutputTiming>,
     (active, id): (Active, u64),
     trouble: TroubleFn,
@@ -761,7 +767,9 @@ fn open_output(
     let channels = usize::from(config.channels());
     let device_rate = config.sample_rate() as usize;
     let mut to_device = Resampler::new(RATE, config.sample_rate());
+    let mut side_to_device = Resampler::new(RATE, config.sample_rate());
     let mut pending: Vec<f32> = Vec::new();
+    let mut pending_side: Vec<f32> = Vec::new();
     let stream = device.build_output_stream(
         config.config(),
         move |data: &mut [f32], _| {
@@ -772,17 +780,29 @@ fn open_output(
                 return;
             }
             if let Some(mut speaker_rx) = try_lock(&speaker) {
+                // Each voice sample takes its difference sample with it, so the two never drift.
+                let mut side_rx = side.as_ref().and_then(|side| try_lock(side));
                 while pending.len() < frames {
                     let Ok(sample) = speaker_rx.pop() else { break };
                     to_device.process(&[sample], |s| pending.push(s));
+                    let difference = side_rx.as_mut().and_then(|side| side.pop().ok()).unwrap_or(0.0);
+                    side_to_device.process(&[difference], |s| pending_side.push(s));
                 }
             }
             let take = pending.len().min(frames);
             let silent = silence.iter().any(|s| s.load(Ordering::Relaxed));
             for (i, frame) in data.chunks_mut(channels).enumerate() {
-                frame.fill(if !silent && i < take { pending[i] } else { 0.0 });
+                let mid = if !silent && i < take { pending[i] } else { 0.0 };
+                frame.fill(mid);
+                // Voice is centred: only share sound has any difference between the speakers.
+                let difference = if !silent && i < take { pending_side.get(i).copied().unwrap_or(0.0) } else { 0.0 };
+                if let [left, right, ..] = frame {
+                    *left = (mid + difference).clamp(-1.0, 1.0);
+                    *right = (mid - difference).clamp(-1.0, 1.0);
+                }
             }
             pending.drain(..take);
+            pending_side.drain(..take.min(pending_side.len()));
             timing.report(
                 (frames * RATE as usize).div_ceil(device_rate),
                 ((frames - take) * RATE as usize).div_ceil(device_rate),
@@ -842,6 +862,7 @@ pub fn play_sample(output: Option<String>, samples: Vec<f32>, cancelled: Arc<Ato
                 &host,
                 route,
                 received.clone(),
+                None,
                 timing.clone(),
                 (active.clone(), 1),
                 trouble.clone(),
@@ -898,6 +919,7 @@ pub fn play_cue(output: Option<String>, samples: Vec<f32>, busy: Arc<AtomicUsize
             &cpal::default_host(),
             &route,
             Arc::new(Mutex::new(rx)),
+            None,
             timing,
             (active, 1),
             trouble,
@@ -932,7 +954,8 @@ impl AudioIo for DeviceIo {
         let DeviceIo { input, output: speakers, input_only, on_issue, events, inbox, stopped } = *self;
         let (mic_tx, mic) = RingBuffer::<CaptureSample>::new(RATE as usize); // 1 s
         let (speaker, speaker_rx) = RingBuffer::<f32>::new(RATE as usize / 2);
-        let output = Arc::new(OutputTiming::default());
+        let (side, side_rx) = RingBuffer::<f32>::new(RATE as usize / 2);
+        let output = Arc::new(OutputTiming { side: Mutex::new(Some(side)), ..OutputTiming::default() });
         let timing = output.clone();
         let stop = StopOnDrop(events.clone());
         let (ready_tx, ready_rx) = std_mpsc::channel::<()>();
@@ -944,6 +967,7 @@ impl AudioIo for DeviceIo {
                     host: cpal::default_host(),
                     mic: Arc::new(Mutex::new(MicFeed { tx: mic_tx, position: 0, last: None })),
                     speaker: Arc::new(Mutex::new(speaker_rx)),
+                    side: Arc::new(Mutex::new(side_rx)),
                     timing,
                     active: Default::default(),
                     offers: Default::default(),

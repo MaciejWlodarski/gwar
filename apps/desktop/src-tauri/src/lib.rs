@@ -7,6 +7,7 @@ mod files;
 mod invites;
 mod ptt;
 mod screen;
+mod share_audio;
 mod shortcuts;
 mod startup;
 mod tray;
@@ -86,6 +87,7 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(startup::Startup::default())
         .manage(voice::Voice::default())
+        .manage(share_audio::ShareCapture::default())
         .manage(shortcuts::Shortcuts::default())
         .manage(ptt::Ptt::default())
         .manage(ts::Ts::default())
@@ -159,6 +161,14 @@ pub fn run() {
             voice::open_mic_privacy_settings,
             screen::screen_capture_support,
             screen::open_screen_privacy_settings,
+            share_audio::share_capture_support,
+            share_audio::share_capture_start,
+            share_audio::share_capture_read,
+            share_audio::share_capture_stop,
+            share_audio::share_playback_open,
+            share_audio::share_playback_close,
+            share_audio::share_playback_gain,
+            share_audio::share_playback_frames,
             files::files_set_server,
             files::files_cancel,
             files::fetch_file,

@@ -20,6 +20,7 @@ mod priority;
 mod ptt;
 mod rtc;
 pub mod sframe;
+pub mod share;
 mod watch;
 
 use std::{
@@ -127,6 +128,8 @@ pub struct Controls {
     stop: AtomicBool,
     /// At most two fresh local cues; the pipeline never blocks on this lock.
     cue: Mutex<Vec<(Vec<f32>, Instant, bool)>>,
+    /// Decoded share sound, once the app has any; survives nothing but this run.
+    share: Mutex<Option<Arc<share::ShareBus>>>,
 }
 
 fn f(v: &AtomicU32) -> f32 {
@@ -155,6 +158,7 @@ impl Default for Controls {
             transmitting: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             cue: Mutex::new(Vec::with_capacity(2)),
+            share: Mutex::new(None),
         }
     }
 }
@@ -288,6 +292,10 @@ impl VoiceHandle {
         }
         pending.push((samples, Instant::now(), while_deafened));
         self.output.wake();
+    }
+    /// Share sound joins this run's mix and echo reference (see [`share`]).
+    pub fn set_share_bus(&self, bus: Arc<share::ShareBus>) {
+        *self.controls.share.lock().unwrap_or_else(|e| e.into_inner()) = Some(bus);
     }
     /// The key channel of an encrypted run; `None` in plaintext and TeamSpeak.
     pub fn keys(&self) -> Option<&keys::KeyChannel> {
@@ -744,6 +752,10 @@ fn pipeline<const CAPTURE: usize>(
     let mut gate = gate::InputGate::default();
     let mut speaker_buffer = SpeakerBuffer::new(Instant::now());
     let mut cues: Vec<(std::vec::IntoIter<f32>, bool)> = Vec::with_capacity(2);
+    // Taken once: the device's difference signal stays in step with `speaker` from the first sample.
+    let mut side = output.side.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let mut side_mix = vec![0f32; FRAME];
+    let mut share_bus = None;
 
     while !controls.stop.load(Ordering::Relaxed) {
         // ---- capture
@@ -842,6 +854,11 @@ fn pipeline<const CAPTURE: usize>(
             }
         }
         cues.retain(|(pcm, allowed)| pcm.len() > 0 && (!deafened || *allowed));
+        if share_bus.is_none()
+            && let Ok(bus) = controls.share.try_lock()
+        {
+            share_bus.clone_from(&bus);
+        }
         while needed > 0 {
             let take = needed.min(FRAME);
             mix[..take].fill(0.0);
@@ -855,9 +872,19 @@ fn pipeline<const CAPTURE: usize>(
                 let cue: f32 = cues.iter_mut().map(|(pcm, _)| pcm.next().unwrap_or(0.0)).sum();
                 *s = (*s * master + cue).clamp(-1.0, 1.0);
             }
+            // Ahead of the echo reference: what the speakers play is what the canceller must know.
+            side_mix[..take].fill(0.0);
+            if let Some(bus) = share_bus.as_ref().filter(|bus| bus.active()) {
+                bus.mix(&mut mix[..take], &mut side_mix[..take], deafened);
+            }
             processing.render(&mix[..take]);
             for &s in &mix[..take] {
                 let _ = speaker.push(s);
+            }
+            if let Some(side) = &mut side {
+                for &s in &side_mix[..take] {
+                    let _ = side.push(s);
+                }
             }
             needed -= take;
         }
@@ -934,6 +961,71 @@ mod codec_tests {
         assert!(played.len() >= expected.len(), "pipeline did not play the cue");
         assert_eq!(&played[..expected.len()], expected.as_slice());
         assert!(outgoing.try_recv().is_err(), "local cue entered the outgoing microphone path");
+    }
+
+    #[test]
+    fn share_sound_reaches_the_speaker_and_the_echo_reference_with_voice_unchanged() {
+        // A viewer on speakers: the microphone hears only what the speaker plays.
+        let playout = share::SharePlayout::new().unwrap();
+        let controls = Arc::new(Controls::default());
+        *controls.share.lock().unwrap() = Some(playout.bus());
+        let c = controls.clone();
+        let (mut mic_tx, mic) = rtrb::RingBuffer::new(48_000);
+        let (speaker, mut heard) = rtrb::RingBuffer::new(FRAME * 8);
+        let (out, _out_rx) = mpsc::channel(64);
+        let (_incoming_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let output = Arc::new(OutputTiming::default());
+        let t = output.clone();
+        let worker = thread::spawn(move || pipeline::<FRAME>(c, Arc::default(), mic, speaker, t, out, incoming));
+        let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
+        encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
+        playout.open(0, 1);
+        let mut rendered = Vec::new();
+        let mut packet = vec![0; 1275];
+        let start = Instant::now();
+        let seconds = 6;
+        for block in 0..seconds * 100u64 {
+            if block % 2 == 0 {
+                let position = block * 480;
+                let pcm: Vec<f32> = (0..960u64)
+                    .flat_map(|i| {
+                        let v = 0.25 * (std::f32::consts::TAU * 330.0 * (position + i) as f32 / 48_000.0).sin()
+                            * (1.0 + 0.5 * (std::f32::consts::TAU * 3.0 * (position + i) as f32 / 48_000.0).sin());
+                        [v, v]
+                    })
+                    .collect();
+                let n = encoder.encode_float(&pcm, &mut packet).unwrap();
+                playout.push(share::ShareFrame { slot: 0, run: 1, rtp_time: position as u32, opus: packet[..n].to_vec() });
+            }
+            let target = start + Duration::from_millis(10 * (block + 1));
+            thread::sleep(target.saturating_duration_since(Instant::now()));
+            let mut played = Vec::with_capacity(FRAME);
+            while played.len() < FRAME {
+                match heard.pop() {
+                    Ok(sample) => played.push(sample),
+                    Err(_) => {
+                        played.resize(FRAME, 0.0);
+                    }
+                }
+            }
+            // The microphone hears the room: the speaker, a block later and 6 dB down.
+            let at = Instant::now();
+            let previous = rendered.len().saturating_sub(FRAME);
+            let echo: Vec<f32> = rendered[previous..].iter().map(|s: &f32| s * 0.5).collect();
+            for i in 0..FRAME {
+                let value = echo.get(i).copied().unwrap_or(0.0);
+                let _ = mic_tx.push(CaptureSample { position: block * FRAME as u64 + i as u64, captured_at: at, value });
+            }
+            rendered.extend(played);
+            output.report(FRAME, 0);
+        }
+        let level = f32::from_bits(controls.input_level.load(Ordering::Relaxed));
+        let played = rendered[rendered.len() - 48_000..].iter().map(|s| s * s).sum::<f32>() / 48_000.0;
+        assert!(played > 0.005, "the speaker played the share: {played}");
+        assert!(level < -35.0, "the echo canceller knows the share: {level:.1} dBFS at the microphone's output");
+        controls.stop.store(true, Ordering::Relaxed);
+        output.wake();
+        worker.join().unwrap().unwrap();
     }
 
     #[test]

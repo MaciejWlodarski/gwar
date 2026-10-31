@@ -41,6 +41,7 @@ use gwar_client::voice::{
     keys::EncryptedStart,
     permission,
     sframe::{Binding, ControlReply, Counters, CryptoStatus},
+    share::SharePlayout,
     start_encrypted, start_teamspeak, start_with,
 };
 use gwar_proto::AUDIO_SLOTS;
@@ -115,6 +116,8 @@ struct Inner {
     ts_sink: Option<VoiceSinkLease>,
     idle_cue_cancel: Arc<AtomicBool>,
     pending_cues: Vec<(Vec<f32>, Instant, bool)>,
+    /// Watched shares' sound; outlives voice runs, and each run's pipeline reads it.
+    share_playout: Option<Arc<SharePlayout>>,
 }
 
 pub struct Voice {
@@ -164,6 +167,7 @@ impl Default for Voice {
                 ts_sink: None,
                 idle_cue_cancel: Arc::default(),
                 pending_cues: Vec::with_capacity(2),
+                share_playout: None,
             }),
             run: AtomicU64::new(0),
             global_ptt: AtomicBool::new(false),
@@ -243,6 +247,25 @@ impl Voice {
             h.set_ptt(active);
         }
         Ok(())
+    }
+
+    /// For commands beside voice: the caller is this webview's current owner.
+    pub fn check_current_owner(&self, owner: u64) -> Result<(), String> {
+        check_owner(&self.lock(), owner)
+    }
+
+    /// Runs `use_it` with the playout, made on first use, and whether a voice run can hear it.
+    pub fn share_playout<T>(&self, use_it: impl FnOnce(&Arc<SharePlayout>, bool) -> T) -> Result<T, String> {
+        let mut inner = self.lock();
+        if inner.share_playout.is_none() {
+            let playout = Arc::new(SharePlayout::new().map_err(|e| format!("{e:#}"))?);
+            if let Some(handle) = &inner.handle {
+                handle.set_share_bus(playout.bus());
+            }
+            inner.share_playout = Some(playout);
+        }
+        let playing = inner.handle.is_some();
+        Ok(use_it(inner.share_playout.as_ref().expect("made above"), playing))
     }
 
     /// Diagnostics for the debug command and log lines.
@@ -575,6 +598,8 @@ fn bootstrap_owner(voice: &Voice) -> u64 {
     if let Some(test) = inner.mic_test.take() {
         test.retire();
     }
+    // A reloaded view's watches are gone; none of their sound may keep playing.
+    inner.share_playout = None;
     inner.owner += 1;
     inner.cancelled_through = 0;
     inner.mic_test_serial = 0;
@@ -588,6 +613,8 @@ fn bootstrap_owner(voice: &Voice) -> u64 {
 #[tauri::command]
 pub fn voice_bootstrap(window: WebviewWindow, voice: State<'_, Voice>) -> Result<u64, String> {
     check_main_window(window.label())?;
+    // A reloaded view cannot have confirmed the capture that is still running.
+    window.state::<crate::share_audio::ShareCapture>().stop();
     Ok(bootstrap_owner(&voice))
 }
 
@@ -771,6 +798,9 @@ pub async fn voice_start(
             tauri::async_runtime::spawn(forward_crypto(app.clone(), owner, run, events));
         }
         handle.set_input_gate_ready(inner.gate_ready);
+        if let Some(playout) = &inner.share_playout {
+            handle.set_share_bus(playout.bus());
+        }
         inner.handle = Some(handle);
         // A choice made while the devices opened applies now.
         if let Some(control) = &control {

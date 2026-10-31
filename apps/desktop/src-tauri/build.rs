@@ -13,5 +13,9 @@ fn main() {
         )
         .unwrap();
     }
+    // The app still starts on macOS 11, which has no ScreenCaptureKit; share sound checks first.
+    if std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos") {
+        println!("cargo:rustc-link-arg=-Wl,-weak_framework,ScreenCaptureKit");
+    }
     tauri_build::build()
 }
