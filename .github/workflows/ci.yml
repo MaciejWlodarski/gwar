@@ -73,9 +73,17 @@ jobs:
       - name: Clippy
         timeout-minutes: 20
         run: cargo clippy --workspace --exclude gwar-desktop --all-targets -- -D warnings
+      # Cold code generation used nine minutes of the old combined test deadline.
+      - name: Build tests
+        timeout-minutes: 20
+        env:
+          CARGO_BUILD_JOBS: "4"
+        run: cargo test --locked --workspace --exclude gwar-desktop --no-run
       - name: Tests
         timeout-minutes: 15
-        run: cargo test --workspace --exclude gwar-desktop
+        env:
+          CARGO_BUILD_JOBS: "4"
+        run: cargo test --locked --workspace --exclude gwar-desktop
 
       - name: Vendored str0m payload and SDP negotiation regressions
         timeout-minutes: 5
@@ -347,9 +355,9 @@ jobs:
           prefix-key: ci-v2-debug0
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      # std-only crate: verify the same tests on Linux, macOS and Windows before app setup.
+      # Verify media tests before app setup; include cold dependency compilation and doctests.
       - name: Platform-neutral media tests
-        timeout-minutes: 2
+        timeout-minutes: 10
         env:
           CARGO_BUILD_JOBS: "4"
         run: cargo test --locked -p gwar-media

@@ -148,6 +148,10 @@ const RECORD_FIXTURES: Record<keyof typeof RECORDS, Record<number, { stored: Rec
 };
 /** The settings (localStorage) per version, and a check of the settings store after loading them. */
 const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: string; bookmarks: unknown[] }): void }> = {
+  7: {
+    stored: { state: { theme: "dark", bookmarks: [], desktop: { openAtLogin: true, startMinimized: true, closeToTray: false }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } } }, version: 7 },
+    check: state => expect(state).toMatchObject({ desktop: { openAtLogin: true, startMinimized: true, closeToTray: false }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } } }),
+  },
   6: {
     stored: { state: { theme: "dark", bookmarks: [], sounds: { enabled: false, volume: 0.25, events: { mute: false } } }, version: 6 },
     check: state => { expect(state).toMatchObject({ sounds: { enabled: false, volume: 0.25, events: { mute: false, peerJoin: true } } }); },
@@ -179,9 +183,9 @@ const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: st
       expect(state.bookmarks).toMatchObject([{ id: "a", address: "a.example" }]);
     },
   },
-  7: {
-    stored: { state: { audio: { inputMode: "ptt", pttKey: "Mouse5", pttReleaseDelay: 80 } }, version: 7 },
-    check: state => { expect(state).toMatchObject({ audio: { inputMode: "ptt", pttKey: "Mouse5", pttReleaseDelay: 80 } }); },
+  8: {
+    stored: { state: { audio: { inputMode: "ptt", pttKey: "Mouse5", pttReleaseDelay: 80 }, desktop: { openAtLogin: true, startMinimized: true, closeToTray: false }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } } }, version: 8 },
+    check: state => { expect(state).toMatchObject({ audio: { inputMode: "ptt", pttKey: "Mouse5", pttReleaseDelay: 80 }, desktop: { openAtLogin: true, startMinimized: true, closeToTray: false }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } } }); },
   },
 };
 const PIN = "gwar.server-pin:wss://a.example/ws";
@@ -424,6 +428,44 @@ describe("the settings (localStorage)", () => {
   }
   afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
 
+  it.each([0, ...versions(7)])("upgrades version %i through desktop v7 and PTT v8 without losing saved values", async version => {
+    const { useSettings } = await page(memory({}));
+    const saved = {
+      audio: { inputMode: "ptt", pttKey: "AltRight", inputDeviceId: "saved-mic", automaticSensitivity: false, vadThreshold: -72 },
+      desktop: { closeToTray: false, muteShortcut: "Control+KeyM", deafenShortcut: "Control+KeyD", openAtLogin: true, startMinimized: true },
+      notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } },
+      notifications: { mentions: false, privateMessages: false, allMessages: true },
+      sounds: { enabled: false, volume: 0.2, events: { mention: false } },
+      bookmarks: [{ id: "one", password: "saved", channelPassword: "also-saved" }],
+      unrelatedFutureField: { value: 42 },
+    };
+    const upgraded = await useSettings.persist.getOptions().migrate!(saved, version);
+    expect(upgraded).toMatchObject({ ...saved, audio: { ...saved.audio, pttReleaseDelay: 300 } });
+    expect(saved.audio).not.toHaveProperty("pttReleaseDelay");
+    const secondPass = await useSettings.persist.getOptions().migrate!(upgraded, version);
+    expect(secondPass).toEqual(upgraded);
+  });
+
+  it.each([0, 80, 1000])("keeps a previously saved v7 PTT delay of %i through v8 and reload", async pttReleaseDelay => {
+    const previous = { audio: { inputMode: "ptt", pttKey: "Mouse5", pttReleaseDelay }, desktop: { openAtLogin: true, startMinimized: true, closeToTray: false }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } } };
+    const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ version: 7, state: previous }) });
+    const { useSettings } = await page(storage);
+    expect(useSettings.getState()).toMatchObject(previous);
+    expect(JSON.parse(storage.getItem(SETTINGS_KEY)!)).toMatchObject({ version: 8, state: previous });
+    const reloaded = await page(storage);
+    expect(reloaded.useSettings.getState()).toMatchObject(previous);
+  });
+
+
+it("migrates v6 desktop and notification preferences without dropping any saved values", async () => {
+  const { useSettings } = await page(memory({}));
+  const migrate = useSettings.persist.getOptions().migrate!;
+  const saved = { desktop: { closeToTray: false, muteShortcut: "Control+KeyM", deafenShortcut: "Control+KeyD" }, notifications: { mentions: false, privateMessages: false, allMessages: true }, sounds: { enabled: false, volume: 0.2, events: { mention: false } }, bookmarks: [{ id: "one", password: "saved", channelPassword: "also-saved" }], unrelatedFutureField: { value: 42 } };
+  const upgraded = await migrate(saved, 6);
+  expect(upgraded).toMatchObject(saved);
+  expect(upgraded).toMatchObject({ desktop: { openAtLogin: false, startMinimized: false }, notificationOverrides: { servers: {}, channels: {} } });
+});
+
   it("restores saved mute and deafen before the voice store is created", async () => {
     const storage = memory({});
     const first = await page(storage);
@@ -463,18 +505,23 @@ describe("the settings (localStorage)", () => {
     expect(s()).toMatchObject({ resumeConnection: null, updateVoiceResume: null });
   });
 
-  it.each([1, 2, 3, 4, 5, 6])("migrates version %s to the current settings losslessly, preserving even previously stored sounds", async version => {
-    const audio = { inputMode: "ptt", inputDeviceId: "saved-mic", outputDeviceId: "saved-speaker", noiseSuppression: false, echoCancellation: false, autoGainControl: false, automaticSensitivity: false, vadThreshold: -72 };
+  it.each([1, 2, 3, 4, 5, 6, 7])("migrates version %s to the current settings losslessly, preserving even previously stored sounds", async version => {
+    const audio = { inputMode: "ptt", pttKey: "AltRight", inputDeviceId: "saved-mic", outputDeviceId: "saved-speaker", noiseSuppression: false, echoCancellation: false, autoGainControl: false, automaticSensitivity: false, vadThreshold: -72 };
     const onboarding = { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true };
     const session = { selfMuted: true, selfDeafened: true, resumeConnection: { address: "a.example", kind: "gwar", name: "A", password: "saved-password", identity: "saved-identity", insecureLan: true }, updateVoiceResume: { address: "a.example", kind: "gwar", version: "1.0", expiresAt: 123456, channel: 2, password: "channel-password" } };
     const sounds = { enabled: false, volume: 0.25, events: { mute: false, connectionLost: false } };
-    const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ version, state: { audio, onboarding, ...session, sounds, theme: "dark" } }) });
+    const desktop = { openAtLogin: true, startMinimized: true, closeToTray: false, muteShortcut: "Control+KeyM", deafenShortcut: "Control+KeyD" };
+    const notificationOverrides = { servers: { room: "none" }, channels: { room: { 2: "mentions" } } };
+    const bookmarks = [{ id: "saved", name: "Local", address: "127.0.0.1", kind: "gwar", password: "keep-me", channelPassword: "channel-password" }];
+    const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ version, state: { audio, onboarding, ...session, sounds, desktop, notificationOverrides, bookmarks, theme: "dark" } }) });
     const { useSettings } = await page(storage);
-    const expected = { theme: "dark", onboarding, ...session, audio, sounds: { ...sounds, events: { ...sounds.events, peerJoin: true } } };
+    const expected = { theme: "dark", onboarding, ...session, desktop, notificationOverrides, bookmarks, audio: { ...audio, pttReleaseDelay: 300 }, sounds: { ...sounds, events: { ...sounds.events, peerJoin: true } } };
     expect(useSettings.getState()).toMatchObject(expected);
     const saved = JSON.parse(storage.getItem(SETTINGS_KEY)!);
     expect(saved.version).toBe(SETTINGS_VERSION);
     expect(saved.state).toMatchObject(expected);
+    await useSettings.persist.rehydrate();
+    expect(useSettings.getState()).toMatchObject(expected);
   });
 
   it.each([1, 2, 3, 4])("adds sensitivity defaults to version %s without losing voice, onboarding or session preferences", async version => {

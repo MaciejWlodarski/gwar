@@ -904,7 +904,7 @@ async function main() {
     if (await pill.count()) throw new Error("the pill is shown in the server view");
     await shot(a, "50-servers-in-voice-dark");
     await a.getByRole("button", { name: "Settings", exact: true }).first().click();
-    await a.getByRole("tab", { name: "Audio" }).click();
+    await a.getByRole("tab", { name: "Voice" }).click();
     await pill.getByText("Voice connected").waitFor();
     await shot(a, "51-settings-audio-pill-dark");
     await a.getByRole("button", { name: "Your profile" }).click();
@@ -1014,7 +1014,7 @@ async function main() {
     await sheet.getByRole("button", { name: "Settings", exact: true }).click();
     const settings = m.getByRole("main", { name: "Settings" });
     await waitFor(() => activeIs(m, () => document.activeElement?.getAttribute("data-page") === "audio"), "focus on the open tab's row", 5000);
-    await settings.getByRole("button", { name: /^Audio/ }).click();
+    await settings.locator('button[data-page="audio"]').click();
     await sectionTab(m, "More").click();
     await sheetOpen();
     if ((await sheet.getAttribute("aria-modal")) !== "true") throw new Error("the More sheet is not modal");
@@ -1022,7 +1022,7 @@ async function main() {
     await sheet.waitFor({ state: "detached" });
     await waitFor(onMore, "focus back on More", 5000);
     await sleep(200);
-    if (!(await settings.getByRole("heading", { name: "Audio", exact: true, level: 2 }).isVisible())) throw new Error("Esc over More left the Audio page");
+    if (!(await settings.getByRole("heading", { name: "Voice", exact: true, level: 2 }).isVisible())) throw new Error("Esc over More left the Voice page");
     // Over a bug report with a draft.
     await sectionTab(m, "More").click();
     await sheetOpen();
@@ -1053,8 +1053,8 @@ async function main() {
     if (!(await current("More"))) throw new Error("More is not marked on Settings");
     await mPill.waitFor();
     await shot(m, "m6-settings-dark");
-    await settings.getByRole("button", { name: /^Audio/ }).click();
-    await settings.getByRole("heading", { name: "Audio", exact: true, level: 2 }).waitFor();
+    await settings.locator('button[data-page="audio"]').click();
+    await settings.getByRole("heading", { name: "Voice", exact: true, level: 2 }).waitFor();
     await shot(m, "m7-settings-audio-dark");
     await settings.getByRole("button", { name: "Back", exact: true }).click();
     await settings.getByRole("button", { name: /^Language/ }).click();
@@ -1091,8 +1091,8 @@ async function main() {
     await r.goto(WEB_URL);
     const rSheet = r.getByRole("dialog", { name: "More", exact: true });
     const settings = r.getByRole("main", { name: "Settings" });
-    const audio = settings.getByRole("heading", { name: "Audio", exact: true, level: 2 });
-    const audioRow = settings.getByRole("button", { name: /^Audio/ });
+    const audio = settings.getByRole("heading", { name: "Voice", exact: true, level: 2 });
+    const audioRow = settings.locator('button[data-page="audio"]');
     const length = () => r.evaluate(() => history.length);
     const still = async (what) => {
       await sleep(300);
@@ -1199,7 +1199,7 @@ async function main() {
       });
     // The gear reopens the tab it showed last.
     await a.getByRole("button", { name: "Settings" }).first().click();
-    await a.getByRole("tab", { name: "Audio" }).click();
+    await a.getByRole("tab", { name: "Voice" }).click();
     await a.getByRole("radio", { name: "Push to talk" }).click();
     await a.getByRole("button", { name: "Choose a key", exact: true }).click();
     await a.keyboard.press("KeyV");
@@ -1563,12 +1563,15 @@ async function main() {
     await item.getByText("0 of 1 uses").waitFor();
     await item.getByRole("button", { name: "Copy link" }).click();
     inviteLink = await a.evaluate(() => navigator.clipboard.readText());
-    const expected = new RegExp(`^${escapeRe(new URL(WEB_URL).origin)}/\\?server=${escapeRe(encodeURIComponent(CLIENT_ADDR))}&invite=[\\w-]+&server_key=[\\w-]{43}&owner=[\\w-]{27}$`);
-    if (!expected.test(inviteLink)) throw new Error(`unexpected invite link ${inviteLink}`);
-    // The web app (Vite) and the server are different origins here, so the link has to name the server.
     const link = new URL(inviteLink);
-    if (link.origin === `http://${SERVER}` || link.searchParams.get("server") !== CLIENT_ADDR) throw new Error(`invite link does not name the server: ${inviteLink}`);
+    const serverName = await a.evaluate(async () => (await window.__gwarE2eImport("/src/state/stores.ts")).useSession.getState().server.name);
+    const params = [...link.searchParams.keys()].sort();
+    if (link.origin !== new URL(WEB_URL).origin || link.pathname !== "/" || link.hash || link.username || link.password || JSON.stringify(params) !== JSON.stringify(["invite", "name", "owner", "server", "server_key"])) throw new Error("unexpected invite link shape");
+    if (!/^[\w-]{3,128}$/.test(link.searchParams.get("invite")) || !/^[\w-]{27}$/.test(link.searchParams.get("owner"))) throw new Error("invalid invite code or owner");
+    // Keep the exact endpoint, verified key, owner, and visible server-name hint in the shared link.
+    if (link.origin === `http://${SERVER}` || link.searchParams.get("server") !== CLIENT_ADDR) throw new Error("invite link does not name the server");
     if (link.searchParams.get("server_key") !== fingerprint) throw new Error("invite fingerprint differs from verified server key");
+    if (link.searchParams.get("name") !== serverName) throw new Error("invite name differs from the inviter's server");
     await shot(a, "25-invites-dark");
     await a.keyboard.press("Escape");
 
@@ -1576,12 +1579,15 @@ async function main() {
     const ivy = await ctx.newPage();
     debugPages.push(ivy);
     await ivy.goto(inviteLink);
-    await ivy.getByText(/You were invited to this server/).waitFor();
+    await ivy.getByRole("heading", { name: serverName, exact: true }).waitFor();
+    await ivy.getByTestId("invite-banner").waitFor();
     if (/invite=/.test(ivy.url())) throw new Error(`the invite stays in the address bar: ${ivy.url()}`);
     await waitFor(async () => (await ivy.getByLabel("Server address").inputValue()) === CLIENT_ADDR, "prefilled server address");
     await shot(ivy, "26-invite-join-dark");
     await setGlobalNickname(ivy, "Ivy");
-    await ivy.getByRole("button", { name: "Connect", exact: true }).click();
+    // Neither loading the link nor reviewing it may contact the invitation's server.
+    if ((await ivy.evaluate(() => window.__sockets.length)) !== 0) throw new Error("invite opened a connection before Join");
+    await ivy.getByRole("button", { name: `Join ${serverName}`, exact: true }).click();
     await ivy.getByText("Not in voice").waitFor({ timeout: 20000 });
     await waitFor(async () => (await nameColor(a, memberSection(a, "Online").getByText("Ivy", { exact: true }))) === ROLE_RGB, "Ivy has the invite's role colour");
 
@@ -1591,7 +1597,7 @@ async function main() {
     await paste.goto(WEB_URL);
     await paste.getByLabel("Server address").fill(inviteLink);
     await waitFor(async () => (await paste.getByLabel("Server address").inputValue()) === CLIENT_ADDR, "address extracted from the pasted link");
-    await paste.getByText(/You were invited to this server/).waitFor();
+    await paste.getByTestId("invite-banner").waitFor();
     await ctx2.close();
 
     // The used-up invite shows its use.

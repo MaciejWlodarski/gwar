@@ -1,3 +1,4 @@
+import { notificationServerKey } from "../lib/notification-scope";
 import type { Attachment } from "../proto/Attachment";
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Client } from "../proto/Client";
@@ -201,7 +202,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
   controller.sounds.reset();
-  settings.useSettings.setState({ sounds: defaultSounds });
+  settings.useSettings.setState({ sounds: defaultSounds, notificationOverrides: { servers: {}, channels: {} } });
   settings.useSettings.setState({ onboarding: { completed: true, firstUsedAt: 1, nudgeDismissed: false, roleReceived: false } });
   engine.capabilities.encryptedVoice = async () => true;
   link = new FakeLink();
@@ -209,7 +210,7 @@ beforeEach(() => {
   stores.useUi.setState({ dialog: { kind: "none" }, joining: null, toasts: [] });
   stores.useVoice.setState({ muted: false, deafened: false, micError: null, state: "idle", reconnecting: false, failure: null });
   settings.useSettings.setState({ selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null, language: "en" });
-  stores.useConnectUi.setState({ restoring: false, startupRetry: false, otherTab: null, busy: false, error: null, invite: null });
+  stores.useConnectUi.setState({ restoring: false, startupRetry: false, otherTab: null, busy: false, error: null, invite: null, inviteLaunch: false });
   (controller as unknown as { restored: boolean; persistRequested: boolean }).restored = false;
   (controller as unknown as { persistRequested: boolean }).persistRequested = false;
   (controller as unknown as { voiceAutoStart: boolean; rememberResume: boolean; voiceRetryAllowed: boolean }).voiceAutoStart = true;
@@ -690,6 +691,17 @@ describe("session resilience", () => {
     expect(settings.useSettings.getState().resumeConnection).toMatchObject({ ...saved, name: "Test" });
     expect(session().phase).toBe("online");
     vi.stubGlobal("navigator", nav);
+  });
+
+  it("a malformed invite launch cannot silently restore a saved connection", async () => {
+    settings.useSettings.setState({ resumeConnection: saved });
+    stores.useConnectUi.setState({ inviteLaunch: true });
+    const connect = vi.spyOn(controller, "connectInteractive");
+    await controller.restoreSession();
+    expect(connect).not.toHaveBeenCalled();
+    expect(engine.start).not.toHaveBeenCalled();
+    stores.useConnectUi.setState({ inviteLaunch: false });
+    connect.mockRestore();
   });
 
   it("restores once after startup without joining voice", async () => {
@@ -2260,6 +2272,25 @@ describe("uploads", () => {
 });
 
 describe("bounded incoming verification", () => {
+  it("honors a mute selected during verification without dropping the verified message", async () => {
+    connectFake(); session().dispatch({ type: "focus", focused: false });
+    settings.useSettings.getState().setNotifications({ mentions: true, privateMessages: true, allMessages: false });
+    let finish!: (result: import("../net/message-signature").MessageVerification) => void;
+    const blocked = new Promise<import("../net/message-signature").MessageVerification>(resolve => { finish = resolve; });
+    const c = controller as unknown as { verifyIncoming: (msg: ChatMessage) => Promise<import("../net/message-signature").MessageVerification> };
+    const verify = vi.spyOn(c, "verifyIncoming").mockReturnValueOnce(blocked);
+    try {
+      link.emit({ ev: "chat.message", d: message(616, 2, { mentions: ["u1"], signature: {} as NonNullable<ChatMessage["signature"]> }) });
+      await vi.advanceTimersByTimeAsync(0);
+      settings.useSettings.getState().setNotificationMode(notificationServerKey(session()), 2, "none");
+      finish({ status: "verified", continuity: "proven", authorization: [] });
+      await vi.advanceTimersByTimeAsync(10);
+      expect(notifyMock).not.toHaveBeenCalled();
+      expect(engine.playSound).not.toHaveBeenCalled();
+      expect(session().threads["ch:2"]?.items.some(i => i.kind === "msg" && i.msg.id === 616 && i.verified)).toBe(true);
+    } finally { verify.mockRestore(); }
+  });
+
   it("verifies a signed file message once and notifies without fetching its bytes", async () => {
     connectFake(); session().dispatch({ type: "focus", focused: false });
     settings.useSettings.getState().setNotifications({ mentions: true, privateMessages: true, allMessages: false });

@@ -71,7 +71,7 @@ its WebKit data directory.
 | IndexedDB `gwar-message-auth-v3` (`net/message-storage.ts`) | `checkpoints` (by `server/author/message`, index `at`): `{revision, hash, created, conversation, at, proven?, deleted?, files?, order}`; `revocations` (by `account:device`): account-signed revocations; `feeds` (by Connect URL): `{cursor, checked, available?, read?}`; `order`: one counter. | Database version 3 (`MESSAGE_STORAGE_MIGRATIONS`; version 1 never held data, the name started at 2). Not a cache: losing it loses rollback protection, so it is migrated, never emptied. |
 | IndexedDB `gwar-mls-v2-<device public key>` (`mls/storage.ts`) | The device's MLS agent: stores `openmls` (OpenMLS's own records), `groups` (`@device`, group records, `{server}/@server` owner pins, `@archive`), `epochs`, `outbox`; binary keys and values written by `crates/gwar-mls`. The runtime's jobs (`@runtime/…`, JSON) live in `outbox`. | Database version 1 (`MLS_MIGRATIONS`), which also versions the runtime's jobs. The agent's records have their own format, the `version` of `@device` (`STORE_FORMAT` in `crates/gwar-mls/src/agent/mod.rs`, currently 1): `STORE_UPGRADES` run as the agent loads and reach storage with its next write. OpenMLS's own records are keyed by its storage version, pinned by a test. **Never wiped**: an unreadable state fails to load and stays. |
 | IndexedDB `gwar-local`, store `entries` (`lib/local-state.ts`) | The device's security state, by key (the names version 1 used in localStorage): `gwar.server-pin:<endpoint>` → `{server_pk, first_seen}`, the server key first seen at an address; `gwar.channels:<server key>` → `{known, deleted, incomplete}`, channel ids seen and seen deleted; `gwar.connect.handle-pin:<Connect URL>:<handle>` → `{uid}`, the account first seen behind a handle; `gwar.connect.service-key:<Connect URL>` → Gwar Connect's service key (a cache, refetched). Values are JSON strings. | Database version 1 (`LOCAL_STATE_MIGRATIONS`; step 1 imports the localStorage entries of version 1, below). The only source of truth: read into memory before the first render, every change one transaction (below). A channel record it cannot read becomes "incomplete" (fails closed), never clean. **Never wiped.** |
-| localStorage `gwar.settings` (zustand `persist`) | Preferences, bookmarks (with server and channel passwords), removed bookmarks, the last server, per-server flags. | zustand's `version` (`SETTINGS_VERSION` in `lib/local-storage.ts`, currently 7). |
+| localStorage `gwar.settings` (zustand `persist`) | Preferences, bookmarks (with server and channel passwords), removed bookmarks, the last server, per-server flags. | zustand's `version` (`SETTINGS_VERSION` in `lib/local-storage.ts`, currently 8). |
 | localStorage `gwar-local.changed` | A ping: the name of the last `gwar-local` key this browser changed and a nonce, so other tabs read it again (no data). | Not data: missing or stale is harmless. |
 | localStorage `gwar.server-pin:*`, `gwar.channels:*`, `gwar.connect.handle-pin:*`, `gwar.connect.service-key:*` | What version 1 kept there, imported into `gwar-local` once. | **Unused** since the import; left in place for tabs and builds of version 1, and removed by a later release. |
 | Cache Storage `gwar-denoise` | The noise suppression module and model. | Cache: entries not in use are deleted. |
@@ -80,6 +80,7 @@ its WebKit data directory.
 
 | File (app data directory) | Holds | Version and mechanism |
 | --- | --- | --- |
+| `startup.json` | Desktop start-minimized preference, read before creating the window. Open-at-login is authoritative in the OS. | Version 1; absent means off, unreadable or newer data is preserved and refused. |
 | `teamspeak-identities.json` | This device's TeamSpeak identities: `{version, default, identities: [{uid, name, identity}]}`. | `version` (`FORMAT` in `crates/gwar-client/src/ts_identities.rs`, currently 1; missing means 1), `UPGRADES` applied as it is read. A newer file is refused and left alone. Holds private keys: never wiped. |
 | `teamspeak-identities.account.json` | The account's TeamSpeak identities from the vault, same format. | As above. Removed on sign-out (the vault keeps them). |
 | `.window-state.json` (tauri-plugin-window-state) | Window size and position. | The plugin's own; a cache. |
@@ -348,6 +349,30 @@ keep every existing preference and gain the defaults automatically. Partial soun
 preferences preserve explicit off switches; missing events default on. The settings
 remain device-local, including in the desktop webview, and are not synced to Connect.
 
+Settings version 7 adds per-server and per-channel `notificationOverrides` and desktop
+`openAtLogin` / `startMinimized` (both false by default). Versions 1 through 6 retain
+all previous values, including nested desktop shortcuts, notifications, sounds,
+bookmarks, credentials and session preferences. Native startup reads its own
+version-1 `startup.json` before the webview exists; missing means off, unreadable
+or newer versions remain untouched. Open-at-login is read from the OS, and only
+an explicit native setting change registers the application. See
+`docs/desktop-notifications.md`.
+
+Settings version 8 adds `audio.pttReleaseDelay` (milliseconds, 0..1000, default
+300) for passive push-to-talk. Upgrades from version 6 and earlier first apply
+version 7's desktop/notification step, then version 8's audio step. Version 7
+settings apply only the new step; the released version 7 migration is unchanged.
+`audio.pttKey` retains its existing physical `KeyboardEvent.code` string exactly;
+mouse bindings use `Mouse3`, `Mouse4`, or `Mouse5`. Unsupported saved keys remain
+visible and can be replaced by the user. The migration adds the delay through
+`validAudio`, preserving other audio fields and all other settings, including
+bookmarks and credentials, device choices, sound preferences, mute/deafen
+shortcuts, startup choices, notification overrides, onboarding and session
+preferences. A delay already saved by an earlier development build is retained.
+Loading and editing a side-button binding preserves it across reloads. Fixtures
+cover every released settings version, with lossless upgrade and reload tests
+through the v6 → v7 → v8 chain.
+
 ### Desktop files
 
 JSON files carry `version` (missing: 1). The loader refuses a newer version
@@ -412,14 +437,3 @@ Every kind has a test that fails when the version grows without a fixture:
 
 Manual sensitivity is unavailable on older servers; settings show a short explanation
 and retain the saved threshold. Unsupported PTT stays closed and asks for a newer server.
-
-### Settings version 7: passive push-to-talk
-
-Version 7 adds `audio.pttReleaseDelay` (milliseconds, 0..1000, default 300).
-`audio.pttKey` retains its existing physical `KeyboardEvent.code` string exactly;
-mouse bindings use `Mouse3`, `Mouse4`, or `Mouse5`. Unsupported saved keys remain
-visible and can be replaced by the user. The migration adds the delay through
-`validAudio`, preserving other audio fields and all other settings, including
-bookmarks, device choices, sound preferences, and mute/deafen shortcuts. Loading
-and editing a side-button binding preserves it across reloads. Concurrent PRs
-that also introduce version 7 must renumber the later migration and fixture.

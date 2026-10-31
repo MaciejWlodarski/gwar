@@ -1,3 +1,4 @@
+import { notificationBadge, notificationServerKey } from "../lib/notification-scope";
 /**
  * Desktop-only wiring between the shared UI state and the Tauri shell:
  * global shortcuts (push-to-talk, mute, deafen), the system tray (with
@@ -98,11 +99,25 @@ export function initDesktop(): (() => void) | undefined {
 
     // Keep the tray menu in step with the UI.
     const sharing = () => useScreen.getState().own !== null;
+    let previousTray = "", previousBadge = -1;
     const pushTray = () => {
       const { muted, deafened } = useVoice.getState();
-      void api.invoke("tray_set_state", { muted, deafened, sharing: sharing() });
+      const settings = useSettings.getState(), session = useSession.getState();
+      const count = Math.min(0xffffffff, notificationBadge(session, settings.notifications, settings.notificationOverrides, notificationServerKey(session)));
+      const state = { muted, deafened, sharing: sharing(), language: settings.language, unread: count > 0 };
+      const serialized = JSON.stringify(state);
+      if (previousTray !== serialized) {
+        previousTray = serialized;
+        void api.invoke("tray_set_state", state).catch(e => console.warn("[desktop] tray update failed", e));
+      }
+      if (previousBadge !== count) {
+        previousBadge = count;
+        void api.invoke("tray_set_badge", { count }).catch(e => console.warn("[desktop] badge update failed", e));
+      }
     };
     pushTray();
+    cleanup(useSettings.subscribe((s, prev) => s.language !== prev.language || s.notifications !== prev.notifications || s.notificationOverrides !== prev.notificationOverrides ? pushTray() : undefined));
+    cleanup(useSession.subscribe((s, prev) => s.threads !== prev.threads || s.address !== prev.address || s.endpoint !== prev.endpoint || s.kind !== prev.kind ? pushTray() : undefined));
     cleanup(useVoice.subscribe((s, prev) => (s.muted !== prev.muted || s.deafened !== prev.deafened ? pushTray() : undefined)));
     // "Stop sharing screen" in the tray, from the picker until the share ends.
     cleanup(useScreen.subscribe((s, prev) => ((s.own !== null) !== (prev.own !== null) ? pushTray() : undefined)));

@@ -39,6 +39,7 @@ import { absoluteUrl, httpOriginFromWsUrl, isPlaintextRemote, parseServerAddress
 import { memberName } from "../lib/member-name";
 import { displayText } from "../lib/text";
 import { checkUpload } from "../lib/files";
+import { notificationServerKey, scopedNotifications } from "../lib/notification-scope";
 import { notificationBody, notifyReason } from "../lib/notify-rules";
 import { setConnectedServer, FILE_TIMEOUT_MS, uploadFromApp } from "../platform/download";
 import { notify } from "../platform/notify";
@@ -61,7 +62,7 @@ import {
 import { TsConnection } from "../net/ts-connection";
 import type { pruneRequest } from "../lib/prune";
 import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, identityFailure, type Identity, type IdentityFailure } from "../net/identity";
-import { isDesktop } from "../platform";
+import { isDesktop, tauri } from "../platform";
 import { createVoiceEngine } from "../voice";
 import { useScreen } from "./screen";
 import { ScreenController } from "./screen-controller";
@@ -783,7 +784,7 @@ class Controller {
     const saved = settings.resumeConnection;
     const update = settings.updateVoiceResume;
     settings.setUpdateVoiceResume(null);
-    if (!saved || useConnectUi.getState().invite || this.conn || useConnectUi.getState().busy) return;
+    if (!saved || useConnectUi.getState().inviteLaunch || useConnectUi.getState().invite || this.conn || useConnectUi.getState().busy) return;
     const resume = update && sameServer(saved, update) && update.version === CLIENT_VERSION && update.expiresAt > Date.now() ? update : null;
     const startup: StartupRestore = { params: saved, cancelled: false, wake: null };
     this.startup = startup;
@@ -2415,22 +2416,22 @@ class Controller {
    */
   private notificationFor(msg: ChatMessage): (() => void) | null {
     const s = useSession.getState();
-    const reason = notifyReason(msg, { meUid: s.me?.uid, focused: s.focused, settings: useSettings.getState().notifications });
-    // Sound preferences are independent of system-notification permission.
-    const sound = () => this.sounds.message(msg, s);
-    if (!reason) return sound;
-    // A system notification is no place for formatting that reorders the text around it.
-    const authorName = displayText(memberName(s.members, msg.author_uid, msg.author_name));
-    const target = typeof msg.target === "object" && "channel" in msg.target ? s.channels[msg.target.channel]?.name : undefined;
-    const channel = target === undefined ? undefined : displayText(target);
-    const title =
-      reason === "dm"
-        ? tNow("notify.dm", { name: authorName })
-        : channel
-          ? tNow("notify.channel", { name: authorName, channel })
-          : tNow("notify.server", { name: authorName, server: displayText(s.server?.name ?? "") });
+    const server = notificationServerKey(s);
     return () => {
-      sound();
+      // Verification can wait in a queue. A mute selected meanwhile must take effect now.
+      const settings = useSettings.getState();
+      const prefs = scopedNotifications(settings.notifications, settings.notificationOverrides, server, msg.target);
+      const reason = notifyReason(msg, { meUid: s.me?.uid, focused: s.focused, settings: prefs });
+      // Sound preferences are independent of system-notification permission.
+      this.sounds.message(msg, s, prefs);
+      if (!reason) return;
+      const authorName = displayText(memberName(s.members, msg.author_uid, msg.author_name));
+      const target = typeof msg.target === "object" && "channel" in msg.target ? s.channels[msg.target.channel]?.name : undefined;
+      const channel = target === undefined ? undefined : displayText(target);
+      const title = reason === "dm" ? tNow("notify.dm", { name: authorName })
+        : channel ? tNow("notify.channel", { name: authorName, channel })
+        : tNow("notify.server", { name: authorName, server: displayText(s.server?.name ?? "") });
+      if (isDesktop() && reason !== "message") void tauri().then(api => api.invoke("desktop_attention")).catch(() => {});
       notify({
         title: msg.author_uid.startsWith("ts:") ? `${title} · ${tNow("chat.teamSpeakNotification")}` : title,
         body: displayText(notificationBody(msg), true),

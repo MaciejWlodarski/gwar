@@ -102,7 +102,8 @@ fn dev_url<R: Runtime>(app: &App<R>) -> Option<Url> {
 /// Creates the main window from its configuration (`create: false` there) with the navigation
 /// and new-window rules above.
 pub(crate) fn create_main<R: Runtime>(app: &App<R>) -> tauri::Result<()> {
-    let config = app.config().app.windows.iter().find(|w| w.label == "main").cloned().expect("main window config");
+    let mut config = app.config().app.windows.iter().find(|w| w.label == "main").cloned().expect("main window config");
+    config.visible = false;
     let dev = dev_url(app);
     let bundled = Url::parse(BUNDLED_ORIGIN).expect("bundled origin");
     // On Windows the window starts empty: the app is loaded once saved media grants are overridden.

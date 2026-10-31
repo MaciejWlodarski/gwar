@@ -1,6 +1,6 @@
 # Push-to-talk
 
-Settings → Audio keeps the PTT key in the input-mode block, replacing the
+Settings → Voice keeps the PTT key in the input-mode block, replacing the
 voice-activity sensitivity controls. Choose a physical keyboard key (including
 left/right modifiers), a middle mouse button, or either side button. Escape
 cancels recording. The mouse icon also offers an explicit button picker, for
@@ -31,7 +31,7 @@ the development app manually if needed). The listener detects a grant without
 another prompt; macOS may require restarting the app. Details are in a dialog,
 with Polish and English UI text. Without access, even a focused-window key cannot
 bypass the closed microphone. The call control also shows a closed microphone
-with the plain-language reason; clicking it opens Audio settings. This is a setup
+with the plain-language reason; clicking it opens Voice settings. This is a setup
 action with no pressed state or mute shortcut announcement, rather than a toggle.
 
 macOS Caps Lock is explicitly unsupported for held PTT: its toggled state is not
@@ -103,7 +103,8 @@ to audit. The project remains MIT-licensed.
 Automated coverage includes callback pass-through and bound-key isolation,
 release-before-rearm, missing releases, sleep/clock discontinuities, audio lease
 expiry, release-delay behavior, permission/recovery IPC, stale registrations,
-and lossless settings migration from v6 to v7. The PTT recorder owns its listeners
+and lossless settings migration through v6 → v7 (desktop notifications/startup)
+→ v8 (PTT release delay). The PTT recorder owns its listeners
 inside the conditionally mounted PTT controls: changing input mode or hiding
 those controls retires keyboard/mouse capture and the global capture flag.
 Tests also cover owner/run replacement, independent health expiry, missing

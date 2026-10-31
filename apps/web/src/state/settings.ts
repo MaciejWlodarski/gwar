@@ -284,6 +284,8 @@ export interface AudioSettings {
 
 /** Options that only exist in the desktop app. */
 export interface DesktopSettings {
+  openAtLogin: boolean;
+  startMinimized: boolean;
   /** Global shortcut (Tauri accelerator, e.g. `Control+Shift+KeyM`) or null. */
   muteShortcut: string | null;
   deafenShortcut: string | null;
@@ -292,6 +294,19 @@ export interface DesktopSettings {
 }
 
 /** When to show a system notification (only while the window is in the background). */
+export type NotificationMode = "all" | "mentions" | "none";
+
+export interface NotificationOverrides {
+  servers: Record<string, NotificationMode>;
+  channels: Record<string, Record<string, NotificationMode>>;
+}
+
+export function readNotificationOverrides(value: unknown): NotificationOverrides {
+  const v = value && typeof value === "object" ? value as Partial<NotificationOverrides> : {};
+  const modes = (x: unknown): Record<string, NotificationMode> => Object.fromEntries(Object.entries(x && typeof x === "object" && !Array.isArray(x) ? x : {}).filter(([, m]) => m === "all" || m === "mentions" || m === "none"));
+  return { servers: modes(v.servers), channels: Object.fromEntries(Object.entries(v.channels && typeof v.channels === "object" && !Array.isArray(v.channels) ? v.channels : {}).map(([key, channels]) => [key, modes(channels)])) };
+}
+
 export interface NotificationSettings {
   mentions: boolean;
   privateMessages: boolean;
@@ -309,6 +324,8 @@ export interface SettingsState extends QualitySettings {
   audio: AudioSettings;
   desktop: DesktopSettings;
   notifications: NotificationSettings;
+  notificationOverrides: NotificationOverrides;
+  setNotificationMode(server: string, channel: number | null, mode: NotificationMode | null): void;
   sounds: SoundSettings;
   /** Per-user playback volume 0..2 keyed by uid. */
   userVolumes: Record<string, number>;
@@ -408,7 +425,7 @@ export function validAudio(value: unknown): AudioSettings {
   };
 }
 
-export const defaultDesktop: DesktopSettings = { muteShortcut: null, deafenShortcut: null, closeToTray: true };
+export const defaultDesktop: DesktopSettings = { muteShortcut: null, deafenShortcut: null, closeToTray: true, openAtLogin: false, startMinimized: false };
 
 export const useSettings = create<SettingsState>()(
   persist(
@@ -424,6 +441,14 @@ export const useSettings = create<SettingsState>()(
       audio: defaultAudio,
       desktop: defaultDesktop,
       notifications: defaultNotifications,
+      notificationOverrides: { servers: {}, channels: {} },
+      setNotificationMode: (server, channel, mode) => set((s) => {
+        const overrides = s.notificationOverrides;
+        const choices = { ...(channel === null ? overrides.servers : overrides.channels[server]) };
+        if (mode === null) delete choices[channel === null ? server : String(channel)];
+        else choices[channel === null ? server : String(channel)] = mode;
+        return { notificationOverrides: channel === null ? { ...overrides, servers: choices } : { ...overrides, channels: { ...overrides.channels, [server]: choices } } };
+      }),
       sounds: defaultSounds,
       userVolumes: {},
       bookmarks: [],
@@ -572,13 +597,15 @@ export const useSettings = create<SettingsState>()(
         if (version < 5) p = { ...p, audio: validAudio(p.audio) };
         // v6 adds device-local cues without discarding any earlier preferences.
         if (version < 6) p = { ...p, sounds: readSounds(p.sounds) };
-        // v7 adds the release delay; key codes and every other setting stay intact.
-        return version < 7 ? { ...p, audio: validAudio(p.audio) } : p;
+        if (version < 7) p = { ...p, desktop: { ...defaultDesktop, ...(p.desktop as object ?? {}) }, notificationOverrides: readNotificationOverrides(p.notificationOverrides) };
+        // v8 adds the release delay; key codes and every other setting stay intact.
+        return version < 8 ? { ...p, audio: validAudio(p.audio) } : p;
       },
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
         return { ...current, ...p, onboarding: readOnboarding(p.onboarding), audio: validAudio(p.audio), desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
+          notificationOverrides: readNotificationOverrides(p.notificationOverrides),
           sounds: readSounds(p.sounds),
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,
