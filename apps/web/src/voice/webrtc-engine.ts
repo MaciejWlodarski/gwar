@@ -116,6 +116,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   /** Each routing attempt's token: a late rejection of an older one changes nothing. */
   private routeAttempt = 0;
   private outputReady: Promise<void> = Promise.resolve();
+  private outputRouteFailed = false;
   /** The microphone was lost or never found: one appearing is opened at once. */
   private micMissing = false;
   private followTimer: ReturnType<typeof setTimeout> | null = null;
@@ -928,6 +929,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
             void (async () => {
               try {
                 const output = this.ensureContext();
+                if (this.outputRouteFailed) this.routeOutput();
                 await output.resume();
                 // The media-element sink may still be on speakers while headphones are pending.
                 // A replacement device route must also settle before the sample can start.
@@ -1001,11 +1003,22 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     const ctx = this.ctx;
     const master = this.output;
     if (!ctx || !master) return;
+    this.outputRouteFailed = false;
     master.disconnect();
     this.routedOutputId = id;
     const attempt = ++this.routeAttempt;
     const ctxSink = typeof ctx.setSinkId === "function";
     const elementSink = typeof HTMLMediaElement !== "undefined" && "setSinkId" in HTMLMediaElement.prototype;
+    const ready = (pending: Promise<void>) => {
+      this.outputReady = pending.catch(error => {
+        if (attempt === this.routeAttempt) {
+          this.outputRouteFailed = true;
+          this.routedOutputId = null;
+        }
+        throw new VoiceError("output_failed", error instanceof Error ? error.message : String(error));
+      });
+      void this.outputReady.catch(() => {});
+    };
     // A device that cannot be routed to plays on the default and counts as not routed, so its
     // return routes it again.
     const unrouted = async (error: unknown) => {
@@ -1021,8 +1034,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     if (!id || ctxSink) {
       master.connect(ctx.destination);
       this.sinkElement?.pause();
-      this.outputReady = (ctx.setSinkId?.(id ?? "") ?? Promise.resolve()).catch(unrouted);
-      void this.outputReady.catch(() => {});
+      ready((ctx.setSinkId?.(id ?? "") ?? Promise.resolve()).catch(unrouted));
       return;
     }
     if (elementSink) {
@@ -1033,10 +1045,9 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         this.sinkElement.srcObject = this.streamDest.stream;
       }
       const element = this.sinkElement;
-      this.outputReady = element.setSinkId!(id).then(async () => {
+      ready(element.setSinkId!(id).then(async () => {
         if (attempt === this.routeAttempt) await element.play();
-      }).catch(unrouted);
-      void this.outputReady.catch(() => {});
+      }).catch(unrouted));
       return;
     }
     master.connect(ctx.destination);

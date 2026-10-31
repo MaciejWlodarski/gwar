@@ -10,6 +10,7 @@ export const en = {
   "audio.listenHint": "3 s recording. Use headphones.",
   "audio.recording": "Speak now…",
   "audio.preparing": "Preparing…",
+  "audio.previewRetry": "Retry microphone preview",
   "audio.playing": "Playing…",
   "audio.listenInCall": "Leave voice to test your microphone.",
   "audio.listenMuted": "Unmute to test your microphone.",

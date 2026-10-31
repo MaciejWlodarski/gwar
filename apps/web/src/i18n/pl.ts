@@ -12,6 +12,7 @@ export const pl: Record<Key, string> = {
   "audio.listenHint": "3 s nagrania. Użyj słuchawek.",
   "audio.recording": "Mów teraz…",
   "audio.preparing": "Przygotowywanie…",
+  "audio.previewRetry": "Ponów podgląd mikrofonu",
   "audio.playing": "Odsłuch…",
   "audio.listenInCall": "Opuść rozmowę, aby zrobić test.",
   "audio.listenMuted": "Włącz mikrofon, aby zrobić test.",

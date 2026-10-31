@@ -26,7 +26,7 @@ try {
           const box = await dialog.boundingBox();
           assert.ok(box.x >= 0 && box.y >= 0 && box.x + box.width <= width + 1 && box.y + box.height <= height + 1, `${name}: dialog outside viewport`);
         }
-        if (["settings", "recording", "preparing", "playing", "restored-preview"].includes(name)) {
+        if (["settings", "recording", "preparing", "playing", "restored-preview", "retried-preview"].includes(name)) {
           const fits = await page.locator("[data-mic-playback] [role=status]").evaluate(el => {
             const range = document.createRange(); range.selectNodeContents(el);
             const rects = [...range.getClientRects()], box = el.getBoundingClientRect();
@@ -112,6 +112,16 @@ try {
       await shutdown.scrollIntoViewIfNeeded();
       assert.ok(await page.evaluate(() => window.fixtureTracks.every(t => t.readyState === "ended")));
       await shot("capture-error");
+      const retry = page.getByRole("button", { name: "Ponów podgląd mikrofonu", exact: true });
+      await retry.waitFor();
+      assert.ok(await page.evaluate(() => {
+        window.dispatchEvent(new Event("blur")); window.dispatchEvent(new Event("focus"));
+        return window.fixtureTracks.every(t => t.readyState === "ended");
+      }), "Timeout automatically reopened capture on focus");
+      await retry.click();
+      await page.waitForFunction(() => window.fixtureTracks.filter(track => track.readyState === "live").length === 1 && Number(document.querySelector('[role=meter]')?.getAttribute("aria-valuenow")) >= 50);
+      assert.equal(await page.evaluate(() => window.fixtureReplays.length), 0, "Silent preview retry played a sample");
+      await shot("retried-preview");
       await context.close();
     }
   }

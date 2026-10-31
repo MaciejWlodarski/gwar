@@ -312,3 +312,91 @@ it("restores the silent meter after Stop test without restarting audible playbac
   expect(voice.startMicTest).toHaveBeenCalledTimes(3);
   expect(voice.startMicTest.mock.calls[2]![2]).toBeUndefined();
 });
+
+it("offers an explicit silent preview retry after unconfirmed native capture shutdown", async () => {
+  await mount();
+  await act(async () => button("Hear yourself").click());
+  const [, signal, playback] = voice.startMicTest.mock.calls[1]!;
+  await act(async () => playback!.error(new VoiceError("mic_stop_failed", "Shutdown timed out")));
+  expect(signal!.aborted).toBe(true);
+  expect(voice.startMicTest).toHaveBeenCalledTimes(2);
+  expect(button("Retry microphone preview")).toBeDefined();
+  await act(async () => button("Retry microphone preview").click());
+  expect(voice.startMicTest).toHaveBeenCalledTimes(3);
+  expect(voice.startMicTest.mock.calls[2]![2]).toBeUndefined();
+  expect(container.querySelector('[role="alert"]')).toBeNull();
+  await act(async () => voice.startMicTest.mock.calls[2]![0](0.65));
+  expect(meter().getAttribute("aria-valuenow")).toBe("65");
+  await act(async () => playback!.error(new VoiceError("mic_stop_failed", "Obsolete timeout")));
+  expect(button("Retry microphone preview")).toBeUndefined();
+  expect(voice.startMicTest).toHaveBeenCalledTimes(3);
+});
+
+it("requires a deliberate retry after timeout despite focus, settings, voice and page transitions", async () => {
+  await mount();
+  await act(async () => button("Hear yourself").click());
+  await act(async () => voice.startMicTest.mock.calls[1]![2]!.error(new VoiceError("mic_stop_failed", "Shutdown timed out")));
+  await act(async () => {
+    window.dispatchEvent(new Event("blur"));
+    window.dispatchEvent(new Event("focus"));
+    visibility = "hidden"; document.dispatchEvent(new Event("visibilitychange"));
+    visibility = "visible"; document.dispatchEvent(new Event("visibilitychange"));
+    useSettings.getState().setAudio({ inputDeviceId: "replacement", noiseSuppression: false });
+    useVoice.setState({ state: "starting" }); useVoice.setState({ state: "idle" });
+    useUi.getState().setSection("home"); useUi.getState().openSettings("audio");
+  });
+  expect(voice.startMicTest).toHaveBeenCalledTimes(2);
+  await act(async () => root.unmount());
+  root = createRoot(container);
+  await mount();
+  expect(voice.startMicTest).toHaveBeenCalledTimes(2);
+  expect(button("Retry microphone preview")).toBeDefined();
+  await act(async () => button("Retry microphone preview").click());
+  expect(voice.startMicTest).toHaveBeenCalledTimes(3);
+  expect(voice.startMicTest.mock.calls[2]![2]).toBeUndefined();
+});
+
+it.each(["blur", "hidden", "mute", "deafen", "voice"])("refuses a silent preview retry while %s and never retries on return", async gate => {
+  await mount();
+  await act(async () => button("Hear yourself").click());
+  await act(async () => voice.startMicTest.mock.calls[1]![2]!.error(new VoiceError("mic_stop_failed", "Shutdown timed out")));
+  await act(async () => {
+    if (gate === "blur") window.dispatchEvent(new Event("blur"));
+    if (gate === "hidden") { visibility = "hidden"; document.dispatchEvent(new Event("visibilitychange")); }
+    if (gate === "mute") useVoice.setState({ muted: true });
+    if (gate === "deafen") useVoice.setState({ deafened: true });
+    if (gate === "voice") useVoice.setState({ state: "starting" });
+  });
+  expect(button("Retry microphone preview").disabled).toBe(["mute", "deafen", "voice"].includes(gate));
+  await act(async () => button("Retry microphone preview").click());
+  expect(voice.startMicTest).toHaveBeenCalledTimes(2);
+  await act(async () => {
+    visibility = "visible"; document.dispatchEvent(new Event("visibilitychange"));
+    window.dispatchEvent(new Event("focus"));
+    useVoice.setState({ state: "idle", muted: false, deafened: false });
+  });
+  expect(voice.startMicTest).toHaveBeenCalledTimes(2);
+  await act(async () => button("Retry microphone preview").click());
+  expect(voice.startMicTest).toHaveBeenCalledTimes(3);
+  expect(voice.startMicTest.mock.calls[2]![2]).toBeUndefined();
+});
+
+it.each(["fails", "is cancelled"])("keeps recovery manual when the explicit retry %s before capture opens", async outcome => {
+  await mount();
+  await act(async () => button("Hear yourself").click());
+  await act(async () => voice.startMicTest.mock.calls[1]![2]!.error(new VoiceError("mic_stop_failed", "Shutdown timed out")));
+  const opening = deferred<() => void>();
+  voice.startMicTest.mockReturnValueOnce(opening.promise);
+  await act(async () => button("Retry microphone preview").click());
+  if (outcome === "fails") await act(async () => opening.reject(new VoiceError("mic_failed", "Device still busy")));
+  await act(async () => {
+    window.dispatchEvent(new Event("blur"));
+    window.dispatchEvent(new Event("focus"));
+  });
+  if (outcome === "is cancelled") await act(async () => opening.resolve(() => {}));
+  expect(voice.startMicTest).toHaveBeenCalledTimes(3);
+  expect(button("Retry microphone preview")).toBeDefined();
+  await act(async () => button("Retry microphone preview").click());
+  expect(voice.startMicTest).toHaveBeenCalledTimes(4);
+  expect(voice.startMicTest.mock.calls[3]![2]).toBeUndefined();
+});

@@ -69,3 +69,6 @@ and sample output. The default meter-only preview remains silent. No sample is
 uploaded, written to disk or retained between tests. Output opening/playback
 failures are reported to the matching UI test. `error_kind: "capture_shutdown"`
 distinguishes unacknowledged input shutdown from an output-device failure.
+The settings UI offers an explicit silent-preview retry after capture-shutdown
+failure. Focus, device/settings changes and Settings remounts cannot retry it
+automatically; an eligible user request is required.

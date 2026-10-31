@@ -1,12 +1,17 @@
 import { useEffect, useRef, useState } from "react";
-import type { VoiceEngine } from "../voice/engine";
+import { VoiceError, type VoiceEngine } from "../voice/engine";
 import { useSettings } from "../state/settings";
 import { useUi, useVoice } from "../state/stores";
+
+// Survives Settings remounts without retaining discarded engines. A shutdown timeout
+// requires a deliberate retry, including after focus, device or permission changes.
+const previewRetryRequired = new WeakSet<VoiceEngine>();
 
 /** Page-scoped, local-only capture. Store subscriptions retire it before a call can open capture. */
 export function useMicPreview(engine: VoiceEngine) {
   const [level, setLevel] = useState(0);
   const [needsPermission, setNeedsPermission] = useState(false);
+  const [needsRetry, setNeedsRetry] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const [playback, setPlayback] = useState<"idle" | "recording" | "preparing" | "playing">("idle");
   const request = useRef<() => void>(() => {});
@@ -32,7 +37,10 @@ export function useMicPreview(engine: VoiceEngine) {
       const current = ++generation;
       retire();
       setNeedsPermission(false);
+      setNeedsRetry(previewRetryRequired.has(engine));
       if (!eligible) return;
+      if (previewRetryRequired.has(engine) && !explicit) return;
+      setNeedsRetry(false);
       setError(null);
       if (sample) setPlayback("recording");
       void (async () => {
@@ -57,15 +65,28 @@ export function useMicPreview(engine: VoiceEngine) {
             error: failure => {
               if (generation !== current || capture.signal.aborted) return;
               retire();
+              if (failure instanceof VoiceError && failure.kind === "mic_stop_failed") {
+                previewRetryRequired.add(engine);
+              }
+              setNeedsRetry(previewRetryRequired.has(engine));
               setError(failure);
             },
           } : undefined);
           if (capture.signal.aborted || generation !== current) stop();
-          else capture.signal.addEventListener("abort", stop, { once: true });
+          else {
+            // Failed or cancelled explicit attempts must not re-enable automatic capture.
+            previewRetryRequired.delete(engine);
+            setNeedsRetry(false);
+            capture.signal.addEventListener("abort", stop, { once: true });
+          }
         } catch (failure) {
           if (generation !== current || capture.signal.aborted) return;
           active = null;
           capture.abort();
+          if (failure instanceof VoiceError && failure.kind === "mic_stop_failed") {
+            previewRetryRequired.add(engine);
+          }
+          setNeedsRetry(previewRetryRequired.has(engine));
           setError(failure);
           setPlayback("idle");
           setNeedsPermission(true);
@@ -96,5 +117,5 @@ export function useMicPreview(engine: VoiceEngine) {
     };
   }, [engine]);
 
-  return { level, needsPermission, error, playback, request: () => request.current(), listen: () => listen.current(), stop: () => stop.current() };
+  return { level, needsPermission, needsRetry, error, playback, request: () => request.current(), listen: () => listen.current(), stop: () => stop.current() };
 }

@@ -81,6 +81,20 @@ The reported TeamSpeak attachment/ban failure at `tests/support/mod.rs:112` is t
 attachments and bans. No changes in this PR affect bridge/server startup or that
 test's setup path. No production TeamSpeak connection was used to investigate it.
 
+## Round-three regressions
+
+A capture-shutdown timeout offers an explicit **Retry microphone preview** action.
+It starts only the silent meter and obeys every #204 eligibility gate. Automatic
+preview stays blocked for that engine across focus, settings, voice and page changes,
+including Settings remounts, until an eligible explicit request opens capture.
+Failed or cancelled retries keep automatic capture blocked. A discarded engine
+is not retained by this failure latch. No timer retries a possibly stuck microphone.
+
+An output-routing failure invalidates the route. The next microphone sample makes
+a fresh routing attempt and waits for it before decoding or playing. Both a direct
+default-sink failure and a failed default fallback are covered, without requiring
+a device change or engine restart. Routing errors are identified as output failures.
+
 ## Design scope and review
 
 The app-screen direction is `true-black-flat`, keeping Gwar's existing palette and

@@ -196,7 +196,7 @@ function AudioTab() {
             <Switch checked={automatic} disabled={gateUnsupported} onCheckedChange={(automaticSensitivity) => setAudio({ automaticSensitivity })} label={t("audio.automaticSensitivity")} description={t(gateUnsupported ? "audio.manualUnsupported" : "audio.automaticSensitivityHint")} />
             {automatic ? <div className="flex items-center"><LevelMeter level={level} label={t("audio.level")} /></div> : <InputSensitivity level={level} threshold={audio.vadThreshold} onChange={(vadThreshold) => setAudio({ vadThreshold })} />}
             <div className="flex items-center">
-              {preview.needsPermission ? <Button onClick={preview.request} className="h-8 self-start text-xs">{t("audio.previewEnable")}</Button> : !automatic && !audio.noiseSuppression ? <p className="text-xs text-subtle">{t("audio.noiseSuggestion")}</p> : null}
+              {preview.needsPermission || preview.needsRetry ? <Button disabled={inCall || muted} onClick={preview.request} className="h-8 self-start text-xs">{t(preview.needsRetry ? "audio.previewRetry" : "audio.previewEnable")}</Button> : !automatic && !audio.noiseSuppression ? <p className="text-xs text-subtle">{t("audio.noiseSuggestion")}</p> : null}
             </div>
           </> : <>
             <div className="flex items-center gap-2">

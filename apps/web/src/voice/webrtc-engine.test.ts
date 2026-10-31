@@ -1344,6 +1344,43 @@ it("discards a sample whose decode finishes after cancellation", async () => {
   expect(phase).not.toHaveBeenCalledWith("playing");
 });
 
+it.each([false, true])("retries failed default output routing for the next sample (after fallback=%s)", async fallback => {
+  const retry = deferred<void>();
+  const sink = vi.fn((_id: string) => retry.promise).mockRejectedValueOnce(new Error("Transient route failure"));
+  if (fallback) sink.mockRejectedValueOnce(new Error("Transient default failure"));
+  vi.stubGlobal("AudioContext", class extends Context {
+    setSinkId = sink;
+    createMediaStreamDestination() { return { ...node(), stream: microphone().stream }; }
+    decodeAudioData = async () => ({}) as AudioBuffer;
+  });
+  vi.stubGlobal("MediaRecorder", class {
+    state = "inactive";
+    ondataavailable: ((event: { data: Blob }) => void) | null = null;
+    onstop: (() => void) | null = null;
+    start() { this.state = "recording"; }
+    stop() { this.state = "inactive"; this.ondataavailable?.({ data: new Blob(["sample"]) }); this.onstop?.(); }
+  });
+  if (fallback) await engine.setOutputDevice("headphones");
+  const error = vi.fn();
+  await engine.startMicTest(vi.fn(), undefined, { phase: vi.fn(), error });
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(error).toHaveBeenCalledOnce();
+  expect(cueSources).toHaveLength(0);
+  const failedAttempts = fallback ? 2 : 1;
+  expect(sink).toHaveBeenCalledTimes(failedAttempts);
+  const phase = vi.fn(), nextError = vi.fn();
+  await engine.startMicTest(vi.fn(), undefined, { phase, error: nextError });
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(sink).toHaveBeenCalledTimes(failedAttempts + 1);
+  expect(cueSources).toHaveLength(0);
+  expect(nextError).not.toHaveBeenCalled();
+  expect(phase).toHaveBeenLastCalledWith("preparing");
+  retry.resolve();
+  await flush();
+  expect(cueSources[0]!.start).toHaveBeenCalledOnce();
+  expect(nextError).not.toHaveBeenCalled();
+});
+
 it("keeps browser gain tied to the stable person when receive slots are replaced", () => {
   const gains: Array<ReturnType<typeof vi.fn>> = [];
   vi.stubGlobal("Audio", class { srcObject = null; muted = true; play = async () => {}; });
