@@ -138,6 +138,8 @@ export interface PersonRef {
 }
 
 export type DialogState =
+  | { kind: "inviteReview"; target: InviteTarget }
+  | { kind: "notifications"; channel: number | null; server?: { address: string; kind: ServerKind; insecureLan?: boolean }; name?: string }
   | { kind: "none" }
   | { kind: "addServer"; editId?: string }
   /** A new server group (holding `server` if given), or the group `id` to edit. */
@@ -333,6 +335,7 @@ interface ConnectUi {
   serverName: string | null;
   /** An invite link was opened or pasted: connecting uses it. */
   invite: InviteTarget | null;
+  inviteLaunch: boolean;
   set(patch: Partial<Omit<ConnectUi, "set">>): void;
 }
 
@@ -345,5 +348,6 @@ export const useConnectUi = create<ConnectUi>()((set) => ({
   needPassword: false,
   serverName: null,
   invite: null,
+  inviteLaunch: false,
   set: (patch) => set(patch),
 }));

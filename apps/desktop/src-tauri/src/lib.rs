@@ -4,8 +4,10 @@
 
 pub mod fake_audio;
 mod files;
+mod invites;
 mod screen;
 mod shortcuts;
+mod startup;
 mod tray;
 mod ts;
 mod ts_identity;
@@ -17,6 +19,7 @@ mod webview;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{Manager, WindowEvent};
+use tauri_plugin_deep_link::DeepLinkExt;
 
 /// Debug-only hooks used by automated verification. They are compiled out of
 /// release builds (the commands exist but answer with nothing).
@@ -66,12 +69,20 @@ pub fn run() {
     let builder = tauri::Builder::default()
         // Must be the first plugin: a second launch focuses the running app.
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| tray::show_main(app)))
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all() - tauri_plugin_window_state::StateFlags::VISIBLE,
+                )
+                .build(),
+        )
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_autostart::Builder::new().app_name("Gwar").build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
-        // TODO: tauri-plugin-autostart (launch at login) once there is a setting for it.
+        .manage(startup::Startup::default())
         .manage(voice::Voice::default())
         .manage(shortcuts::Shortcuts::default())
         .manage(ts::Ts::default())
@@ -79,8 +90,22 @@ pub fn run() {
         .manage(tray::CloseToTray(AtomicBool::new(true)))
         .on_permission_request(|_, kind| webview::media_permission(kind))
         .setup(|app| {
+            // Installed AppImages may move; refresh their desktop integration, never a debug binary.
+            #[cfg(all(target_os = "linux", not(debug_assertions)))]
+            if let Err(error) = app.deep_link().register_all() {
+                tracing::warn!("cannot register desktop invitation links: {error}");
+            }
             webview::create_main(app)?;
             tray::install(app.handle())?;
+            let handle = app.handle().clone();
+            app.deep_link().on_open_url(move |_| tray::show_main(&handle));
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let linked = app.deep_link().get_current().ok().flatten().is_some_and(|urls| !urls.is_empty());
+                if startup::minimized(app.handle()) && !linked {
+                    let _ = window.minimize();
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -139,6 +164,11 @@ pub fn run() {
             ts_identity::ts_identity_detect,
             ts_identity::ts_identity_claim,
             ts_identity::ts_identity_export,
+            invites::desktop_invite_links,
+            startup::desktop_startup,
+            startup::desktop_set_startup,
+            tray::desktop_attention,
+            tray::tray_set_badge,
             tray::tray_set_state,
             tray::set_close_to_tray,
             debug::debug_autoconnect,

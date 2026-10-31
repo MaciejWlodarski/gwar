@@ -1,15 +1,16 @@
+import { InviteDetails } from "./InviteReview";
 import { AlertTriangle, CloudCog, ShieldAlert, Ticket } from "lucide-react";
 import { useEffect, useState, type FormEvent } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { addressLabel, pageContextFromLocation, sameOriginUrl } from "../net/address";
-import { parseInviteLink } from "../net/invite";
+import { desktopInviteLink, parseInviteLink } from "../net/invite";
 import { bookmarkParams, controller, describeBan } from "../state/controller";
 import { isDesktop } from "../platform";
 import { useBookmarks, useSettings, type ServerKind } from "../state/settings";
 import { useAccount } from "../state/account";
 import { useConnectUi, useSession, useUi } from "../state/stores";
-import { Avatar, Button, Field, Input, Segmented, Switch, panelCard } from "./kit";
+import { Avatar, Button, Dialog, Field, Input, Segmented, Switch, panelCard } from "./kit";
 import { TeamSpeakBadge } from "./badges";
 import { Wordmark } from "./Brand";
 import { resolveIdentity } from "../connect/ts-list";
@@ -51,6 +52,8 @@ export function ConnectScreen({ card }: { card?: boolean }) {
   const [kind, setKind] = useState<ServerKind>(desktop && !invite?.server ? lastKind : "gwar");
   const [address, setAddress] = useState(invite?.server ? addressLabel(invite.server, pageContextFromLocation()) : lastAddress);
   const [password, setPassword] = useState("");
+  const [inviteDetails, setInviteDetails] = useState(false);
+  const appLink = invite && !desktop && !/Android|iPhone|iPad/i.test(navigator.userAgent) && !(/Macintosh/i.test(navigator.userAgent) && navigator.maxTouchPoints > 1) ? desktopInviteLink(invite) : null;
   const savedInsecureLan = bookmarks.find((b) => sameServer(b, { kind, address, insecureLan: b.insecureLan }))?.insecureLan ?? false;
   const [insecureLan, setInsecureLan] = useState(savedInsecureLan);
   const [advancedInitiallyOpen] = useState(kind === "teamspeak" || savedInsecureLan);
@@ -69,7 +72,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
   // An invite link without a server means "the server on this page's own origin".
   const inviteWithoutServer = !!invite && !invite.server;
   useEffect(() => {
-    if (kind !== "gwar" || (lastAddress && !inviteWithoutServer)) return;
+    if (invite || kind !== "gwar" || (lastAddress && !inviteWithoutServer)) return;
     let alive = true;
     void probeSameOriginServer().then((found) => {
       if (alive && found) setAddress((current) => (inviteWithoutServer ? found : current || found));
@@ -77,12 +80,13 @@ export function ConnectScreen({ card }: { card?: boolean }) {
     return () => {
       alive = false;
     };
-  }, [lastAddress, kind, inviteWithoutServer]);
+  }, [lastAddress, kind, inviteWithoutServer, invite]);
 
   // Opened from an invite link: the server it names replaces whatever was remembered.
   const [seenInvite, setSeenInvite] = useState(invite);
   if (invite !== seenInvite) {
     setSeenInvite(invite);
+    setInviteDetails(false);
     if (invite?.server) {
       setKind("gwar");
       setAddress(addressLabel(invite.server, pageContextFromLocation()));
@@ -97,6 +101,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
       setAddress(pasted.server ? addressLabel(pasted.server, pageContextFromLocation()) : "");
       return;
     }
+    if (invite) useConnectUi.getState().set({ invite: null });
     setAddress(value);
   };
 
@@ -132,6 +137,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
 
   return (
     <main className={cn("relative flex min-w-0 flex-1 flex-col items-center overflow-y-auto bg-surface", card && panelCard)}>
+      {invite && inviteDetails && <Dialog open title={t("connect.inviteDetails")} onOpenChange={setInviteDetails} footer={<Button onClick={() => { useConnectUi.getState().set({ invite: null }); setInviteDetails(false); }}>{t("connect.inviteForget")}</Button>}><InviteDetails target={invite} /></Dialog>}
       <div className="flex w-full flex-1 flex-col items-center justify-center gap-6 px-4 py-8">
         <form
           onSubmit={submit}
@@ -139,23 +145,15 @@ export function ConnectScreen({ card }: { card?: boolean }) {
         >
           <div className="flex flex-col items-center gap-2 pb-1 text-center">
             <Wordmark className="mb-2 h-10 w-auto text-fg" />
-            <h1 className="text-xl font-semibold tracking-tight">{t("connect.title")}</h1>
-            <p className="text-sm text-muted">{t("connect.subtitle")}</p>
+            <h1 className="text-xl font-semibold tracking-tight break-all">{invite && kind === "gwar" ? invite.name || address : t("connect.title")}</h1>
+            {!invite && <p className="text-sm text-muted">{t("connect.subtitle")}</p>}
           </div>
 
           {invite && kind === "gwar" && (
-            <div className="flex items-start gap-2 rounded-lg bg-accent-soft px-3 py-2 text-sm text-fg">
-              <Ticket className="mt-0.5 size-4 shrink-0 text-accent" />
-              <span className="min-w-0 flex-1">
-                {t("connect.invited")}
-                <button
-                  type="button"
-                  onClick={() => useConnectUi.getState().set({ invite: null })}
-                  className="ml-2 cursor-pointer text-xs text-muted underline hover:text-fg"
-                >
-                  {t("connect.inviteForget")}
-                </button>
-              </span>
+            <div className="flex min-h-11 items-center gap-2 rounded-lg bg-accent-soft px-3 py-2 text-sm text-fg" data-testid="invite-banner">
+              <Ticket className="size-4 shrink-0 text-accent" />
+              <span className="min-w-0 flex-1 truncate">{t("connect.invitation")}</span>
+              <button type="button" className="min-h-8 shrink-0 cursor-pointer text-xs underline" aria-label={t("connect.inviteDetails")} onClick={() => setInviteDetails(true)}>{t("common.details")}</button>
             </div>
           )}
 
@@ -240,9 +238,10 @@ export function ConnectScreen({ card }: { card?: boolean }) {
             </div>
           )}
 
-          <Button type="submit" variant="primary" busy={busy} className="w-full">
-            {busy ? t("connect.connecting") : t("connect.submit")}
+          <Button type="submit" variant="primary" busy={busy} className="h-auto min-h-11 w-full py-2 whitespace-normal break-all">
+            {busy ? t("connect.connecting") : invite && kind === "gwar" ? t("connect.joinServer", { server: invite.name || address }) : t("connect.submit")}
           </Button>
+          {appLink && <a href={appLink} className="flex min-h-11 items-center justify-center rounded-lg border border-line px-3 text-center text-sm font-medium hover:bg-hover">{t("connect.openInApp")}</a>}
           {!invite && <Button type="button" disabled={busy} onClick={() => connect(true)} className="h-auto min-h-11 w-full py-2 whitespace-normal text-center">{t("connect.publicServer")}</Button>}
         </form>
 

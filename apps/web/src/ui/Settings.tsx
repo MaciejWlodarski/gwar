@@ -1,3 +1,4 @@
+import { DesktopStartupSettings } from "./DesktopStartupSettings";
 import { SoundSettings } from "./SoundSettings";
 import { Bell, Volume2, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, Settings as SettingsIcon, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
 import { exportIdentityBackup } from "../state/identity-backup";
@@ -375,6 +376,7 @@ function AppearanceTab() {
       </Section>
       {isDesktop() && (
         <Section title={t("desktop.window")}>
+          <DesktopStartupSettings />
           <Switch
             checked={desktop.closeToTray}
             onCheckedChange={(closeToTray) => setDesktop({ closeToTray })}

@@ -217,3 +217,64 @@ mod tests {
         assert_ne!(base.rgba(), status_icon(false, true).unwrap().rgba());
     }
 }
+
+/// Message attention is independent of notification permission, but honors the same scoped rules.
+#[tauri::command]
+pub fn desktop_attention(app: AppHandle) {
+    if let Some(window) = app.get_webview_window("main")
+        && (!window.is_focused().unwrap_or(true) || !window.is_visible().unwrap_or(true))
+    {
+        let _ = window.request_user_attention(Some(tauri::UserAttentionType::Informational));
+    }
+}
+
+#[tauri::command]
+pub fn tray_set_badge(app: AppHandle, count: u32) {
+    if let Some(window) = app.get_webview_window("main") {
+        #[cfg(not(windows))]
+        let _ = window.set_badge_count(if count == 0 { None } else { Some(i64::from(count)) });
+        #[cfg(windows)]
+        let _ = window.set_overlay_icon(if count == 0 { None } else { Some(badge_icon(count)) });
+        if count == 0 {
+            let _ = window.request_user_attention(None);
+        }
+    }
+}
+
+/// Windows taskbar overlays are 16 px. Display 1–9, then +, legibly at native scale.
+#[cfg(any(windows, test))]
+fn badge_icon(count: u32) -> Image<'static> {
+    const DIGITS: [[u8; 5]; 10] = [
+        [2, 6, 2, 2, 7],
+        [7, 1, 7, 4, 7],
+        [7, 1, 7, 1, 7],
+        [5, 5, 7, 1, 1],
+        [7, 4, 7, 1, 7],
+        [7, 4, 7, 5, 7],
+        [7, 1, 1, 1, 1],
+        [7, 5, 7, 5, 7],
+        [7, 5, 7, 1, 7],
+        [0, 2, 7, 2, 0],
+    ];
+    let rows = DIGITS[count.clamp(1, 10) as usize - 1];
+    let mut rgba = vec![0; 16 * 16 * 4];
+    for y in 0..16 {
+        for x in 0..16 {
+            let i = (y * 16 + x) * 4;
+            if (x as i32 - 8).pow(2) + (y as i32 - 8).pow(2) <= 64 {
+                rgba[i..i + 4].copy_from_slice(&[210, 65, 55, 255]);
+            }
+            if (5..11).contains(&x) && (3..13).contains(&y) && rows[(y - 3) / 2] & (1 << (2 - (x - 5) / 2)) != 0 {
+                rgba[i..i + 4].copy_from_slice(&[255, 255, 255, 255]);
+            }
+        }
+    }
+    Image::new_owned(rgba, 16, 16)
+}
+
+#[cfg(test)]
+#[test]
+fn badge_has_distinct_counts_and_caps_at_plus() {
+    assert_ne!(badge_icon(1).rgba(), badge_icon(2).rgba());
+    assert_eq!(badge_icon(10).rgba(), badge_icon(1000).rgba());
+}

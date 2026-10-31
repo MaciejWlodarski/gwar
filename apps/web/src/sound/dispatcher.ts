@@ -1,3 +1,5 @@
+import { notifyReason } from "../lib/notify-rules";
+import type { NotificationSettings } from "../state/settings";
 import type { ChatMessage } from "../proto/ChatMessage";
 import type { SessionState } from "../state/types";
 import { myChannelId } from "../state/reducer";
@@ -115,12 +117,13 @@ export class SoundDispatcher {
   }
 
   /** Called only for verified live messages, after the existing authenticity checks. */
-  message(msg: ChatMessage, s: SessionState): void {
+  message(msg: ChatMessage, s: SessionState, preferences?: NotificationSettings): void {
     if (!s.me || msg.author_uid === s.me.uid) return;
     const key = `${s.epoch}:${JSON.stringify(msg.target)}:${msg.author_uid}:${msg.id}`;
     if (this.messages.has(key)) return;
     this.messages.add(key);
     if (this.messages.size > 256) this.messages.delete(this.messages.values().next().value!);
+    if (preferences && !notifyReason(msg, { meUid: s.me?.uid, focused: false, settings: preferences })) return;
     const dm = typeof msg.target === "object" && "client" in msg.target;
     const shown = dm ? s.activeThread === `dm:${msg.author_uid}` : msg.target === "server" ? s.activeThread === "server"
       : "channel" in msg.target && s.activeThread === "channel" && s.viewChannel === msg.target.channel;

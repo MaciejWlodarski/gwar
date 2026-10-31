@@ -39,7 +39,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-global-shortcut = "2"
-tauri-plugin-single-instance = "2"
+tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 tauri-plugin-window-state = "2"
 tauri-plugin-notification = "2.5.1"
 tauri-plugin-dialog = "2"
@@ -48,6 +48,8 @@ tauri-plugin-updater = { version = "2.14", default-features = false, features = 
 tauri-plugin-process = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 open = "5.4.4"
+tauri-plugin-autostart = "2"
+tauri-plugin-deep-link = "2"
 
 [dev-dependencies]
 base64 = "0.22"
