@@ -548,6 +548,24 @@ impl Streams {
         self.streams_tx.values_mut()
     }
 
+    pub(crate) fn deferred_send_at(&self) -> Option<Instant> {
+        self.streams_tx
+            .values()
+            .chain(std::iter::once(&self.probe_tx))
+            .filter_map(StreamTx::send_deferred_until)
+            .min()
+    }
+
+    pub(crate) fn clear_send_deferrals(&mut self) {
+        for stream in self
+            .streams_tx
+            .values_mut()
+            .chain(std::iter::once(&mut self.probe_tx))
+        {
+            stream.defer_send_until(None);
+        }
+    }
+
     pub(crate) fn ssrcs_tx(&self, mid: Mid) -> Vec<(Ssrc, Option<Ssrc>)> {
         self.streams_tx
             .values()
@@ -663,7 +681,7 @@ impl Streams {
                 return Some(queue);
             }
             let mut queue = probe_queue.take()?;
-            queue.use_for_padding = !media_padding;
+            queue.use_for_padding &= !media_padding;
             Some(queue)
         })
     }

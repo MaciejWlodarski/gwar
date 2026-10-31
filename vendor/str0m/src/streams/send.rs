@@ -127,6 +127,9 @@ pub struct StreamTx {
     /// The queue information sampled during the latest pacer update.
     queue_info: Option<QueueSnapshot>,
 
+    /// Retry only this stream when the application's wire credit is exhausted.
+    send_deferred_until: Option<Instant>,
+
     /// Whether this sender is to be unpaced in BWE situations.
     ///
     /// Audio defaults to not being paced.
@@ -319,6 +322,7 @@ impl StreamTx {
             rtp_and_wallclock: None,
             send_queue: SendQueue::new(),
             queue_info: None,
+            send_deferred_until: None,
             unpaced: None,
             resends: VecDeque::new(),
             padding: 0,
@@ -497,6 +501,9 @@ impl StreamTx {
         };
 
         self.send_queue.push(packet);
+        // New originals may fit media credit even while an older repair cannot
+        // fit extras credit. Let the pre-dequeue checks choose between them.
+        self.send_deferred_until = None;
     }
 
     fn padding_enabled(&self) -> bool {
@@ -1224,12 +1231,32 @@ impl StreamTx {
 
         self.queue_info = Some(snapshot);
 
+        let deferred = self.send_deferred_until.is_some_and(|at| now < at);
+        if !deferred {
+            self.send_deferred_until = None;
+        }
+
         QueueState {
             midrid: self.midrid,
             unpaced,
-            use_for_padding,
-            snapshot,
+            use_for_padding: use_for_padding && !deferred,
+            snapshot: if deferred {
+                QueueSnapshot {
+                    created_at: now,
+                    ..Default::default()
+                }
+            } else {
+                snapshot
+            },
         }
+    }
+
+    pub(crate) fn defer_send_until(&mut self, at: Option<Instant>) {
+        self.send_deferred_until = at;
+    }
+
+    pub(crate) fn send_deferred_until(&self) -> Option<Instant> {
+        self.send_deferred_until
     }
 
     fn queue_state_resend(&self, now: Instant) -> Option<QueueSnapshot> {
@@ -1354,11 +1381,13 @@ impl StreamTx {
     pub(crate) fn clear_padding(&mut self) {
         self.padding = 0;
         self.queue_info = None;
+        self.send_deferred_until = None;
     }
 
     pub(crate) fn reset_buffers(&mut self) {
         self.send_queue.clear();
         self.queue_info = None;
+        self.send_deferred_until = None;
         self.rtx_cache.clear();
         self.resends.clear();
         self.padding = 0;

@@ -8,9 +8,16 @@ MID/RID and extensions) and reserves SRTP/IPv6 overhead before choosing a packet
 An exhausted budget leaves original, NACK and padding data queued without
 advancing their sequence numbers or TWCC; eligible media can proceed while a
 repair waits. The gate receives the active bounded probe plan and charges actual
-serialized bytes before send accounting. Its retry deadline gates the pacer's
-timeout instead of spinning on an immediate wake. It survives BWE reset.
-Passing `None` removes the optional gate and clears its pending retry deadline.
+serialized bytes before send accounting. Retry deadlines apply per stream:
+an unaffordable repair or padding queue is temporarily ineligible, while other
+streams can spend available media credit. New originals wake their stream so
+they can pass the existing pre-dequeue checks independently of extras credit.
+The earliest deferred stream supplies a retry wake; deferral never allocates
+sequence numbers or TWCC. Queue statistics still include deferred packets.
+The gate survives BWE reset; resetting buffers/padding or passing `None` clears
+pending deferrals. Fallback probe eligibility also respects its stream's wait.
+The depleted-extras regression checks audio and unrelated video delivery within
+20 ms, a new original on the blocked stream, and eventual repair at 60 ms.
 
 Gwar enables shared wire gating when an audio reservation exists; video-only
 transports have no gate installed and keep their existing cap policy. Ending

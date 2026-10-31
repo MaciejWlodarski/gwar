@@ -6,9 +6,11 @@ Scope: browser capture, protocol/SFU forwarding
 and browser viewer playback. Desktop viewing is deliberately video-only until
 share playback enters the native mixer/AEC reference. Native capture/playback is the separate PR 2 in [share-audio.md](share-audio.md).
 
-**Round 4 is not accepted or pushed.** Local candidate `80bc5dd3` passes the
-unchanged startup gate but fails the requested 20% target-time bound in one of
-eight cases. The exact paired results and stopping point are recorded below.
+Round 4 candidate `80bc5dd3` was pushed by the owner as `ead2fc7a`. Both sides
+pass the unchanged eight-case startup gate. One point estimate crosses a
+sampling step; the owner accepted that the measurements cannot resolve a 20%
+timing difference in that case. The raw observations and sampling limits are
+recorded below. Round 5 changes only per-stream credit deferral and its tests.
 
 All services are local and media is generated. No production Gwar or TeamSpeak
 service, physical microphone, or installed Gwar application was used. Rust
@@ -247,38 +249,51 @@ video sender during the answer; those diagnostic fields are null while this
 publisher holds its video source. Target times and the original assertions
 continue to use actual source, encoder and viewer stats.
 
-### Acceptance failed: local candidate not pushed
+### Round 4 paired observations and sampling resolution
 
 The full unchanged eight-case, 60-second matrix was run against each revision's
 own server/web build, sequentially without competing tests or builds. Both
 sides pass all eight original assertions with zero probe counts and **no CPU
-exemptions**. The requested additional 20% timing bound fails in one case:
+exemptions**. One point estimate exceeds 20%, across a sampling step:
 
-| Case | Main `1e0e6d60` (s) | Local `80bc5dd3` (s) | Change | Within 20% |
+| Case | Main `1e0e6d60` (s) | Candidate `80bc5dd3` (s) | Point-estimate change | Point estimate within 20% |
 |---|---|---|---|---|
 | `vp9-barcode20-0` | 1.093 | 1.076 | -1.5% | yes |
 | `vp9-barcode20-1` | 1.556 | 1.569 | +0.9% | yes |
 | `vp9-busy60-0` | 1.519 | 1.581 | +4.1% | yes |
 | `vp9-busy60-1` | 1.563 | 1.510 | -3.4% | yes |
-| `h264-barcode20-0` | 0.978 | 1.542 | +57.8% | **NO** |
+| `h264-barcode20-0` | 0.978 | 1.542 | +57.8% | crosses one sample |
 | `h264-barcode20-1` | 1.599 | 1.552 | -3.0% | yes |
 | `h264-busy60-0` | 1.596 | 1.582 | -0.9% | yes |
 | `h264-busy60-1` | 1.561 | 1.577 | +1.0% | yes |
 
 
-`h264-barcode20-0` is 57.8% slower (1.542 s against 0.978 s), above the allowed
-1.173 s. This is an acceptance failure, not a passing result with an explanation.
-The runner stops at the first failed pair, so the planned second and third pairs
-were not run. Source `80bc5dd3` remains local; the remote PR head was not changed.
+`screen-startup.mjs` collects source/encoder/viewer stats, then sleeps 500 ms
+between observations. Collection adds variable time, so the actual adjacent
+sample spacing is slightly longer than 500 ms. `firstTargetAt` is the elapsed
+time of the first sampled row with target-sized source, encoded and decoded video;
+it is not an exact timestamp of the transition. The transition is bounded by
+the previous observation and that row, at the resolution of those observations.
+The unchanged size/cadence/probe assertions use the existing full gate.
 
-Two subsequent bounded isolations also failed to remove the H.264 gap. Keeping
+For `h264-barcode20-0`, 1.542 s versus 0.978 s crosses one such sample interval.
+Main itself measured 1.599 s on its second H.264 barcode repetition; both sides
+cluster near the same 1.05/1.55 s observation steps. A +57.8% ratio between these
+sampled timestamps does not establish a +57.8% startup regression, or resolve
+the requested 20% difference at a roughly one-second start. The earlier report
+incorrectly treated that ratio as proof of a timing regression. The unchanged
+gate passes 8/8 on both revisions; the owner accepted the sampling interpretation
+and pushed the candidate as `ead2fc7a`. The original comparison runner stopped after this first
+complete pair, so no second or third complete pairs were run.
+
+Two subsequent bounded isolations returned the same H.264 observation step. Keeping
 video attached while retaining the feedback fix measured 1.567 s. Applying the
 same 4 Mb/s start hint in both offer and answer, still without a video hold,
 measured 1.555 s. Native logs still initialize at 300 kb/s. Neither experiment
 raises the bitrate, changes an assertion or qualifies as a full acceptance run.
 No minimum-rate override or forced-resolution workaround is included.
 
-Canonical acceptance logs/results:
+Canonical comparison logs/results:
 `/tmp/gwar209-r4-final-main-run1.log`,
 `/tmp/gwar209-r4-final-head-run1.log`,
 `/tmp/gwar209-r4-final-main-run1/`,
@@ -287,7 +302,7 @@ Canonical acceptance logs/results:
 The later diagnostic evidence is in `gwar209-r4-nohold-*` and
 `gwar209-r4-localhint-*` under `/tmp/`.
 
-The strict Rust checks still pass together on this local candidate: 1 Mb/s
+The strict Rust checks also passed together on the round 4 candidate: 1 Mb/s
 adversarial voice p99 remains below 10 ms, the 2.5 Mb/s combined release delivers
 all packets with no evictions/drops at 5/10/20/30 ms, and active-BWE startup
 sustains exactly 7.872 Mb/s at 10/20 ms service with no pauses. Generated-audio
@@ -295,6 +310,69 @@ playback, reconnect and receiver renewal pass. The unchanged watch, native-voice
 and Chromium/WebKit screen gates pass. Denoise passes on both engines; WebKit
 measured -79.07 dBFS, so the earlier -27.2 dBFS failure did not recur. Denoise is
 unchanged. All 56 screenshots were refreshed and inspected at this local pin.
+
+## Round 5: repairs cannot block other streams
+
+The remaining review reproducer exhausted extras credit while leaving 1,346 B
+of media credit on a 1 Mb/s transport. A NACK for one 1,100-byte video packet
+then selected the oldest repair repeatedly and set a transport-wide 60 ms retry.
+The session regression `blocked_repair_does_not_hold_other_media_before_twcc`
+failed before the fix: a 160-byte Opus packet waited 62 ms
+(`/tmp/gwar209-r5-before.log`).
+
+Deferral now belongs to the selected stream. Its queued data and statistics are
+retained, but its pacer eligibility waits for credit; other streams remain
+eligible. A new original also wakes the deferred stream, since media credit may
+fit it even while its repair still lacks extras credit. Fallback padding cannot
+override a deferred probe stream. The earliest stream deadline schedules the
+retry; removing the gate or resetting buffers clears the waits. Budget checks
+still precede dequeue, packet/sequence accounting, encryption and TWCC.
+
+After the fix, Opus, unrelated video and a new original on the repair's own
+stream send at their first eligible service tick (0 ms additional wait in the
+1 ms test loop). The repair remains deferred until 60 ms; only the three actual
+originals and eventual repair advance TWCC. All 781 vendored str0m library tests
+pass. The pre-fix/fixed evidence is in `/tmp/gwar209-r5-before.log` and
+`/tmp/gwar209-r5-after.log`.
+
+The production rerun passes 241 screen tests (three full matrices ignored by
+default), 19 local integration tests, and the separately executed 96-case voice
+headroom matrix. At 1 Mb/s, adversarial voice p99 remains 9.048–9.288 ms.
+At 2.5 Mb/s, combined production release delivers all 1,578 video and 1,000
+Opus packets with zero evictions or socket drops at 5/10/20/30 ms service.
+Active-BWE startup sustains exactly 7.872 Mb/s at both 10 and 20 ms service,
+with no pause (final estimates 16.525/18.073 Mb/s). Formatting and Clippy with
+`-D warnings` pass. These retain the voice measurement limits stated above.
+
+The unchanged eight-case startup gate ran sequentially against each revision's
+own server/web artifacts, with Chromium 153.0.8010.12, 60 seconds per case and
+no concurrent tests/builds. Exact main `1e0e6d60` and this fix both pass **8/8**,
+with **zero probes and no CPU exemptions** in every case. Sampled target times:
+
+| Case | Main `1e0e6d60` (s) | Fix (s) | Main / fix gate |
+|---|---:|---:|---|
+| `vp9-barcode20-0` | 1.092 | 1.007 | PASS / PASS |
+| `vp9-barcode20-1` | 1.558 | 1.556 | PASS / PASS |
+| `vp9-busy60-0` | 1.486 | 1.517 | PASS / PASS |
+| `vp9-busy60-1` | 1.486 | 1.587 | PASS / PASS |
+| `h264-barcode20-0` | 1.483 | 1.552 | PASS / PASS |
+| `h264-barcode20-1` | 1.572 | 1.564 | PASS / PASS |
+| `h264-busy60-0` | 1.476 | 1.568 | PASS / PASS |
+| `h264-busy60-1` | 1.568 | 1.547 | PASS / PASS |
+
+Every point estimate in this run is within 20% of main (largest slowdown 6.8%);
+the approximately 500 ms observation step still limits timing precision as
+explained above. No startup implementation or assertion changed in this round.
+The full fresh run is retained in `/tmp/gwar209-r5-startup-main/` and
+`/tmp/gwar209-r5-startup-head/`, with matching `.log` files and the paired
+`/tmp/gwar209-r5-comparison.json`. Rust logs are
+`/tmp/gwar209-r5-{screen,matrix,integration,str0m,fmt,clippy}.log`.
+
+The two old owned node/server leftovers were stopped after checking their
+commands and temporary data paths. After both startup runs, all 15 recorded
+runner/browser descendants and the server/preview groups were confirmed gone.
+The unrelated older mobile-probe server was left alone. The ownership check is
+retained in `/tmp/gwar209-r5-process-cleanup.json`.
 
 
 ## Responsive inspection
@@ -335,7 +413,7 @@ on phones and audio controls stay inside fullscreen.
 - The unchanged generated-audio denoise gate passed in Chromium and WebKit.
   WebKit cleaned the steady input to -79.07 dBFS; the CI -27.2 dBFS failure on
   `46c7d744` did not recur. No denoise implementation or assertion was changed.
-- Vendored str0m: all 780 library tests passed.
+- Vendored str0m: all 781 library tests passed after the round 5 fix.
 - Full web suite after integrating #206/#208/#207: 2,403 tests passed across 155 files. Focused source-switch
   and UI/controller checks also passed.
 
@@ -351,6 +429,7 @@ CARGO_BUILD_JOBS=4 cargo test -p gwar-proto --features ts
 CARGO_BUILD_JOBS=4 cargo test -p gwar-server --no-default-features --lib screen
 CARGO_BUILD_JOBS=4 cargo test -p gwar-server --no-default-features --test screen
 CARGO_BUILD_JOBS=4 cargo test -p gwar-server --no-default-features --lib full_voice_headroom_matrix -- --ignored
+CARGO_BUILD_JOBS=4 cargo test --manifest-path vendor/str0m/Cargo.toml --no-default-features --features rust-crypto --lib
 E2E_BROWSERS=chromium E2E_SCREEN_AUDIO=1 node apps/web/e2e/screen.mjs
 E2E_BROWSERS=chromium,webkit E2E_SCREEN_CANVAS=1 E2E_SCREEN_REQUIRE_H264=1 node apps/web/e2e/screen.mjs
 E2E_BROWSERS=chromium node apps/web/e2e/native-voice.mjs
