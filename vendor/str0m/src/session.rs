@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::Event;
-use crate::bwe::BweKind;
+use crate::bwe::{BweKind, RtpSendGate};
 use crate::bwe_::Bwe;
 use crate::config::KeyingMaterial;
 use crate::config_mod::RtcpReportIntervals;
@@ -101,6 +101,8 @@ pub(crate) struct Session {
     bwe_last_event: Option<(Bitrate, bool)>,
     bwe_padding_bitrate_limit: Option<Bitrate>,
     bwe_egress_pacing: Option<(Bitrate, Bitrate)>,
+    rtp_send_gate: Option<Box<dyn RtpSendGate>>,
+    rtp_gate_at: Option<Instant>,
 
     enable_twcc_feedback: bool,
 
@@ -209,6 +211,8 @@ impl Session {
             bwe_last_event: None,
             bwe_padding_bitrate_limit: None,
             bwe_egress_pacing: None,
+            rtp_send_gate: None,
+            rtp_gate_at: None,
             enable_twcc_feedback: false,
             pacer,
             pacer_control: PacerControl::new(),
@@ -1182,13 +1186,24 @@ impl Session {
         let twcc_enabled = exts.id_of(Extension::TransportSequenceNumber).is_some();
         let twcc = twcc_enabled.then_some(&mut self.twcc);
 
-        let receipt = stream.poll_packet(now, exts, twcc, params, buf)?;
+        let budget = self.rtp_send_gate.as_mut().map(|gate| gate.poll_budget(now, self.pacer.active_probe_rate()));
+        let receipt = if let Some(budget) = budget {
+            stream.poll_packet_with_budget(now, exts, twcc, params, buf, budget.media_bytes, budget.extra_bytes)
+        } else {
+            stream.poll_packet(now, exts, twcc, params, buf)
+        };
+        let Some(receipt) = receipt else {
+            self.rtp_gate_at = budget.map(|b| b.retry_at);
+            return None;
+        };
+        self.rtp_gate_at = None;
 
         let PacketReceipt {
             header,
             seq_no,
             is_padding,
             payload_size,
+            is_extra,
         } = receipt;
 
         trace!(payload_size, is_padding, "Poll RTP: {:?}", header);
@@ -1205,6 +1220,9 @@ impl Session {
         }
 
         let protected = srtp_tx.protect_rtp(buf, &header, *seq_no);
+        if let Some(gate) = &mut self.rtp_send_gate {
+            gate.sent(now, protected.len(), is_extra);
+        }
         // Dedicated egress pacing and its feedback use the same wire-byte unit.
         // Reserve IPv6 + UDP even on IPv4, retaining headroom for both paths.
         let sent_size = if self.bwe_egress_pacing.is_some() {
@@ -1248,7 +1266,8 @@ impl Session {
         let feedback_at = self.regular_feedback_at();
         let nack_at = self.nack_at();
         let twcc_at = self.twcc_at();
-        let pacing_at = self.pacer.poll_timeout();
+        let (pacing_at, pacing_reason) = self.pacer.poll_timeout();
+        let pacing_at = (pacing_at.map(|at| self.rtp_gate_at.map_or(at, |gate| at.max(gate))), pacing_reason);
         let packetize_at = self.medias.iter().filter_map(|m| m.poll_timeout()).min();
         let receive_at = self
             .medias
@@ -1351,6 +1370,11 @@ impl Session {
             bwe.set_egress_pacing(probe);
         }
         self.pacer.set_egress_pacing(media);
+    }
+
+    pub fn set_rtp_send_gate(&mut self, gate: Box<dyn RtpSendGate>) {
+        self.rtp_send_gate = Some(gate);
+        self.rtp_gate_at = None;
     }
 
     pub fn set_bwe_padding_bitrate_limit(&mut self, limit: Option<Bitrate>) {
@@ -1530,6 +1554,7 @@ pub struct PacketReceipt {
     pub seq_no: SeqNo,
     pub is_padding: bool,
     pub payload_size: usize,
+    pub is_extra: bool,
 }
 
 /// Find the PayloadParams for the given Pt, either when the Pt is the main Pt for the Codec or

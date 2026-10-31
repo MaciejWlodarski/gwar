@@ -387,6 +387,22 @@ mod tests {
     }
 
     #[test]
+    fn pre_twcc_probe_plan_changes_cannot_mint_another_wire_burst() {
+        let now = Instant::now();
+        let mut e = Egress::new(now);
+        e.set_estimate(1_000_000, now);
+        e.reserve_audio(1, now);
+        let mut gate = e.send_gate();
+        assert!(gate.poll_budget(now, None).media_bytes >= 1148);
+        gate.sent(now, 1100, false);
+        for probe in [Some(str0m::bwe::Bitrate::bps(2_000_000)), None] {
+            let remaining = gate.poll_budget(now, probe);
+            assert!(remaining.media_bytes < 1148, "a probe plan shares the occupied audio/video wire clock");
+            assert!(remaining.extra_bytes < 1148, "repairs cannot buy another burst either");
+        }
+    }
+
+    #[test]
     fn low_bandwidth_bursts_preserve_voice_with_and_without_video() {
         // Production release and socket guards on a 0.5/1/2 Mbps FIFO. The publisher's
         // admissible pair arrives together every 150 ms, deliberately ahead of voice.

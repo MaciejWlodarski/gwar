@@ -2478,7 +2478,7 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                                         && !g.origin.recovery.lock().expect("recovery lock").pending
                                 })
                         });
-                    if permitted && w.egress.charge(egress::Class::Audio, t.contents.len(), now) {
+                    if permitted && w.egress.charge_paced(egress::Class::Audio, t.contents.len(), now) {
                         send(&t.contents, t.destination);
                     }
                     continue;
@@ -2504,7 +2504,7 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                     None
                 };
                 let expired = original.is_some_and(|(_, _, expired)| expired);
-                if !expired && w.egress.charge(class, t.contents.len(), now) {
+                if !expired && w.egress.charge_paced(class, t.contents.len(), now) {
                     send(&t.contents, t.destination);
                 } else if let Some((lane, key_frame, _)) = original {
                     if expired {
@@ -3525,6 +3525,8 @@ fn watcher(
         return Err(REFUSED);
     }
     let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
+    let egress = Egress::new(now);
+    rtc.bwe().set_rtp_send_gate(egress.send_gate());
     let watcher = Watcher {
         id,
         session,
@@ -3545,7 +3547,7 @@ fn watcher(
         keyframe_at: None,
         keyframes_started: None,
         focus: None,
-        egress: Egress::new(now),
+        egress,
         dropped_lanes: Vec::new(),
         desired: None,
         restarted: None,

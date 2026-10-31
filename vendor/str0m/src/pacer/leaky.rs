@@ -276,6 +276,10 @@ impl LeakyBucketPacer {
         self.probe_queue.front().map(|p| p.config().cluster())
     }
 
+    pub(crate) fn active_probe_rate(&self) -> Option<Bitrate> {
+        self.probe_queue.front().map(|p| p.config().target_bitrate())
+    }
+
     /// Check if the active probe is complete and should be finished.
     pub(crate) fn check_probe_complete(&mut self, now: Instant) -> Option<TwccClusterId> {
         // Check if we have a completed probe from a previous call

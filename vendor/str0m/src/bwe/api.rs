@@ -6,6 +6,26 @@ use crate::{Rtc, rtp_::Mid};
 
 pub use crate::rtp_::Bitrate;
 
+/// Application wire credit, checked before removing RTP from its queue or assigning TWCC.
+#[derive(Debug, Clone, Copy)]
+pub struct RtpSendBudget {
+    /// Available media wire bytes, including SRTP and IPv6/UDP overhead.
+    pub media_bytes: usize,
+    /// Available repair/padding wire bytes, a subset of the same aggregate credit.
+    pub extra_bytes: usize,
+    /// Next budget wake when no queued packet fits.
+    pub retry_at: std::time::Instant,
+}
+
+/// A transport's shared wire budget. Repairs and padding are `extra`; all RTP
+/// shares the same credit. `probe_rate` is the active, already bounded probe plan.
+pub trait RtpSendGate: std::fmt::Debug + Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe {
+    /// Read current credit and the active probe's planned bitrate before dequeue.
+    fn poll_budget(&mut self, now: std::time::Instant, probe_rate: Option<Bitrate>) -> RtpSendBudget;
+    /// Serialized SRTP bytes (the gate accounts for UDP/IP itself).
+    fn sent(&mut self, now: std::time::Instant, bytes: usize, extra: bool);
+}
+
 #[derive(Debug, PartialEq)]
 #[non_exhaustive]
 /// Bandwidth estimation kind.
@@ -98,6 +118,13 @@ impl<'a> Bwe<'a> {
     /// transport would share the limit too.
     pub fn set_egress_pacing(&mut self, media: Bitrate, probe: Bitrate) {
         self.0.session.set_bwe_egress_pacing(media, probe);
+    }
+
+    /// Install an application budget before RTP sequence/TWCC accounting. Exhausted
+    /// credit defers the packet instead of fabricating network loss. The gate survives
+    /// estimator resets; RTCP is unaffected.
+    pub fn set_rtp_send_gate(&mut self, gate: Box<dyn RtpSendGate>) {
+        self.0.session.set_rtp_send_gate(gate);
     }
 
     /// Reset the BWE with a new init_bitrate

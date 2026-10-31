@@ -927,6 +927,33 @@ mod tests {
     }
 
     #[test]
+    fn silent_audio_reservation_preserves_live_bwe_startup() {
+        for cadence in [10, 20] {
+            let mut sim = Sim::new(Some(20_000_000));
+            sim.server_interval = cadence * MS;
+            sim.watch("game", 7_872_000, 60, 200_000, None);
+            sim.w.egress.reserve_audio(1, sim.now);
+            assert!(sim.w.frozen.is_none(), "capacity discovery must use actual TWCC feedback");
+            sim.run(10 * SECOND);
+            assert!(!sim.received.is_empty(), "{cadence} ms: video must start in the first ten seconds");
+            sim.run(20 * SECOND);
+            let payload: usize =
+                sim.received.iter().filter(|(at, ..)| *at >= sim.now - 5 * SECOND).map(|(_, _, _, p)| p.len()).sum();
+            eprintln!(
+                "silent audio: {cadence} ms, estimate={}, video={} bps, changes={:?}",
+                sim.w.egress.estimate(),
+                payload * 8 / 5,
+                sim.changes
+            );
+            assert!(payload * 8 / 5 >= 7_500_000, "{cadence} ms: sustain the in-budget source");
+            assert!(
+                !sim.changes.iter().any(|(_, _, change)| matches!(change, Change::Pause(_))),
+                "{cadence} ms: a lossless open link must not pause"
+            );
+        }
+    }
+
+    #[test]
     fn share_audio_keeps_voice_inside_existing_steady_and_startup_bounds() {
         for interval in [MS, 5 * MS, 10 * MS] {
             for loss in [0.0, 0.01] {
