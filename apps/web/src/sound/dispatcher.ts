@@ -6,8 +6,13 @@ import { CONTROL_CUES as controls, type SoundCue, type SoundSettings } from "./c
 /** One dispatcher per controller. No delayed queue: suppressed bursts never play later. */
 export class SoundDispatcher {
   private last = new Map<string, number>();
+  /** Last confirmed channel, retained during departure only for its confirmation. */
   private channel: number | null = null;
   private recoveryChannel: number | null = null;
+  private pendingMove: { channel: number; lost: boolean } | null = null;
+  private departing = false;
+  /** Same-call transport recovery retains ownership; moves, departures and retirement change it. */
+  private voiceGeneration = 0;
   private messages = new Set<string>();
 
   constructor(
@@ -33,37 +38,65 @@ export class SoundDispatcher {
 
   connected(channel: number | null): void {
     if (channel === null) return;
-    if (this.recoveryChannel === channel) this.cue("reconnected");
-    else if (this.channel !== channel) this.cue("selfJoin");
+    if (this.departing || this.channel !== channel || this.pendingMove !== null) this.voiceGeneration++;
+    if (!this.departing && this.recoveryChannel === channel) this.cue("reconnected");
+    else if (this.departing || this.channel !== channel) this.cue("selfJoin");
     this.channel = channel;
     this.recoveryChannel = null;
+    this.pendingMove = null;
+    this.departing = false;
   }
 
   lost(defer = false): boolean {
-    if (this.channel === null || this.recoveryChannel !== null) return false;
-    this.recoveryChannel = this.channel;
+    if (this.departing) return false;
+    if (this.pendingMove) {
+      if (this.pendingMove.lost) return false;
+      this.pendingMove.lost = true;
+    } else {
+      if (this.channel === null || this.recoveryChannel !== null) return false;
+      this.recoveryChannel = this.channel;
+    }
     if (!defer) this.cue("connectionLost");
     return true;
   }
 
-  left(): void {
-    if (this.channel !== null) this.cue("selfLeave");
-    this.reset();
+  /** Abandon recovery now; only this departure may confirm/reset after media stops. */
+  leaving(): () => void {
+    const generation = ++this.voiceGeneration, audible = this.channel !== null;
+    this.recoveryChannel = null;
+    this.pendingMove = null;
+    this.departing = true;
+    return () => {
+      if (generation !== this.voiceGeneration) return;
+      if (audible) this.cue("selfLeave");
+      this.reset();
+    };
   }
 
-  /** A new channel is a new participation, even if the old transport was recovering. */
-  moving(channel: number): void { if (this.channel !== channel) this.retire(); }
+  left(): void { this.leaving()(); }
+
+  /** Keep transport feedback for an ongoing move, without inheriting the old channel's recovery. */
+  moving(channel: number): void {
+    if (!this.departing && (this.channel === channel || this.pendingMove?.channel === channel)) return;
+    const ongoing = !this.departing && (this.channel !== null || this.pendingMove !== null);
+    this.retire();
+    if (ongoing) this.pendingMove = { channel, lost: false };
+  }
 
   /** Retire voice intent without claiming either a transport loss or a deliberate departure. */
-  retire(channel = this.channel): void {
-    if (channel !== this.channel) return;
+  retire(channel?: number): void {
+    if (channel !== undefined && channel !== this.channel && channel !== this.pendingMove?.channel) return;
+    this.voiceGeneration++;
     this.channel = null;
     this.recoveryChannel = null;
+    this.pendingMove = null;
+    this.departing = false;
   }
 
   reset(): void { this.retire(); this.last.clear(); this.messages.clear(); }
 
-  get awaitingRecovery(): boolean { return this.recoveryChannel !== null; }
+  get generation(): number { return this.voiceGeneration; }
+  get awaitingRecovery(): boolean { return this.recoveryChannel !== null || this.pendingMove?.lost === true; }
 
   /** Welcome/history snapshots never sound like a burst of people joining. */
   session(next: SessionState, before: SessionState): void {

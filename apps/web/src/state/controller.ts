@@ -1301,24 +1301,34 @@ class Controller {
 
   /** Leaves voice but stays on the server (and keeps reading chat). */
   async leaveVoice(): Promise<void> {
-    this.joinAttempt++; // a pending encrypted join gives up
+    const intent = ++this.joinAttempt; // a pending encrypted join gives up
     if (!this.canLeaveVoice) return;
+    const conn = this.conn, generation = this.sounds.generation;
+    const current = () => this.conn === conn && this.joinAttempt === intent;
+    const finish = async () => {
+      // A late acknowledgement must not stop a newer channel's media either.
+      if (!current() || generation !== this.sounds.generation) return;
+      const left = this.sounds.leaving();
+      const stopped = this.stopVoice(), run = this.voiceRun;
+      await stopped;
+      if (!current() || run !== this.voiceRun) return;
+      left();
+      useUi.getState().dismissToast("voice-closed");
+    };
     const rejoining = this.rejoin !== null;
     this.rejoin = null;
     void this.screen.stopShare(); // also cancels a republish before screen.start answers
     if (useSession.getState().phase === "reconnecting") {
-      await this.stopVoice();
-      this.sounds.left();
+      await finish();
       return;
     }
     if (myChannelId(useSession.getState()) === null && !rejoining) {
-      await this.stopVoice();
-      this.sounds.left();
+      await finish();
       return;
     }
     const ok = await this.attempt(this.connection.request("channel.leave", {}));
     // The server's client.updated follows; do not wait for it to release the microphone.
-    if (ok) { await this.stopVoice(); this.sounds.left(); useUi.getState().dismissToast("voice-closed"); }
+    if (ok) await finish();
   }
 
   private async rejoinVoice(channel: number): Promise<void> {
@@ -1405,7 +1415,8 @@ class Controller {
   }
 
   private voiceChannelRemoved(): void {
-    this.sounds.retire();
+    const channel = this.voiceRetryChannel ?? myChannelId(useSession.getState());
+    this.sounds.retire(channel ?? undefined);
     this.voiceRetryChannel = null;
     useUi.getState().toast("info", tNow("voice.channelRemoved"), { key: "voice-closed", sticky: true });
   }

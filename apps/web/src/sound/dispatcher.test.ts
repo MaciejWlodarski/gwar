@@ -61,6 +61,39 @@ describe("voice lifecycle", () => {
     expect(heard()).toEqual(["selfJoin", "connectionLost", "selfJoin"]);
     expect(d.awaitingRecovery).toBe(false);
   });
+  it.each([1, 2])("S5 keeps pending-move losses audible without reviving A's recovery (connected channel %s)", channel => {
+    d.connected(1); tick(); d.lost(); tick(); d.moving(2);
+    expect(d.awaitingRecovery).toBe(false);
+    expect(d.lost()).toBe(true); expect(d.lost()).toBe(false);
+    tick(); d.connected(channel);
+    expect(heard()).toEqual(["selfJoin", "connectionLost", "connectionLost", "selfJoin"]);
+  });
+  it("keeps first-time joins and terminally retired pending moves out of recovery", () => {
+    d.moving(1); expect(d.lost()).toBe(false);
+    d.connected(1); tick(); d.moving(2); d.retire(2);
+    expect(d.lost()).toBe(false);
+    d.connected(2);
+    expect(heard()).toEqual(["selfJoin", "selfJoin"]);
+  });
+  it("retiring A does not retire its pending move to B", () => {
+    d.connected(1); tick(); d.moving(2); d.retire(1);
+    expect(d.lost()).toBe(true);
+    tick(); d.connected(2);
+    expect(heard()).toEqual(["selfJoin", "connectionLost", "selfJoin"]);
+  });
+  it("S6 makes a departure completion unable to reset a new participation in the same channel", () => {
+    d.connected(2); tick(); d.lost(); tick();
+    const left = d.leaving();
+    expect(d.awaitingRecovery).toBe(false);
+    d.connected(2); tick(); left(); tick(); d.lost();
+    expect(heard()).toEqual(["selfJoin", "connectionLost", "selfJoin", "connectionLost"]);
+  });
+  it("confirms a current departure only once and ignores transport teardown as a loss", () => {
+    d.connected(2); tick(); const left = d.leaving();
+    expect(d.lost()).toBe(false);
+    left(); tick(); left();
+    expect(heard()).toEqual(["selfJoin", "selfLeave"]);
+  });
   it("remembers recovery even when teardown defers the lost sound", () => {
     d.connected(2); tick(); expect(d.lost(true)).toBe(true); expect(d.lost()).toBe(false);
     d.connected(2);

@@ -52,6 +52,9 @@ exporter validates every timbre before writing any files and reports an invalid 
   Recovery belongs to the original channel and ends on explicit Leave, channel
   removal, a move, or a terminal refusal. Refusals do not sound like transport
   failures. Automatic certificate renewal stays silent when voice returns.
+  An accepted move still reports real transport loss before the target first
+  connects; that first connection confirms joining the target. A delayed Leave
+  completion cannot announce leaving, or reset cues for, a newer call.
 - Verified live mentions and DMs sound unless their conversation is already
   visible and focused. Own messages, history, edits, rejected messages, and
   duplicate deliveries do not sound. Sound switches are independent of system
