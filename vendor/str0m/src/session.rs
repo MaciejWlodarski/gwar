@@ -1386,8 +1386,8 @@ impl Session {
         self.pacer.set_egress_pacing(media);
     }
 
-    pub fn set_rtp_send_gate(&mut self, gate: Box<dyn RtpSendGate>) {
-        self.rtp_send_gate = Some(gate);
+    pub fn set_rtp_send_gate(&mut self, gate: Option<Box<dyn RtpSendGate>>) {
+        self.rtp_send_gate = gate;
         self.rtp_gate_at = None;
     }
 

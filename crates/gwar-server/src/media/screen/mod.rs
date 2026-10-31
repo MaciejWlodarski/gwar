@@ -791,6 +791,15 @@ struct Watcher {
 }
 
 impl Watcher {
+    fn reserve_audio(&mut self, count: usize, now: Instant) {
+        let was_active = self.egress.has_audio();
+        self.egress.reserve_audio(count, now);
+        if was_active != self.egress.has_audio() {
+            let gate = self.egress.has_audio().then(|| self.egress.send_gate());
+            self.rtc.bwe().set_rtp_send_gate(gate);
+        }
+    }
+
     fn wake(&self) -> Instant {
         let mut at = self.egress.wake().map_or(self.deadline, |wake| self.deadline.min(wake));
         for audio in &self.audio {
@@ -3526,7 +3535,6 @@ fn watcher(
     }
     let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
     let egress = Egress::new(now);
-    rtc.bwe().set_rtp_send_gate(egress.send_gate());
     let watcher = Watcher {
         id,
         session,
@@ -6667,6 +6675,7 @@ pub(crate) mod tests {
     #[test]
     fn silent_legacy_shares_do_not_pay_for_unused_audio_slots() {
         let mut pair = Pair::new();
+        assert!(!pair.w.egress.has_wire_gate(), "video-only must not install an added gate");
         let origin = ScreenOrigin::new(2, "legacy".into(), 1, false, false, 8_000_000);
         assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
         let mid = pair.w.slots[0].mid;
@@ -6674,11 +6683,14 @@ pub(crate) mod tests {
         let before = pair.w.egress.plan();
         audio::reserve(&mut pair.w, pair.now);
         assert_eq!(pair.w.egress.plan(), before);
+        assert!(!pair.w.egress.has_wire_gate(), "unused audio receivers must not install an added gate");
         origin.has_audio.store(true, Ordering::Relaxed);
         audio::reserve(&mut pair.w, pair.now);
         assert_eq!(pair.w.egress.plan(), before - audio::WIRE_BPS as f64);
+        assert!(pair.w.egress.has_wire_gate());
         origin.has_audio.store(false, Ordering::Relaxed);
         audio::reserve(&mut pair.w, pair.now);
         assert_eq!(pair.w.egress.plan(), before);
+        assert!(!pair.w.egress.has_wire_gate(), "ending audio removes the added gate");
     }
 }

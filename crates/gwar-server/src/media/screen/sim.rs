@@ -932,7 +932,7 @@ mod tests {
             let mut sim = Sim::new(Some(20_000_000));
             sim.server_interval = cadence * MS;
             sim.watch("game", 7_872_000, 60, 200_000, None);
-            sim.w.egress.reserve_audio(1, sim.now);
+            sim.w.reserve_audio(1, sim.now);
             assert!(sim.w.frozen.is_none(), "capacity discovery must use actual TWCC feedback");
             sim.run(10 * SECOND);
             assert!(!sim.received.is_empty(), "{cadence} ms: video must start in the first ten seconds");
@@ -965,7 +965,7 @@ mod tests {
                 sim.share_audio = 2;
                 sim.join("a", 3_000_000, 30, 150_000, 8_000_000);
                 sim.join("b", 3_000_000, 30, 150_000, 8_000_000);
-                sim.w.egress.reserve_audio(2, sim.now);
+                sim.w.reserve_audio(2, sim.now);
                 sim.run(60 * SECOND);
                 sim.voice_queue.sort();
                 let p99 = sim.voice_queue[sim.voice_queue.len() * 99 / 100];

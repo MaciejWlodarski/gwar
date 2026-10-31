@@ -128,8 +128,8 @@ impl<'a> Bwe<'a> {
 
     /// Install an application budget before RTP sequence/TWCC accounting. Exhausted
     /// credit defers the packet instead of fabricating network loss. The gate survives
-    /// estimator resets; RTCP is unaffected.
-    pub fn set_rtp_send_gate(&mut self, gate: Box<dyn RtpSendGate>) {
+    /// estimator resets; RTCP is unaffected. `None` removes the optional gate.
+    pub fn set_rtp_send_gate(&mut self, gate: Option<Box<dyn RtpSendGate>>) {
         self.0.session.set_rtp_send_gate(gate);
     }
 

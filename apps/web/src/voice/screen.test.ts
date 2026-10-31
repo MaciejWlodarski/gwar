@@ -68,7 +68,7 @@ class Peer {
   ontrack: ((ev: unknown) => void) | null = null;
   close = vi.fn();
   sendParams: Array<RTCRtpSendParameters> = [];
-  transceivers: Array<{ direction: string; init: RTCRtpTransceiverInit; setCodecPreferences: ReturnType<typeof vi.fn>; setHeaderExtensionsToNegotiate: ReturnType<typeof vi.fn>; receiver: Record<string, unknown>; sender: { getParameters: () => RTCRtpSendParameters; setParameters: ReturnType<typeof vi.fn> } }> = [];
+  transceivers: Array<{ direction: string; init: RTCRtpTransceiverInit; setCodecPreferences: ReturnType<typeof vi.fn>; setHeaderExtensionsToNegotiate: ReturnType<typeof vi.fn>; receiver: Record<string, unknown>; sender: { getParameters: () => RTCRtpSendParameters; setParameters: ReturnType<typeof vi.fn>; replaceTrack: ReturnType<typeof vi.fn> } }> = [];
   /** What `getParameters().codecs` reports: the negotiated codecs. */
   codecs: RTCRtpCodecParameters[] = [];
   stats = new Map<string, Record<string, unknown>>([["out", { type: "outbound-rtp", kind: "video", framesEncoded: 1 }]]);
@@ -82,6 +82,7 @@ class Peer {
     const sender = {
       getParameters: () => ({ transactionId: `t${++transaction}`, encodings: [{ ...init.sendEncodings?.[0] }], codecs: this.codecs, headerExtensions: [], rtcp: {} }),
       setParameters: vi.fn(async (p: RTCRtpSendParameters) => { this.sendParams.push(p); }),
+      replaceTrack: vi.fn(async (_track: MediaStreamTrack | null) => {}),
     };
     const extensions = [{ uri: "urn:ietf:params:rtp-hdrext:sdes:mid", direction: "sendrecv" }, { uri: DEPENDENCY_DESCRIPTOR, direction: "stopped" }];
     const t = { direction: init.direction!, init, setCodecPreferences: vi.fn(), getHeaderExtensionsToNegotiate: () => extensions.map(e => ({ ...e })), setHeaderExtensionsToNegotiate: vi.fn(),
@@ -3172,6 +3173,59 @@ describe("share audio", () => {
     await publisher.recover({ share: "A", codec: "h264", width: 1280, height: 720, fps: 30 });
     expect(Peer.all[1]?.transceivers).toHaveLength(2);
     expect(Peer.all[1]?.transceivers[1]?.init.sendEncodings?.[0]?.priority).toBe("very-low");
+    publisher.close();
+  });
+
+  it.each(["\r\n", "\n"])("keeps reserved audio out of video capacity feedback (%j)", async newline => {
+    const original = Peer.offerSdp;
+    const video = ["m=video 9 X 98", "a=sendonly", "a=mid:0", "a=ssrc-group:FID 10 11", "a=ssrc:10 cname:share", "a=ssrc:11 cname:share", "a=extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01", "a=rtcp-fb:98 transport-cc", ""].join(newline);
+    const sound = ["m=audio 9 X 111", "a=sendonly", "a=mid:1", "a=ssrc:12 cname:share", "a=rtpmap:111 opus/48000/2", "a=fmtp:111 minptime=10;useinbandfec=1", "a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time", "a=extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01", "a=rtcp-fb:111 transport-cc", ""].join(newline);
+    Peer.offerSdp = `v=0${newline}${video}${sound}`;
+    const publisher = new ScreenPublisher({ track: { readyState: "live" } as MediaStreamTrack, audio: { readyState: "live" } as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
+    try {
+      await publisher.start();
+      const offer = Peer.all[0]!.localDescription!.sdp!;
+      expect(offer).toContain(video);
+      const audio = offer.slice(offer.indexOf("m=audio "));
+      expect(audio).not.toContain("transport-wide-cc");
+      expect(audio).not.toContain("transport-cc");
+      for (const line of ["a=mid:1", "a=ssrc:12 cname:share", "a=rtpmap:111 opus/48000/2", "a=fmtp:111 minptime=10;useinbandfec=1", "a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"]) expect(audio).toContain(line);
+    } finally { publisher.close(); Peer.offerSdp = original; }
+  });
+
+  it("holds bundled video input until the connected transport has its negotiated allocation", async () => {
+    const track = { readyState: "live" } as MediaStreamTrack;
+    const audio = { readyState: "live" } as MediaStreamTrack;
+    const publisher = new ScreenPublisher({ track, audio, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!, sender = pc.transceivers[0]!.sender;
+    expect(sender.replaceTrack.mock.calls).toEqual([[null]]);
+    expect(pc.sendParams.at(-1)?.encodings[0]?.maxBitrate).toBe(7_872_000);
+    pc.connectionState = "connected"; pc.onconnectionstatechange?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sender.replaceTrack.mock.calls).toEqual([[null], [track]]);
+    publisher.close();
+  });
+
+  it("never reattaches a bundled video source after its publisher closes", async () => {
+    const track = { readyState: "live" } as MediaStreamTrack;
+    const publisher = new ScreenPublisher({ track, audio: { readyState: "live" } as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!, changed = pc.onconnectionstatechange, sender = pc.transceivers[0]!.sender;
+    expect(sender.replaceTrack).toHaveBeenCalledWith(null);
+    publisher.close();
+    pc.connectionState = "connected"; changed?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sender.replaceTrack.mock.calls).toEqual([[null]]);
+  });
+
+  it("keeps the video-only publisher's source attached through negotiation", async () => {
+    const publisher = new ScreenPublisher({ track: { readyState: "live" } as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!;
+    pc.connectionState = "connected"; pc.onconnectionstatechange?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pc.transceivers[0]!.sender.replaceTrack).not.toHaveBeenCalled();
     publisher.close();
   });
 

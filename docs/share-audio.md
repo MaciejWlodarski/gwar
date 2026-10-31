@@ -27,6 +27,27 @@ and platform implementations that misreport their capture source cannot be
 excluded by Gwar's tab selection. Physical speaker/headphone AEC measurements
 are separate from generated-audio transport tests.
 
+## Publisher startup
+
+With bundled audio, Chromium can construct the video encoder at its temporary
+300 kb/s default before the transport activates the existing negotiated 4 Mb/s
+start allocation. Feeding native frames during that interval applies bandwidth
+resolution reductions that take seconds to recover. After making the offer,
+the publisher detaches video input until the transport is connected and its
+sender parameters have completed, then reattaches the same captured track.
+The offered SSRCs, capture lifetime, start hint, congestion response and audio
+priority stay intact. A stale or closed publisher cannot reattach its source.
+Video-only publishers keep their existing negotiation/input path.
+
+Share Opus is fixed at a 64 kb/s ceiling and priced at 128 kb/s including wire
+overhead in every publisher video/uplink budget. The publisher negotiates
+transport-wide congestion feedback for video only. Including sparse share-audio
+packets in that feedback depressed measured video capacity in the mixed
+transport; the fixed audio allowance already accounts for their load. Audio
+retains its RTCP clock reports, CNAME, RTP identity and other extensions. Voice
+has its own unchanged feedback and transport; viewer audio still enters the
+SFU's aggregate release and wire pacing.
+
 ## Compatibility
 
 `screen.audio.capabilities {}` returns `{ "screen_audio": true }`. It is a
@@ -91,6 +112,10 @@ share audio and never sends it through voice processing or sound cues.
   separate audio allowance cannot buy an additional wire burst;
   repairs/probes retain their own cap too. Voice headroom is unchanged. Expired
   sound drops and never raises the probe target.
+- A video-only watch has no audio reservation and no optional wire gate
+  installed, including when its transport negotiated unused audio receivers.
+  Starting audio installs the gate; ending its final audio reservation removes
+  it and its pending retry deadline.
 - Each negotiated audio/video pair shares one SDP stream ID and RTCP CNAME,
   with separate track IDs. Audio uses stable source sequence/timestamp offsets.
   Publisher sender reports map both source clocks through one common NTP anchor;

@@ -547,6 +547,21 @@ export function publishSsrcs(sdp: string): { ssrc: number; rtx_ssrc: number } | 
   return valid(ssrc) && valid(rtx) && ssrc !== rtx ? { ssrc, rtx_ssrc: rtx } : null;
 }
 
+/** Fixed-rate share sound is already priced in video's uplink budget. Use
+ * video's transport feedback for that budget, keeping audio's clock reports,
+ * identity and other extensions intact. This applies only to screen publishing.
+ */
+function withReservedAudio(sdp: string): string {
+  const newline = sdp.includes("\r\n") ? "\r\n" : "\n";
+  return sdp.split(/(?=^m=)/m).map(section => {
+    if (!/^m=audio /m.test(section)) return section;
+    return section.split(/\r?\n/).filter(line =>
+      !/^a=rtcp-fb:(?:\d+|\*) transport-cc(?:\s|$)/.test(line) &&
+      !(line.startsWith("a=extmap:") && line.includes("transport-wide-cc-extensions")),
+    ).join(newline);
+  }).join("");
+}
+
 function rtcConfig(iceServers: IceServer[]): RTCConfiguration {
   return {
     iceServers: iceServers.map(s => ({ urls: s.urls, ...(s.username ? { username: s.username } : {}), ...(s.credential ? { credential: s.credential } : {}) })),
@@ -744,7 +759,8 @@ export class ScreenPublisher {
     });
     this.sender = transceiver.sender;
     const audio = this.params.audio;
-    if (audio?.readyState === "live") {
+    const sharingAudio = audio?.readyState === "live";
+    if (sharingAudio) {
       pc.addTransceiver(audio, { direction: "sendonly", sendEncodings: [{ maxBitrate: 64_000, priority: "very-low", networkPriority: "very-low" }] });
     }
     this.params.audioState?.(audio?.readyState === "live");
@@ -755,11 +771,22 @@ export class ScreenPublisher {
     this.sendCodec = null; this.softwareAv1 = 0;
     preferCodecs(transceiver, "send", recovery?.codec === "vp9" ? "vp9" : undefined, av1);
     if (av1) negotiateDescriptor(transceiver, "sendonly");
-    await pc.setLocalDescription(await pc.createOffer());
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(sharingAudio ? { ...offer, sdp: withReservedAudio(offer.sdp ?? "") } : offer);
     if (this.closed || this.pc !== pc) return;
     const sdp = pc.localDescription?.sdp ?? "";
     const ssrcs = publishSsrcs(sdp);
     if (!ssrcs) throw new Error("the publish offer has no video stream with RTX");
+    // A bundled audio sender creates the encoder before the transport's start
+    // allocation is active. Feeding frames then makes Chromium adapt from its
+    // temporary 300 kb/s default, even though the negotiated hint is 4 Mb/s.
+    // Keep the offered identity, but wait for the connected allocation and our
+    // parameters before giving that encoder video. Video-only keeps its path.
+    let heldVideo = sharingAudio;
+    if (heldVideo) {
+      await transceiver.sender.replaceTrack(null);
+      if (this.closed || this.pc !== pc) return;
+    }
     const answer = this.avoidBroken(await this.params.offer({ ...ssrcs, sdp }));
     if (this.closed || this.pc !== pc) return;
     // Resolve the latest spec after signalling, including edits made while the answer was pending.
@@ -767,12 +794,36 @@ export class ScreenPublisher {
     await pc.setRemoteDescription({ type: "answer", sdp: hinted });
     if (this.closed || this.pc !== pc) return;
     this.answer = { pc, sdp: answer, hinted: leadHinted(hinted), ssrcs };
-    this.stopWatching = watchState(pc, s => { if (s === "connected") this.expectFirstFrame(pc); this.params.state(s); }, () => this.pc === pc);
+    let configured = false;
+    let releasingVideo = false;
+    const releaseVideo = async () => {
+      if (!configured || !heldVideo || releasingVideo || this.closed || this.pc !== pc || pc.connectionState !== "connected") return;
+      releasingVideo = true;
+      try {
+        await this.parameters;
+        if (this.closed || this.pc !== pc || track.readyState === "ended" || pc.connectionState !== "connected") return;
+        await transceiver.sender.replaceTrack(track);
+        if (!this.closed && this.pc === pc) { heldVideo = false; this.expectFirstFrame(pc); }
+      } catch {
+        if (!this.closed && this.pc === pc) this.params.state("failed");
+      } finally {
+        releasingVideo = false;
+      }
+    };
+    this.stopWatching = watchState(pc, s => {
+      if (s === "connected") {
+        if (heldVideo) void releaseVideo();
+        else this.expectFirstFrame(pc);
+      }
+      this.params.state(s);
+    }, () => this.pc === pc);
     // The latest quality: `setSpec` may have run while this negotiated.
     this.refreshSurface();
     await this.applyParameters(this.spec().maxBitrate);
     if (this.closed || this.pc !== pc) return;
     this.negotiated = true;
+    configured = true;
+    if (heldVideo) void releaseVideo();
   }
 
   /** Changes quality while sharing, with no renegotiation. */

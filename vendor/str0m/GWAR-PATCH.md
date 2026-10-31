@@ -10,9 +10,11 @@ advancing their sequence numbers or TWCC; eligible media can proceed while a
 repair waits. The gate receives the active bounded probe plan and charges actual
 serialized bytes before send accounting. Its retry deadline gates the pacer's
 timeout instead of spinning on an immediate wake. It survives BWE reset.
+Passing `None` removes the optional gate and clears its pending retry deadline.
 
 Gwar enables shared wire gating when an audio reservation exists; video-only
-transports keep their existing cap policy. The active probe uses the same wire
+transports have no gate installed and keep their existing cap policy. Ending
+the final audio reservation removes the gate. The active probe uses the same wire
 credit as audio/video, at its dispatched rate and within the existing extras
 reserve. Plan changes preserve credit/debt and never create a second burst.
 This fixes a silent tab starving video discovery when the SFU dropped probes

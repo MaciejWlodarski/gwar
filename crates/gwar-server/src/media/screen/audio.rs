@@ -178,7 +178,7 @@ pub(super) fn reserve(w: &mut Watcher, now: Instant) {
                     .is_some_and(|g| g.alive() && g.origin.has_audio.load(std::sync::atomic::Ordering::Relaxed))
         })
         .count();
-    w.egress.reserve_audio(count, now);
+    w.reserve_audio(count, now);
 }
 
 #[cfg(test)]

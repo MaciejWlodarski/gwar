@@ -570,6 +570,15 @@ impl Egress {
         self.set_estimate(self.estimate(), now);
     }
 
+    pub fn has_audio(&self) -> bool {
+        self.audio_reserve > 0.0
+    }
+
+    #[cfg(test)]
+    pub fn has_wire_gate(&self) -> bool {
+        Arc::strong_count(&self.wire) > 1
+    }
+
     fn release_rate(&self) -> f64 {
         self.plan() / 8.0
     }
