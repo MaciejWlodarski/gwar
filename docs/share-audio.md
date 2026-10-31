@@ -50,11 +50,14 @@ may send `stopped: true` when its retained audio track ends. No unsolicited even
 or field is added for older clients. Guest watch pages retain their existing
 video-only behavior.
 
-No new persistent server data is introduced. Settings v7 adds `shareAudio`,
+No new persistent server data is introduced. Settings v8 adds `shareAudio`,
 keyed by share id, with volume 0–100% and independent mute. It preserves
-all v1–v6 fields, including v6 cues and microphone sensitivity. Fixtures cover
+all v1–v7 fields, including v6 cues, microphone sensitivity and v7 desktop and
+notification choices. Fixtures cover
 every version. The second PR to merge a settings bump must renumber its version
-and add the corresponding fixture.
+and add the corresponding fixture. PR #206 reached main first with v7, so this
+branch uses v8 and also preserves share-audio preferences from its earlier v7
+preview builds.
 
 ## Voice priority and bounded forwarding
 

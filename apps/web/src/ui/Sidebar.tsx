@@ -1,3 +1,4 @@
+import { NotificationBadge } from "./NotificationSettings";
 import * as Dropdown from "@radix-ui/react-dropdown-menu";
 import { ChevronDown, ChevronRight, Copy, Fingerprint, KeyRound, LayoutDashboard, LogOut, Plus, Pencil, Settings2, Ticket, UserPlus } from "lucide-react";
 import { useT } from "../i18n";
@@ -61,11 +62,15 @@ function ServerHeader() {
               {phase === "connecting" ? t("connect.connecting") : phase === "reconnecting" ? t("server.reconnecting") : t("server.connected")}
             </span>
           </span>
+          <NotificationBadge channel={null} />
           <ChevronDown className="size-4 shrink-0 text-muted transition-transform duration-150 group-data-[state=open]:rotate-180" />
         </button>
       </Dropdown.Trigger>
       <Dropdown.Portal>
         <Dropdown.Content align="start" sideOffset={4} className={cn(menuContent, "w-64")}>
+          <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "notifications", channel: null })}>
+            <Settings2 className="size-4" /> {t("notify.scopeTitle")}
+          </Dropdown.Item>
           {kind === "gwar" && uid && (
             <Dropdown.Item className={menuItem} onSelect={() => openDialog({ kind: "nickname", uid })}>
               <Pencil className="size-4" /> {t("nickname.change")}

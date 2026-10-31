@@ -1,6 +1,7 @@
 # P1-6 browser share audio validation
 
-Base: `origin/main` at `1a54b517`. Scope: browser capture, protocol/SFU forwarding
+Original base: `origin/main` at `1a54b517`; round 2 integrates `a3ab9f9b` (#206)
+and renumbers share-audio settings to v8 after main's v7 migration. Scope: browser capture, protocol/SFU forwarding
 and browser viewer playback. Desktop viewing is deliberately video-only until
 share playback enters the native mixer/AEC reference. Native capture/playback is the separate PR 2 in [share-audio.md](share-audio.md).
 
@@ -15,8 +16,11 @@ The tests cover optional audio negotiation, legacy watch layouts, strict respons
 validation, source exclusion when a browser ignores hints, desktop capture with
 no audio, desktop viewing without a webview player/controls/prompts, microphone processing disabled on the share track, lower sender
 priority, aggregate uplink budgeting, stable playback ownership, independent
-controls for two shares from one identity, deafen, automatic/lossless v1–v6
+controls for two shares from one identity, deafen, automatic/lossless v1–v7
 settings upgrades, retained capture and a replacement server without audio support.
+The v8 upgrade also preserves v7 notification/startup choices and the earlier
+v7 share-audio preview map. A failing-before v7 upgrade regression covers this
+merge-order collision (`/tmp/gwar-209-r2-settings-before.log`).
 
 `E2E_SCREEN_AUDIO=1` extends the repository's actual screen e2e. The primary
 sharer uses the real Chromium tab picker. A generated 997 Hz source is captured,
@@ -162,7 +166,7 @@ on phones and audio controls stay inside fullscreen.
   passed on the final code at 1920×1080. The judge recorded local CPU limitations
   for both H.264 busy cases; their decoded rates were 54.8 / 59.7 fps. The isolated
   H.264 busy rerun reached 60.1 fps. No startup assertion was changed.
-- Full web suite: 2,205 tests passed across 148 files. Focused source-switch
+- Full web suite after integrating #206: 2,258 tests passed across 153 files. Focused source-switch
   and UI/controller checks also passed.
 
 ## Commands

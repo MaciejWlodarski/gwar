@@ -2,7 +2,7 @@ import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import "./index.css";
-import { consumeInviteFromLocation } from "./state/invite-boot";
+import { consumeInviteFromLocation, initDesktopInvites } from "./state/invite-boot";
 import { captureLogs } from "./lib/diagnostics";
 import { isDesktop, tauri } from "./platform";
 import { storedDataProblem } from "./lib/stored-data-check";
@@ -19,6 +19,7 @@ if (import.meta.env.MODE === "e2e") await import("./e2e");
 await localState.load();
 
 consumeInviteFromLocation();
+await initDesktopInvites();
 
 // The screen-capture check exists only in bundles built with `GWAR_CAPTURE_CHECK=1`; a debug
 // desktop app started with it then shows the check instead of the app.

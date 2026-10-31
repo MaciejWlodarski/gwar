@@ -148,9 +148,13 @@ const RECORD_FIXTURES: Record<keyof typeof RECORDS, Record<number, { stored: Rec
 };
 /** The settings (localStorage) per version, and a check of the settings store after loading them. */
 const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: string; bookmarks: unknown[] }): void }> = {
+  8: {
+    stored: { version: 8, state: { theme: "dark", bookmarks: [], shareAudio: { friend: { volume: 0.35, muted: true } }, desktop: { openAtLogin: true }, notificationOverrides: { servers: { room: "none" }, channels: {} } } },
+    check: state => expect(state).toMatchObject({ shareAudio: { friend: { volume: 0.35, muted: true } }, desktop: { openAtLogin: true }, notificationOverrides: { servers: { room: "none" }, channels: {} } }),
+  },
   7: {
-    stored: { version: 7, state: { theme: "dark", bookmarks: [], shareAudio: { friend: { volume: 0.35, muted: true } } } },
-    check: state => expect(state).toMatchObject({ shareAudio: { friend: { volume: 0.35, muted: true } } }),
+    stored: { state: { theme: "dark", bookmarks: [], desktop: { openAtLogin: true, startMinimized: true, closeToTray: false }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } } }, version: 7 },
+    check: state => expect(state).toMatchObject({ desktop: { openAtLogin: true, startMinimized: true, closeToTray: false }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } } }),
   },
   6: {
     stored: { state: { theme: "dark", bookmarks: [], sounds: { enabled: false, volume: 0.25, events: { mute: false } } }, version: 6 },
@@ -424,6 +428,28 @@ describe("the settings (localStorage)", () => {
   }
   afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
 
+
+it.each([undefined, { friend: { volume: 0.35, muted: true } }])("upgrades v7 settings with share sound losslessly: %j", async shareAudio => {
+  const saved = { theme: "dark", desktop: { openAtLogin: true, startMinimized: true, closeToTray: false, muteShortcut: "Control+KeyM" }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } }, notifications: { mentions: false }, sounds: { enabled: false, volume: 0.2, events: { mention: false } }, audio: { automaticSensitivity: false, vadThreshold: -72 }, unrelatedFutureField: { value: 42 }, ...(shareAudio ? { shareAudio } : {}) };
+  const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ version: 7, state: saved }) });
+  const { useSettings } = await page(storage);
+  const upgraded = await useSettings.persist.getOptions().migrate!(saved, 7);
+  expect(upgraded).toMatchObject({ ...saved, shareAudio: shareAudio ?? {} });
+  useSettings.getState().setShareAudio("next", { volume: 0.4, muted: true });
+  await useSettings.persist.rehydrate();
+  expect(useSettings.getState()).toMatchObject({ ...saved, shareAudio: { ...shareAudio, next: { volume: 0.4, muted: true } } });
+  expect(JSON.parse(storage.getItem(SETTINGS_KEY)!).version).toBe(SETTINGS_VERSION);
+});
+
+it("migrates v6 desktop and notification preferences without dropping any saved values", async () => {
+  const { useSettings } = await page(memory({}));
+  const migrate = useSettings.persist.getOptions().migrate!;
+  const saved = { desktop: { closeToTray: false, muteShortcut: "Control+KeyM", deafenShortcut: "Control+KeyD" }, notifications: { mentions: false, privateMessages: false, allMessages: true }, sounds: { enabled: false, volume: 0.2, events: { mention: false } }, bookmarks: [{ id: "one", password: "saved", channelPassword: "also-saved" }], unrelatedFutureField: { value: 42 } };
+  const upgraded = await migrate(saved, 6);
+  expect(upgraded).toMatchObject(saved);
+  expect(upgraded).toMatchObject({ desktop: { openAtLogin: false, startMinimized: false }, notificationOverrides: { servers: {}, channels: {} } });
+});
+
   it("restores saved mute and deafen before the voice store is created", async () => {
     const storage = memory({});
     const first = await page(storage);
@@ -463,7 +489,7 @@ describe("the settings (localStorage)", () => {
     expect(s()).toMatchObject({ resumeConnection: null, updateVoiceResume: null });
   });
 
-  it.each([1, 2, 3, 4, 5, 6])("migrates version %s to v7 losslessly, preserving even previously stored sounds", async version => {
+  it.each([1, 2, 3, 4, 5, 6, 7])("migrates version %s to v8 losslessly, preserving even previously stored sounds", async version => {
     const audio = { inputMode: "ptt", inputDeviceId: "saved-mic", outputDeviceId: "saved-speaker", noiseSuppression: false, echoCancellation: false, autoGainControl: false, automaticSensitivity: false, vadThreshold: -72 };
     const onboarding = { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true };
     const session = { selfMuted: true, selfDeafened: true, resumeConnection: { address: "a.example", kind: "gwar", name: "A", password: "saved-password", identity: "saved-identity", insecureLan: true }, updateVoiceResume: { address: "a.example", kind: "gwar", version: "1.0", expiresAt: 123456, channel: 2, password: "channel-password" } };

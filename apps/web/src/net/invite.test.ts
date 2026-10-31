@@ -25,3 +25,28 @@ describe("gwar/4 invites", () => {
     expect(parseInviteLink(`https://server.example/?invite=abc&server_key=${key}`)).toEqual({ code: "abc", server: "https://server.example", serverKey: key });
   });
 });
+
+describe("untrusted desktop invites", () => {
+  it("round-trips an exact destination, key, owner and inviter-supplied name", async () => {
+    const { desktopInviteLink, parseDesktopInvite } = await import("./invite");
+    const target = { code: "abc", serverKey: key, server: "wss://voice.example/custom/ws", owner: "B".repeat(26) + "A", name: "Nasza ekipa" };
+    expect(parseDesktopInvite(desktopInviteLink(target)!)).toEqual(target);
+    const web = buildInviteLink({ webOrigin: "https://web.example", serverEndpoint: target.server, ...target });
+    expect(parseInviteLink(web)).toEqual(target);
+  });
+  it.each([
+    "gwar://invite/a/../?invite=abc", "gwar://invite/%2e/?invite=abc",
+    "gwar://command/?invite=abc", "gwar://invite/path?invite=abc", "gwar://user@invite/?invite=abc", "gwar://invite:42/?invite=abc",
+    "gwar://invite/?invite=abc#fragment", "gwar://invite/?invite=abc&server=javascript:alert(1)",
+    "gwar://invite/?invite=abc&server=wss://user:pass@evil.example/ws", "gwar://invite/?invite=abc&server=wss://room/ws?token=secret",
+    "gwar://invite/?invite=abc&server=wss://room/ws&invite=def", "gwar://invite/?invite=abc&server=wss://room/ws&execute=join",
+    "gwar://invite/?invite=abc&server=wss://room/ws&name=%E2%80%AEspoof", "gwar://invite/?invite=abc&server=wss://room/ws&owner=bad",
+    "gwar://invite/?invite=abc", "gwar://invite/\\?invite=abc", "gwar://invite/?invite=abc&server=" + "x".repeat(4096),
+  ])("refuses malformed routes without any network side effect: %s", async prefix => {
+    const { parseDesktopInvite } = await import("./invite");
+    expect(parseDesktopInvite(`${prefix}&server_key=${key}`)).toBeNull();
+  });
+  it.each(["javascript:alert(1)", "https://a:b@room/", "https://room/path", "https://room/#fragment"])("refuses misleading pasted link wrappers: %s", prefix => {
+    expect(parseInviteLink(`${prefix}${prefix.includes("#") ? "" : "?"}invite=abc&server_key=${key}`)).toBeNull();
+  });
+});

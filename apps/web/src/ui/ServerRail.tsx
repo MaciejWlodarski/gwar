@@ -1,3 +1,4 @@
+import { NotificationBadge } from "./NotificationSettings";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import { Check, ChevronRight, Folder, Plus } from "lucide-react";
 import type { CSSProperties } from "react";
@@ -73,6 +74,7 @@ function ServerButton({ b, card, wash }: { b: Bookmark; card?: boolean; wash?: s
               <Avatar name={b.name} seed={b.address} size={44} square className="!rounded-none" />
             </button>
           </Tooltip>
+          <NotificationBadge channel={null} serverRef={b} className="pointer-events-none absolute -right-1 -top-1 rounded bg-side p-0.5" />
           {b.kind === "teamspeak" && (
             <TeamSpeakBadge
               short
@@ -90,6 +92,7 @@ function ServerButton({ b, card, wash }: { b: Bookmark; card?: boolean; wash?: s
           <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "addServer", editId: b.id })}>
             {t("rail.edit")}
           </ContextMenu.Item>
+          <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "notifications", channel: null, server: { address: b.address, kind: b.kind, insecureLan: b.insecureLan }, name: b.name })}>{t("notify.scopeTitle")}</ContextMenu.Item>
           <GroupSubmenu server={b} />
           <ContextMenu.Separator className={menuSeparator} />
           <ContextMenu.Item className={cn(menuItem, menuItemDanger)} onSelect={() => useSettings.getState().removeBookmark(b.id)}>
