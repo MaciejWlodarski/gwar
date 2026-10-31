@@ -66,6 +66,7 @@ struct Prefs {
     muted: bool,
     deafened: bool,
     ptt: bool,
+    ptt_release_ms: u64,
     echo: bool,
     gain: bool,
     noise: NoiseSuppression,
@@ -78,6 +79,7 @@ impl Prefs {
         handle.set_input_mode(self.mode);
         handle.set_muted(self.muted);
         handle.set_deafened(self.deafened);
+        handle.set_ptt_release_delay(self.ptt_release_ms);
         handle.set_ptt(self.ptt);
         handle.set_capture_processing(self.echo, self.gain);
         handle.set_noise_suppression(self.noise);
@@ -112,6 +114,7 @@ pub struct Voice {
     inner: Mutex<Inner>,
     /// Id of the active `voice_start`; zero after retirement.
     run: AtomicU64,
+    global_ptt: AtomicBool,
     /// What the fake speaker heard (only with `GWAR_FAKE_AUDIO`).
     pub heard: Arc<Heard>,
 }
@@ -135,6 +138,7 @@ impl Default for Voice {
                     muted: false,
                     deafened: false,
                     ptt: false,
+                    ptt_release_ms: 300,
                     // Until the settings say otherwise (they default to all on, at full strength).
                     echo: true,
                     gain: true,
@@ -151,6 +155,7 @@ impl Default for Voice {
                 pending_cues: Vec::with_capacity(2),
             }),
             run: AtomicU64::new(0),
+            global_ptt: AtomicBool::new(false),
             heard: Arc::default(),
         }
     }
@@ -168,6 +173,42 @@ impl Voice {
         if let Some(h) = &inner.handle {
             h.set_ptt(down);
         }
+    }
+
+    pub fn configure_global_ptt(&self, configured: bool) {
+        let mut inner = self.lock();
+        self.global_ptt.store(configured, Ordering::Release);
+        inner.prefs.ptt = false;
+        if let Some(h) = &inner.handle {
+            h.cancel_ptt();
+        }
+    }
+
+    pub fn renew_global_ptt(&self, down: bool) {
+        let inner = self.lock();
+        if let Some(h) = &inner.handle {
+            h.set_ptt_leased(down);
+        }
+    }
+
+    pub fn cancel_global_ptt(&self) {
+        let inner = self.lock();
+        if let Some(h) = &inner.handle {
+            h.cancel_ptt();
+        }
+    }
+
+    fn window_ptt(&self, owner: u64, active: bool) -> Result<(), String> {
+        let mut inner = self.lock();
+        check_owner(&inner, owner)?;
+        if self.global_ptt.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        inner.prefs.ptt = active;
+        if let Some(h) = &inner.handle {
+            h.set_ptt(active);
+        }
+        Ok(())
     }
 
     /// Diagnostics for the debug command and log lines.
@@ -966,11 +1007,22 @@ pub fn voice_set_deafened(
 #[tauri::command]
 pub fn voice_set_ptt(window: WebviewWindow, voice: State<'_, Voice>, owner: u64, active: bool) -> Result<(), String> {
     check_main_window(window.label())?;
+    voice.window_ptt(owner, active)
+}
+
+#[tauri::command]
+pub fn voice_set_ptt_release_delay(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    ms: u64,
+) -> Result<(), String> {
+    check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
-    inner.prefs.ptt = active;
+    inner.prefs.ptt_release_ms = ms.min(1000);
     if let Some(h) = &inner.handle {
-        h.set_ptt(active);
+        h.set_ptt_release_delay(ms);
     }
     Ok(())
 }
@@ -1382,6 +1434,21 @@ mod run_tests {
             io: Box::new(TrackedIo { opened: opened.clone(), closed: closed.clone(), gate: None }),
         });
         (io, opened, closed)
+    }
+
+    #[test]
+    fn window_events_cannot_bypass_global_permission_or_replay_a_stale_press() {
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        voice.window_ptt(owner, true).unwrap();
+        assert!(voice.lock().prefs.ptt);
+        voice.configure_global_ptt(true);
+        assert!(!voice.lock().prefs.ptt);
+        voice.window_ptt(owner, true).unwrap();
+        assert!(!voice.lock().prefs.ptt);
+        voice.configure_global_ptt(false);
+        assert!(!voice.lock().prefs.ptt);
+        assert!(voice.window_ptt(owner + 1, true).is_err());
     }
 
     #[tokio::test]

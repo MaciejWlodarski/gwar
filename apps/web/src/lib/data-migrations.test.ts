@@ -179,6 +179,10 @@ const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: st
       expect(state.bookmarks).toMatchObject([{ id: "a", address: "a.example" }]);
     },
   },
+  7: {
+    stored: { state: { audio: { inputMode: "ptt", pttKey: "Mouse5", pttReleaseDelay: 80 } }, version: 7 },
+    check: state => { expect(state).toMatchObject({ audio: { inputMode: "ptt", pttKey: "Mouse5", pttReleaseDelay: 80 } }); },
+  },
 };
 const PIN = "gwar.server-pin:wss://a.example/ws";
 const pinValue = (key: string, first_seen = 1) => JSON.stringify({ server_pk: key, first_seen });
@@ -459,7 +463,7 @@ describe("the settings (localStorage)", () => {
     expect(s()).toMatchObject({ resumeConnection: null, updateVoiceResume: null });
   });
 
-  it.each([1, 2, 3, 4, 5])("migrates version %s to v6 losslessly, preserving even previously stored sounds", async version => {
+  it.each([1, 2, 3, 4, 5, 6])("migrates version %s to the current settings losslessly, preserving even previously stored sounds", async version => {
     const audio = { inputMode: "ptt", inputDeviceId: "saved-mic", outputDeviceId: "saved-speaker", noiseSuppression: false, echoCancellation: false, autoGainControl: false, automaticSensitivity: false, vadThreshold: -72 };
     const onboarding = { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true };
     const session = { selfMuted: true, selfDeafened: true, resumeConnection: { address: "a.example", kind: "gwar", name: "A", password: "saved-password", identity: "saved-identity", insecureLan: true }, updateVoiceResume: { address: "a.example", kind: "gwar", version: "1.0", expiresAt: 123456, channel: 2, password: "channel-password" } };
@@ -469,7 +473,7 @@ describe("the settings (localStorage)", () => {
     const expected = { theme: "dark", onboarding, ...session, audio, sounds: { ...sounds, events: { ...sounds.events, peerJoin: true } } };
     expect(useSettings.getState()).toMatchObject(expected);
     const saved = JSON.parse(storage.getItem(SETTINGS_KEY)!);
-    expect(saved.version).toBe(6);
+    expect(saved.version).toBe(SETTINGS_VERSION);
     expect(saved.state).toMatchObject(expected);
   });
 

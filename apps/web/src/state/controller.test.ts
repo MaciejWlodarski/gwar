@@ -103,6 +103,7 @@ function fakeEngine() {
     setInputMode: vi.fn(),
     setInputSensitivity: vi.fn(),
     setPttActive: vi.fn(),
+    setPttReleaseDelay: vi.fn(),
     setInputDevice: vi.fn(async () => {}),
     setOutputDevice: vi.fn(async () => {}),
     setCaptureOptions: vi.fn(async () => {}),

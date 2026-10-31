@@ -4,6 +4,7 @@
 
 pub mod fake_audio;
 mod files;
+mod ptt;
 mod screen;
 mod shortcuts;
 mod tray;
@@ -74,6 +75,7 @@ pub fn run() {
         // TODO: tauri-plugin-autostart (launch at login) once there is a setting for it.
         .manage(voice::Voice::default())
         .manage(shortcuts::Shortcuts::default())
+        .manage(ptt::Ptt::default())
         .manage(ts::Ts::default())
         .manage(files::Files::default())
         .manage(tray::CloseToTray(AtomicBool::new(true)))
@@ -128,6 +130,10 @@ pub fn run() {
             files::save_blob_as,
             files::upload_put,
             shortcuts::set_global_shortcut,
+            ptt::set_global_ptt,
+            ptt::global_ptt_status,
+            ptt::open_ptt_settings,
+            voice::voice_set_ptt_release_delay,
             ts::ts_connect,
             ts::ts_request,
             ts::ts_disconnect,

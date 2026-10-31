@@ -21,6 +21,7 @@
     "e2e:archive": "node e2e/archive.mjs",
     "e2e:private": "node e2e/private.mjs",
     "e2e:voice": "node e2e/voice.mjs",
+    "e2e:global-ptt": "node e2e/global-ptt.mjs",
     "e2e:input-sensitivity": "node e2e/input-sensitivity.mjs",
     "e2e:voice-switch": "node e2e/voice-switch.mjs",
     "e2e:denoise": "node e2e/denoise.mjs",

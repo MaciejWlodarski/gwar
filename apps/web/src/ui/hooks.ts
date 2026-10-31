@@ -1,9 +1,11 @@
+import { tNow } from "../i18n";
 import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { flushSync } from "react-dom";
 import { tsBridge, type TsListInfo } from "../connect/teamspeak";
 import { useAccount } from "../state/account";
 import type { Permission } from "../proto/Permission";
 import { controller } from "../state/controller";
+import { mousePttCode, nativeOwnsPtt } from "../platform/ptt";
 import { hasGlobalShortcut, isGlobalShortcutEvent } from "../platform/desktop";
 import { useSettings } from "../state/settings";
 import { useSession, useUi, useVoice, type Section } from "../state/stores";
@@ -216,7 +218,7 @@ export function useShortcuts(): void {
         }
       }
       const { audio } = useSettings.getState();
-      if (audio.inputMode === "ptt" && audio.pttKey && e.code === audio.pttKey && !e.repeat) {
+      if (!nativeOwnsPtt() && audio.inputMode === "ptt" && audio.pttKey && e.code === audio.pttKey && !e.repeat) {
         // Do not steal printable keys while typing a message.
         if (isEditable(e.target) && e.key.length === 1) return;
         controller.setPtt(true);
@@ -224,16 +226,24 @@ export function useShortcuts(): void {
     };
     const up = (e: KeyboardEvent) => {
       const { audio } = useSettings.getState();
-      if (audio.pttKey && e.code === audio.pttKey) controller.setPtt(false);
+      if (!nativeOwnsPtt() && audio.pttKey && e.code === audio.pttKey) controller.setPtt(false);
     };
     // A global push-to-talk shortcut reports its own release, even when unfocused.
     const blur = () => {
       if (!hasGlobalShortcut("ptt")) controller.setPtt(false);
     };
+    const mouse = (event: MouseEvent) => {
+      const { audio } = useSettings.getState();
+      if (!nativeOwnsPtt() && audio.inputMode === "ptt" && audio.pttKey === mousePttCode(event.button)) controller.setPtt(event.type === "mousedown");
+    };
+    window.addEventListener("mousedown", mouse);
+    window.addEventListener("mouseup", mouse);
     window.addEventListener("keydown", down);
     window.addEventListener("keyup", up);
     window.addEventListener("blur", blur);
     return () => {
+      window.removeEventListener("mousedown", mouse);
+      window.removeEventListener("mouseup", mouse);
       window.removeEventListener("keydown", down);
       window.removeEventListener("keyup", up);
       window.removeEventListener("blur", blur);
@@ -253,14 +263,19 @@ export function keyLabel(code: string): string {
   if (code.startsWith("Digit")) return code.slice(5);
   const map: Record<string, string> = {
     Space: "Space",
-    ControlLeft: "Left Ctrl",
-    ControlRight: "Right Ctrl",
-    ShiftLeft: "Left Shift",
-    ShiftRight: "Right Shift",
-    AltLeft: "Left Alt",
-    AltRight: "Right Alt",
+    ControlLeft: tNow("audio.key.ControlLeft"),
+    ControlRight: tNow("audio.key.ControlRight"),
+    ShiftLeft: tNow("audio.key.ShiftLeft"),
+    ShiftRight: tNow("audio.key.ShiftRight"),
+    AltLeft: tNow("audio.key.AltLeft"),
+    AltRight: tNow("audio.key.AltRight"),
     Backquote: "`",
     CapsLock: "Caps Lock",
+    Mouse3: tNow("audio.key.Mouse3"),
+    Mouse4: tNow("audio.key.Mouse4"),
+    Mouse5: tNow("audio.key.Mouse5"),
+    MetaLeft: tNow("audio.key.MetaLeft"),
+    MetaRight: tNow("audio.key.MetaRight"),
   };
   return map[code] ?? code;
 }

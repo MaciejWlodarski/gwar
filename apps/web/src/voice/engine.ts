@@ -124,6 +124,7 @@ export interface VoiceEngine {
   setInputSensitivity(threshold: number | null): void;
   /** Push-to-talk key state; only matters in `ptt` mode. */
   setPttActive(active: boolean): void;
+  setPttReleaseDelay(ms: number): void;
   setInputDevice(deviceId: string | null): Promise<void>;
   setOutputDevice(deviceId: string | null): Promise<void>;
   setCaptureOptions(options: CaptureOptions): Promise<void>;

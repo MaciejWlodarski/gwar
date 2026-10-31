@@ -1,5 +1,7 @@
+import { PttStatus } from "./PttStatus";
+import { mousePttCode, useGlobalPtt } from "../platform/ptt";
 import { SoundSettings } from "./SoundSettings";
-import { Bell, Volume2, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, Settings as SettingsIcon, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
+import { Mouse as MouseIcon, Bell, Volume2, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, Settings as SettingsIcon, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
 import { exportIdentityBackup } from "../state/identity-backup";
 import { useEffect, useRef, useState } from "react";
 import { tNow, useT } from "../i18n";
@@ -18,7 +20,7 @@ import { useSettings, type Language, type Theme } from "../state/settings";
 import { useSession, useUi, useVoice, type SettingsTab } from "../state/stores";
 import { VoiceError } from "../voice/engine";
 import { keyLabel } from "./hooks";
-import { Button, Field, Input, Section, Segmented, Select, Slider, Switch } from "./kit";
+import { Button, IconButton, Dialog, Field, Input, Section, Segmented, Select, Slider, Switch } from "./kit";
 import { AlphaBadge } from "./BugReport";
 import { SettingsPageLayout, type SettingsPage } from "./SettingsLayout";
 import { VersionLabel } from "./Version";
@@ -139,6 +141,7 @@ function AudioTab() {
   const gateUnsupported = useVoice((s) => s.inputGateSupport === false);
   const muted = useVoice((s) => s.muted || s.deafened);
   const [capturing, setCapturing] = useState(false);
+  const [pickingMouse, setPickingMouse] = useState(false);
   const engine = controller.voice;
   const preview = useMicPreview(engine);
   // Gwar's own suppression has a strength: native on the desktop, an AudioWorklet in the browser.
@@ -166,14 +169,30 @@ function AudioTab() {
 
   useEffect(() => {
     if (!capturing) return;
-    const onKey = (e: KeyboardEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-      if (e.code !== "Escape") setAudio({ pttKey: e.code });
+    useGlobalPtt.setState({ capturing: true });
+    const finish = (key: string | null) => {
+      if (key) setAudio({ pttKey: key });
       setCapturing(false);
     };
+    const onKey = (e: KeyboardEvent) => {
+      e.preventDefault(); e.stopPropagation();
+      finish(e.code === "Escape" ? null : e.code);
+    };
+    const onMouse = (e: MouseEvent) => {
+      const code = mousePttCode(e.button);
+      if (!code) return;
+      e.preventDefault(); e.stopPropagation(); finish(code);
+    };
+    const cancel = () => setCapturing(false);
     window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
+    window.addEventListener("mousedown", onMouse, true);
+    window.addEventListener("blur", cancel);
+    return () => {
+      useGlobalPtt.setState({ capturing: false });
+      window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("mousedown", onMouse, true);
+      window.removeEventListener("blur", cancel);
+    };
   }, [capturing, setAudio]);
 
   const withDefault = (list: Array<{ id: string; label: string }>) => [
@@ -186,6 +205,11 @@ function AudioTab() {
 
   return (
     <div>
+      <Dialog open={pickingMouse} onOpenChange={setPickingMouse} title={t("audio.mouseButton")}>
+        <div className="grid gap-2">
+          {["Mouse3", "Mouse4", "Mouse5"].map(key => <Button key={key} className="h-11 justify-start" onClick={() => { setAudio({ pttKey: key }); setPickingMouse(false); }}>{keyLabel(key)}</Button>)}
+        </div>
+      </Dialog>
       <Section title={t("audio.devices")}>
         <Field label={t("audio.input")}>
           {(id) => (
@@ -246,12 +270,17 @@ function AudioTab() {
           </> : <>
             <div className="flex items-center gap-2">
               <Button disabled={gateUnsupported} onClick={() => setCapturing(true)} className={cn("min-w-40", capturing && "border-accent text-accent")}>
-                {capturing ? t("audio.pressKey") : audio.pttKey ? keyLabel(audio.pttKey) : t("audio.setKey")}
+                {capturing ? t("audio.pressPtt") : audio.pttKey ? keyLabel(audio.pttKey) : t("audio.setKey")}
               </Button>
+              <IconButton disabled={gateUnsupported} size="lg" label={t("audio.mouseButton")} onClick={() => { setCapturing(false); setPickingMouse(true); }}><MouseIcon className="size-4" /></IconButton>
               {audio.pttKey && !capturing && <Button variant="ghost" onClick={() => setAudio({ pttKey: null })}>{t("audio.clearKey")}</Button>}
             </div>
-            <p className="self-center text-xs text-subtle">{t(gateUnsupported ? "audio.pttUnsupported" : audio.pttKey ? onDesktop ? "audio.pttHelpGlobal" : "audio.pttHelp" : "audio.pttNoKey")}</p>
-            <div aria-hidden="true" />
+            {gateUnsupported || !audio.pttKey ? <p className="self-center text-xs text-subtle">{t(gateUnsupported ? "audio.pttUnsupported" : "audio.pttNoKey")}</p> : <PttStatus />}
+            <div className="flex items-center gap-3 text-xs">
+              <span className="shrink-0 text-subtle">{t("audio.pttDelay")}</span>
+              <Slider value={audio.pttReleaseDelay} min={0} max={1000} step={10} onChange={(pttReleaseDelay) => setAudio({ pttReleaseDelay })} label={t("audio.pttDelayLabel")} />
+              <span className="w-14 shrink-0 text-right tabular-nums text-muted">{audio.pttReleaseDelay} ms</span>
+            </div>
           </>}
         </div>
         {preview.error != null && <p role="alert" className="text-sm text-danger">{describeVoiceError(preview.error instanceof VoiceError ? preview.error : new VoiceError("mic_failed", String(preview.error)))}</p>}

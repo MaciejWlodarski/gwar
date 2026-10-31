@@ -17,6 +17,7 @@ pub mod keys;
 pub mod permission;
 mod playout;
 mod priority;
+mod ptt;
 mod rtc;
 pub mod sframe;
 mod watch;
@@ -109,7 +110,7 @@ impl MicrophoneProcessor {
 pub struct Controls {
     muted: AtomicBool,
     deafened: AtomicBool,
-    ptt: AtomicBool,
+    ptt: ptt::Ptt,
     vad_threshold: AtomicU32,
     /// One atomic selects automatic, manual or PTT; automatic never reads a changing manual threshold.
     input_mode: AtomicU64,
@@ -141,7 +142,7 @@ impl Default for Controls {
         Self {
             muted: AtomicBool::new(false),
             deafened: AtomicBool::new(false),
-            ptt: AtomicBool::new(false),
+            ptt: ptt::Ptt::default(),
             vad_threshold: AtomicU32::new((-50.0f32).to_bits()),
             input_mode: AtomicU64::new(INPUT_AUTOMATIC),
             input_gate_ready: AtomicBool::new(true),
@@ -298,12 +299,35 @@ impl VoiceHandle {
     }
     pub fn set_muted(&self, muted: bool) {
         self.controls.muted.store(muted, Ordering::Relaxed);
+        if muted {
+            self.controls.ptt.clear_tail();
+        }
     }
     pub fn set_deafened(&self, deafened: bool) {
         self.controls.deafened.store(deafened, Ordering::Relaxed);
+        if deafened {
+            self.controls.ptt.clear_tail();
+        }
     }
     pub fn set_ptt(&self, down: bool) {
-        self.controls.ptt.store(down, Ordering::Relaxed);
+        self.controls.ptt.set(down, false);
+        self.clear_blocked_ptt_tail();
+    }
+    /// Renewed only by the passive desktop observer; expires on the audio thread.
+    pub fn set_ptt_leased(&self, down: bool) {
+        self.controls.ptt.set(down, true);
+        self.clear_blocked_ptt_tail();
+    }
+    fn clear_blocked_ptt_tail(&self) {
+        if self.controls.muted.load(Ordering::Relaxed) || self.controls.deafened.load(Ordering::Relaxed) {
+            self.controls.ptt.clear_tail();
+        }
+    }
+    pub fn cancel_ptt(&self) {
+        self.controls.ptt.cancel();
+    }
+    pub fn set_ptt_release_delay(&self, ms: u64) {
+        self.controls.ptt.set_delay(ms);
     }
     pub fn set_input_mode(&self, mode: InputMode) {
         let mode = match mode {
@@ -749,7 +773,7 @@ fn pipeline<const CAPTURE: usize>(
             let mode_revision = controls.input_mode.load(Ordering::Acquire);
             gate.set_mode(mode_revision);
             let mode = mode_revision & 3;
-            let ptt = (mode == INPUT_PTT).then(|| controls.ptt.load(Ordering::Relaxed));
+            let ptt = (mode == INPUT_PTT).then(|| controls.ptt.active());
             let threshold = if mode == INPUT_AUTOMATIC { -50.0 } else { f(&controls.vad_threshold) };
             let send = gate.allows(
                 Instant::now(),
@@ -1087,7 +1111,7 @@ mod codec_tests {
             feed(0, FRAME * 10, if gate == 2 { 0.0 } else { 0.3 });
             assert!(outgoing.try_recv().is_err());
             controls.muted.store(false, Ordering::Relaxed);
-            controls.ptt.store(true, Ordering::Relaxed);
+            controls.ptt.set(true, false);
             // Only the first of three frames fits the outgoing queue.
             feed(FRAME * 10, FRAME * 3, 0.3);
             assert_eq!(outgoing.try_recv().unwrap().capture_position, (FRAME * 10) as u64);

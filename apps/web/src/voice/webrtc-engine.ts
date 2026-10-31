@@ -103,6 +103,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private deafened = false;
   private mode: InputMode = "vad";
   private ptt = false;
+  private pttReleaseDelay = 300;
   private pttRelease: ReturnType<typeof setTimeout> | null = null;
   private threshold = inputThreshold(null);
   private automaticSensitivity = true;
@@ -1021,6 +1022,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     this.applyTrackEnabled();
   }
 
+  setPttReleaseDelay(ms: number): void { this.pttReleaseDelay = Math.max(0, Math.min(1000, ms)); }
+
   setPttActive(active: boolean): void {
     if (active) {
       if (this.pttRelease) clearTimeout(this.pttRelease);
@@ -1028,18 +1031,17 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       this.ptt = true;
       this.applyTrackEnabled();
     } else if (this.ptt && !this.pttRelease) {
-      // Match native's 300 ms hangover, including the denoiser's buffered word ending.
+      // Preserve the denoiser's buffered word ending for the configured tail.
       this.pttRelease = setTimeout(() => {
         this.pttRelease = null;
         this.ptt = false;
         this.applyTrackEnabled();
-      }, 300);
+      }, this.pttReleaseDelay);
     }
   }
 
   private cancelPttRelease(): void {
-    if (!this.pttRelease) return;
-    clearTimeout(this.pttRelease);
+    if (this.pttRelease) clearTimeout(this.pttRelease);
     this.pttRelease = null;
     this.ptt = false;
   }

@@ -171,3 +171,19 @@ it.each(["text", "smooth", "game", "saver", "auto"] as const)("migrates saved %s
   await useSettings.persist.rehydrate();
   expect(useSettings.getState()).toMatchObject({ ...expected, screenHeight: 1440, screenFps: 60 });
 });
+
+
+it.each(["KeyV", "AltRight", "CapsLock", "F24"])("migrates v6 PTT %s without losing existing settings", async pttKey => {
+  const previous = { language: "pl", theme: "dark", audio: { inputMode: "ptt", pttKey, inputDeviceId: "chosen-mic", noiseStrength: 70, vadThreshold: -64 }, desktop: { muteShortcut: "Control+KeyM", closeToTray: false }, sounds: { enabled: false, volume: 0.4 }, bookmarks: [{ id: "saved", name: "Local", address: "127.0.0.1", kind: "gwar", password: "keep-me" }], selfMuted: true, userVolumes: { friend: 0.7 } };
+  const data = new Map([["gwar.settings", JSON.stringify({ version: 6, state: previous })]]);
+  vi.stubGlobal("window", { localStorage: { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => data.set(key, value), removeItem: (key: string) => data.delete(key) } });
+  vi.resetModules();
+  const { useSettings } = await import("./settings");
+  expect(useSettings.getState()).toMatchObject({ ...previous, audio: { ...previous.audio, pttReleaseDelay: 300 } });
+  expect(JSON.parse(data.get("gwar.settings")!).version).toBe(SETTINGS_VERSION);
+  useSettings.getState().setAudio({ pttKey: "Mouse5", pttReleaseDelay: 80 });
+  await useSettings.persist.rehydrate();
+  expect(useSettings.getState().audio).toMatchObject({ pttKey: "Mouse5", pttReleaseDelay: 80, inputDeviceId: "chosen-mic" });
+  useSettings.getState().setAudio({ pttReleaseDelay: NaN });
+  expect(useSettings.getState().audio.pttReleaseDelay).toBe(300);
+});
