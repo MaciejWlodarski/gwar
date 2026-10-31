@@ -217,11 +217,12 @@ pub struct Snapshot {
 struct NativeRun {
     cancelled: watch::Sender<bool>,
     audio: Mutex<Option<Box<dyn Send>>>,
+    silence: Arc<AtomicBool>,
 }
 
 impl NativeRun {
     fn new() -> Arc<Self> {
-        Arc::new(Self { cancelled: watch::channel(false).0, audio: Mutex::new(None) })
+        Arc::new(Self { cancelled: watch::channel(false).0, audio: Mutex::new(None), silence: Arc::default() })
     }
 
     fn check(&self) -> Result<(), String> {
@@ -231,7 +232,13 @@ impl NativeRun {
     fn retire(&self) {
         let mut audio = self.audio.lock().unwrap_or_else(|e| e.into_inner());
         self.cancelled.send_replace(true);
+        self.silence.store(true, Ordering::SeqCst);
         *audio = None;
+    }
+
+    /// Release capture before local sample playback, retaining its cancellation scope.
+    fn close_capture(&self) {
+        *self.audio.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     async fn until_retired<T>(&self, future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
@@ -1155,6 +1162,21 @@ struct TestLevel {
     db: f32,
 }
 
+#[derive(Clone, Serialize)]
+struct TestState {
+    owner: u64,
+    test: u64,
+    state: &'static str,
+    error: Option<String>,
+}
+
+const MIC_SAMPLE_LEN: usize = 3 * 48_000;
+
+fn append_mic_sample(samples: &mut Vec<f32>, frame: &[f32]) {
+    let take = frame.len().min(MIC_SAMPLE_LEN.saturating_sub(samples.len()));
+    samples.extend_from_slice(&frame[..take]);
+}
+
 fn claim_mic_test(voice: &Voice, owner: u64, id: u64) -> Result<Arc<NativeRun>, String> {
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
@@ -1200,6 +1222,7 @@ pub async fn mic_test_start(
     owner: u64,
     input: Option<String>,
     test: u64,
+    playback: Option<bool>,
 ) -> Result<(), String> {
     check_main_window(window.label())?;
     if !window.is_visible().unwrap_or(false) || !window.is_focused().unwrap_or(false) {
@@ -1219,6 +1242,13 @@ pub async fn mic_test_start(
         .name("gwar-mic-test".into())
         .spawn(move || {
             let AudioPorts { mut mic, speaker: _speaker, _guard, .. } = ports;
+            let playback = playback.unwrap_or(false);
+            let mut samples = Vec::new();
+            let started = Instant::now();
+            if playback {
+                samples.reserve(MIC_SAMPLE_LEN);
+                let _ = app.emit("voice://test-state", TestState { owner, test: id, state: "recording", error: None });
+            }
             let mut processor = MicrophoneProcessor::default();
             let mut frame = [0.0; gwar_client::voice::FRAME];
             let mut filled = 0;
@@ -1241,16 +1271,48 @@ pub async fn mic_test_start(
                     next = Some(s.position + 1);
                     if filled == frame.len() {
                         processor.process(&mut frame, echo, gain, noise, continuous, 0);
+                        if playback {
+                            append_mic_sample(&mut samples, &frame);
+                        }
                         continuous = true;
                         let power = frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32;
                         latest = Some(10.0 * power.max(1e-10).log10());
                         filled = 0;
+                        if playback && (samples.len() == MIC_SAMPLE_LEN || started.elapsed() >= Duration::from_secs(4))
+                        {
+                            break;
+                        }
                     }
                 }
                 if let Some(db) = latest {
                     let _ = app.emit("voice://test-level", TestLevel { owner, test: id, db });
                 }
+                if playback && (samples.len() == MIC_SAMPLE_LEN || started.elapsed() >= Duration::from_secs(4)) {
+                    break;
+                }
                 thread::sleep(Duration::from_millis(50));
+            }
+            // Stop consuming input and release the capture guard before replay.
+            test.close_capture();
+            drop(_guard);
+            if playback && test.check().is_ok() {
+                let _ = app.emit("voice://test-level", TestLevel { owner, test: id, db: -100.0 });
+                let voice = app.state::<Voice>();
+                let (output, gain) = {
+                    let inner = voice.lock();
+                    (inner.prefs.output.clone(), inner.prefs.master)
+                };
+                for sample in &mut samples {
+                    *sample *= gain;
+                }
+                let _ = app.emit("voice://test-state", TestState { owner, test: id, state: "playing", error: None });
+                let result = gwar_client::voice::io::play_sample(output, samples, test.silence.clone());
+                if test.check().is_ok() {
+                    let _ = app.emit(
+                        "voice://test-state",
+                        TestState { owner, test: id, state: "idle", error: result.err().map(|e| format!("{e:#}")) },
+                    );
+                }
             }
         })
         .map_err(|e| e.to_string())?;
@@ -1309,6 +1371,34 @@ mod run_tests {
         sync::atomic::{AtomicBool, AtomicUsize},
         task::Poll,
     };
+
+    #[test]
+    fn recorded_sample_closes_capture_before_playback_and_window_pause_silences_it() {
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        let test = claim_mic_test(&voice, owner, 1).unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        *test.audio.lock().unwrap() = Some(Box::new(Closed(closed.clone())));
+        test.close_capture();
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(test.check().is_ok());
+        assert!(!test.silence.load(Ordering::SeqCst));
+        pause_mic_test(&voice);
+        assert!(test.silence.load(Ordering::SeqCst));
+        assert!(test.check().is_err());
+    }
+
+    #[test]
+    fn microphone_sample_keeps_processed_pcm_and_is_bounded_to_three_seconds() {
+        let mut samples = Vec::new();
+        append_mic_sample(&mut samples, &[0.25, -0.5]);
+        assert_eq!(samples, [0.25, -0.5]);
+        append_mic_sample(&mut samples, &vec![0.125; MIC_SAMPLE_LEN]);
+        assert_eq!(samples.len(), MIC_SAMPLE_LEN);
+        append_mic_sample(&mut samples, &[1.0; 480]);
+        assert_eq!(samples.len(), MIC_SAMPLE_LEN);
+        assert_eq!(samples[MIC_SAMPLE_LEN - 1], 0.125);
+    }
 
     #[test]
     fn preview_releases_its_device_on_window_pause_and_refuses_muted_capture() {

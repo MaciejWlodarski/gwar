@@ -17,7 +17,7 @@ checks the injected calling webview window and rejects any label other than
 | `voice_stop {owner, run}` | Current owner only; retires this or older runs, including starts still pending in DNS or device opening. |
 | `voice_play_cue {owner, cue, volume}` | Current owner and main window only. Accepts only the built-in score names and a clamped 0..1 volume. During voice, mixes local PCM into the selected output before the AEC render reference, independent of voice volume. Outside voice, opens output only (never the microphone). Deafen permits only mute/unmute/deafen/undeafen confirmations. |
 | `voice_set_muted`, `voice_set_deafened`, `voice_set_ptt`, `voice_set_input_mode`, `voice_set_master_gain`, `voice_set_slot_gain`, `voice_set_devices` | Require `owner` alongside their existing arguments. Reject previous-view controls under the voice lock. |
-| `mic_test_start {owner, test, input?}`, `mic_test_stop {owner, test?}` | Current owner only. A monotonically increasing test id fences cancelled starts and stale cleanup. Refuses capture while muted/deafened, in voice or in a hidden/unfocused window. Bootstrap and native focus loss/close also retire the preview. |
+| `mic_test_start {owner, test, input?, playback?}`, `mic_test_stop {owner, test?}` | Current owner only. A monotonically increasing test id fences cancelled starts and stale cleanup. Refuses capture while muted/deafened, in voice or in a hidden/unfocused window. Bootstrap and native focus loss/close also retire the preview. |
 | `mic_permission {owner}` → `granted` / `prompt` / `denied` / `unknown` | Current owner only. Reads OS authorization without opening a device or requesting permission. Unknown platforms require an explicit preview gesture. |
 | `audio_devices`, `open_mic_privacy_settings` | No ownership token: enumeration or a fixed OS settings URI. |
 
@@ -57,3 +57,12 @@ server acknowledges `voice.input_gate`. Mode revisions also discard old queued
 frames and reset the local hangover. Native SDP advertises input-gate version 2;
 automatic mode uses the legacy server criterion. Older servers keep automatic
 activation; manual sensitivity is unavailable and unsupported PTT stays closed.
+
+An explicit `playback: true` microphone test records up to three seconds of processed
+48 kHz mono PCM in memory. It closes the capture guard before opening the chosen
+output. `voice://test-state {owner, test, state, error?}` reports `recording`,
+`playing` and `idle`; only the matching owner/test may update the UI. Retirement,
+including native window focus/visibility loss, immediately cancels both capture
+and sample output. The default meter-only preview remains silent. No sample is
+uploaded, written to disk or retained between tests. Output opening/playback
+failures are reported to the matching UI test.

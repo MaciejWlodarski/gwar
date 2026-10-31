@@ -15,6 +15,7 @@ import {
   type CaptureOptions,
   type DeviceList,
   type InputMode,
+  type MicTestPlayback,
   type VoiceEngine,
   type VoiceEvents,
   type VoiceState,
@@ -806,14 +807,14 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     catch { return "unknown"; }
   }
 
-  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal): Promise<() => void> {
+  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal, playback?: MicTestPlayback): Promise<() => void> {
     return this.micTests.start(async aborted => {
       if (this.state !== "idle" || this.muted || this.deafened || aborted.aborted) return () => {};
-      return this.openMicTest(onLevel, aborted);
+      return this.openMicTest(onLevel, aborted, playback);
     }, signal);
   }
 
-  private async openMicTest(onLevel: (level: number) => void, signal: AbortSignal): Promise<() => void> {
+  private async openMicTest(onLevel: (level: number) => void, signal: AbortSignal, playback?: MicTestPlayback): Promise<() => void> {
     const stream = await this.getStream(() => !signal.aborted);
     if (signal.aborted) { stream.getTracks().forEach(track => track.stop()); return () => {}; }
     let ctx: AudioContext;
@@ -839,11 +840,18 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       }, 50);
       void this.listDevices().then((d) => this.emit("devices", d));
       let stopped = false;
+      let cancelled = false;
+      let recorder: MediaRecorder | null = null;
+      let sampleTimer: ReturnType<typeof setTimeout> | null = null;
+      let replay: AudioBufferSourceNode | null = null;
+      const recording = playback ? ctx.createMediaStreamDestination() : null;
+      if (recording) source.connect(recording);
       const retarget = () => {
         if (stopped) return;
         source.disconnect();
         source = ctx.createMediaStreamSource(pipeline?.running ? new MediaStream([pipeline.track]) : stream);
         source.connect(analyser);
+        if (recording) source.connect(recording);
       };
       if (this.capture.noiseSuppression && !this.denoiseUnavailable) {
         void startDenoise({ changed: retarget, trouble: () => {
@@ -862,7 +870,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
           if (!stopped) retarget();
         }).catch(() => {});
       }
-      const stop = () => {
+      const closeCapture = () => {
         if (stopped) return;
         stopped = true;
         clearInterval(timer);
@@ -871,9 +879,50 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         if (this.previewDenoise === pipeline) this.previewDenoise = null;
         source.disconnect();
         stream.getTracks().forEach((t) => t.stop());
+        recording?.stream.getTracks().forEach(track => track.stop());
         void ctx.close();
         onLevel(0);
       };
+      const stop = () => {
+        if (cancelled) return;
+        cancelled = true;
+        if (sampleTimer) clearTimeout(sampleTimer);
+        if (recorder?.state === "recording") recorder.stop();
+        closeCapture();
+        replay?.stop();
+        replay?.disconnect();
+      };
+      if (recording && playback) {
+        try {
+          recorder = new MediaRecorder(recording.stream);
+          const chunks: Blob[] = [];
+          recorder.ondataavailable = event => { if (!cancelled && event.data.size) chunks.push(event.data); };
+          recorder.onerror = () => { stop(); playback.error(new VoiceError("mic_failed", "Microphone recording failed")); };
+          recorder.onstop = () => {
+            // The input device is closed before any speaker receives the sample.
+            closeCapture();
+            if (cancelled || signal.aborted) return;
+            void (async () => {
+              try {
+                const output = this.ensureContext();
+                await output.resume();
+                const buffer = await output.decodeAudioData(await new Blob(chunks).arrayBuffer());
+                chunks.length = 0;
+                if (cancelled || signal.aborted) return;
+                replay = output.createBufferSource();
+                replay.buffer = buffer;
+                replay.connect(this.master!);
+                replay.onended = () => { replay?.disconnect(); if (!cancelled) playback.phase("idle"); };
+                playback.phase("playing");
+                replay.start();
+              } catch (error) { if (!cancelled && !signal.aborted) playback.error(error); }
+            })();
+          };
+          recorder.start();
+          playback.phase("recording");
+          sampleTimer = setTimeout(() => { if (recorder?.state === "recording") recorder.stop(); closeCapture(); }, 3000);
+        } catch (error) { stop(); throw error; }
+      }
       signal.addEventListener("abort", stop, { once: true });
       return () => { signal.removeEventListener("abort", stop); stop(); };
     } catch (error) {

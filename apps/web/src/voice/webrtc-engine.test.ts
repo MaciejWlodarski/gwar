@@ -1219,3 +1219,83 @@ describe("live server input gate control", () => {
     expect(gate().configure).toHaveBeenLastCalledWith(expect.objectContaining({ automatic: true, blocked: false }));
   });
 });
+
+it("records processed input without a speaker route, closes capture, then replays through the selected output", async () => {
+  const mic = microphone(), phase = vi.fn(), error = vi.fn(), sink = vi.fn(async () => {});
+  const decoded = deferred<AudioBuffer>();
+  getUserMedia.mockResolvedValue(mic.stream);
+  vi.stubGlobal("AudioContext", class extends Context {
+    setSinkId = sink;
+    createMediaStreamDestination() { return { ...node(), stream: microphone().stream }; }
+    decodeAudioData = () => decoded.promise;
+  });
+  vi.stubGlobal("MediaRecorder", class {
+    state = "inactive";
+    ondataavailable: ((event: { data: Blob }) => void) | null = null;
+    onstop: (() => void) | null = null;
+    start() { this.state = "recording"; }
+    stop() { this.state = "inactive"; this.ondataavailable?.({ data: new Blob(["sample"]) }); this.onstop?.(); }
+  });
+  await engine.setOutputDevice("headphones");
+  const abort = new AbortController();
+  const stop = await engine.startMicTest(vi.fn(), abort.signal, { phase, error });
+  expect(phase).toHaveBeenCalledWith("recording");
+  expect(cueSources).toHaveLength(0);
+  expect(Peer.all).toHaveLength(0);
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(mic.track.stop).toHaveBeenCalledOnce();
+  expect(cueSources).toHaveLength(0);
+  decoded.resolve({} as AudioBuffer);
+  await flush();
+  expect(sink).toHaveBeenCalledWith("headphones");
+  expect(phase).toHaveBeenLastCalledWith("playing");
+  expect(cueSources[0]!.start).toHaveBeenCalledOnce();
+  expect(mic.track.stop.mock.invocationCallOrder[0]).toBeLessThan(cueSources[0]!.start.mock.invocationCallOrder[0]!);
+  abort.abort();
+  expect(cueSources[0]!.stop).toHaveBeenCalledOnce();
+  stop();
+  expect(error).not.toHaveBeenCalled();
+});
+
+it("discards a sample whose decode finishes after cancellation", async () => {
+  const decoded = deferred<AudioBuffer>();
+  const phase = vi.fn();
+  vi.stubGlobal("AudioContext", class extends Context {
+    createMediaStreamDestination() { return { ...node(), stream: microphone().stream }; }
+    decodeAudioData = () => decoded.promise;
+  });
+  vi.stubGlobal("MediaRecorder", class {
+    state = "inactive";
+    ondataavailable: ((event: { data: Blob }) => void) | null = null;
+    onstop: (() => void) | null = null;
+    start() { this.state = "recording"; }
+    stop() { this.state = "inactive"; this.ondataavailable?.({ data: new Blob(["sample"]) }); this.onstop?.(); }
+  });
+  const abort = new AbortController();
+  await engine.startMicTest(vi.fn(), abort.signal, { phase, error: vi.fn() });
+  await vi.advanceTimersByTimeAsync(3000);
+  abort.abort();
+  decoded.resolve({} as AudioBuffer);
+  await flush();
+  expect(cueSources).toHaveLength(0);
+  expect(phase).not.toHaveBeenCalledWith("playing");
+});
+
+it("keeps browser gain tied to the stable person when receive slots are replaced", () => {
+  const gains: Array<ReturnType<typeof vi.fn>> = [];
+  vi.stubGlobal("Audio", class { srcObject = null; muted = true; play = async () => {}; });
+  vi.stubGlobal("AudioContext", class extends Context {
+    createGain() { const value = super.createGain(); gains.push(value.gain.setTargetAtTime); return value; }
+  });
+  const receive = engine as unknown as { attachSlot(slot: number, track: MediaStreamTrack): void };
+  engine.setUserVolume("stable-person", 0);
+  engine.setSlotOwner(0, "stable-person");
+  receive.attachSlot(0, microphone().track as unknown as MediaStreamTrack);
+  expect(gains.at(-1)).toHaveBeenLastCalledWith(0, 0, 0.015);
+  receive.attachSlot(0, microphone().track as unknown as MediaStreamTrack);
+  expect(gains.at(-1)).toHaveBeenLastCalledWith(0, 0, 0.015);
+  engine.setSlotOwner(0, "different-person");
+  expect(gains.at(-1)).toHaveBeenLastCalledWith(1, 0, 0.015);
+  engine.setUserVolume("different-person", 0.45);
+  expect(gains.at(-1)).toHaveBeenLastCalledWith(0.45, 0, 0.015);
+});

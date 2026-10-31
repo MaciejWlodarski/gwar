@@ -4,7 +4,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { defaultAudio, useSettings } from "../state/settings";
 import { useUi, useVoice } from "../state/stores";
-import { VoiceError, type MicPermission } from "../voice/engine";
+import { VoiceError, type MicPermission, type MicTestPlayback } from "../voice/engine";
 import { SettingsSection } from "./Settings";
 import { TooltipProvider } from "./kit";
 
@@ -12,7 +12,7 @@ const voice = vi.hoisted(() => ({
   capabilities: { outputDeviceSelection: true },
   listDevices: vi.fn(async () => ({ inputs: [{ id: "replacement", label: "Replacement microphone" }], outputs: [] })),
   micPermission: vi.fn<() => Promise<MicPermission>>(),
-  startMicTest: vi.fn<(onLevel: (level: number) => void, signal?: AbortSignal) => Promise<() => void>>(),
+  startMicTest: vi.fn<(onLevel: (level: number) => void, signal?: AbortSignal, playback?: MicTestPlayback) => Promise<() => void>>(),
 }));
 vi.mock("../state/controller", () => ({
   controller: { voice }, describeVoiceError: (error: Error) => error.message, UploadError: class extends Error {},
@@ -107,6 +107,45 @@ it.each(exits)("stops local capture immediately on %s", async (_name, leave) => 
   });
 });
 
+it.each(exits)("cancels recording and playback synchronously on %s", async (_name, leave) => {
+  const stop = vi.fn(); voice.startMicTest.mockResolvedValue(stop);
+  await mount();
+  await act(async () => button("Hear yourself").click());
+  const [, signal, playback] = voice.startMicTest.mock.calls.at(-1)!;
+  expect(playback).toBeDefined();
+  expect(container.textContent).toContain("Speak now");
+  await act(async () => playback!.phase("playing"));
+  expect(container.textContent).toContain("microphone off");
+  await act(async () => {
+    leave();
+    expect(signal!.aborted).toBe(true);
+  });
+  await act(async () => playback!.phase("recording"));
+  expect(container.textContent).not.toContain("Speak now");
+});
+
+it("allows an explicit PTT sample, stops it on request, and never restarts playback on focus", async () => {
+  useSettings.getState().setAudio({ inputMode: "ptt" });
+  await mount();
+  expect(voice.startMicTest).not.toHaveBeenCalled();
+  await act(async () => button("Hear yourself").click());
+  const signal = voice.startMicTest.mock.calls[0]![1]!;
+  await act(async () => button("Stop test").click());
+  expect(signal.aborted).toBe(true);
+  await act(async () => { window.dispatchEvent(new Event("blur")); window.dispatchEvent(new Event("focus")); });
+  expect(voice.startMicTest).toHaveBeenCalledOnce();
+});
+
+it("does not restart a sample when focus returns and ignores a late failure", async () => {
+  await mount();
+  await act(async () => button("Hear yourself").click());
+  const playback = voice.startMicTest.mock.calls.at(-1)![2]!;
+  await act(async () => { window.dispatchEvent(new Event("blur")); window.dispatchEvent(new Event("focus")); });
+  expect(voice.startMicTest.mock.calls.at(-1)![2]).toBeUndefined();
+  await act(async () => playback.error(new Error("obsolete")));
+  expect(container.querySelector('[role="alert"]')).toBeNull();
+});
+
 it("does not capture when the page opens in an unfocused window", async () => {
   const focus = vi.spyOn(document, "hasFocus").mockReturnValue(false);
   await mount();
@@ -188,4 +227,18 @@ it("explains unsupported manual sensitivity while preserving the saved choice", 
   expect(container.textContent).toContain("Manual sensitivity needs a newer server.");
   expect(container.querySelector('[role="slider"][aria-label="Input sensitivity"]')).toBeNull();
   expect(useSettings.getState().audio).toMatchObject({ automaticSensitivity: false, vadThreshold: -80 });
+});
+
+it.each([
+  { inputDeviceId: "replacement" }, { outputDeviceId: "replacement" },
+  { noiseStrength: 50 }, { masterVolume: 0 },
+])("retires a sample before changing devices or processing: %j", async patch => {
+  await mount();
+  await act(async () => button("Hear yourself").click());
+  const signal = voice.startMicTest.mock.calls.at(-1)![1]!;
+  await act(async () => {
+    useSettings.getState().setAudio(patch);
+    expect(signal.aborted).toBe(true);
+  });
+  expect(voice.startMicTest.mock.calls.at(-1)![2]).toBeUndefined();
 });

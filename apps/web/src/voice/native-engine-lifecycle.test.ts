@@ -180,7 +180,7 @@ describe("native microphone test replacement", () => {
     expect(bridge.invoke.mock.calls.some(([command]) => command === "mic_test_start")).toBe(false);
     unmuted.resolve();
     const stop = await preview;
-    expect(bridge.invoke).toHaveBeenCalledWith("mic_test_start", { owner: 1, input: null, test: 1 });
+    expect(bridge.invoke).toHaveBeenCalledWith("mic_test_start", { owner: 1, input: null, test: 1, playback: false });
     stop();
   });
 
@@ -413,4 +413,36 @@ describe("native acknowledged input mode transitions", () => {
     await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: false }));
     expect(bridge.invoke).not.toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: true });
   });
+});
+
+it("scopes recorded-sample status and errors to its owner/test and retires playback on abort", async () => {
+  const view = engine(), abort = new AbortController(), phase = vi.fn(), error = vi.fn();
+  await view.startMicTest(vi.fn(), abort.signal, { phase, error });
+  expect(bridge.invoke).toHaveBeenCalledWith("mic_test_start", { owner: 1, input: null, test: 1, playback: true });
+  emit("voice://test-state", { owner: 2, test: 1, state: "playing" });
+  emit("voice://test-state", { owner: 1, test: 2, state: "playing" });
+  expect(phase).not.toHaveBeenCalled();
+  emit("voice://test-state", { owner: 1, test: 1, state: "playing" });
+  expect(phase).toHaveBeenCalledWith("playing");
+  emit("voice://test-state", { owner: 1, test: 1, state: "idle", error: "Output unavailable" });
+  expect(error).toHaveBeenCalledWith(expect.objectContaining({ kind: "output_failed" }));
+  abort.abort();
+  phase.mockClear(); error.mockClear();
+  emit("voice://test-state", { owner: 1, test: 1, state: "playing", error: "obsolete" });
+  expect(phase).not.toHaveBeenCalled(); expect(error).not.toHaveBeenCalled();
+  await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1, test: 1 }));
+});
+
+it("applies the same person's saved gain to replacement native receive slots", async () => {
+  const view = engine();
+  view.setUserVolume("stable-uid", 0);
+  view.setSlotOwner(0, "stable-uid");
+  view.setSlotOwner(1, "stable-uid");
+  await view.stop();
+  expect(bridge.invoke).toHaveBeenCalledWith("voice_set_slot_gain", { owner: 1, slot: 0, gain: 0 });
+  expect(bridge.invoke).toHaveBeenCalledWith("voice_set_slot_gain", { owner: 1, slot: 1, gain: 0 });
+  view.setSlotOwner(0, "different-uid");
+  await view.stop();
+  expect(bridge.invoke).toHaveBeenLastCalledWith("voice_stop", expect.anything());
+  expect(bridge.invoke).toHaveBeenCalledWith("voice_set_slot_gain", { owner: 1, slot: 0, gain: 1 });
 });

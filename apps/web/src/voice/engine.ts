@@ -10,6 +10,10 @@ import { dbToLevel } from "./input-sensitivity";
 
 export type InputMode = "vad" | "ptt";
 export type MicPermission = "granted" | "prompt" | "denied" | "unknown";
+export interface MicTestPlayback {
+  phase(value: "recording" | "playing" | "idle"): void;
+  error(error: unknown): void;
+}
 
 export interface CaptureOptions {
   noiseSuppression: boolean;
@@ -140,7 +144,7 @@ export interface VoiceEngine {
   /** Read-only permission check: never opens the microphone or prompts. */
   micPermission(): Promise<MicPermission>;
   /** Local-only capture; cancellation also retires a pending device request. */
-  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal): Promise<() => void>;
+  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal, playback?: MicTestPlayback): Promise<() => void>;
 
   on<E extends keyof VoiceEvents>(event: E, handler: (value: VoiceEvents[E]) => void): () => void;
 }

@@ -86,7 +86,7 @@ describe("welcome", () => {
     const again = reduce(s, { type: "welcome", resync: true, now: 9, welcome: welcome({ session: 7, uid: "u1", clients: [cl(7, 1, { uid: "u1" })] }) });
     expect(again.threads["dm:u2"]).toBeDefined();
     expect(again.threads["ch:1"]?.items).toHaveLength(0);
-    expect(again.threads["server"]?.items.at(-1)).toMatchObject({ text: { key: "sys.reconnected" } });
+    expect(again.threads["server"]?.items.filter(i => i.kind === "sys" && i.text.key === "sys.reconnected") ?? []).toHaveLength(0);
     expect(again.epoch).toBe(s.epoch + 1);
   });
 });
@@ -102,13 +102,13 @@ describe("clients and channels", () => {
     expect(s.clients[3]).toBeUndefined();
   });
 
-  it("adds join/leave notices for my channel only", () => {
+  it("keeps voice presence out of channel messages", () => {
     let s = online();
     s = ev(s, { ev: "client.joined", d: cl(3, 1) });
     s = ev(s, { ev: "client.joined", d: cl(4, 2) });
     s = ev(s, { ev: "client.left", d: { client: 3, reason: { kind: "quit" } } });
     const texts = s.threads["ch:1"]?.items.filter((i) => i.kind === "sys").map((i) => (i.kind === "sys" ? i.text.key : ""));
-    expect(texts).toEqual(["sys.user_joined_channel", "sys.user_left_channel"]);
+    expect(texts).toEqual([]);
   });
 
   it("shows the new channel's chat when I enter it and keeps the other channels' threads", () => {
@@ -117,7 +117,8 @@ describe("clients and channels", () => {
     expect(s.threads["ch:1"]?.items.length).toBeGreaterThan(0);
     s = ev(s, { ev: "client.updated", d: cl(1, 2) });
     expect(s.threads["ch:1"]?.items.length).toBeGreaterThan(0);
-    expect(s.threads["ch:2"]?.items[0]).toMatchObject({ text: { key: "sys.you_joined_channel", params: { name: "c2" } } });
+    expect(s.threads["ch:2"]?.items).toHaveLength(0);
+    expect(s.threads["ch:2"]?.locked).toBe(false);
     expect(s.viewChannel).toBe(2);
     expect(storedKey(s, "channel")).toBe("ch:2");
   });

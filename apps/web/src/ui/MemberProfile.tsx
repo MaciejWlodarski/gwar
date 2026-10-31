@@ -15,6 +15,7 @@ import { isDesktop } from "../platform";
 import { useAccount } from "../state/account";
 import { shortUid } from "../connect/ts-list";
 import { Avatar, Button, Dialog, Field, Input } from "./kit";
+import { PersonAudio } from "./PersonAudio";
 
 export function NicknameDialog({ uid }: { uid: string }) {
   const t = useT();
@@ -117,6 +118,7 @@ export function MemberProfileDialog({ uid, fallback }: { uid: string; fallback: 
             </Button>
           </div>
         )}
+        {!own && <PersonAudio uid={uid} />}
         <Field label={t("member.uid")}>
           {(id) => (
             <div className="flex gap-2">

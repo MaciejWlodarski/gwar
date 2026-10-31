@@ -1,4 +1,4 @@
-import { Headphones, HeadphoneOff, Mic, MicOff, MonitorUp, PhoneOff } from "lucide-react";
+import { Headphones, HeadphoneOff, Mic, MicOff, MonitorUp, PhoneOff, SlidersHorizontal } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
@@ -7,12 +7,13 @@ import { canOpenMicrophoneSettings, openMicrophoneSettings } from "../platform";
 import { useScreen } from "../state/screen";
 import { useSettings } from "../state/settings";
 import { myChannelId } from "../state/reducer";
-import { useSession, useVoice } from "../state/stores";
+import { useSession, useUi, useVoice } from "../state/stores";
 import { qualityTone, useChannelPermission, useConnectionQuality, useMe, keyLabel, modKey } from "./hooks";
 import { Button, Dialog, IconButton, TalkingAvatar, Tooltip } from "./kit";
 import { showVoiceChannel, useVoicePill } from "./nav";
 import { ConnectBadge } from "./badges";
 import { ShareButton } from "./Screen";
+import { AudioDevices } from "./AudioDevices";
 import { ConnectionIndicator } from "./ConnectionQuality";
 
 /** Mic toggle that doubles as a level meter and talking indicator. */
@@ -69,6 +70,18 @@ export function DeafenButton({ size = "lg" }: { size?: "md" | "lg" | "wide" }) {
       {deafened ? <HeadphoneOff className="size-[18px]" /> : <Headphones className="size-[18px]" />}
     </IconButton>
   );
+}
+
+/** Always visible, including on touch screens. */
+export function AudioDeviceButton({ size = "wide" }: { size?: "wide" | "md" }) {
+  const t = useT();
+  const [open, setOpen] = useState(false);
+  return <>
+    <IconButton size={size} label={t("audio.devices")} onClick={() => setOpen(true)} className="bg-hover text-fg hover:bg-active"><SlidersHorizontal className="size-[18px]" /></IconButton>
+    <Dialog open={open} onOpenChange={setOpen} title={t("audio.devices")} width="max-w-md" footer={<Button onClick={() => { setOpen(false); useUi.getState().openSettings("audio"); }}>{t("person.voiceSettings")}</Button>}>
+      {open && <AudioDevices compact />}
+    </Dialog>
+  </>;
 }
 
 /** Who I am here: avatar (with the talking ring), nickname with the Connect badge, and one line under it. */
@@ -249,6 +262,7 @@ export function VoicePanel() {
         <MicButton size="wide" />
         <DeafenButton size="wide" />
         <ShareButton />
+        <AudioDeviceButton />
       </div>
     </div>
   );

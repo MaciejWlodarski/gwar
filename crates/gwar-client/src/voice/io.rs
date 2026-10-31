@@ -745,6 +745,48 @@ fn open_output(
     Ok(stream)
 }
 
+/// Play a microphone sample only after its caller has closed capture. Cancellation
+/// is also checked by the device callback, so hiding the window silences it at once.
+pub fn play_sample(output: Option<String>, samples: Vec<f32>, cancelled: Arc<AtomicBool>) -> anyhow::Result<()> {
+    anyhow::ensure!(!samples.is_empty(), "No microphone audio was recorded");
+    let (mut tx, rx) = RingBuffer::new(samples.len());
+    let duration = Duration::from_secs_f64(samples.len() as f64 / 48_000.0);
+    for sample in samples {
+        let _ = tx.push(sample);
+    }
+    if cancelled.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let timing = Arc::new(OutputTiming::default());
+    let route = output.map_or(Route::Default(None), Route::Named);
+    let active = Arc::new(AtomicU64::new(1));
+    let trouble: TroubleFn = Arc::new(|e| tracing::debug!("microphone sample output: {e:?}"));
+    let _stream = open_output(
+        &cpal::default_host(),
+        &route,
+        Arc::new(Mutex::new(rx)),
+        timing,
+        (active, 1),
+        trouble,
+        vec![cancelled.clone()],
+    )?;
+    let deadline = Instant::now() + duration + Duration::from_millis(500);
+    while tx.slots() < tx.buffer().capacity() && Instant::now() < deadline {
+        if cancelled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    anyhow::ensure!(tx.slots() == tx.buffer().capacity(), "Audio output did not play the microphone sample");
+    for _ in 0..10 {
+        if cancelled.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
+}
+
 /// Outside a call, play a short cue on the chosen output without ever opening the microphone.
 /// The counter bounds this to two workers/streams; bursts are dropped, never queued.
 pub fn play_cue(output: Option<String>, samples: Vec<f32>, busy: Arc<AtomicUsize>, silence: Vec<Arc<AtomicBool>>) {

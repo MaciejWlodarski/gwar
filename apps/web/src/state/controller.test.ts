@@ -200,7 +200,7 @@ beforeEach(() => {
   vi.useFakeTimers();
   vi.clearAllMocks();
   controller.sounds.reset();
-  settings.useSettings.setState({ sounds: defaultSounds });
+  settings.useSettings.setState({ sounds: defaultSounds, userVolumes: {}, userMuted: {} });
   settings.useSettings.setState({ onboarding: { completed: true, firstUsedAt: 1, nudgeDismissed: false, roleReceived: false } });
   engine.capabilities.encryptedVoice = async () => true;
   link = new FakeLink();
@@ -2921,4 +2921,21 @@ describe("native voice uplink fallback", () => {
       }
     } finally { delete win.__TAURI_INTERNALS__; voiceState("idle"); }
   });
+});
+
+it("applies local mute without losing volume and restores the previous level", () => {
+  const s = () => settings.useSettings.getState();
+  s().setUserVolume("stable-person", 0.45);
+  expect(engine.setUserVolume).toHaveBeenLastCalledWith("stable-person", 0.45);
+  s().setUserMuted("stable-person", true);
+  expect(engine.setUserVolume).toHaveBeenLastCalledWith("stable-person", 0);
+  expect(s().userVolumes["stable-person"]).toBe(0.45);
+  s().setUserVolume("stable-person", 0.7);
+  expect(engine.setUserVolume).toHaveBeenLastCalledWith("stable-person", 0);
+  s().setUserMuted("stable-person", false);
+  expect(engine.setUserVolume).toHaveBeenLastCalledWith("stable-person", 0.7);
+  s().setUserMuted("stable-person", true);
+  s().setUserMuted("stable-person", false);
+  s().setUserVolume("stable-person", 1);
+  expect(engine.setUserVolume).toHaveBeenLastCalledWith("stable-person", 1);
 });

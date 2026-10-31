@@ -8,7 +8,10 @@ export function useMicPreview(engine: VoiceEngine) {
   const [level, setLevel] = useState(0);
   const [needsPermission, setNeedsPermission] = useState(false);
   const [error, setError] = useState<unknown>(null);
+  const [playback, setPlayback] = useState<"idle" | "recording" | "playing">("idle");
   const request = useRef<() => void>(() => {});
+  const listen = useRef<() => void>(() => {});
+  const stop = useRef<() => void>(() => {});
 
   useEffect(() => {
     let visible = document.visibilityState !== "hidden";
@@ -16,13 +19,14 @@ export function useMicPreview(engine: VoiceEngine) {
     let generation = 0;
     let key = "";
     let active: AbortController | null = null;
-    const retire = () => { active?.abort(); active = null; setLevel(0); };
-    const refresh = (explicit = false) => {
+    const retire = () => { active?.abort(); active = null; setLevel(0); setPlayback("idle"); };
+    const refresh = (explicit = false, sample = false) => {
       const audio = useSettings.getState().audio;
       const voice = useVoice.getState();
       const ui = useUi.getState();
-      const eligible = visible && focused && ui.section === "settings" && ui.settingsTab === "audio" && audio.inputMode === "vad" && !voice.muted && !voice.deafened && voice.state === "idle";
-      const next = JSON.stringify([eligible, audio.inputDeviceId, audio.noiseSuppression, audio.echoCancellation, audio.autoGainControl]);
+      const available = visible && focused && ui.section === "settings" && ui.settingsTab === "audio" && !voice.muted && !voice.deafened && voice.state === "idle";
+      const eligible = available && (sample || audio.inputMode === "vad");
+      const next = JSON.stringify([available, audio.inputMode, audio.inputDeviceId, audio.outputDeviceId, audio.masterVolume, audio.noiseSuppression, audio.noiseStrength, audio.echoCancellation, audio.autoGainControl]);
       if (!explicit && key === next) return;
       key = next;
       const current = ++generation;
@@ -30,6 +34,7 @@ export function useMicPreview(engine: VoiceEngine) {
       setNeedsPermission(false);
       if (!eligible) return;
       setError(null);
+      if (sample) setPlayback("recording");
       void (async () => {
         const permission = explicit ? "granted" : await engine.micPermission().catch(() => "unknown");
         if (generation !== current) return;
@@ -39,7 +44,14 @@ export function useMicPreview(engine: VoiceEngine) {
         try {
           const stop = await engine.startMicTest(value => {
             if (generation === current && !capture.signal.aborted) setLevel(value);
-          }, capture.signal);
+          }, capture.signal, sample ? {
+            phase: value => { if (generation === current && !capture.signal.aborted) setPlayback(value); },
+            error: failure => {
+              if (generation !== current || capture.signal.aborted) return;
+              retire();
+              setError(failure);
+            },
+          } : undefined);
           if (capture.signal.aborted || generation !== current) stop();
           else capture.signal.addEventListener("abort", stop, { once: true });
         } catch (failure) {
@@ -47,6 +59,7 @@ export function useMicPreview(engine: VoiceEngine) {
           active = null;
           capture.abort();
           setError(failure);
+          setPlayback("idle");
           setNeedsPermission(true);
         }
       })();
@@ -55,6 +68,8 @@ export function useMicPreview(engine: VoiceEngine) {
     const blur = () => { focused = false; refresh(); };
     const focus = () => { focused = true; visible = document.visibilityState !== "hidden"; refresh(); };
     request.current = () => { if (!active || active.signal.aborted) refresh(true); };
+    listen.current = () => refresh(true, true);
+    stop.current = () => { ++generation; retire(); };
     const unlisten = [useSettings.subscribe(() => refresh()), useVoice.subscribe(() => refresh()), useUi.subscribe(() => refresh())];
     document.addEventListener("visibilitychange", visibility);
     window.addEventListener("blur", blur);
@@ -64,6 +79,8 @@ export function useMicPreview(engine: VoiceEngine) {
       ++generation;
       retire();
       request.current = () => {};
+      listen.current = () => {};
+      stop.current = () => {};
       unlisten.forEach(fn => fn());
       document.removeEventListener("visibilitychange", visibility);
       window.removeEventListener("blur", blur);
@@ -71,5 +88,5 @@ export function useMicPreview(engine: VoiceEngine) {
     };
   }, [engine]);
 
-  return { level, needsPermission, error, request: () => request.current() };
+  return { level, needsPermission, error, playback, request: () => request.current(), listen: () => listen.current(), stop: () => stop.current() };
 }

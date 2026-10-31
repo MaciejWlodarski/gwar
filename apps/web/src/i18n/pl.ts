@@ -1,6 +1,20 @@
 import type { Key } from "./en";
 
 export const pl: Record<Key, string> = {
+  "person.mute": "Wycisz dla mnie",
+  "person.volume": "Głośność dla mnie",
+  "person.muted": "Wyciszono dla mnie",
+  "person.changed": "Głośność dla mnie: {volume}%",
+  "person.controls": "Opcje: {name}",
+  "person.voiceSettings": "Ustawienia dźwięku",
+  "audio.listen": "Posłuchaj siebie",
+  "audio.stopListening": "Zatrzymaj test",
+  "audio.listenHint": "3 s nagrania, potem odsłuch. Użyj słuchawek.",
+  "audio.recording": "Mów teraz — nagrywanie 3 s…",
+  "audio.playing": "Odsłuch — mikrofon wyłączony.",
+  "audio.listenInCall": "Opuść rozmowę, aby zrobić test.",
+  "audio.listenMuted": "Włącz mikrofon, aby zrobić test.",
+
   "settings.sounds": "Dźwięki",
   "sounds.enabled": "Dźwięki zdarzeń",
   "sounds.hint": "Subtelne sygnały, gdy coś dzieje się w Gwarze.",

@@ -148,9 +148,13 @@ const RECORD_FIXTURES: Record<keyof typeof RECORDS, Record<number, { stored: Rec
 };
 /** The settings (localStorage) per version, and a check of the settings store after loading them. */
 const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: string; bookmarks: unknown[] }): void }> = {
+  7: {
+    stored: { version: 7, state: { theme: "dark", bookmarks: [], userVolumes: { "stable-identity": 0.45 }, userMuted: { "stable-identity": true } } },
+    check: state => expect(state).toMatchObject({ userVolumes: { "stable-identity": 0.45 }, userMuted: { "stable-identity": true } }),
+  },
   6: {
-    stored: { state: { theme: "dark", bookmarks: [], sounds: { enabled: false, volume: 0.25, events: { mute: false } } }, version: 6 },
-    check: state => { expect(state).toMatchObject({ sounds: { enabled: false, volume: 0.25, events: { mute: false, peerJoin: true } } }); },
+    stored: { state: { theme: "dark", bookmarks: [], userVolumes: { "old-identity": 0.35 }, sounds: { enabled: false, volume: 0.25, events: { mute: false } } }, version: 6 },
+    check: state => { expect(state).toMatchObject({ userVolumes: { "old-identity": 0.35 }, userMuted: {}, sounds: { enabled: false, volume: 0.25, events: { mute: false, peerJoin: true } } }); },
   },
   5: {
     stored: { state: { theme: "light", bookmarks: [], onboarding: { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true }, audio: { automaticSensitivity: false, vadThreshold: -72, inputMode: "ptt" } }, version: 5 },
@@ -420,6 +424,20 @@ describe("the settings (localStorage)", () => {
   }
   afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
 
+
+it("migrates v6 person volumes losslessly and remembers local mute across restarts", async () => {
+  const prefs = { userVolumes: { "stable-uid": 0.45, "other-uid": 1.75 }, audio: { inputDeviceId: "saved-mic", outputDeviceId: "saved-output", noiseStrength: 35 }, sounds: { enabled: false, volume: 0.2 }, theme: "light", bookmarks: [{ id: "server", name: "Saved", address: "localhost", kind: "gwar" }] };
+  const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ version: 6, state: prefs }) });
+  const first = await page(storage);
+  expect(first.useSettings.getState()).toMatchObject({ ...prefs, userMuted: {} });
+  first.useSettings.getState().setUserMuted("stable-uid", true);
+  const second = await page(storage);
+  expect(second.useSettings.getState()).toMatchObject({ ...prefs, userMuted: { "stable-uid": true } });
+  second.useSettings.getState().setUserMuted("stable-uid", false);
+  expect(second.useSettings.getState().userVolumes).toEqual(prefs.userVolumes);
+  expect(second.useSettings.getState().userMuted).toEqual({});
+});
+
   it("restores saved mute and deafen before the voice store is created", async () => {
     const storage = memory({});
     const first = await page(storage);
@@ -459,7 +477,7 @@ describe("the settings (localStorage)", () => {
     expect(s()).toMatchObject({ resumeConnection: null, updateVoiceResume: null });
   });
 
-  it.each([1, 2, 3, 4, 5])("migrates version %s to v6 losslessly, preserving even previously stored sounds", async version => {
+  it.each([1, 2, 3, 4, 5])("migrates version %s to the current version losslessly, preserving even previously stored sounds", async version => {
     const audio = { inputMode: "ptt", inputDeviceId: "saved-mic", outputDeviceId: "saved-speaker", noiseSuppression: false, echoCancellation: false, autoGainControl: false, automaticSensitivity: false, vadThreshold: -72 };
     const onboarding = { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true };
     const session = { selfMuted: true, selfDeafened: true, resumeConnection: { address: "a.example", kind: "gwar", name: "A", password: "saved-password", identity: "saved-identity", insecureLan: true }, updateVoiceResume: { address: "a.example", kind: "gwar", version: "1.0", expiresAt: 123456, channel: 2, password: "channel-password" } };
@@ -469,7 +487,7 @@ describe("the settings (localStorage)", () => {
     const expected = { theme: "dark", onboarding, ...session, audio, sounds: { ...sounds, events: { ...sounds.events, peerJoin: true } } };
     expect(useSettings.getState()).toMatchObject(expected);
     const saved = JSON.parse(storage.getItem(SETTINGS_KEY)!);
-    expect(saved.version).toBe(6);
+    expect(saved.version).toBe(SETTINGS_VERSION);
     expect(saved.state).toMatchObject(expected);
   });
 
