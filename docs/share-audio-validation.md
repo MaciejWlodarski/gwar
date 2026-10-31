@@ -1,4 +1,6 @@
-# P1-6 browser share audio validation
+# P1-6 share audio validation
+
+PR 2, the desktop app, is at the [end](#pr-2-desktop-app). The sections before it are PR 1.
 
 Original base: `origin/main` at `1a54b517`; round 3 merges `1e0e6d60` (#206,
 #208 and #207) and follows their v7/v8/v9 migrations with share-audio v10.
@@ -529,3 +531,75 @@ The initial default-worker web run timed out in unrelated storage/archive tests
 while cold Rust dependencies compiled; the two-worker full rerun passed. Logs
 are retained in `/tmp/gwar-share-audio-*`; initial test/compile failures are kept
 separately from final runs.
+
+## PR 2: desktop app
+
+Base `origin/main` at `fb32779b`, macOS 27.0 on an Apple M5, Chromium 153.0.8010.12.
+All services are local and media is generated. `crates/gwar-server`, `gwar-proto`,
+`gwar-media` and `vendor` have no changes, so SFU behaviour and its budgets are unchanged.
+
+### What ran on this Mac
+
+| Check | Result |
+| --- | --- |
+| Real ScreenCaptureKit capture, `this_mac_captures_other_processes_and_leaves_this_one_out` | Another process's tone arrives at 0.00270; the same tone from this process reads 0.0000000 |
+| Exclusion, Swift probe at −50 dBFS | `afplay` −51 dB; in-process `AVAudioEngine` −240 dB; **`WKWebView` −50.6 dB, not excluded** (hence `silenceWebviewMedia`) |
+| Real hidden `WKWebView`, the real worklet and worker over WebRTC loopback for 14 s | Context stays running with the window hidden, 50–54 receive frames/s, `totalSamplesReceived` 0: the webview decodes nothing |
+| `native-voice.mjs`, Chromium and WebKit | Pass. The real capture queue, webview sender, local SFU, receive transform and native playout carry a 997 Hz tone from a native sharer to a native viewer: 50 frames/s, first decode about 100 ms after the controls appear, no player in that webview. Mute, unmute, withdrawal and voice beside it are checked |
+| Rust | 231 voice tests, 18 of them share playout; desktop `share_audio`; 241 screen lib tests; 19 `--test screen`; the voice headroom matrix |
+| Web | Typecheck, lint, 2,452 Vitest tests; `screen.mjs` with sound, H.264 canvas on Chromium and WebKit, `e2e:watch`, `e2e:denoise` |
+
+`native_bridge` stands in for the desktop shell in that test: its "computer" is a tone and
+its virtual speaker is mono, so the stereo side path is covered only by unit tests.
+A real Tauri app was not started: the picker needs a person, and the installed app is
+off limits. The bridge's JSON IPC is also far slower than Tauri's, so playout counters
+from it say nothing about the real app. One early run saw no decoded sound for 15 s
+beside slot controls racing in that concurrent bridge. Controls are now serialized, and
+it did not come back in the later runs, but the cause was not proven.
+
+### Voice
+
+The adversarial 1 Mb/s limit is unchanged. `low_bandwidth_bursts_preserve_voice_with_and_without_video`:
+
+| Service | Video | `origin/main` p99 | This branch p99 |
+| --- | --- | --- | --- |
+| 1 ms | no | 9.048 ms | 9.048 ms |
+| 1 ms | yes | 9.144 ms | 9.144 ms |
+| 5 ms | no | 9.048 ms | 9.048 ms |
+| 5 ms | yes | 9.288 ms | 9.288 ms |
+| 10 ms | no | 9.048 ms | 9.048 ms |
+| 10 ms | yes | 9.288 ms | 9.288 ms |
+
+Native voice under four shares, by `four_shares_leave_the_voice_pipeline_on_time` in release:
+the real pipeline, six alternating pairs of 20 s arms, from a microphone block to its encoded
+frame. Without shares p99 is 0.61–0.98 ms; with four 64 kb/s stereo shares it is 0.78–1.06 ms.
+The p99 delta per pair is −0.10 to +0.17 ms. Maximum is 7.9 ms with shares and 7.7 ms
+without. This is an in-process measure, **not** paired mouth-to-ear.
+
+### Startup
+
+The committed assertions are unchanged and pass 8/8 on both revisions, twice, with zero
+probes. As in round 6, a local uncommitted copy changed only the observation wait: 50 ms for
+ten seconds, then 500 ms. Order: main, this branch, main, this branch; nothing else ran.
+First time at target size, seconds:
+
+| Case | main 1 | main 2 | branch 1 | branch 2 | Median change |
+| --- | --- | --- | --- | --- | --- |
+| `h264-barcode20-0` | 1.166 | 1.172 | 1.152 | 1.258 | +3.0% |
+| `h264-barcode20-1` | 1.162 | 1.153 | 1.152 | 1.196 | +1.4% |
+| `h264-busy60-0` | 1.166 | 1.168 | 1.150 | 1.164 | −0.9% |
+| `h264-busy60-1` | 1.158 | 1.161 | 1.141 | 1.183 | +0.2% |
+| `vp9-barcode20-0` | 0.732 | 0.747 | 0.744 | 0.680 | −3.7% |
+| `vp9-barcode20-1` | 1.087 | 1.036 | 1.042 | 1.106 | +1.2% |
+| `vp9-busy60-0` | 1.254 | 1.229 | 1.219 | 1.279 | +0.6% |
+| `vp9-busy60-1` | 1.169 | 1.219 | 1.223 | 1.148 | −0.7% |
+
+The last H.264 busy case was recorded as CPU-limited on both runs of this branch (12.9 and
+13.5 ms/frame in OpenH264) and neither run of main. Every run settled at 1080p60. Browser
+encoding paths did not change, and two runs per side cannot say whether this means anything.
+
+### Not measured here
+
+Windows capture and WebView2 exclusion, Windows 10 builds, the macOS permission flow in a real
+app, physical AEC on speakers, lip-sync, paired mouth-to-ear, real stereo output, and a real app
+hidden for minutes. The owner test list is in the pull request. Windows code is compiled by CI only.
