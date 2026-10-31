@@ -102,3 +102,12 @@ The migration regressions were first observed failing with the old read-only/exi
 Host limits remain explicit: the Mac compiles the native bridge and exercises real temporary plist files with injected authorization and OS-version decisions. It does not establish installed login/approval behavior, or execution on an actual macOS 11–12 machine. The actual Windows adapter and test code cross-compile for Windows GNU in an isolated harness with a minimal Tauri handle stub; real registry migration, HKLM permission failures, Task Manager state, and login launch still require Windows. No installed Gwar app, production Gwar, or TeamSpeak was used.
 
 Round-3 checks passed: typecheck; lint (zero errors, four pre-existing warnings); full Vitest (152 files, 2,229 tests); cargo fmt; desktop Clippy with warnings denied; full desktop crate tests (67 passed, one pre-existing signed-updater fixture ignored); isolated Windows GNU cross-compilation of the actual adapter/tests; and responsive browser checks with 72 refreshed screenshots. The cached RustSec check reports zero vulnerabilities with the existing documented maintenance/soundness warnings. No dependency or lockfile changes are introduced.
+
+
+## Review round 4
+
+S1 is fixed narrowly: validate the current executable independently, then accept an unquoted Run value only if it equals that exact path or the old plugin's exact path-plus-one-space format. An unquoted stale target cannot establish ownership and is retained with a not-recognized error; quoted owned moved targets still migrate. The reported `C:\Tools\helper.exe \gwar.exe` command, its trailing-space variant, and other ambiguous values remain byte-for-byte unchanged, with no write or effective-state query. The regression first failed on the reviewed head by returning `Enabled`, then passed after the fix. Existing successful-migration and write-failure fixtures now use the permitted formats.
+
+No UI, dependency, schema, or platform-policy changes are included. Round-3 screenshots remain current. Real Windows registry/login acceptance and installed macOS acceptance retain the limits documented above.
+
+Round-4 validation passed: typecheck; lint (zero errors, the same four existing warnings); full Vitest (152 files, 2,229 tests); cargo fmt; desktop Clippy with warnings denied; desktop tests (68 passed, one existing updater fixture ignored); and isolated Windows GNU cross-compilation of the actual adapter and tests. All Cargo commands used `CARGO_BUILD_JOBS=4`.

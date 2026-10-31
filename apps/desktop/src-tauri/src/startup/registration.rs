@@ -340,12 +340,12 @@ mod windows {
         let run = format!(r"{path}\Run");
         let approved = format!(r"{path}\Approved");
         let run_key = CURRENT_USER.create(&run).unwrap();
-        run_key.set_string("Gwar", r"C:\Old Gwar\gwar.exe ").unwrap();
+        let current = r"C:\Program Files\Gwar\gwar.exe";
+        run_key.set_string("Gwar", format!("{current} ")).unwrap();
         let approved_key = CURRENT_USER.create(&approved).unwrap();
         let approval = [3u8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
         approved_key.set_bytes("Gwar", windows_registry::Type::Bytes, &approval).unwrap();
         let mut entry = RunEntry { root: CURRENT_USER, run: &run, approved: &approved };
-        let current = r"C:\Program Files\Gwar\gwar.exe";
         assert_eq!(model::reconcile(&mut entry, current).unwrap().state, LoginState::Disabled);
         assert_eq!(run_key.get_string("Gwar").unwrap(), format!("\"{current}\""));
         assert_eq!(approved_key.get_value("Gwar").unwrap().as_ref(), &approval);

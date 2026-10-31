@@ -39,13 +39,17 @@ pub fn reconcile<E: Entry>(entry: &mut E, executable: &str) -> Result<Snapshot, 
 
 #[cfg(any(windows, test))]
 pub fn windows_retarget(value: &str, executable: &str) -> Result<String, String> {
-    let command = value.trim_end_matches(' ');
-    let path = if let Some(quoted) = command.strip_prefix('"') {
-        quoted.strip_suffix('"').ok_or("Unrecognized Gwar startup command")?
+    if !windows_owned_path(executable) {
+        return Err("Current startup executable is not a recognized Gwar executable".into());
+    }
+    let owned = if let Some(quoted) = value.strip_prefix('"') {
+        quoted.trim_end_matches(' ').strip_suffix('"').is_some_and(windows_owned_path)
     } else {
-        command
+        // The old plugin wrote exactly the executable path plus one space, with no args.
+        // Other unquoted values can be another program followed by arguments.
+        value == executable || value.strip_suffix(' ') == Some(executable)
     };
-    if !windows_owned_path(path) || !windows_owned_path(executable) {
+    if !owned {
         return Err("Startup entry is not a recognized Gwar executable; left unchanged".into());
     }
     super::windows_command(executable)
@@ -229,10 +233,25 @@ mod tests {
     const MAC: &str = "/Applications/New & Friends/Gwar.app/Contents/MacOS/gwar";
 
     #[test]
+    fn r4_s1_refuses_ambiguous_unquoted_commands_without_writes_or_state_queries() {
+        for value in [
+            r"C:\Tools\helper.exe \gwar.exe",
+            r"C:\Tools\helper.exe \gwar.exe ",
+            r"C:\Old\gwar.exe ",
+            &format!("{WIN}  "),
+        ] {
+            let mut entry = win(Some(value), LoginState::Enabled);
+            let error = reconcile(&mut entry, WIN).expect_err("ambiguous unquoted command is not ours");
+            assert!(error.contains("not a recognized Gwar executable"));
+            assert_eq!(entry.value.as_deref(), Some(value));
+            assert_eq!((entry.writes, entry.queries), (0, 0));
+        }
+    }
+    #[test]
     fn r3_s1_migrates_legacy_and_moved_windows_targets_without_enabling_disabled_entries() {
-        for command in [r"C:\Program Files\Old Gwar\gwar.exe ", r#""D:\Moved Gwar\gwar.exe""#, WIN] {
+        for command in [format!("{WIN} "), r#""D:\Moved Gwar\gwar.exe""#.into(), WIN.into()] {
             for state in [LoginState::Enabled, LoginState::Disabled] {
-                let mut entry = win(Some(command), state);
+                let mut entry = win(Some(&command), state);
                 assert_eq!(reconcile(&mut entry, WIN).unwrap(), Snapshot { present: true, state });
                 assert_eq!(entry.value.as_deref(), Some(format!("\"{WIN}\"").as_str()));
                 assert_eq!(entry.writes, 1);
@@ -248,7 +267,7 @@ mod tests {
     #[test]
     fn recognizes_the_packaged_binary_name_as_well_as_legacy_gwar_names() {
         assert_eq!(
-            windows_retarget(r"C:\Old\gwar-desktop.exe ", r"D:\New\gwar-desktop.exe").unwrap(),
+            windows_retarget(r#""C:\Old\gwar-desktop.exe""#, r"D:\New\gwar-desktop.exe").unwrap(),
             r#""D:\New\gwar-desktop.exe""#
         );
         let old = super::super::launch_agent("/Applications/Old/Gwar.app/Contents/MacOS/gwar-desktop").unwrap();
@@ -266,10 +285,11 @@ mod tests {
             assert_eq!((entry.writes, entry.queries), (0, 0));
         }
         for ignored in [false, true] {
-            let mut entry = win(Some(r"C:\Old\gwar.exe "), LoginState::Enabled);
+            let mut entry = win(Some(r#""C:\Old\gwar.exe""#), LoginState::Enabled);
             entry.fail = !ignored;
             entry.ignore = ignored;
             assert!(reconcile(&mut entry, WIN).is_err());
+            assert_eq!(entry.writes, 1, "exercise an owned entry's failed repair");
             assert_eq!(entry.queries, 0, "never report state after unsuccessful repair");
         }
     }
