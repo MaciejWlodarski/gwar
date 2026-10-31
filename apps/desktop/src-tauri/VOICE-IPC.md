@@ -72,3 +72,9 @@ distinguishes unacknowledged input shutdown from an output-device failure.
 The settings UI offers an explicit silent-preview retry after capture-shutdown
 failure. Focus, device/settings changes and Settings remounts cannot retry it
 automatically; an eligible user request is required.
+Native state retains the previous input's shutdown acknowledgement independently
+of its test/owner. `mic_test_start` refuses with `microphone_shutdown_pending` while
+that input is opening or not yet destroyed, including after Stop or bootstrap.
+Acquisition rechecks the gate under the ownership lock before calling device I/O.
+Once destruction is acknowledged, a later explicit retry is permitted. The UI
+maps this refusal to a short localized message and retains the silent retry action.

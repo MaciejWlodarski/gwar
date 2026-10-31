@@ -85,9 +85,17 @@ controller.voice.listDevices = async () => ({ inputs: [{ id: "fixture-input", la
 controller.init();
 if (view === "capture-error") {
   const start = controller.voice.startMicTest.bind(controller.voice);
+  let timedOut = false, refusedRetry = false;
   controller.voice.startMicTest = (onLevel, signal, playback) => {
-    if (!playback) return start(onLevel, signal);
+    if (!playback) {
+      if (timedOut && !refusedRetry) {
+        refusedRetry = true;
+        return Promise.reject(new VoiceError("mic_stopping", "Fixture: native input shutdown pending"));
+      }
+      return start(onLevel, signal);
+    }
     // Exercise the production error UI without opening an actual native device.
+    timedOut = true;
     queueMicrotask(() => playback.error(new VoiceError("mic_stop_failed", "Fixture: shutdown timed out")));
     return Promise.resolve(() => {});
   };

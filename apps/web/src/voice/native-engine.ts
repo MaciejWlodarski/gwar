@@ -485,7 +485,8 @@ export class NativeVoiceEngine implements VoiceEngine {
       off(); offState();
       signal.removeEventListener("abort", retire);
       if (signal.aborted) { await this.invoke("mic_test_stop", { test }).catch(() => {}); return () => {}; }
-      throw new VoiceError("mic_failed", typeof e === "string" ? e : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      throw new VoiceError(message === "microphone_shutdown_pending" ? "mic_stopping" : "mic_failed", message);
     }
     void this.listDevices().then((d) => this.emit("devices", d));
     return () => {

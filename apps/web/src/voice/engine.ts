@@ -31,6 +31,7 @@ export type VoiceErrorKind =
   | "no_mic" // no input device
   | "mic_failed" // device busy / other capture error
   | "mic_stop_failed" // input shutdown was not acknowledged; the sample was not played
+  | "mic_stopping" // the preceding native input has not been destroyed; no new input was opened
   | "insecure" // page is not a secure context, browsers hide the microphone
   | "output_failed" // speakers could not be opened / disappeared (desktop)
   | "negotiation" // WebRTC offer/answer failed

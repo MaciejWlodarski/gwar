@@ -65,7 +65,7 @@ export function useMicPreview(engine: VoiceEngine) {
             error: failure => {
               if (generation !== current || capture.signal.aborted) return;
               retire();
-              if (failure instanceof VoiceError && failure.kind === "mic_stop_failed") {
+              if (failure instanceof VoiceError && (failure.kind === "mic_stop_failed" || failure.kind === "mic_stopping")) {
                 previewRetryRequired.add(engine);
               }
               setNeedsRetry(previewRetryRequired.has(engine));
@@ -83,7 +83,7 @@ export function useMicPreview(engine: VoiceEngine) {
           if (generation !== current || capture.signal.aborted) return;
           active = null;
           capture.abort();
-          if (failure instanceof VoiceError && failure.kind === "mic_stop_failed") {
+          if (failure instanceof VoiceError && (failure.kind === "mic_stop_failed" || failure.kind === "mic_stopping")) {
             previewRetryRequired.add(engine);
           }
           setNeedsRetry(previewRetryRequired.has(engine));

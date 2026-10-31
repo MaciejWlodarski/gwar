@@ -473,3 +473,18 @@ it("reports an unconfirmed capture shutdown honestly instead of blaming the spea
   emit("voice://test-state", { owner: 1, test: 1, state: "idle", error: "shutdown timed out", error_kind: "capture_shutdown" });
   expect(error).toHaveBeenCalledWith(expect.objectContaining({ kind: "mic_stop_failed" }));
 });
+
+it("reports a native shutdown-pending refusal honestly and permits a later explicit retry", async () => {
+  const invoke = bridge.invoke.getMockImplementation()!;
+  let pending = true;
+  bridge.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+    if (command === "mic_test_start" && pending) throw "microphone_shutdown_pending";
+    return invoke(command, args);
+  });
+  const view = engine();
+  await expect(view.startMicTest(vi.fn())).rejects.toMatchObject({ kind: "mic_stopping" });
+  expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_start")).toHaveLength(1);
+  pending = false;
+  await expect(view.startMicTest(vi.fn())).resolves.toBeTypeOf("function");
+  expect(bridge.invoke).toHaveBeenCalledWith("mic_test_start", expect.objectContaining({ playback: false }));
+});

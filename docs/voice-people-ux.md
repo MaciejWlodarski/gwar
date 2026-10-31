@@ -95,6 +95,15 @@ a fresh routing attempt and waits for it before decoding or playing. Both a dire
 default-sink failure and a failed default fallback are covered, without requiring
 a device change or engine restart. Routing errors are identified as output failures.
 
+## Round-four native retry guard
+
+Native microphone state retains the prior device shutdown acknowledgement across
+Stop, preview cancellation and owner replacement. Both test entry and the actual
+acquisition check it under the ownership lock. A pending open or delayed destruction
+refuses a new input with a short Polish/English message; retry succeeds after the
+old stream really ends. Failed acquisitions with no remaining input release the
+guard. This is enforced by native I/O ownership, independently of the web retry UI.
+
 ## Design scope and review
 
 The app-screen direction is `true-black-flat`, keeping Gwar's existing palette and

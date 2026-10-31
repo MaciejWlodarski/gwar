@@ -158,6 +158,11 @@ impl DeviceIo {
 pub struct DeviceControl(std_mpsc::Sender<Event>, Arc<DeviceStopped>);
 
 impl DeviceControl {
+    /// True only when this device thread has no remaining streams.
+    pub fn is_stopped(&self) -> bool {
+        *self.1.closed.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// `None` follows the system default. Only a side whose choice changed is reopened.
     pub fn set_devices(&self, input: Option<String>, output: Option<String>) {
         let _ = self.0.send(Event::Want { input, output });
@@ -177,10 +182,15 @@ impl DeviceControl {
     }
 }
 
-#[derive(Default)]
 struct DeviceStopped {
     closed: Mutex<bool>,
     changed: Condvar,
+}
+
+impl Default for DeviceStopped {
+    fn default() -> Self {
+        Self { closed: Mutex::new(true), changed: Condvar::new() }
+    }
 }
 
 /// Declared before the device-thread streams so acknowledgement follows their destruction,
@@ -194,6 +204,7 @@ impl Drop for StoppedOnDrop {
 }
 
 fn device_thread(stopped: Arc<DeviceStopped>, serve: impl FnOnce()) {
+    *stopped.closed.lock().unwrap_or_else(|e| e.into_inner()) = false;
     let _stopped = StoppedOnDrop(stopped);
     serve();
 }
@@ -1009,12 +1020,23 @@ mod tests {
     }
 
     #[test]
+    fn an_unopened_device_has_no_pending_stream_destruction() {
+        let io = super::DeviceIo::new(None, None);
+        let control = io.control();
+        assert!(control.is_stopped());
+        drop(io);
+        assert!(control.is_stopped());
+    }
+
+    #[test]
     fn sample_shutdown_reports_a_bounded_failure_instead_of_allowing_playback() {
         let (control, dropping, release, device) = delayed_shutdown();
         dropping.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert!(!control.is_stopped());
         let result = control.stop_and_wait(std::time::Duration::from_millis(10));
         release.send(()).unwrap();
         device.join().unwrap();
+        assert!(control.is_stopped());
         assert!(result.is_err(), "an unacknowledged shutdown cannot allow sample playback");
         control.stop_and_wait(std::time::Duration::from_millis(10)).unwrap();
     }

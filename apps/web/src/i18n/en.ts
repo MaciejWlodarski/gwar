@@ -707,6 +707,7 @@ export const en = {
   "err.voice.no_mic": "No microphone found. You can still chat and listen.",
   "err.voice.mic_failed": "The microphone couldn't be opened (is another app using it?). You can still chat and listen.",
   "err.voice.mic_stop_failed": "The microphone couldn't be stopped in time. Your recording wasn't played.",
+  "err.voice.mic_stopping": "The microphone is still stopping. Try again shortly.",
   "err.voice.insecure": "Browsers only allow the microphone on https or localhost. You can still chat and listen.",
   "err.voice.negotiation": "Couldn't set up the audio connection. Chat still works.",
   "err.voice.unsupported": "This browser doesn't support voice. Chat still works.",

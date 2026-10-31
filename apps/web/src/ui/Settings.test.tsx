@@ -400,3 +400,16 @@ it.each(["fails", "is cancelled"])("keeps recovery manual when the explicit retr
   expect(voice.startMicTest).toHaveBeenCalledTimes(4);
   expect(voice.startMicTest.mock.calls[3]![2]).toBeUndefined();
 });
+
+it("keeps a native shutdown-pending refusal manual and allows silent retry after it clears", async () => {
+  voice.startMicTest.mockRejectedValueOnce(new VoiceError("mic_stopping", "The microphone is still stopping. Try again shortly."));
+  await mount();
+  expect(container.querySelector('[role="alert"]')?.textContent).toBe("The microphone is still stopping. Try again shortly.");
+  expect(button("Retry microphone preview")).toBeDefined();
+  await act(async () => { window.dispatchEvent(new Event("blur")); window.dispatchEvent(new Event("focus")); });
+  expect(voice.startMicTest).toHaveBeenCalledOnce();
+  await act(async () => button("Retry microphone preview").click());
+  expect(voice.startMicTest).toHaveBeenCalledTimes(2);
+  expect(voice.startMicTest.mock.calls[1]![2]).toBeUndefined();
+  expect(container.querySelector('[role="alert"]')).toBeNull();
+});

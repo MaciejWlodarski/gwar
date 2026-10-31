@@ -119,6 +119,10 @@ try {
         return window.fixtureTracks.every(t => t.readyState === "ended");
       }), "Timeout automatically reopened capture on focus");
       await retry.click();
+      await page.getByRole("alert").getByText("Mikrofon nadal się wyłącza. Spróbuj za chwilę.", { exact: true }).waitFor();
+      assert.ok(await page.evaluate(() => window.fixtureTracks.every(track => track.readyState === "ended")), "Refused retry opened another input");
+      await shot("capture-stopping");
+      await retry.click();
       await page.waitForFunction(() => window.fixtureTracks.filter(track => track.readyState === "live").length === 1 && Number(document.querySelector('[role=meter]')?.getAttribute("aria-valuenow")) >= 50);
       assert.equal(await page.evaluate(() => window.fixtureReplays.length), 0, "Silent preview retry played a sample");
       await shot("retried-preview");

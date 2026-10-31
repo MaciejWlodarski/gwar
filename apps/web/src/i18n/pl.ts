@@ -710,6 +710,7 @@ export const pl: Record<Key, string> = {
   "err.voice.no_mic": "Nie znaleziono mikrofonu. Nadal możesz pisać i słuchać.",
   "err.voice.mic_failed": "Nie udało się otworzyć mikrofonu (czy używa go inna aplikacja?). Nadal możesz pisać i słuchać.",
   "err.voice.mic_stop_failed": "Nie udało się wyłączyć mikrofonu na czas. Nagranie nie zostało odtworzone.",
+  "err.voice.mic_stopping": "Mikrofon nadal się wyłącza. Spróbuj za chwilę.",
   "err.voice.insecure": "Przeglądarki zezwalają na mikrofon tylko przez https lub localhost. Nadal możesz pisać i słuchać.",
   "err.voice.negotiation": "Nie udało się nawiązać połączenia audio. Czat nadal działa.",
   "err.voice.unsupported": "Ta przeglądarka nie obsługuje głosu. Czat nadal działa.",
