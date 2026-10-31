@@ -107,6 +107,7 @@ pub fn run() {
                 app.state::<invites::Invites>()
                     .forward_os_urls(app.handle(), urls.into_iter().map(|url| url.to_string()).collect());
             }
+            startup::reconcile(app.handle());
             webview::create_main(app)?;
             tray::install(app.handle())?;
             if let Some(window) = app.get_webview_window("main") {

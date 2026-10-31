@@ -49,8 +49,11 @@ try {
       useUi.setState({ section: "servers" });
       useConnectUi.setState({ invite: { code: "friends", server: "wss://voice.example/custom/ws", serverKey: "A".repeat(43), name: "Nasza ekipa" }, inviteLaunch: true });
     } else if (kind.startsWith("startup")) {
-      window.__TAURI_INTERNALS__ = { invoke: async command => {
-        if (command === "desktop_startup") return { supported: kind !== "startup-linux", openAtLogin: false, startMinimized: false, loginStatus: kind === "startup-approval" ? "approvalRequired" : kind === "startup-pending" ? "pending" : "disabled" };
+      let legacyPresent = kind === "startup-legacy";
+      const status = () => ({ supported: kind !== "startup-linux", openAtLogin: false, startMinimized: false, loginStatus: legacyPresent ? "legacy" : kind === "startup-approval" ? "approvalRequired" : kind === "startup-pending" ? "pending" : "disabled", loginControl: kind === "startup-legacy" || kind === "startup-old-empty" ? "removeOnly" : "full", registrationPresent: legacyPresent });
+      window.__TAURI_INTERNALS__ = { invoke: async (command, args) => {
+        if (command === "desktop_startup") return status();
+        if (command === "desktop_set_startup" && kind === "startup-legacy" && args.openAtLogin === false) { legacyPresent = false; return status(); }
         throw new Error(`Unexpected native fixture command ${command}`);
       } };
       useUi.getState().openSettings("appearance");
@@ -109,6 +112,29 @@ try {
       await capture(`desktop-startup-${status}`, width, "en");
       await page.evaluate(async () => (await import("/src/state/settings.ts")).useSettings.setState({ language: "pl" }));
     }
+    await state("invite");
+    await page.getByRole("button", { name: "Dołącz: Nasza ekipa", exact: true }).waitFor();
+    await state("startup-legacy");
+    const saved = page.getByRole("switch", { name: /^Zapisane uruchamianie przy logowaniu/ });
+    await saved.waitFor();
+    assert.equal(await saved.isChecked(), true);
+    for (const step of ["legacy", "removed"]) {
+      if (step === "removed") { await saved.click(); assert.equal(await saved.isChecked(), false); assert.equal(await saved.isDisabled(), true); }
+      await capture(`desktop-startup-${step}`, width);
+      await page.evaluate(async () => (await import("/src/state/settings.ts")).useSettings.setState({ language: "en" }));
+      await capture(`desktop-startup-${step}`, width, "en");
+      await page.evaluate(async () => (await import("/src/state/settings.ts")).useSettings.setState({ language: "pl" }));
+    }
+    await state("invite");
+    await page.getByRole("button", { name: "Dołącz: Nasza ekipa", exact: true }).waitFor();
+    await state("startup-old-empty");
+    await page.getByRole("switch", { name: /^Uruchamiaj zminimalizowany/ }).waitFor();
+    assert.equal(await page.getByRole("switch", { name: /^Zapisane uruchamianie/ }).count(), 0);
+    assert.equal(await page.getByRole("switch", { name: /^Uruchamiaj przy logowaniu/ }).count(), 0);
+    await capture("desktop-startup-old-empty", width);
+    await page.evaluate(async () => (await import("/src/state/settings.ts")).useSettings.setState({ language: "en" }));
+    await capture("desktop-startup-old-empty", width, "en");
+    await page.evaluate(async () => (await import("/src/state/settings.ts")).useSettings.setState({ language: "pl" }));
     await state("invite");
     await page.getByRole("button", { name: "Dołącz: Nasza ekipa", exact: true }).waitFor();
     assert.equal(await page.locator('a[href^="gwar://invite/"]').count(), 1);

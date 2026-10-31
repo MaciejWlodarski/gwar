@@ -2,6 +2,9 @@
 use serde::Serialize;
 use tauri::AppHandle;
 
+mod model;
+use model::Snapshot;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum LoginState {
@@ -11,6 +14,8 @@ pub enum LoginState {
     ApprovalRequired,
     #[cfg(target_os = "macos")]
     Pending,
+    #[cfg(target_os = "macos")]
+    Legacy,
 }
 
 #[cfg(any(windows, test))]
@@ -43,6 +48,7 @@ fn launch_agent(executable: &str) -> Result<Vec<u8>, String> {
 #[cfg(target_os = "macos")]
 mod macos {
     use super::*;
+    use model::{Entry, Snapshot};
     use objc2_foundation::{NSString, NSURL};
     use objc2_service_management::{SMAppService, SMAppServiceStatus};
     use std::{
@@ -51,88 +57,163 @@ mod macos {
     };
     use tauri::Manager;
 
-    fn path(app: &AppHandle) -> Result<PathBuf, String> {
-        // Keep the former plugin's filename and Label, avoiding duplicate login entries.
-        Ok(app.path().home_dir().map_err(|e| e.to_string())?.join("Library/LaunchAgents/Gwar.plist"))
+    struct PlistEntry<Q> {
+        path: PathBuf,
+        major: isize,
+        authorization: Q,
     }
-
-    pub(super) fn status(app: &AppHandle) -> Result<LoginState, String> {
-        effective_state(&path(app)?, |path| {
-            let path_string = path.to_str().ok_or("Startup plist path is not valid Unicode")?;
-            let url = NSURL::fileURLWithPath(&NSString::from_str(path_string));
-            // macOS 13+ is checked by supported() before this module is called.
-            // statusForLegacyURL: is Apple's Objective-C spelling of statusForLegacyPlist(at:).
-            Ok(unsafe { SMAppService::statusForLegacyURL(&url) })
-        })
-    }
-
-    fn effective_state(
-        path: &Path,
-        query: impl FnOnce(&Path) -> Result<SMAppServiceStatus, String>,
-    ) -> Result<LoginState, String> {
-        if !path.try_exists().map_err(|e| e.to_string())? {
-            return Ok(LoginState::Disabled);
-        }
-        let authorization = query(path)?;
-        let state = match authorization {
-            SMAppServiceStatus::Enabled => LoginState::Enabled,
-            SMAppServiceStatus::RequiresApproval => LoginState::ApprovalRequired,
-            // A file awaiting OS discovery is not proof that it is allowed to run.
-            SMAppServiceStatus::NotRegistered | SMAppServiceStatus::NotFound => LoginState::Pending,
-            _ => return Err("Unrecognized macOS startup authorization status".into()),
-        };
-        Ok(state)
-    }
-
-    pub(super) fn set(app: &AppHandle, enabled: bool) -> Result<(), String> {
-        let path = path(app)?;
-        if enabled {
-            let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-            let bytes = launch_agent(executable.to_str().ok_or("Startup executable path is not valid Unicode")?)?;
-            fs::create_dir_all(path.parent().ok_or("Invalid startup directory")?).map_err(|e| e.to_string())?;
-            let temporary = path.with_extension("plist.tmp");
-            fs::write(&temporary, bytes).map_err(|e| e.to_string())?;
-            fs::rename(temporary, path).map_err(|e| e.to_string())?;
-        } else {
-            match fs::remove_file(path) {
-                Ok(()) => (),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e.to_string()),
+    impl<Q: FnMut(&Path) -> Result<LoginState, String>> Entry for PlistEntry<Q> {
+        type Value = Vec<u8>;
+        fn read(&mut self) -> Result<Option<Vec<u8>>, String> {
+            match fs::read(&self.path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.to_string()),
             }
         }
-        // Never launch a second copy, override macOS consent, or open Settings here.
+        fn retarget(&self, bytes: &Vec<u8>, executable: &str) -> Result<Vec<u8>, String> {
+            model::macos_retarget(bytes, executable)
+        }
+        fn write(&mut self, bytes: &Vec<u8>) -> Result<(), String> {
+            let temporary = self.path.with_extension("plist.tmp");
+            fs::write(&temporary, bytes).map_err(|e| e.to_string())?;
+            fs::rename(temporary, &self.path).map_err(|e| e.to_string())
+        }
+        fn state(&mut self, bytes: &Vec<u8>) -> Result<LoginState, String> {
+            if self.major < 13 {
+                return Ok(LoginState::Legacy);
+            }
+            if model::macos_disabled(bytes)? {
+                return Ok(LoginState::Disabled);
+            }
+            (self.authorization)(&self.path)
+        }
+    }
+
+    fn path(app: &AppHandle) -> Result<PathBuf, String> {
+        Ok(app.path().home_dir().map_err(|e| e.to_string())?.join("Library/LaunchAgents/Gwar.plist"))
+    }
+    fn query(path: &Path) -> Result<LoginState, String> {
+        let path_string = path.to_str().ok_or("Startup plist path is not valid Unicode")?;
+        let url = NSURL::fileURLWithPath(&NSString::from_str(path_string));
+        // Only PlistEntry::state on macOS 13+ calls this selector.
+        // statusForLegacyURL: is Apple's Objective-C name for statusForLegacyPlist(at:).
+        match unsafe { SMAppService::statusForLegacyURL(&url) } {
+            SMAppServiceStatus::Enabled => Ok(LoginState::Enabled),
+            SMAppServiceStatus::RequiresApproval => Ok(LoginState::ApprovalRequired),
+            SMAppServiceStatus::NotRegistered | SMAppServiceStatus::NotFound => Ok(LoginState::Pending),
+            _ => Err("Unrecognized macOS startup authorization status".into()),
+        }
+    }
+    type AuthorizationQuery = fn(&Path) -> Result<LoginState, String>;
+    fn entry(app: &AppHandle) -> Result<PlistEntry<AuthorizationQuery>, String> {
+        Ok(PlistEntry { path: path(app)?, major: super::super::macos_major(), authorization: query })
+    }
+    pub(super) fn status(app: &AppHandle, executable: &str) -> Result<Snapshot, String> {
+        model::reconcile(&mut entry(app)?, executable)
+    }
+    pub(super) fn set(app: &AppHandle, executable: &str, enabled: bool) -> Result<(), String> {
+        set_entry(&mut entry(app)?, executable, enabled)
+    }
+    fn set_entry<Q: FnMut(&Path) -> Result<LoginState, String>>(
+        entry: &mut PlistEntry<Q>,
+        executable: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        if enabled && entry.major < 13 {
+            return Err("This macOS version can remove saved startup but cannot verify enabling it".into());
+        }
+        let prior = model::repair(entry, executable)?;
+        if enabled {
+            let bytes = if let Some(bytes) = prior {
+                let mut value = model::macos_value(&bytes)?;
+                let dict = value.as_dictionary_mut().ok_or("Invalid startup plist")?;
+                dict.insert("RunAtLoad".into(), plist::Value::Boolean(true));
+                if dict.contains_key("Disabled") {
+                    dict.insert("Disabled".into(), plist::Value::Boolean(false));
+                }
+                let mut bytes = Vec::new();
+                value.to_writer_xml(&mut bytes).map_err(|e| e.to_string())?;
+                bytes
+            } else {
+                model::macos_retarget(&launch_agent(executable)?, executable)?
+            };
+            fs::create_dir_all(entry.path.parent().ok_or("Invalid startup directory")?).map_err(|e| e.to_string())?;
+            entry.write(&bytes)?;
+        } else if prior.is_some() {
+            fs::remove_file(&entry.path).map_err(|e| e.to_string())?;
+            if entry.read()?.is_some() {
+                return Err("Startup removal failed read-back validation".into());
+            }
+        }
         Ok(())
+    }
+    pub(super) fn open_settings() {
+        unsafe { SMAppService::openSystemSettingsLoginItems() };
     }
 
     #[cfg(test)]
     #[test]
-    fn s2_existing_launch_agent_requires_effective_macos_authorization() {
-        let dir = std::env::temp_dir().join(format!("gwar-startup-status-{}", std::process::id()));
+    fn r3_s2_filesystem_repairs_before_authorization_and_preserves_disabled_flags() {
+        let dir = std::env::temp_dir().join(format!("gwar-startup-migration-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("Gwar.plist");
-        fs::write(&path, launch_agent("/Applications/Gwar.app/Contents/MacOS/gwar").unwrap()).unwrap();
-        let queried = std::cell::Cell::new(false);
-        let blocked = effective_state(&path, |queried_path| {
-            assert_eq!(queried_path, path);
-            queried.set(true);
-            Ok(SMAppServiceStatus::RequiresApproval)
-        })
-        .unwrap();
-        assert_eq!(blocked, LoginState::ApprovalRequired);
-        assert!(queried.get(), "an existing plist must still query OS authorization");
-        assert_eq!(effective_state(&path, |_| Ok(SMAppServiceStatus::Enabled)).unwrap(), LoginState::Enabled);
-        for status in [SMAppServiceStatus::NotFound, SMAppServiceStatus::NotRegistered] {
-            assert_eq!(effective_state(&path, |_| Ok(status)).unwrap(), LoginState::Pending);
-        }
-        assert!(effective_state(&path, |_| Err("query failed".into())).is_err());
-        fs::remove_file(&path).unwrap();
-        assert_eq!(effective_state(&path, |_| panic!("no registration to query")).unwrap(), LoginState::Disabled);
+        let current = "/Applications/New & Friends/Gwar.app/Contents/MacOS/gwar";
+        let old = launch_agent("/Applications/Old/Gwar.app/Contents/MacOS/gwar").unwrap();
+        fs::write(&path, &old).unwrap();
+        let mut entry = PlistEntry {
+            path: path.clone(),
+            major: 13,
+            authorization: |queried: &Path| {
+                let bytes = fs::read(queried).unwrap();
+                assert_eq!(
+                    model::macos_retarget(&bytes, current).unwrap(),
+                    bytes,
+                    "target must be repaired before asking authorization"
+                );
+                Ok(LoginState::ApprovalRequired)
+            },
+        };
+        assert_eq!(model::reconcile(&mut entry, current).unwrap().state, LoginState::ApprovalRequired);
+        let mut disabled = plist::Value::from_reader_xml(old.as_slice()).unwrap();
+        disabled.as_dictionary_mut().unwrap().insert("Disabled".into(), plist::Value::Boolean(true));
+        disabled.to_file_xml(&path).unwrap();
+        assert_eq!(model::reconcile(&mut entry, current).unwrap().state, LoginState::Disabled);
+        assert!(model::macos_disabled(&fs::read(&path).unwrap()).unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
-
-    pub(super) fn open_settings() {
-        // The caller checks OS availability; only an explicit settings button calls this.
-        unsafe { SMAppService::openSystemSettingsLoginItems() };
+    #[cfg(test)]
+    #[test]
+    fn r3_s3_old_macos_keeps_owned_entry_without_querying_unavailable_api() {
+        let dir = std::env::temp_dir().join(format!("gwar-startup-old-macos-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("Gwar.plist");
+        let current = "/Applications/Gwar.app/Contents/MacOS/gwar";
+        for major in [11, 12] {
+            let before = launch_agent(current).unwrap();
+            fs::write(&path, &before).unwrap();
+            let mut entry = PlistEntry {
+                path: path.clone(),
+                major,
+                authorization: |_: &Path| panic!("SMAppService is unavailable"),
+            };
+            assert_eq!(
+                model::reconcile(&mut entry, current).unwrap(),
+                Snapshot { present: true, state: LoginState::Legacy }
+            );
+            assert!(path.exists(), "reading never deletes an existing user choice");
+            assert!(set_entry(&mut entry, current, true).is_err());
+            assert_eq!(fs::read(&path).unwrap(), before, "unverifiable enable must leave the choice unchanged");
+            set_entry(&mut entry, current, false).unwrap();
+            assert!(!path.exists(), "the existing entry can still be removed");
+            assert!(set_entry(&mut entry, current, true).is_err());
+            assert!(!path.exists(), "removal-only mode never creates a registration");
+        }
+        let mut invalid =
+            PlistEntry { path: path.clone(), major: 13, authorization: |_: &Path| panic!("not registered") };
+        assert!(set_entry(&mut invalid, "/tmp/gwar-desktop", true).is_err());
+        assert!(!path.exists(), "an unrecognized new target must not create an entry");
+        fs::remove_dir_all(dir).unwrap();
     }
 }
 
@@ -164,31 +245,71 @@ mod windows {
         }
     }
 
+    fn read_command(root: &Key, path: &str) -> Result<Option<String>, String> {
+        let Some(value) = optional(root.open(path).and_then(|key| key.get_value("Gwar")))? else {
+            return Ok(None);
+        };
+        if value.ty() != windows_registry::Type::String {
+            return Err("Startup entry has an unrecognized registry type; left unchanged".into());
+        }
+        String::try_from(value).map(Some).map_err(|e| e.to_string())
+    }
     fn entry(root: &Key) -> Result<Option<String>, String> {
-        optional(root.open(RUN).and_then(|key| key.get_string("Gwar")))
+        read_command(root, RUN)
     }
 
-    pub(super) fn status(_: &AppHandle) -> Result<LoginState, String> {
-        let mut enabled = false;
+    struct RunEntry<'a> {
+        root: &'a Key,
+        run: &'a str,
+        approved: &'a str,
+    }
+    impl<'a> RunEntry<'a> {
+        fn new(root: &'a Key) -> Self {
+            Self { root, run: RUN, approved: APPROVED }
+        }
+    }
+    impl model::Entry for RunEntry<'_> {
+        type Value = String;
+        fn read(&mut self) -> Result<Option<String>, String> {
+            read_command(self.root, self.run)
+        }
+        fn retarget(&self, value: &String, executable: &str) -> Result<String, String> {
+            model::windows_retarget(value, executable)
+        }
+        fn write(&mut self, value: &String) -> Result<(), String> {
+            let key = self.root.options().write().open(self.run).map_err(|e| e.to_string())?;
+            write_command(&key, value)
+        }
+        fn state(&mut self, _: &String) -> Result<LoginState, String> {
+            let approval = optional(self.root.open(self.approved).and_then(|key| key.get_value("Gwar")))?;
+            Ok(if windows_approved(approval.as_ref().map(|value| value.as_ref()))? {
+                LoginState::Enabled
+            } else {
+                LoginState::Disabled
+            })
+        }
+    }
+    pub(super) fn status(_: &AppHandle, executable: &str) -> Result<Snapshot, String> {
+        let mut snapshot = Snapshot { present: false, state: LoginState::Disabled };
         for root in [CURRENT_USER, LOCAL_MACHINE] {
-            if let Some(command) = entry(root)? {
-                if command.trim().is_empty() {
-                    continue;
-                }
-                let approval = optional(root.open(APPROVED).and_then(|key| key.get_value("Gwar")))?;
-                enabled |= windows_approved(approval.as_ref().map(|value| value.as_ref()))?;
+            let current = model::reconcile(&mut RunEntry::new(root), executable)?;
+            snapshot.present |= current.present;
+            if current.state == LoginState::Enabled {
+                snapshot.state = LoginState::Enabled;
             }
         }
-        Ok(if enabled { LoginState::Enabled } else { LoginState::Disabled })
+        Ok(snapshot)
     }
 
     fn write_command(key: &Key, command: &str) -> Result<(), String> {
         key.set_string("Gwar", command).map_err(|e| e.to_string())
     }
 
-    pub(super) fn set(_: &AppHandle, enabled: bool) -> Result<(), String> {
-        let executable = std::env::current_exe().map_err(|e| e.to_string())?;
-        let command = windows_command(executable.to_str().ok_or("Startup executable path is not valid Unicode")?)?;
+    pub(super) fn set(_: &AppHandle, executable: &str, enabled: bool) -> Result<(), String> {
+        for root in [CURRENT_USER, LOCAL_MACHINE] {
+            model::repair(&mut RunEntry::new(root), executable)?;
+        }
+        let command = model::windows_retarget(&windows_command(executable)?, executable)?;
         // The former plugin preferred HKLM when elevated. Update an existing entry in
         // that hive too; report access failures rather than leave an unsafe legacy value.
         let machine = entry(LOCAL_MACHINE)?.is_some();
@@ -214,27 +335,45 @@ mod windows {
     }
     #[cfg(test)]
     #[test]
-    fn s1_registry_round_trip_preserves_quoted_spaced_executable() {
-        // An isolated test key: never the user's actual login registration.
+    fn r3_s1_registry_migration_quotes_target_without_changing_approval() {
         let path = format!(r"Software\Gwar\StartupTests\{}", std::process::id());
-        let key = CURRENT_USER.create(&path).unwrap();
-        let command = windows_command(r"C:\Program Files\Games & Friends\Gwar\gwar.exe").unwrap();
-        write_command(&key, &command).unwrap();
-        let actual = key.get_string("Gwar").unwrap();
-        drop(key);
+        let run = format!(r"{path}\Run");
+        let approved = format!(r"{path}\Approved");
+        let run_key = CURRENT_USER.create(&run).unwrap();
+        run_key.set_string("Gwar", r"C:\Old Gwar\gwar.exe ").unwrap();
+        let approved_key = CURRENT_USER.create(&approved).unwrap();
+        let approval = [3u8, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        approved_key.set_bytes("Gwar", windows_registry::Type::Bytes, &approval).unwrap();
+        let mut entry = RunEntry { root: CURRENT_USER, run: &run, approved: &approved };
+        let current = r"C:\Program Files\Gwar\gwar.exe";
+        assert_eq!(model::reconcile(&mut entry, current).unwrap().state, LoginState::Disabled);
+        assert_eq!(run_key.get_string("Gwar").unwrap(), format!("\"{current}\""));
+        assert_eq!(approved_key.get_value("Gwar").unwrap().as_ref(), &approval);
+        run_key.set_expand_string("Gwar", windows_command(current).unwrap()).unwrap();
+        assert!(model::reconcile(&mut entry, current).is_err(), "only literal REG_SZ targets are verified");
+        drop(run_key);
+        drop(approved_key);
         CURRENT_USER.remove_tree(path).unwrap();
-        assert_eq!(actual, r#""C:\Program Files\Games & Friends\Gwar\gwar.exe""#);
     }
 }
 
-pub fn status(app: &AppHandle) -> Result<LoginState, String> {
+#[cfg(any(target_os = "macos", windows))]
+fn executable() -> Result<String, String> {
+    std::env::current_exe()
+        .map_err(|e| e.to_string())?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "Startup executable path is not valid Unicode".into())
+}
+
+pub fn status(app: &AppHandle) -> Result<Snapshot, String> {
     #[cfg(target_os = "macos")]
     {
-        macos::status(app)
+        macos::status(app, &executable()?)
     }
     #[cfg(windows)]
     {
-        windows::status(app)
+        windows::status(app, &executable()?)
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {
@@ -246,11 +385,11 @@ pub fn status(app: &AppHandle) -> Result<LoginState, String> {
 pub fn set(app: &AppHandle, enabled: bool) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        macos::set(app, enabled)
+        macos::set(app, &executable()?, enabled)
     }
     #[cfg(windows)]
     {
-        windows::set(app, enabled)
+        windows::set(app, &executable()?, enabled)
     }
     #[cfg(not(any(target_os = "macos", windows)))]
     {

@@ -48,15 +48,20 @@ pub struct Status {
     open_at_login: bool,
     start_minimized: bool,
     login_status: LoginState,
+    login_control: LoginControl,
+    registration_present: bool,
 }
 
 fn status(app: &AppHandle, prefs: &Preferences) -> Result<Status, String> {
-    let login_status = registration::status(app)?;
+    let snapshot = registration::status(app)?;
+    let login_status = snapshot.state;
     Ok(Status {
         supported: true,
         open_at_login: login_status == LoginState::Enabled,
         start_minimized: prefs.start_minimized,
         login_status,
+        login_control: login_control().ok_or("Startup controls are unavailable")?,
+        registration_present: snapshot.present,
     })
 }
 
@@ -65,12 +70,44 @@ fn platform_supported(os: &str, debug: bool) -> bool {
     !debug && matches!(os, "macos" | "windows")
 }
 
-fn supported() -> bool {
-    #[cfg(target_os = "macos")]
-    if objc2_foundation::NSProcessInfo::processInfo().operatingSystemVersion().majorVersion < 13 {
-        return false;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum LoginControl {
+    Full,
+    RemoveOnly,
+}
+
+fn startup_policy(os: &str, debug: bool, macos_major: isize) -> Option<LoginControl> {
+    if !platform_supported(os, debug) {
+        return None;
     }
-    platform_supported(std::env::consts::OS, cfg!(debug_assertions))
+    if os == "macos" && macos_major < 13 {
+        return Some(LoginControl::RemoveOnly);
+    }
+    Some(LoginControl::Full)
+}
+#[cfg(target_os = "macos")]
+fn macos_major() -> isize {
+    objc2_foundation::NSProcessInfo::processInfo().operatingSystemVersion().majorVersion
+}
+fn login_control() -> Option<LoginControl> {
+    #[cfg(target_os = "macos")]
+    let major = macos_major();
+    #[cfg(not(target_os = "macos"))]
+    let major = 0;
+    startup_policy(std::env::consts::OS, cfg!(debug_assertions), major)
+}
+fn supported() -> bool {
+    login_control().is_some()
+}
+
+/// Repair an existing user choice at app startup, even if settings are never opened.
+pub fn reconcile(app: &AppHandle) {
+    if supported()
+        && let Err(error) = registration::status(app)
+    {
+        tracing::warn!("cannot reconcile login startup registration: {error}");
+    }
 }
 
 #[tauri::command]
@@ -82,6 +119,8 @@ pub fn desktop_startup(app: AppHandle, state: State<'_, Startup>) -> Result<Stat
             open_at_login: false,
             start_minimized: false,
             login_status: LoginState::Disabled,
+            login_control: LoginControl::Full,
+            registration_present: false,
         });
     }
     let _guard = state.0.lock().map_err(|e| e.to_string())?;
@@ -98,6 +137,9 @@ pub fn desktop_set_startup(
 ) -> Result<Status, String> {
     if !supported() {
         return Err("Startup settings are unavailable in this build or on this platform".into());
+    }
+    if open_at_login == Some(true) && login_control() == Some(LoginControl::RemoveOnly) {
+        return Err("This macOS version can remove saved startup but cannot verify enabling it".into());
     }
     let _guard = state.0.lock().map_err(|e| e.to_string())?;
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
@@ -119,7 +161,7 @@ pub fn desktop_set_startup(
 /// Fixed OS destination, available only from the startup settings button.
 #[tauri::command]
 pub fn desktop_open_login_settings(window: tauri::WebviewWindow) -> Result<(), String> {
-    if window.label() != "main" || !supported() {
+    if window.label() != "main" || login_control() != Some(LoginControl::Full) {
         return Err("Login settings are unavailable in this window or build".into());
     }
     registration::open_settings()
@@ -142,6 +184,15 @@ mod tests {
         assert!(!platform_supported("macos", true));
     }
 
+    #[test]
+    fn r3_s3_old_macos_can_remove_without_claiming_verified_enable() {
+        for major in [11, 12] {
+            assert_eq!(startup_policy("macos", false, major), Some(LoginControl::RemoveOnly));
+        }
+        assert_eq!(startup_policy("macos", false, 13), Some(LoginControl::Full));
+        assert_eq!(startup_policy("macos", true, 12), None);
+        assert_eq!(startup_policy("linux", false, 0), None);
+    }
     #[test]
     fn defaults_off_and_refuses_unknown_formats_losslessly() {
         let dir = std::env::temp_dir().join(format!("gwar-startup-{}", std::process::id()));
