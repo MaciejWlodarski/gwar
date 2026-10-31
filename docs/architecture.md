@@ -667,7 +667,10 @@ loads, the main window sets both to deny for the app's origin.
 | `voice_stop` | Low: stops audio. |
 | `voice_set_muted` | Medium: changes microphone transmission. |
 | `voice_set_deafened` | Low: changes playback. |
-| `voice_set_ptt` | Medium: opens/closes microphone transmission. |
+| `voice_set_ptt` | Medium: opens/closes local PTT; cannot bypass an active global observer. |
+| `voice_set_ptt_release_delay` | Low: bounds the PTT release tail to 0–1000 ms. |
+| `set_global_ptt`, `global_ptt_status` | Medium: manage passive input observation and fail-closed recovery; see [push-to-talk](push-to-talk.md). |
+| `open_ptt_settings` | Low: opens the fixed macOS Input Monitoring settings page after a user click. |
 | `voice_set_input_mode` | Medium: changes microphone gate. |
 | `voice_set_master_gain` | Low: changes playback gain. |
 | `voice_set_slot_gain` | Low: changes per-speaker playback gain. |

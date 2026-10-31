@@ -1,3 +1,4 @@
+import { NotificationBadge } from "./NotificationSettings";
 import * as ContextMenu from "@radix-ui/react-context-menu";
 import {
   Ban,
@@ -259,6 +260,9 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
             </span>
           )}
           {collapsed && total > 0 && <span className="shrink-0 rounded-full bg-hover px-1.5 text-xs tabular-nums text-muted">{total}</span>}
+          <button type="button" aria-label={t("notify.channelSettings", { name: channel.name })} className="flex size-6 shrink-0 cursor-pointer items-center justify-center rounded hover:bg-active" onClick={e => { e.stopPropagation(); openDialog({ kind: "notifications", channel: channel.id }); }} onDoubleClick={e => e.stopPropagation()}>
+            <NotificationBadge channel={channel.id} always />
+          </button>
           <MentionBadge count={mentions} />
           <UnreadBadge count={unread} />
           {!spacer && !current && !joining && canJoin && (
@@ -281,6 +285,9 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
       <ContextMenu.Portal>
         <ContextMenu.Content className={menuContent}>
           <ContextMenu.Label className={menuLabel}>{channel.name}</ContextMenu.Label>
+          <ContextMenu.Item className={menuItem} onSelect={() => openDialog({ kind: "notifications", channel: channel.id })}>
+            <NotificationBadge channel={channel.id} always /> {t("notify.scopeTitle")}
+          </ContextMenu.Item>
           <ContextMenu.Item className={menuItem} onSelect={select}>
             <MessageSquare className="size-4" /> {t("tree.openChat")}
           </ContextMenu.Item>

@@ -16,12 +16,12 @@ No production Gwar or TeamSpeak connection is needed for validation.
 
 ## Persistence
 
-Settings version **7** adds `userMuted: Record<uid, true>`. `userVolumes` is unchanged;
+Settings version **9** adds `userMuted: Record<uid, true>`. `userVolumes` is unchanged;
 a muted person's saved volume is retained and the engines receive zero. All earlier
 settings migrate automatically without discarding devices, processing, shortcuts,
 bookmarks, account preferences, sounds or session intent. Muted settings are local to
-the device, just like existing volumes. A later concurrent settings migration must
-renumber this version and its fixture before merging.
+the device, just like existing volumes. The v6 → v7 → v8 → v9 chain retains the
+desktop/notification additions from #206 and the passive PTT release delay from #208.
 
 ## Local visual and audio checks
 
@@ -119,3 +119,12 @@ chat fixture as unused space. Its existing secondary chat metadata contrast warn
 is outside these new controls. These inherited shell/fixture findings were retained;
 new dialogs, device selectors and person controls were inspected directly. Fixture
 participants (Maciej, Anna, Piotr) and headset labels are demonstration data only.
+
+## Main merge compatibility
+
+The Voice and App sounds pages retain the final Polish labels “Głos” and
+“Dźwięki aplikacji”. Shared device controls and the local sample remain alongside
+#208's passive PTT binding/status/release-delay controls. A held PTT key changes
+only the call's send gate; local test capture and output keep their own lifecycle.
+Regressions cover held PTT during record/playback, shutdown timeout, pending-input
+refusal, and later retry. PTT mode never starts an automatic sensitivity preview.

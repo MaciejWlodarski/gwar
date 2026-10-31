@@ -707,6 +707,20 @@ describe("push-to-talk release delay", () => {
     expect(denoiser.setActive).toHaveBeenLastCalledWith(false);
   });
 
+  it("uses the configured tail and clears a held press when input mode changes", async () => {
+    const { mic } = await active();
+    engine.setPttReleaseDelay(80);
+    engine.setPttActive(false);
+    await vi.advanceTimersByTimeAsync(79);
+    expect(mic.track.enabled).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mic.track.enabled).toBe(false);
+    engine.setPttActive(true);
+    engine.setInputMode("vad");
+    engine.setInputMode("ptt");
+    expect(mic.track.enabled).toBe(false);
+  });
+
   it("a new press cancels the old release, and repeated release events do not extend it", async () => {
     const { mic } = await active();
     engine.setPttActive(false); await vi.advanceTimersByTimeAsync(200);
@@ -1220,7 +1234,8 @@ describe("live server input gate control", () => {
   });
 });
 
-it("records processed input without a speaker route, closes capture, then replays through the selected output", async () => {
+it.each([false, true])("records processed input, closes capture, then replays through the selected output (PTT held=%s)", async held => {
+  if (held) { engine.setInputMode("ptt"); engine.setPttReleaseDelay(80); engine.setPttActive(true); }
   const mic = microphone(), phase = vi.fn(), error = vi.fn(), sink = vi.fn(async () => {});
   const decoded = deferred<AudioBuffer>();
   getUserMedia.mockResolvedValue(mic.stream);
@@ -1245,8 +1260,11 @@ it("records processed input without a speaker route, closes capture, then replay
   await vi.advanceTimersByTimeAsync(3000);
   expect(mic.track.stop).toHaveBeenCalledOnce();
   expect(cueSources).toHaveLength(0);
+  if (held) engine.setPttActive(true);
   decoded.resolve({} as AudioBuffer);
   await flush();
+  expect(mic.track.stop).toHaveBeenCalledOnce();
+  expect(getUserMedia).toHaveBeenCalledOnce();
   expect(sink).toHaveBeenCalledWith("headphones");
   expect(phase).toHaveBeenLastCalledWith("playing");
   expect(cueSources[0]!.start).toHaveBeenCalledOnce();

@@ -1,3 +1,5 @@
+import { DesktopStartupSettings } from "./DesktopStartupSettings";
+import { PttControls } from "./PttControls";
 import { SoundSettings } from "./SoundSettings";
 import { Bell, Volume2, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, Settings as SettingsIcon, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
 import { exportIdentityBackup } from "../state/identity-backup";
@@ -138,7 +140,6 @@ function AudioTab() {
   const voiceState = useVoice((s) => s.state);
   const gateUnsupported = useVoice((s) => s.inputGateSupport === false);
   const muted = useVoice((s) => s.muted || s.deafened);
-  const [capturing, setCapturing] = useState(false);
   const engine = controller.voice;
   const preview = useMicPreview(engine);
   // Gwar's own suppression has a strength: native on the desktop, an AudioWorklet in the browser.
@@ -159,18 +160,6 @@ function AudioTab() {
       )}
     </Field>
   );
-
-  useEffect(() => {
-    if (!capturing) return;
-    const onKey = (e: KeyboardEvent) => {
-      e.preventDefault();
-      e.stopPropagation();
-      if (e.code !== "Escape") setAudio({ pttKey: e.code });
-      setCapturing(false);
-    };
-    window.addEventListener("keydown", onKey, true);
-    return () => window.removeEventListener("keydown", onKey, true);
-  }, [capturing, setAudio]);
 
   const inCall = voiceState !== "idle";
   const level = muted ? 0 : inCall ? engineLevel : preview.level;
@@ -199,14 +188,7 @@ function AudioTab() {
               {preview.needsPermission || preview.needsRetry ? <Button disabled={inCall || muted} onClick={preview.request} className="h-8 self-start text-xs">{t(preview.needsRetry ? "audio.previewRetry" : "audio.previewEnable")}</Button> : !automatic && !audio.noiseSuppression ? <p className="text-xs text-subtle">{t("audio.noiseSuggestion")}</p> : null}
             </div>
           </> : <>
-            <div className="flex items-center gap-2">
-              <Button disabled={gateUnsupported} onClick={() => setCapturing(true)} className={cn("min-w-40", capturing && "border-accent text-accent")}>
-                {capturing ? t("audio.pressKey") : audio.pttKey ? keyLabel(audio.pttKey) : t("audio.setKey")}
-              </Button>
-              {audio.pttKey && !capturing && <Button variant="ghost" onClick={() => setAudio({ pttKey: null })}>{t("audio.clearKey")}</Button>}
-            </div>
-            <p className="self-center text-xs text-subtle">{t(gateUnsupported ? "audio.pttUnsupported" : audio.pttKey ? onDesktop ? "audio.pttHelpGlobal" : "audio.pttHelp" : "audio.pttNoKey")}</p>
-            <div aria-hidden="true" />
+            <PttControls key={gateUnsupported ? "unavailable" : "available"} disabled={gateUnsupported} />
           </>}
         </div>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5" data-mic-playback>
@@ -334,6 +316,7 @@ function AppearanceTab() {
       </Section>
       {isDesktop() && (
         <Section title={t("desktop.window")}>
+          <DesktopStartupSettings />
           <Switch
             checked={desktop.closeToTray}
             onCheckedChange={(closeToTray) => setDesktop({ closeToTray })}

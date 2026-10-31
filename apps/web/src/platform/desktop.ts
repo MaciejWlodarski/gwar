@@ -1,9 +1,11 @@
+import { notificationBadge, notificationServerKey } from "../lib/notification-scope";
 /**
  * Desktop-only wiring between the shared UI state and the Tauri shell:
  * global shortcuts (push-to-talk, mute, deafen), the system tray (with
  * "Stop sharing screen" while sharing) and the close-to-tray option.
  * Everything here is a no-op in the browser.
  */
+import { initGlobalPtt, useGlobalPtt } from "./ptt";
 import { tNow } from "../i18n";
 import { controller } from "../state/controller";
 import { useSettings } from "../state/settings";
@@ -17,7 +19,7 @@ type Action = "ptt" | "mute" | "deafen";
 const registered: Record<Action, string | null> = { ptt: null, mute: null, deafen: null };
 
 export function hasGlobalShortcut(action: Action): boolean {
-  return registered[action] !== null;
+  return action === "ptt" ? ["ready", "legacy"].includes(useGlobalPtt.getState().status) : registered[action] !== null;
 }
 
 /** True if this key press is the registered global shortcut for `action` (so the OS already handled it). */
@@ -62,6 +64,7 @@ export function initDesktop(): (() => void) | undefined {
   void (async () => {
     const api = await tauri();
     if (disposed) return;
+    cleanup(await initGlobalPtt(api));
     cleanup(await api.listen<{ down: boolean }>("shortcut://ptt", (p) => controller.setPtt(p.down)));
     const act = (action: string) => {
       if (action === "mute") controller.toggleMute();
@@ -81,7 +84,7 @@ export function initDesktop(): (() => void) | undefined {
         mute: desktop.muteShortcut,
         deafen: desktop.deafenShortcut,
       };
-      for (const action of ["ptt", "mute", "deafen"] as const) {
+      for (const action of ["mute", "deafen"] as const) {
         if (last[action] === wanted[action]) continue;
         last[action] = wanted[action];
         void register(api, action, wanted[action]);
@@ -96,11 +99,25 @@ export function initDesktop(): (() => void) | undefined {
 
     // Keep the tray menu in step with the UI.
     const sharing = () => useScreen.getState().own !== null;
+    let previousTray = "", previousBadge = -1;
     const pushTray = () => {
       const { muted, deafened } = useVoice.getState();
-      void api.invoke("tray_set_state", { muted, deafened, sharing: sharing() });
+      const settings = useSettings.getState(), session = useSession.getState();
+      const count = Math.min(0xffffffff, notificationBadge(session, settings.notifications, settings.notificationOverrides, notificationServerKey(session)));
+      const state = { muted, deafened, sharing: sharing(), language: settings.language, unread: count > 0 };
+      const serialized = JSON.stringify(state);
+      if (previousTray !== serialized) {
+        previousTray = serialized;
+        void api.invoke("tray_set_state", state).catch(e => console.warn("[desktop] tray update failed", e));
+      }
+      if (previousBadge !== count) {
+        previousBadge = count;
+        void api.invoke("tray_set_badge", { count }).catch(e => console.warn("[desktop] badge update failed", e));
+      }
     };
     pushTray();
+    cleanup(useSettings.subscribe((s, prev) => s.language !== prev.language || s.notifications !== prev.notifications || s.notificationOverrides !== prev.notificationOverrides ? pushTray() : undefined));
+    cleanup(useSession.subscribe((s, prev) => s.threads !== prev.threads || s.address !== prev.address || s.endpoint !== prev.endpoint || s.kind !== prev.kind ? pushTray() : undefined));
     cleanup(useVoice.subscribe((s, prev) => (s.muted !== prev.muted || s.deafened !== prev.deafened ? pushTray() : undefined)));
     // "Stop sharing screen" in the tray, from the picker until the share ends.
     cleanup(useScreen.subscribe((s, prev) => ((s.own !== null) !== (prev.own !== null) ? pushTray() : undefined)));

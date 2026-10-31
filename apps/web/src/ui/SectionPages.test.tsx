@@ -6,17 +6,19 @@ import { welcome } from "../net/testing";
 import type { Channel } from "../proto/Channel";
 import type { Client } from "../proto/Client";
 import { initialState } from "../state/reducer";
+import { useGlobalPtt } from "../platform/ptt";
 import { useSettings } from "../state/settings";
 import { useSession, useUi, useVoice, type Section } from "../state/stores";
 import { TooltipProvider } from "./kit";
 import { SectionRail } from "./SectionRail";
+import { useShortcuts } from "./hooks";
 import { SettingsSection } from "./Settings";
 import { VoicePanel, VoicePill } from "./VoicePanel";
 
 // The local fixtures must never ask the public account service for profile/key data.
 vi.mock("../lib/official", async get => ({ ...await get<typeof import("../lib/official")>(), CONNECT_URL: "http://127.0.0.1:18980" }));
 
-const mock = vi.hoisted(() => ({ selectChannel: vi.fn(), leaveVoice: vi.fn(async () => {}), toggleMute: vi.fn(), toggleDeafen: vi.fn(), retryVoice: vi.fn() }));
+const mock = vi.hoisted(() => ({ setPtt: vi.fn(), selectChannel: vi.fn(), leaveVoice: vi.fn(async () => {}), toggleMute: vi.fn(), toggleDeafen: vi.fn(), retryVoice: vi.fn() }));
 vi.mock("../state/controller", async () => {
   const { useSession } = await import("../state/stores");
   return {
@@ -58,6 +60,7 @@ let root: Root, container: HTMLDivElement;
 beforeEach(() => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   mock.selectChannel.mockClear();
+  mock.setPtt.mockClear();
   useVoice.setState({ state: "starting", reconnecting: false, failure: null });
   useSettings.setState({ language: "en" });
   useUi.setState({ section: "servers", back: "servers", settingsTab: "audio", gearTab: "audio", overview: false, collapsed: {}, pane: "list", moreOpen: false, settingsDrill: false, dialog: { kind: "none" } });
@@ -110,6 +113,42 @@ describe("the rail's pages", () => {
 });
 
 describe("the settings page", () => {
+  it("never treats an ordinary click as an unbound PTT key", async () => {
+    const previous = useSettings.getState().audio;
+    const Shortcuts = () => { useShortcuts(); return null; };
+    useSettings.getState().setAudio({ inputMode: "ptt", pttKey: null });
+    try {
+      await render(<Shortcuts />);
+      for (const type of ["mousedown", "mouseup"]) window.dispatchEvent(new MouseEvent(type, { button: 0, bubbles: true }));
+      expect(mock.setPtt).not.toHaveBeenCalled();
+      await act(async () => useSettings.getState().setAudio({ pttKey: "Mouse4" }));
+      for (const button of [0, 1, 2, 4]) window.dispatchEvent(new MouseEvent("mousedown", { button, bubbles: true }));
+      expect(mock.setPtt).not.toHaveBeenCalled();
+      window.dispatchEvent(new MouseEvent("mousedown", { button: 3, bubbles: true }));
+      window.dispatchEvent(new MouseEvent("mouseup", { button: 3, bubbles: true }));
+      expect(mock.setPtt.mock.calls).toEqual([[true], [false]]);
+    } finally { await act(async () => useSettings.setState({ audio: previous })); }
+  });
+
+  it("cancels PTT recording when switching modes and leaves later input untouched", async () => {
+    const previous = useSettings.getState().audio;
+    useSettings.getState().setAudio({ inputMode: "ptt", pttKey: "KeyV" });
+    try {
+      await render(<SettingsSection />);
+      const key = [...container.querySelectorAll("button")].find(b => b.textContent === "V")!;
+      await click(key);
+      expect(useGlobalPtt.getState().capturing).toBe(true);
+      await click([...container.querySelectorAll<HTMLElement>('[role="radio"]')].find(b => b.textContent === "Voice activity")!);
+      expect(useGlobalPtt.getState().capturing).toBe(false);
+      const event = new KeyboardEvent("keydown", { key: "q", code: "KeyQ", bubbles: true, cancelable: true });
+      window.dispatchEvent(event);
+      expect(event.defaultPrevented).toBe(false);
+      expect(useSettings.getState().audio.pttKey).toBe("KeyV");
+      await click([...container.querySelectorAll<HTMLElement>('[role="radio"]')].find(b => b.textContent === "Push to talk")!);
+      expect(useGlobalPtt.getState().capturing).toBe(false);
+    } finally { await act(async () => useSettings.setState({ audio: previous })); }
+  });
+
   const selectedTab = () => container.querySelector('[role="tab"][aria-selected="true"]')?.textContent;
 
   it("opens on the tab it is linked to, and follows a later link", async () => {

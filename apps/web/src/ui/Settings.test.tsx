@@ -31,7 +31,7 @@ beforeEach(() => {
   voice.startMicTest.mockReset().mockResolvedValue(() => {});
   voice.micPermission.mockReset().mockResolvedValue("granted");
   useSettings.setState({ language: "en", audio: { ...defaultAudio } });
-  useVoice.setState({ state: "idle", level: 0, muted: false, deafened: false, inputGateSupport: null });
+  useVoice.setState({ state: "idle", level: 0, muted: false, deafened: false, inputGateSupport: null, pttActive: false });
   useUi.getState().openSettings("audio");
   container = document.createElement("div"); document.body.appendChild(container);
   root = createRoot(container); mounted = true;
@@ -165,7 +165,7 @@ it("stays closed when the tab returns without focus", async () => {
   expect(voice.startMicTest).toHaveBeenCalledTimes(2);
 });
 
-it("stops active capture immediately when the Audio page unmounts", async () => {
+it("stops active capture immediately when the Voice page unmounts", async () => {
   const stop = vi.fn(); voice.startMicTest.mockResolvedValue(stop);
   await mount();
   await act(async () => { root.unmount(); mounted = false; });
@@ -283,7 +283,8 @@ it.each(["prompt", "denied", "unknown"] as const)("does not restore capture auto
   expect(button("Enable microphone preview")).toBeDefined();
 });
 
-it("finishes a PTT sample without opening an automatic preview", async () => {
+it.each([false, true])("finishes a PTT sample without opening an automatic preview (held=%s)", async held => {
+  useVoice.setState({ pttActive: held });
   useSettings.getState().setAudio({ inputMode: "ptt" });
   await mount();
   await act(async () => button("Hear yourself").click());

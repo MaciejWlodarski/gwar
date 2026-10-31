@@ -3,7 +3,8 @@ import { useState, type ReactNode } from "react";
 import { useT } from "../i18n";
 import { cn } from "../lib/cn";
 import { controller, describeVoiceError } from "../state/controller";
-import { canOpenMicrophoneSettings, openMicrophoneSettings } from "../platform";
+import { isDesktop, canOpenMicrophoneSettings, openMicrophoneSettings } from "../platform";
+import { useGlobalPtt } from "../platform/ptt";
 import { useScreen } from "../state/screen";
 import { useSettings } from "../state/settings";
 import { myChannelId } from "../state/reducer";
@@ -26,17 +27,20 @@ export function MicButton({ size = "lg" }: { size?: "md" | "lg" | "wide" }) {
   const pttActive = useVoice((s) => s.pttActive);
   const mode = useSettings((s) => s.audio.inputMode);
   const pttKey = useSettings((s) => s.audio.pttKey);
-  const off = muted || deafened || !!micError;
+  const global = useGlobalPtt();
   const ptt = mode === "ptt";
-  const label = micError ? describeVoiceError(micError) : off ? t("voice.unmute") : t("voice.mute");
+  const pttUnavailable = ptt && (!pttKey || (isDesktop() && global.native && global.status !== "ready"));
+  const off = muted || deafened || !!micError || pttUnavailable;
+  const pttProblem = !pttKey ? t("voice.choosePttKey") : t(global.status === "permission" ? "audio.pttStatus.permission" : global.status === "unsupported_key" ? "audio.pttStatus.unsupported" : "audio.pttStatus.recovering") + " " + t("voice.openAudioSettings");
+  const label = pttUnavailable ? pttProblem : micError ? describeVoiceError(micError) : off ? t("voice.unmute") : t("voice.mute");
 
   return (
     <IconButton
       label={ptt && !off ? t("voice.pttHint", { key: pttKey ? keyLabel(pttKey) : "—" }) : label}
-      shortcut={`${modKey}+⇧+M`}
-      active={off}
+      shortcut={pttUnavailable ? undefined : `${modKey}+⇧+M`}
+      active={pttUnavailable ? undefined : off}
       size={size}
-      onClick={() => (micError ? void controller.retryMic() : controller.toggleMute())}
+      onClick={() => (pttUnavailable ? useUi.getState().openSettings("audio") : micError ? void controller.retryMic() : controller.toggleMute())}
       className={cn(
         "relative overflow-hidden",
         off ? "bg-danger-soft text-danger hover:bg-danger hover:text-white" : "bg-hover text-fg hover:bg-active",

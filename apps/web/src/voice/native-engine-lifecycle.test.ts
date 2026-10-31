@@ -447,13 +447,14 @@ it("applies the same person's saved gain to replacement native receive slots", a
   expect(bridge.invoke).toHaveBeenCalledWith("voice_set_slot_gain", { owner: 1, slot: 0, gain: 1 });
 });
 
-it.each([false, true])("reports native sample completion only after retirement, unless cancelled (%s)", async cancelled => {
+it.each([false, true].flatMap(cancelled => [false, true].map(held => ({ cancelled, held }))))("retires native sample before completion (cancelled=$cancelled, PTT held=$held)", async ({ cancelled, held }) => {
   const closed = deferred<void>(), invoke = bridge.invoke.getMockImplementation()!;
   bridge.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
     if (command === "mic_test_stop") await closed.promise;
     return invoke(command, args);
   });
   const view = engine(), phase = vi.fn(), abort = new AbortController();
+  if (held) { view.setInputMode("ptt"); view.setPttActive(true); }
   await view.startMicTest(vi.fn(), abort.signal, { phase, error: vi.fn() });
   emit("voice://test-state", { owner: 1, test: 1, state: "idle" });
   await Promise.resolve();
@@ -474,7 +475,7 @@ it("reports an unconfirmed capture shutdown honestly instead of blaming the spea
   expect(error).toHaveBeenCalledWith(expect.objectContaining({ kind: "mic_stop_failed" }));
 });
 
-it("reports a native shutdown-pending refusal honestly and permits a later explicit retry", async () => {
+it.each([false, true])("reports shutdown-pending refusal and permits later explicit retry (PTT held=%s)", async held => {
   const invoke = bridge.invoke.getMockImplementation()!;
   let pending = true;
   bridge.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
@@ -482,8 +483,10 @@ it("reports a native shutdown-pending refusal honestly and permits a later expli
     return invoke(command, args);
   });
   const view = engine();
+  if (held) { view.setInputMode("ptt"); view.setPttReleaseDelay(80); view.setPttActive(true); }
   await expect(view.startMicTest(vi.fn())).rejects.toMatchObject({ kind: "mic_stopping" });
   expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_start")).toHaveLength(1);
+  if (held) view.setPttActive(true);
   pending = false;
   await expect(view.startMicTest(vi.fn())).resolves.toBeTypeOf("function");
   expect(bridge.invoke).toHaveBeenCalledWith("mic_test_start", expect.objectContaining({ playback: false }));

@@ -1,3 +1,5 @@
+import { InviteReviewDialog } from "./InviteReview";
+import { NotificationSettingsDialog } from "./NotificationSettings";
 import { MemberProfileDialog, NicknameDialog } from "./MemberProfile";
 import { sameServer } from "../lib/server-key";
 import { Check, Copy } from "lucide-react";
@@ -33,6 +35,10 @@ import { resolveIdentity } from "../connect/ts-list";
 export function Dialogs() {
   const dialog = useUi((s) => s.dialog);
   switch (dialog.kind) {
+    case "inviteReview":
+      return <InviteReviewDialog key={`${dialog.target.server}:${dialog.target.code}`} target={dialog.target} />;
+    case "notifications":
+      return <NotificationSettingsDialog channel={dialog.channel} serverRef={dialog.server} name={dialog.name} />;
     case "none":
       return null;
     case "serverGroup":

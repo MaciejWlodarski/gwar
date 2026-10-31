@@ -355,6 +355,8 @@ export class NativeVoiceEngine implements VoiceEngine {
     this.setInputMode(this.inputMode);
   }
 
+  setPttReleaseDelay(ms: number): void { this.send("voice_set_ptt_release_delay", { ms }); }
+
   setPttActive(active: boolean): void {
     this.send("voice_set_ptt", { active });
   }

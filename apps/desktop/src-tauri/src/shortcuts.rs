@@ -47,6 +47,12 @@ pub fn set_global_shortcut(
     if !matches!(action.as_str(), "ptt" | "mute" | "deafen") {
         return Err(format!("unknown shortcut action {action}"));
     }
+    // Passive PTT has its own command on macOS/Windows. Retain the old Linux shortcut
+    // only where the compositor supports it; the UI explicitly describes its limits.
+    #[cfg(not(target_os = "linux"))]
+    if action == "ptt" {
+        return Err("PTT uses passive observation".into());
+    }
     let gs = app.global_shortcut();
     let mut registered = state.registered.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(old) = registered.remove(&action) {

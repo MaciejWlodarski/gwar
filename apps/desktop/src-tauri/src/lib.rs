@@ -4,8 +4,11 @@
 
 pub mod fake_audio;
 mod files;
+mod invites;
+mod ptt;
 mod screen;
 mod shortcuts;
+mod startup;
 mod tray;
 mod ts;
 mod ts_identity;
@@ -17,6 +20,7 @@ mod webview;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tauri::{Manager, WindowEvent};
+use tauri_plugin_deep_link::DeepLinkExt;
 
 /// Debug-only hooks used by automated verification. They are compiled out of
 /// release builds (the commands exist but answer with nothing).
@@ -63,24 +67,58 @@ pub fn run() {
         )
         .try_init();
 
+    let launches = invites::Invites::from_args(std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()));
     let builder = tauri::Builder::default()
+        .manage(launches.clone())
         // Must be the first plugin: a second launch focuses the running app.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| tray::show_main(app)))
-        .plugin(tauri_plugin_window_state::Builder::default().build())
+        .plugin(tauri_plugin_single_instance::init(invites::single_instance_callback(launches)))
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(
+                    tauri_plugin_window_state::StateFlags::all() - tauri_plugin_window_state::StateFlags::VISIBLE,
+                )
+                .build(),
+        )
+        .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
-        // TODO: tauri-plugin-autostart (launch at login) once there is a setting for it.
+        .manage(startup::Startup::default())
         .manage(voice::Voice::default())
         .manage(shortcuts::Shortcuts::default())
+        .manage(ptt::Ptt::default())
         .manage(ts::Ts::default())
         .manage(files::Files::default())
         .manage(tray::CloseToTray(AtomicBool::new(true)))
         .on_permission_request(|_, kind| webview::media_permission(kind))
         .setup(|app| {
+            // Installed AppImages may move; refresh their desktop integration, never a debug binary.
+            #[cfg(all(target_os = "linux", not(debug_assertions)))]
+            if let Err(error) = app.deep_link().register_all() {
+                tracing::warn!("cannot register desktop invitation links: {error}");
+            }
+            let handle = app.handle().clone();
+            let opened = app.state::<invites::Invites>().inner().clone();
+            app.deep_link().on_open_url(move |event| {
+                opened.forward_os_urls(&handle, event.urls().into_iter().map(|url| url.to_string()).collect());
+                tray::show_main(&handle);
+            });
+            #[cfg(target_os = "macos")]
+            if let Some(urls) = app.deep_link().get_current()? {
+                app.state::<invites::Invites>()
+                    .forward_os_urls(app.handle(), urls.into_iter().map(|url| url.to_string()).collect());
+            }
+            startup::reconcile(app.handle());
             webview::create_main(app)?;
             tray::install(app.handle())?;
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.show();
+                let linked = app.state::<invites::Invites>().was_launched();
+                if startup::minimized(app.handle()) && !linked {
+                    let _ = window.minimize();
+                }
+            }
             Ok(())
         })
         .on_window_event(|window, event| {
@@ -128,6 +166,10 @@ pub fn run() {
             files::save_blob_as,
             files::upload_put,
             shortcuts::set_global_shortcut,
+            ptt::set_global_ptt,
+            ptt::global_ptt_status,
+            ptt::open_ptt_settings,
+            voice::voice_set_ptt_release_delay,
             ts::ts_connect,
             ts::ts_request,
             ts::ts_disconnect,
@@ -139,6 +181,12 @@ pub fn run() {
             ts_identity::ts_identity_detect,
             ts_identity::ts_identity_claim,
             ts_identity::ts_identity_export,
+            invites::desktop_invite_links,
+            startup::desktop_startup,
+            startup::desktop_set_startup,
+            startup::desktop_open_login_settings,
+            tray::desktop_attention,
+            tray::tray_set_badge,
             tray::tray_set_state,
             tray::set_close_to_tray,
             debug::debug_autoconnect,

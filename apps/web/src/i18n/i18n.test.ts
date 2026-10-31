@@ -38,3 +38,11 @@ it("keeps microphone test prompts brief enough for a 360 px action row", () => {
     expect(dictionary["audio.listenHint"].length).toBeLessThanOrEqual(32);
   }
 });
+
+it.each([
+  ["pl", "Głos", "Dźwięki aplikacji"],
+  ["en", "Voice", "App sounds"],
+] as const)("names the voice and app sound pages distinctly in %s", (language, voice, sounds) => {
+  expect(translate(language, "settings.audio")).toBe(voice);
+  expect(translate(language, "settings.sounds")).toBe(sounds);
+});
