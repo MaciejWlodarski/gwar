@@ -126,7 +126,7 @@ it("stays closed when the tab returns without focus", async () => {
   expect(voice.startMicTest).toHaveBeenCalledTimes(2);
 });
 
-it("stops active capture immediately when the Audio page unmounts", async () => {
+it("stops active capture immediately when the Voice page unmounts", async () => {
   const stop = vi.fn(); voice.startMicTest.mockResolvedValue(stop);
   await mount();
   await act(async () => { root.unmount(); mounted = false; });

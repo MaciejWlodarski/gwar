@@ -26,7 +26,7 @@ export const pl: Record<Key, string> = {
   "connect.inviteKey": "Odcisk klucza serwera",
   "desktop.retry": "Spróbuj ponownie",
 
-  "settings.sounds": "Dźwięki",
+  "settings.sounds": "Dźwięki aplikacji",
   "sounds.enabled": "Dźwięki zdarzeń",
   "sounds.hint": "Subtelne sygnały, gdy coś dzieje się w Gwarze.",
   "sounds.volume": "Głośność dźwięków",
@@ -211,7 +211,7 @@ export const pl: Record<Key, string> = {
   "report.send": "Wyślij zgłoszenie",
   "report.sent": "Dziękujemy! Zgłoszenie #{id} zostało wysłane.",
   "report.failed": "Zgłoszenie błędu nie zostało wysłane: {error}",
-  "settings.audio": "Dźwięk",
+  "settings.audio": "Głos",
   "settings.appearance": "Wygląd",
   "settings.identity": "Tożsamość",
   "settings.language": "Język",

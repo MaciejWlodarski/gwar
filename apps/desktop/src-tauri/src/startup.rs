@@ -33,6 +33,9 @@ fn read(path: &Path) -> Result<Preferences, String> {
 }
 
 pub fn minimized(app: &AppHandle) -> bool {
+    if !supported() {
+        return false;
+    }
     app.path().app_config_dir().ok().and_then(|p| read(&p.join("startup.json")).ok()).is_some_and(|p| p.start_minimized)
 }
 
@@ -45,12 +48,20 @@ pub struct Status {
 }
 
 // Debug binaries must never register a development executable at login.
+fn platform_supported(os: &str, debug: bool) -> bool {
+    !debug && matches!(os, "macos" | "windows")
+}
+
 fn supported() -> bool {
-    !cfg!(debug_assertions) && cfg!(any(target_os = "macos", target_os = "windows", target_os = "linux"))
+    platform_supported(std::env::consts::OS, cfg!(debug_assertions))
 }
 
 #[tauri::command]
 pub fn desktop_startup(app: AppHandle, state: State<'_, Startup>) -> Result<Status, String> {
+    // Do not query the plugin on Linux: existence is not effective XDG autostart state.
+    if !supported() {
+        return Ok(Status { supported: false, open_at_login: false, start_minimized: false });
+    }
     let _guard = state.0.lock().map_err(|e| e.to_string())?;
     let prefs = read(&app.path().app_config_dir().map_err(|e| e.to_string())?.join("startup.json"))?;
     Ok(Status {
@@ -68,7 +79,7 @@ pub fn desktop_set_startup(
     start_minimized: Option<bool>,
 ) -> Result<Status, String> {
     if !supported() {
-        return Err("Startup settings require an installed release build".into());
+        return Err("Startup settings are unavailable in this build or on this platform".into());
     }
     let _guard = state.0.lock().map_err(|e| e.to_string())?;
     let dir = app.path().app_config_dir().map_err(|e| e.to_string())?;
@@ -94,6 +105,20 @@ pub fn desktop_set_startup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn s4_linux_appimage_paths_are_not_offered_broken_autostart_controls() {
+        // The plugin writes an unquoted Exec for /home/test/My Apps/Gwar.AppImage.
+        assert!(!platform_supported("linux", false));
+    }
+    #[test]
+    fn s5_linux_disabled_xdg_entries_are_not_reported_by_existence_only() {
+        // Hidden=true and XDG precedence require a different implementation.
+        assert!(!platform_supported("linux", false));
+        assert!(platform_supported("macos", false));
+        assert!(platform_supported("windows", false));
+        assert!(!platform_supported("macos", true));
+    }
+
     #[test]
     fn defaults_off_and_refuses_unknown_formats_losslessly() {
         let dir = std::env::temp_dir().join(format!("gwar-startup-{}", std::process::id()));

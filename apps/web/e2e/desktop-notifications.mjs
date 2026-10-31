@@ -48,9 +48,9 @@ try {
       useSession.setState({ phase: "idle", server: null, channels: {}, me: null });
       useUi.setState({ section: "servers" });
       useConnectUi.setState({ invite: { code: "friends", server: "wss://voice.example/custom/ws", serverKey: "A".repeat(43), name: "Nasza ekipa" }, inviteLaunch: true });
-    } else if (kind === "startup") {
+    } else if (kind === "startup" || kind === "startup-linux") {
       window.__TAURI_INTERNALS__ = { invoke: async command => {
-        if (command === "desktop_startup") return { supported: true, openAtLogin: false, startMinimized: false };
+        if (command === "desktop_startup") return { supported: kind !== "startup-linux", openAtLogin: false, startMinimized: false };
         throw new Error(`Unexpected native fixture command ${command}`);
       } };
       useUi.getState().openSettings("appearance");
@@ -103,6 +103,15 @@ try {
     await page.getByRole("button", { name: "Szczegóły zaproszenia", exact: true }).click();
     await page.getByRole("dialog").waitFor();
     await capture("invite-details", width);
+    await state("startup-linux");
+    await page.getByRole("switch", { name: /^Działaj w zasobniku/ }).waitFor();
+    assert.equal(await page.getByRole("switch", { name: /^Uruchamiaj przy logowaniu/ }).count(), 0);
+    assert.equal(await page.getByRole("switch", { name: /^Uruchamiaj zminimalizowany/ }).count(), 0);
+    await capture("desktop-startup-linux", width);
+    await page.evaluate(async () => { (await import("/src/state/stores.ts")).useUi.getState().openSettings(); });
+    await page.getByText("Dźwięki aplikacji", { exact: true }).waitFor();
+    await page.getByText("Głos", { exact: true }).waitFor();
+    await capture("settings-pages", width);
   }
   assert.deepEqual(forbidden, [], "no production or other external requests");
   console.log("Desktop notifications UI: four widths, persisted choice, compact invite row, details, desktop startup; no external connections.");

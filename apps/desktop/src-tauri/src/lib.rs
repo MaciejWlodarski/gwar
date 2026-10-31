@@ -66,9 +66,11 @@ pub fn run() {
         )
         .try_init();
 
+    let launches = invites::Invites::from_args(std::env::args_os().map(|arg| arg.to_string_lossy().into_owned()));
     let builder = tauri::Builder::default()
+        .manage(launches.clone())
         // Must be the first plugin: a second launch focuses the running app.
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| tray::show_main(app)))
+        .plugin(tauri_plugin_single_instance::init(invites::single_instance_callback(launches)))
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(
@@ -95,13 +97,22 @@ pub fn run() {
             if let Err(error) = app.deep_link().register_all() {
                 tracing::warn!("cannot register desktop invitation links: {error}");
             }
+            let handle = app.handle().clone();
+            let opened = app.state::<invites::Invites>().inner().clone();
+            app.deep_link().on_open_url(move |event| {
+                opened.forward_os_urls(&handle, event.urls().into_iter().map(|url| url.to_string()).collect());
+                tray::show_main(&handle);
+            });
+            #[cfg(target_os = "macos")]
+            if let Some(urls) = app.deep_link().get_current()? {
+                app.state::<invites::Invites>()
+                    .forward_os_urls(app.handle(), urls.into_iter().map(|url| url.to_string()).collect());
+            }
             webview::create_main(app)?;
             tray::install(app.handle())?;
-            let handle = app.handle().clone();
-            app.deep_link().on_open_url(move |_| tray::show_main(&handle));
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.show();
-                let linked = app.deep_link().get_current().ok().flatten().is_some_and(|urls| !urls.is_empty());
+                let linked = app.state::<invites::Invites>().was_launched();
                 if startup::minimized(app.handle()) && !linked {
                     let _ = window.minimize();
                 }

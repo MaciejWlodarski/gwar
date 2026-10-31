@@ -30,7 +30,10 @@ it("reads actual OS state without enabling login and only updates after successf
   expect(invoke).toHaveBeenLastCalledWith("desktop_set_startup", { openAtLogin: true });
 });
 it("hides startup controls where the native shell cannot support them", async () => {
+  useSettings.getState().setDesktop({ openAtLogin: true, startMinimized: true });
   invoke.mockResolvedValue({ supported: false, openAtLogin: false, startMinimized: false });
   await act(async () => root.render(<DesktopStartupSettings />));
   expect(host.querySelector('[role="switch"]')).toBeNull();
+  expect(useSettings.getState().desktop).toMatchObject({ openAtLogin: true, startMinimized: true });
+  expect(invoke).toHaveBeenCalledExactlyOnceWith("desktop_startup");
 });

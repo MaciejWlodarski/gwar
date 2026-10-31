@@ -349,5 +349,8 @@ export const useConnectUi = create<ConnectUi>()((set) => ({
   serverName: null,
   invite: null,
   inviteLaunch: false,
-  set: (patch) => set(patch),
+  set: (patch) => {
+    if (patch.invite) useSession.getState().setClose(null);
+    set(patch.invite ? { ...patch, needPassword: false, serverName: null, error: null, otherTab: null } : patch);
+  },
 }));

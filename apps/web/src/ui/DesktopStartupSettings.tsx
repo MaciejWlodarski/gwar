@@ -19,7 +19,7 @@ export function DesktopStartupSettings() {
     void tauri().then(api => api.invoke<StartupStatus>("desktop_startup")).then(status => {
       if (!alive) return;
       setSupported(status.supported);
-      useSettings.getState().setDesktop({ openAtLogin: status.openAtLogin, startMinimized: status.startMinimized });
+      if (status.supported) useSettings.getState().setDesktop({ openAtLogin: status.openAtLogin, startMinimized: status.startMinimized });
       setError(false);
     }).catch(() => { if (alive) setError(true); }).finally(() => { if (alive) setBusy(false); });
     return () => { alive = false; };
@@ -30,7 +30,7 @@ export function DesktopStartupSettings() {
     setError(false);
     try {
       const status = await (await tauri()).invoke<StartupStatus>("desktop_set_startup", patch);
-      useSettings.getState().setDesktop({ openAtLogin: status.openAtLogin, startMinimized: status.startMinimized });
+      if (status.supported) useSettings.getState().setDesktop({ openAtLogin: status.openAtLogin, startMinimized: status.startMinimized });
     } catch { setError(true); }
     finally { setBusy(false); }
   };

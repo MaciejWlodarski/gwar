@@ -24,7 +24,7 @@ export const en = {
   "connect.inviteKey": "Server fingerprint",
   "desktop.retry": "Try again",
 
-  "settings.sounds": "Sounds",
+  "settings.sounds": "App sounds",
   "sounds.enabled": "Sound cues",
   "sounds.hint": "Quiet cues for what happens in Gwar.",
   "sounds.volume": "Cue volume",
@@ -209,7 +209,7 @@ export const en = {
   "report.send": "Send report",
   "report.sent": "Thank you! Report #{id} was sent.",
   "report.failed": "The bug report was not sent: {error}",
-  "settings.audio": "Audio",
+  "settings.audio": "Voice",
   "settings.appearance": "Appearance",
   "settings.identity": "Identity",
   "settings.language": "Language",

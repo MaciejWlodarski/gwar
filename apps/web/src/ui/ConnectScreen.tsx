@@ -87,6 +87,7 @@ export function ConnectScreen({ card }: { card?: boolean }) {
   if (invite !== seenInvite) {
     setSeenInvite(invite);
     setInviteDetails(false);
+    if (invite) setPassword("");
     if (invite?.server) {
       setKind("gwar");
       setAddress(addressLabel(invite.server, pageContextFromLocation()));

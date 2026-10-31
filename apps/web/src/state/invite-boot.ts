@@ -14,14 +14,14 @@ export function consumeInviteFromLocation(loc: Pick<Location, "search" | "pathna
   useConnectUi.getState().set({ invite: target ? { ...target, server: target.server ?? window.location.origin } : null, inviteLaunch: true });
 }
 
-/** Installed links only stage a review. Listener precedes initial read to cover startup races. */
+interface DesktopLaunch { launched: boolean; links: string[] }
+
+/** Listen before the atomic native drain; raw launch intent never depends on URL parsing. */
 export async function initDesktopInvites(): Promise<void> {
   if (!isDesktop()) return;
   const api = await tauri();
-  let received = false;
-  const receive = (links: string[], cold = false) => {
-    if (!Array.isArray(links) || !links.length) return;
-    if (cold) useConnectUi.getState().set({ inviteLaunch: true });
+  const failClosed = () => useConnectUi.getState().set({ inviteLaunch: true });
+  const receive = (links: string[]) => {
     for (const link of new Set(links.slice(0, 16))) {
       if (typeof link !== "string") continue;
       const target = parseDesktopInvite(link);
@@ -34,12 +34,19 @@ export async function initDesktopInvites(): Promise<void> {
       }
     }
   };
-  try { await api.listen<string[]>("deep-link://new-url", links => { received = true; useConnectUi.getState().set({ inviteLaunch: true }); receive(links); }); }
-  catch { useConnectUi.getState().set({ inviteLaunch: true }); return; }
-  // Failure blocks passive restoration: startup must not connect before an invite was read.
-  try {
-    const links = await api.invoke<string[]>("desktop_invite_links");
-    if (!received) receive(links, true); // A newer live delivery wins over a stale startup read.
-  }
-  catch { useConnectUi.getState().set({ inviteLaunch: true }); }
+  let pending = Promise.resolve();
+  const drain = () => {
+    pending = pending.then(async () => {
+      const launch = await api.invoke<DesktopLaunch>("desktop_invite_links");
+      if (typeof launch?.launched !== "boolean" || !Array.isArray(launch.links)) throw new Error("Invalid native invite state");
+      if (launch.launched || launch.links.length) failClosed();
+      receive(launch.links);
+    }).catch(failClosed);
+    return pending;
+  };
+  try { await api.listen<void>("desktop://invite-ready", drain); }
+  catch { failClosed(); return; }
+  await drain();
+  // A wake received during the first read is drained before passive restoration can begin.
+  await pending;
 }
