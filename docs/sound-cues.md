@@ -55,6 +55,8 @@ exporter validates every timbre before writing any files and reports an invalid 
   An accepted move still reports real transport loss before the target first
   connects; that first connection confirms joining the target. A delayed Leave
   completion cannot announce leaving, or reset cues for, a newer call.
+  Password prompts, refused joins and redundant reconnect stops do not supersede
+  an accepted Leave. Repeated Leave calls confirm the same participation once.
 - Verified live mentions and DMs sound unless their conversation is already
   visible and focused. Own messages, history, edits, rejected messages, and
   duplicate deliveries do not sound. Sound switches are independent of system

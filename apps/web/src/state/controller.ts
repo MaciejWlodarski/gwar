@@ -434,13 +434,15 @@ class Controller {
         this.voiceRetries = 0;
         void this.followVoicePresence();
       } else if (before !== now) {
-        const conn = this.conn;
+        const conn = this.conn, participation = this.sounds.participation;
         const stopped = this.stopVoice();
-        const run = this.voiceRun;
         void stopped.then(() => {
-          if (run !== this.voiceRun || this.conn !== conn) return;
+          if (participation !== this.sounds.participation || this.conn !== conn) return;
           if (now === null) { if (!this.sounds.awaitingRecovery) this.sounds.left(); }
-          else if (myChannelId(useSession.getState()) === now) return this.followVoicePresence();
+          else {
+            const state = useSession.getState(), voice = useVoice.getState().state;
+            if (state.phase === "online" && myChannelId(state) === now && !this.sounds.isLeaving && voice !== "starting" && voice !== "connected") return this.followVoicePresence();
+          }
         });
       }
     });
@@ -883,6 +885,7 @@ class Controller {
       // A server moved from TeamSpeak may hold roles for this person's TeamSpeak identities.
       if (!resync && useSession.getState().kind === "gwar" && conn.serverKey) void offerClaims(conn, conn.serverKey, welcome.uid);
       const myCh = myChannelId(useSession.getState());
+      if (myCh !== null) this.sounds.moving(myCh);
       const v = useVoice.getState();
       if (v.muted || v.deafened || !this.voiceAutoStart) void this.pushMuteState();
       if (myCh !== null) {
@@ -1008,11 +1011,12 @@ class Controller {
           if (this.voiceAutoStart && useSession.getState().phase !== "reconnecting") this.rejoin ??= myChannelId(useSession.getState());
           session.dispatch({ type: "phase", phase: "reconnecting" });
           {
+            const participation = this.sounds.participation;
             const lost = this.sounds.lost(true);
             const at = performance.now();
             this.screen.suspend();
             void this.stopVoice().then(() => {
-              if (this.conn !== conn || performance.now() - at >= 300) return;
+              if (this.conn !== conn || participation !== this.sounds.participation || performance.now() - at >= 300) return;
               if (lost && this.sounds.awaitingRecovery) this.sounds.cue("connectionLost");
             });
           }
@@ -1022,10 +1026,11 @@ class Controller {
           if (status.reason.kind !== "user") {
             session.setClose(status.reason);
             const sharing = !!useScreen.getState().own?.share;
+            const participation = this.sounds.participation;
             const lost = this.sounds.lost(true);
             const attempt = this.connectAttempt;
             void this.teardown().then(() => {
-              if (attempt !== this.connectAttempt || this.conn !== null) return;
+              if (attempt !== this.connectAttempt || this.conn !== null || participation !== this.sounds.participation) return;
               if (lost) this.sounds.cue("connectionLost");
               this.sounds.reset();
               if (sharing) this.sounds.cue("shareStopped");
@@ -1053,11 +1058,11 @@ class Controller {
       this.clearSessionResume();
       useConnectUi.getState().set({ restoring: false, busy: false });
     }
-    const conn = this.conn;
+    const conn = this.conn, participation = this.sounds.participation;
     this.conn = null;
     conn?.close();
     await this.teardown();
-    if (attempt !== this.connectAttempt || this.conn !== null) return;
+    if (attempt !== this.connectAttempt || this.conn !== null || participation !== this.sounds.participation) return;
     if (cueIntent === "depart") this.sounds.left();
     if (!silent) useSession.getState().setClose({ kind: "user" });
   }
@@ -1301,19 +1306,16 @@ class Controller {
 
   /** Leaves voice but stays on the server (and keeps reading chat). */
   async leaveVoice(): Promise<void> {
-    const intent = ++this.joinAttempt; // a pending encrypted join gives up
+    this.joinAttempt++; // a pending encrypted join gives up
     if (!this.canLeaveVoice) return;
-    const conn = this.conn, generation = this.sounds.generation;
-    const current = () => this.conn === conn && this.joinAttempt === intent;
+    const conn = this.conn, participation = this.sounds.participation;
+    const current = () => this.conn === conn && this.sounds.participation === participation;
     const finish = async () => {
       // A late acknowledgement must not stop a newer channel's media either.
-      if (!current() || generation !== this.sounds.generation) return;
+      if (!current()) return;
       const left = this.sounds.leaving();
-      const stopped = this.stopVoice(), run = this.voiceRun;
-      await stopped;
-      if (!current() || run !== this.voiceRun) return;
-      left();
-      useUi.getState().dismissToast("voice-closed");
+      await this.stopVoice();
+      if (current() && left()) useUi.getState().dismissToast("voice-closed");
     };
     const rejoining = this.rejoin !== null;
     this.rejoin = null;
@@ -1333,7 +1335,7 @@ class Controller {
 
   private async rejoinVoice(channel: number): Promise<void> {
     if (!this.voiceRetryAllowed) { this.voiceRetryChannel = channel; return; }
-    const bound = this.bind(), intent = this.joinAttempt;
+    const bound = this.bind(), intent = this.joinAttempt, participation = this.sounds.participation;
     const s = useSession.getState();
     const info = s.channels[channel], password = this.channelPasswords.get(channel);
     const me = s.me ? s.clients[s.me.session] : undefined;
@@ -1344,9 +1346,9 @@ class Controller {
       return;
     }
     const refused = () => {
-      if (bound.current() && useSession.getState().phase === "online" && this.joinAttempt === intent + 1) {
-        if (this.rejoin === channel) this.rejoin = null;
-        this.sounds.retire(channel);
+      if (bound.current() && useSession.getState().phase === "online") {
+        if (this.joinAttempt === intent + 1 && this.rejoin === channel) this.rejoin = null;
+        if (participation === this.sounds.participation) this.sounds.retire(channel);
       }
     };
     try {
@@ -1389,6 +1391,8 @@ class Controller {
     }
     this.voiceAutoStart = true;
     this.voiceRetryAllowed = true;
+    const channel = myChannelId(s);
+    if (channel !== null) this.sounds.moving(channel);
     await this.startVoice();
     if (useScreen.getState().own?.phase === "reconnecting") void this.screen.confirmShare();
   }

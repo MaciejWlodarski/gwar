@@ -94,6 +94,39 @@ describe("voice lifecycle", () => {
     left(); tick(); left();
     expect(heard()).toEqual(["selfJoin", "selfLeave"]);
   });
+  it("keeps one identity through join confirmation, recovery and departure, changing it only for a real join", () => {
+    d.moving(1); const a = d.participation;
+    expect(a).not.toBeNull();
+    d.moving(1); d.connected(1); tick(); d.lost(); d.connected(1);
+    expect(d.participation).toBe(a);
+    const left = d.leaving();
+    expect(d.participation).toBe(a);
+    left(); expect(d.participation).toBeNull();
+    d.moving(1); const next = d.participation;
+    expect(next).not.toBe(a);
+    d.connected(1); expect(d.participation).toBe(next);
+    d.moving(2); expect(d.participation).not.toBe(next);
+  });
+  it("retirement cancels a departure without fabricating a replacement participation", () => {
+    d.connected(1); tick(); const left = d.leaving();
+    d.retire(1);
+    expect(d.participation).toBeNull();
+    expect(left()).toBe(false);
+    expect(heard()).toEqual(["selfJoin"]);
+  });
+  it("lets either redundant Leave complete the same participation exactly once", () => {
+    d.connected(1); tick();
+    const first = d.leaving(), second = d.leaving();
+    expect(first()).toBe(true);
+    expect(second()).toBe(false);
+    expect(heard()).toEqual(["selfJoin", "selfLeave"]);
+  });
+  it("retires the accepted participation even before its first media connection", () => {
+    d.moving(1); expect(d.participation).not.toBeNull();
+    d.retire(1); expect(d.participation).toBeNull();
+    expect(d.lost()).toBe(false);
+    expect(heard()).toEqual([]);
+  });
   it("remembers recovery even when teardown defers the lost sound", () => {
     d.connected(2); tick(); expect(d.lost(true)).toBe(true); expect(d.lost()).toBe(false);
     d.connected(2);
