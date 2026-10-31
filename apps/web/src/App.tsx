@@ -3,6 +3,7 @@ import { accountActions } from "./state/account";
 import { cn } from "./lib/cn";
 import { useIsMobile } from "./lib/media";
 import { initDesktop } from "./platform/desktop";
+import { isDesktop } from "./platform";
 import { initUpdates } from "./platform/updater";
 import { controller } from "./state/controller";
 import { useConnectUi, useSession, useUi, type ServerPane } from "./state/stores";
@@ -23,7 +24,7 @@ import { paneBack, useBackHistory, useServerUnread } from "./ui/nav";
 import { SectionRail } from "./ui/SectionRail";
 import { ServerRail } from "./ui/ServerRail";
 import { SettingsSection } from "./ui/Settings";
-import { ScreenNotice, SharePresetDialog, SharingBar, Stage } from "./ui/Screen";
+import { ShareAudioPlayback, ScreenNotice, SharePresetDialog, SharingBar, Stage } from "./ui/Screen";
 import { useScreen } from "./state/screen";
 import { Sidebar } from "./ui/Sidebar";
 import { IdentityNotices } from "./ui/IdentityNotices";
@@ -74,6 +75,7 @@ export function App() {
       <div className="flex h-dvh w-full flex-col overflow-hidden bg-rail">
         <ConnectionWarning phase={phase} insecure={insecureConnection} />
         <IdentityNotices />
+        {!isDesktop() && <ShareAudioPlayback />}
         <ScreenNotice />
         {showApp && <SharingBar />}
         <div className="flex min-h-0 w-full flex-1 overflow-hidden">

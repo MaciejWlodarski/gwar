@@ -294,7 +294,7 @@ type CaptureControllerCtor = new () => FocusController;
  * Chromium and WebKit refuse `getDisplayMedia` without a user gesture and a focused document,
  * so nothing may be awaited before it. Unknown dictionary members are ignored elsewhere.
  */
-export function captureScreen(spec: ScreenSpec = { mode: "smooth", height: 1080, fps: 30 }): Promise<MediaStream> {
+export function captureScreen(spec: ScreenSpec = { mode: "smooth", height: 1080, fps: 30 }, audio = true): Promise<MediaStream> {
   const Controller = (globalThis as { CaptureController?: CaptureControllerCtor }).CaptureController;
   const controller = typeof Controller === "function" ? new Controller() : null;
   const keepFocus = () => { try { controller?.setFocusBehavior?.("no-focus-change"); } catch { /* only allowed once, and only around the call */ } };
@@ -302,14 +302,27 @@ export function captureScreen(spec: ScreenSpec = { mode: "smooth", height: 1080,
   keepFocus();
   const options = {
     video: { width: { max: spec.height * 16 / 9 }, height: { max: spec.height }, frameRate: { max: spec.fps } },
-    // No shared sound in phase 1 (docs/screen-share.md, "Shared audio").
-    audio: false,
+    // Only another tab: system mixes can contain call playback. Native capture is separate.
+    audio: audio ? { suppressLocalAudioPlayback: false, restrictOwnAudio: true, echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 } : false,
+    windowAudio: "exclude",
     systemAudio: "exclude",
     selfBrowserSurface: "exclude",
     surfaceSwitching: "include",
     ...(controller ? { controller } : {}),
   } as DisplayMediaStreamOptions;
-  return navigator.mediaDevices.getDisplayMedia(options).then(stream => { keepFocus(); return stream; });
+  return navigator.mediaDevices.getDisplayMedia(options).then(stream => {
+    keepFocus();
+    if (!audio || !stream.getVideoTracks()[0] || surfaceOf(stream.getVideoTracks()[0]!) !== "tab") {
+      for (const track of stream.getAudioTracks()) { track.stop(); stream.removeTrack(track); }
+    }
+    const supported = navigator.mediaDevices.getSupportedConstraints?.() as (MediaTrackSupportedConstraints & { restrictOwnAudio?: boolean }) | undefined;
+    if (supported?.restrictOwnAudio) {
+      for (const track of stream.getAudioTracks()) {
+        if ((track.getSettings() as MediaTrackSettings & { restrictOwnAudio?: boolean }).restrictOwnAudio !== true) { track.stop(); stream.removeTrack(track); }
+      }
+    }
+    return stream;
+  });
 }
 
 /** The track's quality settings: content hint and capture cap (`applyConstraints`, never upscaled). */
@@ -534,6 +547,21 @@ export function publishSsrcs(sdp: string): { ssrc: number; rtx_ssrc: number } | 
   return valid(ssrc) && valid(rtx) && ssrc !== rtx ? { ssrc, rtx_ssrc: rtx } : null;
 }
 
+/** Fixed-rate share sound is already priced in video's uplink budget. Use
+ * video's transport feedback for that budget, keeping audio's clock reports,
+ * identity and other extensions intact. This applies only to screen publishing.
+ */
+function withReservedAudio(sdp: string): string {
+  const newline = sdp.includes("\r\n") ? "\r\n" : "\n";
+  return sdp.split(/(?=^m=)/m).map(section => {
+    if (!/^m=audio /m.test(section)) return section;
+    return section.split(/\r?\n/).filter(line =>
+      !/^a=rtcp-fb:(?:\d+|\*) transport-cc(?:\s|$)/.test(line) &&
+      !(line.startsWith("a=extmap:") && line.includes("transport-wide-cc-extensions")),
+    ).join(newline);
+  }).join("");
+}
+
 function rtcConfig(iceServers: IceServer[]): RTCConfiguration {
   return {
     iceServers: iceServers.map(s => ({ urls: s.urls, ...(s.username ? { username: s.username } : {}), ...(s.credential ? { credential: s.credential } : {}) })),
@@ -602,6 +630,8 @@ export interface PublishParams {
   uplink?(status: UplinkStatus | null): void;
   fallbacks?: EncoderFallbacks;
   track: MediaStreamTrack;
+  audio?: MediaStreamTrack;
+  audioState?(sharing: boolean): void;
   quality: ScreenSpec;
   /** The server rejected spec negotiation: retain the legacy encoder ceilings. */
   legacy?: boolean;
@@ -728,6 +758,12 @@ export class ScreenPublisher {
       sendEncodings: [{ ...this.scale(), maxBitrate: spec.maxBitrate, maxFramerate: spec.fps, priority: "low", networkPriority: "low" }],
     });
     this.sender = transceiver.sender;
+    const audio = this.params.audio;
+    const sharingAudio = audio?.readyState === "live";
+    if (sharingAudio) {
+      pc.addTransceiver(audio, { direction: "sendonly", sendEncodings: [{ maxBitrate: 64_000, priority: "very-low", networkPriority: "very-low" }] });
+    }
+    this.params.audioState?.(audio?.readyState === "live");
     this.parameters = Promise.resolve();
     this.desired = 0;
     // A recovery plan names H.264 or VP9: AV1 never comes back within the share.
@@ -735,11 +771,22 @@ export class ScreenPublisher {
     this.sendCodec = null; this.softwareAv1 = 0;
     preferCodecs(transceiver, "send", recovery?.codec === "vp9" ? "vp9" : undefined, av1);
     if (av1) negotiateDescriptor(transceiver, "sendonly");
-    await pc.setLocalDescription(await pc.createOffer());
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(sharingAudio ? { ...offer, sdp: withReservedAudio(offer.sdp ?? "") } : offer);
     if (this.closed || this.pc !== pc) return;
     const sdp = pc.localDescription?.sdp ?? "";
     const ssrcs = publishSsrcs(sdp);
     if (!ssrcs) throw new Error("the publish offer has no video stream with RTX");
+    // A bundled audio sender creates the encoder before the transport's start
+    // allocation is active. Feeding frames then makes Chromium adapt from its
+    // temporary 300 kb/s default, even though the negotiated hint is 4 Mb/s.
+    // Keep the offered identity, but wait for the connected allocation and our
+    // parameters before giving that encoder video. Video-only keeps its path.
+    let heldVideo = sharingAudio;
+    if (heldVideo) {
+      await transceiver.sender.replaceTrack(null);
+      if (this.closed || this.pc !== pc) return;
+    }
     const answer = this.avoidBroken(await this.params.offer({ ...ssrcs, sdp }));
     if (this.closed || this.pc !== pc) return;
     // Resolve the latest spec after signalling, including edits made while the answer was pending.
@@ -747,12 +794,36 @@ export class ScreenPublisher {
     await pc.setRemoteDescription({ type: "answer", sdp: hinted });
     if (this.closed || this.pc !== pc) return;
     this.answer = { pc, sdp: answer, hinted: leadHinted(hinted), ssrcs };
-    this.stopWatching = watchState(pc, s => { if (s === "connected") this.expectFirstFrame(pc); this.params.state(s); }, () => this.pc === pc);
+    let configured = false;
+    let releasingVideo = false;
+    const releaseVideo = async () => {
+      if (!configured || !heldVideo || releasingVideo || this.closed || this.pc !== pc || pc.connectionState !== "connected") return;
+      releasingVideo = true;
+      try {
+        await this.parameters;
+        if (this.closed || this.pc !== pc || track.readyState === "ended" || pc.connectionState !== "connected") return;
+        await transceiver.sender.replaceTrack(track);
+        if (!this.closed && this.pc === pc) { heldVideo = false; this.expectFirstFrame(pc); }
+      } catch {
+        if (!this.closed && this.pc === pc) this.params.state("failed");
+      } finally {
+        releasingVideo = false;
+      }
+    };
+    this.stopWatching = watchState(pc, s => {
+      if (s === "connected") {
+        if (heldVideo) void releaseVideo();
+        else this.expectFirstFrame(pc);
+      }
+      this.params.state(s);
+    }, () => this.pc === pc);
     // The latest quality: `setSpec` may have run while this negotiated.
     this.refreshSurface();
     await this.applyParameters(this.spec().maxBitrate);
     if (this.closed || this.pc !== pc) return;
     this.negotiated = true;
+    configured = true;
+    if (heldVideo) void releaseVideo();
   }
 
   /** Changes quality while sharing, with no renegotiation. */
@@ -818,6 +889,7 @@ export class ScreenPublisher {
       if (!this.trackEnded) { this.trackEnded = true; this.params.ended?.(); }
       return;
     }
+    this.params.audioState?.(this.params.audio?.readyState === "live");
     if (!pc || !this.negotiated) return;
     this.refreshSurface();
     if (this.polling === pc) { this.params.uplink?.(this.uplink.observe(performance.now(), null)); return; }
@@ -851,7 +923,7 @@ export class ScreenPublisher {
     }
     this.watchAv1(out, codec);
     const spec = this.spec();
-    const target = headroomBitrate(spec.maxBitrate, available);
+    const target = this.videoBudget(available);
     const previous = this.adaptationSent;
     const at = out?.timestamp ?? 0, bytes = out?.bytesSent ?? 0;
     const bitrate = previous && at > previous.at && at - previous.at <= HEADROOM_INTERVAL_MS * 2.25 ? Math.max(0, (bytes - previous.bytes) * 8000 / (at - previous.at)) : NaN;
@@ -1078,6 +1150,10 @@ export class ScreenPublisher {
    */
   private refreshSurface(): MediaTrackSettings | undefined {
     const settings = this.params.track.getSettings?.();
+    if (settings?.displaySurface && settings.displaySurface !== "browser" && this.params.audio?.readyState === "live") {
+      this.params.audio.stop();
+      this.params.audioState?.(false);
+    }
     const key = [settings?.deviceId, settings?.displaySurface];
     const first = this.surfaceKey.length === 0;
     const switched = key.some((value, i) => value !== undefined && this.surfaceKey[i] !== undefined && value !== this.surfaceKey[i]);
@@ -1189,7 +1265,7 @@ export class ScreenPublisher {
     const pc = this.pc;
     if (!pc) { this.endProbe(); return; }
     if (this.lift === lift) this.lift++; // the lift is over, even if its write is still queued
-    void this.applyParameters(headroomBitrate(this.spec().maxBitrate, this.available), current).then(written => {
+    void this.applyParameters(this.videoBudget(), current).then(written => {
       if (!current() || this.pc !== pc) return;
       if (written) { this.endProbe(); return; }
       this.probeTimer = setTimeout(() => this.restoreCap(lift, restoration, Math.min(8_000, retry * 2)), retry);
@@ -1232,13 +1308,19 @@ export class ScreenPublisher {
       if (!alive()) return;
       this.applied = maxBitrate; written = true;
       // Any write within the headroom cap (a quality edit, a headroom move) restores the lift.
-      if (this.restoring && restoration === this.restoration && maxBitrate <= headroomBitrate(this.spec().maxBitrate, this.available)) this.endProbe();
+      if (this.restoring && restoration === this.restoration && maxBitrate <= this.videoBudget()) this.endProbe();
     });
     return this.parameters.then(() => written);
   }
 
+  private videoBudget(available = this.available): number {
+    const reserve = this.params.audio?.readyState === "live" ? 128_000 : 0;
+    return Math.min(this.spec().maxBitrate, available && Number.isFinite(available) && available > 0 ? Math.max(1, uplinkVideoBudget(available) - reserve) : this.spec().maxBitrate);
+  }
+
   private spec(): ResolvedSpec {
-    const spec = deriveSpec(this.quality, this.params.legacy), r = this.recovery;
+    const base = deriveSpec(this.quality, this.params.legacy);
+    const spec = this.params.audio?.readyState === "live" ? { ...base, maxBitrate: Math.max(1, base.maxBitrate - 128_000) } : base, r = this.recovery;
     return r ? { ...spec, width: Math.min(spec.width, r.width), height: Math.min(spec.height, r.height), fps: Math.min(spec.fps, r.fps) } : spec;
   }
 
@@ -1256,7 +1338,7 @@ export class ScreenPublisher {
     // The old transport outlives the replacement's negotiation: a lifted sender keeps restoring
     // its cap, by the lift's deadline, until it is retired.
     const retire = this.restoring && this.pc && this.sender
-      ? this.restoreRetiring(this.pc, this.sender, headroomBitrate(this.spec().maxBitrate, this.available), this.restoreBy)
+      ? this.restoreRetiring(this.pc, this.sender, this.videoBudget(), this.restoreBy)
       : () => {};
     // A new transport starts its own estimate.
     this.endProbe();
@@ -1339,6 +1421,7 @@ export interface WatchParams {
   run: number;
   /** Receive slots: `SCREEN_SLOTS` for members, 1 for a TeamSpeak guest's watch page. */
   slots?: number;
+  audio?(): Promise<boolean>;
   iceServers: IceServer[];
   /** Probe and offer AV1 decode (members of an AV1-capable server; never TeamSpeak guests). */
   av1?: boolean;
@@ -1365,6 +1448,8 @@ export class ScreenWatchTransport {
   readonly run: number;
   private pc: RTCPeerConnection | null = null;
   private transceivers: RTCRtpTransceiver[] = [];
+  private audioTransceivers: RTCRtpTransceiver[] = [];
+  private streams: MediaStream[] = [];
   private stopWatching: () => void = () => {};
   private closed = false;
 
@@ -1376,6 +1461,8 @@ export class ScreenWatchTransport {
     const pc = new RTCPeerConnection(rtcConfig(this.params.iceServers));
     this.pc = pc;
     // Without a verified AV1 decoder the offer leaves AV1 out altogether.
+    const audio = await this.params.audio?.() ?? false;
+    if (this.closed) return;
     const av1 = this.params.av1 ? await probeAv1() : null;
     if (this.closed) return;
     for (let i = 0; i < (this.params.slots ?? SCREEN_SLOTS); i++) {
@@ -1385,11 +1472,16 @@ export class ScreenWatchTransport {
       const receiver = transceiver.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null };
       if ("jitterBufferTarget" in receiver) { try { receiver.jitterBufferTarget = 0; } catch { /* out of range on some engines */ } }
       this.transceivers.push(transceiver);
+      this.streams.push(new MediaStream());
+      if (audio) this.audioTransceivers.push(pc.addTransceiver("audio", { direction: "recvonly" }));
     }
     pc.ontrack = ev => {
-      const slot = this.transceivers.indexOf(ev.transceiver);
-      // One stream per slot: the server may name the same stream in every slot.
-      if (this.pc === pc && slot >= 0) this.params.track(slot, new MediaStream([ev.track]));
+      const slot = ev.track.kind === "audio" ? this.audioTransceivers.indexOf(ev.transceiver) : this.transceivers.indexOf(ev.transceiver);
+      if (this.pc === pc && !this.closed && slot >= 0) {
+        const tracks = this.streams[slot]!.getTracks().filter(t => t.kind !== ev.track.kind);
+        this.streams[slot] = new MediaStream([...tracks, ev.track]);
+        this.params.track(slot, this.streams[slot]);
+      }
     };
     await pc.setLocalDescription(await pc.createOffer());
     if (this.closed) return;

@@ -7,23 +7,27 @@
 //!   first, then watch order), and evicted 400 ms after they arrived;
 //! - a packet enters only while the viewer's queued bytes stay within
 //!   `max(64 KB, 400 ms × B)`; a drop either way clears the slot, which waits for a keyframe;
-//! - everything else str0m sends on the transport, repairs and probes, passes one extras bucket
-//!   at the socket, `0.1 × estimate`;
+//! - repairs and probes share an extras bucket at `0.1 × estimate`; with share audio its
+//!   credit and the aggregate wire clock are checked before str0m dequeues/accounting,
+//!   so scheduled capacity probes are paced instead of appearing lost on the network;
 //! - a viewer joining a share starts from an estimate that already carries it
 //!   ([`start_estimate`]), and backs off from there on its own TWCC feedback;
 //! - slots are paused, lowest priority first, when their averages or their keyframes do not
 //!   fit, and resumed once they would, keyframe included.
 //!
-//! Nothing here touches str0m or a clock: the screen task (and the tests) pass `now` in and
-//! apply what comes out.
+//! The screen task, str0m's pre-send callback and tests pass `now` in; no wall-clock
+//! reads or voice work occur here. Legacy video-only transports retain their existing cap.
 use std::{
     collections::VecDeque,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 
 use gwar_proto::ScreenPauseReason;
-use str0m::media::Pt;
+use str0m::{
+    bwe::{Bitrate, RtpSendBudget, RtpSendGate},
+    media::Pt,
+};
 
 use super::{
     dependency_descriptor::Raw,
@@ -96,6 +100,8 @@ pub struct Queued {
     pub pt: Pt,
     /// When the SFU received it from the publisher: str0m's wallclock, and the deadline's base.
     pub arrival: Instant,
+    /// Source-clock wallclock, independent of arrival/deadline and release time.
+    pub wallclock: Instant,
     pub payload: Arc<[u8]>,
     /// The source timestamp of its frame.
     pub frame: u32,
@@ -119,11 +125,16 @@ impl Queued {
         frame: u32,
         keyframe: bool,
     ) -> Self {
-        Self { out, timestamp, marker, pt, arrival, payload, frame, keyframe, dd: None, key: false }
+        Self { out, timestamp, marker, pt, arrival, wallclock: arrival, payload, frame, keyframe, dd: None, key: false }
     }
 
     pub fn with_dd(mut self, dd: Option<Raw>) -> Self {
         self.dd = dd;
+        self
+    }
+
+    pub fn with_wallclock(mut self, wallclock: Instant) -> Self {
+        self.wallclock = wallclock;
         self
     }
 
@@ -317,6 +328,8 @@ pub enum Change {
 pub enum Class {
     /// RTP on a slot's main SSRC: paced at admission/release and checked by serialized size.
     Original,
+    /// Bounded share audio, carved out of the existing screen allocation.
+    Audio,
     /// Any other RTP: RTX repairs, padding and str0m's probes.
     Extra,
     /// RTCP, STUN, DTLS.
@@ -341,6 +354,117 @@ pub struct EgressCounters {
     pub escalations: u64,
 }
 
+/// Keep packet remainders in rate credit without turning them into a second burst.
+/// Every kind of screen RTP shares both limits, at release and before TWCC accounting.
+/// Credit refills at the screen allocation; the peak refills at link speed and
+/// bounds contiguous wire occupation independently of that retained remainder.
+#[derive(Debug, Clone)]
+struct MediaPacer {
+    credit: Bucket,
+    peak: Bucket,
+}
+
+/// One wire clock for ordinary RTP, repairs and active capacity probes. Shared
+/// with str0m so credit is checked before dequeue/TWCC, never by dropping a probe.
+#[derive(Debug)]
+struct WireBudget {
+    pace: MediaPacer,
+    extras: Bucket,
+    estimate: f64,
+    interval: Duration,
+    probe: Option<u64>,
+    active: bool,
+}
+
+impl WireBudget {
+    fn configure(&mut self, estimate: f64, interval: Duration, now: Instant) {
+        self.estimate = estimate;
+        self.interval = interval;
+        self.extras.reconfigure(extras_rate(estimate), extras_burst(estimate), now);
+        self.configure_pace(now);
+    }
+
+    fn configure_pace(&mut self, now: Instant) {
+        // A probe's planned rate is temporary and paid for by the existing extras
+        // reserve. Its bytes still share one peak/debt with audio and video.
+        let estimate = self.estimate.max(self.probe.unwrap_or(0) as f64 / (PLAN + EXTRAS));
+        self.pace.reconfigure(estimate, self.interval, now);
+    }
+}
+
+#[derive(Debug)]
+struct WireGate(Arc<Mutex<WireBudget>>);
+
+impl RtpSendGate for WireGate {
+    fn poll_budget(&mut self, now: Instant, probe_rate: Option<Bitrate>) -> RtpSendBudget {
+        let mut wire = self.0.lock().expect("screen wire budget");
+        if !wire.active {
+            return RtpSendBudget {
+                media_bytes: usize::MAX,
+                extra_bytes: usize::MAX,
+                retry_at: now + Duration::from_millis(1),
+            };
+        }
+        let probe = probe_rate.map(|rate| rate.as_u64());
+        if wire.probe != probe {
+            wire.probe = probe;
+            wire.configure_pace(now);
+        }
+        let media_bytes = wire.pace.available(now) as usize;
+        let extra_bytes = media_bytes.min(wire.extras.available(now) as usize);
+        // Conservative packet lookahead includes RTP extensions, SRTP and IPv6.
+        // When a smaller packet fits, str0m may send it immediately instead.
+        let packet = 1200.0 + 80.0 + 16.0 + 48.0 + 2.0;
+        let rate = ((PLAN + EXTRAS) * wire.estimate).max(probe.unwrap_or(0) as f64) / 8.0;
+        let deficit = (packet - media_bytes as f64).max(0.0);
+        let wait = if deficit > 0.0 {
+            deficit / rate.max(1.0)
+        } else {
+            (packet - extra_bytes as f64).max(0.0) / extras_rate(wire.estimate).max(1.0)
+        };
+        RtpSendBudget { media_bytes, extra_bytes, retry_at: now + Duration::from_secs_f64(wait.max(0.000001)) }
+    }
+
+    fn sent(&mut self, now: Instant, bytes: usize, extra: bool) {
+        let mut wire = self.0.lock().expect("screen wire budget");
+        if wire.active {
+            assert!(wire.pace.take((bytes + 48) as f64, now), "preflight wire credit");
+            if extra {
+                assert!(wire.extras.take(bytes as f64, now), "preflight extras credit");
+            }
+        }
+    }
+}
+
+impl MediaPacer {
+    fn new(estimate: f64, interval: Duration, now: Instant) -> Self {
+        let rate = (PLAN + EXTRAS) * estimate / 8.0;
+        let packet = (1200 + 80 + 16 + 48 + 2) as f64;
+        Self {
+            credit: Bucket::new(rate, interval.as_secs_f64() * rate + packet, now),
+            peak: Bucket::new(estimate / 8.0, (interval.as_secs_f64() * estimate / 8.0).max(packet), now),
+        }
+    }
+
+    fn reconfigure(&mut self, estimate: f64, interval: Duration, now: Instant) {
+        let rate = (PLAN + EXTRAS) * estimate / 8.0;
+        let packet = (1200 + 80 + 16 + 48 + 2) as f64;
+        self.credit.reconfigure(rate, interval.as_secs_f64() * rate + packet, now);
+        self.peak.reconfigure(estimate / 8.0, (interval.as_secs_f64() * estimate / 8.0).max(packet), now);
+    }
+
+    fn available(&mut self, now: Instant) -> f64 {
+        self.credit.available(now).min(self.peak.available(now))
+    }
+
+    fn take(&mut self, bytes: f64, now: Instant) -> bool {
+        if self.available(now) < bytes {
+            return false;
+        }
+        self.credit.take(bytes, now) && self.peak.take(bytes, now)
+    }
+}
+
 pub struct Egress {
     lanes: Vec<Lane>,
     focus: Option<usize>,
@@ -351,7 +475,13 @@ pub struct Egress {
     released_at: Instant,
     release_interval: Duration,
     originals: Bucket,
-    extras: Bucket,
+    audio: Bucket,
+    audio_release: Bucket,
+    /// Shared audio/video release and pre-TWCC wire guards; no per-kind burst allowance.
+    media: MediaPacer,
+    wire: Arc<Mutex<WireBudget>>,
+    media_interval: Duration,
+    audio_reserve: f64,
     probe_need: f64,
     queued: usize,
     /// The estimate fell since the last release: queued keyframes may no longer make it.
@@ -382,7 +512,19 @@ impl Egress {
                 (RELEASE_BURST * PLAN * estimate / 8.0).max(RELEASE_BURST_FLOOR) + (1200 + ORIGINAL_OVERHEAD) as f64,
                 now,
             ),
-            extras: Bucket::new(extras_rate(estimate), extras_burst(estimate), now),
+            audio: Bucket::new(0.0, 2400.0, now),
+            audio_release: Bucket::new(0.0, 2400.0, now),
+            media: MediaPacer::new(estimate, Duration::from_millis(10), now),
+            wire: Arc::new(Mutex::new(WireBudget {
+                pace: MediaPacer::new(estimate, Duration::from_millis(10), now),
+                extras: Bucket::new(extras_rate(estimate), extras_burst(estimate), now),
+                estimate,
+                interval: Duration::from_millis(10),
+                probe: None,
+                active: false,
+            })),
+            media_interval: Duration::from_millis(10),
+            audio_reserve: 0.0,
             probe_need: 0.0,
             queued: 0,
             lowered: false,
@@ -403,9 +545,38 @@ impl Egress {
         self.estimate as u64
     }
 
+    pub fn now(&self) -> Instant {
+        self.refilled
+    }
+
     /// `B`, bits per second.
     pub fn plan(&self) -> f64 {
-        PLAN * self.estimate
+        (PLAN * self.estimate - self.audio_rate()).max(0.0)
+    }
+
+    fn audio_rate(&self) -> f64 {
+        self.audio_reserve.min(PLAN * self.estimate)
+    }
+
+    pub fn reserve_audio(&mut self, count: usize, now: Instant) {
+        if self.audio_reserve == count as f64 * super::audio::WIRE_BPS as f64 {
+            return;
+        }
+        self.refill(now);
+        let before = self.plan();
+        self.audio_reserve = count as f64 * super::audio::WIRE_BPS as f64;
+        self.wire.lock().expect("screen wire budget").active = count > 0;
+        self.lowered |= self.plan() < before && self.queued > 0;
+        self.set_estimate(self.estimate(), now);
+    }
+
+    pub fn has_audio(&self) -> bool {
+        self.audio_reserve > 0.0
+    }
+
+    #[cfg(test)]
+    pub fn has_wire_gate(&self) -> bool {
+        Arc::strong_count(&self.wire) > 1
     }
 
     fn release_rate(&self) -> f64 {
@@ -455,7 +626,10 @@ impl Egress {
         self.estimate = estimate;
         self.tokens = self.tokens.min(self.release_burst());
         self.originals.reconfigure(self.release_rate(), self.socket_burst(), now);
-        self.extras.reconfigure(extras_rate(self.estimate), extras_burst(self.estimate), now);
+        self.audio.reconfigure(self.audio_rate() / 8.0, 2400.0, now);
+        self.audio_release.reconfigure(self.audio_rate() / 8.0, 2400.0, now);
+        self.media.reconfigure(self.estimate, self.media_interval, now);
+        self.wire.lock().expect("screen wire budget").configure(self.estimate, self.media_interval, now);
     }
 
     pub fn paused(&self, lane: usize) -> Option<ScreenPauseReason> {
@@ -721,9 +895,8 @@ impl Egress {
         self.refilled = now;
     }
 
-    /// Evicts what reached its deadline and releases what the bucket allows, most important
-    /// slot first. Returns the released packets in order, and the slots that dropped.
-    pub fn due(&mut self, now: Instant) -> (Vec<(usize, Queued)>, Vec<usize>) {
+    /// Configure one service window before either audio or video spends shared credit.
+    pub fn begin_release(&mut self, now: Instant) {
         // Refill both buckets under the old burst before changing the window.
         // Otherwise release could earn credit that the socket bucket already clipped.
         self.refill(now);
@@ -732,11 +905,28 @@ impl Egress {
         self.released_at = now;
         if !elapsed.is_zero() {
             self.release_interval = elapsed.max(self.release_interval.saturating_sub(elapsed / 20));
+            // Learn regular service up to 30 ms. Idle gaps and longer scheduler stalls
+            // restart at the normal window; they never earn a catch-up wire burst.
+            let interval = if elapsed <= Duration::from_millis(30) {
+                elapsed.max(Duration::from_millis(10))
+            } else {
+                Duration::from_millis(10)
+            };
+            if interval != self.media_interval {
+                self.media_interval = interval;
+                self.media.reconfigure(self.estimate, interval, now);
+                self.wire.lock().expect("screen wire budget").configure(self.estimate, interval, now);
+            }
         }
         if burst != self.release_burst() {
             self.tokens = self.tokens.min(self.release_burst());
             self.originals.reconfigure(self.release_rate(), self.socket_burst(), now);
         }
+    }
+
+    /// Evict expired packets and release video in priority order; report dropped lanes.
+    pub fn due(&mut self, now: Instant) -> (Vec<(usize, Queued)>, Vec<usize>) {
+        self.begin_release(now);
         let mut dropped = Vec::new();
         for lane in 0..self.lanes.len() {
             // Arrival order is deadline order, so the head expires first.
@@ -763,6 +953,9 @@ impl Egress {
             };
             let size = packet.size();
             if size as f64 > self.tokens {
+                break;
+            }
+            if self.audio_reserve > 0.0 && !self.media.take((size + 28) as f64, now) {
                 break;
             }
             let packet = self.lanes[lane].queue.pop_front().unwrap();
@@ -809,12 +1002,75 @@ impl Egress {
                 ((size as f64 - self.tokens).max(0.0) / self.release_rate().max(1.0)).max(0.000001),
             );
         let expiry = self.lanes.iter().filter_map(|l| l.queue.front()).map(|p| p.arrival + DEADLINE).min();
+        let release =
+            if self.audio_reserve > 0.0 { release.max(self.media_wake(size, self.refilled)) } else { release };
         Some(expiry.map_or(release, |expiry| expiry.min(release)))
     }
 
+    pub fn media_wake(&self, size: usize, now: Instant) -> Instant {
+        let mut bucket = self.media.clone();
+        now + Duration::from_secs_f64(
+            ((size as f64 + 28.0 - bucket.available(now)).max(0.0) / ((PLAN + EXTRAS) * self.estimate / 8.0))
+                .max(0.000001),
+        )
+    }
+
+    pub fn audio_due(&mut self, size: usize, now: Instant) -> bool {
+        if self.audio_release.available(now) < size as f64 || self.media.available(now) < (size + 28) as f64 {
+            return false;
+        }
+        self.audio_release.take(size as f64, now) && self.media.take((size + 28) as f64, now)
+    }
+
+    pub fn audio_wake(&self, size: usize, now: Instant) -> Instant {
+        let mut bucket = self.audio_release.clone();
+        let audio = now
+            + Duration::from_secs_f64(
+                ((size as f64 - bucket.available(now)).max(0.0) / (self.audio_rate() / 8.0).max(1.0)).max(0.000001),
+            );
+        audio.max(self.media_wake(size, now))
+    }
+
     /// Charges one outgoing datagram of the watch transport; false drops it at the socket.
+    #[cfg(test)]
     pub fn charge(&mut self, class: Class, size: usize, now: Instant) -> bool {
+        self.charge_inner(class, size, now, false)
+    }
+
+    pub fn send_gate(&self) -> Box<dyn RtpSendGate> {
+        Box::new(WireGate(self.wire.clone()))
+    }
+
+    /// With audio, str0m already charged this RTP before its TWCC send record.
+    pub fn charge_paced(&mut self, class: Class, size: usize, now: Instant) -> bool {
+        self.charge_inner(class, size, now, self.audio_reserve > 0.0)
+    }
+
+    fn charge_inner(&mut self, class: Class, size: usize, now: Instant, paced: bool) -> bool {
+        if !paced && self.audio_reserve > 0.0 && class != Class::Control {
+            let wire = (size + 28) as f64;
+            let mut budget = self.wire.lock().expect("screen wire budget");
+            // Application release has already reserved original/audio bytes in `media`.
+            // Extras may use only unreserved credit; otherwise a probe polled between
+            // release and transmit could steal it and drop a video keyframe at the socket.
+            if budget.pace.available(now) < wire
+                || (class == Class::Extra
+                    && (self.media.available(now) < wire || (self.cap && budget.extras.available(now) < size as f64)))
+            {
+                return false;
+            }
+            if class == Class::Extra {
+                self.media.take(wire, now);
+            }
+            budget.pace.take(wire, now);
+        }
         match class {
+            Class::Audio => {
+                if !self.audio.take(size as f64, now) {
+                    return false;
+                }
+                self.counters.original_bytes += size as u64;
+            }
             Class::Original => {
                 if self.cap && !self.originals.take(size as f64, now) {
                     self.counters.originals_dropped += 1;
@@ -824,7 +1080,7 @@ impl Egress {
             }
             Class::Control => self.counters.control_bytes += size as u64,
             Class::Extra => {
-                if self.cap && !self.extras.take(size as f64, now) {
+                if !paced && self.cap && !self.wire.lock().expect("screen wire budget").extras.take(size as f64, now) {
                     self.counters.extras_dropped += 1;
                     let second = now.saturating_duration_since(self.start).as_secs();
                     if self.dropped_seconds.back() != Some(&second) {
@@ -970,7 +1226,7 @@ impl Egress {
     /// Refill the reserve before raising the probe target, with one MTU of tolerance
     /// at the allocation tick. Watch transports suspend regular padding until this is ready.
     pub fn probe_ready(&mut self, now: Instant) -> bool {
-        self.extras.available(now) >= extras_burst(self.estimate) - 1200.0
+        self.wire.lock().expect("screen wire budget").extras.available(now) >= extras_burst(self.estimate) - 1200.0
     }
 
     /// The bitrate the BWE should probe for: the watched shares' caps with headroom, and

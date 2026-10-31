@@ -235,3 +235,18 @@ two phases: **read everywhere first, write later**.
 6. **Major 5** only if something cannot be additive; clients by then speak 4 and
    5 for a window. Changing the challenge itself counts as a major change until
    one window after step 1, when every supported client reads it leniently.
+
+## Screen audio rollout
+
+P1-6 uses the separate `screen.audio.capabilities` query and accepts both legacy
+video slots and new video/Opus pairs. No legacy frame gains a field. Unsupported
+queries fall back to video-only sharing without an error banner; see
+[share-audio.md](share-audio.md#compatibility). This is a bounded feature-specific
+rollout, not an implementation of the full compatibility proposal above.
+
+Screen audio availability is queried separately with `screen.audio.state`
+(`share`, optional `stopped`, default false). Its reply is `{ audio: boolean }`.
+Older servers reject it normally; viewers then keep video without audio controls
+or playback. Only the owning publisher may set `stopped: true`. Share/Welcome
+and existing event shapes remain unchanged. Desktop viewers keep the legacy
+video-only watch layout until native playback supplies the AEC reference.

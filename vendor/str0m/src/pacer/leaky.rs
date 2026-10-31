@@ -123,9 +123,9 @@ impl Pacer for LeakyBucketPacer {
             } else {
                 elapsed
             };
-            if (self.egress_rate.is_none() || was_backlogged)
-                && cadence <= Duration::from_millis(20)
-            {
+            let max_cadence =
+                Duration::from_millis(if self.egress_rate.is_some() { 30 } else { 20 });
+            if (self.egress_rate.is_none() || was_backlogged) && cadence <= max_cadence {
                 self.bounded_wake_interval =
                     cadence.max(self.bounded_wake_interval.saturating_sub(elapsed / 20));
             }
@@ -275,6 +275,12 @@ impl LeakyBucketPacer {
         self.probe_queue.front().map(|p| p.config().cluster())
     }
 
+    pub(crate) fn active_probe_rate(&self) -> Option<Bitrate> {
+        self.probe_queue
+            .front()
+            .map(|p| p.config().target_bitrate())
+    }
+
     /// Check if the active probe is complete and should be finished.
     pub(crate) fn check_probe_complete(&mut self, now: Instant) -> Option<TwccClusterId> {
         // Check if we have a completed probe from a previous call
@@ -332,6 +338,7 @@ impl LeakyBucketPacer {
             let mut queues = self
                 .queue_states
                 .iter()
+                .filter(|q| q.ready(now))
                 .filter(|q| q.snapshot.packet_count > 0);
 
             if let Some(queue) = queues.next() {
@@ -342,6 +349,7 @@ impl LeakyBucketPacer {
         let unpaced = self
             .queue_states
             .iter()
+            .filter(|q| q.ready(now))
             .filter(|qs| qs.unpaced)
             .filter_map(|qs| qs.snapshot.first_unsent.map(|t| (t, qs)))
             .min_by_key(|(t, _)| *t);
@@ -355,6 +363,7 @@ impl LeakyBucketPacer {
             let non_empty_queues = self
                 .queue_states
                 .iter()
+                .filter(|q| q.ready(now))
                 .filter(|q| q.snapshot.packet_count > 0);
 
             // Send on the non-empty queue with the lowest priority that, was least recently
@@ -401,14 +410,30 @@ impl LeakyBucketPacer {
             }
         }
 
-        let any_queue_for_padding = self.queue_states.iter().any(|q| q.use_for_padding);
-        if !any_queue_for_padding {
-            return None;
+        // Pending packets retain their probe lifecycle while awaiting credit.
+        // In particular, do not fall through to an already expired Probe2 wake
+        // while an earlier padding request is still queued on a blocked source.
+        if let Some(at) = self
+            .queue_states
+            .iter()
+            .filter(|q| q.snapshot.packet_count > 0)
+            .filter_map(|q| q.send_after)
+            .filter(|at| *at > now)
+            .min()
+        {
+            return Some(((at, PacerReason::Handle), None));
         }
+
+        let padding_ready_at = self
+            .queue_states
+            .iter()
+            .filter(|q| q.use_for_padding)
+            .map(|q| q.send_after.unwrap_or(now))
+            .min()?;
 
         // If we're actively probing, use probe timing for padding
         if let Some(probe) = self.probe_queue.front() {
-            let next_probe_time = probe.next_probe_time();
+            let next_probe_time = probe.next_probe_time().max(padding_ready_at);
             // We explicitly don't return a queue to poll here. We need another call to
             // handle_timeout to request the padding before we can poll the selected queue.
             return Some(((next_probe_time, PacerReason::Probe2), None));
@@ -434,7 +459,10 @@ impl LeakyBucketPacer {
 
         // We explicitly don't return a queue to poll here. We need another call to
         // handle_timeout to request the padding before we can poll the selected queue.
-        Some(((padding_at, PacerReason::Padding), None))
+        Some((
+            (padding_at.max(padding_ready_at), PacerReason::Padding),
+            None,
+        ))
     }
 
     fn maybe_update_adjusted_bitrate(&mut self, now: Instant) {
@@ -498,10 +526,10 @@ impl LeakyBucketPacer {
         let maybe_queue = self
             .queue_states
             .iter()
-            .filter(|q| q.use_for_padding)
+            .filter(|q| q.use_for_padding && q.ready(now))
             .max_by_key(|q| q.snapshot.last_emitted);
 
-        if maybe_queue.is_none() {
+        if !self.queue_states.iter().any(|q| q.use_for_padding) {
             // No padding queue, no probes.
             self.probe_queue.clear();
         }
@@ -604,6 +632,7 @@ mod test {
                 midrid: MidRid("screen".into(), None),
                 unpaced: true,
                 use_for_padding: false,
+                send_after: None,
                 snapshot: QueueSnapshot {
                     created_at: now,
                     byte_size: left * 1200,
@@ -645,6 +674,7 @@ mod test {
                 midrid: MidRid("screen".into(), None),
                 unpaced: true,
                 use_for_padding: false,
+                send_after: None,
                 snapshot: QueueSnapshot {
                     created_at: now,
                     byte_size: previous_packets as usize * 1200,
@@ -666,6 +696,7 @@ mod test {
                     midrid: MidRid("screen".into(), None),
                     unpaced: true,
                     use_for_padding: false,
+                    send_after: None,
                     snapshot: QueueSnapshot {
                         created_at: at,
                         byte_size: 120_000,
@@ -713,6 +744,7 @@ mod test {
                     midrid: MidRid("screen".into(), None),
                     unpaced: true,
                     use_for_padding: false,
+                    send_after: None,
                     snapshot: QueueSnapshot {
                         created_at: now,
                         byte_size: 1_200_000,
@@ -766,6 +798,7 @@ mod test {
                         midrid: MidRid("screen".into(), None),
                         unpaced: true,
                         use_for_padding: false,
+                        send_after: None,
                         snapshot: QueueSnapshot {
                             created_at: now,
                             byte_size: left * 1200,
@@ -815,6 +848,7 @@ mod test {
             midrid: MidRid("probe".into(), None),
             unpaced: false,
             use_for_padding: true,
+            send_after: None,
             snapshot: QueueSnapshot {
                 created_at: now,
                 ..Default::default()
@@ -849,6 +883,7 @@ mod test {
             midrid: MidRid("video".into(), None),
             unpaced: true,
             use_for_padding: false,
+            send_after: None,
             snapshot: QueueSnapshot {
                 created_at: now,
                 packet_count: 3,
@@ -883,6 +918,7 @@ mod test {
                 midrid: MidRid("video".into(), None),
                 unpaced: false,
                 use_for_padding: true,
+                send_after: None,
                 snapshot: QueueSnapshot {
                     created_at: now,
                     packet_count: 3,
@@ -917,6 +953,7 @@ mod test {
             midrid: MidRid("probe".into(), None),
             unpaced: true,
             use_for_padding: true,
+            send_after: None,
             snapshot: QueueSnapshot {
                 created_at: now,
                 ..Default::default()
@@ -951,6 +988,7 @@ mod test {
                 midrid: MidRid("probe".into(), None),
                 unpaced: true,
                 use_for_padding: true,
+                send_after: None,
                 snapshot: QueueSnapshot {
                     created_at: now,
                     ..Default::default()
@@ -993,6 +1031,7 @@ mod test {
             midrid: MidRid("probe".into(), None),
             unpaced: false,
             use_for_padding: true,
+            send_after: None,
             snapshot: QueueSnapshot {
                 created_at: now,
                 ..Default::default()
@@ -1426,6 +1465,7 @@ mod test {
             midrid: MidRid(Mid::from("001"), None),
             unpaced: false,
             use_for_padding: true,
+            send_after: None,
             snapshot: QueueSnapshot {
                 created_at: now,
                 byte_size: 10_usize,
@@ -1441,6 +1481,7 @@ mod test {
             midrid: MidRid(Mid::from("002"), None),
             unpaced: false,
             use_for_padding: false,
+            send_after: None,
             snapshot: QueueSnapshot {
                 created_at: now,
                 byte_size: 30_usize,
@@ -1960,6 +2001,7 @@ mod test {
                     midrid: self.midrid,
                     unpaced: self.is_audio,
                     use_for_padding: !self.is_audio && self.last_emitted.is_some(),
+                    send_after: None,
                     snapshot: QueueSnapshot {
                         created_at: now,
                         byte_size: self.queue.iter().map(QueuedPacket::size).sum(),

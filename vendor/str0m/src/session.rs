@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::Event;
-use crate::bwe::BweKind;
+use crate::bwe::{BweKind, RtpSendGate};
 use crate::bwe_::Bwe;
 use crate::config::KeyingMaterial;
 use crate::config_mod::RtcpReportIntervals;
@@ -19,7 +19,7 @@ use crate::media::Media;
 use crate::media::{KeyframeRequestKind, MID_PROBE};
 use crate::media::{MediaAdded, MediaChanged};
 use crate::pacer::PacerControl;
-use crate::pacer::{Pacer, PacerImpl};
+use crate::pacer::{Pacer, PacerImpl, PacerReason};
 use crate::packet::{RedBlock, RedDecoder, red_same_pt_blocks};
 use crate::rtp::{Extension, RawPacket};
 use crate::rtp_::Direction;
@@ -101,6 +101,7 @@ pub(crate) struct Session {
     bwe_last_event: Option<(Bitrate, bool)>,
     bwe_padding_bitrate_limit: Option<Bitrate>,
     bwe_egress_pacing: Option<(Bitrate, Bitrate)>,
+    rtp_send_gate: Option<Box<dyn RtpSendGate>>,
 
     enable_twcc_feedback: bool,
 
@@ -209,6 +210,7 @@ impl Session {
             bwe_last_event: None,
             bwe_padding_bitrate_limit: None,
             bwe_egress_pacing: None,
+            rtp_send_gate: None,
             enable_twcc_feedback: false,
             pacer,
             pacer_control: PacerControl::new(),
@@ -1182,13 +1184,37 @@ impl Session {
         let twcc_enabled = exts.id_of(Extension::TransportSequenceNumber).is_some();
         let twcc = twcc_enabled.then_some(&mut self.twcc);
 
-        let receipt = stream.poll_packet(now, exts, twcc, params, buf)?;
+        let budget = self
+            .rtp_send_gate
+            .as_mut()
+            .map(|gate| gate.poll_budget(now, self.pacer.active_probe_rate()));
+        let receipt = if let Some(budget) = budget {
+            stream.poll_packet_with_budget(
+                now,
+                exts,
+                twcc,
+                params,
+                buf,
+                budget.media_bytes,
+                budget.extra_bytes,
+            )
+        } else {
+            stream.poll_packet(now, exts, twcc, params, buf)
+        };
+        let Some(receipt) = receipt else {
+            // Keep an unaffordable repair/padding queue out of selection until
+            // its retry, without delaying eligible media on other streams.
+            stream.defer_send_until(budget.map(|b| b.retry_at));
+            return None;
+        };
+        stream.defer_send_until(None);
 
         let PacketReceipt {
             header,
             seq_no,
             is_padding,
             payload_size,
+            is_extra,
         } = receipt;
 
         trace!(payload_size, is_padding, "Poll RTP: {:?}", header);
@@ -1205,6 +1231,9 @@ impl Session {
         }
 
         let protected = srtp_tx.protect_rtp(buf, &header, *seq_no);
+        if let Some(gate) = &mut self.rtp_send_gate {
+            gate.sent(now, protected.len(), is_extra);
+        }
         // Dedicated egress pacing and its feedback use the same wire-byte unit.
         // Reserve IPv6 + UDP even on IPv4, retaining headroom for both paths.
         let sent_size = if self.bwe_egress_pacing.is_some() {
@@ -1249,6 +1278,7 @@ impl Session {
         let nack_at = self.nack_at();
         let twcc_at = self.twcc_at();
         let pacing_at = self.pacer.poll_timeout();
+        let deferred_at = self.streams.deferred_send_at();
         let packetize_at = self.medias.iter().filter_map(|m| m.poll_timeout()).min();
         let receive_at = self
             .medias
@@ -1277,6 +1307,7 @@ impl Session {
             .soonest((nack_at, Reason::Nack))
             .soonest((twcc_at, Reason::Twcc))
             .soonest(pacing_at)
+            .soonest((deferred_at, Reason::Pacer(PacerReason::Handle)))
             .soonest((receive_at, Reason::ReceiveReorder))
             .soonest((packetize_at, Reason::Packetize))
             .soonest((paused_at, Reason::PauseCheck))
@@ -1351,6 +1382,11 @@ impl Session {
             bwe.set_egress_pacing(probe);
         }
         self.pacer.set_egress_pacing(media);
+    }
+
+    pub fn set_rtp_send_gate(&mut self, gate: Option<Box<dyn RtpSendGate>>) {
+        self.rtp_send_gate = gate;
+        self.streams.clear_send_deferrals();
     }
 
     pub fn set_bwe_padding_bitrate_limit(&mut self, limit: Option<Bitrate>) {
@@ -1530,6 +1566,7 @@ pub struct PacketReceipt {
     pub seq_no: SeqNo,
     pub is_padding: bool,
     pub payload_size: usize,
+    pub is_extra: bool,
 }
 
 /// Find the PayloadParams for the given Pt, either when the Pt is the main Pt for the Codec or
@@ -1589,6 +1626,271 @@ mod tests {
     use crate::RtcConfig;
     use crate::io::DATAGRAM_MTU_TARGET;
     use crate::packet::RedEncoder;
+
+    #[test]
+    fn partial_probe_survives_temporary_credit_deferral() {
+        probe_survives_credit_deferral(true);
+    }
+
+    #[test]
+    fn unstarted_probe_waits_for_credit_without_busy_polling() {
+        probe_survives_credit_deferral(false);
+    }
+
+    fn probe_survives_credit_deferral(first_packet: bool) {
+        use crate::bwe::RtpSendBudget;
+        use crate::media::MediaKind;
+
+        #[derive(Debug)]
+        struct CreditAt(Instant, bool);
+        impl RtpSendGate for CreditAt {
+            fn poll_budget(&mut self, now: Instant, _: Option<Bitrate>) -> RtpSendBudget {
+                RtpSendBudget {
+                    media_bytes: 1346,
+                    extra_bytes: if now >= self.0 {
+                        100_000
+                    } else if self.1 {
+                        350
+                    } else {
+                        0
+                    },
+                    retry_at: self.0,
+                }
+            }
+            fn sent(&mut self, _: Instant, _: usize, _: bool) {
+                self.1 = false;
+            }
+        }
+        let now = Instant::now();
+        let ready = now + Duration::from_millis(10);
+        let crypto = Arc::new(crate::crypto::from_feature_flags());
+        let mut sender = RtcConfig::default()
+            .set_crypto_provider(crypto.clone())
+            .enable_bwe(Some(Bitrate::mbps(1)))
+            .set_rtp_mode(true)
+            .build(now);
+        let mut peer = RtcConfig::default()
+            .set_crypto_provider(crypto.clone())
+            .set_rtp_mode(true)
+            .build(now);
+        let mut api = sender.sdp_api();
+        let mid = api.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+        let (offer, pending) = api.apply().unwrap();
+        let answer = peer.sdp_api().accept_offer(offer).unwrap();
+        sender.sdp_api().accept_answer(pending, answer).unwrap();
+        sender
+            .direct_api()
+            .stream_tx_by_mid(mid, None)
+            .unwrap()
+            .set_unpaced(true);
+        let s = &mut sender.session;
+        s.set_keying_material(
+            KeyingMaterial::new(&[7; 60]),
+            &crypto,
+            SrtpProfile::AES128_CM_SHA1_80,
+            true,
+        );
+        s.set_bwe_desired_bitrate(Bitrate::mbps(3));
+        s.set_bwe_egress_pacing(Bitrate::kbps(800), Bitrate::mbps(1));
+        s.set_rtp_send_gate(Some(Box::new(CreditAt(ready, first_packet))));
+        s.handle_timeout(now).unwrap();
+        let cluster = s
+            .pacer
+            .active_cluster()
+            .expect("start initial capacity probe");
+        let mut emitted = 0;
+        let mut at = now;
+        let mut callbacks = 0;
+        let deadline = loop {
+            callbacks += 1;
+            assert!(callbacks <= 16, "busy polling before extras credit returns");
+            s.handle_timeout(at).unwrap();
+            s.feedback_tx.clear();
+            emitted += usize::from(s.poll_packet(at).is_some());
+            assert_eq!(
+                s.pacer.active_cluster(),
+                Some(cluster),
+                "a credit wait must not cancel a probe"
+            );
+            let next = s.poll_timeout().0.expect("a useful credit retry");
+            if next >= ready {
+                break next;
+            }
+            // Drive the returned deadline, including same-clock pacer updates.
+            // Never advance time artificially to escape a busy loop.
+            at = at.max(next);
+        };
+        assert_eq!(
+            emitted,
+            usize::from(first_packet),
+            "only the initial grant may send"
+        );
+        assert_eq!(
+            deadline, ready,
+            "wait for useful credit, not an expired probe wake"
+        );
+        assert!(deadline > at);
+        // Actual packet/TWCC progress resumes at the advertised credit deadline.
+        let twcc = s.twcc;
+        s.handle_timeout(deadline).unwrap();
+        s.feedback_tx.clear();
+        assert!(
+            s.poll_packet(deadline).is_some(),
+            "probe resumes when credit returns"
+        );
+        assert_eq!(s.twcc, twcc + 1, "only an actual send advances TWCC");
+    }
+
+    #[test]
+    fn blocked_repair_does_not_hold_other_media_before_twcc() {
+        use crate::bwe::RtpSendBudget;
+        use crate::media::MediaKind;
+        use crate::rtp_::NackEntry;
+        use crate::streams::RtpWrite;
+
+        #[derive(Debug)]
+        struct DepletedExtras(Instant);
+        impl RtpSendGate for DepletedExtras {
+            fn poll_budget(&mut self, now: Instant, _: Option<Bitrate>) -> RtpSendBudget {
+                RtpSendBudget {
+                    media_bytes: 1346,
+                    extra_bytes: if now < self.0 { 0 } else { 1346 },
+                    retry_at: self.0,
+                }
+            }
+            fn sent(&mut self, _: Instant, _: usize, _: bool) {}
+        }
+
+        let now = Instant::now();
+        let crypto = Arc::new(crate::crypto::from_feature_flags());
+        let mut sender = RtcConfig::default()
+            .set_crypto_provider(crypto.clone())
+            .set_rtp_mode(true)
+            .build(now);
+        let mut peer = RtcConfig::default()
+            .set_crypto_provider(crypto.clone())
+            .set_rtp_mode(true)
+            .build(now);
+        let mut api = sender.sdp_api();
+        let mids = [
+            api.add_media(MediaKind::Video, Direction::SendOnly, None, None, None),
+            api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None),
+            api.add_media(MediaKind::Video, Direction::SendOnly, None, None, None),
+        ];
+        let (offer, pending) = api.apply().unwrap();
+        let answer = peer.sdp_api().accept_offer(offer).unwrap();
+        sender.sdp_api().accept_answer(pending, answer).unwrap();
+        let mut ssrcs = Vec::new();
+        for mid in mids {
+            let mut api = sender.direct_api();
+            let stream = api.stream_tx_by_mid(mid, None).unwrap();
+            stream.set_unpaced(true);
+            ssrcs.push(stream.ssrc());
+        }
+        let s = &mut sender.session;
+        s.set_keying_material(
+            KeyingMaterial::new(&[7; 60]),
+            &crypto,
+            SrtpProfile::AES128_CM_SHA1_80,
+            true,
+        );
+        // A fixed 1 Mb/s link, without bandwidth-estimator probes in this isolation.
+        s.pacer = PacerImpl::leaky_bucket(Bitrate::mbps(1));
+        s.set_bwe_egress_pacing(Bitrate::kbps(800), Bitrate::mbps(1));
+        let video_pt = s
+            .codec_config
+            .params()
+            .iter()
+            .find(|p| p.resend().is_some())
+            .unwrap()
+            .pt();
+        let audio_pt = s
+            .codec_config
+            .params()
+            .iter()
+            .find(|p| p.spec().codec == crate::format::Codec::Opus)
+            .unwrap()
+            .pt();
+        let start = now + Duration::from_millis(100);
+        let ready = start + Duration::from_millis(60);
+        s.set_rtp_send_gate(Some(Box::new(DepletedExtras(ready))));
+        s.streams
+            .stream_tx(&ssrcs[0])
+            .unwrap()
+            .write_rtp(RtpWrite::new(video_pt, 7.into(), 0, now, vec![0; 1100]).nackable(true));
+        s.handle_timeout(now).unwrap();
+        assert!(
+            s.poll_packet(now).is_some(),
+            "cache the original video packet"
+        );
+        let next_twcc = s.twcc;
+        s.streams
+            .stream_tx(&ssrcs[0])
+            .unwrap()
+            .handle_nack(
+                std::iter::once(NackEntry { pid: 7, blp: 0 }),
+                start - Duration::from_millis(10),
+            )
+            .unwrap();
+        s.handle_timeout(start).unwrap();
+        assert!(
+            s.poll_packet(start).is_none(),
+            "repair must wait for extras credit"
+        );
+        assert_eq!(s.twcc, next_twcc, "deferral must not allocate TWCC");
+
+        let mut sent = Vec::new();
+        for ms in 1..=80 {
+            let at = start + Duration::from_millis(ms);
+            if ms == 1 {
+                for (i, pt, size) in [(1, audio_pt, 160), (2, video_pt, 200)] {
+                    s.streams
+                        .stream_tx(&ssrcs[i])
+                        .unwrap()
+                        .write_rtp(RtpWrite::new(pt, 1.into(), 0, at, vec![0; size]));
+                }
+            }
+            if ms == 10 {
+                // A new original on the deferred stream must also be eligible.
+                s.streams
+                    .stream_tx(&ssrcs[0])
+                    .unwrap()
+                    .write_rtp(RtpWrite::new(video_pt, 8.into(), 3000, at, vec![0; 160]));
+            }
+            if ms == 1 || ms == 10 || s.poll_timeout().0.is_some_and(|wake| wake <= at) {
+                s.handle_timeout(at).unwrap();
+                s.feedback_tx.clear();
+                for _ in 0..8 {
+                    let Some(packet) = s.poll_packet(at) else {
+                        break;
+                    };
+                    let ssrc = u32::from_be_bytes(packet[8..12].try_into().unwrap());
+                    sent.push((ssrc, ms));
+                    s.handle_timeout(at).unwrap();
+                    s.feedback_tx.clear();
+                }
+            }
+        }
+        for (i, arrived) in [(1, 1), (2, 1), (0, 10)] {
+            let delivered = sent.iter().find(|(ssrc, _)| *ssrc == *ssrcs[i]).unwrap().1;
+            println!("media {i}: {} ms wait", delivered - arrived);
+            assert!(
+                delivered - arrived <= 20,
+                "media {i} waited {} ms behind a blocked repair",
+                delivered - arrived
+            );
+        }
+        let rtx = *s.streams.stream_tx(&ssrcs[0]).unwrap().rtx().unwrap();
+        let repaired = sent.iter().find(|(ssrc, _)| *ssrc == rtx).unwrap().1;
+        println!("repair: {repaired} ms after credit depletion");
+        assert!(repaired >= 60, "a repair must not bypass its extras budget");
+        assert_eq!(
+            s.twcc,
+            next_twcc + 4,
+            "only three originals and the eventual repair allocate TWCC"
+        );
+    }
 
     #[test]
     fn bwe_reset_discards_old_probes_feedback_and_smoothing_but_keeps_transport_sequence() {

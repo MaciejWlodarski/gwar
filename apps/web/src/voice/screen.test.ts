@@ -68,7 +68,7 @@ class Peer {
   ontrack: ((ev: unknown) => void) | null = null;
   close = vi.fn();
   sendParams: Array<RTCRtpSendParameters> = [];
-  transceivers: Array<{ direction: string; init: RTCRtpTransceiverInit; setCodecPreferences: ReturnType<typeof vi.fn>; setHeaderExtensionsToNegotiate: ReturnType<typeof vi.fn>; receiver: Record<string, unknown>; sender: { getParameters: () => RTCRtpSendParameters; setParameters: ReturnType<typeof vi.fn> } }> = [];
+  transceivers: Array<{ direction: string; init: RTCRtpTransceiverInit; setCodecPreferences: ReturnType<typeof vi.fn>; setHeaderExtensionsToNegotiate: ReturnType<typeof vi.fn>; receiver: Record<string, unknown>; sender: { getParameters: () => RTCRtpSendParameters; setParameters: ReturnType<typeof vi.fn>; replaceTrack: ReturnType<typeof vi.fn> } }> = [];
   /** What `getParameters().codecs` reports: the negotiated codecs. */
   codecs: RTCRtpCodecParameters[] = [];
   stats = new Map<string, Record<string, unknown>>([["out", { type: "outbound-rtp", kind: "video", framesEncoded: 1 }]]);
@@ -82,6 +82,7 @@ class Peer {
     const sender = {
       getParameters: () => ({ transactionId: `t${++transaction}`, encodings: [{ ...init.sendEncodings?.[0] }], codecs: this.codecs, headerExtensions: [], rtcp: {} }),
       setParameters: vi.fn(async (p: RTCRtpSendParameters) => { this.sendParams.push(p); }),
+      replaceTrack: vi.fn(async (_track: MediaStreamTrack | null) => {}),
     };
     const extensions = [{ uri: "urn:ietf:params:rtp-hdrext:sdes:mid", direction: "sendrecv" }, { uri: DEPENDENCY_DESCRIPTOR, direction: "stopped" }];
     const t = { direction: init.direction!, init, setCodecPreferences: vi.fn(), getHeaderExtensionsToNegotiate: () => extensions.map(e => ({ ...e })), setHeaderExtensionsToNegotiate: vi.fn(),
@@ -98,7 +99,7 @@ beforeEach(() => {
   const caps = { getCapabilities: () => ({ codecs: [codec("video/VP8"), codec("video/VP9", "profile-id=0"), codec("video/rtx")], headerExtensions: [] }) };
   vi.stubGlobal("RTCRtpSender", caps);
   vi.stubGlobal("RTCRtpReceiver", caps);
-  vi.stubGlobal("MediaStream", class { constructor(readonly tracks: unknown[]) {} });
+  vi.stubGlobal("MediaStream", class { constructor(readonly tracks: MediaStreamTrack[] = []) {} getTracks() { return this.tracks; } });
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
@@ -361,12 +362,12 @@ describe("watch transport", () => {
 
 describe("capture", () => {
   it("asks for video only, keeps Gwar's own tab out and lets the sharer switch", async () => {
-    const getDisplayMedia = vi.fn(async () => ({}) as MediaStream);
+    const getDisplayMedia = vi.fn(async () => ({ getVideoTracks: () => [{ getSettings: () => ({ displaySurface: "browser" }) }], getAudioTracks: () => [] }) as unknown as MediaStream);
     const setFocusBehavior = vi.fn();
     vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
     vi.stubGlobal("CaptureController", class { setFocusBehavior = setFocusBehavior; });
     await captureScreen();
-    expect(getDisplayMedia).toHaveBeenCalledWith(expect.objectContaining({ audio: false, systemAudio: "exclude", selfBrowserSurface: "exclude", surfaceSwitching: "include", controller: expect.anything() }));
+    expect(getDisplayMedia).toHaveBeenCalledWith(expect.objectContaining({ audio: { suppressLocalAudioPlayback: false, restrictOwnAudio: true, echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 }, systemAudio: "exclude", windowAudio: "exclude", selfBrowserSurface: "exclude", surfaceSwitching: "include", controller: expect.anything() }));
     expect(setFocusBehavior).toHaveBeenCalledWith("no-focus-change");
   });
 
@@ -3136,4 +3137,140 @@ describe("first-frame guard", () => {
     expect(pc.createOffer).toHaveBeenCalledTimes(2);
     publisher.close();
   });
+});
+
+describe("share audio", () => {
+  it.each(["screen", "window", "unknown", "browser"])("keeps only another tab's sound after the %s picker, even if the browser ignores exclusion hints", async surface => {
+    const audio = { stop: vi.fn() } as unknown as MediaStreamTrack;
+    const removeTrack = vi.fn();
+    const stream = { getVideoTracks: () => [{ getSettings: () => ({ displaySurface: surface }) }], getAudioTracks: () => [audio], removeTrack };
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia: vi.fn(async () => stream) } });
+    await captureScreen();
+    expect(audio.stop).toHaveBeenCalledTimes(surface === "browser" ? 0 : 1);
+    expect(removeTrack).toHaveBeenCalledTimes(surface === "browser" ? 0 : 1);
+  });
+
+  it("never captures desktop playback, even when its webview ignores audio:false", async () => {
+    const audio = { stop: vi.fn() };
+    const getDisplayMedia = vi.fn(async () => ({ getVideoTracks: () => [{ getSettings: () => ({ displaySurface: "browser" }) }], getAudioTracks: () => [audio], removeTrack: vi.fn() }));
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
+    await captureScreen(undefined, false);
+    expect(getDisplayMedia).toHaveBeenCalledWith(expect.objectContaining({ audio: false, systemAudio: "exclude" }));
+    expect(audio.stop).toHaveBeenCalledOnce();
+  });
+
+  it("publishes sound below voice priority, subtracts its wire allowance, and retains the track in encoder recovery", async () => {
+    const audio = { readyState: "live" } as MediaStreamTrack;
+    const publisher = new ScreenPublisher({ track: { applyConstraints: async () => {} } as unknown as MediaStreamTrack, audio, quality: TEST_SPECS.smooth, iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const first = Peer.all[0]!;
+    expect(first.transceivers).toHaveLength(2);
+    expect(first.transceivers[1]?.init.sendEncodings?.[0]).toMatchObject({ maxBitrate: 64_000, priority: "very-low", networkPriority: "very-low" });
+    expect(publisher.bitrate).toBe(deriveSpec(TEST_SPECS.smooth).maxBitrate - 128_000);
+    first.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 800_000 });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(publisher.bitrate + 128_000).toBeLessThanOrEqual(uplinkVideoBudget(800_000));
+    await publisher.recover({ share: "A", codec: "h264", width: 1280, height: 720, fps: 30 });
+    expect(Peer.all[1]?.transceivers).toHaveLength(2);
+    expect(Peer.all[1]?.transceivers[1]?.init.sendEncodings?.[0]?.priority).toBe("very-low");
+    publisher.close();
+  });
+
+  it.each(["\r\n", "\n"])("keeps reserved audio out of video capacity feedback (%j)", async newline => {
+    const original = Peer.offerSdp;
+    const video = ["m=video 9 X 98", "a=sendonly", "a=mid:0", "a=ssrc-group:FID 10 11", "a=ssrc:10 cname:share", "a=ssrc:11 cname:share", "a=extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01", "a=rtcp-fb:98 transport-cc", ""].join(newline);
+    const sound = ["m=audio 9 X 111", "a=sendonly", "a=mid:1", "a=ssrc:12 cname:share", "a=rtpmap:111 opus/48000/2", "a=fmtp:111 minptime=10;useinbandfec=1", "a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time", "a=extmap:4 http://www.ietf.org/id/draft-holmer-rmcat-transport-wide-cc-extensions-01", "a=rtcp-fb:111 transport-cc", ""].join(newline);
+    Peer.offerSdp = `v=0${newline}${video}${sound}`;
+    const publisher = new ScreenPublisher({ track: { readyState: "live" } as MediaStreamTrack, audio: { readyState: "live" } as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
+    try {
+      await publisher.start();
+      const offer = Peer.all[0]!.localDescription!.sdp!;
+      expect(offer).toContain(video);
+      const audio = offer.slice(offer.indexOf("m=audio "));
+      expect(audio).not.toContain("transport-wide-cc");
+      expect(audio).not.toContain("transport-cc");
+      for (const line of ["a=mid:1", "a=ssrc:12 cname:share", "a=rtpmap:111 opus/48000/2", "a=fmtp:111 minptime=10;useinbandfec=1", "a=extmap:2 http://www.webrtc.org/experiments/rtp-hdrext/abs-send-time"]) expect(audio).toContain(line);
+    } finally { publisher.close(); Peer.offerSdp = original; }
+  });
+
+  it("holds bundled video input until the connected transport has its negotiated allocation", async () => {
+    const track = { readyState: "live" } as MediaStreamTrack;
+    const audio = { readyState: "live" } as MediaStreamTrack;
+    const publisher = new ScreenPublisher({ track, audio, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!, sender = pc.transceivers[0]!.sender;
+    expect(sender.replaceTrack.mock.calls).toEqual([[null]]);
+    expect(pc.sendParams.at(-1)?.encodings[0]?.maxBitrate).toBe(7_872_000);
+    pc.connectionState = "connected"; pc.onconnectionstatechange?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sender.replaceTrack.mock.calls).toEqual([[null], [track]]);
+    publisher.close();
+  });
+
+  it("never reattaches a bundled video source after its publisher closes", async () => {
+    const track = { readyState: "live" } as MediaStreamTrack;
+    const publisher = new ScreenPublisher({ track, audio: { readyState: "live" } as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!, changed = pc.onconnectionstatechange, sender = pc.transceivers[0]!.sender;
+    expect(sender.replaceTrack).toHaveBeenCalledWith(null);
+    publisher.close();
+    pc.connectionState = "connected"; changed?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(sender.replaceTrack.mock.calls).toEqual([[null]]);
+  });
+
+  it("keeps the video-only publisher's source attached through negotiation", async () => {
+    const publisher = new ScreenPublisher({ track: { readyState: "live" } as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!;
+    pc.connectionState = "connected"; pc.onconnectionstatechange?.();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(pc.transceivers[0]!.sender.replaceTrack).not.toHaveBeenCalled();
+    publisher.close();
+  });
+
+  it("offers paired receive slots only after support is confirmed and combines their tracks", async () => {
+    const received = vi.fn();
+    const watch = new ScreenWatchTransport({ run: 1, audio: async () => true, iceServers: [], offer: async () => "answer", state: () => {}, track: received });
+    await watch.start();
+    const peer = Peer.all[0]!;
+    expect(peer.transceivers).toHaveLength(SCREEN_SLOTS * 2);
+    const video = { kind: "video" }, audio = { kind: "audio" };
+    peer.ontrack?.({ transceiver: peer.transceivers[0], track: video });
+    peer.ontrack?.({ transceiver: peer.transceivers[1], track: audio });
+    expect(received).toHaveBeenLastCalledWith(0, expect.objectContaining({ tracks: [video, audio] }));
+    const stale = peer.ontrack!;
+    watch.close();
+    stale({ transceiver: peer.transceivers[1], track: audio });
+    expect(received).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the legacy watch layout against a server without audio support", async () => {
+    const watch = new ScreenWatchTransport({ run: 1, audio: async () => false, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {} });
+    await watch.start();
+    expect(Peer.all[0]?.transceivers).toHaveLength(SCREEN_SLOTS);
+    watch.close();
+  });
+});
+
+
+it("drops tab sound when a browser advertises own-audio exclusion but did not apply it", async () => {
+  const audio = { stop: vi.fn(), getSettings: () => ({ restrictOwnAudio: false }) };
+  const removeTrack = vi.fn();
+  const stream = { getVideoTracks: () => [{ getSettings: () => ({ displaySurface: "browser" }) }], getAudioTracks: () => [audio], removeTrack };
+  vi.stubGlobal("navigator", { mediaDevices: { getSupportedConstraints: () => ({ restrictOwnAudio: true }), getDisplayMedia: async () => stream } });
+  await captureScreen();
+  expect(audio.stop).toHaveBeenCalledOnce(); expect(removeTrack).toHaveBeenCalledWith(audio);
+});
+
+
+it("stops sound truthfully when the retained source changes from a tab to a window", async () => {
+  let displaySurface = "browser";
+  const audio = { readyState: "live", stop: vi.fn(function(this: { readyState: string }) { this.readyState = "ended"; }) };
+  const audioState = vi.fn();
+  const publisher = new ScreenPublisher({ track: { getSettings: () => ({ displaySurface }) } as unknown as MediaStreamTrack, audio: audio as unknown as MediaStreamTrack, audioState, quality: TEST_SPECS.smooth, iceServers: [], offer: async () => "answer", state: () => {} });
+  await publisher.start(); displaySurface = "window";
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(audio.stop).toHaveBeenCalledOnce(); expect(audioState).toHaveBeenLastCalledWith(false);
+  publisher.close();
 });

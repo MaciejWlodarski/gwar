@@ -73,7 +73,15 @@ pub struct QueueState {
     pub midrid: MidRid,
     pub unpaced: bool,
     pub use_for_padding: bool,
+    /// Temporary packet eligibility; never removes the stream's probe capability.
+    pub send_after: Option<Instant>,
     pub snapshot: QueueSnapshot,
+}
+
+impl QueueState {
+    pub fn ready(&self, now: Instant) -> bool {
+        self.send_after.is_none_or(|at| now >= at)
+    }
 }
 
 /// A request to generate a specific amount of padding.

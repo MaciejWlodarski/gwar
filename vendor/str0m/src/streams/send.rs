@@ -127,6 +127,9 @@ pub struct StreamTx {
     /// The queue information sampled during the latest pacer update.
     queue_info: Option<QueueSnapshot>,
 
+    /// Retry only this stream when the application's wire credit is exhausted.
+    send_deferred_until: Option<Instant>,
+
     /// Whether this sender is to be unpaced in BWE situations.
     ///
     /// Audio defaults to not being paced.
@@ -319,6 +322,7 @@ impl StreamTx {
             rtp_and_wallclock: None,
             send_queue: SendQueue::new(),
             queue_info: None,
+            send_deferred_until: None,
             unpaced: None,
             resends: VecDeque::new(),
             padding: 0,
@@ -497,6 +501,9 @@ impl StreamTx {
         };
 
         self.send_queue.push(packet);
+        // New originals may fit media credit even while an older repair cannot
+        // fit extras credit. Let the pre-dequeue checks choose between them.
+        self.send_deferred_until = None;
     }
 
     fn padding_enabled(&self) -> bool {
@@ -511,6 +518,22 @@ impl StreamTx {
         params: &[PayloadParams],
         buf: &mut Vec<u8>,
     ) -> Option<PacketReceipt> {
+        self.poll_packet_with_budget(now, exts, twcc, params, buf, usize::MAX, usize::MAX)
+    }
+
+    /// Bounds include worst-case RTP extensions, SRTP tag and IPv6/UDP. Check
+    /// before queue removal, sequence increments, statistics or TWCC assignment.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn poll_packet_with_budget(
+        &mut self,
+        now: Instant,
+        exts: &ExtensionMap,
+        twcc: Option<&mut u64>,
+        params: &[PayloadParams],
+        buf: &mut Vec<u8>,
+        media_bytes: usize,
+        extra_bytes: usize,
+    ) -> Option<PacketReceipt> {
         let mid = self.midrid.mid();
         let rid = self.midrid.rid();
         let is_probe = self.ssrc.is_probe();
@@ -521,12 +544,13 @@ impl StreamTx {
         let remote_acked_ssrc = self.remote_acked_ssrc;
         let remote_acked_rtx_ssrc = self.remote_acked_rtx_ssrc;
 
-        let (next, is_padding) = if let Some(next) = self.poll_packet_resend(now) {
+        let (next, is_padding) = if let Some(next) = self.poll_packet_resend(now, extra_bytes, exts)
+        {
             (next, false)
-        } else if let Some(next) = self.poll_packet_regular(now) {
+        } else if let Some(next) = self.poll_packet_regular(now, media_bytes, exts) {
             (next, false)
         } else {
-            let next = self.poll_packet_padding(now)?;
+            let next = self.poll_packet_padding(now, extra_bytes, exts)?;
             (next, true)
         };
 
@@ -765,6 +789,7 @@ impl StreamTx {
             seq_no,
             is_padding,
             payload_size: body_len,
+            is_extra: !pop_send_queue,
         })
     }
 
@@ -804,7 +829,12 @@ impl StreamTx {
         ratio
     }
 
-    fn poll_packet_resend(&mut self, now: Instant) -> Option<NextPacket<'_>> {
+    fn poll_packet_resend(
+        &mut self,
+        now: Instant,
+        budget: usize,
+        exts: &ExtensionMap,
+    ) -> Option<NextPacket<'_>> {
         if let Some(ratio_cap) = self.rtx_ratio_cap {
             let ratio = self.rtx_ratio_downsampled(now);
 
@@ -816,21 +846,34 @@ impl StreamTx {
         }
 
         let seq_no = loop {
-            let resend = self.resends.pop_front()?;
+            let resend = self.resends.front()?;
 
             let pkt = self.rtx_cache.get_cached_packet_by_seq_no(resend.seq_no);
 
             // The seq_no could simply be too old to exist in the buffer, in which
             // case we will not do a resend.
             let Some(pkt) = pkt else {
+                self.resends.pop_front();
                 continue;
             };
+            if !fits_wire_budget(
+                &pkt.header,
+                exts,
+                self.midrid,
+                now,
+                pkt.payload.len() + 2,
+                budget,
+            ) {
+                return None;
+            }
 
             // Cached packets must be nackable. This is ensured before adding the
             // entry to the self.rtx_cache.
             assert!(pkt.nackable);
 
-            break pkt.seq_no;
+            let seq_no = pkt.seq_no;
+            self.resends.pop_front();
+            break seq_no;
         };
 
         // Borrow checker gymnastics.
@@ -853,11 +896,26 @@ impl StreamTx {
         })
     }
 
-    fn poll_packet_regular(&mut self, now: Instant) -> Option<NextPacket<'_>> {
+    fn poll_packet_regular(
+        &mut self,
+        now: Instant,
+        budget: usize,
+        exts: &ExtensionMap,
+    ) -> Option<NextPacket<'_>> {
         // exit via ? here is ok since that means there is nothing to send.
         // The packet remains in the head of the send queue until we
         // finish poll_packet, at which point we move it to the cache.
         let pkt = self.send_queue.peek()?;
+        if !fits_wire_budget(
+            &pkt.header,
+            exts,
+            self.midrid,
+            now,
+            pkt.payload.len(),
+            budget,
+        ) {
+            return None;
+        }
 
         pkt.timestamp = now;
 
@@ -876,7 +934,12 @@ impl StreamTx {
         })
     }
 
-    fn poll_packet_padding(&mut self, _now: Instant) -> Option<NextPacket> {
+    fn poll_packet_padding(
+        &mut self,
+        now: Instant,
+        budget: usize,
+        exts: &ExtensionMap,
+    ) -> Option<NextPacket> {
         if !self.padding_enabled() {
             self.padding = 0;
             return None;
@@ -903,6 +966,16 @@ impl StreamTx {
                 if pkt.payload.len() < MAX_BLANK_PADDING_PAYLOAD_SIZE {
                     break 'outer;
                 }
+                if !fits_wire_budget(
+                    &pkt.header,
+                    exts,
+                    self.midrid,
+                    now,
+                    pkt.payload.len() + 2,
+                    budget,
+                ) {
+                    break 'outer;
+                }
                 let orig_seq_no = pkt.seq_no;
                 let seq_no = self.seq_no_rtx.inc();
 
@@ -916,6 +989,19 @@ impl StreamTx {
             }
         };
 
+        let len = self
+            .padding
+            .clamp(SRTP_BLOCK_SIZE, MAX_BLANK_PADDING_PAYLOAD_SIZE);
+        if !fits_wire_budget(
+            &self.blank_packet.header,
+            exts,
+            self.midrid,
+            now,
+            len.div_ceil(SRTP_BLOCK_SIZE) * SRTP_BLOCK_SIZE + 2,
+            budget,
+        ) {
+            return None;
+        }
         let seq_no = if self.ssrc.is_probe() {
             self.seq_no.inc()
         } else {
@@ -1145,12 +1231,26 @@ impl StreamTx {
 
         self.queue_info = Some(snapshot);
 
+        let deferred = self.send_deferred_until.is_some_and(|at| now < at);
+        if !deferred {
+            self.send_deferred_until = None;
+        }
+
         QueueState {
             midrid: self.midrid,
             unpaced,
             use_for_padding,
+            send_after: self.send_deferred_until,
             snapshot,
         }
+    }
+
+    pub(crate) fn defer_send_until(&mut self, at: Option<Instant>) {
+        self.send_deferred_until = at;
+    }
+
+    pub(crate) fn send_deferred_until(&self) -> Option<Instant> {
+        self.send_deferred_until
     }
 
     fn queue_state_resend(&self, now: Instant) -> Option<QueueSnapshot> {
@@ -1275,11 +1375,13 @@ impl StreamTx {
     pub(crate) fn clear_padding(&mut self) {
         self.padding = 0;
         self.queue_info = None;
+        self.send_deferred_until = None;
     }
 
     pub(crate) fn reset_buffers(&mut self) {
         self.send_queue.clear();
         self.queue_info = None;
+        self.send_deferred_until = None;
         self.rtx_cache.clear();
         self.resends.clear();
         self.padding = 0;
@@ -1330,6 +1432,34 @@ struct NextPacket<'a> {
     pkt: &'a mut RtpPacket,
 }
 
+/// Include every header extension the outgoing form may add. Measure the actual
+/// negotiated layout so CSRCs or a large dependency descriptor cannot overspend
+/// the gate. No allocation or duplicate header write on the ungated path.
+fn fits_wire_budget(
+    header: &RtpHeader,
+    exts: &ExtensionMap,
+    midrid: MidRid,
+    now: Instant,
+    payload: usize,
+    budget: usize,
+) -> bool {
+    if budget == usize::MAX {
+        return true;
+    }
+    let mut header = header.clone();
+    // Padding's cached header may not have its negotiated PT assigned yet; PT
+    // does not affect the serialized header length.
+    header.payload_type = 0.into();
+    header.ext_vals.mid = Some(midrid.mid());
+    header.ext_vals.rid = midrid.rid();
+    header.ext_vals.rid_repair = midrid.rid();
+    header.ext_vals.abs_send_time = Some(now);
+    header.ext_vals.transport_cc = Some(0);
+    let mut scratch = [0; DATAGRAM_MAX_PACKET_SIZE];
+    let bytes = header.write_to(&mut scratch, exts);
+    bytes.saturating_add(payload).saturating_add(16 + 48) <= budget
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NextPacketKind {
     Regular,
@@ -1347,6 +1477,145 @@ struct Resend {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn wire_credit_defers_media_repairs_and_padding_before_twcc() {
+        let now = Instant::now();
+        let codecs = CodecConfig::new_with_defaults();
+        let exts = ExtensionMap::standard();
+        let mut stream = StreamTx::new(
+            42.into(),
+            Some(44.into()),
+            MidRid("vid".into(), None),
+            false,
+            1200,
+        );
+        stream.write_rtp(
+            RtpWrite::new(
+                96.into(),
+                7.into(),
+                9000,
+                now,
+                Arc::<[u8]>::from(vec![0x10; 1100]),
+            )
+            .nackable(true),
+        );
+        stream.send_queue.handle_timeout(now);
+        stream.send_queue.peek().unwrap().header.csrc_count = 15;
+        let mut twcc = 42;
+        let mut buf = vec![];
+        for _ in 0..3 {
+            assert!(
+                stream
+                    .poll_packet_with_budget(
+                        now,
+                        &exts,
+                        Some(&mut twcc),
+                        codecs.params(),
+                        &mut buf,
+                        0,
+                        0
+                    )
+                    .is_none()
+            );
+            assert_eq!(twcc, 42);
+            assert_eq!(stream.stats.packets, 0);
+            assert!(stream.send_queue.peek().is_some());
+        }
+        assert!(
+            stream
+                .poll_packet_with_budget(
+                    now,
+                    &exts,
+                    Some(&mut twcc),
+                    codecs.params(),
+                    &mut buf,
+                    1244,
+                    0
+                )
+                .is_none()
+        );
+        assert_eq!(twcc, 42, "CSRC/header bytes must be included before TWCC");
+        let media = stream
+            .poll_packet_with_budget(
+                now,
+                &exts,
+                Some(&mut twcc),
+                codecs.params(),
+                &mut buf,
+                1400,
+                0,
+            )
+            .unwrap();
+        assert!(!media.is_extra);
+        assert_eq!(media.header.ext_vals.transport_cc, Some(42));
+        stream.resends.push_back(Resend {
+            seq_no: 7.into(),
+            queued_at: now,
+            payload_size: 1100,
+        });
+        let sequence = stream.seq_no_rtx;
+        assert!(
+            stream
+                .poll_packet_with_budget(
+                    now,
+                    &exts,
+                    Some(&mut twcc),
+                    codecs.params(),
+                    &mut buf,
+                    1400,
+                    0
+                )
+                .is_none()
+        );
+        assert_eq!(twcc, 43);
+        assert_eq!(stream.seq_no_rtx, sequence);
+        assert_eq!(stream.resends.len(), 1);
+        let repair = stream
+            .poll_packet_with_budget(
+                now,
+                &exts,
+                Some(&mut twcc),
+                codecs.params(),
+                &mut buf,
+                1400,
+                1400,
+            )
+            .unwrap();
+        assert!(repair.is_extra);
+        assert_eq!(repair.header.ext_vals.transport_cc, Some(43));
+        stream.generate_padding(240);
+        let sequence = stream.seq_no_rtx;
+        assert!(
+            stream
+                .poll_packet_with_budget(
+                    now,
+                    &exts,
+                    Some(&mut twcc),
+                    codecs.params(),
+                    &mut buf,
+                    1400,
+                    0
+                )
+                .is_none()
+        );
+        assert_eq!(twcc, 44);
+        assert_eq!(stream.seq_no_rtx, sequence);
+        assert_eq!(stream.padding, 240);
+        let padding = stream
+            .poll_packet_with_budget(
+                now,
+                &exts,
+                Some(&mut twcc),
+                codecs.params(),
+                &mut buf,
+                1400,
+                1400,
+            )
+            .unwrap();
+        assert!(padding.is_extra && padding.is_padding);
+        assert_eq!(padding.header.ext_vals.transport_cc, Some(44));
+    }
 
     #[test]
     fn regular_padding_does_not_search_probe_negotiation() {

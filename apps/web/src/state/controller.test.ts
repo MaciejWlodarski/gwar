@@ -1473,7 +1473,7 @@ describe("staying on the server without voice", () => {
     }
     const { useScreen } = await import("./screen");
     const source = { readyState: "live", stop: vi.fn(), applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }) };
-    const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
+    const stream = { getTracks: () => [source], getAudioTracks: () => [], getVideoTracks: () => [source] } as unknown as MediaStream;
     useScreen.setState({ own: { phase: "live", attempt: 7, share: "old", stream, surface: "screen", spec: { mode: "smooth", height: 1080, fps: 30 }, viewers: 0, guests: 0, guestLink: false, preview: false } });
     let started!: (value: { share: string }) => void;
     const request = link.request.bind(link);
@@ -1517,7 +1517,7 @@ describe("staying on the server without voice", () => {
     // The user shares after the server moves them to plaintext; voice is still refused.
     const { useScreen } = await import("./screen");
     const source = { readyState: "live", stop: vi.fn(), applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }) };
-    const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
+    const stream = { getTracks: () => [source], getAudioTracks: () => [], getVideoTracks: () => [source] } as unknown as MediaStream;
     useScreen.setState({ own: { phase: "live", attempt: 7, share: "old", stream, surface: "screen", spec: { mode: "smooth", height: 1080, fps: 30 }, viewers: 0, guests: 0, guestLink: false, preview: false } });
     // Hold any unexpected republish before it can construct a real media transport.
     const request = link.request.bind(link);
@@ -1556,7 +1556,7 @@ describe("staying on the server without voice", () => {
     connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
     const { useScreen } = await import("./screen");
     const source = { readyState: "live", stop: vi.fn() };
-    useScreen.setState({ own: { phase: "live", attempt: 7, share: "retained", stream: { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream,
+    useScreen.setState({ own: { phase: "live", attempt: 7, share: "retained", stream: { getTracks: () => [source], getAudioTracks: () => [], getVideoTracks: () => [source] } as unknown as MediaStream,
       surface: "screen", spec: { mode: "smooth", height: 1080, fps: 30 }, viewers: 0, guests: 0, guestLink: false, preview: false } });
     link.status_({ state: "reconnecting", attempt: 1, retryAt: 0 });
     if (welcomed) {
@@ -1594,7 +1594,7 @@ describe("staying on the server without voice", () => {
     connectFake({ channel: 2 }); await vi.advanceTimersByTimeAsync(10);
     const { useScreen } = await import("./screen");
     const source = { readyState: "live", stop: vi.fn(), applyConstraints: vi.fn(async () => {}), getSettings: () => ({ width: 1920, height: 1080 }) };
-    useScreen.setState({ own: { phase: "live", attempt: 7, share: "old", stream: { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream,
+    useScreen.setState({ own: { phase: "live", attempt: 7, share: "old", stream: { getTracks: () => [source], getAudioTracks: () => [], getVideoTracks: () => [source] } as unknown as MediaStream,
       surface: "screen", spec: { mode: "smooth", height: 1080, fps: 30 }, viewers: 0, guests: 0, guestLink: false, preview: false } });
     let started!: (value: { share: string }) => void;
     const request = link.request.bind(link);

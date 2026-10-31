@@ -19,6 +19,8 @@ export type OwnPhase = "picking" | "choosing" | "starting" | "live" | "reconnect
 
 export interface OwnShare {
   phase: OwnPhase;
+  audio?: boolean;
+  audioServer?: boolean;
   /** One per attempt: late results of an earlier attempt change nothing. */
   attempt: number;
   share: string | null;
@@ -47,6 +49,8 @@ export interface Watch {
   id: number;
   slot: number | null;
   status: "requesting" | "watching";
+  /** Confirmed by the server for this grant, never inferred from a negotiated receiver. */
+  audio?: boolean;
   paused?: ScreenPauseReason;
   waiting?: true;
 }
@@ -76,6 +80,7 @@ export type ScreenAction =
   | { type: "pick"; attempt: number }
   | { type: "picked"; attempt: number; stream: MediaStream; surface: ScreenSurface }
   | { type: "choose"; spec: ScreenSpec }
+  | { type: "audio"; attempt: number; sharing: boolean; server?: boolean }
   | { type: "surface"; attempt: number; surface: ScreenSurface; spec: ScreenSpec }
   | { type: "queueShare"; attempt: number }
   | { type: "starting"; attempt: number }
@@ -95,6 +100,7 @@ export type ScreenAction =
   | { type: "stream"; run: number; slot: number; stream: MediaStream }
   | { type: "watch"; share: string; id: number }
   | { type: "granted"; run: number; id: number; slot: number }
+  | { type: "watchAudio"; run: number; id: number; audio: boolean }
   | { type: "slot"; run: number; slot: number; share: string | null }
   | { type: "unwatch"; share: string }
   | { type: "paused"; share: string; reason: ScreenPauseReason }
@@ -200,6 +206,8 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       }
       return { ...state, transport: { run, phase } };
     }
+    case "audio":
+      return state.own?.attempt === action.attempt ? { ...state, own: { ...state.own, audio: action.sharing, ...(action.server === undefined ? {} : { audioServer: action.server }) } } : state;
     case "stream": {
       if (action.run !== state.transport.run || action.slot < 0 || action.slot >= SCREEN_SLOTS) return state;
       const streams = state.streams.slice();
@@ -210,6 +218,8 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       if (state.watches.some(w => w.share === action.share)) return { ...state, stage: action.share };
       return { ...state, watches: [...state.watches, { share: action.share, id: action.id, slot: null, status: "requesting" }], stage: action.share };
     }
+    case "watchAudio":
+      return action.run === state.transport.run ? { ...state, watches: state.watches.map(w => w.id === action.id && w.status === "watching" ? { ...w, audio: action.audio } : w) } : state;
     case "granted": {
       // Only the answer to this watch's own request: an earlier watch's assignment never counts.
       const { run, id, slot } = action;
@@ -240,7 +250,11 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       const paused = action.type === "paused" ? action.reason : undefined;
       const watch = state.watches.find(w => w.share === action.share && w.status === "watching");
       if (!watch || (watch.paused === paused && !watch.waiting)) return state;
-      return { ...state, watches: state.watches.map(w => (w === watch ? { share: w.share, id: w.id, slot: w.slot, status: w.status, ...(paused ? { paused } : {}) } : w)) };
+      return { ...state, watches: state.watches.map(w => {
+        if (w !== watch) return w;
+        const { paused: _, waiting: __, ...grant } = w;
+        return { ...grant, ...(paused ? { paused } : {}) };
+      }) };
     }
     case "waiting": {
       const watch = state.watches.find(w => w.share === action.share && w.status === "watching");

@@ -1110,7 +1110,7 @@ function ChatHeader() {
 
   const joinButton = active === "channel" && channel && !spacer && myChannel !== channel.id && canJoin && phase === "online" ? <Button size="sm" busy={joining} onClick={() => void controller.joinChannelInteractive(channel.id)}><Headphones className="size-4" /><span>{t("tree.joinVoice")}</span></Button> : null;
   return (
-    <header className="shrink-0 border-b border-line">
+    <header data-testid="chat-header" className="@container shrink-0 border-b border-line">
       <div className="flex h-12 items-center gap-2 px-3 md:px-4">
         {isMobile && <BackButton label={t("nav.toChannels")} entry onClick={() => paneBack("list")} />}
         {icon}
@@ -1121,7 +1121,7 @@ function ChatHeader() {
           </p>
         </div>
         {active === "channel" && onGwar && !encrypted && (
-          <span className="hidden shrink-0 text-xs text-subtle md:inline">{t("chat.notEncrypted")}</span>
+          <span className="hidden shrink-0 text-xs text-subtle @3xl:inline">{t("chat.notEncrypted")}</span>
         )}
         {sealed && (
           <Tooltip label={t("chat.messagesEncrypted")}>
@@ -1138,7 +1138,7 @@ function ChatHeader() {
           </button>
         )}
         {active === "channel" && userCount > 0 && (
-          <span className="hidden shrink-0 text-xs text-subtle sm:inline">{t(countKey(lang, "chat.users", userCount), { count: userCount })}</span>
+          <span className="hidden shrink-0 text-xs text-subtle @xl:inline">{t(countKey(lang, "chat.users", userCount), { count: userCount })}</span>
         )}
         {!isMobile && joinButton}
         {isMobile && phase !== "idle" && inVoice && (

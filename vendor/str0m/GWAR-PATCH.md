@@ -1,5 +1,39 @@
 # str0m 0.24.1: screen probe protection
 
+`Bwe::set_rtp_send_gate` optionally installs the application's shared wire and
+repair/padding credit before RTP dequeue, sequence allocation, packet statistics
+and TWCC accounting. `RtpSendBudget` supplies media/extras byte allowances and a
+retry deadline. The stream measures its negotiated RTP header (including CSRCs,
+MID/RID and extensions) and reserves SRTP/IPv6 overhead before choosing a packet.
+An exhausted budget leaves original, NACK and padding data queued without
+advancing their sequence numbers or TWCC; eligible media can proceed while a
+repair waits. The gate receives the active bounded probe plan and charges actual
+serialized bytes before send accounting. Retry deadlines apply per stream:
+an unaffordable repair or padding queue is temporarily ineligible, while other
+streams can spend available media credit. New originals wake their stream so
+they can pass the existing pre-dequeue checks independently of extras credit.
+The earliest deferred stream supplies a retry wake; deferral never allocates
+sequence numbers or TWCC. Queue statistics still include deferred packets.
+The gate survives BWE reset; resetting buffers/padding or passing `None` clears
+pending deferrals. Fallback probe eligibility also respects its stream's wait.
+Queue states keep probe capability and queued packets throughout a temporary
+credit wait; `send_after` controls packet readiness separately. Pending padding
+therefore keeps its active cluster and schedules the credit deadline instead of
+an expired Probe2 wake. Regressions cover both partial and unstarted probes,
+including future-only retry and resumed packet/TWCC progress when credit returns.
+The depleted-extras regression checks audio and unrelated video delivery within
+20 ms, a new original on the blocked stream, and eventual repair at 60 ms.
+
+Gwar enables shared wire gating when an audio reservation exists; video-only
+transports have no gate installed and keep their existing cap policy. Ending
+the final audio reservation removes the gate. The active probe uses the same wire
+credit as audio/video, at its dispatched rate and within the existing extras
+reserve. Plan changes preserve credit/debt and never create a second burst.
+This fixes a silent tab starving video discovery when the SFU dropped probes
+after str0m had already recorded them as sent. The live-TWCC 20 Mb/s startup
+regression covers 10/20 ms service; the original 1 Mb/s adversarial voice and
+2.5 Mb/s combined-throughput regressions remain strict.
+
 `StreamTx::poll_packet_padding` uses blank padding instead of a cached packet
 smaller than `MAX_BLANK_PADDING_PAYLOAD_SIZE` (240 bytes). NACK repair is
 unchanged. Reusing tiny Text deltas amplified payload-sized probe clusters
@@ -104,7 +138,12 @@ serialized SRTP plus a conservative 48-byte IPv6/UDP allowance, and TWCC and ALR
 use that same byte unit. Rates and byte targets therefore describe occupied
 capacity even for small padding. Queue pressure cannot increase this ceiling.
 Ordinary bursts use 2 ms (one-MTU floor, one-packet rounding); regular wake
-cadences up to 20 ms are allowed, but longer stalls do not create burst credit.
+cadences up to 30 ms are allowed, matching the SFU's coarse application release
+window. Longer stalls do not create burst credit. Without this egress ceiling,
+the byte-limited probe cadence remains bounded at 20 ms. A production paired
+audio/video regression in `gwar-server` exercises 5/10/20/30 ms service with no
+in-budget eviction or socket drop; the separate aggregate socket guard still
+prevents audio from buying an independent burst.
 Backlog counts decrease after sends. The next wake admits the next packet rather
 than clearing the whole burst debt; cadence learning uses deadline lateness so
 the pacer cannot teach itself larger bursts. A rounded-deadline regression covers
@@ -208,3 +247,10 @@ sending application keeps every stream within what the receiver declared.
 Upstream required equality of all three, so an offer whose level or tier
 differed from the local configuration in either direction lost AV1. `av1_levels_and_tiers_are_declared_per_receiver`
 covers this.
+
+`SdpApi::accept_offer_with_sync_groups` optionally gives each outgoing audio/video
+pair one stream ID and RTCP CNAME before generating its answer or initializing
+sender reports. Track IDs remain distinct; ordinary `accept_offer` uses no groups
+and preserves its behavior. Gwar uses this for paired screen receivers so
+libwebrtc negotiates synchronization rather than merely combining tracks in JS.
+The server regression checks both the actual answer and stored media identities.

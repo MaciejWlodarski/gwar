@@ -103,7 +103,7 @@ describe("the desktop app", () => {
   it.each([false, true])("notifies on lost retained capture unless explicitly stopped (Stop=%s)", async explicit => {
     useDesktopCapture.setState({ capture: "ok" });
     const source = Object.assign(new EventTarget(), { readyState: "live", stop: vi.fn(), getSettings: () => ({}) });
-    const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
+    const stream = { getTracks: () => [source], getAudioTracks: () => [], getVideoTracks: () => [source] } as unknown as MediaStream;
     getDisplayMedia.mockImplementationOnce(async () => stream);
     const screen = new ScreenController(() => null, String);
     screen.beginShare(); await flush();
@@ -121,7 +121,7 @@ describe("the desktop app", () => {
   it("also notifies the desktop sharer when republishing times out", async () => {
     vi.useFakeTimers();
     const track = { readyState: "live", stop: vi.fn() };
-    useScreen.setState({ own: { phase: "live", attempt: 1, share: "M", stream: { getVideoTracks: () => [track], getTracks: () => [track] } as unknown as MediaStream,
+    useScreen.setState({ own: { phase: "live", attempt: 1, share: "M", stream: { getAudioTracks: () => [], getVideoTracks: () => [track], getTracks: () => [track] } as unknown as MediaStream,
       surface: "window", spec: legacySpec("text"), viewers: 0, guests: 0, guestLink: false, preview: false } });
     const screen = new ScreenController(() => null, String);
     screen.suspend();

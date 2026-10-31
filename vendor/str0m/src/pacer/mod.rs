@@ -59,6 +59,13 @@ impl PacerImpl {
             PacerImpl::LeakyBucket(v) => v.check_probe_complete(now),
         }
     }
+
+    pub fn active_probe_rate(&self) -> Option<Bitrate> {
+        match self {
+            PacerImpl::Null(_) => None,
+            PacerImpl::LeakyBucket(v) => v.active_probe_rate(),
+        }
+    }
 }
 
 impl Pacer for PacerImpl {

@@ -66,6 +66,13 @@ impl<'a> SdpApi<'a> {
     /// let json_answer = serde_json::to_vec(&answer).unwrap();
     /// ```
     pub fn accept_offer(self, offer: SdpOffer) -> Result<SdpAnswer, RtcError> {
+        self.accept_offer_with_sync_groups(offer, &[])
+    }
+
+    /// Accept an offer, grouping outgoing media by a common SDP stream ID and RTCP CNAME.
+    /// Configure before the answer and first timeout so SDP and sender reports agree.
+    /// Track IDs remain distinct. Empty groups retain the ordinary negotiation behavior.
+    pub fn accept_offer_with_sync_groups(self, offer: SdpOffer, groups: &[Vec<Mid>]) -> Result<SdpAnswer, RtcError> {
         debug!("Accept offer");
 
         // Invalidate any outstanding PendingOffer.
@@ -110,6 +117,21 @@ impl<'a> SdpApi<'a> {
 
         // Modify session with offer.
         apply_offer(&mut self.rtc.session, offer)?;
+
+        for group in groups {
+            let Some(first) = group.first().and_then(|mid| self.rtc.session.medias.iter().find(|m| m.mid() == *mid))
+            else {
+                continue;
+            };
+            let cname = first.cname().to_owned();
+            let stream_id = first.stream_id().to_owned();
+            for media in self.rtc.session.medias.iter_mut().filter(|m| group.contains(&m.mid())) {
+                let mut msid = media.msid().clone();
+                msid.stream_id = stream_id.clone();
+                media.set_msid(msid);
+                media.set_cname(cname.clone());
+            }
+        }
 
         // Handle potentially new m=application line.
         let client = self.rtc.dtls.is_active().expect("DTLS active to be set");

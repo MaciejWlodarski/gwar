@@ -99,6 +99,18 @@ fn not_found() -> ErrorBody {
 }
 
 impl Core {
+    pub(super) fn screen_audio_state(&self, session: SessionId, id: &str, stopped: bool) -> Reply {
+        let share = self.visible_share(session, id)?;
+        self.may_watch(session, share)?;
+        if stopped {
+            if share.sharer != session {
+                return Err(err(ErrorCode::Forbidden, "only the publisher may stop share sound"));
+            }
+            share.origin.has_audio.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(Response::ScreenAudioState { audio: share.origin.has_audio.load(std::sync::atomic::Ordering::Relaxed) })
+    }
+
     fn share_view(&self, id: &str) -> ScreenShare {
         let s = &self.shares[id];
         ScreenShare {

@@ -1,3 +1,4 @@
+import { defaultShareAudio, readShareAudio, type ShareAudioSettings } from "../voice/share-audio";
 import { defaultSounds, readSounds, type SoundCue, type SoundSettings } from "../sound/catalog";
 import { readOnboarding, type Onboarding } from "../lib/onboarding";
 import { defaultQuality, migrateQuality, type QualitySettings } from "../voice/screen-quality";
@@ -327,6 +328,9 @@ export interface SettingsState extends QualitySettings {
   notificationOverrides: NotificationOverrides;
   setNotificationMode(server: string, channel: number | null, mode: NotificationMode | null): void;
   sounds: SoundSettings;
+  /** Per-share screen sound. Reconnect copies it to the confirmed replacement. */
+  shareAudio: Record<string, ShareAudioSettings>;
+  setShareAudio(share: string, patch: Partial<ShareAudioSettings>): void;
   /** Per-user playback volume 0..2 keyed by uid. */
   userVolumes: Record<string, number>;
   /** Local mute by stable uid; the separate volume survives muting. */
@@ -434,6 +438,8 @@ export const useSettings = create<SettingsState>()(
   persist(
     (set) => ({
       ...defaultQuality,
+      shareAudio: {},
+      setShareAudio: (share, patch) => set(s => ({ shareAudio: { ...s.shareAudio, ...readShareAudio({ [share]: { ...(s.shareAudio[share] ?? defaultShareAudio), ...patch } }) } })),
       setScreenQuality: (patch) => set(patch),
       onboarding: null,
       setOnboarding: (patch) => set((s) => ({ onboarding: { completed: false, firstUsedAt: Date.now(), nudgeDismissed: false, roleReceived: false, ...s.onboarding, ...patch } })),
@@ -611,7 +617,9 @@ export const useSettings = create<SettingsState>()(
         // v8 adds the release delay; key codes and every other setting stay intact.
         if (version < 8) p = { ...p, audio: validAudio(p.audio) };
         // v9 adds local mute without changing retained person volumes or other preferences.
-        return version < 9 ? { userMuted: {}, ...p } : p;
+        if (version < 9) p = { userMuted: {}, ...p };
+        // v10 follows desktop v7, PTT v8 and local person mute v9.
+        return version < 10 ? { ...p, shareAudio: readShareAudio(p.shareAudio) } : p;
       },
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
@@ -619,6 +627,7 @@ export const useSettings = create<SettingsState>()(
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
           notificationOverrides: readNotificationOverrides(p.notificationOverrides),
           sounds: readSounds(p.sounds),
+          shareAudio: readShareAudio(p.shareAudio),
           userMuted: p.userMuted && typeof p.userMuted === "object" && !Array.isArray(p.userMuted) ? Object.fromEntries(Object.entries(p.userMuted).filter(([, v]) => v === true)) : {},
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,

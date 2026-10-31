@@ -53,7 +53,7 @@ function qualityLabel(q: ConnectionQuality): Key {
  * The always-on indicator. The panel shows it whenever there is a measurement (bars and ms, as the
  * round trip always was); the pill and the sharing bar only once it is not good.
  */
-export function ConnectionIndicator({ variant }: { variant: "panel" | "pill" | "bar" }) {
+export function ConnectionIndicator({ variant, compact = false }: { variant: "panel" | "pill" | "bar"; compact?: boolean }) {
   const t = useT();
   const q = useConnectionQuality();
   const voiceConnected = useVoiceConnectionActive();
@@ -81,7 +81,7 @@ export function ConnectionIndicator({ variant }: { variant: "panel" | "pill" | "
       >
         <Bars quality={q.quality} className={variant === "pill" ? "size-[18px]" : "size-3.5"} />
         {variant === "panel" && `${millis(q.rttMs)} ms`}
-        {variant === "bar" && <span>{label}</span>}
+        {variant === "bar" && !compact && <span>{label}</span>}
       </button>
     </Tooltip>
   );
