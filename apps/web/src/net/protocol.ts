@@ -37,6 +37,7 @@ export type RequestData<O extends Op> = Extract<Request, { op: O }>["d"];
 export interface ResponseMap {
   "screen.spec.capabilities": { screen_spec: boolean };
   "screen.audio.capabilities": { screen_audio: boolean };
+  "screen.audio.state": { audio: boolean };
   "screen.capabilities": { screen_h264: boolean };
   "screen.av1.capabilities": { screen_av1: boolean };
   "mls.device.publish": Empty;

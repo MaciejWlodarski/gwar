@@ -391,6 +391,7 @@ mod tests {
             keyframe: false,
             codec: VideoCodec::H264(declared),
             arrival: Instant::now(),
+            wallclock: Instant::now(),
             payload: Arc::from(payload),
         }
     }

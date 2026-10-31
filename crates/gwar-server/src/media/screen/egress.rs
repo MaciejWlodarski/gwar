@@ -96,6 +96,8 @@ pub struct Queued {
     pub pt: Pt,
     /// When the SFU received it from the publisher: str0m's wallclock, and the deadline's base.
     pub arrival: Instant,
+    /// Source-clock wallclock, independent of arrival/deadline and release time.
+    pub wallclock: Instant,
     pub payload: Arc<[u8]>,
     /// The source timestamp of its frame.
     pub frame: u32,
@@ -119,11 +121,16 @@ impl Queued {
         frame: u32,
         keyframe: bool,
     ) -> Self {
-        Self { out, timestamp, marker, pt, arrival, payload, frame, keyframe, dd: None, key: false }
+        Self { out, timestamp, marker, pt, arrival, wallclock: arrival, payload, frame, keyframe, dd: None, key: false }
     }
 
     pub fn with_dd(mut self, dd: Option<Raw>) -> Self {
         self.dd = dd;
+        self
+    }
+
+    pub fn with_wallclock(mut self, wallclock: Instant) -> Self {
+        self.wallclock = wallclock;
         self
     }
 
@@ -355,6 +362,10 @@ pub struct Egress {
     originals: Bucket,
     extras: Bucket,
     audio: Bucket,
+    audio_release: Bucket,
+    /// Shared audio/video release and final wire guards. Credit never grows with a stall.
+    media: Bucket,
+    wire: Bucket,
     audio_reserve: f64,
     probe_need: f64,
     queued: usize,
@@ -388,6 +399,9 @@ impl Egress {
             ),
             extras: Bucket::new(extras_rate(estimate), extras_burst(estimate), now),
             audio: Bucket::new(0.0, 2400.0, now),
+            audio_release: Bucket::new(0.0, 2400.0, now),
+            media: Bucket::new((PLAN + EXTRAS) * estimate / 8.0, media_burst(estimate), now),
+            wire: Bucket::new((PLAN + EXTRAS) * estimate / 8.0, media_burst(estimate), now),
             audio_reserve: 0.0,
             probe_need: 0.0,
             queued: 0,
@@ -407,6 +421,10 @@ impl Egress {
 
     pub fn estimate(&self) -> u64 {
         self.estimate as u64
+    }
+
+    pub fn now(&self) -> Instant {
+        self.refilled
     }
 
     /// `B`, bits per second.
@@ -478,6 +496,9 @@ impl Egress {
         self.originals.reconfigure(self.release_rate(), self.socket_burst(), now);
         self.extras.reconfigure(extras_rate(self.estimate), extras_burst(self.estimate), now);
         self.audio.reconfigure(self.audio_rate() / 8.0, 2400.0, now);
+        self.audio_release.reconfigure(self.audio_rate() / 8.0, 2400.0, now);
+        self.media.reconfigure((PLAN + EXTRAS) * self.estimate / 8.0, media_burst(self.estimate), now);
+        self.wire.reconfigure((PLAN + EXTRAS) * self.estimate / 8.0, media_burst(self.estimate), now);
     }
 
     pub fn paused(&self, lane: usize) -> Option<ScreenPauseReason> {
@@ -787,6 +808,9 @@ impl Egress {
             if size as f64 > self.tokens {
                 break;
             }
+            if self.audio_reserve > 0.0 && !self.media.take((size + 28) as f64, now) {
+                break;
+            }
             let packet = self.lanes[lane].queue.pop_front().unwrap();
             self.lanes[lane].bytes -= size;
             self.queued -= size;
@@ -831,11 +855,53 @@ impl Egress {
                 ((size as f64 - self.tokens).max(0.0) / self.release_rate().max(1.0)).max(0.000001),
             );
         let expiry = self.lanes.iter().filter_map(|l| l.queue.front()).map(|p| p.arrival + DEADLINE).min();
+        let release =
+            if self.audio_reserve > 0.0 { release.max(self.media_wake(size, self.refilled)) } else { release };
         Some(expiry.map_or(release, |expiry| expiry.min(release)))
+    }
+
+    pub fn media_wake(&self, size: usize, now: Instant) -> Instant {
+        let mut bucket = self.media.clone();
+        now + Duration::from_secs_f64(
+            ((size as f64 + 28.0 - bucket.available(now)).max(0.0) / ((PLAN + EXTRAS) * self.estimate / 8.0))
+                .max(0.000001),
+        )
+    }
+
+    pub fn audio_due(&mut self, size: usize, now: Instant) -> bool {
+        if self.audio_release.available(now) < size as f64 || self.media.available(now) < (size + 28) as f64 {
+            return false;
+        }
+        self.audio_release.take(size as f64, now) && self.media.take((size + 28) as f64, now)
+    }
+
+    pub fn audio_wake(&self, size: usize, now: Instant) -> Instant {
+        let mut bucket = self.audio_release.clone();
+        let audio = now
+            + Duration::from_secs_f64(
+                ((size as f64 - bucket.available(now)).max(0.0) / (self.audio_rate() / 8.0).max(1.0)).max(0.000001),
+            );
+        audio.max(self.media_wake(size, now))
     }
 
     /// Charges one outgoing datagram of the watch transport; false drops it at the socket.
     pub fn charge(&mut self, class: Class, size: usize, now: Instant) -> bool {
+        if self.audio_reserve > 0.0 && class != Class::Control {
+            let wire = (size + 28) as f64;
+            // Application release has already reserved original/audio bytes in `media`.
+            // Extras may use only unreserved credit; otherwise a probe polled between
+            // release and transmit could steal it and drop a video keyframe at the socket.
+            if self.wire.available(now) < wire
+                || (class == Class::Extra
+                    && (self.media.available(now) < wire || (self.cap && self.extras.available(now) < size as f64)))
+            {
+                return false;
+            }
+            if class == Class::Extra {
+                self.media.take(wire, now);
+            }
+            self.wire.take(wire, now);
+        }
         match class {
             Class::Audio => {
                 if !self.audio.take(size as f64, now) {
@@ -1024,6 +1090,12 @@ impl Egress {
     pub fn orders(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
         self.lanes.iter().enumerate().filter(|(_, l)| l.active()).map(|(i, l)| (i, l.order))
     }
+}
+
+fn media_burst(estimate: f64) -> f64 {
+    // At low bandwidth, one maximum datagram including UDP/IP, never two audio bursts.
+    // At higher bandwidth retain at most 10 ms of the existing screen allocation.
+    (0.010 * (PLAN + EXTRAS) * estimate / 8.0).max((1200 + ORIGINAL_OVERHEAD + 28) as f64)
 }
 
 fn extras_rate(estimate: f64) -> f64 {

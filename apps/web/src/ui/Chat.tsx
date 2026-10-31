@@ -1101,7 +1101,7 @@ function ChatHeader() {
   }
 
   return (
-    <header className="flex h-12 shrink-0 items-center gap-2 border-b border-line px-3 md:px-4">
+    <header data-testid="chat-header" className="@container flex h-12 shrink-0 items-center gap-2 border-b border-line px-3 md:px-4">
       {isMobile && <BackButton label={t("nav.toChannels")} entry onClick={() => paneBack("list")} />}
       {icon}
       <div className="min-w-0 flex-1">
@@ -1111,7 +1111,7 @@ function ChatHeader() {
         </p>
       </div>
       {active === "channel" && onGwar && !encrypted && (
-        <span className="hidden shrink-0 text-xs text-subtle md:inline">{t("chat.notEncrypted")}</span>
+        <span className="hidden shrink-0 text-xs text-subtle @3xl:inline">{t("chat.notEncrypted")}</span>
       )}
       {sealed && (
         <Tooltip label={t("chat.messagesEncrypted")}>
@@ -1128,7 +1128,7 @@ function ChatHeader() {
         </button>
       )}
       {active === "channel" && userCount > 0 && (
-        <span className="hidden shrink-0 text-xs text-subtle sm:inline">{t(countKey(lang, "chat.users", userCount), { count: userCount })}</span>
+        <span className="hidden shrink-0 text-xs text-subtle @xl:inline">{t(countKey(lang, "chat.users", userCount), { count: userCount })}</span>
       )}
       {isMobile && phase !== "idle" && inVoice && (
         <div className="flex items-center gap-1">

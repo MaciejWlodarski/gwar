@@ -211,14 +211,17 @@ export function SharingBar() {
   const watching = own.phase === "live" ? t(countKey(lang, "screen.watching", own.viewers), { count: own.viewers }) : t(own.phase === "reconnecting" ? "screen.reconnecting" : "screen.starting");
   const linked = !!own.share && !!links[own.share];
   return (
-    <div role="status" aria-label={t("screen.sharingBar")} className="flex shrink-0 items-center gap-2 bg-[#a92c3e] px-3 py-1.5 text-sm text-white">
+    <div role="status" aria-label={t("screen.sharingBar")} className="flex shrink-0 items-center gap-1 bg-[#a92c3e] px-2 py-1.5 text-sm text-white sm:gap-2 sm:px-3">
       <MonitorUp aria-hidden className="size-4 shrink-0" />
-      <span className="min-w-0 flex-1 text-xs" data-testid="share-audio-status">{t(own.phase === "reconnecting" ? "screen.reconnecting" : own.phase === "starting" ? "screen.starting" : own.audio ? "screen.audioOn" : "screen.audioOff")}</span>
+      <span className="min-w-0 flex-1 truncate text-xs" data-testid="screen-viewers">{watching}</span>
+      {own.phase === "live" && <span data-testid="share-audio-status" className="flex shrink-0 items-center gap-1 text-xs" aria-label={t(own.audio ? own.viewers === 0 ? "screen.sharingAudio" : "screen.audioOn" : "screen.audioOff")}>
+        {own.audio ? <Volume2 aria-hidden className="size-3.5" /> : <VolumeX aria-hidden className="size-3.5" />}<span className="hidden sm:inline">{t(own.audio ? own.viewers === 0 ? "screen.sharingAudio" : "screen.audioOn" : "screen.audioOff")}</span>
+      </span>}
       <ConnectionIndicator variant="bar" compact />
-      <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-2 text-white hover:bg-white/15" onClick={() => setDetails(true)}>{t("common.details")}</Button>
-      <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-2 text-white hover:bg-white/15" aria-label={t("screen.stop")} onClick={() => void controller.screen.stopShare()}>{t("screen.stopShort")}</Button>
+      <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 sm:px-2" onClick={() => setDetails(true)}>{t("common.details")}</Button>
+      <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 sm:px-2" aria-label={t("screen.stop")} onClick={() => void controller.screen.stopShare()}>{t("screen.stopShort")}</Button>
       <Dialog open={details} onOpenChange={setDetails} title={t("screen.sharingBar")}>
-        <p data-testid="screen-viewers" className="mb-3 text-sm text-muted">{watching}</p>
+        <p className="mb-3 text-sm text-muted">{watching}</p>
         <p className="mb-3 text-sm">{t(own.audio ? own.phase === "live" ? "screen.audioSharing" : "screen.audioReady" : isDesktop() ? "screen.audioDesktop" : own.audioServer === false ? "screen.audioServer" : "screen.audioUnavailable")}</p>
         <QualityControls spec={own.spec} />
         {own.phase === "live" && <SenderStats />}
@@ -554,7 +557,8 @@ export function ShareAudioPlayback() {
   const watches = useScreen(s => s.watches);
   const shares = useSession(s => s.shares);
   const me = useSession(s => s.me?.session);
-  return <>{watches.filter(w => w.status === "watching" && shares[w.share]?.client !== me).map(w => <ShareAudioPlayer key={w.id} share={w.share} slot={w.slot!} paused={w.paused === "budget"} />)}</>;
+  if (isDesktop()) return null;
+  return <>{watches.filter(w => w.status === "watching" && w.audio === true && shares[w.share]?.client !== me).map(w => <ShareAudioPlayer key={w.id} share={w.share} slot={w.slot!} paused={w.paused === "budget"} />)}</>;
 }
 
 function ShareAudioPlayer({ share, slot, paused }: { share: string; slot: number; paused: boolean }) {
@@ -590,9 +594,10 @@ export function ShareAudioControls({ share }: { share: string }) {
   const t = useT();
   const client = useSession(s => { const id = s.shares[share]?.client; return id === undefined ? undefined : s.clients[id]; });
   const prefs = useSettings(s => s.shareAudio[share] ?? defaultShareAudio);
+  const available = useScreen(s => s.watches.some(w => w.share === share && w.status === "watching" && w.audio === true));
   const stream = useScreen(s => { const slot = slotOf(s, share); return slot === null ? null : s.streams[slot]; });
-  if (!client || !stream?.getAudioTracks().length) return null;
-  return <div className="flex shrink-0 items-center gap-3 px-3 py-2 text-sm" data-testid="share-audio-controls">
+  if (isDesktop() || !available || !client || !stream?.getAudioTracks().length) return null;
+  return <div className="flex w-full max-w-[344px] shrink-0 items-center gap-3 px-3 py-2 text-sm" data-testid="share-audio-controls">
     <IconButton label={t(prefs.muted ? "screen.unmuteAudio" : "screen.muteAudio")} aria-pressed={prefs.muted} onClick={() => useSettings.getState().setShareAudio(share, { muted: !prefs.muted })}>
       {prefs.muted ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
     </IconButton>

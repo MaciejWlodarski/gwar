@@ -31,8 +31,8 @@ vi.mock("../voice/screen", async importOriginal => {
     close = vi.fn();
     clearSlot = vi.fn();
     keyframe = vi.fn();
-    constructor(readonly params: { run: number; state(s: string): void; offer(sdp: string, run: number): Promise<string> }) { this.run = params.run; media.transports.push(this); }
-    async start() { await this.params.offer("watch-offer", this.run); }
+    constructor(readonly params: { run: number; audio?(): Promise<boolean>; state(s: string): void; offer(sdp: string, run: number): Promise<string> }) { this.run = params.run; media.transports.push(this); }
+    async start() { await this.params.audio?.(); await this.params.offer("watch-offer", this.run); }
     async stats() { return null; }
   }
   class ScreenPublisher {
@@ -201,12 +201,14 @@ describe("watching", () => {
 });
 
 describe("reused receive slots", () => {
-  function setup(holdGrant = false) {
+  function setup(holdGrant = false, audio = false) {
     for (const id of ["B", "C", "D"]) useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "screen.started", d: share(id, 2, 2) } });
     let offers = 0;
     const pending = deferred<{ slot: number }>();
     const grant = deferred<{ slot: number }>();
     const { link, ops } = fakeLink({
+      "screen.audio.capabilities": () => ({ screen_audio: audio }),
+      "screen.audio.state": d => ({ audio: d.share !== "C" }),
       "screen.watch.offer": () => { offers++; return { sdp: "answer" }; },
       "screen.watch": d => offers === 1
         ? d.share === "D" ? pending.promise : d.share === "C" && holdGrant ? grant.promise : { slot: d.share === "A" ? 0 : 1 }
@@ -223,6 +225,35 @@ describe("reused receive slots", () => {
     };
     return { screen, start, pending, grant, ops };
   }
+
+  it.each(["unwatch", "release"])("renews audio receivers after %s even with another watch active", async how => {
+    const { screen, start } = setup(false, true);
+    const old = await start();
+    const stream = {} as MediaStream;
+    useScreen.getState().dispatch({ type: "stream", run: old.params.run, slot: 1, stream });
+    if (how === "unwatch") await screen.unwatch("B");
+    else {
+      screen.handleEvent({ ev: "screen.slot", d: { run: old.params.run, slot: 1, share: null } });
+      screen.handleEvent({ ev: "screen.stopped", d: { share: "B", reason: "stopped" } });
+    }
+    const watching = screen.watch("C");
+    await flush();
+    expect(old.close).toHaveBeenCalledOnce();
+    expect(media.transports).toHaveLength(2);
+    expect(useScreen.getState().streams.every(s => s === null)).toBe(true);
+    expect(useScreen.getState().watches.every(w => w.audio !== true)).toBe(true);
+    useScreen.getState().dispatch({ type: "stream", run: old.params.run, slot: 1, stream });
+    expect(useScreen.getState().streams.every(s => s === null)).toBe(true);
+    media.transports[1]!.params.state("connected");
+    await watching; await flush();
+    expect(useScreen.getState().watches).toMatchObject([
+      { share: "A", status: "watching", audio: true }, { share: "C", status: "watching", audio: false },
+    ]);
+    // A negotiated audio track still exists for C, a legacy video-only publisher.
+    useScreen.getState().dispatch({ type: "watchAudio", run: old.params.run, id: 3, audio: true });
+    expect(useScreen.getState().watches.find(w => w.share === "C")?.audio).toBe(false);
+    screen.reset();
+  });
 
   it.each(["unwatch", "release"])("renews a reused slot after %s when it is the only watch", async how => {
     const { screen, start } = setup();

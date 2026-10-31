@@ -1,8 +1,8 @@
 # Browser screen-share sound (P1-6, PR 1)
 
 This is the browser/transport half of P1-6. A supported browser can share
-another tab's sound through the screen SFU. Windows and macOS desktop captures
-remain video-only. Encrypted channels still cannot share screens; this change
+another tab's sound through the screen SFU. Desktop capture and viewing remain video-only. The webview never receives or
+plays share sound: native playback must first enter the native mixer and AEC reference. Encrypted channels still cannot share screens; this change
 adds no plaintext exception to that rule.
 
 ## Capture and echo boundaries
@@ -42,7 +42,12 @@ layouts: four video m-lines, or four interleaved video/Opus pairs. Every watch
 m-line remains receive-only. A publisher may add exactly one send-only Opus
 m-line after its existing video/RTX m-line. Legacy video viewers can watch
 new audio publishers without receiving audio. Legacy publishers work with new
-viewers; their audio slots stay silent. Guest watch pages retain their existing
+viewers; their audio slots stay silent and show no audio controls or autoplay prompt.
+`screen.audio.state { share, stopped?: false }` explicitly reports current audio
+availability. Viewers query it for their current grant and refresh once per second;
+an unknown query or failed refresh means no audio playback. The publisher alone
+may send `stopped: true` when its retained audio track ends. No unsolicited event
+or field is added for older clients. Guest watch pages retain their existing
 video-only behavior.
 
 No new persistent server data is introduced. Settings v7 adds `shareAudio`,
@@ -68,13 +73,22 @@ share audio and never sends it through voice processing or sound cues.
   Its SSRC and negotiated Opus payload type are checked. Video ingress loses
   the same allowance; the existing whole-transport ingress meter still applies.
 - Each granted slot of a share that actually negotiated audio reserves 128 kb/s *inside* the viewer's existing
-  `0.8 × estimate` screen allocation. Video uses what remains. The audio socket
-  bucket is capped by that allocation, with a 2,400-byte burst for the entire
-  viewer. Repairs/probes keep their existing separate cap; voice's headroom
-  is unchanged. Audio drops immediately when over budget; it never queues a
-  backlog of old sound or raises the probe target.
-- Audio uses stable source sequence/timestamp offsets and the source packet's
-  SFU arrival wallclock. New sources restart the mapping without restarting the
+  `0.8 × estimate` screen allocation. Video uses what remains. Audio waits in a queue of at most four packets with a 100 ms deadline,
+  released before video through one aggregate screen pacer. Its burst is at most
+  10 ms of the existing 80% media plus 10% repair/probe allocation, with a
+  one-datagram floor including
+  UDP/IP. Idle periods and scheduler stalls never enlarge this credit. A second
+  aggregate guard checks serialized audio, video, repairs and probes before the
+  socket. Repairs/probes reserve only unused application credit, so they cannot
+  steal credit from a released media packet and drop a video keyframe. The
+  separate audio allowance cannot buy an additional wire burst;
+  repairs/probes retain their own cap too. Voice headroom is unchanged. Expired
+  sound drops and never raises the probe target.
+- Each negotiated audio/video pair shares one SDP stream ID and RTCP CNAME,
+  with separate track IDs. Audio uses stable source sequence/timestamp offsets.
+  Publisher sender reports map both source clocks through one common NTP anchor;
+  source wallclock is kept separately from queue arrival/deadline and release.
+  Before sender reports arrive, the common SFU arrival clock is the fallback. New sources restart the mapping without restarting the
   viewer transport. No Opus RTX/NACK queue is added. Sender reports keep the
   audio/video wallclock association; perceptual lip-sync is still an acceptance
   measurement, not established just by forwarding RTP.
@@ -84,17 +98,28 @@ share audio and never sends it through voice processing or sound cues.
 
 ## Playback and reconnect
 
-There is one audio element per granted remote share, independent of stage,
+Browser viewers have one audio element per granted remote share with confirmed
+audio availability, independent of stage,
 thumbnail, fullscreen and picture-in-picture video elements. Its volume and
 mute survive stage changes and republishing under a new share id (the controller copies preferences only
 when it has identified the confirmed replacement). Shares from two devices of
 the same person retain independent controls. Deafen
 mutes it; selecting an output device applies `setSinkId` where supported.
 Browsers without that API use their normal output. Autoplay refusal offers
-an explicit Play share sound button.
+an explicit Play share sound button only for an audio-enabled share. Desktop
+viewers negotiate video only and have no player, volume control, sound prompt
+or sound claim. Native playback through the voice mixer/AEC reference belongs
+to PR 2.
 
-The sharer's compact sharing row shows sound on/off (or reconnecting).
-Its details dialog contains viewer counts, quality settings, preview and
+Reassigning a previously used audio slot replaces the watch peer connection
+before granting playback. New DTLS keys, SSRCs and receiver buffers fence delayed
+packets of the previous share. Other watches are restored on the new transport
+and may briefly show Connecting. Legacy video-only transport reuse is unchanged.
+
+The sharer's compact sharing row keeps the watcher count beside sound status
+(or shows Sharing with sound before anyone watches). At phone widths the sound
+state uses an accessible icon so both buttons and the count stay in one row.
+Its details dialog contains quality settings, preview and
 statistics. English and Polish strings are included. The captured audio track
 belongs to the same retained MediaStream as video: reconnect reuses it without
 another picker, including encoder recovery. An ended track or a replacement

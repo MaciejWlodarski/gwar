@@ -36,9 +36,19 @@ try {
       await dialog.evaluate(async e => { await Promise.all(e.getAnimations({ subtree: true }).map(a => a.finished)); });
       const box = await dialog.boundingBox(); assert.ok(box.x >= 0 && box.x + box.width <= width && box.y >= 0 && box.y + box.height <= height);
       await page.screenshot({ path: path.join(output, `fixture-details-${lang}-${name}.png`), animations: "disabled" });
+      await page.goto(`${base}?lang=${lang}&zero=1`);
+      const zero = page.getByRole("status", { name: lang === "pl" ? "Udostępniasz ekran" : "You are sharing your screen" });
+      await zero.waitFor();
+      assert.ok((await zero.boundingBox()).height <= 46);
+      await page.screenshot({ path: path.join(output, `fixture-zero-${lang}-${name}.png`), animations: "disabled" });
       await page.goto(`${base}?lang=${lang}&choose=1&silent=1`);
       await page.getByRole("dialog").waitFor();
       await page.screenshot({ path: path.join(output, `fixture-no-sound-${lang}-${name}.png`), animations: "disabled" });
+      await page.goto(`${base}?lang=${lang}&slow=1`);
+      await page.getByTestId("connection-quality").waitFor();
+      const count = await page.getByTestId("screen-viewers").evaluate(e => ({ width: e.clientWidth, needed: e.scrollWidth }));
+      assert.ok(count.needed <= count.width, `poor connection must not truncate ${lang} watcher count at ${width}px: ${JSON.stringify(count)}`);
+      results.at(-1).poorConnectionCount = count;
     }
   }
   writeFileSync(path.join(output, "fixture-layouts.json"), JSON.stringify(results, null, 2));

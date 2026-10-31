@@ -243,3 +243,10 @@ video slots and new video/Opus pairs. No legacy frame gains a field. Unsupported
 queries fall back to video-only sharing without an error banner; see
 [share-audio.md](share-audio.md#compatibility). This is a bounded feature-specific
 rollout, not an implementation of the full compatibility proposal above.
+
+Screen audio availability is queried separately with `screen.audio.state`
+(`share`, optional `stopped`, default false). Its reply is `{ audio: boolean }`.
+Older servers reject it normally; viewers then keep video without audio controls
+or playback. Only the owning publisher may set `stopped: true`. Share/Welcome
+and existing event shapes remain unchanged. Desktop viewers keep the legacy
+video-only watch layout until native playback supplies the AEC reference.

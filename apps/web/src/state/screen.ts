@@ -49,6 +49,8 @@ export interface Watch {
   id: number;
   slot: number | null;
   status: "requesting" | "watching";
+  /** Confirmed by the server for this grant, never inferred from a negotiated receiver. */
+  audio?: boolean;
   paused?: ScreenPauseReason;
   waiting?: true;
 }
@@ -98,6 +100,7 @@ export type ScreenAction =
   | { type: "stream"; run: number; slot: number; stream: MediaStream }
   | { type: "watch"; share: string; id: number }
   | { type: "granted"; run: number; id: number; slot: number }
+  | { type: "watchAudio"; run: number; id: number; audio: boolean }
   | { type: "slot"; run: number; slot: number; share: string | null }
   | { type: "unwatch"; share: string }
   | { type: "paused"; share: string; reason: ScreenPauseReason }
@@ -215,6 +218,8 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       if (state.watches.some(w => w.share === action.share)) return { ...state, stage: action.share };
       return { ...state, watches: [...state.watches, { share: action.share, id: action.id, slot: null, status: "requesting" }], stage: action.share };
     }
+    case "watchAudio":
+      return action.run === state.transport.run ? { ...state, watches: state.watches.map(w => w.id === action.id && w.status === "watching" ? { ...w, audio: action.audio } : w) } : state;
     case "granted": {
       // Only the answer to this watch's own request: an earlier watch's assignment never counts.
       const { run, id, slot } = action;

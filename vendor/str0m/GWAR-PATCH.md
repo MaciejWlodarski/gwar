@@ -208,3 +208,10 @@ sending application keeps every stream within what the receiver declared.
 Upstream required equality of all three, so an offer whose level or tier
 differed from the local configuration in either direction lost AV1. `av1_levels_and_tiers_are_declared_per_receiver`
 covers this.
+
+`SdpApi::accept_offer_with_sync_groups` optionally gives each outgoing audio/video
+pair one stream ID and RTCP CNAME before generating its answer or initializing
+sender reports. Track IDs remain distinct; ordinary `accept_offer` uses no groups
+and preserves its behavior. Gwar uses this for paired screen receivers so
+libwebrtc negotiates synchronization rather than merely combining tracks in JS.
+The server regression checks both the actual answer and stored media identities.

@@ -108,6 +108,8 @@ export class ScreenController {
   private transportReady: Promise<number> | null = null;
   /** A receiver that carried a share can still hold its last decoded frame. */
   private readonly usedSlots = new Set<number>();
+  private watchAudio = false;
+  private audioTimer: ReturnType<typeof setInterval> | null = null;
   /** Owned by the grant, not by a stage/thumbnail video that can remount. */
   /** Each granted watch still waiting for its first frame; no timer while the server pauses it. */
   private readonly firstFrameTimers = new Map<number, { run: number; timer: ReturnType<typeof setTimeout> | null }>();
@@ -374,7 +376,11 @@ export class ScreenController {
     const publisher = new ScreenPublisher({
       uplink: screen => { if (current() && this.publisher === publisher) useUplink.setState({ screen }); },
       audio: screenAudio ? own.stream?.getAudioTracks()[0] : undefined,
-      audioState: sharing => { if (current()) dispatch({ type: "audio", attempt, sharing }); },
+      audioState: sharing => {
+        if (!current()) return;
+        dispatch({ type: "audio", attempt, sharing });
+        if (!sharing) void conn.request("screen.audio.state", { share, stopped: true }).catch(() => {});
+      },
       track, fallbacks: this.encoderFallbacks, quality: latest(), legacy: !screenSpec, av1: hardwareAv1, automaticMode: useSettings.getState().screenMode === null, iceServers: s.iceServers,
       ended: () => { if (this.publisher === publisher) { if (this.recoveringAttempt === attempt) this.recoveryFailed(); else void this.stopShare(true); } },
       surfaceChanged: (surface, spec) => {
@@ -511,17 +517,22 @@ export class ScreenController {
       const reused = this.usedSlots.has(slot);
       this.usedSlots.add(slot);
       if (!current()) { await conn.request("screen.unwatch", { share }).catch(() => {}); return; }
-      if (reused && useScreen.getState().watches.every(w => w.id === id)) {
-        // With no other watch to interrupt, discard the old receiver's decoded frame.
-        // Otherwise keep the transport and fence this slot's readiness to its grant;
-        // hiding its old frame must not reload another active (or pending) watch.
+      if (reused && (this.watchAudio || useScreen.getState().watches.every(w => w.id === id))) {
+        // Legacy video receivers can fence frame readiness without interrupting other
+        // watches. A paired transport needs fresh audio receivers on every slot reuse.
+        // Audio cannot fence a decoded sample by receipt time like video. A fresh PC
+        // gives the new grant new DTLS keys, SSRCs and jitter buffers before playback.
+        const others = useScreen.getState().watches.filter(w => w.id !== id);
+        for (const watch of others) this.waitForWatch(watch.id);
         this.dropTransport();
         await this.startWatch(conn, share, id, generation);
+        this.resumeWatches();
         return;
       }
       this.expectFirstFrame(share, run, id);
       this.lastStart = Date.now();
       dispatch({ type: "granted", run, id, slot });
+      if (this.watchAudio) void this.refreshAudio(conn, run, id, share);
       if (useScreen.getState().stage === share) void conn.request("screen.focus", { share }).catch(() => {});
     } catch (e) {
       if (!alive() || useScreen.getState().transport.phase === "failed" || (run !== undefined && useScreen.getState().transport.run !== run)) return;
@@ -672,6 +683,11 @@ export class ScreenController {
     return this.transport.stats(watch.slot);
   }
 
+  private async refreshAudio(conn: Link, run: number, id: number, share: string): Promise<void> {
+    const audio = await conn.request("screen.audio.state", { share, stopped: false }, { timeoutMs: 1_500 }).then(r => r.audio).catch(() => false);
+    if (this.link() === conn && useScreen.getState().watches.some(w => w.id === id && w.share === share && w.status === "watching")) dispatch({ type: "watchAudio", run, id, audio });
+  }
+
   /** The session's watch transport, negotiated on the first watch and kept; resolves to its run once connected. */
   private ensureTransport(conn: Link, retries = 2): Promise<number> {
     const phase = useScreen.getState().transport.phase;
@@ -703,7 +719,11 @@ export class ScreenController {
     const transport: ScreenWatchTransport = new ScreenWatchTransport({
       run,
       av1: true,
-      audio: () => conn.request("screen.audio.capabilities", {}, { timeoutMs: 1_500 }).then(f => f.screen_audio === true).catch(() => false),
+      audio: async () => {
+        const enabled = !isDesktop() && await conn.request("screen.audio.capabilities", {}, { timeoutMs: 1_500 }).then(f => f.screen_audio === true).catch(() => false);
+        if (this.transport === transport) this.watchAudio = enabled;
+        return enabled;
+      },
       iceServers: useSession.getState().iceServers,
       offer: async (sdp, run, h264 = [], av1 = null) => {
         // Query explicitly: adding fields to Welcome would break old clients' strict
@@ -723,7 +743,12 @@ export class ScreenController {
         if (this.transport !== transport) return;
         if (state === "failed") { fail(new Error(tNow("screen.watchFailed"))); return; }
         dispatch({ type: "transport", run, phase: state });
-        if (state === "connected") settle.resolve(run);
+        if (state === "connected") {
+          settle.resolve(run);
+          if (this.watchAudio && !this.audioTimer) this.audioTimer = setInterval(() => {
+            for (const w of useScreen.getState().watches) if (w.status === "watching") void this.refreshAudio(conn, run, w.id, w.share);
+          }, 1_000);
+        }
       },
       decodeFailed: (slot, share, generation) => { if (screenH264 && this.transport === transport) void conn.request("screen.decode_failed", { run, slot, share, generation }).catch(() => {}); },
       track: (slot, stream) => { if (this.transport === transport) dispatch({ type: "stream", run, slot, stream }); },
@@ -756,6 +781,9 @@ export class ScreenController {
    * also cancels its connection timeout, so nothing else would ever settle that wait.
    */
   private dropTransport(): void {
+    if (this.audioTimer) clearInterval(this.audioTimer);
+    this.audioTimer = null;
+    this.watchAudio = false;
     for (const { timer } of this.firstFrameTimers.values()) if (timer) clearTimeout(timer);
     this.firstFrameTimers.clear();
     // A new watch transport starts its spacing over.

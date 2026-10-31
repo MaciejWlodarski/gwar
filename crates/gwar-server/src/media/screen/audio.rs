@@ -1,8 +1,16 @@
 //! Opus for plaintext screen shares. Uses the screen task and a bounded, separate ingress
 //! bucket. At egress its fixed allowance is subtracted from video's existing 80% allocation:
 //! voice's reserve and the voice task are never borrowed for share sound.
-use super::{DIRECTIONS, Watcher, ingress::Bucket, sections, wipe};
-use std::{collections::HashSet, time::Instant};
+use super::{
+    DIRECTIONS, Watcher,
+    egress::{Egress, ORIGINAL_OVERHEAD, Queued},
+    ingress::Bucket,
+    sections, wipe,
+};
+use std::{
+    collections::{HashSet, VecDeque},
+    time::{Duration, Instant},
+};
 use str0m::{
     Rtc,
     format::Codec,
@@ -79,6 +87,7 @@ pub(super) struct Slot {
     publication: Option<u64>,
     next: u64,
     ticks: u32,
+    pending: VecDeque<Queued>,
 }
 
 impl Slot {
@@ -88,19 +97,21 @@ impl Slot {
             s.set_unpaced(true);
             *s.ssrc()
         });
-        Self { mid, pt, ssrc, source: None, publication: None, next: 0, ticks: 0 }
+        Self { mid, pt, ssrc, source: None, publication: None, next: 0, ticks: 0, pending: VecDeque::new() }
     }
 
     pub fn clear(&mut self, rtc: &mut Rtc) {
         self.source = None;
         self.publication = None;
+        self.pending.clear();
         wipe(rtc, self.mid);
     }
 
-    pub fn write(&mut self, rtc: &mut Rtc, packet: &RtpPacket, publication: u64) {
+    pub fn queue(&mut self, packet: &RtpPacket, publication: u64, wallclock: Instant) {
         let Some(pt) = self.pt else { return };
         let source = *packet.seq_no;
         if self.publication != Some(publication) || self.source.is_none_or(|(ssrc, ..)| ssrc != packet.header.ssrc) {
+            self.pending.clear();
             self.publication = Some(publication);
             self.source = Some((packet.header.ssrc, source, self.next, packet.header.timestamp, self.ticks));
         }
@@ -114,13 +125,43 @@ impl Slot {
             self.next = sequence + 1;
             self.ticks = ticks.wrapping_add(960);
         }
-        if let Some(stream) = rtc.direct_api().stream_tx_by_mid(self.mid, None) {
-            self.ssrc = *stream.ssrc();
-            stream.set_unpaced(true);
-            stream.write_rtp(
-                RtpWrite::new(pt, sequence.into(), ticks, packet.timestamp, packet.payload.clone())
-                    .marker(packet.header.marker),
-            );
+        // A short, bounded queue, shared release pacing with video; no stale sound backlog.
+        if self.pending.len() == 4 {
+            self.pending.pop_front();
+        }
+        self.pending.push_back(
+            Queued::new(sequence, ticks, packet.header.marker, pt, packet.timestamp, packet.payload.clone(), 0, false)
+                .with_wallclock(wallclock),
+        );
+    }
+
+    pub fn wake(&self, egress: &Egress, now: Instant) -> Option<Instant> {
+        self.pending.front().map(|p| {
+            egress.audio_wake(p.payload.len() + ORIGINAL_OVERHEAD, now).min(p.arrival + Duration::from_millis(100))
+        })
+    }
+
+    pub fn release(&mut self, rtc: &mut Rtc, egress: &mut Egress, now: Instant, enabled: bool) {
+        if !enabled {
+            self.pending.clear();
+            return;
+        }
+        while self.pending.front().is_some_and(|p| p.arrival + Duration::from_millis(100) <= now) {
+            self.pending.pop_front();
+        }
+        while let Some(packet) = self.pending.front() {
+            if !egress.audio_due(packet.payload.len() + ORIGINAL_OVERHEAD, now) {
+                break;
+            }
+            let packet = self.pending.pop_front().unwrap();
+            if let Some(stream) = rtc.direct_api().stream_tx_by_mid(self.mid, None) {
+                self.ssrc = *stream.ssrc();
+                stream.set_unpaced(true);
+                stream.write_rtp(
+                    RtpWrite::new(packet.pt, packet.out.into(), packet.timestamp, packet.wallclock, packet.payload)
+                        .marker(packet.marker),
+                );
+            }
         }
     }
 }
@@ -164,6 +205,50 @@ mod tests {
     }
 
     #[test]
+    fn each_negotiated_pair_shares_its_sdp_and_rtcp_sync_identity() {
+        use super::super::{Caps, Lease, watcher};
+        use str0m::media::Direction;
+        let now = Instant::now();
+        let mut peer = Rtc::new(now);
+        let mut api = peer.sdp_api();
+        for _ in 0..SCREEN_SLOTS {
+            api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None);
+            api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None);
+        }
+        let (offer, _) = api.apply().unwrap();
+        let (w, answer) = watcher(
+            1,
+            2,
+            3,
+            Lease::new(),
+            SCREEN_SLOTS,
+            &offer.to_sdp_string(),
+            Caps { browser: false, h264: &[], av1: None },
+            "127.0.0.1:6000".parse().unwrap(),
+            now,
+        )
+        .unwrap();
+        let sections = sections(&answer);
+        let mut groups = HashSet::new();
+        for pair in sections.chunks(2) {
+            let identities: Vec<_> = pair
+                .iter()
+                .map(|lines| {
+                    let mid = lines.iter().find_map(|l| l.strip_prefix("a=mid:")).unwrap();
+                    let media = w.rtc.media(Mid::from(mid)).unwrap();
+                    assert!(lines.iter().any(|l| l.contains(&format!("cname:{}", media.cname()))));
+                    assert!(lines.iter().any(|l| l.starts_with(&format!("a=msid:{} ", media.stream_id()))));
+                    (media.stream_id(), media.cname(), media.track_id())
+                })
+                .collect();
+            assert_eq!(identities[0].0, identities[1].0);
+            assert_eq!(identities[0].1, identities[1].1);
+            assert_ne!(identities[0].2, identities[1].2);
+            assert!(groups.insert(identities[0].0));
+        }
+    }
+
+    #[test]
     fn audio_publish_keeps_legacy_video_identity_and_refuses_other_audio_directions() {
         let video = "m=video 9 UDP/TLS/RTP/SAVPF 98 99\r\na=sendonly\r\na=ssrc-group:FID 1 2\r\na=ssrc:1 cname:v\r\na=ssrc:2 cname:v\r\n";
         let audio =
@@ -195,6 +280,83 @@ mod tests {
             assert!(egress.plan() + ceiling <= PLAN * estimate as f64);
             egress.reserve_audio(0, now + Duration::from_secs(1));
             assert_eq!(egress.plan(), before);
+        }
+    }
+
+    #[test]
+    fn adversarial_audio_bursts_cannot_spend_a_second_wire_burst() {
+        let now = Instant::now();
+        let mut e = Egress::new(now);
+        e.set_estimate(1_000_000, now);
+        e.reserve_audio(1, now);
+        assert!(e.charge(Class::Audio, 1100, now));
+        assert!(!e.charge(Class::Audio, 1100, now), "the second packet must wait for aggregate pacing");
+        assert!(!e.charge(Class::Original, 1100, now), "video cannot spend another screen burst");
+        assert!(!e.charge(Class::Extra, 1100, now), "repairs/probes share the final wire guard");
+        assert!(e.charge(Class::Control, 80, now));
+    }
+
+    #[test]
+    fn a_probe_cannot_spend_credit_already_reserved_for_released_media() {
+        let now = Instant::now();
+        let mut e = Egress::new(now);
+        e.set_estimate(1_000_000, now);
+        e.reserve_audio(1, now);
+        assert!(e.audio_due(1164, now), "application release reserves this packet");
+        assert!(!e.charge(Class::Extra, 1100, now), "a probe cannot steal the released packet's wire credit");
+        assert!(e.charge(Class::Audio, 1100, now), "released media reaches the socket without a pacing drop");
+    }
+
+    #[test]
+    fn low_bandwidth_bursts_preserve_voice_with_and_without_video() {
+        // Production release and socket guards on a 0.5/1/2 Mbps FIFO. The publisher's
+        // admissible pair arrives together every 150 ms, deliberately ahead of voice.
+        for bandwidth in [500_000, 1_000_000, 2_000_000] {
+            for cadence in [1, 5, 10] {
+                for video in [false, true] {
+                    let start = Instant::now();
+                    let mut e = Egress::new(start);
+                    e.set_estimate(bandwidth, start);
+                    e.reserve_audio(1, start);
+                    let mut pending = 0;
+                    let mut busy = 0.0_f64;
+                    let mut voice = Vec::new();
+                    for ms in 0..30_000 {
+                        let now = start + Duration::from_millis(ms);
+                        let time = ms as f64 / 1000.0;
+                        if ms % 150 == 0 {
+                            pending += 2;
+                        }
+                        if ms % cadence == 0 {
+                            while pending > 0 && e.audio_due(1164, now) {
+                                pending -= 1;
+                                if e.charge(Class::Audio, 1100, now) {
+                                    busy = busy.max(time) + 1128.0 * 8.0 / bandwidth as f64;
+                                }
+                            }
+                            if video && e.charge(Class::Original, 1100, now) {
+                                busy = busy.max(time) + 1128.0 * 8.0 / bandwidth as f64;
+                            }
+                        }
+                        // Match the 1 Mbps review probe's 100 kb/s voice; on the
+                        // 0.5 Mbps link use 32 kb/s, inside the same voice reserve.
+                        let (interval, bytes) = if bandwidth >= 1_000_000 { (10, 125.0) } else { (20, 80.0) };
+                        if ms % interval == 0 {
+                            voice.push((busy - time).max(0.0));
+                            busy = busy.max(time) + bytes * 8.0 / bandwidth as f64;
+                        }
+                    }
+                    voice.sort_by(f64::total_cmp);
+                    let p99 = voice[voice.len() * 99 / 100];
+                    let bound = (1128.0 * 8.0 / bandwidth as f64).max(0.010);
+                    eprintln!("{bandwidth} bps, {cadence} ms, video={video}: voice p99={p99:.6}s");
+                    assert!(
+                        p99 <= bound + 0.000001,
+                        "{bandwidth} bps, {cadence} ms, video={video}: p99={p99:.4} > {bound:.4}"
+                    );
+                    assert!(pending < 3, "no unbounded sound backlog");
+                }
+            }
         }
     }
 }

@@ -19,6 +19,7 @@
 mod audio;
 pub mod av1;
 mod av1_stream;
+mod clock;
 mod codec;
 pub mod dependency_descriptor;
 mod egress;
@@ -168,7 +169,7 @@ pub struct ScreenOrigin {
     /// The bitrate cap its ingress byte bucket follows, and what each of its slots reserves.
     pub cap_bps: u64,
     alive: AtomicBool,
-    has_audio: AtomicBool,
+    pub(crate) has_audio: AtomicBool,
     recovery: std::sync::Mutex<recovery::Recovery>,
     /// What a viewer joining it starts from, refreshed from its measured rate every allocation
     /// tick (`egress::start_estimate`); zero until the first tick.
@@ -569,6 +570,7 @@ struct Publisher {
     ssrc: Ssrc,
     codecs: HashMap<Pt, VideoCodec>,
     audio: Option<audio::Publisher>,
+    clock: clock::Clock,
     prefix: h264_admission::Prefix,
     h264_stream: h264_stream::Admission,
     av1_stream: av1_stream::Admission,
@@ -791,6 +793,11 @@ struct Watcher {
 impl Watcher {
     fn wake(&self) -> Instant {
         let mut at = self.egress.wake().map_or(self.deadline, |wake| self.deadline.min(wake));
+        for audio in &self.audio {
+            if let Some(wake) = audio.wake(&self.egress, self.egress.now()) {
+                at = at.min(wake);
+            }
+        }
         if !self.connected {
             at = at.min(self.created + WATCH_CONNECT);
         }
@@ -850,6 +857,7 @@ struct Forward {
     keyframe: bool,
     codec: VideoCodec,
     arrival: Instant,
+    wallclock: Instant,
     payload: Arc<[u8]>,
 }
 
@@ -1753,15 +1761,20 @@ impl Sfu {
                         if !p.origin.alive() {
                             continue;
                         }
-                        if let Some(audio) = p.audio.as_mut()
+                        if p.origin.has_audio.load(Ordering::Relaxed)
+                            && let Some(audio) = p.audio.as_mut()
                             && audio.accepts(&packet, now)
                         {
-                            sounds.push(packet);
+                            let wallclock =
+                                p.clock.map(packet.header.timestamp, packet.timestamp, packet.last_sender_info, 48_000);
+                            sounds.push((packet, wallclock));
                             continue;
                         }
                         if packet.header.ssrc != p.ssrc {
                             continue;
                         }
+                        let wallclock =
+                            p.clock.map(packet.header.timestamp, packet.timestamp, packet.last_sender_info, 90_000);
                         let Some(codec) = p.codecs.get(&packet.header.payload_type).copied() else { continue };
                         let source = *packet.seq_no;
                         let same =
@@ -1788,6 +1801,7 @@ impl Sfu {
                                 keyframe: false,
                                 codec,
                                 arrival: packet.timestamp,
+                                wallclock,
                                 payload: packet.payload.clone(),
                             };
                             let (live, held, verdict) = prefix_packet(&mut p, forward, waiting, now);
@@ -1818,6 +1832,7 @@ impl Sfu {
                                         keyframe,
                                         codec,
                                         arrival: packet.timestamp,
+                                        wallclock,
                                         payload: packet.payload.clone(),
                                     }
                                 },
@@ -1850,7 +1865,7 @@ impl Sfu {
         self.schedule_publisher(share);
         self.forward_packets(share, &origin, forwards, now);
         if !origin.recovery.lock().expect("recovery lock").pending {
-            for packet in sounds {
+            for (packet, wallclock) in sounds {
                 let slots = self.slots_of(share);
                 for (session, index) in slots {
                     let Some(w) = self.watchers.get_mut(&session) else { continue };
@@ -1862,7 +1877,7 @@ impl Sfu {
                     }
                     audio::reserve(w, now);
                     if let Some(audio) = w.audio.get_mut(index) {
-                        audio.write(&mut w.rtc, &packet, publication);
+                        audio.queue(&packet, publication, wallclock);
                     }
                     self.flush_watcher(session);
                 }
@@ -2457,7 +2472,11 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                         .and_then(|i| w.slots.get(i).map(|s| (i, s)))
                         .is_some_and(|(i, s)| {
                             w.egress.paused(i) != Some(ScreenPauseReason::Budget)
-                                && s.grant.as_ref().is_some_and(|g| g.alive())
+                                && s.grant.as_ref().is_some_and(|g| {
+                                    g.alive()
+                                        && g.origin.has_audio.load(Ordering::Relaxed)
+                                        && !g.origin.recovery.lock().expect("recovery lock").pending
+                                })
                         });
                     if permitted && w.egress.charge(egress::Class::Audio, t.contents.len(), now) {
                         send(&t.contents, t.destination);
@@ -3249,7 +3268,8 @@ fn enqueue(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forwa
         forward.timestamp,
         forward.keyframe,
     )
-    .with_dd(dd);
+    .with_dd(dd)
+    .with_wallclock(forward.wallclock);
     let dropped = w.egress.admit(index, packet, now);
     for &lane in &dropped {
         w.slots[lane].dropped(now);
@@ -3274,6 +3294,15 @@ fn enqueue(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forwa
 /// Writes what the viewer's release bucket allows into str0m. Its shared RTP pacer smooths
 /// originals together with RTX and probes; transmission checks the original deadline again.
 fn release(w: &mut Watcher, now: Instant) {
+    for (i, audio) in w.audio.iter_mut().enumerate() {
+        let enabled = w.egress.paused(i) != Some(ScreenPauseReason::Budget)
+            && w.slots[i].grant.as_ref().is_some_and(|g| {
+                g.alive()
+                    && g.origin.has_audio.load(Ordering::Relaxed)
+                    && !g.origin.recovery.lock().expect("recovery lock").pending
+            });
+        audio.release(&mut w.rtc, &mut w.egress, now, enabled);
+    }
     let (released, dropped) = w.egress.due(now);
     for &lane in &dropped {
         w.slots[lane].dropped(now);
@@ -3300,10 +3329,10 @@ fn release(w: &mut Watcher, now: Instant) {
             extensions.user_values.set(dd);
         }
         slot.originals.push_back((packet.out as u16, packet.key_frame(), packet.arrival));
-        // The wallclock is the packet's arrival, not its release: sender reports describe the
-        // sharer's timeline.
+        // Sender reports use the common publisher clock (arrival before source reports),
+        // never application release time: queued picture stays aligned with share sound.
         stream.write_rtp(
-            RtpWrite::new(packet.pt, packet.out.into(), packet.timestamp, packet.arrival, packet.payload)
+            RtpWrite::new(packet.pt, packet.out.into(), packet.timestamp, packet.wallclock, packet.payload)
                 .marker(packet.marker)
                 .nackable(true)
                 .ext_vals(extensions),
@@ -3431,6 +3460,7 @@ fn publisher(
         ssrc,
         codecs,
         audio,
+        clock: clock::Clock::default(),
         prefix: h264_admission::Prefix::default(),
         h264_stream: h264_stream::Admission::default(),
         av1_stream: av1_stream::Admission::default(),
@@ -3472,7 +3502,19 @@ fn watcher(
     }
     let offer = SdpOffer::from_sdp_string(sdp).map_err(|_| "invalid SDP offer")?;
     let mut rtc = rtc(advertise, now, true, true)?;
-    let answer = rtc.sdp_api().accept_offer(offer).map_err(|_| "offer not acceptable")?;
+    let groups = if sections(sdp).len() == size * 2 {
+        sections(sdp)
+            .chunks(2)
+            .map(|pair| {
+                pair.iter()
+                    .filter_map(|lines| lines.iter().find_map(|l| l.strip_prefix("a=mid:")).map(Mid::from))
+                    .collect()
+            })
+            .collect::<Vec<Vec<Mid>>>()
+    } else {
+        Vec::new()
+    };
+    let answer = rtc.sdp_api().accept_offer_with_sync_groups(offer, &groups).map_err(|_| "offer not acceptable")?;
     let ssrcs = sections(sdp)
         .into_iter()
         .flatten()
@@ -3778,6 +3820,7 @@ pub(crate) mod tests {
             keyframe: n.is_multiple_of(10),
             codec: VideoCodec::Vp9,
             arrival: pair.now,
+            wallclock: pair.now,
             payload: Arc::from([if n.is_multiple_of(10) { 0x10 } else { 0x00 }, 0x00, n as u8, 0xaa].as_slice()),
         };
         let packets: Vec<_> = (0..30).map(packet).collect();
@@ -3835,6 +3878,7 @@ pub(crate) mod tests {
             keyframe: true,
             codec: VideoCodec::Vp9,
             arrival: pair.now,
+            wallclock: pair.now,
             payload: Arc::from(vec![0x10; 1100]),
         };
         assert!(enqueue(&mut pair.w, 0, &origin, &forward, pair.now));
@@ -3995,6 +4039,7 @@ pub(crate) mod tests {
                 keyframe: source == 1,
                 codec: VideoCodec::Vp9,
                 arrival: pair.now,
+                wallclock: pair.now,
                 payload: Arc::from(vec![0x10; 1100]),
             };
             assert!(enqueue(&mut pair.w, 0, &origin, &forward, pair.now));
@@ -4090,6 +4135,7 @@ pub(crate) mod tests {
             keyframe: true,
             codec: VideoCodec::Vp9,
             arrival: Instant::now() - egress::DEADLINE,
+            wallclock: Instant::now() - egress::DEADLINE,
             payload: Arc::from([0x10, 0, 1, 2].as_slice()),
         };
         assert!(enqueue(&mut pair.w, 0, &origin, &forward, pair.now));
@@ -4131,6 +4177,7 @@ pub(crate) mod tests {
                 ssrc: 1.into(),
                 codecs: HashMap::new(),
                 audio: None,
+                clock: clock::Clock::default(),
                 prefix: h264_admission::Prefix::default(),
                 h264_stream: h264_stream::Admission::default(),
                 av1_stream: av1_stream::Admission::default(),
@@ -4167,6 +4214,7 @@ pub(crate) mod tests {
             keyframe: true,
             codec: VideoCodec::Vp9,
             arrival: now,
+            wallclock: now,
             payload: Arc::from(vec![0x10; 1100]),
         };
         let packets = w.egress.admission_bound() / (1100 + egress::ORIGINAL_OVERHEAD);
@@ -4198,6 +4246,7 @@ pub(crate) mod tests {
                 keyframe: source == 1,
                 codec: VideoCodec::Vp9,
                 arrival: released_at,
+                wallclock: released_at,
                 payload: Arc::from(vec![0x10; 1100]),
             };
             assert!(enqueue(w, 0, &origin, &f, released_at));
@@ -4262,6 +4311,7 @@ pub(crate) mod tests {
                 keyframe: n == 0,
                 codec: VideoCodec::Vp9,
                 arrival: now,
+                wallclock: now,
                 payload: Arc::from([if n == 0 { 0x10 } else { 0x00 }, 0x00, n as u8, 0xaa].as_slice()),
             };
             assert!(enqueue(&mut pair.w, 0, &origin, &forward, now));
@@ -4309,6 +4359,7 @@ pub(crate) mod tests {
                 keyframe: n == 0,
                 codec: VideoCodec::Vp9,
                 arrival: now,
+                wallclock: now,
                 payload: Arc::from([if n == 0 { 0x10 } else { 0x00 }, 0x00, n as u8, 0xaa].as_slice()),
             };
             assert!(enqueue(&mut pair.w, 0, &origin, &forward, now));
@@ -4698,6 +4749,7 @@ pub(crate) mod tests {
                                     keyframe: packet == 0,
                                     codec: VideoCodec::Vp9,
                                     arrival: at,
+                                    wallclock: at,
                                     payload: Arc::from(vec![0; 1024]),
                                 };
                                 assert!(enqueue(sfu.watchers.get_mut(&1).unwrap(), slot, &origin, &forward, at));
@@ -5075,6 +5127,7 @@ pub(crate) mod tests {
             marker: true,
             keyframe: false,
             arrival: at,
+            wallclock: at,
             payload: Arc::from([0x40, 1]),
         };
         sfu.forward_packets("h264", &origin, vec![(delta.clone(), false)], at);
@@ -5181,6 +5234,7 @@ pub(crate) mod tests {
             ssrc: 1.into(),
             codecs: HashMap::new(),
             audio: None,
+            clock: clock::Clock::default(),
             prefix: h264_admission::Prefix::default(),
             h264_stream: h264_stream::Admission::default(),
             av1_stream: av1_stream::Admission::default(),
@@ -5207,6 +5261,7 @@ pub(crate) mod tests {
             keyframe: false,
             codec: VideoCodec::H264(0x42e033),
             arrival: now,
+            wallclock: now,
             payload: Arc::from(payload),
         }
     }
@@ -5426,6 +5481,7 @@ pub(crate) mod tests {
                     keyframe: packet == 0,
                     codec: VideoCodec::Vp9,
                     arrival: failure,
+                    wallclock: failure,
                     payload: Arc::from(vec![0; 1000]),
                 };
                 enqueue(w, 0, &origin, &forward, failure);
@@ -5523,6 +5579,7 @@ pub(crate) mod tests {
                     keyframe: packet == 0,
                     codec: VideoCodec::Vp9,
                     arrival: at,
+                    wallclock: at,
                     payload: Arc::from(vec![0u8; 1000]),
                 };
                 let origin = sfu.publishers[name].origin.clone();
@@ -5590,6 +5647,7 @@ pub(crate) mod tests {
             keyframe,
             codec: VideoCodec::Vp9,
             arrival: at,
+            wallclock: at,
             payload: Arc::from(vec![0; 936]), // exactly 1000 serialized bytes
         };
         let w = sfu.watchers.get_mut(&1).unwrap();
@@ -5726,6 +5784,7 @@ pub(crate) mod tests {
                         keyframe: true,
                         codec: VideoCodec::Vp9,
                         arrival: now,
+                        wallclock: now,
                         payload: Arc::from(vec![0; 1000]),
                     },
                     now

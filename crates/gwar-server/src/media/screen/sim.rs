@@ -407,6 +407,7 @@ impl Sim {
                     keyframe: key && n == 0,
                     codec: VideoCodec::Vp9,
                     arrival: now,
+                    wallclock: now,
                     payload: payload(share.source, n == 0, len),
                 };
                 share.source += 1;
@@ -1441,6 +1442,7 @@ mod tests {
                 keyframe: source == 100,
                 codec: VideoCodec::Vp9,
                 arrival,
+                wallclock: arrival,
                 payload: payload(source, true, 1000),
             };
             assert!(enqueue(&mut sim.w, 0, &origin, &forward, sim.now), "{source} is queued");

@@ -519,6 +519,7 @@ export const en = {
   "screen.audioReady": "Tab sound will be shared.",
   "screen.audioUnavailable": "No sound from this choice. Try a browser tab with audio enabled.",
   "screen.audioOn": "Sound on",
+  "screen.sharingAudio": "Sharing with sound",
   "screen.audioOff": "No sound",
   "screen.shareVolume": "Share volume",
   "screen.muteAudio": "Mute share sound",

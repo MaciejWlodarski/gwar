@@ -54,6 +54,27 @@ async fn optional_capability_query_keeps_legacy_clients_and_welcome_compatible()
 }
 
 #[tokio::test]
+async fn audio_availability_is_explicit_and_only_the_publisher_can_stop_it() {
+    let server = TestServer::start().await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    let share = alice.share_in(seed_channel(&alice, "General")).await;
+    assert_eq!(bob.request("screen.audio.state", json!({"share":share})).await.unwrap(), json!({"audio":false}));
+    assert_eq!(
+        bob.request("screen.audio.state", json!({"share":share,"stopped":true})).await.unwrap_err().code,
+        gwar_proto::ErrorCode::Forbidden
+    );
+    assert_eq!(
+        alice.request("screen.audio.state", json!({"share":share,"stopped":true})).await.unwrap(),
+        json!({"audio":false})
+    );
+    assert_eq!(
+        bob.request("screen.audio.state", json!({"share":"unknown"})).await.unwrap_err().code,
+        gwar_proto::ErrorCode::NotFound
+    );
+}
+
+#[tokio::test]
 async fn a_late_viewer_starts_at_a_keyframe_and_gets_every_byte_in_order() {
     let server = TestServer::start().await;
     let mut alice = Client::connect(&server, "alice").await;

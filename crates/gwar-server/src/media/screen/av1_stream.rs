@@ -397,6 +397,7 @@ pub(super) mod tests {
             keyframe: false,
             codec: VideoCodec::Av1,
             arrival: Instant::now(),
+            wallclock: Instant::now(),
             payload: Arc::from(payload),
         }
     }

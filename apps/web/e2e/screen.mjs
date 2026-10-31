@@ -576,6 +576,12 @@ async function run(browsers, web, server, token) {
 
   // A moderator viewer, in another channel's voice.
   const cv = await device(engine("chromium"), web, server, "cv-mod", { frequency: 300 });
+  if (process.env.E2E_SCREEN_AUDIO !== "1") await session(cv, (_, __, controller) => {
+    // Exercise a legacy four-video viewer alongside new paired WebKit viewers.
+    const request = controller.connection.request.bind(controller.connection);
+    controller.connection.request = (op, ...args) => op === "screen.audio.capabilities"
+      ? Promise.resolve({ screen_audio: false }) : request(op, ...args);
+  });
   await cv.evaluate(async token => {
     const { controller } = await window.__gwarE2eImport("/src/state/controller.ts");
     await controller.connection.request("token.redeem", { token });
@@ -657,6 +663,16 @@ async function run(browsers, web, server, token) {
   await codecFlow(cs, cv, csShare, primary, requiredSize);
   if (process.env.E2E_SCREEN_AUDIO === "1") {
     await soundReceived(cv, csShare);
+    await watch(cv, "ws-canvas");
+    await sees(cv, wsShare, 2, "video-only publisher with paired receivers");
+    assert.equal(await cv.getByTestId("share-audio-controls").count(), 0, "a negotiated receiver is not proof of sound");
+    assert.equal(await cv.locator(`audio[data-share-audio="${wsShare}"]`).count(), 0);
+    const oldRun = await session(cv, (_, screen) => screen.transport.run);
+    await session(cv, (_, __, controller, id) => controller.screen.unwatch(id), csShare);
+    await watch(cv, "cs-tab");
+    assert.notEqual(await session(cv, (_, screen) => screen.transport.run), oldRun, "slot reuse creates fresh audio receivers even while video-only watch remains active");
+    await soundReceived(cv, csShare);
+    await waitFor(() => session(cv, (_, screen, __, id) => screen.watches.some(w => w.share === id && w.status === "watching"), wsShare), "other watch restored after audio receiver renewal");
     if (process.env.E2E_SHARE_AUDIO_SCREENSHOTS) {
       const directory = process.env.E2E_SHARE_AUDIO_SCREENSHOTS; mkdirSync(directory, { recursive: true });
       for (const lang of ["pl", "en"]) {
@@ -664,6 +680,15 @@ async function run(browsers, web, server, token) {
         for (const [name, width, height] of [["desktop", 1440, 900], ["tablet", 768, 1024], ["390", 390, 844], ["360", 360, 800]]) {
           for (const [role, page] of [["sharer", cs], ["viewer", cv]]) {
             await page.setViewportSize({ width, height });
+            if (role === "viewer" && name === "desktop") {
+              const header = page.getByTestId("chat-header");
+              const layout = await header.evaluate(el => ({ width: el.clientWidth, title: el.querySelector("h2").clientWidth }));
+              assert.ok(layout.title >= Math.min(120, layout.width / 2), `chat title wins within its own ${layout.width}px header: ${layout.title}px`);
+            }
+            if (role === "viewer") {
+              const controls = await page.getByTestId("share-audio-controls").boundingBox();
+              assert.ok(controls.width <= 344, "volume stays compact and left aligned");
+            }
             await page.screenshot({ path: path.join(directory, `${role}-${lang}-${name}.png`), animations: "disabled" });
           }
         }
@@ -683,6 +708,11 @@ async function run(browsers, web, server, token) {
     assert.ok(await cv.locator(`audio[data-share-audio="${replacement}"]`).evaluate(a => a.muted && a.volume === 0.35), "volume and mute survive reconnect");
     await cv.getByRole("button", { name: "Unmute share sound", exact: true }).click();
     assert.equal(await cv.locator("audio[data-share-audio]").count(), 1, "one output across slot and stage reuse");
+    await session(cs, (_, screen) => screen.own.stream.getAudioTracks().forEach(t => t.stop()));
+    await waitFor(() => session(cv, (_, screen, __, id) => screen.watches.find(w => w.share === id)?.audio === false, replacement), "ended sound removes availability");
+    assert.equal(await cv.getByTestId("share-audio-controls").count(), 0);
+    assert.equal(await cv.locator("audio[data-share-audio]").count(), 0);
+    await sees(cv, replacement, 1, "picture continues truthfully after audio ends");
     checks.push({ check: "generated 997 Hz tab sound, per-share volume/mute, no self-playback, retained audio across reconnect", ok: true });
     return opened.flatMap(p => errors(p).map(e => `${p.deviceName}: ${e}`));
   }
@@ -782,7 +812,8 @@ async function run(browsers, web, server, token) {
   await watch(ws, "c3-restart");
   await watch(wv, "c3-restart");
   await sees(wv, second, 6, "concurrent WebKit watch reveals its new grant's frame");
-  assert.equal(await session(wv, (_, screen) => screen.transport.run), concurrentWebKitRun, "WebKit reuse preserves its other active watches' transport");
+  assert.notEqual(await session(wv, (_, screen) => screen.transport.run), concurrentWebKitRun, "paired WebKit slots get fresh audio receivers before reuse");
+  await sees(wv, wsShare, 2, "paired receiver renewal restores other active watches");
   // The second share has its own source (6, another shape): its frames cannot be the first's.
   await sees(cv, second, 6, "second share of the restarting sharer");
   assert.equal(await session(cv, (_, screen) => screen.transport.run), oldViewerRun, "another active watch prevents renewal");

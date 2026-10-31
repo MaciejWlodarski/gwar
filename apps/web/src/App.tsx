@@ -3,6 +3,7 @@ import { accountActions } from "./state/account";
 import { cn } from "./lib/cn";
 import { useIsMobile } from "./lib/media";
 import { initDesktop } from "./platform/desktop";
+import { isDesktop } from "./platform";
 import { initUpdates } from "./platform/updater";
 import { controller } from "./state/controller";
 import { useConnectUi, useSession, useUi, type ServerPane } from "./state/stores";
@@ -74,7 +75,7 @@ export function App() {
       <div className="flex h-dvh w-full flex-col overflow-hidden bg-rail">
         <ConnectionWarning phase={phase} insecure={insecureConnection} />
         <IdentityNotices />
-        <ShareAudioPlayback />
+        {!isDesktop() && <ShareAudioPlayback />}
         <ScreenNotice />
         {showApp && <SharingBar />}
         <div className="flex min-h-0 w-full flex-1 overflow-hidden">

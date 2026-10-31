@@ -1923,6 +1923,7 @@ impl Core {
             Request::ScreenCapabilities {} => Ok(Response::ScreenCapabilities { screen_h264: true }),
             Request::ScreenAv1Capabilities {} => Ok(Response::ScreenAv1Capabilities { screen_av1: true }),
             Request::ScreenAudioCapabilities {} => Ok(Response::ScreenAudioCapabilities { screen_audio: true }),
+            Request::ScreenAudioState { share, stopped } => self.screen_audio_state(session, &share, stopped),
             Request::ScreenFocus { share } => self.screen_focus(session, &share),
             Request::ScreenDecodeFailed { share, slot, run, generation } => {
                 self.screen_decode_failed(session, &share, slot, run, generation)
