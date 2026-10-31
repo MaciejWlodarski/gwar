@@ -352,7 +352,8 @@ it("shows a closed microphone with a plain reason and opens audio settings when 
     useGlobalPtt.setState({ status: "permission", native: true });
     await render(<MicButton />);
     const button = container.querySelector("button")!;
-    expect(button.getAttribute("aria-label")).toBe("Brak zgody. Mikrofon zamknięty.");
+    expect(button.getAttribute("aria-label")).toBe("Brak zgody. Mikrofon zamknięty. Otwórz ustawienia dźwięku.");
+    expect(button.hasAttribute("aria-pressed")).toBe(false);
     await act(async () => button.click());
     expect(useUi.getState()).toMatchObject({ section: "settings", settingsTab: "audio" });
     expect(toggle).not.toHaveBeenCalled();
@@ -364,4 +365,20 @@ it("shows a closed microphone with a plain reason and opens audio settings when 
     await act(async () => { useSettings.setState({ audio: previousAudio }); useGlobalPtt.setState(previousGlobal); });
     delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
   }
+});
+
+
+it("the microphone setup action has a precise name and no pressed state when PTT has no key", async () => {
+  const previous = useSettings.getState().audio;
+  const toggle = vi.spyOn(controller, "toggleMute");
+  useSettings.getState().setAudio({ inputMode: "ptt", pttKey: null });
+  try {
+    await render(<MicButton />);
+    const button = container.querySelector("button")!;
+    expect(button.getAttribute("aria-label")).toBe("Wybierz klawisz do mówienia w ustawieniach dźwięku");
+    expect(button.hasAttribute("aria-pressed")).toBe(false);
+    await act(async () => button.click());
+    expect(useUi.getState()).toMatchObject({ section: "settings", settingsTab: "audio" });
+    expect(toggle).not.toHaveBeenCalled();
+  } finally { await act(async () => useSettings.setState({ audio: previous })); }
 });

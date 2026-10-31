@@ -64,3 +64,9 @@ configured, `voice_set_ptt` cannot open or close that gate: UI events only refle
 the listener state. The audio pipeline enforces a renewable 250 ms lease; stale
 webview commands cannot renew it. `set_global_ptt` is main-window-only and replaces
 the observer generation atomically. See [push-to-talk](../../../docs/push-to-talk.md).
+
+Global PTT authorization is additionally bound to the native voice owner/run.
+A lease renewal for a held press cannot transfer to a replacement run: the
+voice lock cancels it, and the observer must recover and see a release first.
+Observer-health proofs expire independently of bound-input physical polling;
+missed release callbacks cancel immediately without the configured tail.

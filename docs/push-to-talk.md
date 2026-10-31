@@ -31,7 +31,8 @@ the development app manually if needed). The listener detects a grant without
 another prompt; macOS may require restarting the app. Details are in a dialog,
 with Polish and English UI text. Without access, even a focused-window key cannot
 bypass the closed microphone. The call control also shows a closed microphone
-with the plain-language reason; clicking it opens Audio settings.
+with the plain-language reason; clicking it opens Audio settings. This is a setup
+action with no pressed state or mute shortcut announcement, rather than a toggle.
 
 macOS Caps Lock is explicitly unsupported for held PTT: its toggled state is not
 a reliable physical hold. The saved binding stays visible with an explanation.
@@ -41,7 +42,8 @@ Unsupported keyboard codes remain saved, rather than silently changing bindings.
 ## Failure recovery
 
 The listener polls **only the bound input's** physical held state. A missed
-release closes capture even if the release callback never arrives. A poll can
+release is a failure: physical release with an observed held state cancels
+capture immediately, even with the maximum 1000 ms release delay. A poll can
 close the gate, but cannot open it: opening requires a matched callback and a
 release after listener installation/recovery.
 
@@ -52,13 +54,28 @@ clock changes fail closed. An unavailable/disabled tap, missing callbacks, a
 locked/off-console macOS session, or an unavailable Windows input desktop cancels
 PTT without its release tail. Recovery installs a fresh listener and requires a
 release before another press. A UI status poll restarts a stale supervisor.
-Delayed webview PTT commands cannot reopen native global capture.
+Delayed webview PTT commands cannot reopen native global capture. Authorization
+also belongs to one native voice owner/run. Switching or rejoining voice, or
+replacing the webview owner, cancels the old press under the voice lock and
+requires a physical release before a new press can authorize that run.
 
-Windows uses `WH_KEYBOARD_LL` or `WH_MOUSE_LL` on a dedicated message-pump thread.
-Both callbacks **always return `CallNextHookEx`**, including unrelated events.
-Injected events cannot open PTT. Windows can silently remove a slow hook; physical
-release polling closes an existing hold, and a physical press without a matching
-callback triggers reinstallation. See [Microsoft's low-level hook contract](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelkeyboardproc).
+Observer health has its own 250 ms lease, separate from physical-state polling.
+Only explicit OS health checks (every 100 ms) renew that authorization. A
+latched callback state and a physically held key cannot renew a failed receiver.
+A failed receiver must be reinstalled and released before it can open capture.
+
+Windows uses passive Raw Input (`RIDEV_INPUTSINK`) and a message-only window.
+It never sets `RIDEV_NOLEGACY`, so the focused app still receives normal input.
+This replaces low-level hooks, which Windows can silently evict without a
+queryable health status. The health check verifies that the receiver window and
+its callback still exist and that `GetRegisteredRawInputDevices` still reports
+our exact passive registration. Existing native subscriptions are saved and
+restored when PTT stops; an old observer cannot unregister its replacement.
+Only the bound key/button's state survives the callback; its temporary OS packet
+is discarded, including positions, wheel data, and all unbound input.
+See [Microsoft's monitoring recommendation](https://learn.microsoft.com/en-us/windows/win32/winmsg/lowlevelkeyboardproc),
+[Raw Input](https://learn.microsoft.com/en-us/windows/win32/inputdev/about-raw-input),
+and [registration inspection](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-getregisteredrawinputdevices).
 The macOS implementation uses the [CoreGraphics event tap API](https://developer.apple.com/documentation/coregraphics/cgevent/tapcreate(tap:place:options:eventsofinterest:callback:userinfo:)).
 
 ## Linux and browsers
@@ -80,9 +97,14 @@ to audit. The project remains MIT-licensed.
 Automated coverage includes callback pass-through and bound-key isolation,
 release-before-rearm, missing releases, sleep/clock discontinuities, audio lease
 expiry, release-delay behavior, permission/recovery IPC, stale registrations,
-and lossless settings migration from v6 to v7. Browser screenshots exercise real
+and lossless settings migration from v6 to v7. The PTT recorder owns its listeners
+inside the conditionally mounted PTT controls: changing input mode or hiding
+those controls retires keyboard/mouse capture and the global capture flag.
+Tests also cover owner/run replacement, independent health expiry, missing
+release cancellation, Raw Input matching, setup-button accessibility, and
+production MLS stale-commit retry (the browser fixture tolerates only `stale`). Browser screenshots exercise real
 rendered settings with fixture permission states; they do not establish an OS
 permission grant or physical keyboard/mouse behavior. Real macOS/Windows hardware
 checks must still cover focused games/editors receiving the binding, mouse side
 buttons, modifiers/AltGr, permission grant/revocation, sleep, lock/unlock, secure
-input, and Windows hook eviction.
+input, and Windows receiver/registration loss.

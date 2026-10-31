@@ -158,7 +158,9 @@ try {
   console.log("PASS second recipient device re-renders when history keys arrive");
   // Every remaining device learns the signed revocation; the disposable DS runs --no-connect.
   await a.evaluate(() => window.dm.revoke(21, 2));
-  await b2.evaluate(() => window.dm.revoke(21, 2));
+  // The other remaining device may win the revocation commit. Production keeps
+  // the loser durable and replays the authoritative log on its next sync pass.
+  await b2.evaluate(() => window.dm.revoke(21, 2).catch(error => { if (error?.code !== "stale") throw error; }));
   await sync(a, b2);
   await send(a, "after revocation");
   await b2.getByText("after revocation", { exact: true }).waitFor({ timeout: 45000 });

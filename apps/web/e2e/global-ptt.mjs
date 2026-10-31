@@ -87,6 +87,9 @@ try {
     await page.getByRole("button", { name: "Prawy Alt", exact: true }).click();
     await page.keyboard.press("Escape");
     await page.getByRole("button", { name: "Prawy Alt", exact: true }).waitFor();
+    const delayLabel = page.getByText("Opóźnienie po puszczeniu", { exact: true });
+    assert.ok(await delayLabel.isVisible());
+    assert.ok(await delayLabel.evaluate(el => el.getBoundingClientRect().height < parseFloat(getComputedStyle(el).lineHeight) * 1.5), `${name}: release-delay label wraps`);
     const slider = page.getByRole("slider", { name: "Opóźnienie po puszczeniu klawisza", exact: true });
     assert.equal(await slider.getAttribute("aria-valuenow"), "300");
     await slider.focus(); await page.keyboard.press("Home");

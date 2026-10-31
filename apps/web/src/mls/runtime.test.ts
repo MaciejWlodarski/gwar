@@ -301,6 +301,28 @@ describe("MLS synchronization", () => {
     expect(f.calls.filter(c => c.op === "mls.commit").map(c => c.data.commit)).toEqual(["BA"]);
     expect((await f.durable()).out).toBeNull();
   });
+  it("automatically replays the winning log on the next pass after a stale revocation commit", async () => {
+    const f = await fixture({ ...clean(), groups: [summary()] });
+    const schedule = globalThis.setTimeout;
+    const timers = vi.spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof setTimeout>) => {
+      const [callback, delay, ...values] = args;
+      return schedule(callback, delay === 15_000 ? 30 : delay, ...values);
+    }) as typeof setTimeout);
+    try {
+      f.state().out = pending();
+      f.world.commitError = new RequestError("stale", "stale epoch or incarnation");
+      await expect(f.runtime.sync()).rejects.toMatchObject({ code: "stale" });
+      expect((await f.durable()).out?.commit).toEqual([4]);
+      const attempts = f.calls.filter(c => c.op === "mls.commit").length;
+      f.world.head = 1;
+      f.world.entries = [{ epoch: 0, commit: "CQ", proposals: [] }];
+      expect(timers.mock.calls.some(([, delay]) => delay === 15_000)).toBe(true);
+      await vi.waitFor(async () => { expect((await f.durable()).out).toBeNull(); expect(f.runtime.status(conversation)).toBe("ready"); });
+      expect(f.calls.filter(c => c.op === "mls.commit")).toHaveLength(attempts);
+    } finally {
+      await f.runtime.close(); timers.mockRestore();
+    }
+  });
   it.each(["early", "bad_request", "stale"] as const)("keeps a %s rejected commit for retry", async code => {
     const f = await fixture({ ...clean(), groups: [summary()] });
     f.state().out = pending(); f.world.commitError = new RequestError(code, code);

@@ -131,6 +131,11 @@ impl Observer {
         }
     }
 
+    pub fn check_health(&self) -> bool {
+        // SAFETY: queries this tap and its permission only, never input contents.
+        unsafe { CGPreflightListenEventAccess() && CGEventTapIsEnabled(self.tap) }
+    }
+
     pub fn physical_down(&self) -> Option<bool> {
         // SAFETY: only the bound key/button and session availability are queried.
         unsafe {

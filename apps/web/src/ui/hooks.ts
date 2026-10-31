@@ -234,7 +234,7 @@ export function useShortcuts(): void {
     };
     const mouse = (event: MouseEvent) => {
       const { audio } = useSettings.getState();
-      if (!nativeOwnsPtt() && audio.inputMode === "ptt" && audio.pttKey === mousePttCode(event.button)) controller.setPtt(event.type === "mousedown");
+      if (!nativeOwnsPtt() && audio.inputMode === "ptt" && audio.pttKey && audio.pttKey === mousePttCode(event.button)) controller.setPtt(event.type === "mousedown");
     };
     window.addEventListener("mousedown", mouse);
     window.addEventListener("mouseup", mouse);

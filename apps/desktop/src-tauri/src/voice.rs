@@ -90,8 +90,16 @@ impl Prefs {
     }
 }
 
+#[derive(Default)]
+struct GlobalPttAuthorization {
+    owner: u64,
+    run: u64,
+    armed: bool,
+}
+
 struct Inner {
     owner: u64,
+    global_ptt_authorization: GlobalPttAuthorization,
     startup: Option<Arc<NativeRun>>,
     mic_test: Option<Arc<NativeRun>>,
     mic_test_serial: u64,
@@ -126,6 +134,7 @@ impl Default for Voice {
             cue_deafened: Arc::default(),
             inner: Mutex::new(Inner {
                 owner: 0,
+                global_ptt_authorization: GlobalPttAuthorization::default(),
                 startup: None,
                 mic_test: None,
                 mic_test_serial: 0,
@@ -178,21 +187,44 @@ impl Voice {
     pub fn configure_global_ptt(&self, configured: bool) {
         let mut inner = self.lock();
         self.global_ptt.store(configured, Ordering::Release);
+        inner.global_ptt_authorization =
+            GlobalPttAuthorization { owner: inner.owner, run: self.run.load(Ordering::SeqCst), armed: false };
         inner.prefs.ptt = false;
         if let Some(h) = &inner.handle {
             h.cancel_ptt();
         }
     }
 
-    pub fn renew_global_ptt(&self, down: bool) {
-        let inner = self.lock();
+    /// A held observation authorizes only its original native owner/run. A refusal
+    /// makes the observer retire its backend and require a physical release again.
+    pub fn renew_global_ptt(&self, down: bool) -> bool {
+        let mut inner = self.lock();
+        let run = self.run.load(Ordering::SeqCst);
+        if inner.global_ptt_authorization.owner != inner.owner || inner.global_ptt_authorization.run != run {
+            inner.global_ptt_authorization = GlobalPttAuthorization { owner: inner.owner, run, armed: false };
+            if let Some(h) = &inner.handle {
+                h.cancel_ptt();
+            }
+            return false;
+        }
+        if !down {
+            inner.global_ptt_authorization.armed = true;
+        }
+        if !inner.global_ptt_authorization.armed {
+            if let Some(h) = &inner.handle {
+                h.cancel_ptt();
+            }
+            return false;
+        }
         if let Some(h) = &inner.handle {
             h.set_ptt_leased(down);
         }
+        true
     }
 
     pub fn cancel_global_ptt(&self) {
-        let inner = self.lock();
+        let mut inner = self.lock();
+        inner.global_ptt_authorization.armed = false;
         if let Some(h) = &inner.handle {
             h.cancel_ptt();
         }
@@ -514,6 +546,8 @@ fn starting_voice_retires_idle_cues_and_bootstrap_discards_pending_cues() {
 }
 
 fn clear_run(voice: &Voice, inner: &mut Inner) {
+    inner.global_ptt_authorization.armed = false;
+    inner.prefs.ptt = false;
     retire_idle_cues(inner);
     inner.pending_cues.clear();
     if let Some(startup) = inner.startup.take() {
@@ -1361,6 +1395,56 @@ mod run_tests {
         sync::atomic::{AtomicBool, AtomicUsize},
         task::Poll,
     };
+
+    #[tokio::test]
+    async fn global_ptt_held_presses_do_not_cross_voice_runs_or_owners() {
+        async fn install(
+            voice: &Voice,
+            owner: u64,
+            run: u64,
+        ) -> (
+            tokio::sync::mpsc::Sender<gwar_client::teamspeak::TsAudio>,
+            tokio::sync::mpsc::Receiver<gwar_client::teamspeak::TsMicrophone>,
+        ) {
+            claim_run(voice, owner, run).unwrap();
+            let (incoming, receive) = tokio::sync::mpsc::channel(64);
+            let (send, outgoing) = tokio::sync::mpsc::channel(64);
+            let handle = start_teamspeak(Box::new(FakeIo { tone: true, heard: voice.heard.clone() }), receive, send)
+                .await
+                .unwrap();
+            let mut inner = voice.lock();
+            inner.prefs.mode = InputMode::PushToTalk;
+            inner.prefs.noise = NoiseSuppression::percent(0);
+            inner.prefs.echo = false;
+            inner.prefs.gain = false;
+            inner.prefs.apply(&handle);
+            inner.handle = Some(handle);
+            (incoming, outgoing)
+        }
+        for replacement in ["switch", "rejoin", "owner"] {
+            let voice = Voice::default();
+            let owner = bootstrap_owner(&voice);
+            let (_incoming, mut outgoing) = install(&voice, owner, 1).await;
+            voice.configure_global_ptt(true);
+            voice.renew_global_ptt(false);
+            voice.renew_global_ptt(true);
+            assert!(tokio::time::timeout(Duration::from_secs(1), outgoing.recv()).await.unwrap().is_some());
+            let next_owner = if replacement == "owner" { bootstrap_owner(&voice) } else { owner };
+            if replacement == "rejoin" {
+                retire_run(&voice, owner, 1).unwrap();
+            }
+            let (_next_incoming, mut next_outgoing) =
+                install(&voice, next_owner, if next_owner == owner { 2 } else { 1 }).await;
+            for _ in 0..6 {
+                voice.renew_global_ptt(true); // the observer still sees the original held press
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert!(next_outgoing.try_recv().is_err(), "held PTT crossed {replacement}");
+            }
+            voice.renew_global_ptt(false); // a real release followed by a new press
+            voice.renew_global_ptt(true);
+            assert!(tokio::time::timeout(Duration::from_secs(1), next_outgoing.recv()).await.unwrap().is_some());
+        }
+    }
 
     #[test]
     fn preview_releases_its_device_on_window_pause_and_refuses_muted_capture() {

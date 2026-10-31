@@ -4,6 +4,8 @@
 mod binding;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(windows, test))]
+mod packet;
 #[cfg(windows)]
 mod windows;
 #[cfg(target_os = "macos")]
@@ -81,17 +83,32 @@ struct Safety {
     reset: bool,
     armed: bool,
     previous: Option<SystemTime>,
+    health_proven: Option<SystemTime>,
 }
 #[cfg(any(target_os = "macos", windows, test))]
 impl Safety {
+    /// Only an explicit OS observer-health check can extend this lease.
+    fn prove_health(&mut self, now: SystemTime) {
+        self.health_proven = Some(now);
+    }
+    fn invalidate(&mut self) {
+        self.armed = false;
+        self.reset = true;
+    }
     fn sample(&mut self, now: SystemTime, physical: bool, observed: bool, healthy: bool) -> bool {
+        if self.reset {
+            return false;
+        }
         let gap = self
             .previous
             .replace(now)
             .is_some_and(|last| now.duration_since(last).map_or(true, |gap| gap > Duration::from_millis(200)));
-        if !healthy || gap {
-            self.reset = true;
-            self.armed = false;
+        // The initial healthy sample establishes an installation proof; subsequent
+        // physical polls cannot keep a silently lost observer authorized.
+        let proof = *self.health_proven.get_or_insert(now);
+        let expired = now.duration_since(proof).map_or(true, |age| age >= Duration::from_millis(250));
+        if !healthy || gap || expired || (!physical && observed) {
+            self.invalidate();
             return false;
         }
         if !physical {
@@ -153,6 +170,7 @@ fn observe(app: AppHandle, shared: Arc<Mutex<Inner>>, generation: u64, binding: 
     let mut backend = None;
     let mut safety = Safety::default();
     let mut missing = 0_u8;
+    let mut health_checked = None;
     let mut last_down = None;
     let mut last_notify = std::time::Instant::now();
     loop {
@@ -163,6 +181,7 @@ fn observe(app: AppHandle, shared: Arc<Mutex<Inner>>, generation: u64, binding: 
             signal.healthy.store(true, Ordering::Release);
             safety = Safety::default();
             missing = 0;
+            health_checked = None;
             match platform::Observer::open(binding, signal.clone()) {
                 Ok(observer) => backend = Some(observer),
                 Err(reason) => status = reason,
@@ -171,6 +190,17 @@ fn observe(app: AppHandle, shared: Arc<Mutex<Inner>>, generation: u64, binding: 
         let mut down = false;
         if let Some(observer) = &mut backend {
             observer.pump();
+            let now = SystemTime::now();
+            if health_checked
+                .is_none_or(|last| now.duration_since(last).map_or(true, |age| age >= Duration::from_millis(100)))
+            {
+                health_checked = Some(now);
+                if observer.check_health() {
+                    safety.prove_health(now);
+                } else {
+                    signal.healthy.store(false, Ordering::Release);
+                }
+            }
             match observer.physical_down() {
                 Some(physical) if signal.healthy.load(Ordering::Acquire) => {
                     down = safety.sample(SystemTime::now(), physical, signal.down.load(Ordering::Acquire), true);
@@ -200,8 +230,13 @@ fn observe(app: AppHandle, shared: Arc<Mutex<Inner>>, generation: u64, binding: 
             inner.heartbeat = Some(SystemTime::now());
             let voice = app.state::<Voice>();
             if status == Status::Ready {
-                voice.renew_global_ptt(down);
+                if !voice.renew_global_ptt(down) {
+                    down = false;
+                    safety.invalidate();
+                    status = Status::Recovering;
+                }
             } else {
+                down = false;
                 voice.cancel_global_ptt();
             }
             if inner.status != status {
@@ -268,13 +303,59 @@ pub fn open_ptt_settings(window: WebviewWindow) -> Result<(), String> {
 mod tests {
     use super::*;
     #[test]
+    fn global_ptt_physical_polls_cannot_extend_an_unverified_listener() {
+        let now = SystemTime::now();
+        let mut safety = Safety::default();
+        safety.sample(now, false, false, true);
+        assert!(safety.sample(now + Duration::from_millis(20), true, true, true));
+        let mut allowed = true;
+        for tick in 2..=15 {
+            allowed = safety.sample(now + Duration::from_millis(tick * 20), true, true, true);
+        }
+        assert!(!allowed, "physical polling renewed a silently evicted listener");
+        assert!(safety.reset);
+    }
+
+    #[test]
+    fn global_ptt_fresh_os_health_proofs_allow_long_holds_but_cannot_rearm_a_failed_receiver() {
+        let now = SystemTime::now();
+        let mut safety = Safety::default();
+        safety.prove_health(now);
+        safety.sample(now, false, false, true);
+        for tick in 1..=3000 {
+            let at = now + Duration::from_millis(tick * 20);
+            if tick % 5 == 0 {
+                safety.prove_health(at);
+            }
+            assert!(safety.sample(at, true, true, true));
+        }
+        safety.invalidate();
+        safety.prove_health(now + Duration::from_secs(60));
+        assert!(!safety.sample(now + Duration::from_secs(60), true, true, true));
+    }
+
+    #[test]
+    fn global_ptt_a_missing_release_is_a_failure_instead_of_a_normal_tail() {
+        let now = SystemTime::now();
+        let mut safety = Safety::default();
+        safety.sample(now, false, false, true);
+        assert!(safety.sample(now, true, true, true));
+        assert!(!safety.sample(now, false, true, true));
+        assert!(safety.reset, "a missing callback must cancel capture without its release delay");
+    }
+
+    #[test]
     fn startup_and_resume_need_a_fresh_press_but_lost_release_closes() {
         let now = SystemTime::now();
         let mut s = Safety::default();
         assert!(!s.sample(now, true, true, true));
         assert!(!s.sample(now, false, false, true));
         assert!(s.sample(now, true, true, true));
-        assert!(!s.sample(now, false, true, true)); // lost key-up
+        assert!(!s.sample(now, false, true, true)); // lost key-up retires this backend
+        assert!(s.reset);
+        s = Safety::default(); // a newly installed receiver still needs a release
+        assert!(!s.sample(now, true, true, true));
+        assert!(!s.sample(now, false, false, true));
         assert!(!s.sample(now, true, false, true)); // a poll cannot open the mic
         assert!(s.sample(now, true, true, true));
         assert!(!s.sample(now + Duration::from_secs(30), true, true, true));
