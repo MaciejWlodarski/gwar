@@ -159,13 +159,23 @@ on phones and audio controls stay inside fullscreen.
 - Clippy with `-D warnings`, formatting and the local server build passed.
 - Chromium generated-audio gate passed before and after reconnect at 996.09375 Hz.
   Volume, mute, receiver renewal, audio-end availability and single-output
-  assertions passed. Final RMS: 0.07081 / 0.07090 / 0.07089 (initial / renewed /
+  assertions passed. Final RMS: 0.07079 / 0.07074 / 0.07092 (initial / renewed /
   reconnected). The final sequential run logged no denoise fallback.
 - Chromium/WebKit fixed-1080p60 H.264 screen gate passed, with legacy and paired
-  viewers. After fixing probe credit stealing, all eight unchanged startup cases
-  passed on the final code at 1920×1080. The judge recorded local CPU limitations
-  for both H.264 busy cases; their decoded rates were 54.8 / 59.7 fps. The isolated
-  H.264 busy rerun reached 60.1 fps. No startup assertion was changed.
+  viewers. The round-2 unchanged startup gate completed all eight cases at
+  1920×1080 and the expected 20/60 fps, but **failed two probe-count assertions**
+  (`vp9-busy60-1`: 1; `h264-busy60-0`: 2). It is not a clean startup-gate pass.
+  The initial run failed the same assertion in one H.264 case; removing
+  competing test load did not remove it. The diagnostic infers probes from a
+  ceiling-cap transition and a later GCC estimate: ordinary ceiling writes were
+  followed by estimate drops before its next sample. For example, VP9 rose
+  from 7.344 to its 7.872 Mb/s ceiling after a 9.566 Mb/s estimate, then the
+  diagnostic sampled 6.534 Mb/s. No preceding twelve-second sample was
+  undersized or bandwidth-limited, so the publisher's actual stale-probe
+  conditions were false. That publisher path is unchanged from `d3ce7354`.
+  The test and its assertions remain unchanged. Raw rows and a compact excerpt
+  are retained in `/tmp/gwar-209-r2-startup-results/` and
+  `/tmp/gwar-209-r2-startup-probe-evidence.json`.
 - Full web suite after integrating #206: 2,258 tests passed across 153 files. Focused source-switch
   and UI/controller checks also passed.
 
@@ -188,7 +198,7 @@ CARGO_BUILD_JOBS=4 pnpm --filter web e2e:watch
 node apps/web/e2e/screen-startup.mjs
 ```
 
-A concurrent validation run logged a browser denoise fallback under CPU load;
+A round-1 concurrent validation run logged a browser denoise fallback under CPU load;
 it is not a calibrated voice-latency result. Local source/capture CPU limitations
 are recorded by the unchanged startup judge rather than relaxing its assertions.
 The final audio smoke runs separately from the other browser gates.
