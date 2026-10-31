@@ -435,10 +435,12 @@ class Controller {
         void this.followVoicePresence();
       } else if (before !== now) {
         const conn = this.conn, participation = this.sounds.participation;
+        // Marked before the stop: a rejoin while it is pending is a new participation.
+        const left = now === null && !this.sounds.awaitingRecovery ? this.sounds.leaving() : null;
         const stopped = this.stopVoice();
         void stopped.then(() => {
           if (participation !== this.sounds.participation || this.conn !== conn) return;
-          if (now === null) { if (!this.sounds.awaitingRecovery) this.sounds.left(); }
+          if (now === null) { if (myChannelId(useSession.getState()) === null) left?.(); }
           else {
             const state = useSession.getState(), voice = useVoice.getState().state;
             if (state.phase === "online" && myChannelId(state) === now && !this.sounds.isLeaving && voice !== "starting" && voice !== "connected") return this.followVoicePresence();

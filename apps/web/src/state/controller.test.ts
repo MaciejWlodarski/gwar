@@ -529,6 +529,24 @@ describe("sound cue wiring", () => {
     expect(engine.playSound.mock.calls.map(([cue]) => cue)).toEqual(["selfJoin", "connectionLost"]);
   });
 
+  it("does not let the stop of a server removal confirm a leave over the rejoined call", async () => {
+    connectFake({ channel: 2 }); engine.emitState("connected");
+    await vi.advanceTimersByTimeAsync(1000);
+    let finish!: () => void;
+    engine.stop.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+    link.emit({ ev: "client.updated", d: client(1, null) });
+    await vi.advanceTimersByTimeAsync(0);
+    link.emit({ ev: "client.updated", d: client(1, 2) });
+    await vi.advanceTimersByTimeAsync(1000);
+    engine.emitState("connected");
+    await vi.advanceTimersByTimeAsync(1000);
+    finish();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(engine.playSound.mock.calls.map(([cue]) => cue)).toEqual(["selfJoin", "selfJoin"]);
+    engine.emitState("failed");
+    expect(engine.playSound.mock.calls.map(([cue]) => cue)).toEqual(["selfJoin", "selfJoin", "connectionLost"]);
+  });
+
   it("R4 S2 confirms Leave after a redundant reconnect stop without newer participation", async () => {
     connectFake({ channel: 2 }); engine.emitState("connected");
     await vi.advanceTimersByTimeAsync(1000);
