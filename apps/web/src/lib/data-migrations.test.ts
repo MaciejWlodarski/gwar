@@ -148,6 +148,10 @@ const RECORD_FIXTURES: Record<keyof typeof RECORDS, Record<number, { stored: Rec
 };
 /** The settings (localStorage) per version, and a check of the settings store after loading them. */
 const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: string; bookmarks: unknown[] }): void }> = {
+  7: {
+    stored: { state: { theme: "dark", bookmarks: [], desktop: { openAtLogin: true, startMinimized: true, closeToTray: false }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } } }, version: 7 },
+    check: state => expect(state).toMatchObject({ desktop: { openAtLogin: true, startMinimized: true, closeToTray: false }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } } }),
+  },
   6: {
     stored: { state: { theme: "dark", bookmarks: [], sounds: { enabled: false, volume: 0.25, events: { mute: false } } }, version: 6 },
     check: state => { expect(state).toMatchObject({ sounds: { enabled: false, volume: 0.25, events: { mute: false, peerJoin: true } } }); },
@@ -420,6 +424,16 @@ describe("the settings (localStorage)", () => {
   }
   afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
 
+
+it("migrates v6 desktop and notification preferences without dropping any saved values", async () => {
+  const { useSettings } = await page(memory({}));
+  const migrate = useSettings.persist.getOptions().migrate!;
+  const saved = { desktop: { closeToTray: false, muteShortcut: "Control+KeyM", deafenShortcut: "Control+KeyD" }, notifications: { mentions: false, privateMessages: false, allMessages: true }, sounds: { enabled: false, volume: 0.2, events: { mention: false } }, bookmarks: [{ id: "one", password: "saved", channelPassword: "also-saved" }], unrelatedFutureField: { value: 42 } };
+  const upgraded = await migrate(saved, 6);
+  expect(upgraded).toMatchObject(saved);
+  expect(upgraded).toMatchObject({ desktop: { openAtLogin: false, startMinimized: false }, notificationOverrides: { servers: {}, channels: {} } });
+});
+
   it("restores saved mute and deafen before the voice store is created", async () => {
     const storage = memory({});
     const first = await page(storage);
@@ -469,7 +483,7 @@ describe("the settings (localStorage)", () => {
     const expected = { theme: "dark", onboarding, ...session, audio, sounds: { ...sounds, events: { ...sounds.events, peerJoin: true } } };
     expect(useSettings.getState()).toMatchObject(expected);
     const saved = JSON.parse(storage.getItem(SETTINGS_KEY)!);
-    expect(saved.version).toBe(6);
+    expect(saved.version).toBe(SETTINGS_VERSION);
     expect(saved.state).toMatchObject(expected);
   });
 

@@ -137,15 +137,15 @@ describe("the settings list on a phone", () => {
     expect(row("Language")?.textContent).toBe("LanguageEnglish");
     expect(container.textContent).toContain("Alpha");
 
-    await click(row("Audio"));
+    await click(row("Voice"));
     expect(useUi.getState()).toMatchObject({ settingsTab: "audio", settingsDrill: true });
-    expect(container.querySelector("main header h2")?.textContent).toBe("Audio");
+    expect(container.querySelector("main header h2")?.textContent).toBe("Voice");
     expect(document.activeElement?.textContent).toBe("Back");
 
     // Esc (or Back) leaves the page for the list first, then Settings.
     await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
     expect(useUi.getState()).toMatchObject({ section: "settings", settingsDrill: false });
-    expect(document.activeElement).toBe(row("Audio"));
+    expect(document.activeElement).toBe(row("Voice"));
     await act(async () => window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true })));
     expect(useUi.getState().section).toBe("home");
   });
@@ -342,7 +342,7 @@ describe("phone steps as browser history", () => {
     await nav(() => history.back());
     expect(ui()).toMatchObject({ section: "settings", settingsTab: "audio", settingsDrill: true });
     expect(ui().setSection).toBe(setSection);
-    expect(container.querySelector("main header h2")?.textContent).toBe("Audio");
+    expect(container.querySelector("main header h2")?.textContent).toBe("Voice");
     // An entry without a view of ours is the base view.
     await nav(() => history.forward());
     expect(ui()).toMatchObject({ section: "servers", pane: "list" });

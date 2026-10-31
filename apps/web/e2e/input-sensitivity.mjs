@@ -231,7 +231,7 @@ try {
     "Automatic/manual/PTT share a fixed-height control slot. Checked for horizontal overflow, three-line copy, and mode layout shifts at every width. Noise suppression on/off uses the real preview processor.",
     "The meter is measured by the app from a generated 440 Hz sine: -70 dBFS below, -30 dBFS above.",
     "Automatic retains the legacy server decision (-50 dBov, or -60 with voice activity, with a 400 ms tail). Manual screenshots use -50 dBFS.",
-    "Preview capture: granted permission starts on Audio settings; PTT, mute, deafen, handover, page/tab exit, visibility and window blur stop tracks synchronously. Unknown permission waits for the explicit button.",
+    "Preview capture: granted permission starts on Voice settings; PTT, mute, deafen, handover, page/tab exit, visibility and window blur stop tracks synchronously. Unknown permission waits for the explicit button.",
     ...screenshots, `Real AudioWorklet output levels (dBFS): ${JSON.stringify(levels)}`, "",
   ].join("\n"));
   console.log(JSON.stringify({ output, screenshots: screenshots.length, exits, levels }));
