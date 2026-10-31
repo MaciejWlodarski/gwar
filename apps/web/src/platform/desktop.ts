@@ -98,9 +98,11 @@ export function initDesktop(): (() => void) | undefined {
     const sharing = () => useScreen.getState().own !== null;
     const pushTray = () => {
       const { muted, deafened } = useVoice.getState();
-      void api.invoke("tray_set_state", { muted, deafened, sharing: sharing() });
+      void api.invoke("tray_set_state", { muted, deafened, sharing: sharing(), language: useSettings.getState().language, unread: Object.values(useSession.getState().threads).some(t => t.unread > 0) });
     };
     pushTray();
+    cleanup(useSettings.subscribe((s, prev) => s.language !== prev.language ? pushTray() : undefined));
+    cleanup(useSession.subscribe(pushTray));
     cleanup(useVoice.subscribe((s, prev) => (s.muted !== prev.muted || s.deafened !== prev.deafened ? pushTray() : undefined)));
     // "Stop sharing screen" in the tray, from the picker until the share ends.
     cleanup(useScreen.subscribe((s, prev) => ((s.own !== null) !== (prev.own !== null) ? pushTray() : undefined)));

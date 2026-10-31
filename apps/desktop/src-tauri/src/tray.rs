@@ -5,7 +5,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{
     AppHandle, Emitter, Manager, State,
     image::Image,
@@ -14,6 +14,8 @@ use tauri::{
 };
 
 pub struct Tray {
+    toggle: MenuItem<tauri::Wry>,
+    quit: MenuItem<tauri::Wry>,
     mute: CheckMenuItem<tauri::Wry>,
     deafen: CheckMenuItem<tauri::Wry>,
     stop_share: MenuItem<tauri::Wry>,
@@ -45,11 +47,11 @@ fn toggle_main(app: &AppHandle) {
 }
 
 pub fn install(app: &AppHandle) -> tauri::Result<()> {
-    let toggle = MenuItem::with_id(app, "toggle", "Show / Hide Voice", true, None::<&str>)?;
+    let toggle = MenuItem::with_id(app, "toggle", "Show / hide Gwar", true, None::<&str>)?;
     let mute = CheckMenuItem::with_id(app, "mute", "Mute microphone", true, false, None::<&str>)?;
     let deafen = CheckMenuItem::with_id(app, "deafen", "Deafen", true, false, None::<&str>)?;
     let stop_share = MenuItem::with_id(app, "stop_share", "Stop sharing screen", false, None::<&str>)?;
-    let quit = MenuItem::with_id(app, "quit", "Quit Voice", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "quit", "Quit Gwar", true, None::<&str>)?;
     let menu = Menu::with_items(
         app,
         &[
@@ -92,32 +94,100 @@ pub fn install(app: &AppHandle) -> tauri::Result<()> {
             }
         })
         .build(app)?;
-    app.manage(Tray { mute, deafen, stop_share });
+    app.manage(Tray { toggle, quit, mute, deafen, stop_share });
     Ok(())
 }
 
-/// The tray's tooltip: sharing first, since it is what others see.
-fn tooltip(muted: bool, deafened: bool, sharing: bool) -> &'static str {
+/// The renderer sends a locale, never arbitrary native menu text.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    Pl,
+    En,
+}
+
+fn labels(language: Language) -> [&'static str; 8] {
+    match language {
+        Language::Pl => [
+            "Pokaż / ukryj Gwar",
+            "Zakończ Gwar",
+            "Wycisz mikrofon",
+            "Wyłącz dźwięk",
+            "Zakończ udostępnianie ekranu",
+            "Gwar (udostępniasz ekran)",
+            "Gwar (dźwięk wyłączony)",
+            "Gwar (mikrofon wyciszony)",
+        ],
+        Language::En => [
+            "Show / hide Gwar",
+            "Quit Gwar",
+            "Mute microphone",
+            "Deafen",
+            "Stop sharing screen",
+            "Gwar (sharing your screen)",
+            "Gwar (deafened)",
+            "Gwar (muted)",
+        ],
+    }
+}
+
+fn tooltip(language: Language, muted: bool, deafened: bool, sharing: bool) -> &'static str {
+    let text = labels(language);
     if sharing {
-        "Gwar (sharing your screen)"
+        text[5]
     } else if deafened {
-        "Voice (deafened)"
+        text[6]
     } else if muted {
-        "Voice (muted)"
+        text[7]
     } else {
         "Gwar"
     }
 }
 
-/// The UI reports the current mute/deafen state, and whether this device shares its screen, so
-/// the tray stays in sync.
+/// Draw a template-safe status dot or mute slash on the original silhouette.
+fn status_icon(muted: bool, unread: bool) -> tauri::Result<Image<'static>> {
+    let base = Image::from_bytes(include_bytes!("../icons/tray.png"))?;
+    let (w, h) = (base.width(), base.height());
+    let mut rgba = base.rgba().to_vec();
+    if muted || unread {
+        for y in 0..h {
+            for x in 0..w {
+                let dot = unread && x >= w * 3 / 4 && y >= h * 3 / 4;
+                let slash = muted && (x as i32 + y as i32 - w as i32).abs() <= 1;
+                if dot || slash {
+                    let i = ((y * w + x) * 4) as usize;
+                    rgba[i..i + 4].copy_from_slice(&[0, 0, 0, 255]);
+                }
+            }
+        }
+    }
+    Ok(Image::new_owned(rgba, w, h))
+}
+
 #[tauri::command]
-pub fn tray_set_state(app: AppHandle, tray: State<'_, Tray>, muted: bool, deafened: bool, sharing: bool) {
+pub fn tray_set_state(
+    app: AppHandle,
+    tray: State<'_, Tray>,
+    muted: bool,
+    deafened: bool,
+    sharing: bool,
+    language: Language,
+    unread: bool,
+) {
+    let text = labels(language);
+    let _ = tray.toggle.set_text(text[0]);
+    let _ = tray.quit.set_text(text[1]);
+    let _ = tray.mute.set_text(text[2]);
+    let _ = tray.deafen.set_text(text[3]);
+    let _ = tray.stop_share.set_text(text[4]);
     let _ = tray.mute.set_checked(muted);
     let _ = tray.deafen.set_checked(deafened);
     let _ = tray.stop_share.set_enabled(sharing);
     if let Some(icon) = app.tray_by_id("main") {
-        let _ = icon.set_tooltip(Some(tooltip(muted, deafened, sharing)));
+        let _ = icon.set_tooltip(Some(tooltip(language, muted, deafened, sharing)));
+        if let Ok(image) = status_icon(muted || deafened, unread) {
+            let _ = icon.set_icon(Some(image));
+        }
     }
 }
 
@@ -128,11 +198,22 @@ pub fn set_close_to_tray(state: State<'_, CloseToTray>, enabled: bool) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     #[test]
-    fn sharing_shows_in_the_tooltip_first() {
-        assert_eq!(super::tooltip(true, true, true), "Gwar (sharing your screen)");
-        assert_eq!(super::tooltip(true, true, false), "Voice (deafened)");
-        assert_eq!(super::tooltip(true, false, false), "Voice (muted)");
-        assert_eq!(super::tooltip(false, false, false), "Gwar");
+    fn localized_labels_and_priority() {
+        assert_eq!(tooltip(Language::Pl, true, true, true), "Gwar (udostępniasz ekran)");
+        assert_eq!(tooltip(Language::En, true, true, false), "Gwar (deafened)");
+        assert_eq!(tooltip(Language::Pl, true, false, false), "Gwar (mikrofon wyciszony)");
+        for language in [Language::En, Language::Pl] {
+            assert!(labels(language)[0].contains("Gwar"));
+            assert!(labels(language)[1].contains("Gwar"));
+            assert_eq!(tooltip(language, false, false, false), "Gwar");
+        }
+    }
+    #[test]
+    fn status_changes_the_icon() {
+        let base = status_icon(false, false).unwrap();
+        assert_ne!(base.rgba(), status_icon(true, false).unwrap().rgba());
+        assert_ne!(base.rgba(), status_icon(false, true).unwrap().rgba());
     }
 }
