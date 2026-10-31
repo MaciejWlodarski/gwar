@@ -26,6 +26,14 @@ try {
           const box = await dialog.boundingBox();
           assert.ok(box.x >= 0 && box.y >= 0 && box.x + box.width <= width + 1 && box.y + box.height <= height + 1, `${name}: dialog outside viewport`);
         }
+        if (["settings", "recording", "playing", "restored-preview"].includes(name)) {
+          const fits = await page.locator("[data-mic-playback] [role=status]").evaluate(el => {
+            const range = document.createRange(); range.selectNodeContents(el);
+            const rects = [...range.getClientRects()], box = el.getBoundingClientRect();
+            return rects.length === 1 && rects.every(rect => rect.left >= box.left - 1 && rect.right <= box.right + 1) && el.scrollWidth <= el.clientWidth;
+          });
+          assert.ok(fits, `${device}/${theme}/${name}: status wraps or clips`);
+        }
         const file = `${device}-${theme}-${name}-pl.png`;
         await page.screenshot({ path: path.join(output, file), animations: "disabled" });
         shots.push(file);
@@ -36,13 +44,23 @@ try {
       await hear.scrollIntoViewIfNeeded();
       await shot("settings");
       await hear.click();
-      await page.getByText("Mów teraz — nagrywanie 3 s…", { exact: true }).waitFor();
+      await page.getByText("Mów teraz…", { exact: true }).waitFor();
+      // Assert a live recording meter, rather than photographing the first zero frame.
+      await page.waitForFunction(() => Number(document.querySelector('[role=meter]')?.getAttribute("aria-valuenow")) >= 50);
+      await page.evaluate(() => window.fixtureSetGain(0));
+      await page.waitForFunction(() => Number(document.querySelector('[role=meter]')?.getAttribute("aria-valuenow")) <= 20);
+      await page.evaluate(() => window.fixtureSetGain(.03));
+      await page.waitForFunction(() => Number(document.querySelector('[role=meter]')?.getAttribute("aria-valuenow")) >= 50);
+      await page.getByText("Mów teraz…", { exact: true }).waitFor();
       await shot("recording");
-      await page.getByText("Odsłuch — mikrofon wyłączony.", { exact: true }).waitFor();
+      await page.getByText("Odsłuch…", { exact: true }).waitFor();
       assert.ok(await page.evaluate(() => window.fixtureTracks.every(t => t.readyState === "ended")), "Capture remains live during replay");
-      assert.ok(await page.evaluate(() => window.fixtureReplays.length === 1 && window.fixtureReplays[0].liveInputs === 0), "No audible sample, or feedback path");
+      assert.ok(await page.evaluate(() => window.fixtureReplays.length === 1 && window.fixtureReplays[0].liveInputs === 0 && window.fixtureReplays[0].rms > .005), "No audible sample, or feedback path");
       await shot("playing");
       await hear.waitFor();
+      await page.waitForFunction(() => window.fixtureTracks.filter(track => track.readyState === "live").length === 1 && Number(document.querySelector('[role=meter]')?.getAttribute("aria-valuenow")) >= 50);
+      assert.ok(await page.evaluate(() => window.fixtureSampleReleased()), "Completed sample retains buffers or callbacks");
+      await shot("restored-preview");
       // Focus/visibility cancellation is synchronous and never starts another sample automatically.
       await hear.click();
       assert.ok(await page.evaluate(() => { window.dispatchEvent(new Event("blur")); return window.fixtureTracks.every(t => t.readyState === "ended"); }));
@@ -81,6 +99,6 @@ try {
     }
   }
   assert.deepEqual(errors, []);
-  await writeFile(path.join(output, "README.md"), `# Voice UX screenshots\n\n${shots.length} screenshots of production React components in a local offline fixture. Polish, both themes, desktop 1440x900, tablet 768x1024, 390x844 and 360x800. Generated microphone tone; no OS microphone or Gwar/TeamSpeak connection. Device labels and participants are fixture data.\n\nChecked: no page overflow; dialogs fit; local mute retains 45% volume; stable-uid settings; visible join controls; record then playback with zero live input tracks; synchronous blur cancellation.\n\n${shots.map(s => `- ${s}`).join("\n")}\n`);
+  await writeFile(path.join(output, "README.md"), `# Voice UX screenshots\n\n${shots.length} screenshots of production React components in a local offline fixture. Polish, both themes, desktop 1440x900, tablet 768x1024, 390x844 and 360x800. Generated microphone tone; no OS microphone or Gwar/TeamSpeak connection. Device labels and participants are fixture data.\n\nChecked: no page overflow; dialogs fit; local mute retains 45% volume; stable-uid settings; visible join controls; record then playback with zero live input tracks; synchronous blur cancellation; live recording level follows input changes; completed samples release buffers/callbacks and restore the eligible silent preview; idle/record/play status fits on one line.\n\n${shots.map(s => `- ${s}`).join("\n")}\n`);
   console.log(`PASS: ${shots.length} screenshots and offline voice UX assertions. ${output}`);
 } finally { await browser.close(); }

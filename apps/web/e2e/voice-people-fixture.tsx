@@ -34,22 +34,38 @@ useVoice.setState({ state: view === "settings" ? "idle" : "connected", muted: fa
 // The real engine records/decodes/replays a generated tone. The OS mic is never opened.
 Object.defineProperty(navigator, "permissions", { configurable: true, value: { query: async () => ({ state: "granted" }) } });
 const tracks: MediaStreamTrack[] = [];
-const replays: Array<{ liveInputs: number }> = [];
-Object.assign(window, { fixtureTracks: tracks, fixtureReplays: replays });
+const replays: Array<{ liveInputs: number; rms: number }> = [];
+const sources: WeakRef<AudioBufferSourceNode>[] = [], recorders: WeakRef<MediaRecorder>[] = [];
+let currentGain: GainNode | null = null;
+const Recorder = MediaRecorder;
+window.MediaRecorder = class extends Recorder {
+  constructor(stream: MediaStream, options?: MediaRecorderOptions) { super(stream, options); recorders.push(new WeakRef(this)); }
+};
+Object.assign(window, {
+  fixtureTracks: tracks, fixtureReplays: replays,
+  fixtureSetGain: (value: number) => { if (currentGain) currentGain.gain.value = value; },
+  fixtureSampleReleased: () => sources.every(ref => { const node = ref.deref(); return !node || (node.buffer === null && node.onended === null); }) &&
+    recorders.every(ref => { const recorder = ref.deref(); return !recorder || (!recorder.ondataavailable && !recorder.onstop && !recorder.onerror); }),
+});
 const createBufferSource = AudioContext.prototype.createBufferSource;
 AudioContext.prototype.createBufferSource = function () {
   const source = createBufferSource.call(this), start = source.start.bind(source);
-  source.start = (...args) => { replays.push({ liveInputs: tracks.filter(track => track.readyState === "live").length }); start(...args); };
+  sources.push(new WeakRef(source));
+  source.start = (...args) => {
+    const pcm = source.buffer?.getChannelData(0) ?? [];
+    const rms = Math.sqrt(pcm.reduce((sum, sample) => sum + sample * sample, 0) / Math.max(1, pcm.length));
+    replays.push({ liveInputs: tracks.filter(track => track.readyState === "live").length, rms }); start(...args);
+  };
   return source;
 };
 navigator.mediaDevices.getUserMedia = async () => {
   const ctx = new AudioContext();
   const tone = ctx.createOscillator(), gain = ctx.createGain(), destination = ctx.createMediaStreamDestination();
-  gain.gain.value = 0.03;
+  gain.gain.value = 0.03; currentGain = gain;
   tone.connect(gain).connect(destination); tone.start(); await ctx.resume();
   const track = destination.stream.getAudioTracks()[0]!, stop = track.stop.bind(track);
   tracks.push(track);
-  track.stop = () => { if (track.readyState === "ended") return; stop(); tone.stop(); void ctx.close(); };
+  track.stop = () => { if (track.readyState === "ended") return; stop(); tone.stop(); if (currentGain === gain) currentGain = null; void ctx.close(); };
   return destination.stream;
 };
 controller.voice.listDevices = async () => ({ inputs: [{ id: "fixture-input", label: "Mikrofon zestawu słuchawkowego" }], outputs: [{ id: "fixture-output", label: "Słuchawki" }] });

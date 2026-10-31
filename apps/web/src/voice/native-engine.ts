@@ -447,13 +447,13 @@ export class NativeVoiceEngine implements VoiceEngine {
   }
 
   startMicTest(onLevel: (level: number) => void, signal?: AbortSignal, playback?: MicTestPlayback): Promise<() => void> {
-    return this.micTests.start(async aborted => {
+    return this.micTests.start(async (aborted, complete) => {
       if (this.state !== "idle" || this.muted || this.deafened || aborted.aborted) return () => {};
-      return this.openMicTest(onLevel, aborted, playback);
+      return this.openMicTest(onLevel, aborted, complete, playback);
     }, signal);
   }
 
-  private async openMicTest(onLevel: (level: number) => void, signal: AbortSignal, playback?: MicTestPlayback): Promise<() => void | Promise<void>> {
+  private async openMicTest(onLevel: (level: number) => void, signal: AbortSignal, complete: () => Promise<boolean>, playback?: MicTestPlayback): Promise<() => void | Promise<void>> {
     const test = ++this.micTestId;
     // Apply queued mute/device controls before the native preview checks its capture policy.
     await this.queue;
@@ -469,6 +469,7 @@ export class NativeVoiceEngine implements VoiceEngine {
     const offState = playback ? await api.listen<{ owner: number; test: number; state: "recording" | "playing" | "idle"; error?: string }>("voice://test-state", p => {
       if (p.owner !== owner || p.test !== test || test !== this.micTestId || signal.aborted) return;
       if (p.error) playback.error(new VoiceError("output_failed", p.error));
+      else if (p.state === "idle") void complete().then(current => { if (current) playback.phase("idle"); });
       else playback.phase(p.state);
     }) : () => {};
     // Listener setup can finish after a newer test has already opened capture.

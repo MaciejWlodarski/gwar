@@ -29,3 +29,11 @@ describe("dictionaries", () => {
     expect(translate("en", countKey("en", "chat.users", 2), { count: 2 })).toBe("2 users in voice");
   });
 });
+
+it("keeps microphone test prompts brief enough for a 360 px action row", () => {
+  for (const dictionary of [pl, en]) {
+    expect(dictionary["audio.recording"].length).toBeLessThanOrEqual(16);
+    expect(dictionary["audio.playing"].length).toBeLessThanOrEqual(16);
+    expect(dictionary["audio.listenHint"].length).toBeLessThanOrEqual(32);
+  }
+});

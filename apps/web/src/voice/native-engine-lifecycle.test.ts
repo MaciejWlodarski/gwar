@@ -446,3 +446,23 @@ it("applies the same person's saved gain to replacement native receive slots", a
   expect(bridge.invoke).toHaveBeenLastCalledWith("voice_stop", expect.anything());
   expect(bridge.invoke).toHaveBeenCalledWith("voice_set_slot_gain", { owner: 1, slot: 0, gain: 1 });
 });
+
+it.each([false, true])("reports native sample completion only after retirement, unless cancelled (%s)", async cancelled => {
+  const closed = deferred<void>(), invoke = bridge.invoke.getMockImplementation()!;
+  bridge.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+    if (command === "mic_test_stop") await closed.promise;
+    return invoke(command, args);
+  });
+  const view = engine(), phase = vi.fn(), abort = new AbortController();
+  await view.startMicTest(vi.fn(), abort.signal, { phase, error: vi.fn() });
+  emit("voice://test-state", { owner: 1, test: 1, state: "idle" });
+  await Promise.resolve();
+  expect(phase).not.toHaveBeenCalledWith("idle");
+  if (cancelled) abort.abort();
+  closed.resolve();
+  await vi.waitFor(() => expect((view as unknown as { micTests: { runs: Set<unknown> } }).micTests.runs.size).toBe(0));
+  if (cancelled) expect(phase).not.toHaveBeenCalled();
+  else expect(phase).toHaveBeenCalledExactlyOnceWith("idle");
+  expect(listeners.get("voice://test-state")?.size).toBe(0);
+  expect(listeners.get("voice://test-level")?.size).toBe(0);
+});

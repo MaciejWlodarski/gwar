@@ -11,6 +11,7 @@ import { dbToLevel } from "./input-sensitivity";
 export type InputMode = "vad" | "ptt";
 export type MicPermission = "granted" | "prompt" | "denied" | "unknown";
 export interface MicTestPlayback {
+  /** Natural idle is reported only after the run, recording and playback resources retire. */
   phase(value: "recording" | "playing" | "idle"): void;
   error(error: unknown): void;
 }

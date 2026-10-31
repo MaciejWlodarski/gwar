@@ -808,13 +808,13 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   }
 
   startMicTest(onLevel: (level: number) => void, signal?: AbortSignal, playback?: MicTestPlayback): Promise<() => void> {
-    return this.micTests.start(async aborted => {
+    return this.micTests.start(async (aborted, complete) => {
       if (this.state !== "idle" || this.muted || this.deafened || aborted.aborted) return () => {};
-      return this.openMicTest(onLevel, aborted, playback);
+      return this.openMicTest(onLevel, aborted, complete, playback);
     }, signal);
   }
 
-  private async openMicTest(onLevel: (level: number) => void, signal: AbortSignal, playback?: MicTestPlayback): Promise<() => void> {
+  private async openMicTest(onLevel: (level: number) => void, signal: AbortSignal, complete: () => Promise<boolean>, playback?: MicTestPlayback): Promise<() => void> {
     const stream = await this.getStream(() => !signal.aborted);
     if (signal.aborted) { stream.getTracks().forEach(track => track.stop()); return () => {}; }
     let ctx: AudioContext;
@@ -844,6 +844,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       let recorder: MediaRecorder | null = null;
       let sampleTimer: ReturnType<typeof setTimeout> | null = null;
       let replay: AudioBufferSourceNode | null = null;
+      const chunks: Blob[] = [];
       const recording = playback ? ctx.createMediaStreamDestination() : null;
       if (recording) source.connect(recording);
       const retarget = () => {
@@ -887,20 +888,38 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         if (cancelled) return;
         cancelled = true;
         if (sampleTimer) clearTimeout(sampleTimer);
-        if (recorder?.state === "recording") recorder.stop();
+        sampleTimer = null;
+        if (recorder) {
+          const held = recorder;
+          recorder = null;
+          held.ondataavailable = held.onstop = held.onerror = null;
+          if (held.state === "recording") held.stop();
+        }
+        chunks.length = 0;
         closeCapture();
-        replay?.stop();
-        replay?.disconnect();
+        if (replay) {
+          const held = replay;
+          replay = null;
+          held.onended = null;
+          held.stop();
+          held.disconnect();
+          held.buffer = null;
+        }
       };
       if (recording && playback) {
         try {
           recorder = new MediaRecorder(recording.stream);
-          const chunks: Blob[] = [];
           recorder.ondataavailable = event => { if (!cancelled && event.data.size) chunks.push(event.data); };
-          recorder.onerror = () => { stop(); playback.error(new VoiceError("mic_failed", "Microphone recording failed")); };
+          const failed = (error: unknown) => {
+            void complete().then(current => { if (current) playback.error(error); });
+          };
+          recorder.onerror = () => failed(new VoiceError("mic_failed", "Microphone recording failed"));
           recorder.onstop = () => {
             // The input device is closed before any speaker receives the sample.
             closeCapture();
+            if (recorder) recorder.ondataavailable = recorder.onstop = recorder.onerror = null;
+            recorder = null;
+            sampleTimer = null;
             if (cancelled || signal.aborted) return;
             void (async () => {
               try {
@@ -912,10 +931,13 @@ export class WebRtcVoiceEngine implements VoiceEngine {
                 replay = output.createBufferSource();
                 replay.buffer = buffer;
                 replay.connect(this.master!);
-                replay.onended = () => { replay?.disconnect(); if (!cancelled) playback.phase("idle"); };
+                replay.onended = () => {
+                  void complete().then(current => { if (current) playback.phase("idle"); });
+                };
                 playback.phase("playing");
                 replay.start();
-              } catch (error) { if (!cancelled && !signal.aborted) playback.error(error); }
+              } catch (error) { if (!cancelled && !signal.aborted) failed(error); }
+              finally { chunks.length = 0; }
             })();
           };
           recorder.start();

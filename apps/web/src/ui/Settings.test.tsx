@@ -115,7 +115,7 @@ it.each(exits)("cancels recording and playback synchronously on %s", async (_nam
   expect(playback).toBeDefined();
   expect(container.textContent).toContain("Speak now");
   await act(async () => playback!.phase("playing"));
-  expect(container.textContent).toContain("microphone off");
+  expect(container.textContent).toContain("Playing…");
   await act(async () => {
     leave();
     expect(signal!.aborted).toBe(true);
@@ -241,4 +241,71 @@ it.each([
     expect(signal.aborted).toBe(true);
   });
   expect(voice.startMicTest.mock.calls.at(-1)![2]).toBeUndefined();
+});
+
+it("restores the eligible sensitivity preview after completed playback has retired", async () => {
+  const stopped = vi.fn();
+  voice.startMicTest.mockResolvedValueOnce(() => {}).mockResolvedValueOnce(stopped).mockResolvedValue(() => {});
+  await mount();
+  await act(async () => button("Hear yourself").click());
+  const [, sampleSignal, playback] = voice.startMicTest.mock.calls[1]!;
+  await act(async () => playback!.phase("playing"));
+  await act(async () => playback!.phase("idle"));
+  expect(sampleSignal!.aborted).toBe(true);
+  expect(stopped).toHaveBeenCalledOnce();
+  expect(voice.startMicTest).toHaveBeenCalledTimes(3);
+  expect(voice.startMicTest.mock.calls[2]![2]).toBeUndefined();
+  await act(async () => voice.startMicTest.mock.calls[2]![0](0.64));
+  expect(meter().getAttribute("aria-valuenow")).toBe("64");
+});
+
+it("shows fresh microphone levels while recording and ignores the old preview's levels", async () => {
+  await mount();
+  const oldLevel = voice.startMicTest.mock.calls[0]![0];
+  await act(async () => button("Hear yourself").click());
+  const [sampleLevel, , playback] = voice.startMicTest.mock.calls[1]!;
+  await act(async () => { playback!.phase("recording"); sampleLevel(0.7); oldLevel(0); });
+  expect(meter().getAttribute("aria-valuenow")).toBe("70");
+  await act(async () => sampleLevel(0.4));
+  expect(meter().getAttribute("aria-valuenow")).toBe("40");
+});
+
+it.each(["prompt", "denied", "unknown"] as const)("does not restore capture automatically when permission becomes %s", async permission => {
+  await mount();
+  await act(async () => button("Hear yourself").click());
+  const playback = voice.startMicTest.mock.calls[1]![2]!;
+  voice.micPermission.mockResolvedValue(permission);
+  await act(async () => playback.phase("idle"));
+  expect(voice.startMicTest).toHaveBeenCalledTimes(2);
+  expect(button("Enable microphone preview")).toBeDefined();
+});
+
+it("finishes a PTT sample without opening an automatic preview", async () => {
+  useSettings.getState().setAudio({ inputMode: "ptt" });
+  await mount();
+  await act(async () => button("Hear yourself").click());
+  const [, signal, playback] = voice.startMicTest.mock.calls[0]!;
+  await act(async () => playback!.phase("idle"));
+  expect(signal!.aborted).toBe(true);
+  expect(voice.startMicTest).toHaveBeenCalledOnce();
+});
+
+it.each(exits)("never restores preview from a late playback completion after %s", async (_name, leave) => {
+  await mount();
+  await act(async () => button("Hear yourself").click());
+  const playback = voice.startMicTest.mock.calls[1]![2]!;
+  await act(async () => leave());
+  const count = voice.startMicTest.mock.calls.length;
+  await act(async () => playback.phase("idle"));
+  expect(voice.startMicTest).toHaveBeenCalledTimes(count);
+});
+
+it("restores the silent meter after Stop test without restarting audible playback", async () => {
+  await mount();
+  await act(async () => button("Hear yourself").click());
+  const signal = voice.startMicTest.mock.calls[1]![1]!;
+  await act(async () => button("Stop test").click());
+  expect(signal.aborted).toBe(true);
+  expect(voice.startMicTest).toHaveBeenCalledTimes(3);
+  expect(voice.startMicTest.mock.calls[2]![2]).toBeUndefined();
 });

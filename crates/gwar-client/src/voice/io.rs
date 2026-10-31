@@ -586,20 +586,24 @@ fn guarded<T>(what: &str, call: impl FnOnce() -> T) -> Result<T> {
     })
 }
 
+fn device_offer(host: &cpal::Host, side: Side) -> Offer {
+    match side {
+        Side::Input => Offer {
+            default: host.default_input_device().as_ref().and_then(device_name),
+            names: names(host.input_devices()),
+        },
+        Side::Output => Offer {
+            default: host.default_output_device().as_ref().and_then(device_name),
+            names: names(host.output_devices()),
+        },
+    }
+}
+
 impl Backend for Cpal {
     type Stream = cpal::Stream;
 
     fn offer(&self, side: Side) -> Offer {
-        let read = || match side {
-            Side::Input => Offer {
-                default: self.host.default_input_device().as_ref().and_then(device_name),
-                names: names(self.host.input_devices()),
-            },
-            Side::Output => Offer {
-                default: self.host.default_output_device().as_ref().and_then(device_name),
-                names: names(self.host.output_devices()),
-            },
-        };
+        let read = || device_offer(&self.host, side);
         let last = &self.offers[lane_index(side)];
         match guarded("audio device enumeration", read) {
             Ok(offer) => *last.borrow_mut() = offer,
@@ -745,6 +749,28 @@ fn open_output(
     Ok(stream)
 }
 
+/// Uses the same saved-device and failed-open fallback decisions as the voice router.
+fn open_sample_output<T>(
+    wanted: Option<String>,
+    offer: &Offer,
+    mut open: impl FnMut(&Route) -> Result<T>,
+) -> Result<T> {
+    let now = Instant::now();
+    let mut follow = Follow::new(wanted, false);
+    loop {
+        let Plan::Open(route) = follow.plan(offer, now) else {
+            anyhow::bail!("no output device found");
+        };
+        match open(&route) {
+            Ok(stream) => return Ok(stream),
+            Err(error) => match &route {
+                Route::Named(name) => follow.bench(name, now),
+                Route::Default(_) => return Err(error),
+            },
+        }
+    }
+}
+
 /// Play a microphone sample only after its caller has closed capture. Cancellation
 /// is also checked by the device callback, so hiding the window silences it at once.
 pub fn play_sample(output: Option<String>, samples: Vec<f32>, cancelled: Arc<AtomicBool>) -> anyhow::Result<()> {
@@ -758,18 +784,25 @@ pub fn play_sample(output: Option<String>, samples: Vec<f32>, cancelled: Arc<Ato
         return Ok(());
     }
     let timing = Arc::new(OutputTiming::default());
-    let route = output.map_or(Route::Default(None), Route::Named);
+    let host = cpal::default_host();
+    let offer = guarded("audio device enumeration", || device_offer(&host, Side::Output))?;
     let active = Arc::new(AtomicU64::new(1));
     let trouble: TroubleFn = Arc::new(|e| tracing::debug!("microphone sample output: {e:?}"));
-    let _stream = open_output(
-        &cpal::default_host(),
-        &route,
-        Arc::new(Mutex::new(rx)),
-        timing,
-        (active, 1),
-        trouble,
-        vec![cancelled.clone()],
-    )?;
+    let received = Arc::new(Mutex::new(rx));
+    let _stream = open_sample_output(output, &offer, |route| {
+        anyhow::ensure!(!cancelled.load(Ordering::SeqCst), "microphone sample cancelled");
+        guarded("opening a microphone sample output", || {
+            open_output(
+                &host,
+                route,
+                received.clone(),
+                timing.clone(),
+                (active.clone(), 1),
+                trouble.clone(),
+                vec![cancelled.clone()],
+            )
+        })
+    })?;
     let deadline = Instant::now() + duration + Duration::from_millis(500);
     while tx.slots() < tx.buffer().capacity() && Instant::now() < deadline {
         if cancelled.load(Ordering::SeqCst) {
@@ -896,6 +929,29 @@ impl AudioIo for DeviceIo {
 mod tests {
     use super::{OutputTiming, Resampler};
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn sample_output_uses_the_default_when_the_saved_headset_is_unplugged() {
+        let offer = super::Offer { default: Some("Speakers".into()), names: vec!["Speakers".into()] };
+        let route = super::open_sample_output(Some("Headset".into()), &offer, |route| Ok(route.clone())).unwrap();
+        assert_eq!(route, super::Route::Default(Some("Speakers".into())));
+    }
+
+    #[test]
+    fn sample_output_falls_back_when_the_present_headset_cannot_open() {
+        let offer = super::Offer { default: Some("Speakers".into()), names: vec!["Speakers".into(), "Headset".into()] };
+        let mut attempts = Vec::new();
+        let route = super::open_sample_output(Some("Headset".into()), &offer, |route| {
+            attempts.push(route.clone());
+            if matches!(route, super::Route::Named(_)) {
+                anyhow::bail!("device unavailable");
+            }
+            Ok(route.clone())
+        })
+        .unwrap();
+        assert_eq!(attempts, [super::Route::Named("Headset".into()), super::Route::Default(Some("Speakers".into()))]);
+        assert_eq!(route, super::Route::Default(Some("Speakers".into())));
+    }
 
     #[test]
     fn underruns_exclude_idle_output_and_count_callbacks_and_samples_separately() {

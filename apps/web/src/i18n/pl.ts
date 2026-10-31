@@ -9,9 +9,9 @@ export const pl: Record<Key, string> = {
   "person.voiceSettings": "Ustawienia dźwięku",
   "audio.listen": "Posłuchaj siebie",
   "audio.stopListening": "Zatrzymaj test",
-  "audio.listenHint": "3 s nagrania, potem odsłuch. Użyj słuchawek.",
-  "audio.recording": "Mów teraz — nagrywanie 3 s…",
-  "audio.playing": "Odsłuch — mikrofon wyłączony.",
+  "audio.listenHint": "3 s nagrania. Użyj słuchawek.",
+  "audio.recording": "Mów teraz…",
+  "audio.playing": "Odsłuch…",
   "audio.listenInCall": "Opuść rozmowę, aby zrobić test.",
   "audio.listenMuted": "Włącz mikrofon, aby zrobić test.",
 

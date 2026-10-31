@@ -45,7 +45,15 @@ export function useMicPreview(engine: VoiceEngine) {
           const stop = await engine.startMicTest(value => {
             if (generation === current && !capture.signal.aborted) setLevel(value);
           }, capture.signal, sample ? {
-            phase: value => { if (generation === current && !capture.signal.aborted) setPlayback(value); },
+            phase: value => {
+              if (generation !== current || capture.signal.aborted) return;
+              if (value === "idle") {
+                // Engines report completion only after the sample run has fully retired.
+                // Recheck permission and every privacy gate before restoring the silent meter.
+                key = "";
+                refresh();
+              } else setPlayback(value);
+            },
             error: failure => {
               if (generation !== current || capture.signal.aborted) return;
               retire();
@@ -69,7 +77,7 @@ export function useMicPreview(engine: VoiceEngine) {
     const focus = () => { focused = true; visible = document.visibilityState !== "hidden"; refresh(); };
     request.current = () => { if (!active || active.signal.aborted) refresh(true); };
     listen.current = () => refresh(true, true);
-    stop.current = () => { ++generation; retire(); };
+    stop.current = () => { key = ""; refresh(); };
     const unlisten = [useSettings.subscribe(() => refresh()), useVoice.subscribe(() => refresh()), useUi.subscribe(() => refresh())];
     document.addEventListener("visibilitychange", visibility);
     window.addEventListener("blur", blur);

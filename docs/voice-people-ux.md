@@ -32,9 +32,30 @@ microphone tone and a policy blocking external requests. It never opens the OS m
 The check asserts that no live input track exists when actual browser sample playback
 starts, cancellation is synchronous, mute preserves the stored volume, join controls
 are visible, and dialogs fit at 1440, 768, 390 and 360 pixels in both themes.
+Recording screenshots wait for a live level, then verify it follows a generated
+tone being silenced and restored. The earlier empty bar was captured before the
+first level update; the fixture input is not silent. Compact Polish and English
+idle, recording and playback labels fit without clipping or wrapping. After sample
+playback, the test verifies that recording callbacks and decoded buffers have been
+released and the eligible automatic sensitivity meter has resumed.
 Screenshots are approval evidence for the UI; they do not establish physical-device
 or native audio quality. Native cancellation/ownership is covered by Rust and IPC
 regressions without launching the installed app.
+
+## Round-one regressions
+
+Completed samples now retire their engine-owned run before reporting completion.
+Both engines release their callbacks, and browser playback also clears its decoded
+buffer. Natural completion and **Stop test** recheck all #204 privacy and permission
+gates before restoring the silent sensitivity meter; audible playback never restarts
+automatically. Native sample output uses #200's saved-device fallback decisions for
+an unplugged or unopenable output.
+
+The browser smoke suite waits for actual online/voice state after reconnect and
+the opened, joined channel before testing history pagination. It retains peer
+resynchronization, identity-pin and older-history assertions without relying on
+removed presence notices. The remaining join-related sound-preview text in
+`e2e/sound-cues.mjs` is an existing sound control, not a presence-notice wait.
 
 ## Design scope and review
 

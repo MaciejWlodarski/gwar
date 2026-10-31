@@ -1299,3 +1299,33 @@ it("keeps browser gain tied to the stable person when receive slots are replaced
   engine.setUserVolume("different-person", 0.45);
   expect(gains.at(-1)).toHaveBeenLastCalledWith(0.45, 0, 0.015);
 });
+
+it("retires completed microphone playback and releases its sample and recorder callbacks", async () => {
+  const recorders: Array<{ ondataavailable: unknown; onstop: unknown; onerror: unknown }> = [];
+  const phase = vi.fn();
+  vi.stubGlobal("AudioContext", class extends Context {
+    createMediaStreamDestination() { return { ...node(), stream: microphone().stream }; }
+    decodeAudioData = async () => ({}) as AudioBuffer;
+  });
+  vi.stubGlobal("MediaRecorder", class {
+    state = "inactive";
+    ondataavailable: ((event: { data: Blob }) => void) | null = null;
+    onstop: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    constructor() { recorders.push(this); }
+    start() { this.state = "recording"; }
+    stop() { this.state = "inactive"; this.ondataavailable?.({ data: new Blob(["private microphone sample"]) }); this.onstop?.(); }
+  });
+  await engine.startMicTest(vi.fn(), undefined, { phase, error: vi.fn() });
+  await vi.advanceTimersByTimeAsync(3000);
+  await flush();
+  const replay = cueSources[0]!;
+  expect(replay.buffer).not.toBeNull();
+  (replay.onended as (() => void) | null)?.();
+  await flush();
+  expect(replay.buffer).toBeNull();
+  expect(replay.onended).toBeNull();
+  expect(recorders[0]).toMatchObject({ ondataavailable: null, onstop: null, onerror: null });
+  expect((engine as unknown as { micTests: { runs: Set<unknown> } }).micTests.runs.size).toBe(0);
+  expect(phase).toHaveBeenLastCalledWith("idle");
+});
