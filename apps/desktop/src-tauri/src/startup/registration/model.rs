@@ -10,6 +10,10 @@ pub struct Snapshot {
 pub trait Entry {
     type Value: PartialEq;
     fn read(&mut self) -> Result<Option<Self::Value>, String>;
+    /// A value under our name that another program owns. It reads as no registration.
+    fn foreign(&self, _value: &Self::Value, _executable: &str) -> bool {
+        false
+    }
     fn retarget(&self, value: &Self::Value, executable: &str) -> Result<Self::Value, String>;
     fn write(&mut self, value: &Self::Value) -> Result<(), String>;
     fn state(&mut self, value: &Self::Value) -> Result<LoginState, String>;
@@ -19,6 +23,9 @@ pub fn repair<E: Entry>(entry: &mut E, executable: &str) -> Result<Option<E::Val
     let Some(before) = entry.read()? else {
         return Ok(None);
     };
+    if entry.foreign(&before, executable) {
+        return Ok(None);
+    }
     let desired = entry.retarget(&before, executable)?;
     if before != desired {
         entry.write(&desired).map_err(|e| format!("Cannot migrate startup registration: {e}"))?;
@@ -42,17 +49,59 @@ pub fn windows_retarget(value: &str, executable: &str) -> Result<String, String>
     if !windows_owned_path(executable) {
         return Err("Current startup executable is not a recognized Gwar executable".into());
     }
-    let owned = if let Some(quoted) = value.strip_prefix('"') {
-        quoted.trim_end_matches(' ').strip_suffix('"').is_some_and(windows_owned_path)
-    } else {
-        // The old plugin wrote exactly the executable path plus one space, with no args.
-        // Other unquoted values can be another program followed by arguments.
-        value == executable || value.strip_suffix(' ') == Some(executable)
-    };
-    if !owned {
+    if !windows_owned(value, executable) {
         return Err("Startup entry is not a recognized Gwar executable; left unchanged".into());
     }
     super::windows_command(executable)
+}
+
+#[cfg(any(windows, test))]
+fn windows_owned(value: &str, executable: &str) -> bool {
+    if let Some(quoted) = value.strip_prefix('"') {
+        return quoted.trim_end_matches(' ').strip_suffix('"').is_some_and(windows_owned_path);
+    }
+    // The old plugin wrote exactly the executable path plus one space, with no args.
+    // Other unquoted values can be another program followed by arguments.
+    let path = value.strip_suffix(' ').unwrap_or(value);
+    let drive = |p: &str| p.get(1..2) == Some(":");
+    if drive(path) && drive(executable) {
+        path.get(..1).zip(executable.get(..1)).is_some_and(|(a, b)| a.eq_ignore_ascii_case(b))
+            && path.get(1..) == executable.get(1..)
+    } else {
+        path == executable
+    }
+}
+
+#[cfg(any(windows, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hive {
+    Absent,
+    Ours,
+    Foreign,
+}
+
+#[cfg(any(windows, test))]
+pub fn windows_hive(value: Option<&str>, executable: &str) -> Hive {
+    match value {
+        None => Hive::Absent,
+        Some(value) if windows_owned(value, executable) => Hive::Ours,
+        Some(_) => Hive::Foreign,
+    }
+}
+
+/// Which of (machine, user) a change touches. A foreign value is never written or removed.
+#[cfg(any(windows, test))]
+pub fn windows_changes(machine: Hive, user: Hive, enabled: bool) -> Result<(bool, bool), String> {
+    if !enabled {
+        return Ok((machine == Hive::Ours, user == Hive::Ours));
+    }
+    if machine == Hive::Ours {
+        return Ok((true, user == Hive::Ours));
+    }
+    if user == Hive::Foreign {
+        return Err("Another program already uses Gwar's startup entry; left unchanged".into());
+    }
+    Ok((false, true))
 }
 
 #[cfg(any(windows, test))]
@@ -178,6 +227,7 @@ mod tests {
     struct Memory<V> {
         value: Option<V>,
         retarget: fn(&V, &str) -> Result<V, String>,
+        foreign: fn(&V, &str) -> bool,
         state: LoginState,
         writes: usize,
         queries: usize,
@@ -188,6 +238,9 @@ mod tests {
         type Value = V;
         fn read(&mut self) -> Result<Option<V>, String> {
             Ok(self.value.clone())
+        }
+        fn foreign(&self, value: &V, exe: &str) -> bool {
+            (self.foreign)(value, exe)
         }
         fn retarget(&self, value: &V, exe: &str) -> Result<V, String> {
             (self.retarget)(value, exe)
@@ -211,6 +264,7 @@ mod tests {
         Memory {
             value: value.map(String::from),
             retarget: |v, e| windows_retarget(v, e),
+            foreign: |v, e| windows_hive(Some(v), e) == Hive::Foreign,
             state,
             writes: 0,
             queries: 0,
@@ -222,6 +276,7 @@ mod tests {
         Memory {
             value,
             retarget: |v, e| macos_retarget(v, e),
+            foreign: |_, _| false,
             state,
             writes: 0,
             queries: 0,
@@ -233,7 +288,7 @@ mod tests {
     const MAC: &str = "/Applications/New & Friends/Gwar.app/Contents/MacOS/gwar";
 
     #[test]
-    fn r4_s1_refuses_ambiguous_unquoted_commands_without_writes_or_state_queries() {
+    fn r4_s1_leaves_ambiguous_unquoted_commands_alone_and_reports_no_gwar_entry() {
         for value in [
             r"C:\Tools\helper.exe \gwar.exe",
             r"C:\Tools\helper.exe \gwar.exe ",
@@ -241,10 +296,36 @@ mod tests {
             &format!("{WIN}  "),
         ] {
             let mut entry = win(Some(value), LoginState::Enabled);
-            let error = reconcile(&mut entry, WIN).expect_err("ambiguous unquoted command is not ours");
-            assert!(error.contains("not a recognized Gwar executable"));
+            let snapshot = reconcile(&mut entry, WIN).expect("a foreign value is not a settings failure");
+            assert_eq!(snapshot, Snapshot { present: false, state: LoginState::Disabled });
             assert_eq!(entry.value.as_deref(), Some(value));
             assert_eq!((entry.writes, entry.queries), (0, 0));
+        }
+    }
+    #[test]
+    fn r5_s1_enabling_preserves_foreign_values_and_disabling_removes_only_ours() {
+        use Hive::*;
+        assert_eq!(windows_changes(Foreign, Absent, true), Ok((false, true)));
+        assert_eq!(windows_changes(Foreign, Ours, true), Ok((false, true)));
+        assert!(windows_changes(Absent, Foreign, true).is_err(), "the user hive has one Gwar value");
+        assert_eq!(windows_changes(Ours, Foreign, true), Ok((true, false)));
+        assert_eq!(windows_changes(Ours, Absent, true), Ok((true, false)));
+        assert_eq!(windows_changes(Ours, Ours, true), Ok((true, true)));
+        assert_eq!(windows_changes(Absent, Absent, true), Ok((false, true)));
+        assert_eq!(windows_changes(Foreign, Foreign, false), Ok((false, false)));
+        assert_eq!(windows_changes(Foreign, Ours, false), Ok((false, true)));
+        assert_eq!(windows_changes(Ours, Foreign, false), Ok((true, false)));
+    }
+    #[test]
+    fn r5_s2_owned_legacy_value_matches_the_drive_letter_in_any_case() {
+        let current = r"C:\Gwar\gwar.exe";
+        let mut entry = win(Some(r"c:\Gwar\gwar.exe "), LoginState::Enabled);
+        assert_eq!(reconcile(&mut entry, current).unwrap().state, LoginState::Enabled);
+        assert_eq!(entry.value.as_deref(), Some(r#""C:\Gwar\gwar.exe""#));
+        for value in [r"c:\gwar\gwar.exe ", r"D:\Gwar\gwar.exe ", r"c:\Gwar\gwar.exe  "] {
+            let mut foreign = win(Some(value), LoginState::Enabled);
+            assert!(!reconcile(&mut foreign, current).unwrap().present);
+            assert_eq!(foreign.writes, 0);
         }
     }
     #[test]
@@ -280,7 +361,7 @@ mod tests {
     fn r3_s1_refuses_foreign_commands_and_surfaces_failed_migration_or_stale_readback() {
         for value in [r#""C:\Windows\cmd.exe""#, r#""C:\Gwar\gwar.exe" --other"#, "anything", r"relative\gwar.exe"] {
             let mut entry = win(Some(value), LoginState::Enabled);
-            assert!(reconcile(&mut entry, WIN).is_err());
+            assert!(!reconcile(&mut entry, WIN).unwrap().present);
             assert_eq!(entry.value.as_deref(), Some(value));
             assert_eq!((entry.writes, entry.queries), (0, 0));
         }

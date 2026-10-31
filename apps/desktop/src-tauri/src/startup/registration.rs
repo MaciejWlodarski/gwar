@@ -273,6 +273,9 @@ mod windows {
         fn read(&mut self) -> Result<Option<String>, String> {
             read_command(self.root, self.run)
         }
+        fn foreign(&self, value: &String, executable: &str) -> bool {
+            model::windows_hive(Some(value), executable) == model::Hive::Foreign
+        }
         fn retarget(&self, value: &String, executable: &str) -> Result<String, String> {
             model::windows_retarget(value, executable)
         }
@@ -312,15 +315,13 @@ mod windows {
         let command = model::windows_retarget(&windows_command(executable)?, executable)?;
         // The former plugin preferred HKLM when elevated. Update an existing entry in
         // that hive too; report access failures rather than leave an unsafe legacy value.
-        let machine = entry(LOCAL_MACHINE)?.is_some();
-        for (root, is_machine) in [(LOCAL_MACHINE, true), (CURRENT_USER, false)] {
-            if is_machine && !machine {
+        let hive = |root: &Key| Ok::<_, String>(model::windows_hive(entry(root)?.as_deref(), executable));
+        let (machine, user) = model::windows_changes(hive(LOCAL_MACHINE)?, hive(CURRENT_USER)?, enabled)?;
+        for (root, change) in [(LOCAL_MACHINE, machine), (CURRENT_USER, user)] {
+            if !change {
                 continue;
             }
             if enabled {
-                if machine && !is_machine && entry(root)?.is_none() {
-                    continue;
-                }
                 write_command(&root.create(RUN).map_err(|e| e.to_string())?, &command)?;
                 if let Some(key) = optional(root.options().write().open(APPROVED))? {
                     let mut value = [0u8; 12];
