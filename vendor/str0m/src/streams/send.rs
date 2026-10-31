@@ -537,7 +537,8 @@ impl StreamTx {
         let remote_acked_ssrc = self.remote_acked_ssrc;
         let remote_acked_rtx_ssrc = self.remote_acked_rtx_ssrc;
 
-        let (next, is_padding) = if let Some(next) = self.poll_packet_resend(now, extra_bytes, exts) {
+        let (next, is_padding) = if let Some(next) = self.poll_packet_resend(now, extra_bytes, exts)
+        {
             (next, false)
         } else if let Some(next) = self.poll_packet_regular(now, media_bytes, exts) {
             (next, false)
@@ -821,7 +822,12 @@ impl StreamTx {
         ratio
     }
 
-    fn poll_packet_resend(&mut self, now: Instant, budget: usize, exts: &ExtensionMap) -> Option<NextPacket<'_>> {
+    fn poll_packet_resend(
+        &mut self,
+        now: Instant,
+        budget: usize,
+        exts: &ExtensionMap,
+    ) -> Option<NextPacket<'_>> {
         if let Some(ratio_cap) = self.rtx_ratio_cap {
             let ratio = self.rtx_ratio_downsampled(now);
 
@@ -843,7 +849,14 @@ impl StreamTx {
                 self.resends.pop_front();
                 continue;
             };
-            if !fits_wire_budget(&pkt.header, exts, self.midrid, now, pkt.payload.len() + 2, budget) {
+            if !fits_wire_budget(
+                &pkt.header,
+                exts,
+                self.midrid,
+                now,
+                pkt.payload.len() + 2,
+                budget,
+            ) {
                 return None;
             }
 
@@ -876,12 +889,24 @@ impl StreamTx {
         })
     }
 
-    fn poll_packet_regular(&mut self, now: Instant, budget: usize, exts: &ExtensionMap) -> Option<NextPacket<'_>> {
+    fn poll_packet_regular(
+        &mut self,
+        now: Instant,
+        budget: usize,
+        exts: &ExtensionMap,
+    ) -> Option<NextPacket<'_>> {
         // exit via ? here is ok since that means there is nothing to send.
         // The packet remains in the head of the send queue until we
         // finish poll_packet, at which point we move it to the cache.
         let pkt = self.send_queue.peek()?;
-        if !fits_wire_budget(&pkt.header, exts, self.midrid, now, pkt.payload.len(), budget) {
+        if !fits_wire_budget(
+            &pkt.header,
+            exts,
+            self.midrid,
+            now,
+            pkt.payload.len(),
+            budget,
+        ) {
             return None;
         }
 
@@ -902,7 +927,12 @@ impl StreamTx {
         })
     }
 
-    fn poll_packet_padding(&mut self, now: Instant, budget: usize, exts: &ExtensionMap) -> Option<NextPacket> {
+    fn poll_packet_padding(
+        &mut self,
+        now: Instant,
+        budget: usize,
+        exts: &ExtensionMap,
+    ) -> Option<NextPacket> {
         if !self.padding_enabled() {
             self.padding = 0;
             return None;
@@ -929,7 +959,14 @@ impl StreamTx {
                 if pkt.payload.len() < MAX_BLANK_PADDING_PAYLOAD_SIZE {
                     break 'outer;
                 }
-                if !fits_wire_budget(&pkt.header, exts, self.midrid, now, pkt.payload.len() + 2, budget) {
+                if !fits_wire_budget(
+                    &pkt.header,
+                    exts,
+                    self.midrid,
+                    now,
+                    pkt.payload.len() + 2,
+                    budget,
+                ) {
                     break 'outer;
                 }
                 let orig_seq_no = pkt.seq_no;
@@ -945,9 +982,17 @@ impl StreamTx {
             }
         };
 
-        let len = self.padding.clamp(SRTP_BLOCK_SIZE, MAX_BLANK_PADDING_PAYLOAD_SIZE);
-        if !fits_wire_budget(&self.blank_packet.header, exts, self.midrid, now,
-            len.div_ceil(SRTP_BLOCK_SIZE) * SRTP_BLOCK_SIZE + 2, budget) {
+        let len = self
+            .padding
+            .clamp(SRTP_BLOCK_SIZE, MAX_BLANK_PADDING_PAYLOAD_SIZE);
+        if !fits_wire_budget(
+            &self.blank_packet.header,
+            exts,
+            self.midrid,
+            now,
+            len.div_ceil(SRTP_BLOCK_SIZE) * SRTP_BLOCK_SIZE + 2,
+            budget,
+        ) {
             return None;
         }
         let seq_no = if self.ssrc.is_probe() {
@@ -1367,8 +1412,17 @@ struct NextPacket<'a> {
 /// Include every header extension the outgoing form may add. Measure the actual
 /// negotiated layout so CSRCs or a large dependency descriptor cannot overspend
 /// the gate. No allocation or duplicate header write on the ungated path.
-fn fits_wire_budget(header: &RtpHeader, exts: &ExtensionMap, midrid: MidRid, now: Instant, payload: usize, budget: usize) -> bool {
-    if budget == usize::MAX { return true; }
+fn fits_wire_budget(
+    header: &RtpHeader,
+    exts: &ExtensionMap,
+    midrid: MidRid,
+    now: Instant,
+    payload: usize,
+    budget: usize,
+) -> bool {
+    if budget == usize::MAX {
+        return true;
+    }
     let mut header = header.clone();
     // Padding's cached header may not have its negotiated PT assigned yet; PT
     // does not affect the serialized header length.
@@ -1406,39 +1460,136 @@ mod test {
         let now = Instant::now();
         let codecs = CodecConfig::new_with_defaults();
         let exts = ExtensionMap::standard();
-        let mut stream = StreamTx::new(42.into(), Some(44.into()), MidRid("vid".into(), None), false, 1200);
-        stream.write_rtp(RtpWrite::new(96.into(), 7.into(), 9000, now, Arc::<[u8]>::from(vec![0x10; 1100])).nackable(true));
+        let mut stream = StreamTx::new(
+            42.into(),
+            Some(44.into()),
+            MidRid("vid".into(), None),
+            false,
+            1200,
+        );
+        stream.write_rtp(
+            RtpWrite::new(
+                96.into(),
+                7.into(),
+                9000,
+                now,
+                Arc::<[u8]>::from(vec![0x10; 1100]),
+            )
+            .nackable(true),
+        );
         stream.send_queue.handle_timeout(now);
         stream.send_queue.peek().unwrap().header.csrc_count = 15;
         let mut twcc = 42;
         let mut buf = vec![];
         for _ in 0..3 {
-            assert!(stream.poll_packet_with_budget(now, &exts, Some(&mut twcc), codecs.params(), &mut buf, 0, 0).is_none());
+            assert!(
+                stream
+                    .poll_packet_with_budget(
+                        now,
+                        &exts,
+                        Some(&mut twcc),
+                        codecs.params(),
+                        &mut buf,
+                        0,
+                        0
+                    )
+                    .is_none()
+            );
             assert_eq!(twcc, 42);
             assert_eq!(stream.stats.packets, 0);
             assert!(stream.send_queue.peek().is_some());
         }
-        assert!(stream.poll_packet_with_budget(now, &exts, Some(&mut twcc), codecs.params(), &mut buf, 1244, 0).is_none());
+        assert!(
+            stream
+                .poll_packet_with_budget(
+                    now,
+                    &exts,
+                    Some(&mut twcc),
+                    codecs.params(),
+                    &mut buf,
+                    1244,
+                    0
+                )
+                .is_none()
+        );
         assert_eq!(twcc, 42, "CSRC/header bytes must be included before TWCC");
-        let media = stream.poll_packet_with_budget(now, &exts, Some(&mut twcc), codecs.params(), &mut buf, 1400, 0).unwrap();
+        let media = stream
+            .poll_packet_with_budget(
+                now,
+                &exts,
+                Some(&mut twcc),
+                codecs.params(),
+                &mut buf,
+                1400,
+                0,
+            )
+            .unwrap();
         assert!(!media.is_extra);
         assert_eq!(media.header.ext_vals.transport_cc, Some(42));
-        stream.resends.push_back(Resend { seq_no: 7.into(), queued_at: now, payload_size: 1100 });
+        stream.resends.push_back(Resend {
+            seq_no: 7.into(),
+            queued_at: now,
+            payload_size: 1100,
+        });
         let sequence = stream.seq_no_rtx;
-        assert!(stream.poll_packet_with_budget(now, &exts, Some(&mut twcc), codecs.params(), &mut buf, 1400, 0).is_none());
+        assert!(
+            stream
+                .poll_packet_with_budget(
+                    now,
+                    &exts,
+                    Some(&mut twcc),
+                    codecs.params(),
+                    &mut buf,
+                    1400,
+                    0
+                )
+                .is_none()
+        );
         assert_eq!(twcc, 43);
         assert_eq!(stream.seq_no_rtx, sequence);
         assert_eq!(stream.resends.len(), 1);
-        let repair = stream.poll_packet_with_budget(now, &exts, Some(&mut twcc), codecs.params(), &mut buf, 1400, 1400).unwrap();
+        let repair = stream
+            .poll_packet_with_budget(
+                now,
+                &exts,
+                Some(&mut twcc),
+                codecs.params(),
+                &mut buf,
+                1400,
+                1400,
+            )
+            .unwrap();
         assert!(repair.is_extra);
         assert_eq!(repair.header.ext_vals.transport_cc, Some(43));
         stream.generate_padding(240);
         let sequence = stream.seq_no_rtx;
-        assert!(stream.poll_packet_with_budget(now, &exts, Some(&mut twcc), codecs.params(), &mut buf, 1400, 0).is_none());
+        assert!(
+            stream
+                .poll_packet_with_budget(
+                    now,
+                    &exts,
+                    Some(&mut twcc),
+                    codecs.params(),
+                    &mut buf,
+                    1400,
+                    0
+                )
+                .is_none()
+        );
         assert_eq!(twcc, 44);
         assert_eq!(stream.seq_no_rtx, sequence);
         assert_eq!(stream.padding, 240);
-        let padding = stream.poll_packet_with_budget(now, &exts, Some(&mut twcc), codecs.params(), &mut buf, 1400, 1400).unwrap();
+        let padding = stream
+            .poll_packet_with_budget(
+                now,
+                &exts,
+                Some(&mut twcc),
+                codecs.params(),
+                &mut buf,
+                1400,
+                1400,
+            )
+            .unwrap();
         assert!(padding.is_extra && padding.is_padding);
         assert_eq!(padding.header.ext_vals.transport_cc, Some(44));
     }

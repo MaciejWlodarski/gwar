@@ -123,10 +123,9 @@ impl Pacer for LeakyBucketPacer {
             } else {
                 elapsed
             };
-            let max_cadence = Duration::from_millis(if self.egress_rate.is_some() { 30 } else { 20 });
-            if (self.egress_rate.is_none() || was_backlogged)
-                && cadence <= max_cadence
-            {
+            let max_cadence =
+                Duration::from_millis(if self.egress_rate.is_some() { 30 } else { 20 });
+            if (self.egress_rate.is_none() || was_backlogged) && cadence <= max_cadence {
                 self.bounded_wake_interval =
                     cadence.max(self.bounded_wake_interval.saturating_sub(elapsed / 20));
             }
@@ -277,7 +276,9 @@ impl LeakyBucketPacer {
     }
 
     pub(crate) fn active_probe_rate(&self) -> Option<Bitrate> {
-        self.probe_queue.front().map(|p| p.config().target_bitrate())
+        self.probe_queue
+            .front()
+            .map(|p| p.config().target_bitrate())
     }
 
     /// Check if the active probe is complete and should be finished.

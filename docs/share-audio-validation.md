@@ -1,7 +1,8 @@
 # P1-6 browser share audio validation
 
-Original base: `origin/main` at `1a54b517`; round 2 integrates `a3ab9f9b` (#206)
-and renumbers share-audio settings to v8 after main's v7 migration. Scope: browser capture, protocol/SFU forwarding
+Original base: `origin/main` at `1a54b517`; round 3 merges `1e0e6d60` (#206,
+#208 and #207) and follows their v7/v8/v9 migrations with share-audio v10.
+Scope: browser capture, protocol/SFU forwarding
 and browser viewer playback. Desktop viewing is deliberately video-only until
 share playback enters the native mixer/AEC reference. Native capture/playback is the separate PR 2 in [share-audio.md](share-audio.md).
 
@@ -16,11 +17,13 @@ The tests cover optional audio negotiation, legacy watch layouts, strict respons
 validation, source exclusion when a browser ignores hints, desktop capture with
 no audio, desktop viewing without a webview player/controls/prompts, microphone processing disabled on the share track, lower sender
 priority, aggregate uplink budgeting, stable playback ownership, independent
-controls for two shares from one identity, deafen, automatic/lossless v1–v7
+controls for two shares from one identity, deafen, automatic/lossless v1–v9
 settings upgrades, retained capture and a replacement server without audio support.
-The v8 upgrade also preserves v7 notification/startup choices and the earlier
-v7 share-audio preview map. A failing-before v7 upgrade regression covers this
-merge-order collision (`/tmp/gwar-209-r2-settings-before.log`).
+The v10 upgrade preserves notification/startup choices, PTT bindings/release
+delay, person volumes/mutes, credentials and earlier v7/v8 share-audio preview
+maps. Its all-version regression failed before the v10 step was present
+(`/tmp/gwar209-r3-settings-before.log`). The labels Głos and Dźwięki aplikacji
+remain covered by the existing bilingual settings tests.
 
 `E2E_SCREEN_AUDIO=1` extends the repository's actual screen e2e. The primary
 sharer uses the real Chromium tab picker. A generated 997 Hz source is captured,
@@ -46,7 +49,7 @@ The audio wire allowance is subtracted from existing publisher/video and viewer
 screen budgets; it does not consume the voice reserve. Real Chromium stats show
 share audio's `very-low` priority versus the existing `low` video/voice settings.
 Ingress bounds packet rates and fan-out; audio/video share release pacing and
-a final serialized-wire guard. Audio never passes through the voice task. Video-only shares pay no unused audio reservation.
+a pre-TWCC wire gate covering serialized packet overhead. Audio never passes through the voice task. Video-only shares pay no unused audio reservation.
 
 The existing full 96-case voice-headroom matrix passed. A new six-case test
 saturates two 128 kb/s audio allowances on the same simulated FIFO as video and
@@ -129,6 +132,73 @@ Failing-before logs are retained under `/tmp/gwar-209-r2-`: `combined-before.log
 `clock-before-final.log`, `ui-before.log` and `watch-before.log`. Neither the watch
 e2e nor the startup/native-voice watcher-count assertions were changed.
 
+## Round 3: active bandwidth estimation
+
+The earlier frozen-estimate throughput test did not cover probe-driven capacity
+discovery. Sol's silent-reservation reproducer exposed a real startup regression:
+the shared socket guard discarded capacity probes after str0m had assigned
+TWCC send records. The previous startup report's sampling explanation did not
+establish parity with main and did not account for that regression.
+
+The new `silent_audio_reservation_preserves_live_bwe_startup` regression uses the
+production Sim, both real str0m peers and actual TWCC feedback on a lossless
+20 Mb/s link, a silent 128 kb/s reservation, 7.872 Mb/s video, 60 fps and a
+200 KB initial keyframe. No estimate is frozen. It failed on `46c7d744` with no
+video in the first ten seconds (`/tmp/gwar209-r3-before.log`). With the pre-send
+gate, 10/20 ms service sustains 7.872 Mb/s with no pauses; final estimates were
+17.707/17.193 Mb/s. Queueing, sequence, packet-statistic and TWCC deferral are
+also covered by a str0m unit test, including CSRC/header bytes. Changing a probe
+plan at the same instant cannot mint a second wire burst.
+
+The same shared credit now runs before str0m removes media, repairs or padding
+from its queues. It follows the active bounded probe plan and existing extras
+reserve, so capacity discovery is not reported as application-created loss.
+Legacy video-only cap policy stays intact. The unchanged 1 Mb/s adversarial
+voice limits and 2.5 Mb/s zero-eviction test at 5/10/20/30 ms all pass alongside
+the live-BWE regression and full voice-headroom matrix.
+
+### Unchanged browser startup comparison
+
+The full eight-case, 60-second-per-case startup gate ran sequentially against
+exact main `1e0e6d60` and the merged fixed source `5272ffa8`, using each revision's
+own server and web build. The existing harness, judge and assertions are
+unchanged. Both bundles use the normal development/e2e build mode. No other
+browser gate ran concurrently. Times below are the harness's `firstTargetAt`;
+they show the fixed branch reaches full quality later than main, although all
+cases reach it within 8.67 seconds.
+
+| Case | Main `1e0e6d60`: result; target time | Fixed branch: result; target time | Decoded fps main / fix |
+|---|---|---|---|
+| `vp9-barcode20-0` | PASS; 1.06 s | PASS; 8.67 s | 19.9 / 20.1 |
+| `vp9-barcode20-1` | PASS; 1.57 s | PASS; 4.62 s | 20.1 / 20.0 |
+| `vp9-busy60-0` | PASS; 1.50 s | PASS; 6.61 s | 60.0 / 59.9 |
+| `vp9-busy60-1` | PASS; 1.51 s | PASS; 7.03 s | 60.0 / 60.1 |
+| `h264-barcode20-0` | PASS; 1.48 s | PASS; 6.56 s | 20.0 / 20.0 |
+| `h264-barcode20-1` | PASS; 1.57 s | PASS; 6.63 s | 19.9 / 20.0 |
+| `h264-busy60-0` | PASS; 1.52 s | FAIL (1 probe); 8.64 s | 60.0 / 60.0 |
+| `h264-busy60-1` | PASS; 1.50 s | FAIL (1 probe); 8.64 s | 60.1 / 60.0 |
+
+Main passes 8/8; the fixed branch passes 6/8. **Both fixed-branch H.264 busy
+cases fail the unchanged zero-allocation-probe assertion; neither fails on
+main.** Every case decodes 1920×1080 at the expected cadence, with no CPU
+exemptions or unrecovered results. This is not an all-green startup gate.
+
+For `h264-busy60-0`, the counted cap rise is at 56.593 s: 7.050 → 7.872 Mb/s,
+while sampled GCC falls from 9.191 to 6.273 Mb/s. For `h264-busy60-1`, it is at
+28.828 s: 7.505 → 7.872 Mb/s, while GCC falls from 9.852 to 6.791 Mb/s. Each
+preceding twelve-second window has 24 samples, all full-size and none bandwidth-
+limited. Those observations support a cap/estimate sampling mismatch rather
+than the publisher's sustained undersized/bandwidth-limited stale-probe
+conditions. They do not turn a failed assertion into a pass. The live-BWE SFU
+regression above separately verifies the repaired transport behavior.
+
+Canonical logs/results are `/tmp/gwar209-r3-main-startup.log`,
+`/tmp/gwar209-r3-head-startup.log`,
+`/tmp/gwar209-r3-startup-main-1e0e6d60/` and
+`/tmp/gwar209-r3-startup-head-5272ffa8/`. The compact cap/estimate excerpts are in
+`/tmp/gwar209-r3-startup-probe-evidence.json`. Initial noncanonical build/setup
+failures are kept in `*-startup-setup.log`; they are not included in the matrix.
+
 ## Responsive inspection
 
 Real built UI screenshots are retained under `gwar-mockups/share-audio/` at
@@ -153,30 +223,22 @@ on phones and audio controls stay inside fullscreen.
 
 - Typecheck and lint passed (lint retains four pre-existing warnings).
 - Protocol: 131 tests passed.
-- Rust screen: 239 tests passed, three full matrices ignored by default; the full
+- Rust screen: 241 tests passed, three full matrices ignored by default; the full
   96-case voice-headroom matrix was run separately and passed.
 - Local screen integration: 19 tests passed.
 - Clippy with `-D warnings`, formatting and the local server build passed.
 - Chromium generated-audio gate passed before and after reconnect at 996.09375 Hz.
   Volume, mute, receiver renewal, audio-end availability and single-output
-  assertions passed. Final RMS: 0.07079 / 0.07074 / 0.07092 (initial / renewed /
+  assertions passed. Final RMS: 0.07085 / 0.07079 / 0.07084 (initial / renewed /
   reconnected). The final sequential run logged no denoise fallback.
 - Chromium/WebKit fixed-1080p60 H.264 screen gate passed, with legacy and paired
-  viewers. The round-2 unchanged startup gate completed all eight cases at
-  1920×1080 and the expected 20/60 fps, but **failed two probe-count assertions**
-  (`vp9-busy60-1`: 1; `h264-busy60-0`: 2). It is not a clean startup-gate pass.
-  The initial run failed the same assertion in one H.264 case; removing
-  competing test load did not remove it. The diagnostic infers probes from a
-  ceiling-cap transition and a later GCC estimate: ordinary ceiling writes were
-  followed by estimate drops before its next sample. For example, VP9 rose
-  from 7.344 to its 7.872 Mb/s ceiling after a 9.566 Mb/s estimate, then the
-  diagnostic sampled 6.534 Mb/s. No preceding twelve-second sample was
-  undersized or bandwidth-limited, so the publisher's actual stale-probe
-  conditions were false. That publisher path is unchanged from `d3ce7354`.
-  The test and its assertions remain unchanged. Raw rows and a compact excerpt
-  are retained in `/tmp/gwar-209-r2-startup-results/` and
-  `/tmp/gwar-209-r2-startup-probe-evidence.json`.
-- Full web suite after integrating #206: 2,258 tests passed across 153 files. Focused source-switch
+  viewers. The unchanged TeamSpeak watch gate also passed, including guest
+  pageshow recovery and the 150-second heartbeat.
+- The unchanged generated-audio denoise gate passed in Chromium and WebKit.
+  WebKit cleaned the steady input to -76.62 dBFS; the CI -27.2 dBFS failure on
+  `46c7d744` did not recur. No denoise implementation or assertion was changed.
+- Vendored str0m: all 780 library tests passed.
+- Full web suite after integrating #206/#208/#207: 2,398 tests passed across 155 files. Focused source-switch
   and UI/controller checks also passed.
 
 ## Commands
@@ -195,7 +257,8 @@ E2E_BROWSERS=chromium E2E_SCREEN_AUDIO=1 node apps/web/e2e/screen.mjs
 E2E_BROWSERS=chromium,webkit E2E_SCREEN_CANVAS=1 E2E_SCREEN_REQUIRE_H264=1 node apps/web/e2e/screen.mjs
 E2E_BROWSERS=chromium node apps/web/e2e/native-voice.mjs
 CARGO_BUILD_JOBS=4 pnpm --filter web e2e:watch
-node apps/web/e2e/screen-startup.mjs
+E2E_STARTUP_CODECS=vp9,h264 E2E_STARTUP_REPEATS=2 E2E_STARTUP_SECONDS=60 node apps/web/e2e/screen-startup.mjs
+pnpm --filter web e2e:denoise
 ```
 
 A round-1 concurrent validation run logged a browser denoise fallback under CPU load;

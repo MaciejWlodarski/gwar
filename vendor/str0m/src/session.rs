@@ -1186,9 +1186,20 @@ impl Session {
         let twcc_enabled = exts.id_of(Extension::TransportSequenceNumber).is_some();
         let twcc = twcc_enabled.then_some(&mut self.twcc);
 
-        let budget = self.rtp_send_gate.as_mut().map(|gate| gate.poll_budget(now, self.pacer.active_probe_rate()));
+        let budget = self
+            .rtp_send_gate
+            .as_mut()
+            .map(|gate| gate.poll_budget(now, self.pacer.active_probe_rate()));
         let receipt = if let Some(budget) = budget {
-            stream.poll_packet_with_budget(now, exts, twcc, params, buf, budget.media_bytes, budget.extra_bytes)
+            stream.poll_packet_with_budget(
+                now,
+                exts,
+                twcc,
+                params,
+                buf,
+                budget.media_bytes,
+                budget.extra_bytes,
+            )
         } else {
             stream.poll_packet(now, exts, twcc, params, buf)
         };
@@ -1267,7 +1278,10 @@ impl Session {
         let nack_at = self.nack_at();
         let twcc_at = self.twcc_at();
         let (pacing_at, pacing_reason) = self.pacer.poll_timeout();
-        let pacing_at = (pacing_at.map(|at| self.rtp_gate_at.map_or(at, |gate| at.max(gate))), pacing_reason);
+        let pacing_at = (
+            pacing_at.map(|at| self.rtp_gate_at.map_or(at, |gate| at.max(gate))),
+            pacing_reason,
+        );
         let packetize_at = self.medias.iter().filter_map(|m| m.poll_timeout()).min();
         let receive_at = self
             .medias

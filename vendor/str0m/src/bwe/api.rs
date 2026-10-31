@@ -19,9 +19,15 @@ pub struct RtpSendBudget {
 
 /// A transport's shared wire budget. Repairs and padding are `extra`; all RTP
 /// shares the same credit. `probe_rate` is the active, already bounded probe plan.
-pub trait RtpSendGate: std::fmt::Debug + Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe {
+pub trait RtpSendGate:
+    std::fmt::Debug + Send + Sync + std::panic::UnwindSafe + std::panic::RefUnwindSafe
+{
     /// Read current credit and the active probe's planned bitrate before dequeue.
-    fn poll_budget(&mut self, now: std::time::Instant, probe_rate: Option<Bitrate>) -> RtpSendBudget;
+    fn poll_budget(
+        &mut self,
+        now: std::time::Instant,
+        probe_rate: Option<Bitrate>,
+    ) -> RtpSendBudget;
     /// Serialized SRTP bytes (the gate accounts for UDP/IP itself).
     fn sent(&mut self, now: std::time::Instant, bytes: usize, extra: bool);
 }
