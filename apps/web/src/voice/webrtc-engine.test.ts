@@ -707,6 +707,20 @@ describe("push-to-talk release delay", () => {
     expect(denoiser.setActive).toHaveBeenLastCalledWith(false);
   });
 
+  it("uses the configured tail and clears a held press when input mode changes", async () => {
+    const { mic } = await active();
+    engine.setPttReleaseDelay(80);
+    engine.setPttActive(false);
+    await vi.advanceTimersByTimeAsync(79);
+    expect(mic.track.enabled).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(mic.track.enabled).toBe(false);
+    engine.setPttActive(true);
+    engine.setInputMode("vad");
+    engine.setInputMode("ptt");
+    expect(mic.track.enabled).toBe(false);
+  });
+
   it("a new press cancels the old release, and repeated release events do not extend it", async () => {
     const { mic } = await active();
     engine.setPttActive(false); await vi.advanceTimersByTimeAsync(200);

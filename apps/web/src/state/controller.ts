@@ -357,6 +357,7 @@ class Controller {
     const applyAudio = (s = useSettings.getState()) => {
       const a = s.audio;
       e.setInputMode(a.inputMode);
+      e.setPttReleaseDelay(a.pttReleaseDelay);
       e.setInputSensitivity(a.automaticSensitivity ? null : a.vadThreshold);
       e.setMasterVolume(a.masterVolume);
       void e.setOutputDevice(a.outputDeviceId);
@@ -386,6 +387,7 @@ class Controller {
       const a = s.audio;
       const p = prev.audio;
       if (a.inputMode !== p.inputMode) e.setInputMode(a.inputMode);
+      if (a.pttReleaseDelay !== p.pttReleaseDelay) e.setPttReleaseDelay(a.pttReleaseDelay);
       if (a.automaticSensitivity !== p.automaticSensitivity || a.vadThreshold !== p.vadThreshold) e.setInputSensitivity(a.automaticSensitivity ? null : a.vadThreshold);
       if (a.masterVolume !== p.masterVolume) e.setMasterVolume(a.masterVolume);
       if (a.outputDeviceId !== p.outputDeviceId) void e.setOutputDevice(a.outputDeviceId);

@@ -16,7 +16,7 @@ checks the injected calling webview window and rejects any label other than
 | `voice_answer {owner, run, sdp?, error?}` | Current owner and matching pending run only. |
 | `voice_stop {owner, run}` | Current owner only; retires this or older runs, including starts still pending in DNS or device opening. |
 | `voice_play_cue {owner, cue, volume}` | Current owner and main window only. Accepts only the built-in score names and a clamped 0..1 volume. During voice, mixes local PCM into the selected output before the AEC render reference, independent of voice volume. Outside voice, opens output only (never the microphone). Deafen permits only mute/unmute/deafen/undeafen confirmations. |
-| `voice_set_muted`, `voice_set_deafened`, `voice_set_ptt`, `voice_set_input_mode`, `voice_set_master_gain`, `voice_set_slot_gain`, `voice_set_devices` | Require `owner` alongside their existing arguments. Reject previous-view controls under the voice lock. |
+| `voice_set_muted`, `voice_set_deafened`, `voice_set_ptt`, `voice_set_ptt_release_delay`, `voice_set_input_mode`, `voice_set_master_gain`, `voice_set_slot_gain`, `voice_set_devices` | Require `owner` alongside their existing arguments. Reject previous-view controls under the voice lock. |
 | `mic_test_start {owner, test, input?}`, `mic_test_stop {owner, test?}` | Current owner only. A monotonically increasing test id fences cancelled starts and stale cleanup. Refuses capture while muted/deafened, in voice or in a hidden/unfocused window. Bootstrap and native focus loss/close also retire the preview. |
 | `mic_permission {owner}` → `granted` / `prompt` / `denied` / `unknown` | Current owner only. Reads OS authorization without opening a device or requesting permission. Unknown platforms require an explicit preview gesture. |
 | `audio_devices`, `open_mic_privacy_settings` | No ownership token: enumeration or a fixed OS settings URI. |
@@ -57,3 +57,16 @@ server acknowledges `voice.input_gate`. Mode revisions also discard old queued
 frames and reset the local hangover. Native SDP advertises input-gate version 2;
 automatic mode uses the legacy server criterion. Older servers keep automatic
 activation; manual sensitivity is unavailable and unsupported PTT stays closed.
+
+
+Passive global PTT owns native capture independently of the webview. While it is
+configured, `voice_set_ptt` cannot open or close that gate: UI events only reflect
+the listener state. The audio pipeline enforces a renewable 250 ms lease; stale
+webview commands cannot renew it. `set_global_ptt` is main-window-only and replaces
+the observer generation atomically. See [push-to-talk](../../../docs/push-to-talk.md).
+
+Global PTT authorization is additionally bound to the native voice owner/run.
+A lease renewal for a held press cannot transfer to a replacement run: the
+voice lock cancels it, and the observer must recover and see a release first.
+Observer-health proofs expire independently of bound-input physical polling;
+missed release callbacks cancel immediately without the configured tail.

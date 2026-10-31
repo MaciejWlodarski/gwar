@@ -2,6 +2,7 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useGlobalPtt } from "../platform/ptt";
 import { controller } from "../state/controller";
 import { initialState } from "../state/reducer";
 import { initialScreen, useScreen } from "../state/screen";
@@ -11,7 +12,7 @@ import { connectionQuality, EPISODE_MERGE_MS, QUALITY_IMPROVE_MS, resetCongestio
 import { ConnectionDetails, NOTICE_MS } from "./ConnectionQuality";
 import { SharingBar } from "./Screen";
 import { Toaster } from "./Toaster";
-import { VoicePanel, VoicePill } from "./VoicePanel";
+import { MicButton, VoicePanel, VoicePill } from "./VoicePanel";
 import { TooltipProvider } from "./kit";
 
 vi.mock("./useVerifiedHandle", () => ({ useVerifiedHandle: () => null }));
@@ -337,4 +338,47 @@ describe("the congestion notice", () => {
     expect(region.className).toContain("top-3");
     expect(container.querySelectorAll('[data-testid="congestion-notice"]')).toHaveLength(1);
   });
+});
+
+
+it("shows a closed microphone with a plain reason and opens audio settings when global PTT is unavailable", async () => {
+  Object.defineProperty(window, "__TAURI_INTERNALS__", { configurable: true, value: {} });
+  const previousAudio = useSettings.getState().audio;
+  const previousGlobal = useGlobalPtt.getState();
+  const toggle = vi.spyOn(controller, "toggleMute");
+  try {
+    useSettings.getState().setAudio({ inputMode: "ptt", pttKey: "Mouse4" });
+    useVoice.setState({ muted: false, deafened: false });
+    useGlobalPtt.setState({ status: "permission", native: true });
+    await render(<MicButton />);
+    const button = container.querySelector("button")!;
+    expect(button.getAttribute("aria-label")).toBe("Brak zgody. Mikrofon zamknięty. Otwórz ustawienia dźwięku.");
+    expect(button.hasAttribute("aria-pressed")).toBe(false);
+    await act(async () => button.click());
+    expect(useUi.getState()).toMatchObject({ section: "settings", settingsTab: "audio" });
+    expect(toggle).not.toHaveBeenCalled();
+    await act(async () => useGlobalPtt.setState({ status: "ready" }));
+    expect(button.getAttribute("aria-label")).toContain("Mysz 4");
+    await act(async () => button.click());
+    expect(toggle).toHaveBeenCalledOnce();
+  } finally {
+    await act(async () => { useSettings.setState({ audio: previousAudio }); useGlobalPtt.setState(previousGlobal); });
+    delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__;
+  }
+});
+
+
+it("the microphone setup action has a precise name and no pressed state when PTT has no key", async () => {
+  const previous = useSettings.getState().audio;
+  const toggle = vi.spyOn(controller, "toggleMute");
+  useSettings.getState().setAudio({ inputMode: "ptt", pttKey: null });
+  try {
+    await render(<MicButton />);
+    const button = container.querySelector("button")!;
+    expect(button.getAttribute("aria-label")).toBe("Wybierz klawisz do mówienia w ustawieniach dźwięku");
+    expect(button.hasAttribute("aria-pressed")).toBe(false);
+    await act(async () => button.click());
+    expect(useUi.getState()).toMatchObject({ section: "settings", settingsTab: "audio" });
+    expect(toggle).not.toHaveBeenCalled();
+  } finally { await act(async () => useSettings.setState({ audio: previous })); }
 });

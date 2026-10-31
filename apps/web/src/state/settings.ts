@@ -269,8 +269,10 @@ export interface AudioSettings {
   /** Automatic retains the default gate; manual uses vadThreshold in dBFS. */
   automaticSensitivity: boolean;
   vadThreshold: number;
-  /** KeyboardEvent.code of the push-to-talk key. */
+  /** Physical KeyboardEvent.code or Mouse3/Mouse4/Mouse5; old key codes are preserved verbatim. */
   pttKey: string | null;
+  /** Release tail in milliseconds, 0..1000. */
+  pttReleaseDelay: number;
   noiseSuppression: boolean;
   /** How hard noise suppression works, 10..100 (percent; below 100 it caps the cut at half a dB per percent). */
   noiseStrength: number;
@@ -402,6 +404,7 @@ export const defaultAudio: AudioSettings = {
   automaticSensitivity: true,
   vadThreshold: DEFAULT_INPUT_DB,
   pttKey: null,
+  pttReleaseDelay: 300,
   noiseSuppression: true,
   noiseStrength: 100,
   echoCancellation: true,
@@ -418,6 +421,7 @@ export function validAudio(value: unknown): AudioSettings {
     ...defaultAudio, ...audio,
     automaticSensitivity: typeof audio.automaticSensitivity === "boolean" ? audio.automaticSensitivity : true,
     vadThreshold: inputThreshold(audio.vadThreshold),
+    pttReleaseDelay: typeof audio.pttReleaseDelay === "number" && Number.isFinite(audio.pttReleaseDelay) ? Math.min(1000, Math.max(0, Math.round(audio.pttReleaseDelay))) : 300,
   };
 }
 
@@ -594,7 +598,8 @@ export const useSettings = create<SettingsState>()(
         // v6 adds device-local cues without discarding any earlier preferences.
         if (version < 6) p = { ...p, sounds: readSounds(p.sounds) };
         if (version < 7) p = { ...p, desktop: { ...defaultDesktop, ...(p.desktop as object ?? {}) }, notificationOverrides: readNotificationOverrides(p.notificationOverrides) };
-        return p;
+        // v8 adds the release delay; key codes and every other setting stay intact.
+        return version < 8 ? { ...p, audio: validAudio(p.audio) } : p;
       },
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;

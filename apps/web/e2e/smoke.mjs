@@ -1201,7 +1201,7 @@ async function main() {
     await a.getByRole("button", { name: "Settings" }).first().click();
     await a.getByRole("tab", { name: "Voice" }).click();
     await a.getByRole("radio", { name: "Push to talk" }).click();
-    await a.getByRole("button", { name: "Choose a key" }).click();
+    await a.getByRole("button", { name: "Choose a key", exact: true }).click();
     await a.keyboard.press("KeyV");
     await a.keyboard.press("Escape");
     await a.locator("header").first().click();

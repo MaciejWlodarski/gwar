@@ -5,6 +5,7 @@ import { notificationBadge, notificationServerKey } from "../lib/notification-sc
  * "Stop sharing screen" while sharing) and the close-to-tray option.
  * Everything here is a no-op in the browser.
  */
+import { initGlobalPtt, useGlobalPtt } from "./ptt";
 import { tNow } from "../i18n";
 import { controller } from "../state/controller";
 import { useSettings } from "../state/settings";
@@ -18,7 +19,7 @@ type Action = "ptt" | "mute" | "deafen";
 const registered: Record<Action, string | null> = { ptt: null, mute: null, deafen: null };
 
 export function hasGlobalShortcut(action: Action): boolean {
-  return registered[action] !== null;
+  return action === "ptt" ? ["ready", "legacy"].includes(useGlobalPtt.getState().status) : registered[action] !== null;
 }
 
 /** True if this key press is the registered global shortcut for `action` (so the OS already handled it). */
@@ -63,6 +64,7 @@ export function initDesktop(): (() => void) | undefined {
   void (async () => {
     const api = await tauri();
     if (disposed) return;
+    cleanup(await initGlobalPtt(api));
     cleanup(await api.listen<{ down: boolean }>("shortcut://ptt", (p) => controller.setPtt(p.down)));
     const act = (action: string) => {
       if (action === "mute") controller.toggleMute();
@@ -82,7 +84,7 @@ export function initDesktop(): (() => void) | undefined {
         mute: desktop.muteShortcut,
         deafen: desktop.deafenShortcut,
       };
-      for (const action of ["ptt", "mute", "deafen"] as const) {
+      for (const action of ["mute", "deafen"] as const) {
         if (last[action] === wanted[action]) continue;
         last[action] = wanted[action];
         void register(api, action, wanted[action]);
