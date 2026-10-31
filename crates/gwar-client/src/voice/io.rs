@@ -3,7 +3,7 @@
 
 use std::{
     sync::{
-        Arc, Mutex, MutexGuard, OnceLock, TryLockError,
+        Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc as std_mpsc,
     },
@@ -127,12 +127,13 @@ pub struct DeviceIo {
     pub on_issue: Option<IssueSink>,
     events: std_mpsc::Sender<Event>,
     inbox: std_mpsc::Receiver<Event>,
+    stopped: Arc<DeviceStopped>,
 }
 
 impl DeviceIo {
     pub fn new(input: Option<String>, output: Option<String>) -> Self {
         let (events, inbox) = std_mpsc::channel();
-        Self { input, output, input_only: false, on_issue: None, events, inbox }
+        Self { input, output, input_only: false, on_issue: None, events, inbox, stopped: Arc::default() }
     }
 
     /// A settings preview owns capture only; cues retain the output device.
@@ -148,19 +149,53 @@ impl DeviceIo {
 
     /// Moves the devices once open to other choices, without restarting the engine.
     pub fn control(&self) -> DeviceControl {
-        DeviceControl(self.events.clone())
+        DeviceControl(self.events.clone(), self.stopped.clone())
     }
 }
 
 /// Changes the devices of a [`DeviceIo`]; does nothing once it stopped.
 #[derive(Clone)]
-pub struct DeviceControl(std_mpsc::Sender<Event>);
+pub struct DeviceControl(std_mpsc::Sender<Event>, Arc<DeviceStopped>);
 
 impl DeviceControl {
     /// `None` follows the system default. Only a side whose choice changed is reopened.
     pub fn set_devices(&self, input: Option<String>, output: Option<String>) {
         let _ = self.0.send(Event::Want { input, output });
     }
+
+    /// Requests shutdown and waits for actual stream destruction on the device thread.
+    pub fn stop_and_wait(&self, timeout: Duration) -> Result<()> {
+        let _ = self.0.send(Event::Stop);
+        let closed = self.1.closed.lock().map_err(|_| anyhow!("audio shutdown acknowledgement failed"))?;
+        let (closed, _) = self
+            .1
+            .changed
+            .wait_timeout_while(closed, timeout, |closed| !*closed)
+            .map_err(|_| anyhow!("audio shutdown acknowledgement failed"))?;
+        anyhow::ensure!(*closed, "microphone device shutdown timed out; sample was not played");
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct DeviceStopped {
+    closed: Mutex<bool>,
+    changed: Condvar,
+}
+
+/// Declared before the device-thread streams so acknowledgement follows their destruction,
+/// including when a driver panics and the thread unwinds.
+struct StoppedOnDrop(Arc<DeviceStopped>);
+impl Drop for StoppedOnDrop {
+    fn drop(&mut self) {
+        *self.0.closed.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.0.changed.notify_all();
+    }
+}
+
+fn device_thread(stopped: Arc<DeviceStopped>, serve: impl FnOnce()) {
+    let _stopped = StoppedOnDrop(stopped);
+    serve();
 }
 
 /// What the device thread reacts to.
@@ -883,7 +918,7 @@ pub fn play_cue(output: Option<String>, samples: Vec<f32>, busy: Arc<AtomicUsize
 
 impl AudioIo for DeviceIo {
     fn open(self: Box<Self>) -> Result<AudioPorts> {
-        let DeviceIo { input, output: speakers, input_only, on_issue, events, inbox } = *self;
+        let DeviceIo { input, output: speakers, input_only, on_issue, events, inbox, stopped } = *self;
         let (mic_tx, mic) = RingBuffer::<CaptureSample>::new(RATE as usize); // 1 s
         let (speaker, speaker_rx) = RingBuffer::<f32>::new(RATE as usize / 2);
         let output = Arc::new(OutputTiming::default());
@@ -893,32 +928,34 @@ impl AudioIo for DeviceIo {
         // cpal streams are not `Send` on every platform; they live on this thread, and the
         // CoreAudio listeners are added and removed on it.
         thread::Builder::new().name("gwar-audio-devices".into()).spawn(move || {
-            let backend = Cpal {
-                host: cpal::default_host(),
-                mic: Arc::new(Mutex::new(MicFeed { tx: mic_tx, position: 0, last: None })),
-                speaker: Arc::new(Mutex::new(speaker_rx)),
-                timing,
-                active: Default::default(),
-                offers: Default::default(),
-            };
-            let changed = events.clone();
-            let _watch = watch::start(move || {
-                let _ = changed.send(Event::Changed);
-            });
-            let sink = on_issue.clone();
-            let mut router = Router::new(backend, input, speakers, events, on_issue);
-            router.lanes[1].enabled = !input_only;
-            let served = guarded("the audio device thread", || {
-                router.start(Instant::now());
-                let _ = ready_tx.send(());
-                router.run(&inbox);
-            });
-            if let (Err(e), Some(sink)) = (served, sink) {
-                // Without this thread the devices are gone; say so instead of falling silent.
-                tracing::error!("{e:#}");
-                sink(DeviceIssue::Input(format!("{e:#}")));
-                sink(DeviceIssue::Output(format!("{e:#}")));
-            }
+            device_thread(stopped, || {
+                let backend = Cpal {
+                    host: cpal::default_host(),
+                    mic: Arc::new(Mutex::new(MicFeed { tx: mic_tx, position: 0, last: None })),
+                    speaker: Arc::new(Mutex::new(speaker_rx)),
+                    timing,
+                    active: Default::default(),
+                    offers: Default::default(),
+                };
+                let changed = events.clone();
+                let _watch = watch::start(move || {
+                    let _ = changed.send(Event::Changed);
+                });
+                let sink = on_issue.clone();
+                let mut router = Router::new(backend, input, speakers, events, on_issue);
+                router.lanes[1].enabled = !input_only;
+                let served = guarded("the audio device thread", || {
+                    router.start(Instant::now());
+                    let _ = ready_tx.send(());
+                    router.run(&inbox);
+                });
+                if let (Err(e), Some(sink)) = (served, sink) {
+                    // Without this thread the devices are gone; say so instead of falling silent.
+                    tracing::error!("{e:#}");
+                    sink(DeviceIssue::Input(format!("{e:#}")));
+                    sink(DeviceIssue::Output(format!("{e:#}")));
+                }
+            })
         })?;
         ready_rx.recv().map_err(|_| anyhow!("audio thread died"))?;
         Ok(AudioPorts { mic, speaker, output, _guard: Box::new(stop) })
@@ -929,6 +966,58 @@ impl AudioIo for DeviceIo {
 mod tests {
     use super::{OutputTiming, Resampler};
     use std::sync::atomic::Ordering;
+
+    /// Like cpal: the guard only queues Stop; the input stream drops later on its thread.
+    fn delayed_shutdown()
+    -> (super::DeviceControl, std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)
+    {
+        let io = super::DeviceIo::new(None, None);
+        let control = io.control();
+        let (entered, dropping) = std::sync::mpsc::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        struct Input(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+        impl Drop for Input {
+            fn drop(&mut self) {
+                self.0.send(()).unwrap();
+                self.1.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+            }
+        }
+        let thread = std::thread::spawn(move || {
+            super::device_thread(io.stopped, || {
+                let _input = Input(entered, held);
+                assert!(matches!(io.inbox.recv().unwrap(), super::Event::Stop));
+            })
+        });
+        drop(super::StopOnDrop(control.0.clone()));
+        (control, dropping, release, thread)
+    }
+
+    #[test]
+    fn sample_shutdown_waits_for_delayed_device_stream_destruction() {
+        let (control, dropping, release, device) = delayed_shutdown();
+        dropping.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let (done, answer) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            done.send(control.stop_and_wait(std::time::Duration::from_secs(1))).unwrap();
+        });
+        let early = answer.recv_timeout(std::time::Duration::from_millis(50));
+        release.send(()).unwrap();
+        device.join().unwrap();
+        waiter.join().unwrap();
+        assert!(early.is_err(), "playback was allowed before the input stream was destroyed");
+        answer.recv_timeout(std::time::Duration::from_secs(1)).unwrap().unwrap();
+    }
+
+    #[test]
+    fn sample_shutdown_reports_a_bounded_failure_instead_of_allowing_playback() {
+        let (control, dropping, release, device) = delayed_shutdown();
+        dropping.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let result = control.stop_and_wait(std::time::Duration::from_millis(10));
+        release.send(()).unwrap();
+        device.join().unwrap();
+        assert!(result.is_err(), "an unacknowledged shutdown cannot allow sample playback");
+        control.stop_and_wait(std::time::Duration::from_millis(10)).unwrap();
+    }
 
     #[test]
     fn sample_output_uses_the_default_when_the_saved_headset_is_unplugged() {

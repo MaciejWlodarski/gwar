@@ -26,7 +26,7 @@ try {
           const box = await dialog.boundingBox();
           assert.ok(box.x >= 0 && box.y >= 0 && box.x + box.width <= width + 1 && box.y + box.height <= height + 1, `${name}: dialog outside viewport`);
         }
-        if (["settings", "recording", "playing", "restored-preview"].includes(name)) {
+        if (["settings", "recording", "preparing", "playing", "restored-preview"].includes(name)) {
           const fits = await page.locator("[data-mic-playback] [role=status]").evaluate(el => {
             const range = document.createRange(); range.selectNodeContents(el);
             const rects = [...range.getClientRects()], box = el.getBoundingClientRect();
@@ -53,6 +53,11 @@ try {
       await page.waitForFunction(() => Number(document.querySelector('[role=meter]')?.getAttribute("aria-valuenow")) >= 50);
       await page.getByText("Mów teraz…", { exact: true }).waitFor();
       await shot("recording");
+      await page.getByText("Przygotowywanie…", { exact: true }).waitFor();
+      assert.ok(await page.evaluate(() => window.fixtureTracks.every(t => t.readyState === "ended")));
+      assert.equal(await page.evaluate(() => window.fixtureReplays.length), 0, "Sample played before routing completed");
+      await shot("preparing");
+      await page.evaluate(() => window.fixtureReleaseRoute());
       await page.getByText("Odsłuch…", { exact: true }).waitFor();
       assert.ok(await page.evaluate(() => window.fixtureTracks.every(t => t.readyState === "ended")), "Capture remains live during replay");
       assert.ok(await page.evaluate(() => window.fixtureReplays.length === 1 && window.fixtureReplays[0].liveInputs === 0 && window.fixtureReplays[0].rms > .005), "No audible sample, or feedback path");
@@ -95,10 +100,22 @@ try {
       await open("chat");
       assert.ok(await page.getByRole("button", { name: "Dołącz do głosu", exact: true }).isVisible());
       await shot("chat-header");
+      await open("spacer");
+      await page.getByRole("heading", { name: "[cspacer1]Rozmowy", exact: true }).waitFor();
+      assert.equal(await page.locator("main header").getByRole("button", { name: "Dołącz do głosu", exact: true }).count(), 0, "Spacer header offers voice joining");
+      await shot("spacer-header");
+      await open("capture-error");
+      if (width < 800) await page.locator('[data-page="audio"]').click();
+      await page.getByRole("button", { name: "Posłuchaj siebie", exact: true }).click();
+      const shutdown = page.getByRole("alert");
+      await shutdown.getByText("Nie udało się wyłączyć mikrofonu na czas. Nagranie nie zostało odtworzone.", { exact: true }).waitFor();
+      await shutdown.scrollIntoViewIfNeeded();
+      assert.ok(await page.evaluate(() => window.fixtureTracks.every(t => t.readyState === "ended")));
+      await shot("capture-error");
       await context.close();
     }
   }
   assert.deepEqual(errors, []);
-  await writeFile(path.join(output, "README.md"), `# Voice UX screenshots\n\n${shots.length} screenshots of production React components in a local offline fixture. Polish, both themes, desktop 1440x900, tablet 768x1024, 390x844 and 360x800. Generated microphone tone; no OS microphone or Gwar/TeamSpeak connection. Device labels and participants are fixture data.\n\nChecked: no page overflow; dialogs fit; local mute retains 45% volume; stable-uid settings; visible join controls; record then playback with zero live input tracks; synchronous blur cancellation; live recording level follows input changes; completed samples release buffers/callbacks and restore the eligible silent preview; idle/record/play status fits on one line.\n\n${shots.map(s => `- ${s}`).join("\n")}\n`);
+  await writeFile(path.join(output, "README.md"), `# Voice UX screenshots\n\n${shots.length} screenshots of production React components in a local offline fixture. Polish, both themes, desktop 1440x900, tablet 768x1024, 390x844 and 360x800. Generated microphone tone; no OS microphone or Gwar/TeamSpeak connection. Device labels and participants are fixture data.\n\nChecked: no page overflow; dialogs fit; local mute retains 45% volume; stable-uid settings; visible join controls; record then playback with zero live input tracks; synchronous blur cancellation; live recording level follows input changes; completed samples release buffers/callbacks and restore the eligible silent preview; idle/record/play status fits on one line; spacer headers have no join action; capture-shutdown failure uses the production localized error UI (injected error, no native hardware).\n\n${shots.map(s => `- ${s}`).join("\n")}\n`);
   console.log(`PASS: ${shots.length} screenshots and offline voice UX assertions. ${output}`);
 } finally { await browser.close(); }

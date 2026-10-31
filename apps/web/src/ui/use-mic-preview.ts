@@ -8,7 +8,7 @@ export function useMicPreview(engine: VoiceEngine) {
   const [level, setLevel] = useState(0);
   const [needsPermission, setNeedsPermission] = useState(false);
   const [error, setError] = useState<unknown>(null);
-  const [playback, setPlayback] = useState<"idle" | "recording" | "playing">("idle");
+  const [playback, setPlayback] = useState<"idle" | "recording" | "preparing" | "playing">("idle");
   const request = useRef<() => void>(() => {});
   const listen = useRef<() => void>(() => {});
   const stop = useRef<() => void>(() => {});

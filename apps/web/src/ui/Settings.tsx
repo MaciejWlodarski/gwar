@@ -211,7 +211,7 @@ function AudioTab() {
         </div>
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5" data-mic-playback>
           <Button size="sm" disabled={inCall || muted} onClick={preview.playback === "idle" ? preview.listen : preview.stop}>{t(preview.playback === "idle" ? "audio.listen" : "audio.stopListening")}</Button>
-          <span role="status" className="text-xs text-muted">{t(inCall ? "audio.listenInCall" : muted ? "audio.listenMuted" : preview.playback === "recording" ? "audio.recording" : preview.playback === "playing" ? "audio.playing" : "audio.listenHint")}</span>
+          <span role="status" className="text-xs text-muted">{t(inCall ? "audio.listenInCall" : muted ? "audio.listenMuted" : preview.playback === "recording" ? "audio.recording" : preview.playback === "preparing" ? "audio.preparing" : preview.playback === "playing" ? "audio.playing" : "audio.listenHint")}</span>
         </div>
         {preview.error != null && <p role="alert" className="text-sm text-danger">{describeVoiceError(preview.error instanceof VoiceError ? preview.error : new VoiceError("mic_failed", String(preview.error)))}</p>}
       </Section>

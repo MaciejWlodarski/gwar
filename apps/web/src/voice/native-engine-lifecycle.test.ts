@@ -466,3 +466,10 @@ it.each([false, true])("reports native sample completion only after retirement, 
   expect(listeners.get("voice://test-state")?.size).toBe(0);
   expect(listeners.get("voice://test-level")?.size).toBe(0);
 });
+
+it("reports an unconfirmed capture shutdown honestly instead of blaming the speakers", async () => {
+  const view = engine(), error = vi.fn();
+  await view.startMicTest(vi.fn(), undefined, { phase: vi.fn(), error });
+  emit("voice://test-state", { owner: 1, test: 1, state: "idle", error: "shutdown timed out", error_kind: "capture_shutdown" });
+  expect(error).toHaveBeenCalledWith(expect.objectContaining({ kind: "mic_stop_failed" }));
+});

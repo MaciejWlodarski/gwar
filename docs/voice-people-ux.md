@@ -57,6 +57,30 @@ resynchronization, identity-pin and older-history assertions without relying on
 removed presence notices. The remaining join-related sound-preview text in
 `e2e/sound-cues.mjs` is an existing sound control, not a presence-notice wait.
 
+## Round-two regressions
+
+Native sample playback waits for an acknowledgement emitted after device-thread
+stream destruction, including delayed destruction. The two-second deadline prevents
+playback when shutdown cannot be confirmed, with a specific Polish/English error.
+Guard drop and cancellation remain immediate stop requests. Playback rechecks
+ownership after waiting. Browser samples wait for the current output route or its
+completed fallback, then recheck cancellation; media-element playback also waits
+for `setSinkId`. Regressions cover deferred context/element routing, replacement,
+fallback failure and cancellation.
+A short Preparing status covers shutdown, routing and decode waits after recording
+has stopped. The browser fixture deliberately defers routing and verifies that
+capture is closed and playback has not begun in this state.
+
+The chat header applies the same top-level TeamSpeak spacer rule as the tree,
+including channels promoted to the top level after their parent disappears. Spacers
+have no Join voice action at desktop or mobile widths; Gwar names and nested
+TeamSpeak channels remain joinable.
+
+The reported TeamSpeak attachment/ban failure at `tests/support/mod.rs:112` is the
+120-second bridge-ready setup wait, before the test connects clients or exercises
+attachments and bans. No changes in this PR affect bridge/server startup or that
+test's setup path. No production TeamSpeak connection was used to investigate it.
+
 ## Design scope and review
 
 The app-screen direction is `true-black-flat`, keeping Gwar's existing palette and

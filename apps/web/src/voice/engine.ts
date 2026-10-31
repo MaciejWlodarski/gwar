@@ -12,7 +12,7 @@ export type InputMode = "vad" | "ptt";
 export type MicPermission = "granted" | "prompt" | "denied" | "unknown";
 export interface MicTestPlayback {
   /** Natural idle is reported only after the run, recording and playback resources retire. */
-  phase(value: "recording" | "playing" | "idle"): void;
+  phase(value: "recording" | "preparing" | "playing" | "idle"): void;
   error(error: unknown): void;
 }
 
@@ -30,6 +30,7 @@ export type VoiceErrorKind =
   | "mic_denied" // permission refused
   | "no_mic" // no input device
   | "mic_failed" // device busy / other capture error
+  | "mic_stop_failed" // input shutdown was not acknowledged; the sample was not played
   | "insecure" // page is not a secure context, browsers hide the microphone
   | "output_failed" // speakers could not be opened / disappeared (desktop)
   | "negotiation" // WebRTC offer/answer failed

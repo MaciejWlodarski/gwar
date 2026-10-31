@@ -115,6 +115,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private routedOutputId: string | null = null;
   /** Each routing attempt's token: a late rejection of an older one changes nothing. */
   private routeAttempt = 0;
+  private outputReady: Promise<void> = Promise.resolve();
   /** The microphone was lost or never found: one appearing is opened at once. */
   private micMissing = false;
   private followTimer: ReturnType<typeof setTimeout> | null = null;
@@ -845,6 +846,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       let sampleTimer: ReturnType<typeof setTimeout> | null = null;
       let replay: AudioBufferSourceNode | null = null;
       const chunks: Blob[] = [];
+      let sampleBuffer: AudioBuffer | null = null;
       const recording = playback ? ctx.createMediaStreamDestination() : null;
       if (recording) source.connect(recording);
       const retarget = () => {
@@ -896,6 +898,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
           if (held.state === "recording") held.stop();
         }
         chunks.length = 0;
+        sampleBuffer = null;
         closeCapture();
         if (replay) {
           const held = replay;
@@ -921,15 +924,26 @@ export class WebRtcVoiceEngine implements VoiceEngine {
             recorder = null;
             sampleTimer = null;
             if (cancelled || signal.aborted) return;
+            playback.phase("preparing");
             void (async () => {
               try {
                 const output = this.ensureContext();
                 await output.resume();
-                const buffer = await output.decodeAudioData(await new Blob(chunks).arrayBuffer());
+                // The media-element sink may still be on speakers while headphones are pending.
+                // A replacement device route must also settle before the sample can start.
+                // Wait before decoding so cancellation clears all recorded chunks while pending.
+                let route: Promise<void>;
+                do { route = this.outputReady; await route; } while (route !== this.outputReady);
+                if (cancelled || signal.aborted) return;
+                sampleBuffer = await output.decodeAudioData(await new Blob(chunks).arrayBuffer());
                 chunks.length = 0;
+                if (cancelled || signal.aborted) { sampleBuffer = null; return; }
+                // Decoding can also outlive a cancellation or a device change.
+                do { route = this.outputReady; await route; } while (route !== this.outputReady);
                 if (cancelled || signal.aborted) return;
                 replay = output.createBufferSource();
-                replay.buffer = buffer;
+                replay.buffer = sampleBuffer;
+                sampleBuffer = null;
                 replay.connect(this.master!);
                 replay.onended = () => {
                   void complete().then(current => { if (current) playback.phase("idle"); });
@@ -994,18 +1008,21 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     const elementSink = typeof HTMLMediaElement !== "undefined" && "setSinkId" in HTMLMediaElement.prototype;
     // A device that cannot be routed to plays on the default and counts as not routed, so its
     // return routes it again.
-    const unrouted = () => {
-      if (attempt !== this.routeAttempt || !id) return;
+    const unrouted = async (error: unknown) => {
+      if (attempt !== this.routeAttempt) return;
+      if (!id) throw error;
       this.routedOutputId = null;
       master.disconnect();
-      master.connect(ctx.destination);
       this.sinkElement?.pause();
-      void ctx.setSinkId?.("").catch(() => {});
+      // Do not declare the default ready while resetting a failed context sink is pending.
+      await ctx.setSinkId?.("");
+      if (attempt === this.routeAttempt) master.connect(ctx.destination);
     };
     if (!id || ctxSink) {
       master.connect(ctx.destination);
       this.sinkElement?.pause();
-      void ctx.setSinkId?.(id ?? "").catch(unrouted);
+      this.outputReady = (ctx.setSinkId?.(id ?? "") ?? Promise.resolve()).catch(unrouted);
+      void this.outputReady.catch(() => {});
       return;
     }
     if (elementSink) {
@@ -1015,11 +1032,15 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         this.sinkElement = new Audio() as SinkAudioElement;
         this.sinkElement.srcObject = this.streamDest.stream;
       }
-      void this.sinkElement.setSinkId?.(id).catch(unrouted);
-      void this.sinkElement.play().catch(() => {});
+      const element = this.sinkElement;
+      this.outputReady = element.setSinkId!(id).then(async () => {
+        if (attempt === this.routeAttempt) await element.play();
+      }).catch(unrouted);
+      void this.outputReady.catch(() => {});
       return;
     }
     master.connect(ctx.destination);
+    this.outputReady = Promise.resolve();
   }
 
   private attachSlot(slot: number, track: MediaStreamTrack): void {

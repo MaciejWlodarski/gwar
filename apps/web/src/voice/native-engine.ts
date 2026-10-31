@@ -466,9 +466,9 @@ export class NativeVoiceEngine implements VoiceEngine {
       smooth = target > smooth ? target : smooth * 0.8 + target * 0.2;
       onLevel(smooth < 0.01 ? 0 : smooth);
     });
-    const offState = playback ? await api.listen<{ owner: number; test: number; state: "recording" | "playing" | "idle"; error?: string }>("voice://test-state", p => {
+    const offState = playback ? await api.listen<{ owner: number; test: number; state: "recording" | "preparing" | "playing" | "idle"; error?: string; error_kind?: "capture_shutdown" }>("voice://test-state", p => {
       if (p.owner !== owner || p.test !== test || test !== this.micTestId || signal.aborted) return;
-      if (p.error) playback.error(new VoiceError("output_failed", p.error));
+      if (p.error) playback.error(new VoiceError(p.error_kind === "capture_shutdown" ? "mic_stop_failed" : "output_failed", p.error));
       else if (p.state === "idle") void complete().then(current => { if (current) playback.phase("idle"); });
       else playback.phase(p.state);
     }) : () => {};

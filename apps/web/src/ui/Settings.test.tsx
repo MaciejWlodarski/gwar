@@ -249,6 +249,9 @@ it("restores the eligible sensitivity preview after completed playback has retir
   await mount();
   await act(async () => button("Hear yourself").click());
   const [, sampleSignal, playback] = voice.startMicTest.mock.calls[1]!;
+  await act(async () => playback!.phase("preparing"));
+  expect(container.textContent).toContain("Preparing…");
+  expect(button("Stop test")).toBeDefined();
   await act(async () => playback!.phase("playing"));
   await act(async () => playback!.phase("idle"));
   expect(sampleSignal!.aborted).toBe(true);

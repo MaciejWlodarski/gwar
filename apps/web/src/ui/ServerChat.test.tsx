@@ -44,6 +44,31 @@ afterEach(async () => {
 const show = () => act(async () => root.render(<TooltipProvider><ChatArea /></TooltipProvider>));
 const button = (label: string) => container.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
 
+it.each([false, true])("does not offer header voice joining for a TeamSpeak spacer (mobile=%s)", async mobile => {
+  vi.spyOn(window, "matchMedia").mockImplementation(query => ({ matches: mobile, media: query, addEventListener: vi.fn(), removeEventListener: vi.fn() }) as unknown as MediaQueryList);
+  const join = vi.spyOn(controller, "joinChannelInteractive").mockResolvedValue();
+  const channel = { id: 2, parent: null, name: "[cspacer1]Welcome", topic: "", position: 2, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false };
+  useSession.setState({ kind: "teamspeak", activeThread: "channel", viewChannel: 2, permissions: ["connect"], channels: { 2: channel },
+    owner: { uid: "me" } as never,
+    clients: { 1: { id: 1, uid: "me", nickname: "Me", channel: null, groups: [], platform: "web", muted: false, deafened: false, away: null, talking: false, voice: false, voice_binding: null } } });
+  await show();
+  const action = () => [...container.querySelectorAll<HTMLButtonElement>("header button")].find(el => el.textContent === "Join voice");
+  expect(action()).toBeUndefined();
+  expect(join).not.toHaveBeenCalled();
+  // Gwar does not interpret spacer syntax, and nested TeamSpeak names are real channels.
+  await act(async () => useSession.setState({ kind: "gwar" }));
+  expect(action()).toBeDefined();
+  await act(async () => action()!.click());
+  expect(join).toHaveBeenCalledWith(2);
+  await act(async () => useSession.setState({ kind: "teamspeak", channels: { 1: { ...channel, id: 1, name: "Lobby" }, 2: { ...channel, parent: 1 } } }));
+  expect(action()).toBeDefined();
+  await act(async () => action()!.click());
+  expect(join).toHaveBeenCalledTimes(2);
+  // The tree promotes an orphan to its top level, where spacer syntax applies again.
+  await act(async () => useSession.setState({ channels: { 2: { ...channel, parent: 1 } } }));
+  expect(action()).toBeUndefined();
+});
+
 it.each(["encrypted", "plaintext", "teamspeak"] as const)("uses the %s server sending and attachment path", async mode => {
   const encrypted = mode === "encrypted";
   useSession.setState({ kind: mode === "teamspeak" ? "teamspeak" : "gwar", server: { ...welcome().server, upload_limit: 1000, server_chat: { encrypted, history: encrypted } } });

@@ -1168,9 +1168,18 @@ struct TestState {
     test: u64,
     state: &'static str,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_kind: Option<&'static str>,
 }
 
 const MIC_SAMPLE_LEN: usize = 3 * 48_000;
+const MIC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn finish_sample_capture(test: &NativeRun, wait: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    test.close_capture();
+    wait()?;
+    test.check()
+}
 
 fn append_mic_sample(samples: &mut Vec<f32>, frame: &[f32]) {
     let take = frame.len().min(MIC_SAMPLE_LEN.saturating_sub(samples.len()));
@@ -1231,7 +1240,8 @@ pub async fn mic_test_start(
     let app = window.app_handle().clone();
     let id = test;
     let test = claim_mic_test(&voice, owner, id)?;
-    let io = Box::new(RunIo { run: test.clone(), io: make_io(&voice, input, None, issue_sink(&app, owner), true).0 });
+    let (io, devices) = make_io(&voice, input, None, issue_sink(&app, owner), true);
+    let io = Box::new(RunIo { run: test.clone(), io });
     // Wait for a cancelled open to finish releasing its ports before voice can acquire capture.
     let ports = tokio::task::spawn_blocking(move || io.open())
         .await
@@ -1247,7 +1257,10 @@ pub async fn mic_test_start(
             let started = Instant::now();
             if playback {
                 samples.reserve(MIC_SAMPLE_LEN);
-                let _ = app.emit("voice://test-state", TestState { owner, test: id, state: "recording", error: None });
+                let _ = app.emit(
+                    "voice://test-state",
+                    TestState { owner, test: id, state: "recording", error: None, error_kind: None },
+                );
             }
             let mut processor = MicrophoneProcessor::default();
             let mut frame = [0.0; gwar_client::voice::FRAME];
@@ -1292,9 +1305,34 @@ pub async fn mic_test_start(
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            // Stop consuming input and release the capture guard before replay.
-            test.close_capture();
-            drop(_guard);
+            // A dropped guard only queues Stop. A sample must wait for actual stream destruction.
+            if playback && test.check().is_ok() {
+                let _ = app.emit(
+                    "voice://test-state",
+                    TestState { owner, test: id, state: "preparing", error: None, error_kind: None },
+                );
+            }
+            let closed = finish_sample_capture(&test, || {
+                drop(_guard);
+                devices
+                    .as_ref()
+                    .map_or(Ok(()), |devices| devices.stop_and_wait(MIC_SHUTDOWN_TIMEOUT).map_err(|e| format!("{e:#}")))
+            });
+            if let Err(error) = closed {
+                if playback && test.check().is_ok() {
+                    let _ = app.emit(
+                        "voice://test-state",
+                        TestState {
+                            owner,
+                            test: id,
+                            state: "idle",
+                            error: Some(error),
+                            error_kind: Some("capture_shutdown"),
+                        },
+                    );
+                }
+                return;
+            }
             if playback && test.check().is_ok() {
                 let _ = app.emit("voice://test-level", TestLevel { owner, test: id, db: -100.0 });
                 let voice = app.state::<Voice>();
@@ -1305,12 +1343,21 @@ pub async fn mic_test_start(
                 for sample in &mut samples {
                     *sample *= gain;
                 }
-                let _ = app.emit("voice://test-state", TestState { owner, test: id, state: "playing", error: None });
+                let _ = app.emit(
+                    "voice://test-state",
+                    TestState { owner, test: id, state: "playing", error: None, error_kind: None },
+                );
                 let result = gwar_client::voice::io::play_sample(output, samples, test.silence.clone());
                 if test.check().is_ok() {
                     let _ = app.emit(
                         "voice://test-state",
-                        TestState { owner, test: id, state: "idle", error: result.err().map(|e| format!("{e:#}")) },
+                        TestState {
+                            owner,
+                            test: id,
+                            state: "idle",
+                            error: result.err().map(|e| format!("{e:#}")),
+                            error_kind: None,
+                        },
                     );
                 }
             }
@@ -1386,6 +1433,33 @@ mod run_tests {
         pause_mic_test(&voice);
         assert!(test.silence.load(Ordering::SeqCst));
         assert!(test.check().is_err());
+    }
+
+    #[test]
+    fn sample_playback_requires_acknowledged_capture_shutdown_and_current_ownership() {
+        let test = NativeRun::new();
+        let closed = Arc::new(AtomicBool::new(false));
+        *test.audio.lock().unwrap() = Some(Box::new(Closed(closed.clone())));
+        let mut played = false;
+        let result = finish_sample_capture(&test, || {
+            assert!(closed.load(Ordering::SeqCst), "Stop must be requested before waiting");
+            Err("microphone device shutdown timed out".into())
+        })
+        .map(|()| {
+            played = true;
+        });
+        assert!(result.unwrap_err().contains("shutdown timed out"));
+        assert!(!played);
+        // Cancellation while the device thread is stopping also forbids playback.
+        let result = finish_sample_capture(&test, || {
+            test.retire();
+            Ok(())
+        })
+        .map(|()| {
+            played = true;
+        });
+        assert!(result.is_err());
+        assert!(!played);
     }
 
     #[test]

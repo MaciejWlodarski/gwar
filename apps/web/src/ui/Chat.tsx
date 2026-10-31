@@ -8,6 +8,7 @@ import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRe
 import { countKey, useLanguage, useT, type TFn } from "../i18n";
 import { cn } from "../lib/cn";
 import { memberName } from "../lib/member-name";
+import { parseSpacer } from "../lib/spacer";
 import { buildRows, messageTarget, sealedThread, type Row } from "../lib/chat";
 import { useIsMobile } from "../lib/media";
 import { checkUpload, formatBytes } from "../lib/files";
@@ -1073,6 +1074,10 @@ function ChatHeader() {
   const phase = useSession((s) => s.phase);
   const viewChannel = useSession((s) => s.viewChannel);
   const channel = useSession((s) => (s.viewChannel === null ? undefined : s.channels[s.viewChannel]));
+  const spacer = useSession(s => {
+    const channel = s.viewChannel === null ? undefined : s.channels[s.viewChannel];
+    return s.kind !== "gwar" && !!channel && !!parseSpacer(channel.name, channel.parent === null || !s.channels[channel.parent]);
+  });
   // People talking in the channel whose chat is open.
   const userCount = useSession((s) => Object.values(s.clients).filter((c) => c.channel !== null && c.channel === s.viewChannel).length);
   const myChannel = useSession(myChannelId);
@@ -1103,7 +1108,7 @@ function ChatHeader() {
     if (encrypted) icon = <Lock className="size-5 text-subtle" />;
   }
 
-  const joinButton = active === "channel" && channel && myChannel !== channel.id && canJoin && phase === "online" ? <Button size="sm" busy={joining} onClick={() => void controller.joinChannelInteractive(channel.id)}><Headphones className="size-4" /><span>{t("tree.joinVoice")}</span></Button> : null;
+  const joinButton = active === "channel" && channel && !spacer && myChannel !== channel.id && canJoin && phase === "online" ? <Button size="sm" busy={joining} onClick={() => void controller.joinChannelInteractive(channel.id)}><Headphones className="size-4" /><span>{t("tree.joinVoice")}</span></Button> : null;
   return (
     <header className="shrink-0 border-b border-line">
       <div className="flex h-12 items-center gap-2 px-3 md:px-4">

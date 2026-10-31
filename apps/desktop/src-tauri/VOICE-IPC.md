@@ -59,10 +59,13 @@ automatic mode uses the legacy server criterion. Older servers keep automatic
 activation; manual sensitivity is unavailable and unsupported PTT stays closed.
 
 An explicit `playback: true` microphone test records up to three seconds of processed
-48 kHz mono PCM in memory. It closes the capture guard before opening the chosen
-output. `voice://test-state {owner, test, state, error?}` reports `recording`,
-`playing` and `idle`; only the matching owner/test may update the UI. Retirement,
+48 kHz mono PCM in memory. It requests capture shutdown, then waits up to two seconds
+for the device thread to acknowledge actual stream destruction before opening the
+chosen output. A shutdown timeout prevents playback and reports a localized capture
+shutdown failure. `voice://test-state {owner, test, state, error?, error_kind?}` reports `recording`,
+`preparing`, `playing` and `idle`; only the matching owner/test may update the UI. Retirement,
 including native window focus/visibility loss, immediately cancels both capture
 and sample output. The default meter-only preview remains silent. No sample is
 uploaded, written to disk or retained between tests. Output opening/playback
-failures are reported to the matching UI test.
+failures are reported to the matching UI test. `error_kind: "capture_shutdown"`
+distinguishes unacknowledged input shutdown from an output-device failure.

@@ -1257,6 +1257,69 @@ it("records processed input without a speaker route, closes capture, then replay
   expect(error).not.toHaveBeenCalled();
 });
 
+it.each([
+  ["context", "ready"], ["element", "ready"],
+  ["context", "cancel"], ["element", "cancel"],
+  ["context", "fallback"], ["element", "fallback"],
+  ["context", "fallback-cancel"], ["context", "fallback-failed"],
+  ["context", "replace"], ["element", "replace"],
+] as const)("waits for the %s output route before microphone sample playback (%s)", async (route, outcome) => {
+  const routed = deferred<void>(), fallback = deferred<void>(), replacement = deferred<void>();
+  const sink = vi.fn((id: string) => id === "usb" ? replacement.promise : id ? routed.promise : fallback.promise), play = vi.fn(async () => {});
+  class Element { setSinkId(id: string) { return sink(id); } play = play; pause = vi.fn(); srcObject = null; }
+  vi.stubGlobal("HTMLMediaElement", Element);
+  vi.stubGlobal("Audio", Element);
+  vi.stubGlobal("AudioContext", class extends Context {
+    setSinkId = route === "context" ? sink : undefined;
+    createMediaStreamDestination() { return { ...node(), stream: microphone().stream }; }
+    decodeAudioData = async () => ({}) as AudioBuffer;
+  });
+  vi.stubGlobal("MediaRecorder", class {
+    state = "inactive";
+    ondataavailable: ((event: { data: Blob }) => void) | null = null;
+    onstop: (() => void) | null = null;
+    start() { this.state = "recording"; }
+    stop() { this.state = "inactive"; this.ondataavailable?.({ data: new Blob(["sample"]) }); this.onstop?.(); }
+  });
+  await engine.setOutputDevice("headphones");
+  const phase = vi.fn(), error = vi.fn(), abort = new AbortController();
+  await engine.startMicTest(vi.fn(), abort.signal, { phase, error });
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(sink).toHaveBeenCalledWith("headphones");
+  expect(cueSources).toHaveLength(0);
+  expect(phase).not.toHaveBeenCalledWith("playing");
+  if (route === "element") expect(play).not.toHaveBeenCalled();
+  expect(phase).toHaveBeenLastCalledWith("preparing");
+  if (outcome === "cancel") abort.abort();
+  if (outcome === "replace") await engine.setOutputDevice("usb");
+  if (outcome.startsWith("fallback")) {
+    routed.reject(new DOMException("Headphones disappeared", "NotFoundError"));
+    await flush();
+    if (route === "context") {
+      expect(sink).toHaveBeenCalledWith("");
+      expect(cueSources).toHaveLength(0);
+      if (outcome === "fallback-cancel") abort.abort();
+      if (outcome === "fallback-failed") fallback.reject(new Error("Default output also failed"));
+      else fallback.resolve();
+    }
+  } else routed.resolve();
+  await flush();
+  if (outcome === "replace") {
+    expect(cueSources).toHaveLength(0);
+    replacement.resolve();
+    await flush();
+  }
+  if (outcome === "cancel" || outcome === "fallback-cancel" || outcome === "fallback-failed") {
+    expect(cueSources).toHaveLength(0);
+    expect(phase).not.toHaveBeenCalledWith("playing");
+    if (outcome === "fallback-failed") expect(error).toHaveBeenCalledOnce();
+    else expect(error).not.toHaveBeenCalled();
+  } else {
+    expect(cueSources[0]!.start).toHaveBeenCalledOnce();
+    expect(error).not.toHaveBeenCalled();
+  }
+});
+
 it("discards a sample whose decode finishes after cancellation", async () => {
   const decoded = deferred<AudioBuffer>();
   const phase = vi.fn();
