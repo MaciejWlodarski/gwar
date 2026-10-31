@@ -38,6 +38,12 @@ macOS Caps Lock is explicitly unsupported for held PTT: its toggled state is not
 a reliable physical hold. The saved binding stays visible with an explanation.
 Windows Caps Lock and right/left modifiers are observed as physical scan codes.
 Unsupported keyboard codes remain saved, rather than silently changing bindings.
+macOS tracks each side of Shift, Control, Option and Command using the bound
+side's device-dependent event flag, rather than the aggregate modifier flag.
+Releasing and pressing the bound side while its opposite stays held preserves
+normal release-delay behavior without triggering listener recovery.
+The flag values are defined in Apple's
+[IOLLEvent.h](https://github.com/apple-oss-distributions/IOHIDFamily/blob/main/IOHIDSystem/IOKit/hidsystem/IOLLEvent.h).
 
 ## Failure recovery
 
@@ -102,7 +108,11 @@ inside the conditionally mounted PTT controls: changing input mode or hiding
 those controls retires keyboard/mouse capture and the global capture flag.
 Tests also cover owner/run replacement, independent health expiry, missing
 release cancellation, Raw Input matching, setup-button accessibility, and
-production MLS stale-commit retry (the browser fixture tolerates only `stale`). Browser screenshots exercise real
+production MLS stale-commit retry (the browser fixture tolerates only `stale`).
+Unposted CoreGraphics-event regressions exercise overlapping release/re-press
+cycles for both sides of every supported modifier pair and verify that physical
+state polling leaves the listener healthy.
+Browser screenshots exercise real
 rendered settings with fixture permission states; they do not establish an OS
 permission grant or physical keyboard/mouse behavior. Real macOS/Windows hardware
 checks must still cover focused games/editors receiving the binding, mouse side

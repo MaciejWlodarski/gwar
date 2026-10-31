@@ -67,11 +67,17 @@ unsafe extern "C" fn callback(_: Ref, kind: u32, event: Ref, info: Ref) -> Ref {
             let down = if b.mouse {
                 kind == 25
             } else if kind == 12 {
+                // NX_DEVICE*KEYMASK values from IOKit/hidsystem/IOLLEvent.h.
+                // Aggregate flags remain set while the opposite side is held.
                 let mask = match b.mac {
-                    54 | 55 => 1 << 20,
-                    56 | 60 => 1 << 17,
-                    58 | 61 => 1 << 19,
-                    59 | 62 => 1 << 18,
+                    54 => 0x0010,
+                    55 => 0x0008,
+                    56 => 0x0002,
+                    60 => 0x0004,
+                    58 => 0x0020,
+                    61 => 0x0040,
+                    59 => 0x0001,
+                    62 => 0x2000,
                     _ => 0,
                 };
                 unsafe { CGEventGetFlags(event) & mask != 0 }
@@ -185,6 +191,8 @@ impl Drop for Observer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ptt::Safety;
+    use std::time::{Duration, SystemTime};
     #[repr(C)]
     struct Point {
         x: f64,
@@ -194,6 +202,70 @@ mod tests {
         fn CGEventCreateKeyboardEvent(source: Ref, key: u16, down: bool) -> Ref;
         fn CGEventSetFlags(event: Ref, flags: u64);
         fn CGEventCreateMouseEvent(source: Ref, kind: u32, point: Point, button: u32) -> Ref;
+    }
+
+    fn modifier_overlap(binding: &str, other: &str, aggregate: u64, bound_flag: u64, other_flag: u64) {
+        let signal = Arc::new(Signal::default());
+        let mut context = Context { binding: Binding::parse(binding).unwrap(), signal: signal.clone() };
+        let info = (&mut context as *mut Context).cast();
+        let bound = context.binding.mac;
+        let other = Binding::parse(other).unwrap().mac;
+        let both = aggregate | bound_flag | other_flag;
+        let start = SystemTime::now();
+        let mut safety = Safety::default();
+        safety.prove_health(start);
+        assert!(!safety.sample(start, false, false, true));
+        // Real flagsChanged payloads retain the aggregate bit until both sides
+        // are released. No event is posted and no tap or OS permission is needed.
+        for (step, (key, flags, physical)) in [
+            (bound, aggregate | bound_flag, true),
+            (other, both, true),
+            (bound, aggregate | other_flag, false),
+            (bound, both, true),
+            (other, aggregate | bound_flag, true),
+            (bound, 0, false),
+            (other, aggregate | other_flag, false),
+            (bound, both, true),
+            (bound, aggregate | other_flag, false),
+            (other, 0, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            unsafe {
+                let event = CGEventCreateKeyboardEvent(ptr::null_mut(), key, true);
+                assert!(!event.is_null());
+                CGEventSetFlags(event, flags);
+                assert_eq!(callback(ptr::null_mut(), 12, event, info), event);
+                CFRelease(event);
+            }
+            let observed = signal.down.load(Ordering::Acquire);
+            assert_eq!(observed, physical, "{binding}, step {step}: bound side must match its physical state");
+            assert!(signal.healthy.load(Ordering::Acquire));
+            let now = start + Duration::from_millis((step as u64 + 1) * 20);
+            assert_eq!(safety.sample(now, physical, observed, true), physical);
+            assert!(!safety.reset, "{binding}, step {step}: overlapping modifiers must not trigger recovery");
+        }
+    }
+
+    macro_rules! overlapping_modifiers {
+        ($($name:ident: ($binding:literal, $other:literal, $aggregate:expr, $bound:expr, $peer:expr)),+ $(,)?) => {
+            $(#[test]
+            fn $name() {
+                modifier_overlap($binding, $other, $aggregate, $bound, $peer);
+            })+
+        };
+    }
+    // Device-dependent NX_DEVICE*KEYMASK values from IOKit/hidsystem/IOLLEvent.h.
+    overlapping_modifiers! {
+        overlapping_shift_left: ("ShiftLeft", "ShiftRight", 1 << 17, 0x0002, 0x0004),
+        overlapping_shift_right: ("ShiftRight", "ShiftLeft", 1 << 17, 0x0004, 0x0002),
+        overlapping_control_left: ("ControlLeft", "ControlRight", 1 << 18, 0x0001, 0x2000),
+        overlapping_control_right: ("ControlRight", "ControlLeft", 1 << 18, 0x2000, 0x0001),
+        overlapping_alt_left: ("AltLeft", "AltRight", 1 << 19, 0x0020, 0x0040),
+        overlapping_alt_right: ("AltRight", "AltLeft", 1 << 19, 0x0040, 0x0020),
+        overlapping_meta_left: ("MetaLeft", "MetaRight", 1 << 20, 0x0008, 0x0010),
+        overlapping_meta_right: ("MetaRight", "MetaLeft", 1 << 20, 0x0010, 0x0008),
     }
 
     #[test]
@@ -225,7 +297,7 @@ mod tests {
         unsafe {
             let event = CGEventCreateKeyboardEvent(ptr::null_mut(), 61, true);
             assert!(!event.is_null());
-            CGEventSetFlags(event, 1 << 19);
+            CGEventSetFlags(event, (1 << 19) | 0x0040);
             assert_eq!(callback(ptr::null_mut(), 12, event, info), event);
             assert!(signal.down.load(Ordering::Acquire));
             CGEventSetFlags(event, 0);
