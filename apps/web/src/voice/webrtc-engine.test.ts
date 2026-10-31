@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DenoiseEvents, DenoisePipeline } from "./denoise";
 import type { VoiceEngine } from "./engine";
 import { WebRtcVoiceEngine } from "./webrtc-engine";
+import score from "../../../../shared/sound-cues.json";
 
 const startDenoise = vi.hoisted(() => vi.fn<(events: DenoiseEvents, signal: AbortSignal) => Promise<DenoisePipeline>>());
 vi.mock("./denoise", () => ({ startDenoise }));
@@ -44,7 +45,12 @@ const node = () => ({ connect: vi.fn(), disconnect: vi.fn() });
 const resume = vi.fn<() => Promise<void>>();
 const mediaSource = vi.fn((_stream: MediaStream) => node());
 const getUserMedia = vi.fn<() => Promise<MediaStream>>();
+const cueSources: Array<ReturnType<typeof cueSource>> = [];
+const cueSource = () => ({ ...node(), start: vi.fn(), stop: vi.fn(), buffer: null, onended: null });
 class Context {
+  state = "running";
+  createBufferSource() { const source = cueSource(); cueSources.push(source); return source; }
+  createBuffer() { return { copyToChannel: vi.fn() }; }
   currentTime = 0;
   destination = {};
   resume = resume;
@@ -64,6 +70,7 @@ const flush = () => vi.advanceTimersByTimeAsync(0);
 beforeEach(() => {
   vi.useFakeTimers();
   Peer.all = [];
+  cueSources.length = 0;
   gates.length = 0;
   startInputGate.mockReset().mockImplementation(async () => {
     const track = microphone().track as unknown as MediaStreamTrack;
@@ -89,6 +96,52 @@ afterEach(async () => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+describe("cue output alongside microphone preview and voice", () => {
+  it("plays idle cues without microphone capture and retires them before voice starts", async () => {
+    const uplink = vi.fn(), support = vi.fn();
+    engine.on("uplink", uplink); engine.on("inputGateSupport", support);
+    await engine.setOutputDevice("headphones");
+    engine.playSound("mute", 0.6);
+    const idle = cueSources[0]!;
+    expect(idle.start).toHaveBeenCalledOnce();
+    expect(getUserMedia).not.toHaveBeenCalled();
+    expect(startInputGate).not.toHaveBeenCalled();
+    expect(Peer.all).toHaveLength(0);
+    await engine.start(params());
+    expect(idle.stop).toHaveBeenCalledOnce();
+    expect(idle.disconnect).toHaveBeenCalled();
+    expect(getUserMedia).toHaveBeenCalledOnce();
+    engine.playSound("selfJoin", 0.6);
+    const active = cueSources[1]!;
+    await engine.stop();
+    expect(active.stop).toHaveBeenCalledOnce();
+    expect(gate().close).toHaveBeenCalledOnce();
+    expect(uplink).toHaveBeenLastCalledWith(null);
+    expect(support).toHaveBeenLastCalledWith(null);
+  });
+
+  it.each(["unknown", "toString", "__proto__"])("S4 drops a cue with unavailable timbre %s without opening output or capture", name => {
+    const original = score.cues.mute.timbre;
+    score.cues.mute.timbre = name;
+    try {
+      expect(() => engine.playSound("mute", 0.6)).not.toThrow();
+      expect(cueSources).toHaveLength(0);
+      expect(getUserMedia).not.toHaveBeenCalled();
+    } finally { score.cues.mute.timbre = original; }
+  });
+
+  it("deafens activity cues while retaining control confirmation without capture", () => {
+    engine.playSound("peerJoin", 0.6);
+    engine.setDeafened(true);
+    expect(cueSources[0]!.stop).toHaveBeenCalledOnce();
+    engine.playSound("peerJoin", 0.6);
+    engine.playSound("deafen", 0.6);
+    expect(cueSources).toHaveLength(2);
+    expect(cueSources[1]!.start).toHaveBeenCalledOnce();
+    expect(getUserMedia).not.toHaveBeenCalled();
+  });
 });
 
 describe("browser voice run ownership", () => {

@@ -1,5 +1,6 @@
+import { SoundSettings } from "./SoundSettings";
+import { Bell, Volume2, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, Settings as SettingsIcon, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
 import { exportIdentityBackup } from "../state/identity-backup";
-import { Bell, Check, CloudCog, Copy, Download, Languages, Monitor, Moon, Palette, Settings as SettingsIcon, SlidersHorizontal, Sun, Upload, UserRound } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { tNow, useT } from "../i18n";
 import { cn } from "../lib/cn";
@@ -40,6 +41,7 @@ export function SettingsSection({ card }: { card?: boolean }) {
   const tabs: Array<SettingsPage<SettingsTab>> = [
     { id: "audio", label: t("settings.audio"), icon: <SlidersHorizontal className="size-4" />, value: t(inputMode === "ptt" ? "audio.ptt" : "audio.vad") },
     { id: "notifications", label: t("settings.notifications"), icon: <Bell className="size-4" /> },
+    { id: "sounds", label: t("settings.sounds"), icon: <Volume2 className="size-4" /> },
     { id: "appearance", label: t("settings.appearance"), icon: <Palette className="size-4" />, value: t(`appearance.${theme}`) },
     { id: "identity", label: t("settings.identity"), icon: <UserRound className="size-4" />, value: nickname || undefined, group: 1 },
     { id: "account", label: t("settings.account"), icon: <CloudCog className="size-4" />, value: handle ? `@${handle}` : undefined, group: 1 },
@@ -56,6 +58,7 @@ export function SettingsSection({ card }: { card?: boolean }) {
       {(page) =>
         page === "audio" ? <AudioTab />
         : page === "notifications" ? <NotificationsTab />
+        : page === "sounds" ? <SoundSettings />
         : page === "appearance" ? <AppearanceTab />
         : page === "identity" ? <IdentityTab />
         : page === "account" ? <AccountTab />

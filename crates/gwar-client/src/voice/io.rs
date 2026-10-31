@@ -123,6 +123,7 @@ pub type IssueSink = Arc<dyn Fn(DeviceIssue) + Send + Sync>;
 pub struct DeviceIo {
     pub input: Option<String>,
     pub output: Option<String>,
+    input_only: bool,
     pub on_issue: Option<IssueSink>,
     events: std_mpsc::Sender<Event>,
     inbox: std_mpsc::Receiver<Event>,
@@ -131,7 +132,13 @@ pub struct DeviceIo {
 impl DeviceIo {
     pub fn new(input: Option<String>, output: Option<String>) -> Self {
         let (events, inbox) = std_mpsc::channel();
-        Self { input, output, on_issue: None, events, inbox }
+        Self { input, output, input_only: false, on_issue: None, events, inbox }
+    }
+
+    /// A settings preview owns capture only; cues retain the output device.
+    pub fn input_only(mut self) -> Self {
+        self.input_only = true;
+        self
     }
 
     pub fn with_issue_sink(mut self, sink: IssueSink) -> Self {
@@ -268,6 +275,7 @@ enum Move {
 }
 
 struct Lane<S> {
+    enabled: bool,
     side: Side,
     follow: Follow,
     stream: Option<S>,
@@ -297,6 +305,7 @@ impl<B: Backend> Router<B> {
     ) -> Self {
         let mut wanted = [input, output];
         let lanes = [0, 1].map(|i| Lane {
+            enabled: true,
             side: SIDES[i],
             follow: Follow::new(wanted[i].take(), backend.reroutes(SIDES[i])),
             stream: None,
@@ -322,6 +331,9 @@ impl<B: Backend> Router<B> {
 
     /// Puts one side on the device it belongs on now, or reports why it cannot be.
     fn reconcile(&mut self, index: usize, now: Instant, why: Move) {
+        if !self.lanes[index].enabled {
+            return;
+        }
         let side = self.lanes[index].side;
         let offer = self.backend.offer(side);
         let plan = self.lanes[index].follow.plan(&offer, now);
@@ -449,7 +461,7 @@ impl<B: Backend> Router<B> {
         if self.poll_at.is_some_and(|at| now >= at) {
             self.poll_at = None;
             for index in 0..2 {
-                if !self.lanes[index].follow.waiting() {
+                if !self.lanes[index].enabled || !self.lanes[index].follow.waiting() {
                     continue;
                 }
                 if self.lanes[index].follow.settle(now) {
@@ -462,7 +474,7 @@ impl<B: Backend> Router<B> {
     }
 
     fn schedule(&mut self, now: Instant) {
-        if !self.lanes.iter().any(|lane| lane.follow.waiting()) {
+        if !self.lanes.iter().any(|lane| lane.enabled && lane.follow.waiting()) {
             self.poll_at = None;
         } else if self.poll_at.is_none() {
             self.poll_at = Some(now + POLL);
@@ -600,9 +612,15 @@ impl Backend for Cpal {
         let active = self.active[lane_index(side)].clone();
         guarded("opening an audio device", || match side {
             Side::Input => open_input(&self.host, route, self.mic.clone(), self.timing.clone(), (active, id), trouble),
-            Side::Output => {
-                open_output(&self.host, route, self.speaker.clone(), self.timing.clone(), (active, id), trouble)
-            }
+            Side::Output => open_output(
+                &self.host,
+                route,
+                self.speaker.clone(),
+                self.timing.clone(),
+                (active, id),
+                trouble,
+                Vec::new(),
+            ),
         })?
     }
 
@@ -681,6 +699,7 @@ fn open_output(
     timing: Arc<OutputTiming>,
     (active, id): (Active, u64),
     trouble: TroubleFn,
+    silence: Vec<Arc<AtomicBool>>,
 ) -> Result<cpal::Stream> {
     let device = match route {
         Route::Named(name) => {
@@ -709,8 +728,9 @@ fn open_output(
                 }
             }
             let take = pending.len().min(frames);
+            let silent = silence.iter().any(|s| s.load(Ordering::Relaxed));
             for (i, frame) in data.chunks_mut(channels).enumerate() {
-                frame.fill(if i < take { pending[i] } else { 0.0 });
+                frame.fill(if !silent && i < take { pending[i] } else { 0.0 });
             }
             pending.drain(..take);
             timing.report(
@@ -725,9 +745,70 @@ fn open_output(
     Ok(stream)
 }
 
+/// Outside a call, play a short cue on the chosen output without ever opening the microphone.
+/// The counter bounds this to two workers/streams; bursts are dropped, never queued.
+pub fn play_cue(output: Option<String>, samples: Vec<f32>, busy: Arc<AtomicUsize>, silence: Vec<Arc<AtomicBool>>) {
+    if busy.fetch_add(1, Ordering::AcqRel) >= 2 {
+        busy.fetch_sub(1, Ordering::Release);
+        return;
+    }
+    let release = busy.clone();
+    let result = thread::Builder::new().name("gwar-cue-output".into()).spawn(move || {
+        struct Release(Arc<AtomicUsize>);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::Release);
+            }
+        }
+        let _release = Release(release);
+        let (mut tx, rx) = RingBuffer::new(samples.len().max(1));
+        for sample in samples {
+            let _ = tx.push(sample);
+        }
+        if silence.iter().any(|s| s.load(Ordering::Relaxed)) {
+            return;
+        }
+        let timing = Arc::new(OutputTiming::default());
+        let route = output.map_or(Route::Default(None), Route::Named);
+        let cancelled = silence.clone();
+        let active = Arc::new(AtomicU64::new(1));
+        let trouble: TroubleFn = Arc::new(|e| tracing::debug!("sound cue output: {e:?}"));
+        match open_output(
+            &cpal::default_host(),
+            &route,
+            Arc::new(Mutex::new(rx)),
+            timing,
+            (active, 1),
+            trouble,
+            silence,
+        ) {
+            Ok(_stream) => {
+                let deadline = Instant::now() + Duration::from_secs(1);
+                while tx.slots() < tx.buffer().capacity() && Instant::now() < deadline {
+                    if cancelled.iter().any(|s| s.load(Ordering::Relaxed)) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                // The last callback still has to reach the device.
+                for _ in 0..10 {
+                    if cancelled.iter().any(|s| s.load(Ordering::Relaxed)) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            Err(e) => tracing::debug!("sound cue output unavailable: {e:#}"),
+        }
+    });
+    if result.is_err() {
+        busy.fetch_sub(1, Ordering::Release);
+    }
+}
+
 impl AudioIo for DeviceIo {
     fn open(self: Box<Self>) -> Result<AudioPorts> {
-        let DeviceIo { input, output: speakers, on_issue, events, inbox } = *self;
+        let DeviceIo { input, output: speakers, input_only, on_issue, events, inbox } = *self;
         let (mic_tx, mic) = RingBuffer::<CaptureSample>::new(RATE as usize); // 1 s
         let (speaker, speaker_rx) = RingBuffer::<f32>::new(RATE as usize / 2);
         let output = Arc::new(OutputTiming::default());
@@ -751,6 +832,7 @@ impl AudioIo for DeviceIo {
             });
             let sink = on_issue.clone();
             let mut router = Router::new(backend, input, speakers, events, on_issue);
+            router.lanes[1].enabled = !input_only;
             let served = guarded("the audio device thread", || {
                 router.start(Instant::now());
                 let _ = ready_tx.send(());
@@ -920,6 +1002,26 @@ mod router_tests {
             let stream = self.router.lanes[lane_index(side)].generation;
             assert!(self.router.handle(Event::Trouble { side, stream, trouble: Trouble::Lost("gone".into()) }, now));
         }
+    }
+
+    #[test]
+    fn microphone_preview_never_opens_output_even_after_device_changes() {
+        let now = Instant::now();
+        let mut s = Setup::new(laptop(), None, None);
+        s.router.lanes[1].enabled = false;
+        s.router.start(now);
+        assert_eq!(s.opened(), [(Side::Input, default("MacBook mic"))]);
+        assert_eq!(s.router.deadline(), None);
+        s.fake().offers[1] = offer(Some("Headphones"), &["Headphones"]);
+        s.router.handle(Event::Changed, now);
+        s.router.tick(now + SETTLE);
+        s.router.handle(Event::Want { input: None, output: Some("Headphones".into()) }, now + SETTLE);
+        assert!(s.opened().is_empty());
+        assert_eq!(s.fake().open_streams.load(Ordering::Relaxed), 1);
+        assert_eq!(s.router.deadline(), None);
+        let streams = s.fake().open_streams.clone();
+        drop(s);
+        assert_eq!(streams.load(Ordering::Relaxed), 0);
     }
 
     #[test]

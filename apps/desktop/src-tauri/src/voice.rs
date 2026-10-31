@@ -29,10 +29,10 @@ use std::{
     net::IpAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gwar_client::voice::{
@@ -102,9 +102,13 @@ struct Inner {
     pending_answer: Option<(u64, oneshot::Sender<Result<String, String>>)>,
     cancelled_through: u64,
     ts_sink: Option<VoiceSinkLease>,
+    idle_cue_cancel: Arc<AtomicBool>,
+    pending_cues: Vec<(Vec<f32>, Instant, bool)>,
 }
 
 pub struct Voice {
+    idle_cue_busy: Arc<AtomicUsize>,
+    cue_deafened: Arc<AtomicBool>,
     inner: Mutex<Inner>,
     /// Id of the active `voice_start`; zero after retirement.
     run: AtomicU64,
@@ -115,6 +119,8 @@ pub struct Voice {
 impl Default for Voice {
     fn default() -> Self {
         Self {
+            idle_cue_busy: Arc::default(),
+            cue_deafened: Arc::default(),
             inner: Mutex::new(Inner {
                 owner: 0,
                 startup: None,
@@ -141,6 +147,8 @@ impl Default for Voice {
                 pending_answer: None,
                 cancelled_through: 0,
                 ts_sink: None,
+                idle_cue_cancel: Arc::default(),
+                pending_cues: Vec::with_capacity(2),
             }),
             run: AtomicU64::new(0),
             heard: Arc::default(),
@@ -389,6 +397,7 @@ fn make_io(
     input: Option<String>,
     output: Option<String>,
     sink: IssueSink,
+    input_only: bool,
 ) -> (Box<dyn AudioIo>, Option<DeviceControl>) {
     if cfg!(debug_assertions) && std::env::var("GWAR_FAKE_AUDIO").is_ok_and(|v| v == "fail") {
         // Exercises the "no devices at all" path: report problems, keep listening/chatting.
@@ -405,6 +414,7 @@ fn make_io(
         return (Box::new(FakeIo { tone: fake_audio::tone(), heard: voice.heard.clone() }), None);
     }
     let devices = DeviceIo::new(input, output).with_issue_sink(sink.clone());
+    let devices = if input_only { devices.input_only() } else { devices };
     let control = devices.control();
     (Box::new(FallbackIo { primary: Box::new(devices), sink }), Some(control))
 }
@@ -429,7 +439,42 @@ fn check_owner(inner: &Inner, owner: u64) -> Result<(), String> {
     if owner == 0 || inner.owner != owner { Err("superseded owner".into()) } else { Ok(()) }
 }
 
+fn retire_idle_cues(inner: &mut Inner) {
+    inner.idle_cue_cancel.store(true, Ordering::Relaxed);
+    inner.idle_cue_cancel = Arc::default();
+}
+
+#[cfg(test)]
+#[test]
+fn starting_voice_retires_idle_cues_and_bootstrap_discards_pending_cues() {
+    let voice = Voice::default();
+    let owner = bootstrap_owner(&voice);
+    let idle = voice.lock().idle_cue_cancel.clone();
+    let preview = claim_mic_test(&voice, owner, 1).unwrap();
+    let preview_closed = Arc::new(AtomicBool::new(false));
+    struct PreviewGuard(Arc<AtomicBool>);
+    impl Drop for PreviewGuard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    *preview.audio.lock().unwrap() = Some(Box::new(PreviewGuard(preview_closed.clone())));
+    claim_run(&voice, owner, 1).unwrap();
+    assert!(idle.load(Ordering::Relaxed));
+    assert!(preview.check().is_err());
+    assert!(preview_closed.load(Ordering::SeqCst));
+    {
+        let mut inner = voice.lock();
+        assert!(!inner.idle_cue_cancel.load(Ordering::Relaxed));
+        inner.pending_cues.push((vec![0.1], Instant::now(), true));
+    }
+    bootstrap_owner(&voice);
+    assert!(voice.lock().pending_cues.is_empty());
+}
+
 fn clear_run(voice: &Voice, inner: &mut Inner) {
+    retire_idle_cues(inner);
+    inner.pending_cues.clear();
     if let Some(startup) = inner.startup.take() {
         startup.retire();
     }
@@ -589,11 +634,21 @@ pub async fn voice_start(
         _ => return Err("invalid voice binding".into()),
     };
     let startup = claim_run(&voice, owner, run)?;
+    // Cancellation silences the callback immediately; wait for its output stream
+    // to close before the call opens that same device.
+    startup
+        .until_retired(async {
+            while voice.idle_cue_busy.load(Ordering::Acquire) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            Ok(())
+        })
+        .await?;
     let (input, output) = {
         let inner = voice.lock();
         (inner.prefs.input.clone(), inner.prefs.output.clone())
     };
-    let (io, control) = make_io(&voice, input, output, issue_sink(&app, owner));
+    let (io, control) = make_io(&voice, input, output, issue_sink(&app, owner), false);
     let io: Box<dyn AudioIo> = Box::new(RunIo { run: startup.clone(), io });
 
     let handle = startup
@@ -622,6 +677,12 @@ pub async fn voice_start(
             return Err("superseded".into()); // `handle` drops here
         }
         inner.prefs.apply(&handle);
+        let deafened = inner.prefs.deafened;
+        for (pcm, at, allowed) in inner.pending_cues.drain(..) {
+            if at.elapsed() < Duration::from_millis(300) && (!deafened || allowed) {
+                handle.play_cue(pcm, allowed);
+            }
+        }
         if let Some(events) = handle.take_crypto_events() {
             tauri::async_runtime::spawn(forward_crypto(app.clone(), owner, run, events));
         }
@@ -832,6 +893,41 @@ async fn monitor(app: AppHandle, owner: u64, run: u64) {
 // ------------------------------------------------------------------- controls
 
 #[tauri::command]
+pub fn voice_play_cue(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    cue: String,
+    volume: f32,
+) -> Result<(), String> {
+    check_main_window(window.label())?;
+    let mut inner = voice.lock();
+    check_owner(&inner, owner)?;
+    if inner.prefs.deafened && !gwar_client::voice::cues::while_deafened(&cue) {
+        return Ok(());
+    }
+    let samples = gwar_client::voice::cues::render(&cue, volume).ok_or("unknown sound cue")?;
+    let allowed = gwar_client::voice::cues::while_deafened(&cue);
+    if let Some(handle) = &inner.handle {
+        handle.play_cue(samples, allowed);
+    } else if inner.startup.is_some() {
+        // A cue during device opening waits for the AEC-aware voice mix. It never
+        // opens another output beside a microphone that is just starting.
+        if inner.pending_cues.len() == 2 {
+            inner.pending_cues.remove(0);
+        }
+        inner.pending_cues.push((samples, Instant::now(), allowed));
+    } else {
+        let mut silence = vec![inner.idle_cue_cancel.clone()];
+        if !allowed {
+            silence.push(voice.cue_deafened.clone());
+        }
+        gwar_client::voice::io::play_cue(inner.prefs.output.clone(), samples, voice.idle_cue_busy.clone(), silence);
+    }
+    Ok(())
+}
+
+#[tauri::command]
 pub fn voice_set_muted(window: WebviewWindow, voice: State<'_, Voice>, owner: u64, muted: bool) -> Result<(), String> {
     check_main_window(window.label())?;
     let mut inner = voice.lock();
@@ -857,6 +953,7 @@ pub fn voice_set_deafened(
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
     inner.prefs.deafened = deafened;
+    voice.cue_deafened.store(deafened, Ordering::Relaxed);
     if deafened && let Some(test) = inner.mic_test.take() {
         test.retire();
     }
@@ -1015,6 +1112,9 @@ pub fn voice_set_devices(
     check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
+    if inner.prefs.output != output {
+        retire_idle_cues(&mut inner);
+    }
     if let Some(devices) = &inner.devices {
         devices.set_devices(input.clone(), output.clone());
     }
@@ -1108,7 +1208,7 @@ pub async fn mic_test_start(
     let app = window.app_handle().clone();
     let id = test;
     let test = claim_mic_test(&voice, owner, id)?;
-    let io = Box::new(RunIo { run: test.clone(), io: make_io(&voice, input, None, issue_sink(&app, owner)).0 });
+    let io = Box::new(RunIo { run: test.clone(), io: make_io(&voice, input, None, issue_sink(&app, owner), true).0 });
     // Wait for a cancelled open to finish releasing its ports before voice can acquire capture.
     let ports = tokio::task::spawn_blocking(move || io.open())
         .await

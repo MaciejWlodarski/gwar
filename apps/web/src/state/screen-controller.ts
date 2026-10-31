@@ -146,6 +146,7 @@ export class ScreenController {
     private readonly link: () => Link | null,
     private readonly describe: (e: unknown) => string,
     private readonly canResumeVoice: () => boolean = () => true,
+    private readonly unexpectedStop: () => void = () => {},
   ) {}
 
   /** Ends my share locally when I leave or change my voice channel; the server ends it too (`left`). */
@@ -198,7 +199,7 @@ export class ScreenController {
         track.addEventListener("ended", () => {
           if (useScreen.getState().own?.attempt !== attempt) return;
           if (this.suspended || this.retainedCapture || this.recoveringAttempt === attempt) this.recoveryFailed();
-          else void this.stopShare();
+          else void this.stopShare(true);
         });
         if (["permission", "permissionHint"].includes(useScreen.getState().notice ?? "")) dispatch({ type: "notice", notice: null });
         dispatch({ type: "picked", attempt, stream, surface: surfaceOf(track) });
@@ -222,7 +223,7 @@ export class ScreenController {
 
   private recoveryFailed(): void {
     if (!useScreen.getState().own) return;
-    void this.stopShare();
+    void this.stopShare(true);
     this.showNotice("reconnect");
     if (isDesktop()) notify({ title: "Gwar", body: tNow("screen.reconnectStopped"), tag: "screen-reconnect" });
   }
@@ -363,7 +364,7 @@ export class ScreenController {
     const publisher = new ScreenPublisher({
       uplink: screen => { if (current() && this.publisher === publisher) useUplink.setState({ screen }); },
       track, fallbacks: this.encoderFallbacks, quality: latest(), legacy: !screenSpec, av1: hardwareAv1, automaticMode: useSettings.getState().screenMode === null, iceServers: s.iceServers,
-      ended: () => { if (this.publisher === publisher) { if (this.recoveringAttempt === attempt) this.recoveryFailed(); else void this.stopShare(); } },
+      ended: () => { if (this.publisher === publisher) { if (this.recoveringAttempt === attempt) this.recoveryFailed(); else void this.stopShare(true); } },
       surfaceChanged: (surface, spec) => {
         if (current()) dispatch({ type: "surface", attempt, surface, spec });
       },
@@ -375,7 +376,7 @@ export class ScreenController {
       encodeFailed: () => {
         if (this.publisher !== publisher) return;
         if (this.recoveringAttempt === attempt) this.recoveryFailed();
-        else { void this.stopShare(); this.stoppedNotice(tNow("screen.stopped.encoder")); }
+        else { void this.stopShare(true); this.stoppedNotice(tNow("screen.stopped.encoder")); }
       },
     });
     this.publisher = publisher;
@@ -389,8 +390,9 @@ export class ScreenController {
   }
 
   /** Stops my share (or closes the quality menu): locally at once, then on the server. */
-  async stopShare(): Promise<void> {
+  async stopShare(unexpected = false): Promise<void> {
     const own = useScreen.getState().own;
+    if (unexpected && (own?.share || this.recoveringAttempt !== null)) this.unexpectedStop();
     const conn = this.link();
     // Capture and UI stop now. Keep DTLS until the explicit stop settles: closing it
     // earlier can overtake even an already sent WebSocket request at the server.
@@ -831,12 +833,13 @@ export class ScreenController {
         if (share === this.lostPublisherShare) {
           this.lostPublisherShare = null;
           if (reason === "transport") { if (!this.suspended) void this.confirmShare(); }
-          else { this.endOwn(); const text = this.ownStopText(reason, by); if (text) this.stoppedNotice(text, reason === "moderator" ? "info" : "error"); }
+          else { if (reason !== "left") this.unexpectedStop(); this.endOwn(); const text = this.ownStopText(reason, by); if (text) this.stoppedNotice(text, reason === "moderator" ? "info" : "error"); }
           return;
         }
         const own = useScreen.getState().own;
         if (own?.share === share) {
           if (this.recoveringAttempt === own.attempt) { this.recoveryFailed(); return; }
+          if (reason !== "left") this.unexpectedStop();
           this.endOwn();
           const text = this.ownStopText(reason, by);
           if (text) this.stoppedNotice(text, reason === "moderator" ? "info" : "error");

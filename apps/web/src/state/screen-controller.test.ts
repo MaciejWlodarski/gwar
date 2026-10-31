@@ -854,11 +854,29 @@ describe("sharing", () => {
     await vi.advanceTimersByTimeAsync(60_000); expect(useScreen.getState().notice).toBe(notice); screen.reset();
   });
 
+  it("confirms a terminal retained-share timeout exactly once", async () => {
+    useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+    const { link } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+    const unexpectedStop = vi.fn();
+    const screen = new ScreenController(() => link, String, () => true, unexpectedStop), track = choosing();
+    await screen.confirmShare();
+    screen.handleEvent({ ev: "screen.started", d: share("M", 1, 1) });
+    screen.suspend();
+    expect(unexpectedStop).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(unexpectedStop).toHaveBeenCalledOnce();
+    expect(track.stop).toHaveBeenCalledOnce();
+    await vi.advanceTimersByTimeAsync(45_000);
+    expect(unexpectedStop).toHaveBeenCalledOnce();
+    screen.reset();
+  });
+
   it("retains capture through repeated suspend and republishes after the new voice binding", async () => {
     useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
     let starts = 0;
     const { link, calls } = fakeLink({ "screen.start": () => ({ share: `M${++starts}` }), "screen.publish.offer": () => ({ sdp: "answer" }) });
-    const screen = new ScreenController(() => link, String), track = choosing();
+    const unexpectedStop = vi.fn();
+    const screen = new ScreenController(() => link, String, () => true, unexpectedStop), track = choosing();
     await screen.confirmShare();
     const stream = useScreen.getState().own!.stream;
     screen.handleEvent({ ev: "screen.started", d: share("M1", 1, 1) });
@@ -874,6 +892,7 @@ describe("sharing", () => {
     screen.handleEvent({ ev: "screen.started", d: share("M2", 1, 1) });
     expect(useScreen.getState().own?.phase).toBe("live");
     expect(useScreen.getState().notice).toBeNull();
+    expect(unexpectedStop).not.toHaveBeenCalled();
     screen.reset();
     expect(track.stop).toHaveBeenCalledOnce();
   });
@@ -1132,11 +1151,13 @@ describe("sharing", () => {
   it("stops a share whose encoder never produced a frame, with one toast, and ignores an old publisher", async () => {
     useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
     const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
-    const screen = new ScreenController(() => link, String), t = choosing();
+    const unexpected = vi.fn();
+    const screen = new ScreenController(() => link, String, () => true, unexpected), t = choosing();
     await screen.confirmShare();
     const publisher = media.publishers[0]!;
     publisher.params.encodeFailed(); await flush();
     expect(useScreen.getState().own).toBeNull();
+    expect(unexpected).toHaveBeenCalledOnce();
     expect(t.stop).toHaveBeenCalledTimes(1);
     expect(publisher.close).toHaveBeenCalledTimes(1);
     expect(calls.filter(([op]) => op === "screen.stop")).toEqual([["screen.stop", { share: "M" }]]);
@@ -1146,6 +1167,7 @@ describe("sharing", () => {
     expect(useScreen.getState().own?.share).toBe("M");
     expect(toast).toHaveBeenCalledTimes(1);
     await screen.stopShare();
+    expect(unexpected).toHaveBeenCalledOnce();
   });
 
   it.each(["modern", "legacy", "unsupported"])("sends all quality choices safely to a %s server", async server => {

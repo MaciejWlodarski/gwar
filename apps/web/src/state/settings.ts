@@ -1,3 +1,4 @@
+import { defaultSounds, readSounds, type SoundCue, type SoundSettings } from "../sound/catalog";
 import { readOnboarding, type Onboarding } from "../lib/onboarding";
 import { defaultQuality, migrateQuality, type QualitySettings } from "../voice/screen-quality";
 import { serverKey } from "../lib/server-key";
@@ -306,6 +307,7 @@ export interface SettingsState extends QualitySettings {
   audio: AudioSettings;
   desktop: DesktopSettings;
   notifications: NotificationSettings;
+  sounds: SoundSettings;
   /** Per-user playback volume 0..2 keyed by uid. */
   userVolumes: Record<string, number>;
   bookmarks: Bookmark[];
@@ -344,6 +346,8 @@ export interface SettingsState extends QualitySettings {
   setAudio(patch: Partial<AudioSettings>): void;
   setDesktop(patch: Partial<DesktopSettings>): void;
   setNotifications(patch: Partial<NotificationSettings>): void;
+  setSounds(patch: Partial<Omit<SoundSettings, "events">>): void;
+  setSoundEvent(cue: SoundCue, enabled: boolean): void;
   setUserVolume(uid: string, volume: number): void;
   saveBookmark(bookmark: BookmarkInput): void;
   removeBookmark(id: string): void;
@@ -416,6 +420,7 @@ export const useSettings = create<SettingsState>()(
       audio: defaultAudio,
       desktop: defaultDesktop,
       notifications: defaultNotifications,
+      sounds: defaultSounds,
       userVolumes: {},
       bookmarks: [],
       removedBookmarks: {},
@@ -442,6 +447,8 @@ export const useSettings = create<SettingsState>()(
       setMembersOpen: (membersOpen) => set({ membersOpen }),
       setAudio: (patch) => set((s) => ({ audio: validAudio({ ...s.audio, ...patch }) })),
       setDesktop: (patch) => set((s) => ({ desktop: { ...s.desktop, ...patch } })),
+      setSounds: (patch) => set((s) => ({ sounds: readSounds({ ...s.sounds, ...patch }) })),
+      setSoundEvent: (cue, enabled) => set((s) => ({ sounds: { ...s.sounds, events: { ...s.sounds.events, [cue]: enabled } } })),
       setNotifications: (patch) => set((s) => ({ notifications: { ...s.notifications, ...patch } })),
       setUserVolume: (uid, volume) =>
         set((s) => {
@@ -558,12 +565,15 @@ export const useSettings = create<SettingsState>()(
         let p = migrateQuality((persisted ?? {}) as Record<string, unknown>);
         // Preserve v4's session preferences before adding v5 sensitivity.
         if (version < 4) p = { selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null, ...p, onboarding: readOnboarding(p.onboarding) };
-        return version < 5 ? { ...p, audio: validAudio(p.audio) } : p;
+        if (version < 5) p = { ...p, audio: validAudio(p.audio) };
+        // v6 adds device-local cues without discarding any earlier preferences.
+        return version < 6 ? { ...p, sounds: readSounds(p.sounds) } : p;
       },
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
         return { ...current, ...p, onboarding: readOnboarding(p.onboarding), audio: validAudio(p.audio), desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
+          sounds: readSounds(p.sounds),
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,
           serverGroups: validGroups(p.serverGroups),

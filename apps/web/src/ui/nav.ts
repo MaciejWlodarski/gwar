@@ -99,7 +99,7 @@ const KEY = "gwarNav";
 const SECTIONS: readonly Section[] = ["home", "servers", "settings", "bugReport"];
 const TOP: readonly Section[] = ["home", "servers"];
 const PANES: readonly ServerPane[] = ["list", "chat", "members"];
-const TABS = Object.keys({ audio: 1, notifications: 1, appearance: 1, identity: 1, account: 1, language: 1 } satisfies Record<SettingsTab, 1>) as SettingsTab[];
+const TABS = Object.keys({ audio: 1, notifications: 1, sounds: 1, appearance: 1, identity: 1, account: 1, language: 1 } satisfies Record<SettingsTab, 1>) as SettingsTab[];
 
 const isObject = (x: unknown): x is Record<string, unknown> => typeof x === "object" && x !== null && !Array.isArray(x);
 const oneOf = <T extends string>(value: unknown, allowed: readonly T[]): T | undefined => (allowed as readonly unknown[]).includes(value) ? (value as T) : undefined;

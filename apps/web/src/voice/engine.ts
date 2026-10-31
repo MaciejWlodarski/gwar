@@ -84,6 +84,10 @@ export interface VoiceEvents {
 }
 
 export interface VoiceEngine {
+  /** Local-only notifications, independent of voice volume, through the voice output device. */
+  playSound?(cue: import("../sound/catalog").SoundCue, volume: number): void;
+  /** Unlock browser autoplay from a gesture without opening the microphone. */
+  unlockSounds?(): void;
   readonly capabilities: {
     /** Output device can be chosen (not just the system default). */
     outputDeviceSelection: boolean;

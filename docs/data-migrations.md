@@ -71,7 +71,7 @@ its WebKit data directory.
 | IndexedDB `gwar-message-auth-v3` (`net/message-storage.ts`) | `checkpoints` (by `server/author/message`, index `at`): `{revision, hash, created, conversation, at, proven?, deleted?, files?, order}`; `revocations` (by `account:device`): account-signed revocations; `feeds` (by Connect URL): `{cursor, checked, available?, read?}`; `order`: one counter. | Database version 3 (`MESSAGE_STORAGE_MIGRATIONS`; version 1 never held data, the name started at 2). Not a cache: losing it loses rollback protection, so it is migrated, never emptied. |
 | IndexedDB `gwar-mls-v2-<device public key>` (`mls/storage.ts`) | The device's MLS agent: stores `openmls` (OpenMLS's own records), `groups` (`@device`, group records, `{server}/@server` owner pins, `@archive`), `epochs`, `outbox`; binary keys and values written by `crates/gwar-mls`. The runtime's jobs (`@runtime/…`, JSON) live in `outbox`. | Database version 1 (`MLS_MIGRATIONS`), which also versions the runtime's jobs. The agent's records have their own format, the `version` of `@device` (`STORE_FORMAT` in `crates/gwar-mls/src/agent/mod.rs`, currently 1): `STORE_UPGRADES` run as the agent loads and reach storage with its next write. OpenMLS's own records are keyed by its storage version, pinned by a test. **Never wiped**: an unreadable state fails to load and stays. |
 | IndexedDB `gwar-local`, store `entries` (`lib/local-state.ts`) | The device's security state, by key (the names version 1 used in localStorage): `gwar.server-pin:<endpoint>` → `{server_pk, first_seen}`, the server key first seen at an address; `gwar.channels:<server key>` → `{known, deleted, incomplete}`, channel ids seen and seen deleted; `gwar.connect.handle-pin:<Connect URL>:<handle>` → `{uid}`, the account first seen behind a handle; `gwar.connect.service-key:<Connect URL>` → Gwar Connect's service key (a cache, refetched). Values are JSON strings. | Database version 1 (`LOCAL_STATE_MIGRATIONS`; step 1 imports the localStorage entries of version 1, below). The only source of truth: read into memory before the first render, every change one transaction (below). A channel record it cannot read becomes "incomplete" (fails closed), never clean. **Never wiped.** |
-| localStorage `gwar.settings` (zustand `persist`) | Preferences, bookmarks (with server and channel passwords), removed bookmarks, the last server, per-server flags. | zustand's `version` (`SETTINGS_VERSION` in `lib/local-storage.ts`, currently 5). |
+| localStorage `gwar.settings` (zustand `persist`) | Preferences, bookmarks (with server and channel passwords), removed bookmarks, the last server, per-server flags. | zustand's `version` (`SETTINGS_VERSION` in `lib/local-storage.ts`, currently 6). |
 | localStorage `gwar-local.changed` | A ping: the name of the last `gwar-local` key this browser changed and a nonce, so other tabs read it again (no data). | Not data: missing or stale is harmless. |
 | localStorage `gwar.server-pin:*`, `gwar.channels:*`, `gwar.connect.handle-pin:*`, `gwar.connect.service-key:*` | What version 1 kept there, imported into `gwar-local` once. | **Unused** since the import; left in place for tabs and builds of version 1, and removed by a later release. |
 | Cache Storage `gwar-denoise` | The noise suppression module and model. | Cache: entries not in use are deleted. |
@@ -341,6 +341,12 @@ muting, hiding the tab/window or starting voice cancels capture. A call waits fo
 any pending preview acquisition to release its device first. Permission is read
 without prompting: unless already granted, an explicit preview button is required
 (also on platforms where permission cannot be queried). Preview audio is never sent.
+
+Settings version 6 adds `sounds`: a master switch, independent 0..1 volume
+(default 0.6), and enabled-by-default switches for all 14 cues. Versions 1 through 5
+keep every existing preference and gain the defaults automatically. Partial sound
+preferences preserve explicit off switches; missing events default on. The settings
+remain device-local, including in the desktop webview, and are not synced to Connect.
 
 ### Desktop files
 

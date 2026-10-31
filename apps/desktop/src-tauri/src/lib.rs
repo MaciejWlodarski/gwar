@@ -105,6 +105,7 @@ pub fn run() {
             voice::voice_set_keys,
             voice::voice_crypto_counters,
             voice::voice_set_muted,
+            voice::voice_play_cue,
             voice::voice_set_deafened,
             voice::voice_set_ptt,
             voice::voice_set_input_mode,
