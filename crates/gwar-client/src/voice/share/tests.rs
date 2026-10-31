@@ -74,8 +74,7 @@ fn drain(worker: &mut Worker, bus: &ShareBus, blocks: usize) -> (Vec<f32>, Vec<f
 fn feed(
     worker: &mut Worker,
     encoder: &mut Encoder,
-    slot: usize,
-    run: u64,
+    (slot, run): (usize, u64),
     first: u64,
     count: u64,
     hz: (f32, f32),
@@ -96,7 +95,7 @@ fn stereo_survives_decoding_and_reaches_mid_and_side() {
     worker.handle(Input::Open { slot: 2, run: 7 });
     let (mut mid, mut side) = (Vec::new(), Vec::new());
     for n in 0..40 {
-        feed(&mut worker, &mut encoder, 2, 7, n, 1, (440.0, 1000.0), Instant::now());
+        feed(&mut worker, &mut encoder, (2, 7), n, 1, (440.0, 1000.0), Instant::now());
         let (m, s) = drain(&mut worker, &bus, 2);
         mid.extend(m);
         side.extend(s);
@@ -201,8 +200,8 @@ fn a_lost_packet_is_concealed_and_a_stopped_stream_goes_quiet() {
     let mut encoder = encoder();
     worker.handle(Input::Open { slot: 0, run: 1 });
     let at = Instant::now();
-    feed(&mut worker, &mut encoder, 0, 1, 0, 20, (440.0, 440.0), at);
-    feed(&mut worker, &mut encoder, 0, 1, 21, 20, (440.0, 440.0), at);
+    feed(&mut worker, &mut encoder, (0, 1), 0, 20, (440.0, 440.0), at);
+    feed(&mut worker, &mut encoder, (0, 1), 21, 20, (440.0, 440.0), at);
     let (mid, _) = drain(&mut worker, &bus, 70);
     assert!(worker.counters.concealed.load(Ordering::Relaxed) >= 1);
     let (mid2, _) = drain(&mut worker, &bus, 40);
@@ -216,9 +215,9 @@ fn a_stall_backlog_is_dropped_not_replayed() {
     let (mut worker, bus, _input) = worker();
     let mut encoder = encoder();
     worker.handle(Input::Open { slot: 0, run: 1 });
-    feed(&mut worker, &mut encoder, 0, 1, 0, 3, (440.0, 440.0), Instant::now());
+    feed(&mut worker, &mut encoder, (0, 1), 0, 3, (440.0, 440.0), Instant::now());
     drain(&mut worker, &bus, 4);
-    feed(&mut worker, &mut encoder, 0, 1, 3, 25, (440.0, 440.0), Instant::now());
+    feed(&mut worker, &mut encoder, (0, 1), 3, 25, (440.0, 440.0), Instant::now());
     drain(&mut worker, &bus, 4);
     let stream = worker.streams[0].as_ref().unwrap();
     assert!(worker.counters.backlog_drops.load(Ordering::Relaxed) > 0);
@@ -230,7 +229,7 @@ fn the_queue_is_bounded_and_malformed_frames_are_refused() {
     let (mut worker, _bus, _input) = worker();
     worker.handle(Input::Open { slot: 0, run: 1 });
     let mut encoder = encoder();
-    feed(&mut worker, &mut encoder, 0, 1, 0, 40, (440.0, 440.0), Instant::now());
+    feed(&mut worker, &mut encoder, (0, 1), 0, 40, (440.0, 440.0), Instant::now());
     assert_eq!(worker.streams[0].as_ref().unwrap().jitter.queue.len(), MAX_QUEUED);
     assert_eq!(worker.counters.late_drops.load(Ordering::Relaxed), 8);
     let before = worker.counters.late_drops.load(Ordering::Relaxed);
@@ -246,10 +245,10 @@ fn a_newer_run_fences_frames_of_the_previous_share_on_that_slot() {
     let (mut worker, _bus, _input) = worker();
     let mut encoder = encoder();
     worker.handle(Input::Open { slot: 1, run: 5 });
-    feed(&mut worker, &mut encoder, 1, 5, 0, 4, (440.0, 440.0), Instant::now());
+    feed(&mut worker, &mut encoder, (1, 5), 0, 4, (440.0, 440.0), Instant::now());
     worker.handle(Input::Open { slot: 1, run: 6 });
     assert!(worker.streams[1].as_ref().unwrap().jitter.queue.is_empty(), "the old queue is gone");
-    feed(&mut worker, &mut encoder, 1, 5, 4, 2, (440.0, 440.0), Instant::now());
+    feed(&mut worker, &mut encoder, (1, 5), 4, 2, (440.0, 440.0), Instant::now());
     assert!(worker.streams[1].as_ref().unwrap().jitter.queue.is_empty(), "a delayed old frame is dropped");
     worker.handle(Input::Open { slot: 1, run: 5 });
     assert_eq!(worker.streams[1].as_ref().unwrap().run, 6, "an older run cannot come back");
@@ -269,8 +268,8 @@ fn volume_mute_and_two_shares_mix_independently() {
     worker.gain[3].store(0.0f32.to_bits(), Ordering::Relaxed);
     let mut mid = Vec::new();
     for n in 0..30 {
-        feed(&mut worker, &mut one, 0, 1, n, 1, (440.0, 440.0), Instant::now());
-        feed(&mut worker, &mut two, 3, 1, n, 1, (1000.0, 1000.0), Instant::now());
+        feed(&mut worker, &mut one, (0, 1), n, 1, (440.0, 440.0), Instant::now());
+        feed(&mut worker, &mut two, (3, 1), n, 1, (1000.0, 1000.0), Instant::now());
         mid.extend(drain(&mut worker, &bus, 2).0);
     }
     let tail = &mid[12_000..];
@@ -288,7 +287,7 @@ fn clock_drift_is_absorbed_without_dropping_packets() {
     for round in 0..3000u64 {
         // The sender's clock runs fast: 1,001 packets for every 1,000 the output plays.
         while n * 1000 <= round * 1001 / 2 {
-            feed(&mut worker, &mut encoder, 0, 1, n, 1, (440.0, 440.0), start + Duration::from_millis(10 * round));
+            feed(&mut worker, &mut encoder, (0, 1), n, 1, (440.0, 440.0), start + Duration::from_millis(10 * round));
             n += 1;
         }
         drain(&mut worker, &bus, 1);

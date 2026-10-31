@@ -746,10 +746,12 @@ fn open_input(
     Ok(stream)
 }
 
+type SpeakerRing = Arc<Mutex<Consumer<f32>>>;
+
 fn open_output(
     host: &cpal::Host,
     route: &Route,
-    (speaker, side): (Arc<Mutex<Consumer<f32>>>, Option<Arc<Mutex<Consumer<f32>>>>),
+    (speaker, side): (SpeakerRing, Option<SpeakerRing>),
     timing: Arc<OutputTiming>,
     (active, id): (Active, u64),
     trouble: TroubleFn,
