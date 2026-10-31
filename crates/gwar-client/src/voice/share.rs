@@ -20,11 +20,7 @@ use std::{
 };
 
 use anyhow::Result;
-use audiopus::{
-    Channels, MutSignals, SampleRate,
-    coder::Decoder,
-    packet::Packet,
-};
+use audiopus::{Channels, MutSignals, SampleRate, coder::Decoder, packet::Packet};
 use gwar_proto::SCREEN_SLOTS;
 use rtrb::{Consumer, Producer, RingBuffer};
 
@@ -159,7 +155,8 @@ impl SharePlayout {
         let (input, inbox) = sync_channel(INPUT_QUEUE);
         let (tx, rx) = RingBuffer::new(RING_CAPACITY);
         let counters = Arc::<Counters>::default();
-        let bus = Arc::new(ShareBus { ring: Mutex::new(rx), active: AtomicBool::new(false), counters: counters.clone() });
+        let bus =
+            Arc::new(ShareBus { ring: Mutex::new(rx), active: AtomicBool::new(false), counters: counters.clone() });
         let gain = Arc::new(std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())));
         let stop = Arc::new(AtomicBool::new(false));
         let worker = Worker {
@@ -257,7 +254,9 @@ impl Jitter {
     }
 
     fn delay(&self) -> Duration {
-        Duration::from_secs_f64((FRAME_MS as f64 / 1000.0 + 2.0 * self.deviation).clamp(MIN_DELAY.as_secs_f64(), MAX_DELAY.as_secs_f64()))
+        Duration::from_secs_f64(
+            (FRAME_MS as f64 / 1000.0 + 2.0 * self.deviation).clamp(MIN_DELAY.as_secs_f64(), MAX_DELAY.as_secs_f64()),
+        )
     }
 
     fn observe(&mut self, rtp_time: u32, now: Instant) {
@@ -398,7 +397,12 @@ impl Stream {
 
     /// Adds `gain` times this stream to `mix`. Drift is taken up by reading very slightly faster.
     fn mix(&mut self, mix: &mut [[f32; 2]], gain: f32) {
-        let step = 1.0 + if self.jitter.started && self.jitter.queued() > self.jitter.delay() + DRIFT_MARGIN { DRIFT_RATE } else { 0.0 };
+        let step = 1.0
+            + if self.jitter.started && self.jitter.queued() > self.jitter.delay() + DRIFT_MARGIN {
+                DRIFT_RATE
+            } else {
+                0.0
+            };
         for out in mix {
             let (Some(&now), Some(&next)) = (self.pcm.front(), self.pcm.get(1)) else { return };
             let blend = self.fraction as f32;
@@ -567,6 +571,30 @@ impl CaptureQueue {
             }
         }
     }
+}
+
+/// The largest batch a webview may send: 4 slots × 16 packets × Opus's largest.
+const MAX_BATCH: usize = 16 + 4 * 16 * (7 + 1275);
+
+/// `owner: u64, run: u64`, then per frame `slot: u8, rtp_time: u32, length: u16, opus`, little-endian.
+pub fn parse_frames(body: &[u8]) -> Option<(u64, Vec<ShareFrame>)> {
+    if body.len() > MAX_BATCH {
+        return None;
+    }
+    let (header, mut rest) = body.split_at_checked(16)?;
+    let owner = u64::from_le_bytes(header[..8].try_into().ok()?);
+    let run = u64::from_le_bytes(header[8..].try_into().ok()?);
+    let mut frames = Vec::new();
+    while !rest.is_empty() {
+        let (head, tail) = rest.split_at_checked(7)?;
+        let slot = usize::from(head[0]);
+        let rtp_time = u32::from_le_bytes(head[1..5].try_into().ok()?);
+        let length = usize::from(u16::from_le_bytes(head[5..7].try_into().ok()?));
+        let (opus, tail) = tail.split_at_checked(length)?;
+        frames.push(ShareFrame { slot, run, rtp_time, opus: opus.to_vec() });
+        rest = tail;
+    }
+    Some((owner, frames))
 }
 
 #[cfg(test)]

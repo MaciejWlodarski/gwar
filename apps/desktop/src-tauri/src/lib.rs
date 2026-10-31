@@ -162,6 +162,7 @@ pub fn run() {
             screen::screen_capture_support,
             screen::open_screen_privacy_settings,
             share_audio::share_capture_support,
+            share_audio::share_capture_allow,
             share_audio::share_capture_start,
             share_audio::share_capture_read,
             share_audio::share_capture_stop,

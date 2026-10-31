@@ -10,6 +10,7 @@ import type { ScreenPauseReason } from "../proto/ScreenPauseReason";
 import type { ScreenSurface } from "../proto/ScreenSurface";
 import { SCREEN_SLOTS } from "../voice/screen";
 import { resolveQuality, defaultQuality, sameSpec, type ScreenSpec } from "../voice/screen-quality";
+import type { ComputerSoundState } from "../voice/share-sound";
 
 /**
  * My share: `picking` while the browser's picker is open, `choosing` in the quality menu,
@@ -21,6 +22,8 @@ export interface OwnShare {
   phase: OwnPhase;
   audio?: boolean;
   audioServer?: boolean;
+  /** The desktop app's computer sound; absent in a browser and until the system has answered. */
+  computerSound?: ComputerSoundState;
   /** One per attempt: late results of an earlier attempt change nothing. */
   attempt: number;
   share: string | null;
@@ -51,6 +54,8 @@ export interface Watch {
   status: "requesting" | "watching";
   /** Confirmed by the server for this grant, never inferred from a negotiated receiver. */
   audio?: boolean;
+  /** Desktop app: the native mixer has taken this share's sound, so it can really be heard. */
+  soundReady?: boolean;
   paused?: ScreenPauseReason;
   waiting?: true;
 }
@@ -81,6 +86,7 @@ export type ScreenAction =
   | { type: "picked"; attempt: number; stream: MediaStream; surface: ScreenSurface }
   | { type: "choose"; spec: ScreenSpec }
   | { type: "audio"; attempt: number; sharing: boolean; server?: boolean }
+  | { type: "computerSound"; attempt: number; state: ComputerSoundState }
   | { type: "surface"; attempt: number; surface: ScreenSurface; spec: ScreenSpec }
   | { type: "queueShare"; attempt: number }
   | { type: "starting"; attempt: number }
@@ -101,6 +107,7 @@ export type ScreenAction =
   | { type: "watch"; share: string; id: number }
   | { type: "granted"; run: number; id: number; slot: number }
   | { type: "watchAudio"; run: number; id: number; audio: boolean }
+  | { type: "watchSound"; id: number; ready: boolean }
   | { type: "slot"; run: number; slot: number; share: string | null }
   | { type: "unwatch"; share: string }
   | { type: "paused"; share: string; reason: ScreenPauseReason }
@@ -218,6 +225,10 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       if (state.watches.some(w => w.share === action.share)) return { ...state, stage: action.share };
       return { ...state, watches: [...state.watches, { share: action.share, id: action.id, slot: null, status: "requesting" }], stage: action.share };
     }
+    case "computerSound":
+      return state.own?.attempt === action.attempt ? { ...state, own: { ...state.own, computerSound: action.state } } : state;
+    case "watchSound":
+      return { ...state, watches: state.watches.map(w => w.id === action.id ? { ...w, soundReady: action.ready } : w) };
     case "watchAudio":
       return action.run === state.transport.run ? { ...state, watches: state.watches.map(w => w.id === action.id && w.status === "watching" ? { ...w, audio: action.audio } : w) } : state;
     case "granted": {

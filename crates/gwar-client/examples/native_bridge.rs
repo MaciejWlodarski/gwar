@@ -7,7 +7,8 @@
 //! Usage: native_bridge <microphone Hz>
 //! stdin:  {"id", "command", "args"} per line
 //! stdout: {"id", "ok"} | {"id", "error"} replies and {"event", "payload"} events
-//! Test-only command `snapshot {frequency}` reports the speaker's recent tone.
+//! Test-only command `snapshot {frequency}` reports the speaker's recent tone. Share sound uses
+//! the real playout and capture queue; the "computer" plays a 997 Hz tone, `share_stats` counts.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -26,6 +27,7 @@ use gwar_client::voice::{
     io::{AudioIo, AudioPorts, CaptureSample, OutputTiming},
     keys::EncryptedStart,
     sframe::{Binding, ControlReply},
+    share::{CaptureQueue, SharePlayout, parse_frames},
     start_encrypted, start_with,
 };
 use rtrb::RingBuffer;
@@ -38,6 +40,8 @@ use tokio::{
 const RATE: usize = 48_000;
 const BLOCK: usize = 480;
 const WINDOW: usize = 4096;
+/// The tone the fixture's "computer" plays while a share captures its sound.
+const COMPUTER_TONE: f64 = 997.0;
 
 struct ToneIo {
     frequency: f64,
@@ -124,6 +128,8 @@ struct State {
     run: u64,
     handle: Option<VoiceHandle>,
     answers: HashMap<u64, oneshot::Sender<Result<String, String>>>,
+    playout: Option<Arc<SharePlayout>>,
+    capture: Option<(u64, Arc<CaptureQueue>)>,
 }
 
 struct Bridge {
@@ -147,6 +153,18 @@ impl Bridge {
         anyhow::ensure!(number(args, "owner")? == state.owner, "superseded owner");
         let current = number(args, "run")? == state.run;
         Ok(state.handle.as_ref().filter(|_| current).and_then(|h| h.keys().cloned()))
+    }
+
+    fn playout(&self) -> anyhow::Result<Arc<SharePlayout>> {
+        let mut state = self.state.lock().unwrap();
+        if state.playout.is_none() {
+            let playout = Arc::new(SharePlayout::new()?);
+            if let Some(handle) = &state.handle {
+                handle.set_share_bus(playout.bus());
+            }
+            state.playout = Some(playout);
+        }
+        Ok(state.playout.clone().expect("made above"))
     }
 
     async fn command(self: Arc<Self>, command: &str, args: Value) -> anyhow::Result<Value> {
@@ -192,6 +210,72 @@ impl Bridge {
                 Ok(keys.map_or(Value::Null, |k| serde_json::to_value(k.counters()).unwrap()))
             }
             "audio_devices" => Ok(json!({ "inputs": [], "outputs": [] })),
+            "share_capture_support" => Ok(json!("ok")),
+            "share_capture_start" => {
+                let id = number(&args, "id")?;
+                let queue = Arc::<CaptureQueue>::default();
+                self.state.lock().unwrap().capture = Some((id, queue.clone()));
+                tokio::spawn(async move {
+                    let mut position = 0u64;
+                    while !queue.is_closed() {
+                        let block: Vec<f32> = (0..BLOCK as u64)
+                            .flat_map(|i| {
+                                let phase = (position + i) as f64 * COMPUTER_TONE * std::f64::consts::TAU / RATE as f64;
+                                [phase.sin() as f32 * 0.2; 2]
+                            })
+                            .collect();
+                        queue.write(&block);
+                        position += BLOCK as u64;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                });
+                Ok(Value::Null)
+            }
+            "share_capture_read" => {
+                let id = number(&args, "id")?;
+                let queue = self.state.lock().unwrap().capture.clone().filter(|(running, _)| *running == id);
+                let (_, queue) = queue.context("closed")?;
+                let samples = queue.read(Duration::from_millis(100)).await;
+                anyhow::ensure!(!samples.is_empty() || !queue.is_closed(), "closed");
+                Ok(json!(samples.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>()))
+            }
+            "share_capture_stop" => {
+                let id = number(&args, "id")?;
+                let mut state = self.state.lock().unwrap();
+                if state.capture.as_ref().is_some_and(|(running, _)| *running == id) {
+                    state.capture.take().unwrap().1.close();
+                }
+                Ok(Value::Null)
+            }
+            "share_playback_open" => {
+                let (slot, run) = (number(&args, "slot")? as usize, number(&args, "run")?);
+                self.playout()?.open(slot, run);
+                Ok(json!(self.state.lock().unwrap().handle.is_some()))
+            }
+            "share_playback_close" => {
+                self.playout()?.close(number(&args, "slot")? as usize);
+                Ok(Value::Null)
+            }
+            "share_playback_gain" => {
+                self.playout()?
+                    .set_gain(number(&args, "slot")? as usize, args["gain"].as_f64().context("gain")? as f32);
+                Ok(Value::Null)
+            }
+            "share_playback_frames" => {
+                let body: Vec<u8> = serde_json::from_value(args["body"].clone())?;
+                let (_, frames) = parse_frames(&body).context("malformed share frames")?;
+                let playout = self.playout()?;
+                for frame in frames {
+                    playout.push(frame);
+                }
+                Ok(Value::Null)
+            }
+            "share_stats" => {
+                let stats = self.playout()?.stats();
+                Ok(
+                    json!({ "frames": stats.frames, "decoded": stats.decoded, "concealed": stats.concealed, "late": stats.late_drops, "backlog": stats.backlog_drops, "underruns": stats.ring_underruns }),
+                )
+            }
             "snapshot" => {
                 let frequency = args["frequency"].as_f64().context("frequency")?;
                 Ok(json!({ "tone": tone(&self.played.lock().unwrap(), frequency) }))
@@ -238,6 +322,9 @@ impl Bridge {
         {
             let mut state = self.state.lock().unwrap();
             anyhow::ensure!(state.owner == owner && state.run == run, "superseded");
+            if let Some(playout) = &state.playout {
+                handle.set_share_bus(playout.bus());
+            }
             state.handle = Some(handle);
         }
         if let Some(mut events) = events {

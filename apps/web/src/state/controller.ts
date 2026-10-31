@@ -270,7 +270,7 @@ class Controller {
     (cue, volume) => this.engine.playSound?.(cue, volume));
   /** Screen sharing and watching (docs/screen-share.md). */
   readonly screen = new ScreenController(() => this.conn, describeRequestError,
-    () => this.voiceAutoStart && this.voiceRetryAllowed, () => this.sounds.cue("shareStopped"));
+    () => this.voiceAutoStart && this.voiceRetryAllowed, () => this.sounds.cue("shareStopped"), () => this.engine.shareSound?.() ?? null);
 
   constructor() {
     this.engine = createVoiceEngine();

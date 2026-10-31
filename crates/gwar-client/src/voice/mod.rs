@@ -989,13 +989,19 @@ mod codec_tests {
                 let position = block * 480;
                 let pcm: Vec<f32> = (0..960u64)
                     .flat_map(|i| {
-                        let v = 0.25 * (std::f32::consts::TAU * 330.0 * (position + i) as f32 / 48_000.0).sin()
+                        let v = 0.25
+                            * (std::f32::consts::TAU * 330.0 * (position + i) as f32 / 48_000.0).sin()
                             * (1.0 + 0.5 * (std::f32::consts::TAU * 3.0 * (position + i) as f32 / 48_000.0).sin());
                         [v, v]
                     })
                     .collect();
                 let n = encoder.encode_float(&pcm, &mut packet).unwrap();
-                playout.push(share::ShareFrame { slot: 0, run: 1, rtp_time: position as u32, opus: packet[..n].to_vec() });
+                playout.push(share::ShareFrame {
+                    slot: 0,
+                    run: 1,
+                    rtp_time: position as u32,
+                    opus: packet[..n].to_vec(),
+                });
             }
             let target = start + Duration::from_millis(10 * (block + 1));
             thread::sleep(target.saturating_duration_since(Instant::now()));
@@ -1014,7 +1020,8 @@ mod codec_tests {
             let echo: Vec<f32> = rendered[previous..].iter().map(|s: &f32| s * 0.5).collect();
             for i in 0..FRAME {
                 let value = echo.get(i).copied().unwrap_or(0.0);
-                let _ = mic_tx.push(CaptureSample { position: block * FRAME as u64 + i as u64, captured_at: at, value });
+                let _ =
+                    mic_tx.push(CaptureSample { position: block * FRAME as u64 + i as u64, captured_at: at, value });
             }
             rendered.extend(played);
             output.report(FRAME, 0);

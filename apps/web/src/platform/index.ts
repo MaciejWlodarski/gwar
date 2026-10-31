@@ -12,7 +12,8 @@ export function isDesktop(): boolean {
 export type Unlisten = () => void;
 
 export interface TauriBridge {
-  invoke<T = void>(command: string, args?: Record<string, unknown>): Promise<T>;
+  /** A `Uint8Array` is sent as a raw request body, for media too frequent for JSON. */
+  invoke<T = void>(command: string, args?: Record<string, unknown> | Uint8Array): Promise<T>;
   listen<T>(event: string, handler: (payload: T) => void): Promise<Unlisten>;
 }
 
@@ -21,7 +22,7 @@ let bridge: Promise<TauriBridge> | null = null;
 /** The `invoke`/`listen` pair of the desktop shell. Only call when `isDesktop()`. */
 export function tauri(): Promise<TauriBridge> {
   bridge ??= Promise.all([import("@tauri-apps/api/core"), import("@tauri-apps/api/event")]).then(([core, event]) => ({
-    invoke: <T = void>(command: string, args?: Record<string, unknown>) => core.invoke<T>(command, args),
+    invoke: <T = void>(command: string, args?: Record<string, unknown> | Uint8Array) => core.invoke<T>(command, args),
     listen: <T>(name: string, handler: (payload: T) => void) => event.listen<T>(name, (e) => handler(e.payload)),
   }));
   return bridge;

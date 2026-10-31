@@ -148,6 +148,10 @@ const RECORD_FIXTURES: Record<keyof typeof RECORDS, Record<number, { stored: Rec
 };
 /** The settings (localStorage) per version, and a check of the settings store after loading them. */
 const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: string; bookmarks: unknown[] }): void }> = {
+  11: {
+    stored: { version: 11, state: { theme: "dark", bookmarks: [], shareComputerSound: true, shareAudio: { friend: { volume: 0.35, muted: true } }, userVolumes: { friend: 0.7 }, audio: { inputMode: "ptt", pttKey: "Mouse5", pttReleaseDelay: 80 } } },
+    check: state => expect(state).toMatchObject({ shareComputerSound: true, shareAudio: { friend: { volume: 0.35, muted: true } }, userVolumes: { friend: 0.7 }, audio: { pttKey: "Mouse5", pttReleaseDelay: 80 } }),
+  },
   10: {
     stored: { version: 10, state: { theme: "dark", bookmarks: [], shareAudio: { friend: { volume: 0.35, muted: true } }, userVolumes: { friend: 0.7 }, userMuted: { friend: true }, audio: { inputMode: "ptt", pttKey: "Mouse5", pttReleaseDelay: 80 }, desktop: { openAtLogin: true }, notificationOverrides: { servers: { room: "none" }, channels: {} } } },
     check: state => expect(state).toMatchObject({ shareAudio: { friend: { volume: 0.35, muted: true } }, userVolumes: { friend: 0.7 }, userMuted: { friend: true }, audio: { pttKey: "Mouse5", pttReleaseDelay: 80 }, desktop: { openAtLogin: true }, notificationOverrides: { servers: { room: "none" }, channels: {} } }),
@@ -436,6 +440,18 @@ describe("the settings (localStorage)", () => {
   }
   afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
 
+
+it.each(versions(10))("upgrades v%i settings with computer sound off until asked, then remembers the answer", async version => {
+  const saved = { theme: "dark", userVolumes: { friend: 0.7 }, shareAudio: { friend: { volume: 0.35, muted: true } } };
+  const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ version, state: saved }) });
+  const { useSettings } = await page(storage);
+  expect(await useSettings.persist.getOptions().migrate!(saved, version)).toMatchObject({ ...saved, shareComputerSound: false });
+  expect(useSettings.getState()).toMatchObject({ ...saved, shareComputerSound: false });
+  useSettings.getState().setShareComputerSound(true);
+  await useSettings.persist.rehydrate();
+  expect(useSettings.getState()).toMatchObject({ ...saved, shareComputerSound: true });
+  expect(JSON.parse(storage.getItem(SETTINGS_KEY)!).version).toBe(SETTINGS_VERSION);
+});
 
 it.each(versions(9).flatMap(version => [undefined, { friend: { volume: 0.35, muted: true } }].map(shareAudio => ({ version, shareAudio }))))("upgrades v$version settings with share sound losslessly: $shareAudio", async ({ version, shareAudio }) => {
   const saved = { theme: "dark", desktop: { openAtLogin: true, startMinimized: true, closeToTray: false, muteShortcut: "Control+KeyM" }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } }, notifications: { mentions: false }, sounds: { enabled: false, volume: 0.2, events: { mention: false } }, audio: { inputMode: "ptt", pttKey: "Mouse5", pttReleaseDelay: 80, automaticSensitivity: false, vadThreshold: -72 }, userVolumes: { friend: 0.7 }, userMuted: { friend: true }, bookmarks: [{ id: "saved", address: "localhost", kind: "gwar", name: "Saved", password: "keep-me", channelPassword: "also-keep" }], unrelatedFutureField: { value: 42 }, ...(shareAudio ? { shareAudio } : {}) };

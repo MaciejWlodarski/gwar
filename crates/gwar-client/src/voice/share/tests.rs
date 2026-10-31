@@ -71,7 +71,16 @@ fn drain(worker: &mut Worker, bus: &ShareBus, blocks: usize) -> (Vec<f32>, Vec<f
     (mid, side)
 }
 
-fn feed(worker: &mut Worker, encoder: &mut Encoder, slot: usize, run: u64, first: u64, count: u64, hz: (f32, f32), at: Instant) {
+fn feed(
+    worker: &mut Worker,
+    encoder: &mut Encoder,
+    slot: usize,
+    run: u64,
+    first: u64,
+    count: u64,
+    hz: (f32, f32),
+    at: Instant,
+) {
     for n in first..first + count {
         let position = n * FRAME as u64;
         let opus = packet(encoder, position, hz.0, hz.1);
@@ -339,4 +348,35 @@ async fn a_reader_wakes_as_soon_as_sound_arrives() {
     queue.write(&[0.5, -0.5]);
     assert_eq!(reader.await.unwrap(), [0.5, -0.5]);
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+fn batch(frames: &[(u8, u32, &[u8])]) -> Vec<u8> {
+    let mut body = [7u64.to_le_bytes(), 9u64.to_le_bytes()].concat();
+    for (slot, time, opus) in frames {
+        body.push(*slot);
+        body.extend(time.to_le_bytes());
+        body.extend((opus.len() as u16).to_le_bytes());
+        body.extend(*opus);
+    }
+    body
+}
+
+#[test]
+fn a_batch_keeps_its_frames_and_their_order() {
+    let (owner, frames) = parse_frames(&batch(&[(1, 960, &[1, 2]), (3, 1920, &[3])])).unwrap();
+    assert_eq!(owner, 7);
+    assert_eq!(frames.len(), 2);
+    assert_eq!((frames[0].slot, frames[0].run, frames[0].rtp_time), (1, 9, 960));
+    assert_eq!(frames[0].opus, [1, 2]);
+    assert_eq!((frames[1].slot, frames[1].rtp_time), (3, 1920));
+}
+
+#[test]
+fn truncated_or_oversized_batches_are_refused_whole() {
+    assert!(parse_frames(&[0; 15]).is_none());
+    let mut cut = batch(&[(1, 960, &[1, 2])]);
+    cut.pop();
+    assert!(parse_frames(&cut).is_none());
+    assert!(parse_frames(&vec![0; MAX_BATCH + 1]).is_none());
+    assert_eq!(parse_frames(&batch(&[])).unwrap().1.len(), 0);
 }

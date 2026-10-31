@@ -12,9 +12,12 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use gwar_client::voice::share::{CaptureQueue, ShareFrame};
+use gwar_client::voice::share::{CaptureQueue, parse_frames};
 use serde::Serialize;
-use tauri::{State, WebviewWindow, ipc::{InvokeBody, Request, Response}};
+use tauri::{
+    State, WebviewWindow,
+    ipc::{InvokeBody, Request, Response},
+};
 
 use crate::voice::Voice;
 
@@ -32,6 +35,7 @@ mod platform {
     pub fn support() -> Support {
         Support::Unsupported
     }
+    pub fn allow() {}
     pub fn start(_queue: Arc<CaptureQueue>) -> Result<Box<dyn Send>, Refusal> {
         Err(Refusal::Unsupported)
     }
@@ -111,6 +115,16 @@ pub fn share_capture_support() -> Support {
     platform::support()
 }
 
+/// Asks the OS to list Gwar for this permission. The answer takes a relaunch to apply.
+#[tauri::command]
+pub fn share_capture_allow(window: WebviewWindow) -> Result<(), String> {
+    if window.label() != "main" {
+        return Err("share sound requires the main window".into());
+    }
+    platform::allow();
+    Ok(())
+}
+
 /// Starts capturing, only ever from the sharer's own confirmation. Sound must never begin on
 /// its own: `id` belongs to one share start, and the webview stops it with that share.
 #[tauri::command]
@@ -128,7 +142,8 @@ pub async fn share_capture_start(
     capture.stop();
     let queue = Arc::<CaptureQueue>::default();
     let opened = queue.clone();
-    let started = tauri::async_runtime::spawn_blocking(move || platform::start(opened)).await.map_err(|e| e.to_string())?;
+    let started =
+        tauri::async_runtime::spawn_blocking(move || platform::start(opened)).await.map_err(|e| e.to_string())?;
     let stream = started.map_err(|refusal| {
         tracing::warn!("share sound did not start: {refusal:?}");
         refusal.code().to_owned()
@@ -194,7 +209,12 @@ pub fn share_playback_open(
 }
 
 #[tauri::command]
-pub fn share_playback_close(window: WebviewWindow, voice: State<'_, Voice>, owner: u64, slot: usize) -> Result<(), String> {
+pub fn share_playback_close(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    slot: usize,
+) -> Result<(), String> {
     check_caller(&window, &voice, owner)?;
     voice.share_playout(|playout, _| playout.close(slot))
 }
@@ -229,64 +249,9 @@ pub async fn share_playback_frames(
     Ok(())
 }
 
-/// The largest batch the webview may send: 4 slots × 16 packets × Opus's largest.
-const MAX_BATCH: usize = 16 + 4 * 16 * (7 + 1275);
-
-/// `owner: u64, run: u64`, then per frame `slot: u8, rtp_time: u32, length: u16, opus`, little-endian.
-fn parse_frames(body: &[u8]) -> Option<(u64, Vec<ShareFrame>)> {
-    if body.len() > MAX_BATCH {
-        return None;
-    }
-    let (header, mut rest) = body.split_at_checked(16)?;
-    let owner = u64::from_le_bytes(header[..8].try_into().ok()?);
-    let run = u64::from_le_bytes(header[8..].try_into().ok()?);
-    let mut frames = Vec::new();
-    while !rest.is_empty() {
-        let (head, tail) = rest.split_at_checked(7)?;
-        let slot = usize::from(head[0]);
-        let rtp_time = u32::from_le_bytes(head[1..5].try_into().ok()?);
-        let length = usize::from(u16::from_le_bytes(head[5..7].try_into().ok()?));
-        let (opus, tail) = tail.split_at_checked(length)?;
-        frames.push(ShareFrame { slot, run, rtp_time, opus: opus.to_vec() });
-        rest = tail;
-    }
-    Some((owner, frames))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn batch(frames: &[(u8, u32, &[u8])]) -> Vec<u8> {
-        let mut body = [7u64.to_le_bytes(), 9u64.to_le_bytes()].concat();
-        for (slot, time, opus) in frames {
-            body.push(*slot);
-            body.extend(time.to_le_bytes());
-            body.extend((opus.len() as u16).to_le_bytes());
-            body.extend(*opus);
-        }
-        body
-    }
-
-    #[test]
-    fn a_batch_keeps_its_frames_and_their_order() {
-        let (owner, frames) = parse_frames(&batch(&[(1, 960, &[1, 2]), (3, 1920, &[3])])).unwrap();
-        assert_eq!(owner, 7);
-        assert_eq!(frames.len(), 2);
-        assert_eq!((frames[0].slot, frames[0].run, frames[0].rtp_time), (1, 9, 960));
-        assert_eq!(frames[0].opus, [1, 2]);
-        assert_eq!((frames[1].slot, frames[1].rtp_time), (3, 1920));
-    }
-
-    #[test]
-    fn truncated_or_oversized_batches_are_refused_whole() {
-        assert!(parse_frames(&[0; 15]).is_none());
-        let mut cut = batch(&[(1, 960, &[1, 2])]);
-        cut.pop();
-        assert!(parse_frames(&cut).is_none());
-        assert!(parse_frames(&vec![0; MAX_BATCH + 1]).is_none());
-        assert_eq!(parse_frames(&batch(&[])).unwrap().1.len(), 0);
-    }
 
     #[test]
     fn refusals_have_codes_the_web_ui_knows() {
@@ -304,7 +269,8 @@ mod tests {
     async fn this_mac_captures_other_processes_and_leaves_this_one_out() {
         let dir = std::env::temp_dir().join(format!("gwar-share-sound-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let tone: Vec<f32> = (0..96_000).map(|i| 0.003 * (std::f32::consts::TAU * 997.0 * i as f32 / 48_000.0).sin()).collect();
+        let tone: Vec<f32> =
+            (0..96_000).map(|i| 0.003 * (std::f32::consts::TAU * 997.0 * i as f32 / 48_000.0).sin()).collect();
         let path = dir.join("tone.wav");
         std::fs::write(&path, wav(&tone)).unwrap();
         let queue = Arc::<CaptureQueue>::default();

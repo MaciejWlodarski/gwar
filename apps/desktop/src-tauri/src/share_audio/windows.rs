@@ -15,17 +15,19 @@ use windows::{
     Win32::{
         Foundation::{CloseHandle, E_FAIL, HANDLE, WAIT_OBJECT_0},
         Media::Audio::{
-            ActivateAudioInterfaceAsync, AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED,
-            AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK,
-            AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
-            AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, IActivateAudioInterfaceAsyncOperation,
-            IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl, IAudioCaptureClient,
-            IAudioClient, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
-            WAVEFORMATEX, WAVE_FORMAT_PCM,
+            AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+            AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, AUDIOCLIENT_ACTIVATION_PARAMS,
+            AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+            AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
+            IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
+            IAudioCaptureClient, IAudioClient, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+            VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, WAVE_FORMAT_PCM, WAVEFORMATEX,
         },
         System::{
             Com::{COINIT_MULTITHREADED, CoInitializeEx, CoUninitialize, StructuredStorage::PROPVARIANT},
-            Threading::{CreateEventW, GetCurrentProcessId, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject},
+            Threading::{
+                CreateEventW, GetCurrentProcessId, INFINITE, SetEvent, WaitForMultipleObjects, WaitForSingleObject,
+            },
             Variant::VT_BLOB,
         },
     },
@@ -60,7 +62,10 @@ pub fn support() -> Support {
 struct Completed(HANDLE);
 
 impl IActivateAudioInterfaceCompletionHandler_Impl for Completed_Impl {
-    fn ActivateCompleted(&self, _operation: windows::core::Ref<IActivateAudioInterfaceAsyncOperation>) -> windows::core::Result<()> {
+    fn ActivateCompleted(
+        &self,
+        _operation: windows::core::Ref<IActivateAudioInterfaceAsyncOperation>,
+    ) -> windows::core::Result<()> {
         // SAFETY: the event outlives the wait for this completion (see `activate`).
         unsafe { SetEvent(self.0) }
     }
@@ -119,7 +124,12 @@ fn activate() -> windows::core::Result<IAudioClient> {
     result
 }
 
-fn capture(queue: &CaptureQueue, stop: &AtomicBool, stop_event: HANDLE, opened: mpsc::SyncSender<Result<(), String>>) -> windows::core::Result<()> {
+fn capture(
+    queue: &CaptureQueue,
+    stop: &AtomicBool,
+    stop_event: HANDLE,
+    opened: mpsc::SyncSender<Result<(), String>>,
+) -> windows::core::Result<()> {
     let client = activate();
     let client = match client {
         Ok(client) => client,
@@ -172,7 +182,11 @@ fn capture(queue: &CaptureQueue, stop: &AtomicBool, stop_event: HANDLE, opened: 
 }
 
 /// Copies every packet the client holds.
-unsafe fn drain(reader: &IAudioCaptureClient, stereo: &mut Vec<f32>, queue: &CaptureQueue) -> windows::core::Result<()> {
+unsafe fn drain(
+    reader: &IAudioCaptureClient,
+    stereo: &mut Vec<f32>,
+    queue: &CaptureQueue,
+) -> windows::core::Result<()> {
     // SAFETY: the caller's contract.
     unsafe {
         while reader.GetNextPacketSize()? > 0 {
@@ -215,6 +229,9 @@ impl Drop for Capture {
         }
     }
 }
+
+/// Windows has no permission to ask for.
+pub fn allow() {}
 
 pub fn start(queue: Arc<CaptureQueue>) -> Result<Box<dyn Send>, Refusal> {
     if support() != Support::Ok {

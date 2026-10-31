@@ -11,7 +11,7 @@ import { useSettings } from "./settings";
 import { create } from "zustand";
 import { tNow } from "../i18n";
 import { RequestError, type Link } from "../net/connection";
-import { isDesktop, tauri } from "../platform";
+import { isDesktop, openScreenRecordingSettings, tauri } from "../platform";
 import { notify } from "../platform/notify";
 import { captureFailure } from "../voice/screen-permission";
 import { channelPermissions } from "../lib/channel-permissions";
@@ -19,6 +19,8 @@ import type { Event } from "../proto/Event";
 import type { ScreenStopReason } from "../proto/ScreenStopReason";
 import { nextMediaRun } from "../voice/engine";
 import { applyCaptureSpec, captureScreen, captureSupport, probeAv1Encoder, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PublishStats, type SlotStats, type EncoderFallbacks } from "../voice/screen";
+import { defaultShareAudio } from "../voice/share-audio";
+import { computerSoundSupport, ComputerSound, shareSoundReceivable, ShareSoundReceiver, type ShareSoundLink } from "../voice/share-sound";
 import { myChannelId } from "./reducer";
 import { useScreen, type ScreenAction } from "./screen";
 import { useSession, useUi } from "./stores";
@@ -109,6 +111,10 @@ export class ScreenController {
   /** A receiver that carried a share can still hold its last decoded frame. */
   private readonly usedSlots = new Set<number>();
   private watchAudio = false;
+  /** Desktop app: this share's computer sound, from the sharer's confirmation until it ends. */
+  private sound: ComputerSound | null = null;
+  /** Desktop app: where the watch transport's sound goes instead of the webview's decoder. */
+  private receiver: ShareSoundReceiver | null = null;
   private audioTimer: ReturnType<typeof setInterval> | null = null;
   /** Owned by the grant, not by a stage/thumbnail video that can remount. */
   /** Each granted watch still waiting for its first frame; no timer while the server pauses it. */
@@ -149,7 +155,13 @@ export class ScreenController {
     private readonly describe: (e: unknown) => string,
     private readonly canResumeVoice: () => boolean = () => true,
     private readonly unexpectedStop: () => void = () => {},
+    private readonly soundLink: () => Promise<ShareSoundLink> | null = () => null,
   ) {}
+
+  /** Share sound goes through the native mixer here, never through the webview. */
+  usesNativeSound(): boolean {
+    return isDesktop() || this.soundLink() !== null;
+  }
 
   /** Ends my share locally when I leave or change my voice channel; the server ends it too (`left`). */
   init(): void {
@@ -205,6 +217,7 @@ export class ScreenController {
         });
         if (["permission", "permissionHint"].includes(useScreen.getState().notice ?? "")) dispatch({ type: "notice", notice: null });
         dispatch({ type: "picked", attempt, stream, surface: surfaceOf(track) });
+        void this.soundLink()?.then(computerSoundSupport, () => "unsupported" as const).then(state => dispatch({ type: "computerSound", attempt, state }));
         dispatch({ type: "audio", attempt, sharing: stream.getAudioTracks().some(t => t.readyState === "live") });
         for (const audio of stream.getAudioTracks()) audio.addEventListener("ended", () => dispatch({ type: "audio", attempt, sharing: false }));
         dispatch({ type: "choose", spec: resolveQuality(useSettings.getState(), surfaceOf(track)) });
@@ -322,6 +335,8 @@ export class ScreenController {
     const recovering = own.phase === "reconnecting";
     if (recovering && track.readyState === "ended") { this.recoveryFailed(); return; }
     const { attempt, spec, surface } = own;
+    // Consent is this click, and only its own task can start an AudioContext.
+    if (own.phase === "choosing" && own.computerSound === "ok" && useSettings.getState().shareComputerSound) this.prepareSound(attempt);
     // Only what the sharer saw and confirmed: the notice and the checkbox were in the quality menu.
     const guestLink = own.guestLink && this.guestLinkPossible();
     const generation = this.generation;
@@ -350,6 +365,12 @@ export class ScreenController {
       if (!current()) return;
       if (!screenAudio) {
         for (const audio of own.stream?.getAudioTracks() ?? []) { audio.stop(); own.stream?.removeTrack(audio); }
+        this.endSound();
+      } else if (this.sound) {
+        const sound = await this.sound.start();
+        if (!current()) return;
+        if (typeof sound === "string") { this.endSound(); dispatch({ type: "computerSound", attempt, state: sound }); }
+        else if (!own.stream?.getTracks().includes(sound)) own.stream?.addTrack(sound);
       }
       dispatch({ type: "audio", attempt, server: screenAudio, sharing: screenAudio && own.stream?.getAudioTracks().some(t => t.readyState === "live") === true });
       await applyCaptureSpec(track, spec, !screenSpec);
@@ -376,6 +397,7 @@ export class ScreenController {
     const publisher = new ScreenPublisher({
       uplink: screen => { if (current() && this.publisher === publisher) useUplink.setState({ screen }); },
       audio: screenAudio ? own.stream?.getAudioTracks()[0] : undefined,
+      nativeAudio: this.sound !== null,
       audioState: sharing => {
         if (!current()) return;
         dispatch({ type: "audio", attempt, sharing });
@@ -426,9 +448,44 @@ export class ScreenController {
     }
   }
 
+  private prepareSound(attempt: number): void {
+    if (this.sound) return;
+    try {
+      this.sound = new ComputerSound(this.soundLink, () => {
+        this.sound = null;
+        dispatch({ type: "computerSound", attempt, state: "failed" });
+      });
+    } catch (e) {
+      console.warn("[share sound] context:", e);
+      dispatch({ type: "computerSound", attempt, state: "failed" });
+    }
+  }
+
+  /** Puts Gwar on the OS list as well: until first asked, it is not there to turn on. */
+  async allowComputerSound(): Promise<void> {
+    const link = await this.soundLink();
+    await link?.api.invoke("share_capture_allow");
+    await openScreenRecordingSettings();
+  }
+
+  private endSound(): void {
+    this.sound?.stop();
+    this.sound = null;
+  }
+
+  /** Details' "stop sharing sound": takes the consent back. The picture goes on. */
+  stopComputerSound(): void {
+    const own = useScreen.getState().own;
+    if (!own || !this.sound) return;
+    this.endSound();
+    dispatch({ type: "computerSound", attempt: own.attempt, state: "stopped" });
+    dispatch({ type: "audio", attempt: own.attempt, sharing: false });
+  }
+
   /** Ends my share here: the transport closes and the capture stops. */
   private endOwn(): void {
     useUplink.setState({ screen: null });
+    this.endSound();
     const own = useScreen.getState().own;
     const publisher = this.publisher;
     this.publisher = null;
@@ -683,6 +740,28 @@ export class ScreenController {
     return this.transport.stats(watch.slot);
   }
 
+  private soundGain(share: string): number {
+    const { volume, muted } = useSettings.getState().shareAudio[share] ?? defaultShareAudio;
+    return muted ? 0 : volume;
+  }
+
+  /** The player of a watch with confirmed sound; its controls appear only if this succeeds. */
+  async openSound(id: number, share: string, slot: number): Promise<void> {
+    const receiver = this.receiver;
+    if (!receiver) return;
+    const ready = await receiver.openSlot(slot, this.soundGain(share)).catch(() => false);
+    if (this.receiver === receiver) dispatch({ type: "watchSound", id, ready });
+  }
+
+  closeSound(id: number, slot: number): void {
+    this.receiver?.closeSlot(slot);
+    dispatch({ type: "watchSound", id, ready: false });
+  }
+
+  setSoundGain(share: string, slot: number): void {
+    this.receiver?.setGain(slot, this.soundGain(share));
+  }
+
   private async refreshAudio(conn: Link, run: number, id: number, share: string): Promise<void> {
     const audio = await conn.request("screen.audio.state", { share, stopped: false }, { timeoutMs: 1_500 }).then(r => r.audio).catch(() => false);
     if (this.link() === conn && useScreen.getState().watches.some(w => w.id === id && w.share === share && w.status === "watching")) dispatch({ type: "watchAudio", run, id, audio });
@@ -720,10 +799,17 @@ export class ScreenController {
       run,
       av1: true,
       audio: async () => {
-        const enabled = !isDesktop() && await conn.request("screen.audio.capabilities", {}, { timeoutMs: 1_500 }).then(f => f.screen_audio === true).catch(() => false);
-        if (this.transport === transport) this.watchAudio = enabled;
+        const server = await conn.request("screen.audio.capabilities", {}, { timeoutMs: 1_500 }).then(f => f.screen_audio === true).catch(() => false);
+        const native = this.usesNativeSound();
+        // Without a way to keep it from the webview's decoder, the desktop app stays video only.
+        const link = native && server && await shareSoundReceivable() ? await this.soundLink()?.catch(() => null) : null;
+        const enabled = native ? !!link : server;
+        if (this.transport !== transport) return enabled;
+        if (link) this.receiver = new ShareSoundReceiver(link, run);
+        this.watchAudio = enabled;
         return enabled;
       },
+      soundTransform: slot => this.receiver?.transform(slot),
       iceServers: useSession.getState().iceServers,
       offer: async (sdp, run, h264 = [], av1 = null) => {
         // Query explicitly: adding fields to Welcome would break old clients' strict
@@ -784,6 +870,8 @@ export class ScreenController {
     if (this.audioTimer) clearInterval(this.audioTimer);
     this.audioTimer = null;
     this.watchAudio = false;
+    this.receiver?.close();
+    this.receiver = null;
     for (const { timer } of this.firstFrameTimers.values()) if (timer) clearTimeout(timer);
     this.firstFrameTimers.clear();
     // A new watch transport starts its spacing over.

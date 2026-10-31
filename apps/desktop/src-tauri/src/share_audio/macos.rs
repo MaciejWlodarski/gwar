@@ -11,7 +11,11 @@ use std::time::Duration;
 use block2::RcBlock;
 use dispatch2::DispatchQueue;
 use gwar_client::voice::share::CaptureQueue;
-use objc2::{AnyThread, DefinedClass, define_class, msg_send, rc::Retained, runtime::{NSObject, NSObjectProtocol, ProtocolObject}};
+use objc2::{
+    AnyThread, DefinedClass, define_class, msg_send,
+    rc::Retained,
+    runtime::{NSObject, NSObjectProtocol, ProtocolObject},
+};
 use objc2_core_audio_types::{AudioBuffer, AudioBufferList};
 use objc2_core_foundation::CFRetained;
 use objc2_core_graphics::{CGPreflightScreenCaptureAccess, CGRequestScreenCaptureAccess};
@@ -123,6 +127,11 @@ pub fn support() -> Support {
     }
 }
 
+/// The system's one-time prompt, which also lists Gwar in System Settings.
+pub fn allow() {
+    CGRequestScreenCaptureAccess();
+}
+
 /// A display to attach the stream to. The filter chooses no window: sound is system-wide.
 fn display() -> Result<Retained<SCContentFilter>, Refusal> {
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -153,7 +162,11 @@ fn display() -> Result<Retained<SCContentFilter>, Refusal> {
         let _ = sender.try_send(result);
     });
     // SAFETY: the block lives until the framework releases it.
-    unsafe { SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(false, false, &done) };
+    unsafe {
+        SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
+            false, false, &done,
+        )
+    };
     receiver.recv_timeout(START_TIMEOUT).map_err(|_| Refusal::Failed("timed out listing displays".into()))?
 }
 
@@ -194,8 +207,7 @@ pub fn start(queue: Arc<CaptureQueue>) -> Result<Box<dyn Send>, Refusal> {
         Support::Ok => {}
         Support::Unsupported => return Err(Refusal::Unsupported),
         Support::Permission => {
-            // The system's one-time prompt; System Settings decides from then on.
-            CGRequestScreenCaptureAccess();
+            allow();
             return Err(Refusal::Permission);
         }
     }
@@ -204,9 +216,8 @@ pub fn start(queue: Arc<CaptureQueue>) -> Result<Box<dyn Send>, Refusal> {
     let output = Output::new(queue);
     let delegate = ProtocolObject::from_ref(&*output);
     // SAFETY: valid filter and configuration; the delegate outlives the stream through `Stream`.
-    let stream = unsafe {
-        SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, Some(delegate))
-    };
+    let stream =
+        unsafe { SCStream::initWithFilter_configuration_delegate(SCStream::alloc(), &filter, &config, Some(delegate)) };
     let handler = DispatchQueue::new("app.gwar.share-sound", None);
     // SAFETY: the output and its queue stay alive with `Stream`.
     unsafe {
