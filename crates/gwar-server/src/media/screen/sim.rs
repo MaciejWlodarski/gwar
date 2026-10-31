@@ -178,6 +178,8 @@ pub struct Sim {
     arrivals: HashMap<(usize, u16), Instant>,
     /// Queue residence seen by independent 100 kbps voice on the same bottleneck.
     voice: bool,
+    /// Synthetic screen sound uses the production audio socket bucket, then the same FIFO.
+    share_audio: usize,
     voice_queue: Vec<Duration>,
     /// Worst queue voice met within `JOIN` of the start, and from then to 15 s.
     voice_join_queue_max: Duration,
@@ -248,6 +250,7 @@ impl Sim {
             next_server: now,
             arrivals: HashMap::new(),
             voice: false,
+            share_audio: 0,
             voice_queue: Vec::new(),
             voice_join_queue_max: Duration::ZERO,
             voice_startup_queue_max: Duration::ZERO,
@@ -494,6 +497,17 @@ impl Sim {
                     {
                         share.wants_key = true;
                     }
+                }
+            }
+        }
+        if self.share_audio > 0 && self.elapsed().as_millis().is_multiple_of(20) {
+            for _ in 0..self.share_audio {
+                // Saturate each 128 kb/s wire allowance, not merely typical 64 kb/s Opus.
+                if self.w.egress.charge(egress::Class::Audio, 320, now)
+                    && let Some(rate) = self.down.rate
+                {
+                    self.down.busy =
+                        self.down.busy.max(now) + Duration::from_secs_f64((320 + WIRE) as f64 * 8.0 / rate as f64);
                 }
             }
         }
@@ -911,6 +925,35 @@ mod tests {
         voice_headroom(1..=8);
     }
 
+    #[test]
+    fn share_audio_keeps_voice_inside_existing_steady_and_startup_bounds() {
+        for interval in [MS, 5 * MS, 10 * MS] {
+            for loss in [0.0, 0.01] {
+                let mut sim = Sim::new(Some(5_000_000));
+                sim.server_interval = interval;
+                sim.down.loss = loss;
+                sim.up.loss = loss;
+                sim.voice = true;
+                sim.share_audio = 2;
+                sim.join("a", 3_000_000, 30, 150_000, 8_000_000);
+                sim.join("b", 3_000_000, 30, 150_000, 8_000_000);
+                sim.w.egress.reserve_audio(2, sim.now);
+                sim.run(60 * SECOND);
+                sim.voice_queue.sort();
+                let p99 = sim.voice_queue[sim.voice_queue.len() * 99 / 100];
+                let steady = (10 * MS).max(interval + 2 * MS);
+                let startup = (10 * MS).max(2 * interval + 2 * MS);
+                assert!(p99 <= steady, "{interval:?} loss={loss} p99={p99:?}");
+                assert!(
+                    sim.voice_startup_queue_max <= startup,
+                    "{interval:?} loss={loss} startup={:?}",
+                    sim.voice_startup_queue_max
+                );
+                assert!(voice_hurt(&sim, sim.start, sim.start + JOIN).0 < SECOND);
+            }
+        }
+    }
+
     fn voice_headroom(seeds: std::ops::RangeInclusive<u64>) {
         let mut failures = Vec::new();
         for interval in [MS, 5 * MS, 10 * MS] {
@@ -1317,7 +1360,7 @@ mod tests {
 
     /// Two 2 Mbps shares; slot 1 loses an original whose NACK is held back while the slot
     /// stops (`stop`), then the NACK arrives and the estimator is made to probe.
-    fn stop_with_a_nack_in_flight(stop: impl FnOnce(&mut Watcher)) -> (Sim, Instant) {
+    fn stop_with_a_nack_in_flight(stop: impl FnOnce(&mut Watcher, Instant)) -> (Sim, Instant) {
         let mut sim = Sim::new(None);
         sim.watch("a", 2_000_000, 30, 60_000, None);
         sim.watch("b", 2_000_000, 30, 60_000, None);
@@ -1327,7 +1370,7 @@ mod tests {
         sim.hold = true;
         sim.run(100 * MS);
         assert!(sim.down.dropped == 1 && !sim.held.is_empty());
-        stop(&mut sim.w);
+        stop(&mut sim.w, sim.now);
         let stopped = sim.now;
         sim.hold = false;
         for datagram in std::mem::take(&mut sim.held) {
@@ -1352,7 +1395,7 @@ mod tests {
                 sim.w.rtc.bwe().reset(Bitrate::bps(100_000));
                 sim.w.rtc.handle_input(Input::Timeout(sim.now)).unwrap();
             }
-            empty(&mut sim.w, 0);
+            empty(&mut sim.w, 0, sim.now);
             assert_eq!(sim.w.desired, None);
             let stopped = sim.now;
             sim.run(30 * SECOND);
@@ -1369,8 +1412,8 @@ mod tests {
 
     #[test]
     fn pause_and_unwatch_stop_everything_of_the_slot() {
-        let (paused, at) = stop_with_a_nack_in_flight(|w| apply(w, 1, Change::Pause(ScreenPauseReason::Bandwidth)));
-        let (unwatched, at2) = stop_with_a_nack_in_flight(|w| empty(w, 1));
+        let (paused, at) = stop_with_a_nack_in_flight(|w, _| apply(w, 1, Change::Pause(ScreenPauseReason::Bandwidth)));
+        let (unwatched, at2) = stop_with_a_nack_in_flight(|w, now| empty(w, 1, now));
         for (sim, at) in [(paused, at), (unwatched, at2)] {
             let context = summary(&sim);
             assert_eq!(media_of(&sim, 1, at), 0, "nothing of the slot after it stopped: {context}");

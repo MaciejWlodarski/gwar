@@ -132,7 +132,35 @@ function devicePatch({ frequency, sources, sendCodec, receiveCodec, trace }, sta
 }
 
 const sourcePage = `<!doctype html><title>${SOURCE_TITLE}</title><style>html,body{margin:0;height:100%;overflow:hidden;background:#777}canvas{display:block;width:100vw;height:100vh}</style>
-<canvas width="1920" height="1080"></canvas><script>(${stampBarcode})(document.querySelector("canvas"), 1, 60)</script>`;
+<canvas width="1920" height="1080"></canvas><script>(${stampBarcode})(document.querySelector("canvas"), 1, 60); const ctx=new AudioContext();const tone=ctx.createOscillator();tone.frequency.value=997;const gain=ctx.createGain();gain.gain.value=0.1;tone.connect(gain).connect(ctx.destination);tone.start();ctx.resume();window.__toneContext=ctx;</script>`;
+
+/** Verify decoded audio samples, rather than treating an m-line or packet count as sound. */
+async function soundReceived(page, share) {
+  await waitFor(() => session(page, (_, screen, __, share) => {
+    const watch = screen.watches.find(w => w.share === share);
+    return watch?.status === "watching" && !!screen.streams[watch.slot]?.getAudioTracks().length;
+  }, share), "audio receiver track");
+  const result = await page.evaluate(async share => {
+    const element = document.querySelector(`audio[data-share-audio="${share}"]`);
+    const stream = element?.srcObject;
+    if (!stream) return { peak: 0 };
+    const context = new AudioContext(); await context.resume();
+    const source = context.createMediaStreamSource(stream), analyser = context.createAnalyser();
+    analyser.fftSize = 4096; source.connect(analyser);
+    const samples = new Float32Array(analyser.fftSize), bins = new Float32Array(analyser.frequencyBinCount); let peak = 0, peakHz = 0;
+    for (let n = 0; n < 30; n++) {
+      await new Promise(r => setTimeout(r, 100)); analyser.getFloatTimeDomainData(samples);
+      const rms = Math.sqrt(samples.reduce((sum, x) => sum + x*x, 0) / samples.length);
+      if (rms > peak) {
+        peak = rms; analyser.getFloatFrequencyData(bins);
+        const bin = bins.reduce((best, x, i) => x > bins[best] ? i : best, 0); peakHz = bin * context.sampleRate / analyser.fftSize;
+      }
+    }
+    source.disconnect(); await context.close(); return { peak, peakHz };
+  }, share);
+  assert.ok(result.peak > 0.02 && result.peakHz > 970 && result.peakHz < 1020, `decoded generated 997 Hz share audio: ${JSON.stringify(result)}`);
+  checks.push({ check: "decoded 997 Hz share audio", share, ...result });
+}
 
 /** What a failure prints per device: each open peer connection's RTP streams and the stage's videos. */
 const diagnostics = page => page.evaluate(async () => ({
@@ -149,7 +177,7 @@ const diagnostics = page => page.evaluate(async () => ({
     });
     return { state: pc.connectionState, streams, offeredCodecs: pc.localDescription?.sdp?.split(/\r?\n/).filter(l => /^m=video|^a=rtpmap:.*(AV1|H264|VP9|VP8)/i.test(l)), answeredCodecs: pc.remoteDescription?.sdp?.split(/\r?\n/).filter(l => /^m=video|^a=rtpmap:.*(AV1|H264|VP9|VP8)/i.test(l)) };
   })),
-  capture: window.__pcs.flatMap(pc => pc.getSenders().filter(s => s.track?.kind === "video").map(s => ({ settings: s.track.getSettings(), parameters: s.getParameters() }))),
+  capture: window.__pcs.flatMap(pc => pc.getSenders().filter(s => s.track).map(s => ({ kind: s.track.kind, label: s.track.label, settings: s.track.getSettings(), parameters: s.getParameters() }))),
   videos: [...document.querySelectorAll("video[data-share]")].map(v => {
     const track = v.srcObject?.getVideoTracks?.()[0];
     return { share: v.dataset.share, readyState: v.readyState, size: `${v.videoWidth}x${v.videoHeight}`, paused: v.paused, track: track && `${track.readyState}${track.muted ? " muted" : ""}`,
@@ -236,7 +264,7 @@ async function share(page, surface, preset = null) {
     await dialog.getByLabel("Frame rate", { exact: true }).selectOption(preset === "Game" ? "60" : preset === "Text" ? "15" : "30");
   }
   await dialog.getByRole("button", { name: "Share", exact: true }).click();
-  await bar(page).getByText(/watching$/).waitFor({ timeout: 30_000 });
+  await waitFor(() => ownShare(page), "share announced", 30_000);
   const id = await ownShare(page);
   assert.ok(id, `${page.deviceName} has a live share`);
   return id;
@@ -326,7 +354,7 @@ async function codecFlow(publisher, viewer, share, expectedCodecs, size = null) 
   const read = async (page, direction) => page.evaluate(async ({ direction, slot }) => {
     for (const pc of window.__pcs) {
       if (pc.connectionState !== "connected") continue;
-      const transceivers = pc.getTransceivers();
+      const transceivers = pc.getTransceivers().filter(t => t.receiver.track.kind === "video");
       const target = direction === "in" ? transceivers[slot] : null;
       if (direction === "in" && (!target || target.direction !== "recvonly" || target.receiver.track.kind !== "video")) continue;
       const report = direction === "in" ? await target.receiver.getStats() : await pc.getStats();
@@ -563,7 +591,10 @@ async function run(browsers, web, server, token) {
   // Chromium shares a real tab; WebKit shares a canvas.
   const cs = await device(engine("chromium"), web, server, "cs-tab", { frequency: 440, canvasId: chromiumTab ? null : 1 });
   if (chromiumTab) {
-    await (await cs.context_.newPage()).setContent(sourcePage);
+    const source = await cs.context_.newPage();
+    await source.route("**/share-audio-source", route => route.fulfill({ contentType: "text/html", body: sourcePage }));
+    await source.goto(`${web}/share-audio-source`);
+    checks.push({ check: "generated source audio", ...await source.evaluate(async () => { await window.__toneContext.resume(); return { state: window.__toneContext.state, sampleRate: window.__toneContext.sampleRate }; }) });
     // Chromium refuses the picker to a tab in the background.
     await cs.bringToFront();
   }
@@ -624,6 +655,38 @@ async function run(browsers, web, server, token) {
   await watch(cv, "cs-tab");
   await sees(cv, csShare, 1, "chromium → chromium, viewer in another channel");
   await codecFlow(cs, cv, csShare, primary, requiredSize);
+  if (process.env.E2E_SCREEN_AUDIO === "1") {
+    await soundReceived(cv, csShare);
+    if (process.env.E2E_SHARE_AUDIO_SCREENSHOTS) {
+      const directory = process.env.E2E_SHARE_AUDIO_SCREENSHOTS; mkdirSync(directory, { recursive: true });
+      for (const lang of ["pl", "en"]) {
+        for (const page of [cs, cv]) await page.evaluate(async lang => (await window.__gwarE2eImport("/src/state/settings.ts")).useSettings.setState({ language: lang }), lang);
+        for (const [name, width, height] of [["desktop", 1440, 900], ["tablet", 768, 1024], ["390", 390, 844], ["360", 360, 800]]) {
+          for (const [role, page] of [["sharer", cs], ["viewer", cv]]) {
+            await page.setViewportSize({ width, height });
+            await page.screenshot({ path: path.join(directory, `${role}-${lang}-${name}.png`), animations: "disabled" });
+          }
+        }
+      }
+      for (const page of [cs, cv]) { await page.setViewportSize({ width: 1440, height: 900 }); await page.evaluate(async () => (await window.__gwarE2eImport("/src/state/settings.ts")).useSettings.setState({ language: "en" })); }
+    }
+
+    assert.equal(await cs.locator("audio[data-share-audio]").count(), 0, "the sharer never plays its own share");
+    await cv.getByLabel("Share volume", { exact: true }).fill("35");
+    await waitFor(() => cv.locator(`audio[data-share-audio="${csShare}"]`).evaluate(a => a.volume === 0.35), "per-share volume");
+    await cv.getByRole("button", { name: "Mute share sound", exact: true }).click();
+    assert.ok(await cv.locator(`audio[data-share-audio="${csShare}"]`).evaluate(a => a.muted));
+    await session(cs, (_, __, controller) => controller.connection.socket.close(4000, "share audio reconnect"));
+    let replacement;
+    await waitFor(async () => { replacement = await shareOf(cv, "cs-tab"); return replacement && replacement !== csShare; }, "republished share");
+    await soundReceived(cv, replacement);
+    assert.ok(await cv.locator(`audio[data-share-audio="${replacement}"]`).evaluate(a => a.muted && a.volume === 0.35), "volume and mute survive reconnect");
+    await cv.getByRole("button", { name: "Unmute share sound", exact: true }).click();
+    assert.equal(await cv.locator("audio[data-share-audio]").count(), 1, "one output across slot and stage reuse");
+    checks.push({ check: "generated 997 Hz tab sound, per-share volume/mute, no self-playback, retained audio across reconnect", ok: true });
+    return opened.flatMap(p => errors(p).map(e => `${p.deviceName}: ${e}`));
+  }
+
   checks.push({ check: "selected browser codec verified through SFU", codec: primary.replace("video/", ""), fixedCanvas });
   if (h264Share) {
     const incompatible = await device(engine("chromium"), web, server, "vp9-only-viewer", { receiveCodec: "vp9" });
@@ -636,7 +699,7 @@ async function run(browsers, web, server, token) {
   await watch(cv, "ws-canvas");
   await sees(cv, wsShare, 2, "webkit → chromium");
   await codecFlow(ws, cv, wsShare, "video/vp9");
-  await bar(cs).getByText("1 watching").waitFor({ timeout: 10_000 });
+  await waitFor(() => session(cs, (_, screen) => screen.own?.viewers === 1), "viewer count", 10_000);
 
   // A late joiner, in no voice at all, learns of both from the Welcome.
   const wv = await device(engine("webkit"), web, server, "wv-late", { frequency: 660 });
@@ -649,7 +712,7 @@ async function run(browsers, web, server, token) {
   await watch(wv, "ws-canvas");
   await sees(wv, wsShare, 2, "webkit → webkit");
   await codecFlow(ws, wv, wsShare, "video/vp9");
-  await bar(ws).getByText("2 watching").waitFor({ timeout: 10_000 });
+  await waitFor(() => session(ws, (_, screen) => screen.own?.viewers === 2), "viewer count", 10_000);
 
   // The real Stage moves both players without rebinding their live streams.
   const beforeFocus = await session(wv, (_, screen) => ({ transport: screen.transport, watches: screen.watches }));
@@ -897,7 +960,7 @@ try {
   await waitFor(() => /redeem this one-time admin token in your client: (\S+)/.test(server.output), "server admin token", 60_000);
   const token = /redeem this one-time admin token in your client: (\S+)/.exec(server.output)[1];
   if (engines.includes("chromium")) {
-    browsers.chromium = await chromium.launch({ channel: "chromium", headless: true, args: ["--autoplay-policy=no-user-gesture-required", `--auto-select-tab-capture-source-by-title=${SOURCE_TITLE}`] });
+    browsers.chromium = await chromium.launch({ channel: "chromium", headless: true, ignoreDefaultArgs: process.env.E2E_SCREEN_AUDIO === "1" ? ["--mute-audio"] : [], args: ["--autoplay-policy=no-user-gesture-required", `--auto-select-tab-capture-source-by-title=${SOURCE_TITLE}`] });
   }
   if (engines.includes("webkit")) browsers.webkit = await webkit.launch({ headless: true });
   warnings = await run(browsers, web, ws, token);

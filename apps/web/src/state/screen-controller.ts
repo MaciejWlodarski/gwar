@@ -184,7 +184,7 @@ export class ScreenController {
     const attempt = ++this.attempts;
     let picked: Promise<MediaStream>;
     try {
-      picked = captureScreen(resolveQuality(useSettings.getState(), "unknown"));
+      picked = captureScreen(resolveQuality(useSettings.getState(), "unknown"), !isDesktop());
     } catch (e) {
       this.captureError(e);
       return;
@@ -203,6 +203,8 @@ export class ScreenController {
         });
         if (["permission", "permissionHint"].includes(useScreen.getState().notice ?? "")) dispatch({ type: "notice", notice: null });
         dispatch({ type: "picked", attempt, stream, surface: surfaceOf(track) });
+        dispatch({ type: "audio", attempt, sharing: stream.getAudioTracks().some(t => t.readyState === "live") });
+        for (const audio of stream.getAudioTracks()) audio.addEventListener("ended", () => dispatch({ type: "audio", attempt, sharing: false }));
         dispatch({ type: "choose", spec: resolveQuality(useSettings.getState(), surfaceOf(track)) });
       },
       (e: unknown) => {
@@ -334,12 +336,20 @@ export class ScreenController {
     dispatch({ type: "starting", attempt });
     let share: string;
     let screenSpec: boolean;
+    let screenAudio: boolean;
     // AV1 needs a hardware encoder here; an older server simply answers without AV1.
     const av1 = probeAv1Encoder();
     try {
       screenSpec = await conn.request("screen.spec.capabilities", {}, { timeoutMs: 1_500 })
         .then(features => features.screen_spec === true).catch(() => false);
       if (!current()) return;
+      screenAudio = await conn.request("screen.audio.capabilities", {}, { timeoutMs: 1_500 })
+        .then(features => features.screen_audio === true).catch(() => false);
+      if (!current()) return;
+      if (!screenAudio) {
+        for (const audio of own.stream?.getAudioTracks() ?? []) { audio.stop(); own.stream?.removeTrack(audio); }
+      }
+      dispatch({ type: "audio", attempt, server: screenAudio, sharing: screenAudio && own.stream?.getAudioTracks().some(t => t.readyState === "live") === true });
       await applyCaptureSpec(track, spec, !screenSpec);
       if (!current()) return;
       share = (await conn.request("screen.start", { call: binding.call, participation: binding.participation, preset: legacyPreset(spec), ...(screenSpec ? { spec } : {}), surface, guest_link: guestLink })).share;
@@ -363,6 +373,8 @@ export class ScreenController {
     if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
     const publisher = new ScreenPublisher({
       uplink: screen => { if (current() && this.publisher === publisher) useUplink.setState({ screen }); },
+      audio: screenAudio ? own.stream?.getAudioTracks()[0] : undefined,
+      audioState: sharing => { if (current()) dispatch({ type: "audio", attempt, sharing }); },
       track, fallbacks: this.encoderFallbacks, quality: latest(), legacy: !screenSpec, av1: hardwareAv1, automaticMode: useSettings.getState().screenMode === null, iceServers: s.iceServers,
       ended: () => { if (this.publisher === publisher) { if (this.recoveringAttempt === attempt) this.recoveryFailed(); else void this.stopShare(true); } },
       surfaceChanged: (surface, spec) => {
@@ -691,6 +703,7 @@ export class ScreenController {
     const transport: ScreenWatchTransport = new ScreenWatchTransport({
       run,
       av1: true,
+      audio: () => conn.request("screen.audio.capabilities", {}, { timeoutMs: 1_500 }).then(f => f.screen_audio === true).catch(() => false),
       iceServers: useSession.getState().iceServers,
       offer: async (sdp, run, h264 = [], av1 = null) => {
         // Query explicitly: adding fields to Welcome would break old clients' strict
@@ -970,6 +983,8 @@ export class ScreenController {
       clearTimeout(this.waiting.get(watch.id));
       this.waiting.delete(watch.id);
       if (target) this.targets.set(watch.id, { ...target, client: info.client });
+      const playback = useSettings.getState().shareAudio[watch.share];
+      if (info.share !== watch.share && playback) useSettings.getState().setShareAudio(info.share, playback);
       dispatch({ type: "watchReplaced", id: watch.id, share: info.share });
       const generation = this.generation;
       void this.serial(info.share, () => this.startWatch(conn, info.share, watch.id, generation));

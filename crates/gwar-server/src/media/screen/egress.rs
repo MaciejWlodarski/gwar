@@ -317,6 +317,8 @@ pub enum Change {
 pub enum Class {
     /// RTP on a slot's main SSRC: paced at admission/release and checked by serialized size.
     Original,
+    /// Bounded share audio, carved out of the existing screen allocation.
+    Audio,
     /// Any other RTP: RTX repairs, padding and str0m's probes.
     Extra,
     /// RTCP, STUN, DTLS.
@@ -352,6 +354,8 @@ pub struct Egress {
     release_interval: Duration,
     originals: Bucket,
     extras: Bucket,
+    audio: Bucket,
+    audio_reserve: f64,
     probe_need: f64,
     queued: usize,
     /// The estimate fell since the last release: queued keyframes may no longer make it.
@@ -383,6 +387,8 @@ impl Egress {
                 now,
             ),
             extras: Bucket::new(extras_rate(estimate), extras_burst(estimate), now),
+            audio: Bucket::new(0.0, 2400.0, now),
+            audio_reserve: 0.0,
             probe_need: 0.0,
             queued: 0,
             lowered: false,
@@ -405,7 +411,22 @@ impl Egress {
 
     /// `B`, bits per second.
     pub fn plan(&self) -> f64 {
-        PLAN * self.estimate
+        (PLAN * self.estimate - self.audio_rate()).max(0.0)
+    }
+
+    fn audio_rate(&self) -> f64 {
+        self.audio_reserve.min(PLAN * self.estimate)
+    }
+
+    pub fn reserve_audio(&mut self, count: usize, now: Instant) {
+        if self.audio_reserve == count as f64 * super::audio::WIRE_BPS as f64 {
+            return;
+        }
+        self.refill(now);
+        let before = self.plan();
+        self.audio_reserve = count as f64 * super::audio::WIRE_BPS as f64;
+        self.lowered |= self.plan() < before && self.queued > 0;
+        self.set_estimate(self.estimate(), now);
     }
 
     fn release_rate(&self) -> f64 {
@@ -456,6 +477,7 @@ impl Egress {
         self.tokens = self.tokens.min(self.release_burst());
         self.originals.reconfigure(self.release_rate(), self.socket_burst(), now);
         self.extras.reconfigure(extras_rate(self.estimate), extras_burst(self.estimate), now);
+        self.audio.reconfigure(self.audio_rate() / 8.0, 2400.0, now);
     }
 
     pub fn paused(&self, lane: usize) -> Option<ScreenPauseReason> {
@@ -815,6 +837,12 @@ impl Egress {
     /// Charges one outgoing datagram of the watch transport; false drops it at the socket.
     pub fn charge(&mut self, class: Class, size: usize, now: Instant) -> bool {
         match class {
+            Class::Audio => {
+                if !self.audio.take(size as f64, now) {
+                    return false;
+                }
+                self.counters.original_bytes += size as u64;
+            }
             Class::Original => {
                 if self.cap && !self.originals.take(size as f64, now) {
                     self.counters.originals_dropped += 1;

@@ -1,3 +1,4 @@
+import { defaultShareAudio, readShareAudio, type ShareAudioSettings } from "../voice/share-audio";
 import { defaultSounds, readSounds, type SoundCue, type SoundSettings } from "../sound/catalog";
 import { readOnboarding, type Onboarding } from "../lib/onboarding";
 import { defaultQuality, migrateQuality, type QualitySettings } from "../voice/screen-quality";
@@ -308,6 +309,9 @@ export interface SettingsState extends QualitySettings {
   desktop: DesktopSettings;
   notifications: NotificationSettings;
   sounds: SoundSettings;
+  /** Per-share screen sound. Reconnect copies it to the confirmed replacement. */
+  shareAudio: Record<string, ShareAudioSettings>;
+  setShareAudio(share: string, patch: Partial<ShareAudioSettings>): void;
   /** Per-user playback volume 0..2 keyed by uid. */
   userVolumes: Record<string, number>;
   bookmarks: Bookmark[];
@@ -410,6 +414,8 @@ export const useSettings = create<SettingsState>()(
   persist(
     (set) => ({
       ...defaultQuality,
+      shareAudio: {},
+      setShareAudio: (share, patch) => set(s => ({ shareAudio: { ...s.shareAudio, ...readShareAudio({ [share]: { ...(s.shareAudio[share] ?? defaultShareAudio), ...patch } }) } })),
       setScreenQuality: (patch) => set(patch),
       onboarding: null,
       setOnboarding: (patch) => set((s) => ({ onboarding: { completed: false, firstUsedAt: Date.now(), nudgeDismissed: false, roleReceived: false, ...s.onboarding, ...patch } })),
@@ -567,13 +573,15 @@ export const useSettings = create<SettingsState>()(
         if (version < 4) p = { selfMuted: false, selfDeafened: false, resumeConnection: null, updateVoiceResume: null, ...p, onboarding: readOnboarding(p.onboarding) };
         if (version < 5) p = { ...p, audio: validAudio(p.audio) };
         // v6 adds device-local cues without discarding any earlier preferences.
-        return version < 6 ? { ...p, sounds: readSounds(p.sounds) } : p;
+        if (version < 6) p = { ...p, sounds: readSounds(p.sounds) };
+        return version < 7 ? { ...p, shareAudio: readShareAudio(p.shareAudio) } : p;
       },
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
         return { ...current, ...p, onboarding: readOnboarding(p.onboarding), audio: validAudio(p.audio), desktop: { ...current.desktop, ...(p.desktop ?? {}) },
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
           sounds: readSounds(p.sounds),
+          shareAudio: readShareAudio(p.shareAudio),
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,
           serverGroups: validGroups(p.serverGroups),

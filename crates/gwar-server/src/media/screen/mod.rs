@@ -16,6 +16,7 @@
 //! that do not fit the viewer's estimate are paused. The task also measures what it sends
 //! against the server-wide budget.
 
+mod audio;
 pub mod av1;
 mod av1_stream;
 mod codec;
@@ -167,6 +168,7 @@ pub struct ScreenOrigin {
     /// The bitrate cap its ingress byte bucket follows, and what each of its slots reserves.
     pub cap_bps: u64,
     alive: AtomicBool,
+    has_audio: AtomicBool,
     recovery: std::sync::Mutex<recovery::Recovery>,
     /// What a viewer joining it starts from, refreshed from its measured rate every allocation
     /// tick (`egress::start_estimate`); zero until the first tick.
@@ -190,6 +192,7 @@ impl ScreenOrigin {
             private,
             cap_bps,
             alive: AtomicBool::new(true),
+            has_audio: AtomicBool::new(false),
             recovery: Default::default(),
             start_bps: AtomicU64::new(0),
         })
@@ -565,6 +568,7 @@ struct Publisher {
     ufrag: String,
     ssrc: Ssrc,
     codecs: HashMap<Pt, VideoCodec>,
+    audio: Option<audio::Publisher>,
     prefix: h264_admission::Prefix,
     h264_stream: h264_stream::Admission,
     av1_stream: av1_stream::Admission,
@@ -702,6 +706,7 @@ struct Watcher {
     /// Local ICE username fragment, which routes its STUN.
     ufrag: String,
     slots: Vec<Slot>,
+    audio: Vec<audio::Slot>,
     /// How many slots the offer has.
     size: usize,
     h264: HashMap<Mid, HashMap<Pt, codec::Limits>>,
@@ -1109,7 +1114,7 @@ impl Sfu {
                 let Some(w) = self.watchers.get_mut(&session).filter(|w| w.run == run) else { return };
                 w.pending.retain(|(s, _, _)| *s != slot);
                 if (slot as usize) < w.slots.len() {
-                    empty(w, slot as usize);
+                    empty(w, slot as usize, now);
                 }
                 self.flush_watcher(session);
             }
@@ -1409,7 +1414,7 @@ impl Sfu {
                     saw_path(w, datagram.source);
                 }
                 // Revoked slots are wiped before a NACK can reach their RTX caches.
-                sweep(w);
+                sweep(w, datagram.at);
                 if let Err(e) = w.rtc.handle_input(input) {
                     debug!(session, "screen watch input: {e}");
                     w.rtc.disconnect();
@@ -1616,6 +1621,7 @@ impl Sfu {
         for session in sessions {
             let Some(w) = self.watchers.get_mut(&session) else { continue };
             w.ceiling = ceiling;
+            audio::reserve(w, now);
             if let Some((slot, change)) = allocate(w, now, &rates, budget) {
                 self.tell(session, slot, change, now);
             }
@@ -1709,6 +1715,7 @@ impl Sfu {
             debug!(share, sent = p.keyframes.sent, received = p.keyframes.received, "screen keyframe requested");
         }
         let mut forwards = Vec::new();
+        let mut sounds = Vec::new();
         let waiting = self.slots_of(share).iter().any(|(session, index)| {
             let w = &self.watchers[session];
             w.slots[*index].segment.waiting() && w.egress.paused(*index).is_none()
@@ -1743,7 +1750,16 @@ impl Sfu {
                     }
                     RtcEvent::IceConnectionStateChange(IceConnectionState::Disconnected) => p.rtc.disconnect(),
                     RtcEvent::RtpPacket(packet) => {
-                        if !p.origin.alive() || packet.header.ssrc != p.ssrc {
+                        if !p.origin.alive() {
+                            continue;
+                        }
+                        if let Some(audio) = p.audio.as_mut()
+                            && audio.accepts(&packet, now)
+                        {
+                            sounds.push(packet);
+                            continue;
+                        }
+                        if packet.header.ssrc != p.ssrc {
                             continue;
                         }
                         let Some(codec) = p.codecs.get(&packet.header.payload_type).copied() else { continue };
@@ -1829,9 +1845,29 @@ impl Sfu {
             return;
         }
         let origin = p.origin.clone();
+        let publication = p.id;
         self.publishers.insert(share.to_owned(), p);
         self.schedule_publisher(share);
         self.forward_packets(share, &origin, forwards, now);
+        if !origin.recovery.lock().expect("recovery lock").pending {
+            for packet in sounds {
+                let slots = self.slots_of(share);
+                for (session, index) in slots {
+                    let Some(w) = self.watchers.get_mut(&session) else { continue };
+                    if session == origin.session
+                        || w.egress.paused(index) == Some(ScreenPauseReason::Budget)
+                        || !w.slots[index].grant.as_ref().is_some_and(|g| g.alive())
+                    {
+                        continue;
+                    }
+                    audio::reserve(w, now);
+                    if let Some(audio) = w.audio.get_mut(index) {
+                        audio.write(&mut w.rtc, &packet, publication);
+                    }
+                    self.flush_watcher(session);
+                }
+            }
+        }
     }
 
     fn forward_packets(
@@ -1881,7 +1917,7 @@ impl Sfu {
                     debug!(session, slot = index, codec = ?forward.codec, "screen codec incompatible with viewer offer");
                     let grant = w.slots[index].grant.clone().expect("checked above");
                     let run = w.run;
-                    empty(w, index);
+                    empty(w, index, now);
                     self.signal(ScreenSignal::Incompatible { session, run, grant });
                     continue;
                 }
@@ -2216,7 +2252,7 @@ impl Sfu {
                         generation = w.slots[index].generation,
                         "screen decode reporter isolated"
                     );
-                    empty(w, index);
+                    empty(w, index, now);
                     self.signal(ScreenSignal::Incompatible { session, run, grant });
                 }
             }
@@ -2349,7 +2385,7 @@ fn video_pts(rtc: &Rtc, mid: Mid) -> HashMap<VideoCodec, Pt> {
 /// cap on its way to `send`; keyframe requests from the viewer are collected by slot. True if it
 /// connected just now.
 fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dyn FnMut(&[u8], SocketAddr)) -> bool {
-    sweep(w);
+    sweep(w, now);
     requests.append(&mut w.dropped_lanes);
     let mut connected = false;
     let mut released = false;
@@ -2366,7 +2402,7 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
     let mut due = 0;
     loop {
         // Membership can end independently while this transport's output is draining.
-        sweep(w);
+        sweep(w, now);
         if !w.rtc.is_alive() {
             return connected;
         }
@@ -2407,7 +2443,25 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
             }
             Output::Transmit(t) => {
                 // Revocation also fences an output produced during poll_output.
-                if is_rtp(&t.contents) && sweep(w) {
+                if is_rtp(&t.contents) && sweep(w, now) {
+                    continue;
+                }
+                let audio = is_rtp(&t.contents)
+                    && w.audio.iter().any(|s| s.ssrc == u32::from_be_bytes(t.contents[8..12].try_into().unwrap()));
+                if audio {
+                    let ssrc = u32::from_be_bytes(t.contents[8..12].try_into().unwrap());
+                    let permitted = w
+                        .audio
+                        .iter()
+                        .position(|s| s.ssrc == ssrc)
+                        .and_then(|i| w.slots.get(i).map(|s| (i, s)))
+                        .is_some_and(|(i, s)| {
+                            w.egress.paused(i) != Some(ScreenPauseReason::Budget)
+                                && s.grant.as_ref().is_some_and(|g| g.alive())
+                        });
+                    if permitted && w.egress.charge(egress::Class::Audio, t.contents.len(), now) {
+                        send(&t.contents, t.destination);
+                    }
                     continue;
                 }
                 let slots = &w.slots;
@@ -2466,6 +2520,12 @@ fn drive(w: &mut Watcher, now: Instant, requests: &mut Vec<usize>, send: &mut dy
                             assign(w, index, grant, order, now);
                             requests.push(index);
                         }
+                    }
+                }
+                RtcEvent::MediaAdded(added) if added.kind == MediaKind::Audio && added.direction.is_sending() => {
+                    if w.audio.len() < w.size {
+                        w.audio.push(audio::Slot::new(&mut w.rtc, added.mid));
+                        audio::reserve(w, now);
                     }
                 }
                 RtcEvent::KeyframeRequest(request) => {
@@ -2945,12 +3005,13 @@ fn add_slot(w: &mut Watcher, mid: Mid) -> usize {
 /// Points a slot at a new share, `order`-th watched: a new segment from its next keyframe, a
 /// fresh RTX cache and queue.
 fn assign(w: &mut Watcher, index: usize, grant: Arc<WatchGrant>, order: u64, now: Instant) {
-    empty(w, index);
+    empty(w, index, now);
     let focused = w.focus.as_deref() == Some(grant.share.as_str());
     let slot = &mut w.slots[index];
     slot.grant = Some(grant);
     slot.generation = slot.generation.wrapping_add(1);
     w.egress.assign(index, order, now);
+    audio::reserve(w, now);
     if focused {
         w.egress.focus(Some(index));
     }
@@ -2963,7 +3024,7 @@ fn assign(w: &mut Watcher, index: usize, grant: Arc<WatchGrant>, order: u64, now
 }
 
 /// Empties a slot: nothing of its old media is sent after this, repairs and probes included.
-fn empty(w: &mut Watcher, index: usize) {
+fn empty(w: &mut Watcher, index: usize, now: Instant) {
     let slot = &mut w.slots[index];
     slot.grant = None;
     slot.logged = None;
@@ -2980,7 +3041,11 @@ fn empty(w: &mut Watcher, index: usize) {
     slot.failed_at = None;
     slot.originals.clear();
     w.egress.unassign(index);
+    if let Some(audio) = w.audio.get_mut(index) {
+        audio.clear(&mut w.rtc);
+    }
     wipe(&mut w.rtc, slot.mid);
+    audio::reserve(w, now);
     if w.pending.is_empty() && w.slots.iter().all(|s| s.grant.is_none()) {
         w.rtc.bwe().set_desired_bitrate(Bitrate::ZERO);
         w.desired = None;
@@ -3001,12 +3066,12 @@ fn wipe(rtc: &mut Rtc, mid: Mid) {
 
 /// Releases every slot whose grant ended, ahead of the core's `Release`: once access ends,
 /// nothing of the share leaves this transport, cached repairs included.
-fn sweep(w: &mut Watcher) -> bool {
+fn sweep(w: &mut Watcher, now: Instant) -> bool {
     w.pending.retain(|(_, grant, _)| grant.alive());
     let mut revoked = false;
     for index in 0..w.slots.len() {
         if w.slots[index].grant.as_ref().is_some_and(|g| !g.alive()) {
-            empty(w, index);
+            empty(w, index, now);
             revoked = true;
         }
     }
@@ -3288,6 +3353,14 @@ fn rtc(advertise: SocketAddr, now: Instant, bwe: bool, av1: bool) -> Result<Rtc,
         config.codec_config().add_h264(pt.into(), Some(rtx.into()), true, profile);
     }
     config = config.enable_vp9(true);
+    config.codec_config().add_config(
+        100.into(),
+        None,
+        Codec::Opus,
+        str0m::media::Frequency::FORTY_EIGHT_KHZ,
+        Some(2),
+        Default::default(),
+    );
     // The browser fallback is VP9 profile 0. str0m's default also enables profile 2;
     // advertising it here would allow routing a 10-bit stream to a profile-0-only slot.
     let params = config
@@ -3342,8 +3415,14 @@ fn publisher(
     if codecs.is_empty() {
         return Err("no supported AV1, H.264 mode 1 or VP9 in the offer");
     }
+    let audio = audio::Publisher::from_sdp(&mut rtc, sdp, now)?;
+    if origin.encrypted && audio.is_some() {
+        return Err("encrypted screen audio is unavailable");
+    }
+    origin.has_audio.store(audio.is_some(), Ordering::Relaxed);
     let cap = origin.cap_bps;
     let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
+    let video_cap = cap.saturating_sub(if audio.is_some() { audio::WIRE_BPS } else { 0 }).max(1);
     let publisher = Publisher {
         id,
         origin,
@@ -3351,12 +3430,13 @@ fn publisher(
         ufrag,
         ssrc,
         codecs,
+        audio,
         prefix: h264_admission::Prefix::default(),
         h264_stream: h264_stream::Admission::default(),
         av1_stream: av1_stream::Admission::default(),
         current: None,
         meter: Meter::new(cap, now),
-        ingress: Ingress::new(cap, now),
+        ingress: Ingress::new(video_cap, now),
         rate: ShareMeter::default(),
         ended: None,
         connected: false,
@@ -3410,6 +3490,7 @@ fn watcher(
         rtc,
         ufrag,
         slots: Vec::with_capacity(size),
+        audio: Vec::new(),
         size,
         h264: codec::offered(sdp, if caps.browser { caps.h264 } else { &[] }),
         av1: caps.av1.filter(gwar_proto::Av1Capability::valid),
@@ -3489,9 +3570,9 @@ fn sections(sdp: &str) -> Vec<Vec<&str>> {
 fn watch_offer(sdp: &str, size: usize) -> bool {
     let sections = sections(sdp);
     (size == SCREEN_SLOTS || size == GUEST_SLOTS)
-        && sections.len() == size
-        && sections.iter().all(|lines| {
-            lines[0].starts_with("m=video ")
+        && (sections.len() == size || sections.len() == size * 2)
+        && sections.iter().enumerate().all(|(i, lines)| {
+            lines[0].starts_with(if sections.len() == size * 2 && i % 2 == 1 { "m=audio " } else { "m=video " })
                 && lines.iter().filter(|l| DIRECTIONS.contains(&l.trim_end())).eq(["a=recvonly"].iter())
         })
 }
@@ -3503,7 +3584,9 @@ const DIRECTIONS: [&str; 4] = ["a=sendrecv", "a=sendonly", "a=recvonly", "a=inac
 pub fn publish_ssrcs(sdp: &str) -> Option<(u32, u32)> {
     let sections = sections(sdp);
     let media: Vec<_> = sections.iter().filter(|s| !s[0].starts_with("m=application")).collect();
-    if media.len() != 1 || !media[0][0].starts_with("m=video ") {
+    if !(media.len() == 1 || (media.len() == 2 && audio::publish_section(media[1])))
+        || !media[0][0].starts_with("m=video ")
+    {
         return None;
     }
     let lines = media[0];
@@ -3725,7 +3808,7 @@ pub(crate) mod tests {
         for packet in &packets[20..] {
             assert!(!enqueue(&mut pair.w, 0, &origin, packet, pair.now), "fresh RTP after revocation");
         }
-        sweep(&mut pair.w);
+        sweep(&mut pair.w, pair.now);
         pair.hold = false;
         for datagram in std::mem::take(&mut pair.held) {
             pair.send_to_sfu(&datagram);
@@ -4047,6 +4130,7 @@ pub(crate) mod tests {
                 ufrag: String::new(),
                 ssrc: 1.into(),
                 codecs: HashMap::new(),
+                audio: None,
                 prefix: h264_admission::Prefix::default(),
                 h264_stream: h264_stream::Admission::default(),
                 av1_stream: av1_stream::Admission::default(),
@@ -4195,7 +4279,7 @@ pub(crate) mod tests {
         assert!(!pair.held.is_empty(), "the viewer reports its loss");
         grant.end();
         if swept {
-            sweep(&mut pair.w);
+            sweep(&mut pair.w, pair.now);
         }
         pair.hold = false;
         for datagram in std::mem::take(&mut pair.held) {
@@ -4232,7 +4316,7 @@ pub(crate) mod tests {
         release(&mut pair.w, now);
         grant.end();
         if swept {
-            sweep(&mut pair.w);
+            sweep(&mut pair.w, pair.now);
         }
         (0..20).map(|_| pair.step(&mut |_| false)).sum()
     }
@@ -5080,7 +5164,7 @@ pub(crate) mod tests {
         report(&mut sfu, 7, now + Duration::from_secs(15));
         assert!(origin.recovery.lock().unwrap().pending);
         origin.recovery.lock().unwrap().pending = false;
-        empty(sfu.watchers.get_mut(&7).unwrap(), 0);
+        empty(sfu.watchers.get_mut(&7).unwrap(), 0, now);
         sfu.recoveries(now + Duration::from_secs(24));
         assert!(!origin.recovery.lock().unwrap().pending);
         sfu.recoveries(now + Duration::from_secs(25));
@@ -5096,6 +5180,7 @@ pub(crate) mod tests {
             ufrag: String::new(),
             ssrc: 1.into(),
             codecs: HashMap::new(),
+            audio: None,
             prefix: h264_admission::Prefix::default(),
             h264_stream: h264_stream::Admission::default(),
             av1_stream: av1_stream::Admission::default(),
@@ -6335,8 +6420,8 @@ pub(crate) mod tests {
             assert!(recovery.pending && !recovery.av1());
         }
         // Viewer 1 leaves and viewer 2 watches again while the replacement is pending.
-        empty(sfu.watchers.get_mut(&1).unwrap(), 0);
-        empty(sfu.watchers.get_mut(&2).unwrap(), 0);
+        empty(sfu.watchers.get_mut(&1).unwrap(), 0, now);
+        empty(sfu.watchers.get_mut(&2).unwrap(), 0, now);
         assign(sfu.watchers.get_mut(&2).unwrap(), 0, WatchGrant::new(origin.clone()), 5, now);
         sfu.forward_packets("h264", &origin, vec![(av1, true)], now);
         assert!(origin.recovery.lock().unwrap().pending, "old-codec media stays fenced");
@@ -6389,5 +6474,22 @@ pub(crate) mod tests {
             w.slots[0].segment.wait();
         }
         assert_eq!(numbers, [0x1234, 0x1235]);
+    }
+    #[test]
+    fn silent_legacy_shares_do_not_pay_for_unused_audio_slots() {
+        let mut pair = Pair::new();
+        let origin = ScreenOrigin::new(2, "legacy".into(), 1, false, false, 8_000_000);
+        assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
+        let mid = pair.w.slots[0].mid;
+        pair.w.audio.push(audio::Slot::new(&mut pair.w.rtc, mid));
+        let before = pair.w.egress.plan();
+        audio::reserve(&mut pair.w, pair.now);
+        assert_eq!(pair.w.egress.plan(), before);
+        origin.has_audio.store(true, Ordering::Relaxed);
+        audio::reserve(&mut pair.w, pair.now);
+        assert_eq!(pair.w.egress.plan(), before - audio::WIRE_BPS as f64);
+        origin.has_audio.store(false, Ordering::Relaxed);
+        audio::reserve(&mut pair.w, pair.now);
+        assert_eq!(pair.w.egress.plan(), before);
     }
 }

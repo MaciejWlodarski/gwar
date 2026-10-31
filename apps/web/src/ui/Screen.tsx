@@ -2,9 +2,11 @@
  * Screen-sharing interface (docs/screen-share.md, "Interface"): the Share button, the preset
  * menu, the sharing bar, LIVE badges and the stage.
  */
-import { Maximize, MessageSquare, MessageSquareOff, Minimize, MonitorOff, MonitorUp, PictureInPicture2, RotateCw, ScreenShareOff, X } from "lucide-react";
+import { Maximize, MessageSquare, MessageSquareOff, Minimize, MonitorOff, MonitorUp, PictureInPicture2, RotateCw, ScreenShareOff, Volume2, VolumeX, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
+import { defaultShareAudio } from "../voice/share-audio";
+import { useSettings } from "../state/settings";
 import { cn } from "../lib/cn";
 import { ConnectionIndicator } from "./ConnectionQuality";
 import { canOpenScreenRecordingSettings, isDesktop, openScreenRecordingSettings } from "../platform";
@@ -169,6 +171,7 @@ export function SharePresetDialog() {
     >
       <OwnPreview stream={own.stream} className="mb-3 aspect-video w-full rounded-md bg-black" />
       <QualityControls spec={own.spec} />
+      <p className="mt-3 text-sm text-muted" data-testid="share-audio-status">{t(own.audio ? "screen.audioReady" : isDesktop() ? "screen.audioDesktop" : own.audioServer === false ? "screen.audioServer" : "screen.audioUnavailable")}</p>
       <p className="mt-3 text-xs text-subtle">{t("screen.presetHint")}</p>
       {linkable && (
         // Shown before anything is published: no link exists until the share starts with it.
@@ -201,36 +204,30 @@ function OwnPreview({ stream, className }: { stream: MediaStream | null; classNa
 export function SharingBar() {
   const t = useT();
   const lang = useLanguage();
+  const [details, setDetails] = useState(false);
   const own = useScreen(s => s.own);
   const links = useScreen(s => s.links);
   if (!own || (own.phase !== "starting" && own.phase !== "live" && own.phase !== "reconnecting")) return null;
   const watching = own.phase === "live" ? t(countKey(lang, "screen.watching", own.viewers), { count: own.viewers }) : t(own.phase === "reconnecting" ? "screen.reconnecting" : "screen.starting");
   const linked = !!own.share && !!links[own.share];
   return (
-    <div role="status" aria-label={t("screen.sharingBar")} className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 bg-danger px-3 py-1.5 text-sm text-white">
+    <div role="status" aria-label={t("screen.sharingBar")} className="flex shrink-0 items-center gap-2 bg-[#a92c3e] px-3 py-1.5 text-sm text-white">
       <MonitorUp aria-hidden className="size-4 shrink-0" />
-      <span className="font-medium">{t("screen.sharingBar")}</span>
-      <span data-testid="screen-viewers" className="text-white/85">{watching}</span>
-      {own.phase === "live" && <SenderStats />}
-      {linked && own.share && (
-        <span data-testid="screen-ts-link" className="flex items-center gap-1.5 text-white/85">
-          <span>{`${t("screen.tsLinkOn")} · ${t(countKey(lang, "screen.guests", own.guests), { count: own.guests })}`}</span>
-          <Button size="sm" variant="secondary" title={t("screen.tsTurnOffTitle")} className="h-6 border-white/40 px-2 text-xs text-white hover:bg-white/15"
-            onClick={() => void controller.screen.turnOffLink(own.share!)}>
-            {t("screen.tsTurnOff")}
-          </Button>
-        </span>
-      )}
-      <span className="ml-auto flex max-w-full flex-wrap items-center justify-end gap-2">
-        <QualityControls spec={own.spec} bar />
-        <Button size="sm" variant="secondary" aria-pressed={own.preview} className={cn("border-white/40 text-white hover:bg-white/15", own.preview && "bg-white/20")}
-          onClick={() => controller.screen.setPreview(!own.preview)}>
-          {t("screen.preview")}
-        </Button>
-        <Button size="sm" variant="secondary" className="border-white/40 text-white hover:bg-white/15" onClick={() => void controller.screen.stopShare()}>
-          <ScreenShareOff className="size-4" /> {t("screen.stop")}
-        </Button>
-      </span>
+      <span className="min-w-0 flex-1 text-xs" data-testid="share-audio-status">{t(own.phase === "reconnecting" ? "screen.reconnecting" : own.phase === "starting" ? "screen.starting" : own.audio ? "screen.audioOn" : "screen.audioOff")}</span>
+      <ConnectionIndicator variant="bar" compact />
+      <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-2 text-white hover:bg-white/15" onClick={() => setDetails(true)}>{t("common.details")}</Button>
+      <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-2 text-white hover:bg-white/15" aria-label={t("screen.stop")} onClick={() => void controller.screen.stopShare()}>{t("screen.stopShort")}</Button>
+      <Dialog open={details} onOpenChange={setDetails} title={t("screen.sharingBar")}>
+        <p data-testid="screen-viewers" className="mb-3 text-sm text-muted">{watching}</p>
+        <p className="mb-3 text-sm">{t(own.audio ? own.phase === "live" ? "screen.audioSharing" : "screen.audioReady" : isDesktop() ? "screen.audioDesktop" : own.audioServer === false ? "screen.audioServer" : "screen.audioUnavailable")}</p>
+        <QualityControls spec={own.spec} />
+        {own.phase === "live" && <SenderStats />}
+        {linked && own.share && <div data-testid="screen-ts-link" className="mt-3 text-sm">
+          <p>{`${t("screen.tsLinkOn")} · ${t(countKey(lang, "screen.guests", own.guests), { count: own.guests })}`}</p>
+          <Button size="sm" onClick={() => void controller.screen.turnOffLink(own.share!)}>{t("screen.tsTurnOff")}</Button>
+        </div>}
+        <Button className="mt-3" aria-pressed={own.preview} onClick={() => controller.screen.setPreview(!own.preview)}>{t("screen.preview")}</Button>
+      </Dialog>
       {own.preview && <OwnPreview stream={own.stream} className="fixed right-3 bottom-3 z-40 w-56 rounded-md border border-line-strong bg-black shadow-pop" />}
     </div>
   );
@@ -259,8 +256,8 @@ function SenderStats() {
   return (
     <div className="flex min-w-0 flex-wrap items-center gap-1.5">
       <ConnectionIndicator variant="bar" />
-      <details data-testid="screen-sender-stats" className="relative text-xs text-white">
-        <summary className="cursor-pointer rounded border border-white/40 px-2 py-1 font-medium">
+      <details data-testid="screen-sender-stats" className="relative text-xs text-fg">
+        <summary className="cursor-pointer rounded border border-line px-2 py-1 font-medium">
           {/* Congestion is the more specific reason the encoder is held back. */}
           {t(congested ? "common.details" : stats.limitation === "cpu" ? "screen.limitedCpu" : stats.limitation === "bandwidth" ? "screen.limitedBandwidth" : "screen.qualityGood")}
         </summary>
@@ -283,14 +280,14 @@ export function LiveBadge({ client, name }: { client: Client; name: string }) {
   const isMe = useSession(s => s.me?.session === client.id);
   const watchable = useCanWatch();
   if (!client.sharing) return null;
-  const pill = "shrink-0 rounded bg-danger px-1 text-[10px] leading-4 font-bold tracking-wide text-white";
+  const pill = "shrink-0 rounded bg-[#a92c3e] px-1 text-[10px] leading-4 font-bold tracking-wide text-white";
   if (isMe) return <span className={pill} title={t("screen.liveSelf")}>{t("screen.live")}</span>;
   if (!watchable || !share) {
     return <span className={pill} title={t(!watchable && isDesktop() ? "screen.liveDesktop" : "screen.liveTitle", { name })}>{t("screen.live")}</span>;
   }
   return (
     <button type="button" aria-label={t("screen.liveTitle", { name })} title={t("screen.liveTitle", { name })}
-      onClick={e => { e.stopPropagation(); void controller.screen.watch(share.share); }}
+      onClick={e => { e.stopPropagation(); useUi.getState().showChat(); void controller.screen.watch(share.share); }}
       onDoubleClick={e => e.stopPropagation()}
       className={cn(pill, "t cursor-pointer hover:brightness-110")}>
       {t("screen.live")}
@@ -552,6 +549,60 @@ const stageButton = "text-white/80 hover:bg-white/10 hover:text-white";
  * The stage: the share in focus large, other shares of its channel and every other watched
  * share as cards (click to swap), with the chat beside it unless hidden.
  */
+/** One player per granted watch. Stage changes and duplicate thumbnails never duplicate sound. */
+export function ShareAudioPlayback() {
+  const watches = useScreen(s => s.watches);
+  const shares = useSession(s => s.shares);
+  const me = useSession(s => s.me?.session);
+  return <>{watches.filter(w => w.status === "watching" && shares[w.share]?.client !== me).map(w => <ShareAudioPlayer key={w.id} share={w.share} slot={w.slot!} paused={w.paused === "budget"} />)}</>;
+}
+
+function ShareAudioPlayer({ share, slot, paused }: { share: string; slot: number; paused: boolean }) {
+  const ref = useRef<HTMLAudioElement>(null);
+  const stream = useScreen(s => s.streams[slot]);
+  const client = useSession(s => { const id = s.shares[share]?.client; return id === undefined ? undefined : s.clients[id]; });
+  const prefs = useSettings(s => s.shareAudio[share] ?? defaultShareAudio);
+  const [blocked, setBlocked] = useState(false);
+  const deafened = useSettings(s => s.selfDeafened);
+  const device = useSettings(s => s.audio.outputDeviceId);
+  useEffect(() => {
+    const audio = ref.current;
+    if (!audio) return;
+    let current = true;
+    const tracks = stream?.getAudioTracks() ?? [];
+    audio.srcObject = tracks.length ? new MediaStream(tracks) : null;
+    setBlocked(false);
+    if (audio.srcObject) void audio.play().then(() => { if (current) setBlocked(false); }, () => { if (current) setBlocked(true); });
+    return () => { current = false; audio.pause(); audio.srcObject = null; };
+  }, [stream]);
+  useLayoutEffect(() => {
+    const audio = ref.current;
+    if (!audio) return;
+    audio.volume = prefs.volume;
+    audio.muted = prefs.muted || deafened || paused;
+    if (typeof audio.setSinkId === "function") void audio.setSinkId(device ?? "").catch(() => {});
+  }, [prefs, deafened, paused, device]);
+  const t = useT();
+  return <><audio ref={ref} autoPlay muted={prefs.muted || deafened || paused} data-share-audio={share} />{blocked && <TopBanner><span className="min-w-0 flex-1 text-sm">{client?.nickname}</span><Button size="sm" onClick={() => void ref.current?.play().then(() => setBlocked(false), () => setBlocked(true))}>{t("screen.playAudio")}</Button></TopBanner>}</>;
+}
+
+export function ShareAudioControls({ share }: { share: string }) {
+  const t = useT();
+  const client = useSession(s => { const id = s.shares[share]?.client; return id === undefined ? undefined : s.clients[id]; });
+  const prefs = useSettings(s => s.shareAudio[share] ?? defaultShareAudio);
+  const stream = useScreen(s => { const slot = slotOf(s, share); return slot === null ? null : s.streams[slot]; });
+  if (!client || !stream?.getAudioTracks().length) return null;
+  return <div className="flex shrink-0 items-center gap-3 px-3 py-2 text-sm" data-testid="share-audio-controls">
+    <IconButton label={t(prefs.muted ? "screen.unmuteAudio" : "screen.muteAudio")} aria-pressed={prefs.muted} onClick={() => useSettings.getState().setShareAudio(share, { muted: !prefs.muted })}>
+      {prefs.muted ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
+    </IconButton>
+    <label className="flex min-w-0 flex-1 items-center gap-3">{t("screen.shareVolume")}
+      <input type="range" min="0" max="100" value={Math.round(prefs.volume * 100)} className="min-w-0 flex-1 accent-[var(--accent)]" onChange={e => useSettings.getState().setShareAudio(share, { volume: Number(e.target.value) / 100 })} />
+    </label>
+    <output className="w-9 text-right tabular-nums">{Math.round(prefs.volume * 100)}%</output>
+  </div>;
+}
+
 export function Stage({ card }: { card?: boolean }) {
   const t = useT();
   const stage = useScreen(s => s.stage);
@@ -602,21 +653,21 @@ export function Stage({ card }: { card?: boolean }) {
 
   return (
     <section aria-label={t("screen.stage")} className={cn("flex min-w-0 flex-1 flex-col bg-[#0b0b0d] text-white", card && panelCard)}>
-      <header className="flex h-12 shrink-0 items-center gap-2 border-b border-white/10 px-3">
+      <header className="flex min-h-12 shrink-0 flex-wrap items-center gap-2 border-b border-white/10 px-3 py-1.5">
         {!card && <BackButton label={t("nav.toChannels")} entry onClick={() => paneBack("list")} />}
         {client && <TalkingAvatar name={name} seed={client.uid} size={24} talking={client.talking} />}
-        <h2 className="min-w-0 truncate text-[15px] font-semibold">{info ? t("screen.sharerTitle", { name }) : t("screen.watchReconnecting")}</h2>
-        {info && <span className="shrink-0 rounded bg-danger px-1 text-[10px] leading-4 font-bold tracking-wide">{t("screen.live")}</span>}
+        <h2 aria-label={info ? t("screen.sharerTitle", { name }) : t("screen.watchReconnecting")} className="min-w-0 truncate text-[15px] font-semibold">{info ? name : t("screen.watchReconnecting")}</h2>
+        {info && <span className="shrink-0 rounded bg-[#a92c3e] px-1 text-[10px] leading-4 font-bold tracking-wide">{t("screen.live")}</span>}
         <QualityBadge share={stage} />
-        <span className="ml-auto flex items-center gap-1">
+        <span className="ml-auto flex max-w-full flex-wrap items-center gap-1">
           {mayStop && linked && (
             <Button size="sm" variant="secondary" className="border-white/30 text-white hover:bg-white/10" onClick={() => void controller.screen.turnOffLink(stage)}>
               {t("screen.tsTurnOffOther")}
             </Button>
           )}
           {mayStop && (
-            <Button size="sm" variant="secondary" className="border-white/30 text-white hover:bg-white/10" onClick={() => void controller.screen.stopOther(stage)}>
-              <ScreenShareOff className="size-4" /> {t("screen.stopOther")}
+            <Button size="sm" variant="secondary" className="border-white/30 text-white hover:bg-white/10" aria-label={t("screen.stopOther")} onClick={() => void controller.screen.stopOther(stage)}>
+              <ScreenShareOff className="size-4" /> {t("screen.stopShort")}
             </Button>
           )}
           {pip && (
@@ -631,12 +682,13 @@ export function Stage({ card }: { card?: boolean }) {
             onClick={() => useScreen.getState().dispatch({ type: "chat", hidden: !chatHidden })}>
             {chatHidden ? <MessageSquare className="size-[18px]" /> : <MessageSquareOff className="size-[18px]" />}
           </IconButton>
-          <Button size="sm" variant="secondary" className="border-white/30 text-white hover:bg-white/10" onClick={() => void controller.screen.unwatch(stage)}>
-            <X className="size-4" /> <span className="max-sm:sr-only">{t("screen.stopWatching")}</span>
+          <Button size="sm" variant="secondary" className="border-white/30 text-white hover:bg-white/10" aria-label={t("screen.stopWatching")} onClick={() => void controller.screen.unwatch(stage)}>
+            <X className="size-4" />
           </Button>
         </span>
       </header>
       <div ref={frame} className="flex min-h-0 flex-1 flex-col bg-black">
+        <ShareAudioControls share={stage} />
         <ShareVideo key={stage} share={stage} className="flex-1" onDoubleClick={toggleFullscreen} videoRef={v => { video.current = v; }} />
       </div>
       {cards.length > 0 && (

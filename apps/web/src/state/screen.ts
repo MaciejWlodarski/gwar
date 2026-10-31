@@ -19,6 +19,8 @@ export type OwnPhase = "picking" | "choosing" | "starting" | "live" | "reconnect
 
 export interface OwnShare {
   phase: OwnPhase;
+  audio?: boolean;
+  audioServer?: boolean;
   /** One per attempt: late results of an earlier attempt change nothing. */
   attempt: number;
   share: string | null;
@@ -76,6 +78,7 @@ export type ScreenAction =
   | { type: "pick"; attempt: number }
   | { type: "picked"; attempt: number; stream: MediaStream; surface: ScreenSurface }
   | { type: "choose"; spec: ScreenSpec }
+  | { type: "audio"; attempt: number; sharing: boolean; server?: boolean }
   | { type: "surface"; attempt: number; surface: ScreenSurface; spec: ScreenSpec }
   | { type: "queueShare"; attempt: number }
   | { type: "starting"; attempt: number }
@@ -200,6 +203,8 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       }
       return { ...state, transport: { run, phase } };
     }
+    case "audio":
+      return state.own?.attempt === action.attempt ? { ...state, own: { ...state.own, audio: action.sharing, ...(action.server === undefined ? {} : { audioServer: action.server }) } } : state;
     case "stream": {
       if (action.run !== state.transport.run || action.slot < 0 || action.slot >= SCREEN_SLOTS) return state;
       const streams = state.streams.slice();

@@ -98,7 +98,7 @@ beforeEach(() => {
   const caps = { getCapabilities: () => ({ codecs: [codec("video/VP8"), codec("video/VP9", "profile-id=0"), codec("video/rtx")], headerExtensions: [] }) };
   vi.stubGlobal("RTCRtpSender", caps);
   vi.stubGlobal("RTCRtpReceiver", caps);
-  vi.stubGlobal("MediaStream", class { constructor(readonly tracks: unknown[]) {} });
+  vi.stubGlobal("MediaStream", class { constructor(readonly tracks: MediaStreamTrack[] = []) {} getTracks() { return this.tracks; } });
 });
 afterEach(() => { vi.useRealTimers(); vi.unstubAllGlobals(); vi.restoreAllMocks(); });
 
@@ -361,12 +361,12 @@ describe("watch transport", () => {
 
 describe("capture", () => {
   it("asks for video only, keeps Gwar's own tab out and lets the sharer switch", async () => {
-    const getDisplayMedia = vi.fn(async () => ({}) as MediaStream);
+    const getDisplayMedia = vi.fn(async () => ({ getVideoTracks: () => [{ getSettings: () => ({ displaySurface: "browser" }) }], getAudioTracks: () => [] }) as unknown as MediaStream);
     const setFocusBehavior = vi.fn();
     vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
     vi.stubGlobal("CaptureController", class { setFocusBehavior = setFocusBehavior; });
     await captureScreen();
-    expect(getDisplayMedia).toHaveBeenCalledWith(expect.objectContaining({ audio: false, systemAudio: "exclude", selfBrowserSurface: "exclude", surfaceSwitching: "include", controller: expect.anything() }));
+    expect(getDisplayMedia).toHaveBeenCalledWith(expect.objectContaining({ audio: { suppressLocalAudioPlayback: false, restrictOwnAudio: true, echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 }, systemAudio: "exclude", windowAudio: "exclude", selfBrowserSurface: "exclude", surfaceSwitching: "include", controller: expect.anything() }));
     expect(setFocusBehavior).toHaveBeenCalledWith("no-focus-change");
   });
 
@@ -3136,4 +3136,87 @@ describe("first-frame guard", () => {
     expect(pc.createOffer).toHaveBeenCalledTimes(2);
     publisher.close();
   });
+});
+
+describe("share audio", () => {
+  it.each(["screen", "window", "unknown", "browser"])("keeps only another tab's sound after the %s picker, even if the browser ignores exclusion hints", async surface => {
+    const audio = { stop: vi.fn() } as unknown as MediaStreamTrack;
+    const removeTrack = vi.fn();
+    const stream = { getVideoTracks: () => [{ getSettings: () => ({ displaySurface: surface }) }], getAudioTracks: () => [audio], removeTrack };
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia: vi.fn(async () => stream) } });
+    await captureScreen();
+    expect(audio.stop).toHaveBeenCalledTimes(surface === "browser" ? 0 : 1);
+    expect(removeTrack).toHaveBeenCalledTimes(surface === "browser" ? 0 : 1);
+  });
+
+  it("never captures desktop playback, even when its webview ignores audio:false", async () => {
+    const audio = { stop: vi.fn() };
+    const getDisplayMedia = vi.fn(async () => ({ getVideoTracks: () => [{ getSettings: () => ({ displaySurface: "browser" }) }], getAudioTracks: () => [audio], removeTrack: vi.fn() }));
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
+    await captureScreen(undefined, false);
+    expect(getDisplayMedia).toHaveBeenCalledWith(expect.objectContaining({ audio: false, systemAudio: "exclude" }));
+    expect(audio.stop).toHaveBeenCalledOnce();
+  });
+
+  it("publishes sound below voice priority, subtracts its wire allowance, and retains the track in encoder recovery", async () => {
+    const audio = { readyState: "live" } as MediaStreamTrack;
+    const publisher = new ScreenPublisher({ track: { applyConstraints: async () => {} } as unknown as MediaStreamTrack, audio, quality: TEST_SPECS.smooth, iceServers: [], offer: async () => "answer", state: () => {} });
+    await publisher.start();
+    const first = Peer.all[0]!;
+    expect(first.transceivers).toHaveLength(2);
+    expect(first.transceivers[1]?.init.sendEncodings?.[0]).toMatchObject({ maxBitrate: 64_000, priority: "very-low", networkPriority: "very-low" });
+    expect(publisher.bitrate).toBe(deriveSpec(TEST_SPECS.smooth).maxBitrate - 128_000);
+    first.stats.set("pair", { type: "candidate-pair", nominated: true, state: "succeeded", availableOutgoingBitrate: 800_000 });
+    await vi.advanceTimersByTimeAsync(2000);
+    expect(publisher.bitrate + 128_000).toBeLessThanOrEqual(uplinkVideoBudget(800_000));
+    await publisher.recover({ share: "A", codec: "h264", width: 1280, height: 720, fps: 30 });
+    expect(Peer.all[1]?.transceivers).toHaveLength(2);
+    expect(Peer.all[1]?.transceivers[1]?.init.sendEncodings?.[0]?.priority).toBe("very-low");
+    publisher.close();
+  });
+
+  it("offers paired receive slots only after support is confirmed and combines their tracks", async () => {
+    const received = vi.fn();
+    const watch = new ScreenWatchTransport({ run: 1, audio: async () => true, iceServers: [], offer: async () => "answer", state: () => {}, track: received });
+    await watch.start();
+    const peer = Peer.all[0]!;
+    expect(peer.transceivers).toHaveLength(SCREEN_SLOTS * 2);
+    const video = { kind: "video" }, audio = { kind: "audio" };
+    peer.ontrack?.({ transceiver: peer.transceivers[0], track: video });
+    peer.ontrack?.({ transceiver: peer.transceivers[1], track: audio });
+    expect(received).toHaveBeenLastCalledWith(0, expect.objectContaining({ tracks: [video, audio] }));
+    const stale = peer.ontrack!;
+    watch.close();
+    stale({ transceiver: peer.transceivers[1], track: audio });
+    expect(received).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps the legacy watch layout against a server without audio support", async () => {
+    const watch = new ScreenWatchTransport({ run: 1, audio: async () => false, iceServers: [], offer: async () => "answer", state: () => {}, track: () => {} });
+    await watch.start();
+    expect(Peer.all[0]?.transceivers).toHaveLength(SCREEN_SLOTS);
+    watch.close();
+  });
+});
+
+
+it("drops tab sound when a browser advertises own-audio exclusion but did not apply it", async () => {
+  const audio = { stop: vi.fn(), getSettings: () => ({ restrictOwnAudio: false }) };
+  const removeTrack = vi.fn();
+  const stream = { getVideoTracks: () => [{ getSettings: () => ({ displaySurface: "browser" }) }], getAudioTracks: () => [audio], removeTrack };
+  vi.stubGlobal("navigator", { mediaDevices: { getSupportedConstraints: () => ({ restrictOwnAudio: true }), getDisplayMedia: async () => stream } });
+  await captureScreen();
+  expect(audio.stop).toHaveBeenCalledOnce(); expect(removeTrack).toHaveBeenCalledWith(audio);
+});
+
+
+it("stops sound truthfully when the retained source changes from a tab to a window", async () => {
+  let displaySurface = "browser";
+  const audio = { readyState: "live", stop: vi.fn(function(this: { readyState: string }) { this.readyState = "ended"; }) };
+  const audioState = vi.fn();
+  const publisher = new ScreenPublisher({ track: { getSettings: () => ({ displaySurface }) } as unknown as MediaStreamTrack, audio: audio as unknown as MediaStreamTrack, audioState, quality: TEST_SPECS.smooth, iceServers: [], offer: async () => "answer", state: () => {} });
+  await publisher.start(); displaySurface = "window";
+  await vi.advanceTimersByTimeAsync(2000);
+  expect(audio.stop).toHaveBeenCalledOnce(); expect(audioState).toHaveBeenLastCalledWith(false);
+  publisher.close();
 });

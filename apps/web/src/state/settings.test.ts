@@ -171,3 +171,16 @@ it.each(["text", "smooth", "game", "saver", "auto"] as const)("migrates saved %s
   await useSettings.persist.rehydrate();
   expect(useSettings.getState()).toMatchObject({ ...expected, screenHeight: 1440, screenFps: 60 });
 });
+
+it("keeps share sound separate from voice and cues, and persists mute without losing its volume", async () => {
+  const data = new Map<string, string>([["gwar.settings", JSON.stringify({ version: 6, state: { theme: "dark", audio: { masterVolume: 0.8, automaticSensitivity: false, vadThreshold: -72 }, sounds: { enabled: false, volume: 0.25, events: { mute: false } } } })]]);
+  vi.stubGlobal("window", { localStorage: { getItem: (key: string) => data.get(key) ?? null, setItem: (key: string, value: string) => data.set(key, value), removeItem: (key: string) => data.delete(key) } });
+  vi.resetModules();
+  const { useSettings } = await import("./settings");
+  const before = useSettings.getState();
+  useSettings.getState().setShareAudio("friend", { volume: 0.35 });
+  useSettings.getState().setShareAudio("friend", { muted: true });
+  await useSettings.persist.rehydrate();
+  expect(useSettings.getState()).toMatchObject({ theme: "dark", audio: before.audio, sounds: before.sounds, shareAudio: { friend: { volume: 0.35, muted: true } } });
+  expect(JSON.parse(data.get("gwar.settings")!).version).toBe(SETTINGS_VERSION);
+});

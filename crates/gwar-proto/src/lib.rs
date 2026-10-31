@@ -309,6 +309,9 @@ wire! {
         /// Unknown on older servers.
         #[serde(rename = "screen.av1.capabilities")]
         ScreenAv1Capabilities {},
+        /// Optional Opus screen audio and paired watch slots. Unknown on older servers.
+        #[serde(rename = "screen.audio.capabilities")]
+        ScreenAudioCapabilities {},
         /// The share on the viewer's stage: it gets first claim on the viewer's bandwidth.
         #[serde(rename = "screen.focus")]
         ScreenFocus { share: String },
@@ -632,6 +635,7 @@ wire! {
         ScreenCapabilities { screen_h264: bool },
         ScreenSpecCapabilities { screen_spec: bool },
         ScreenAv1Capabilities { screen_av1: bool },
+        ScreenAudioCapabilities { screen_audio: bool },
         /// `screen.publish.offer`, `screen.watch.offer`: the SDP answer.
         ScreenAnswer { sdp: String },
         /// `screen.watch`: the watch transport's slot the share arrives in.

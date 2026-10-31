@@ -11,6 +11,7 @@ import { useSettings } from "./settings";
 import { useUplink } from "./uplink";
 
 interface PublisherOptions {
+  audio?: MediaStreamTrack;
   uplink?(status: import("../voice/uplink-congestion").UplinkStatus | null): void;
   ended(): void;
   fallbacks?: import("../voice/screen").EncoderFallbacks;
@@ -56,6 +57,7 @@ function fakeLink(handlers: Record<string, Handler>) {
   const calls: Array<[string, Record<string, unknown>]> = [];
   const link = {
     request: vi.fn(async (op: string, d: Record<string, unknown>) => {
+      if (op === "screen.audio.capabilities") return handlers[op]?.(d) ?? { screen_audio: false };
       if (op === "screen.spec.capabilities") return handlers[op]?.(d) ?? { screen_spec: false };
       if (op === "screen.capabilities") return handlers[op]?.(d) ?? { screen_h264: false };
       calls.push([op, d]);
@@ -658,6 +660,7 @@ describe("watch recovery", () => {
     const screen = new ScreenController(() => link, String); initialise(screen);
     const watching = screen.watch("A"); await flush();
     media.transports[0]!.params.state("connected"); await watching;
+    useSettings.getState().setShareAudio("A", { volume: 0.35, muted: true });
     if (kind === "session") screen.suspend();
     else {
       screen.handleEvent({ ev: "screen.slot", d: { run: useScreen.getState().transport.run, slot: 0, share: null } });
@@ -678,6 +681,8 @@ describe("watch recovery", () => {
     media.transports[1]!.params.state("connected");
     await flush();
     expect(useScreen.getState().stage).toBe("new");
+    expect(useSettings.getState().shareAudio.new).toEqual({ volume: 0.35, muted: true });
+    expect(useSettings.getState().shareAudio.A).toEqual({ volume: 0.35, muted: true });
     expect(useScreen.getState().watches).toMatchObject([{ share: "new", status: "watching" }]);
     expect(toast).not.toHaveBeenCalled();
     screen.reset();
@@ -759,7 +764,7 @@ describe("watch requests across a reset (review round 2)", () => {
 describe("sharing", () => {
   const track = () => ({ readyState: "live", stop: vi.fn(), addEventListener: vi.fn(), getSettings: () => ({ displaySurface: "browser" }) });
   const choosing = (t = track()) => {
-    useScreen.setState({ own: { phase: "choosing", attempt: 1, share: null, stream: { getVideoTracks: () => [t], getTracks: () => [t] } as unknown as MediaStream, surface: "tab", spec: legacySpec("text"), viewers: 0, guests: 0, guestLink: true, preview: false } });
+    useScreen.setState({ own: { phase: "choosing", attempt: 1, share: null, stream: { getAudioTracks: () => [], getVideoTracks: () => [t], getTracks: () => [t] } as unknown as MediaStream, surface: "tab", spec: legacySpec("text"), viewers: 0, guests: 0, guestLink: true, preview: false } });
     return t;
   };
 
@@ -996,7 +1001,7 @@ describe("sharing", () => {
     useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
     const picked = deferred<MediaStream>();
     vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia: () => picked.promise } });
-    const source = track(); const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
+    const source = track(); const stream = { getTracks: () => [source], getAudioTracks: () => [], getVideoTracks: () => [source] } as unknown as MediaStream;
     const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
     const screen = new ScreenController(() => link, String); initialise(screen);
     screen.beginShare();
@@ -1021,7 +1026,7 @@ describe("sharing", () => {
   it.each([false, true])("shows persistent guidance when the captured window ends during recovery (resumed=%s)", async resumed => {
     useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
     const source = Object.assign(new EventTarget(), { readyState: "live", stop: vi.fn(), getSettings: () => ({ displaySurface: "browser" }) });
-    const stream = { getTracks: () => [source], getVideoTracks: () => [source] } as unknown as MediaStream;
+    const stream = { getTracks: () => [source], getAudioTracks: () => [], getVideoTracks: () => [source] } as unknown as MediaStream;
     vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia: async () => stream } });
     const { link, calls } = fakeLink({ "screen.start": () => ({ share: "M" }), "screen.publish.offer": () => ({ sdp: "answer" }) });
     const screen = new ScreenController(() => link, String);
@@ -1350,4 +1355,30 @@ describe("sharing", () => {
     expect(begin).toHaveBeenCalledOnce();
     expect(toast).toHaveBeenCalledWith("info", "Mod stopped your screen share.", expect.objectContaining({ sticky: true, key: "screen-stopped" }));
   });
+});
+
+it.each([true, false, "ended"] as const)("retained share audio survives reconnect or stops truthfully (next server audio=%s)", async support => {
+  useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "client.updated", d: cl(1, 1) } });
+  let negotiated = true, starts = 0;
+  const { link } = fakeLink({ "screen.audio.capabilities": () => ({ screen_audio: negotiated }), "screen.start": () => ({ share: `M${++starts}` }), "screen.publish.offer": () => ({ sdp: "answer" }) });
+  const source = { readyState: "live", stop: vi.fn(), getSettings: () => ({ displaySurface: "browser" }) };
+  const audio = { readyState: "live", stop: vi.fn(function(this: { readyState: string }) { this.readyState = "ended"; }) };
+  let sounds = [audio];
+  const stream = { getVideoTracks: () => [source], getAudioTracks: () => sounds, getTracks: () => [source, ...sounds], removeTrack: () => { sounds = []; } } as unknown as MediaStream;
+  useScreen.setState({ own: { phase: "choosing", attempt: 1, share: null, stream, surface: "tab", spec: legacySpec("smooth"), viewers: 0, guests: 0, guestLink: false, preview: false } });
+  const screen = new ScreenController(() => link, String);
+  initialise(screen);
+  await screen.confirmShare();
+  expect(media.publishers[0]!.params).toMatchObject({ audio });
+  screen.suspend();
+  expect(audio.stop).not.toHaveBeenCalled();
+  negotiated = support !== false;
+  if (support === "ended") audio.readyState = "ended";
+  screen.resume(); await flush();
+  const own = useScreen.getState().own!;
+  expect(own.stream).toBe(stream);
+  expect(own.audio).toBe(support === true);
+  if (support === false) { expect(audio.stop).toHaveBeenCalledOnce(); expect(sounds).toHaveLength(0); }
+  if (support === true) expect(media.publishers[1]!.params).toMatchObject({ audio });
+  screen.reset();
 });

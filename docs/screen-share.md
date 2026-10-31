@@ -14,6 +14,10 @@ kept here ([Spikes](#spikes)).
 
 ## Summary
 
+P1-6 browser audio implementation and the separate native follow-up are described
+in [Browser screen-share sound](share-audio.md). It supersedes the phase-2 design
+below for plaintext browser tab audio; encrypted sharing remains unavailable.
+
 - **One media path for every client that has a usable webview.** Browsers, and
   the desktop app on macOS and Windows, capture with `getDisplayMedia` and send
   through extra `RTCPeerConnection`s in the web layer, the **screen

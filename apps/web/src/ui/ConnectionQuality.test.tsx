@@ -150,15 +150,15 @@ it("drops the held colour with the measurement, and shows the next one as it is"
 it("replaces the generic sender reason in the sharing bar while congested, then restores it", async () => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
   await render(<SharingBar />);
-  expect(container.textContent).toContain("Ograniczone przez łącze");
+  expect(container.textContent).toContain("Bez dźwięku");
   expect(indicator()).toBeNull();
   await set({ screen: bloated });
-  expect(indicator()?.textContent).toBe("Wysyłanie nie nadąża");
+  expect(indicator()?.getAttribute("aria-label")).toContain("Wysyłanie nie nadąża");
   expect(indicator()?.getAttribute("aria-live")).toBe("off");
   expect(container.textContent).not.toContain("Ograniczone przez łącze");
   await set({ screen: healthy });
   await act(async () => vi.advanceTimersByTime(QUALITY_IMPROVE_MS));
-  expect(container.textContent).toContain("Ograniczone przez łącze");
+  expect(container.textContent).toContain("Bez dźwięku");
   expect(indicator()).toBeNull();
 });
 
@@ -166,7 +166,7 @@ it("shows voice congestion in the sharing bar even before encoder stats arrive",
   vi.mocked(controller.screen.ownStats).mockResolvedValue(null);
   useUplink.setState({ voice: bloated });
   await render(<SharingBar />);
-  expect(indicator()?.textContent).toBe("Wysyłanie nie nadąża");
+  expect(indicator()?.getAttribute("aria-label")).toContain("Wysyłanie nie nadąża");
 });
 
 it.each([
@@ -202,7 +202,7 @@ it("keeps screen congestion on the share while the server reconnects, without vo
   expect(useUplink.getState().voice).toBeNull();
   expect(notice()).toBeNull();
   expect(container.querySelectorAll('[data-testid="connection-quality"]')).toHaveLength(1);
-  expect(indicator()?.textContent).toBe("Wysyłanie nie nadąża");
+  expect(indicator()?.getAttribute("aria-label")).toContain("Wysyłanie nie nadąża");
   await act(async () => indicator()!.click());
   const details = document.querySelector('[data-testid="connection-details"]')!;
   expect(details.textContent).toContain("wysyłaniem udostępnianego ekranu");

@@ -10,7 +10,7 @@ import { controller } from "../state/controller";
 import { initialScreen, useScreen } from "../state/screen";
 import { useDesktopCapture, type DesktopCapture } from "../state/screen-controller";
 import { useSettings } from "../state/settings";
-import { useSession } from "../state/stores";
+import { useSession, useUi } from "../state/stores";
 import { TooltipProvider } from "./kit";
 import * as platform from "../platform";
 import { LiveBadge, ScreenNotice, ShareButton, ShareVideo, SharingBar } from "./Screen";
@@ -188,11 +188,12 @@ it("shows independent quality controls and saves an explicit click on the surfac
   useScreen.getState().dispatch({ type: "picked", attempt: 1, stream: {} as MediaStream, surface: "screen" });
   useScreen.getState().dispatch({ type: "starting", attempt: 1 });
   await act(async () => root.render(<SharingBar />));
-  expect(container.textContent).toContain("Płynność");
-  const modes = container.querySelectorAll<HTMLInputElement>('input[type="radio"]');
+  await act(async () => [...container.querySelectorAll("button")].find(b => b.textContent === "Szczegóły")!.click());
+  expect(document.body.textContent).toContain("Płynność");
+  const modes = document.querySelectorAll<HTMLInputElement>('input[type="radio"]');
   expect(modes).toHaveLength(2);
-  expect(container.textContent).toContain("Ostry tekst");
-  expect(container.querySelectorAll("select")).toHaveLength(2);
+  expect(document.body.textContent).toContain("Ostry tekst");
+  expect(document.querySelectorAll("select")).toHaveLength(2);
   await act(async () => modes[0]!.click());
   expect(useSettings.getState().screenMode).toBe("smooth");
 });
@@ -428,11 +429,21 @@ it("shows a calm quality chip and keeps encoder statistics behind Details", asyn
     dispatch({ type: "started", attempt: 1, share: "M" });
     dispatch({ type: "live", share: "M" });
     await act(async () => root.render(<SharingBar />));
-    const details = container.querySelector<HTMLDetailsElement>('[data-testid="screen-sender-stats"]')!;
+    await act(async () => [...container.querySelectorAll("button")].find(b => b.textContent === "Details")!.click());
+    const details = document.querySelector<HTMLDetailsElement>('[data-testid="screen-sender-stats"]')!;
     expect(details.open).toBe(false);
     expect(details.querySelector("summary")?.textContent).toBe("Good quality");
     expect(details.textContent).toContain("1080p · 60 fps · 4.2 Mb/s · VP9");
     await act(async () => details.querySelector("summary")!.click());
     expect(details.open).toBe(true);
   } finally { stats.mockRestore(); }
+});
+
+
+it("opens a watched share's stage and sound controls instead of leaving the phone on its channel list", async () => {
+  await show();
+  useUi.setState({ pane: "list" });
+  const watch = vi.spyOn(controller.screen, "watch").mockResolvedValue();
+  try { await act(async () => badge().click()); expect(useUi.getState().pane).toBe("chat"); expect(watch).toHaveBeenCalledWith("S"); }
+  finally { watch.mockRestore(); }
 });
