@@ -1035,6 +1035,114 @@ mod codec_tests {
         worker.join().unwrap().unwrap();
     }
 
+    /// One arm of the paired load run: the time from a microphone block to its encoded frame,
+    /// and the speaker samples the pipeline failed to supply, with `shares` playing stereo music.
+    fn voice_pipeline_under_shares(shares: usize, seconds: u64) -> (Vec<Duration>, u64) {
+        let playout = share::SharePlayout::new().unwrap();
+        let controls = Arc::new(Controls::default());
+        *controls.share.lock().unwrap() = Some(playout.bus());
+        let c = controls.clone();
+        let (mut mic_tx, mic) = rtrb::RingBuffer::new(48_000);
+        let (speaker, mut heard) = rtrb::RingBuffer::new(FRAME * 8);
+        let (out, mut outgoing) = mpsc::channel(256);
+        let (_incoming_tx, incoming) = std::sync::mpsc::sync_channel(8);
+        let output = Arc::new(OutputTiming::default());
+        let t = output.clone();
+        let worker = thread::spawn(move || pipeline::<FRAME>(c, Arc::default(), mic, speaker, t, out, incoming));
+        let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
+        encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
+        for slot in 0..shares {
+            playout.open(slot, 1);
+        }
+        let mut packet = vec![0; 1275];
+        let (mut latency, mut missing) = (Vec::new(), 0u64);
+        let start = Instant::now();
+        for block in 0..seconds * 100 {
+            let position = block * FRAME as u64;
+            if block % 2 == 0 && shares > 0 {
+                let pcm: Vec<f32> = (0..960u64)
+                    .flat_map(|i| {
+                        let time = (position + i) as f32 / 48_000.0;
+                        let left = 0.2 * (std::f32::consts::TAU * 330.0 * time).sin();
+                        let right = 0.2 * (std::f32::consts::TAU * 523.0 * time).sin();
+                        [left, right]
+                    })
+                    .collect();
+                let n = encoder.encode_float(&pcm, &mut packet).unwrap();
+                for slot in 0..shares {
+                    playout.push(share::ShareFrame {
+                        slot,
+                        run: 1,
+                        rtp_time: position as u32,
+                        opus: packet[..n].to_vec(),
+                    });
+                }
+            }
+            thread::sleep((start + Duration::from_millis(10 * block)).saturating_duration_since(Instant::now()));
+            for _ in 0..FRAME {
+                if heard.pop().is_err() {
+                    missing += 1;
+                }
+            }
+            output.report(FRAME, 0);
+            let fed = Instant::now();
+            for i in 0..FRAME as u64 {
+                let phase = std::f32::consts::TAU * 440.0 * (position + i) as f32 / 48_000.0;
+                let _ =
+                    mic_tx.push(CaptureSample { position: position + i, captured_at: fed, value: 0.25 * phase.sin() });
+            }
+            output.wake();
+            while fed.elapsed() < Duration::from_millis(8) {
+                if outgoing.try_recv().is_ok() {
+                    latency.push(fed.elapsed());
+                    break;
+                }
+                thread::yield_now();
+            }
+        }
+        controls.stop.store(true, Ordering::Relaxed);
+        output.wake();
+        worker.join().unwrap().unwrap();
+        latency.sort();
+        (latency, missing)
+    }
+
+    /// Run by hand in release: alternating pairs, four shares against none, on the real pipeline.
+    #[test]
+    #[ignore = "a timing measurement, not a unit test"]
+    fn four_shares_leave_the_voice_pipeline_on_time() {
+        let percentile = |all: &[Duration], p: f64| all[((all.len() - 1) as f64 * p) as usize].as_secs_f64() * 1000.0;
+        let mut worst_delta = f64::MIN;
+        for pair in 0..6 {
+            let order = if pair % 2 == 0 { [0, 4] } else { [4, 0] };
+            let mut arms = [None, None];
+            for shares in order {
+                arms[shares / 4] = Some(voice_pipeline_under_shares(shares, 20));
+            }
+            let [Some(base), Some(load)] = arms else { unreachable!() };
+            assert!(
+                base.0.len() > 1500 && load.0.len() > 1500,
+                "voice kept sending: {} {}",
+                base.0.len(),
+                load.0.len()
+            );
+            let delta = percentile(&load.0, 0.99) - percentile(&base.0, 0.99);
+            worst_delta = worst_delta.max(delta);
+            println!(
+                "pair {pair} order {order:?}: none p50 {:.3} p99 {:.3} max {:.3} missing {} | four p50 {:.3} p99 {:.3} max {:.3} missing {} | p99 delta {delta:+.3} ms",
+                percentile(&base.0, 0.5),
+                percentile(&base.0, 0.99),
+                percentile(&base.0, 1.0),
+                base.1,
+                percentile(&load.0, 0.5),
+                percentile(&load.0, 0.99),
+                percentile(&load.0, 1.0),
+                load.1,
+            );
+        }
+        assert!(worst_delta < 1.0, "share playback delayed voice: {worst_delta:.3} ms");
+    }
+
     #[test]
     fn encoded_sender_bounds_count_unexpected_duration_without_dropping_it() {
         let counters = Counters::default();

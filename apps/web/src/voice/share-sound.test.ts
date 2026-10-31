@@ -73,7 +73,7 @@ it("stops forwarding when closed and leaves no worker behind", async () => {
   receiver.close();
   deliver(frame(2));
   expect(frames()).toHaveLength(0);
-  expect(calls.map(c => c.command)).toContain("share_playback_close");
+  await vi.waitFor(() => expect(calls.map(c => c.command)).toContain("share_playback_close"));
   expect(worker.terminate).toHaveBeenCalled();
   expect(await receiver.openSlot(2, 1)).toBe(false);
 });

@@ -73,7 +73,7 @@ function nativeFixture(frequency) {
   const fixture = { page: null, log: () => child.log };
   createInterface({ input: child.stdout }).on("line", line => {
     const message = JSON.parse(line);
-    if (line.length < 1000) child.log += `< ${line.slice(0, 300)}\n`;
+    if (line.length < 1000 && !line.includes('"ok":null')) child.log += `< ${line.slice(0, 300)}\n`;
     if ("event" in message) {
       void fixture.page?.evaluate(({ event, payload }) => window.__nativeEmit(event, payload), message).catch(() => {});
       return;
@@ -261,6 +261,9 @@ async function shareAndWatch(sharer, viewer) {
   return { ms: Date.now() - started, size: `${last.width}x${last.height}` };
 }
 
+/** Beside two voices its share of the energy is small, but without it the tone measures under 0.001. */
+const shareHeard = async viewer => (await viewer.native.request("snapshot", { frequency: 997 })).tone > 0.005;
+
 /** Native sender to native viewer, through the UI: consent, playback, controls, withdrawal. */
 async function computerSound(sharer, viewer, browserViewer) {
   const started = Date.now();
@@ -278,8 +281,12 @@ async function computerSound(sharer, viewer, browserViewer) {
   const before = await viewer.native.request("share_stats", {});
   await viewer.page.getByRole("button", { name: `${sharer.name} is sharing their screen. Click to watch.` }).click();
   await browserViewer.page.getByRole("button", { name: `${sharer.name} is sharing their screen. Click to watch.` }).click();
-  const heard = await waitFor(() => hears(viewer, 997), "native viewer hears the sharer's computer sound", 30_000);
-  await viewer.page.getByTestId("share-audio-controls").waitFor({ timeout: 10_000 });
+  const watching = Date.now();
+  await viewer.page.locator("video[data-share]").waitFor({ timeout: 15_000 });
+  await viewer.page.getByTestId("share-audio-controls").waitFor({ timeout: 15_000 });
+  const controls = Date.now() - watching;
+  const firstFrame = await waitFor(async () => (await viewer.native.request("share_stats", {})).decoded > 0, "the viewer's mixer gets the first sound", 8_000);
+  const heard = await waitFor(() => shareHeard(viewer), "native viewer hears the sharer's computer sound", 30_000);
   assert.equal(await viewer.page.locator("audio[data-share-audio]").count(), 0, "the desktop webview has no share player");
   await browserViewer.page.locator("audio[data-share-audio]").waitFor({ state: "attached", timeout: 15_000 });
   await waitFor(async () => (await hears(viewer, 770)) && (await hears(browserViewer, 770)), "voice beside share sound", 20_000);
@@ -288,23 +295,23 @@ async function computerSound(sharer, viewer, browserViewer) {
   const after = await viewer.native.request("share_stats", {});
   const rate = (after.frames - settled.frames) / 10;
   assert.ok(rate > 45 && rate < 55, `viewer takes one Opus frame per 20 ms, got ${rate}/s`);
-  assert.ok(await hears(viewer, 997) && await hears(viewer, 770), "ten seconds in, voice and share sound still play together");
+  assert.ok(await shareHeard(viewer) && await hears(viewer, 770), "ten seconds in, voice and share sound still play together");
   await viewer.page.getByTestId("share-audio-controls").getByRole("button", { name: "Mute share sound" }).click();
-  await waitFor(async () => !(await hears(viewer, 997)), "muting silences the share here", 5_000);
+  await waitFor(async () => !(await shareHeard(viewer)), "muting silences the share here", 5_000);
   assert.ok(await hears(viewer, 770), "muting a share leaves voice alone");
   await viewer.page.getByTestId("share-audio-controls").getByRole("button", { name: "Unmute share sound" }).click();
-  await waitFor(() => hears(viewer, 997), "unmuting brings the share back", 5_000);
+  await waitFor(() => shareHeard(viewer), "unmuting brings the share back", 5_000);
   await page.getByRole("status", { name: "You are sharing your screen" }).getByRole("button", { name: "Details", exact: true }).click();
   const details = page.getByRole("dialog", { name: "You are sharing your screen" });
   await details.getByRole("button", { name: "Stop sharing sound" }).click();
   await details.getByText("Computer sound is off for this share.").waitFor({ timeout: 5_000 });
   await page.keyboard.press("Escape");
-  await waitFor(async () => !(await hears(viewer, 997)), "stopping sound reaches the viewer", 10_000);
+  await waitFor(async () => !(await shareHeard(viewer)), "stopping sound reaches the viewer", 10_000);
   await viewer.page.getByTestId("share-audio-controls").waitFor({ state: "detached", timeout: 10_000 });
   await viewer.page.locator("video[data-share]").waitFor({ timeout: 5_000 });
   await page.getByRole("status", { name: "You are sharing your screen" }).getByRole("button", { name: "Stop sharing" }).click();
   await viewer.page.locator("video[data-share]").waitFor({ state: "detached", timeout: 15_000 });
-  return { ms: Date.now() - started, heardAfterMs: heard, framesBeforeWatching: before.frames, stats: await viewer.native.request("share_stats", {}), framesPerSecond: rate };
+  return { ms: Date.now() - started, controlsAfterMs: controls, firstSoundMs: firstFrame, heardMs: heard, framesBeforeWatching: before.frames, stats: await viewer.native.request("share_stats", {}), framesPerSecond: rate };
 }
 
 async function run(engine, web, server, token) {

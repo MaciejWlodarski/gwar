@@ -166,6 +166,10 @@ export class ShareSoundReceiver {
   private pending: ShareSoundFrame[] = [];
   private sending = false;
   private closed = false;
+  /** Slots still asked for, so a close overtaking an open is not undone by it. */
+  private readonly wanted = new Set<number>();
+  /** Open, close and volume reach the shell in the order they were asked. */
+  private controls: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly link: ShareSoundLink, private readonly run: number, create: () => Worker = createWorker) {
     this.worker = create();
@@ -191,25 +195,32 @@ export class ShareSoundReceiver {
       .finally(() => { this.sending = false; this.flush(); });
   }
 
+  private control<T>(command: string, args: Record<string, unknown>): Promise<T> {
+    const done = this.controls.then(() => this.link.api.invoke<T>(command, { ...args, owner: this.link.owner }));
+    this.controls = done.catch(() => {});
+    return done;
+  }
+
   /** True once this slot's sound can really be heard here. No frame goes ahead of its volume. */
   async openSlot(slot: number, gain: number): Promise<boolean> {
     if (this.closed) return false;
-    const { owner } = this.link;
-    const playing = await this.link.api.invoke<boolean>("share_playback_open", { owner, run: this.run, slot });
-    await this.link.api.invoke("share_playback_gain", { owner, slot, gain });
-    if (this.closed) return false;
+    this.wanted.add(slot);
+    const playing = await this.control<boolean>("share_playback_open", { run: this.run, slot });
+    await this.control("share_playback_gain", { slot, gain });
+    if (this.closed || !this.wanted.has(slot)) return false;
     this.open.add(slot);
     return playing;
   }
 
   closeSlot(slot: number): void {
     this.open.delete(slot);
+    this.wanted.delete(slot);
     this.pending = this.pending.filter(frame => frame.slot !== slot);
-    if (!this.closed) void this.link.api.invoke("share_playback_close", { owner: this.link.owner, slot }).catch(() => {});
+    if (!this.closed) void this.control("share_playback_close", { slot }).catch(() => {});
   }
 
   setGain(slot: number, gain: number): void {
-    if (!this.closed) void this.link.api.invoke("share_playback_gain", { owner: this.link.owner, slot, gain }).catch(() => {});
+    if (!this.closed) void this.control("share_playback_gain", { slot, gain }).catch(() => {});
   }
 
   close(): void {
