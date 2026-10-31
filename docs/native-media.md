@@ -1769,6 +1769,11 @@ target; their larger keyframes only affect joins and recoveries.
 
 ## 7. Shared audio
 
+The desktop app shipped a smaller route first: the webview remains the transport and
+native code does capture, decoding and mixing, without B8's native publish endpoint.
+See [share-audio.md](share-audio.md#desktop-app-computer-sound-and-native-playback).
+The sharer's echo canceller below is not done yet.
+
 On the wire, native shared audio is exactly
 [Shared audio (phase 2)](screen-share.md#shared-audio-phase-2): codec,
 m-lines, SFU forwarding, lip sync and the `"gwar screen audio v1"` SFrame

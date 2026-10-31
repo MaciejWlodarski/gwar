@@ -669,8 +669,7 @@ impl Backend for Cpal {
             Side::Output => open_output(
                 &self.host,
                 route,
-                self.speaker.clone(),
-                Some(self.side.clone()),
+                (self.speaker.clone(), Some(self.side.clone())),
                 self.timing.clone(),
                 (active, id),
                 trouble,
@@ -750,8 +749,7 @@ fn open_input(
 fn open_output(
     host: &cpal::Host,
     route: &Route,
-    speaker: Arc<Mutex<Consumer<f32>>>,
-    side: Option<Arc<Mutex<Consumer<f32>>>>,
+    (speaker, side): (Arc<Mutex<Consumer<f32>>>, Option<Arc<Mutex<Consumer<f32>>>>),
     timing: Arc<OutputTiming>,
     (active, id): (Active, u64),
     trouble: TroubleFn,
@@ -861,8 +859,7 @@ pub fn play_sample(output: Option<String>, samples: Vec<f32>, cancelled: Arc<Ato
             open_output(
                 &host,
                 route,
-                received.clone(),
-                None,
+                (received.clone(), None),
                 timing.clone(),
                 (active.clone(), 1),
                 trouble.clone(),
@@ -918,8 +915,7 @@ pub fn play_cue(output: Option<String>, samples: Vec<f32>, busy: Arc<AtomicUsize
         match open_output(
             &cpal::default_host(),
             &route,
-            Arc::new(Mutex::new(rx)),
-            None,
+            (Arc::new(Mutex::new(rx)), None),
             timing,
             (active, 1),
             trouble,

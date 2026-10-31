@@ -90,3 +90,25 @@ A lease renewal for a held press cannot transfer to a replacement run: the
 voice lock cancels it, and the observer must recover and see a release first.
 Observer-health proofs expire independently of bound-input physical polling;
 missed release callbacks cancel immediately without the configured tail.
+
+## Share sound
+
+See [share-audio](../../../docs/share-audio.md#desktop-app-computer-sound-and-native-playback).
+Every command except `share_capture_support` and `share_capture_allow` takes the voice `owner`
+and refuses a superseded one or any window but `main`. Bootstrap stops a capture and drops
+the playout left by the previous view. Neither direction holds a voice lock while media flows.
+
+| Command | Arguments | Result |
+| --- | --- | --- |
+| `share_capture_support` | | `ok`, `permission` or `unsupported`. |
+| `share_capture_allow` | | Asks macOS to list Gwar for Screen Recording. |
+| `share_capture_start` | `owner, id` | Starts capturing. `id` must grow; errors are `permission`, `unsupported`, `failed` or `superseded`. |
+| `share_capture_read` | `owner, id` | Interleaved 48 kHz stereo `f32`, raw. Waits up to 100 ms; empty means no sound yet, the error `closed` means over. |
+| `share_capture_stop` | `owner, id` | Stops that capture; a stale id stops nothing. |
+| `share_playback_open` | `owner, run, slot` | Claims `slot` for watch transport `run`. False while no voice engine runs. |
+| `share_playback_close` | `owner, slot` | Stops that slot. |
+| `share_playback_gain` | `owner, slot, gain` | 0 to 1, independent of voice volume. |
+| `share_playback_frames` | raw body | `owner: u64, run: u64`, then per frame `slot: u8, rtp_time: u32, length: u16, opus`, little-endian. A malformed batch is refused whole. |
+
+Sound goes only where it was asked for: a frame for a closed slot or an older run is
+dropped, and the webview sends no frame ahead of the slot's volume.

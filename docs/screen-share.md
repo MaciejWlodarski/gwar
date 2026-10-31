@@ -253,10 +253,9 @@ Tradeoffs we accept with the webview path:
   PR 1 check: frame rate with Gwar hidden for five minutes. If it fails, the
   desktop sets `NSProcessInfo.beginActivity(.userInitiated)` while sharing.
 - **No hardware H.264 under E2E** in phase 1; see the codec section.
-- **No shared audio from the desktop app**, even in phase 2's browser audio.
-  WKWebView cannot capture audio, and on Windows the system mix would contain
-  Gwar's native voice playback ([Shared audio](#shared-audio-phase-2)). Native
-  capture that leaves out Gwar's own process comes later (PR 10).
+- **Shared audio from the desktop app** comes from native capture, not from
+  `getDisplayMedia`, and viewers there hear it through the native mixer
+  ([share-audio.md](share-audio.md#desktop-app-computer-sound-and-native-playback)).
 
 Phase 3 may bring native capture: macOS and Windows for games if measurements
 show the webview's encoder or throttling falls short. A native Linux path

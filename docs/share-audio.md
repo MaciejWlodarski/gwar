@@ -1,9 +1,10 @@
-# Browser screen-share sound (P1-6, PR 1)
+# Screen-share sound (P1-6)
 
-This is the browser/transport half of P1-6. A supported browser can share
-another tab's sound through the screen SFU. Native desktop capture and viewing remain video-only. The webview never receives or
-plays share sound: native playback must first enter the native mixer and AEC reference. Encrypted channels still cannot share screens; this change
-adds no plaintext exception to that rule.
+A supported browser can share another tab's sound through the screen SFU (PR 1).
+The desktop app can share the computer's sound, leaving Gwar's own sound out, and plays
+share sound through the native mixer (PR 2, [below](#desktop-app-computer-sound-and-native-playback)).
+The webview never plays share sound. Encrypted channels still cannot share
+screens; neither change adds a plaintext exception to that rule.
 
 ## Capture and echo boundaries
 
@@ -14,9 +15,10 @@ track; the call microphone settings are untouched. The local tab keeps playing;
 the share preview is always muted. Returned audio from a screen, window or
 unknown surface is stopped and removed, even if the browser ignored the
 picker hints. Where the browser advertises `restrictOwnAudio`, the returned
-track must confirm that it was applied or the sound is discarded. Desktop capture explicitly requests no audio and also discards
-any returned audio. Neither browser nor native voice playback is intentionally
-included in a system mix in this PR.
+track must confirm that it was applied or the sound is discarded. The desktop app's
+picker explicitly requests no audio and discards any returned audio: its sound comes
+from native capture instead. Neither browser nor native voice playback is intentionally
+included in a system mix.
 
 These are browser APIs, not a guarantee about every OS/browser. The
 [Screen Capture draft](https://www.w3.org/TR/screen-capture/)
@@ -71,7 +73,8 @@ may send `stopped: true` when its retained audio track ends. No unsolicited even
 or field is added for older clients. Guest watch pages retain their existing
 video-only behavior.
 
-No new persistent server data is introduced. Settings v10 adds `shareAudio`,
+No new persistent server data is introduced. Settings v11 adds the desktop app's
+`shareComputerSound` consent, off for everyone until asked. Settings v10 adds `shareAudio`,
 keyed by share id, with volume 0–100% and independent mute. It preserves
 all v1–v9 fields: cues and sensitivity, desktop/notification choices in v7,
 PTT bindings and release delay in v8, and person volume/mute in v9. Fixtures cover
@@ -143,9 +146,7 @@ the same person retain independent controls. Deafen
 mutes it; selecting an output device applies `setSinkId` where supported.
 Browsers without that API use their normal output. Autoplay refusal offers
 an explicit Play share sound button only for an audio-enabled share. Desktop
-viewers negotiate video only and have no player, volume control, sound prompt
-or sound claim. Native playback through the voice mixer/AEC reference belongs
-to PR 2.
+viewers have no player or sound prompt: their sound plays natively, below.
 
 Reassigning a previously used audio slot replaces the watch peer connection
 before granting playback. New DTLS keys, SSRCs and receiver buffers fence delayed
@@ -168,21 +169,85 @@ Stopping or leaving stops all captured tracks.
 Validation results, commands and the calibrated latency-gate limitation are in
 [share-audio-validation.md](share-audio-validation.md).
 
-## PR 2: native process-excluding capture
+## Desktop app: computer sound and native playback
 
-This is a separate implementation, not a small extension to the webview picker.
-Follow [native-media.md](native-media.md#7-shared-audio):
+The webview stays the transport. It keeps its peer connections and the same Opus
+m-lines as a browser, so this adds nothing to the protocol, the SFU or its budgets:
+share audio is still 64 kb/s, `very-low` priority, 128 kb/s in every budget, and
+retained across reconnect. Native code owns capture, decoding, mixing and echo
+cancellation. Details of the commands are in
+[VOICE-IPC.md](../apps/desktop/src-tauri/VOICE-IPC.md#share-sound).
 
-- macOS: ScreenCaptureKit audio with `capturesAudio` and
-  `excludesCurrentProcessAudio`; verify WebKit helper-process exclusion as well
-  as native voice/cue exclusion, and fail closed where exclusion is unavailable.
-- Windows: WASAPI process loopback excluding Gwar's process tree, including
-  WebView2 helpers. Unsupported Windows versions remain video-only; do not
-  substitute whole-device loopback that includes the call.
-- Own the native capture lifecycle, consent, timestamps and a bounded bridge
-  into the share's Opus sender; preserve picture/audio together on reconnect.
-- Native playback must feed share sound into the voice AEC reference alongside
-  voice, with per-share controls and the selected output device.
-- Run native generated-tone, process-exclusion, physical AEC, lip-sync and paired
-  voice-latency acceptance on both platforms. Neither production services nor
-  the installed Gwar application are needed for this work.
+### Sharing
+
+The quality menu asks once, with **Share computer sound** / **Udostępniaj dźwięk
+komputera**. It is off until the sharer turns it on, and the answer is remembered
+(settings v11). Starting the share is the consent: capture never begins by itself.
+Details has a **Stop sharing sound** action; turning it back on needs a new share,
+since the sender's m-line exists only from the start.
+
+```
+OS capture → CaptureQueue (200 ms, oldest goes) → share_capture_read (awaited, raw f32)
+           → AudioWorklet (30 ms target, 100 ms limit) → MediaStreamAudioDestination → Opus sender
+```
+
+The worklet's track goes only to the sender, never to `context.destination`. The read
+loop waits on the shell's own promise, so a hidden window's timers do not slow it. The
+`AudioContext` is made in the Start click's own task. A capture that hangs is abandoned
+after 4 s: sound never holds the picture back. Whatever goes wrong, the picture
+continues and Details says why, in plain words.
+
+- **macOS 14 or newer:** ScreenCaptureKit with `capturesAudio` and
+  `excludesCurrentProcessAudio`. It needs Screen Recording for Gwar and a relaunch
+  after granting it. The dialog offers to open System Settings; asking also adds Gwar
+  to the list there. The framework is weakly linked, so macOS 11 to 13 still run Gwar
+  and simply cannot share sound.
+- **WebKit is not covered by that exclusion.** Measured here on macOS 27: a tone played
+  by the app's `AVAudioEngine` was excluded (−240 dB), one played by its `WKWebView`
+  arrived unchanged (−50.6 dB against −50 dB played). Its helpers are not in
+  `SCShareableContent.applications` either, so an application filter cannot help. Voice and cues
+  are native, so only chat attachments play in the webview: while capture runs on
+  macOS, `silenceWebviewMedia` keeps every `<audio>` and `<video>` there muted, and
+  undoes it afterwards. A chat video played during a sound share is silent.
+- **Windows 11 or newer (build 20348+):** WASAPI process loopback excluding Gwar's
+  process tree, which contains its WebView2 helpers. Earlier builds fail closed; a
+  whole-device loopback, which would contain the call, is never used.
+- Any other system, or a failed check: the picture alone, and the UI says so.
+
+### Watching
+
+A desktop viewer's audio receivers each get an `RTCRtpScriptTransform` before any
+description is made. The worker posts every encoded frame out and writes none back, so
+the webview has nothing to decode. `shareSoundReceivable` asks the real worker first;
+without transform events the app stays video only, with no sound claim.
+
+```
+worker → share_playback_frames (raw batch, one in flight, 400 frames at most)
+       → SharePlayout thread: ordered jitter queue (40–160 ms), Opus decode, mix of up to 4 shares
+       → ShareBus (40 ms ring) → voice pipeline → speaker + echo canceller reference
+```
+
+- **Voice comes first.** The playout thread has ordinary priority. The voice pipeline
+  takes the ring with `try_lock` and never waits for it. Share sound only uses the room
+  voice leaves, so a loud share can clip but the voice under it cannot.
+- **Echo:** share sound is mixed before `processing.render`, so the canceller knows
+  it and a viewer on speakers does not send it back. Stereo keeps its mid in that mix and
+  sends its side to the output callback in lockstep, so the reference is what the speaker
+  plays. Selecting an output device needs nothing new.
+- **Controls:** the same per-share volume and mute as a browser (`shareAudio`), independent
+  of voice volume. They appear only when the server confirms sound and the mixer has
+  taken it. Deafen silences it without falling behind. There is no autoplay prompt.
+- A newer watch transport retires everything older, by run. Playback is not tied to one
+  voice run: a voice reconnect replaces the pipeline reading the ring, not the streams.
+- A lost frame is concealed up to 100 ms. A stall's backlog is dropped rather than played late.
+
+### Not included
+
+- **The sharer's own echo.** Sound the sharer's speakers play can reach their microphone.
+  Feeding the captured sound to the canceller ([native-media.md](native-media.md#echo-and-the-sharers-microphone))
+  is not done yet; headphones avoid it.
+- **Lip-sync is not actively corrected.** Sound runs behind the picture by the jitter queue and
+  rings, by estimate at most 100–120 ms. It has not been measured.
+- Mobile clients and the browser are unchanged.
+
+Validation is in [share-audio-validation.md](share-audio-validation.md#pr-2-desktop-app).
