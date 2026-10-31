@@ -357,10 +357,11 @@ class Controller {
     const applyAudio = (s = useSettings.getState()) => {
       const a = s.audio;
       e.setInputMode(a.inputMode);
+      e.setPttReleaseDelay(a.pttReleaseDelay);
       e.setInputSensitivity(a.automaticSensitivity ? null : a.vadThreshold);
       e.setMasterVolume(a.masterVolume);
       void e.setOutputDevice(a.outputDeviceId);
-      for (const [uid, v] of Object.entries(s.userVolumes)) e.setUserVolume(uid, v);
+      for (const uid of new Set([...Object.keys(s.userVolumes), ...Object.keys(s.userMuted)])) e.setUserVolume(uid, s.userMuted[uid] ? 0 : s.userVolumes[uid] ?? 1);
     };
     // Device and capture options are applied before the mic opens.
     const first = useSettings.getState().audio;
@@ -386,6 +387,7 @@ class Controller {
       const a = s.audio;
       const p = prev.audio;
       if (a.inputMode !== p.inputMode) e.setInputMode(a.inputMode);
+      if (a.pttReleaseDelay !== p.pttReleaseDelay) e.setPttReleaseDelay(a.pttReleaseDelay);
       if (a.automaticSensitivity !== p.automaticSensitivity || a.vadThreshold !== p.vadThreshold) e.setInputSensitivity(a.automaticSensitivity ? null : a.vadThreshold);
       if (a.masterVolume !== p.masterVolume) e.setMasterVolume(a.masterVolume);
       if (a.outputDeviceId !== p.outputDeviceId) void e.setOutputDevice(a.outputDeviceId);
@@ -403,9 +405,13 @@ class Controller {
           autoGainControl: a.autoGainControl,
         });
       }
-      if (s.userVolumes !== prev.userVolumes) {
-        for (const [uid, v] of Object.entries(s.userVolumes)) if (prev.userVolumes[uid] !== v) e.setUserVolume(uid, v);
-        for (const uid of Object.keys(prev.userVolumes)) if (!(uid in s.userVolumes)) e.setUserVolume(uid, 1);
+      if (s.userVolumes !== prev.userVolumes || s.userMuted !== prev.userMuted) {
+        const uids = new Set([...Object.keys(prev.userVolumes), ...Object.keys(s.userVolumes), ...Object.keys(prev.userMuted), ...Object.keys(s.userMuted)]);
+        for (const uid of uids) {
+          const before = prev.userMuted[uid] ? 0 : prev.userVolumes[uid] ?? 1;
+          const after = s.userMuted[uid] ? 0 : s.userVolumes[uid] ?? 1;
+          if (before !== after) e.setUserVolume(uid, after);
+        }
       }
     });
 

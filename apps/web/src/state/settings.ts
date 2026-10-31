@@ -270,8 +270,10 @@ export interface AudioSettings {
   /** Automatic retains the default gate; manual uses vadThreshold in dBFS. */
   automaticSensitivity: boolean;
   vadThreshold: number;
-  /** KeyboardEvent.code of the push-to-talk key. */
+  /** Physical KeyboardEvent.code or Mouse3/Mouse4/Mouse5; old key codes are preserved verbatim. */
   pttKey: string | null;
+  /** Release tail in milliseconds, 0..1000. */
+  pttReleaseDelay: number;
   noiseSuppression: boolean;
   /** How hard noise suppression works, 10..100 (percent; below 100 it caps the cut at half a dB per percent). */
   noiseStrength: number;
@@ -331,6 +333,8 @@ export interface SettingsState extends QualitySettings {
   setShareAudio(share: string, patch: Partial<ShareAudioSettings>): void;
   /** Per-user playback volume 0..2 keyed by uid. */
   userVolumes: Record<string, number>;
+  /** Local mute by stable uid; the separate volume survives muting. */
+  userMuted: Record<string, true>;
   bookmarks: Bookmark[];
   /** Bookmarks removed on this device, by id; see {@link BOOKMARK_TOMBSTONE_MS}. */
   removedBookmarks: Record<string, BookmarkRemoval>;
@@ -370,6 +374,7 @@ export interface SettingsState extends QualitySettings {
   setSounds(patch: Partial<Omit<SoundSettings, "events">>): void;
   setSoundEvent(cue: SoundCue, enabled: boolean): void;
   setUserVolume(uid: string, volume: number): void;
+  setUserMuted(uid: string, muted: boolean): void;
   saveBookmark(bookmark: BookmarkInput): void;
   removeBookmark(id: string): void;
   /** The list after a sync with Gwar Connect; not counted as an edit. */
@@ -406,6 +411,7 @@ export const defaultAudio: AudioSettings = {
   automaticSensitivity: true,
   vadThreshold: DEFAULT_INPUT_DB,
   pttKey: null,
+  pttReleaseDelay: 300,
   noiseSuppression: true,
   noiseStrength: 100,
   echoCancellation: true,
@@ -422,6 +428,7 @@ export function validAudio(value: unknown): AudioSettings {
     ...defaultAudio, ...audio,
     automaticSensitivity: typeof audio.automaticSensitivity === "boolean" ? audio.automaticSensitivity : true,
     vadThreshold: inputThreshold(audio.vadThreshold),
+    pttReleaseDelay: typeof audio.pttReleaseDelay === "number" && Number.isFinite(audio.pttReleaseDelay) ? Math.min(1000, Math.max(0, Math.round(audio.pttReleaseDelay))) : 300,
   };
 }
 
@@ -453,6 +460,7 @@ export const useSettings = create<SettingsState>()(
       }),
       sounds: defaultSounds,
       userVolumes: {},
+      userMuted: {},
       bookmarks: [],
       removedBookmarks: {},
       bookmarkAccount: null,
@@ -488,6 +496,12 @@ export const useSettings = create<SettingsState>()(
           else userVolumes[uid] = volume;
           return { userVolumes };
         }),
+      setUserMuted: (uid, muted) => set((s) => {
+        const userMuted = { ...s.userMuted };
+        if (muted) userMuted[uid] = true;
+        else delete userMuted[uid];
+        return { userMuted };
+      }),
       saveBookmark: (input) =>
         set((s) => {
           // Saving a server that is already saved updates that bookmark, in its place.
@@ -600,7 +614,12 @@ export const useSettings = create<SettingsState>()(
         // v6 adds device-local cues without discarding any earlier preferences.
         if (version < 6) p = { ...p, sounds: readSounds(p.sounds) };
         if (version < 7) p = { ...p, desktop: { ...defaultDesktop, ...(p.desktop as object ?? {}) }, notificationOverrides: readNotificationOverrides(p.notificationOverrides) };
-        return version < 8 ? { ...p, shareAudio: readShareAudio(p.shareAudio) } : p;
+        // v8 adds the release delay; key codes and every other setting stay intact.
+        if (version < 8) p = { ...p, audio: validAudio(p.audio) };
+        // v9 adds local mute without changing retained person volumes or other preferences.
+        if (version < 9) p = { userMuted: {}, ...p };
+        // v10 follows desktop v7, PTT v8 and local person mute v9.
+        return version < 10 ? { ...p, shareAudio: readShareAudio(p.shareAudio) } : p;
       },
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
@@ -609,6 +628,7 @@ export const useSettings = create<SettingsState>()(
           notificationOverrides: readNotificationOverrides(p.notificationOverrides),
           sounds: readSounds(p.sounds),
           shareAudio: readShareAudio(p.shareAudio),
+          userMuted: p.userMuted && typeof p.userMuted === "object" && !Array.isArray(p.userMuted) ? Object.fromEntries(Object.entries(p.userMuted).filter(([, v]) => v === true)) : {},
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,
           serverGroups: validGroups(p.serverGroups),

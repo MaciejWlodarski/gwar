@@ -8,6 +8,7 @@ import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRe
 import { countKey, useLanguage, useT, type TFn } from "../i18n";
 import { cn } from "../lib/cn";
 import { memberName } from "../lib/member-name";
+import { parseSpacer } from "../lib/spacer";
 import { buildRows, messageTarget, sealedThread, type Row } from "../lib/chat";
 import { useIsMobile } from "../lib/media";
 import { checkUpload, formatBytes } from "../lib/files";
@@ -26,7 +27,7 @@ import { useChannelPermission, useRoster, useUidColor } from "./hooks";
 import { useMembersPanel } from "./members";
 import { paneBack } from "./nav";
 import { useMentionAutocomplete } from "./MentionInput";
-import { DeafenButton, MicButton } from "./VoicePanel";
+import { AudioDeviceButton, DeafenButton, MicButton } from "./VoicePanel";
 import { Avatar, BackButton, Button, EmptyState, IconButton, panelCard, Spinner, Tooltip } from "./kit";
 
 // -------------------------------------------------------------------- text
@@ -1073,9 +1074,16 @@ function ChatHeader() {
   const phase = useSession((s) => s.phase);
   const viewChannel = useSession((s) => s.viewChannel);
   const channel = useSession((s) => (s.viewChannel === null ? undefined : s.channels[s.viewChannel]));
+  const spacer = useSession(s => {
+    const channel = s.viewChannel === null ? undefined : s.channels[s.viewChannel];
+    return s.kind !== "gwar" && !!channel && !!parseSpacer(channel.name, channel.parent === null || !s.channels[channel.parent]);
+  });
   // People talking in the channel whose chat is open.
   const userCount = useSession((s) => Object.values(s.clients).filter((c) => c.channel !== null && c.channel === s.viewChannel).length);
-  const inVoice = useSession((s) => myChannelId(s) !== null);
+  const myChannel = useSession(myChannelId);
+  const inVoice = myChannel !== null;
+  const canJoin = useChannelPermission(viewChannel, "connect");
+  const joining = useUi(s => s.joining === viewChannel);
   const members = useMembersPanel();
   const sealed = useSession(s => { const key = storedKey(s, active); return sealedThread(key, s.kind, s.channels, s.server?.server_chat) ? key as StoredThreadKey : null; });
   const encrypted = !!sealed;
@@ -1100,50 +1108,56 @@ function ChatHeader() {
     if (encrypted) icon = <Lock className="size-5 text-subtle" />;
   }
 
+  const joinButton = active === "channel" && channel && !spacer && myChannel !== channel.id && canJoin && phase === "online" ? <Button size="sm" busy={joining} onClick={() => void controller.joinChannelInteractive(channel.id)}><Headphones className="size-4" /><span>{t("tree.joinVoice")}</span></Button> : null;
   return (
-    <header data-testid="chat-header" className="@container flex h-12 shrink-0 items-center gap-2 border-b border-line px-3 md:px-4">
-      {isMobile && <BackButton label={t("nav.toChannels")} entry onClick={() => paneBack("list")} />}
-      {icon}
-      <div className="min-w-0 flex-1">
-        <h2 className="truncate text-[15px] leading-tight font-semibold">{title}</h2>
-        <p className="truncate text-xs leading-tight text-muted" title={sub}>
-          {sub}
-        </p>
-      </div>
-      {active === "channel" && onGwar && !encrypted && (
-        <span className="hidden shrink-0 text-xs text-subtle @3xl:inline">{t("chat.notEncrypted")}</span>
-      )}
-      {sealed && (
-        <Tooltip label={t("chat.messagesEncrypted")}>
-          <button type="button" aria-label={t("channel.readers")} onClick={() => useUi.getState().openDialog({ kind: "readers", thread: sealed })}
-            className="t flex shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted hover:bg-hover hover:text-fg">
-            <Lock className="size-3.5" /> <span className="hidden sm:inline">{t("channel.readers")}</span>
-          </button>
-        </Tooltip>
-      )}
-      {active === "channel" && onGwar && channel?.encrypted && viewChannel !== null && (
-        <button type="button" aria-label={t("channel.hearers")} onClick={() => useUi.getState().openDialog({ kind: "hearers", channel: viewChannel })}
-          className="t flex shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted hover:bg-hover hover:text-fg">
-          <Headphones className="size-3.5" /> <span className="hidden sm:inline">{t("channel.hearers")}</span>
-        </button>
-      )}
-      {active === "channel" && userCount > 0 && (
-        <span className="hidden shrink-0 text-xs text-subtle @xl:inline">{t(countKey(lang, "chat.users", userCount), { count: userCount })}</span>
-      )}
-      {isMobile && phase !== "idle" && inVoice && (
-        <div className="flex items-center gap-1">
-          <MicButton size="md" />
-          <DeafenButton size="md" />
+    <header data-testid="chat-header" className="@container shrink-0 border-b border-line">
+      <div className="flex h-12 items-center gap-2 px-3 md:px-4">
+        {isMobile && <BackButton label={t("nav.toChannels")} entry onClick={() => paneBack("list")} />}
+        {icon}
+        <div className="min-w-0 flex-1">
+          <h2 className="truncate text-[15px] leading-tight font-semibold">{title}</h2>
+          <p className="truncate text-xs leading-tight text-muted" title={sub}>
+            {sub}
+          </p>
         </div>
-      )}
-      <IconButton
-        label={t("chat.members")}
-        active={members.open}
-        onClick={members.toggle}
-        className={cn(members.open && !members.isMobile && "bg-active text-fg")}
-      >
-        <Users className="size-[18px]" />
-      </IconButton>
+        {active === "channel" && onGwar && !encrypted && (
+          <span className="hidden shrink-0 text-xs text-subtle @3xl:inline">{t("chat.notEncrypted")}</span>
+        )}
+        {sealed && (
+          <Tooltip label={t("chat.messagesEncrypted")}>
+            <button type="button" aria-label={t("channel.readers")} onClick={() => useUi.getState().openDialog({ kind: "readers", thread: sealed })}
+              className="t flex shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted hover:bg-hover hover:text-fg">
+              <Lock className="size-3.5" /> <span className="hidden sm:inline">{t("channel.readers")}</span>
+            </button>
+          </Tooltip>
+        )}
+        {active === "channel" && onGwar && channel?.encrypted && viewChannel !== null && (
+          <button type="button" aria-label={t("channel.hearers")} onClick={() => useUi.getState().openDialog({ kind: "hearers", channel: viewChannel })}
+            className="t flex shrink-0 cursor-pointer items-center gap-1 rounded-md px-1.5 py-1 text-xs text-muted hover:bg-hover hover:text-fg">
+            <Headphones className="size-3.5" /> <span className="hidden sm:inline">{t("channel.hearers")}</span>
+          </button>
+        )}
+        {active === "channel" && userCount > 0 && (
+          <span className="hidden shrink-0 text-xs text-subtle @xl:inline">{t(countKey(lang, "chat.users", userCount), { count: userCount })}</span>
+        )}
+        {!isMobile && joinButton}
+        {isMobile && phase !== "idle" && inVoice && (
+          <div className="flex items-center gap-1">
+            <MicButton size="md" />
+            <DeafenButton size="md" />
+            <AudioDeviceButton size="md" />
+          </div>
+        )}
+        <IconButton
+          label={t("chat.members")}
+          active={members.open}
+          onClick={members.toggle}
+          className={cn(members.open && !members.isMobile && "bg-active text-fg")}
+        >
+          <Users className="size-[18px]" />
+        </IconButton>
+      </div>
+      {isMobile && joinButton && <div className="flex items-center justify-between gap-2 border-t border-line px-3 py-1.5"><span className="min-w-0 truncate text-xs text-muted">{title}</span>{joinButton}</div>}
     </header>
   );
 }

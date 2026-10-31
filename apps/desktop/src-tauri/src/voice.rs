@@ -66,6 +66,7 @@ struct Prefs {
     muted: bool,
     deafened: bool,
     ptt: bool,
+    ptt_release_ms: u64,
     echo: bool,
     gain: bool,
     noise: NoiseSuppression,
@@ -78,6 +79,7 @@ impl Prefs {
         handle.set_input_mode(self.mode);
         handle.set_muted(self.muted);
         handle.set_deafened(self.deafened);
+        handle.set_ptt_release_delay(self.ptt_release_ms);
         handle.set_ptt(self.ptt);
         handle.set_capture_processing(self.echo, self.gain);
         handle.set_noise_suppression(self.noise);
@@ -88,10 +90,19 @@ impl Prefs {
     }
 }
 
+#[derive(Default)]
+struct GlobalPttAuthorization {
+    owner: u64,
+    run: u64,
+    armed: bool,
+}
+
 struct Inner {
     owner: u64,
+    global_ptt_authorization: GlobalPttAuthorization,
     startup: Option<Arc<NativeRun>>,
     mic_test: Option<Arc<NativeRun>>,
+    mic_input: Option<Arc<MicInput>>,
     mic_test_serial: u64,
     gate_serial: u64,
     gate_ready: bool,
@@ -112,6 +123,7 @@ pub struct Voice {
     inner: Mutex<Inner>,
     /// Id of the active `voice_start`; zero after retirement.
     run: AtomicU64,
+    global_ptt: AtomicBool,
     /// What the fake speaker heard (only with `GWAR_FAKE_AUDIO`).
     pub heard: Arc<Heard>,
 }
@@ -123,8 +135,10 @@ impl Default for Voice {
             cue_deafened: Arc::default(),
             inner: Mutex::new(Inner {
                 owner: 0,
+                global_ptt_authorization: GlobalPttAuthorization::default(),
                 startup: None,
                 mic_test: None,
+                mic_input: None,
                 mic_test_serial: 0,
                 gate_serial: 0,
                 gate_ready: true,
@@ -135,6 +149,7 @@ impl Default for Voice {
                     muted: false,
                     deafened: false,
                     ptt: false,
+                    ptt_release_ms: 300,
                     // Until the settings say otherwise (they default to all on, at full strength).
                     echo: true,
                     gain: true,
@@ -151,6 +166,7 @@ impl Default for Voice {
                 pending_cues: Vec::with_capacity(2),
             }),
             run: AtomicU64::new(0),
+            global_ptt: AtomicBool::new(false),
             heard: Arc::default(),
         }
     }
@@ -168,6 +184,65 @@ impl Voice {
         if let Some(h) = &inner.handle {
             h.set_ptt(down);
         }
+    }
+
+    pub fn configure_global_ptt(&self, configured: bool) {
+        let mut inner = self.lock();
+        self.global_ptt.store(configured, Ordering::Release);
+        inner.global_ptt_authorization =
+            GlobalPttAuthorization { owner: inner.owner, run: self.run.load(Ordering::SeqCst), armed: false };
+        inner.prefs.ptt = false;
+        if let Some(h) = &inner.handle {
+            h.cancel_ptt();
+        }
+    }
+
+    /// A held observation authorizes only its original native owner/run. A refusal
+    /// makes the observer retire its backend and require a physical release again.
+    pub fn renew_global_ptt(&self, down: bool) -> bool {
+        let mut inner = self.lock();
+        let run = self.run.load(Ordering::SeqCst);
+        if inner.global_ptt_authorization.owner != inner.owner || inner.global_ptt_authorization.run != run {
+            inner.global_ptt_authorization = GlobalPttAuthorization { owner: inner.owner, run, armed: false };
+            if let Some(h) = &inner.handle {
+                h.cancel_ptt();
+            }
+            return false;
+        }
+        if !down {
+            inner.global_ptt_authorization.armed = true;
+        }
+        if !inner.global_ptt_authorization.armed {
+            if let Some(h) = &inner.handle {
+                h.cancel_ptt();
+            }
+            return false;
+        }
+        if let Some(h) = &inner.handle {
+            h.set_ptt_leased(down);
+        }
+        true
+    }
+
+    pub fn cancel_global_ptt(&self) {
+        let mut inner = self.lock();
+        inner.global_ptt_authorization.armed = false;
+        if let Some(h) = &inner.handle {
+            h.cancel_ptt();
+        }
+    }
+
+    fn window_ptt(&self, owner: u64, active: bool) -> Result<(), String> {
+        let mut inner = self.lock();
+        check_owner(&inner, owner)?;
+        if self.global_ptt.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        inner.prefs.ptt = active;
+        if let Some(h) = &inner.handle {
+            h.set_ptt(active);
+        }
+        Ok(())
     }
 
     /// Diagnostics for the debug command and log lines.
@@ -217,11 +292,12 @@ pub struct Snapshot {
 struct NativeRun {
     cancelled: watch::Sender<bool>,
     audio: Mutex<Option<Box<dyn Send>>>,
+    silence: Arc<AtomicBool>,
 }
 
 impl NativeRun {
     fn new() -> Arc<Self> {
-        Arc::new(Self { cancelled: watch::channel(false).0, audio: Mutex::new(None) })
+        Arc::new(Self { cancelled: watch::channel(false).0, audio: Mutex::new(None), silence: Arc::default() })
     }
 
     fn check(&self) -> Result<(), String> {
@@ -231,7 +307,13 @@ impl NativeRun {
     fn retire(&self) {
         let mut audio = self.audio.lock().unwrap_or_else(|e| e.into_inner());
         self.cancelled.send_replace(true);
+        self.silence.store(true, Ordering::SeqCst);
         *audio = None;
+    }
+
+    /// Release capture before local sample playback, retaining its cancellation scope.
+    fn close_capture(&self) {
+        *self.audio.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     async fn until_retired<T>(&self, future: impl Future<Output = Result<T, String>>) -> Result<T, String> {
@@ -473,6 +555,8 @@ fn starting_voice_retires_idle_cues_and_bootstrap_discards_pending_cues() {
 }
 
 fn clear_run(voice: &Voice, inner: &mut Inner) {
+    inner.global_ptt_authorization.armed = false;
+    inner.prefs.ptt = false;
     retire_idle_cues(inner);
     inner.pending_cues.clear();
     if let Some(startup) = inner.startup.take() {
@@ -966,11 +1050,22 @@ pub fn voice_set_deafened(
 #[tauri::command]
 pub fn voice_set_ptt(window: WebviewWindow, voice: State<'_, Voice>, owner: u64, active: bool) -> Result<(), String> {
     check_main_window(window.label())?;
+    voice.window_ptt(owner, active)
+}
+
+#[tauri::command]
+pub fn voice_set_ptt_release_delay(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    ms: u64,
+) -> Result<(), String> {
+    check_main_window(window.label())?;
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
-    inner.prefs.ptt = active;
+    inner.prefs.ptt_release_ms = ms.min(1000);
     if let Some(h) = &inner.handle {
-        h.set_ptt(active);
+        h.set_ptt_release_delay(ms);
     }
     Ok(())
 }
@@ -1155,6 +1250,83 @@ struct TestLevel {
     db: f32,
 }
 
+#[derive(Clone, Serialize)]
+struct TestState {
+    owner: u64,
+    test: u64,
+    state: &'static str,
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_kind: Option<&'static str>,
+}
+
+const MIC_SAMPLE_LEN: usize = 3 * 48_000;
+const MIC_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const MIC_SHUTDOWN_PENDING: &str = "microphone_shutdown_pending";
+
+type MicShutdown = Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// None means acquisition is still in progress; retain the eventual device acknowledgement.
+#[derive(Default)]
+struct MicInput {
+    shutdown: Mutex<Option<MicShutdown>>,
+}
+
+impl MicInput {
+    fn stopped(&self) -> bool {
+        self.shutdown.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|stopped| stopped())
+    }
+}
+
+struct MicOpen {
+    input: Arc<MicInput>,
+    shutdown: MicShutdown,
+}
+
+impl Drop for MicOpen {
+    fn drop(&mut self) {
+        *self.input.shutdown.lock().unwrap_or_else(|e| e.into_inner()) = Some(self.shutdown.clone());
+    }
+}
+
+fn check_mic_shutdown(inner: &Inner) -> Result<(), String> {
+    if inner.mic_input.as_ref().is_some_and(|input| !input.stopped()) {
+        return Err(MIC_SHUTDOWN_PENDING.into());
+    }
+    Ok(())
+}
+
+fn open_mic_input(
+    voice: &Voice,
+    owner: u64,
+    test: &Arc<NativeRun>,
+    io: Box<dyn AudioIo>,
+    shutdown: MicShutdown,
+) -> Result<AudioPorts, String> {
+    let input = {
+        let mut inner = voice.lock();
+        check_owner(&inner, owner)?;
+        test.check()?;
+        check_mic_shutdown(&inner)?;
+        let input = Arc::new(MicInput::default());
+        inner.mic_input = Some(input.clone());
+        input
+    };
+    let _opening = MicOpen { input, shutdown };
+    Box::new(RunIo { run: test.clone(), io }).open().map_err(|e| format!("{e:#}"))
+}
+
+fn finish_sample_capture(test: &NativeRun, wait: impl FnOnce() -> Result<(), String>) -> Result<(), String> {
+    test.close_capture();
+    wait()?;
+    test.check()
+}
+
+fn append_mic_sample(samples: &mut Vec<f32>, frame: &[f32]) {
+    let take = frame.len().min(MIC_SAMPLE_LEN.saturating_sub(samples.len()));
+    samples.extend_from_slice(&frame[..take]);
+}
+
 fn claim_mic_test(voice: &Voice, owner: u64, id: u64) -> Result<Arc<NativeRun>, String> {
     let mut inner = voice.lock();
     check_owner(&inner, owner)?;
@@ -1171,6 +1343,7 @@ fn claim_mic_test(voice: &Voice, owner: u64, id: u64) -> Result<Arc<NativeRun>, 
     if let Some(test) = inner.mic_test.take() {
         test.retire();
     }
+    check_mic_shutdown(&inner)?;
     let test = NativeRun::new();
     inner.mic_test = Some(test.clone());
     Ok(test)
@@ -1200,6 +1373,7 @@ pub async fn mic_test_start(
     owner: u64,
     input: Option<String>,
     test: u64,
+    playback: Option<bool>,
 ) -> Result<(), String> {
     check_main_window(window.label())?;
     if !window.is_visible().unwrap_or(false) || !window.is_focused().unwrap_or(false) {
@@ -1208,17 +1382,32 @@ pub async fn mic_test_start(
     let app = window.app_handle().clone();
     let id = test;
     let test = claim_mic_test(&voice, owner, id)?;
-    let io = Box::new(RunIo { run: test.clone(), io: make_io(&voice, input, None, issue_sink(&app, owner), true).0 });
+    let (io, devices) = make_io(&voice, input, None, issue_sink(&app, owner), true);
+    let shutdown = devices.clone();
+    let shutdown: MicShutdown = Arc::new(move || shutdown.as_ref().is_none_or(DeviceControl::is_stopped));
+    let opening_app = app.clone();
+    let opening_test = test.clone();
     // Wait for a cancelled open to finish releasing its ports before voice can acquire capture.
-    let ports = tokio::task::spawn_blocking(move || io.open())
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| format!("{e:#}"))?;
+    let ports = tokio::task::spawn_blocking(move || {
+        open_mic_input(&opening_app.state::<Voice>(), owner, &opening_test, io, shutdown)
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     test.check()?;
     thread::Builder::new()
         .name("gwar-mic-test".into())
         .spawn(move || {
             let AudioPorts { mut mic, speaker: _speaker, _guard, .. } = ports;
+            let playback = playback.unwrap_or(false);
+            let mut samples = Vec::new();
+            let started = Instant::now();
+            if playback {
+                samples.reserve(MIC_SAMPLE_LEN);
+                let _ = app.emit(
+                    "voice://test-state",
+                    TestState { owner, test: id, state: "recording", error: None, error_kind: None },
+                );
+            }
             let mut processor = MicrophoneProcessor::default();
             let mut frame = [0.0; gwar_client::voice::FRAME];
             let mut filled = 0;
@@ -1241,16 +1430,82 @@ pub async fn mic_test_start(
                     next = Some(s.position + 1);
                     if filled == frame.len() {
                         processor.process(&mut frame, echo, gain, noise, continuous, 0);
+                        if playback {
+                            append_mic_sample(&mut samples, &frame);
+                        }
                         continuous = true;
                         let power = frame.iter().map(|sample| sample * sample).sum::<f32>() / frame.len() as f32;
                         latest = Some(10.0 * power.max(1e-10).log10());
                         filled = 0;
+                        if playback && (samples.len() == MIC_SAMPLE_LEN || started.elapsed() >= Duration::from_secs(4))
+                        {
+                            break;
+                        }
                     }
                 }
                 if let Some(db) = latest {
                     let _ = app.emit("voice://test-level", TestLevel { owner, test: id, db });
                 }
+                if playback && (samples.len() == MIC_SAMPLE_LEN || started.elapsed() >= Duration::from_secs(4)) {
+                    break;
+                }
                 thread::sleep(Duration::from_millis(50));
+            }
+            // A dropped guard only queues Stop. A sample must wait for actual stream destruction.
+            if playback && test.check().is_ok() {
+                let _ = app.emit(
+                    "voice://test-state",
+                    TestState { owner, test: id, state: "preparing", error: None, error_kind: None },
+                );
+            }
+            let closed = finish_sample_capture(&test, || {
+                drop(_guard);
+                devices
+                    .as_ref()
+                    .map_or(Ok(()), |devices| devices.stop_and_wait(MIC_SHUTDOWN_TIMEOUT).map_err(|e| format!("{e:#}")))
+            });
+            if let Err(error) = closed {
+                if playback && test.check().is_ok() {
+                    let _ = app.emit(
+                        "voice://test-state",
+                        TestState {
+                            owner,
+                            test: id,
+                            state: "idle",
+                            error: Some(error),
+                            error_kind: Some("capture_shutdown"),
+                        },
+                    );
+                }
+                return;
+            }
+            if playback && test.check().is_ok() {
+                let _ = app.emit("voice://test-level", TestLevel { owner, test: id, db: -100.0 });
+                let voice = app.state::<Voice>();
+                let (output, gain) = {
+                    let inner = voice.lock();
+                    (inner.prefs.output.clone(), inner.prefs.master)
+                };
+                for sample in &mut samples {
+                    *sample *= gain;
+                }
+                let _ = app.emit(
+                    "voice://test-state",
+                    TestState { owner, test: id, state: "playing", error: None, error_kind: None },
+                );
+                let result = gwar_client::voice::io::play_sample(output, samples, test.silence.clone());
+                if test.check().is_ok() {
+                    let _ = app.emit(
+                        "voice://test-state",
+                        TestState {
+                            owner,
+                            test: id,
+                            state: "idle",
+                            error: result.err().map(|e| format!("{e:#}")),
+                            error_kind: None,
+                        },
+                    );
+                }
             }
         })
         .map_err(|e| e.to_string())?;
@@ -1309,6 +1564,254 @@ mod run_tests {
         sync::atomic::{AtomicBool, AtomicUsize},
         task::Poll,
     };
+
+    #[tokio::test]
+    async fn global_ptt_held_presses_do_not_cross_voice_runs_or_owners() {
+        async fn install(
+            voice: &Voice,
+            owner: u64,
+            run: u64,
+        ) -> (
+            tokio::sync::mpsc::Sender<gwar_client::teamspeak::TsAudio>,
+            tokio::sync::mpsc::Receiver<gwar_client::teamspeak::TsMicrophone>,
+        ) {
+            claim_run(voice, owner, run).unwrap();
+            let (incoming, receive) = tokio::sync::mpsc::channel(64);
+            let (send, outgoing) = tokio::sync::mpsc::channel(64);
+            let handle = start_teamspeak(Box::new(FakeIo { tone: true, heard: voice.heard.clone() }), receive, send)
+                .await
+                .unwrap();
+            let mut inner = voice.lock();
+            inner.prefs.mode = InputMode::PushToTalk;
+            inner.prefs.noise = NoiseSuppression::percent(0);
+            inner.prefs.echo = false;
+            inner.prefs.gain = false;
+            inner.prefs.apply(&handle);
+            inner.handle = Some(handle);
+            (incoming, outgoing)
+        }
+        for replacement in ["switch", "rejoin", "owner"] {
+            let voice = Voice::default();
+            let owner = bootstrap_owner(&voice);
+            let (_incoming, mut outgoing) = install(&voice, owner, 1).await;
+            voice.configure_global_ptt(true);
+            voice.renew_global_ptt(false);
+            voice.renew_global_ptt(true);
+            assert!(tokio::time::timeout(Duration::from_secs(1), outgoing.recv()).await.unwrap().is_some());
+            let next_owner = if replacement == "owner" { bootstrap_owner(&voice) } else { owner };
+            if replacement == "rejoin" {
+                retire_run(&voice, owner, 1).unwrap();
+            }
+            let (_next_incoming, mut next_outgoing) =
+                install(&voice, next_owner, if next_owner == owner { 2 } else { 1 }).await;
+            for _ in 0..6 {
+                voice.renew_global_ptt(true); // the observer still sees the original held press
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                assert!(next_outgoing.try_recv().is_err(), "held PTT crossed {replacement}");
+            }
+            voice.renew_global_ptt(false); // a real release followed by a new press
+            voice.renew_global_ptt(true);
+            assert!(tokio::time::timeout(Duration::from_secs(1), next_outgoing.recv()).await.unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn recorded_sample_closes_capture_before_playback_and_window_pause_silences_it() {
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        voice.configure_global_ptt(true);
+        assert!(voice.renew_global_ptt(false));
+        assert!(voice.renew_global_ptt(true));
+        let test = claim_mic_test(&voice, owner, 1).unwrap();
+        let closed = Arc::new(AtomicBool::new(false));
+        *test.audio.lock().unwrap() = Some(Box::new(Closed(closed.clone())));
+        test.close_capture();
+        assert!(voice.renew_global_ptt(true));
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(test.check().is_ok());
+        assert!(!test.silence.load(Ordering::SeqCst));
+        pause_mic_test(&voice);
+        assert!(test.silence.load(Ordering::SeqCst));
+        assert!(test.check().is_err());
+    }
+
+    #[test]
+    fn sample_playback_requires_acknowledged_capture_shutdown_and_current_ownership() {
+        let test = NativeRun::new();
+        let closed = Arc::new(AtomicBool::new(false));
+        *test.audio.lock().unwrap() = Some(Box::new(Closed(closed.clone())));
+        let mut played = false;
+        let result = finish_sample_capture(&test, || {
+            assert!(closed.load(Ordering::SeqCst), "Stop must be requested before waiting");
+            Err("microphone device shutdown timed out".into())
+        })
+        .map(|()| {
+            played = true;
+        });
+        assert!(result.unwrap_err().contains("shutdown timed out"));
+        assert!(!played);
+        // Cancellation while the device thread is stopping also forbids playback.
+        let result = finish_sample_capture(&test, || {
+            test.retire();
+            Ok(())
+        })
+        .map(|()| {
+            played = true;
+        });
+        assert!(result.is_err());
+        assert!(!played);
+    }
+
+    #[test]
+    fn mic_retry_cannot_overlap_delayed_input_destruction_even_after_owner_replacement() {
+        for replace_owner in [false, true] {
+            let voice = Voice::default();
+            let owner = bootstrap_owner(&voice);
+            let opened = Arc::new(AtomicUsize::new(0));
+            voice.configure_global_ptt(true);
+            assert!(voice.renew_global_ptt(false));
+            assert!(voice.renew_global_ptt(true));
+            let closed = Arc::new(AtomicBool::new(false));
+            let (stop, stopping) = std::sync::mpsc::channel();
+            let (entered, destroying) = std::sync::mpsc::channel();
+            let (release, held) = std::sync::mpsc::channel();
+            let ended = closed.clone();
+            let device = thread::spawn(move || {
+                stopping.recv_timeout(Duration::from_secs(2)).unwrap();
+                entered.send(()).unwrap();
+                held.recv_timeout(Duration::from_secs(2)).unwrap();
+                ended.store(true, Ordering::SeqCst);
+            });
+            struct QueuedStop(std::sync::mpsc::Sender<()>);
+            impl Drop for QueuedStop {
+                fn drop(&mut self) {
+                    let _ = self.0.send(());
+                }
+            }
+            struct InputIo {
+                opened: Arc<AtomicUsize>,
+                guard: Option<Box<dyn Send>>,
+            }
+            impl AudioIo for InputIo {
+                fn open(mut self: Box<Self>) -> anyhow::Result<AudioPorts> {
+                    self.opened.fetch_add(1, Ordering::SeqCst);
+                    let mut ports = Box::new(NullIo).open()?;
+                    ports._guard = self.guard.take().unwrap_or_else(|| Box::new(()));
+                    Ok(ports)
+                }
+            }
+            let first = claim_mic_test(&voice, owner, 1).unwrap();
+            let observed = closed.clone();
+            let ports = open_mic_input(
+                &voice,
+                owner,
+                &first,
+                Box::new(InputIo { opened: opened.clone(), guard: Some(Box::new(QueuedStop(stop))) }),
+                Arc::new(move || observed.load(Ordering::SeqCst)),
+            )
+            .unwrap();
+            // The passive observer may keep renewing a held key throughout the test.
+            assert!(voice.renew_global_ptt(true));
+            assert!(voice.lock().handle.is_none());
+            // A capture timeout has released only the queueing guard, not the real stream.
+            assert!(finish_sample_capture(&first, || Err("shutdown timed out".into())).is_err());
+            destroying.recv_timeout(Duration::from_secs(1)).unwrap();
+            drop(ports);
+            retire_mic_test(&voice, owner, Some(1)).unwrap();
+            let owner = if replace_owner { bootstrap_owner(&voice) } else { owner };
+            voice.renew_global_ptt(true);
+            let retry = claim_mic_test(&voice, owner, 2).and_then(|retry| {
+                open_mic_input(
+                    &voice,
+                    owner,
+                    &retry,
+                    Box::new(InputIo { opened: opened.clone(), guard: None }),
+                    Arc::new(|| true),
+                )
+            });
+            let before_ack = opened.load(Ordering::SeqCst);
+            release.send(()).unwrap();
+            device.join().unwrap();
+            assert!(
+                matches!(retry, Err(ref error) if error == MIC_SHUTDOWN_PENDING),
+                "retry opened before destruction acknowledgement"
+            );
+            assert_eq!(before_ack, 1, "the old input overlapped a new input");
+            voice.renew_global_ptt(true);
+            let retry = claim_mic_test(&voice, owner, 3).unwrap();
+            open_mic_input(
+                &voice,
+                owner,
+                &retry,
+                Box::new(InputIo { opened: opened.clone(), guard: None }),
+                Arc::new(|| true),
+            )
+            .unwrap();
+            assert_eq!(opened.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[test]
+    fn mic_retry_waits_for_a_cancelled_acquisition_to_finish_releasing_input() {
+        let voice = Arc::new(Voice::default());
+        let owner = bootstrap_owner(&voice);
+        let first = claim_mic_test(&voice, owner, 1).unwrap();
+        let opened = Arc::new(AtomicUsize::new(0));
+        let closed = Arc::new(AtomicBool::new(false));
+        let (entered, acquiring) = oneshot::channel();
+        let (release, held) = std::sync::mpsc::channel();
+        let io = TrackedIo { opened: opened.clone(), closed: closed.clone(), gate: Some((entered, held)) };
+        let opening_voice = voice.clone();
+        let observed = closed.clone();
+        let opening = thread::spawn(move || {
+            open_mic_input(
+                &opening_voice,
+                owner,
+                &first,
+                Box::new(io),
+                Arc::new(move || observed.load(Ordering::SeqCst)),
+            )
+        });
+        acquiring.blocking_recv().unwrap();
+        retire_mic_test(&voice, owner, Some(1)).unwrap();
+        let refused = claim_mic_test(&voice, owner, 2);
+        release.send(()).unwrap();
+        assert!(opening.join().unwrap().is_err());
+        assert!(matches!(refused, Err(ref error) if error == MIC_SHUTDOWN_PENDING));
+        assert!(closed.load(Ordering::SeqCst));
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+        let retry = claim_mic_test(&voice, owner, 3).unwrap();
+        open_mic_input(&voice, owner, &retry, Box::new(NullIo), Arc::new(|| true)).unwrap();
+    }
+
+    #[test]
+    fn failed_mic_acquisition_does_not_permanently_block_retry() {
+        struct FailedIo;
+        impl AudioIo for FailedIo {
+            fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
+                anyhow::bail!("device did not open")
+            }
+        }
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        let first = claim_mic_test(&voice, owner, 1).unwrap();
+        assert!(open_mic_input(&voice, owner, &first, Box::new(FailedIo), Arc::new(|| true)).is_err());
+        retire_mic_test(&voice, owner, Some(1)).unwrap();
+        let retry = claim_mic_test(&voice, owner, 2).unwrap();
+        open_mic_input(&voice, owner, &retry, Box::new(NullIo), Arc::new(|| true)).unwrap();
+    }
+
+    #[test]
+    fn microphone_sample_keeps_processed_pcm_and_is_bounded_to_three_seconds() {
+        let mut samples = Vec::new();
+        append_mic_sample(&mut samples, &[0.25, -0.5]);
+        assert_eq!(samples, [0.25, -0.5]);
+        append_mic_sample(&mut samples, &vec![0.125; MIC_SAMPLE_LEN]);
+        assert_eq!(samples.len(), MIC_SAMPLE_LEN);
+        append_mic_sample(&mut samples, &[1.0; 480]);
+        assert_eq!(samples.len(), MIC_SAMPLE_LEN);
+        assert_eq!(samples[MIC_SAMPLE_LEN - 1], 0.125);
+    }
 
     #[test]
     fn preview_releases_its_device_on_window_pause_and_refuses_muted_capture() {
@@ -1382,6 +1885,21 @@ mod run_tests {
             io: Box::new(TrackedIo { opened: opened.clone(), closed: closed.clone(), gate: None }),
         });
         (io, opened, closed)
+    }
+
+    #[test]
+    fn window_events_cannot_bypass_global_permission_or_replay_a_stale_press() {
+        let voice = Voice::default();
+        let owner = bootstrap_owner(&voice);
+        voice.window_ptt(owner, true).unwrap();
+        assert!(voice.lock().prefs.ptt);
+        voice.configure_global_ptt(true);
+        assert!(!voice.lock().prefs.ptt);
+        voice.window_ptt(owner, true).unwrap();
+        assert!(!voice.lock().prefs.ptt);
+        voice.configure_global_ptt(false);
+        assert!(!voice.lock().prefs.ptt);
+        assert!(voice.window_ptt(owner + 1, true).is_err());
     }
 
     #[tokio::test]

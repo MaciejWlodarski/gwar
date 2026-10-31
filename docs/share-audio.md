@@ -50,14 +50,13 @@ may send `stopped: true` when its retained audio track ends. No unsolicited even
 or field is added for older clients. Guest watch pages retain their existing
 video-only behavior.
 
-No new persistent server data is introduced. Settings v8 adds `shareAudio`,
+No new persistent server data is introduced. Settings v10 adds `shareAudio`,
 keyed by share id, with volume 0–100% and independent mute. It preserves
-all v1–v7 fields, including v6 cues, microphone sensitivity and v7 desktop and
-notification choices. Fixtures cover
-every version. The second PR to merge a settings bump must renumber its version
-and add the corresponding fixture. PR #206 reached main first with v7, so this
-branch uses v8 and also preserves share-audio preferences from its earlier v7
-preview builds.
+all v1–v9 fields: cues and sensitivity, desktop/notification choices in v7,
+PTT bindings and release delay in v8, and person volume/mute in v9. Fixtures cover
+every version and upgrade/reload. Main's #206/#208/#207 migrations retain their
+numbers; this branch follows them at v10. Earlier v7/v8 share-audio preview maps
+also survive. The Polish settings labels remain Głos and Dźwięki aplikacji.
 
 ## Voice priority and bounded forwarding
 
@@ -84,9 +83,11 @@ share audio and never sends it through voice processing or sound cues.
   floor including UDP/IP. Regular coarse service can use a window up to 30 ms;
   longer gaps reset the window rather than accumulating a catch-up burst. Audio
   and video configure this window together before either releases. A second
-  aggregate guard checks serialized audio, video, repairs and probes before the
-  socket. Repairs/probes reserve only unused application credit, so they cannot
-  steal credit from a released media packet and drop a video keyframe. The
+  wire gate checks queued audio, video, repairs and probes before str0m removes
+  packets or assigns TWCC send records. Exhausted credit defers a packet; it
+  does not turn application pacing into reported network loss. During a bounded
+  capacity probe, that same gate follows its dispatched rate and existing extras
+  reserve, retaining the occupied wire clock across plan changes. The
   separate audio allowance cannot buy an additional wire burst;
   repairs/probes retain their own cap too. Voice headroom is unchanged. Expired
   sound drops and never raises the probe target.

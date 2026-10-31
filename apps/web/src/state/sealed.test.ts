@@ -402,9 +402,7 @@ describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
     await dm.open(thread);
     expect(useSession.getState().threads[thread]?.items.filter(i => i.kind === "msg").map(i => i.msg.id)).toEqual([2]);
     expect(useSession.getState().threads[thread]).toMatchObject({ loaded: true, mentions: 0 });
-    if (kind === "server") expect(useSession.getState().threads.server?.items.filter(i => i.kind === "sys")).toEqual([
-      expect.objectContaining({ text: { key: "sys.reconnected" } }),
-    ]);
+    if (kind === "server") expect(useSession.getState().threads.server?.items.filter(i => i.kind === "sys")).toEqual([]);
   });
   it("starts mention accounting over after a resync", async () => {
     await dm.receive((await post(1)).sealed, true);

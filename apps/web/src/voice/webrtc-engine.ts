@@ -15,6 +15,7 @@ import {
   type CaptureOptions,
   type DeviceList,
   type InputMode,
+  type MicTestPlayback,
   type VoiceEngine,
   type VoiceEvents,
   type VoiceState,
@@ -103,6 +104,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private deafened = false;
   private mode: InputMode = "vad";
   private ptt = false;
+  private pttReleaseDelay = 300;
   private pttRelease: ReturnType<typeof setTimeout> | null = null;
   private threshold = inputThreshold(null);
   private automaticSensitivity = true;
@@ -114,6 +116,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
   private routedOutputId: string | null = null;
   /** Each routing attempt's token: a late rejection of an older one changes nothing. */
   private routeAttempt = 0;
+  private outputReady: Promise<void> = Promise.resolve();
+  private outputRouteFailed = false;
   /** The microphone was lost or never found: one appearing is opened at once. */
   private micMissing = false;
   private followTimer: ReturnType<typeof setTimeout> | null = null;
@@ -806,14 +810,14 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     catch { return "unknown"; }
   }
 
-  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal): Promise<() => void> {
-    return this.micTests.start(async aborted => {
+  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal, playback?: MicTestPlayback): Promise<() => void> {
+    return this.micTests.start(async (aborted, complete) => {
       if (this.state !== "idle" || this.muted || this.deafened || aborted.aborted) return () => {};
-      return this.openMicTest(onLevel, aborted);
+      return this.openMicTest(onLevel, aborted, complete, playback);
     }, signal);
   }
 
-  private async openMicTest(onLevel: (level: number) => void, signal: AbortSignal): Promise<() => void> {
+  private async openMicTest(onLevel: (level: number) => void, signal: AbortSignal, complete: () => Promise<boolean>, playback?: MicTestPlayback): Promise<() => void> {
     const stream = await this.getStream(() => !signal.aborted);
     if (signal.aborted) { stream.getTracks().forEach(track => track.stop()); return () => {}; }
     let ctx: AudioContext;
@@ -839,11 +843,20 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       }, 50);
       void this.listDevices().then((d) => this.emit("devices", d));
       let stopped = false;
+      let cancelled = false;
+      let recorder: MediaRecorder | null = null;
+      let sampleTimer: ReturnType<typeof setTimeout> | null = null;
+      let replay: AudioBufferSourceNode | null = null;
+      const chunks: Blob[] = [];
+      let sampleBuffer: AudioBuffer | null = null;
+      const recording = playback ? ctx.createMediaStreamDestination() : null;
+      if (recording) source.connect(recording);
       const retarget = () => {
         if (stopped) return;
         source.disconnect();
         source = ctx.createMediaStreamSource(pipeline?.running ? new MediaStream([pipeline.track]) : stream);
         source.connect(analyser);
+        if (recording) source.connect(recording);
       };
       if (this.capture.noiseSuppression && !this.denoiseUnavailable) {
         void startDenoise({ changed: retarget, trouble: () => {
@@ -862,7 +875,7 @@ export class WebRtcVoiceEngine implements VoiceEngine {
           if (!stopped) retarget();
         }).catch(() => {});
       }
-      const stop = () => {
+      const closeCapture = () => {
         if (stopped) return;
         stopped = true;
         clearInterval(timer);
@@ -871,9 +884,84 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         if (this.previewDenoise === pipeline) this.previewDenoise = null;
         source.disconnect();
         stream.getTracks().forEach((t) => t.stop());
+        recording?.stream.getTracks().forEach(track => track.stop());
         void ctx.close();
         onLevel(0);
       };
+      const stop = () => {
+        if (cancelled) return;
+        cancelled = true;
+        if (sampleTimer) clearTimeout(sampleTimer);
+        sampleTimer = null;
+        if (recorder) {
+          const held = recorder;
+          recorder = null;
+          held.ondataavailable = held.onstop = held.onerror = null;
+          if (held.state === "recording") held.stop();
+        }
+        chunks.length = 0;
+        sampleBuffer = null;
+        closeCapture();
+        if (replay) {
+          const held = replay;
+          replay = null;
+          held.onended = null;
+          held.stop();
+          held.disconnect();
+          held.buffer = null;
+        }
+      };
+      if (recording && playback) {
+        try {
+          recorder = new MediaRecorder(recording.stream);
+          recorder.ondataavailable = event => { if (!cancelled && event.data.size) chunks.push(event.data); };
+          const failed = (error: unknown) => {
+            void complete().then(current => { if (current) playback.error(error); });
+          };
+          recorder.onerror = () => failed(new VoiceError("mic_failed", "Microphone recording failed"));
+          recorder.onstop = () => {
+            // The input device is closed before any speaker receives the sample.
+            closeCapture();
+            if (recorder) recorder.ondataavailable = recorder.onstop = recorder.onerror = null;
+            recorder = null;
+            sampleTimer = null;
+            if (cancelled || signal.aborted) return;
+            playback.phase("preparing");
+            void (async () => {
+              try {
+                const output = this.ensureContext();
+                if (this.outputRouteFailed) this.routeOutput();
+                await output.resume();
+                // The media-element sink may still be on speakers while headphones are pending.
+                // A replacement device route must also settle before the sample can start.
+                // Wait before decoding so cancellation clears all recorded chunks while pending.
+                let route: Promise<void>;
+                do { route = this.outputReady; await route; } while (route !== this.outputReady);
+                if (cancelled || signal.aborted) return;
+                sampleBuffer = await output.decodeAudioData(await new Blob(chunks).arrayBuffer());
+                chunks.length = 0;
+                if (cancelled || signal.aborted) { sampleBuffer = null; return; }
+                // Decoding can also outlive a cancellation or a device change.
+                do { route = this.outputReady; await route; } while (route !== this.outputReady);
+                if (cancelled || signal.aborted) return;
+                replay = output.createBufferSource();
+                replay.buffer = sampleBuffer;
+                sampleBuffer = null;
+                replay.connect(this.master!);
+                replay.onended = () => {
+                  void complete().then(current => { if (current) playback.phase("idle"); });
+                };
+                playback.phase("playing");
+                replay.start();
+              } catch (error) { if (!cancelled && !signal.aborted) failed(error); }
+              finally { chunks.length = 0; }
+            })();
+          };
+          recorder.start();
+          playback.phase("recording");
+          sampleTimer = setTimeout(() => { if (recorder?.state === "recording") recorder.stop(); closeCapture(); }, 3000);
+        } catch (error) { stop(); throw error; }
+      }
       signal.addEventListener("abort", stop, { once: true });
       return () => { signal.removeEventListener("abort", stop); stop(); };
     } catch (error) {
@@ -916,25 +1004,38 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     const ctx = this.ctx;
     const master = this.output;
     if (!ctx || !master) return;
+    this.outputRouteFailed = false;
     master.disconnect();
     this.routedOutputId = id;
     const attempt = ++this.routeAttempt;
     const ctxSink = typeof ctx.setSinkId === "function";
     const elementSink = typeof HTMLMediaElement !== "undefined" && "setSinkId" in HTMLMediaElement.prototype;
+    const ready = (pending: Promise<void>) => {
+      this.outputReady = pending.catch(error => {
+        if (attempt === this.routeAttempt) {
+          this.outputRouteFailed = true;
+          this.routedOutputId = null;
+        }
+        throw new VoiceError("output_failed", error instanceof Error ? error.message : String(error));
+      });
+      void this.outputReady.catch(() => {});
+    };
     // A device that cannot be routed to plays on the default and counts as not routed, so its
     // return routes it again.
-    const unrouted = () => {
-      if (attempt !== this.routeAttempt || !id) return;
+    const unrouted = async (error: unknown) => {
+      if (attempt !== this.routeAttempt) return;
+      if (!id) throw error;
       this.routedOutputId = null;
       master.disconnect();
-      master.connect(ctx.destination);
       this.sinkElement?.pause();
-      void ctx.setSinkId?.("").catch(() => {});
+      // Do not declare the default ready while resetting a failed context sink is pending.
+      await ctx.setSinkId?.("");
+      if (attempt === this.routeAttempt) master.connect(ctx.destination);
     };
     if (!id || ctxSink) {
       master.connect(ctx.destination);
       this.sinkElement?.pause();
-      void ctx.setSinkId?.(id ?? "").catch(unrouted);
+      ready((ctx.setSinkId?.(id ?? "") ?? Promise.resolve()).catch(unrouted));
       return;
     }
     if (elementSink) {
@@ -944,11 +1045,14 @@ export class WebRtcVoiceEngine implements VoiceEngine {
         this.sinkElement = new Audio() as SinkAudioElement;
         this.sinkElement.srcObject = this.streamDest.stream;
       }
-      void this.sinkElement.setSinkId?.(id).catch(unrouted);
-      void this.sinkElement.play().catch(() => {});
+      const element = this.sinkElement;
+      ready(element.setSinkId!(id).then(async () => {
+        if (attempt === this.routeAttempt) await element.play();
+      }).catch(unrouted));
       return;
     }
     master.connect(ctx.destination);
+    this.outputReady = Promise.resolve();
   }
 
   private attachSlot(slot: number, track: MediaStreamTrack): void {
@@ -1021,6 +1125,8 @@ export class WebRtcVoiceEngine implements VoiceEngine {
     this.applyTrackEnabled();
   }
 
+  setPttReleaseDelay(ms: number): void { this.pttReleaseDelay = Math.max(0, Math.min(1000, ms)); }
+
   setPttActive(active: boolean): void {
     if (active) {
       if (this.pttRelease) clearTimeout(this.pttRelease);
@@ -1028,18 +1134,17 @@ export class WebRtcVoiceEngine implements VoiceEngine {
       this.ptt = true;
       this.applyTrackEnabled();
     } else if (this.ptt && !this.pttRelease) {
-      // Match native's 300 ms hangover, including the denoiser's buffered word ending.
+      // Preserve the denoiser's buffered word ending for the configured tail.
       this.pttRelease = setTimeout(() => {
         this.pttRelease = null;
         this.ptt = false;
         this.applyTrackEnabled();
-      }, 300);
+      }, this.pttReleaseDelay);
     }
   }
 
   private cancelPttRelease(): void {
-    if (!this.pttRelease) return;
-    clearTimeout(this.pttRelease);
+    if (this.pttRelease) clearTimeout(this.pttRelease);
     this.pttRelease = null;
     this.ptt = false;
   }

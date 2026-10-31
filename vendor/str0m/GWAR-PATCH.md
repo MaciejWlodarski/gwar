@@ -1,5 +1,25 @@
 # str0m 0.24.1: screen probe protection
 
+`Bwe::set_rtp_send_gate` optionally installs the application's shared wire and
+repair/padding credit before RTP dequeue, sequence allocation, packet statistics
+and TWCC accounting. `RtpSendBudget` supplies media/extras byte allowances and a
+retry deadline. The stream measures its negotiated RTP header (including CSRCs,
+MID/RID and extensions) and reserves SRTP/IPv6 overhead before choosing a packet.
+An exhausted budget leaves original, NACK and padding data queued without
+advancing their sequence numbers or TWCC; eligible media can proceed while a
+repair waits. The gate receives the active bounded probe plan and charges actual
+serialized bytes before send accounting. Its retry deadline gates the pacer's
+timeout instead of spinning on an immediate wake. It survives BWE reset.
+
+Gwar enables shared wire gating when an audio reservation exists; video-only
+transports keep their existing cap policy. The active probe uses the same wire
+credit as audio/video, at its dispatched rate and within the existing extras
+reserve. Plan changes preserve credit/debt and never create a second burst.
+This fixes a silent tab starving video discovery when the SFU dropped probes
+after str0m had already recorded them as sent. The live-TWCC 20 Mb/s startup
+regression covers 10/20 ms service; the original 1 Mb/s adversarial voice and
+2.5 Mb/s combined-throughput regressions remain strict.
+
 `StreamTx::poll_packet_padding` uses blank padding instead of a cached packet
 smaller than `MAX_BLANK_PADDING_PAYLOAD_SIZE` (240 bytes). NACK repair is
 unchanged. Reusing tiny Text deltas amplified payload-sized probe clusters

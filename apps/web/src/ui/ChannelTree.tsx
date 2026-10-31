@@ -23,8 +23,11 @@ import {
   Trash2,
   Users,
   Volume2,
+  VolumeX,
+  Volume1,
+  MoreHorizontal,
 } from "lucide-react";
-import { memo, useMemo, useRef, useState, type KeyboardEvent, type ReactNode } from "react";
+import { memo, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useT } from "../i18n";
 import { PLATFORM_LABEL } from "../lib/platform";
 import { cn } from "../lib/cn";
@@ -40,9 +43,10 @@ import { useTsImage } from "./ts-images";
 import { useChannelPermission, useGroupsColor, useMyWho, useWhoOf } from "./hooks";
 import { canActOn } from "../lib/permissions";
 import { CLIENT_MIME, clientDragData, readClientDrag } from "../lib/client-drag";
+import { PersonAudio } from "./PersonAudio";
 import { ModerationItems } from "./ModerationMenu";
 import { LiveBadge } from "./Screen";
-import { EmptyState, TalkingAvatar, Slider, menuContent, menuItem, menuItemDanger, menuLabel, menuSeparator } from "./kit";
+import { EmptyState, TalkingAvatar, menuContent, menuItem, menuItemDanger, menuLabel, menuSeparator } from "./kit";
 
 export function ChannelTree() {
   const t = useT();
@@ -134,7 +138,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
   });
 
   const join = () => {
-    if (!canJoin) return;
+    if (!canJoin || spacer || joining) return;
     // Joining opens the channel's chat beside the tree, but a phone stays on the tree, by its voice panel.
     const { pane } = useUi.getState();
     void controller.joinChannelInteractive(channel.id);
@@ -149,6 +153,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
       if (e.shiftKey) join();
+      else if (!onGwar && !spacer && canJoin) join();
       else select();
     } else if (e.key === "ArrowRight" && collapsed) {
       toggleCollapsed(channel.id);
@@ -169,8 +174,8 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           data-entry={selected || undefined}
           data-treeitem
           tabIndex={0}
-          onClick={select}
-          onDoubleClick={join}
+          onClick={() => !onGwar && !spacer && canJoin ? join() : select()}
+          onDoubleClick={() => onGwar && join()}
           onKeyDown={onKey}
           onDragOver={(e) => {
             if (canMove && e.dataTransfer.types.includes(CLIENT_MIME)) {
@@ -191,7 +196,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           style={{ paddingLeft: 4 + node.depth * 16 }}
           className={cn(
             "t group flex cursor-pointer items-center gap-1 rounded-md pr-2 text-sm",
-            compact ? "h-7" : "h-8",
+            compact ? "h-7 pointer-coarse:min-h-11" : "h-8 pointer-coarse:min-h-11",
             selected ? "bg-accent-soft font-medium text-fg" : unread > 0 ? "font-semibold text-fg hover:bg-hover" : "text-muted hover:bg-hover hover:text-fg",
             dragOver && "bg-accent/25 ring-1 ring-accent",
           )}
@@ -260,7 +265,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           </button>
           <MentionBadge count={mentions} />
           <UnreadBadge count={unread} />
-          {!current && !joining && canJoin && (
+          {!spacer && !current && !joining && canJoin && (
             <button
               type="button"
               aria-label={t("tree.joinVoiceNamed", { name: channel.name })}
@@ -270,7 +275,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
                 join();
               }}
               onDoubleClick={(e) => e.stopPropagation()}
-              className="t flex size-6 w-0 shrink-0 cursor-pointer items-center justify-center overflow-hidden rounded text-muted opacity-0 group-focus-within:w-6 group-focus-within:opacity-100 group-hover:w-6 group-hover:opacity-100 hover:bg-active hover:text-fg pointer-coarse:w-6 pointer-coarse:opacity-100"
+              className="t flex size-7 shrink-0 cursor-pointer items-center justify-center rounded text-muted pointer-coarse:size-11 hover:bg-active hover:text-fg"
             >
               <Headphones className="size-3.5" />
             </button>
@@ -286,7 +291,7 @@ const ChannelRow = memo(function ChannelRow({ node, collapsed, compact }: { node
           <ContextMenu.Item className={menuItem} onSelect={select}>
             <MessageSquare className="size-4" /> {t("tree.openChat")}
           </ContextMenu.Item>
-          <ContextMenu.Item className={menuItem} disabled={current || !canJoin} onSelect={join}>
+          <ContextMenu.Item className={menuItem} disabled={!!spacer || current || !canJoin || joining} onSelect={join}>
             <LogIn className="size-4" /> {t("tree.joinVoice")}
           </ContextMenu.Item>
           {!onGwar && (
@@ -364,6 +369,9 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
     if (isMe) return;
     useSession.getState().dispatch({ type: "openDm", uid: client.uid, name: client.nickname });
   };
+  const localVolume = useSettings(s => s.userVolumes[client.uid] ?? 1);
+  const localMuted = useSettings(s => !!s.userMuted[client.uid]);
+  const openProfile = () => useUi.getState().openDialog({ kind: "memberProfile", uid: client.uid, fallback: client.nickname });
   const avatarSize = compact ? 18 : 22; // plus the ring: the row height
   const silenced = client.muted || client.deafened;
 
@@ -383,15 +391,15 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
           }}
           onDoubleClick={openDm}
           onKeyDown={(e) => {
-            if (e.key === "Enter") {
+            if (e.target === e.currentTarget && e.key === "Enter") {
               e.preventDefault();
-              openDm();
+              openProfile();
             }
           }}
           style={{ paddingLeft: 4 + (depth + 1) * 16 + 17 }}
           className={cn(
             "t flex items-center gap-1.5 rounded-md pr-2 text-sm text-fg hover:bg-hover",
-            compact ? "h-6" : "h-7",
+            compact ? "h-6 pointer-coarse:min-h-11" : "h-7 pointer-coarse:min-h-11",
           )}
         >
           <TalkingAvatar name={client.nickname} seed={client.uid} image={avatar} size={avatarSize} talking={client.talking} />
@@ -406,6 +414,9 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
             </span>
           )}
           <span className="ml-auto flex shrink-0 items-center gap-1.5">
+            {!isMe && (localMuted || localVolume !== 1) && <span className="flex items-center gap-0.5 text-xs tabular-nums text-warn" title={t(localMuted || localVolume === 0 ? "person.muted" : "person.changed", { volume: Math.round(localVolume * 100) })}>
+              {localMuted || localVolume === 0 ? <VolumeX aria-label={t("person.muted")} className="size-3.5" /> : <><Volume1 aria-hidden className="size-3.5" /><span>{Math.round(localVolume * 100)}%</span></>}
+            </span>}
             {client.server_muted && !client.server_deafened && (
               <MicOff aria-label={t("tree.serverMuted")} className="size-3.5 text-warn">
                 <title>{t("tree.serverMuted")}</title>
@@ -422,6 +433,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
               <span className="rounded bg-hover px-1 text-[10px] font-medium leading-4 text-subtle">{PLATFORM_LABEL[client.platform]}</span>
             )}
           </span>
+          {!isMe && <button type="button" aria-label={t("person.controls", { name: client.nickname })} onClick={e => { e.stopPropagation(); openProfile(); }} onDoubleClick={e => e.stopPropagation()} className="t flex size-7 shrink-0 cursor-pointer items-center justify-center rounded text-muted pointer-coarse:size-11 hover:bg-active hover:text-fg"><MoreHorizontal className="size-4" /></button>}
         </div>
       </ContextMenu.Trigger>
       <ContextMenu.Portal>
@@ -434,7 +446,7 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
           </ContextMenu.Item>
           {!isMe && (
             <>
-              <VolumeControl uid={client.uid} />
+              <div className="px-2 py-2"><PersonAudio uid={client.uid} /></div>
               <ContextMenu.Separator className={menuSeparator} />
               <ContextMenu.Item className={menuItem} onSelect={openDm}>
                 <MessageSquare className="size-4" /> {t("tree.pm")}
@@ -451,28 +463,5 @@ function UserRow({ client: sessionClient, depth, compact }: { client: Client; de
         </ContextMenu.Content>
       </ContextMenu.Portal>
     </ContextMenu.Root>
-  );
-}
-
-function VolumeControl({ uid }: { uid: string }): ReactNode {
-  const t = useT();
-  const volume = useSettings((s) => s.userVolumes[uid] ?? 1);
-  const set = useSettings((s) => s.setUserVolume);
-  return (
-    <div className="px-2 py-2" onPointerDown={(e) => e.stopPropagation()} onKeyDown={(e) => e.stopPropagation()}>
-      <div className="mb-1 flex items-center justify-between text-xs text-muted">
-        <span className="flex items-center gap-1.5">
-          <Volume2 className="size-3.5" /> {t("tree.volume")}
-        </span>
-        <button
-          className="t cursor-pointer rounded px-1 tabular-nums hover:bg-hover hover:text-fg"
-          onClick={() => set(uid, 1)}
-          title={t("tree.volumeReset")}
-        >
-          {Math.round(volume * 100)}%
-        </button>
-      </div>
-      <Slider value={Math.round(volume * 100)} min={0} max={200} step={5} onChange={(v) => set(uid, v / 100)} label={t("tree.volume")} />
-    </div>
   );
 }
