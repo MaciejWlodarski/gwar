@@ -28,7 +28,8 @@ const draw = () => {
 const stream = canvas.captureStream(10);
 const sound = new AudioContext(); const destination = sound.createMediaStreamDestination(); const tone = sound.createOscillator(); tone.frequency.value = 997; tone.connect(destination); tone.start(); stream.addTrack(destination.stream.getAudioTracks()[0]!);
 useScreen.setState({ ...initialScreen, transport: { phase: "connected", run: 1 }, stage: "A", slots: ["A", null, null, null], streams: [stream, null, null, null],
-  own: { phase: query.has("choose") ? "choosing" : "live", attempt: 1, share: "M", stream, surface: "tab", spec: { mode: "smooth", height: 1080, fps: 30 }, audio: !query.has("silent"), viewers: query.has("zero") ? 0 : 2, guests: 0, guestLink: false, preview: false },
+  own: { phase: query.has("choose") ? "choosing" : "live", attempt: 1, share: "M", stream, surface: "tab", spec: { mode: "smooth", height: 1080, fps: 30 }, audio: !query.has("silent"), viewers: query.has("zero") || query.has("linked") ? 0 : 2, guests: query.has("linked") ? 2 : 0, guestLink: query.has("linked"), preview: false },
+  links: query.has("linked") ? { M: true } : {},
   watches: [{ share: "A", id: 1, slot: 0, status: "watching", audio: true }],
 });
 controller.screen.ownStats = async () => null; controller.screen.stats = async () => null;

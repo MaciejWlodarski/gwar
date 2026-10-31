@@ -350,6 +350,45 @@ pub struct EgressCounters {
     pub escalations: u64,
 }
 
+/// Keep packet remainders in rate credit without turning them into a second burst.
+/// Every kind of screen RTP shares both limits, at release and at the socket.
+/// Credit refills at the screen allocation; the peak refills at link speed and
+/// bounds contiguous wire occupation independently of that retained remainder.
+#[derive(Clone)]
+struct MediaPacer {
+    credit: Bucket,
+    peak: Bucket,
+}
+
+impl MediaPacer {
+    fn new(estimate: f64, interval: Duration, now: Instant) -> Self {
+        let rate = (PLAN + EXTRAS) * estimate / 8.0;
+        let packet = (1200 + ORIGINAL_OVERHEAD + 28) as f64;
+        Self {
+            credit: Bucket::new(rate, interval.as_secs_f64() * rate + packet, now),
+            peak: Bucket::new(estimate / 8.0, (interval.as_secs_f64() * estimate / 8.0).max(packet), now),
+        }
+    }
+
+    fn reconfigure(&mut self, estimate: f64, interval: Duration, now: Instant) {
+        let rate = (PLAN + EXTRAS) * estimate / 8.0;
+        let packet = (1200 + ORIGINAL_OVERHEAD + 28) as f64;
+        self.credit.reconfigure(rate, interval.as_secs_f64() * rate + packet, now);
+        self.peak.reconfigure(estimate / 8.0, (interval.as_secs_f64() * estimate / 8.0).max(packet), now);
+    }
+
+    fn available(&mut self, now: Instant) -> f64 {
+        self.credit.available(now).min(self.peak.available(now))
+    }
+
+    fn take(&mut self, bytes: f64, now: Instant) -> bool {
+        if self.available(now) < bytes {
+            return false;
+        }
+        self.credit.take(bytes, now) && self.peak.take(bytes, now)
+    }
+}
+
 pub struct Egress {
     lanes: Vec<Lane>,
     focus: Option<usize>,
@@ -363,9 +402,10 @@ pub struct Egress {
     extras: Bucket,
     audio: Bucket,
     audio_release: Bucket,
-    /// Shared audio/video release and final wire guards. Credit never grows with a stall.
-    media: Bucket,
-    wire: Bucket,
+    /// Shared audio/video release and final wire guards; no per-kind burst allowance.
+    media: MediaPacer,
+    wire: MediaPacer,
+    media_interval: Duration,
     audio_reserve: f64,
     probe_need: f64,
     queued: usize,
@@ -400,8 +440,9 @@ impl Egress {
             extras: Bucket::new(extras_rate(estimate), extras_burst(estimate), now),
             audio: Bucket::new(0.0, 2400.0, now),
             audio_release: Bucket::new(0.0, 2400.0, now),
-            media: Bucket::new((PLAN + EXTRAS) * estimate / 8.0, media_burst(estimate), now),
-            wire: Bucket::new((PLAN + EXTRAS) * estimate / 8.0, media_burst(estimate), now),
+            media: MediaPacer::new(estimate, Duration::from_millis(10), now),
+            wire: MediaPacer::new(estimate, Duration::from_millis(10), now),
+            media_interval: Duration::from_millis(10),
             audio_reserve: 0.0,
             probe_need: 0.0,
             queued: 0,
@@ -497,8 +538,8 @@ impl Egress {
         self.extras.reconfigure(extras_rate(self.estimate), extras_burst(self.estimate), now);
         self.audio.reconfigure(self.audio_rate() / 8.0, 2400.0, now);
         self.audio_release.reconfigure(self.audio_rate() / 8.0, 2400.0, now);
-        self.media.reconfigure((PLAN + EXTRAS) * self.estimate / 8.0, media_burst(self.estimate), now);
-        self.wire.reconfigure((PLAN + EXTRAS) * self.estimate / 8.0, media_burst(self.estimate), now);
+        self.media.reconfigure(self.estimate, self.media_interval, now);
+        self.wire.reconfigure(self.estimate, self.media_interval, now);
     }
 
     pub fn paused(&self, lane: usize) -> Option<ScreenPauseReason> {
@@ -764,9 +805,8 @@ impl Egress {
         self.refilled = now;
     }
 
-    /// Evicts what reached its deadline and releases what the bucket allows, most important
-    /// slot first. Returns the released packets in order, and the slots that dropped.
-    pub fn due(&mut self, now: Instant) -> (Vec<(usize, Queued)>, Vec<usize>) {
+    /// Configure one service window before either audio or video spends shared credit.
+    pub fn begin_release(&mut self, now: Instant) {
         // Refill both buckets under the old burst before changing the window.
         // Otherwise release could earn credit that the socket bucket already clipped.
         self.refill(now);
@@ -775,11 +815,28 @@ impl Egress {
         self.released_at = now;
         if !elapsed.is_zero() {
             self.release_interval = elapsed.max(self.release_interval.saturating_sub(elapsed / 20));
+            // Learn regular service up to 30 ms. Idle gaps and longer scheduler stalls
+            // restart at the normal window; they never earn a catch-up wire burst.
+            let interval = if elapsed <= Duration::from_millis(30) {
+                elapsed.max(Duration::from_millis(10))
+            } else {
+                Duration::from_millis(10)
+            };
+            if interval != self.media_interval {
+                self.media_interval = interval;
+                self.media.reconfigure(self.estimate, interval, now);
+                self.wire.reconfigure(self.estimate, interval, now);
+            }
         }
         if burst != self.release_burst() {
             self.tokens = self.tokens.min(self.release_burst());
             self.originals.reconfigure(self.release_rate(), self.socket_burst(), now);
         }
+    }
+
+    /// Evict expired packets and release video in priority order; report dropped lanes.
+    pub fn due(&mut self, now: Instant) -> (Vec<(usize, Queued)>, Vec<usize>) {
+        self.begin_release(now);
         let mut dropped = Vec::new();
         for lane in 0..self.lanes.len() {
             // Arrival order is deadline order, so the head expires first.
@@ -1090,12 +1147,6 @@ impl Egress {
     pub fn orders(&self) -> impl Iterator<Item = (usize, u64)> + '_ {
         self.lanes.iter().enumerate().filter(|(_, l)| l.active()).map(|(i, l)| (i, l.order))
     }
-}
-
-fn media_burst(estimate: f64) -> f64 {
-    // At low bandwidth, one maximum datagram including UDP/IP, never two audio bursts.
-    // At higher bandwidth retain at most 10 ms of the existing screen allocation.
-    (0.010 * (PLAN + EXTRAS) * estimate / 8.0).max((1200 + ORIGINAL_OVERHEAD + 28) as f64)
 }
 
 fn extras_rate(estimate: f64) -> f64 {

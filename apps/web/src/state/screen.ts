@@ -250,7 +250,11 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       const paused = action.type === "paused" ? action.reason : undefined;
       const watch = state.watches.find(w => w.share === action.share && w.status === "watching");
       if (!watch || (watch.paused === paused && !watch.waiting)) return state;
-      return { ...state, watches: state.watches.map(w => (w === watch ? { share: w.share, id: w.id, slot: w.slot, status: w.status, ...(paused ? { paused } : {}) } : w)) };
+      return { ...state, watches: state.watches.map(w => {
+        if (w !== watch) return w;
+        const { paused: _, waiting: __, ...grant } = w;
+        return { ...grant, ...(paused ? { paused } : {}) };
+      }) };
     }
     case "waiting": {
       const watch = state.watches.find(w => w.share === action.share && w.status === "watching");

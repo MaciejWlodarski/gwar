@@ -123,8 +123,9 @@ impl Pacer for LeakyBucketPacer {
             } else {
                 elapsed
             };
+            let max_cadence = Duration::from_millis(if self.egress_rate.is_some() { 30 } else { 20 });
             if (self.egress_rate.is_none() || was_backlogged)
-                && cadence <= Duration::from_millis(20)
+                && cadence <= max_cadence
             {
                 self.bounded_wake_interval =
                     cadence.max(self.bounded_wake_interval.saturating_sub(elapsed / 20));

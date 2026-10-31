@@ -104,7 +104,12 @@ serialized SRTP plus a conservative 48-byte IPv6/UDP allowance, and TWCC and ALR
 use that same byte unit. Rates and byte targets therefore describe occupied
 capacity even for small padding. Queue pressure cannot increase this ceiling.
 Ordinary bursts use 2 ms (one-MTU floor, one-packet rounding); regular wake
-cadences up to 20 ms are allowed, but longer stalls do not create burst credit.
+cadences up to 30 ms are allowed, matching the SFU's coarse application release
+window. Longer stalls do not create burst credit. Without this egress ceiling,
+the byte-limited probe cadence remains bounded at 20 ms. A production paired
+audio/video regression in `gwar-server` exercises 5/10/20/30 ms service with no
+in-budget eviction or socket drop; the separate aggregate socket guard still
+prevents audio from buying an independent burst.
 Backlog counts decrease after sends. The next wake admits the next packet rather
 than clearing the whole burst debt; cadence learning uses deadline lateness so
 the pacer cannot teach itself larger bursts. A rounded-deadline regression covers

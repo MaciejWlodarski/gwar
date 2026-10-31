@@ -39,6 +39,7 @@ try {
       await page.goto(`${base}?lang=${lang}&zero=1`);
       const zero = page.getByRole("status", { name: lang === "pl" ? "Udostępniasz ekran" : "You are sharing your screen" });
       await zero.waitFor();
+      await page.waitForFunction(() => document.querySelector("video[data-share]")?.readyState >= 2);
       assert.ok((await zero.boundingBox()).height <= 46);
       await page.screenshot({ path: path.join(output, `fixture-zero-${lang}-${name}.png`), animations: "disabled" });
       await page.goto(`${base}?lang=${lang}&choose=1&silent=1`);
@@ -49,6 +50,18 @@ try {
       const count = await page.getByTestId("screen-viewers").evaluate(e => ({ width: e.clientWidth, needed: e.scrollWidth }));
       assert.ok(count.needed <= count.width, `poor connection must not truncate ${lang} watcher count at ${width}px: ${JSON.stringify(count)}`);
       results.at(-1).poorConnectionCount = count;
+      await page.goto(`${base}?lang=${lang}&linked=1&slow=1`);
+      await page.getByTestId("screen-ts-link").waitFor();
+      await page.waitForFunction(() => document.querySelector("video[data-share]")?.readyState >= 2);
+      await page.evaluate(() => document.fonts.ready);
+      const linked = await page.getByRole("status", { name: lang === "pl" ? "Udostępniasz ekran" : "You are sharing your screen" }).evaluate(e => ({ width: e.clientWidth, needed: e.scrollWidth, height: e.getBoundingClientRect().height }));
+      const guests = await page.getByTestId("screen-viewers").evaluate(e => ({ width: e.clientWidth, needed: e.scrollWidth, text: e.textContent }));
+      assert.ok(linked.needed <= linked.width && linked.height <= 46, `guest link must fit the compact bar at ${width}px: ${JSON.stringify(linked)}`);
+      assert.ok(guests.needed <= guests.width, `guest viewer count must fit: ${JSON.stringify(guests)}`);
+      assert.equal(guests.text, lang === "pl" ? "2 osoby oglądają" : "2 watching");
+      if (width >= 1024) assert.ok(await page.getByTestId("screen-ts-link").getByRole("button", { name: lang === "pl" ? "Wyłącz" : "Turn off", exact: true }).isVisible());
+      await page.screenshot({ path: path.join(output, `fixture-linked-${lang}-${name}.png`), animations: "disabled" });
+      results.at(-1).guestLink = { ...linked, guests };
     }
   }
   writeFileSync(path.join(output, "fixture-layouts.json"), JSON.stringify(results, null, 2));

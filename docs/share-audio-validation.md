@@ -75,7 +75,7 @@ The production release/socket guards are also exercised on 18 adversarial FIFO
 cases: 0.5/1/2 Mb/s, 1/5/10 ms scheduler cadence, with/without competing video.
 Two admissible 1,100-byte datagrams arrive together every 150 ms, ahead of voice.
 Voice is 100 kb/s at 1/2 Mb/s (32 kb/s at 0.5 Mb/s). At 1 Mb/s p99 is
-9.048–9.312 ms in every case; at 2 Mb/s it is 4.512 ms. At 0.5 Mb/s it is
+9.048–9.288 ms in every case; at 2 Mb/s it is 4.512–9.024 ms. At 0.5 Mb/s it is
 18.048 ms, one datagram's unavoidable serialization time. These bounds include
 UDP/IP and are not a claim of sub-10-ms queueing below one-packet capacity.
 The separate final guard also rejects a same-time video/repair burst; audio
@@ -89,19 +89,59 @@ voice binding, whose paths are unchanged here. It was not reproduced in the loca
 failure diagnostics; the local timeout was reproduced solely by the missing zero
 count, then removed by restoring it. No MLS race fix is claimed by this PR.
 
+## Round 2 regressions
+
+- The combined production release/socket test negotiates real paired str0m
+  transports, queues two 20 ms Opus streams and 1.47 Mb/s video at a fixed
+  2.5 Mb/s estimate (1.744 Mb/s video allocation), and checks delivery of all
+  1,578 video and 1,000 audio packets from ten seconds of input, followed by a
+  500 ms drain. It failed with the old
+  clipped shared bucket. It now passes at 5/10/20/30 ms service with zero
+  evictions or socket drops. Rate credit retains a packet remainder; a separate
+  shared peak limit bounds the burst. The internal str0m egress pacer also
+  accepts regular 30 ms service rather than starving the application queue.
+  All 18 unchanged low-bandwidth/adversarial voice limits pass alongside it.
+- The decreasing-delay regression writes both source clocks through the real
+  str0m sender, receives 600 packets per track and inspects received sender
+  reports after the path delay changes from 100 to 20 ms. The fixed anchor
+  failed with RTP-time-zero reports. Rebasing the common anchor passes for
+  both tracks; a separate delayed-video test prevents a per-packet clamp from
+  silently breaking the shared mapping.
+- A component regression failed when bandwidth pause rebuilt the watch without
+  its confirmed audio flag. Pause, waiting and resume now keep the same audio
+  element, mute/volume and controls for that grant without waiting for a poll.
+- The unchanged `pnpm --filter web e2e:watch` reproduced CI job 124480443693 at
+  `watch.mjs:284`. Both guests rejoined and decoded frames after persisted
+  `pageshow`; the guest count was correct. The bar's `screen-ts-link` summary
+  and turn-off action had moved inside the closed Details dialog, so they were
+  absent from the DOM. Restoring the desktop summary/action fixes the unchanged
+  test, including its 150-second heartbeat and link revocation checks. This was
+  a bar rendering regression, not pacing or a failed guest rejoin. Phones retain
+  an accessible link icon and use Details for the action; the normal watcher
+  count includes guests. A component test and bilingual responsive assertions
+  cover the summary, full count and compact row.
+
+Failing-before logs are retained under `/tmp/gwar-209-r2-`: `combined-before.log`,
+`clock-before-final.log`, `ui-before.log` and `watch-before.log`. Neither the watch
+e2e nor the startup/native-voice watcher-count assertions were changed.
+
 ## Responsive inspection
 
 Real built UI screenshots are retained under `gwar-mockups/share-audio/` at
 1440×900, 768×1024, 390×844 and 360×800, in Polish and English. `fixture-*`
 images render the actual components offline with generated media, including
-zero viewers, no-sound and details dialogs. There are 48 PNGs across both languages
+zero viewers, no-sound, details dialogs and active guest links. There are 56 PNGs across both languages
 and all four sizes. `sharer-*` and `viewer-*` images come from the
 live local-server audio e2e. No screenshot substitutes for audio measurements.
 
-The existing Gwar palette/type direction was retained. The browser inspector
-reported **0 FAIL**; its one warning is a live MediaStream without a static
-poster, which has no poster asset by design. Screenshots were opened and
-inspected. The narrow sharing row, dialog bounds, full control visibility,
+The existing Gwar palette/type direction was retained. The final linked/poor-
+connection fixture reports **0 FAIL, 3 WARN**, allowing `edge-text` for the
+compact status row's deliberate 8–12 px inset. Its warnings are the live stream
+without a poster, compact 12 px status labels, and the existing red sharing
+status colour. Those are intentional within this call UI; the full Polish
+count and both buttons remain visible at 360 px. All 56 screenshots were opened
+in a contact sheet, with narrow and desktop views also inspected at full size.
+The narrow sharing row, dialog bounds, full control visibility,
 contrast and sharer-name clipping were checked; LIVE opens the conversation pane
 on phones and audio controls stay inside fullscreen.
 
@@ -109,20 +149,20 @@ on phones and audio controls stay inside fullscreen.
 
 - Typecheck and lint passed (lint retains four pre-existing warnings).
 - Protocol: 131 tests passed.
-- Rust screen: 236 tests passed, three full matrices ignored by default; the full
+- Rust screen: 239 tests passed, three full matrices ignored by default; the full
   96-case voice-headroom matrix was run separately and passed.
 - Local screen integration: 19 tests passed.
 - Clippy with `-D warnings`, formatting and the local server build passed.
 - Chromium generated-audio gate passed before and after reconnect at 996.09375 Hz.
   Volume, mute, receiver renewal, audio-end availability and single-output
-  assertions passed. Final RMS: 0.07095 / 0.07095 / 0.07091 (initial / renewed /
+  assertions passed. Final RMS: 0.07081 / 0.07090 / 0.07089 (initial / renewed /
   reconnected). The final sequential run logged no denoise fallback.
 - Chromium/WebKit fixed-1080p60 H.264 screen gate passed, with legacy and paired
   viewers. After fixing probe credit stealing, all eight unchanged startup cases
   passed on the final code at 1920×1080. The judge recorded local CPU limitations
   for both H.264 busy cases; their decoded rates were 54.8 / 59.7 fps. The isolated
   H.264 busy rerun reached 60.1 fps. No startup assertion was changed.
-- Full web suite: 2,204 tests passed across 148 files. Focused source-switch
+- Full web suite: 2,205 tests passed across 148 files. Focused source-switch
   and UI/controller checks also passed.
 
 ## Commands
@@ -140,6 +180,7 @@ CARGO_BUILD_JOBS=4 cargo test -p gwar-server --no-default-features --lib full_vo
 E2E_BROWSERS=chromium E2E_SCREEN_AUDIO=1 node apps/web/e2e/screen.mjs
 E2E_BROWSERS=chromium,webkit E2E_SCREEN_CANVAS=1 E2E_SCREEN_REQUIRE_H264=1 node apps/web/e2e/screen.mjs
 E2E_BROWSERS=chromium node apps/web/e2e/native-voice.mjs
+CARGO_BUILD_JOBS=4 pnpm --filter web e2e:watch
 node apps/web/e2e/screen-startup.mjs
 ```
 

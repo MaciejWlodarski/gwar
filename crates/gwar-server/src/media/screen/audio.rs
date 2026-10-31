@@ -80,8 +80,8 @@ impl Publisher {
 }
 
 pub(super) struct Slot {
-    mid: Mid,
-    pt: Option<Pt>,
+    pub(super) mid: Mid,
+    pub(super) pt: Option<Pt>,
     pub ssrc: u32,
     source: Option<(Ssrc, u64, u64, u32, u32)>,
     publication: Option<u64>,
@@ -190,6 +190,85 @@ mod tests {
         publish_ssrcs, watch_offer,
     };
     use std::time::Duration;
+
+    #[test]
+    fn combined_production_audio_and_video_release_keeps_its_allocation() {
+        use super::super::{ScreenOrigin, WatchGrant, assign, tests::Pair};
+        use std::sync::{Arc, atomic::Ordering};
+        for cadence in [5, 10, 20, 30] {
+            let mut pair = Pair::with_audio(true);
+            let start = pair.now;
+            for i in 0..2 {
+                let origin = ScreenOrigin::new(100 + i as u32, format!("audio-{i}"), 1, false, false, 2_500_000);
+                origin.has_audio.store(true, Ordering::Relaxed);
+                assign(&mut pair.w, i, WatchGrant::new(origin), i as u64, start);
+            }
+            reserve(&mut pair.w, start);
+            pair.w.egress.set_estimate(2_500_000, start);
+            assert_eq!(pair.w.egress.plan(), 1_744_000.0);
+            let video_pt = *pair.w.slots[0].pts.values().next().unwrap();
+            let mut credit = 0.0;
+            let mut video = 0;
+            for ms in 0..10_500 {
+                pair.now = start + Duration::from_millis(ms);
+                if ms < 10_000 {
+                    if ms % 20 == 0 {
+                        for slot in &mut pair.w.audio[..2] {
+                            slot.pending.push_back(Queued::new(
+                                ms / 20,
+                                ms as u32 * 48,
+                                false,
+                                slot.pt.unwrap(),
+                                pair.now,
+                                Arc::from(vec![0; 160]),
+                                0,
+                                false,
+                            ));
+                        }
+                    }
+                    credit += 1_470_000.0 / 8.0 / 1000.0;
+                    while credit >= 1164.0 {
+                        credit -= 1164.0;
+                        let packet = Queued::new(
+                            video,
+                            video as u32 * 3000,
+                            true,
+                            video_pt,
+                            pair.now,
+                            Arc::from(vec![0x08; 1100]),
+                            video as u32,
+                            video == 0,
+                        );
+                        assert!(pair.w.egress.admit(0, packet, pair.now).is_empty());
+                        video += 1;
+                    }
+                }
+                if ms % cadence == 0 {
+                    pair.drain();
+                }
+            }
+            eprintln!(
+                "cadence={cadence} estimate={} plan={} counters={:?} written={}/{}",
+                pair.w.egress.estimate(),
+                pair.w.egress.plan(),
+                pair.w.egress.counters,
+                pair.w.slots[0].written,
+                video
+            );
+            assert_eq!(pair.w.egress.counters.evicted, 0, "{cadence} ms must not evict in-budget video");
+            assert_eq!(pair.w.egress.counters.originals_dropped, 0, "{cadence} ms socket guard");
+            assert_eq!(pair.w.slots[0].written, video, "{cadence} ms usable throughput");
+            assert_eq!(
+                pair.received.get(&pair.w.slots[0].ssrc.unwrap()).copied(),
+                Some(video as usize),
+                "{cadence} ms delivered video"
+            );
+            for slot in &pair.w.audio[..2] {
+                assert_eq!(pair.received.get(&slot.ssrc).copied(), Some(500), "{cadence} ms delivered Opus");
+            }
+            assert!(pair.w.audio[..2].iter().all(|s| s.pending.is_empty()));
+        }
+    }
 
     #[test]
     fn legacy_and_audio_watch_offers_coexist_without_sending_media() {
@@ -328,6 +407,7 @@ mod tests {
                             pending += 2;
                         }
                         if ms % cadence == 0 {
+                            e.begin_release(now);
                             while pending > 0 && e.audio_due(1164, now) {
                                 pending -= 1;
                                 if e.charge(Class::Audio, 1100, now) {

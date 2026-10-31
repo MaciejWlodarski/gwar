@@ -2,7 +2,7 @@
  * Screen-sharing interface (docs/screen-share.md, "Interface"): the Share button, the preset
  * menu, the sharing bar, LIVE badges and the stage.
  */
-import { Maximize, MessageSquare, MessageSquareOff, Minimize, MonitorOff, MonitorUp, PictureInPicture2, RotateCw, ScreenShareOff, Volume2, VolumeX, X } from "lucide-react";
+import { Link2, Maximize, MessageSquare, MessageSquareOff, Minimize, MonitorOff, MonitorUp, PictureInPicture2, RotateCw, ScreenShareOff, Volume2, VolumeX, X } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from "react";
 import { countKey, useLanguage, useT, type Key } from "../i18n";
 import { defaultShareAudio } from "../voice/share-audio";
@@ -208,14 +208,21 @@ export function SharingBar() {
   const own = useScreen(s => s.own);
   const links = useScreen(s => s.links);
   if (!own || (own.phase !== "starting" && own.phase !== "live" && own.phase !== "reconnecting")) return null;
-  const watching = own.phase === "live" ? t(countKey(lang, "screen.watching", own.viewers), { count: own.viewers }) : t(own.phase === "reconnecting" ? "screen.reconnecting" : "screen.starting");
+  const viewers = own.viewers + own.guests;
+  const watching = own.phase === "live" ? t(countKey(lang, "screen.watching", viewers), { count: viewers }) : t(own.phase === "reconnecting" ? "screen.reconnecting" : "screen.starting");
   const linked = !!own.share && !!links[own.share];
+  const linkStatus = `${t("screen.tsLinkOn")} · ${t(countKey(lang, "screen.guests", own.guests), { count: own.guests })}`;
   return (
     <div role="status" aria-label={t("screen.sharingBar")} className="flex shrink-0 items-center gap-1 bg-[#a92c3e] px-2 py-1.5 text-sm text-white sm:gap-2 sm:px-3">
-      <MonitorUp aria-hidden className="size-4 shrink-0" />
+      <MonitorUp aria-hidden className={cn("size-4 shrink-0", linked && "hidden lg:block")} />
       <span className="min-w-0 flex-1 truncate text-xs" data-testid="screen-viewers">{watching}</span>
-      {own.phase === "live" && <span data-testid="share-audio-status" className="flex shrink-0 items-center gap-1 text-xs" aria-label={t(own.audio ? own.viewers === 0 ? "screen.sharingAudio" : "screen.audioOn" : "screen.audioOff")}>
-        {own.audio ? <Volume2 aria-hidden className="size-3.5" /> : <VolumeX aria-hidden className="size-3.5" />}<span className="hidden sm:inline">{t(own.audio ? own.viewers === 0 ? "screen.sharingAudio" : "screen.audioOn" : "screen.audioOff")}</span>
+      {linked && own.share && <span data-testid="screen-ts-link" className="flex shrink-0 items-center gap-2 text-xs">
+        <span role="img" aria-label={linkStatus} className="lg:hidden"><Link2 aria-hidden className="size-3.5" /></span>
+        <span className="hidden lg:inline">{linkStatus}</span>
+        <span className="hidden lg:inline-flex"><Button size="sm" variant="secondary" className="border-white/40 px-2 text-white hover:bg-white/15" onClick={() => void controller.screen.turnOffLink(own.share!)}>{t("screen.tsTurnOff")}</Button></span>
+      </span>}
+      {own.phase === "live" && <span data-testid="share-audio-status" className="flex shrink-0 items-center gap-1 text-xs" aria-label={t(own.audio ? viewers === 0 ? "screen.sharingAudio" : "screen.audioOn" : "screen.audioOff")}>
+        {own.audio ? <Volume2 aria-hidden className="size-3.5" /> : <VolumeX aria-hidden className="size-3.5" />}<span className="hidden sm:inline">{t(own.audio ? viewers === 0 ? "screen.sharingAudio" : "screen.audioOn" : "screen.audioOff")}</span>
       </span>}
       <ConnectionIndicator variant="bar" compact />
       <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 sm:px-2" onClick={() => setDetails(true)}>{t("common.details")}</Button>
@@ -225,8 +232,8 @@ export function SharingBar() {
         <p className="mb-3 text-sm">{t(own.audio ? own.phase === "live" ? "screen.audioSharing" : "screen.audioReady" : isDesktop() ? "screen.audioDesktop" : own.audioServer === false ? "screen.audioServer" : "screen.audioUnavailable")}</p>
         <QualityControls spec={own.spec} />
         {own.phase === "live" && <SenderStats />}
-        {linked && own.share && <div data-testid="screen-ts-link" className="mt-3 text-sm">
-          <p>{`${t("screen.tsLinkOn")} · ${t(countKey(lang, "screen.guests", own.guests), { count: own.guests })}`}</p>
+        {linked && own.share && <div className="mt-3 text-sm">
+          <p>{linkStatus}</p>
           <Button size="sm" onClick={() => void controller.screen.turnOffLink(own.share!)}>{t("screen.tsTurnOff")}</Button>
         </div>}
         <Button className="mt-3" aria-pressed={own.preview} onClick={() => controller.screen.setPreview(!own.preview)}>{t("screen.preview")}</Button>

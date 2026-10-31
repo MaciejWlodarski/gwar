@@ -20,13 +20,15 @@ impl Clock {
             Ok(delta) => local.checked_add(delta),
             Err(e) => local.checked_sub(e.duration()),
         };
-        // Broken or discontinuous source reports cannot move a live transport arbitrarily.
-        mapped
-            .filter(|at| {
-                arrival.saturating_duration_since(*at).max(at.saturating_duration_since(arrival))
-                    < Duration::from_secs(10)
-            })
-            .unwrap_or(arrival)
+        // A faster path must move the common mapping back, not leave every subsequent
+        // wallclock ahead of receipt (str0m cannot produce a sender report for that).
+        // Rebase both clocks together; clamping only this packet would lose A/V sync.
+        if mapped.is_none_or(|at| at > arrival || arrival.duration_since(at) >= Duration::from_secs(10)) {
+            self.anchor = Some((source, arrival));
+            arrival
+        } else {
+            mapped.unwrap()
+        }
     }
 }
 
@@ -54,5 +56,26 @@ mod tests {
         let next_video = clock.map(91_800, now + Duration::from_millis(190), Some(report(90_000, 90_000)), 90_000);
         assert_eq!(next_audio, next_video);
         assert_eq!(next_audio.duration_since(audio), Duration::from_millis(20));
+    }
+
+    #[test]
+    fn a_faster_path_rebases_both_clocks_instead_of_clamping_each_packet() {
+        let start = Instant::now();
+        let ntp = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let report = |rate| SenderInfo {
+            ssrc: 1.into(),
+            ntp_time: ntp,
+            rtp_time: MediaTime::new(rate as u64, str0m::media::Frequency::new(rate).unwrap()),
+            sender_packet_count: 1,
+            sender_octet_count: 100,
+        };
+        let mut clock = Clock::default();
+        clock.map(48_000, start + Duration::from_millis(100), Some(report(48_000)), 48_000);
+        let audio = clock.map(96_000, start + Duration::from_millis(1020), Some(report(48_000)), 48_000);
+        let video = clock.map(180_000, start + Duration::from_millis(1180), Some(report(90_000)), 90_000);
+        assert_eq!(audio, start + Duration::from_millis(1020));
+        assert_eq!(video, audio, "delayed video keeps the adjusted common mapping");
+        let next = clock.map(181_800, start + Duration::from_millis(1200), Some(report(90_000)), 90_000);
+        assert_eq!(next - video, Duration::from_millis(20));
     }
 }

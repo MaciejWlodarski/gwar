@@ -35,6 +35,12 @@ it("has one output per other share across focus changes, with independent mute, 
     expect(audio.muted).toBe(false); expect(audio.volume).toBe(0.35);
     await act(async () => useScreen.setState({ stage: "SELF" }));
     expect(host.querySelector("audio")).toBe(audio);
+    for (const action of [{ type: "paused", share: "A", reason: "bandwidth" }, { type: "waiting", share: "A" }, { type: "resumed", share: "A" }] as const) {
+      await act(async () => useScreen.getState().dispatch(action));
+      expect(host.querySelector('audio[data-share-audio="A"]')).toBe(audio);
+      expect(audio.muted).toBe(false);
+      expect(host.querySelector('[data-testid="share-audio-controls"]')).not.toBeNull();
+    }
     await act(async () => useSettings.setState({ selfDeafened: true }));
     expect(audio.muted).toBe(true);
     await act(async () => useScreen.setState({ watches: [] }));
@@ -70,5 +76,20 @@ it.each([[0, false], [0, true], [2, true]] as const)("keeps %s watchers in the s
     const status = host.querySelector('[role="status"]')!;
     expect(status.querySelector('[data-testid="screen-viewers"]')?.textContent).toBe(`${viewers} watching`);
     expect(status.querySelector('[data-testid="share-audio-status"]')).not.toBeNull();
+  } finally { await act(async () => root.unmount()); host.remove(); }
+});
+
+it("shows the live guest link count and turn-off action without opening details", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  useSettings.setState({ language: "en" });
+  useScreen.setState({ ...initialScreen, links: { M: true }, own: { phase: "live", attempt: 1, share: "M", stream: null, surface: "tab", spec: { mode: "smooth", height: 720, fps: 30 }, viewers: 0, guests: 2, guestLink: true, preview: false, audio: true } });
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  try {
+    await act(async () => root.render(<TooltipProvider><SharingBar /></TooltipProvider>));
+    const link = host.querySelector('[data-testid="screen-ts-link"]');
+    expect(link?.textContent).toContain("TeamSpeak link on · 2 guests");
+    expect(link?.querySelector("button")?.textContent).toBe("Turn off");
+    expect(host.querySelector('[data-testid="screen-viewers"]')?.textContent).toBe("2 watching");
+    expect(host.querySelector('[data-testid="share-audio-status"]')?.getAttribute("aria-label")).toBe("Sound on");
   } finally { await act(async () => root.unmount()); host.remove(); }
 });

@@ -3294,6 +3294,7 @@ fn enqueue(w: &mut Watcher, index: usize, origin: &ScreenOrigin, forward: &Forwa
 /// Writes what the viewer's release bucket allows into str0m. Its shared RTP pacer smooths
 /// originals together with RTX and probes; transmission checks the original deadline again.
 fn release(w: &mut Watcher, now: Instant) {
+    w.egress.begin_release(now);
     for (i, audio) in w.audio.iter_mut().enumerate() {
         let enabled = w.egress.paused(i) != Some(ScreenPauseReason::Budget)
             && w.slots[i].grant.as_ref().is_some_and(|g| {
@@ -3663,10 +3664,12 @@ pub(crate) mod tests {
 
     /// A watch transport built as the screen task builds one, connected in memory to a viewer's
     /// str0m with one receiving slot. Time is simulated.
-    struct Pair {
-        w: Watcher,
+    pub(super) struct Pair {
+        pub(super) w: Watcher,
         client: Rtc,
-        now: Instant,
+        pub(super) now: Instant,
+        reports: Vec<(u32, u64)>,
+        pub(super) received: HashMap<u32, usize>,
         /// Holds the viewer's datagrams back instead of delivering them.
         hold: bool,
         held: Vec<Vec<u8>>,
@@ -3678,15 +3681,24 @@ pub(crate) mod tests {
 
     /// A viewer's client and its offer of a watch transport.
     fn viewer_offer(now: Instant) -> (Rtc, SdpOffer, str0m::change::SdpPendingOffer) {
-        let mut client = Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp9(true).build(now);
+        viewer_offer_audio(now, false)
+    }
+
+    fn viewer_offer_audio(now: Instant, audio: bool) -> (Rtc, SdpOffer, str0m::change::SdpPendingOffer) {
+        let mut client =
+            Rtc::builder().set_rtp_mode(true).clear_codecs().enable_vp9(true).enable_opus(audio, false).build(now);
         client.add_local_candidate(Candidate::host(addr(5000), "udp").unwrap());
         // str0m's random mids can collide within one offer: redraw.
         loop {
             let mut api = client.sdp_api();
-            let mids: HashSet<Mid> = (0..SCREEN_SLOTS)
-                .map(|_| api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None))
-                .collect();
-            if mids.len() == SCREEN_SLOTS {
+            let mut mids = HashSet::new();
+            for _ in 0..SCREEN_SLOTS {
+                mids.insert(api.add_media(MediaKind::Video, Direction::RecvOnly, None, None, None));
+                if audio {
+                    mids.insert(api.add_media(MediaKind::Audio, Direction::RecvOnly, None, None, None));
+                }
+            }
+            if mids.len() == SCREEN_SLOTS * if audio { 2 } else { 1 } {
                 let (offer, pending) = api.apply().unwrap();
                 return (client, offer, pending);
             }
@@ -3695,8 +3707,12 @@ pub(crate) mod tests {
 
     impl Pair {
         fn new() -> Self {
+            Self::with_audio(false)
+        }
+
+        pub(super) fn with_audio(audio: bool) -> Self {
             let now = Instant::now();
-            let (mut client, offer, pending) = viewer_offer(now);
+            let (mut client, offer, pending) = viewer_offer_audio(now, audio);
             let (w, answer) = watcher(
                 1,
                 7,
@@ -3710,7 +3726,17 @@ pub(crate) mod tests {
             )
             .unwrap();
             client.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
-            let mut pair = Self { w, client, now, hold: false, held: Vec::new(), checks: Vec::new(), repairs: 0 };
+            let mut pair = Self {
+                w,
+                client,
+                now,
+                reports: Vec::new(),
+                received: HashMap::new(),
+                hold: false,
+                held: Vec::new(),
+                checks: Vec::new(),
+                repairs: 0,
+            };
             // A pair keeps its estimate where its test puts it: these tests exercise a viewer
             // with no room for an optimistic start (a budget that leaves none, or a share added
             // next to one already flowing). `sim.rs` covers optimistic starts.
@@ -3776,17 +3802,33 @@ pub(crate) mod tests {
                             contents: (&*t.contents).try_into().unwrap(),
                         };
                         self.client.handle_input(Input::Receive(self.now, receive)).unwrap();
+                        self.poll_client(true);
                     }
                     Output::Event(RtcEvent::Connected) => self.w.connected = true,
                     Output::Event(RtcEvent::MediaAdded(added)) if added.direction.is_sending() => {
-                        add_slot(&mut self.w, added.mid);
+                        if self.w.rtc.media(added.mid).unwrap().kind() == MediaKind::Audio {
+                            self.w.audio.push(audio::Slot::new(&mut self.w.rtc, added.mid));
+                        } else {
+                            add_slot(&mut self.w, added.mid);
+                        }
                     }
                     Output::Event(_) => {}
                 }
             }
+            self.poll_client(true);
+            self.now += Duration::from_millis(5);
+            self.w.rtc.handle_input(Input::Timeout(self.now)).unwrap();
+            self.client.handle_input(Input::Timeout(self.now)).unwrap();
+            sent
+        }
+
+        fn poll_client(&mut self, feedback: bool) {
+            // RTP mode has a single pending packet. Drain after every datagram,
+            // rather than overwriting one pair member before observing it.
             loop {
                 match self.client.poll_output().unwrap() {
                     Output::Timeout(_) => break,
+                    Output::Transmit(_) if !feedback => {}
                     Output::Transmit(t) if self.hold => self.held.push(t.contents.to_vec()),
                     Output::Transmit(t) => {
                         if matches!(t.contents.first(), Some(0..=3)) {
@@ -3794,13 +3836,99 @@ pub(crate) mod tests {
                         }
                         self.send_to_sfu(&t.contents);
                     }
+                    Output::Event(RtcEvent::RtpPacket(packet)) => {
+                        *self.received.entry(*packet.header.ssrc).or_default() += 1;
+                        if let Some(report) = packet.last_sender_info {
+                            self.reports.push((*report.ssrc, report.rtp_time.numer()));
+                        }
+                    }
                     Output::Event(_) => {}
                 }
             }
-            self.now += Duration::from_millis(5);
-            self.w.rtc.handle_input(Input::Timeout(self.now)).unwrap();
+        }
+
+        /// Fixed-estimate production release/socket path. Do not return TWCC: these tests
+        /// measure allocation at a specified capacity rather than estimator convergence.
+        pub(super) fn drain(&mut self) {
+            let mut packets = Vec::new();
+            drive(&mut self.w, self.now, &mut Vec::new(), &mut |bytes, _| packets.push(bytes.to_vec()));
+            for bytes in packets {
+                self.client
+                    .handle_input(Input::Receive(
+                        self.now,
+                        Receive {
+                            proto: Protocol::Udp,
+                            source: addr(6000),
+                            destination: addr(5000),
+                            contents: bytes.as_slice().try_into().unwrap(),
+                        },
+                    ))
+                    .unwrap();
+                self.poll_client(false);
+            }
             self.client.handle_input(Input::Timeout(self.now)).unwrap();
-            sent
+            self.poll_client(false);
+        }
+    }
+
+    #[test]
+    fn paired_sender_reports_stay_live_after_source_delay_decreases() {
+        use str0m::{
+            media::{Frequency, MediaTime},
+            rtp::rtcp::SenderInfo,
+        };
+        let mut pair = Pair::with_audio(true);
+        let mut clock = clock::Clock::default();
+        let start = pair.now;
+        let remote = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let mids = [pair.w.slots[0].mid, pair.w.audio[0].mid];
+        let mut ssrcs = Vec::new();
+        for mid in mids {
+            ssrcs.push(*pair.w.rtc.direct_api().stream_tx_by_mid(mid, None).unwrap().ssrc());
+        }
+        for n in 0..600_u64 {
+            // Source packets skip 80 ms as the path switches from 100 to 20 ms delay.
+            let source_ms = n * 20 + if n >= 50 { 80 } else { 0 };
+            pair.now = start + Duration::from_millis(100 + n * 20);
+            pair.w.rtc.handle_input(Input::Timeout(pair.now)).unwrap();
+            for (i, rate) in [90_000_u32, 48_000].into_iter().enumerate() {
+                let base = rate;
+                let ticks = base + (source_ms * u64::from(rate) / 1000) as u32;
+                let report = SenderInfo {
+                    ssrc: ssrcs[i].into(),
+                    ntp_time: remote,
+                    rtp_time: MediaTime::new(u64::from(base), Frequency::new(rate).unwrap()),
+                    sender_packet_count: n as u32,
+                    sender_octet_count: n as u32 * 100,
+                };
+                let wallclock = clock.map(ticks, pair.now, Some(report), rate);
+                let pt =
+                    if i == 0 { *pair.w.slots[0].pts.values().next().unwrap() } else { pair.w.audio[0].pt.unwrap() };
+                let mut direct = pair.w.rtc.direct_api();
+                let stream = direct.stream_tx_by_mid(mids[i], None).unwrap();
+                stream.set_unpaced(true);
+                if i == 0 && n == 0 {
+                    stream.set_rtx_cache(RTX_PACKETS, RTX_AGE, Some(RTX_RATIO));
+                }
+                stream.write_rtp(
+                    RtpWrite::new(pt, n.into(), ticks, wallclock, Arc::<[u8]>::from(vec![0x08; 100]))
+                        .marker(true)
+                        .nackable(i == 0),
+                );
+            }
+            pair.step(&mut |_| false);
+            if n == 50 {
+                pair.reports.clear();
+            }
+        }
+        for ssrc in ssrcs {
+            assert_eq!(pair.received.get(&ssrc).copied(), Some(600));
+            let reports: Vec<_> = pair.reports.iter().filter(|(source, _)| *source == ssrc).collect();
+            assert!(reports.len() >= 250, "actual received sender reports for SSRC {ssrc}: {}", reports.len());
+            assert!(
+                reports.iter().all(|(_, ticks)| *ticks > 0),
+                "future wallclocks must not turn sender reports into RTP time zero"
+            );
         }
     }
 

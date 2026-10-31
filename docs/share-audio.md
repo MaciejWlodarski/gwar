@@ -74,10 +74,13 @@ share audio and never sends it through voice processing or sound cues.
   the same allowance; the existing whole-transport ingress meter still applies.
 - Each granted slot of a share that actually negotiated audio reserves 128 kb/s *inside* the viewer's existing
   `0.8 × estimate` screen allocation. Video uses what remains. Audio waits in a queue of at most four packets with a 100 ms deadline,
-  released before video through one aggregate screen pacer. Its burst is at most
-  10 ms of the existing 80% media plus 10% repair/probe allocation, with a
-  one-datagram floor including
-  UDP/IP. Idle periods and scheduler stalls never enlarge this credit. A second
+  released before video through one aggregate screen pacer. Rate credit stays at
+  the existing 80% media plus 10% repair/probe allocation and retains one packet
+  of remainder instead of clipping it every service interval. A shared peak
+  guard permits at most 10 ms at the estimated link rate, with a one-datagram
+  floor including UDP/IP. Regular coarse service can use a window up to 30 ms;
+  longer gaps reset the window rather than accumulating a catch-up burst. Audio
+  and video configure this window together before either releases. A second
   aggregate guard checks serialized audio, video, repairs and probes before the
   socket. Repairs/probes reserve only unused application credit, so they cannot
   steal credit from a released media packet and drop a video keyframe. The
@@ -87,6 +90,8 @@ share audio and never sends it through voice processing or sound cues.
 - Each negotiated audio/video pair shares one SDP stream ID and RTCP CNAME,
   with separate track IDs. Audio uses stable source sequence/timestamp offsets.
   Publisher sender reports map both source clocks through one common NTP anchor;
+  a decrease in path delay moves that common anchor back so mapped wallclocks
+  never lie ahead of packet receipt and str0m can keep producing valid reports.
   source wallclock is kept separately from queue arrival/deadline and release.
   Before sender reports arrive, the common SFU arrival clock is the fallback. New sources restart the mapping without restarting the
   viewer transport. No Opus RTX/NACK queue is added. Sender reports keep the
@@ -100,8 +105,10 @@ share audio and never sends it through voice processing or sound cues.
 
 Browser viewers have one audio element per granted remote share with confirmed
 audio availability, independent of stage,
-thumbnail, fullscreen and picture-in-picture video elements. Its volume and
-mute survive stage changes and republishing under a new share id (the controller copies preferences only
+thumbnail, fullscreen and picture-in-picture video elements. Confirmed audio
+availability survives bandwidth pause, waiting-for-picture and resume transitions
+of the same grant; bandwidth pauses still permit audio. Volume and mute survive
+stage changes and republishing under a new share id (the controller copies preferences only
 when it has identified the confirmed replacement). Shares from two devices of
 the same person retain independent controls. Deafen
 mutes it; selecting an output device applies `setSinkId` where supported.
@@ -120,7 +127,10 @@ The sharer's compact sharing row keeps the watcher count beside sound status
 (or shows Sharing with sound before anyone watches). At phone widths the sound
 state uses an accessible icon so both buttons and the count stay in one row.
 Its details dialog contains quality settings, preview and
-statistics. English and Polish strings are included. The captured audio track
+statistics. An active TeamSpeak link keeps its guest count and turn-off action
+in the desktop row; phones use an accessible link icon with the full summary and
+turn-off action in Details. The watcher count includes those guests. English and
+Polish strings are included. The captured audio track
 belongs to the same retained MediaStream as video: reconnect reuses it without
 another picker, including encoder recovery. An ended track or a replacement
 server without audio support leaves the video running and reports no sound.
