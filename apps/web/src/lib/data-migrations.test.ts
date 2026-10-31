@@ -148,13 +148,17 @@ const RECORD_FIXTURES: Record<keyof typeof RECORDS, Record<number, { stored: Rec
 };
 /** The settings (localStorage) per version, and a check of the settings store after loading them. */
 const LOCAL_FIXTURES: Record<number, { stored: unknown; check(state: { theme: string; bookmarks: unknown[] }): void }> = {
+  9: {
+    stored: { version: 9, state: { theme: "dark", bookmarks: [], userVolumes: { "stable-identity": 0.45 }, userMuted: { "stable-identity": true } } },
+    check: state => expect(state).toMatchObject({ userVolumes: { "stable-identity": 0.45 }, userMuted: { "stable-identity": true } }),
+  },
   7: {
     stored: { state: { theme: "dark", bookmarks: [], desktop: { openAtLogin: true, startMinimized: true, closeToTray: false }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } } }, version: 7 },
     check: state => expect(state).toMatchObject({ desktop: { openAtLogin: true, startMinimized: true, closeToTray: false }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } } }),
   },
   6: {
-    stored: { state: { theme: "dark", bookmarks: [], sounds: { enabled: false, volume: 0.25, events: { mute: false } } }, version: 6 },
-    check: state => { expect(state).toMatchObject({ sounds: { enabled: false, volume: 0.25, events: { mute: false, peerJoin: true } } }); },
+    stored: { state: { theme: "dark", bookmarks: [], userVolumes: { "old-identity": 0.35 }, sounds: { enabled: false, volume: 0.25, events: { mute: false } } }, version: 6 },
+    check: state => { expect(state).toMatchObject({ userVolumes: { "old-identity": 0.35 }, userMuted: {}, sounds: { enabled: false, volume: 0.25, events: { mute: false, peerJoin: true } } }); },
   },
   5: {
     stored: { state: { theme: "light", bookmarks: [], onboarding: { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true }, audio: { automaticSensitivity: false, vadThreshold: -72, inputMode: "ptt" } }, version: 5 },
@@ -428,10 +432,23 @@ describe("the settings (localStorage)", () => {
   }
   afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
 
-  it.each([0, ...versions(7)])("upgrades version %i through desktop v7 and PTT v8 without losing saved values", async version => {
+
+it("migrates v6 person volumes losslessly and remembers local mute across restarts", async () => {
+  const prefs = { userVolumes: { "stable-uid": 0.45, "other-uid": 1.75 }, audio: { inputDeviceId: "saved-mic", outputDeviceId: "saved-output", noiseStrength: 35 }, sounds: { enabled: false, volume: 0.2 }, theme: "light", bookmarks: [{ id: "server", name: "Saved", address: "localhost", kind: "gwar" }] };
+  const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ version: 6, state: prefs }) });
+  const first = await page(storage);
+  expect(first.useSettings.getState()).toMatchObject({ ...prefs, userMuted: {} });
+  first.useSettings.getState().setUserMuted("stable-uid", true);
+  const second = await page(storage);
+  expect(second.useSettings.getState()).toMatchObject({ ...prefs, userMuted: { "stable-uid": true } });
+  second.useSettings.getState().setUserMuted("stable-uid", false);
+  expect(second.useSettings.getState().userVolumes).toEqual(prefs.userVolumes);
+  expect(second.useSettings.getState().userMuted).toEqual({});
+});
+  it.each([0, ...versions(8)])("upgrades version %i through desktop v7, PTT v8 and person mute v9 without losing saved values", async version => {
     const { useSettings } = await page(memory({}));
     const saved = {
-      audio: { inputMode: "ptt", pttKey: "AltRight", inputDeviceId: "saved-mic", automaticSensitivity: false, vadThreshold: -72 },
+      audio: { inputMode: "ptt", pttKey: "AltRight", inputDeviceId: "saved-mic", automaticSensitivity: false, vadThreshold: -72, ...(version === 8 ? { pttReleaseDelay: 300 } : {}) },
       desktop: { closeToTray: false, muteShortcut: "Control+KeyM", deafenShortcut: "Control+KeyD", openAtLogin: true, startMinimized: true },
       notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } },
       notifications: { mentions: false, privateMessages: false, allMessages: true },
@@ -440,18 +457,18 @@ describe("the settings (localStorage)", () => {
       unrelatedFutureField: { value: 42 },
     };
     const upgraded = await useSettings.persist.getOptions().migrate!(saved, version);
-    expect(upgraded).toMatchObject({ ...saved, audio: { ...saved.audio, pttReleaseDelay: 300 } });
-    expect(saved.audio).not.toHaveProperty("pttReleaseDelay");
+    expect(upgraded).toMatchObject({ ...saved, userMuted: {}, audio: { ...saved.audio, pttReleaseDelay: 300 } });
+    if (version < 8) expect(saved.audio).not.toHaveProperty("pttReleaseDelay");
     const secondPass = await useSettings.persist.getOptions().migrate!(upgraded, version);
     expect(secondPass).toEqual(upgraded);
   });
 
-  it.each([0, 80, 1000])("keeps a previously saved v7 PTT delay of %i through v8 and reload", async pttReleaseDelay => {
+  it.each([0, 80, 1000])("keeps a previously saved v7 PTT delay of %i through v9 and reload", async pttReleaseDelay => {
     const previous = { audio: { inputMode: "ptt", pttKey: "Mouse5", pttReleaseDelay }, desktop: { openAtLogin: true, startMinimized: true, closeToTray: false }, notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } } };
     const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ version: 7, state: previous }) });
     const { useSettings } = await page(storage);
     expect(useSettings.getState()).toMatchObject(previous);
-    expect(JSON.parse(storage.getItem(SETTINGS_KEY)!)).toMatchObject({ version: 8, state: previous });
+    expect(JSON.parse(storage.getItem(SETTINGS_KEY)!)).toMatchObject({ version: SETTINGS_VERSION, state: previous });
     const reloaded = await page(storage);
     expect(reloaded.useSettings.getState()).toMatchObject(previous);
   });
@@ -465,6 +482,31 @@ it("migrates v6 desktop and notification preferences without dropping any saved 
   expect(upgraded).toMatchObject(saved);
   expect(upgraded).toMatchObject({ desktop: { openAtLogin: false, startMinimized: false }, notificationOverrides: { servers: {}, channels: {} } });
 });
+
+  it.each([0, ...versions(8)])("preserves version %i person preferences and both merged migrations through v9 and restart", async version => {
+    const previous = {
+      audio: { inputMode: "ptt", pttKey: "Mouse5", pttReleaseDelay: 80, inputDeviceId: "saved-mic", outputDeviceId: "headphones", automaticSensitivity: false, vadThreshold: -72, noiseStrength: 35 },
+      desktop: { openAtLogin: true, startMinimized: true, closeToTray: false, muteShortcut: "Control+KeyM" },
+      notificationOverrides: { servers: { room: "none" }, channels: { room: { 2: "mentions" } } },
+      userVolumes: { "stable-uid": 0.45, "other-uid": 1.75 },
+      // Preserve preferences from this PR's earlier development builds too.
+      userMuted: { "stable-uid": true },
+      sounds: { enabled: false, volume: 0.2 },
+      bookmarks: [{ id: "saved", address: "127.0.0.1", kind: "gwar", name: "Local", password: "secret", channelPassword: "channel-secret" }],
+      unrelatedFutureField: { value: 42 },
+    };
+    const storage = memory({ [SETTINGS_KEY]: JSON.stringify({ version, state: previous }) });
+    const first = await page(storage);
+    expect(first.useSettings.getState()).toMatchObject(previous);
+    expect(JSON.parse(storage.getItem(SETTINGS_KEY)!)).toMatchObject({ version: 9, state: previous });
+    first.useSettings.getState().setUserMuted("other-uid", true);
+    const second = await page(storage);
+    expect(second.useSettings.getState()).toMatchObject({ ...previous, userMuted: { "stable-uid": true, "other-uid": true } });
+    second.useSettings.getState().setUserMuted("stable-uid", false);
+    const third = await page(storage);
+    expect(third.useSettings.getState()).toMatchObject({ ...previous, userMuted: { "other-uid": true } });
+    expect(third.useSettings.getState().userVolumes).toEqual(previous.userVolumes);
+  });
 
   it("restores saved mute and deafen before the voice store is created", async () => {
     const storage = memory({});
@@ -505,7 +547,7 @@ it("migrates v6 desktop and notification preferences without dropping any saved 
     expect(s()).toMatchObject({ resumeConnection: null, updateVoiceResume: null });
   });
 
-  it.each([1, 2, 3, 4, 5, 6, 7])("migrates version %s to the current settings losslessly, preserving even previously stored sounds", async version => {
+  it.each(versions(8))("migrates version %s to the current settings losslessly, preserving even previously stored sounds", async version => {
     const audio = { inputMode: "ptt", pttKey: "AltRight", inputDeviceId: "saved-mic", outputDeviceId: "saved-speaker", noiseSuppression: false, echoCancellation: false, autoGainControl: false, automaticSensitivity: false, vadThreshold: -72 };
     const onboarding = { completed: true, firstUsedAt: 100, nudgeDismissed: true, roleReceived: true };
     const session = { selfMuted: true, selfDeafened: true, resumeConnection: { address: "a.example", kind: "gwar", name: "A", password: "saved-password", identity: "saved-identity", insecureLan: true }, updateVoiceResume: { address: "a.example", kind: "gwar", version: "1.0", expiresAt: 123456, channel: 2, password: "channel-password" } };

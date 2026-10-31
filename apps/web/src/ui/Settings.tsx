@@ -20,14 +20,15 @@ import { useSettings, type Language, type Theme } from "../state/settings";
 import { useSession, useUi, useVoice, type SettingsTab } from "../state/stores";
 import { VoiceError } from "../voice/engine";
 import { keyLabel } from "./hooks";
-import { Button, Field, Input, Section, Segmented, Select, Slider, Switch } from "./kit";
+import { Button, Field, Input, Section, Segmented, Slider, Switch } from "./kit";
 import { AlphaBadge } from "./BugReport";
 import { SettingsPageLayout, type SettingsPage } from "./SettingsLayout";
 import { VersionLabel } from "./Version";
+import { AudioDevices } from "./AudioDevices";
 import { InputSensitivity } from "./InputSensitivity";
 import { useMicPreview } from "./use-mic-preview";
 
-const DEFAULT = "__default";
+
 
 /** The settings section: the gear opens it on the last tab, the account avatar on the identity tab. */
 export function SettingsSection({ card }: { card?: boolean }) {
@@ -135,7 +136,6 @@ function AudioTab() {
   const desktop = useSettings((s) => s.desktop);
   const setDesktop = useSettings((s) => s.setDesktop);
   const onDesktop = isDesktop();
-  const devices = useVoice((s) => s.devices);
   const engineLevel = useVoice((s) => s.level);
   const voiceState = useVoice((s) => s.state);
   const gateUnsupported = useVoice((s) => s.inputGateSupport === false);
@@ -161,59 +161,13 @@ function AudioTab() {
     </Field>
   );
 
-  useEffect(() => {
-    void engine.listDevices().then((d) => useVoice.getState().set({ devices: d }));
-  }, [engine]);
-
-
-  const withDefault = (list: Array<{ id: string; label: string }>) => [
-    { value: DEFAULT, label: t("audio.systemDefault") },
-    ...list.map((d) => ({ value: d.id, label: d.label })),
-  ];
   const inCall = voiceState !== "idle";
   const level = muted ? 0 : inCall ? engineLevel : preview.level;
   const automatic = gateUnsupported || audio.automaticSensitivity;
 
   return (
     <div>
-      <Section title={t("audio.devices")}>
-        <Field label={t("audio.input")}>
-          {(id) => (
-            <Select
-              id={id}
-              value={audio.inputDeviceId && devices.inputs.some((d) => d.id === audio.inputDeviceId) ? audio.inputDeviceId : DEFAULT}
-              onValueChange={(v) => setAudio({ inputDeviceId: v === DEFAULT ? null : v })}
-              options={withDefault(devices.inputs)}
-            />
-          )}
-        </Field>
-        <Field label={t("audio.output")} hint={engine.capabilities.outputDeviceSelection ? undefined : t("audio.outputUnsupported")}>
-          {(id) => (
-            <Select
-              id={id}
-              disabled={!engine.capabilities.outputDeviceSelection}
-              value={audio.outputDeviceId && devices.outputs.some((d) => d.id === audio.outputDeviceId) ? audio.outputDeviceId : DEFAULT}
-              onValueChange={(v) => setAudio({ outputDeviceId: v === DEFAULT ? null : v })}
-              options={withDefault(devices.outputs)}
-            />
-          )}
-        </Field>
-        <Field label={t("audio.masterVolume")}>
-          {() => (
-            <div className="flex items-center gap-3">
-              <Slider
-                value={Math.round(audio.masterVolume * 100)}
-                min={0}
-                max={150}
-                step={5}
-                onChange={(v) => setAudio({ masterVolume: v / 100 })}
-                label={t("audio.masterVolume")}
-              />
-              <span className="w-12 shrink-0 text-right text-sm tabular-nums text-muted">{Math.round(audio.masterVolume * 100)}%</span>
-            </div>
-          )}
-        </Field>
-      </Section>
+      <AudioDevices />
 
       <Section title={t("audio.inputMode")}>
         <Segmented
@@ -231,11 +185,15 @@ function AudioTab() {
             <Switch checked={automatic} disabled={gateUnsupported} onCheckedChange={(automaticSensitivity) => setAudio({ automaticSensitivity })} label={t("audio.automaticSensitivity")} description={t(gateUnsupported ? "audio.manualUnsupported" : "audio.automaticSensitivityHint")} />
             {automatic ? <div className="flex items-center"><LevelMeter level={level} label={t("audio.level")} /></div> : <InputSensitivity level={level} threshold={audio.vadThreshold} onChange={(vadThreshold) => setAudio({ vadThreshold })} />}
             <div className="flex items-center">
-              {preview.needsPermission ? <Button onClick={preview.request} className="h-8 self-start text-xs">{t("audio.previewEnable")}</Button> : !automatic && !audio.noiseSuppression ? <p className="text-xs text-subtle">{t("audio.noiseSuggestion")}</p> : null}
+              {preview.needsPermission || preview.needsRetry ? <Button disabled={inCall || muted} onClick={preview.request} className="h-8 self-start text-xs">{t(preview.needsRetry ? "audio.previewRetry" : "audio.previewEnable")}</Button> : !automatic && !audio.noiseSuppression ? <p className="text-xs text-subtle">{t("audio.noiseSuggestion")}</p> : null}
             </div>
           </> : <>
             <PttControls key={gateUnsupported ? "unavailable" : "available"} disabled={gateUnsupported} />
           </>}
+        </div>
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1.5" data-mic-playback>
+          <Button size="sm" disabled={inCall || muted} onClick={preview.playback === "idle" ? preview.listen : preview.stop}>{t(preview.playback === "idle" ? "audio.listen" : "audio.stopListening")}</Button>
+          <span role="status" className="text-xs text-muted">{t(inCall ? "audio.listenInCall" : muted ? "audio.listenMuted" : preview.playback === "recording" ? "audio.recording" : preview.playback === "preparing" ? "audio.preparing" : preview.playback === "playing" ? "audio.playing" : "audio.listenHint")}</span>
         </div>
         {preview.error != null && <p role="alert" className="text-sm text-danger">{describeVoiceError(preview.error instanceof VoiceError ? preview.error : new VoiceError("mic_failed", String(preview.error)))}</p>}
       </Section>

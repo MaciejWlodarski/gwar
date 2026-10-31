@@ -1,6 +1,22 @@
 import type { Key } from "./en";
 
 export const pl: Record<Key, string> = {
+  "person.mute": "Wycisz dla mnie",
+  "person.volume": "Głośność dla mnie",
+  "person.muted": "Wyciszono dla mnie",
+  "person.changed": "Głośność dla mnie: {volume}%",
+  "person.controls": "Opcje: {name}",
+  "person.voiceSettings": "Ustawienia dźwięku",
+  "audio.listen": "Posłuchaj siebie",
+  "audio.stopListening": "Zatrzymaj test",
+  "audio.listenHint": "3 s nagrania. Użyj słuchawek.",
+  "audio.recording": "Mów teraz…",
+  "audio.preparing": "Przygotowywanie…",
+  "audio.previewRetry": "Ponów podgląd mikrofonu",
+  "audio.playing": "Odsłuch…",
+  "audio.listenInCall": "Opuść rozmowę, aby zrobić test.",
+  "audio.listenMuted": "Włącz mikrofon, aby zrobić test.",
+
   "notify.scopeTitle": "Ustawienia powiadomień",
   "notify.scopeHint": "Wybierz, które wiadomości mają zwracać twoją uwagę. Wiadomości zostają na czacie.",
   "notify.mode.all": "Wszystkie wiadomości",
@@ -759,6 +775,8 @@ export const pl: Record<Key, string> = {
   "err.voice.output_failed": "Nie udało się otworzyć głośników. Sprawdź urządzenie wyjściowe w ustawieniach.",
   "err.voice.no_mic": "Nie znaleziono mikrofonu. Nadal możesz pisać i słuchać.",
   "err.voice.mic_failed": "Nie udało się otworzyć mikrofonu (czy używa go inna aplikacja?). Nadal możesz pisać i słuchać.",
+  "err.voice.mic_stop_failed": "Nie udało się wyłączyć mikrofonu na czas. Nagranie nie zostało odtworzone.",
+  "err.voice.mic_stopping": "Mikrofon nadal się wyłącza. Spróbuj za chwilę.",
   "err.voice.insecure": "Przeglądarki zezwalają na mikrofon tylko przez https lub localhost. Nadal możesz pisać i słuchać.",
   "err.voice.negotiation": "Nie udało się nawiązać połączenia audio. Czat nadal działa.",
   "err.voice.unsupported": "Ta przeglądarka nie obsługuje głosu. Czat nadal działa.",

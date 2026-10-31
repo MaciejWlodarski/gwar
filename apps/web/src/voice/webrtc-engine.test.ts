@@ -1233,3 +1233,217 @@ describe("live server input gate control", () => {
     expect(gate().configure).toHaveBeenLastCalledWith(expect.objectContaining({ automatic: true, blocked: false }));
   });
 });
+
+it.each([false, true])("records processed input, closes capture, then replays through the selected output (PTT held=%s)", async held => {
+  if (held) { engine.setInputMode("ptt"); engine.setPttReleaseDelay(80); engine.setPttActive(true); }
+  const mic = microphone(), phase = vi.fn(), error = vi.fn(), sink = vi.fn(async () => {});
+  const decoded = deferred<AudioBuffer>();
+  getUserMedia.mockResolvedValue(mic.stream);
+  vi.stubGlobal("AudioContext", class extends Context {
+    setSinkId = sink;
+    createMediaStreamDestination() { return { ...node(), stream: microphone().stream }; }
+    decodeAudioData = () => decoded.promise;
+  });
+  vi.stubGlobal("MediaRecorder", class {
+    state = "inactive";
+    ondataavailable: ((event: { data: Blob }) => void) | null = null;
+    onstop: (() => void) | null = null;
+    start() { this.state = "recording"; }
+    stop() { this.state = "inactive"; this.ondataavailable?.({ data: new Blob(["sample"]) }); this.onstop?.(); }
+  });
+  await engine.setOutputDevice("headphones");
+  const abort = new AbortController();
+  const stop = await engine.startMicTest(vi.fn(), abort.signal, { phase, error });
+  expect(phase).toHaveBeenCalledWith("recording");
+  expect(cueSources).toHaveLength(0);
+  expect(Peer.all).toHaveLength(0);
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(mic.track.stop).toHaveBeenCalledOnce();
+  expect(cueSources).toHaveLength(0);
+  if (held) engine.setPttActive(true);
+  decoded.resolve({} as AudioBuffer);
+  await flush();
+  expect(mic.track.stop).toHaveBeenCalledOnce();
+  expect(getUserMedia).toHaveBeenCalledOnce();
+  expect(sink).toHaveBeenCalledWith("headphones");
+  expect(phase).toHaveBeenLastCalledWith("playing");
+  expect(cueSources[0]!.start).toHaveBeenCalledOnce();
+  expect(mic.track.stop.mock.invocationCallOrder[0]).toBeLessThan(cueSources[0]!.start.mock.invocationCallOrder[0]!);
+  abort.abort();
+  expect(cueSources[0]!.stop).toHaveBeenCalledOnce();
+  stop();
+  expect(error).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["context", "ready"], ["element", "ready"],
+  ["context", "cancel"], ["element", "cancel"],
+  ["context", "fallback"], ["element", "fallback"],
+  ["context", "fallback-cancel"], ["context", "fallback-failed"],
+  ["context", "replace"], ["element", "replace"],
+] as const)("waits for the %s output route before microphone sample playback (%s)", async (route, outcome) => {
+  const routed = deferred<void>(), fallback = deferred<void>(), replacement = deferred<void>();
+  const sink = vi.fn((id: string) => id === "usb" ? replacement.promise : id ? routed.promise : fallback.promise), play = vi.fn(async () => {});
+  class Element { setSinkId(id: string) { return sink(id); } play = play; pause = vi.fn(); srcObject = null; }
+  vi.stubGlobal("HTMLMediaElement", Element);
+  vi.stubGlobal("Audio", Element);
+  vi.stubGlobal("AudioContext", class extends Context {
+    setSinkId = route === "context" ? sink : undefined;
+    createMediaStreamDestination() { return { ...node(), stream: microphone().stream }; }
+    decodeAudioData = async () => ({}) as AudioBuffer;
+  });
+  vi.stubGlobal("MediaRecorder", class {
+    state = "inactive";
+    ondataavailable: ((event: { data: Blob }) => void) | null = null;
+    onstop: (() => void) | null = null;
+    start() { this.state = "recording"; }
+    stop() { this.state = "inactive"; this.ondataavailable?.({ data: new Blob(["sample"]) }); this.onstop?.(); }
+  });
+  await engine.setOutputDevice("headphones");
+  const phase = vi.fn(), error = vi.fn(), abort = new AbortController();
+  await engine.startMicTest(vi.fn(), abort.signal, { phase, error });
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(sink).toHaveBeenCalledWith("headphones");
+  expect(cueSources).toHaveLength(0);
+  expect(phase).not.toHaveBeenCalledWith("playing");
+  if (route === "element") expect(play).not.toHaveBeenCalled();
+  expect(phase).toHaveBeenLastCalledWith("preparing");
+  if (outcome === "cancel") abort.abort();
+  if (outcome === "replace") await engine.setOutputDevice("usb");
+  if (outcome.startsWith("fallback")) {
+    routed.reject(new DOMException("Headphones disappeared", "NotFoundError"));
+    await flush();
+    if (route === "context") {
+      expect(sink).toHaveBeenCalledWith("");
+      expect(cueSources).toHaveLength(0);
+      if (outcome === "fallback-cancel") abort.abort();
+      if (outcome === "fallback-failed") fallback.reject(new Error("Default output also failed"));
+      else fallback.resolve();
+    }
+  } else routed.resolve();
+  await flush();
+  if (outcome === "replace") {
+    expect(cueSources).toHaveLength(0);
+    replacement.resolve();
+    await flush();
+  }
+  if (outcome === "cancel" || outcome === "fallback-cancel" || outcome === "fallback-failed") {
+    expect(cueSources).toHaveLength(0);
+    expect(phase).not.toHaveBeenCalledWith("playing");
+    if (outcome === "fallback-failed") expect(error).toHaveBeenCalledOnce();
+    else expect(error).not.toHaveBeenCalled();
+  } else {
+    expect(cueSources[0]!.start).toHaveBeenCalledOnce();
+    expect(error).not.toHaveBeenCalled();
+  }
+});
+
+it("discards a sample whose decode finishes after cancellation", async () => {
+  const decoded = deferred<AudioBuffer>();
+  const phase = vi.fn();
+  vi.stubGlobal("AudioContext", class extends Context {
+    createMediaStreamDestination() { return { ...node(), stream: microphone().stream }; }
+    decodeAudioData = () => decoded.promise;
+  });
+  vi.stubGlobal("MediaRecorder", class {
+    state = "inactive";
+    ondataavailable: ((event: { data: Blob }) => void) | null = null;
+    onstop: (() => void) | null = null;
+    start() { this.state = "recording"; }
+    stop() { this.state = "inactive"; this.ondataavailable?.({ data: new Blob(["sample"]) }); this.onstop?.(); }
+  });
+  const abort = new AbortController();
+  await engine.startMicTest(vi.fn(), abort.signal, { phase, error: vi.fn() });
+  await vi.advanceTimersByTimeAsync(3000);
+  abort.abort();
+  decoded.resolve({} as AudioBuffer);
+  await flush();
+  expect(cueSources).toHaveLength(0);
+  expect(phase).not.toHaveBeenCalledWith("playing");
+});
+
+it.each([false, true])("retries failed default output routing for the next sample (after fallback=%s)", async fallback => {
+  const retry = deferred<void>();
+  const sink = vi.fn((_id: string) => retry.promise).mockRejectedValueOnce(new Error("Transient route failure"));
+  if (fallback) sink.mockRejectedValueOnce(new Error("Transient default failure"));
+  vi.stubGlobal("AudioContext", class extends Context {
+    setSinkId = sink;
+    createMediaStreamDestination() { return { ...node(), stream: microphone().stream }; }
+    decodeAudioData = async () => ({}) as AudioBuffer;
+  });
+  vi.stubGlobal("MediaRecorder", class {
+    state = "inactive";
+    ondataavailable: ((event: { data: Blob }) => void) | null = null;
+    onstop: (() => void) | null = null;
+    start() { this.state = "recording"; }
+    stop() { this.state = "inactive"; this.ondataavailable?.({ data: new Blob(["sample"]) }); this.onstop?.(); }
+  });
+  if (fallback) await engine.setOutputDevice("headphones");
+  const error = vi.fn();
+  await engine.startMicTest(vi.fn(), undefined, { phase: vi.fn(), error });
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(error).toHaveBeenCalledOnce();
+  expect(cueSources).toHaveLength(0);
+  const failedAttempts = fallback ? 2 : 1;
+  expect(sink).toHaveBeenCalledTimes(failedAttempts);
+  const phase = vi.fn(), nextError = vi.fn();
+  await engine.startMicTest(vi.fn(), undefined, { phase, error: nextError });
+  await vi.advanceTimersByTimeAsync(3000);
+  expect(sink).toHaveBeenCalledTimes(failedAttempts + 1);
+  expect(cueSources).toHaveLength(0);
+  expect(nextError).not.toHaveBeenCalled();
+  expect(phase).toHaveBeenLastCalledWith("preparing");
+  retry.resolve();
+  await flush();
+  expect(cueSources[0]!.start).toHaveBeenCalledOnce();
+  expect(nextError).not.toHaveBeenCalled();
+});
+
+it("keeps browser gain tied to the stable person when receive slots are replaced", () => {
+  const gains: Array<ReturnType<typeof vi.fn>> = [];
+  vi.stubGlobal("Audio", class { srcObject = null; muted = true; play = async () => {}; });
+  vi.stubGlobal("AudioContext", class extends Context {
+    createGain() { const value = super.createGain(); gains.push(value.gain.setTargetAtTime); return value; }
+  });
+  const receive = engine as unknown as { attachSlot(slot: number, track: MediaStreamTrack): void };
+  engine.setUserVolume("stable-person", 0);
+  engine.setSlotOwner(0, "stable-person");
+  receive.attachSlot(0, microphone().track as unknown as MediaStreamTrack);
+  expect(gains.at(-1)).toHaveBeenLastCalledWith(0, 0, 0.015);
+  receive.attachSlot(0, microphone().track as unknown as MediaStreamTrack);
+  expect(gains.at(-1)).toHaveBeenLastCalledWith(0, 0, 0.015);
+  engine.setSlotOwner(0, "different-person");
+  expect(gains.at(-1)).toHaveBeenLastCalledWith(1, 0, 0.015);
+  engine.setUserVolume("different-person", 0.45);
+  expect(gains.at(-1)).toHaveBeenLastCalledWith(0.45, 0, 0.015);
+});
+
+it("retires completed microphone playback and releases its sample and recorder callbacks", async () => {
+  const recorders: Array<{ ondataavailable: unknown; onstop: unknown; onerror: unknown }> = [];
+  const phase = vi.fn();
+  vi.stubGlobal("AudioContext", class extends Context {
+    createMediaStreamDestination() { return { ...node(), stream: microphone().stream }; }
+    decodeAudioData = async () => ({}) as AudioBuffer;
+  });
+  vi.stubGlobal("MediaRecorder", class {
+    state = "inactive";
+    ondataavailable: ((event: { data: Blob }) => void) | null = null;
+    onstop: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    constructor() { recorders.push(this); }
+    start() { this.state = "recording"; }
+    stop() { this.state = "inactive"; this.ondataavailable?.({ data: new Blob(["private microphone sample"]) }); this.onstop?.(); }
+  });
+  await engine.startMicTest(vi.fn(), undefined, { phase, error: vi.fn() });
+  await vi.advanceTimersByTimeAsync(3000);
+  await flush();
+  const replay = cueSources[0]!;
+  expect(replay.buffer).not.toBeNull();
+  (replay.onended as (() => void) | null)?.();
+  await flush();
+  expect(replay.buffer).toBeNull();
+  expect(replay.onended).toBeNull();
+  expect(recorders[0]).toMatchObject({ ondataavailable: null, onstop: null, onerror: null });
+  expect((engine as unknown as { micTests: { runs: Set<unknown> } }).micTests.runs.size).toBe(0);
+  expect(phase).toHaveBeenLastCalledWith("idle");
+});

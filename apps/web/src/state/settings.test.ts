@@ -180,7 +180,7 @@ it.each([6, 7].flatMap(version => ["KeyV", "AltRight", "CapsLock", "F24"].map(pt
   vi.resetModules();
   const { useSettings } = await import("./settings");
   expect(useSettings.getState()).toMatchObject({ ...previous, audio: { ...previous.audio, pttReleaseDelay: 300 } });
-  expect(JSON.parse(data.get("gwar.settings")!).version).toBe(8);
+  expect(JSON.parse(data.get("gwar.settings")!).version).toBe(SETTINGS_VERSION);
   useSettings.getState().setAudio({ pttKey: "Mouse5", pttReleaseDelay: 80 });
   await useSettings.persist.rehydrate();
   expect(useSettings.getState().audio).toMatchObject({ pttKey: "Mouse5", pttReleaseDelay: 80, inputDeviceId: "chosen-mic" });

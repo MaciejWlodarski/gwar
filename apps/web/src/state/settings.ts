@@ -329,6 +329,8 @@ export interface SettingsState extends QualitySettings {
   sounds: SoundSettings;
   /** Per-user playback volume 0..2 keyed by uid. */
   userVolumes: Record<string, number>;
+  /** Local mute by stable uid; the separate volume survives muting. */
+  userMuted: Record<string, true>;
   bookmarks: Bookmark[];
   /** Bookmarks removed on this device, by id; see {@link BOOKMARK_TOMBSTONE_MS}. */
   removedBookmarks: Record<string, BookmarkRemoval>;
@@ -368,6 +370,7 @@ export interface SettingsState extends QualitySettings {
   setSounds(patch: Partial<Omit<SoundSettings, "events">>): void;
   setSoundEvent(cue: SoundCue, enabled: boolean): void;
   setUserVolume(uid: string, volume: number): void;
+  setUserMuted(uid: string, muted: boolean): void;
   saveBookmark(bookmark: BookmarkInput): void;
   removeBookmark(id: string): void;
   /** The list after a sync with Gwar Connect; not counted as an edit. */
@@ -451,6 +454,7 @@ export const useSettings = create<SettingsState>()(
       }),
       sounds: defaultSounds,
       userVolumes: {},
+      userMuted: {},
       bookmarks: [],
       removedBookmarks: {},
       bookmarkAccount: null,
@@ -486,6 +490,12 @@ export const useSettings = create<SettingsState>()(
           else userVolumes[uid] = volume;
           return { userVolumes };
         }),
+      setUserMuted: (uid, muted) => set((s) => {
+        const userMuted = { ...s.userMuted };
+        if (muted) userMuted[uid] = true;
+        else delete userMuted[uid];
+        return { userMuted };
+      }),
       saveBookmark: (input) =>
         set((s) => {
           // Saving a server that is already saved updates that bookmark, in its place.
@@ -599,7 +609,9 @@ export const useSettings = create<SettingsState>()(
         if (version < 6) p = { ...p, sounds: readSounds(p.sounds) };
         if (version < 7) p = { ...p, desktop: { ...defaultDesktop, ...(p.desktop as object ?? {}) }, notificationOverrides: readNotificationOverrides(p.notificationOverrides) };
         // v8 adds the release delay; key codes and every other setting stay intact.
-        return version < 8 ? { ...p, audio: validAudio(p.audio) } : p;
+        if (version < 8) p = { ...p, audio: validAudio(p.audio) };
+        // v9 adds local mute without changing retained person volumes or other preferences.
+        return version < 9 ? { userMuted: {}, ...p } : p;
       },
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
@@ -607,6 +619,7 @@ export const useSettings = create<SettingsState>()(
           notifications: { ...current.notifications, ...(p.notifications ?? {}) },
           notificationOverrides: readNotificationOverrides(p.notificationOverrides),
           sounds: readSounds(p.sounds),
+          userMuted: p.userMuted && typeof p.userMuted === "object" && !Array.isArray(p.userMuted) ? Object.fromEntries(Object.entries(p.userMuted).filter(([, v]) => v === true)) : {},
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,
           serverGroups: validGroups(p.serverGroups),

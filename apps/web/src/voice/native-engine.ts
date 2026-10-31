@@ -11,6 +11,7 @@ import {
   type CaptureOptions,
   type DeviceList,
   type InputMode,
+  type MicTestPlayback,
   type VoiceEngine,
   type VoiceEvents,
   type VoiceState,
@@ -447,14 +448,14 @@ export class NativeVoiceEngine implements VoiceEngine {
     return this.invoke("mic_permission");
   }
 
-  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal): Promise<() => void> {
-    return this.micTests.start(async aborted => {
+  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal, playback?: MicTestPlayback): Promise<() => void> {
+    return this.micTests.start(async (aborted, complete) => {
       if (this.state !== "idle" || this.muted || this.deafened || aborted.aborted) return () => {};
-      return this.openMicTest(onLevel, aborted);
+      return this.openMicTest(onLevel, aborted, complete, playback);
     }, signal);
   }
 
-  private async openMicTest(onLevel: (level: number) => void, signal: AbortSignal): Promise<() => void | Promise<void>> {
+  private async openMicTest(onLevel: (level: number) => void, signal: AbortSignal, complete: () => Promise<boolean>, playback?: MicTestPlayback): Promise<() => void | Promise<void>> {
     const test = ++this.micTestId;
     // Apply queued mute/device controls before the native preview checks its capture policy.
     await this.queue;
@@ -467,24 +468,31 @@ export class NativeVoiceEngine implements VoiceEngine {
       smooth = target > smooth ? target : smooth * 0.8 + target * 0.2;
       onLevel(smooth < 0.01 ? 0 : smooth);
     });
+    const offState = playback ? await api.listen<{ owner: number; test: number; state: "recording" | "preparing" | "playing" | "idle"; error?: string; error_kind?: "capture_shutdown" }>("voice://test-state", p => {
+      if (p.owner !== owner || p.test !== test || test !== this.micTestId || signal.aborted) return;
+      if (p.error) playback.error(new VoiceError(p.error_kind === "capture_shutdown" ? "mic_stop_failed" : "output_failed", p.error));
+      else if (p.state === "idle") void complete().then(current => { if (current) playback.phase("idle"); });
+      else playback.phase(p.state);
+    }) : () => {};
     // Listener setup can finish after a newer test has already opened capture.
     if (test !== this.micTestId || signal.aborted) {
-      off();
+      off(); offState();
       return () => {};
     }
     const retire = () => { void this.invoke("mic_test_stop", { test }).catch(() => {}); };
     signal.addEventListener("abort", retire, { once: true });
     try {
-      await this.invoke("mic_test_start", { input: this.inputDevice, test });
+      await this.invoke("mic_test_start", { input: this.inputDevice, test, playback: !!playback });
     } catch (e) {
-      off();
+      off(); offState();
       signal.removeEventListener("abort", retire);
       if (signal.aborted) { await this.invoke("mic_test_stop", { test }).catch(() => {}); return () => {}; }
-      throw new VoiceError("mic_failed", typeof e === "string" ? e : String(e));
+      const message = e instanceof Error ? e.message : String(e);
+      throw new VoiceError(message === "microphone_shutdown_pending" ? "mic_stopping" : "mic_failed", message);
     }
     void this.listDevices().then((d) => this.emit("devices", d));
     return () => {
-      off();
+      off(); offState();
       signal.removeEventListener("abort", retire);
       // A late result belongs to its own test, never the replacement's capture.
       if (test === this.micTestId) { ++this.micTestId; onLevel(0); }

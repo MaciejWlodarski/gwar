@@ -17,7 +17,7 @@ checks the injected calling webview window and rejects any label other than
 | `voice_stop {owner, run}` | Current owner only; retires this or older runs, including starts still pending in DNS or device opening. |
 | `voice_play_cue {owner, cue, volume}` | Current owner and main window only. Accepts only the built-in score names and a clamped 0..1 volume. During voice, mixes local PCM into the selected output before the AEC render reference, independent of voice volume. Outside voice, opens output only (never the microphone). Deafen permits only mute/unmute/deafen/undeafen confirmations. |
 | `voice_set_muted`, `voice_set_deafened`, `voice_set_ptt`, `voice_set_ptt_release_delay`, `voice_set_input_mode`, `voice_set_master_gain`, `voice_set_slot_gain`, `voice_set_devices` | Require `owner` alongside their existing arguments. Reject previous-view controls under the voice lock. |
-| `mic_test_start {owner, test, input?}`, `mic_test_stop {owner, test?}` | Current owner only. A monotonically increasing test id fences cancelled starts and stale cleanup. Refuses capture while muted/deafened, in voice or in a hidden/unfocused window. Bootstrap and native focus loss/close also retire the preview. |
+| `mic_test_start {owner, test, input?, playback?}`, `mic_test_stop {owner, test?}` | Current owner only. A monotonically increasing test id fences cancelled starts and stale cleanup. Refuses capture while muted/deafened, in voice or in a hidden/unfocused window. Bootstrap and native focus loss/close also retire the preview. |
 | `mic_permission {owner}` → `granted` / `prompt` / `denied` / `unknown` | Current owner only. Reads OS authorization without opening a device or requesting permission. Unknown platforms require an explicit preview gesture. |
 | `audio_devices`, `open_mic_privacy_settings` | No ownership token: enumeration or a fixed OS settings URI. |
 
@@ -58,6 +58,26 @@ frames and reset the local hangover. Native SDP advertises input-gate version 2;
 automatic mode uses the legacy server criterion. Older servers keep automatic
 activation; manual sensitivity is unavailable and unsupported PTT stays closed.
 
+An explicit `playback: true` microphone test records up to three seconds of processed
+48 kHz mono PCM in memory. It requests capture shutdown, then waits up to two seconds
+for the device thread to acknowledge actual stream destruction before opening the
+chosen output. A shutdown timeout prevents playback and reports a localized capture
+shutdown failure. `voice://test-state {owner, test, state, error?, error_kind?}` reports `recording`,
+`preparing`, `playing` and `idle`; only the matching owner/test may update the UI. Retirement,
+including native window focus/visibility loss, immediately cancels both capture
+and sample output. The default meter-only preview remains silent. No sample is
+uploaded, written to disk or retained between tests. Output opening/playback
+failures are reported to the matching UI test. `error_kind: "capture_shutdown"`
+distinguishes unacknowledged input shutdown from an output-device failure.
+The settings UI offers an explicit silent-preview retry after capture-shutdown
+failure. Focus, device/settings changes and Settings remounts cannot retry it
+automatically; an eligible user request is required.
+Native state retains the previous input's shutdown acknowledgement independently
+of its test/owner. `mic_test_start` refuses with `microphone_shutdown_pending` while
+that input is opening or not yet destroyed, including after Stop or bootstrap.
+Acquisition rechecks the gate under the ownership lock before calling device I/O.
+Once destruction is acknowledged, a later explicit retry is permitted. The UI
+maps this refusal to a short localized message and retains the silent retry action.
 
 Passive global PTT owns native capture independently of the webview. While it is
 configured, `voice_set_ptt` cannot open or close that gate: UI events only reflect

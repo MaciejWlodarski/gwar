@@ -12,7 +12,7 @@ import { NewerDataError } from "./stored-data";
 
 export const SETTINGS_KEY = "gwar.settings";
 /** zustand's `version` of the settings (state/settings.ts). */
-export const SETTINGS_VERSION = 8;
+export const SETTINGS_VERSION = 9;
 
 let problem: unknown;
 const listeners = new Set<() => void>();

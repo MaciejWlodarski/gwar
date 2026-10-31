@@ -10,6 +10,11 @@ import { dbToLevel } from "./input-sensitivity";
 
 export type InputMode = "vad" | "ptt";
 export type MicPermission = "granted" | "prompt" | "denied" | "unknown";
+export interface MicTestPlayback {
+  /** Natural idle is reported only after the run, recording and playback resources retire. */
+  phase(value: "recording" | "preparing" | "playing" | "idle"): void;
+  error(error: unknown): void;
+}
 
 export interface CaptureOptions {
   noiseSuppression: boolean;
@@ -25,6 +30,8 @@ export type VoiceErrorKind =
   | "mic_denied" // permission refused
   | "no_mic" // no input device
   | "mic_failed" // device busy / other capture error
+  | "mic_stop_failed" // input shutdown was not acknowledged; the sample was not played
+  | "mic_stopping" // the preceding native input has not been destroyed; no new input was opened
   | "insecure" // page is not a secure context, browsers hide the microphone
   | "output_failed" // speakers could not be opened / disappeared (desktop)
   | "negotiation" // WebRTC offer/answer failed
@@ -141,7 +148,7 @@ export interface VoiceEngine {
   /** Read-only permission check: never opens the microphone or prompts. */
   micPermission(): Promise<MicPermission>;
   /** Local-only capture; cancellation also retires a pending device request. */
-  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal): Promise<() => void>;
+  startMicTest(onLevel: (level: number) => void, signal?: AbortSignal, playback?: MicTestPlayback): Promise<() => void>;
 
   on<E extends keyof VoiceEvents>(event: E, handler: (value: VoiceEvents[E]) => void): () => void;
 }

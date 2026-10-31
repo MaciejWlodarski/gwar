@@ -180,7 +180,7 @@ describe("native microphone test replacement", () => {
     expect(bridge.invoke.mock.calls.some(([command]) => command === "mic_test_start")).toBe(false);
     unmuted.resolve();
     const stop = await preview;
-    expect(bridge.invoke).toHaveBeenCalledWith("mic_test_start", { owner: 1, input: null, test: 1 });
+    expect(bridge.invoke).toHaveBeenCalledWith("mic_test_start", { owner: 1, input: null, test: 1, playback: false });
     stop();
   });
 
@@ -413,4 +413,81 @@ describe("native acknowledged input mode transitions", () => {
     await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: false }));
     expect(bridge.invoke).not.toHaveBeenCalledWith("voice_set_gate_ready", { owner: 1, run, serial: 1, ready: true });
   });
+});
+
+it("scopes recorded-sample status and errors to its owner/test and retires playback on abort", async () => {
+  const view = engine(), abort = new AbortController(), phase = vi.fn(), error = vi.fn();
+  await view.startMicTest(vi.fn(), abort.signal, { phase, error });
+  expect(bridge.invoke).toHaveBeenCalledWith("mic_test_start", { owner: 1, input: null, test: 1, playback: true });
+  emit("voice://test-state", { owner: 2, test: 1, state: "playing" });
+  emit("voice://test-state", { owner: 1, test: 2, state: "playing" });
+  expect(phase).not.toHaveBeenCalled();
+  emit("voice://test-state", { owner: 1, test: 1, state: "playing" });
+  expect(phase).toHaveBeenCalledWith("playing");
+  emit("voice://test-state", { owner: 1, test: 1, state: "idle", error: "Output unavailable" });
+  expect(error).toHaveBeenCalledWith(expect.objectContaining({ kind: "output_failed" }));
+  abort.abort();
+  phase.mockClear(); error.mockClear();
+  emit("voice://test-state", { owner: 1, test: 1, state: "playing", error: "obsolete" });
+  expect(phase).not.toHaveBeenCalled(); expect(error).not.toHaveBeenCalled();
+  await vi.waitFor(() => expect(bridge.invoke).toHaveBeenCalledWith("mic_test_stop", { owner: 1, test: 1 }));
+});
+
+it("applies the same person's saved gain to replacement native receive slots", async () => {
+  const view = engine();
+  view.setUserVolume("stable-uid", 0);
+  view.setSlotOwner(0, "stable-uid");
+  view.setSlotOwner(1, "stable-uid");
+  await view.stop();
+  expect(bridge.invoke).toHaveBeenCalledWith("voice_set_slot_gain", { owner: 1, slot: 0, gain: 0 });
+  expect(bridge.invoke).toHaveBeenCalledWith("voice_set_slot_gain", { owner: 1, slot: 1, gain: 0 });
+  view.setSlotOwner(0, "different-uid");
+  await view.stop();
+  expect(bridge.invoke).toHaveBeenLastCalledWith("voice_stop", expect.anything());
+  expect(bridge.invoke).toHaveBeenCalledWith("voice_set_slot_gain", { owner: 1, slot: 0, gain: 1 });
+});
+
+it.each([false, true].flatMap(cancelled => [false, true].map(held => ({ cancelled, held }))))("retires native sample before completion (cancelled=$cancelled, PTT held=$held)", async ({ cancelled, held }) => {
+  const closed = deferred<void>(), invoke = bridge.invoke.getMockImplementation()!;
+  bridge.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+    if (command === "mic_test_stop") await closed.promise;
+    return invoke(command, args);
+  });
+  const view = engine(), phase = vi.fn(), abort = new AbortController();
+  if (held) { view.setInputMode("ptt"); view.setPttActive(true); }
+  await view.startMicTest(vi.fn(), abort.signal, { phase, error: vi.fn() });
+  emit("voice://test-state", { owner: 1, test: 1, state: "idle" });
+  await Promise.resolve();
+  expect(phase).not.toHaveBeenCalledWith("idle");
+  if (cancelled) abort.abort();
+  closed.resolve();
+  await vi.waitFor(() => expect((view as unknown as { micTests: { runs: Set<unknown> } }).micTests.runs.size).toBe(0));
+  if (cancelled) expect(phase).not.toHaveBeenCalled();
+  else expect(phase).toHaveBeenCalledExactlyOnceWith("idle");
+  expect(listeners.get("voice://test-state")?.size).toBe(0);
+  expect(listeners.get("voice://test-level")?.size).toBe(0);
+});
+
+it("reports an unconfirmed capture shutdown honestly instead of blaming the speakers", async () => {
+  const view = engine(), error = vi.fn();
+  await view.startMicTest(vi.fn(), undefined, { phase: vi.fn(), error });
+  emit("voice://test-state", { owner: 1, test: 1, state: "idle", error: "shutdown timed out", error_kind: "capture_shutdown" });
+  expect(error).toHaveBeenCalledWith(expect.objectContaining({ kind: "mic_stop_failed" }));
+});
+
+it.each([false, true])("reports shutdown-pending refusal and permits later explicit retry (PTT held=%s)", async held => {
+  const invoke = bridge.invoke.getMockImplementation()!;
+  let pending = true;
+  bridge.invoke.mockImplementation(async (command: string, args?: Record<string, unknown>) => {
+    if (command === "mic_test_start" && pending) throw "microphone_shutdown_pending";
+    return invoke(command, args);
+  });
+  const view = engine();
+  if (held) { view.setInputMode("ptt"); view.setPttReleaseDelay(80); view.setPttActive(true); }
+  await expect(view.startMicTest(vi.fn())).rejects.toMatchObject({ kind: "mic_stopping" });
+  expect(bridge.invoke.mock.calls.filter(([command]) => command === "mic_test_start")).toHaveLength(1);
+  if (held) view.setPttActive(true);
+  pending = false;
+  await expect(view.startMicTest(vi.fn())).resolves.toBeTypeOf("function");
+  expect(bridge.invoke).toHaveBeenCalledWith("mic_test_start", expect.objectContaining({ playback: false }));
 });

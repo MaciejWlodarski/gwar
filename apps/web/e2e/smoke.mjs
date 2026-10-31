@@ -816,7 +816,7 @@ async function main() {
 
   await check("user volume slider persists per uid", async () => {
     await treeItem(b, /Alice/).click({ button: "right" });
-    const slider = b.getByRole("slider", { name: "Volume" });
+    const slider = b.getByRole("slider", { name: "Volume for me", exact: true });
     await slider.focus();
     await b.keyboard.press("ArrowRight");
     await b.keyboard.press("ArrowRight");
@@ -835,10 +835,16 @@ async function main() {
     // A new session joins from Alice's point of view and the old one leaves.
     await waitFor(() => fa.events("client.joined").length > before, "Bob rejoined", 15000);
     await b.getByText("Voice connected").waitFor({ timeout: 20000 });
-    await b.getByText("Reconnected to the server").click({ trial: true }).catch(() => {});
+    await b.waitForFunction(async () => {
+      const { useSession, useVoice } = await window.__gwarE2eImport("/src/state/stores.ts");
+      return useSession.getState().phase === "online" && useVoice.getState().state === "connected";
+    });
     await treeItem(b, /Alice/).waitFor();
     await b.getByRole("tab", { name: "Server" }).click();
-    await b.getByText("Reconnected to the server").waitFor();
+    await b.waitForFunction(async () => {
+      const { useSession } = await window.__gwarE2eImport("/src/state/stores.ts");
+      return useSession.getState().activeThread === "server" && useSession.getState().phase === "online";
+    });
     const pinAfter = await storedPin(b, CLIENT_ALIAS);
     if (pinBefore !== pinAfter) throw new Error("second connection replaced the first-contact pin");
     const fingerprint = await serverFingerprint(b);
@@ -1686,7 +1692,13 @@ async function main() {
     await a.getByLabel("Name").fill(BULK);
     await a.getByRole("button", { name: "Create" }).click();
     await treeItem(a, BULK).dblclick();
-    await a.getByText(`You joined ${BULK}`).waitFor();
+    await a.waitForFunction(async name => {
+      const { useSession } = await window.__gwarE2eImport("/src/state/stores.ts");
+      const state = useSession.getState();
+      return state.activeThread === "channel" && state.channels[state.viewChannel]?.name === name &&
+        state.clients[state.me?.session]?.channel === state.viewChannel;
+    }, BULK);
+    await a.getByRole("heading", { name: BULK, exact: true }).waitFor();
     for (let i = 1; i <= 60; i++) {
       await composer(a).fill(`bulk-${i}`);
       await composer(a).press("Enter");

@@ -356,22 +356,6 @@ function removeClient(state: SessionState, id: number): SessionState {
   return { ...state, clients, slots: state.slots.map((s) => (s === id ? null : s)) };
 }
 
-/** Adds join/leave notices to my current channel's thread. */
-function channelNotices(prev: SessionState, next: SessionState, at: number, id: number): SessionState {
-  const mine = next.me?.session;
-  if (id === mine) return next;
-  const myCh = myChannelId(next);
-  if (myCh === null) return next;
-  const before = prev.clients[id];
-  const after = next.clients[id];
-  const wasHere = before?.channel === myCh;
-  const isHere = after?.channel === myCh;
-  if (wasHere === isHere) return next;
-  const name = (after ?? before)?.nickname ?? "?";
-  const text: SysText = { key: isHere ? "sys.user_joined_channel" : "sys.user_left_channel", params: { name }, uid: (after ?? before)?.uid };
-  return withThread(next, channelThreadKey(myCh), (t) => pushItem(t, sysItem(at, text, `${id}${isHere ? "j" : "l"}`), false));
-}
-
 function reduceEvent(state: SessionState, event: Event, now: number, verified = false, authentic = false): SessionState {
   switch (event.ev) {
     case "chat.sealed":
@@ -431,7 +415,6 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
     case "client.joined":
     case "client.updated": {
       const client = event.d;
-      const prev = state;
       const prevMyChannel = myChannelId(state);
       let next: SessionState = upsertMember({ ...state, clients: { ...state.clients, [client.id]: client } }, client, now);
       // A client that is no longer sharing has no share: its stop may have been told to its viewers only.
@@ -441,11 +424,8 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
         const ch = client.channel;
         if (ch !== prevMyChannel && ch !== null) {
           // I entered a voice channel (by my own request or an admin's): show its chat.
-          const name = next.channels[ch]?.name ?? "";
           next = { ...next, viewChannel: ch };
-          next = withThread(next, channelThreadKey(ch), (t) =>
-            pushItem({ ...t, locked: false }, sysItem(now, { key: "sys.you_joined_channel", params: { name } }, "me"), false),
-          );
+          next = withThread(next, channelThreadKey(ch), t => ({ ...t, locked: false }));
         }
         return next;
       }
@@ -454,7 +434,7 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
       if (dm?.peer && dm.peer.name !== client.nickname) {
         next = withThread(next, dmKey(client.uid), (t) => ({ ...t, peer: { uid: client.uid, name: client.nickname } }));
       }
-      return channelNotices(prev, next, now, client.id);
+      return next;
     }
     case "client.left": {
       const gone = state.clients[event.d.client];
@@ -462,7 +442,7 @@ function reduceEvent(state: SessionState, event: Event, now: number, verified = 
       let next = removeClient({ ...state, shares: withoutShares(state.shares, s => s.client === left) }, left);
       // Still known, now offline (unless another session of the same user remains).
       if (gone && !Object.values(next.clients).some((c) => c.uid === gone.uid)) next = upsertMember(next, gone, now);
-      return channelNotices(state, next, now, event.d.client);
+      return next;
     }
     // Shown by the controller (a toast); nothing in the session changes.
     case "client.poked":
@@ -621,9 +601,7 @@ export function reduce(state: SessionState, action: Action): SessionState {
       if (active && next.focused) {
         next = withThread(next, active, (t) => ({ ...t, unread: 0, mentions: 0 }));
       }
-      if (action.resync) {
-        next = withThread(next, "server", (t) => pushItem(t, sysItem(action.now, { key: "sys.reconnected" }, "re"), false));
-      } else if (w.server.welcome.trim()) {
+      if (!action.resync && w.server.welcome.trim()) {
         next = withThread(next, "server", (t) =>
           pushItem(t, sysItem(action.now, { key: "sys.welcome", params: { text: w.server.welcome.trim() } }, "w"), false),
         );
