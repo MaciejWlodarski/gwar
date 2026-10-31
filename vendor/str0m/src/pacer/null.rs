@@ -46,12 +46,12 @@ impl Pacer for NullPacer {
 
     fn handle_timeout(
         &mut self,
-        _now: Instant,
+        now: Instant,
         iter: impl Iterator<Item = QueueState>,
     ) -> Option<PaddingRequest> {
         self.needs_timeout_before_next_poll = false;
         self.queue_states.clear();
-        self.queue_states.extend(iter);
+        self.queue_states.extend(iter.filter(|q| q.ready(now)));
 
         None
     }

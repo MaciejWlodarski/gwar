@@ -1628,6 +1628,121 @@ mod tests {
     use crate::packet::RedEncoder;
 
     #[test]
+    fn partial_probe_survives_temporary_credit_deferral() {
+        probe_survives_credit_deferral(true);
+    }
+
+    #[test]
+    fn unstarted_probe_waits_for_credit_without_busy_polling() {
+        probe_survives_credit_deferral(false);
+    }
+
+    fn probe_survives_credit_deferral(first_packet: bool) {
+        use crate::bwe::RtpSendBudget;
+        use crate::media::MediaKind;
+
+        #[derive(Debug)]
+        struct CreditAt(Instant, bool);
+        impl RtpSendGate for CreditAt {
+            fn poll_budget(&mut self, now: Instant, _: Option<Bitrate>) -> RtpSendBudget {
+                RtpSendBudget {
+                    media_bytes: 1346,
+                    extra_bytes: if now >= self.0 {
+                        100_000
+                    } else if self.1 {
+                        350
+                    } else {
+                        0
+                    },
+                    retry_at: self.0,
+                }
+            }
+            fn sent(&mut self, _: Instant, _: usize, _: bool) {
+                self.1 = false;
+            }
+        }
+        let now = Instant::now();
+        let ready = now + Duration::from_millis(10);
+        let crypto = Arc::new(crate::crypto::from_feature_flags());
+        let mut sender = RtcConfig::default()
+            .set_crypto_provider(crypto.clone())
+            .enable_bwe(Some(Bitrate::mbps(1)))
+            .set_rtp_mode(true)
+            .build(now);
+        let mut peer = RtcConfig::default()
+            .set_crypto_provider(crypto.clone())
+            .set_rtp_mode(true)
+            .build(now);
+        let mut api = sender.sdp_api();
+        let mid = api.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+        let (offer, pending) = api.apply().unwrap();
+        let answer = peer.sdp_api().accept_offer(offer).unwrap();
+        sender.sdp_api().accept_answer(pending, answer).unwrap();
+        sender
+            .direct_api()
+            .stream_tx_by_mid(mid, None)
+            .unwrap()
+            .set_unpaced(true);
+        let s = &mut sender.session;
+        s.set_keying_material(
+            KeyingMaterial::new(&[7; 60]),
+            &crypto,
+            SrtpProfile::AES128_CM_SHA1_80,
+            true,
+        );
+        s.set_bwe_desired_bitrate(Bitrate::mbps(3));
+        s.set_bwe_egress_pacing(Bitrate::kbps(800), Bitrate::mbps(1));
+        s.set_rtp_send_gate(Some(Box::new(CreditAt(ready, first_packet))));
+        s.handle_timeout(now).unwrap();
+        let cluster = s
+            .pacer
+            .active_cluster()
+            .expect("start initial capacity probe");
+        let mut emitted = 0;
+        let mut at = now;
+        let mut callbacks = 0;
+        let deadline = loop {
+            callbacks += 1;
+            assert!(callbacks <= 16, "busy polling before extras credit returns");
+            s.handle_timeout(at).unwrap();
+            s.feedback_tx.clear();
+            emitted += usize::from(s.poll_packet(at).is_some());
+            assert_eq!(
+                s.pacer.active_cluster(),
+                Some(cluster),
+                "a credit wait must not cancel a probe"
+            );
+            let next = s.poll_timeout().0.expect("a useful credit retry");
+            if next >= ready {
+                break next;
+            }
+            // Drive the returned deadline, including same-clock pacer updates.
+            // Never advance time artificially to escape a busy loop.
+            at = at.max(next);
+        };
+        assert_eq!(
+            emitted,
+            usize::from(first_packet),
+            "only the initial grant may send"
+        );
+        assert_eq!(
+            deadline, ready,
+            "wait for useful credit, not an expired probe wake"
+        );
+        assert!(deadline > at);
+        // Actual packet/TWCC progress resumes at the advertised credit deadline.
+        let twcc = s.twcc;
+        s.handle_timeout(deadline).unwrap();
+        s.feedback_tx.clear();
+        assert!(
+            s.poll_packet(deadline).is_some(),
+            "probe resumes when credit returns"
+        );
+        assert_eq!(s.twcc, twcc + 1, "only an actual send advances TWCC");
+    }
+
+    #[test]
     fn blocked_repair_does_not_hold_other_media_before_twcc() {
         use crate::bwe::RtpSendBudget;
         use crate::media::MediaKind;

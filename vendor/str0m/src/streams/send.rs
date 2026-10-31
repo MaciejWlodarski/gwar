@@ -1239,15 +1239,9 @@ impl StreamTx {
         QueueState {
             midrid: self.midrid,
             unpaced,
-            use_for_padding: use_for_padding && !deferred,
-            snapshot: if deferred {
-                QueueSnapshot {
-                    created_at: now,
-                    ..Default::default()
-                }
-            } else {
-                snapshot
-            },
+            use_for_padding,
+            send_after: self.send_deferred_until,
+            snapshot,
         }
     }
 

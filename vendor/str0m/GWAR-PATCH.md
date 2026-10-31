@@ -16,6 +16,11 @@ The earliest deferred stream supplies a retry wake; deferral never allocates
 sequence numbers or TWCC. Queue statistics still include deferred packets.
 The gate survives BWE reset; resetting buffers/padding or passing `None` clears
 pending deferrals. Fallback probe eligibility also respects its stream's wait.
+Queue states keep probe capability and queued packets throughout a temporary
+credit wait; `send_after` controls packet readiness separately. Pending padding
+therefore keeps its active cluster and schedules the credit deadline instead of
+an expired Probe2 wake. Regressions cover both partial and unstarted probes,
+including future-only retry and resumed packet/TWCC progress when credit returns.
 The depleted-extras regression checks audio and unrelated video delivery within
 20 ms, a new original on the blocked stream, and eventual repair at 60 ms.
 

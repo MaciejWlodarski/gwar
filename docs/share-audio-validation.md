@@ -10,7 +10,13 @@ Round 4 candidate `80bc5dd3` was pushed by the owner as `ead2fc7a`. Both sides
 pass the unchanged eight-case startup gate. One point estimate crosses a
 sampling step; the owner accepted that the measurements cannot resolve a 20%
 timing difference in that case. The raw observations and sampling limits are
-recorded below. Round 5 changes only per-stream credit deferral and its tests.
+recorded below. Round 6 separates temporary send readiness from probe capability
+and adds finer paired startup measurements; it does not change the committed gate.
+
+**The finer observed times do not all meet the 20% requirement.** One paired
+H.264 barcode result is 0.576 s on main versus 1.157 s on the fix. The full
+two-run table and measurement limits are recorded in round 6 below; no timing
+parity or startup-acceptance claim is made.
 
 All services are local and media is generated. No production Gwar or TeamSpeak
 service, physical microphone, or installed Gwar application was used. Rust
@@ -360,9 +366,9 @@ with **zero probes and no CPU exemptions** in every case. Sampled target times:
 | `h264-busy60-0` | 1.476 | 1.568 | PASS / PASS |
 | `h264-busy60-1` | 1.568 | 1.547 | PASS / PASS |
 
-Every point estimate in this run is within 20% of main (largest slowdown 6.8%);
-the approximately 500 ms observation step still limits timing precision as
-explained above. No startup implementation or assertion changed in this round.
+These approximately 500 ms observations cannot establish the 20% timing bound;
+the finer paired measurements below supersede that comparison for timing.
+No startup implementation or assertion changed in this round.
 The full fresh run is retained in `/tmp/gwar209-r5-startup-main/` and
 `/tmp/gwar209-r5-startup-head/`, with matching `.log` files and the paired
 `/tmp/gwar209-r5-comparison.json`. Rust logs are
@@ -374,6 +380,82 @@ runner/browser descendants and the server/preview groups were confirmed gone.
 The unrelated older mobile-probe server was left alone. The ownership check is
 retained in `/tmp/gwar209-r5-process-cleanup.json`.
 
+
+## Round 6: probe capability survives credit waits
+
+Round 5 incorrectly hid deferred queues and their padding capability. With
+1,346 B of media credit but no extras until 10 ms, that canceled a partially
+sent probe at 3 ms. An unstarted fallback probe instead kept returning an
+expired Probe2 deadline. Both committed regressions fail on `115f040d`, pass on
+an `ead2fc7a` source archive with only those tests added, and pass with this fix:
+`partial_probe_survives_temporary_credit_deferral` and
+`unstarted_probe_waits_for_credit_without_busy_polling`.
+
+Queue states now retain their packets and probe capability. A separate
+`send_after` deadline controls packet eligibility in both pacers. A pending
+padding request therefore keeps its cluster and waits for useful credit instead
+of falling through to an expired probe wake. Other eligible media still runs;
+the previous blocked-repair/audio regression remains passing. The two new
+regressions check the same cluster survives, only the initial grant sends,
+the next deadline is in the future, and an actual packet advances TWCC when
+credit returns. No pre-dequeue or pre-TWCC budget check was removed.
+
+The final Rust source passes 783 str0m library tests, 241 screen tests, 19 local
+integration tests, the separately executed 96-case voice matrix, formatting and
+Clippy with `-D warnings`. The strict 1 Mb/s adversarial p99 is still
+9.048–9.288 ms. Combined 2.5 Mb/s production release delivers every packet with
+zero evictions/drops at 5/10/20/30 ms service. Live-BWE startup sustains exactly
+7.872 Mb/s at 10/20 ms with no pause (estimates 17.707/17.193 Mb/s).
+Failing-before, fixed, and old-reference logs are
+`/tmp/gwar209-r6-{before-final,str0m-final,ead-tests-final}.log`; production logs use the same prefix.
+
+### Finer paired startup measurements
+
+The committed 60-second startup gate passes 8/8 on the repaired source, with
+zero probes and no CPU exemptions. Separately, a local, uncommitted copy changes
+only the observation wait: 50 ms during the first ten seconds, then 500 ms.
+Every assertion and the committed gate remain unchanged. The local copy was
+run in order main 1, fix 1, main 2, fix 2, with all eight 60-second cases in each
+run. Both revisions use their own server/web artifacts, Chromium 153.0.8010.12,
+generated media and identical settings; no builds or tests ran concurrently.
+Main is exactly `1e0e6d60`. The measured production source was not changed
+while the runs were in progress.
+
+Actual early observation gaps have median 54.9 ms, p95 56.4 ms and maximum
+80.6 ms. All 32 target transitions have a preceding non-target observation;
+their brackets are 53.3–67.7 ms wide. `firstTargetAt` retains its existing
+source/encoder/viewer size definition and clock origin. Seconds to target:
+
+| Case | Main run 1 (s) | Fix run 1 (s) | Main run 2 (s) | Fix run 2 (s) |
+|---|---:|---:|---:|---:|
+| `vp9-barcode20-0` | 0.622 | 0.723 | 0.741 | 0.761 |
+| `vp9-barcode20-1` | 1.098 | 1.097 | 1.030 | 1.191 |
+| `vp9-busy60-0` | 1.196 | 1.234 | 1.132 | 1.232 |
+| `vp9-busy60-1` | 1.219 | 1.138 | 1.256 | 1.183 |
+| `h264-barcode20-0` | 1.107 | 1.114 | 1.110 | 1.139 |
+| `h264-barcode20-1` | 1.140 | 1.150 | 0.576 | 1.157 |
+| `h264-busy60-0` | 1.153 | 1.165 | 1.078 | 1.088 |
+| `h264-busy60-1` | 1.169 | 1.171 | 1.181 | 1.181 |
+
+All four finer matrices pass their unchanged gate assertions, with zero probes
+and no CPU exemptions. **The observed times do not all meet the 20% timing
+requirement.** In the second `h264-barcode20-1` pair, the fix takes
+1.157 s versus main's 0.576 s (+101.1%). Its transition bracket
+is (1.103, 1.157] s, versus main's (0.521, 0.576] s:
+the gap is at least 0.527 s, well beyond sampling resolution.
+It must not be dismissed as a 500 ms sampling-step flip. The first pair for
+that case is 1.140/1.150 s; main itself varies by 0.564 s between runs. These two
+runs do not determine the cause of that variation or establish a general
+startup bound. No timing-parity or startup-acceptance claim follows from them;
+this narrow probe repair does not include another startup implementation change.
+
+Raw results and traces are `/tmp/gwar209-r6-fine-{main,head}-{1,2}/`, with
+matching `.log` files. The paired report is `/tmp/gwar209-r6-fine-comparison.json`
+and the six-decimal table is `/tmp/gwar209-r6-fine-times.csv`. The unchanged gate
+is retained in `/tmp/gwar209-r6-gate-head/`. The local measurement script is
+retained outside the checkout and is not committed. All 209 recorded
+runner/browser descendants and all owned startup servers/previews were
+confirmed exited; `/tmp/gwar209-r6-process-cleanup.json` records the check.
 
 ## Responsive inspection
 
@@ -413,7 +495,7 @@ on phones and audio controls stay inside fullscreen.
 - The unchanged generated-audio denoise gate passed in Chromium and WebKit.
   WebKit cleaned the steady input to -79.07 dBFS; the CI -27.2 dBFS failure on
   `46c7d744` did not recur. No denoise implementation or assertion was changed.
-- Vendored str0m: all 781 library tests passed after the round 5 fix.
+- Vendored str0m: all 783 library tests passed after the round 6 fix.
 - Full web suite after integrating #206/#208/#207: 2,403 tests passed across 155 files. Focused source-switch
   and UI/controller checks also passed.
 
