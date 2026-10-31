@@ -82,7 +82,7 @@ jobs:
       matrix:
         include:
           - name: macos
-            os: macos-14
+            os: macos-15
             # One universal (arm64 + x86_64) disk image, and the same app for the updater
             # (`app` keeps it after the disk image is made; see "macOS update archive").
             args: --target universal-apple-darwin --bundles app,dmg
