@@ -6,6 +6,10 @@ Scope: browser capture, protocol/SFU forwarding
 and browser viewer playback. Desktop viewing is deliberately video-only until
 share playback enters the native mixer/AEC reference. Native capture/playback is the separate PR 2 in [share-audio.md](share-audio.md).
 
+**Round 4 is not accepted or pushed.** Local candidate `80bc5dd3` passes the
+unchanged startup gate but fails the requested 20% target-time bound in one of
+eight cases. The exact paired results and stopping point are recorded below.
+
 All services are local and media is generated. No production Gwar or TeamSpeak
 service, physical microphone, or installed Gwar application was used. Rust
 commands use `CARGO_BUILD_JOBS=4`. Web validation uses the copied denoise/MLS
@@ -199,6 +203,100 @@ Canonical logs/results are `/tmp/gwar209-r3-main-startup.log`,
 `/tmp/gwar209-r3-startup-probe-evidence.json`. Initial noncanonical build/setup
 failures are kept in `*-startup-setup.log`; they are not included in the matrix.
 
+## Round 4: preserve main's startup behavior
+
+The slowdown had a publisher-side cause. With audio captured but not negotiated,
+VP9 reached target at 1.17 s. Disabling only the SFU's optional wire gate still
+took 6.77 s. Native Chromium encoder logs then showed `SetStartBitrate 300000`,
+three resolution reductions and 640×360 input before the connected transport
+activated its existing 4 Mb/s allocation roughly 60 ms later. The encoder needed
+seconds to undo those reductions. This was not evidence for capping a capacity
+probe at its current estimate: the SFU gate follows the active dispatched probe
+rate, and removing it did not repair the browser start.
+
+The publisher now keeps its offered video identity but detaches video input
+until connection and parameter setup complete. No bitrate limit or start hint
+is raised. Video-only publishing keeps its existing path. Two regressions fail
+without the change, including a late connection after close. A separate Rust
+regression failed while video-only viewers still had an unlimited hook installed;
+the hook is now absent until audio is reserved, and removed with the last audio
+reservation. Negotiating unused audio receivers costs no reservation or gate.
+
+The first complete paired experiment with only the connected-input fix put all
+eight cases within 20% of main (worst slowdown 8.3%), but still failed two probe
+counts. It is retained in `/tmp/gwar209-r4-comparison-run1.json` and is not a
+passing acceptance run. Bundled audio feedback also depressed video throughput:
+that VP9 busy run sent 6.139 Mb/s, against main's 7.990 Mb/s.
+
+A separate four-case, full-duration isolation excluded the fixed-rate audio from
+transport-wide feedback while leaving video feedback and the SFU budget intact.
+All four busy cases passed with zero probe counts and 7.846–7.886 Mb/s video.
+The final publisher offer applies that policy: Opus is still capped at 64 kb/s
+and charged at 128 kb/s in the video/uplink budget. Audio's RTCP clock reports,
+CNAME, identity and other extensions remain negotiated. Tests failed before this
+change and check both SDP newline forms, unchanged video feedback and preserved
+audio clock/codec identity. Voice and viewer feedback are unchanged.
+
+Failing-before logs: `/tmp/gwar209-r4-publisher-before.log`,
+`/tmp/gwar209-r4-video-only-before.log` and
+`/tmp/gwar209-r4-feedback-before.log`. Encoder evidence is in
+`/tmp/gwar209-r4-chromium.log`; the discarded diagnostic script-collision runs
+are superseded by `gwar209-r4b-*`. Final implementation pin: `80bc5dd3`.
+The unchanged harness's optional start-hint observer recognizes an attached
+video sender during the answer; those diagnostic fields are null while this
+publisher holds its video source. Target times and the original assertions
+continue to use actual source, encoder and viewer stats.
+
+### Acceptance failed: local candidate not pushed
+
+The full unchanged eight-case, 60-second matrix was run against each revision's
+own server/web build, sequentially without competing tests or builds. Both
+sides pass all eight original assertions with zero probe counts and **no CPU
+exemptions**. The requested additional 20% timing bound fails in one case:
+
+| Case | Main `1e0e6d60` (s) | Local `80bc5dd3` (s) | Change | Within 20% |
+|---|---|---|---|---|
+| `vp9-barcode20-0` | 1.093 | 1.076 | -1.5% | yes |
+| `vp9-barcode20-1` | 1.556 | 1.569 | +0.9% | yes |
+| `vp9-busy60-0` | 1.519 | 1.581 | +4.1% | yes |
+| `vp9-busy60-1` | 1.563 | 1.510 | -3.4% | yes |
+| `h264-barcode20-0` | 0.978 | 1.542 | +57.8% | **NO** |
+| `h264-barcode20-1` | 1.599 | 1.552 | -3.0% | yes |
+| `h264-busy60-0` | 1.596 | 1.582 | -0.9% | yes |
+| `h264-busy60-1` | 1.561 | 1.577 | +1.0% | yes |
+
+
+`h264-barcode20-0` is 57.8% slower (1.542 s against 0.978 s), above the allowed
+1.173 s. This is an acceptance failure, not a passing result with an explanation.
+The runner stops at the first failed pair, so the planned second and third pairs
+were not run. Source `80bc5dd3` remains local; the remote PR head was not changed.
+
+Two subsequent bounded isolations also failed to remove the H.264 gap. Keeping
+video attached while retaining the feedback fix measured 1.567 s. Applying the
+same 4 Mb/s start hint in both offer and answer, still without a video hold,
+measured 1.555 s. Native logs still initialize at 300 kb/s. Neither experiment
+raises the bitrate, changes an assertion or qualifies as a full acceptance run.
+No minimum-rate override or forced-resolution workaround is included.
+
+Canonical acceptance logs/results:
+`/tmp/gwar209-r4-final-main-run1.log`,
+`/tmp/gwar209-r4-final-head-run1.log`,
+`/tmp/gwar209-r4-final-main-run1/`,
+`/tmp/gwar209-r4-final-head-run1/` and
+`/tmp/gwar209-r4-stopped-report.json`.
+The later diagnostic evidence is in `gwar209-r4-nohold-*` and
+`gwar209-r4-localhint-*` under `/tmp/`.
+
+The strict Rust checks still pass together on this local candidate: 1 Mb/s
+adversarial voice p99 remains below 10 ms, the 2.5 Mb/s combined release delivers
+all packets with no evictions/drops at 5/10/20/30 ms, and active-BWE startup
+sustains exactly 7.872 Mb/s at 10/20 ms service with no pauses. Generated-audio
+playback, reconnect and receiver renewal pass. The unchanged watch, native-voice
+and Chromium/WebKit screen gates pass. Denoise passes on both engines; WebKit
+measured -79.07 dBFS, so the earlier -27.2 dBFS failure did not recur. Denoise is
+unchanged. All 56 screenshots were refreshed and inspected at this local pin.
+
+
 ## Responsive inspection
 
 Real built UI screenshots are retained under `gwar-mockups/share-audio/` at
@@ -235,10 +333,10 @@ on phones and audio controls stay inside fullscreen.
   viewers. The unchanged TeamSpeak watch gate also passed, including guest
   pageshow recovery and the 150-second heartbeat.
 - The unchanged generated-audio denoise gate passed in Chromium and WebKit.
-  WebKit cleaned the steady input to -76.62 dBFS; the CI -27.2 dBFS failure on
+  WebKit cleaned the steady input to -79.07 dBFS; the CI -27.2 dBFS failure on
   `46c7d744` did not recur. No denoise implementation or assertion was changed.
 - Vendored str0m: all 780 library tests passed.
-- Full web suite after integrating #206/#208/#207: 2,398 tests passed across 155 files. Focused source-switch
+- Full web suite after integrating #206/#208/#207: 2,403 tests passed across 155 files. Focused source-switch
   and UI/controller checks also passed.
 
 ## Commands

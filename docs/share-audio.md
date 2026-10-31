@@ -1,7 +1,7 @@
 # Browser screen-share sound (P1-6, PR 1)
 
 This is the browser/transport half of P1-6. A supported browser can share
-another tab's sound through the screen SFU. Desktop capture and viewing remain video-only. The webview never receives or
+another tab's sound through the screen SFU. Native desktop capture and viewing remain video-only. The webview never receives or
 plays share sound: native playback must first enter the native mixer and AEC reference. Encrypted channels still cannot share screens; this change
 adds no plaintext exception to that rule.
 
