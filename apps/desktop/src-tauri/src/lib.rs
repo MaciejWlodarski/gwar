@@ -79,7 +79,6 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_deep_link::init())
-        .plugin(tauri_plugin_autostart::Builder::new().app_name("Gwar").build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_dialog::init())
@@ -178,6 +177,7 @@ pub fn run() {
             invites::desktop_invite_links,
             startup::desktop_startup,
             startup::desktop_set_startup,
+            startup::desktop_open_login_settings,
             tray::desktop_attention,
             tray::tray_set_badge,
             tray::tray_set_state,

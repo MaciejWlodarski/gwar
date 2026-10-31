@@ -48,9 +48,9 @@ try {
       useSession.setState({ phase: "idle", server: null, channels: {}, me: null });
       useUi.setState({ section: "servers" });
       useConnectUi.setState({ invite: { code: "friends", server: "wss://voice.example/custom/ws", serverKey: "A".repeat(43), name: "Nasza ekipa" }, inviteLaunch: true });
-    } else if (kind === "startup" || kind === "startup-linux") {
+    } else if (kind.startsWith("startup")) {
       window.__TAURI_INTERNALS__ = { invoke: async command => {
-        if (command === "desktop_startup") return { supported: kind !== "startup-linux", openAtLogin: false, startMinimized: false };
+        if (command === "desktop_startup") return { supported: kind !== "startup-linux", openAtLogin: false, startMinimized: false, loginStatus: kind === "startup-approval" ? "approvalRequired" : kind === "startup-pending" ? "pending" : "disabled" };
         throw new Error(`Unexpected native fixture command ${command}`);
       } };
       useUi.getState().openSettings("appearance");
@@ -62,11 +62,11 @@ try {
       useUi.getState().openDialog({ kind: "notifications", channel: 2 });
     }
   }, kind);
-  async function capture(name, width) {
+  async function capture(name, width, language = "pl") {
     await page.evaluate(() => document.fonts.ready);
     const overflow = await page.evaluate(() => document.documentElement.scrollWidth > innerWidth);
     assert.equal(overflow, false, `${name} ${width}: no page overflow`);
-    if (shots) { mkdirSync(shots, { recursive: true }); await page.screenshot({ path: path.join(shots, `${name}-pl-${width}.png`), animations: "disabled" }); }
+    if (shots) { mkdirSync(shots, { recursive: true }); await page.screenshot({ path: path.join(shots, `${name}-${language}-${width}.png`), animations: "disabled" }); }
   }
   for (const width of [1440, 768, 390, 360]) {
     await page.setViewportSize({ width, height: width >= 768 ? 900 : 844 });
@@ -94,6 +94,21 @@ try {
     await state("startup");
     await page.getByRole("switch", { name: /^Uruchamiaj przy logowaniu/ }).waitFor();
     await capture("desktop-startup", width);
+    for (const status of ["approval", "pending"]) {
+      await state("invite");
+      await page.getByRole("button", { name: "Dołącz: Nasza ekipa", exact: true }).waitFor();
+      await state(`startup-${status}`);
+      await page.getByTestId("startup-status").waitFor();
+      assert.equal(await page.getByRole("switch", { name: /^Uruchamiaj przy logowaniu/ }).isChecked(), false);
+      const row = await page.getByTestId("startup-status").evaluate(el => ({ height: el.getBoundingClientRect().height, fits: el.scrollWidth <= el.clientWidth, singleLine: el.firstElementChild.getBoundingClientRect().height < 20 }));
+      assert.ok(row.height <= 40 && row.fits && row.singleLine, `${width}: compact startup ${status} row`);
+      await capture(`desktop-startup-${status}`, width);
+      await page.evaluate(async () => (await import("/src/state/settings.ts")).useSettings.setState({ language: "en" }));
+      const english = await page.getByTestId("startup-status").evaluate(el => ({ fits: el.scrollWidth <= el.clientWidth, singleLine: el.firstElementChild.getBoundingClientRect().height < 20 }));
+      assert.ok(english.fits && english.singleLine, `${width}: compact English startup ${status} row`);
+      await capture(`desktop-startup-${status}`, width, "en");
+      await page.evaluate(async () => (await import("/src/state/settings.ts")).useSettings.setState({ language: "pl" }));
+    }
     await state("invite");
     await page.getByRole("button", { name: "Dołącz: Nasza ekipa", exact: true }).waitFor();
     assert.equal(await page.locator('a[href^="gwar://invite/"]').count(), 1);

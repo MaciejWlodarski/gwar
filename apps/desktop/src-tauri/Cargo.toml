@@ -18,10 +18,15 @@ custom-protocol = ["tauri/custom-protocol"]
 # The WebView2 profile's saved media grants (src/webview.rs); the versions wry uses.
 webview2-com = "0.39"
 windows = "0.62"
+# Already locked through the former autostart implementation.
+windows-registry = "0.6.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The macOS version, for the screen-sharing gate (src/screen.rs); the version wry uses.
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSDictionary", "NSProcessInfo", "NSString"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSDictionary", "NSProcessInfo", "NSString", "NSURL"] }
+
+# The Objective-C spelling of statusForLegacyPlist(at:) is statusForLegacyURL:.
+objc2-service-management = { version = "0.3.2", default-features = false, features = ["std", "objc2", "objc2-foundation", "SMAppService"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -48,7 +53,9 @@ tauri-plugin-updater = { version = "2.14", default-features = false, features = 
 tauri-plugin-process = "2"
 reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
 open = "5.4.4"
-tauri-plugin-autostart = "2"
+
+# Already locked through Tauri; serialize LaunchAgents rather than interpolating XML.
+plist = "1.10.1"
 tauri-plugin-deep-link = "2"
 
 [dev-dependencies]

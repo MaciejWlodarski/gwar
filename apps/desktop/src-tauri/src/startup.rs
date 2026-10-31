@@ -1,8 +1,10 @@
 //! Startup choices: OS registration is authoritative; the window preference is read before creation.
+use registration::LoginState;
 use serde::{Deserialize, Serialize};
 use std::{fs, path::Path, sync::Mutex};
 use tauri::{AppHandle, Manager, State};
-use tauri_plugin_autostart::ManagerExt;
+
+mod registration;
 
 #[derive(Default)]
 pub struct Startup(pub Mutex<()>);
@@ -45,6 +47,17 @@ pub struct Status {
     supported: bool,
     open_at_login: bool,
     start_minimized: bool,
+    login_status: LoginState,
+}
+
+fn status(app: &AppHandle, prefs: &Preferences) -> Result<Status, String> {
+    let login_status = registration::status(app)?;
+    Ok(Status {
+        supported: true,
+        open_at_login: login_status == LoginState::Enabled,
+        start_minimized: prefs.start_minimized,
+        login_status,
+    })
 }
 
 // Debug binaries must never register a development executable at login.
@@ -53,22 +66,27 @@ fn platform_supported(os: &str, debug: bool) -> bool {
 }
 
 fn supported() -> bool {
+    #[cfg(target_os = "macos")]
+    if objc2_foundation::NSProcessInfo::processInfo().operatingSystemVersion().majorVersion < 13 {
+        return false;
+    }
     platform_supported(std::env::consts::OS, cfg!(debug_assertions))
 }
 
 #[tauri::command]
 pub fn desktop_startup(app: AppHandle, state: State<'_, Startup>) -> Result<Status, String> {
-    // Do not query the plugin on Linux: existence is not effective XDG autostart state.
+    // Linux and debug builds never read or write OS registration.
     if !supported() {
-        return Ok(Status { supported: false, open_at_login: false, start_minimized: false });
+        return Ok(Status {
+            supported: false,
+            open_at_login: false,
+            start_minimized: false,
+            login_status: LoginState::Disabled,
+        });
     }
     let _guard = state.0.lock().map_err(|e| e.to_string())?;
     let prefs = read(&app.path().app_config_dir().map_err(|e| e.to_string())?.join("startup.json"))?;
-    Ok(Status {
-        supported: supported(),
-        open_at_login: app.autolaunch().is_enabled().map_err(|e| e.to_string())?,
-        start_minimized: prefs.start_minimized,
-    })
+    status(&app, &prefs)
 }
 
 #[tauri::command]
@@ -86,7 +104,7 @@ pub fn desktop_set_startup(
     let path = dir.join("startup.json");
     let mut prefs = read(&path)?;
     if let Some(enabled) = open_at_login {
-        if enabled { app.autolaunch().enable() } else { app.autolaunch().disable() }.map_err(|e| e.to_string())?;
+        registration::set(&app, enabled)?;
     }
     if let Some(minimized) = start_minimized {
         prefs.start_minimized = minimized;
@@ -95,11 +113,16 @@ pub fn desktop_set_startup(
         fs::write(&temporary, serde_json::to_vec(&prefs).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
         fs::rename(temporary, path).map_err(|e| e.to_string())?;
     }
-    Ok(Status {
-        supported: true,
-        open_at_login: app.autolaunch().is_enabled().map_err(|e| e.to_string())?,
-        start_minimized: prefs.start_minimized,
-    })
+    status(&app, &prefs)
+}
+
+/// Fixed OS destination, available only from the startup settings button.
+#[tauri::command]
+pub fn desktop_open_login_settings(window: tauri::WebviewWindow) -> Result<(), String> {
+    if window.label() != "main" || !supported() {
+        return Err("Login settings are unavailable in this window or build".into());
+    }
+    registration::open_settings()
 }
 
 #[cfg(test)]

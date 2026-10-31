@@ -4,7 +4,7 @@ Audit follow-up for P2-14 through P2-17, checked against main `1a54b517`.
 
 - P2-17 was implemented first, in a separate commit. Tray labels and tooltips follow English or Polish, use Gwar throughout, and show a mute slash or unread mark.
 - P2-14 remained open except for message sounds, already delivered in #202. Server and channel menus now offer all messages, mentions only, none, and inheritance. Channel choices override server choices; otherwise existing global preferences apply. The same effective preferences gate existing message sounds, system notifications, desktop attention, and the desktop badge. A mute selected while signature verification is pending takes effect at notification delivery. A muted channel still keeps its messages and ordinary unread counters. DMs follow the server choice; mentions-only still allows DMs. Pokes and voice/presence cues retain their existing rules.
-- P2-15 remained open. Installed macOS and Windows releases expose open-at-login and start-minimized switches, both off by default. The official Tauri autostart plugin owns OS registration. Opening settings reads actual OS state; only a successful native write and read-back changes the switches. Browser, debug, and Linux builds hide these controls. Linux native commands refuse changes and do not query the plugin's existence-only status. Saved Linux preferences are retained but not applied. Start minimized minimizes the window, preserving its Dock/taskbar entry; opening an invitation brings the review window forward. Window-state restoration retains geometry but cannot restore an old hidden state over this preference.
+- P2-15 remained open. Installed macOS 13+ and Windows releases expose open-at-login and start-minimized switches, both off by default. Small app-owned adapters register a LaunchAgent on macOS and a quoted Run command on Windows. Opening settings reads effective OS state; only native read-back changes the switches. macOS approval or unconfirmed authorization keeps open-at-login off, with one compact status row. Settings opens only after a click, and returning to Gwar refreshes the status. Browser, debug, and Linux builds hide these controls. Linux native commands refuse changes. macOS before 13 also hides the startup controls because effective authorization cannot be queried there. Saved Linux preferences are retained but not applied. Start minimized minimizes the window, preserving its Dock/taskbar entry; opening an invitation brings the review window forward. Window-state restoration retains geometry but cannot restore an old hidden state over this preference.
 - P2-16 remained open. Installed bundles register `gwar://invite/`. A browser invitation offers an explicit desktop handoff on desktop operating systems. Cold and running-instance links use the same strict parser. Loading or receiving a link cannot join a server, contact its destination, or enter voice. Cold invite launches, including malformed links, suppress saved-session restoration. A running session stays connected until the person chooses to leave and review the new invitation, then separately clicks Join.
 
 ## Invitation identity and deployment boundary
@@ -21,27 +21,22 @@ Settings version 7 adds `notificationOverrides` and the two desktop fields while
 
 The supported platforms' native window preference is also stored in app-config `startup.json`, version 1, because it must be read before creating the webview. A missing file means off; unreadable or newer files are retained and never overwritten. OS autostart registration is authoritative for open-at-login. Merely hydrating browser preferences never registers an executable.
 
-No additional Tauri plugin capabilities are needed: the frontend drains raw launch arguments and a separate launch-intent flag through the app-owned `desktop_invite_links` command, and listens for queue wake events through the existing `core:event:allow-listen`. Autostart is mediated by app-owned boolean-only commands. Deep-link register/unregister and autostart plugin commands are not exposed to JavaScript. The navigation allowlist and webview media restrictions are unchanged.
+No additional Tauri plugin capabilities are needed: the frontend drains raw launch arguments and a separate launch-intent flag through the app-owned `desktop_invite_links` command, and listens for queue wake events through the existing `core:event:allow-listen`. Autostart is mediated by app-owned boolean-only commands. Deep-link register/unregister is not exposed to JavaScript. The app-owned login-settings command opens only the fixed macOS Login Items panel, from the main window. The navigation allowlist and webview media restrictions are unchanged.
 
 ## Dependency review
 
-New locked dependencies and their published licenses:
+New locked dependencies retained from the initial implementation and their published licenses:
 
 | Crate | Version | License |
 | --- | --- | --- |
-| tauri-plugin-autostart | 2.7.0 | Apache-2.0 OR MIT |
 | tauri-plugin-deep-link | 2.6.3 | Apache-2.0 OR MIT |
-| auto-launch | 0.6.0 | MIT |
-| dirs | 6.0.0 | MIT OR Apache-2.0 |
-| nix | 0.31.3 | MIT |
 | objc2-security | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
 | objc2-service-management | 0.3.2 | Zlib OR Apache-2.0 OR MIT |
-| os_info | 3.15.0 | MIT |
-| smappservice-rs | 0.1.3 | MIT |
 
+Round 2 removes `tauri-plugin-autostart`, `auto-launch`, `smappservice-rs`, `os_info`, `nix 0.31.3`, and `dirs 6.0.0`. Nothing is vendored or patched. The replacement promotes already-locked `plist 1.10.1` (MIT), `windows-registry 0.6.1` (MIT OR Apache-2.0), and `objc2-service-management 0.3.2` to direct dependencies. No package or version is added to the round-1 lockfile.
 Cargo metadata confirms these licenses are in the existing distribution allowlist. A refreshed `cargo audit` reported no entries in its vulnerability category and no advisories on new dependencies. Existing warnings remain for audiopus_sys, proc-macro-error, proc-macro-error2, zbus_names, zvariant, zvariant_derive (maintenance), and glib (RUSTSEC-2024-0429, soundness). This change does not update those dependencies.
 
-References: [Tauri autostart](https://v2.tauri.app/plugin/autostart/), [Tauri deep linking](https://v2.tauri.app/plugin/deep-linking/).
+References: [Apple legacy login-item authorization](https://developer.apple.com/documentation/servicemanagement/smappservice/statusforlegacyplist%28at%3A%29), [Tauri deep linking](https://v2.tauri.app/plugin/deep-linking/).
 
 ## Verification
 
@@ -51,12 +46,12 @@ Local validation passed:
 
 - `pnpm --filter web typecheck`.
 - `pnpm --filter web lint`: no errors; four warnings in unchanged files.
-- Full Vitest: 152 files, 2,223 tests passed (`--maxWorkers=2 --testTimeout=20000` to avoid contention with concurrent builds). The delayed-verification mute regression was first observed failing, then passed after the fix. Warm and pasted-invite password regressions also passed.
+- Full Vitest: 152 files, 2,227 tests passed (`--maxWorkers=2 --testTimeout=20000` to avoid contention with concurrent builds). The delayed-verification mute regression was first observed failing, then passed after the fix. Warm and pasted-invite password regressions also passed.
 - `pnpm --filter web build` (existing chunk-size and dynamic-import warnings).
 - `CARGO_BUILD_JOBS=4 cargo fmt --all --check`.
 - `CARGO_BUILD_JOBS=4 cargo clippy -p gwar-desktop --all-targets -- -D warnings`.
-- `CARGO_BUILD_JOBS=4 cargo test -p gwar-desktop`: 56 passed, one existing signed-updater test ignored because it needs `GWAR_UPDATER_DIR`.
-- The browser regression passed and 32 round-1 screenshots were visually inspected across all four widths. Gwar's existing palette, typography, navigation, and components were retained; the narrow invitation banner was shortened after screenshot inspection.
+- `CARGO_BUILD_JOBS=4 cargo test -p gwar-desktop`: 60 passed, one existing signed-updater test ignored because it needs `GWAR_UPDATER_DIR`.
+- The browser regression passed and 48 round-2 screenshots were refreshed across all four widths; the 24 affected startup screenshots were visually inspected. Gwar's existing palette, typography, navigation, and components were retained; the narrow invitation banner was shortened after screenshot inspection.
 
 Manual release acceptance still needs installed-platform checks of login registration, login launch and minimization on macOS and Windows, plus cold/warm OS URL dispatch and native tray/taskbar rendering on macOS, Windows, and Linux. Unit and browser tests do not establish those OS behaviors. Production Gwar and TeamSpeak were never contacted, and `/Applications/Gwar.app` was never launched.
 
@@ -77,3 +72,16 @@ The browser-smoke failure was an outdated URL-shape assertion: the invite now in
 Round-1 local validation passed: typecheck; lint (the same four warnings in unchanged files); all 2,223 Vitest tests across 152 files; cargo fmt; desktop Clippy with warnings denied; desktop tests (56 passed, one existing updater-fixture test ignored); all 53 platform-neutral media tests and doctests; the 11 CI-selection regression tests; and the full loopback browser smoke suite (72/72 checks). The invite admission/role assertion passed after the link-field, invitation-copy and explicit-Join selectors were updated. Mobile Voice settings selectors target the settings row rather than the live voice-status control. The admission/role assertion was retained; no tests were skipped to obtain the pass.
 
 The responsive browser suite passed with 32 screenshots at 1440, 768, 390 and 360 px, including the Linux policy and both renamed settings pages. All were visually inspected. The round-1 screenshot output is kept separately from the original review images. No production services or installed desktop application were used.
+
+
+## Review round 2
+
+- S1: Windows Run values contain exactly one quoted executable, including paths with spaces, ampersands, or Unicode. Quotes, NUL, and line breaks are refused rather than interpolated. The adapter uses the registry API, not a shell. Existing machine-wide entries from the former plugin remain in their original hive; write failures are reported rather than silently ignoring the old entry. Task Manager's startup approval is read, and an explicit enable updates it. The spaced-path regression failed with the former unquoted format. A Windows-only test writes and reads the same command through an isolated temporary registry key, never the actual Run key.
+- S2: macOS calls `SMAppService.statusForLegacyPlist(at:)` through its Objective-C selector `statusForLegacyURL:`. A plist on disk is insufficient: only `Enabled` checks the switch. `RequiresApproval` shows a short Polish or English line and an explicit System Settings button. Unknown/not-yet-discovered registration stays off with a compact status/check-again row. No polling, automatic Settings opening, consent override, or second app launch is performed. Returning from Settings re-reads authorization. The existence-only projection and missing approval UI were first observed failing their regressions.
+- S3: `plist::Value` serializes LaunchAgent XML and round-trip validation refuses any unrepresentable path before touching the installed entry. A regression containing `&`, `<`, `>`, quotes, apostrophes, and Polish characters failed with the former raw XML formatting. Writes use an atomic rename and retain the former `Gwar.plist` filename/Label to avoid duplicate entries. Native `startup.json` and web settings versions are unchanged; their saved preferences are retained.
+
+Round-2 verification distinguishes host evidence from installed-platform acceptance. The Mac compiles the actual Objective-C bridge and runs the authorization projection, XML round-trip, and shared Windows quoting regressions. Browser screenshots use display-only status replies, so they establish layout and behavior rather than OS authorization. No real login registration or background-item permission was changed on this Mac, and no installed Gwar application was launched. A signed installed Mac build still needs a System Settings disable/approve cycle, a special-character install-path test, and a login launch. The actual Windows registration source and its tests cross-compile for `x86_64-pc-windows-gnu` in an isolated harness with a minimal Tauri handle stub, using the already-locked package versions. This checks Windows API types, not the complete Tauri Windows build or runtime behavior. The isolated registry test, Task Manager enable/disable, and actual spaced-path login launch still need a real Windows machine. Linux remains hidden.
+
+Refreshed screenshots are in `~/dev/projects/gwar-mockups/desktop-notifications/round-2/`, at 1440, 768, 390, and 360 pixels. The regression checks approval and pending rows in both languages, including single-line fit, and blocks external requests.
+
+Round-2 local checks passed: typecheck; lint with zero errors and the same four existing warnings; full Vitest (152 files, 2,227 tests); cargo fmt; desktop Clippy with warnings denied; full desktop crate tests (60 passed, one existing signed-updater fixture test ignored); isolated Windows GNU compilation of the real adapter and its tests; and the responsive browser regression. The cached `cargo audit --no-fetch` check reported zero vulnerabilities, with only the previously documented maintenance/soundness warnings. All Cargo commands used `CARGO_BUILD_JOBS=4`.

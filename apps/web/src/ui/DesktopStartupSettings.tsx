@@ -1,10 +1,10 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useT } from "../i18n";
 import { tauri } from "../platform";
 import { useSettings } from "../state/settings";
 import { Button, Switch } from "./kit";
 
-interface StartupStatus { supported: boolean; openAtLogin: boolean; startMinimized: boolean }
+interface StartupStatus { supported: boolean; openAtLogin: boolean; startMinimized: boolean; loginStatus: "disabled" | "enabled" | "approvalRequired" | "pending" }
 
 /** Only successful native read-back changes the switches. Mounting never enables autostart. */
 export function DesktopStartupSettings() {
@@ -14,31 +14,55 @@ export function DesktopStartupSettings() {
   const [busy, setBusy] = useState(true);
   const [error, setError] = useState(false);
   const [attempt, setAttempt] = useState(0);
+  const [loginStatus, setLoginStatus] = useState<StartupStatus["loginStatus"]>("disabled");
+  const apply = useCallback((status: StartupStatus) => {
+    setSupported(status.supported);
+    setLoginStatus(status.loginStatus);
+    if (status.supported) useSettings.getState().setDesktop({ openAtLogin: status.openAtLogin, startMinimized: status.startMinimized });
+  }, []);
+  const refresh = () => { setBusy(true); setAttempt(a => a + 1); };
+  useEffect(() => {
+    // Re-read after the person returns from System Settings; never poll or request consent.
+    const focus = () => { if (!busy) { setBusy(true); setAttempt(a => a + 1); } };
+    window.addEventListener("focus", focus);
+    return () => window.removeEventListener("focus", focus);
+  }, [busy]);
   useEffect(() => {
     let alive = true;
     void tauri().then(api => api.invoke<StartupStatus>("desktop_startup")).then(status => {
       if (!alive) return;
-      setSupported(status.supported);
-      if (status.supported) useSettings.getState().setDesktop({ openAtLogin: status.openAtLogin, startMinimized: status.startMinimized });
+      apply(status);
       setError(false);
     }).catch(() => { if (alive) setError(true); }).finally(() => { if (alive) setBusy(false); });
     return () => { alive = false; };
-  }, [attempt]);
+  }, [attempt, apply]);
   const change = async (patch: Partial<Pick<StartupStatus, "openAtLogin" | "startMinimized">>) => {
     if (busy) return;
     setBusy(true);
     setError(false);
     try {
       const status = await (await tauri()).invoke<StartupStatus>("desktop_set_startup", patch);
-      if (status.supported) useSettings.getState().setDesktop({ openAtLogin: status.openAtLogin, startMinimized: status.startMinimized });
+      apply(status);
     } catch { setError(true); }
+    finally { setBusy(false); }
+  };
+  const openSettings = async () => {
+    if (busy) return;
+    setBusy(true);
+    setError(false);
+    try { await (await tauri()).invoke("desktop_open_login_settings"); }
+    catch { setError(true); }
     finally { setBusy(false); }
   };
   return <>
     {supported && <>
       <Switch checked={desktop.openAtLogin} disabled={busy} onCheckedChange={openAtLogin => void change({ openAtLogin })} label={t("desktop.openAtLogin")} description={t("desktop.openAtLoginHint")} />
+      {(loginStatus === "approvalRequired" || loginStatus === "pending") && <div role="status" data-testid="startup-status" className="flex items-center justify-between gap-2 text-xs text-muted">
+        <span>{t(loginStatus === "approvalRequired" ? "desktop.loginApproval" : "desktop.loginPending")}</span>
+        <Button disabled={busy} onClick={loginStatus === "approvalRequired" ? () => void openSettings() : refresh}>{t(loginStatus === "approvalRequired" ? "desktop.loginSettings" : "desktop.loginCheck")}</Button>
+      </div>}
       <Switch checked={desktop.startMinimized} disabled={busy} onCheckedChange={startMinimized => void change({ startMinimized })} label={t("desktop.startMinimized")} description={t("desktop.startMinimizedHint")} />
     </>}
-    {error && <div role="alert" className="flex items-center justify-between gap-2 text-sm text-danger"><span>{t("desktop.startupFailed")}</span><Button disabled={busy} onClick={() => { setBusy(true); setAttempt(a => a + 1); }}>{t("desktop.retry")}</Button></div>}
+    {error && <div role="alert" className="flex items-center justify-between gap-2 text-sm text-danger"><span>{t("desktop.startupFailed")}</span><Button disabled={busy} onClick={refresh}>{t("desktop.retry")}</Button></div>}
   </>;
 }
