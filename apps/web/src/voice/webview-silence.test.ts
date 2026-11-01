@@ -25,3 +25,21 @@ it("keeps every webview player silent, whatever starts it, and undoes only what 
   late.dispatchEvent(new Event("volumechange"));
   expect(late.muted).toBe(false);
 });
+
+it("stays silent until the last capture lets go, and restores only then", () => {
+  document.body.innerHTML = '<video id="chat"></video><audio id="mine" muted></audio>';
+  const chat = document.querySelector<HTMLVideoElement>("#chat")!, mine = document.querySelector<HTMLAudioElement>("#mine")!;
+  const old = silenceWebviewMedia();
+  const replacement = silenceWebviewMedia();
+  old();
+  expect(chat.muted).toBe(true);
+  old();
+  expect(chat.muted).toBe(true);
+  const late = document.body.appendChild(document.createElement("audio"));
+  late.dispatchEvent(new Event("play"));
+  expect(late.muted).toBe(true);
+  replacement();
+  expect(chat.muted).toBe(false);
+  expect(late.muted).toBe(false);
+  expect(mine.muted).toBe(true);
+});
