@@ -746,12 +746,13 @@ fn pipeline<const CAPTURE: usize>(
     out: mpsc::Sender<Outgoing>,
     incoming: std::sync::mpsc::Receiver<Incoming>,
 ) -> Result<()> {
+    // Before the promotion: the sleeping worker in here must not inherit it.
+    let mut processing = MicrophoneProcessor::default();
     let _priority = priority::Priority::promote();
     let encoder = voice_encoder()?;
     output.attach();
     let mut slots = (0..AUDIO_SLOTS).map(|_| Slot::new()).collect::<Result<Vec<_>>>()?;
     let mut capture = CaptureFrame::new(CAPTURE);
-    let mut processing = MicrophoneProcessor::default();
     let mut next_position = None;
     let mut mix = vec![0f32; FRAME];
     let mut packet = vec![0u8; 1275];

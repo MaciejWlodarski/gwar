@@ -18,8 +18,12 @@ use sonora::{
 
 use super::FRAME;
 use std::{
-    sync::mpsc::{Receiver, sync_channel},
-    thread,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+        mpsc::{Receiver, sync_channel},
+    },
+    thread::{self, Thread},
 };
 
 /// Nothing on, at the full 48 kHz: by default the processing runs at 32 kHz, which would take
@@ -98,7 +102,7 @@ enum Channels {
     /// Voice alone: one channel, as if share sound did not exist.
     Mono,
     /// Share sound played. The stereo canceller is being built off this thread.
-    Building(Receiver<Stage>),
+    Building,
     /// It hears everything the mono one does, and voice still comes from the mono one. The count
     /// is the frames of sound still to hear: over silence there is nothing to learn from.
     Learning(Box<Stage>, usize),
@@ -109,10 +113,63 @@ enum Channels {
     Refused,
 }
 
+/// Waits through a voice session, in case share sound plays, and builds the stereo canceller then.
+/// It starts with the session because nothing about starting a thread is fit for the voice thread;
+/// asking it and taking what it built touch neither the heap nor a lock. Voice alone pays for one
+/// sleeping thread.
+struct StereoWorker {
+    thread: Thread,
+    order: Arc<AtomicU8>,
+    built: Receiver<Box<Stage>>,
+}
+
+const WAIT: u8 = 0;
+const BUILD: u8 = 1;
+const LEAVE: u8 = 2;
+
+impl StereoWorker {
+    fn start() -> Option<Self> {
+        let (send, built) = sync_channel(1);
+        let order = Arc::new(AtomicU8::new(WAIT));
+        let told = order.clone();
+        let work = move || {
+            loop {
+                match told.load(Ordering::Acquire) {
+                    WAIT => thread::park(),
+                    BUILD => {
+                        let _ = send.send(Box::new(Stage::stereo()));
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+        };
+        match thread::Builder::new().name("gwar-stereo-canceller".into()).spawn(work) {
+            Ok(worker) => Some(Self { thread: worker.thread().clone(), order, built }),
+            Err(error) => {
+                tracing::warn!("the stereo echo canceller will not be available: {error}");
+                None
+            }
+        }
+    }
+
+    fn tell(&self, order: u8) {
+        self.order.store(order, Ordering::Release);
+        self.thread.unpark();
+    }
+}
+
+impl Drop for StereoWorker {
+    fn drop(&mut self) {
+        self.tell(LEAVE);
+    }
+}
+
 pub(crate) struct Processing {
     echo: Stage,
     gain: Stage,
     channels: Channels,
+    stereo: Option<StereoWorker>,
     learning_frames: usize,
     /// What each speaker was given since the last whole frame went to the canceller.
     render: [[f32; FRAME]; 2],
@@ -128,6 +185,7 @@ impl Processing {
             echo: Stage::new(1),
             gain: Stage::new(1),
             channels: Channels::Mono,
+            stereo: StereoWorker::start(),
             learning_frames: LEARNING_FRAMES,
             render: [[0.0; FRAME]; 2],
             rendered: 0,
@@ -161,29 +219,28 @@ impl Processing {
     }
 
     /// Share sound is playing here: from now until this voice session ends the canceller is
-    /// stereo. Costs this thread one thread start, once. Voice alone never gets here.
+    /// stereo. Only wakes the worker, once. Voice alone never gets here.
     pub(crate) fn pin_stereo(&mut self) {
         if !matches!(self.channels, Channels::Mono) {
             return;
         }
-        let (built, receiver) = sync_channel(1);
-        let build = move || {
-            let _ = built.send(Stage::stereo());
-        };
-        self.channels = match thread::Builder::new().name("gwar-stereo-canceller".into()).spawn(build) {
-            Ok(_) => Channels::Building(receiver),
-            Err(error) => {
-                tracing::warn!("the stereo echo canceller did not start: {error}");
-                Channels::Refused
+        self.channels = match &self.stereo {
+            Some(worker) => {
+                worker.tell(BUILD);
+                Channels::Building
             }
+            None => Channels::Refused,
         };
     }
 
     /// Takes the built canceller if it has arrived. Never waits.
     fn collect_stereo(&mut self) {
-        let Channels::Building(receiver) = &self.channels else { return };
-        let Ok(stage) = receiver.try_recv() else { return };
-        self.channels = Channels::Learning(Box::new(stage), self.learning_frames);
+        if !matches!(self.channels, Channels::Building) {
+            return;
+        }
+        if let Some(Ok(stage)) = self.stereo.as_ref().map(|worker| worker.built.try_recv()) {
+            self.channels = Channels::Learning(stage, self.learning_frames);
+        }
     }
 
     /// The stereo canceller replaces the mono one, at once if nothing is playing through it.
@@ -418,9 +475,9 @@ mod tests {
     impl Processing {
         /// As the pipeline would find it some frames later, for tests that count frames.
         fn built(&mut self) {
-            if let Channels::Building(receiver) = &self.channels {
-                let stage = receiver.recv().unwrap();
-                self.channels = Channels::Learning(Box::new(stage), self.learning_frames);
+            if matches!(self.channels, Channels::Building) {
+                let stage = self.stereo.as_ref().unwrap().built.recv().unwrap();
+                self.channels = Channels::Learning(stage, self.learning_frames);
             }
         }
 
@@ -430,6 +487,56 @@ mod tests {
 
         fn is_stereo(&self) -> bool {
             matches!(self.channels, Channels::Stereo(_))
+        }
+    }
+
+    /// Counts this thread's trips to the allocator while it is switched on: the voice thread must
+    /// make none on the way to stereo.
+    mod heap {
+        use std::{
+            alloc::{GlobalAlloc, Layout, System},
+            cell::Cell,
+        };
+
+        thread_local! {
+            static COUNTING: Cell<bool> = const { Cell::new(false) };
+            static TRIPS: Cell<usize> = const { Cell::new(0) };
+        }
+
+        fn trip() {
+            if COUNTING.try_with(Cell::get).unwrap_or(false) {
+                let _ = TRIPS.try_with(|trips| trips.set(trips.get() + 1));
+            }
+        }
+
+        struct Counting;
+
+        // SAFETY: every call goes straight on to the system allocator; `trip` allocates nothing.
+        unsafe impl GlobalAlloc for Counting {
+            unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+                trip();
+                unsafe { System.alloc(layout) }
+            }
+            unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+                trip();
+                unsafe { System.dealloc(pointer, layout) }
+            }
+            unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+                trip();
+                unsafe { System.realloc(pointer, layout, size) }
+            }
+        }
+
+        #[global_allocator]
+        static COUNTING_ALLOCATOR: Counting = Counting;
+
+        /// How many times `work` went to the allocator on this thread.
+        pub fn trips(work: impl FnOnce()) -> usize {
+            TRIPS.set(0);
+            COUNTING.set(true);
+            work();
+            COUNTING.set(false);
+            TRIPS.get()
         }
     }
 
@@ -608,6 +715,58 @@ mod tests {
         let echo = room(&left, 60);
         let out = through(&mut session(LEARNING_FRAMES), far, &echo, Some(pin));
         windows.iter().map(|(from, to)| db(&out[from * RATE / 2..to * RATE / 2])).collect()
+    }
+
+    /// Sonora itself goes to the heap for every frame, in `origin/main` too. So what is held to
+    /// zero is everything this file adds on the way to stereo, and a frame may cost no more than
+    /// the cancellers running in it cost anyway.
+    #[test]
+    fn the_way_to_stereo_never_touches_the_heap_on_the_voice_thread() {
+        let sound = wide(&voice(4 * RATE, 150.0, -18.0));
+        let mut frames = sound.as_chunks::<FRAME>().0.iter();
+        let mut processing = session(LEARNING_FRAMES);
+        let mut step = |processing: &mut Processing| {
+            let far = frames.next().expect("enough sound");
+            let mut near = [0f32; FRAME];
+            heap::trips(|| {
+                processing.render(far);
+                processing.cancel_echo(&mut near, 20);
+            })
+        };
+        // The first frames set things up: what counts is an ordinary frame.
+        for _ in 0..100 {
+            step(&mut processing);
+        }
+        let mono = (0..20).map(|_| step(&mut processing)).max().unwrap();
+
+        assert_eq!(heap::trips(|| processing.pin_stereo()), 0, "the pin");
+        while matches!(processing.channels, Channels::Building) {
+            assert_eq!(heap::trips(|| processing.collect_stereo()), 0, "taking what was built");
+            thread::yield_now();
+        }
+        assert!(matches!(processing.channels, Channels::Learning(..)));
+
+        let _ = step(&mut processing);
+        let learning = (0..20).map(|_| step(&mut processing)).max().unwrap();
+        let mut frame = [0f32; FRAME];
+        assert_eq!(heap::trips(|| processing.take_over(Some(&mut frame))), 0, "the take-over");
+        assert!(processing.is_stereo());
+        let _ = step(&mut processing);
+        let stereo = (0..20).map(|_| step(&mut processing)).max().unwrap();
+        eprintln!("heap trips a frame: mono {mono}, both while learning {learning}, stereo {stereo}");
+        assert!(learning <= mono + stereo, "learning costs {learning}, mono {mono}, stereo {stereo}");
+    }
+
+    #[test]
+    fn a_session_without_share_sound_ends_its_sleeping_worker() {
+        let processing = Processing::new();
+        let order = processing.stereo.as_ref().unwrap().order.clone();
+        drop(processing);
+        let started = std::time::Instant::now();
+        while Arc::strong_count(&order) > 1 {
+            assert!(started.elapsed().as_secs() < 5, "the worker is still there");
+            thread::yield_now();
+        }
     }
 
     #[test]
