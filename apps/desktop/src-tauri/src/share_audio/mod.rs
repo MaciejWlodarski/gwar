@@ -333,11 +333,13 @@ async fn open(
     let stream = match started {
         Ok(Ok(stream)) => stream,
         Ok(Err(refusal)) => {
+            queue.close();
             capture.failed(id);
             tracing::warn!("share sound did not start: {refusal:?}");
             return Err(refusal.code().to_owned());
         }
         Err(error) => {
+            queue.close();
             capture.failed(id);
             return Err(error.to_string());
         }
@@ -839,6 +841,82 @@ mod tests {
         old.end_by_system();
         assert!(!new.is_closed());
         assert!(capture.reader(6).is_queue());
+    }
+
+    #[test]
+    fn a_resume_that_failed_to_start_keeps_the_consent() {
+        let capture = ShareCapture::default();
+        running(&capture, 5);
+        assert!(!stalled(&capture, 5));
+        for _ in 0..3 {
+            capture.resume(5, OWNER).unwrap().stream_ended();
+            capture.failed(5);
+        }
+        assert!(matches!(capture.reader(5), Reading::Paused), "the bar stays on restoring");
+        let back = resumed(&capture, 5);
+        assert!(!back.is_closed());
+        assert!(capture.reader(5).is_queue());
+    }
+
+    #[test]
+    fn a_failed_resume_stops_only_its_own_try() {
+        let capture = ShareCapture::default();
+        let queue = running(&capture, 5);
+        assert!(!stalled(&capture, 5));
+        let back = capture.resume(5, OWNER).unwrap();
+        back.stream_ended();
+        assert!(back.is_closed() && !back.was_ended_by_system() && !queue.was_ended_by_system());
+    }
+
+    #[test]
+    fn a_start_given_up_on_keeps_the_consent_if_it_comes_up_late() {
+        let capture = ShareCapture::default();
+        running(&capture, 5);
+        assert!(!stalled(&capture, 5));
+        let back = capture.resume(5, OWNER).unwrap();
+        back.close();
+        back.stream_started();
+        back.stream_ended();
+        capture.failed(5);
+        assert!(capture.resume(5, OWNER).is_ok());
+    }
+
+    #[test]
+    fn a_started_stream_that_ends_takes_the_consent() {
+        let capture = ShareCapture::default();
+        let queue = capture.begin(5).unwrap();
+        queue.stream_started();
+        capture.commit(5, OWNER, queue.clone(), Box::new(()), || Ok(())).unwrap();
+        queue.stream_ended();
+        assert!(queue.was_ended_by_system());
+        assert!(!capture.keep_alive(5, Instant::now()));
+        assert!(capture.resume(5, OWNER).is_err());
+    }
+
+    #[test]
+    fn a_started_stream_that_ends_before_its_commit_refuses_it() {
+        let capture = ShareCapture::default();
+        running(&capture, 5);
+        assert!(!stalled(&capture, 5));
+        let back = capture.resume(5, OWNER).unwrap();
+        back.stream_started();
+        back.stream_ended();
+        assert!(capture.commit(5, OWNER, back.clone(), Box::new(()), || Ok(())).is_err());
+        assert!(capture.resume(5, OWNER).is_err());
+    }
+
+    #[test]
+    fn a_replaced_streams_late_ending_stops_the_replacement() {
+        let capture = ShareCapture::default();
+        let queue = capture.begin(5).unwrap();
+        queue.stream_started();
+        capture.commit(5, OWNER, queue.clone(), Box::new(()), || Ok(())).unwrap();
+        assert!(!stalled(&capture, 5));
+        let back = resumed(&capture, 5);
+        queue.stream_ended();
+        assert!(back.is_closed());
+        assert!(!capture.keep_alive(5, Instant::now()));
+        assert!(capture.resume(5, OWNER).is_err());
     }
 
     #[test]

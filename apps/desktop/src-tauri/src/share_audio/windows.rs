@@ -181,6 +181,7 @@ fn capture(
         client.Start()?;
         (reader, ready)
     };
+    queue.stream_started();
     let _ = opened.try_send(Ok(()));
     let handles = [ready, stop_event];
     let mut stereo = Vec::new();
@@ -279,7 +280,7 @@ pub fn start(queue: Arc<CaptureQueue>) -> Result<Box<dyn Send>, Refusal> {
             if flag.load(Ordering::Relaxed) {
                 queue.close();
             } else {
-                queue.end_by_system();
+                queue.stream_ended();
             }
             if joined {
                 // SAFETY: this thread initialized COM above.

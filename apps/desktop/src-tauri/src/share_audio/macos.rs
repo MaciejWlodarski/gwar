@@ -56,7 +56,7 @@ define_class!(
         #[unsafe(method(stream:didStopWithError:))]
         unsafe fn stopped(&self, _stream: &SCStream, error: &NSError) {
             tracing::warn!("share sound stopped: {error}");
-            self.ivars().queue.end_by_system();
+            self.ivars().queue.stream_ended();
         }
     }
 );
@@ -213,7 +213,7 @@ pub fn start(queue: Arc<CaptureQueue>) -> Result<Box<dyn Send>, Refusal> {
     }
     let filter = display()?;
     let config = configuration();
-    let output = Output::new(queue);
+    let output = Output::new(queue.clone());
     let delegate = ProtocolObject::from_ref(&*output);
     // SAFETY: valid filter and configuration; the delegate outlives the stream through `Stream`.
     let stream =
@@ -231,7 +231,11 @@ pub fn start(queue: Arc<CaptureQueue>) -> Result<Box<dyn Send>, Refusal> {
     let (sender, receiver) = mpsc::sync_channel(1);
     let started = RcBlock::new(move |error: *mut NSError| {
         // SAFETY: valid or null for the call's duration.
-        let _ = sender.try_send(unsafe { error.as_ref() }.map(ToString::to_string));
+        let failure = unsafe { error.as_ref() }.map(ToString::to_string);
+        if failure.is_none() {
+            queue.stream_started();
+        }
+        let _ = sender.try_send(failure);
     });
     // SAFETY: the block lives until the framework releases it.
     unsafe { stream.startCaptureWithCompletionHandler(Some(&started)) };

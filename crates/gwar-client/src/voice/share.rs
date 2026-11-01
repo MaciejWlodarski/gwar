@@ -614,6 +614,8 @@ pub struct CaptureQueue {
     samples: Mutex<CaptureState>,
     ready: tokio::sync::Notify,
     closed: AtomicBool,
+    /// This queue's stream came up, so an ending from it is the OS's and not a failed start.
+    stream_up: AtomicBool,
     consent: Arc<CaptureConsent>,
 }
 
@@ -638,6 +640,7 @@ impl Default for CaptureQueue {
             samples: Mutex::default(),
             ready: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
+            stream_up: AtomicBool::new(false),
             consent: Arc::default(),
         }
     }
@@ -683,6 +686,23 @@ impl CaptureQueue {
         for queue in std::iter::once(self).chain(open.as_deref()) {
             queue.samples.lock().unwrap_or_else(|e| e.into_inner()).samples.clear();
             queue.close();
+        }
+    }
+
+    /// The OS stream feeding this queue is running. A start already given up on stays failed.
+    pub fn stream_started(&self) {
+        if !self.is_closed() {
+            self.stream_up.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// The OS stream feeding this queue stopped without Gwar asking. One that was running ended
+    /// the capture; one that never came up is only a failed start, and the share can try again.
+    pub fn stream_ended(&self) {
+        if self.stream_up.load(Ordering::SeqCst) {
+            self.end_by_system();
+        } else {
+            self.close();
         }
     }
 
