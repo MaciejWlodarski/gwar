@@ -822,12 +822,46 @@ from run to run:
 | Echo: worst second around the take-over, of 100 | 0–25, every arm | 40–100 |
 | Echo: arms with holds later | 2 | 6 |
 
-Arriving at another moment is enough: with a tone before the shares, `origin/main` held in none
-of 24 arms, and in 2 of 24 given a random 0–40 ms before the canceller arrives. In
-`four_shares_leave_the_voice_pipeline_on_time` the same hold fails "voice kept sending" on this
-branch in 1 of 21 pairs and in none of 42 on `origin/main`. There the canceller is the same as
-`origin/main`'s and arrives after the same work, so this is the behaviour above, at an
-alignment `origin/main`'s fixed timing happens to avoid.
+`four_shares_leave_the_voice_pipeline_on_time` failed "voice kept sending" here in 1 of 21 pairs
+and in none of 42 on `origin/main`. This branch does not cause that. Nothing plays before the shares
+in that test, so a new canceller arrives as it does on `origin/main`. Below, in arms with four shares
+and four such runs at a time, and six at a time for 26 of the arms in the first row:
+
+| Arms under 1500 frames sent, of 2000 | `origin/main` | This branch |
+| --- | --- | --- |
+| Arrival as it falls | 1 of 60 | 0 of 60 |
+| Shorter holds too, under 1800 | 8 of 60 | 7 of 60 |
+| Held back 1, 2 or 4 frames | 11 of 40 | 10 of 40 |
+| First frame it hears, as it falls: the first, the one after | 33, 27 | 36, 24 |
+
+So moving the start of the same canceller by one frame is enough to turn holds on, on `origin/main`
+too. Sooner is no cure: a canceller ready before the pin, always in on the first frame, held in 6 of
+26. What picks the outcome inside AEC3 is not settled. Neither the order of the first calls nor the
+delay on the first frame predicts it: holds as they fall began at both 10 and 20 ms.
+
+**A history that broke.** What a warming canceller learned counts only for one unbroken stretch of
+one room: `what_a_broken_history_costs`, and the tests beside it, with the worker stopped where the
+test says.
+
+- A new device. Speakers for 6 s, headphones for 6 s, then share sound: the frames of a near voice
+  kept 3–8 s in are 0.87 cold and 0.74 if the canceller is not told. Told, it is 0.87, because it goes
+  the cold way. Every way to another device counts: the user's choice, a stream lost and opened again,
+  and the default the operating system moved by itself. If that happens beside the mono canceller,
+  the warmed one goes back to the worker and a new one learns.
+- A frame lost to a full ring breaks it, because the other side goes on without it. A worker stopped
+  for 640 ms and back between render and capture read −31 dBFS after the pin in review; now the session
+  starts over on the mono canceller, −71.4 dBFS in that quarter second against −70.4 unbroken, and
+  it can qualify again. Turning the canceller off breaks it as well.
+- A late candidate. Feeding now only stops once it is taken, and it is taken only with the ring empty,
+  before the next frame goes to anyone. So it misses nothing whatever kept it: with the echo 150 ms
+  away, 100 ms late reads −69.1 dBFS 100–250 ms after the take-over, against −68.6 on time and −57.1
+  before this. Offered behind, it goes back to the worker, which catches up and offers it again. After
+  50 tries, a quarter of a second, or with a broken history, it is refused: the worker frees it and
+  builds a new one, and voice never left the mono canceller, so the old path follows bit for bit
+  to its take-over.
+- Rests need no evening out. They may cut more of one side than the other: 8 frames at each rest
+  changes less than 1 dB right after one (`rests_need_not_cut_speakers_and_microphone_evenly`),
+  since what follows goes on in the order it happened and the echo's tail has run out.
 
 **Cost.** The worker's canceller per 10 ms frame, `warming_cost`, on this Mac's M5:
 
@@ -850,17 +884,21 @@ of learning at best, which is what this removes, for a cost this small.
 
 Timing, in release, alternating with `origin/main`:
 `low_bandwidth_bursts_preserve_voice_with_and_without_video` is unchanged, 9.048–9.288 ms at 1 Mb/s.
-`a_busy_voice_session_stays_on_time`, the speakers busy and the worker at work: p99 0.87–0.97 ms on
-`origin/main` and 0.20–0.95 ms here; on slow cores 0.58–0.97 ms and 0.65–0.99 ms. That and the
-battery figures are from before the echo check, which adds one read to each frame on the worker.
-`four_shares_leave_the_voice_pipeline_on_time`: the same bimodal p99 with four shares on both,
-0.30–1.34 ms and 0.30–1.39 ms. The 1.0 ms delta limit failed on `origin/main` in 4 runs of 7, worst
-1.121 ms, and on this branch in 3 of the 7 runs that reached the end, worst 1.093 ms. It compares two
-modes that do not depend on this code. The worker does not run in those arms: nothing plays
-before the shares start.
+`a_busy_voice_session_stays_on_time`, the speakers busy and the worker at work, 12 arms of it here
+beside 9 on `origin/main`: p99 0.28–0.75 ms there and 0.11–1.13 ms here, with no limit on it. Four
+arms here reach 1.03–1.13 ms, about 0.15 ms above `origin/main`'s highest mode in any run so far. Max is
+7.3 ms there and 7.2 ms here. Speakers fell short 480 samples twice in those arms here, and in none
+on `origin/main`. On slow cores, from before the echo check, 0.58–0.97 ms and 0.65–0.99 ms. The
+battery figures are also from before that check, which adds one read to each frame on the worker.
+`four_shares_leave_the_voice_pipeline_on_time`, two runs of 6 pairs each, alternating: the same
+modes on both, p99 0.26–1.09 ms here and 0.30–1.57 ms on `origin/main`. All 24 pairs kept sending. The
+1.0 ms delta limit held in all 12 pairs here, worst +0.839 ms, and failed one run on `origin/main`,
++1.312 ms. It compares two modes that do not depend on this code. The worker does not run in those
+arms: nothing plays before the shares start.
 
 Not done: a reconnect with a share already playing still goes the cold way, and so does a session
-where nobody has been heard alone. Real rooms, real microphones and real voices are untested.
+where nobody has been heard alone. Headphones in a jack the system does not show as another device
+are not seen as a new device. Real rooms, real microphones and real voices are untested.
 
 ### Startup
 

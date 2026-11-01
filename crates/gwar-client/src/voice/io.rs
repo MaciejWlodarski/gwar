@@ -64,6 +64,8 @@ pub struct OutputTiming {
     pub(crate) underruns: AtomicU64,
     pub(crate) capture_overflow_samples: AtomicU64,
     pub(crate) underrun_samples: AtomicU64,
+    /// Counts the times the microphone or the speakers became another device.
+    pub(crate) route_changes: AtomicU64,
 }
 
 impl OutputTiming {
@@ -294,6 +296,8 @@ pub(crate) trait Backend {
     fn activate(&mut self, side: Side, id: u64);
     /// The operating system moves an open default stream to a new default by itself.
     fn reroutes(&self, side: Side) -> bool;
+    /// The microphone or the speakers are now another device than the engine was hearing.
+    fn route_changed(&mut self);
 }
 
 /// Related notifications (a headset appears, then becomes the default) settle before acting.
@@ -390,7 +394,12 @@ impl<B: Backend> Router<B> {
         let offer = self.backend.offer(side);
         let plan = self.lanes[index].follow.plan(&offer, now);
         match plan {
-            Plan::Keep => {}
+            // The operating system may have moved the stream without asking anyone.
+            Plan::Keep => {
+                if self.lanes[index].follow.take_followed() {
+                    self.backend.route_changed();
+                }
+            }
             Plan::Missing => {
                 if self.lanes[index].follow.failed(&offer, now, false) {
                     let message = match side {
@@ -415,6 +424,7 @@ impl<B: Backend> Router<B> {
                     Ok(opened) => {
                         tracing::info!("audio {side:?} opened on {route:?}");
                         self.backend.activate(side, id);
+                        self.backend.route_changed();
                         // The old stream closes once the new one plays.
                         lane.stream = Some(opened);
                         lane.generation = id;
@@ -687,6 +697,10 @@ impl Backend for Cpal {
     fn reroutes(&self, side: Side) -> bool {
         // cpal opens the macOS default output as a default-output AudioUnit, which follows the default.
         cfg!(target_os = "macos") && side == Side::Output
+    }
+
+    fn route_changed(&mut self) {
+        self.timing.route_changes.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -1148,6 +1162,7 @@ mod router_tests {
         /// The stream each side plays, by number.
         active: [u64; 2],
         rerouting_output: bool,
+        route_changes: usize,
     }
 
     struct Stream(Arc<AtomicUsize>);
@@ -1176,6 +1191,9 @@ mod router_tests {
         }
         fn reroutes(&self, side: Side) -> bool {
             self.rerouting_output && side == Side::Output
+        }
+        fn route_changed(&mut self) {
+            self.route_changes += 1;
         }
     }
 
@@ -1294,6 +1312,41 @@ mod router_tests {
         s.router.handle(Event::Trouble { side: Side::Output, stream, trouble: Trouble::Rerouted }, now + SETTLE);
         assert!(s.opened().is_empty());
         assert!(s.issues().is_empty());
+    }
+
+    #[test]
+    fn every_way_to_another_device_is_told_to_the_engine() {
+        let now = Instant::now();
+        let mut fake = laptop();
+        fake.offers[1] = offer(Some("Speakers"), &["Speakers", "Headphones"]);
+        let mut s = Setup::new(fake, None, None);
+        s.router.start(now);
+        let later = now + Duration::from_secs(30);
+
+        s.fake().route_changes = 0;
+        s.router.handle(Event::Want { input: None, output: Some("Headphones".into()) }, later);
+        assert_eq!(s.fake().route_changes, 1, "the user's choice");
+
+        // Long enough after that the stream did not die right after opening.
+        s.fake().route_changes = 0;
+        s.lost(Side::Output, later + Duration::from_secs(30));
+        assert_eq!(s.fake().route_changes, 1, "a stream lost and opened again");
+    }
+
+    #[test]
+    fn a_default_output_the_system_moved_is_told_to_the_engine_once() {
+        let now = Instant::now();
+        let mut s = Setup::new(Fake { rerouting_output: true, ..laptop() }, None, None);
+        s.router.start(now);
+        s.fake().route_changes = 0;
+        let stream = s.router.lanes[1].generation;
+        let trouble = |trouble| Event::Trouble { side: Side::Output, stream, trouble };
+        s.router.handle(trouble(Trouble::Rerouted), now + SETTLE);
+        assert_eq!(s.fake().route_changes, 0, "nothing moved");
+        s.fake().offers[1] = offer(Some("Headphones"), &["Speakers", "Headphones"]);
+        s.router.handle(trouble(Trouble::Rerouted), now + SETTLE);
+        s.router.handle(trouble(Trouble::Rerouted), now + SETTLE);
+        assert_eq!(s.fake().route_changes, 1);
     }
 
     #[test]

@@ -90,6 +90,8 @@ pub struct Follow {
     reported: bool,
     /// Microphone access is denied: not retried until the engine restarts.
     blocked: bool,
+    /// The operating system took the open stream to another device: [`Follow::take_followed`].
+    followed: bool,
 }
 
 impl Follow {
@@ -105,7 +107,13 @@ impl Follow {
             bench: None,
             reported: false,
             blocked: false,
+            followed: false,
         }
+    }
+
+    /// Whether the open stream was found on another device since the last time this was asked.
+    pub fn take_followed(&mut self) -> bool {
+        std::mem::take(&mut self.followed)
     }
 
     /// The user chose another device (`None`: the system default). True if that changes anything.
@@ -140,6 +148,7 @@ impl Follow {
         let target = self.target(offer, now);
         match &mut self.open {
             Some(Route::Default(name)) if self.reroutes && matches!(target, Route::Default(Some(_))) => {
+                self.followed |= *name != offer.default;
                 name.clone_from(&offer.default);
                 self.opened_default.clone_from(&offer.default);
                 Plan::Keep

@@ -76,11 +76,12 @@ fn speech_activity(mode: u64, processed_level: i8) -> bool {
 pub struct MicrophoneProcessor {
     processing: Processing,
     denoiser: Denoiser,
+    route_changes: u64,
 }
 
 impl Default for MicrophoneProcessor {
     fn default() -> Self {
-        Self { processing: Processing::new(), denoiser: Denoiser::new() }
+        Self { processing: Processing::new(), denoiser: Denoiser::new(), route_changes: 0 }
     }
 }
 
@@ -106,8 +107,17 @@ impl MicrophoneProcessor {
         self.processing.render(samples);
     }
     /// This is a voice session: see [`Processing::warm_stereo`].
-    fn warm_stereo(&mut self) {
+    fn warm_stereo(&mut self, output: &OutputTiming) {
+        self.route_changes = output.route_changes.load(Ordering::Relaxed);
         self.processing.warm_stereo();
+    }
+    /// Whether the devices changed since it last looked: see [`Processing::route_changed`].
+    fn follow_route(&mut self, output: &OutputTiming) {
+        let route_changes = output.route_changes.load(Ordering::Relaxed);
+        if route_changes != self.route_changes {
+            self.route_changes = route_changes;
+            self.processing.route_changed();
+        }
     }
     /// Share sound is playing: see [`Processing::pin_stereo`].
     fn pin_stereo(&mut self) {
@@ -752,7 +762,7 @@ fn pipeline<const CAPTURE: usize>(
 ) -> Result<()> {
     // Before the promotion: the sleeping worker in here must not inherit it.
     let mut processing = MicrophoneProcessor::default();
-    processing.warm_stereo();
+    processing.warm_stereo(&output);
     let _priority = priority::Priority::promote();
     let encoder = voice_encoder()?;
     output.attach();
@@ -768,6 +778,7 @@ fn pipeline<const CAPTURE: usize>(
     let mut share_bus = None;
 
     while !controls.stop.load(Ordering::Relaxed) {
+        processing.follow_route(&output);
         // ---- capture
         // Take only what is queued now: a producer faster than real time (an
         // always-ready device) must not keep a promoted thread from playback.
@@ -921,6 +932,26 @@ fn pipeline<const CAPTURE: usize>(
 }
 
 pub use gwar_proto::opus::packet_samples as opus_samples;
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_device_reaches_the_canceller_of_a_session_once() {
+        let output = OutputTiming::default();
+        // What opening the devices counted before the session began says nothing.
+        output.route_changes.store(2, Ordering::Relaxed);
+        let mut processor = MicrophoneProcessor::default();
+        processor.warm_stereo(&output);
+        processor.follow_route(&output);
+        assert_eq!(processor.processing.history(), 0);
+        output.route_changes.fetch_add(1, Ordering::Relaxed);
+        processor.follow_route(&output);
+        processor.follow_route(&output);
+        assert_eq!(processor.processing.history(), 1);
+    }
+}
 
 #[cfg(test)]
 mod codec_tests {

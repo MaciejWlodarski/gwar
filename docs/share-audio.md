@@ -285,6 +285,13 @@ worker → share_playback_frames (raw batch, one in flight, 400 frames at most)
     and a trained canceller holds the near voice down harder at new sound than a new one does.
     Wide sound does leak here, on quiet speakers and on speakers nobody has heard alone yet.
 
+  What it learned is only good for that room and that stretch of the session, so a new microphone
+  or speakers start it over, and so does a frame it lost for being a whole ring behind, or the
+  canceller being turned off. Whatever it has found before then counts for nothing. It takes over
+  only having heard every frame up to the one it takes over at, and it gets a quarter of a second
+  to catch up: a later one is refused and the second way follows, voice on the mono canceller
+  throughout.
+
   A reconnect starts over, so with a share already playing it takes the second way
   (see [validation](share-audio-validation.md#warm-stereo-canceller)). Vendored Sonora adds the one option
   this needs ([`vendor/sonora/GWAR-PATCH.md`](../vendor/sonora/GWAR-PATCH.md)). Selecting an
