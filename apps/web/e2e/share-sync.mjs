@@ -13,7 +13,9 @@
  *   SYNC_VIEWERS=browser,desktop                who watches, side by side
  *   SYNC_SECONDS=30                             how long they watch
  *   SYNC_ENGINE=chromium|webkit                 the viewers' engine (default: chromium)
- *   SYNC_OFF=1                                  nothing waits: main's playback, for a before
+ *   SYNC_OFF=1                                  main's playback, for a before: no picture wait, no sound
+ *                                               hold, no late-frame filter (so no stall report), no held
+ *                                               start; the run fails if any of these was not seen refused
  *   SYNC_OUT=path.json                          every burst and the summaries
  */
 import { spawn, spawnSync } from "node:child_process";
@@ -27,7 +29,7 @@ import { fileURLToPath } from "node:url";
 import { chromium, webkit } from "playwright";
 import { chooseFirstRunName } from "./first-run.mjs";
 import { stopProcesses } from "./processes.mjs";
-import { offsetSummary, pairBursts } from "./share-sync-judge.mjs";
+import { SOUND_GAPS_MS, baselineFaults, offsetSummary, pairBursts } from "./share-sync-judge.mjs";
 
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(webRoot, "../..");
@@ -68,8 +70,9 @@ async function waitFor(check, what, timeout = 30_000) {
 
 /**
  * The source tab. A burst is planned 100 ms ahead so the audio graph can start it on its exact
- * sample, and the first draw at or after that instant carries the burst's number. A 5 ms timer
- * keeps that draw within a few milliseconds whatever the compositor's rhythm.
+ * sample, and the first draw at or after that instant carries the burst's number. Its sound is two
+ * pulses whose gap carries the number too, so sound late by whole bursts stays with its own burst.
+ * A 5 ms timer keeps the draw within a few milliseconds whatever the compositor's rhythm.
  */
 const sourcePage = `<!doctype html><title>${SOURCE_TITLE}</title><style>html,body{margin:0;height:100%;overflow:hidden;background:#777}canvas{display:block;width:100vw;height:100vh}</style>
 <canvas width="1280" height="720"></canvas><script>
@@ -78,6 +81,8 @@ const audio = new AudioContext({ sampleRate: 48000 }), tone = audio.createOscill
 tone.frequency.value = 997; gain.gain.value = 0; tone.connect(gain).connect(audio.destination); tone.start();
 window.__bursts = []; window.__toneContext = audio;
 let burst = 0, plan = null, nextPlan = 0, tick = 0;
+const GAPS = ${JSON.stringify(SOUND_GAPS_MS)};
+function pulse(when) { gain.gain.setValueAtTime(0.2, when); gain.gain.setValueAtTime(0, when + 0.06); }
 function bits(n) { const out = []; for (let i = 11; i >= 0; i--) out.push((n >> i) & 1); const check = (n ^ (n >> 4) ^ (n >> 8) ^ 10) & 15; for (let i = 3; i >= 0; i--) out.push((check >> i) & 1); return out; }
 function paint() {
   const { width: w, height: h } = canvas;
@@ -94,7 +99,7 @@ setInterval(() => {
   if (!plan && audio.state === "running" && now >= nextPlan) {
     const at = now + 100, stamp = audio.getOutputTimestamp();
     const when = stamp.contextTime + (at - stamp.performanceTime) / 1000;
-    gain.gain.setValueAtTime(0.2, when); gain.gain.setValueAtTime(0, when + 0.1);
+    pulse(when); pulse(when + GAPS[((burst + 1) & 4095) % GAPS.length] / 1000);
     plan = { at };
     nextPlan = at + 900;
   }
@@ -115,6 +120,19 @@ function viewerPatch() {
   /** When a watch's sound can first be heard, against its first picture. */
   window.__audible = null;
   window.__granted = null;
+  /** What a `SYNC_OFF` run must have kept out; judged by `baselineFaults`. */
+  window.__baseline = { filtersRun: 0, filtersRefused: 0, soundHolds: 0 };
+  if (window.RTCRtpScriptTransform) window.RTCRtpScriptTransform = new Proxy(window.RTCRtpScriptTransform, {
+    construct(target, args) {
+      // Only the late-frame filter names a kind; the desktop's sound path stays.
+      if (args[1]?.kind) {
+        // The app plays on as it would have: the same catch as an engine without transforms.
+        if (window.__syncOff) { window.__baseline.filtersRefused++; throw new Error("the baseline has no filter"); }
+        window.__baseline.filtersRun++;
+      }
+      return new target(...args);
+    },
+  });
   const audible = setInterval(async () => {
     const watch = (await window.__gwarE2eImport("/src/state/screen.ts")).useScreen.getState().watches[0];
     if (watch?.status === "watching") window.__granted ??= Date.now();
@@ -239,10 +257,15 @@ function bridgePatch() {
 async function device(browser, web, server, name, native = false) {
   const context = await browser.newContext({ locale: "en-US", viewport: { width: 1280, height: 800 } });
   await context.route("**/*", route => (new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort()));
-  await context.addInitScript(viewerPatch);
   if (process.env.SYNC_OFF) await context.addInitScript(() => {
-    Object.defineProperty(RTCRtpReceiver.prototype, "jitterBufferTarget", { get() { return null; }, set() {} });
+    window.__syncOff = true;
+    // Main writes 0 once, at the start of a slot; anything else is a picture wait.
+    const target = Object.getOwnPropertyDescriptor(RTCRtpReceiver.prototype, "jitterBufferTarget");
+    Object.defineProperty(RTCRtpReceiver.prototype, "jitterBufferTarget", { ...target, set(ms) {
+      if (ms === 0) target.set.call(this, 0);
+    } });
   });
+  await context.addInitScript(viewerPatch);
   const page = await context.newPage();
   if (native) {
     page.native = nativeFixture();
@@ -251,8 +274,19 @@ async function device(browser, web, server, name, native = false) {
     await context.addInitScript(bridgePatch);
   }
   await page.goto(web);
+  await page.waitForFunction(() => typeof window.__gwarE2eImport === "function");
+  // In the same dispatch as the grant: a later release would leave the desktop slot's gain at 0.
+  if (process.env.SYNC_OFF) await page.evaluate(async () => {
+    const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts");
+    useScreen.subscribe(state => {
+      for (const watch of state.watches) {
+        if (!watch.soundHeld) continue;
+        window.__baseline.soundHolds++;
+        state.dispatch({ type: "soundReleased", id: watch.id });
+      }
+    });
+  });
   if (native) {
-    await page.waitForFunction(() => typeof window.__gwarE2eImport === "function");
     await page.evaluate(async () => {
       const { NativeVoiceEngine } = await window.__gwarE2eImport("/src/voice/native-engine.ts");
       const { controller } = await window.__gwarE2eImport("/src/state/controller.ts");
@@ -295,7 +329,7 @@ async function viewer(browser, web, server, sharer, kind) {
 }
 
 async function viewerRecord(page) {
-  const record = await page.evaluate(() => ({ presented: window.__presented, onsets: window.__onsets, health: window.__health, audible: window.__audible, granted: window.__granted }));
+  const record = await page.evaluate(() => ({ presented: window.__presented, onsets: window.__onsets, health: window.__health, audible: window.__audible, granted: window.__granted, baseline: window.__baseline }));
   if (page.native) {
     record.onsets = await page.native.request("speaker_onsets");
     record.mixer = await page.native.request("share_stats");
@@ -345,6 +379,7 @@ async function run() {
     const report = { net: netName, spec: netSpec, bursts, viewers: {} };
     for (const page of watching) {
       const record = await viewerRecord(page);
+      if (process.env.SYNC_OFF) assert.deepEqual(baselineFaults(record.baseline), [], `the ${page.kind} viewer's baseline is not main`);
       const pairs = pairBursts(bursts, record.presented, record.onsets);
       report.viewers[page.kind] = { summary: offsetSummary(pairs), pairs, mixer: record.mixer, health: record.health, presented: record.presented, audible: record.audible, granted: record.granted };
       console.log(JSON.stringify({ net: netName, viewer: page.kind, ...offsetSummary(pairs), drawn: bursts.length, mixer: record.mixer }));

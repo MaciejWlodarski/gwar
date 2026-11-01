@@ -5,14 +5,30 @@ export const SOUND_LEAD_LIMIT_MS = 45;
 export const SOUND_LAG_LIMIT_MS = 125;
 
 /**
- * One row per burst the source drew. A sound onset belongs to the latest burst drawn before it, so
- * pairing still holds when picture or sound stalls for seconds. All times share the system clock.
+ * Sound carries the burst's number as the gap between its two pulses. The pulses are 60 ms long, and
+ * an onset needs 200 ms of quiet before it, so the shortest gap leaves 240 ms. The gap from a burst's
+ * second pulse to the next burst's first is at least 540 ms, outside every code.
+ */
+export const SOUND_GAPS_MS = [300, 340, 380, 420, 460];
+const GAP_TOLERANCE_MS = 20;
+export const soundGapMs = burst => SOUND_GAPS_MS[burst % SOUND_GAPS_MS.length];
+
+/** The code in a pair of onsets, or -1 when the two are not one burst's pulses. */
+const codeOf = gap => SOUND_GAPS_MS.findIndex(code => Math.abs(gap - code) < GAP_TOLERANCE_MS);
+
+/**
+ * One row per burst the source drew. Sound is matched by the number it carries, so sound any number
+ * of seconds late stays with its own burst, up to the codes' 5 s repeat. Onsets without a whole pair
+ * of pulses say nothing. All times share the system clock.
  */
 export function pairBursts(bursts, presented, onsets) {
   const sound = new Map();
-  for (const onset of onsets) {
-    const burst = bursts.findLast(b => b.drawnAt <= onset);
-    if (burst && !sound.has(burst.burst)) sound.set(burst.burst, onset);
+  for (let i = 0; i + 1 < onsets.length; i++) {
+    const code = codeOf(onsets[i + 1] - onsets[i]);
+    if (code < 0) continue;
+    const burst = bursts.findLast(b => b.burst % SOUND_GAPS_MS.length === code && b.drawnAt <= onsets[i]);
+    if (burst && !sound.has(burst.burst)) sound.set(burst.burst, onsets[i]);
+    i++;
   }
   const picture = new Map(presented.map(p => [p.burst, p.at]));
   return bursts.flatMap(({ burst, drawnAt }) => {
@@ -42,4 +58,13 @@ export function offsetSummary(pairs) {
     pictureMedianMs: median(pairs.map(pair => pair.pictureMs)),
     soundMedianMs: median(pairs.map(pair => pair.soundMs)),
   };
+}
+
+/** Why a `SYNC_OFF` run is not main's playback; empty when it is. */
+export function baselineFaults({ filtersRun, filtersRefused, soundHolds }) {
+  return [
+    filtersRun > 0 && `${filtersRun} late-frame filters ran`,
+    filtersRefused === 0 && "no late-frame filter was refused, so none was seen",
+    soundHolds === 0 && "no held sound was released, so none was seen",
+  ].filter(Boolean);
 }
