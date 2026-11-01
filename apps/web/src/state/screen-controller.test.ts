@@ -256,6 +256,31 @@ describe("reused receive slots", () => {
     screen.reset();
   });
 
+  it("keeps a share's sound through a poll that gets no answer", async () => {
+    let answer: () => unknown = () => ({ audio: true });
+    const { link } = fakeLink({
+      "screen.audio.capabilities": () => ({ screen_audio: true }),
+      "screen.audio.state": () => answer(),
+      "screen.watch.offer": () => ({ sdp: "answer" }),
+      "screen.watch": () => ({ slot: 0 }),
+    });
+    const screen = new ScreenController(() => link, String);
+    const watching = screen.watch("A");
+    await flush();
+    media.transports[0]!.params.state("connected");
+    await watching; await flush();
+    const audio = () => useScreen.getState().watches[0]?.audio;
+    expect(audio()).toBe(true);
+    // A stalled page times out the poll; the share has not lost its sound.
+    answer = () => { throw new Error("timed out"); };
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(audio()).toBe(true);
+    answer = () => ({ audio: false });
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(audio()).toBe(false);
+    screen.reset();
+  });
+
   it.each(["unwatch", "release"])("renews a reused slot after %s when it is the only watch", async how => {
     const { screen, start } = setup();
     const old = await start(false);
