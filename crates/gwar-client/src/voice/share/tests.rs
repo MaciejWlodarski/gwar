@@ -126,6 +126,18 @@ fn a_loud_share_clips_itself_never_the_voice_under_it() {
 }
 
 #[test]
+fn only_sound_really_played_counts_as_played() {
+    let (mut worker, bus, _playout) = worker();
+    let _ = worker.ring.push([0.2, -0.2]);
+    assert!(bus.mix(&mut [[0.0; 2]], false));
+    let _ = worker.ring.push([0.0, 0.0]);
+    assert!(!bus.mix(&mut [[0.5; 2]], false), "a muted share plays silence");
+    let _ = worker.ring.push([0.2, 0.2]);
+    assert!(!bus.mix(&mut [[0.0; 2]], true), "deafened plays nothing");
+    assert!(!bus.mix(&mut [[0.5; 2]], false), "an empty ring plays nothing");
+}
+
+#[test]
 fn a_held_mix_lock_costs_the_pipeline_nothing() {
     let (_worker, bus, _playout) = worker();
     bus.active.store(true, Ordering::Relaxed);

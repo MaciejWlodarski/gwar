@@ -105,6 +105,10 @@ impl MicrophoneProcessor {
     fn render(&mut self, samples: &[[f32; 2]]) {
         self.processing.render(samples);
     }
+    /// Share sound is playing: see [`Processing::pin_stereo`].
+    fn pin_stereo(&mut self) {
+        self.processing.pin_stereo();
+    }
 }
 
 /// Shared voice controls: atomics for voice and a bounded, try-locked handoff for local cues.
@@ -176,6 +180,8 @@ pub enum LinkState {
 /// Counters written by the transport/pipeline, read through [`VoiceHandle::stats`].
 #[derive(Default)]
 pub(crate) struct Counters {
+    /// This session's canceller has been pinned to stereo: share sound played here.
+    stereo_echo: AtomicBool,
     frames_sent: AtomicU64,
     frames_received: AtomicU64,
     unexpected_duration: AtomicU64,
@@ -873,8 +879,11 @@ fn pipeline<const CAPTURE: usize>(
             for (pair, &s) in speakers[..take].iter_mut().zip(&mix[..take]) {
                 *pair = [s; 2];
             }
-            if let Some(bus) = share_bus.as_ref().filter(|bus| bus.active()) {
-                bus.mix(&mut speakers[..take], deafened);
+            if let Some(bus) = share_bus.as_ref().filter(|bus| bus.active())
+                && bus.mix(&mut speakers[..take], deafened)
+            {
+                processing.pin_stereo();
+                counters.stereo_echo.store(true, Ordering::Relaxed);
             }
             // The final channels, clipping included: the canceller must know what the room hears.
             processing.render(&speakers[..take]);
@@ -963,6 +972,13 @@ mod codec_tests {
     /// down. Each of `shares` plays `stereo` of a time in seconds. Returns the power of what the
     /// left speaker played and the level left at the microphone's output, in dBFS.
     fn echo_of_share(shares: usize, stereo: fn(f32) -> [f32; 2], seconds: u64) -> (f32, f32) {
+        let (played, level, pinned) = watch_share(shares, 1.0, stereo, seconds);
+        assert!(pinned, "share sound played, so the canceller is stereo");
+        (played, level)
+    }
+
+    /// As `echo_of_share`, at volume `gain`; also whether this session's canceller was pinned.
+    fn watch_share(shares: usize, gain: f32, stereo: fn(f32) -> [f32; 2], seconds: u64) -> (f32, f32, bool) {
         let playout = share::SharePlayout::new().unwrap();
         let controls = Arc::new(Controls::default());
         *controls.share.lock().unwrap() = Some(playout.bus());
@@ -973,11 +989,13 @@ mod codec_tests {
         let (_incoming_tx, incoming) = std::sync::mpsc::sync_channel(8);
         let output = Arc::new(OutputTiming::default());
         let t = output.clone();
-        let worker = thread::spawn(move || pipeline::<FRAME>(c, Arc::default(), mic, speaker, t, out, incoming));
+        let counters = Arc::<Counters>::default();
+        let k = counters.clone();
+        let worker = thread::spawn(move || pipeline::<FRAME>(c, k, mic, speaker, t, out, incoming));
         let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
         encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
         for slot in 0..shares {
-            assert!(playout.open(slot, 1, 1.0));
+            assert!(playout.open(slot, 1, gain));
         }
         let mut rendered = Vec::new();
         let mut packet = vec![0; 1275];
@@ -1021,7 +1039,18 @@ mod codec_tests {
         controls.stop.store(true, Ordering::Relaxed);
         output.wake();
         worker.join().unwrap().unwrap();
-        (played, level)
+        (played, level, counters.stereo_echo.load(Ordering::Relaxed))
+    }
+
+    #[test]
+    fn a_sharer_or_a_muted_viewer_stays_on_one_channel() {
+        let wide = |time: f32| {
+            let value = music(time, 330.0);
+            [value, -value]
+        };
+        assert!(!watch_share(0, 1.0, wide, 1).2, "nothing played here: a sharer");
+        assert!(!watch_share(1, 0.0, wide, 1).2, "a share muted from the start plays nothing");
+        assert!(watch_share(1, 1.0, wide, 1).2, "and the first sound really played pins it");
     }
 
     /// Music-like: a tone with a slow swell, so the canceller has something changing to follow.
@@ -1073,7 +1102,9 @@ mod codec_tests {
         let (_incoming_tx, incoming) = std::sync::mpsc::sync_channel(8);
         let output = Arc::new(OutputTiming::default());
         let t = output.clone();
-        let worker = thread::spawn(move || pipeline::<FRAME>(c, Arc::default(), mic, speaker, t, out, incoming));
+        let counters = Arc::<Counters>::default();
+        let k = counters.clone();
+        let worker = thread::spawn(move || pipeline::<FRAME>(c, k, mic, speaker, t, out, incoming));
         let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
         encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
         for slot in 0..shares {

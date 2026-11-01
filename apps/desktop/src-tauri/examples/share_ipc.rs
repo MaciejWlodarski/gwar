@@ -1,7 +1,8 @@
 //! Real Tauri IPC under share sound's load, with nothing else of Gwar around it: a small window
 //! whose page does what `voice/share-sound.ts` does, against the real `SharePlayout` and
 //! `CaptureQueue`. It connects to nothing and keeps its data under its own identifier. Run by hand:
-//! `cargo run -p gwar-desktop --example share_ipc -- 30` prints one JSON report.
+//! `cargo run -p gwar-desktop --example share_ipc -- 30` prints one JSON report. Add
+//! `SHARE_IPC_AWAKE=1` for a run longer than a locked or idle Mac leaves this page awake.
 
 use std::{
     borrow::Cow,
@@ -95,6 +96,7 @@ fn main() {
     let capturing = Arc::new(AtomicBool::new(false));
     let queue = Arc::<CaptureQueue>::default();
     let (running, source) = (capturing.clone(), queue.clone());
+    let awake = std::env::var_os("SHARE_IPC_AWAKE").is_some();
     thread::spawn(move || {
         let start = Instant::now();
         let mut block = 0u32;
@@ -104,7 +106,14 @@ fn main() {
             if running.load(Ordering::Relaxed) {
                 source.write(&[0.1; 960]);
             }
-            thread::sleep((start + Duration::from_millis(10) * block).saturating_duration_since(Instant::now()));
+            let next = start + Duration::from_millis(10) * block;
+            if !awake {
+                thread::sleep(next.saturating_duration_since(Instant::now()));
+            }
+            // App Nap stretches this process's sleeps past 100 ms; a real call's audio exempts it.
+            while Instant::now() < next {
+                std::hint::spin_loop();
+            }
         }
     });
     let mut context = tauri::generate_context!();
@@ -117,11 +126,16 @@ fn main() {
     tauri::Builder::default()
         .manage(Probe { playout, queue, capturing, seconds })
         .invoke_handler(tauri::generate_handler![probe_setup, probe_frames, probe_read, probe_done])
-        .setup(|app| {
-            WebviewWindowBuilder::new(app, "probe", WebviewUrl::App("index.html".into()))
+        .setup(move |app| {
+            // A locked screen freezes this page, as it would a real one. For a long run on a Mac
+            // nobody is at, `SHARE_IPC_AWAKE=1` measures the IPC instead of the lock.
+            let mut window = WebviewWindowBuilder::new(app, "probe", WebviewUrl::App("index.html".into()))
                 .title("share_ipc")
-                .inner_size(320.0, 120.0)
-                .build()?;
+                .inner_size(320.0, 120.0);
+            if awake {
+                window = window.background_throttling(tauri::utils::config::BackgroundThrottlingPolicy::Disabled);
+            }
+            window.build()?;
             Ok(())
         })
         .run(context)

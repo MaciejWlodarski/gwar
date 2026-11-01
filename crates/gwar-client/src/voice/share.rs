@@ -125,9 +125,11 @@ impl ShareBus {
     /// Adds share sound to `speakers`, which hold voice alone, centred. Never waits. Deafened
     /// consumes the sound without playing it, so the picture and the sound stay together. Share
     /// sound only uses the room voice leaves: a loud share can clip, the voice under it cannot.
-    pub fn mix(&self, speakers: &mut [[f32; 2]], deafened: bool) {
-        let Ok(mut ring) = self.ring.try_lock() else { return };
+    /// Returns whether any sound was really played: a muted share or a deafened viewer plays none.
+    pub fn mix(&self, speakers: &mut [[f32; 2]], deafened: bool) -> bool {
+        let Ok(mut ring) = self.ring.try_lock() else { return false };
         let mut missing = 0u64;
+        let mut played = false;
         for pair in speakers {
             let Ok([left, right]) = ring.pop() else {
                 missing += 1;
@@ -136,6 +138,7 @@ impl ShareBus {
             if deafened {
                 continue;
             }
+            played |= left != 0.0 || right != 0.0;
             let voice = pair[0];
             let room = 1.0 - voice.abs();
             let mid = voice + (0.5 * (left + right)).clamp(-room, room);
@@ -145,6 +148,7 @@ impl ShareBus {
         if missing > 0 && self.active() {
             self.counters.ring_underruns.fetch_add(missing, Ordering::Relaxed);
         }
+        played
     }
 }
 

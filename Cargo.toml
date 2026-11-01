@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/desktop/src-tauri"]
-exclude = ["vendor/tsclientlib", "vendor/str0m"]
+exclude = ["vendor/tsclientlib", "vendor/str0m", "vendor/sonora"]
 
 [workspace.package]
 edition = "2024"
@@ -54,6 +54,8 @@ strip = true
 
 [patch.crates-io]
 str0m = { path = "vendor/str0m" }
+# See vendor/sonora/GWAR-PATCH.md.
+sonora = { path = "vendor/sonora" }
 
 # tsclientlib connects to a download's file transfer itself, where Gwar can
 # neither time it out nor cancel it; the patch hands the offer over instead.
