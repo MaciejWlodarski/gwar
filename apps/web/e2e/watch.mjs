@@ -69,7 +69,7 @@ function pagePatch(share) {
     construct(target, args) { const pc = new target(...args); window.__pcs.push(pc); return pc; },
   });
   if (!share) return;
-  const media = navigator.mediaDevices;
+  const media = MediaDevices.prototype;
   media.getUserMedia = async () => {
     const context = new AudioContext();
     const destination = context.createMediaStreamDestination();

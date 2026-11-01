@@ -56,7 +56,7 @@ try {
     window.testCaptures = [];
     let context, gain;
     window.setTestInputDb = db => { gain.gain.value = Math.SQRT2 * 10 ** (db / 20); };
-    navigator.mediaDevices.getUserMedia = async () => {
+    MediaDevices.prototype.getUserMedia = async () => {
       context ??= new AudioContext();
       await context.resume();
       const oscillator = context.createOscillator();

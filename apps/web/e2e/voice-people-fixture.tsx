@@ -71,7 +71,7 @@ AudioContext.prototype.createBufferSource = function () {
   };
   return source;
 };
-navigator.mediaDevices.getUserMedia = async () => {
+MediaDevices.prototype.getUserMedia = async () => {
   const ctx = new AudioContext();
   const tone = ctx.createOscillator(), gain = ctx.createGain(), destination = ctx.createMediaStreamDestination();
   gain.gain.value = 0.03; currentGain = gain;

@@ -40,7 +40,7 @@ try {
   page.on("pageerror", error => errors.push(String(error)));
   await page.addInitScript(() => {
     localStorage.setItem("gwar.settings", JSON.stringify({ version: 6, state: { language: "pl", theme: "dark", onboarding: { completed: true, firstUsedAt: Date.now(), nudgeDismissed: true, roleReceived: false }, audio: { inputMode: "ptt", pttKey: "KeyV" } } }));
-    navigator.mediaDevices.getUserMedia = async () => { throw new Error("Microphone must not open for PTT settings"); };
+    MediaDevices.prototype.getUserMedia = async () => { throw new Error("Microphone must not open for PTT settings"); };
   });
   const setup = async () => {
     await page.goto(url);

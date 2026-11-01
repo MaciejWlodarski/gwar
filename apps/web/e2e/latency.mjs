@@ -201,7 +201,7 @@ function pagePatch({ role, ptime, mic, scheme, share }) {
     }
     // screen-startup.mjs's busy source (moving blocks across the whole frame, calibrated to fit
     // 1080p60's 8 Mb/s cap), scaled to the share's size.
-    navigator.mediaDevices.getDisplayMedia = async () => {
+    MediaDevices.prototype.getDisplayMedia = async () => {
       const width = Math.round(share.height * 16 / 9), height = share.height, k = width / 1920;
       const canvas = document.createElement("canvas");
       [canvas.width, canvas.height] = [width, height];
@@ -288,7 +288,7 @@ function pagePatch({ role, ptime, mic, scheme, share }) {
     void tick();
     return (state.generator = g);
   };
-  navigator.mediaDevices.getUserMedia = async () => {
+  MediaDevices.prototype.getUserMedia = async () => {
     if (mic === "track") generator ??= Promise.resolve(trackGenerator());
     generator ??= (async () => {
       const ctx = new AudioContext({ sampleRate: 48000, latencyHint: "interactive" });
@@ -304,7 +304,7 @@ function pagePatch({ role, ptime, mic, scheme, share }) {
     // Each capture is a clone: the app stops its tracks, the generator keeps running.
     return new MediaStream([(await generator).track.clone()]);
   };
-  navigator.mediaDevices.enumerateDevices = async () => [];
+  MediaDevices.prototype.enumerateDevices = async () => [];
   // Taps record, in parallel, what the app connects to its output (the receiver's master gain)
   // and, on the sender, what its noise suppression sends (the model's worklet, which feeds a
   // MediaStream destination of its own context).

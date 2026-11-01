@@ -39,7 +39,7 @@ try {
       source.start = (...a) => { window.__soundStarts++; start(...a); };
       return source;
     };
-    navigator.mediaDevices.getUserMedia = async () => { window.__micRequests++; throw new Error("Sound settings must not open the microphone"); };
+    MediaDevices.prototype.getUserMedia = async () => { window.__micRequests++; throw new Error("Sound settings must not open the microphone"); };
   });
   const page = await context.newPage(), errors = [];
   page.on("pageerror", e => errors.push(e.message));
