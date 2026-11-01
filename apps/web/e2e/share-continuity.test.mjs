@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { continuityLimits, continuityProblems, shareContinuity } from "./share-continuity.mjs";
+import { batchTiming, continuityLimits, continuityProblems, shareContinuity } from "./share-continuity.mjs";
 
 /** A clock the run moves itself; `answers` lists when each stats read comes back and what it says. */
 function scripted(answers) {
@@ -55,6 +55,12 @@ test("a late answer without new frames is not a pause over: it goes on", async (
   const report = await shareContinuity(...run(scripted(silent)));
   assert.ok(report.longestGapMs > 4_500, JSON.stringify(report));
   assert.ok(continuityProblems(report, continuityLimits(true)).some(problem => problem.startsWith("no new sound")));
+});
+
+test("batch timing finds the slow trips and the wait between batches", () => {
+  const timing = batchTiming([{ started: 0, ms: 2 }, { started: 300, ms: 200 }, { started: 320, ms: 3 }]);
+  assert.deepEqual(timing, { batches: 3, tripP50Ms: 3, tripP99Ms: 200, tripOver160Ms: 1, longestWaitMs: 300 });
+  assert.equal(batchTiming([]).batches, 0);
 });
 
 function run({ read, now, wait }) {

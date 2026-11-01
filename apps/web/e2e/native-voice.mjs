@@ -19,7 +19,7 @@
 import { chooseFirstRunName } from "./first-run.mjs";
 import { stopProcesses } from "./processes.mjs";
 import { canvasCapture, readBarcode, stampBarcode } from "./screen-source.mjs";
-import { continuityLimits, continuityProblems, shareContinuity } from "./share-continuity.mjs";
+import { batchTiming, continuityLimits, continuityProblems, shareContinuity } from "./share-continuity.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -84,8 +84,14 @@ function nativeFixture(frequency) {
     if ("error" in message) waiter?.reject(new Error(message.error));
     else waiter?.resolve(message.ok);
   });
+  fixture.batches = [];
   fixture.request = (command, args = {}) => new Promise((resolve, reject) => {
     const id = ++next;
+    if (command === "share_playback_frames") {
+      const started = performance.now();
+      const finish = resolve;
+      resolve = value => { fixture.batches.push({ started, ms: performance.now() - started }); finish(value); };
+    }
     pending.set(id, { resolve, reject });
     if (!["snapshot", "audio_devices", "share_capture_read", "share_playback_frames"].includes(command)) child.log += `> ${command} ${JSON.stringify(args).slice(0, 300)}\n`;
     child.stdin.write(`${JSON.stringify({ id, command, args })}\n`);
@@ -97,9 +103,15 @@ function nativeFixture(frequency) {
 /** Browser-side half of the bridge: `NativeVoiceEngine`'s invoke/listen pair. */
 function bridgePatch() {
   const listeners = new Map();
+  window.__batches = [];
   window.__nativeEmit = (event, payload) => { for (const handler of listeners.get(event) ?? []) handler(payload); };
   window.__nativeBridge = async () => ({
-    invoke: (command, args) => window.__nativeInvoke(command, args instanceof Uint8Array ? { body: Array.from(args) } : args ?? {}),
+    invoke: (command, args) => {
+      if (!(args instanceof Uint8Array)) return window.__nativeInvoke(command, args ?? {});
+      // The one command the real shell takes as raw bytes: what this bridge costs it is measured.
+      const started = performance.now();
+      return window.__nativeInvoke(command, { body: Array.from(args) }).finally(() => { window.__batches.push({ started, ms: performance.now() - started }); });
+    },
     listen: async (event, handler) => {
       const set = listeners.get(event) ?? new Set();
       listeners.set(event, set);
@@ -291,8 +303,12 @@ async function computerSound(sharer, viewer, browserViewer) {
   assert.equal(await viewer.page.locator("audio[data-share-audio]").count(), 0, "the desktop webview has no share player");
   await browserViewer.page.locator("audio[data-share-audio]").waitFor({ state: "attached", timeout: 15_000 });
   await waitFor(async () => (await hears(viewer, 770)) && (await hears(browserViewer, 770)), "voice beside share sound", 20_000);
+  await viewer.page.evaluate(() => { window.__batches.length = 0; });
+  viewer.native.batches.length = 0;
   const continuity = await shareContinuity(() => viewer.native.request("share_stats", {}), 10_000);
   console.log(`share sound continuity: ${JSON.stringify(continuity)}`);
+  // Each batch waits for the last one's answer: a slow bridge holds frames back, then lands them at once.
+  console.log(`share sound bridge: ${JSON.stringify({ page: batchTiming(await viewer.page.evaluate(() => window.__batches)), process: batchTiming(viewer.native.batches) })}`);
   const rate = continuity.frames / (continuity.ms / 1_000);
   assert.ok(rate > 45 && rate < 55, `viewer takes one Opus frame per 20 ms, got ${rate}/s`);
   assert.deepEqual(continuityProblems(continuity, continuityLimits(Boolean(process.env.CI))), [], `share sound kept playing: ${JSON.stringify(continuity)}`);
