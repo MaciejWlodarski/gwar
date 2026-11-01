@@ -268,7 +268,7 @@ export function SharingBar() {
         <span className="hidden lg:inline-flex"><Button size="sm" variant="secondary" className="border-white/40 px-2 text-white hover:bg-white/15" onClick={() => void controller.screen.turnOffLink(own.share!)}>{t("screen.tsTurnOff")}</Button></span>
       </span>}
       {own.phase === "live" && <span data-testid="share-audio-status" className="flex shrink-0 items-center gap-1 text-xs" aria-label={t(audioLabel)}>
-        {own.audio && !resuming ? <Volume2 aria-hidden className="size-3.5" /> : <VolumeX aria-hidden className="size-3.5" />}<span className="hidden sm:inline">{t(audioLabel)}</span>
+        {resuming ? <RotateCw aria-hidden className="size-3.5 motion-safe:animate-spin" /> : own.audio ? <Volume2 aria-hidden className="size-3.5" /> : <VolumeX aria-hidden className="size-3.5" />}<span className="hidden sm:inline">{t(audioLabel)}</span>
       </span>}
       <ConnectionIndicator variant="bar" compact />
       <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 sm:px-2" onClick={() => setDetails(true)}>{t("common.details")}</Button>

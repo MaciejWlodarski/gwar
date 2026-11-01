@@ -153,6 +153,10 @@ it("says sound is coming back, and keeps the way out, while a paused capture ret
   try {
     await act(async () => root.render(<TooltipProvider><SharingBar /></TooltipProvider>));
     expect(host.querySelector('[data-testid="share-audio-status"]')?.getAttribute("aria-label")).toBe("Restoring sound");
+    // On a phone the icon is all there is: it must not read as "no sound".
+    const icon = host.querySelector('[data-testid="share-audio-status"] svg')?.getAttribute("class") ?? "";
+    expect(icon).toContain("lucide-rotate-cw");
+    expect(icon).not.toContain("lucide-volume-x");
     expect(host.querySelector('[role="alert"]')).toBeNull();
     await act(async () => [...host.querySelectorAll("button")].find(b => b.textContent === "Details")!.click());
     expect(document.body.textContent).toContain("Bringing computer sound back. The picture is still shared.");
