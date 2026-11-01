@@ -3,6 +3,7 @@ import type { Link } from "../net/connection";
 import { welcome } from "../net/testing";
 import type { Channel } from "../proto/Channel";
 import type { Client } from "../proto/Client";
+import { applyCaptureSpec } from "../voice/screen";
 import { legacySpec } from "../voice/screen-quality";
 import { ScreenController } from "./screen-controller";
 import { initialScreen, useScreen } from "./screen";
@@ -79,6 +80,8 @@ function choosing(computerSound: "ok" | "permission" | undefined) {
   return { stream };
 }
 const own = () => useScreen.getState().own;
+/** The wait of an ask that has nothing to add to yet, plus a margin. */
+const SOUND_CHECK_MS = 6_000;
 
 beforeEach(() => {
   sound.instances.length = 0; sound.receivers.length = 0; sound.result = liveTrack(); sound.receivable = true; sound.support = "ok";
@@ -378,6 +381,140 @@ describe("sound coming back during a share", () => {
     expect(own()).toMatchObject({ phase: "live", computerSound: "failed", soundAdding: false });
     expect(toast()).toHaveBeenCalledOnce();
     expect(sound.instances[0]!.stop).toHaveBeenCalled();
+    screen.reset();
+  });
+
+  describe("while a recovery replaces the publisher", () => {
+    /** A running share whose add waits on `release`, with the publisher that took the add. */
+    const addHeld = async () => {
+      const screen = await pictureOnly();
+      await vi.waitFor(() => expect(own()?.soundAddable).toBe(true));
+      const first = media.publishers[0]!;
+      let release!: () => void;
+      first.addAudio.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+      const adding = screen.turnOnSound();
+      await vi.waitFor(() => expect(first.addAudio).toHaveBeenCalled());
+      return { screen, adding, release: () => release(), first };
+    };
+    /** Connection lost and back; the publisher that held sound is gone once `replaced` returns. */
+    const replaced = async (screen: ScreenController, before: number) => {
+      screen.resume();
+      await vi.waitFor(() => expect(media.publishers.length).toBeGreaterThan(before));
+      live();
+      return media.publishers.at(-1)!;
+    };
+
+    it("leaves the capture the replacement took up when the old add ends", async () => {
+      const { screen, adding, release } = await addHeld();
+      const track = sound.result as MediaStreamTrack;
+      screen.suspend();
+      const replacement = await replaced(screen, 1);
+      expect(replacement.params).toMatchObject({ audio: track, nativeAudio: true });
+      release();
+      expect(await adding).toBe("ok");
+      expect(sound.instances[0]!.stop).not.toHaveBeenCalled();
+      expect(own()).toMatchObject({ audio: true, computerSound: "ok", soundAdding: false });
+      expect(toast()).not.toHaveBeenCalled();
+      screen.reset();
+    });
+
+    it("leaves the capture for a recovery still on its way", async () => {
+      const { screen, adding, release } = await addHeld();
+      const track = sound.result as MediaStreamTrack;
+      screen.suspend();
+      release();
+      expect(await adding).toBeNull();
+      expect(sound.instances[0]!.stop).not.toHaveBeenCalled();
+      const replacement = await replaced(screen, 1);
+      expect(replacement.params).toMatchObject({ audio: track, nativeAudio: true });
+      await vi.advanceTimersByTimeAsync(SOUND_CHECK_MS);
+      expect(replacement.addAudio).not.toHaveBeenCalled();
+      expect(sound.instances[0]!.stop).not.toHaveBeenCalled();
+      expect(toast()).not.toHaveBeenCalled();
+      screen.reset();
+    });
+
+    it("does not add to the replacement a capture it already carries", async () => {
+      const screen = await pictureOnly();
+      await vi.waitFor(() => expect(own()?.soundAddable).toBe(true));
+      const track = sound.result as MediaStreamTrack;
+      let capture!: (track: MediaStreamTrack) => void;
+      sound.result = new Promise<MediaStreamTrack>(resolve => { capture = resolve; });
+      const adding = screen.turnOnSound();
+      expect(sound.instances[0]!.start).toHaveBeenCalledOnce();
+      sound.result = track;
+      screen.suspend();
+      const replacement = await replaced(screen, 1);
+      capture(track);
+      expect(await adding).toBe("ok");
+      expect(replacement.addAudio).not.toHaveBeenCalled();
+      expect(sound.instances[0]!.stop).not.toHaveBeenCalled();
+      screen.reset();
+    });
+
+    it("a refusal that outlived its publisher is the recovery's to answer", async () => {
+      const screen = await pictureOnly();
+      await vi.waitFor(() => expect(own()?.soundAddable).toBe(true));
+      sound.result = "unsupported";
+      const adding = screen.turnOnSound();
+      screen.suspend();
+      expect(await adding).toBeNull();
+      expect(sound.instances[0]!.stop).not.toHaveBeenCalled();
+      sound.result = liveTrack();
+      expect((await replaced(screen, 1)).params).toMatchObject({ audio: sound.result, nativeAudio: true });
+      expect(sound.instances[0]!.stop).not.toHaveBeenCalled();
+      screen.reset();
+    });
+
+    it("an ask with no publisher yet waits for one and adds to it", async () => {
+      const screen = await pictureOnly();
+      await vi.waitFor(() => expect(own()?.soundAddable).toBe(true));
+      screen.suspend();
+      let proceed!: () => void;
+      vi.mocked(applyCaptureSpec).mockClear();
+      vi.mocked(applyCaptureSpec).mockImplementationOnce(() => new Promise<void>(resolve => { proceed = resolve; }));
+      screen.resume();
+      await vi.waitFor(() => expect(applyCaptureSpec).toHaveBeenCalled());
+      live();
+      expect(await screen.turnOnSound()).toBeNull();
+      expect(sound.instances[0]!.start).not.toHaveBeenCalled();
+      proceed();
+      await vi.waitFor(() => expect(media.publishers.length).toBe(2));
+      live();
+      await vi.waitFor(() => expect(own()?.soundAddable).toBe(true));
+      const replacement = media.publishers.at(-1)!;
+      expect(replacement.params).toMatchObject({ audio: undefined });
+      await vi.advanceTimersByTimeAsync(SOUND_CHECK_MS);
+      expect(replacement.addAudio).toHaveBeenCalledOnce();
+      expect(own()).toMatchObject({ computerSound: "ok", soundAdding: false });
+      expect(toast()).not.toHaveBeenCalled();
+      screen.reset();
+    });
+  });
+
+  it("a tab's sound added to a replaced publisher stops and says so, and the new one is left alone", async () => {
+    const conn = link();
+    const screen = new ScreenController(() => conn, String);
+    useSettings.setState({ shareComputerSound: false });
+    choosing(undefined);
+    await screen.confirmShare();
+    live();
+    const track = liveTrack();
+    media.tabSound = track;
+    let release!: () => void;
+    media.publishers[0]!.addAudio.mockImplementationOnce(() => new Promise<void>(resolve => { release = resolve; }));
+    const adding = screen.turnOnSound();
+    await vi.waitFor(() => expect(media.publishers[0]!.addAudio).toHaveBeenCalled());
+    screen.suspend();
+    screen.resume();
+    await vi.waitFor(() => expect(media.publishers).toHaveLength(2));
+    live();
+    release();
+    expect(await adding).toBe("failed");
+    expect(track.stop).toHaveBeenCalled();
+    expect(media.publishers[1]!.addAudio).not.toHaveBeenCalled();
+    expect(media.publishers[1]!.close).not.toHaveBeenCalled();
+    expect(toast()).toHaveBeenCalledOnce();
     screen.reset();
   });
 

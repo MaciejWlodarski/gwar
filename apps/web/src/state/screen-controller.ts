@@ -406,6 +406,7 @@ export class ScreenController {
         if (typeof sound === "string") this.soundRefused(attempt, sound);
         else {
           this.soundCameUp();
+          dispatch({ type: "computerSound", attempt, state: "ok" });
           if (!own.stream?.getTracks().includes(sound)) own.stream?.addTrack(sound);
         }
       }
@@ -622,7 +623,8 @@ export class ScreenController {
     this.pendingSound.add(track);
     track.addEventListener("ended", () => dispatch({ type: "audio", attempt, sharing: false }));
     try {
-      await this.attachSound(track);
+      if (!this.publisher) throw new Error("the share has no transport");
+      await this.attachSound(track, this.publisher);
       this.tabSoundAdded = true;
       return "ok";
     } catch (e) {
@@ -642,16 +644,21 @@ export class ScreenController {
   private async bringSoundBack(attempt: number): Promise<ComputerSoundState | "ok" | null> {
     const sound = this.sound;
     if (!sound || useScreen.getState().own?.soundAdding) return null;
+    const publisher = this.publisher;
     this.soundTriedAt = Date.now();
     if (this.soundTimer) clearTimeout(this.soundTimer);
     this.soundTimer = null;
+    // Nothing to add to yet: the ask waits for the publisher that is on its way.
+    if (!publisher) { this.retrySoundAfter(attempt, "permission"); return null; }
     const current = () => useScreen.getState().own?.attempt === attempt && this.sound === sound;
     dispatch({ type: "soundAdding", attempt, adding: true });
+    let track: MediaStreamTrack | ComputerSoundState | null = null;
     try {
-      const track = await sound.start();
+      track = await sound.start();
       if (!current()) return null;
+      if (this.publisher !== publisher) return this.soundOutlivedPublisher(attempt, track);
       if (typeof track === "string") { this.soundRefused(attempt, track); return track; }
-      await this.attachSound(track);
+      await this.attachSound(track, publisher);
       if (!current()) return null;
       this.soundCameUp();
       dispatch({ type: "computerSound", attempt, state: "ok" });
@@ -659,6 +666,7 @@ export class ScreenController {
     } catch (e) {
       console.warn("[share sound] add:", e);
       if (!current()) return null;
+      if (this.publisher !== publisher) return this.soundOutlivedPublisher(attempt, track);
       // The capture came up, so this ask is spent; the picture never noticed.
       this.endSound();
       dispatch({ type: "computerSound", attempt, state: "failed" });
@@ -667,12 +675,23 @@ export class ScreenController {
     } finally { dispatch({ type: "soundAdding", attempt, adding: false }); }
   }
 
-  private async attachSound(track: MediaStreamTrack): Promise<void> {
+  /**
+   * A recovery replaced the publisher this add was for. The capture belongs to the share, and the
+   * recovery takes it up by itself, so nothing here may stop it or speak for it. An ask the
+   * recovery has not answered waits for the new publisher, without using up its tries.
+   */
+  private soundOutlivedPublisher(attempt: number, track: MediaStreamTrack | ComputerSoundState | null): "ok" | null {
+    const stream = useScreen.getState().own?.stream;
+    if (track && typeof track !== "string" && stream?.getTracks().includes(track)) return "ok";
+    this.retrySoundAfter(attempt, "permission");
+    return null;
+  }
+
+  private async attachSound(track: MediaStreamTrack, publisher: ScreenPublisher): Promise<void> {
     const own = useScreen.getState().own;
     const conn = this.link();
     const share = own?.share;
-    const publisher = this.publisher;
-    if (!own || !share || !conn || !publisher) throw new Error("the share has no transport");
+    if (!own || !share || !conn) throw new Error("the share has no transport");
     await publisher.addAudio(track, {
       renegotiate: async sdp => (await conn.request("screen.audio.add", { share, sdp }, { timeoutMs: SOUND_NEGOTIATION_MS })).sdp,
       resume: async () => { await conn.request("screen.audio.resume", { share }); },
