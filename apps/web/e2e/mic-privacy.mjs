@@ -48,9 +48,11 @@ export function installMicPrivacyGuard(injected) {
       queueMicrotask(() => { if ([...previews].some(live)) violation("Preview capture survived window blur"); });
     });
   });
-  const media = navigator.mediaDevices;
+  // On the prototype, with the capture doubles: on the instance it would shadow one set after it,
+  // and a later double replacing it only means that page's captures go unchecked.
+  const media = globalThis.MediaDevices?.prototype;
   if (!media?.getUserMedia) return;
-  const native = media.getUserMedia.bind(media);
+  const native = media.getUserMedia;
   media.getUserMedia = async (...args) => {
     window.__gum++;
     const priorPending = pending++;
@@ -62,7 +64,7 @@ export function installMicPrivacyGuard(injected) {
     if (preview && !eligible(state)) violation("Preview requested without authorization");
     if ((preview || previewInFlight || [...previews].some(live)) && (priorPending || window.__micStreams.some(live))) violation("Overlapping microphone acquisition or live capture");
     try {
-      const stream = await native(...args);
+      const stream = await native.apply(navigator.mediaDevices, args);
       window.__micStreams.push(stream);
       if (preview) { previews.add(stream); changed(); }
       return stream;
