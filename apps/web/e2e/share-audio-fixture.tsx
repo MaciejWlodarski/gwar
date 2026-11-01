@@ -7,8 +7,12 @@ import { useSession, useUi } from "../src/state/stores";
 import { controller } from "../src/state/controller";
 import { SharePresetDialog, SharingBar, Stage } from "../src/ui/Screen";
 import { TooltipProvider } from "../src/ui/kit";
+import type { ComputerSoundState } from "../src/voice/share-sound";
 import "../src/index.css";
 const query = new URLSearchParams(location.search);
+// The desktop app's sound UI, by platform marker alone: no shell, capture or native engine runs.
+const computerSound = query.get("computer") as ComputerSoundState | null;
+if (computerSound) (window as unknown as { __TAURI_INTERNALS__: object }).__TAURI_INTERNALS__ = {};
 const client = (id: number, nickname: string) => ({ id, uid: `fixture-${id}`, nickname, channel: 1, groups: [], platform: "web", muted: false, deafened: false, away: null, talking: false, voice: true, voice_binding: null });
 useSettings.setState({ language: query.get("lang") === "en" ? "en" : "pl", theme: "dark", shareAudio: {} });
 useUi.setState({ section: "servers" });
@@ -28,9 +32,11 @@ const draw = () => {
 const stream = canvas.captureStream(10);
 const sound = new AudioContext(); const destination = sound.createMediaStreamDestination(); const tone = sound.createOscillator(); tone.frequency.value = 997; tone.connect(destination); tone.start(); stream.addTrack(destination.stream.getAudioTracks()[0]!);
 useScreen.setState({ ...initialScreen, transport: { phase: "connected", run: 1 }, stage: "A", slots: ["A", null, null, null], streams: [stream, null, null, null],
-  own: { phase: query.has("choose") ? "choosing" : "live", attempt: 1, share: "M", stream, surface: "tab", spec: { mode: "smooth", height: 1080, fps: 30 }, audio: !query.has("silent"), viewers: query.has("zero") || query.has("linked") ? 0 : 2, guests: query.has("linked") ? 2 : 0, guestLink: query.has("linked"), preview: false },
+  own: { phase: query.has("choose") ? "choosing" : "live", attempt: 1, share: "M", stream, surface: computerSound ? "screen" : "tab", spec: { mode: "smooth", height: 1080, fps: 30 }, audio: !query.has("silent") && (!computerSound || ((computerSound === "ok" || computerSound === "resuming") && !query.has("choose"))), ...(computerSound ? { computerSound } : {}), viewers: query.has("zero") || query.has("linked") ? 0 : 2, guests: query.has("linked") ? 2 : 0, guestLink: query.has("linked"), preview: false },
   links: query.has("linked") ? { M: true } : {},
-  watches: [{ share: "A", id: 1, slot: 0, status: "watching", audio: true }],
+  // The desktop states watch a share without sound, unless a test asks for one that has it.
+  watches: [{ share: "A", id: 1, slot: 0, status: "watching", audio: !computerSound || query.has("watchsound"), soundReady: query.has("watchsound") }],
 });
+if (computerSound) { controller.screen.openSound = async () => {}; controller.screen.closeSound = () => {}; controller.screen.setSoundGain = () => {}; }
 controller.screen.ownStats = async () => null; controller.screen.stats = async () => null;
 createRoot(document.getElementById("root")!).render(<TooltipProvider><main className="flex h-screen flex-col bg-surface text-fg"><header className="bg-side px-4 py-3 text-sm font-semibold"><h1>Gwar / Rozmowy</h1></header><SharingBar /><div className="flex min-h-0 flex-1"><Stage /></div><SharePresetDialog /></main></TooltipProvider>);

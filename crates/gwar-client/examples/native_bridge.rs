@@ -7,25 +7,28 @@
 //! Usage: native_bridge <microphone Hz>
 //! stdin:  {"id", "command", "args"} per line
 //! stdout: {"id", "ok"} | {"id", "error"} replies and {"event", "payload"} events
-//! Test-only command `snapshot {frequency}` reports the speaker's recent tone.
+//! Test-only command `snapshot {frequency}` reports the speaker's recent tone. Share sound uses
+//! the real playout and capture queue; the "computer" plays a 997 Hz tone, `share_stats` counts.
 
 use std::{
     collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
 };
 
 use anyhow::Context;
+use base64::{Engine, prelude::BASE64_STANDARD};
 use gwar_client::voice::{
-    LinkState, VoiceHandle,
-    io::{AudioIo, AudioPorts, CaptureSample, OutputTiming},
+    LinkState, SlotStats, VoiceHandle,
+    io::{AudioIo, AudioPorts, CaptureSample, OutputTiming, mono},
     keys::EncryptedStart,
     sframe::{Binding, ControlReply},
+    share::{CaptureQueue, SharePlayout, parse_frames},
     start_encrypted, start_with,
 };
 use rtrb::RingBuffer;
@@ -38,11 +41,18 @@ use tokio::{
 const RATE: usize = 48_000;
 const BLOCK: usize = 480;
 const WINDOW: usize = 4096;
+/// The tone the fixture's "computer" plays while a share captures its sound.
+const COMPUTER_TONE: f64 = 997.0;
 
 struct ToneIo {
     frequency: f64,
     played: Arc<Mutex<VecDeque<f32>>>,
+    computer: ComputerLog,
+    from_ring: Arc<AtomicU64>,
 }
+
+/// The computer tone's strength at the speaker, one value per block, for as long as a run asks.
+type ComputerLog = Arc<Mutex<Option<Vec<f32>>>>;
 
 struct Guard {
     stop: Arc<AtomicBool>,
@@ -61,7 +71,7 @@ impl Drop for Guard {
 impl AudioIo for ToneIo {
     fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
         let (mut mic_tx, mic) = RingBuffer::new(RATE);
-        let (speaker, mut speaker_rx) = RingBuffer::new(RATE / 2);
+        let (speaker, mut speaker_rx) = RingBuffer::<[f32; 2]>::new(RATE / 2);
         let output = Arc::new(OutputTiming::default());
         let timing = output.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -80,10 +90,17 @@ impl AudioIo for ToneIo {
                         position: position + i as u64,
                         value,
                     });
-                    block.push(speaker_rx.pop().unwrap_or_else(|_| {
-                        missing += 1;
-                        0.0
-                    }));
+                    block.push(speaker_rx.pop().map_or_else(
+                        |_| {
+                            missing += 1;
+                            0.0
+                        },
+                        mono,
+                    ));
+                }
+                self.from_ring.fetch_add((BLOCK - missing) as u64, Ordering::Relaxed);
+                if let Some(log) = self.computer.lock().unwrap().as_mut() {
+                    log.push(strength(&block, COMPUTER_TONE));
                 }
                 {
                     let mut played = self.played.lock().unwrap();
@@ -102,6 +119,19 @@ impl AudioIo for ToneIo {
         })?;
         Ok(AudioPorts { mic, speaker, output, _guard: Box::new(Guard { stop, thread: Some(thread) }) })
     }
+}
+
+/// One tone's amplitude in a block, windowed so that a voice beside it does not leak in.
+fn strength(block: &[f32], frequency: f64) -> f32 {
+    let (mut sine, mut cosine, mut weight) = (0.0, 0.0, 0.0);
+    for (i, s) in block.iter().enumerate() {
+        let hann = 0.5 - 0.5 * (i as f64 * std::f64::consts::TAU / block.len() as f64).cos();
+        let phase = i as f64 * frequency * std::f64::consts::TAU / RATE as f64;
+        sine += f64::from(*s) * hann * phase.sin();
+        cosine += f64::from(*s) * hann * phase.cos();
+        weight += hann;
+    }
+    (2.0 * (sine * sine + cosine * cosine).sqrt() / weight) as f32
 }
 
 /// The tone's share of the recent speaker energy, 0 when silent (the browser test's measure).
@@ -124,12 +154,19 @@ struct State {
     run: u64,
     handle: Option<VoiceHandle>,
     answers: HashMap<u64, oneshot::Sender<Result<String, String>>>,
+    playout: Option<Arc<SharePlayout>>,
+    capture: Option<(u64, Arc<CaptureQueue>)>,
 }
 
 struct Bridge {
     frequency: f64,
     played: Arc<Mutex<VecDeque<f32>>>,
+    computer: ComputerLog,
+    /// Samples the speaker has taken from the voice ring.
+    from_ring: Arc<AtomicU64>,
     state: Mutex<State>,
+    /// When the fake computer started, and how many samples it has written.
+    capture_clock: Arc<Mutex<(Option<Instant>, u64)>>,
 }
 
 fn emit(event: &str, payload: Value) {
@@ -147,6 +184,18 @@ impl Bridge {
         anyhow::ensure!(number(args, "owner")? == state.owner, "superseded owner");
         let current = number(args, "run")? == state.run;
         Ok(state.handle.as_ref().filter(|_| current).and_then(|h| h.keys().cloned()))
+    }
+
+    fn playout(&self) -> anyhow::Result<Arc<SharePlayout>> {
+        let mut state = self.state.lock().unwrap();
+        if state.playout.is_none() {
+            let playout = Arc::new(SharePlayout::new()?);
+            if let Some(handle) = &state.handle {
+                handle.set_share_bus(playout.bus());
+            }
+            state.playout = Some(playout);
+        }
+        Ok(state.playout.clone().expect("made above"))
     }
 
     async fn command(self: Arc<Self>, command: &str, args: Value) -> anyhow::Result<Value> {
@@ -191,10 +240,115 @@ impl Bridge {
                 let keys = self.keys(&args)?;
                 Ok(keys.map_or(Value::Null, |k| serde_json::to_value(k.counters()).unwrap()))
             }
+            "voice_flow" => {
+                let state = self.state.lock().unwrap();
+                let handle = state.handle.as_ref().context("no voice session")?;
+                let stats = handle.stats();
+                let sum = |field: fn(&SlotStats) -> u64| stats.slots.iter().map(field).sum::<u64>();
+                let crypto = handle.keys().map(|keys| keys.counters()).unwrap_or_default();
+                Ok(json!({
+                    "framesReceived": stats.frames_received,
+                    "rejected": crypto.no_key + crypto.auth_failed + crypto.replay_dropped,
+                    "decrypted": crypto.decrypted,
+                    "concealments": sum(|slot| slot.concealments),
+                    "queuedSamples": sum(|slot| slot.queued_samples),
+                    "speakerSamples": self.from_ring.load(Ordering::Relaxed),
+                    "underrunSamples": stats.underrun_samples,
+                }))
+            }
             "audio_devices" => Ok(json!({ "inputs": [], "outputs": [] })),
+            "share_capture_support" => Ok(json!("ok")),
+            "share_capture_start" => {
+                let id = number(&args, "id")?;
+                let queue = Arc::<CaptureQueue>::default();
+                self.state.lock().unwrap().capture = Some((id, queue.clone()));
+                let started = Instant::now();
+                self.capture_clock.lock().unwrap().0 = Some(started);
+                let written = self.capture_clock.clone();
+                tokio::spawn(async move {
+                    let mut position = 0u64;
+                    while !queue.is_closed() {
+                        let block: Vec<f32> = (0..BLOCK as u64)
+                            .flat_map(|i| {
+                                let phase = (position + i) as f64 * COMPUTER_TONE * std::f64::consts::TAU / RATE as f64;
+                                [phase.sin() as f32 * 0.2; 2]
+                            })
+                            .collect();
+                        queue.write(&block);
+                        position += BLOCK as u64;
+                        written.lock().unwrap().1 = position;
+                        // By the clock, as a sound device runs: a plain 10 ms sleep runs 13% slow.
+                        let due = started + Duration::from_secs_f64(position as f64 / RATE as f64);
+                        tokio::time::sleep_until(due.into()).await;
+                    }
+                });
+                Ok(Value::Null)
+            }
+            "share_capture_read" => {
+                let id = number(&args, "id")?;
+                let queue = self.state.lock().unwrap().capture.clone().filter(|(running, _)| *running == id);
+                let (_, queue) = queue.context("closed")?;
+                let samples = queue.read(Duration::from_millis(100)).await;
+                anyhow::ensure!(!samples.is_empty() || !queue.is_closed(), "closed");
+                Ok(json!(BASE64_STANDARD.encode(samples.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>())))
+            }
+            "share_capture_stats" => {
+                let (started, written) = *self.capture_clock.lock().unwrap();
+                let dropped = self.state.lock().unwrap().capture.as_ref().map_or(0, |(_, queue)| queue.dropped());
+                let elapsed = started.map_or(0.0, |started| started.elapsed().as_secs_f64());
+                Ok(
+                    json!({ "writtenSeconds": written as f64 / RATE as f64, "elapsedSeconds": elapsed, "dropped": dropped }),
+                )
+            }
+            "share_capture_stop" => {
+                let id = number(&args, "id")?;
+                let mut state = self.state.lock().unwrap();
+                if state.capture.as_ref().is_some_and(|(running, _)| *running == id) {
+                    state.capture.take().unwrap().1.close();
+                }
+                Ok(Value::Null)
+            }
+            "share_playback_open" => {
+                let (slot, run) = (number(&args, "slot")? as usize, number(&args, "run")?);
+                let gain = args["gain"].as_f64().context("gain")? as f32;
+                let opened = self.playout()?.open(slot, run, gain);
+                Ok(json!(opened && self.state.lock().unwrap().handle.is_some()))
+            }
+            "share_playback_close" => {
+                self.playout()?.close(number(&args, "slot")? as usize, number(&args, "run")?);
+                Ok(Value::Null)
+            }
+            "share_playback_gain" => {
+                let (slot, run) = (number(&args, "slot")? as usize, number(&args, "run")?);
+                self.playout()?.set_gain(slot, run, args["gain"].as_f64().context("gain")? as f32);
+                Ok(Value::Null)
+            }
+            "share_playback_frames" => {
+                let body: Vec<u8> = serde_json::from_value(args["body"].clone())?;
+                let (_, frames) = parse_frames(&body).context("malformed share frames")?;
+                let playout = self.playout()?;
+                for frame in frames {
+                    playout.push(frame);
+                }
+                Ok(Value::Null)
+            }
+            "share_stats" => {
+                let stats = self.playout()?.stats();
+                Ok(
+                    json!({ "frames": stats.frames, "decoded": stats.decoded, "concealed": stats.concealed, "late": stats.late_drops, "backlog": stats.backlog_drops, "input": stats.input_drops, "underruns": stats.ring_underruns }),
+                )
+            }
+            "computer_log_start" => {
+                *self.computer.lock().unwrap() = Some(Vec::new());
+                Ok(Value::Null)
+            }
+            "computer_log_stop" => Ok(json!(self.computer.lock().unwrap().take().unwrap_or_default())),
             "snapshot" => {
                 let frequency = args["frequency"].as_f64().context("frequency")?;
-                Ok(json!({ "tone": tone(&self.played.lock().unwrap(), frequency) }))
+                let played = self.played.lock().unwrap();
+                let energy = played.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>();
+                let rms = (energy / played.len().max(1) as f64).sqrt();
+                Ok(json!({ "tone": tone(&played, frequency), "rms": rms }))
             }
             // Device, gain and gate setters do not change what this fixture tests.
             _ => Ok(Value::Null),
@@ -228,7 +382,12 @@ impl Bridge {
             emit("voice://offer", json!({ "owner": owner, "run": run, "sdp": sdp }));
             answered.await?.map_err(anyhow::Error::msg)
         };
-        let io = Box::new(ToneIo { frequency: self.frequency, played: self.played.clone() });
+        let io = Box::new(ToneIo {
+            frequency: self.frequency,
+            played: self.played.clone(),
+            computer: self.computer.clone(),
+            from_ring: self.from_ring.clone(),
+        });
         let server: IpAddr = "127.0.0.1".parse()?;
         let handle = match crypto {
             Some(crypto) => start_encrypted(io, server, signal, crypto).await?,
@@ -238,6 +397,9 @@ impl Bridge {
         {
             let mut state = self.state.lock().unwrap();
             anyhow::ensure!(state.owner == owner && state.run == run, "superseded");
+            if let Some(playout) = &state.playout {
+                handle.set_share_bus(playout.bus());
+            }
             state.handle = Some(handle);
         }
         if let Some(mut events) = events {
@@ -289,7 +451,14 @@ impl Bridge {
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let frequency: f64 = std::env::args().nth(1).context("usage: native_bridge <microphone Hz>")?.parse()?;
-    let bridge = Arc::new(Bridge { frequency, played: Arc::default(), state: Mutex::default() });
+    let bridge = Arc::new(Bridge {
+        frequency,
+        played: Arc::default(),
+        computer: Arc::default(),
+        from_ring: Arc::default(),
+        state: Mutex::default(),
+        capture_clock: Arc::default(),
+    });
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await? {
         let request: Value = serde_json::from_str(&line)?;

@@ -7,6 +7,7 @@ mod files;
 mod invites;
 mod ptt;
 mod screen;
+mod share_audio;
 mod shortcuts;
 mod startup;
 mod tray;
@@ -86,12 +87,19 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(startup::Startup::default())
         .manage(voice::Voice::default())
+        .manage(share_audio::ShareCapture::default())
         .manage(shortcuts::Shortcuts::default())
         .manage(ptt::Ptt::default())
         .manage(ts::Ts::default())
         .manage(files::Files::default())
         .manage(tray::CloseToTray(AtomicBool::new(true)))
         .on_permission_request(|_, kind| webview::media_permission(kind))
+        .on_page_load(|webview, load| {
+            // The old page is gone from here on, whatever its JavaScript managed to clean up.
+            if webview.label() == "main" && load.event() == tauri::webview::PageLoadEvent::Started {
+                webview.state::<share_audio::ShareCapture>().retire();
+            }
+        })
         .setup(|app| {
             // Installed AppImages may move; refresh their desktop integration, never a debug binary.
             #[cfg(all(target_os = "linux", not(debug_assertions)))]
@@ -159,6 +167,16 @@ pub fn run() {
             voice::open_mic_privacy_settings,
             screen::screen_capture_support,
             screen::open_screen_privacy_settings,
+            share_audio::share_capture_support,
+            share_audio::share_capture_allow,
+            share_audio::share_capture_start,
+            share_audio::share_capture_resume,
+            share_audio::share_capture_read,
+            share_audio::share_capture_stop,
+            share_audio::share_playback_open,
+            share_audio::share_playback_close,
+            share_audio::share_playback_gain,
+            share_audio::share_playback_frames,
             files::files_set_server,
             files::files_cancel,
             files::fetch_file,

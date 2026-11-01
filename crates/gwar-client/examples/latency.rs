@@ -506,7 +506,7 @@ fn prefaulted_ring<T: Copy>(capacity: usize, fill: T) -> (rtrb::Producer<T>, rtr
 struct Callbacks {
     io: Box<FakeIo>,
     mic: rtrb::Producer<CaptureSample>,
-    speaker: rtrb::Consumer<f32>,
+    speaker: rtrb::Consumer<[f32; 2]>,
     timing: Arc<OutputTiming>,
     /// Delays decoded audio, including silence and carrier, before playout. Capture/playout
     /// timestamps always remain the actual callback times.
@@ -520,7 +520,7 @@ impl Callbacks {
     fn new(
         io: Box<FakeIo>,
         mic: rtrb::Producer<CaptureSample>,
-        speaker: rtrb::Consumer<f32>,
+        speaker: rtrb::Consumer<[f32; 2]>,
         timing: Arc<OutputTiming>,
     ) -> Self {
         let delay = DelayLine::new(io.delay_samples);
@@ -575,11 +575,14 @@ impl Callbacks {
             if self.mic.push(CaptureSample { captured_at: Instant::now(), position: at as u64, value }).is_err() {
                 return Err(Termination::MicRingFull);
             }
-            let value = self.speaker.pop().unwrap_or_else(|_| {
-                data.underflows += 1;
-                missing += 1;
-                0.0
-            });
+            let value = self.speaker.pop().map_or_else(
+                |_| {
+                    data.underflows += 1;
+                    missing += 1;
+                    0.0
+                },
+                |[left, _]| left,
+            );
             if !io.tone {
                 let playout_s = (now - io.epoch).as_secs_f64() + i as f64 / RATE as f64;
                 data.samples.push((playout_s, self.delay.process(value)));
@@ -625,7 +628,7 @@ impl AudioIo for FakeIo {
     fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
         let blank = CaptureSample { captured_at: Instant::now(), position: 0, value: 0.0 };
         let (mic_tx, mic) = prefaulted_ring(RATE, blank);
-        let (speaker, speaker_rx) = prefaulted_ring(RATE / 2, 0.0);
+        let (speaker, speaker_rx) = prefaulted_ring(RATE / 2, [0.0; 2]);
         let output = Arc::new(OutputTiming::default());
         let control = self.control.clone();
         let callbacks = Callbacks::new(self, mic_tx, speaker_rx, output.clone());
@@ -1501,7 +1504,7 @@ mod tests {
             warmup_samples: 0,
         });
         let (mic_tx, mic) = prefaulted_ring(mic_ring, CaptureSample { captured_at: now, position: 0, value: 0.0 });
-        let (speaker, speaker_rx) = prefaulted_ring(RATE / 2, 0.0);
+        let (speaker, speaker_rx) = prefaulted_ring(RATE / 2, [0.0; 2]);
         (Callbacks::new(io, mic_tx, speaker_rx, Arc::new(OutputTiming::default())), mic, speaker, data, control)
     }
 
@@ -1515,7 +1518,7 @@ mod tests {
         let allocations = counting::allocations(|| {
             for _ in 0..40 {
                 for _ in 0..BLOCK / 2 {
-                    let _ = speaker.push(0.25);
+                    let _ = speaker.push([0.25; 2]);
                 }
                 receiver.run(receiver.due() + Duration::from_millis(6)).unwrap();
                 sender.run(sender.due()).unwrap();

@@ -37,10 +37,16 @@ pub struct CaptureSample {
     pub value: f32,
 }
 
+/// What a one-channel device plays of a speaker pair.
+pub fn mono([left, right]: [f32; 2]) -> f32 {
+    0.5 * (left + right)
+}
+
 /// Ring ends handed to the engine. Dropping `_guard` stops the devices.
 pub struct AudioPorts {
     pub mic: Consumer<CaptureSample>,
-    pub speaker: Producer<f32>,
+    /// Final left and right samples, as a pair: the two channels cannot slip apart.
+    pub speaker: Producer<[f32; 2]>,
     pub _guard: Box<dyn Send>,
     /// Shared with the output callback; report each callback to wake the pipeline.
     pub output: Arc<OutputTiming>,
@@ -612,7 +618,7 @@ type Active = Arc<AtomicU64>;
 struct Cpal {
     host: cpal::Host,
     mic: Arc<Mutex<MicFeed>>,
-    speaker: Arc<Mutex<Consumer<f32>>>,
+    speaker: SpeakerRing,
     timing: Arc<OutputTiming>,
     active: [Active; 2],
     /// The last offers read, standing in when enumeration fails.
@@ -742,10 +748,12 @@ fn open_input(
     Ok(stream)
 }
 
+type SpeakerRing = Arc<Mutex<Consumer<[f32; 2]>>>;
+
 fn open_output(
     host: &cpal::Host,
     route: &Route,
-    speaker: Arc<Mutex<Consumer<f32>>>,
+    speaker: SpeakerRing,
     timing: Arc<OutputTiming>,
     (active, id): (Active, u64),
     trouble: TroubleFn,
@@ -760,8 +768,10 @@ fn open_output(
     let config = device.default_output_config()?;
     let channels = usize::from(config.channels());
     let device_rate = config.sample_rate() as usize;
-    let mut to_device = Resampler::new(RATE, config.sample_rate());
+    let mut left_to_device = Resampler::new(RATE, config.sample_rate());
+    let mut right_to_device = Resampler::new(RATE, config.sample_rate());
     let mut pending: Vec<f32> = Vec::new();
+    let mut pending_right: Vec<f32> = Vec::new();
     let stream = device.build_output_stream(
         config.config(),
         move |data: &mut [f32], _| {
@@ -773,16 +783,22 @@ fn open_output(
             }
             if let Some(mut speaker_rx) = try_lock(&speaker) {
                 while pending.len() < frames {
-                    let Ok(sample) = speaker_rx.pop() else { break };
-                    to_device.process(&[sample], |s| pending.push(s));
+                    let Ok([left, right]) = speaker_rx.pop() else { break };
+                    left_to_device.process(&[left], |s| pending.push(s));
+                    right_to_device.process(&[right], |s| pending_right.push(s));
                 }
             }
             let take = pending.len().min(frames);
             let silent = silence.iter().any(|s| s.load(Ordering::Relaxed));
             for (i, frame) in data.chunks_mut(channels).enumerate() {
-                frame.fill(if !silent && i < take { pending[i] } else { 0.0 });
+                let pair = if !silent && i < take { [pending[i], pending_right[i]] } else { [0.0; 2] };
+                frame.fill(mono(pair));
+                if let [left, right, ..] = frame {
+                    [*left, *right] = pair;
+                }
             }
             pending.drain(..take);
+            pending_right.drain(..take);
             timing.report(
                 (frames * RATE as usize).div_ceil(device_rate),
                 ((frames - take) * RATE as usize).div_ceil(device_rate),
@@ -821,10 +837,10 @@ fn open_sample_output<T>(
 /// is also checked by the device callback, so hiding the window silences it at once.
 pub fn play_sample(output: Option<String>, samples: Vec<f32>, cancelled: Arc<AtomicBool>) -> anyhow::Result<()> {
     anyhow::ensure!(!samples.is_empty(), "No microphone audio was recorded");
-    let (mut tx, rx) = RingBuffer::new(samples.len());
+    let (mut tx, rx) = RingBuffer::<[f32; 2]>::new(samples.len());
     let duration = Duration::from_secs_f64(samples.len() as f64 / 48_000.0);
     for sample in samples {
-        let _ = tx.push(sample);
+        let _ = tx.push([sample; 2]);
     }
     if cancelled.load(Ordering::SeqCst) {
         return Ok(());
@@ -882,9 +898,9 @@ pub fn play_cue(output: Option<String>, samples: Vec<f32>, busy: Arc<AtomicUsize
             }
         }
         let _release = Release(release);
-        let (mut tx, rx) = RingBuffer::new(samples.len().max(1));
+        let (mut tx, rx) = RingBuffer::<[f32; 2]>::new(samples.len().max(1));
         for sample in samples {
-            let _ = tx.push(sample);
+            let _ = tx.push([sample; 2]);
         }
         if silence.iter().any(|s| s.load(Ordering::Relaxed)) {
             return;
@@ -931,7 +947,7 @@ impl AudioIo for DeviceIo {
     fn open(self: Box<Self>) -> Result<AudioPorts> {
         let DeviceIo { input, output: speakers, input_only, on_issue, events, inbox, stopped } = *self;
         let (mic_tx, mic) = RingBuffer::<CaptureSample>::new(RATE as usize); // 1 s
-        let (speaker, speaker_rx) = RingBuffer::<f32>::new(RATE as usize / 2);
+        let (speaker, speaker_rx) = RingBuffer::<[f32; 2]>::new(RATE as usize / 2);
         let output = Arc::new(OutputTiming::default());
         let timing = output.clone();
         let stop = StopOnDrop(events.clone());

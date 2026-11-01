@@ -1,0 +1,70 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>share_ipc</title>
+<pre id="out">running</pre>
+<script>
+// The load of voice/share-sound.ts: one batch in flight, at most 400 pending and 64 in a batch,
+// and one long-polling reader.
+const { invoke } = window.__TAURI_INTERNALS__;
+const MAX_PENDING = 400, MAX_BATCH = 64;
+const percentile = (values, p) => { const sorted = [...values].sort((a, b) => a - b); return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))] ?? 0; };
+function encode(frames) {
+  const size = frames.reduce((total, frame) => total + 7 + frame.data.length, 16);
+  const body = new Uint8Array(size), view = new DataView(body.buffer);
+  view.setBigUint64(0, 1n, true); view.setBigUint64(8, 1n, true);
+  let at = 16;
+  for (const { slot, rtpTime, data } of frames) {
+    view.setUint8(at, slot); view.setUint32(at + 1, rtpTime >>> 0, true); view.setUint16(at + 5, data.length, true);
+    body.set(data, at + 7); at += 7 + data.length;
+  }
+  return body;
+}
+(async () => {
+  // Running audio keeps the page awake when nobody looks at it, as a share's own context does.
+  const context = new AudioContext(), source = context.createConstantSource(), hush = context.createGain();
+  hush.gain.value = 0; source.connect(hush).connect(context.destination); source.start();
+  await context.resume().catch(() => {});
+  const { seconds, slots } = await invoke("probe_setup");
+  const data = crypto.getRandomValues(new Uint8Array(160));
+  data[0] = 0xfc;
+  const pending = [], trips = [], batches = [], reads = [];
+  let sending = false, shifted = 0, sent = 0, bytes = 0, lastRead = performance.now(), readGap = 0;
+  const flush = () => {
+    if (sending || !pending.length) return;
+    sending = true;
+    const frames = pending.splice(0, MAX_BATCH), at = performance.now();
+    batches.push(frames.length);
+    invoke("probe_frames", encode(frames)).finally(() => { trips.push(performance.now() - at); sending = false; flush(); });
+  };
+  // Timers stall in a page nobody looks at, and the app has none here: its frames arrive with
+  // the network, its reads complete on their own. So the reads are this page's clock.
+  const started = performance.now();
+  let rtpTime = 0;
+  const arrive = now => {
+    while (rtpTime / 48 <= now - started) {
+      for (let slot = 0; slot < slots; slot++) {
+        pending.push({ slot, rtpTime, data }); sent++;
+        if (pending.length > MAX_PENDING) { pending.shift(); shifted++; }
+      }
+      rtpTime += 960;
+    }
+    flush();
+  };
+  await (async () => {
+    while (performance.now() - started < seconds * 1000) {
+      const at = performance.now();
+      const buffer = await invoke("probe_read");
+      const now = performance.now();
+      reads.push(now - at);
+      bytes += buffer.byteLength ?? buffer.length ?? 0;
+      if (buffer.byteLength) { readGap = Math.max(readGap, now - lastRead); lastRead = now; }
+      arrive(now);
+    }
+  })();
+  await invoke("probe_done", { page: {
+    seconds, sent, shifted, batches: batches.length, largestBatch: Math.max(...batches),
+    tripMs: { p50: percentile(trips, 0.5), p99: percentile(trips, 0.99), max: Math.max(...trips) },
+    capture: { reads: reads.length, bytes, expectedBytes: seconds * 192000 * 2, readP99Ms: percentile(reads, 0.99), longestGapMs: readGap },
+  } });
+})().catch(error => { document.getElementById("out").textContent = String(error); invoke("probe_done", { page: { error: String(error) } }); });
+</script>

@@ -64,6 +64,43 @@ try {
       results.at(-1).guestLink = { ...linked, guests };
     }
   }
+  // The desktop app's computer sound: one question before the share, honest states during it.
+  for (const lang of ["pl", "en"]) {
+    for (const [name, width, height] of [["desktop", 1440, 900], ["tablet", 768, 1024], ["390", 390, 844], ["360", 360, 800]]) {
+      await page.setViewportSize({ width, height });
+      // Ready is not painted: a narrow window's first video frame comes a moment later.
+      const shot = async label => { await page.evaluate(() => document.fonts.ready); await page.waitForTimeout(500); await page.screenshot({ path: path.join(output, `computer-${label}-${lang}-${name}.png`), animations: "disabled" }); };
+      const fits = async label => {
+        const dialog = page.getByRole("dialog"); await dialog.waitFor();
+        await dialog.evaluate(async e => { await Promise.all(e.getAnimations({ subtree: true }).map(a => a.finished)); });
+        const box = await dialog.boundingBox();
+        assert.ok(box.x >= 0 && box.x + box.width <= width && box.y >= 0 && box.y + box.height <= height, `${label} dialog fits ${width}x${height}: ${JSON.stringify(box)}`);
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth - innerWidth), 0);
+      };
+      for (const state of ["ok", "permission", "unsupported"]) {
+        await page.goto(`${base}?lang=${lang}&choose=1&computer=${state}`);
+        await page.getByTestId("computer-sound-choice").waitFor();
+        await fits(`choose ${state}`);
+        await shot(`choose-${state}`);
+      }
+      for (const state of ["ok", "resuming", "failed", "stopped", "permission"]) {
+        await page.goto(`${base}?lang=${lang}&computer=${state}`);
+        await page.getByRole("status", { name: lang === "pl" ? "Udostępniasz ekran" : "You are sharing your screen" }).waitFor();
+        await page.waitForFunction(() => document.querySelector("video[data-share]")?.readyState >= 2);
+        assert.ok((await page.getByRole("status", { name: lang === "pl" ? "Udostępniasz ekran" : "You are sharing your screen" }).boundingBox()).height <= 46, "sharing banner stays one compact row");
+        assert.equal(await page.getByTestId("share-audio-controls").count(), 0, `${state}: a share without sound has no volume`);
+        await shot(`live-${state}`);
+        await page.getByRole("button", { name: lang === "pl" ? "Szczegóły" : "Details", exact: true }).click();
+        await fits(`details ${state}`);
+        await shot(`details-${state}`);
+      }
+      // Watching somebody else's share with sound while my own has none: the volume is theirs.
+      await page.goto(`${base}?lang=${lang}&computer=failed&watchsound=1`);
+      await page.getByTestId("share-audio-controls").waitFor();
+      await page.waitForFunction(() => document.querySelector("video[data-share]")?.readyState >= 2);
+      await shot("watching-sound");
+    }
+  }
   writeFileSync(path.join(output, "fixture-layouts.json"), JSON.stringify(results, null, 2));
   console.log(JSON.stringify({ status: "pass", screenshots: output, layouts: results.length }));
 } finally { await browser.close(); }

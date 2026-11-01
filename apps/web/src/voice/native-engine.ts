@@ -97,6 +97,8 @@ export class NativeVoiceEngine implements VoiceEngine {
 
   // ---------------------------------------------------------------- events
 
+  shareSound(): Promise<{ api: TauriBridge; owner: number }> { return this.ready; }
+
   playSound(cue: SoundCue, volume: number): void {
     // Preserve ordering with mute/deafen and stop, including outside a call.
     void this.send("voice_play_cue", { cue, volume }, performance.now() + 300);

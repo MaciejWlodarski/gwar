@@ -8,7 +8,9 @@
  * workers. Tones are checked at the browser's WebAudio output and at each
  * native speaker. Last, in a plaintext channel, a native device shares its
  * screen through the webview's own transports (docs/screen-share.md, PR 5)
- * and the browser watches it, with native voice going on in the same call.
+ * and the browser watches it, with native voice going on in the same call. Then its computer
+ * sound (the fixture's 997 Hz tone, through the real capture queue, webview sender and SFU)
+ * reaches a native viewer's mixer, with no player in that viewer's webview.
  *
  * Build once: cargo build -p gwar-server && cargo build -p gwar-client --example native_bridge
  *   E2E_BROWSERS=chromium,webkit   engine of every page (default: chromium; CI runs Chromium,
@@ -17,6 +19,8 @@
 import { chooseFirstRunName } from "./first-run.mjs";
 import { stopProcesses } from "./processes.mjs";
 import { canvasCapture, readBarcode, stampBarcode } from "./screen-source.mjs";
+import { monitorEventLoopDelay } from "node:perf_hooks";
+import { batchTiming, continuityLimits, continuityProblems, shareContinuity, toneCoverage, whereSoundStopped } from "./share-continuity.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -71,7 +75,7 @@ function nativeFixture(frequency) {
   const fixture = { page: null, log: () => child.log };
   createInterface({ input: child.stdout }).on("line", line => {
     const message = JSON.parse(line);
-    child.log += `< ${line.slice(0, 300)}\n`;
+    if (line.length < 1000 && !line.includes('"ok":null')) child.log += `< ${line.slice(0, 300)}\n`;
     if ("event" in message) {
       void fixture.page?.evaluate(({ event, payload }) => window.__nativeEmit(event, payload), message).catch(() => {});
       return;
@@ -81,10 +85,18 @@ function nativeFixture(frequency) {
     if ("error" in message) waiter?.reject(new Error(message.error));
     else waiter?.resolve(message.ok);
   });
+  fixture.batches = [];
+  fixture.reads = [];
   fixture.request = (command, args = {}) => new Promise((resolve, reject) => {
     const id = ++next;
+    if (command === "share_playback_frames" || command === "share_capture_read") {
+      const started = performance.now();
+      const finish = resolve;
+      const timed = command === "share_capture_read" ? fixture.reads : fixture.batches;
+      resolve = value => { timed.push({ started, ms: performance.now() - started }); finish(value); };
+    }
     pending.set(id, { resolve, reject });
-    if (command !== "snapshot" && command !== "audio_devices") child.log += `> ${command} ${JSON.stringify(args).slice(0, 300)}\n`;
+    if (!["snapshot", "audio_devices", "share_capture_read", "share_playback_frames"].includes(command)) child.log += `> ${command} ${JSON.stringify(args).slice(0, 300)}\n`;
     child.stdin.write(`${JSON.stringify({ id, command, args })}\n`);
   });
   fixture.hears = async other => (await fixture.request("snapshot", { frequency: other })).tone > 0.05;
@@ -94,9 +106,18 @@ function nativeFixture(frequency) {
 /** Browser-side half of the bridge: `NativeVoiceEngine`'s invoke/listen pair. */
 function bridgePatch() {
   const listeners = new Map();
+  window.__batches = [];
   window.__nativeEmit = (event, payload) => { for (const handler of listeners.get(event) ?? []) handler(payload); };
   window.__nativeBridge = async () => ({
-    invoke: (command, args) => window.__nativeInvoke(command, args ?? {}),
+    invoke: (command, args) => {
+      // The real shell hands this over as raw bytes. A list of numbers this long costs Playwright
+      // hundreds of milliseconds of Node's only thread for each read on a loaded runner.
+      if (command === "share_capture_read") return window.__nativeInvoke(command, args).then(text => Uint8Array.from(atob(text), c => c.charCodeAt(0)).buffer);
+      if (!(args instanceof Uint8Array)) return window.__nativeInvoke(command, args ?? {});
+      // The one command the real shell takes as raw bytes: what this bridge costs it is measured.
+      const started = performance.now();
+      return window.__nativeInvoke(command, { body: Array.from(args) }).finally(() => { window.__batches.push({ started, ms: performance.now() - started }); });
+    },
     listen: async (event, handler) => {
       const set = listeners.get(event) ?? new Set();
       listeners.set(event, set);
@@ -109,6 +130,15 @@ function bridgePatch() {
 /** Synthetic microphone and the app's output tap for the browser device. */
 function devicePatch(frequency) {
   window.__outputs = [];
+  window.__microphones = [];
+  window.__peers = [];
+  window.RTCPeerConnection = new Proxy(window.RTCPeerConnection, {
+    construct(target, args, created) {
+      const peer = Reflect.construct(target, args, created);
+      window.__peers.push(peer);
+      return peer;
+    },
+  });
   const connect = AudioNode.prototype.connect;
   AudioNode.prototype.connect = function (...args) {
     if (args[0] === this.context.destination) {
@@ -122,6 +152,7 @@ function devicePatch(frequency) {
   const media = navigator.mediaDevices;
   media.getUserMedia = async () => {
     const context = new AudioContext();
+    window.__microphones.push(context);
     const oscillator = context.createOscillator();
     oscillator.frequency.value = frequency;
     const gain = context.createGain();
@@ -152,6 +183,35 @@ async function browserTone(page, frequency) {
     return rms < 0.002 ? 0 : 2 * (sine * sine + cosine * cosine) / (pcm.length * energy);
   }, frequency);
 }
+/** What a browser that speaks is doing: its fake microphone's state and what it has sent. */
+const senderFlow = page => page.evaluate(async () => {
+  let packetsSent = 0;
+  for (const peer of window.__peers) {
+    for (const stat of (await peer.getStats()).values()) if (stat.type === "outbound-rtp" && stat.kind === "audio") packetsSent += stat.packetsSent ?? 0;
+  }
+  return { context: window.__microphones.at(-1)?.state ?? "missing", packetsSent };
+});
+
+/** Waits to hear `frequency`; if it never comes, says where on `speaker`'s way here it stopped. */
+async function hearsFrom(listener, speaker, frequency, what, timeout) {
+  try { return await waitFor(() => hears(listener, frequency), what, timeout); }
+  catch (error) {
+    const look = async () => ({
+      sender: speaker.native ? null : await senderFlow(speaker.page),
+      ...await listener.native.request("voice_flow", {}),
+      rms: (await listener.native.request("snapshot", { frequency })).rms,
+    });
+    const report = await (async () => {
+      const first = await look();
+      await sleep(1_000);
+      const last = await look();
+      return { stopped: whereSoundStopped(first, last), first, last };
+    })().catch(String);
+    console.log(`voice path at failure: ${what}: ${JSON.stringify(report)}`);
+    throw error;
+  }
+}
+
 const hears = async (device, frequency) => device.native ? device.native.hears(frequency) : (await browserTone(device.page, frequency)) > 0.05;
 
 const voice = page => page.evaluate(async () => {
@@ -259,6 +319,98 @@ async function shareAndWatch(sharer, viewer) {
   return { ms: Date.now() - started, size: `${last.width}x${last.height}` };
 }
 
+/** Beside two voices its share of the energy is small, but without it the tone measures under 0.001. */
+const shareHeard = async viewer => (await viewer.native.request("snapshot", { frequency: 997 })).tone > 0.005;
+
+/** What the sound path was doing when a check gave up, end to end, over one more second. */
+async function soundAtFailure(sharer, viewer) {
+  const look = async () => ({ playout: await viewer.native.request("share_stats", {}), source: await sharer.native.request("share_capture_stats", {}), heard: await viewer.native.request("snapshot", { frequency: 997 }) });
+  const first = await look();
+  await sleep(1_000);
+  const last = await look();
+  return { first, last, reads: batchTiming(sharer.native.reads.slice(-200)), batches: batchTiming(viewer.native.batches.slice(-200)) };
+}
+
+/** Native sender to native viewer, through the UI: consent, playback, controls, withdrawal. */
+async function computerSound(sharer, viewer, browserViewer) {
+  try { return await computerSoundFlow(sharer, viewer, browserViewer); }
+  catch (error) {
+    console.log(`share sound at failure: ${JSON.stringify(await soundAtFailure(sharer, viewer).catch(reason => String(reason)))}`);
+    throw error;
+  }
+}
+
+async function computerSoundFlow(sharer, viewer, browserViewer) {
+  const started = Date.now();
+  const page = sharer.page;
+  await page.getByRole("button", { name: "Share screen", exact: true }).click();
+  const dialog = page.getByRole("dialog", { name: "Share your screen" });
+  await dialog.waitFor({ timeout: 20_000 });
+  const choice = dialog.getByRole("checkbox", { name: "Share computer sound" });
+  await waitFor(() => choice.isEnabled(), "the system answered whether it can share sound");
+  assert.equal(await choice.isChecked(), false, "computer sound stays off until the sharer asks");
+  await choice.check();
+  await dialog.getByRole("button", { name: "Share", exact: true }).click();
+  const bar = page.getByRole("status", { name: "You are sharing your screen" });
+  await bar.getByTestId("share-audio-status").getByText("Sharing with sound").waitFor({ timeout: 30_000 });
+  const before = await viewer.native.request("share_stats", {});
+  await viewer.page.getByRole("button", { name: `${sharer.name} is sharing their screen. Click to watch.` }).click();
+  await browserViewer.page.getByRole("button", { name: `${sharer.name} is sharing their screen. Click to watch.` }).click();
+  const watching = Date.now();
+  await viewer.page.locator("video[data-share]").waitFor({ timeout: 15_000 });
+  await viewer.page.getByTestId("share-audio-controls").waitFor({ timeout: 15_000 });
+  const controls = Date.now() - watching;
+  const firstFrame = await waitFor(async () => (await viewer.native.request("share_stats", {})).decoded > 0, "the viewer's mixer gets the first sound", 8_000);
+  const heard = await waitFor(() => shareHeard(viewer), "native viewer hears the sharer's computer sound", 30_000);
+  assert.equal(await viewer.page.locator("audio[data-share-audio]").count(), 0, "the desktop webview has no share player");
+  await browserViewer.page.locator("audio[data-share-audio]").waitFor({ state: "attached", timeout: 15_000 });
+  await waitFor(async () => (await hears(viewer, 770)) && (await hears(browserViewer, 770)), "voice beside share sound", 20_000);
+  await viewer.page.evaluate(() => { window.__batches.length = 0; });
+  viewer.native.batches.length = 0;
+  sharer.native.reads.length = 0;
+  const sourceBefore = await sharer.native.request("share_capture_stats", {});
+  await viewer.native.request("computer_log_start", {});
+  const nodeLoop = monitorEventLoopDelay({ resolution: 10 });
+  nodeLoop.enable();
+  const continuity = await shareContinuity(async () => ({ ...await viewer.native.request("share_stats", {}), heard: await shareHeard(viewer) }), 10_000);
+  nodeLoop.disable();
+  console.log(`share sound continuity: ${JSON.stringify(continuity)}`);
+  const speaker = toneCoverage(await viewer.native.request("computer_log_stop", {}));
+  console.log(`share sound at the speaker: ${JSON.stringify(speaker)}`);
+  // Each batch waits for the last one's answer: a slow bridge holds frames back, then lands them at once.
+  const source = await sharer.native.request("share_capture_stats", {});
+  console.log(`share sound bridge: ${JSON.stringify({
+    page: batchTiming(await viewer.page.evaluate(() => window.__batches)),
+    process: batchTiming(viewer.native.batches),
+    reads: batchTiming(sharer.native.reads),
+    node: { loopP50Ms: Math.round(nodeLoop.percentile(50) / 1e6), loopP99Ms: Math.round(nodeLoop.percentile(99) / 1e6), loopMaxMs: Math.round(nodeLoop.max / 1e6) },
+    source: { rate: Number(((source.writtenSeconds - sourceBefore.writtenSeconds) / (source.elapsedSeconds - sourceBefore.elapsedSeconds)).toFixed(3)), dropped: source.dropped - sourceBefore.dropped },
+  })}`);
+  const rate = continuity.frames / (continuity.ms / 1_000);
+  assert.ok(rate > 45 && rate < 55, `viewer takes one Opus frame per 20 ms, got ${rate}/s`);
+  const sourceLost = (source.dropped - sourceBefore.dropped) / (48_000 * (source.writtenSeconds - sourceBefore.writtenSeconds));
+  const report = { ...continuity, speaker: speaker.share, sourceLost: Number(sourceLost.toFixed(3)) };
+  assert.deepEqual(continuityProblems(report, continuityLimits(Boolean(process.env.CI))), [], `share sound kept playing: ${JSON.stringify(report)}`);
+  // Not one instant: on a slow runner the tone can miss the short window this looks at.
+  await waitFor(async () => (await shareHeard(viewer)) && (await hears(viewer, 770)), "ten seconds in, voice and share sound still play together", 10_000);
+  await viewer.page.getByTestId("share-audio-controls").getByRole("button", { name: "Mute share sound" }).click();
+  await waitFor(async () => !(await shareHeard(viewer)), "muting silences the share here", 5_000);
+  assert.ok(await hears(viewer, 770), "muting a share leaves voice alone");
+  await viewer.page.getByTestId("share-audio-controls").getByRole("button", { name: "Unmute share sound" }).click();
+  await waitFor(() => shareHeard(viewer), "unmuting brings the share back", 5_000);
+  await page.getByRole("status", { name: "You are sharing your screen" }).getByRole("button", { name: "Details", exact: true }).click();
+  const details = page.getByRole("dialog", { name: "You are sharing your screen" });
+  await details.getByRole("button", { name: "Stop sharing sound" }).click();
+  await details.getByText("Computer sound is off for this share.").waitFor({ timeout: 5_000 });
+  await page.keyboard.press("Escape");
+  await waitFor(async () => !(await shareHeard(viewer)), "stopping sound reaches the viewer", 10_000);
+  await viewer.page.getByTestId("share-audio-controls").waitFor({ state: "detached", timeout: 10_000 });
+  await viewer.page.locator("video[data-share]").waitFor({ timeout: 5_000 });
+  await page.getByRole("status", { name: "You are sharing your screen" }).getByRole("button", { name: "Stop sharing" }).click();
+  await viewer.page.locator("video[data-share]").waitFor({ state: "detached", timeout: 15_000 });
+  return { ms: Date.now() - started, controlsAfterMs: controls, firstSoundMs: firstFrame, heardMs: heard, framesBeforeWatching: before.frames, continuity, stats: await viewer.native.request("share_stats", {}), framesPerSecond: rate };
+}
+
 async function run(engine, web, server, token) {
   const type = engine === "webkit" ? webkit : chromium;
   const browser = await type.launch({ headless: true, args: engine === "chromium" ? ["--autoplay-policy=no-user-gesture-required"] : [] });
@@ -282,14 +434,14 @@ async function run(engine, web, server, token) {
     // Browser <-> native through the SFU, both directions SFrame.
     timings.danEnter = await join(dan, channel);
     timings.danActive = await active(dan, "native sending key active");
-    timings.danHearsAlice = await waitFor(() => hears(dan, 440), "native dan hears browser alice", 20_000);
+    timings.danHearsAlice = await hearsFrom(dan, alice, 440, "native dan hears browser alice", 20_000);
     timings.aliceHearsDan = await waitFor(() => hears(alice, 550), "browser alice hears native dan", 20_000);
 
     // Native <-> native, plus both natives with the browser.
     timings.erinEnter = await join(erin, channel);
     timings.erinActive = await active(erin, "native sending key active");
     timings.erinHears = await waitFor(async () => (await hears(erin, 440)) && (await hears(erin, 550)), "native erin hears alice and dan", 25_000);
-    timings.danHearsErin = await waitFor(() => hears(dan, 770), "native dan hears native erin", 25_000);
+    timings.danHearsErin = await hearsFrom(dan, erin, 770, "native dan hears native erin", 25_000);
     timings.aliceHearsErin = await waitFor(() => hears(alice, 770), "browser alice hears native erin", 25_000);
 
     // Real SFrame on every engine: both directions counted, nothing failed.
@@ -326,6 +478,10 @@ async function run(engine, web, server, token) {
     await erin.page.getByRole("status", { name: "You are sharing your screen" }).getByRole("button", { name: "Stop sharing" }).click();
     await alice.page.locator("video[data-share]").waitFor({ state: "detached", timeout: 15_000 });
     await waitFor(() => hears(alice, 770), "browser alice hears native erin after the share", 20_000);
+
+    await join(dan, plain);
+    await waitFor(() => hears(dan, 770), "native dan hears native erin in the open channel", 20_000);
+    timings.computerSound = await computerSound(erin, dan, alice);
 
     const errors = opened.flatMap(d => d.page.errors.filter(e => !/Conversation synchronization|favicon|Failed to load resource/.test(e)).map(e => `${d.name}: ${e}`));
     results.push({ engine, status: "pass", timings, errors });

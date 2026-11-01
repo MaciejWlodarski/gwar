@@ -94,7 +94,7 @@ impl Drop for Guard {
 impl AudioIo for MarkerIo {
     fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
         let (mut mic_tx, mic) = RingBuffer::new(RATE);
-        let (speaker, mut speaker_rx) = RingBuffer::new(RATE / 2);
+        let (speaker, mut speaker_rx) = RingBuffer::<[f32; 2]>::new(RATE / 2);
         let output = Arc::new(OutputTiming::default());
         let timing = output.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -133,10 +133,13 @@ impl AudioIo for MarkerIo {
                     if mic_tx.push(CaptureSample { captured_at: Instant::now(), position: at as u64, value }).is_err() {
                         return;
                     }
-                    let played = speaker_rx.pop().unwrap_or_else(|_| {
-                        missing += 1;
-                        0.0
-                    });
+                    let played = speaker_rx.pop().map_or_else(
+                        |_| {
+                            missing += 1;
+                            0.0
+                        },
+                        |[left, _]| left,
+                    );
                     if !self.sender && armed.is_some() {
                         data.playout.push(played);
                     }

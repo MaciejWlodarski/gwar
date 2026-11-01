@@ -65,7 +65,7 @@ impl Drop for Guard {
 impl AudioIo for ToneIo {
     fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
         let (mut mic_tx, mic) = RingBuffer::new(RATE);
-        let (speaker, mut speaker_rx) = RingBuffer::new(RATE / 2);
+        let (speaker, mut speaker_rx) = RingBuffer::<[f32; 2]>::new(RATE / 2);
         let output = Arc::new(OutputTiming::default());
         let timing = output.clone();
         let stop = Arc::new(AtomicBool::new(false));
@@ -87,10 +87,13 @@ impl AudioIo for ToneIo {
                         position: position + i as u64,
                         value,
                     });
-                    let played = f64::from(speaker_rx.pop().unwrap_or_else(|_| {
-                        missing += 1;
-                        0.0
-                    }));
+                    let played = f64::from(speaker_rx.pop().map_or_else(
+                        |_| {
+                            missing += 1;
+                            0.0
+                        },
+                        |[left, _]| left,
+                    ));
                     energy += played * played;
                     let phase = i as f64 * BROWSER_TONE * std::f64::consts::TAU / RATE as f64;
                     sine += played * phase.sin();

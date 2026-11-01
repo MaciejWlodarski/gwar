@@ -987,7 +987,7 @@ try {
   const binary = process.env.GWAR_SERVER_BIN ?? path.join(repoRoot, "target/debug/gwar-server");
   const serverPort = await port();
   const ws = `ws://127.0.0.1:${serverPort}/ws`;
-  const server = start("gwar-server", binary, ["--data-dir", path.join(dataDir, "server"), "--http", `127.0.0.1:${serverPort}`, "--media", `127.0.0.1:${serverPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", ws, "--web-origin", web, "--no-connect"]);
+  const server = start("gwar-server", binary, ["--data-dir", path.join(dataDir, "server"), "--http", `127.0.0.1:${serverPort}`, "--media", `127.0.0.1:${serverPort}`, "--public-ip", "127.0.0.1", "--public-endpoint", ws, "--web-origin", web, "--no-connect"], { env: { ...process.env, RUST_LOG: process.env.RUST_LOG ?? "info,gwar_server::media::screen=debug" } });
   await waitFor(() => /redeem this one-time admin token in your client: (\S+)/.test(server.output), "server admin token", 60_000);
   const token = /redeem this one-time admin token in your client: (\S+)/.exec(server.output)[1];
   if (engines.includes("chromium")) {

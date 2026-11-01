@@ -18,8 +18,8 @@ import type { ScreenShare } from "../proto/ScreenShare";
 import { controller } from "../state/controller";
 import { guestLinkPossible, useCanWatch, useScreenSupport } from "../state/screen-controller";
 import { myChannelId, shareOf } from "../state/reducer";
-import { slotOf, useScreen } from "../state/screen";
-import { useSession, useUi } from "../state/stores";
+import { slotOf, useScreen, type OwnShare } from "../state/screen";
+import { useSession, useUi, useVoice } from "../state/stores";
 import { type PublishStats } from "../voice/screen";
 import { HEIGHTS, FRAME_RATES, type ScreenSpec } from "../voice/screen-quality";
 import { useChannelPermission, useConnectionQuality, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
@@ -146,6 +146,50 @@ function QualityControls({ spec, bar = false }: { spec: ScreenSpec; bar?: boolea
   </div>;
 }
 
+/** The sentence that says what happens to sound, for the sharer's quality menu and details. */
+function soundStatus(own: OwnShare): Key {
+  if (own.computerSound === "resuming") return "screen.computerSoundResuming";
+  const computer = isDesktop() || own.computerSound !== undefined;
+  if (own.audio) {
+    if (own.phase === "live") return computer ? "screen.computerSoundSharing" : "screen.audioSharing";
+    return computer ? "screen.computerSoundReady" : "screen.audioReady";
+  }
+  if (own.audioServer === false) return "screen.audioServer";
+  if (!computer) return "screen.audioUnavailable";
+  switch (own.computerSound) {
+    case "permission": return "screen.computerSoundPermission";
+    case "unsupported": return "screen.computerSoundUnsupported";
+    case "failed": return "screen.computerSoundFailed";
+    case "stopped": return "screen.computerSoundStopped";
+    default: return "screen.computerSoundOff";
+  }
+}
+
+function ComputerSoundPermission() {
+  const t = useT();
+  if (!canOpenScreenRecordingSettings()) return null;
+  return <Button size="sm" className="mt-1.5" onClick={() => void controller.screen.allowComputerSound().catch((e: unknown) => console.warn("[screen] privacy settings:", e))}>{t("screen.openSettings")}</Button>;
+}
+
+/** Desktop only, and only asked here: computer sound starts from this answer and Start. */
+function ComputerSoundChoice({ state }: { state: OwnShare["computerSound"] }) {
+  const t = useT();
+  const on = useSettings(s => s.shareComputerSound);
+  if (state === "permission" || state === "unsupported") {
+    return <div className="mt-3 text-sm text-muted" data-testid="computer-sound-choice">
+      <p>{t(state === "permission" ? "screen.computerSoundPermission" : "screen.computerSoundUnsupported")}</p>
+      {state === "permission" && <ComputerSoundPermission />}
+    </div>;
+  }
+  return <div className="mt-3" data-testid="computer-sound-choice">
+    <label className="flex cursor-pointer items-center gap-2 text-sm text-fg">
+      <input type="checkbox" className="size-4 accent-[var(--accent)]" disabled={state === undefined} checked={on} onChange={e => useSettings.getState().setShareComputerSound(e.target.checked)} />
+      {t("screen.computerSound")}
+    </label>
+    <p className="mt-1 ml-6 text-xs text-subtle">{t("screen.computerSoundHint")}</p>
+  </div>;
+}
+
 /** The quality menu, after the browser's picker and before anything is published. */
 export function SharePresetDialog() {
   const t = useT();
@@ -171,7 +215,7 @@ export function SharePresetDialog() {
     >
       <OwnPreview stream={own.stream} className="mb-3 aspect-video w-full rounded-md bg-black" />
       <QualityControls spec={own.spec} />
-      <p className="mt-3 text-sm text-muted" data-testid="share-audio-status">{t(own.audio ? "screen.audioReady" : isDesktop() ? "screen.audioDesktop" : own.audioServer === false ? "screen.audioServer" : "screen.audioUnavailable")}</p>
+      {controller.screen.usesNativeSound() ? <ComputerSoundChoice state={own.computerSound} /> : <p className="mt-3 text-sm text-muted" data-testid="share-audio-status">{t(soundStatus(own))}</p>}
       <p className="mt-3 text-xs text-subtle">{t("screen.presetHint")}</p>
       {linkable && (
         // Shown before anything is published: no link exists until the share starts with it.
@@ -209,6 +253,8 @@ export function SharingBar() {
   const links = useScreen(s => s.links);
   if (!own || (own.phase !== "starting" && own.phase !== "live" && own.phase !== "reconnecting")) return null;
   const viewers = own.viewers + own.guests;
+  const resuming = own.computerSound === "resuming";
+  const audioLabel = resuming ? "screen.audioResuming" : own.audio ? viewers === 0 ? "screen.sharingAudio" : "screen.audioOn" : "screen.audioOff";
   const watching = own.phase === "live" ? t(countKey(lang, "screen.watching", viewers), { count: viewers }) : t(own.phase === "reconnecting" ? "screen.reconnecting" : "screen.starting");
   const linked = !!own.share && !!links[own.share];
   const linkStatus = `${t("screen.tsLinkOn")} · ${t(countKey(lang, "screen.guests", own.guests), { count: own.guests })}`;
@@ -221,15 +267,19 @@ export function SharingBar() {
         <span className="hidden lg:inline">{linkStatus}</span>
         <span className="hidden lg:inline-flex"><Button size="sm" variant="secondary" className="border-white/40 px-2 text-white hover:bg-white/15" onClick={() => void controller.screen.turnOffLink(own.share!)}>{t("screen.tsTurnOff")}</Button></span>
       </span>}
-      {own.phase === "live" && <span data-testid="share-audio-status" className="flex shrink-0 items-center gap-1 text-xs" aria-label={t(own.audio ? viewers === 0 ? "screen.sharingAudio" : "screen.audioOn" : "screen.audioOff")}>
-        {own.audio ? <Volume2 aria-hidden className="size-3.5" /> : <VolumeX aria-hidden className="size-3.5" />}<span className="hidden sm:inline">{t(own.audio ? viewers === 0 ? "screen.sharingAudio" : "screen.audioOn" : "screen.audioOff")}</span>
+      {own.phase === "live" && <span data-testid="share-audio-status" className="flex shrink-0 items-center gap-1 text-xs" aria-label={t(audioLabel)}>
+        {resuming ? <RotateCw aria-hidden className="size-3.5 motion-safe:animate-spin" /> : own.audio ? <Volume2 aria-hidden className="size-3.5" /> : <VolumeX aria-hidden className="size-3.5" />}<span className="hidden sm:inline">{t(audioLabel)}</span>
       </span>}
       <ConnectionIndicator variant="bar" compact />
       <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 sm:px-2" onClick={() => setDetails(true)}>{t("common.details")}</Button>
       <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 sm:px-2" aria-label={t("screen.stop")} onClick={() => void controller.screen.stopShare()}>{t("screen.stopShort")}</Button>
       <Dialog open={details} onOpenChange={setDetails} title={t("screen.sharingBar")}>
         <p className="mb-3 text-sm text-muted">{watching}</p>
-        <p className="mb-3 text-sm">{t(own.audio ? own.phase === "live" ? "screen.audioSharing" : "screen.audioReady" : isDesktop() ? "screen.audioDesktop" : own.audioServer === false ? "screen.audioServer" : "screen.audioUnavailable")}</p>
+        <div className="mb-3 text-sm">
+          <p>{t(soundStatus(own))}</p>
+          {own.computerSound === "permission" && <ComputerSoundPermission />}
+          {own.audio && (own.computerSound === "ok" || resuming) && <Button size="sm" className="mt-1.5" onClick={() => controller.screen.stopComputerSound()}>{t("screen.stopComputerSound")}</Button>}
+        </div>
         <QualityControls spec={own.spec} />
         {own.phase === "live" && <SenderStats />}
         {linked && own.share && <div className="mt-3 text-sm">
@@ -564,8 +614,23 @@ export function ShareAudioPlayback() {
   const watches = useScreen(s => s.watches);
   const shares = useSession(s => s.shares);
   const me = useSession(s => s.me?.session);
-  if (isDesktop()) return null;
-  return <>{watches.filter(w => w.status === "watching" && w.audio === true && shares[w.share]?.client !== me).map(w => <ShareAudioPlayer key={w.id} share={w.share} slot={w.slot!} paused={w.paused === "budget"} />)}</>;
+  const heard = watches.filter(w => w.status === "watching" && w.audio === true && shares[w.share]?.client !== me);
+  if (controller.screen.usesNativeSound()) return <>{heard.map(w => <NativeShareSound key={w.id} id={w.id} share={w.share} slot={w.slot!} />)}</>;
+  return <>{heard.map(w => <ShareAudioPlayer key={w.id} share={w.share} slot={w.slot!} paused={w.paused === "budget"} />)}</>;
+}
+
+/** Desktop app: plays in the native mixer, so there is no element and nothing to unblock. */
+function NativeShareSound({ id, share, slot }: { id: number; share: string; slot: number }) {
+  const run = useScreen(s => s.transport.run);
+  const voice = useVoice(s => s.state);
+  const { volume, muted } = useSettings(s => s.shareAudio[share] ?? defaultShareAudio);
+  useEffect(() => {
+    void controller.screen.openSound(id, share, slot);
+    return () => controller.screen.closeSound(id, slot);
+    // The mixer takes sound only with voice running: it is asked again when that changes.
+  }, [id, share, slot, run, voice]);
+  useEffect(() => controller.screen.setSoundGain(share, slot), [share, slot, volume, muted]);
+  return null;
 }
 
 function ShareAudioPlayer({ share, slot, paused }: { share: string; slot: number; paused: boolean }) {
@@ -601,9 +666,10 @@ export function ShareAudioControls({ share }: { share: string }) {
   const t = useT();
   const client = useSession(s => { const id = s.shares[share]?.client; return id === undefined ? undefined : s.clients[id]; });
   const prefs = useSettings(s => s.shareAudio[share] ?? defaultShareAudio);
-  const available = useScreen(s => s.watches.some(w => w.share === share && w.status === "watching" && w.audio === true));
+  const native = controller.screen.usesNativeSound();
+  const available = useScreen(s => s.watches.some(w => w.share === share && w.status === "watching" && w.audio === true && (!native || w.soundReady === true)));
   const stream = useScreen(s => { const slot = slotOf(s, share); return slot === null ? null : s.streams[slot]; });
-  if (isDesktop() || !available || !client || !stream?.getAudioTracks().length) return null;
+  if (!available || !client || (!native && !stream?.getAudioTracks().length)) return null;
   return <div className="flex w-full max-w-[344px] shrink-0 items-center gap-3 px-3 py-2 text-sm" data-testid="share-audio-controls">
     <IconButton label={t(prefs.muted ? "screen.unmuteAudio" : "screen.muteAudio")} aria-pressed={prefs.muted} onClick={() => useSettings.getState().setShareAudio(share, { muted: !prefs.muted })}>
       {prefs.muted ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}

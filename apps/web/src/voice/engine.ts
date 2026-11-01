@@ -95,6 +95,8 @@ export interface VoiceEngine {
   playSound?(cue: import("../sound/catalog").SoundCue, volume: number): void;
   /** Unlock browser autoplay from a gesture without opening the microphone. */
   unlockSounds?(): void;
+  /** Only an engine with a native mixer has it: share sound never plays in its webview. */
+  shareSound?(): Promise<import("./share-sound").ShareSoundLink>;
   readonly capabilities: {
     /** Output device can be chosen (not just the system default). */
     outputDeviceSelection: boolean;

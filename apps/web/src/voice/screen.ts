@@ -480,7 +480,13 @@ function declareSectionAv1Level(lines: string[], level: number): string[] {
   return out;
 }
 
-/** Each returned tuple has passed a real WebRTC decoder probe; unavailable/timeout means SDP only. */
+const H264_PROBE_MS = 10_000;
+
+/**
+ * Each returned tuple has passed a real WebRTC decoder probe; unavailable/timeout means SDP only.
+ * That is level 3.1, so a viewer who ran out of time is refused any 1080p share for the whole
+ * transport: the deadline is for a probe that hangs, not for a busy machine.
+ */
 export async function probeH264(): Promise<H264Capability[]> {
   const media = navigator.mediaCapabilities;
   if (typeof media?.decodingInfo !== "function") return [];
@@ -505,7 +511,7 @@ export async function probeH264(): Promise<H264Capability[]> {
     const highest = supported.findLast(c => c !== null);
     if (highest) result.push(highest);
   }));
-  await Promise.race([probes, new Promise<void>(resolve => { timer = setTimeout(resolve, 1500); })]);
+  await Promise.race([probes, new Promise<void>(resolve => { timer = setTimeout(() => { console.warn("[screen] H.264 decode probe timed out"); resolve(); }, H264_PROBE_MS); })]);
   clearTimeout(timer);
   // Late probe completions cannot mutate the capability message after the timeout.
   return [...result].sort((a, b) => a.profile_level_id - b.profile_level_id);
@@ -631,6 +637,8 @@ export interface PublishParams {
   fallbacks?: EncoderFallbacks;
   track: MediaStreamTrack;
   audio?: MediaStreamTrack;
+  /** Computer sound from the desktop app: it follows no captured surface. */
+  nativeAudio?: boolean;
   audioState?(sharing: boolean): void;
   quality: ScreenSpec;
   /** The server rejected spec negotiation: retain the legacy encoder ceilings. */
@@ -1150,7 +1158,7 @@ export class ScreenPublisher {
    */
   private refreshSurface(): MediaTrackSettings | undefined {
     const settings = this.params.track.getSettings?.();
-    if (settings?.displaySurface && settings.displaySurface !== "browser" && this.params.audio?.readyState === "live") {
+    if (!this.params.nativeAudio && settings?.displaySurface && settings.displaySurface !== "browser" && this.params.audio?.readyState === "live") {
       this.params.audio.stop();
       this.params.audioState?.(false);
     }
@@ -1422,6 +1430,8 @@ export interface WatchParams {
   /** Receive slots: `SCREEN_SLOTS` for members, 1 for a TeamSpeak guest's watch page. */
   slots?: number;
   audio?(): Promise<boolean>;
+  /** For the desktop app: taken as each audio receiver is made, so nothing here ever decodes it. */
+  soundTransform?(slot: number): RTCRtpScriptTransform | undefined;
   iceServers: IceServer[];
   /** Probe and offer AV1 decode (members of an AV1-capable server; never TeamSpeak guests). */
   av1?: boolean;
@@ -1473,7 +1483,12 @@ export class ScreenWatchTransport {
       if ("jitterBufferTarget" in receiver) { try { receiver.jitterBufferTarget = 0; } catch { /* out of range on some engines */ } }
       this.transceivers.push(transceiver);
       this.streams.push(new MediaStream());
-      if (audio) this.audioTransceivers.push(pc.addTransceiver("audio", { direction: "recvonly" }));
+      if (audio) {
+        const sound = pc.addTransceiver("audio", { direction: "recvonly" });
+        const transform = this.params.soundTransform?.(i);
+        if (transform) sound.receiver.transform = transform;
+        this.audioTransceivers.push(sound);
+      }
     }
     pc.ontrack = ev => {
       const slot = ev.track.kind === "audio" ? this.audioTransceivers.indexOf(ev.transceiver) : this.transceivers.indexOf(ev.transceiver);

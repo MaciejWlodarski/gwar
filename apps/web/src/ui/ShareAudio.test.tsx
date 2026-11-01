@@ -6,7 +6,8 @@ import { initialState } from "../state/reducer";
 import { initialScreen, useScreen } from "../state/screen";
 import { useSession } from "../state/stores";
 import { useSettings } from "../state/settings";
-import { ShareAudioPlayback, ShareAudioControls, SharingBar } from "./Screen";
+import { controller } from "../state/controller";
+import { ShareAudioPlayback, ShareAudioControls, SharePresetDialog, SharingBar } from "./Screen";
 import { TooltipProvider } from "./kit";
 
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); });
@@ -66,6 +67,105 @@ it.each(["desktop", "video-only"])("never plays or offers sound for a %s viewer"
   } finally { await act(async () => root.unmount()); host.remove(); delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__; }
 });
 
+function desktop(): () => void {
+  Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {}, configurable: true });
+  return () => { delete (window as unknown as Record<string, unknown>).__TAURI_INTERNALS__; };
+}
+
+it("plays through the native mixer on the desktop app, offering controls only once it really can", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const undo = desktop();
+  const play = vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue();
+  const open = vi.spyOn(controller.screen, "openSound").mockResolvedValue();
+  const close = vi.spyOn(controller.screen, "closeSound").mockImplementation(() => {});
+  const gain = vi.spyOn(controller.screen, "setSoundGain").mockImplementation(() => {});
+  useSettings.setState({ language: "en", shareAudio: { A: { volume: 0.5, muted: false } } });
+  useSession.setState({ ...initialState, me: { session: 1, uid: "me" }, clients: { 1: { uid: "me" }, 2: { uid: "friend" } } as never, shares: { A: { share: "A", client: 2 }, SELF: { share: "SELF", client: 1 } } as never });
+  useScreen.setState({ ...initialScreen, transport: { phase: "connected", run: 4 }, slots: ["A", "SELF", null, null], streams: [new MediaStream(), new MediaStream(), null, null], watches: [{ share: "A", id: 1, slot: 0, status: "watching", audio: true }, { share: "SELF", id: 2, slot: 1, status: "watching", audio: true }] });
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  try {
+    await act(async () => root.render(<TooltipProvider><ShareAudioPlayback /><ShareAudioControls share="A" /></TooltipProvider>));
+    expect(open.mock.calls).toEqual([[1, "A", 0]]);
+    expect(host.querySelector("audio")).toBeNull();
+    expect(play).not.toHaveBeenCalled();
+    expect(host.querySelector('[data-testid="share-audio-controls"]')).toBeNull();
+    await act(async () => useScreen.getState().dispatch({ type: "watchSound", id: 1, ready: true }));
+    expect(host.querySelector('[data-testid="share-audio-controls"]')).not.toBeNull();
+    gain.mockClear();
+    await act(async () => useSettings.getState().setShareAudio("A", { muted: true }));
+    expect(gain).toHaveBeenCalledWith("A", 0);
+    await act(async () => useScreen.setState({ watches: [] }));
+    expect(close).toHaveBeenCalledWith(1, 0);
+  } finally { await act(async () => root.unmount()); host.remove(); undo(); }
+});
+
+const ownShare = (extra: object) => ({ phase: "choosing" as const, attempt: 1, share: null, stream: null, surface: "screen" as const, spec: { mode: "smooth" as const, height: 720 as const, fps: 30 as const }, viewers: 0, guests: 0, guestLink: false, preview: false, ...extra });
+
+it.each([
+  ["ok", "Share computer sound"],
+  ["permission", "Screen & System Audio Recording"],
+  ["unsupported", "needs macOS 14"],
+] as const)("asks about computer sound honestly on the desktop app: %s", async (computerSound, text) => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const undo = desktop();
+  useSettings.setState({ language: "en", shareComputerSound: false });
+  useSession.setState({ ...initialState });
+  useScreen.setState({ ...initialScreen, own: ownShare({ computerSound }) });
+  const root = createRoot(document.createElement("div"));
+  try {
+    await act(async () => root.render(<TooltipProvider><SharePresetDialog /></TooltipProvider>));
+    const choice = document.querySelector('[data-testid="computer-sound-choice"]')!;
+    expect(choice.textContent).toContain(text);
+    const box = choice.querySelector<HTMLInputElement>("input[type=checkbox]");
+    if (computerSound !== "ok") { expect(box).toBeNull(); return; }
+    expect(box!.checked).toBe(false);
+    await act(async () => box!.click());
+    expect(useSettings.getState().shareComputerSound).toBe(true);
+  } finally { await act(async () => root.unmount()); undo(); }
+});
+
+it("says why there is no computer sound in Details, and can take sharing back", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const undo = desktop();
+  const stop = vi.spyOn(controller.screen, "stopComputerSound").mockImplementation(() => {});
+  useSettings.setState({ language: "en" });
+  useScreen.setState({ ...initialScreen, own: ownShare({ phase: "live", share: "M", audio: true, computerSound: "ok", viewers: 1 }) });
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  const details = () => [...host.querySelectorAll("button")].find(b => b.textContent === "Details")!;
+  try {
+    await act(async () => root.render(<TooltipProvider><SharingBar /></TooltipProvider>));
+    await act(async () => details().click());
+    expect(document.body.textContent).toContain("Computer sound is shared, except sounds from Gwar.");
+    await act(async () => [...document.querySelectorAll("button")].find(b => b.textContent === "Stop sharing sound")!.click());
+    expect(stop).toHaveBeenCalled();
+    await act(async () => useScreen.setState({ own: ownShare({ phase: "live", share: "M", audio: false, computerSound: "stopped", viewers: 1 }) }));
+    expect(document.body.textContent).toContain("Computer sound is off for this share.");
+    expect([...document.querySelectorAll("button")].some(b => b.textContent === "Stop sharing sound")).toBe(false);
+  } finally { await act(async () => root.unmount()); host.remove(); undo(); }
+});
+
+it("says sound is coming back, and keeps the way out, while a paused capture returns", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const undo = desktop();
+  useSettings.setState({ language: "en" });
+  useScreen.setState({ ...initialScreen, own: ownShare({ phase: "live", share: "M", audio: true, computerSound: "resuming", viewers: 1 }) });
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  try {
+    await act(async () => root.render(<TooltipProvider><SharingBar /></TooltipProvider>));
+    expect(host.querySelector('[data-testid="share-audio-status"]')?.getAttribute("aria-label")).toBe("Restoring sound");
+    // On a phone the icon is all there is: it must not read as "no sound".
+    const icon = host.querySelector('[data-testid="share-audio-status"] svg')?.getAttribute("class") ?? "";
+    expect(icon).toContain("lucide-rotate-cw");
+    expect(icon).not.toContain("lucide-volume-x");
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+    await act(async () => [...host.querySelectorAll("button")].find(b => b.textContent === "Details")!.click());
+    expect(document.body.textContent).toContain("Bringing computer sound back. The picture is still shared.");
+    expect([...document.querySelectorAll("button")].some(b => b.textContent === "Stop sharing sound")).toBe(true);
+    await act(async () => useScreen.setState({ own: ownShare({ phase: "live", share: "M", audio: true, computerSound: "ok", viewers: 1 }) }));
+    expect(host.querySelector('[data-testid="share-audio-status"]')?.getAttribute("aria-label")).toBe("Sound on");
+  } finally { await act(async () => root.unmount()); host.remove(); undo(); }
+});
+
 it.each([[0, false], [0, true], [2, true]] as const)("keeps %s watchers in the sharing status beside audio=%s", async (viewers, audio) => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   useSettings.setState({ language: "en" });
@@ -92,4 +192,15 @@ it("shows the live guest link count and turn-off action without opening details"
     expect(host.querySelector('[data-testid="screen-viewers"]')?.textContent).toBe("2 watching");
     expect(host.querySelector('[data-testid="share-audio-status"]')?.getAttribute("aria-label")).toBe("Sound on");
   } finally { await act(async () => root.unmount()); host.remove(); }
+});
+
+it("names the macOS pane as System Settings does, and speaks of sound alike in both languages", async () => {
+  const [{ en }, { pl }] = await Promise.all([import("../i18n/en"), import("../i18n/pl")]);
+  for (const key of ["screen.permissionPlace.macos", "screen.computerSoundPermission"] as const) {
+    expect(en[key]).toContain("Privacy & Security → Screen & System Audio Recording");
+    expect(pl[key]).toContain("Prywatność i ochrona → Nagrywanie ekranu i dźwięku systemowego");
+  }
+  for (const words of [en, pl].flatMap(lang => [lang["screen.audioOn"], lang["screen.audioOff"], lang["screen.sharingAudio"]])) {
+    expect(words[0]).toBe(words[0]!.toUpperCase());
+  }
 });

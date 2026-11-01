@@ -702,8 +702,10 @@ at 720p30, 1080p60 and 1440p60. Each probe includes the profile-level-id,
 width, height, frame rate and bitrate. The highest successful tuple per
 profile is sent as `h264` on `screen.watch.offer` and `guest.offer`:
 `{profile_level_id, max_fs, max_mbps}`. At most three unique profiles and
-only those target tuples are accepted. Probing has a 1.5 s deadline;
-unavailable, rejected or timed-out probes grant no promotion. The `browser` marker opts into verified capabilities; the flag alone grants
+only those target tuples are accepted. Probing has a 10 s deadline, for a
+probe that hangs rather than a busy machine: without a promotion the viewer
+stays at level 3.1 and is refused a 1080p share for the whole transport.
+Unavailable, rejected or timed-out probes grant no promotion. The `browser` marker opts into verified capabilities; the flag alone grants
 nothing, and native offers retain their SDP limits. Old clients and native viewers retain
 their SDP-negotiated level, including explicit low levels without asymmetry.
 A verified matching profile can raise that level only to the probed target;
@@ -1768,6 +1770,11 @@ target; their larger keyframes only affect joins and recoveries.
   default.
 
 ## 7. Shared audio
+
+The desktop app shipped a smaller route first: the webview remains the transport and
+native code does capture, decoding and mixing, without B8's native publish endpoint.
+See [share-audio.md](share-audio.md#desktop-app-computer-sound-and-native-playback).
+The sharer's echo canceller below is not done yet.
 
 On the wire, native shared audio is exactly
 [Shared audio (phase 2)](screen-share.md#shared-audio-phase-2): codec,

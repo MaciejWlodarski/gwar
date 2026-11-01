@@ -331,6 +331,9 @@ export interface SettingsState extends QualitySettings {
   /** Per-share screen sound. Reconnect copies it to the confirmed replacement. */
   shareAudio: Record<string, ShareAudioSettings>;
   setShareAudio(share: string, patch: Partial<ShareAudioSettings>): void;
+  /** Desktop app: the sharer's last answer to "Share computer sound". Off until they say so. */
+  shareComputerSound: boolean;
+  setShareComputerSound(on: boolean): void;
   /** Per-user playback volume 0..2 keyed by uid. */
   userVolumes: Record<string, number>;
   /** Local mute by stable uid; the separate volume survives muting. */
@@ -440,6 +443,8 @@ export const useSettings = create<SettingsState>()(
       ...defaultQuality,
       shareAudio: {},
       setShareAudio: (share, patch) => set(s => ({ shareAudio: { ...s.shareAudio, ...readShareAudio({ [share]: { ...(s.shareAudio[share] ?? defaultShareAudio), ...patch } }) } })),
+      shareComputerSound: false,
+      setShareComputerSound: (shareComputerSound) => set({ shareComputerSound }),
       setScreenQuality: (patch) => set(patch),
       onboarding: null,
       setOnboarding: (patch) => set((s) => ({ onboarding: { completed: false, firstUsedAt: Date.now(), nudgeDismissed: false, roleReceived: false, ...s.onboarding, ...patch } })),
@@ -619,7 +624,9 @@ export const useSettings = create<SettingsState>()(
         // v9 adds local mute without changing retained person volumes or other preferences.
         if (version < 9) p = { userMuted: {}, ...p };
         // v10 follows desktop v7, PTT v8 and local person mute v9.
-        return version < 10 ? { ...p, shareAudio: readShareAudio(p.shareAudio) } : p;
+        if (version < 10) p = { ...p, shareAudio: readShareAudio(p.shareAudio) };
+        // v11 asks before computer sound is ever shared: nobody has answered yet.
+        return version < 11 ? { ...p, shareComputerSound: false } : p;
       },
       merge: (persisted, current) => {
         const p = migrateQuality((persisted ?? {}) as Record<string, unknown>) as Partial<SettingsState>;
@@ -628,6 +635,7 @@ export const useSettings = create<SettingsState>()(
           notificationOverrides: readNotificationOverrides(p.notificationOverrides),
           sounds: readSounds(p.sounds),
           shareAudio: readShareAudio(p.shareAudio),
+          shareComputerSound: p.shareComputerSound === true,
           userMuted: p.userMuted && typeof p.userMuted === "object" && !Array.isArray(p.userMuted) ? Object.fromEntries(Object.entries(p.userMuted).filter(([, v]) => v === true)) : {},
           channelEncryption: typeof p.channelEncryption === "object" && p.channelEncryption !== null ? p.channelEncryption : {},
           archiveUploads: typeof p.archiveUploads === "boolean" ? p.archiveUploads : current.archiveUploads,

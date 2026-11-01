@@ -52,14 +52,14 @@ const cl = (id: number, channel: number | null, extra: Partial<Client> = {}): Cl
 });
 const share = (id: string, client: number, channel: number) => ({ share: id, client, channel, preset: "text" as const, surface: "tab" as const });
 
-type Handler = (d: Record<string, unknown>) => unknown;
+type Handler = (d: Record<string, unknown>, opts?: { timeoutMs?: number }) => unknown;
 function fakeLink(handlers: Record<string, Handler>) {
   const calls: Array<[string, Record<string, unknown>]> = [];
   const link = {
-    request: vi.fn(async (op: string, d: Record<string, unknown>) => {
-      if (op === "screen.audio.capabilities") return handlers[op]?.(d) ?? { screen_audio: false };
+    request: vi.fn(async (op: string, d: Record<string, unknown>, opts?: { timeoutMs?: number }) => {
+      if (op === "screen.audio.capabilities") return handlers[op]?.(d, opts) ?? { screen_audio: false };
       if (op === "screen.spec.capabilities") return handlers[op]?.(d) ?? { screen_spec: false };
-      if (op === "screen.capabilities") return handlers[op]?.(d) ?? { screen_h264: false };
+      if (op === "screen.capabilities") return handlers[op]?.(d, opts) ?? { screen_h264: false };
       calls.push([op, d]);
       const handler = handlers[op];
       if (!handler) return {};
@@ -733,6 +733,26 @@ describe("watch requests across a reset (review round 2)", () => {
     const pending = screen.watch("A");
     await flush();
     expect(calls).toHaveLength(1);
+    screen.reset();
+    await pending;
+  });
+  it("a busy machine's late feature answers still decide the watch transport", async () => {
+    // A timed-out answer reads as an old server, and an unverified viewer is refused 1080p H.264.
+    const late = (answer: unknown) => async (_: unknown, opts?: { timeoutMs?: number }) => {
+      await new Promise(resolve => setTimeout(resolve, 2_000));
+      if ((opts?.timeoutMs ?? Infinity) < 2_000) throw new Error("timed out");
+      return answer;
+    };
+    const { link, calls } = fakeLink({
+      "screen.audio.capabilities": late({ screen_audio: true }), "screen.capabilities": late({ screen_h264: true }),
+      "screen.watch.offer": () => ({ sdp: "answer" }),
+    });
+    const screen = new ScreenController(() => link, String);
+    const pending = screen.watch("A");
+    await vi.advanceTimersByTimeAsync(4_100);
+    expect(calls[0]?.[0]).toBe("screen.watch.offer");
+    expect(Object.keys(calls[0]![1]).sort()).toEqual(["browser", "h264", "run", "sdp"]);
+    expect((screen as unknown as { watchAudio: boolean }).watchAudio).toBe(true);
     screen.reset();
     await pending;
   });

@@ -26,7 +26,7 @@ struct FakeIo {
 impl AudioIo for FakeIo {
     fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
         let (mut mic_tx, mic) = RingBuffer::new(48_000);
-        let (speaker, mut speaker_rx) = RingBuffer::new(24_000);
+        let (speaker, mut speaker_rx) = RingBuffer::<[f32; 2]>::new(24_000);
         let heard = self.heard.clone();
         let tone = self.tone;
         // Real-time pacing: 10 ms of samples in, 10 ms out, like a device.
@@ -48,7 +48,7 @@ impl AudioIo for FakeIo {
                 let mut out = heard.lock().unwrap();
                 let missing = 480usize.saturating_sub(speaker_rx.slots());
                 for _ in 0..480 {
-                    out.push(speaker_rx.pop().unwrap_or(0.0));
+                    out.push(speaker_rx.pop().map_or(0.0, |[left, _]| left));
                 }
                 timing.report(480, missing);
                 drop(out);

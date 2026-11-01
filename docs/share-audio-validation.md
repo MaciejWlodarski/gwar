@@ -1,4 +1,6 @@
-# P1-6 browser share audio validation
+# P1-6 share audio validation
+
+PR 2, the desktop app, is at the [end](#pr-2-desktop-app). The sections before it are PR 1.
 
 Original base: `origin/main` at `1a54b517`; round 3 merges `1e0e6d60` (#206,
 #208 and #207) and follows their v7/v8/v9 migrations with share-audio v10.
@@ -529,3 +531,235 @@ The initial default-worker web run timed out in unrelated storage/archive tests
 while cold Rust dependencies compiled; the two-worker full rerun passed. Logs
 are retained in `/tmp/gwar-share-audio-*`; initial test/compile failures are kept
 separately from final runs.
+
+## PR 2: desktop app
+
+Base `origin/main` at `fb32779b`, macOS 27.0 on an Apple M5, Chromium 153.0.8010.12.
+All services are local and media is generated. `gwar-proto`, `gwar-media`, `vendor` and
+everything of `crates/gwar-server` but one test's fake speaker have no changes, so SFU
+behaviour and its budgets are unchanged.
+
+### What ran on this Mac
+
+| Check | Result |
+| --- | --- |
+| Real ScreenCaptureKit capture, `this_mac_captures_other_processes_and_leaves_this_one_out` | Another process's tone arrives at 0.00270; the same tone from this process reads 0.0000000 |
+| Exclusion, Swift probe at −50 dBFS | `afplay` −51 dB; in-process `AVAudioEngine` −240 dB; **`WKWebView` −50.6 dB, not excluded** (hence `silenceWebviewMedia`) |
+| Real hidden `WKWebView`, the real worklet and worker over WebRTC loopback for 14 s | Context stays running with the window hidden, 50–54 receive frames/s, `totalSamplesReceived` 0: the webview decodes nothing |
+| `native-voice.mjs`, Chromium and WebKit | Pass. The real capture queue, webview sender, local SFU, receive transform and native playout carry a 997 Hz tone from a native sharer to a native viewer, with no player in that webview. Mute, unmute, withdrawal and voice beside it are checked |
+| Continuity in that test, 10 s of the mixer's counters and the speaker's record | Chromium 504 of 504 frames, WebKit 504 of 503 decoded (counters are read a moment apart), none late, dropped or underrun, longest gap 102 ms, the tone at every 10 ms of the speaker |
+| Real Tauri IPC, `share_ipc`, four shares | See below |
+| Rust | 237 voice tests, 22 of them share playout; desktop `share_audio`; 241 screen lib tests; 19 `--test screen`; the voice headroom matrix |
+| Web | Typecheck, lint, 2,475 Vitest tests; `screen.mjs` with sound, H.264 canvas on Chromium and WebKit, `e2e:watch`, `e2e:denoise` |
+
+`native_bridge` stands in for the desktop shell in `native-voice.mjs`: its "computer" is a
+tone and its virtual speaker keeps one channel. Stereo is covered by the pipeline tests.
+The app itself was not started: the picker needs a person, and the installed app is off
+limits. One early run saw no decoded sound for 15 s beside slot controls racing in that
+concurrent bridge. Controls are now fenced by run and cannot be lost, and it did not come back,
+but the cause of that run was not proven.
+
+### What CI's continuity drop was
+
+`browser-private` varied from 498 of 502 frames down to 305 of 493, and failed in three
+different places, on `7f391279` and `4420af23` alike. So the S3 changes were not the cause.
+Three defects stacked up, all shown by measurement:
+
+1. **The test bridge, the trigger.** It sent each capture read to the page as a list of numbers.
+   Playwright serialized that on Node's only thread, which then stalled for the whole run:
+   with 16 busy loops on this Mac the loop's p99 was 278 ms against 15 ms idle, reads fell from
+   about 1,000 to 36 in 10 s, and 137,000 of 490,000 frames fell out of the 200 ms queue. The
+   real shell passes raw bytes. Base64 here, under the same load, gives a p99 of 13 ms, about
+   1,009 reads and nothing lost, on three runs of three. On CI's runner: 505 of 504 decoded,
+   none concealed, loop p99 11 ms.
+2. **The sender's worklet, this PR's code.** Any level over 100 ms snapped to 30 ms, so each
+   late lump lost nearly all of itself. With 8 busy loops the worklet threw away 931,200 of
+   1,114,560 frames written. It now drops only what stayed queued for half a second.
+3. **The viewer's queue, this PR's code.** It cut everything over 240 ms the moment it saw it,
+   and sound arriving after the queue ran dry was dropped as late. Lumps of 200 ms lost 19% with
+   no backlog drop at all. Both are fixed, with `sound_arriving_in_lumps_is_not_mistaken_for_a_backlog`
+   failing first.
+
+The bridge's fake computer also ran 13% slow on plain sleeps; it now runs on the clock.
+
+Frame counts could not see any of this: Opus frames kept flowing with silence in them. With the
+old worklet, under load, 501 of 498 frames decoded while the tone was there at 14 of 50 looks. The
+first version of this check failed on CI at 7 of 25 looks, and was right that sound was missing,
+though the looks themselves mislead: a stall times them too. One CI run read 33 of 33 with 37% of
+the source lost, and locally 37 of 37 with the speaker's own record at 90%. So the gate now also
+holds that record, the tone's amplitude for every 10 ms at the speaker (`toneCoverage`), and the
+share of the source lost. Through the canceller nothing is removed: the record is taken from
+the speaker ring, and the canceller only touches the microphone's path.
+
+One WebKit run of `native-voice.mjs`, on `a5e36236`, timed out at `native dan hears browser
+alice`, before any share, with the listener's speaker at exactly 0 for 20 s. That is 1 run in 18
+on that code; the 17 after it passed, 9 of them straight after Chromium as in the gates. Cause
+not shown. A timeout on that step, or on `native dan hears native erin`, now prints
+`voice path at failure` with the first stage that stopped: the sender's audio context or packets,
+remote track, decode, ring or output (`whereSoundStopped`). Forced failures read correctly: a
+suspended context as `sender` in both browsers, a muted track as `remote track`, and another
+frequency as `output`.
+
+`browser-private` also failed once, on `7f391279`, at `the member joins` in `private.mjs`, before
+any share. This PR does not touch that path. It did not recur in eleven local runs, ten of them
+under load, or in any CI attempt since. Its cause is not known. A timeout there now prints each
+device's groups.
+
+### Real Tauri IPC
+
+`cargo run -p gwar-desktop --example share_ipc -- 300`, a debug build, with `SHARE_IPC_AWAKE=1`
+so the page keeps running on this unattended Mac. A small window of its own under its own
+identifier, connecting to nothing, runs the real raw `invoke` path in a real `WKWebView` with
+`voice/share-sound.ts`'s limits: 50 packets/s of 160 bytes on each of four shares into the real
+`SharePlayout`, and one long-polling reader of a real `CaptureQueue` at 48 kHz stereo.
+
+| Five minutes on this locked Mac | Idle | 8 busy loops |
+| --- | --- | --- |
+| Frames sent, decoded | 60,012, 58,820 (98.0%) | 60,004, 57,628 (96.0%) |
+| Concealed, late, input queue | 20, 40, 0 | 28, 0, 0 |
+| Dropped as a stall's backlog | 1,048 | 2,316 |
+| Batch round trip, p50, p99, max | 2, 5, 337 ms | 7, 55, 173 ms |
+| Captured stereo dropped of 14.4 M frames | 13,920 | 0 |
+| Longest gap between reads | 338 ms | 173 ms |
+| Output ring underruns | 329,090 | 614,916 |
+
+So the real path is not the bridge's: its reads hold no list of numbers, and the read stays near
+real time even under load. It does stall: 337 ms once, idle, on a Mac nobody is at. A stall past
+200 ms loses sound from the capture queue, and that is the queue's limit working: the sound
+never waits longer than that. Whether the real app stalls as often is not measured. Before the
+queue fix the same load decoded 52,948 of
+59,644, with 6,408 backlog drops and 465,600 captured frames lost.
+
+This is the page's reader, not the real worklet, which only the browser runs reach. It says
+nothing about a hidden app or the real app's load beside WebRTC, and Windows' WebView2 was not
+measured at all. A five-minute run is also what found `a_delay_that_grows_while_the_queue_is_watched_drops_nothing`:
+no shorter gate reached it.
+
+### Review round
+
+Tests that failed first, on the code as it stood: the four web groups of S4, S5 and S6
+(`share-sound.test.ts`), and `a_full_frame_queue_cannot_lose_a_replacement` (S7). Put back
+into the fixed code, these failed too: a reference of the middle alone in
+`opposite_speakers_are_in_the_echo_reference_too`, −26.2 dBFS left against the required
+−35 (S1); and the old install check in `a_stop_during_startup_cancels_that_start` and
+`a_new_view_cancels_a_start_the_old_one_left_behind` (S3).
+
+Windows activation (S9) and `retire_on_renderer_loss` type-check for `x86_64-pc-windows-gnu`
+in a stub crate here and compile in CI's `desktop (windows-2022)`. They have not run: no test
+reaches them, and a real renderer crash has not been caused on any platform.
+
+The pane's name comes from Apple's Mac User Guide, for macOS 14 and 15 alike: "Screen &
+System Audio Recording", in Polish "Nagrywanie ekranu i dźwięku systemowego". This Mac's
+settings could not confirm it, and it may differ on early 14.x.
+
+### Voice
+
+Voice alone keeps `origin/main`'s canceller to the bit: 60 s of simulated echo, gain and all,
+fingerprint `c2d868db7d8d0eeb` on both (`voice_alone_is_mains_canceller_to_the_bit`, and
+`lets_a_voice_through_once_there_is_no_echo` passes unchanged). The first share sound that
+really plays pins a stereo canceller for the rest of the voice session
+(`share_sound_pins_stereo_for_the_rest_of_the_session`,
+`a_sharer_or_a_muted_viewer_stays_on_one_channel`). A reconnect starts a new pipeline, so it
+starts on one channel again and pins again.
+
+The cost per 10 ms frame, render and capture, `stereo_reference_cost` in release:
+
+| Canceller | Median | p99 |
+| --- | --- | --- |
+| One channel, `origin/main`'s path | 46.3 µs (0.46% of a core) | 51.5 µs |
+| Voice alone, this branch | 46.7 µs (0.47%) | 52.4 µs |
+| Pinned, share sound playing | 48.1 µs (0.48%) | 58.9 µs |
+
+The slowest of the three frames through the switch took 76 µs. Both cancellers run for those
+3 s of learning.
+
+The voice thread never goes to the heap on the way to stereo: the pin, taking the built
+canceller and the take-over make no allocation or free at all
+(`the_way_to_stereo_never_touches_the_heap_on_the_voice_thread`, against nine on the pin alone
+before). A worker that sleeps through the session does that work; a session with no share sound
+pays for that one thread and ends it (`a_session_without_share_sound_ends_its_sleeping_worker`).
+Sonora itself is another matter, here and on `origin/main`: 98 heap trips a frame on one canceller,
+98 pinned, 174 while both run during learning. That is unchanged by this PR for voice alone,
+and it is not bounded by anything here.
+
+The switch, against staying mono with no share at all, in simulated rooms (3 far voices × 3
+delays × 2 near voices), seconds after the pin, mean dBFS (`the_switch_against_staying_mono`):
+
+| Window | 0–.5 | .5–1 | 1–1.5 | 1.5–2 | 2–3 | 3–4 | 4–6 | 16–24 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Echo, stay mono | −63.0 | −64.1 | −62.6 | −64.1 | −63.5 | −63.6 | −63.6 | −66.4 |
+| Echo, switched | −63.0 | −64.1 | −62.6 | −64.1 | −63.5 | −58.8 | −59.3 | −66.7 |
+| Voice level, stay mono | −24.8 | −25.0 | −25.4 | −25.3 | −25.1 | −24.8 | −25.0 | −26.6 |
+| Voice level, switched | −24.8 | −25.0 | −25.4 | −25.3 | −25.1 | −25.4 | −25.1 | −26.9 |
+
+So for the first 2 s, and to 3 s, voice echo and level are identical to staying mono, in every
+room. After take-over the echo is about 5 dB higher for a few seconds, around −59 dBFS, 11 dB
+in the worst room, and it is level again by 16 s. The hand-over is one crossfaded frame with no
+click, no gap and the same lag, 586 samples (`the_switch_has_no_click_and_no_gap`,
+`the_switch_keeps_the_voice_in_time`). On headphones the voice loses at most 1.3 dB at
+6–8 s, then ±0.8 dB (`the_switch_on_headphones`).
+
+The price of that is the share itself: wide sound leaks at about −28 dBFS while the canceller
+learns, about 3.5 s of sound, is at −35 at 3–4 s and −71 by 8–12 s
+(`wide_sound_through_the_switch`). A near voice beside wide share sound also keeps 2–3 dB less of
+its shape after take-over than one with no share at all.
+
+Bursts no longer leak once pinned (`stereo_bursts_never_leak_once_pinned`, 1 s on, 1 s off, in
+anti-phase), and voice then wide sound is cancelled from when it is learned
+(`wide_sound_after_voice_is_cancelled_from_when_it_is_learned`). One relearn remains: after 310 s
+of voice at another pitch with the pin long past, wide sound reads −70.9 before it, then −29.4, −35.9 in its first second and −71.1 from then
+on, so about a second of leak (`wide_sound_after_five_minutes_of_voice`). All of this is simulated:
+none of it has been measured on real speakers.
+
+The adversarial 1 Mb/s limit is unchanged. `low_bandwidth_bursts_preserve_voice_with_and_without_video`:
+
+| Service | Video | `origin/main` p99 | This branch p99 |
+| --- | --- | --- | --- |
+| 1 ms | no | 9.048 ms | 9.048 ms |
+| 1 ms | yes | 9.144 ms | 9.144 ms |
+| 5 ms | no | 9.048 ms | 9.048 ms |
+| 5 ms | yes | 9.288 ms | 9.288 ms |
+| 10 ms | no | 9.048 ms | 9.048 ms |
+| 10 ms | yes | 9.288 ms | 9.288 ms |
+
+Native voice under four shares, by `four_shares_leave_the_voice_pipeline_on_time` in release:
+the real pipeline, six alternating pairs of 20 s arms, from a microphone block to its encoded
+frame, with the stereo reference. This Mac runs slower now than it did for the earlier figure, so both revisions were run
+in turn, two rounds each. Without shares p99 is 0.70–1.02 ms on both. With four shares it is
+1.08–1.22 ms before the pin and 1.21–1.38 ms with it, so the pinned canceller costs about
+0.15 ms there. The test's limit is 1.0 ms of p99 delta. It failed once, 1.137 ms, against an arm
+without shares that happened to read 0.23 ms, in a run with four shares at the usual 1.37 ms; the
+next four full runs of the pinned code passed, worst delta 0.70 ms. This is an in-process measure, **not** paired
+mouth-to-ear.
+
+### Startup
+
+Not rerun after the review round, which changed nothing a browser's startup runs: the
+paired figures below are from `ddc55112`. The committed assertions are unchanged and pass 8/8 on both revisions, twice, with zero
+probes. As in round 6, a local uncommitted copy changed only the observation wait: 50 ms for
+ten seconds, then 500 ms. Order: main, this branch, main, this branch; nothing else ran.
+First time at target size, seconds:
+
+| Case | main 1 | main 2 | branch 1 | branch 2 | Median change |
+| --- | --- | --- | --- | --- | --- |
+| `h264-barcode20-0` | 1.166 | 1.172 | 1.152 | 1.258 | +3.0% |
+| `h264-barcode20-1` | 1.162 | 1.153 | 1.152 | 1.196 | +1.4% |
+| `h264-busy60-0` | 1.166 | 1.168 | 1.150 | 1.164 | −0.9% |
+| `h264-busy60-1` | 1.158 | 1.161 | 1.141 | 1.183 | +0.2% |
+| `vp9-barcode20-0` | 0.732 | 0.747 | 0.744 | 0.680 | −3.7% |
+| `vp9-barcode20-1` | 1.087 | 1.036 | 1.042 | 1.106 | +1.2% |
+| `vp9-busy60-0` | 1.254 | 1.229 | 1.219 | 1.279 | +0.6% |
+| `vp9-busy60-1` | 1.169 | 1.219 | 1.223 | 1.148 | −0.7% |
+
+The last H.264 busy case was recorded as CPU-limited on both runs of this branch (12.9 and
+13.5 ms/frame in OpenH264) and neither run of main. Every run settled at 1080p60. Browser
+encoding paths did not change, and two runs per side cannot say whether this means anything.
+
+### Not measured here
+
+Windows capture and WebView2 exclusion, Windows 10 builds, the macOS permission flow in a real
+app, physical AEC on speakers, lip-sync, paired mouth-to-ear, real stereo output, a real app
+hidden for minutes, a real stall or sleep and wake in the app (pause and resume are tested on the
+shell's state and on the webview's reader, not end to end in a real webview), and whether
+ScreenCaptureKit or process loopback survive a real sleep: if the OS ends the stream, computer
+sound ends and Details says so. The owner test list is in the pull request. Windows code is compiled by CI only.
