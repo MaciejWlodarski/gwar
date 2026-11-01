@@ -85,12 +85,14 @@ function nativeFixture(frequency) {
     else waiter?.resolve(message.ok);
   });
   fixture.batches = [];
+  fixture.reads = [];
   fixture.request = (command, args = {}) => new Promise((resolve, reject) => {
     const id = ++next;
-    if (command === "share_playback_frames") {
+    if (command === "share_playback_frames" || command === "share_capture_read") {
       const started = performance.now();
       const finish = resolve;
-      resolve = value => { fixture.batches.push({ started, ms: performance.now() - started }); finish(value); };
+      const timed = command === "share_capture_read" ? fixture.reads : fixture.batches;
+      resolve = value => { timed.push({ started, ms: performance.now() - started }); finish(value); };
     }
     pending.set(id, { resolve, reject });
     if (!["snapshot", "audio_devices", "share_capture_read", "share_playback_frames"].includes(command)) child.log += `> ${command} ${JSON.stringify(args).slice(0, 300)}\n`;
@@ -277,8 +279,25 @@ async function shareAndWatch(sharer, viewer) {
 /** Beside two voices its share of the energy is small, but without it the tone measures under 0.001. */
 const shareHeard = async viewer => (await viewer.native.request("snapshot", { frequency: 997 })).tone > 0.005;
 
+/** What the sound path was doing when a check gave up, end to end, over one more second. */
+async function soundAtFailure(sharer, viewer) {
+  const look = async () => ({ playout: await viewer.native.request("share_stats", {}), source: await sharer.native.request("share_capture_stats", {}), heard: await viewer.native.request("snapshot", { frequency: 997 }) });
+  const first = await look();
+  await sleep(1_000);
+  const last = await look();
+  return { first, last, reads: batchTiming(sharer.native.reads.slice(-200)), batches: batchTiming(viewer.native.batches.slice(-200)) };
+}
+
 /** Native sender to native viewer, through the UI: consent, playback, controls, withdrawal. */
 async function computerSound(sharer, viewer, browserViewer) {
+  try { return await computerSoundFlow(sharer, viewer, browserViewer); }
+  catch (error) {
+    console.log(`share sound at failure: ${JSON.stringify(await soundAtFailure(sharer, viewer).catch(reason => String(reason)))}`);
+    throw error;
+  }
+}
+
+async function computerSoundFlow(sharer, viewer, browserViewer) {
   const started = Date.now();
   const page = sharer.page;
   await page.getByRole("button", { name: "Share screen", exact: true }).click();
@@ -305,10 +324,18 @@ async function computerSound(sharer, viewer, browserViewer) {
   await waitFor(async () => (await hears(viewer, 770)) && (await hears(browserViewer, 770)), "voice beside share sound", 20_000);
   await viewer.page.evaluate(() => { window.__batches.length = 0; });
   viewer.native.batches.length = 0;
-  const continuity = await shareContinuity(() => viewer.native.request("share_stats", {}), 10_000);
+  sharer.native.reads.length = 0;
+  const sourceBefore = await sharer.native.request("share_capture_stats", {});
+  const continuity = await shareContinuity(async () => ({ ...await viewer.native.request("share_stats", {}), heard: await shareHeard(viewer) }), 10_000);
   console.log(`share sound continuity: ${JSON.stringify(continuity)}`);
   // Each batch waits for the last one's answer: a slow bridge holds frames back, then lands them at once.
-  console.log(`share sound bridge: ${JSON.stringify({ page: batchTiming(await viewer.page.evaluate(() => window.__batches)), process: batchTiming(viewer.native.batches) })}`);
+  const source = await sharer.native.request("share_capture_stats", {});
+  console.log(`share sound bridge: ${JSON.stringify({
+    page: batchTiming(await viewer.page.evaluate(() => window.__batches)),
+    process: batchTiming(viewer.native.batches),
+    reads: batchTiming(sharer.native.reads),
+    source: { rate: Number(((source.writtenSeconds - sourceBefore.writtenSeconds) / (source.elapsedSeconds - sourceBefore.elapsedSeconds)).toFixed(3)), dropped: source.dropped - sourceBefore.dropped },
+  })}`);
   const rate = continuity.frames / (continuity.ms / 1_000);
   assert.ok(rate > 45 && rate < 55, `viewer takes one Opus frame per 20 ms, got ${rate}/s`);
   assert.deepEqual(continuityProblems(continuity, continuityLimits(Boolean(process.env.CI))), [], `share sound kept playing: ${JSON.stringify(continuity)}`);

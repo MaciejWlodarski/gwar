@@ -13,7 +13,7 @@ function scripted(answers) {
       const { takesMs = 0, ...moved } = answers(next++, time);
       time += takesMs;
       for (const [key, value] of Object.entries(moved)) totals[key] += value;
-      return { ...totals };
+      return { ...totals, heard: moved.silent !== true };
     },
   };
 }
@@ -43,9 +43,11 @@ test("an outage inside one late answer counts: a delayed report of new frames en
 
 test("the synthetic outage fails on each measure alone", () => {
   const limits = continuityLimits(true);
-  const fine = { frames: 500, decoded: 498, concealed: 4, ringUnderruns: 0, longestGapMs: 300, longestLookMs: 300 };
+  const fine = { frames: 500, decoded: 498, concealed: 4, ringUnderruns: 0, longestGapMs: 300, longestLookMs: 300, looks: 100, heard: 100 };
   assert.deepEqual(continuityProblems(fine, limits), []);
-  assert.equal(continuityProblems({ ...fine, decoded: 350, ringUnderruns: 144_000 }, limits).length, 1, "350 of 500 decoded is only caught by the output");
+  assert.equal(continuityProblems({ ...fine, decoded: 350 }, limits).length, 1);
+  assert.equal(continuityProblems({ ...fine, concealed: 150 }, limits).length, 1);
+  assert.equal(continuityProblems({ ...fine, ringUnderruns: 144_000 }, limits).length, 1);
   assert.equal(continuityProblems({ ...fine, longestGapMs: 3_000 }, limits).length, 1);
   assert.equal(continuityProblems({ ...fine, longestLookMs: 1_600 }, limits).length, 1);
 });
@@ -55,6 +57,12 @@ test("a late answer without new frames is not a pause over: it goes on", async (
   const report = await shareContinuity(...run(scripted(silent)));
   assert.ok(report.longestGapMs > 4_500, JSON.stringify(report));
   assert.ok(continuityProblems(report, continuityLimits(true)).some(problem => problem.startsWith("no new sound")));
+});
+
+test("frames that reach the mixer but carry no sound fail, whatever the frame counts say", async () => {
+  const report = await shareContinuity(...run(scripted(at => ({ ...healthy(), silent: at % 8 !== 0 }))));
+  assert.equal(report.decoded, 500);
+  assert.deepEqual(continuityProblems(report, continuityLimits(true)), [`the sound was there at ${report.heard} of ${report.looks} looks`]);
 });
 
 test("batch timing finds the slow trips and the wait between batches", () => {

@@ -6,7 +6,7 @@
 export async function shareContinuity(read, ms, { now = Date.now, wait = delay => new Promise(resolve => setTimeout(resolve, delay)) } = {}) {
   const first = await read();
   const started = now();
-  let last = first, answered = started, progress = started, longestGapMs = 0, longestLookMs = 0;
+  let last = first, answered = started, progress = started, longestGapMs = 0, longestLookMs = 0, looks = 0, heard = 0;
   while (now() - started < ms) {
     await wait(100);
     const stats = await read();
@@ -14,11 +14,13 @@ export async function shareContinuity(read, ms, { now = Date.now, wait = delay =
     longestLookMs = Math.max(longestLookMs, at - answered);
     longestGapMs = Math.max(longestGapMs, at - progress);
     if (stats.decoded > last.decoded) progress = at;
+    looks += 1;
+    if (stats.heard) heard += 1;
     answered = at;
     last = stats;
   }
   const delta = key => last[key] - first[key];
-  return { ms: now() - started, frames: delta("frames"), decoded: delta("decoded"), concealed: delta("concealed"), late: delta("late"), backlog: delta("backlog"), inputDrops: delta("input"), ringUnderruns: delta("underruns"), longestGapMs, longestLookMs };
+  return { ms: now() - started, frames: delta("frames"), decoded: delta("decoded"), concealed: delta("concealed"), late: delta("late"), backlog: delta("backlog"), inputDrops: delta("input"), ringUnderruns: delta("underruns"), longestGapMs, longestLookMs, looks, heard };
 }
 
 /** How long `{ started, ms }` batches took there and back, and the longest wait between two of them. */
@@ -32,8 +34,8 @@ export function batchTiming(batches) {
 
 /** The fixture's JSON bridge delivers in long bursts on a 4-vCPU runner, which the real IPC does not (share_ipc). */
 export const continuityLimits = ci => ci
-  ? { decoded: 0.5, concealed: 0.5, gapMs: 2_000, lookMs: 1_500, underrunMs: 200 }
-  : { decoded: 0.9, concealed: 0.1, gapMs: 1_000, lookMs: 500, underrunMs: 100 };
+  ? { decoded: 0.8, concealed: 0.2, heard: 0.8, gapMs: 1_000, lookMs: 1_500, underrunMs: 200 }
+  : { decoded: 0.9, concealed: 0.1, heard: 0.9, gapMs: 1_000, lookMs: 500, underrunMs: 100 };
 
 const SAMPLES_PER_MS = 48;
 
@@ -42,6 +44,8 @@ export function continuityProblems(report, limits) {
   const problems = [];
   if (report.decoded < limits.decoded * report.frames) problems.push(`the mixer decoded ${report.decoded} of ${report.frames} frames`);
   if (report.concealed > limits.concealed * report.frames) problems.push(`${report.concealed} of ${report.frames} frames were patched over`);
+  // Frames count even when they carry silence, so only the speaker can say sound got through.
+  if (report.heard < limits.heard * report.looks) problems.push(`the sound was there at ${report.heard} of ${report.looks} looks`);
   if (report.longestGapMs > limits.gapMs) problems.push(`no new sound for ${report.longestGapMs} ms`);
   if (report.longestLookMs > limits.lookMs) problems.push(`stats stayed away for ${report.longestLookMs} ms, so this run says little`);
   if (report.ringUnderruns > limits.underrunMs * SAMPLES_PER_MS) problems.push(`the output ran out of ${report.ringUnderruns} samples`);

@@ -53,6 +53,7 @@ try {
       await new Promise(resolve => setTimeout(resolve, 250));
     }
     for (const page of pages) console.error(await page.evaluate(() => window.mls.errors));
+    for (const page of pages) console.error(await page.evaluate(() => JSON.stringify(window.mls.runtime.inventory().map(g => ({ conversation: g.conversation, status: g.record.status, members: g.members?.length })))).catch(String));
     throw new Error(`timed out: ${what}`);
   };
   // The owner (account 11), a member (21) and an outsider (31), one device each.

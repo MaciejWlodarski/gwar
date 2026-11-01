@@ -139,6 +139,8 @@ struct Bridge {
     frequency: f64,
     played: Arc<Mutex<VecDeque<f32>>>,
     state: Mutex<State>,
+    /// When the fake computer started, and how many samples it has written.
+    capture_clock: Arc<Mutex<(Option<Instant>, u64)>>,
 }
 
 fn emit(event: &str, payload: Value) {
@@ -218,6 +220,9 @@ impl Bridge {
                 let id = number(&args, "id")?;
                 let queue = Arc::<CaptureQueue>::default();
                 self.state.lock().unwrap().capture = Some((id, queue.clone()));
+                let started = Instant::now();
+                self.capture_clock.lock().unwrap().0 = Some(started);
+                let written = self.capture_clock.clone();
                 tokio::spawn(async move {
                     let mut position = 0u64;
                     while !queue.is_closed() {
@@ -229,7 +234,10 @@ impl Bridge {
                             .collect();
                         queue.write(&block);
                         position += BLOCK as u64;
-                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        written.lock().unwrap().1 = position;
+                        // By the clock, as a sound device runs: a plain 10 ms sleep runs 13% slow.
+                        let due = started + Duration::from_secs_f64(position as f64 / RATE as f64);
+                        tokio::time::sleep_until(due.into()).await;
                     }
                 });
                 Ok(Value::Null)
@@ -241,6 +249,14 @@ impl Bridge {
                 let samples = queue.read(Duration::from_millis(100)).await;
                 anyhow::ensure!(!samples.is_empty() || !queue.is_closed(), "closed");
                 Ok(json!(samples.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>()))
+            }
+            "share_capture_stats" => {
+                let (started, written) = *self.capture_clock.lock().unwrap();
+                let dropped = self.state.lock().unwrap().capture.as_ref().map_or(0, |(_, queue)| queue.dropped());
+                let elapsed = started.map_or(0.0, |started| started.elapsed().as_secs_f64());
+                Ok(
+                    json!({ "writtenSeconds": written as f64 / RATE as f64, "elapsedSeconds": elapsed, "dropped": dropped }),
+                )
             }
             "share_capture_stop" => {
                 let id = number(&args, "id")?;
@@ -282,7 +298,10 @@ impl Bridge {
             }
             "snapshot" => {
                 let frequency = args["frequency"].as_f64().context("frequency")?;
-                Ok(json!({ "tone": tone(&self.played.lock().unwrap(), frequency) }))
+                let played = self.played.lock().unwrap();
+                let energy = played.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>();
+                let rms = (energy / played.len().max(1) as f64).sqrt();
+                Ok(json!({ "tone": tone(&played, frequency), "rms": rms }))
             }
             // Device, gain and gate setters do not change what this fixture tests.
             _ => Ok(Value::Null),
@@ -380,7 +399,8 @@ impl Bridge {
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let frequency: f64 = std::env::args().nth(1).context("usage: native_bridge <microphone Hz>")?.parse()?;
-    let bridge = Arc::new(Bridge { frequency, played: Arc::default(), state: Mutex::default() });
+    let bridge =
+        Arc::new(Bridge { frequency, played: Arc::default(), state: Mutex::default(), capture_clock: Arc::default() });
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await? {
         let request: Value = serde_json::from_str(&line)?;
