@@ -19,6 +19,7 @@
 import { chooseFirstRunName } from "./first-run.mjs";
 import { stopProcesses } from "./processes.mjs";
 import { canvasCapture, readBarcode, stampBarcode } from "./screen-source.mjs";
+import { continuityLimits, continuityProblems, shareContinuity } from "./share-continuity.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -264,25 +265,6 @@ async function shareAndWatch(sharer, viewer) {
 /** Beside two voices its share of the energy is small, but without it the tone measures under 0.001. */
 const shareHeard = async viewer => (await viewer.native.request("snapshot", { frequency: 997 })).tone > 0.005;
 
-/**
- * Whether share sound keeps flowing, not just whether it is there now: what the mixer did over
- * `ms`, and the longest stretch in which no frame was decoded.
- */
-async function shareContinuity(viewer, ms) {
-  const first = await viewer.native.request("share_stats", {});
-  const started = Date.now();
-  let last = first, progress = started, longestGapMs = 0;
-  while (Date.now() - started < ms) {
-    await sleep(100);
-    const now = await viewer.native.request("share_stats", {});
-    if (now.decoded > last.decoded) progress = Date.now();
-    longestGapMs = Math.max(longestGapMs, Date.now() - progress);
-    last = now;
-  }
-  const delta = key => last[key] - first[key];
-  return { ms: Date.now() - started, frames: delta("frames"), decoded: delta("decoded"), concealed: delta("concealed"), late: delta("late"), backlog: delta("backlog"), inputDrops: delta("input"), ringUnderruns: delta("underruns"), longestGapMs };
-}
-
 /** Native sender to native viewer, through the UI: consent, playback, controls, withdrawal. */
 async function computerSound(sharer, viewer, browserViewer) {
   const started = Date.now();
@@ -309,15 +291,11 @@ async function computerSound(sharer, viewer, browserViewer) {
   assert.equal(await viewer.page.locator("audio[data-share-audio]").count(), 0, "the desktop webview has no share player");
   await browserViewer.page.locator("audio[data-share-audio]").waitFor({ state: "attached", timeout: 15_000 });
   await waitFor(async () => (await hears(viewer, 770)) && (await hears(browserViewer, 770)), "voice beside share sound", 20_000);
-  const continuity = await shareContinuity(viewer, 10_000);
+  const continuity = await shareContinuity(() => viewer.native.request("share_stats", {}), 10_000);
   console.log(`share sound continuity: ${JSON.stringify(continuity)}`);
   const rate = continuity.frames / (continuity.ms / 1_000);
   assert.ok(rate > 45 && rate < 55, `viewer takes one Opus frame per 20 ms, got ${rate}/s`);
-  // The fixture's JSON bridge delivers in long bursts on a 4-vCPU runner, which the real IPC does not (share_ipc).
-  const slack = process.env.CI ? { decoded: 0.5, concealed: 0.5, gapMs: 2_000 } : { decoded: 0.9, concealed: 0.1, gapMs: 1_000 };
-  assert.ok(continuity.decoded >= slack.decoded * continuity.frames, `the mixer decoded what arrived: ${JSON.stringify(continuity)}`);
-  assert.ok(continuity.concealed <= slack.concealed * continuity.frames, `sound was not patched over: ${JSON.stringify(continuity)}`);
-  assert.ok(continuity.longestGapMs <= slack.gapMs, `sound did not stop: ${JSON.stringify(continuity)}`);
+  assert.deepEqual(continuityProblems(continuity, continuityLimits(Boolean(process.env.CI))), [], `share sound kept playing: ${JSON.stringify(continuity)}`);
   // Not one instant: the fixture's JSON bridge delivers in bursts on a slow runner, between which the tone gaps.
   await waitFor(async () => (await shareHeard(viewer)) && (await hears(viewer, 770)), "ten seconds in, voice and share sound still play together", 10_000);
   await viewer.page.getByTestId("share-audio-controls").getByRole("button", { name: "Mute share sound" }).click();
