@@ -62,7 +62,7 @@ impl Drop for StopOnDrop {
 impl AudioIo for FakeIo {
     fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
         let (mut mic_tx, mic) = RingBuffer::<CaptureSample>::new(48_000);
-        let (speaker, mut speaker_rx) = RingBuffer::<f32>::new(24_000);
+        let (speaker, mut speaker_rx) = RingBuffer::<[f32; 2]>::new(24_000);
         let stop = Arc::new(AtomicBool::new(false));
         let stopped = stop.clone();
         let FakeIo { tone, heard } = *self;
@@ -84,7 +84,7 @@ impl AudioIo for FakeIo {
                 }
                 let missing = 480usize.saturating_sub(speaker_rx.slots());
                 for _ in 0..480 {
-                    let s = speaker_rx.pop().unwrap_or(0.0);
+                    let s = speaker_rx.pop().map_or(0.0, gwar_client::voice::io::mono);
                     if s.abs() > 0.01 {
                         heard.loud_samples.fetch_add(1, Ordering::Relaxed);
                     }
@@ -114,7 +114,7 @@ pub struct NullIo;
 impl AudioIo for NullIo {
     fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
         let (_mic_tx, mic) = RingBuffer::<CaptureSample>::new(1);
-        let (speaker, _speaker_rx) = RingBuffer::<f32>::new(48_000 / 2);
+        let (speaker, _speaker_rx) = RingBuffer::<[f32; 2]>::new(48_000 / 2);
         let output = Arc::new(OutputTiming::default());
         // The unused ring ends are dropped; the engine only ever sees empty/full rings.
         Ok(AudioPorts { mic, speaker, output, _guard: Box::new(()) })

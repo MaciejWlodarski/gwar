@@ -73,7 +73,7 @@ impl AudioIo for FakeIo {
                 let mut out = heard.lock().unwrap();
                 let missing = 480usize.saturating_sub(speaker_rx.slots());
                 for _ in 0..480 {
-                    out.push(speaker_rx.pop().unwrap_or(0.0));
+                    out.push(speaker_rx.pop().map_or(0.0, |[left, _]| left));
                 }
                 timing.report(480, missing);
                 drop(out);

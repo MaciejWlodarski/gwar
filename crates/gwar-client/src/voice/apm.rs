@@ -31,9 +31,14 @@ struct Stage {
 
 impl Stage {
     fn new() -> Self {
-        let stream = StreamConfig::new(super::io::RATE, 1);
+        // Two render channels cost little while they match: the canceller's own detector keeps
+        // it on one channel until the speakers really differ, which only share sound makes them.
         Self {
-            apm: AudioProcessing::builder().config(base()).capture_config(stream).render_config(stream).build(),
+            apm: AudioProcessing::builder()
+                .config(base())
+                .capture_config(StreamConfig::new(super::io::RATE, 1))
+                .render_config(StreamConfig::new(super::io::RATE, 2))
+                .build(),
             on: false,
         }
     }
@@ -52,15 +57,23 @@ impl Stage {
 pub(crate) struct Processing {
     echo: Stage,
     gain: Stage,
-    /// What the speaker was given since the last whole frame went to the canceller.
-    render: [f32; FRAME],
+    /// What each speaker was given since the last whole frame went to the canceller.
+    render: [[f32; FRAME]; 2],
     rendered: usize,
+    render_scratch: [[f32; FRAME]; 2],
     scratch: [f32; FRAME],
 }
 
 impl Processing {
     pub(crate) fn new() -> Self {
-        Self { echo: Stage::new(), gain: Stage::new(), render: [0.0; FRAME], rendered: 0, scratch: [0.0; FRAME] }
+        Self {
+            echo: Stage::new(),
+            gain: Stage::new(),
+            render: [[0.0; FRAME]; 2],
+            rendered: 0,
+            render_scratch: [[0.0; FRAME]; 2],
+            scratch: [0.0; FRAME],
+        }
     }
 
     /// Turns the stages on or off, as the settings choose them. The canceller enforces its
@@ -83,18 +96,21 @@ impl Processing {
         });
     }
 
-    /// What the speaker will play, as it is queued for it: the echo's reference.
-    pub(crate) fn render(&mut self, samples: &[f32]) {
+    /// What the speakers will play, as it is queued for them: the echo's reference.
+    pub(crate) fn render(&mut self, samples: &[[f32; 2]]) {
         if !self.echo.on {
             return;
         }
-        for &sample in samples {
-            self.render[self.rendered] = sample;
+        for &[left, right] in samples {
+            self.render[0][self.rendered] = left;
+            self.render[1][self.rendered] = right;
             self.rendered += 1;
             if self.rendered == FRAME {
                 self.rendered = 0;
+                let [left, right] = &self.render;
+                let [left_out, right_out] = &mut self.render_scratch;
                 // Errors are only for formats other than the one built above.
-                let _ = self.echo.apm.process_render_f32(&[&self.render], &mut [&mut self.scratch]);
+                let _ = self.echo.apm.process_render_f32(&[left, right], &mut [left_out, right_out]);
             }
         }
     }
@@ -157,7 +173,7 @@ mod tests {
     fn run(processing: &mut Processing, render: &[f32], capture: &[f32]) -> Vec<f32> {
         let mut out = capture.to_vec();
         for (r, c) in render.as_chunks::<FRAME>().0.iter().zip(out.as_chunks_mut::<FRAME>().0) {
-            processing.render(r);
+            processing.render(&r.map(|s| [s; 2]));
             processing.cancel_echo(c, 20);
             processing.control_gain(c);
         }
@@ -235,5 +251,63 @@ mod tests {
         processing.configure(true, true);
         processing.configure(false, false);
         assert_eq!(run(&mut processing, &vec![0.5; RATE], &near), near);
+    }
+
+    /// One arm's canceller time per 10 ms frame, render and capture together, past its first 3 s.
+    fn frame_cost(mut frame: impl FnMut(usize)) -> (std::time::Duration, std::time::Duration) {
+        let mut spent: Vec<_> = (0..3_000)
+            .map(|index| {
+                let started = std::time::Instant::now();
+                frame(index);
+                started.elapsed()
+            })
+            .skip(300)
+            .collect();
+        spent.sort();
+        (spent[spent.len() / 2], spent[spent.len() * 99 / 100])
+    }
+
+    /// The price of the stereo reference: `cargo test --release ... stereo_reference_cost -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "a timing measurement, run in release"]
+    fn stereo_reference_cost() {
+        let len = 30 * RATE;
+        let left = voice(len, 120.0, -20.0);
+        let right = voice(len, 190.0, -20.0);
+        let echo: Vec<f32> = left.iter().map(|sample| sample * 0.3).collect();
+        let block = |signal: &[f32], index: usize| -> [f32; FRAME] {
+            signal[index * FRAME..(index + 1) * FRAME].try_into().unwrap()
+        };
+        // What voice alone costs before this change: one channel, all the way through.
+        let stream = StreamConfig::new(super::super::io::RATE, 1);
+        let mut mono = AudioProcessing::builder().config(base()).capture_config(stream).render_config(stream).build();
+        let canceller = EchoCanceller { transparent_mode: TransparentModeType::Hmm, ..Default::default() };
+        mono.apply_config(Config { echo_canceller: Some(canceller), ..base() });
+        let (mut far_out, mut near_out) = ([0f32; FRAME], [0f32; FRAME]);
+        let one = frame_cost(|index| {
+            let far = block(&left, index);
+            let near = block(&echo, index);
+            let _ = mono.process_render_f32(&[&far], &mut [&mut far_out]);
+            let _ = mono.set_stream_delay_ms(20);
+            let _ = mono.process_capture_f32(&[&near], &mut [&mut near_out]);
+        });
+        let arm = |right: &[f32]| {
+            let mut processing = Processing::new();
+            processing.configure(true, false);
+            frame_cost(|index| {
+                let (far_left, far_right) = (block(&left, index), block(right, index));
+                let pairs: [[f32; 2]; FRAME] = std::array::from_fn(|i| [far_left[i], far_right[i]]);
+                let mut near = block(&echo, index);
+                processing.render(&pairs);
+                processing.cancel_echo(&mut near, 20);
+            })
+        };
+        let same = arm(&left);
+        let different = arm(&right);
+        let budget = std::time::Duration::from_millis(10);
+        for (name, (median, p99)) in [("one channel", one), ("voice alone", same), ("share sound", different)] {
+            let share = 100.0 * median.as_secs_f64() / budget.as_secs_f64();
+            eprintln!("{name}: median {median:?} ({share:.2}% of a core), p99 {p99:?}");
+        }
     }
 }

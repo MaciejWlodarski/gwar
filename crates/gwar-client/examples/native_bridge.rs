@@ -24,7 +24,7 @@ use std::{
 use anyhow::Context;
 use gwar_client::voice::{
     LinkState, VoiceHandle,
-    io::{AudioIo, AudioPorts, CaptureSample, OutputTiming},
+    io::{AudioIo, AudioPorts, CaptureSample, OutputTiming, mono},
     keys::EncryptedStart,
     sframe::{Binding, ControlReply},
     share::{CaptureQueue, SharePlayout, parse_frames},
@@ -84,10 +84,13 @@ impl AudioIo for ToneIo {
                         position: position + i as u64,
                         value,
                     });
-                    block.push(speaker_rx.pop().unwrap_or_else(|_| {
-                        missing += 1;
-                        0.0
-                    }));
+                    block.push(speaker_rx.pop().map_or_else(
+                        |_| {
+                            missing += 1;
+                            0.0
+                        },
+                        mono,
+                    ));
                 }
                 {
                     let mut played = self.played.lock().unwrap();
@@ -249,16 +252,17 @@ impl Bridge {
             }
             "share_playback_open" => {
                 let (slot, run) = (number(&args, "slot")? as usize, number(&args, "run")?);
-                self.playout()?.open(slot, run);
-                Ok(json!(self.state.lock().unwrap().handle.is_some()))
+                let gain = args["gain"].as_f64().context("gain")? as f32;
+                let opened = self.playout()?.open(slot, run, gain);
+                Ok(json!(opened && self.state.lock().unwrap().handle.is_some()))
             }
             "share_playback_close" => {
-                self.playout()?.close(number(&args, "slot")? as usize);
+                self.playout()?.close(number(&args, "slot")? as usize, number(&args, "run")?);
                 Ok(Value::Null)
             }
             "share_playback_gain" => {
-                self.playout()?
-                    .set_gain(number(&args, "slot")? as usize, args["gain"].as_f64().context("gain")? as f32);
+                let (slot, run) = (number(&args, "slot")? as usize, number(&args, "run")?);
+                self.playout()?.set_gain(slot, run, args["gain"].as_f64().context("gain")? as f32);
                 Ok(Value::Null)
             }
             "share_playback_frames" => {
@@ -273,7 +277,7 @@ impl Bridge {
             "share_stats" => {
                 let stats = self.playout()?.stats();
                 Ok(
-                    json!({ "frames": stats.frames, "decoded": stats.decoded, "concealed": stats.concealed, "late": stats.late_drops, "backlog": stats.backlog_drops, "underruns": stats.ring_underruns }),
+                    json!({ "frames": stats.frames, "decoded": stats.decoded, "concealed": stats.concealed, "late": stats.late_drops, "backlog": stats.backlog_drops, "input": stats.input_drops, "underruns": stats.ring_underruns }),
                 )
             }
             "snapshot" => {

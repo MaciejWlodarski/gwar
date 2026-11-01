@@ -4,9 +4,8 @@
 //! Voice comes first. Share sound runs on its own ordinary-priority thread, which decodes
 //! ahead into one bounded stereo ring. The voice pipeline only takes what that ring holds
 //! and never waits: a late, slow or dead share thread is silence in the share, nothing else.
-//! The mid signal joins voice before the echo canceller's reference, so a viewer's microphone
-//! does not send the share back into the call. The side signal is only the difference
-//! between the two speakers.
+//! The final left and right channels, voice and share together and clipped, are the echo
+//! canceller's reference, so a viewer's microphone does not send the share back into the call.
 
 use std::{
     collections::VecDeque,
@@ -50,7 +49,7 @@ const BACKLOG_MARGIN: Duration = Duration::from_millis(80);
 /// A stream that has nothing for this long stops concealing and starts over.
 const CONCEAL_LIMIT: u32 = 5;
 
-/// Commands wait here while the share thread runs; a full queue drops share sound only.
+/// Frames wait here while the share thread runs; a full queue drops share sound only.
 const INPUT_QUEUE: usize = 256;
 
 /// Encoded share sound from one watch slot, in arrival order.
@@ -63,10 +62,28 @@ pub struct ShareFrame {
     pub opus: Vec<u8>,
 }
 
-enum Input {
-    Frame(ShareFrame, Instant),
-    Open { slot: usize, run: u64 },
-    Close { slot: usize },
+/// What the webview asked of one slot. This is not queued with the frames, so a backlog of them
+/// cannot lose a command, and a command is in force as soon as it returns.
+#[derive(Default)]
+struct SlotControl {
+    /// The newest watch transport that has given this slot a command. It stays after a close:
+    /// anything still on its way from an older transport finds it and changes nothing.
+    run: u64,
+    open: bool,
+    /// Waiting for the share thread, which owns the streams.
+    replacement: Option<Stream>,
+}
+
+/// Commands, read by the share thread when `changed` says so.
+struct Controls {
+    slots: Mutex<Vec<SlotControl>>,
+    changed: AtomicBool,
+}
+
+impl Controls {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<SlotControl>> {
+        self.slots.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -105,15 +122,13 @@ impl ShareBus {
         self.active.load(Ordering::Relaxed)
     }
 
-    /// Adds share sound to `mid`, the mono mix that also feeds the echo canceller, and writes the
-    /// stereo difference to `side`. Never waits. Deafened consumes the sound without playing it,
-    /// so the picture and the sound stay together. Share sound only uses the room voice leaves:
-    /// a loud share can clip, the voice under it cannot.
-    pub(super) fn mix(&self, mid: &mut [f32], side: &mut [f32], deafened: bool) {
-        side.fill(0.0);
+    /// Adds share sound to `speakers`, which hold voice alone, centred. Never waits. Deafened
+    /// consumes the sound without playing it, so the picture and the sound stay together. Share
+    /// sound only uses the room voice leaves: a loud share can clip, the voice under it cannot.
+    pub fn mix(&self, speakers: &mut [[f32; 2]], deafened: bool) {
         let Ok(mut ring) = self.ring.try_lock() else { return };
         let mut missing = 0u64;
-        for (voice, side) in mid.iter_mut().zip(side) {
+        for pair in speakers {
             let Ok([left, right]) = ring.pop() else {
                 missing += 1;
                 continue;
@@ -121,10 +136,11 @@ impl ShareBus {
             if deafened {
                 continue;
             }
+            let voice = pair[0];
             let room = 1.0 - voice.abs();
-            let added = (0.5 * (left + right)).clamp(-room, room);
-            *voice += added;
-            *side = (0.5 * (left - right)).clamp(-room, room);
+            let mid = voice + (0.5 * (left + right)).clamp(-room, room);
+            let side = (0.5 * (left - right)).clamp(-room, room);
+            *pair = [(mid + side).clamp(-1.0, 1.0), (mid - side).clamp(-1.0, 1.0)];
         }
         if missing > 0 && self.active() {
             self.counters.ring_underruns.fetch_add(missing, Ordering::Relaxed);
@@ -143,7 +159,8 @@ impl Drop for Stop {
 /// Native playout of every watched share. It outlives voice runs: a reconnect replaces the
 /// pipeline reading [`ShareBus`], not the streams.
 pub struct SharePlayout {
-    input: SyncSender<Input>,
+    input: SyncSender<(ShareFrame, Instant)>,
+    controls: Arc<Controls>,
     bus: Arc<ShareBus>,
     counters: Arc<Counters>,
     gain: Arc<[AtomicU32; SCREEN_SLOTS]>,
@@ -152,15 +169,27 @@ pub struct SharePlayout {
 
 impl SharePlayout {
     pub fn new() -> Result<Self> {
+        let (playout, worker) = Self::parts();
+        // Deliberately not promoted: voice's realtime thread is the one that must not lose time.
+        thread::Builder::new().name("gwar-share-sound".into()).spawn(move || worker.run())?;
+        Ok(playout)
+    }
+
+    fn parts() -> (Self, Worker) {
         let (input, inbox) = sync_channel(INPUT_QUEUE);
         let (tx, rx) = RingBuffer::new(RING_CAPACITY);
         let counters = Arc::<Counters>::default();
         let bus =
             Arc::new(ShareBus { ring: Mutex::new(rx), active: AtomicBool::new(false), counters: counters.clone() });
         let gain = Arc::new(std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())));
+        let controls = Arc::new(Controls {
+            slots: Mutex::new((0..SCREEN_SLOTS).map(|_| SlotControl::default()).collect()),
+            changed: AtomicBool::new(false),
+        });
         let stop = Arc::new(AtomicBool::new(false));
         let worker = Worker {
             inbox,
+            controls: controls.clone(),
             ring: tx,
             streams: (0..SCREEN_SLOTS).map(|_| None).collect(),
             bus: bus.clone(),
@@ -169,44 +198,72 @@ impl SharePlayout {
             stop: stop.clone(),
             block: vec![[0.0; 2]; RING_TARGET],
         };
-        // Deliberately not promoted: voice's realtime thread is the one that must not lose time.
-        thread::Builder::new().name("gwar-share-sound".into()).spawn(move || worker.run())?;
-        Ok(Self { input, bus, counters, gain, _stop: Stop(stop) })
+        (Self { input, controls, bus, counters, gain, _stop: Stop(stop) }, worker)
     }
 
     pub fn bus(&self) -> Arc<ShareBus> {
         self.bus.clone()
     }
 
-    /// Prepares a slot for `run`'s frames; a newer run forgets the older run's decoder and queue.
-    pub fn open(&self, slot: usize, run: u64) {
-        if slot < SCREEN_SLOTS {
-            self.send(Input::Open { slot, run });
+    /// Prepares a slot for `run`'s frames at volume `gain`. True once it is in force, also when it
+    /// already was; false when a newer run has this slot, or there is no decoder to give it. A
+    /// newer run forgets the older run's decoder and queue.
+    pub fn open(&self, slot: usize, run: u64, gain: f32) -> bool {
+        if slot >= SCREEN_SLOTS {
+            return false;
         }
+        let mut slots = self.controls.lock();
+        let control = &mut slots[slot];
+        if run < control.run {
+            return false;
+        }
+        if run > control.run || !control.open {
+            let Ok(stream) = Stream::new(run) else { return false };
+            *control = SlotControl { run, open: true, replacement: Some(stream) };
+            self.controls.changed.store(true, Ordering::Release);
+        }
+        self.store_gain(slot, gain);
+        true
     }
 
-    pub fn close(&self, slot: usize) {
-        if slot < SCREEN_SLOTS {
-            self.send(Input::Close { slot });
+    /// Ends `run`'s use of a slot. False, and nothing changes, when a newer run has it.
+    pub fn close(&self, slot: usize, run: u64) -> bool {
+        if slot >= SCREEN_SLOTS {
+            return false;
         }
+        let mut slots = self.controls.lock();
+        let control = &mut slots[slot];
+        if run < control.run {
+            return false;
+        }
+        *control = SlotControl { run, open: false, replacement: None };
+        self.controls.changed.store(true, Ordering::Release);
+        true
     }
 
-    /// Volume of one slot, 0 to 1; muting is 0.
-    pub fn set_gain(&self, slot: usize, gain: f32) {
-        if let Some(value) = self.gain.get(slot) {
-            let gain = if gain.is_finite() { gain.clamp(0.0, 1.0) } else { 0.0 };
-            value.store(gain.to_bits(), Ordering::Relaxed);
+    /// Volume of one slot, 0 to 1; muting is 0. False, and nothing changes, when a newer run has it.
+    pub fn set_gain(&self, slot: usize, run: u64, gain: f32) -> bool {
+        if slot >= SCREEN_SLOTS {
+            return false;
         }
+        let mut slots = self.controls.lock();
+        if run < slots[slot].run {
+            return false;
+        }
+        slots[slot].run = run;
+        self.store_gain(slot, gain);
+        true
+    }
+
+    fn store_gain(&self, slot: usize, gain: f32) {
+        let gain = if gain.is_finite() { gain.clamp(0.0, 1.0) } else { 0.0 };
+        self.gain[slot].store(gain.to_bits(), Ordering::Relaxed);
     }
 
     /// Never blocks; a full queue costs share sound, not the caller.
     pub fn push(&self, frame: ShareFrame) {
         self.counters.frames.fetch_add(1, Ordering::Relaxed);
-        self.send(Input::Frame(frame, Instant::now()));
-    }
-
-    fn send(&self, input: Input) {
-        if let Err(TrySendError::Full(_)) = self.input.try_send(input) {
+        if let Err(TrySendError::Full(_)) = self.input.try_send((frame, Instant::now())) {
             self.counters.input_drops.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -418,7 +475,8 @@ impl Stream {
 }
 
 struct Worker {
-    inbox: Receiver<Input>,
+    inbox: Receiver<(ShareFrame, Instant)>,
+    controls: Arc<Controls>,
     ring: Producer<[f32; 2]>,
     streams: Vec<Option<Stream>>,
     bus: Arc<ShareBus>,
@@ -432,10 +490,10 @@ impl Worker {
     fn run(mut self) {
         while !self.stop.load(Ordering::Relaxed) {
             match self.inbox.recv_timeout(Duration::from_millis(5)) {
-                Ok(input) => {
-                    self.handle(input);
-                    while let Ok(input) = self.inbox.try_recv() {
-                        self.handle(input);
+                Ok((frame, arrived)) => {
+                    self.receive(frame, arrived);
+                    while let Ok((frame, arrived)) = self.inbox.try_recv() {
+                        self.receive(frame, arrived);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -445,36 +503,41 @@ impl Worker {
         }
     }
 
-    fn handle(&mut self, input: Input) {
-        match input {
-            Input::Open { slot, run } => {
-                if self.streams[slot].as_ref().is_none_or(|stream| run > stream.run)
-                    && let Ok(stream) = Stream::new(run)
-                {
-                    self.streams[slot] = Some(stream);
-                }
-            }
-            Input::Close { slot } => self.streams[slot] = None,
-            Input::Frame(frame, arrived) => {
-                let Some(stream) = self.streams.get_mut(frame.slot).and_then(Option::as_mut) else { return };
-                let duration = opus_samples(&frame.opus).map_or(0, |samples| samples as usize);
-                if stream.run != frame.run
-                    || frame.opus.len() > MAX_OPUS_BYTES
-                    || duration == 0
-                    || duration > MAX_PACKET_SAMPLES
-                    || stream.jitter.queue.len() >= MAX_QUEUED
-                    || !stream.jitter.push(Queued { rtp_time: frame.rtp_time, opus: frame.opus }, arrived)
-                {
-                    self.counters.late_drops.fetch_add(1, Ordering::Relaxed);
-                }
+    /// Takes up what the webview has commanded since the last look. A frame queued after a
+    /// command returned always finds it applied.
+    fn apply_controls(&mut self) {
+        if !self.controls.changed.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        for (control, stream) in self.controls.lock().iter_mut().zip(&mut self.streams) {
+            if let Some(replacement) = control.replacement.take() {
+                *stream = Some(replacement);
+            } else if !control.open {
+                *stream = None;
             }
         }
         self.bus.active.store(self.streams.iter().any(Option::is_some), Ordering::Relaxed);
     }
 
+    fn receive(&mut self, frame: ShareFrame, arrived: Instant) {
+        self.apply_controls();
+        let Some(stream) = self.streams.get_mut(frame.slot).and_then(Option::as_mut) else { return };
+        let duration = opus_samples(&frame.opus).map_or(0, |samples| samples as usize);
+        if stream.run != frame.run
+            || frame.opus.len() > MAX_OPUS_BYTES
+            || duration == 0
+            || duration > MAX_PACKET_SAMPLES
+            || stream.jitter.queue.len() >= MAX_QUEUED
+            || !stream.jitter.push(Queued { rtp_time: frame.rtp_time, opus: frame.opus }, arrived)
+        {
+            self.counters.late_drops.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Tops the ring up to its target. Silence is also written, so one quiet or stalled stream
     /// cannot hold the others back; an idle engine writes nothing.
     fn produce(&mut self) {
+        self.apply_controls();
         if !self.bus.active() {
             return;
         }

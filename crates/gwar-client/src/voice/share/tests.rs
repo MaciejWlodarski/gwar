@@ -1,4 +1,4 @@
-use std::{sync::mpsc::sync_channel, thread::sleep};
+use std::thread::sleep;
 
 use audiopus::{Application, Bitrate, Channels, SampleRate, coder::Encoder};
 
@@ -40,35 +40,22 @@ fn tone(samples: &[f32], hz: f32) -> f32 {
 }
 
 /// A worker without its thread: the test drives it, so timing is exact.
-fn worker() -> (Worker, Arc<ShareBus>, SyncSender<Input>) {
-    let (input, inbox) = sync_channel(INPUT_QUEUE);
-    let (ring, rx) = RingBuffer::new(RING_CAPACITY);
-    let counters = Arc::<Counters>::default();
-    let bus = Arc::new(ShareBus { ring: Mutex::new(rx), active: AtomicBool::new(false), counters: counters.clone() });
-    let worker = Worker {
-        inbox,
-        ring,
-        streams: (0..SCREEN_SLOTS).map(|_| None).collect(),
-        bus: bus.clone(),
-        counters,
-        gain: Arc::new(std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits()))),
-        stop: Arc::new(AtomicBool::new(false)),
-        block: vec![[0.0; 2]; RING_TARGET],
-    };
-    (worker, bus, input)
+fn worker() -> (Worker, Arc<ShareBus>, SharePlayout) {
+    let (playout, worker) = SharePlayout::parts();
+    (worker, playout.bus(), playout)
 }
 
-/// Plays `blocks` of 10 ms against the worker and returns mid and side.
+/// Plays `blocks` of 10 ms against the worker and returns the left and right speakers.
 fn drain(worker: &mut Worker, bus: &ShareBus, blocks: usize) -> (Vec<f32>, Vec<f32>) {
-    let (mut mid, mut side) = (Vec::new(), Vec::new());
+    let (mut left, mut right) = (Vec::new(), Vec::new());
     for _ in 0..blocks {
         worker.produce();
-        let (mut m, mut s) = ([0f32; 480], [0f32; 480]);
-        bus.mix(&mut m, &mut s, false);
-        mid.extend(m);
-        side.extend(s);
+        let mut speakers = [[0f32; 2]; 480];
+        bus.mix(&mut speakers, false);
+        left.extend(speakers.iter().map(|pair| pair[0]));
+        right.extend(speakers.iter().map(|pair| pair[1]));
     }
-    (mid, side)
+    (left, right)
 }
 
 fn feed(
@@ -84,75 +71,70 @@ fn feed(
         let position = n * FRAME as u64;
         let opus = packet(encoder, position, hz.0, hz.1);
         let arrived = at + Duration::from_millis(20 * (n - first));
-        worker.handle(Input::Frame(ShareFrame { slot, run, rtp_time: position as u32, opus }, arrived));
+        worker.receive(ShareFrame { slot, run, rtp_time: position as u32, opus }, arrived);
     }
 }
 
 #[test]
-fn stereo_survives_decoding_and_reaches_mid_and_side() {
-    let (mut worker, bus, _input) = worker();
+fn stereo_survives_decoding_and_reaches_each_speaker() {
+    let (mut worker, bus, playout) = worker();
     let mut encoder = encoder();
-    worker.handle(Input::Open { slot: 2, run: 7 });
-    let (mut mid, mut side) = (Vec::new(), Vec::new());
+    playout.open(2, 7, 1.0);
+    let (mut left, mut right) = (Vec::new(), Vec::new());
     for n in 0..40 {
         feed(&mut worker, &mut encoder, (2, 7), n, 1, (440.0, 1000.0), Instant::now());
-        let (m, s) = drain(&mut worker, &bus, 2);
-        mid.extend(m);
-        side.extend(s);
+        let (l, r) = drain(&mut worker, &bus, 2);
+        left.extend(l);
+        right.extend(r);
     }
-    let settled = 8000..mid.len();
-    let (mid, side) = (&mid[settled.clone()], &side[settled]);
-    // L = M + S, R = M - S: 440 Hz only on the left, 1 kHz only on the right.
-    let left: Vec<f32> = mid.iter().zip(side).map(|(m, s)| m + s).collect();
-    let right: Vec<f32> = mid.iter().zip(side).map(|(m, s)| m - s).collect();
-    assert!(tone(&left, 440.0) > 0.2, "left {}", tone(&left, 440.0));
-    assert!(tone(&right, 1000.0) > 0.2, "right {}", tone(&right, 1000.0));
-    assert!(tone(&left, 1000.0) < 0.04 && tone(&right, 440.0) < 0.04);
+    // 440 Hz only on the left, 1 kHz only on the right.
+    let (left, right) = (&left[8000..], &right[8000..]);
+    assert!(tone(left, 440.0) > 0.2, "left {}", tone(left, 440.0));
+    assert!(tone(right, 1000.0) > 0.2, "right {}", tone(right, 1000.0));
+    assert!(tone(left, 1000.0) < 0.04 && tone(right, 440.0) < 0.04);
 }
 
 #[test]
 fn the_voice_pipeline_never_sees_a_share_that_is_not_there() {
-    let (mut worker, bus, _input) = worker();
+    let (mut worker, bus, _playout) = worker();
     assert!(!bus.active());
     worker.produce();
     assert_eq!(worker.ring.buffer().capacity(), worker.ring.slots(), "an idle engine writes nothing");
-    let mut voice = [0.25f32; 480];
-    let mut side = [1f32; 480];
-    bus.mix(&mut voice, &mut side, false);
-    assert_eq!(voice, [0.25; 480], "voice unchanged");
-    assert_eq!(side, [0.0; 480]);
+    let mut speakers = [[0.25f32; 2]; 480];
+    bus.mix(&mut speakers, false);
+    assert_eq!(speakers, [[0.25; 2]; 480], "voice unchanged");
     assert_eq!(bus.counters.ring_underruns.load(Ordering::Relaxed), 0);
 }
 
 #[test]
 fn a_loud_share_clips_itself_never_the_voice_under_it() {
-    let (mut worker, bus, _input) = worker();
+    let (mut worker, bus, _playout) = worker();
     bus.active.store(true, Ordering::Relaxed);
     let _ = worker.ring.push([1.0, 1.0]);
     let _ = worker.ring.push([-1.0, 1.0]);
-    let mut voice = [0.9f32, -0.9];
-    let mut side = [0f32; 2];
-    bus.mix(&mut voice, &mut side, false);
-    assert_eq!(voice[0], 1.0);
-    assert!((voice[1] + 0.9).abs() < 1e-6, "mid is zero here");
-    assert!(side[1].abs() <= 0.1 + 1e-6);
+    let mut speakers = [[0.9f32; 2], [-0.9; 2]];
+    bus.mix(&mut speakers, false);
+    assert_eq!(speakers[0], [1.0, 1.0], "the share fills what voice leaves");
+    let centre = 0.5 * (speakers[1][0] + speakers[1][1]);
+    assert!((centre + 0.9).abs() < 1e-6, "the voice stays where it was: {centre}");
+    assert!((speakers[1][0] - speakers[1][1]).abs() <= 0.2 + 1e-6, "{:?}", speakers[1]);
     let _ = worker.ring.push([1.0, 1.0]);
-    let mut voice = [0.5f32];
-    bus.mix(&mut voice, &mut [0.0], true);
-    assert_eq!(voice[0], 0.5, "deafen plays no share sound");
+    let mut speakers = [[0.5f32; 2]];
+    bus.mix(&mut speakers, true);
+    assert_eq!(speakers[0], [0.5, 0.5], "deafen plays no share sound");
     assert_eq!(worker.ring.buffer().capacity(), worker.ring.slots(), "and still consumes it");
 }
 
 #[test]
 fn a_held_mix_lock_costs_the_pipeline_nothing() {
-    let (_worker, bus, _input) = worker();
+    let (_worker, bus, _playout) = worker();
     bus.active.store(true, Ordering::Relaxed);
     let _held = bus.ring.lock().unwrap();
-    let mut voice = [0.5f32; 480];
+    let mut speakers = [[0.5f32; 2]; 480];
     let started = Instant::now();
-    bus.mix(&mut voice, &mut [0.0; 480], false);
+    bus.mix(&mut speakers, false);
     assert!(started.elapsed() < Duration::from_millis(5), "the pipeline waited");
-    assert_eq!(voice, [0.5; 480]);
+    assert_eq!(speakers, [[0.5; 2]; 480]);
 }
 
 #[test]
@@ -196,9 +178,9 @@ fn delay_stays_in_its_bounds_and_follows_late_arrivals() {
 
 #[test]
 fn a_lost_packet_is_concealed_and_a_stopped_stream_goes_quiet() {
-    let (mut worker, bus, _input) = worker();
+    let (mut worker, bus, playout) = worker();
     let mut encoder = encoder();
-    worker.handle(Input::Open { slot: 0, run: 1 });
+    playout.open(0, 1, 1.0);
     let at = Instant::now();
     feed(&mut worker, &mut encoder, (0, 1), 0, 20, (440.0, 440.0), at);
     feed(&mut worker, &mut encoder, (0, 1), 21, 20, (440.0, 440.0), at);
@@ -212,9 +194,9 @@ fn a_lost_packet_is_concealed_and_a_stopped_stream_goes_quiet() {
 
 #[test]
 fn a_stall_backlog_is_dropped_not_replayed() {
-    let (mut worker, bus, _input) = worker();
+    let (mut worker, bus, playout) = worker();
     let mut encoder = encoder();
-    worker.handle(Input::Open { slot: 0, run: 1 });
+    playout.open(0, 1, 1.0);
     feed(&mut worker, &mut encoder, (0, 1), 0, 3, (440.0, 440.0), Instant::now());
     drain(&mut worker, &bus, 4);
     feed(&mut worker, &mut encoder, (0, 1), 3, 25, (440.0, 440.0), Instant::now());
@@ -226,44 +208,113 @@ fn a_stall_backlog_is_dropped_not_replayed() {
 
 #[test]
 fn the_queue_is_bounded_and_malformed_frames_are_refused() {
-    let (mut worker, _bus, _input) = worker();
-    worker.handle(Input::Open { slot: 0, run: 1 });
+    let (mut worker, _bus, playout) = worker();
+    playout.open(0, 1, 1.0);
     let mut encoder = encoder();
     feed(&mut worker, &mut encoder, (0, 1), 0, 40, (440.0, 440.0), Instant::now());
     assert_eq!(worker.streams[0].as_ref().unwrap().jitter.queue.len(), MAX_QUEUED);
     assert_eq!(worker.counters.late_drops.load(Ordering::Relaxed), 8);
     let before = worker.counters.late_drops.load(Ordering::Relaxed);
     for opus in [vec![], vec![0u8; 1276], vec![0xff]] {
-        worker.handle(Input::Frame(ShareFrame { slot: 0, run: 1, rtp_time: 1, opus }, Instant::now()));
+        worker.receive(ShareFrame { slot: 0, run: 1, rtp_time: 1, opus }, Instant::now());
     }
     assert_eq!(worker.counters.late_drops.load(Ordering::Relaxed), before + 3);
-    worker.handle(Input::Frame(ShareFrame { slot: 9, run: 1, rtp_time: 1, opus: vec![] }, Instant::now()));
+    worker.receive(ShareFrame { slot: 9, run: 1, rtp_time: 1, opus: vec![] }, Instant::now());
 }
 
 #[test]
 fn a_newer_run_fences_frames_of_the_previous_share_on_that_slot() {
-    let (mut worker, _bus, _input) = worker();
+    let (mut worker, _bus, playout) = worker();
     let mut encoder = encoder();
-    worker.handle(Input::Open { slot: 1, run: 5 });
+    playout.open(1, 5, 1.0);
     feed(&mut worker, &mut encoder, (1, 5), 0, 4, (440.0, 440.0), Instant::now());
-    worker.handle(Input::Open { slot: 1, run: 6 });
+    assert!(playout.open(1, 6, 1.0));
+    worker.apply_controls();
     assert!(worker.streams[1].as_ref().unwrap().jitter.queue.is_empty(), "the old queue is gone");
     feed(&mut worker, &mut encoder, (1, 5), 4, 2, (440.0, 440.0), Instant::now());
     assert!(worker.streams[1].as_ref().unwrap().jitter.queue.is_empty(), "a delayed old frame is dropped");
-    worker.handle(Input::Open { slot: 1, run: 5 });
+    assert!(!playout.open(1, 5, 1.0), "an older run is told it lost");
+    worker.apply_controls();
     assert_eq!(worker.streams[1].as_ref().unwrap().run, 6, "an older run cannot come back");
-    worker.handle(Input::Close { slot: 1 });
+    assert!(playout.close(1, 6));
+    worker.apply_controls();
     assert!(worker.streams[1].is_none());
     assert!(!worker.bus.active());
 }
 
 #[test]
+fn a_full_frame_queue_cannot_lose_a_replacement() {
+    let (mut worker, bus, playout) = worker();
+    assert!(playout.open(0, 1, 1.0));
+    worker.apply_controls();
+    let mut encoder = encoder();
+    for n in 0..INPUT_QUEUE as u64 + 8 {
+        let opus = packet(&mut encoder, n, 440.0, 440.0);
+        playout.push(ShareFrame { slot: 0, run: 1, rtp_time: n as u32 * FRAME as u32, opus });
+    }
+    assert!(playout.stats().input_drops > 0, "the queue really was full");
+    assert!(playout.open(0, 2, 1.0), "the replacement is in force");
+    while let Ok((frame, arrived)) = worker.inbox.try_recv() {
+        worker.receive(frame, arrived);
+    }
+    assert_eq!(worker.streams[0].as_ref().map(|stream| stream.run), Some(2));
+    assert!(worker.streams[0].as_ref().unwrap().jitter.queue.is_empty(), "the old run's backlog stays out");
+    assert!(playout.close(0, 2));
+    for n in 0..INPUT_QUEUE as u64 + 8 {
+        playout.push(ShareFrame { slot: 0, run: 2, rtp_time: n as u32, opus: vec![0xfc, 0xff, 0xfe] });
+    }
+    worker.produce();
+    assert!(!bus.active(), "a close is not lost either");
+}
+
+#[test]
+fn a_late_command_of_an_old_run_cannot_touch_its_replacement() {
+    let (mut worker, _bus, playout) = worker();
+    assert!(playout.open(1, 5, 0.25));
+    assert!(playout.open(1, 6, 0.75));
+    worker.apply_controls();
+    assert!(!playout.close(1, 5), "the old receiver's close comes after its replacement opened");
+    assert!(!playout.set_gain(1, 5, 0.0), "and so does its volume");
+    worker.apply_controls();
+    assert_eq!(worker.streams[1].as_ref().map(|stream| stream.run), Some(6), "the new run keeps playing");
+    assert_eq!(f32::from_bits(worker.gain[1].load(Ordering::Relaxed)), 0.75);
+}
+
+#[test]
+fn a_closed_slot_still_remembers_the_run_that_closed_it() {
+    let (mut worker, _bus, playout) = worker();
+    assert!(playout.open(1, 6, 1.0));
+    assert!(playout.close(1, 6));
+    assert!(!playout.open(1, 5, 1.0), "an open from before the close stays out");
+    assert!(!playout.set_gain(1, 5, 0.0));
+    worker.apply_controls();
+    assert!(worker.streams[1].is_none());
+    assert!(playout.open(1, 6, 1.0), "the same run may watch the slot again");
+    worker.apply_controls();
+    assert_eq!(worker.streams[1].as_ref().map(|stream| stream.run), Some(6));
+    assert!(!playout.open(SCREEN_SLOTS, 7, 1.0) && !playout.close(SCREEN_SLOTS, 7));
+    assert!(!playout.set_gain(SCREEN_SLOTS, 7, 1.0));
+}
+
+#[test]
+fn opening_a_slot_twice_keeps_its_stream() {
+    let (mut worker, _bus, playout) = worker();
+    let mut encoder = encoder();
+    assert!(playout.open(0, 1, 1.0));
+    feed(&mut worker, &mut encoder, (0, 1), 0, 4, (440.0, 440.0), Instant::now());
+    assert!(playout.open(0, 1, 0.5), "already in force");
+    worker.apply_controls();
+    assert_eq!(worker.streams[0].as_ref().unwrap().jitter.queue.len(), 4);
+    assert_eq!(f32::from_bits(worker.gain[0].load(Ordering::Relaxed)), 0.5);
+}
+
+#[test]
 fn volume_mute_and_two_shares_mix_independently() {
-    let (mut worker, bus, _input) = worker();
+    let (mut worker, bus, playout) = worker();
     let mut one = encoder();
     let mut two = encoder();
-    worker.handle(Input::Open { slot: 0, run: 1 });
-    worker.handle(Input::Open { slot: 3, run: 1 });
+    playout.open(0, 1, 1.0);
+    playout.open(3, 1, 1.0);
     worker.gain[0].store(0.5f32.to_bits(), Ordering::Relaxed);
     worker.gain[3].store(0.0f32.to_bits(), Ordering::Relaxed);
     let mut mid = Vec::new();
@@ -279,9 +330,9 @@ fn volume_mute_and_two_shares_mix_independently() {
 
 #[test]
 fn clock_drift_is_absorbed_without_dropping_packets() {
-    let (mut worker, bus, _input) = worker();
+    let (mut worker, bus, playout) = worker();
     let mut encoder = encoder();
-    worker.handle(Input::Open { slot: 0, run: 1 });
+    playout.open(0, 1, 1.0);
     let start = Instant::now();
     let mut n = 0;
     for round in 0..3000u64 {
@@ -301,9 +352,8 @@ fn clock_drift_is_absorbed_without_dropping_packets() {
 fn the_thread_serves_a_real_stream_and_drops_rather_than_blocks() {
     let playout = SharePlayout::new().unwrap();
     let mut encoder = encoder();
-    playout.open(0, 1);
-    playout.set_gain(0, f32::NAN);
-    playout.set_gain(0, 1.0);
+    assert!(playout.open(0, 1, f32::NAN));
+    assert!(playout.set_gain(0, 1, 1.0));
     let started = Instant::now();
     for n in 0..20_000u64 {
         let position = n * FRAME as u64;

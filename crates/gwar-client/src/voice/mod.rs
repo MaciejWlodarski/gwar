@@ -102,7 +102,7 @@ impl MicrophoneProcessor {
         self.denoiser.process(samples, noise, continuous);
         raw
     }
-    fn render(&mut self, samples: &[f32]) {
+    fn render(&mut self, samples: &[[f32; 2]]) {
         self.processing.render(samples);
     }
 }
@@ -735,7 +735,7 @@ fn pipeline<const CAPTURE: usize>(
     controls: Arc<Controls>,
     counters: Arc<Counters>,
     mut mic: rtrb::Consumer<CaptureSample>,
-    mut speaker: rtrb::Producer<f32>,
+    mut speaker: rtrb::Producer<[f32; 2]>,
     output: Arc<OutputTiming>,
     out: mpsc::Sender<Outgoing>,
     incoming: std::sync::mpsc::Receiver<Incoming>,
@@ -752,9 +752,7 @@ fn pipeline<const CAPTURE: usize>(
     let mut gate = gate::InputGate::default();
     let mut speaker_buffer = SpeakerBuffer::new(Instant::now());
     let mut cues: Vec<(std::vec::IntoIter<f32>, bool)> = Vec::with_capacity(2);
-    // Taken once: the device's difference signal stays in step with `speaker` from the first sample.
-    let mut side = output.side.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut side_mix = vec![0f32; FRAME];
+    let mut speakers = vec![[0f32; 2]; FRAME];
     let mut share_bus = None;
 
     while !controls.stop.load(Ordering::Relaxed) {
@@ -872,19 +870,16 @@ fn pipeline<const CAPTURE: usize>(
                 let cue: f32 = cues.iter_mut().map(|(pcm, _)| pcm.next().unwrap_or(0.0)).sum();
                 *s = (*s * master + cue).clamp(-1.0, 1.0);
             }
-            // Ahead of the echo reference: what the speakers play is what the canceller must know.
-            side_mix[..take].fill(0.0);
+            for (pair, &s) in speakers[..take].iter_mut().zip(&mix[..take]) {
+                *pair = [s; 2];
+            }
             if let Some(bus) = share_bus.as_ref().filter(|bus| bus.active()) {
-                bus.mix(&mut mix[..take], &mut side_mix[..take], deafened);
+                bus.mix(&mut speakers[..take], deafened);
             }
-            processing.render(&mix[..take]);
-            for &s in &mix[..take] {
-                let _ = speaker.push(s);
-            }
-            if let Some(side) = &mut side {
-                for &s in &side_mix[..take] {
-                    let _ = side.push(s);
-                }
+            // The final channels, clipping included: the canceller must know what the room hears.
+            processing.render(&speakers[..take]);
+            for &pair in &speakers[..take] {
+                let _ = speaker.push(pair);
             }
             needed -= take;
         }
@@ -949,8 +944,9 @@ mod codec_tests {
         let mut played = Vec::new();
         let deadline = Instant::now() + Duration::from_secs(5);
         while played.len() < expected.len() && Instant::now() < deadline {
-            while let Ok(sample) = heard.pop() {
-                played.push(sample);
+            while let Ok([left, right]) = heard.pop() {
+                assert_eq!(left, right, "voice and cues are centred");
+                played.push(left);
             }
             timing.wake();
             thread::sleep(Duration::from_millis(1));
@@ -963,9 +959,10 @@ mod codec_tests {
         assert!(outgoing.try_recv().is_err(), "local cue entered the outgoing microphone path");
     }
 
-    #[test]
-    fn share_sound_reaches_the_speaker_and_the_echo_reference_with_voice_unchanged() {
-        // A viewer on speakers: the microphone hears only what the speaker plays.
+    /// A viewer on speakers: the microphone hears only the left speaker, a block later and 6 dB
+    /// down. Each of `shares` plays `stereo` of a time in seconds. Returns the power of what the
+    /// left speaker played and the level left at the microphone's output, in dBFS.
+    fn echo_of_share(shares: usize, stereo: fn(f32) -> [f32; 2], seconds: u64) -> (f32, f32) {
         let playout = share::SharePlayout::new().unwrap();
         let controls = Arc::new(Controls::default());
         *controls.share.lock().unwrap() = Some(playout.bus());
@@ -979,42 +976,35 @@ mod codec_tests {
         let worker = thread::spawn(move || pipeline::<FRAME>(c, Arc::default(), mic, speaker, t, out, incoming));
         let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
         encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
-        playout.open(0, 1);
+        for slot in 0..shares {
+            assert!(playout.open(slot, 1, 1.0));
+        }
         let mut rendered = Vec::new();
         let mut packet = vec![0; 1275];
         let start = Instant::now();
-        let seconds = 6;
-        for block in 0..seconds * 100u64 {
+        for block in 0..seconds * 100 {
             if block % 2 == 0 {
                 let position = block * 480;
-                let pcm: Vec<f32> = (0..960u64)
-                    .flat_map(|i| {
-                        let v = 0.25
-                            * (std::f32::consts::TAU * 330.0 * (position + i) as f32 / 48_000.0).sin()
-                            * (1.0 + 0.5 * (std::f32::consts::TAU * 3.0 * (position + i) as f32 / 48_000.0).sin());
-                        [v, v]
-                    })
-                    .collect();
+                let pcm: Vec<f32> = (0..960u64).flat_map(|i| stereo((position + i) as f32 / 48_000.0)).collect();
                 let n = encoder.encode_float(&pcm, &mut packet).unwrap();
-                playout.push(share::ShareFrame {
-                    slot: 0,
-                    run: 1,
-                    rtp_time: position as u32,
-                    opus: packet[..n].to_vec(),
-                });
+                for slot in 0..shares {
+                    playout.push(share::ShareFrame {
+                        slot,
+                        run: 1,
+                        rtp_time: position as u32,
+                        opus: packet[..n].to_vec(),
+                    });
+                }
             }
             let target = start + Duration::from_millis(10 * (block + 1));
             thread::sleep(target.saturating_duration_since(Instant::now()));
             let mut played = Vec::with_capacity(FRAME);
             while played.len() < FRAME {
                 match heard.pop() {
-                    Ok(sample) => played.push(sample),
-                    Err(_) => {
-                        played.resize(FRAME, 0.0);
-                    }
+                    Ok([left, _]) => played.push(left),
+                    Err(_) => played.resize(FRAME, 0.0),
                 }
             }
-            // The microphone hears the room: the speaker, a block later and 6 dB down.
             let at = Instant::now();
             let previous = rendered.len().saturating_sub(FRAME);
             let echo: Vec<f32> = rendered[previous..].iter().map(|s: &f32| s * 0.5).collect();
@@ -1028,11 +1018,46 @@ mod codec_tests {
         }
         let level = f32::from_bits(controls.input_level.load(Ordering::Relaxed));
         let played = rendered[rendered.len() - 48_000..].iter().map(|s| s * s).sum::<f32>() / 48_000.0;
-        assert!(played > 0.005, "the speaker played the share: {played}");
-        assert!(level < -35.0, "the echo canceller knows the share: {level:.1} dBFS at the microphone's output");
         controls.stop.store(true, Ordering::Relaxed);
         output.wake();
         worker.join().unwrap().unwrap();
+        (played, level)
+    }
+
+    /// Music-like: a tone with a slow swell, so the canceller has something changing to follow.
+    fn music(time: f32, hz: f32) -> f32 {
+        0.25 * (std::f32::consts::TAU * hz * time).sin() * (1.0 + 0.5 * (std::f32::consts::TAU * 3.0 * time).sin())
+    }
+
+    #[test]
+    fn share_sound_reaches_the_speaker_and_the_echo_reference_with_voice_unchanged() {
+        let (played, level) = echo_of_share(1, |time: f32| [music(time, 330.0); 2], 6);
+        assert!(played > 0.005, "the speaker played the share: {played}");
+        assert!(level < -35.0, "the echo canceller knows the share: {level:.1} dBFS at the microphone's output");
+    }
+
+    #[test]
+    fn opposite_speakers_are_in_the_echo_reference_too() {
+        // Nothing here survives a mix to mono: a reference of the middle alone would be silence.
+        let opposite = |time: f32| {
+            let value = music(time, 330.0);
+            [value, -value]
+        };
+        let (played, level) = echo_of_share(1, opposite, 8);
+        assert!(played > 0.005, "the speaker played the share: {played}");
+        assert!(level < -35.0, "the echo canceller knows both speakers: {level:.1} dBFS at the microphone's output");
+    }
+
+    #[test]
+    fn a_clipping_share_is_in_the_echo_reference_as_it_is_played() {
+        // Three shares add up past full scale on the left: the room hears flat tops.
+        let loud = |time: f32| {
+            let value = 2.8 * music(time, 330.0);
+            [value, 0.1 * value]
+        };
+        let (played, level) = echo_of_share(3, loud, 8);
+        assert!(played > 0.3, "the left speaker clipped: {played}");
+        assert!(level < -30.0, "the echo canceller follows the clipping: {level:.1} dBFS");
     }
 
     /// One arm of the paired load run: the time from a microphone block to its encoded frame,
@@ -1052,7 +1077,7 @@ mod codec_tests {
         let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Stereo, Application::Audio).unwrap();
         encoder.set_bitrate(Bitrate::BitsPerSecond(64_000)).unwrap();
         for slot in 0..shares {
-            playout.open(slot, 1);
+            assert!(playout.open(slot, 1, 1.0));
         }
         let mut packet = vec![0; 1275];
         let (mut latency, mut missing) = (Vec::new(), 0u64);

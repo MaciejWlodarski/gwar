@@ -2630,7 +2630,7 @@ impl gwar_client::voice::io::AudioIo for ToneIo {
                 }
                 let missing = 480usize.saturating_sub(speaker_rx.slots());
                 let mut out = heard.lock().unwrap();
-                out.extend((0..480).map(|_| speaker_rx.pop().unwrap_or(0.0)));
+                out.extend((0..480).map(|_| speaker_rx.pop().map_or(0.0, |[left, _]| left)));
                 drop(out);
                 timing.report(480, missing);
                 std::thread::sleep(std::time::Duration::from_millis(10));
