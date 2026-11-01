@@ -149,7 +149,7 @@ function devicePatch(frequency) {
     }
     return connect.apply(this, args);
   };
-  const media = navigator.mediaDevices;
+  const media = MediaDevices.prototype;
   media.getUserMedia = async () => {
     const context = new AudioContext();
     window.__microphones.push(context);

@@ -3,13 +3,14 @@ import assert from "node:assert/strict";
 import { installMicPrivacyGuard } from "./mic-privacy.mjs";
 
 test("privacy guard rejects hidden requests, overlap, and delayed release on every exit", async () => {
-  const original = { window: globalThis.window, document: globalThis.document, navigator: Object.getOwnPropertyDescriptor(globalThis, "navigator") };
+  const original = { window: globalThis.window, document: globalThis.document, MediaDevices: globalThis.MediaDevices, navigator: Object.getOwnPropertyDescriptor(globalThis, "navigator") };
   try {
     globalThis.window = { addEventListener() {} };
     globalThis.document = { addEventListener() {} };
     const track = () => ({ readyState: "live", stop() { this.readyState = "ended"; } });
     let resolve;
-    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { mediaDevices: { getUserMedia: () => new Promise(yes => { resolve = () => { const t = track(); yes({ getTracks: () => [t] }); }; }) } } });
+    globalThis.MediaDevices = class { getUserMedia() { return new Promise(yes => { resolve = () => { const t = track(); yes({ getTracks: () => [t] }); }; }); } };
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { mediaDevices: new MediaDevices() } });
     const base = { section: "settings", tab: "audio", mode: "vad", muted: false, deafened: false, visible: true, idle: true };
     let state = { ...base }, changed;
     installMicPrivacyGuard({ read: () => state, subscribe: fn => { changed = fn; } });
@@ -33,7 +34,29 @@ test("privacy guard rejects hidden requests, overlap, and delayed release on eve
       capture.getTracks()[0].stop();
     }
   } finally {
-    globalThis.window = original.window; globalThis.document = original.document;
+    globalThis.window = original.window; globalThis.document = original.document; globalThis.MediaDevices = original.MediaDevices;
+    if (original.navigator) Object.defineProperty(globalThis, "navigator", original.navigator); else delete globalThis.navigator;
+  }
+});
+
+test("a double on the prototype reaches the page, set before or after the guard", async () => {
+  const original = { window: globalThis.window, document: globalThis.document, MediaDevices: globalThis.MediaDevices, navigator: Object.getOwnPropertyDescriptor(globalThis, "navigator") };
+  const state = { section: "server", tab: "general", mode: "vad", muted: false, deafened: false, visible: true, idle: false };
+  const install = () => installMicPrivacyGuard({ read: () => state, subscribe() {} });
+  const denied = async () => { throw new DOMException("Permission denied", "NotAllowedError"); };
+  try {
+    globalThis.window = { addEventListener() {} };
+    globalThis.document = { addEventListener() {} };
+    globalThis.MediaDevices = class { async getUserMedia() { return { getTracks: () => [] }; } };
+    Object.defineProperty(globalThis, "navigator", { configurable: true, value: { mediaDevices: new MediaDevices() } });
+    install();
+    MediaDevices.prototype.getUserMedia = denied;
+    await assert.rejects(navigator.mediaDevices.getUserMedia(), { name: "NotAllowedError" });
+    install();
+    await assert.rejects(navigator.mediaDevices.getUserMedia(), { name: "NotAllowedError" });
+    assert.equal(window.__gum, 1);
+  } finally {
+    globalThis.window = original.window; globalThis.document = original.document; globalThis.MediaDevices = original.MediaDevices;
     if (original.navigator) Object.defineProperty(globalThis, "navigator", original.navigator); else delete globalThis.navigator;
   }
 });

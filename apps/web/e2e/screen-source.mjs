@@ -60,7 +60,9 @@ export function readBarcode(video) {
  */
 export function canvasCapture(sources, stamp) {
   let next = 0;
-  navigator.mediaDevices.getDisplayMedia = async () => {
+  // On the prototype, as every fake here: WebKit collects the `navigator.mediaDevices` wrapper, and
+  // what was set on it, once nothing in script holds it. The app then gets WebKit's mock devices.
+  MediaDevices.prototype.getDisplayMedia = async () => {
     const { id, size, fps = 20 } = sources[Math.min(next++, sources.length - 1)];
     const canvas = document.createElement("canvas");
     [canvas.width, canvas.height] = size;

@@ -1256,7 +1256,7 @@ async function main() {
     const ctx = await newCtx({ permissions: [] });
     // What a real browser does when the user clicks "Block".
     await ctx.addInitScript(() => {
-      navigator.mediaDevices.getUserMedia = () => Promise.reject(new DOMException("Permission denied", "NotAllowedError"));
+      MediaDevices.prototype.getUserMedia = () => Promise.reject(new DOMException("Permission denied", "NotAllowedError"));
     });
     const e = await ctx.newPage();
     await e.goto(WEB_URL);

@@ -116,7 +116,7 @@ function devicePatch({ frequency, sources, sendCodec, receiveCodec, trace }, sta
       return kind === "video" && caps ? { ...caps, codecs: caps.codecs.filter(c => ["video/rtx", `video/${selected}`].includes(c.mimeType.toLowerCase())) } : caps;
     };
   }
-  const media = navigator.mediaDevices;
+  const media = MediaDevices.prototype;
   media.getUserMedia = async () => {
     const context = new AudioContext();
     const oscillator = context.createOscillator();
@@ -514,7 +514,7 @@ async function reconnectAndScreenshots(cs, cv, viewers, chromiumTab) {
     await sleep(6_500);
     await captureNotice("reconnect-stopped");
     await cs.evaluate(() => {
-      navigator.mediaDevices.getDisplayMedia = async () => { throw new DOMException("Permission denied by system", "NotAllowedError"); };
+      MediaDevices.prototype.getDisplayMedia = async () => { throw new DOMException("Permission denied by system", "NotAllowedError"); };
     });
     await session(cs, (_, __, controller) => controller.screen.beginShare());
     await cs.getByTestId("screen-notice").getByRole("button", { name: "Jak włączyć", exact: true }).waitFor();

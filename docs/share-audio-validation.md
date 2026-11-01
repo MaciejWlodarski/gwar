@@ -600,6 +600,12 @@ remote track, decode, ring or output (`whereSoundStopped`). Forced failures read
 suspended context as `sender` in both browsers, a muted track as `remote track`, and another
 frequency as `output`.
 
+The natural failure then read `sender: its audio context is missing`: the page never reached the
+test's fake microphone. WebKit collects the `navigator.mediaDevices` wrapper once nothing in script
+holds it, and anything set on the wrapper goes with it, so a garbage collection between the init
+script and the first capture hands the app WebKit's mock devices. The e2e fakes now sit on
+`MediaDevices.prototype`.
+
 `browser-private` also failed once, on `7f391279`, at `the member joins` in `private.mjs`, before
 any share. This PR does not touch that path. It did not recur in eleven local runs, ten of them
 under load, or in any CI attempt since. Its cause is not known. A timeout there now prints each

@@ -96,7 +96,7 @@ function devicePatch({ frequency, sources }, stamp, read, capture) {
       return pc;
     },
   });
-  const media = navigator.mediaDevices;
+  const media = MediaDevices.prototype;
   media.getUserMedia = async () => {
     const context = new AudioContext();
     const oscillator = context.createOscillator();
