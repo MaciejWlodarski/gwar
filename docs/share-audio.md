@@ -290,7 +290,9 @@ worker → share_playback_frames (raw batch, one in flight, 400 frames at most)
   canceller being turned off. Whatever it has found before then counts for nothing. It takes over
   only having heard every frame up to the one it takes over at, and it gets a quarter of a second
   to catch up: a later one is refused and the second way follows, voice on the mono canceller
-  throughout.
+  throughout. Once in charge it still knows it learned one room: at a new device, however late the
+  news comes, the worker trains another for 3 s of sound, and that one replaces it in a single
+  frame.
 
   A reconnect starts over, so with a share already playing it takes the second way
   (see [validation](share-audio-validation.md#warm-stereo-canceller)). Vendored Sonora adds the one option

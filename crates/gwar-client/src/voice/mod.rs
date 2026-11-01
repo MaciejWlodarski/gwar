@@ -1140,6 +1140,17 @@ mod codec_tests {
     /// second before the shares, as if the far side had been talking alone. Also how many frames
     /// voice sent in each second.
     fn voice_pipeline_under_load(shares: usize, lead: u64, echo: bool, seconds: u64) -> (Vec<Duration>, u64, Vec<u32>) {
+        voice_pipeline_told(shares, lead, echo, seconds, None)
+    }
+
+    /// As [`voice_pipeline_under_load`], with the devices changing at second `moved`.
+    fn voice_pipeline_told(
+        shares: usize,
+        lead: u64,
+        echo: bool,
+        seconds: u64,
+        moved: Option<u64>,
+    ) -> (Vec<Duration>, u64, Vec<u32>) {
         let playout = share::SharePlayout::new().unwrap();
         let controls = Arc::new(Controls::default());
         *controls.share.lock().unwrap() = Some(playout.bus());
@@ -1179,6 +1190,9 @@ mod codec_tests {
         let start = Instant::now();
         for block in 0..seconds * 100 {
             let position = block * FRAME as u64;
+            if moved.is_some_and(|second| block == second * 100) {
+                output.route_changes.fetch_add(1, Ordering::Relaxed);
+            }
             if block % 2 == 0 && shares > 0 && block >= lead * 100 {
                 let pcm: Vec<f32> = (0..960u64)
                     .flat_map(|i| {
@@ -1259,6 +1273,25 @@ mod codec_tests {
             let at = |p: f64| latency[((latency.len() - 1) as f64 * p) as usize].as_secs_f64() * 1000.0;
             println!(
                 "lead {lead} echo {echo} p99 {:.3} max {:.3} missing {missing} sent {} by second {sent:?}",
+                at(0.99),
+                at(1.0),
+                latency.len()
+            );
+        }
+    }
+
+    /// Run by hand in release: a warmed session with four shares, the devices changing 4 s after
+    /// they start or not at all, on the real pipeline. Nothing runs but the frames of the voice
+    /// thread and the worker: the worst of them is what a replacement costs here.
+    #[test]
+    #[ignore = "a measurement in real time, not a unit test"]
+    fn a_late_new_device_stays_on_time() {
+        for round in 0..6 {
+            let moved = (round % 2 == 0).then_some(14);
+            let (latency, missing, sent) = voice_pipeline_told(4, 10, true, 22, moved);
+            let at = |p: f64| latency[((latency.len() - 1) as f64 * p) as usize].as_secs_f64() * 1000.0;
+            println!(
+                "moved {moved:?} p99 {:.3} max {:.3} missing {missing} sent {} by second {sent:?}",
                 at(0.99),
                 at(1.0),
                 latency.len()

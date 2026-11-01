@@ -849,12 +849,13 @@ test says.
   and the default the operating system moved by itself, whether it says so to the stream or it only
   shows as another endpoint id, under the same name or not. If that happens beside the mono canceller,
   the warmed one goes back to the worker and a new one learns.
-- A new device seen right after the take-over. The route is read right before each capture, so it can
-  still change just after that, in the capture that promotes the warmed canceller. So the mono
-  canceller goes on hearing everything until the next capture. If the route changed by then, voice
-  crossfades back to it and a new one learns: from there out is to the bit what the mono canceller
-  makes alone, with no click (`a_new_device_seen_right_after_the_take_over_goes_back_without_a_click`).
-  After that capture a new device leaves the stereo canceller alone, as on `origin/main`.
+- A new device after the take-over, however late the news comes. The canceller in charge knows it
+  came from the worker, for the rest of the session, so no window decides. The worker trains another
+  on the frames from the notice on, for as long as one learns beside the mono canceller, and it comes
+  in as one frame like any other: the voice thread only copies frames meanwhile. Until then voice
+  stays on the old one, because a new canceller holds a voice down hard for its first 2.5 s and the
+  mono one has not heard the frames since the take-over. See the table below. A stereo canceller
+  that did not warm stays on a new device, as on `origin/main`.
 - A frame lost to a full ring breaks it, because the other side goes on without it. A worker stopped
   for 640 ms and back between render and capture read −31 dBFS after the pin in review; now the session
   starts over on the mono canceller, −71.4 dBFS in that quarter second against −70.4 unbroken, and
@@ -869,6 +870,52 @@ test says.
 - Rests need no evening out. They may cut more of one side than the other: 8 frames at each rest
   changes less than 1 dB right after one (`rests_need_not_cut_speakers_and_microphone_evenly`),
   since what follows goes on in the order it happened and the echo's tail has run out.
+
+A late new device, `what_a_late_new_device_costs`: a warmed session in charge on speakers, then
+headphones or another room, and the notice 7 s in. "Cold" is a session that never warmed.
+
+| Voice kept on headphones, seconds after the notice | 0–3 | 3–5 | 5–8 | 8–16 |
+| --- | --- | --- | --- | --- |
+| Replaced | 0.63 | 0.93 | 0.98 | 0.97 |
+| Not told | 0.63 | 0.53 | 0.88 | 0.87 |
+| Cold | 0.74 | 0.79 | 0.86 | 0.85 |
+
+| Echo in a new room, dBFS by second | 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Replaced | −44.8 | −59.3 | −76.9 | −64.5 | −65.0 | −68.9 | −73.0 | −76.7 | −77.6 |
+| Not told | −44.8 | −59.3 | −76.9 | −76.7 | −76.3 | −76.2 | −76.3 | −76.3 | −76.9 |
+| Cold | −46.8 | −76.9 | −58.7 | −60.4 | −64.1 | −53.0 | −60.3 | −73.1 | −73.8 |
+
+So voice pays 0.11 below cold for the first 3 s, on a canceller that is about to go, and then does
+better than either. In a room with an echo the new canceller gives back up to 12 dB for 4 s against
+keeping the old one, which is the price of not knowing which kind of room it is.
+
+The frames on the voice thread, 12 sessions a run, four runs of the same build, with another worker's
+browser tests on the machine, so the worst frames are the machine's as much as this code's. One of
+the four was noisier than the rest, and its worst frames stand apart here:
+
+| Frame | Median | Worst, three runs | Worst, the noisy run | Heap visits, most |
+| --- | --- | --- | --- | --- |
+| Mono, as on `origin/main` | 74–96 µs | 255–498 µs | 4.60 ms | 102 |
+| Learning beside the mono one, as on `origin/main` | 139–204 µs | 636–891 µs | 17.2 ms | 178 |
+| Stereo in charge | 76–95 µs | 227–343 µs | 1.46 ms | 98 |
+| Stereo while the replacement learns | 84–103 µs | 240–481 µs | 2.49 ms | 98 |
+| The swap | 95–128 µs | 131–168 µs | 189 µs | 98 |
+| The replacement in charge | 81–98 µs | 213–290 µs | 509 µs | 99 |
+
+Every heap visit there is Sonora's own, in one pass: no frame on this path adds a second one
+(`replacing_a_warmed_canceller_adds_nothing_to_the_heap_on_the_voice_thread`). A young canceller
+goes to the heap once more at most, below what mono does on `origin/main`.
+
+The real pipeline over a late notice, `a_late_new_device_stays_on_time`, four shares and the canceller
+on for 22 s, the notice at second 14 of every other round, alternating with `origin/main`, 12 rounds
+each. On `origin/main` the notice changes nothing, so its rounds are a measure of the machine.
+
+| | `origin/main`, notice ignored | This branch, no notice | This branch, notice |
+| --- | --- | --- | --- |
+| p99 | 0.29–2.62 ms | 0.32–2.01 ms | 0.27–1.14 ms |
+| Max | 0.33–7.71 ms | 0.38–7.59 ms | 0.31–4.65 ms |
+| Speakers short | 480 once | never | 480 once |
 
 **Cost.** The worker's canceller per 10 ms frame, `warming_cost`, on this Mac's M5:
 
@@ -891,17 +938,19 @@ of learning at best, which is what this removes, for a cost this small.
 
 Timing, in release, alternating with `origin/main`:
 `low_bandwidth_bursts_preserve_voice_with_and_without_video` is unchanged, 9.048–9.288 ms at 1 Mb/s.
-`a_busy_voice_session_stays_on_time`, the speakers busy and the worker at work, 12 arms of it here
-beside 9 on `origin/main`: p99 0.28–0.75 ms there and 0.11–1.13 ms here, with no limit on it. Four
-arms here reach 1.03–1.13 ms, about 0.15 ms above `origin/main`'s highest mode in any run so far. Max is
-7.3 ms there and 7.2 ms here. Speakers fell short 480 samples twice in those arms here, and in none
-on `origin/main`. On slow cores, from before the echo check, 0.58–0.97 ms and 0.65–0.99 ms. The
-battery figures are also from before that check, which adds one read to each frame on the worker.
+`a_busy_voice_session_stays_on_time`, the speakers busy and the worker at work, 6 arms each, alternating:
+p99 0.28–1.28 ms on `origin/main` and 0.30–1.10 ms here, with no limit on it. So the high mode that an
+earlier round saw only here, 1.03–1.13 ms in 4 of 12 arms, is on `origin/main` too, 2 of 6 arms now. Max
+is 7.8 ms here and 6.0 ms there. Speakers fell short 480 samples in two arms on `origin/main` and in
+none here this time, and in two here and none there in the earlier round, so it follows neither.
+On slow cores, from before the echo check, 0.58–0.97 ms and 0.65–0.99 ms. The battery figures are
+also from before that check, which adds one read to each frame on the worker.
 `four_shares_leave_the_voice_pipeline_on_time`, two runs of 6 pairs each, alternating: the same
-modes on both, p99 0.26–1.09 ms here and 0.30–1.57 ms on `origin/main`. All 24 pairs kept sending. The
-1.0 ms delta limit held in all 12 pairs here, worst +0.839 ms, and failed one run on `origin/main`,
-+1.312 ms. It compares two modes that do not depend on this code. The worker does not run in those
-arms: nothing plays before the shares start.
+modes on both, p99 with shares 0.31–0.69 ms here and 0.26–1.31 ms on `origin/main`. All 24 pairs kept
+sending. The 1.0 ms delta limit held in all 12 pairs here, worst +0.411 ms, and failed one run on
+`origin/main`, +1.071 ms, as it did in the earlier round, +1.312 ms. It compares two modes that do not
+depend on this code. The worker does not run in those arms: nothing plays before the shares start.
+All of this ran beside another worker's browser tests.
 
 Not done: a reconnect with a share already playing still goes the cold way, and so does a session
 where nobody has been heard alone. Headphones in a jack the system does not show as another device

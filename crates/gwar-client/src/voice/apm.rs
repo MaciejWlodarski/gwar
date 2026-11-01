@@ -56,6 +56,8 @@ const HANDOVER_FRAMES: usize = 5;
 const ECHO_FOUND: f64 = 12.0;
 /// Frames the warming canceller may fall behind, render and capture counted apart: 640 ms.
 const WARMING_RING: usize = 128;
+/// Samples over which a replacement joins what its predecessor last put out: 2.5 ms.
+const SPLICE: usize = 120;
 /// How many times a warmed canceller may arrive behind before it is refused: a quarter of a second.
 /// It normally arrives caught up the first time.
 const HANDOVER_TRIES: usize = 50;
@@ -146,7 +148,6 @@ enum Heard {
 /// A stereo canceller trained on everything the voice session hears, with no output anyone uses.
 struct Warming {
     stage: Box<Stage>,
-    heard: Consumer<(u32, Heard)>,
     /// Frames of sound it has learned from, for [`Processing::collect_stereo`].
     sound: Arc<AtomicUsize>,
     /// Whether it ever reached [`ECHO_FOUND`].
@@ -156,11 +157,16 @@ struct Warming {
 }
 
 impl Warming {
+    fn new(sound: &Arc<AtomicUsize>, history: u32) -> Self {
+        sound.store(0, Ordering::Relaxed);
+        Self { stage: Box::new(Stage::stereo()), sound: sound.clone(), found_echo: false, history }
+    }
+
     /// Everything waiting in the ring. A frame from a later stretch starts it all over, here on the
     /// worker: nothing learned before a break says anything about what comes after it.
-    fn catch_up(&mut self) {
+    fn catch_up(&mut self, ring: &mut Consumer<(u32, Heard)>) {
         let (mut left, mut right, mut near) = ([0f32; FRAME], [0f32; FRAME], [0f32; FRAME]);
-        while let Ok((history, heard)) = self.heard.pop() {
+        while let Ok((history, heard)) = ring.pop() {
             if history != self.history {
                 self.history = history;
                 *self.stage = Stage::stereo();
@@ -191,6 +197,11 @@ enum Returned {
     Behind(Warming),
     /// It will not do: a new one comes the way one always did.
     Refused(Box<Stage>),
+    /// The one in charge learned another room. A new one is to hear `sound` frames of sound from
+    /// stretch `history` on, here, and is offered then.
+    Replace { sound: usize, history: u32 },
+    /// The one just replaced, to be freed here.
+    Retired(#[allow(dead_code)] Box<Stage>),
 }
 
 /// Waits through a voice session, in case share sound plays, and provides the stereo canceller
@@ -203,6 +214,7 @@ struct StereoWorker {
     thread: Thread,
     order: Arc<AtomicU8>,
     built: Receiver<Box<Stage>>,
+    /// A canceller on offer, with the ring still on the worker's side.
     warmed: Consumer<Warming>,
     returned: Producer<Returned>,
     feed: Producer<(u32, Heard)>,
@@ -222,7 +234,8 @@ impl StereoWorker {
         let (send, built) = sync_channel(1);
         let (feed, heard) = RingBuffer::new(WARMING_RING);
         let (mut offer, warmed) = RingBuffer::new(1);
-        let (returned, mut back) = RingBuffer::new(1);
+        // A canceller retired, and a device right after it.
+        let (returned, mut back) = RingBuffer::new(2);
         let order = Arc::new(AtomicU8::new(WAIT));
         let sound = Arc::new(AtomicUsize::new(0));
         let told = order.clone();
@@ -232,25 +245,19 @@ impl StereoWorker {
         #[cfg(test)]
         let held = hold.clone();
         let work = move || {
-            let mut heard = Some(heard);
+            let mut heard = heard;
             let mut warming: Option<Warming> = None;
             loop {
                 #[cfg(test)]
                 stall(&held, HOLD_WORK);
                 let order = told.load(Ordering::Acquire);
                 if let Some(warming) = &mut warming {
-                    warming.catch_up();
+                    warming.catch_up(&mut heard);
                 }
                 match order {
                     WAIT => thread::park(),
-                    WARM => match heard.take() {
-                        Some(heard) => {
-                            let stage = Box::new(Stage::stereo());
-                            let sound = learned.clone();
-                            warming = Some(Warming { stage, heard, sound, found_echo: false, history: 0 });
-                        }
-                        None => thread::park(),
-                    },
+                    WARM if warming.is_some() => thread::park(),
+                    WARM => warming = Some(Warming::new(&learned, 0)),
                     BUILD => match warming.take() {
                         Some(warmed) if warmed.found_echo => {
                             #[cfg(test)]
@@ -264,7 +271,19 @@ impl StereoWorker {
                                     drop(stage);
                                     return;
                                 }
-                                None => return,
+                                Some(Returned::Replace { sound, history }) => {
+                                    return replace_when_told(
+                                        (sound, history),
+                                        &mut heard,
+                                        &mut offer,
+                                        &mut back,
+                                        &told,
+                                        &learned,
+                                        #[cfg(test)]
+                                        &held,
+                                    );
+                                }
+                                _ => return,
                             }
                         }
                         warmed => {
@@ -300,6 +319,44 @@ impl StereoWorker {
     fn tell(&self, order: u8) {
         self.order.store(order, Ordering::Release);
         self.thread.unpark();
+    }
+}
+
+/// What is left of the worker once a warmed canceller is in charge: each time the voice thread says
+/// that canceller's room is gone, one new canceller heard from there on, offered when it has heard
+/// as much as one that learned beside the mono canceller.
+fn replace_when_told(
+    (mut needed, history): (usize, u32),
+    ring: &mut Consumer<(u32, Heard)>,
+    offer: &mut Producer<Warming>,
+    back: &mut Consumer<Returned>,
+    told: &AtomicU8,
+    learned: &Arc<AtomicUsize>,
+    #[cfg(test)] held: &AtomicU8,
+) {
+    let mut learning = Some(Warming::new(learned, history));
+    loop {
+        if let Some(mut new) = learning.take() {
+            new.catch_up(ring);
+            if learned.load(Ordering::Relaxed) < needed {
+                learning = Some(new);
+            } else {
+                #[cfg(test)]
+                stall(held, HOLD_DELIVERY);
+                let _ = offer.push(new);
+            }
+        }
+        match back.pop() {
+            Ok(Returned::Behind(new)) => learning = Some(new),
+            Ok(Returned::Replace { sound, history }) => {
+                needed = sound;
+                learning = Some(Warming::new(learned, history));
+            }
+            // What is retired ends here.
+            Ok(_) => {}
+            Err(_) if told.load(Ordering::Acquire) == LEAVE => return,
+            Err(_) => thread::park(),
+        }
     }
 }
 
@@ -340,14 +397,6 @@ impl Drop for StereoWorker {
     }
 }
 
-/// From one canceller's frame to the other's: `frame` becomes `next` over its length.
-fn crossfade(frame: &mut [f32; FRAME], next: &[f32; FRAME]) {
-    for (index, (sample, next)) in frame.iter_mut().zip(next).enumerate() {
-        let phase = (index + 1) as f32 / FRAME as f32 * std::f32::consts::FRAC_PI_2;
-        *sample = *sample * phase.cos().powi(2) + next * phase.sin().powi(2);
-    }
-}
-
 pub(crate) struct Processing {
     echo: Stage,
     gain: Stage,
@@ -360,13 +409,13 @@ pub(crate) struct Processing {
     history: u32,
     /// Times a warmed canceller was offered behind.
     handover_tries: usize,
-    /// The canceller learning beside the mono one is the warmed one.
-    warmed_learning: bool,
-    /// The warmed canceller took over in the last capture, after the last look at the route, so
-    /// the mono one goes on hearing everything until the next.
-    stereo_on_trial: bool,
-    /// The route had changed by then: [`Processing::go_back`].
-    going_back: bool,
+    /// The stereo canceller, learning or in charge, comes from the worker: it knows one room.
+    warmed: bool,
+    /// That room is gone, and the worker is training what replaces the one in charge.
+    replacing: bool,
+    /// The replacement came in since the last frame out, which ended on `last_sample`.
+    spliced: bool,
+    last_sample: f32,
     /// Frames since the speakers last played anything, up to [`WARMING_TAIL`].
     silent_frames: usize,
     fed_frames: usize,
@@ -389,9 +438,10 @@ impl Processing {
             warming: false,
             history: 0,
             handover_tries: 0,
-            warmed_learning: false,
-            stereo_on_trial: false,
-            going_back: false,
+            warmed: false,
+            replacing: false,
+            spliced: false,
+            last_sample: 0.0,
             silent_frames: WARMING_TAIL,
             fed_frames: 0,
             render: [[0.0; FRAME]; 2],
@@ -410,8 +460,10 @@ impl Processing {
     pub(crate) fn configure(&mut self, echo: bool, gain: bool) {
         if !echo {
             self.take_over(None);
-            self.stereo_on_trial = false;
-            self.going_back = false;
+            // It starts from scratch when it is turned on again, so there is no room to outlive.
+            self.warmed = false;
+            self.warming &= !self.replacing;
+            self.replacing = false;
         }
         let stereo = matches!(self.channels, Channels::Stereo(_));
         if self.echo.set(echo, || canceller(stereo)) {
@@ -460,25 +512,36 @@ impl Processing {
 
     /// The microphone or the speakers are other devices now, so the room is another one: speakers
     /// that had an echo may be headphones that have none, which a canceller trained on the echo
-    /// would take the voice down for. As far as voice goes this one never warmed. The stereo
-    /// canceller already learning beside the mono one is replaced if it was warmed, and stays if
-    /// it was not: it is new, and goes on to learn this room like any other. Once it has taken over
-    /// and a capture has gone by it stays too, as a stereo canceller does on any change of device.
+    /// would take the voice down for. One rule, for as long as the session lasts, however late
+    /// the news comes: a stereo canceller that learned the old room on the worker goes. Beside the
+    /// mono one, where voice is not on it, it goes at once and the old path follows. In charge, it
+    /// stays until the worker has trained another on the new room, off this thread, for as long as
+    /// one learns beside the mono one. Nothing runs here for that but copying the frames: voice
+    /// stays stereo until the swap, a frame like any other. One that did not warm stays either
+    /// way: it learned here as it always did, and goes on to learn the new room.
     pub(crate) fn route_changed(&mut self) {
         self.break_history();
-        if self.stereo_on_trial {
-            self.going_back = true;
+        if !self.warmed {
             return;
         }
-        if !self.warmed_learning || !matches!(self.channels, Channels::Learning(..)) {
-            return;
+        let Some(worker) = &mut self.stereo else { return };
+        match self.channels {
+            Channels::Learning(..) => {
+                let Channels::Learning(stage, _) = std::mem::replace(&mut self.channels, Channels::Building) else {
+                    return;
+                };
+                self.warmed = false;
+                let _ = worker.returned.push(Returned::Refused(stage));
+            }
+            Channels::Stereo(_) if !self.replacing => {
+                self.replacing = true;
+                self.warming = true;
+                let (sound, history) = (self.learning_frames, self.history);
+                let _ = worker.returned.push(Returned::Replace { sound, history });
+            }
+            _ => return,
         }
-        let Channels::Learning(stage, _) = std::mem::replace(&mut self.channels, Channels::Building) else { return };
-        self.warmed_learning = false;
-        if let Some(worker) = &mut self.stereo {
-            let _ = worker.returned.push(Returned::Refused(stage));
-            worker.thread.unpark();
-        }
+        worker.thread.unpark();
     }
 
     /// Share sound is playing here: from now until this voice session ends the canceller is
@@ -509,28 +572,35 @@ impl Processing {
         }
     }
 
-    /// Takes the warmed canceller if it has heard every frame so far, before the next one is given
-    /// to anybody: then it goes on from the frame after with nothing missing, whatever kept it, and
-    /// however far behind that frame the echo comes back. Feeding only stops here for that reason.
-    /// It goes back if the ring holds more, and is refused if it never catches up or its history
-    /// was broken. Refused, voice stays on the mono canceller, which it never left, while a new
-    /// stereo one comes and learns: the way a session that never warmed goes.
+    /// Takes the canceller the worker offers if it has heard every frame so far, before the next
+    /// one is given to anybody: then it goes on from the frame after with nothing missing, whatever
+    /// kept it, and however far behind that frame the echo comes back. Feeding only stops here for
+    /// that reason. It goes back if the ring holds more. A warmed canceller is refused if it never
+    /// catches up or its history was broken: voice stays on the mono canceller, which it never left,
+    /// while a new stereo one comes and learns, the way a session that never warmed goes. A
+    /// replacement goes back as well, since the worker starts it over at a break by itself.
     fn collect_warmed(&mut self) {
-        if !self.warming || !matches!(self.channels, Channels::Building) {
+        if !self.warming || !(self.replacing || matches!(self.channels, Channels::Building)) {
             return;
         }
         let Some(worker) = &mut self.stereo else { return };
         let Ok(warmed) = worker.warmed.pop() else { return };
         let unbroken = warmed.history == self.history;
-        if unbroken && warmed.heard.is_empty() {
-            let left_to_hear = self.learning_frames.saturating_sub(warmed.sound.load(Ordering::Relaxed));
-            let left_to_hear = left_to_hear.max(HANDOVER_FRAMES.min(self.learning_frames));
-            self.channels = Channels::Learning(warmed.stage, left_to_hear);
+        let returned = if unbroken && worker.feed.slots() == WARMING_RING {
             self.warming = false;
-            self.warmed_learning = true;
-            return;
-        }
-        let returned = if unbroken && self.handover_tries < HANDOVER_TRIES {
+            if !self.replacing {
+                let left_to_hear = self.learning_frames.saturating_sub(warmed.sound.load(Ordering::Relaxed));
+                let left_to_hear = left_to_hear.max(HANDOVER_FRAMES.min(self.learning_frames));
+                self.channels = Channels::Learning(warmed.stage, left_to_hear);
+                self.warmed = true;
+                return;
+            }
+            self.replacing = false;
+            self.spliced = true;
+            let mut retired = warmed.stage;
+            std::mem::swap(&mut self.echo, &mut *retired);
+            Returned::Retired(retired)
+        } else if self.replacing || (unbroken && self.handover_tries < HANDOVER_TRIES) {
             self.handover_tries += 1;
             Returned::Behind(warmed)
         } else {
@@ -564,31 +634,18 @@ impl Processing {
         }
     }
 
-    /// The route changed just as the warmed canceller took over, too late for anyone to see before
-    /// it did. The mono canceller has heard everything, so voice goes back to it through the same
-    /// crossfade, `frame` being what the warmed one just made of this one, and a new stereo one
-    /// comes and learns.
-    fn go_back(&mut self, frame: &mut [f32; FRAME]) {
-        self.stereo_on_trial = false;
-        self.going_back = false;
-        crossfade(frame, &self.learned);
-        let Channels::Stereo(mut stage) = std::mem::replace(&mut self.channels, Channels::Building) else { return };
-        std::mem::swap(&mut self.echo, &mut *stage);
-        if let Some(worker) = &mut self.stereo {
-            let _ = worker.returned.push(Returned::Refused(stage));
-            worker.thread.unpark();
-        }
-    }
-
     /// The stereo canceller replaces the mono one, at once if nothing is playing through it.
-    /// `fade` is the frame it has just processed; `self.learned` holds its output there.
-    fn take_over(&mut self, fade: Option<&mut [f32; FRAME]>) {
+    /// `crossfade` is the frame it has just processed; `self.learned` holds its output there.
+    fn take_over(&mut self, crossfade: Option<&mut [f32; FRAME]>) {
         if !matches!(self.channels, Channels::Learning(..)) {
             return;
         }
         let Channels::Learning(mut stage, _) = std::mem::replace(&mut self.channels, Channels::Refused) else { return };
-        if let Some(frame) = fade {
-            crossfade(frame, &self.learned);
+        if let Some(frame) = crossfade {
+            for (index, (sample, learned)) in frame.iter_mut().zip(&self.learned).enumerate() {
+                let phase = (index + 1) as f32 / FRAME as f32 * std::f32::consts::FRAC_PI_2;
+                *sample = *sample * phase.cos().powi(2) + learned * phase.sin().powi(2);
+            }
         }
         std::mem::swap(&mut self.echo, &mut *stage);
         self.channels = Channels::Stereo(stage);
@@ -627,14 +684,9 @@ impl Processing {
         if let Some(stage) = stereo {
             let _ = stage.apm.process_render_f32(&[left, right], &mut [&mut *left_out, &mut *right_out]);
         }
-        let mono = match &mut self.channels {
-            Channels::Stereo(mono) if self.stereo_on_trial => Some(&mut **mono),
-            Channels::Stereo(_) => None,
-            _ => Some(&mut self.echo),
-        };
-        if let Some(mono) = mono {
+        if !matches!(self.channels, Channels::Stereo(_)) {
             let mid: [f32; FRAME] = std::array::from_fn(|index| 0.5 * (left[index] + right[index]));
-            let _ = mono.apm.process_render_f32(&[&mid], &mut [left_out]);
+            let _ = self.echo.apm.process_render_f32(&[&mid], &mut [left_out]);
         }
         if self.warming_hears_speakers() {
             self.overhear(Heard::Speakers(self.render));
@@ -654,33 +706,33 @@ impl Processing {
             return;
         }
         self.collect_stereo();
-        // A capture has gone by since it took over, and the route was looked at before this one.
-        self.stereo_on_trial &= self.going_back;
         for frame in frames.as_chunks_mut::<FRAME>().0 {
             self.scratch.copy_from_slice(frame);
             if self.warming && self.silent_frames < WARMING_TAIL {
                 self.overhear(Heard::Microphone(self.scratch, delay_ms.min(500) as i32));
             }
             let mut learned = false;
-            match &mut self.channels {
-                Channels::Learning(stage, left) => {
-                    let _ = stage.apm.set_stream_delay_ms(delay_ms.min(500) as i32);
-                    let _ = stage.apm.process_capture_f32(&[&self.scratch], &mut [&mut self.learned]);
-                    learned = *left == 0;
-                }
-                Channels::Stereo(mono) if self.stereo_on_trial => {
-                    let _ = mono.apm.set_stream_delay_ms(delay_ms.min(500) as i32);
-                    let _ = mono.apm.process_capture_f32(&[&self.scratch], &mut [&mut self.learned]);
-                }
-                _ => {}
+            if let Channels::Learning(stage, left) = &mut self.channels {
+                let _ = stage.apm.set_stream_delay_ms(delay_ms.min(500) as i32);
+                let _ = stage.apm.process_capture_f32(&[&self.scratch], &mut [&mut self.learned]);
+                learned = *left == 0;
             }
             let _ = self.echo.apm.set_stream_delay_ms(delay_ms.min(500) as i32);
             let _ = self.echo.apm.process_capture_f32(&[&self.scratch], &mut [frame]);
             if learned {
                 self.take_over(Some(frame));
-                self.stereo_on_trial = std::mem::take(&mut self.warmed_learning);
-            } else if self.going_back {
-                self.go_back(frame);
+            }
+            if std::mem::take(&mut self.spliced) {
+                // Both cancellers pass a voice alike and neither has the other's output, so what
+                // is left to join is one step. It is taken out over the next few milliseconds.
+                let step = self.last_sample - frame[0];
+                for (index, sample) in frame[..SPLICE].iter_mut().enumerate() {
+                    let phase = index as f32 / SPLICE as f32 * std::f32::consts::FRAC_PI_2;
+                    *sample += step * phase.cos().powi(2);
+                }
+            }
+            if self.replacing {
+                self.last_sample = frame[FRAME - 1];
             }
         }
     }
@@ -1402,11 +1454,32 @@ mod tests {
     }
 
     impl Processing {
-        /// Waits until the worker has taken everything out of the ring.
+        /// Waits until the worker has taken everything out of the ring, or has offered a canceller
+        /// and is itself waiting for the voice thread, as it would for the next frame.
         fn caught_up(&self) {
             let worker = self.stereo.as_ref().unwrap();
-            while worker.feed.slots() < WARMING_RING {
+            while worker.feed.slots() < WARMING_RING && worker.warmed.is_empty() {
                 worker.thread.unpark();
+                thread::yield_now();
+            }
+        }
+
+        /// Waits as a voice thread does for its next frame, a long time for the worker: until the
+        /// ring is empty and, if a replacement has heard enough, it is on offer. These tests run
+        /// frames as fast as they can, so an offer can stand while the ring holds more, and go back
+        /// and come again for as long as a loaded machine keeps the worker slower than they are.
+        fn ready_for_the_next_frame(&mut self) {
+            loop {
+                self.caught_up();
+                let worker = self.stereo.as_ref().unwrap();
+                let (empty, offered) = (worker.feed.slots() == WARMING_RING, !worker.warmed.is_empty());
+                let due = self.replacing && worker.sound.load(Ordering::Relaxed) >= self.learning_frames;
+                if empty && (offered || !due) {
+                    return;
+                }
+                if !empty {
+                    self.collect_stereo();
+                }
                 thread::yield_now();
             }
         }
@@ -1590,59 +1663,9 @@ mod tests {
         assert!(change.abs() < 3.0, "voice jumped {change:.1} dB at the switch");
     }
 
-    /// Only heard of once the capture that promoted the warmed canceller is over: the route changed
-    /// after the last look at it. Voice goes back, and from there it is the mono canceller's own.
-    #[test]
-    fn a_new_device_seen_right_after_the_take_over_goes_back_without_a_click() {
-        let len = 12 * RATE;
-        let far = pairs(&voice(len, 120.0, -20.0));
-        let left = left_channel(&far);
-        let pin = 6 * RATE;
-        let near: Vec<f32> = room(&left, 60)
-            .iter()
-            .zip(voice(len, 200.0, -24.0))
-            .enumerate()
-            .map(|(index, (echo, voice))| echo + if index < 5 * RATE { 0.0 } else { voice })
-            .collect();
-        let alone = through(&mut session(LEARNING_FRAMES), &far, &near, None);
-
-        let mut processing = warmed_on_speakers(&far, &near, 6);
-        let mut out = alone[..pin].to_vec();
-        processing.pin_stereo();
-        processing.collected();
-        let mut at = pin;
-        while !processing.is_stereo() {
-            out.extend(tick(&mut processing, &far[at..at + FRAME], &near[at..at + FRAME]));
-            at += FRAME;
-        }
-        let promoted = at;
-        processing.route_changed();
-        out.extend(tick(&mut processing, &far[at..at + FRAME], &near[at..at + FRAME]));
-        at += FRAME;
-        assert!(!processing.is_stereo(), "the obsolete canceller stays in charge");
-        let back = at;
-        processing.collected();
-        assert_eq!(processing.left_to_hear(), Some(LEARNING_FRAMES), "a new one learns beside the mono one");
-        for _ in 0..200 {
-            out.extend(tick(&mut processing, &far[at..at + FRAME], &near[at..at + FRAME]));
-            at += FRAME;
-        }
-        assert!(
-            alone[back..at].iter().zip(&out[back..at]).all(|(a, b)| a.to_bits() == b.to_bits()),
-            "the mono canceller heard everything meanwhile"
-        );
-        let around = promoted - 4 * FRAME..back + 4 * FRAME;
-        let step = |signal: &[f32]| signal.windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0, f32::max);
-        assert!(step(&out[around.clone()]) <= step(&alone[RATE..pin]), "a click on the way back");
-        let change = db(&out[around.clone()]) - db(&alone[around]);
-        assert!(change.abs() < 3.0, "voice jumped {change:.1} dB on the way back");
-    }
-
-    #[test]
-    fn a_new_device_later_on_leaves_the_stereo_canceller_alone() {
-        let far = pairs(&voice(8 * RATE, 120.0, -20.0));
-        let echo = room(&left_channel(&far), 60);
-        let mut processing = warmed_on_speakers(&far, &echo, 6);
+    /// A session past the take-over on speakers, with the sample it got to.
+    fn past_the_take_over(far: &[[f32; 2]], echo: &[f32]) -> (Processing, usize) {
+        let mut processing = warmed_on_speakers(far, echo, 6);
         processing.pin_stereo();
         processing.collected();
         let mut at = 6 * RATE;
@@ -1650,12 +1673,137 @@ mod tests {
             tick(&mut processing, &far[at..at + FRAME], &echo[at..at + FRAME]);
             at += FRAME;
         }
-        // One whole capture has gone by since it took over with the route unchanged.
-        tick(&mut processing, &far[at..at + FRAME], &echo[at..at + FRAME]);
-        at += FRAME;
+        assert!(processing.warmed, "it took over warmed");
+        (processing, at)
+    }
+
+    /// A warmed session on speakers until sample `moved`, then on headphones. The notice of the
+    /// new device comes at sample `told`, if at all, and however long after `moved` that takes.
+    fn moved_to_headphones(moved: usize, told: Option<usize>, again: Option<usize>, len: usize) -> Vec<f32> {
+        let far = pairs(&voice(len, 120.0, -20.0));
+        let echo = room(&left_channel(&far), 60);
+        let said = voice(len, 200.0, -24.0);
+        let (mut processing, mut at) = past_the_take_over(&far, &echo);
+        let mut out = vec![0.0; at];
+        while at + FRAME <= len {
+            if told == Some(at) || again == Some(at) {
+                processing.route_changed();
+            }
+            let near = if at < moved { &echo } else { &said };
+            out.extend(tick(&mut processing, &far[at..at + FRAME], &near[at..at + FRAME]));
+            processing.ready_for_the_next_frame();
+            at += FRAME;
+        }
+        out
+    }
+
+    /// The first sample that came out differently because of the notice.
+    fn replaced_at(told: &[f32], untold: &[f32]) -> usize {
+        let frames = told.as_chunks::<FRAME>().0.iter().zip(untold.as_chunks::<FRAME>().0);
+        let differs = |(index, (told, untold)): (usize, (&[f32; FRAME], &[f32; FRAME]))| {
+            told.iter().zip(untold).any(|(a, b)| a.to_bits() != b.to_bits()).then_some(index * FRAME)
+        };
+        frames.enumerate().find_map(differs).expect("the warmed canceller stayed in charge")
+    }
+
+    /// However long after the take-over the notice comes, the canceller from the old room goes.
+    #[test]
+    fn a_new_device_any_time_after_the_take_over_replaces_the_warmed_canceller() {
+        let (len, moved) = (16 * RATE, 7 * RATE);
+        let untold = moved_to_headphones(moved, None, None, len);
+        for notice in [moved, moved + 100 * FRAME] {
+            let told = moved_to_headphones(moved, Some(notice), None, len);
+            let at = replaced_at(&told, &untold);
+            assert!(at >= notice + LEARNING_FRAMES * FRAME, "it learned the new room first: {at} after {notice}");
+            assert!(at <= notice + 2 * LEARNING_FRAMES * FRAME, "and took no longer: {at} after {notice}");
+        }
+    }
+
+    #[test]
+    fn the_replacement_comes_in_without_a_click() {
+        let (len, moved) = (14 * RATE, 7 * RATE);
+        let untold = moved_to_headphones(moved, None, None, len);
+        let told = moved_to_headphones(moved, Some(moved), None, len);
+        let at = replaced_at(&told, &untold);
+        let step = |signal: &[f32]| signal.windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0, f32::max);
+        let around = at - 4 * FRAME..at + 4 * FRAME;
+        assert!(step(&told[around]) <= step(&told[moved..at - 4 * FRAME]), "a click at the swap");
+    }
+
+    #[test]
+    fn another_new_device_while_one_is_learning_starts_it_over() {
+        let (len, moved) = (16 * RATE, 7 * RATE);
+        let again = moved + 100 * FRAME;
+        let untold = moved_to_headphones(moved, None, None, len);
+        let told = moved_to_headphones(moved, Some(moved), Some(again), len);
+        let at = replaced_at(&told, &untold);
+        assert!(at >= again + LEARNING_FRAMES * FRAME, "it heard the first of them only: {at}");
+    }
+
+    #[test]
+    fn a_stereo_canceller_that_never_warmed_stays_on_a_new_device() {
+        let far = pairs(&voice(6 * RATE, 120.0, -20.0));
+        let silent = vec![0.0; 6 * RATE];
+        let mut told = session(50);
+        let mut untold = session(50);
+        let one = through(&mut told, &far[..3 * RATE], &silent[..3 * RATE], Some(RATE));
+        assert_eq!(one, through(&mut untold, &far[..3 * RATE], &silent[..3 * RATE], Some(RATE)));
+        assert!(told.is_stereo());
+        told.route_changed();
+        let near = voice(3 * RATE, 200.0, -24.0);
+        let told = through(&mut told, &far[3 * RATE..], &near, None);
+        let untold = through(&mut untold, &far[3 * RATE..], &near, None);
+        assert!(told.iter().zip(&untold).all(|(a, b)| a.to_bits() == b.to_bits()), "as on main");
+    }
+
+    #[test]
+    fn a_replacement_on_offer_when_the_next_device_comes_starts_over() {
+        let len = 20 * RATE;
+        let far = pairs(&voice(len, 120.0, -20.0));
+        let echo = room(&left_channel(&far), 60);
+        let (mut processing, mut at) = past_the_take_over(&far, &echo);
+        processing.hold_worker(HOLD_DELIVERY);
+        processing.route_changed();
+        let held =
+            |processing: &Processing| processing.stereo.as_ref().unwrap().hold.load(Ordering::Acquire) & HELD != 0;
+        while !held(&processing) {
+            tick(&mut processing, &far[at..at + FRAME], &echo[at..at + FRAME]);
+            at += FRAME;
+            while !held(&processing) && processing.stereo.as_ref().unwrap().feed.slots() < WARMING_RING {
+                processing.stereo.as_ref().unwrap().thread.unpark();
+                thread::yield_now();
+            }
+        }
+        processing.route_changed();
+        processing.hold_worker(0);
+        while processing.stereo.as_ref().unwrap().warmed.is_empty() {
+            thread::yield_now();
+        }
+        processing.collect_stereo();
+        assert!(processing.replacing, "it learned the wrong room too");
+        let frames = 50;
+        for _ in 0..frames {
+            tick(&mut processing, &far[at..at + FRAME], &echo[at..at + FRAME]);
+            processing.caught_up();
+            at += FRAME;
+        }
+        assert!(processing.replacing && processing.sound_heard_warming() <= frames, "it starts over");
+    }
+
+    #[test]
+    fn turning_the_canceller_off_ends_a_replacement() {
+        let far = pairs(&voice(9 * RATE, 120.0, -20.0));
+        let echo = room(&left_channel(&far), 60);
+        let (mut processing, at) = past_the_take_over(&far, &echo);
         processing.route_changed();
         tick(&mut processing, &far[at..at + FRAME], &echo[at..at + FRAME]);
-        assert!(processing.is_stereo(), "as on main");
+        processing.configure(false, false);
+        let fed = processing.fed_frames;
+        assert_eq!(warm_through(&mut processing, &far[at..], &echo[at..], None), echo[at..], "off is off");
+        processing.configure(true, false);
+        warm_through(&mut processing, &far[at..], &echo[at..], None);
+        assert_eq!(processing.fed_frames, fed, "nothing is learning for it now");
+        assert!(processing.is_stereo());
     }
 
     #[test]
@@ -2093,6 +2241,42 @@ mod tests {
         assert!(warm.is_stereo());
     }
 
+    /// Heap trips of frames through a stereo canceller in charge, without a notice; and from a
+    /// notice through the swap, which is one pass like the frames around it.
+    #[test]
+    fn replacing_a_warmed_canceller_adds_nothing_to_the_heap_on_the_voice_thread() {
+        let far = pairs(&voice(11 * RATE, 120.0, -20.0));
+        let echo = room(&left_channel(&far), 60);
+        let frame = |processing: &mut Processing, at: usize| {
+            let (speakers, mut near) = (&far[at..at + FRAME], [0f32; FRAME]);
+            near.copy_from_slice(&echo[at..at + FRAME]);
+            heap::trips(|| {
+                processing.render(speakers);
+                processing.cancel_echo(&mut near, 20);
+            })
+        };
+        let (mut plain, start) = past_the_take_over(&far, &echo);
+        let mut at = start;
+        let mut worst = 0;
+        for _ in 0..400 {
+            worst = worst.max(frame(&mut plain, at));
+            at += FRAME;
+        }
+
+        let (mut told, start) = past_the_take_over(&far, &echo);
+        assert_eq!(heap::trips(|| told.route_changed()), 0, "the notice");
+        let mut at = start;
+        let mut replacing = 0;
+        while told.replacing {
+            replacing = replacing.max(frame(&mut told, at));
+            told.ready_for_the_next_frame();
+            at += FRAME;
+        }
+        // The frame after the swap too, which the new canceller is in charge of from the start.
+        replacing = replacing.max(frame(&mut told, at));
+        assert!(replacing <= worst, "the worst frame costs {replacing} trips against {worst} without a notice");
+    }
+
     #[test]
     fn a_refused_candidate_never_touches_the_heap_on_the_voice_thread() {
         let far = pairs(&voice(7 * RATE, 120.0, -20.0));
@@ -2120,31 +2304,6 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(learning.left_to_hear(), Some(LEARNING_FRAMES));
-
-        let mut back = warmed_on_speakers(&far, &echo, 6);
-        back.pin_stereo();
-        back.collected();
-        let mut at = 6 * RATE;
-        while !back.is_stereo() {
-            tick(&mut back, &far[at..at + FRAME], &echo[at..at + FRAME]);
-            at += FRAME;
-        }
-        assert_eq!(heap::trips(|| back.route_changed()), 0, "the late news");
-        let mut near = [0f32; FRAME];
-        near.copy_from_slice(&echo[at..at + FRAME]);
-        let cost = heap::trips(|| back.cancel_echo(&mut near, 20));
-        let mut mono = warmed_on_speakers(&far, &echo, 6);
-        mono.pin_stereo();
-        mono.collected();
-        let mut learning = 0;
-        for index in 0..3 {
-            let from = 6 * RATE + index * FRAME;
-            let mut near = [0f32; FRAME];
-            near.copy_from_slice(&echo[from..from + FRAME]);
-            mono.render(&far[from..from + FRAME]);
-            learning = learning.max(heap::trips(|| mono.cancel_echo(&mut near, 20)));
-        }
-        assert!(cost <= learning, "going back costs what two cancellers cost: {cost} against {learning}");
 
         let mut behind = warmed_on_speakers(&far, &echo, 6);
         behind.pin_stereo();
@@ -2453,6 +2612,127 @@ mod tests {
 
         eprintln!("on time: {:.1} dBFS", echo_after_a_late_candidate(0));
         eprintln!("100 ms late: {:.1} dBFS", echo_after_a_late_candidate(10));
+    }
+
+    /// A late new device, run in release. The share of a voice's frames kept on headphones, by
+    /// seconds after the notice; the echo in a new room; and what the frames on the voice thread
+    /// cost: Sonora's heap visits, and the time, beside the frames `origin/main` runs too.
+    #[test]
+    #[ignore = "a comparison, run in release"]
+    fn what_a_late_new_device_costs() {
+        let notice = 7 * RATE;
+        let total = 24 * RATE;
+        let windows = [(0usize, 3usize), (3, 5), (5, 8), (8, 16)];
+        let far = pairs(&long_voice(total, 150.0, -20.0));
+        let left = left_channel(&far);
+        let said: Vec<f32> = long_voice(total, 200.0, -24.0)
+            .iter()
+            .enumerate()
+            .map(|(index, sample)| if (index / (2 * RATE)).is_multiple_of(2) { 0.0 } else { *sample })
+            .collect();
+        let speakers = room(&left, 60);
+        let moved = room(&left, 120);
+        let moved: Vec<f32> = moved.iter().map(|echo| 0.7 * echo).collect();
+        let arm = |told: bool, near: &[f32]| {
+            let (mut processing, mut at) = past_the_take_over(&far, &speakers);
+            let mut out = vec![0.0; at];
+            while at + FRAME <= total {
+                if told && at / FRAME == notice / FRAME {
+                    processing.route_changed();
+                }
+                let near = if at < notice { &speakers } else { near };
+                out.extend(tick(&mut processing, &far[at..at + FRAME], &near[at..at + FRAME]));
+                processing.ready_for_the_next_frame();
+                at += FRAME;
+            }
+            out
+        };
+        let cold = |near: &[f32]| {
+            let pinned: Vec<f32> = (0..total).map(|i| if i < notice { speakers[i] } else { near[i] }).collect();
+            through(&mut session(LEARNING_FRAMES), &far, &pinned, Some(6 * RATE))
+        };
+        let kept = |out: &[f32], from: usize, to: usize| {
+            let range = notice + from * RATE..notice + to * RATE;
+            let frames = out[range.clone()].as_chunks::<FRAME>().0.iter().zip(said[range].as_chunks::<FRAME>().0);
+            let (mut speaking, mut kept) = (0.0f32, 0.0f32);
+            for (out, said) in frames.filter(|(_, said)| db(&said[..]) > -40.0) {
+                speaking += 1.0;
+                kept += f32::from(u8::from(db(&out[..]) > db(&said[..]) - 10.0));
+            }
+            kept / speaking
+        };
+        for (name, out) in [("told", arm(true, &said)), ("untold", arm(false, &said)), ("cold", cold(&said))] {
+            let cells: Vec<String> = windows.iter().map(|(a, b)| format!("{:.2}", kept(&out, *a, *b))).collect();
+            eprintln!("headphones {name}: kept {}", cells.join(" "));
+        }
+        for (name, out) in [("told", arm(true, &moved)), ("untold", arm(false, &moved)), ("cold", cold(&moved))] {
+            let by_second: Vec<String> = (0..9)
+                .map(|second| format!("{:.1}", db(&out[notice + second * RATE..notice + (second + 1) * RATE])))
+                .collect();
+            eprintln!("new room {name}: echo {}", by_second.join(" "));
+        }
+
+        let timed = |processing: &mut Processing, at: usize| {
+            let (speakers_now, mut near) = (&far[at..at + FRAME], [0f32; FRAME]);
+            near.copy_from_slice(&speakers[at..at + FRAME]);
+            let start = std::time::Instant::now();
+            let trips = heap::trips(|| {
+                processing.render(speakers_now);
+                processing.cancel_echo(&mut near, 20);
+            });
+            (start.elapsed(), trips)
+        };
+        let report = |name: &str, frames: &mut Vec<(std::time::Duration, usize)>| {
+            frames.sort();
+            let (median, worst) = (frames[frames.len() / 2].0, frames[frames.len() - 1].0);
+            let trips = frames.iter().map(|frame| frame.1).max().unwrap();
+            eprintln!(
+                "{name}: {} frames, median {median:?}, worst {worst:?}, heap visits at most {trips}",
+                frames.len()
+            );
+        };
+        let (mut mono, mut learning, mut stereo, mut feeding, mut swaps, mut after) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..12 {
+            let mut plain = session(LEARNING_FRAMES);
+            for at in (0..6 * RATE).step_by(FRAME) {
+                mono.push(timed(&mut plain, at));
+            }
+            plain.pin_stereo();
+            plain.collected();
+            let mut at = 6 * RATE;
+            while !plain.is_stereo() {
+                learning.push(timed(&mut plain, at));
+                at += FRAME;
+            }
+            let (mut told, mut at) = past_the_take_over(&far, &speakers);
+            for _ in 0..100 {
+                stereo.push(timed(&mut told, at));
+                at += FRAME;
+            }
+            told.route_changed();
+            told.caught_up();
+            while told.replacing {
+                let frame = timed(&mut told, at);
+                told.ready_for_the_next_frame();
+                at += FRAME;
+                if told.replacing {
+                    feeding.push(frame);
+                } else {
+                    swaps.push(frame);
+                }
+            }
+            for _ in 0..100 {
+                after.push(timed(&mut told, at));
+                at += FRAME;
+            }
+        }
+        report("mono, as on main", &mut mono);
+        report("learning beside the mono one, as on main", &mut learning);
+        report("stereo in charge", &mut stereo);
+        report("stereo while the replacement learns", &mut feeding);
+        report("the swap", &mut swaps);
+        report("the replacement in charge", &mut after);
     }
 
     /// [`voice`] for long sessions: `f32` phase stops following the pitch after about 140 s.
