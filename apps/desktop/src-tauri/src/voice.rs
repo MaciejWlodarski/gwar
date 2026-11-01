@@ -613,9 +613,11 @@ fn bootstrap_owner(voice: &Voice) -> u64 {
 #[tauri::command]
 pub fn voice_bootstrap(window: WebviewWindow, voice: State<'_, Voice>) -> Result<u64, String> {
     check_main_window(window.label())?;
+    let owner = bootstrap_owner(&voice);
+    // After the new owner: a start the old view has under way fails its owner check from here on.
     // A reloaded view cannot have confirmed the capture that is still running.
-    window.state::<crate::share_audio::ShareCapture>().stop();
-    Ok(bootstrap_owner(&voice))
+    window.state::<crate::share_audio::ShareCapture>().retire();
+    Ok(owner)
 }
 
 // Claim/retire under the same lock as ownership, answers and the media handle.

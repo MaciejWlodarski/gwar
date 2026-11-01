@@ -132,7 +132,11 @@ pub(crate) fn create_main<R: Runtime>(app: &App<R>) -> tauri::Result<()> {
             NewWindowResponse::Deny
         });
     #[cfg(windows)]
-    windows_media::deny_saved_media(&builder.build()?, app_url);
+    {
+        let window = builder.build()?;
+        windows_media::retire_on_renderer_loss(&window);
+        windows_media::deny_saved_media(&window, app_url);
+    }
     #[cfg(not(windows))]
     builder.build()?;
     Ok(())
@@ -142,18 +146,54 @@ pub(crate) fn create_main<R: Runtime>(app: &App<R>) -> tauri::Result<()> {
 mod windows_media {
     use std::{cell::Cell, rc::Rc};
 
-    use tauri::{Runtime, Url, WebviewWindow};
+    use tauri::{Manager, Runtime, Url, WebviewWindow};
     use webview2_com::{
         Microsoft::Web::WebView2::Win32::{
             COREWEBVIEW2_PERMISSION_KIND, COREWEBVIEW2_PERMISSION_KIND_CAMERA, COREWEBVIEW2_PERMISSION_KIND_MICROPHONE,
-            COREWEBVIEW2_PERMISSION_STATE_DENY, ICoreWebView2_13, ICoreWebView2Profile4,
+            COREWEBVIEW2_PERMISSION_STATE_DENY, COREWEBVIEW2_PROCESS_FAILED_KIND,
+            COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
+            COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
+            COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE, ICoreWebView2_13, ICoreWebView2Profile4,
         },
-        SetPermissionStateCompletedHandler,
+        ProcessFailedEventHandler, SetPermissionStateCompletedHandler,
     };
     use windows::core::{HSTRING, Interface};
 
     static KINDS: [COREWEBVIEW2_PERMISSION_KIND; 2] =
         [COREWEBVIEW2_PERMISSION_KIND_MICROPHONE, COREWEBVIEW2_PERMISSION_KIND_CAMERA];
+
+    /// A crashed renderer runs no JavaScript, and the window stays open on a dead page with no
+    /// sharing controls: what it was sharing ends here. Elsewhere the reader lease covers this.
+    pub(super) fn retire_on_renderer_loss<R: Runtime>(window: &WebviewWindow<R>) {
+        let app = window.app_handle().clone();
+        let result = window.with_webview(move |webview| {
+            let handler = ProcessFailedEventHandler::create(Box::new(move |_, args| {
+                let mut kind = COREWEBVIEW2_PROCESS_FAILED_KIND::default();
+                if let Some(args) = args {
+                    unsafe { args.ProcessFailedKind(&mut kind) }?;
+                }
+                if [
+                    COREWEBVIEW2_PROCESS_FAILED_KIND_BROWSER_PROCESS_EXITED,
+                    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_EXITED,
+                    COREWEBVIEW2_PROCESS_FAILED_KIND_RENDER_PROCESS_UNRESPONSIVE,
+                ]
+                .contains(&kind)
+                {
+                    app.state::<crate::share_audio::ShareCapture>().retire();
+                }
+                Ok(())
+            }));
+            let mut token = 0;
+            let watched = unsafe { webview.controller().CoreWebView2() }
+                .and_then(|core| unsafe { core.add_ProcessFailed(&handler, &mut token) });
+            if let Err(e) = watched {
+                tracing::error!("cannot watch the webview's renderer: {e}");
+            }
+        });
+        if let Err(e) = result {
+            tracing::error!("cannot reach the webview: {e}");
+        }
+    }
 
     /// WebView2 answers `getUserMedia` from a grant saved in its profile without asking the
     /// permission handler (wry's `with_permission_handler` notes this). Earlier builds had no

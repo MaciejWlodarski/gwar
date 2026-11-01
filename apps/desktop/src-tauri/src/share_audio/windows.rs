@@ -59,15 +59,42 @@ pub fn support() -> Support {
 
 // `implement` answers for IAgileObject itself, as this callback from another apartment needs.
 #[implement(IActivateAudioInterfaceCompletionHandler)]
-struct Completed(HANDLE);
+struct Completed {
+    done: Arc<Event>,
+    /// Still read by an activation that outlives its timeout.
+    _params: Box<AUDIOCLIENT_ACTIVATION_PARAMS>,
+}
 
 impl IActivateAudioInterfaceCompletionHandler_Impl for Completed_Impl {
     fn ActivateCompleted(
         &self,
         _operation: windows::core::Ref<IActivateAudioInterfaceAsyncOperation>,
     ) -> windows::core::Result<()> {
-        // SAFETY: the event outlives the wait for this completion (see `activate`).
-        unsafe { SetEvent(self.0) }
+        // SAFETY: this handler co-owns the event, so a timed-out wait cannot close it first.
+        unsafe { SetEvent(self.done.0) }
+    }
+}
+
+/// An auto-reset event, closed by its last owner. A late completion after a timed-out wait
+/// must find this event, not whatever the system has since given the same handle to.
+struct Event(HANDLE);
+
+// SAFETY: a Win32 event may be used from any thread.
+unsafe impl Send for Event {}
+// SAFETY: as above.
+unsafe impl Sync for Event {}
+
+impl Event {
+    fn new() -> windows::core::Result<Self> {
+        // SAFETY: an auto-reset event with no name, owned from here on.
+        unsafe { CreateEventW(None, false, false, None) }.map(Self)
+    }
+}
+
+impl Drop for Event {
+    fn drop(&mut self) {
+        // SAFETY: only this owner closes it, once.
+        let _ = unsafe { CloseHandle(self.0) };
     }
 }
 
@@ -83,7 +110,7 @@ struct BlobVariant {
 const _: () = assert!(size_of::<BlobVariant>() == size_of::<PROPVARIANT>());
 
 fn activate() -> windows::core::Result<IAudioClient> {
-    let params = AUDIOCLIENT_ACTIVATION_PARAMS {
+    let params = Box::new(AUDIOCLIENT_ACTIVATION_PARAMS {
         ActivationType: AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
         Anonymous: AUDIOCLIENT_ACTIVATION_PARAMS_0 {
             ProcessLoopbackParams: AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS {
@@ -92,24 +119,23 @@ fn activate() -> windows::core::Result<IAudioClient> {
                 ProcessLoopbackMode: PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
             },
         },
-    };
+    });
     let blob = BlobVariant {
         vt: VT_BLOB.0,
         reserved: [0; 3],
         size: size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
-        data: (&raw const params).cast_mut().cast(),
+        data: (&raw const *params).cast_mut().cast(),
     };
-    // SAFETY: an auto-reset event with no name; closed below on every path.
-    let done = unsafe { CreateEventW(None, false, false, None) }?;
-    let handler: IActivateAudioInterfaceCompletionHandler = Completed(done).into();
-    // SAFETY: `blob` has PROPVARIANT's layout and `params` stay alive until the wait ends.
-    let result = unsafe {
+    let done = Arc::new(Event::new()?);
+    let handler: IActivateAudioInterfaceCompletionHandler = Completed { done: done.clone(), _params: params }.into();
+    // SAFETY: `blob` has PROPVARIANT's layout, and the handler keeps `params` for the operation.
+    unsafe {
         let variant = (&raw const blob).cast::<PROPVARIANT>();
         ActivateAudioInterfaceAsync(VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK, &IAudioClient::IID, Some(variant), &handler)
     }
     .and_then(|operation| {
-        // SAFETY: the event is valid until `CloseHandle` below.
-        if unsafe { WaitForSingleObject(done, ACTIVATE_TIMEOUT_MS) } != WAIT_OBJECT_0 {
+        // SAFETY: `done` holds the event open.
+        if unsafe { WaitForSingleObject(done.0, ACTIVATE_TIMEOUT_MS) } != WAIT_OBJECT_0 {
             return Err(E_FAIL.into());
         }
         let mut status = windows::core::HRESULT(0);
@@ -118,10 +144,7 @@ fn activate() -> windows::core::Result<IAudioClient> {
         unsafe { operation.GetActivateResult(&mut status, &mut unknown) }?;
         status.ok()?;
         unknown.ok_or_else(|| windows::core::Error::from(E_FAIL))?.cast()
-    });
-    // SAFETY: created above and no longer waited on.
-    let _ = unsafe { CloseHandle(done) };
-    result
+    })
 }
 
 fn capture(

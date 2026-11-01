@@ -94,6 +94,12 @@ pub fn run() {
         .manage(files::Files::default())
         .manage(tray::CloseToTray(AtomicBool::new(true)))
         .on_permission_request(|_, kind| webview::media_permission(kind))
+        .on_page_load(|webview, load| {
+            // The old page is gone from here on, whatever its JavaScript managed to clean up.
+            if webview.label() == "main" && load.event() == tauri::webview::PageLoadEvent::Started {
+                webview.state::<share_audio::ShareCapture>().retire();
+            }
+        })
         .setup(|app| {
             // Installed AppImages may move; refresh their desktop integration, never a debug binary.
             #[cfg(all(target_os = "linux", not(debug_assertions)))]

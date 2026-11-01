@@ -6,16 +6,13 @@
 //! - Watching: the webview hands over encoded Opus before anything decodes it, so it cannot play
 //!   share sound. [`SharePlayout`] decodes it into the voice mix and the echo reference.
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
-};
-use std::time::Duration;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
 use gwar_client::voice::share::{CaptureQueue, parse_frames};
 use serde::Serialize;
 use tauri::{
-    State, WebviewWindow,
+    Manager, State, WebviewWindow,
     ipc::{InvokeBody, Request, Response},
 };
 
@@ -43,6 +40,11 @@ mod platform {
 
 /// How often an idle capture answers the webview, so a stale reader cannot hang on forever.
 const READ_WAIT: Duration = Duration::from_millis(100);
+/// A capture nobody reads for this long has lost its webview, however that happened: its
+/// JavaScript cannot be trusted to clean up after a crash. Far beyond any healthy read, which
+/// takes `READ_WAIT` at most and keeps going in a hidden window.
+const READER_LEASE: Duration = Duration::from_secs(5);
+const LEASE_CHECK: Duration = Duration::from_secs(1);
 
 /// Whether this system can share its sound with Gwar's own sound left out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -77,27 +79,121 @@ struct Running {
     id: u64,
     queue: Arc<CaptureQueue>,
     _capture: Box<dyn Send>,
+    last_read: Instant,
 }
 
-/// The running capture. One at a time; a stale id reads nothing and stops nothing.
+#[derive(Default)]
+struct CaptureState {
+    running: Option<Running>,
+    /// The start waiting on the OS. Whatever clears it has cancelled that start.
+    starting: Option<u64>,
+    /// The newest id seen, by a start or a stop: nothing at or below it can start any more.
+    newest: u64,
+}
+
+/// The running capture. One at a time; a stale id reads nothing and stops nothing. Every change
+/// happens under one lock, so a stop cannot fall between a start's checks and its commit.
 #[derive(Default)]
 pub struct ShareCapture {
-    running: Mutex<Option<Running>>,
-    latest: AtomicU64,
+    state: Mutex<CaptureState>,
 }
 
 impl ShareCapture {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Running>> {
-        self.running.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> MutexGuard<'_, CaptureState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    fn queue(&self, id: u64) -> Option<Arc<CaptureQueue>> {
-        self.lock().as_ref().filter(|running| running.id == id).map(|running| running.queue.clone())
+    /// Claims the capture for start `id`; whatever ran before ends. The queue is the new one's.
+    fn begin(&self, id: u64) -> Result<Arc<CaptureQueue>, String> {
+        let mut state = self.lock();
+        if id <= state.newest {
+            return Err("superseded".into());
+        }
+        state.newest = id;
+        state.starting = Some(id);
+        let old = state.running.take();
+        drop(state);
+        Self::end(old);
+        Ok(Arc::default())
     }
 
-    /// Closes the capture and tells whoever is reading. The OS stream stops when it drops.
-    pub fn stop(&self) {
-        if let Some(running) = self.lock().take() {
+    /// Installs what the OS gave start `id`, unless it was cancelled meanwhile or `current` says
+    /// its webview no longer owns the app. Refused, the capture stops here.
+    fn commit(
+        &self,
+        id: u64,
+        queue: Arc<CaptureQueue>,
+        capture: Box<dyn Send>,
+        current: impl FnOnce() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut state = self.lock();
+        let allowed = if state.starting == Some(id) { current() } else { Err("superseded".into()) };
+        if state.starting == Some(id) {
+            state.starting = None;
+        }
+        if let Err(refused) = allowed {
+            drop(state);
+            queue.close();
+            return Err(refused);
+        }
+        state.running = Some(Running { id, queue, _capture: capture, last_read: Instant::now() });
+        Ok(())
+    }
+
+    /// The OS refused start `id`.
+    fn failed(&self, id: u64) {
+        let mut state = self.lock();
+        if state.starting == Some(id) {
+            state.starting = None;
+        }
+    }
+
+    /// The queue of capture `id`, for a reader. Reading is what keeps a capture alive.
+    fn reader(&self, id: u64) -> Option<Arc<CaptureQueue>> {
+        let mut state = self.lock();
+        let running = state.running.as_mut().filter(|running| running.id == id)?;
+        running.last_read = Instant::now();
+        Some(running.queue.clone())
+    }
+
+    /// Stops capture `id` and cancels it if it is still starting; it can never start after this.
+    fn stop(&self, id: u64) {
+        let mut state = self.lock();
+        state.newest = state.newest.max(id);
+        if state.starting == Some(id) {
+            state.starting = None;
+        }
+        let old = state.running.take_if(|running| running.id == id);
+        drop(state);
+        Self::end(old);
+    }
+
+    /// Ends everything, a pending start too: the webview that asked for it is gone.
+    pub fn retire(&self) {
+        let mut state = self.lock();
+        state.starting = None;
+        let old = state.running.take();
+        drop(state);
+        Self::end(old);
+    }
+
+    /// Whether capture `id` still has a reader at `now`; if not, it ends here.
+    fn keep_alive(&self, id: u64, now: Instant) -> bool {
+        let mut state = self.lock();
+        let Some(running) = state.running.as_ref().filter(|running| running.id == id) else { return false };
+        if now.saturating_duration_since(running.last_read) < READER_LEASE {
+            return true;
+        }
+        let old = state.running.take();
+        drop(state);
+        tracing::warn!("share sound stopped: nothing is reading it");
+        Self::end(old);
+        false
+    }
+
+    /// Tells whoever is reading. The OS stream stops when it drops.
+    fn end(running: Option<Running>) {
+        if let Some(running) = running {
             running.queue.close();
         }
     }
@@ -136,22 +232,31 @@ pub async fn share_capture_start(
     id: u64,
 ) -> Result<(), String> {
     check_caller(&window, &voice, owner)?;
-    if id <= capture.latest.fetch_max(id, Ordering::SeqCst) {
-        return Err("superseded".into());
-    }
-    capture.stop();
-    let queue = Arc::<CaptureQueue>::default();
+    let queue = capture.begin(id)?;
     let opened = queue.clone();
-    let started =
-        tauri::async_runtime::spawn_blocking(move || platform::start(opened)).await.map_err(|e| e.to_string())?;
-    let stream = started.map_err(|refusal| {
-        tracing::warn!("share sound did not start: {refusal:?}");
-        refusal.code().to_owned()
-    })?;
-    if capture.latest.load(Ordering::SeqCst) != id {
-        return Err("superseded".into());
-    }
-    *capture.lock() = Some(Running { id, queue, _capture: stream });
+    let started = tauri::async_runtime::spawn_blocking(move || platform::start(opened)).await;
+    let stream = match started {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(refusal)) => {
+            capture.failed(id);
+            tracing::warn!("share sound did not start: {refusal:?}");
+            return Err(refusal.code().to_owned());
+        }
+        Err(error) => {
+            capture.failed(id);
+            return Err(error.to_string());
+        }
+    };
+    capture.commit(id, queue, stream, || check_caller(&window, &voice, owner))?;
+    let app = window.app_handle().clone();
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(LEASE_CHECK).await;
+            if !app.state::<ShareCapture>().keep_alive(id, Instant::now()) {
+                return;
+            }
+        }
+    });
     Ok(())
 }
 
@@ -166,10 +271,10 @@ pub async fn share_capture_read(
     id: u64,
 ) -> Result<Response, String> {
     check_caller(&window, &voice, owner)?;
-    let queue = capture.queue(id).ok_or("closed")?;
+    let queue = capture.reader(id).ok_or("closed")?;
     let samples = queue.read(READ_WAIT).await;
     if samples.is_empty() && queue.is_closed() {
-        capture.stop();
+        capture.stop(id);
         return Err("closed".into());
     }
     Ok(Response::new(samples.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>()))
@@ -184,15 +289,13 @@ pub fn share_capture_stop(
     id: u64,
 ) -> Result<(), String> {
     check_caller(&window, &voice, owner)?;
-    capture.latest.fetch_max(id, Ordering::SeqCst);
-    if capture.queue(id).is_some() {
-        capture.stop();
-    }
+    capture.stop(id);
     Ok(())
 }
 
-/// Claims the mix for `slot`'s share on watch transport `run`. False when no voice engine is
-/// running here: without it nothing could be heard, and the UI must not offer a volume.
+/// Claims the mix for `slot`'s share on watch transport `run`, at volume `gain`. False when a
+/// newer transport has the slot, or no voice engine is running here: nothing could be heard then,
+/// and the UI must not offer a volume.
 #[tauri::command]
 pub fn share_playback_open(
     window: WebviewWindow,
@@ -200,23 +303,25 @@ pub fn share_playback_open(
     owner: u64,
     run: u64,
     slot: usize,
+    gain: f32,
 ) -> Result<bool, String> {
     check_caller(&window, &voice, owner)?;
-    voice.share_playout(|playout, playing| {
-        playout.open(slot, run);
-        playing
-    })
+    voice.share_playout(|playout, playing| playout.open(slot, run, gain) && playing)
 }
 
+/// Ends `run`'s claim. A close that arrives after a newer transport took the slot changes nothing.
 #[tauri::command]
 pub fn share_playback_close(
     window: WebviewWindow,
     voice: State<'_, Voice>,
     owner: u64,
+    run: u64,
     slot: usize,
 ) -> Result<(), String> {
     check_caller(&window, &voice, owner)?;
-    voice.share_playout(|playout, _| playout.close(slot))
+    voice.share_playout(|playout, _| {
+        playout.close(slot, run);
+    })
 }
 
 /// Volume of one watched share, 0 to 1, independent of voice volume; muted is 0.
@@ -225,11 +330,14 @@ pub fn share_playback_gain(
     window: WebviewWindow,
     voice: State<'_, Voice>,
     owner: u64,
+    run: u64,
     slot: usize,
     gain: f32,
 ) -> Result<(), String> {
     check_caller(&window, &voice, owner)?;
-    voice.share_playout(|playout, _| playout.set_gain(slot, gain))
+    voice.share_playout(|playout, _| {
+        playout.set_gain(slot, run, gain);
+    })
 }
 
 /// One batch of encoded frames, as `parse_frames` reads them.
@@ -325,15 +433,99 @@ mod tests {
         out
     }
 
+    fn starting(capture: &ShareCapture, id: u64) -> (Arc<CaptureQueue>, Box<dyn Send>) {
+        (capture.begin(id).unwrap(), Box::new(()))
+    }
+
+    fn running(capture: &ShareCapture, id: u64) -> Arc<CaptureQueue> {
+        let (queue, stream) = starting(capture, id);
+        capture.commit(id, queue.clone(), stream, || Ok(())).unwrap();
+        queue
+    }
+
     #[test]
     fn a_stale_capture_reads_nothing_and_stops_nothing() {
         let capture = ShareCapture::default();
-        *capture.lock() = Some(Running { id: 5, queue: Arc::default(), _capture: Box::new(()) });
-        assert!(capture.queue(4).is_none());
-        assert!(capture.queue(5).is_some());
-        let queue = capture.queue(5).unwrap();
-        capture.stop();
+        let queue = running(&capture, 5);
+        assert!(capture.reader(4).is_none());
+        capture.stop(4);
+        assert!(capture.reader(5).is_some());
+        capture.stop(5);
         assert!(queue.is_closed());
-        assert!(capture.queue(5).is_none());
+        assert!(capture.reader(5).is_none());
+    }
+
+    #[test]
+    fn a_stop_during_startup_cancels_that_start() {
+        let capture = ShareCapture::default();
+        let (queue, stream) = starting(&capture, 5);
+        capture.stop(5);
+        let refused = capture.commit(5, queue.clone(), stream, || Ok(()));
+        assert_eq!(refused.unwrap_err(), "superseded");
+        assert!(queue.is_closed(), "the capture that came too late ends at once");
+        assert!(capture.reader(5).is_none());
+    }
+
+    #[test]
+    fn a_stop_that_overtakes_its_start_still_wins() {
+        let capture = ShareCapture::default();
+        capture.stop(5);
+        assert!(capture.begin(5).is_err());
+    }
+
+    #[test]
+    fn a_new_view_cancels_a_start_the_old_one_left_behind() {
+        let capture = ShareCapture::default();
+        let (queue, stream) = starting(&capture, 5);
+        capture.retire();
+        assert!(capture.commit(5, queue.clone(), stream, || Ok(())).is_err());
+        assert!(queue.is_closed());
+        assert!(capture.reader(5).is_none());
+    }
+
+    #[test]
+    fn a_start_commits_only_for_the_current_owner() {
+        let capture = ShareCapture::default();
+        let (queue, stream) = starting(&capture, 5);
+        let refused = capture.commit(5, queue.clone(), stream, || Err("stale owner".into()));
+        assert_eq!(refused.unwrap_err(), "stale owner");
+        assert!(queue.is_closed());
+        assert!(capture.reader(5).is_none());
+    }
+
+    #[test]
+    fn a_newer_start_cancels_the_older_one_and_replaces_a_running_one() {
+        let capture = ShareCapture::default();
+        let old = running(&capture, 4);
+        let (first, first_stream) = starting(&capture, 5);
+        assert!(old.is_closed());
+        let (second, second_stream) = starting(&capture, 6);
+        assert!(capture.commit(5, first.clone(), first_stream, || Ok(())).is_err());
+        assert!(first.is_closed());
+        capture.commit(6, second.clone(), second_stream, || Ok(())).unwrap();
+        assert!(capture.reader(6).is_some() && !second.is_closed());
+    }
+
+    #[test]
+    fn a_capture_without_a_reader_ends_by_itself() {
+        let capture = ShareCapture::default();
+        let queue = running(&capture, 5);
+        let started = Instant::now();
+        assert!(capture.keep_alive(5, started + READER_LEASE / 2));
+        assert!(!queue.is_closed());
+        assert!(capture.reader(5).is_some(), "a read renews the lease");
+        assert!(capture.keep_alive(5, Instant::now() + READER_LEASE - Duration::from_secs(1)));
+        assert!(!capture.keep_alive(5, Instant::now() + READER_LEASE + Duration::from_secs(1)));
+        assert!(queue.is_closed(), "no JavaScript took part in this");
+        assert!(capture.reader(5).is_none());
+    }
+
+    #[test]
+    fn an_old_lease_cannot_end_the_capture_that_replaced_it() {
+        let capture = ShareCapture::default();
+        running(&capture, 4);
+        let queue = running(&capture, 5);
+        assert!(!capture.keep_alive(4, Instant::now() + 2 * READER_LEASE), "the old watch ends");
+        assert!(!queue.is_closed());
     }
 }
