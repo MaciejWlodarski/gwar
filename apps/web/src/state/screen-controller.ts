@@ -37,6 +37,8 @@ const WATCH_UNAVAILABLE_MS = 5_000;
  * or AV1 for everyone watching with this viewer.
  */
 const WATCH_FEATURE_TIMEOUT_MS = 10_000;
+/** A picture that is late stops holding the sound back: sound matters more than the picture. */
+const SOUND_HOLD_MS = 1_500;
 /** A watch's first frame must arrive within this long after its grant, across stage changes. */
 const FIRST_FRAME_TIMEOUT_MS = 35_000;
 /** The server takes a Try again at most this long after the share's last start or retry for me, and holds an earlier one until then (`RETRY_FIRST`). */
@@ -147,7 +149,7 @@ export class ScreenController {
   private audioTimer: ReturnType<typeof setInterval> | null = null;
   /** Owned by the grant, not by a stage/thumbnail video that can remount. */
   /** Each granted watch still waiting for its first frame; no timer while the server pauses it. */
-  private readonly firstFrameTimers = new Map<number, { run: number; timer: ReturnType<typeof setTimeout> | null }>();
+  private readonly firstFrameTimers = new Map<number, { run: number; timer: ReturnType<typeof setTimeout> | null; sound: ReturnType<typeof setTimeout> }>();
   private attempts = 0;
   private watchIds = 0;
   /** Each share's watch requests, one at a time. */
@@ -892,13 +894,23 @@ export class ScreenController {
   private expectFirstFrame(share: string, run: number, id: number): void {
     this.clearFirstFrame(id);
     const timer = setTimeout(() => this.frameFailed(share, run, id), FIRST_FRAME_TIMEOUT_MS);
-    this.firstFrameTimers.set(id, { run, timer });
+    const sound = setTimeout(() => this.releaseSound(id), SOUND_HOLD_MS);
+    this.firstFrameTimers.set(id, { run, timer, sound });
   }
 
   private clearFirstFrame(id: number): void {
     const pending = this.firstFrameTimers.get(id);
     if (pending?.timer) clearTimeout(pending.timer);
+    if (pending) clearTimeout(pending.sound);
     this.firstFrameTimers.delete(id);
+  }
+
+  /** The watch's sound starts here, so it never plays ahead of a picture that is not there yet. */
+  private releaseSound(id: number): void {
+    const watch = useScreen.getState().watches.find(w => w.id === id);
+    if (!watch?.soundHeld) return;
+    dispatch({ type: "soundReleased", id });
+    if (watch.slot !== null) this.setSoundGain(watch.share, watch.slot);
   }
 
   /**
@@ -918,6 +930,12 @@ export class ScreenController {
   }
 
   /** A warm receiver can need a keyframe for its newly initialized media player. */
+  /** The link is back after a stall: the server restores this viewer's estimate as well. */
+  private frameLost(share: string, run: number, id: number): void {
+    const conn = this.link();
+    if (conn) void conn.request("screen.stalled", { share }).catch(() => this.requestFrame(share, run, id));
+  }
+
   requestFrame(share: string, run: number, id: number): void {
     const screen = useScreen.getState();
     if (screen.transport.run !== run || !screen.watches.some(w => w.id === id && w.share === share && w.status === "watching")) return;
@@ -929,6 +947,7 @@ export class ScreenController {
     const screen = useScreen.getState();
     if (screen.transport.run !== run || !screen.watches.some(w => w.id === id && w.share === share && w.status === "watching")) return;
     if (this.firstFrameTimers.get(id)?.run === run) this.clearFirstFrame(id);
+    this.releaseSound(id);
     this.watchRecoveries = 0;
   }
 
@@ -977,7 +996,7 @@ export class ScreenController {
 
   private soundGain(share: string): number {
     const { volume, muted } = useSettings.getState().shareAudio[share] ?? defaultShareAudio;
-    return muted ? 0 : volume;
+    return muted || useScreen.getState().watches.some(w => w.share === share && w.soundHeld) ? 0 : volume;
   }
 
   /** The player of a watch with confirmed sound; its controls appear only if this succeeds. */
@@ -1095,6 +1114,13 @@ export class ScreenController {
           }, 1_000);
         }
       },
+      frameLost: slot => {
+        const watch = useScreen.getState().watches.find(w => w.slot === slot);
+        if (watch && this.transport === transport) {
+          this.pictureSync?.linkBack(slot);
+          this.frameLost(watch.share, run, watch.id);
+        }
+      },
       decodeFailed: (slot, share, generation) => { if (screenH264 && this.transport === transport) void conn.request("screen.decode_failed", { run, slot, share, generation }).catch(() => {}); },
       track: (slot, stream) => { if (this.transport === transport) dispatch({ type: "stream", run, slot, stream }); },
     });
@@ -1132,7 +1158,7 @@ export class ScreenController {
     this.pictureSync = null;
     this.receiver?.close();
     this.receiver = null;
-    for (const { timer } of this.firstFrameTimers.values()) if (timer) clearTimeout(timer);
+    for (const { timer, sound } of this.firstFrameTimers.values()) { if (timer) clearTimeout(timer); clearTimeout(sound); }
     this.firstFrameTimers.clear();
     // A new watch transport starts its spacing over.
     this.lastStart = null;

@@ -335,6 +335,10 @@ wire! {
         /// Asks for a keyframe of a watched share (throttled).
         #[serde(rename = "screen.keyframe")]
         ScreenKeyframe { share: String },
+        /// A link stall's backlog was dropped here and frames are on time again: the link is back,
+        /// whatever the estimate made of the burst. Asks for a keyframe too.
+        #[serde(rename = "screen.stalled")]
+        ScreenStalled { share: String },
         /// H.264 arrived after a keyframe for four seconds without decode progress.
         #[serde(rename = "screen.decode_failed")]
         ScreenDecodeFailed { share: String, slot: u32, #[serde(deserialize_with = "voice::run")] #[cfg_attr(feature = "ts", ts(type = "number"))] run: u64, generation: u16 },

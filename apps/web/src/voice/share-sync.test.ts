@@ -74,6 +74,10 @@ describe("nextWaits", () => {
     expect(nextWaits({ picture: 0, sound: 200 }, -4, false, 30, true).sound).toBe(200);
   });
 
+  it("moves the picture the whole way even while sound waits: sound can only come down slowly", () => {
+    expect(nextWaits({ picture: 0, sound: 150 }, 260, true, 30, true)).toEqual({ picture: 290, sound: 150 });
+  });
+
   it("gives back what one side waits before the other waits more", () => {
     expect(nextWaits({ picture: 0, sound: 200 }, 300, false, 30, true)).toEqual({ picture: 0, sound: 190 });
     expect(nextWaits({ picture: 150, sound: 0 }, -60, false, 30, true)).toEqual({ picture: 120, sound: 0 });
@@ -101,6 +105,56 @@ const at = (picture: number) => [1, { picture, sound: 0 }];
 const settle = async (sync: PictureSync, slots: SyncSlot[] = [slot]) => { await sync.tick(slots); await sync.tick(slots); };
 
 describe("PictureSync", () => {
+  it("moves the whole way once after a break has settled, then gently again", async () => {
+    const { waits, sync, link } = fixture(30);
+    await settle(sync);
+    await sync.tick([slot]);
+    const { sound, picture } = pair(300);
+    link.sound.mockResolvedValue(sound);
+    link.picture.mockReturnValue(picture);
+    link.now = () => picture.unixMs + 20;
+    await sync.tick([slot]);
+    expect(waits.at(-1)).toEqual(at(100));
+    sync.linkBack(1);
+    await sync.tick([slot]);
+    expect(waits.at(-1)).toEqual(at(100));
+    await sync.tick([slot]);
+    expect(waits.at(-1)).toEqual(at(400));
+    await sync.tick([slot]);
+    expect(waits.at(-1)).toEqual(at(440));
+  });
+
+  it("keeps its one move after a break for the gap that opens when the sound lands", async () => {
+    const { waits, sync, link } = fixture(20);
+    await settle(sync);
+    await sync.tick([slot]);
+    sync.linkBack(1);
+    await sync.tick([slot]);
+    await sync.tick([slot]);
+    const { sound, picture } = pair(250);
+    link.sound.mockResolvedValue(sound);
+    link.picture.mockReturnValue(picture);
+    link.now = () => picture.unixMs + 20;
+    const before = waits.at(-1)?.[1] as Waits;
+    await sync.tick([slot]);
+    expect(waits.at(-1)).toEqual(at(before.picture + 250));
+  });
+
+  it("drops a stale wait at once after a break, when the picture is the late one", async () => {
+    const { waits, sync, link } = fixture(200);
+    await settle(sync);
+    await sync.tick([slot]);
+    expect(waits.at(-1)).toEqual(at(230));
+    const { sound, picture } = pair(-150);
+    link.sound.mockResolvedValue(sound);
+    link.picture.mockReturnValue(picture);
+    link.now = () => picture.unixMs + 20;
+    sync.linkBack(1);
+    await sync.tick([slot]);
+    await sync.tick([slot]);
+    expect(waits.at(-1)).toEqual(at(80));
+  });
+
   it("makes a late joiner's picture wait at once, then corrects gently", async () => {
     const { sync, waits } = fixture(80);
     await settle(sync);

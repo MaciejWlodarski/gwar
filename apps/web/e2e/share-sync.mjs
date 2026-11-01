@@ -4,7 +4,7 @@
  * that changes at the same instant as a tone burst, once a second. Each viewer records when it
  * presents the new picture and when the burst comes out, so every burst gives one offset:
  * positive means the sound lags the picture. With Chromium viewers nothing reaches the Mac's
- * speakers: it runs with `--disable-audio-output`, and the desktop viewer's speaker is
+ * speakers: on macOS it runs with `--disable-audio-output`, and the desktop viewer's speaker is
  * `native_bridge`'s virtual device. WebKit viewers opened the speakers even as desktop viewers, so
  * those run on CI only.
  *
@@ -13,6 +13,7 @@
  *   SYNC_VIEWERS=browser,desktop                who watches, side by side
  *   SYNC_SECONDS=30                             how long they watch
  *   SYNC_ENGINE=chromium|webkit                 the viewers' engine (default: chromium)
+ *   SYNC_OFF=1                                  nothing waits: main's playback, for a before
  *   SYNC_OUT=path.json                          every burst and the summaries
  */
 import { spawn, spawnSync } from "node:child_process";
@@ -111,6 +112,14 @@ function viewerPatch() {
   window.__presented = [];
   window.__onsets = [];
   window.__pcs = [];
+  /** When a watch's sound can first be heard, against its first picture. */
+  window.__audible = null;
+  window.__granted = null;
+  const audible = setInterval(async () => {
+    const watch = (await window.__gwarE2eImport("/src/state/screen.ts")).useScreen.getState().watches[0];
+    if (watch?.status === "watching") window.__granted ??= Date.now();
+    if (watch?.status === "watching" && !watch.soundHeld) { window.__audible = Date.now(); clearInterval(audible); }
+  }, 10);
   window.RTCPeerConnection = new Proxy(window.RTCPeerConnection, {
     construct(target, args) { const pc = new target(...args); window.__pcs.push(pc); return pc; },
   });
@@ -231,11 +240,14 @@ async function device(browser, web, server, name, native = false) {
   const context = await browser.newContext({ locale: "en-US", viewport: { width: 1280, height: 800 } });
   await context.route("**/*", route => (new URL(route.request().url()).hostname === "127.0.0.1" ? route.continue() : route.abort()));
   await context.addInitScript(viewerPatch);
+  if (process.env.SYNC_OFF) await context.addInitScript(() => {
+    Object.defineProperty(RTCRtpReceiver.prototype, "jitterBufferTarget", { get() { return null; }, set() {} });
+  });
   const page = await context.newPage();
   if (native) {
     page.native = nativeFixture();
     page.native.page = page;
-    await page.exposeFunction("__nativeInvoke", (command, args) => page.native.request(command, args));
+    await page.exposeFunction("__nativeInvoke", (command, args) => (process.env.SYNC_OFF && command === "share_playback_hold" ? null : page.native.request(command, args)));
     await context.addInitScript(bridgePatch);
   }
   await page.goto(web);
@@ -283,7 +295,7 @@ async function viewer(browser, web, server, sharer, kind) {
 }
 
 async function viewerRecord(page) {
-  const record = await page.evaluate(() => ({ presented: window.__presented, onsets: window.__onsets, health: window.__health }));
+  const record = await page.evaluate(() => ({ presented: window.__presented, onsets: window.__onsets, health: window.__health, audible: window.__audible, granted: window.__granted }));
   if (page.native) {
     record.onsets = await page.native.request("speaker_onsets");
     record.mixer = await page.native.request("share_stats");
@@ -309,7 +321,7 @@ async function run() {
     fixture.once("exit", () => reject(new Error(`fixture exited: ${fixture.output}`)));
   });
 
-  const browser = await chromium.launch({ channel: "chromium", headless: true, ignoreDefaultArgs: ["--mute-audio"], args: ["--autoplay-policy=no-user-gesture-required", "--disable-audio-output", `--auto-select-tab-capture-source-by-title=${SOURCE_TITLE}`] });
+  const browser = await chromium.launch({ channel: "chromium", headless: true, ignoreDefaultArgs: ["--mute-audio"], args: ["--autoplay-policy=no-user-gesture-required", ...(process.platform === "darwin" ? ["--disable-audio-output"] : []), `--auto-select-tab-capture-source-by-title=${SOURCE_TITLE}`] });
   const viewerEngine = process.env.SYNC_ENGINE === "webkit" ? await webkit.launch({ headless: true }) : browser;
   try {
     const sharer = await device(browser, web, ready.url, "sync-sharer");
@@ -334,7 +346,7 @@ async function run() {
     for (const page of watching) {
       const record = await viewerRecord(page);
       const pairs = pairBursts(bursts, record.presented, record.onsets);
-      report.viewers[page.kind] = { summary: offsetSummary(pairs), pairs, mixer: record.mixer, health: record.health, presented: record.presented };
+      report.viewers[page.kind] = { summary: offsetSummary(pairs), pairs, mixer: record.mixer, health: record.health, presented: record.presented, audible: record.audible, granted: record.granted };
       console.log(JSON.stringify({ net: netName, viewer: page.kind, ...offsetSummary(pairs), drawn: bursts.length, mixer: record.mixer }));
       console.log(pairs.map(pair => pair.offsetMs.toFixed(0)).join(" "));
     }

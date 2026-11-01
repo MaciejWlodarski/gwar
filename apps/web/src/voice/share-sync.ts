@@ -34,6 +34,10 @@ const MAX_SOUND_WAIT_MS = 400;
 const MAX_STEP_MS = 40;
 /** The first seconds of a watch are its keyframe and its buffers settling, not its lip-sync. */
 const SETTLING_LOOKS = 2;
+/** Looks after a break: the backlog lands in the first, and the others may move the whole way, once. */
+const BREAK_LOOKS = 4;
+/** A gap smaller than this after a break is not worth the one move: sound may still land. */
+const BREAK_MOVE_MS = 45;
 /** The picture's wait, which a Bluetooth speaker can reach. The receiver's own limit is 4 s. */
 export const MAX_WAIT_MS = 1_000;
 
@@ -56,19 +60,22 @@ export interface Waits { picture: number; sound: number }
 const clamp = (value: number, max = MAX_WAIT_MS) => Math.round(Math.min(max, Math.max(0, value)));
 
 /**
- * The next waits. The first look moves the picture the whole way: nobody has seen it settle. Sound
- * only ever moves in steps, because a picture that starts late usually catches up by itself, and
- * sound held for that would then lag. Noise moves nothing, and sound is only made to wait for a
- * clear lead. Whatever one side already waits is given back before the other waits more, and both
- * keep giving back while they agree: a browser's own sync pulls each side up to the other, so a lag
- * alone would never show that a wait is no longer needed.
+ * The next waits. The first look, and the one after a break has settled, move the picture the
+ * whole way: nobody has seen it settle. It takes a second or two to get there, so only one look
+ * may, or looks at a picture still on its way would add up to an overshoot. Sound only ever moves
+ * in steps, because a picture that starts late usually catches up by itself, and sound held for
+ * that would then lag. Noise moves nothing, and sound is only made to wait for a clear lead. Past
+ * that one move, whatever one side already waits is given back before the other waits more, and
+ * both keep giving back while they agree: a browser's own sync pulls each side up to the other, so
+ * a lag alone would never show that a wait is no longer needed.
  */
 export function nextWaits(waits: Waits, lag: number, first: boolean, shownPicture: number, soundWaits: boolean): Waits {
-  const change = first ? lag : Math.min(MAX_STEP_MS, Math.abs(lag) * GAIN);
+  const change = Math.min(MAX_STEP_MS, Math.abs(lag) * GAIN);
+  if (first && (lag > 0 || waits.picture > 0)) return { ...waits, picture: clamp((waits.picture === 0 ? shownPicture : waits.picture) + lag) };
   if (lag >= 0 && waits.sound > 0) {
     return { ...waits, sound: clamp(waits.sound - Math.min(SOUND_STEP_MS, Math.max(SOUND_STEP_MS / 2, change)), MAX_SOUND_WAIT_MS) };
   }
-  if (!first && Math.abs(lag) < DEADBAND_MS) return waits.picture > 0 ? { ...waits, picture: clamp(waits.picture - GIVE_BACK_MS) } : waits;
+  if (Math.abs(lag) < DEADBAND_MS) return waits.picture > 0 ? { ...waits, picture: clamp(waits.picture - GIVE_BACK_MS) } : waits;
   if (lag > 0) return { ...waits, picture: clamp((waits.picture === 0 ? shownPicture : waits.picture) + change) };
   const step = Math.min(MAX_STEP_MS, -lag * GAIN);
   if (waits.picture > 0) return { ...waits, picture: clamp(waits.picture - step) };
@@ -97,7 +104,7 @@ export interface PictureSyncLink {
   now(): number;
 }
 
-interface SlotState { share: string; waits: Waits; looks: number }
+interface SlotState { share: string; waits: Waits; looks: number; breakLooks?: number }
 const NO_WAIT: Waits = { picture: 0, sound: 0 };
 const same = (a: Waits, b: Waits) => a.picture === b.picture && a.sound === b.sound;
 
@@ -129,6 +136,12 @@ export class PictureSync {
     if (state && !same(state.waits, NO_WAIT)) this.link.wait(slot, NO_WAIT);
   }
 
+  /** The picture just came back from a break: it has jumped already, so one more move goes unseen. */
+  linkBack(slot: number): void {
+    const state = this.states.get(slot);
+    if (state) this.states.set(slot, { ...state, breakLooks: BREAK_LOOKS });
+  }
+
   private async look({ share, slot, heard, paused }: SyncSlot): Promise<void> {
     if (paused) return;
     const state = this.states.get(slot) ?? { share, waits: NO_WAIT, looks: 0 };
@@ -142,9 +155,12 @@ export class PictureSync {
     const picture = this.link.picture(slot);
     if (!sound || !picture || this.link.now() - picture.unixMs > STALE_PICTURE_MS) return;
     if (state.looks < SETTLING_LOOKS) { this.states.set(slot, { ...state, looks: state.looks + 1 }); return; }
+    if (state.breakLooks === BREAK_LOOKS) { this.states.set(slot, { ...state, breakLooks: BREAK_LOOKS - 1 }); return; }
     const lag = soundLagMs(association, sound, picture);
     const shown = await this.link.shown(slot).catch(() => 0);
-    this.set(slot, state, { ...state, waits: nextWaits(state.waits, lag, state.looks === SETTLING_LOOKS, shown, this.link.soundWaits), looks: state.looks + 1 });
+    const breakLooks = state.breakLooks ?? 0;
+    const whole = state.looks === SETTLING_LOOKS || (breakLooks > 0 && Math.abs(lag) > BREAK_MOVE_MS);
+    this.set(slot, state, { ...state, waits: nextWaits(state.waits, lag, whole, shown, this.link.soundWaits), looks: state.looks + 1, breakLooks: whole ? 0 : Math.max(0, breakLooks - 1) });
   }
 
   private set(slot: number, before: SlotState, after: SlotState): void {

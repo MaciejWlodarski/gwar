@@ -165,7 +165,7 @@ describe("watching", () => {
     await watching;
     expect(ops()).toEqual(["screen.watch.offer", "screen.watch", "screen.watch", "screen.watch", "screen.focus"]);
     expect(calls[0]![1]).toMatchObject({ run: transport.params.run, sdp: "watch-offer" });
-    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 1, status: "watching" }]);
+    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 1, status: "watching", soundHeld: true }]);
     // A second watch reuses the transport.
     useSession.getState().dispatch({ type: "event", now: 2, event: { ev: "screen.started", d: share("B", 2, 2) } });
     await screen.watch("B").catch(() => {});
@@ -415,11 +415,11 @@ describe("reused receive slots", () => {
     const old = await start(false);
     const watch = useScreen.getState().watches[0]!;
     const failed = vi.spyOn(screen, "frameFailed");
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBe(2);
     screen.frameReceived("B", old.params.run - 1, watch.id);
     screen.frameReceived("B", old.params.run, watch.id - 1);
     screen.frameReceived("A", old.params.run, watch.id);
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBe(2);
     screen.frameReceived("B", old.params.run, watch.id);
     expect(vi.getTimerCount()).toBe(0);
     screen.frameReceived("B", old.params.run, watch.id);
@@ -439,7 +439,7 @@ describe("reused receive slots", () => {
     expect(ops()).not.toContain("screen.keyframe");
     screen.requestFrame("B", old.params.run, watch.id);
     expect(ops().filter(op => op === "screen.keyframe")).toHaveLength(1);
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBe(2);
     await screen.unwatch("B");
     screen.requestFrame("B", old.params.run, watch.id);
     expect(ops().filter(op => op === "screen.keyframe")).toHaveLength(1);
@@ -450,7 +450,7 @@ describe("reused receive slots", () => {
     const { screen, start } = setup();
     const old = await start(false);
     const failed = vi.spyOn(screen, "frameFailed");
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBe(2);
     if (how === "unwatch") await screen.unwatch("B");
     if (how === "release") screen.handleEvent({ ev: "screen.slot", d: { run: old.params.run, slot: 1, share: null } });
     if (how === "stop") screen.handleEvent({ ev: "screen.stopped", d: { share: "B", reason: "stopped" } });
@@ -463,12 +463,34 @@ describe("reused receive slots", () => {
     screen.reset();
   });
 
+  it("keeps a new watch silent until its picture shows, with nothing lost when it comes first", async () => {
+    const { screen, start } = setup();
+    const old = await start(false);
+    const watch = useScreen.getState().watches[0]!;
+    expect(watch.soundHeld).toBe(true);
+    screen.frameReceived("B", old.params.run, watch.id);
+    expect(useScreen.getState().watches[0]!.soundHeld).toBeUndefined();
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("stops holding the sound for a picture that is late, or paused", async () => {
+    const { screen, start } = setup();
+    await start(false);
+    const gain = vi.spyOn(screen, "setSoundGain").mockImplementation(() => {});
+    screen.handleEvent({ ev: "screen.paused", d: { share: "B", reason: "bandwidth" } });
+    await vi.advanceTimersByTimeAsync(1_499);
+    expect(useScreen.getState().watches[0]!.soundHeld).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(useScreen.getState().watches[0]!.soundHeld).toBeUndefined();
+    expect(gain).toHaveBeenCalledWith("B", useScreen.getState().watches[0]!.slot);
+  });
+
   it("holds the first-frame deadline while the server pauses the share and starts it over on resume", async () => {
     const { screen, start } = setup();
     const old = await start(false);
     const watch = useScreen.getState().watches[0]!;
     const failed = vi.spyOn(screen, "frameFailed");
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBe(2);
     await vi.advanceTimersByTimeAsync(20_000);
     // Paused before its first frame: however long the pause, the wait does not run out.
     screen.handleEvent({ ev: "screen.paused", d: { share: "B", reason: "bandwidth" } });
@@ -478,7 +500,7 @@ describe("reused receive slots", () => {
     expect(useScreen.getState().watches).toMatchObject([{ share: "B", status: "watching", paused: "bandwidth" }]);
     // Resumed: a full 35 s wait again, not what was left of the first one.
     screen.handleEvent({ ev: "screen.resumed", d: { share: "B" } });
-    expect(vi.getTimerCount()).toBe(1);
+    expect(vi.getTimerCount()).toBe(2);
     await vi.advanceTimersByTimeAsync(34_999);
     expect(failed).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
@@ -553,7 +575,7 @@ describe("watch requests (review round 1)", () => {
     screen.handleEvent({ ev: "screen.slot", d: { run, slot: 1, share: "A" } });
     answers[1]!.resolve({ slot: 1 });
     await Promise.all([first, stopping, second]);
-    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 1, status: "watching" }]);
+    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 1, status: "watching", soundHeld: true }]);
     // The second request goes out only after the first watch's release.
     expect(ops().slice(1)).toEqual(["screen.watch", "screen.unwatch", "screen.unwatch", "screen.watch", "screen.focus"]);
   });
@@ -832,7 +854,7 @@ describe("watch requests across a reset (review round 2)", () => {
     await vi.advanceTimersByTimeAsync(100);
     await again;
     expect(calls.map(([op]) => op)).toEqual(["screen.watch.offer", "screen.watch.offer", "screen.watch", "screen.focus"]);
-    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 0, status: "watching" }]);
+    expect(useScreen.getState().watches).toEqual([{ share: "A", id: expect.any(Number), slot: 0, status: "watching", soundHeld: true }]);
   });
 
   it("requests of the old session send nothing on the new one, and do not hold it up", async () => {

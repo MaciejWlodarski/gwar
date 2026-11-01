@@ -249,6 +249,10 @@ audio and one video RTP time of the same instant for the asker's slot, or `known
 SFU has them. Older servers reject it; a viewer stops asking and plays as before, without lip-sync.
 No existing shape changes.
 
+After a link stall a viewer sends `screen.stalled` (`share`), which answers `{}`. An older server
+rejects it, and the viewer falls back to `screen.keyframe`: it recovers as well, but on the estimate
+the break left behind.
+
 Screen audio availability is queried separately with `screen.audio.state`
 (`share`, optional `stopped`, default false). Its reply is `{ audio: boolean }`.
 Older servers reject it normally; viewers then keep video without audio controls

@@ -103,6 +103,12 @@ const TRANSPORT_BYTE_HEADROOM: f64 = 1.5;
 const ADDRESSES_PER_TRANSPORT: usize = 4;
 /// Allocation (pauses, resumes, probing targets) and the budget check run this often.
 const ALLOCATION_TICK: Duration = Duration::from_millis(100);
+/// The estimate a stall's burst knocked down is remembered this long.
+const PEAK_MEMORY: Duration = Duration::from_secs(15);
+/// A viewer's word that its link is back moves its estimate at most this often.
+const RESTORE_EVERY: Duration = Duration::from_secs(10);
+/// The burst's own feedback can land after the viewer's word: one more fall this soon is undone.
+const RESTORE_HOLD: Duration = Duration::from_secs(1);
 /// A viewer whose every slot is paused, at least one for bandwidth, retries its most important
 /// one this long after the pause; a retry that was inconclusive is followed this long after it
 /// started. The continuous-fit resume may come first. A viewer's own Try again waits as long
@@ -520,6 +526,11 @@ pub enum ScreenCmd {
         session: SessionId,
         share: String,
     },
+    /// A viewer's `screen.stalled`.
+    Stalled {
+        session: SessionId,
+        share: String,
+    },
     DecodeFailed {
         session: SessionId,
         run: u64,
@@ -748,6 +759,14 @@ struct Attempt {
     counted: bool,
 }
 
+/// The last estimate put back on a viewer's word that its link had returned.
+#[derive(Clone, Copy)]
+struct Restored {
+    at: Instant,
+    target: u64,
+    held: bool,
+}
+
 struct Watcher {
     id: u64,
     session: SessionId,
@@ -789,6 +808,11 @@ struct Watcher {
     connection: u64,
     remembered: Option<u64>,
     /// The server-wide budget: no optimistic start goes above it.
+    /// The highest recent estimate, and when, for `link_back`.
+    peak: (u64, Instant),
+    /// The viewer dropped a stall's backlog and is receiving on time: a burst, not a slower link.
+    link_back: bool,
+    restored: Option<Restored>,
     ceiling: u64,
     /// The next automatic retry of a fully paused viewer, the retries that failed since media
     /// last kept flowing, and since when it has flowed with no slot paused for bandwidth.
@@ -1220,6 +1244,17 @@ impl Sfu {
                 });
                 if let Some(slot) = slot {
                     self.ask_keyframe(session, slot, now);
+                }
+            }
+            ScreenCmd::Stalled { session, share } => {
+                let slot = self.watchers.get(&session).and_then(|w| {
+                    w.slots.iter().position(|s| s.grant.as_ref().is_some_and(|g| g.share == share && g.alive()))
+                });
+                if let Some(slot) = slot {
+                    self.ask_keyframe(session, slot, now);
+                    if let Some(w) = self.watchers.get_mut(&session) {
+                        w.link_back = true;
+                    }
                 }
             }
             ScreenCmd::DecodeFailed { session, run, slot, generation, share } => {
@@ -2678,6 +2713,21 @@ fn allocate(
         w.rtc.bwe().set_desired_bitrate(Bitrate::bps(desired.unwrap_or(0)));
         w.desired = desired;
     }
+    let told = std::mem::take(&mut w.link_back)
+        && w.restored.is_none_or(|r| now.saturating_duration_since(r.at) >= RESTORE_EVERY);
+    let undone = w.restored.filter(|r| {
+        !r.held && now.saturating_duration_since(r.at) < RESTORE_HOLD && w.egress.estimate() < r.target / 2
+    });
+    if let Some(r) = undone {
+        restart_estimator(w, r.target, now, &caps, &lanes);
+        w.restored = Some(Restored { held: true, ..r });
+    } else if told {
+        let target = w.egress.needed(&caps, &lanes).map_or(w.peak.0, |needed| needed.min(w.peak.0));
+        if target > w.egress.estimate() {
+            restart_estimator(w, target, now, &caps, &lanes);
+            w.restored = Some(Restored { at: now, target, held: false });
+        }
+    }
     // Finish a ready priority handoff or resume before considering a fresh start.
     if let Some((slot, change)) = w.egress.allocate(now, &lanes, budget) {
         if change == Change::Resume && w.restarted.is_some() {
@@ -3017,6 +3067,9 @@ fn try_again(w: &mut Watcher, slot: usize, rates: &HashMap<String, ShareRate>, n
 
 /// Keep queue admission and transport pacing on the same estimate.
 fn set_estimate(w: &mut Watcher, estimate: u64, now: Instant) {
+    if estimate >= w.peak.0 || now.saturating_duration_since(w.peak.1) >= PEAK_MEMORY {
+        w.peak = (estimate, now);
+    }
     w.egress.set_estimate(estimate, now);
     pacing(w);
 }
@@ -3687,6 +3740,9 @@ fn watcher(
         connection: 0,
         remembered: None,
         ceiling: u64::MAX,
+        peak: (0, now),
+        link_back: false,
+        restored: None,
         retry_at: None,
         retries: 0,
         healthy_since: None,
@@ -4279,6 +4335,61 @@ pub(crate) mod tests {
         w.egress.set_estimate(9_000_000, Instant::now());
         sfu.end_watch(7, Instant::now());
         assert_eq!(sfu.remembered.get(&100).map(|(estimate, _)| *estimate), Some(9_000_000));
+    }
+
+    #[test]
+    fn a_viewer_whose_link_is_back_gets_its_estimate_back_once() {
+        let mut pair = Pair::new();
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
+        assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
+        set_estimate(&mut pair.w, 40_000_000, pair.now);
+        pair.now += Duration::from_secs(2);
+        set_estimate(&mut pair.w, 3_000_000, pair.now);
+        pair.w.link_back = true;
+        allocate(&mut pair.w, pair.now, &HashMap::new(), false);
+        let back = pair.w.egress.estimate();
+        assert!(back > 3_000_000, "the burst said nothing about the link");
+        assert!(back < 40_000_000, "the share's need, not the probed peak: {back}");
+        set_estimate(&mut pair.w, 3_000_000, pair.now);
+        pair.now += RESTORE_EVERY - Duration::from_secs(1);
+        pair.w.link_back = true;
+        allocate(&mut pair.w, pair.now, &HashMap::new(), false);
+        assert_eq!(pair.w.egress.estimate(), 3_000_000, "not on a viewer's say-so alone");
+        assert!(!pair.w.link_back);
+    }
+
+    #[test]
+    fn the_word_of_a_link_back_never_lowers_an_estimate_or_raises_a_stale_one() {
+        let mut pair = Pair::new();
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
+        assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
+        set_estimate(&mut pair.w, 40_000_000, pair.now);
+        pair.now += PEAK_MEMORY;
+        set_estimate(&mut pair.w, 3_000_000, pair.now);
+        pair.w.link_back = true;
+        allocate(&mut pair.w, pair.now, &HashMap::new(), false);
+        assert_eq!(pair.w.egress.estimate(), 3_000_000, "nothing recent to go back to");
+    }
+
+    #[test]
+    fn a_restored_estimate_survives_the_backlogs_own_feedback_once() {
+        let mut pair = Pair::new();
+        let origin = ScreenOrigin::new(1, "share".into(), 1, false, false, 8_000_000);
+        assign(&mut pair.w, 0, WatchGrant::new(origin.clone()), 1, pair.now);
+        set_estimate(&mut pair.w, 40_000_000, pair.now);
+        pair.now += Duration::from_secs(1);
+        set_estimate(&mut pair.w, 3_000_000, pair.now);
+        pair.w.link_back = true;
+        allocate(&mut pair.w, pair.now, &HashMap::new(), false);
+        let back = pair.w.egress.estimate();
+        pair.now += Duration::from_millis(600);
+        set_estimate(&mut pair.w, 3_000_000, pair.now);
+        allocate(&mut pair.w, pair.now, &HashMap::new(), false);
+        assert_eq!(pair.w.egress.estimate(), back, "the first feedback of the burst says nothing either");
+        pair.now += Duration::from_millis(600);
+        set_estimate(&mut pair.w, 3_000_000, pair.now);
+        allocate(&mut pair.w, pair.now, &HashMap::new(), false);
+        assert_eq!(pair.w.egress.estimate(), 3_000_000, "falling again is the link's answer");
     }
 
     #[test]

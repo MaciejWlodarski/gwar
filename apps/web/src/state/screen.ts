@@ -60,6 +60,8 @@ export interface Watch {
   audio?: boolean;
   /** Desktop app: the native mixer has taken this share's sound, so it can really be heard. */
   soundReady?: boolean;
+  /** A new watch is silent until its picture is on screen, or for `SOUND_HOLD_MS` at most. */
+  soundHeld?: true;
   paused?: ScreenPauseReason;
   waiting?: true;
 }
@@ -114,6 +116,7 @@ export type ScreenAction =
   | { type: "granted"; run: number; id: number; slot: number }
   | { type: "watchAudio"; run: number; id: number; audio: boolean }
   | { type: "watchSound"; id: number; ready: boolean }
+  | { type: "soundReleased"; id: number }
   | { type: "slot"; run: number; slot: number; share: string | null }
   | { type: "unwatch"; share: string }
   | { type: "paused"; share: string; reason: ScreenPauseReason }
@@ -239,6 +242,8 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       return state.own?.attempt === action.attempt ? { ...state, own: { ...state.own, soundAdding: action.adding } } : state;
     case "watchSound":
       return { ...state, watches: state.watches.map(w => w.id === action.id ? { ...w, soundReady: action.ready } : w) };
+    case "soundReleased":
+      return { ...state, watches: state.watches.map(w => w.id === action.id && w.soundHeld ? (({ soundHeld: _, ...rest }) => rest)(w) : w) };
     case "watchAudio":
       return action.run === state.transport.run ? { ...state, watches: state.watches.map(w => w.id === action.id && w.status === "watching" ? { ...w, audio: action.audio } : w) } : state;
     case "granted": {
@@ -249,7 +254,7 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
       if (!watch) return state;
       const slots = state.slots.slice();
       slots[slot] = watch.share;
-      return { ...state, slots, watches: state.watches.map(w => (w === watch ? { share: w.share, id: w.id, slot, status: "watching" } : w)) };
+      return { ...state, slots, watches: state.watches.map(w => (w === watch ? { share: w.share, id: w.id, slot, status: "watching", soundHeld: true } : w)) };
     }
     case "slot": {
       const { run, slot, share } = action;

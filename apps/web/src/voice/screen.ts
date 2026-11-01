@@ -8,6 +8,8 @@
  * transport (fresh DTLS and SSRCs), and the watch transport belongs to the session, with
  * `SCREEN_SLOTS` fixed receive-only slots the server fills (`screen.slot`).
  */
+import type { MediaKind } from "./late-frames";
+import type { LinkBack } from "./late-frames-worker";
 import type { PictureClock, SoundClock } from "./share-sync";
 import { RtcUplinkObserver, type UplinkStatus } from "./uplink-congestion";
 import type { Av1Capability } from "../proto/Av1Capability";
@@ -1564,12 +1566,20 @@ export interface WatchParams {
   /** `screen.watch.offer` with this run: the server's answer. */
   offer(sdp: string, run: number, h264?: H264Capability[], av1?: Av1Capability | null): Promise<string>;
   decodeFailed?(slot: number, share: string, generation: number): void;
+  /** Late frames were dropped: the decoder has nothing to go on until the next keyframe. */
+  frameLost?(slot: number): void;
   state(state: TransportState): void;
   /** A slot's video track arrived (once per slot and transport). */
   track(slot: number, stream: MediaStream): void;
 }
 
 export interface SlotStats { width: number; height: number; fps: number; framesDecoded: number }
+
+function createLateFramesWorker(lost: (slot: number) => void): Worker {
+  const worker = new Worker(new URL("./late-frames-worker.ts", import.meta.url), { type: "module", name: "gwar-late-frames" });
+  worker.onmessage = (event: MessageEvent<LinkBack>) => lost(event.data.slot);
+  return worker;
+}
 
 /**
  * The session's watch transport: `SCREEN_SLOTS` receive-only video m-lines (one on the guest
@@ -1586,6 +1596,7 @@ export class ScreenWatchTransport {
   private transceivers: RTCRtpTransceiver[] = [];
   private audioTransceivers: RTCRtpTransceiver[] = [];
   private heldBefore = new WeakMap<RTCRtpReceiver, { delay: number; emitted: number }>();
+  private lateFrames: Worker | null = null;
   private streams: MediaStream[] = [];
   private stopWatching: () => void = () => {};
   private closed = false;
@@ -1608,12 +1619,14 @@ export class ScreenWatchTransport {
       if (av1) negotiateDescriptor(transceiver, "recvonly");
       const receiver = transceiver.receiver as RTCRtpReceiver & { jitterBufferTarget?: number | null };
       if ("jitterBufferTarget" in receiver) { try { receiver.jitterBufferTarget = 0; } catch { /* out of range on some engines */ } }
+      this.shedLateFrames(receiver, i, "video");
       this.transceivers.push(transceiver);
       this.streams.push(new MediaStream());
       if (audio) {
         const sound = pc.addTransceiver("audio", { direction: "recvonly" });
         const transform = this.params.soundTransform?.(i);
         if (transform) sound.receiver.transform = transform;
+        else this.shedLateFrames(sound.receiver, i, "audio");
         this.audioTransceivers.push(sound);
       }
     }
@@ -1637,6 +1650,15 @@ export class ScreenWatchTransport {
     if (this.closed) return;
     this.stopWatching = watchState(pc, s => this.params.state(s), () => this.pc === pc);
     if (!this.closed && this.params.decodeFailed) this.decodeTimer = setInterval(() => void this.checkDecode(), 1000);
+  }
+
+  /** Late frames go before the receiver sees them, where the engine lets anything sit there. */
+  private shedLateFrames(receiver: RTCRtpReceiver, slot: number, kind: MediaKind): void {
+    if (typeof RTCRtpScriptTransform !== "function" || typeof Worker !== "function") return;
+    try {
+      this.lateFrames ??= createLateFramesWorker(slot => { if (!this.closed) this.params.frameLost?.(slot); });
+      receiver.transform = new RTCRtpScriptTransform(this.lateFrames, { slot, kind });
+    } catch { /* it plays as it would have */ }
   }
 
   keyframe(slot: number, share: string, generation: number): void {
@@ -1725,5 +1747,7 @@ export class ScreenWatchTransport {
     this.pc = null;
     this.transceivers = [];
     if (pc) { pc.ontrack = null; pc.onconnectionstatechange = null; pc.close(); }
+    this.lateFrames?.terminate();
+    this.lateFrames = null;
   }
 }

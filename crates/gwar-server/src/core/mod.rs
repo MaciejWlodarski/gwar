@@ -1935,6 +1935,7 @@ impl Core {
                 self.screen_decode_failed(session, &share, slot, run, generation)
             }
             Request::ScreenKeyframe { share } => self.screen_keyframe(session, &share),
+            Request::ScreenStalled { share } => self.screen_stalled(session, &share),
             Request::ScreenStop { share } => self.screen_stop(session, &share),
             Request::ScreenWatch { share } => self.screen_watch(session, &share),
             Request::ScreenUnwatch { share } => self.screen_unwatch(session, &share),

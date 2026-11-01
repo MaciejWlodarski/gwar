@@ -403,11 +403,45 @@ starts over like a new watch. A server without the query answers once and the vi
 again; a webview without `jitterBufferTarget` leaves the picture alone, and the desktop mixer can
 still hold sound.
 
-What this cannot fix is a picture that is not arriving. After a link stall the picture can stay
-500–1000 ms late for 10–20 s, and on a link jittery enough to collapse the estimate it can stop
-altogether. Sound then leads whatever is done here, and it does not chase seconds of picture
-delay at 1 %. The numbers are in
+**A new watch starts together.** Its sound is silent until its first picture is on screen, so
+nobody hears a share they cannot see yet, and nothing about the first frame changes. A picture that
+is 1.5 s late stops holding the sound back, because sound matters more. Past that moment the
+picture can still run 300–700 ms behind for a few seconds, while the sharer's encoder and uplink
+ramp; that is the first viewer of a new share only, and sound does not wait for it, because the
+picture catches up by itself and sound held for it would then lag.
+
+What this cannot fix is a picture that is not arriving: on a link jittery enough to collapse the
+estimate it can stop altogether, and sound then leads whatever is done here. The numbers are in
 [share-audio-validation.md](share-audio-validation.md#lip-sync).
+
+### After a link stall
+
+When a link stops for a while and comes back, everything it held arrives at once. A receiver that
+takes that backlog plays seconds behind and unlearns it slowly: the SFU's queue is clear within
+about 3 s, but 500–1600 ms stays in the viewer's jitter buffer for 7–10 s. The estimate falls with
+it, to 3–4 Mb/s from tens, and at that rate a keyframe misses its deadline. Two such keyframes
+paused the picture for more than 10 s, on a link that was back and proven seconds before.
+
+So a viewer drops the backlog before its receiver sees it (`apps/web/src/voice/late-frames.ts`).
+`RTCRtpScriptTransform` runs on each received frame and works out how much longer it took than the
+quickest of the last few seconds, by the media's own clock. A picture frame over 500 ms late, or a
+sound frame over 200 ms late, goes; in the desktop app sound leaves for the mixer, which drops late
+frames itself. Keyframes are always kept. Nothing is shed for more than a second in a row: a link
+that stays that slow is the link now, and it sets the new measure. Without script transforms a
+viewer plays the backlog, as before.
+
+The first frame of a backlog proves the link is back, so that is when the viewer sends
+`screen.stalled`, and again at the first frame in time, because frames were dropped since any
+keyframe in between. The SFU asks for a keyframe and puts the estimate back to what the watched
+shares need with room for a keyframe, never past what the link carried in the last 15 s. It does
+that at most once in 10 s on a viewer's word, and it undoes one more fall within the next second,
+because the burst's own feedback can land after the word of it. The estimator then proves or
+lowers it as usual.
+
+The picture has just jumped, so one more move goes unseen: after the backlog lands, the first look
+that finds the two sides over 45 ms apart moves the picture the whole way, once, while sound is
+free to come down at its own pace. Sound is only ever dropped before its decoder, which conceals
+the gap as it would a lost packet.
 
 ### Not included
 

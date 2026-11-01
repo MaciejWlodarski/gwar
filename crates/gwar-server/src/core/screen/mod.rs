@@ -824,6 +824,14 @@ impl Core {
         Ok(Response::Empty {})
     }
 
+    pub(super) fn screen_stalled(&mut self, session: SessionId, id: &str) -> Reply {
+        if !self.visible_share(session, id)?.viewers.contains(&session) {
+            return Err(err(ErrorCode::NotFound, "you are not watching this share"));
+        }
+        let _ = self.screen.try_send(ScreenCmd::Stalled { session, share: id.to_owned() });
+        Ok(Response::Empty {})
+    }
+
     /// Releases the slot that carries `id` for `session`: its grant ends now, the SFU wipes it
     /// next, and the viewer hears of it when `tell`.
     fn free_slot(&mut self, session: SessionId, id: &str, tell: bool) {

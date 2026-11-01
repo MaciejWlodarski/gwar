@@ -1233,6 +1233,15 @@ impl Egress {
     /// room for the largest recent keyframe within the deadline, within `PROBE_REACH` of the
     /// estimate. `None` with nothing watched.
     pub fn desired(&self, caps: &[u64], rates: &[ShareRate]) -> Option<u64> {
+        self.need(caps, rates).map(|need| need.min(PROBE_REACH * self.estimate) as u64)
+    }
+
+    /// What the watched shares need, with room for a keyframe, however far the estimate is from it.
+    pub fn needed(&self, caps: &[u64], rates: &[ShareRate]) -> Option<u64> {
+        self.need(caps, rates).map(|need| need as u64)
+    }
+
+    fn need(&self, caps: &[u64], rates: &[ShareRate]) -> Option<f64> {
         let watched: Vec<usize> = (0..self.lanes.len()).filter(|&l| self.lanes[l].assigned).collect();
         if watched.is_empty() {
             return None;
@@ -1244,8 +1253,7 @@ impl Egress {
             .max()
             .unwrap_or(0)
             .max(KEYFRAME_FLOOR);
-        let target = caps * DESIRED_HEADROOM + keyframe as f64 * 8.0 / DEADLINE.as_secs_f64();
-        Some(target.min(PROBE_REACH * self.estimate) as u64)
+        Some(caps * DESIRED_HEADROOM + keyframe as f64 * 8.0 / DEADLINE.as_secs_f64())
     }
 
     /// Active slots and their watch order, for the server-wide budget.

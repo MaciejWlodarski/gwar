@@ -931,8 +931,10 @@ jobs:
           pactl load-module module-null-sink sink_name=e2e
           pactl set-default-sink e2e
           mkdir -p "$RUNNER_TEMP/share-sync"
-          SYNC_OUT="$RUNNER_TEMP/share-sync/chromium.json" node apps/web/e2e/share-sync.mjs
-          SYNC_ENGINE=webkit SYNC_OUT="$RUNNER_TEMP/share-sync/webkit.json" node apps/web/e2e/share-sync.mjs
+          failed=0
+          SYNC_OUT="$RUNNER_TEMP/share-sync/chromium.json" node apps/web/e2e/share-sync.mjs || failed=$?
+          SYNC_ENGINE=webkit SYNC_OUT="$RUNNER_TEMP/share-sync/webkit.json" node apps/web/e2e/share-sync.mjs || failed=$?
+          exit "$failed"
       - name: Retain lip-sync reports even on failure
         if: always()
         timeout-minutes: 5
