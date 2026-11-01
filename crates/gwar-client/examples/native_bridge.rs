@@ -15,7 +15,7 @@ use std::{
     net::IpAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -24,7 +24,7 @@ use std::{
 use anyhow::Context;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use gwar_client::voice::{
-    LinkState, VoiceHandle,
+    LinkState, SlotStats, VoiceHandle,
     io::{AudioIo, AudioPorts, CaptureSample, OutputTiming, mono},
     keys::EncryptedStart,
     sframe::{Binding, ControlReply},
@@ -48,6 +48,7 @@ struct ToneIo {
     frequency: f64,
     played: Arc<Mutex<VecDeque<f32>>>,
     computer: ComputerLog,
+    from_ring: Arc<AtomicU64>,
 }
 
 /// The computer tone's strength at the speaker, one value per block, for as long as a run asks.
@@ -97,6 +98,7 @@ impl AudioIo for ToneIo {
                         mono,
                     ));
                 }
+                self.from_ring.fetch_add((BLOCK - missing) as u64, Ordering::Relaxed);
                 if let Some(log) = self.computer.lock().unwrap().as_mut() {
                     log.push(strength(&block, COMPUTER_TONE));
                 }
@@ -160,6 +162,8 @@ struct Bridge {
     frequency: f64,
     played: Arc<Mutex<VecDeque<f32>>>,
     computer: ComputerLog,
+    /// Samples the speaker has taken from the voice ring.
+    from_ring: Arc<AtomicU64>,
     state: Mutex<State>,
     /// When the fake computer started, and how many samples it has written.
     capture_clock: Arc<Mutex<(Option<Instant>, u64)>>,
@@ -235,6 +239,22 @@ impl Bridge {
             "voice_crypto_counters" => {
                 let keys = self.keys(&args)?;
                 Ok(keys.map_or(Value::Null, |k| serde_json::to_value(k.counters()).unwrap()))
+            }
+            "voice_flow" => {
+                let state = self.state.lock().unwrap();
+                let handle = state.handle.as_ref().context("no voice session")?;
+                let stats = handle.stats();
+                let sum = |field: fn(&SlotStats) -> u64| stats.slots.iter().map(field).sum::<u64>();
+                let crypto = handle.keys().map(|keys| keys.counters()).unwrap_or_default();
+                Ok(json!({
+                    "framesReceived": stats.frames_received,
+                    "rejected": crypto.no_key + crypto.auth_failed + crypto.replay_dropped,
+                    "decrypted": crypto.decrypted,
+                    "concealments": sum(|slot| slot.concealments),
+                    "queuedSamples": sum(|slot| slot.queued_samples),
+                    "speakerSamples": self.from_ring.load(Ordering::Relaxed),
+                    "underrunSamples": stats.underrun_samples,
+                }))
             }
             "audio_devices" => Ok(json!({ "inputs": [], "outputs": [] })),
             "share_capture_support" => Ok(json!("ok")),
@@ -366,6 +386,7 @@ impl Bridge {
             frequency: self.frequency,
             played: self.played.clone(),
             computer: self.computer.clone(),
+            from_ring: self.from_ring.clone(),
         });
         let server: IpAddr = "127.0.0.1".parse()?;
         let handle = match crypto {
@@ -434,6 +455,7 @@ async fn main() -> anyhow::Result<()> {
         frequency,
         played: Arc::default(),
         computer: Arc::default(),
+        from_ring: Arc::default(),
         state: Mutex::default(),
         capture_clock: Arc::default(),
     });

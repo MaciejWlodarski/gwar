@@ -260,8 +260,10 @@ worker → share_playback_frames (raw batch, one in flight, 400 frames at most)
   share sound that actually plays pins a stereo canceller for the rest of that voice session,
   even after the share ends, so hopping between shares costs one relearn. A sharer, a deafened
   viewer and a viewer who muted the share stay on one channel. A reconnect replaces the
-  pipeline, so it starts on one channel and pins again at the next share sound. The stereo
-  canceller is built off the voice thread and hears everything while it learns, 3 s of sound,
+  pipeline, so it starts on one channel and pins again at the next share sound. A sleeping
+  worker starts with each voice session, before the pipeline is promoted, and builds the stereo
+  canceller when told; the pin itself touches neither the heap nor a lock. The stereo
+  canceller hears everything while it learns, 3 s of sound,
   with voice still coming from the mono one; a raised-cosine frame hands over. So voice echo
   and level do not change for the first 3 s, but wide share sound leaks for about that long
   (see [validation](share-audio-validation.md#voice)). Vendored Sonora adds the one option

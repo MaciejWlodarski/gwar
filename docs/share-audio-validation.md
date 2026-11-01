@@ -591,6 +591,15 @@ holds that record, the tone's amplitude for every 10 ms at the speaker (`toneCov
 share of the source lost. Through the canceller nothing is removed: the record is taken from
 the speaker ring, and the canceller only touches the microphone's path.
 
+One WebKit run of `native-voice.mjs`, on `a5e36236`, timed out at `native dan hears browser
+alice`, before any share, with the listener's speaker at exactly 0 for 20 s. That is 1 run in 18
+on that code; the 17 after it passed, 9 of them straight after Chromium as in the gates. Cause
+not shown. A timeout on that step, or on `native dan hears native erin`, now prints
+`voice path at failure` with the first stage that stopped: the sender's audio context or packets,
+remote track, decode, ring or output (`whereSoundStopped`). Forced failures read correctly: a
+suspended context as `sender` in both browsers, a muted track as `remote track`, and another
+frequency as `output`.
+
 `browser-private` also failed once, on `7f391279`, at `the member joins` in `private.mjs`, before
 any share. This PR does not touch that path. It did not recur in eleven local runs, ten of them
 under load, or in any CI attempt since. Its cause is not known. A timeout there now prints each
@@ -657,12 +666,21 @@ The cost per 10 ms frame, render and capture, `stereo_reference_cost` in release
 
 | Canceller | Median | p99 |
 | --- | --- | --- |
-| One channel, `origin/main`'s path | 46.4 µs (0.46% of a core) | 51.2 µs |
-| Voice alone, this branch | 46.6 µs (0.47%) | 51.4 µs |
-| Pinned, share sound playing | 48.3 µs (0.48%) | 52.7 µs |
+| One channel, `origin/main`'s path | 46.3 µs (0.46% of a core) | 51.5 µs |
+| Voice alone, this branch | 46.7 µs (0.47%) | 52.4 µs |
+| Pinned, share sound playing | 48.1 µs (0.48%) | 58.9 µs |
 
-The slowest of the three frames through the switch took 74 µs. Both cancellers run for those
+The slowest of the three frames through the switch took 76 µs. Both cancellers run for those
 3 s of learning.
+
+The voice thread never goes to the heap on the way to stereo: the pin, taking the built
+canceller and the take-over make no allocation or free at all
+(`the_way_to_stereo_never_touches_the_heap_on_the_voice_thread`, against nine on the pin alone
+before). A worker that sleeps through the session does that work; a session with no share sound
+pays for that one thread and ends it (`a_session_without_share_sound_ends_its_sleeping_worker`).
+Sonora itself is another matter, here and on `origin/main`: 98 heap trips a frame on one canceller,
+98 pinned, 174 while both run during learning. That is unchanged by this PR for voice alone,
+and it is not bounded by anything here.
 
 The switch, against staying mono with no share at all, in simulated rooms (3 far voices × 3
 delays × 2 near voices), seconds after the pin, mean dBFS (`the_switch_against_staying_mono`):

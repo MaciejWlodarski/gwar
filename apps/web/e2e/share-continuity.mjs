@@ -23,6 +23,23 @@ export async function shareContinuity(read, ms, { now = Date.now, wait = delay =
   return { ms: now() - started, frames: delta("frames"), decoded: delta("decoded"), concealed: delta("concealed"), late: delta("late"), backlog: delta("backlog"), inputDrops: delta("input"), ringUnderruns: delta("underruns"), longestGapMs, longestLookMs, looks, heard };
 }
 
+/**
+ * The first stage of a voice path that stopped, from two looks a second apart at a listener in the
+ * native engine. `sender` is the browser that speaks, when it is one.
+ */
+export function whereSoundStopped(first, last) {
+  const moved = key => last[key] - first[key];
+  const { context, packetsSent } = last.sender ?? {};
+  if (last.sender && context !== "running") return `sender: its audio context is ${context}`;
+  if (last.sender && packetsSent === first.sender.packetsSent) return "sender: no packets leave it";
+  if (moved("framesReceived") === 0) return "remote track: no frames reach the listener";
+  if (moved("rejected") > 0) return `decode: ${moved("rejected")} frames refused before decoding`;
+  if (moved("concealments") > moved("framesReceived") / 2) return `decode: ${moved("concealments")} frames made up for ${moved("framesReceived")} received`;
+  if (moved("speakerSamples") === 0) return "ring: nothing goes to the speaker";
+  if (last.rms < 0.002) return "output: the speaker plays silence, so the frames carry none";
+  return `output: the speaker plays another sound (rms ${last.rms.toFixed(3)})`;
+}
+
 /** How long `{ started, ms }` batches took there and back, and the longest wait between two of them. */
 export function batchTiming(batches) {
   const trips = batches.map(batch => batch.ms).sort((a, b) => a - b);

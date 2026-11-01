@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { batchTiming, continuityLimits, continuityProblems, shareContinuity, toneCoverage } from "./share-continuity.mjs";
+import { batchTiming, continuityLimits, continuityProblems, shareContinuity, toneCoverage, whereSoundStopped } from "./share-continuity.mjs";
 
 /** A clock the run moves itself; `answers` lists when each stats read comes back and what it says. */
 function scripted(answers) {
@@ -71,6 +71,21 @@ test("tone coverage counts where the tone played and its longest gap", () => {
   const strengths = [...Array(40).fill(0.2), ...Array(30).fill(0), ...Array(25).fill(0.1), ...Array(5).fill(0.001)];
   assert.deepEqual(toneCoverage(strengths), { blocks: 100, present: 65, share: 0.65, longestSilentMs: 300, strength: 0.2 });
   assert.equal(toneCoverage([]).share, 0);
+});
+
+test("a silent listener's path names the first stage that stopped", () => {
+  const first = { sender: { context: "running", packetsSent: 100 }, framesReceived: 100, rejected: 0, concealments: 0, speakerSamples: 48_000, rms: 0 };
+  const flowing = { ...first, sender: { context: "running", packetsSent: 150 }, framesReceived: 150, speakerSamples: 96_000 };
+  const stopped = changes => whereSoundStopped(first, { ...flowing, ...changes }).split(":")[0];
+  assert.equal(stopped({ sender: { context: "suspended", packetsSent: 150 } }), "sender");
+  assert.equal(stopped({ sender: { context: "running", packetsSent: 100 } }), "sender");
+  assert.equal(stopped({ framesReceived: 100 }), "remote track");
+  assert.equal(stopped({ rejected: 50 }), "decode");
+  assert.equal(stopped({ concealments: 50 }), "decode");
+  assert.equal(stopped({ speakerSamples: 48_000 }), "ring");
+  assert.equal(stopped({}), "output");
+  assert.match(whereSoundStopped(first, { ...flowing, rms: 0.2 }), /^output: .*another sound/);
+  assert.equal(whereSoundStopped({ ...first, sender: null }, { ...flowing, sender: null, framesReceived: 100 }).split(":")[0], "remote track");
 });
 
 test("batch timing finds the slow trips and the wait between batches", () => {

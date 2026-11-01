@@ -20,7 +20,7 @@ import { chooseFirstRunName } from "./first-run.mjs";
 import { stopProcesses } from "./processes.mjs";
 import { canvasCapture, readBarcode, stampBarcode } from "./screen-source.mjs";
 import { monitorEventLoopDelay } from "node:perf_hooks";
-import { batchTiming, continuityLimits, continuityProblems, shareContinuity, toneCoverage } from "./share-continuity.mjs";
+import { batchTiming, continuityLimits, continuityProblems, shareContinuity, toneCoverage, whereSoundStopped } from "./share-continuity.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -130,6 +130,15 @@ function bridgePatch() {
 /** Synthetic microphone and the app's output tap for the browser device. */
 function devicePatch(frequency) {
   window.__outputs = [];
+  window.__microphones = [];
+  window.__peers = [];
+  window.RTCPeerConnection = new Proxy(window.RTCPeerConnection, {
+    construct(target, args, created) {
+      const peer = Reflect.construct(target, args, created);
+      window.__peers.push(peer);
+      return peer;
+    },
+  });
   const connect = AudioNode.prototype.connect;
   AudioNode.prototype.connect = function (...args) {
     if (args[0] === this.context.destination) {
@@ -143,6 +152,7 @@ function devicePatch(frequency) {
   const media = navigator.mediaDevices;
   media.getUserMedia = async () => {
     const context = new AudioContext();
+    window.__microphones.push(context);
     const oscillator = context.createOscillator();
     oscillator.frequency.value = frequency;
     const gain = context.createGain();
@@ -173,6 +183,35 @@ async function browserTone(page, frequency) {
     return rms < 0.002 ? 0 : 2 * (sine * sine + cosine * cosine) / (pcm.length * energy);
   }, frequency);
 }
+/** What a browser that speaks is doing: its fake microphone's state and what it has sent. */
+const senderFlow = page => page.evaluate(async () => {
+  let packetsSent = 0;
+  for (const peer of window.__peers) {
+    for (const stat of (await peer.getStats()).values()) if (stat.type === "outbound-rtp" && stat.kind === "audio") packetsSent += stat.packetsSent ?? 0;
+  }
+  return { context: window.__microphones.at(-1)?.state ?? "missing", packetsSent };
+});
+
+/** Waits to hear `frequency`; if it never comes, says where on `speaker`'s way here it stopped. */
+async function hearsFrom(listener, speaker, frequency, what, timeout) {
+  try { return await waitFor(() => hears(listener, frequency), what, timeout); }
+  catch (error) {
+    const look = async () => ({
+      sender: speaker.native ? null : await senderFlow(speaker.page),
+      ...await listener.native.request("voice_flow", {}),
+      rms: (await listener.native.request("snapshot", { frequency })).rms,
+    });
+    const report = await (async () => {
+      const first = await look();
+      await sleep(1_000);
+      const last = await look();
+      return { stopped: whereSoundStopped(first, last), first, last };
+    })().catch(String);
+    console.log(`voice path at failure: ${what}: ${JSON.stringify(report)}`);
+    throw error;
+  }
+}
+
 const hears = async (device, frequency) => device.native ? device.native.hears(frequency) : (await browserTone(device.page, frequency)) > 0.05;
 
 const voice = page => page.evaluate(async () => {
@@ -395,14 +434,14 @@ async function run(engine, web, server, token) {
     // Browser <-> native through the SFU, both directions SFrame.
     timings.danEnter = await join(dan, channel);
     timings.danActive = await active(dan, "native sending key active");
-    timings.danHearsAlice = await waitFor(() => hears(dan, 440), "native dan hears browser alice", 20_000);
+    timings.danHearsAlice = await hearsFrom(dan, alice, 440, "native dan hears browser alice", 20_000);
     timings.aliceHearsDan = await waitFor(() => hears(alice, 550), "browser alice hears native dan", 20_000);
 
     // Native <-> native, plus both natives with the browser.
     timings.erinEnter = await join(erin, channel);
     timings.erinActive = await active(erin, "native sending key active");
     timings.erinHears = await waitFor(async () => (await hears(erin, 440)) && (await hears(erin, 550)), "native erin hears alice and dan", 25_000);
-    timings.danHearsErin = await waitFor(() => hears(dan, 770), "native dan hears native erin", 25_000);
+    timings.danHearsErin = await hearsFrom(dan, erin, 770, "native dan hears native erin", 25_000);
     timings.aliceHearsErin = await waitFor(() => hears(alice, 770), "browser alice hears native erin", 25_000);
 
     // Real SFrame on every engine: both directions counted, nothing failed.
