@@ -409,10 +409,14 @@ function mobile(): boolean {
   return data?.mobile ?? /Mobi|Android|iPhone|iPad/i.test(navigator.userAgent ?? "");
 }
 
+/** For a decoder probe that hangs, not for a busy machine: a watch transport keeps its answer for life. */
+const DECODE_PROBE_MS = 10_000;
+
 /**
  * The largest AV1 size (720p, 1080p or 1440p, at 60 fps) that passed a real WebRTC decoder probe:
- * hardware, or software on a desktop up to 1080p. `null` (none, unavailable or slow) keeps AV1
- * out of the watch offer, so no AV1 stream ever reaches this viewer.
+ * hardware, or software on a desktop up to 1080p. `null` (none, unavailable or hung) keeps AV1
+ * out of the watch offer, so no AV1 stream ever reaches this viewer, and its watch turns an AV1
+ * share to H.264 for everyone.
  */
 export async function probeAv1(): Promise<Av1Capability | null> {
   const media = navigator.mediaCapabilities;
@@ -432,7 +436,7 @@ export async function probeAv1(): Promise<Av1Capability | null> {
     const found = targets.findLast((_, i) => ok[i]);
     return found ? { width: found.width, height: found.height } : null;
   });
-  return within(probes, 1500, null);
+  return within(probes, DECODE_PROBE_MS, null);
 }
 
 /**
@@ -480,8 +484,6 @@ function declareSectionAv1Level(lines: string[], level: number): string[] {
   return out;
 }
 
-const H264_PROBE_MS = 10_000;
-
 /**
  * Each returned tuple has passed a real WebRTC decoder probe; unavailable/timeout means SDP only.
  * That is level 3.1, so a viewer who ran out of time is refused any 1080p share for the whole
@@ -511,7 +513,7 @@ export async function probeH264(): Promise<H264Capability[]> {
     const highest = supported.findLast(c => c !== null);
     if (highest) result.push(highest);
   }));
-  await Promise.race([probes, new Promise<void>(resolve => { timer = setTimeout(() => { console.warn("[screen] H.264 decode probe timed out"); resolve(); }, H264_PROBE_MS); })]);
+  await Promise.race([probes, new Promise<void>(resolve => { timer = setTimeout(() => { console.warn("[screen] H.264 decode probe timed out"); resolve(); }, DECODE_PROBE_MS); })]);
   clearTimeout(timer);
   // Late probe completions cannot mutate the capability message after the timeout.
   return [...result].sort((a, b) => a.profile_level_id - b.profile_level_id);
