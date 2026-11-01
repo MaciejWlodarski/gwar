@@ -30,6 +30,11 @@ export type ShareAvailability = Exclude<ScreenSupport, "ok"> | "ok" | "teamspeak
 
 /** How long `screen.watch` is retried while the server has not seen the watch transport connect. */
 const WATCH_UNAVAILABLE_MS = 5_000;
+/**
+ * For the answers a watch transport keeps for life. Old servers refuse at once, so a timeout here
+ * only ever means a busy machine, and reading it as "no" loses the share's sound, or H.264 at 1080p.
+ */
+const WATCH_FEATURE_TIMEOUT_MS = 10_000;
 /** A watch's first frame must arrive within this long after its grant, across stage changes. */
 const FIRST_FRAME_TIMEOUT_MS = 35_000;
 /** The server takes a Try again at most this long after the share's last start or retry for me, and holds an earlier one until then (`RETRY_FIRST`). */
@@ -800,7 +805,7 @@ export class ScreenController {
       run,
       av1: true,
       audio: async () => {
-        const server = await conn.request("screen.audio.capabilities", {}, { timeoutMs: 1_500 }).then(f => f.screen_audio === true).catch(() => false);
+        const server = await conn.request("screen.audio.capabilities", {}, { timeoutMs: WATCH_FEATURE_TIMEOUT_MS }).then(f => f.screen_audio === true).catch(() => false);
         const native = this.usesNativeSound();
         // Without a way to keep it from the webview's decoder, the desktop app stays video only.
         const link = native && server && await shareSoundReceivable() ? await this.soundLink()?.catch(() => null) : null;
@@ -817,7 +822,7 @@ export class ScreenController {
         // validators. An older server replies bad_request and retains legacy offers.
         await conn.request("screen.spec.capabilities", {}, { timeoutMs: 1_500 }).catch(() => {});
         if (this.transport !== transport) throw new Error("the watch transport was replaced");
-        screenH264 = await conn.request("screen.capabilities", {}, { timeoutMs: 1_500 })
+        screenH264 = await conn.request("screen.capabilities", {}, { timeoutMs: WATCH_FEATURE_TIMEOUT_MS })
           .then(features => features.screen_h264 === true).catch(() => false);
         if (this.transport !== transport) throw new Error("the watch transport was replaced");
         // Only a server that knows the field may see it: older ones reject unknown fields.

@@ -480,7 +480,13 @@ function declareSectionAv1Level(lines: string[], level: number): string[] {
   return out;
 }
 
-/** Each returned tuple has passed a real WebRTC decoder probe; unavailable/timeout means SDP only. */
+const H264_PROBE_MS = 10_000;
+
+/**
+ * Each returned tuple has passed a real WebRTC decoder probe; unavailable/timeout means SDP only.
+ * That is level 3.1, so a viewer who ran out of time is refused any 1080p share for the whole
+ * transport: the deadline is for a probe that hangs, not for a busy machine.
+ */
 export async function probeH264(): Promise<H264Capability[]> {
   const media = navigator.mediaCapabilities;
   if (typeof media?.decodingInfo !== "function") return [];
@@ -505,7 +511,7 @@ export async function probeH264(): Promise<H264Capability[]> {
     const highest = supported.findLast(c => c !== null);
     if (highest) result.push(highest);
   }));
-  await Promise.race([probes, new Promise<void>(resolve => { timer = setTimeout(resolve, 1500); })]);
+  await Promise.race([probes, new Promise<void>(resolve => { timer = setTimeout(() => { console.warn("[screen] H.264 decode probe timed out"); resolve(); }, H264_PROBE_MS); })]);
   clearTimeout(timer);
   // Late probe completions cannot mutate the capability message after the timeout.
   return [...result].sort((a, b) => a.profile_level_id - b.profile_level_id);

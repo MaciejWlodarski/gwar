@@ -418,12 +418,23 @@ describe("verified H.264 decode capability and progress", () => {
     decodingInfo.mockRejectedValue(new Error("unsupported"));
     expect(await probeH264()).toEqual([]);
   });
+  it("waits for a busy machine's probe: a late answer still counts", async () => {
+    const decodingInfo = vi.fn(async (c: MediaDecodingConfiguration) => {
+      await new Promise(resolve => setTimeout(resolve, 2_000));
+      return { supported: c.video!.width <= 1920, smooth: true, powerEfficient: false };
+    });
+    vi.stubGlobal("navigator", { mediaCapabilities: { decodingInfo } });
+    const { probeH264 } = await import("./screen");
+    const pending = probeH264();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect((await pending).map(c => c.max_fs)).toEqual([8160, 8160, 8160]);
+  });
   it("bounds probe time and never publishes an unverified or late tuple", async () => {
     let finish!: (v: MediaCapabilitiesDecodingInfo) => void;
     vi.stubGlobal("navigator", { mediaCapabilities: { decodingInfo: () => new Promise<MediaCapabilitiesDecodingInfo>(resolve => { finish = resolve; }) } });
     const { probeH264 } = await import("./screen");
     const pending = probeH264();
-    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(10_000);
     const caps = await pending;
     expect(caps).toEqual([]);
     finish({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null });
