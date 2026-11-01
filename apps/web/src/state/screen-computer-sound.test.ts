@@ -10,7 +10,7 @@ import { useSettings } from "./settings";
 import { useSession, useUi } from "./stores";
 
 const sound = vi.hoisted(() => ({
-  instances: [] as Array<{ link: unknown; ended: () => void; stop: ReturnType<typeof vi.fn>; start: ReturnType<typeof vi.fn> }>,
+  instances: [] as Array<{ link: unknown; ended: (state?: string) => void; resuming: (active: boolean) => void; stop: ReturnType<typeof vi.fn>; start: ReturnType<typeof vi.fn> }>,
   result: null as unknown,
   receivers: [] as Array<{ run: number; slots: Array<[number, number]>; gains: Array<[number, number]>; closed: boolean }>,
   receivable: true,
@@ -21,7 +21,7 @@ vi.mock("../voice/share-sound", () => ({
   ComputerSound: class {
     stop = vi.fn();
     start = vi.fn(async () => sound.result);
-    constructor(readonly link: unknown, readonly ended: () => void) { sound.instances.push(this); }
+    constructor(readonly link: unknown, readonly ended: (state?: string) => void, readonly resuming: (active: boolean) => void) { sound.instances.push(this); }
   },
   ShareSoundReceiver: class {
     slots: Array<[number, number]> = [];
@@ -155,12 +155,35 @@ describe("computer sound", () => {
     expect(own()).not.toBeNull();
   });
 
+  it("says when sound is coming back, and what stopped it from coming back", async () => {
+    const screen = controllerOn(link());
+    choosing("ok");
+    await screen.confirmShare();
+    sound.instances[0]!.resuming(true);
+    expect(own()).toMatchObject({ computerSound: "resuming", audio: true });
+    sound.instances[0]!.resuming(false);
+    expect(own()).toMatchObject({ computerSound: "ok", audio: true });
+    sound.instances[0]!.resuming(true);
+    sound.instances[0]!.ended("permission");
+    expect(own()).toMatchObject({ computerSound: "permission", audio: false });
+  });
+
+  it("lets the sharer take sound back while it is coming back", async () => {
+    const screen = controllerOn(link());
+    choosing("ok");
+    await screen.confirmShare();
+    sound.instances[0]!.resuming(true);
+    screen.stopComputerSound();
+    expect(sound.instances[0]!.stop).toHaveBeenCalled();
+    expect(own()).toMatchObject({ computerSound: "stopped", audio: false });
+  });
+
   it("reports a capture the OS ended, and ends with the share", async () => {
     const screen = controllerOn(link());
     choosing("ok");
     await screen.confirmShare();
-    sound.instances[0]!.ended();
-    expect(own()).toMatchObject({ computerSound: "failed" });
+    sound.instances[0]!.ended("failed");
+    expect(own()).toMatchObject({ computerSound: "failed", audio: false });
     choosing("ok");
     await screen.confirmShare();
     await screen.stopShare();

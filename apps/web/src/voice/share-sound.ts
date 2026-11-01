@@ -11,12 +11,20 @@ import { silenceWebviewMedia } from "./webview-silence";
 
 export interface ShareSoundLink { api: TauriBridge; owner: number }
 export type ComputerSoundSupport = "ok" | "permission" | "unsupported";
-/** Why there is no computer sound, or `ok` while it flows. `stopped`: the sharer turned it off. */
-export type ComputerSoundState = ComputerSoundSupport | "failed" | "stopped";
+/** Why a capture ended without the sharer asking. */
+export type ComputerSoundEnd = Exclude<ComputerSoundSupport, "ok"> | "failed";
+/**
+ * Why there is no computer sound, or `ok` while it flows. `resuming`: it paused while nothing read
+ * it and is on its way back. `stopped`: the sharer turned it off.
+ */
+export type ComputerSoundState = ComputerSoundSupport | "failed" | "resuming" | "stopped";
 
 const SAMPLE_RATE = 48_000;
 /** Sound must never delay the picture: an OS capture that hangs just means no sound. */
 const START_TIMEOUT_MS = 4_000;
+/** The OS may need a moment after a machine wakes; a capture that stays refused is a failure. */
+const RESUME_TRIES = 3;
+const RESUME_RETRY_MS = 1_000;
 /** About two seconds of four shares; older frames would only be dropped by the mixer's jitter. */
 const MAX_PENDING_FRAMES = 400;
 const MAX_BATCH_FRAMES = 64;
@@ -30,6 +38,12 @@ export async function computerSoundSupport(link: ShareSoundLink): Promise<Comput
 }
 
 const toBuffer = (bytes: ArrayBuffer | ArrayLike<number>): ArrayBuffer => bytes instanceof ArrayBuffer ? bytes : Uint8Array.from(bytes).buffer;
+
+function withinStartTime<T>(work: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("capture start timed out")), START_TIMEOUT_MS); });
+  return Promise.race([work, late]).finally(() => clearTimeout(timer));
+}
 
 let lastCapture = 0;
 /** Grows across reloads too: the shell refuses an id it has already seen. */
@@ -48,8 +62,15 @@ export class ComputerSound {
   private unsilence: (() => void) | null = null;
   private stopped = false;
 
-  /** `ended` reports a capture that the OS ended, never one stopped through `stop`. */
-  constructor(private readonly link: () => Promise<ShareSoundLink> | null, private readonly ended: () => void) {
+  /**
+   * `ended` reports a capture that ended by itself, never one stopped through `stop`. `resuming`
+   * brackets the time a paused capture is on its way back.
+   */
+  constructor(
+    private readonly link: () => Promise<ShareSoundLink> | null,
+    private readonly ended: (state: ComputerSoundEnd) => void,
+    private readonly resuming: (active: boolean) => void = () => {},
+  ) {
     this.context = new AudioContext({ sampleRate: SAMPLE_RATE, latencyHint: "interactive" });
     void this.context.resume().catch(() => {});
   }
@@ -86,10 +107,7 @@ export class ComputerSound {
     const id = nextCapture();
     // Registered first: a stop racing a slow start must reach the shell after it.
     this.capture = { link, id };
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("capture start timed out")), START_TIMEOUT_MS); });
-    try { await Promise.race([link.api.invoke("share_capture_start", { owner: link.owner, id }), late]); }
-    finally { clearTimeout(timer); }
+    await withinStartTime(link.api.invoke("share_capture_start", { owner: link.owner, id }));
     this.checkLive();
     const track = destination.stream.getAudioTracks()[0];
     if (!track) throw new Error("no sound track");
@@ -100,15 +118,39 @@ export class ComputerSound {
 
   /** Waits on the shell's own promise, so a hidden window's timers do not slow the sound. */
   private async pump(link: ShareSoundLink, id: number, port: MessagePort): Promise<void> {
+    let end: ComputerSoundEnd = "failed";
     while (!this.stopped) {
       let bytes: ArrayBuffer;
       try { bytes = toBuffer(await link.api.invoke<ArrayBuffer>("share_capture_read", { owner: link.owner, id })); }
-      catch { break; }
+      catch (error) {
+        if (error !== "paused" || this.stopped) break;
+        const refused = await this.resume(link, id);
+        if (!refused) continue;
+        end = refused;
+        break;
+      }
       if (!this.stopped && bytes.byteLength) port.postMessage(bytes, [bytes]);
     }
     if (this.stopped) return;
     this.stop();
-    this.ended();
+    this.ended(end);
+  }
+
+  /** Brings back a capture the shell paused. Returns why it could not, if it could not. */
+  private async resume(link: ShareSoundLink, id: number): Promise<ComputerSoundEnd | null> {
+    this.resuming(true);
+    for (let tries = 1; !this.stopped; tries++) {
+      try {
+        await withinStartTime(link.api.invoke("share_capture_resume", { owner: link.owner, id }));
+        if (!this.stopped) this.resuming(false);
+        return null;
+      } catch (error) {
+        if (error === "permission" || error === "unsupported") return error;
+        if (error !== "failed" || tries === RESUME_TRIES) return "failed";
+      }
+      await new Promise(resolve => setTimeout(resolve, RESUME_RETRY_MS));
+    }
+    return null;
   }
 
   stop(): void {

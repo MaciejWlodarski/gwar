@@ -148,6 +148,7 @@ function QualityControls({ spec, bar = false }: { spec: ScreenSpec; bar?: boolea
 
 /** The sentence that says what happens to sound, for the sharer's quality menu and details. */
 function soundStatus(own: OwnShare): Key {
+  if (own.computerSound === "resuming") return "screen.computerSoundResuming";
   const computer = isDesktop() || own.computerSound !== undefined;
   if (own.audio) {
     if (own.phase === "live") return computer ? "screen.computerSoundSharing" : "screen.audioSharing";
@@ -252,6 +253,8 @@ export function SharingBar() {
   const links = useScreen(s => s.links);
   if (!own || (own.phase !== "starting" && own.phase !== "live" && own.phase !== "reconnecting")) return null;
   const viewers = own.viewers + own.guests;
+  const resuming = own.computerSound === "resuming";
+  const audioLabel = resuming ? "screen.audioResuming" : own.audio ? viewers === 0 ? "screen.sharingAudio" : "screen.audioOn" : "screen.audioOff";
   const watching = own.phase === "live" ? t(countKey(lang, "screen.watching", viewers), { count: viewers }) : t(own.phase === "reconnecting" ? "screen.reconnecting" : "screen.starting");
   const linked = !!own.share && !!links[own.share];
   const linkStatus = `${t("screen.tsLinkOn")} · ${t(countKey(lang, "screen.guests", own.guests), { count: own.guests })}`;
@@ -264,8 +267,8 @@ export function SharingBar() {
         <span className="hidden lg:inline">{linkStatus}</span>
         <span className="hidden lg:inline-flex"><Button size="sm" variant="secondary" className="border-white/40 px-2 text-white hover:bg-white/15" onClick={() => void controller.screen.turnOffLink(own.share!)}>{t("screen.tsTurnOff")}</Button></span>
       </span>}
-      {own.phase === "live" && <span data-testid="share-audio-status" className="flex shrink-0 items-center gap-1 text-xs" aria-label={t(own.audio ? viewers === 0 ? "screen.sharingAudio" : "screen.audioOn" : "screen.audioOff")}>
-        {own.audio ? <Volume2 aria-hidden className="size-3.5" /> : <VolumeX aria-hidden className="size-3.5" />}<span className="hidden sm:inline">{t(own.audio ? viewers === 0 ? "screen.sharingAudio" : "screen.audioOn" : "screen.audioOff")}</span>
+      {own.phase === "live" && <span data-testid="share-audio-status" className="flex shrink-0 items-center gap-1 text-xs" aria-label={t(audioLabel)}>
+        {own.audio && !resuming ? <Volume2 aria-hidden className="size-3.5" /> : <VolumeX aria-hidden className="size-3.5" />}<span className="hidden sm:inline">{t(audioLabel)}</span>
       </span>}
       <ConnectionIndicator variant="bar" compact />
       <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 sm:px-2" onClick={() => setDetails(true)}>{t("common.details")}</Button>
@@ -275,7 +278,7 @@ export function SharingBar() {
         <div className="mb-3 text-sm">
           <p>{t(soundStatus(own))}</p>
           {own.computerSound === "permission" && <ComputerSoundPermission />}
-          {own.audio && own.computerSound === "ok" && <Button size="sm" className="mt-1.5" onClick={() => controller.screen.stopComputerSound()}>{t("screen.stopComputerSound")}</Button>}
+          {own.audio && (own.computerSound === "ok" || resuming) && <Button size="sm" className="mt-1.5" onClick={() => controller.screen.stopComputerSound()}>{t("screen.stopComputerSound")}</Button>}
         </div>
         <QualityControls spec={own.spec} />
         {own.phase === "live" && <SenderStats />}

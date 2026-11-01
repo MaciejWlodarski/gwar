@@ -83,7 +83,7 @@ try {
         await fits(`choose ${state}`);
         await shot(`choose-${state}`);
       }
-      for (const state of ["ok", "failed", "stopped", "permission"]) {
+      for (const state of ["ok", "resuming", "failed", "stopped", "permission"]) {
         await page.goto(`${base}?lang=${lang}&computer=${state}`);
         await page.getByRole("status", { name: lang === "pl" ? "Udostępniasz ekran" : "You are sharing your screen" }).waitFor();
         await page.waitForFunction(() => document.querySelector("video[data-share]")?.readyState >= 2);

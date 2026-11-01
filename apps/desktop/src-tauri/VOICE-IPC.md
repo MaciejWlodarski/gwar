@@ -97,15 +97,17 @@ See [share-audio](../../../docs/share-audio.md#desktop-app-computer-sound-and-na
 Every command except `share_capture_support` and `share_capture_allow` takes the voice `owner`
 and refuses a superseded one or any window but `main`. Bootstrap ends a capture, cancels a
 start under way and drops the playout left by the previous view. So do a page load and, on
-Windows, a failed WebView2 process. A capture nothing has read for five seconds ends by
-itself. Neither direction holds a voice lock while media flows.
+Windows, a failed WebView2 process. A capture nothing has read for five seconds pauses by
+itself: the OS stops listening, and only `share_capture_resume` for the same id and owner can
+bring it back. Stopping it, a newer start or any of the above clears that. Neither direction holds a voice lock while media flows.
 
 | Command | Arguments | Result |
 | --- | --- | --- |
 | `share_capture_support` | | `ok`, `permission` or `unsupported`. |
 | `share_capture_allow` | | Asks macOS to list Gwar under Screen & System Audio Recording. |
 | `share_capture_start` | `owner, id` | Starts capturing. `id` must grow; errors are `permission`, `unsupported`, `failed` or `superseded`. |
-| `share_capture_read` | `owner, id` | Interleaved 48 kHz stereo `f32`, raw. Waits up to 100 ms; empty means no sound yet, the error `closed` means over. |
+| `share_capture_read` | `owner, id` | Interleaved 48 kHz stereo `f32`, raw. Waits up to 100 ms; empty means no sound yet, the error `paused` asks for `share_capture_resume`, `closed` means over. |
+| `share_capture_resume` | `owner, id` | Restarts the paused capture `id` for its own owner. Errors are `permission`, `unsupported` and `failed` as for a start, where `failed` may be tried again, or `closed` when nothing can resume. |
 | `share_capture_stop` | `owner, id` | Stops that capture, or cancels its start: `id` can never start after this. A stale id stops nothing. A running capture has ended when this returns. |
 | `share_playback_open` | `owner, run, slot, gain` | Claims `slot` for watch transport `run` at `gain`. True only once that is in force; false for a run older than the slot's newest, or while no voice engine runs. |
 | `share_playback_close` | `owner, run, slot` | Stops that slot, unless a newer run has it. The slot remembers `run` after this. |

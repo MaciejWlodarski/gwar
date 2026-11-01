@@ -133,6 +133,107 @@ it.each(["permission", "unsupported", "failed", "boom"])("refusal %s gives a sta
   expect(ended).not.toHaveBeenCalled();
 });
 
+/** A running capture whose reads and resumes the test answers by hand. */
+async function stalledSound() {
+  const { port, track } = audioFakes();
+  const { ComputerSound } = await import("./share-sound");
+  const reads: Array<{ resolve(bytes: ArrayBuffer): void; reject(error: unknown): void }> = [];
+  const resumes: Array<{ args: unknown; resolve(): void; reject(error: unknown): void }> = [];
+  const invoke = vi.fn((command: string, args?: unknown) => {
+    if (command === "share_capture_read") return new Promise<ArrayBuffer>((resolve, reject) => reads.push({ resolve, reject }));
+    if (command === "share_capture_resume") return new Promise<void>((resolve, reject) => resumes.push({ args, resolve, reject }));
+    return Promise.resolve();
+  });
+  const ended = vi.fn();
+  const resuming = vi.fn();
+  const sound = new ComputerSound(() => Promise.resolve({ api: { invoke }, owner: 7 } as unknown as ShareSoundLink), ended, resuming);
+  await expect(sound.start()).resolves.toBe(track);
+  await vi.waitFor(() => expect(reads).toHaveLength(1));
+  const id = (invoke.mock.calls.find(([command]) => command === "share_capture_start")![1] as { id: number }).id;
+  return { port, track, sound, reads, resumes, ended, resuming, invoke, id };
+}
+
+it("gets a stalled capture back and goes on with the same share", async () => {
+  const { port, track, reads, resumes, ended, resuming, id } = await stalledSound();
+  reads[0]!.reject("paused");
+  await vi.waitFor(() => expect(resumes).toHaveLength(1));
+  expect(resumes[0]!.args).toEqual({ owner: 7, id });
+  expect(resuming.mock.calls).toEqual([[true]]);
+  resumes[0]!.resolve();
+  await vi.waitFor(() => expect(reads).toHaveLength(2));
+  expect(resuming.mock.calls).toEqual([[true], [false]]);
+  reads[1]!.resolve(new ArrayBuffer(16));
+  await vi.waitFor(() => expect(port.postMessage).toHaveBeenCalledTimes(1));
+  expect(ended).not.toHaveBeenCalled();
+  expect(track.stop).not.toHaveBeenCalled();
+});
+
+it("tries a failed resume again, then tells the share", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const { reads, resumes, ended, track } = await stalledSound();
+    reads[0]!.reject("paused");
+    await vi.waitFor(() => expect(resumes).toHaveLength(1));
+    resumes[0]!.reject("failed");
+    await vi.waitFor(() => vi.advanceTimersByTime(1_000) && expect(resumes).toHaveLength(2));
+    resumes[1]!.reject("failed");
+    await vi.waitFor(() => vi.advanceTimersByTime(1_000) && expect(resumes).toHaveLength(3));
+    expect(ended).not.toHaveBeenCalled();
+    resumes[2]!.reject("failed");
+    await vi.waitFor(() => expect(ended).toHaveBeenCalledWith("failed"));
+    expect(track.stop).toHaveBeenCalled();
+  } finally { vi.useRealTimers(); }
+});
+
+it.each(["permission", "unsupported"] as const)("a resume refused with %s says so at once", async refusal => {
+  const { reads, resumes, ended, invoke } = await stalledSound();
+  reads[0]!.reject("paused");
+  await vi.waitFor(() => expect(resumes).toHaveLength(1));
+  resumes[0]!.reject(refusal);
+  await vi.waitFor(() => expect(ended).toHaveBeenCalledWith(refusal));
+  expect(resumes).toHaveLength(1);
+  expect(invoke.mock.calls.some(([command]) => command === "share_capture_stop")).toBe(true);
+});
+
+it("gives up on a resume that hangs, and on one the shell no longer knows", async () => {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    const { reads, resumes, ended } = await stalledSound();
+    reads[0]!.reject("paused");
+    await vi.waitFor(() => expect(resumes).toHaveLength(1));
+    await vi.advanceTimersByTimeAsync(4_000);
+    await vi.waitFor(() => expect(ended).toHaveBeenCalledWith("failed"));
+  } finally { vi.useRealTimers(); }
+  const { reads, resumes, ended } = await stalledSound();
+  reads[0]!.reject("paused");
+  await vi.waitFor(() => expect(resumes).toHaveLength(1));
+  resumes[0]!.reject("closed");
+  await vi.waitFor(() => expect(ended).toHaveBeenCalledWith("failed"));
+  expect(resumes).toHaveLength(1);
+});
+
+it("does not resume for a sharer who stopped meanwhile", async () => {
+  const { sound, reads, resumes, ended, resuming } = await stalledSound();
+  sound.stop();
+  reads[0]!.reject("paused");
+  await new Promise(resolve => setTimeout(resolve));
+  expect(resumes).toHaveLength(0);
+  expect(ended).not.toHaveBeenCalled();
+  expect(resuming).not.toHaveBeenCalled();
+});
+
+it("a stop during a resume leaves the sharer's choice alone", async () => {
+  const { sound, reads, resumes, ended, resuming } = await stalledSound();
+  reads[0]!.reject("paused");
+  await vi.waitFor(() => expect(resumes).toHaveLength(1));
+  sound.stop();
+  resumes[0]!.resolve();
+  await new Promise(resolve => setTimeout(resolve));
+  expect(resuming.mock.calls).toEqual([[true]]);
+  expect(ended).not.toHaveBeenCalled();
+  expect(reads).toHaveLength(1);
+});
+
 it("gives up on a capture that hangs: sound never holds the picture back", async () => {
   audioFakes();
   vi.useFakeTimers();
@@ -232,6 +333,29 @@ it("mutes the webview before capture starts and until the shell has stopped it",
   await new Promise(resolve => setTimeout(resolve));
   expect(audio.muted).toBe(true);
   stopping.resolve();
+  await vi.waitFor(() => expect(audio.muted).toBe(false));
+  audio.remove();
+});
+
+it("keeps the webview silent for a replacement capture when the old stop is acknowledged late", async () => {
+  onMac();
+  const { worklet } = audioStage();
+  worklet.resolve();
+  const audio = document.body.appendChild(document.createElement("audio"));
+  const stopping = deferred<void>();
+  let waiting = true;
+  const { link } = shell(async command => {
+    if (command === "share_capture_stop" && waiting) { waiting = false; await stopping.promise; }
+  });
+  const old = new ComputerSound(async () => link, vi.fn());
+  await old.start();
+  old.stop();
+  const replacement = new ComputerSound(async () => link, vi.fn());
+  await replacement.start();
+  stopping.resolve();
+  await new Promise(resolve => setTimeout(resolve));
+  expect(audio.muted).toBe(true);
+  replacement.stop();
   await vi.waitFor(() => expect(audio.muted).toBe(false));
   audio.remove();
 });

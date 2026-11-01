@@ -200,8 +200,22 @@ continues and Details says why, in plain words.
 A capture cannot outlive the share that asked for it. A stop at any step of the start
 cancels it, however late the OS answers: start, stop and the final install share one lock,
 and the install also checks that the webview still owns the app. Nothing here relies on
-JavaScript cleaning up: a page load, a new view, a failed WebView2 process, or five seconds
-without a read each end the capture.
+JavaScript cleaning up: a page load, a new view or a failed WebView2 process ends the capture.
+
+Five seconds without a read pause it instead: the OS stops listening, viewers hear silence, and
+the shell keeps only the share's id and owner. A stalled renderer, a suspended webview and a
+sleeping machine all look like this, and none of them took the sharer's consent back. When reads
+return, the webview asks to resume that id; the shell restarts the OS capture for the same id of
+the same owner, and for nothing else. Stopping the share, a newer start or a lost webview clears
+what was kept, so nothing can resume after them. The webview cannot update its own page while it
+is stalled, so the bar says "Restoring sound" from when it runs again until the capture is back,
+and Details keeps "Stop sharing sound" throughout. A refused resume is tried three times, a second
+apart, for a machine that has just woken; after that, or if the OS withdrew permission, the
+share goes on without sound and Details says why.
+
+The clocks differ across sleep: macOS's stops, so a nap may not reach the five seconds, while
+Windows's runs, so waking there pauses first and resumes on the next read. A capture the OS itself
+ended stays ended: on macOS the user can stop it from the menu bar, and that must not come back.
 
 - **macOS 14 or newer:** ScreenCaptureKit with `capturesAudio` and
   `excludesCurrentProcessAudio`. It needs Gwar turned on under Screen & System Audio

@@ -170,6 +170,7 @@ pub fn run() {
             share_audio::share_capture_support,
             share_audio::share_capture_allow,
             share_audio::share_capture_start,
+            share_audio::share_capture_resume,
             share_audio::share_capture_read,
             share_audio::share_capture_stop,
             share_audio::share_playback_open,

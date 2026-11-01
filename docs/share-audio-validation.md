@@ -659,5 +659,7 @@ encoding paths did not change, and two runs per side cannot say whether this mea
 
 Windows capture and WebView2 exclusion, Windows 10 builds, the macOS permission flow in a real
 app, physical AEC on speakers, lip-sync, paired mouth-to-ear, real stereo output, a real app
-hidden for minutes, and whether a real sharer's page stays awake enough to keep its five-second
-reader lease while hidden: if it does not, computer sound ends and Details says so. The owner test list is in the pull request. Windows code is compiled by CI only.
+hidden for minutes, a real stall or sleep and wake in the app (pause and resume are tested on the
+shell's state and on the webview's reader, not end to end in a real webview), and whether
+ScreenCaptureKit or process loopback survive a real sleep: if the OS ends the stream, computer
+sound ends and Details says so. The owner test list is in the pull request. Windows code is compiled by CI only.

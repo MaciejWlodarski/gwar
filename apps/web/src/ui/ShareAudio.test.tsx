@@ -144,6 +144,24 @@ it("says why there is no computer sound in Details, and can take sharing back", 
   } finally { await act(async () => root.unmount()); host.remove(); undo(); }
 });
 
+it("says sound is coming back, and keeps the way out, while a paused capture returns", async () => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const undo = desktop();
+  useSettings.setState({ language: "en" });
+  useScreen.setState({ ...initialScreen, own: ownShare({ phase: "live", share: "M", audio: true, computerSound: "resuming", viewers: 1 }) });
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  try {
+    await act(async () => root.render(<TooltipProvider><SharingBar /></TooltipProvider>));
+    expect(host.querySelector('[data-testid="share-audio-status"]')?.getAttribute("aria-label")).toBe("Restoring sound");
+    expect(host.querySelector('[role="alert"]')).toBeNull();
+    await act(async () => [...host.querySelectorAll("button")].find(b => b.textContent === "Details")!.click());
+    expect(document.body.textContent).toContain("Bringing computer sound back. The picture is still shared.");
+    expect([...document.querySelectorAll("button")].some(b => b.textContent === "Stop sharing sound")).toBe(true);
+    await act(async () => useScreen.setState({ own: ownShare({ phase: "live", share: "M", audio: true, computerSound: "ok", viewers: 1 }) }));
+    expect(host.querySelector('[data-testid="share-audio-status"]')?.getAttribute("aria-label")).toBe("Sound on");
+  } finally { await act(async () => root.unmount()); host.remove(); undo(); }
+});
+
 it.each([[0, false], [0, true], [2, true]] as const)("keeps %s watchers in the sharing status beside audio=%s", async (viewers, audio) => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   useSettings.setState({ language: "en" });

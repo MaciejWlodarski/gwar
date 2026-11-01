@@ -451,10 +451,11 @@ export class ScreenController {
   private prepareSound(attempt: number): void {
     if (this.sound) return;
     try {
-      this.sound = new ComputerSound(this.soundLink, () => {
+      this.sound = new ComputerSound(this.soundLink, state => {
         this.sound = null;
-        dispatch({ type: "computerSound", attempt, state: "failed" });
-      });
+        dispatch({ type: "computerSound", attempt, state });
+        dispatch({ type: "audio", attempt, sharing: false });
+      }, resuming => dispatch({ type: "computerSound", attempt, state: resuming ? "resuming" : "ok" }));
     } catch (e) {
       console.warn("[share sound] context:", e);
       dispatch({ type: "computerSound", attempt, state: "failed" });

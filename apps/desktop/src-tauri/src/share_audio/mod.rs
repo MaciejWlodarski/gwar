@@ -40,9 +40,10 @@ mod platform {
 
 /// How often an idle capture answers the webview, so a stale reader cannot hang on forever.
 const READ_WAIT: Duration = Duration::from_millis(100);
-/// A capture nobody reads for this long has lost its webview, however that happened: its
-/// JavaScript cannot be trusted to clean up after a crash. Far beyond any healthy read, which
-/// takes `READ_WAIT` at most and keeps going in a hidden window.
+/// A capture nobody reads for this long is paused: the OS stops listening until the webview comes
+/// back. Far beyond any healthy read, which takes `READ_WAIT` at most and goes on in a hidden
+/// window. A stall, a suspended webview and a sleeping machine all look like this, and all of them
+/// recover. A webview that is gone never asks, so its JavaScript need not clean up after a crash.
 const READER_LEASE: Duration = Duration::from_secs(5);
 const LEASE_CHECK: Duration = Duration::from_secs(1);
 
@@ -77,14 +78,31 @@ impl Refusal {
 
 struct Running {
     id: u64,
+    owner: u64,
     queue: Arc<CaptureQueue>,
     _capture: Box<dyn Send>,
     last_read: Instant,
 }
 
+/// A capture that lost its reader. It holds nothing of the OS, only the share's consent: stopping
+/// the share, a newer start and a lost webview all clear it, and then nothing can resume.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Paused {
+    id: u64,
+    owner: u64,
+}
+
+/// What a reader finds under an id.
+enum Reading {
+    Queue(Arc<CaptureQueue>),
+    Paused,
+    Over,
+}
+
 #[derive(Default)]
 struct CaptureState {
     running: Option<Running>,
+    paused: Option<Paused>,
     /// The start waiting on the OS. Whatever clears it has cancelled that start.
     starting: Option<u64>,
     /// The newest id seen, by a start or a stop: nothing at or below it can start any more.
@@ -111,9 +129,21 @@ impl ShareCapture {
         }
         state.newest = id;
         state.starting = Some(id);
+        state.paused = None;
         let old = state.running.take();
         drop(state);
         Self::end(old);
+        Ok(Arc::default())
+    }
+
+    /// Lets paused capture `id` start again, for the same share of the same owner only. The
+    /// consent stays until the capture's commit, so a refused try can be repeated.
+    fn resume(&self, id: u64, owner: u64) -> Result<Arc<CaptureQueue>, String> {
+        let mut state = self.lock();
+        if state.paused != Some(Paused { id, owner }) || state.starting.is_some() {
+            return Err("closed".into());
+        }
+        state.starting = Some(id);
         Ok(Arc::default())
     }
 
@@ -122,6 +152,7 @@ impl ShareCapture {
     fn commit(
         &self,
         id: u64,
+        owner: u64,
         queue: Arc<CaptureQueue>,
         capture: Box<dyn Send>,
         current: impl FnOnce() -> Result<(), String>,
@@ -136,7 +167,8 @@ impl ShareCapture {
             queue.close();
             return Err(refused);
         }
-        state.running = Some(Running { id, queue, _capture: capture, last_read: Instant::now() });
+        state.paused = None;
+        state.running = Some(Running { id, owner, queue, _capture: capture, last_read: Instant::now() });
         Ok(())
     }
 
@@ -148,12 +180,28 @@ impl ShareCapture {
         }
     }
 
-    /// The queue of capture `id`, for a reader. Reading is what keeps a capture alive.
-    fn reader(&self, id: u64) -> Option<Arc<CaptureQueue>> {
+    /// What a reader of capture `id` gets. Reading is what keeps a capture alive.
+    fn reader(&self, id: u64) -> Reading {
         let mut state = self.lock();
-        let running = state.running.as_mut().filter(|running| running.id == id)?;
-        running.last_read = Instant::now();
-        Some(running.queue.clone())
+        if state.paused.is_some_and(|paused| paused.id == id) {
+            return Reading::Paused;
+        }
+        match state.running.as_mut().filter(|running| running.id == id) {
+            Some(running) => {
+                running.last_read = Instant::now();
+                Reading::Queue(running.queue.clone())
+            }
+            None => Reading::Over,
+        }
+    }
+
+    /// Why a read of capture `id` found its queue closed: a pause, or the end of it.
+    fn closed(&self, id: u64) -> &'static str {
+        if self.lock().paused.is_some_and(|paused| paused.id == id) {
+            return "paused";
+        }
+        self.stop(id);
+        "closed"
     }
 
     /// Stops capture `id` and cancels it if it is still starting; it can never start after this.
@@ -163,6 +211,7 @@ impl ShareCapture {
         if state.starting == Some(id) {
             state.starting = None;
         }
+        state.paused.take_if(|paused| paused.id == id);
         let old = state.running.take_if(|running| running.id == id);
         drop(state);
         Self::end(old);
@@ -172,21 +221,23 @@ impl ShareCapture {
     pub fn retire(&self) {
         let mut state = self.lock();
         state.starting = None;
+        state.paused = None;
         let old = state.running.take();
         drop(state);
         Self::end(old);
     }
 
-    /// Whether capture `id` still has a reader at `now`; if not, it ends here.
+    /// Whether capture `id` still has a reader at `now`; if not, it pauses here.
     fn keep_alive(&self, id: u64, now: Instant) -> bool {
         let mut state = self.lock();
         let Some(running) = state.running.as_ref().filter(|running| running.id == id) else { return false };
         if now.saturating_duration_since(running.last_read) < READER_LEASE {
             return true;
         }
+        state.paused = Some(Paused { id, owner: running.owner });
         let old = state.running.take();
         drop(state);
-        tracing::warn!("share sound stopped: nothing is reading it");
+        tracing::info!("share sound paused: nothing is reading it");
         Self::end(old);
         false
     }
@@ -233,6 +284,33 @@ pub async fn share_capture_start(
 ) -> Result<(), String> {
     check_caller(&window, &voice, owner)?;
     let queue = capture.begin(id)?;
+    open(&window, &voice, &capture, owner, id, queue).await
+}
+
+/// Brings back the capture that lost its reader, for the same share of the same owner: the
+/// sharer's consent to `id` still stands. The OS can still say no, as in `share_capture_start`.
+#[tauri::command]
+pub async fn share_capture_resume(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    capture: State<'_, ShareCapture>,
+    owner: u64,
+    id: u64,
+) -> Result<(), String> {
+    check_caller(&window, &voice, owner)?;
+    let queue = capture.resume(id, owner)?;
+    open(&window, &voice, &capture, owner, id, queue).await
+}
+
+/// Opens the OS capture of a claimed `id`, and watches its reader from then on.
+async fn open(
+    window: &WebviewWindow,
+    voice: &Voice,
+    capture: &ShareCapture,
+    owner: u64,
+    id: u64,
+    queue: Arc<CaptureQueue>,
+) -> Result<(), String> {
     let opened = queue.clone();
     let started = tauri::async_runtime::spawn_blocking(move || platform::start(opened)).await;
     let stream = match started {
@@ -247,7 +325,7 @@ pub async fn share_capture_start(
             return Err(error.to_string());
         }
     };
-    capture.commit(id, queue, stream, || check_caller(&window, &voice, owner))?;
+    capture.commit(id, owner, queue, stream, || check_caller(window, voice, owner))?;
     let app = window.app_handle().clone();
     tauri::async_runtime::spawn(async move {
         loop {
@@ -261,7 +339,7 @@ pub async fn share_capture_start(
 }
 
 /// Interleaved 48 kHz stereo `f32` as raw bytes. Waits briefly for sound and answers empty when
-/// there is none; an error means this capture is over.
+/// there is none. The error `paused` asks for `share_capture_resume`; any other ends this capture.
 #[tauri::command]
 pub async fn share_capture_read(
     window: WebviewWindow,
@@ -271,11 +349,14 @@ pub async fn share_capture_read(
     id: u64,
 ) -> Result<Response, String> {
     check_caller(&window, &voice, owner)?;
-    let queue = capture.reader(id).ok_or("closed")?;
+    let queue = match capture.reader(id) {
+        Reading::Queue(queue) => queue,
+        Reading::Paused => return Err("paused".into()),
+        Reading::Over => return Err("closed".into()),
+    };
     let samples = queue.read(READ_WAIT).await;
     if samples.is_empty() && queue.is_closed() {
-        capture.stop(id);
-        return Err("closed".into());
+        return Err(capture.closed(id).into());
     }
     Ok(Response::new(samples.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>()))
 }
@@ -433,13 +514,25 @@ mod tests {
         out
     }
 
+    const OWNER: u64 = 9;
+
+    impl Reading {
+        fn is_queue(&self) -> bool {
+            matches!(self, Reading::Queue(_))
+        }
+
+        fn is_over(&self) -> bool {
+            matches!(self, Reading::Over)
+        }
+    }
+
     fn starting(capture: &ShareCapture, id: u64) -> (Arc<CaptureQueue>, Box<dyn Send>) {
         (capture.begin(id).unwrap(), Box::new(()))
     }
 
     fn running(capture: &ShareCapture, id: u64) -> Arc<CaptureQueue> {
         let (queue, stream) = starting(capture, id);
-        capture.commit(id, queue.clone(), stream, || Ok(())).unwrap();
+        capture.commit(id, OWNER, queue.clone(), stream, || Ok(())).unwrap();
         queue
     }
 
@@ -447,12 +540,12 @@ mod tests {
     fn a_stale_capture_reads_nothing_and_stops_nothing() {
         let capture = ShareCapture::default();
         let queue = running(&capture, 5);
-        assert!(capture.reader(4).is_none());
+        assert!(capture.reader(4).is_over());
         capture.stop(4);
-        assert!(capture.reader(5).is_some());
+        assert!(capture.reader(5).is_queue());
         capture.stop(5);
         assert!(queue.is_closed());
-        assert!(capture.reader(5).is_none());
+        assert!(capture.reader(5).is_over());
     }
 
     #[test]
@@ -460,10 +553,10 @@ mod tests {
         let capture = ShareCapture::default();
         let (queue, stream) = starting(&capture, 5);
         capture.stop(5);
-        let refused = capture.commit(5, queue.clone(), stream, || Ok(()));
+        let refused = capture.commit(5, OWNER, queue.clone(), stream, || Ok(()));
         assert_eq!(refused.unwrap_err(), "superseded");
         assert!(queue.is_closed(), "the capture that came too late ends at once");
-        assert!(capture.reader(5).is_none());
+        assert!(capture.reader(5).is_over());
     }
 
     #[test]
@@ -478,19 +571,19 @@ mod tests {
         let capture = ShareCapture::default();
         let (queue, stream) = starting(&capture, 5);
         capture.retire();
-        assert!(capture.commit(5, queue.clone(), stream, || Ok(())).is_err());
+        assert!(capture.commit(5, OWNER, queue.clone(), stream, || Ok(())).is_err());
         assert!(queue.is_closed());
-        assert!(capture.reader(5).is_none());
+        assert!(capture.reader(5).is_over());
     }
 
     #[test]
     fn a_start_commits_only_for_the_current_owner() {
         let capture = ShareCapture::default();
         let (queue, stream) = starting(&capture, 5);
-        let refused = capture.commit(5, queue.clone(), stream, || Err("stale owner".into()));
+        let refused = capture.commit(5, OWNER, queue.clone(), stream, || Err("stale owner".into()));
         assert_eq!(refused.unwrap_err(), "stale owner");
         assert!(queue.is_closed());
-        assert!(capture.reader(5).is_none());
+        assert!(capture.reader(5).is_over());
     }
 
     #[test]
@@ -500,24 +593,124 @@ mod tests {
         let (first, first_stream) = starting(&capture, 5);
         assert!(old.is_closed());
         let (second, second_stream) = starting(&capture, 6);
-        assert!(capture.commit(5, first.clone(), first_stream, || Ok(())).is_err());
+        assert!(capture.commit(5, OWNER, first.clone(), first_stream, || Ok(())).is_err());
         assert!(first.is_closed());
-        capture.commit(6, second.clone(), second_stream, || Ok(())).unwrap();
-        assert!(capture.reader(6).is_some() && !second.is_closed());
+        capture.commit(6, OWNER, second.clone(), second_stream, || Ok(())).unwrap();
+        assert!(capture.reader(6).is_queue() && !second.is_closed());
+    }
+
+    /// Past the lease from now: a stalled renderer, a suspended webview or a machine that slept.
+    fn stalled(capture: &ShareCapture, id: u64) -> bool {
+        capture.keep_alive(id, Instant::now() + READER_LEASE + Duration::from_secs(1))
+    }
+
+    fn resumed(capture: &ShareCapture, id: u64) -> Arc<CaptureQueue> {
+        let queue = capture.resume(id, OWNER).unwrap();
+        capture.commit(id, OWNER, queue.clone(), Box::new(()), || Ok(())).unwrap();
+        queue
     }
 
     #[test]
-    fn a_capture_without_a_reader_ends_by_itself() {
+    fn a_capture_without_a_reader_stops_listening_by_itself() {
         let capture = ShareCapture::default();
         let queue = running(&capture, 5);
         let started = Instant::now();
         assert!(capture.keep_alive(5, started + READER_LEASE / 2));
         assert!(!queue.is_closed());
-        assert!(capture.reader(5).is_some(), "a read renews the lease");
+        assert!(capture.reader(5).is_queue(), "a read renews the lease");
         assert!(capture.keep_alive(5, Instant::now() + READER_LEASE - Duration::from_secs(1)));
-        assert!(!capture.keep_alive(5, Instant::now() + READER_LEASE + Duration::from_secs(1)));
+        assert!(!stalled(&capture, 5));
         assert!(queue.is_closed(), "no JavaScript took part in this");
-        assert!(capture.reader(5).is_none());
+        assert!(capture.lock().running.is_none(), "the OS stream dropped with it");
+    }
+
+    #[test]
+    fn a_stalled_reader_gets_its_capture_back() {
+        let capture = ShareCapture::default();
+        let queue = running(&capture, 5);
+        assert!(!stalled(&capture, 5));
+        assert!(matches!(capture.reader(5), Reading::Paused));
+        assert_eq!(capture.closed(5), "paused", "the read in flight does not end the share's sound");
+        let back = resumed(&capture, 5);
+        assert!(!Arc::ptr_eq(&queue, &back) && !back.is_closed());
+        assert!(capture.reader(5).is_queue());
+        assert!(capture.keep_alive(5, Instant::now()), "and it is watched again");
+        assert!(!stalled(&capture, 5), "a second stall pauses it just the same");
+        resumed(&capture, 5);
+    }
+
+    #[test]
+    fn a_refused_resume_can_be_tried_again() {
+        let capture = ShareCapture::default();
+        running(&capture, 5);
+        stalled(&capture, 5);
+        capture.resume(5, OWNER).unwrap();
+        assert!(capture.resume(5, OWNER).is_err(), "one at a time");
+        capture.failed(5);
+        resumed(&capture, 5);
+    }
+
+    #[test]
+    fn only_the_same_share_of_the_same_owner_can_resume() {
+        let capture = ShareCapture::default();
+        running(&capture, 5);
+        stalled(&capture, 5);
+        assert!(capture.resume(4, OWNER).is_err());
+        assert!(capture.resume(6, OWNER).is_err());
+        assert!(capture.resume(5, OWNER + 1).is_err());
+        assert!(capture.resume(5, OWNER).is_ok());
+    }
+
+    #[test]
+    fn a_paused_capture_cannot_outlive_its_consent() {
+        type End = fn(&ShareCapture);
+        let ended: [(&str, End); 3] = [
+            ("the sharer stopped it", |capture| capture.stop(5)),
+            ("the webview was lost", |capture| capture.retire()),
+            ("a new share started", |capture| drop(capture.begin(6).unwrap())),
+        ];
+        for (why, end) in ended {
+            let capture = ShareCapture::default();
+            running(&capture, 5);
+            stalled(&capture, 5);
+            end(&capture);
+            assert!(capture.resume(5, OWNER).is_err(), "{why}");
+            assert!(capture.reader(5).is_over(), "{why}");
+        }
+    }
+
+    #[test]
+    fn a_stop_or_a_lost_webview_during_a_resume_wins() {
+        let ended: [fn(&ShareCapture); 2] = [|capture| capture.stop(5), |capture| capture.retire()];
+        for end in ended {
+            let capture = ShareCapture::default();
+            running(&capture, 5);
+            stalled(&capture, 5);
+            let queue = capture.resume(5, OWNER).unwrap();
+            end(&capture);
+            assert!(capture.commit(5, OWNER, queue.clone(), Box::new(()), || Ok(())).is_err());
+            assert!(queue.is_closed());
+            assert!(capture.reader(5).is_over());
+        }
+    }
+
+    #[test]
+    fn a_resume_commits_only_for_the_current_owner() {
+        let capture = ShareCapture::default();
+        running(&capture, 5);
+        stalled(&capture, 5);
+        let queue = capture.resume(5, OWNER).unwrap();
+        assert!(capture.commit(5, OWNER, queue.clone(), Box::new(()), || Err("stale owner".into())).is_err());
+        assert!(queue.is_closed());
+    }
+
+    #[test]
+    fn an_os_ending_stays_an_ending() {
+        let capture = ShareCapture::default();
+        let queue = running(&capture, 5);
+        queue.close();
+        assert_eq!(capture.closed(5), "closed");
+        assert!(capture.resume(5, OWNER).is_err());
     }
 
     #[test]
