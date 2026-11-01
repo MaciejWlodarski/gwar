@@ -846,8 +846,15 @@ test says.
 - A new device. Speakers for 6 s, headphones for 6 s, then share sound: the frames of a near voice
   kept 3–8 s in are 0.87 cold and 0.74 if the canceller is not told. Told, it is 0.87, because it goes
   the cold way. Every way to another device counts: the user's choice, a stream lost and opened again,
-  and the default the operating system moved by itself. If that happens beside the mono canceller,
+  and the default the operating system moved by itself, whether it says so to the stream or it only
+  shows as another endpoint id, under the same name or not. If that happens beside the mono canceller,
   the warmed one goes back to the worker and a new one learns.
+- A new device seen right after the take-over. The route is read right before each capture, so it can
+  still change just after that, in the capture that promotes the warmed canceller. So the mono
+  canceller goes on hearing everything until the next capture. If the route changed by then, voice
+  crossfades back to it and a new one learns: from there out is to the bit what the mono canceller
+  makes alone, with no click (`a_new_device_seen_right_after_the_take_over_goes_back_without_a_click`).
+  After that capture a new device leaves the stereo canceller alone, as on `origin/main`.
 - A frame lost to a full ring breaks it, because the other side goes on without it. A worker stopped
   for 640 ms and back between render and capture read −31 dBFS after the pin in review; now the session
   starts over on the mono canceller, −71.4 dBFS in that quarter second against −70.4 unbroken, and
@@ -898,7 +905,8 @@ arms: nothing plays before the shares start.
 
 Not done: a reconnect with a share already playing still goes the cold way, and so does a session
 where nobody has been heard alone. Headphones in a jack the system does not show as another device
-are not seen as a new device. Real rooms, real microphones and real voices are untested.
+are not seen as a new device, and on Linux neither is a default PulseAudio or PipeWire moves by
+itself, which reaches this code in no way. Real rooms, real microphones and real voices are untested.
 
 ### Startup
 

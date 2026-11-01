@@ -340,6 +340,14 @@ impl Drop for StereoWorker {
     }
 }
 
+/// From one canceller's frame to the other's: `frame` becomes `next` over its length.
+fn crossfade(frame: &mut [f32; FRAME], next: &[f32; FRAME]) {
+    for (index, (sample, next)) in frame.iter_mut().zip(next).enumerate() {
+        let phase = (index + 1) as f32 / FRAME as f32 * std::f32::consts::FRAC_PI_2;
+        *sample = *sample * phase.cos().powi(2) + next * phase.sin().powi(2);
+    }
+}
+
 pub(crate) struct Processing {
     echo: Stage,
     gain: Stage,
@@ -354,6 +362,11 @@ pub(crate) struct Processing {
     handover_tries: usize,
     /// The canceller learning beside the mono one is the warmed one.
     warmed_learning: bool,
+    /// The warmed canceller took over in the last capture, after the last look at the route, so
+    /// the mono one goes on hearing everything until the next.
+    stereo_on_trial: bool,
+    /// The route had changed by then: [`Processing::go_back`].
+    going_back: bool,
     /// Frames since the speakers last played anything, up to [`WARMING_TAIL`].
     silent_frames: usize,
     fed_frames: usize,
@@ -377,6 +390,8 @@ impl Processing {
             history: 0,
             handover_tries: 0,
             warmed_learning: false,
+            stereo_on_trial: false,
+            going_back: false,
             silent_frames: WARMING_TAIL,
             fed_frames: 0,
             render: [[0.0; FRAME]; 2],
@@ -395,6 +410,8 @@ impl Processing {
     pub(crate) fn configure(&mut self, echo: bool, gain: bool) {
         if !echo {
             self.take_over(None);
+            self.stereo_on_trial = false;
+            self.going_back = false;
         }
         let stereo = matches!(self.channels, Channels::Stereo(_));
         if self.echo.set(echo, || canceller(stereo)) {
@@ -445,9 +462,14 @@ impl Processing {
     /// that had an echo may be headphones that have none, which a canceller trained on the echo
     /// would take the voice down for. As far as voice goes this one never warmed. The stereo
     /// canceller already learning beside the mono one is replaced if it was warmed, and stays if
-    /// it was not: it is new, and goes on to learn this room like any other.
+    /// it was not: it is new, and goes on to learn this room like any other. Once it has taken over
+    /// and a capture has gone by it stays too, as a stereo canceller does on any change of device.
     pub(crate) fn route_changed(&mut self) {
         self.break_history();
+        if self.stereo_on_trial {
+            self.going_back = true;
+            return;
+        }
         if !self.warmed_learning || !matches!(self.channels, Channels::Learning(..)) {
             return;
         }
@@ -542,18 +564,31 @@ impl Processing {
         }
     }
 
+    /// The route changed just as the warmed canceller took over, too late for anyone to see before
+    /// it did. The mono canceller has heard everything, so voice goes back to it through the same
+    /// crossfade, `frame` being what the warmed one just made of this one, and a new stereo one
+    /// comes and learns.
+    fn go_back(&mut self, frame: &mut [f32; FRAME]) {
+        self.stereo_on_trial = false;
+        self.going_back = false;
+        crossfade(frame, &self.learned);
+        let Channels::Stereo(mut stage) = std::mem::replace(&mut self.channels, Channels::Building) else { return };
+        std::mem::swap(&mut self.echo, &mut *stage);
+        if let Some(worker) = &mut self.stereo {
+            let _ = worker.returned.push(Returned::Refused(stage));
+            worker.thread.unpark();
+        }
+    }
+
     /// The stereo canceller replaces the mono one, at once if nothing is playing through it.
-    /// `crossfade` is the frame it has just processed; `self.learned` holds its output there.
-    fn take_over(&mut self, crossfade: Option<&mut [f32; FRAME]>) {
+    /// `fade` is the frame it has just processed; `self.learned` holds its output there.
+    fn take_over(&mut self, fade: Option<&mut [f32; FRAME]>) {
         if !matches!(self.channels, Channels::Learning(..)) {
             return;
         }
         let Channels::Learning(mut stage, _) = std::mem::replace(&mut self.channels, Channels::Refused) else { return };
-        if let Some(frame) = crossfade {
-            for (index, (sample, learned)) in frame.iter_mut().zip(&self.learned).enumerate() {
-                let phase = (index + 1) as f32 / FRAME as f32 * std::f32::consts::FRAC_PI_2;
-                *sample = *sample * phase.cos().powi(2) + learned * phase.sin().powi(2);
-            }
+        if let Some(frame) = fade {
+            crossfade(frame, &self.learned);
         }
         std::mem::swap(&mut self.echo, &mut *stage);
         self.channels = Channels::Stereo(stage);
@@ -592,9 +627,14 @@ impl Processing {
         if let Some(stage) = stereo {
             let _ = stage.apm.process_render_f32(&[left, right], &mut [&mut *left_out, &mut *right_out]);
         }
-        if !matches!(self.channels, Channels::Stereo(_)) {
+        let mono = match &mut self.channels {
+            Channels::Stereo(mono) if self.stereo_on_trial => Some(&mut **mono),
+            Channels::Stereo(_) => None,
+            _ => Some(&mut self.echo),
+        };
+        if let Some(mono) = mono {
             let mid: [f32; FRAME] = std::array::from_fn(|index| 0.5 * (left[index] + right[index]));
-            let _ = self.echo.apm.process_render_f32(&[&mid], &mut [left_out]);
+            let _ = mono.apm.process_render_f32(&[&mid], &mut [left_out]);
         }
         if self.warming_hears_speakers() {
             self.overhear(Heard::Speakers(self.render));
@@ -614,21 +654,33 @@ impl Processing {
             return;
         }
         self.collect_stereo();
+        // A capture has gone by since it took over, and the route was looked at before this one.
+        self.stereo_on_trial &= self.going_back;
         for frame in frames.as_chunks_mut::<FRAME>().0 {
             self.scratch.copy_from_slice(frame);
             if self.warming && self.silent_frames < WARMING_TAIL {
                 self.overhear(Heard::Microphone(self.scratch, delay_ms.min(500) as i32));
             }
             let mut learned = false;
-            if let Channels::Learning(stage, left) = &mut self.channels {
-                let _ = stage.apm.set_stream_delay_ms(delay_ms.min(500) as i32);
-                let _ = stage.apm.process_capture_f32(&[&self.scratch], &mut [&mut self.learned]);
-                learned = *left == 0;
+            match &mut self.channels {
+                Channels::Learning(stage, left) => {
+                    let _ = stage.apm.set_stream_delay_ms(delay_ms.min(500) as i32);
+                    let _ = stage.apm.process_capture_f32(&[&self.scratch], &mut [&mut self.learned]);
+                    learned = *left == 0;
+                }
+                Channels::Stereo(mono) if self.stereo_on_trial => {
+                    let _ = mono.apm.set_stream_delay_ms(delay_ms.min(500) as i32);
+                    let _ = mono.apm.process_capture_f32(&[&self.scratch], &mut [&mut self.learned]);
+                }
+                _ => {}
             }
             let _ = self.echo.apm.set_stream_delay_ms(delay_ms.min(500) as i32);
             let _ = self.echo.apm.process_capture_f32(&[&self.scratch], &mut [frame]);
             if learned {
                 self.take_over(Some(frame));
+                self.stereo_on_trial = std::mem::take(&mut self.warmed_learning);
+            } else if self.going_back {
+                self.go_back(frame);
             }
         }
     }
@@ -1538,6 +1590,74 @@ mod tests {
         assert!(change.abs() < 3.0, "voice jumped {change:.1} dB at the switch");
     }
 
+    /// Only heard of once the capture that promoted the warmed canceller is over: the route changed
+    /// after the last look at it. Voice goes back, and from there it is the mono canceller's own.
+    #[test]
+    fn a_new_device_seen_right_after_the_take_over_goes_back_without_a_click() {
+        let len = 12 * RATE;
+        let far = pairs(&voice(len, 120.0, -20.0));
+        let left = left_channel(&far);
+        let pin = 6 * RATE;
+        let near: Vec<f32> = room(&left, 60)
+            .iter()
+            .zip(voice(len, 200.0, -24.0))
+            .enumerate()
+            .map(|(index, (echo, voice))| echo + if index < 5 * RATE { 0.0 } else { voice })
+            .collect();
+        let alone = through(&mut session(LEARNING_FRAMES), &far, &near, None);
+
+        let mut processing = warmed_on_speakers(&far, &near, 6);
+        let mut out = alone[..pin].to_vec();
+        processing.pin_stereo();
+        processing.collected();
+        let mut at = pin;
+        while !processing.is_stereo() {
+            out.extend(tick(&mut processing, &far[at..at + FRAME], &near[at..at + FRAME]));
+            at += FRAME;
+        }
+        let promoted = at;
+        processing.route_changed();
+        out.extend(tick(&mut processing, &far[at..at + FRAME], &near[at..at + FRAME]));
+        at += FRAME;
+        assert!(!processing.is_stereo(), "the obsolete canceller stays in charge");
+        let back = at;
+        processing.collected();
+        assert_eq!(processing.left_to_hear(), Some(LEARNING_FRAMES), "a new one learns beside the mono one");
+        for _ in 0..200 {
+            out.extend(tick(&mut processing, &far[at..at + FRAME], &near[at..at + FRAME]));
+            at += FRAME;
+        }
+        assert!(
+            alone[back..at].iter().zip(&out[back..at]).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the mono canceller heard everything meanwhile"
+        );
+        let around = promoted - 4 * FRAME..back + 4 * FRAME;
+        let step = |signal: &[f32]| signal.windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0, f32::max);
+        assert!(step(&out[around.clone()]) <= step(&alone[RATE..pin]), "a click on the way back");
+        let change = db(&out[around.clone()]) - db(&alone[around]);
+        assert!(change.abs() < 3.0, "voice jumped {change:.1} dB on the way back");
+    }
+
+    #[test]
+    fn a_new_device_later_on_leaves_the_stereo_canceller_alone() {
+        let far = pairs(&voice(8 * RATE, 120.0, -20.0));
+        let echo = room(&left_channel(&far), 60);
+        let mut processing = warmed_on_speakers(&far, &echo, 6);
+        processing.pin_stereo();
+        processing.collected();
+        let mut at = 6 * RATE;
+        while !processing.is_stereo() {
+            tick(&mut processing, &far[at..at + FRAME], &echo[at..at + FRAME]);
+            at += FRAME;
+        }
+        // One whole capture has gone by since it took over with the route unchanged.
+        tick(&mut processing, &far[at..at + FRAME], &echo[at..at + FRAME]);
+        at += FRAME;
+        processing.route_changed();
+        tick(&mut processing, &far[at..at + FRAME], &echo[at..at + FRAME]);
+        assert!(processing.is_stereo(), "as on main");
+    }
+
     #[test]
     fn a_new_device_leaves_a_cold_canceller_learning() {
         let far = pairs(&voice(3 * RATE, 120.0, -20.0));
@@ -2000,6 +2120,31 @@ mod tests {
             thread::yield_now();
         }
         assert_eq!(learning.left_to_hear(), Some(LEARNING_FRAMES));
+
+        let mut back = warmed_on_speakers(&far, &echo, 6);
+        back.pin_stereo();
+        back.collected();
+        let mut at = 6 * RATE;
+        while !back.is_stereo() {
+            tick(&mut back, &far[at..at + FRAME], &echo[at..at + FRAME]);
+            at += FRAME;
+        }
+        assert_eq!(heap::trips(|| back.route_changed()), 0, "the late news");
+        let mut near = [0f32; FRAME];
+        near.copy_from_slice(&echo[at..at + FRAME]);
+        let cost = heap::trips(|| back.cancel_echo(&mut near, 20));
+        let mut mono = warmed_on_speakers(&far, &echo, 6);
+        mono.pin_stereo();
+        mono.collected();
+        let mut learning = 0;
+        for index in 0..3 {
+            let from = 6 * RATE + index * FRAME;
+            let mut near = [0f32; FRAME];
+            near.copy_from_slice(&echo[from..from + FRAME]);
+            mono.render(&far[from..from + FRAME]);
+            learning = learning.max(heap::trips(|| mono.cancel_echo(&mut near, 20)));
+        }
+        assert!(cost <= learning, "going back costs what two cancellers cost: {cost} against {learning}");
 
         let mut behind = warmed_on_speakers(&far, &echo, 6);
         behind.pin_stereo();

@@ -778,7 +778,6 @@ fn pipeline<const CAPTURE: usize>(
     let mut share_bus = None;
 
     while !controls.stop.load(Ordering::Relaxed) {
-        processing.follow_route(&output);
         // ---- capture
         // Take only what is queued now: a producer faster than real time (an
         // always-ready device) must not keep a promoted thread from playback.
@@ -788,6 +787,8 @@ fn pipeline<const CAPTURE: usize>(
             // Keep automatic's legacy raw decision. Manual sensitivity and its meter
             // measure the processed audio that is actually encoded and transmitted.
             let queued = speaker.buffer().capacity() - speaker.slots();
+            // Right before the frame that may promote a warmed canceller.
+            processing.follow_route(&output);
             let db = processing.process(
                 &mut capture.samples,
                 controls.echo_cancellation.load(Ordering::Relaxed),

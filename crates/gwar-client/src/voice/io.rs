@@ -479,8 +479,11 @@ impl<B: Backend> Router<B> {
                     return true;
                 }
                 match trouble {
-                    // Only the default's name changes.
-                    Trouble::Rerouted => self.reconcile(index, now, Move::Auto),
+                    // The stream goes on where the system took it.
+                    Trouble::Rerouted => {
+                        self.lanes[index].follow.rerouted();
+                        self.reconcile(index, now, Move::Auto);
+                    }
                     Trouble::Lost(message) => {
                         tracing::warn!("audio {side:?} stream lost: {message}");
                         let offer = self.backend.offer(side);
@@ -604,6 +607,10 @@ fn device_name(device: &cpal::Device) -> Option<String> {
     device.description().ok().map(|d| d.name().to_owned())
 }
 
+fn device_id(device: &cpal::Device) -> Option<String> {
+    device.id().ok().map(|id| id.to_string())
+}
+
 fn names<E>(devices: Result<impl Iterator<Item = cpal::Device>, E>) -> Vec<String> {
     devices.map(|it| it.filter_map(|d| device_name(&d)).collect()).unwrap_or_default()
 }
@@ -652,10 +659,12 @@ fn device_offer(host: &cpal::Host, side: Side) -> Offer {
     match side {
         Side::Input => Offer {
             default: host.default_input_device().as_ref().and_then(device_name),
+            default_id: host.default_input_device().as_ref().and_then(device_id),
             names: names(host.input_devices()),
         },
         Side::Output => Offer {
             default: host.default_output_device().as_ref().and_then(device_name),
+            default_id: host.default_output_device().as_ref().and_then(device_id),
             names: names(host.output_devices()),
         },
     }
@@ -1073,14 +1082,19 @@ mod tests {
 
     #[test]
     fn sample_output_uses_the_default_when_the_saved_headset_is_unplugged() {
-        let offer = super::Offer { default: Some("Speakers".into()), names: vec!["Speakers".into()] };
+        let offer =
+            super::Offer { default: Some("Speakers".into()), names: vec!["Speakers".into()], ..Default::default() };
         let route = super::open_sample_output(Some("Headset".into()), &offer, |route| Ok(route.clone())).unwrap();
         assert_eq!(route, super::Route::Default(Some("Speakers".into())));
     }
 
     #[test]
     fn sample_output_falls_back_when_the_present_headset_cannot_open() {
-        let offer = super::Offer { default: Some("Speakers".into()), names: vec!["Speakers".into(), "Headset".into()] };
+        let offer = super::Offer {
+            default: Some("Speakers".into()),
+            names: vec!["Speakers".into(), "Headset".into()],
+            ..Default::default()
+        };
         let mut attempts = Vec::new();
         let route = super::open_sample_output(Some("Headset".into()), &offer, |route| {
             attempts.push(route.clone());
@@ -1198,7 +1212,11 @@ mod router_tests {
     }
 
     fn offer(default: Option<&str>, names: &[&str]) -> Offer {
-        Offer { default: default.map(str::to_owned), names: names.iter().map(|n| (*n).to_owned()).collect() }
+        Offer {
+            default: default.map(str::to_owned),
+            default_id: None,
+            names: names.iter().map(|n| (*n).to_owned()).collect(),
+        }
     }
 
     fn laptop() -> Fake {
@@ -1340,13 +1358,43 @@ mod router_tests {
         s.router.start(now);
         s.fake().route_changes = 0;
         let stream = s.router.lanes[1].generation;
-        let trouble = |trouble| Event::Trouble { side: Side::Output, stream, trouble };
-        s.router.handle(trouble(Trouble::Rerouted), now + SETTLE);
-        assert_eq!(s.fake().route_changes, 0, "nothing moved");
         s.fake().offers[1] = offer(Some("Headphones"), &["Speakers", "Headphones"]);
-        s.router.handle(trouble(Trouble::Rerouted), now + SETTLE);
-        s.router.handle(trouble(Trouble::Rerouted), now + SETTLE);
+        s.router.handle(Event::Trouble { side: Side::Output, stream, trouble: Trouble::Rerouted }, now + SETTLE);
         assert_eq!(s.fake().route_changes, 1);
+    }
+
+    #[test]
+    fn a_reroute_is_told_to_the_engine_whatever_the_name_says() {
+        // Headphones on an endpoint of the same name: the system's word is all there is.
+        let now = Instant::now();
+        let mut s = Setup::new(Fake { rerouting_output: true, ..laptop() }, None, None);
+        s.router.start(now);
+        s.opened();
+        s.fake().route_changes = 0;
+        let stream = s.router.lanes[1].generation;
+        s.router.handle(Event::Trouble { side: Side::Output, stream, trouble: Trouble::Rerouted }, now + SETTLE);
+        assert_eq!(s.fake().route_changes, 1);
+        assert!(s.opened().is_empty(), "the stream stays");
+    }
+
+    #[test]
+    fn another_endpoint_by_the_same_name_is_told_to_the_engine() {
+        // No reroute reaches the stream, only the notification that the default changed.
+        let now = Instant::now();
+        let mut speakers = laptop();
+        speakers.offers[1].default_id = Some("speakers".into());
+        let mut s = Setup::new(Fake { rerouting_output: true, ..speakers }, None, None);
+        s.router.start(now);
+        s.opened();
+        s.fake().route_changes = 0;
+        s.router.handle(Event::Changed, now);
+        s.router.tick(now + SETTLE);
+        assert_eq!(s.fake().route_changes, 0, "the same endpoint");
+        s.fake().offers[1].default_id = Some("headphones".into());
+        s.router.handle(Event::Changed, now + SETTLE);
+        s.router.tick(now + SETTLE * 2);
+        assert_eq!(s.fake().route_changes, 1, "not the same one");
+        assert!(s.opened().is_empty(), "the stream stays");
     }
 
     #[test]
