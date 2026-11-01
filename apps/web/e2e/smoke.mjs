@@ -324,6 +324,24 @@ async function joinWithButton(page, name) {
 const memberSection = (page, name) => page.getByRole("region", { name, exact: true });
 
 const composer = (page) => page.getByRole("textbox", { name: "Message", exact: true });
+/** A sender and a receiver of an encrypted message, as they stand: enough to tell a send that failed from a row that cannot open. */
+const privateState = (page) => page.evaluate(async () => {
+  const { controller } = await window.__gwarE2eImport("/src/state/controller.ts");
+  const { useSession, useUi } = await window.__gwarE2eImport("/src/state/stores.ts");
+  const state = useSession.getState();
+  const keys = Object.keys(state.threads).filter(key => key.startsWith("dm:"));
+  const box = document.querySelector('textarea[aria-label="Message"]');
+  return {
+    active: state.activeThread,
+    threads: keys.map(key => {
+      const thread = state.threads[key];
+      return { key, securing: thread.securing, waiting: thread.waiting, loaded: thread.loaded, status: controller.sealed?.runtime.status(controller.sealed.conversation(key)),
+        last: thread.items.slice(-3).map(item => item.kind === "msg" ? { text: item.msg.text.slice(0, 40), cannotOpen: item.cannotOpen ?? null } : item.kind) };
+    }),
+    toasts: useUi.getState().toasts.map(toast => [toast.kind, toast.text]),
+    composer: box && { value: box.value, disabled: box.disabled },
+  };
+});
 const escapeRe = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const treeItem = (page, name) => page.getByRole("treeitem", { name: typeof name === "string" ? new RegExp(escapeRe(name)) : name });
 
@@ -1985,7 +2003,11 @@ async function main() {
             await composer(a).fill(`verification private ${rid}`);
             await composer(a).press("Enter");
           }
-          await page.getByText(`verification private ${rid}`, { exact: true }).waitFor();
+          await page.getByText(`verification private ${rid}`, { exact: true }).waitFor().catch(async error => {
+            // One run in 240 timed out here: which side lost the message, and what each side saw.
+            for (const [name, side] of [["a", a], ["b", b]]) console.log(`private message at failure (waiting on ${page === a ? "a" : "b"}): ${name}: ${JSON.stringify(await privateState(side).catch(String))}`);
+            throw error;
+          });
         } else if (tab) await page.getByRole("tab", { name: tab }).click();
         await waitFor(() => page.locator('[data-message][data-message-verification="pending"]').count().then((n) => n === 0), "message verification complete");
         if (await page.locator('[data-testid^="message-verification-"]').count() || await page.getByText("Signature valid", { exact: true }).count()) {
@@ -2004,7 +2026,8 @@ async function main() {
             }));
             return { serverKey: controller.messageServerKey, key, messages };
           });
-          throw new Error(`valid message was flagged: ${JSON.stringify(diagnostic)}`);
+          const flags = await page.locator('[data-testid^="message-verification-"]').evaluateAll(marks => marks.map(mark => [mark.dataset.testid, mark.getAttribute("aria-label")]));
+          throw new Error(`valid message was flagged: ${JSON.stringify({ ...diagnostic, flags })}`);
         }
       }
     }
