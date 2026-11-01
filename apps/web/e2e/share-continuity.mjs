@@ -32,10 +32,10 @@ export function batchTiming(batches) {
   return { batches: trips.length, tripP50Ms: at(0.5), tripP99Ms: at(0.99), tripOver160Ms: trips.filter(ms => ms > 160).length, longestWaitMs };
 }
 
-/** The fixture's JSON bridge delivers in long bursts on a 4-vCPU runner, which the real IPC does not (share_ipc). */
+/** CI's runner holds the same sound as a quiet machine: only a whisker of room for its clock. */
 export const continuityLimits = ci => ci
-  ? { decoded: 0.8, concealed: 0.2, heard: 0.8, speaker: 0.95, sourceLost: 0.02, gapMs: 1_000, lookMs: 1_500, underrunMs: 200 }
-  : { decoded: 0.9, concealed: 0.1, heard: 0.9, speaker: 0.99, sourceLost: 0, gapMs: 1_000, lookMs: 500, underrunMs: 100 };
+  ? { decoded: 0.9, concealed: 0.1, heard: 0.9, speaker: 0.98, sourceLost: 0.01, gapMs: 500, lookMs: 500, underrunMs: 100 }
+  : { decoded: 0.9, concealed: 0.1, heard: 0.9, speaker: 0.99, sourceLost: 0, gapMs: 500, lookMs: 500, underrunMs: 100 };
 
 const SAMPLES_PER_MS = 48;
 

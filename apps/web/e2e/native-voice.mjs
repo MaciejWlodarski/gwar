@@ -352,7 +352,7 @@ async function computerSoundFlow(sharer, viewer, browserViewer) {
   const sourceLost = (source.dropped - sourceBefore.dropped) / (48_000 * (source.writtenSeconds - sourceBefore.writtenSeconds));
   const report = { ...continuity, speaker: speaker.share, sourceLost: Number(sourceLost.toFixed(3)) };
   assert.deepEqual(continuityProblems(report, continuityLimits(Boolean(process.env.CI))), [], `share sound kept playing: ${JSON.stringify(report)}`);
-  // Not one instant: the fixture's JSON bridge delivers in bursts on a slow runner, between which the tone gaps.
+  // Not one instant: on a slow runner the tone can miss the short window this looks at.
   await waitFor(async () => (await shareHeard(viewer)) && (await hears(viewer, 770)), "ten seconds in, voice and share sound still play together", 10_000);
   await viewer.page.getByTestId("share-audio-controls").getByRole("button", { name: "Mute share sound" }).click();
   await waitFor(async () => !(await shareHeard(viewer)), "muting silences the share here", 5_000);

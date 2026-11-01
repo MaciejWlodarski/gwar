@@ -188,10 +188,12 @@ since the sender's m-line exists only from the start.
 
 ```
 OS capture → CaptureQueue (200 ms, oldest goes) → share_capture_read (awaited, raw f32)
-           → AudioWorklet (30 ms target, 100 ms limit) → MediaStreamAudioDestination → Opus sender
+           → AudioWorklet (starts at 30 ms, holds 400 ms) → MediaStreamAudioDestination → Opus sender
 ```
 
-The worklet's track goes only to the sender, never to `context.destination`. The read
+A busy machine hands sound over in lumps, so the worklet only drops what stayed queued for
+half a second: sound that drains before the next lump is on time, and a real stall catches up
+within a second. The worklet's track goes only to the sender, never to `context.destination`. The read
 loop waits on the shell's own promise, so a hidden window's timers do not slow it. The
 `AudioContext` is made in the Start click's own task. A capture that hangs is abandoned
 after 4 s: sound never holds the picture back. Whatever goes wrong, the picture
@@ -253,10 +255,18 @@ worker → share_playback_frames (raw batch, one in flight, 400 frames at most)
   voice leaves, so a loud share can clip but the voice under it cannot.
 - **Echo:** the canceller's reference is the final left and right channels, voice and
   share together, clipping included, so a viewer on speakers does not send the share back.
-  Both go to the device as pairs through one ring, so they cannot slip apart. While the
-  channels match, as they do for voice alone, the canceller's detector stays on one
-  channel; it takes about two seconds to adapt when a share makes them differ, and then
-  relearns the room. Selecting an output device needs nothing new.
+  Both go to the device as pairs through one ring, so they cannot slip apart. Voice alone
+  keeps one channel, to the bit what it was before share sound existed. The first non-silent
+  share sound that actually plays pins a stereo canceller for the rest of that voice session,
+  even after the share ends, so hopping between shares costs one relearn. A sharer, a deafened
+  viewer and a viewer who muted the share stay on one channel. A reconnect replaces the
+  pipeline, so it starts on one channel and pins again at the next share sound. The stereo
+  canceller is built off the voice thread and hears everything while it learns, 3 s of sound,
+  with voice still coming from the mono one; a raised-cosine frame hands over. So voice echo
+  and level do not change for the first 3 s, but wide share sound leaks for about that long
+  (see [validation](share-audio-validation.md#voice)). Vendored Sonora adds the one option
+  this needs ([`vendor/sonora/GWAR-PATCH.md`](../vendor/sonora/GWAR-PATCH.md)). Selecting an
+  output device needs nothing new.
 - **Controls:** the same per-share volume and mute as a browser (`shareAudio`), independent
   of voice volume. They appear only when the server confirms sound and the mixer has
   taken it. Deafen silences it without falling behind. There is no autoplay prompt.
@@ -265,7 +275,11 @@ worker → share_playback_frames (raw batch, one in flight, 400 frames at most)
   closes. They do not share the frame queue, so no backlog can lose one, and `open` only
   reports success once it is in force. Playback is not tied to one voice run: a voice
   reconnect replaces the pipeline reading the ring, not the streams.
-- A lost frame is concealed up to 100 ms. A stall's backlog is dropped rather than played late.
+- A lost frame is concealed up to 100 ms. Sound that arrives after the queue ran dry still
+  plays, which leaves the queue the cushion the next lump needs. A queue that stayed over
+  its limit (the delay plus 80 ms) for half a second is a stall's backlog: the excess is
+  dropped rather than played late. So after a stall, sound can trail by up to 640 ms for half
+  a second.
 
 ### Not included
 
