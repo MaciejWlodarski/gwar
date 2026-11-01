@@ -713,9 +713,11 @@ its shape after take-over than one with no share at all.
 Bursts no longer leak once pinned (`stereo_bursts_never_leak_once_pinned`, 1 s on, 1 s off, in
 anti-phase), and voice then wide sound is cancelled from when it is learned
 (`wide_sound_after_voice_is_cancelled_from_when_it_is_learned`). One relearn remains: after 310 s
-of voice at another pitch with the pin long past, wide sound reads −70.9 before it, then −29.4, −35.9 in its first second and −71.1 from then
-on, so about a second of leak (`wide_sound_after_five_minutes_of_voice`). All of this is simulated:
-none of it has been measured on real speakers.
+of one held note with the pin long past, wide sound reads −70.9 before it, then −29.4, −35.9 in its first second and −71.1 from then
+on, so about a second of leak (`wide_sound_after_five_minutes_of_voice`). The note is held because
+the test's `voice` stops following its pitch after about 140 s: `f32` phase can no longer take the
+step. Real voices do not do this: see below. All of this is simulated: none of it has been
+measured on real speakers.
 
 The adversarial 1 Mb/s limit is unchanged. `low_bandwidth_bursts_preserve_voice_with_and_without_video`:
 
@@ -737,6 +739,128 @@ in turn, two rounds each. Without shares p99 is 0.70–1.02 ms on both. With fou
 without shares that happened to read 0.23 ms, in a run with four shares at the usual 1.37 ms; the
 next four full runs of the pinned code passed, worst delta 0.70 ms. This is an in-process measure, **not** paired
 mouth-to-ear.
+
+### Warm stereo canceller
+
+The learning above is gone on speakers: a stereo canceller trains off the voice thread for the whole
+session and takes over within 5 frames of sound after the pin. "Cold" below is that earlier
+behaviour, which is what is left when no echo was found, and the rows are in release:
+`the_warmed_switch_against_cold_and_staying_mono`, `the_wide_leak_cold_and_warm`,
+`the_near_voice_cold_and_warm`, `warming_cost`. All simulated; none of it is on real speakers.
+
+**Voice alone** stays to the bit: fingerprint `c2d868db7d8d0eeb` with the worker running, beside
+`origin/main`'s, and `warming_leaves_voice_alone_to_the_bit` feeds it every frame.
+
+Echo in the same 18 rooms, mean dBFS by the second after the first share sound, 6 s into a session,
+and in brackets the room furthest above staying mono, in dB:
+
+| Second | 0–1 | 1–2 | 2–3 | 3–4 | 4–5 | 5–6 | 6–7 | 7–8 | 8–12 | 12–16 | 16–24 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Stay mono | −62.8 | −62.9 | −63.5 | −63.6 | −63.3 | −64.3 | −64.0 | −64.0 | −65.0 | −66.7 | −66.4 |
+| Cold | −62.8 | −62.9 | −63.5 | −58.8 (11.1) | −58.7 (10.1) | −60.2 (6.8) | −61.4 (5.1) | −62.5 (2.6) | −63.7 (4.0) | −65.7 (8.6) | −66.7 (2.5) |
+| Warm | −63.6 (0.9) | −63.8 (1.0) | −64.4 (1.1) | −64.8 (1.2) | −65.6 (1.1) | −66.0 (0.9) | −65.1 (0.9) | −65.1 (0.9) | −65.9 (0.6) | −67.9 (0.3) | −68.8 (0.1) |
+
+20 s into a session the worst warm room is 0.3 dB for 7 s, then 1.1, 0.1, 2.2 and 4.7 at 16–24 s;
+cold reaches 15.4 dB at 3–4 s.
+
+Voice level, the near voice joining 4 s into the session so that the far side was heard alone:
+stay mono −25.5 to −26.6, cold −24.6 to −27.6, warm −25.7 to −27.4. Warm is 0.1–0.9 dB under staying
+mono from the switch on, in the mean, and the worst room swings as much as cold's: 13.0 dB at 5–6 s
+on both, 6 s in. At 20 s it is 0.3–1.1 dB under, worst 9.0 dB, where cold's is 20.8 dB.
+
+Wide sound at the room's left speaker only, dBFS, by time after its first sample:
+
+| | 0–.25 s | .25–.5 | .5–1 | 1–1.5 | 1.5–2 | 2–3 | 3–4 | 8–12 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Cold, every case | −27 to −29 | −28 | −28 | −28 | −27 | −28 | −33 | −65 to −79 |
+| Warm, 6 s in | −67 to −75 | −67 to −75 | −67 to −76 | −68 to −77 | −69 to −78 | −69 to −78 | −70 to −78 | −73 to −82 |
+| Warm, 310 s in | −76 to −93 | −76 to −93 | −76 to −93 | −76 to −92 | −75 to −92 | −75 to −92 | −75 to −93 | −75 to −92 |
+
+Those use a voice that keeps moving. Both speakers reaching the microphone, with quiet side
+content, reads −38 to −43 cold in the first second and −52 to −59 warm from the start, 6 s in. After
+310 s of the one held note described above a shorter leak remains: warm reads −32 to −37 for a
+second, then −72.
+
+**The near voice** is what warm pays with on speakers. Frames of a voice speaking in turns that come
+out within 10 dB of it, by seconds after the share's first sound. On speakers a frame that is only
+leak counts as through as well, so cold's first 3 s read better than they sound:
+
+| | 0–3 | 3–8 | 8–16 | 16–32 |
+| --- | --- | --- | --- | --- |
+| Headphones, 6 s in: cold and warm | 0.82 | 0.99 | 0.99 | 0.99 |
+| Headphones, 30 s in: cold and warm | 0.74 | 0.99 | 0.99 | 0.99 |
+| Speakers, 6 s in: stay mono | 0.75 | 0.70 | 0.67 | 0.70 |
+| Speakers, 6 s in: cold | 0.75 | 0.25 | 0.93 | 0.95 |
+| Speakers, 6 s in: warm | 0.94 | 0.71 | 0.86 | 0.82 |
+| Speakers, 30 s in: stay mono | 0.71 | 0.60 | 0.63 | 0.69 |
+| Speakers, 30 s in: cold | 0.71 | 0.31 | 0.94 | 0.94 |
+| Speakers, 30 s in: warm | 0.72 | 0.62 | 0.68 | 0.82 |
+
+So warm has no second of holes after the take-over, and keeps less of the near voice than cold later
+on, while wide sound plays over it. That voice here is 10 dB under the share. A near voice beside
+wide share sound was already down cold, by its shape; warm starts that at once rather than 3 s in,
+about 1 dB below staying mono over the first 3 s, then level with cold or better.
+
+Headphones go exactly the cold way because a canceller trained this long holds the near voice
+down harder at new sound. Warm without this check kept 0.33–0.48 of it for the first 3 s and
+0.74–0.81 to 8 s, against 0.61–0.65 and about 1.0. The check is the most the canceller takes the
+microphone down in the session (`ECHO_FOUND`, 12 dB). Headphones reach at most 9.1 dB in
+18 cases with a near voice absent, in turns or always on, noisy or not, its worst an octave above
+the far voice. Speakers pass 12 dB within 2–8 s when the far side talks alone at times (once 13 s),
+down to 20 dB quieter than the room here if the microphone is clean. Below that, or with a noisy microphone, or if the near side
+never stops talking, it stays cold (`headphones_go_the_way_of_a_session_that_never_warmed`).
+
+Holds on a steady tone: `voice_keeps_sending_through_the_warmed_switch` plays four wide tones
+at a steady 440 Hz tone at the microphone in the real pipeline, three rounds beside
+`origin/main`. This is the stereo canceller's own behaviour, on `origin/main` too, and it swings
+from run to run:
+
+| Frames sent, 12 arms each | `origin/main` | This branch |
+| --- | --- | --- |
+| No echo: arms with holds | 4 (1328–2084 of 1800–2200) | 1 (1979 of 2200) |
+| Echo: mean sent | 1126 | 1107 |
+| Echo: worst second around the take-over, of 100 | 0–25, every arm | 40–100 |
+| Echo: arms with holds later | 2 | 6 |
+
+Arriving at another moment is enough: with a tone before the shares, `origin/main` held in none
+of 24 arms, and in 2 of 24 given a random 0–40 ms before the canceller arrives. In
+`four_shares_leave_the_voice_pipeline_on_time` the same hold fails "voice kept sending" on this
+branch in 1 of 21 pairs and in none of 42 on `origin/main`. There the canceller is the same as
+`origin/main`'s and arrives after the same work, so this is the behaviour above, at an
+alignment `origin/main`'s fixed timing happens to avoid.
+
+**Cost.** The worker's canceller per 10 ms frame, `warming_cost`, on this Mac's M5:
+
+| Core | Worker | Share of that core |
+| --- | --- | --- |
+| Fast, with the machine idle | 48.6–57.8 µs | 0.49–0.58% |
+| Slow (`taskpolicy -b`), three runs | 100–232 µs | 1.0–2.3% |
+
+That is only while the speakers are playing and for half a second after: a session where nobody
+talks wakes nothing. The voice thread pays 3–5 µs a frame to copy, on 48–57 µs of canceller. The
+worker holds 758 kB for its canceller and up to 480 kB for its ring, and wakes 25 times a second
+while there is sound.
+
+Battery, by `ri_energy_nj` of the whole process over 30 s of paced frames, three rounds, with this
+much noise: speech 12.6, 16.9, 19.1 mW without warming, 30.8, 14.1, 38.5 mW with it, so a median of
+about +14 mW; silence 8.4–11.7 against 10.1–10.8 mW, so nothing. That is about 0.03% of a 50 Wh
+battery for an hour of someone talking non-stop. Starting it only when someone shares with sound
+was not done: it needs a new message from the webview and leaves the canceller seconds
+of learning at best, which is what this removes, for a cost this small.
+
+Timing, in release, alternating with `origin/main`:
+`low_bandwidth_bursts_preserve_voice_with_and_without_video` is unchanged, 9.048–9.288 ms at 1 Mb/s.
+`a_busy_voice_session_stays_on_time`, the speakers busy and the worker at work: p99 0.87–0.97 ms on
+`origin/main` and 0.20–0.95 ms here; on slow cores 0.58–0.97 ms and 0.65–0.99 ms. That and the
+battery figures are from before the echo check, which adds one read to each frame on the worker.
+`four_shares_leave_the_voice_pipeline_on_time`: the same bimodal p99 with four shares on both,
+0.30–1.34 ms and 0.30–1.39 ms. The 1.0 ms delta limit failed on `origin/main` in 4 runs of 7, worst
+1.121 ms, and on this branch in 3 of the 7 runs that reached the end, worst 1.093 ms. It compares two
+modes that do not depend on this code. The worker does not run in those arms: nothing plays
+before the shares start.
+
+Not done: a reconnect with a share already playing still goes the cold way, and so does a session
+where nobody has been heard alone. Real rooms, real microphones and real voices are untested.
 
 ### Startup
 

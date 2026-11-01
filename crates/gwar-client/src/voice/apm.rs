@@ -8,8 +8,10 @@
 //! passes the microphone untouched.
 //!
 //! Voice alone uses one render channel, and a voice session that never plays share sound stays
-//! there. The first share sound really played starts a stereo canceller beside it, which takes
-//! over once it has learned the room and stays until the session ends: [`Processing::pin_stereo`].
+//! there. The first share sound really played brings in a stereo canceller, which stays until the
+//! session ends: [`Processing::pin_stereo`]. In a voice session that canceller has been listening
+//! from the start, off the voice thread, so on speakers it arrives already knowing the room:
+//! [`Processing::warm_stereo`].
 
 use sonora::{
     AudioProcessing, Config, StreamConfig,
@@ -17,10 +19,11 @@ use sonora::{
 };
 
 use super::FRAME;
+use rtrb::{Consumer, Producer, RingBuffer};
 use std::{
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicU8, AtomicUsize, Ordering},
         mpsc::{Receiver, sync_channel},
     },
     thread::{self, Thread},
@@ -42,6 +45,23 @@ const LEARNING_FRAMES: usize = 300;
 /// A frame's power that counts as playing, summed over its samples and channels: -50 dBFS, where
 /// AEC3 itself starts to count a block as sound.
 const PLAYING: f32 = 1e-5 * FRAME as f32;
+/// Frames of sound a stereo canceller that has already learned still runs beside the mono one on
+/// the voice thread: it missed the frames of its journey there, and its output has to be in step
+/// before the crossfade.
+const HANDOVER_FRAMES: usize = 5;
+/// How far the warming canceller must take the microphone down, in dB, before it counts as having
+/// found an echo. Measured beside a voice that overlaps the far one, the most headphones reach is
+/// 9.1 dB; speakers pass 12 within seconds of the far side talking alone, unless they are very
+/// quiet. Nothing else tells the two apart, and they want opposite things:
+/// [`Processing::warm_stereo`].
+const ECHO_FOUND: f64 = 12.0;
+/// Frames the warming canceller may fall behind, render and capture counted apart: 640 ms.
+const WARMING_RING: usize = 128;
+/// How many frames of speakers wait for the worker, so that it wakes 25 times a second.
+const WARMING_BATCH: usize = 4;
+/// Frames after the speakers fall silent that the warming canceller still hears: the echo's tail.
+/// Past that nothing plays and there is nothing to learn, so it costs nothing either.
+const WARMING_TAIL: usize = 50;
 
 /// One of WebRTC's processors, set up for a single stage (or none, while it is off).
 struct Stage {
@@ -113,31 +133,105 @@ enum Channels {
     Refused,
 }
 
-/// Waits through a voice session, in case share sound plays, and builds the stereo canceller then.
-/// It starts with the session because nothing about starting a thread is fit for the voice thread;
-/// asking it and taking what it built touch neither the heap nor a lock. Voice alone pays for one
-/// sleeping thread.
+/// One frame the warming canceller is to hear, in the order the mono one heard it. The ring holds
+/// these by value because it is the only memory they get: boxing them would mean the heap.
+#[allow(clippy::large_enum_variant)]
+enum Heard {
+    Speakers([[f32; FRAME]; 2]),
+    Microphone([f32; FRAME], i32),
+}
+
+/// A stereo canceller trained on everything the voice session hears, with no output anyone uses.
+struct Warming {
+    stage: Box<Stage>,
+    heard: Consumer<Heard>,
+    /// Frames of sound it has learned from, for [`Processing::collect_stereo`].
+    sound: Arc<AtomicUsize>,
+    /// Whether it ever reached [`ECHO_FOUND`].
+    found_echo: bool,
+}
+
+impl Warming {
+    /// Everything waiting in the ring.
+    fn catch_up(&mut self) {
+        let (mut left, mut right, mut near) = ([0f32; FRAME], [0f32; FRAME], [0f32; FRAME]);
+        while let Ok(heard) = self.heard.pop() {
+            match heard {
+                Heard::Speakers([far_left, far_right]) => {
+                    let power: f32 = far_left.iter().chain(&far_right).map(|sample| sample * sample).sum();
+                    self.sound.fetch_add(usize::from(power >= PLAYING), Ordering::Relaxed);
+                    let far: [&[f32]; 2] = [&far_left, &far_right];
+                    let _ = self.stage.apm.process_render_f32(&far, &mut [&mut left, &mut right]);
+                }
+                Heard::Microphone(microphone, delay_ms) => {
+                    let _ = self.stage.apm.set_stream_delay_ms(delay_ms);
+                    let _ = self.stage.apm.process_capture_f32(&[&microphone], &mut [&mut near]);
+                    let taken_down = self.stage.apm.statistics().echo_return_loss_enhancement;
+                    self.found_echo |= taken_down.is_some_and(|enhancement| enhancement >= ECHO_FOUND);
+                }
+            }
+        }
+    }
+}
+
+/// Waits through a voice session, in case share sound plays, and provides the stereo canceller
+/// then. Told to warm, it trains that canceller meanwhile on what the voice thread leaves in a ring;
+/// otherwise it builds one when asked. It starts with the session because nothing about starting a
+/// thread is fit for the voice thread; feeding it, asking it and taking what it has touch neither
+/// the heap nor a lock. A worker that falls a whole ring behind loses frames: that costs it some
+/// of what it learned, and voice nothing, since nothing waits for it.
 struct StereoWorker {
     thread: Thread,
     order: Arc<AtomicU8>,
     built: Receiver<Box<Stage>>,
+    feed: Producer<Heard>,
+    sound: Arc<AtomicUsize>,
 }
 
 const WAIT: u8 = 0;
 const BUILD: u8 = 1;
 const LEAVE: u8 = 2;
+const WARM: u8 = 3;
 
 impl StereoWorker {
     fn start() -> Option<Self> {
         let (send, built) = sync_channel(1);
+        let (feed, heard) = RingBuffer::new(WARMING_RING);
         let order = Arc::new(AtomicU8::new(WAIT));
+        let sound = Arc::new(AtomicUsize::new(0));
         let told = order.clone();
+        let learned = sound.clone();
         let work = move || {
+            let mut heard = Some(heard);
+            let mut warming: Option<Warming> = None;
             loop {
-                match told.load(Ordering::Acquire) {
+                // Read first: the voice thread stops feeding before it orders BUILD, so what is
+                // caught up on after this read is everything.
+                let order = told.load(Ordering::Acquire);
+                if let Some(warming) = &mut warming {
+                    warming.catch_up();
+                }
+                match order {
                     WAIT => thread::park(),
+                    WARM => match heard.take() {
+                        Some(heard) => {
+                            let stage = Box::new(Stage::stereo());
+                            warming = Some(Warming { stage, heard, sound: learned.clone(), found_echo: false });
+                        }
+                        None => thread::park(),
+                    },
                     BUILD => {
-                        let _ = send.send(Box::new(Stage::stereo()));
+                        match warming.take() {
+                            Some(warmed) if warmed.found_echo => {
+                                let _ = send.send(warmed.stage);
+                            }
+                            // It goes after the new one, which arrives when it would have anyway.
+                            warmed => {
+                                learned.store(0, Ordering::Relaxed);
+                                let _ = send.send(Box::new(Stage::stereo()));
+                                drop(warmed);
+                            }
+                        }
                         return;
                     }
                     _ => return,
@@ -145,7 +239,7 @@ impl StereoWorker {
             }
         };
         match thread::Builder::new().name("gwar-stereo-canceller".into()).spawn(work) {
-            Ok(worker) => Some(Self { thread: worker.thread().clone(), order, built }),
+            Ok(worker) => Some(Self { thread: worker.thread().clone(), order, built, feed, sound }),
             Err(error) => {
                 tracing::warn!("the stereo echo canceller will not be available: {error}");
                 None
@@ -171,6 +265,10 @@ pub(crate) struct Processing {
     channels: Channels,
     stereo: Option<StereoWorker>,
     learning_frames: usize,
+    warming: bool,
+    /// Frames since the speakers last played anything, up to [`WARMING_TAIL`].
+    silent_frames: usize,
+    fed_frames: usize,
     /// What each speaker was given since the last whole frame went to the canceller.
     render: [[f32; FRAME]; 2],
     rendered: usize,
@@ -187,6 +285,9 @@ impl Processing {
             channels: Channels::Mono,
             stereo: StereoWorker::start(),
             learning_frames: LEARNING_FRAMES,
+            warming: false,
+            silent_frames: WARMING_TAIL,
+            fed_frames: 0,
             render: [[0.0; FRAME]; 2],
             rendered: 0,
             render_scratch: [[0.0; FRAME]; 2],
@@ -218,6 +319,22 @@ impl Processing {
         });
     }
 
+    /// A voice session may play share sound later: from now on the worker trains the stereo
+    /// canceller on the same microphone and speakers as the mono one. Voice comes out of the mono
+    /// one to the bit as if this were never called.
+    ///
+    /// On speakers that canceller takes over within frames of the first share sound, so wide sound
+    /// does not leak for seconds while one learns. Without an echo there is no leak to stop, and a
+    /// canceller trained this long takes the near voice down for the first seconds of new sound
+    /// more than a new one does. So one that found no echo is left behind: headphones, and anyone
+    /// the far side never talked alone to, go the way of [`Processing::pin_stereo`] without this.
+    pub(crate) fn warm_stereo(&mut self) {
+        if let Some(worker) = &self.stereo {
+            worker.tell(WARM);
+            self.warming = true;
+        }
+    }
+
     /// Share sound is playing here: from now until this voice session ends the canceller is
     /// stereo. Only wakes the worker, once. Voice alone never gets here.
     pub(crate) fn pin_stereo(&mut self) {
@@ -233,13 +350,34 @@ impl Processing {
         };
     }
 
-    /// Takes the built canceller if it has arrived. Never waits.
+    /// Takes the stereo canceller if it has arrived. Never waits.
     fn collect_stereo(&mut self) {
         if !matches!(self.channels, Channels::Building) {
             return;
         }
-        if let Some(Ok(stage)) = self.stereo.as_ref().map(|worker| worker.built.try_recv()) {
-            self.channels = Channels::Learning(stage, self.learning_frames);
+        let Some(worker) = &self.stereo else { return };
+        if let Ok(stage) = worker.built.try_recv() {
+            let sound = worker.sound.load(Ordering::Relaxed);
+            let left_to_hear = self.learning_frames.saturating_sub(sound);
+            self.channels = Channels::Learning(stage, left_to_hear.max(HANDOVER_FRAMES.min(self.learning_frames)));
+        }
+    }
+
+    /// Whether the warming canceller hears this frame. Called once for each frame of speakers.
+    fn warming_hears_speakers(&mut self) -> bool {
+        if !self.warming || !matches!(self.channels, Channels::Mono) {
+            return false;
+        }
+        let [left, right] = &self.render;
+        let power: f32 = left.iter().chain(right).map(|sample| sample * sample).sum();
+        self.silent_frames = if power >= PLAYING { 0 } else { (self.silent_frames + 1).min(WARMING_TAIL) };
+        self.silent_frames < WARMING_TAIL
+    }
+
+    /// Leaves a frame for the warming canceller, if it has room. Never waits.
+    fn overhear(&mut self, heard: Heard) {
+        if let Some(worker) = &mut self.stereo {
+            let _ = worker.feed.push(heard);
         }
     }
 
@@ -296,6 +434,15 @@ impl Processing {
             let mid: [f32; FRAME] = std::array::from_fn(|index| 0.5 * (left[index] + right[index]));
             let _ = self.echo.apm.process_render_f32(&[&mid], &mut [left_out]);
         }
+        if self.warming_hears_speakers() {
+            self.overhear(Heard::Speakers(self.render));
+            self.fed_frames += 1;
+            if self.fed_frames.is_multiple_of(WARMING_BATCH)
+                && let Some(worker) = &self.stereo
+            {
+                worker.thread.unpark();
+            }
+        }
     }
 
     /// Takes the speaker out of the microphone's whole 10 ms frames, in place. `delay_ms` is how
@@ -307,6 +454,9 @@ impl Processing {
         self.collect_stereo();
         for frame in frames.as_chunks_mut::<FRAME>().0 {
             self.scratch.copy_from_slice(frame);
+            if self.warming && self.silent_frames < WARMING_TAIL && matches!(self.channels, Channels::Mono) {
+                self.overhear(Heard::Microphone(self.scratch, delay_ms.min(500) as i32));
+            }
             let mut learned = false;
             if let Channels::Learning(stage, left) = &mut self.channels {
                 let _ = stage.apm.set_stream_delay_ms(delay_ms.min(500) as i32);
@@ -501,11 +651,13 @@ mod tests {
         thread_local! {
             static COUNTING: Cell<bool> = const { Cell::new(false) };
             static TRIPS: Cell<usize> = const { Cell::new(0) };
+            static BYTES: Cell<isize> = const { Cell::new(0) };
         }
 
-        fn trip() {
+        fn trip(bytes: isize) {
             if COUNTING.try_with(Cell::get).unwrap_or(false) {
                 let _ = TRIPS.try_with(|trips| trips.set(trips.get() + 1));
+                let _ = BYTES.try_with(|total| total.set(total.get() + bytes));
             }
         }
 
@@ -514,15 +666,15 @@ mod tests {
         // SAFETY: every call goes straight on to the system allocator; `trip` allocates nothing.
         unsafe impl GlobalAlloc for Counting {
             unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-                trip();
+                trip(layout.size() as isize);
                 unsafe { System.alloc(layout) }
             }
             unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
-                trip();
+                trip(-(layout.size() as isize));
                 unsafe { System.dealloc(pointer, layout) }
             }
             unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, size: usize) -> *mut u8 {
-                trip();
+                trip(size as isize - layout.size() as isize);
                 unsafe { System.realloc(pointer, layout, size) }
             }
         }
@@ -537,6 +689,15 @@ mod tests {
             work();
             COUNTING.set(false);
             TRIPS.get()
+        }
+
+        /// How many bytes `work` left allocated on this thread, and what it made.
+        pub fn bytes<T>(work: impl FnOnce() -> T) -> (usize, T) {
+            BYTES.set(0);
+            COUNTING.set(true);
+            let made = work();
+            COUNTING.set(false);
+            (BYTES.get().max(0) as usize, made)
         }
     }
 
@@ -1027,5 +1188,591 @@ mod tests {
             let share = 100.0 * median.as_secs_f64() / budget.as_secs_f64();
             eprintln!("{name}: median {median:?} ({share:.2}% of a core), p99 {p99:?}");
         }
+    }
+
+    impl Processing {
+        /// Waits until the worker has taken everything out of the ring.
+        fn caught_up(&self) {
+            let worker = self.stereo.as_ref().unwrap();
+            while worker.feed.slots() < WARMING_RING {
+                worker.thread.unpark();
+                thread::yield_now();
+            }
+        }
+
+        /// As the pipeline would find it some frames later, by its own path.
+        fn collected(&mut self) {
+            while matches!(self.channels, Channels::Building) {
+                self.collect_stereo();
+                thread::yield_now();
+            }
+        }
+
+        fn sound_heard_warming(&self) -> usize {
+            self.stereo.as_ref().unwrap().sound.load(Ordering::Relaxed)
+        }
+
+        fn left_to_hear(&self) -> Option<usize> {
+            match &self.channels {
+                Channels::Learning(_, left) => Some(*left),
+                _ => None,
+            }
+        }
+    }
+
+    fn warm_session() -> Processing {
+        let mut processing = session(LEARNING_FRAMES);
+        processing.warm_stereo();
+        processing
+    }
+
+    /// [`through`] with a session that warms: the worker never loses a frame here, so that what
+    /// comes out does not depend on how the threads happened to run.
+    fn warm_through(processing: &mut Processing, far: &[[f32; 2]], near: &[f32], pin: Option<usize>) -> Vec<f32> {
+        let mut out = near.to_vec();
+        let frames = far.as_chunks::<FRAME>().0.iter().zip(out.as_chunks_mut::<FRAME>().0);
+        for (index, (far, frame)) in frames.enumerate() {
+            if index.is_multiple_of(WARMING_RING / 4) {
+                processing.caught_up();
+            }
+            if pin.is_some_and(|at| index * FRAME >= at) {
+                processing.caught_up();
+                processing.pin_stereo();
+                processing.collected();
+            }
+            processing.render(far);
+            processing.cancel_echo(frame, 20);
+        }
+        out
+    }
+
+    /// Far voice, and a near voice over its echo.
+    fn talking_room(len: usize) -> (Vec<f32>, Vec<f32>) {
+        let far = voice(len, 120.0, -20.0);
+        let near = room(&far, 60).iter().zip(voice(len, 200.0, -24.0)).map(|(echo, voice)| echo + voice).collect();
+        (far, near)
+    }
+
+    #[test]
+    fn warming_leaves_voice_alone_to_the_bit() {
+        let len = 8 * RATE;
+        let (far, near) = talking_room(len);
+        let plain = through(&mut session(LEARNING_FRAMES), &pairs(&far), &near, None);
+        let mut warm = warm_session();
+        let warmed = warm_through(&mut warm, &pairs(&far), &near, None);
+        assert!(warm.is_mono());
+        warm.caught_up();
+        assert!(warm.sound_heard_warming() > 300, "it really heard: {}", warm.sound_heard_warming());
+        assert!(plain.iter().zip(&warmed).all(|(a, b)| a.to_bits() == b.to_bits()), "voice alone changed");
+    }
+
+    #[test]
+    fn a_full_ring_costs_the_warming_canceller_not_the_voice() {
+        let len = 8 * RATE;
+        let (far, near) = talking_room(len);
+        let far = pairs(&far);
+        let plain = through(&mut session(LEARNING_FRAMES), &far, &near, None);
+        // Far faster than the worker, which has nothing to say about it.
+        let mut warm = warm_session();
+        let warmed = through(&mut warm, &far, &near, None);
+        assert!(plain.iter().zip(&warmed).all(|(a, b)| a.to_bits() == b.to_bits()), "voice alone changed");
+        let quiet = vec![0.0; RATE];
+        through(&mut warm, &far[..RATE], &near[..RATE], Some(0));
+        warm.collected();
+        through(&mut warm, &pairs(&voice(4 * RATE, 120.0, -20.0)), &quiet[..RATE], None);
+        through(&mut warm, &pairs(&voice(4 * RATE, 120.0, -20.0)), &vec![0.0; 4 * RATE], None);
+        assert!(warm.is_stereo(), "it still gets there");
+    }
+
+    #[test]
+    fn a_warmed_canceller_takes_over_within_frames_of_the_pin() {
+        let len = 7 * RATE;
+        let far = pairs(&voice(len, 120.0, -20.0));
+        let left: Vec<f32> = far.iter().map(|pair| pair[0]).collect();
+        let echo = room(&left, 60);
+        let mut processing = warm_session();
+        warm_through(&mut processing, &far[..6 * RATE], &echo[..6 * RATE], None);
+        processing.caught_up();
+        processing.pin_stereo();
+        processing.collected();
+        assert_eq!(processing.left_to_hear(), Some(HANDOVER_FRAMES));
+        let after = 6 * RATE + 12 * FRAME;
+        warm_through(&mut processing, &far[6 * RATE..after], &echo[6 * RATE..after], None);
+        assert!(processing.is_stereo());
+    }
+
+    #[test]
+    fn a_canceller_warmed_too_little_still_learns_the_rest_on_the_side() {
+        // Long enough a wait that the room is found well before it is over.
+        let far = pairs(&voice(10 * RATE, 120.0, -20.0));
+        let left: Vec<f32> = far.iter().map(|pair| pair[0]).collect();
+        let echo = room(&left, 60);
+        let wait = 3 * LEARNING_FRAMES;
+        let found = (1..=20).find_map(|step| {
+            let upto = step * RATE / 2;
+            let mut processing = session(wait);
+            processing.warm_stereo();
+            warm_through(&mut processing, &far[..upto], &echo[..upto], None);
+            processing.caught_up();
+            let sound = processing.sound_heard_warming();
+            processing.pin_stereo();
+            processing.collected();
+            processing.left_to_hear().filter(|left| *left < wait).map(|left| (sound, left))
+        });
+        let (sound, left_to_hear) = found.expect("the room was found");
+        assert!((1..wait).contains(&sound), "{sound}");
+        assert_eq!(left_to_hear, wait - sound);
+    }
+
+    #[test]
+    fn headphones_go_the_way_of_a_session_that_never_warmed() {
+        // A voice that overlaps the far one, with no echo at all.
+        let len = 12 * RATE;
+        let far = pairs(&voice(len, 100.0, -20.0));
+        let near = voice(len, 200.0, -24.0);
+        let mut warm = warm_session();
+        warm_through(&mut warm, &far, &near, None);
+        warm.caught_up();
+        assert!(warm.sound_heard_warming() > LEARNING_FRAMES, "it heard plenty");
+        warm.pin_stereo();
+        warm.collected();
+        assert_eq!(warm.left_to_hear(), Some(LEARNING_FRAMES), "and starts again, as if it had not");
+    }
+
+    #[test]
+    fn a_silent_session_gives_the_warming_canceller_nothing_to_do() {
+        let mut processing = warm_session();
+        let silent = vec![0.0; 3 * RATE];
+        through(&mut processing, &pairs(&silent), &voice(3 * RATE, 200.0, -24.0), None);
+        // Nobody played anything: the microphone alone is not worth a frame of the worker.
+        assert_eq!(processing.stereo.as_ref().unwrap().feed.slots(), WARMING_RING);
+        assert_eq!(processing.fed_frames, 0);
+        processing.pin_stereo();
+        processing.collected();
+        assert_eq!(processing.left_to_hear(), Some(LEARNING_FRAMES), "and it learned nothing");
+    }
+
+    #[test]
+    fn warming_rests_when_the_speakers_do_and_keeps_the_echo_tail() {
+        let mut processing = warm_session();
+        let sound = vec![[0.1; 2]; RATE];
+        let silent = vec![0.0; RATE];
+        warm_through(&mut processing, &sound, &silent, None);
+        let fed = processing.fed_frames;
+        warm_through(&mut processing, &pairs(&vec![0.0; 2 * RATE]), &vec![0.0; 2 * RATE], None);
+        assert_eq!(processing.fed_frames - fed, WARMING_TAIL - 1, "the tail, then nothing");
+        warm_through(&mut processing, &sound, &silent, None);
+        assert_eq!(processing.fed_frames - fed - (WARMING_TAIL - 1), 100, "and back with the sound");
+    }
+
+    #[test]
+    fn warming_pauses_with_the_canceller() {
+        let mut processing = warm_session();
+        let far = pairs(&voice(2 * RATE, 120.0, -20.0));
+        let left: Vec<f32> = far.iter().map(|pair| pair[0]).collect();
+        let echo = room(&left, 60);
+        warm_through(&mut processing, &far, &echo, None);
+        let fed = processing.fed_frames;
+        processing.configure(false, false);
+        assert_eq!(warm_through(&mut processing, &far, &echo, None), echo, "off passes the microphone untouched");
+        assert_eq!(processing.fed_frames, fed);
+        processing.configure(true, false);
+        warm_through(&mut processing, &far, &echo, None);
+        assert!(processing.fed_frames > fed, "and it goes on with the canceller");
+        assert!(processing.is_mono());
+    }
+
+    #[test]
+    fn a_warmed_session_ends_its_worker() {
+        let mut processing = warm_session();
+        let far = pairs(&voice(RATE, 120.0, -20.0));
+        through(&mut processing, &far, &vec![0.0; RATE], None);
+        let order = processing.stereo.as_ref().unwrap().order.clone();
+        drop(processing);
+        let started = std::time::Instant::now();
+        while Arc::strong_count(&order) > 1 {
+            assert!(started.elapsed().as_secs() < 5, "the worker is still there");
+            thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn the_warmed_switch_has_no_click_and_no_gap() {
+        let len = 12 * RATE;
+        let far = pairs(&voice(len, 120.0, -20.0));
+        let left: Vec<f32> = far.iter().map(|pair| pair[0]).collect();
+        let pin = 8 * RATE;
+        // The far side alone first, so that the room is found; then both.
+        let talking = |index: usize, voice: f32| if index < 5 * RATE { 0.0 } else { voice };
+        let near: Vec<f32> = room(&left, 60)
+            .iter()
+            .zip(voice(len, 200.0, -24.0))
+            .enumerate()
+            .map(|(index, (echo, voice))| echo + talking(index, voice))
+            .collect();
+        let alone = through(&mut session(LEARNING_FRAMES), &far, &near, None);
+        let switched = warm_through(&mut warm_session(), &far, &near, Some(pin));
+        assert_eq!(alone[..pin], switched[..pin], "nothing moved before the pin");
+        let mut warmed = warm_session();
+        warm_through(&mut warmed, &far[..pin], &near[..pin], None);
+        warmed.caught_up();
+        warmed.pin_stereo();
+        warmed.collected();
+        assert_eq!(warmed.left_to_hear(), Some(HANDOVER_FRAMES), "this was the warmed way");
+        let around = pin - 2 * FRAME..pin + 16 * FRAME;
+        let step = |signal: &[f32]| signal.windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0, f32::max);
+        let steady = step(&alone[RATE..pin]);
+        assert!(step(&switched[around.clone()]) <= steady, "a click at the switch");
+        let change = db(&switched[around.clone()]) - db(&alone[around]);
+        assert!(change.abs() < 3.0, "voice jumped {change:.1} dB at the switch");
+    }
+
+    #[test]
+    fn wide_sound_from_the_first_moment_after_voice_does_not_leak() {
+        let sound = voice(12 * RATE, 150.0, -18.0);
+        let mut far = pairs(&sound[..8 * RATE]);
+        far.extend(wide(&sound[8 * RATE..]));
+        let left: Vec<f32> = far.iter().map(|pair| pair[0]).collect();
+        let echo = room(&left, 60);
+        let out = warm_through(&mut warm_session(), &far, &echo, Some(8 * RATE));
+        let leak = db(&out[8 * RATE..8 * RATE + RATE / 4]);
+        assert!(leak < -55.0, "{leak:.1} dBFS in the first quarter second");
+        let settled = db(&out[10 * RATE..]);
+        assert!(settled < -60.0, "{settled:.1} dBFS");
+    }
+
+    #[test]
+    fn the_warmed_way_to_stereo_never_touches_the_heap_on_the_voice_thread() {
+        let sound = voice(6 * RATE, 150.0, -18.0);
+        let echo = room(&sound, 60);
+        let far = pairs(&sound);
+        let step = |processing: &mut Processing, at: &mut usize| {
+            let (far, mut near) = (&far[*at..*at + FRAME], [0f32; FRAME]);
+            near.copy_from_slice(&echo[*at..*at + FRAME]);
+            *at += FRAME;
+            heap::trips(|| {
+                processing.render(far);
+                processing.cancel_echo(&mut near, 20);
+            })
+        };
+        let mut at = 0;
+        let mut plain = session(LEARNING_FRAMES);
+        let mut warm = warm_session();
+        for _ in 0..400 {
+            let mut plain_at = at;
+            let _ = step(&mut plain, &mut plain_at);
+            step(&mut warm, &mut at);
+            warm.caught_up();
+        }
+        let mut plain_at = at;
+        let alone = (0..20).map(|_| step(&mut plain, &mut plain_at)).max().unwrap();
+        let warming = (0..20).map(|_| step(&mut warm, &mut at)).max().unwrap();
+        assert!(warming <= alone, "feeding the worker adds nothing to a frame: {warming} against {alone}");
+
+        warm.caught_up();
+        assert_eq!(heap::trips(|| warm.pin_stereo()), 0, "the pin");
+        while matches!(warm.channels, Channels::Building) {
+            assert_eq!(heap::trips(|| warm.collect_stereo()), 0, "taking what was warmed");
+            thread::yield_now();
+        }
+        assert_eq!(warm.left_to_hear(), Some(HANDOVER_FRAMES), "it found the room");
+        let mut frame = [0f32; FRAME];
+        assert_eq!(heap::trips(|| warm.take_over(Some(&mut frame))), 0, "the take-over");
+        assert!(warm.is_stereo());
+    }
+
+    #[test]
+    #[ignore = "printed by hand beside voice_alone_fingerprint"]
+    fn warmed_voice_alone_fingerprint() {
+        let mut hash = 0xcbf29ce484222325u64;
+        for (far_pitch, delay) in [(100.0, 20), (150.0, 60), (230.0, 150)] {
+            let len = 20 * RATE;
+            let far = voice(len, far_pitch, -20.0);
+            let near: Vec<f32> = room(&far, delay).iter().zip(voice(len, 200.0, -24.0)).map(|(e, n)| e + n).collect();
+            let mut processing = Processing::new();
+            processing.configure(true, true);
+            processing.warm_stereo();
+            for sample in run(&mut processing, &far, &near) {
+                hash = (hash ^ u64::from(sample.to_bits())).wrapping_mul(0x100000001b3);
+            }
+        }
+        eprintln!("warmed voice alone fingerprint {hash:016x}");
+    }
+
+    /// The numbers behind [`Processing::warm_stereo`]: each window after the share's first sound,
+    /// in dBFS, as the mean over the rooms of [`the_switch_against_staying_mono`] with `stay` the
+    /// session that never pinned, `cold` the canceller that starts learning at the pin and `warm`
+    /// the one that has been listening. `worst` is the room furthest above `stay`, in dB.
+    #[test]
+    #[ignore = "a comparison, run in release"]
+    fn the_warmed_switch_against_cold_and_staying_mono() {
+        let second = RATE;
+        let windows: Vec<(usize, usize)> = (0..8).map(|at| (at, at + 1)).chain([(8, 12), (12, 16), (16, 24)]).collect();
+        for before in [6, 20] {
+            let pin = before * second;
+            let total = pin + 24 * second;
+            let span = |at: (usize, usize)| pin + at.0 * second..pin + at.1 * second;
+            let mut sum = vec![[[0f32; 3]; 3]; windows.len()];
+            let mut worst = vec![[[f32::MIN; 2]; 3]; windows.len()];
+            let mut loudest = vec![[[f32::MIN; 2]; 3]; windows.len()];
+            let mut count = 0.0;
+            for far_pitch in [100.0, 150.0, 230.0] {
+                for delay in [20, 60, 150] {
+                    for near_pitch in [180.0, 280.0] {
+                        count += 1.0;
+                        let far = voice(total, far_pitch, -20.0);
+                        let echo = room(&far, delay);
+                        // The near voice joins 4 s in: far alone first, or nothing finds the room.
+                        let near: Vec<f32> = voice(total, near_pitch, -24.0)
+                            .iter()
+                            .enumerate()
+                            .map(|(index, sample)| if index < 4 * second { 0.0 } else { *sample })
+                            .collect();
+                        let talk: Vec<f32> = echo.iter().zip(&near).map(|(e, n)| e + n).collect();
+                        let same = pairs(&far);
+                        let hum = voice(total, 170.0, -24.0);
+                        let shared: Vec<[f32; 2]> = far
+                            .iter()
+                            .zip(&hum)
+                            .enumerate()
+                            .map(|(index, (f, h))| if index < pin { [*f; 2] } else { [f + h, f - h] })
+                            .collect();
+                        let left: Vec<f32> = shared.iter().map(|pair| pair[0]).collect();
+                        let heard: Vec<f32> = room(&left, delay).iter().zip(&near).map(|(e, n)| e + n).collect();
+                        let cold =
+                            |far: &[[f32; 2]], mic: &[f32]| through(&mut session(LEARNING_FRAMES), far, mic, Some(pin));
+                        let warm =
+                            |far: &[[f32; 2]], mic: &[f32]| warm_through(&mut warm_session(), far, mic, Some(pin));
+                        let stay_echo = through(&mut session(LEARNING_FRAMES), &same, &echo, None);
+                        let stay_talk = through(&mut session(LEARNING_FRAMES), &same, &talk, None);
+                        let arms = [
+                            [cold(&same, &echo), warm(&same, &echo)],
+                            [cold(&same, &talk), warm(&same, &talk)],
+                            [cold(&shared, &heard), warm(&shared, &heard)],
+                        ];
+                        for (index, window) in windows.iter().enumerate() {
+                            let r = span(*window);
+                            let kept = |out: &[f32]| fidelity(&out[r.clone()], &near[r.clone()]).1;
+                            let rows: [(f32, [f32; 2]); 3] = [
+                                (db(&stay_echo[r.clone()]), [db(&arms[0][0][r.clone()]), db(&arms[0][1][r.clone()])]),
+                                (db(&stay_talk[r.clone()]), [db(&arms[1][0][r.clone()]), db(&arms[1][1][r.clone()])]),
+                                (kept(&stay_talk), [kept(&arms[2][0]), kept(&arms[2][1])]),
+                            ];
+                            for (row, (stay, moved)) in rows.iter().enumerate() {
+                                sum[index][row][0] += stay;
+                                for arm in 0..2 {
+                                    sum[index][row][arm + 1] += moved[arm];
+                                    let off = [moved[arm] - stay, (moved[arm] - stay).abs(), stay - moved[arm]][row];
+                                    worst[index][row][arm] = worst[index][row][arm].max(off);
+                                    loudest[index][row][arm] = loudest[index][row][arm].max(moved[arm]);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (row, name) in ["echo", "level", "kept beside wide share"].iter().enumerate() {
+                for (index, window) in windows.iter().enumerate() {
+                    let [stay, cold, warm] = sum[index][row].map(|total| total / count);
+                    eprintln!(
+                        "pin {before} {name} {}-{} s: stay {stay:.1} cold {cold:.1} warm {warm:.1}, worst room {:.1}/{:.1} dB, loudest {:.1}/{:.1}",
+                        window.0,
+                        window.1,
+                        worst[index][row][0],
+                        worst[index][row][1],
+                        loudest[index][row][0],
+                        loudest[index][row][1],
+                    );
+                }
+            }
+        }
+    }
+
+    /// Wide sound from the first share sound, in dBFS, in `WIDE_WINDOWS` after it. `same` is the
+    /// voice's own pitch, `new` a pitch the canceller never heard. `steady` trains on [`voice`] past
+    /// the 140 s where it stops moving, so on one held note: the one case found that still leaks.
+    /// `speakers` is mid and side music-like sound where both speakers reach the microphone.
+    #[test]
+    #[ignore = "a comparison, run in release"]
+    fn the_wide_leak_cold_and_warm() {
+        let second = RATE;
+        let windows = [(0, 1), (1, 2), (2, 4), (4, 6), (6, 8), (8, 12), (12, 16), (16, 24), (32, 48)];
+        let show = |name: String, pin: usize, cold: &[f32], warm: &[f32]| {
+            for (arm, out) in [("cold", cold), ("warm", warm)] {
+                let levels: Vec<String> = windows
+                    .iter()
+                    .map(|(from, to)| format!("{:.1}", db(&out[pin + from * second / 4..pin + to * second / 4])))
+                    .collect();
+                eprintln!("wide {name} {arm}: {}", levels.join(" "));
+            }
+        };
+        for pin_at in [6, 20, 60, 310] {
+            let pin = pin_at * second;
+            for (name, before, after) in [("same", 120.0, 120.0), ("same", 190.0, 190.0), ("new", 150.0, 120.0)] {
+                let mut far = pairs(&long_voice(pin, before, -18.0));
+                far.extend(wide(&long_voice(12 * second, after, -18.0)));
+                let left: Vec<f32> = far.iter().map(|pair| pair[0]).collect();
+                let echo = room(&left, 60);
+                let cold = through(&mut session(LEARNING_FRAMES), &far, &echo, Some(pin));
+                let warm = warm_through(&mut warm_session(), &far, &echo, Some(pin));
+                show(format!("{name} {before}->{after} pin {pin_at}"), pin, &cold, &warm);
+            }
+            let talk = long_voice(pin + 12 * second, 150.0, -18.0);
+            let mid = long_voice(pin + 12 * second, 120.0, -20.0);
+            let side = long_voice(pin + 12 * second, 170.0, -28.0);
+            let far: Vec<[f32; 2]> = (0..talk.len())
+                .map(|at| if at < pin { [talk[at]; 2] } else { [mid[at] + side[at], mid[at] - side[at]] })
+                .collect();
+            let left: Vec<f32> = far.iter().map(|pair| pair[0]).collect();
+            let right: Vec<f32> = far.iter().map(|pair| pair[1]).collect();
+            let echo: Vec<f32> = room(&left, 60).iter().zip(room(&right, 75)).map(|(l, r)| l + 0.7 * r).collect();
+            let cold = through(&mut session(LEARNING_FRAMES), &far, &echo, Some(pin));
+            let warm = warm_through(&mut warm_session(), &far, &echo, Some(pin));
+            show(format!("speakers pin {pin_at}"), pin, &cold, &warm);
+        }
+        let pin = 310 * second;
+        let mut far = pairs(&voice(pin, 150.0, -18.0));
+        far.extend(wide(&long_voice(12 * second, 120.0, -18.0)));
+        let left: Vec<f32> = far.iter().map(|pair| pair[0]).collect();
+        let echo = room(&left, 60);
+        let cold = through(&mut session(LEARNING_FRAMES), &far, &echo, Some(pin));
+        let warm = warm_through(&mut warm_session(), &far, &echo, Some(pin));
+        show("steady pin 310".into(), pin, &cold, &warm);
+    }
+
+    /// How much of a near voice speaking in turns gets through, from the first share sound: the
+    /// share of the frames it speaks in that come out within 10 dB of it. On speakers, frames
+    /// that only leak also count as through, so `cold`'s first 3 s read better than they sound.
+    #[test]
+    #[ignore = "a comparison, run in release"]
+    fn the_near_voice_cold_and_warm() {
+        let windows = [(0usize, 3usize), (3, 8), (8, 16), (16, 32)];
+        for lead_at in [6usize, 30] {
+            for (name, speakers) in [("headphones", false), ("speakers", true)] {
+                let mut sum = [[0f32; 4]; 3];
+                let mut count = 0.0;
+                for offset in 0..8 {
+                    let pin = lead_at * RATE + offset * 130;
+                    let total = pin + 32 * RATE;
+                    let talk = long_voice(total, 150.0, -20.0);
+                    let (left, right) = (long_voice(total, 120.0, -14.0), long_voice(total, 190.0, -14.0));
+                    let far: Vec<[f32; 2]> =
+                        (0..total).map(|i| if i < pin { [talk[i]; 2] } else { [left[i], right[i]] }).collect();
+                    let said: Vec<f32> = long_voice(total, 200.0, -24.0)
+                        .iter()
+                        .enumerate()
+                        .map(|(index, sample)| if (index / (2 * RATE)).is_multiple_of(2) { 0.0 } else { *sample })
+                        .collect();
+                    let near: Vec<f32> = if speakers {
+                        let channel = |side: usize| far.iter().map(|pair| pair[side]).collect::<Vec<f32>>();
+                        let (l, r) = (room(&channel(0), 60), room(&channel(1), 75));
+                        (0..total).map(|i| l[i] + 0.7 * r[i] + said[i]).collect()
+                    } else {
+                        said.clone()
+                    };
+                    let stay = through(&mut session(LEARNING_FRAMES), &far, &near, None);
+                    let cold = through(&mut session(LEARNING_FRAMES), &far, &near, Some(pin));
+                    let warm = warm_through(&mut warm_session(), &far, &near, Some(pin));
+                    count += 1.0;
+                    for (arm, out) in [&stay, &cold, &warm].iter().enumerate() {
+                        for (index, (from, to)) in windows.iter().enumerate() {
+                            let range = pin + from * RATE..pin + to * RATE;
+                            let frames = out[range.clone()]
+                                .as_chunks::<FRAME>()
+                                .0
+                                .iter()
+                                .zip(said[range].as_chunks::<FRAME>().0);
+                            let (mut speaking, mut kept) = (0.0f32, 0.0f32);
+                            for (out, said) in frames.filter(|(_, said)| db(&said[..]) > -40.0) {
+                                speaking += 1.0;
+                                kept += f32::from(u8::from(db(&out[..]) > db(&said[..]) - 10.0));
+                            }
+                            sum[arm][index] += kept / speaking;
+                        }
+                    }
+                }
+                for (arm, row) in ["stay", "cold", "warm"].iter().zip(&sum) {
+                    let cells: Vec<String> = row.iter().map(|total| format!("{:.2}", total / count)).collect();
+                    eprintln!("near {name} after {lead_at} s {arm}: {}", cells.join(" "));
+                }
+            }
+        }
+    }
+
+    /// [`voice`] for long sessions: `f32` phase stops following the pitch after about 140 s.
+    fn long_voice(len: usize, pitch: f32, dbfs: f32) -> Vec<f32> {
+        let pitch = f64::from(pitch);
+        let mut phase = 0f64;
+        let mut out: Vec<f32> = (0..len)
+            .map(|i| {
+                let t = i as f64 / RATE as f64;
+                let f0 = pitch * (1.0 + 0.15 * (std::f64::consts::TAU * 2.7 * t).sin());
+                phase = (phase + std::f64::consts::TAU * f0 / RATE as f64) % std::f64::consts::TAU;
+                let harmonics: f64 =
+                    (1..).map(f64::from).take_while(|h| h * f0 < 5_000.0).map(|h| (h * phase).sin() / h).sum();
+                (harmonics * (std::f64::consts::PI * ((4.0 * t) % 1.0)).sin().powi(2)) as f32
+            })
+            .collect();
+        let gain = 10f32.powf(dbfs / 20.0) / (out.iter().map(|x| x * x).sum::<f32>() / len as f32).sqrt();
+        out.iter_mut().for_each(|x| *x *= gain);
+        out
+    }
+
+    /// What warming costs: the worker's canceller, on whatever core runs this, the voice thread's
+    /// share of feeding it, and the memory. `taskpolicy -b` puts a whole run on the slow cores.
+    #[test]
+    #[ignore = "a timing measurement, run in release"]
+    fn warming_cost() {
+        let len = 30 * RATE;
+        let left = voice(len, 120.0, -20.0);
+        let echo: Vec<f32> = room(&left, 60);
+        let block = |signal: &[f32], index: usize| -> [f32; FRAME] {
+            signal[index * FRAME..(index + 1) * FRAME].try_into().unwrap()
+        };
+        let mono = {
+            let mut processing = session(LEARNING_FRAMES);
+            frame_cost(|index| {
+                let (far, mut near) = (block(&left, index), block(&echo, index));
+                processing.render(&far.map(|sample| [sample; 2]));
+                processing.cancel_echo(&mut near, 20);
+            })
+        };
+        // The same frames, feeding the worker, which is kept up with outside the timed part.
+        let fed = {
+            let mut processing = warm_session();
+            let mut spent = Vec::new();
+            for index in 0..3_000 {
+                let (far, mut near) = (block(&left, index), block(&echo, index));
+                let far = far.map(|sample| [sample; 2]);
+                let started = std::time::Instant::now();
+                processing.render(&far);
+                processing.cancel_echo(&mut near, 20);
+                spent.push(started.elapsed());
+                if index.is_multiple_of(16) {
+                    processing.caught_up();
+                }
+            }
+            spent.drain(..300);
+            spent.sort();
+            (spent[spent.len() / 2], spent[spent.len() * 99 / 100])
+        };
+        let mut stage = Stage::stereo();
+        let (mut left_out, mut right_out, mut near_out) = ([0f32; FRAME], [0f32; FRAME], [0f32; FRAME]);
+        let shadow = frame_cost(|index| {
+            let (far, near) = (block(&left, index), block(&echo, index));
+            let _ = stage.apm.process_render_f32(&[&far, &far], &mut [&mut left_out, &mut right_out]);
+            let _ = stage.apm.set_stream_delay_ms(20);
+            let _ = stage.apm.process_capture_f32(&[&near], &mut [&mut near_out]);
+        });
+        let budget = std::time::Duration::from_millis(10);
+        for (name, (median, p99)) in [("mono on the voice thread", mono), ("and feeding", fed), ("worker", shadow)] {
+            let share = 100.0 * median.as_secs_f64() / budget.as_secs_f64();
+            eprintln!("{name}: median {median:?} ({share:.2}% of a core), p99 {p99:?}");
+        }
+        let started = std::time::Instant::now();
+        let (bytes, built) = heap::bytes(Stage::stereo);
+        eprintln!("a stereo canceller: {} kB, built in {:?}", bytes / 1024, started.elapsed());
+        drop(built);
+        eprintln!("the ring: {} kB", WARMING_RING * std::mem::size_of::<Heard>() / 1024);
     }
 }

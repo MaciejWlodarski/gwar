@@ -105,6 +105,10 @@ impl MicrophoneProcessor {
     fn render(&mut self, samples: &[[f32; 2]]) {
         self.processing.render(samples);
     }
+    /// This is a voice session: see [`Processing::warm_stereo`].
+    fn warm_stereo(&mut self) {
+        self.processing.warm_stereo();
+    }
     /// Share sound is playing: see [`Processing::pin_stereo`].
     fn pin_stereo(&mut self) {
         self.processing.pin_stereo();
@@ -748,6 +752,7 @@ fn pipeline<const CAPTURE: usize>(
 ) -> Result<()> {
     // Before the promotion: the sleeping worker in here must not inherit it.
     let mut processing = MicrophoneProcessor::default();
+    processing.warm_stereo();
     let _priority = priority::Priority::promote();
     let encoder = voice_encoder()?;
     output.attach();
@@ -1093,6 +1098,16 @@ mod codec_tests {
     /// One arm of the paired load run: the time from a microphone block to its encoded frame,
     /// and the speaker samples the pipeline failed to supply, with `shares` playing stereo music.
     fn voice_pipeline_under_shares(shares: usize, seconds: u64) -> (Vec<Duration>, u64) {
+        let (latency, missing, _) = voice_pipeline_under_load(shares, 0, false, seconds);
+        (latency, missing)
+    }
+
+    /// As [`voice_pipeline_under_shares`], after `lead` seconds of a cue in the speakers and no
+    /// share: sound in a voice session, which is what the warming stereo canceller learns from.
+    /// With `echo` the room returns the speakers to the microphone, whose tone starts only a
+    /// second before the shares, as if the far side had been talking alone. Also how many frames
+    /// voice sent in each second.
+    fn voice_pipeline_under_load(shares: usize, lead: u64, echo: bool, seconds: u64) -> (Vec<Duration>, u64, Vec<u32>) {
         let playout = share::SharePlayout::new().unwrap();
         let controls = Arc::new(Controls::default());
         *controls.share.lock().unwrap() = Some(playout.bus());
@@ -1111,12 +1126,28 @@ mod codec_tests {
         for slot in 0..shares {
             assert!(playout.open(slot, 1, 1.0));
         }
+        if lead > 0 {
+            // A voice: on a steady tone the canceller never shows what it found.
+            let mut phase = 0f64;
+            let sound = (0..lead as usize * 48_000)
+                .map(|i| {
+                    let time = i as f64 / 48_000.0;
+                    let pitch = 150.0 * (1.0 + 0.15 * (std::f64::consts::TAU * 2.7 * time).sin());
+                    phase = (phase + std::f64::consts::TAU * pitch / 48_000.0) % std::f64::consts::TAU;
+                    let harmonics: f64 = (1..=20).map(|h| (f64::from(h) * phase).sin() / f64::from(h)).sum();
+                    (0.2 * harmonics * (std::f64::consts::PI * ((4.0 * time) % 1.0)).sin().powi(2)) as f32
+                })
+                .collect();
+            controls.cue.lock().unwrap().push((sound, Instant::now(), true));
+        }
         let mut packet = vec![0; 1275];
         let (mut latency, mut missing) = (Vec::new(), 0u64);
+        let mut sent = vec![0; seconds as usize];
+        let mut returned = [0f32; FRAME];
         let start = Instant::now();
         for block in 0..seconds * 100 {
             let position = block * FRAME as u64;
-            if block % 2 == 0 && shares > 0 {
+            if block % 2 == 0 && shares > 0 && block >= lead * 100 {
                 let pcm: Vec<f32> = (0..960u64)
                     .flat_map(|i| {
                         let time = (position + i) as f32 / 48_000.0;
@@ -1136,22 +1167,30 @@ mod codec_tests {
                 }
             }
             thread::sleep((start + Duration::from_millis(10 * block)).saturating_duration_since(Instant::now()));
-            for _ in 0..FRAME {
-                if heard.pop().is_err() {
-                    missing += 1;
+            let room = returned;
+            for out in &mut returned {
+                match heard.pop() {
+                    Ok([left, _]) => *out = left,
+                    Err(_) => {
+                        *out = 0.0;
+                        missing += 1;
+                    }
                 }
             }
             output.report(FRAME, 0);
             let fed = Instant::now();
+            let tone = if echo && block + 100 < lead * 100 { 0.0 } else { 0.25 };
             for i in 0..FRAME as u64 {
                 let phase = std::f32::consts::TAU * 440.0 * (position + i) as f32 / 48_000.0;
-                let _ =
-                    mic_tx.push(CaptureSample { position: position + i, captured_at: fed, value: 0.25 * phase.sin() });
+                let back = if echo { 0.3 * room[i as usize] } else { 0.0 };
+                let value = tone * phase.sin() + back;
+                let _ = mic_tx.push(CaptureSample { position: position + i, captured_at: fed, value });
             }
             output.wake();
             while fed.elapsed() < Duration::from_millis(8) {
                 if outgoing.try_recv().is_ok() {
                     latency.push(fed.elapsed());
+                    sent[block as usize / 100] += 1;
                     break;
                 }
                 thread::yield_now();
@@ -1161,7 +1200,38 @@ mod codec_tests {
         output.wake();
         worker.join().unwrap().unwrap();
         latency.sort();
-        (latency, missing)
+        (latency, missing, sent)
+    }
+
+    /// Run by hand in release, beside the same test on `origin/main`: voice with the speakers busy.
+    #[test]
+    #[ignore = "a timing measurement, not a unit test"]
+    fn a_busy_voice_session_stays_on_time() {
+        for _ in 0..3 {
+            let (latency, missing, _) = voice_pipeline_under_load(0, 20, false, 20);
+            let at = |p: f64| latency[((latency.len() - 1) as f64 * p) as usize].as_secs_f64() * 1000.0;
+            println!("busy p50 {:.3} p99 {:.3} max {:.3} missing {missing}", at(0.5), at(0.99), at(1.0));
+        }
+    }
+
+    /// Run by hand in release: sound first, then four shares, a steady tone at the microphone.
+    /// Without an echo that is headphones, where voice goes on as if nothing had warmed; with one
+    /// the warmed canceller takes over in the real pipeline.
+    #[test]
+    #[ignore = "a measurement in real time, not a unit test"]
+    fn voice_keeps_sending_through_the_warmed_switch() {
+        for (lead, echo) in
+            [(6, false), (6, false), (10, false), (10, false), (6, true), (6, true), (10, true), (10, true)]
+        {
+            let (latency, missing, sent) = voice_pipeline_under_load(4, lead, echo, lead + 12);
+            let at = |p: f64| latency[((latency.len() - 1) as f64 * p) as usize].as_secs_f64() * 1000.0;
+            println!(
+                "lead {lead} echo {echo} p99 {:.3} max {:.3} missing {missing} sent {} by second {sent:?}",
+                at(0.99),
+                at(1.0),
+                latency.len()
+            );
+        }
     }
 
     /// Run by hand in release: alternating pairs, four shares against none, on the real pipeline.
