@@ -401,7 +401,7 @@ async function computerSoundFlow(sharer, viewer, browserViewer) {
   await page.getByRole("status", { name: "You are sharing your screen" }).getByRole("button", { name: "Details", exact: true }).click();
   const details = page.getByRole("dialog", { name: "You are sharing your screen" });
   await details.getByRole("button", { name: "Stop sharing sound" }).click();
-  await details.getByText("Computer sound is off for this share.").waitFor({ timeout: 5_000 });
+  await details.getByText("Computer sound is off. The picture is still shared.").waitFor({ timeout: 5_000 });
   await page.keyboard.press("Escape");
   await waitFor(async () => !(await shareHeard(viewer)), "stopping sound reaches the viewer", 10_000);
   await viewer.page.getByTestId("share-audio-controls").waitFor({ state: "detached", timeout: 10_000 });
