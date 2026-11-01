@@ -627,9 +627,9 @@ The adversarial 1 Mb/s limit is unchanged. `low_bandwidth_bursts_preserve_voice_
 
 Native voice under four shares, by `four_shares_leave_the_voice_pipeline_on_time` in release:
 the real pipeline, six alternating pairs of 20 s arms, from a microphone block to its encoded
-frame, now with the stereo reference. Without shares p99 is 0.36–0.45 ms; with four 64 kb/s
-stereo shares it is 0.45–0.56 ms. The p99 delta per pair is +0.00 to +0.17 ms. Maximum is
-4.8 ms with shares and 5.3 ms without. This is an in-process measure, **not** paired
+frame, now with the stereo reference. Without shares p99 is 0.37–0.42 ms; with four 64 kb/s
+stereo shares it is 0.44–0.51 ms. The p99 delta per pair is +0.06 to +0.09 ms. Maximum is
+0.7 ms with shares and 3.5 ms without. This is an in-process measure, **not** paired
 mouth-to-ear.
 
 ### Startup
