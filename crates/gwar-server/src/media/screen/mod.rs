@@ -591,6 +591,8 @@ struct Publisher {
     rtc: Rtc,
     /// Local ICE username fragment, which routes its STUN.
     ufrag: String,
+    /// Who is at the other end, so a re-offer can be held to it.
+    identity: BTreeSet<String>,
     ssrc: Ssrc,
     codecs: HashMap<Pt, VideoCodec>,
     audio: Option<audio::Publisher>,
@@ -3503,6 +3505,7 @@ fn publisher(
         origin,
         rtc,
         ufrag,
+        identity: transport_identity(sdp),
         ssrc,
         codecs,
         audio,
@@ -3527,15 +3530,7 @@ fn publisher(
 /// budget on the wire and its forwarding state carry on; only the ingress allowance moves, as
 /// it would have been had the share started with sound.
 fn add_audio(p: &mut Publisher, sdp: &str, now: Instant) -> Result<String, &'static str> {
-    if p.audio.is_some() {
-        return Err("the share already has sound");
-    }
-    if p.origin.encrypted {
-        return Err("encrypted screen audio is unavailable");
-    }
-    if audio::Publisher::offered(sdp)?.is_none() {
-        return Err("the offer has no sound");
-    }
+    check_added_sound(p, sdp, now)?;
     let offer = SdpOffer::from_sdp_string(sdp).map_err(|_| "invalid SDP offer")?;
     let answer = p.rtc.sdp_api().accept_offer(offer).map_err(|_| "offer not acceptable")?;
     let Some(audio) = audio::Publisher::from_sdp(&mut p.rtc, sdp, now)? else {
@@ -3545,6 +3540,49 @@ fn add_audio(p: &mut Publisher, sdp: &str, now: Instant) -> Result<String, &'sta
     p.audio = Some(audio);
     p.origin.audio_negotiated(true);
     Ok(answer.to_sdp_string())
+}
+
+/// Everything `add_audio` can refuse, with the running transport untouched: str0m changes its
+/// `Rtc` as it reads an offer, so nothing may be left for it or for `audio::Publisher` to refuse.
+/// A re-offer keeps the connection and the video stream, and adds one new sound stream.
+fn check_added_sound(p: &mut Publisher, sdp: &str, now: Instant) -> Result<(), &'static str> {
+    const CHANGED: &str = "the re-offer changes the running share";
+    if p.audio.is_some() {
+        return Err("the share already has sound");
+    }
+    if p.origin.encrypted {
+        return Err("encrypted screen audio is unavailable");
+    }
+    let Some(ssrc) = audio::Publisher::offered(sdp)? else {
+        return Err("the offer has no sound");
+    };
+    if transport_identity(sdp) != p.identity || publish_ssrcs(sdp).map(|(video, _)| video) != Some(*p.ssrc) {
+        return Err(CHANGED);
+    }
+    let sections = sections(sdp);
+    let mid = |lines: &[&str]| lines.iter().find_map(|l| l.strip_prefix("a=mid:")).map(Mid::from);
+    let video = p.rtc.direct_api().stream_rx(&p.ssrc).map(|s| s.mid());
+    let [picture, sound] = sections.as_slice() else { return Err(CHANGED) };
+    if mid(picture) != video || mid(sound).is_none() || mid(sound) == video {
+        return Err(CHANGED);
+    }
+    let taken =
+        picture.iter().filter_map(|l| l.strip_prefix("a=ssrc:")?.split_whitespace().next()?.parse::<u32>().ok());
+    if taken.chain([*p.ssrc]).any(|known| known == *ssrc) || p.rtc.direct_api().stream_rx(&ssrc).is_some() {
+        return Err("screen audio must have its own SSRC");
+    }
+    // The rest of what the offer must be is what a fresh transport would accept of it.
+    let offer = SdpOffer::from_sdp_string(sdp).map_err(|_| "invalid SDP offer")?;
+    let av1 = p.origin.recovery.lock().expect("recovery lock").av1();
+    let mut trial = rtc(SocketAddr::from(([127, 0, 0, 1], 9)), now, false, av1)?;
+    trial.sdp_api().accept_offer(offer).map_err(|_| "offer not acceptable")?;
+    audio::Publisher::from_sdp(&mut trial, sdp, now)?.ok_or("the offer has no sound").map(|_| ())
+}
+
+/// The lines that say who the remote end of a connection is.
+fn transport_identity(sdp: &str) -> BTreeSet<String> {
+    const IDENTITY: [&str; 3] = ["a=ice-ufrag:", "a=ice-pwd:", "a=fingerprint:"];
+    sdp.lines().filter(|l| IDENTITY.iter().any(|p| l.starts_with(p))).map(str::to_owned).collect()
 }
 
 /// What a watch offer says about its viewer's decoders, beyond its SDP.
@@ -4372,6 +4410,7 @@ pub(crate) mod tests {
                 origin: origin.clone(),
                 rtc: rtc(addr(6000), now, false, false).unwrap(),
                 ufrag: String::new(),
+                identity: BTreeSet::new(),
                 ssrc: 1.into(),
                 codecs: HashMap::new(),
                 audio: None,
@@ -5429,6 +5468,7 @@ pub(crate) mod tests {
             origin: ScreenOrigin::new(1, "h264".into(), 1, false, false, 1_000_000_000),
             rtc: rtc(addr(6000), now, false, false).unwrap(),
             ufrag: String::new(),
+            identity: BTreeSet::new(),
             ssrc: 1.into(),
             codecs: HashMap::new(),
             audio: None,
@@ -6790,6 +6830,68 @@ pub(crate) mod tests {
             assert!(p.audio.is_none(), "{why}");
             assert!(!p.origin.has_audio.load(Ordering::Relaxed), "{why}");
         }
+    }
+
+    /// One refused offer per thing a re-offer must keep or leave alone.
+    fn refused_sound_offers(offer: &str, video: u32, rtx: u32) -> Vec<(&'static str, String)> {
+        let audio = sections(offer)[1]
+            .iter()
+            .find_map(|l| l.strip_prefix("a=ssrc:")?.split_whitespace().next()?.parse::<u32>().ok())
+            .unwrap();
+        let mid = |n: usize| sections(offer)[n].iter().find_map(|l| l.strip_prefix("a=mid:")).unwrap().to_owned();
+        let same_mid = offer.replace(&format!("a=mid:{}\r\n", mid(1)), &format!("a=mid:{}\r\n", mid(0)));
+        let fingerprint = offer.lines().find(|l| l.starts_with("a=fingerprint:")).unwrap();
+        let swapped = sections(offer);
+        vec![
+            ("sound on the video SSRC", offer.replace(&format!("a=ssrc:{audio} "), &format!("a=ssrc:{video} "))),
+            ("sound on the RTX SSRC", offer.replace(&format!("a=ssrc:{audio} "), &format!("a=ssrc:{rtx} "))),
+            ("the video stream's MID", same_mid),
+            (
+                "another video SSRC",
+                offer
+                    .replace(&format!("a=ssrc:{video} "), "a=ssrc:4242 ")
+                    .replace(&format!("FID {video} "), "FID 4242 "),
+            ),
+            ("an ICE restart", offer.replace("a=ice-ufrag:", "a=ice-ufrag:x")),
+            ("another peer", offer.replace(fingerprint, "a=fingerprint:sha-256 00:11")),
+            ("sound first", [swapped[1].join("\r\n"), swapped[0].join("\r\n")].join("\r\n")),
+        ]
+    }
+
+    #[test]
+    fn a_refused_re_offer_leaves_the_transport_as_it_was() {
+        let now = Instant::now();
+        let (mut p, mut peer, ssrc, rtx) = running_publisher(now);
+        let ufrag = p.ufrag.clone();
+        let offer = sound_offer(&mut peer);
+        let sound_mid = sections(&offer)[1].iter().find_map(|l| l.strip_prefix("a=mid:")).unwrap().to_owned();
+        for (why, sdp) in refused_sound_offers(&offer, ssrc, rtx) {
+            assert_ne!(sdp, offer, "{why}");
+            assert!(add_audio(&mut p, &sdp, now).is_err(), "{why}");
+            assert!(p.audio.is_none(), "{why}");
+            assert!(!p.origin.has_audio.load(Ordering::Relaxed), "{why}");
+            assert_eq!(p.rtc.direct_api().local_ice_credentials().ufrag, ufrag, "{why}");
+            assert!(p.rtc.media(Mid::from(sound_mid.as_str())).is_none(), "{why}: nothing installed");
+        }
+        add_audio(&mut p, &offer, now).expect("a good offer still works after every refusal");
+        assert!(p.audio.is_some());
+    }
+
+    #[test]
+    fn a_refused_re_offer_leaves_room_for_a_fresh_mid() {
+        let now = Instant::now();
+        let (mut p, mut peer, ssrc, _) = running_publisher(now);
+        let offer = sound_offer(&mut peer);
+        let audio = sections(&offer)[1]
+            .iter()
+            .find_map(|l| l.strip_prefix("a=ssrc:")?.split_whitespace().next()?.parse::<u32>().ok())
+            .unwrap();
+        let mid = sections(&offer)[1].iter().find_map(|l| l.strip_prefix("a=mid:")).unwrap().to_owned();
+        let refused = offer.replace(&format!("a=ssrc:{audio} "), &format!("a=ssrc:{ssrc} "));
+        assert!(add_audio(&mut p, &refused, now).is_err());
+        let fresh =
+            offer.replace(&format!("a=mid:{mid}\r\n"), "a=mid:zz\r\n").replace(&format!(" {mid}\r\n"), " zz\r\n");
+        add_audio(&mut p, &fresh, now).expect("the refusal left no trace");
     }
 
     #[test]

@@ -233,6 +233,43 @@ describe("sound coming back during a share", () => {
     old.reset();
   });
 
+  it.each([["a retry", false], ["the window coming back", true]] as const)("does not try %s on a server that cannot take sound into a running share", async (_, focus) => {
+    const conn = link(true, false);
+    const screen = controllerOn(conn);
+    sound.result = "failed";
+    choosing("ok");
+    await screen.confirmShare();
+    live();
+    await vi.waitFor(() => expect(own()?.soundAddable).toBe(false));
+    const starts = sound.instances[0]!.start.mock.calls.length;
+    if (focus) { vi.setSystemTime(Date.now() + 60_000); focusBack(screen); } else await vi.advanceTimersByTimeAsync(120_000);
+    expect(sound.instances[0]?.start.mock.calls.length).toBe(starts);
+    expect(vi.mocked(conn.request).mock.calls.some(([op]) => op === "screen.audio.add")).toBe(false);
+    expect(toast()).not.toHaveBeenCalled();
+    screen.reset();
+  });
+
+  it("waits for the server's answer about running shares before it tries again", async () => {
+    let answer!: (value: { screen_audio_add: boolean }) => void;
+    const base = link();
+    const conn = { request: vi.fn((op: string) => op === "screen.audio.add.capabilities"
+      ? new Promise(resolve => { answer = resolve; }) : (base.request as unknown as (op: string) => Promise<unknown>)(op)) } as unknown as Link;
+    const screen = controllerOn(conn);
+    sound.result = "failed";
+    choosing("ok");
+    await screen.confirmShare();
+    live();
+    const starts = sound.instances[0]!.start.mock.calls.length;
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(sound.instances[0]!.start.mock.calls.length).toBe(starts);
+    sound.result = liveTrack();
+    answer({ screen_audio_add: true });
+    await vi.waitFor(() => expect(own()?.soundAddable).toBe(true));
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(sound.instances[0]!.start.mock.calls.length).toBeGreaterThan(starts);
+    screen.reset();
+  });
+
   it("a permission granted later brings sound in with no click, on the same capture object", async () => {
     const screen = await refusedShare("permission");
     const stored = media.publishers[0]!;
@@ -374,6 +411,46 @@ describe("sound coming back during a share", () => {
       useScreen.getState().dispatch({ type: "recoverOwn" });
       await screen.confirmShare();
       expect(media.publishers.at(-1)!.params).toMatchObject({ audio: track, nativeAudio: true });
+      screen.reset();
+    });
+
+    it("stops a picked tab's sound when the share stops during its add, and never attaches it", async () => {
+      const screen = await browser();
+      const stream = own()!.stream as unknown as { addTrack: ReturnType<typeof vi.fn> };
+      const addTrack = vi.spyOn(stream, "addTrack");
+      const track = liveTrack();
+      media.tabSound = track;
+      let finish!: () => void;
+      media.publishers[0]!.addAudio.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+      const adding = screen.turnOnSound();
+      await vi.waitFor(() => expect(media.publishers[0]!.addAudio).toHaveBeenCalled());
+      await screen.stopShare();
+      expect(track.stop).toHaveBeenCalled();
+      finish();
+      await adding;
+      expect(addTrack).not.toHaveBeenCalled();
+      expect(toast()).not.toHaveBeenCalled();
+      screen.reset();
+    });
+
+    it("stops sound that came up on a transport a recovery has replaced", async () => {
+      const screen = await browser();
+      const stream = own()!.stream as unknown as { getTracks(): unknown[] };
+      const track = liveTrack();
+      media.tabSound = track;
+      let finish!: () => void;
+      media.publishers[0]!.addAudio.mockImplementationOnce(() => new Promise<void>(resolve => { finish = resolve; }));
+      const adding = screen.turnOnSound();
+      await vi.waitFor(() => expect(media.publishers[0]!.addAudio).toHaveBeenCalled());
+      useScreen.getState().dispatch({ type: "audio", attempt: own()!.attempt, sharing: true });
+      useScreen.getState().dispatch({ type: "recoverOwn" });
+      await screen.confirmShare();
+      expect(media.publishers).toHaveLength(2);
+      finish();
+      await adding;
+      expect(track.stop).toHaveBeenCalled();
+      expect(stream.getTracks()).not.toContain(track);
+      expect(own()?.audio).toBeFalsy();
       screen.reset();
     });
 

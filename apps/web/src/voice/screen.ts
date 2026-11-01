@@ -921,6 +921,8 @@ export class ScreenPublisher {
       if (this.closed || this.pc !== pc) throw new Error("the transport was replaced");
       this.audio = track;
       this.nativeAudio = true;
+      // Sound stopped a moment ago may not have been polled yet: this report must still go out.
+      this.audioLive = null;
     } finally { this.addingAudio = false; }
     this.reportAudio();
     // The sound's allowance comes out of the video cap, as if the share had started with it.

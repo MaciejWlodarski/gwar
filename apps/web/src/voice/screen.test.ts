@@ -3305,6 +3305,17 @@ describe("sound joining a running share", () => {
   };
   const server = (answer = `v=0\r\nm=video 9 X 98\r\na=mid:0\r\n${AUDIO}`) => ({ renegotiate: vi.fn(async (_sdp: string) => answer), resume: vi.fn(async () => {}) });
 
+  it("reports sound that comes back before anyone polled that it had stopped", async () => {
+    const { publisher, audioState } = await running();
+    const first = track();
+    await publisher.addAudio(first, server());
+    audioState.mockClear();
+    (first as unknown as { readyState: string }).readyState = "ended";
+    await publisher.addAudio(track(), server());
+    expect(audioState).toHaveBeenLastCalledWith(true);
+    publisher.close();
+  });
+
   it("adds the m-line on the same connection and leaves the video sender alone", async () => {
     const { publisher, pc, audioState } = await running();
     const sender = pc.transceivers[0]!.sender;
