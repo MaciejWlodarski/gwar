@@ -769,8 +769,9 @@ export class ScreenController {
   }
 
   private async refreshAudio(conn: Link, run: number, id: number, share: string): Promise<void> {
-    const audio = await conn.request("screen.audio.state", { share, stopped: false }, { timeoutMs: 1_500 }).then(r => r.audio).catch(() => false);
-    if (this.link() === conn && useScreen.getState().watches.some(w => w.id === id && w.share === share && w.status === "watching")) dispatch({ type: "watchAudio", run, id, audio });
+    // No answer says nothing about the share, and a stalled page would drop its player for it.
+    const audio = await conn.request("screen.audio.state", { share, stopped: false }, { timeoutMs: 1_500 }).then(r => r.audio).catch(() => null);
+    if (audio !== null && this.link() === conn && useScreen.getState().watches.some(w => w.id === id && w.share === share && w.status === "watching")) dispatch({ type: "watchAudio", run, id, audio });
   }
 
   /** The session's watch transport, negotiated on the first watch and kept; resolves to its run once connected. */

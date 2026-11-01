@@ -744,7 +744,9 @@ async function run(browsers, web, server, token) {
   await codecFlow(ws, wv, wsShare, "video/vp9");
   await waitFor(() => session(ws, (_, screen) => screen.own?.viewers === 2), "viewer count", 10_000);
 
-  // The real Stage moves both players without rebinding their live streams.
+  // The real Stage moves both players without rebinding their live streams. A new watch has no
+  // `audio` until the first answer about the share's sound, a poll a stalled page sends late.
+  await waitFor(() => session(wv, (_, screen) => screen.watches.every(w => w.audio !== undefined)), "the watches know their share's sound", 10_000);
   const beforeFocus = await session(wv, (_, screen) => ({ transport: screen.transport, watches: screen.watches }));
   await wv.evaluate(() => { window.__stageVideos = new Map([...document.querySelectorAll("video[data-share]")].map(v => [v.dataset.share, v])); });
   await wv.evaluate(share => document.querySelector(`video[data-share="${share}"]`).closest('[role="button"]').click(), csShare);
