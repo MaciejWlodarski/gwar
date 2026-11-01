@@ -176,6 +176,8 @@ pub fn run() {
             share_audio::share_playback_open,
             share_audio::share_playback_close,
             share_audio::share_playback_gain,
+            share_audio::share_playback_clock,
+            share_audio::share_playback_hold,
             share_audio::share_playback_frames,
             files::files_set_server,
             files::files_cancel,

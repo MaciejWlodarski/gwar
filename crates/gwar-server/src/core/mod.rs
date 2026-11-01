@@ -1929,6 +1929,7 @@ impl Core {
             }
             Request::ScreenAudioAdd { share, sdp } => return self.screen_audio_add(session, id, share, sdp),
             Request::ScreenAudioResume { share } => self.screen_audio_resume(session, &share),
+            Request::ScreenAudioSync { share } => self.screen_audio_sync(session, &share),
             Request::ScreenFocus { share } => self.screen_focus(session, &share),
             Request::ScreenDecodeFailed { share, slot, run, generation } => {
                 self.screen_decode_failed(session, &share, slot, run, generation)

@@ -511,3 +511,122 @@ fn truncated_or_oversized_batches_are_refused_whole() {
     assert!(parse_frames(&vec![0; MAX_BATCH + 1]).is_none());
     assert_eq!(parse_frames(&batch(&[])).unwrap().1.len(), 0);
 }
+
+#[test]
+fn the_clock_says_when_a_sample_reaches_the_speaker() {
+    let (mut worker, bus, playout) = worker();
+    assert!(playout.open(1, 7, 1.0));
+    worker.apply_controls();
+    assert_eq!(playout.clock(1, 7), None, "nothing has been written yet");
+    let mut encoder = encoder();
+    let at = Instant::now();
+    feed(&mut worker, &mut encoder, (1, 7), 0, 12, (440.0, 440.0), at);
+    worker.produce();
+    assert_eq!(playout.clock(1, 7), None, "no voice pipeline has told where the speaker is");
+
+    // 480 samples stand before the speaker, and the mark's sample is the ring's first.
+    bus.note_output(480);
+    let first = playout.clock(1, 7).unwrap();
+    let (written, rtp_time) = {
+        let marks = playout.marks.lock().unwrap();
+        (marks[1].unwrap().written, marks[1].unwrap().rtp_time)
+    };
+    assert_eq!(written, 0);
+    assert_eq!(first.rtp_time, rtp_time);
+    let output = bus.output.lock().unwrap().unwrap();
+    assert_eq!(first.at, output.at + Duration::from_millis(10));
+
+    // Taking 10 ms from the ring brings a later mark no closer than it was: its position moved too.
+    let mut speakers = [[0f32; 2]; 480];
+    bus.mix(&mut speakers, false);
+    worker.produce();
+    bus.note_output(480);
+    let later = playout.clock(1, 7).unwrap();
+    let output = bus.output.lock().unwrap().unwrap();
+    let ahead = later.at.duration_since(output.at).as_secs_f64() * f64::from(RATE);
+    let held = (playout.marks.lock().unwrap()[1].unwrap().written - 480) as f64;
+    assert!((ahead - 480.0 - held).abs() < 1.0, "{ahead} samples ahead");
+    assert_ne!(later.rtp_time, first.rtp_time);
+}
+
+#[test]
+fn the_clock_belongs_to_one_run_and_one_slot() {
+    let (mut worker, bus, playout) = worker();
+    assert!(playout.open(0, 7, 1.0));
+    worker.apply_controls();
+    let mut encoder = encoder();
+    feed(&mut worker, &mut encoder, (0, 7), 0, 12, (440.0, 440.0), Instant::now());
+    worker.produce();
+    bus.note_output(0);
+    assert!(playout.clock(0, 7).is_some());
+    assert_eq!(playout.clock(0, 8), None);
+    assert_eq!(playout.clock(1, 7), None);
+    assert_eq!(playout.clock(SCREEN_SLOTS, 7), None);
+}
+
+#[test]
+fn the_clock_reads_system_time() {
+    let now = Instant::now();
+    let unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs_f64() * 1000.0;
+    let ahead = ShareClock { rtp_time: 0, at: now + Duration::from_millis(100) };
+    assert!((ahead.unix_ms() - unix - 100.0).abs() < 50.0);
+}
+
+/// Plays `seconds` of a stream arriving on time.
+fn play_on_time(
+    worker: &mut Worker,
+    bus: &ShareBus,
+    encoder: &mut Encoder,
+    slot: (usize, u64),
+    first: u64,
+    seconds: u64,
+) {
+    let start = Instant::now();
+    for n in 0..seconds * 50 {
+        feed(worker, encoder, slot, first + n, 1, (440.0, 440.0), start + Duration::from_millis(20 * n));
+        drain(worker, bus, 2);
+    }
+}
+
+#[test]
+fn sound_reaches_a_hold_for_the_picture_without_a_jump() {
+    let (mut worker, bus, playout) = worker();
+    assert!(playout.open(0, 7, 1.0));
+    worker.apply_controls();
+    let mut encoder = encoder();
+    play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 0, 2);
+    let before = worker.streams[0].as_ref().unwrap().jitter.queued();
+    assert!(playout.set_hold(0, 7, 60));
+
+    // One second at 1 % is 10 ms: the queue may not move faster than that, in either direction.
+    play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 100, 1);
+    let early = worker.streams[0].as_ref().unwrap().jitter.queued();
+    assert!(early <= before + Duration::from_millis(40), "{before:?} to {early:?} in a second");
+    play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 150, 7);
+    let held = worker.streams[0].as_ref().unwrap().jitter.queued();
+    assert!(held >= before + Duration::from_millis(60), "{before:?} to {held:?}");
+    let stats = playout.stats();
+    assert_eq!((stats.late_drops, stats.backlog_drops, stats.concealed), (0, 0, 0));
+
+    assert!(playout.set_hold(0, 7, 0));
+    play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 500, 10);
+    let jitter = &worker.streams[0].as_ref().unwrap().jitter;
+    let (released, delay) = (jitter.queued(), jitter.delay());
+    assert!(released <= delay + DRIFT_MARGIN + Duration::from_millis(20), "{released:?} over {delay:?}");
+    let stats = playout.stats();
+    assert_eq!((stats.late_drops, stats.backlog_drops, stats.concealed), (0, 0, 0));
+}
+
+#[test]
+fn a_hold_is_bounded_and_a_new_run_starts_without_one() {
+    let (mut worker, _bus, playout) = worker();
+    assert!(playout.open(0, 7, 1.0));
+    worker.apply_controls();
+    assert!(playout.set_hold(0, 7, 60_000));
+    assert_eq!(playout.hold[0].load(Ordering::Relaxed), MAX_HOLD.as_millis() as u32);
+    assert!(MAX_HOLD + MAX_DELAY < Duration::from_millis(u64::from(FRAME_MS) * MAX_QUEUED as u64));
+    assert!(playout.open(0, 8, 1.0));
+    assert_eq!(playout.hold[0].load(Ordering::Relaxed), 0);
+    assert!(!playout.set_hold(0, 7, 100), "an older run has no say");
+    assert_eq!(playout.hold[0].load(Ordering::Relaxed), 0);
+}

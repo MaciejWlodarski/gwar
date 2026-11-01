@@ -94,6 +94,8 @@ pub(super) struct Slot {
     next: u64,
     ticks: u32,
     pending: VecDeque<Queued>,
+    /// RTP time and publisher wallclock of the last packet written.
+    last_written: Option<(u32, Instant)>,
 }
 
 impl Slot {
@@ -103,13 +105,24 @@ impl Slot {
             s.set_unpaced(true);
             *s.ssrc()
         });
-        Self { mid, pt, ssrc, source: None, publication: None, next: 0, ticks: 0, pending: VecDeque::new() }
+        Self {
+            mid,
+            pt,
+            ssrc,
+            source: None,
+            publication: None,
+            next: 0,
+            ticks: 0,
+            pending: VecDeque::new(),
+            last_written: None,
+        }
     }
 
     pub fn clear(&mut self, rtc: &mut Rtc) {
         self.source = None;
         self.publication = None;
         self.pending.clear();
+        self.last_written = None;
         wipe(rtc, self.mid);
     }
 
@@ -163,12 +176,40 @@ impl Slot {
             if let Some(stream) = rtc.direct_api().stream_tx_by_mid(self.mid, None) {
                 self.ssrc = *stream.ssrc();
                 stream.set_unpaced(true);
+                self.last_written = Some((packet.timestamp, packet.wallclock));
                 stream.write_rtp(
                     RtpWrite::new(packet.pt, packet.out.into(), packet.timestamp, packet.wallclock, packet.payload)
                         .marker(packet.marker),
                 );
             }
         }
+    }
+}
+
+/// Further apart than this, the last sound and picture are not of the same stretch of a share.
+const MAX_ASSOCIATED_GAP: Duration = Duration::from_secs(2);
+const VIDEO_RATE: f64 = 90_000.0;
+
+/// Sound and picture RTP times of one instant. Both wallclocks come from the publisher's common
+/// clock, so the sender reports' association survives this SFU's queues and each slot's own
+/// timestamps. A viewer whose sound does not reach its webview's engine cannot get it elsewhere.
+fn associate_pair(video: (u32, Instant), audio: (u32, Instant)) -> Option<(u32, u32)> {
+    let (later, earlier, sign) = if audio.1 >= video.1 { (audio.1, video.1, 1.0) } else { (video.1, audio.1, -1.0) };
+    let gap = later.duration_since(earlier);
+    if gap > MAX_ASSOCIATED_GAP {
+        return None;
+    }
+    let ticks = (sign * gap.as_secs_f64() * VIDEO_RATE).round() as i64;
+    Some((audio.0, video.0.wrapping_add(ticks as u32)))
+}
+
+/// Publishes each watched slot's association to the signalling side.
+pub(super) fn associate(w: &Watcher) {
+    for (slot, sound) in w.slots.iter().zip(&w.audio) {
+        let (Some(grant), Some(video), Some(audio)) = (&slot.grant, slot.last_written, sound.last_written) else {
+            continue;
+        };
+        grant.set_sound_clock(associate_pair(video, audio));
     }
 }
 
@@ -460,5 +501,26 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+
+    #[test]
+    fn the_association_is_one_instant_on_the_pictures_clock() {
+        let at = Instant::now();
+        let later = at + Duration::from_millis(20);
+        // Sound 20 ms after the picture: the picture's time moves on by those 20 ms.
+        assert_eq!(associate_pair((1_000, at), (500, later)), Some((500, 2_800)));
+        assert_eq!(associate_pair((1_000, later), (500, at)), Some((500, 1_000u32.wrapping_sub(1_800))));
+        assert_eq!(associate_pair((u32::MAX, at), (7, later)), Some((7, 1_799)));
+    }
+
+    #[test]
+    fn sound_and_picture_of_different_stretches_are_not_associated() {
+        let at = Instant::now();
+        assert_eq!(associate_pair((1, at), (2, at + Duration::from_secs(3))), None);
     }
 }

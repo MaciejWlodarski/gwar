@@ -440,6 +440,49 @@ pub fn share_playback_gain(
     })
 }
 
+/// How long a slot's sound waits for its picture, in milliseconds.
+#[tauri::command]
+pub fn share_playback_hold(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    run: u64,
+    slot: usize,
+    ms: u32,
+) -> Result<(), String> {
+    check_caller(&window, &voice, owner)?;
+    voice.share_playout(|playout, _| {
+        playout.set_hold(slot, run, ms);
+    })
+}
+
+/// When a recent sound sample of a slot leaves the speaker, for lining the picture up with it.
+#[tauri::command]
+pub fn share_playback_clock(
+    window: WebviewWindow,
+    voice: State<'_, Voice>,
+    owner: u64,
+    run: u64,
+    slot: usize,
+) -> Result<Option<SoundClock>, String> {
+    check_caller(&window, &voice, owner)?;
+    voice.share_playout(|playout, _| playout.clock(slot, run).map(SoundClock::from))
+}
+
+/// `rtpTime` plays at `unixMs`: the system clock, which `Date.now()` in the webview also reads.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SoundClock {
+    rtp_time: u32,
+    unix_ms: f64,
+}
+
+impl From<gwar_client::voice::share::ShareClock> for SoundClock {
+    fn from(clock: gwar_client::voice::share::ShareClock) -> Self {
+        Self { rtp_time: clock.rtp_time, unix_ms: clock.unix_ms() }
+    }
+}
+
 /// One batch of encoded frames, as `parse_frames` reads them.
 #[tauri::command]
 pub async fn share_playback_frames(

@@ -8,6 +8,7 @@
  * transport (fresh DTLS and SSRCs), and the watch transport belongs to the session, with
  * `SCREEN_SLOTS` fixed receive-only slots the server fills (`screen.slot`).
  */
+import type { PictureClock, SoundClock } from "./share-sync";
 import { RtcUplinkObserver, type UplinkStatus } from "./uplink-congestion";
 import type { Av1Capability } from "../proto/Av1Capability";
 import type { H264Capability } from "../proto/H264Capability";
@@ -1584,6 +1585,7 @@ export class ScreenWatchTransport {
   private pc: RTCPeerConnection | null = null;
   private transceivers: RTCRtpTransceiver[] = [];
   private audioTransceivers: RTCRtpTransceiver[] = [];
+  private heldBefore = new WeakMap<RTCRtpReceiver, { delay: number; emitted: number }>();
   private streams: MediaStream[] = [];
   private stopWatching: () => void = () => {};
   private closed = false;
@@ -1661,6 +1663,41 @@ export class ScreenWatchTransport {
       });
     } catch { /* Missing stats cannot prove that a decoder failed. */ }
     finally { this.polling = false; }
+  }
+
+  /** The picture a slot last handed over, and when: lip-sync reads it. */
+  pictureClock(slot: number): PictureClock | null {
+    const source = this.transceivers[slot]?.receiver.getSynchronizationSources()[0];
+    return source && !this.closed ? { rtpTime: source.rtpTimestamp, unixMs: source.timestamp } : null;
+  }
+
+  /** The sound a slot last played, and when, where the webview plays it. */
+  soundClock(slot: number): SoundClock | null {
+    const source = this.audioTransceivers[slot]?.receiver.getSynchronizationSources()[0];
+    return source && !this.closed ? { rtpTime: source.rtpTimestamp, unixMs: source.timestamp } : null;
+  }
+
+  /** How long a slot's picture was held since the last look, in milliseconds. */
+  async pictureDelay(slot: number): Promise<number> {
+    const receiver = this.transceivers[slot]?.receiver;
+    let delay = 0;
+    if (!receiver) return delay;
+    (await receiver.getStats()).forEach(s => {
+      if (s.type !== "inbound-rtp") return;
+      const { jitterBufferDelay = 0, jitterBufferEmittedCount = 0 } = s as RTCInboundRtpStreamStats & { jitterBufferDelay?: number; jitterBufferEmittedCount?: number };
+      const last = this.heldBefore.get(receiver) ?? { delay: 0, emitted: 0 };
+      const emitted = jitterBufferEmittedCount - last.emitted;
+      if (emitted <= 0) return;
+      this.heldBefore.set(receiver, { delay: jitterBufferDelay, emitted: jitterBufferEmittedCount });
+      delay = 1_000 * (jitterBufferDelay - last.delay) / emitted;
+    });
+    return delay;
+  }
+
+  /** Holds a slot's picture back, on top of nothing but the receiver's smallest delay. */
+  setPictureWait(slot: number, ms: number): void {
+    const receiver = this.transceivers[slot]?.receiver as (RTCRtpReceiver & { jitterBufferTarget?: number | null }) | undefined;
+    if (receiver && "jitterBufferTarget" in receiver) { try { receiver.jitterBufferTarget = ms; } catch { /* out of range on some engines */ } }
   }
 
   /** What one slot decodes, for the stage's quality badge. */

@@ -21,9 +21,10 @@ import { nextMediaRun } from "../voice/engine";
 import { applyCaptureSpec, captureScreen, captureSupport, captureTabSound, probeAv1Encoder, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PublishStats, type SlotStats, type EncoderFallbacks } from "../voice/screen";
 import { defaultShareAudio } from "../voice/share-audio";
 import { computerSoundSupport, ComputerSound, shareSoundReceivable, ShareSoundReceiver, type ComputerSoundState, type ShareSoundLink } from "../voice/share-sound";
+import { PictureSync } from "../voice/share-sync";
 import { myChannelId } from "./reducer";
 import { useScreen, type ScreenAction } from "./screen";
-import { useSession, useUi } from "./stores";
+import { useSession, useUi, useVoice } from "./stores";
 
 /** Why this device cannot share here, or "ok". */
 export type ShareAvailability = Exclude<ScreenSupport, "ok"> | "ok" | "teamspeak" | "encrypted" | "forbidden";
@@ -124,6 +125,8 @@ export class ScreenController {
   /** A receiver that carried a share can still hold its last decoded frame. */
   private readonly usedSlots = new Set<number>();
   private watchAudio = false;
+  /** The desktop app's lip-sync, for as long as sound reaches the native mixer. */
+  private pictureSync: PictureSync | null = null;
   /** Desktop app: this share's computer sound, from the sharer's confirmation until it ends. */
   private sound: ComputerSound | null = null;
   /**
@@ -986,6 +989,7 @@ export class ScreenController {
   }
 
   closeSound(id: number, slot: number): void {
+    this.pictureSync?.release(slot);
     this.receiver?.closeSlot(slot);
     dispatch({ type: "watchSound", id, ready: false });
   }
@@ -998,6 +1002,14 @@ export class ScreenController {
     // No answer says nothing about the share, and a stalled page would drop its player for it.
     const audio = await conn.request("screen.audio.state", { share, stopped: false }, { timeoutMs: 1_500 }).then(r => r.audio).catch(() => null);
     if (audio !== null && this.link() === conn && useScreen.getState().watches.some(w => w.id === id && w.share === share && w.status === "watching")) dispatch({ type: "watchAudio", run, id, audio });
+  }
+
+  /** One look at every watch with sound that can be heard here. */
+  private syncPictures(): void {
+    const deafened = useVoice.getState().deafened;
+    const native = this.receiver !== null;
+    void this.pictureSync?.tick(useScreen.getState().watches.flatMap(w => w.status === "watching" && w.slot !== null && (native ? w.soundReady : w.audio)
+      ? [{ share: w.share, slot: w.slot, heard: !deafened && this.soundGain(w.share) > 0, paused: w.paused !== undefined }] : []));
   }
 
   /** The session's watch transport, negotiated on the first watch and kept; resolves to its run once connected. */
@@ -1038,7 +1050,20 @@ export class ScreenController {
         const link = native && server && await shareSoundReceivable() ? await this.soundLink()?.catch(() => null) : null;
         const enabled = native ? !!link : server;
         if (this.transport !== transport) return enabled;
-        if (link) this.receiver = new ShareSoundReceiver(link, run);
+        const receiver = link ? new ShareSoundReceiver(link, run) : null;
+        if (receiver) this.receiver = receiver;
+        if (enabled) this.pictureSync = new PictureSync({
+          association: share => conn.request("screen.audio.sync", { share }, { timeoutMs: 1_000 }),
+          sound: async slot => receiver ? receiver.clock(slot) : transport.soundClock(slot),
+          picture: slot => transport.pictureClock(slot),
+          shown: slot => transport.pictureDelay(slot),
+          wait: (slot, waits) => {
+            transport.setPictureWait(slot, waits.picture);
+            receiver?.hold(slot, waits.sound);
+          },
+          soundWaits: receiver !== null,
+          now: () => Date.now(),
+        });
         this.watchAudio = enabled;
         return enabled;
       },
@@ -1066,6 +1091,7 @@ export class ScreenController {
           settle.resolve(run);
           if (this.watchAudio && !this.audioTimer) this.audioTimer = setInterval(() => {
             for (const w of useScreen.getState().watches) if (w.status === "watching") void this.refreshAudio(conn, run, w.id, w.share);
+            this.syncPictures();
           }, 1_000);
         }
       },
@@ -1103,6 +1129,7 @@ export class ScreenController {
     if (this.audioTimer) clearInterval(this.audioTimer);
     this.audioTimer = null;
     this.watchAudio = false;
+    this.pictureSync = null;
     this.receiver?.close();
     this.receiver = null;
     for (const { timer } of this.firstFrameTimers.values()) if (timer) clearTimeout(timer);

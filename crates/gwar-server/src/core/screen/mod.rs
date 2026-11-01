@@ -174,6 +174,19 @@ impl Core {
         Ok(Response::ScreenAudioState { audio: true })
     }
 
+    /// What the viewer's own transport has forwarded, for its lip-sync.
+    pub(super) fn screen_audio_sync(&self, session: SessionId, id: &str) -> Reply {
+        let share = self.visible_share(session, id)?;
+        self.may_watch(session, share)?;
+        let clock = self.sessions[&session]
+            .watch
+            .as_ref()
+            .and_then(|watch| watch.slots.iter().flatten().find(|(share, _)| share == id))
+            .and_then(|(_, grant)| grant.sound_clock());
+        let (audio_rtp, video_rtp) = clock.unwrap_or_default();
+        Ok(Response::ScreenAudioSync { known: clock.is_some(), audio_rtp, video_rtp })
+    }
+
     fn share_view(&self, id: &str) -> ScreenShare {
         let s = &self.shares[id];
         ScreenShare {

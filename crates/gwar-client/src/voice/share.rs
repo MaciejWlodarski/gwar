@@ -15,7 +15,7 @@ use std::{
         mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel},
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Result;
@@ -44,6 +44,14 @@ const MAX_QUEUED: usize = 32;
 const DRIFT_MARGIN: Duration = Duration::from_millis(10);
 /// 0.2 % stays inaudible and covers any sound card's clock error.
 const DRIFT_RATE: f64 = 0.002;
+/// While sound moves to hold back for the picture or to give that back: 1 % is 10 ms a second,
+/// and no music is that far out of tune for the few seconds it takes.
+const HOLD_RATE: f64 = 0.01;
+/// How quickly the reading speed follows, per sample: changes of speed take 100 ms, so an uneven
+/// queue cannot be heard as a wobble.
+const RATE_SMOOTHING: f64 = 1.0 / 4800.0;
+/// The most sound holds back for the picture. `MAX_QUEUED` has to stay above this and `MAX_DELAY`.
+const MAX_HOLD: Duration = Duration::from_millis(400);
 /// Anything further ahead is a stall's backlog: dropped, never replayed.
 const BACKLOG_MARGIN: Duration = Duration::from_millis(80);
 /// Sound counts as a backlog only if it stayed queued for this long. A busy machine hands sound
@@ -112,9 +120,49 @@ struct Counters {
     ring_underruns: AtomicU64,
 }
 
+/// Where the voice pipeline was, for telling when a sample of the ring comes out.
+#[derive(Clone, Copy)]
+struct OutputClock {
+    /// Samples taken from the ring before `at`.
+    taken: u64,
+    at: Instant,
+    /// How many samples were still ahead of the next one on its way to the speaker.
+    ahead: usize,
+}
+
+/// One instant of a stream: the sample with this RTP time is the ring's `written`th.
+#[derive(Clone, Copy)]
+struct Mark {
+    run: u64,
+    written: u64,
+    rtp_time: u32,
+}
+
+/// When one of a stream's samples leaves the speaker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShareClock {
+    pub rtp_time: u32,
+    pub at: Instant,
+}
+
+impl ShareClock {
+    /// `at` on the system clock, in milliseconds since the Unix epoch.
+    pub fn unix_ms(&self) -> f64 {
+        let now = Instant::now();
+        let unix = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64() * 1000.0;
+        match self.at.checked_duration_since(now) {
+            Some(ahead) => unix + ahead.as_secs_f64() * 1000.0,
+            None => unix - now.duration_since(self.at).as_secs_f64() * 1000.0,
+        }
+    }
+}
+
 /// What the voice pipeline reads: decoded share sound, independent of any one voice run.
 pub struct ShareBus {
     ring: Mutex<Consumer<[f32; 2]>>,
+    taken: AtomicU64,
+    /// Written with `try_lock`: the pipeline never waits, and a missed note is 10 ms old at most.
+    output: Mutex<Option<OutputClock>>,
     /// Any open stream; without one the pipeline's only cost is this load.
     active: AtomicBool,
     counters: Arc<Counters>,
@@ -123,6 +171,13 @@ pub struct ShareBus {
 impl ShareBus {
     pub(super) fn active(&self) -> bool {
         self.active.load(Ordering::Relaxed)
+    }
+
+    /// Called before each `mix`: `ahead` samples stand between it and the speaker.
+    pub(super) fn note_output(&self, ahead: usize) {
+        if let Ok(mut output) = self.output.try_lock() {
+            *output = Some(OutputClock { taken: self.taken.load(Ordering::Relaxed), at: Instant::now(), ahead });
+        }
     }
 
     /// Adds share sound to `speakers`, which hold voice alone, centred. Never waits. Deafened
@@ -138,6 +193,7 @@ impl ShareBus {
                 missing += 1;
                 continue;
             };
+            self.taken.fetch_add(1, Ordering::Relaxed);
             if deafened {
                 continue;
             }
@@ -171,6 +227,9 @@ pub struct SharePlayout {
     bus: Arc<ShareBus>,
     counters: Arc<Counters>,
     gain: Arc<[AtomicU32; SCREEN_SLOTS]>,
+    /// How long each slot's sound waits for its picture, in milliseconds.
+    hold: Arc<[AtomicU32; SCREEN_SLOTS]>,
+    marks: Arc<Mutex<[Option<Mark>; SCREEN_SLOTS]>>,
     _stop: Stop,
 }
 
@@ -186,8 +245,15 @@ impl SharePlayout {
         let (input, inbox) = sync_channel(INPUT_QUEUE);
         let (tx, rx) = RingBuffer::new(RING_CAPACITY);
         let counters = Arc::<Counters>::default();
-        let bus =
-            Arc::new(ShareBus { ring: Mutex::new(rx), active: AtomicBool::new(false), counters: counters.clone() });
+        let bus = Arc::new(ShareBus {
+            ring: Mutex::new(rx),
+            taken: AtomicU64::new(0),
+            output: Mutex::new(None),
+            active: AtomicBool::new(false),
+            counters: counters.clone(),
+        });
+        let marks = Arc::new(Mutex::new([None; SCREEN_SLOTS]));
+        let hold = Arc::new(std::array::from_fn(|_| AtomicU32::new(0)));
         let gain = Arc::new(std::array::from_fn(|_| AtomicU32::new(1.0f32.to_bits())));
         let controls = Arc::new(Controls {
             slots: Mutex::new((0..SCREEN_SLOTS).map(|_| SlotControl::default()).collect()),
@@ -204,8 +270,11 @@ impl SharePlayout {
             gain: Arc::clone(&gain),
             stop: stop.clone(),
             block: vec![[0.0; 2]; RING_TARGET],
+            hold: Arc::clone(&hold),
+            marks: marks.clone(),
+            written: 0,
         };
-        (Self { input, controls, bus, counters, gain, _stop: Stop(stop) }, worker)
+        (Self { input, controls, bus, counters, gain, hold, marks, _stop: Stop(stop) }, worker)
     }
 
     pub fn bus(&self) -> Arc<ShareBus> {
@@ -228,6 +297,7 @@ impl SharePlayout {
             let Ok(stream) = Stream::new(run) else { return false };
             *control = SlotControl { run, open: true, replacement: Some(stream) };
             self.controls.changed.store(true, Ordering::Release);
+            self.hold[slot].store(0, Ordering::Relaxed);
         }
         self.store_gain(slot, gain);
         true
@@ -262,9 +332,35 @@ impl SharePlayout {
         true
     }
 
+    /// How long a slot's sound waits for its picture. Sound reaches a new hold by playing up to 1 %
+    /// slower or faster, never by a jump. False, and nothing changes, when a newer run has it.
+    pub fn set_hold(&self, slot: usize, run: u64, ms: u32) -> bool {
+        if slot >= SCREEN_SLOTS {
+            return false;
+        }
+        let slots = self.controls.lock();
+        if run < slots[slot].run {
+            return false;
+        }
+        self.hold[slot].store(ms.min(MAX_HOLD.as_millis() as u32), Ordering::Relaxed);
+        true
+    }
+
     fn store_gain(&self, slot: usize, gain: f32) {
         let gain = if gain.is_finite() { gain.clamp(0.0, 1.0) } else { 0.0 };
         self.gain[slot].store(gain.to_bits(), Ordering::Relaxed);
+    }
+
+    /// When a recent sample of `run`'s stream in `slot` leaves the speaker, for lining the
+    /// picture up with it. `None` until sound has reached a running voice pipeline.
+    pub fn clock(&self, slot: usize, run: u64) -> Option<ShareClock> {
+        let mark = (*self.marks.lock().unwrap_or_else(|e| e.into_inner()).get(slot)?)?;
+        let output = (*self.bus.output.lock().unwrap_or_else(|e| e.into_inner()))?;
+        (mark.run == run).then_some(())?;
+        let ahead = (mark.written as i64 - output.taken as i64) + output.ahead as i64;
+        let offset = Duration::from_secs_f64(ahead.unsigned_abs() as f64 / f64::from(RATE));
+        let at = if ahead >= 0 { output.at + offset } else { output.at.checked_sub(offset)? };
+        Some(ShareClock { rtp_time: mark.rtp_time, at })
     }
 
     /// Never blocks; a full queue costs share sound, not the caller.
@@ -310,6 +406,10 @@ struct Jitter {
     /// The shortest the queue has been since it went over its limit, `watched` samples ago.
     lowest: usize,
     watched: usize,
+    /// How long the sound waits for its picture, on top of what the network asks.
+    hold: Duration,
+    /// A hold was lowered and the queue is still on its way down.
+    releasing: bool,
 }
 
 /// Wrapping RTP order.
@@ -328,13 +428,41 @@ impl Jitter {
             dry_since: None,
             lowest: usize::MAX,
             watched: 0,
+            hold: Duration::ZERO,
+            releasing: false,
         }
     }
 
     fn delay(&self) -> Duration {
-        Duration::from_secs_f64(
-            (FRAME_MS as f64 / 1000.0 + 2.0 * self.deviation).clamp(MIN_DELAY.as_secs_f64(), MAX_DELAY.as_secs_f64()),
-        )
+        self.hold
+            + Duration::from_secs_f64(
+                (FRAME_MS as f64 / 1000.0 + 2.0 * self.deviation)
+                    .clamp(MIN_DELAY.as_secs_f64(), MAX_DELAY.as_secs_f64()),
+            )
+    }
+
+    fn set_hold(&mut self, hold: Duration) {
+        self.releasing |= hold < self.hold;
+        self.hold = hold;
+    }
+
+    /// The reading speed the queue asks for.
+    fn speed(&mut self) -> f64 {
+        if !self.started {
+            return 1.0;
+        }
+        let (queued, delay) = (self.queued(), self.delay());
+        self.releasing &= queued > delay + DRIFT_MARGIN;
+        if !self.releasing && self.hold.is_zero() {
+            return if queued > delay + DRIFT_MARGIN { 1.0 + DRIFT_RATE } else { 1.0 };
+        }
+        if queued > delay + DRIFT_MARGIN {
+            1.0 + HOLD_RATE
+        } else if queued + DRIFT_MARGIN < delay {
+            1.0 - HOLD_RATE
+        } else {
+            1.0
+        }
     }
 
     fn observe(&mut self, rtp_time: u32, now: Instant) {
@@ -439,6 +567,8 @@ struct Stream {
     fraction: f64,
     concealing: u32,
     scratch: Vec<f32>,
+    /// The speed reading is at, on its way to what the queue asks.
+    speed: f64,
 }
 
 impl Stream {
@@ -451,6 +581,7 @@ impl Stream {
             fraction: 0.0,
             concealing: 0,
             scratch: vec![0.0; 2 * MAX_PACKET_SAMPLES],
+            speed: 1.0,
         })
     }
 
@@ -497,20 +628,22 @@ impl Stream {
         }
     }
 
-    /// Adds `gain` times this stream to `mix`. Drift is taken up by reading very slightly faster.
+    /// The RTP time of the next sample `mix` reads.
+    fn position(&self) -> Option<u32> {
+        Some(self.jitter.next?.wrapping_sub(self.pcm.len() as u32))
+    }
+
+    /// Adds `gain` times this stream to `mix`. Drift is taken up by reading very slightly faster,
+    /// and a hold for the picture by reading a little slower or faster.
     fn mix(&mut self, mix: &mut [[f32; 2]], gain: f32) {
-        let step = 1.0
-            + if self.jitter.started && self.jitter.queued() > self.jitter.delay() + DRIFT_MARGIN {
-                DRIFT_RATE
-            } else {
-                0.0
-            };
+        let step = self.jitter.speed();
         for out in mix {
+            self.speed += (step - self.speed) * RATE_SMOOTHING;
             let (Some(&now), Some(&next)) = (self.pcm.front(), self.pcm.get(1)) else { return };
             let blend = self.fraction as f32;
             out[0] += gain * (now[0] + (next[0] - now[0]) * blend);
             out[1] += gain * (now[1] + (next[1] - now[1]) * blend);
-            self.fraction += step;
+            self.fraction += self.speed;
             while self.fraction >= 1.0 {
                 self.fraction -= 1.0;
                 self.pcm.pop_front();
@@ -527,8 +660,12 @@ struct Worker {
     bus: Arc<ShareBus>,
     counters: Arc<Counters>,
     gain: Arc<[AtomicU32; SCREEN_SLOTS]>,
+    hold: Arc<[AtomicU32; SCREEN_SLOTS]>,
     stop: Arc<AtomicBool>,
     block: Vec<[f32; 2]>,
+    marks: Arc<Mutex<[Option<Mark>; SCREEN_SLOTS]>>,
+    /// Samples written to the ring.
+    written: u64,
 }
 
 impl Worker {
@@ -595,11 +732,16 @@ impl Worker {
         block.fill([0.0; 2]);
         for (slot, stream) in self.streams.iter_mut().enumerate() {
             let Some(stream) = stream else { continue };
+            stream.jitter.set_hold(Duration::from_millis(u64::from(self.hold[slot].load(Ordering::Relaxed))));
             stream.fill(wanted, &self.counters);
+            if let Some(rtp_time) = stream.position() {
+                let mark = Mark { run: stream.run, written: self.written, rtp_time };
+                self.marks.lock().unwrap_or_else(|e| e.into_inner())[slot] = Some(mark);
+            }
             stream.mix(block, f32::from_bits(self.gain[slot].load(Ordering::Relaxed)));
         }
         for frame in block.iter() {
-            let _ = self.ring.push(*frame);
+            self.written += u64::from(self.ring.push(*frame).is_ok());
         }
     }
 }

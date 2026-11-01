@@ -325,6 +325,10 @@ wire! {
         /// Brings back sound I stopped, on the m-line my share already negotiated.
         #[serde(rename = "screen.audio.resume")]
         ScreenAudioResume { share: String },
+        /// The sound and picture RTP times of one instant of a watched share, as this viewer's
+        /// transport stamps them. Unknown on older servers.
+        #[serde(rename = "screen.audio.sync")]
+        ScreenAudioSync { share: String },
         /// The share on the viewer's stage: it gets first claim on the viewer's bandwidth.
         #[serde(rename = "screen.focus")]
         ScreenFocus { share: String },
@@ -651,6 +655,8 @@ wire! {
         ScreenAudioCapabilities { screen_audio: bool },
         ScreenAudioAddCapabilities { screen_audio_add: bool },
         ScreenAudioState { audio: bool },
+        /// `screen.audio.sync`: `known` stays false until both sound and picture were forwarded.
+        ScreenAudioSync { known: bool, audio_rtp: u32, video_rtp: u32 },
         /// `screen.publish.offer`, `screen.watch.offer`: the SDP answer.
         ScreenAnswer { sdp: String },
         /// `screen.watch`: the watch transport's slot the share arrives in.

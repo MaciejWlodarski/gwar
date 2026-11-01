@@ -275,11 +275,26 @@ pub struct WatchGrant {
     origin: Arc<ScreenOrigin>,
     alive: AtomicBool,
     leases: Vec<Arc<Lease>>,
+    /// Sound and picture RTP times of one instant on this viewer's transport.
+    sound_clock: Mutex<Option<(u32, u32)>>,
 }
 
 impl WatchGrant {
     pub fn new(origin: Arc<ScreenOrigin>) -> Arc<Self> {
-        Arc::new(Self { share: origin.share.clone(), origin, alive: AtomicBool::new(true), leases: Vec::new() })
+        Arc::new(Self {
+            share: origin.share.clone(),
+            origin,
+            alive: AtomicBool::new(true),
+            leases: Vec::new(),
+            sound_clock: Mutex::new(None),
+        })
+    }
+    /// The latest instant both sound and picture were forwarded for this watch.
+    pub fn sound_clock(&self) -> Option<(u32, u32)> {
+        *self.sound_clock.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    fn set_sound_clock(&self, clock: Option<(u32, u32)>) {
+        *self.sound_clock.lock().unwrap_or_else(|e| e.into_inner()) = clock;
     }
     /// Guest authority is checked directly, without waiting for asynchronous teardown.
     pub fn guest(origin: Arc<ScreenOrigin>, link: Arc<Lease>, membership: Option<Arc<Lease>>) -> Arc<Self> {
@@ -288,6 +303,7 @@ impl WatchGrant {
             origin,
             alive: AtomicBool::new(true),
             leases: std::iter::once(link).chain(membership).collect(),
+            sound_clock: Mutex::new(None),
         })
     }
     pub fn alive(&self) -> bool {
@@ -664,6 +680,8 @@ struct Slot {
     /// Released originals still owned by str0m: sequence, source keyframe and arrival deadline.
     originals: VecDeque<(u16, Option<u32>, Instant)>,
     written: u64,
+    /// RTP time and publisher wallclock of the last original written; see [`audio::associate`].
+    last_written: Option<(u32, Instant)>,
     keyframe_at: Option<Instant>,
     last_h264: Option<(Instant, h264_stream::Requirements)>,
     last_av1: Option<(Instant, av1_stream::Requirements)>,
@@ -691,6 +709,7 @@ impl Slot {
             initial_failed: None,
             keyframe_pending: None,
             originals: VecDeque::new(),
+            last_written: None,
             written: 0,
             keyframe_at: None,
             last_h264: None,
@@ -1681,6 +1700,7 @@ impl Sfu {
             let Some(w) = self.watchers.get_mut(&session) else { continue };
             w.ceiling = ceiling;
             audio::reserve(w, now);
+            audio::associate(w);
             if let Some((slot, change)) = allocate(w, now, &rates, budget) {
                 self.tell(session, slot, change, now);
             }
@@ -3097,6 +3117,7 @@ fn assign(w: &mut Watcher, index: usize, grant: Arc<WatchGrant>, order: u64, now
 fn empty(w: &mut Watcher, index: usize, now: Instant) {
     let slot = &mut w.slots[index];
     slot.grant = None;
+    slot.last_written = None;
     slot.logged = None;
     slot.segment.wait();
     slot.asked = None;
@@ -3381,6 +3402,7 @@ fn release(w: &mut Watcher, now: Instant) {
             extensions.user_values.set(dd);
         }
         slot.originals.push_back((packet.out as u16, packet.key_frame(), packet.arrival));
+        slot.last_written = Some((packet.timestamp, packet.wallclock));
         // Sender reports use the common publisher clock (arrival before source reports),
         // never application release time: queued picture stays aligned with share sound.
         stream.write_rtp(

@@ -897,11 +897,13 @@ fn pipeline<const CAPTURE: usize>(
             for (pair, &s) in speakers[..take].iter_mut().zip(&mix[..take]) {
                 *pair = [s; 2];
             }
-            if let Some(bus) = share_bus.as_ref().filter(|bus| bus.active())
-                && bus.mix(&mut speakers[..take], deafened)
-            {
-                processing.pin_stereo();
-                counters.stereo_echo.store(true, Ordering::Relaxed);
+            if let Some(bus) = share_bus.as_ref().filter(|bus| bus.active()) {
+                let queued = speaker.buffer().capacity() - speaker.slots();
+                bus.note_output(queued + output.device_latency_samples.load(Ordering::Relaxed));
+                if bus.mix(&mut speakers[..take], deafened) {
+                    processing.pin_stereo();
+                    counters.stereo_echo.store(true, Ordering::Relaxed);
+                }
             }
             // The final channels, clipping included: the canceller must know what the room hears.
             processing.render(&speakers[..take]);

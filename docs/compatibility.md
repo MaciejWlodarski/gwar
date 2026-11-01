@@ -244,6 +244,11 @@ queries fall back to video-only sharing without an error banner; see
 [share-audio.md](share-audio.md#compatibility). This is a bounded feature-specific
 rollout, not an implementation of the full compatibility proposal above.
 
+Lip-sync asks `screen.audio.sync` (`share`), which answers `{ known, audio_rtp, video_rtp }`: one
+audio and one video RTP time of the same instant for the asker's slot, or `known: false` until the
+SFU has them. Older servers reject it; a viewer stops asking and plays as before, without lip-sync.
+No existing shape changes.
+
 Screen audio availability is queried separately with `screen.audio.state`
 (`share`, optional `stopped`, default false). Its reply is `{ audio: boolean }`.
 Older servers reject it normally; viewers then keep video without audio controls

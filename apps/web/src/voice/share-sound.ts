@@ -4,6 +4,7 @@
  * the native mixer before anything can decode it here. Both directions are bounded, and neither
  * touches voice: the sound cannot wait on the voice engine, nor the voice engine on the sound.
  */
+import type { SoundClock } from "./share-sync";
 import type { TauriBridge } from "../platform";
 import type { ShareSoundFrame, ShareSoundProbe } from "./share-sound-worker";
 import worklet from "./share-sound-worklet.ts?worker&url";
@@ -285,6 +286,17 @@ export class ShareSoundReceiver {
 
   setGain(slot: number, gain: number): void {
     if (!this.closed) void this.control("share_playback_gain", { run: this.run, slot, gain }).catch(() => {});
+  }
+
+  /** How long this slot's sound waits for its picture. The mixer gets there by itself, unheard. */
+  hold(slot: number, ms: number): void {
+    if (!this.closed) void this.control("share_playback_hold", { run: this.run, slot, ms }).catch(() => {});
+  }
+
+  /** When a recent sample of this slot leaves the speaker. */
+  clock(slot: number): Promise<SoundClock | null> {
+    if (this.closed || !this.open.has(slot)) return Promise.resolve(null);
+    return this.link.api.invoke<SoundClock | null>("share_playback_clock", { owner: this.link.owner, run: this.run, slot });
   }
 
   close(): void {

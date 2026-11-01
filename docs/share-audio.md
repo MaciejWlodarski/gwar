@@ -370,13 +370,50 @@ worker → share_playback_frames (raw batch, one in flight, 400 frames at most)
   dropped rather than played late. So after a stall, sound can trail by up to 640 ms for half
   a second.
 
+### Lip-sync
+
+A viewer lines a share's picture and sound up once a second. Voice is never involved, and a share
+without sound never comes through here. `apps/web/src/voice/share-sync.ts` holds the decisions.
+
+Both sides are read where they come out: the picture from the video receiver's synchronization
+source, and the sound from the audio receiver's in a browser or from the mixer in the desktop app,
+which reports when a recent sample reaches the speaker (`share_playback_clock`). The SFU rewrites
+RTP times per viewer, so only it can relate them: `screen.audio.sync` returns one audio and one
+video RTP time of the same instant for the viewer's slot, taken from the sender reports' shared
+wallclock, or `known: false` until it has them. A viewer asks at each look.
+
+**The picture waits.** Sound carries speech, and a picture a few tens of milliseconds later is the
+smaller loss. `jitterBufferTarget` is a minimum, so a wait starts from the delay the receiver
+already has. The first look moves the whole way, since nobody has seen the picture settle; later
+ones move at most 40 ms at half the error, and nothing moves for less than 10 ms. A picture that
+keeps agreeing gives 5 ms a second back, because a browser's own sync pulls each side up to the
+other and a lag alone would never show that a wait is no longer needed.
+
+**Sound waits only in the desktop app**, for a picture that is late with nothing left to give, for
+a lead over 25 ms, in steps. Sound leaves the webview there, so its own sync has none to work with.
+The mixer plays it 1 % slower, 10 ms a second and at most 400 ms in all, with the speed changing
+over 100 ms; when the wait falls it plays 1 % faster until the queue is back. With no wait the
+mixer reads exactly as before. While sound is not ahead it keeps giving a wait back. In a browser
+the engine's own sync moves sound; a second controller on the same pair only drove both up.
+
+A late joiner settles for two looks and starts alone, per slot. A paused picture moves nothing, so
+the waits are still there for the resume, and the next look corrects what the pause changed. Muting
+and deafening release both waits, since nothing heard is left to line up with, and sound coming back
+starts over like a new watch. A server without the query answers once and the viewer does not ask
+again; a webview without `jitterBufferTarget` leaves the picture alone, and the desktop mixer can
+still hold sound.
+
+What this cannot fix is a picture that is not arriving. After a link stall the picture can stay
+500–1000 ms late for 10–20 s, and on a link jittery enough to collapse the estimate it can stop
+altogether. Sound then leads whatever is done here, and it does not chase seconds of picture
+delay at 1 %. The numbers are in
+[share-audio-validation.md](share-audio-validation.md#lip-sync).
+
 ### Not included
 
 - **The sharer's own echo.** Sound the sharer's speakers play can reach their microphone.
   Feeding the captured sound to the canceller ([native-media.md](native-media.md#echo-and-the-sharers-microphone))
   is not done yet; headphones avoid it.
-- **Lip-sync is not actively corrected.** Sound runs behind the picture by the jitter queue and
-  rings, by estimate at most 100–120 ms. It has not been measured.
 - Mobile clients and the browser are unchanged.
 
 Validation is in [share-audio-validation.md](share-audio-validation.md#pr-2-desktop-app).
