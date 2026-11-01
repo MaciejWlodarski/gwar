@@ -295,7 +295,8 @@ async function computerSound(sharer, viewer, browserViewer) {
   const after = await viewer.native.request("share_stats", {});
   const rate = (after.frames - settled.frames) / 10;
   assert.ok(rate > 45 && rate < 55, `viewer takes one Opus frame per 20 ms, got ${rate}/s`);
-  assert.ok(await shareHeard(viewer) && await hears(viewer, 770), "ten seconds in, voice and share sound still play together");
+  // Not one instant: the fixture's JSON bridge delivers in bursts on a slow runner, between which the tone gaps.
+  await waitFor(async () => (await shareHeard(viewer)) && (await hears(viewer, 770)), "ten seconds in, voice and share sound still play together", 10_000);
   await viewer.page.getByTestId("share-audio-controls").getByRole("button", { name: "Mute share sound" }).click();
   await waitFor(async () => !(await shareHeard(viewer)), "muting silences the share here", 5_000);
   assert.ok(await hears(viewer, 770), "muting a share leaves voice alone");

@@ -553,7 +553,9 @@ All services are local and media is generated. `crates/gwar-server`, `gwar-proto
 its virtual speaker is mono, so the stereo side path is covered only by unit tests.
 A real Tauri app was not started: the picker needs a person, and the installed app is
 off limits. The bridge's JSON IPC is also far slower than Tauri's, so playout counters
-from it say nothing about the real app. One early run saw no decoded sound for 15 s
+from it say nothing about the real app: on a 4-vCPU CI runner it delivered bursts long
+enough that 312 of 943 frames were dropped as backlog and 230 concealed, while this Mac
+dropped none. The real IPC's burst size has not been measured. One early run saw no decoded sound for 15 s
 beside slot controls racing in that concurrent bridge. Controls are now serialized, and
 it did not come back in the later runs, but the cause was not proven.
 
