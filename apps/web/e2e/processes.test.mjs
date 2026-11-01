@@ -24,3 +24,8 @@ test("escalates after the group leader exits while a descendant ignores SIGTERM"
     await stopProcesses([child], 100);
   }
 });
+
+test("treats a group of only zombies as gone, as macOS answers it with EPERM", async t => {
+  t.mock.method(process, "kill", () => { throw Object.assign(new Error("kill EPERM"), { code: "EPERM" }); });
+  await stopProcesses([{ pid: 12345 }], 100);
+});

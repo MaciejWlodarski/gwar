@@ -2,7 +2,8 @@
 export async function stopProcesses(children, graceMs = 5000) {
   const signal = (child, name) => {
     try { process.kill(-child.pid, name); return true; }
-    catch (error) { if (error.code === "ESRCH") return false; throw error; }
+    // macOS says EPERM for a group whose processes have all exited and wait to be reaped.
+    catch (error) { if (error.code === "ESRCH" || error.code === "EPERM") return false; throw error; }
   };
   for (const child of children) signal(child, "SIGTERM");
   const deadline = Date.now() + graceMs;
