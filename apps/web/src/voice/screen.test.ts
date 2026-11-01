@@ -2742,8 +2742,19 @@ describe("AV1", () => {
     expect(await probeAv1()).toBeNull();
     decodingInfo.mockImplementation(() => new Promise(() => {}));
     const pending = probeAv1();
-    await vi.advanceTimersByTimeAsync(1500);
+    await vi.advanceTimersByTimeAsync(10_000);
     expect(await pending).toBeNull();
+  });
+
+  it("waits for a busy machine's decoder probe: a late answer still counts", async () => {
+    vi.stubGlobal("navigator", { mediaCapabilities: { decodingInfo: async (c: MediaDecodingConfiguration) => {
+      await new Promise(resolve => setTimeout(resolve, 2_000));
+      return { supported: c.video!.height <= 1080, smooth: true, powerEfficient: false };
+    } } });
+    const { probeAv1 } = await import("./screen");
+    const pending = probeAv1();
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(await pending).toEqual({ width: 1920, height: 1080 });
   });
 
   it("is offered first with its descriptor by a hardware encoder, and never after a recovery plan", async () => {

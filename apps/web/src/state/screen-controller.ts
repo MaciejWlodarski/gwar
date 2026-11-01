@@ -32,7 +32,8 @@ export type ShareAvailability = Exclude<ScreenSupport, "ok"> | "ok" | "teamspeak
 const WATCH_UNAVAILABLE_MS = 5_000;
 /**
  * For the answers a watch transport keeps for life. Old servers refuse at once, so a timeout here
- * only ever means a busy machine, and reading it as "no" loses the share's sound, or H.264 at 1080p.
+ * only ever means a busy machine, and reading it as "no" loses the share's sound, H.264 at 1080p,
+ * or AV1 for everyone watching with this viewer.
  */
 const WATCH_FEATURE_TIMEOUT_MS = 10_000;
 /** A watch's first frame must arrive within this long after its grant, across stage changes. */
@@ -826,7 +827,7 @@ export class ScreenController {
           .then(features => features.screen_h264 === true).catch(() => false);
         if (this.transport !== transport) throw new Error("the watch transport was replaced");
         // Only a server that knows the field may see it: older ones reject unknown fields.
-        const screenAv1 = screenH264 && av1 !== null && await conn.request("screen.av1.capabilities", {}, { timeoutMs: 1_500 })
+        const screenAv1 = screenH264 && av1 !== null && await conn.request("screen.av1.capabilities", {}, { timeoutMs: WATCH_FEATURE_TIMEOUT_MS })
           .then(features => features.screen_av1 === true).catch(() => false);
         if (this.transport !== transport) throw new Error("the watch transport was replaced");
         return (await conn.request("screen.watch.offer", { run, sdp, ...(screenH264 ? { browser: true, h264 } : {}), ...(screenAv1 && av1 ? { av1 } : {}) }, { timeoutMs: 35_000 })).sdp;

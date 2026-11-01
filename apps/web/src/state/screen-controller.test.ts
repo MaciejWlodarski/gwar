@@ -60,6 +60,7 @@ function fakeLink(handlers: Record<string, Handler>) {
       if (op === "screen.audio.capabilities") return handlers[op]?.(d, opts) ?? { screen_audio: false };
       if (op === "screen.spec.capabilities") return handlers[op]?.(d) ?? { screen_spec: false };
       if (op === "screen.capabilities") return handlers[op]?.(d, opts) ?? { screen_h264: false };
+      if (op === "screen.av1.capabilities") return handlers[op]?.(d, opts) ?? { screen_av1: false };
       calls.push([op, d]);
       const handler = handlers[op];
       if (!handler) return {};
@@ -753,6 +754,28 @@ describe("watch requests across a reset (review round 2)", () => {
     expect(calls[0]?.[0]).toBe("screen.watch.offer");
     expect(Object.keys(calls[0]![1]).sort()).toEqual(["browser", "h264", "run", "sdp"]);
     expect((screen as unknown as { watchAudio: boolean }).watchAudio).toBe(true);
+    screen.reset();
+    await pending;
+  });
+  it("a busy machine's late AV1 answer still reaches the watch offer", async () => {
+    // Without it the viewer's offer has no AV1, and that viewer turns an AV1 share to H.264 for everyone.
+    const { link, calls } = fakeLink({
+      "screen.capabilities": () => ({ screen_h264: true }),
+      "screen.av1.capabilities": async (_, opts) => {
+        await new Promise(resolve => setTimeout(resolve, 2_000));
+        if ((opts?.timeoutMs ?? Infinity) < 2_000) throw new Error("timed out");
+        return { screen_av1: true };
+      },
+      "screen.watch.offer": () => ({ sdp: "answer" }),
+    });
+    const screen = new ScreenController(() => link, String);
+    const pending = screen.watch("A");
+    await flush();
+    const transport = media.transports.at(-1)! as unknown as { params: { offer(sdp: string, run: number, h264: unknown[], av1: unknown): Promise<string> }; run: number };
+    const offer = transport.params.offer("watch-offer", transport.run, [], { width: 1920, height: 1080 });
+    await vi.advanceTimersByTimeAsync(2_100);
+    await offer;
+    expect(calls.filter(([op]) => op === "screen.watch.offer").at(-1)?.[1].av1).toEqual({ width: 1920, height: 1080 });
     screen.reset();
     await pending;
   });

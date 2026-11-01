@@ -2090,8 +2090,9 @@ production server is involved.
     `getStats` twice in a row switches in place to the negotiated H.264
     (`RTCRtpEncodingParameters.codec`); the SFU follows the codec change at
     its next keyframe, and an engine that cannot switch ends the transport.
-    Viewers probe `decodingInfo` for WebRTC AV1 and offer it only for a size
-    that is power-efficient, or, on desktops, up to 1080p in software. The
+    Viewers probe `decodingInfo` for WebRTC AV1, with the same 10 s deadline as
+    H.264, and offer it only for a size that is power-efficient, or, on
+    desktops, up to 1080p in software. The
     decode watchdog covers AV1 like H.264. The sharing bar shows "AV1".
   - Tests: Rust unit tests (sequence-header operating points, split and
     reordered prefixes, descriptor checks, seeded random input, limits,
