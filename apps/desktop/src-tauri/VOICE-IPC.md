@@ -95,19 +95,21 @@ missed release callbacks cancel immediately without the configured tail.
 
 See [share-audio](../../../docs/share-audio.md#desktop-app-computer-sound-and-native-playback).
 Every command except `share_capture_support` and `share_capture_allow` takes the voice `owner`
-and refuses a superseded one or any window but `main`. Bootstrap stops a capture and drops
-the playout left by the previous view. Neither direction holds a voice lock while media flows.
+and refuses a superseded one or any window but `main`. Bootstrap ends a capture, cancels a
+start under way and drops the playout left by the previous view. So do a page load and, on
+Windows, a failed WebView2 process. A capture nothing has read for five seconds ends by
+itself. Neither direction holds a voice lock while media flows.
 
 | Command | Arguments | Result |
 | --- | --- | --- |
 | `share_capture_support` | | `ok`, `permission` or `unsupported`. |
-| `share_capture_allow` | | Asks macOS to list Gwar for Screen Recording. |
+| `share_capture_allow` | | Asks macOS to list Gwar under Screen & System Audio Recording. |
 | `share_capture_start` | `owner, id` | Starts capturing. `id` must grow; errors are `permission`, `unsupported`, `failed` or `superseded`. |
 | `share_capture_read` | `owner, id` | Interleaved 48 kHz stereo `f32`, raw. Waits up to 100 ms; empty means no sound yet, the error `closed` means over. |
-| `share_capture_stop` | `owner, id` | Stops that capture; a stale id stops nothing. |
-| `share_playback_open` | `owner, run, slot` | Claims `slot` for watch transport `run`. False while no voice engine runs. |
-| `share_playback_close` | `owner, slot` | Stops that slot. |
-| `share_playback_gain` | `owner, slot, gain` | 0 to 1, independent of voice volume. |
+| `share_capture_stop` | `owner, id` | Stops that capture, or cancels its start: `id` can never start after this. A stale id stops nothing. A running capture has ended when this returns. |
+| `share_playback_open` | `owner, run, slot, gain` | Claims `slot` for watch transport `run` at `gain`. True only once that is in force; false for a run older than the slot's newest, or while no voice engine runs. |
+| `share_playback_close` | `owner, run, slot` | Stops that slot, unless a newer run has it. The slot remembers `run` after this. |
+| `share_playback_gain` | `owner, run, slot, gain` | 0 to 1, independent of voice volume; ignored for an older run. |
 | `share_playback_frames` | raw body | `owner: u64, run: u64`, then per frame `slot: u8, rtp_time: u32, length: u16, opus`, little-endian. A malformed batch is refused whole. |
 
 Sound goes only where it was asked for: a frame for a closed slot or an older run is

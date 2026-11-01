@@ -3600,7 +3600,7 @@ Picker refusal detection is intentionally limited to evidence in browser errors:
 | Other failure | Generic localized error |
 
 Guidance names Gwar in the desktop shell and the detected browser on the web.
-macOS names System Settings → Privacy & Security → Screen Recording; Windows
+macOS names System Settings → Privacy & Security → Screen & System Audio Recording; Windows
 names Settings → Privacy & security; other systems get generic privacy guidance.
 Identity, expiry and screen banners share the same shell: 57 pixels tall, 12-pixel
 vertical padding, a visible icon at every width, and 32-pixel controls. Each stays

@@ -68,7 +68,8 @@ try {
   for (const lang of ["pl", "en"]) {
     for (const [name, width, height] of [["desktop", 1440, 900], ["tablet", 768, 1024], ["390", 390, 844], ["360", 360, 800]]) {
       await page.setViewportSize({ width, height });
-      const shot = async label => { await page.evaluate(() => document.fonts.ready); await page.screenshot({ path: path.join(output, `computer-${label}-${lang}-${name}.png`), animations: "disabled" }); };
+      // Ready is not painted: a narrow window's first video frame comes a moment later.
+      const shot = async label => { await page.evaluate(() => document.fonts.ready); await page.waitForTimeout(500); await page.screenshot({ path: path.join(output, `computer-${label}-${lang}-${name}.png`), animations: "disabled" }); };
       const fits = async label => {
         const dialog = page.getByRole("dialog"); await dialog.waitFor();
         await dialog.evaluate(async e => { await Promise.all(e.getAnimations({ subtree: true }).map(a => a.finished)); });

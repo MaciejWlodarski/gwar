@@ -197,18 +197,25 @@ loop waits on the shell's own promise, so a hidden window's timers do not slow i
 after 4 s: sound never holds the picture back. Whatever goes wrong, the picture
 continues and Details says why, in plain words.
 
+A capture cannot outlive the share that asked for it. A stop at any step of the start
+cancels it, however late the OS answers: start, stop and the final install share one lock,
+and the install also checks that the webview still owns the app. Nothing here relies on
+JavaScript cleaning up: a page load, a new view, a failed WebView2 process, or five seconds
+without a read each end the capture.
+
 - **macOS 14 or newer:** ScreenCaptureKit with `capturesAudio` and
-  `excludesCurrentProcessAudio`. It needs Screen Recording for Gwar and a relaunch
-  after granting it. The dialog offers to open System Settings; asking also adds Gwar
+  `excludesCurrentProcessAudio`. It needs Gwar turned on under Screen & System Audio
+  Recording, and a relaunch after granting it. The dialog offers to open System Settings; asking also adds Gwar
   to the list there. The framework is weakly linked, so macOS 11 to 13 still run Gwar
   and simply cannot share sound.
 - **WebKit is not covered by that exclusion.** Measured here on macOS 27: a tone played
   by the app's `AVAudioEngine` was excluded (−240 dB), one played by its `WKWebView`
   arrived unchanged (−50.6 dB against −50 dB played). Its helpers are not in
   `SCShareableContent.applications` either, so an application filter cannot help. Voice and cues
-  are native, so only chat attachments play in the webview: while capture runs on
-  macOS, `silenceWebviewMedia` keeps every `<audio>` and `<video>` there muted, and
-  undoes it afterwards. A chat video played during a sound share is silent.
+  are native, so only chat attachments play in the webview: on macOS
+  `silenceWebviewMedia` keeps every `<audio>` and `<video>` there muted from before the
+  capture starts until the shell has stopped it. A chat video played during a sound share
+  is silent.
 - **Windows 11 or newer (build 20348+):** WASAPI process loopback excluding Gwar's
   process tree, which contains its WebView2 helpers. Earlier builds fail closed; a
   whole-device loopback, which would contain the call, is never used.
@@ -224,21 +231,26 @@ without transform events the app stays video only, with no sound claim.
 ```
 worker → share_playback_frames (raw batch, one in flight, 400 frames at most)
        → SharePlayout thread: ordered jitter queue (40–160 ms), Opus decode, mix of up to 4 shares
-       → ShareBus (40 ms ring) → voice pipeline → speaker + echo canceller reference
+       → ShareBus (40 ms ring) → voice pipeline → speakers + echo canceller reference
 ```
 
 - **Voice comes first.** The playout thread has ordinary priority. The voice pipeline
   takes the ring with `try_lock` and never waits for it. Share sound only uses the room
   voice leaves, so a loud share can clip but the voice under it cannot.
-- **Echo:** share sound is mixed before `processing.render`, so the canceller knows
-  it and a viewer on speakers does not send it back. Stereo keeps its mid in that mix and
-  sends its side to the output callback in lockstep, so the reference is what the speaker
-  plays. Selecting an output device needs nothing new.
+- **Echo:** the canceller's reference is the final left and right channels, voice and
+  share together, clipping included, so a viewer on speakers does not send the share back.
+  Both go to the device as pairs through one ring, so they cannot slip apart. While the
+  channels match, as they do for voice alone, the canceller's detector stays on one
+  channel; it takes about two seconds to adapt when a share makes them differ, and then
+  relearns the room. Selecting an output device needs nothing new.
 - **Controls:** the same per-share volume and mute as a browser (`shareAudio`), independent
   of voice volume. They appear only when the server confirms sound and the mixer has
   taken it. Deafen silences it without falling behind. There is no autoplay prompt.
-- A newer watch transport retires everything older, by run. Playback is not tied to one
-  voice run: a voice reconnect replaces the pipeline reading the ring, not the streams.
+- A newer watch transport retires everything older, by run. Open, close and volume each
+  name their run and are refused below the slot's newest, which a slot remembers after it
+  closes. They do not share the frame queue, so no backlog can lose one, and `open` only
+  reports success once it is in force. Playback is not tied to one voice run: a voice
+  reconnect replaces the pipeline reading the ring, not the streams.
 - A lost frame is concealed up to 100 ms. A stall's backlog is dropped rather than played late.
 
 ### Not included
