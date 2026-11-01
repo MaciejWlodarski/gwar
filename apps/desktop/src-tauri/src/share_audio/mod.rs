@@ -153,7 +153,7 @@ impl ShareCapture {
             return Err("closed".into());
         }
         state.starting = Some(id);
-        Ok(Arc::default())
+        Ok(state.paused.as_ref().map_or_else(Arc::default, |paused| paused.queue.restarted()))
     }
 
     /// Installs what the OS gave start `id`, unless it was cancelled meanwhile or `current` says
@@ -167,10 +167,9 @@ impl ShareCapture {
         current: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
         let mut state = self.lock();
-        let ended = state.paused.as_ref().is_some_and(|paused| paused.id == id) && !state.paused(id);
         let allowed = match state.starting == Some(id) {
-            true if ended => Err("closed".into()),
-            true => current(),
+            // Last, so an ending that comes during `current` is seen, and one after it finds this queue.
+            true => current().and_then(|()| if queue.adopt() { Ok(()) } else { Err("closed".into()) }),
             false => Err("superseded".into()),
         };
         if state.starting == Some(id) {
@@ -245,11 +244,12 @@ impl ShareCapture {
     fn keep_alive(&self, id: u64, now: Instant) -> bool {
         let mut state = self.lock();
         let Some(running) = state.running.as_ref().filter(|running| running.id == id) else { return false };
-        if now.saturating_duration_since(running.last_read) < READER_LEASE {
+        // Ended by the OS, the consent went with it: the stream stops now, with or without a reader.
+        let ended = running.queue.was_ended_by_system();
+        if !ended && now.saturating_duration_since(running.last_read) < READER_LEASE {
             return true;
         }
-        // Ended by the OS, the consent went with it. A read that comes back hears that it is over.
-        if !running.queue.was_ended_by_system() {
+        if !ended {
             tracing::info!("share sound paused: nothing is reading it");
             state.paused = Some(Paused { id, owner: running.owner, queue: running.queue.clone() });
         }
@@ -766,6 +766,79 @@ mod tests {
         assert!(back.is_closed(), "the stream it opened stops again");
         assert!(capture.lock().running.is_none());
         assert!(capture.resume(5, OWNER).is_err(), "and there is no second try");
+    }
+
+    #[test]
+    fn an_os_ending_before_a_commit_refuses_it() {
+        let capture = ShareCapture::default();
+        let queue = capture.begin(5).unwrap();
+        queue.end_by_system();
+        assert!(capture.commit(5, OWNER, queue.clone(), Box::new(()), || Ok(())).is_err());
+        assert!(capture.lock().running.is_none(), "no capture runs after the stop");
+    }
+
+    #[test]
+    fn an_os_ending_during_a_commit_refuses_it() {
+        let capture = ShareCapture::default();
+        let queue = capture.begin(5).unwrap();
+        let ending = queue.clone();
+        let started = capture.commit(5, OWNER, queue.clone(), Box::new(()), move || {
+            ending.end_by_system();
+            Ok(())
+        });
+        assert!(started.is_err());
+        assert!(capture.lock().running.is_none());
+
+        let capture = ShareCapture::default();
+        let queue = running(&capture, 5);
+        assert!(!stalled(&capture, 5));
+        let back = capture.resume(5, OWNER).unwrap();
+        let reopened = capture.commit(5, OWNER, back.clone(), Box::new(()), move || {
+            queue.end_by_system();
+            Ok(())
+        });
+        assert!(reopened.is_err(), "the check before this one cannot see it");
+        assert!(back.is_closed(), "the stream it opened stops again");
+        assert!(capture.lock().running.is_none());
+        assert!(capture.resume(5, OWNER).is_err(), "and there is no second try");
+    }
+
+    #[test]
+    fn an_os_ending_after_a_commit_stops_the_replacement() {
+        let capture = ShareCapture::default();
+        let queue = running(&capture, 5);
+        assert!(!stalled(&capture, 5));
+        let back = resumed(&capture, 5);
+        queue.end_by_system();
+        assert!(back.is_closed(), "the old stream's late callback reaches the new one");
+        assert!(!capture.keep_alive(5, Instant::now()), "and the OS stream stops at once, with no read");
+        assert!(capture.lock().running.is_none());
+        assert!(matches!(capture.reader(5), Reading::Over));
+        assert!(capture.resume(5, OWNER).is_err());
+    }
+
+    #[test]
+    fn an_os_ending_reaches_every_later_resume() {
+        let capture = ShareCapture::default();
+        let first = running(&capture, 5);
+        assert!(!stalled(&capture, 5));
+        resumed(&capture, 5);
+        assert!(!stalled(&capture, 5));
+        let last = resumed(&capture, 5);
+        first.end_by_system();
+        assert!(last.is_closed());
+        assert!(!capture.keep_alive(5, Instant::now()));
+        assert!(capture.resume(5, OWNER).is_err());
+    }
+
+    #[test]
+    fn a_newer_share_is_not_stopped_by_an_older_ones_ending() {
+        let capture = ShareCapture::default();
+        let old = running(&capture, 5);
+        let new = running(&capture, 6);
+        old.end_by_system();
+        assert!(!new.is_closed());
+        assert!(capture.reader(6).is_queue());
     }
 
     #[test]

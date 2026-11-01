@@ -218,6 +218,9 @@ share goes on without sound and Details says why.
 The clocks differ across sleep: macOS's stops, so a nap may not reach the five seconds, while
 Windows's runs, so waking there pauses first and resumes on the next read. A capture the OS itself
 ended stays ended: on macOS the user can stop it from the menu bar, and that must not come back.
+Every restart of a share carries the same consent, so a stop that arrives late, from a stream
+already replaced, ends the one running now. Its sound stops being passed on at once, and the OS
+stream within a second. A newer share has its own consent.
 
 - **macOS 14 or newer:** ScreenCaptureKit with `capturesAudio` and
   `excludesCurrentProcessAudio`. It needs Gwar turned on under Screen & System Audio

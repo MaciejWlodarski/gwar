@@ -614,7 +614,16 @@ pub struct CaptureQueue {
     samples: Mutex<CaptureState>,
     ready: tokio::sync::Notify,
     closed: AtomicBool,
+    consent: Arc<CaptureConsent>,
+}
+
+/// One share's consent to its sound, through every restart of the capture: an ending from the OS
+/// holds for all of them, even from a stream that was already replaced when it arrived.
+#[derive(Default)]
+struct CaptureConsent {
     ended_by_system: AtomicBool,
+    /// The queue in use. Set and ended under this lock, so one comes first.
+    open: Mutex<std::sync::Weak<CaptureQueue>>,
 }
 
 #[derive(Default)]
@@ -629,7 +638,7 @@ impl Default for CaptureQueue {
             samples: Mutex::default(),
             ready: tokio::sync::Notify::new(),
             closed: AtomicBool::new(false),
-            ended_by_system: AtomicBool::new(false),
+            consent: Arc::default(),
         }
     }
 }
@@ -638,6 +647,9 @@ impl CaptureQueue {
     /// `stereo` is interleaved. Called from the capture thread; the lock is only held to copy.
     pub fn write(&self, stereo: &[f32]) {
         let mut state = self.samples.lock().unwrap_or_else(|e| e.into_inner());
+        if self.was_ended_by_system() {
+            return;
+        }
         state.samples.extend(stereo.iter().copied());
         let excess = state.samples.len().saturating_sub(CAPTURE_LIMIT);
         if excess > 0 {
@@ -663,12 +675,35 @@ impl CaptureQueue {
     /// The OS ended this capture, as when the sharer stops it from the menu bar. That takes the
     /// consent with it: unlike [`Self::close`], nothing may bring this one back on its own.
     pub fn end_by_system(&self) {
-        self.ended_by_system.store(true, Ordering::SeqCst);
-        self.close();
+        let open = {
+            let open = self.consent.open.lock().unwrap_or_else(|e| e.into_inner());
+            self.consent.ended_by_system.store(true, Ordering::SeqCst);
+            open.upgrade()
+        };
+        for queue in std::iter::once(self).chain(open.as_deref()) {
+            queue.samples.lock().unwrap_or_else(|e| e.into_inner()).samples.clear();
+            queue.close();
+        }
     }
 
     pub fn was_ended_by_system(&self) -> bool {
-        self.ended_by_system.load(Ordering::SeqCst)
+        self.consent.ended_by_system.load(Ordering::SeqCst)
+    }
+
+    /// The queue for a restart of this capture, under the same consent.
+    pub fn restarted(&self) -> Arc<Self> {
+        Arc::new(Self { consent: self.consent.clone(), ..Self::default() })
+    }
+
+    /// Makes this the capture's queue in use, unless the OS has ended it. From here on an ending
+    /// reaches this queue, whichever restart's stream reports it.
+    pub fn adopt(self: &Arc<Self>) -> bool {
+        let mut open = self.consent.open.lock().unwrap_or_else(|e| e.into_inner());
+        if self.was_ended_by_system() {
+            return false;
+        }
+        *open = Arc::downgrade(self);
+        true
     }
 
     /// Stereo frames lost to a stalled reader.

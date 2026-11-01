@@ -459,6 +459,15 @@ async fn the_capture_queue_drops_old_sound_and_keeps_channels_in_step() {
 }
 
 #[tokio::test]
+async fn no_sound_is_read_once_the_system_ended_a_capture() {
+    let queue = Arc::new(CaptureQueue::default());
+    queue.write(&[0.5, -0.5]);
+    queue.end_by_system();
+    queue.write(&[0.5, -0.5]);
+    assert!(queue.read(Duration::from_secs(1)).await.is_empty(), "the stream runs on for a moment");
+}
+
+#[tokio::test]
 async fn a_reader_wakes_as_soon_as_sound_arrives() {
     let queue = Arc::new(CaptureQueue::default());
     let reader = {
