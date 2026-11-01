@@ -46,6 +46,9 @@ const DRIFT_MARGIN: Duration = Duration::from_millis(10);
 const DRIFT_RATE: f64 = 0.002;
 /// Anything further ahead is a stall's backlog: dropped, never replayed.
 const BACKLOG_MARGIN: Duration = Duration::from_millis(80);
+/// Sound counts as a backlog only if it stayed queued for this long. A busy machine hands sound
+/// over in lumps, and a lump that drains again before the next one is simply on time.
+const BACKLOG_WATCH: usize = (RATE / 2) as usize; // 500 ms
 /// A stream that has nothing for this long stops concealing and starts over.
 const CONCEAL_LIMIT: u32 = 5;
 
@@ -302,6 +305,11 @@ struct Jitter {
     last_arrival: Option<(Instant, u32)>,
     /// Largest recent arrival error in seconds, decaying.
     deviation: f64,
+    /// Where the sound ran out, while it is out.
+    dry_since: Option<u32>,
+    /// The shortest the queue has been since it went over its limit, `watched` samples ago.
+    lowest: usize,
+    watched: usize,
 }
 
 /// Wrapping RTP order.
@@ -311,7 +319,16 @@ fn ahead(a: u32, b: u32) -> i32 {
 
 impl Jitter {
     fn new() -> Self {
-        Self { queue: VecDeque::new(), next: None, started: false, last_arrival: None, deviation: 0.0 }
+        Self {
+            queue: VecDeque::new(),
+            next: None,
+            started: false,
+            last_arrival: None,
+            deviation: 0.0,
+            dry_since: None,
+            lowest: usize::MAX,
+            watched: 0,
+        }
     }
 
     fn delay(&self) -> Duration {
@@ -337,7 +354,13 @@ impl Jitter {
     fn push(&mut self, packet: Queued, now: Instant) -> bool {
         self.observe(packet.rtp_time, now);
         if self.next.is_some_and(|next| ahead(packet.rtp_time, next) < 0) {
-            return false;
+            // Sound that comes after the queue ran dry is late, not lost. Playing it costs a few
+            // milliseconds of delay, which is the cushion the next late arrival needs.
+            if !self.queue.is_empty() || self.dry_since.is_none_or(|dry| ahead(packet.rtp_time, dry) < 0) {
+                return false;
+            }
+            self.next = Some(packet.rtp_time);
+            self.dry_since = None;
         }
         let at = self.queue.iter().rposition(|q| ahead(q.rtp_time, packet.rtp_time) <= 0);
         if let Some(index) = at
@@ -362,17 +385,28 @@ impl Jitter {
     fn restart(&mut self) {
         self.started = false;
         self.next = None;
+        self.dry_since = None;
     }
 
-    /// A stall's backlog goes, oldest first; returns how many packets.
-    fn trim(&mut self) -> u64 {
-        let mut dropped = 0;
-        while self.started && self.queued() > self.delay() + BACKLOG_MARGIN {
-            self.queue.pop_front();
-            self.next = None;
-            dropped += 1;
+    /// A stall's backlog goes, oldest first, once the queue has stayed over its limit through
+    /// `BACKLOG_WATCH` of playback; `frames` is how much is about to play. Returns how many packets.
+    fn trim(&mut self, frames: usize) -> u64 {
+        let keep = (self.delay() + BACKLOG_MARGIN).as_millis() as usize / FRAME_MS as usize;
+        if !self.started || self.queue.len() <= keep {
+            (self.lowest, self.watched) = (usize::MAX, 0);
+            return 0;
         }
-        dropped
+        self.lowest = self.lowest.min(self.queue.len());
+        self.watched += frames;
+        if self.watched < BACKLOG_WATCH {
+            return 0;
+        }
+        let excess = self.lowest - keep;
+        self.queue.drain(..excess);
+        self.next = None;
+        self.dry_since = None;
+        (self.lowest, self.watched) = (usize::MAX, 0);
+        excess as u64
     }
 
     /// The next packet in order, or `None` when its turn has come and it did not arrive.
@@ -380,11 +414,15 @@ impl Jitter {
         let front = self.queue.front()?;
         match self.next {
             Some(next) if ahead(front.rtp_time, next) > 0 => None,
-            _ => self.queue.pop_front(),
+            _ => {
+                self.dry_since = None;
+                self.queue.pop_front()
+            }
         }
     }
 
     fn skip(&mut self) {
+        self.dry_since = self.dry_since.or(self.next);
         self.next = self.next.map(|next| next.wrapping_add(FRAME as u32));
     }
 }
@@ -432,7 +470,7 @@ impl Stream {
 
     /// Decodes until `frames` stereo samples are ready, or the stream has nothing to give yet.
     fn fill(&mut self, frames: usize, counters: &Counters) {
-        counters.backlog_drops.fetch_add(self.jitter.trim(), Ordering::Relaxed);
+        counters.backlog_drops.fetch_add(self.jitter.trim(frames), Ordering::Relaxed);
         while self.pcm.len() < frames + 2 {
             if !self.jitter.ready() {
                 return;

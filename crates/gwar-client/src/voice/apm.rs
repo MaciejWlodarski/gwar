@@ -102,9 +102,9 @@ enum Channels {
     /// It hears everything the mono one does, and voice still comes from the mono one. The count
     /// is the frames of sound still to hear: over silence there is nothing to learn from.
     Learning(Box<Stage>, usize),
-    /// `echo` is the stereo canceller until the session ends. `Stage` is the old one: freeing it
-    /// here is not worth the wait on a thread that voice runs on.
-    Stereo(Stage),
+    /// `echo` is the stereo canceller until the session ends. The box holds the old one: freeing
+    /// it here is not worth the wait on a thread that voice runs on.
+    Stereo(#[allow(dead_code)] Box<Stage>),
     /// No thread could be had: voice goes on as it was, and share sound's sides leak.
     Refused,
 }
@@ -192,14 +192,15 @@ impl Processing {
         if !matches!(self.channels, Channels::Learning(..)) {
             return;
         }
-        let Channels::Learning(stage, _) = std::mem::replace(&mut self.channels, Channels::Refused) else { return };
+        let Channels::Learning(mut stage, _) = std::mem::replace(&mut self.channels, Channels::Refused) else { return };
         if let Some(frame) = crossfade {
             for (index, (sample, learned)) in frame.iter_mut().zip(&self.learned).enumerate() {
                 let phase = (index + 1) as f32 / FRAME as f32 * std::f32::consts::FRAC_PI_2;
                 *sample = *sample * phase.cos().powi(2) + learned * phase.sin().powi(2);
             }
         }
-        self.channels = Channels::Stereo(std::mem::replace(&mut self.echo, *stage));
+        std::mem::swap(&mut self.echo, &mut *stage);
+        self.channels = Channels::Stereo(stage);
     }
 
     /// What the speakers will play, as it is queued for them: the echo's reference.
@@ -558,6 +559,29 @@ mod tests {
     }
 
     #[test]
+    fn the_switch_keeps_the_voice_in_time() {
+        // Headphones: sound plays and none of it comes back, so the two cancellers should agree.
+        let len = 10 * RATE;
+        let far = pairs(&voice(len, 120.0, -20.0));
+        let near = voice(len, 200.0, -24.0);
+        let alone = through(&mut session(100), &far, &near, None);
+        let switched = through(&mut session(100), &far, &near, Some(2 * RATE));
+        let take_over = take_over_at(&far, 2 * RATE, 100);
+        let after = take_over..take_over + 2 * RATE;
+        let lag = |out: &[f32]| {
+            let chunk = &near[after.clone()];
+            (0..1200usize)
+                .max_by_key(|lag| {
+                    let dot: f32 =
+                        chunk[..chunk.len() - 1200].iter().zip(&out[after.start + lag..]).map(|(n, o)| n * o).sum();
+                    (dot * 1e3) as i64
+                })
+                .unwrap()
+        };
+        assert_eq!(lag(&alone), lag(&switched), "both cancellers delay the voice alike");
+    }
+
+    #[test]
     fn a_canceller_turned_off_while_learning_comes_back_stereo() {
         let len = 6 * RATE;
         let far = pairs(&voice(len, 120.0, -20.0));
@@ -666,6 +690,34 @@ mod tests {
                     .collect();
                 eprintln!("learning {learning} {name}: {}", cells.join(" "));
             }
+        }
+    }
+
+    /// Headphones: nothing comes back, and voice must not pay for a canceller it does not need.
+    #[test]
+    #[ignore = "a comparison, run in release"]
+    fn the_switch_on_headphones() {
+        let second = RATE;
+        let pin = 6 * second;
+        let total = 24 * second;
+        for learning in [300, 400, 600, 800] {
+            let mut cells = Vec::new();
+            for (far_pitch, near_pitch, far_db) in [(120.0, 200.0, -20.0), (230.0, 150.0, -20.0), (150.0, 280.0, -14.0)]
+            {
+                let far = pairs(&voice(total, far_pitch, far_db));
+                let near = voice(total, near_pitch, -24.0);
+                let stay = through(&mut session(learning), &far, &near, None);
+                let moved = through(&mut session(learning), &far, &near, Some(pin));
+                let row: Vec<String> = [(0, 2), (2, 4), (4, 6), (6, 8), (8, 10), (10, 14), (14, 18)]
+                    .iter()
+                    .map(|(from, to)| {
+                        let r = pin + from * second..pin + to * second;
+                        format!("{:.1}/{:.1}", db(&stay[r.clone()]), db(&moved[r]))
+                    })
+                    .collect();
+                cells.push(row.join(" "));
+            }
+            eprintln!("headphones learning {learning}: {}", cells.join(" | "));
         }
     }
 

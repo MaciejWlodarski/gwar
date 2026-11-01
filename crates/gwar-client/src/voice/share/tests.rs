@@ -209,13 +209,60 @@ fn a_stall_backlog_is_dropped_not_replayed() {
     let (mut worker, bus, playout) = worker();
     let mut encoder = encoder();
     playout.open(0, 1, 1.0);
-    feed(&mut worker, &mut encoder, (0, 1), 0, 3, (440.0, 440.0), Instant::now());
+    let start = Instant::now();
+    feed(&mut worker, &mut encoder, (0, 1), 0, 3, (440.0, 440.0), start);
     drain(&mut worker, &bus, 4);
-    feed(&mut worker, &mut encoder, (0, 1), 3, 25, (440.0, 440.0), Instant::now());
-    drain(&mut worker, &bus, 4);
+    // Half a second lands at once, then sound runs on at its own pace: that queue will not drain.
+    feed(&mut worker, &mut encoder, (0, 1), 3, 25, (440.0, 440.0), start + Duration::from_millis(40));
+    for n in 0..30 {
+        let at = start + Duration::from_millis(40 + 20 * n);
+        feed(&mut worker, &mut encoder, (0, 1), 28 + n, 1, (440.0, 440.0), at);
+        drain(&mut worker, &bus, 2);
+    }
     let stream = worker.streams[0].as_ref().unwrap();
     assert!(worker.counters.backlog_drops.load(Ordering::Relaxed) > 0);
     assert!(stream.jitter.queued() <= stream.jitter.delay() + BACKLOG_MARGIN);
+}
+
+#[test]
+fn sound_already_played_stays_out_after_the_queue_ran_dry() {
+    let (mut worker, bus, playout) = worker();
+    let mut encoder = encoder();
+    playout.open(0, 1, 1.0);
+    let start = Instant::now();
+    feed(&mut worker, &mut encoder, (0, 1), 0, 4, (440.0, 440.0), start);
+    drain(&mut worker, &bus, 12);
+    assert!(worker.counters.concealed.load(Ordering::Relaxed) >= 1);
+    let late = worker.counters.late_drops.load(Ordering::Relaxed);
+    feed(&mut worker, &mut encoder, (0, 1), 1, 1, (440.0, 440.0), start);
+    assert_eq!(worker.counters.late_drops.load(Ordering::Relaxed), late + 1, "a duplicate of played sound");
+    feed(&mut worker, &mut encoder, (0, 1), 4, 1, (440.0, 440.0), start);
+    assert_eq!(worker.counters.late_drops.load(Ordering::Relaxed), late + 1, "the first sound it was missing");
+}
+
+/// A saturated machine hands sound over in lumps. All of it must still play: a queue that empties
+/// again before the next lump is not behind, however long it was for a moment.
+#[test]
+fn sound_arriving_in_lumps_is_not_mistaken_for_a_backlog() {
+    for lump_ms in [200u64, 300, 400, 500] {
+        let (mut worker, bus, playout) = worker();
+        let mut encoder = encoder();
+        playout.open(0, 1, 1.0);
+        let start = Instant::now();
+        let lump = lump_ms / 20;
+        for round in 0..20 {
+            let at = start + Duration::from_millis(lump_ms * round);
+            for n in round * lump..(round + 1) * lump {
+                feed(&mut worker, &mut encoder, (0, 1), n, 1, (440.0, 440.0), at);
+            }
+            drain(&mut worker, &bus, (lump_ms / 10) as usize);
+        }
+        let counters = &worker.counters;
+        let (decoded, backlog) =
+            (counters.decoded.load(Ordering::Relaxed), counters.backlog_drops.load(Ordering::Relaxed));
+        assert_eq!(backlog, 0, "{lump_ms} ms lumps: {decoded} decoded of {}", 20 * lump);
+        assert!(decoded >= 18 * lump, "{lump_ms} ms lumps: {decoded} decoded of {}", 20 * lump);
+    }
 }
 
 #[test]
