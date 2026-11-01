@@ -401,10 +401,13 @@ impl Jitter {
         if self.watched < BACKLOG_WATCH {
             return 0;
         }
-        let excess = self.lowest - keep;
-        self.queue.drain(..excess);
-        self.next = None;
-        self.dry_since = None;
+        // The limit moves with the delay, so the shortest length may already be under it.
+        let excess = self.lowest.saturating_sub(keep);
+        if excess > 0 {
+            self.queue.drain(..excess);
+            self.next = None;
+            self.dry_since = None;
+        }
         (self.lowest, self.watched) = (usize::MAX, 0);
         excess as u64
     }

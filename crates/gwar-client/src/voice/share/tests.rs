@@ -224,6 +224,20 @@ fn a_stall_backlog_is_dropped_not_replayed() {
     assert!(stream.jitter.queued() <= stream.jitter.delay() + BACKLOG_MARGIN);
 }
 
+/// Its limit grows with the delay, so the shortest the queue has been can fall below it mid-watch.
+#[test]
+fn a_delay_that_grows_while_the_queue_is_watched_drops_nothing() {
+    let mut jitter = Jitter::new();
+    jitter.started = true;
+    let packets = |range: std::ops::Range<u32>| range.map(|n| Queued { rtp_time: n * FRAME as u32, opus: vec![] });
+    jitter.queue.extend(packets(0..8));
+    assert_eq!(jitter.trim(BACKLOG_WATCH / 2), 0);
+    jitter.deviation = 0.07;
+    jitter.queue.extend(packets(8..13));
+    assert_eq!(jitter.trim(BACKLOG_WATCH), 0);
+    assert_eq!(jitter.queue.len(), 13);
+}
+
 #[test]
 fn sound_already_played_stays_out_after_the_queue_ran_dry() {
     let (mut worker, bus, playout) = worker();
