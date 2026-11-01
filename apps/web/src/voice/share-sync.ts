@@ -43,6 +43,12 @@ const BREAK_MOVE_MS = 45;
 /** The picture's wait, which a Bluetooth speaker can reach. The receiver's own limit is 4 s. */
 export const MAX_WAIT_MS = 1_000;
 
+/**
+ * Where sync puts the sound: the middle of the range nobody notices, 45 ms ahead to 125 ms behind.
+ * A link's noise then has the same room both ways, and the picture waits this much less.
+ */
+export const SOUND_AIM_MS = 40;
+
 const signedRtp = (value: number) => (value | 0);
 
 /**
@@ -163,7 +169,7 @@ export class PictureSync {
     if (!sound || !picture || this.link.now() - picture.unixMs > STALE_PICTURE_MS) return;
     if (state.looks < SETTLING_LOOKS) { this.states.set(slot, { ...state, looks: state.looks + 1 }); return; }
     if (state.breakLooks === BREAK_LOOKS) { this.states.set(slot, { ...state, breakLooks: BREAK_LOOKS - 1 }); return; }
-    const lag = soundLagMs(association, sound, picture);
+    const lag = soundLagMs(association, sound, picture) - SOUND_AIM_MS;
     const shown = await this.link.shown(slot).catch(() => 0);
     const breakLooks = state.breakLooks ?? 0;
     const whole = state.looks === SETTLING_LOOKS || (breakLooks > 0 && Math.abs(lag) > BREAK_MOVE_MS);

@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { RequestError } from "../net/connection";
-import { MAX_WAIT_MS, nextWaits, PictureSync, soundLagMs, type PictureSyncLink, type SyncSlot, type Waits } from "./share-sync";
+import { MAX_WAIT_MS, nextWaits, PictureSync, SOUND_AIM_MS, soundLagMs, type PictureSyncLink, type SyncSlot, type Waits } from "./share-sync";
 
 const association = { known: true, audio_rtp: 48_000, video_rtp: 90_000 };
 /** A picture and a sound of the same instant of the share, `lag` ms apart at the output. */
@@ -86,9 +86,10 @@ describe("nextWaits", () => {
   });
 });
 
+/** `lag` is measured from where sync aims, as every wait is. */
 function fixture(lag = 80) {
   const waits: Array<[number, Waits]> = [];
-  const { sound, picture } = pair(lag);
+  const { sound, picture } = pair(lag + SOUND_AIM_MS);
   const link = {
     association: vi.fn(async () => association),
     sound: vi.fn(async () => sound),
@@ -110,7 +111,7 @@ describe("PictureSync", () => {
     const { waits, sync, link } = fixture(30);
     await settle(sync);
     await sync.tick([slot]);
-    const { sound, picture } = pair(300);
+    const { sound, picture } = pair(300 + SOUND_AIM_MS);
     link.sound.mockResolvedValue(sound);
     link.picture.mockReturnValue(picture);
     link.now = () => picture.unixMs + 20;
@@ -132,7 +133,7 @@ describe("PictureSync", () => {
     sync.linkBack(1);
     await sync.tick([slot]);
     await sync.tick([slot]);
-    const { sound, picture } = pair(250);
+    const { sound, picture } = pair(250 + SOUND_AIM_MS);
     link.sound.mockResolvedValue(sound);
     link.picture.mockReturnValue(picture);
     link.now = () => picture.unixMs + 20;
@@ -146,7 +147,7 @@ describe("PictureSync", () => {
     await settle(sync);
     await sync.tick([slot]);
     expect(waits.at(-1)).toEqual(at(230));
-    const { sound, picture } = pair(-150);
+    const { sound, picture } = pair(-150 + SOUND_AIM_MS);
     link.sound.mockResolvedValue(sound);
     link.picture.mockReturnValue(picture);
     link.now = () => picture.unixMs + 20;
@@ -154,6 +155,17 @@ describe("PictureSync", () => {
     await sync.tick([slot]);
     await sync.tick([slot]);
     expect(waits.at(-1)).toEqual(at(80));
+  });
+
+  it("aims at the middle of what nobody notices, not at the edge sound must not lead past", async () => {
+    expect(SOUND_AIM_MS).toBe(40);
+    const { sync, waits, link } = fixture(0);
+    const { sound, picture } = pair(40);
+    link.sound.mockResolvedValue(sound);
+    link.picture.mockReturnValue(picture);
+    await settle(sync);
+    await sync.tick([slot]);
+    expect(waits).toEqual([]);
   });
 
   it("makes a late joiner's picture wait at once, then corrects gently", async () => {
