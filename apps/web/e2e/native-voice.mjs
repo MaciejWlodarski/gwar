@@ -19,7 +19,8 @@
 import { chooseFirstRunName } from "./first-run.mjs";
 import { stopProcesses } from "./processes.mjs";
 import { canvasCapture, readBarcode, stampBarcode } from "./screen-source.mjs";
-import { batchTiming, continuityLimits, continuityProblems, shareContinuity } from "./share-continuity.mjs";
+import { monitorEventLoopDelay } from "node:perf_hooks";
+import { batchTiming, continuityLimits, continuityProblems, shareContinuity, toneCoverage } from "./share-continuity.mjs";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -109,6 +110,9 @@ function bridgePatch() {
   window.__nativeEmit = (event, payload) => { for (const handler of listeners.get(event) ?? []) handler(payload); };
   window.__nativeBridge = async () => ({
     invoke: (command, args) => {
+      // The real shell hands this over as raw bytes. A list of numbers this long costs Playwright
+      // hundreds of milliseconds of Node's only thread for each read on a loaded runner.
+      if (command === "share_capture_read") return window.__nativeInvoke(command, args).then(text => Uint8Array.from(atob(text), c => c.charCodeAt(0)).buffer);
       if (!(args instanceof Uint8Array)) return window.__nativeInvoke(command, args ?? {});
       // The one command the real shell takes as raw bytes: what this bridge costs it is measured.
       const started = performance.now();
@@ -326,19 +330,28 @@ async function computerSoundFlow(sharer, viewer, browserViewer) {
   viewer.native.batches.length = 0;
   sharer.native.reads.length = 0;
   const sourceBefore = await sharer.native.request("share_capture_stats", {});
+  await viewer.native.request("computer_log_start", {});
+  const nodeLoop = monitorEventLoopDelay({ resolution: 10 });
+  nodeLoop.enable();
   const continuity = await shareContinuity(async () => ({ ...await viewer.native.request("share_stats", {}), heard: await shareHeard(viewer) }), 10_000);
+  nodeLoop.disable();
   console.log(`share sound continuity: ${JSON.stringify(continuity)}`);
+  const speaker = toneCoverage(await viewer.native.request("computer_log_stop", {}));
+  console.log(`share sound at the speaker: ${JSON.stringify(speaker)}`);
   // Each batch waits for the last one's answer: a slow bridge holds frames back, then lands them at once.
   const source = await sharer.native.request("share_capture_stats", {});
   console.log(`share sound bridge: ${JSON.stringify({
     page: batchTiming(await viewer.page.evaluate(() => window.__batches)),
     process: batchTiming(viewer.native.batches),
     reads: batchTiming(sharer.native.reads),
+    node: { loopP50Ms: Math.round(nodeLoop.percentile(50) / 1e6), loopP99Ms: Math.round(nodeLoop.percentile(99) / 1e6), loopMaxMs: Math.round(nodeLoop.max / 1e6) },
     source: { rate: Number(((source.writtenSeconds - sourceBefore.writtenSeconds) / (source.elapsedSeconds - sourceBefore.elapsedSeconds)).toFixed(3)), dropped: source.dropped - sourceBefore.dropped },
   })}`);
   const rate = continuity.frames / (continuity.ms / 1_000);
   assert.ok(rate > 45 && rate < 55, `viewer takes one Opus frame per 20 ms, got ${rate}/s`);
-  assert.deepEqual(continuityProblems(continuity, continuityLimits(Boolean(process.env.CI))), [], `share sound kept playing: ${JSON.stringify(continuity)}`);
+  const sourceLost = (source.dropped - sourceBefore.dropped) / (48_000 * (source.writtenSeconds - sourceBefore.writtenSeconds));
+  const report = { ...continuity, speaker: speaker.share, sourceLost: Number(sourceLost.toFixed(3)) };
+  assert.deepEqual(continuityProblems(report, continuityLimits(Boolean(process.env.CI))), [], `share sound kept playing: ${JSON.stringify(report)}`);
   // Not one instant: the fixture's JSON bridge delivers in bursts on a slow runner, between which the tone gaps.
   await waitFor(async () => (await shareHeard(viewer)) && (await hears(viewer, 770)), "ten seconds in, voice and share sound still play together", 10_000);
   await viewer.page.getByTestId("share-audio-controls").getByRole("button", { name: "Mute share sound" }).click();

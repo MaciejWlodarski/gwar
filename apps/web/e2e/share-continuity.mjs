@@ -34,10 +34,21 @@ export function batchTiming(batches) {
 
 /** The fixture's JSON bridge delivers in long bursts on a 4-vCPU runner, which the real IPC does not (share_ipc). */
 export const continuityLimits = ci => ci
-  ? { decoded: 0.8, concealed: 0.2, heard: 0.8, gapMs: 1_000, lookMs: 1_500, underrunMs: 200 }
-  : { decoded: 0.9, concealed: 0.1, heard: 0.9, gapMs: 1_000, lookMs: 500, underrunMs: 100 };
+  ? { decoded: 0.8, concealed: 0.2, heard: 0.8, speaker: 0.95, sourceLost: 0.02, gapMs: 1_000, lookMs: 1_500, underrunMs: 200 }
+  : { decoded: 0.9, concealed: 0.1, heard: 0.9, speaker: 0.99, sourceLost: 0, gapMs: 1_000, lookMs: 500, underrunMs: 100 };
 
 const SAMPLES_PER_MS = 48;
+
+/** Where a tone played, from its amplitude per `blockMs` at the speaker, however a run looked at it. */
+export function toneCoverage(strengths, { blockMs = 10, floor = 0.01 } = {}) {
+  let present = 0, silent = 0, longestSilentMs = 0;
+  const heard = strengths.filter(value => value >= floor).sort((a, b) => a - b);
+  for (const value of strengths) {
+    if (value >= floor) { present += 1; silent = 0; }
+    else longestSilentMs = Math.max(longestSilentMs, ++silent * blockMs);
+  }
+  return { blocks: strengths.length, present, share: Number((present / (strengths.length || 1)).toFixed(3)), longestSilentMs, strength: Number((heard[heard.length >> 1] ?? 0).toFixed(4)) };
+}
 
 /** What went wrong over a `shareContinuity` report, in words; empty when sound kept playing. */
 export function continuityProblems(report, limits) {
@@ -45,6 +56,10 @@ export function continuityProblems(report, limits) {
   if (report.decoded < limits.decoded * report.frames) problems.push(`the mixer decoded ${report.decoded} of ${report.frames} frames`);
   if (report.concealed > limits.concealed * report.frames) problems.push(`${report.concealed} of ${report.frames} frames were patched over`);
   // Frames count even when they carry silence, so only the speaker can say sound got through.
+  // The looks are spot checks: a stall times them too, so they can land only in the gaps or only
+  // between them. The speaker's own record has no such bias, and the source says where it went.
+  if (report.speaker < limits.speaker) problems.push(`the speaker played the sound for ${report.speaker} of the time`);
+  if (report.sourceLost > limits.sourceLost) problems.push(`${report.sourceLost} of the computer's sound never left the queue`);
   if (report.heard < limits.heard * report.looks) problems.push(`the sound was there at ${report.heard} of ${report.looks} looks`);
   if (report.longestGapMs > limits.gapMs) problems.push(`no new sound for ${report.longestGapMs} ms`);
   if (report.longestLookMs > limits.lookMs) problems.push(`stats stayed away for ${report.longestLookMs} ms, so this run says little`);

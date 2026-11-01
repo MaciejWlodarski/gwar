@@ -22,6 +22,7 @@ use std::{
 };
 
 use anyhow::Context;
+use base64::{Engine, prelude::BASE64_STANDARD};
 use gwar_client::voice::{
     LinkState, VoiceHandle,
     io::{AudioIo, AudioPorts, CaptureSample, OutputTiming, mono},
@@ -46,7 +47,11 @@ const COMPUTER_TONE: f64 = 997.0;
 struct ToneIo {
     frequency: f64,
     played: Arc<Mutex<VecDeque<f32>>>,
+    computer: ComputerLog,
 }
+
+/// The computer tone's strength at the speaker, one value per block, for as long as a run asks.
+type ComputerLog = Arc<Mutex<Option<Vec<f32>>>>;
 
 struct Guard {
     stop: Arc<AtomicBool>,
@@ -92,6 +97,9 @@ impl AudioIo for ToneIo {
                         mono,
                     ));
                 }
+                if let Some(log) = self.computer.lock().unwrap().as_mut() {
+                    log.push(strength(&block, COMPUTER_TONE));
+                }
                 {
                     let mut played = self.played.lock().unwrap();
                     played.extend(block);
@@ -109,6 +117,19 @@ impl AudioIo for ToneIo {
         })?;
         Ok(AudioPorts { mic, speaker, output, _guard: Box::new(Guard { stop, thread: Some(thread) }) })
     }
+}
+
+/// One tone's amplitude in a block, windowed so that a voice beside it does not leak in.
+fn strength(block: &[f32], frequency: f64) -> f32 {
+    let (mut sine, mut cosine, mut weight) = (0.0, 0.0, 0.0);
+    for (i, s) in block.iter().enumerate() {
+        let hann = 0.5 - 0.5 * (i as f64 * std::f64::consts::TAU / block.len() as f64).cos();
+        let phase = i as f64 * frequency * std::f64::consts::TAU / RATE as f64;
+        sine += f64::from(*s) * hann * phase.sin();
+        cosine += f64::from(*s) * hann * phase.cos();
+        weight += hann;
+    }
+    (2.0 * (sine * sine + cosine * cosine).sqrt() / weight) as f32
 }
 
 /// The tone's share of the recent speaker energy, 0 when silent (the browser test's measure).
@@ -138,6 +159,7 @@ struct State {
 struct Bridge {
     frequency: f64,
     played: Arc<Mutex<VecDeque<f32>>>,
+    computer: ComputerLog,
     state: Mutex<State>,
     /// When the fake computer started, and how many samples it has written.
     capture_clock: Arc<Mutex<(Option<Instant>, u64)>>,
@@ -248,7 +270,7 @@ impl Bridge {
                 let (_, queue) = queue.context("closed")?;
                 let samples = queue.read(Duration::from_millis(100)).await;
                 anyhow::ensure!(!samples.is_empty() || !queue.is_closed(), "closed");
-                Ok(json!(samples.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>()))
+                Ok(json!(BASE64_STANDARD.encode(samples.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<u8>>())))
             }
             "share_capture_stats" => {
                 let (started, written) = *self.capture_clock.lock().unwrap();
@@ -296,6 +318,11 @@ impl Bridge {
                     json!({ "frames": stats.frames, "decoded": stats.decoded, "concealed": stats.concealed, "late": stats.late_drops, "backlog": stats.backlog_drops, "input": stats.input_drops, "underruns": stats.ring_underruns }),
                 )
             }
+            "computer_log_start" => {
+                *self.computer.lock().unwrap() = Some(Vec::new());
+                Ok(Value::Null)
+            }
+            "computer_log_stop" => Ok(json!(self.computer.lock().unwrap().take().unwrap_or_default())),
             "snapshot" => {
                 let frequency = args["frequency"].as_f64().context("frequency")?;
                 let played = self.played.lock().unwrap();
@@ -335,7 +362,11 @@ impl Bridge {
             emit("voice://offer", json!({ "owner": owner, "run": run, "sdp": sdp }));
             answered.await?.map_err(anyhow::Error::msg)
         };
-        let io = Box::new(ToneIo { frequency: self.frequency, played: self.played.clone() });
+        let io = Box::new(ToneIo {
+            frequency: self.frequency,
+            played: self.played.clone(),
+            computer: self.computer.clone(),
+        });
         let server: IpAddr = "127.0.0.1".parse()?;
         let handle = match crypto {
             Some(crypto) => start_encrypted(io, server, signal, crypto).await?,
@@ -399,8 +430,13 @@ impl Bridge {
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> anyhow::Result<()> {
     let frequency: f64 = std::env::args().nth(1).context("usage: native_bridge <microphone Hz>")?.parse()?;
-    let bridge =
-        Arc::new(Bridge { frequency, played: Arc::default(), state: Mutex::default(), capture_clock: Arc::default() });
+    let bridge = Arc::new(Bridge {
+        frequency,
+        played: Arc::default(),
+        computer: Arc::default(),
+        state: Mutex::default(),
+        capture_clock: Arc::default(),
+    });
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
     while let Some(line) = lines.next_line().await? {
         let request: Value = serde_json::from_str(&line)?;

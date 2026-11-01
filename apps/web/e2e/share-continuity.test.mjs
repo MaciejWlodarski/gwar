@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { batchTiming, continuityLimits, continuityProblems, shareContinuity } from "./share-continuity.mjs";
+import { batchTiming, continuityLimits, continuityProblems, shareContinuity, toneCoverage } from "./share-continuity.mjs";
 
 /** A clock the run moves itself; `answers` lists when each stats read comes back and what it says. */
 function scripted(answers) {
@@ -43,11 +43,13 @@ test("an outage inside one late answer counts: a delayed report of new frames en
 
 test("the synthetic outage fails on each measure alone", () => {
   const limits = continuityLimits(true);
-  const fine = { frames: 500, decoded: 498, concealed: 4, ringUnderruns: 0, longestGapMs: 300, longestLookMs: 300, looks: 100, heard: 100 };
+  const fine = { frames: 500, decoded: 498, concealed: 4, ringUnderruns: 0, longestGapMs: 300, longestLookMs: 300, looks: 100, heard: 100, speaker: 1, sourceLost: 0 };
   assert.deepEqual(continuityProblems(fine, limits), []);
   assert.equal(continuityProblems({ ...fine, decoded: 350 }, limits).length, 1);
   assert.equal(continuityProblems({ ...fine, concealed: 150 }, limits).length, 1);
   assert.equal(continuityProblems({ ...fine, ringUnderruns: 144_000 }, limits).length, 1);
+  assert.equal(continuityProblems({ ...fine, speaker: 0.902 }, limits).length, 1, "looks all saw it, the speaker did not");
+  assert.equal(continuityProblems({ ...fine, sourceLost: 0.28 }, limits).length, 1);
   assert.equal(continuityProblems({ ...fine, longestGapMs: 3_000 }, limits).length, 1);
   assert.equal(continuityProblems({ ...fine, longestLookMs: 1_600 }, limits).length, 1);
 });
@@ -63,6 +65,12 @@ test("frames that reach the mixer but carry no sound fail, whatever the frame co
   const report = await shareContinuity(...run(scripted(at => ({ ...healthy(), silent: at % 8 !== 0 }))));
   assert.equal(report.decoded, 500);
   assert.deepEqual(continuityProblems(report, continuityLimits(true)), [`the sound was there at ${report.heard} of ${report.looks} looks`]);
+});
+
+test("tone coverage counts where the tone played and its longest gap", () => {
+  const strengths = [...Array(40).fill(0.2), ...Array(30).fill(0), ...Array(25).fill(0.1), ...Array(5).fill(0.001)];
+  assert.deepEqual(toneCoverage(strengths), { blocks: 100, present: 65, share: 0.65, longestSilentMs: 300, strength: 0.2 });
+  assert.equal(toneCoverage([]).share, 0);
 });
 
 test("batch timing finds the slow trips and the wait between batches", () => {
