@@ -618,6 +618,27 @@ fn sound_reaches_a_hold_for_the_picture_without_a_jump() {
 }
 
 #[test]
+fn a_hold_given_back_leaves_no_gap_in_the_sound() {
+    let (mut worker, bus, playout) = worker();
+    assert!(playout.open(0, 7, 1.0));
+    worker.apply_controls();
+    let mut encoder = encoder();
+    play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 0, 2);
+    assert!(playout.set_hold(0, 7, 120));
+    play_on_time(&mut worker, &bus, &mut encoder, (0, 7), 100, 14);
+    assert!(playout.set_hold(0, 7, 0));
+
+    let start = Instant::now();
+    let mut gaps = 0;
+    for n in 0..14 * 50 {
+        feed(&mut worker, &mut encoder, (0, 7), 800 + n, 1, (440.0, 440.0), start + Duration::from_millis(20 * n));
+        gaps += drain(&mut worker, &bus, 2).0.iter().filter(|sample| **sample == 0.0).count();
+    }
+    assert_eq!(gaps, 0, "samples the mixer left empty with packets queued");
+    assert_eq!(playout.stats().concealed, 0);
+}
+
+#[test]
 fn a_hold_is_bounded_and_a_new_run_starts_without_one() {
     let (mut worker, _bus, playout) = worker();
     assert!(playout.open(0, 7, 1.0));

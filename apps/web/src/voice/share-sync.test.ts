@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { RequestError } from "../net/connection";
 import { MAX_WAIT_MS, nextWaits, PictureSync, soundLagMs, type PictureSyncLink, type SyncSlot, type Waits } from "./share-sync";
 
 const association = { known: true, audio_rtp: 48_000, video_rtp: 90_000 };
@@ -217,11 +218,42 @@ describe("PictureSync", () => {
 
   it("stops asking an older server", async () => {
     const { sync, link, waits } = fixture();
-    link.association.mockRejectedValue(new Error("bad_request"));
+    link.association.mockRejectedValue(new RequestError("bad_request", "unknown request"));
     await sync.tick([slot]);
     await sync.tick([slot]);
     expect(link.association).toHaveBeenCalledTimes(1);
     expect(waits).toEqual([]);
+  });
+
+  it("a question that got no answer is asked again, and the sides line up as before", async () => {
+    const { sync, link, waits } = fixture();
+    link.association.mockRejectedValueOnce(new Error("request timed out"));
+    await sync.tick([slot]);
+    await settle(sync);
+    await sync.tick([slot]);
+    expect(link.association).toHaveBeenCalledTimes(4);
+    expect(waits.at(-1)).toEqual(at(110));
+  });
+
+  it("a wait is released on mute after a question that got no answer", async () => {
+    const { sync, link, waits } = fixture();
+    await settle(sync);
+    await sync.tick([slot]);
+    expect(waits.at(-1)).toEqual(at(110));
+    link.association.mockRejectedValueOnce(new Error("request timed out"));
+    await sync.tick([slot]);
+    await sync.tick([{ ...slot, heard: false }]);
+    expect(waits.at(-1)).toEqual(at(0));
+  });
+
+  it("a wait is released on mute even after the server said it does not know the question", async () => {
+    const { sync, link, waits } = fixture();
+    await settle(sync);
+    await sync.tick([slot]);
+    link.association.mockRejectedValueOnce(new RequestError("bad_request", "unknown request"));
+    await sync.tick([slot]);
+    await sync.tick([{ ...slot, heard: false }]);
+    expect(waits.at(-1)).toEqual(at(0));
   });
 
   it("a slot that never waited is told nothing when it ends", async () => {

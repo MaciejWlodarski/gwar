@@ -7,6 +7,8 @@
  * part there. Voice never waits. A share without sound never comes through here.
  */
 
+import { RequestError } from "../net/connection";
+
 /** RTP times of one instant, from `screen.audio.sync`. */
 export interface SoundAssociation { known: boolean; audio_rtp: number; video_rtp: number }
 /** A sound sample and when it comes out: `share_playback_clock`, or a browser's receiver. */
@@ -125,7 +127,7 @@ export class PictureSync {
       for (const [slot, state] of [...this.states]) {
         if (slots.find(s => s.slot === slot)?.share !== state.share) this.release(slot);
       }
-      if (!this.unsupported) for (const slot of slots) await this.look(slot);
+      for (const slot of slots) await this.look(slot);
     } finally { this.running = false; }
   }
 
@@ -149,7 +151,12 @@ export class PictureSync {
       this.set(slot, state, { ...state, waits: NO_WAIT, looks: 0 });
       return;
     }
-    const association = await this.link.association(share).catch(() => { this.unsupported = true; return null; });
+    if (this.unsupported) return;
+    // Only that answer is final: a question lost on the way is asked again at the next look.
+    const association = await this.link.association(share).catch((e: unknown) => {
+      if (e instanceof RequestError && e.code === "bad_request") this.unsupported = true;
+      return null;
+    });
     if (!association?.known) return;
     const sound = await this.link.sound(slot).catch(() => null);
     const picture = this.link.picture(slot);

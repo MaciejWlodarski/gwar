@@ -605,7 +605,9 @@ impl Stream {
     /// Decodes until `frames` stereo samples are ready, or the stream has nothing to give yet.
     fn fill(&mut self, frames: usize, counters: &Counters) {
         counters.backlog_drops.fetch_add(self.jitter.trim(frames), Ordering::Relaxed);
-        while self.pcm.len() < frames + 2 {
+        // `mix` at its fastest, and the sample it interpolates towards past a part-way position.
+        let wanted = (frames as f64 * (1.0 + HOLD_RATE)).ceil() as usize + 2;
+        while self.pcm.len() < wanted {
             if !self.jitter.ready() {
                 return;
             }
