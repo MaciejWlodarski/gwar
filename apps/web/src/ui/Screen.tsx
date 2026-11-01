@@ -280,9 +280,9 @@ export function SharingBar() {
         <span className="hidden lg:inline">{linkStatus}</span>
         <span className="hidden lg:inline-flex"><Button size="sm" variant="secondary" className="border-white/40 px-2 text-white hover:bg-white/15" onClick={() => void controller.screen.turnOffLink(own.share!)}>{t("screen.tsTurnOff")}</Button></span>
       </span>}
-      {addable && <Button size="sm" variant="secondary" data-testid="share-audio-add" disabled={adding} title={t(adding ? "screen.soundTurningOn" : "screen.soundTurnOn")} aria-label={t(adding ? "screen.soundTurningOn" : "screen.soundTurnOn")} className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 disabled:opacity-90 sm:px-2" onClick={() => { if (soundNeedsDetails(own)) setDetails(true); else turnOn(); }}>
+      {addable && <Tooltip label={t(adding ? "screen.soundTurningOn" : "screen.soundTurnOn")} side="bottom"><Button size="sm" variant="secondary" data-testid="share-audio-add" disabled={adding} aria-label={t(adding ? "screen.soundTurningOn" : "screen.soundTurnOn")} className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 disabled:opacity-90 sm:px-2" onClick={() => { if (soundNeedsDetails(own)) setDetails(true); else turnOn(); }}>
         {adding ? <RotateCw aria-hidden className="size-3.5 motion-safe:animate-spin" /> : <VolumeX aria-hidden className="size-3.5" />}<span className="hidden sm:inline">{t(adding ? "screen.soundTurningOn" : "screen.soundTurnOn")}</span>
-      </Button>}
+      </Button></Tooltip>}
       {own.phase === "live" && !addable && <span data-testid="share-audio-status" className="flex shrink-0 items-center gap-1 text-xs" aria-label={t(audioLabel)}>
         {resuming ? <RotateCw aria-hidden className="size-3.5 motion-safe:animate-spin" /> : own.audio ? <Volume2 aria-hidden className="size-3.5" /> : <VolumeX aria-hidden className="size-3.5" />}<span className="hidden sm:inline">{t(audioLabel)}</span>
       </span>}

@@ -166,6 +166,21 @@ it("says sound is coming back, and keeps the way out, while a paused capture ret
   } finally { await act(async () => root.unmount()); host.remove(); undo(); }
 });
 
+it.each([["en", "Turn on sound"], ["pl", "Włącz dźwięk"]] as const)("names the icon-only sound button on a phone in %s", async (language, name) => {
+  vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
+  const undo = desktop();
+  useSettings.setState({ language });
+  useScreen.setState({ ...initialScreen, own: ownShare({ phase: "live", share: "M", audio: false, computerSound: "stopped", soundAddable: true, viewers: 1 }) });
+  const host = document.createElement("div"); document.body.append(host); const root = createRoot(host);
+  try {
+    await act(async () => root.render(<TooltipProvider><SharingBar /></TooltipProvider>));
+    const button = host.querySelector<HTMLButtonElement>('[data-testid="share-audio-add"]')!;
+    expect(button.getAttribute("aria-label")).toBe(name);
+    await act(async () => button.focus());
+    expect(document.querySelector('[role="tooltip"]')?.textContent).toContain(name);
+  } finally { await act(async () => root.unmount()); host.remove(); undo(); }
+});
+
 it.each([[0, false], [0, true], [2, true]] as const)("keeps %s watchers in the sharing status beside audio=%s", async (viewers, audio) => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
   useSettings.setState({ language: "en" });

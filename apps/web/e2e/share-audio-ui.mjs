@@ -118,6 +118,12 @@ try {
         const fit = await sharing.evaluate(e => ({ width: e.clientWidth, needed: e.scrollWidth, height: e.getBoundingClientRect().height }));
         assert.ok(fit.needed <= fit.width && fit.height <= 46, `${label} stays one compact row at ${width}px: ${JSON.stringify(fit)}`);
         assert.ok((await add.boundingBox()).height >= 24, `${label}: the button is a real target`);
+        const named = lang === "pl" ? "Włącz dźwięk" : "Turn on sound";
+        assert.equal(await add.getAttribute("aria-label"), named);
+        await add.focus();
+        await page.getByRole("tooltip", { name: named }).waitFor({ timeout: 3_000 });
+        await page.screenshot({ path: path.join(output, `sound-back-tooltip-${label}-${lang}-${name}.png`), animations: "disabled" });
+        await add.blur();
         await page.screenshot({ path: path.join(output, `sound-back-${label}-${lang}-${name}.png`), animations: "disabled" });
         await page.getByRole("button", { name: lang === "pl" ? "Szczegóły" : "Details", exact: true }).click();
         const dialog = page.getByRole("dialog"); await dialog.waitFor();
