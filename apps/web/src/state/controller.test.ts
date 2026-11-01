@@ -2771,6 +2771,14 @@ describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
     expect(sealed.open).toHaveBeenCalledWith(thread, 5);
   });
 
+  it("tells the sender when an encrypted message was not sent", async () => {
+    connectPublic();
+    const sealed = fakeSealed(); install(sealed);
+    sealed.send.mockRejectedValueOnce(new Error("Securing this conversation"));
+    expect(await controller.sendChat(kind === "server" ? "server" : "channel", "hi")).toBe(false);
+    expect(stores.useUi.getState().toasts.map(t => [t.kind, t.text])).toEqual([["error", "Securing this conversation"]]);
+  });
+
   it("sends only this connection's encrypted uploads with a sealed message, and keeps them on edits", async () => {
     connectPublic();
     const sealed = fakeSealed(); install(sealed);
