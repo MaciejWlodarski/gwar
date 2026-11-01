@@ -97,9 +97,14 @@ async function measure() {
   speaker.start();
   await sleep(500);
   const spoken = await level();
+  // WebKit's way between two audio contexts loses half or more of the power on some runs, model
+  // or no model: the same way without the model is what the model is held to.
+  model.setActive(false);
+  await sleep(500);
+  const bypassed = await level();
   model.close();
   await context.close();
-  return { loadMs, passed, cleaned, spoken, troubles };
+  return { loadMs, passed, cleaned, spoken, bypassed, troubles };
 }
 
 async function run(engine, web) {
@@ -126,7 +131,8 @@ async function run(engine, web) {
     assert.deepEqual(result.troubles, [], "the model reported trouble");
     assert.ok(result.passed > -35, `inactive: passes as captured (${result.passed.toFixed(1)} dBFS)`);
     assert.ok(result.cleaned < result.passed - 20, `active: noise down by more than 20 dB (${result.passed.toFixed(1)} → ${result.cleaned.toFixed(1)} dBFS)`);
-    assert.ok(result.spoken > -26, `active: a voice at -20 dBFS over the noise comes through (${result.spoken.toFixed(1)} dBFS)`);
+    assert.ok(result.bypassed > -35, `inactive: a voice at -20 dBFS passes as captured (${result.bypassed.toFixed(1)} dBFS)`);
+    assert.ok(result.spoken > result.bypassed - 6, `active: the model keeps a voice over the noise (${result.bypassed.toFixed(1)} → ${result.spoken.toFixed(1)} dBFS)`);
     results.push({ engine, status: "pass", ...result, errors });
   } finally { await browser.close(); }
 }
