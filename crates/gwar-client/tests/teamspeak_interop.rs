@@ -53,7 +53,7 @@ struct FakeIo {
 impl AudioIo for FakeIo {
     fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
         let (mut mic_tx, mic) = RingBuffer::new(48_000);
-        let (speaker, mut speaker_rx) = RingBuffer::new(24_000);
+        let (speaker, mut speaker_rx) = RingBuffer::<[f32; 2]>::new(24_000);
         let (heard, with_tone) = (self.heard.clone(), self.tone);
         let output = Arc::new(OutputTiming::default());
         let timing = output.clone();

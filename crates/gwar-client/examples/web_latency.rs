@@ -94,7 +94,7 @@ impl Drop for Guard {
 impl AudioIo for MarkerIo {
     fn open(self: Box<Self>) -> anyhow::Result<AudioPorts> {
         let (mut mic_tx, mic) = RingBuffer::new(RATE);
-        let (speaker, mut speaker_rx) = RingBuffer::new(RATE / 2);
+        let (speaker, mut speaker_rx) = RingBuffer::<[f32; 2]>::new(RATE / 2);
         let output = Arc::new(OutputTiming::default());
         let timing = output.clone();
         let stop = Arc::new(AtomicBool::new(false));

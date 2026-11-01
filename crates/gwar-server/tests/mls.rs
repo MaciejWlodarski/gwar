@@ -2613,7 +2613,7 @@ impl gwar_client::voice::io::AudioIo for ToneIo {
     fn open(self: Box<Self>) -> anyhow::Result<gwar_client::voice::io::AudioPorts> {
         use gwar_client::voice::io::{AudioPorts, CaptureSample, OutputTiming};
         let (mut mic_tx, mic) = rtrb::RingBuffer::new(48_000);
-        let (speaker, mut speaker_rx) = rtrb::RingBuffer::new(24_000);
+        let (speaker, mut speaker_rx) = rtrb::RingBuffer::<[f32; 2]>::new(24_000);
         let output = std::sync::Arc::new(OutputTiming::default());
         let timing = output.clone();
         let (heard, tone) = (self.heard, self.tone);
