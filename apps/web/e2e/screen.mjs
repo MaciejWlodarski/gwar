@@ -21,6 +21,8 @@
  *   E2E_SCREEN_RECONNECT_ONLY=1 focus on session recovery and screenshot capture
  *   E2E_SCREEN_CANVAS=1          fixed 1080p60 canvas instead of adaptive tab capture
  *   E2E_SCREEN_REQUIRE_H264=1    fail if the main sharer exposes no H.264 encoder
+ *   E2E_SCREEN_AUDIO=1           real sound through the SFU. `--disable-audio-output` keeps Chromium's
+ *                                graphs running with no output device, so nothing reaches the speakers
  *
  * AV1 is hardware-only: the main sharer must offer AV1 exactly when MediaCapabilities reports a
  * power-efficient AV1 encoder. Headless CI Chromium has none, so the share stays H.264 there;
@@ -269,6 +271,28 @@ async function share(page, surface, preset = null) {
   assert.ok(id, `${page.deviceName} has a live share`);
   return id;
 }
+/** The bar's Turn on sound, then Details' Choose a tab: the auto-selected picker returns the source tab. */
+async function turnOnTabSound(page) {
+  await bar(page).getByTestId("share-audio-add").click();
+  await page.getByRole("dialog").getByRole("button", { name: "Choose a tab", exact: true }).click();
+  await waitFor(() => session(page, (_, screen) => screen.own?.audio === true), "sound joined the share", 15_000);
+  await page.keyboard.press("Escape");
+}
+/** The sharer's video sender: which transport, stream and encoder it is. */
+const videoSender = page => page.evaluate(async () => {
+  const live = window.__pcs.filter(pc => pc.connectionState === "connected" && pc.getTransceivers().some(t => t.direction === "sendonly"));
+  const report = await live[0].getStats();
+  const out = [...report.values()].find(s => s.type === "outbound-rtp" && s.kind === "video");
+  return { pcs: live.length, ssrc: out?.ssrc, encoder: out?.encoderImplementation, keyFrames: out?.keyFramesEncoded };
+});
+/** What the viewer has decoded of a watched share. */
+const videoReceiver = (page, share) => session(page, async (_, screen, controller, id) => {
+  const track = screen.streams[screen.watches.find(w => w.share === id)?.slot]?.getVideoTracks()[0];
+  const pc = window.__pcs.find(pc => pc.connectionState === "connected" && pc.getReceivers().some(r => r.track === track));
+  const report = await pc.getStats(track);
+  const inbound = [...report.values()].find(s => s.type === "inbound-rtp");
+  return { frames: inbound?.framesDecoded ?? 0, keyFrames: inbound?.keyFramesDecoded ?? 0 };
+}, share);
 async function stopSharing(page) {
   await bar(page).getByRole("button", { name: "Stop sharing" }).click();
   await bar(page).waitFor({ state: "detached" });
@@ -714,6 +738,49 @@ async function run(browsers, web, server, token) {
     assert.equal(await cv.locator("audio[data-share-audio]").count(), 0);
     await sees(cv, replacement, 1, "picture continues truthfully after audio ends");
     checks.push({ check: "generated 997 Hz tab sound, per-share volume/mute, no self-playback, retained audio across reconnect", ok: true });
+
+    // The share that lost its sound takes it back on the m-line it already has.
+    await turnOnTabSound(cs);
+    await waitFor(() => session(cv, (_, screen, __, id) => screen.watches.find(w => w.share === id)?.audio === true, replacement), "the viewer sees sound return without rewatching", 10_000);
+    await soundReceived(cv, replacement);
+    assert.equal(await ownShare(cs), replacement, "sound came back in the same share");
+    checks.push({ check: "stopped sound comes back in the same share, viewers without rewatching", ok: true });
+
+    // A share that never had sound gets the m-line added to its running transport.
+    const pictureOnly = await device(engine("chromium"), web, server, "picture-only", { frequency: 700, canvasId: 5, sendCodec: "vp9" });
+    await join(pictureOnly, channels.stage);
+    const silent = await share(pictureOnly, "Sharing your screen");
+    await watch(cv, "picture-only");
+    await sees(cv, silent, 5, "picture-only share before sound");
+    assert.equal(await session(cv, (_, screen, __, id) => screen.watches.find(w => w.share === id)?.audio, silent), false);
+    const senderBefore = await videoSender(pictureOnly);
+    const receiverBefore = await videoReceiver(cv, silent);
+    const run = await session(cv, (_, screen) => screen.transport.run);
+    const frames = [];
+    const sampling = (async () => { for (let i = 0; i < 80; i++) { frames.push({ at: Date.now(), ...await videoReceiver(cv, silent) }); await sleep(100); } })();
+    await sleep(2_000);
+    // The picture came from the test's canvas; the sound comes through the real picker from the source tab.
+    await pictureOnly.evaluate(() => { delete navigator.mediaDevices.getDisplayMedia; });
+    await turnOnTabSound(pictureOnly);
+    await waitFor(() => session(cv, (_, screen, __, id) => screen.watches.find(w => w.share === id)?.audio === true, silent), "the viewer sees new sound without rewatching", 10_000);
+    await soundReceived(cv, silent);
+    await sampling;
+    const senderAfter = await videoSender(pictureOnly);
+    const receiverAfter = await videoReceiver(cv, silent);
+    await sees(cv, silent, 5, "the same picture after sound joined");
+    assert.equal(await ownShare(pictureOnly), silent, "the same share");
+    assert.equal(await session(cv, (_, screen) => screen.transport.run), run, "the same watch transport");
+    assert.equal(senderAfter.pcs, senderBefore.pcs, "the same publish transport");
+    assert.equal(senderAfter.ssrc, senderBefore.ssrc, "the same video stream");
+    assert.equal(senderAfter.encoder, senderBefore.encoder, "the same encoder");
+    assert.equal(senderAfter.keyFrames, senderBefore.keyFrames, "no keyframe was needed, so the encoder never restarted");
+    assert.equal(receiverAfter.keyFrames, receiverBefore.keyFrames, "the viewer decoded straight through");
+    const gaps = frames.slice(1).map((sample, i) => ({ frames: sample.frames - frames[i].frames, ms: sample.at - frames[i].at }));
+    assert.ok(gaps.every(gap => gap.frames >= 0), "decoded frames only ever go up");
+    let stall = 0, longest = 0;
+    for (const gap of gaps) { stall = gap.frames ? 0 : stall + gap.ms; longest = Math.max(longest, stall); }
+    assert.ok(longest < 500, `the picture never stalled while sound joined: ${longest} ms`);
+    checks.push({ check: "sound joins a running picture-only share with no restart", keyFrames: receiverAfter.keyFrames, longestStallMs: longest, framesDecoded: receiverAfter.frames - receiverBefore.frames });
     return opened.flatMap(p => errors(p).map(e => `${p.deviceName}: ${e}`));
   }
 
@@ -993,7 +1060,7 @@ try {
   await waitFor(() => /redeem this one-time admin token in your client: (\S+)/.test(server.output), "server admin token", 60_000);
   const token = /redeem this one-time admin token in your client: (\S+)/.exec(server.output)[1];
   if (engines.includes("chromium")) {
-    browsers.chromium = await chromium.launch({ channel: "chromium", headless: true, ignoreDefaultArgs: process.env.E2E_SCREEN_AUDIO === "1" ? ["--mute-audio"] : [], args: ["--autoplay-policy=no-user-gesture-required", `--auto-select-tab-capture-source-by-title=${SOURCE_TITLE}`] });
+    browsers.chromium = await chromium.launch({ channel: "chromium", headless: true, ignoreDefaultArgs: process.env.E2E_SCREEN_AUDIO === "1" ? ["--mute-audio"] : [], args: ["--autoplay-policy=no-user-gesture-required", `--auto-select-tab-capture-source-by-title=${SOURCE_TITLE}`, ...(process.env.E2E_SCREEN_AUDIO === "1" ? ["--disable-audio-output"] : [])] });
   }
   if (engines.includes("webkit")) browsers.webkit = await webkit.launch({ headless: true });
   warnings = await run(browsers, web, ws, token);

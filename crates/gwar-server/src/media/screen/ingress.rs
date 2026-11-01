@@ -232,6 +232,11 @@ impl Ingress {
         }
     }
 
+    /// The byte allowance for a new cap; everything about the running stream stays.
+    pub fn set_cap(&mut self, cap_bps: u64, now: Instant) {
+        self.bytes.reconfigure(BYTE_HEADROOM * cap_bps as f64 / 8.0, FRAME_BYTES as f64, now);
+    }
+
     pub fn waiting(&self) -> bool {
         self.blocked
     }

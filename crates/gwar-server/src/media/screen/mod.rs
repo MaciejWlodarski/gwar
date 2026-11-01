@@ -170,6 +170,8 @@ pub struct ScreenOrigin {
     pub cap_bps: u64,
     alive: AtomicBool,
     pub(crate) has_audio: AtomicBool,
+    /// The publish transport carries an Opus m-line, whether or not sound flows on it now.
+    audio_negotiated: AtomicBool,
     recovery: std::sync::Mutex<recovery::Recovery>,
     /// What a viewer joining it starts from, refreshed from its measured rate every allocation
     /// tick (`egress::start_estimate`); zero until the first tick.
@@ -194,6 +196,7 @@ impl ScreenOrigin {
             cap_bps,
             alive: AtomicBool::new(true),
             has_audio: AtomicBool::new(false),
+            audio_negotiated: AtomicBool::new(false),
             recovery: Default::default(),
             start_bps: AtomicU64::new(0),
         })
@@ -207,6 +210,21 @@ impl ScreenOrigin {
     fn measured(&self, rate: ShareRate) {
         self.start_bps.store(egress::start_estimate(rate, self.cap_bps), Ordering::Relaxed);
     }
+    /// Whether the transport has sound; a publisher's stop leaves the m-line in place.
+    fn audio_negotiated(&self, negotiated: bool) {
+        self.audio_negotiated.store(negotiated, Ordering::Relaxed);
+        self.has_audio.store(negotiated, Ordering::Relaxed);
+    }
+
+    /// Sound flows again on the m-line it already has, if there is one.
+    pub fn resume_audio(&self) -> bool {
+        let negotiated = self.audio_negotiated.load(Ordering::Relaxed);
+        if negotiated {
+            self.has_audio.store(true, Ordering::Relaxed);
+        }
+        negotiated
+    }
+
     pub fn alive(&self) -> bool {
         self.alive.load(Ordering::Acquire)
     }
@@ -420,6 +438,12 @@ pub enum ScreenCmd {
     Publish {
         origin: Arc<ScreenOrigin>,
         ssrc: u32,
+        sdp: String,
+        reply: oneshot::Sender<Result<String, &'static str>>,
+    },
+    /// Adds the Opus m-line to a running publish transport, answered with the SDP answer.
+    AddAudio {
+        share: String,
         sdp: String,
         reply: oneshot::Sender<Result<String, &'static str>>,
     },
@@ -1076,6 +1100,18 @@ impl Sfu {
                         let _ = reply.send(Err(message));
                     }
                 }
+            }
+            ScreenCmd::AddAudio { share, sdp, reply } => {
+                if reply.is_closed() {
+                    return;
+                }
+                let Some(publisher) = self.publishers.get_mut(&share) else {
+                    let _ = reply.send(Err("the share has no publish transport"));
+                    return;
+                };
+                let answer = add_audio(publisher, &sdp, now);
+                self.flush_publisher(&share);
+                let _ = reply.send(answer);
             }
             ScreenCmd::EndPublish { share } => self.end_publish(&share),
             ScreenCmd::Watch { session, connection, run, lease, slots, sdp, browser, h264, av1, reply } => {
@@ -3458,7 +3494,7 @@ fn publisher(
     if origin.encrypted && audio.is_some() {
         return Err("encrypted screen audio is unavailable");
     }
-    origin.has_audio.store(audio.is_some(), Ordering::Relaxed);
+    origin.audio_negotiated(audio.is_some());
     let cap = origin.cap_bps;
     let ufrag = rtc.direct_api().local_ice_credentials().ufrag;
     let video_cap = cap.saturating_sub(if audio.is_some() { audio::WIRE_BPS } else { 0 }).max(1);
@@ -3485,6 +3521,30 @@ fn publisher(
         deadline: now,
     };
     Ok((publisher, answer.to_sdp_string()))
+}
+
+/// The running transport's re-offer with its Opus m-line. The video stream, its encoder's
+/// budget on the wire and its forwarding state carry on; only the ingress allowance moves, as
+/// it would have been had the share started with sound.
+fn add_audio(p: &mut Publisher, sdp: &str, now: Instant) -> Result<String, &'static str> {
+    if p.audio.is_some() {
+        return Err("the share already has sound");
+    }
+    if p.origin.encrypted {
+        return Err("encrypted screen audio is unavailable");
+    }
+    if audio::Publisher::offered(sdp)?.is_none() {
+        return Err("the offer has no sound");
+    }
+    let offer = SdpOffer::from_sdp_string(sdp).map_err(|_| "invalid SDP offer")?;
+    let answer = p.rtc.sdp_api().accept_offer(offer).map_err(|_| "offer not acceptable")?;
+    let Some(audio) = audio::Publisher::from_sdp(&mut p.rtc, sdp, now)? else {
+        return Err("the offer has no sound");
+    };
+    p.ingress.set_cap(p.origin.cap_bps.saturating_sub(audio::WIRE_BPS).max(1), now);
+    p.audio = Some(audio);
+    p.origin.audio_negotiated(true);
+    Ok(answer.to_sdp_string())
 }
 
 /// What a watch offer says about its viewer's decoders, beyond its SDP.
@@ -6672,6 +6732,77 @@ pub(crate) mod tests {
         }
         assert_eq!(numbers, [0x1234, 0x1235]);
     }
+    /// A running video-only publisher, and its peer's offer with the Opus m-line added.
+    fn running_publisher(now: Instant) -> (Publisher, Rtc, u32, u32) {
+        let mut peer = Rtc::builder().set_rtp_mode(true).build(now);
+        peer.add_local_candidate(Candidate::host(addr(5000), "udp").unwrap());
+        let mut api = peer.sdp_api();
+        api.add_media(MediaKind::Video, Direction::SendOnly, None, None, None);
+        let (offer, pending) = api.apply().unwrap();
+        let sdp = offer.to_sdp_string();
+        let (ssrc, rtx) = publish_ssrcs(&sdp).unwrap();
+        let origin = ScreenOrigin::new(1, "sound".into(), 1, false, false, 8_000_000);
+        let (publisher, answer) = super::publisher(1, origin, ssrc, &sdp, addr(6000), now).unwrap();
+        peer.sdp_api().accept_answer(pending, SdpAnswer::from_sdp_string(&answer).unwrap()).unwrap();
+        (publisher, peer, ssrc, rtx)
+    }
+
+    fn sound_offer(peer: &mut Rtc) -> String {
+        let mut api = peer.sdp_api();
+        api.add_media(MediaKind::Audio, Direction::SendOnly, None, None, None);
+        api.apply().unwrap().0.to_sdp_string()
+    }
+
+    #[test]
+    fn sound_joins_a_running_share_on_the_same_transport() {
+        let now = Instant::now();
+        let (mut p, mut peer, ssrc, rtx) = running_publisher(now);
+        assert!(!p.origin.has_audio.load(Ordering::Relaxed));
+        let ufrag = p.ufrag.clone();
+        let video = p.rtc.direct_api().stream_rx(&Ssrc::from(ssrc)).map(|s| s.mid()).unwrap();
+        let offer = sound_offer(&mut peer);
+        assert_eq!(publish_ssrcs(&offer), Some((ssrc, rtx)));
+        let answer = add_audio(&mut p, &offer, now).unwrap();
+        assert!(p.audio.is_some());
+        assert!(p.origin.has_audio.load(Ordering::Relaxed));
+        assert_eq!(sections(&answer).len(), 2, "video and sound: {answer}");
+        assert_eq!(p.rtc.direct_api().local_ice_credentials().ufrag, ufrag, "the same connection");
+        assert_eq!(p.rtc.direct_api().stream_rx(&Ssrc::from(ssrc)).map(|s| s.mid()), Some(video));
+        assert_eq!(add_audio(&mut p, &offer, now), Err("the share already has sound"));
+    }
+
+    #[test]
+    fn a_refused_sound_offer_changes_nothing_about_the_share() {
+        let now = Instant::now();
+        let (mut p, mut peer, ..) = running_publisher(now);
+        let offer = sound_offer(&mut peer);
+        let bad: [(&str, String); 4] = [
+            ("no sound", sections(&offer).first().unwrap().join("\r\n")),
+            (
+                "two SSRCs",
+                offer.replacen("a=sendonly\r\n", "a=sendonly\r\na=ssrc:7 cname:x\r\na=ssrc:8 cname:x\r\n", 2),
+            ),
+            ("not sending", offer.replace("a=sendonly", "a=sendrecv")),
+            ("not an offer", "v=0".into()),
+        ];
+        for (why, sdp) in bad {
+            assert!(add_audio(&mut p, &sdp, now).is_err(), "{why}");
+            assert!(p.audio.is_none(), "{why}");
+            assert!(!p.origin.has_audio.load(Ordering::Relaxed), "{why}");
+        }
+    }
+
+    #[test]
+    fn resuming_needs_an_m_line_and_stopped_sound_keeps_it() {
+        let origin = ScreenOrigin::new(1, "sound".into(), 1, false, false, 8_000_000);
+        assert!(!origin.resume_audio(), "a picture-only share has nothing to resume");
+        assert!(!origin.has_audio.load(Ordering::Relaxed));
+        origin.audio_negotiated(true);
+        origin.has_audio.store(false, Ordering::Relaxed);
+        assert!(origin.resume_audio());
+        assert!(origin.has_audio.load(Ordering::Relaxed));
+    }
+
     #[test]
     fn silent_legacy_shares_do_not_pay_for_unused_audio_slots() {
         let mut pair = Pair::new();

@@ -82,6 +82,64 @@ every version and upgrade/reload. Main's #206/#208/#207 migrations retain their
 numbers; this branch follows them at v10. Earlier v7/v8 share-audio preview maps
 also survive. The Polish settings labels remain Głos and Dźwięki aplikacji.
 
+## Sound during a running share
+
+A share that lost its sound, or never had it, takes it back without ending. The picture
+keeps its transport, encoder and stream, so viewers see no restart, and they pick the
+sound up from `screen.audio.state`, which they already poll every second. Viewer
+transports always carry paired audio m-lines, so nobody rewatches.
+
+There are two ways in, depending on whether the publish transport has an audio m-line:
+
+| Share | Path | Protocol |
+| --- | --- | --- |
+| Started with sound, sound ended | `replaceTrack` on the existing sender | `screen.audio.resume` |
+| Started without sound | Re-offer on the same transport, adding one Opus m-line | `screen.audio.add` |
+
+`screen.audio.add` carries a new offer for the running share. The SFU refuses it unless the
+sender is the sharer, the share is negotiated, not encrypted, and the offer keeps the
+picture's SSRC and RTX SSRC. It validates the offer before applying it, so a refused offer
+changes nothing: the share continues as picture only and the page rolls its offer back. An
+accepted one lowers the picture's ingress cap by the same 128 kb/s that a share with sound
+reserves from the start. The picture's bitrate target drops with it, which is the only
+thing a viewer could notice, and only if the link was already full.
+
+Renegotiation is used rather than an m-line every share carries, so a normal video-only
+start is byte-for-byte what it was: the startup gate is unaffected, and video-only shares
+pay nothing. The one addition to a start is a `screen.audio.add.capabilities` query after
+the share is live, which nothing waits for.
+
+### Consent and retries
+
+- The sharer's ask stands from Start, or from turning sound on in a live share, until the
+  capture comes up. While it stands, a capture that failed is retried after 5, 15 and 45 s, a
+  missing permission is checked every 5 s, and both are tried when the window regains focus,
+  which is when a permission was most likely just granted.
+- A capture that came up and ended, by **Stop sharing sound**, by the OS, or by the browser's
+  own stop bar, is never retried. It takes a new click. Retrying is for the capture that
+  never came, not for the stream somebody ended.
+- A retry is quiet. It does not show a toast, take focus or open anything. If it comes up,
+  the bar changes; if not, the bar keeps offering **Turn on sound**.
+
+### Controls
+
+The bar shows **Turn on sound** / **Włącz dźwięk** where the status would be, as an icon below
+the `sm` breakpoint. In the desktop app it acts at once, unless the permission is missing.
+Otherwise it opens Details, which says what is wrong and offers the next step. The button
+exists only when a click can do something: not on a server without the query, not on a
+system without capture, not while a resume is already running.
+
+On macOS `CGPreflightScreenCaptureAccess` can stay stale until the app relaunches, so a
+missing permission no longer short-circuits the start: a real capture attempt is the only
+sure answer. Whether capture works after a grant without a relaunch depends on the OS, so
+Details says that reopening Gwar may be needed, and that it ends the share.
+
+A browser has no way to add sound to an existing capture. **Choose a tab** opens a second
+picker restricted to tabs. Its video is stopped at once and only the audio is kept, which
+the e2e run confirms keeps Chromium's tab audio alive. The browser's own stop bar for that
+capture ends the sound only. This needs `suppressLocalAudioPlayback`, so it is offered only
+in Chromium browsers. Elsewhere the bar keeps its plain status.
+
 ## Voice priority and bounded forwarding
 
 Voice keeps its separate transport and task. The screen task never decodes
@@ -183,8 +241,8 @@ cancellation. Details of the commands are in
 The quality menu asks once, with **Share computer sound** / **Udostępniaj dźwięk
 komputera**. It is off until the sharer turns it on, and the answer is remembered
 (settings v11). Starting the share is the consent: capture never begins by itself.
-Details has a **Stop sharing sound** action; turning it back on needs a new share,
-since the sender's m-line exists only from the start.
+Details has a **Stop sharing sound** action. Sound can come back during the same share;
+see [Sound during a running share](#sound-during-a-running-share).
 
 ```
 OS capture → CaptureQueue (200 ms, oldest goes) → share_capture_read (awaited, raw f32)

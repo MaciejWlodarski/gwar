@@ -14,9 +14,10 @@ const sound = vi.hoisted(() => ({
   result: null as unknown,
   receivers: [] as Array<{ run: number; slots: Array<[number, number]>; gains: Array<[number, number]>; closed: boolean }>,
   receivable: true,
+  support: "ok",
 }));
 vi.mock("../voice/share-sound", () => ({
-  computerSoundSupport: async () => "ok",
+  computerSoundSupport: async () => sound.support,
   shareSoundReceivable: async () => sound.receivable,
   ComputerSound: class {
     stop = vi.fn();
@@ -35,11 +36,12 @@ vi.mock("../voice/share-sound", () => ({
     close() { this.closed = true; }
   },
 }));
-const media = vi.hoisted(() => ({ publishers: [] as Array<{ params: { audio?: MediaStreamTrack; nativeAudio?: boolean } }>, transports: [] as Array<{ params: { audio?(): Promise<boolean> } }> }));
+const media = vi.hoisted(() => ({ added: [] as MediaStreamTrack[], tabSound: null as unknown, publishers: [] as Array<{ addAudio: ReturnType<typeof vi.fn>; close: ReturnType<typeof vi.fn>; params: { audio?: MediaStreamTrack; nativeAudio?: boolean } }>, transports: [] as Array<{ params: { audio?(): Promise<boolean> } }> }));
 vi.mock("../voice/screen", async importOriginal => ({
   ...await importOriginal<typeof import("../voice/screen")>(),
   ScreenPublisher: class {
     fallbacks = vi.fn(); close = vi.fn(); setSpec = vi.fn(async () => {});
+    addAudio = vi.fn(async (track: MediaStreamTrack, add: { renegotiate(sdp: string): Promise<string> }) => { media.added.push(track); await add.renegotiate("offer"); });
     constructor(readonly params: { audio?: MediaStreamTrack; nativeAudio?: boolean }) { media.publishers.push(this); }
     async start() {}
   },
@@ -50,14 +52,17 @@ vi.mock("../voice/screen", async importOriginal => ({
   },
   applyCaptureSpec: vi.fn(async () => {}),
   captureSupport: () => "ok" as const,
+  captureTabSound: () => (media.tabSound instanceof Error ? Promise.reject(media.tabSound) : Promise.resolve(media.tabSound)),
 }));
 
 const ch = (id: number): Channel => ({ id, parent: null, name: `c${id}`, topic: "", position: id, has_password: false, max_clients: null, encrypted: false, history: false, private: false, synced: false });
 const cl = (id: number, channel: number | null): Client => ({ id, uid: `u${id}`, nickname: `n${id}`, channel, groups: [2], platform: "web", muted: false, deafened: false, away: null, talking: false, voice: false, voice_binding: { call: "AAAAAAAAAAAAAAAAAAAAAA", participation: "AQEBAQEBAQEBAQEBAQEBAQ", run: 1 } });
 
-function link(audio = true) {
+function link(audio = true, addable = true) {
   return { request: vi.fn(async (op: string) => {
     if (op === "screen.audio.capabilities") return { screen_audio: audio };
+    if (op === "screen.audio.add.capabilities") { if (!addable) throw new Error("bad_request"); return { screen_audio_add: true }; }
+    if (op === "screen.audio.add") return { sdp: "answer" };
     if (op === "screen.spec.capabilities") return { screen_spec: false };
     if (op === "screen.capabilities") return { screen_h264: false };
     if (op === "screen.start") return { share: "M" };
@@ -76,8 +81,8 @@ function choosing(computerSound: "ok" | "permission" | undefined) {
 const own = () => useScreen.getState().own;
 
 beforeEach(() => {
-  sound.instances.length = 0; sound.receivers.length = 0; sound.result = liveTrack(); sound.receivable = true;
-  media.publishers.length = 0; media.transports.length = 0;
+  sound.instances.length = 0; sound.receivers.length = 0; sound.result = liveTrack(); sound.receivable = true; sound.support = "ok";
+  media.publishers.length = 0; media.transports.length = 0; media.added.length = 0; media.tabSound = null;
   useSettings.setState({ shareComputerSound: true, shareAudio: {} });
   useUi.setState({ toast: vi.fn() });
   useScreen.setState({ ...initialScreen });
@@ -119,7 +124,9 @@ describe("computer sound", () => {
     expect(media.publishers).toHaveLength(1);
     expect(media.publishers[0]!.params.audio).toBeUndefined();
     expect(own()).toMatchObject({ phase: "starting", audio: false, computerSound: state });
-    expect(sound.instances[0]!.stop).toHaveBeenCalled();
+    // Only an answer that cannot change ends the ask; the others wait to try again.
+    expect(sound.instances[0]!.stop).toHaveBeenCalledTimes(state === "unsupported" ? 1 : 0);
+    screen.reset();
   });
 
   it("stops capturing for a server without share sound", async () => {
@@ -188,6 +195,204 @@ describe("computer sound", () => {
     await screen.confirmShare();
     await screen.stopShare();
     expect(sound.instances[1]!.stop).toHaveBeenCalled();
+  });
+});
+
+describe("sound coming back during a share", () => {
+  const toast = () => useUi.getState().toast as unknown as ReturnType<typeof vi.fn>;
+  const live = () => useScreen.setState(s => ({ own: { ...s.own!, phase: "live", share: "M" } }));
+  /** A running share whose start said `refused`. */
+  const refusedShare = async (refused: string, conn = link()) => {
+    sound.result = refused;
+    const screen = controllerOn(conn);
+    choosing("ok");
+    await screen.confirmShare();
+    live();
+    return screen;
+  };
+  /** A running picture-only share nobody asked sound for. */
+  const pictureOnly = async (conn = link()) => {
+    useSettings.setState({ shareComputerSound: false });
+    const screen = controllerOn(conn);
+    choosing("ok");
+    await screen.confirmShare();
+    live();
+    return screen;
+  };
+  const focusBack = (screen: ScreenController) => (screen as unknown as { soundCauseMayHaveCleared(): void }).soundCauseMayHaveCleared();
+
+  beforeEach(() => { vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] }); });
+  afterEach(() => { vi.useRealTimers(); });
+
+  it("learns whether this server takes sound into a running share", async () => {
+    const screen = await pictureOnly();
+    await vi.waitFor(() => expect(own()?.soundAddable).toBe(true));
+    screen.reset();
+    const old = await pictureOnly(link(true, false));
+    await vi.waitFor(() => expect(own()?.soundAddable).toBe(false));
+    old.reset();
+  });
+
+  it("a permission granted later brings sound in with no click, on the same capture object", async () => {
+    const screen = await refusedShare("permission");
+    const stored = media.publishers[0]!;
+    sound.support = "permission";
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(sound.instances[0]!.start).toHaveBeenCalledTimes(1);
+    sound.support = "ok";
+    const track = liveTrack();
+    sound.result = track;
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(sound.instances).toHaveLength(1);
+    expect(media.added).toEqual([track]);
+    expect(own()).toMatchObject({ computerSound: "ok", soundAdding: false });
+    expect(stored.close).not.toHaveBeenCalled();
+    expect(media.publishers).toHaveLength(1);
+    screen.reset();
+  });
+
+  it("coming back to the window tries the capture itself, because the check can be out of date", async () => {
+    const screen = await refusedShare("permission");
+    sound.support = "permission";
+    sound.result = liveTrack();
+    await vi.advanceTimersByTimeAsync(3_000);
+    focusBack(screen);
+    await vi.waitFor(() => expect(media.added).toHaveLength(1));
+    screen.reset();
+  });
+
+  it("gives a failed start a few quiet tries and then leaves it to a click", async () => {
+    const screen = await refusedShare("failed");
+    for (const wait of [5_000, 15_000, 45_000]) await vi.advanceTimersByTimeAsync(wait);
+    expect(sound.instances[0]!.start).toHaveBeenCalledTimes(4);
+    expect(sound.instances[0]!.stop).toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(sound.instances[0]!.start).toHaveBeenCalledTimes(4);
+    expect(toast()).not.toHaveBeenCalled();
+    expect(own()).toMatchObject({ computerSound: "failed", audio: false });
+    screen.reset();
+  });
+
+  it("never asks on its own when nobody asked for sound", async () => {
+    const screen = await pictureOnly();
+    await vi.advanceTimersByTimeAsync(600_000);
+    focusBack(screen);
+    expect(sound.instances).toHaveLength(0);
+    screen.reset();
+  });
+
+  it("never revives a stream the OS ended", async () => {
+    const screen = controllerOn(link());
+    choosing("ok");
+    await screen.confirmShare();
+    live();
+    sound.instances[0]!.ended("failed");
+    expect(own()).toMatchObject({ computerSound: "failed", audio: false });
+    await vi.advanceTimersByTimeAsync(600_000);
+    focusBack(screen);
+    expect(sound.instances).toHaveLength(1);
+    expect(sound.instances[0]!.start).toHaveBeenCalledTimes(1);
+    expect(media.added).toHaveLength(0);
+    screen.reset();
+  });
+
+  it("never revives sound the sharer stopped", async () => {
+    const screen = controllerOn(link());
+    choosing("ok");
+    await screen.confirmShare();
+    live();
+    screen.stopComputerSound();
+    await vi.advanceTimersByTimeAsync(600_000);
+    focusBack(screen);
+    expect(media.added).toHaveLength(0);
+    screen.reset();
+  });
+
+  it("a stopped sound comes back from a click, as a new capture", async () => {
+    const screen = controllerOn(link());
+    choosing("ok");
+    await screen.confirmShare();
+    live();
+    screen.stopComputerSound();
+    const track = liveTrack();
+    sound.result = track;
+    expect(await screen.turnOnSound()).toBe("ok");
+    expect(sound.instances).toHaveLength(2);
+    expect(media.added).toEqual([track]);
+    expect(own()).toMatchObject({ computerSound: "ok" });
+    expect(media.publishers).toHaveLength(1);
+    screen.reset();
+  });
+
+  it("stopping the share cancels what was still waiting", async () => {
+    const screen = await refusedShare("failed");
+    await screen.stopShare();
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(sound.instances[0]!.start).toHaveBeenCalledTimes(1);
+    expect(sound.instances[0]!.stop).toHaveBeenCalled();
+  });
+
+  it("a server's refusal leaves the picture and says so once", async () => {
+    const conn = link();
+    const screen = await pictureOnly(conn);
+    (conn.request as ReturnType<typeof vi.fn>).mockImplementation(async (op: string) => { if (op === "screen.audio.add") throw new Error("refused"); return {}; });
+    expect(await screen.turnOnSound()).toBe("failed");
+    expect(media.publishers[0]!.close).not.toHaveBeenCalled();
+    expect(own()).toMatchObject({ phase: "live", computerSound: "failed", soundAdding: false });
+    expect(toast()).toHaveBeenCalledOnce();
+    expect(sound.instances[0]!.stop).toHaveBeenCalled();
+    screen.reset();
+  });
+
+  it("does nothing while sound is already there", async () => {
+    const screen = controllerOn(link());
+    choosing("ok");
+    await screen.confirmShare();
+    live();
+    expect(await screen.turnOnSound()).toBeNull();
+    expect(media.added).toHaveLength(0);
+    screen.reset();
+  });
+
+  describe("in a browser", () => {
+    const browser = async () => {
+      const conn = link();
+      const screen = new ScreenController(() => conn, String);
+      useSettings.setState({ shareComputerSound: false });
+      choosing(undefined);
+      await screen.confirmShare();
+      live();
+      return screen;
+    };
+
+    it("adds the chosen tab's sound and keeps it across a recovery, whatever the picture shows", async () => {
+      const screen = await browser();
+      const track = liveTrack();
+      media.tabSound = track;
+      expect(await screen.turnOnSound()).toBe("ok");
+      expect(media.added).toEqual([track]);
+      useScreen.getState().dispatch({ type: "recoverOwn" });
+      await screen.confirmShare();
+      expect(media.publishers.at(-1)!.params).toMatchObject({ audio: track, nativeAudio: true });
+      screen.reset();
+    });
+
+    it("takes a closed picker as an answer", async () => {
+      const screen = await browser();
+      media.tabSound = new Error("NotAllowedError");
+      expect(await screen.turnOnSound()).toBeNull();
+      expect(toast()).not.toHaveBeenCalled();
+      expect(own()).toMatchObject({ phase: "live", soundAdding: false });
+      screen.reset();
+    });
+
+    it("says so when the choice had no sound", async () => {
+      const screen = await browser();
+      media.tabSound = null;
+      expect(await screen.turnOnSound()).toBeNull();
+      expect(toast()).toHaveBeenCalledOnce();
+      screen.reset();
+    });
   });
 });
 

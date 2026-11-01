@@ -54,6 +54,40 @@ async fn optional_capability_query_keeps_legacy_clients_and_welcome_compatible()
 }
 
 #[tokio::test]
+async fn sound_can_only_join_my_own_running_share() {
+    let server = TestServer::start().await;
+    let mut alice = Client::connect(&server, "alice").await;
+    let mut bob = Client::connect(&server, "bob").await;
+    assert_eq!(
+        alice.request("screen.audio.add.capabilities", json!({})).await.unwrap(),
+        json!({"screen_audio_add":true})
+    );
+    let share = alice.share_in(seed_channel(&alice, "General")).await;
+    assert_eq!(
+        bob.request("screen.audio.add", json!({"share":share,"sdp":"v=0"})).await.unwrap_err().code,
+        gwar_proto::ErrorCode::Forbidden
+    );
+    assert_eq!(
+        bob.request("screen.audio.resume", json!({"share":share})).await.unwrap_err().code,
+        gwar_proto::ErrorCode::Forbidden
+    );
+    assert_eq!(
+        alice.request("screen.audio.add", json!({"share":share,"sdp":"v=0"})).await.unwrap_err().code,
+        gwar_proto::ErrorCode::BadRequest
+    );
+    assert_eq!(
+        alice.request("screen.audio.resume", json!({"share":share})).await.unwrap_err().code,
+        gwar_proto::ErrorCode::Conflict,
+        "a picture-only share has no sound to bring back"
+    );
+    assert_eq!(
+        alice.request("screen.audio.state", json!({"share":share})).await.unwrap(),
+        json!({"audio":false}),
+        "and the refusals did not touch the share"
+    );
+}
+
+#[tokio::test]
 async fn audio_availability_is_explicit_and_only_the_publisher_can_stop_it() {
     let server = TestServer::start().await;
     let mut alice = Client::connect(&server, "alice").await;

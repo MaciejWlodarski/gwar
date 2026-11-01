@@ -1113,6 +1113,9 @@ fn translate(request: &Request, own: u16, view: &View) -> Result<Vec<(Part, OutC
         | Request::ScreenAv1Capabilities {}
         | Request::ScreenAudioCapabilities {}
         | Request::ScreenAudioState { .. }
+        | Request::ScreenAudioAddCapabilities {}
+        | Request::ScreenAudioAdd { .. }
+        | Request::ScreenAudioResume { .. }
         | Request::ScreenFocus { .. }
         | Request::ScreenDecodeFailed { .. }
         | Request::ScreenKeyframe { .. } => return Err(refused("screen sharing requires a Gwar server")),

@@ -4,8 +4,9 @@ import { initialScreen, useScreen } from "../state/screen";
 import { useSession, useUi } from "../state/stores";
 import { welcome } from "../net/testing";
 import type { Link } from "../net/connection";
+import type { ScreenRecovery } from "../proto/ScreenRecovery";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { captureScreen, DEPENDENCY_DESCRIPTOR, headroomBitrate, MIN_BITRATE, preferredCodecs, publishSsrcs, ScreenPublisher, type PublishParams, ScreenWatchTransport, SCREEN_SLOTS, StaleEstimateProbe, StuckCaptureGuard } from "./screen";
+import { captureTabSound, tabSoundSupported, captureScreen, DEPENDENCY_DESCRIPTOR, headroomBitrate, MIN_BITRATE, preferredCodecs, publishSsrcs, ScreenPublisher, type PublishParams, ScreenWatchTransport, SCREEN_SLOTS, StaleEstimateProbe, StuckCaptureGuard } from "./screen";
 
 import { deriveSpec, legacySpec, type ScreenSpec } from "./screen-quality";
 import type { ScreenPreset } from "../proto/ScreenPreset";
@@ -64,17 +65,19 @@ class Peer {
   static offerSdp = "v=0\r\nm=video 9 X 98\r\na=ssrc-group:FID 10 11\r\na=ssrc:10 c\r\na=ssrc:11 c\r\n";
   localDescription: RTCSessionDescriptionInit | null = null;
   connectionState = "new";
+  signalingState = "stable";
+  remoteDescription: RTCSessionDescriptionInit | null = null;
   onconnectionstatechange: (() => void) | null = null;
   ontrack: ((ev: unknown) => void) | null = null;
   close = vi.fn();
   sendParams: Array<RTCRtpSendParameters> = [];
-  transceivers: Array<{ direction: string; init: RTCRtpTransceiverInit; setCodecPreferences: ReturnType<typeof vi.fn>; setHeaderExtensionsToNegotiate: ReturnType<typeof vi.fn>; receiver: Record<string, unknown>; sender: { getParameters: () => RTCRtpSendParameters; setParameters: ReturnType<typeof vi.fn>; replaceTrack: ReturnType<typeof vi.fn> } }> = [];
+  transceivers: Array<{ direction: string; init: RTCRtpTransceiverInit; stop: ReturnType<typeof vi.fn>; setCodecPreferences: ReturnType<typeof vi.fn>; setHeaderExtensionsToNegotiate: ReturnType<typeof vi.fn>; receiver: Record<string, unknown>; sender: { getParameters: () => RTCRtpSendParameters; setParameters: ReturnType<typeof vi.fn>; replaceTrack: ReturnType<typeof vi.fn> } }> = [];
   /** What `getParameters().codecs` reports: the negotiated codecs. */
   codecs: RTCRtpCodecParameters[] = [];
   stats = new Map<string, Record<string, unknown>>([["out", { type: "outbound-rtp", kind: "video", framesEncoded: 1 }]]);
   createOffer = vi.fn(async () => ({ type: "offer" as const, sdp: Peer.offerSdp }));
   setLocalDescription = vi.fn(async (d: RTCSessionDescriptionInit) => { this.localDescription = d; });
-  setRemoteDescription = vi.fn(async () => {});
+  setRemoteDescription = vi.fn(async (d: RTCSessionDescriptionInit) => { this.remoteDescription = d; });
   getStats = vi.fn(async () => this.stats);
   constructor() { Peer.all.push(this); }
   addTransceiver(_kind: unknown, init: RTCRtpTransceiverInit) {
@@ -85,7 +88,7 @@ class Peer {
       replaceTrack: vi.fn(async (_track: MediaStreamTrack | null) => {}),
     };
     const extensions = [{ uri: "urn:ietf:params:rtp-hdrext:sdes:mid", direction: "sendrecv" }, { uri: DEPENDENCY_DESCRIPTOR, direction: "stopped" }];
-    const t = { direction: init.direction!, init, setCodecPreferences: vi.fn(), getHeaderExtensionsToNegotiate: () => extensions.map(e => ({ ...e })), setHeaderExtensionsToNegotiate: vi.fn(),
+    const t = { direction: init.direction!, init, stop: vi.fn(), setCodecPreferences: vi.fn(), getHeaderExtensionsToNegotiate: () => extensions.map(e => ({ ...e })), setHeaderExtensionsToNegotiate: vi.fn(),
       receiver: { jitterBufferTarget: null }, sender };
     this.transceivers.push(t);
     return t;
@@ -3285,6 +3288,176 @@ it("drops tab sound when a browser advertises own-audio exclusion but did not ap
   expect(audio.stop).toHaveBeenCalledOnce(); expect(removeTrack).toHaveBeenCalledWith(audio);
 });
 
+
+describe("sound joining a running share", () => {
+  const VIDEO = "m=video 9 X 98\r\na=mid:0\r\na=fmtp:98 x-google-start-bitrate=4000\r\n";
+  const AUDIO = "m=audio 9 X 111\r\na=mid:1\r\n";
+  const track = (readyState = "live") => ({ readyState, stop: vi.fn() }) as unknown as MediaStreamTrack;
+  const running = async (audio?: MediaStreamTrack) => {
+    const audioState = vi.fn();
+    const video = { readyState: "live", applyConstraints: async () => {} } as unknown as MediaStreamTrack;
+    const publisher = new ScreenPublisher({ track: video, audio, audioState, quality: TEST_SPECS.game, iceServers: [], offer: async () => `v=0\r\n${VIDEO}`, state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!;
+    pc.connectionState = "connected"; pc.onconnectionstatechange?.();
+    await vi.advanceTimersByTimeAsync(0);
+    return { publisher, pc, audioState, video };
+  };
+  const server = (answer = `v=0\r\nm=video 9 X 98\r\na=mid:0\r\n${AUDIO}`) => ({ renegotiate: vi.fn(async (_sdp: string) => answer), resume: vi.fn(async () => {}) });
+
+  it("adds the m-line on the same connection and leaves the video sender alone", async () => {
+    const { publisher, pc, audioState } = await running();
+    const sender = pc.transceivers[0]!.sender;
+    const before = sender.replaceTrack.mock.calls.length;
+    const sound = track(), add = server();
+    await publisher.addAudio(sound, add);
+    expect(Peer.all).toHaveLength(1);
+    expect(pc.close).not.toHaveBeenCalled();
+    expect(pc.transceivers).toHaveLength(2);
+    expect(pc.transceivers[1]!.init.sendEncodings?.[0]).toMatchObject({ maxBitrate: 64_000, priority: "very-low" });
+    expect(add.renegotiate).toHaveBeenCalledOnce();
+    expect(sender.replaceTrack.mock.calls.length).toBe(before);
+    expect(audioState).toHaveBeenLastCalledWith(true);
+    publisher.close();
+  });
+
+  it("keeps the applied video answer, start hint included, so nothing rebuilds the encoder", async () => {
+    const { publisher, pc } = await running();
+    const applied = pc.remoteDescription!.sdp!;
+    expect(applied).toContain("x-google-start-bitrate");
+    await publisher.addAudio(track(), server());
+    const after = pc.remoteDescription!.sdp!;
+    expect(after.slice(after.indexOf("m=video"), after.indexOf("m=audio"))).toBe(applied.slice(applied.indexOf("m=video")));
+    expect(after).toContain(AUDIO);
+    publisher.close();
+  });
+
+  it("gives the sound's allowance back to nothing else: the video cap drops once, in place", async () => {
+    const { publisher, pc } = await running();
+    expect(pc.sendParams.at(-1)?.encodings[0]?.maxBitrate).toBe(8_000_000);
+    await publisher.addAudio(track(), server());
+    expect(pc.sendParams.at(-1)?.encodings[0]?.maxBitrate).toBe(7_872_000);
+    publisher.close();
+  });
+
+  it("puts everything back when the server refuses, the picture untouched", async () => {
+    const { publisher, pc, audioState } = await running();
+    audioState.mockClear();
+    const add = server();
+    add.renegotiate.mockImplementation(async () => { pc.signalingState = "have-local-offer"; throw new Error("refused"); });
+    await expect(publisher.addAudio(track(), add)).rejects.toThrow("refused");
+    expect(pc.setLocalDescription).toHaveBeenLastCalledWith({ type: "rollback" });
+    expect(pc.transceivers[1]!.stop).toHaveBeenCalled();
+    expect(pc.close).not.toHaveBeenCalled();
+    expect(audioState).not.toHaveBeenCalled();
+    await publisher.addAudio(track(), server()).catch(() => {});
+    publisher.close();
+  });
+
+  it("brings stopped sound back on the m-line it has, with no new offer", async () => {
+    const stopped = { readyState: "live" } as { readyState: string };
+    const { publisher, pc, audioState } = await running(stopped as MediaStreamTrack);
+    stopped.readyState = "ended";
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(audioState).toHaveBeenLastCalledWith(false);
+    const createdOffers = pc.createOffer.mock.calls.length;
+    const sound = track(), add = server();
+    await publisher.addAudio(sound, add);
+    expect(pc.transceivers[1]!.sender.replaceTrack).toHaveBeenLastCalledWith(sound);
+    expect(add.resume).toHaveBeenCalledOnce();
+    expect(add.renegotiate).not.toHaveBeenCalled();
+    expect(pc.createOffer.mock.calls.length).toBe(createdOffers);
+    expect(audioState).toHaveBeenLastCalledWith(true);
+    publisher.close();
+  });
+
+  it("takes the track back off the sender when the server will not resume", async () => {
+    const { publisher, pc } = await running(track());
+    const add = server();
+    add.resume.mockRejectedValue(new Error("no"));
+    await expect(publisher.addAudio(track(), add)).rejects.toThrow("no");
+    expect(pc.transceivers[1]!.sender.replaceTrack).toHaveBeenLastCalledWith(null);
+    publisher.close();
+  });
+
+  it("never reports sound gone while it is on its way", async () => {
+    const { publisher, audioState } = await running();
+    audioState.mockClear();
+    let answer!: (sdp: string) => void;
+    const adding = publisher.addAudio(track(), { renegotiate: () => new Promise(resolve => { answer = resolve; }), resume: async () => {} });
+    await vi.advanceTimersByTimeAsync(4_100);
+    expect(audioState).not.toHaveBeenCalled();
+    answer(`v=0\r\n${VIDEO}${AUDIO}`);
+    await adding;
+    expect(audioState.mock.calls).toEqual([[true]]);
+    publisher.close();
+  });
+
+  it("is refused before the transport is up, and a replaced transport is not claimed", async () => {
+    const publisher = new ScreenPublisher({ track: { readyState: "live" } as MediaStreamTrack, quality: TEST_SPECS.game, iceServers: [], offer: async () => `v=0\r\n${VIDEO}`, state: () => {} });
+    await expect(publisher.addAudio(track(), server())).rejects.toThrow("not ready");
+    await publisher.start();
+    await expect(publisher.addAudio(track(), server())).rejects.toThrow("not ready");
+    publisher.close();
+  });
+
+  it("a later recovery's transport starts with the added sound", async () => {
+    const { publisher, pc } = await running();
+    const sound = track();
+    await publisher.addAudio(sound, server());
+    await publisher.recover({ codec: "vp9", width: 1280, height: 720, fps: 30 } as ScreenRecovery);
+    const next = Peer.all.at(-1)!;
+    expect(next).not.toBe(pc);
+    expect(next.transceivers).toHaveLength(2);
+    publisher.close();
+  });
+
+  it("does not stop added sound when the picture is not a tab", async () => {
+    const sound = track();
+    const picture = { readyState: "live", getSettings: () => ({ displaySurface: "window" }) } as unknown as MediaStreamTrack;
+    const publisher = new ScreenPublisher({ track: picture, quality: TEST_SPECS.game, iceServers: [], offer: async () => `v=0\r\n${VIDEO}`, state: () => {} });
+    await publisher.start();
+    const pc = Peer.all[0]!;
+    pc.connectionState = "connected"; pc.onconnectionstatechange?.();
+    await vi.advanceTimersByTimeAsync(0);
+    await publisher.addAudio(sound, server());
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(sound.stop).not.toHaveBeenCalled();
+    publisher.close();
+  });
+});
+
+describe("a tab's sound on its own", () => {
+  const capture = (surface: string, audio: unknown[]) => {
+    const video = { stop: vi.fn(), getSettings: () => ({ displaySurface: surface }) };
+    const stream = { getVideoTracks: () => [video], getAudioTracks: () => audio, removeTrack: (t: unknown) => audio.splice(audio.indexOf(t), 1) };
+    vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia: vi.fn(async () => stream), getSupportedConstraints: () => ({ suppressLocalAudioPlayback: true }) } });
+    return video;
+  };
+
+  it("keeps only the sound of a tab, and stops the second picture at once", async () => {
+    const sound = { stop: vi.fn() };
+    const video = capture("browser", [sound]);
+    expect(await captureTabSound()).toBe(sound);
+    expect(video.stop).toHaveBeenCalledOnce();
+    expect(sound.stop).not.toHaveBeenCalled();
+  });
+
+  it.each(["window", "monitor"])("takes no sound from a %s", async surface => {
+    const sound = { stop: vi.fn() };
+    const video = capture(surface, [sound]);
+    expect(await captureTabSound()).toBeNull();
+    expect(sound.stop).toHaveBeenCalledOnce();
+    expect(video.stop).toHaveBeenCalledOnce();
+  });
+
+  it("offers nothing where the picker cannot return sound", () => {
+    vi.stubGlobal("navigator", { mediaDevices: { getSupportedConstraints: () => ({}) } });
+    expect(tabSoundSupported()).toBe(false);
+    vi.stubGlobal("navigator", { mediaDevices: { getSupportedConstraints: () => ({ suppressLocalAudioPlayback: true }) } });
+    expect(tabSoundSupported()).toBe(true);
+  });
+});
 
 it("stops sound truthfully when the retained source changes from a tab to a window", async () => {
   let displaySurface = "browser";

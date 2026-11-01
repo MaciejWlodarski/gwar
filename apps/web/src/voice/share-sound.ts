@@ -50,12 +50,14 @@ let lastCapture = 0;
 const nextCapture = () => (lastCapture = Math.max(lastCapture + 1, Date.now()));
 
 /**
- * One share's computer sound. Build it in the Start click's own task: an `AudioContext` made
- * later can stay suspended. `start` is safe to repeat, so a retried share keeps the same capture.
+ * One share's computer sound. Build it in the click's own task: an `AudioContext` made later can
+ * stay suspended. `start` is safe to repeat: a retried share keeps the same capture, and after a
+ * refusal it tries again under the same context, so a retry needs no click of its own.
  */
 export class ComputerSound {
   private readonly context: AudioContext;
   private started: Promise<MediaStreamTrack | ComputerSoundState> | null = null;
+  private module: Promise<void> | null = null;
   private track: MediaStreamTrack | null = null;
   private node: AudioWorkletNode | null = null;
   private capture: { link: ShareSoundLink; id: number } | null = null;
@@ -79,7 +81,8 @@ export class ComputerSound {
   start(): Promise<MediaStreamTrack | ComputerSoundState> {
     this.started ??= this.open().catch((error: unknown) => {
       console.warn("[share sound] capture:", error);
-      this.stop();
+      this.release();
+      this.started = null;
       return error === "permission" || error === "unsupported" ? error : "failed";
     });
     return this.started;
@@ -94,7 +97,7 @@ export class ComputerSound {
     const link = await this.link();
     this.checkLive();
     if (!link) throw new Error("no native engine");
-    await this.context.audioWorklet.addModule(worklet);
+    await (this.module ??= this.context.audioWorklet.addModule(worklet).catch((error: unknown) => { this.module = null; throw error; }));
     this.checkLive();
     const node = new AudioWorkletNode(this.context, "gwar-share-sound", { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
     // Never `context.destination`: the sound must not play here as well.
@@ -153,18 +156,25 @@ export class ComputerSound {
     return null;
   }
 
-  stop(): void {
-    if (this.stopped) return;
-    this.stopped = true;
-    const { capture, unsilence } = this;
+  /** Ends whatever capture there is. The context stays for a next try. */
+  private release(): void {
+    const { capture, unsilence, node } = this;
     this.capture = null;
     this.unsilence = null;
+    this.node = null;
     // The webview stays silent until the shell has really stopped listening to it.
     const shut = capture ? capture.link.api.invoke("share_capture_stop", { owner: capture.link.owner, id: capture.id }).catch(() => {}) : Promise.resolve();
     void shut.finally(() => unsilence?.());
     this.track?.stop();
-    this.node?.disconnect();
-    this.node?.port.close();
+    this.track = null;
+    node?.disconnect();
+    node?.port.close();
+  }
+
+  stop(): void {
+    if (this.stopped) return;
+    this.stopped = true;
+    this.release();
     void this.context.close().catch(() => {});
   }
 }
