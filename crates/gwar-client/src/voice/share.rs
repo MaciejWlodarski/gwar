@@ -614,6 +614,7 @@ pub struct CaptureQueue {
     samples: Mutex<CaptureState>,
     ready: tokio::sync::Notify,
     closed: AtomicBool,
+    ended_by_system: AtomicBool,
 }
 
 #[derive(Default)]
@@ -624,7 +625,12 @@ struct CaptureState {
 
 impl Default for CaptureQueue {
     fn default() -> Self {
-        Self { samples: Mutex::default(), ready: tokio::sync::Notify::new(), closed: AtomicBool::new(false) }
+        Self {
+            samples: Mutex::default(),
+            ready: tokio::sync::Notify::new(),
+            closed: AtomicBool::new(false),
+            ended_by_system: AtomicBool::new(false),
+        }
     }
 }
 
@@ -652,6 +658,17 @@ impl CaptureQueue {
 
     pub fn is_closed(&self) -> bool {
         self.closed.load(Ordering::SeqCst)
+    }
+
+    /// The OS ended this capture, as when the sharer stops it from the menu bar. That takes the
+    /// consent with it: unlike [`Self::close`], nothing may bring this one back on its own.
+    pub fn end_by_system(&self) {
+        self.ended_by_system.store(true, Ordering::SeqCst);
+        self.close();
+    }
+
+    pub fn was_ended_by_system(&self) -> bool {
+        self.ended_by_system.load(Ordering::SeqCst)
     }
 
     /// Stereo frames lost to a stalled reader.

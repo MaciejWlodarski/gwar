@@ -56,7 +56,7 @@ define_class!(
         #[unsafe(method(stream:didStopWithError:))]
         unsafe fn stopped(&self, _stream: &SCStream, error: &NSError) {
             tracing::warn!("share sound stopped: {error}");
-            self.ivars().queue.close();
+            self.ivars().queue.end_by_system();
         }
     }
 );

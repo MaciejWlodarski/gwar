@@ -275,7 +275,12 @@ pub fn start(queue: Arc<CaptureQueue>) -> Result<Box<dyn Send>, Refusal> {
             if let Err(error) = capture(&queue, &flag, stop_event, opened) {
                 tracing::warn!("share sound stopped: {error}");
             }
-            queue.close();
+            // Gwar's own stop can still come back; an ending it did not ask for cannot.
+            if flag.load(Ordering::Relaxed) {
+                queue.close();
+            } else {
+                queue.end_by_system();
+            }
             if joined {
                 // SAFETY: this thread initialized COM above.
                 unsafe { CoUninitialize() };

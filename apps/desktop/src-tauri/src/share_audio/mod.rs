@@ -85,11 +85,20 @@ struct Running {
 }
 
 /// A capture that lost its reader. It holds nothing of the OS, only the share's consent: stopping
-/// the share, a newer start and a lost webview all clear it, and then nothing can resume.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// the share, a newer start and a lost webview all clear it, and then nothing can resume. The old
+/// queue is how an OS ending reaches it, however late: that takes the consent away too.
 struct Paused {
     id: u64,
     owner: u64,
+    queue: Arc<CaptureQueue>,
+}
+
+impl CaptureState {
+    /// Whether capture `id` is paused and can still come back. One the OS ended no longer is.
+    fn paused(&mut self, id: u64) -> bool {
+        self.paused.take_if(|paused| paused.id == id && paused.queue.was_ended_by_system());
+        self.paused.as_ref().is_some_and(|paused| paused.id == id)
+    }
 }
 
 /// What a reader finds under an id.
@@ -140,7 +149,7 @@ impl ShareCapture {
     /// consent stays until the capture's commit, so a refused try can be repeated.
     fn resume(&self, id: u64, owner: u64) -> Result<Arc<CaptureQueue>, String> {
         let mut state = self.lock();
-        if state.paused != Some(Paused { id, owner }) || state.starting.is_some() {
+        if !state.paused(id) || state.paused.as_ref().is_some_and(|p| p.owner != owner) || state.starting.is_some() {
             return Err("closed".into());
         }
         state.starting = Some(id);
@@ -158,7 +167,12 @@ impl ShareCapture {
         current: impl FnOnce() -> Result<(), String>,
     ) -> Result<(), String> {
         let mut state = self.lock();
-        let allowed = if state.starting == Some(id) { current() } else { Err("superseded".into()) };
+        let ended = state.paused.as_ref().is_some_and(|paused| paused.id == id) && !state.paused(id);
+        let allowed = match state.starting == Some(id) {
+            true if ended => Err("closed".into()),
+            true => current(),
+            false => Err("superseded".into()),
+        };
         if state.starting == Some(id) {
             state.starting = None;
         }
@@ -183,7 +197,7 @@ impl ShareCapture {
     /// What a reader of capture `id` gets. Reading is what keeps a capture alive.
     fn reader(&self, id: u64) -> Reading {
         let mut state = self.lock();
-        if state.paused.is_some_and(|paused| paused.id == id) {
+        if state.paused(id) {
             return Reading::Paused;
         }
         match state.running.as_mut().filter(|running| running.id == id) {
@@ -197,7 +211,7 @@ impl ShareCapture {
 
     /// Why a read of capture `id` found its queue closed: a pause, or the end of it.
     fn closed(&self, id: u64) -> &'static str {
-        if self.lock().paused.is_some_and(|paused| paused.id == id) {
+        if self.lock().paused(id) {
             return "paused";
         }
         self.stop(id);
@@ -234,10 +248,13 @@ impl ShareCapture {
         if now.saturating_duration_since(running.last_read) < READER_LEASE {
             return true;
         }
-        state.paused = Some(Paused { id, owner: running.owner });
+        // Ended by the OS, the consent went with it. A read that comes back hears that it is over.
+        if !running.queue.was_ended_by_system() {
+            tracing::info!("share sound paused: nothing is reading it");
+            state.paused = Some(Paused { id, owner: running.owner, queue: running.queue.clone() });
+        }
         let old = state.running.take();
         drop(state);
-        tracing::info!("share sound paused: nothing is reading it");
         Self::end(old);
         false
     }
@@ -708,9 +725,56 @@ mod tests {
     fn an_os_ending_stays_an_ending() {
         let capture = ShareCapture::default();
         let queue = running(&capture, 5);
-        queue.close();
+        queue.end_by_system();
         assert_eq!(capture.closed(5), "closed");
         assert!(capture.resume(5, OWNER).is_err());
+    }
+
+    /// Stopped from the menu bar while the renderer hangs: reads coming back must not undo it.
+    #[test]
+    fn an_os_ending_before_the_stall_cannot_be_resumed() {
+        let capture = ShareCapture::default();
+        let queue = running(&capture, 5);
+        queue.end_by_system();
+        assert!(!stalled(&capture, 5));
+        assert!(matches!(capture.reader(5), Reading::Over), "the reader hears it ended");
+        assert_eq!(capture.closed(5), "closed");
+        assert!(capture.resume(5, OWNER).is_err());
+    }
+
+    /// The OS stream outlives the pause by a moment, until `running` has dropped.
+    #[test]
+    fn an_os_ending_during_the_pause_cannot_be_resumed() {
+        let capture = ShareCapture::default();
+        let queue = running(&capture, 5);
+        assert!(!stalled(&capture, 5));
+        queue.end_by_system();
+        assert!(matches!(capture.reader(5), Reading::Over), "no paused answer asks for a resume");
+        assert_eq!(capture.closed(5), "closed");
+        assert!(capture.resume(5, OWNER).is_err());
+    }
+
+    #[test]
+    fn an_os_ending_during_a_resume_cannot_be_committed() {
+        let capture = ShareCapture::default();
+        let queue = running(&capture, 5);
+        assert!(!stalled(&capture, 5));
+        let back = capture.resume(5, OWNER).unwrap();
+        queue.end_by_system();
+        let reopened = capture.commit(5, OWNER, back.clone(), Box::new(()), || Ok(()));
+        assert!(reopened.is_err());
+        assert!(back.is_closed(), "the stream it opened stops again");
+        assert!(capture.lock().running.is_none());
+        assert!(capture.resume(5, OWNER).is_err(), "and there is no second try");
+    }
+
+    #[test]
+    fn gwars_own_stop_stays_resumable() {
+        let capture = ShareCapture::default();
+        let queue = running(&capture, 5);
+        assert!(!stalled(&capture, 5));
+        assert!(queue.is_closed() && !queue.was_ended_by_system());
+        assert!(capture.resume(5, OWNER).is_ok());
     }
 
     #[test]
