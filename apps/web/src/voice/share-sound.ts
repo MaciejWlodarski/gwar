@@ -64,16 +64,25 @@ export class ComputerSound {
     return this.started;
   }
 
+  /** After every wait of `open`: a stop may have come, and the closed context does not say so. */
+  private checkLive(): void {
+    if (this.stopped) throw new Error("stopped while starting");
+  }
+
   private async open(): Promise<MediaStreamTrack> {
     const link = await this.link();
+    this.checkLive();
     if (!link) throw new Error("no native engine");
     await this.context.audioWorklet.addModule(worklet);
+    this.checkLive();
     const node = new AudioWorkletNode(this.context, "gwar-share-sound", { numberOfInputs: 0, numberOfOutputs: 1, outputChannelCount: [2] });
     // Never `context.destination`: the sound must not play here as well.
     const destination = this.context.createMediaStreamDestination();
     destination.channelCount = 2;
     node.connect(destination);
     this.node = node;
+    // Before the capture exists: anything playing here now would be in its first samples.
+    if (/Macintosh|Mac OS X/.test(navigator.userAgent)) this.unsilence = silenceWebviewMedia();
     const id = nextCapture();
     // Registered first: a stop racing a slow start must reach the shell after it.
     this.capture = { link, id };
@@ -81,11 +90,10 @@ export class ComputerSound {
     const late = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("capture start timed out")), START_TIMEOUT_MS); });
     try { await Promise.race([link.api.invoke("share_capture_start", { owner: link.owner, id }), late]); }
     finally { clearTimeout(timer); }
-    if (this.stopped) throw new Error("stopped while starting");
+    this.checkLive();
     const track = destination.stream.getAudioTracks()[0];
     if (!track) throw new Error("no sound track");
     this.track = track;
-    if (/Macintosh|Mac OS X/.test(navigator.userAgent)) this.unsilence = silenceWebviewMedia();
     void this.pump(link, id, node.port);
     return track;
   }
@@ -106,10 +114,12 @@ export class ComputerSound {
   stop(): void {
     if (this.stopped) return;
     this.stopped = true;
-    if (this.capture) void this.capture.link.api.invoke("share_capture_stop", { owner: this.capture.link.owner, id: this.capture.id }).catch(() => {});
+    const { capture, unsilence } = this;
     this.capture = null;
-    this.unsilence?.();
     this.unsilence = null;
+    // The webview stays silent until the shell has really stopped listening to it.
+    const shut = capture ? capture.link.api.invoke("share_capture_stop", { owner: capture.link.owner, id: capture.id }).catch(() => {}) : Promise.resolve();
+    void shut.finally(() => unsilence?.());
     this.track?.stop();
     this.node?.disconnect();
     this.node?.port.close();
@@ -168,7 +178,10 @@ export class ShareSoundReceiver {
   private closed = false;
   /** Slots still asked for, so a close overtaking an open is not undone by it. */
   private readonly wanted = new Set<number>();
-  /** Open, close and volume reach the shell in the order they were asked. */
+  /**
+   * Open, close and volume reach the shell in the order they were asked. Between receivers nothing
+   * is ordered: each command names its run, and the shell ignores runs older than the slot's newest.
+   */
   private controls: Promise<unknown> = Promise.resolve();
 
   constructor(private readonly link: ShareSoundLink, private readonly run: number, create: () => Worker = createWorker) {
@@ -205,27 +218,26 @@ export class ShareSoundReceiver {
   async openSlot(slot: number, gain: number): Promise<boolean> {
     if (this.closed) return false;
     this.wanted.add(slot);
-    const playing = await this.control<boolean>("share_playback_open", { run: this.run, slot });
-    await this.control("share_playback_gain", { slot, gain });
-    if (this.closed || !this.wanted.has(slot)) return false;
+    const playing = await this.control<boolean>("share_playback_open", { run: this.run, slot, gain });
+    if (!playing || this.closed || !this.wanted.has(slot)) return false;
     this.open.add(slot);
-    return playing;
+    return true;
   }
 
   closeSlot(slot: number): void {
     this.open.delete(slot);
     this.wanted.delete(slot);
     this.pending = this.pending.filter(frame => frame.slot !== slot);
-    if (!this.closed) void this.control("share_playback_close", { slot }).catch(() => {});
+    if (!this.closed) void this.control("share_playback_close", { run: this.run, slot }).catch(() => {});
   }
 
   setGain(slot: number, gain: number): void {
-    if (!this.closed) void this.control("share_playback_gain", { slot, gain }).catch(() => {});
+    if (!this.closed) void this.control("share_playback_gain", { run: this.run, slot, gain }).catch(() => {});
   }
 
   close(): void {
     if (this.closed) return;
-    for (const slot of this.open) this.closeSlot(slot);
+    for (const slot of new Set([...this.open, ...this.wanted])) this.closeSlot(slot);
     this.closed = true;
     this.pending = [];
     this.worker.terminate();

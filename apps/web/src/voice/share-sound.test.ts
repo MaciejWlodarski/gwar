@@ -1,9 +1,10 @@
+// @vitest-environment happy-dom
 import { afterEach, expect, it, vi } from "vitest";
-import { encodeShareFrames, ShareSoundReceiver, type ShareSoundLink } from "./share-sound";
+import { ComputerSound, encodeShareFrames, ShareSoundReceiver, type ShareSoundLink } from "./share-sound";
 import type { ShareSoundFrame } from "./share-sound-worker";
 
 vi.mock("./share-sound-worklet.ts?worker&url", () => ({ default: "worklet.js" }));
-afterEach(() => { vi.unstubAllGlobals(); vi.resetModules(); });
+afterEach(() => { vi.unstubAllGlobals(); vi.restoreAllMocks(); vi.resetModules(); });
 
 function fakeWorker() {
   const worker = { onmessage: null as ((event: { data: ShareSoundFrame }) => void) | null, terminate: vi.fn() };
@@ -45,9 +46,8 @@ it("sends nothing for a slot that is not open, and its volume before its first f
   expect(frames()).toHaveLength(0);
   expect(await receiver.openSlot(1, 0)).toBe(true);
   deliver(frame(1));
-  expect(calls.map(c => c.command)).toEqual(["share_playback_open", "share_playback_gain", "share_playback_frames"]);
-  expect(calls[0]!.args).toEqual({ owner: 7, run: 3, slot: 1 });
-  expect(calls[1]!.args).toEqual({ owner: 7, slot: 1, gain: 0 });
+  expect(calls.map(c => c.command)).toEqual(["share_playback_open", "share_playback_frames"]);
+  expect(calls[0]!.args).toEqual({ owner: 7, run: 3, slot: 1, gain: 0 });
 });
 
 it("keeps one batch in flight and a bounded backlog behind a stalled shell", async () => {
@@ -146,4 +146,136 @@ it("gives up on a capture that hangs: sound never holds the picture back", async
     await expect(started).resolves.toBe("failed");
     expect(invoke.mock.calls.some(([command]) => command === "share_capture_stop")).toBe(true);
   } finally { vi.useRealTimers(); }
+});
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+/** What `ComputerSound` needs of Web Audio, with each slow step under the test's control. */
+function audioStage() {
+  const worklet = deferred<void>();
+  const made = { nodes: 0 };
+  class FakeContext {
+    audioWorklet = { addModule: () => worklet.promise };
+    resume = async () => {};
+    close = async () => {};
+    createMediaStreamDestination() { return { channelCount: 0, stream: { getAudioTracks: () => [{ stop: vi.fn() }] } }; }
+  }
+  class FakeNode {
+    constructor() { made.nodes++; }
+    connect = vi.fn();
+    disconnect = vi.fn();
+    port = { postMessage: vi.fn(), close: vi.fn() };
+  }
+  vi.stubGlobal("AudioContext", FakeContext);
+  vi.stubGlobal("AudioWorkletNode", FakeNode);
+  return { worklet, made };
+}
+
+function shell(handle: (command: string) => Promise<unknown> = async () => undefined) {
+  const calls: string[] = [];
+  const invoke = vi.fn(async (command: string) => {
+    calls.push(command);
+    if (command === "share_capture_read") return new Promise(() => {});
+    return handle(command);
+  });
+  return { calls, link: { api: { invoke, listen: vi.fn() }, owner: 7 } as unknown as ShareSoundLink };
+}
+
+const onMac = () => vi.spyOn(navigator, "userAgent", "get").mockReturnValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)");
+
+it("never starts capture after a stop during the worklet's load", async () => {
+  const { worklet, made } = audioStage();
+  const { calls, link } = shell();
+  const sound = new ComputerSound(async () => link, vi.fn());
+  const started = sound.start();
+  await new Promise(resolve => setTimeout(resolve));
+  sound.stop();
+  worklet.resolve();
+  expect(typeof await started).toBe("string");
+  expect(calls).not.toContain("share_capture_start");
+  expect(made.nodes).toBe(0);
+});
+
+it("never starts capture after a stop while the engine is awaited", async () => {
+  const { worklet } = audioStage();
+  worklet.resolve();
+  const { calls, link } = shell();
+  const engine = deferred<ShareSoundLink>();
+  const sound = new ComputerSound(() => engine.promise, vi.fn());
+  const started = sound.start();
+  sound.stop();
+  engine.resolve(link);
+  expect(typeof await started).toBe("string");
+  expect(calls).not.toContain("share_capture_start");
+});
+
+it("mutes the webview before capture starts and until the shell has stopped it", async () => {
+  onMac();
+  const { worklet } = audioStage();
+  worklet.resolve();
+  const audio = document.body.appendChild(document.createElement("audio"));
+  const stopping = deferred<void>();
+  const mutedAt: Record<string, boolean> = {};
+  const { link } = shell(async command => {
+    mutedAt[command] = audio.muted;
+    if (command === "share_capture_stop") await stopping.promise;
+  });
+  const sound = new ComputerSound(async () => link, vi.fn());
+  await sound.start();
+  expect(mutedAt.share_capture_start).toBe(true);
+  sound.stop();
+  await vi.waitFor(() => expect(mutedAt.share_capture_stop).toBe(true));
+  await new Promise(resolve => setTimeout(resolve));
+  expect(audio.muted).toBe(true);
+  stopping.resolve();
+  await vi.waitFor(() => expect(audio.muted).toBe(false));
+  audio.remove();
+});
+
+it("gives the webview its sound back when capture could not start", async () => {
+  onMac();
+  const { worklet } = audioStage();
+  worklet.resolve();
+  const audio = document.body.appendChild(document.createElement("audio"));
+  const { link } = shell(async command => { if (command === "share_capture_start") throw "permission"; });
+  expect(await new ComputerSound(async () => link, vi.fn()).start()).toBe("permission");
+  await vi.waitFor(() => expect(audio.muted).toBe(false));
+  audio.remove();
+});
+
+it("tells the shell which run each slot command belongs to", async () => {
+  const { calls, link } = bridge();
+  const receiver = new ShareSoundReceiver(link, 3, fakeWorker().create);
+  await receiver.openSlot(1, 0.5);
+  receiver.setGain(1, 0.25);
+  receiver.closeSlot(1);
+  await vi.waitFor(() => expect(calls).toHaveLength(3));
+  expect(calls).toEqual([
+    { command: "share_playback_open", args: { owner: 7, run: 3, slot: 1, gain: 0.5 } },
+    { command: "share_playback_gain", args: { owner: 7, run: 3, slot: 1, gain: 0.25 } },
+    { command: "share_playback_close", args: { owner: 7, run: 3, slot: 1 } },
+  ]);
+});
+
+it("forwards nothing for a slot the shell refused", async () => {
+  const { link, frames, calls } = bridge();
+  (link.api.invoke as ReturnType<typeof vi.fn>).mockImplementationOnce(async (command: string, args?: unknown) => { calls.push({ command, args }); return false; });
+  const { create, deliver } = fakeWorker();
+  const receiver = new ShareSoundReceiver(link, 3, create);
+  expect(await receiver.openSlot(1, 1)).toBe(false);
+  deliver(frame(1));
+  expect(frames()).toHaveLength(0);
+});
+
+it("closes a slot that was still opening when the transport closed", async () => {
+  const { calls, link } = bridge();
+  const receiver = new ShareSoundReceiver(link, 3, fakeWorker().create);
+  const opening = receiver.openSlot(2, 1);
+  receiver.close();
+  expect(await opening).toBe(false);
+  await vi.waitFor(() => expect(calls.map(c => c.command)).toContain("share_playback_close"));
 });

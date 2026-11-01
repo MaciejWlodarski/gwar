@@ -264,6 +264,25 @@ async function shareAndWatch(sharer, viewer) {
 /** Beside two voices its share of the energy is small, but without it the tone measures under 0.001. */
 const shareHeard = async viewer => (await viewer.native.request("snapshot", { frequency: 997 })).tone > 0.005;
 
+/**
+ * Whether share sound keeps flowing, not just whether it is there now: what the mixer did over
+ * `ms`, and the longest stretch in which no frame was decoded.
+ */
+async function shareContinuity(viewer, ms) {
+  const first = await viewer.native.request("share_stats", {});
+  const started = Date.now();
+  let last = first, progress = started, longestGapMs = 0;
+  while (Date.now() - started < ms) {
+    await sleep(100);
+    const now = await viewer.native.request("share_stats", {});
+    if (now.decoded > last.decoded) progress = Date.now();
+    longestGapMs = Math.max(longestGapMs, Date.now() - progress);
+    last = now;
+  }
+  const delta = key => last[key] - first[key];
+  return { ms: Date.now() - started, frames: delta("frames"), decoded: delta("decoded"), concealed: delta("concealed"), late: delta("late"), backlog: delta("backlog"), inputDrops: delta("input"), ringUnderruns: delta("underruns"), longestGapMs };
+}
+
 /** Native sender to native viewer, through the UI: consent, playback, controls, withdrawal. */
 async function computerSound(sharer, viewer, browserViewer) {
   const started = Date.now();
@@ -290,11 +309,13 @@ async function computerSound(sharer, viewer, browserViewer) {
   assert.equal(await viewer.page.locator("audio[data-share-audio]").count(), 0, "the desktop webview has no share player");
   await browserViewer.page.locator("audio[data-share-audio]").waitFor({ state: "attached", timeout: 15_000 });
   await waitFor(async () => (await hears(viewer, 770)) && (await hears(browserViewer, 770)), "voice beside share sound", 20_000);
-  const settled = await viewer.native.request("share_stats", {});
-  await sleep(10_000);
-  const after = await viewer.native.request("share_stats", {});
-  const rate = (after.frames - settled.frames) / 10;
+  const continuity = await shareContinuity(viewer, 10_000);
+  console.log(`share sound continuity: ${JSON.stringify(continuity)}`);
+  const rate = continuity.frames / (continuity.ms / 1_000);
   assert.ok(rate > 45 && rate < 55, `viewer takes one Opus frame per 20 ms, got ${rate}/s`);
+  assert.ok(continuity.decoded >= 0.9 * continuity.frames, `the mixer decoded what arrived: ${JSON.stringify(continuity)}`);
+  assert.ok(continuity.concealed <= 0.1 * continuity.frames, `sound was not patched over: ${JSON.stringify(continuity)}`);
+  assert.ok(continuity.longestGapMs <= 1_000, `no second of sound went missing: ${JSON.stringify(continuity)}`);
   // Not one instant: the fixture's JSON bridge delivers in bursts on a slow runner, between which the tone gaps.
   await waitFor(async () => (await shareHeard(viewer)) && (await hears(viewer, 770)), "ten seconds in, voice and share sound still play together", 10_000);
   await viewer.page.getByTestId("share-audio-controls").getByRole("button", { name: "Mute share sound" }).click();
@@ -312,7 +333,7 @@ async function computerSound(sharer, viewer, browserViewer) {
   await viewer.page.locator("video[data-share]").waitFor({ timeout: 5_000 });
   await page.getByRole("status", { name: "You are sharing your screen" }).getByRole("button", { name: "Stop sharing" }).click();
   await viewer.page.locator("video[data-share]").waitFor({ state: "detached", timeout: 15_000 });
-  return { ms: Date.now() - started, controlsAfterMs: controls, firstSoundMs: firstFrame, heardMs: heard, framesBeforeWatching: before.frames, stats: await viewer.native.request("share_stats", {}), framesPerSecond: rate };
+  return { ms: Date.now() - started, controlsAfterMs: controls, firstSoundMs: firstFrame, heardMs: heard, framesBeforeWatching: before.frames, continuity, stats: await viewer.native.request("share_stats", {}), framesPerSecond: rate };
 }
 
 async function run(engine, web, server, token) {

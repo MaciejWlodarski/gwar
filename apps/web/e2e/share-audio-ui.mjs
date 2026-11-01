@@ -84,14 +84,20 @@ try {
       }
       for (const state of ["ok", "failed", "stopped", "permission"]) {
         await page.goto(`${base}?lang=${lang}&computer=${state}`);
-        await page.getByTestId("share-audio-controls").waitFor();
+        await page.getByRole("status", { name: lang === "pl" ? "Udostępniasz ekran" : "You are sharing your screen" }).waitFor();
         await page.waitForFunction(() => document.querySelector("video[data-share]")?.readyState >= 2);
         assert.ok((await page.getByRole("status", { name: lang === "pl" ? "Udostępniasz ekran" : "You are sharing your screen" }).boundingBox()).height <= 46, "sharing banner stays one compact row");
+        assert.equal(await page.getByTestId("share-audio-controls").count(), 0, `${state}: a share without sound has no volume`);
         await shot(`live-${state}`);
         await page.getByRole("button", { name: lang === "pl" ? "Szczegóły" : "Details", exact: true }).click();
         await fits(`details ${state}`);
         await shot(`details-${state}`);
       }
+      // Watching somebody else's share with sound while my own has none: the volume is theirs.
+      await page.goto(`${base}?lang=${lang}&computer=failed&watchsound=1`);
+      await page.getByTestId("share-audio-controls").waitFor();
+      await page.waitForFunction(() => document.querySelector("video[data-share]")?.readyState >= 2);
+      await shot("watching-sound");
     }
   }
   writeFileSync(path.join(output, "fixture-layouts.json"), JSON.stringify(results, null, 2));

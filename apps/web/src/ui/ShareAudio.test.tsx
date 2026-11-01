@@ -103,7 +103,7 @@ const ownShare = (extra: object) => ({ phase: "choosing" as const, attempt: 1, s
 
 it.each([
   ["ok", "Share computer sound"],
-  ["permission", "needs Screen Recording"],
+  ["permission", "Screen & System Audio Recording"],
   ["unsupported", "needs macOS 14"],
 ] as const)("asks about computer sound honestly on the desktop app: %s", async (computerSound, text) => {
   vi.stubGlobal("IS_REACT_ACT_ENVIRONMENT", true);
@@ -170,4 +170,15 @@ it("shows the live guest link count and turn-off action without opening details"
     expect(host.querySelector('[data-testid="screen-viewers"]')?.textContent).toBe("2 watching");
     expect(host.querySelector('[data-testid="share-audio-status"]')?.getAttribute("aria-label")).toBe("Sound on");
   } finally { await act(async () => root.unmount()); host.remove(); }
+});
+
+it("names the macOS pane as System Settings does, and speaks of sound alike in both languages", async () => {
+  const [{ en }, { pl }] = await Promise.all([import("../i18n/en"), import("../i18n/pl")]);
+  for (const key of ["screen.permissionPlace.macos", "screen.computerSoundPermission"] as const) {
+    expect(en[key]).toContain("Privacy & Security → Screen & System Audio Recording");
+    expect(pl[key]).toContain("Prywatność i ochrona → Nagrywanie ekranu i dźwięku systemowego");
+  }
+  for (const words of [en, pl].flatMap(lang => [lang["screen.audioOn"], lang["screen.audioOff"], lang["screen.sharingAudio"]])) {
+    expect(words[0]).toBe(words[0]!.toUpperCase());
+  }
 });
