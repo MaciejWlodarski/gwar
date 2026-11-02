@@ -65,3 +65,22 @@ test('keeps persistent invalid or qualified results and leaked labels as failure
     assert.deepEqual(await settledVerificationState(page, { timeout: 50 }), { pending: 0, flags: 0, signatureValid: true });
   } finally { await page.close(); }
 });
+
+test('rejects a real warning immediately even if a later render clears it', async () => {
+  const page = await browser.newPage();
+  try {
+    for (const kind of ['invalid', 'unsigned', 'qualified']) {
+      await page.setContent(`<span data-testid="message-verification-${kind}" aria-label="Signature valid; device revoked">Warning</span>`);
+      const changing = {
+        evaluate: async (...args) => {
+          const observed = await page.evaluate(...args);
+          // Deterministic: the bad result was observed before the following render.
+          // Waiting for all flags to disappear would hide that result.
+          await page.locator('span').evaluateAll(marks => marks.forEach(mark => mark.remove()));
+          return observed;
+        },
+      };
+      assert.equal((await settledVerificationState(changing, { timeout: 1000 })).flags, 1);
+    }
+  } finally { await page.close(); }
+});
