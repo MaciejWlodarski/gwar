@@ -34,6 +34,8 @@ const SOUND_DEADBAND_MS = 25;
 const SOUND_STEP_MS = 10;
 const MAX_SOUND_WAIT_MS = 400;
 const MAX_STEP_MS = 40;
+/** Past the aim this far, sound nears the edge of the range. Short of it nobody hears a lag. */
+const START_WAIT_MS = 45;
 /**
  * The first seconds of a watch are its keyframes and its buffers settling, not its lip-sync, and
  * the engine's own sync gets there by itself: a wait raised in them only made the start later.
@@ -78,10 +80,12 @@ const clamp = (value: number, max = MAX_WAIT_MS) => Math.round(Math.min(max, Mat
  * that would then lag. Noise moves nothing, and sound is only made to wait for a clear lead. Past
  * that one move, whatever one side already waits is given back before the other waits more, and
  * both keep giving back while they agree: a browser's own sync pulls each side up to the other, so
- * a lag alone would never show that a wait is no longer needed.
+ * a lag alone would never show that a wait is no longer needed. A lag well inside the range starts
+ * no wait: it would add latency and move sound towards the edge it must not lead past.
  */
 export function nextWaits(waits: Waits, lag: number, first: boolean, shownPicture: number, soundWaits: boolean): Waits {
   const change = Math.min(MAX_STEP_MS, Math.abs(lag) * GAIN);
+  if (lag > 0 && lag < START_WAIT_MS && waits.picture === 0 && waits.sound === 0) return waits;
   if (first && (lag > 0 || waits.picture > 0)) return { ...waits, picture: clamp((waits.picture === 0 ? shownPicture : waits.picture) + lag) };
   if (lag >= 0 && waits.sound > 0) {
     return { ...waits, sound: clamp(waits.sound - Math.min(SOUND_STEP_MS, Math.max(SOUND_STEP_MS / 2, change)), MAX_SOUND_WAIT_MS) };

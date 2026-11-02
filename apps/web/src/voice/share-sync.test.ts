@@ -107,6 +107,13 @@ const at = (picture: number) => [1, { picture, sound: 0 }];
 const settle = async (sync: PictureSync, slots: SyncSlot[] = [slot]) => { for (let i = 0; i < SETTLING_LOOKS; i++) await sync.tick(slots); };
 
 describe("PictureSync", () => {
+  it("starts no wait for a lag inside the range, and keeps correcting one it has", () => {
+    expect(nextWaits({ picture: 0, sound: 0 }, 30, true, 40, true)).toEqual({ picture: 0, sound: 0 });
+    expect(nextWaits({ picture: 0, sound: 0 }, 30, false, 40, true)).toEqual({ picture: 0, sound: 0 });
+    expect(nextWaits({ picture: 0, sound: 0 }, 60, true, 40, true).picture).toBe(100);
+    expect(nextWaits({ picture: 60, sound: 0 }, 30, false, 40, true).picture).toBe(75);
+  });
+
   it("waits for nothing while a watch settles", async () => {
     const { sync, waits } = fixture(300);
     for (let look = 0; look < 8; look++) await sync.tick([slot]);
@@ -195,7 +202,7 @@ describe("PictureSync", () => {
     await look;
     expect(waits).toEqual([]);
     await sync.tick([slot]);
-    expect(link.association).toHaveBeenCalledTimes(4);
+    expect(link.association).toHaveBeenCalledTimes(SETTLING_LOOKS + 2);
     expect(waits).toEqual([]);
   });
 
@@ -207,7 +214,7 @@ describe("PictureSync", () => {
     const { sound: clock } = pair(80 + SOUND_AIM_MS);
     link.sound.mockImplementationOnce(() => new Promise(resolve => { sound = resolve; }));
     const look = sync.tick([slot]);
-    await vi.waitFor(() => expect(link.sound).toHaveBeenCalledTimes(4));
+    await vi.waitFor(() => expect(link.sound).toHaveBeenCalledTimes(SETTLING_LOOKS + 2));
     sync.release(1);
     expect(waits.at(-1)).toEqual(at(0));
     sound(clock);
@@ -273,7 +280,7 @@ describe("PictureSync", () => {
     await sync.tick([slot]);
     await sync.tick([{ ...slot, paused: true }]);
     expect(waits).toEqual([at(110)]);
-    expect(link.association).toHaveBeenCalledTimes(3);
+    expect(link.association).toHaveBeenCalledTimes(SETTLING_LOOKS + 1);
   });
 
   it("does nothing on a still picture or before sound has come", async () => {
@@ -306,7 +313,7 @@ describe("PictureSync", () => {
     await sync.tick([slot]);
     await settle(sync);
     await sync.tick([slot]);
-    expect(link.association).toHaveBeenCalledTimes(4);
+    expect(link.association).toHaveBeenCalledTimes(SETTLING_LOOKS + 2);
     expect(waits.at(-1)).toEqual(at(110));
   });
 
