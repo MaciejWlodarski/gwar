@@ -1,0 +1,76 @@
+name: denoise-idle-prebuild
+on:
+  push:
+    branches: ['diag/denoise-idle-prebuild']
+permissions:
+  contents: read
+  actions: read
+jobs:
+  readiness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        n: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1
+        with:
+          node-version: 22.23.3
+          cache: pnpm
+      - name: Existing pinned wasm artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh run download 41499299117 -n denoise-wasm -D crates/gwar-denoise-wasm/pkg
+          gh run download 41499299117 -n mls-wasm -D crates/gwar-mls-wasm/pkg
+      - run: pnpm install --frozen-lockfile
+      - run: bash scripts/ci/apt-install.sh --playwright chromium webkit firefox
+      - run: pnpm --filter web exec playwright install chromium webkit firefox
+      - name: Actual model bit identity, persistent handover and lifecycle regressions
+        run: nice -n 10 pnpm --filter web test src/voice/denoise src/voice/webrtc-engine.test.ts src/state/controller.test.ts
+      - name: Paired main and prebuild, cold/warm joins, main-thread tasks and original quality
+        env:
+          E2E_BROWSERS: chromium,webkit,firefox
+        run: |
+          sudo apt-get install -y pulseaudio
+          pulseaudio --start --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=e2e
+          pactl set-default-sink e2e
+          pactl set-default-source e2e.monitor
+          mkdir -p "$RUNNER_TEMP/readiness"
+          status=0
+          for variant in main pr pr main; do
+            ref=3e3cbdcec35ca34c369d17ac70ef376135c7475e
+            if [ "$variant" = pr ]; then ref=${{ github.sha }}; fi
+            git restore --source="$ref" -- apps/web/src
+            python3 scripts/ci/denoise-idle-instrument.py
+            nice -n 10 pnpm --filter web typecheck
+            echo "VARIANT $variant $ref"
+            for scenario in cold warm; do
+              echo "SCENARIO $scenario"
+              set +e
+              E2E_DENOISE_CASE="$scenario" nice -n 10 pnpm --filter web exec node e2e/denoise-join.mjs 2>&1 | tee -a "$RUNNER_TEMP/readiness/$variant-$scenario.log"
+              code=${PIPESTATUS[0]}
+              set -e
+              echo "EXIT $variant $scenario $code"
+              if [ "$code" -ne 0 ]; then status=1; fi
+            done
+            echo "SCENARIO quality"
+            set +e
+            nice -n 10 pnpm --filter web exec node e2e/denoise.mjs 2>&1 | tee -a "$RUNNER_TEMP/readiness/$variant-quality.log"
+            code=${PIPESTATUS[0]}
+            set -e
+            echo "EXIT $variant quality $code"
+            if [ "$code" -ne 0 ]; then status=1; fi
+          done
+          exit "$status"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: ${{ !cancelled() }}
+        with:
+          name: denoise-idle-prebuild-${{ matrix.n }}
+          path: ${{ runner.temp }}/readiness
