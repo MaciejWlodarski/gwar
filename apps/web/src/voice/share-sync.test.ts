@@ -121,7 +121,8 @@ describe("PictureSync", () => {
   });
 
   it("moves the whole way once after a break has settled, then gently again", async () => {
-    const { waits, sync, link } = fixture(30);
+    const { waits, sync, link } = fixture(50);
+    link.shown.mockResolvedValue(10);
     await settle(sync);
     await sync.tick([slot]);
     const { sound, picture } = pair(300 + SOUND_AIM_MS);
@@ -140,9 +141,13 @@ describe("PictureSync", () => {
   });
 
   it("keeps its one move after a break for the gap that opens when the sound lands", async () => {
-    const { waits, sync, link } = fixture(20);
+    const { waits, sync, link } = fixture(50);
+    link.shown.mockResolvedValue(0);
     await settle(sync);
     await sync.tick([slot]);
+    const small = pair(20 + SOUND_AIM_MS);
+    link.sound.mockResolvedValue(small.sound);
+    link.picture.mockReturnValue(small.picture);
     sync.linkBack(1);
     await sync.tick([slot]);
     await sync.tick([slot]);
