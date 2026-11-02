@@ -27,15 +27,19 @@ export class PipelinePool {
   private entries = new Set<Entry>();
   private cancelIdle: (() => void) | null = null;
   private failure: string | null = null;
+  private attempted = false;
+  private preparationError: string | null = null;
 
   constructor(private create: (events: DenoiseEvents, signal: AbortSignal) => Promise<PreparedDenoise>, private schedule = idle, private unusable = () => {}) {}
 
   configure(enabled: boolean, online: boolean): void {
     const left = this.online && !online;
+    const entered = !this.online && online;
     this.enabled = enabled; this.online = online;
     if (!enabled || !online) { this.cancelIdle?.(); this.cancelIdle = null; }
-    if (!enabled || left) { this.dispose(); this.failure = null; }
-    if (enabled && online && !this.failure && !this.spare && this.entries.size === 0 && !this.cancelIdle && import.meta.env.MODE !== "desktop" && typeof AudioWorkletNode !== "undefined") {
+    if (!enabled || left) { this.dispose(); this.failure = null; this.preparationError = null; }
+    if (!enabled || left || entered) this.attempted = false;
+    if (enabled && online && !this.attempted && !this.failure && !this.spare && this.entries.size === 0 && !this.cancelIdle && import.meta.env.MODE !== "desktop" && typeof AudioWorkletNode !== "undefined") {
       this.cancelIdle = this.schedule(() => {
         this.cancelIdle = null;
         if (this.enabled && this.online && !this.spare && this.entries.size === 0) this.spare = this.make();
@@ -44,7 +48,7 @@ export class PipelinePool {
   }
 
   status() {
-    return { state: this.spare ? (this.spare.clearing ? "clearing" : this.spare.ready ? "ready" : "preparing") : this.cancelIdle ? "scheduled" : this.entries.size ? "active" : "empty", pipelines: this.entries.size, idleRunning: this.spare?.raw?.running ?? false, error: this.failure };
+    return { state: this.spare ? (this.spare.clearing ? "clearing" : this.spare.ready ? "ready" : "preparing") : this.cancelIdle ? "scheduled" : this.entries.size ? "active" : "empty", pipelines: this.entries.size, idleRunning: this.spare?.raw?.running ?? false, error: this.failure, preparationError: this.preparationError };
   }
 
   private destroy(entry: Entry): void {
@@ -57,6 +61,7 @@ export class PipelinePool {
   }
 
   private make(): Entry {
+    this.attempted = true; this.preparationError = null;
     const entry: Entry = { active: true, ready: false, clearing: false, abort: new AbortController(), raw: null, promise: null!, events: null, stopTrack: null };
     this.entries.add(entry);
     entry.promise = Promise.resolve().then(() => this.create({
@@ -77,7 +82,9 @@ export class PipelinePool {
       return raw;
     });
     void entry.promise.catch(error => {
-      if (entry.active && String(error).includes("too slow:")) { this.failure = String(error); this.unusable(); }
+      if (entry.active) this.preparationError = String(error);
+      // Login can briefly be busy. An idle failure must not permanently disable a later call.
+      if (entry.active && entry.events && String(error).includes("too slow:")) { this.failure = String(error); this.unusable(); }
       this.destroy(entry);
     });
     return entry;

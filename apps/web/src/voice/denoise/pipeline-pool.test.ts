@@ -40,7 +40,7 @@ describe("one prepared suppression pipeline", () => {
     expect(create).not.toHaveBeenCalled();
     pool.configure(true, true); pool.configure(true, true); await idle();
     expect(create).toHaveBeenCalledOnce();
-    expect(pool.status()).toEqual({ state: "ready", pipelines: 1, idleRunning: false, error: null });
+    expect(pool.status()).toEqual({ state: "ready", pipelines: 1, idleRunning: false, error: null, preparationError: null });
     expect(raws[0]!.park).toHaveBeenCalledOnce();
     expect(raws[0]!.track.enabled).toBe(false);
   });
@@ -134,5 +134,17 @@ describe("one prepared suppression pipeline", () => {
     await expect(pending).rejects.toThrow("released");
     waking.resolve(); await flush();
     expect(raws[0]!.outputs).toHaveLength(0);
+  });
+
+  it("does not retry a busy idle warm-up repeatedly or poison the next explicit call", async () => {
+    create.mockRejectedValueOnce(new Error("too slow: 6.0 ms a frame"));
+    pool.configure(true, true); await idle();
+    expect(pool.status().error).toBeNull();
+    expect(pool.status().preparationError).toContain("too slow");
+    pool.configure(true, true); await idle();
+    expect(create).toHaveBeenCalledOnce();
+    const retried = await acquire();
+    expect(create).toHaveBeenCalledTimes(2);
+    retried.close();
   });
 });
