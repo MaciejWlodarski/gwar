@@ -7,3 +7,5 @@ export function verificationState(page) {
       !['SCRIPT', 'STYLE'].includes(element.tagName) && element.textContent?.replace(/\s+/g, ' ').trim() === 'Signature valid'),
   }));
 }
+
+export function settledVerificationState(page) { return verificationState(page); }

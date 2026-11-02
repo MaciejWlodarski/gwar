@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { after, before, test } from 'node:test';
 import { chromium } from 'playwright';
-import { verificationState } from './verification-state.mjs';
+import { verificationState, settledVerificationState } from './verification-state.mjs';
 let browser;
 before(async () => { browser = await chromium.launch({ args: ['--disable-audio-output'] }); });
 after(async () => { await browser?.close(); });
@@ -41,5 +41,27 @@ test('retains pending and real invalid indicators in their actual states', async
     assert.deepEqual(await verificationState(page), { pending: 0, flags: 1, signatureValid: false });
     await page.setContent('<span>Signature valid</span>');
     assert.deepEqual(await verificationState(page), { pending: 0, flags: 0, signatureValid: true });
+  } finally { await page.close(); }
+});
+
+test('waits for a lifecycle read after the signature check has completed', async () => {
+  const page = await browser.newPage();
+  try {
+    await page.setContent('<span data-testid="message-verification-qualified">Channel history has not been read yet</span>');
+    await page.evaluate(() => {
+      setTimeout(() => { document.body.innerHTML = 'Verified messages'; }, 160);
+    });
+    assert.deepEqual(await settledVerificationState(page, { timeout: 5000 }), { pending: 0, flags: 0, signatureValid: false });
+  } finally { await page.close(); }
+});
+test('keeps persistent invalid or qualified results and leaked labels as failures', async () => {
+  const page = await browser.newPage();
+  try {
+    for (const kind of ['invalid', 'qualified']) {
+      await page.setContent(`<span data-testid="message-verification-${kind}">Warning</span>`);
+      assert.deepEqual(await settledVerificationState(page, { timeout: 50 }), { pending: 0, flags: 1, signatureValid: false });
+    }
+    await page.setContent('<span>Signature valid</span>');
+    assert.deepEqual(await settledVerificationState(page, { timeout: 50 }), { pending: 0, flags: 0, signatureValid: true });
   } finally { await page.close(); }
 });
