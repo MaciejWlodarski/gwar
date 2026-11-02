@@ -1365,6 +1365,26 @@ impl AudioProcessingImpl {
                 }
                 5 => c.filter.conservative_initial_phase = true,
                 6 => c.ep_strength.erle_onset_compensation_in_dominant_nearend = true,
+                7 => c.ep_strength.nearend_len = 0.0,
+                8 => {
+                    c.ep_strength.default_len = 0.80;
+                    c.ep_strength.nearend_len = 0.80;
+                }
+                9 => {
+                    c.ep_strength.default_len = 0.80;
+                    c.ep_strength.nearend_len = 0.0;
+                }
+                10 => c.ep_strength.nearend_len = 0.75,
+                11 => c.ep_strength.nearend_len = 0.76,
+                12 | 13 => {
+                    c.ep_strength.nearend_len = 0.0;
+                    c.suppressor.dominant_nearend_detection.enr_threshold =
+                        if ec.measurement_native_profile == 12 {
+                            0.05
+                        } else {
+                            0.01
+                        };
+                }
                 _ => {}
             }
         }

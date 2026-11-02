@@ -1025,9 +1025,13 @@ and the app.
 regression under investigation. `apps/web/src/state/settings.ts` defaults to
 `noiseStrength: 100`, noise suppression on, echo cancellation on and automatic
 gain control on. The model is unchanged. Route floors are lower priority until
-this regression is resolved. `recorded_speech_is_not_held_after_stereo` now checks
+this regression is resolved. No measured native variant passes both full speech
+and echo acceptance. `recorded_speech_is_not_held_after_stereo` now checks
 warm against cold across both leads, both routes and all three denoising levels;
-no failing-first acceptance is removed.
+no failing-first acceptance is removed. The acceptance rerun reproduces the same
+12 held/kept pairs exactly; the two speaker/full-denoise cases fail. Its process
+was paused for another worker, so its elapsed duration is not a timing result.
+[Full failing-first output](measurements/aec-speech-acceptance.txt).
 
 #### Native AEC wiring defect and measurement scope
 
@@ -1102,7 +1106,7 @@ at half-second intervals. Native resets currently execute only in isolated tests
 any selected production reset must be prepared on the worker to preserve the
 voice-thread heap bound.
 
-#### Recorded-speech matrix: preliminary gate
+#### Recorded-speech matrix and full echo rejection
 
 Native profile 1 disables only the conservative tail-frequency-response envelope;
 it keeps the estimated reverb model and decay. Profile 2 sets the native default
@@ -1126,12 +1130,114 @@ native two-reference variants fail the speech matrix, including headphones, and
 are not selected. The cold two-reference arm also exceeds the preliminary echo
 bound by 5.02 dB in one first window.
 
-These are preliminary gates. The full #220 echo tables, including broad/wide,
-antiphase, steady holds, delays and levels, are being measured before selecting
-any production change. All observations are preserved in
+The full paired #220 echo tables reject both apparent winners. They cover the
+original mono and wide/same/new/antiphase/steady/speaker cases, delays, levels and
+pin times. Each run compares the candidate directly with the unchanged warm
+control before rounding; every room/window must be no more than 1 dB louder.
+There are 549 paired observations per profile (396 from the mono table, including
+repeated pure-echo controls for both near-talker pitches, and 153 from the wide
+table). These are not 549 independent rooms.
+
+| Native profile | Speech gate, 12 cases | Echo observations > +1 dB | Worst echo delta | Current warm / candidate dBFS at the worst window |
+| --- | --- | --- | --- | --- |
+| 1: disable conservative tail envelope | Pass | 12 / 549 | +13.498 | -59.328 / -45.830 |
+| 2: zero default and nearend decay | Pass | 47 / 549 | +14.951 | -59.328 / -44.377 |
+| 7: zero nearend decay only | Pass in the two default speaker/full-denoise screens; full speech matrix not run | 6 / 549 | +4.615 | -36.599 / -31.985 |
+| Plain cold, unchanged config | Speech baseline | 408 / 549 | +64.952 | -92.647 / -27.695 |
+
+Profiles 1 and 2 are worst in `wide both speakers`, pin 310 s, 0.5-1 s after
+pinning. Profile 7 is worst in `wide steady`, pin 310 s, 0.25-0.5 s. Plain cold
+is worst in `wide same 190->190`, pin 310 s, 0.25-0.5 s. Plain cold therefore
+also fails the requested +1 dB echo bound; reverting warm takeover is an owner
+trade-off, not an accepted fix under that bound.
+
+A zero decay config does not clear an existing reverb-power accumulator:
+`ReverbModel::update_reverb` skips updating it when decay is zero, matching
+[upstream WebRTC](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_processing/aec3/reverb_model.cc).
+Thus profile 7 freezes the stored tail during dominant nearend; it does not simply
+multiply the current residual by zero. Profile 2 starts with both decays zero and
+never builds that accumulator. Nearend-only mild decay 0.75/0.76 still holds
+421-510 active decoded speech frames at the two default speaker leads.
+Requiring stronger nearend evidence (ENR threshold 0.05 or 0.01 instead of 0.25)
+with nearend decay zero also fails both default speaker cases: 421-510 held frames,
+kept 0.048-0.098, below cold's 0.105/0.128. These stricter arms are rejected before
+spending a full echo-table run. [Strict-nearend screen](measurements/aec-strict-nearend.txt).
+Profile 9 (default decay 0.80, nearend decay zero) passes 11/12 speech cases but
+fails the strict kept floor on headphones, 6 s lead, full denoising: 0.7125541
+versus cold's 0.7134199, with 37 held frames in both. It is rejected without a full
+echo-table run, despite passing both default speaker screens and the preliminary
+quiet-echo check. [Full profile-9 matrix](measurements/aec-profile9-matrix.txt).
+Correct two-reference warm construction combined with fresh AEC state,
+fresh gain/ERLE, conservative initial adaptation, or nearend-only zero decay also
+fails the speech gate on held frames or kept signal. No tested variant is selected
+for production. The model remains unchanged.
+
+All observations are preserved in
 [aec-native-speech-matrix.csv](measurements/aec-native-speech-matrix.csv),
-[aec-native-speech-gate.txt](measurements/aec-native-speech-gate.txt) and
-[aec-native-reverb.txt](measurements/aec-native-reverb.txt).
+[aec-native-speech-gate.txt](measurements/aec-native-speech-gate.txt),
+[aec-native-reverb.txt](measurements/aec-native-reverb.txt),
+[aec-paired-echo-cases.csv](measurements/aec-paired-echo-cases.csv),
+[aec-paired-echo-profile1.txt](measurements/aec-paired-echo-profile1.txt),
+[aec-paired-echo-profile2.txt](measurements/aec-paired-echo-profile2.txt),
+[aec-paired-echo-profile7.txt](measurements/aec-paired-echo-profile7.txt),
+[aec-bounded-native.txt](measurements/aec-bounded-native.txt) and
+[aec-decay-budget.txt](measurements/aec-decay-budget.txt).
+
+#### Cold path and why a stereo-only adjustment cannot recover its start
+
+The same tail changes were measured on the cold path with default AGC. They
+improve model output after the stereo pin but do not repair the leading mono
+AEC's earlier attenuation. The hold counters below are active-input frames at
+AEC / automatic gate / manual gate / decoded Opus output, respectively.
+
+| Lead, full denoising | Native arm | Holds AEC / auto / manual / decoded | Kept |
+| --- | --- | --- | --- |
+| 6 s | Current cold | 62 / 49 / 114 / 136 | 0.105 |
+| 6 s | Cold, profile 1 | 62 / 49 / 112 / 80 | 0.123 |
+| 6 s | Cold, profile 2 | 62 / 49 / 53 / 80 | 0.378 |
+| 10 s | Current cold | 108 / 93 / 94 / 106 | 0.128 |
+| 10 s | Cold, profile 1 | 108 / 93 / 94 / 106 | 0.144 |
+| 10 s | Cold, profile 2 | 108 / 93 / 94 / 106 | 0.388 |
+
+These experiments apply the native profile only to the stereo stage. The early
+62/108 AEC holds and 49/93 automatic-gate holds occur before that stage and remain
+identical. No-AEC keeps about 0.797 with three decoded held frames. Resetting the
+stereo state alone cannot recover already discarded speech. The native
+linear-versus-suppressor observations show an additional nonlinear loss, followed
+by a much larger history-dependent model loss; a single native state variable has
+not been proved to explain the whole warm regression. The cold model is not a
+clean reference for speech preservation. [Cold diagnostic output](measurements/aec-cold-native.txt).
+
+#### Reproducing the priority-1 gates
+
+Run one process at a time, without audio devices. The first command is the
+failing-first acceptance for the unchanged production configuration. Diagnostic
+screens print observations and can pass as Rust tests while their printed gate
+is false; `native_paired_echo_gate` actually asserts the per-window echo bound.
+
+```sh
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib recorded_speech_is_not_held_after_stereo -- --ignored --nocapture --test-threads=1
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib native_speech_and_quiet_echo_gate -- --ignored --nocapture --test-threads=1
+GWAR_NATIVE_AEC_PROFILE=1 CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib native_paired_echo_gate -- --ignored --nocapture --test-threads=1
+```
+
+Use `GWAR_NATIVE_AEC_PROFILE=2` or `7` for the other fully measured echo arms.
+`GWAR_NATIVE_ARMS` selects comma-separated speech-matrix tags; 40/41 map to native
+profiles 1/2, 90 to profile 7, 95/96 to mild nearend decay 0.75/0.76, and 97/98 to
+the stronger nearend-evidence profiles. Native overrides remain test-only.
+
+#### Local validation of the native diagnostic checkpoint
+
+The release APM suite passes 54 active tests (32 ignored diagnostics), including
+the voice-thread heap and replacement guards. Both voice-alone fingerprints are
+bit-identical at `c2d868db7d8d0eeb`. Release workspace clippy with all targets
+(excluding the desktop package, as in the earlier native validation), `-D warnings`,
+format and diff checks pass. [Validation output](measurements/aec-native-validation.txt).
+The complete workspace run after wake is retained in the earlier checkpoint;
+it was not repeated for these diagnostic-only additions after acoustic acceptance
+failed. The failing-first speech acceptance and paired echo failures remain
+explicit blockers. Timing and route acceptance are not declared complete by
+these local checks.
 
 #### Main four-share control
 
@@ -1160,7 +1266,7 @@ loading web settings; its defaults are not proof of the user-facing noiseStrengt
 removal first. Mono-like suppressor tuning is rejected for production. Its optional
 measurement arm is available only through a dev-dependency feature. Stereo still
 pins on the first share sound. The per-content option must dominate every case and
-window before it can be considered for production.
+window before it can be considered for production.**
 
 **State / next steps (post-wake stop, 2026-11-02): NOT READY FOR REVIEW.**
 Current stereo remains selected. The current route detector misses five of 17

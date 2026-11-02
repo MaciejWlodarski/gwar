@@ -103,8 +103,12 @@ impl Stage {
     /// A running stereo canceller, its memory all allocated: this one frame of silence builds what
     /// the first real frame would otherwise build on the thread voice runs on.
     fn stereo() -> Self {
+        Self::stereo_config(canceller(true))
+    }
+
+    fn stereo_config(config: Config) -> Self {
         let mut stage = Self::new(2);
-        stage.apm.apply_config(canceller(true));
+        stage.apm.apply_config(config);
         stage.on = true;
         let silence = [0f32; FRAME];
         let (mut left, mut right, mut near) = ([0f32; FRAME], [0f32; FRAME], [0f32; FRAME]);
@@ -242,6 +246,8 @@ static ECHO_GONE_IGNORED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 #[cfg(test)]
 static AEC_NATIVE_PROFILE: AtomicU8 = AtomicU8::new(0);
 #[cfg(test)]
+static AEC_WARM_ONLY_TWO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
 static AEC_NATIVE_CHANNELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 static AEC_NONLINEAR_AT_TAKEOVER: AtomicU8 = AtomicU8::new(0);
@@ -279,8 +285,17 @@ struct Warming {
 impl Warming {
     fn new(sound: &Arc<AtomicUsize>, history: u32) -> Self {
         sound.store(0, Ordering::Relaxed);
+        let config = canceller(true);
+        #[cfg(test)]
+        let config = {
+            let mut config = config;
+            if AEC_WARM_ONLY_TWO.load(Ordering::Relaxed) {
+                config.echo_canceller.as_mut().unwrap().measurement_two_channel_start = true;
+            }
+            config
+        };
         Self {
-            stage: Box::new(Stage::stereo()),
+            stage: Box::new(Stage::stereo_config(config)),
             sound: sound.clone(),
             found_echo: false,
             history,
@@ -828,7 +843,7 @@ impl Processing {
         #[cfg(test)]
         {
             let mode = AEC_NONLINEAR_AT_TAKEOVER.load(Ordering::Relaxed);
-            if mode != 0 {
+            if mode != 0 && (self.warmed || !AEC_WARM_ONLY_TWO.load(Ordering::Relaxed)) {
                 stage.apm.measurement_restart_nonlinear(mode);
             }
         }
@@ -2695,7 +2710,7 @@ mod tests {
     #[ignore = "strict paired per-room +1 dB gate on full #220 echo tables; run in release alone"]
     fn native_paired_echo_gate() {
         let profile: u8 = std::env::var("GWAR_NATIVE_AEC_PROFILE").unwrap_or_else(|_| "1".into()).parse().unwrap();
-        assert!((1..=2).contains(&profile));
+        assert!([1, 2, 7, 8, 9, 10, 11].contains(&profile));
         AEC_NATIVE_PROFILE.store(0, Ordering::Relaxed);
         AEC_ECHO_COMPARE_PROFILE.store(profile, Ordering::Relaxed);
         AEC_ECHO_REGRESSIONS.store(0, Ordering::Relaxed);

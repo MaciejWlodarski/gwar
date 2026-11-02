@@ -1,0 +1,13 @@
+   Compiling sonora v0.2.0 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/vendor/sonora)
+   Compiling gwar-client v0.1.2 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/crates/gwar-client)
+    Finished `release` profile [optimized] target(s) in 8m 41s
+     Running unittests src/lib.rs (/tmp/gwar-aec-sol/release/deps/gwar_client-63cb5b99089087a9)
+
+running 1 test
+test voice::apm::tests::tones::nearend_decay_budget_screen ... decay-budget,lead=6,mode=97,hold=510,kept=0.08658009,cold-hold=136,cold-kept=0.104761906,pass=false,near-gain=[[-8.870746, 0.42576003], [-35.602245, 0.24642086], [-70.50385, 0.100104816]]
+decay-budget,lead=6,mode=98,hold=510,kept=0.06666667,cold-hold=136,cold-kept=0.104761906,pass=false,near-gain=[[-10.351822, 0.3926037], [-34.34165, 0.25725973], [-70.69891, 0.10050019]]
+decay-budget,lead=10,mode=97,hold=421,kept=0.097835496,cold-hold=106,cold-kept=0.12813853,pass=false,near-gain=[[-7.294305, 0.44222617], [-37.216305, 0.22445379], [-72.898796, 0.08633315]]
+decay-budget,lead=10,mode=98,hold=510,kept=0.048484847,cold-hold=106,cold-kept=0.12813853,pass=false,near-gain=[[-9.985414, 0.3517792], [-37.955166, 0.2183177], [-73.47933, 0.08731913]]
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 400 filtered out; finished in 16.44s

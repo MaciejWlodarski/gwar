@@ -140,6 +140,7 @@ struct ArmOptions {
     native_at_share: bool,
     nonlinear_restart: u8,
     native_channels: bool,
+    warm_only_two: bool,
     native_profile: u8,
 }
 impl ArmOptions {
@@ -156,6 +157,7 @@ impl ArmOptions {
             native_at_share: false,
             nonlinear_restart: 0,
             native_channels: false,
+            warm_only_two: false,
             native_profile: 0,
         };
         match tag {
@@ -268,6 +270,60 @@ impl ArmOptions {
                 o.gain = true;
                 o.native_profile = 2;
             }
+            90..=92 => {
+                o.warm = true;
+                o.gain = true;
+                o.native_profile = tag - 83;
+            }
+            86 => {
+                o.warm = true;
+                o.gain = true;
+                o.warm_only_two = true;
+                o.nonlinear_restart = 3;
+            }
+            87 => {
+                o.warm = true;
+                o.gain = true;
+                o.warm_only_two = true;
+                o.nonlinear_restart = 4;
+            }
+            88 => {
+                o.warm = true;
+                o.gain = true;
+                o.warm_only_two = true;
+                o.nonlinear_restart = 3;
+                o.native_profile = 5;
+            }
+            89 => {
+                o.warm = true;
+                o.gain = true;
+                o.warm_only_two = true;
+                o.nonlinear_restart = 3;
+                o.native_profile = 7;
+            }
+            93 => {
+                o.gain = true;
+                o.native_profile = 7;
+            }
+            94 => {
+                o.gain = true;
+                o.native_profile = 9;
+            }
+            95 => {
+                o.warm = true;
+                o.gain = true;
+                o.native_profile = 10;
+            }
+            96 => {
+                o.warm = true;
+                o.gain = true;
+                o.native_profile = 11;
+            }
+            97 | 98 => {
+                o.warm = true;
+                o.gain = true;
+                o.native_profile = tag - 85;
+            }
             _ => panic!("unknown measurement arm {tag}"),
         }
         o
@@ -298,6 +354,7 @@ fn arm_with_options(name: &str, lead: usize, echo: bool, noise: u8, mode: u8, op
                 }
         })
         .collect();
+    AEC_WARM_ONLY_TWO.store(options.warm_only_two, Ordering::Relaxed);
     AEC_NATIVE_PROFILE.store(options.native_profile, Ordering::Relaxed);
     AEC_NATIVE_CHANNELS.store(options.native_channels, Ordering::Relaxed);
     AEC_NONLINEAR_AT_TAKEOVER.store(options.nonlinear_restart, Ordering::Relaxed);
@@ -428,6 +485,7 @@ fn arm_with_options(name: &str, lead: usize, echo: bool, noise: u8, mode: u8, op
             }
         }
     }
+    AEC_WARM_ONLY_TWO.store(false, Ordering::Relaxed);
     AEC_NATIVE_PROFILE.store(0, Ordering::Relaxed);
     AEC_NATIVE_CHANNELS.store(false, Ordering::Relaxed);
     AEC_NONLINEAR_AT_TAKEOVER.store(0, Ordering::Relaxed);
@@ -604,9 +662,13 @@ fn native_reverb_and_capture_state() {
 #[test]
 #[ignore = "default speech matrix and 500 ms quiet-echo gate; run in release alone"]
 fn native_speech_and_quiet_echo_gate() {
-    let modes = [7, 40, 41, 51, 54, 31];
-    let mut speech_pass = [true; 6];
-    let mut echo_pass = [true; 6];
+    let modes: Vec<u8> = std::env::var("GWAR_NATIVE_ARMS")
+        .unwrap_or_else(|_| "7,40,41,51,54,31".into())
+        .split(',')
+        .map(|v| v.parse().unwrap())
+        .collect();
+    let mut speech_pass = vec![true; modes.len()];
+    let mut echo_pass = vec![true; modes.len()];
     for lead in [6, 10] {
         for echo in [false, true] {
             for noise in [0, 50, 100] {
@@ -616,7 +678,7 @@ fn native_speech_and_quiet_echo_gate() {
                     "speech-matrix-control,lead={lead},echo={echo},noise={noise},cold-hold={},cold-kept={},no-aec-hold={},no-aec-kept={}",
                     cold.maximum[3], cold.kept, no_aec.maximum[3], no_aec.kept
                 );
-                for (i, mode) in modes.into_iter().enumerate() {
+                for (i, mode) in modes.iter().copied().enumerate() {
                     let h = arm("human speech", lead, echo, noise, mode);
                     let pass = h.maximum[3] <= cold.maximum[3] && h.kept >= cold.kept;
                     speech_pass[i] &= pass;
@@ -631,7 +693,7 @@ fn native_speech_and_quiet_echo_gate() {
         current_options.gain = false;
         let current = arm_with_options("silence", lead, true, 0, 7, current_options);
         eprintln!("echo-matrix-control,lead={lead},levels={:?}", current.echo_levels);
-        for (i, mode) in modes.into_iter().enumerate() {
+        for (i, mode) in modes.iter().copied().enumerate() {
             let mut options = ArmOptions::tagged(mode);
             options.gain = false;
             let h = arm_with_options("silence", lead, true, 0, mode, options);
@@ -645,7 +707,7 @@ fn native_speech_and_quiet_echo_gate() {
             );
         }
     }
-    for (i, mode) in modes.into_iter().enumerate() {
+    for (i, mode) in modes.iter().copied().enumerate() {
         eprintln!(
             "native-gate,mode={mode},speech={},quiet-echo={},accepted={}",
             speech_pass[i],
@@ -667,6 +729,45 @@ fn cold_path_native_reverb() {
                     h.maximum, h.kept, h.aec_split, h.projection
                 );
             }
+        }
+    }
+}
+
+#[test]
+#[ignore = "bounded native nearend/reverb screening; run in release alone"]
+fn bounded_native_reverb_screen() {
+    for lead in [6, 10] {
+        let cold = arm("human speech", lead, true, 100, 8);
+        for mode in [34, 35, 86, 87, 88, 89, 90, 91, 92] {
+            let h = arm("human speech", lead, true, 100, mode);
+            eprintln!(
+                "bounded-native,lead={lead},mode={mode},hold={},kept={},cold-hold={},cold-kept={},speech-pass={}",
+                h.maximum[3],
+                h.kept,
+                cold.maximum[3],
+                cold.kept,
+                h.maximum[3] <= cold.maximum[3] && h.kept >= cold.kept
+            );
+        }
+    }
+}
+
+#[test]
+#[ignore = "native nearend-confidence budget screening; run in release alone"]
+fn nearend_decay_budget_screen() {
+    for lead in [6, 10] {
+        let cold = arm("human speech", lead, true, 100, 8);
+        for mode in [97, 98] {
+            let h = arm("human speech", lead, true, 100, mode);
+            eprintln!(
+                "decay-budget,lead={lead},mode={mode},hold={},kept={},cold-hold={},cold-kept={},pass={},near-gain={:?}",
+                h.maximum[3],
+                h.kept,
+                cold.maximum[3],
+                cold.kept,
+                h.maximum[3] <= cold.maximum[3] && h.kept >= cold.kept,
+                h.projection[1]
+            );
         }
     }
 }
