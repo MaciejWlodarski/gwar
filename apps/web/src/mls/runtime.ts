@@ -108,6 +108,8 @@ export class MlsRuntime {
   private readonly statuses = new Map<string, ConversationStatus>();
   /** Explicitly opened DMs not yet ready, including ones the server does not know yet. */
   private readonly openingDms = new Map<string, Backoff>();
+  private readonly opening = new Map<string, Promise<void>>();
+  private readonly dmSyncFailures = new Set<string>();
   private readonly rosters = new Map<string, Roster>();
   private readonly listeners = new Set<() => void>();
   private readonly missing = new Map<string, Set<string>>();
@@ -456,21 +458,25 @@ export class MlsRuntime {
       void this.ownerChecks.then(() => { this.managersRecheck = false; });
     }
     if (this.syncing) { this.dirty = true; return this.syncing; }
-    let failed = false;
+    let failed = false, isolated = false;
     this.syncing = this.engine.run(async () => {
       // Bound each pass; events arriving during it request one subsequent pass.
       this.dirty = false; this.wakeAt = undefined;
       this.activeGeneration = this.generation;
       this.assertCurrent(this.generation);
-      try { await this.observePrivateGroups(); await this.synchronize(); }
+      try {
+        await this.observePrivateGroups();
+        const failures = await this.synchronize();
+        this.updateStatuses();
+        if (failures.length) { isolated = true; throw failures[0]; }
+      }
       catch (error) {
         // Rosters follow the durable state the failed pass left (a restart
         // accepted before a join failed), before any later operation runs.
-        await this.engine.reload().then(() => this.updateStatuses(true), () => {});
+        if (!isolated) await this.engine.reload().then(() => this.updateStatuses(true), () => {});
         throw error;
       }
-      this.updateStatuses();
-    }).catch(error => { failed = true; this.markSecuring(); throw error; }).finally(() => {
+    }).catch(error => { failed = true; if (!isolated) this.markSecuring(); throw error; }).finally(() => {
       this.syncing = undefined;
       // Periodic refill, revocation/expiry checks and missing history retries;
       // sooner for a channel group whose create or join comes due.
@@ -524,7 +530,7 @@ export class MlsRuntime {
     }
     for (const [conversation, g] of shown) {
       const gate = this.gate(encoded(g.group));
-      const ready = usable(gate) && !this.held.has(conversation);
+      const ready = usable(gate) && !this.held.has(conversation) && !this.dmSyncFailures.has(conversation);
       this.statuses.set(conversation, gate.status === "creating" ? "creating" : ready && !securing ? "ready" : "securing");
       const first = g.record.evidence?.[this.uid]?.[0]?.first;
       // A live pin still to be joined (a restart just accepted) already names the conversation's group.
@@ -705,7 +711,8 @@ export class MlsRuntime {
       after = page.next;
     } while (after);
   }
-  private async synchronize(): Promise<void> {
+  private async synchronize(): Promise<unknown[]> {
+    const failures: unknown[] = [];
     await this.publish();
     const groups = await this.groups();
     for (const g of this.inventory()) if (g.record.status === "creating" && this.enabled(g.conversation)) {
@@ -715,25 +722,30 @@ export class MlsRuntime {
     this.held = await this.acceptRestarts(groups);
     await this.welcomes();
     for (const g of groups) if (g.conversation.startsWith("dm:") && !this.held.has(g.conversation)) {
-      try { await this.syncGroup(g.group, g.pending); }
-      catch (error) { if (!(error instanceof Restarted)) throw error; }
+      try {
+        await this.syncGroup(g.group, g.pending);
+        this.dmSyncFailures.delete(g.conversation);
+      } catch (error) {
+        this.assertCurrent(this.activeGeneration);
+        if (error instanceof Restarted) continue;
+        await this.engine.reload();
+        this.assertCurrent(this.activeGeneration);
+        this.dmSyncFailures.add(g.conversation);
+        failures.push(error);
+        this.options.onError?.(error);
+      }
     }
     for (const [conversation, due] of this.openingDms) {
       const known = groups.find(g => g.conversation === conversation);
       if (known) {
-        if (!this.held.has(conversation) && usable(this.gate(known.group))) this.openingDms.delete(conversation);
+        if (!this.held.has(conversation) && !this.dmSyncFailures.has(conversation) && usable(this.gate(known.group))) this.openingDms.delete(conversation);
         continue;
       }
-      if (due.at > this.now()) { this.wakeAt = Math.min(this.wakeAt ?? Infinity, due.at); continue; }
-      try {
-        await this.createGroup(conversation, true);
-        this.openingDms.delete(conversation);
-      } catch (error) {
+      try { await this.createOpenedDm(conversation, due); }
+      catch (error) {
         this.assertCurrent(this.activeGeneration);
         await this.engine.reload();
-        const delay = Math.min(15_000, due.delay * 2);
-        this.openingDms.set(conversation, { at: this.now() + delay, delay });
-        this.wakeAt = Math.min(this.wakeAt ?? Infinity, this.now() + delay);
+        this.assertCurrent(this.activeGeneration);
         this.options.onError?.(error);
       }
     }
@@ -747,6 +759,7 @@ export class MlsRuntime {
     } while (after);
     await this.sendHistory();
     await this.requestMissing();
+    return failures;
   }
   /** Follows the restarts the server holds (docs/e2e-build.md "Restarts")
    * and returns the conversations to leave alone in this pass: those whose
@@ -1335,23 +1348,61 @@ export class MlsRuntime {
       this.lastRequest.set(group, this.now());
     }
   }
+  /** The first open and background recovery share one creation deadline. */
+  private async createOpenedDm(conversation: string, due: Backoff): Promise<void> {
+    if (due.at > this.now()) { this.wakeAt = Math.min(this.wakeAt ?? Infinity, due.at); this.schedule(due.at - this.now()); return; }
+    try {
+      await this.createGroup(conversation, true);
+      this.dmSyncFailures.delete(conversation);
+      this.openingDms.delete(conversation);
+    } catch (error) {
+      this.assertCurrent(this.activeGeneration);
+      const delay = Math.min(15_000, due.delay * 2);
+      const at = this.now() + delay;
+      this.openingDms.set(conversation, { at, delay });
+      this.wakeAt = Math.min(this.wakeAt ?? Infinity, at);
+      this.schedule(delay);
+      throw error;
+    }
+  }
   async openConversation(conversation: string): Promise<void> {
     participants(conversation);
-    this.openingDms.set(conversation, { at: this.now(), delay: 500 });
-    return this.engine.run(async () => {
+    const opening = this.opening.get(conversation);
+    if (opening) return opening;
+    if (!this.openingDms.has(conversation)) this.openingDms.set(conversation, { at: this.now(), delay: 500 });
+    const run = this.engine.run(async () => {
       this.activeGeneration = this.generation; this.assertCurrent(this.activeGeneration);
       this.statuses.set(conversation, "creating"); this.notify();
-      const known = (await this.groups()).find(g => g.conversation === conversation);
-      for (const g of this.inventory()) if (g.conversation === conversation && g.record.status === "creating") {
-        await this.transition({ settle: { ...this.settleArgs(encoded(g.group)), winner: known ? bytes(known.group) : null } });
+      try {
+        const known = (await this.groups()).find(g => g.conversation === conversation);
+        for (const g of this.inventory()) if (g.conversation === conversation && g.record.status === "creating") {
+          await this.transition({ settle: { ...this.settleArgs(encoded(g.group)), winner: known ? bytes(known.group) : null } });
+        }
+        if (known && (await this.acceptRestarts([known])).size) { this.held.add(conversation); throw new Error("MLS conversation is still securing"); }
+        if (known) {
+          this.held.delete(conversation);
+          await this.syncGroup(known.group, known.pending);
+          this.dmSyncFailures.delete(conversation);
+          this.openingDms.delete(conversation);
+        } else {
+          await this.createOpenedDm(conversation, this.openingDms.get(conversation)!);
+          await this.sendHistory();
+        }
+        this.updateStatuses();
+        // A backed-off open has no local group yet, so inventory cannot set its status.
+        if (this.openingDms.has(conversation)) { this.statuses.set(conversation, "securing"); this.notify(); }
+      } catch (error) {
+        this.assertCurrent(this.activeGeneration);
+        await this.engine.reload();
+        this.assertCurrent(this.activeGeneration);
+        this.dmSyncFailures.add(conversation);
+        this.statuses.set(conversation, "securing"); this.notify();
+        this.schedule(1000);
+        throw error;
       }
-      if (known && (await this.acceptRestarts([known])).size) { this.held.add(conversation); throw new Error("MLS conversation is still securing"); }
-      if (known) { this.held.delete(conversation); await this.syncGroup(known.group, known.pending); this.openingDms.delete(conversation); this.updateStatuses(); return; }
-      await this.createGroup(conversation, true);
-      this.openingDms.delete(conversation);
-      await this.sendHistory();
-      this.updateStatuses();
-    }).catch(error => { this.markSecuring(); this.schedule(1000); throw error; });
+    }).finally(() => { if (this.opening.get(conversation) === run) this.opening.delete(conversation); });
+    this.opening.set(conversation, run);
+    return run;
   }
   /** Creates the conversation's group, or a restart's next incarnation, and
    * settles with the group the server holds. */
