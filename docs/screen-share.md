@@ -2459,46 +2459,32 @@ production estimate did not grow during the first 12 s, as it does in the
 simulator, is not known: the server logged allocation at debug level only,
 which the info-level lines above now cover.
 
-#### A jittery link and the picture
+#### A jittery link and the picture: known limitation
 
-A probe cluster lasts about 8 ms, so ±10 ms per packet on the viewer's link stretched its arrival
-and read as saturation. The estimate fell to 2 to 5 Mb/s on a link with room, a keyframe no longer
-fit, two failed keyframes paused the slot, and the picture stopped until a retry. An estimate
-lowered this way could not climb back either, because the SFU then sent less and the estimator
-caps at 1.5 times what was acknowledged. Now a saturated cluster under 0.75 of the best of the last
-three within 4 s moves the estimate only down to that best (`vendor/str0m/GWAR-PATCH.md`). A full
-link shows it in cluster after cluster, so a genuine limit lowers the estimate as before, and delay
-and loss feedback are unchanged.
+Receive jitter of ±10–20 ms can freeze the picture for 15 s or longer even on a
+link with spare capacity. A probe cluster lasts about 8 ms, so jitter can stretch
+its arrival enough to trigger str0m's saturated-probe backoff. The lower estimate
+immediately lowers the SFU budget; keyframes stop fitting, two failed keyframes
+pause the lane, and the ordinary retry ladder starts at 15 s. With little media,
+the acknowledged-rate limit can also prevent the estimate from recovering.
 
-A browser viewer on a 5 Mb/s share with sound, four 45 s runs per link, before and after (runs with
-a stop of 5 s or more, seconds stopped, settled seconds with picture and sound in range, median
-frames decoded):
+PR #221 preserves this production behavior. The complete vendored str0m source
+and the SFU's egress, allocation, pause and retry code are identical to main at
+1099a681. The retained changes are the netem correlated-jitter profile, simulation
+tools, pinned-main safety coverage and explicit vendored BWE tests in CI.
 
-| Downlink (`LATENCY_NET`) | Runs | Stopped, s | In range | Frames |
-| --- | --- | --- | --- | --- |
-| `normal` | 0 → 0 | 0 → 0 | 133/136 → 134/136 | |
-| `delay=20ms,jitter=5ms,keep_order` | 0 → 0 | 0 → 0 | 125/137 → 123/137 | |
-| `delay=20ms,jitter=10ms,keep_order` | 4 → 1 | 76 → 27 | 39/77 → 76/83 | 404 → 746 |
-| `delay=20ms,jitter=20ms,keep_order` | 4 → 3 | 80 → 48 | 24/65 → 83/106 | |
-| `delay=20ms,jitter=10ms` (reordering) | 4 → 3 | 94 → 66 | 13/42 → 7/32 | 55 → 28 |
-| `delay=20ms,jitter=10ms,hold=10ms,keep_order` | 2 → 3 | 38 → 62 | 74/97 → 46/63 | |
-| `delay=20ms,jitter=5ms,keep_order,rate=4mbit,queue=100ms` | 4 → 4 | 63 → 63 | 5/73 → 3/68 | |
-| `stall=270ms@10s,every=10s` | 2 → 1 | 23 → 11 | 65/111 → 83/125 | |
+Three estimator changes were rejected because they hurt voice on real capacity
+drops. A brief SFU pause grace also hurt voice despite preserving the estimate's
+budgets. A final settled-feedback gate preserved main's pauses but never resumed
+early in 48 paired jitter cases: pause counts, total paused time and resume waits
+were identical. A healthy constructed-feedback unit test did not predict the
+actual jitter result. Current senders expose one encoded layer; this experiment
+did not add a lower layer or transcode the source.
 
-The first and second rows, and the `rate=4mbit` row, are the controls: nothing to fix, and a genuine
-limit that must still pause. The fix helps independent per-packet jitter. It does not help when
-jitter comes in runs (`hold=`, one draw for 10 ms of packets), or when 10 ms of jitter also reorders
-packets, and four runs cannot tell the movement in those two rows from noise. A stop that is left
-lasts about 15 s because the retry after a pause waits `RETRY_FIRST`, which stays: a retry under
-`RAMP` could not conclude, and the ladder is what keeps failed retries away from voice.
-
-How the emulation compares with a real link: `jitter=` is uniform, so ±10 ms is a spread of 20 ms on
-every packet independently. One home Wi-Fi link to its router, idle, measured 300 pings at 4.1 ms
-average, 0.77 ms standard deviation, 7.8 ms worst, no loss, which is well below that. A
-[public hotspot study](https://arxiv.org/pdf/1608.06606) found 9.2 to 13.7 ms of one-way jitter, and
-[a VoIP over Wi-Fi paper](https://www.ime.usp.br/~kon/papers/mmsp06.pdf) found one-way delay usually
-under 10 ms with occasional extreme variation. So ±5 ms, which has no stops, covers an idle home
-link, and ±10 ms a busy or public one: harsher than idle Wi-Fi, not out of reach.
+The [latency guide](latency.md#screen-share-jitter-known-limitation-and-rejected-recovery-designs)
+records all rejected approaches, the historical browser table, the jitter
+simulation table, censored waits and reproduction commands. No picture-freeze
+fix or production voice improvement is claimed by this PR.
 
 ### Cost on the deployment VM
 

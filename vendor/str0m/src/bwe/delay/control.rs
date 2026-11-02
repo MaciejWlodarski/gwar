@@ -53,10 +53,18 @@ impl DelayController {
         }
     }
 
-    /// Gwar: a TWCC report's delays, so a probe result in the same report can be judged by them.
-    /// `update` then decides on the estimate.
-    pub fn observe(&mut self, acked: &[AckedPacket]) {
+    /// Record a packet from a TWCC report.
+    pub fn update(
+        &mut self,
+        acked: &[AckedPacket],
+        acked_bitrate: Option<Bitrate>,
+        probe_bitrate: Option<Bitrate>,
+        now: Instant,
+    ) -> Option<Bitrate> {
+        let mut max_rtt = None;
+
         for acked_packet in acked {
+            max_rtt = max_rtt.max(Some(acked_packet.rtt()));
             if let Some(delay_variation) = self
                 .arrival_group_accumulator
                 .accumulate_packet(acked_packet)
@@ -78,17 +86,7 @@ impl DelayController {
                     .add_delay_observation(delay_variation, delay_variation.last_remote_recv_time);
             }
         }
-    }
 
-    /// Record a TWCC report that `observe` has seen.
-    pub fn update(
-        &mut self,
-        acked: &[AckedPacket],
-        acked_bitrate: Option<Bitrate>,
-        probe_bitrate: Option<Bitrate>,
-        now: Instant,
-    ) -> Option<Bitrate> {
-        let max_rtt = acked.iter().map(AckedPacket::rtt).max();
         if let Some(rtt) = max_rtt {
             self.update_rtt(rtt);
         }

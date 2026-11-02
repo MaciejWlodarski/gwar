@@ -254,29 +254,3 @@ sender reports. Track IDs remain distinct; ordinary `accept_offer` uses no group
 and preserves its behavior. Gwar uses this for paired screen receivers so
 libwebrtc negotiates synchronization rather than merely combining tracks in JS.
 The server regression checks both the actual answer and stored media identities.
-
-A saturated probe cluster no longer lowers the estimate on its own when jitter
-stretched it. A cluster lasts about 8 ms, so 10 ms of jitter on the link is enough to
-stretch its arrival and read as saturation, and an estimate lowered that way cannot
-climb back: the SFU then sends less, which caps it at 1.5 times what was
-acknowledged. Jitter holds a run of packets back and lets them go together, so most
-of such a cluster arrives as fast as it was sent (median receive gap, at the
-cluster's mean packet size, at least 0.9 of its send rate); a full link spaces every
-packet out alike. Only a stretched cluster under 0.75 of the best of the last three
-within 4 s is filtered: it moves the estimate only down to that best, for the delay
-and the loss controllers alike, unless the report it came in shows congestion by
-itself: delay overuse, or 5 % lost (`DelayController::observe` runs first for that).
-A full link also shows in cluster after cluster, alike, and those lower it as before;
-delay and loss feedback are unchanged. Measuring the link's delay spread instead was
-tried and dropped: a real queue widens it too, which hid saturation and raised
-voice's p99 past its bound in
-`share_audio_keeps_voice_inside_existing_steady_and_startup_bounds`. Filtering every
-low cluster, stretched or not, kept a real drop's estimate above the link up to 1.1 s
-longer and queued voice up to 1.8 s longer in the simulator.
-`only_clusters_in_a_row_can_call_the_link_saturated` covers the memory,
-`a_stretched_cluster_lowers_no_estimate_through_the_loss_controller` and
-`a_cluster_a_full_link_spaced_out_lowers_the_estimate_at_once` the two shapes, and in
-Gwar's simulator `a_real_drop_in_the_link_lowers_the_estimate_before_voice_pays_for_it`
-and `no_drop_of_the_link_costs_more_than_it_did_before_the_probe_filter` (step and
-2 s ramp, lossless and 1 % lossy, 5 and 10 ms cadence, ten phases of the probe
-interval, each against the filter off via `_gwar_sim::set_probe_filter`) the drops.

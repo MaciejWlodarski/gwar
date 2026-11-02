@@ -1661,3 +1661,166 @@ regressed the unimpaired relay (median 46.0 → 58.0 ms) and the documented mixe
 spec (concealments 246 → 411). The target only limits shrinking, and the
 five-second low-water rule already retains periodic spikes, so longer estimator
 memory mostly kept extra delay. Other relative-delay designs remain untested.
+
+## Screen-share jitter: known limitation and rejected recovery designs
+
+Receive jitter can freeze a share for 15 s or longer on a link with spare
+capacity. An approximately 8 ms probe cluster can read low when jitter stretches
+its receive interval. The estimate falls, the SFU budget follows it, failed
+keyframes pause the picture, and the first ordinary retry waits 15 s. With little
+media to acknowledge, the estimator may also remain application-limited.
+
+**PR #221 retains this known limitation.** Production str0m and SFU behavior are
+unchanged from main `1099a681`. The PR keeps `hold=`, test-only network models,
+pinned-main simulation coverage and explicit BWE unit tests in CI. It does not
+claim a picture or voice improvement.
+
+### Profiles and measurement rules
+
+All impaired browser rows use `seed=42;down:`. The screen is capped at 5 Mb/s.
+
+| Row | Network |
+| --- | --- |
+| plain | `normal` |
+| j5 | `delay=20ms,jitter=5ms,keep_order` |
+| j10 | `delay=20ms,jitter=10ms,keep_order` |
+| j20 | `delay=20ms,jitter=20ms,keep_order` |
+| r10 | `delay=20ms,jitter=10ms` |
+| h10 | `delay=20ms,jitter=10ms,hold=10ms,keep_order` |
+| cap | `delay=20ms,jitter=5ms,keep_order,rate=4mbit,queue=100ms` |
+| steps | `stall=270ms@10s,every=10s` |
+
+Local browser runs use Chromium with `--disable-audio-output`. The PID guard
+snapshots pre-existing `pmset -g assertions` and ignores the owner's Chrome. It
+stops only an audio-out assertion created by the test's Node/Playwright process
+tree, including a coreaudiod assertion's `Created for PID`, and logs the matched
+assertion. `uptime` is recorded at the start and end of each run. Load above 6 or
+a sleep/wake in `pmset -g log` makes the run void and requires a repeat. Timing
+runs must not overlap another worker's runs. A shared prebuilt web bundle can
+serve both arms, keeping repeated web builds outside the timing window.
+
+### Historical browser measurements: withdrawn estimator filter
+
+The original worker reported four 45 s browser runs per row, main to the withdrawn
+recent-cluster filter. These measurements describe a rejected estimator design;
+they do not validate the final PR or the later SFU experiments. The jitter gains
+could not be retained under the zero-regression voice requirement.
+
+| Downlink | Runs with long stops | Stopped, s | In-range samples | Frames |
+| --- | --- | --- | --- | --- |
+| plain | 0 → 0 | 0 → 0 | 133/136 → 134/136 | |
+| j5 | 0 → 0 | 0 → 0 | 125/137 → 123/137 | |
+| j10 | 4 → 1 | 76 → 27 | 39/77 → 76/83 | 404 → 746 |
+| j20 | 4 → 3 | 80 → 48 | 24/65 → 83/106 | |
+| r10 | 4 → 3 | 94 → 66 | 13/42 → 7/32 | 55 → 28 |
+| h10 | 2 → 3 | 38 → 62 | 74/97 → 46/63 | |
+| cap | 4 → 4 | 63 → 63 | 5/73 → 3/68 | |
+| steps | 2 → 1 | 23 → 11 | 65/111 → 83/125 | |
+
+### Rejected approaches and voice evidence
+
+Voice hurt time is the duration for which an independent 100 kb/s voice flow
+meets at least 50 ms of physical FIFO queue. Above-capacity time is the duration
+for which the screen estimate exceeds link capacity minus cross traffic. These
+are simulator metrics, not measurements of native device playout latency.
+
+| Approach | Evidence | Worst added voice hurt time | Worst added above-capacity time | Result |
+| --- | --- | --- | --- | --- |
+| Hold a lone low cluster against recent high clusters (`5deda792`) | 480 drop cases | 1,770 ms | 1,070 ms | Rejected |
+| Filter only stretched clusters (`e152948b`) | Evenly delivered drops passed, but a burst-delivered full link queued voice for 1,050 ms versus main's 220 ms | 830 ms in that counterexample | Not reported for that counterexample | Rejected |
+| Back off, then verify at 0.85 of the old estimate after 500 ms | 2,560 cases; voice worse in 128, above-capacity time worse in 206 | 1,390 ms | 4,140 ms | Rejected |
+| Keep main BWE; defer pause for 2 s after a sharp cut and resume after 300 ms of fit | 640 cases; voice worse in 5 and better in none; above-capacity time worse in 5 and better in 8 | 90 ms | 1,250 ms | Rejected |
+| Keep main pauses; resume after 2 s of settled feedback, adequate ACK rate and budget | All 2,560 drop pairs had delta 0, but the new path never fired; it also never fired under jitter below | 0 ms | 0 ms | Rejected: no picture benefit |
+
+The pause-grace counterexamples used seed 1 and a 6 → 2 Mb/s drop, 5 ms service,
+and no random loss:
+
+| Phase | Aggregation | Cross traffic | Metric | Main | Grace prototype |
+| --- | --- | --- | --- | --- | --- |
+| 400 ms | 5 ms | 1 Mb/s | Voice hurt time | 400 ms | 490 ms |
+| 600 ms | none | none | Above-capacity time | 2,830 ms | 4,080 ms |
+
+Unchanged estimator code and unchanged budgets did not make the grace safe:
+keeping a different packet stream flowing changed feedback while main still
+overestimated the reduced link. The final experiment therefore retained main's
+pause and required a non-decreasing estimate, normal delay detector, loss below
+2%, fresh reports and enough acknowledged bitrate throughout a two-second window.
+It did not restart BWE or raise its estimate. Constructed healthy-feedback tests
+passed, but the real simulated feedback never permitted an early jitter resume.
+
+### Settled-feedback experiment: paired jitter simulations
+
+Each arm ran 60 simulated seconds, using seeds 1, 2, 3 and 42, 5/10 ms SFU
+service, 20 ms downlink propagation, uniform signed jitter and `keep_order`.
+The free downlink had no rate cap. Shares ran at 60 fps, either 3 Mb/s with a
+32 KB keyframe or 5 Mb/s with a 150 KB keyframe. The draw and hold clock match the
+netem profile's SplitMix64 uniform distribution; these are synthetic packet
+sources and a str0m viewer, not a browser encoder/decoder measurement.
+
+| Profile | Paired cases | Pauses, main → prototype | Total paused, main → prototype | Completed resume waits, both arms | Early resumes |
+| --- | --- | --- | --- | --- | --- |
+| ±10 ms, independent draws | 16 | 12 → 12 | 165.15 s → 165.15 s | 15.10–15.40 s | 0 |
+| ±20 ms, independent draws | 16 | 24 → 24 | 356.55 s → 356.55 s | 15.10 s | 0 |
+| ±10 ms, `hold=10ms` | 16 | 13 → 13 | 198.70 s → 198.70 s | 12.30–21.50 s | 0 |
+
+All 48 paired result records were identical. Runs still paused when the 60 s
+window ended count toward total paused time; their incomplete waits are not
+included in the completed-wait range. There were 3, 13 and 2 such censored runs
+in the three rows respectively. [Per-case data](data/screen-jitter-recovery.csv)
+includes the completed waits and censored durations. The incomplete browser
+matrix was stopped after this simulator rejection; it is not acceptance evidence.
+
+### Retained simulation coverage
+
+`Link::aggregate` batches delivery after bottleneck serialization. `Sim::cross`
+adds full-size cross-traffic packets to the same physical FIFO. The jitter model
+uses signed uniform delay, a hold interval and explicit order preservation.
+With jitter disabled, it consumes no new random draws or delay conversions.
+
+The drop matrix covers two service cadences, 0/1% loss, 0/2/5/10 ms aggregation,
+0/1 Mb/s cross traffic, step cuts 20 → 5, 20 → 4 and 6 → 2 Mb/s, a 20 → 5 Mb/s
+two-second ramp, and five phases through the probe interval. Four seeds produce
+2,560 cases. The [baseline fixture](../crates/gwar-server/src/media/screen/drop-baseline.csv)
+pins main `1099a681`; the restored main code is checked against every stored
+result. It is a measured simulator baseline, not an analytical safety bound.
+Changes may improve either metric but may not exceed the pinned value.
+
+The ordinary `drop_matrix_matches_main_baseline` test runs 80 representative
+cases in CI, including the burst/cross-traffic combinations that broke earlier
+designs. It compares against stored main results rather than comparing the same
+current implementation with itself. The full sweep and jitter report are manual:
+
+```sh
+CARGO_BUILD_JOBS=4 nice -n 10 cargo test --release -p gwar-server --lib drop_sweep -- --ignored --nocapture
+CARGO_BUILD_JOBS=4 nice -n 10 cargo test --release -p gwar-server --lib jitter_matrix -- --ignored --nocapture
+```
+
+`SWEEP_SEEDS=1` selects a quick drop run; omit it for all four seeds. A baseline
+update requires an explicit new source pin and review of every changed metric.
+The BWE crate is excluded from workspace tests, so CI separately runs:
+
+```sh
+cargo test -j 4 --manifest-path vendor/str0m/Cargo.toml --no-default-features --features aws-lc-rs,_internal_test_exports --lib bwe_::
+```
+
+### Validation of the final fallback
+
+- Screen suite: 226 passed, 5 manual matrix/report tests ignored.
+- Full drop sweep: all 2,560 cases reproduced the main baseline; maximum added
+  voice hurt time and above-capacity time were both 0 ms.
+- The restored main reproduced every metric in all 48 recorded jitter cases.
+- Vendored str0m BWE: 93 unit tests passed, explicitly through its own manifest.
+- Netem example: 16 tests passed, including the held-jitter profile.
+- Workspace formatting, server/test clippy with warnings denied, and CI
+  coverage-selection checks passed.
+
+### State / next steps
+
+- Final scope: profiles, simulation tools, pinned-main coverage, BWE tests in CI
+  and this known-limitation report. No estimator or SFU behavior change remains.
+- The settled-feedback design is rejected because it made no early resumes in
+  the jitter matrix. The freeze remains a known limitation.
+- Any future recovery proposal must demonstrate activation and substantially
+  shorter jitter pauses before being accepted on a drop sweep that never
+  exercises its recovery path. Current senders have one encoded layer; lower
+  layer selection or encoder adaptation needs separate implementation work.

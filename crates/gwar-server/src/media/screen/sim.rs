@@ -42,6 +42,16 @@ pub struct Link {
     pub dropped: u64,
     /// Drops the datagrams it picks.
     pub filter: Option<Filter>,
+    /// Delivers in batches this far apart, as Wi-Fi aggregates frames (zero: as they come).
+    pub aggregate: Duration,
+    epoch: Instant,
+    pub jitter: Duration,
+    pub jitter_hold: Duration,
+    pub keep_order: bool,
+    jitter_seed: u64,
+    jitter_until: Instant,
+    jitter_value: f64,
+    last_due: Instant,
 }
 
 impl Link {
@@ -56,6 +66,15 @@ impl Link {
             seed: 0x9e37_79b9_7f4a_7c15,
             dropped: 0,
             filter: None,
+            aggregate: Duration::ZERO,
+            epoch: now,
+            jitter: Duration::ZERO,
+            jitter_hold: Duration::ZERO,
+            keep_order: false,
+            jitter_seed: 1,
+            jitter_until: now,
+            jitter_value: 0.0,
+            last_due: now,
         }
     }
 
@@ -81,7 +100,35 @@ impl Link {
         } else {
             self.busy = now;
         }
-        self.flight.push_back((self.busy + self.delay, datagram.to_vec()));
+        let mut due = self.busy + self.delay;
+        if !self.jitter.is_zero() {
+            if self.busy >= self.jitter_until {
+                // Same SplitMix64 uniform draw and hold clock as latency/netem.rs.
+                self.jitter_seed = self.jitter_seed.wrapping_add(0x9e3779b97f4a7c15);
+                let mut value = self.jitter_seed;
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d049bb133111eb);
+                value ^= value >> 31;
+                self.jitter_value = 2.0 * ((value >> 11) as f64 / (1u64 << 53) as f64) - 1.0;
+                self.jitter_until = self.busy + self.jitter_hold;
+            }
+            let delay = (self.delay.as_secs_f64() + self.jitter_value * self.jitter.as_secs_f64()).max(0.0);
+            due = self.busy + Duration::from_secs_f64(delay);
+        }
+        if !self.aggregate.is_zero() {
+            let batches = due.saturating_duration_since(self.epoch).as_nanos().div_ceil(self.aggregate.as_nanos());
+            due = self.epoch + Duration::from_nanos((batches * self.aggregate.as_nanos()) as u64);
+        }
+        if self.keep_order {
+            due = due.max(self.last_due);
+        }
+        self.last_due = due;
+        if self.jitter.is_zero() || self.keep_order {
+            self.flight.push_back((due, datagram.to_vec()));
+        } else {
+            let at = self.flight.partition_point(|(time, _)| *time <= due);
+            self.flight.insert(at, (due, datagram.to_vec()));
+        }
     }
 
     fn due(&mut self, now: Instant) -> Vec<Vec<u8>> {
@@ -181,6 +228,9 @@ pub struct Sim {
     /// Synthetic screen sound uses the production audio socket bucket, then the same FIFO.
     share_audio: usize,
     voice_queue: Vec<Duration>,
+    /// Other traffic on the downlink, in bit/s.
+    pub cross: u64,
+    cross_bytes: f64,
     /// Worst queue voice met within `JOIN` of the start, and from then to 15 s.
     voice_join_queue_max: Duration,
     voice_startup_queue_max: Duration,
@@ -252,6 +302,8 @@ impl Sim {
             voice: false,
             share_audio: 0,
             voice_queue: Vec::new(),
+            cross: 0,
+            cross_bytes: 0.0,
             voice_join_queue_max: Duration::ZERO,
             voice_startup_queue_max: Duration::ZERO,
             voice_trace: Vec::new(),
@@ -509,6 +561,19 @@ impl Sim {
                 {
                     self.down.busy =
                         self.down.busy.max(now) + Duration::from_secs_f64((320 + WIRE) as f64 * 8.0 / rate as f64);
+                }
+            }
+        }
+        // Someone else's traffic through the same queue, in full-size packets.
+        if self.cross > 0
+            && let Some(rate) = self.down.rate
+        {
+            self.cross_bytes += self.cross as f64 / 8.0 / 1000.0;
+            while self.cross_bytes >= 1200.0 {
+                self.cross_bytes -= 1200.0;
+                let start = self.down.busy.max(now);
+                if start - now <= self.down.queue {
+                    self.down.busy = start + Duration::from_secs_f64(1200.0 * 8.0 / rate as f64);
                 }
             }
         }
@@ -826,41 +891,240 @@ mod tests {
         assert!(hurt <= 700 * MS, "{hurt:?}: {}", summary(&sim));
     }
 
-    /// A 20 Mb/s link drops to 5 Mb/s at once, or over 2 s, `phase` into a probe interval. How
-    /// long the estimate stays above the link over the 5 s after, and how long voice queues past
-    /// `HURT`; `filter` off is the estimator as it was before stretched probes were filtered.
-    fn drop_case(cadence: u32, phase: u32, ramp: bool, loss: f64, filter: bool) -> (u64, Duration) {
-        str0m::_gwar_sim::set_probe_filter(filter);
-        let mut sim = Sim::new(Some(20_000_000));
+    /// How a link's capacity falls: at once from `from` to `to`, or over 2 s.
+    #[derive(Clone, Copy, Debug)]
+    pub struct LinkDrop {
+        pub from: u64,
+        pub to: u64,
+        pub ramp: bool,
+        pub loss: f64,
+        /// Delivery batched this far apart.
+        pub aggregate: Duration,
+        /// Other traffic in the same queue, bit/s.
+        pub cross: u64,
+    }
+
+    /// A complete pinned-main matrix, independent of the implementation under test.
+    /// Fields: seed, cadence, loss ppm, aggregation, cross traffic, from/to,
+    /// ramp flag, phase; values: above-capacity ms and voice-hurt ms.
+    type DropBaseline = HashMap<[u64; 9], (u64, u64)>;
+
+    fn drop_baseline() -> DropBaseline {
+        let mut baseline = HashMap::new();
+        for line in include_str!("drop-baseline.csv").lines().filter(|l| !l.starts_with('#')).skip(1) {
+            let fields: Vec<u64> = line.split(',').map(|n| n.parse().expect("numeric drop baseline")).collect();
+            assert_eq!(fields.len(), 11);
+            let key: [u64; 9] = fields[..9].try_into().unwrap();
+            assert!(baseline.insert(key, (fields[9], fields[10])).is_none(), "duplicate drop case");
+        }
+        assert_eq!(baseline.len(), 2560, "complete four-seed main baseline");
+        baseline
+    }
+
+    fn drop_key(seed: u64, cadence: u32, phase: u32, drop: LinkDrop) -> [u64; 9] {
+        [
+            seed,
+            cadence as u64,
+            (drop.loss * 1_000_000.0).round() as u64,
+            drop.aggregate.as_millis() as u64,
+            drop.cross,
+            drop.from,
+            drop.to,
+            u64::from(drop.ramp),
+            phase as u64,
+        ]
+    }
+
+    /// Drops the link at a phase through the probe interval and observes five
+    /// seconds. Voice is a separate 100 kb/s flow through the same physical FIFO.
+    fn drop_case(seed: u64, cadence: u32, phase: u32, drop: LinkDrop) -> (u64, u64) {
+        let mut sim = Sim::with_seed(Some(drop.from), seed);
         sim.voice = true;
-        sim.down.loss = loss;
+        sim.down.loss = drop.loss;
+        sim.down.aggregate = drop.aggregate;
+        sim.cross = drop.cross;
         sim.server_interval = MS * cadence;
         sim.join("share", 5_000_000, 30, 150_000, 8_000_000);
         sim.run(10 * SECOND + MS * phase);
         let dropped = sim.now;
         let mut above = 0;
         for step in 0..500u64 {
-            let capacity = if ramp { 20_000_000 - 15_000_000 * step.min(200) / 200 } else { 5_000_000 };
+            let capacity = if drop.ramp { drop.from - (drop.from - drop.to) * step.min(200) / 200 } else { drop.to };
             sim.down.rate = Some(capacity);
             sim.run(10 * MS);
-            above += u64::from(sim.w.egress.estimate() > capacity) * 10;
+            above += u64::from(sim.w.egress.estimate() > capacity.saturating_sub(drop.cross)) * 10;
         }
-        str0m::_gwar_sim::set_probe_filter(true);
-        (above, voice_hurt(&sim, dropped, sim.now).0)
+        (above, voice_hurt(&sim, dropped, sim.now).0.as_millis() as u64)
+    }
+
+    fn assert_drop_case(baseline: &DropBaseline, seed: u64, cadence: u32, phase: u32, drop: LinkDrop) -> (i64, i64) {
+        let key = drop_key(seed, cadence, phase, drop);
+        let (was_above, was_hurt) = baseline[&key];
+        let (above, hurt) = drop_case(seed, cadence, phase, drop);
+        println!(
+            "SWEEP s{seed} c{cadence} {drop:?} p{phase}: above {above} was {was_above} hurt {hurt} was {was_hurt}"
+        );
+        (above as i64 - was_above as i64, hurt as i64 - was_hurt as i64)
     }
 
     #[test]
-    fn no_drop_of_the_link_costs_more_than_it_did_before_the_probe_filter() {
-        // A full link spaces a probe out alike, so the filter must leave it alone wherever in
-        // the probe interval the drop comes, at either cadence, lossless or lossy.
+    fn drop_matrix_matches_main_baseline() {
+        let baseline = drop_baseline();
+        let step = |from, to| LinkDrop { from, to, ramp: false, loss: 0.0, aggregate: Duration::ZERO, cross: 0 };
+        let drops = [
+            step(20_000_000, 5_000_000),
+            LinkDrop { ramp: true, loss: 0.01, ..step(20_000_000, 5_000_000) },
+            LinkDrop { loss: 0.01, aggregate: 10 * MS, cross: 1_000_000, ..step(20_000_000, 5_000_000) },
+            step(6_000_000, 2_000_000),
+            LinkDrop { aggregate: 5 * MS, cross: 1_000_000, ..step(6_000_000, 2_000_000) },
+            LinkDrop { loss: 0.01, aggregate: 5 * MS, cross: 1_000_000, ..step(6_000_000, 2_000_000) },
+            LinkDrop { loss: 0.01, aggregate: 5 * MS, ..step(20_000_000, 4_000_000) },
+            LinkDrop { aggregate: 2 * MS, cross: 1_000_000, ..step(6_000_000, 2_000_000) },
+        ];
         for cadence in [5, 10] {
-            for (ramp, loss) in [(false, 0.0), (true, 0.01)] {
-                for phase in (0..1000).step_by(100) {
-                    let (above, hurt) = drop_case(cadence, phase, ramp, loss, true);
-                    let (was_above, was_hurt) = drop_case(cadence, phase, ramp, loss, false);
-                    let case = format!("{cadence} ms, ramp {ramp}, loss {loss}, {phase} ms in");
-                    assert!(above <= was_above, "{case}: above the link {above} ms, was {was_above} ms");
-                    assert!(hurt <= was_hurt, "{case}: voice queued {hurt:?}, was {was_hurt:?}");
+            for drop in drops {
+                for phase in (0..1000).step_by(200) {
+                    let (above, hurt) = assert_drop_case(&baseline, 1, cadence, phase, drop);
+                    assert!(
+                        above <= 0 && hurt <= 0,
+                        "{cadence} ms, {drop:?}, phase {phase}: added above {above} ms, voice {hurt} ms"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "full four-seed drop sweep; use release mode"]
+    fn drop_sweep() {
+        let seeds: Vec<u64> = std::env::var("SWEEP_SEEDS")
+            .map_or(vec![1, 2, 3, 4], |s| s.split(',').map(|n| n.parse().unwrap()).collect());
+        let baseline = drop_baseline();
+        let (mut worst_above, mut worst_hurt) = (0i64, 0i64);
+        let mut cases = 0;
+        for seed in seeds {
+            for cadence in [5, 10] {
+                for loss in [0.0, 0.01] {
+                    for aggregate in [0, 2, 5, 10] {
+                        for cross in [0, 1_000_000] {
+                            for (from, to, ramp) in [
+                                (20_000_000, 5_000_000, false),
+                                (20_000_000, 4_000_000, false),
+                                (6_000_000, 2_000_000, false),
+                                (20_000_000, 5_000_000, true),
+                            ] {
+                                let drop = LinkDrop { from, to, ramp, loss, aggregate: MS * aggregate, cross };
+                                for phase in (0..1000).step_by(200) {
+                                    let (above, hurt) = assert_drop_case(&baseline, seed, cadence, phase, drop);
+                                    worst_above = worst_above.max(above);
+                                    worst_hurt = worst_hurt.max(hurt);
+                                    cases += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        println!("SWEEP {cases} cases, worst delta: above {worst_above} ms, voice {worst_hurt} ms");
+        assert!(worst_above <= 0 && worst_hurt <= 0);
+    }
+
+    #[test]
+    fn simulated_jitter_matches_uniform_bounds_order_and_hold() {
+        let now = Instant::now();
+        for jitter in [10, 20] {
+            let mut link = Link::new(None, now);
+            link.delay = 20 * MS;
+            link.jitter = jitter * MS;
+            link.keep_order = true;
+            for i in 0..100u8 {
+                link.send(now + MS * i as u32, &[i]);
+            }
+            let mut previous = now;
+            for (due, data) in &link.flight {
+                let sent = now + MS * data[0] as u32;
+                assert!(*due >= sent + MS * (20 - jitter));
+                assert!(*due <= sent + MS * (20 + jitter));
+                assert!(*due >= previous);
+                previous = *due;
+            }
+        }
+        let mut link = Link::new(None, now);
+        link.delay = 20 * MS;
+        link.jitter = 10 * MS;
+        link.jitter_hold = 10 * MS;
+        link.keep_order = true;
+        for elapsed in [0, 2, 9] {
+            link.send(now + elapsed * MS, &[elapsed as u8]);
+        }
+        let draw = link.jitter_value;
+        assert_eq!(link.flight[1].0 - link.flight[0].0, 2 * MS);
+        assert_eq!(link.flight[2].0 - link.flight[0].0, 9 * MS);
+        link.send(now + 10 * MS, &[10]);
+        assert_ne!(link.jitter_value, draw, "a fresh draw after the hold");
+    }
+
+    fn jitter_case(seed: u64, cadence: u32, jitter: u32, hold: u32, bitrate: u64, key: usize) -> serde_json::Value {
+        let mut sim = Sim::with_seed(None, seed);
+        sim.server_interval = cadence * MS;
+        sim.up.delay = Duration::ZERO;
+        sim.down.delay = 20 * MS;
+        sim.down.jitter = jitter * MS;
+        sim.down.jitter_hold = hold * MS;
+        sim.down.keep_order = true;
+        sim.down.jitter_seed = seed;
+        sim.join("jitter", bitrate, 60, key, 8_000_000);
+        sim.run(60 * SECOND);
+        let mut paused = None;
+        let mut count = 0;
+        let mut total = Duration::ZERO;
+        let mut resumed = Vec::new();
+        for &(at, slot, change) in &sim.changes {
+            if slot != 0 {
+                continue;
+            }
+            match change {
+                Change::Pause(ScreenPauseReason::Bandwidth) => {
+                    if paused.is_none() {
+                        paused = Some(at);
+                        count += 1;
+                    }
+                }
+                Change::Resume => {
+                    if let Some(from) = paused.take() {
+                        let duration = at - from;
+                        total += duration;
+                        resumed.push(duration.as_millis() as u64);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let censored = paused.map(|from| (sim.now - from).as_millis() as u64);
+        if let Some(from) = paused {
+            total += sim.now - from;
+        }
+        serde_json::json!({"pauses": count, "paused_ms": total.as_millis() as u64,
+            "resume_ms": resumed, "censored_ms": censored,
+            "estimate": sim.w.egress.estimate(), "received_packets": sim.received.len()})
+    }
+
+    #[test]
+    #[ignore = "manual seeded jitter picture report"]
+    fn jitter_matrix() {
+        for seed in [1, 2, 3, 42] {
+            for cadence in [5, 10] {
+                for (jitter, hold) in [(10, 0), (20, 0), (10, 10)] {
+                    for (bitrate, key) in [(3_000_000, 32_000), (5_000_000, 150_000)] {
+                        let picture = jitter_case(seed, cadence, jitter, hold, bitrate, key);
+                        println!(
+                            "JITTER {}",
+                            serde_json::json!({"seed": seed, "cadence": cadence,
+                            "jitter_ms": jitter, "hold_ms": hold, "bitrate": bitrate, "key": key,
+                            "picture": picture})
+                        );
+                    }
                 }
             }
         }
