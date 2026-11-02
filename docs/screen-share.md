@@ -2459,6 +2459,33 @@ production estimate did not grow during the first 12 s, as it does in the
 simulator, is not known: the server logged allocation at debug level only,
 which the info-level lines above now cover.
 
+#### A jittery link and the picture: known limitation
+
+Receive jitter of ±10–20 ms can freeze the picture for 15 s or longer even on a
+link with spare capacity. A probe cluster lasts about 8 ms, so jitter can stretch
+its arrival enough to trigger str0m's saturated-probe backoff. The lower estimate
+immediately lowers the SFU budget; keyframes stop fitting, two failed keyframes
+pause the lane, and the ordinary retry ladder starts at 15 s. With little media,
+the acknowledged-rate limit can also prevent the estimate from recovering.
+
+PR #221 preserves this production behavior. The complete vendored str0m source
+and the SFU's egress, allocation, pause and retry code are identical to main at
+1099a681. The retained changes are the netem correlated-jitter profile, simulation
+tools, pinned-main safety coverage and explicit vendored BWE tests in CI.
+
+Three estimator changes were rejected because they hurt voice on real capacity
+drops. A brief SFU pause grace also hurt voice despite preserving the estimate's
+budgets. A final settled-feedback gate preserved main's pauses but never resumed
+early in 48 paired jitter cases: pause counts, total paused time and resume waits
+were identical. A healthy constructed-feedback unit test did not predict the
+actual jitter result. Current senders expose one encoded layer; this experiment
+did not add a lower layer or transcode the source.
+
+The [latency guide](latency.md#screen-share-jitter-known-limitation-and-rejected-recovery-designs)
+records all rejected approaches, the historical browser table, the jitter
+simulation table, censored waits and reproduction commands. No picture-freeze
+fix or production voice improvement is claimed by this PR.
+
 ### Cost on the deployment VM
 
 Egress per viewer equals the share's rate (the SFU never transcodes):

@@ -45,6 +45,34 @@ describe("atomic bounded message storage", () => {
     expect(results.map((r) => r.continuity).sort()).toEqual(["fork", "proven"]);
     expect((await b.checkpoint("key", checkpoint(), "-")).continuity).toBe("rollback");
   });
+  it("does not queue exclusive rechecks of the visible page ahead of unseen history", async () => {
+    const store = new MessageStorage(crypto.randomUUID());
+    for (let i = 0; i < 50; i++) await store.checkpoint(`visible-${i}`, checkpoint(0, `hash-${i}`), "-");
+    const transactions = vi.spyOn(IDBDatabase.prototype, "transaction");
+    try {
+      // The view rechecks its 50 admitted messages while the next history page arrives.
+      const visible = Array.from({ length: 50 }, (_, i) => store.checkpoint(`visible-${i}`, checkpoint(0, `hash-${i}`), "-"));
+      const older = store.checkpoint("older", checkpoint(0, "older"), "-");
+      expect(await older).toEqual({ continuity: "proven", duplicate: false, order: 0 });
+      expect(await Promise.all(visible)).toEqual(Array.from({ length: 50 }, () => ({ continuity: "proven", duplicate: true, order: 0 })));
+      // Only the unseen revision needs an exclusive transaction and strict persistence.
+      expect(transactions.mock.calls.filter(([, mode]) => mode === "readwrite")).toHaveLength(1);
+    } finally { transactions.mockRestore(); }
+  });
+  it("rechecks duplicates against persisted revisions and every immutable binding", async () => {
+    const name = crypto.randomUUID(), a = new MessageStorage(name), b = new MessageStorage(name);
+    const original = { ...checkpoint(), files: "original files" };
+    await a.checkpoint("key", original, "-");
+    expect(await a.checkpoint("key", original, "-")).toMatchObject({ continuity: "proven", duplicate: true });
+    for (const changed of [{ created: 2 }, { conversation: "channel:8" }, { files: "other files" }, { hash: "other hash" }]) {
+      expect(await a.checkpoint("key", { ...original, ...changed }, "-")).toMatchObject({ continuity: "fork", duplicate: false });
+    }
+    await b.checkpoint("key", { ...original, revision: 1, hash: "new hash" }, "hash");
+    expect(await a.checkpoint("key", original, "-")).toMatchObject({ continuity: "rollback", duplicate: false });
+    await b.checkpoint("key", { ...original, revision: 2, hash: "deleted", deleted: true }, "new hash");
+    expect(await a.checkpoint("key", { ...original, revision: 2, hash: "deleted", deleted: true }, "new hash")).toMatchObject({ continuity: "proven", duplicate: true });
+    expect(await a.checkpoint("key", { ...original, revision: 3, hash: "resurrected" }, "deleted")).toMatchObject({ continuity: "fork", duplicate: false });
+  });
   it("evicts the oldest checkpoint at the explicit bound", async () => {
     const name = crypto.randomUUID(), checkpoints: Record<string, unknown> = {};
     for (let i = 0; i < MAX_CHECKPOINTS; i++) checkpoints[`key-${i}`] = { ...checkpoint(0, `hash-${i}`, i), proven: true };
@@ -250,8 +278,11 @@ describe("per-record storage work", () => {
       await store.checkpoint("server:author:message", checkpoint(), "-");
       expect(puts).toHaveBeenCalledOnce();
       expect(puts.mock.calls[0]?.[1]).toBe("server:author:message");
-      expect(transactions).toHaveBeenCalledTimes(2);
-      expect(transactions.mock.calls.every(([stores, mode]) => JSON.stringify(stores) === '["checkpoints","order"]' && mode === "readwrite")).toBe(true);
+      expect(transactions.mock.calls).toEqual([
+        [["checkpoints"], "readonly", { durability: "strict" }],
+        [["checkpoints", "order"], "readwrite", { durability: "strict" }],
+        [["checkpoints"], "readonly", { durability: "strict" }],
+      ]);
     } finally { puts.mockRestore(); transactions.mockRestore(); }
   });
   it("reads thread authorization in one transaction and aborts an extra feed at the eight-service bound", async () => {
