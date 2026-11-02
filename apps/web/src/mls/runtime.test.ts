@@ -50,7 +50,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
         case "sending_key": return [g!.record.checkpoint!.epoch, Array(32).fill(1)];
         case "seal_message": return [9];
         case "pending": g!.record.server_pending = d!.pending as boolean; return null;
-        case "settle": if (d!.winner) g!.record = summary().record; else this.state.groups = []; return !!d!.winner;
+        case "settle": if (d!.winner) { g!.record = summary().record; g!.live = true; } else this.state.groups = []; return !!d!.winner;
         case "welcome":
         case "replace_stale_welcome": {
           const duplicate = this.state.welcomes.includes(d!.id as string);
@@ -132,6 +132,7 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
     chunks: [] as { id: string; group: string; sender_uid: string; chunk: string }[],
     wanted: [] as { group: string; device: string; assignment?: string }[], nothingToShare: false,
     commitError: null as RequestError | null, requestError: null as RequestError | null, shareError: false, ackError: false,
+    createError: null as Error | null, lostCreateAnswer: false,
     beforeLog: null as null | (() => Promise<void>),
     /** Epochs the tree endpoint answers with, in order; then the log head. */
     treeEpochs: [] as number[],
@@ -171,7 +172,11 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
         case "mls.history.ack": expect((await durable()).imports).toBeGreaterThan(0); world.chunks = world.chunks.filter(c => !(data.ids as string[]).includes(c.id)); return {};
         case "mls.history.wanted": return { wanted: world.wanted, next: null };
         case "mls.history.request": if (world.requestError) throw world.requestError; return {};
-        case "mls.group.create": world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }]; return { group };
+        case "mls.group.create":
+          if (world.createError) throw world.createError;
+          world.groups = [{ conversation, group, incarnation: 0, epoch: 0, pending: false }];
+          if (world.lostCreateAnswer) { world.lostCreateAnswer = false; throw new Error("lost create answer"); }
+          return { group };
         case "mls.history.decline": return {};
         case "mls.group_history": return { incarnations: world.chain, next: null };
         case "owner.chain": return { genesis: "genesis", links: [], next: null };
@@ -214,6 +219,44 @@ async function fixture(initial = clean(), hasRemoteGroup = true, options: Option
   };
 }
 describe("MLS synchronization", () => {
+  it("retries an explicitly opened DM after creation failed before the server knew the group", async () => {
+    conversation = `dm:${[await uidForPublicKey(device), b64(5,20)].sort().join(":")}`;
+    const f = await fixture(clean(), false);
+    f.world.createError = new RequestError("rate_limited", "try later");
+    await expect(f.runtime.openConversation(conversation)).rejects.toThrow("try later");
+    expect(f.runtime.status(conversation)).toBe("securing");
+    expect(f.world.groups).toEqual([]);
+    f.world.createError = null;
+    await f.runtime.sync();
+    expect(f.calls.filter(c => c.op === "mls.group.create")).toHaveLength(2);
+    expect(f.runtime.status(conversation)).toBe("ready");
+    await f.runtime.sync();
+    expect(f.calls.filter(c => c.op === "mls.group.create")).toHaveLength(2);
+  });
+  it("recovers a lost creation answer by settling the server's winner without creating twice", async () => {
+    conversation = `dm:${[await uidForPublicKey(device), b64(5,20)].sort().join(":")}`;
+    const f = await fixture(clean(), false);
+    f.world.lostCreateAnswer = true;
+    await expect(f.runtime.openConversation(conversation)).rejects.toThrow("lost create answer");
+    await f.runtime.sync();
+    expect(f.runtime.status(conversation)).toBe("ready");
+    expect(f.calls.filter(c => c.op === "mls.group.create")).toHaveLength(1);
+  });
+  it("backs off a repeatedly rejected DM without losing the open intent", async () => {
+    let now = Date.now();
+    conversation = `dm:${[await uidForPublicKey(device), b64(5,20)].sort().join(":")}`;
+    const f = await fixture(clean(), false, { now: () => now });
+    f.world.createError = new RequestError("rate_limited", "try later");
+    await expect(f.runtime.openConversation(conversation)).rejects.toThrow();
+    await f.runtime.sync();
+    const count = f.calls.filter(c => c.op === "mls.group.create").length;
+    await f.runtime.sync();
+    expect(f.calls.filter(c => c.op === "mls.group.create")).toHaveLength(count);
+    now += 1000;
+    f.world.createError = null;
+    await f.runtime.sync();
+    expect(f.runtime.status(conversation)).toBe("ready");
+  });
   it("settles persisted Creating groups from the authoritative group list", async () => {
     const f = await fixture({ ...clean(), groups: [summary("creating")] });
     expect(f.operations.some(op => op.op === "settle")).toBe(true);
