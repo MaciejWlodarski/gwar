@@ -17,8 +17,8 @@ The only source change, marked `Gwar:` in `src/config.rs` and
 - The transparent mode now reaches the multichannel config too. Upstream leaves
   that config on Legacy whatever was asked for.
 
-`crates/gwar-client/src/voice/apm.rs` turns detection off when a voice session's
-first share sound pins the canceller to stereo. Regressions there:
+`crates/gwar-client/src/voice/apm.rs` builds its stereo canceller with detection off,
+training it beside the mono one for the first share sound. Regressions there:
 `stereo_bursts_never_leak_once_pinned`,
 `wide_sound_after_voice_is_cancelled_from_when_it_is_learned`,
 `wide_sound_after_five_minutes_of_voice`.

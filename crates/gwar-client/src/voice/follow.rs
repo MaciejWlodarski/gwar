@@ -20,6 +20,8 @@ pub enum Side {
 pub struct Offer {
     /// The system default device's name; `None` when there is no device at all.
     pub default: Option<String>,
+    /// The default device itself: two endpoints can go by one name.
+    pub default_id: Option<String>,
     pub names: Vec<String>,
 }
 
@@ -82,6 +84,8 @@ pub struct Follow {
     /// The system default when the open stream was opened: a loss after the default changed
     /// is the change, not a broken device.
     opened_default: Option<String>,
+    /// The device itself behind that default, or the one it moved to since.
+    endpoint: Option<String>,
     /// The last route opened since the user chose `wanted`; a change of kind is announced.
     last: Option<Route>,
     failure: Option<Failure>,
@@ -90,6 +94,8 @@ pub struct Follow {
     reported: bool,
     /// Microphone access is denied: not retried until the engine restarts.
     blocked: bool,
+    /// The operating system took the open stream to another device: [`Follow::take_followed`].
+    followed: bool,
 }
 
 impl Follow {
@@ -100,12 +106,25 @@ impl Follow {
             open: None,
             opened_at: None,
             opened_default: None,
+            endpoint: None,
             last: None,
             failure: None,
             bench: None,
             reported: false,
             blocked: false,
+            followed: false,
         }
+    }
+
+    /// The operating system says it took the open stream elsewhere. Its word counts even when
+    /// the offer looks the same: not every move shows there.
+    pub fn rerouted(&mut self) {
+        self.followed = true;
+    }
+
+    /// Whether the open stream went to another device since the last time this was asked.
+    pub fn take_followed(&mut self) -> bool {
+        std::mem::take(&mut self.followed)
     }
 
     /// The user chose another device (`None`: the system default). True if that changes anything.
@@ -140,7 +159,9 @@ impl Follow {
         let target = self.target(offer, now);
         match &mut self.open {
             Some(Route::Default(name)) if self.reroutes && matches!(target, Route::Default(Some(_))) => {
+                self.followed |= *name != offer.default || self.endpoint != offer.default_id;
                 name.clone_from(&offer.default);
+                self.endpoint.clone_from(&offer.default_id);
                 self.opened_default.clone_from(&offer.default);
                 Plan::Keep
             }
@@ -190,6 +211,8 @@ impl Follow {
         self.open = Some(route.clone());
         self.opened_at = Some(now);
         self.opened_default.clone_from(&offer.default);
+        self.endpoint.clone_from(&offer.default_id);
+        self.followed = false;
         self.last = Some(route);
         // A stream that kept dying is trusted again only once it survives (see `settle`).
         let probation = self.failure.as_ref().is_some_and(|f| f.offer.is_none());
@@ -292,7 +315,11 @@ mod tests {
     use super::*;
 
     fn offer(default: Option<&str>, names: &[&str]) -> Offer {
-        Offer { default: default.map(str::to_owned), names: names.iter().map(|n| (*n).to_owned()).collect() }
+        Offer {
+            default: default.map(str::to_owned),
+            default_id: None,
+            names: names.iter().map(|n| (*n).to_owned()).collect(),
+        }
     }
 
     fn default(name: &str) -> Route {

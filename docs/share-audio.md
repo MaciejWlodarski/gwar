@@ -262,15 +262,40 @@ worker → share_playback_frames (raw batch, one in flight, 400 frames at most)
   Both go to the device as pairs through one ring, so they cannot slip apart. Voice alone
   keeps one channel, to the bit what it was before share sound existed. The first non-silent
   share sound that actually plays pins a stereo canceller for the rest of that voice session,
-  even after the share ends, so hopping between shares costs one relearn. A sharer, a deafened
+  even after the share ends, so hopping between shares switches only once. A sharer, a deafened
   viewer and a viewer who muted the share stay on one channel. A reconnect replaces the
-  pipeline, so it starts on one channel and pins again at the next share sound. A sleeping
-  worker starts with each voice session, before the pipeline is promoted, and builds the stereo
-  canceller when told; the pin itself touches neither the heap nor a lock. The stereo
-  canceller hears everything while it learns, 3 s of sound,
-  with voice still coming from the mono one; a raised-cosine frame hands over. So voice echo
-  and level do not change for the first 3 s, but wide share sound leaks for about that long
-  (see [validation](share-audio-validation.md#voice)). Vendored Sonora adds the one option
+  pipeline, so it starts on one channel and pins again at the next share sound.
+
+  A worker starts with each voice session, before the pipeline is promoted, and trains a stereo
+  canceller beside the mono one on the same microphone and speakers, off the voice thread. The
+  voice thread only copies frames into a fixed ring and never waits. Voice alone still comes out
+  of the mono canceller, to the bit. Past half a second of silent speakers the worker hears
+  nothing, so a quiet session costs a sleeping thread. The pin, taking the canceller and the
+  take-over touch neither the heap nor a lock.
+
+  What happens at the first share sound depends on whether that canceller found an echo, which
+  it counts as having taken the microphone down by 12 dB at some point:
+
+  - **Echo found, speakers.** It takes over 5 frames of sound after the pin; a raised-cosine frame
+    hands over. It needs 3 s of sound behind it, or it hears the rest beside the mono one first.
+    Wide sound does not leak and voice echo does not rise.
+  - **No echo found.** Headphones, very quiet speakers, or nobody has yet talked alone at the far
+    side. It is left behind and a new stereo canceller hears 3 s of sound beside the mono one, with
+    voice still from the mono one, as it would without any of this. Headphones have no leak to stop,
+    and a trained canceller holds the near voice down harder at new sound than a new one does.
+    Wide sound does leak here, on quiet speakers and on speakers nobody has heard alone yet.
+
+  What it learned is only good for that room and that stretch of the session, so a new microphone
+  or speakers start it over, and so does a frame it lost for being a whole ring behind, or the
+  canceller being turned off. Whatever it has found before then counts for nothing. It takes over
+  only having heard every frame up to the one it takes over at, and it gets a quarter of a second
+  to catch up: a later one is refused and the second way follows, voice on the mono canceller
+  throughout. Once in charge it still knows it learned one room: at a new device, however late the
+  news comes, the worker trains another for 3 s of sound, and that one replaces it in a single
+  frame.
+
+  A reconnect starts over, so with a share already playing it takes the second way
+  (see [validation](share-audio-validation.md#warm-stereo-canceller)). Vendored Sonora adds the one option
   this needs ([`vendor/sonora/GWAR-PATCH.md`](../vendor/sonora/GWAR-PATCH.md)). Selecting an
   output device needs nothing new.
 - **Controls:** the same per-share volume and mute as a browser (`shareAudio`), independent
