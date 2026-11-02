@@ -389,7 +389,9 @@ is measured from that aim.
 **The picture waits.** Sound carries speech, and a picture a few tens of milliseconds later is the
 smaller loss. `jitterBufferTarget` is a minimum, so a wait starts from the delay the receiver
 already has. The first look moves the whole way, since nobody has seen the picture settle; later
-ones move at most 40 ms at half the error, and nothing moves for less than 10 ms. A picture that
+ones move at most 40 ms at half the error, and nothing moves for less than 10 ms. A wait starts only
+when sound is 45 ms past the aim, short of the range's edge: below that it would only add latency and
+push sound towards the edge it must not lead past. A picture that
 keeps agreeing gives 5 ms a second back, because a browser's own sync pulls each side up to the
 other and a lag alone would never show that a wait is no longer needed.
 
@@ -400,7 +402,8 @@ over 100 ms; when the wait falls it plays 1 % faster until the queue is back. Wi
 mixer reads exactly as before. While sound is not ahead it keeps giving a wait back. In a browser
 the engine's own sync moves sound; a second controller on the same pair only drove both up.
 
-A late joiner settles for two looks and starts alone, per slot. A paused picture moves nothing, so
+A watch settles for ten looks before anything moves, per slot: its keyframes and buffers are still
+landing, and the engine's own sync gets there by itself. A paused picture moves nothing, so
 the waits are still there for the resume, and the next look corrects what the pause changed. Muting
 and deafening release both waits, since nothing heard is left to line up with, and sound coming back
 starts over like a new watch. A server without the query answers `bad_request` once and the viewer does not ask
@@ -414,6 +417,10 @@ is 1.5 s late stops holding the sound back, because sound matters more. Past tha
 picture can still run 300–700 ms behind for a few seconds, while the sharer's encoder and uplink
 ramp; that is the first viewer of a new share only, and sound does not wait for it, because the
 picture catches up by itself and sound held for it would then lag.
+
+Stopping sound and bringing it back is the case this does not cover. The publisher's RTP time stays
+behind its clock by the length of the stop, so for 10–20 s the engine holds the picture 300–470 ms
+late, with or without this, and sound leads by that much.
 
 What this cannot fix is a picture that is not arriving: on a link jittery enough to collapse the
 estimate it can stop altogether, and sound then leads whatever is done here. The numbers are in
@@ -429,7 +436,8 @@ paused the picture for more than 10 s, on a link that was back and proven second
 
 So a viewer drops the backlog before its receiver sees it (`apps/web/src/voice/late-frames.ts`).
 `RTCRtpScriptTransform` runs on each received frame and works out how much longer it took than the
-quickest of the last few seconds, by the media's own clock. A picture frame over 500 ms late, or a
+quickest of the last few seconds, by the media's own clock. It only acts after arrivals stopped for
+200 ms: frames that are late without that are a queue, which the receiver drains by itself. A picture frame over 500 ms late, or a
 sound frame over 200 ms late, goes; in the desktop app sound leaves for the mixer, which drops late
 frames itself. Keyframes are always kept. Nothing is shed for more than a second in a row: a link
 that stays that slow is the link now, and it sets the new measure. Without script transforms a
