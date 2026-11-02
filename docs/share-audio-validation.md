@@ -1093,11 +1093,12 @@ Before the sender report fix, adding sound took a browser viewer to 0/19 and 0/2
 1400 ms late, and to about 900 ms without it. Stopping and returning leaves the publisher's RTP time
 behind its clock by the length of the stop, so the engine's sync moves the picture 300–470 ms late for
 10–20 s on both viewers, and sound leads by that much, with or without sync. Those runs are bimodal
-(0 to 21 of 21 each), and two earlier batches gave 28/86 with sync and 24/44 without. In a browser sync
+(0 to 21 of 21 each), and earlier batches gave 39/134 with sync and 24/44 without. In a browser sync
 can do nothing about a late picture. Fixing the cause means rewriting audio RTP time at the SFU, which
 was not done.
 
-The target is met nearly everywhere settled. Elsewhere:
+Settled, the target holds on 0.96 or more of bursts on every link without a stall, and on 0.72 to 0.90
+around stalls. Elsewhere:
 
 - **A 2 s stall.** Counting from the first picture after it, in the five bursts from 3 to 8 s:
 
@@ -1122,7 +1123,7 @@ engine holds a start and a jittery link better than a wait does, so:
 - A picture wait starts after ten looks, not two: at ±5 ms and two looks, 269/279 and 22/75 in the first
   12 s on the browser, against 282/282 and 56/75 without sync.
 - The filter acts only after arrivals stopped for 200 ms. Before that it took a queue for a stall: at
-  ±10 ms the desktop was 121/141 with the filter alone and 137/140 with the waits alone.
+  ±10 ms the desktop was 121/141 with the filter alone and 137/140 with the waits alone, in four runs.
 - A wait starts only 45 ms past the aim. Without that the desktop at ±5 ms was 261/281.
 
 **Sync aims 40 ms late, not at zero.** Zero sits 45 ms from the edge sound must not pass, so a link's

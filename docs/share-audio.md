@@ -437,7 +437,8 @@ paused the picture for more than 10 s, on a link that was back and proven second
 So a viewer drops the backlog before its receiver sees it (`apps/web/src/voice/late-frames.ts`).
 `RTCRtpScriptTransform` runs on each received frame and works out how much longer it took than the
 quickest of the last few seconds, by the media's own clock. It only acts after arrivals stopped for
-200 ms: frames that are late without that are a queue, which the receiver drains by itself. A picture frame over 500 ms late, or a
+200 ms: frames that are late without that are a queue, which the receiver drains by itself. A
+picture frame over 500 ms late, or a
 sound frame over 200 ms late, goes; in the desktop app sound leaves for the mixer, which drops late
 frames itself. Keyframes are always kept. Nothing is shed for more than a second in a row: a link
 that stays that slow is the link now, and it sets the new measure. Without script transforms a
