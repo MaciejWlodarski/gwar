@@ -16,6 +16,8 @@
  *   SYNC_OFF=1                                  main's playback, for a before: no picture wait, no sound
  *                                               hold, no late-frame filter (so no stall report), no held
  *                                               start; the run fails if any of these was not seen refused
+ *   SYNC_ADD=1                                  the share starts with no sound and gets it 8 s into the watch
+ *   SYNC_RETURN=1                               the sound stops 8 s into the watch and returns 5 s later
  *   SYNC_OUT=path.json                          every burst and the summaries
  */
 import { spawn, spawnSync } from "node:child_process";
@@ -29,7 +31,7 @@ import { fileURLToPath } from "node:url";
 import { chromium, webkit } from "playwright";
 import { chooseFirstRunName } from "./first-run.mjs";
 import { stopProcesses } from "./processes.mjs";
-import { SOUND_GAPS_MS, baselineFaults, offsetSummary, pairBursts } from "./share-sync-judge.mjs";
+import { ONSET_QUIET_MS, SOUND_CODES, baselineFaults, offsetSummary, pairBursts } from "./share-sync-judge.mjs";
 
 const webRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const repoRoot = path.resolve(webRoot, "../..");
@@ -70,8 +72,8 @@ async function waitFor(check, what, timeout = 30_000) {
 
 /**
  * The source tab. A burst is planned 100 ms ahead so the audio graph can start it on its exact
- * sample, and the first draw at or after that instant carries the burst's number. Its sound is two
- * pulses whose gap carries the number too, so sound late by whole bursts stays with its own burst.
+ * sample, and the first draw at or after that instant carries the burst's number. Its sound is four
+ * pulses whose gaps carry the number too, so sound late by any whole seconds stays with its burst.
  * A 5 ms timer keeps the draw within a few milliseconds whatever the compositor's rhythm.
  */
 const sourcePage = `<!doctype html><title>${SOURCE_TITLE}</title><style>html,body{margin:0;height:100%;overflow:hidden;background:#777}canvas{display:block;width:100vw;height:100vh}</style>
@@ -81,8 +83,8 @@ const audio = new AudioContext({ sampleRate: 48000 }), tone = audio.createOscill
 tone.frequency.value = 997; gain.gain.value = 0; tone.connect(gain).connect(audio.destination); tone.start();
 window.__bursts = []; window.__toneContext = audio;
 let burst = 0, plan = null, nextPlan = 0, tick = 0;
-const GAPS = ${JSON.stringify(SOUND_GAPS_MS)};
-function pulse(when) { gain.gain.setValueAtTime(0.2, when); gain.gain.setValueAtTime(0, when + 0.06); }
+const CODES = ${JSON.stringify(SOUND_CODES)};
+function pulse(when) { gain.gain.setValueAtTime(0.2, when); gain.gain.setValueAtTime(0, when + 0.04); }
 function bits(n) { const out = []; for (let i = 11; i >= 0; i--) out.push((n >> i) & 1); const check = (n ^ (n >> 4) ^ (n >> 8) ^ 10) & 15; for (let i = 3; i >= 0; i--) out.push((check >> i) & 1); return out; }
 function paint() {
   const { width: w, height: h } = canvas;
@@ -99,7 +101,9 @@ setInterval(() => {
   if (!plan && audio.state === "running" && now >= nextPlan) {
     const at = now + 100, stamp = audio.getOutputTimestamp();
     const when = stamp.contextTime + (at - stamp.performanceTime) / 1000;
-    pulse(when); pulse(when + GAPS[((burst + 1) & 4095) % GAPS.length] / 1000);
+    let next = when;
+    pulse(next);
+    for (const gap of CODES[((burst + 1) & 4095) % CODES.length]) pulse(next += gap / 1000);
     plan = { at };
     nextPlan = at + 900;
   }
@@ -180,14 +184,17 @@ function viewerPatch() {
       }
       video.requestVideoFrameCallback(frame);
     };
-    const find = () => {
-      video = document.querySelector("video[data-share]");
-      if (video && video.requestVideoFrameCallback) video.requestVideoFrameCallback(frame); else setTimeout(find, 100);
-    };
-    find();
+    // The stage can replace its element during a watch.
+    setInterval(() => {
+      const current = document.querySelector("video[data-share]");
+      if (current === video) return;
+      video = current;
+      video?.requestVideoFrameCallback(frame);
+    }, 100);
   };
   /** A browser viewer's sound: the same track its `<audio>` plays, through a silent tap. */
-  window.__followSound = element => {
+  window.__followSound = (element, quietSamples) => {
+    void window.__syncAudio?.close();
     const context = new AudioContext({ sampleRate: 48000 });
     void context.resume();
     const source = context.createMediaStreamSource(element.srcObject);
@@ -206,7 +213,7 @@ function viewerPatch() {
             window.__onsets.push(performance.timeOrigin + stamp.performanceTime + (playedAt - stamp.contextTime) * 1000);
           }
           quiet = 0;
-        } else if (++quiet > 9600) armed = true;
+        } else if (++quiet > quietSamples) armed = true;
       }
     };
     source.connect(tap); tap.connect(mute).connect(context.destination);
@@ -266,6 +273,16 @@ async function device(browser, web, server, name, native = false) {
     } });
   });
   await context.addInitScript(viewerPatch);
+  // The picker's first answer has the tab's picture only, as a share nobody asked sound for.
+  if (process.env.SYNC_ADD) await context.addInitScript(() => {
+    const pick = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
+    let first = true;
+    navigator.mediaDevices.getDisplayMedia = options => {
+      const audio = !first;
+      first = false;
+      return pick(audio ? options : { ...options, audio: false });
+    };
+  });
   const page = await context.newPage();
   if (native) {
     page.native = nativeFixture();
@@ -320,12 +337,28 @@ async function viewer(browser, web, server, sharer, kind) {
   page.kind = kind;
   await joinDefault(page);
   await page.getByRole("button", { name: `${sharer} is sharing their screen. Click to watch.` }).click();
-  if (kind === "browser") {
-    await page.locator("audio[data-share-audio]").waitFor({ state: "attached", timeout: 20_000 });
-    await page.evaluate(() => window.__followSound(document.querySelector("audio[data-share-audio]")));
-  } else await page.getByTestId("share-audio-controls").waitFor({ timeout: 20_000 });
+  if (!process.env.SYNC_ADD) await followSound(page);
+  else await page.locator("video").first().waitFor({ state: "attached", timeout: 20_000 });
   await page.evaluate(() => { window.__followPicture(); window.__followHealth(); });
   return page;
+}
+
+async function followSound(page) {
+  if (page.kind === "browser") {
+    await page.locator("audio[data-share-audio]").waitFor({ state: "attached", timeout: 20_000 });
+    await page.evaluate(quiet => window.__followSound(document.querySelector("audio[data-share-audio]"), quiet), ONSET_QUIET_MS * 48);
+  } else await page.getByTestId("share-audio-controls").waitFor({ timeout: 20_000 });
+}
+
+/** The sharing bar's Turn on sound, then Details' Choose a tab; the viewers need no new watch. */
+async function turnOnSound(sharer, viewers) {
+  await sharer.bringToFront();
+  await sharer.getByTestId("share-audio-add").first().click();
+  await sharer.getByRole("dialog").getByRole("button", { name: "Choose a tab", exact: true }).click();
+  await waitFor(() => sharer.evaluate(async () => (await window.__gwarE2eImport("/src/state/screen.ts")).useScreen.getState().own?.audio === true), "sound joined the share", 15_000);
+  await sharer.keyboard.press("Escape");
+  await Promise.all(viewers.map(followSound));
+  return Date.now();
 }
 
 async function viewerRecord(page) {
@@ -374,14 +407,22 @@ async function run() {
 
     const watching = [];
     for (const kind of VIEWERS) watching.push(await viewer(viewerEngine, web, ready.url, "sync-sharer", kind));
+    let soundBack = null;
+    if (process.env.SYNC_ADD) { await sleep(8_000); soundBack = await turnOnSound(sharer, watching); }
+    if (process.env.SYNC_RETURN) {
+      await sleep(8_000);
+      await sharer.evaluate(async () => (await window.__gwarE2eImport("/src/state/screen.ts")).useScreen.getState().own.stream.getAudioTracks().forEach(track => track.stop()));
+      await sleep(5_000);
+      soundBack = await turnOnSound(sharer, watching);
+    }
     await sleep(seconds * 1000);
     const bursts = await source.evaluate(() => window.__bursts);
-    const report = { net: netName, spec: netSpec, bursts, viewers: {} };
+    const report = { net: netName, spec: netSpec, bursts, soundBack, viewers: {} };
     for (const page of watching) {
       const record = await viewerRecord(page);
       if (process.env.SYNC_OFF) assert.deepEqual(baselineFaults(record.baseline), [], `the ${page.kind} viewer's baseline is not main`);
       const pairs = pairBursts(bursts, record.presented, record.onsets);
-      report.viewers[page.kind] = { summary: offsetSummary(pairs), pairs, mixer: record.mixer, health: record.health, presented: record.presented, audible: record.audible, granted: record.granted };
+      report.viewers[page.kind] = { summary: offsetSummary(pairs), pairs, onsets: record.onsets, mixer: record.mixer, health: record.health, presented: record.presented, audible: record.audible, granted: record.granted };
       console.log(JSON.stringify({ net: netName, viewer: page.kind, ...offsetSummary(pairs), drawn: bursts.length, mixer: record.mixer }));
       console.log(pairs.map(pair => pair.offsetMs.toFixed(0)).join(" "));
     }

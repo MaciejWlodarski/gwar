@@ -1,10 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { SOUND_GAPS_MS, baselineFaults, offsetSummary, pairBursts, soundGapMs } from "./share-sync-judge.mjs";
+import { SOUND_GAPS_MS, baselineFaults, offsetSummary, pairBursts, soundGapsMs } from "./share-sync-judge.mjs";
 
 const bursts = [{ burst: 1, drawnAt: 1_000 }, { burst: 2, drawnAt: 2_000 }, { burst: 3, drawnAt: 3_000 }];
-/** The two onsets of a burst whose sound starts at `at`. */
-const heard = (burst, at) => [at, at + soundGapMs(burst)];
+/** The onsets of a burst whose sound starts at `at`. */
+const heard = (burst, at) => soundGapsMs(burst).reduce((pulses, gap) => [...pulses, pulses.at(-1) + gap], [at]);
 
 test("sound a whole burst late is paired by its number, not by what was drawn last", () => {
   const presented = bursts.map(({ burst, drawnAt }) => ({ burst, at: drawnAt + 100 }));
@@ -14,10 +14,31 @@ test("sound a whole burst late is paired by its number, not by what was drawn la
   assert.equal(offsetSummary(pairs).inRange, 0);
 });
 
-test("half a burst says nothing: a lost second pulse leaves no row, and never a wrong one", () => {
+test("sound seconds late stays with its burst however many bursts have passed", () => {
+  const many = Array.from({ length: 30 }, (_, n) => ({ burst: n + 1, drawnAt: 1_000 * (n + 1) }));
+  const presented = many.map(({ burst, drawnAt }) => ({ burst, at: drawnAt + 100 }));
+  for (const late of [5_060, 10_060, 25_060]) {
+    const sound = many.flatMap(({ burst, drawnAt }) => heard(burst, drawnAt + late));
+    const pairs = pairBursts(many, presented, sound);
+    assert.equal(pairs.length, many.length);
+    assert.ok(pairs.every(pair => pair.offsetMs === late - 100), `${late}: ${pairs[0].offsetMs}`);
+    assert.equal(offsetSummary(pairs).inRange, 0);
+  }
+});
+
+test("a number that fits two bursts of the run pairs with neither", () => {
+  const long = Array.from({ length: 140 }, (_, n) => ({ burst: n + 1, drawnAt: 1_000 * (n + 1) }));
+  const presented = long.map(({ burst, drawnAt }) => ({ burst, at: drawnAt + 100 }));
+  assert.deepEqual(pairBursts(long, presented, heard(130, 130_150)), []);
+  assert.equal(pairBursts(long, presented, heard(100, 100_150)).length, 1);
+});
+
+test("a burst that lost any pulse says nothing, and never something wrong", () => {
   const presented = bursts.map(({ burst, drawnAt }) => ({ burst, at: drawnAt + 100 }));
-  assert.deepEqual(pairBursts(bursts, presented, [heard(1, 1_100)[0], ...heard(2, 2_100)]).map(pair => pair.burst), [2]);
-  assert.deepEqual(pairBursts(bursts, presented, [heard(1, 1_100)[1], ...heard(2, 2_100)]).map(pair => pair.burst), [2]);
+  for (let lost = 0; lost < 4; lost++) {
+    const broken = heard(1, 1_100).filter((_, pulse) => pulse !== lost);
+    assert.deepEqual(pairBursts(bursts, presented, [...broken, ...heard(2, 2_100)]).map(pair => pair.burst), [2]);
+  }
 });
 
 test("a positive offset means the sound comes after the picture", () => {
@@ -42,14 +63,9 @@ test("the range is the task's: sound may lead 45 ms and lag 125", () => {
   assert.deepEqual(offsetSummary([]), { bursts: 0 });
 });
 
-test("a second pulse and the next burst's first can never read as a code", () => {
+test("the end of one burst and the start of the next can never read as a digit", () => {
   const period = 1_000, longest = Math.max(...SOUND_GAPS_MS);
-  assert.ok(period - longest > longest + 20);
-  const presented = bursts.map(({ burst, drawnAt }) => ({ burst, at: drawnAt + 100 }));
-  for (let burst = 0; burst < SOUND_GAPS_MS.length; burst++) {
-    const [, second] = heard(burst, 1_150);
-    assert.deepEqual(pairBursts(bursts, presented, [second, 1_000 + 1_150]), []);
-  }
+  assert.ok(period - 3 * longest > longest + 15);
 });
 
 test("a baseline is main's only if what this work added was seen and refused", () => {

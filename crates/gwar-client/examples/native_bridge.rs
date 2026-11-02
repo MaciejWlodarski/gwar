@@ -45,7 +45,7 @@ const WINDOW: usize = 4096;
 /// The tone the fixture's "computer" plays while a share captures its sound.
 const COMPUTER_TONE: f64 = 997.0;
 /// A burst starts after this many quiet samples, and above this level.
-const ONSET_QUIET: usize = RATE / 5;
+const ONSET_QUIET: usize = RATE * 60 / 1000;
 const ONSET_LEVEL: f32 = 0.02;
 
 struct ToneIo {
