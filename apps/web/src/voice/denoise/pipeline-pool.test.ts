@@ -82,8 +82,8 @@ describe("one prepared suppression pipeline", () => {
     expect(create).toHaveBeenCalledTimes(2);
     a.close(); await flush(); b.close(); await flush();
     expect(pool.status().pipelines).toBe(1);
-    expect(raws[1]!.close).toHaveBeenCalledOnce();
-    expect(raws[0]!.close).not.toHaveBeenCalled();
+    expect(raws[0]!.close).toHaveBeenCalledOnce();
+    expect(raws[1]!.close).not.toHaveBeenCalled();
   });
 
   it("cancels one waiting call without cancelling the prebuild or a later owner", async () => {
@@ -117,6 +117,7 @@ describe("one prepared suppression pipeline", () => {
     pool.configure(true, true); await idle();
     const oldEvents = events(), leased = await acquire(oldEvents);
     pool.configure(false, true);
+    expect(raws[0]!.clones[0]!.stop).toHaveBeenCalledOnce();
     reports[0]!.changed(); reports[0]!.trouble("stale"); leased.close();
     expect(raws[0]!.close).toHaveBeenCalledOnce();
     expect(oldEvents.changed).not.toHaveBeenCalled(); expect(oldEvents.trouble).not.toHaveBeenCalled();
