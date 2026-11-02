@@ -550,4 +550,3 @@ test voice::apm::tests::warmed_voice_alone_fingerprint ... warmed voice alone fi
 ok
 
 test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 379 filtered out; finished in 4.03s
-
