@@ -24,3 +24,13 @@ training it beside the mono one for the first share sound. Regressions there:
 `wide_sound_after_five_minutes_of_voice`.
 
 Drop this patch if upstream exposes both settings.
+
+## PR #223 measurement control
+
+`EchoCanceller.multichannel_suppressor_like_mono` defaults to false. The isolated,
+ignored `independent_talker_channel_tradeoffs` test can set it for stereo stages
+only, through a test-only flag in Gwar. It copies two values from the default mono
+configuration into the multichannel suppressor: `max_inc_factor` (2.0 instead of
+1.5) and `max_dec_factor_lf` (0.25 instead of 0.35). The multichannel adaptive filter
+keeps its existing coarse-filter lengths and rates. The application does not set
+this option; choosing a production tuning requires the owner's voice/echo decision.

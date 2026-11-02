@@ -742,6 +742,13 @@ mouth-to-ear.
 
 ### Warm stereo canceller
 
+**Near-voice fixture correction (PR #223).** The historical near-voice tables below
+use `voice()` / `long_voice()` for both talkers. Those fixtures share their vibrato
+and syllable rates, and overlapping harmonics can look like delayed far speech.
+The independent `talker()` audit below supersedes claims about how much near voice
+is preserved. Echo-only measurements have no near talker and are listed separately.
+
+
 The learning above is gone on speakers: a stereo canceller trains off the voice thread for the whole
 session and takes over within 5 frames of sound after the pin. "Cold" below is that earlier
 behaviour, which is what is left when no echo was found, and the rows are in release:
@@ -1011,3 +1018,247 @@ only, and `E2E_SCREEN_AUDIO` is not part of CI.
 Not exercised here: the real macOS permission grant, the native capture on Windows, and
 Chrome's visible second picker, which the test selects automatically. Those need a person
 and the app.
+
+### Independent-talker audit and owner decision (PR #223)
+
+**State / next steps:** blocked at the requested channel/tuning decision. No
+production channel or suppressor choice was changed. The inherited route detector
+still needs its reported warming/in-charge regressions fixed. Steady-tone pipeline
+probes, OS-detector retention, the complete hard-limit run and green Linux CI remain
+pending. This checkpoint is not ready for review.
+
+The comparisons ran on arm64 macOS, release, Rust 1.99.1, one test at a time with
+`nice -n 10`. No audio device, browser, WebKit, application bundle or production
+connection was used. `EchoGone` is disabled to isolate #220. The stereo mono-like
+variant changes only `max_inc_factor` from 1.5 to 2.0 and `max_dec_factor_lf` from
+0.35 to 0.25; the stereo adaptive filter is retained. It is enabled only by the
+isolated ignored measurement test, never by the app.
+
+#### Reproduction and limits
+
+```sh
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib the_warmed_switch_against_cold_and_staying_mono -- --ignored --nocapture --test-threads=1
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib the_near_voice_cold_and_warm -- --ignored --nocapture --test-threads=1
+CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test -p gwar-client --release --lib independent_talker_channel_tradeoffs -- --ignored --nocapture --test-threads=1
+```
+
+The complete console output is in [aec-independent-talkers.txt](measurements/aec-independent-talkers.txt),
+and all 1,296 room/voice/window observations for the channel comparison are in
+[aec-channel-cases.csv](measurements/aec-channel-cases.csv). These are synthetic
+AEC measurements without gain, denoising, gating or Opus. They do not establish
+speech intelligibility or any real-time p99 limit.
+
+"Kept" retains the previous definition: the share of speaking frames whose output
+RMS is within 10 dB of clean near input, counting near frames above -40 dBFS.
+On speakers residual echo can inflate this fraction. The echo column measures
+output in silent near turns, starting 250 ms after the near voice stops (the
+longest simulated acoustic tail is 205 ms). Lower echo dBFS is better. Headphones
+have no acoustic echo; their quiet output is the processing floor. The mono
+antiphase rows' nearly 1.0 "kept" cannot establish voice preservation by itself:
+their echo is very loud.
+
+#### Corrected #220 near-voice table
+
+The far/share signals, eight offsets and windows are retained. The near fixture is
+now `talker(213 Hz, 3.1 Hz vibrato, 3.3 syllables/s, -24 dBFS)` with independent
+harmonic phases instead of correlated 200 Hz `long_voice`. The pitch and shape
+changed with the fixture, so differences are not attributed to correlation alone.
+Values are means across the eight offsets; windows follow share sound.
+
+| Route / lead / canceller | 0-3 | 3-8 | 8-16 | 16-32 |
+| --- | --- | --- | --- | --- |
+| headphones, 6 s, stay | 0.90 | 0.83 | 0.82 | 0.85 |
+| headphones, 6 s, cold | 0.90 | 0.76 | 0.77 | 0.81 |
+| headphones, 6 s, warm | 0.90 | 0.76 | 0.77 | 0.81 |
+| speakers, 6 s, stay | 0.75 | 0.64 | 0.47 | 0.50 |
+| speakers, 6 s, cold | 0.75 | 0.44 | 0.74 | 0.76 |
+| speakers, 6 s, warm | 0.80 | 0.47 | 0.48 | 0.57 |
+| headphones, 30 s, stay | 0.86 | 0.81 | 0.85 | 0.84 |
+| headphones, 30 s, cold | 0.86 | 0.77 | 0.79 | 0.79 |
+| headphones, 30 s, warm | 0.86 | 0.77 | 0.79 | 0.79 |
+| speakers, 30 s, stay | 0.81 | 0.62 | 0.46 | 0.57 |
+| speakers, 30 s, cold | 0.81 | 0.14 | 0.56 | 0.74 |
+| speakers, 30 s, warm | 0.70 | 0.47 | 0.39 | 0.56 |
+
+The claim that headphones recover to about 0.99 after the first three seconds is
+not reproduced. The claim that warm loses no more near voice than staying mono is
+also not reproduced. Warm can remove the cold takeover hole, but that does not
+imply better near-voice preservation in every later window. At a 30 s lead warm
+also keeps less than cold in the first window (0.70 vs 0.81).
+
+#### #220 echo, mixed level and projected near level
+
+Same 18 rooms (three far pitches, three delays, two near pitches) and two lead times.
+Near pitches stay 180/280 Hz but use `talker` with independent modulation/phases.
+Echo-only rows have no near voice and retain their old inputs. "Level" is mixed
+output dBFS. "Near beside wide" is near projection gain in dB from the existing
+best-lag `fidelity` calculation. Each mean cell is **stay / cold / warm**.
+
+| Lead | Metric | Window, s | Mean | Worst cold/warm vs stay, dB |
+| --- | --- | --- | --- | --- |
+| 6 | echo | 0-1 | -62.8 / -62.8 / -63.6 | 0.0 / 0.9 |
+| 6 | echo | 1-2 | -62.9 / -62.9 / -63.8 | 0.0 / 1.0 |
+| 6 | echo | 2-3 | -63.5 / -63.5 / -64.4 | 0.0 / 1.1 |
+| 6 | echo | 3-4 | -63.6 / -58.8 / -64.8 | 11.1 / 1.2 |
+| 6 | echo | 4-5 | -63.3 / -58.7 / -65.6 | 10.1 / 1.1 |
+| 6 | echo | 5-6 | -64.3 / -60.2 / -66.0 | 6.8 / 0.9 |
+| 6 | echo | 6-7 | -64.0 / -61.4 / -65.1 | 5.1 / 0.9 |
+| 6 | echo | 7-8 | -64.0 / -62.5 / -65.1 | 2.6 / 0.9 |
+| 6 | echo | 8-12 | -65.0 / -63.7 / -65.9 | 4.0 / 0.6 |
+| 6 | echo | 12-16 | -66.7 / -65.7 / -67.9 | 8.6 / 0.3 |
+| 6 | echo | 16-24 | -66.4 / -66.7 / -68.8 | 2.5 / 0.1 |
+| 6 | level | 0-1 | -25.8 / -25.8 / -25.8 | 0.0 / 0.7 |
+| 6 | level | 1-2 | -25.2 / -25.2 / -25.4 | 0.0 / 0.5 |
+| 6 | level | 2-3 | -26.3 / -26.3 / -26.5 | 0.0 / 1.5 |
+| 6 | level | 3-4 | -26.2 / -27.3 / -26.7 | 4.5 / 3.8 |
+| 6 | level | 4-5 | -25.2 / -26.2 / -25.8 | 5.8 / 4.0 |
+| 6 | level | 5-6 | -26.2 / -27.0 / -26.5 | 6.0 / 4.7 |
+| 6 | level | 6-7 | -26.3 / -28.4 / -26.7 | 17.3 / 2.5 |
+| 6 | level | 7-8 | -25.5 / -27.7 / -26.3 | 10.2 / 4.8 |
+| 6 | level | 8-12 | -25.8 / -26.4 / -26.1 | 2.4 / 2.4 |
+| 6 | level | 12-16 | -25.9 / -26.9 / -26.3 | 5.5 / 3.1 |
+| 6 | level | 16-24 | -25.9 / -26.2 / -26.1 | 3.6 / 2.3 |
+| 6 | kept beside wide share | 0-1 | -8.1 / -7.9 / -8.5 | 0.6 / 1.6 |
+| 6 | kept beside wide share | 1-2 | -8.1 / -7.9 / -8.9 | 1.9 / 3.3 |
+| 6 | kept beside wide share | 2-3 | -8.4 / -8.2 / -9.8 | 3.3 / 9.3 |
+| 6 | kept beside wide share | 3-4 | -8.2 / -12.6 / -11.3 | 10.2 / 9.1 |
+| 6 | kept beside wide share | 4-5 | -7.6 / -13.0 / -11.7 | 21.8 / 18.8 |
+| 6 | kept beside wide share | 5-6 | -8.7 / -14.0 / -11.8 | 23.5 / 9.2 |
+| 6 | kept beside wide share | 6-7 | -8.4 / -16.0 / -12.4 | 24.6 / 18.9 |
+| 6 | kept beside wide share | 7-8 | -8.1 / -12.4 / -11.1 | 16.7 / 10.5 |
+| 6 | kept beside wide share | 8-12 | -8.1 / -14.0 / -11.3 | 24.6 / 20.4 |
+| 6 | kept beside wide share | 12-16 | -8.1 / -13.3 / -11.3 | 23.6 / 23.6 |
+| 6 | kept beside wide share | 16-24 | -8.1 / -12.5 / -9.9 | 21.9 / 9.9 |
+| 20 | echo | 0-1 | -66.5 / -66.5 / -67.9 | 0.0 / 0.3 |
+| 20 | echo | 1-2 | -68.2 / -68.2 / -69.6 | 0.0 / 0.3 |
+| 20 | echo | 2-3 | -68.0 / -68.0 / -69.0 | 0.0 / 0.3 |
+| 20 | echo | 3-4 | -68.1 / -58.1 / -68.8 | 15.4 / 0.3 |
+| 20 | echo | 4-5 | -67.9 / -60.1 / -68.4 | 11.3 / 0.1 |
+| 20 | echo | 5-6 | -66.2 / -62.7 / -67.9 | 7.7 / 0.1 |
+| 20 | echo | 6-7 | -67.8 / -66.0 / -69.8 | 5.0 / 0.1 |
+| 20 | echo | 7-8 | -69.5 / -67.7 / -70.5 | 10.1 / 1.1 |
+| 20 | echo | 8-12 | -67.5 / -65.5 / -69.8 | 15.4 / 0.1 |
+| 20 | echo | 12-16 | -68.6 / -68.4 / -69.5 | 13.4 / 2.2 |
+| 20 | echo | 16-24 | -68.2 / -66.8 / -68.3 | 11.8 / 4.7 |
+| 20 | level | 0-1 | -25.2 / -25.2 / -25.4 | 0.0 / 1.0 |
+| 20 | level | 1-2 | -26.1 / -26.1 / -26.3 | 0.0 / 1.4 |
+| 20 | level | 2-3 | -26.1 / -26.1 / -26.4 | 0.0 / 1.8 |
+| 20 | level | 3-4 | -25.5 / -27.4 / -26.1 | 5.2 / 5.2 |
+| 20 | level | 4-5 | -25.5 / -29.1 / -26.4 | 12.9 / 9.1 |
+| 20 | level | 5-6 | -26.2 / -29.1 / -27.8 | 16.2 / 16.2 |
+| 20 | level | 6-7 | -26.1 / -28.2 / -26.6 | 7.4 / 4.2 |
+| 20 | level | 7-8 | -25.6 / -26.7 / -25.5 | 10.4 / 1.9 |
+| 20 | level | 8-12 | -26.0 / -26.4 / -26.1 | 5.7 / 1.9 |
+| 20 | level | 12-16 | -26.0 / -26.3 / -26.1 | 5.6 / 2.6 |
+| 20 | level | 16-24 | -26.1 / -26.1 / -26.2 | 3.0 / 2.8 |
+| 20 | kept beside wide share | 0-1 | -7.5 / -7.2 / -8.8 | 0.3 / 6.1 |
+| 20 | kept beside wide share | 1-2 | -8.4 / -8.2 / -9.8 | 1.2 / 7.0 |
+| 20 | kept beside wide share | 2-3 | -7.9 / -7.7 / -9.4 | 0.5 / 6.5 |
+| 20 | kept beside wide share | 3-4 | -8.0 / -11.9 / -10.2 | 9.8 / 9.8 |
+| 20 | kept beside wide share | 4-5 | -7.4 / -15.2 / -10.8 | 28.7 / 25.6 |
+| 20 | kept beside wide share | 5-6 | -7.7 / -17.1 / -10.9 | 31.9 / 24.1 |
+| 20 | kept beside wide share | 6-7 | -8.5 / -15.4 / -11.7 | 24.5 / 23.6 |
+| 20 | kept beside wide share | 7-8 | -8.5 / -14.6 / -10.4 | 23.2 / 7.2 |
+| 20 | kept beside wide share | 8-12 | -8.2 / -11.4 / -9.6 | 20.5 / 5.4 |
+| 20 | kept beside wide share | 12-16 | -8.2 / -11.7 / -9.4 | 23.2 / 4.2 |
+| 20 | kept beside wide share | 16-24 | -8.5 / -9.6 / -9.0 | 10.1 / 3.3 |
+
+Echo-only means and worst-room values reproduce #220 at the shown precision.
+The near-dependent claims change: with the independent fixture, the 6 s-lead
+mixed-level worst difference is 17.3 dB cold / 4.8 dB warm, instead of 13.0 dB
+for both; at 20 s it is 16.2 / 16.2 dB. Near projection beside wide sound is
+1.8-4.1 dB below staying mono in the windows from 3 s onward at the 6 s lead,
+which is a larger loss than the earlier correlated fixture suggested.
+
+#### Channels through the production Processing path
+
+Includes warming qualification, the cold fallback, handover and capture delay.
+Mono never pins. Six seconds of leading far voice precede 32 s of share content.
+Nine cases per row: delays 20/60/150 ms times three independent near talkers
+(213/176/251 Hz), speaking on alternating seconds. The two speakers have different
+impulse responses; "left speaker" means only the left reaches the microphone.
+Shapes: mono `[a,a]`, panned `[a,0]`, independent stereo `[a,b]`, antiphase `[a,-a]`.
+Share level is -14 dBFS per active channel; near is -24 dBFS. Vectors use windows
+**0-3 / 3-8 / 8-16 / 16-32 seconds** after share sound.
+
+| Share | Acoustic route | Canceller | Kept fraction | Echo / quiet output, dBFS |
+| --- | --- | --- | --- | --- |
+| mono content | headphones | stereo | 0.830 / 0.724 / 0.748 / 0.743 | -95.6 / -96.0 / -95.7 / -95.2 |
+| mono content | headphones | mono downmix | 0.830 / 0.765 / 0.814 / 0.774 | -95.6 / -95.9 / -95.8 / -95.4 |
+| mono content | headphones | stereo mono-like suppressor | 0.830 / 0.767 / 0.793 / 0.782 | -95.6 / -96.0 / -95.7 / -95.2 |
+| mono content | left speaker | stereo | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| mono content | left speaker | mono downmix | 0.613 / 0.598 / 0.605 / 0.608 | -59.8 / -63.3 / -63.1 / -62.4 |
+| mono content | left speaker | stereo mono-like suppressor | 0.610 / 0.577 / 0.598 / 0.588 | -61.7 / -64.2 / -64.1 / -63.8 |
+| mono content | both speakers | stereo | 0.488 / 0.439 / 0.429 / 0.398 | -52.3 / -55.8 / -55.6 / -55.1 |
+| mono content | both speakers | mono downmix | 0.548 / 0.495 / 0.498 / 0.469 | -52.6 / -55.2 / -54.7 / -53.7 |
+| mono content | both speakers | stereo mono-like suppressor | 0.541 / 0.492 / 0.495 / 0.469 | -52.1 / -55.8 / -55.6 / -55.1 |
+| panned | headphones | stereo | 0.880 / 0.754 / 0.748 / 0.743 | -95.8 / -96.0 / -95.7 / -95.2 |
+| panned | headphones | mono downmix | 0.880 / 0.830 / 0.883 / 0.837 | -95.8 / -96.2 / -95.3 / -95.7 |
+| panned | headphones | stereo mono-like suppressor | 0.880 / 0.796 / 0.793 / 0.782 | -95.8 / -96.0 / -95.7 / -95.2 |
+| panned | left speaker | stereo | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| panned | left speaker | mono downmix | 0.729 / 0.611 / 0.624 / 0.622 | -46.3 / -62.7 / -62.3 / -62.7 |
+| panned | left speaker | stereo mono-like suppressor | 0.610 / 0.577 / 0.598 / 0.588 | -61.7 / -64.2 / -64.1 / -63.8 |
+| panned | both speakers | stereo | 0.528 / 0.569 / 0.575 / 0.556 | -54.8 / -55.7 / -59.2 / -62.3 |
+| panned | both speakers | mono downmix | 0.690 / 0.642 / 0.639 / 0.632 | -50.4 / -56.7 / -59.4 / -60.9 |
+| panned | both speakers | stereo mono-like suppressor | 0.569 / 0.612 / 0.617 / 0.599 | -54.7 / -55.7 / -59.1 / -62.3 |
+| wide independent | headphones | stereo | 0.863 / 0.717 / 0.748 / 0.743 | -95.7 / -96.0 / -95.7 / -95.2 |
+| wide independent | headphones | mono downmix | 0.863 / 0.758 / 0.665 / 0.760 | -95.7 / -95.5 / -95.3 / -94.5 |
+| wide independent | headphones | stereo mono-like suppressor | 0.863 / 0.762 / 0.793 / 0.782 | -95.7 / -96.0 / -95.7 / -95.2 |
+| wide independent | left speaker | stereo | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| wide independent | left speaker | mono downmix | 0.718 / 0.679 / 0.715 / 0.716 | -44.4 / -47.1 / -44.0 / -42.3 |
+| wide independent | left speaker | stereo mono-like suppressor | 0.610 / 0.577 / 0.598 / 0.588 | -61.7 / -64.2 / -64.1 / -63.8 |
+| wide independent | both speakers | stereo | 0.653 / 0.583 / 0.669 / 0.713 | -34.4 / -37.7 / -36.2 / -34.1 |
+| wide independent | both speakers | mono downmix | 0.578 / 0.591 / 0.614 / 0.622 | -51.7 / -51.2 / -49.9 / -48.4 |
+| wide independent | both speakers | stereo mono-like suppressor | 0.661 / 0.645 / 0.718 / 0.755 | -34.1 / -34.9 / -34.5 / -32.8 |
+| wide antiphase | headphones | stereo | 0.992 / 0.733 / 0.748 / 0.743 | -149.8 / -96.0 / -95.7 / -95.2 |
+| wide antiphase | headphones | mono downmix | 0.992 / 0.990 / 0.990 / 0.990 | -149.8 / -147.5 / -147.5 / -146.1 |
+| wide antiphase | headphones | stereo mono-like suppressor | 0.992 / 0.776 / 0.793 / 0.782 | -149.8 / -96.0 / -95.7 / -95.2 |
+| wide antiphase | left speaker | stereo | 0.577 / 0.536 / 0.556 / 0.544 | -61.7 / -64.2 / -64.1 / -63.8 |
+| wide antiphase | left speaker | mono downmix | 0.999 / 0.997 / 0.998 / 0.998 | -24.0 / -23.8 / -24.0 / -23.9 |
+| wide antiphase | left speaker | stereo mono-like suppressor | 0.610 / 0.577 / 0.598 / 0.588 | -61.7 / -64.2 / -64.1 / -63.8 |
+| wide antiphase | both speakers | stereo | 0.445 / 0.491 / 0.541 / 0.533 | -46.0 / -54.5 / -53.9 / -54.0 |
+| wide antiphase | both speakers | mono downmix | 1.000 / 0.999 / 1.000 / 0.999 | -24.4 / -24.4 / -24.4 / -24.4 |
+| wide antiphase | both speakers | stereo mono-like suppressor | 0.515 / 0.561 / 0.595 / 0.592 | -45.6 / -54.3 / -53.8 / -54.0 |
+
+A concrete conflicting case is independent stereo, both speakers, 150 ms left
+path, 176 Hz near talker, 3-8 s after share sound:
+
+| Canceller | Kept | Echo in near silence, dBFS |
+| --- | --- | --- |
+| Stereo (current) | 0.477 | -41.55 |
+| Stereo, mono suppressor | 0.544 | -36.13 |
+
+Mono-like suppression increases the frame fraction by 0.066 while making echo
+5.42 dB louder here. This alone prevents accepting it as a non-regressing option.
+
+#### Why implementation stops here
+
+Neither alternative dominates current stereo on both outputs across every case
+and window. Mono loses the reference for antiphase and cannot independently fit
+two unrelated speaker paths. Mono-like stereo suppression preserves more near
+frames in some rows while allowing more echo in others. Choosing how much echo to
+accept for voice is the owner's decision; this checkpoint does not choose it.
+
+The inherited 27-room route-gap results were not rerun at this checkpoint; their
+failing windows remain open. OS detection has not been accepted on acoustic
+evidence. Original Linux CI failed with `E0432` at `voice/watch.rs:266`:
+`pulseaudio::protocol::PortInfo` does not exist. The import now uses
+`pulseaudio::protocol::port_info::PortInfo`; Linux compilation and the PulseAudio
+null-sink test still require CI verification.
+
+After the owner decision: fix and remeasure every route-gap window against both
+baselines, decide OS notices from benefit, reproduce realistic tone holds through
+leading signal/Opus/gate/denoiser, then run fingerprints, heap checks, 1 Mb/s
+9.048-9.288 ms p99, four-share delta <=1.0 ms, clippy, fmt, full tests and CI.
+
+#### Checkpoint verification
+
+- Release APM tests: **51 passed, 15 ignored**, including the warmed handover,
+  refused-candidate and replacement-path heap checks.
+- Explicit voice-alone fingerprints: **2 passed**, both `c2d868db7d8d0eeb`.
+- Three ignored comparisons above: **3 passed**; their success means they completed,
+  not that the branch meets the owner's acoustic acceptance requirement.
+- `cargo fmt --all --check` and `git diff --check`: passed.
+- Not run at this checkpoint: clippy, full workspace tests, 1 Mb/s and four-share
+  timing limits, realistic tone/Opus/gate/denoiser probes, Linux build/null sinks.
+  The inherited Linux CI is red; its import fix still requires a new CI run.

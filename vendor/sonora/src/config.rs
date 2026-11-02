@@ -186,6 +186,9 @@ pub struct EchoCanceller {
     /// channel (default: true, as upstream). When false, the canceller uses every
     /// render channel from its first frame and never resets on a change of content.
     pub detect_stereo_content: bool,
+    /// Gwar measurement control: use the mono suppressor's release/attack tuning
+    /// with the multichannel adaptive filter. False preserves upstream tuning.
+    pub multichannel_suppressor_like_mono: bool,
 }
 
 impl Default for EchoCanceller {
@@ -194,6 +197,7 @@ impl Default for EchoCanceller {
             enforce_high_pass_filtering: true,
             transparent_mode: TransparentModeType::default(),
             detect_stereo_content: true,
+            multichannel_suppressor_like_mono: false,
         }
     }
 }

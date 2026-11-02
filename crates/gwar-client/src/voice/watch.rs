@@ -263,7 +263,7 @@ mod linux {
         time::Duration,
     };
 
-    use pulseaudio::{Client, protocol::PortInfo};
+    use pulseaudio::{Client, protocol::port_info::PortInfo};
 
     use super::{Side, endpoint};
 

@@ -129,6 +129,11 @@ fn canceller(stereo: bool) -> Config {
         detect_stereo_content: !stereo,
         ..Default::default()
     };
+    #[cfg(test)]
+    let canceller = EchoCanceller {
+        multichannel_suppressor_like_mono: stereo && MEASURE_MONO_SUPPRESSOR.load(Ordering::Relaxed),
+        ..canceller
+    };
     Config { echo_canceller: Some(canceller), ..base() }
 }
 
@@ -217,6 +222,10 @@ impl EchoGone {
 /// run them alone.
 #[cfg(test)]
 static ECHO_GONE_IGNORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Only the isolated channel comparison changes this; run that test alone.
+#[cfg(test)]
+static MEASURE_MONO_SUPPRESSOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// A stereo canceller trained on everything the voice session hears, with no output anyone uses.
 struct Warming {
@@ -2458,6 +2467,7 @@ mod tests {
     #[test]
     #[ignore = "a comparison, run in release"]
     fn the_warmed_switch_against_cold_and_staying_mono() {
+        ECHO_GONE_IGNORED.store(true, Ordering::Relaxed);
         let second = RATE;
         let windows: Vec<(usize, usize)> = (0..8).map(|at| (at, at + 1)).chain([(8, 12), (12, 16), (16, 24)]).collect();
         for before in [6, 20] {
@@ -2475,7 +2485,7 @@ mod tests {
                         let far = voice(total, far_pitch, -20.0);
                         let echo = room(&far, delay);
                         // The near voice joins 4 s in: far alone first, or nothing finds the room.
-                        let near: Vec<f32> = voice(total, near_pitch, -24.0)
+                        let near: Vec<f32> = talker(total, near_pitch, 3.1, 3.3, -24.0)
                             .iter()
                             .enumerate()
                             .map(|(index, sample)| if index < 4 * second { 0.0 } else { *sample })
@@ -2538,6 +2548,7 @@ mod tests {
                 }
             }
         }
+        ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
     }
 
     /// Wide sound from the first share sound, in dBFS, in `WIDE_WINDOWS` after it. `same` is the
@@ -2598,6 +2609,7 @@ mod tests {
     #[test]
     #[ignore = "a comparison, run in release"]
     fn the_near_voice_cold_and_warm() {
+        ECHO_GONE_IGNORED.store(true, Ordering::Relaxed);
         let windows = [(0usize, 3usize), (3, 8), (8, 16), (16, 32)];
         for lead_at in [6usize, 30] {
             for (name, speakers) in [("headphones", false), ("speakers", true)] {
@@ -2610,7 +2622,7 @@ mod tests {
                     let (left, right) = (long_voice(total, 120.0, -14.0), long_voice(total, 190.0, -14.0));
                     let far: Vec<[f32; 2]> =
                         (0..total).map(|i| if i < pin { [talk[i]; 2] } else { [left[i], right[i]] }).collect();
-                    let said: Vec<f32> = long_voice(total, 200.0, -24.0)
+                    let said: Vec<f32> = talker(total, 213.0, 3.1, 3.3, -24.0)
                         .iter()
                         .enumerate()
                         .map(|(index, sample)| if (index / (2 * RATE)).is_multiple_of(2) { 0.0 } else { *sample })
@@ -2649,6 +2661,7 @@ mod tests {
                 }
             }
         }
+        ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
     }
 
     /// What a history that broke costs, run in release. The share of the frames a voice speaks in
@@ -3078,6 +3091,115 @@ mod tests {
                 eprintln!("  {name}: {}; worst room against before {:+.3}", cells.join(" "), worst[index]);
             }
         }
+    }
+
+    /// Compares the production Processing path, including warming qualification,
+    /// the cold fallback, handover and capture delay. Mono never pins. The near
+    /// voice is independent, and echo is measured 250 ms into its silent turns.
+    /// The new route detector is disabled to isolate #220's channel/tuning choice.
+    /// No gain, denoiser, gate, device or real-time scheduler is involved.
+    #[test]
+    #[ignore = "a channel/tuning comparison, run in release and alone"]
+    fn independent_talker_channel_tradeoffs() {
+        ECHO_GONE_IGNORED.store(true, Ordering::Relaxed);
+        let pin = 6 * RATE;
+        let total = pin + 32 * RATE;
+        let windows = [(0, 3), (3, 8), (8, 16), (16, 32)];
+        let lead = long_voice(total, 150.0, -20.0);
+        let a = long_voice(total, 120.0, -14.0);
+        let b = talker(total, 187.0, 2.17, 4.31, -14.0);
+        let names = ["stereo", "mono downmix", "stereo mono-like suppressor"];
+        for shape in ["mono content", "panned", "wide independent", "wide antiphase"] {
+            let far: Vec<[f32; 2]> = (0..total)
+                .map(|i| {
+                    if i < pin {
+                        return [lead[i]; 2];
+                    }
+                    match shape {
+                        "mono content" => [a[i]; 2],
+                        "panned" => [a[i], 0.0],
+                        "wide independent" => [a[i], b[i]],
+                        _ => [a[i], -a[i]],
+                    }
+                })
+                .collect();
+            let left = left_channel(&far);
+            let right: Vec<f32> = far.iter().map(|pair| pair[1]).collect();
+            for acoustic in ["headphones", "left speaker", "both speakers"] {
+                let mut kept = [[0.0f32; 4]; 3];
+                let mut residual = [[0.0f32; 4]; 3];
+                let mut count = 0.0;
+                for delay in [20, 60, 150] {
+                    let l = room(&left, delay);
+                    let r = room(&right, delay + 15);
+                    let echo: Vec<f32> = (0..total)
+                        .map(|i| match acoustic {
+                            "headphones" => 0.0,
+                            "left speaker" => l[i],
+                            _ => l[i] + 0.7 * r[i],
+                        })
+                        .collect();
+                    for (pitch, vibrato, syllables) in [(213.0, 3.1, 3.3), (176.0, 2.3, 4.1), (251.0, 3.7, 2.9)] {
+                        count += 1.0;
+                        let said: Vec<f32> = talker(total, pitch, vibrato, syllables, -24.0)
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, s)| if (i / RATE).is_multiple_of(2) { 0.0 } else { s })
+                            .collect();
+                        let mic: Vec<f32> = echo.iter().zip(&said).map(|(e, s)| e + s).collect();
+                        for mode in 0..3 {
+                            MEASURE_MONO_SUPPRESSOR.store(mode == 2, Ordering::Relaxed);
+                            let mut p = if mode == 1 { session(LEARNING_FRAMES) } else { warm_session() };
+                            let mut out = Vec::with_capacity(total);
+                            for at in (0..total).step_by(FRAME) {
+                                if mode != 1 && at == pin {
+                                    p.caught_up();
+                                    p.pin_stereo();
+                                    p.collected();
+                                }
+                                out.extend(tick(&mut p, &far[at..at + FRAME], &mic[at..at + FRAME]));
+                                if mode != 1 {
+                                    p.ready_for_the_next_frame();
+                                }
+                            }
+                            let mut case_kept = [0.0f32; 4];
+                            let mut case_echo = [0.0f32; 4];
+                            for (w, (from, to)) in windows.iter().enumerate() {
+                                let mut speaking = 0;
+                                let mut through = 0;
+                                let mut quiet = Vec::new();
+                                for at in (pin + from * RATE..pin + to * RATE).step_by(FRAME) {
+                                    if db(&said[at..at + FRAME]) > -40.0 {
+                                        speaking += 1;
+                                        through +=
+                                            usize::from(db(&out[at..at + FRAME]) > db(&said[at..at + FRAME]) - 10.0);
+                                    } else if (at / RATE).is_multiple_of(2) && at % RATE >= RATE / 4 {
+                                        quiet.extend_from_slice(&out[at..at + FRAME]);
+                                    }
+                                }
+                                case_kept[w] = through as f32 / speaking as f32;
+                                case_echo[w] = db(&quiet);
+                                kept[mode][w] += case_kept[w];
+                                residual[mode][w] += case_echo[w];
+                            }
+                            eprintln!(
+                                "channel-case,{shape},{acoustic},{delay},{pitch},{mode},{case_kept:?},{case_echo:?}"
+                            );
+                        }
+                    }
+                }
+                for mode in 0..3 {
+                    eprintln!(
+                        "channels {shape} / {acoustic} / {} / {count} cases: kept {:?}; quiet dBFS {:?}",
+                        names[mode],
+                        kept[mode].map(|v| (1000.0 * v / count).round() / 1000.0),
+                        residual[mode].map(|v| (10.0 * v / count).round() / 10.0)
+                    );
+                }
+            }
+        }
+        MEASURE_MONO_SUPPRESSOR.store(false, Ordering::Relaxed);
+        ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
     }
 
     /// EXPLORATORY: a steady tone at the microphone, share tones in the speakers, no echo.

@@ -1285,6 +1285,10 @@ impl AudioProcessingImpl {
         let mut multichannel = EchoCanceller3Config::create_default_multichannel_config();
         multichannel.echo_removal_control.transparent_mode = ec.transparent_mode;
         multichannel.multi_channel.detect_stereo_content = ec.detect_stereo_content;
+        if ec.multichannel_suppressor_like_mono {
+            multichannel.suppressor.normal_tuning.max_inc_factor = config.suppressor.normal_tuning.max_inc_factor;
+            multichannel.suppressor.normal_tuning.max_dec_factor_lf = config.suppressor.normal_tuning.max_dec_factor_lf;
+        }
         let multichannel_config = Some(multichannel);
 
         self.submodules.echo_controller = Some(EchoCanceller3::new(

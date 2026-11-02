@@ -1,0 +1,1297 @@
+share,room,delay_ms,near_pitch_hz,canceller,seconds_after_share,output_frames_within_10db_fraction,quiet_output_dbfs
+mono content,headphones,20,213,Stereo (current),0-3,0.85365856,-96.03017
+mono content,headphones,20,213,Stereo (current),3-8,0.75619835,-95.98728
+mono content,headphones,20,213,Stereo (current),8-16,0.745283,-95.47486
+mono content,headphones,20,213,Stereo (current),16-32,0.784375,-95.745766
+mono content,headphones,20,213,Mono downmix,0-3,0.85365856,-96.03017
+mono content,headphones,20,213,Mono downmix,3-8,0.8057851,-95.891075
+mono content,headphones,20,213,Mono downmix,8-16,0.8050314,-95.87042
+mono content,headphones,20,213,Mono downmix,16-32,0.825,-95.95705
+mono content,headphones,20,213,"Stereo, mono suppressor",0-3,0.85365856,-96.03017
+mono content,headphones,20,213,"Stereo, mono suppressor",3-8,0.79752064,-95.98717
+mono content,headphones,20,213,"Stereo, mono suppressor",8-16,0.7955975,-95.47474
+mono content,headphones,20,213,"Stereo, mono suppressor",16-32,0.81875,-95.74565
+mono content,headphones,20,176,Stereo (current),0-3,0.8125,-94.766014
+mono content,headphones,20,176,Stereo (current),3-8,0.6141079,-95.96241
+mono content,headphones,20,176,Stereo (current),8-16,0.7075472,-95.92373
+mono content,headphones,20,176,Stereo (current),16-32,0.76175547,-95.961494
+mono content,headphones,20,176,Mono downmix,0-3,0.8125,-94.766014
+mono content,headphones,20,176,Mono downmix,3-8,0.6887967,-95.87745
+mono content,headphones,20,176,Mono downmix,8-16,0.7955975,-96.008804
+mono content,headphones,20,176,Mono downmix,16-32,0.7868339,-95.96256
+mono content,headphones,20,176,"Stereo, mono suppressor",0-3,0.8125,-94.766014
+mono content,headphones,20,176,"Stereo, mono suppressor",3-8,0.6721992,-95.96226
+mono content,headphones,20,176,"Stereo, mono suppressor",8-16,0.7515723,-95.92357
+mono content,headphones,20,176,"Stereo, mono suppressor",16-32,0.79780567,-95.96138
+mono content,headphones,20,251,Stereo (current),0-3,0.8227848,-95.97067
+mono content,headphones,20,251,Stereo (current),3-8,0.8008299,-96.08677
+mono content,headphones,20,251,Stereo (current),8-16,0.7917981,-95.61794
+mono content,headphones,20,251,Stereo (current),16-32,0.68380064,-93.93554
+mono content,headphones,20,251,Mono downmix,0-3,0.8227848,-95.97067
+mono content,headphones,20,251,Mono downmix,3-8,0.8008299,-95.89601
+mono content,headphones,20,251,Mono downmix,8-16,0.84227127,-95.66861
+mono content,headphones,20,251,Mono downmix,16-32,0.7087228,-94.26489
+mono content,headphones,20,251,"Stereo, mono suppressor",0-3,0.8227848,-95.97067
+mono content,headphones,20,251,"Stereo, mono suppressor",3-8,0.8298755,-96.08665
+mono content,headphones,20,251,"Stereo, mono suppressor",8-16,0.8328076,-95.617905
+mono content,headphones,20,251,"Stereo, mono suppressor",16-32,0.7305296,-93.9355
+mono content,headphones,60,213,Stereo (current),0-3,0.85365856,-96.03017
+mono content,headphones,60,213,Stereo (current),3-8,0.75619835,-95.98728
+mono content,headphones,60,213,Stereo (current),8-16,0.745283,-95.47486
+mono content,headphones,60,213,Stereo (current),16-32,0.784375,-95.745766
+mono content,headphones,60,213,Mono downmix,0-3,0.85365856,-96.03017
+mono content,headphones,60,213,Mono downmix,3-8,0.8057851,-95.891075
+mono content,headphones,60,213,Mono downmix,8-16,0.8050314,-95.87042
+mono content,headphones,60,213,Mono downmix,16-32,0.825,-95.95705
+mono content,headphones,60,213,"Stereo, mono suppressor",0-3,0.85365856,-96.03017
+mono content,headphones,60,213,"Stereo, mono suppressor",3-8,0.79752064,-95.98717
+mono content,headphones,60,213,"Stereo, mono suppressor",8-16,0.7955975,-95.47474
+mono content,headphones,60,213,"Stereo, mono suppressor",16-32,0.81875,-95.74565
+mono content,headphones,60,176,Stereo (current),0-3,0.8125,-94.766014
+mono content,headphones,60,176,Stereo (current),3-8,0.6141079,-95.96241
+mono content,headphones,60,176,Stereo (current),8-16,0.7075472,-95.92373
+mono content,headphones,60,176,Stereo (current),16-32,0.76175547,-95.961494
+mono content,headphones,60,176,Mono downmix,0-3,0.8125,-94.766014
+mono content,headphones,60,176,Mono downmix,3-8,0.6887967,-95.87745
+mono content,headphones,60,176,Mono downmix,8-16,0.7955975,-96.008804
+mono content,headphones,60,176,Mono downmix,16-32,0.7868339,-95.96256
+mono content,headphones,60,176,"Stereo, mono suppressor",0-3,0.8125,-94.766014
+mono content,headphones,60,176,"Stereo, mono suppressor",3-8,0.6721992,-95.96226
+mono content,headphones,60,176,"Stereo, mono suppressor",8-16,0.7515723,-95.92357
+mono content,headphones,60,176,"Stereo, mono suppressor",16-32,0.79780567,-95.96138
+mono content,headphones,60,251,Stereo (current),0-3,0.8227848,-95.97067
+mono content,headphones,60,251,Stereo (current),3-8,0.8008299,-96.08677
+mono content,headphones,60,251,Stereo (current),8-16,0.7917981,-95.61794
+mono content,headphones,60,251,Stereo (current),16-32,0.68380064,-93.93554
+mono content,headphones,60,251,Mono downmix,0-3,0.8227848,-95.97067
+mono content,headphones,60,251,Mono downmix,3-8,0.8008299,-95.89601
+mono content,headphones,60,251,Mono downmix,8-16,0.84227127,-95.66861
+mono content,headphones,60,251,Mono downmix,16-32,0.7087228,-94.26489
+mono content,headphones,60,251,"Stereo, mono suppressor",0-3,0.8227848,-95.97067
+mono content,headphones,60,251,"Stereo, mono suppressor",3-8,0.8298755,-96.08665
+mono content,headphones,60,251,"Stereo, mono suppressor",8-16,0.8328076,-95.617905
+mono content,headphones,60,251,"Stereo, mono suppressor",16-32,0.7305296,-93.9355
+mono content,headphones,150,213,Stereo (current),0-3,0.85365856,-96.03017
+mono content,headphones,150,213,Stereo (current),3-8,0.75619835,-95.98728
+mono content,headphones,150,213,Stereo (current),8-16,0.745283,-95.47486
+mono content,headphones,150,213,Stereo (current),16-32,0.784375,-95.745766
+mono content,headphones,150,213,Mono downmix,0-3,0.85365856,-96.03017
+mono content,headphones,150,213,Mono downmix,3-8,0.8057851,-95.891075
+mono content,headphones,150,213,Mono downmix,8-16,0.8050314,-95.87042
+mono content,headphones,150,213,Mono downmix,16-32,0.825,-95.95705
+mono content,headphones,150,213,"Stereo, mono suppressor",0-3,0.85365856,-96.03017
+mono content,headphones,150,213,"Stereo, mono suppressor",3-8,0.79752064,-95.98717
+mono content,headphones,150,213,"Stereo, mono suppressor",8-16,0.7955975,-95.47474
+mono content,headphones,150,213,"Stereo, mono suppressor",16-32,0.81875,-95.74565
+mono content,headphones,150,176,Stereo (current),0-3,0.8125,-94.766014
+mono content,headphones,150,176,Stereo (current),3-8,0.6141079,-95.96241
+mono content,headphones,150,176,Stereo (current),8-16,0.7075472,-95.92373
+mono content,headphones,150,176,Stereo (current),16-32,0.76175547,-95.961494
+mono content,headphones,150,176,Mono downmix,0-3,0.8125,-94.766014
+mono content,headphones,150,176,Mono downmix,3-8,0.6887967,-95.87745
+mono content,headphones,150,176,Mono downmix,8-16,0.7955975,-96.008804
+mono content,headphones,150,176,Mono downmix,16-32,0.7868339,-95.96256
+mono content,headphones,150,176,"Stereo, mono suppressor",0-3,0.8125,-94.766014
+mono content,headphones,150,176,"Stereo, mono suppressor",3-8,0.6721992,-95.96226
+mono content,headphones,150,176,"Stereo, mono suppressor",8-16,0.7515723,-95.92357
+mono content,headphones,150,176,"Stereo, mono suppressor",16-32,0.79780567,-95.96138
+mono content,headphones,150,251,Stereo (current),0-3,0.8227848,-95.97067
+mono content,headphones,150,251,Stereo (current),3-8,0.8008299,-96.08677
+mono content,headphones,150,251,Stereo (current),8-16,0.7917981,-95.61794
+mono content,headphones,150,251,Stereo (current),16-32,0.68380064,-93.93554
+mono content,headphones,150,251,Mono downmix,0-3,0.8227848,-95.97067
+mono content,headphones,150,251,Mono downmix,3-8,0.8008299,-95.89601
+mono content,headphones,150,251,Mono downmix,8-16,0.84227127,-95.66861
+mono content,headphones,150,251,Mono downmix,16-32,0.7087228,-94.26489
+mono content,headphones,150,251,"Stereo, mono suppressor",0-3,0.8227848,-95.97067
+mono content,headphones,150,251,"Stereo, mono suppressor",3-8,0.8298755,-96.08665
+mono content,headphones,150,251,"Stereo, mono suppressor",8-16,0.8328076,-95.617905
+mono content,headphones,150,251,"Stereo, mono suppressor",16-32,0.7305296,-93.9355
+mono content,left speaker,20,213,Stereo (current),0-3,0.597561,-60.432045
+mono content,left speaker,20,213,Stereo (current),3-8,0.58677685,-63.80625
+mono content,left speaker,20,213,Stereo (current),8-16,0.5691824,-63.975582
+mono content,left speaker,20,213,Stereo (current),16-32,0.58125,-65.13918
+mono content,left speaker,20,213,Mono downmix,0-3,0.6585366,-59.356674
+mono content,left speaker,20,213,Mono downmix,3-8,0.6322314,-64.67027
+mono content,left speaker,20,213,Mono downmix,8-16,0.6069182,-63.641373
+mono content,left speaker,20,213,Mono downmix,16-32,0.640625,-62.277596
+mono content,left speaker,20,213,"Stereo, mono suppressor",0-3,0.64634144,-60.4266
+mono content,left speaker,20,213,"Stereo, mono suppressor",3-8,0.6322314,-63.80493
+mono content,left speaker,20,213,"Stereo, mono suppressor",8-16,0.6132075,-63.973915
+mono content,left speaker,20,213,"Stereo, mono suppressor",16-32,0.615625,-65.13857
+mono content,left speaker,20,176,Stereo (current),0-3,0.6375,-60.081078
+mono content,left speaker,20,176,Stereo (current),3-8,0.4439834,-61.117256
+mono content,left speaker,20,176,Stereo (current),8-16,0.48427674,-61.531216
+mono content,left speaker,20,176,Stereo (current),16-32,0.4184953,-62.502846
+mono content,left speaker,20,176,Mono downmix,0-3,0.6875,-58.756454
+mono content,left speaker,20,176,Mono downmix,3-8,0.5062241,-59.367313
+mono content,left speaker,20,176,Mono downmix,8-16,0.5157233,-60.350563
+mono content,left speaker,20,176,Mono downmix,16-32,0.47178683,-61.45979
+mono content,left speaker,20,176,"Stereo, mono suppressor",0-3,0.7125,-60.073936
+mono content,left speaker,20,176,"Stereo, mono suppressor",3-8,0.49377593,-61.114532
+mono content,left speaker,20,176,"Stereo, mono suppressor",8-16,0.5377358,-61.53004
+mono content,left speaker,20,176,"Stereo, mono suppressor",16-32,0.492163,-62.50236
+mono content,left speaker,20,251,Stereo (current),0-3,0.5949367,-60.304714
+mono content,left speaker,20,251,Stereo (current),3-8,0.6307054,-63.119637
+mono content,left speaker,20,251,Stereo (current),8-16,0.6340694,-62.982677
+mono content,left speaker,20,251,Stereo (current),16-32,0.63707167,-61.897316
+mono content,left speaker,20,251,Mono downmix,0-3,0.6329114,-60.449364
+mono content,left speaker,20,251,Mono downmix,3-8,0.68049794,-65.2215
+mono content,left speaker,20,251,Mono downmix,8-16,0.69085175,-64.13121
+mono content,left speaker,20,251,Mono downmix,16-32,0.6931464,-62.908382
+mono content,left speaker,20,251,"Stereo, mono suppressor",0-3,0.62025315,-60.302895
+mono content,left speaker,20,251,"Stereo, mono suppressor",3-8,0.67634857,-63.117634
+mono content,left speaker,20,251,"Stereo, mono suppressor",8-16,0.6719243,-62.98165
+mono content,left speaker,20,251,"Stereo, mono suppressor",16-32,0.6775701,-61.896194
+mono content,left speaker,60,213,Stereo (current),0-3,0.6219512,-56.066864
+mono content,left speaker,60,213,Stereo (current),3-8,0.55785125,-63.647896
+mono content,left speaker,60,213,Stereo (current),8-16,0.5943396,-63.59934
+mono content,left speaker,60,213,Stereo (current),16-32,0.609375,-63.19049
+mono content,left speaker,60,213,Mono downmix,0-3,0.6585366,-53.521824
+mono content,left speaker,60,213,Mono downmix,3-8,0.6322314,-62.44991
+mono content,left speaker,60,213,Mono downmix,8-16,0.6446541,-61.55251
+mono content,left speaker,60,213,Mono downmix,16-32,0.6625,-60.11577
+mono content,left speaker,60,213,"Stereo, mono suppressor",0-3,0.6585366,-56.065292
+mono content,left speaker,60,213,"Stereo, mono suppressor",3-8,0.607438,-63.64723
+mono content,left speaker,60,213,"Stereo, mono suppressor",8-16,0.6257862,-63.596767
+mono content,left speaker,60,213,"Stereo, mono suppressor",16-32,0.6453125,-63.189423
+mono content,left speaker,60,176,Stereo (current),0-3,0.575,-62.710155
+mono content,left speaker,60,176,Stereo (current),3-8,0.44813278,-63.43571
+mono content,left speaker,60,176,Stereo (current),8-16,0.5157233,-63.96521
+mono content,left speaker,60,176,Stereo (current),16-32,0.4968652,-63.261963
+mono content,left speaker,60,176,Mono downmix,0-3,0.625,-60.80214
+mono content,left speaker,60,176,Mono downmix,3-8,0.47717842,-60.687374
+mono content,left speaker,60,176,Mono downmix,8-16,0.581761,-61.426548
+mono content,left speaker,60,176,Mono downmix,16-32,0.5705329,-60.031506
+mono content,left speaker,60,176,"Stereo, mono suppressor",0-3,0.625,-62.388397
+mono content,left speaker,60,176,"Stereo, mono suppressor",3-8,0.4647303,-63.43445
+mono content,left speaker,60,176,"Stereo, mono suppressor",8-16,0.5691824,-63.964314
+mono content,left speaker,60,176,"Stereo, mono suppressor",16-32,0.5470219,-63.260612
+mono content,left speaker,60,251,Stereo (current),0-3,0.62025315,-58.58894
+mono content,left speaker,60,251,Stereo (current),3-8,0.6141079,-63.50387
+mono content,left speaker,60,251,Stereo (current),8-16,0.6340694,-63.27683
+mono content,left speaker,60,251,Stereo (current),16-32,0.5981308,-63.62639
+mono content,left speaker,60,251,Mono downmix,0-3,0.5949367,-49.010292
+mono content,left speaker,60,251,Mono downmix,3-8,0.70124483,-61.97625
+mono content,left speaker,60,251,Mono downmix,8-16,0.67507887,-63.018402
+mono content,left speaker,60,251,Mono downmix,16-32,0.6697819,-62.25647
+mono content,left speaker,60,251,"Stereo, mono suppressor",0-3,0.65822786,-58.588387
+mono content,left speaker,60,251,"Stereo, mono suppressor",3-8,0.6556017,-63.50303
+mono content,left speaker,60,251,"Stereo, mono suppressor",8-16,0.67507887,-63.27553
+mono content,left speaker,60,251,"Stereo, mono suppressor",16-32,0.6401869,-63.625675
+mono content,left speaker,150,213,Stereo (current),0-3,0.5121951,-63.536186
+mono content,left speaker,150,213,Stereo (current),3-8,0.553719,-64.36035
+mono content,left speaker,150,213,Stereo (current),8-16,0.5597484,-64.27805
+mono content,left speaker,150,213,Stereo (current),16-32,0.5359375,-64.48457
+mono content,left speaker,150,213,Mono downmix,0-3,0.5487805,-63.872772
+mono content,left speaker,150,213,Mono downmix,3-8,0.59917355,-63.385586
+mono content,left speaker,150,213,Mono downmix,8-16,0.6069182,-63.652363
+mono content,left speaker,150,213,Mono downmix,16-32,0.590625,-64.06865
+mono content,left speaker,150,213,"Stereo, mono suppressor",0-3,0.5243902,-63.527504
+mono content,left speaker,150,213,"Stereo, mono suppressor",3-8,0.57438016,-64.35703
+mono content,left speaker,150,213,"Stereo, mono suppressor",8-16,0.5974843,-64.27594
+mono content,left speaker,150,213,"Stereo, mono suppressor",16-32,0.5734375,-64.48294
+mono content,left speaker,150,176,Stereo (current),0-3,0.475,-67.69728
+mono content,left speaker,150,176,Stereo (current),3-8,0.4439834,-66.65857
+mono content,left speaker,150,176,Stereo (current),8-16,0.46226415,-66.84015
+mono content,left speaker,150,176,Stereo (current),16-32,0.44043887,-64.920105
+mono content,left speaker,150,176,Mono downmix,0-3,0.4875,-62.46386
+mono content,left speaker,150,176,Mono downmix,3-8,0.5560166,-62.22668
+mono content,left speaker,150,176,Mono downmix,8-16,0.5314465,-61.913605
+mono content,left speaker,150,176,Mono downmix,16-32,0.54545456,-63.188255
+mono content,left speaker,150,176,"Stereo, mono suppressor",0-3,0.475,-67.68901
+mono content,left speaker,150,176,"Stereo, mono suppressor",3-8,0.5186722,-66.65797
+mono content,left speaker,150,176,"Stereo, mono suppressor",8-16,0.5031447,-66.839264
+mono content,left speaker,150,176,"Stereo, mono suppressor",16-32,0.4984326,-64.919655
+mono content,left speaker,150,251,Stereo (current),0-3,0.556962,-65.87668
+mono content,left speaker,150,251,Stereo (current),3-8,0.54771787,-67.73499
+mono content,left speaker,150,251,Stereo (current),8-16,0.5520505,-66.72754
+mono content,left speaker,150,251,Stereo (current),16-32,0.576324,-65.37649
+mono content,left speaker,150,251,Mono downmix,0-3,0.62025315,-69.62001
+mono content,left speaker,150,251,Mono downmix,3-8,0.593361,-69.354454
+mono content,left speaker,150,251,Mono downmix,8-16,0.5899054,-68.16995
+mono content,left speaker,150,251,Mono downmix,16-32,0.6292835,-65.5093
+mono content,left speaker,150,251,"Stereo, mono suppressor",0-3,0.56962025,-65.87592
+mono content,left speaker,150,251,"Stereo, mono suppressor",3-8,0.57261413,-67.729294
+mono content,left speaker,150,251,"Stereo, mono suppressor",8-16,0.5899054,-66.72541
+mono content,left speaker,150,251,"Stereo, mono suppressor",16-32,0.60436136,-65.37352
+mono content,both speakers,20,213,Stereo (current),0-3,0.5121951,-55.386204
+mono content,both speakers,20,213,Stereo (current),3-8,0.446281,-55.983467
+mono content,both speakers,20,213,Stereo (current),8-16,0.4025157,-55.609688
+mono content,both speakers,20,213,Stereo (current),16-32,0.371875,-54.76773
+mono content,both speakers,20,213,Mono downmix,0-3,0.5731707,-55.223007
+mono content,both speakers,20,213,Mono downmix,3-8,0.45867768,-54.810352
+mono content,both speakers,20,213,Mono downmix,8-16,0.4811321,-54.337822
+mono content,both speakers,20,213,Mono downmix,16-32,0.459375,-53.31212
+mono content,both speakers,20,213,"Stereo, mono suppressor",0-3,0.5609756,-55.379707
+mono content,both speakers,20,213,"Stereo, mono suppressor",3-8,0.5041322,-55.979057
+mono content,both speakers,20,213,"Stereo, mono suppressor",8-16,0.4811321,-55.605183
+mono content,both speakers,20,213,"Stereo, mono suppressor",16-32,0.453125,-54.76417
+mono content,both speakers,20,176,Stereo (current),0-3,0.5625,-55.39297
+mono content,both speakers,20,176,Stereo (current),3-8,0.45228216,-55.49757
+mono content,both speakers,20,176,Stereo (current),8-16,0.3899371,-55.45158
+mono content,both speakers,20,176,Stereo (current),16-32,0.3526646,-54.92614
+mono content,both speakers,20,176,Mono downmix,0-3,0.675,-54.69328
+mono content,both speakers,20,176,Mono downmix,3-8,0.38174275,-54.831116
+mono content,both speakers,20,176,Mono downmix,8-16,0.4465409,-54.402
+mono content,both speakers,20,176,Mono downmix,16-32,0.36520377,-53.455917
+mono content,both speakers,20,176,"Stereo, mono suppressor",0-3,0.6125,-55.377274
+mono content,both speakers,20,176,"Stereo, mono suppressor",3-8,0.47302905,-55.49238
+mono content,both speakers,20,176,"Stereo, mono suppressor",8-16,0.46226415,-55.448784
+mono content,both speakers,20,176,"Stereo, mono suppressor",16-32,0.4184953,-54.92252
+mono content,both speakers,20,251,Stereo (current),0-3,0.5443038,-53.93646
+mono content,both speakers,20,251,Stereo (current),3-8,0.46887967,-55.43629
+mono content,both speakers,20,251,Stereo (current),8-16,0.47949526,-54.93565
+mono content,both speakers,20,251,Stereo (current),16-32,0.39719626,-54.873318
+mono content,both speakers,20,251,Mono downmix,0-3,0.56962025,-51.12692
+mono content,both speakers,20,251,Mono downmix,3-8,0.5975104,-55.287956
+mono content,both speakers,20,251,Mono downmix,8-16,0.5709779,-54.510654
+mono content,both speakers,20,251,Mono downmix,16-32,0.55451715,-53.564156
+mono content,both speakers,20,251,"Stereo, mono suppressor",0-3,0.556962,-53.92585
+mono content,both speakers,20,251,"Stereo, mono suppressor",3-8,0.560166,-55.431282
+mono content,both speakers,20,251,"Stereo, mono suppressor",8-16,0.5583596,-54.932053
+mono content,both speakers,20,251,"Stereo, mono suppressor",16-32,0.5046729,-54.8695
+mono content,both speakers,60,213,Stereo (current),0-3,0.5243902,-49.34027
+mono content,both speakers,60,213,Stereo (current),3-8,0.35950413,-55.07967
+mono content,both speakers,60,213,Stereo (current),8-16,0.3773585,-55.26916
+mono content,both speakers,60,213,Stereo (current),16-32,0.34375,-55.16766
+mono content,both speakers,60,213,Mono downmix,0-3,0.63414633,-45.373528
+mono content,both speakers,60,213,Mono downmix,3-8,0.48347107,-54.419556
+mono content,both speakers,60,213,Mono downmix,8-16,0.4874214,-54.10279
+mono content,both speakers,60,213,Mono downmix,16-32,0.4546875,-52.851185
+mono content,both speakers,60,213,"Stereo, mono suppressor",0-3,0.58536583,-48.247894
+mono content,both speakers,60,213,"Stereo, mono suppressor",3-8,0.45454547,-55.072243
+mono content,both speakers,60,213,"Stereo, mono suppressor",8-16,0.4654088,-55.26608
+mono content,both speakers,60,213,"Stereo, mono suppressor",16-32,0.4421875,-55.165134
+mono content,both speakers,60,176,Stereo (current),0-3,0.6125,-54.907833
+mono content,both speakers,60,176,Stereo (current),3-8,0.23236515,-55.258083
+mono content,both speakers,60,176,Stereo (current),8-16,0.30503145,-55.46766
+mono content,both speakers,60,176,Stereo (current),16-32,0.26802507,-54.312195
+mono content,both speakers,60,176,Mono downmix,0-3,0.55,-47.341038
+mono content,both speakers,60,176,Mono downmix,3-8,0.373444,-54.909508
+mono content,both speakers,60,176,Mono downmix,8-16,0.45597485,-54.669716
+mono content,both speakers,60,176,Mono downmix,16-32,0.39184952,-53.818592
+mono content,both speakers,60,176,"Stereo, mono suppressor",0-3,0.6875,-54.814037
+mono content,both speakers,60,176,"Stereo, mono suppressor",3-8,0.28630707,-55.25354
+mono content,both speakers,60,176,"Stereo, mono suppressor",8-16,0.4025157,-55.465603
+mono content,both speakers,60,176,"Stereo, mono suppressor",16-32,0.338558,-54.310192
+mono content,both speakers,60,251,Stereo (current),0-3,0.46835443,-45.7722
+mono content,both speakers,60,251,Stereo (current),3-8,0.53526974,-55.70404
+mono content,both speakers,60,251,Stereo (current),8-16,0.47634068,-55.333637
+mono content,both speakers,60,251,Stereo (current),16-32,0.40965733,-54.59492
+mono content,both speakers,60,251,Mono downmix,0-3,0.4177215,-51.465607
+mono content,both speakers,60,251,Mono downmix,3-8,0.593361,-55.016243
+mono content,both speakers,60,251,Mono downmix,8-16,0.52996844,-54.754623
+mono content,both speakers,60,251,Mono downmix,16-32,0.46261683,-53.695942
+mono content,both speakers,60,251,"Stereo, mono suppressor",0-3,0.49367088,-45.429806
+mono content,both speakers,60,251,"Stereo, mono suppressor",3-8,0.58921164,-55.69889
+mono content,both speakers,60,251,"Stereo, mono suppressor",8-16,0.5583596,-55.329594
+mono content,both speakers,60,251,"Stereo, mono suppressor",16-32,0.49376947,-54.59205
+mono content,both speakers,150,213,Stereo (current),0-3,0.4512195,-49.681282
+mono content,both speakers,150,213,Stereo (current),3-8,0.49586776,-56.142788
+mono content,both speakers,150,213,Stereo (current),8-16,0.49685535,-55.80509
+mono content,both speakers,150,213,Stereo (current),16-32,0.4859375,-55.27046
+mono content,both speakers,150,213,Mono downmix,0-3,0.47560975,-58.568405
+mono content,both speakers,150,213,Mono downmix,3-8,0.5041322,-57.702957
+mono content,both speakers,150,213,Mono downmix,8-16,0.5062893,-56.448944
+mono content,both speakers,150,213,Mono downmix,16-32,0.5296875,-54.580765
+mono content,both speakers,150,213,"Stereo, mono suppressor",0-3,0.5,-49.392372
+mono content,both speakers,150,213,"Stereo, mono suppressor",3-8,0.5289256,-56.134216
+mono content,both speakers,150,213,"Stereo, mono suppressor",8-16,0.5345912,-55.797905
+mono content,both speakers,150,213,"Stereo, mono suppressor",16-32,0.5328125,-55.266006
+mono content,both speakers,150,176,Stereo (current),0-3,0.1125,-57.391743
+mono content,both speakers,150,176,Stereo (current),3-8,0.41493776,-56.63967
+mono content,both speakers,150,176,Stereo (current),8-16,0.4056604,-56.357124
+mono content,both speakers,150,176,Stereo (current),16-32,0.4357367,-55.799767
+mono content,both speakers,150,176,Mono downmix,0-3,0.425,-53.932793
+mono content,both speakers,150,176,Mono downmix,3-8,0.4813278,-54.4733
+mono content,both speakers,150,176,Mono downmix,8-16,0.4591195,-54.096447
+mono content,both speakers,150,176,Mono downmix,16-32,0.44200626,-53.69245
+mono content,both speakers,150,176,"Stereo, mono suppressor",0-3,0.2375,-57.335953
+mono content,both speakers,150,176,"Stereo, mono suppressor",3-8,0.44813278,-56.63093
+mono content,both speakers,150,176,"Stereo, mono suppressor",8-16,0.4371069,-56.351017
+mono content,both speakers,150,176,"Stereo, mono suppressor",16-32,0.47178683,-55.79578
+mono content,both speakers,150,251,Stereo (current),0-3,0.6075949,-49.097626
+mono content,both speakers,150,251,Stereo (current),3-8,0.54771787,-56.567875
+mono content,both speakers,150,251,Stereo (current),8-16,0.5236593,-56.30911
+mono content,both speakers,150,251,Stereo (current),16-32,0.5140187,-56.193207
+mono content,both speakers,150,251,Mono downmix,0-3,0.6075949,-55.40016
+mono content,both speakers,150,251,Mono downmix,3-8,0.58506227,-55.400856
+mono content,both speakers,150,251,Mono downmix,8-16,0.5488959,-54.808144
+mono content,both speakers,150,251,Mono downmix,16-32,0.56542057,-54.08608
+mono content,both speakers,150,251,"Stereo, mono suppressor",0-3,0.6329114,-48.67901
+mono content,both speakers,150,251,"Stereo, mono suppressor",3-8,0.5809129,-56.560116
+mono content,both speakers,150,251,"Stereo, mono suppressor",8-16,0.5583596,-56.29965
+mono content,both speakers,150,251,"Stereo, mono suppressor",16-32,0.5623053,-56.188488
+panned,headphones,20,213,Stereo (current),0-3,0.8902439,-96.39373
+panned,headphones,20,213,Stereo (current),3-8,0.79752064,-95.98728
+panned,headphones,20,213,Stereo (current),8-16,0.745283,-95.47486
+panned,headphones,20,213,Stereo (current),16-32,0.784375,-95.745766
+panned,headphones,20,213,Mono downmix,0-3,0.8902439,-96.39373
+panned,headphones,20,213,Mono downmix,3-8,0.87603307,-96.129776
+panned,headphones,20,213,Mono downmix,8-16,0.8616352,-96.19709
+panned,headphones,20,213,Mono downmix,16-32,0.875,-96.23804
+panned,headphones,20,213,"Stereo, mono suppressor",0-3,0.8902439,-96.39373
+panned,headphones,20,213,"Stereo, mono suppressor",3-8,0.838843,-95.98717
+panned,headphones,20,213,"Stereo, mono suppressor",8-16,0.7955975,-95.47474
+panned,headphones,20,213,"Stereo, mono suppressor",16-32,0.81875,-95.74565
+panned,headphones,20,176,Stereo (current),0-3,0.875,-94.84747
+panned,headphones,20,176,Stereo (current),3-8,0.6556017,-95.96241
+panned,headphones,20,176,Stereo (current),8-16,0.7075472,-95.92373
+panned,headphones,20,176,Stereo (current),16-32,0.76175547,-95.961494
+panned,headphones,20,176,Mono downmix,0-3,0.875,-94.84747
+panned,headphones,20,176,Mono downmix,3-8,0.77178425,-96.43404
+panned,headphones,20,176,Mono downmix,8-16,0.8710692,-96.42366
+panned,headphones,20,176,Mono downmix,16-32,0.8714734,-96.50227
+panned,headphones,20,176,"Stereo, mono suppressor",0-3,0.875,-94.84747
+panned,headphones,20,176,"Stereo, mono suppressor",3-8,0.7053942,-95.96226
+panned,headphones,20,176,"Stereo, mono suppressor",8-16,0.7515723,-95.92357
+panned,headphones,20,176,"Stereo, mono suppressor",16-32,0.79780567,-95.96138
+panned,headphones,20,251,Stereo (current),0-3,0.87341774,-96.23878
+panned,headphones,20,251,Stereo (current),3-8,0.80912864,-96.08677
+panned,headphones,20,251,Stereo (current),8-16,0.7917981,-95.61794
+panned,headphones,20,251,Stereo (current),16-32,0.68380064,-93.93554
+panned,headphones,20,251,Mono downmix,0-3,0.87341774,-96.23878
+panned,headphones,20,251,Mono downmix,3-8,0.84232366,-96.1699
+panned,headphones,20,251,Mono downmix,8-16,0.9148265,-93.26976
+panned,headphones,20,251,Mono downmix,16-32,0.7647975,-94.37471
+panned,headphones,20,251,"Stereo, mono suppressor",0-3,0.87341774,-96.23878
+panned,headphones,20,251,"Stereo, mono suppressor",3-8,0.84232366,-96.08665
+panned,headphones,20,251,"Stereo, mono suppressor",8-16,0.8328076,-95.617905
+panned,headphones,20,251,"Stereo, mono suppressor",16-32,0.7305296,-93.9355
+panned,headphones,60,213,Stereo (current),0-3,0.8902439,-96.39373
+panned,headphones,60,213,Stereo (current),3-8,0.79752064,-95.98728
+panned,headphones,60,213,Stereo (current),8-16,0.745283,-95.47486
+panned,headphones,60,213,Stereo (current),16-32,0.784375,-95.745766
+panned,headphones,60,213,Mono downmix,0-3,0.8902439,-96.39373
+panned,headphones,60,213,Mono downmix,3-8,0.87603307,-96.129776
+panned,headphones,60,213,Mono downmix,8-16,0.8616352,-96.19709
+panned,headphones,60,213,Mono downmix,16-32,0.875,-96.23804
+panned,headphones,60,213,"Stereo, mono suppressor",0-3,0.8902439,-96.39373
+panned,headphones,60,213,"Stereo, mono suppressor",3-8,0.838843,-95.98717
+panned,headphones,60,213,"Stereo, mono suppressor",8-16,0.7955975,-95.47474
+panned,headphones,60,213,"Stereo, mono suppressor",16-32,0.81875,-95.74565
+panned,headphones,60,176,Stereo (current),0-3,0.875,-94.84747
+panned,headphones,60,176,Stereo (current),3-8,0.6556017,-95.96241
+panned,headphones,60,176,Stereo (current),8-16,0.7075472,-95.92373
+panned,headphones,60,176,Stereo (current),16-32,0.76175547,-95.961494
+panned,headphones,60,176,Mono downmix,0-3,0.875,-94.84747
+panned,headphones,60,176,Mono downmix,3-8,0.77178425,-96.43404
+panned,headphones,60,176,Mono downmix,8-16,0.8710692,-96.42366
+panned,headphones,60,176,Mono downmix,16-32,0.8714734,-96.50227
+panned,headphones,60,176,"Stereo, mono suppressor",0-3,0.875,-94.84747
+panned,headphones,60,176,"Stereo, mono suppressor",3-8,0.7053942,-95.96226
+panned,headphones,60,176,"Stereo, mono suppressor",8-16,0.7515723,-95.92357
+panned,headphones,60,176,"Stereo, mono suppressor",16-32,0.79780567,-95.96138
+panned,headphones,60,251,Stereo (current),0-3,0.87341774,-96.23878
+panned,headphones,60,251,Stereo (current),3-8,0.80912864,-96.08677
+panned,headphones,60,251,Stereo (current),8-16,0.7917981,-95.61794
+panned,headphones,60,251,Stereo (current),16-32,0.68380064,-93.93554
+panned,headphones,60,251,Mono downmix,0-3,0.87341774,-96.23878
+panned,headphones,60,251,Mono downmix,3-8,0.84232366,-96.1699
+panned,headphones,60,251,Mono downmix,8-16,0.9148265,-93.26976
+panned,headphones,60,251,Mono downmix,16-32,0.7647975,-94.37471
+panned,headphones,60,251,"Stereo, mono suppressor",0-3,0.87341774,-96.23878
+panned,headphones,60,251,"Stereo, mono suppressor",3-8,0.84232366,-96.08665
+panned,headphones,60,251,"Stereo, mono suppressor",8-16,0.8328076,-95.617905
+panned,headphones,60,251,"Stereo, mono suppressor",16-32,0.7305296,-93.9355
+panned,headphones,150,213,Stereo (current),0-3,0.8902439,-96.39373
+panned,headphones,150,213,Stereo (current),3-8,0.79752064,-95.98728
+panned,headphones,150,213,Stereo (current),8-16,0.745283,-95.47486
+panned,headphones,150,213,Stereo (current),16-32,0.784375,-95.745766
+panned,headphones,150,213,Mono downmix,0-3,0.8902439,-96.39373
+panned,headphones,150,213,Mono downmix,3-8,0.87603307,-96.129776
+panned,headphones,150,213,Mono downmix,8-16,0.8616352,-96.19709
+panned,headphones,150,213,Mono downmix,16-32,0.875,-96.23804
+panned,headphones,150,213,"Stereo, mono suppressor",0-3,0.8902439,-96.39373
+panned,headphones,150,213,"Stereo, mono suppressor",3-8,0.838843,-95.98717
+panned,headphones,150,213,"Stereo, mono suppressor",8-16,0.7955975,-95.47474
+panned,headphones,150,213,"Stereo, mono suppressor",16-32,0.81875,-95.74565
+panned,headphones,150,176,Stereo (current),0-3,0.875,-94.84747
+panned,headphones,150,176,Stereo (current),3-8,0.6556017,-95.96241
+panned,headphones,150,176,Stereo (current),8-16,0.7075472,-95.92373
+panned,headphones,150,176,Stereo (current),16-32,0.76175547,-95.961494
+panned,headphones,150,176,Mono downmix,0-3,0.875,-94.84747
+panned,headphones,150,176,Mono downmix,3-8,0.77178425,-96.43404
+panned,headphones,150,176,Mono downmix,8-16,0.8710692,-96.42366
+panned,headphones,150,176,Mono downmix,16-32,0.8714734,-96.50227
+panned,headphones,150,176,"Stereo, mono suppressor",0-3,0.875,-94.84747
+panned,headphones,150,176,"Stereo, mono suppressor",3-8,0.7053942,-95.96226
+panned,headphones,150,176,"Stereo, mono suppressor",8-16,0.7515723,-95.92357
+panned,headphones,150,176,"Stereo, mono suppressor",16-32,0.79780567,-95.96138
+panned,headphones,150,251,Stereo (current),0-3,0.87341774,-96.23878
+panned,headphones,150,251,Stereo (current),3-8,0.80912864,-96.08677
+panned,headphones,150,251,Stereo (current),8-16,0.7917981,-95.61794
+panned,headphones,150,251,Stereo (current),16-32,0.68380064,-93.93554
+panned,headphones,150,251,Mono downmix,0-3,0.87341774,-96.23878
+panned,headphones,150,251,Mono downmix,3-8,0.84232366,-96.1699
+panned,headphones,150,251,Mono downmix,8-16,0.9148265,-93.26976
+panned,headphones,150,251,Mono downmix,16-32,0.7647975,-94.37471
+panned,headphones,150,251,"Stereo, mono suppressor",0-3,0.87341774,-96.23878
+panned,headphones,150,251,"Stereo, mono suppressor",3-8,0.84232366,-96.08665
+panned,headphones,150,251,"Stereo, mono suppressor",8-16,0.8328076,-95.617905
+panned,headphones,150,251,"Stereo, mono suppressor",16-32,0.7305296,-93.9355
+panned,left speaker,20,213,Stereo (current),0-3,0.597561,-60.432045
+panned,left speaker,20,213,Stereo (current),3-8,0.58677685,-63.80625
+panned,left speaker,20,213,Stereo (current),8-16,0.5691824,-63.975582
+panned,left speaker,20,213,Stereo (current),16-32,0.58125,-65.13918
+panned,left speaker,20,213,Mono downmix,0-3,0.75609756,-53.573017
+panned,left speaker,20,213,Mono downmix,3-8,0.6404959,-64.57534
+panned,left speaker,20,213,Mono downmix,8-16,0.6415094,-63.863174
+panned,left speaker,20,213,Mono downmix,16-32,0.6515625,-61.617756
+panned,left speaker,20,213,"Stereo, mono suppressor",0-3,0.64634144,-60.4266
+panned,left speaker,20,213,"Stereo, mono suppressor",3-8,0.6322314,-63.80493
+panned,left speaker,20,213,"Stereo, mono suppressor",8-16,0.6132075,-63.973915
+panned,left speaker,20,213,"Stereo, mono suppressor",16-32,0.615625,-65.13857
+panned,left speaker,20,176,Stereo (current),0-3,0.6375,-60.081078
+panned,left speaker,20,176,Stereo (current),3-8,0.4439834,-61.117256
+panned,left speaker,20,176,Stereo (current),8-16,0.48427674,-61.531216
+panned,left speaker,20,176,Stereo (current),16-32,0.4184953,-62.502846
+panned,left speaker,20,176,Mono downmix,0-3,0.8,-40.53114
+panned,left speaker,20,176,Mono downmix,3-8,0.55186725,-57.83351
+panned,left speaker,20,176,Mono downmix,8-16,0.5974843,-58.85211
+panned,left speaker,20,176,Mono downmix,16-32,0.53291535,-63.812294
+panned,left speaker,20,176,"Stereo, mono suppressor",0-3,0.7125,-60.073936
+panned,left speaker,20,176,"Stereo, mono suppressor",3-8,0.49377593,-61.114532
+panned,left speaker,20,176,"Stereo, mono suppressor",8-16,0.5377358,-61.53004
+panned,left speaker,20,176,"Stereo, mono suppressor",16-32,0.492163,-62.50236
+panned,left speaker,20,251,Stereo (current),0-3,0.5949367,-60.304714
+panned,left speaker,20,251,Stereo (current),3-8,0.6307054,-63.119637
+panned,left speaker,20,251,Stereo (current),8-16,0.6340694,-62.982677
+panned,left speaker,20,251,Stereo (current),16-32,0.63707167,-61.897316
+panned,left speaker,20,251,Mono downmix,0-3,0.8227848,-41.499115
+panned,left speaker,20,251,Mono downmix,3-8,0.6887967,-65.10644
+panned,left speaker,20,251,Mono downmix,8-16,0.6940063,-63.95245
+panned,left speaker,20,251,Mono downmix,16-32,0.7056075,-63.393517
+panned,left speaker,20,251,"Stereo, mono suppressor",0-3,0.62025315,-60.302895
+panned,left speaker,20,251,"Stereo, mono suppressor",3-8,0.67634857,-63.117634
+panned,left speaker,20,251,"Stereo, mono suppressor",8-16,0.6719243,-62.98165
+panned,left speaker,20,251,"Stereo, mono suppressor",16-32,0.6775701,-61.896194
+panned,left speaker,60,213,Stereo (current),0-3,0.6219512,-56.066864
+panned,left speaker,60,213,Stereo (current),3-8,0.55785125,-63.647896
+panned,left speaker,60,213,Stereo (current),8-16,0.5943396,-63.59934
+panned,left speaker,60,213,Stereo (current),16-32,0.609375,-63.19049
+panned,left speaker,60,213,Mono downmix,0-3,0.76829267,-39.369854
+panned,left speaker,60,213,Mono downmix,3-8,0.6363636,-62.29313
+panned,left speaker,60,213,Mono downmix,8-16,0.6509434,-61.559578
+panned,left speaker,60,213,Mono downmix,16-32,0.653125,-61.724285
+panned,left speaker,60,213,"Stereo, mono suppressor",0-3,0.6585366,-56.065292
+panned,left speaker,60,213,"Stereo, mono suppressor",3-8,0.607438,-63.64723
+panned,left speaker,60,213,"Stereo, mono suppressor",8-16,0.6257862,-63.596767
+panned,left speaker,60,213,"Stereo, mono suppressor",16-32,0.6453125,-63.189423
+panned,left speaker,60,176,Stereo (current),0-3,0.575,-62.710155
+panned,left speaker,60,176,Stereo (current),3-8,0.44813278,-63.43571
+panned,left speaker,60,176,Stereo (current),8-16,0.5157233,-63.96521
+panned,left speaker,60,176,Stereo (current),16-32,0.4968652,-63.261963
+panned,left speaker,60,176,Mono downmix,0-3,0.7125,-44.3247
+panned,left speaker,60,176,Mono downmix,3-8,0.48547718,-59.54092
+panned,left speaker,60,176,Mono downmix,8-16,0.6006289,-59.50237
+panned,left speaker,60,176,Mono downmix,16-32,0.5893417,-60.299583
+panned,left speaker,60,176,"Stereo, mono suppressor",0-3,0.625,-62.388397
+panned,left speaker,60,176,"Stereo, mono suppressor",3-8,0.4647303,-63.43445
+panned,left speaker,60,176,"Stereo, mono suppressor",8-16,0.5691824,-63.964314
+panned,left speaker,60,176,"Stereo, mono suppressor",16-32,0.5470219,-63.260612
+panned,left speaker,60,251,Stereo (current),0-3,0.62025315,-58.58894
+panned,left speaker,60,251,Stereo (current),3-8,0.6141079,-63.50387
+panned,left speaker,60,251,Stereo (current),8-16,0.6340694,-63.27683
+panned,left speaker,60,251,Stereo (current),16-32,0.5981308,-63.62639
+panned,left speaker,60,251,Mono downmix,0-3,0.8227848,-39.866188
+panned,left speaker,60,251,Mono downmix,3-8,0.71784234,-60.84022
+panned,left speaker,60,251,Mono downmix,8-16,0.681388,-61.62951
+panned,left speaker,60,251,Mono downmix,16-32,0.6697819,-63.77245
+panned,left speaker,60,251,"Stereo, mono suppressor",0-3,0.65822786,-58.588387
+panned,left speaker,60,251,"Stereo, mono suppressor",3-8,0.6556017,-63.50303
+panned,left speaker,60,251,"Stereo, mono suppressor",8-16,0.67507887,-63.27553
+panned,left speaker,60,251,"Stereo, mono suppressor",16-32,0.6401869,-63.625675
+panned,left speaker,150,213,Stereo (current),0-3,0.5121951,-63.536186
+panned,left speaker,150,213,Stereo (current),3-8,0.553719,-64.36035
+panned,left speaker,150,213,Stereo (current),8-16,0.5597484,-64.27805
+panned,left speaker,150,213,Stereo (current),16-32,0.5359375,-64.48457
+panned,left speaker,150,213,Mono downmix,0-3,0.6219512,-51.20329
+panned,left speaker,150,213,Mono downmix,3-8,0.607438,-62.941994
+panned,left speaker,150,213,Mono downmix,8-16,0.6100629,-62.857117
+panned,left speaker,150,213,Mono downmix,16-32,0.6125,-62.233276
+panned,left speaker,150,213,"Stereo, mono suppressor",0-3,0.5243902,-63.527504
+panned,left speaker,150,213,"Stereo, mono suppressor",3-8,0.57438016,-64.35703
+panned,left speaker,150,213,"Stereo, mono suppressor",8-16,0.5974843,-64.27594
+panned,left speaker,150,213,"Stereo, mono suppressor",16-32,0.5734375,-64.48294
+panned,left speaker,150,176,Stereo (current),0-3,0.475,-67.69728
+panned,left speaker,150,176,Stereo (current),3-8,0.4439834,-66.65857
+panned,left speaker,150,176,Stereo (current),8-16,0.46226415,-66.84015
+panned,left speaker,150,176,Stereo (current),16-32,0.44043887,-64.920105
+panned,left speaker,150,176,Mono downmix,0-3,0.5625,-53.190025
+panned,left speaker,150,176,Mono downmix,3-8,0.5643154,-61.82068
+panned,left speaker,150,176,Mono downmix,8-16,0.5503145,-60.838207
+panned,left speaker,150,176,Mono downmix,16-32,0.5579937,-62.321396
+panned,left speaker,150,176,"Stereo, mono suppressor",0-3,0.475,-67.68901
+panned,left speaker,150,176,"Stereo, mono suppressor",3-8,0.5186722,-66.65797
+panned,left speaker,150,176,"Stereo, mono suppressor",8-16,0.5031447,-66.839264
+panned,left speaker,150,176,"Stereo, mono suppressor",16-32,0.4984326,-64.919655
+panned,left speaker,150,251,Stereo (current),0-3,0.556962,-65.87668
+panned,left speaker,150,251,Stereo (current),3-8,0.54771787,-67.73499
+panned,left speaker,150,251,Stereo (current),8-16,0.5520505,-66.72754
+panned,left speaker,150,251,Stereo (current),16-32,0.576324,-65.37649
+panned,left speaker,150,251,Mono downmix,0-3,0.6962025,-52.76266
+panned,left speaker,150,251,Mono downmix,3-8,0.60580915,-69.32172
+panned,left speaker,150,251,Mono downmix,8-16,0.5899054,-68.094154
+panned,left speaker,150,251,Mono downmix,16-32,0.6292835,-65.43787
+panned,left speaker,150,251,"Stereo, mono suppressor",0-3,0.56962025,-65.87592
+panned,left speaker,150,251,"Stereo, mono suppressor",3-8,0.57261413,-67.729294
+panned,left speaker,150,251,"Stereo, mono suppressor",8-16,0.5899054,-66.72541
+panned,left speaker,150,251,"Stereo, mono suppressor",16-32,0.60436136,-65.37352
+panned,both speakers,20,213,Stereo (current),0-3,0.5243902,-55.804447
+panned,both speakers,20,213,Stereo (current),3-8,0.62396693,-55.480076
+panned,both speakers,20,213,Stereo (current),8-16,0.5974843,-58.80413
+panned,both speakers,20,213,Stereo (current),16-32,0.575,-62.926308
+panned,both speakers,20,213,Mono downmix,0-3,0.75609756,-52.101154
+panned,both speakers,20,213,Mono downmix,3-8,0.6735537,-56.183395
+panned,both speakers,20,213,Mono downmix,8-16,0.6477987,-58.81021
+panned,both speakers,20,213,Mono downmix,16-32,0.653125,-60.75499
+panned,both speakers,20,213,"Stereo, mono suppressor",0-3,0.5365854,-55.71778
+panned,both speakers,20,213,"Stereo, mono suppressor",3-8,0.6652893,-55.444633
+panned,both speakers,20,213,"Stereo, mono suppressor",8-16,0.6226415,-58.803123
+panned,both speakers,20,213,"Stereo, mono suppressor",16-32,0.621875,-62.92543
+panned,both speakers,20,176,Stereo (current),0-3,0.5875,-55.149918
+panned,both speakers,20,176,Stereo (current),3-8,0.5186722,-55.319256
+panned,both speakers,20,176,Stereo (current),8-16,0.509434,-60.37269
+panned,both speakers,20,176,Stereo (current),16-32,0.46865204,-64.81741
+panned,both speakers,20,176,Mono downmix,0-3,0.825,-52.977295
+panned,both speakers,20,176,Mono downmix,3-8,0.57261413,-56.708336
+panned,both speakers,20,176,Mono downmix,8-16,0.6006289,-60.085663
+panned,both speakers,20,176,Mono downmix,16-32,0.5501567,-62.15837
+panned,both speakers,20,176,"Stereo, mono suppressor",0-3,0.6625,-55.072075
+panned,both speakers,20,176,"Stereo, mono suppressor",3-8,0.5560166,-55.29531
+panned,both speakers,20,176,"Stereo, mono suppressor",8-16,0.5660377,-60.371803
+panned,both speakers,20,176,"Stereo, mono suppressor",16-32,0.5188088,-64.816605
+panned,both speakers,20,251,Stereo (current),0-3,0.5316456,-54.59819
+panned,both speakers,20,251,Stereo (current),3-8,0.64315355,-55.783737
+panned,both speakers,20,251,Stereo (current),8-16,0.6214511,-58.250572
+panned,both speakers,20,251,Stereo (current),16-32,0.5950156,-61.415283
+panned,both speakers,20,251,Mono downmix,0-3,0.721519,-49.6833
+panned,both speakers,20,251,Mono downmix,3-8,0.7427386,-55.74223
+panned,both speakers,20,251,Mono downmix,8-16,0.71608835,-58.18056
+panned,both speakers,20,251,Mono downmix,16-32,0.71495324,-60.325207
+panned,both speakers,20,251,"Stereo, mono suppressor",0-3,0.556962,-54.560463
+panned,both speakers,20,251,"Stereo, mono suppressor",3-8,0.68049794,-55.77337
+panned,both speakers,20,251,"Stereo, mono suppressor",8-16,0.66246057,-58.248444
+panned,both speakers,20,251,"Stereo, mono suppressor",16-32,0.6542056,-61.413788
+panned,both speakers,60,213,Stereo (current),0-3,0.5365854,-54.889187
+panned,both speakers,60,213,Stereo (current),3-8,0.5495868,-54.991203
+panned,both speakers,60,213,Stereo (current),8-16,0.6037736,-58.110764
+panned,both speakers,60,213,Stereo (current),16-32,0.6140625,-61.5251
+panned,both speakers,60,213,Mono downmix,0-3,0.70731705,-44.95317
+panned,both speakers,60,213,Mono downmix,3-8,0.6818182,-56.009823
+panned,both speakers,60,213,Mono downmix,8-16,0.6666667,-57.874928
+panned,both speakers,60,213,Mono downmix,16-32,0.678125,-58.462227
+panned,both speakers,60,213,"Stereo, mono suppressor",0-3,0.597561,-54.81136
+panned,both speakers,60,213,"Stereo, mono suppressor",3-8,0.61570245,-54.97225
+panned,both speakers,60,213,"Stereo, mono suppressor",8-16,0.6477987,-58.10852
+panned,both speakers,60,213,"Stereo, mono suppressor",16-32,0.65,-61.523872
+panned,both speakers,60,176,Stereo (current),0-3,0.6625,-54.567085
+panned,both speakers,60,176,Stereo (current),3-8,0.36099586,-54.956722
+panned,both speakers,60,176,Stereo (current),8-16,0.44968554,-59.162067
+panned,both speakers,60,176,Stereo (current),16-32,0.45768026,-61.308395
+panned,both speakers,60,176,Mono downmix,0-3,0.6875,-43.477573
+panned,both speakers,60,176,Mono downmix,3-8,0.526971,-55.481133
+panned,both speakers,60,176,Mono downmix,8-16,0.6132075,-58.32262
+panned,both speakers,60,176,Mono downmix,16-32,0.5862069,-59.337276
+panned,both speakers,60,176,"Stereo, mono suppressor",0-3,0.675,-54.437546
+panned,both speakers,60,176,"Stereo, mono suppressor",3-8,0.4273859,-54.936897
+panned,both speakers,60,176,"Stereo, mono suppressor",8-16,0.5345912,-59.160046
+panned,both speakers,60,176,"Stereo, mono suppressor",16-32,0.531348,-61.307365
+panned,both speakers,60,251,Stereo (current),0-3,0.46835443,-48.032295
+panned,both speakers,60,251,Stereo (current),3-8,0.62655604,-55.22446
+panned,both speakers,60,251,Stereo (current),8-16,0.59621453,-58.87246
+panned,both speakers,60,251,Stereo (current),16-32,0.5685358,-61.384804
+panned,both speakers,60,251,Mono downmix,0-3,0.5443038,-42.446526
+panned,both speakers,60,251,Mono downmix,3-8,0.71369296,-55.697803
+panned,both speakers,60,251,Mono downmix,8-16,0.6971609,-57.913498
+panned,both speakers,60,251,Mono downmix,16-32,0.6744548,-61.769867
+panned,both speakers,60,251,"Stereo, mono suppressor",0-3,0.49367088,-48.01783
+panned,both speakers,60,251,"Stereo, mono suppressor",3-8,0.68049794,-55.19995
+panned,both speakers,60,251,"Stereo, mono suppressor",8-16,0.6687697,-58.869614
+panned,both speakers,60,251,"Stereo, mono suppressor",16-32,0.62772584,-61.38422
+panned,both speakers,150,213,Stereo (current),0-3,0.47560975,-56.702087
+panned,both speakers,150,213,Stereo (current),3-8,0.6446281,-56.02153
+panned,both speakers,150,213,Stereo (current),8-16,0.6383648,-58.809746
+panned,both speakers,150,213,Stereo (current),16-32,0.578125,-62.83812
+panned,both speakers,150,213,Mono downmix,0-3,0.64634144,-58.22889
+panned,both speakers,150,213,Mono downmix,3-8,0.6198347,-58.23413
+panned,both speakers,150,213,Mono downmix,8-16,0.6132075,-61.81279
+panned,both speakers,150,213,Mono downmix,16-32,0.6,-63.054104
+panned,both speakers,150,213,"Stereo, mono suppressor",0-3,0.5243902,-56.620518
+panned,both speakers,150,213,"Stereo, mono suppressor",3-8,0.6487603,-55.99449
+panned,both speakers,150,213,"Stereo, mono suppressor",8-16,0.6509434,-58.80337
+panned,both speakers,150,213,"Stereo, mono suppressor",16-32,0.6,-62.836185
+panned,both speakers,150,176,Stereo (current),0-3,0.4375,-57.20654
+panned,both speakers,150,176,Stereo (current),3-8,0.5560166,-57.34693
+panned,both speakers,150,176,Stereo (current),8-16,0.5566038,-60.100105
+panned,both speakers,150,176,Stereo (current),16-32,0.5266458,-63.007603
+panned,both speakers,150,176,Mono downmix,0-3,0.5875,-54.31847
+panned,both speakers,150,176,Mono downmix,3-8,0.58506227,-57.15599
+panned,both speakers,150,176,Mono downmix,8-16,0.5597484,-61.405064
+panned,both speakers,150,176,Mono downmix,16-32,0.5689655,-60.142883
+panned,both speakers,150,176,"Stereo, mono suppressor",0-3,0.4625,-57.156693
+panned,both speakers,150,176,"Stereo, mono suppressor",3-8,0.58921164,-57.328762
+panned,both speakers,150,176,"Stereo, mono suppressor",8-16,0.5754717,-60.090946
+panned,both speakers,150,176,"Stereo, mono suppressor",16-32,0.55172414,-63.006245
+panned,both speakers,150,251,Stereo (current),0-3,0.5316456,-56.401566
+panned,both speakers,150,251,Stereo (current),3-8,0.5975104,-56.423794
+panned,both speakers,150,251,Stereo (current),8-16,0.6025237,-59.897057
+panned,both speakers,150,251,Stereo (current),16-32,0.6168224,-61.337242
+panned,both speakers,150,251,Mono downmix,0-3,0.73417723,-55.31425
+panned,both speakers,150,251,Mono downmix,3-8,0.66390043,-58.866
+panned,both speakers,150,251,Mono downmix,8-16,0.6340694,-60.50979
+panned,both speakers,150,251,Mono downmix,16-32,0.6635514,-62.04472
+panned,both speakers,150,251,"Stereo, mono suppressor",0-3,0.6075949,-56.301186
+panned,both speakers,150,251,"Stereo, mono suppressor",3-8,0.64315355,-56.401867
+panned,both speakers,150,251,"Stereo, mono suppressor",8-16,0.62776023,-59.890762
+panned,both speakers,150,251,"Stereo, mono suppressor",16-32,0.63707167,-61.329926
+wide independent,headphones,20,213,Stereo (current),0-3,0.8902439,-95.92311
+wide independent,headphones,20,213,Stereo (current),3-8,0.7644628,-95.98728
+wide independent,headphones,20,213,Stereo (current),8-16,0.745283,-95.47486
+wide independent,headphones,20,213,Stereo (current),16-32,0.784375,-95.745766
+wide independent,headphones,20,213,Mono downmix,0-3,0.8902439,-95.93094
+wide independent,headphones,20,213,Mono downmix,3-8,0.7066116,-94.64446
+wide independent,headphones,20,213,Mono downmix,8-16,0.6666667,-94.82208
+wide independent,headphones,20,213,Mono downmix,16-32,0.7796875,-95.70617
+wide independent,headphones,20,213,"Stereo, mono suppressor",0-3,0.8902439,-95.92311
+wide independent,headphones,20,213,"Stereo, mono suppressor",3-8,0.80991733,-95.98717
+wide independent,headphones,20,213,"Stereo, mono suppressor",8-16,0.7955975,-95.47474
+wide independent,headphones,20,213,"Stereo, mono suppressor",16-32,0.81875,-95.74565
+wide independent,headphones,20,176,Stereo (current),0-3,0.7625,-95.15308
+wide independent,headphones,20,176,Stereo (current),3-8,0.58921164,-95.96241
+wide independent,headphones,20,176,Stereo (current),8-16,0.7075472,-95.92373
+wide independent,headphones,20,176,Stereo (current),16-32,0.76175547,-95.961494
+wide independent,headphones,20,176,Mono downmix,0-3,0.7625,-95.14736
+wide independent,headphones,20,176,Mono downmix,3-8,0.7095436,-95.88446
+wide independent,headphones,20,176,Mono downmix,8-16,0.5880503,-95.132515
+wide independent,headphones,20,176,Mono downmix,16-32,0.6238245,-95.277954
+wide independent,headphones,20,176,"Stereo, mono suppressor",0-3,0.7625,-95.15308
+wide independent,headphones,20,176,"Stereo, mono suppressor",3-8,0.6473029,-95.96226
+wide independent,headphones,20,176,"Stereo, mono suppressor",8-16,0.7515723,-95.92357
+wide independent,headphones,20,176,"Stereo, mono suppressor",16-32,0.79780567,-95.96138
+wide independent,headphones,20,251,Stereo (current),0-3,0.93670887,-95.916916
+wide independent,headphones,20,251,Stereo (current),3-8,0.7966805,-96.08677
+wide independent,headphones,20,251,Stereo (current),8-16,0.7917981,-95.61794
+wide independent,headphones,20,251,Stereo (current),16-32,0.68380064,-93.93554
+wide independent,headphones,20,251,Mono downmix,0-3,0.93670887,-95.90992
+wide independent,headphones,20,251,Mono downmix,3-8,0.8589212,-95.87261
+wide independent,headphones,20,251,Mono downmix,8-16,0.7413249,-95.82942
+wide independent,headphones,20,251,Mono downmix,16-32,0.8753894,-92.55027
+wide independent,headphones,20,251,"Stereo, mono suppressor",0-3,0.93670887,-95.916916
+wide independent,headphones,20,251,"Stereo, mono suppressor",3-8,0.8298755,-96.08665
+wide independent,headphones,20,251,"Stereo, mono suppressor",8-16,0.8328076,-95.617905
+wide independent,headphones,20,251,"Stereo, mono suppressor",16-32,0.7305296,-93.9355
+wide independent,headphones,60,213,Stereo (current),0-3,0.8902439,-95.92311
+wide independent,headphones,60,213,Stereo (current),3-8,0.7644628,-95.98728
+wide independent,headphones,60,213,Stereo (current),8-16,0.745283,-95.47486
+wide independent,headphones,60,213,Stereo (current),16-32,0.784375,-95.745766
+wide independent,headphones,60,213,Mono downmix,0-3,0.8902439,-95.93094
+wide independent,headphones,60,213,Mono downmix,3-8,0.7066116,-94.64446
+wide independent,headphones,60,213,Mono downmix,8-16,0.6666667,-94.82208
+wide independent,headphones,60,213,Mono downmix,16-32,0.7796875,-95.70617
+wide independent,headphones,60,213,"Stereo, mono suppressor",0-3,0.8902439,-95.92311
+wide independent,headphones,60,213,"Stereo, mono suppressor",3-8,0.80991733,-95.98717
+wide independent,headphones,60,213,"Stereo, mono suppressor",8-16,0.7955975,-95.47474
+wide independent,headphones,60,213,"Stereo, mono suppressor",16-32,0.81875,-95.74565
+wide independent,headphones,60,176,Stereo (current),0-3,0.7625,-95.15308
+wide independent,headphones,60,176,Stereo (current),3-8,0.58921164,-95.96241
+wide independent,headphones,60,176,Stereo (current),8-16,0.7075472,-95.92373
+wide independent,headphones,60,176,Stereo (current),16-32,0.76175547,-95.961494
+wide independent,headphones,60,176,Mono downmix,0-3,0.7625,-95.14736
+wide independent,headphones,60,176,Mono downmix,3-8,0.7095436,-95.88446
+wide independent,headphones,60,176,Mono downmix,8-16,0.5880503,-95.132515
+wide independent,headphones,60,176,Mono downmix,16-32,0.6238245,-95.277954
+wide independent,headphones,60,176,"Stereo, mono suppressor",0-3,0.7625,-95.15308
+wide independent,headphones,60,176,"Stereo, mono suppressor",3-8,0.6473029,-95.96226
+wide independent,headphones,60,176,"Stereo, mono suppressor",8-16,0.7515723,-95.92357
+wide independent,headphones,60,176,"Stereo, mono suppressor",16-32,0.79780567,-95.96138
+wide independent,headphones,60,251,Stereo (current),0-3,0.93670887,-95.916916
+wide independent,headphones,60,251,Stereo (current),3-8,0.7966805,-96.08677
+wide independent,headphones,60,251,Stereo (current),8-16,0.7917981,-95.61794
+wide independent,headphones,60,251,Stereo (current),16-32,0.68380064,-93.93554
+wide independent,headphones,60,251,Mono downmix,0-3,0.93670887,-95.90992
+wide independent,headphones,60,251,Mono downmix,3-8,0.8589212,-95.87261
+wide independent,headphones,60,251,Mono downmix,8-16,0.7413249,-95.82942
+wide independent,headphones,60,251,Mono downmix,16-32,0.8753894,-92.55027
+wide independent,headphones,60,251,"Stereo, mono suppressor",0-3,0.93670887,-95.916916
+wide independent,headphones,60,251,"Stereo, mono suppressor",3-8,0.8298755,-96.08665
+wide independent,headphones,60,251,"Stereo, mono suppressor",8-16,0.8328076,-95.617905
+wide independent,headphones,60,251,"Stereo, mono suppressor",16-32,0.7305296,-93.9355
+wide independent,headphones,150,213,Stereo (current),0-3,0.8902439,-95.92311
+wide independent,headphones,150,213,Stereo (current),3-8,0.7644628,-95.98728
+wide independent,headphones,150,213,Stereo (current),8-16,0.745283,-95.47486
+wide independent,headphones,150,213,Stereo (current),16-32,0.784375,-95.745766
+wide independent,headphones,150,213,Mono downmix,0-3,0.8902439,-95.93094
+wide independent,headphones,150,213,Mono downmix,3-8,0.7066116,-94.64446
+wide independent,headphones,150,213,Mono downmix,8-16,0.6666667,-94.82208
+wide independent,headphones,150,213,Mono downmix,16-32,0.7796875,-95.70617
+wide independent,headphones,150,213,"Stereo, mono suppressor",0-3,0.8902439,-95.92311
+wide independent,headphones,150,213,"Stereo, mono suppressor",3-8,0.80991733,-95.98717
+wide independent,headphones,150,213,"Stereo, mono suppressor",8-16,0.7955975,-95.47474
+wide independent,headphones,150,213,"Stereo, mono suppressor",16-32,0.81875,-95.74565
+wide independent,headphones,150,176,Stereo (current),0-3,0.7625,-95.15308
+wide independent,headphones,150,176,Stereo (current),3-8,0.58921164,-95.96241
+wide independent,headphones,150,176,Stereo (current),8-16,0.7075472,-95.92373
+wide independent,headphones,150,176,Stereo (current),16-32,0.76175547,-95.961494
+wide independent,headphones,150,176,Mono downmix,0-3,0.7625,-95.14736
+wide independent,headphones,150,176,Mono downmix,3-8,0.7095436,-95.88446
+wide independent,headphones,150,176,Mono downmix,8-16,0.5880503,-95.132515
+wide independent,headphones,150,176,Mono downmix,16-32,0.6238245,-95.277954
+wide independent,headphones,150,176,"Stereo, mono suppressor",0-3,0.7625,-95.15308
+wide independent,headphones,150,176,"Stereo, mono suppressor",3-8,0.6473029,-95.96226
+wide independent,headphones,150,176,"Stereo, mono suppressor",8-16,0.7515723,-95.92357
+wide independent,headphones,150,176,"Stereo, mono suppressor",16-32,0.79780567,-95.96138
+wide independent,headphones,150,251,Stereo (current),0-3,0.93670887,-95.916916
+wide independent,headphones,150,251,Stereo (current),3-8,0.7966805,-96.08677
+wide independent,headphones,150,251,Stereo (current),8-16,0.7917981,-95.61794
+wide independent,headphones,150,251,Stereo (current),16-32,0.68380064,-93.93554
+wide independent,headphones,150,251,Mono downmix,0-3,0.93670887,-95.90992
+wide independent,headphones,150,251,Mono downmix,3-8,0.8589212,-95.87261
+wide independent,headphones,150,251,Mono downmix,8-16,0.7413249,-95.82942
+wide independent,headphones,150,251,Mono downmix,16-32,0.8753894,-92.55027
+wide independent,headphones,150,251,"Stereo, mono suppressor",0-3,0.93670887,-95.916916
+wide independent,headphones,150,251,"Stereo, mono suppressor",3-8,0.8298755,-96.08665
+wide independent,headphones,150,251,"Stereo, mono suppressor",8-16,0.8328076,-95.617905
+wide independent,headphones,150,251,"Stereo, mono suppressor",16-32,0.7305296,-93.9355
+wide independent,left speaker,20,213,Stereo (current),0-3,0.597561,-60.432045
+wide independent,left speaker,20,213,Stereo (current),3-8,0.58677685,-63.80625
+wide independent,left speaker,20,213,Stereo (current),8-16,0.5691824,-63.975582
+wide independent,left speaker,20,213,Stereo (current),16-32,0.58125,-65.13918
+wide independent,left speaker,20,213,Mono downmix,0-3,0.5121951,-42.847805
+wide independent,left speaker,20,213,Mono downmix,3-8,0.6280992,-49.549107
+wide independent,left speaker,20,213,Mono downmix,8-16,0.7641509,-44.81081
+wide independent,left speaker,20,213,Mono downmix,16-32,0.7078125,-43.81506
+wide independent,left speaker,20,213,"Stereo, mono suppressor",0-3,0.64634144,-60.4266
+wide independent,left speaker,20,213,"Stereo, mono suppressor",3-8,0.6322314,-63.80493
+wide independent,left speaker,20,213,"Stereo, mono suppressor",8-16,0.6132075,-63.973915
+wide independent,left speaker,20,213,"Stereo, mono suppressor",16-32,0.615625,-65.13857
+wide independent,left speaker,20,176,Stereo (current),0-3,0.6375,-60.081078
+wide independent,left speaker,20,176,Stereo (current),3-8,0.4439834,-61.117256
+wide independent,left speaker,20,176,Stereo (current),8-16,0.48427674,-61.531216
+wide independent,left speaker,20,176,Stereo (current),16-32,0.4184953,-62.502846
+wide independent,left speaker,20,176,Mono downmix,0-3,0.5625,-49.62319
+wide independent,left speaker,20,176,Mono downmix,3-8,0.64315355,-47.511906
+wide independent,left speaker,20,176,Mono downmix,8-16,0.7012579,-42.638145
+wide independent,left speaker,20,176,Mono downmix,16-32,0.6583072,-40.968517
+wide independent,left speaker,20,176,"Stereo, mono suppressor",0-3,0.7125,-60.073936
+wide independent,left speaker,20,176,"Stereo, mono suppressor",3-8,0.49377593,-61.114532
+wide independent,left speaker,20,176,"Stereo, mono suppressor",8-16,0.5377358,-61.53004
+wide independent,left speaker,20,176,"Stereo, mono suppressor",16-32,0.492163,-62.50236
+wide independent,left speaker,20,251,Stereo (current),0-3,0.5949367,-60.304714
+wide independent,left speaker,20,251,Stereo (current),3-8,0.6307054,-63.119637
+wide independent,left speaker,20,251,Stereo (current),8-16,0.6340694,-62.982677
+wide independent,left speaker,20,251,Stereo (current),16-32,0.63707167,-61.897316
+wide independent,left speaker,20,251,Mono downmix,0-3,0.6329114,-45.980278
+wide independent,left speaker,20,251,Mono downmix,3-8,0.7842324,-48.747063
+wide independent,left speaker,20,251,Mono downmix,8-16,0.76340693,-45.619164
+wide independent,left speaker,20,251,Mono downmix,16-32,0.741433,-43.49592
+wide independent,left speaker,20,251,"Stereo, mono suppressor",0-3,0.62025315,-60.302895
+wide independent,left speaker,20,251,"Stereo, mono suppressor",3-8,0.67634857,-63.117634
+wide independent,left speaker,20,251,"Stereo, mono suppressor",8-16,0.6719243,-62.98165
+wide independent,left speaker,20,251,"Stereo, mono suppressor",16-32,0.6775701,-61.896194
+wide independent,left speaker,60,213,Stereo (current),0-3,0.6219512,-56.066864
+wide independent,left speaker,60,213,Stereo (current),3-8,0.55785125,-63.647896
+wide independent,left speaker,60,213,Stereo (current),8-16,0.5943396,-63.59934
+wide independent,left speaker,60,213,Stereo (current),16-32,0.609375,-63.19049
+wide independent,left speaker,60,213,Mono downmix,0-3,0.69512194,-42.14449
+wide independent,left speaker,60,213,Mono downmix,3-8,0.6570248,-47.005447
+wide independent,left speaker,60,213,Mono downmix,8-16,0.7704403,-45.080166
+wide independent,left speaker,60,213,Mono downmix,16-32,0.69375,-43.1477
+wide independent,left speaker,60,213,"Stereo, mono suppressor",0-3,0.6585366,-56.065292
+wide independent,left speaker,60,213,"Stereo, mono suppressor",3-8,0.607438,-63.64723
+wide independent,left speaker,60,213,"Stereo, mono suppressor",8-16,0.6257862,-63.596767
+wide independent,left speaker,60,213,"Stereo, mono suppressor",16-32,0.6453125,-63.189423
+wide independent,left speaker,60,176,Stereo (current),0-3,0.575,-62.710155
+wide independent,left speaker,60,176,Stereo (current),3-8,0.44813278,-63.43571
+wide independent,left speaker,60,176,Stereo (current),8-16,0.5157233,-63.96521
+wide independent,left speaker,60,176,Stereo (current),16-32,0.4968652,-63.261963
+wide independent,left speaker,60,176,Mono downmix,0-3,0.825,-51.14586
+wide independent,left speaker,60,176,Mono downmix,3-8,0.65975106,-46.791805
+wide independent,left speaker,60,176,Mono downmix,8-16,0.6698113,-42.153862
+wide independent,left speaker,60,176,Mono downmix,16-32,0.70846397,-41.88919
+wide independent,left speaker,60,176,"Stereo, mono suppressor",0-3,0.625,-62.388397
+wide independent,left speaker,60,176,"Stereo, mono suppressor",3-8,0.4647303,-63.43445
+wide independent,left speaker,60,176,"Stereo, mono suppressor",8-16,0.5691824,-63.964314
+wide independent,left speaker,60,176,"Stereo, mono suppressor",16-32,0.5470219,-63.260612
+wide independent,left speaker,60,251,Stereo (current),0-3,0.62025315,-58.58894
+wide independent,left speaker,60,251,Stereo (current),3-8,0.6141079,-63.50387
+wide independent,left speaker,60,251,Stereo (current),8-16,0.6340694,-63.27683
+wide independent,left speaker,60,251,Stereo (current),16-32,0.5981308,-63.62639
+wide independent,left speaker,60,251,Mono downmix,0-3,0.65822786,-46.639114
+wide independent,left speaker,60,251,Mono downmix,3-8,0.7759336,-47.915997
+wide independent,left speaker,60,251,Mono downmix,8-16,0.829653,-43.49432
+wide independent,left speaker,60,251,Mono downmix,16-32,0.7507788,-42.35742
+wide independent,left speaker,60,251,"Stereo, mono suppressor",0-3,0.65822786,-58.588387
+wide independent,left speaker,60,251,"Stereo, mono suppressor",3-8,0.6556017,-63.50303
+wide independent,left speaker,60,251,"Stereo, mono suppressor",8-16,0.67507887,-63.27553
+wide independent,left speaker,60,251,"Stereo, mono suppressor",16-32,0.6401869,-63.625675
+wide independent,left speaker,150,213,Stereo (current),0-3,0.5121951,-63.536186
+wide independent,left speaker,150,213,Stereo (current),3-8,0.553719,-64.36035
+wide independent,left speaker,150,213,Stereo (current),8-16,0.5597484,-64.27805
+wide independent,left speaker,150,213,Stereo (current),16-32,0.5359375,-64.48457
+wide independent,left speaker,150,213,Mono downmix,0-3,0.902439,-39.217453
+wide independent,left speaker,150,213,Mono downmix,3-8,0.75206614,-43.875523
+wide independent,left speaker,150,213,Mono downmix,8-16,0.6320755,-43.40942
+wide independent,left speaker,150,213,Mono downmix,16-32,0.7890625,-41.65394
+wide independent,left speaker,150,213,"Stereo, mono suppressor",0-3,0.5243902,-63.527504
+wide independent,left speaker,150,213,"Stereo, mono suppressor",3-8,0.57438016,-64.35703
+wide independent,left speaker,150,213,"Stereo, mono suppressor",8-16,0.5974843,-64.27594
+wide independent,left speaker,150,213,"Stereo, mono suppressor",16-32,0.5734375,-64.48294
+wide independent,left speaker,150,176,Stereo (current),0-3,0.475,-67.69728
+wide independent,left speaker,150,176,Stereo (current),3-8,0.4439834,-66.65857
+wide independent,left speaker,150,176,Stereo (current),8-16,0.46226415,-66.84015
+wide independent,left speaker,150,176,Stereo (current),16-32,0.44043887,-64.920105
+wide independent,left speaker,150,176,Mono downmix,0-3,0.875,-41.47531
+wide independent,left speaker,150,176,Mono downmix,3-8,0.44813278,-46.69388
+wide independent,left speaker,150,176,Mono downmix,8-16,0.5786164,-45.078644
+wide independent,left speaker,150,176,Mono downmix,16-32,0.64890283,-41.61712
+wide independent,left speaker,150,176,"Stereo, mono suppressor",0-3,0.475,-67.68901
+wide independent,left speaker,150,176,"Stereo, mono suppressor",3-8,0.5186722,-66.65797
+wide independent,left speaker,150,176,"Stereo, mono suppressor",8-16,0.5031447,-66.839264
+wide independent,left speaker,150,176,"Stereo, mono suppressor",16-32,0.4984326,-64.919655
+wide independent,left speaker,150,251,Stereo (current),0-3,0.556962,-65.87668
+wide independent,left speaker,150,251,Stereo (current),3-8,0.54771787,-67.73499
+wide independent,left speaker,150,251,Stereo (current),8-16,0.5520505,-66.72754
+wide independent,left speaker,150,251,Stereo (current),16-32,0.576324,-65.37649
+wide independent,left speaker,150,251,Mono downmix,0-3,0.79746836,-40.248486
+wide independent,left speaker,150,251,Mono downmix,3-8,0.7593361,-45.967556
+wide independent,left speaker,150,251,Mono downmix,8-16,0.7287066,-43.369965
+wide independent,left speaker,150,251,Mono downmix,16-32,0.7429907,-41.4879
+wide independent,left speaker,150,251,"Stereo, mono suppressor",0-3,0.56962025,-65.87592
+wide independent,left speaker,150,251,"Stereo, mono suppressor",3-8,0.57261413,-67.729294
+wide independent,left speaker,150,251,"Stereo, mono suppressor",8-16,0.5899054,-66.72541
+wide independent,left speaker,150,251,"Stereo, mono suppressor",16-32,0.60436136,-65.37352
+wide independent,both speakers,20,213,Stereo (current),0-3,0.6097561,-34.70469
+wide independent,both speakers,20,213,Stereo (current),3-8,0.60330576,-34.971832
+wide independent,both speakers,20,213,Stereo (current),8-16,0.6540881,-36.938713
+wide independent,both speakers,20,213,Stereo (current),16-32,0.7296875,-33.287014
+wide independent,both speakers,20,213,Mono downmix,0-3,0.3292683,-50.04403
+wide independent,both speakers,20,213,Mono downmix,3-8,0.61570245,-51.25484
+wide independent,both speakers,20,213,Mono downmix,8-16,0.6037736,-50.581455
+wide independent,both speakers,20,213,Mono downmix,16-32,0.6703125,-47.901596
+wide independent,both speakers,20,213,"Stereo, mono suppressor",0-3,0.6097561,-34.533356
+wide independent,both speakers,20,213,"Stereo, mono suppressor",3-8,0.6652893,-33.378254
+wide independent,both speakers,20,213,"Stereo, mono suppressor",8-16,0.7106918,-34.94782
+wide independent,both speakers,20,213,"Stereo, mono suppressor",16-32,0.7671875,-32.54882
+wide independent,both speakers,20,176,Stereo (current),0-3,0.8375,-34.795364
+wide independent,both speakers,20,176,Stereo (current),3-8,0.47302905,-38.804623
+wide independent,both speakers,20,176,Stereo (current),8-16,0.7264151,-36.077972
+wide independent,both speakers,20,176,Stereo (current),16-32,0.6865204,-35.37713
+wide independent,both speakers,20,176,Mono downmix,0-3,0.575,-52.055122
+wide independent,both speakers,20,176,Mono downmix,3-8,0.57261413,-51.13316
+wide independent,both speakers,20,176,Mono downmix,8-16,0.49056605,-50.09893
+wide independent,both speakers,20,176,Mono downmix,16-32,0.44670847,-47.82839
+wide independent,both speakers,20,176,"Stereo, mono suppressor",0-3,0.8375,-34.58095
+wide independent,both speakers,20,176,"Stereo, mono suppressor",3-8,0.5228216,-35.62797
+wide independent,both speakers,20,176,"Stereo, mono suppressor",8-16,0.7704403,-33.999268
+wide independent,both speakers,20,176,"Stereo, mono suppressor",16-32,0.7366771,-33.519344
+wide independent,both speakers,20,251,Stereo (current),0-3,0.65822786,-34.301483
+wide independent,both speakers,20,251,Stereo (current),3-8,0.6887967,-37.743904
+wide independent,both speakers,20,251,Stereo (current),8-16,0.77287066,-34.384792
+wide independent,both speakers,20,251,Stereo (current),16-32,0.76791275,-33.215603
+wide independent,both speakers,20,251,Mono downmix,0-3,0.5063291,-49.338524
+wide independent,both speakers,20,251,Mono downmix,3-8,0.7261411,-51.33835
+wide independent,both speakers,20,251,Mono downmix,8-16,0.6687697,-51.245632
+wide independent,both speakers,20,251,Mono downmix,16-32,0.6682243,-49.5538
+wide independent,both speakers,20,251,"Stereo, mono suppressor",0-3,0.6835443,-33.811916
+wide independent,both speakers,20,251,"Stereo, mono suppressor",3-8,0.7634855,-34.774124
+wide independent,both speakers,20,251,"Stereo, mono suppressor",8-16,0.81388015,-32.958054
+wide independent,both speakers,20,251,"Stereo, mono suppressor",16-32,0.7912772,-32.25219
+wide independent,both speakers,60,213,Stereo (current),0-3,0.76829267,-34.41122
+wide independent,both speakers,60,213,Stereo (current),3-8,0.57024795,-37.99524
+wide independent,both speakers,60,213,Stereo (current),8-16,0.6352201,-39.32512
+wide independent,both speakers,60,213,Stereo (current),16-32,0.6921875,-34.699184
+wide independent,both speakers,60,213,Mono downmix,0-3,0.6219512,-51.44742
+wide independent,both speakers,60,213,Mono downmix,3-8,0.5785124,-51.537724
+wide independent,both speakers,60,213,Mono downmix,8-16,0.6792453,-50.353355
+wide independent,both speakers,60,213,Mono downmix,16-32,0.6765625,-47.789078
+wide independent,both speakers,60,213,"Stereo, mono suppressor",0-3,0.76829267,-34.201412
+wide independent,both speakers,60,213,"Stereo, mono suppressor",3-8,0.6322314,-35.282055
+wide independent,both speakers,60,213,"Stereo, mono suppressor",8-16,0.6886792,-36.39979
+wide independent,both speakers,60,213,"Stereo, mono suppressor",16-32,0.7390625,-33.095493
+wide independent,both speakers,60,176,Stereo (current),0-3,0.6875,-35.41541
+wide independent,both speakers,60,176,Stereo (current),3-8,0.4979253,-38.812847
+wide independent,both speakers,60,176,Stereo (current),8-16,0.6226415,-36.01116
+wide independent,both speakers,60,176,Stereo (current),16-32,0.7946708,-33.8697
+wide independent,both speakers,60,176,Mono downmix,0-3,0.55,-52.273544
+wide independent,both speakers,60,176,Mono downmix,3-8,0.5767635,-49.917152
+wide independent,both speakers,60,176,Mono downmix,8-16,0.5408805,-49.889874
+wide independent,both speakers,60,176,Mono downmix,16-32,0.55329156,-47.906784
+wide independent,both speakers,60,176,"Stereo, mono suppressor",0-3,0.6875,-34.73856
+wide independent,both speakers,60,176,"Stereo, mono suppressor",3-8,0.5435685,-36.042862
+wide independent,both speakers,60,176,"Stereo, mono suppressor",8-16,0.6792453,-34.375347
+wide independent,both speakers,60,176,"Stereo, mono suppressor",16-32,0.82758623,-32.484783
+wide independent,both speakers,60,251,Stereo (current),0-3,0.65822786,-32.946266
+wide independent,both speakers,60,251,Stereo (current),3-8,0.70124483,-38.28031
+wide independent,both speakers,60,251,Stereo (current),8-16,0.71924293,-34.907764
+wide independent,both speakers,60,251,Stereo (current),16-32,0.68068534,-34.821808
+wide independent,both speakers,60,251,Mono downmix,0-3,0.56962025,-48.480907
+wide independent,both speakers,60,251,Mono downmix,3-8,0.6680498,-50.890106
+wide independent,both speakers,60,251,Mono downmix,8-16,0.7444795,-50.146748
+wide independent,both speakers,60,251,Mono downmix,16-32,0.6931464,-48.5165
+wide independent,both speakers,60,251,"Stereo, mono suppressor",0-3,0.65822786,-32.582565
+wide independent,both speakers,60,251,"Stereo, mono suppressor",3-8,0.7634855,-35.78509
+wide independent,both speakers,60,251,"Stereo, mono suppressor",8-16,0.7570978,-33.751488
+wide independent,both speakers,60,251,"Stereo, mono suppressor",16-32,0.7429907,-33.148693
+wide independent,both speakers,150,213,Stereo (current),0-3,0.6097561,-33.671165
+wide independent,both speakers,150,213,Stereo (current),3-8,0.58264464,-37.60321
+wide independent,both speakers,150,213,Stereo (current),8-16,0.591195,-35.28705
+wide independent,both speakers,150,213,Stereo (current),16-32,0.678125,-34.031185
+wide independent,both speakers,150,213,Mono downmix,0-3,0.73170733,-56.302063
+wide independent,both speakers,150,213,Mono downmix,3-8,0.5371901,-53.844917
+wide independent,both speakers,150,213,Mono downmix,8-16,0.49056605,-52.359528
+wide independent,both speakers,150,213,Mono downmix,16-32,0.665625,-50.16811
+wide independent,both speakers,150,213,"Stereo, mono suppressor",0-3,0.6097561,-33.456314
+wide independent,both speakers,150,213,"Stereo, mono suppressor",3-8,0.6446281,-34.522842
+wide independent,both speakers,150,213,"Stereo, mono suppressor",8-16,0.6446541,-34.412678
+wide independent,both speakers,150,213,"Stereo, mono suppressor",16-32,0.7171875,-32.877907
+wide independent,both speakers,150,176,Stereo (current),0-3,0.2875,-35.097404
+wide independent,both speakers,150,176,Stereo (current),3-8,0.47717842,-41.551605
+wide independent,both speakers,150,176,Stereo (current),8-16,0.6477987,-36.192966
+wide independent,both speakers,150,176,Stereo (current),16-32,0.6677116,-33.37108
+wide independent,both speakers,150,176,Mono downmix,0-3,0.6125,-53.00206
+wide independent,both speakers,150,176,Mono downmix,3-8,0.34854773,-51.0446
+wide independent,both speakers,150,176,Mono downmix,8-16,0.5849057,-48.262787
+wide independent,both speakers,150,176,Mono downmix,16-32,0.52507836,-47.484756
+wide independent,both speakers,150,176,"Stereo, mono suppressor",0-3,0.3375,-35.09258
+wide independent,both speakers,150,176,"Stereo, mono suppressor",3-8,0.5435685,-36.127865
+wide independent,both speakers,150,176,"Stereo, mono suppressor",8-16,0.6886792,-34.76926
+wide independent,both speakers,150,176,"Stereo, mono suppressor",16-32,0.71473354,-32.37173
+wide independent,both speakers,150,251,Stereo (current),0-3,0.75949365,-34.06342
+wide independent,both speakers,150,251,Stereo (current),3-8,0.6514523,-33.90809
+wide independent,both speakers,150,251,Stereo (current),8-16,0.65299684,-36.923367
+wide independent,both speakers,150,251,Stereo (current),16-32,0.7165109,-34.34524
+wide independent,both speakers,150,251,Mono downmix,0-3,0.70886075,-51.9232
+wide independent,both speakers,150,251,Mono downmix,3-8,0.6929461,-50.10239
+wide independent,both speakers,150,251,Mono downmix,8-16,0.72239745,-46.073387
+wide independent,both speakers,150,251,Mono downmix,16-32,0.6978193,-48.53567
+wide independent,both speakers,150,251,"Stereo, mono suppressor",0-3,0.75949365,-33.807167
+wide independent,both speakers,150,251,"Stereo, mono suppressor",3-8,0.7302905,-32.94384
+wide independent,both speakers,150,251,"Stereo, mono suppressor",8-16,0.7066246,-35.176197
+wide independent,both speakers,150,251,"Stereo, mono suppressor",16-32,0.7601246,-32.963642
+wide antiphase,headphones,20,213,Stereo (current),0-3,0.9878049,-147.0877
+wide antiphase,headphones,20,213,Stereo (current),3-8,0.77272725,-95.98728
+wide antiphase,headphones,20,213,Stereo (current),8-16,0.745283,-95.47486
+wide antiphase,headphones,20,213,Stereo (current),16-32,0.784375,-95.745766
+wide antiphase,headphones,20,213,Mono downmix,0-3,0.9878049,-147.0877
+wide antiphase,headphones,20,213,Mono downmix,3-8,0.9917355,-152.02951
+wide antiphase,headphones,20,213,Mono downmix,8-16,0.990566,-145.86267
+wide antiphase,headphones,20,213,Mono downmix,16-32,0.9890625,-146.91957
+wide antiphase,headphones,20,213,"Stereo, mono suppressor",0-3,0.9878049,-147.0877
+wide antiphase,headphones,20,213,"Stereo, mono suppressor",3-8,0.8140496,-95.98717
+wide antiphase,headphones,20,213,"Stereo, mono suppressor",8-16,0.7955975,-95.47474
+wide antiphase,headphones,20,213,"Stereo, mono suppressor",16-32,0.81875,-95.74565
+wide antiphase,headphones,20,176,Stereo (current),0-3,1.0,-156.17273
+wide antiphase,headphones,20,176,Stereo (current),3-8,0.6141079,-95.96241
+wide antiphase,headphones,20,176,Stereo (current),8-16,0.7075472,-95.92373
+wide antiphase,headphones,20,176,Stereo (current),16-32,0.76175547,-95.961494
+wide antiphase,headphones,20,176,Mono downmix,0-3,1.0,-156.17273
+wide antiphase,headphones,20,176,Mono downmix,3-8,0.98755187,-137.89478
+wide antiphase,headphones,20,176,Mono downmix,8-16,0.990566,-148.23535
+wide antiphase,headphones,20,176,Mono downmix,16-32,0.99059564,-140.69179
+wide antiphase,headphones,20,176,"Stereo, mono suppressor",0-3,1.0,-156.17273
+wide antiphase,headphones,20,176,"Stereo, mono suppressor",3-8,0.6721992,-95.96226
+wide antiphase,headphones,20,176,"Stereo, mono suppressor",8-16,0.7515723,-95.92357
+wide antiphase,headphones,20,176,"Stereo, mono suppressor",16-32,0.79780567,-95.96138
+wide antiphase,headphones,20,251,Stereo (current),0-3,0.98734176,-146.0832
+wide antiphase,headphones,20,251,Stereo (current),3-8,0.813278,-96.08677
+wide antiphase,headphones,20,251,Stereo (current),8-16,0.7917981,-95.61794
+wide antiphase,headphones,20,251,Stereo (current),16-32,0.68380064,-93.93554
+wide antiphase,headphones,20,251,Mono downmix,0-3,0.98734176,-146.0832
+wide antiphase,headphones,20,251,Mono downmix,3-8,0.99170125,-152.68633
+wide antiphase,headphones,20,251,Mono downmix,8-16,0.9873817,-148.51355
+wide antiphase,headphones,20,251,Mono downmix,16-32,0.99065423,-150.69945
+wide antiphase,headphones,20,251,"Stereo, mono suppressor",0-3,0.98734176,-146.0832
+wide antiphase,headphones,20,251,"Stereo, mono suppressor",3-8,0.84232366,-96.08665
+wide antiphase,headphones,20,251,"Stereo, mono suppressor",8-16,0.8328076,-95.617905
+wide antiphase,headphones,20,251,"Stereo, mono suppressor",16-32,0.7305296,-93.9355
+wide antiphase,headphones,60,213,Stereo (current),0-3,0.9878049,-147.0877
+wide antiphase,headphones,60,213,Stereo (current),3-8,0.77272725,-95.98728
+wide antiphase,headphones,60,213,Stereo (current),8-16,0.745283,-95.47486
+wide antiphase,headphones,60,213,Stereo (current),16-32,0.784375,-95.745766
+wide antiphase,headphones,60,213,Mono downmix,0-3,0.9878049,-147.0877
+wide antiphase,headphones,60,213,Mono downmix,3-8,0.9917355,-152.02951
+wide antiphase,headphones,60,213,Mono downmix,8-16,0.990566,-145.86267
+wide antiphase,headphones,60,213,Mono downmix,16-32,0.9890625,-146.91957
+wide antiphase,headphones,60,213,"Stereo, mono suppressor",0-3,0.9878049,-147.0877
+wide antiphase,headphones,60,213,"Stereo, mono suppressor",3-8,0.8140496,-95.98717
+wide antiphase,headphones,60,213,"Stereo, mono suppressor",8-16,0.7955975,-95.47474
+wide antiphase,headphones,60,213,"Stereo, mono suppressor",16-32,0.81875,-95.74565
+wide antiphase,headphones,60,176,Stereo (current),0-3,1.0,-156.17273
+wide antiphase,headphones,60,176,Stereo (current),3-8,0.6141079,-95.96241
+wide antiphase,headphones,60,176,Stereo (current),8-16,0.7075472,-95.92373
+wide antiphase,headphones,60,176,Stereo (current),16-32,0.76175547,-95.961494
+wide antiphase,headphones,60,176,Mono downmix,0-3,1.0,-156.17273
+wide antiphase,headphones,60,176,Mono downmix,3-8,0.98755187,-137.89478
+wide antiphase,headphones,60,176,Mono downmix,8-16,0.990566,-148.23535
+wide antiphase,headphones,60,176,Mono downmix,16-32,0.99059564,-140.69179
+wide antiphase,headphones,60,176,"Stereo, mono suppressor",0-3,1.0,-156.17273
+wide antiphase,headphones,60,176,"Stereo, mono suppressor",3-8,0.6721992,-95.96226
+wide antiphase,headphones,60,176,"Stereo, mono suppressor",8-16,0.7515723,-95.92357
+wide antiphase,headphones,60,176,"Stereo, mono suppressor",16-32,0.79780567,-95.96138
+wide antiphase,headphones,60,251,Stereo (current),0-3,0.98734176,-146.0832
+wide antiphase,headphones,60,251,Stereo (current),3-8,0.813278,-96.08677
+wide antiphase,headphones,60,251,Stereo (current),8-16,0.7917981,-95.61794
+wide antiphase,headphones,60,251,Stereo (current),16-32,0.68380064,-93.93554
+wide antiphase,headphones,60,251,Mono downmix,0-3,0.98734176,-146.0832
+wide antiphase,headphones,60,251,Mono downmix,3-8,0.99170125,-152.68633
+wide antiphase,headphones,60,251,Mono downmix,8-16,0.9873817,-148.51355
+wide antiphase,headphones,60,251,Mono downmix,16-32,0.99065423,-150.69945
+wide antiphase,headphones,60,251,"Stereo, mono suppressor",0-3,0.98734176,-146.0832
+wide antiphase,headphones,60,251,"Stereo, mono suppressor",3-8,0.84232366,-96.08665
+wide antiphase,headphones,60,251,"Stereo, mono suppressor",8-16,0.8328076,-95.617905
+wide antiphase,headphones,60,251,"Stereo, mono suppressor",16-32,0.7305296,-93.9355
+wide antiphase,headphones,150,213,Stereo (current),0-3,0.9878049,-147.0877
+wide antiphase,headphones,150,213,Stereo (current),3-8,0.77272725,-95.98728
+wide antiphase,headphones,150,213,Stereo (current),8-16,0.745283,-95.47486
+wide antiphase,headphones,150,213,Stereo (current),16-32,0.784375,-95.745766
+wide antiphase,headphones,150,213,Mono downmix,0-3,0.9878049,-147.0877
+wide antiphase,headphones,150,213,Mono downmix,3-8,0.9917355,-152.02951
+wide antiphase,headphones,150,213,Mono downmix,8-16,0.990566,-145.86267
+wide antiphase,headphones,150,213,Mono downmix,16-32,0.9890625,-146.91957
+wide antiphase,headphones,150,213,"Stereo, mono suppressor",0-3,0.9878049,-147.0877
+wide antiphase,headphones,150,213,"Stereo, mono suppressor",3-8,0.8140496,-95.98717
+wide antiphase,headphones,150,213,"Stereo, mono suppressor",8-16,0.7955975,-95.47474
+wide antiphase,headphones,150,213,"Stereo, mono suppressor",16-32,0.81875,-95.74565
+wide antiphase,headphones,150,176,Stereo (current),0-3,1.0,-156.17273
+wide antiphase,headphones,150,176,Stereo (current),3-8,0.6141079,-95.96241
+wide antiphase,headphones,150,176,Stereo (current),8-16,0.7075472,-95.92373
+wide antiphase,headphones,150,176,Stereo (current),16-32,0.76175547,-95.961494
+wide antiphase,headphones,150,176,Mono downmix,0-3,1.0,-156.17273
+wide antiphase,headphones,150,176,Mono downmix,3-8,0.98755187,-137.89478
+wide antiphase,headphones,150,176,Mono downmix,8-16,0.990566,-148.23535
+wide antiphase,headphones,150,176,Mono downmix,16-32,0.99059564,-140.69179
+wide antiphase,headphones,150,176,"Stereo, mono suppressor",0-3,1.0,-156.17273
+wide antiphase,headphones,150,176,"Stereo, mono suppressor",3-8,0.6721992,-95.96226
+wide antiphase,headphones,150,176,"Stereo, mono suppressor",8-16,0.7515723,-95.92357
+wide antiphase,headphones,150,176,"Stereo, mono suppressor",16-32,0.79780567,-95.96138
+wide antiphase,headphones,150,251,Stereo (current),0-3,0.98734176,-146.0832
+wide antiphase,headphones,150,251,Stereo (current),3-8,0.813278,-96.08677
+wide antiphase,headphones,150,251,Stereo (current),8-16,0.7917981,-95.61794
+wide antiphase,headphones,150,251,Stereo (current),16-32,0.68380064,-93.93554
+wide antiphase,headphones,150,251,Mono downmix,0-3,0.98734176,-146.0832
+wide antiphase,headphones,150,251,Mono downmix,3-8,0.99170125,-152.68633
+wide antiphase,headphones,150,251,Mono downmix,8-16,0.9873817,-148.51355
+wide antiphase,headphones,150,251,Mono downmix,16-32,0.99065423,-150.69945
+wide antiphase,headphones,150,251,"Stereo, mono suppressor",0-3,0.98734176,-146.0832
+wide antiphase,headphones,150,251,"Stereo, mono suppressor",3-8,0.84232366,-96.08665
+wide antiphase,headphones,150,251,"Stereo, mono suppressor",8-16,0.8328076,-95.617905
+wide antiphase,headphones,150,251,"Stereo, mono suppressor",16-32,0.7305296,-93.9355
+wide antiphase,left speaker,20,213,Stereo (current),0-3,0.597561,-60.432045
+wide antiphase,left speaker,20,213,Stereo (current),3-8,0.58677685,-63.80625
+wide antiphase,left speaker,20,213,Stereo (current),8-16,0.5691824,-63.975582
+wide antiphase,left speaker,20,213,Stereo (current),16-32,0.58125,-65.13918
+wide antiphase,left speaker,20,213,Mono downmix,0-3,0.9878049,-24.025177
+wide antiphase,left speaker,20,213,Mono downmix,3-8,0.9917355,-23.830036
+wide antiphase,left speaker,20,213,Mono downmix,8-16,0.9937107,-23.958511
+wide antiphase,left speaker,20,213,Mono downmix,16-32,0.9921875,-23.916592
+wide antiphase,left speaker,20,213,"Stereo, mono suppressor",0-3,0.64634144,-60.4266
+wide antiphase,left speaker,20,213,"Stereo, mono suppressor",3-8,0.6322314,-63.80493
+wide antiphase,left speaker,20,213,"Stereo, mono suppressor",8-16,0.6132075,-63.973915
+wide antiphase,left speaker,20,213,"Stereo, mono suppressor",16-32,0.615625,-65.13857
+wide antiphase,left speaker,20,176,Stereo (current),0-3,0.6375,-60.081078
+wide antiphase,left speaker,20,176,Stereo (current),3-8,0.4439834,-61.117256
+wide antiphase,left speaker,20,176,Stereo (current),8-16,0.48427674,-61.531216
+wide antiphase,left speaker,20,176,Stereo (current),16-32,0.4184953,-62.502846
+wide antiphase,left speaker,20,176,Mono downmix,0-3,1.0,-24.025173
+wide antiphase,left speaker,20,176,Mono downmix,3-8,0.98755187,-23.830032
+wide antiphase,left speaker,20,176,Mono downmix,8-16,0.9937107,-23.958511
+wide antiphase,left speaker,20,176,Mono downmix,16-32,0.9937304,-23.916586
+wide antiphase,left speaker,20,176,"Stereo, mono suppressor",0-3,0.7125,-60.073936
+wide antiphase,left speaker,20,176,"Stereo, mono suppressor",3-8,0.49377593,-61.114532
+wide antiphase,left speaker,20,176,"Stereo, mono suppressor",8-16,0.5377358,-61.53004
+wide antiphase,left speaker,20,176,"Stereo, mono suppressor",16-32,0.492163,-62.50236
+wide antiphase,left speaker,20,251,Stereo (current),0-3,0.5949367,-60.304714
+wide antiphase,left speaker,20,251,Stereo (current),3-8,0.6307054,-63.119637
+wide antiphase,left speaker,20,251,Stereo (current),8-16,0.6340694,-62.982677
+wide antiphase,left speaker,20,251,Stereo (current),16-32,0.63707167,-61.897316
+wide antiphase,left speaker,20,251,Mono downmix,0-3,1.0,-24.025177
+wide antiphase,left speaker,20,251,Mono downmix,3-8,0.99170125,-23.830032
+wide antiphase,left speaker,20,251,Mono downmix,8-16,0.99369085,-23.95851
+wide antiphase,left speaker,20,251,Mono downmix,16-32,0.99688476,-23.916586
+wide antiphase,left speaker,20,251,"Stereo, mono suppressor",0-3,0.62025315,-60.302895
+wide antiphase,left speaker,20,251,"Stereo, mono suppressor",3-8,0.67634857,-63.117634
+wide antiphase,left speaker,20,251,"Stereo, mono suppressor",8-16,0.6719243,-62.98165
+wide antiphase,left speaker,20,251,"Stereo, mono suppressor",16-32,0.6775701,-61.896194
+wide antiphase,left speaker,60,213,Stereo (current),0-3,0.6219512,-56.066864
+wide antiphase,left speaker,60,213,Stereo (current),3-8,0.55785125,-63.647896
+wide antiphase,left speaker,60,213,Stereo (current),8-16,0.5943396,-63.59934
+wide antiphase,left speaker,60,213,Stereo (current),16-32,0.609375,-63.19049
+wide antiphase,left speaker,60,213,Mono downmix,0-3,1.0,-24.028387
+wide antiphase,left speaker,60,213,Mono downmix,3-8,1.0,-23.821236
+wide antiphase,left speaker,60,213,Mono downmix,8-16,1.0,-23.957779
+wide antiphase,left speaker,60,213,Mono downmix,16-32,1.0,-23.917582
+wide antiphase,left speaker,60,213,"Stereo, mono suppressor",0-3,0.6585366,-56.065292
+wide antiphase,left speaker,60,213,"Stereo, mono suppressor",3-8,0.607438,-63.64723
+wide antiphase,left speaker,60,213,"Stereo, mono suppressor",8-16,0.6257862,-63.596767
+wide antiphase,left speaker,60,213,"Stereo, mono suppressor",16-32,0.6453125,-63.189423
+wide antiphase,left speaker,60,176,Stereo (current),0-3,0.575,-62.710155
+wide antiphase,left speaker,60,176,Stereo (current),3-8,0.44813278,-63.43571
+wide antiphase,left speaker,60,176,Stereo (current),8-16,0.5157233,-63.96521
+wide antiphase,left speaker,60,176,Stereo (current),16-32,0.4968652,-63.261963
+wide antiphase,left speaker,60,176,Mono downmix,0-3,1.0,-24.028381
+wide antiphase,left speaker,60,176,Mono downmix,3-8,1.0,-23.821238
+wide antiphase,left speaker,60,176,Mono downmix,8-16,1.0,-23.957771
+wide antiphase,left speaker,60,176,Mono downmix,16-32,1.0,-23.917582
+wide antiphase,left speaker,60,176,"Stereo, mono suppressor",0-3,0.625,-62.388397
+wide antiphase,left speaker,60,176,"Stereo, mono suppressor",3-8,0.4647303,-63.43445
+wide antiphase,left speaker,60,176,"Stereo, mono suppressor",8-16,0.5691824,-63.964314
+wide antiphase,left speaker,60,176,"Stereo, mono suppressor",16-32,0.5470219,-63.260612
+wide antiphase,left speaker,60,251,Stereo (current),0-3,0.62025315,-58.58894
+wide antiphase,left speaker,60,251,Stereo (current),3-8,0.6141079,-63.50387
+wide antiphase,left speaker,60,251,Stereo (current),8-16,0.6340694,-63.27683
+wide antiphase,left speaker,60,251,Stereo (current),16-32,0.5981308,-63.62639
+wide antiphase,left speaker,60,251,Mono downmix,0-3,1.0,-24.028389
+wide antiphase,left speaker,60,251,Mono downmix,3-8,1.0,-23.821232
+wide antiphase,left speaker,60,251,Mono downmix,8-16,1.0,-23.957783
+wide antiphase,left speaker,60,251,Mono downmix,16-32,1.0,-23.91758
+wide antiphase,left speaker,60,251,"Stereo, mono suppressor",0-3,0.65822786,-58.588387
+wide antiphase,left speaker,60,251,"Stereo, mono suppressor",3-8,0.6556017,-63.50303
+wide antiphase,left speaker,60,251,"Stereo, mono suppressor",8-16,0.67507887,-63.27553
+wide antiphase,left speaker,60,251,"Stereo, mono suppressor",16-32,0.6401869,-63.625675
+wide antiphase,left speaker,150,213,Stereo (current),0-3,0.5121951,-63.536186
+wide antiphase,left speaker,150,213,Stereo (current),3-8,0.553719,-64.36035
+wide antiphase,left speaker,150,213,Stereo (current),8-16,0.5597484,-64.27805
+wide antiphase,left speaker,150,213,Stereo (current),16-32,0.5359375,-64.48457
+wide antiphase,left speaker,150,213,Mono downmix,0-3,1.0,-24.024673
+wide antiphase,left speaker,150,213,Mono downmix,3-8,1.0,-23.833437
+wide antiphase,left speaker,150,213,Mono downmix,8-16,1.0,-23.955093
+wide antiphase,left speaker,150,213,Mono downmix,16-32,1.0,-23.904213
+wide antiphase,left speaker,150,213,"Stereo, mono suppressor",0-3,0.5243902,-63.527504
+wide antiphase,left speaker,150,213,"Stereo, mono suppressor",3-8,0.57438016,-64.35703
+wide antiphase,left speaker,150,213,"Stereo, mono suppressor",8-16,0.5974843,-64.27594
+wide antiphase,left speaker,150,213,"Stereo, mono suppressor",16-32,0.5734375,-64.48294
+wide antiphase,left speaker,150,176,Stereo (current),0-3,0.475,-67.69728
+wide antiphase,left speaker,150,176,Stereo (current),3-8,0.4439834,-66.65857
+wide antiphase,left speaker,150,176,Stereo (current),8-16,0.46226415,-66.84015
+wide antiphase,left speaker,150,176,Stereo (current),16-32,0.44043887,-64.920105
+wide antiphase,left speaker,150,176,Mono downmix,0-3,1.0,-24.024666
+wide antiphase,left speaker,150,176,Mono downmix,3-8,1.0,-23.833437
+wide antiphase,left speaker,150,176,Mono downmix,8-16,1.0,-23.955088
+wide antiphase,left speaker,150,176,Mono downmix,16-32,1.0,-23.904217
+wide antiphase,left speaker,150,176,"Stereo, mono suppressor",0-3,0.475,-67.68901
+wide antiphase,left speaker,150,176,"Stereo, mono suppressor",3-8,0.5186722,-66.65797
+wide antiphase,left speaker,150,176,"Stereo, mono suppressor",8-16,0.5031447,-66.839264
+wide antiphase,left speaker,150,176,"Stereo, mono suppressor",16-32,0.4984326,-64.919655
+wide antiphase,left speaker,150,251,Stereo (current),0-3,0.556962,-65.87668
+wide antiphase,left speaker,150,251,Stereo (current),3-8,0.54771787,-67.73499
+wide antiphase,left speaker,150,251,Stereo (current),8-16,0.5520505,-66.72754
+wide antiphase,left speaker,150,251,Stereo (current),16-32,0.576324,-65.37649
+wide antiphase,left speaker,150,251,Mono downmix,0-3,1.0,-24.02467
+wide antiphase,left speaker,150,251,Mono downmix,3-8,1.0,-23.833439
+wide antiphase,left speaker,150,251,Mono downmix,8-16,1.0,-23.955086
+wide antiphase,left speaker,150,251,Mono downmix,16-32,1.0,-23.904219
+wide antiphase,left speaker,150,251,"Stereo, mono suppressor",0-3,0.56962025,-65.87592
+wide antiphase,left speaker,150,251,"Stereo, mono suppressor",3-8,0.57261413,-67.729294
+wide antiphase,left speaker,150,251,"Stereo, mono suppressor",8-16,0.5899054,-66.72541
+wide antiphase,left speaker,150,251,"Stereo, mono suppressor",16-32,0.60436136,-65.37352
+wide antiphase,both speakers,20,213,Stereo (current),0-3,0.31707317,-47.87287
+wide antiphase,both speakers,20,213,Stereo (current),3-8,0.5206612,-54.481117
+wide antiphase,both speakers,20,213,Stereo (current),8-16,0.5503145,-53.82341
+wide antiphase,both speakers,20,213,Stereo (current),16-32,0.5453125,-53.650444
+wide antiphase,both speakers,20,213,Mono downmix,0-3,1.0,-24.361473
+wide antiphase,both speakers,20,213,Mono downmix,3-8,0.9958678,-24.412806
+wide antiphase,both speakers,20,213,Mono downmix,8-16,1.0,-24.37477
+wide antiphase,both speakers,20,213,Mono downmix,16-32,0.996875,-24.403212
+wide antiphase,both speakers,20,213,"Stereo, mono suppressor",0-3,0.40243903,-46.66867
+wide antiphase,both speakers,20,213,"Stereo, mono suppressor",3-8,0.607438,-54.25502
+wide antiphase,both speakers,20,213,"Stereo, mono suppressor",8-16,0.6037736,-53.749027
+wide antiphase,both speakers,20,213,"Stereo, mono suppressor",16-32,0.61875,-53.643852
+wide antiphase,both speakers,20,176,Stereo (current),0-3,0.525,-54.39236
+wide antiphase,both speakers,20,176,Stereo (current),3-8,0.35684648,-53.963486
+wide antiphase,both speakers,20,176,Stereo (current),8-16,0.5345912,-53.278206
+wide antiphase,both speakers,20,176,Stereo (current),16-32,0.39028212,-53.922306
+wide antiphase,both speakers,20,176,Mono downmix,0-3,1.0,-24.36145
+wide antiphase,both speakers,20,176,Mono downmix,3-8,0.9958506,-24.412811
+wide antiphase,both speakers,20,176,Mono downmix,8-16,1.0,-24.374763
+wide antiphase,both speakers,20,176,Mono downmix,16-32,0.9968652,-24.403217
+wide antiphase,both speakers,20,176,"Stereo, mono suppressor",0-3,0.6375,-53.76319
+wide antiphase,both speakers,20,176,"Stereo, mono suppressor",3-8,0.43153527,-53.856377
+wide antiphase,both speakers,20,176,"Stereo, mono suppressor",8-16,0.591195,-53.239
+wide antiphase,both speakers,20,176,"Stereo, mono suppressor",16-32,0.45924765,-53.91613
+wide antiphase,both speakers,20,251,Stereo (current),0-3,0.43037975,-47.75869
+wide antiphase,both speakers,20,251,Stereo (current),3-8,0.6016598,-54.509815
+wide antiphase,both speakers,20,251,Stereo (current),8-16,0.5899054,-53.77044
+wide antiphase,both speakers,20,251,Stereo (current),16-32,0.6246106,-53.538708
+wide antiphase,both speakers,20,251,Mono downmix,0-3,1.0,-24.36146
+wide antiphase,both speakers,20,251,Mono downmix,3-8,0.9958506,-24.412819
+wide antiphase,both speakers,20,251,Mono downmix,8-16,0.9968454,-24.374763
+wide antiphase,both speakers,20,251,Mono downmix,16-32,0.99844235,-24.403212
+wide antiphase,both speakers,20,251,"Stereo, mono suppressor",0-3,0.5063291,-47.63379
+wide antiphase,both speakers,20,251,"Stereo, mono suppressor",3-8,0.6680498,-54.425026
+wide antiphase,both speakers,20,251,"Stereo, mono suppressor",8-16,0.6435331,-53.747093
+wide antiphase,both speakers,20,251,"Stereo, mono suppressor",16-32,0.6713396,-53.53252
+wide antiphase,both speakers,60,213,Stereo (current),0-3,0.3902439,-41.740337
+wide antiphase,both speakers,60,213,Stereo (current),3-8,0.55785125,-53.82937
+wide antiphase,both speakers,60,213,Stereo (current),8-16,0.5660377,-53.297
+wide antiphase,both speakers,60,213,Stereo (current),16-32,0.6109375,-53.388752
+wide antiphase,both speakers,60,213,Mono downmix,0-3,1.0,-24.35344
+wide antiphase,both speakers,60,213,Mono downmix,3-8,1.0,-24.409298
+wide antiphase,both speakers,60,213,Mono downmix,8-16,1.0,-24.371925
+wide antiphase,both speakers,60,213,Mono downmix,16-32,1.0,-24.394014
+wide antiphase,both speakers,60,213,"Stereo, mono suppressor",0-3,0.4878049,-41.693687
+wide antiphase,both speakers,60,213,"Stereo, mono suppressor",3-8,0.6198347,-53.77413
+wide antiphase,both speakers,60,213,"Stereo, mono suppressor",8-16,0.6100629,-53.28057
+wide antiphase,both speakers,60,213,"Stereo, mono suppressor",16-32,0.65625,-53.380196
+wide antiphase,both speakers,60,176,Stereo (current),0-3,0.4125,-39.849895
+wide antiphase,both speakers,60,176,Stereo (current),3-8,0.34854773,-53.521496
+wide antiphase,both speakers,60,176,Stereo (current),8-16,0.5691824,-52.951694
+wide antiphase,both speakers,60,176,Stereo (current),16-32,0.5470219,-53.428642
+wide antiphase,both speakers,60,176,Mono downmix,0-3,1.0,-24.353443
+wide antiphase,both speakers,60,176,Mono downmix,3-8,1.0,-24.409285
+wide antiphase,both speakers,60,176,Mono downmix,8-16,1.0,-24.371922
+wide antiphase,both speakers,60,176,Mono downmix,16-32,1.0,-24.394012
+wide antiphase,both speakers,60,176,"Stereo, mono suppressor",0-3,0.4875,-39.798515
+wide antiphase,both speakers,60,176,"Stereo, mono suppressor",3-8,0.4107884,-53.426163
+wide antiphase,both speakers,60,176,"Stereo, mono suppressor",8-16,0.6132075,-52.9228
+wide antiphase,both speakers,60,176,"Stereo, mono suppressor",16-32,0.59090906,-53.41776
+wide antiphase,both speakers,60,251,Stereo (current),0-3,0.51898736,-39.903797
+wide antiphase,both speakers,60,251,Stereo (current),3-8,0.5975104,-54.187347
+wide antiphase,both speakers,60,251,Stereo (current),8-16,0.6214511,-53.486485
+wide antiphase,both speakers,60,251,Stereo (current),16-32,0.5576324,-53.816345
+wide antiphase,both speakers,60,251,Mono downmix,0-3,1.0,-24.353443
+wide antiphase,both speakers,60,251,Mono downmix,3-8,1.0,-24.409298
+wide antiphase,both speakers,60,251,Mono downmix,8-16,1.0,-24.371925
+wide antiphase,both speakers,60,251,Mono downmix,16-32,1.0,-24.394016
+wide antiphase,both speakers,60,251,"Stereo, mono suppressor",0-3,0.5822785,-39.79342
+wide antiphase,both speakers,60,251,"Stereo, mono suppressor",3-8,0.6556017,-54.045624
+wide antiphase,both speakers,60,251,"Stereo, mono suppressor",8-16,0.67823344,-53.44033
+wide antiphase,both speakers,60,251,"Stereo, mono suppressor",16-32,0.63084114,-53.80667
+wide antiphase,both speakers,150,213,Stereo (current),0-3,0.64634144,-44.060024
+wide antiphase,both speakers,150,213,Stereo (current),3-8,0.5123967,-55.31664
+wide antiphase,both speakers,150,213,Stereo (current),8-16,0.5408805,-54.639053
+wide antiphase,both speakers,150,213,Stereo (current),16-32,0.51875,-54.703056
+wide antiphase,both speakers,150,213,Mono downmix,0-3,1.0,-24.339901
+wide antiphase,both speakers,150,213,Mono downmix,3-8,1.0,-24.443527
+wide antiphase,both speakers,150,213,Mono downmix,8-16,1.0,-24.358307
+wide antiphase,both speakers,150,213,Mono downmix,16-32,1.0,-24.389046
+wide antiphase,both speakers,150,213,"Stereo, mono suppressor",0-3,0.64634144,-43.94459
+wide antiphase,both speakers,150,213,"Stereo, mono suppressor",3-8,0.57024795,-54.902206
+wide antiphase,both speakers,150,213,"Stereo, mono suppressor",8-16,0.6006289,-54.61491
+wide antiphase,both speakers,150,213,"Stereo, mono suppressor",16-32,0.5859375,-54.69831
+wide antiphase,both speakers,150,176,Stereo (current),0-3,0.35,-51.825146
+wide antiphase,both speakers,150,176,Stereo (current),3-8,0.4107884,-55.88577
+wide antiphase,both speakers,150,176,Stereo (current),8-16,0.4716981,-55.168488
+wide antiphase,both speakers,150,176,Stereo (current),16-32,0.4827586,-54.9
+wide antiphase,both speakers,150,176,Mono downmix,0-3,1.0,-24.33992
+wide antiphase,both speakers,150,176,Mono downmix,3-8,1.0,-24.443516
+wide antiphase,both speakers,150,176,Mono downmix,8-16,1.0,-24.358301
+wide antiphase,both speakers,150,176,Mono downmix,16-32,1.0,-24.38905
+wide antiphase,both speakers,150,176,"Stereo, mono suppressor",0-3,0.35,-51.32859
+wide antiphase,both speakers,150,176,"Stereo, mono suppressor",3-8,0.48962656,-55.66181
+wide antiphase,both speakers,150,176,"Stereo, mono suppressor",8-16,0.5220126,-55.13997
+wide antiphase,both speakers,150,176,"Stereo, mono suppressor",16-32,0.52978057,-54.89208
+wide antiphase,both speakers,150,251,Stereo (current),0-3,0.4177215,-46.46462
+wide antiphase,both speakers,150,251,Stereo (current),3-8,0.5103735,-55.050827
+wide antiphase,both speakers,150,251,Stereo (current),8-16,0.42902207,-54.362453
+wide antiphase,both speakers,150,251,Stereo (current),16-32,0.5233645,-55.017242
+wide antiphase,both speakers,150,251,Mono downmix,0-3,1.0,-24.339903
+wide antiphase,both speakers,150,251,Mono downmix,3-8,1.0,-24.443527
+wide antiphase,both speakers,150,251,Mono downmix,8-16,1.0,-24.358309
+wide antiphase,both speakers,150,251,Mono downmix,16-32,1.0,-24.389053
+wide antiphase,both speakers,150,251,"Stereo, mono suppressor",0-3,0.5316456,-46.218468
+wide antiphase,both speakers,150,251,"Stereo, mono suppressor",3-8,0.593361,-54.793983
+wide antiphase,both speakers,150,251,"Stereo, mono suppressor",8-16,0.49526814,-54.335686
+wide antiphase,both speakers,150,251,"Stereo, mono suppressor",16-32,0.58566976,-55.011806
