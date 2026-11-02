@@ -1,3 +1,5 @@
+$ /tmp/gwar-aec-sol/head/release/deps/gwar_client-63cb5b99089087a9 voice::apm::tests::shipped::what_an_unreported_device_costs --exact --ignored --nocapture --test-threads=1
+P7 binary source: ac4af9e4c2f6a5dffee325f791b6835623f6ca49; actual nice 10; one heavy task.
 
 running 1 test
 test voice::apm::tests::shipped::what_an_unreported_device_costs ... shipped-route	in charge, then headphones	100	20	213	mono	0	0.658536613
@@ -2858,5 +2860,5 @@ shipped-route-mean	in charge, then another room	P7-reported	6	-52.622954898
 shipped-route-mean	in charge, then another room	P7-reported	8	-49.430282451
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 171.04s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 161.50s
 

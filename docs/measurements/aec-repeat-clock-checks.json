@@ -1,0 +1,37 @@
+[
+  {
+    "name": "fingerprints",
+    "exit_code": 0,
+    "sleep_clock_drift_s": 1.0388903319835663e-05
+  },
+  {
+    "name": "heap",
+    "exit_code": 0,
+    "sleep_clock_drift_s": -1.0230578482151031e-06
+  },
+  {
+    "name": "apm",
+    "exit_code": 0,
+    "sleep_clock_drift_s": 5.134660750627518e-05
+  },
+  {
+    "name": "speech",
+    "exit_code": 0,
+    "sleep_clock_drift_s": 0.000239012879319489
+  },
+  {
+    "name": "echo",
+    "exit_code": 0,
+    "sleep_clock_drift_s": 0.0009883325546979904
+  },
+  {
+    "name": "routes",
+    "exit_code": 0,
+    "sleep_clock_drift_s": 0.0008085709996521473
+  },
+  {
+    "name": "one-mbps",
+    "exit_code": 0,
+    "sleep_clock_drift_s": 0.000734880450181663
+  }
+]

@@ -1,7 +1,5 @@
-nice: setpriority: Operation not permitted
-   Compiling gwar-client v0.1.2 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/crates/gwar-client)
-    Finished `release` profile [optimized] target(s) in 1m 30s
-     Running unittests src/lib.rs (/tmp/gwar-aec-sol/release/deps/gwar_client-63cb5b99089087a9)
+$ /tmp/gwar-aec-sol/head/release/deps/gwar_client-63cb5b99089087a9 voice::apm::tests::shipped::shipped_p7_echo_tables --exact --ignored --nocapture --test-threads=1
+P7 binary source: ac4af9e4c2f6a5dffee325f791b6835623f6ca49; actual nice 10; one heavy task.
 
 running 1 test
 test voice::apm::tests::shipped::shipped_p7_echo_tables ... native-echo-pair,mono,pin=6,far=100,delay=20,near=180,s=0-1,current=-70.201782227,candidate=-70.201782227,delta=0.000000000,cold=-71.058906555,energy-current=9.546045167703241e-8,energy-candidate=9.546045167703241e-8,energy-cold=7.836305644365102e-8
@@ -656,5 +654,5 @@ native-echo-pair,wide,steady pin 310,q=32-48,current=-80.801101685,candidate=-80
 shipped echo: over +1 dB 6, worst 4.614568710 dB; every window meets the approved envelope
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 227.01s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 197.17s
 

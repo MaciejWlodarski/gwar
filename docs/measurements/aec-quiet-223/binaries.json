@@ -1,0 +1,14 @@
+{
+  "head": {
+    "sha": "ac4af9e4c2f6a5dffee325f791b6835623f6ca49",
+    "cwd": "/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d",
+    "binary": "/tmp/gwar-aec-sol/head/release/deps/gwar_client-63cb5b99089087a9",
+    "target": "/tmp/gwar-aec-sol/head"
+  },
+  "main": {
+    "sha": "208c886668b597a1c1334c926bb8ccd2948e8b83",
+    "cwd": "/tmp/gwar-aec-main-223-ac4af9e4",
+    "binary": "/tmp/gwar-aec-sol/main/release/deps/gwar_client-d75cd4dd4994a192",
+    "target": "/tmp/gwar-aec-sol/main"
+  }
+}

@@ -1,0 +1,4 @@
+2026-11-02T22:00:40.106811+00:00 paused waiting recorder for DSP checks; load (9.9853515625, 7.36376953125, 6.859375); no timing child
+2026-11-02T22:10:07.789001+00:00 resumed quiet recorder after DSP stage; load (5.5166015625, 6.60986328125, 6.82470703125)
+Owner updated start/void limits to 3.5/4.5 with 01:00 deadline; stopped waiting recorder before any test attempt to reconfigure.
+Owner paused work for 1-2 days. Stopped own recorder; no further quiet-window waiting.

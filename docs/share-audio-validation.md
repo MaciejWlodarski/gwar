@@ -1021,21 +1021,43 @@ and the app.
 
 ### Owner-approved Left warm P7 (PR #223, current implementation)
 
-**State / next steps: validation resumed; draft until quiet paired timing and all checks complete.**
-The owner selected **Left warm P7**, accepting its measured speech/echo trade-off.
-The earlier +1.241 ms run is not qualified under the revised timing protocol:
-the owner reported load around 6 and concurrent workers, and that run lacks
-before/after uptime and continuous load records. The earlier +0.344 ms pass is
-also historical, not a substitute for the new acceptance measurements.
+**State / next steps: PAUSED at the owner’s request for 1–2 days; PR remains a draft.**
+No process is waiting for a quiet window and no automatic resumption is scheduled.
+The owner selected **Left warm P7 only**, accepting 6/549 echo windows >+1 dB,
+2 >+3 dB, 0 >+6 dB, max +4.614568710 dB and total energy +0.200643008 dB.
+Production still keeps warm takeover, the first-sound pin and the left reference.
 
-The new protocol pins P7 at `ac4af9e4` and main at `208c8866`, builds separate
-binaries/targets, and runs head/main/head/main/head/main. Each run starts only
-at one-minute load <3, with no `ss-tools/run.sh`, share-sync E2E, other cargo or
-Rust-test process. Uptime is captured before/after; load is sampled throughout.
-Load >4, overlapping timing/builds, or sleep/lost coverage voids an attempt.
-Every attempt is retained, including valid failures. All 36 per-pair results
-and the three adjacent head/main comparisons will be reported. Production
-code is unchanged while this validation is repeated.
+The earlier +1.241 ms four-share run is uncontrolled and excluded from the new
+acceptance protocol (owner-reported load around 6, concurrent workers, no complete
+uptime/load record). The earlier +0.344 ms pass is historical too. **No quiet
+attempt started before this pause.** Waiting/preflight records, both prepared
+binary identities and equal test/helper source hashes are retained in
+[the paused timing archive](measurements/aec-quiet-223/README.md).
+
+On resume, rebuild the final head and main `208c8866` separately and run
+head/main/head/main/head/main. Start at one-minute load <3.5; void if load exceeds
+4.5, another cargo/test or #213 timing overlaps, or sleep/lost coverage occurs.
+Keep all attempts and valid failures, record uptime before/after and load
+throughout, and report all 36 pairs. Head max must be <=1.0 ms and not
+systematically worse than main. The old 01:00 deadline is cancelled by the pause.
+
+Completed before pausing: both fingerprints `c2d868db7d8d0eeb`; four heap guards;
+53 active release APM tests; the 12-case speech matrix (11 strict passes and the
+accepted one-frame headphone deficit); all 549 approved echo windows; all
+2,754 route cells / 102 means; 1 Mb/s p99 9.048–9.288 ms. The regenerated speech,
+echo/energy and route CSVs match prior approved P7 observations exactly.
+[Release checks](measurements/aec-release-checks.txt) and
+[clock/sleep continuity](measurements/aec-repeat-clock-checks.json).
+Linux CI at `c2dd41d7` passed fmt, clippy and the full workspace suite
+(1,498 passed, 0 failed, 50 ignored), plus 140 vendored str0m tests. Both formerly
+failing APM assertions pass unchanged. [Linux evidence](measurements/aec-linux-validation.txt).
+
+Remaining: the controlled six-run comparison and final-head validation/CI;
+the exact resume checklist below includes speech, 549 echo windows, routes,
+clippy, fmt and full tests. Local full-workspace, featureless compilation and
+standalone constructor checks were not repeated. The Sonora two-reference fix
+remains dev-feature opt-in only, for the separate follow-up.
+
 Earlier checkpoints in this document are historical, including their stop states.
 
 The production change against main `1099a681` is only
@@ -1244,6 +1266,65 @@ Reproduce the committed acoustic CSVs without building or playing audio:
 ```sh
 python3 docs/measurements/summarize-aec-shipped.py
 ```
+
+#### Exact resume commands
+
+Run from the resumed, clean PR checkout. Do not overlap another heavy build or
+#213's timing. The helper sets absolute nice 10 (avoids inherited nice 20), uses
+four Cargo jobs and separate targets, and records both exact revisions.
+
+```sh
+git worktree add --detach /tmp/gwar-aec-main-223 208c886668b597a1c1334c926bb8ccd2948e8b83
+python3 docs/measurements/build-aec-pair.py --head-dir . --main-dir /tmp/gwar-aec-main-223 --target-root /tmp/gwar-aec-sol --out /tmp/gwar-aec-binaries.json
+python3 docs/measurements/run-aec-quiet-timing.py --binaries /tmp/gwar-aec-binaries.json --out /tmp/gwar-aec-quiet-223 --start-load 3.5 --max-load 4.5
+python3 docs/measurements/summarize-aec-quiet.py /tmp/gwar-aec-quiet-223
+```
+
+The order is head/main/head/main/head/main, three runs each. Every run executes
+`voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time --exact --ignored --nocapture --test-threads=1`.
+Record uptime before/after and load throughout; require start <3.5 and void any
+load >4.5, another cargo/test or #213 timing overlap, or sleep/lost coverage.
+Retain valid failures. Report all 36 pairs and adjacent head/main comparisons.
+Pass needs head max <=1.0 ms and no systematic worsening against main.
+Use a new `--deadline-utc` only if the owner sets one; the old 01:00 deadline
+was cancelled by the pause.
+
+After the controlled comparison, finish/reconfirm the following gates against
+the resumed final head. Release speech/echo/route CSVs already matched the
+approved observations at this checkpoint; completed measurements do not become
+invalid merely because the Mac sleeps later. Rerun any measurement that spans sleep.
+The Linux CI full suite, clippy and fmt passed on `c2dd41d7`; final-head CI is
+still required after subsequent pushes. Local full-workspace and standalone
+constructor/featureless checks were not repeated before the pause.
+
+```sh
+aec_run() { python3 -c 'import os,subprocess,sys; os.setpriority(os.PRIO_PROCESS,0,10); raise SystemExit(subprocess.call(sys.argv[1:]))' "$@"; }
+export CARGO_TARGET_DIR=/tmp/gwar-aec-sol/head CARGO_BUILD_JOBS=4
+AEC_PROBE=$(python3 -c 'import json; print(json.load(open("/tmp/gwar-aec-binaries.json"))["head"]["binary"])')
+aec_run "$AEC_PROBE" fingerprint --ignored --nocapture --test-threads=1
+aec_run "$AEC_PROBE" heap_on_the_voice_thread --nocapture --test-threads=1
+aec_run "$AEC_PROBE" voice::apm::tests::tones::recorded_speech_is_not_held_after_stereo --exact --ignored --nocapture --test-threads=1
+aec_run "$AEC_PROBE" voice::apm::tests::shipped::shipped_p7_echo_tables --exact --ignored --nocapture --test-threads=1
+aec_run "$AEC_PROBE" voice::apm::tests::shipped::what_an_unreported_device_costs --exact --ignored --nocapture --test-threads=1
+aec_run cargo test --locked --release -p gwar-server --lib low_bandwidth_bursts_preserve_voice_with_and_without_video -- --nocapture --test-threads=1
+aec_run cargo check --locked --release -p gwar-client --lib
+cargo tree --locked -p gwar-client -e normal,build --format '{p} {f}'
+aec_run cargo clippy --locked --workspace --exclude gwar-desktop --all-targets -- -D warnings
+cargo fmt --all --check
+aec_run cargo test --locked --workspace --exclude gwar-desktop -- --test-threads=1
+gh pr checks 223 --repo MaciejWlodarski/gwar
+```
+
+The featureless graph must omit `gwar-aec-measurements` and `model-measurements`.
+For the isolated Sonora follow-up regression only (not a production selection):
+
+```sh
+aec_run cargo test --offline --manifest-path vendor/sonora/Cargo.toml --config "patch.crates-io.sonora-aec3.path=\"$PWD/vendor/sonora-aec3\"" --features gwar-aec-measurements --release --lib echo_canceller3::tests -- --test-threads=1
+```
+
+Remove only the `vendor/sonora/Cargo.lock` generated by that standalone command
+if none existed before. Keep the constructor fix measurement-only until the
+owner accepts a separate two-reference solution. Do not merge this PR.
 
 ### Correct render references and native options (historical PR #223 options checkpoint)
 

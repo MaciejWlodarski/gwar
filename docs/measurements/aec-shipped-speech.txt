@@ -1,3 +1,5 @@
+$ /tmp/gwar-aec-sol/head/release/deps/gwar_client-63cb5b99089087a9 voice::apm::tests::tones::recorded_speech_is_not_held_after_stereo --exact --ignored --nocapture --test-threads=1
+P7 binary source: ac4af9e4c2f6a5dffee325f791b6835623f6ca49; actual nice 10; one heavy task.
 
 running 1 test
 test voice::apm::tests::tones::recorded_speech_is_not_held_after_stereo ... shipped-speech,lead=6,echo=false,noise=0,cold-hold=25,cold-kept=0.73679656,hold=25,kept=0.73593074,active=1155,cold-kept-frames=851,kept-frames=850,approved-frame-exception=1
@@ -14,5 +16,5 @@ shipped-speech,lead=10,echo=true,noise=50,cold-hold=105,cold-kept=0.3073593,hold
 shipped-speech,lead=10,echo=true,noise=100,cold-hold=106,cold-kept=0.12813853,hold=49,kept=0.425974,active=1155,cold-kept-frames=148,kept-frames=492,approved-frame-exception=0
 ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 47.85s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 48.41s
 
