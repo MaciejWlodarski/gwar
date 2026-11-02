@@ -8,6 +8,7 @@ vi.mock("./worklet.ts?worker&url", () => ({ default: "/assets/worklet.js" }));
 
 interface FakeNode {
   connect: ReturnType<typeof vi.fn>;
+  disconnect: ReturnType<typeof vi.fn>;
   port: { onmessage: ((event: MessageEvent<Report>) => void) | null; postMessage(message: Request): void };
 }
 interface FakeWorker {
@@ -22,6 +23,7 @@ describe("loading the model", () => {
   let worker: FakeWorker;
   let posted: Request[];
   let outputs: ReturnType<typeof vi.fn>;
+  let tracks: Array<{ enabled: boolean; readyState: string; stop: ReturnType<typeof vi.fn> }>;
   let closed: number;
   const report = (data: Report) => node.port.onmessage!({ data } as MessageEvent<Report>);
   const tick = () => new Promise(resolve => setTimeout(resolve));
@@ -29,7 +31,12 @@ describe("loading the model", () => {
   beforeEach(() => {
     posted = [];
     closed = 0;
-    outputs = vi.fn(() => ({ stream: { getAudioTracks: () => [{ stop() {} }] } }));
+    tracks = [];
+    outputs = vi.fn(() => {
+      const track = { enabled: true, readyState: "live", stop: vi.fn(() => { track.readyState = "ended"; }) };
+      tracks.push(track);
+      return { stream: { getAudioTracks: () => [track] } };
+    });
     class FakeContext {
       state = "running";
       audioWorklet = { addModule: async () => {} };
@@ -42,6 +49,7 @@ describe("loading the model", () => {
     }
     class FakeNodeClass {
       connect = vi.fn();
+      disconnect = vi.fn();
       port = { onmessage: null, postMessage: (message: Request) => { posted.push(message); } };
       constructor() { node = this as unknown as FakeNode; }
     }
@@ -116,7 +124,15 @@ describe("loading the model", () => {
     expect(posted.at(-1)).toEqual({ type: "clear" });
     report({ type: "cleared" }); await parked;
     expect(cleared).toBe(true);
+    expect(pipeline.running).toBe(false);
+    const retired = pipeline.track;
+    expect(tracks[0]!.stop).toHaveBeenCalledOnce();
+    await pipeline.wake();
+    expect(pipeline.track).not.toBe(retired);
+    expect(pipeline.running).toBe(true);
+    expect(outputs).toHaveBeenCalledTimes(2);
     pipeline.close();
+    expect(tracks[1]!.stop).toHaveBeenCalledOnce();
   });
 
   it("gives up when the worker cannot build the model", async () => {

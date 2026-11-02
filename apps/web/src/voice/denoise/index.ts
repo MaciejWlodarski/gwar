@@ -83,11 +83,14 @@ export async function createDenoise(events: DenoiseEvents, signal: AbortSignal):
   let parked: Promise<void> | null = null;
   let resolvePark: (() => void) | null = null;
   let rejectPark: ((error: Error) => void) | null = null;
+  let destination: MediaStreamAudioDestinationNode | null = null;
   const shut = () => {
     rejectPark?.(new Error("the pipeline closed"));
     resolvePark = null; rejectPark = null; parked = null;
     model!.release();
     channel.port2.close();
+    destination?.stream.getAudioTracks().forEach(track => { if (track.readyState !== "ended") track.stop(); });
+    destination = null;
     for (const type of gestures) window.removeEventListener(type, resume);
     void context.close().catch(() => {});
   };
@@ -106,7 +109,6 @@ export async function createDenoise(events: DenoiseEvents, signal: AbortSignal):
       channelCount: 1,
       channelCountMode: "explicit",
     });
-    let destination: MediaStreamAudioDestinationNode | null = null;
     const post = (request: Request, transfer: Transferable[] = []) => node.port.postMessage(request, transfer);
     const describe = (report: Exclude<Outcome, { type: "ready" }>) => (report.type === "slow" ? `too slow: ${report.reason}` : report.reason);
     let closed = false;
@@ -167,9 +169,9 @@ export async function createDenoise(events: DenoiseEvents, signal: AbortSignal):
           if (slow && !closed) events.trouble(describe(slow));
         }, PACE_WINDOW_S * 1000)
       : undefined;
-    const track = destination!.stream.getAudioTracks()[0]!;
+    let track = destination!.stream.getAudioTracks()[0]!;
     return {
-      track,
+      get track() { return track; },
       get running() {
         return context.state === "running";
       },
@@ -196,14 +198,31 @@ export async function createDenoise(events: DenoiseEvents, signal: AbortSignal):
       setStrength(strength) {
         post({ type: "strength", strength });
       },
-      wake() { idle = false; return context.state === "running" ? Promise.resolve() : context.resume(); },
+      wake() {
+        // A fresh stream boundary also discards the browser's own queued output, beyond our
+        // acknowledged frame/ring clear. No previous caller's track can affect this output.
+        if (!destination) {
+          destination = context.createMediaStreamDestination();
+          destination.channelCount = 1;
+          node.connect(destination);
+          track = destination.stream.getAudioTracks()[0]!;
+        }
+        idle = false;
+        return context.state === "running" ? Promise.resolve() : context.resume();
+      },
       park() {
         if (parked) return parked;
         idle = true;
         active = false;
         track.enabled = false;
         source?.disconnect(); source = null;
-        parked = new Promise<void>((resolve, reject) => { resolvePark = resolve; rejectPark = reject; }).then(() => context.suspend());
+        parked = new Promise<void>((resolve, reject) => { resolvePark = resolve; rejectPark = reject; }).then(async () => {
+          if (closed) throw new Error("the pipeline closed");
+          if (track.readyState !== "ended") track.stop();
+          if (destination) node.disconnect(destination);
+          destination = null;
+          await context.suspend();
+        });
         post({ type: "clear" });
         return parked;
       },
@@ -212,7 +231,6 @@ export async function createDenoise(events: DenoiseEvents, signal: AbortSignal):
         clearInterval(watch);
         context.onstatechange = null;
         source?.disconnect();
-        track.stop();
         shut();
       },
     };

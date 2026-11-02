@@ -44,7 +44,7 @@ export class PipelinePool {
   }
 
   status() {
-    return { state: this.spare ? (this.spare.clearing ? "clearing" : this.spare.ready ? "ready" : "preparing") : this.cancelIdle ? "scheduled" : this.entries.size ? "active" : "empty", pipelines: this.entries.size, error: this.failure };
+    return { state: this.spare ? (this.spare.clearing ? "clearing" : this.spare.ready ? "ready" : "preparing") : this.cancelIdle ? "scheduled" : this.entries.size ? "active" : "empty", pipelines: this.entries.size, idleRunning: this.spare?.raw?.running ?? false, error: this.failure };
   }
 
   private destroy(entry: Entry): void {
@@ -126,7 +126,7 @@ export class PipelinePool {
       signal.throwIfAborted();
       if (!entry.active || returned) throw new Error("the prepared pipeline was released");
       delivered = true;
-      track = raw.track.clone(); track.enabled = true;
+      track = raw.track; track.enabled = true;
       entry.stopTrack = stopTrack;
       signal.addEventListener("abort", release, { once: true });
       const current = () => !returned && entry.active;

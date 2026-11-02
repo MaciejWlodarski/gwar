@@ -10,12 +10,13 @@ function deferred<T>() {
 const events = () => ({ trouble: vi.fn(), changed: vi.fn() });
 const flush = async () => { for (let n = 0; n < 12; n++) await Promise.resolve(); };
 function pipeline() {
-  const clones: Array<{ enabled: boolean; stop: ReturnType<typeof vi.fn> }> = [];
-  const track = { enabled: true, clone: vi.fn(() => {
-    const clone = { enabled: false, stop: vi.fn() }; clones.push(clone);
-    return clone as unknown as MediaStreamTrack;
+  let running = true;
+  const outputs: Array<{ enabled: boolean; stop: ReturnType<typeof vi.fn> }> = [];
+  let track = { enabled: true, stop: vi.fn() };
+  return { get track() { return track; }, outputs, get running() { return running; }, setSource: vi.fn(), setActive: vi.fn(), setStrength: vi.fn(), close: vi.fn(), park: vi.fn(async () => { running = false; }), wake: vi.fn(async () => {
+    running = true;
+    track = { enabled: false, stop: vi.fn() }; outputs.push(track);
   }) };
-  return { track, clones, running: true, setSource: vi.fn(), setActive: vi.fn(), setStrength: vi.fn(), close: vi.fn(), park: vi.fn(async () => {}), wake: vi.fn(async () => {}) };
 }
 
 describe("one prepared suppression pipeline", () => {
@@ -39,7 +40,7 @@ describe("one prepared suppression pipeline", () => {
     expect(create).not.toHaveBeenCalled();
     pool.configure(true, true); pool.configure(true, true); await idle();
     expect(create).toHaveBeenCalledOnce();
-    expect(pool.status()).toEqual({ state: "ready", pipelines: 1, error: null });
+    expect(pool.status()).toEqual({ state: "ready", pipelines: 1, idleRunning: false, error: null });
     expect(raws[0]!.park).toHaveBeenCalledOnce();
     expect(raws[0]!.track.enabled).toBe(false);
   });
@@ -51,7 +52,7 @@ describe("one prepared suppression pipeline", () => {
     const second = await acquire();
     expect(create).toHaveBeenCalledOnce();
     expect(first.track).not.toBe(second.track);
-    expect(raw.clones[0]!.stop).toHaveBeenCalledOnce();
+    expect(raw.outputs[0]!.stop).toHaveBeenCalledOnce();
     first.setActive(true); first.setStrength(10); first.setSource({} as MediaStream);
     expect(raw.setActive).not.toHaveBeenCalled(); expect(raw.setStrength).not.toHaveBeenCalled(); expect(raw.setSource).not.toHaveBeenCalled();
     second.setActive(true); second.setStrength(60);
@@ -70,10 +71,10 @@ describe("one prepared suppression pipeline", () => {
     const next = acquire().then(pipeline => { delivered = true; return pipeline; });
     await flush();
     expect(delivered).toBe(false);
-    expect(raws[0]!.track.clone).toHaveBeenCalledOnce();
+    expect(raws[0]!.wake).toHaveBeenCalledOnce();
     ack.resolve();
     (await next).close();
-    expect(raws[0]!.track.clone).toHaveBeenCalledTimes(2);
+    expect(raws[0]!.wake).toHaveBeenCalledTimes(2);
   });
 
   it("isolates concurrent users and destroys surplus returned runtimes", async () => {
@@ -110,14 +111,14 @@ describe("one prepared suppression pipeline", () => {
     await expect(pending).rejects.toThrow("cancelled wake");
     const next = acquire(); waking.resolve();
     const borrowed = await next; await flush();
-    expect(raws[0]!.track.clone).toHaveBeenCalledOnce(); borrowed.close();
+    expect(raws[0]!.wake).toHaveBeenCalledTimes(2); borrowed.close();
   });
 
   it("disable releases cached and leased runtimes, ignores retired callbacks and allows a clean re-enable", async () => {
     pool.configure(true, true); await idle();
     const oldEvents = events(), leased = await acquire(oldEvents);
     pool.configure(false, true);
-    expect(raws[0]!.clones[0]!.stop).toHaveBeenCalledOnce();
+    expect(raws[0]!.outputs[0]!.stop).toHaveBeenCalledOnce();
     reports[0]!.changed(); reports[0]!.trouble("stale"); leased.close();
     expect(raws[0]!.close).toHaveBeenCalledOnce();
     expect(oldEvents.changed).not.toHaveBeenCalled(); expect(oldEvents.trouble).not.toHaveBeenCalled();
@@ -132,6 +133,6 @@ describe("one prepared suppression pipeline", () => {
     const pending = acquire(); await flush(); pool.dispose();
     await expect(pending).rejects.toThrow("released");
     waking.resolve(); await flush();
-    expect(raws[0]!.track.clone).not.toHaveBeenCalled();
+    expect(raws[0]!.outputs).toHaveLength(0);
   });
 });

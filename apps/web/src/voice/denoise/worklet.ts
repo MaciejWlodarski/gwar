@@ -39,6 +39,7 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   private warming = WARM_UP;
   private warmUpMs = 0;
   private lastWarmMs = Infinity;
+  private warmCpuMs = 0;
   private quanta = 0;
   private seed = 1;
   private active = false;
@@ -170,6 +171,7 @@ class DenoiseProcessor extends AudioWorkletProcessor {
     if (!this.run(frame, false)) return;
     // The second half counts: the browser compiles the model fully while the first runs.
     this.lastWarmMs = Date.now() - started;
+    this.warmCpuMs += this.lastWarmMs;
     if (this.warming <= WARM_UP / 2) this.warmUpMs += this.lastWarmMs;
     if (--this.warming > 0) return;
     const mean = this.warmUpMs / (WARM_UP / 2);
@@ -200,7 +202,8 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
     // Keep the original every-other-quantum cadence when a frame costs measurable time.
     // If Date.now measures zero cost, allow the next quantum too; never run two in one quantum.
-    if (this.exports && this.warming > 0 && !this.failed && (this.quanta++ % 2 === 0 || this.lastWarmMs === 0)) this.warmUp();
+    const fast = this.lastWarmMs === 0 && this.warmCpuMs < WARM_UP - this.warming;
+    if (this.exports && this.warming > 0 && !this.failed && (this.quanta++ % 2 === 0 || fast)) this.warmUp();
     this.frameMs = null;
     const output = outputs[0]?.[0];
     if (output) this.framing.push(inputs[0]?.[0] ?? null, output);
