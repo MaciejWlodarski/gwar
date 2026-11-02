@@ -212,8 +212,12 @@ impl ScreenOrigin {
     }
     /// Whether the transport has sound; a publisher's stop leaves the m-line in place.
     fn audio_negotiated(&self, negotiated: bool) {
-        self.audio_negotiated.store(negotiated, Ordering::Relaxed);
-        self.has_audio.store(negotiated, Ordering::Relaxed);
+        let previous = self.audio_negotiated.swap(negotiated, Ordering::Relaxed);
+        // A replacement with the same Opus m-line changes no sound intent. In particular,
+        // renegotiating the picture must not resume sound the publisher explicitly stopped.
+        if !negotiated || !previous {
+            self.has_audio.store(negotiated, Ordering::Relaxed);
+        }
     }
 
     /// Sound flows again on the m-line it already has, if there is one.
@@ -6126,8 +6130,21 @@ pub(crate) mod tests {
         tier: u8,
         now: Instant,
     ) -> (Rtc, String, str0m::change::SdpPendingOffer) {
-        let mut config =
-            Rtc::builder().set_rtp_mode(true).clear_codecs().set_extension(5, dependency_descriptor::extension());
+        av1_peer_with_audio_at(direction, level, tier, false, now)
+    }
+
+    fn av1_peer_with_audio_at(
+        direction: Direction,
+        level: u8,
+        tier: u8,
+        audio: bool,
+        now: Instant,
+    ) -> (Rtc, String, str0m::change::SdpPendingOffer) {
+        let mut config = Rtc::builder()
+            .set_rtp_mode(true)
+            .clear_codecs()
+            .enable_opus(audio, false)
+            .set_extension(5, dependency_descriptor::extension());
         let format = str0m::format::FormatParams {
             profile: Some(0),
             level_idx: Some(level),
@@ -6147,8 +6164,49 @@ pub(crate) mod tests {
         peer.add_local_candidate(Candidate::host(addr(5000), "udp").unwrap());
         let mut api = peer.sdp_api();
         api.add_media(MediaKind::Video, direction, None, None, None);
+        if audio {
+            api.add_media(MediaKind::Audio, direction, None, None, None);
+        }
         let (offer, pending) = api.apply().unwrap();
         (peer, offer.to_sdp_string(), pending)
+    }
+
+    fn av1_republish_audio(stopped: bool) {
+        let now = Instant::now();
+        let origin = ScreenOrigin::new(1, "av1-sound".into(), 1, false, false, 8_000_000);
+        let (_, offer, _) = av1_peer_with_audio_at(Direction::SendOnly, 5, 0, true, now);
+        let (ssrc, _) = publish_ssrcs(&offer).unwrap();
+        let (first, answer) = publisher(1, origin.clone(), ssrc, &offer, addr(6000), now).unwrap();
+        assert!(answer.contains("AV1/90000"));
+        assert!(first.audio.is_some());
+        assert!(origin.has_audio.load(Ordering::Relaxed));
+        if stopped {
+            // The same state change as screen.audio.state(stopped=true).
+            origin.has_audio.store(false, Ordering::Relaxed);
+        }
+        // A viewer without AV1 makes recovery retire it, while retaining this origin.
+        origin.recovery.lock().unwrap().retire_av1();
+        drop(first);
+        assert_eq!(origin.has_audio.load(Ordering::Relaxed), !stopped);
+        let (_, offer, _) = av1_peer_with_audio_at(Direction::SendOnly, 5, 0, true, now);
+        let (ssrc, _) = publish_ssrcs(&offer).unwrap();
+        let (replacement, answer) = publisher(2, origin.clone(), ssrc, &offer, addr(6000), now).unwrap();
+        assert!(!answer.contains("AV1/90000"));
+        assert!(answer.contains("H264/90000"));
+        assert!(replacement.audio.is_some(), "Opus is still negotiated");
+        assert_eq!(origin.has_audio.load(Ordering::Relaxed), !stopped, "codec recovery keeps the owner's sound state");
+        assert!(origin.resume_audio(), "an explicit resume can still enable the existing m-line");
+        assert!(origin.has_audio.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn audio_av1_live_publisher_recovery_keeps_sound_available() {
+        av1_republish_audio(false);
+    }
+
+    #[test]
+    fn audio_av1_stopped_publisher_recovery_does_not_restart_sound() {
+        av1_republish_audio(true);
     }
 
     #[test]
