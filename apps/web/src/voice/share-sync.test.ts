@@ -168,6 +168,63 @@ describe("PictureSync", () => {
     expect(waits).toEqual([]);
   });
 
+  it("releases a muted slot's wait even while its share is paused", async () => {
+    const { sync, waits } = fixture();
+    await settle(sync);
+    await sync.tick([slot]);
+    expect(waits.at(-1)).toEqual(at(110));
+    await sync.tick([{ ...slot, paused: true, heard: false }]);
+    expect(waits.at(-1)).toEqual(at(0));
+  });
+
+  it("a look still waiting when its slot is released changes nothing", async () => {
+    const { sync, link, waits } = fixture();
+    await settle(sync);
+    let shown!: (ms: number) => void;
+    link.shown.mockImplementationOnce(() => new Promise<number>(resolve => { shown = resolve; }));
+    const look = sync.tick([slot]);
+    await vi.waitFor(() => expect(link.shown).toHaveBeenCalled());
+    sync.release(1);
+    shown(30);
+    await look;
+    expect(waits).toEqual([]);
+    await sync.tick([slot]);
+    expect(link.association).toHaveBeenCalledTimes(4);
+    expect(waits).toEqual([]);
+  });
+
+  it("a look still waiting does not undo a release that follows a wait", async () => {
+    const { sync, link, waits } = fixture();
+    await settle(sync);
+    await sync.tick([slot]);
+    let sound!: (clock: { rtpTime: number; unixMs: number }) => void;
+    const { sound: clock } = pair(80 + SOUND_AIM_MS);
+    link.sound.mockImplementationOnce(() => new Promise(resolve => { sound = resolve; }));
+    const look = sync.tick([slot]);
+    await vi.waitFor(() => expect(link.sound).toHaveBeenCalledTimes(4));
+    sync.release(1);
+    expect(waits.at(-1)).toEqual(at(0));
+    sound(clock);
+    await look;
+    expect(waits.at(-1)).toEqual(at(0));
+  });
+
+  it("a break reported during a look still counts", async () => {
+    const { sync, link, waits } = fixture(300);
+    await settle(sync);
+    await sync.tick([slot]);
+    let shown!: (ms: number) => void;
+    link.shown.mockImplementationOnce(() => new Promise<number>(resolve => { shown = resolve; }));
+    const look = sync.tick([slot]);
+    await vi.waitFor(() => expect(link.shown).toHaveBeenCalledTimes(2));
+    sync.linkBack(1);
+    shown(30);
+    await look;
+    const before = waits.at(-1)![1].picture;
+    await sync.tick([slot]);
+    expect(waits.at(-1)![1].picture).toBe(before + 300);
+  });
+
   it("makes a late joiner's picture wait at once, then corrects gently", async () => {
     const { sync, waits } = fixture(80);
     await settle(sync);

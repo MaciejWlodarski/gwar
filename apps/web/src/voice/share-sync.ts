@@ -120,6 +120,8 @@ const same = (a: Waits, b: Waits) => a.picture === b.picture && a.sound === b.so
 export class PictureSync {
   private readonly states = new Map<number, SlotState>();
   private running = false;
+  /** A look that waited across a release is about a slot that no longer waits; it writes nothing. */
+  private releases = 0;
   /** An older server does not know the question; it stops being asked. */
   private unsupported = false;
 
@@ -139,6 +141,7 @@ export class PictureSync {
 
   /** The slot's sound ended, or its share did: both sides are back to as soon as they can. */
   release(slot: number): void {
+    this.releases++;
     const state = this.states.get(slot);
     this.states.delete(slot);
     if (state && !same(state.waits, NO_WAIT)) this.link.wait(slot, NO_WAIT);
@@ -151,13 +154,13 @@ export class PictureSync {
   }
 
   private async look({ share, slot, heard, paused }: SyncSlot): Promise<void> {
-    if (paused) return;
-    const state = this.states.get(slot) ?? { share, waits: NO_WAIT, looks: 0 };
+    const start = this.states.get(slot) ?? { share, waits: NO_WAIT, looks: 0 };
     if (!heard) {
-      this.set(slot, state, { ...state, waits: NO_WAIT, looks: 0 });
+      this.set(slot, start, { ...start, waits: NO_WAIT, looks: 0 });
       return;
     }
-    if (this.unsupported) return;
+    if (paused || this.unsupported) return;
+    const releases = this.releases;
     // Only that answer is final: a question lost on the way is asked again at the next look.
     const association = await this.link.association(share).catch((e: unknown) => {
       if (e instanceof RequestError && e.code === "bad_request") this.unsupported = true;
@@ -166,11 +169,16 @@ export class PictureSync {
     if (!association?.known) return;
     const sound = await this.link.sound(slot).catch(() => null);
     const picture = this.link.picture(slot);
-    if (!sound || !picture || this.link.now() - picture.unixMs > STALE_PICTURE_MS) return;
-    if (state.looks < SETTLING_LOOKS) { this.states.set(slot, { ...state, looks: state.looks + 1 }); return; }
-    if (state.breakLooks === BREAK_LOOKS) { this.states.set(slot, { ...state, breakLooks: BREAK_LOOKS - 1 }); return; }
+    if (!sound || !picture || this.link.now() - picture.unixMs > STALE_PICTURE_MS || this.releases !== releases) return;
+    const seen = this.states.get(slot) ?? start;
+    if (seen.looks < SETTLING_LOOKS) { this.states.set(slot, { ...seen, looks: seen.looks + 1 }); return; }
+    if (seen.breakLooks === BREAK_LOOKS) { this.states.set(slot, { ...seen, breakLooks: BREAK_LOOKS - 1 }); return; }
     const lag = soundLagMs(association, sound, picture) - SOUND_AIM_MS;
     const shown = await this.link.shown(slot).catch(() => 0);
+    if (this.releases !== releases) return;
+    // Whatever else happened while the receiver answered, such as a break, stands.
+    const state = this.states.get(slot) ?? seen;
+    if (state.breakLooks === BREAK_LOOKS) { this.states.set(slot, { ...state, breakLooks: BREAK_LOOKS - 1 }); return; }
     const breakLooks = state.breakLooks ?? 0;
     const whole = state.looks === SETTLING_LOOKS || (breakLooks > 0 && Math.abs(lag) > BREAK_MOVE_MS);
     this.set(slot, state, { ...state, waits: nextWaits(state.waits, lag, whole, shown, this.link.soundWaits), looks: state.looks + 1, breakLooks: whole ? 0 : Math.max(0, breakLooks - 1) });
