@@ -1122,9 +1122,9 @@ impl StreamTx {
     }
 
     pub(crate) fn create_sr_and_update(&mut self, now: Instant, feedback: &mut VecDeque<Rtcp>) {
-        // Gwar: nothing written has no RTP time, and a report saying zero stays in a receiver's
-        // clock estimate for its next twenty reports. The SDES below keeps the cadence.
-        if self.rtp_and_wallclock.is_some() {
+        // Gwar: nothing sent has no RTP time, and a report saying zero stays in a receiver's clock
+        // estimate for its next twenty reports. The SDES below keeps the cadence.
+        if self.current_rtp_time(now).is_some() {
             let sr = self.create_sender_report(now);
 
             trace!("Created feedback SR: {:?}", sr);
@@ -1797,7 +1797,15 @@ mod test {
         assert!(!reported(&feedback));
         assert!(!feedback.is_empty(), "the cadence stays");
 
-        stream.rtp_and_wallclock = Some((48_000, now));
+        // Written but not sent yet, as when a report falls due right after the first write: the
+        // clock rate comes with the first send, and there is still no RTP time to report.
+        stream.write_rtp(RtpWrite::new(111.into(), 7.into(), 48_000, now, Arc::<[u8]>::from(vec![0x10; 100])));
+        let mut feedback = VecDeque::new();
+        stream.create_sr_and_update(now, &mut feedback);
+        assert!(!reported(&feedback));
+        assert!(!feedback.is_empty(), "the cadence stays");
+
+        stream.clock_rate = Some(Frequency::FORTY_EIGHT_KHZ);
         let mut feedback = VecDeque::new();
         stream.create_sr_and_update(now, &mut feedback);
         assert!(reported(&feedback));
