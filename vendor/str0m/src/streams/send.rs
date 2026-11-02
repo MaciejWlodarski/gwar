@@ -1041,6 +1041,11 @@ impl StreamTx {
             // First handle_timeout sets the kind. No sender report until then.
             return not_happening();
         }
+        if self.rtp_and_wallclock.is_none() {
+            // Gwar: nothing written has no RTP time, and a report saying zero stays in a
+            // receiver's clock estimate for its next twenty reports.
+            return not_happening();
+        }
         self.last_sender_report + intervals.for_audio(self.is_audio())
     }
 
@@ -1781,11 +1786,29 @@ mod test {
     }
 
     #[test]
+    fn no_sender_report_says_anything_before_the_first_packet() {
+        let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
+        let now = Instant::now();
+        stream.kind = Some(MediaKind::Audio);
+        let intervals = RtcpReportIntervals {
+            audio: Duration::from_millis(750),
+            video: Duration::from_millis(500),
+        };
+
+        assert_eq!(stream.sender_report_at(intervals), not_happening());
+        assert!(!stream.need_sr(now, intervals));
+
+        stream.rtp_and_wallclock = Some((48_000, now));
+        assert!(stream.need_sr(now, intervals));
+    }
+
+    #[test]
     fn sender_report_uses_supplied_intervals() {
         let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
         let now = Instant::now();
         stream.kind = Some(MediaKind::Audio);
         stream.last_sender_report = now;
+        stream.rtp_and_wallclock = Some((0, now));
 
         assert_eq!(
             stream.sender_report_at(RtcpReportIntervals {
