@@ -360,6 +360,34 @@ it("keeps the webview silent for a replacement capture when the old stop is ackn
   audio.remove();
 });
 
+it("tries again after a refusal under the same context, with a new capture id", async () => {
+  const { worklet } = audioStage();
+  worklet.resolve();
+  let refuse = true;
+  const ids: number[] = [];
+  const { calls, link } = shell(async command => { if (command === "share_capture_start" && refuse) throw "permission"; });
+  const invoke = link.api.invoke as ReturnType<typeof vi.fn>;
+  const sound = new ComputerSound(async () => link, vi.fn());
+  expect(await sound.start()).toBe("permission");
+  expect(calls).toContain("share_capture_stop");
+  refuse = false;
+  expect(typeof await sound.start()).toBe("object");
+  for (const [command, args] of invoke.mock.calls as Array<[string, { id: number }]>) if (command === "share_capture_start") ids.push(args.id);
+  expect(ids).toHaveLength(2);
+  expect(ids[1]).toBeGreaterThan(ids[0]!);
+  sound.stop();
+});
+
+it("a stop after a refusal still ends everything", async () => {
+  const { worklet } = audioStage();
+  worklet.resolve();
+  const { link } = shell(async command => { if (command === "share_capture_start") throw "failed"; });
+  const sound = new ComputerSound(async () => link, vi.fn());
+  expect(await sound.start()).toBe("failed");
+  sound.stop();
+  expect(await sound.start()).toBe("failed");
+});
+
 it("gives the webview its sound back when capture could not start", async () => {
   onMac();
   const { worklet } = audioStage();

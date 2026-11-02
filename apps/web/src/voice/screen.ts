@@ -303,7 +303,7 @@ export function captureScreen(spec: ScreenSpec = { mode: "smooth", height: 1080,
   const options = {
     video: { width: { max: spec.height * 16 / 9 }, height: { max: spec.height }, frameRate: { max: spec.fps } },
     // Only another tab: system mixes can contain call playback. Native capture is separate.
-    audio: audio ? { suppressLocalAudioPlayback: false, restrictOwnAudio: true, echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 } : false,
+    audio: audio ? SOUND_OPTIONS : false,
     windowAudio: "exclude",
     systemAudio: "exclude",
     selfBrowserSurface: "exclude",
@@ -312,17 +312,53 @@ export function captureScreen(spec: ScreenSpec = { mode: "smooth", height: 1080,
   } as DisplayMediaStreamOptions;
   return navigator.mediaDevices.getDisplayMedia(options).then(stream => {
     keepFocus();
-    if (!audio || !stream.getVideoTracks()[0] || surfaceOf(stream.getVideoTracks()[0]!) !== "tab") {
-      for (const track of stream.getAudioTracks()) { track.stop(); stream.removeTrack(track); }
-    }
-    const supported = navigator.mediaDevices.getSupportedConstraints?.() as (MediaTrackSupportedConstraints & { restrictOwnAudio?: boolean }) | undefined;
-    if (supported?.restrictOwnAudio) {
-      for (const track of stream.getAudioTracks()) {
-        if ((track.getSettings() as MediaTrackSettings & { restrictOwnAudio?: boolean }).restrictOwnAudio !== true) { track.stop(); stream.removeTrack(track); }
-      }
-    }
+    if (!audio) for (const track of stream.getAudioTracks()) { track.stop(); stream.removeTrack(track); }
+    keepTabSound(stream);
     return stream;
   });
+}
+
+const SOUND_OPTIONS = { suppressLocalAudioPlayback: false, restrictOwnAudio: true, echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 2 };
+
+/** Drops what the rules above forbid: sound that is not from a tab, or a tab of ours that a browser left in. */
+function keepTabSound(stream: MediaStream): void {
+  if (!stream.getVideoTracks()[0] || surfaceOf(stream.getVideoTracks()[0]!) !== "tab") {
+    for (const track of stream.getAudioTracks()) { track.stop(); stream.removeTrack(track); }
+  }
+  const supported = navigator.mediaDevices.getSupportedConstraints?.() as (MediaTrackSupportedConstraints & { restrictOwnAudio?: boolean }) | undefined;
+  if (supported?.restrictOwnAudio) {
+    for (const track of stream.getAudioTracks()) {
+      if ((track.getSettings() as MediaTrackSettings & { restrictOwnAudio?: boolean }).restrictOwnAudio !== true) { track.stop(); stream.removeTrack(track); }
+    }
+  }
+}
+
+/** Whether this browser's picker can return a tab's sound (Chromium's alone, today). */
+export function tabSoundSupported(): boolean {
+  const supported = navigator.mediaDevices?.getSupportedConstraints?.() as (MediaTrackSupportedConstraints & { suppressLocalAudioPlayback?: boolean }) | undefined;
+  return supported?.suppressLocalAudioPlayback === true;
+}
+
+/**
+ * The picker again, for a tab's sound alone: a running share keeps its own picture, so the picture
+ * this capture must come with is stopped at once. Call it from the click handler, as `captureScreen`.
+ * Null when the choice has no sound; rejects when the sharer closes the picker.
+ */
+export async function captureTabSound(): Promise<MediaStreamTrack | null> {
+  const options = {
+    video: { width: { max: 640 }, height: { max: 360 }, frameRate: { max: 1 }, displaySurface: "browser" },
+    audio: SOUND_OPTIONS,
+    windowAudio: "exclude",
+    systemAudio: "exclude",
+    selfBrowserSurface: "exclude",
+    monitorTypeSurfaces: "exclude",
+    surfaceSwitching: "exclude",
+  } as DisplayMediaStreamOptions;
+  const stream = await navigator.mediaDevices.getDisplayMedia(options);
+  keepTabSound(stream);
+  const track = stream.getAudioTracks()[0] ?? null;
+  for (const video of stream.getVideoTracks()) video.stop();
+  return track;
 }
 
 /** The track's quality settings: content hint and capture cap (`applyConstraints`, never upscaled). */
@@ -570,6 +606,18 @@ function withReservedAudio(sdp: string): string {
   }).join("");
 }
 
+/**
+ * The answer to a re-offer that adds sound, with the video section as it stands now: a changed
+ * codec list or start hint would rebuild the encoder, and only the sound is new.
+ */
+export function keepVideoAnswer(current: string, answer: string): string {
+  const video = (sdp: string) => sdp.split(/(?=^m=)/m).find(section => section.startsWith("m=video "));
+  const kept = video(current), offered = video(answer);
+  return kept && offered ? answer.replace(offered, () => kept) : answer;
+}
+
+const SOUND_ENCODING: RTCRtpEncodingParameters = { maxBitrate: 64_000, priority: "very-low", networkPriority: "very-low" };
+
 function rtcConfig(iceServers: IceServer[]): RTCConfiguration {
   return {
     iceServers: iceServers.map(s => ({ urls: s.urls, ...(s.username ? { username: s.username } : {}), ...(s.credential ? { credential: s.credential } : {}) })),
@@ -639,7 +687,7 @@ export interface PublishParams {
   fallbacks?: EncoderFallbacks;
   track: MediaStreamTrack;
   audio?: MediaStreamTrack;
-  /** Computer sound from the desktop app: it follows no captured surface. */
+  /** Sound with its own source (the computer's, or a tab chosen later): it follows no captured surface. */
   nativeAudio?: boolean;
   audioState?(sharing: boolean): void;
   quality: ScreenSpec;
@@ -705,6 +753,15 @@ export class ScreenPublisher {
   private available: number | undefined;
   private run = 0;
   private revision = 0;
+  /** What sound goes out, and whether it is tied to the captured surface; `addAudio` changes both. */
+  private audio: MediaStreamTrack | undefined;
+  private nativeAudio: boolean;
+  /** The current transport's sound sender, once it has one: the m-line outlives a stopped sound. */
+  private audioSender: RTCRtpSender | null = null;
+  /** The sharing bar and the server hear of a sound ending once, not at every poll. */
+  private audioLive: boolean | null = null;
+  /** While sound is being added, so a poll cannot report it gone before it has come. */
+  private addingAudio = false;
   private parameters: Promise<void> = Promise.resolve();
   private adaptationSent: { bytes: number; at: number } | null = null;
   private surfaceKey: (string | undefined)[] = [];
@@ -731,6 +788,8 @@ export class ScreenPublisher {
     globalThis.addEventListener?.("pagehide", this.pageHide);
     this.quality = { ...params.quality };
     this.automaticMode = params.automaticMode === true;
+    this.audio = params.audio;
+    this.nativeAudio = params.nativeAudio === true;
     if (params.fallbacks) {
       this.startHintUnsafe = params.fallbacks.startHintUnsafe;
       this.codecFellBack = params.fallbacks.codecFellBack;
@@ -768,12 +827,11 @@ export class ScreenPublisher {
       sendEncodings: [{ ...this.scale(), maxBitrate: spec.maxBitrate, maxFramerate: spec.fps, priority: "low", networkPriority: "low" }],
     });
     this.sender = transceiver.sender;
-    const audio = this.params.audio;
+    const audio = this.audio;
     const sharingAudio = audio?.readyState === "live";
-    if (sharingAudio) {
-      pc.addTransceiver(audio, { direction: "sendonly", sendEncodings: [{ maxBitrate: 64_000, priority: "very-low", networkPriority: "very-low" }] });
-    }
-    this.params.audioState?.(audio?.readyState === "live");
+    this.audioSender = sharingAudio ? pc.addTransceiver(audio, { direction: "sendonly", sendEncodings: [{ ...SOUND_ENCODING }] }).sender : null;
+    this.audioLive = null;
+    this.reportAudio();
     this.parameters = Promise.resolve();
     this.desired = 0;
     // A recovery plan names H.264 or VP9: AV1 never comes back within the share.
@@ -834,6 +892,70 @@ export class ScreenPublisher {
     this.negotiated = true;
     configured = true;
     if (heldVideo) void releaseVideo();
+  }
+
+  /** Tells the controller when sound starts or ends; quiet while it stays as it was. */
+  private reportAudio(): void {
+    if (this.addingAudio) return;
+    const live = this.audio?.readyState === "live";
+    if (live === this.audioLive) return;
+    this.audioLive = live;
+    this.params.audioState?.(live);
+  }
+
+  /**
+   * Sound for this running share, on the same connection and the same video sender, so the
+   * picture neither stops nor restarts. A transport that has the m-line takes the new track as
+   * it is; otherwise this is one re-offer with the sound added, and the video section of the
+   * answer stays what it was. `add` asks the server, which refuses without touching the picture;
+   * a refusal puts everything back, and a later recovery's new transport starts with the sound.
+   */
+  async addAudio(track: MediaStreamTrack, add: { renegotiate(sdp: string): Promise<string>; resume(): Promise<void> }): Promise<void> {
+    const pc = this.pc;
+    if (this.closed || !pc || !this.negotiated || this.addingAudio || pc.signalingState !== "stable" || pc.connectionState !== "connected") throw new Error("the share is not ready for sound");
+    this.addingAudio = true;
+    try {
+      if (this.audioSender) await this.resumeAudio(this.audioSender, track, add);
+      else await this.negotiateAudio(pc, track, add);
+      // A replaced transport started without this sound; the sharer can ask again.
+      if (this.closed || this.pc !== pc) throw new Error("the transport was replaced");
+      this.audio = track;
+      this.nativeAudio = true;
+      // Sound stopped a moment ago may not have been polled yet: this report must still go out.
+      this.audioLive = null;
+    } finally { this.addingAudio = false; }
+    this.reportAudio();
+    // The sound's allowance comes out of the video cap, as if the share had started with it.
+    if (this.negotiated) await this.applyParameters(this.videoBudget());
+  }
+
+  private async resumeAudio(sender: RTCRtpSender, track: MediaStreamTrack, add: { resume(): Promise<void> }): Promise<void> {
+    await sender.replaceTrack(track);
+    try { await add.resume(); }
+    catch (e) { await sender.replaceTrack(null).catch(() => {}); throw e; }
+  }
+
+  private async negotiateAudio(pc: RTCPeerConnection, track: MediaStreamTrack, add: { renegotiate(sdp: string): Promise<string> }): Promise<void> {
+    const transceiver = pc.addTransceiver(track, { direction: "sendonly", sendEncodings: [{ ...SOUND_ENCODING }] });
+    const stale = () => this.closed || this.pc !== pc;
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription({ ...offer, sdp: withReservedAudio(offer.sdp ?? "") });
+      if (stale()) return;
+      const answer = await add.renegotiate(pc.localDescription?.sdp ?? "");
+      if (stale()) return;
+      await pc.setRemoteDescription({ type: "answer", sdp: keepVideoAnswer(pc.remoteDescription?.sdp ?? "", answer) });
+      if (stale()) return;
+      this.audioSender = transceiver.sender;
+      // The first-frame guard's stored answer must keep matching the offers it makes from now on.
+      if (this.answer?.pc === pc) this.answer = { ...this.answer, sdp: keepVideoAnswer(this.answer.sdp, answer) };
+    } catch (e) {
+      if (!stale()) {
+        if (pc.signalingState === "have-local-offer") await pc.setLocalDescription({ type: "rollback" }).catch(() => {});
+        transceiver.stop();
+      }
+      throw e;
+    }
   }
 
   /** Changes quality while sharing, with no renegotiation. */
@@ -899,7 +1021,7 @@ export class ScreenPublisher {
       if (!this.trackEnded) { this.trackEnded = true; this.params.ended?.(); }
       return;
     }
-    this.params.audioState?.(this.params.audio?.readyState === "live");
+    this.reportAudio();
     if (!pc || !this.negotiated) return;
     this.refreshSurface();
     if (this.polling === pc) { this.params.uplink?.(this.uplink.observe(performance.now(), null)); return; }
@@ -1160,9 +1282,10 @@ export class ScreenPublisher {
    */
   private refreshSurface(): MediaTrackSettings | undefined {
     const settings = this.params.track.getSettings?.();
-    if (!this.params.nativeAudio && settings?.displaySurface && settings.displaySurface !== "browser" && this.params.audio?.readyState === "live") {
-      this.params.audio.stop();
-      this.params.audioState?.(false);
+    if (!this.nativeAudio && settings?.displaySurface && settings.displaySurface !== "browser" && this.audio?.readyState === "live") {
+      this.audio.stop();
+      this.audio = undefined;
+      this.reportAudio();
     }
     const key = [settings?.deviceId, settings?.displaySurface];
     const first = this.surfaceKey.length === 0;
@@ -1324,13 +1447,13 @@ export class ScreenPublisher {
   }
 
   private videoBudget(available = this.available): number {
-    const reserve = this.params.audio?.readyState === "live" ? 128_000 : 0;
+    const reserve = this.audio?.readyState === "live" ? 128_000 : 0;
     return Math.min(this.spec().maxBitrate, available && Number.isFinite(available) && available > 0 ? Math.max(1, uplinkVideoBudget(available) - reserve) : this.spec().maxBitrate);
   }
 
   private spec(): ResolvedSpec {
     const base = deriveSpec(this.quality, this.params.legacy);
-    const spec = this.params.audio?.readyState === "live" ? { ...base, maxBitrate: Math.max(1, base.maxBitrate - 128_000) } : base, r = this.recovery;
+    const spec = this.audio?.readyState === "live" ? { ...base, maxBitrate: Math.max(1, base.maxBitrate - 128_000) } : base, r = this.recovery;
     return r ? { ...spec, width: Math.min(spec.width, r.width), height: Math.min(spec.height, r.height), fps: Math.min(spec.fps, r.fps) } : spec;
   }
 

@@ -20,7 +20,7 @@ import { guestLinkPossible, useCanWatch, useScreenSupport } from "../state/scree
 import { myChannelId, shareOf } from "../state/reducer";
 import { slotOf, useScreen, type OwnShare } from "../state/screen";
 import { useSession, useUi, useVoice } from "../state/stores";
-import { type PublishStats } from "../voice/screen";
+import { tabSoundSupported, type PublishStats } from "../voice/screen";
 import { HEIGHTS, FRAME_RATES, type ScreenSpec } from "../voice/screen-quality";
 import { useChannelPermission, useConnectionQuality, useMe, useMemberName, useMyWho, useWhoOf } from "./hooks";
 import { BackButton, Button, Dialog, IconButton, panelCard, TalkingAvatar, Tooltip, TopBanner } from "./kit";
@@ -155,15 +155,25 @@ function soundStatus(own: OwnShare): Key {
     return computer ? "screen.computerSoundReady" : "screen.audioReady";
   }
   if (own.audioServer === false) return "screen.audioServer";
-  if (!computer) return "screen.audioUnavailable";
+  if (!computer) return canAddSound(own) ? "screen.audioAddHint" : "screen.audioUnavailable";
   switch (own.computerSound) {
-    case "permission": return "screen.computerSoundPermission";
+    case "permission": return own.phase === "live" ? "screen.computerSoundPermissionLive" : "screen.computerSoundPermission";
     case "unsupported": return "screen.computerSoundUnsupported";
     case "failed": return "screen.computerSoundFailed";
-    case "stopped": return "screen.computerSoundStopped";
+    case "stopped": return canAddSound(own) ? "screen.computerSoundOffLive" : "screen.computerSoundStopped";
     default: return "screen.computerSoundOff";
   }
 }
+
+/** Whether sound can join this running share; a false here shows nothing to press. */
+function canAddSound(own: OwnShare): boolean {
+  if (own.phase !== "live" || own.audio || !own.soundAddable || own.audioServer === false) return false;
+  if (!controller.screen.usesNativeSound()) return tabSoundSupported();
+  return own.computerSound !== undefined && own.computerSound !== "unsupported" && own.computerSound !== "resuming";
+}
+
+/** The bar's button acts at once only where nothing needs explaining first. */
+const soundNeedsDetails = (own: OwnShare) => !controller.screen.usesNativeSound() || own.computerSound === "permission";
 
 function ComputerSoundPermission() {
   const t = useT();
@@ -255,6 +265,9 @@ export function SharingBar() {
   const viewers = own.viewers + own.guests;
   const resuming = own.computerSound === "resuming";
   const audioLabel = resuming ? "screen.audioResuming" : own.audio ? viewers === 0 ? "screen.sharingAudio" : "screen.audioOn" : "screen.audioOff";
+  const addable = canAddSound(own);
+  const adding = own.soundAdding === true;
+  const turnOn = () => void controller.screen.turnOnSound().then(why => { if (why === "permission") setDetails(true); });
   const watching = own.phase === "live" ? t(countKey(lang, "screen.watching", viewers), { count: viewers }) : t(own.phase === "reconnecting" ? "screen.reconnecting" : "screen.starting");
   const linked = !!own.share && !!links[own.share];
   const linkStatus = `${t("screen.tsLinkOn")} · ${t(countKey(lang, "screen.guests", own.guests), { count: own.guests })}`;
@@ -267,18 +280,24 @@ export function SharingBar() {
         <span className="hidden lg:inline">{linkStatus}</span>
         <span className="hidden lg:inline-flex"><Button size="sm" variant="secondary" className="border-white/40 px-2 text-white hover:bg-white/15" onClick={() => void controller.screen.turnOffLink(own.share!)}>{t("screen.tsTurnOff")}</Button></span>
       </span>}
-      {own.phase === "live" && <span data-testid="share-audio-status" className="flex shrink-0 items-center gap-1 text-xs" aria-label={t(audioLabel)}>
+      {addable && <Tooltip label={t(adding ? "screen.soundTurningOn" : "screen.soundTurnOn")} side="bottom"><Button size="sm" variant="secondary" data-testid="share-audio-add" disabled={adding} aria-label={t(adding ? "screen.soundTurningOn" : "screen.soundTurnOn")} className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 disabled:opacity-90 sm:px-2" onClick={() => { if (soundNeedsDetails(own)) setDetails(true); else turnOn(); }}>
+        {adding ? <RotateCw aria-hidden className="size-3.5 motion-safe:animate-spin" /> : <VolumeX aria-hidden className="size-3.5" />}<span className="hidden sm:inline">{t(adding ? "screen.soundTurningOn" : "screen.soundTurnOn")}</span>
+      </Button></Tooltip>}
+      {own.phase === "live" && !addable && <span data-testid="share-audio-status" className="flex shrink-0 items-center gap-1 text-xs" aria-label={t(audioLabel)}>
         {resuming ? <RotateCw aria-hidden className="size-3.5 motion-safe:animate-spin" /> : own.audio ? <Volume2 aria-hidden className="size-3.5" /> : <VolumeX aria-hidden className="size-3.5" />}<span className="hidden sm:inline">{t(audioLabel)}</span>
       </span>}
       <ConnectionIndicator variant="bar" compact />
-      <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 sm:px-2" onClick={() => setDetails(true)}>{t("common.details")}</Button>
-      <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 sm:px-2" aria-label={t("screen.stop")} onClick={() => void controller.screen.stopShare()}>{t("screen.stopShort")}</Button>
+      <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 disabled:opacity-90 sm:px-2" onClick={() => setDetails(true)}>{t("common.details")}</Button>
+      <Button size="sm" variant="secondary" className="shrink-0 border-white/40 px-1.5 text-white hover:bg-white/15 disabled:opacity-90 sm:px-2" aria-label={t("screen.stop")} onClick={() => void controller.screen.stopShare()}>{t("screen.stopShort")}</Button>
       <Dialog open={details} onOpenChange={setDetails} title={t("screen.sharingBar")}>
         <p className="mb-3 text-sm text-muted">{watching}</p>
         <div className="mb-3 text-sm">
-          <p>{t(soundStatus(own))}</p>
-          {own.computerSound === "permission" && <ComputerSoundPermission />}
-          {own.audio && (own.computerSound === "ok" || resuming) && <Button size="sm" className="mt-1.5" onClick={() => controller.screen.stopComputerSound()}>{t("screen.stopComputerSound")}</Button>}
+          <p data-testid="share-audio-detail">{t(soundStatus(own))}</p>
+          <div className="flex flex-wrap gap-2">
+            {own.computerSound === "permission" && <ComputerSoundPermission />}
+            {addable && <Button size="sm" className="mt-1.5" busy={adding} onClick={turnOn}>{t(controller.screen.usesNativeSound() ? "screen.soundTurnOn" : "screen.audioChooseTab")}</Button>}
+            {own.audio && (own.computerSound === "ok" || resuming) && <Button size="sm" className="mt-1.5" onClick={() => controller.screen.stopComputerSound()}>{t("screen.stopComputerSound")}</Button>}
+          </div>
         </div>
         <QualityControls spec={own.spec} />
         {own.phase === "live" && <SenderStats />}

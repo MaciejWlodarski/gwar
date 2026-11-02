@@ -988,3 +988,26 @@ hidden for minutes, a real stall or sleep and wake in the app (pause and resume 
 shell's state and on the webview's reader, not end to end in a real webview), and whether
 ScreenCaptureKit or process loopback survive a real sleep: if the OS ends the stream, computer
 sound ends and Details says so. The owner test list is in the pull request. Windows code is compiled by CI only.
+
+## Sound during a running share
+
+`E2E_BROWSERS=chromium E2E_SCREEN_AUDIO=1 node apps/web/e2e/screen.mjs`, against a local
+server with generated media. `--disable-audio-output` gives Chromium's audio graphs no
+output device, so the run stays silent; a guard polling `pmset -g assertions` for
+`BuiltInSpeakerDevice` saw nothing. WebKit has no such flag, so this scenario is Chromium
+only, and `E2E_SCREEN_AUDIO` is not part of CI.
+
+| Check | Result |
+| --- | --- |
+| Stopped sound returns in the same share, viewer does not rewatch | 997 Hz decoded, peak 0.071 |
+| Sound joins a picture-only share through the real tab picker | 997 Hz decoded, peak 0.071 |
+| Second capture's video stopped, tab audio stays alive | Yes |
+| Publish transport, video SSRC, encoder while sound joins | Unchanged |
+| Watch transport run while sound joins | Unchanged |
+| Keyframes the sender produced because of the join | 0 |
+| Keyframes the viewer decoded in the whole sample | 1, the first |
+| Longest decode stall in 8 s sampled at 10 Hz, join in the middle | 0 ms |
+
+Not exercised here: the real macOS permission grant, the native capture on Windows, and
+Chrome's visible second picker, which the test selects automatically. Those need a person
+and the app.

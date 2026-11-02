@@ -24,6 +24,10 @@ export interface OwnShare {
   audioServer?: boolean;
   /** The desktop app's computer sound; absent in a browser and until the system has answered. */
   computerSound?: ComputerSoundState;
+  /** The server takes sound into a running share; older ones need a new share for it. */
+  soundAddable?: boolean;
+  /** Sound is on its way into the running share. */
+  soundAdding?: boolean;
   /** One per attempt: late results of an earlier attempt change nothing. */
   attempt: number;
   share: string | null;
@@ -87,6 +91,8 @@ export type ScreenAction =
   | { type: "choose"; spec: ScreenSpec }
   | { type: "audio"; attempt: number; sharing: boolean; server?: boolean }
   | { type: "computerSound"; attempt: number; state: ComputerSoundState }
+  | { type: "soundAddable"; attempt: number; addable: boolean }
+  | { type: "soundAdding"; attempt: number; adding: boolean }
   | { type: "surface"; attempt: number; surface: ScreenSurface; spec: ScreenSpec }
   | { type: "queueShare"; attempt: number }
   | { type: "starting"; attempt: number }
@@ -227,6 +233,10 @@ export function reduceScreen(state: ScreenState, action: ScreenAction): ScreenSt
     }
     case "computerSound":
       return state.own?.attempt === action.attempt ? { ...state, own: { ...state.own, computerSound: action.state } } : state;
+    case "soundAddable":
+      return state.own?.attempt === action.attempt ? { ...state, own: { ...state.own, soundAddable: action.addable } } : state;
+    case "soundAdding":
+      return state.own?.attempt === action.attempt ? { ...state, own: { ...state.own, soundAdding: action.adding } } : state;
     case "watchSound":
       return { ...state, watches: state.watches.map(w => w.id === action.id ? { ...w, soundReady: action.ready } : w) };
     case "watchAudio":

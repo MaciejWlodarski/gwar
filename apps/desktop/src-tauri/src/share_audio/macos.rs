@@ -203,15 +203,20 @@ impl Drop for Stream {
 }
 
 pub fn start(queue: Arc<CaptureQueue>) -> Result<Box<dyn Send>, Refusal> {
-    match support() {
-        Support::Ok => {}
+    let refused = match support() {
+        Support::Ok => false,
         Support::Unsupported => return Err(Refusal::Unsupported),
-        Support::Permission => {
-            allow();
-            return Err(Refusal::Permission);
+        Support::Permission => true,
+    };
+    // The check can stay out of date until a relaunch, while the capture already works: a sharer
+    // who has just turned it on keeps their share. Only the capture itself can say no for sure.
+    let filter = display().map_err(|error| {
+        if !refused {
+            return error;
         }
-    }
-    let filter = display()?;
+        allow();
+        Refusal::Permission
+    })?;
     let config = configuration();
     let output = Output::new(queue.clone());
     let delegate = ProtocolObject::from_ref(&*output);

@@ -250,3 +250,11 @@ Older servers reject it normally; viewers then keep video without audio controls
 or playback. Only the owning publisher may set `stopped: true`. Share/Welcome
 and existing event shapes remain unchanged. Desktop viewers keep the legacy
 video-only watch layout until native playback supplies the AEC reference.
+
+Adding sound to a running share is queried separately with
+`screen.audio.add.capabilities`, whose reply is `{ screen_audio_add: boolean }`. A
+server that answers with a refusal keeps the old behaviour: the sharer sees the plain
+status, and sound needs a new share. `screen.audio.add` (`share`, `sdp`, answered
+with `ScreenAnswer`) and `screen.audio.resume` (`share`, answered with
+`ScreenAudioState`) are only sent after that query succeeds. No existing frame
+changes shape, and viewers need nothing new: they see `audio` turn true.

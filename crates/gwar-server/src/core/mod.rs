@@ -1924,6 +1924,11 @@ impl Core {
             Request::ScreenAv1Capabilities {} => Ok(Response::ScreenAv1Capabilities { screen_av1: true }),
             Request::ScreenAudioCapabilities {} => Ok(Response::ScreenAudioCapabilities { screen_audio: true }),
             Request::ScreenAudioState { share, stopped } => self.screen_audio_state(session, &share, stopped),
+            Request::ScreenAudioAddCapabilities {} => {
+                Ok(Response::ScreenAudioAddCapabilities { screen_audio_add: true })
+            }
+            Request::ScreenAudioAdd { share, sdp } => return self.screen_audio_add(session, id, share, sdp),
+            Request::ScreenAudioResume { share } => self.screen_audio_resume(session, &share),
             Request::ScreenFocus { share } => self.screen_focus(session, &share),
             Request::ScreenDecodeFailed { share, slot, run, generation } => {
                 self.screen_decode_failed(session, &share, slot, run, generation)

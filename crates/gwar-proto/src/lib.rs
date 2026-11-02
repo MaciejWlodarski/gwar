@@ -315,6 +315,16 @@ wire! {
         /// Audio availability for one share; `stopped` is only accepted from its publisher.
         #[serde(rename = "screen.audio.state")]
         ScreenAudioState { share: String, #[serde(default)] stopped: bool },
+        /// Whether sound can join a running share. Unknown on older servers.
+        #[serde(rename = "screen.audio.add.capabilities")]
+        ScreenAudioAddCapabilities {},
+        /// Adds sound to my running share: the offer is the same transport with the one Opus
+        /// m-line added, so nothing about its picture restarts. Answered with `ScreenAnswer`.
+        #[serde(rename = "screen.audio.add")]
+        ScreenAudioAdd { share: String, sdp: String },
+        /// Brings back sound I stopped, on the m-line my share already negotiated.
+        #[serde(rename = "screen.audio.resume")]
+        ScreenAudioResume { share: String },
         /// The share on the viewer's stage: it gets first claim on the viewer's bandwidth.
         #[serde(rename = "screen.focus")]
         ScreenFocus { share: String },
@@ -639,6 +649,7 @@ wire! {
         ScreenSpecCapabilities { screen_spec: bool },
         ScreenAv1Capabilities { screen_av1: bool },
         ScreenAudioCapabilities { screen_audio: bool },
+        ScreenAudioAddCapabilities { screen_audio_add: bool },
         ScreenAudioState { audio: bool },
         /// `screen.publish.offer`, `screen.watch.offer`: the SDP answer.
         ScreenAnswer { sdp: String },

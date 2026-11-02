@@ -25,7 +25,8 @@ beforeEach(() => {
   toast.mockReset();
   useUi.setState({ toast });
   vi.stubGlobal("RTCPeerConnection", class {});
-  vi.stubGlobal("window", { isSecureContext: true });
+  vi.stubGlobal("window", { isSecureContext: true, addEventListener: vi.fn() });
+  vi.stubGlobal("document", { addEventListener: vi.fn() });
   vi.stubGlobal("navigator", { mediaDevices: { getDisplayMedia } });
 });
 afterEach(() => { vi.unstubAllGlobals(); });

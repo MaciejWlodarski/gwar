@@ -52,6 +52,12 @@ describe("bounded server frames", () => {
     expect(responseFor("screen.audio.capabilities", { screen_audio: "true" })).toBe(false);
     expect(responseFor("screen.audio.state", { audio: false })).toBe(true);
     expect(responseFor("screen.audio.state", { audio: "false" })).toBe(false);
+    expect(responseFor("screen.audio.add.capabilities", { screen_audio_add: true })).toBe(true);
+    expect(responseFor("screen.audio.add.capabilities", { screen_audio_add: "true" })).toBe(false);
+    expect(responseFor("screen.audio.resume", { audio: true })).toBe(true);
+    expect(responseFor("screen.audio.resume", { audio: "true" })).toBe(false);
+    expect(responseFor("screen.audio.add", { sdp: "v=0" })).toBe(true);
+    expect(responseFor("screen.audio.add", {})).toBe(false);
     expect(responseFor("screen.spec.capabilities", { screen_spec: true, extra: 1 })).toBe(false);
     // Old clients' capability shape is unchanged.
     expect(responseFor("screen.capabilities", { screen_h264: true, screen_spec: true })).toBe(false);

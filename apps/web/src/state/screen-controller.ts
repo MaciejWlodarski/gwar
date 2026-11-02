@@ -18,9 +18,9 @@ import { channelPermissions } from "../lib/channel-permissions";
 import type { Event } from "../proto/Event";
 import type { ScreenStopReason } from "../proto/ScreenStopReason";
 import { nextMediaRun } from "../voice/engine";
-import { applyCaptureSpec, captureScreen, captureSupport, probeAv1Encoder, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PublishStats, type SlotStats, type EncoderFallbacks } from "../voice/screen";
+import { applyCaptureSpec, captureScreen, captureSupport, captureTabSound, probeAv1Encoder, ScreenPublisher, ScreenWatchTransport, SCREEN_SLOTS, surfaceOf, type PublishStats, type SlotStats, type EncoderFallbacks } from "../voice/screen";
 import { defaultShareAudio } from "../voice/share-audio";
-import { computerSoundSupport, ComputerSound, shareSoundReceivable, ShareSoundReceiver, type ShareSoundLink } from "../voice/share-sound";
+import { computerSoundSupport, ComputerSound, shareSoundReceivable, ShareSoundReceiver, type ComputerSoundState, type ShareSoundLink } from "../voice/share-sound";
 import { myChannelId } from "./reducer";
 import { useScreen, type ScreenAction } from "./screen";
 import { useSession, useUi } from "./stores";
@@ -42,6 +42,13 @@ const FIRST_FRAME_TIMEOUT_MS = 35_000;
 const RETRY_SPACING_MS = 15_000;
 /** remove() emits a final move update before client.left; allow that ordered sequence to settle. */
 const DEPARTURE_SETTLE_MS = 150;
+/** Sound that would not start is tried again this long after each try, then left to a click. */
+const SOUND_RETRY_MS = [5_000, 15_000, 45_000];
+/** How often the system's permission is asked after, while the sharer waits for it. */
+const SOUND_PERMISSION_MS = 5_000;
+/** Coming back to the app tries sound at most this often. */
+const SOUND_REFOCUS_MS = 3_000;
+const SOUND_NEGOTIATION_MS = 10_000;
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -119,6 +126,19 @@ export class ScreenController {
   private watchAudio = false;
   /** Desktop app: this share's computer sound, from the sharer's confirmation until it ends. */
   private sound: ComputerSound | null = null;
+  /**
+   * The attempt whose sharer asked for sound that has not come up yet. Only this may start
+   * without a click: the ask still stands, and nothing was ever captured under it. A stream that
+   * came up and ended, by the sharer or by the OS, clears it for good.
+   */
+  private soundWanted: number | null = null;
+  private soundTimer: ReturnType<typeof setTimeout> | null = null;
+  private soundTries = 0;
+  private soundTriedAt = 0;
+  /** A tab's sound chosen during the share: it has its own source, whatever the picture shows. */
+  private tabSoundAdded = false;
+  /** Picked sound on its way into the share: no stream holds it yet, so nothing else stops it. */
+  private pendingSound = new Set<MediaStreamTrack>();
   /** Desktop app: where the watch transport's sound goes instead of the webview's decoder. */
   private receiver: ShareSoundReceiver | null = null;
   private audioTimer: ReturnType<typeof setInterval> | null = null;
@@ -174,6 +194,11 @@ export class ScreenController {
     if (this.initialised) return;
     this.initialised = true;
     if (isDesktop()) void loadDesktopCapture();
+    // Back from System Settings, or from anything else that held the sound up.
+    if (typeof window !== "undefined") {
+      window.addEventListener("focus", () => this.soundCauseMayHaveCleared());
+      document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") this.soundCauseMayHaveCleared(); });
+    }
     useScreen.subscribe((s) => { if (s.own?.phase === "live") useUi.getState().dismissToast("screen-stopped"); });
     useSession.subscribe((s, prev) => {
       const own = useScreen.getState().own;
@@ -342,7 +367,10 @@ export class ScreenController {
     if (recovering && track.readyState === "ended") { this.recoveryFailed(); return; }
     const { attempt, spec, surface } = own;
     // Consent is this click, and only its own task can start an AudioContext.
-    if (own.phase === "choosing" && own.computerSound === "ok" && useSettings.getState().shareComputerSound) this.prepareSound(attempt);
+    if (own.phase === "choosing" && own.computerSound === "ok" && useSettings.getState().shareComputerSound) {
+      this.prepareSound(attempt);
+      this.soundWanted = attempt;
+    }
     // Only what the sharer saw and confirmed: the notice and the checkbox were in the quality menu.
     const guestLink = own.guestLink && this.guestLinkPossible();
     const generation = this.generation;
@@ -375,8 +403,12 @@ export class ScreenController {
       } else if (this.sound) {
         const sound = await this.sound.start();
         if (!current()) return;
-        if (typeof sound === "string") { this.endSound(); dispatch({ type: "computerSound", attempt, state: sound }); }
-        else if (!own.stream?.getTracks().includes(sound)) own.stream?.addTrack(sound);
+        if (typeof sound === "string") this.soundRefused(attempt, sound);
+        else {
+          this.soundCameUp();
+          dispatch({ type: "computerSound", attempt, state: "ok" });
+          if (!own.stream?.getTracks().includes(sound)) own.stream?.addTrack(sound);
+        }
       }
       dispatch({ type: "audio", attempt, server: screenAudio, sharing: screenAudio && own.stream?.getAudioTracks().some(t => t.readyState === "live") === true });
       await applyCaptureSpec(track, spec, !screenSpec);
@@ -390,6 +422,14 @@ export class ScreenController {
     }
     if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
     dispatch({ type: "started", attempt, share });
+    void (screenAudio ? conn.request("screen.audio.add.capabilities", {}, { timeoutMs: WATCH_FEATURE_TIMEOUT_MS }) : Promise.reject(new Error("no share sound")))
+      .then(features => features.screen_audio_add === true).catch(() => false)
+      .then(addable => {
+        if (!current()) return;
+        dispatch({ type: "soundAddable", attempt, addable });
+        // An ask left standing would have nothing to come back through.
+        if (!addable) this.soundCameUp();
+      });
     // Quality may have changed while `screen.start` ran: the publisher starts with the latest,
     // and a later change reaches it through `setSpec`.
     const latest = () => useScreen.getState().own?.spec ?? spec;
@@ -402,8 +442,8 @@ export class ScreenController {
     if (!current()) { void conn.request("screen.stop", { share }).catch(() => {}); return; }
     const publisher = new ScreenPublisher({
       uplink: screen => { if (current() && this.publisher === publisher) useUplink.setState({ screen }); },
-      audio: screenAudio ? own.stream?.getAudioTracks()[0] : undefined,
-      nativeAudio: this.sound !== null,
+      audio: screenAudio ? own.stream?.getAudioTracks().find(t => t.readyState === "live") : undefined,
+      nativeAudio: this.sound !== null || this.tabSoundAdded,
       audioState: sharing => {
         if (!current()) return;
         dispatch({ type: "audio", attempt, sharing });
@@ -459,6 +499,7 @@ export class ScreenController {
     try {
       this.sound = new ComputerSound(this.soundLink, state => {
         this.sound = null;
+        this.soundCameUp();
         dispatch({ type: "computerSound", attempt, state });
         dispatch({ type: "audio", attempt, sharing: false });
       }, resuming => dispatch({ type: "computerSound", attempt, state: resuming ? "resuming" : "ok" }));
@@ -470,14 +511,195 @@ export class ScreenController {
 
   /** Puts Gwar on the OS list as well: until first asked, it is not there to turn on. */
   async allowComputerSound(): Promise<void> {
+    const own = useScreen.getState().own;
+    // In a running share this click is the ask: sound comes as soon as the system lets it.
+    if (own?.phase === "live" && own.soundAddable !== false) {
+      this.prepareSound(own.attempt);
+      if (this.sound) this.soundWanted = own.attempt;
+    }
     const link = await this.soundLink();
     await link?.api.invoke("share_capture_allow");
     await openScreenRecordingSettings();
+    if (own?.phase === "live" && this.soundWanted === own.attempt) this.retrySoundAfter(own.attempt, "permission");
   }
 
   private endSound(): void {
+    this.soundCameUp();
     this.sound?.stop();
     this.sound = null;
+  }
+
+  /** Nothing more to wait for: it came up, or the ask ended with it. */
+  private soundCameUp(): void {
+    this.soundWanted = null;
+    this.soundTries = 0;
+    if (this.soundTimer) clearTimeout(this.soundTimer);
+    this.soundTimer = null;
+  }
+
+  /** The system said no. Whatever it said is shown; the ask stands if the answer can change. */
+  private soundRefused(attempt: number, state: ComputerSoundState): void {
+    dispatch({ type: "computerSound", attempt, state });
+    if (state === "permission" || state === "failed") this.retrySoundAfter(attempt, state);
+    else this.endSound();
+  }
+
+  private retrySoundAfter(attempt: number, state: ComputerSoundState): void {
+    if (this.soundWanted !== attempt) return;
+    if (this.soundTimer) clearTimeout(this.soundTimer);
+    this.soundTimer = null;
+    const wait = state === "permission" ? SOUND_PERMISSION_MS : SOUND_RETRY_MS[this.soundTries++];
+    // Out of tries: the status stays, and so does the button for the next ask.
+    if (wait === undefined) { this.endSound(); return; }
+    this.soundTimer = setTimeout(() => {
+      this.soundTimer = null;
+      void this.retrySound(attempt, state);
+    }, wait);
+  }
+
+  private async retrySound(attempt: number, state: ComputerSoundState): Promise<void> {
+    const own = useScreen.getState().own;
+    if (own?.attempt !== attempt || this.soundWanted !== attempt) return;
+    // A reconnect brings the publisher back; its own start already tried this sound. A server
+    // that has not said it takes sound into a running share is not asked to.
+    const waiting = own.phase !== "live" || !this.publisher || own.soundAddable !== true || (state === "permission" && await this.soundSupport() !== "ok");
+    if (this.soundWanted !== attempt) return;
+    if (waiting) { this.retrySoundAfter(attempt, "permission"); return; }
+    await this.bringSoundBack(attempt);
+  }
+
+  private async soundSupport(): Promise<ComputerSoundState> {
+    const link = this.soundLink();
+    return link ? link.then(computerSoundSupport, () => "unsupported" as const) : "unsupported";
+  }
+
+  /**
+   * The window came back. A quality menu that was waiting for the permission can offer sound now,
+   * and an ask that still stands tries the real capture: the permission check can stay out of
+   * date until a relaunch while the capture itself already works.
+   */
+  private soundCauseMayHaveCleared(): void {
+    const own = useScreen.getState().own;
+    if (!own) return;
+    if (own.phase === "choosing" && own.computerSound === "permission") {
+      void this.soundSupport().then(state => { if (state === "ok") dispatch({ type: "computerSound", attempt: own.attempt, state }); });
+    }
+    if (this.soundWanted !== own.attempt || own.phase !== "live" || own.audio || own.soundAddable !== true || Date.now() - this.soundTriedAt < SOUND_REFOCUS_MS) return;
+    void this.bringSoundBack(own.attempt);
+  }
+
+  /** Details' and the bar's "Turn on sound". Ends with why not, if it did not come. */
+  async turnOnSound(): Promise<ComputerSoundState | "ok" | null> {
+    const own = useScreen.getState().own;
+    if (own?.phase !== "live" || own.audio || own.soundAdding) return null;
+    if (!this.usesNativeSound()) return this.addTabSound(own.attempt);
+    // The click's own task, for the context. A new ask, whatever became of the last one.
+    this.prepareSound(own.attempt);
+    if (!this.sound) return "failed";
+    this.soundCameUp();
+    this.soundWanted = own.attempt;
+    return this.bringSoundBack(own.attempt);
+  }
+
+  private async addTabSound(attempt: number): Promise<ComputerSoundState | "ok" | null> {
+    // Runs up to the picker in this click's task, as the browser requires.
+    const picked = captureTabSound();
+    const current = () => useScreen.getState().own?.attempt === attempt;
+    dispatch({ type: "soundAdding", attempt, adding: true });
+    let track: MediaStreamTrack | null;
+    try { track = await picked; }
+    catch (e) {
+      // Closing the picker is an answer, not a failure.
+      console.warn("[screen] tab sound:", e);
+      dispatch({ type: "soundAdding", attempt, adding: false });
+      return null;
+    }
+    if (!current()) { track?.stop(); return null; }
+    if (!track) {
+      dispatch({ type: "soundAdding", attempt, adding: false });
+      useUi.getState().toast("info", tNow("screen.audioUnavailable"));
+      return null;
+    }
+    this.pendingSound.add(track);
+    track.addEventListener("ended", () => dispatch({ type: "audio", attempt, sharing: false }));
+    try {
+      if (!this.publisher) throw new Error("the share has no transport");
+      await this.attachSound(track, this.publisher);
+      this.tabSoundAdded = true;
+      return "ok";
+    } catch (e) {
+      console.warn("[screen] tab sound:", e);
+      track.stop();
+      if (!current()) return null;
+      dispatch({ type: "audio", attempt, sharing: false });
+      useUi.getState().toast("error", tNow("screen.soundFailed"));
+      return "failed";
+    } finally {
+      this.pendingSound.delete(track);
+      dispatch({ type: "soundAdding", attempt, adding: false });
+    }
+  }
+
+  /** Starts the capture that was asked for and adds it to the running share. */
+  private async bringSoundBack(attempt: number): Promise<ComputerSoundState | "ok" | null> {
+    const sound = this.sound;
+    if (!sound || useScreen.getState().own?.soundAdding) return null;
+    const publisher = this.publisher;
+    this.soundTriedAt = Date.now();
+    if (this.soundTimer) clearTimeout(this.soundTimer);
+    this.soundTimer = null;
+    // Nothing to add to yet: the ask waits for the publisher that is on its way.
+    if (!publisher) { this.retrySoundAfter(attempt, "permission"); return null; }
+    const current = () => useScreen.getState().own?.attempt === attempt && this.sound === sound;
+    dispatch({ type: "soundAdding", attempt, adding: true });
+    let track: MediaStreamTrack | ComputerSoundState | null = null;
+    try {
+      track = await sound.start();
+      if (!current()) return null;
+      if (this.publisher !== publisher) return this.soundOutlivedPublisher(attempt, track);
+      if (typeof track === "string") { this.soundRefused(attempt, track); return track; }
+      await this.attachSound(track, publisher);
+      if (!current()) return null;
+      this.soundCameUp();
+      dispatch({ type: "computerSound", attempt, state: "ok" });
+      return "ok";
+    } catch (e) {
+      console.warn("[share sound] add:", e);
+      if (!current()) return null;
+      if (this.publisher !== publisher) return this.soundOutlivedPublisher(attempt, track);
+      // The capture came up, so this ask is spent; the picture never noticed.
+      this.endSound();
+      dispatch({ type: "computerSound", attempt, state: "failed" });
+      useUi.getState().toast("error", tNow("screen.soundFailed"));
+      return "failed";
+    } finally { dispatch({ type: "soundAdding", attempt, adding: false }); }
+  }
+
+  /**
+   * A recovery replaced the publisher this add was for. The capture belongs to the share, and the
+   * recovery takes it up by itself, so nothing here may stop it or speak for it. An ask the
+   * recovery has not answered waits for the new publisher, without using up its tries.
+   */
+  private soundOutlivedPublisher(attempt: number, track: MediaStreamTrack | ComputerSoundState | null): "ok" | null {
+    const stream = useScreen.getState().own?.stream;
+    if (track && typeof track !== "string" && stream?.getTracks().includes(track)) return "ok";
+    this.retrySoundAfter(attempt, "permission");
+    return null;
+  }
+
+  private async attachSound(track: MediaStreamTrack, publisher: ScreenPublisher): Promise<void> {
+    const own = useScreen.getState().own;
+    const conn = this.link();
+    const share = own?.share;
+    if (!own || !share || !conn) throw new Error("the share has no transport");
+    await publisher.addAudio(track, {
+      renegotiate: async sdp => (await conn.request("screen.audio.add", { share, sdp }, { timeoutMs: SOUND_NEGOTIATION_MS })).sdp,
+      resume: async () => { await conn.request("screen.audio.resume", { share }); },
+    });
+    const after = useScreen.getState().own;
+    if (after?.attempt !== own.attempt || after.share !== share || this.publisher !== publisher) throw new Error("the share moved on while its sound came up");
+    for (const old of own.stream?.getAudioTracks() ?? []) if (old !== track && old.readyState !== "live") own.stream?.removeTrack(old);
+    if (!own.stream?.getTracks().includes(track)) own.stream?.addTrack(track);
   }
 
   /** Details' "stop sharing sound": takes the consent back. The picture goes on. */
@@ -493,6 +715,8 @@ export class ScreenController {
   private endOwn(): void {
     useUplink.setState({ screen: null });
     this.endSound();
+    for (const track of this.pendingSound) track.stop();
+    this.pendingSound.clear();
     const own = useScreen.getState().own;
     const publisher = this.publisher;
     this.publisher = null;
@@ -504,6 +728,7 @@ export class ScreenController {
     this.encoderFallbacks = undefined;
     this.retainedCapture = false;
     this.lostPublisherShare = null;
+    this.tabSoundAdded = false;
     if (!own) return;
     stopStream(own.stream);
     dispatch({ type: "ownEnded", attempt: own.attempt });

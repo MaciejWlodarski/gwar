@@ -111,6 +111,69 @@ impl Core {
         Ok(Response::ScreenAudioState { audio: share.origin.has_audio.load(std::sync::atomic::Ordering::Relaxed) })
     }
 
+    /// The share of `session` whose publish transport is up, for sound joining it later.
+    fn running_publish(&self, session: SessionId, id: &str) -> Result<&Share, ErrorBody> {
+        let share = self.visible_share(session, id)?;
+        if share.sharer != session {
+            return Err(err(ErrorCode::Forbidden, "this is not your share"));
+        }
+        if share.publish.as_ref().is_none_or(|p| p.answer.is_none()) {
+            return Err(err(ErrorCode::Conflict, "the share is not negotiated yet"));
+        }
+        if self.is_encrypted(share.channel) {
+            return Err(err(ErrorCode::Unavailable, "screen sharing in encrypted channels is not available yet"));
+        }
+        Ok(share)
+    }
+
+    /// Renegotiates a running share's transport with its Opus m-line. Whatever goes wrong here
+    /// leaves the picture alone: unlike a share's first offer, a refusal does not end the share.
+    pub(super) fn screen_audio_add(
+        &mut self,
+        session: SessionId,
+        id: u32,
+        share: String,
+        sdp: String,
+    ) -> Option<Reply> {
+        let checked = (|| {
+            let running = self.running_publish(session, &share)?;
+            if sdp.len() > SDP_LIMIT {
+                return Err(err(ErrorCode::TooLarge, "SDP too large"));
+            }
+            let offer = &running.publish.as_ref().expect("checked above").offer;
+            if publish_ssrcs(&sdp) != Some((offer.ssrc, offer.rtx_ssrc)) {
+                return Err(bad("the offer must keep the share's video stream"));
+            }
+            Ok(())
+        })();
+        if let Err(e) = checked.and_then(|()| self.take_offer(session, OfferKind::Publish)) {
+            return Some(Err(e));
+        }
+        let Ok(permit) = self.screen.clone().try_reserve_owned() else {
+            return Some(Err(err(ErrorCode::Unavailable, "screen engine busy")));
+        };
+        let (reply, rx) = oneshot::channel();
+        permit.send(ScreenCmd::AddAudio { share, sdp, reply });
+        let tx = self.me.upgrade()?;
+        tokio::spawn(async move {
+            let answer = negotiated(rx).await;
+            let resume = move |core: &mut Core| {
+                core.reply(session, id, answer.map(|sdp| Response::ScreenAnswer { sdp }).map_err(bad));
+            };
+            let _ = tx.send(CoreMsg::Resume(Box::new(resume))).await;
+        });
+        None
+    }
+
+    /// Sound the sharer stopped, back on the m-line it already has.
+    pub(super) fn screen_audio_resume(&self, session: SessionId, id: &str) -> Reply {
+        let origin = &self.running_publish(session, id)?.origin;
+        if !origin.resume_audio() {
+            return Err(err(ErrorCode::Conflict, "this share has no sound to resume"));
+        }
+        Ok(Response::ScreenAudioState { audio: true })
+    }
+
     fn share_view(&self, id: &str) -> ScreenShare {
         let s = &self.shares[id];
         ScreenShare {

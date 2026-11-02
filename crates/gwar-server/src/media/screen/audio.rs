@@ -43,7 +43,9 @@ pub(super) struct Publisher {
 }
 
 impl Publisher {
-    pub fn from_sdp(rtc: &mut Rtc, sdp: &str, now: Instant) -> Result<Option<Self>, &'static str> {
+    /// The offer's one sound stream, if it has one. Read from the text, so a running transport
+    /// can refuse a bad offer before anything about it changes.
+    pub fn offered(sdp: &str) -> Result<Option<Ssrc>, &'static str> {
         let sections = sections(sdp);
         let audio: Vec<_> = sections.iter().filter(|s| s[0].starts_with("m=audio ")).collect();
         let Some(lines) = audio.first() else { return Ok(None) };
@@ -55,7 +57,11 @@ impl Publisher {
         if ssrcs.len() != 1 || ssrcs.contains(&0) {
             return Err("screen audio must name one SSRC");
         }
-        let ssrc = Ssrc::from(*ssrcs.iter().next().unwrap());
+        Ok(Some(Ssrc::from(*ssrcs.iter().next().unwrap())))
+    }
+
+    pub fn from_sdp(rtc: &mut Rtc, sdp: &str, now: Instant) -> Result<Option<Self>, &'static str> {
+        let Some(ssrc) = Self::offered(sdp)? else { return Ok(None) };
         let mid = rtc.direct_api().stream_rx(&ssrc).map(|s| s.mid()).ok_or("audio SSRC not negotiated")?;
         if rtc.media(mid).is_none_or(|m| m.kind() != MediaKind::Audio || !m.direction().is_receiving()) {
             return Err("audio not negotiated");
