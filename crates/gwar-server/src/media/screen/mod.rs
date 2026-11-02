@@ -176,6 +176,8 @@ pub struct ScreenOrigin {
     pub cap_bps: u64,
     alive: AtomicBool,
     pub(crate) has_audio: AtomicBool,
+    /// How many times the publisher resumed sound it had stopped (`audio::SoundTime`).
+    audio_resumes: AtomicU64,
     /// The publish transport carries an Opus m-line, whether or not sound flows on it now.
     audio_negotiated: AtomicBool,
     recovery: std::sync::Mutex<recovery::Recovery>,
@@ -202,6 +204,7 @@ impl ScreenOrigin {
             cap_bps,
             alive: AtomicBool::new(true),
             has_audio: AtomicBool::new(false),
+            audio_resumes: AtomicU64::new(0),
             audio_negotiated: AtomicBool::new(false),
             recovery: Default::default(),
             start_bps: AtomicU64::new(0),
@@ -230,7 +233,8 @@ impl ScreenOrigin {
     pub fn resume_audio(&self) -> bool {
         let negotiated = self.audio_negotiated.load(Ordering::Relaxed);
         if negotiated {
-            self.has_audio.store(true, Ordering::Relaxed);
+            self.audio_resumes.fetch_add(1, Ordering::Relaxed);
+            self.has_audio.store(true, Ordering::Release);
         }
         negotiated
     }
@@ -1867,13 +1871,17 @@ impl Sfu {
                         if !p.origin.alive() {
                             continue;
                         }
-                        if p.origin.has_audio.load(Ordering::Relaxed)
+                        // Acquire: a resume's count is in place before its sound is let through.
+                        if p.origin.has_audio.load(Ordering::Acquire)
                             && let Some(audio) = p.audio.as_mut()
                             && audio.accepts(&packet, now)
                         {
-                            let wallclock =
-                                p.clock.map(packet.header.timestamp, packet.timestamp, packet.last_sender_info, 48_000);
-                            sounds.push((packet, wallclock));
+                            let report = packet.last_sender_info;
+                            let resumes = p.origin.audio_resumes.load(Ordering::Relaxed);
+                            let (rtp, placed) =
+                                audio.time.place(packet.header.timestamp, packet.timestamp, report.as_ref(), resumes);
+                            let wallclock = p.clock.map(placed, packet.timestamp, report, 48_000);
+                            sounds.push((packet, rtp, wallclock));
                             continue;
                         }
                         if packet.header.ssrc != p.ssrc {
@@ -1971,7 +1979,7 @@ impl Sfu {
         self.schedule_publisher(share);
         self.forward_packets(share, &origin, forwards, now);
         if !origin.recovery.lock().expect("recovery lock").pending {
-            for (packet, wallclock) in sounds {
+            for (packet, rtp, wallclock) in sounds {
                 let slots = self.slots_of(share);
                 for (session, index) in slots {
                     let Some(w) = self.watchers.get_mut(&session) else { continue };
@@ -1983,7 +1991,7 @@ impl Sfu {
                     }
                     audio::reserve(w, now);
                     if let Some(audio) = w.audio.get_mut(index) {
-                        audio.queue(&packet, publication, wallclock);
+                        audio.queue(&packet, rtp, publication, wallclock);
                     }
                     self.flush_watcher(session);
                 }
