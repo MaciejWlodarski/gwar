@@ -2226,8 +2226,9 @@ mod tests {
                 while resumes(&sim, 0) == resumed {
                     run_judged(&mut sim, MS, &mut judged);
                 }
+                // A retry also waits for the probe credit, a few ticks at most.
                 let gap = sim.now - MS - sim.start - carried.at;
-                assert!(gap >= RETRY_FIRST && gap <= RETRY_FIRST + 2 * ALLOCATION_TICK, "{gap:?}: {context}");
+                assert!(gap >= RETRY_FIRST && gap <= RETRY_FIRST + SECOND, "{gap:?}: {context}");
                 let start = carried.attempt.unwrap().start;
                 let step = ((RETRY_STEP * carried_step(carried.sent, start) as f64) as u64).max(INITIAL_ESTIMATE);
                 assert_eq!(sim.w.attempt, Some(Attempt { slot: 0, start: step, counted: true }), "{context}");

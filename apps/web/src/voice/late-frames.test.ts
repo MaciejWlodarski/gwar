@@ -45,6 +45,15 @@ describe("LateFrames", () => {
     expect(feed(late, 160, 30, 6_000).every(v => v.keep)).toBe(true);
   });
 
+  it("leaves a queue alone: frames that only run late never stopped arriving", () => {
+    const late = new LateFrames("video");
+    feed(late, 0, 100, 0);
+    // Frames keep coming, 40 ms apart for 33 ms of media, so the picture falls behind as a queue does.
+    const queued = [];
+    for (let n = 100; n < 220; n++) queued.push(late.see(n * 2970, 3_300 + (n - 100) * 40, false));
+    expect(queued.every(v => v.keep && !v.back)).toBe(true);
+  });
+
   it("takes a slot that carries something else as a new start", () => {
     const late = new LateFrames("video");
     feed(late, 0, 100, 0);

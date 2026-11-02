@@ -34,8 +34,11 @@ const SOUND_DEADBAND_MS = 25;
 const SOUND_STEP_MS = 10;
 const MAX_SOUND_WAIT_MS = 400;
 const MAX_STEP_MS = 40;
-/** The first seconds of a watch are its keyframe and its buffers settling, not its lip-sync. */
-const SETTLING_LOOKS = 2;
+/**
+ * The first seconds of a watch are its keyframes and its buffers settling, not its lip-sync, and
+ * the engine's own sync gets there by itself: a wait raised in them only made the start later.
+ */
+export const SETTLING_LOOKS = 10;
 /** Looks after a break: the backlog lands in the first, and the others may move the whole way, once. */
 const BREAK_LOOKS = 4;
 /** A gap smaller than this after a break is not worth the one move: sound may still land. */

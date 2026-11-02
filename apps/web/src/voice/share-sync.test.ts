@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { RequestError } from "../net/connection";
-import { MAX_WAIT_MS, nextWaits, PictureSync, SOUND_AIM_MS, soundLagMs, type PictureSyncLink, type SyncSlot, type Waits } from "./share-sync";
+import { MAX_WAIT_MS, nextWaits, PictureSync, SETTLING_LOOKS, SOUND_AIM_MS, soundLagMs, type PictureSyncLink, type SyncSlot, type Waits } from "./share-sync";
 
 const association = { known: true, audio_rtp: 48_000, video_rtp: 90_000 };
 /** A picture and a sound of the same instant of the share, `lag` ms apart at the output. */
@@ -104,9 +104,15 @@ function fixture(lag = 80) {
 const slot: SyncSlot = { share: "A", slot: 1, heard: true, paused: false };
 const at = (picture: number) => [1, { picture, sound: 0 }];
 /** Past the seconds a watch settles in. */
-const settle = async (sync: PictureSync, slots: SyncSlot[] = [slot]) => { await sync.tick(slots); await sync.tick(slots); };
+const settle = async (sync: PictureSync, slots: SyncSlot[] = [slot]) => { for (let i = 0; i < SETTLING_LOOKS; i++) await sync.tick(slots); };
 
 describe("PictureSync", () => {
+  it("waits for nothing while a watch settles", async () => {
+    const { sync, waits } = fixture(300);
+    for (let look = 0; look < 8; look++) await sync.tick([slot]);
+    expect(waits).toEqual([]);
+  });
+
   it("moves the whole way once after a break has settled, then gently again", async () => {
     const { waits, sync, link } = fixture(30);
     await settle(sync);

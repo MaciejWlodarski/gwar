@@ -13,6 +13,8 @@ const KINDS: Record<MediaKind, { ticks: number; lateMs: number }> = {
   video: { ticks: 90, lateMs: 500 },
   audio: { ticks: 48, lateMs: 200 },
 };
+/** A stall stops arrivals first. Frames late without that are a queue, which the receiver can drain. */
+const STALL_GAP_MS = 200;
 /** The quickest frame is remembered this long, over two windows. */
 const WINDOW_MS = 5_000;
 /** A link that stays this slow is the link now: its frames play, and it sets the new measure. */
@@ -43,6 +45,7 @@ export class LateFrames {
   private before = Infinity;
   private windowEnds = 0;
   private shedSince: number | null = null;
+  private arrived: number | null = null;
 
   constructor(kind: MediaKind) { ({ ticks: this.ticks, lateMs: this.lateMs } = KINDS[kind]); }
 
@@ -53,7 +56,9 @@ export class LateFrames {
     const transit = now - this.media;
     if (this.transit !== null && Math.abs(transit - this.transit) > NEW_TIMELINE_MS) this.restart();
     this.transit = transit;
-    if (transit - Math.min(this.quickest, this.before) > this.lateMs) {
+    const stopped = this.arrived !== null && now - this.arrived >= STALL_GAP_MS;
+    this.arrived = now;
+    if (transit - Math.min(this.quickest, this.before) > this.lateMs && (stopped || this.shedSince !== null)) {
       const back = this.shedSince === null;
       this.shedSince ??= now;
       if (now - this.shedSince < MAX_SHED_MS) return { keep: key, back };
