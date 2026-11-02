@@ -47,6 +47,8 @@ export type Request =
   | { type: "reset" }
   /** Retire an owner's input and all buffered output before reusing the warmed processor. */
   | { type: "clear" }
+  /** Confirm a real render quantum after a parked context resumes. */
+  | { type: "wake"; token: number }
   /** Percent, 10..100. */
   | { type: "strength"; strength: number };
 
@@ -54,6 +56,7 @@ export type Report =
   /** The model is in place: the page makes the output and connects the node, whose warm-up then starts. */
   | { type: "loaded" }
   | { type: "cleared" }
+  | { type: "awake"; token: number }
   | { type: "ready" }
   | { type: "failed"; reason: string }
   /** Too slow for this machine. */

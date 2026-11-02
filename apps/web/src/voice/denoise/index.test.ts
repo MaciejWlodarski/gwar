@@ -127,7 +127,17 @@ describe("loading the model", () => {
     expect(pipeline.running).toBe(false);
     const retired = pipeline.track;
     expect(tracks[0]!.stop).toHaveBeenCalledOnce();
-    await pipeline.wake();
+    const waking = pipeline.wake();
+    await tick();
+    const wake = posted.at(-1)!;
+    expect(wake.type).toBe("wake");
+    if (wake.type !== "wake") throw new Error("no render-clock request");
+    let awake = false;
+    void waking.then(() => { awake = true; });
+    report({ type: "awake", token: wake.token - 1 });
+    await tick(); expect(awake).toBe(false);
+    report({ type: "awake", token: wake.token });
+    await waking;
     expect(pipeline.track).not.toBe(retired);
     expect(pipeline.running).toBe(true);
     expect(outputs).toHaveBeenCalledTimes(2);

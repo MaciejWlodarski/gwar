@@ -11,7 +11,7 @@ async function processor() {
   vi.resetModules();
   const reports: Report[] = [];
   let Registered!: new () => Processor;
-  vi.stubGlobal("AudioWorkletProcessor", class { port = { onmessage: null, postMessage: (report: Report) => reports.push(report) }; });
+  vi.stubGlobal("AudioWorkletProcessor", class { port = { onmessage: null, postMessage: (report: Report) => reports.push(structuredClone(report)) }; });
   vi.stubGlobal("registerProcessor", (_name: string, ctor: new () => Processor) => { Registered = ctor; });
   vi.stubGlobal("currentTime", 0);
   await import("./worklet");
@@ -53,5 +53,19 @@ describe("worklet warm-up and ownership boundaries", () => {
       node.process([[]], output);
       expect(output[0]![0]!.every(sample => sample === 0)).toBe(true);
     }
+  });
+
+  it("acknowledges the newest wake only after rendering, and clearing retires a pending wake", async () => {
+    const { node, reports } = await processor();
+    node.port.onmessage({ data: { type: "wake", token: 1 } });
+    node.port.onmessage({ data: { type: "wake", token: 2 } });
+    expect(reports).toEqual([]);
+    const output = [[new Float32Array(QUANTUM)]];
+    node.process([[]], output);
+    expect(reports).toEqual([{ type: "awake", token: 2 }]);
+    node.port.onmessage({ data: { type: "wake", token: 3 } });
+    node.port.onmessage({ data: { type: "clear" } });
+    node.process([[]], output);
+    expect(reports).toEqual([{ type: "awake", token: 2 }, { type: "cleared" }]);
   });
 });

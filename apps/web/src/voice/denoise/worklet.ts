@@ -47,6 +47,8 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   /** The model starts over before the next frame: a gap in what it was given. */
   private fresh = true;
   private failed = false;
+  private wakeToken: number | null = null;
+  private awakeReport = { type: "awake" as const, token: 0 };
   /** The ms the model took on a frame in this render quantum, if it ran. */
   private frameMs: number | null = null;
   private framing = new Framing(frame => this.clean(frame));
@@ -89,10 +91,14 @@ class DenoiseProcessor extends AudioWorkletProcessor {
         this.fresh = true;
         break;
       case "clear":
+        this.wakeToken = null;
         this.active = false;
         this.fresh = true;
         this.framing.clear();
         this.report({ type: "cleared" });
+        break;
+      case "wake":
+        this.wakeToken = request.token;
         break;
       case "strength":
         this.strength = request.strength;
@@ -207,6 +213,11 @@ class DenoiseProcessor extends AudioWorkletProcessor {
     this.frameMs = null;
     const output = outputs[0]?.[0];
     if (output) this.framing.push(inputs[0]?.[0] ?? null, output);
+    if (this.wakeToken !== null) {
+      this.awakeReport.token = this.wakeToken;
+      this.wakeToken = null;
+      this.report(this.awakeReport);
+    }
     if (this.exports && this.warming === 0 && this.active && !this.failed) {
       const slow = this.pace.check(Date.now(), currentTime, this.frameMs);
       if (slow) this.report(slow);

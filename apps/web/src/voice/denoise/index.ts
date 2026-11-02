@@ -40,7 +40,7 @@ export interface PreparedDenoise extends DenoisePipeline {
 const LOAD_TIMEOUT_MS = 30_000;
 
 /** What settles a load. */
-type Outcome = Exclude<Report, { type: "loaded" | "cleared" }>;
+type Outcome = Exclude<Report, { type: "loaded" | "cleared" | "awake" }>;
 
 export const denoisePreparation = new PipelinePool(createDenoise, undefined, () => denoiseModels.dispose());
 export function prepareDenoise(enabled: boolean, online: boolean): void {
@@ -83,10 +83,16 @@ export async function createDenoise(events: DenoiseEvents, signal: AbortSignal):
   let parked: Promise<void> | null = null;
   let resolvePark: (() => void) | null = null;
   let rejectPark: ((error: Error) => void) | null = null;
+  let waking: Promise<void> | null = null;
+  let resolveWake: (() => void) | null = null;
+  let rejectWake: ((error: Error) => void) | null = null;
+  let wakeToken = 0;
   let destination: MediaStreamAudioDestinationNode | null = null;
   const shut = () => {
     rejectPark?.(new Error("the pipeline closed"));
     resolvePark = null; rejectPark = null; parked = null;
+    rejectWake?.(new Error("the pipeline closed"));
+    resolveWake = null; rejectWake = null; waking = null; wakeToken++;
     model!.release();
     channel.port2.close();
     destination?.stream.getAudioTracks().forEach(track => { if (track.readyState !== "ended") track.stop(); });
@@ -125,7 +131,12 @@ export async function createDenoise(events: DenoiseEvents, signal: AbortSignal):
       context.addEventListener("statechange", started);
     });
     const receive = (report: Report) => {
-      if (report.type === "cleared") {
+      if (report.type === "awake") {
+        if (report.token !== wakeToken) return;
+        const resolve = resolveWake;
+        resolveWake = null; rejectWake = null; waking = null;
+        resolve?.();
+      } else if (report.type === "cleared") {
         const resolve = resolvePark;
         resolvePark = null; rejectPark = null; parked = null;
         resolve?.();
@@ -199,6 +210,8 @@ export async function createDenoise(events: DenoiseEvents, signal: AbortSignal):
         post({ type: "strength", strength });
       },
       wake() {
+        if (closed) return Promise.reject(new Error("the pipeline closed"));
+        if (waking) return waking;
         // A fresh stream boundary also discards the browser's own queued output, beyond our
         // acknowledged frame/ring clear. No previous caller's track can affect this output.
         if (!destination) {
@@ -208,10 +221,23 @@ export async function createDenoise(events: DenoiseEvents, signal: AbortSignal):
           track = destination.stream.getAudioTracks()[0]!;
         }
         idle = false;
-        return context.state === "running" ? Promise.resolve() : context.resume();
+        const token = ++wakeToken;
+        const pending = new Promise<void>((resolve, reject) => { resolveWake = resolve; rejectWake = reject; });
+        waking = pending;
+        void Promise.resolve().then(() => context.state === "running" ? undefined : context.resume()).then(() => {
+          if (waking === pending) post({ type: "wake", token });
+        }, error => {
+          if (waking !== pending) return;
+          const reject = rejectWake;
+          resolveWake = null; rejectWake = null; waking = null;
+          reject?.(error);
+        });
+        return pending;
       },
       park() {
         if (parked) return parked;
+        rejectWake?.(new Error("the pipeline was parked"));
+        resolveWake = null; rejectWake = null; waking = null; wakeToken++;
         idle = true;
         active = false;
         track.enabled = false;
