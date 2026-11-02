@@ -47,7 +47,7 @@ test('retains pending and real invalid indicators in their actual states', async
 test('waits for a lifecycle read after the signature check has completed', async () => {
   const page = await browser.newPage();
   try {
-    await page.setContent('<span data-testid="message-verification-qualified">Channel history has not been read yet</span>');
+    await page.setContent('<span data-testid="message-verification-qualified" data-verification-continuity="proven" data-verification-authorization="channel-history-incomplete">Channel history has not been read yet</span>');
     await page.evaluate(() => {
       setTimeout(() => { document.body.innerHTML = 'Verified messages'; }, 160);
     });
@@ -59,10 +59,11 @@ test('keeps persistent invalid or qualified results and leaked labels as failure
   try {
     for (const kind of ['invalid', 'qualified']) {
       await page.setContent(`<span data-testid="message-verification-${kind}">Warning</span>`);
-      assert.deepEqual(await settledVerificationState(page, { timeout: 50 }), { pending: 0, flags: 1, signatureValid: false });
+      assert.deepEqual(await settledVerificationState(page, { timeout: 50 }), { pending: 0, flags: 1, signatureValid: false,
+        indicators: [{ kind: `message-verification-${kind}`, label: null, message: null, continuity: null, authorization: null }] });
     }
     await page.setContent('<span>Signature valid</span>');
-    assert.deepEqual(await settledVerificationState(page, { timeout: 50 }), { pending: 0, flags: 0, signatureValid: true });
+    assert.deepEqual(await settledVerificationState(page, { timeout: 50 }), { pending: 0, flags: 0, signatureValid: true, indicators: [] });
   } finally { await page.close(); }
 });
 
@@ -81,6 +82,24 @@ test('rejects a real warning immediately even if a later render clears it', asyn
         },
       };
       assert.equal((await settledVerificationState(changing, { timeout: 1000 })).flags, 1);
+    }
+  } finally { await page.close(); }
+});
+
+test('a pending channel record cannot defer revoked or unproven results', async () => {
+  const page = await browser.newPage();
+  try {
+    for (const [continuity, authorization] of [['unproven', 'channel-history-incomplete'],
+      ['proven', 'channel-history-incomplete device-revoked'], ['storage-unavailable', 'channel-history-incomplete']]) {
+      await page.setContent(`<span data-testid="message-verification-qualified" data-verification-continuity="${continuity}" data-verification-authorization="${authorization}">Warning</span>`);
+      const changing = { evaluate: async (...args) => {
+        const observed = await page.evaluate(...args);
+        await page.locator('span').evaluateAll(marks => marks.forEach(mark => mark.remove()));
+        return observed;
+      } };
+      const result = await settledVerificationState(changing, { timeout: 1000 });
+      assert.equal(result.flags, 1);
+      assert.deepEqual(result.indicators.map(mark => [mark.continuity, mark.authorization]), [[continuity, authorization]]);
     }
   } finally { await page.close(); }
 });

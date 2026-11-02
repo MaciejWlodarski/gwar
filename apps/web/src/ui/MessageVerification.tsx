@@ -40,6 +40,8 @@ export function MessageVerificationIndicator({ verification, showAuthor = false 
     <Tooltip label={label}>
       <span tabIndex={0} aria-label={label} data-message-warning={invalid || unsigned || undefined}
         data-testid={`message-verification-${invalid ? "invalid" : unsigned ? "unsigned" : "qualified"}`}
+        data-verification-continuity={verification.continuity}
+        data-verification-authorization={verification.authorization.join(" ")}
         className={`inline-flex cursor-default items-center gap-1 align-middle text-[11px] ${invalid ? "text-danger" : unsigned ? "text-warn" : "text-subtle"}`}>
         <Icon aria-hidden className="size-3.5 shrink-0" />
         {invalid && <span>{t("chat.invalid")}</span>}
