@@ -468,7 +468,7 @@ export class MlsRuntime {
         await this.observePrivateGroups();
         const failures = await this.synchronize();
         this.updateStatuses();
-        if (failures.length) { isolated = true; throw failures[0]; }
+        return failures;
       }
       catch (error) {
         // Rosters follow the durable state the failed pass left (a restart
@@ -476,6 +476,10 @@ export class MlsRuntime {
         if (!isolated) await this.engine.reload().then(() => this.updateStatuses(true), () => {});
         throw error;
       }
+    }).then(failures => {
+      // Keep the caller's error while the other conversations retain their own status.
+      // Throw outside the engine queue: each failed DM was already reloaded durably.
+      if (failures.length) { isolated = true; throw failures[0]; }
     }).catch(error => { failed = true; if (!isolated) this.markSecuring(); throw error; }).finally(() => {
       this.syncing = undefined;
       // Periodic refill, revocation/expiry checks and missing history retries;
