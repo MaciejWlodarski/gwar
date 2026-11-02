@@ -7,7 +7,7 @@
  */
 import pin from "../../../../../crates/gwar-denoise-wasm/model.json";
 import { PACE_WINDOW_S, Underruns } from "./pace";
-import type { Report, Request } from "./protocol";
+import type { Build, BuildFailed, Report, Request } from "./protocol";
 
 export interface DenoisePipeline {
   /** The cleaned microphone, to send while `running`. */
@@ -33,27 +33,10 @@ export interface DenoiseEvents {
 const CACHE = "gwar-denoise";
 const LOAD_TIMEOUT_MS = 30_000;
 
-async function sha256(bytes: ArrayBuffer): Promise<string> {
-  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
-  return Array.from(digest, b => b.toString(16).padStart(2, "0")).join("");
-}
+/** What settles a load. */
+type Outcome = Exclude<Report, { type: "loaded" }>;
 
-/** A same-origin asset, from the Cache API when it is there (and matches `hash`), else downloaded and kept. */
-async function asset(cache: Cache | null, signal: AbortSignal, url: string, hash?: string): Promise<ArrayBuffer> {
-  const kept = await cache?.match(url);
-  if (kept) {
-    const bytes = await kept.arrayBuffer();
-    if (!hash || (await sha256(bytes)) === hash) return bytes;
-  }
-  const response = await fetch(url, { signal });
-  if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
-  const bytes = await response.arrayBuffer();
-  if (hash && (await sha256(bytes)) !== hash) throw new Error(`${url}: not the pinned model`);
-  await cache?.put(url, new Response(bytes.slice(0), { headers: { "content-type": response.headers.get("content-type") ?? "application/octet-stream" } })).catch(() => {});
-  return bytes;
-}
-
-async function assets(signal: AbortSignal): Promise<{ code: ArrayBuffer; archive: ArrayBuffer; worklet: string }> {
+async function urls(): Promise<{ code: string; archive: string; worklet: string }> {
   // The desktop app's web build leaves the files out: it suppresses noise natively.
   if (import.meta.env.MODE === "desktop") throw new Error("not in the desktop app");
   const [{ default: wasm }, { default: model }, { default: worklet }] = await Promise.all([
@@ -61,12 +44,7 @@ async function assets(signal: AbortSignal): Promise<{ code: ArrayBuffer; archive
     import("../../../../../crates/gwar-denoise-wasm/pkg/model.bin?url"),
     import("./worklet.ts?worker&url"),
   ]);
-  const urls = [wasm, model].map(url => new URL(url, location.href).href);
-  const cache = typeof caches === "undefined" ? null : await caches.open(CACHE).catch(() => null);
-  const [code, archive] = await Promise.all([asset(cache, signal, urls[0]!), asset(cache, signal, urls[1]!, pin.sha256)]);
-  // Earlier builds' copies.
-  if (cache) for (const request of await cache.keys()) if (!urls.includes(request.url)) void cache.delete(request);
-  return { code, archive, worklet };
+  return { code: new URL(wasm, location.href).href, archive: new URL(model, location.href).href, worklet };
 }
 
 /**
@@ -75,9 +53,17 @@ async function assets(signal: AbortSignal): Promise<{ code: ArrayBuffer; archive
  */
 export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): Promise<DenoisePipeline> {
   if (typeof AudioWorkletNode === "undefined") throw new Error("no AudioWorklet");
-  const { code, archive, worklet } = await assets(signal);
+  const { code, archive, worklet } = await urls();
   signal.throwIfAborted();
   const context = new AudioContext({ sampleRate: 48_000, latencyHint: "interactive" });
+  // Downloads, checks and builds the model, all off the page and off the audio thread.
+  let builder: Worker;
+  try {
+    builder = new Worker(new URL("./build-worker.ts", import.meta.url), { type: "module", name: "gwar-denoise-build" });
+  } catch (error) {
+    void context.close().catch(() => {});
+    throw error;
+  }
   // Browsers start audio only after a user gesture, and Safari interrupts it (a call, another
   // app): resume on the next gesture, as the playback context does.
   const resume = () => {
@@ -86,8 +72,9 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
   const gestures = ["pointerdown", "keydown"] as const;
   for (const type of gestures) window.addEventListener(type, resume, { passive: true });
   // The first report settles the load; later ones are trouble.
-  let settle: ((report: Report) => void) | null = null;
+  let settle: ((report: Outcome) => void) | null = null;
   const shut = () => {
+    builder.terminate();
     for (const type of gestures) window.removeEventListener(type, resume);
     void context.close().catch(() => {});
   };
@@ -106,13 +93,12 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
       channelCount: 1,
       channelCountMode: "explicit",
     });
-    const destination = context.createMediaStreamDestination();
-    node.connect(destination);
+    let destination: MediaStreamAudioDestinationNode | null = null;
     const post = (request: Request, transfer: Transferable[] = []) => node.port.postMessage(request, transfer);
-    const describe = (report: Exclude<Report, { type: "ready" }>) => (report.type === "slow" ? `too slow: ${report.reason}` : report.reason);
+    const describe = (report: Exclude<Outcome, { type: "ready" }>) => (report.type === "slow" ? `too slow: ${report.reason}` : report.reason);
     let closed = false;
     // Chromium runs the worklet's tasks only while the context runs: the time limit starts then.
-    const ready = new Promise<Report>(resolve => {
+    const ready = new Promise<Outcome>(resolve => {
       settle = resolve;
       const limit = () => setTimeout(() => resolve({ type: "failed", reason: "loading timed out" }), LOAD_TIMEOUT_MS);
       if (context.state === "running") return limit();
@@ -124,7 +110,15 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
       context.addEventListener("statechange", started);
     });
     const receive = (report: Report) => {
-      if (settle) {
+      if (report.type === "loaded") {
+        if (!settle) return;
+        // Not before: in Chromium the context gaining a stream output has the main thread take a
+        // lock the audio device holds through a render, and a render waits for the worklet. Until
+        // now that thread compiled the frame's code and copied the model in (snapshot.ts).
+        builder.terminate();
+        destination = context.createMediaStreamDestination();
+        node.connect(destination);
+      } else if (settle) {
         settle(report);
         settle = null;
       } else if (report.type !== "ready" && !closed) {
@@ -134,8 +128,15 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
     node.port.onmessage = (event: MessageEvent<Report>) => receive(event.data);
     // An exception the worklet left uncaught: its output is silence from then on.
     node.onprocessorerror = () => receive({ type: "failed", reason: "the worklet failed" });
+    builder.onmessage = (event: MessageEvent<BuildFailed>) => receive(event.data);
+    builder.onerror = event => {
+      event.preventDefault();
+      receive({ type: "failed", reason: event.message || "the model could not be built" });
+    };
+    const channel = new MessageChannel();
+    builder.postMessage({ code, archive, sha256: pin.sha256, cache: CACHE, worklet: channel.port1 } satisfies Build, [channel.port1]);
     resume();
-    post({ type: "load", code, archive }, [code, archive]);
+    post({ type: "load", worker: channel.port2 }, [channel.port2]);
     const report = await ready;
     settle = null;
     if (report.type !== "ready") throw new Error(describe(report));
@@ -153,7 +154,7 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
           if (slow && !closed) events.trouble(describe(slow));
         }, PACE_WINDOW_S * 1000)
       : undefined;
-    const track = destination.stream.getAudioTracks()[0]!;
+    const track = destination!.stream.getAudioTracks()[0]!;
     return {
       track,
       get running() {

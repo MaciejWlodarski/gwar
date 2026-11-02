@@ -5,6 +5,10 @@
  * comes through; while the microphone is not sent, it passes as captured. Needs crates/gwar-denoise-wasm/pkg (scripts/denoise-wasm/build.sh).
  *
  *   E2E_BROWSERS=chromium,webkit,firefox   engines to run (default: chromium,webkit)
+ *   E2E_SILENT=1                           Chromium plays to no device (for runs on a desk)
+ *
+ * In Chromium it also holds the load to what it must never do: take the audio thread for long.
+ * A render waits for that thread, and the page's main thread can wait for a render (index.ts).
  *
  * Firefox's audio contexts start only with an audio device (on Linux, a sound server: CI runs
  * PulseAudio with a null sink).
@@ -110,7 +114,7 @@ async function measure() {
 async function run(engine, web) {
   const launchers = { chromium, firefox, webkit };
   const options = {
-    chromium: { args: ["--autoplay-policy=no-user-gesture-required"] },
+    chromium: { args: ["--autoplay-policy=no-user-gesture-required", ...(process.env.E2E_SILENT === "1" ? ["--disable-audio-output"] : [])] },
     firefox: { firefoxUserPrefs: { "media.autoplay.default": 0, "media.autoplay.block-webaudio": false } },
   };
   const browser = await launchers[engine].launch(options[engine] ?? {});
@@ -122,12 +126,24 @@ async function run(engine, web) {
     await page.waitForFunction(() => typeof window.__gwarE2eImport === "function");
     // A gesture, for browsers that start audio only after one.
     await page.mouse.click(1, 1);
+    const tracing = engine === "chromium";
+    if (tracing) await browser.startTracing(page, { categories: ["toplevel", "base", "devtools.timeline", "disabled-by-default-devtools.timeline"] });
     // A context that never starts (no audio device) leaves the load waiting.
     let timer;
     const result = await Promise.race([
       page.evaluate(measure),
       new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("timed out: no audio device?")), 120_000); }),
     ]).finally(() => clearTimeout(timer));
+    if (tracing) {
+      const events = JSON.parse((await browser.stopTracing()).toString()).traceEvents;
+      const threads = new Map(events.filter(e => e.name === "thread_name").map(e => [`${e.pid}:${e.tid}`, e.args?.name ?? ""]));
+      const longest = name => Math.max(0, ...events.filter(e => e.ph === "X" && e.name === "RunTask" && name.test(threads.get(`${e.pid}:${e.tid}`) ?? "")).map(e => e.dur / 1000));
+      result.audioThreadTaskMs = Math.round(longest(/AudioWorklet/));
+      result.mainThreadTaskMs = Math.round(longest(/^CrRendererMain$/));
+      // The model is built in a worker: on the audio thread, only a chunk of its copy at a time and
+      // the first frame (which compiles that frame's code) run; building it there took 0.3 to 8 s.
+      assert.ok(result.audioThreadTaskMs < 150, `the audio thread ran a task of ${result.audioThreadTaskMs} ms`);
+    }
     assert.deepEqual(result.troubles, [], "the model reported trouble");
     assert.ok(result.passed > -35, `inactive: passes as captured (${result.passed.toFixed(1)} dBFS)`);
     assert.ok(result.cleaned < result.passed - 20, `active: noise down by more than 20 dB (${result.passed.toFixed(1)} → ${result.cleaned.toFixed(1)} dBFS)`);

@@ -1,10 +1,13 @@
 /**
  * The noise suppression's AudioWorklet: runs the model (`crates/gwar-denoise-wasm`) on the
- * capture context's audio thread, frame by frame, with no hop to another thread and back.
+ * capture context's audio thread, frame by frame, with no hop to another thread and back. The
+ * model is built in a worker and arrives as a copy of the module's memory (snapshot.ts): nothing
+ * here takes the thread for long, so a render never waits long for it.
  */
 import { FRAME, Framing } from "./framing";
 import { BUDGET_MS, Pace } from "./pace";
-import type { Report, Request } from "./protocol";
+import type { Handover, Next, Report, Request } from "./protocol";
+import { growMemory, modelError, writeChunk } from "./snapshot";
 
 // AudioWorkletGlobalScope, which TypeScript's DOM library leaves out.
 declare class AudioWorkletProcessor {
@@ -15,8 +18,6 @@ declare const currentTime: number;
 
 interface Exports {
   memory: WebAssembly.Memory;
-  gwar_denoise_archive(length: number): number;
-  gwar_denoise_new(): number;
   gwar_denoise_frame(denoiser: number): number;
   gwar_denoise_process(denoiser: number, strength: number): number;
   gwar_denoise_reset(denoiser: number): void;
@@ -28,6 +29,10 @@ interface Exports {
 const WARM_UP = 200;
 class DenoiseProcessor extends AudioWorkletProcessor {
   private exports: Exports | null = null;
+  /** The instance the model is being copied into, and the copy's size. */
+  private loading: Exports | null = null;
+  private size = 0;
+  private worker: MessagePort | null = null;
   private denoiser = 0;
   private pace = new Pace();
   /** Warm-up frames still to run; the model cleans nothing until they have. */
@@ -50,7 +55,11 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   }
 
   private report(report: Report): void {
-    if (report.type !== "ready") this.failed = true;
+    if (report.type === "failed" || report.type === "slow") {
+      this.failed = true;
+      this.worker?.close();
+      this.worker = null;
+    }
     this.port.postMessage(report);
   }
 
@@ -61,11 +70,14 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   private receive(request: Request): void {
     switch (request.type) {
       case "load":
-        // Compiled off this thread; only building the model (~0.3 s) runs on it.
-        WebAssembly.compile(request.code)
-          .then(module => WebAssembly.instantiate(module, {}))
-          .then(instance => this.load(instance.exports as unknown as Exports, new Uint8Array(request.archive)))
-          .catch((error: unknown) => this.fail(error));
+        this.worker = request.worker;
+        this.worker.onmessage = (event: MessageEvent<Handover>) => {
+          try {
+            this.handover(event.data);
+          } catch (error) {
+            this.fail(error);
+          }
+        };
         break;
       case "active":
         if (request.active && !this.active) this.fresh = true;
@@ -80,20 +92,48 @@ class DenoiseProcessor extends AudioWorkletProcessor {
     }
   }
 
-  private load(exports: Exports, archive: Uint8Array): void {
-    const at = exports.gwar_denoise_archive(archive.length);
-    new Uint8Array(exports.memory.buffer, at, archive.length).set(archive);
-    const denoiser = exports.gwar_denoise_new();
-    if (!denoiser) throw new Error(this.error(exports));
-    this.exports = exports;
-    this.denoiser = denoiser;
+  /** The build worker's handover, one message (and task) at a time. */
+  private handover(message: Handover): void {
+    if (this.failed) return;
+    const ask = () => this.worker!.postMessage({ type: "next" } satisfies Next);
+    switch (message.type) {
+      case "code":
+        // Compiled off this thread.
+        WebAssembly.compile(message.code)
+          .then(module => WebAssembly.instantiate(module, {}))
+          .then(instance => {
+            this.loading = instance.exports as unknown as Exports;
+            ask();
+          })
+          .catch((error: unknown) => this.fail(error));
+        break;
+      case "model":
+        growMemory(this.loading!.memory, message.size);
+        this.size = message.size;
+        this.denoiser = message.denoiser;
+        ask();
+        break;
+      case "memory":
+        writeChunk(this.loading!.memory, message.offset, message.bytes);
+        if (message.offset + message.bytes.byteLength < this.size) return ask();
+        this.worker!.close();
+        this.worker = null;
+        this.loaded(this.loading!);
+        break;
+    }
   }
 
-  private error(exports: Exports): string {
-    const bytes = new Uint8Array(exports.memory.buffer, exports.gwar_denoise_error(), exports.gwar_denoise_error_len());
-    // No TextDecoder on the audio thread; the messages are ASCII.
-    return String.fromCharCode(...bytes);
+  /**
+   * The model is in place. One frame first, before the page makes the output: the browser
+   * compiles the functions a frame runs on their first call, on this thread.
+   */
+  private loaded(exports: Exports): void {
+    this.exports = exports;
+    this.loading = null;
+    if (!this.run(this.noise(), false)) return;
+    this.report({ type: "loaded" });
   }
+
 
   /** Cleans `frame` in place with the model; false if it failed, the frame left as it was. */
   private run(frame: Float32Array, reset: boolean): boolean {
@@ -102,7 +142,7 @@ class DenoiseProcessor extends AudioWorkletProcessor {
       if (reset) exports.gwar_denoise_reset(this.denoiser);
       new Float32Array(exports.memory.buffer, exports.gwar_denoise_frame(this.denoiser), FRAME).set(frame);
       if (!exports.gwar_denoise_process(this.denoiser, this.strength)) {
-        this.report({ type: "failed", reason: this.error(exports) });
+        this.report({ type: "failed", reason: modelError(exports) });
         return false;
       }
     } catch (error) {
@@ -116,11 +156,7 @@ class DenoiseProcessor extends AudioWorkletProcessor {
 
   /** One frame of quiet noise; after the last, the model is ready, unless it was too slow. */
   private warmUp(): void {
-    const frame = new Float32Array(FRAME);
-    for (let j = 0; j < FRAME; j++) {
-      this.seed = (Math.imul(this.seed, 1664525) + 1013904223) >>> 0;
-      frame[j] = (this.seed / 2 ** 32 - 0.5) * 0.01;
-    }
+    const frame = this.noise();
     const started = Date.now();
     if (!this.run(frame, false)) return;
     // The second half counts: the browser compiles the model fully while the first runs.
@@ -130,6 +166,16 @@ class DenoiseProcessor extends AudioWorkletProcessor {
     if (mean > BUDGET_MS) return this.report({ type: "slow", reason: `${mean.toFixed(1)} ms a frame` });
     this.fresh = true;
     this.report({ type: "ready" });
+  }
+
+  /** A frame of quiet noise. */
+  private noise(): Float32Array {
+    const frame = new Float32Array(FRAME);
+    for (let j = 0; j < FRAME; j++) {
+      this.seed = (Math.imul(this.seed, 1664525) + 1013904223) >>> 0;
+      frame[j] = (this.seed / 2 ** 32 - 0.5) * 0.01;
+    }
+    return frame;
   }
 
   /** While muted, warming up or not loaded, frames pass as captured, and the model is idle. */
