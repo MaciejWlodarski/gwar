@@ -55,6 +55,7 @@ async function measure() {
   source.buffer = noise;
   source.loop = true;
   const microphone = context.createMediaStreamDestination();
+  microphone.channelCount = 1;
   source.connect(microphone);
   source.start();
   model.setSource(microphone.stream);
@@ -144,10 +145,14 @@ async function run(engine, web) {
       // the first frame (which compiles that frame's code) run; building it there took 0.3 to 8 s.
       assert.ok(result.audioThreadTaskMs < 150, `the audio thread ran a task of ${result.audioThreadTaskMs} ms`);
     }
+    console.log(JSON.stringify({ type: "DENOISE_MEASURE", engine, ...result }));
     assert.deepEqual(result.troubles, [], "the model reported trouble");
     assert.ok(result.passed > -35, `inactive: passes as captured (${result.passed.toFixed(1)} dBFS)`);
+    assert.ok(Math.abs(result.passed + 30) < 1, `inactive: preserves the mono source's -30 dBFS (${result.passed.toFixed(1)} dBFS)`);
     assert.ok(result.cleaned < result.passed - 20, `active: noise down by more than 20 dB (${result.passed.toFixed(1)} → ${result.cleaned.toFixed(1)} dBFS)`);
     assert.ok(result.bypassed > -35, `inactive: a voice at -20 dBFS passes as captured (${result.bypassed.toFixed(1)} dBFS)`);
+    const voiceAndNoise = 10 * Math.log10(10 ** (-20 / 10) + 10 ** (-30 / 10));
+    assert.ok(Math.abs(result.bypassed - voiceAndNoise) < 1, `inactive: preserves the voice and noise power (${result.bypassed.toFixed(1)} dBFS)`);
     assert.ok(result.spoken > result.bypassed - 6, `active: the model keeps a voice over the noise (${result.bypassed.toFixed(1)} → ${result.spoken.toFixed(1)} dBFS)`);
     results.push({ engine, status: "pass", ...result, errors });
   } finally { await browser.close(); }

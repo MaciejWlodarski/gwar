@@ -117,6 +117,7 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
         // now that thread compiled the frame's code and copied the model in (snapshot.ts).
         builder.terminate();
         destination = context.createMediaStreamDestination();
+        destination.channelCount = 1;
         node.connect(destination);
       } else if (settle) {
         settle(report);
