@@ -12,6 +12,7 @@
  *   SYNC_NET=normal|jitter|<LATENCY_NET spec>   the link in front of every viewer (default: normal)
  *   SYNC_VIEWERS=browser,desktop                who watches, side by side
  *   SYNC_SECONDS=30                             how long they watch
+ *   SYNC_NOHOLD=1 / SYNC_NOFILTER=1             sync on, but without the start's sound hold / the late-frame filter (A/B)
  *   SYNC_ENGINE=chromium|webkit                 the viewers' engine (default: chromium)
  *   SYNC_OFF=1                                  main's playback, for a before: no picture wait, no sound
  *                                               hold, no late-frame filter (so no stall report), no held
@@ -131,7 +132,7 @@ function viewerPatch() {
       // Only the late-frame filter names a kind; the desktop's sound path stays.
       if (args[1]?.kind) {
         // The app plays on as it would have: the same catch as an engine without transforms.
-        if (window.__syncOff) { window.__baseline.filtersRefused++; throw new Error("the baseline has no filter"); }
+        if (window.__syncOff || window.__noFilter) { window.__baseline.filtersRefused++; throw new Error("the baseline has no filter"); }
         window.__baseline.filtersRun++;
       }
       return new target(...args);
@@ -272,6 +273,7 @@ async function device(browser, web, server, name, native = false) {
       if (ms === 0) target.set.call(this, 0);
     } });
   });
+  if (process.env.SYNC_NOFILTER) await context.addInitScript(() => { window.__noFilter = true; });
   await context.addInitScript(viewerPatch);
   // The picker's first answer has the tab's picture only, as a share nobody asked sound for.
   if (process.env.SYNC_ADD) await context.addInitScript(() => {
@@ -293,7 +295,7 @@ async function device(browser, web, server, name, native = false) {
   await page.goto(web);
   await page.waitForFunction(() => typeof window.__gwarE2eImport === "function");
   // In the same dispatch as the grant: a later release would leave the desktop slot's gain at 0.
-  if (process.env.SYNC_OFF) await page.evaluate(async () => {
+  if (process.env.SYNC_OFF || process.env.SYNC_NOHOLD) await page.evaluate(async () => {
     const { useScreen } = await window.__gwarE2eImport("/src/state/screen.ts");
     useScreen.subscribe(state => {
       for (const watch of state.watches) {
