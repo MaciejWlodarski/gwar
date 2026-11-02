@@ -1287,7 +1287,8 @@ Chromium if the audio thread runs a task of 150 ms or more while the model loads
 
 200 frames of quiet noise run through the model during preparation, at most one
 per quantum. The original every-other-quantum cadence remains when frames have
-measurable cost; sub-millisecond aggregate work can use the next quantum too.
+higher measured cost; average CPU below half a render quantum can use the next
+quantum too.
 This compiles the model fully before it counts; if the second half of
 them averages more than 5 ms a frame, the model is too slow here.
 

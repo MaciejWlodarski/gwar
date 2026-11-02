@@ -4,7 +4,7 @@
  * model is built in a worker and arrives as a copy of the module's memory (snapshot.ts): nothing
  * here takes the thread for long, so a render never waits long for it.
  */
-import { FRAME, Framing } from "./framing";
+import { FRAME, Framing, QUANTUM } from "./framing";
 import { BUDGET_MS, Pace } from "./pace";
 import type { Handover, Next, Report, Request } from "./protocol";
 import { growMemory, modelError, writeChunk } from "./snapshot";
@@ -25,8 +25,9 @@ interface Exports {
   gwar_denoise_error_len(): number;
 }
 
-/** Frames run through the model after loading, one every other render quantum, before it counts. */
+/** All frames run before readiness; faster cadence requires less than half a quantum of CPU. */
 const WARM_UP = 200;
+const WARM_QUANTUM_BUDGET_MS = (QUANTUM / 48_000) * 1000 / 2;
 class DenoiseProcessor extends AudioWorkletProcessor {
   private exports: Exports | null = null;
   /** The instance the model is being copied into, and the copy's size. */
@@ -206,9 +207,10 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   }
 
   process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
-    // Keep the original every-other-quantum cadence when a frame costs measurable time.
-    // If Date.now measures zero cost, allow the next quantum too; never run two in one quantum.
-    const fast = this.lastWarmMs === 0 && this.warmCpuMs < WARM_UP - this.warming;
+    // Keep every-other-quantum cadence unless measured CPU stays below half a quantum.
+    // Date.now rounds individual frames to ms; the cumulative mean prevents rounding from
+    // repeatedly admitting an expensive frame. Always run all 200, at most one per quantum.
+    const fast = this.lastWarmMs <= Math.ceil(WARM_QUANTUM_BUDGET_MS) && this.warmCpuMs < (WARM_UP - this.warming) * WARM_QUANTUM_BUDGET_MS;
     if (this.exports && this.warming > 0 && !this.failed && (this.quanta++ % 2 === 0 || fast)) this.warmUp();
     this.frameMs = null;
     const output = outputs[0]?.[0];

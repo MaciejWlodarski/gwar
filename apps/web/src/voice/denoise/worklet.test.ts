@@ -20,7 +20,7 @@ async function processor() {
 afterEach(() => { vi.restoreAllMocks(); vi.unstubAllGlobals(); vi.resetModules(); });
 
 describe("worklet warm-up and ownership boundaries", () => {
-  it.each([{ ms: 0, quanta: 200, outcome: "ready" }, { ms: 3, quanta: 399, outcome: "ready" }, { ms: 6, quanta: 399, outcome: "slow" }])("runs all 200 frames at $ms ms, never twice per quantum, and retains the 5 ms budget", async ({ ms, quanta, outcome }) => {
+  it.each([{ ms: 0, quanta: 200, outcome: "ready" }, { ms: 1, quanta: 200, outcome: "ready" }, { ms: 2, quanta: 399, outcome: "ready" }, { ms: 3, quanta: 399, outcome: "ready" }, { ms: 6, quanta: 399, outcome: "slow" }])("runs all 200 frames at $ms ms, never twice per quantum, and retains the 5 ms budget", async ({ ms, quanta, outcome }) => {
       const { node, reports } = await processor();
       let clock = 0, frames = 0;
       vi.spyOn(Date, "now").mockImplementation(() => clock);
