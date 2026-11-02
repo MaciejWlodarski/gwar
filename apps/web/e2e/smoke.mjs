@@ -37,6 +37,7 @@ import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { installMicPrivacyGuard } from "./mic-privacy.mjs";
 import { sendComposer } from "./composer-actions.mjs";
+import { stopProcesses } from "./processes.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(here, "..");
@@ -100,8 +101,8 @@ async function ensureServer(connectUrl) {
   const bin = process.env.GWAR_SERVER_BIN ?? path.join(repoRoot, "target/debug/gwar-server");
   const args = ["--data-dir", dataDir, "--http", SERVER, "--media", SERVER, "--public-ip", SERVER.split(":")[0], "--public-endpoint", CLIENT_ADDR, "--public-endpoint", CLIENT_ALIAS, "--web-origin", new URL(WEB_URL).origin, "--connect-url", connectUrl];
   const child = existsSync(bin)
-    ? spawn(bin, args, { cwd: repoRoot })
-    : spawn("cargo", ["run", "-q", "-p", "gwar-server", "--", ...args], { cwd: repoRoot });
+    ? spawn(bin, args, { cwd: repoRoot, detached: true })
+    : spawn("cargo", ["run", "-q", "-p", "gwar-server", "--", ...args], { cwd: repoRoot, detached: true });
   child.on("exit", (code) => code && console.error(`server exited with code ${code}`));
   children.push(child);
   let log = "";
@@ -146,8 +147,8 @@ async function ensureConnect() {
   const bin = process.env.GWAR_CONNECT_BIN ?? path.join(repoRoot, "target/debug/gwar-connect");
   const args = ["--data-dir", dataDir, "--http", `127.0.0.1:${port}`, "--origin", new URL(WEB_URL).origin];
   const child = existsSync(bin)
-    ? spawn(bin, args, { cwd: repoRoot })
-    : spawn("cargo", ["run", "-q", "-p", "gwar-connect", "--", ...args], { cwd: repoRoot });
+    ? spawn(bin, args, { cwd: repoRoot, detached: true })
+    : spawn("cargo", ["run", "-q", "-p", "gwar-connect", "--", ...args], { cwd: repoRoot, detached: true });
   child.on("exit", (code) => code && console.error(`gwar-connect exited with code ${code}`));
   children.push(child);
   const base = `http://127.0.0.1:${port}`;
@@ -168,7 +169,8 @@ async function ensureWeb(connectUrl) {
   // builds still require HTTPS. The test serves dist, with a loopback-only test CSP exception.
   const build = spawnSync("npx", ["vite", "build", "--mode", "e2e"], { cwd: webRoot, env: { ...process.env, NODE_ENV: "development", VITE_CONNECT_URL: connectUrl }, encoding: "utf8" });
   if (build.status !== 0) throw new Error(`e2e web build failed: ${build.stdout} ${build.stderr}`);
-  const child = spawn("npx", ["vite", "preview", "--host", "127.0.0.1", "--port", new URL(WEB_URL).port || "5173", "--strictPort"], { cwd: webRoot, env: { ...process.env, VITE_CONNECT_URL: connectUrl } });
+  const viteCli = path.join(path.dirname(fileURLToPath(import.meta.resolve("vite/package.json"))), "bin/vite.js");
+  const child = spawn(process.execPath, [viteCli, "preview", "--host", "127.0.0.1", "--port", new URL(WEB_URL).port || "5173", "--strictPort"], { cwd: webRoot, env: { ...process.env, VITE_CONNECT_URL: connectUrl }, detached: true });
   children.push(child);
   await waitFor(() => reachable(WEB_URL), "vite preview", 30000);
   console.log("started vite preview serving apps/web/dist");
@@ -1797,7 +1799,7 @@ async function main() {
       const child = spawn(
         bin,
         ["--data-dir", dir, "--http", `127.0.0.1:${port}`, "--media", `127.0.0.1:${port}`, "--public-ip", "127.0.0.1", "--public-endpoint", `ws://127.0.0.1:${port}/ws`, "--web-root", dist, "--no-connect"],
-        { env: { ...process.env, GWAR_NO_TEAMSPEAK: "true" } },
+        { env: { ...process.env, GWAR_NO_TEAMSPEAK: "true" }, detached: true },
       );
       children.push(child);
       try {
@@ -2157,11 +2159,14 @@ async function main() {
   await browser.close();
 }
 
+let cleaning;
+const cleanup = () => cleaning ??= (async () => {
+  // The latency proxy has no PID; every spawned child owns a detached process group.
+  for (const child of children) if (!child.pid) child.kill();
+  await stopProcesses(children.filter(child => child.pid));
+})();
 for (const sig of ["SIGINT", "SIGTERM"]) {
-  process.on(sig, () => {
-    for (const c of children) c.kill();
-    process.exit(130);
-  });
+  process.on(sig, () => { void cleanup().finally(() => process.exit(130)); });
 }
 
 let failed = false;
@@ -2171,7 +2176,7 @@ try {
   console.error(e);
   failed = true;
 } finally {
-  for (const c of children) c.kill();
+  await cleanup();
 }
 const bad = results.filter((r) => !r.ok);
 console.log(`\n${results.length - bad.length}/${results.length} checks passed`);
