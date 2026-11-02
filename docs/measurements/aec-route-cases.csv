@@ -4130,3 +4130,462 @@ scenario,far_hz,left_delay_ms,near_hz,arm,seconds,value
 "in charge, then another room",230,150,251,native-gain-change,4-5,-46.647724
 "in charge, then another room",230,150,251,native-gain-change,6-7,-53.864056
 "in charge, then another room",230,150,251,native-gain-change,8-9,-55.826027
+"in charge, then headphones",100,20,213,retained-deferred,0-3,0.597561
+"in charge, then headphones",100,20,213,retained-deferred,3-5,0.6125
+"in charge, then headphones",100,20,213,retained-deferred,5-8,0.7839506
+"in charge, then headphones",100,20,213,retained-deferred,8-16,0.8238994
+"in charge, then headphones",100,20,176,retained-deferred,0-3,0.525
+"in charge, then headphones",100,20,176,retained-deferred,3-5,0.4875
+"in charge, then headphones",100,20,176,retained-deferred,5-8,0.6086956
+"in charge, then headphones",100,20,176,retained-deferred,8-16,0.6540881
+"in charge, then headphones",100,20,251,retained-deferred,0-3,0.6329114
+"in charge, then headphones",100,20,251,retained-deferred,3-5,0.62025315
+"in charge, then headphones",100,20,251,retained-deferred,5-8,0.75308645
+"in charge, then headphones",100,20,251,retained-deferred,8-16,0.73501575
+"in charge, then headphones",100,60,213,retained-deferred,0-3,0.597561
+"in charge, then headphones",100,60,213,retained-deferred,3-5,0.6375
+"in charge, then headphones",100,60,213,retained-deferred,5-8,0.7777778
+"in charge, then headphones",100,60,213,retained-deferred,8-16,0.7515723
+"in charge, then headphones",100,60,176,retained-deferred,0-3,0.525
+"in charge, then headphones",100,60,176,retained-deferred,3-5,0.4875
+"in charge, then headphones",100,60,176,retained-deferred,5-8,0.61490685
+"in charge, then headphones",100,60,176,retained-deferred,8-16,0.7201258
+"in charge, then headphones",100,60,251,retained-deferred,0-3,0.5822785
+"in charge, then headphones",100,60,251,retained-deferred,3-5,0.5822785
+"in charge, then headphones",100,60,251,retained-deferred,5-8,0.7222222
+"in charge, then headphones",100,60,251,retained-deferred,8-16,0.6845426
+"in charge, then headphones",100,150,213,retained-deferred,0-3,0.5487805
+"in charge, then headphones",100,150,213,retained-deferred,3-5,0.5625
+"in charge, then headphones",100,150,213,retained-deferred,5-8,0.59876543
+"in charge, then headphones",100,150,213,retained-deferred,8-16,0.7106918
+"in charge, then headphones",100,150,176,retained-deferred,0-3,0.6125
+"in charge, then headphones",100,150,176,retained-deferred,3-5,0.5625
+"in charge, then headphones",100,150,176,retained-deferred,5-8,0.5590062
+"in charge, then headphones",100,150,176,retained-deferred,8-16,0.8427673
+"in charge, then headphones",100,150,251,retained-deferred,0-3,0.5949367
+"in charge, then headphones",100,150,251,retained-deferred,3-5,0.6329114
+"in charge, then headphones",100,150,251,retained-deferred,5-8,0.80864197
+"in charge, then headphones",100,150,251,retained-deferred,8-16,0.82649845
+"in charge, then headphones",150,20,213,retained-deferred,0-3,0.6097561
+"in charge, then headphones",150,20,213,retained-deferred,3-5,0.625
+"in charge, then headphones",150,20,213,retained-deferred,5-8,0.75308645
+"in charge, then headphones",150,20,213,retained-deferred,8-16,0.827044
+"in charge, then headphones",150,20,176,retained-deferred,0-3,0.4625
+"in charge, then headphones",150,20,176,retained-deferred,3-5,0.4
+"in charge, then headphones",150,20,176,retained-deferred,5-8,0.49689442
+"in charge, then headphones",150,20,176,retained-deferred,8-16,0.5754717
+"in charge, then headphones",150,20,251,retained-deferred,0-3,0.6455696
+"in charge, then headphones",150,20,251,retained-deferred,3-5,0.5949367
+"in charge, then headphones",150,20,251,retained-deferred,5-8,0.74691355
+"in charge, then headphones",150,20,251,retained-deferred,8-16,0.873817
+"in charge, then headphones",150,60,213,retained-deferred,0-3,0.5609756
+"in charge, then headphones",150,60,213,retained-deferred,3-5,0.5875
+"in charge, then headphones",150,60,213,retained-deferred,5-8,0.75308645
+"in charge, then headphones",150,60,213,retained-deferred,8-16,0.7955975
+"in charge, then headphones",150,60,176,retained-deferred,0-3,0.45
+"in charge, then headphones",150,60,176,retained-deferred,3-5,0.4125
+"in charge, then headphones",150,60,176,retained-deferred,5-8,0.5838509
+"in charge, then headphones",150,60,176,retained-deferred,8-16,0.5377358
+"in charge, then headphones",150,60,251,retained-deferred,0-3,0.6075949
+"in charge, then headphones",150,60,251,retained-deferred,3-5,0.5822785
+"in charge, then headphones",150,60,251,retained-deferred,5-8,0.7160494
+"in charge, then headphones",150,60,251,retained-deferred,8-16,0.8391167
+"in charge, then headphones",150,150,213,retained-deferred,0-3,0.5731707
+"in charge, then headphones",150,150,213,retained-deferred,3-5,0.575
+"in charge, then headphones",150,150,213,retained-deferred,5-8,0.70987654
+"in charge, then headphones",150,150,213,retained-deferred,8-16,0.836478
+"in charge, then headphones",150,150,176,retained-deferred,0-3,0.55
+"in charge, then headphones",150,150,176,retained-deferred,3-5,0.55
+"in charge, then headphones",150,150,176,retained-deferred,5-8,0.4347826
+"in charge, then headphones",150,150,176,retained-deferred,8-16,0.5440252
+"in charge, then headphones",150,150,251,retained-deferred,0-3,0.5949367
+"in charge, then headphones",150,150,251,retained-deferred,3-5,0.6329114
+"in charge, then headphones",150,150,251,retained-deferred,5-8,0.80246913
+"in charge, then headphones",150,150,251,retained-deferred,8-16,0.8233439
+"in charge, then headphones",230,20,213,retained-deferred,0-3,0.3902439
+"in charge, then headphones",230,20,213,retained-deferred,3-5,0.525
+"in charge, then headphones",230,20,213,retained-deferred,5-8,0.5
+"in charge, then headphones",230,20,213,retained-deferred,8-16,0.5157233
+"in charge, then headphones",230,20,176,retained-deferred,0-3,0.4875
+"in charge, then headphones",230,20,176,retained-deferred,3-5,0.375
+"in charge, then headphones",230,20,176,retained-deferred,5-8,0.6335404
+"in charge, then headphones",230,20,176,retained-deferred,8-16,0.8018868
+"in charge, then headphones",230,20,251,retained-deferred,0-3,0.56962025
+"in charge, then headphones",230,20,251,retained-deferred,3-5,0.5822785
+"in charge, then headphones",230,20,251,retained-deferred,5-8,0.72839504
+"in charge, then headphones",230,20,251,retained-deferred,8-16,0.8201893
+"in charge, then headphones",230,60,213,retained-deferred,0-3,0.36585367
+"in charge, then headphones",230,60,213,retained-deferred,3-5,0.475
+"in charge, then headphones",230,60,213,retained-deferred,5-8,0.46296296
+"in charge, then headphones",230,60,213,retained-deferred,8-16,0.5188679
+"in charge, then headphones",230,60,176,retained-deferred,0-3,0.375
+"in charge, then headphones",230,60,176,retained-deferred,3-5,0.3125
+"in charge, then headphones",230,60,176,retained-deferred,5-8,0.49689442
+"in charge, then headphones",230,60,176,retained-deferred,8-16,0.6886792
+"in charge, then headphones",230,60,251,retained-deferred,0-3,0.5822785
+"in charge, then headphones",230,60,251,retained-deferred,3-5,0.56962025
+"in charge, then headphones",230,60,251,retained-deferred,5-8,0.8148148
+"in charge, then headphones",230,60,251,retained-deferred,8-16,0.8328076
+"in charge, then headphones",230,150,213,retained-deferred,0-3,0.46341464
+"in charge, then headphones",230,150,213,retained-deferred,3-5,0.475
+"in charge, then headphones",230,150,213,retained-deferred,5-8,0.42592594
+"in charge, then headphones",230,150,213,retained-deferred,8-16,0.5377358
+"in charge, then headphones",230,150,176,retained-deferred,0-3,0.325
+"in charge, then headphones",230,150,176,retained-deferred,3-5,0.4625
+"in charge, then headphones",230,150,176,retained-deferred,5-8,0.46583852
+"in charge, then headphones",230,150,176,retained-deferred,8-16,0.5880503
+"in charge, then headphones",230,150,251,retained-deferred,0-3,0.51898736
+"in charge, then headphones",230,150,251,retained-deferred,3-5,0.556962
+"in charge, then headphones",230,150,251,retained-deferred,5-8,0.75308645
+"in charge, then headphones",230,150,251,retained-deferred,8-16,0.829653
+"warming, headphones 8 s before the share",100,20,213,retained-deferred,0-3,0.86585367
+"warming, headphones 8 s before the share",100,20,213,retained-deferred,3-5,0.8625
+"warming, headphones 8 s before the share",100,20,213,retained-deferred,5-8,0.82098764
+"warming, headphones 8 s before the share",100,20,213,retained-deferred,8-16,0.8238994
+"warming, headphones 8 s before the share",100,20,176,retained-deferred,0-3,0.8
+"warming, headphones 8 s before the share",100,20,176,retained-deferred,3-5,0.725
+"warming, headphones 8 s before the share",100,20,176,retained-deferred,5-8,0.77018636
+"warming, headphones 8 s before the share",100,20,176,retained-deferred,8-16,0.7861635
+"warming, headphones 8 s before the share",100,20,251,retained-deferred,0-3,0.89873415
+"warming, headphones 8 s before the share",100,20,251,retained-deferred,3-5,0.886076
+"warming, headphones 8 s before the share",100,20,251,retained-deferred,5-8,0.8888889
+"warming, headphones 8 s before the share",100,20,251,retained-deferred,8-16,0.873817
+"warming, headphones 8 s before the share",100,60,213,retained-deferred,0-3,0.8292683
+"warming, headphones 8 s before the share",100,60,213,retained-deferred,3-5,0.9
+"warming, headphones 8 s before the share",100,60,213,retained-deferred,5-8,0.80864197
+"warming, headphones 8 s before the share",100,60,213,retained-deferred,8-16,0.8207547
+"warming, headphones 8 s before the share",100,60,176,retained-deferred,0-3,0.7875
+"warming, headphones 8 s before the share",100,60,176,retained-deferred,3-5,0.675
+"warming, headphones 8 s before the share",100,60,176,retained-deferred,5-8,0.8385093
+"warming, headphones 8 s before the share",100,60,176,retained-deferred,8-16,0.7358491
+"warming, headphones 8 s before the share",100,60,251,retained-deferred,0-3,0.8227848
+"warming, headphones 8 s before the share",100,60,251,retained-deferred,3-5,0.65822786
+"warming, headphones 8 s before the share",100,60,251,retained-deferred,5-8,0.82098764
+"warming, headphones 8 s before the share",100,60,251,retained-deferred,8-16,0.851735
+"warming, headphones 8 s before the share",100,150,213,retained-deferred,0-3,0.85365856
+"warming, headphones 8 s before the share",100,150,213,retained-deferred,3-5,0.8
+"warming, headphones 8 s before the share",100,150,213,retained-deferred,5-8,0.8271605
+"warming, headphones 8 s before the share",100,150,213,retained-deferred,8-16,0.8207547
+"warming, headphones 8 s before the share",100,150,176,retained-deferred,0-3,0.7625
+"warming, headphones 8 s before the share",100,150,176,retained-deferred,3-5,0.95
+"warming, headphones 8 s before the share",100,150,176,retained-deferred,5-8,0.78881985
+"warming, headphones 8 s before the share",100,150,176,retained-deferred,8-16,0.8113208
+"warming, headphones 8 s before the share",100,150,251,retained-deferred,0-3,0.84810126
+"warming, headphones 8 s before the share",100,150,251,retained-deferred,3-5,0.886076
+"warming, headphones 8 s before the share",100,150,251,retained-deferred,5-8,0.8333333
+"warming, headphones 8 s before the share",100,150,251,retained-deferred,8-16,0.82649845
+"warming, headphones 8 s before the share",150,20,213,retained-deferred,0-3,0.85365856
+"warming, headphones 8 s before the share",150,20,213,retained-deferred,3-5,0.85
+"warming, headphones 8 s before the share",150,20,213,retained-deferred,5-8,0.8333333
+"warming, headphones 8 s before the share",150,20,213,retained-deferred,8-16,0.8144654
+"warming, headphones 8 s before the share",150,20,176,retained-deferred,0-3,0.5375
+"warming, headphones 8 s before the share",150,20,176,retained-deferred,3-5,0.525
+"warming, headphones 8 s before the share",150,20,176,retained-deferred,5-8,0.54658383
+"warming, headphones 8 s before the share",150,20,176,retained-deferred,8-16,0.5377358
+"warming, headphones 8 s before the share",150,20,251,retained-deferred,0-3,0.87341774
+"warming, headphones 8 s before the share",150,20,251,retained-deferred,3-5,0.89873415
+"warming, headphones 8 s before the share",150,20,251,retained-deferred,5-8,0.88271606
+"warming, headphones 8 s before the share",150,20,251,retained-deferred,8-16,0.873817
+"warming, headphones 8 s before the share",150,60,213,retained-deferred,0-3,0.8414634
+"warming, headphones 8 s before the share",150,60,213,retained-deferred,3-5,0.8875
+"warming, headphones 8 s before the share",150,60,213,retained-deferred,5-8,0.77160496
+"warming, headphones 8 s before the share",150,60,213,retained-deferred,8-16,0.8144654
+"warming, headphones 8 s before the share",150,60,176,retained-deferred,0-3,0.75
+"warming, headphones 8 s before the share",150,60,176,retained-deferred,3-5,0.4875
+"warming, headphones 8 s before the share",150,60,176,retained-deferred,5-8,0.5590062
+"warming, headphones 8 s before the share",150,60,176,retained-deferred,8-16,0.5534591
+"warming, headphones 8 s before the share",150,60,251,retained-deferred,0-3,0.8607595
+"warming, headphones 8 s before the share",150,60,251,retained-deferred,3-5,0.84810126
+"warming, headphones 8 s before the share",150,60,251,retained-deferred,5-8,0.88271606
+"warming, headphones 8 s before the share",150,60,251,retained-deferred,8-16,0.829653
+"warming, headphones 8 s before the share",150,150,213,retained-deferred,0-3,0.85365856
+"warming, headphones 8 s before the share",150,150,213,retained-deferred,3-5,0.85
+"warming, headphones 8 s before the share",150,150,213,retained-deferred,5-8,0.7777778
+"warming, headphones 8 s before the share",150,150,213,retained-deferred,8-16,0.8207547
+"warming, headphones 8 s before the share",150,150,176,retained-deferred,0-3,0.6875
+"warming, headphones 8 s before the share",150,150,176,retained-deferred,3-5,0.6375
+"warming, headphones 8 s before the share",150,150,176,retained-deferred,5-8,0.49068323
+"warming, headphones 8 s before the share",150,150,176,retained-deferred,8-16,0.6069182
+"warming, headphones 8 s before the share",150,150,251,retained-deferred,0-3,0.89873415
+"warming, headphones 8 s before the share",150,150,251,retained-deferred,3-5,0.886076
+"warming, headphones 8 s before the share",150,150,251,retained-deferred,5-8,0.8518519
+"warming, headphones 8 s before the share",150,150,251,retained-deferred,8-16,0.8233439
+"warming, headphones 8 s before the share",230,20,213,retained-deferred,0-3,0.79268295
+"warming, headphones 8 s before the share",230,20,213,retained-deferred,3-5,0.35
+"warming, headphones 8 s before the share",230,20,213,retained-deferred,5-8,0.5740741
+"warming, headphones 8 s before the share",230,20,213,retained-deferred,8-16,0.5125786
+"warming, headphones 8 s before the share",230,20,176,retained-deferred,0-3,0.6125
+"warming, headphones 8 s before the share",230,20,176,retained-deferred,3-5,0.725
+"warming, headphones 8 s before the share",230,20,176,retained-deferred,5-8,0.7329193
+"warming, headphones 8 s before the share",230,20,176,retained-deferred,8-16,0.8018868
+"warming, headphones 8 s before the share",230,20,251,retained-deferred,0-3,0.835443
+"warming, headphones 8 s before the share",230,20,251,retained-deferred,3-5,0.835443
+"warming, headphones 8 s before the share",230,20,251,retained-deferred,5-8,0.8765432
+"warming, headphones 8 s before the share",230,20,251,retained-deferred,8-16,0.807571
+"warming, headphones 8 s before the share",230,60,213,retained-deferred,0-3,0.58536583
+"warming, headphones 8 s before the share",230,60,213,retained-deferred,3-5,0.325
+"warming, headphones 8 s before the share",230,60,213,retained-deferred,5-8,0.5740741
+"warming, headphones 8 s before the share",230,60,213,retained-deferred,8-16,0.5125786
+"warming, headphones 8 s before the share",230,60,176,retained-deferred,0-3,0.775
+"warming, headphones 8 s before the share",230,60,176,retained-deferred,3-5,0.6
+"warming, headphones 8 s before the share",230,60,176,retained-deferred,5-8,0.60248446
+"warming, headphones 8 s before the share",230,60,176,retained-deferred,8-16,0.5754717
+"warming, headphones 8 s before the share",230,60,251,retained-deferred,0-3,0.8607595
+"warming, headphones 8 s before the share",230,60,251,retained-deferred,3-5,0.79746836
+"warming, headphones 8 s before the share",230,60,251,retained-deferred,5-8,0.86419755
+"warming, headphones 8 s before the share",230,60,251,retained-deferred,8-16,0.5867508
+"warming, headphones 8 s before the share",230,150,213,retained-deferred,0-3,0.58536583
+"warming, headphones 8 s before the share",230,150,213,retained-deferred,3-5,0.625
+"warming, headphones 8 s before the share",230,150,213,retained-deferred,5-8,0.5493827
+"warming, headphones 8 s before the share",230,150,213,retained-deferred,8-16,0.5754717
+"warming, headphones 8 s before the share",230,150,176,retained-deferred,0-3,0.6625
+"warming, headphones 8 s before the share",230,150,176,retained-deferred,3-5,0.5125
+"warming, headphones 8 s before the share",230,150,176,retained-deferred,5-8,0.4347826
+"warming, headphones 8 s before the share",230,150,176,retained-deferred,8-16,0.6069182
+"warming, headphones 8 s before the share",230,150,251,retained-deferred,0-3,0.835443
+"warming, headphones 8 s before the share",230,150,251,retained-deferred,3-5,0.8607595
+"warming, headphones 8 s before the share",230,150,251,retained-deferred,5-8,0.83950615
+"warming, headphones 8 s before the share",230,150,251,retained-deferred,8-16,0.81388015
+"warming, headphones 3 s before the share",100,20,213,retained-deferred,0-3,0.6707317
+"warming, headphones 3 s before the share",100,20,213,retained-deferred,3-5,0.8
+"warming, headphones 3 s before the share",100,20,213,retained-deferred,5-8,0.82098764
+"warming, headphones 3 s before the share",100,20,213,retained-deferred,8-16,0.8238994
+"warming, headphones 3 s before the share",100,20,176,retained-deferred,0-3,0.625
+"warming, headphones 3 s before the share",100,20,176,retained-deferred,3-5,0.6625
+"warming, headphones 3 s before the share",100,20,176,retained-deferred,5-8,0.77018636
+"warming, headphones 3 s before the share",100,20,176,retained-deferred,8-16,0.7893082
+"warming, headphones 3 s before the share",100,20,251,retained-deferred,0-3,0.721519
+"warming, headphones 3 s before the share",100,20,251,retained-deferred,3-5,0.7468355
+"warming, headphones 3 s before the share",100,20,251,retained-deferred,5-8,0.77160496
+"warming, headphones 3 s before the share",100,20,251,retained-deferred,8-16,0.7539432
+"warming, headphones 3 s before the share",100,60,213,retained-deferred,0-3,0.6707317
+"warming, headphones 3 s before the share",100,60,213,retained-deferred,3-5,0.8875
+"warming, headphones 3 s before the share",100,60,213,retained-deferred,5-8,0.80246913
+"warming, headphones 3 s before the share",100,60,213,retained-deferred,8-16,0.7264151
+"warming, headphones 3 s before the share",100,60,176,retained-deferred,0-3,0.5625
+"warming, headphones 3 s before the share",100,60,176,retained-deferred,3-5,0.5875
+"warming, headphones 3 s before the share",100,60,176,retained-deferred,5-8,0.8385093
+"warming, headphones 3 s before the share",100,60,176,retained-deferred,8-16,0.7515723
+"warming, headphones 3 s before the share",100,60,251,retained-deferred,0-3,0.70886075
+"warming, headphones 3 s before the share",100,60,251,retained-deferred,3-5,0.79746836
+"warming, headphones 3 s before the share",100,60,251,retained-deferred,5-8,0.7962963
+"warming, headphones 3 s before the share",100,60,251,retained-deferred,8-16,0.7003155
+"warming, headphones 3 s before the share",100,150,213,retained-deferred,0-3,0.7195122
+"warming, headphones 3 s before the share",100,150,213,retained-deferred,3-5,0.6375
+"warming, headphones 3 s before the share",100,150,213,retained-deferred,5-8,0.82098764
+"warming, headphones 3 s before the share",100,150,213,retained-deferred,8-16,0.7798742
+"warming, headphones 3 s before the share",100,150,176,retained-deferred,0-3,0.6625
+"warming, headphones 3 s before the share",100,150,176,retained-deferred,3-5,0.675
+"warming, headphones 3 s before the share",100,150,176,retained-deferred,5-8,0.7826087
+"warming, headphones 3 s before the share",100,150,176,retained-deferred,8-16,0.8081761
+"warming, headphones 3 s before the share",100,150,251,retained-deferred,0-3,0.6962025
+"warming, headphones 3 s before the share",100,150,251,retained-deferred,3-5,0.7468355
+"warming, headphones 3 s before the share",100,150,251,retained-deferred,5-8,0.8518519
+"warming, headphones 3 s before the share",100,150,251,retained-deferred,8-16,0.8233439
+"warming, headphones 3 s before the share",150,20,213,retained-deferred,0-3,0.69512194
+"warming, headphones 3 s before the share",150,20,213,retained-deferred,3-5,0.85
+"warming, headphones 3 s before the share",150,20,213,retained-deferred,5-8,0.83950615
+"warming, headphones 3 s before the share",150,20,213,retained-deferred,8-16,0.827044
+"warming, headphones 3 s before the share",150,20,176,retained-deferred,0-3,0.5375
+"warming, headphones 3 s before the share",150,20,176,retained-deferred,3-5,0.4875
+"warming, headphones 3 s before the share",150,20,176,retained-deferred,5-8,0.60248446
+"warming, headphones 3 s before the share",150,20,176,retained-deferred,8-16,0.5628931
+"warming, headphones 3 s before the share",150,20,251,retained-deferred,0-3,0.6962025
+"warming, headphones 3 s before the share",150,20,251,retained-deferred,3-5,0.8227848
+"warming, headphones 3 s before the share",150,20,251,retained-deferred,5-8,0.8765432
+"warming, headphones 3 s before the share",150,20,251,retained-deferred,8-16,0.8675079
+"warming, headphones 3 s before the share",150,60,213,retained-deferred,0-3,0.6585366
+"warming, headphones 3 s before the share",150,60,213,retained-deferred,3-5,0.9
+"warming, headphones 3 s before the share",150,60,213,retained-deferred,5-8,0.7777778
+"warming, headphones 3 s before the share",150,60,213,retained-deferred,8-16,0.8081761
+"warming, headphones 3 s before the share",150,60,176,retained-deferred,0-3,0.5125
+"warming, headphones 3 s before the share",150,60,176,retained-deferred,3-5,0.4625
+"warming, headphones 3 s before the share",150,60,176,retained-deferred,5-8,0.621118
+"warming, headphones 3 s before the share",150,60,176,retained-deferred,8-16,0.5566038
+"warming, headphones 3 s before the share",150,60,251,retained-deferred,0-3,0.6962025
+"warming, headphones 3 s before the share",150,60,251,retained-deferred,3-5,0.84810126
+"warming, headphones 3 s before the share",150,60,251,retained-deferred,5-8,0.88271606
+"warming, headphones 3 s before the share",150,60,251,retained-deferred,8-16,0.82649845
+"warming, headphones 3 s before the share",150,150,213,retained-deferred,0-3,0.63414633
+"warming, headphones 3 s before the share",150,150,213,retained-deferred,3-5,0.8625
+"warming, headphones 3 s before the share",150,150,213,retained-deferred,5-8,0.7962963
+"warming, headphones 3 s before the share",150,150,213,retained-deferred,8-16,0.8301887
+"warming, headphones 3 s before the share",150,150,176,retained-deferred,0-3,0.55
+"warming, headphones 3 s before the share",150,150,176,retained-deferred,3-5,0.5375
+"warming, headphones 3 s before the share",150,150,176,retained-deferred,5-8,0.48447204
+"warming, headphones 3 s before the share",150,150,176,retained-deferred,8-16,0.572327
+"warming, headphones 3 s before the share",150,150,251,retained-deferred,0-3,0.6329114
+"warming, headphones 3 s before the share",150,150,251,retained-deferred,3-5,0.6455696
+"warming, headphones 3 s before the share",150,150,251,retained-deferred,5-8,0.7839506
+"warming, headphones 3 s before the share",150,150,251,retained-deferred,8-16,0.8233439
+"warming, headphones 3 s before the share",230,20,213,retained-deferred,0-3,0.5365854
+"warming, headphones 3 s before the share",230,20,213,retained-deferred,3-5,0.5875
+"warming, headphones 3 s before the share",230,20,213,retained-deferred,5-8,0.5802469
+"warming, headphones 3 s before the share",230,20,213,retained-deferred,8-16,0.6100629
+"warming, headphones 3 s before the share",230,20,176,retained-deferred,0-3,0.55
+"warming, headphones 3 s before the share",230,20,176,retained-deferred,3-5,0.525
+"warming, headphones 3 s before the share",230,20,176,retained-deferred,5-8,0.7329193
+"warming, headphones 3 s before the share",230,20,176,retained-deferred,8-16,0.8018868
+"warming, headphones 3 s before the share",230,20,251,retained-deferred,0-3,0.6075949
+"warming, headphones 3 s before the share",230,20,251,retained-deferred,3-5,0.6329114
+"warming, headphones 3 s before the share",230,20,251,retained-deferred,5-8,0.8518519
+"warming, headphones 3 s before the share",230,20,251,retained-deferred,8-16,0.84227127
+"warming, headphones 3 s before the share",230,60,213,retained-deferred,0-3,0.5365854
+"warming, headphones 3 s before the share",230,60,213,retained-deferred,3-5,0.55
+"warming, headphones 3 s before the share",230,60,213,retained-deferred,5-8,0.47530866
+"warming, headphones 3 s before the share",230,60,213,retained-deferred,8-16,0.49685535
+"warming, headphones 3 s before the share",230,60,176,retained-deferred,0-3,0.4625
+"warming, headphones 3 s before the share",230,60,176,retained-deferred,3-5,0.4625
+"warming, headphones 3 s before the share",230,60,176,retained-deferred,5-8,0.54658383
+"warming, headphones 3 s before the share",230,60,176,retained-deferred,8-16,0.572327
+"warming, headphones 3 s before the share",230,60,251,retained-deferred,0-3,0.65822786
+"warming, headphones 3 s before the share",230,60,251,retained-deferred,3-5,0.835443
+"warming, headphones 3 s before the share",230,60,251,retained-deferred,5-8,0.8518519
+"warming, headphones 3 s before the share",230,60,251,retained-deferred,8-16,0.829653
+"warming, headphones 3 s before the share",230,150,213,retained-deferred,0-3,0.5243902
+"warming, headphones 3 s before the share",230,150,213,retained-deferred,3-5,0.5125
+"warming, headphones 3 s before the share",230,150,213,retained-deferred,5-8,0.5802469
+"warming, headphones 3 s before the share",230,150,213,retained-deferred,8-16,0.5786164
+"warming, headphones 3 s before the share",230,150,176,retained-deferred,0-3,0.4875
+"warming, headphones 3 s before the share",230,150,176,retained-deferred,3-5,0.525
+"warming, headphones 3 s before the share",230,150,176,retained-deferred,5-8,0.47826087
+"warming, headphones 3 s before the share",230,150,176,retained-deferred,8-16,0.6132075
+"warming, headphones 3 s before the share",230,150,251,retained-deferred,0-3,0.5949367
+"warming, headphones 3 s before the share",230,150,251,retained-deferred,3-5,0.65822786
+"warming, headphones 3 s before the share",230,150,251,retained-deferred,5-8,0.7654321
+"warming, headphones 3 s before the share",230,150,251,retained-deferred,8-16,0.82649845
+"in charge, then another room",100,20,213,retained-deferred,0-1,-44.254322
+"in charge, then another room",100,20,213,retained-deferred,2-3,-38.97574
+"in charge, then another room",100,20,213,retained-deferred,4-5,-39.3926
+"in charge, then another room",100,20,213,retained-deferred,6-7,-66.71815
+"in charge, then another room",100,20,213,retained-deferred,8-9,-60.40274
+"in charge, then another room",100,20,176,retained-deferred,0-1,-53.67073
+"in charge, then another room",100,20,176,retained-deferred,2-3,-45.63898
+"in charge, then another room",100,20,176,retained-deferred,4-5,-39.06505
+"in charge, then another room",100,20,176,retained-deferred,6-7,-64.21919
+"in charge, then another room",100,20,176,retained-deferred,8-9,-48.385654
+"in charge, then another room",100,20,251,retained-deferred,0-1,-38.586304
+"in charge, then another room",100,20,251,retained-deferred,2-3,-37.352577
+"in charge, then another room",100,20,251,retained-deferred,4-5,-36.14615
+"in charge, then another room",100,20,251,retained-deferred,6-7,-66.98083
+"in charge, then another room",100,20,251,retained-deferred,8-9,-66.95626
+"in charge, then another room",100,60,213,retained-deferred,0-1,-45.256622
+"in charge, then another room",100,60,213,retained-deferred,2-3,-43.004524
+"in charge, then another room",100,60,213,retained-deferred,4-5,-64.47631
+"in charge, then another room",100,60,213,retained-deferred,6-7,-66.745445
+"in charge, then another room",100,60,213,retained-deferred,8-9,-42.544075
+"in charge, then another room",100,60,176,retained-deferred,0-1,-45.48184
+"in charge, then another room",100,60,176,retained-deferred,2-3,-41.10214
+"in charge, then another room",100,60,176,retained-deferred,4-5,-41.379658
+"in charge, then another room",100,60,176,retained-deferred,6-7,-40.737476
+"in charge, then another room",100,60,176,retained-deferred,8-9,-46.48785
+"in charge, then another room",100,60,251,retained-deferred,0-1,-39.650097
+"in charge, then another room",100,60,251,retained-deferred,2-3,-37.348953
+"in charge, then another room",100,60,251,retained-deferred,4-5,-39.156063
+"in charge, then another room",100,60,251,retained-deferred,6-7,-66.93283
+"in charge, then another room",100,60,251,retained-deferred,8-9,-67.359535
+"in charge, then another room",100,150,213,retained-deferred,0-1,-69.559265
+"in charge, then another room",100,150,213,retained-deferred,2-3,-44.924435
+"in charge, then another room",100,150,213,retained-deferred,4-5,-41.863083
+"in charge, then another room",100,150,213,retained-deferred,6-7,-68.3994
+"in charge, then another room",100,150,213,retained-deferred,8-9,-60.072617
+"in charge, then another room",100,150,176,retained-deferred,0-1,-44.278217
+"in charge, then another room",100,150,176,retained-deferred,2-3,-45.715214
+"in charge, then another room",100,150,176,retained-deferred,4-5,-51.95064
+"in charge, then another room",100,150,176,retained-deferred,6-7,-41.330727
+"in charge, then another room",100,150,176,retained-deferred,8-9,-46.358353
+"in charge, then another room",100,150,251,retained-deferred,0-1,-41.573517
+"in charge, then another room",100,150,251,retained-deferred,2-3,-42.408333
+"in charge, then another room",100,150,251,retained-deferred,4-5,-38.1756
+"in charge, then another room",100,150,251,retained-deferred,6-7,-67.13691
+"in charge, then another room",100,150,251,retained-deferred,8-9,-67.78407
+"in charge, then another room",150,20,213,retained-deferred,0-1,-42.361465
+"in charge, then another room",150,20,213,retained-deferred,2-3,-43.60756
+"in charge, then another room",150,20,213,retained-deferred,4-5,-69.44741
+"in charge, then another room",150,20,213,retained-deferred,6-7,-70.353485
+"in charge, then another room",150,20,213,retained-deferred,8-9,-40.606346
+"in charge, then another room",150,20,176,retained-deferred,0-1,-44.22823
+"in charge, then another room",150,20,176,retained-deferred,2-3,-51.93829
+"in charge, then another room",150,20,176,retained-deferred,4-5,-67.74541
+"in charge, then another room",150,20,176,retained-deferred,6-7,-67.49786
+"in charge, then another room",150,20,176,retained-deferred,8-9,-45.434868
+"in charge, then another room",150,20,251,retained-deferred,0-1,-40.789154
+"in charge, then another room",150,20,251,retained-deferred,2-3,-39.317665
+"in charge, then another room",150,20,251,retained-deferred,4-5,-71.65402
+"in charge, then another room",150,20,251,retained-deferred,6-7,-71.42342
+"in charge, then another room",150,20,251,retained-deferred,8-9,-71.22876
+"in charge, then another room",150,60,213,retained-deferred,0-1,-41.283077
+"in charge, then another room",150,60,213,retained-deferred,2-3,-42.39918
+"in charge, then another room",150,60,213,retained-deferred,4-5,-63.229446
+"in charge, then another room",150,60,213,retained-deferred,6-7,-71.57901
+"in charge, then another room",150,60,213,retained-deferred,8-9,-40.66811
+"in charge, then another room",150,60,176,retained-deferred,0-1,-41.987625
+"in charge, then another room",150,60,176,retained-deferred,2-3,-51.043846
+"in charge, then another room",150,60,176,retained-deferred,4-5,-69.22125
+"in charge, then another room",150,60,176,retained-deferred,6-7,-67.03568
+"in charge, then another room",150,60,176,retained-deferred,8-9,-46.143967
+"in charge, then another room",150,60,251,retained-deferred,0-1,-40.625896
+"in charge, then another room",150,60,251,retained-deferred,2-3,-38.464867
+"in charge, then another room",150,60,251,retained-deferred,4-5,-70.03496
+"in charge, then another room",150,60,251,retained-deferred,6-7,-71.77783
+"in charge, then another room",150,60,251,retained-deferred,8-9,-71.49808
+"in charge, then another room",150,150,213,retained-deferred,0-1,-43.382767
+"in charge, then another room",150,150,213,retained-deferred,2-3,-44.852432
+"in charge, then another room",150,150,213,retained-deferred,4-5,-40.31824
+"in charge, then another room",150,150,213,retained-deferred,6-7,-71.50909
+"in charge, then another room",150,150,213,retained-deferred,8-9,-42.425823
+"in charge, then another room",150,150,176,retained-deferred,0-1,-43.53985
+"in charge, then another room",150,150,176,retained-deferred,2-3,-57.96702
+"in charge, then another room",150,150,176,retained-deferred,4-5,-70.88664
+"in charge, then another room",150,150,176,retained-deferred,6-7,-39.842754
+"in charge, then another room",150,150,176,retained-deferred,8-9,-46.362022
+"in charge, then another room",150,150,251,retained-deferred,0-1,-44.03234
+"in charge, then another room",150,150,251,retained-deferred,2-3,-40.146503
+"in charge, then another room",150,150,251,retained-deferred,4-5,-41.986652
+"in charge, then another room",150,150,251,retained-deferred,6-7,-72.20662
+"in charge, then another room",150,150,251,retained-deferred,8-9,-70.65904
+"in charge, then another room",230,20,213,retained-deferred,0-1,-47.862915
+"in charge, then another room",230,20,213,retained-deferred,2-3,-43.82551
+"in charge, then another room",230,20,213,retained-deferred,4-5,-43.343815
+"in charge, then another room",230,20,213,retained-deferred,6-7,-54.585747
+"in charge, then another room",230,20,213,retained-deferred,8-9,-37.629425
+"in charge, then another room",230,20,176,retained-deferred,0-1,-36.733868
+"in charge, then another room",230,20,176,retained-deferred,2-3,-42.607826
+"in charge, then another room",230,20,176,retained-deferred,4-5,-45.77146
+"in charge, then another room",230,20,176,retained-deferred,6-7,-43.274033
+"in charge, then another room",230,20,176,retained-deferred,8-9,-40.81337
+"in charge, then another room",230,20,251,retained-deferred,0-1,-35.151344
+"in charge, then another room",230,20,251,retained-deferred,2-3,-38.355316
+"in charge, then another room",230,20,251,retained-deferred,4-5,-44.682396
+"in charge, then another room",230,20,251,retained-deferred,6-7,-44.54866
+"in charge, then another room",230,20,251,retained-deferred,8-9,-41.53011
+"in charge, then another room",230,60,213,retained-deferred,0-1,-49.121445
+"in charge, then another room",230,60,213,retained-deferred,2-3,-40.583946
+"in charge, then another room",230,60,213,retained-deferred,4-5,-48.919456
+"in charge, then another room",230,60,213,retained-deferred,6-7,-52.57161
+"in charge, then another room",230,60,213,retained-deferred,8-9,-39.78977
+"in charge, then another room",230,60,176,retained-deferred,0-1,-46.284107
+"in charge, then another room",230,60,176,retained-deferred,2-3,-41.638794
+"in charge, then another room",230,60,176,retained-deferred,4-5,-49.384403
+"in charge, then another room",230,60,176,retained-deferred,6-7,-38.8031
+"in charge, then another room",230,60,176,retained-deferred,8-9,-42.036354
+"in charge, then another room",230,60,251,retained-deferred,0-1,-34.558453
+"in charge, then another room",230,60,251,retained-deferred,2-3,-35.992107
+"in charge, then another room",230,60,251,retained-deferred,4-5,-50.326866
+"in charge, then another room",230,60,251,retained-deferred,6-7,-49.133472
+"in charge, then another room",230,60,251,retained-deferred,8-9,-45.138454
+"in charge, then another room",230,150,213,retained-deferred,0-1,-41.20788
+"in charge, then another room",230,150,213,retained-deferred,2-3,-39.77157
+"in charge, then another room",230,150,213,retained-deferred,4-5,-46.872936
+"in charge, then another room",230,150,213,retained-deferred,6-7,-57.854668
+"in charge, then another room",230,150,213,retained-deferred,8-9,-40.63383
+"in charge, then another room",230,150,176,retained-deferred,0-1,-38.975643
+"in charge, then another room",230,150,176,retained-deferred,2-3,-53.797905
+"in charge, then another room",230,150,176,retained-deferred,4-5,-49.211586
+"in charge, then another room",230,150,176,retained-deferred,6-7,-39.81233
+"in charge, then another room",230,150,176,retained-deferred,8-9,-45.789337
+"in charge, then another room",230,150,251,retained-deferred,0-1,-37.869255
+"in charge, then another room",230,150,251,retained-deferred,2-3,-38.048214
+"in charge, then another room",230,150,251,retained-deferred,4-5,-46.647724
+"in charge, then another room",230,150,251,retained-deferred,6-7,-53.864056
+"in charge, then another room",230,150,251,retained-deferred,8-9,-55.826027

@@ -1027,21 +1027,19 @@ measurement arm is available only through a dev-dependency feature. Stereo still
 pins on the first share sound. The per-content option must dominate every case and
 window before it can be considered for production.
 
-**State / next steps (post-wake WIP, 2026-11-02):** current stereo remains selected.
-Route-window floors and recorded-speech holds remain blockers. The per-content
-selector fails dominance and is rejected. The two-window worker detector repairs
-the inherited drops, but it does not meet both baseline floors in every window.
-A retained candidate with delayed takeover is being measured as a diagnostic;
-it is not enabled in production. The tested denoiser workaround leaks echo and
-is rejected.
+**State / next steps (post-wake stop, 2026-11-02): NOT READY FOR REVIEW.**
+Current stereo remains selected. The current route detector misses five of 17
+mean baseline floors; retaining and deferring the candidate still misses three
+and is rejected. The per-content selector fails dominance and is rejected.
+Recorded speech is held for 510 active frames; the tested native-AEC and denoiser
+workarounds do not fix it without lost echo removal. The four-share test stops
+in its third pair with 1,399 sent frames, below its >1,500-frame guard.
 
-The interrupted full run is not counted. The post-wake full release workspace
-run passed 1,496 tests (39 ignored), and final release clippy passed. The Linux
-build and PulseAudio null-sink test passed CI on `a298543b`; its Rust job failed
-only the measurement-loop clippy warning, now fixed and verified locally.
-Fingerprints/heap, four-share timing and the exact acoustic acceptance probes are
-being repeated on the final client binary. PR #223 remains a draft and is not
-ready for review.
+The owner's no-compromise instruction requires stopping here. Before review,
+fix and pass the route floors, recorded-speech hold and full six-pair four-share
+run, then obtain green CI for the final head. No compromise was enabled to make
+these results appear to pass. Completed data and exact failing probes are
+preserved below and in the measurement artifacts.
 
 The comparisons ran on arm64 macOS, release, Rust 1.99.1, one test at a time with
 `nice -n 10`. No audio device, browser, WebKit, application bundle or production
@@ -1278,7 +1276,7 @@ are synthetic AEC-only runs, without gain, gate, denoising or Opus. Headphone
 windows are 0-3 / 3-5 / 5-8 / 8-16 s after the later of the pin and the move.
 Another-room cells are echo dBFS in seconds 0, 2, 4, 6 and 8 after the move, while
 the near talker is silent; lower is better. Means do not establish every room's
-acceptance. All 4,131 individual observations, including diagnostic arms, are in
+acceptance. All 4,590 individual observations, including diagnostic arms, are in
 [aec-route-cases.csv](measurements/aec-route-cases.csv).
 
 `worker-only` removes the inherited in-charge acoustic replacement. `worker-faster`
@@ -1333,6 +1331,27 @@ three-second move. In the other room, its second-2 echo is -42.994 dBFS versus
 -43.477 before #220. `route_gaps_reach_both_baselines` makes this acceptance
 failure explicit; an ignored comparison completing successfully is not a pass
 of that requirement.
+
+The final post-wake experiment keeps the old filter after the absence detector
+fires, but waits the full three-second learning interval after the pin before
+using it. It is measurement-only:
+
+| Scenario | Retained candidate, delayed takeover |
+| --- | --- |
+| in charge, then headphones | 0.531 / 0.536 / 0.648 / 0.724 |
+| warming, headphones 8 s before the share | 0.784 / 0.735 / 0.742 / 0.734 |
+| warming, headphones 3 s before the share | 0.615 / 0.676 / 0.733 / 0.733 |
+| in charge, then another room | -43.419 / -42.994 / -51.159 / -58.773 / -50.762 |
+
+This changes the trade-off rather than satisfying the floor. With headphones
+three seconds before the pin, it improves 3-5 s to 0.676 but loses 5-8 s against
+before-#220 (0.733 versus 0.770). With an eight-second move it loses that same
+window (0.742 versus 0.770). Its other-room echo still loses second 2. The option
+is rejected. The 2,295 repeated baseline/current/native observations reproduce
+the completed pre-sleep values exactly; 459 retained/deferred observations are
+added to the route CSV. The current two-window candidate still misses five of
+17 mean cells; the deferred variant misses three. Neither is accepted as a
+complete route-gap fix. Per-room comparisons are stricter still.
 
 The per-second observations are preserved in
 [aec-route-tone-probes.txt](measurements/aec-route-tone-probes.txt). They isolate
@@ -1531,15 +1550,54 @@ the post-filter do not eliminate the recorded-speech hold. Skipping its complex
 filter preserves more of the near projection, but is rejected: the pure-echo
 3-8 s level changes from -65.31 to -7.21 dBFS, **58.11 dB louder**. Its apparent
 1.0 "kept" therefore cannot be read as complete voice preservation.
+A corrected post-wake native-gain-change probe at the first share sound, with
+all model stages retained, also reaches 510 held decoded speech frames (kept
+0.142). It is rejected as a speech fix. This measurement uses separate typed
+controls for warm/gain/model options; the earlier exploratory native-speech log
+with overlapping numeric conditions is excluded from committed evidence.
+
 These denoiser and native-AEC controls are feature-gated diagnostics supplied
-only by dev dependencies. No such workaround is enabled in production.
+only by dev dependencies. The normal/build dependency graph contains neither
+`gwar-aec-measurements` nor `model-measurements`. No such workaround is enabled
+in production.
 
 #### Post-wake validation and reproduction
 
 The pre-sleep full workspace run is incomplete and is not counted. It was stopped
-before sleep; all completed raw acoustic measurements above finished before sleep.
-The full suite and remaining exact acceptance probes are rerun after the owner's
-17:56 wake time. Final command results and CI status will be recorded here.
+before sleep; completed acoustic measurements finished before sleep. After the
+owner's 17:56 wake, the full suite and exact acceptance probes were rerun.
+[Full post-wake evidence](measurements/aec-post-wake-validation.txt) preserves
+commands, all output and the failures, including the completed pre-sleep FIFO
+simulation. Results are:
+
+| Requirement | Result |
+| --- | --- |
+| Full release workspace, excluding desktop | **PASS:** 1,496 passed, 39 ignored, 56 binaries/doc suites at resumed `a298543b` |
+| Final APM after diagnostic-only source changes | **PASS:** 54 passed, 24 ignored at `2b489471`; all four voice-thread heap guards passed, including replacement/refusal |
+| Voice-alone and warmed fingerprints | **PASS:** both `c2d868db7d8d0eeb`, rerun after wake |
+| Release workspace clippy, all targets, warnings denied | **PASS** at `2b489471`; fixes CI's needless-range-loop warning |
+| Production dependency feature isolation | **PASS:** neither diagnostic feature present in the normal/build graph |
+| 1 Mb/s FIFO simulation | **PASS:** completed before sleep, 9.048-9.288 ms p99; also active in the repeated full suite |
+| Four-share full six-pair p99 delta <=1 ms | **FAIL / not established:** third pair stops on sent-frame guard, 1,998 without shares / 1,399 with four shares, required >1,500 each |
+| Route floors against both baselines | **FAIL:** current candidate misses five of 17 mean cells; deferred arm misses three; per-case acceptance is not established |
+| Recorded speech without long holds | **FAIL:** executed acceptance probe exits 101; 510 held decoded active frames versus 3 without AEC |
+| Per-content option dominates current stereo | **FAIL / rejected:** 168 of 432 case/windows fail strict dominance; no production selection |
+| Linux build and PulseAudio null sinks | **PASS** in [a298543b CI](https://github.com/MaciejWlodarski/gwar/actions/runs/41476145382), `rust-voice` including `a_default_the_server_moves_is_seen`; `native-build` and Linux desktop also pass |
+| Overall CI | a298543b failed only measurement-loop clippy, now fixed locally; [2b489471 CI](https://github.com/MaciejWlodarski/gwar/actions/runs/41487816694) was queued at the last check. Green CI on the final head is not established |
+
+The two completed timing pairs were:
+
+| Pair/order | No-share p99, ms | Four-share p99, ms | Delta, ms |
+| --- | --- | --- | --- |
+| 0: 0, then 4 | 0.203 | 0.259 | +0.056 |
+| 1: 4, then 0 | 0.236 | 0.293 | +0.058 |
+
+The third pair fails before its percentiles are reported. These two rows do not
+prove the six-pair hard limit. The failure is preserved rather than rerunning
+until a favorable sample appears. No further measurements are run after this
+hard-limit failure. Formatting and diff checks are completed before the final
+checkpoint commit. The final documentation-only head's CI status is reported in
+the PR body.
 
 ```sh
 CARGO_TARGET_DIR=/tmp/gwar-aec-sol CARGO_BUILD_JOBS=4 nice -n 10 cargo test --locked --release --workspace --exclude gwar-desktop -- --test-threads=1
