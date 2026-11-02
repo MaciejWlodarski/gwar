@@ -14,6 +14,7 @@
 //! and default constants, enabling compatible bandwidth discovery with WebRTC endpoints.
 
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::fmt;
 use std::time::{Duration, Instant};
 
@@ -52,6 +53,11 @@ pub(crate) use probe::ProbeClusterConfig;
 const INITIAL_BITRATE_WINDOW: Duration = Duration::from_millis(500);
 const BITRATE_WINDOW: Duration = Duration::from_millis(150);
 const STARTUP_PHASE: Duration = Duration::from_secs(2);
+/// A saturated probe cluster counts against this many recent ones, this recent.
+const RECENT_PROBES: usize = 3;
+const RECENT_PROBE_AGE: Duration = Duration::from_secs(4);
+/// Clusters of a full link agree this closely.
+const PROBE_AGREEMENT: f64 = 0.75;
 
 pub struct Bwe {
     bwe: SendSideBandwidthEstimator,
@@ -157,6 +163,12 @@ impl Bwe {
     }
 }
 
+struct RecentProbe {
+    cluster: TwccClusterId,
+    at: Instant,
+    bitrate: Bitrate,
+}
+
 struct SendSideBandwidthEstimator {
     delay_controller: DelayController,
     loss_controller: LossController,
@@ -166,6 +178,8 @@ struct SendSideBandwidthEstimator {
     started_at: Option<Instant>,
     alr_detector: AlrDetector,
     last_updated_estimate: Option<Bitrate>,
+    /// What the latest probe clusters showed, oldest first.
+    recent_probes: VecDeque<RecentProbe>,
     application_paced: bool,
 }
 
@@ -189,6 +203,7 @@ impl SendSideBandwidthEstimator {
             started_at: None,
             alr_detector,
             last_updated_estimate: None,
+            recent_probes: VecDeque::new(),
             application_paced: false,
         }
     }
@@ -220,9 +235,9 @@ impl SendSideBandwidthEstimator {
         let mut latest_probe_capacity = None;
         let previous_delay_estimate = self.delay_controller.last_estimate();
         let previous_estimate = self.last_estimate();
-        for (config, bitrate, saturated) in
-            self.probe_estimator.update(send_records.iter().copied())
-        {
+        let probes: Vec<_> = self.probe_estimator.update(send_records.iter().copied()).collect();
+        for (config, bitrate, saturated) in probes {
+            let best = self.remember_probe(config.cluster(), bitrate, now);
             // A paced probe whose receive rate matches its actual send rate only
             // demonstrates a capacity floor. Local underfill cannot lower a prior
             // estimate; ordinary delay/loss feedback still detects congestion.
@@ -235,6 +250,15 @@ impl SendSideBandwidthEstimator {
                 // A floor can recover a lower loss estimate without inventing
                 // evidence for the higher delay ceiling, or lowering that ceiling.
                 bitrate.max(previous_delay_estimate.unwrap_or(bitrate))
+            } else if previous_estimate.is_some_and(|previous| bitrate < previous)
+                && bitrate.as_f64() < best.as_f64() * PROBE_AGREEMENT
+            {
+                // A cluster lasts a few milliseconds, so jitter on the link alone can read as
+                // saturation. A link that is full shows it in cluster after cluster, alike.
+                if previous_estimate.is_some_and(|previous| best >= previous) {
+                    continue;
+                }
+                best
             } else {
                 bitrate
             };
@@ -415,6 +439,19 @@ impl SendSideBandwidthEstimator {
         }
     }
 
+    /// Adds a cluster's latest result and returns the best of the recent ones.
+    fn remember_probe(&mut self, cluster: TwccClusterId, bitrate: Bitrate, now: Instant) -> Bitrate {
+        self.recent_probes.retain(|probe| {
+            probe.cluster != cluster && now.saturating_duration_since(probe.at) < RECENT_PROBE_AGE
+        });
+        self.recent_probes.push_back(RecentProbe { cluster, at: now, bitrate });
+        while self.recent_probes.len() > RECENT_PROBES {
+            self.recent_probes.pop_front();
+        }
+        let best = self.recent_probes.iter().map(|probe| probe.bitrate.as_f64()).fold(0.0, f64::max);
+        Bitrate::bps(best as u64)
+    }
+
     /// Get the latest estimate.
     pub fn last_estimate(&self) -> Option<Bitrate> {
         let delay_estimate = self.delay_controller.last_estimate();
@@ -570,6 +607,21 @@ mod tests {
                 "the policy ceiling cannot suppress capacity discovery"
             );
         }
+    }
+
+    #[test]
+    fn only_clusters_in_a_row_can_call_the_link_saturated() {
+        let base = Instant::now();
+        let mut controller = Bwe::new(Bitrate::mbps(5));
+        let bwe = &mut controller.bwe;
+        let at = |seconds| base + Duration::from_secs(seconds);
+        let mbps = |mbps| Bitrate::mbps(mbps);
+        assert_eq!(bwe.remember_probe(1.into(), mbps(9), at(0)), mbps(9));
+        assert_eq!(bwe.remember_probe(2.into(), mbps(3), at(1)), mbps(9), "one low cluster");
+        assert_eq!(bwe.remember_probe(2.into(), mbps(2), at(1)), mbps(9), "the same cluster again");
+        assert_eq!(bwe.remember_probe(3.into(), mbps(3), at(2)), mbps(9));
+        assert_eq!(bwe.remember_probe(4.into(), mbps(3), at(3)), mbps(3), "three in a row");
+        assert_eq!(bwe.remember_probe(5.into(), mbps(2), at(9)), mbps(2), "old ones say nothing");
     }
 
     #[test]

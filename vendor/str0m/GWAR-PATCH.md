@@ -254,3 +254,15 @@ sender reports. Track IDs remain distinct; ordinary `accept_offer` uses no group
 and preserves its behavior. Gwar uses this for paired screen receivers so
 libwebrtc negotiates synchronization rather than merely combining tracks in JS.
 The server regression checks both the actual answer and stored media identities.
+
+A saturated probe cluster no longer lowers the estimate on its own when it is far
+below the recent ones. A cluster lasts about 8 ms, so 10 ms of jitter on the link
+is enough to stretch its arrival and read as saturation, and an estimate lowered
+that way cannot climb back: the SFU then sends less, which caps it at 1.5 times
+what was acknowledged. A result under 0.75 of the best of the last three clusters
+within 4 s now moves the estimate only down to that best. A full link shows it in
+cluster after cluster, alike, and those lower it as before; delay and loss feedback
+are unchanged. Measuring the link's delay spread instead was tried and dropped: a
+real queue widens it too, which hid saturation and raised voice's p99 past its
+bound in `share_audio_keeps_voice_inside_existing_steady_and_startup_bounds`.
+`only_clusters_in_a_row_can_call_the_link_saturated` covers the memory.
