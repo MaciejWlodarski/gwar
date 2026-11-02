@@ -135,6 +135,8 @@ async function run(engine, web) {
     assert.ok(Math.abs(result.passed + 30) < 1, `inactive: preserves the mono source's -30 dBFS (${result.passed.toFixed(1)} dBFS)`);
     assert.ok(result.cleaned < result.passed - 20, `active: noise down by more than 20 dB (${result.passed.toFixed(1)} → ${result.cleaned.toFixed(1)} dBFS)`);
     assert.ok(result.bypassed > -35, `inactive: a voice at -20 dBFS passes as captured (${result.bypassed.toFixed(1)} dBFS)`);
+    const voiceAndNoise = 10 * Math.log10(10 ** (-20 / 10) + 10 ** (-30 / 10));
+    assert.ok(Math.abs(result.bypassed - voiceAndNoise) < 1, `inactive: preserves the voice and noise power (${result.bypassed.toFixed(1)} dBFS)`);
     assert.ok(result.spoken > result.bypassed - 6, `active: the model keeps a voice over the noise (${result.bypassed.toFixed(1)} → ${result.spoken.toFixed(1)} dBFS)`);
     results.push({ engine, status: "pass", ...result, errors });
   } finally { await browser.close(); }

@@ -107,8 +107,8 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
       channelCountMode: "explicit",
     });
     const destination = context.createMediaStreamDestination();
-    // The worklet produces mono. Keep the stream mono too: WebKit's stereo stream bridge
-    // can read its duplicated channels at different positions and attenuate their downmix.
+    // Preserve the worklet's mono channel count at the MediaStream boundary. The default
+    // stereo upmix/downmix changes the observed level on some WebKit stream bridges.
     destination.channelCount = 1;
     node.connect(destination);
     const post = (request: Request, transfer: Transferable[] = []) => node.port.postMessage(request, transfer);
