@@ -401,7 +401,7 @@ impl EchoCanceller3 {
         let capture_sub_frame_view =
             vec![vec![vec![0.0_f32; SUB_FRAME_LENGTH]; num_capture_channels]; num_bands];
 
-        Self {
+        let mut canceller = Self {
             sample_rate_hz,
             num_bands,
             num_render_input_channels: num_render_channels,
@@ -426,7 +426,10 @@ impl EchoCanceller3 {
             block_processor,
             saturated_microphone_signal: false,
             api_call_metrics: ApiCallJitterMetrics::new(),
-        }
+        };
+        // Gwar: match upstream construction, including a detector disabled at startup.
+        canceller.initialize();
+        canceller
     }
 
     /// Re-initializes internal state (called when stereo content changes).
@@ -761,7 +764,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "failing-first native channel wiring regression; run before/after constructor fix"]
     fn disabled_detection_must_keep_all_render_reference_channels() {
         let mut config = EchoCanceller3Config::default();
         config.multi_channel.detect_stereo_content = false;

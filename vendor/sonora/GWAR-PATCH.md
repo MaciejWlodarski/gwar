@@ -6,17 +6,20 @@ Source: the `sonora` crate 0.2.0 from crates.io, the release Gwar used before
 benches and their optional dependencies, which are not vendored. Its `sonora-*`
 sub-crates originally came from crates.io; PR #223 also vendors `sonora-aec3` for native-state diagnostics.
 
-The only source change, marked `Gwar:` in `src/config.rs` and
-`src/audio_processing_impl.rs`, is one option, `EchoCanceller.detect_stereo_content`:
+The configuration changes, marked `Gwar:` in `src/config.rs` and
+`src/audio_processing_impl.rs`, include `EchoCanceller.detect_stereo_content`:
 
 - True, the default, is upstream's behaviour. One render channel, which is all
   Gwar uses for voice alone, takes no path this patch touches: a voice session
   stays bit for bit what it was (`voice_alone_is_mains_canceller_to_the_bit`).
 - False turns off AEC3's content detector. The original intention was to cancel
   both reference channels immediately. PR #223 found that Sonora's constructor
-  still hardcodes one render channel and never calls `initialize` while detection
-  is disabled, so the historical path actually uses only the left reference.
-  Correct native initialization is measured separately before production selection.
+  hardcoded one render channel and never called `initialize` while detection
+  was disabled, so the historical path used only the left reference. The separate
+  constructor fix now calls `initialize`, as WebRTC does, so the initial channel
+  count follows the detector. `disabled_detection_must_keep_all_render_reference_channels`
+  is an active regression test. This fixes reference wiring without selecting any
+  experimental suppressor profile.
 - The transparent mode now reaches the multichannel config too. Upstream leaves
   that config on Legacy whatever was asked for.
 
