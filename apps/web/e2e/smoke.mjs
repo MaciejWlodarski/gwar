@@ -38,7 +38,7 @@ import { chromium } from "playwright";
 import { installMicPrivacyGuard } from "./mic-privacy.mjs";
 import { sendComposer } from "./composer-actions.mjs";
 import { stopProcesses } from "./processes.mjs";
-import { verificationState } from "./verification-state.mjs";
+import { settledVerificationState } from "./verification-state.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(here, "..");
@@ -2056,12 +2056,8 @@ async function main() {
             throw error;
           });
         } else if (tab) await page.getByRole("tab", { name: tab }).click();
-        let verification;
-        await waitFor(async () => {
-          verification = await verificationState(page);
-          return verification.pending === 0;
-        }, "message verification complete");
-        if (verification.flags || verification.signatureValid) {
+        const verification = await settledVerificationState(page);
+        if (verification.pending || verification.flags || verification.signatureValid) {
           const diagnostic = await page.evaluate(async () => {
             const snapshot = () => ({
               pending: [...document.querySelectorAll('[data-message][data-message-verification="pending"]')].map(row => row.getAttribute("data-message")),
