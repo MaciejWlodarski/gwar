@@ -640,6 +640,8 @@ struct Cpal {
     active: [Active; 2],
     /// The last offers read, standing in when enumeration fails.
     offers: [std::cell::RefCell<Offer>; 2],
+    /// Default-device notifications, and where a default really plays when the device does not tell.
+    watch: Option<watch::Watch>,
 }
 
 /// Runs a cpal call that may panic (wasapi's `description()` expects its property store),
@@ -677,7 +679,15 @@ impl Backend for Cpal {
         let read = || device_offer(&self.host, side);
         let last = &self.offers[lane_index(side)];
         match guarded("audio device enumeration", read) {
-            Ok(offer) => *last.borrow_mut() = offer,
+            Ok(mut offer) => {
+                if let Some(endpoint) = self.watch.as_ref().and_then(|watch| watch.endpoint(side)) {
+                    offer.default_id = Some(match offer.default_id.take() {
+                        Some(device) => format!("{device} {endpoint}"),
+                        None => endpoint,
+                    });
+                }
+                *last.borrow_mut() = offer;
+            }
             Err(e) => tracing::warn!("{e:#}"),
         }
         last.borrow().clone()
@@ -705,7 +715,8 @@ impl Backend for Cpal {
 
     fn reroutes(&self, side: Side) -> bool {
         // cpal opens the macOS default output as a default-output AudioUnit, which follows the default.
-        cfg!(target_os = "macos") && side == Side::Output
+        // On Linux the sound server moves both sides of ALSA's `default` by itself.
+        (cfg!(target_os = "macos") && side == Side::Output) || self.watch.as_ref().is_some_and(watch::Watch::reroutes)
     }
 
     fn route_changed(&mut self) {
@@ -979,6 +990,10 @@ impl AudioIo for DeviceIo {
         // CoreAudio listeners are added and removed on it.
         thread::Builder::new().name("gwar-audio-devices".into()).spawn(move || {
             device_thread(stopped, || {
+                let changed = events.clone();
+                let watch = watch::start(move || {
+                    let _ = changed.send(Event::Changed);
+                });
                 let backend = Cpal {
                     host: cpal::default_host(),
                     mic: Arc::new(Mutex::new(MicFeed { tx: mic_tx, position: 0, last: None })),
@@ -986,11 +1001,8 @@ impl AudioIo for DeviceIo {
                     timing,
                     active: Default::default(),
                     offers: Default::default(),
+                    watch,
                 };
-                let changed = events.clone();
-                let _watch = watch::start(move || {
-                    let _ = changed.send(Event::Changed);
-                });
                 let sink = on_issue.clone();
                 let mut router = Router::new(backend, input, speakers, events, on_issue);
                 router.lanes[1].enabled = !input_only;
@@ -1176,6 +1188,8 @@ mod router_tests {
         /// The stream each side plays, by number.
         active: [u64; 2],
         rerouting_output: bool,
+        /// A sound server moves the default microphone too (Linux).
+        rerouting_input: bool,
         route_changes: usize,
     }
 
@@ -1204,7 +1218,10 @@ mod router_tests {
             self.active[lane_index(side)] = id;
         }
         fn reroutes(&self, side: Side) -> bool {
-            self.rerouting_output && side == Side::Output
+            match side {
+                Side::Input => self.rerouting_input,
+                Side::Output => self.rerouting_output,
+            }
         }
         fn route_changed(&mut self) {
             self.route_changes += 1;
@@ -1395,6 +1412,32 @@ mod router_tests {
         s.router.tick(now + SETTLE * 2);
         assert_eq!(s.fake().route_changes, 1, "not the same one");
         assert!(s.opened().is_empty(), "the stream stays");
+    }
+
+    #[test]
+    fn a_default_a_sound_server_moves_is_told_to_the_engine() {
+        // Linux: ALSA's default stays the device, the server moves what is behind it, a sink or
+        // only its port, on either side.
+        let now = Instant::now();
+        let mut laptop = laptop();
+        laptop.offers[0].default_id = Some("alsa:default builtin#analog-input-internal-mic".into());
+        laptop.offers[1].default_id = Some("alsa:default builtin#analog-output-speaker".into());
+        let mut s = Setup::new(Fake { rerouting_output: true, rerouting_input: true, ..laptop }, None, None);
+        s.router.start(now);
+        s.opened();
+        s.fake().route_changes = 0;
+        s.fake().offers[1].default_id = Some("alsa:default builtin#analog-output-headphones".into());
+        s.router.handle(Event::Changed, now);
+        s.router.tick(now + SETTLE);
+        assert_eq!(s.fake().route_changes, 1, "headphones in the jack");
+        s.fake().offers[0].default_id = Some("alsa:default usb-headset".into());
+        s.router.handle(Event::Changed, now + SETTLE);
+        s.router.tick(now + SETTLE * 2);
+        assert_eq!(s.fake().route_changes, 2, "another microphone");
+        s.router.handle(Event::Changed, now + SETTLE * 2);
+        s.router.tick(now + SETTLE * 3);
+        assert_eq!(s.fake().route_changes, 2, "nothing moved");
+        assert!(s.opened().is_empty(), "the streams stay");
     }
 
     #[test]
