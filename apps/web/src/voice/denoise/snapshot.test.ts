@@ -132,11 +132,20 @@ describe.skipIf(!present && !process.env.CI)("the worker hands the model to the 
     const processor = new Registered!();
     const channel = new MessageChannel();
     const handed: string[] = [];
+    let inFlight = 0, mostInFlight = 0;
+    const request = channel.port2.postMessage.bind(channel.port2);
+    channel.port2.postMessage = (message: unknown, transfer: Transferable[] = []) => {
+      if ((message as { type: string; chunks: number }).type === "next" && (message as { chunks: number }).chunks === 1 && inFlight) inFlight--;
+      request(message, transfer);
+    };
     // Watches the worker's side: what it sends to the worklet.
     const send = channel.port1.postMessage.bind(channel.port1) as (message: unknown, transfer: Transferable[]) => void;
     (channel.port1 as unknown as { postMessage(message: { type: string; bytes?: ArrayBuffer }, transfer: Transferable[]): void }).postMessage = (message, transfer) => {
       handed.push(message.type);
-      if (message.bytes) expect(message.bytes.byteLength).toBeLessThanOrEqual(CHUNK);
+      if (message.bytes) {
+        expect(message.bytes.byteLength).toBeLessThanOrEqual(CHUNK);
+        mostInFlight = Math.max(mostInFlight, ++inFlight);
+      }
       send(message, transfer);
     };
     (globalThis as unknown as { onmessage(event: { data: Build }): void }).onmessage({
@@ -150,6 +159,8 @@ describe.skipIf(!present && !process.env.CI)("the worker hands the model to the 
     expect(handed[1]).toBe("model");
     expect(handed.slice(2).every(type => type === "memory")).toBe(true);
     expect(handed.length).toBeGreaterThan(10);
+    expect(mostInFlight).toBeGreaterThan(1);
+    expect(mostInFlight).toBeLessThanOrEqual(8);
 
     // The page then connects the node: quanta warm it up, and it is ready.
     let seed = 3;

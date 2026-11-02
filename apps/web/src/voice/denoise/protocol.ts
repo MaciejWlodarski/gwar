@@ -30,9 +30,10 @@ export type Handover =
   | { type: "model"; size: number; denoiser: number }
   | { type: "memory"; offset: number; bytes: ArrayBuffer };
 
-/** Worklet → build worker: ready for the model (after `code`), then for each next chunk. */
+/** Worklet → build worker: ready for the model, then credits for bounded chunks in flight. */
 export interface Next {
   type: "next";
+  chunks: number;
 }
 
 export type Request =

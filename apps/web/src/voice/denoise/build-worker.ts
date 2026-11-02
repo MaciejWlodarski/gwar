@@ -41,23 +41,25 @@ async function build({ code: codeUrl, archive: archiveUrl, sha256: pin, cache: n
   let chunks: Generator<{ offset: number; bytes: ArrayBuffer }> | null = null;
   let model: { size: number; denoiser: number } | null = null;
   let asked = false;
-  const next = () => {
+  const next = (count = 1) => {
     if (!model) return;
     if (!chunks) {
       chunks = memoryChunks(exports!.memory);
       return send({ type: "model", ...model });
     }
-    const chunk = chunks.next();
-    if (chunk.done) return;
-    // Before sending: the transfer leaves the bytes empty here.
-    const last = chunk.value.offset + chunk.value.bytes.byteLength >= model.size;
-    send({ type: "memory", ...chunk.value }, [chunk.value.bytes]);
-    if (last) self.close();
+    for (let i = 0; i < count; i++) {
+      const chunk = chunks.next();
+      if (chunk.done) return;
+      // Before sending: the transfer leaves the bytes empty here.
+      const last = chunk.value.offset + chunk.value.bytes.byteLength >= model.size;
+      send({ type: "memory", ...chunk.value }, [chunk.value.bytes]);
+      if (last) { self.close(); return; }
+    }
   };
   worklet.onmessage = (event: MessageEvent<Next>) => {
     if (event.data.type !== "next") return;
     asked = true;
-    next();
+    next(event.data.chunks);
   };
 
   const cache = typeof caches === "undefined" ? null : await caches.open(name).catch(() => null);

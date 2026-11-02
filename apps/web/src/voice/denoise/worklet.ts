@@ -95,7 +95,7 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   /** The build worker's handover, one message (and task) at a time. */
   private handover(message: Handover): void {
     if (this.failed) return;
-    const ask = () => this.worker!.postMessage({ type: "next" } satisfies Next);
+    const ask = (chunks = 1) => this.worker!.postMessage({ type: "next", chunks } satisfies Next);
     switch (message.type) {
       case "code":
         // Compiled off this thread.
@@ -111,7 +111,9 @@ class DenoiseProcessor extends AudioWorkletProcessor {
         growMemory(this.loading!.memory, message.size);
         this.size = message.size;
         this.denoiser = message.denoiser;
-        ask();
+        // A bounded window avoids one render-clock round trip per 2 MiB. Each chunk still
+        // arrives in its own task; every consumed chunk returns exactly one credit.
+        ask(8);
         break;
       case "memory":
         writeChunk(this.loading!.memory, message.offset, message.bytes);
