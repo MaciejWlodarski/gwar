@@ -171,6 +171,8 @@ and accept decimals (0 through 24 hours); percentages require `%` (0 through
   the total is clamped to zero. With no base delay, half of uniform draws pass
   immediately and half add up to 5 ms. `distribution=normal` uses a normal draw
   with sigma `jitter/3`, clipped to the same bounds; default is `uniform`.
+- `hold=10ms`: keep one jitter draw for this long, so packets are delayed in runs
+  as on a radio link. Default is a new draw per packet.
 - `keep_order` (or `keep_order=true`): hold a packet until the previous packet's
   scheduled release if needed. Default is false, so jitter may reorder packets.
 - `stall=270ms@12s`: block egress from 12.000 through 12.270 seconds on the
