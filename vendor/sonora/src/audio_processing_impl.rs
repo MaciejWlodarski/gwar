@@ -74,6 +74,8 @@ struct CaptureState {
     capture_output_used: bool,
     capture_output_used_last_frame: bool,
     echo_path_gain_change: bool,
+    #[cfg(feature = "gwar-aec-measurements")]
+    reported_echo_gain_change: bool,
     prev_pre_adjustment_gain: f32,
     playout_volume: i32,
     prev_playout_volume: i32,
@@ -93,6 +95,8 @@ impl Default for CaptureState {
             capture_output_used: true,
             capture_output_used_last_frame: true,
             echo_path_gain_change: false,
+            #[cfg(feature = "gwar-aec-measurements")]
+            reported_echo_gain_change: false,
             prev_pre_adjustment_gain: -1.0,
             playout_volume: -1,
             prev_playout_volume: -1,
@@ -292,6 +296,11 @@ impl AudioProcessingImpl {
     /// Returns current processing statistics.
     pub(crate) fn get_statistics(&self) -> &AudioProcessingStats {
         &self.capture.stats
+    }
+
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub(crate) fn notify_echo_gain_change(&mut self) {
+        self.capture.reported_echo_gain_change = true;
     }
 
     /// Sets the applied input volume (e.g. from the OS mixer).
@@ -504,8 +513,12 @@ impl AudioProcessingImpl {
         }
 
         // Phase 2: Echo path gain change detection.
+        #[cfg(feature = "gwar-aec-measurements")]
+        let reported = std::mem::take(&mut self.capture.reported_echo_gain_change);
+        #[cfg(not(feature = "gwar-aec-measurements"))]
+        let reported = false;
         if self.submodules.echo_controller.is_some() {
-            self.capture.echo_path_gain_change = self.capture.applied_input_volume_changed;
+            self.capture.echo_path_gain_change = self.capture.applied_input_volume_changed || reported;
 
             if let Some(adjuster) = &self.submodules.capture_levels_adjuster {
                 let pre_adjustment_gain = adjuster.get_pre_adjustment_gain();
@@ -1285,6 +1298,7 @@ impl AudioProcessingImpl {
         let mut multichannel = EchoCanceller3Config::create_default_multichannel_config();
         multichannel.echo_removal_control.transparent_mode = ec.transparent_mode;
         multichannel.multi_channel.detect_stereo_content = ec.detect_stereo_content;
+        #[cfg(feature = "gwar-aec-measurements")]
         if ec.multichannel_suppressor_like_mono {
             multichannel.suppressor.normal_tuning.max_inc_factor = config.suppressor.normal_tuning.max_inc_factor;
             multichannel.suppressor.normal_tuning.max_dec_factor_lf = config.suppressor.normal_tuning.max_dec_factor_lf;

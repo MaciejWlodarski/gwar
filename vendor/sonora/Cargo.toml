@@ -37,6 +37,10 @@ repository = "https://github.com/dignifiedquire/sonora"
 name = "sonora"
 path = "src/lib.rs"
 
+[features]
+# Only enabled by gwar-client's dev-dependency for isolated measurements.
+gwar-aec-measurements = []
+
 [dependencies.sonora-aec3]
 version = "0.2.0"
 

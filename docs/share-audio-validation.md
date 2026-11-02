@@ -1021,11 +1021,29 @@ and the app.
 
 ### Independent-talker audit and owner decision (PR #223)
 
-**State / next steps:** blocked at the requested channel/tuning decision. No
-production channel or suppressor choice was changed. The inherited route detector
-still needs its reported warming/in-charge regressions fixed. Steady-tone pipeline
-probes, OS-detector retention, the complete hard-limit run and green Linux CI remain
-pending. This checkpoint is not ready for review.
+**Owner decision (2026-11-02): retain the current stereo canceller, with echo
+removal first. Mono-like suppressor tuning is rejected for production. Its optional
+measurement arm is available only through a dev-dependency feature. Stereo still
+pins on the first share sound. The per-content option must dominate every case and
+window before it can be considered for production.
+
+**State / next steps (WIP before host sleep, 2026-11-02):** the owner decision is
+resolved. Worker-only, two-window route detection fixes the inherited 3-second
+and in-charge drops, but does not reach both baseline floors in every window.
+The content-correlation option fails dominance and is rejected. Recorded human
+speech can be held with stereo AEC and full denoising; the tested gain-mask
+workaround leaks echo and is rejected. This is not ready for review.
+
+Raw completed measurements are saved in
+[aec-route-cases.csv](measurements/aec-route-cases.csv),
+[aec-content-cases.csv](measurements/aec-content-cases.csv) and
+[aec-route-tone-probes.txt](measurements/aec-route-tone-probes.txt).
+Final tables and acceptance interpretation still need to be integrated below.
+The full workspace test run was interrupted before host sleep and is incomplete.
+After wake, rerun any measurement that spans sleep, the full tests, final clippy,
+fingerprints/heap, four-share timing, and CI on the new head. The completed 1 Mb/s
+FIFO measurement reported 9.048-9.288 ms p99 before sleep. Production stereo
+and its default suppressor tuning remain selected.
 
 The comparisons ran on arm64 macOS, release, Rust 1.99.1, one test at a time with
 `nice -n 10`. No audio device, browser, WebKit, application bundle or production
@@ -1236,8 +1254,8 @@ Mono-like suppression increases the frame fraction by 0.066 while making echo
 Neither alternative dominates current stereo on both outputs across every case
 and window. Mono loses the reference for antiphase and cannot independently fit
 two unrelated speaker paths. Mono-like stereo suppression preserves more near
-frames in some rows while allowing more echo in others. Choosing how much echo to
-accept for voice is the owner's decision; this checkpoint does not choose it.
+frames in some rows while allowing more echo in others. The owner chose current stereo and prioritized echo removal, so mono-like
+suppression is rejected for production.
 
 The inherited 27-room route-gap results were not rerun at this checkpoint; their
 failing windows remain open. OS detection has not been accepted on acoustic

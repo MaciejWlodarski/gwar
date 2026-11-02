@@ -75,13 +75,15 @@ const ECHO_GONE: f32 = 15.0;
 /// The least echo return loss, in dB, that is a belief in an echo. A canceller that has found none
 /// reads -30, AEC3's start.
 const ECHO_BELIEVED: f64 = 0.0;
-/// Looks at the speakers playing, of the last 16, that must find the echo gone: one second.
-const ECHO_GONE_LOOKS: u32 = 4;
+/// Looks at the speakers playing, of the last 16, that must find the echo gone: half a second.
+const ECHO_GONE_LOOKS: u32 = 2;
 
 /// One of WebRTC's processors, set up for a single stage (or none, while it is off).
 struct Stage {
     apm: AudioProcessing,
     on: bool,
+    #[cfg(test)]
+    notified_absence: bool,
 }
 
 impl Stage {
@@ -93,6 +95,8 @@ impl Stage {
                 .render_config(StreamConfig::new(super::io::RATE, render_channels))
                 .build(),
             on: false,
+            #[cfg(test)]
+            notified_absence: false,
         }
     }
 
@@ -107,6 +111,12 @@ impl Stage {
         let _ = stage.apm.process_render_f32(&[&silence, &silence], &mut [&mut left, &mut right]);
         let _ = stage.apm.process_capture_f32(&[&silence], &mut [&mut near]);
         stage
+    }
+
+    #[cfg(test)]
+    fn native_gain_change(&mut self) {
+        self.apm.notify_echo_gain_change();
+        self.notified_absence = true;
     }
 
     /// Whether `on` changed; one turned on starts from scratch.
@@ -168,7 +178,7 @@ enum Heard {
 /// the microphone with the echo the canceller's own echo return loss predicts from the speakers. A
 /// near voice or a new room's echo only add to the microphone: only an echo that went away, or
 /// speakers turned far down, leaves it [`ECHO_GONE`] dB under. A canceller that believes in no
-/// echo is never told this. Fixed size: it runs on the voice thread too.
+/// echo is never told this. This observer runs only on the warming worker.
 #[derive(Default)]
 struct EchoGone {
     /// This window's speaker energy, the louder side, and the window's before it.
@@ -208,7 +218,10 @@ impl EchoGone {
         };
         let believed = played * 10f32.powf(-(loss as f32) / 10.0);
         self.looks = self.looks << 1 | u16::from(microphone < believed * 10f32.powf(-ECHO_GONE / 10.0));
-        let gone = self.looks.count_ones() >= ECHO_GONE_LOOKS;
+        let needed = ECHO_GONE_LOOKS;
+        #[cfg(test)]
+        let needed = if ROUTE_MEASUREMENT.load(Ordering::Relaxed) >= 2 { needed } else { 4 };
+        let gone = self.looks.count_ones() >= needed;
         #[cfg(test)]
         let gone = gone && !ECHO_GONE_IGNORED.load(Ordering::Relaxed);
         if gone {
@@ -226,6 +239,10 @@ static ECHO_GONE_IGNORED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// Only the isolated channel comparison changes this; run that test alone.
 #[cfg(test)]
 static MEASURE_MONO_SUPPRESSOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Isolated route comparisons: worker only, worker faster, worker faster and kept eligible.
+#[cfg(test)]
+static ROUTE_MEASUREMENT: AtomicU8 = AtomicU8::new(2);
 
 /// A stereo canceller trained on everything the voice session hears, with no output anyone uses.
 struct Warming {
@@ -284,7 +301,21 @@ impl Warming {
                     let taken_down = statistics.echo_return_loss_enhancement;
                     self.found_echo |= taken_down.is_some_and(|enhancement| enhancement >= ECHO_FOUND);
                     if self.echo.microphone(&microphone, || statistics.echo_return_loss) {
+                        #[cfg(test)]
+                        if ROUTE_MEASUREMENT.load(Ordering::Relaxed) == 4 {
+                            self.echo = EchoGone::default();
+                            if !self.stage.notified_absence {
+                                self.stage.native_gain_change();
+                            }
+                            continue;
+                        }
+                        #[cfg(test)]
+                        let eligible = self.found_echo;
                         self.start_over();
+                        #[cfg(test)]
+                        if ROUTE_MEASUREMENT.load(Ordering::Relaxed) == 3 {
+                            self.found_echo = eligible;
+                        }
                     }
                 }
             }
@@ -519,7 +550,8 @@ pub(crate) struct Processing {
     last_sample: f32,
     /// Frames since the speakers last played anything, up to [`WARMING_TAIL`].
     silent_frames: usize,
-    /// Whether the room the warmed canceller in charge learned is still there.
+    /// Reproduces the inherited voice-thread detector only in isolated comparisons.
+    #[cfg(test)]
     echo_gone: EchoGone,
     fed_frames: usize,
     /// What each speaker was given since the last whole frame went to the canceller.
@@ -546,6 +578,7 @@ impl Processing {
             spliced: false,
             last_sample: 0.0,
             silent_frames: WARMING_TAIL,
+            #[cfg(test)]
             echo_gone: EchoGone::default(),
             fed_frames: 0,
             render: [[0.0; FRAME]; 2],
@@ -625,7 +658,10 @@ impl Processing {
     /// way: it learned here as it always did, and goes on to learn the new room.
     pub(crate) fn route_changed(&mut self) {
         self.break_history();
-        self.echo_gone = EchoGone::default();
+        #[cfg(test)]
+        {
+            self.echo_gone = EchoGone::default();
+        }
         if !self.warmed {
             return;
         }
@@ -702,7 +738,10 @@ impl Processing {
             }
             self.replacing = false;
             self.spliced = true;
-            self.echo_gone = EchoGone::default();
+            #[cfg(test)]
+            {
+                self.echo_gone = EchoGone::default();
+            }
             let mut retired = warmed.stage;
             std::mem::swap(&mut self.echo, &mut *retired);
             Returned::Retired(retired)
@@ -755,7 +794,10 @@ impl Processing {
         }
         std::mem::swap(&mut self.echo, &mut *stage);
         self.channels = Channels::Stereo(stage);
-        self.echo_gone = EchoGone::default();
+        #[cfg(test)]
+        {
+            self.echo_gone = EchoGone::default();
+        }
     }
 
     /// What the speakers will play, as it is queued for them: the echo's reference.
@@ -795,6 +837,7 @@ impl Processing {
             let mid: [f32; FRAME] = std::array::from_fn(|index| 0.5 * (left[index] + right[index]));
             let _ = self.echo.apm.process_render_f32(&[&mid], &mut [left_out]);
         }
+        #[cfg(test)]
         if self.watching_the_echo() {
             self.echo_gone.speakers(&self.render);
         }
@@ -809,9 +852,12 @@ impl Processing {
         }
     }
 
-    /// Whether the warmed canceller in charge is watched for a room that went away unannounced:
-    /// [`EchoGone`]. Not while a replacement learns, which a new notice would only start over.
+    /// Reproduces the inherited voice-thread replacement detector for measurements.
+    #[cfg(test)]
     fn watching_the_echo(&self) -> bool {
+        if !matches!(ROUTE_MEASUREMENT.load(Ordering::Relaxed), 0 | 4) {
+            return false;
+        }
         self.warmed && !self.replacing && matches!(self.channels, Channels::Stereo(_))
     }
 
@@ -822,6 +868,7 @@ impl Processing {
             return;
         }
         self.collect_stereo();
+        #[cfg(test)]
         let mut echo_gone = false;
         for frame in frames.as_chunks_mut::<FRAME>().0 {
             self.scratch.copy_from_slice(frame);
@@ -851,14 +898,22 @@ impl Processing {
             if self.replacing {
                 self.last_sample = frame[FRAME - 1];
             }
+            #[cfg(test)]
             if self.watching_the_echo() {
                 let echo = &self.echo;
                 echo_gone |= self.echo_gone.microphone(&self.scratch, || echo.apm.statistics().echo_return_loss);
             }
         }
         // As the notice of a new device would be, between frames.
+        #[cfg(test)]
         if echo_gone {
-            self.route_changed();
+            if ROUTE_MEASUREMENT.load(Ordering::Relaxed) == 4 {
+                if !self.echo.notified_absence {
+                    self.echo.native_gain_change();
+                }
+            } else {
+                self.route_changed();
+            }
         }
     }
 
@@ -2941,15 +2996,61 @@ mod tests {
         eprintln!("the ring: {} kB", WARMING_RING * std::mem::size_of::<Heard>() / 1024);
     }
 
+    #[test]
+    fn acoustic_absence_needs_two_complete_playing_windows() {
+        let mut observer = EchoGone::default();
+        for frame in 0..3 * ECHO_WINDOW {
+            observer.speakers(&[[0.1; FRAME]; 2]);
+            let gone = observer.microphone(&[0.0001; FRAME], || Some(10.0));
+            assert_eq!(gone, frame + 1 == 3 * ECHO_WINDOW);
+        }
+        let mut room = EchoGone::default();
+        for _ in 0..20 * ECHO_WINDOW {
+            room.speakers(&[[0.1; FRAME]; 2]);
+            assert!(!room.microphone(&[0.03; FRAME], || Some(10.0)));
+        }
+    }
+
+    #[test]
+    fn unreported_headphones_three_seconds_before_pin_refuse_the_old_room() {
+        let total = 20 * RATE;
+        let far = pairs(&long_voice(total, 150.0, -20.0));
+        let echo = room(&left_channel(&far), 60);
+        let near: Vec<f32> = talker(total, 213.0, 3.1, 3.3, -24.0)
+            .into_iter()
+            .enumerate()
+            .map(|(i, s)| 0.0001 + if (i / RATE).is_multiple_of(2) { 0.0 } else { s })
+            .collect();
+        let mut p = warmed_on_speakers(&far, &echo, 13);
+        warm_through(&mut p, &far[13 * RATE..16 * RATE], &near[13 * RATE..16 * RATE], None);
+        p.caught_up();
+        p.pin_stereo();
+        p.collected();
+        assert!(!p.warmed, "the old room must not qualify the candidate");
+        assert_eq!(p.left_to_hear(), Some(LEARNING_FRAMES));
+    }
+
+    #[test]
+    fn unreported_headphones_do_not_replace_the_canceller_in_charge() {
+        let far = pairs(&long_voice(20 * RATE, 150.0, -20.0));
+        let echo = room(&left_channel(&far), 60);
+        let mut p = warmed_on_speakers(&far, &echo, 8);
+        warm_through(&mut p, &far[8 * RATE..12 * RATE], &echo[8 * RATE..12 * RATE], Some(0));
+        assert!(p.is_stereo());
+        let history = p.history;
+        warm_through(&mut p, &far[12 * RATE..], &vec![0.0001; 8 * RATE], None);
+        assert_eq!(p.history, history, "an acoustic absence must not enqueue a replacement");
+        assert!(!p.replacing);
+    }
+
     /// A device change nobody reports, run in release: headphones in a jack the system does not
     /// show, or a default PulseAudio or PipeWire moves (both look alike to the canceller). Voice
     /// kept on headphones, and the echo in another room, against `origin/main` before the warm
     /// canceller ("before"), the same change reported at once (the reset the code does when told),
     /// and one canceller on one channel that nothing resets, as a browser or Discord runs it.
     /// The near voice is [`talker`]: one that shares nothing with the far voice. 27 rooms.
-    #[test]
-    #[ignore = "a comparison, run in release"]
-    fn what_an_unreported_device_costs() {
+    fn measure_unreported_device_costs(only_native: bool) -> bool {
+        let mut accepted = true;
         let total = 36 * RATE;
         let windows = [(0usize, 3usize), (3, 5), (5, 8), (8, 16)];
         /// 0: one channel, nothing pinned; 1: before; 2: warm.
@@ -2983,7 +3084,17 @@ mod tests {
             }
             out
         }
-        let arms = ["one channel, never reset", "before", "main, not told", "main, told", "here, not told"];
+        let arms = [
+            "one channel, never reset",
+            "before",
+            "main, not told",
+            "main, told",
+            "here, not told",
+            "worker only",
+            "worker faster",
+            "worker faster, keep eligibility",
+            "native gain change",
+        ];
         let scenarios = [
             ("in charge, then headphones", 8, 16, false),
             ("warming, headphones 8 s before the share", 16, 8, false),
@@ -2993,8 +3104,8 @@ mod tests {
         for (scenario, pin, moved, echo) in scenarios {
             let (pin, moved) = (pin * RATE, moved * RATE);
             let from = pin.max(moved);
-            let mut sums = [[0f32; 9]; 5];
-            let mut worst = [f32::MIN; 5];
+            let mut sums = [[0f32; 9]; 9];
+            let mut worst = [f32::MIN; 9];
             let mut count = 0.0;
             for far_pitch in [100.0, 150.0, 230.0] {
                 for delay in [20, 60, 150] {
@@ -3016,25 +3127,54 @@ mod tests {
                         } else {
                             said.clone()
                         };
-                        let mut cells = [[0f32; 9]; 5];
+                        let mut cells = [[0f32; 9]; 9];
                         let runs = [
                             (0u8, None, true),
                             (1, None, true),
                             (2, None, true),
                             (2, Some(moved), true),
                             (2, None, false),
+                            (2, None, false),
+                            (2, None, false),
+                            (2, None, false),
+                            (2, None, false),
                         ];
                         for (index, (mode, told, blind)) in runs.into_iter().enumerate() {
+                            if only_native && !matches!(index, 0 | 1 | 2 | 6 | 8) {
+                                continue;
+                            }
                             ECHO_GONE_IGNORED.store(blind, Ordering::Relaxed);
+                            ROUTE_MEASUREMENT.store(index.saturating_sub(4) as u8, Ordering::Relaxed);
                             let out = arm(mode, (pin, moved, told), &far, [&speakers, &after]);
                             ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
+                            if !echo && far_pitch == 150.0 && delay == 60 && pitch == 213.0 {
+                                let by_second: Vec<f32> = (0..16)
+                                    .map(|second| {
+                                        let range = from + second * RATE..from + (second + 1) * RATE;
+                                        let (mut speaking, mut kept) = (0.0f32, 0.0f32);
+                                        for (o, s) in out[range.clone()]
+                                            .as_chunks::<FRAME>()
+                                            .0
+                                            .iter()
+                                            .zip(said[range].as_chunks::<FRAME>().0)
+                                        {
+                                            if db(&s[..]) > -40.0 {
+                                                speaking += 1.0;
+                                                kept += f32::from(u8::from(db(&o[..]) > db(&s[..]) - 10.0));
+                                            }
+                                        }
+                                        kept / speaking
+                                    })
+                                    .collect();
+                                eprintln!("route-seconds,{scenario},{index},{by_second:?}");
+                            }
                             if echo {
-                                for second in 0..9 {
+                                for (second, cell) in cells[index].iter_mut().enumerate() {
                                     let quiet: Vec<f32> = (from + second * RATE..from + (second + 1) * RATE)
                                         .filter(|i| (i / RATE).is_multiple_of(2))
                                         .map(|i| out[i])
                                         .collect();
-                                    cells[index][second] = if quiet.is_empty() { f32::NAN } else { db(&quiet) };
+                                    *cell = if quiet.is_empty() { f32::NAN } else { db(&quiet) };
                                 }
                             } else {
                                 for (w, (a, b)) in windows.iter().enumerate() {
@@ -3053,7 +3193,11 @@ mod tests {
                                 }
                             }
                         }
-                        for index in 0..5 {
+                        for index in 0..9 {
+                            if only_native && !matches!(index, 0 | 1 | 2 | 6 | 8) {
+                                continue;
+                            }
+                            eprintln!("route-case,{scenario},{far_pitch},{delay},{pitch},{index},{:?}", cells[index]);
                             for (sum, cell) in sums[index].iter_mut().zip(cells[index]) {
                                 *sum += if cell.is_nan() { 0.0 } else { cell };
                             }
@@ -3081,7 +3225,25 @@ mod tests {
                 "{scenario}, {count} rooms, {}",
                 if echo { "echo dBFS by second, near silent" } else { "voice kept by 0-3, 3-5, 5-8, 8-16 s" }
             );
+            for window in 0..if echo { 9 } else { 4 } {
+                if echo && window % 2 == 1 {
+                    continue;
+                }
+                let got = sums[6][window] / count;
+                let before = sums[1][window] / count;
+                let main = sums[2][window] / count;
+                let passes = if echo { got <= before.min(main) } else { got >= before.max(main) };
+                if !passes {
+                    eprintln!(
+                        "route-acceptance MISS,{scenario},window={window},before={before:.9},main={main:.9},here={got:.9}"
+                    );
+                }
+                accepted &= passes;
+            }
             for (index, name) in arms.iter().enumerate() {
+                if only_native && !matches!(index, 0 | 1 | 2 | 6 | 8) {
+                    continue;
+                }
                 let cells: Vec<String> = sums[index]
                     .iter()
                     .take(if echo { 9 } else { 4 })
@@ -3090,6 +3252,76 @@ mod tests {
                     .collect();
                 eprintln!("  {name}: {}; worst room against before {:+.3}", cells.join(" "), worst[index]);
             }
+        }
+        ROUTE_MEASUREMENT.store(2, Ordering::Relaxed);
+        accepted
+    }
+
+    #[test]
+    #[ignore = "route comparison, run in release alone"]
+    fn what_an_unreported_device_costs() {
+        measure_unreported_device_costs(false);
+    }
+
+    #[test]
+    #[ignore = "native AEC path-change comparison, run in release alone"]
+    fn native_gain_change_routes() {
+        measure_unreported_device_costs(true);
+    }
+
+    #[test]
+    #[ignore = "strict acoustic acceptance, known to fail; run in release alone"]
+    fn route_gaps_reach_both_baselines() {
+        assert!(measure_unreported_device_costs(true), "route gaps do not meet both baseline floors");
+    }
+
+    /// Measurement-only observer. Four render frames are classified on a separate
+    /// thread. Equal/panned channels remain mono; negative correlation is wide.
+    struct ContentChoice {
+        input: Option<std::sync::mpsc::SyncSender<[[f32; FRAME]; 2]>>,
+        output: std::sync::mpsc::Receiver<bool>,
+        worker: Option<thread::JoinHandle<()>>,
+    }
+
+    impl ContentChoice {
+        fn new() -> Self {
+            let (input, frames) = std::sync::mpsc::sync_channel::<[[f32; FRAME]; 2]>(1);
+            let (answer, output) = std::sync::mpsc::sync_channel(1);
+            let worker = thread::spawn(move || {
+                let (mut left, mut right, mut dot, mut frames_heard) = (0.0f64, 0.0f64, 0.0f64, 0usize);
+                let mut wide = false;
+                while let Ok(frame) = frames.recv() {
+                    for (&l, &r) in frame[0].iter().zip(&frame[1]) {
+                        let (l, r) = (f64::from(l), f64::from(r));
+                        left += l * l;
+                        right += r * r;
+                        dot += l * r;
+                    }
+                    frames_heard += 1;
+                    if frames_heard == 4 {
+                        wide |= left.min(right) > f64::from(PLAYING) && dot < 0.95 * (left * right).sqrt();
+                        (left, right, dot, frames_heard) = (0.0, 0.0, 0.0, 0);
+                    }
+                    if answer.send(wide).is_err() {
+                        return;
+                    }
+                }
+            });
+            Self { input: Some(input), output, worker: Some(worker) }
+        }
+        fn wide(&self, frame: &[[f32; 2]]) -> bool {
+            self.input
+                .as_ref()
+                .unwrap()
+                .send(std::array::from_fn(|side| std::array::from_fn(|i| frame[i][side])))
+                .unwrap();
+            self.output.recv().unwrap()
+        }
+    }
+    impl Drop for ContentChoice {
+        fn drop(&mut self) {
+            drop(self.input.take());
+            let _ = self.worker.take().unwrap().join();
         }
     }
 
@@ -3108,7 +3340,7 @@ mod tests {
         let lead = long_voice(total, 150.0, -20.0);
         let a = long_voice(total, 120.0, -14.0);
         let b = talker(total, 187.0, 2.17, 4.31, -14.0);
-        let names = ["stereo", "mono downmix", "stereo mono-like suppressor"];
+        let names = ["stereo", "mono downmix", "stereo mono-like suppressor", "content correlation"];
         for shape in ["mono content", "panned", "wide independent", "wide antiphase"] {
             let far: Vec<[f32; 2]> = (0..total)
                 .map(|i| {
@@ -3126,8 +3358,8 @@ mod tests {
             let left = left_channel(&far);
             let right: Vec<f32> = far.iter().map(|pair| pair[1]).collect();
             for acoustic in ["headphones", "left speaker", "both speakers"] {
-                let mut kept = [[0.0f32; 4]; 3];
-                let mut residual = [[0.0f32; 4]; 3];
+                let mut kept = [[0.0f32; 4]; 4];
+                let mut residual = [[0.0f32; 4]; 4];
                 let mut count = 0.0;
                 for delay in [20, 60, 150] {
                     let l = room(&left, delay);
@@ -3147,12 +3379,18 @@ mod tests {
                             .map(|(i, s)| if (i / RATE).is_multiple_of(2) { 0.0 } else { s })
                             .collect();
                         let mic: Vec<f32> = echo.iter().zip(&said).map(|(e, s)| e + s).collect();
-                        for mode in 0..3 {
+                        for mode in 0..4 {
                             MEASURE_MONO_SUPPRESSOR.store(mode == 2, Ordering::Relaxed);
                             let mut p = if mode == 1 { session(LEARNING_FRAMES) } else { warm_session() };
                             let mut out = Vec::with_capacity(total);
+                            let content = (mode == 3).then(ContentChoice::new);
                             for at in (0..total).step_by(FRAME) {
-                                if mode != 1 && at == pin {
+                                let pin_now = if let Some(content) = &content {
+                                    at >= pin && content.wide(&far[at..at + FRAME])
+                                } else {
+                                    mode != 1 && at == pin
+                                };
+                                if pin_now {
                                     p.caught_up();
                                     p.pin_stereo();
                                     p.collected();
@@ -3188,7 +3426,7 @@ mod tests {
                         }
                     }
                 }
-                for mode in 0..3 {
+                for mode in 0..4 {
                     eprintln!(
                         "channels {shape} / {acoustic} / {} / {count} cases: kept {:?}; quiet dBFS {:?}",
                         names[mode],
@@ -3202,39 +3440,8 @@ mod tests {
         ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
     }
 
-    /// EXPLORATORY: a steady tone at the microphone, share tones in the speakers, no echo.
-    #[test]
-    #[ignore = "exploratory"]
-    fn explore_tone() {
-        let total = 20 * RATE;
-        let tone = |f: f32, a: f32, i: usize| a * (std::f32::consts::TAU * f * i as f32 / RATE as f32).sin();
-        let far: Vec<[f32; 2]> = (0..total).map(|i| [tone(330.0, 0.8, i), tone(523.0, 0.8, i)]).collect();
-        let mic: Vec<f32> = (0..total).map(|i| tone(440.0, 0.25, i)).collect();
-        for offset in 0..12 {
-            // The microphone starts `offset` frames before the speakers play.
-            let mut p = session(LEARNING_FRAMES);
-            let mut out = Vec::new();
-            for at in (0..total).step_by(FRAME) {
-                let playing = at >= offset * FRAME;
-                if playing {
-                    p.pin_stereo();
-                    p.built();
-                }
-                let speakers: Vec<[f32; 2]> = if playing {
-                    far[at - offset * FRAME..at - offset * FRAME + FRAME].to_vec()
-                } else {
-                    vec![[0.0; 2]; FRAME]
-                };
-                out.extend(tick(&mut p, &speakers, &mic[at..at + FRAME]));
-            }
-            let held: Vec<usize> = (0..total / FRAME)
-                .filter(|f| db(&out[f * FRAME..(f + 1) * FRAME]) < db(&mic[f * FRAME..(f + 1) * FRAME]) - 10.0)
-                .collect();
-            let by_second: Vec<String> =
-                (0..20).map(|s| format!("{}", held.iter().filter(|f| **f / 100 == s).count())).collect();
-            eprintln!("offset {offset}: held {} frames, by second {}", held.len(), by_second.join(" "));
-        }
-    }
+    #[cfg(feature = "deep-filter")]
+    mod tones;
 
     /// A talker that shares nothing with [`long_voice`]: its own vibrato and syllable rates and its
     /// own harmonic phases, so no part of it is a delayed copy of the far voice that a canceller

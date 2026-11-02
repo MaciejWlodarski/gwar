@@ -514,6 +514,13 @@ impl AudioProcessing {
             .set_runtime_setting(RuntimeSetting::PlayoutVolumeChange(volume));
     }
 
+    /// Measurement control: report an observed echo gain change for the next capture,
+    /// without changing volume, configuration or rebuilding the echo controller.
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub fn notify_echo_gain_change(&mut self) {
+        self.inner.notify_echo_gain_change();
+    }
+
     /// Notifies that the playout (render) audio device has changed.
     ///
     /// Applied at the next `process_render_*` call.

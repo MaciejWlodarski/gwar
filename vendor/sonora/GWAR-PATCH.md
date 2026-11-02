@@ -32,5 +32,6 @@ ignored `independent_talker_channel_tradeoffs` test can set it for stereo stages
 only, through a test-only flag in Gwar. It copies two values from the default mono
 configuration into the multichannel suppressor: `max_inc_factor` (2.0 instead of
 1.5) and `max_dec_factor_lf` (0.25 instead of 0.35). The multichannel adaptive filter
-keeps its existing coarse-filter lengths and rates. The application does not set
-this option; choosing a production tuning requires the owner's voice/echo decision.
+keeps its existing coarse-filter lengths and rates. The option and diagnostic echo-gain notification exist only with the
+`gwar-aec-measurements` dev-dependency feature. The owner rejected mono-like
+tuning for production on 2026-11-02: retain current stereo, echo removal first.

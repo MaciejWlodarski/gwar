@@ -61,6 +61,22 @@ impl Model {
         self.limit = NO_LIMIT;
     }
 
+    /// Diagnostic control, compiled only for the isolated client measurement arm.
+    #[cfg(feature = "model-measurements")]
+    pub fn set_measurement_min_snr(&mut self, minimum: f32) {
+        self.base.min_db_thresh = minimum;
+        self.live.min_db_thresh = minimum;
+    }
+
+    /// Diagnostic control for separating the gain mask, complex filter and post-filter.
+    #[cfg(feature = "model-measurements")]
+    pub fn set_measurement_stages(&mut self, df_above: f32, post_filter: bool) {
+        for state in [&mut self.base, &mut self.live] {
+            state.max_db_df_thresh = df_above;
+            state.post_filter = post_filter;
+        }
+    }
+
     /// Cleans `frame` in place, as hard as `strength` says (not off).
     pub fn process(&mut self, frame: &mut [f32; FRAME], strength: NoiseSuppression) -> Result<()> {
         let limit = strength.limit_db();

@@ -188,6 +188,7 @@ pub struct EchoCanceller {
     pub detect_stereo_content: bool,
     /// Gwar measurement control: use the mono suppressor's release/attack tuning
     /// with the multichannel adaptive filter. False preserves upstream tuning.
+    #[cfg(feature = "gwar-aec-measurements")]
     pub multichannel_suppressor_like_mono: bool,
 }
 
@@ -197,6 +198,7 @@ impl Default for EchoCanceller {
             enforce_high_pass_filtering: true,
             transparent_mode: TransparentModeType::default(),
             detect_stereo_content: true,
+            #[cfg(feature = "gwar-aec-measurements")]
             multichannel_suppressor_like_mono: false,
         }
     }
