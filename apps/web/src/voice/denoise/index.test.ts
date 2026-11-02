@@ -25,11 +25,13 @@ describe("loading the model", () => {
   let outputs: ReturnType<typeof vi.fn>;
   let tracks: Array<{ enabled: boolean; readyState: string; stop: ReturnType<typeof vi.fn> }>;
   let closed: number;
+  let contextState: string;
   const report = (data: Report) => node.port.onmessage!({ data } as MessageEvent<Report>);
   const tick = () => new Promise(resolve => setTimeout(resolve));
 
   beforeEach(() => {
     posted = [];
+    contextState = "running";
     closed = 0;
     tracks = [];
     outputs = vi.fn(() => {
@@ -38,7 +40,8 @@ describe("loading the model", () => {
       return { stream: { getAudioTracks: () => [track] } };
     });
     class FakeContext {
-      state = "running";
+      get state() { return contextState; }
+      set state(value: string) { contextState = value; }
       audioWorklet = { addModule: async () => {} };
       createMediaStreamDestination = outputs;
       addEventListener() {}
@@ -143,6 +146,22 @@ describe("loading the model", () => {
     expect(outputs).toHaveBeenCalledTimes(2);
     pipeline.close();
     expect(tracks[1]!.stop).toHaveBeenCalledOnce();
+  });
+
+  it("resumes an interrupted context to acknowledge a return, then leaves the spare suspended", async () => {
+    const pending = startDenoise({ trouble() {}, changed() {} }, new AbortController().signal);
+    await vi.waitFor(() => expect(posted).toHaveLength(1));
+    report({ type: "loaded" }); report({ type: "ready" });
+    const pipeline = await pending;
+    contextState = "interrupted";
+    const returned = pipeline.park();
+    await tick();
+    // Chromium does not deliver worklet control tasks while the context is suspended.
+    expect(contextState).toBe("running");
+    expect(pipeline.track.enabled).toBe(false);
+    report({ type: "cleared" }); await returned;
+    expect(contextState).toBe("suspended");
+    pipeline.close();
   });
 
   it("gives up when the worker cannot build the model", async () => {

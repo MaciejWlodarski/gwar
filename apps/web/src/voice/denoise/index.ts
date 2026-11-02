@@ -74,7 +74,7 @@ export async function createDenoise(events: DenoiseEvents, signal: AbortSignal):
   // app): resume on the next gesture, as the playback context does.
   let idle = false;
   const resume = () => {
-    if (!idle && context.state !== "running" && context.state !== "closed") void context.resume().catch(() => {});
+    if ((!idle || resolvePark) && context.state !== "running" && context.state !== "closed") void context.resume().catch(() => {});
   };
   const gestures = ["pointerdown", "keydown"] as const;
   for (const type of gestures) window.addEventListener(type, resume, { passive: true });
@@ -250,6 +250,9 @@ export async function createDenoise(events: DenoiseEvents, signal: AbortSignal):
           await context.suspend();
         });
         post({ type: "clear" });
+        // An interrupted/suspended context must run long enough to acknowledge the clear.
+        // Its output is already disabled and the microphone detached; suspend again on ACK.
+        resume();
         return parked;
       },
       close() {
