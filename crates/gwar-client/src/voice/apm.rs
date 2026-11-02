@@ -148,6 +148,7 @@ fn canceller(stereo: bool) -> Config {
         multichannel_suppressor_like_mono: stereo && MEASURE_MONO_SUPPRESSOR.load(Ordering::Relaxed),
         measurement_two_channel_start: stereo && AEC_NATIVE_CHANNELS.load(Ordering::Relaxed),
         measurement_native_profile: if stereo { AEC_NATIVE_PROFILE.load(Ordering::Relaxed) } else { 0 },
+        measurement_left_reference: stereo && AEC_LEGACY_REFERENCE.load(Ordering::Relaxed),
         ..canceller
     };
     Config { echo_canceller: Some(canceller), ..base() }
@@ -245,6 +246,10 @@ static ECHO_GONE_IGNORED: std::sync::atomic::AtomicBool = std::sync::atomic::Ato
 /// Only the isolated channel comparison changes this; run that test alone.
 #[cfg(test)]
 static AEC_NATIVE_PROFILE: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+static AEC_LEGACY_REFERENCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static AEC_PIPELINE_COLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 static AEC_WARM_ONLY_TWO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
@@ -675,6 +680,10 @@ impl Processing {
     /// more than a new one does. So one that found no echo is left behind: headphones, and anyone
     /// the far side never talked alone to, go the way of [`Processing::pin_stereo`] without this.
     pub(crate) fn warm_stereo(&mut self) {
+        #[cfg(test)]
+        if AEC_PIPELINE_COLD.load(Ordering::Relaxed) {
+            return;
+        }
         if let Some(worker) = &self.stereo {
             worker.tell(WARM);
             self.warming = true;
@@ -981,6 +990,30 @@ impl Processing {
             self.scratch.copy_from_slice(frame);
             let _ = self.gain.apm.process_capture_f32(&[&self.scratch], &mut [frame]);
         }
+    }
+}
+
+/// Isolated timing control. The production path never reads these test-only choices.
+#[cfg(test)]
+pub(super) fn with_native_pipeline_option(id: u8, run: impl FnOnce()) {
+    let (profile, legacy, cold) = match id {
+        0 => (0, false, false),
+        1 => (7, true, false),
+        2 => (7, false, false),
+        3 => (7, false, true),
+        4 => (1, false, false),
+        5 => (1, false, true),
+        _ => panic!("unknown native pipeline option {id}"),
+    };
+    let old_profile = AEC_NATIVE_PROFILE.swap(profile, Ordering::Relaxed);
+    let old_legacy = AEC_LEGACY_REFERENCE.swap(legacy, Ordering::Relaxed);
+    let old_cold = AEC_PIPELINE_COLD.swap(cold, Ordering::Relaxed);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
+    AEC_NATIVE_PROFILE.store(old_profile, Ordering::Relaxed);
+    AEC_LEGACY_REFERENCE.store(old_legacy, Ordering::Relaxed);
+    AEC_PIPELINE_COLD.store(old_cold, Ordering::Relaxed);
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
     }
 }
 
@@ -3586,6 +3619,8 @@ mod tests {
 
     #[cfg(feature = "deep-filter")]
     mod tones;
+
+    mod reference_options;
 
     /// A talker that shares nothing with [`long_voice`]: its own vibrato and syllable rates and its
     /// own harmonic phases, so no part of it is a delayed copy of the far voice that a canceller

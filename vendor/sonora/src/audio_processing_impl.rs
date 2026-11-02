@@ -1405,6 +1405,14 @@ impl AudioProcessingImpl {
                 .unwrap()
                 .measurement_correct_channel_start();
         }
+        #[cfg(feature = "gwar-aec-measurements")]
+        if ec.measurement_left_reference {
+            self.submodules
+                .echo_controller
+                .as_mut()
+                .unwrap()
+                .measurement_restore_left_reference();
+        }
     }
 
     fn initialize_noise_suppressor(&mut self) {

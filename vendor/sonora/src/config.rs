@@ -194,6 +194,9 @@ pub struct EchoCanceller {
     pub measurement_two_channel_start: bool,
     #[cfg(feature = "gwar-aec-measurements")]
     pub measurement_native_profile: u8,
+    /// Reconstruct the historical left-only reference for comparisons.
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub measurement_left_reference: bool,
 }
 
 impl Default for EchoCanceller {
@@ -208,6 +211,8 @@ impl Default for EchoCanceller {
             measurement_two_channel_start: false,
             #[cfg(feature = "gwar-aec-measurements")]
             measurement_native_profile: 0,
+            #[cfg(feature = "gwar-aec-measurements")]
+            measurement_left_reference: false,
         }
     }
 }

@@ -140,6 +140,7 @@ struct ArmOptions {
     native_at_share: bool,
     nonlinear_restart: u8,
     native_channels: bool,
+    legacy_reference: bool,
     warm_only_two: bool,
     native_profile: u8,
 }
@@ -157,6 +158,7 @@ impl ArmOptions {
             native_at_share: false,
             nonlinear_restart: 0,
             native_channels: false,
+            legacy_reference: false,
             warm_only_two: false,
             native_profile: 0,
         };
@@ -324,6 +326,11 @@ impl ArmOptions {
                 o.gain = true;
                 o.native_profile = tag - 85;
             }
+            100..=103 => {
+                o.warm = tag == 100 || tag == 102;
+                o.gain = true;
+                o.native_profile = if tag <= 101 { 7 } else { 1 };
+            }
             _ => panic!("unknown measurement arm {tag}"),
         }
         o
@@ -333,6 +340,12 @@ impl ArmOptions {
 #[cfg(feature = "deep-filter")]
 fn arm(name: &str, lead: usize, echo: bool, noise: u8, mode: u8) -> Holds {
     arm_with_options(name, lead, echo, noise, mode, ArmOptions::tagged(mode))
+}
+
+fn historical_arm(name: &str, lead: usize, echo: bool, noise: u8, mode: u8) -> Holds {
+    let mut options = ArmOptions::tagged(mode);
+    options.legacy_reference = true;
+    arm_with_options(name, lead, echo, noise, mode, options)
 }
 
 fn arm_with_options(name: &str, lead: usize, echo: bool, noise: u8, mode: u8, options: ArmOptions) -> Holds {
@@ -354,6 +367,7 @@ fn arm_with_options(name: &str, lead: usize, echo: bool, noise: u8, mode: u8, op
                 }
         })
         .collect();
+    AEC_LEGACY_REFERENCE.store(options.legacy_reference, Ordering::Relaxed);
     AEC_WARM_ONLY_TWO.store(options.warm_only_two, Ordering::Relaxed);
     AEC_NATIVE_PROFILE.store(options.native_profile, Ordering::Relaxed);
     AEC_NATIVE_CHANNELS.store(options.native_channels, Ordering::Relaxed);
@@ -485,6 +499,7 @@ fn arm_with_options(name: &str, lead: usize, echo: bool, noise: u8, mode: u8, op
             }
         }
     }
+    AEC_LEGACY_REFERENCE.store(false, Ordering::Relaxed);
     AEC_WARM_ONLY_TWO.store(false, Ordering::Relaxed);
     AEC_NATIVE_PROFILE.store(0, Ordering::Relaxed);
     AEC_NATIVE_CHANNELS.store(false, Ordering::Relaxed);
@@ -619,7 +634,7 @@ fn recorded_speech_is_not_held_after_stereo() {
     for lead in [6, 10] {
         for echo in [false, true] {
             for noise in [0, 50, 100] {
-                let cold = arm("human speech", lead, echo, noise, 8);
+                let cold = historical_arm("human speech", lead, echo, noise, 8);
                 let warm = arm("human speech", lead, echo, noise, 7);
                 eprintln!("speech-gate,lead={lead},echo={echo},noise={noise},cold={cold:?},warm={warm:?}");
                 if warm.maximum[3] > cold.maximum[3] || warm.kept < cold.kept {
@@ -672,7 +687,7 @@ fn native_speech_and_quiet_echo_gate() {
     for lead in [6, 10] {
         for echo in [false, true] {
             for noise in [0, 50, 100] {
-                let cold = arm("human speech", lead, echo, noise, 8);
+                let cold = historical_arm("human speech", lead, echo, noise, 8);
                 let no_aec = arm("human speech", lead, echo, noise, 9);
                 eprintln!(
                     "speech-matrix-control,lead={lead},echo={echo},noise={noise},cold-hold={},cold-kept={},no-aec-hold={},no-aec-kept={}",
@@ -691,6 +706,7 @@ fn native_speech_and_quiet_echo_gate() {
         }
         let mut current_options = ArmOptions::tagged(7);
         current_options.gain = false;
+        current_options.legacy_reference = true;
         let current = arm_with_options("silence", lead, true, 0, 7, current_options);
         eprintln!("echo-matrix-control,lead={lead},levels={:?}", current.echo_levels);
         for (i, mode) in modes.iter().copied().enumerate() {

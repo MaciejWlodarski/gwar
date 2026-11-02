@@ -1019,7 +1019,145 @@ Not exercised here: the real macOS permission grant, the native capture on Windo
 Chrome's visible second picker, which the test selects automatically. Those need a person
 and the app.
 
-### Priority 1: default recorded-speech regression (continuation)
+### Correct render references and native options (PR #223 continuation)
+
+**State / next steps:** no measured option passes both strict acoustic gates.
+The separate constructor fix is commit `d9972dfe8cf8744e1097f4c7ef8b7b814b438b80`.
+It calls `initialize` as [upstream WebRTC does](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_processing/aec3/echo_canceller3.cc) and makes the draft branch actually
+use both reference channels when detection is disabled. No experimental profile,
+mono-like tuning, model change, or per-content selector is selected for production.
+The default suppressor profile and warm-takeover policy remain in place. This is
+an options checkpoint, not readiness for review or permission to merge.
+
+The historical cold floor remains the pre-fix left-reference control, not a new
+cold baseline after the wiring change. Every held/kept cold value was reproduced
+exactly. For echo, the historical warm left-reference/profile-0 control remains
+the reference. All 549 dBFS values of that warm control, the cold control and
+left-reference warm/profile 7 match the previous raw tables exactly. The
+measurement-only reconstruction of left-reference startup defaults off.
+
+The formerly ignored native channel regression fails before the constructor fix
+(one reference instead of two) and passes afterward. All 13 wrapper AEC3 tests
+pass. [Constructor test evidence](measurements/aec-constructor-validation.txt).
+
+#### Options: strict speech and echo gates
+
+Default speaker cases use denoise 100 and AGC on. Each speech cell gives held
+active decoded 10 ms frames / kept, for 6 s and 10 s leads. These are not necessarily
+consecutive wall-clock seconds. Kept is RMS-based and can include leaked echo.
+Speech acceptance checks held <= historical cold and kept >= historical cold in
+each of 12 lead/route/denoise cases, without rounding tolerances.
+
+| Arm | Default speech: held/kept, lead 6; lead 10 | Speech pass /12 | Echo windows >+1 / +3 / +6 dB | Worst echo delta, dB | Total echo energy delta, dB | Four-share max delta / guard |
+| --- | --- | --- | --- | --- | --- | --- |
+| left-warm-p7 | 49/0.422; 49/0.426 | 11 | 6 / 2 / 0 | +4.615 | +0.201 | +0.344 ms / PASS |
+| two-warm-p7 | 192/0.081; 151/0.113 | 0 | 185 / 92 / 65 | +48.033 | +2.465 | +1.843 ms / FAIL |
+| two-cold-p7 | 80/0.602; 106/0.606 | 6 | 422 / 312 / 221 | +64.952 | +12.770 | +0.806 ms / PASS |
+| two-warm-p1 | 192/0.084; 342/0.119 | 0 | 198 / 98 / 70 | +48.541 | +2.397 | +0.292 ms / PASS |
+| two-cold-p1 | 80/0.602; 106/0.606 | 6 | 424 / 314 / 221 | +64.952 | +12.774 | +0.224 ms / PASS |
+
+Historical default cold: 136/0.105 and 106/0.128; historical warm: 510/0.142 and
+421/0.133. The 549 rows are 396 mono-table observations, including repeated
+pure-echo controls for both near-pitch labels, plus 153 wide-table observations.
+They are not 549 independent rooms. The echo tables are synthetic AEC-only PCM,
+without Opus, AGC, gating or denoising; the speech matrix includes both Opus
+passes, the gates, AGC and the embedded model. Total energy is the sum of squared samples
+in f64 divided by 48 kHz, across exactly those windows; it includes their actual
+durations and the documented repeated controls. Delta is 10 log10(candidate / warm
+control total). It is a catalogue metric, not a distribution of real users' rooms.
+
+At the worst two-reference warm windows (`wide new 150->120`, pin 60 s,
+0-0.25 s), absolute echo is -80.007 -> -31.974 dBFS (two-warm-p7); -80.007 -> -31.466 dBFS (two-warm-p1).
+The cold worst is -92.647 -> -27.695 dBFS at `wide same 190->190`,
+pin 310 s, 0.25-0.5 s. Large relative dB differences at a quiet floor and
+loud onset echo are therefore visible separately from the energy aggregate.
+
+Profile 7 with the historical left reference passes 11/12 speech cases. The one
+failure is headphones, lead 6 s, denoise 0: kept 0.73593074 versus cold 0.73679656,
+with 25 held frames in both. This single active frame is not rounded into a pass.
+Its echo has four >1 dB windows in the first second and two repeated mono controls
+at 7-8 s (+1.176 dB). Thus its six failures are not all immediately after takeover.
+
+The two-reference cold arms pass every speaker case and fail every headphone
+case. Warm fails all 12 cases with either profile. Profile 7 cold preserves more
+headphone speech than profile 1 cold at lead 10 s (43 held versus 84, kept about
+0.608-0.629 versus 0.593-0.617), but both remain below the historical kept floor.
+All 60 speech observations and per-window echo/energy observations are preserved:
+[aec-reference-speech.csv](measurements/aec-reference-speech.csv),
+[aec-reference-echo.csv](measurements/aec-reference-echo.csv),
+[aec-reference-echo-summary.csv](measurements/aec-reference-echo-summary.csv).
+
+#### Right-only and independent wide shares
+
+An additional 108 windows per arm cover four leads (6/20/60/310 s) and three
+shapes. `right-only` has zero left render after the pin and only the right speaker
+reaches the microphone. `wide-right` uses independent left/right fixtures and
+only the right acoustic path. `wide-both` adds the left path and 0.7 times the right
+path. The right fixture has unrelated vibrato and syllable timing. These 108
+windows are separate from the required 549 and are not pooled into their energy.
+
+| Arm | Right-only energy delta, dB | Independent wide/right delta, dB | Independent wide/both delta, dB |
+| --- | --- | --- | --- |
+| left-warm-p7 | -0.014 | +1.105 | +1.843 |
+| two-warm-p7 | -50.824 | -26.982 | -12.409 |
+| two-cold-p7 | -48.237 | -28.790 | +3.947 |
+| two-warm-p1 | -51.590 | -27.414 | -6.766 |
+| two-cold-p1 | -48.239 | -28.785 | +4.864 |
+
+The right-reference bug is directly visible: corrected variants reduce right-only
+energy by 48-52 dB. Correct reference wiring does not make the warm/cold trade-off
+disappear. [All right-path windows](measurements/aec-reference-right-echo.csv) and
+[aggregate metrics](measurements/aec-reference-right-summary.csv).
+
+#### Validation and remaining blockers
+
+Both voice-alone fingerprints remain `c2d868db7d8d0eeb`. Voice-thread heap guards,
+including replacement, pass. The active APM suite has 52 passing tests and two
+unchanged assertions failing after correct two-reference construction: the
+cross-correlation lag estimate is 586 versus 585 samples, and the first-quarter-
+second warm wide echo is -28.5 dBFS against a <-55 dBFS requirement. Those
+assertions are preserved. [Final validation output](measurements/aec-reference-validation.txt).
+Release workspace clippy with all targets (excluding
+the desktop package) passes with `-D warnings`. All five options completed the unchanged six-pair four-share test body. Four
+pass the p99 and sent-frame guards; two-reference warm/profile 7 fails the p99
+bound with +1.843 ms in its sixth pair. All sent-frame guards pass. No failing
+run is replaced with a favorable rerun. The unchanged exact guard on the corrected
+default profile (no experimental tuning) also passes six pairs, maximum reported
+delta +0.288 ms. [Default guard output](measurements/aec-reference-four-default.txt).
+
+The timing tests use virtual headphones, no leading audio, AGC on and native
+denoise 0. They use the same release test binary with dev-only AEC diagnostics
+and linear-output export enabled. They do not measure the denoise-100 model's
+worker scheduling or hardware latency. The table reports the largest printed
+three-decimal delta; the Rust guard checks the unrounded value. Raw logs for
+[option 1](measurements/aec-reference-four-1.txt),
+[option 2](measurements/aec-reference-four-2.txt),
+[option 3](measurements/aec-reference-four-3.txt),
+[option 4](measurements/aec-reference-four-4.txt),
+[option 5](measurements/aec-reference-four-5.txt), and
+[summary](measurements/aec-reference-four-summary.csv).
+
+Recommendation for the owner: select no tuning automatically. Among correctly
+wired options, cold/profile 7 is the preferred speech-first trade-off to discuss:
+it improves default speaker speech substantially, does better than cold/profile 1
+on the 10 s headphone cases, has slightly lower aggregate echo, and passes the
+four-share guard. Its catalogue echo energy is +12.770 dB against current warm,
+but only +0.011 dB against historical cold. The six headphone kept-floor failures
+and 422 echo windows above +1 dB remain explicit costs requiring an owner decision.
+Historical left-only/profile 7 remains a counterfactual option with the reference
+wiring defect; it is not enabled as a fix.
+
+Raw speech logs: [profile 7, historical left](measurements/aec-profile7-full-speech.txt),
+[all four two-reference arms](measurements/aec-two-reference-speech.txt).
+Raw echo logs: [full 549](measurements/aec-reference-full-echo.txt),
+[right paths](measurements/aec-reference-right-echo.txt).
+The raw files regenerate the CSVs without building or playing audio:
+
+```sh
+python3 docs/measurements/summarize-aec-reference-options.py --speech --echo --right
+```
+
+### Priority 1: default recorded-speech regression (historical pre-fix checkpoint)
 
 **State / next steps:** default warm + speakers + full denoising is the production
 regression under investigation. `apps/web/src/state/settings.ts` defaults to
@@ -1138,12 +1276,16 @@ There are 549 paired observations per profile (396 from the mono table, includin
 repeated pure-echo controls for both near-talker pitches, and 153 from the wide
 table). These are not 549 independent rooms.
 
-| Native profile | Speech gate, 12 cases | Echo observations > +1 dB | Worst echo delta | Current warm / candidate dBFS at the worst window |
-| --- | --- | --- | --- | --- |
-| 1: disable conservative tail envelope | Pass | 12 / 549 | +13.498 | -59.328 / -45.830 |
-| 2: zero default and nearend decay | Pass | 47 / 549 | +14.951 | -59.328 / -44.377 |
-| 7: zero nearend decay only | Pass in the two default speaker/full-denoise screens; full speech matrix not run | 6 / 549 | +4.615 | -36.599 / -31.985 |
-| Plain cold, unchanged config | Speech baseline | 408 / 549 | +64.952 | -92.647 / -27.695 |
+| Native profile | Speech gate, 12 cases | Echo observations > +1 / +3 / +6 dB | Worst echo delta | Total energy delta, dB | Current warm / candidate dBFS at the worst window |
+| --- | --- | --- | --- | --- | --- |
+| 1: disable conservative tail envelope | Pass | 12 / 5 / 3 | +13.498 | +0.136 | -59.328 / -45.830 |
+| 2: zero default and nearend decay | Pass | 47 / 25 / 14 | +14.951 | +1.133 | -59.328 / -44.377 |
+| 7: zero nearend decay only | 11/12, completed in the latest checkpoint | 6 / 2 / 0 | +4.615 | +0.201 | -36.599 / -31.985 |
+| Plain cold, unchanged config | Speech baseline | 408 / 296 / 211 | +64.952 | +12.759 | -92.647 / -27.695 |
+
+The historical profile-1/2 energy aggregates are reconstructed from the unrounded
+per-window RMS dB values and durations; the latest options above additionally
+record direct f64 sums of squares.
 
 Profiles 1 and 2 are worst in `wide both speakers`, pin 310 s, 0.5-1 s after
 pinning. Profile 7 is worst in `wide steady`, pin 310 s, 0.25-0.5 s. Plain cold

@@ -720,6 +720,21 @@ impl EchoCanceller3 {
         self.initialize();
     }
 
+    /// Reconstruct pre-fix channel wiring before any frame, for historical controls only.
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub(crate) fn measurement_restore_left_reference(&mut self) {
+        self.num_render_channels_to_aec = 1;
+        self.render_block.set_num_channels(1);
+        self.render_blocker = FrameBlocker::new(self.num_bands, 1);
+        self.block_processor = BlockProcessor::new(
+            self.config_selector.active_config(),
+            self.sample_rate_hz,
+            1,
+            self.num_capture_channels,
+        );
+        self.render_sub_frame_view = vec![vec![vec![0.0; SUB_FRAME_LENGTH]]; self.num_bands];
+    }
+
     /// Collects current metrics from the echo canceller.
     pub(crate) fn get_metrics(&self) -> BlockProcessorMetricsOutput {
         self.block_processor.get_metrics()

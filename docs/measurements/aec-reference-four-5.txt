@@ -1,0 +1,11 @@
+
+running 1 test
+test voice::codec_tests::four_shares_for_native_aec_option ... pair 0 order [0, 4]: none p50 0.152 p99 0.484 max 7.634 missing 480 | four p50 0.168 p99 0.708 max 4.387 missing 0 | p99 delta +0.224 ms
+pair 1 order [4, 0]: none p50 0.163 p99 0.357 max 7.702 missing 480 | four p50 0.005 p99 0.490 max 7.353 missing 0 | p99 delta +0.134 ms
+pair 2 order [0, 4]: none p50 0.138 p99 0.603 max 4.875 missing 480 | four p50 0.011 p99 0.655 max 2.116 missing 0 | p99 delta +0.051 ms
+pair 3 order [4, 0]: none p50 0.005 p99 0.288 max 4.179 missing 480 | four p50 0.006 p99 0.465 max 4.668 missing 0 | p99 delta +0.177 ms
+pair 4 order [0, 4]: none p50 0.003 p99 0.239 max 4.577 missing 480 | four p50 0.006 p99 0.248 max 1.276 missing 0 | p99 delta +0.008 ms
+pair 5 order [4, 0]: none p50 0.140 p99 0.264 max 2.497 missing 480 | four p50 0.005 p99 0.402 max 5.389 missing 0 | p99 delta +0.137 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 403 filtered out; finished in 239.92s
