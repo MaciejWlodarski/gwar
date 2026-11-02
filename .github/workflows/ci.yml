@@ -85,9 +85,10 @@ jobs:
           CARGO_BUILD_JOBS: "4"
         run: cargo test --locked --workspace --exclude gwar-desktop
 
-      - name: Vendored str0m payload and SDP negotiation regressions
+      - name: Vendored str0m BWE, payload and SDP negotiation regressions
         timeout-minutes: 5
         run: |
+          cargo test -j 4 --manifest-path vendor/str0m/Cargo.toml --no-default-features --features aws-lc-rs,_internal_test_exports --lib bwe_::
           cargo test -j 4 --manifest-path vendor/str0m/Cargo.toml --no-default-features --features aws-lc-rs,_internal_test_exports --lib format::payload_params
           cargo test -j 4 --manifest-path vendor/str0m/Cargo.toml --no-default-features --features aws-lc-rs,_internal_test_exports --test sdp-negotiation
 

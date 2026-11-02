@@ -40,6 +40,9 @@ pub struct Direction {
     jitter: Duration,
     normal: bool,
     keep_order: bool,
+    /// How long one jitter draw lasts. Radio links delay packets in runs, not one by one: with
+    /// `hold=` every packet of a run keeps its draw, and only the runs differ.
+    hold: Duration,
     loss: f64,
     burst: Option<(usize, f64)>,
     reorder: f64,
@@ -68,6 +71,7 @@ impl Default for Direction {
             jitter: Duration::ZERO,
             normal: false,
             keep_order: false,
+            hold: Duration::ZERO,
             loss: 0.0,
             burst: None,
             reorder: 0.0,
@@ -150,6 +154,7 @@ impl Spec {
                         }
                     }
                     "keep_order" => config.keep_order = value.parse().context("keep_order must be true or false")?,
+                    "hold" => config.hold = duration(value)?,
                     "loss" => config.loss = probability(value)?,
                     "burst" => {
                         let (count, chance) = value.split_once('@').context("expected burst=N@P%")?;
@@ -517,6 +522,9 @@ struct Scheduler {
     random: Random,
     burst_left: usize,
     last_due: Duration,
+    /// The jitter draw in force, and when it ends.
+    held: f64,
+    held_until: Duration,
     highest_sent: Option<u64>,
     queue: BTreeMap<(Duration, u64), Packet>,
     counts: Counts,
@@ -529,6 +537,8 @@ impl Scheduler {
             random: Random(seed),
             burst_left: 0,
             last_due: Duration::ZERO,
+            held: 0.0,
+            held_until: Duration::ZERO,
             highest_sent: None,
             queue: BTreeMap::new(),
             counts: Counts::default(),
@@ -570,6 +580,8 @@ impl Scheduler {
         }
         let jitter = if self.config.jitter.is_zero() {
             0.0
+        } else if sent < self.held_until {
+            self.held
         } else if self.config.normal {
             // Normal sigma = bound/3, clipped to the configured bound.
             ((-2.0 * (1.0 - self.random.unit()).ln()).sqrt() * (std::f64::consts::TAU * self.random.unit()).cos() / 3.0)
@@ -577,6 +589,10 @@ impl Scheduler {
         } else {
             2.0 * self.random.unit() - 1.0
         };
+        if sent >= self.held_until {
+            self.held = jitter;
+            self.held_until = sent + self.config.hold;
+        }
         let delay = (self.config.delay.as_secs_f64() + jitter * self.config.jitter.as_secs_f64()).max(0.0);
         let mut due = sent + Duration::from_secs_f64(delay);
         if self.random.chance(self.config.reorder) {
@@ -1017,6 +1033,22 @@ mod tests {
         // Pin the generator so the same seed remains stable after refactors.
         assert!((Random(1).unit() - 0.566561575172281).abs() < 1e-15);
     }
+    #[test]
+    fn hold_keeps_one_jitter_draw_for_a_run_of_packets() {
+        let mut scheduler = scheduler("seed=3;up:delay=20ms,jitter=10ms,hold=10ms");
+        for i in 0..100 {
+            scheduler.enqueue(Duration::from_millis(i), Vec::new(), &mut Link::default()).unwrap();
+        }
+        // In order of sending: a run with a shorter draw overtakes the end of the one before it.
+        let mut sent = drain(&mut scheduler);
+        sent.sort_by_key(|(i, _)| *i);
+        let delays: Vec<_> = sent.iter().map(|(i, due)| *due - Duration::from_millis(*i)).collect();
+        for run in delays.chunks(10) {
+            assert!(run.iter().all(|delay| *delay == run[0]), "{run:?}");
+        }
+        assert!(delays.chunks(10).any(|run| run[0] != delays[0]), "the runs differ");
+    }
+
     #[test]
     fn jitter_reorders_unless_keep_order() {
         for keep_order in [false, true] {
