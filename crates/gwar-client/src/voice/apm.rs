@@ -255,6 +255,9 @@ struct Warming {
     history: u32,
     /// The room it learned may be gone without a notice: then it starts over, as at a break.
     echo: EchoGone,
+    /// Measurement only: retain the old filter, but defer its takeover after echo disappears.
+    #[cfg(test)]
+    absence_seen: bool,
 }
 
 impl Warming {
@@ -266,6 +269,8 @@ impl Warming {
             found_echo: false,
             history,
             echo: EchoGone::default(),
+            #[cfg(test)]
+            absence_seen: false,
         }
     }
 
@@ -275,6 +280,10 @@ impl Warming {
         self.sound.store(0, Ordering::Relaxed);
         self.found_echo = false;
         self.echo = EchoGone::default();
+        #[cfg(test)]
+        {
+            self.absence_seen = false;
+        }
     }
 
     /// Everything waiting in the ring. A frame from a later stretch starts it all over, here on the
@@ -301,6 +310,12 @@ impl Warming {
                     let taken_down = statistics.echo_return_loss_enhancement;
                     self.found_echo |= taken_down.is_some_and(|enhancement| enhancement >= ECHO_FOUND);
                     if self.echo.microphone(&microphone, || statistics.echo_return_loss) {
+                        #[cfg(test)]
+                        if ROUTE_MEASUREMENT.load(Ordering::Relaxed) == 5 {
+                            self.echo = EchoGone::default();
+                            self.absence_seen = true;
+                            continue;
+                        }
                         #[cfg(test)]
                         if ROUTE_MEASUREMENT.load(Ordering::Relaxed) == 4 {
                             self.echo = EchoGone::default();
@@ -732,6 +747,8 @@ impl Processing {
             if !self.replacing {
                 let left_to_hear = self.learning_frames.saturating_sub(warmed.sound.load(Ordering::Relaxed));
                 let left_to_hear = left_to_hear.max(HANDOVER_FRAMES.min(self.learning_frames));
+                #[cfg(test)]
+                let left_to_hear = if warmed.absence_seen { self.learning_frames } else { left_to_hear };
                 self.channels = Channels::Learning(warmed.stage, left_to_hear);
                 self.warmed = true;
                 return;
@@ -3049,7 +3066,7 @@ mod tests {
     /// canceller ("before"), the same change reported at once (the reset the code does when told),
     /// and one canceller on one channel that nothing resets, as a browser or Discord runs it.
     /// The near voice is [`talker`]: one that shares nothing with the far voice. 27 rooms.
-    fn measure_unreported_device_costs(only_native: bool) -> bool {
+    fn measure_unreported_device_costs(only_native: bool, accepted_arm: usize) -> bool {
         let mut accepted = true;
         let total = 36 * RATE;
         let windows = [(0usize, 3usize), (3, 5), (5, 8), (8, 16)];
@@ -3094,6 +3111,7 @@ mod tests {
             "worker faster",
             "worker faster, keep eligibility",
             "native gain change",
+            "retained candidate, deferred takeover",
         ];
         let scenarios = [
             ("in charge, then headphones", 8, 16, false),
@@ -3104,8 +3122,8 @@ mod tests {
         for (scenario, pin, moved, echo) in scenarios {
             let (pin, moved) = (pin * RATE, moved * RATE);
             let from = pin.max(moved);
-            let mut sums = [[0f32; 9]; 9];
-            let mut worst = [f32::MIN; 9];
+            let mut sums = [[0f32; 9]; 10];
+            let mut worst = [f32::MIN; 10];
             let mut count = 0.0;
             for far_pitch in [100.0, 150.0, 230.0] {
                 for delay in [20, 60, 150] {
@@ -3127,7 +3145,7 @@ mod tests {
                         } else {
                             said.clone()
                         };
-                        let mut cells = [[0f32; 9]; 9];
+                        let mut cells = [[0f32; 9]; 10];
                         let runs = [
                             (0u8, None, true),
                             (1, None, true),
@@ -3138,9 +3156,10 @@ mod tests {
                             (2, None, false),
                             (2, None, false),
                             (2, None, false),
+                            (2, None, false),
                         ];
                         for (index, (mode, told, blind)) in runs.into_iter().enumerate() {
-                            if only_native && !matches!(index, 0 | 1 | 2 | 6 | 8) {
+                            if only_native && !matches!(index, 0 | 1 | 2 | 6 | 8 | 9) {
                                 continue;
                             }
                             ECHO_GONE_IGNORED.store(blind, Ordering::Relaxed);
@@ -3193,8 +3212,8 @@ mod tests {
                                 }
                             }
                         }
-                        for index in 0..9 {
-                            if only_native && !matches!(index, 0 | 1 | 2 | 6 | 8) {
+                        for index in 0..10 {
+                            if only_native && !matches!(index, 0 | 1 | 2 | 6 | 8 | 9) {
                                 continue;
                             }
                             eprintln!("route-case,{scenario},{far_pitch},{delay},{pitch},{index},{:?}", cells[index]);
@@ -3225,11 +3244,11 @@ mod tests {
                 "{scenario}, {count} rooms, {}",
                 if echo { "echo dBFS by second, near silent" } else { "voice kept by 0-3, 3-5, 5-8, 8-16 s" }
             );
-            for window in 0..if echo { 9 } else { 4 } {
+            for (window, value) in sums[accepted_arm].iter().enumerate().take(if echo { 9 } else { 4 }) {
                 if echo && window % 2 == 1 {
                     continue;
                 }
-                let got = sums[6][window] / count;
+                let got = value / count;
                 let before = sums[1][window] / count;
                 let main = sums[2][window] / count;
                 let passes = if echo { got <= before.min(main) } else { got >= before.max(main) };
@@ -3241,7 +3260,7 @@ mod tests {
                 accepted &= passes;
             }
             for (index, name) in arms.iter().enumerate() {
-                if only_native && !matches!(index, 0 | 1 | 2 | 6 | 8) {
+                if only_native && !matches!(index, 0 | 1 | 2 | 6 | 8 | 9) {
                     continue;
                 }
                 let cells: Vec<String> = sums[index]
@@ -3260,19 +3279,26 @@ mod tests {
     #[test]
     #[ignore = "route comparison, run in release alone"]
     fn what_an_unreported_device_costs() {
-        measure_unreported_device_costs(false);
+        measure_unreported_device_costs(false, 6);
     }
 
     #[test]
     #[ignore = "native AEC path-change comparison, run in release alone"]
     fn native_gain_change_routes() {
-        measure_unreported_device_costs(true);
+        measure_unreported_device_costs(true, 6);
     }
 
     #[test]
     #[ignore = "strict acoustic acceptance, known to fail; run in release alone"]
     fn route_gaps_reach_both_baselines() {
-        assert!(measure_unreported_device_costs(true), "route gaps do not meet both baseline floors");
+        assert!(measure_unreported_device_costs(true, 6), "route gaps do not meet both baseline floors");
+    }
+
+    #[test]
+    #[ignore = "deferred retained-candidate comparison, run in release alone"]
+    fn deferred_candidate_routes() {
+        let accepted = measure_unreported_device_costs(true, 9);
+        eprintln!("deferred route acceptance: {accepted}");
     }
 
     /// Measurement-only observer. Four render frames are classified on a separate
