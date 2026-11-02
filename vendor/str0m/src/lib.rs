@@ -2280,4 +2280,9 @@ pub mod _gwar_sim {
         fastrand::seed(seed);
         crate::util::simulation_start()
     }
+
+    /// Gwar: whether this thread's estimators filter stretched probe clusters (on by default).
+    pub fn set_probe_filter(on: bool) {
+        crate::bwe_::PROBE_FILTER.with(|filter| filter.set(on));
+    }
 }

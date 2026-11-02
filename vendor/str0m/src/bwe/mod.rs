@@ -165,6 +165,24 @@ impl Bwe {
     }
 }
 
+#[cfg(feature = "_gwar_sim")]
+thread_local! {
+    /// Off in a simulation that compares with the estimator as it was without the filter.
+    pub(crate) static PROBE_FILTER: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
+}
+
+/// Whether a stretched cluster may be filtered (`PROBE_FILTER`).
+fn probe_filter() -> bool {
+    #[cfg(feature = "_gwar_sim")]
+    {
+        PROBE_FILTER.with(|on| on.get())
+    }
+    #[cfg(not(feature = "_gwar_sim"))]
+    {
+        true
+    }
+}
+
 struct RecentProbe {
     cluster: TwccClusterId,
     at: Instant,
@@ -265,6 +283,7 @@ impl SendSideBandwidthEstimator {
         let previous_estimate = self.last_estimate();
         let probes: Vec<_> = self.probe_estimator.update(send_records.iter().copied()).collect();
         for (config, bitrate, saturated) in probes {
+            let stretched = saturated && self.probe_estimator.stretched(config.cluster());
             let best = self.remember_probe(config.cluster(), bitrate, now);
             // A paced probe whose receive rate matches its actual send rate only
             // demonstrates a capacity floor. Local underfill cannot lower a prior
@@ -279,11 +298,14 @@ impl SendSideBandwidthEstimator {
                 // evidence for the higher delay ceiling, or lowering that ceiling.
                 bitrate.max(previous_delay_estimate.unwrap_or(bitrate))
             } else if !congested
+                && stretched
+                && probe_filter()
                 && previous_estimate.is_some_and(|previous| bitrate < previous)
                 && bitrate.as_f64() < best.as_f64() * PROBE_AGREEMENT
             {
                 // A cluster lasts a few milliseconds, so jitter on the link alone can read as
-                // saturation. A link that is full shows it in rising delay or loss, or in
+                // saturation: it holds a run of packets back and lets them go together. A full
+                // link spaces every packet out instead, and shows in rising delay or loss, or in
                 // cluster after cluster, alike.
                 if previous_estimate.is_some_and(|previous| best >= previous) {
                     continue;
@@ -635,13 +657,16 @@ mod tests {
         assert_eq!(bwe.remember_probe(5.into(), mbps(2), at(9)), mbps(2), "old ones say nothing");
     }
 
-    /// Feeds one finished saturated cluster: 12 packets sent 1 ms apart, received `gap` apart.
+    /// Feeds one finished saturated cluster: 12 packets sent 1 ms apart, received over 11 `gap`s.
+    /// Spaced out alike, as a full link spaces them, or `held`: the first half as fast as they
+    /// were sent, then the rest at once after a hold, as jitter on the way delivers them.
     fn saturated_probe(
         bwe: &mut SendSideBandwidthEstimator,
         cluster: u64,
         start: Instant,
         gap: Duration,
         seq: u64,
+        held: bool,
     ) {
         let cluster: TwccClusterId = cluster.into();
         let config = ProbeClusterConfig::new(cluster, Bitrate::mbps(10), ProbeKind::Initial)
@@ -655,7 +680,11 @@ mod tests {
                     start + Duration::from_millis(i as u64),
                     1200,
                     done,
-                    Some(start + gap * i),
+                    Some(match (held, i) {
+                        (false, _) => start + gap * i,
+                        (true, 0..6) => start + Duration::from_micros(200) * i,
+                        (true, _) => start + gap * 11 - Duration::from_micros(200) * (11 - i),
+                    }),
                 )
             })
             .collect();
@@ -669,7 +698,7 @@ mod tests {
         let mut controller = Bwe::new(Bitrate::mbps(5));
         let bwe = &mut controller.bwe;
         bwe.started_at = Some(base - STARTUP_PHASE);
-        saturated_probe(bwe, 1, base, Duration::from_micros(2_000), 1_000);
+        saturated_probe(bwe, 1, base, Duration::from_micros(2_000), 1_000, false);
         assert!(bwe.last_estimate().unwrap() >= Bitrate::kbps(4_400));
         // The estimate sits above what that cluster showed.
         // Soon enough that no loss observation completes: the probe result stands alone.
@@ -679,9 +708,26 @@ mod tests {
         let carried = bwe.last_estimate().unwrap();
         assert_eq!(carried, Bitrate::mbps(5));
         // About 2.3 Mb/s on the receive side, with nothing lost and nothing else saying so.
-        saturated_probe(bwe, 2, stretched, Duration::from_micros(4_200), 2_000);
+        saturated_probe(bwe, 2, stretched, Duration::from_micros(4_200), 2_000, true);
         let after = bwe.last_estimate().unwrap();
         assert!(after >= carried * 0.9, "{carried} fell to {after}");
+    }
+
+    #[test]
+    fn a_cluster_a_full_link_spaced_out_lowers_the_estimate_at_once() {
+        // As above, but every packet of the second cluster arrives 4.2 ms after the one before:
+        // the link is full, whatever the clusters before it showed.
+        let base = Instant::now();
+        let mut controller = Bwe::new(Bitrate::mbps(5));
+        let bwe = &mut controller.bwe;
+        bwe.started_at = Some(base - STARTUP_PHASE);
+        saturated_probe(bwe, 1, base, Duration::from_micros(2_000), 1_000, false);
+        let at = base + Duration::from_millis(100);
+        bwe.delay_controller.update(&[], None, Some(Bitrate::mbps(5)), at);
+        bwe.loss_controller.set_bandwidth_estimate(Bitrate::mbps(5));
+        saturated_probe(bwe, 2, at, Duration::from_micros(4_200), 2_000, false);
+        let after = bwe.last_estimate().unwrap();
+        assert!(after <= Bitrate::kbps(2_300), "{after}");
     }
 
     #[test]

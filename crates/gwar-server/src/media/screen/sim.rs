@@ -826,6 +826,46 @@ mod tests {
         assert!(hurt <= 700 * MS, "{hurt:?}: {}", summary(&sim));
     }
 
+    /// A 20 Mb/s link drops to 5 Mb/s at once, or over 2 s, `phase` into a probe interval. How
+    /// long the estimate stays above the link over the 5 s after, and how long voice queues past
+    /// `HURT`; `filter` off is the estimator as it was before stretched probes were filtered.
+    fn drop_case(cadence: u32, phase: u32, ramp: bool, loss: f64, filter: bool) -> (u64, Duration) {
+        str0m::_gwar_sim::set_probe_filter(filter);
+        let mut sim = Sim::new(Some(20_000_000));
+        sim.voice = true;
+        sim.down.loss = loss;
+        sim.server_interval = MS * cadence;
+        sim.join("share", 5_000_000, 30, 150_000, 8_000_000);
+        sim.run(10 * SECOND + MS * phase);
+        let dropped = sim.now;
+        let mut above = 0;
+        for step in 0..500u64 {
+            let capacity = if ramp { 20_000_000 - 15_000_000 * step.min(200) / 200 } else { 5_000_000 };
+            sim.down.rate = Some(capacity);
+            sim.run(10 * MS);
+            above += u64::from(sim.w.egress.estimate() > capacity) * 10;
+        }
+        str0m::_gwar_sim::set_probe_filter(true);
+        (above, voice_hurt(&sim, dropped, sim.now).0)
+    }
+
+    #[test]
+    fn no_drop_of_the_link_costs_more_than_it_did_before_the_probe_filter() {
+        // A full link spaces a probe out alike, so the filter must leave it alone wherever in
+        // the probe interval the drop comes, at either cadence, lossless or lossy.
+        for cadence in [5, 10] {
+            for (ramp, loss) in [(false, 0.0), (true, 0.01)] {
+                for phase in (0..1000).step_by(100) {
+                    let (above, hurt) = drop_case(cadence, phase, ramp, loss, true);
+                    let (was_above, was_hurt) = drop_case(cadence, phase, ramp, loss, false);
+                    let case = format!("{cadence} ms, ramp {ramp}, loss {loss}, {phase} ms in");
+                    assert!(above <= was_above, "{case}: above the link {above} ms, was {was_above} ms");
+                    assert!(hurt <= was_hurt, "{case}: voice queued {hurt:?}, was {was_hurt:?}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn keyframes_overflowing_admission_pause_a_3_mbps_viewer_and_its_retries_back_off() {
         let mut sim = Sim::new(Some(3_000_000));
