@@ -64,7 +64,7 @@ import type { pruneRequest } from "../lib/prune";
 import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, identityFailure, type Identity, type IdentityFailure } from "../net/identity";
 import { isDesktop, tauri } from "../platform";
 import { createVoiceEngine } from "../voice";
-import { denoiseModels } from "../voice/denoise/model-cache";
+import { prepareDenoise } from "../voice/denoise";
 import { useScreen } from "./screen";
 import { ScreenController } from "./screen-controller";
 import { microphoneSsrc } from "../voice/sdp";
@@ -368,7 +368,7 @@ class Controller {
     const first = useSettings.getState().audio;
     const prepareSuppression = () => {
       const phase = useSession.getState().phase;
-      denoiseModels.configure(!isDesktop() && useSettings.getState().audio.noiseSuppression, phase === "online" || phase === "reconnecting");
+      prepareDenoise(!isDesktop() && useSettings.getState().audio.noiseSuppression, phase === "online" || phase === "reconnecting");
     };
     prepareSuppression();
     useSession.subscribe((s, prev) => { if (s.phase !== prev.phase) prepareSuppression(); });

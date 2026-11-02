@@ -28,6 +28,15 @@ export class Framing {
 
   constructor(private clean: (frame: Float32Array) => void) {}
 
+  /** A new owner must hear neither queued output nor a partial frame from the previous source. */
+  clear(): void {
+    this.frame.fill(0);
+    this.ring.fill(0);
+    this.filled = 0;
+    this.read = 0;
+    this.queued = LEAD;
+  }
+
   /** Takes one quantum of input (`null`: silence) and fills `output`, of the same length. */
   push(input: Float32Array | null, output: Float32Array): void {
     for (let i = 0; i < output.length; i++) {

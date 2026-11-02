@@ -114,9 +114,14 @@ describe.skipIf(!present && !process.env.CI)("the worker hands the model to the 
 
   it("in chunks, one message each, and the worklet then cleans noise", async () => {
     const reports: Report[] = [];
+    let reportTarget = reports;
     let Registered: (new () => Processor) | null = null;
     vi.stubGlobal("AudioWorkletProcessor", class {
-      port = { onmessage: null, postMessage: (report: Report) => reports.push(report) };
+      port;
+      constructor() {
+        const sink = reportTarget;
+        this.port = { onmessage: null, postMessage: (report: Report) => sink.push(report) };
+      }
     });
     vi.stubGlobal("registerProcessor", (_: string, processor: new () => Processor) => { Registered = processor; });
     vi.stubGlobal("currentTime", 0);
@@ -175,20 +180,47 @@ describe.skipIf(!present && !process.env.CI)("the worker hands the model to the 
     // The audio clock keeps up with the wall clock here: the pace checks see a fast machine.
     const started = Date.now();
     const tick = () => { (globalThis as unknown as { currentTime: number }).currentTime = (Date.now() - started) / 1000; };
-    for (let q = 0; q < 1000 && !reports.some(report => report.type === "ready"); q++) { tick(); processor.process(quantum(), output); }
+    for (let q = 0; q < 1000 && !reports.some(report => report.type === "ready"); q++) { tick(); processor.process([[]], output); }
     expect(reports).toEqual([{ type: "loaded" }, { type: "ready" }]);
+    processor.port.onmessage!({ data: { type: "clear" } });
     processor.port.onmessage!({ data: { type: "active", active: true } });
+    const firstOutput = new Float32Array(600 * QUANTUM);
     let energyIn = 0, energyOut = 0;
     for (let q = 0; q < 600; q++) {
       const input = quantum();
       tick();
       processor.process(input, output);
+      firstOutput.set(output[0]![0]!, q * QUANTUM);
       if (q < 200) continue;
       for (const sample of input[0]![0]!) energyIn += sample * sample;
       for (const sample of output[0]![0]!) energyOut += sample * sample;
     }
     expect(10 * Math.log10(energyIn / energyOut)).toBeGreaterThan(20);
+
+    // A later call copies the same worker-owned model, after the first consumer has processed
+    // real samples. It must produce identical bits without another download or build.
+    const secondReports: Report[] = [];
+    reportTarget = secondReports;
+    const second = new Registered!();
+    const later = new MessageChannel();
+    (globalThis as unknown as { onmessage(event: { data: BuilderRequest }): void }).onmessage({
+      data: { type: "attach", id: 2, worklet: later.port1 as unknown as MessagePort },
+    });
+    second.port.onmessage!({ data: { type: "load", worker: later.port2 as unknown as MessagePort } });
+    await vi.waitFor(() => expect(secondReports).toContainEqual({ type: "loaded" }), { timeout: 30_000, interval: 20 });
+    seed = 3;
+    for (let q = 0; q < 1000 && !secondReports.some(report => report.type === "ready"); q++) { tick(); second.process([[]], output); }
+    expect(secondReports).toEqual([{ type: "loaded" }, { type: "ready" }]);
+    second.port.onmessage!({ data: { type: "clear" } });
+    second.port.onmessage!({ data: { type: "active", active: true } });
+    const secondOutput = new Float32Array(firstOutput.length);
+    for (let q = 0; q < 600; q++) { tick(); second.process(quantum(), output); secondOutput.set(output[0]![0]!, q * QUANTUM); }
+    expect(bits([secondOutput])).toEqual(bits([firstOutput]));
+    expect(workerReplies).toEqual([{ type: "ready", bytes: expect.any(Number) }]);
+    expect(workerClosed).toBe(false);
     channel.port1.close();
     channel.port2.close();
+    later.port1.close();
+    later.port2.close();
   }, 60_000);
 });

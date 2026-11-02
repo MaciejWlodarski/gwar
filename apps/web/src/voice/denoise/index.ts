@@ -6,6 +6,7 @@
  * its 10 ms frames to the audio thread's quanta.
  */
 import { denoiseModels } from "./model-cache";
+import { PipelinePool } from "./pipeline-pool";
 export { denoiseModels } from "./model-cache";
 import { PACE_WINDOW_S, Underruns } from "./pace";
 import type { BuildFailed, Report, Request } from "./protocol";
@@ -31,16 +32,30 @@ export interface DenoiseEvents {
   changed(): void;
 }
 
+export interface PreparedDenoise extends DenoisePipeline {
+  park(): Promise<void>;
+  wake(): Promise<void>;
+}
+
 const LOAD_TIMEOUT_MS = 30_000;
 
 /** What settles a load. */
-type Outcome = Exclude<Report, { type: "loaded" }>;
+type Outcome = Exclude<Report, { type: "loaded" | "cleared" }>;
+
+export const denoisePreparation = new PipelinePool(createDenoise, undefined, () => denoiseModels.dispose());
+export function prepareDenoise(enabled: boolean, online: boolean): void {
+  denoisePreparation.configure(enabled, online);
+  denoiseModels.configure(enabled && !denoisePreparation.status().error, online);
+}
+export function startDenoise(events: DenoiseEvents, signal: AbortSignal): Promise<DenoisePipeline> {
+  return denoisePreparation.acquire(events, signal);
+}
 
 /**
  * Loads the model; rejects if this browser or machine cannot run it, or once `signal` aborts
  * (which also releases everything it had taken).
  */
-export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): Promise<DenoisePipeline> {
+export async function createDenoise(events: DenoiseEvents, signal: AbortSignal): Promise<PreparedDenoise> {
   if (typeof AudioWorkletNode === "undefined") throw new Error("no AudioWorklet");
   signal.throwIfAborted();
   const channel = new MessageChannel();
@@ -57,14 +72,20 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
   }
   // Browsers start audio only after a user gesture, and Safari interrupts it (a call, another
   // app): resume on the next gesture, as the playback context does.
+  let idle = false;
   const resume = () => {
-    if (context.state !== "running" && context.state !== "closed") void context.resume().catch(() => {});
+    if (!idle && context.state !== "running" && context.state !== "closed") void context.resume().catch(() => {});
   };
   const gestures = ["pointerdown", "keydown"] as const;
   for (const type of gestures) window.addEventListener(type, resume, { passive: true });
   // The first report settles the load; later ones are trouble.
   let settle: ((report: Outcome) => void) | null = null;
+  let parked: Promise<void> | null = null;
+  let resolvePark: (() => void) | null = null;
+  let rejectPark: ((error: Error) => void) | null = null;
   const shut = () => {
+    rejectPark?.(new Error("the pipeline closed"));
+    resolvePark = null; rejectPark = null; parked = null;
     model!.release();
     channel.port2.close();
     for (const type of gestures) window.removeEventListener(type, resume);
@@ -102,7 +123,11 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
       context.addEventListener("statechange", started);
     });
     const receive = (report: Report) => {
-      if (report.type === "loaded") {
+      if (report.type === "cleared") {
+        const resolve = resolvePark;
+        resolvePark = null; rejectPark = null; parked = null;
+        resolve?.();
+      } else if (report.type === "loaded") {
         if (!settle) return;
         // Not before: in Chromium the context gaining a stream output has the main thread take a
         // lock the audio device holds through a render, and a render waits for the worklet. Until
@@ -170,6 +195,17 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
       },
       setStrength(strength) {
         post({ type: "strength", strength });
+      },
+      wake() { idle = false; return context.state === "running" ? Promise.resolve() : context.resume(); },
+      park() {
+        if (parked) return parked;
+        idle = true;
+        active = false;
+        track.enabled = false;
+        source?.disconnect(); source = null;
+        parked = new Promise<void>((resolve, reject) => { resolvePark = resolve; rejectPark = reject; }).then(() => context.suspend());
+        post({ type: "clear" });
+        return parked;
       },
       close() {
         closed = true;

@@ -38,6 +38,7 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   /** Warm-up frames still to run; the model cleans nothing until they have. */
   private warming = WARM_UP;
   private warmUpMs = 0;
+  private lastWarmMs = Infinity;
   private quanta = 0;
   private seed = 1;
   private active = false;
@@ -85,6 +86,12 @@ class DenoiseProcessor extends AudioWorkletProcessor {
         break;
       case "reset":
         this.fresh = true;
+        break;
+      case "clear":
+        this.active = false;
+        this.fresh = true;
+        this.framing.clear();
+        this.report({ type: "cleared" });
         break;
       case "strength":
         this.strength = request.strength;
@@ -162,7 +169,8 @@ class DenoiseProcessor extends AudioWorkletProcessor {
     const started = Date.now();
     if (!this.run(frame, false)) return;
     // The second half counts: the browser compiles the model fully while the first runs.
-    if (this.warming <= WARM_UP / 2) this.warmUpMs += Date.now() - started;
+    this.lastWarmMs = Date.now() - started;
+    if (this.warming <= WARM_UP / 2) this.warmUpMs += this.lastWarmMs;
     if (--this.warming > 0) return;
     const mean = this.warmUpMs / (WARM_UP / 2);
     if (mean > BUDGET_MS) return this.report({ type: "slow", reason: `${mean.toFixed(1)} ms a frame` });
@@ -190,9 +198,9 @@ class DenoiseProcessor extends AudioWorkletProcessor {
   }
 
   process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean {
-    // Every other quantum, so as not to take the thread over (Firefox shares it with the page's
-    // other 48 kHz contexts).
-    if (this.exports && this.warming > 0 && !this.failed && this.quanta++ % 2 === 0) this.warmUp();
+    // Keep the original every-other-quantum cadence when a frame costs measurable time.
+    // If Date.now measures zero cost, allow the next quantum too; never run two in one quantum.
+    if (this.exports && this.warming > 0 && !this.failed && (this.quanta++ % 2 === 0 || this.lastWarmMs === 0)) this.warmUp();
     this.frameMs = null;
     const output = outputs[0]?.[0];
     if (output) this.framing.push(inputs[0]?.[0] ?? null, output);

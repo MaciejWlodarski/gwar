@@ -228,6 +228,7 @@ afterEach(async () => {
 describe("idle suppression preparation", () => {
   it("follows login, enable/disable, reconnect and logout without waiting for voice", async () => {
     const configure = vi.spyOn(denoiseModels, "configure");
+    const originalAudio = settings.useSettings.getState().audio;
     const enabled = (noiseSuppression: boolean) => settings.useSettings.setState({ audio: { ...settings.useSettings.getState().audio, noiseSuppression } });
     try {
       enabled(false);
@@ -242,7 +243,7 @@ describe("idle suppression preparation", () => {
       expect(configure).toHaveBeenLastCalledWith(false, true);
       await controller.disconnect(true);
       expect(configure).toHaveBeenLastCalledWith(false, false);
-    } finally { configure.mockRestore(); }
+    } finally { settings.useSettings.setState({ audio: originalAudio }); configure.mockRestore(); }
   });
 });
 

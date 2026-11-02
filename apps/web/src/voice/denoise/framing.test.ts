@@ -31,4 +31,16 @@ describe("noise suppression framing", () => {
     for (let q = 0; q < 20; q++) framing.push(null, output);
     expect(output.every(s => s === 0)).toBe(true);
   });
+
+  it("clears both queued output and a partial frame before another source owns it", () => {
+    const framing = new Framing(() => {});
+    const output = new Float32Array(QUANTUM);
+    for (let q = 0; q < 7; q++) framing.push(new Float32Array(QUANTUM).fill(0.75), output);
+    expect(output.some(sample => sample !== 0)).toBe(true);
+    framing.clear();
+    for (let q = 0; q < 20; q++) {
+      framing.push(null, output);
+      expect(output.every(sample => sample === 0)).toBe(true);
+    }
+  });
 });

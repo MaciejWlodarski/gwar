@@ -14,7 +14,7 @@ export interface Build {
 
 export type BuilderRequest = Build | { type: "attach"; id: number; worklet: MessagePort } | { type: "detach"; id: number };
 
-/** Build worker → page: only its failure; the worklet reports the rest. */
+/** Build worker → page: cache readiness/size or construction failure, without model bytes. */
 export interface BuildFailed {
   type: "failed";
   reason: string;
@@ -45,12 +45,15 @@ export type Request =
   | { type: "active"; active: boolean }
   /** The model starts over: a different microphone. */
   | { type: "reset" }
+  /** Retire an owner's input and all buffered output before reusing the warmed processor. */
+  | { type: "clear" }
   /** Percent, 10..100. */
   | { type: "strength"; strength: number };
 
 export type Report =
   /** The model is in place: the page makes the output and connects the node, whose warm-up then starts. */
   | { type: "loaded" }
+  | { type: "cleared" }
   | { type: "ready" }
   | { type: "failed"; reason: string }
   /** Too slow for this machine. */

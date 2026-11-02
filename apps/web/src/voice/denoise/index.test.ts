@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { startDenoise, denoiseModels } from "./index";
+import { createDenoise as startDenoise, denoiseModels } from "./index";
 import type { BuilderRequest, Report, Request } from "./protocol";
 
 vi.mock("../../../../../crates/gwar-denoise-wasm/pkg/gwar_denoise.wasm?url", () => ({ default: "/assets/gwar_denoise.wasm" }));
@@ -36,7 +36,8 @@ describe("loading the model", () => {
       createMediaStreamDestination = outputs;
       addEventListener() {}
       removeEventListener() {}
-      async resume() {}
+      async resume() { this.state = "running"; }
+      async suspend() { this.state = "suspended"; }
       async close() { closed++; }
     }
     class FakeNodeClass {
@@ -100,6 +101,22 @@ describe("loading the model", () => {
     expect(outputs).not.toHaveBeenCalled();
     report({ type: "loaded" }); report({ type: "ready" });
     (await second).close();
+  });
+
+  it("parks only after the worklet acknowledges clearing its buffers", async () => {
+    const pending = startDenoise({ trouble() {}, changed() {} }, new AbortController().signal);
+    await vi.waitFor(() => expect(posted).toHaveLength(1));
+    report({ type: "loaded" }); report({ type: "ready" });
+    const pipeline = await pending;
+    let cleared = false;
+    const parked = pipeline.park();
+    expect(pipeline.park()).toBe(parked);
+    void parked.then(() => { cleared = true; });
+    await tick(); expect(cleared).toBe(false);
+    expect(posted.at(-1)).toEqual({ type: "clear" });
+    report({ type: "cleared" }); await parked;
+    expect(cleared).toBe(true);
+    pipeline.close();
   });
 
   it("gives up when the worker cannot build the model", async () => {
