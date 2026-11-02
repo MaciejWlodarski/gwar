@@ -107,6 +107,9 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
       channelCountMode: "explicit",
     });
     const destination = context.createMediaStreamDestination();
+    // The worklet produces mono. Keep the stream mono too: WebKit's stereo stream bridge
+    // can read its duplicated channels at different positions and attenuate their downmix.
+    destination.channelCount = 1;
     node.connect(destination);
     const post = (request: Request, transfer: Transferable[] = []) => node.port.postMessage(request, transfer);
     const describe = (report: Exclude<Report, { type: "ready" }>) => (report.type === "slow" ? `too slow: ${report.reason}` : report.reason);
