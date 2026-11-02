@@ -20,6 +20,7 @@
  *   SYNC_ADD=1                                  the share starts with no sound and gets it 8 s into the watch
  *   SYNC_RETURN=1                               the sound stops 8 s into the watch and returns 5 s later
  *   SYNC_OUT=path.json                          every burst and the summaries
+ *   SYNC_FAKE_TAB=1                             the sharer's page is the source (Linux, where a tab's sound is not captured)
  */
 import { spawn, spawnSync } from "node:child_process";
 import assert from "node:assert/strict";
@@ -77,11 +78,11 @@ async function waitFor(check, what, timeout = 30_000) {
  * pulses whose gaps carry the number too, so sound late by any whole seconds stays with its burst.
  * A 5 ms timer keeps the draw within a few milliseconds whatever the compositor's rhythm.
  */
-const sourcePage = `<!doctype html><title>${SOURCE_TITLE}</title><style>html,body{margin:0;height:100%;overflow:hidden;background:#777}canvas{display:block;width:100vw;height:100vh}</style>
-<canvas width="1280" height="720"></canvas><script>
-const canvas = document.querySelector("canvas"), draw2d = canvas.getContext("2d");
+const sourceScript = `
+function startSource(canvas, sink) {
+const draw2d = canvas.getContext("2d");
 const audio = new AudioContext({ sampleRate: 48000 }), tone = audio.createOscillator(), gain = audio.createGain();
-tone.frequency.value = 997; gain.gain.value = 0; tone.connect(gain).connect(audio.destination); tone.start();
+tone.frequency.value = 997; gain.gain.value = 0; tone.connect(gain).connect(sink(audio)); tone.start();
 window.__bursts = []; window.__toneContext = audio;
 let burst = 0, plan = null, nextPlan = 0, tick = 0;
 const CODES = ${JSON.stringify(SOUND_CODES)};
@@ -115,7 +116,40 @@ setInterval(() => {
   }
   paint();
 }, 5);
+}`;
+const sourcePage = `<!doctype html><title>${SOURCE_TITLE}</title><style>html,body{margin:0;height:100%;overflow:hidden;background:#777}canvas{display:block;width:100vw;height:100vh}</style>
+<canvas width="1280" height="720"></canvas><script>${sourceScript}
+startSource(document.querySelector("canvas"), audio => audio.destination);
 </script>`;
+
+/**
+ * For Linux, whose Chromium gives a tab's picture but not its sound: the sharer's own page runs the
+ * source and \`getDisplayMedia\` answers with its canvas and its tone, both reported as a tab. The
+ * tone goes to the stream only, never to a speaker. What it leaves out is the browser's tab capture;
+ * everything from the sharer's encoder to the viewers' playback is the same.
+ */
+const fakeTab = `${sourceScript}
+(() => {
+  let made = null;
+  MediaDevices.prototype.getDisplayMedia = async options => {
+    if (!made) {
+      const canvas = document.createElement("canvas");
+      [canvas.width, canvas.height] = [1280, 720];
+      canvas.style.cssText = "position:fixed;left:0;bottom:0;width:64px;height:36px;opacity:0.02;pointer-events:none;z-index:-1";
+      document.body.appendChild(canvas);
+      let out = null;
+      startSource(canvas, audio => (out = audio.createMediaStreamDestination()));
+      await window.__toneContext.resume();
+      made = { video: canvas.captureStream(60).getVideoTracks()[0], audio: out.stream.getAudioTracks()[0] };
+    }
+    const tab = track => {
+      const settings = track.getSettings.bind(track);
+      track.getSettings = () => ({ ...settings(), displaySurface: "browser" });
+      return track;
+    };
+    return new MediaStream([tab(made.video.clone()), ...(options?.audio ? [tab(made.audio.clone())] : [])]);
+  };
+})();`;
 
 /** Installed in every viewer: the presentation of each new burst number. */
 function viewerPatch() {
@@ -275,6 +309,7 @@ async function device(browser, web, server, name, native = false) {
   });
   if (process.env.SYNC_NOFILTER) await context.addInitScript(() => { window.__noFilter = true; });
   await context.addInitScript(viewerPatch);
+  if (process.env.SYNC_FAKE_TAB && name === "sync-sharer") await context.addInitScript({ content: fakeTab });
   // The picker's first answer has the tab's picture only, as a share nobody asked sound for.
   if (process.env.SYNC_ADD) await context.addInitScript(() => {
     const pick = navigator.mediaDevices.getDisplayMedia.bind(navigator.mediaDevices);
@@ -394,11 +429,14 @@ async function run() {
   const viewerEngine = process.env.SYNC_ENGINE === "webkit" ? await webkit.launch({ headless: true }) : browser;
   try {
     const sharer = await device(browser, web, ready.url, "sync-sharer");
-    const source = await sharer.context_.newPage();
-    await source.route("**/share-sync-source", route => route.fulfill({ contentType: "text/html", body: sourcePage }));
-    await source.goto(`${web}/share-sync-source`);
-    await source.evaluate(() => window.__toneContext.resume());
-    await sharer.bringToFront();
+    let source = sharer;
+    if (!process.env.SYNC_FAKE_TAB) {
+      source = await sharer.context_.newPage();
+      await source.route("**/share-sync-source", route => route.fulfill({ contentType: "text/html", body: sourcePage }));
+      await source.goto(`${web}/share-sync-source`);
+      await source.evaluate(() => window.__toneContext.resume());
+      await sharer.bringToFront();
+    }
     await joinDefault(sharer);
     await sharer.getByRole("button", { name: "Share screen", exact: true }).click();
     const dialog = sharer.getByRole("dialog", { name: "Share your screen" });

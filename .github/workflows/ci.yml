@@ -926,6 +926,8 @@ jobs:
         env:
           SYNC_FIXTURE: ${{ github.workspace }}/target/debug/examples/web_latency
           NATIVE_BRIDGE_BIN: ${{ github.workspace }}/target/debug/examples/native_bridge
+          # Linux Chromium captures a tab's picture but not its sound: the sharer's page is the source.
+          SYNC_FAKE_TAB: "1"
         run: |
           pulseaudio --start --exit-idle-time=-1
           pactl load-module module-null-sink sink_name=e2e
