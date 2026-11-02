@@ -1,0 +1,72 @@
+diff --git a/vendor/str0m/src/bwe/probe/estimator.rs b/vendor/str0m/src/bwe/probe/estimator.rs
+index 70b3fbba..c49c576b 100644
+--- a/vendor/str0m/src/bwe/probe/estimator.rs
++++ b/vendor/str0m/src/bwe/probe/estimator.rs
+@@ -86,8 +86,6 @@ struct ProbeEstimatorState {
+     /// Number of packets included in this probe (received packets only).
+     packet_count: usize,
+     send_times: BTreeSet<Instant>,
+-    /// Gwar: receive times of the packets included, for `stretched`.
+-    recv_times: Vec<Instant>,
+ }
+ 
+ impl ProbeEstimator {
+@@ -182,12 +180,6 @@ impl ProbeEstimator {
+             .filter_map(|s| s.calculate_bitrate())
+     }
+ 
+-    /// Gwar: whether the cluster's packets mostly arrived as fast as they were sent
+-    /// (`ProbeEstimatorState::stretched`).
+-    pub fn stretched(&self, cluster: TwccClusterId) -> bool {
+-        self.states.iter().find(|s| s.config.cluster() == cluster).is_some_and(|s| s.stretched())
+-    }
+-
+     /// Mark the probe as ended.
+     ///
+     /// The probe will continue collecting feedback during a cluster history
+@@ -257,7 +249,6 @@ impl ProbeEstimatorState {
+             total_bytes: DataSize::ZERO,
+             packet_count: 0,
+             send_times: BTreeSet::new(),
+-            recv_times: Vec::new(),
+         }
+     }
+ 
+@@ -296,37 +287,10 @@ impl ProbeEstimatorState {
+ 
+         self.total_bytes += packet_size;
+         self.packet_count += 1;
+-        self.recv_times.push(recv_time);
+ 
+         true
+     }
+ 
+-    /// Gwar: whether the cluster arrived mostly as fast as it was sent, and only a few long
+-    /// gaps between its packets lowered its receive rate. A full link spaces every packet out
+-    /// alike; jitter on the way holds a run of them back and lets them go together.
+-    fn stretched(&self) -> bool {
+-        let (Some(first), Some(last)) = (self.first_send_time, self.last_send_time) else {
+-            return false;
+-        };
+-        let send_size = self.total_bytes.saturating_sub(self.size_last_send);
+-        let send_interval = last.saturating_duration_since(first);
+-        let recv_size = self.total_bytes.saturating_sub(self.size_first_receive);
+-        if self.recv_times.len() < MIN_CLUSTER_SIZE || send_interval.is_zero() || send_size <= DataSize::ZERO {
+-            return false;
+-        }
+-        let mut times = self.recv_times.clone();
+-        times.sort_unstable();
+-        let mut gaps: Vec<Duration> = times.windows(2).map(|w| w[1] - w[0]).collect();
+-        gaps.sort_unstable();
+-        let typical = gaps[gaps.len() / 2];
+-        if typical.is_zero() {
+-            return true;
+-        }
+-        let packet = recv_size.as_bytes_f64() / gaps.len() as f64;
+-        let dense = DataSize::bytes(packet as i64) / typical;
+-        dense.as_f64() >= (send_size / send_interval).as_f64() * MIN_RATIO_FOR_UNSATURATED_LINK
+-    }
+-
+     fn calculate_bitrate(&self) -> Option<(ProbeClusterConfig, Bitrate, bool)> {
+         let result = self.do_calculate_bitrate();
+ 

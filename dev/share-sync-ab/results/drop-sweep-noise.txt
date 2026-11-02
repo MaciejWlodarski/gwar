@@ -1,0 +1,62 @@
+# Drop sweep, 2,560 cases, per-case delta vs main's baseline (ms). sr = #213's sender-report patch; c1..c10 = neutral byte controls on main (c1 = c2 after padding).
+run            n | metric     sum   mean   p90   p99  worst   best changed
+sr          2560 | above   -13820   -5.4    10   790   4000  -3080     528
+sr          2560 | voice   -11080   -4.3    10   130    460   -920     642
+c1          2560 | above    -8620   -3.4     0   150   4270  -3080     206
+c1          2560 | voice     -340   -0.1     0    80    260   -360     256
+c2          2560 | above    -8620   -3.4     0   150   4270  -3080     206
+c2          2560 | voice     -340   -0.1     0    80    260   -360     256
+c3          2560 | above   -44040  -17.2     0   480   4270  -4040     406
+c3          2560 | voice    -4180   -1.6    10   120    920   -680     540
+c4          2560 | above     1260    0.5     0   120   4000  -3010     188
+c4          2560 | voice    -2900   -1.1     0    80    260   -250     242
+c5          2560 | above    -1660   -0.6     0   720   4000  -3080     404
+c5          2560 | voice    -1520   -0.6     0   110    480   -920     484
+c6          2560 | above   -26620  -10.4    10   710   4000  -3080     522
+c6          2560 | voice    -1300   -0.5    10   150    480   -920     636
+c7          2560 | above    -8760   -3.4     0   650   4270  -4040     314
+c7          2560 | voice    -5220   -2.0     0   110    310   -920     408
+c8          2560 | above   -43720  -17.1     0   950   3140  -4040     446
+c8          2560 | voice    -6240   -2.4    10   110    380   -680     592
+c9          2560 | above   -55280  -21.6    10   740   3230  -4170     588
+c9          2560 | voice    -5420   -2.1    10   180    920   -910     776
+c10         2560 | above     9620    3.8     0   390   4000  -3010     292
+c10         2560 | voice    -2920   -1.1     0   100    190   -780     368
+
+# Distribution of the values themselves minus main's
+run      metric     sum   p50   p90   p95   p99   max   (value minus main's)
+sweep-sr above   -13820     0     0     0     0     0
+sweep-sr voice   -11080     0     0   -70   -10     0
+sweep-c1 above    -8620     0     0     0     0     0
+sweep-c1 voice     -340     0     0     0     0   -30
+sweep-c3 above   -44040   -20     0     0     0     0
+sweep-c3 voice    -4180   -10     0     0   -60    10
+sweep-c4 above     1260     0     0     0     0     0
+sweep-c4 voice    -2900     0     0   -60     0     0
+sweep-c5 above    -1660     0     0     0     0     0
+sweep-c5 voice    -1520     0     0   -70     0     0
+sweep-c6 above   -26620     0     0     0     0     0
+sweep-c6 voice    -1300     0     0   -70   -10     0
+sweep-c7 above    -8760     0     0     0     0     0
+sweep-c7 voice    -5220   -10     0   -60   -60   -30
+sweep-c8 above   -43720   -20     0     0     0     0
+sweep-c8 voice    -6240   -10    10   -10     0    10
+sweep-c9 above   -55280   -40     0     0     0     0
+sweep-c9 voice    -5420   -10    10   -10   -70   -20
+sweep-c10 above     9620    10     0     0     0     0
+sweep-c10 voice    -2920     0     0   -60     0     0
+
+# The old 80-case CI subset
+run            n | metric     sum   mean   p90   p99  worst   best changed
+sub-sr        80 | above     1440   18.0    10  1900   1900   -320      16
+sub-sr        80 | voice     -210   -2.6    10   110    110   -380      19
+sub-c1        80 | above    -1080  -13.5     0    40     40   -490       5
+sub-c1        80 | voice      150    1.9     0   260    260   -210       8
+sub-c3        80 | above     -550   -6.9     0   100    100   -510      10
+sub-c3        80 | voice       40    0.5     0   330    330   -210      13
+sub-c4        80 | above      -90   -1.1     0   390    390   -490       6
+sub-c4        80 | voice     -110   -1.4     0   260    260   -240       7
+sub-c5        80 | above     -690   -8.6     0   350    350  -1170       7
+sub-c5        80 | voice     -330   -4.1     0   130    130   -240       9
+sub-c6        80 | above     -610   -7.6     0    80     80   -320      15
+sub-c6        80 | voice     -170   -2.1    10   110    110   -380      16
