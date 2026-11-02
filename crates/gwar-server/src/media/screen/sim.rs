@@ -809,6 +809,24 @@ mod tests {
     }
 
     #[test]
+    fn a_real_drop_in_the_link_lowers_the_estimate_before_voice_pays_for_it() {
+        let mut sim = Sim::new(Some(20_000_000));
+        sim.voice = true;
+        sim.server_interval = 5 * MS;
+        sim.join("share", 5_000_000, 30, 150_000, 8_000_000);
+        sim.run(23 * SECOND);
+        sim.down.rate = Some(5_000_000);
+        let dropped = sim.now;
+        sim.run(SECOND);
+        let estimate = sim.w.egress.estimate();
+        sim.run(9 * SECOND);
+        let (hurt, worst) = voice_hurt(&sim, dropped, sim.now);
+        println!("after the drop: estimate {estimate} at 1 s, voice hurt {hurt:?}, worst {worst:?}");
+        assert!(estimate <= 6_500_000, "{estimate}: {}", summary(&sim));
+        assert!(hurt <= 700 * MS, "{hurt:?}: {}", summary(&sim));
+    }
+
+    #[test]
     fn keyframes_overflowing_admission_pause_a_3_mbps_viewer_and_its_retries_back_off() {
         let mut sim = Sim::new(Some(3_000_000));
         sim.voice = true;

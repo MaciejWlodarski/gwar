@@ -260,9 +260,14 @@ below the recent ones. A cluster lasts about 8 ms, so 10 ms of jitter on the lin
 is enough to stretch its arrival and read as saturation, and an estimate lowered
 that way cannot climb back: the SFU then sends less, which caps it at 1.5 times
 what was acknowledged. A result under 0.75 of the best of the last three clusters
-within 4 s now moves the estimate only down to that best. A full link shows it in
-cluster after cluster, alike, and those lower it as before; delay and loss feedback
-are unchanged. Measuring the link's delay spread instead was tried and dropped: a
+within 4 s now moves the estimate only down to that best, for the delay and the loss
+controllers alike, unless the report it came in shows congestion by itself: delay
+overuse, or 5 % lost. `DelayController::observe` runs first for that, so voice does
+not wait for a real drop. A full link also shows in cluster after cluster, alike, and
+those lower it as before; delay and loss feedback are unchanged. Measuring the link's delay spread instead was tried and dropped: a
 real queue widens it too, which hid saturation and raised voice's p99 past its
 bound in `share_audio_keeps_voice_inside_existing_steady_and_startup_bounds`.
-`only_clusters_in_a_row_can_call_the_link_saturated` covers the memory.
+`only_clusters_in_a_row_can_call_the_link_saturated` covers the memory,
+`a_stretched_cluster_lowers_no_estimate_through_the_loss_controller` the combined
+estimate, and `a_real_drop_in_the_link_lowers_the_estimate_before_voice_pays_for_it`
+in Gwar's simulator the drop.
