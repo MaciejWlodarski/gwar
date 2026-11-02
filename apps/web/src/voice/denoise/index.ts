@@ -107,6 +107,9 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
       channelCountMode: "explicit",
     });
     const destination = context.createMediaStreamDestination();
+    // Preserve the worklet's mono channel count at the MediaStream boundary. The default
+    // stereo upmix/downmix changes the observed level on some WebKit stream bridges.
+    destination.channelCount = 1;
     node.connect(destination);
     const post = (request: Request, transfer: Transferable[] = []) => node.port.postMessage(request, transfer);
     const describe = (report: Exclude<Report, { type: "ready" }>) => (report.type === "slow" ? `too slow: ${report.reason}` : report.reason);
