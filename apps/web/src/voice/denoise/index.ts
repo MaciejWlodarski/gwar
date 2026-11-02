@@ -1,13 +1,14 @@
 /**
  * The web app's own noise suppression: DeepFilterNet3's low-latency model, as on the desktop,
  * run by an AudioWorklet on a capture context of its own. Its module and the model's archive
- * (~15 + 36 MB) are downloaded the first time suppression is on in a call and kept in the
+ * (~15 + 36 MB) are prepared in an idle build worker after login and kept in the
  * Cache API; the archive must match its pin. It adds ~19 ms: 10 for the model, the rest to fit
  * its 10 ms frames to the audio thread's quanta.
  */
-import pin from "../../../../../crates/gwar-denoise-wasm/model.json";
+import { denoiseModels } from "./model-cache";
+export { denoiseModels } from "./model-cache";
 import { PACE_WINDOW_S, Underruns } from "./pace";
-import type { Build, BuildFailed, Report, Request } from "./protocol";
+import type { BuildFailed, Report, Request } from "./protocol";
 
 export interface DenoisePipeline {
   /** The cleaned microphone, to send while `running`. */
@@ -30,22 +31,10 @@ export interface DenoiseEvents {
   changed(): void;
 }
 
-const CACHE = "gwar-denoise";
 const LOAD_TIMEOUT_MS = 30_000;
 
 /** What settles a load. */
 type Outcome = Exclude<Report, { type: "loaded" }>;
-
-async function urls(): Promise<{ code: string; archive: string; worklet: string }> {
-  // The desktop app's web build leaves the files out: it suppresses noise natively.
-  if (import.meta.env.MODE === "desktop") throw new Error("not in the desktop app");
-  const [{ default: wasm }, { default: model }, { default: worklet }] = await Promise.all([
-    import("../../../../../crates/gwar-denoise-wasm/pkg/gwar_denoise.wasm?url"),
-    import("../../../../../crates/gwar-denoise-wasm/pkg/model.bin?url"),
-    import("./worklet.ts?worker&url"),
-  ]);
-  return { code: new URL(wasm, location.href).href, archive: new URL(model, location.href).href, worklet };
-}
 
 /**
  * Loads the model; rejects if this browser or machine cannot run it, or once `signal` aborts
@@ -53,15 +42,17 @@ async function urls(): Promise<{ code: string; archive: string; worklet: string 
  */
 export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): Promise<DenoisePipeline> {
   if (typeof AudioWorkletNode === "undefined") throw new Error("no AudioWorklet");
-  const { code, archive, worklet } = await urls();
   signal.throwIfAborted();
-  const context = new AudioContext({ sampleRate: 48_000, latencyHint: "interactive" });
-  // Downloads, checks and builds the model, all off the page and off the audio thread.
-  let builder: Worker;
+  const channel = new MessageChannel();
+  let earlyFailure: BuildFailed | undefined;
+  let receiveBuild: (report: BuildFailed) => void = report => { earlyFailure = report; };
+  let model: Awaited<ReturnType<typeof denoiseModels.connect>> | null = null;
+  let context: AudioContext;
   try {
-    builder = new Worker(new URL("./build-worker.ts", import.meta.url), { type: "module", name: "gwar-denoise-build" });
+    model = await denoiseModels.connect(channel.port1, reason => receiveBuild({ type: "failed", reason }), signal);
+    context = new AudioContext({ sampleRate: 48_000, latencyHint: "interactive" });
   } catch (error) {
-    void context.close().catch(() => {});
+    model?.release(); channel.port1.close(); channel.port2.close();
     throw error;
   }
   // Browsers start audio only after a user gesture, and Safari interrupts it (a call, another
@@ -74,7 +65,8 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
   // The first report settles the load; later ones are trouble.
   let settle: ((report: Outcome) => void) | null = null;
   const shut = () => {
-    builder.terminate();
+    model!.release();
+    channel.port2.close();
     for (const type of gestures) window.removeEventListener(type, resume);
     void context.close().catch(() => {});
   };
@@ -84,7 +76,7 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
   };
   signal.addEventListener("abort", abort, { once: true });
   try {
-    await context.audioWorklet.addModule(worklet);
+    await context.audioWorklet.addModule(model.worklet);
     signal.throwIfAborted();
     const node = new AudioWorkletNode(context, "gwar-denoise", {
       numberOfInputs: 1,
@@ -115,7 +107,7 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
         // Not before: in Chromium the context gaining a stream output has the main thread take a
         // lock the audio device holds through a render, and a render waits for the worklet. Until
         // now that thread compiled the frame's code and copied the model in (snapshot.ts).
-        builder.terminate();
+        model!.release();
         destination = context.createMediaStreamDestination();
         destination.channelCount = 1;
         node.connect(destination);
@@ -129,13 +121,8 @@ export async function startDenoise(events: DenoiseEvents, signal: AbortSignal): 
     node.port.onmessage = (event: MessageEvent<Report>) => receive(event.data);
     // An exception the worklet left uncaught: its output is silence from then on.
     node.onprocessorerror = () => receive({ type: "failed", reason: "the worklet failed" });
-    builder.onmessage = (event: MessageEvent<BuildFailed>) => receive(event.data);
-    builder.onerror = event => {
-      event.preventDefault();
-      receive({ type: "failed", reason: event.message || "the model could not be built" });
-    };
-    const channel = new MessageChannel();
-    builder.postMessage({ code, archive, sha256: pin.sha256, cache: CACHE, worklet: channel.port1 } satisfies Build, [channel.port1]);
+    receiveBuild = receive;
+    if (earlyFailure) receive(earlyFailure);
     resume();
     post({ type: "load", worker: channel.port2 }, [channel.port2]);
     const report = await ready;

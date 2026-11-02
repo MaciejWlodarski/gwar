@@ -2,6 +2,7 @@
 
 /** Page → build worker, once. */
 export interface Build {
+  type: "build";
   /** The module and the model's archive, same-origin. */
   code: string;
   archive: string;
@@ -9,15 +10,16 @@ export interface Build {
   sha256: string;
   /** Cache API cache to keep them in; other entries there are earlier builds'. */
   cache: string;
-  /** To the worklet. */
-  worklet: MessagePort;
 }
+
+export type BuilderRequest = Build | { type: "attach"; id: number; worklet: MessagePort } | { type: "detach"; id: number };
 
 /** Build worker → page: only its failure; the worklet reports the rest. */
 export interface BuildFailed {
   type: "failed";
   reason: string;
 }
+export type BuilderReply = BuildFailed | { type: "ready"; bytes: number };
 
 /** Build worker → worklet. */
 export type Handover =

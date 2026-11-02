@@ -64,6 +64,7 @@ import type { pruneRequest } from "../lib/prune";
 import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, identityFailure, type Identity, type IdentityFailure } from "../net/identity";
 import { isDesktop, tauri } from "../platform";
 import { createVoiceEngine } from "../voice";
+import { denoiseModels } from "../voice/denoise/model-cache";
 import { useScreen } from "./screen";
 import { ScreenController } from "./screen-controller";
 import { microphoneSsrc } from "../voice/sdp";
@@ -365,6 +366,12 @@ class Controller {
     };
     // Device and capture options are applied before the mic opens.
     const first = useSettings.getState().audio;
+    const prepareSuppression = () => {
+      const phase = useSession.getState().phase;
+      denoiseModels.configure(!isDesktop() && useSettings.getState().audio.noiseSuppression, phase === "online" || phase === "reconnecting");
+    };
+    prepareSuppression();
+    useSession.subscribe((s, prev) => { if (s.phase !== prev.phase) prepareSuppression(); });
     void e.setInputDevice(first.inputDeviceId);
     void e.setCaptureOptions({
       noiseSuppression: first.noiseSuppression,
@@ -386,6 +393,7 @@ class Controller {
       }
       const a = s.audio;
       const p = prev.audio;
+      if (a.noiseSuppression !== p.noiseSuppression) prepareSuppression();
       if (a.inputMode !== p.inputMode) e.setInputMode(a.inputMode);
       if (a.pttReleaseDelay !== p.pttReleaseDelay) e.setPttReleaseDelay(a.pttReleaseDelay);
       if (a.automaticSensitivity !== p.automaticSensitivity || a.vadThreshold !== p.vadThreshold) e.setInputSensitivity(a.automaticSensitivity ? null : a.vadThreshold);

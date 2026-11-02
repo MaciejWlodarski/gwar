@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import pin from "../../../../../crates/gwar-denoise-wasm/model.json";
 import { FRAME, QUANTUM } from "./framing";
-import type { Build, Report, Request } from "./protocol";
+import type { BuilderRequest, Report, Request } from "./protocol";
 import { CHUNK, buildModel, growMemory, memoryChunks, writeChunk, type ModelExports } from "./snapshot";
 
 // The real module and model (scripts/denoise-wasm/build.sh); CI's web job always has them.
@@ -122,8 +122,8 @@ describe.skipIf(!present && !process.env.CI)("the worker hands the model to the 
     vi.stubGlobal("currentTime", 0);
     const files: Record<string, Buffer> = { "http://gwar.test/gwar_denoise.wasm": code(), "http://gwar.test/model.bin": readFileSync(new URL("model.bin", pkg)) };
     vi.stubGlobal("fetch", async (url: string) => new Response(new Uint8Array(files[url]!)));
-    const workerFailures: unknown[] = [];
-    vi.stubGlobal("postMessage", (message: unknown) => workerFailures.push(message));
+    const workerReplies: unknown[] = [];
+    vi.stubGlobal("postMessage", (message: unknown) => workerReplies.push(message));
     let workerClosed = false;
     vi.stubGlobal("close", () => { workerClosed = true; });
 
@@ -134,7 +134,7 @@ describe.skipIf(!present && !process.env.CI)("the worker hands the model to the 
     const handed: string[] = [];
     let inFlight = 0, mostInFlight = 0;
     const request = channel.port2.postMessage.bind(channel.port2);
-    channel.port2.postMessage = (message: unknown, transfer: Transferable[] = []) => {
+    (channel.port2 as unknown as { postMessage(message: unknown, transfer?: Transferable[]): void }).postMessage = (message, transfer = []) => {
       if ((message as { type: string; chunks: number }).type === "next" && (message as { chunks: number }).chunks === 1 && inFlight) inFlight--;
       request(message, transfer);
     };
@@ -148,13 +148,16 @@ describe.skipIf(!present && !process.env.CI)("the worker hands the model to the 
       }
       send(message, transfer);
     };
-    (globalThis as unknown as { onmessage(event: { data: Build }): void }).onmessage({
-      data: { code: "http://gwar.test/gwar_denoise.wasm", archive: "http://gwar.test/model.bin", sha256: pin.sha256, cache: "test", worklet: channel.port1 as unknown as MessagePort },
+    (globalThis as unknown as { onmessage(event: { data: BuilderRequest }): void }).onmessage({
+      data: { type: "build", code: "http://gwar.test/gwar_denoise.wasm", archive: "http://gwar.test/model.bin", sha256: pin.sha256, cache: "test" },
+    });
+    (globalThis as unknown as { onmessage(event: { data: BuilderRequest }): void }).onmessage({
+      data: { type: "attach", id: 1, worklet: channel.port1 as unknown as MessagePort },
     });
     processor.port.onmessage!({ data: { type: "load", worker: channel.port2 as unknown as MessagePort } });
     await vi.waitFor(() => expect(reports).toContainEqual({ type: "loaded" }), { timeout: 30_000, interval: 20 });
-    expect(workerFailures).toEqual([]);
-    expect(workerClosed).toBe(true);
+    expect(workerReplies).toEqual([{ type: "ready", bytes: expect.any(Number) }]);
+    expect(workerClosed).toBe(false);
     expect(handed[0]).toBe("code");
     expect(handed[1]).toBe("model");
     expect(handed.slice(2).every(type => type === "memory")).toBe(true);

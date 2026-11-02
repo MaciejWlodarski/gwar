@@ -4,12 +4,12 @@
  * builds the model, and hands the module's memory to the worklet a chunk at a time (snapshot.ts).
  */
 import { buildModel, memoryChunks, type ModelExports } from "./snapshot";
-import type { Build, BuildFailed, Handover, Next } from "./protocol";
+import type { Build, BuilderReply, BuilderRequest, Handover, Next } from "./protocol";
 
 /** The worker's global scope, without the webworker lib (it would retype the app's globals). */
 interface WorkerScope {
-  onmessage: ((event: MessageEvent<Build>) => void) | null;
-  postMessage(message: BuildFailed): void;
+  onmessage: ((event: MessageEvent<BuilderRequest>) => void) | null;
+  postMessage(message: BuilderReply): void;
   close(): void;
 }
 const self = globalThis as unknown as WorkerScope;
@@ -34,55 +34,91 @@ async function asset(cache: Cache | null, url: string, hash?: string): Promise<A
   return bytes;
 }
 
-async function build({ code: codeUrl, archive: archiveUrl, sha256: pin, cache: name, worklet }: Build): Promise<void> {
-  const send = (message: Handover, transfer: Transferable[] = []) => worklet.postMessage(message, transfer);
-  let exports: ModelExports | null = null;
-  // The worklet asks for the model once it has compiled the code, then for each chunk.
-  let chunks: Generator<{ offset: number; bytes: ArrayBuffer }> | null = null;
-  let model: { size: number; denoiser: number } | null = null;
-  let asked = false;
-  const next = (count = 1) => {
-    if (!model) return;
-    if (!chunks) {
-      chunks = memoryChunks(exports!.memory);
-      return send({ type: "model", ...model });
-    }
-    for (let i = 0; i < count; i++) {
-      const chunk = chunks.next();
-      if (chunk.done) return;
-      // Before sending: the transfer leaves the bytes empty here.
-      const last = chunk.value.offset + chunk.value.bytes.byteLength >= model.size;
-      send({ type: "memory", ...chunk.value }, [chunk.value.bytes]);
-      if (last) { self.close(); return; }
-    }
-  };
-  worklet.onmessage = (event: MessageEvent<Next>) => {
-    if (event.data.type !== "next") return;
-    asked = true;
-    next(event.data.chunks);
-  };
+interface Model { exports: ModelExports; denoiser: number; size: number }
+interface Copy { port: MessagePort; chunks: ReturnType<typeof memoryChunks> | null; credits: number }
+const copies = new Map<number, Copy>();
+let model: Model | null = null;
+let code: ArrayBuffer | null = null;
+let started = false;
 
-  const cache = typeof caches === "undefined" ? null : await caches.open(name).catch(() => null);
-  const archive = asset(cache, archiveUrl, pin);
-  // Seen below; a failure of the code first fails the build alone.
-  archive.catch(() => {});
-  const code = await asset(cache, codeUrl);
-  // Earlier builds' copies.
-  if (cache) void cache.keys().then(requests => { for (const request of requests) if (request.url !== codeUrl && request.url !== archiveUrl) void cache.delete(request); }).catch(() => {});
-  const copy = code.slice(0);
-  send({ type: "code", code: copy }, [copy]);
-  const module = await WebAssembly.compile(code);
-  const instance = await WebAssembly.instantiate(module, {});
-  exports = instance.exports as unknown as ModelExports;
-  const denoiser = buildModel(exports, new Uint8Array(await archive));
-  model = { size: exports.memory.buffer.byteLength, denoiser };
-  if (asked) next();
+function detach(id: number): void {
+  const copy = copies.get(id);
+  if (!copy) return;
+  copies.delete(id);
+  copy.port.onmessage = null;
+  copy.port.close();
+  copy.chunks?.return(undefined);
 }
 
-self.onmessage = (event: MessageEvent<Build>) => {
-  self.onmessage = null;
-  build(event.data).catch((error: unknown) => {
-    self.postMessage({ type: "failed", reason: error instanceof Error ? error.message : String(error) } satisfies BuildFailed);
-    self.close();
-  });
+function pump(id: number, copy: Copy): void {
+  if (!model) return;
+  const send = (message: Handover, transfer: Transferable[] = []) => copy.port.postMessage(message, transfer);
+  while (copy.credits > 0) {
+    copy.credits--;
+    if (!copy.chunks) {
+      copy.chunks = memoryChunks(model.exports.memory);
+      send({ type: "model", size: model.size, denoiser: model.denoiser });
+      continue;
+    }
+    const chunk = copy.chunks.next();
+    if (chunk.done) return detach(id);
+    const last = chunk.value.offset + chunk.value.bytes.byteLength >= model.size;
+    send({ type: "memory", ...chunk.value }, [chunk.value.bytes]);
+    if (last) return detach(id);
+  }
+}
+
+function sendCode(copy: Copy): void {
+  if (!code) return;
+  const bytes = code.slice(0);
+  copy.port.postMessage({ type: "code", code: bytes } satisfies Handover, [bytes]);
+}
+
+/** Lower-priority work where supported; no expensive operation runs on the page. */
+function background<T>(run: () => T): Promise<T> {
+  const scheduler = (globalThis as unknown as { scheduler?: { postTask<T>(run: () => T, options: { priority: "background" }): Promise<T> } }).scheduler;
+  if (scheduler) return scheduler.postTask(run, { priority: "background" });
+  return new Promise((resolve, reject) => setTimeout(() => { try { resolve(run()); } catch (error) { reject(error); } }, 0));
+}
+
+async function build({ code: codeUrl, archive: archiveUrl, sha256: pin, cache: name }: Build): Promise<void> {
+  const cache = typeof caches === "undefined" ? null : await caches.open(name).catch(() => null);
+  const archive = asset(cache, archiveUrl, pin);
+  void archive.catch(() => {});
+  code = await asset(cache, codeUrl);
+  if (cache) void cache.keys().then(requests => { for (const request of requests) if (request.url !== codeUrl && request.url !== archiveUrl) void cache.delete(request); }).catch(() => {});
+  for (const copy of copies.values()) sendCode(copy);
+  const module = await WebAssembly.compile(code);
+  const instance = await WebAssembly.instantiate(module, {});
+  const exports = instance.exports as unknown as ModelExports;
+  const bytes = new Uint8Array(await archive);
+  const denoiser = await background(() => buildModel(exports, bytes));
+  model = { exports, size: exports.memory.buffer.byteLength, denoiser };
+  self.postMessage({ type: "ready", bytes: model.size });
+  for (const [id, copy] of copies) pump(id, copy);
+}
+
+self.onmessage = (event: MessageEvent<BuilderRequest>) => {
+  const request = event.data;
+  if (request.type === "detach") return detach(request.id);
+  if (request.type === "attach") {
+    detach(request.id);
+    const copy: Copy = { port: request.worklet, chunks: null, credits: 0 };
+    copies.set(request.id, copy);
+    copy.port.onmessage = (event: MessageEvent<Next>) => {
+      if (event.data.type !== "next" || !copies.has(request.id)) return;
+      const credits = event.data.chunks ?? 1;
+      if (!Number.isInteger(credits) || credits < 1 || credits > 8) return;
+      copy.credits = Math.min(8, copy.credits + credits);
+      pump(request.id, copy);
+    };
+    sendCode(copy);
+  } else if (!started) {
+    started = true;
+    build(request).catch((error: unknown) => {
+      for (const id of copies.keys()) detach(id);
+      self.postMessage({ type: "failed", reason: error instanceof Error ? error.message : String(error) });
+      self.close();
+    });
+  }
 };
