@@ -1730,7 +1730,7 @@ are simulator metrics, not measurements of native device playout latency.
 | Filter only stretched clusters (`e152948b`) | Evenly delivered drops passed, but a burst-delivered full link queued voice for 1,050 ms versus main's 220 ms | 830 ms in that counterexample | Not reported for that counterexample | Rejected |
 | Back off, then verify at 0.85 of the old estimate after 500 ms | 2,560 cases; voice worse in 128, above-capacity time worse in 206 | 1,390 ms | 4,140 ms | Rejected |
 | Keep main BWE; defer pause for 2 s after a sharp cut and resume after 300 ms of fit | 640 cases; voice worse in 5 and better in none; above-capacity time worse in 5 and better in 8 | 90 ms | 1,250 ms | Rejected |
-| Keep main pauses; resume after 2 s of settled feedback, adequate ACK rate and budget | All 2,560 drop pairs had delta 0, but the new path never fired; it also never fired under jitter below | 0 ms | 0 ms | Rejected: no picture benefit |
+| Keep main pauses; resume after 2 s of settled feedback, adequate ACK rate and budget | All 2,560 drop pairs had delta 0 with no early resumes, as intended; all 48 jitter pairs also had no early resumes | 0 ms | 0 ms | Rejected: no picture benefit |
 
 The pause-grace counterexamples used seed 1 and a 6 → 2 Mb/s drop, 5 ms service,
 and no random loss:
@@ -1820,7 +1820,8 @@ cargo test -j 4 --manifest-path vendor/str0m/Cargo.toml --no-default-features --
   and this known-limitation report. No estimator or SFU behavior change remains.
 - The settled-feedback design is rejected because it made no early resumes in
   the jitter matrix. The freeze remains a known limitation.
-- Any future recovery proposal must demonstrate activation and substantially
-  shorter jitter pauses before being accepted on a drop sweep that never
-  exercises its recovery path. Current senders have one encoded layer; lower
-  layer selection or encoder adaptation needs separate implementation work.
+- Future recovery proposals need both activation with substantially shorter
+  jitter pauses and a zero-regression capacity-drop gate. Inactivity during a
+  real capacity drop is intended; inactivity under jitter rejected this design.
+  Current senders have one encoded layer; lower-layer selection or encoder
+  adaptation needs separate implementation work.
