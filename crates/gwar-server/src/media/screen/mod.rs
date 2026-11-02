@@ -212,8 +212,12 @@ impl ScreenOrigin {
     }
     /// Whether the transport has sound; a publisher's stop leaves the m-line in place.
     fn audio_negotiated(&self, negotiated: bool) {
-        self.audio_negotiated.store(negotiated, Ordering::Relaxed);
-        self.has_audio.store(negotiated, Ordering::Relaxed);
+        let previous = self.audio_negotiated.swap(negotiated, Ordering::Relaxed);
+        // A replacement with the same Opus m-line changes no sound intent. In particular,
+        // renegotiating the picture must not resume sound the publisher explicitly stopped.
+        if !negotiated || !previous {
+            self.has_audio.store(negotiated, Ordering::Relaxed);
+        }
     }
 
     /// Sound flows again on the m-line it already has, if there is one.
