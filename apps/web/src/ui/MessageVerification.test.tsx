@@ -43,6 +43,8 @@ describe("quiet localized message verification", () => {
       await show({ ...valid, continuity: "unproven", authorization: ["certificate-expired"] }, { first });
       const icon = container.querySelector('[data-testid="message-verification-qualified"]')!;
       expect(icon.className).toContain("text-subtle"); expect(icon.textContent).toBe("");
+      expect(icon.getAttribute("data-verification-continuity")).toBe("unproven");
+      expect(icon.getAttribute("data-verification-authorization")).toBe("certificate-expired");
       expect(icon.getAttribute("aria-label")).toContain("certificate expired; signing time unproven");
       expect(icon.getAttribute("aria-label")).toContain("no record of earlier versions");
       expect(container.querySelector("p")).toBeNull();
