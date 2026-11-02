@@ -1,8 +1,9 @@
-/** The original separate reads, retained for the failing-first race regression. */
-export async function verificationState(page) {
-  return {
-    pending: await page.locator('[data-message][data-message-verification="pending"]').count(),
-    flags: await page.locator('[data-testid^="message-verification-"]').count(),
-    signatureValid: Boolean(await page.getByText('Signature valid', { exact: true }).count()),
-  };
+/** One DOM snapshot: a new pending render cannot race a later flag query. */
+export function verificationState(page) {
+  return page.evaluate(() => ({
+    pending: document.querySelectorAll('[data-message][data-message-verification="pending"]').length,
+    flags: document.querySelectorAll('[data-testid^="message-verification-"]').length,
+    signatureValid: [...document.querySelectorAll('body *')].some(element =>
+      !['SCRIPT', 'STYLE'].includes(element.tagName) && element.textContent?.replace(/\s+/g, ' ').trim() === 'Signature valid'),
+  }));
 }

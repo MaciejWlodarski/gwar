@@ -38,6 +38,7 @@ import { chromium } from "playwright";
 import { installMicPrivacyGuard } from "./mic-privacy.mjs";
 import { sendComposer } from "./composer-actions.mjs";
 import { stopProcesses } from "./processes.mjs";
+import { verificationState } from "./verification-state.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(here, "..");
@@ -2055,8 +2056,12 @@ async function main() {
             throw error;
           });
         } else if (tab) await page.getByRole("tab", { name: tab }).click();
-        await waitFor(() => page.locator('[data-message][data-message-verification="pending"]').count().then((n) => n === 0), "message verification complete");
-        if (await page.locator('[data-testid^="message-verification-"]').count() || await page.getByText("Signature valid", { exact: true }).count()) {
+        let verification;
+        await waitFor(async () => {
+          verification = await verificationState(page);
+          return verification.pending === 0;
+        }, "message verification complete");
+        if (verification.flags || verification.signatureValid) {
           const diagnostic = await page.evaluate(async () => {
             const snapshot = () => ({
               pending: [...document.querySelectorAll('[data-message][data-message-verification="pending"]')].map(row => row.getAttribute("data-message")),
@@ -2081,7 +2086,7 @@ async function main() {
           });
           const flags = await page.locator('[data-testid^="message-verification-"]').evaluateAll(marks => marks.map(mark => [mark.dataset.testid, mark.getAttribute("aria-label")]));
           await explainPrivate("verification warning", [["page", page]]);
-          throw new Error(`valid message was flagged: ${JSON.stringify({ ...diagnostic, flags })}`);
+          throw new Error(`valid message was flagged: ${JSON.stringify({ ...diagnostic, decision: verification, flags })}`);
         }
       }
     }
