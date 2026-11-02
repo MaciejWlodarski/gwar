@@ -1,0 +1,147 @@
+Owner-approved Left warm P7 validation checkpoint.
+Production code: warm takeover, one left render reference, nearend decay zero only.
+Base: main 1099a6817bbbabb9074004000915a3c884262cdd.
+
+HARD STOP: exact six-pair four-share guard exits 101 at +1.241 ms (limit <1.0 ms).
+All six pairs and both sent-frame guards complete. No valid failed run was retried.
+Fingerprint/speech/echo/route tests completed before this valid hard-limit failure.
+No further measurements, full tests or clippy were run after it. Formatting and
+checkpoint bookkeeping were completed. CI status is tracked on PR #223.
+
+The final release rebuild added only f64 echo-energy logging after the first
+completed acoustic batch; the shipped production behavior was identical. The
+549-window table was repeated on that binary and matched the approved envelope.
+The initial rebuild's sandbox rejected nice; own cargo/rustc processes were
+reniced to 10 before the measurement binary ran. Actual nice 10 was verified.
+
+
+The first six-pair attempt was stopped (own PID 48173, SIGTERM, exit 143) before completion because it ran at actual nice 20 rather than intended nice 10. The agent's process had inherited nice 10, and an additional nice -n 10 added another 10. This run is not used for acceptance. The replacement run's own PID 51452 was verified at actual nice 10 before its first pair completed; its command uses nice -n 0 to retain that already-lowered priority. The invalid raw output is preserved separately. No valid failing six-pair run was discarded.
+
+
+active
+   Compiling gwar-client v0.1.2 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/crates/gwar-client)
+    Finished `release` profile [optimized] target(s) in 1m 03s
+     Running unittests src/lib.rs (/tmp/gwar-aec-sol/release/deps/gwar_client-63cb5b99089087a9)
+
+running 85 tests
+test voice::apm::tests::a_broken_history_can_be_learned_again ... ok
+test voice::apm::tests::a_canceller_turned_off_while_learning_comes_back_stereo ... ok
+test voice::apm::tests::a_canceller_warmed_too_little_still_learns_the_rest_on_the_side ... ok
+test voice::apm::tests::a_candidate_offered_behind_goes_back_and_comes_again ... ok
+test voice::apm::tests::a_candidate_that_keeps_arriving_behind_is_refused ... ok
+test voice::apm::tests::a_candidate_that_never_catches_up_is_refused ... ok
+test voice::apm::tests::a_frame_lost_to_a_full_ring_costs_the_candidate_its_training ... ok
+test voice::apm::tests::a_full_ring_costs_the_warming_canceller_not_the_voice ... ok
+test voice::apm::tests::a_late_candidate_hears_all_it_missed_before_it_takes_over ... ok
+test voice::apm::tests::a_new_device_any_time_after_the_take_over_replaces_the_warmed_canceller ... ok
+test voice::apm::tests::a_new_device_can_qualify_all_over_again ... ok
+test voice::apm::tests::a_new_device_during_the_handover_goes_the_old_way_without_a_click ... ok
+test voice::apm::tests::a_new_device_forgets_the_room ... ok
+test voice::apm::tests::a_new_device_leaves_a_cold_canceller_learning ... ok
+test voice::apm::tests::a_new_device_while_the_candidate_is_on_its_way_sends_it_back ... ok
+test voice::apm::tests::a_refused_candidate_never_touches_the_heap_on_the_voice_thread ... ok
+test voice::apm::tests::a_replacement_on_offer_when_the_next_device_comes_starts_over ... ok
+test voice::apm::tests::a_session_that_heard_nothing_goes_exactly_the_way_of_one_that_never_warmed ... ok
+test voice::apm::tests::a_session_without_share_sound_ends_its_sleeping_worker ... ok
+test voice::apm::tests::a_silent_session_gives_the_warming_canceller_nothing_to_do ... ok
+test voice::apm::tests::a_stereo_canceller_that_never_warmed_stays_on_a_new_device ... ok
+test voice::apm::tests::a_warmed_canceller_takes_over_within_frames_of_the_pin ... ok
+test voice::apm::tests::a_warmed_session_ends_its_worker ... ok
+test voice::apm::tests::another_new_device_while_one_is_learning_starts_it_over ... ok
+test voice::apm::tests::cancels_the_speaker_in_the_microphone ... ok
+test voice::apm::tests::headphones_go_the_way_of_a_session_that_never_warmed ... ok
+test voice::apm::tests::independent_talker_channel_tradeoffs ... ignored, a channel/tuning comparison, run in release and alone
+test voice::apm::tests::keeps_the_whole_band ... ok
+test voice::apm::tests::leaves_the_voice_alone_with_nothing_played ... ok
+test voice::apm::tests::lets_a_voice_through_once_there_is_no_echo ... ok
+test voice::apm::tests::native_paired_echo_gate ... ignored, strict paired per-room +1 dB gate on full #220 echo tables; run in release alone
+test voice::apm::tests::native_profile_echo_tables ... ignored, native-profile comparison on the complete #220 echo tables; run in release alone
+test voice::apm::tests::passes_the_microphone_untouched_when_off ... ok
+test voice::apm::tests::raises_a_quiet_voice ... ok
+test voice::apm::tests::reference_options::native_reference_options_full_echo ... ignored, seven arms on all 549 paired echo windows; run in release alone
+test voice::apm::tests::reference_options::native_reference_options_right_echo ... ignored, right-only and independent wide acoustic paths; run in release alone
+test voice::apm::tests::replacing_a_warmed_canceller_adds_nothing_to_the_heap_on_the_voice_thread ... ok
+test voice::apm::tests::rests_need_not_cut_speakers_and_microphone_evenly ... ok
+test voice::apm::tests::share_sound_pins_stereo_for_the_rest_of_the_session ... ok
+test voice::apm::tests::shipped::production_stereo_keeps_one_render_reference ... ok
+test voice::apm::tests::shipped::shipped_p7_echo_tables ... ignored, all 549 windows against the owner-approved P7 envelope; release alone
+test voice::apm::tests::shipped::what_an_unreported_device_costs ... ignored, main/P7 route gaps, 27 rooms; release alone
+test voice::apm::tests::silence_teaches_the_stereo_canceller_nothing ... ok
+test voice::apm::tests::stereo_bursts_never_leak_once_pinned ... ok
+test voice::apm::tests::stereo_reference_cost ... ignored, a timing measurement, run in release
+test voice::apm::tests::the_near_voice_cold_and_warm ... ignored, a comparison, run in release
+test voice::apm::tests::the_replacement_comes_in_without_a_click ... ok
+test voice::apm::tests::the_switch_against_staying_mono ... ignored, a comparison, run in release
+test voice::apm::tests::the_switch_has_no_click_and_no_gap ... ok
+test voice::apm::tests::the_switch_keeps_the_voice_in_time ... ok
+test voice::apm::tests::the_switch_on_headphones ... ignored, a comparison, run in release
+test voice::apm::tests::the_warmed_switch_against_cold_and_staying_mono ... ignored, a comparison, run in release
+test voice::apm::tests::the_warmed_switch_has_no_click_and_no_gap ... ok
+test voice::apm::tests::the_warmed_way_to_stereo_never_touches_the_heap_on_the_voice_thread ... ok
+test voice::apm::tests::the_way_to_stereo_never_touches_the_heap_on_the_voice_thread ... ok
+test voice::apm::tests::the_wide_leak_cold_and_warm ... ignored, a comparison, run in release
+test voice::apm::tests::tones::aec_linear_and_suppression_at_takeover ... ignored, native AEC state and linear/suppressor comparison; run in release alone
+test voice::apm::tests::tones::bounded_native_reverb_screen ... ignored, bounded native nearend/reverb screening; run in release alone
+test voice::apm::tests::tones::cold_path_native_reverb ... ignored, cold-path native reverb comparison, recorded speech; run in release alone
+test voice::apm::tests::tones::gain_mask_after_stereo ... ignored, post-AEC gain-mask speech/noise/echo comparison, run in release
+test voice::apm::tests::tones::level_before_the_model ... ignored, model level diagnostic, run in release
+test voice::apm::tests::tones::model_context_after_the_takeover ... ignored, isolated model-context diagnostic, run in release
+test voice::apm::tests::tones::model_stages_after_echo ... ignored, model stage diagnostic, run in release
+test voice::apm::tests::tones::native_change_at_first_share ... ignored, native AEC gain-change held-speech diagnostic, run in release
+test voice::apm::tests::tones::native_reverb_and_capture_state ... ignored, native reverb/noise/state/config isolation; run in release alone
+test voice::apm::tests::tones::native_speech_and_quiet_echo_gate ... ignored, default speech matrix and 500 ms quiet-echo gate; run in release alone
+test voice::apm::tests::tones::nearend_decay_budget_screen ... ignored, native nearend-confidence budget screening; run in release alone
+test voice::apm::tests::tones::realistic_signals_through_the_warmed_switch ... ignored, leading signal, Opus, gate and model comparison; run in release alone
+test voice::apm::tests::tones::recorded_speech_is_not_held_after_stereo ... ignored, owner-approved 12-case recorded-speech acceptance; run in release alone
+test voice::apm::tests::turning_the_canceller_off_ends_a_replacement ... ok
+test voice::apm::tests::unreported_headphones_do_not_replace_the_canceller_in_charge ... ok
+test voice::apm::tests::voice_alone_fingerprint ... ignored, printed by hand beside the same test on origin/main
+test voice::apm::tests::voice_alone_is_mains_canceller_to_the_bit ... ok
+test voice::apm::tests::voice_stays_on_the_mono_canceller_while_stereo_learns ... ok
+test voice::apm::tests::warmed_voice_alone_fingerprint ... ignored, printed by hand beside voice_alone_fingerprint
+test voice::apm::tests::warming_cost ... ignored, a timing measurement, run in release
+test voice::apm::tests::warming_leaves_voice_alone_to_the_bit ... ok
+test voice::apm::tests::warming_pauses_with_the_canceller ... ok
+test voice::apm::tests::warming_rests_when_the_speakers_do_and_keeps_the_echo_tail ... ok
+test voice::apm::tests::what_a_broken_history_costs ... ignored, a comparison, run in release
+test voice::apm::tests::what_a_late_new_device_costs ... ignored, a comparison, run in release
+test voice::apm::tests::wide_sound_after_five_minutes_of_voice ... ok
+test voice::apm::tests::wide_sound_after_voice_is_cancelled_from_when_it_is_learned ... ok
+test voice::apm::tests::wide_sound_from_the_first_moment_after_voice_does_not_leak ... ok
+test voice::apm::tests::wide_sound_through_the_switch ... ignored, a comparison, run in release
+
+test result: ok. 53 passed; 0 failed; 32 ignored; 0 measured; 314 filtered out; finished in 11.04s
+
+
+
+fingerprints
+
+running 2 tests
+test voice::apm::tests::voice_alone_fingerprint ... voice alone fingerprint c2d868db7d8d0eeb
+ok
+test voice::apm::tests::warmed_voice_alone_fingerprint ... warmed voice alone fingerprint c2d868db7d8d0eeb
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 397 filtered out; finished in 1.43s
+
+
+
+speech: see aec-shipped-speech.txt
+
+
+echo-final: see aec-shipped-echo.txt
+
+
+routes: see aec-shipped-routes.txt
+
+
+four: see aec-shipped-four.txt
+
+
+Invalid timing input: see aec-shipped-four-invalid-priority.txt; not acceptance evidence.
+
+Read-only normal/build graph check after the timing stop: neither diagnostic feature present.
+$ CARGO_NET_OFFLINE=true cargo tree --locked -p gwar-client -e normal,build --format "{p} {f}"
+├── gwar-denoise v0.1.0 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/crates/gwar-denoise) embedded-model,model
+├── sonora v0.2.0 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/vendor/sonora)
+│   ├── sonora-aec3 v0.2.0 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/vendor/sonora-aec3)

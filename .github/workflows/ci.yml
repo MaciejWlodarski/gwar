@@ -150,17 +150,9 @@ jobs:
           cache-bin: false
           shared-key: linux-tests
           save-if: false
-      - name: System libraries (Opus, ALSA, a PulseAudio server)
+      - name: System libraries (Opus, ALSA)
         timeout-minutes: 8
-        run: bash scripts/ci/apt-install.sh libopus-dev libasound2-dev pkg-config pulseaudio
-      # Two null sinks, so nothing sounds: the default the server moves reaches the engine.
-      - name: Sound server defaults
-        timeout-minutes: 15
-        run: |
-          pulseaudio --daemonize=yes --exit-idle-time=-1 -n \
-            --load="module-native-protocol-unix auth-anonymous=1" \
-            --load="module-null-sink sink_name=gwar_a" --load="module-null-sink sink_name=gwar_b"
-          cargo test --workspace --exclude gwar-desktop --lib voice::watch -- --ignored
+        run: bash scripts/ci/apt-install.sh libopus-dev libasound2-dev pkg-config
       - name: Queued encrypted voice
         timeout-minutes: 15
         run: cargo test --workspace --exclude gwar-desktop --features gwar-server/test-hooks --test mls voice_opaque_srtp

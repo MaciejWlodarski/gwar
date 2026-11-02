@@ -8,9 +8,12 @@ The upstream BSD-3-Clause license is retained.
 adds fixed-size snapshots of the native linear/suppressor state. It exposes
 native suppression-gain, ERLE and AEC-state constructors/resets for isolated
 handover experiments. Adaptive filter coefficients and render alignment are not
-changed by those controls. No model or production tuning changes are selected.
+changed by those controls. The core's production code is unchanged. Sonora's
+wrapper separately selects profile 7 (`ep_strength.nearend_len = 0`) for Gwar's
+share canceller, following the owner's recorded-speech/echo trade-off decision.
 Any selected state reset must be prepared off the voice thread before promotion.
 
 The Sonora wrapper separately exports its native 16 kHz linear output, and can
 measure correct two-channel construction separately from the current control:
-upstream Sonora hardcodes one channel even with stereo detection disabled.
+upstream Sonora hardcodes one channel even with stereo detection disabled. The
+corrected constructor is an explicit dev-feature opt-in, not the production path.

@@ -66,24 +66,11 @@ const WARMING_BATCH: usize = 4;
 /// Frames after the speakers fall silent that the warming canceller still hears: the echo's tail.
 /// Past that nothing plays and there is nothing to learn, so it costs nothing either.
 const WARMING_TAIL: usize = 50;
-/// Frames in one look at whether the echo is still there: 250 ms, longer than most echoes take.
-const ECHO_WINDOW: usize = 25;
-/// How far under the echo a canceller believes in the microphone must be, in dB, for a look to say
-/// the echo is gone. Speakers in a room never put the microphone under it: a near voice only adds.
-/// Measured, speakers read 7 dB over it at the least, headphones 27 dB under.
-const ECHO_GONE: f32 = 15.0;
-/// The least echo return loss, in dB, that is a belief in an echo. A canceller that has found none
-/// reads -30, AEC3's start.
-const ECHO_BELIEVED: f64 = 0.0;
-/// Looks at the speakers playing, of the last 16, that must find the echo gone: half a second.
-const ECHO_GONE_LOOKS: u32 = 2;
 
 /// One of WebRTC's processors, set up for a single stage (or none, while it is off).
 struct Stage {
     apm: AudioProcessing,
     on: bool,
-    #[cfg(test)]
-    notified_absence: bool,
 }
 
 impl Stage {
@@ -95,20 +82,14 @@ impl Stage {
                 .render_config(StreamConfig::new(super::io::RATE, render_channels))
                 .build(),
             on: false,
-            #[cfg(test)]
-            notified_absence: false,
         }
     }
 
     /// A running stereo canceller, its memory all allocated: this one frame of silence builds what
     /// the first real frame would otherwise build on the thread voice runs on.
     fn stereo() -> Self {
-        Self::stereo_config(canceller(true))
-    }
-
-    fn stereo_config(config: Config) -> Self {
         let mut stage = Self::new(2);
-        stage.apm.apply_config(config);
+        stage.apm.apply_config(canceller(true));
         stage.on = true;
         let silence = [0f32; FRAME];
         let (mut left, mut right, mut near) = ([0f32; FRAME], [0f32; FRAME], [0f32; FRAME]);
@@ -120,7 +101,18 @@ impl Stage {
     #[cfg(test)]
     fn native_gain_change(&mut self) {
         self.apm.notify_echo_gain_change();
-        self.notified_absence = true;
+    }
+
+    #[cfg(test)]
+    fn stereo_config(config: Config) -> Self {
+        let mut stage = Self::new(2);
+        stage.apm.apply_config(config);
+        stage.on = true;
+        let silence = [0f32; FRAME];
+        let (mut left, mut right, mut near) = ([0f32; FRAME], [0f32; FRAME], [0f32; FRAME]);
+        let _ = stage.apm.process_render_f32(&[&silence, &silence], &mut [&mut left, &mut right]);
+        let _ = stage.apm.process_capture_f32(&[&silence], &mut [&mut near]);
+        stage
     }
 
     /// Whether `on` changed; one turned on starts from scratch.
@@ -141,15 +133,20 @@ fn canceller(stereo: bool) -> Config {
     let canceller = EchoCanceller {
         transparent_mode: TransparentModeType::Hmm,
         detect_stereo_content: !stereo,
+        zero_nearend_reverb_decay: stereo,
         ..Default::default()
     };
     #[cfg(test)]
-    let canceller = EchoCanceller {
-        multichannel_suppressor_like_mono: stereo && MEASURE_MONO_SUPPRESSOR.load(Ordering::Relaxed),
-        measurement_two_channel_start: stereo && AEC_NATIVE_CHANNELS.load(Ordering::Relaxed),
-        measurement_native_profile: if stereo { AEC_NATIVE_PROFILE.load(Ordering::Relaxed) } else { 0 },
-        measurement_left_reference: stereo && AEC_LEGACY_REFERENCE.load(Ordering::Relaxed),
-        ..canceller
+    let canceller = {
+        let profile = AEC_NATIVE_PROFILE.load(Ordering::Relaxed);
+        EchoCanceller {
+            multichannel_suppressor_like_mono: stereo && MEASURE_MONO_SUPPRESSOR.load(Ordering::Relaxed),
+            measurement_two_channel_start: stereo && AEC_NATIVE_CHANNELS.load(Ordering::Relaxed),
+            measurement_native_profile: if stereo && profile != SHIPPED_AEC_PROFILE { profile } else { 0 },
+            measurement_left_reference: stereo && AEC_LEGACY_REFERENCE.load(Ordering::Relaxed),
+            zero_nearend_reverb_decay: stereo && profile == SHIPPED_AEC_PROFILE,
+            ..canceller
+        }
     };
     Config { echo_canceller: Some(canceller), ..base() }
 }
@@ -178,99 +175,6 @@ enum Heard {
     Microphone([f32; FRAME], i32),
 }
 
-/// Whether the echo a canceller learned is still in the microphone. A room that changes without
-/// notice, headphones in a jack the system does not report or a default a sound server moved,
-/// leaves the canceller believing in an echo that is no longer there, and that belief holds the
-/// near voice down. Over windows of [`ECHO_WINDOW`] frames with the speakers playing, it compares
-/// the microphone with the echo the canceller's own echo return loss predicts from the speakers. A
-/// near voice or a new room's echo only add to the microphone: only an echo that went away, or
-/// speakers turned far down, leaves it [`ECHO_GONE`] dB under. A canceller that believes in no
-/// echo is never told this. This observer runs only on the warming worker.
-#[derive(Default)]
-struct EchoGone {
-    /// This window's speaker energy, the louder side, and the window's before it.
-    speakers: f32,
-    before: f32,
-    microphone: f32,
-    frames: usize,
-    /// One bit for each of the last 16 windows with the speakers playing: whether the echo was gone.
-    looks: u16,
-}
-
-impl EchoGone {
-    /// One frame of the speakers, as the canceller hears them.
-    fn speakers(&mut self, [left, right]: &[[f32; FRAME]; 2]) {
-        let energy = |side: &[f32; FRAME]| side.iter().map(|sample| sample * sample).sum::<f32>();
-        self.speakers += energy(left).max(energy(right));
-    }
-
-    /// One frame of the microphone, before the canceller; `return_loss` is the canceller's echo
-    /// return loss after it. True when the echo is gone: then it starts over.
-    fn microphone(&mut self, frame: &[f32; FRAME], return_loss: impl FnOnce() -> Option<f64>) -> bool {
-        self.microphone += frame.iter().map(|sample| sample * sample).sum::<f32>();
-        self.frames += 1;
-        if self.frames < ECHO_WINDOW {
-            return false;
-        }
-        // An echo up to a window late still comes from speakers that played in both windows.
-        let played = self.speakers.min(self.before);
-        let microphone = self.microphone;
-        (self.before, self.speakers, self.microphone, self.frames) = (self.speakers, 0.0, 0.0, 0);
-        if played < (ECHO_WINDOW / 2) as f32 * PLAYING {
-            return false;
-        }
-        let Some(loss) = return_loss().filter(|loss| *loss >= ECHO_BELIEVED) else {
-            self.looks = 0;
-            return false;
-        };
-        let believed = played * 10f32.powf(-(loss as f32) / 10.0);
-        self.looks = self.looks << 1 | u16::from(microphone < believed * 10f32.powf(-ECHO_GONE / 10.0));
-        let needed = ECHO_GONE_LOOKS;
-        #[cfg(test)]
-        let needed = if ROUTE_MEASUREMENT.load(Ordering::Relaxed) >= 2 { needed } else { 4 };
-        let gone = self.looks.count_ones() >= needed;
-        #[cfg(test)]
-        let gone = gone && !ECHO_GONE_IGNORED.load(Ordering::Relaxed);
-        if gone {
-            self.looks = 0;
-        }
-        gone
-    }
-}
-
-/// Comparisons against `origin/main` turn [`EchoGone`] off with this, everywhere in the process:
-/// run them alone.
-#[cfg(test)]
-static ECHO_GONE_IGNORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Only the isolated channel comparison changes this; run that test alone.
-#[cfg(test)]
-static AEC_NATIVE_PROFILE: AtomicU8 = AtomicU8::new(0);
-#[cfg(test)]
-static AEC_LEGACY_REFERENCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
-static AEC_PIPELINE_COLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
-static AEC_WARM_ONLY_TWO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
-static AEC_NATIVE_CHANNELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
-static AEC_NONLINEAR_AT_TAKEOVER: AtomicU8 = AtomicU8::new(0);
-#[cfg(test)]
-static AEC_ECHO_COMPARE_PROFILE: AtomicU8 = AtomicU8::new(0);
-#[cfg(test)]
-static AEC_ECHO_REGRESSIONS: AtomicUsize = AtomicUsize::new(0);
-#[cfg(test)]
-static AEC_ECHO_WORST_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-#[cfg(test)]
-static AEC_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-#[cfg(test)]
-static MEASURE_MONO_SUPPRESSOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Isolated route comparisons: worker only, worker faster, worker faster and kept eligible.
-#[cfg(test)]
-static ROUTE_MEASUREMENT: AtomicU8 = AtomicU8::new(2);
-
 /// A stereo canceller trained on everything the voice session hears, with no output anyone uses.
 struct Warming {
     stage: Box<Stage>,
@@ -280,46 +184,21 @@ struct Warming {
     found_echo: bool,
     /// The unbroken stretch of the session it has heard: [`Processing::break_history`].
     history: u32,
-    /// The room it learned may be gone without a notice: then it starts over, as at a break.
-    echo: EchoGone,
-    /// Measurement only: retain the old filter, but defer its takeover after echo disappears.
-    #[cfg(test)]
-    absence_seen: bool,
 }
 
 impl Warming {
     fn new(sound: &Arc<AtomicUsize>, history: u32) -> Self {
         sound.store(0, Ordering::Relaxed);
-        let config = canceller(true);
+        let stage = Box::new(Stage::stereo());
         #[cfg(test)]
-        let config = {
-            let mut config = config;
-            if AEC_WARM_ONLY_TWO.load(Ordering::Relaxed) {
-                config.echo_canceller.as_mut().unwrap().measurement_two_channel_start = true;
-            }
-            config
+        let stage = if AEC_WARM_ONLY_TWO.load(Ordering::Relaxed) {
+            let mut config = canceller(true);
+            config.echo_canceller.as_mut().unwrap().measurement_two_channel_start = true;
+            Box::new(Stage::stereo_config(config))
+        } else {
+            stage
         };
-        Self {
-            stage: Box::new(Stage::stereo_config(config)),
-            sound: sound.clone(),
-            found_echo: false,
-            history,
-            echo: EchoGone::default(),
-            #[cfg(test)]
-            absence_seen: false,
-        }
-    }
-
-    /// Nothing learned so far counts.
-    fn start_over(&mut self) {
-        *self.stage = Stage::stereo();
-        self.sound.store(0, Ordering::Relaxed);
-        self.found_echo = false;
-        self.echo = EchoGone::default();
-        #[cfg(test)]
-        {
-            self.absence_seen = false;
-        }
+        Self { stage, sound: sound.clone(), found_echo: false, history }
     }
 
     /// Everything waiting in the ring. A frame from a later stretch starts it all over, here on the
@@ -329,45 +208,22 @@ impl Warming {
         while let Ok((history, heard)) = ring.pop() {
             if history != self.history {
                 self.history = history;
-                self.start_over();
+                *self.stage = Stage::stereo();
+                self.sound.store(0, Ordering::Relaxed);
+                self.found_echo = false;
             }
             match heard {
-                Heard::Speakers(far) => {
-                    let power: f32 = far.iter().flatten().map(|sample| sample * sample).sum();
+                Heard::Speakers([far_left, far_right]) => {
+                    let power: f32 = far_left.iter().chain(&far_right).map(|sample| sample * sample).sum();
                     self.sound.fetch_add(usize::from(power >= PLAYING), Ordering::Relaxed);
-                    self.echo.speakers(&far);
-                    let [far_left, far_right] = &far;
-                    let _ = self.stage.apm.process_render_f32(&[far_left, far_right], &mut [&mut left, &mut right]);
+                    let far: [&[f32]; 2] = [&far_left, &far_right];
+                    let _ = self.stage.apm.process_render_f32(&far, &mut [&mut left, &mut right]);
                 }
                 Heard::Microphone(microphone, delay_ms) => {
                     let _ = self.stage.apm.set_stream_delay_ms(delay_ms);
                     let _ = self.stage.apm.process_capture_f32(&[&microphone], &mut [&mut near]);
-                    let statistics = self.stage.apm.statistics();
-                    let taken_down = statistics.echo_return_loss_enhancement;
+                    let taken_down = self.stage.apm.statistics().echo_return_loss_enhancement;
                     self.found_echo |= taken_down.is_some_and(|enhancement| enhancement >= ECHO_FOUND);
-                    if self.echo.microphone(&microphone, || statistics.echo_return_loss) {
-                        #[cfg(test)]
-                        if ROUTE_MEASUREMENT.load(Ordering::Relaxed) == 5 {
-                            self.echo = EchoGone::default();
-                            self.absence_seen = true;
-                            continue;
-                        }
-                        #[cfg(test)]
-                        if ROUTE_MEASUREMENT.load(Ordering::Relaxed) == 4 {
-                            self.echo = EchoGone::default();
-                            if !self.stage.notified_absence {
-                                self.stage.native_gain_change();
-                            }
-                            continue;
-                        }
-                        #[cfg(test)]
-                        let eligible = self.found_echo;
-                        self.start_over();
-                        #[cfg(test)]
-                        if ROUTE_MEASUREMENT.load(Ordering::Relaxed) == 3 {
-                            self.found_echo = eligible;
-                        }
-                    }
                 }
             }
         }
@@ -601,9 +457,6 @@ pub(crate) struct Processing {
     last_sample: f32,
     /// Frames since the speakers last played anything, up to [`WARMING_TAIL`].
     silent_frames: usize,
-    /// Reproduces the inherited voice-thread detector only in isolated comparisons.
-    #[cfg(test)]
-    echo_gone: EchoGone,
     fed_frames: usize,
     /// What each speaker was given since the last whole frame went to the canceller.
     render: [[f32; FRAME]; 2],
@@ -629,8 +482,6 @@ impl Processing {
             spliced: false,
             last_sample: 0.0,
             silent_frames: WARMING_TAIL,
-            #[cfg(test)]
-            echo_gone: EchoGone::default(),
             fed_frames: 0,
             render: [[0.0; FRAME]; 2],
             rendered: 0,
@@ -713,10 +564,6 @@ impl Processing {
     /// way: it learned here as it always did, and goes on to learn the new room.
     pub(crate) fn route_changed(&mut self) {
         self.break_history();
-        #[cfg(test)]
-        {
-            self.echo_gone = EchoGone::default();
-        }
         if !self.warmed {
             return;
         }
@@ -787,18 +634,12 @@ impl Processing {
             if !self.replacing {
                 let left_to_hear = self.learning_frames.saturating_sub(warmed.sound.load(Ordering::Relaxed));
                 let left_to_hear = left_to_hear.max(HANDOVER_FRAMES.min(self.learning_frames));
-                #[cfg(test)]
-                let left_to_hear = if warmed.absence_seen { self.learning_frames } else { left_to_hear };
                 self.channels = Channels::Learning(warmed.stage, left_to_hear);
                 self.warmed = true;
                 return;
             }
             self.replacing = false;
             self.spliced = true;
-            #[cfg(test)]
-            {
-                self.echo_gone = EchoGone::default();
-            }
             let mut retired = warmed.stage;
             std::mem::swap(&mut self.echo, &mut *retired);
             Returned::Retired(retired)
@@ -858,10 +699,6 @@ impl Processing {
         }
         std::mem::swap(&mut self.echo, &mut *stage);
         self.channels = Channels::Stereo(stage);
-        #[cfg(test)]
-        {
-            self.echo_gone = EchoGone::default();
-        }
     }
 
     /// What the speakers will play, as it is queued for them: the echo's reference.
@@ -901,10 +738,6 @@ impl Processing {
             let mid: [f32; FRAME] = std::array::from_fn(|index| 0.5 * (left[index] + right[index]));
             let _ = self.echo.apm.process_render_f32(&[&mid], &mut [left_out]);
         }
-        #[cfg(test)]
-        if self.watching_the_echo() {
-            self.echo_gone.speakers(&self.render);
-        }
         if self.warming_hears_speakers() {
             self.overhear(Heard::Speakers(self.render));
             self.fed_frames += 1;
@@ -916,15 +749,6 @@ impl Processing {
         }
     }
 
-    /// Reproduces the inherited voice-thread replacement detector for measurements.
-    #[cfg(test)]
-    fn watching_the_echo(&self) -> bool {
-        if !matches!(ROUTE_MEASUREMENT.load(Ordering::Relaxed), 0 | 4) {
-            return false;
-        }
-        self.warmed && !self.replacing && matches!(self.channels, Channels::Stereo(_))
-    }
-
     /// Takes the speaker out of the microphone's whole 10 ms frames, in place. `delay_ms` is how
     /// long the speaker's reference waits before it is played (the canceller finds the rest).
     pub(crate) fn cancel_echo(&mut self, frames: &mut [f32], delay_ms: u32) {
@@ -932,8 +756,6 @@ impl Processing {
             return;
         }
         self.collect_stereo();
-        #[cfg(test)]
-        let mut echo_gone = false;
         for frame in frames.as_chunks_mut::<FRAME>().0 {
             self.scratch.copy_from_slice(frame);
             if self.warming && self.silent_frames < WARMING_TAIL {
@@ -962,22 +784,6 @@ impl Processing {
             if self.replacing {
                 self.last_sample = frame[FRAME - 1];
             }
-            #[cfg(test)]
-            if self.watching_the_echo() {
-                let echo = &self.echo;
-                echo_gone |= self.echo_gone.microphone(&self.scratch, || echo.apm.statistics().echo_return_loss);
-            }
-        }
-        // As the notice of a new device would be, between frames.
-        #[cfg(test)]
-        if echo_gone {
-            if ROUTE_MEASUREMENT.load(Ordering::Relaxed) == 4 {
-                if !self.echo.notified_absence {
-                    self.echo.native_gain_change();
-                }
-            } else {
-                self.route_changed();
-            }
         }
     }
 
@@ -992,6 +798,33 @@ impl Processing {
         }
     }
 }
+
+#[cfg(test)]
+const SHIPPED_AEC_PROFILE: u8 = u8::MAX;
+#[cfg(test)]
+static AEC_NATIVE_PROFILE: AtomicU8 = AtomicU8::new(SHIPPED_AEC_PROFILE);
+#[cfg(test)]
+static AEC_LEGACY_REFERENCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static AEC_PIPELINE_COLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static AEC_WARM_ONLY_TWO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static AEC_NATIVE_CHANNELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static AEC_NONLINEAR_AT_TAKEOVER: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+static AEC_ECHO_COMPARE_PROFILE: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+static AEC_ECHO_REGRESSIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static AEC_ECHO_WORST_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(test)]
+static AEC_APPROVED_ECHO: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static AEC_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static MEASURE_MONO_SUPPRESSOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Isolated timing control. The production path never reads these test-only choices.
 #[cfg(test)]
@@ -1008,10 +841,12 @@ pub(super) fn with_native_pipeline_option(id: u8, run: impl FnOnce()) {
     let old_profile = AEC_NATIVE_PROFILE.swap(profile, Ordering::Relaxed);
     let old_legacy = AEC_LEGACY_REFERENCE.swap(legacy, Ordering::Relaxed);
     let old_cold = AEC_PIPELINE_COLD.swap(cold, Ordering::Relaxed);
+    let old_channels = AEC_NATIVE_CHANNELS.swap(!legacy, Ordering::Relaxed);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(run));
     AEC_NATIVE_PROFILE.store(old_profile, Ordering::Relaxed);
     AEC_LEGACY_REFERENCE.store(old_legacy, Ordering::Relaxed);
     AEC_PIPELINE_COLD.store(old_cold, Ordering::Relaxed);
+    AEC_NATIVE_CHANNELS.store(old_channels, Ordering::Relaxed);
     if let Err(panic) = result {
         std::panic::resume_unwind(panic);
     }
@@ -1927,8 +1762,14 @@ mod tests {
         let around = take_over - 4 * FRAME..take_over + 4 * FRAME;
         let step = |signal: &[f32]| signal.windows(2).map(|pair| (pair[1] - pair[0]).abs()).fold(0.0, f32::max);
         assert!(step(&out[around.clone()]) <= step(&alone[RATE..take_over]), "a click at the switch");
-        let change = db(&out[around.clone()]) - db(&alone[around]);
-        assert!(change.abs() < 3.0, "voice jumped {change:.1} dB at the switch");
+        // P7 intentionally preserves more near voice than the mono stage. Its level
+        // is not required to match mono: cancelling the warm candidate must instead
+        // produce the exact ordinary cold path, with the click bound above unchanged.
+        let cold = through(&mut session(LEARNING_FRAMES), &far, &near, Some(pin));
+        assert!(
+            out.iter().zip(&cold).all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the cancelled handover differs from ordinary cold P7"
+        );
     }
 
     /// A session past the take-over on speakers, with the sample it got to.
@@ -2610,7 +2451,6 @@ mod tests {
     #[test]
     #[ignore = "a comparison, run in release"]
     fn the_warmed_switch_against_cold_and_staying_mono() {
-        ECHO_GONE_IGNORED.store(true, Ordering::Relaxed);
         let second = RATE;
         let windows: Vec<(usize, usize)> = (0..8).map(|at| (at, at + 1)).chain([(8, 12), (12, 16), (16, 24)]).collect();
         for before in [6, 20] {
@@ -2675,6 +2515,11 @@ mod tests {
                                     db(&arms[0][1][r.clone()]),
                                     db(&extra[r.clone()]),
                                     db(&arms[0][0][r.clone()]),
+                                    [
+                                        echo_energy(&arms[0][1][r.clone()]),
+                                        echo_energy(&extra[r.clone()]),
+                                        echo_energy(&arms[0][0][r.clone()]),
+                                    ],
                                 );
                             }
                             let kept = |out: &[f32]| fidelity(&out[r.clone()], &near[r.clone()]).1;
@@ -2711,7 +2556,6 @@ mod tests {
                 }
             }
         }
-        ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
     }
 
     #[test]
@@ -2722,20 +2566,26 @@ mod tests {
         AEC_NATIVE_PROFILE.store(profile, Ordering::Relaxed);
         eprintln!("native echo tables, profile={profile}");
         the_warmed_switch_against_cold_and_staying_mono();
-        ECHO_GONE_IGNORED.store(true, Ordering::Relaxed);
         the_wide_leak_cold_and_warm();
-        ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
         AEC_NATIVE_PROFILE.store(0, Ordering::Relaxed);
     }
 
-    fn record_native_echo_pair(label: &str, current: f32, candidate: f32, cold: f32) {
+    fn echo_energy(samples: &[f32]) -> f64 {
+        samples.iter().map(|s| f64::from(*s).powi(2)).sum::<f64>() / RATE as f64
+    }
+
+    fn record_native_echo_pair(label: &str, current: f32, candidate: f32, cold: f32, energy: [f64; 3]) {
+        if AEC_APPROVED_ECHO.load(Ordering::Relaxed) {
+            shipped::check_approved_echo(label, current, candidate);
+        }
         let delta = candidate - current;
         if delta > 1.0 {
             AEC_ECHO_REGRESSIONS.fetch_add(1, Ordering::Relaxed);
         }
         AEC_ECHO_WORST_BITS.fetch_max(delta.max(0.0).to_bits(), Ordering::Relaxed);
         eprintln!(
-            "native-echo-pair,{label},current={current:.9},candidate={candidate:.9},delta={delta:.9},cold={cold:.9}"
+            "native-echo-pair,{label},current={current:.9},candidate={candidate:.9},delta={delta:.9},cold={cold:.9},energy-current={:.15e},energy-candidate={:.15e},energy-cold={:.15e}",
+            energy[0], energy[1], energy[2]
         );
     }
 
@@ -2749,9 +2599,7 @@ mod tests {
         AEC_ECHO_REGRESSIONS.store(0, Ordering::Relaxed);
         AEC_ECHO_WORST_BITS.store(0, Ordering::Relaxed);
         the_warmed_switch_against_cold_and_staying_mono();
-        ECHO_GONE_IGNORED.store(true, Ordering::Relaxed);
         the_wide_leak_cold_and_warm();
-        ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
         AEC_ECHO_COMPARE_PROFILE.store(0, Ordering::Relaxed);
         let failures = AEC_ECHO_REGRESSIONS.load(Ordering::Relaxed);
         let worst = f32::from_bits(AEC_ECHO_WORST_BITS.load(Ordering::Relaxed));
@@ -2787,7 +2635,8 @@ mod tests {
                         &format!("wide,{name},q={a}-{b}"),
                         db(&warm[r.clone()]),
                         db(&extra[r.clone()]),
-                        db(&cold[r]),
+                        db(&cold[r.clone()]),
+                        [echo_energy(&warm[r.clone()]), echo_energy(&extra[r.clone()]), echo_energy(&cold[r])],
                     );
                 }
             }
@@ -2832,7 +2681,6 @@ mod tests {
     #[test]
     #[ignore = "a comparison, run in release"]
     fn the_near_voice_cold_and_warm() {
-        ECHO_GONE_IGNORED.store(true, Ordering::Relaxed);
         let windows = [(0usize, 3usize), (3, 8), (8, 16), (16, 32)];
         for lead_at in [6usize, 30] {
             for (name, speakers) in [("headphones", false), ("speakers", true)] {
@@ -2884,7 +2732,6 @@ mod tests {
                 }
             }
         }
-        ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
     }
 
     /// What a history that broke costs, run in release. The share of the frames a voice speaks in
@@ -3165,40 +3012,6 @@ mod tests {
     }
 
     #[test]
-    fn acoustic_absence_needs_two_complete_playing_windows() {
-        let mut observer = EchoGone::default();
-        for frame in 0..3 * ECHO_WINDOW {
-            observer.speakers(&[[0.1; FRAME]; 2]);
-            let gone = observer.microphone(&[0.0001; FRAME], || Some(10.0));
-            assert_eq!(gone, frame + 1 == 3 * ECHO_WINDOW);
-        }
-        let mut room = EchoGone::default();
-        for _ in 0..20 * ECHO_WINDOW {
-            room.speakers(&[[0.1; FRAME]; 2]);
-            assert!(!room.microphone(&[0.03; FRAME], || Some(10.0)));
-        }
-    }
-
-    #[test]
-    fn unreported_headphones_three_seconds_before_pin_refuse_the_old_room() {
-        let total = 20 * RATE;
-        let far = pairs(&long_voice(total, 150.0, -20.0));
-        let echo = room(&left_channel(&far), 60);
-        let near: Vec<f32> = talker(total, 213.0, 3.1, 3.3, -24.0)
-            .into_iter()
-            .enumerate()
-            .map(|(i, s)| 0.0001 + if (i / RATE).is_multiple_of(2) { 0.0 } else { s })
-            .collect();
-        let mut p = warmed_on_speakers(&far, &echo, 13);
-        warm_through(&mut p, &far[13 * RATE..16 * RATE], &near[13 * RATE..16 * RATE], None);
-        p.caught_up();
-        p.pin_stereo();
-        p.collected();
-        assert!(!p.warmed, "the old room must not qualify the candidate");
-        assert_eq!(p.left_to_hear(), Some(LEARNING_FRAMES));
-    }
-
-    #[test]
     fn unreported_headphones_do_not_replace_the_canceller_in_charge() {
         let far = pairs(&long_voice(20 * RATE, 150.0, -20.0));
         let echo = room(&left_channel(&far), 60);
@@ -3211,246 +3024,7 @@ mod tests {
         assert!(!p.replacing);
     }
 
-    /// A device change nobody reports, run in release: headphones in a jack the system does not
-    /// show, or a default PulseAudio or PipeWire moves (both look alike to the canceller). Voice
-    /// kept on headphones, and the echo in another room, against `origin/main` before the warm
-    /// canceller ("before"), the same change reported at once (the reset the code does when told),
-    /// and one canceller on one channel that nothing resets, as a browser or Discord runs it.
-    /// The near voice is [`talker`]: one that shares nothing with the far voice. 27 rooms.
-    fn measure_unreported_device_costs(only_native: bool, accepted_arm: usize) -> bool {
-        let mut accepted = true;
-        let total = 36 * RATE;
-        let windows = [(0usize, 3usize), (3, 5), (5, 8), (8, 16)];
-        /// 0: one channel, nothing pinned; 1: before; 2: warm.
-        fn arm(
-            mode: u8,
-            (pin, moved, told): (usize, usize, Option<usize>),
-            far: &[[f32; 2]],
-            near: [&[f32]; 2],
-        ) -> Vec<f32> {
-            let mut p = if mode == 2 { warm_session() } else { session(LEARNING_FRAMES) };
-            let mut out = Vec::with_capacity(far.len());
-            let mut at = 0;
-            while at + FRAME <= far.len() {
-                if mode == 2 && (at / FRAME).is_multiple_of(WARMING_RING / 4) {
-                    p.caught_up();
-                }
-                if mode > 0 && at == pin {
-                    p.caught_up();
-                    p.pin_stereo();
-                    p.collected();
-                }
-                if told == Some(at) {
-                    p.route_changed();
-                }
-                let near = near[usize::from(at >= moved)];
-                out.extend(tick(&mut p, &far[at..at + FRAME], &near[at..at + FRAME]));
-                if mode == 2 {
-                    p.ready_for_the_next_frame();
-                }
-                at += FRAME;
-            }
-            out
-        }
-        let arms = [
-            "one channel, never reset",
-            "before",
-            "main, not told",
-            "main, told",
-            "here, not told",
-            "worker only",
-            "worker faster",
-            "worker faster, keep eligibility",
-            "native gain change",
-            "retained candidate, deferred takeover",
-        ];
-        let scenarios = [
-            ("in charge, then headphones", 8, 16, false),
-            ("warming, headphones 8 s before the share", 16, 8, false),
-            ("warming, headphones 3 s before the share", 16, 13, false),
-            ("in charge, then another room", 8, 16, true),
-        ];
-        for (scenario, pin, moved, echo) in scenarios {
-            let (pin, moved) = (pin * RATE, moved * RATE);
-            let from = pin.max(moved);
-            let mut sums = [[0f32; 9]; 10];
-            let mut worst = [f32::MIN; 10];
-            let mut count = 0.0;
-            for far_pitch in [100.0, 150.0, 230.0] {
-                for delay in [20, 60, 150] {
-                    for (pitch, vibrato, syllables) in [(213.0, 3.1, 3.3), (176.0, 2.3, 4.1), (251.0, 3.7, 2.9)] {
-                        count += 1.0;
-                        let far = pairs(&long_voice(total, far_pitch, -20.0));
-                        let left = left_channel(&far);
-                        let hiss =
-                            |i: usize| ((i as u32).wrapping_mul(2_654_435_761) as f32 / u32::MAX as f32 - 0.5) * 0.002;
-                        // Speaks every other second, so the far side is heard alone in between.
-                        let said: Vec<f32> = talker(total, pitch, vibrato, syllables, -24.0)
-                            .iter()
-                            .enumerate()
-                            .map(|(i, sample)| hiss(i) + if (i / RATE).is_multiple_of(2) { 0.0 } else { *sample })
-                            .collect();
-                        let speakers: Vec<f32> = room(&left, delay).iter().zip(&said).map(|(e, s)| e + s).collect();
-                        let after: Vec<f32> = if echo {
-                            room(&left, delay + 60).iter().zip(&said).map(|(e, s)| 0.7 * e + s).collect()
-                        } else {
-                            said.clone()
-                        };
-                        let mut cells = [[0f32; 9]; 10];
-                        let runs = [
-                            (0u8, None, true),
-                            (1, None, true),
-                            (2, None, true),
-                            (2, Some(moved), true),
-                            (2, None, false),
-                            (2, None, false),
-                            (2, None, false),
-                            (2, None, false),
-                            (2, None, false),
-                            (2, None, false),
-                        ];
-                        for (index, (mode, told, blind)) in runs.into_iter().enumerate() {
-                            if only_native && !matches!(index, 0 | 1 | 2 | 6 | 8 | 9) {
-                                continue;
-                            }
-                            ECHO_GONE_IGNORED.store(blind, Ordering::Relaxed);
-                            ROUTE_MEASUREMENT.store(index.saturating_sub(4) as u8, Ordering::Relaxed);
-                            let out = arm(mode, (pin, moved, told), &far, [&speakers, &after]);
-                            ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
-                            if !echo && far_pitch == 150.0 && delay == 60 && pitch == 213.0 {
-                                let by_second: Vec<f32> = (0..16)
-                                    .map(|second| {
-                                        let range = from + second * RATE..from + (second + 1) * RATE;
-                                        let (mut speaking, mut kept) = (0.0f32, 0.0f32);
-                                        for (o, s) in out[range.clone()]
-                                            .as_chunks::<FRAME>()
-                                            .0
-                                            .iter()
-                                            .zip(said[range].as_chunks::<FRAME>().0)
-                                        {
-                                            if db(&s[..]) > -40.0 {
-                                                speaking += 1.0;
-                                                kept += f32::from(u8::from(db(&o[..]) > db(&s[..]) - 10.0));
-                                            }
-                                        }
-                                        kept / speaking
-                                    })
-                                    .collect();
-                                eprintln!("route-seconds,{scenario},{index},{by_second:?}");
-                            }
-                            if echo {
-                                for (second, cell) in cells[index].iter_mut().enumerate() {
-                                    let quiet: Vec<f32> = (from + second * RATE..from + (second + 1) * RATE)
-                                        .filter(|i| (i / RATE).is_multiple_of(2))
-                                        .map(|i| out[i])
-                                        .collect();
-                                    *cell = if quiet.is_empty() { f32::NAN } else { db(&quiet) };
-                                }
-                            } else {
-                                for (w, (a, b)) in windows.iter().enumerate() {
-                                    let r = from + a * RATE..from + b * RATE;
-                                    let frames = out[r.clone()]
-                                        .as_chunks::<FRAME>()
-                                        .0
-                                        .iter()
-                                        .zip(said[r].as_chunks::<FRAME>().0);
-                                    let (mut speaking, mut kept) = (0.0f32, 0.0f32);
-                                    for (o, s) in frames.filter(|(_, s)| db(&s[..]) > -40.0) {
-                                        speaking += 1.0;
-                                        kept += f32::from(u8::from(db(&o[..]) > db(&s[..]) - 10.0));
-                                    }
-                                    cells[index][w] = kept / speaking;
-                                }
-                            }
-                        }
-                        for index in 0..10 {
-                            if only_native && !matches!(index, 0 | 1 | 2 | 6 | 8 | 9) {
-                                continue;
-                            }
-                            eprintln!("route-case,{scenario},{far_pitch},{delay},{pitch},{index},{:?}", cells[index]);
-                            for (sum, cell) in sums[index].iter_mut().zip(cells[index]) {
-                                *sum += if cell.is_nan() { 0.0 } else { cell };
-                            }
-                            // How much worse than before this room gets: its loudest second of echo
-                            // above before's, or the voice it keeps less over the 16 s.
-                            let worse = if echo {
-                                (0..9)
-                                    .step_by(2)
-                                    .map(|second| cells[index][second] - cells[1][second])
-                                    .fold(f32::MIN, f32::max)
-                            } else {
-                                windows
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(w, (a, b))| (b - a) as f32 * (cells[1][w] - cells[index][w]))
-                                    .sum::<f32>()
-                                    / 16.0
-                            };
-                            worst[index] = worst[index].max(worse);
-                        }
-                    }
-                }
-            }
-            eprintln!(
-                "{scenario}, {count} rooms, {}",
-                if echo { "echo dBFS by second, near silent" } else { "voice kept by 0-3, 3-5, 5-8, 8-16 s" }
-            );
-            for (window, value) in sums[accepted_arm].iter().enumerate().take(if echo { 9 } else { 4 }) {
-                if echo && window % 2 == 1 {
-                    continue;
-                }
-                let got = value / count;
-                let before = sums[1][window] / count;
-                let main = sums[2][window] / count;
-                let passes = if echo { got <= before.min(main) } else { got >= before.max(main) };
-                if !passes {
-                    eprintln!(
-                        "route-acceptance MISS,{scenario},window={window},before={before:.9},main={main:.9},here={got:.9}"
-                    );
-                }
-                accepted &= passes;
-            }
-            for (index, name) in arms.iter().enumerate() {
-                if only_native && !matches!(index, 0 | 1 | 2 | 6 | 8 | 9) {
-                    continue;
-                }
-                let cells: Vec<String> = sums[index]
-                    .iter()
-                    .take(if echo { 9 } else { 4 })
-                    .step_by(if echo { 2 } else { 1 })
-                    .map(|v| format!("{:.2}", v / count))
-                    .collect();
-                eprintln!("  {name}: {}; worst room against before {:+.3}", cells.join(" "), worst[index]);
-            }
-        }
-        ROUTE_MEASUREMENT.store(2, Ordering::Relaxed);
-        accepted
-    }
-
-    #[test]
-    #[ignore = "route comparison, run in release alone"]
-    fn what_an_unreported_device_costs() {
-        measure_unreported_device_costs(false, 6);
-    }
-
-    #[test]
-    #[ignore = "native AEC path-change comparison, run in release alone"]
-    fn native_gain_change_routes() {
-        measure_unreported_device_costs(true, 6);
-    }
-
-    #[test]
-    #[ignore = "strict acoustic acceptance, known to fail; run in release alone"]
-    fn route_gaps_reach_both_baselines() {
-        assert!(measure_unreported_device_costs(true, 6), "route gaps do not meet both baseline floors");
-    }
-
-    #[test]
-    #[ignore = "deferred retained-candidate comparison, run in release alone"]
-    fn deferred_candidate_routes() {
-        let accepted = measure_unreported_device_costs(true, 9);
-        eprintln!("deferred route acceptance: {accepted}");
-    }
+    mod shipped;
 
     /// Measurement-only observer. Four render frames are classified on a separate
     /// thread. Equal/panned channels remain mono; negative correlation is wide.
@@ -3510,7 +3084,6 @@ mod tests {
     #[test]
     #[ignore = "a channel/tuning comparison, run in release and alone"]
     fn independent_talker_channel_tradeoffs() {
-        ECHO_GONE_IGNORED.store(true, Ordering::Relaxed);
         let pin = 6 * RATE;
         let total = pin + 32 * RATE;
         let windows = [(0, 3), (3, 8), (8, 16), (16, 32)];
@@ -3614,7 +3187,6 @@ mod tests {
             }
         }
         MEASURE_MONO_SUPPRESSOR.store(false, Ordering::Relaxed);
-        ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
     }
 
     #[cfg(feature = "deep-filter")]

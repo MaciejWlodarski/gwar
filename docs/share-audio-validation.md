@@ -1019,9 +1019,224 @@ Not exercised here: the real macOS permission grant, the native capture on Windo
 Chrome's visible second picker, which the test selects automatically. Those need a person
 and the app.
 
-### Correct render references and native options (PR #223 continuation)
+### Owner-approved Left warm P7 (PR #223, current implementation)
 
-**State / next steps:** no measured option passes both strict acoustic gates.
+**State / next steps: NOT READY FOR REVIEW.** The owner selected **Left warm P7**,
+accepting its measured speech/echo trade-off, but the shipped configuration fails
+the repeated six-pair four-share hard limit: **+1.241 ms**, required <1.0 ms.
+Measurements stop at that failure; PR #223 remains a draft.
+Earlier checkpoints in this document are historical, including their stop states.
+
+The production change against main `1099a681` is only
+`ep_strength.nearend_len = 0` for the share canceller, in both native configs.
+The warm takeover, first-share-sound stereo pin, left-only reference wiring,
+adaptive filter, other suppressor settings, gain control, model and existing
+route-change handling stay as on main. Mono voice construction keeps its default.
+The owner rejected mono-like tuning. The per-content selector failed dominance
+in 168/432 case/windows and is measurement-only.
+
+The owner accepts **6/549 echo windows above +1 dB, 2 above +3 dB, 0 above +6 dB,
+worst +4.614568710 dB, total energy +0.200643008 dB** against current warm/main.
+The four onset windows and two repeated mono controls at 7–8 s remain visible;
+this is not a claim that all extra echo is immediately after the pin. The 549
+observations include repeated controls, as explained in the historical options
+section. No strict +1 dB echo-gate pass is claimed.
+[Raw shipped echo](measurements/aec-shipped-echo.txt),
+[all 549 windows and f64 energies](measurements/aec-shipped-echo.csv),
+[energy summary](measurements/aec-shipped-echo-summary.csv).
+
+#### Shipped speech matrix
+
+The actual production configuration is selected by its ordinary config field,
+not by forcing measurement profile 7. The matrix includes leading render audio,
+render and voice Opus, AGC, gates and the full embedded denoiser. Held means active
+decoded 10 ms frames in the longest hold, not total wall-clock silence. Kept is
+RMS-based and can include leaked echo. All cases have 1,155 active input frames.
+
+| Lead, s | Route | Denoising % | Cold held / kept frames | P7 held / kept frames | Strict floor |
+| --- | --- | --- | --- | --- | --- |
+| 6 | headphones | 0 | 25 / 851 | 25 / 850 | one frame below; owner accepted |
+| 6 | headphones | 50 | 37 / 823 | 37 / 824 | PASS |
+| 6 | headphones | 100 | 37 / 824 | 37 / 825 | PASS |
+| 6 | speakers | 0 | 49 / 965 | 0 / 1155 | PASS |
+| 6 | speakers | 50 | 70 / 320 | 0 / 707 | PASS |
+| 6 | speakers | 100 | 136 / 121 | 49 / 487 | PASS |
+| 10 | headphones | 0 | 84 / 795 | 79 / 800 | PASS |
+| 10 | headphones | 50 | 84 / 765 | 79 / 771 | PASS |
+| 10 | headphones | 100 | 84 / 763 | 79 / 772 | PASS |
+| 10 | speakers | 0 | 93 / 980 | 0 / 1155 | PASS |
+| 10 | speakers | 50 | 105 / 355 | 0 / 705 | PASS |
+| 10 | speakers | 100 | 106 / 148 | 49 / 492 | PASS |
+
+P7 meets the strict held/kept floor in 11/12 cases. The explicit accepted
+exception is headphones, 6 s lead, denoising 0: 850 kept frames versus cold 851,
+held 25 in both (0.73593074 versus 0.73679656). The acceptance test retains its
+name `recorded_speech_is_not_held_after_stereo`, uses integer frame counts and
+permits exactly this one frame in this one case. It does not round all cases or
+weaken the held-frame requirement. Default speaker cases improve from cold
+136/0.104761906 and 106/0.12813853 to **49/0.42164502 and 49/0.425974**.
+There are still speech holds; this is an improvement, not no-AEC equivalence.
+[Raw matrix](measurements/aec-shipped-speech.txt),
+[all counts](measurements/aec-shipped-speech.csv).
+
+#### Route gaps: main versus shipped P7
+
+No production acoustic absence detector, Linux default-device polling or macOS
+data-source listener remains from the rejected experiments. The `pulseaudio`
+crate and its now-orphaned null-sink CI test are removed. Existing main macOS
+default-device/device-list notifications remain. The workflow, `io.rs` and
+`watch.rs` match main exactly. OS notices did not meet the joint route floors;
+a notice can help one headphone window and worsen another room's echo.
+
+The measurement-only route table retains all 27 rooms, three independent near
+voices, and all windows against both main and pre-#220 cold. Values below are
+means; the complete per-room CSV is authoritative for individual regressions.
+Headphone windows are seconds 0–3 / 3–5 / 5–8 / 8–16 after the later of route
+change and pin. Higher kept is better.
+
+**in charge, then headphones.**
+
+| Arm | 0–3 | 3–5 | 5–8 | 8–16 |
+| --- | --- | --- | --- | --- |
+| mono | 0.587 | 0.589 | 0.735 | 0.806 |
+| cold | 0.527 | 0.529 | 0.646 | 0.712 |
+| main-unreported | 0.531 | 0.536 | 0.648 | 0.724 |
+| P7-unreported | 0.529 | 0.547 | 0.649 | 0.724 |
+| main-reported | 0.531 | 0.560 | 0.761 | 0.716 |
+| P7-reported | 0.529 | 0.562 | 0.753 | 0.722 |
+
+**warming, headphones 8 s before the share.**
+
+| Arm | 0–3 | 3–5 | 5–8 | 8–16 |
+| --- | --- | --- | --- | --- |
+| mono | 0.784 | 0.796 | 0.814 | 0.814 |
+| cold | 0.784 | 0.622 | 0.770 | 0.707 |
+| main-unreported | 0.731 | 0.714 | 0.742 | 0.734 |
+| P7-unreported | 0.728 | 0.720 | 0.743 | 0.735 |
+| main-reported | 0.784 | 0.622 | 0.770 | 0.707 |
+| P7-reported | 0.784 | 0.622 | 0.762 | 0.712 |
+
+**warming, headphones 3 s before the share.**
+
+| Arm | 0–3 | 3–5 | 5–8 | 8–16 |
+| --- | --- | --- | --- | --- |
+| mono | 0.615 | 0.749 | 0.787 | 0.803 |
+| cold | 0.615 | 0.607 | 0.770 | 0.707 |
+| main-unreported | 0.559 | 0.647 | 0.733 | 0.733 |
+| P7-unreported | 0.554 | 0.658 | 0.733 | 0.733 |
+| main-reported | 0.615 | 0.607 | 0.770 | 0.707 |
+| P7-reported | 0.615 | 0.607 | 0.762 | 0.712 |
+
+**in charge, then another room.** Quiet near-end seconds 0–1 / 2–3 / 4–5 / 6–7 / 8–9, echo dBFS; lower is better.
+
+| Arm | 0–1 | 2–3 | 4–5 | 6–7 | 8–9 |
+| --- | --- | --- | --- | --- | --- |
+| mono | -45.247 | -44.217 | -48.051 | -58.183 | -49.202 |
+| cold | -42.856 | -43.477 | -50.669 | -55.403 | -49.337 |
+| main-unreported | -43.419 | -42.994 | -51.159 | -58.773 | -50.762 |
+| P7-unreported | -39.451 | -40.046 | -49.795 | -58.597 | -50.642 |
+| main-reported | -43.419 | -42.994 | -47.063 | -53.087 | -49.527 |
+| P7-reported | -39.451 | -40.046 | -45.924 | -52.623 | -49.430 |
+
+P7 does **not** fix #220's unreported warming regression. At 8 s before pin,
+the first-window mean changes 0.731389 → 0.727645 (cold 0.784080); at 3 s it changes
+0.559426 → 0.553802 (cold 0.615148). Later windows have mixed, small changes. In
+charge, the first headphone mean falls 0.531442 → 0.528590; the next three rise.
+After a different-room change, mean echo is louder by +3.967 / +2.948 / +1.364 /
++0.176 / +0.120 dB. This remains separate route-gap work; no route-floor pass is
+claimed. Per-room P7/unreported deficits against main occur in 25/108 in-charge
+headphone cells, 11/108 (8 s), 22/108 (3 s), and 108/135 echo cells. Against cold,
+they occur in 45/108, 58/108, 73/108 and 78/135 respectively.
+The worst individual different-room quiet-echo cell is -69.559 → -39.434 dBFS (+30.126 dB), far 100 Hz, delay 150 ms, near 213 Hz, seconds 0–1. This is outside the fixed-room 549-window catalogue.
+[Raw route table](measurements/aec-shipped-routes.txt),
+[all 2,754 cells](measurements/aec-shipped-routes.csv),
+[102 means](measurements/aec-shipped-route-means.csv).
+
+#### Known defect: one render reference; follow-up
+
+The current Sonora constructor hardcodes one render reference while detection
+is disabled. Its "stereo" path is therefore left-only, including main and this
+release. `d9972dfe` fixes a real upstream-port defect by calling `initialize`
+in the constructor. That change now exists only in
+`new_initialized_for_measurement`, behind `gwar-aec-measurements`, and requires
+explicit `measurement_two_channel_start = true`. The default is false even
+when the dev feature is present. No constructor fix is enabled in production.
+The corrected constructor regression and an active Gwar regression for the
+retained one-reference production path make the two choices explicit.
+
+Corrected two-reference variants remove 48–52 dB more right-only echo, but fail
+the joint speech/echo gates. They need a separate follow-up. The complete options
+and right-path tables below remain measurement evidence, not selected behavior.
+`gwar-aec-measurements` and `model-measurements` are enabled only by dev
+dependencies; native-state snapshots, linear-output export, nonlinear resets,
+mono-like tuning, channel correction and model experiments require those features.
+A read-only `cargo tree -e normal,build` check confirms neither feature in the
+production graph. A fresh featureless compilation was not run before the hard stop.
+
+#### Assertions and final validation
+
+The two Rust-CI failures at the two-reference checkpoint were
+`the_switch_keeps_the_voice_in_time` (586 versus 585 samples) and
+`wide_sound_from_the_first_moment_after_voice_does_not_leak` (-28.5 dBFS versus
+<-55 dBFS). Their assertions are unchanged and both pass with shipped left P7.
+A separate cold-fallback RMS comparison against mono was stale: P7 intentionally
+preserves more near voice and differed by 3.3 dB. It now requires bit-for-bit
+agreement with ordinary cold P7 across the entire output, while retaining the
+original click bound and the before-takeover mono equality. This tests the
+actual fallback contract, without loosening a numerical threshold.
+
+The shipped configuration's completed validation is below. The exact unchanged
+six-pair four-share guard completed all pairs and sent-frame guards, then failed
+with **+1.241 ms** in pair 4: no-share p99 0.063 ms, four-share p99 1.304 ms.
+The earlier selected-option +0.344 ms pass is historical evidence, not a
+replacement for this failed repetition. No valid failed timing run was retried.
+
+| Requirement | Current checkpoint |
+| --- | --- |
+| Speech matrix | 12 completed; 11 strict passes, one owner-accepted single-frame headphone deficit |
+| Echo table | All 549 meet the exact approved P7 envelope; >+1/+3/+6 dB: 6/2/0, worst +4.614568710 dB, total +0.200643008 dB |
+| Route table | 2,754 cells / 102 means completed; warming regression is slightly worse, not fixed |
+| Both voice-alone fingerprints | PASS: `c2d868db7d8d0eeb` |
+| Active release APM / heap guards | PASS: 53 tests; all four voice-thread heap guards, including replacement/refusal |
+| Four-share six pairs | **FAIL:** max +1.241 ms, limit <1.0 ms; all sent-frame guards pass |
+| 1 Mb/s p99 | Not rerun at this checkpoint after the hard stop; prior 9.048–9.288 ms evidence is historical |
+| Production dependency feature graph | PASS: neither diagnostic feature in normal/build edges |
+| Final full workspace / clippy / standalone constructor tests / featureless compilation | Not rerun after the hard stop |
+| Formatting / diff whitespace | PASS: workspace fmt, upstream-style vendor fmt, `git diff --check` |
+| Final Linux / overall CI | See PR #223 checks on the pushed checkpoint; not claimed green here |
+
+| Pair/order | No-share p99, ms | Four-share p99, ms | Delta, ms |
+| --- | --- | --- | --- |
+| 0: [0, 4] | 0.701 | 1.292 | +0.591 |
+| 1: [4, 0] | 0.040 | 0.707 | +0.666 |
+| 2: [0, 4] | 0.903 | 1.033 | +0.130 |
+| 3: [4, 0] | 0.476 | 1.135 | +0.659 |
+| 4: [0, 4] | 0.063 | 1.304 | +1.241 |
+| 5: [4, 0] | 0.413 | 0.617 | +0.204 |
+
+An earlier attempt was stopped before completing six pairs because inherited
+nice 10 plus another `nice -n 10` produced actual nice 20. Its complete partial
+output is retained and excluded. The valid replacement was verified at actual
+nice 10 before its first pair completed. No other heavy build/test ran alongside
+it. [Invalid input](measurements/aec-shipped-four-invalid-priority.txt),
+[valid hard-limit failure](measurements/aec-shipped-four.txt),
+[all six pairs](measurements/aec-shipped-four.csv),
+[validation and fingerprints/heap output](measurements/aec-shipped-validation.txt).
+The test uses virtual headphones, AGC on, denoising 0, no leading audio and the
+release dev-feature binary; it does not measure denoise-100 worker scheduling
+or hardware latency. No local browser, WebKit, physical audio output or
+production service is used. No additional performance workaround is selected:
+production remains only P7, as ordered.
+
+Reproduce the committed acoustic CSVs without building or playing audio:
+
+```sh
+python3 docs/measurements/summarize-aec-shipped.py
+```
+
+### Correct render references and native options (historical PR #223 options checkpoint)
+
+**Historical checkpoint, superseded by the owner-approved P7 section above.** No measured option passes both strict acoustic gates.
 The separate constructor fix is commit `d9972dfe8cf8744e1097f4c7ef8b7b814b438b80`.
 It calls `initialize` as [upstream WebRTC does](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_processing/aec3/echo_canceller3.cc) and makes the draft branch actually
 use both reference channels when detection is disabled. No experimental profile,
@@ -1159,7 +1374,7 @@ python3 docs/measurements/summarize-aec-reference-options.py --speech --echo --r
 
 ### Priority 1: default recorded-speech regression (historical pre-fix checkpoint)
 
-**State / next steps:** default warm + speakers + full denoising is the production
+**Historical checkpoint:** default warm + speakers + full denoising is the production
 regression under investigation. `apps/web/src/state/settings.ts` defaults to
 `noiseStrength: 100`, noise suppression on, echo cancellation on and automatic
 gain control on. The model is unchanged. Route floors are lower priority until
@@ -1410,7 +1625,7 @@ measurement arm is available only through a dev-dependency feature. Stereo still
 pins on the first share sound. The per-content option must dominate every case and
 window before it can be considered for production.**
 
-**State / next steps (post-wake stop, 2026-11-02): NOT READY FOR REVIEW.**
+**Historical post-wake stop, 2026-11-02: NOT READY FOR REVIEW at that checkpoint.**
 Current stereo remains selected. The current route detector misses five of 17
 mean baseline floors; retaining and deferring the candidate still misses three
 and is rejected. The per-content selector fails dominance and is rejected.

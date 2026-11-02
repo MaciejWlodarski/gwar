@@ -537,11 +537,12 @@ impl AudioProcessingImpl {
         // Phase 2: Echo path gain change detection.
         #[cfg(feature = "gwar-aec-measurements")]
         let reported = std::mem::take(&mut self.capture.reported_echo_gain_change);
-        #[cfg(not(feature = "gwar-aec-measurements"))]
-        let reported = false;
         if self.submodules.echo_controller.is_some() {
-            self.capture.echo_path_gain_change =
-                self.capture.applied_input_volume_changed || reported;
+            self.capture.echo_path_gain_change = self.capture.applied_input_volume_changed;
+            #[cfg(feature = "gwar-aec-measurements")]
+            {
+                self.capture.echo_path_gain_change |= reported;
+            }
 
             if let Some(adjuster) = &self.submodules.capture_levels_adjuster {
                 let pre_adjustment_gain = adjuster.get_pre_adjustment_gain();
@@ -1338,6 +1339,10 @@ impl AudioProcessingImpl {
         let mut multichannel = EchoCanceller3Config::create_default_multichannel_config();
         multichannel.echo_removal_control.transparent_mode = ec.transparent_mode;
         multichannel.multi_channel.detect_stereo_content = ec.detect_stereo_content;
+        if ec.zero_nearend_reverb_decay {
+            config.ep_strength.nearend_len = 0.0;
+            multichannel.ep_strength.nearend_len = 0.0;
+        }
         #[cfg(feature = "gwar-aec-measurements")]
         if ec.multichannel_suppressor_like_mono {
             multichannel.suppressor.normal_tuning.max_inc_factor =
@@ -1390,21 +1395,33 @@ impl AudioProcessingImpl {
         }
         let multichannel_config = Some(multichannel);
 
-        self.submodules.echo_controller = Some(EchoCanceller3::new(
+        #[cfg(feature = "gwar-aec-measurements")]
+        let controller = if ec.measurement_two_channel_start {
+            EchoCanceller3::new_initialized_for_measurement(
+                config,
+                multichannel_config,
+                sample_rate_hz,
+                num_render_channels,
+                num_capture_channels,
+            )
+        } else {
+            EchoCanceller3::new(
+                config,
+                multichannel_config,
+                sample_rate_hz,
+                num_render_channels,
+                num_capture_channels,
+            )
+        };
+        #[cfg(not(feature = "gwar-aec-measurements"))]
+        let controller = EchoCanceller3::new(
             config,
             multichannel_config,
             sample_rate_hz,
             num_render_channels,
             num_capture_channels,
-        ));
-        #[cfg(feature = "gwar-aec-measurements")]
-        if ec.measurement_two_channel_start {
-            self.submodules
-                .echo_controller
-                .as_mut()
-                .unwrap()
-                .measurement_correct_channel_start();
-        }
+        );
+        self.submodules.echo_controller = Some(controller);
         #[cfg(feature = "gwar-aec-measurements")]
         if ec.measurement_left_reference {
             self.submodules

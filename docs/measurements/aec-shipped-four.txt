@@ -1,0 +1,21 @@
+
+running 1 test
+test voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time ... pair 0 order [0, 4]: none p50 0.010 p99 0.701 max 3.996 missing 480 | four p50 0.010 p99 1.292 max 3.705 missing 0 | p99 delta +0.591 ms
+pair 1 order [4, 0]: none p50 0.011 p99 0.040 max 1.189 missing 480 | four p50 0.011 p99 0.707 max 5.416 missing 0 | p99 delta +0.666 ms
+pair 2 order [0, 4]: none p50 0.011 p99 0.903 max 2.631 missing 480 | four p50 0.010 p99 1.033 max 6.709 missing 0 | p99 delta +0.130 ms
+pair 3 order [4, 0]: none p50 0.010 p99 0.476 max 1.560 missing 480 | four p50 0.011 p99 1.135 max 7.014 missing 0 | p99 delta +0.659 ms
+pair 4 order [0, 4]: none p50 0.010 p99 0.063 max 1.572 missing 480 | four p50 0.011 p99 1.304 max 5.518 missing 0 | p99 delta +1.241 ms
+pair 5 order [4, 0]: none p50 0.010 p99 0.413 max 1.663 missing 480 | four p50 0.010 p99 0.617 max 6.392 missing 0 | p99 delta +0.204 ms
+
+thread 'voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time' (47011371) panicked at crates/gwar-client/src/voice/mod.rs:1343:9:
+share playback delayed voice: 1.241 ms
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 398 filtered out; finished in 239.93s
+

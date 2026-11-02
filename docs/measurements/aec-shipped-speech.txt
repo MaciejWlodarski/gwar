@@ -1,0 +1,18 @@
+
+running 1 test
+test voice::apm::tests::tones::recorded_speech_is_not_held_after_stereo ... shipped-speech,lead=6,echo=false,noise=0,cold-hold=25,cold-kept=0.73679656,hold=25,kept=0.73593074,active=1155,cold-kept-frames=851,kept-frames=850,approved-frame-exception=1
+shipped-speech,lead=6,echo=false,noise=50,cold-hold=37,cold-kept=0.7125541,hold=37,kept=0.7134199,active=1155,cold-kept-frames=823,kept-frames=824,approved-frame-exception=0
+shipped-speech,lead=6,echo=false,noise=100,cold-hold=37,cold-kept=0.7134199,hold=37,kept=0.71428573,active=1155,cold-kept-frames=824,kept-frames=825,approved-frame-exception=0
+shipped-speech,lead=6,echo=true,noise=0,cold-hold=49,cold-kept=0.83549786,hold=0,kept=1,active=1155,cold-kept-frames=965,kept-frames=1155,approved-frame-exception=0
+shipped-speech,lead=6,echo=true,noise=50,cold-hold=70,cold-kept=0.27705628,hold=0,kept=0.6121212,active=1155,cold-kept-frames=320,kept-frames=707,approved-frame-exception=0
+shipped-speech,lead=6,echo=true,noise=100,cold-hold=136,cold-kept=0.104761906,hold=49,kept=0.42164502,active=1155,cold-kept-frames=121,kept-frames=487,approved-frame-exception=0
+shipped-speech,lead=10,echo=false,noise=0,cold-hold=84,cold-kept=0.6883117,hold=79,kept=0.6926407,active=1155,cold-kept-frames=795,kept-frames=800,approved-frame-exception=0
+shipped-speech,lead=10,echo=false,noise=50,cold-hold=84,cold-kept=0.66233766,hold=79,kept=0.66753244,active=1155,cold-kept-frames=765,kept-frames=771,approved-frame-exception=0
+shipped-speech,lead=10,echo=false,noise=100,cold-hold=84,cold-kept=0.6606061,hold=79,kept=0.66839826,active=1155,cold-kept-frames=763,kept-frames=772,approved-frame-exception=0
+shipped-speech,lead=10,echo=true,noise=0,cold-hold=93,cold-kept=0.8484849,hold=0,kept=1,active=1155,cold-kept-frames=980,kept-frames=1155,approved-frame-exception=0
+shipped-speech,lead=10,echo=true,noise=50,cold-hold=105,cold-kept=0.3073593,hold=0,kept=0.6103896,active=1155,cold-kept-frames=355,kept-frames=705,approved-frame-exception=0
+shipped-speech,lead=10,echo=true,noise=100,cold-hold=106,cold-kept=0.12813853,hold=49,kept=0.425974,active=1155,cold-kept-frames=148,kept-frames=492,approved-frame-exception=0
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 47.85s
+

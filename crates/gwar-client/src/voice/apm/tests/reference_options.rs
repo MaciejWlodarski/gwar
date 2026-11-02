@@ -21,13 +21,15 @@ const OPTIONS: [NativeOption; 7] = [
 
 fn option_output(option: NativeOption, far: &[[f32; 2]], mic: &[f32], pin: usize) -> Vec<f32> {
     AEC_NATIVE_PROFILE.store(option.profile, Ordering::Relaxed);
+    AEC_NATIVE_CHANNELS.store(!option.legacy, Ordering::Relaxed);
     AEC_LEGACY_REFERENCE.store(option.legacy, Ordering::Relaxed);
     let out = if option.warm {
         warm_through(&mut warm_session(), far, mic, Some(pin))
     } else {
         through(&mut session(LEARNING_FRAMES), far, mic, Some(pin))
     };
-    AEC_NATIVE_PROFILE.store(0, Ordering::Relaxed);
+    AEC_NATIVE_PROFILE.store(SHIPPED_AEC_PROFILE, Ordering::Relaxed);
+    AEC_NATIVE_CHANNELS.store(false, Ordering::Relaxed);
     AEC_LEGACY_REFERENCE.store(false, Ordering::Relaxed);
     out
 }
@@ -43,7 +45,6 @@ fn emit_option_window(option: NativeOption, case: &str, from: usize, to: usize, 
 #[test]
 #[ignore = "seven arms on all 549 paired echo windows; run in release alone"]
 fn native_reference_options_full_echo() {
-    ECHO_GONE_IGNORED.store(true, Ordering::Relaxed);
     let mono_windows: Vec<_> = (0..8).map(|at| (at, at + 1)).chain([(8, 12), (12, 16), (16, 24)]).collect();
     for before in [6, 20] {
         let pin = before * RATE;
@@ -108,13 +109,11 @@ fn native_reference_options_full_echo() {
     far.extend(wide(&long_voice(12 * RATE, 120.0, -18.0)));
     let mic = room(&left_channel(&far), 60);
     run_wide("steady pin 310", pin, &far, &mic);
-    ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
 }
 
 #[test]
 #[ignore = "right-only and independent wide acoustic paths; run in release alone"]
 fn native_reference_options_right_echo() {
-    ECHO_GONE_IGNORED.store(true, Ordering::Relaxed);
     let windows = [(0, 1), (1, 2), (2, 4), (4, 6), (6, 8), (8, 12), (12, 16), (16, 24), (32, 48)];
     for before in [6, 20, 60, 310] {
         let pin = before * RATE;
@@ -152,5 +151,4 @@ fn native_reference_options_right_echo() {
             }
         }
     }
-    ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
 }

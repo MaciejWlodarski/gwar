@@ -119,6 +119,8 @@ fn projection(out: &[f32], near: &[f32], from: usize, to: usize) -> [f32; 2] {
 struct Holds {
     maximum: [usize; 4],
     kept: f32,
+    speaking_frames: usize,
+    kept_frames: usize,
     sent: Vec<usize>,
     levels: [f32; 3],
     projection: [[[f32; 2]; 3]; 2],
@@ -327,9 +329,15 @@ impl ArmOptions {
                 o.native_profile = tag - 85;
             }
             100..=103 => {
+                o.native_channels = true;
                 o.warm = tag == 100 || tag == 102;
                 o.gain = true;
                 o.native_profile = if tag <= 101 { 7 } else { 1 };
+            }
+            110 => {
+                o.warm = true;
+                o.gain = true;
+                o.native_profile = SHIPPED_AEC_PROFILE;
             }
             _ => panic!("unknown measurement arm {tag}"),
         }
@@ -501,7 +509,7 @@ fn arm_with_options(name: &str, lead: usize, echo: bool, noise: u8, mode: u8, op
     }
     AEC_LEGACY_REFERENCE.store(false, Ordering::Relaxed);
     AEC_WARM_ONLY_TWO.store(false, Ordering::Relaxed);
-    AEC_NATIVE_PROFILE.store(0, Ordering::Relaxed);
+    AEC_NATIVE_PROFILE.store(SHIPPED_AEC_PROFILE, Ordering::Relaxed);
     AEC_NATIVE_CHANNELS.store(false, Ordering::Relaxed);
     AEC_NONLINEAR_AT_TAKEOVER.store(0, Ordering::Relaxed);
     Holds {
@@ -525,6 +533,8 @@ fn arm_with_options(name: &str, lead: usize, echo: bool, noise: u8, mode: u8, op
         },
         maximum,
         kept: kept / speaking,
+        speaking_frames: speaking as usize,
+        kept_frames: kept as usize,
         sent,
         levels: std::array::from_fn(|i| (10.0 * (powers[i] / counts[i] as f64 + 1e-20).log10()) as f32),
         projection: if name.starts_with("human") {
@@ -615,7 +625,6 @@ fn gain_mask_after_stereo() {
 #[cfg(feature = "deep-filter")]
 #[ignore = "native AEC gain-change held-speech diagnostic, run in release"]
 fn native_change_at_first_share() {
-    ROUTE_MEASUREMENT.store(4, Ordering::Relaxed);
     for name in ["human speech", "silence"] {
         let h = arm(name, 6, true, 100, 20);
         eprintln!(
@@ -623,27 +632,38 @@ fn native_change_at_first_share() {
             h.maximum, h.kept, h.levels, h.projection, h.sent
         );
     }
-    ROUTE_MEASUREMENT.store(2, Ordering::Relaxed);
 }
 
 #[test]
 #[cfg(feature = "deep-filter")]
-#[ignore = "strict acoustic acceptance, known to fail; run in release alone"]
+#[ignore = "owner-approved 12-case recorded-speech acceptance; run in release alone"]
 fn recorded_speech_is_not_held_after_stereo() {
-    let mut failures = Vec::new();
     for lead in [6, 10] {
         for echo in [false, true] {
             for noise in [0, 50, 100] {
                 let cold = historical_arm("human speech", lead, echo, noise, 8);
-                let warm = arm("human speech", lead, echo, noise, 7);
-                eprintln!("speech-gate,lead={lead},echo={echo},noise={noise},cold={cold:?},warm={warm:?}");
-                if warm.maximum[3] > cold.maximum[3] || warm.kept < cold.kept {
-                    failures.push((lead, echo, noise, cold.maximum[3], warm.maximum[3], cold.kept, warm.kept));
-                }
+                let shipped = arm("human speech", lead, echo, noise, 110);
+                let allowed_frame = usize::from(lead == 6 && !echo && noise == 0);
+                assert_eq!(cold.speaking_frames, shipped.speaking_frames);
+                eprintln!(
+                    "shipped-speech,lead={lead},echo={echo},noise={noise},cold-hold={},cold-kept={},hold={},kept={},active={},cold-kept-frames={},kept-frames={},approved-frame-exception={allowed_frame}",
+                    cold.maximum[3],
+                    cold.kept,
+                    shipped.maximum[3],
+                    shipped.kept,
+                    shipped.speaking_frames,
+                    cold.kept_frames,
+                    shipped.kept_frames
+                );
+                assert!(shipped.maximum[3] <= cold.maximum[3], "held speech: lead {lead}, echo {echo}, noise {noise}");
+                // Owner accepted exactly one lost active frame in this one fixed headphone case.
+                assert!(
+                    shipped.kept_frames + allowed_frame >= cold.kept_frames,
+                    "kept speech: lead {lead}, echo {echo}, noise {noise}"
+                );
             }
         }
     }
-    assert!(failures.is_empty(), "warm speech regresses against cold: {failures:?}");
 }
 
 #[test]
