@@ -1021,10 +1021,21 @@ and the app.
 
 ### Owner-approved Left warm P7 (PR #223, current implementation)
 
-**State / next steps: NOT READY FOR REVIEW.** The owner selected **Left warm P7**,
-accepting its measured speech/echo trade-off, but the shipped configuration fails
-the repeated six-pair four-share hard limit: **+1.241 ms**, required <1.0 ms.
-Measurements stop at that failure; PR #223 remains a draft.
+**State / next steps: validation resumed; draft until quiet paired timing and all checks complete.**
+The owner selected **Left warm P7**, accepting its measured speech/echo trade-off.
+The earlier +1.241 ms run is not qualified under the revised timing protocol:
+the owner reported load around 6 and concurrent workers, and that run lacks
+before/after uptime and continuous load records. The earlier +0.344 ms pass is
+also historical, not a substitute for the new acceptance measurements.
+
+The new protocol pins P7 at `ac4af9e4` and main at `208c8866`, builds separate
+binaries/targets, and runs head/main/head/main/head/main. Each run starts only
+at one-minute load <3, with no `ss-tools/run.sh`, share-sync E2E, other cargo or
+Rust-test process. Uptime is captured before/after; load is sampled throughout.
+Load >4, overlapping timing/builds, or sleep/lost coverage voids an attempt.
+Every attempt is retained, including valid failures. All 36 per-pair results
+and the three adjacent head/main comparisons will be reported. Production
+code is unchanged while this validation is repeated.
 Earlier checkpoints in this document are historical, including their stop states.
 
 The production change against main `1099a681` is only
@@ -1173,7 +1184,7 @@ mono-like tuning, channel correction and model experiments require those feature
 A read-only `cargo tree -e normal,build` check confirms neither feature in the
 production graph. A fresh featureless compilation was not run before the hard stop.
 
-#### Assertions and final validation
+#### Assertions and historical uncontrolled validation
 
 The two Rust-CI failures at the two-reference checkpoint were
 `the_switch_keeps_the_voice_in_time` (586 versus 585 samples) and

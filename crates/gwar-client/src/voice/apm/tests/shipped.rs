@@ -160,11 +160,11 @@ fn what_an_unreported_device_costs() {
         }
         for (index, (arm, _, _, _)) in arms.iter().enumerate() {
             let count = if echo { 9 } else { 4 };
-            for w in 0..count {
+            for (w, sum) in sums[index].iter().enumerate().take(count) {
                 if echo && w % 2 != 0 {
                     continue;
                 }
-                eprintln!("shipped-route-mean\t{name}\t{arm}\t{w}\t{:.9}", sums[index][w] / 27.0);
+                eprintln!("shipped-route-mean\t{name}\t{arm}\t{w}\t{:.9}", sum / 27.0);
             }
         }
     }
