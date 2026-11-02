@@ -122,6 +122,8 @@ struct Holds {
     sent: Vec<usize>,
     levels: [f32; 3],
     projection: [[[f32; 2]; 3]; 2],
+    aec_split: [[[f32; 2]; 3]; 2],
+    echo_levels: Vec<f32>,
 }
 
 /// Stable diagnostic tags, represented as independent controls so adding a
@@ -136,6 +138,9 @@ struct ArmOptions {
     normalize: bool,
     mask_after_stereo: bool,
     native_at_share: bool,
+    nonlinear_restart: u8,
+    native_channels: bool,
+    native_profile: u8,
 }
 impl ArmOptions {
     fn tagged(tag: u8) -> Self {
@@ -149,6 +154,9 @@ impl ArmOptions {
             normalize: false,
             mask_after_stereo: false,
             native_at_share: false,
+            nonlinear_restart: 0,
+            native_channels: false,
+            native_profile: 0,
         };
         match tag {
             0 => {}
@@ -212,6 +220,54 @@ impl ArmOptions {
                 o.gain = true;
                 o.native_at_share = true;
             }
+            21..=24 => {
+                o.warm = true;
+                o.gain = true;
+                o.nonlinear_restart = tag - 20;
+            }
+            25..=28 => {
+                o.gain = true;
+                o.nonlinear_restart = tag - 24;
+            }
+            30 => {
+                o.warm = true;
+                o.gain = true;
+                o.native_channels = true;
+            }
+            31 => {
+                o.gain = true;
+                o.native_channels = true;
+            }
+            32..=35 => {
+                o.warm = true;
+                o.gain = true;
+                o.native_channels = true;
+                o.nonlinear_restart = tag - 31;
+            }
+            36..=38 => {
+                o.warm = true;
+                o.gain = true;
+                o.nonlinear_restart = tag - 31;
+            }
+            40..=45 => {
+                o.warm = true;
+                o.gain = true;
+                o.native_profile = tag - 39;
+            }
+            50..=55 => {
+                o.warm = true;
+                o.gain = true;
+                o.native_channels = true;
+                o.native_profile = tag - 49;
+            }
+            80 => {
+                o.gain = true;
+                o.native_profile = 1;
+            }
+            81 => {
+                o.gain = true;
+                o.native_profile = 2;
+            }
             _ => panic!("unknown measurement arm {tag}"),
         }
         o
@@ -220,6 +276,10 @@ impl ArmOptions {
 
 #[cfg(feature = "deep-filter")]
 fn arm(name: &str, lead: usize, echo: bool, noise: u8, mode: u8) -> Holds {
+    arm_with_options(name, lead, echo, noise, mode, ArmOptions::tagged(mode))
+}
+
+fn arm_with_options(name: &str, lead: usize, echo: bool, noise: u8, mode: u8, options: ArmOptions) -> Holds {
     let total = (lead + 16) * RATE;
     let far = coded_render(lead, total);
     let l = room(&left_channel(&far), 60);
@@ -238,7 +298,9 @@ fn arm(name: &str, lead: usize, echo: bool, noise: u8, mode: u8) -> Holds {
                 }
         })
         .collect();
-    let options = ArmOptions::tagged(mode);
+    AEC_NATIVE_PROFILE.store(options.native_profile, Ordering::Relaxed);
+    AEC_NATIVE_CHANNELS.store(options.native_channels, Ordering::Relaxed);
+    AEC_NONLINEAR_AT_TAKEOVER.store(options.nonlinear_restart, Ordering::Relaxed);
     let mut p = if options.warm { warm_session() } else { session(LEARNING_FRAMES) };
     p.configure(options.aec, options.gain);
     let mut model = (noise > 0).then(|| gwar_denoise::Model::embedded().unwrap());
@@ -259,6 +321,8 @@ fn arm(name: &str, lead: usize, echo: bool, noise: u8, mode: u8) -> Holds {
     let mut maximum = [0usize; 4];
     let (mut speaking, mut kept) = (0.0f32, 0.0f32);
     let mut sent = vec![0usize; lead + 16];
+    let mut linear = Vec::with_capacity(total);
+    let mut suppressed = Vec::with_capacity(total);
     let mut before_model = Vec::with_capacity(total);
     let mut after_model = Vec::with_capacity(total);
     let mut powers = [0.0f64; 3];
@@ -293,6 +357,23 @@ fn arm(name: &str, lead: usize, echo: bool, noise: u8, mode: u8) -> Holds {
             && let Some(model) = &mut model
         {
             model.set_measurement_stages(if p.is_stereo() { -100.0 } else { 35.0 }, true);
+        }
+        linear.extend(p.echo.apm.measurement_linear().into_iter().flat_map(|v| [v; 3]));
+        suppressed.extend_from_slice(&frame);
+        if AEC_TRACE.load(Ordering::Relaxed) && at >= (lead - 1) * RATE && at.is_multiple_of(RATE / 2) {
+            eprintln!(
+                "aec-state,{name},lead={lead},echo={echo},noise={noise},mode={mode},at={:.2},stereo={},active={:?}",
+                at as f32 / RATE as f32 - lead as f32,
+                p.is_stereo(),
+                p.echo.apm.measurement()
+            );
+            if let Channels::Learning(stage, _) = &p.channels {
+                eprintln!(
+                    "aec-candidate,mode={mode},at={:.2},state={:?}",
+                    at as f32 / RATE as f32 - lead as f32,
+                    stage.apm.measurement()
+                );
+            }
         }
         let raw = db(&frame);
         p.control_gain(&mut frame);
@@ -347,7 +428,28 @@ fn arm(name: &str, lead: usize, echo: bool, noise: u8, mode: u8) -> Holds {
             }
         }
     }
+    AEC_NATIVE_PROFILE.store(0, Ordering::Relaxed);
+    AEC_NATIVE_CHANNELS.store(false, Ordering::Relaxed);
+    AEC_NONLINEAR_AT_TAKEOVER.store(0, Ordering::Relaxed);
     Holds {
+        echo_levels: (0..32)
+            .map(|n| db(&after_model[lead * RATE + n * RATE / 2..lead * RATE + (n + 1) * RATE / 2]))
+            .collect(),
+        aec_split: if name.starts_with("human") {
+            std::array::from_fn(|stage| {
+                std::array::from_fn(|w| {
+                    let (a, b) = [(0, 3), (3, 8), (8, 16)][w];
+                    projection(
+                        if stage == 0 { &linear } else { &suppressed },
+                        &said,
+                        (lead + a) * RATE,
+                        (lead + b) * RATE,
+                    )
+                })
+            })
+        } else {
+            [[[f32::NAN; 2]; 3]; 2]
+        },
         maximum,
         kept: kept / speaking,
         sent,
@@ -455,9 +557,116 @@ fn native_change_at_first_share() {
 #[cfg(feature = "deep-filter")]
 #[ignore = "strict acoustic acceptance, known to fail; run in release alone"]
 fn recorded_speech_is_not_held_after_stereo() {
-    let control = arm("human speech", 6, true, 100, 9);
-    let current = arm("human speech", 6, true, 100, 7);
-    eprintln!("human acceptance: without AEC {control:?}; current stereo {current:?}");
-    assert!(control.maximum[3] < 100, "speech control must remain audible");
-    assert!(current.maximum[3] < 100, "stereo + full denoising held at least one second of active speech");
+    let mut failures = Vec::new();
+    for lead in [6, 10] {
+        for echo in [false, true] {
+            for noise in [0, 50, 100] {
+                let cold = arm("human speech", lead, echo, noise, 8);
+                let warm = arm("human speech", lead, echo, noise, 7);
+                eprintln!("speech-gate,lead={lead},echo={echo},noise={noise},cold={cold:?},warm={warm:?}");
+                if warm.maximum[3] > cold.maximum[3] || warm.kept < cold.kept {
+                    failures.push((lead, echo, noise, cold.maximum[3], warm.maximum[3], cold.kept, warm.kept));
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "warm speech regresses against cold: {failures:?}");
+}
+
+#[test]
+#[ignore = "native AEC state and linear/suppressor comparison; run in release alone"]
+fn aec_linear_and_suppression_at_takeover() {
+    AEC_TRACE.store(true, Ordering::Relaxed);
+    for mode in [8, 7, 21, 22, 23, 24, 30, 31, 32, 33] {
+        let h = arm("human speech", 6, true, 100, mode);
+        eprintln!(
+            "aec-split,mode={mode},maxima={:?},kept={},linear-and-suppressed={:?},gain-and-model={:?},levels={:?}",
+            h.maximum, h.kept, h.aec_split, h.projection, h.levels
+        );
+    }
+    AEC_TRACE.store(false, Ordering::Relaxed);
+}
+
+#[test]
+#[ignore = "native reverb/noise/state/config isolation; run in release alone"]
+fn native_reverb_and_capture_state() {
+    AEC_TRACE.store(true, Ordering::Relaxed);
+    for mode in [36, 37, 38, 40, 41, 42, 43, 44, 45, 50, 51, 52, 53, 54, 55] {
+        let h = arm("human speech", 6, true, 100, mode);
+        eprintln!(
+            "aec-native,mode={mode},maxima={:?},kept={},linear-and-suppressed={:?},gain-and-model={:?},levels={:?}",
+            h.maximum, h.kept, h.aec_split, h.projection, h.levels
+        );
+    }
+    AEC_TRACE.store(false, Ordering::Relaxed);
+}
+
+#[test]
+#[ignore = "default speech matrix and 500 ms quiet-echo gate; run in release alone"]
+fn native_speech_and_quiet_echo_gate() {
+    let modes = [7, 40, 41, 51, 54, 31];
+    let mut speech_pass = [true; 6];
+    let mut echo_pass = [true; 6];
+    for lead in [6, 10] {
+        for echo in [false, true] {
+            for noise in [0, 50, 100] {
+                let cold = arm("human speech", lead, echo, noise, 8);
+                let no_aec = arm("human speech", lead, echo, noise, 9);
+                eprintln!(
+                    "speech-matrix-control,lead={lead},echo={echo},noise={noise},cold-hold={},cold-kept={},no-aec-hold={},no-aec-kept={}",
+                    cold.maximum[3], cold.kept, no_aec.maximum[3], no_aec.kept
+                );
+                for (i, mode) in modes.into_iter().enumerate() {
+                    let h = arm("human speech", lead, echo, noise, mode);
+                    let pass = h.maximum[3] <= cold.maximum[3] && h.kept >= cold.kept;
+                    speech_pass[i] &= pass;
+                    eprintln!(
+                        "speech-matrix,lead={lead},echo={echo},noise={noise},mode={mode},hold={},kept={},pass={pass},near-gain={:?}",
+                        h.maximum[3], h.kept, h.projection[1]
+                    );
+                }
+            }
+        }
+        let mut current_options = ArmOptions::tagged(7);
+        current_options.gain = false;
+        let current = arm_with_options("silence", lead, true, 0, 7, current_options);
+        eprintln!("echo-matrix-control,lead={lead},levels={:?}", current.echo_levels);
+        for (i, mode) in modes.into_iter().enumerate() {
+            let mut options = ArmOptions::tagged(mode);
+            options.gain = false;
+            let h = arm_with_options("silence", lead, true, 0, mode, options);
+            let delta: Vec<f32> = h.echo_levels.iter().zip(&current.echo_levels).map(|(a, b)| a - b).collect();
+            let worst = delta.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let pass = worst <= 1.0;
+            echo_pass[i] &= pass;
+            eprintln!(
+                "echo-matrix,lead={lead},mode={mode},levels={:?},delta={delta:?},worst={worst},pass={pass}",
+                h.echo_levels
+            );
+        }
+    }
+    for (i, mode) in modes.into_iter().enumerate() {
+        eprintln!(
+            "native-gate,mode={mode},speech={},quiet-echo={},accepted={}",
+            speech_pass[i],
+            echo_pass[i],
+            speech_pass[i] && echo_pass[i]
+        );
+    }
+}
+
+#[test]
+#[ignore = "cold-path native reverb comparison, recorded speech; run in release alone"]
+fn cold_path_native_reverb() {
+    for lead in [6, 10] {
+        for noise in [0, 50, 100] {
+            for mode in [8, 80, 81] {
+                let h = arm("human speech", lead, true, noise, mode);
+                eprintln!(
+                    "cold-native,lead={lead},noise={noise},mode={mode},maxima={:?},kept={},aec={:?},model={:?}",
+                    h.maximum, h.kept, h.aec_split, h.projection
+                );
+            }
+        }
+    }
 }

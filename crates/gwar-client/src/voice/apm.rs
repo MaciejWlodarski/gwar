@@ -142,6 +142,8 @@ fn canceller(stereo: bool) -> Config {
     #[cfg(test)]
     let canceller = EchoCanceller {
         multichannel_suppressor_like_mono: stereo && MEASURE_MONO_SUPPRESSOR.load(Ordering::Relaxed),
+        measurement_two_channel_start: stereo && AEC_NATIVE_CHANNELS.load(Ordering::Relaxed),
+        measurement_native_profile: if stereo { AEC_NATIVE_PROFILE.load(Ordering::Relaxed) } else { 0 },
         ..canceller
     };
     Config { echo_canceller: Some(canceller), ..base() }
@@ -237,6 +239,20 @@ impl EchoGone {
 static ECHO_GONE_IGNORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Only the isolated channel comparison changes this; run that test alone.
+#[cfg(test)]
+static AEC_NATIVE_PROFILE: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+static AEC_NATIVE_CHANNELS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+#[cfg(test)]
+static AEC_NONLINEAR_AT_TAKEOVER: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+static AEC_ECHO_COMPARE_PROFILE: AtomicU8 = AtomicU8::new(0);
+#[cfg(test)]
+static AEC_ECHO_REGRESSIONS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static AEC_ECHO_WORST_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+#[cfg(test)]
+static AEC_TRACE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 #[cfg(test)]
 static MEASURE_MONO_SUPPRESSOR: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
@@ -807,6 +823,13 @@ impl Processing {
             for (index, (sample, learned)) in frame.iter_mut().zip(&self.learned).enumerate() {
                 let phase = (index + 1) as f32 / FRAME as f32 * std::f32::consts::FRAC_PI_2;
                 *sample = *sample * phase.cos().powi(2) + learned * phase.sin().powi(2);
+            }
+        }
+        #[cfg(test)]
+        {
+            let mode = AEC_NONLINEAR_AT_TAKEOVER.load(Ordering::Relaxed);
+            if mode != 0 {
+                stage.apm.measurement_restart_nonlinear(mode);
             }
         }
         std::mem::swap(&mut self.echo, &mut *stage);
@@ -2584,8 +2607,28 @@ mod tests {
                             [cold(&same, &talk), warm(&same, &talk)],
                             [cold(&shared, &heard), warm(&shared, &heard)],
                         ];
+                        let profile = AEC_ECHO_COMPARE_PROFILE.load(Ordering::Relaxed);
+                        let extra = if profile > 0 {
+                            let old = AEC_NATIVE_PROFILE.swap(profile, Ordering::Relaxed);
+                            let extra = warm(&same, &echo);
+                            AEC_NATIVE_PROFILE.store(old, Ordering::Relaxed);
+                            Some(extra)
+                        } else {
+                            None
+                        };
                         for (index, window) in windows.iter().enumerate() {
                             let r = span(*window);
+                            if let Some(extra) = &extra {
+                                record_native_echo_pair(
+                                    &format!(
+                                        "mono,pin={before},far={far_pitch},delay={delay},near={near_pitch},s={}-{}",
+                                        window.0, window.1
+                                    ),
+                                    db(&arms[0][1][r.clone()]),
+                                    db(&extra[r.clone()]),
+                                    db(&arms[0][0][r.clone()]),
+                                );
+                            }
                             let kept = |out: &[f32]| fidelity(&out[r.clone()], &near[r.clone()]).1;
                             let rows: [(f32, [f32; 2]); 3] = [
                                 (db(&stay_echo[r.clone()]), [db(&arms[0][0][r.clone()]), db(&arms[0][1][r.clone()])]),
@@ -2623,6 +2666,51 @@ mod tests {
         ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
     }
 
+    #[test]
+    #[ignore = "native-profile comparison on the complete #220 echo tables; run in release alone"]
+    fn native_profile_echo_tables() {
+        let profile: u8 = std::env::var("GWAR_NATIVE_AEC_PROFILE").unwrap_or_else(|_| "0".into()).parse().unwrap();
+        assert!(profile <= 2);
+        AEC_NATIVE_PROFILE.store(profile, Ordering::Relaxed);
+        eprintln!("native echo tables, profile={profile}");
+        the_warmed_switch_against_cold_and_staying_mono();
+        ECHO_GONE_IGNORED.store(true, Ordering::Relaxed);
+        the_wide_leak_cold_and_warm();
+        ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
+        AEC_NATIVE_PROFILE.store(0, Ordering::Relaxed);
+    }
+
+    fn record_native_echo_pair(label: &str, current: f32, candidate: f32, cold: f32) {
+        let delta = candidate - current;
+        if delta > 1.0 {
+            AEC_ECHO_REGRESSIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        AEC_ECHO_WORST_BITS.fetch_max(delta.max(0.0).to_bits(), Ordering::Relaxed);
+        eprintln!(
+            "native-echo-pair,{label},current={current:.9},candidate={candidate:.9},delta={delta:.9},cold={cold:.9}"
+        );
+    }
+
+    #[test]
+    #[ignore = "strict paired per-room +1 dB gate on full #220 echo tables; run in release alone"]
+    fn native_paired_echo_gate() {
+        let profile: u8 = std::env::var("GWAR_NATIVE_AEC_PROFILE").unwrap_or_else(|_| "1".into()).parse().unwrap();
+        assert!((1..=2).contains(&profile));
+        AEC_NATIVE_PROFILE.store(0, Ordering::Relaxed);
+        AEC_ECHO_COMPARE_PROFILE.store(profile, Ordering::Relaxed);
+        AEC_ECHO_REGRESSIONS.store(0, Ordering::Relaxed);
+        AEC_ECHO_WORST_BITS.store(0, Ordering::Relaxed);
+        the_warmed_switch_against_cold_and_staying_mono();
+        ECHO_GONE_IGNORED.store(true, Ordering::Relaxed);
+        the_wide_leak_cold_and_warm();
+        ECHO_GONE_IGNORED.store(false, Ordering::Relaxed);
+        AEC_ECHO_COMPARE_PROFILE.store(0, Ordering::Relaxed);
+        let failures = AEC_ECHO_REGRESSIONS.load(Ordering::Relaxed);
+        let worst = f32::from_bits(AEC_ECHO_WORST_BITS.load(Ordering::Relaxed));
+        eprintln!("native paired echo gate profile={profile}: failures={failures},worst={worst:.9} dB");
+        assert_eq!(failures, 0, "native configuration makes a quiet-echo room/window >1 dB louder");
+    }
+
     /// Wide sound from the first share sound, in dBFS, in `WIDE_WINDOWS` after it. `same` is the
     /// voice's own pitch, `new` a pitch the canceller never heard. `steady` trains on [`voice`] past
     /// the 140 s where it stops moving, so on one held note: the one case found that still leaks.
@@ -2632,13 +2720,28 @@ mod tests {
     fn the_wide_leak_cold_and_warm() {
         let second = RATE;
         let windows = [(0, 1), (1, 2), (2, 4), (4, 6), (6, 8), (8, 12), (12, 16), (16, 24), (32, 48)];
-        let show = |name: String, pin: usize, cold: &[f32], warm: &[f32]| {
+        let show = |name: String, pin: usize, cold: &[f32], warm: &[f32], far: &[[f32; 2]], echo: &[f32]| {
             for (arm, out) in [("cold", cold), ("warm", warm)] {
                 let levels: Vec<String> = windows
                     .iter()
                     .map(|(from, to)| format!("{:.1}", db(&out[pin + from * second / 4..pin + to * second / 4])))
                     .collect();
                 eprintln!("wide {name} {arm}: {}", levels.join(" "));
+            }
+            let profile = AEC_ECHO_COMPARE_PROFILE.load(Ordering::Relaxed);
+            if profile > 0 {
+                let old = AEC_NATIVE_PROFILE.swap(profile, Ordering::Relaxed);
+                let extra = warm_through(&mut warm_session(), far, echo, Some(pin));
+                AEC_NATIVE_PROFILE.store(old, Ordering::Relaxed);
+                for (a, b) in windows {
+                    let r = pin + a * second / 4..pin + b * second / 4;
+                    record_native_echo_pair(
+                        &format!("wide,{name},q={a}-{b}"),
+                        db(&warm[r.clone()]),
+                        db(&extra[r.clone()]),
+                        db(&cold[r]),
+                    );
+                }
             }
         };
         for pin_at in [6, 20, 60, 310] {
@@ -2650,7 +2753,7 @@ mod tests {
                 let echo = room(&left, 60);
                 let cold = through(&mut session(LEARNING_FRAMES), &far, &echo, Some(pin));
                 let warm = warm_through(&mut warm_session(), &far, &echo, Some(pin));
-                show(format!("{name} {before}->{after} pin {pin_at}"), pin, &cold, &warm);
+                show(format!("{name} {before}->{after} pin {pin_at}"), pin, &cold, &warm, &far, &echo);
             }
             let talk = long_voice(pin + 12 * second, 150.0, -18.0);
             let mid = long_voice(pin + 12 * second, 120.0, -20.0);
@@ -2663,7 +2766,7 @@ mod tests {
             let echo: Vec<f32> = room(&left, 60).iter().zip(room(&right, 75)).map(|(l, r)| l + 0.7 * r).collect();
             let cold = through(&mut session(LEARNING_FRAMES), &far, &echo, Some(pin));
             let warm = warm_through(&mut warm_session(), &far, &echo, Some(pin));
-            show(format!("speakers pin {pin_at}"), pin, &cold, &warm);
+            show(format!("speakers pin {pin_at}"), pin, &cold, &warm, &far, &echo);
         }
         let pin = 310 * second;
         let mut far = pairs(&voice(pin, 150.0, -18.0));
@@ -2672,7 +2775,7 @@ mod tests {
         let echo = room(&left, 60);
         let cold = through(&mut session(LEARNING_FRAMES), &far, &echo, Some(pin));
         let warm = warm_through(&mut warm_session(), &far, &echo, Some(pin));
-        show("steady pin 310".into(), pin, &cold, &warm);
+        show("steady pin 310".into(), pin, &cold, &warm, &far, &echo);
     }
 
     /// How much of a near voice speaking in turns gets through, from the first share sound: the

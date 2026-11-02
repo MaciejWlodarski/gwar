@@ -486,7 +486,7 @@ impl EchoCanceller3 {
     pub(crate) fn process_capture(
         &mut self,
         capture: &mut AudioBuffer,
-        linear_output: Option<&mut AudioBuffer>,
+        mut linear_output: Option<&mut AudioBuffer>,
         level_change: bool,
     ) {
         debug_assert_eq!(self.num_bands, capture.num_bands());
@@ -530,6 +530,12 @@ impl EchoCanceller3 {
                 aec_reference_is_downmixed_stereo,
                 sub_frame_idx,
             );
+            if let (Some(output), Some(view)) = (
+                linear_output.as_deref_mut(),
+                &self.linear_output_sub_frame_view,
+            ) {
+                write_sub_frame_to_audio_buffer(view, sub_frame_idx, output);
+            }
         }
 
         // Process any remaining block from the capture blocker.
@@ -698,6 +704,19 @@ impl EchoCanceller3 {
         }
     }
 
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub(crate) fn measurement(&self) -> sonora_aec3::measurement::Measurement {
+        self.block_processor.measurement()
+    }
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub(crate) fn measurement_restart_nonlinear(&mut self, mode: u8) {
+        self.block_processor.measurement_restart_nonlinear(mode);
+    }
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub(crate) fn measurement_correct_channel_start(&mut self) {
+        self.initialize();
+    }
+
     /// Collects current metrics from the echo canceller.
     pub(crate) fn get_metrics(&self) -> BlockProcessorMetricsOutput {
         self.block_processor.get_metrics()
@@ -739,6 +758,15 @@ mod tests {
             num_channels,
             sample_rate_hz,
         )
+    }
+
+    #[test]
+    #[ignore = "failing-first native channel wiring regression; run before/after constructor fix"]
+    fn disabled_detection_must_keep_all_render_reference_channels() {
+        let mut config = EchoCanceller3Config::default();
+        config.multi_channel.detect_stereo_content = false;
+        let ec = EchoCanceller3::new(config, None, 48000, 2, 1);
+        assert_eq!(ec.num_render_channels_to_aec, 2);
     }
 
     #[test]

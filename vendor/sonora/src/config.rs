@@ -190,6 +190,10 @@ pub struct EchoCanceller {
     /// with the multichannel adaptive filter. False preserves upstream tuning.
     #[cfg(feature = "gwar-aec-measurements")]
     pub multichannel_suppressor_like_mono: bool,
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub measurement_two_channel_start: bool,
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub measurement_native_profile: u8,
 }
 
 impl Default for EchoCanceller {
@@ -200,6 +204,10 @@ impl Default for EchoCanceller {
             detect_stereo_content: true,
             #[cfg(feature = "gwar-aec-measurements")]
             multichannel_suppressor_like_mono: false,
+            #[cfg(feature = "gwar-aec-measurements")]
+            measurement_two_channel_start: false,
+            #[cfg(feature = "gwar-aec-measurements")]
+            measurement_native_profile: 0,
         }
     }
 }

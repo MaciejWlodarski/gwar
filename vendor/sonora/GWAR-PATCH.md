@@ -4,7 +4,7 @@ Source: the `sonora` crate 0.2.0 from crates.io, the release Gwar used before
 (BSD-3-Clause, `LICENSE`). Vendored: `src/`, `README.md` and the license;
 `Cargo.toml.orig` is upstream's manifest. `Cargo.toml` leaves out its examples,
 benches and their optional dependencies, which are not vendored. Its `sonora-*`
-sub-crates still come from crates.io.
+sub-crates originally came from crates.io; PR #223 also vendors `sonora-aec3` for native-state diagnostics.
 
 The only source change, marked `Gwar:` in `src/config.rs` and
 `src/audio_processing_impl.rs`, is one option, `EchoCanceller.detect_stereo_content`:
@@ -12,8 +12,11 @@ The only source change, marked `Gwar:` in `src/config.rs` and
 - True, the default, is upstream's behaviour. One render channel, which is all
   Gwar uses for voice alone, takes no path this patch touches: a voice session
   stays bit for bit what it was (`voice_alone_is_mains_canceller_to_the_bit`).
-- False turns off AEC3's content detector, so two render channels are cancelled as
-  two from the first frame, and never fall back to one after five minutes of mono.
+- False turns off AEC3's content detector. The original intention was to cancel
+  both reference channels immediately. PR #223 found that Sonora's constructor
+  still hardcodes one render channel and never calls `initialize` while detection
+  is disabled, so the historical path actually uses only the left reference.
+  Correct native initialization is measured separately before production selection.
 - The transparent mode now reaches the multichannel config too. Upstream leaves
   that config on Legacy whatever was asked for.
 

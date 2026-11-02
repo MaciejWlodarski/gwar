@@ -1019,6 +1019,141 @@ Not exercised here: the real macOS permission grant, the native capture on Windo
 Chrome's visible second picker, which the test selects automatically. Those need a person
 and the app.
 
+### Priority 1: default recorded-speech regression (continuation)
+
+**State / next steps:** default warm + speakers + full denoising is the production
+regression under investigation. `apps/web/src/state/settings.ts` defaults to
+`noiseStrength: 100`, noise suppression on, echo cancellation on and automatic
+gain control on. The model is unchanged. Route floors are lower priority until
+this regression is resolved. `recorded_speech_is_not_held_after_stereo` now checks
+warm against cold across both leads, both routes and all three denoising levels;
+no failing-first acceptance is removed.
+
+#### Native AEC wiring defect and measurement scope
+
+The audit found that Sonora's `EchoCanceller3::new` hardcodes
+`num_render_channels_to_aec = 1` even with stereo detection disabled. The disabled
+detector already reports persistent multichannel content but its update returns
+false, so the constructor never calls `initialize`. Render subframe preparation
+then copies only the left input when temporary detection is false. The new native
+snapshots confirm **one reference channel** for the historical "stereo" control.
+[Upstream WebRTC calls `Initialize()` in its constructor](https://webrtc.googlesource.com/src/+/refs/heads/main/modules/audio_processing/aec3/echo_canceller3.cc),
+which selects the actual channel count from the detector's initial state.
+
+The historical tables below still describe the measured production program;
+"stereo" in those tables means the requested two-channel stream and multichannel
+configuration, not two actual adaptive reference channels. Conclusions about true
+two-reference stereo versus mono cannot be inferred from those old arms. A
+separate diagnostic calls native initialization correctly, keeping all existing
+multichannel tuning unchanged. It is not yet selected for production.
+
+Native AEC3 0.2.0 is vendored with its original license, registry checksum and
+feature-gated snapshots/state controls. The wrapper exports its native 16 kHz
+linear output. Projection of that low-band signal is a diagnostic, not a full-band
+speech score. The post-suppressor output is measured at 48 kHz before AGC. Baseline
+AEC and model outputs reproduce the earlier recorded-speech results.
+
+The candidate already receives the real pre-AEC microphone: `cancel_echo` copies
+the input into `Heard::Microphone` before processing it, and the worker sends that
+copy to AEC3. It is not trained on the far reference as a fake microphone. The
+probe's near talker begins one second before the share, after far-only leading
+audio, which is intentional.
+
+#### First isolated state experiments
+
+Six-second lead, both speaker paths, full denoising and **default AGC on**. Thus
+the cold control has 136 decoded held frames here; the earlier 80 decoded / 112
+manual-gate values used AGC off. All holds count active-input 10 ms frames, not
+necessarily consecutive wall-clock time. `kept` is RMS-based and may include echo;
+full acceptance also requires the quiet-echo tables.
+
+| Native arm | Held decoded frames | Kept | Linear projected gain, 3-8 s dB | Suppressor projected gain, 3-8 s dB | Model projected gain, 8-16 s dB |
+| --- | --- | --- | --- | --- | --- |
+| Cold current (AGC on) | 136 | 0.105 | -2.45 | -8.22 | -35.09 |
+| Warm current (AGC on) | 510 | 0.142 | -2.46 | -8.24 | -70.27 |
+| Reset suppression gain | 510 | 0.145 | -2.46 | -8.24 | -70.23 |
+| Reset ERLE only | 510 | 0.145 | -2.46 | -8.24 | -70.93 |
+| Reset AEC state, keep filters | 409 | 0.167 | -2.49 | -8.29 | -60.17 |
+| Reset gain and ERLE | 510 | 0.167 | -2.46 | -8.24 | -70.89 |
+| Warm, correct two-reference start | 190 | 0.078 | -3.63 | -28.74 | -41.07 |
+| Cold, correct two-reference start | 80 | 0.602 | -2.56 | -2.53 | -5.79 |
+| Warm, two references + gain reset | 129 | 0.084 | -3.63 | -28.74 | -41.10 |
+| Warm, two references + ERLE reset | 131 | 0.049 | -3.63 | -28.74 | -40.59 |
+
+Resetting suppression gain alone or ERLE alone leaves the 510-frame hold. A
+fresh AEC state with the old filters reduces it to 409, still above cold. Correct
+two-reference construction alone is not enough for warm. The cold two-reference
+arm improves recorded-speech output, but its native state enters transparent mode
+and its echo must be measured before considering it a fix.
+
+At 3-8 s, current warm's linear projection is -2.46 dB versus -8.24 dB after the
+suppressor. Current cold's corresponding projections are -2.45 / -8.22 dB: late
+AEC outputs are very similar despite the model's much larger warm loss later.
+The warm/cold difference develops after different takeover histories in the first
+three seconds. Snapshots also show different render-buffer delay estimates:
+56 ms in the warm path and 12 ms in the cold path in this room. Reverb decay stays
+at 0.83 in both, and warmed ERLE rapidly falls after the content changes. These
+observations guide further native residual/reverb/noise/config isolation; they
+do not establish a single cause yet. The model is not modified.
+
+[Complete linear/suppressor snapshots](measurements/aec-linear-suppression.txt)
+include ERL/ERLE, delay, filter delay, gains, nearend/transparent state and powers
+at half-second intervals. Native resets currently execute only in isolated tests;
+any selected production reset must be prepared on the worker to preserve the
+voice-thread heap bound.
+
+#### Recorded-speech matrix: preliminary gate
+
+Native profile 1 disables only the conservative tail-frequency-response envelope;
+it keeps the estimated reverb model and decay. Profile 2 sets the native default
+and nearend reverb decay to zero. Both keep the existing filter, suppression
+attack/release tuning and model. The historical control still has the one-left-
+reference wiring defect described above; correct two-reference arms are separate.
+
+Both profiles pass **all 12** lead (6/10 s), route (headphones/speakers) and
+denoise (0/50/100) cases against the unchanged cold control. With speakers and
+full denoising:
+
+| Lead | Cold hold / kept | Current warm hold / kept | Profile 1 hold / kept | Profile 2 hold / kept | No AEC hold / kept |
+| --- | --- | --- | --- | --- | --- |
+| 6 | 136 / 0.105 | 510 / 0.142 | 93 / 0.243 | 49 / 0.424 | 3 / 0.797 |
+| 10 | 106 / 0.128 | 421 / 0.133 | 81 / 0.193 | 49 / 0.424 | 3 / 0.797 |
+
+The preliminary quiet-echo gate uses 32 half-second windows for each lead on the
+same four-share signal, without AGC or denoising. Profile 1's largest increase
+is +0.062 dB; profile 2's is +0.263 dB. Both meet the +1 dB bound here. Correct
+native two-reference variants fail the speech matrix, including headphones, and
+are not selected. The cold two-reference arm also exceeds the preliminary echo
+bound by 5.02 dB in one first window.
+
+These are preliminary gates. The full #220 echo tables, including broad/wide,
+antiphase, steady holds, delays and levels, are being measured before selecting
+any production change. All observations are preserved in
+[aec-native-speech-matrix.csv](measurements/aec-native-speech-matrix.csv),
+[aec-native-speech-gate.txt](measurements/aec-native-speech-gate.txt) and
+[aec-native-reverb.txt](measurements/aec-native-reverb.txt).
+
+#### Main four-share control
+
+The **unmodified** exact test from main `1099a6817bbbabb9074004000915a3c884262cdd`
+completed all six pairs. It passed the >1,500 sent-frame guards and the <=1 ms p99
+requirement. [Complete control output](measurements/aec-main-four-share.txt).
+
+| Pair/order | No-share p99, ms | Four-share p99, ms | Delta, ms |
+| --- | --- | --- | --- |
+| 0: [0, 4] | 0.349 | 0.444 | +0.096 |
+| 1: [4, 0] | 0.327 | 0.329 | +0.002 |
+| 2: [0, 4] | 0.313 | 0.407 | +0.094 |
+| 3: [4, 0] | 0.376 | 0.346 | -0.030 |
+| 4: [0, 4] | 0.346 | 0.499 | +0.153 |
+| 5: [4, 0] | 0.200 | 0.553 | +0.353 |
+
+Worst delta: +0.353 ms. This run does not reproduce the branch's guard failure;
+that failure remains a branch acceptance issue while the AEC investigation
+continues. The exact benchmark constructs native controls directly, rather than
+loading web settings; its defaults are not proof of the user-facing noiseStrength
+100 path.
+
 ### Independent-talker audit and owner decision (PR #223)
 
 **Owner decision (2026-11-02): retain the current stereo canceller, with echo
