@@ -36,6 +36,7 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { chromium } from "playwright";
 import { installMicPrivacyGuard } from "./mic-privacy.mjs";
+import { sendComposer } from "./composer-actions.mjs";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const webRoot = path.resolve(here, "..");
@@ -340,6 +341,13 @@ const privateState = (page) => page.evaluate(async () => {
     }),
     toasts: useUi.getState().toasts.map(toast => [toast.kind, toast.text]),
     composer: box && { value: box.value, disabled: box.disabled },
+    mls: controller.sealed?.runtime && {
+      statuses: Object.fromEntries(controller.sealed.runtime.statuses),
+      opening: Object.fromEntries(controller.sealed.runtime.openingDms),
+      held: [...controller.sealed.runtime.held],
+      generation: controller.sealed.runtime.generation,
+      activeGeneration: controller.sealed.runtime.activeGeneration,
+    },
   };
 });
 const escapeRe = (t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -771,11 +779,15 @@ async function main() {
   await check("private messages verify in both directions across endpoint aliases, with unread badges", async () => {
     await treeItem(b, /Alice/).dblclick();
     await b.getByRole("tab", { name: "Alice", exact: true, selected: true }).waitFor();
-    await composer(b).fill("psst");
-    // Opening an encrypted conversation can disable the composer again while its group settles.
-    // press() sends a key even then; click() waits for the Send button to be enabled.
-    await b.getByRole("button", { name: "Send message", exact: true }).click();
-    await a.getByRole("tab", { name: /Bob/ }).waitFor();
+    const diagnosed = async (step, action) => {
+      try { return await action(); }
+      catch (error) {
+        for (const [name, page] of [["a", a], ["b", b]]) console.log(`private messages at failure (${step}): ${name}: ${JSON.stringify(await privateState(page).catch(String))}`);
+        throw error;
+      }
+    };
+    await diagnosed("bob sends", () => sendComposer(b, "psst"));
+    await diagnosed("alice gets the tab", () => a.getByRole("tab", { name: /Bob/ }).waitFor());
     await a.getByRole("tab", { name: /Bob 1/ }).waitFor();
     await a.getByRole("tab", { name: /Bob/ }).click();
     await a.getByText("psst").waitFor();
@@ -784,8 +796,7 @@ async function main() {
       const row = page.locator("[data-message]").filter({ hasText: "psst" });
       await waitFor(() => row.getAttribute("data-message-verification").then((v) => v === "verified"), "verified private message");
     }
-    await composer(a).fill(`alias DM reply ${rid}`);
-    await a.getByRole("button", { name: "Send message", exact: true }).click();
+    await diagnosed("alice replies", () => sendComposer(a, `alias DM reply ${rid}`));
     for (const page of [a, b]) {
       const row = page.locator("[data-message]").filter({ hasText: `alias DM reply ${rid}` });
       await row.waitFor();
