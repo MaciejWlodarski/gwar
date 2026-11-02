@@ -382,6 +382,10 @@ RTP times per viewer, so only it can relate them: `screen.audio.sync` returns on
 video RTP time of the same instant for the viewer's slot, taken from the sender reports' shared
 wallclock, or `known: false` until it has them. A viewer asks at each look.
 
+**Sync aims 40 ms late**, the middle of the range nobody notices, 45 ms ahead to 125 ms behind. Aimed
+at zero, a link's ordinary noise keeps crossing the edge sound must not lead past. Every wait below
+is measured from that aim.
+
 **The picture waits.** Sound carries speech, and a picture a few tens of milliseconds later is the
 smaller loss. `jitterBufferTarget` is a minimum, so a wait starts from the delay the receiver
 already has. The first look moves the whole way, since nobody has seen the picture settle; later
@@ -399,8 +403,9 @@ the engine's own sync moves sound; a second controller on the same pair only dro
 A late joiner settles for two looks and starts alone, per slot. A paused picture moves nothing, so
 the waits are still there for the resume, and the next look corrects what the pause changed. Muting
 and deafening release both waits, since nothing heard is left to line up with, and sound coming back
-starts over like a new watch. A server without the query answers once and the viewer does not ask
-again; a webview without `jitterBufferTarget` leaves the picture alone, and the desktop mixer can
+starts over like a new watch. A server without the query answers `bad_request` once and the viewer does not ask
+again; a question lost to a timeout is asked again at the next look, and muting releases the waits
+either way. A webview without `jitterBufferTarget` leaves the picture alone, and the desktop mixer can
 still hold sound.
 
 **A new watch starts together.** Its sound is silent until its first picture is on screen, so
