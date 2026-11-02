@@ -1041,11 +1041,6 @@ impl StreamTx {
             // First handle_timeout sets the kind. No sender report until then.
             return not_happening();
         }
-        if self.rtp_and_wallclock.is_none() {
-            // Gwar: nothing written has no RTP time, and a report saying zero stays in a
-            // receiver's clock estimate for its next twenty reports.
-            return not_happening();
-        }
         self.last_sender_report + intervals.for_audio(self.is_audio())
     }
 
@@ -1127,10 +1122,14 @@ impl StreamTx {
     }
 
     pub(crate) fn create_sr_and_update(&mut self, now: Instant, feedback: &mut VecDeque<Rtcp>) {
-        let sr = self.create_sender_report(now);
+        // Gwar: nothing written has no RTP time, and a report saying zero stays in a receiver's
+        // clock estimate for its next twenty reports. The SDES below keeps the cadence.
+        if self.rtp_and_wallclock.is_some() {
+            let sr = self.create_sender_report(now);
 
-        trace!("Created feedback SR: {:?}", sr);
-        feedback.push_back(Rtcp::SenderReport(sr));
+            trace!("Created feedback SR: {:?}", sr);
+            feedback.push_back(Rtcp::SenderReport(sr));
+        }
 
         if let Some(ds) = self.create_sdes() {
             feedback.push_back(Rtcp::SourceDescription(ds));
@@ -1790,16 +1789,18 @@ mod test {
         let mut stream = StreamTx::new(42.into(), None, MidRid(Mid::from("0"), None), false, 1200);
         let now = Instant::now();
         stream.kind = Some(MediaKind::Audio);
-        let intervals = RtcpReportIntervals {
-            audio: Duration::from_millis(750),
-            video: Duration::from_millis(500),
-        };
+        stream.cname = Some("sound".into());
+        let reported = |feedback: &VecDeque<Rtcp>| feedback.iter().any(|r| matches!(r, Rtcp::SenderReport(_)));
 
-        assert_eq!(stream.sender_report_at(intervals), not_happening());
-        assert!(!stream.need_sr(now, intervals));
+        let mut feedback = VecDeque::new();
+        stream.create_sr_and_update(now, &mut feedback);
+        assert!(!reported(&feedback));
+        assert!(!feedback.is_empty(), "the cadence stays");
 
         stream.rtp_and_wallclock = Some((48_000, now));
-        assert!(stream.need_sr(now, intervals));
+        let mut feedback = VecDeque::new();
+        stream.create_sr_and_update(now, &mut feedback);
+        assert!(reported(&feedback));
     }
 
     #[test]
@@ -1808,7 +1809,6 @@ mod test {
         let now = Instant::now();
         stream.kind = Some(MediaKind::Audio);
         stream.last_sender_report = now;
-        stream.rtp_and_wallclock = Some((0, now));
 
         assert_eq!(
             stream.sender_report_at(RtcpReportIntervals {

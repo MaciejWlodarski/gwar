@@ -255,8 +255,8 @@ and preserves its behavior. Gwar uses this for paired screen receivers so
 libwebrtc negotiates synchronization rather than merely combining tracks in JS.
 The server regression checks both the actual answer and stored media identities.
 
-`StreamTx::sender_report_at` holds sender reports until the first packet is
-written. Upstream reports RTP time zero against the real wall clock on a stream
+`StreamTx::create_sr_and_update` leaves the sender report out until the first packet
+is written, and keeps its SDES so RTCP's cadence is unchanged. Upstream reports RTP time zero against the real wall clock on a stream
 that has sent nothing, so a viewer watching a picture-only share had a run of
 false points in the audio estimate when sound joined; libwebrtc keeps twenty, and
 held the sound back by up to 900 ms for half a minute while they aged out.
