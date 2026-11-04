@@ -142,12 +142,15 @@ const fakeTab = `${sourceScript}
       await window.__toneContext.resume();
       made = { video: canvas.captureStream(60).getVideoTracks()[0], audio: out.stream.getAudioTracks()[0] };
     }
-    const tab = track => {
+    // A tab's capture reports what it applied, as a real one does: the surface, and for its sound
+    // \`restrictOwnAudio\` when it was asked (the app drops tab sound that does not keep its own out).
+    const tab = (track, applied) => {
       const settings = track.getSettings.bind(track);
-      track.getSettings = () => ({ ...settings(), displaySurface: "browser" });
+      track.getSettings = () => ({ ...settings(), displaySurface: "browser", ...applied });
       return track;
     };
-    return new MediaStream([tab(made.video.clone()), ...(options?.audio ? [tab(made.audio.clone())] : [])]);
+    const restrictOwnAudio = typeof options?.audio === "object" && options.audio.restrictOwnAudio === true;
+    return new MediaStream([tab(made.video.clone()), ...(options?.audio ? [tab(made.audio.clone(), restrictOwnAudio ? { restrictOwnAudio } : {})] : [])]);
   };
 })();`;
 
@@ -177,6 +180,15 @@ function viewerPatch() {
     if (watch?.status === "watching") window.__granted ??= Date.now();
     if (watch?.status === "watching" && !watch.soundHeld) { window.__audible = Date.now(); clearInterval(audible); }
   }, 10);
+  /** When the late-frame filter said the link is back (it then asks for a keyframe). */
+  window.__linkBacks = [];
+  window.Worker = new Proxy(window.Worker, {
+    construct(target, args) {
+      const worker = new target(...args);
+      if (args[1]?.name === "gwar-late-frames") worker.addEventListener("message", () => window.__linkBacks.push(Date.now()));
+      return worker;
+    },
+  });
   window.RTCPeerConnection = new Proxy(window.RTCPeerConnection, {
     construct(target, args) { const pc = new target(...args); window.__pcs.push(pc); return pc; },
   });
@@ -399,7 +411,7 @@ async function turnOnSound(sharer, viewers) {
 }
 
 async function viewerRecord(page) {
-  const record = await page.evaluate(() => ({ presented: window.__presented, onsets: window.__onsets, health: window.__health, audible: window.__audible, granted: window.__granted, baseline: window.__baseline }));
+  const record = await page.evaluate(() => ({ presented: window.__presented, onsets: window.__onsets, health: window.__health, audible: window.__audible, granted: window.__granted, baseline: window.__baseline, linkBacks: window.__linkBacks }));
   if (page.native) {
     record.onsets = await page.native.request("speaker_onsets");
     record.mixer = await page.native.request("share_stats");
@@ -462,7 +474,7 @@ async function run() {
       const record = await viewerRecord(page);
       if (process.env.SYNC_OFF) assert.deepEqual(baselineFaults(record.baseline), [], `the ${page.kind} viewer's baseline is not main`);
       const pairs = pairBursts(bursts, record.presented, record.onsets);
-      report.viewers[page.kind] = { summary: offsetSummary(pairs), pairs, onsets: record.onsets, mixer: record.mixer, health: record.health, presented: record.presented, audible: record.audible, granted: record.granted };
+      report.viewers[page.kind] = { summary: offsetSummary(pairs), pairs, onsets: record.onsets, mixer: record.mixer, health: record.health, presented: record.presented, audible: record.audible, granted: record.granted, linkBacks: record.linkBacks };
       console.log(JSON.stringify({ net: netName, viewer: page.kind, ...offsetSummary(pairs), drawn: bursts.length, mixer: record.mixer }));
       console.log(pairs.map(pair => pair.offsetMs.toFixed(0)).join(" "));
     }
