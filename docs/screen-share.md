@@ -331,20 +331,22 @@ decode stays for browser compatibility.
   H.264 viewer beyond the four-second watchdog window trigger share-wide recovery:
   a lower H.264 target, then VP9 when all peers offered it. Reports are limited
   per viewer/share to one every ten seconds; the share has a ten-second hold-down.
-  The browser permits two counted reports per generation, with four-second
-  detection and a retry deadline ten seconds from the same observed stall. The
-  SFU's drops reach the viewer as lost packets, or as a poll with no new packets
-  while the slot waits for a keyframe, and the server ignores the reports they
-  starved. Every such sign starts the count over, even one that comes after a
-  report already went out, and a report counts only when it comes more than ten
-  seconds after the last sign. So a decoder that never decodes is reported again
-  five to sixteen seconds after the last sign, whatever order reports and drops
-  come in, and the server takes that report once the stream has been whole for
-  its window. Only the server tells its own drops from the network's, so while
-  signs keep coming the browser keeps reporting every ten seconds: one request
-  per stalled slot, which the server answers in constant time. Anchoring both to
-  that stall avoids accumulating polling delays across the first report and retry,
-  which could otherwise exceed the corroboration window during replacement.
+  The browser has no report budget. A decoder that receives packets and decodes
+  nothing for four seconds is reported then and every ten seconds after, until it
+  decodes, its packets stop, or the slot's generation changes because the server
+  isolated it or fell back; a new stall never brings a report closer than ten
+  seconds to the last one. The viewer cannot see the SFU's drops (a gap's lost
+  packets can be balanced by duplicates), so it does not try: the server ignores
+  a report from a slot not yet whole for its window in constant time, and takes
+  the first one after. A decoder that never decodes therefore has a report taken
+  at most 4 s + 10 s + one stats poll (1 s) after the slot becomes whole, plus
+  the report's transit; the viewer is isolated two seconds later, or the share
+  falls back at once. If the viewer's previous report was taken less than ten
+  seconds before, the server's throttle can hold it back one more step. Deadlines
+  run from the stall, not from each rounded poll: viewers that stalled together
+  on a replacement keyframe report within one poll of each other, inside the
+  server's two-second corroboration window, where rounded polls would otherwise
+  add up past it.
   Watch slots survive replacement, old-publisher packets drop, and the replacement
   keyframe opens the retained slots. Restore H.264 after reporters leave or two
   minutes, then hold for a minute before another downgrade. A3/B11a own native
