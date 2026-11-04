@@ -136,6 +136,60 @@ describe("one prepared suppression pipeline", () => {
     expect(raws[0]!.outputs).toHaveLength(0);
   });
 
+  it("lends a cold preparation straight to the call that waits for it, without suspending and resuming it", async () => {
+    pool.configure(true, true);
+    const borrowed = await acquire(), raw = raws[0]!;
+    expect(raw.park).not.toHaveBeenCalled();
+    expect(raw.wake).not.toHaveBeenCalled();
+    expect(borrowed.track).toBe(raw.track);
+    expect(borrowed.track.enabled).toBe(true);
+    borrowed.close(); await flush();
+    expect(raw.park).toHaveBeenCalledOnce();
+    expect(pool.status().state).toBe("ready");
+    (await acquire()).close();
+    expect(raw.wake).toHaveBeenCalledOnce();
+  });
+
+  it("lends an idle preparation that a call joined before it finished without suspending it", async () => {
+    const ready = deferred<PreparedDenoise>(), raw = pipeline();
+    create.mockReturnValueOnce(ready.promise);
+    pool.configure(true, true); await idle();
+    const next = acquire();
+    ready.resolve(raw as unknown as PreparedDenoise);
+    const borrowed = await next;
+    expect(raw.park).not.toHaveBeenCalled();
+    expect(raw.wake).not.toHaveBeenCalled();
+    borrowed.close();
+  });
+
+  it("parks a lent cold preparation whose call left before it was delivered", async () => {
+    const ready = deferred<PreparedDenoise>(), raw = pipeline();
+    create.mockReturnValueOnce(ready.promise);
+    pool.configure(true, true);
+    const abort = new AbortController(), pending = acquire(events(), abort.signal);
+    ready.resolve(raw as unknown as PreparedDenoise);
+    await Promise.resolve(); await Promise.resolve();
+    abort.abort(new Error("left"));
+    await expect(pending).rejects.toThrow("left");
+    await flush();
+    expect(raw.park).toHaveBeenCalledOnce();
+    expect(pool.status()).toMatchObject({ state: "ready", idleRunning: false });
+  });
+
+  it("tells a waiting call why its preparation failed", async () => {
+    create.mockRejectedValueOnce(new Error("too slow: 6.0 ms a frame"));
+    pool.configure(true, true);
+    await expect(acquire()).rejects.toThrow("too slow: 6.0 ms a frame");
+  });
+
+  it("tells a waking call why its prepared runtime failed", async () => {
+    pool.configure(true, true); await idle();
+    const waking = deferred<void>(); raws[0]!.wake.mockReturnValueOnce(waking.promise);
+    const pending = acquire(); await flush();
+    reports[0]!.trouble("the worklet failed");
+    await expect(pending).rejects.toThrow("the worklet failed");
+  });
+
   it("does not retry a busy idle warm-up repeatedly or poison the next explicit call", async () => {
     create.mockRejectedValueOnce(new Error("too slow: 6.0 ms a frame"));
     pool.configure(true, true); await idle();

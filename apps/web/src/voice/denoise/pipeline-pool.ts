@@ -4,6 +4,10 @@ interface Entry {
   active: boolean;
   ready: boolean;
   clearing: boolean;
+  /** Running and unparked: lent straight to the call that waited for its preparation. */
+  awake: boolean;
+  /** Why it was destroyed, for a call still waiting on it. */
+  reason: Error | null;
   abort: AbortController;
   raw: PreparedDenoise | null;
   promise: Promise<PreparedDenoise>;
@@ -54,6 +58,7 @@ export class PipelinePool {
   private destroy(entry: Entry): void {
     if (!entry.active) return;
     entry.active = false; entry.events = null;
+    entry.reason ??= new Error("the prepared pipeline was released");
     entry.stopTrack?.(); entry.stopTrack = null;
     if (this.spare === entry) this.spare = null;
     this.entries.delete(entry);
@@ -62,19 +67,24 @@ export class PipelinePool {
 
   private make(): Entry {
     this.attempted = true; this.preparationError = null;
-    const entry: Entry = { active: true, ready: false, clearing: false, abort: new AbortController(), raw: null, promise: null!, events: null, stopTrack: null };
+    const entry: Entry = { active: true, ready: false, clearing: false, awake: false, reason: null, abort: new AbortController(), raw: null, promise: null!, events: null, stopTrack: null };
     this.entries.add(entry);
     entry.promise = Promise.resolve().then(() => this.create({
       changed: () => { if (entry.active) entry.events?.changed(); },
       trouble: reason => {
         if (!entry.active) return;
         const events = entry.events;
+        entry.reason = new Error(reason);
         this.destroy(entry);
         events?.trouble(reason);
       },
     }, entry.abort.signal)).then(async raw => {
       if (!entry.active) { raw.close(); throw new Error("the prepared pipeline was released"); }
       entry.raw = raw;
+      // A call waits for this preparation: its warmed, running context is the call's as it is.
+      // Suspending and resuming it in between would only delay the call (WebKit's audio
+      // device takes tens of ms each way).
+      if (entry.events) { entry.ready = true; entry.awake = true; return raw; }
       raw.track.enabled = false;
       await raw.park();
       if (!entry.active) throw new Error("the prepared pipeline was released");
@@ -82,6 +92,7 @@ export class PipelinePool {
       return raw;
     });
     void entry.promise.catch(error => {
+      if (entry.active) entry.reason = error instanceof Error ? error : new Error(String(error));
       if (entry.active) this.preparationError = String(error);
       // Login can briefly be busy. An idle failure must not permanently disable a later call.
       if (entry.active && entry.events && String(error).includes("too slow:")) { this.failure = String(error); this.unusable(); }
@@ -108,9 +119,9 @@ export class PipelinePool {
       stopTrack(); entry.stopTrack = null; entry.events = null;
       if (!entry.active) return;
       if (!this.enabled || !this.online || this.spare || this.entries.size > 1) { this.destroy(entry); return; }
-      if (delivered || waking) {
+      if (delivered || waking || entry.awake) {
         entry.clearing = true;
-        entry.promise = (waking ?? entry.promise).then(async raw => { await raw.park(); entry.clearing = false; return raw; });
+        entry.promise = (waking ?? entry.promise).then(async raw => { await raw.park(); entry.awake = false; entry.clearing = false; return raw; });
         void entry.promise.catch(() => this.destroy(entry));
       }
       this.spare = entry;
@@ -119,10 +130,11 @@ export class PipelinePool {
       const raw = await new Promise<PreparedDenoise>((resolve, reject) => {
         const clean = () => { signal.removeEventListener("abort", abort); entry.abort.signal.removeEventListener("abort", retired); };
         const abort = () => { clean(); release(); reject(signal.reason); };
-        const retired = () => { clean(); release(); reject(new Error("the prepared pipeline was released")); };
+        const retired = () => { clean(); release(); reject(entry.reason); };
         entry.promise.then(value => {
           signal.throwIfAborted();
-          waking = value.wake().then(() => value);
+          if (entry.awake) return value;
+          waking = value.wake().then(() => { entry.awake = true; return value; });
           return waking;
         })
           .then(value => { clean(); resolve(value); }, error => { clean(); reject(error); });
