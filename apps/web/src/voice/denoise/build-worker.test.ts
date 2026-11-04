@@ -82,6 +82,14 @@ describe("the model worker's pristine snapshot", () => {
     expect(port.sent.filter(m => m.type === "memory")).toHaveLength(9);
   });
 
+  it("builds from fresh downloads without waiting for the Cache API to keep them", async () => {
+    const put = vi.fn(() => new Promise<void>(() => {}));
+    vi.stubGlobal("caches", { open: async () => ({ match: async () => undefined, put, keys: async () => [], delete: vi.fn() }) });
+    await ready();
+    expect(put).toHaveBeenCalledTimes(2);
+    expect(buildModel).toHaveBeenCalledOnce();
+  });
+
   it("detaches a cancelled copy without cancelling another copy or destroying the cache", async () => {
     await ready();
     const a = new Port(), b = new Port(); attach(1, a); attach(2, b);

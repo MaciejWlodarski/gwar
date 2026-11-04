@@ -98,13 +98,16 @@ describe("the shared denoise model", () => {
     expect(cache.status().state).toBe("ready");
   });
 
-  it("disabling during asset resolution prevents the retired worker from starting", async () => {
+  it("starts the worker while the asset URLs resolve, and disabling meanwhile retires it unstarted", async () => {
     let resolve!: (value: { code: string; archive: string; worklet: string }) => void;
     assets.mockReturnValueOnce(new Promise(yes => { resolve = yes; }));
     cache.configure(true, true); idle();
+    expect(builders).toHaveLength(1);
     cache.configure(false, true);
+    expect(builders[0]!.terminate).toHaveBeenCalledOnce();
     resolve({ code: "wasm", archive: "model", worklet: "worklet" }); await flush();
-    expect(builders).toHaveLength(0);
+    expect(builders).toHaveLength(1);
+    expect(builders[0]!.posted).toEqual([]);
   });
 
   it("aborts a waiting caller promptly without cancelling another caller's build", async () => {

@@ -85,8 +85,8 @@ export class ModelCache {
 
   private async start(entry: Entry): Promise<void> {
     try {
-      const assets = await this.host.assets();
-      if (!entry.active) return;
+      if (import.meta.env.MODE === "desktop") throw new Error("not in the desktop app");
+      // The worker's own script loads while the asset URLs resolve.
       const worker = this.host.worker();
       entry.worker = worker;
       this.builds++;
@@ -101,6 +101,8 @@ export class ModelCache {
         event.preventDefault();
         this.fail(entry, event.message || "the model could not be built");
       };
+      const assets = await this.host.assets();
+      if (!entry.active) return;
       worker.postMessage({ type: "build", code: assets.code, archive: assets.archive, sha256: pin.sha256, cache: "gwar-denoise" } satisfies Build);
       entry.initialize({ worker, worklet: assets.worklet });
     } catch (error) { this.fail(entry, error instanceof Error ? error.message : String(error)); }

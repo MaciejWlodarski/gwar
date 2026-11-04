@@ -30,7 +30,8 @@ async function asset(cache: Cache | null, url: string, hash?: string): Promise<A
   if (!response.ok) throw new Error(`${url}: HTTP ${response.status}`);
   const bytes = await response.arrayBuffer();
   if (hash && (await sha256(bytes)) !== hash) throw new Error(`${url}: not the pinned model`);
-  await cache?.put(url, new Response(bytes.slice(0), { headers: { "content-type": response.headers.get("content-type") ?? "application/octet-stream" } })).catch(() => {});
+  // Kept for the next load while this one builds: the disk write is not on the way to a call.
+  void cache?.put(url, new Response(bytes.slice(0), { headers: { "content-type": response.headers.get("content-type") ?? "application/octet-stream" } })).catch(() => {});
   return bytes;
 }
 
