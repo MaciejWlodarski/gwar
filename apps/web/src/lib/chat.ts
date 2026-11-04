@@ -61,12 +61,19 @@ export type FailedPlace = { key: string; at: number; after?: string };
 
 /** Rows for a thread's raw items, of which only `visible` ones are shown, and its failed sends. A send's
  *  anchor is a raw item; it resolves to the nearest shown item at or above it, so an anchor that is hidden
- *  (at send time or later) still keeps the card below what was on screen. */
+ *  (at send time or later), or deleted, still keeps the card below what was on screen. */
 export function threadRows(raw: ChatItem[], visible: (item: ChatItem) => boolean, failed: FailedPlace[]): Row[] {
   const shown = raw.filter(visible);
   const keys = new Set(shown.map(i => i.key));
+  // A deleted anchor message is gone from `raw`; messages are ordered by id, so the last one at or below
+  // its id takes its place.
+  const position = (after: string) => {
+    const at = raw.findIndex(r => r.key === after);
+    const id = at < 0 ? /^m(\d+)$/.exec(after)?.[1] : undefined;
+    return id === undefined ? at : raw.findLastIndex(r => r.kind === "msg" && r.msg.id <= Number(id));
+  };
   const anchor = (after: string | undefined) => {
-    for (let i = after === undefined ? -1 : raw.findIndex(r => r.key === after); i >= 0; i--) {
+    for (let i = after === undefined ? -1 : position(after); i >= 0; i--) {
       if (keys.has(raw[i]!.key)) return raw[i]!.key;
     }
     return undefined;

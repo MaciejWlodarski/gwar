@@ -81,6 +81,11 @@ describe("threadRows", () => {
     const rows = threadRows(raw, i => i.key !== "m1", [{ key: "failed:1", at: base + 1000, after: "m1" }]);
     expect(keys(rows)).toEqual(["day", "failed:1", "m2"]);
   });
+  it("keeps the card below what was shown when its anchor message is deleted", () => {
+    const raw = [signed(1, base, base + 59_000), signed(3, base + 2000, base + 61_000)];
+    const rows = threadRows(raw, () => true, [{ key: "failed:1", at: base + 1000, after: "m2" }]);
+    expect(keys(rows)).toEqual(["day", "m1", "failed:1", "m3"]);
+  });
 });
 
 describe("unreadLabel", () => {
