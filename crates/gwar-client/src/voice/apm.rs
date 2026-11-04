@@ -2509,8 +2509,9 @@ mod tests {
     /// session that never pinned, `cold` the canceller that starts learning at the pin and `warm`
     /// the one that has been listening. `worst` is the room furthest above `stay`, in dB.
     #[test]
-    #[ignore = "a comparison, run in release"]
+    #[ignore = "a comparison, run in release, single-threaded"]
     fn the_warmed_switch_against_cold_and_staying_mono() {
+        let _scope = measurement_scope();
         let second = RATE;
         let windows: Vec<(usize, usize)> = (0..8).map(|at| (at, at + 1)).chain([(8, 12), (12, 16), (16, 24)]).collect();
         for before in [6, 20] {
@@ -2673,8 +2674,9 @@ mod tests {
     /// the 140 s where it stops moving, so on one held note: the one case found that still leaks.
     /// `speakers` is mid and side music-like sound where both speakers reach the microphone.
     #[test]
-    #[ignore = "a comparison, run in release"]
+    #[ignore = "a comparison, run in release, single-threaded"]
     fn the_wide_leak_cold_and_warm() {
+        let _scope = measurement_scope();
         let second = RATE;
         let windows = [(0, 1), (1, 2), (2, 4), (4, 6), (6, 8), (8, 12), (12, 16), (16, 24), (32, 48)];
         let show = |name: String, pin: usize, cold: &[f32], warm: &[f32], far: &[[f32; 2]], echo: &[f32]| {

@@ -102,7 +102,9 @@ Sonora exposes both settings, and `zero_nearend_reverb_decay` when it exposes
 public config. The measurement hooks exist only for the PR #223 studies and the
 two-reference follow-up; drop them, and the vendored `sonora-aec3`, once that
 follow-up is decided and no committed measurement needs to be regenerated. When
-rebasing on a new upstream release, re-apply only the `Gwar:` changes and the
+rebasing on a new upstream release, re-apply only the `Gwar:` changes, the P7
+`zero_nearend_reverb_decay` switch (`src/config.rs` field and its
+`ep_strength.nearend_len = 0` block in `src/audio_processing_impl.rs`) and the
 feature-gated hooks above, then rerun `voice_alone_is_mains_canceller_to_the_bit`,
 both voice-alone fingerprints and the shipped P7 gates in
 `docs/share-audio-validation.md`.
