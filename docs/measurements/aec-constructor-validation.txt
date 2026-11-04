@@ -1,0 +1,70 @@
+Before: native disabled-detection regression, ignored test explicitly selected.
+After: all echo_canceller3 wrapper tests, regression active.
+Offline release, nice -n 10, no audio devices.
+
+BEFORE
+     Locking 25 packages to highest Rust 1.91 compatible versions
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.27
+   Compiling quote v1.0.47
+   Compiling unicode-xid v0.2.6
+   Compiling once_cell v1.21.4
+   Compiling sonora-fft v0.2.0
+   Compiling sonora-simd v0.2.0
+   Compiling tracing-core v0.1.36
+   Compiling pin-project-lite v0.2.17
+   Compiling sonora-ns v0.2.0
+   Compiling syn v2.0.119
+   Compiling syn v3.0.9
+   Compiling bytemuck_derive v1.12.1
+   Compiling bytemuck v1.25.2
+   Compiling derive_more-impl v2.1.1
+   Compiling tracing-attributes v0.1.31
+   Compiling tracing v0.1.44
+   Compiling derive_more v2.1.1
+   Compiling sonora-common-audio v0.2.0
+   Compiling sonora-aec3 v0.2.0 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/vendor/sonora-aec3)
+   Compiling sonora-agc2 v0.2.0
+   Compiling sonora v0.2.0 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/vendor/sonora)
+    Finished `release` profile [optimized] target(s) in 10.10s
+     Running unittests src/lib.rs (/tmp/gwar-aec-sol/release/deps/sonora-b8d0dbe82421ed51)
+
+running 1 test
+test echo_canceller3::tests::disabled_detection_must_keep_all_render_reference_channels ...
+thread 'echo_canceller3::tests::disabled_detection_must_keep_all_render_reference_channels' (46068503) panicked at src/echo_canceller3.rs:769:9:
+assertion `left == right` failed
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    echo_canceller3::tests::disabled_detection_must_keep_all_render_reference_channels
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 198 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`
+
+AFTER
+   Compiling sonora v0.2.0 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/vendor/sonora)
+    Finished `release` profile [optimized] target(s) in 1.64s
+     Running unittests src/lib.rs (/tmp/gwar-aec-sol/release/deps/sonora-b8d0dbe82421ed51)
+
+running 13 tests
+test echo_canceller3::tests::analyze_and_process_mono_16khz ... ok
+test echo_canceller3::tests::analyze_and_process_mono_48khz ... ok
+test echo_canceller3::tests::block_delay_buffer_basic ... ok
+test echo_canceller3::tests::block_delay_buffer_zero_delay ... ok
+test echo_canceller3::tests::construct_default_config_16khz ... ok
+test echo_canceller3::tests::construct_default_config_48khz ... ok
+test echo_canceller3::tests::construct_stereo ... ok
+test echo_canceller3::tests::disabled_detection_must_keep_all_render_reference_channels ... ok
+test echo_canceller3::tests::get_metrics_returns_valid ... ok
+test echo_canceller3::tests::saturation_detection ... ok
+test echo_canceller3::tests::set_audio_buffer_delay ... ok
+test echo_canceller3::tests::set_capture_output_usage ... ok
+test echo_canceller3::tests::stereo_content_detection ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 186 filtered out; finished in 0.00s

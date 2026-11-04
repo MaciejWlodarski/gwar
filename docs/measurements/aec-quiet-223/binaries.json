@@ -1,0 +1,14 @@
+{
+  "head": {
+    "sha": "7699190642dc4ff737f7218a22ce1a319902c7fc",
+    "cwd": "<PR checkout>",
+    "binary": "/private/tmp/gwar-aec223-iMGI/targets/head/release/deps/gwar_client-63cb5b99089087a9",
+    "target": "/private/tmp/gwar-aec223-iMGI/targets/head"
+  },
+  "main": {
+    "sha": "6c1c45c9d677b63f6b61ba25a91fcd997a014ca1",
+    "cwd": "/private/tmp/gwar-aec223-iMGI/main",
+    "binary": "/private/tmp/gwar-aec223-iMGI/targets/main/release/deps/gwar_client-d75cd4dd4994a192",
+    "target": "/private/tmp/gwar-aec223-iMGI/targets/main"
+  }
+}

@@ -1,0 +1,139 @@
+PR #223 final-head validation, 2026-11-04, head 7699190642dc4ff737f7218a22ce1a319902c7fc (main 6c1c45c9 merged).
+Release dev-feature test binary from build-aec-pair.py; actual nice 10, CARGO_BUILD_JOBS=4; virtual devices only.
+
+## Gate start/end, exit codes and load
+== fingerprint start 2026-11-04T21:28:57Z 22:28  up  9:52, 1 user, load averages: 1.68 2.95 3.95
+== fingerprint rc=0 end 2026-11-04T21:28:58Z 22:28  up  9:52, 1 user, load averages: 1.68 2.95 3.95
+== heap start 2026-11-04T21:28:58Z 22:28  up  9:52, 1 user, load averages: 1.68 2.95 3.95
+== heap rc=0 end 2026-11-04T21:28:59Z 22:28  up  9:52, 1 user, load averages: 1.68 2.95 3.95
+== speech start 2026-11-04T21:28:59Z 22:28  up  9:52, 1 user, load averages: 1.68 2.95 3.95
+== speech rc=0 end 2026-11-04T21:29:47Z 22:29  up  9:53, 1 user, load averages: 1.78 2.77 3.82
+== echo start 2026-11-04T21:29:47Z 22:29  up  9:53, 1 user, load averages: 1.78 2.77 3.82
+== echo rc=0 end 2026-11-04T21:33:19Z 22:33  up  9:57, 1 user, load averages: 4.71 3.40 3.82
+== routes start 2026-11-04T21:33:19Z 22:33  up  9:57, 1 user, load averages: 4.71 3.40 3.82
+== routes rc=0 end 2026-11-04T21:36:55Z 22:36  up 10 hrs, 1 user, load averages: 5.14 4.71 4.29
+== apm_release start 2026-11-04T21:36:55Z 22:36  up 10 hrs, 1 user, load averages: 5.14 4.71 4.29
+== apm_release rc=0 end 2026-11-04T21:37:06Z 22:37  up 10 hrs, 1 user, load averages: 4.58 4.60 4.26
+== lowbw start 2026-11-04T21:37:06Z 22:37  up 10 hrs, 1 user, load averages: 4.58 4.60 4.26
+== lowbw rc=0 end 2026-11-04T21:39:41Z 22:39  up 10:03, 1 user, load averages: 5.10 4.84 4.41
+== check_featureless start 2026-11-04T21:39:41Z 22:39  up 10:03, 1 user, load averages: 5.10 4.84 4.41
+== check_featureless rc=0 end 2026-11-04T21:40:23Z 22:40  up 10:04, 1 user, load averages: 5.94 5.08 4.52
+== tree start 2026-11-04T21:40:23Z 22:40  up 10:04, 1 user, load averages: 5.94 5.08 4.52
+== tree rc=0 end 2026-11-04T21:40:23Z 22:40  up 10:04, 1 user, load averages: 5.87 5.08 4.52
+== fmt start 2026-11-04T21:40:23Z 22:40  up 10:04, 1 user, load averages: 5.87 5.08 4.52
+== fmt rc=0 end 2026-11-04T21:40:25Z 22:40  up 10:04, 1 user, load averages: 5.87 5.08 4.52
+== clippy start 2026-11-04T21:40:25Z 22:40  up 10:04, 1 user, load averages: 5.87 5.08 4.52
+== clippy rc=0 end 2026-11-04T21:43:30Z 22:43  up 10:07, 1 user, load averages: 7.37 6.08 5.04
+== workspace start 2026-11-04T21:43:30Z 22:43  up 10:07, 1 user, load averages: 7.37 6.08 5.04
+== workspace rc=0 end 2026-11-04T22:05:35Z 23:05  up 10:29, 1 user, load averages: 3.13 3.21 4.21
+== sonora_constructor start 2026-11-04T22:05:35Z 23:05  up 10:29, 1 user, load averages: 3.13 3.21 4.21
+== sonora_constructor rc=0 end 2026-11-04T22:05:41Z 23:05  up 10:29, 1 user, load averages: 3.04 3.19 4.20
+ALLDONE
+
+## Fingerprints
+test voice::apm::tests::voice_alone_fingerprint ... voice alone fingerprint c2d868db7d8d0eeb
+test voice::apm::tests::warmed_voice_alone_fingerprint ... warmed voice alone fingerprint c2d868db7d8d0eeb
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 397 filtered out; finished in 1.44s
+
+## Heap guards
+test voice::apm::tests::a_refused_candidate_never_touches_the_heap_on_the_voice_thread ... ok
+test voice::apm::tests::replacing_a_warmed_canceller_adds_nothing_to_the_heap_on_the_voice_thread ... ok
+test voice::apm::tests::the_warmed_way_to_stereo_never_touches_the_heap_on_the_voice_thread ... ok
+test voice::apm::tests::the_way_to_stereo_never_touches_the_heap_on_the_voice_thread ... heap trips a frame: mono 98, both while learning 174, stereo 98
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 395 filtered out; finished in 0.34s
+
+## Release APM
+test result: ok. 53 passed; 0 failed; 32 ignored; 0 measured; 314 filtered out; finished in 11.40s
+
+## Speech matrix (shipped-speech lines)
+test voice::apm::tests::tones::recorded_speech_is_not_held_after_stereo ... shipped-speech,lead=6,echo=false,noise=0,cold-hold=25,cold-kept=0.73679656,hold=25,kept=0.73593074,active=1155,cold-kept-frames=851,kept-frames=850,approved-frame-exception=1
+shipped-speech,lead=6,echo=false,noise=50,cold-hold=37,cold-kept=0.7125541,hold=37,kept=0.7134199,active=1155,cold-kept-frames=823,kept-frames=824,approved-frame-exception=0
+shipped-speech,lead=6,echo=false,noise=100,cold-hold=37,cold-kept=0.7134199,hold=37,kept=0.71428573,active=1155,cold-kept-frames=824,kept-frames=825,approved-frame-exception=0
+shipped-speech,lead=6,echo=true,noise=0,cold-hold=49,cold-kept=0.83549786,hold=0,kept=1,active=1155,cold-kept-frames=965,kept-frames=1155,approved-frame-exception=0
+shipped-speech,lead=6,echo=true,noise=50,cold-hold=70,cold-kept=0.27705628,hold=0,kept=0.6121212,active=1155,cold-kept-frames=320,kept-frames=707,approved-frame-exception=0
+shipped-speech,lead=6,echo=true,noise=100,cold-hold=136,cold-kept=0.104761906,hold=49,kept=0.42164502,active=1155,cold-kept-frames=121,kept-frames=487,approved-frame-exception=0
+shipped-speech,lead=10,echo=false,noise=0,cold-hold=84,cold-kept=0.6883117,hold=79,kept=0.6926407,active=1155,cold-kept-frames=795,kept-frames=800,approved-frame-exception=0
+shipped-speech,lead=10,echo=false,noise=50,cold-hold=84,cold-kept=0.66233766,hold=79,kept=0.66753244,active=1155,cold-kept-frames=765,kept-frames=771,approved-frame-exception=0
+shipped-speech,lead=10,echo=false,noise=100,cold-hold=84,cold-kept=0.6606061,hold=79,kept=0.66839826,active=1155,cold-kept-frames=763,kept-frames=772,approved-frame-exception=0
+shipped-speech,lead=10,echo=true,noise=0,cold-hold=93,cold-kept=0.8484849,hold=0,kept=1,active=1155,cold-kept-frames=980,kept-frames=1155,approved-frame-exception=0
+shipped-speech,lead=10,echo=true,noise=50,cold-hold=105,cold-kept=0.3073593,hold=0,kept=0.6103896,active=1155,cold-kept-frames=355,kept-frames=705,approved-frame-exception=0
+shipped-speech,lead=10,echo=true,noise=100,cold-hold=106,cold-kept=0.12813853,hold=49,kept=0.425974,active=1155,cold-kept-frames=148,kept-frames=492,approved-frame-exception=0
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 48.62s
+
+## Echo
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 211.31s
+
+## Route gaps
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 398 filtered out; finished in 216.26s
+
+## Regenerated CSVs from these outputs (summarize-aec-shipped.py in a scratch copy)
+Echo: {'windows': 549, 'over_1db': 6, 'over_3db': 2, 'over_6db': 0, 'worst_db': 4.61456871, 'baseline_energy_fs2_s': 0.004001022865927848, 'energy_fs2_s': 0.004190205612532646, 'total_energy_delta_db': 0.20064300842624447}
+in charge, then headphones main-unreported misses 25 / 108 worst delta -0.07499998800000007
+in charge, then headphones cold misses 45 / 108 worst delta -0.18296527900000004
+warming, headphones 8 s before the share main-unreported misses 11 / 108 worst delta -0.0625
+warming, headphones 8 s before the share cold misses 58 / 108 worst delta -0.32500004799999993
+warming, headphones 3 s before the share main-unreported misses 22 / 108 worst delta -0.08750000600000002
+warming, headphones 3 s before the share cold misses 73 / 108 worst delta -0.462500006
+in charge, then another room main-unreported misses 108 / 135 worst delta 30.125724792999996
+in charge, then another room cold misses 78 / 135 worst delta 16.138828278
+byte-identical to committed aec-shipped-speech.csv
+byte-identical to committed aec-shipped-echo.csv
+byte-identical to committed aec-shipped-echo-summary.csv
+byte-identical to committed aec-shipped-routes.csv
+byte-identical to committed aec-shipped-route-means.csv
+
+## 1 Mb/s and 500 kb/s voice p99
+500000 bps, 1 ms, video=false: voice p99=0.018048s
+500000 bps, 1 ms, video=true: voice p99=0.018048s
+500000 bps, 5 ms, video=false: voice p99=0.018048s
+500000 bps, 5 ms, video=true: voice p99=0.018048s
+500000 bps, 10 ms, video=false: voice p99=0.018048s
+500000 bps, 10 ms, video=true: voice p99=0.018048s
+1000000 bps, 1 ms, video=false: voice p99=0.009048s
+1000000 bps, 1 ms, video=true: voice p99=0.009144s
+1000000 bps, 5 ms, video=false: voice p99=0.009048s
+1000000 bps, 5 ms, video=true: voice p99=0.009288s
+1000000 bps, 10 ms, video=false: voice p99=0.009048s
+1000000 bps, 10 ms, video=true: voice p99=0.009288s
+2000000 bps, 1 ms, video=false: voice p99=0.009024s
+2000000 bps, 1 ms, video=true: voice p99=0.004512s
+2000000 bps, 5 ms, video=false: voice p99=0.009024s
+2000000 bps, 5 ms, video=true: voice p99=0.004512s
+2000000 bps, 10 ms, video=false: voice p99=0.009024s
+2000000 bps, 10 ms, video=true: voice p99=0.009024s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 538 filtered out; finished in 0.01s
+
+## Featureless graph (lines naming sonora or gwar-denoise; no measurement feature)
+gwar-client v0.1.2 (crates/gwar-client) deep-filter,default
+│   ├── sonora-aec3 v0.2.0 (vendor/sonora-aec3) 
+├── gwar-denoise v0.1.0 (crates/gwar-denoise) embedded-model,model
+├── sonora v0.2.0 (vendor/sonora) 
+measurement features in normal/build graph: 0
+
+## Featureless release check
+    Finished `release` profile [optimized] target(s) in 41.32s
+
+## fmt
+cargo fmt --all --check: exit 0, no output:        0 bytes
+
+## clippy
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3m 05s
+
+## Workspace tests
+passed 1498 failed 0 ignored 51
+
+## Standalone Sonora echo_canceller3 tests (measurement feature)
+test echo_canceller3::tests::analyze_and_process_mono_16khz ... ok
+test echo_canceller3::tests::analyze_and_process_mono_48khz ... ok
+test echo_canceller3::tests::block_delay_buffer_basic ... ok
+test echo_canceller3::tests::block_delay_buffer_zero_delay ... ok
+test echo_canceller3::tests::construct_default_config_16khz ... ok
+test echo_canceller3::tests::construct_default_config_48khz ... ok
+test echo_canceller3::tests::construct_stereo ... ok
+test echo_canceller3::tests::disabled_detection_must_keep_all_render_reference_channels ... ok
+test echo_canceller3::tests::get_metrics_returns_valid ... ok
+test echo_canceller3::tests::saturation_detection ... ok
+test echo_canceller3::tests::set_audio_buffer_delay ... ok
+test echo_canceller3::tests::set_capture_output_usage ... ok
+test echo_canceller3::tests::stereo_content_detection ... ok
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 186 filtered out; finished in 0.00s

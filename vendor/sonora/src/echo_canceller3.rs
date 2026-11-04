@@ -429,6 +429,26 @@ impl EchoCanceller3 {
         }
     }
 
+    /// Upstream constructor behavior, isolated until the two-reference follow-up is accepted.
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub(crate) fn new_initialized_for_measurement(
+        config: EchoCanceller3Config,
+        multichannel_config: Option<EchoCanceller3Config>,
+        sample_rate_hz: usize,
+        num_render_channels: usize,
+        num_capture_channels: usize,
+    ) -> Self {
+        let mut canceller = Self::new(
+            config,
+            multichannel_config,
+            sample_rate_hz,
+            num_render_channels,
+            num_capture_channels,
+        );
+        canceller.initialize();
+        canceller
+    }
+
     /// Re-initializes internal state (called when stereo content changes).
     fn initialize(&mut self) {
         self.num_render_channels_to_aec = if self
@@ -521,6 +541,8 @@ impl EchoCanceller3 {
             .multichannel_content_detector
             .is_temporary_multi_channel_content_detected();
 
+        #[cfg(feature = "gwar-aec-measurements")]
+        let mut linear_output = linear_output;
         // Process two sub-frames (0 and 1).
         for sub_frame_idx in 0..2 {
             self.process_capture_sub_frame(
@@ -530,6 +552,13 @@ impl EchoCanceller3 {
                 aec_reference_is_downmixed_stereo,
                 sub_frame_idx,
             );
+            #[cfg(feature = "gwar-aec-measurements")]
+            if let (Some(output), Some(view)) = (
+                linear_output.as_deref_mut(),
+                &self.linear_output_sub_frame_view,
+            ) {
+                write_sub_frame_to_audio_buffer(view, sub_frame_idx, output);
+            }
         }
 
         // Process any remaining block from the capture blocker.
@@ -698,6 +727,29 @@ impl EchoCanceller3 {
         }
     }
 
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub(crate) fn measurement(&self) -> sonora_aec3::measurement::Measurement {
+        self.block_processor.measurement()
+    }
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub(crate) fn measurement_restart_nonlinear(&mut self, mode: u8) {
+        self.block_processor.measurement_restart_nonlinear(mode);
+    }
+    /// Reconstruct pre-fix channel wiring before any frame, for historical controls only.
+    #[cfg(feature = "gwar-aec-measurements")]
+    pub(crate) fn measurement_restore_left_reference(&mut self) {
+        self.num_render_channels_to_aec = 1;
+        self.render_block.set_num_channels(1);
+        self.render_blocker = FrameBlocker::new(self.num_bands, 1);
+        self.block_processor = BlockProcessor::new(
+            self.config_selector.active_config(),
+            self.sample_rate_hz,
+            1,
+            self.num_capture_channels,
+        );
+        self.render_sub_frame_view = vec![vec![vec![0.0; SUB_FRAME_LENGTH]]; self.num_bands];
+    }
+
     /// Collects current metrics from the echo canceller.
     pub(crate) fn get_metrics(&self) -> BlockProcessorMetricsOutput {
         self.block_processor.get_metrics()
@@ -739,6 +791,15 @@ mod tests {
             num_channels,
             sample_rate_hz,
         )
+    }
+
+    #[test]
+    #[cfg(feature = "gwar-aec-measurements")]
+    fn disabled_detection_must_keep_all_render_reference_channels() {
+        let mut config = EchoCanceller3Config::default();
+        config.multi_channel.detect_stereo_content = false;
+        let ec = EchoCanceller3::new_initialized_for_measurement(config, None, 48000, 2, 1);
+        assert_eq!(ec.num_render_channels_to_aec, 2);
     }
 
     #[test]

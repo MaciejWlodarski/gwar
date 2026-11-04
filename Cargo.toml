@@ -1,7 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/desktop/src-tauri"]
-exclude = ["vendor/tsclientlib", "vendor/str0m", "vendor/sonora"]
+exclude = ["vendor/tsclientlib", "vendor/str0m", "vendor/sonora", "vendor/sonora-aec3"]
 
 [workspace.package]
 edition = "2024"
@@ -56,6 +56,8 @@ strip = true
 str0m = { path = "vendor/str0m" }
 # See vendor/sonora/GWAR-PATCH.md.
 sonora = { path = "vendor/sonora" }
+# Native AEC3 diagnostics and state-only handover experiments; see GWAR-PATCH.md.
+sonora-aec3 = { path = "vendor/sonora-aec3" }
 
 # tsclientlib connects to a download's file transfer itself, where Gwar can
 # neither time it out nor cancel it; the patch hands the offer over instead.

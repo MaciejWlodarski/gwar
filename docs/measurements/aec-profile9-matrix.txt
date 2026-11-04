@@ -1,0 +1,34 @@
+
+running 1 test
+test voice::apm::tests::tones::native_speech_and_quiet_echo_gate ... speech-matrix-control,lead=6,echo=false,noise=0,cold-hold=25,cold-kept=0.73679656,no-aec-hold=1,no-aec-kept=0.851948
+speech-matrix,lead=6,echo=false,noise=0,mode=92,hold=25,kept=0.73852813,pass=true,near-gain=[[1.436441, 0.7034846], [-3.4094431, 0.7996171], [-2.8054554, 0.8281049]]
+speech-matrix-control,lead=6,echo=false,noise=50,cold-hold=37,cold-kept=0.7125541,no-aec-hold=2,no-aec-kept=0.8060606
+speech-matrix,lead=6,echo=false,noise=50,mode=92,hold=37,kept=0.71428573,pass=true,near-gain=[[1.285569, 0.70296496], [-3.6009374, 0.79940134], [-2.9887807, 0.82769656]]
+speech-matrix-control,lead=6,echo=false,noise=100,cold-hold=37,cold-kept=0.7134199,no-aec-hold=2,no-aec-kept=0.8051948
+speech-matrix,lead=6,echo=false,noise=100,mode=92,hold=37,kept=0.7125541,pass=false,near-gain=[[1.2764958, 0.7029284], [-3.6124818, 0.799383], [-2.9998274, 0.8276676]]
+speech-matrix-control,lead=6,echo=true,noise=0,cold-hold=49,cold-kept=0.83549786,no-aec-hold=0,no-aec-kept=1
+speech-matrix,lead=6,echo=true,noise=0,mode=92,hold=0,kept=1,pass=true,near-gain=[[-2.2277822, 0.1827618], [-8.300801, 0.13418846], [-10.068488, 0.123175815]]
+speech-matrix-control,lead=6,echo=true,noise=50,cold-hold=70,cold-kept=0.27705628,no-aec-hold=0,no-aec-kept=0.95238096
+speech-matrix,lead=6,echo=true,noise=50,mode=92,hold=0,kept=0.6138528,pass=true,near-gain=[[-7.2765737, 0.4646393], [-12.692528, 0.5399939], [-12.651658, 0.5524974]]
+speech-matrix-control,lead=6,echo=true,noise=100,cold-hold=136,cold-kept=0.104761906,no-aec-hold=3,no-aec-kept=0.7974026
+speech-matrix,lead=6,echo=true,noise=100,mode=92,hold=49,kept=0.42337662,pass=true,near-gain=[[-7.6943007, 0.46750537], [-13.065666, 0.5732131], [-12.832787, 0.5817064]]
+echo-matrix-control,lead=6,levels=[-17.38148, -16.00808, -16.0086, -16.02278, -16.041487, -16.046083, -16.040386, -16.0467, -16.047585, -16.050608, -14.893854, -11.038507, -11.037977, -11.0386505, -11.036817, -11.038649, -15.5251045, -16.02135, -16.046455, -16.047417, -15.831842, -16.026527, -16.03521, -16.0445, -15.916495, -15.719146, -16.027428, -16.030502, -16.058828, -11.846084, -11.036836, -12.242631]
+echo-matrix,lead=6,mode=92,levels=[-17.381239, -16.007969, -16.00602, -16.013885, -16.008497, -16.013092, -16.006903, -16.01323, -16.013973, -16.017078, -14.879088, -11.038507, -11.037977, -11.0386505, -11.036817, -11.038649, -15.505926, -15.991076, -16.02482, -16.029938, -15.818225, -15.992987, -16.010786, -16.023634, -15.900935, -15.703806, -15.993488, -16.00559, -16.026438, -11.815944, -11.036836, -12.233157],delta=[0.00024032593, 0.00011062622, 0.0025806427, 0.008893967, 0.032989502, 0.03299141, 0.033483505, 0.033470154, 0.033611298, 0.03352928, 0.014765739, 0.0, 0.0, 0.0, 0.0, 0.0, 0.01917839, 0.030274391, 0.021635056, 0.017478943, 0.013617516, 0.033540726, 0.0244236, 0.020866394, 0.01556015, 0.015339851, 0.03393936, 0.02491188, 0.032390594, 0.030139923, 0.0, 0.009473801],worst=0.03393936,pass=true
+speech-matrix-control,lead=10,echo=false,noise=0,cold-hold=84,cold-kept=0.6883117,no-aec-hold=1,no-aec-kept=0.851948
+speech-matrix,lead=10,echo=false,noise=0,mode=92,hold=46,kept=0.6909091,pass=true,near-gain=[[1.1855184, 0.69446015], [-4.7877064, 0.7487894], [-2.987014, 0.82083386]]
+speech-matrix-control,lead=10,echo=false,noise=50,cold-hold=84,cold-kept=0.66233766,no-aec-hold=2,no-aec-kept=0.8069264
+speech-matrix,lead=10,echo=false,noise=50,mode=92,hold=79,kept=0.6666667,pass=true,near-gain=[[1.05322, 0.69425154], [-4.9882593, 0.74843526], [-3.165553, 0.82038265]]
+speech-matrix-control,lead=10,echo=false,noise=100,cold-hold=84,cold-kept=0.6606061,no-aec-hold=2,no-aec-kept=0.8051948
+speech-matrix,lead=10,echo=false,noise=100,mode=92,hold=79,kept=0.6666667,pass=true,near-gain=[[1.045273, 0.6942338], [-5.0003567, 0.7484069], [-3.1763082, 0.82034963]]
+speech-matrix-control,lead=10,echo=true,noise=0,cold-hold=93,cold-kept=0.8484849,no-aec-hold=0,no-aec-kept=1
+speech-matrix,lead=10,echo=true,noise=0,mode=92,hold=0,kept=1,pass=true,near-gain=[[-2.2471154, 0.18342546], [-8.182698, 0.13432175], [-10.201644, 0.121655926]]
+speech-matrix-control,lead=10,echo=true,noise=50,cold-hold=105,cold-kept=0.3073593,no-aec-hold=0,no-aec-kept=0.95238096
+speech-matrix,lead=10,echo=true,noise=50,mode=92,hold=0,kept=0.61558443,pass=true,near-gain=[[-6.4385624, 0.45120022], [-12.762688, 0.53525084], [-12.650153, 0.55418235]]
+speech-matrix-control,lead=10,echo=true,noise=100,cold-hold=106,cold-kept=0.12813853,no-aec-hold=3,no-aec-kept=0.7965368
+speech-matrix,lead=10,echo=true,noise=100,mode=92,hold=49,kept=0.42337662,pass=true,near-gain=[[-6.765634, 0.45856965], [-13.159186, 0.5666942], [-12.820344, 0.58384806]]
+echo-matrix-control,lead=10,levels=[-17.412199, -16.006899, -16.007713, -16.01969, -16.039345, -16.046263, -16.04034, -16.044968, -16.053045, -16.050547, -14.6194515, -11.034008, -11.036913, -11.039325, -11.037851, -11.038498, -11.037856, -11.038479, -11.037876, -11.038499, -11.037989, -11.038521, -11.037985, -11.038484, -11.037969, -11.038495, -11.037959, -11.038515, -11.037964, -11.038494, -11.03797, -11.038507]
+echo-matrix,lead=10,mode=92,levels=[-17.412113, -16.006811, -16.006407, -16.013723, -16.007532, -16.013414, -16.007141, -16.011656, -16.019575, -16.0202, -14.601158, -11.034008, -11.036913, -11.039325, -11.037851, -11.038498, -11.037856, -11.038479, -11.037876, -11.038499, -11.037989, -11.038521, -11.037985, -11.038484, -11.037969, -11.038495, -11.037959, -11.038515, -11.037964, -11.038494, -11.03797, -11.038507],delta=[8.583069e-5, 8.773804e-5, 0.0013065338, 0.0059661865, 0.031812668, 0.03284836, 0.03319931, 0.033311844, 0.033470154, 0.030345917, 0.01829338, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],worst=0.033470154,pass=true
+native-gate,mode=92,speech=false,quiet-echo=true,accepted=false
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 400 filtered out; finished in 78.38s

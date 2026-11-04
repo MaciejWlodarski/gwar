@@ -1,0 +1,13 @@
+Unmodified main 1099a6817bbbabb9074004000915a3c884262cdd
+Exact six-pair four_shares_leave_the_voice_pipeline_on_time, release, nice -n 10, virtual buffers.
+
+running 1 test
+test voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time ... pair 0 order [0, 4]: none p50 0.128 p99 0.349 max 4.114 missing 960 | four p50 0.006 p99 0.444 max 3.489 missing 0 | p99 delta +0.096 ms
+pair 1 order [4, 0]: none p50 0.011 p99 0.327 max 3.824 missing 480 | four p50 0.011 p99 0.329 max 6.882 missing 0 | p99 delta +0.002 ms
+pair 2 order [0, 4]: none p50 0.127 p99 0.313 max 1.246 missing 480 | four p50 0.191 p99 0.407 max 4.660 missing 0 | p99 delta +0.094 ms
+pair 3 order [4, 0]: none p50 0.097 p99 0.376 max 4.369 missing 1920 | four p50 0.105 p99 0.346 max 0.656 missing 0 | p99 delta -0.030 ms
+pair 4 order [0, 4]: none p50 0.013 p99 0.346 max 1.453 missing 480 | four p50 0.192 p99 0.499 max 6.095 missing 0 | p99 delta +0.153 ms
+pair 5 order [4, 0]: none p50 0.100 p99 0.200 max 3.567 missing 480 | four p50 0.002 p99 0.553 max 5.415 missing 0 | p99 delta +0.353 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 375 filtered out; finished in 239.92s

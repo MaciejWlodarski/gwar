@@ -1,0 +1,14 @@
+   Compiling gwar-client v0.1.2 (/Users/zireael/.t3/worktrees/voice-communicator/t3-e65fca3d/crates/gwar-client)
+    Finished `release` profile [optimized] target(s) in 1m 54s
+     Running unittests src/lib.rs (/tmp/gwar-aec-sol/release/deps/gwar_client-63cb5b99089087a9)
+
+running 1 test
+test voice::codec_tests::four_shares_for_native_aec_option ... pair 0 order [0, 4]: none p50 0.086 p99 0.240 max 1.855 missing 480 | four p50 0.106 p99 0.391 max 4.129 missing 0 | p99 delta +0.151 ms
+pair 1 order [4, 0]: none p50 0.094 p99 0.281 max 2.360 missing 480 | four p50 0.099 p99 0.296 max 0.705 missing 0 | p99 delta +0.015 ms
+pair 2 order [0, 4]: none p50 0.082 p99 0.426 max 4.701 missing 480 | four p50 0.099 p99 0.285 max 5.003 missing 0 | p99 delta -0.141 ms
+pair 3 order [4, 0]: none p50 0.089 p99 0.177 max 0.392 missing 480 | four p50 0.106 p99 0.521 max 2.648 missing 0 | p99 delta +0.344 ms
+pair 4 order [0, 4]: none p50 0.085 p99 0.174 max 0.371 missing 480 | four p50 0.105 p99 0.258 max 2.774 missing 0 | p99 delta +0.084 ms
+pair 5 order [4, 0]: none p50 0.006 p99 0.440 max 7.128 missing 5280 | four p50 0.109 p99 0.293 max 2.087 missing 0 | p99 delta -0.148 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 403 filtered out; finished in 239.92s

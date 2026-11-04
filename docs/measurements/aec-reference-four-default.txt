@@ -1,0 +1,11 @@
+
+running 1 test
+test voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time ... pair 0 order [0, 4]: none p50 0.005 p99 0.290 max 2.064 missing 480 | four p50 0.006 p99 0.455 max 4.913 missing 0 | p99 delta +0.164 ms
+pair 1 order [4, 0]: none p50 0.012 p99 0.187 max 2.587 missing 480 | four p50 0.103 p99 0.294 max 1.142 missing 0 | p99 delta +0.107 ms
+pair 2 order [0, 4]: none p50 0.005 p99 0.306 max 0.595 missing 480 | four p50 0.006 p99 0.595 max 7.909 missing 0 | p99 delta +0.288 ms
+pair 3 order [4, 0]: none p50 0.081 p99 0.282 max 4.501 missing 3360 | four p50 0.004 p99 0.282 max 0.737 missing 0 | p99 delta +0.000 ms
+pair 4 order [0, 4]: none p50 0.005 p99 0.329 max 0.720 missing 480 | four p50 0.204 p99 0.475 max 3.826 missing 0 | p99 delta +0.146 ms
+pair 5 order [4, 0]: none p50 0.085 p99 0.320 max 6.373 missing 960 | four p50 0.002 p99 0.561 max 5.050 missing 0 | p99 delta +0.242 ms
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 403 filtered out; finished in 239.91s

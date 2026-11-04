@@ -65,6 +65,7 @@ import type { pruneRequest } from "../lib/prune";
 import { identitySeed, uidForPublicKey, accountKeyOf, importIdentity, loadActiveIdentity, identityFailure, type Identity, type IdentityFailure } from "../net/identity";
 import { isDesktop, tauri } from "../platform";
 import { createVoiceEngine } from "../voice";
+import { prepareDenoise } from "../voice/denoise";
 import { useScreen } from "./screen";
 import { ScreenController } from "./screen-controller";
 import { microphoneSsrc } from "../voice/sdp";
@@ -372,6 +373,12 @@ class Controller {
     };
     // Device and capture options are applied before the mic opens.
     const first = useSettings.getState().audio;
+    const prepareSuppression = () => {
+      const phase = useSession.getState().phase;
+      prepareDenoise(!isDesktop() && useSettings.getState().audio.noiseSuppression, phase === "online" || phase === "reconnecting");
+    };
+    prepareSuppression();
+    useSession.subscribe((s, prev) => { if (s.phase !== prev.phase) prepareSuppression(); });
     void e.setInputDevice(first.inputDeviceId);
     void e.setCaptureOptions({
       noiseSuppression: first.noiseSuppression,
@@ -393,6 +400,7 @@ class Controller {
       }
       const a = s.audio;
       const p = prev.audio;
+      if (a.noiseSuppression !== p.noiseSuppression) prepareSuppression();
       if (a.inputMode !== p.inputMode) e.setInputMode(a.inputMode);
       if (a.pttReleaseDelay !== p.pttReleaseDelay) e.setPttReleaseDelay(a.pttReleaseDelay);
       if (a.automaticSensitivity !== p.automaticSensitivity || a.vadThreshold !== p.vadThreshold) e.setInputSensitivity(a.automaticSensitivity ? null : a.vadThreshold);
@@ -2170,7 +2178,9 @@ class Controller {
         const upload = this.uploaded.get(uploadId);
         return upload?.conn === conn && upload.att.sealed ? [structuredClone(upload.att)] : [];
       });
-      id = useOutbox.getState().add({ ...m, id, session, authorUid, serverKey, attachmentMetadata,
+      // Anchor a new attempt after what is on screen now; a retry keeps the original place.
+      const after = retryId === undefined ? useSession.getState().threads[m.thread]?.items.at(-1)?.key : m.after;
+      id = useOutbox.getState().add({ ...m, id, session, authorUid, serverKey, attachmentMetadata, after,
         sending: retryId === undefined, error: tNow("chat.notSent") }).id;
       this.sendAttempts.set(id, attempt);
       const currentAttempt = () => !attempt.signal.aborted && this.sendAttempts.get(id!) === attempt && ownsView() && session === this.sendSession

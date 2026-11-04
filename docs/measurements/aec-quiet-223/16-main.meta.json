@@ -1,0 +1,87 @@
+{
+  "arm": "main",
+  "sha": "6c1c45c9d677b63f6b61ba25a91fcd997a014ca1",
+  "binary": "/private/tmp/gwar-aec223-iMGI/targets/main/release/deps/gwar_client-d75cd4dd4994a192",
+  "binary_sha256": "c09245733f7d8cf1bb3695bd56e5e05dd0f1ea8042874e38019df545eef784be",
+  "command": [
+    "/private/tmp/gwar-aec223-iMGI/targets/main/release/deps/gwar_client-d75cd4dd4994a192",
+    "voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time",
+    "--exact",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "before": {
+    "at": "2026-11-04T21:16:38.142490+00:00",
+    "load": [
+      2.12060546875,
+      4.0654296875,
+      3.541015625
+    ],
+    "uptime": "22:16  up  9:40, 2 users, load averages: 2.12 4.07 3.54",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "start_nice": 10,
+  "valid": false,
+  "invalid_reasons": [
+    "overlap with another cargo/test or #213 timing",
+    "overlap at end"
+  ],
+  "start_limit": 3.5,
+  "max_limit": 4.5,
+  "launch": {
+    "at": "2026-11-04T21:16:38.218932+00:00",
+    "load": [
+      2.12060546875,
+      4.0654296875,
+      3.541015625
+    ],
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "pid": 49806,
+  "test_nice": 10,
+  "exit_code": -15,
+  "after": {
+    "at": "2026-11-04T21:16:53.509044+00:00",
+    "load": [
+      1.94580078125,
+      3.9306640625,
+      3.50146484375
+    ],
+    "uptime": "22:16  up  9:40, 2 users, load averages: 1.95 3.93 3.50",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": [
+        {
+          "pid": 49911,
+          "parent": 49905,
+          "nice": 19,
+          "command": "cargo"
+        },
+        {
+          "pid": 49928,
+          "parent": 49911,
+          "nice": 19,
+          "command": "rustc"
+        }
+      ]
+    }
+  },
+  "peak_load_1m": 2.12060546875,
+  "pair_count": 0
+}

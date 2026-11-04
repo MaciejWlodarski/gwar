@@ -16,6 +16,30 @@ console.log(`gwar_denoise.wasm: ${bytes.length} bytes, ${gzipSync(bytes, { level
 const module = await WebAssembly.compile(bytes);
 const imports = WebAssembly.Module.imports(module);
 if (imports.length) throw new Error(`the module imports ${imports.map(i => `${i.module}.${i.name}`).join(', ')}`);
+
+// The web app builds the model in a worker and hands the worklet a copy of the memory
+// (apps/web/src/voice/denoise/snapshot.ts): the module must keep all its state there. The only
+// mutable global may be the stack pointer, which is back where it started between calls.
+function mutableGlobals(wasm) {
+  let at = 8;
+  const leb = () => { let value = 0, shift = 0, byte; do { byte = wasm[at++]; value += (byte & 0x7f) * 2 ** shift; shift += 7; } while (byte & 0x80); return value; };
+  let mutable = 0;
+  while (at < wasm.length) {
+    const id = wasm[at++], size = leb(), end = at + size;
+    if (id === 6) {
+      for (let count = leb(); count > 0; count--) {
+        at++; // value type
+        if (wasm[at++] === 1) mutable++;
+        while (wasm[at] !== 0x0b) at++; // a constant expression (no nested blocks)
+        at++;
+      }
+    }
+    at = end;
+  }
+  return mutable;
+}
+const globals = mutableGlobals(bytes);
+if (globals !== 1) throw new Error(`${globals} mutable globals: the worklet's copy of the model would miss state`);
 const { exports } = await WebAssembly.instantiate(module, {});
 const memory = () => exports.memory.buffer;
 

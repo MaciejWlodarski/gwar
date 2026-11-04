@@ -1,0 +1,71 @@
+{
+  "arm": "main",
+  "sha": "6c1c45c9d677b63f6b61ba25a91fcd997a014ca1",
+  "binary": "/private/tmp/gwar-aec223-iMGI/targets/main/release/deps/gwar_client-d75cd4dd4994a192",
+  "binary_sha256": "c09245733f7d8cf1bb3695bd56e5e05dd0f1ea8042874e38019df545eef784be",
+  "command": [
+    "/private/tmp/gwar-aec223-iMGI/targets/main/release/deps/gwar_client-d75cd4dd4994a192",
+    "voice::codec_tests::four_shares_leave_the_voice_pipeline_on_time",
+    "--exact",
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1"
+  ],
+  "before": {
+    "at": "2026-11-04T20:36:17.810636+00:00",
+    "load": [
+      1.84033203125,
+      2.57958984375,
+      3.392578125
+    ],
+    "uptime": "21:36  up 9 hrs, 2 users, load averages: 1.84 2.58 3.39",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "start_nice": 10,
+  "valid": true,
+  "invalid_reasons": [],
+  "start_limit": 3.5,
+  "max_limit": 4.5,
+  "launch": {
+    "at": "2026-11-04T20:36:17.882676+00:00",
+    "load": [
+      1.84033203125,
+      2.57958984375,
+      3.392578125
+    ],
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "pid": 13396,
+  "test_nice": 10,
+  "exit_code": 0,
+  "after": {
+    "at": "2026-11-04T20:40:18.032830+00:00",
+    "load": [
+      1.912109375,
+      2.12646484375,
+      2.9833984375
+    ],
+    "uptime": "21:40  up  9:04, 2 users, load averages: 1.91 2.13 2.98",
+    "processes": {
+      "pgrep": {
+        "ss-tools/run.sh": [],
+        "e2e/share-sync\\.mjs": []
+      },
+      "other_cargo_or_tests": []
+    }
+  },
+  "peak_load_1m": 2.1455078125,
+  "pair_count": 6
+}
