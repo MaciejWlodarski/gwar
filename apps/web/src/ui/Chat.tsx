@@ -380,12 +380,14 @@ function FailedMessageRow({ message: f }: { message: FailedSend }) {
   useSession(s => s.epoch);
   const fresh = !!f.sealed && f.session !== controller.sendSession;
   const missing = !!f.sealed && (f.attachments ?? []).some(id => !f.attachmentMetadata?.some(a => a.id === id && a.sealed));
+  // One line: what happened, and why when it can be said plainly.
+  const status = f.unknown ? t("chat.maybeSent") : f.error && f.error !== t("chat.notSent") ? `${t("chat.notSent")} · ${f.error}` : t("chat.notSent");
   return (
-  <div key={f.id} role="alert" className="mx-4 mt-2 flex gap-3 rounded-lg border border-danger/40 bg-danger-soft px-3 py-2">
+  <div key={f.id} role="alert" aria-busy={f.retrying || undefined} className="mx-4 mt-2 flex gap-3 rounded-lg border border-danger/40 bg-danger-soft px-3 py-2">
     <AlertCircle className="mt-0.5 size-4 shrink-0 text-danger" />
     <div className="min-w-0 flex-1">
-      <div className="text-xs font-medium text-danger">
-        {t("chat.notSent")}
+      <div data-failed-status className="truncate text-xs font-medium text-danger" title={status}>
+        {status}
       </div>
       <div className="mt-0.5 text-sm break-words whitespace-pre-wrap text-fg/80">{f.text}</div>
       {!!f.attachments?.length && <div className="mt-1 flex flex-col items-start gap-1.5">
@@ -395,13 +397,13 @@ function FailedMessageRow({ message: f }: { message: FailedSend }) {
         })}
       </div>}
       <div className="mt-1.5 flex flex-wrap gap-2">
-        <button
-          disabled={missing}
+        {!f.unknown && <button
+          disabled={missing || f.retrying}
           onClick={() => void controller.retrySend(f.id, fresh)}
           className="t flex cursor-pointer items-center gap-1 rounded-md bg-danger px-2 py-1 text-xs font-medium text-white hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          <RotateCw className="size-3" /> {t("chat.retry")}
-        </button>
+          {f.retrying ? <><Loader2 className="size-3 animate-spin" /> {t("chat.sending")}</> : <><RotateCw className="size-3" /> {t("chat.retry")}</>}
+        </button>}
         <button
           onClick={() => void controller.dismissSend(f.id)}
           className="t cursor-pointer rounded-md px-2 py-1 text-xs font-medium text-muted hover:bg-hover hover:text-fg"

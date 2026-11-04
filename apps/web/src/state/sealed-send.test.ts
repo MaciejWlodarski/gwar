@@ -213,3 +213,35 @@ it("still fails when the resync leaves this conversation securing", async () => 
   expect(request.mock.calls.filter(([op]) => op === "chat.sealed.send")).toHaveLength(1);
   expect(useOutbox.getState().failed).toHaveLength(1);
 });
+
+it("ends a retry the server holds but cannot show as 'may have been sent', with nothing left to retry", async () => {
+  const { RequestError } = await import("../net/connection");
+  request.mockRejectedValueOnce(new Error("answer lost"));
+  await controller.sendChat("server", "removed by a moderator");
+  const failed = useOutbox.getState().failed[0]!;
+  // The lost attempt was stored and then removed: its ID stays taken, its row is gone.
+  request.mockImplementation(async op => {
+    if (op === "chat.sealed.send") throw new RequestError("conflict", "message_id already used in this conversation");
+    return { sealed: [] };
+  });
+  await controller.retrySend(failed.id);
+  expect(useOutbox.getState().failed).toMatchObject([{ id: failed.id, unknown: true, retrying: false }]);
+  await controller.retrySend(failed.id);
+  expect(request.mock.calls.filter(([op]) => op === "chat.sealed.send")).toHaveLength(2);
+});
+
+it("marks the files of a send the server no longer takes as missing", async () => {
+  const { RequestError } = await import("../net/connection");
+  const { tNow } = await import("../i18n");
+  c.uploaded.set(attachment.id, { conn: link, att: attachment });
+  request.mockRejectedValueOnce(new Error("answer lost"));
+  await controller.sendChat("server", "files expired", { attachments: [attachment.id] });
+  const failed = useOutbox.getState().failed[0]!;
+  request.mockImplementation(async op => {
+    if (op === "chat.sealed.send") throw new RequestError("bad_request", "invalid files");
+    return { sealed: [] };
+  });
+  await controller.retrySend(failed.id);
+  expect(useOutbox.getState().failed).toMatchObject([{ id: failed.id, attachments: [attachment.id], attachmentMetadata: [], error: tNow("chat.missingAttachments") }]);
+  expect(useOutbox.getState().failed[0]!.unknown).toBeUndefined();
+});

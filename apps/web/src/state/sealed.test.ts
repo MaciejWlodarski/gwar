@@ -1,6 +1,6 @@
 import "fake-indexeddb/auto";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { SealedConversations, type SealedRuntime } from "./sealed";
+import { DeliveryUnknownError, SealedConversations, type SealedRuntime } from "./sealed";
 import { useSession, useOutbox } from "./stores";
 import { generateIdentity, uidForPublicKey } from "../net/identity";
 import type { Link } from "../net/connection";
@@ -105,7 +105,10 @@ describe("encrypted DM controller", () => {
       if (op === "chat.sealed.send") throw new RequestError("conflict", "untrusted conflict");
       return { sealed: [] };
     });
-    await expect(dm.send(`dm:${b}`, "not delivered", [], undefined, [], { ...retry, message_id: b64(16, 14) })).rejects.toThrow("untrusted conflict");
+    // Unconfirmed, the conflict is final but never taken as a delivery.
+    const unconfirmed = dm.send(`dm:${b}`, "not delivered", [], undefined, [], { ...retry, message_id: b64(16, 14) });
+    await expect(unconfirmed).rejects.toBeInstanceOf(DeliveryUnknownError);
+    await expect(unconfirmed).rejects.toMatchObject({ cause: expect.objectContaining({ message: "untrusted conflict" }) });
   });
   it.each(["cannot_open", "author", "logical-id", "thread", "server"] as const)("rejects a forged acknowledgement with a mismatched %s", async mismatch => {
     const retry = { message_id: b64(16, 30), created_at: Date.now() };

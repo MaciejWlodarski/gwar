@@ -749,6 +749,8 @@ export const pl: Record<Key, string> = {
   "chat.notSent": "Nie wysłano",
   "chat.locked": "Ten kanał jest chroniony hasłem",
   "chat.retry": "Wyślij ponownie",
+  "chat.sending": "Wysyłanie…",
+  "chat.maybeSent": "Mogła zostać wysłana lub usunięta",
   "chat.missingAttachments": "Dodaj plik ponownie, aby go wysłać.",
   "chat.dismiss": "Odrzuć",
   "chat.reconnecting": "Utracono połączenie. Łączenie ponownie…",

@@ -746,6 +746,8 @@ export const en = {
   "chat.notSent": "Not sent",
   "chat.locked": "That channel is password protected",
   "chat.retry": "Send again",
+  "chat.sending": "Sending…",
+  "chat.maybeSent": "May have been sent or removed",
   "chat.missingAttachments": "Attach the file again to send it.",
   "chat.dismiss": "Dismiss",
   "chat.reconnecting": "Connection lost. Reconnecting…",

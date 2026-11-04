@@ -2479,6 +2479,74 @@ describe("edits stay on their connection; history ownership follows each verifie
     g.c.conn = link;
   });
 
+  it("retries a plaintext send as the same message, and takes the server's duplicate answer as delivered", async () => {
+    vi.useRealTimers(); connectFake();
+    const { RequestError, RequestTimeoutError } = await import("../net/connection");
+    const { tNow } = await import("../i18n");
+    const g = await genuine(), { a } = await servers(g);
+    stores.useSession.setState({ viewChannel: 1 });
+    const sent = () => (a.request.mock.calls as [string, { signature: { message_id: string; created_at: number } }][]).filter(([op]) => op === "chat.send").map(([, d]) => d.signature);
+    // The server stored the message, but its answer did not arrive in time.
+    a.request.mockRejectedValueOnce(new RequestTimeoutError("chat.send"));
+    expect(await controller.sendChat("channel", "only once")).toBe(false);
+    const failed = stores.useOutbox.getState().failed[0]!;
+    expect(failed).toMatchObject({ text: "only once", error: tNow("err.req.timeout"), identity: { message_id: sent()[0]!.message_id, created_at: sent()[0]!.created_at } });
+    a.request.mockRejectedValueOnce(new RequestError("conflict", "message_id already used"));
+    await controller.retrySend(failed.id);
+    expect(sent()).toHaveLength(2);
+    expect(sent()[1]).toMatchObject({ message_id: sent()[0]!.message_id, created_at: sent()[0]!.created_at });
+    expect(stores.useOutbox.getState().failed).toEqual([]);
+    g.c.conn = link;
+  });
+
+  it("drops a plaintext card whose message is already shown, and re-signs one too old to sign again", async () => {
+    vi.useRealTimers(); connectFake();
+    const g = await genuine(), { a } = await servers(g);
+    stores.useSession.setState({ viewChannel: 1 });
+    const sent = () => (a.request.mock.calls as [string, { signature: { message_id: string } }][]).filter(([op]) => op === "chat.send").map(([, d]) => d.signature);
+    a.request.mockRejectedValueOnce(new Error("lost")).mockRejectedValueOnce(new Error("lost"));
+    await controller.sendChat("channel", "arrived anyway");
+    const shown = stores.useOutbox.getState().failed[0]!;
+    // The broadcast of the first attempt reached me although its answer did not.
+    session().dispatch({ type: "event", now: Date.now(), authentic: true,
+      event: { ev: "chat.message", d: { ...message(80, 1, { author_uid: g.uid, text: "arrived anyway" }), signature: { ...g.msg.signature!, message_id: sent()[0]!.message_id } } } });
+    await controller.retrySend(shown.id);
+    expect(sent()).toHaveLength(1);
+    expect(stores.useOutbox.getState().failed).toEqual([]);
+    await controller.sendChat("channel", "five minutes later");
+    const old = stores.useOutbox.getState().failed[0]! as { id: number; identity?: { message_id: string; created_at: number } };
+    stores.useOutbox.getState().update(old.id, { identity: { ...old.identity!, created_at: Date.now() - 5 * 60_000 } });
+    await controller.retrySend(old.id);
+    expect(sent()).toHaveLength(3);
+    expect(sent()[2]!.message_id).not.toBe(sent()[1]!.message_id);
+    expect(stores.useOutbox.getState().failed).toEqual([]);
+    g.c.conn = link;
+  });
+
+  it("marks a card while its retry is in flight and gives a plain reason when it fails again", async () => {
+    vi.useRealTimers(); connectFake();
+    const { RequestError } = await import("../net/connection");
+    const { tNow } = await import("../i18n");
+    const g = await genuine(), { a } = await servers(g);
+    stores.useSession.setState({ viewChannel: 1 });
+    a.request.mockRejectedValueOnce(new Error("internal detail"));
+    await controller.sendChat("channel", "retry me");
+    const failed = stores.useOutbox.getState().failed[0]!;
+    // Internal error text is never shown on the card.
+    expect(failed.error).toBe("");
+    let reject!: (error: Error) => void;
+    a.request.mockImplementationOnce(() => new Promise((_, fail) => { reject = fail; }));
+    const retry = controller.retrySend(failed.id);
+    await vi.waitFor(() => expect(a.request).toHaveBeenCalledTimes(2));
+    expect(stores.useOutbox.getState().failed).toMatchObject([{ id: failed.id, retrying: true }]);
+    await controller.retrySend(failed.id);
+    expect(a.request).toHaveBeenCalledTimes(2);
+    reject(new RequestError("forbidden", "no access to this channel"));
+    await retry;
+    expect(stores.useOutbox.getState().failed).toMatchObject([{ id: failed.id, retrying: false, error: tNow("chat.locked") }]);
+    g.c.conn = link;
+  });
+
   it("an edit is not sent when a newer revision arrived while it was being signed (Astra r3 probe, inverted)", async () => {
     vi.useRealTimers(); connectFake();
     const g = await genuine(), { a } = await servers(g), held = gate();
@@ -2804,10 +2872,11 @@ describe.each(["channel", "server"] as const)("encrypted %s chat", kind => {
   it("tells the sender when an encrypted message was not sent", async () => {
     connectPublic();
     const sealed = fakeSealed(); install(sealed);
-    sealed.send.mockRejectedValueOnce(new Error("Securing this conversation"));
+    const { tNow } = await import("../i18n");
+    sealed.send.mockRejectedValueOnce(new Error(tNow("chat.securing")));
     expect(await controller.sendChat(kind === "server" ? "server" : "channel", "hi")).toBe(false);
     const failed = stores.useOutbox.getState().failed.at(-1)!;
-    expect(failed).toMatchObject({ thread, text: "hi", error: "Securing this conversation", sealed: { message_id: expect.any(String) } });
+    expect(failed).toMatchObject({ thread, text: "hi", error: tNow("chat.securing"), sealed: { message_id: expect.any(String) } });
     expect(stores.useUi.getState().toasts).toEqual([]);
     await controller.retrySend(failed.id);
     expect(sealed.send).toHaveBeenLastCalledWith(thread, "hi", [], undefined, [], failed.sealed, expect.any(Function));

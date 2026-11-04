@@ -309,22 +309,29 @@ interface FailedMessage {
   attachmentMetadata?: Attachment[];
   /** Retained before delivery and hidden until failure. */
   sending?: boolean;
+  /** An explicit retry of this card is in flight. */
+  retrying?: boolean;
+  /** The server already holds this message ID but no copy of it is found: it may have been sent and
+   *  removed. Final; the card can only be dismissed. */
+  unknown?: boolean;
 }
 
+/** A plaintext message's signed ID and creation time, kept so a retry is the same message. */
+type PlainIdentity = { identity?: { message_id: string; created_at: number } };
 export type FailedSend = FailedMessage & (
-  | { target: ChatTarget; dmUid?: string; sealed?: never }
+  | ({ target: ChatTarget; dmUid?: string; sealed?: never } & PlainIdentity)
   | { sealed: { message_id: string; created_at: number }; target?: never; dmUid?: never }
 );
 
 interface OutboxStore {
   failed: FailedSend[];
   add(item: Omit<FailedMessage, "id"> & { id?: number } & (
-    | { target: ChatTarget; dmUid?: string; sealed?: never }
+    | ({ target: ChatTarget; dmUid?: string; sealed?: never } & PlainIdentity)
     | { sealed: { message_id: string; created_at: number }; target?: never; dmUid?: never }
   )): FailedSend;
   remove(id: number): FailedSend | undefined;
   clear(): void;
-  update(id: number, patch: Partial<FailedMessage>): void;
+  update(id: number, patch: Partial<FailedMessage> & PlainIdentity): void;
   reconcile(serverKey: string, thread: string, authorUid: string, messageId: string): void;
 }
 
