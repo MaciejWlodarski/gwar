@@ -66,11 +66,14 @@ export function threadRows(raw: ChatItem[], visible: (item: ChatItem) => boolean
   const shown = raw.filter(visible);
   const keys = new Set(shown.map(i => i.key));
   // A deleted anchor message is gone from `raw`; messages are ordered by id, so the last one at or below
-  // its id takes its place.
+  // its id takes its place. Plaintext rows are keyed `m{id}` and sealed rows `e{id}`; their ids come from
+  // different tables, so only rows of the anchor's own kind are compared.
   const position = (after: string) => {
     const at = raw.findIndex(r => r.key === after);
-    const id = at < 0 ? /^m(\d+)$/.exec(after)?.[1] : undefined;
-    return id === undefined ? at : raw.findLastIndex(r => r.kind === "msg" && r.msg.id <= Number(id));
+    const deleted = at < 0 ? /^([me])(\d+)$/.exec(after) : null;
+    if (!deleted) return at;
+    const [, prefix, id] = deleted;
+    return raw.findLastIndex(r => r.kind === "msg" && r.key.startsWith(prefix!) && r.msg.id <= Number(id));
   };
   const anchor = (after: string | undefined) => {
     for (let i = after === undefined ? -1 : position(after); i >= 0; i--) {

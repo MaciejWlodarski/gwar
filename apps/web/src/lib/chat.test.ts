@@ -96,6 +96,12 @@ describe("threadRows", () => {
     const rows = threadRows(raw, () => true, [{ key: "failed:1", at: base + 1000, after: "m3" }]);
     expect(keys(rows)).toEqual(["day", "failed:1", "m5", "m6"]);
   });
+  it("keeps the card below what was shown when its encrypted anchor message is deleted", () => {
+    const sealed = (id: number, at: number, created: number): ChatItem => ({ ...signed(id, at, created), key: `e${id}` });
+    const raw = [sealed(1, base, base + 59_000), sealed(3, base + 2000, base + 61_000)];
+    const rows = threadRows(raw, () => true, [{ key: "failed:1", at: base + 1000, after: "e2" }]);
+    expect(keys(rows)).toEqual(["day", "e1", "failed:1", "e3"]);
+  });
 });
 
 describe("unreadLabel", () => {
