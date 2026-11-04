@@ -6,6 +6,9 @@
  *
  *   E2E_BROWSERS=chromium,webkit,firefox   engines to run (default: chromium,webkit)
  *   E2E_SILENT=1                           Chromium plays to no device (for runs on a desk)
+ *   E2E_DENOISE_CONTROL=audio-thread-build the code under test is a control that still builds the
+ *                                          model on the audio thread (main before #222): its trace
+ *                                          must show that task, proving the check below can fail
  *
  * In Chromium it also holds the load to what it must never do: take the audio thread for long.
  * A render waits for that thread, and the page's main thread can wait for a render (index.ts).
@@ -138,12 +141,22 @@ async function run(engine, web) {
     if (tracing) {
       const events = JSON.parse((await browser.stopTracing()).toString()).traceEvents;
       const threads = new Map(events.filter(e => e.name === "thread_name").map(e => [`${e.pid}:${e.tid}`, e.args?.name ?? ""]));
-      const longest = name => Math.max(0, ...events.filter(e => e.ph === "X" && e.name === "RunTask" && name.test(threads.get(`${e.pid}:${e.tid}`) ?? "")).map(e => e.dur / 1000));
-      result.audioThreadTaskMs = Math.round(longest(/AudioWorklet/));
-      result.mainThreadTaskMs = Math.round(longest(/^CrRendererMain$/));
-      // The model is built in a worker: on the audio thread, only a chunk of its copy at a time and
-      // the first frame (which compiles that frame's code) run; building it there took 0.3 to 8 s.
-      assert.ok(result.audioThreadTaskMs < 150, `the audio thread ran a task of ${result.audioThreadTaskMs} ms`);
+      const tasks = name => events.filter(e => e.ph === "X" && e.name === "RunTask" && name.test(threads.get(`${e.pid}:${e.tid}`) ?? "")).map(e => e.dur / 1000);
+      const audioTasks = tasks(/AudioWorklet/);
+      result.audioThreadTasks = audioTasks.length;
+      result.audioThreadTaskMs = Math.round(Math.max(0, ...audioTasks));
+      result.mainThreadTaskMs = Math.round(Math.max(0, ...tasks(/^CrRendererMain$/)));
+      // Not vacuous: a trace without the worklet's thread would pass any bound.
+      assert.ok(result.audioThreadTasks > 0, "the trace shows no task of the audio worklet's thread");
+      if (process.env.E2E_DENOISE_CONTROL === "audio-thread-build") {
+        // Building the model on the audio thread takes 0.3 to 8 s (520 to 741 ms on CI runners):
+        // the trace must catch it, or the bound below proves nothing.
+        assert.ok(result.audioThreadTaskMs >= 150, `control: the trace missed the audio thread's model build (longest task ${result.audioThreadTaskMs} ms)`);
+      } else {
+        // The model is built in a worker: on the audio thread, only a chunk of its copy at a time
+        // and the first frame (which compiles that frame's code) run.
+        assert.ok(result.audioThreadTaskMs < 150, `the audio thread ran a task of ${result.audioThreadTaskMs} ms`);
+      }
     }
     console.log(JSON.stringify({ type: "DENOISE_MEASURE", engine, ...result }));
     assert.deepEqual(result.troubles, [], "the model reported trouble");

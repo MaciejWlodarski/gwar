@@ -36,6 +36,12 @@ jobs:
       - name: Paired main and prebuild, cold/warm joins, main-thread tasks and original quality
         env:
           E2E_BROWSERS: chromium,webkit,firefox
+          # The control: current main, which still builds the model on the audio thread.
+          CONTROL: d04d51a99a4e37fb4aef9f5ff92e361de7b0dccb
+          # Interleaved on one runner; `pr` is this commit's source.
+          ORDER: main pr pr main
+          SCENARIOS: cold warm
+          QUALITY: '1'
         run: |
           sudo apt-get install -y pulseaudio
           pulseaudio --start --exit-idle-time=-1
@@ -44,14 +50,19 @@ jobs:
           pactl set-default-source e2e.monitor
           mkdir -p "$RUNNER_TEMP/readiness"
           status=0
-          for variant in main pr pr main; do
-            ref=3e3cbdcec35ca34c369d17ac70ef376135c7475e
-            if [ "$variant" = pr ]; then ref=${{ github.sha }}; fi
+          for entry in $ORDER; do
+            variant=${entry%%=*}
+            case "$entry" in
+              *=*) ref=${entry#*=} ;;
+              main) ref=$CONTROL ;;
+              *) ref=${{ github.sha }} ;;
+            esac
             git restore --source="$ref" -- apps/web/src
             python3 scripts/ci/denoise-idle-instrument.py
+            python3 scripts/ci/denoise-phase-instrument.py
             nice -n 10 pnpm --filter web typecheck
             echo "VARIANT $variant $ref"
-            for scenario in cold warm; do
+            for scenario in $SCENARIOS; do
               echo "SCENARIO $scenario"
               set +e
               E2E_DENOISE_CASE="$scenario" nice -n 10 pnpm --filter web exec node e2e/denoise-join.mjs 2>&1 | tee -a "$RUNNER_TEMP/readiness/$variant-$scenario.log"
@@ -60,9 +71,13 @@ jobs:
               echo "EXIT $variant $scenario $code"
               if [ "$code" -ne 0 ]; then status=1; fi
             done
+            if [ "$QUALITY" != 1 ]; then continue; fi
             echo "SCENARIO quality"
+            # Main is the positive control of the audio-thread bound: its trace must show the
+            # model build there (e2e/denoise.mjs), while the candidate must stay below it.
+            control=; if [ "$variant" = main ]; then control=audio-thread-build; fi
             set +e
-            nice -n 10 pnpm --filter web exec node e2e/denoise.mjs 2>&1 | tee -a "$RUNNER_TEMP/readiness/$variant-quality.log"
+            E2E_DENOISE_CONTROL="$control" nice -n 10 pnpm --filter web exec node e2e/denoise.mjs 2>&1 | tee -a "$RUNNER_TEMP/readiness/$variant-quality.log"
             code=${PIPESTATUS[0]}
             set -e
             echo "EXIT $variant quality $code"

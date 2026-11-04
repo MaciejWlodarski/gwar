@@ -44,8 +44,10 @@ async function measure() {
       await window.__denoiseJoinGesture();
       const started = performance.now();
       if (!prebuilt && join === 0) prepare();
-      window.__gwarDenoiseCallMark = stage => {
-        phases.push({ stage, ms: performance.now() - started });
+      // Worker and worklet marks carry their own Date.now(): the same clock as timeOrigin + now().
+      const startedAt = performance.timeOrigin + started;
+      window.__gwarDenoiseCallMark = (stage, at) => {
+        phases.push({ stage, ms: (at ?? performance.timeOrigin + performance.now()) - startedAt });
         if (stage === "source-ready") settle();
       };
       // No remote transport is opened: use the real engine/capture/gate/model initialization,
